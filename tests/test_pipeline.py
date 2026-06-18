@@ -357,11 +357,15 @@ def test_augment_features_properties(meta):
 
     features = _augment_features(embeddings, scores, ages)
 
-    assert features.shape == (n, 385)
+    assert features.shape == (n, 386)
     assert np.allclose(features[:, :384], embeddings)
     assert np.all(features[:, 384] >= 0.0) and np.all(features[:, 384] <= 1.0)
+    assert np.all(features[:, 385] >= 0.0) and np.all(features[:, 385] <= 1.0)
 
-    # When all 4 personalization features are provided, shape expands to (n, 389)
+    # When all 7 derived features are provided, shape expands to (n, 393)
+    comment_counts = np.array([max(s, 0) for s in scores])
+    text_lengths = np.array([abs(a) % 10000 for a in ages])
+    hn_quality = comment_counts.astype(np.float32) / (np.abs(ages) + 1)
     sim_up = np.random.uniform(-1, 1, n).astype(np.float32)
     sim_down = np.random.uniform(-1, 1, n).astype(np.float32)
     closest_up = np.random.uniform(-1, 1, n).astype(np.float32)
@@ -371,13 +375,15 @@ def test_augment_features_properties(meta):
         embeddings,
         scores,
         ages,
+        comment_counts=comment_counts,
+        text_lengths=text_lengths,
+        hn_quality=hn_quality,
         sim_to_upvoted=sim_up,
         sim_to_downvoted=sim_down,
         closest_upvoted=closest_up,
         closest_downvoted=closest_down,
     )
-
-    assert features7.shape == (n, 389)
+    assert features7.shape == (n, 393)
     assert np.allclose(features7[:, :384], embeddings)
     # All normalized cols in [0, 1]
     assert np.all(features7[:, 384:] >= 0.0) and np.all(features7[:, 384:] <= 1.0)
@@ -424,11 +430,7 @@ def test_mmr_engagement_promotion_boundaries(score_a, score_b, eng_a, eng_b):
     ),
     cand_count=st.integers(min_value=1, max_value=10),
 )
-@settings(
-    max_examples=25,
-    suppress_health_check=[HealthCheck.function_scoped_fixture],
-    deadline=1000,
-)
+@settings(max_examples=25, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=1000)
 def test_svm_fitting_robustness(tmp_path, embedder, feedback_actions, cand_count):
     import uuid
 

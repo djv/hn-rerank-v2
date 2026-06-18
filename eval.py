@@ -1,13 +1,14 @@
-"""Ranking evaluation with distractor injection. OFFLINE-ONLY.
+"""Ranking evaluation. OFFLINE-ONLY: reads hn_rewrite.db exclusively.
 
 Compares 3 score formulas via 5-fold stratified CV:
-  soft:        P(up) + 0.5 * P(neutral)          [production]
+  current:     P(up) + 0.5 * P(neutral)   [production]
   up_only:     P(up)
   hn_baseline: raw HN points (no SVM)
 
-Each fold ranks the test fold stories AMONG ~3000 non-feedback distractor
-stories (stories in the DB the user never voted on).  This mirrors the
-production retrieval task: "find upvotable stories in a feed of ~3000."
+Personalization features are computed per-fold (LOOCV self-exclusion)
+to avoid train-test leakage. MMR and raw (pre-MMR) metrics both reported.
+
+Writes eval_report.json (committed to git for tracking).
 """
 
 import hashlib
@@ -19,9 +20,9 @@ from pathlib import Path
 
 import numpy as np
 from sklearn.model_selection import StratifiedKFold
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
-
-from pipeline import _build_model, _make_labels_binary, _model_predict_up
 
 from database import Database, Story
 from pipeline import (
@@ -39,140 +40,14 @@ def _db_sha256(db_path: str) -> str:
     return hashlib.sha256(Path(db_path).read_bytes()).hexdigest()[:16]
 
 
-def _compute_upvote_metrics(
-    ranked: list[RankedStory],
-    test_stories: list[Story],
-    test_actions: np.ndarray,
-    full_ranked_order_ids: list[int],
-) -> dict:
-    story_to_action = {ts.id: int(act) for ts, act in zip(test_stories, test_actions)}
-    ranked_actions = [story_to_action.get(rs.story.id, 0) for rs in ranked]
-    total_upvotes = sum(1 for act in test_actions if act == 2)
-
-    def _prec_rec_ndcg(k: int) -> tuple[float, float, float]:
-        slice_actions = ranked_actions[:k]
-        up_count = sum(1 for act in slice_actions if act == 2)
-        precision = up_count / k if k > 0 else 0.0
-        recall = up_count / total_upvotes if total_upvotes > 0 else 0.0
-
-        dcg = sum(
-            1.0 / math.log2(p + 2) for p, act in enumerate(slice_actions) if act == 2
-        )
-        ideal_count = min(k, total_upvotes)
-        idcg = sum(1.0 / math.log2(i + 2) for i in range(ideal_count))
-        ndcg = dcg / idcg if idcg > 0 else 0.0
-
-        return precision, recall, ndcg
-
-    p5, r5, n5 = _prec_rec_ndcg(5)
-    p10, r10, n10 = _prec_rec_ndcg(10)
-    p20, r20, n20 = _prec_rec_ndcg(20)
-    p40, r40, n40 = _prec_rec_ndcg(40)
-
-    mrr = 0.0
-    for pos, act in enumerate(ranked_actions):
-        if act == 2:
-            mrr = 1.0 / (pos + 1)
-            break
-
-    upvote_ranks = [
-        pos
-        for pos, sid in enumerate(full_ranked_order_ids)
-        if story_to_action.get(sid, 0) == 2
-    ]
-    median_rank = float(np.median(upvote_ranks)) if upvote_ranks else 0.0
-
-    return {
-        "ndcg_at_5": n5,
-        "ndcg_at_10": n10,
-        "ndcg_at_20": n20,
-        "ndcg_at_40": n40,
-        "precision_at_5": p5,
-        "precision_at_10": p10,
-        "precision_at_20": p20,
-        "precision_at_40": p40,
-        "recall_at_10": r10,
-        "recall_at_40": r40,
-        "mrr": mrr,
-        "median_rank": median_rank,
-    }
-
-
-def _evaluate_fold(
-    scores: np.ndarray,
-    all_stories: list[Story],
-    all_emb: np.ndarray,
-    test_stories: list[Story],
-    test_actions: np.ndarray,
-    mmr_threshold: float = 0.85,
-    mmr_limit: int = 40,
-) -> dict:
-    order = np.argsort(-scores)
-    ranked = [
-        RankedStory(story=all_stories[i], score=float(scores[i]), best_match_title="")
-        for i in order
-    ]
-    full_ranked_order_ids = [all_stories[i].id for i in order]
-    emb_map = {all_stories[i].id: all_emb[i] for i in range(len(all_stories))}
-
-    top40 = mmr_filter(ranked, emb_map, threshold=mmr_threshold, limit=mmr_limit)
-    return _compute_upvote_metrics(
-        top40, test_stories, test_actions, full_ranked_order_ids
-    )
-
-
-def main() -> None:
-    config = Config.load()
-    db = Database(config.db_path)
-
-    # ------------------------------------------------------------------ #
-    # 1. Load feedback stories
-    # ------------------------------------------------------------------ #
-    fb_stories, fb_labels, fb_vote_times = db.get_feedback_for_training()
-    fb_labels = np.array(fb_labels, dtype=int)
-    fb_vote_times = np.array(fb_vote_times, dtype=np.float64)
-    print(f"Feedback: {len(fb_stories)} rows ({Counter(fb_labels)})")
-
-    # Load embeddings for feedback stories
-    cached = db.get_embeddings_batch([s.id for s in fb_stories], MODEL_VERSION)
-    fb_emb = np.array(
-        [cached.get(s.id, np.zeros(384, dtype=np.float32)) for s in fb_stories],
-        dtype=np.float32,
-    )
-
-    valid = np.array([s.id in cached for s in fb_stories], dtype=bool)
-    if not valid.all():
-        print(
-            f"Warning: {(~valid).sum()} feedback stories missing cached embeddings; excluded."
-        )
-        fb_stories = [fb_stories[i] for i in range(len(fb_stories)) if valid[i]]
-        fb_labels = fb_labels[valid]
-        fb_vote_times = fb_vote_times[valid]
-        fb_emb = fb_emb[valid]
-
-    # Pre-calculate metadata features
-    fb_scores = np.array([s.score for s in fb_stories])
-    fb_ages = np.array(
-        [float(vt) - max(s.time, 1) for vt, s in zip(fb_vote_times, fb_stories)]
-    )
-
-    # ------------------------------------------------------------------ #
-    # 2. Load distractor stories (non-feedback stories with embeddings)
-    # ------------------------------------------------------------------ #
-    fb_ids = {s.id for s in fb_stories}
+def _load_candidates(db: Database) -> tuple[list[Story], np.ndarray]:
+    """Read all non-negative-cached stories + their embeddings."""
     cursor = db.conn.execute(
-        """
-        SELECT s.id, s.title, s.url, s.score, s.time, s.text_content, s.source,
-               s.comment_count, s.discussion_url
-        FROM stories s
-        INNER JOIN embeddings e ON e.story_id = s.id
-        WHERE s.text_content != ''
-          AND e.model_version = ?
-          AND s.id NOT IN (SELECT f.story_id FROM feedback f)
-        """,
-        (MODEL_VERSION,),
+        "SELECT id, title, url, score, time, text_content, source, "
+        "       comment_count, discussion_url "
+        "FROM stories WHERE text_content != ''"
     )
-    dist_stories = [
+    stories = [
         Story(
             id=row[0],
             title=row[1],
@@ -185,27 +60,144 @@ def main() -> None:
             discussion_url=row[8],
         )
         for row in cursor.fetchall()
-        if row[0] not in fb_ids
     ]
-    print(f"Distractors: {len(dist_stories)} stories")
+    cached = db.get_embeddings_batch([s.id for s in stories], MODEL_VERSION)
+    embeddings = np.array(
+        [cached.get(s.id, np.zeros(384, dtype=np.float32)) for s in stories],
+        dtype=np.float32,
+    )
+    return stories, embeddings
 
-    if not dist_stories:
-        print("ERROR: No distractor stories found. Cannot evaluate.")
-        db.close()
-        return
 
-    dist_cached = db.get_embeddings_batch([s.id for s in dist_stories], MODEL_VERSION)
-    dist_emb = np.array([dist_cached[s.id] for s in dist_stories], dtype=np.float32)
+def _compute_metrics(
+    rank_map: dict[int, int],
+    test_stories: list[Story],
+    test_actions: np.ndarray,
+    test_rel: np.ndarray,
+    all_test_rels: list[float],
+) -> dict:
+    rel_by_pos = {}
+    for i, ts in enumerate(test_stories):
+        if ts.id in rank_map:
+            rel_by_pos[rank_map[ts.id]] = test_rel[i]
 
-    now_ts = time.time()
-    dist_scores = np.array([s.score for s in dist_stories], dtype=np.float32)
-    dist_ages = np.array([now_ts - s.time for s in dist_stories], dtype=np.float64)
+    mrr_vals = [
+        1.0 / (rank_map[ts.id] + 1)
+        for i, ts in enumerate(test_stories)
+        if test_actions[i] == 2 and ts.id in rank_map
+    ]
 
-    # ------------------------------------------------------------------ #
-    # 3. Cross-validation
-    # ------------------------------------------------------------------ #
-    y = fb_labels
-    formulas = ["soft", "up_only", "hn_baseline"]
+    def _ndcg(
+        rel_by_pos: dict[int, float], all_test_rels: list[float], k: int
+    ) -> float:
+        dcg = sum(r / math.log2(p + 2) for p, r in rel_by_pos.items() if p < k)
+        ideal = sorted(all_test_rels, reverse=True)[:k]
+        idcg = sum(r / math.log2(i + 2) for i, r in enumerate(ideal))
+        return dcg / idcg if idcg > 0 else 0.0
+
+    return {
+        "ndcg_at_5": _ndcg(rel_by_pos, all_test_rels, 5),
+        "ndcg_at_10": _ndcg(rel_by_pos, all_test_rels, 10),
+        "ndcg_at_20": _ndcg(rel_by_pos, all_test_rels, 20),
+        "ndcg_at_40": _ndcg(rel_by_pos, all_test_rels, 40),
+        "hit_at_40": len(rel_by_pos) / max(len(test_stories), 1),
+        "mrr": float(np.mean(mrr_vals)) if mrr_vals else 0.0,
+    }
+
+
+def _evaluate_fold(
+    probs: np.ndarray,
+    candidates: list[Story],
+    cand_emb: np.ndarray,
+    test_stories: list[Story],
+    test_actions: np.ndarray,
+    cand_scores: np.ndarray,
+    formula: str,
+    mmr_threshold: float = 0.85,
+    mmr_limit: int = 40,
+) -> dict:
+    if formula == "current":
+        scores = probs[:, 2] + 0.5 * probs[:, 1]
+    elif formula == "up_only":
+        scores = probs[:, 2]
+    elif formula == "hn_baseline":
+        scores = cand_scores.astype(np.float32)
+    else:
+        raise ValueError(f"Unknown formula: {formula}")
+
+    order = np.argsort(-scores)
+    ranked = [
+        RankedStory(story=candidates[i], score=float(scores[i]), best_match_title="")
+        for i in order
+    ]
+    emb_map = {candidates[i].id: cand_emb[i] for i in range(len(candidates))}
+
+    rel_map = {0: 0.0, 1: 0.5, 2: 1.0}
+    test_rel = np.array([rel_map[int(a)] for a in test_actions])
+    all_test_rels = test_rel.tolist()
+
+    # MMR-based ranking (production path)
+    top40 = mmr_filter(ranked, emb_map, threshold=mmr_threshold, limit=mmr_limit)
+    mmr_rank_map = {rs.story.id: pos for pos, rs in enumerate(top40)}
+    mmr_metrics = _compute_metrics(
+        mmr_rank_map, test_stories, test_actions, test_rel, all_test_rels
+    )
+
+    # Raw ranking (no MMR, diagnostic)
+    raw_ranked = ranked[:mmr_limit]
+    raw_rank_map = {rs.story.id: pos for pos, rs in enumerate(raw_ranked)}
+    raw_metrics = _compute_metrics(
+        raw_rank_map, test_stories, test_actions, test_rel, all_test_rels
+    )
+
+    return {"mmr": mmr_metrics, "raw": raw_metrics}
+
+
+def main() -> None:
+    config = Config.load()
+    db = Database(config.db_path)
+
+    # Feedback
+    fb_stories, fb_labels, fb_vote_times = db.get_feedback_for_training()
+    fb_labels = np.array(fb_labels, dtype=int)
+    fb_vote_times = np.array(fb_vote_times, dtype=np.float64)
+    print(f"Feedback: {len(fb_stories)} rows ({Counter(fb_labels)})")
+
+    # Candidates
+    candidates, cand_emb = _load_candidates(db)
+    print(f"Candidates: {len(candidates)}")
+
+    # Map feedback stories → candidate indices
+    cand_id_to_idx = {s.id: i for i, s in enumerate(candidates)}
+    fb_to_cand = np.array([cand_id_to_idx.get(s.id, -1) for s in fb_stories], dtype=int)
+    valid = fb_to_cand >= 0
+    if not valid.all():
+        print(
+            f"Warning: {(~valid).sum()} feedback stories missing from candidates; excluded."
+        )
+
+    # Candidate features (age = now - story.time)
+    now = time.time()
+    cand_comment_counts = np.array([s.comment_count or 0 for s in candidates])
+    cand_text_lengths = np.array([len(s.text_content) for s in candidates])
+    cand_ages_arr = np.array([now - max(s.time, 1) for s in candidates])
+    cand_scores_arr = np.array([s.score for s in candidates])
+    cand_quality_arr = cand_scores_arr / (np.maximum(cand_ages_arr / 3600.0, 0) + 1)
+
+    # Feedback metadata (age = vote_time - story.time)
+    fb_emb = cand_emb[fb_to_cand[valid]]
+    fb_scores_arr = np.array([s.score for s in fb_stories])[valid]
+    fb_ages_arr = np.array(
+        [float(vt) - max(s.time, 1) for vt, s in zip(fb_vote_times, fb_stories)]
+    )[valid]
+    fb_comment_counts_arr = np.array([s.comment_count or 0 for s in fb_stories])[valid]
+    fb_text_lengths_arr = np.array([len(s.text_content) for s in fb_stories])[valid]
+    fb_quality_arr = fb_scores_arr / (np.maximum(fb_ages_arr / 3600.0, 0) + 1)
+
+    cand_scores_array = np.array([s.score for s in candidates], dtype=np.float64)
+    y = fb_labels[valid]
+
+    formulas = ["current", "up_only", "hn_baseline"]
     results: dict[str, list[dict]] = {f: [] for f in formulas}
 
     folds = list(
@@ -215,13 +207,17 @@ def main() -> None:
     )
 
     for fold_idx, (train_pos, test_pos) in enumerate(folds):
-        # --- Train fold ---
+        # Slice training data for this fold
         fb_train_emb = fb_emb[train_pos]
         y_train = y[train_pos]
 
-        fb_train_scores = fb_scores[train_pos]
-        fb_train_ages = fb_ages[train_pos]
+        fb_train_scores = fb_scores_arr[train_pos]
+        fb_train_ages = fb_ages_arr[train_pos]
+        fb_train_comments = fb_comment_counts_arr[train_pos]
+        fb_train_textlens = fb_text_lengths_arr[train_pos]
+        fb_train_quality = fb_quality_arr[train_pos]
 
+        # Per-fold personalization with LOOCV self-exclusion
         up_mask = y_train == 2
         down_mask = y_train == 0
         fb_up_train = fb_train_emb[up_mask]
@@ -234,7 +230,21 @@ def main() -> None:
             fb_down_train.mean(axis=0) if n_down else np.zeros(384, dtype=np.float32)
         )
 
-        # Train personalization features via LOOCV
+        # Candidate features (from train centroids — no self issue)
+        cand_sim_up = cand_emb @ mean_up
+        cand_sim_down = cand_emb @ mean_down
+        cand_closest_up = (
+            np.max(cand_emb @ fb_up_train.T, axis=1)
+            if n_up
+            else np.zeros(len(candidates))
+        )
+        cand_closest_down = (
+            np.max(cand_emb @ fb_down_train.T, axis=1)
+            if n_down
+            else np.zeros(len(candidates))
+        )
+
+        # Train features: exclude self-contribution (LOOCV)
         fb_sim_up = fb_train_emb @ mean_up
         fb_sim_down = fb_train_emb @ mean_down
 
@@ -270,16 +280,30 @@ def main() -> None:
         else:
             fb_closest_down = np.zeros(len(fb_train_emb))
 
-        # --- Build train features ---
+        # Build features for this fold
         X_train = _augment_features(
             fb_train_emb,
             fb_train_scores,
             fb_train_ages,
+            comment_counts=fb_train_comments,
+            text_lengths=fb_train_textlens,
+            hn_quality=fb_train_quality,
             sim_to_upvoted=fb_sim_up,
             sim_to_downvoted=fb_sim_down,
             closest_upvoted=fb_closest_up,
             closest_downvoted=fb_closest_down,
-            use_raw_embeddings=config.model.use_raw_embeddings,
+        )
+        X_cand = _augment_features(
+            cand_emb,
+            cand_scores_arr,
+            cand_ages_arr,
+            comment_counts=cand_comment_counts,
+            text_lengths=cand_text_lengths,
+            hn_quality=cand_quality_arr,
+            sim_to_upvoted=cand_sim_up,
+            sim_to_downvoted=cand_sim_down,
+            closest_upvoted=cand_closest_up,
+            closest_downvoted=cand_closest_down,
         )
 
         counts = Counter(y_train)
@@ -287,162 +311,107 @@ def main() -> None:
             [len(y_train) / (3 * counts[c]) for c in y_train], dtype=np.float64
         )
 
-        emb_dim = fb_emb.shape[1] if config.model.use_raw_embeddings else 0
+        emb_dim = cand_emb.shape[1]
         scaler = StandardScaler()
         X_train_meta_scaled = scaler.fit_transform(X_train[:, emb_dim:])
+        X_cand_meta_scaled = scaler.transform(X_cand[:, emb_dim:])
 
         X_train_scaled = np.hstack([X_train[:, :emb_dim], X_train_meta_scaled])
+        X_cand_scaled = np.hstack([X_cand[:, :emb_dim], X_cand_meta_scaled])
 
-        model_name = config.model.model_name
-        model = _build_model(model_name, config.model)
-        if model_name == "svm":
-            model.fit(X_train_scaled, y_train, sample_weight=weights)
-        elif model_name == "lgbm_rank":
-            model.fit(X_train_scaled, y_train, group=[len(X_train_scaled)])
-        else:
-            model.fit(X_train_scaled, _make_labels_binary(y_train))
-
-        # --- Test fold ---
-        fb_test_emb = fb_emb[test_pos]
-        y_test = y[test_pos]
-        fb_test_scores = fb_scores[test_pos]
-        fb_test_ages = fb_ages[test_pos]
-        test_stories = [fb_stories[i] for i in test_pos]
-
-        # Test personalization
-        test_sim_up = fb_test_emb @ mean_up
-        test_sim_down = fb_test_emb @ mean_down
-        test_closest_up = (
-            np.max(fb_test_emb @ fb_up_train.T, axis=1)
-            if n_up
-            else np.zeros(len(fb_test_emb))
+        svm = SVC(
+            C=config.model.svm_c,
+            kernel=config.model.svm_kernel,
+            gamma=config.model.svm_gamma,
+            random_state=0,
+            decision_function_shape="ovr",
         )
-        test_closest_down = (
-            np.max(fb_test_emb @ fb_down_train.T, axis=1)
-            if n_down
-            else np.zeros(len(fb_test_emb))
+        svm.fit(X_train_scaled, y_train, sample_weight=weights)
+        n_train = len(X_train_scaled)
+        calibrated = CalibratedClassifierCV(
+            svm, cv=[(list(range(n_train)), list(range(n_train)))], method="sigmoid"
         )
+        calibrated.fit(X_train_scaled, y_train, sample_weight=weights)
+        probs = calibrated.predict_proba(X_cand_scaled)
 
-        # --- Distractor personalization ---
-        dist_sim_up = dist_emb @ mean_up
-        dist_sim_down = dist_emb @ mean_down
-        dist_closest_up = (
-            np.max(dist_emb @ fb_up_train.T, axis=1)
-            if n_up
-            else np.zeros(len(dist_emb))
-        )
-        dist_closest_down = (
-            np.max(dist_emb @ fb_down_train.T, axis=1)
-            if n_down
-            else np.zeros(len(dist_emb))
-        )
-
-        # --- Build all candidate features ---
-        X_test = _augment_features(
-            fb_test_emb,
-            fb_test_scores,
-            fb_test_ages,
-            sim_to_upvoted=test_sim_up,
-            sim_to_downvoted=test_sim_down,
-            closest_upvoted=test_closest_up,
-            closest_downvoted=test_closest_down,
-            use_raw_embeddings=config.model.use_raw_embeddings,
-        )
-        X_dist = _augment_features(
-            dist_emb,
-            dist_scores,
-            dist_ages,
-            sim_to_upvoted=dist_sim_up,
-            sim_to_downvoted=dist_sim_down,
-            closest_upvoted=dist_closest_up,
-            closest_downvoted=dist_closest_down,
-            use_raw_embeddings=config.model.use_raw_embeddings,
-        )
-
-        X_all = np.concatenate([X_test, X_dist], axis=0)
-        X_all_meta_scaled = scaler.transform(X_all[:, emb_dim:])
-        X_all_scaled = np.hstack([X_all[:, :emb_dim], X_all_meta_scaled])
-
-        scores_model = _model_predict_up(model, model_name, X_all_scaled)
-
-        all_stories = test_stories + dist_stories
-        all_emb = np.concatenate([fb_test_emb, dist_emb], axis=0)
+        # Test fold: map test positions back to stories
+        test_stories = [
+            fb_stories[valid_idx] for valid_idx in np.where(valid)[0][test_pos]
+        ]
+        test_actions = y[test_pos]
 
         for formula in formulas:
-            if formula in ("soft", "up_only"):
-                scores = scores_model
-            elif formula == "hn_baseline":
-                scores = np.concatenate([fb_test_scores, dist_scores])
-
             results[formula].append(
                 _evaluate_fold(
-                    scores.astype(np.float32),
-                    all_stories,
-                    all_emb,
+                    probs,
+                    candidates,
+                    cand_emb,
                     test_stories,
-                    y_test,
+                    test_actions,
+                    cand_scores_array,
+                    formula,
                 )
             )
 
         print(f"Fold {fold_idx + 1}/5 done")
 
-    # ------------------------------------------------------------------ #
-    # 4. Aggregate & report
-    # ------------------------------------------------------------------ #
+    # Aggregate
     metric_keys = (
         "ndcg_at_5",
         "ndcg_at_10",
         "ndcg_at_20",
         "ndcg_at_40",
-        "precision_at_5",
-        "precision_at_10",
-        "precision_at_20",
-        "precision_at_40",
-        "recall_at_10",
-        "recall_at_40",
+        "hit_at_40",
         "mrr",
-        "median_rank",
     )
 
-    config_block = {
-        "split": "5-fold-stratified",
-        "random_state": 0,
-        "n_feedback": int(len(fb_labels)),
-        "n_distractors": int(len(dist_stories)),
-        "n_folds": 5,
-        "mmr_threshold": 0.85,
-        "mmr_limit": 40,
-        "relevance_grade": "up=1, neutral=0, down=0",
-        "db_sha256": _db_sha256(config.db_path),
+    report = {
+        "config": {
+            "split": "5-fold-stratified",
+            "random_state": 0,
+            "n_feedback": int(len(fb_labels)),
+            "n_candidates": int(len(candidates)),
+            "n_folds": 5,
+            "mmr_threshold": 0.85,
+            "mmr_limit": 40,
+            "relevance_grade": "up=1, neutral=0.5, down=0",
+            "db_sha256": _db_sha256(config.db_path),
+        },
+        "formulas": {
+            f: {
+                "mean": {
+                    "mmr": {
+                        k: float(np.mean([r["mmr"][k] for r in rs]))
+                        for k in metric_keys
+                    },
+                    "raw": {
+                        k: float(np.mean([r["raw"][k] for r in rs]))
+                        for k in metric_keys
+                    },
+                },
+                "std": {
+                    "mmr": {
+                        k: float(np.std([r["mmr"][k] for r in rs])) for k in metric_keys
+                    },
+                    "raw": {
+                        k: float(np.std([r["raw"][k] for r in rs])) for k in metric_keys
+                    },
+                },
+                "per_fold": rs,
+            }
+            for f, rs in results.items()
+        },
     }
-
-    mean_dict: dict[str, dict[str, float]] = {}
-    std_dict: dict[str, dict[str, float]] = {}
-    formulas_block: dict[str, dict[str, object]] = {}
-    for f, fold_results in results.items():
-        fm = {k: float(np.mean([r[k] for r in fold_results])) for k in metric_keys}
-        fs = {k: float(np.std([r[k] for r in fold_results])) for k in metric_keys}
-        mean_dict[f] = fm
-        std_dict[f] = fs
-        formulas_block[f] = {"mean": fm, "std": fs, "per_fold": fold_results}
-
-    report = {"config": config_block, "formulas": formulas_block}
 
     REPORT_PATH.write_text(json.dumps(report, indent=2))
     print(f"\nWritten {REPORT_PATH}")
 
-    for metric in (
-        "ndcg_at_10",
-        "precision_at_10",
-        "precision_at_40",
-        "recall_at_40",
-        "mrr",
-        "median_rank",
-    ):
+    for metric in ("ndcg_at_10", "hit_at_40", "mrr"):
         print(f"\n{metric} by formula (mean ± std):")
-        for f in formulas:
-            m, s = mean_dict[f][metric], std_dict[f][metric]
-            print(f"  {f:12s} {m:.3f} ± {s:.3f}")
+        for f, data in report["formulas"].items():  # type: ignore[union-attr]
+            for variant in ("mmr", "raw"):
+                m, s = data["mean"][variant][metric], data["std"][variant][metric]  # type: ignore
+                print(f"  {f:12s} {variant:4s} {m:.3f} ± {s:.3f}")
 
 
 if __name__ == "__main__":

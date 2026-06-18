@@ -20,9 +20,7 @@ import onnxruntime as ort
 from bs4 import BeautifulSoup
 from jinja2 import Environment, FileSystemLoader
 from numpy.typing import NDArray
-import lightgbm as lgb
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
 
@@ -32,16 +30,10 @@ from transformers import AutoTokenizer
 
 @dataclass(frozen=True)
 class ModelConfig:
-    model_name: str = "svm"
     svm_c: float = 0.3
     svm_gamma: float | str = 0.1
     svm_kernel: str = "rbf"
-    lr_c: float = 1.0
-    rf_n_estimators: int = 200
-    lgbm_n_estimators: int = 200
-    lgbm_lr: float = 0.05
     diversity_threshold: float = 0.55
-    use_raw_embeddings: bool = True
 
 
 @dataclass(frozen=True)
@@ -86,16 +78,10 @@ class Config:
             server_port=main_cfg.get("server_port", 8765),
             regen_interval_seconds=main_cfg.get("regen_interval_seconds", 10800),
             model=ModelConfig(
-                model_name=model_cfg.get("model_name", "svm"),
                 svm_c=model_cfg.get("svm_c", 0.3),
                 svm_gamma=model_cfg.get("svm_gamma", 0.1),
                 svm_kernel=model_cfg.get("svm_kernel", "rbf"),
-                lr_c=model_cfg.get("lr_c", 1.0),
-                rf_n_estimators=model_cfg.get("rf_n_estimators", 200),
-                lgbm_n_estimators=model_cfg.get("lgbm_n_estimators", 200),
-                lgbm_lr=model_cfg.get("lgbm_lr", 0.05),
                 diversity_threshold=model_cfg.get("diversity_threshold", 0.55),
-                use_raw_embeddings=model_cfg.get("use_raw_embeddings", True),
             ),
             rss=RssConfig(
                 enabled=rss_cfg.get("enabled", True),
@@ -332,7 +318,6 @@ async def fetch_candidates(
             candidate_ids.add(sid)
 
     # 2. Live Window daily chunks from Algolia
-    live_metrics: dict[int, tuple[int, int | None]] = {}
     async with httpx.AsyncClient(timeout=30.0) as client:
         for day in range(7):
             end_ts = now_ts - (day * 86400)
@@ -367,8 +352,6 @@ async def fetch_candidates(
                         points = int(h.get("points") or 0)
                         if points <= 5:
                             continue
-                        num_comments = h.get("num_comments")
-                        live_metrics[oid] = (points, num_comments)
                         day_ids.append(oid)
                     page += 1
                     if len(hits) < 100:
@@ -379,10 +362,6 @@ async def fetch_candidates(
             for oid in day_ids:
                 if oid not in exclude_ids:
                     candidate_ids.add(oid)
-
-        # Refresh score and comment_count for existing stories
-        for oid, (pts, nc) in live_metrics.items():
-            db.update_story_metrics(oid, pts, nc)
 
         candidates = await fetch_stories_by_id(list(candidate_ids), db, client)
 
@@ -586,21 +565,29 @@ def get_or_compute_embeddings(
 
 # Normalization constants for metadata features
 _LOG_POINTS_SCALE = 8.0  # log1p(~3000) ≈ 8
+_AGE_DAYS_SCALE = 30.0  # cap at 30 days
+_LOG_COMMENTS_SCALE = 7.0  # log1p(~1000) ≈ 6.9
+_LOG_TEXTLEN_SCALE = 12.0  # log1p(~100000) ≈ 11.5
+_LOG_QUALITY_SCALE = 8.0  # log1p(score/(age_hours+1)) rarely exceeds 8
 
 
 def _augment_features(
     embeddings: NDArray[np.float32],
     scores: list[int] | np.ndarray,
     age_seconds: list[float] | np.ndarray,
+    comment_counts: np.ndarray | None = None,
+    text_lengths: np.ndarray | None = None,
+    hn_quality: np.ndarray | None = None,
     sim_to_upvoted: np.ndarray | None = None,
     sim_to_downvoted: np.ndarray | None = None,
     closest_upvoted: np.ndarray | None = None,
     closest_downvoted: np.ndarray | None = None,
-    *,
-    use_raw_embeddings: bool = True,
 ) -> NDArray[np.float32]:
     n = len(scores)
-    n_meta = 1
+    n_meta = 2
+    for f in (comment_counts, text_lengths, hn_quality):
+        if f is not None:
+            n_meta += 1
     if sim_to_upvoted is not None:
         n_meta += 4
 
@@ -613,6 +600,32 @@ def _augment_features(
         / _LOG_POINTS_SCALE
     )
     col += 1
+
+    # age days
+    age_days = np.maximum(age_seconds, 0) / 86400.0
+    meta[:, col] = np.clip(age_days, 0, _AGE_DAYS_SCALE) / _AGE_DAYS_SCALE
+    col += 1
+
+    if comment_counts is not None:
+        meta[:, col] = (
+            np.clip(np.log1p(np.maximum(comment_counts, 0)), 0, _LOG_COMMENTS_SCALE)
+            / _LOG_COMMENTS_SCALE
+        )
+        col += 1
+
+    if text_lengths is not None:
+        meta[:, col] = (
+            np.clip(np.log1p(np.maximum(text_lengths, 0)), 0, _LOG_TEXTLEN_SCALE)
+            / _LOG_TEXTLEN_SCALE
+        )
+        col += 1
+
+    if hn_quality is not None:
+        meta[:, col] = (
+            np.clip(np.log1p(np.maximum(hn_quality, 0)), 0, _LOG_QUALITY_SCALE)
+            / _LOG_QUALITY_SCALE
+        )
+        col += 1
 
     if sim_to_upvoted is not None:
         assert (
@@ -629,64 +642,7 @@ def _augment_features(
         meta[:, col] = (np.clip(closest_downvoted, -1, 1) + 1) / 2
         col += 1
 
-    if use_raw_embeddings:
-        return np.concatenate([embeddings, meta], axis=1)
-    return meta
-
-
-def _model_predict_up(
-    model: object, model_name: str, X: NDArray[np.float32]
-) -> NDArray[np.float32]:
-    if model_name == "svm":
-        return model.predict_proba(X)[:, 2]
-    elif model_name in ("lr", "rf", "lgbm"):
-        return model.predict_proba(X)[:, 1]
-    elif model_name == "lgbm_rank":
-        return 1.0 / (1.0 + np.exp(-model.predict(X)))
-    raise ValueError(f"Unknown model: {model_name}")
-
-
-def _build_model(model_name: str, config: ModelConfig) -> object:
-    if model_name == "svm":
-        return SVC(
-            C=config.svm_c,
-            kernel=config.svm_kernel,
-            gamma=config.svm_gamma,
-            random_state=0,
-            decision_function_shape="ovr",
-            probability=True,
-        )
-    elif model_name == "lr":
-        return LogisticRegression(
-            C=config.lr_c,
-            solver="lbfgs",
-            max_iter=1000,
-            random_state=0,
-        )
-    elif model_name == "rf":
-        return RandomForestClassifier(
-            n_estimators=config.rf_n_estimators,
-            random_state=0,
-        )
-    elif model_name == "lgbm":
-        return lgb.LGBMClassifier(
-            n_estimators=config.lgbm_n_estimators,
-            learning_rate=config.lgbm_lr,
-            random_state=0,
-            verbose=0,
-        )
-    elif model_name == "lgbm_rank":
-        return lgb.LGBMRanker(
-            n_estimators=config.lgbm_n_estimators,
-            learning_rate=config.lgbm_lr,
-            random_state=0,
-            verbose=0,
-        )
-    raise ValueError(f"Unknown model: {model_name}")
-
-
-def _make_labels_binary(labels: list[int]) -> list[int]:
-    return [1 if label == 2 else 0 for label in labels]
+    return np.concatenate([embeddings, meta], axis=1)
 
 
 def rank_stories(
@@ -704,7 +660,7 @@ def rank_stories(
     feedback_stories, feedback_labels, vote_times = db.get_feedback_for_training()
 
     # Multiclass SVM: 0=down, 1=neutral, 2=up
-    if len(feedback_labels) >= 5:
+    if len(feedback_labels) >= 1:
         try:
             fb_embeddings = get_or_compute_embeddings(feedback_stories, embedder, db)
 
@@ -757,15 +713,23 @@ def rank_stories(
             fb_ages = np.array(
                 [vt - s.time for vt, s in zip(vote_times, feedback_stories)]
             )
+            fb_comment_counts = np.array(
+                [s.comment_count or 0 for s in feedback_stories]
+            )
+            fb_text_lengths = np.array([len(s.text_content) for s in feedback_stories])
+            fb_quality = fb_scores / (np.maximum(fb_ages / 3600.0, 0) + 1)
+
             fb_features = _augment_features(
                 fb_embeddings,
                 fb_scores,
                 fb_ages,
+                comment_counts=fb_comment_counts,
+                text_lengths=fb_text_lengths,
+                hn_quality=fb_quality,
                 sim_to_upvoted=fb_sim_to_up,
                 sim_to_downvoted=fb_sim_to_down,
                 closest_upvoted=fb_closest_up,
                 closest_downvoted=fb_closest_down,
-                use_raw_embeddings=config.model.use_raw_embeddings,
             )
 
             # Ensure all three classes (0, 1, 2) are present
@@ -792,61 +756,58 @@ def rank_stories(
             weights.extend([1e-6] * len(missing))
             sample_weights = np.array(weights, dtype=np.float64)
 
-            emb_dim = (
-                candidate_embeddings.shape[1] if config.model.use_raw_embeddings else 0
-            )
+            emb_dim = candidate_embeddings.shape[1]
             scaler = StandardScaler()
             fb_features_meta_scaled = scaler.fit_transform(fb_features[:, emb_dim:])
 
-            fb_features_scaled = np.hstack(
-                [fb_features[:, :emb_dim], fb_features_meta_scaled]
-            )
-            model_name = config.model.model_name
-            model = _build_model(model_name, config.model)
+            fb_features_scaled = np.hstack([fb_features[:, :emb_dim], fb_features_meta_scaled])
 
-            if model_name == "svm":
-                model.fit(fb_features_scaled, labels, sample_weight=sample_weights)
-            elif model_name == "lgbm_rank":
-                model.fit(fb_features_scaled, labels, group=[len(fb_features_scaled)])
-            else:
-                model.fit(fb_features_scaled, _make_labels_binary(labels))
+            svm = SVC(
+                C=config.model.svm_c,
+                kernel=config.model.svm_kernel,
+                gamma=config.model.svm_gamma,
+                random_state=0,
+                decision_function_shape="ovr",
+            )
+            svm.fit(fb_features_scaled, labels, sample_weight=sample_weights)
+            n_train = len(fb_features_scaled)
+            calibrated = CalibratedClassifierCV(
+                svm, cv=[(list(range(n_train)), list(range(n_train)))], method="sigmoid"
+            )
+            calibrated.fit(fb_features_scaled, labels, sample_weight=sample_weights)
 
             # Augment candidate features: age_now = now - story_time
             cand_scores = np.array([s.score for s in candidates])
             cand_ages = np.array([now - s.time for s in candidates])
+            cand_comment_counts = np.array([s.comment_count or 0 for s in candidates])
+            cand_text_lengths = np.array([len(s.text_content) for s in candidates])
+            cand_quality = cand_scores / (np.maximum(cand_ages / 3600.0, 0) + 1)
+
             cand_features = _augment_features(
                 candidate_embeddings,
                 cand_scores,
                 cand_ages,
+                comment_counts=cand_comment_counts,
+                text_lengths=cand_text_lengths,
+                hn_quality=cand_quality,
                 sim_to_upvoted=cand_sim_to_up,
                 sim_to_downvoted=cand_sim_to_down,
                 closest_upvoted=cand_closest_up,
                 closest_downvoted=cand_closest_down,
-                use_raw_embeddings=config.model.use_raw_embeddings,
             )
             cand_features_meta_scaled = scaler.transform(cand_features[:, emb_dim:])
-            cand_features_scaled = np.hstack(
-                [cand_features[:, :emb_dim], cand_features_meta_scaled]
-            )
+            cand_features_scaled = np.hstack([cand_features[:, :emb_dim], cand_features_meta_scaled])
 
-            scores = _model_predict_up(model, model_name, cand_features_scaled)
+            probs = calibrated.predict_proba(cand_features_scaled)
+            class_order = list(calibrated.classes_)
+            idx_up = class_order.index(2)
+            idx_neutral = class_order.index(1)
+            scores = probs[:, idx_up] + 0.5 * probs[:, idx_neutral]
         except Exception as e:
-            logging.error(f"Failed to fit feedback {config.model.model_name}: {e}")
+            logging.error(f"Failed to fit feedback SVM: {e}")
 
     if scores is None:
-        if len(feedback_labels) >= 1:
-            try:
-                fb_labels_arr = np.array(feedback_labels)
-                up_mask = fb_labels_arr == 2
-                if up_mask.any():
-                    fb_embeddings = get_or_compute_embeddings(feedback_stories, embedder, db)
-                    fb_up_embs = fb_embeddings[up_mask]
-                    scores = np.max(candidate_embeddings @ fb_up_embs.T, axis=1)
-                    scores = (np.clip(scores, -1, 1) + 1) / 2
-            except Exception:
-                pass
-        if scores is None:
-            scores = np.full(len(candidates), 0.5, dtype=np.float32)
+        scores = np.full(len(candidates), 0.5, dtype=np.float32)
 
     ranked = []
     for s, score in zip(candidates, scores):

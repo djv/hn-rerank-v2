@@ -116,15 +116,6 @@ class Database:
         self.conn.close()
 
     # Stories
-    def update_story_metrics(
-        self, story_id: int, score: int, comment_count: int | None
-    ) -> None:
-        with self.conn:
-            self.conn.execute(
-                "UPDATE stories SET score = ?, comment_count = ?, fetched_at = ? WHERE id = ?",
-                (score, comment_count, time.time(), story_id),
-            )
-
     def upsert_story(self, story: Story) -> None:
         with self.conn:
             self.conn.execute(

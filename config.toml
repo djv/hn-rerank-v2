@@ -9,14 +9,9 @@ server_port = 8766
 regen_interval_seconds = 10800
 
 [hn_rewrite.model]
-model_name = "svm"
 svm_c = 0.3
-svm_kernel = "linear"
-use_raw_embeddings = true
-lr_c = 1.0
-rf_n_estimators = 200
-lgbm_n_estimators = 200
-lgbm_lr = 0.05
+svm_gamma = 0.1
+svm_kernel = "rbf"
 min_feedback_labels = 10
 min_signal_examples = 5
 diversity_threshold = 0.55
