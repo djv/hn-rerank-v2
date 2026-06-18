@@ -5,12 +5,11 @@ from database import Database, Story
 from pipeline import (
     Embedder,
     RankedStory,
-    _clean_text,
+    clean_text,
     compose_story_text,
     get_or_compute_embeddings,
     mmr_filter,
     rank_stories,
-    strip_html,
     Config,
 )
 
@@ -76,16 +75,16 @@ def test_compose_text():
 
 def test_strip_html():
     raw_html = "<p>Hello &amp; welcome to <a href='#'>Hacker News</a>!</p>"
-    cleaned = strip_html(raw_html)
+    cleaned = clean_text(raw_html)
     assert cleaned == "Hello & welcome to Hacker News!"
 
 
 def test_clean_text():
-    assert _clean_text("Valid text content here that has enough length.") is not None
-    assert _clean_text("Short") is None  # too short
-    assert _clean_text("!!!???---***+++///\\\\|") is None  # excessive punctuation
+    assert clean_text("Valid text content here that has enough length.") != ""
+    assert clean_text("Short", min_len=20) == ""  # too short
+    assert clean_text("!!!???---***+++///\\\\|") == ""  # excessive punctuation
     # Braille block characters
-    assert _clean_text("⠠⠓⠑⠫⠕ ⠺⠕⠗⠇⠙") is None
+    assert clean_text("⠠⠓⠑⠫⠕ ⠺⠕⠗⠇⠙") == ""
 
 
 def test_rank_no_feedback_fallback(db, embedder):

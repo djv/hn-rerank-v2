@@ -104,36 +104,29 @@ class RankedStory:
 
 
 # Text processing helpers
-def strip_html(txt: str) -> str:
-    if not txt:
+def clean_text(raw_text: str, min_len: int = 0) -> str:
+    if not raw_text:
         return ""
-    if "<" not in txt and ">" not in txt and "&" not in txt:
-        clean = html.unescape(txt)
-        clean = re.sub(r"\s+([.,;:!?])", r"\1", clean)
-        clean = re.sub(r"\s+", " ", clean).strip()
-        return clean
-    try:
-        clean = BeautifulSoup(txt, "html.parser").get_text(" ", strip=True)
-    except Exception:
-        clean = re.sub(r"<[^>]*>", " ", txt)
-    clean = html.unescape(clean)
-    clean = re.sub(r"\s+([.,;:!?])", r"\1", clean)
-    clean = re.sub(r"\s+", " ", clean).strip()
-    return clean
+    if "<" not in raw_text and ">" not in raw_text and "&" not in raw_text:
+        txt = html.unescape(raw_text)
+    else:
+        try:
+            txt = BeautifulSoup(raw_text, "html.parser").get_text(" ", strip=True)
+        except Exception:
+            txt = re.sub(r"<[^>]*>", " ", raw_text)
+        txt = html.unescape(txt)
 
+    txt = re.sub(r"[\u2800-\u28FF\u2500-\u27BF]+", "", txt)
+    txt = re.sub(r"[#*^\\/|\\-_+]{3,}", "", txt)
+    txt = re.sub(r"\s+([.,;:!?])", r"\1", txt)
+    txt = re.sub(r"\s+", " ", txt).strip()
 
-def _clean_text(txt: str) -> str | None:
-    txt = html.unescape(txt)
-    txt_clean = re.sub(r"[\u2800-\u28FF\u2500-\u27BF]+", "", txt)
-    txt_clean = re.sub(r"[#*^\\/\\|\\-_+]{3,}", "", txt_clean)
-    if not txt_clean:
-        return None
-    alnum_count = sum(c.isalnum() for c in txt_clean)
-    if len(txt_clean) > 0 and (alnum_count / len(txt_clean)) < 0.5:
-        return None
-    if len(txt_clean.strip()) <= 20:
-        return None
-    return txt_clean
+    if len(txt) <= min_len:
+        return ""
+    alnum = sum(c.isalnum() for c in txt)
+    if len(txt) > 0 and (alnum / len(txt)) < 0.5:
+        return ""
+    return txt
 
 
 def _extract_comments_recursive(
@@ -154,9 +147,8 @@ def _extract_comments_recursive(
         score = -points + depth * DEPTH_PENALTY
         text = child.get("text", "")
         if text:
-            clean = strip_html(text)
-            clean = _clean_text(clean)
-            if clean and len(clean) >= MIN_COMMENT_LENGTH:
+            clean = clean_text(text, min_len=MIN_COMMENT_LENGTH)
+            if clean:
                 results.append({"text": clean, "score": score})
         if depth < max_depth and child.get("children"):
             results.extend(
@@ -172,9 +164,9 @@ def compose_story_text(
     self_text: str = "",
     comments: list[str] | None = None,
 ) -> str:
-    clean_title = strip_html(title)
-    clean_self = strip_html(self_text)[:6000]
-    clean_comments = " ".join(strip_html(c) for c in (comments or []) if c)[:6000]
+    clean_title = clean_text(title)
+    clean_self = clean_text(self_text)[:6000]
+    clean_comments = " ".join(clean_text(c) for c in (comments or []) if c)[:6000]
 
     parts = []
     if clean_title:
@@ -274,7 +266,7 @@ async def fetch_story(client: httpx.AsyncClient, sid: int, db: Database) -> Stor
         score = item.get("points") or 0
         comment_count = item.get("num_comments")
         created_at = item.get("created_at_i") or 0
-        story_text = strip_html(str(item.get("story_text") or item.get("text") or ""))
+        story_text = clean_text(str(item.get("story_text") or item.get("text") or ""))
 
         children = item.get("children", [])
         all_comments = _extract_comments_recursive(children)
@@ -495,7 +487,7 @@ async def fetch_rss_feeds(
                 elif "summary" in entry:
                     summary = entry.summary
 
-                clean_summary = strip_html(summary)
+                clean_summary = clean_text(summary)
                 snippet = clean_summary[:1000]
                 text_content = f"{title}. {snippet}".strip()
 
@@ -544,7 +536,6 @@ class Embedder:
             providers=["CPUExecutionProvider"],
         )
         self.max_tokens = 256
-        self._lock = threading.Lock()
 
     def encode(self, texts: list[str], batch_size: int = 64) -> NDArray[np.float32]:
         if not texts:
@@ -553,14 +544,13 @@ class Embedder:
         embeddings = []
         for i in range(0, len(texts), batch_size):
             batch_texts = texts[i : i + batch_size]
-            with self._lock:
-                inputs = self.tokenizer(
-                    batch_texts,
-                    padding=True,
-                    truncation=True,
-                    max_length=self.max_tokens,
-                    return_tensors="np",
-                )
+            inputs = self.tokenizer(
+                batch_texts,
+                padding=True,
+                truncation=True,
+                max_length=self.max_tokens,
+                return_tensors="np",
+            )
 
             onnx_inputs = {}
             for input_meta in self.session.get_inputs():
@@ -656,27 +646,21 @@ def rank_stories(
             fb_ages = [vt - s.time for vt, s in zip(vote_times, feedback_stories)]
             fb_features = _augment_features(fb_embeddings, fb_scores, fb_ages)
 
-            labels = list(feedback_labels)
-            n_real = len(labels)
+            # Ensure all three classes (0, 1, 2) are present
+            missing = {0, 1, 2} - set(feedback_labels)
+            if missing:
+                fb_features = np.concatenate([fb_features, np.zeros((len(missing), fb_features.shape[1]), dtype=np.float32)], axis=0)
+                labels = list(feedback_labels) + list(missing)
+            else:
+                labels = list(feedback_labels)
 
-            # Pad missing classes with dummy zero-vector samples so SVC always sees 3 classes
-            present_classes = set(labels)
-            for cls in (0, 1, 2):
-                if cls not in present_classes:
-                    fb_features = np.concatenate(
-                        [fb_features, np.zeros((1, fb_features.shape[1]), dtype=np.float32)], axis=0
-                    )
-                    labels.append(cls)
-
-            # Compute balanced sample weights for real samples; near-zero for dummies
-            class_counts = Counter(labels[:n_real]) if n_real > 0 else Counter()
-            n_classes_real = max(len(class_counts), 1)
-            sample_weights = np.ones(len(labels), dtype=np.float64)
-            for i, lbl in enumerate(labels):
-                if i < n_real:
-                    sample_weights[i] = n_real / (n_classes_real * class_counts[lbl])
-                else:
-                    sample_weights[i] = 1e-6
+            # Compute balanced weights for real feedback; 1e-6 for dummies
+            counts = Counter(feedback_labels)
+            n_classes = len(counts)
+            n_real = len(feedback_labels)
+            weights = [n_real / (n_classes * counts[lbl]) for lbl in feedback_labels]
+            weights.extend([1e-6] * len(missing))
+            sample_weights = np.array(weights, dtype=np.float64)
 
             svm = SVC(
                 C=config.model.svm_c,
