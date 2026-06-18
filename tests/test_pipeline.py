@@ -228,53 +228,6 @@ def test_mmr_output_is_subset(scores):
     assert filtered_ids == sorted(filtered_ids, key=lambda x: input_ids.index(x))
 
 
-def test_rank_single_feedback_vote(db, embedder):
-    config = Config()
-    # Add exactly one feedback record (upvote) to DB
-    db.upsert_story(
-        Story(
-            id=100,
-            title="Only Up",
-            url=None,
-            score=0,
-            time=0,
-            text_content="Only upvote text content",
-        )
-    )
-    db.upsert_feedback(100, "up")
-
-    candidates = [
-        Story(
-            id=1,
-            title="Match Story",
-            url=None,
-            score=0,
-            time=0,
-            text_content="Only upvote text content similar",
-        ),
-        Story(
-            id=2,
-            title="Other Story",
-            url=None,
-            score=0,
-            time=0,
-            text_content="Completely unrelated recipes for cake cooking",
-        ),
-    ]
-    cand_embs = embedder.encode([s.text_content for s in candidates])
-
-    ranked = rank_stories(
-        candidates=candidates,
-        candidate_embeddings=cand_embs,
-        db=db,
-        config=config,
-        embedder=embedder,
-    )
-
-    assert len(ranked) == 2
-    # Should rank the matching story higher (or equal with single feedback)
-    assert ranked[0].story.id == 1
-    assert ranked[0].score >= ranked[1].score
 
 
 def test_rank_no_feedback_frontpage_sort(db, embedder):

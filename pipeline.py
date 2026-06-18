@@ -748,6 +748,7 @@ def rank_stories(
                 labels = list(feedback_labels) + list(missing)
             else:
                 labels = list(feedback_labels)
+
             # Compute balanced weights for real feedback; 1e-6 for dummies
             counts = Counter(feedback_labels)
             n_classes = len(counts)
@@ -768,13 +769,9 @@ def rank_stories(
                 gamma=config.model.svm_gamma,
                 random_state=0,
                 decision_function_shape="ovr",
+                probability=True,
             )
             svm.fit(fb_features_scaled, labels, sample_weight=sample_weights)
-            n_train = len(fb_features_scaled)
-            calibrated = CalibratedClassifierCV(
-                svm, cv=[(list(range(n_train)), list(range(n_train)))], method="sigmoid"
-            )
-            calibrated.fit(fb_features_scaled, labels, sample_weight=sample_weights)
 
             # Augment candidate features: age_now = now - story_time
             cand_scores = np.array([s.score for s in candidates])
@@ -798,8 +795,8 @@ def rank_stories(
             cand_features_meta_scaled = scaler.transform(cand_features[:, emb_dim:])
             cand_features_scaled = np.hstack([cand_features[:, :emb_dim], cand_features_meta_scaled])
 
-            probs = calibrated.predict_proba(cand_features_scaled)
-            class_order = list(calibrated.classes_)
+            probs = svm.predict_proba(cand_features_scaled)
+            class_order = list(svm.classes_)
             idx_up = class_order.index(2)
             idx_neutral = class_order.index(1)
             scores = probs[:, idx_up] + 0.5 * probs[:, idx_neutral]

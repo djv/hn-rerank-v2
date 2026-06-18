@@ -325,14 +325,10 @@ def main() -> None:
             gamma=config.model.svm_gamma,
             random_state=0,
             decision_function_shape="ovr",
+            probability=True,
         )
         svm.fit(X_train_scaled, y_train, sample_weight=weights)
-        n_train = len(X_train_scaled)
-        calibrated = CalibratedClassifierCV(
-            svm, cv=[(list(range(n_train)), list(range(n_train)))], method="sigmoid"
-        )
-        calibrated.fit(X_train_scaled, y_train, sample_weight=weights)
-        probs = calibrated.predict_proba(X_cand_scaled)
+        probs = svm.predict_proba(X_cand_scaled)
 
         # Test fold: map test positions back to stories
         test_stories = [
