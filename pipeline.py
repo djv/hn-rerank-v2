@@ -22,6 +22,7 @@ from jinja2 import Environment, FileSystemLoader
 from numpy.typing import NDArray
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.svm import SVC
+from sklearn.preprocessing import StandardScaler
 
 from database import Database, Story
 from transformers import AutoTokenizer
@@ -755,6 +756,12 @@ def rank_stories(
             weights.extend([1e-6] * len(missing))
             sample_weights = np.array(weights, dtype=np.float64)
 
+            emb_dim = candidate_embeddings.shape[1]
+            scaler = StandardScaler()
+            fb_features_meta_scaled = scaler.fit_transform(fb_features[:, emb_dim:])
+
+            fb_features_scaled = np.hstack([fb_features[:, :emb_dim], fb_features_meta_scaled])
+
             svm = SVC(
                 C=config.model.svm_c,
                 kernel=config.model.svm_kernel,
@@ -762,12 +769,12 @@ def rank_stories(
                 random_state=0,
                 decision_function_shape="ovr",
             )
-            svm.fit(fb_features, labels, sample_weight=sample_weights)
-            n_train = len(fb_features)
+            svm.fit(fb_features_scaled, labels, sample_weight=sample_weights)
+            n_train = len(fb_features_scaled)
             calibrated = CalibratedClassifierCV(
                 svm, cv=[(list(range(n_train)), list(range(n_train)))], method="sigmoid"
             )
-            calibrated.fit(fb_features, labels, sample_weight=sample_weights)
+            calibrated.fit(fb_features_scaled, labels, sample_weight=sample_weights)
 
             # Augment candidate features: age_now = now - story_time
             cand_scores = np.array([s.score for s in candidates])
@@ -788,8 +795,10 @@ def rank_stories(
                 closest_upvoted=cand_closest_up,
                 closest_downvoted=cand_closest_down,
             )
+            cand_features_meta_scaled = scaler.transform(cand_features[:, emb_dim:])
+            cand_features_scaled = np.hstack([cand_features[:, :emb_dim], cand_features_meta_scaled])
 
-            probs = calibrated.predict_proba(cand_features)
+            probs = calibrated.predict_proba(cand_features_scaled)
             class_order = list(calibrated.classes_)
             idx_up = class_order.index(2)
             idx_neutral = class_order.index(1)

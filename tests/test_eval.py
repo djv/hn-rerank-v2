@@ -8,9 +8,9 @@ def test_report_exists():
     assert REPORT.exists(), "Run `uv run python eval.py` first."
 
 
-def test_report_has_4_formulas():
+def test_report_has_3_formulas():
     r = json.loads(REPORT.read_text())
-    assert r["formulas"].keys() == {"current", "diff", "up_only", "hn_baseline"}
+    assert r["formulas"].keys() == {"current", "up_only", "hn_baseline"}
 
 
 def test_report_has_5_folds():
@@ -21,5 +21,6 @@ def test_report_has_5_folds():
 
 def test_svm_better_than_random():
     r = json.loads(REPORT.read_text())
-    ndcg = r["formulas"]["up_only"]["mean"]["ndcg_at_10"]
-    assert ndcg > 0.15, f"Best SVM NDCG@10 ({ndcg:.3f}) <= random (~0.15)"
+    up_only = r["formulas"]["up_only"]["mean"]["mmr"]["ndcg_at_10"]
+    hn = r["formulas"]["hn_baseline"]["mean"]["mmr"]["ndcg_at_10"]
+    assert up_only > hn, f"SVM NDCG@10 ({up_only:.3f}) <= HN baseline ({hn:.3f})"
