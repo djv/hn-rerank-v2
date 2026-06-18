@@ -262,11 +262,12 @@ async def fetch_stories_by_id(
         return []
 
     stories = db.get_stories(ids)
+    valid_stories = [s for s in stories if s.text_content != ""]
     found_ids = {s.id for s in stories}
     missing_ids = [sid for sid in ids if sid not in found_ids]
 
     if not missing_ids:
-        return stories
+        return valid_stories
 
     created_client = False
     if client is None:
@@ -285,12 +286,12 @@ async def fetch_stories_by_id(
 
         for s in fetched:
             if s:
-                stories.append(s)
+                valid_stories.append(s)
     finally:
         if created_client:
             await client.aclose()
 
-    return stories
+    return valid_stories
 
 
 async def fetch_candidates(
@@ -747,7 +748,6 @@ def rank_stories(
                 labels = list(feedback_labels) + list(missing)
             else:
                 labels = list(feedback_labels)
-
             # Compute balanced weights for real feedback; 1e-6 for dummies
             counts = Counter(feedback_labels)
             n_classes = len(counts)
