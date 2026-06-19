@@ -20,6 +20,7 @@ class Story:
     source: str = "hn"
     comment_count: int | None = None
     discussion_url: str | None = None
+    comment_count_at_fetch: int = 0
 
 
 @dataclass(frozen=True)
@@ -55,9 +56,16 @@ class Database:
                     source         TEXT NOT NULL DEFAULT 'hn',
                     comment_count  INTEGER,
                     discussion_url TEXT,
-                    fetched_at     REAL NOT NULL
+                    fetched_at     REAL NOT NULL,
+                    comment_count_at_fetch INTEGER NOT NULL DEFAULT 0
                 )
             """)
+            cursor = self.conn.execute("PRAGMA table_info(stories)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if "comment_count_at_fetch" not in columns:
+                self.conn.execute(
+                    "ALTER TABLE stories ADD COLUMN comment_count_at_fetch INTEGER NOT NULL DEFAULT 0"
+                )
             self.conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_stories_time ON stories(time)"
             )
@@ -123,8 +131,9 @@ class Database:
                 """
                 INSERT INTO stories (
                     id, title, url, score, time, text_content, source,
-                    comment_count, discussion_url, fetched_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    comment_count, discussion_url, fetched_at,
+                    comment_count_at_fetch
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     title=excluded.title,
                     url=excluded.url,
@@ -134,7 +143,8 @@ class Database:
                     source=excluded.source,
                     comment_count=excluded.comment_count,
                     discussion_url=excluded.discussion_url,
-                    fetched_at=excluded.fetched_at
+                    fetched_at=excluded.fetched_at,
+                    comment_count_at_fetch=excluded.comment_count_at_fetch
                 """,
                 (
                     story.id,
@@ -147,6 +157,7 @@ class Database:
                     story.comment_count,
                     story.discussion_url,
                     time.time(),
+                    story.comment_count_at_fetch,
                 ),
             )
 
@@ -162,12 +173,14 @@ class Database:
             source=row[6],
             comment_count=row[7],
             discussion_url=row[8],
+            comment_count_at_fetch=row[9],
         )
 
     def get_story(self, story_id: int) -> Story | None:
         cursor = self.conn.execute(
             """
-            SELECT id, title, url, score, time, text_content, source, comment_count, discussion_url
+            SELECT id, title, url, score, time, text_content, source, comment_count, discussion_url,
+                   comment_count_at_fetch
             FROM stories WHERE id = ?
             """,
             (story_id,),
@@ -182,7 +195,8 @@ class Database:
             return []
         placeholders = ",".join("?" for _ in ids)
         query = f"""
-            SELECT id, title, url, score, time, text_content, source, comment_count, discussion_url
+            SELECT id, title, url, score, time, text_content, source, comment_count, discussion_url,
+                   comment_count_at_fetch
             FROM stories WHERE id IN ({placeholders})
         """
         cursor = self.conn.execute(query, ids)

@@ -35,6 +35,12 @@ class ModelConfig:
     diversity_threshold: float = 0.55
 
 
+# Comment text refetch thresholds (used during regen to refresh stale text_content)
+COMMENT_GROWTH_THRESHOLD = 0.30  # 30% growth since last text fetch triggers refetch
+COMMENT_REFETCH_MAX_AGE_HOURS = 24  # Only refetch stories younger than this
+MAX_REFETCH_PER_REGEN = 10  # Bound Algolia cost per regen
+
+
 @dataclass(frozen=True)
 class RssConfig:
     enabled: bool = True
@@ -252,12 +258,97 @@ async def fetch_story(
             if comment_count is not None
             else len(all_comments),
             discussion_url=f"https://news.ycombinator.com/item?id={sid}",
+            comment_count_at_fetch=comment_count
+            if comment_count is not None
+            else len(all_comments),
         )
 
         db.upsert_story(story)
         return story
     except Exception as e:
         logging.error(f"Error fetching story {sid}: {e}")
+        return None
+
+
+async def refetch_story_text(
+    client: httpx.AsyncClient,
+    db: Database,
+    embedder: Embedder,
+    story_id: int,
+    current_count: int,
+) -> Story | None:
+    """Re-fetch comment text from Algolia items API, recompose text_content, re-embed.
+
+    Used during regen when a story's comment_count has grown >= 30% since the last
+    text fetch. Returns the updated Story, or None on failure (caller keeps stale data).
+
+    Safety: caller is responsible for excluding stories with feedback to avoid
+    invalidating the cached embedding for voted stories.
+    """
+    try:
+        resp = await client.get(f"https://hn.algolia.com/api/v1/items/{story_id}")
+        if resp.status_code != 200:
+            logging.warning(
+                f"refetch_story_text({story_id}): algolia status={resp.status_code}, "
+                f"keeping stale text_content"
+            )
+            return None
+
+        item = resp.json()
+        if not item or item.get("type") != "story":
+            logging.warning(
+                f"refetch_story_text({story_id}): algolia returned non-story, "
+                f"keeping stale text_content"
+            )
+            return None
+
+        children = item.get("children", [])
+        all_comments = _extract_comments_recursive(children)
+        all_comments.sort(key=lambda x: x["score"])
+        selected = all_comments[:24]
+        new_comments_text = [c["text"] for c in selected]
+
+        existing = db.get_story(story_id)
+        if existing is None:
+            return None
+
+        story_text = clean_text(str(item.get("story_text") or item.get("text") or ""))
+        new_text_content = compose_story_text(
+            title=item.get("title", "") or existing.title,
+            self_text=story_text,
+            comments=new_comments_text,
+        )
+        if not new_text_content:
+            logging.warning(
+                f"refetch_story_text({story_id}): empty composed text, "
+                f"keeping stale text_content"
+            )
+            return None
+
+        updated = Story(
+            id=story_id,
+            title=html.unescape(item.get("title", "")) or existing.title,
+            url=item.get("url") or existing.url,
+            score=item.get("points") or existing.score,
+            time=item.get("created_at_i") or existing.time,
+            text_content=new_text_content,
+            source="hn",
+            comment_count=item.get("num_comments") or current_count,
+            discussion_url=existing.discussion_url,
+            comment_count_at_fetch=item.get("num_comments") or current_count,
+        )
+        db.upsert_story(updated)
+
+        # Re-embed the new text_content. Force a fresh computation by
+        # overwriting the cached embedding.
+        new_vec = embedder.encode([new_text_content])[0]
+        db.upsert_embedding(story_id, "all-MiniLM-L6-v2|mean|norm|256", new_vec)
+
+        return updated
+    except Exception as e:
+        logging.warning(
+            f"refetch_story_text({story_id}): failed ({e!r}), keeping stale text_content"
+        )
         return None
 
 
@@ -300,11 +391,71 @@ async def fetch_stories_by_id(
     return valid_stories
 
 
+def _is_refetch_eligible(
+    sid: int,
+    comment_count_at_fetch: int,
+    new_comment_count: int | None,
+    story_time: int,
+    feedback_ids: set[int],
+    now_ts: int,
+) -> tuple[bool, int]:
+    """Pure eligibility check for refetch_story_text.
+
+    Returns (eligible, new_comment_count). When new_comment_count is None
+    (algolia search did not include num_comments), the story is not eligible
+    and 0 is returned for the new count.
+    """
+    if new_comment_count is None or new_comment_count <= comment_count_at_fetch:
+        return False, 0
+    if comment_count_at_fetch <= 0:
+        return False, 0
+    growth = (new_comment_count - comment_count_at_fetch) / comment_count_at_fetch
+    if growth < COMMENT_GROWTH_THRESHOLD:
+        return False, 0
+    max_age_seconds = COMMENT_REFETCH_MAX_AGE_HOURS * 3600
+    if (now_ts - story_time) >= max_age_seconds:
+        return False, 0
+    if sid in feedback_ids:
+        return False, 0
+    return True, new_comment_count
+
+
+def _select_refetch_ids(
+    candidates: list[Story],
+    fresh_metadata: dict[int, dict],
+    feedback_ids: set[int],
+    now_ts: int,
+) -> list[int]:
+    """Select up to MAX_REFETCH_PER_REGEN story IDs to refetch, ordered by
+    growth ratio (highest first)."""
+    eligible: list[tuple[float, int, int]] = []
+    for s in candidates:
+        if s.id not in fresh_metadata:
+            continue
+        meta = fresh_metadata[s.id]
+        new_comments = meta.get("comment_count")
+        is_ok, new_count = _is_refetch_eligible(
+            sid=s.id,
+            comment_count_at_fetch=s.comment_count_at_fetch,
+            new_comment_count=new_comments,
+            story_time=s.time,
+            feedback_ids=feedback_ids,
+            now_ts=now_ts,
+        )
+        if is_ok:
+            growth = (new_count - s.comment_count_at_fetch) / s.comment_count_at_fetch
+            eligible.append((growth, s.id, new_count))
+
+    eligible.sort(key=lambda x: x[0], reverse=True)
+    return [sid for _, sid, _ in eligible[:MAX_REFETCH_PER_REGEN]]
+
+
 async def fetch_candidates(
     config: Config,
     exclude_ids: set[int],
     exclude_urls: set[str],
     db: Database,
+    embedder: Embedder | None = None,
 ) -> tuple[list[Story], int]:
     candidate_ids = set()
     fresh_metadata = {}
@@ -315,7 +466,8 @@ async def fetch_candidates(
     # 1. Archive Window from DB
     cursor = db.conn.execute(
         """
-        SELECT id, title, url, score, time, text_content, source, comment_count, discussion_url
+        SELECT id, title, url, score, time, text_content, source, comment_count, discussion_url,
+               comment_count_at_fetch
         FROM stories WHERE source = 'hn' AND time >= ? AND time < ?
         """,
         (cutoff_ts, live_start_ts),
@@ -397,6 +549,32 @@ async def fetch_candidates(
                     updated_s = replace(s, score=new_score, comment_count=new_comments)
                     candidates[i] = updated_s
                     db.upsert_story(updated_s)
+
+        # Detect growth candidates and refetch comment text for top stories.
+        # Triggers refetch when comment_count has grown >= COMMENT_GROWTH_THRESHOLD
+        # since the last text fetch, story is < 24h old, and story has no feedback
+        # (feedback exclusion protects the 1,647-row training contract from
+        # embedding churn).
+        if embedder is not None and candidates:
+            now_ts_local = int(time.time())
+            refetch_ids = _select_refetch_ids(
+                candidates=candidates,
+                fresh_metadata=fresh_metadata,
+                feedback_ids=exclude_ids,
+                now_ts=now_ts_local,
+            )
+            for sid in refetch_ids:
+                try:
+                    updated = await refetch_story_text(
+                        client, db, embedder, sid, fresh_metadata[sid]["comment_count"]
+                    )
+                    if updated is not None:
+                        for i, c in enumerate(candidates):
+                            if c.id == sid:
+                                candidates[i] = updated
+                                break
+                except Exception as e:
+                    logging.warning(f"refetch_story_text({sid}) raised: {e!r}")
 
     # Dedup
     deduped_candidates = []
@@ -1039,7 +1217,7 @@ async def run_pipeline(config: Config) -> None:
 
     exclude_ids = feedback_ids
     candidates, n_fetched = await fetch_candidates(
-        config, exclude_ids, feedback_urls, db
+        config, exclude_ids, feedback_urls, db, embedder
     )
     logging.info(f"Fetched {n_fetched} candidates (excluded {len(exclude_ids)})")
 

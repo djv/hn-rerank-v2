@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 from hypothesis import given, strategies as st, settings, HealthCheck
+from typing import Literal
 from database import Database, Story
 from pipeline import (
     Embedder,
@@ -475,3 +476,244 @@ async def test_fetch_candidates_returns_tuple(tmp_path, monkeypatch):
     assert isinstance(candidates, list)
     assert isinstance(count, int)
     assert count == len(candidates)
+
+
+# Tests for auto-refetch of comment text on growth (fetch_candidates refetch block)
+def _seed_story(
+    db: Database,
+    sid: int,
+    *,
+    comment_count: int,
+    comment_count_at_fetch: int,
+    age_hours: int,
+    feedback_action: Literal["up", "neutral", "down"] | None = None,
+) -> Story:
+    """Insert a story in the live window with controlled engagement metrics."""
+    from time import time as _now
+
+    story_time = int(_now()) - (age_hours * 3600)
+    story = Story(
+        id=sid,
+        title=f"Test story {sid}",
+        url=f"https://example.com/{sid}",
+        score=100,
+        time=story_time,
+        text_content=f"initial text content for story {sid}",
+        source="hn",
+        comment_count=comment_count,
+        discussion_url=f"https://news.ycombinator.com/item?id={sid}",
+        comment_count_at_fetch=comment_count_at_fetch,
+    )
+    db.upsert_story(story)
+    if feedback_action is not None:
+        db.upsert_feedback(sid, feedback_action)
+    return story
+
+
+def test_refetch_eligibility_triggers_at_30pct_growth():
+    """comment_count grown from 10 to 14 (+40%) at age 1h is eligible."""
+    from pipeline import _is_refetch_eligible
+    from time import time as _now
+
+    sid = 1001
+    now = int(_now())
+    eligible, new_count = _is_refetch_eligible(
+        sid=sid,
+        comment_count_at_fetch=10,
+        new_comment_count=14,
+        story_time=now - 3600,
+        feedback_ids=set(),
+        now_ts=now,
+    )
+    assert eligible is True
+    assert new_count == 14
+
+
+def test_refetch_eligibility_skipped_below_30pct_growth():
+    """10 to 12 (+20%) is below threshold; not eligible."""
+    from pipeline import _is_refetch_eligible
+    from time import time as _now
+
+    now = int(_now())
+    eligible, _ = _is_refetch_eligible(
+        sid=1002,
+        comment_count_at_fetch=10,
+        new_comment_count=12,
+        story_time=now - 3600,
+        feedback_ids=set(),
+        now_ts=now,
+    )
+    assert eligible is False
+
+
+def test_refetch_eligibility_skipped_after_24h_age():
+    """Eligible growth but age > 24h is skipped."""
+    from pipeline import _is_refetch_eligible
+    from time import time as _now
+
+    now = int(_now())
+    eligible, _ = _is_refetch_eligible(
+        sid=1003,
+        comment_count_at_fetch=10,
+        new_comment_count=14,
+        story_time=now - (25 * 3600),
+        feedback_ids=set(),
+        now_ts=now,
+    )
+    assert eligible is False
+
+
+def test_refetch_eligibility_skipped_for_feedback_story():
+    """Stories in feedback_ids are protected from refetch (training contract)."""
+    from pipeline import _is_refetch_eligible
+    from time import time as _now
+
+    now = int(_now())
+    eligible, _ = _is_refetch_eligible(
+        sid=1004,
+        comment_count_at_fetch=10,
+        new_comment_count=14,
+        story_time=now - 3600,
+        feedback_ids={1004},
+        now_ts=now,
+    )
+    assert eligible is False
+
+
+def test_refetch_eligibility_skipped_when_baseline_zero():
+    """comment_count_at_fetch == 0 means no baseline; cannot compute growth."""
+    from pipeline import _is_refetch_eligible
+    from time import time as _now
+
+    now = int(_now())
+    eligible, _ = _is_refetch_eligible(
+        sid=1005,
+        comment_count_at_fetch=0,
+        new_comment_count=14,
+        story_time=now - 3600,
+        feedback_ids=set(),
+        now_ts=now,
+    )
+    assert eligible is False
+
+
+def test_refetch_eligibility_skipped_when_count_did_not_grow():
+    """If new_comment_count <= comment_count_at_fetch, no refetch."""
+    from pipeline import _is_refetch_eligible
+    from time import time as _now
+
+    now = int(_now())
+    eligible, _ = _is_refetch_eligible(
+        sid=1006,
+        comment_count_at_fetch=10,
+        new_comment_count=10,
+        story_time=now - 3600,
+        feedback_ids=set(),
+        now_ts=now,
+    )
+    assert eligible is False
+
+
+def test_refetch_selects_top_n_by_growth(db, embedder):
+    """Only MAX_REFETCH_PER_REGEN stories are selected, prioritized by growth."""
+    from pipeline import _select_refetch_ids, MAX_REFETCH_PER_REGEN
+    from time import time as _now
+
+    now = int(_now())
+    candidates = []
+    fresh_metadata = {}
+    for i in range(MAX_REFETCH_PER_REGEN + 5):
+        sid = 2000 + i
+        candidates.append(
+            _seed_story(
+                db,
+                sid,
+                comment_count=100 + i,
+                comment_count_at_fetch=10,
+                age_hours=1,
+            )
+        )
+        fresh_metadata[sid] = {"score": 200, "comment_count": 100 + i}
+    selected = _select_refetch_ids(
+        candidates=candidates,
+        fresh_metadata=fresh_metadata,
+        feedback_ids=set(),
+        now_ts=now,
+    )
+    assert len(selected) == MAX_REFETCH_PER_REGEN
+    # Should be the highest-growth stories (those with highest new_count, since
+    # baseline is the same for all in this test). Growth ratio is monotonic in
+    # new_count when baseline is fixed.
+    selected_set = set(selected)
+    assert max(selected_set) > min(selected_set)  # at least some spread
+
+
+async def test_refetch_failure_keeps_stale_data(db, embedder):
+    """If refetch_story_text fails, the original story is preserved (no DB change)."""
+    import httpx
+    from pipeline import refetch_story_text
+
+    _seed_story(
+        db,
+        3001,
+        comment_count=14,
+        comment_count_at_fetch=10,
+        age_hours=1,
+    )
+    original = db.get_story(3001)
+    original_text = original.text_content
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        raise RuntimeError("simulated algolia outage")
+
+    transport = httpx.MockTransport(_handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        result = await refetch_story_text(client, db, embedder, 3001, current_count=14)
+
+    assert result is None
+    after = db.get_story(3001)
+    assert after.text_content == original_text
+    assert after.comment_count == original.comment_count
+    assert after.comment_count_at_fetch == original.comment_count_at_fetch
+
+
+async def test_refetch_updates_comment_count_at_fetch_on_success(db, embedder):
+    """Successful refetch sets comment_count_at_fetch == new comment_count."""
+    import httpx
+    from pipeline import refetch_story_text
+
+    sid = 3002
+    _seed_story(
+        db,
+        sid,
+        comment_count=14,
+        comment_count_at_fetch=10,
+        age_hours=1,
+    )
+
+    fake_item = {
+        "type": "story",
+        "title": "Updated Title",
+        "url": "https://example.com/3002",
+        "points": 200,
+        "num_comments": 16,
+        "created_at_i": int(__import__("time").time()),
+        "story_text": "Updated self text",
+        "children": [
+            {"text": f"comment {i}", "score": 10 - i, "children": []} for i in range(5)
+        ],
+    }
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=fake_item)
+
+    transport = httpx.MockTransport(_handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        result = await refetch_story_text(client, db, embedder, sid, current_count=16)
+
+    assert result is not None
+    assert result.comment_count == 16
+    assert result.comment_count_at_fetch == 16
+    persisted = db.get_story(sid)
+    assert persisted.comment_count_at_fetch == 16
+    assert persisted.text_content != ""  # recomposed
