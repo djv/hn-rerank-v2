@@ -32,7 +32,7 @@ class ModelConfig:
     svm_c: float = 0.3
     svm_gamma: float | str = 0.1
     svm_kernel: str = "rbf"
-    diversity_threshold: float = 0.55
+    diversity_threshold: float = 0.50
 
 
 # Comment text refetch thresholds (used during regen to refresh stale text_content)
@@ -86,7 +86,7 @@ class Config:
                 svm_c=model_cfg.get("svm_c", 0.3),
                 svm_gamma=model_cfg.get("svm_gamma", 0.1),
                 svm_kernel=model_cfg.get("svm_kernel", "rbf"),
-                diversity_threshold=model_cfg.get("diversity_threshold", 0.55),
+                diversity_threshold=model_cfg.get("diversity_threshold", 0.50),
             ),
             rss=RssConfig(
                 enabled=rss_cfg.get("enabled", True),
@@ -1035,7 +1035,7 @@ def rank_stories(
             class_order = list(svm.classes_)
             idx_up = class_order.index(2)
             idx_neutral = class_order.index(1)
-            scores = probs[:, idx_up] + 0.5 * probs[:, idx_neutral]
+            scores = probs[:, idx_up]
         except Exception as e:
             logging.error(f"Failed to fit feedback SVM: {e}")
 
@@ -1207,9 +1207,7 @@ async def run_pipeline(config: Config) -> None:
     )
 
     selected_ids = {item.story.id for item in final}
-    remaining = [
-        r for r in ranked if r.story.id not in selected_ids
-    ]
+    remaining = [r for r in ranked if r.story.id not in selected_ids]
 
     # Calculate parameters for remaining discovery passes
     feedback_stories, feedback_labels, _ = db.get_feedback_for_training()
@@ -1254,7 +1252,9 @@ async def run_pipeline(config: Config) -> None:
         uncertain_ids = set()
 
     # Assign badges to remaining candidates
-    discussion_threshold = np.percentile(cand_comment_counts, 90) if len(cand_comment_counts) else 0
+    discussion_threshold = (
+        np.percentile(cand_comment_counts, 90) if len(cand_comment_counts) else 0
+    )
     engagement_threshold = np.percentile(cand_scores, 90) if len(cand_scores) else 0
 
     remaining_decorated = []
@@ -1262,16 +1262,12 @@ async def run_pipeline(config: Config) -> None:
         idx = story_id_to_idx[r.story.id]
         is_uncertain = r.story.id in uncertain_ids
         is_novel = bool(cand_max_sim[idx] <= sim_threshold and r.score > 0.5)
-        is_similar = bool(
-            cand_closest_up[idx] > 0.55
-        )
+        is_similar = bool(cand_closest_up[idx] > 0.55)
         is_discussion_rich = bool(
             cand_comment_counts[idx] >= discussion_threshold
             and cand_comment_counts[idx] > 0
         )
-        is_high_engagement = bool(
-            cand_scores[idx] >= engagement_threshold
-        )
+        is_high_engagement = bool(cand_scores[idx] >= engagement_threshold)
         remaining_decorated.append(
             replace(
                 r,
@@ -1287,7 +1283,9 @@ async def run_pipeline(config: Config) -> None:
     uncertain_items = [r for r in remaining_decorated if r.is_uncertain]
     final.extend(uncertain_items)
     selected_ids |= {item.story.id for item in uncertain_items}
-    remaining_decorated = [r for r in remaining_decorated if r.story.id not in selected_ids]
+    remaining_decorated = [
+        r for r in remaining_decorated if r.story.id not in selected_ids
+    ]
 
     # 2. Surface up to 5 novel stories
     novel_pool = [r for r in remaining_decorated if r.is_novel]
@@ -1295,15 +1293,21 @@ async def run_pipeline(config: Config) -> None:
     novel_items = novel_pool[:5]
     final.extend(novel_items)
     selected_ids |= {item.story.id for item in novel_items}
-    remaining_decorated = [r for r in remaining_decorated if r.story.id not in selected_ids]
+    remaining_decorated = [
+        r for r in remaining_decorated if r.story.id not in selected_ids
+    ]
 
     # 3. Surface up to 5 most similar stories
     similar_pool = [r for r in remaining_decorated if r.is_similar]
-    similar_pool.sort(key=lambda r: cand_closest_up[story_id_to_idx[r.story.id]], reverse=True)
+    similar_pool.sort(
+        key=lambda r: cand_closest_up[story_id_to_idx[r.story.id]], reverse=True
+    )
     similar_items = similar_pool[:5]
     final.extend(similar_items)
     selected_ids |= {item.story.id for item in similar_items}
-    remaining_decorated = [r for r in remaining_decorated if r.story.id not in selected_ids]
+    remaining_decorated = [
+        r for r in remaining_decorated if r.story.id not in selected_ids
+    ]
 
     # 4. Surface up to 5 discussion-rich stories
     discussion_pool = [r for r in remaining_decorated if r.is_discussion_rich]
@@ -1311,7 +1315,9 @@ async def run_pipeline(config: Config) -> None:
     discussion_items = discussion_pool[:5]
     final.extend(discussion_items)
     selected_ids |= {item.story.id for item in discussion_items}
-    remaining_decorated = [r for r in remaining_decorated if r.story.id not in selected_ids]
+    remaining_decorated = [
+        r for r in remaining_decorated if r.story.id not in selected_ids
+    ]
 
     # 5. Surface up to 5 high-engagement stories
     engagement_pool = [r for r in remaining_decorated if r.is_high_engagement]

@@ -14,7 +14,7 @@ svm_gamma = 0.1
 svm_kernel = "rbf"
 min_feedback_labels = 10
 min_signal_examples = 5
-diversity_threshold = 0.55
+diversity_threshold = 0.50
 
 
 [hn_rewrite.rss]
