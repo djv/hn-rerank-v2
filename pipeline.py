@@ -1067,8 +1067,8 @@ async def run_pipeline(config: Config) -> None:
     top_score = max((r.score for r in ranked), default=0.0)
     logging.info(f"Ranked {len(ranked)} stories, top_score={top_score:.3f}")
 
-    num_uncertain = 2 if config.count >= 10 else 0
-    limit = max(1, config.count - num_uncertain)
+    num_uncertain = 5 if config.count >= 10 else 0
+    limit = config.count
     final = mmr_filter(
         ranked,
         embeddings_map,
