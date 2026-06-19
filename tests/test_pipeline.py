@@ -310,12 +310,11 @@ def test_augment_features_properties(meta):
 
     features = _augment_features(embeddings, scores, ages)
 
-    assert features.shape == (n, 386)
+    assert features.shape == (n, 385)
     assert np.allclose(features[:, :384], embeddings)
     assert np.all(features[:, 384] >= 0.0) and np.all(features[:, 384] <= 1.0)
-    assert np.all(features[:, 385] >= 0.0) and np.all(features[:, 385] <= 1.0)
 
-    # When all 7 derived features are provided, shape expands to (n, 393)
+    # When all 7 derived features are provided, shape expands to (n, 392)
     comment_counts = np.array([max(s, 0) for s in scores])
     text_lengths = np.array([abs(a) % 10000 for a in ages])
     hn_quality = comment_counts.astype(np.float32) / (np.abs(ages) + 1)
@@ -336,7 +335,7 @@ def test_augment_features_properties(meta):
         closest_upvoted=closest_up,
         closest_downvoted=closest_down,
     )
-    assert features7.shape == (n, 393)
+    assert features7.shape == (n, 392)
     assert np.allclose(features7[:, :384], embeddings)
     # All normalized cols in [0, 1]
     assert np.all(features7[:, 384:] >= 0.0) and np.all(features7[:, 384:] <= 1.0)

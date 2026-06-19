@@ -585,7 +585,7 @@ def _augment_features(
     closest_downvoted: np.ndarray | None = None,
 ) -> NDArray[np.float32]:
     n = len(scores)
-    n_meta = 2
+    n_meta = 1
     for f in (comment_counts, text_lengths, hn_quality):
         if f is not None:
             n_meta += 1
@@ -600,11 +600,6 @@ def _augment_features(
         np.clip(np.log1p(np.maximum(scores, 0)), 0, _LOG_POINTS_SCALE)
         / _LOG_POINTS_SCALE
     )
-    col += 1
-
-    # age days
-    age_days = np.maximum(age_seconds, 0) / 86400.0
-    meta[:, col] = np.clip(age_days, 0, _AGE_DAYS_SCALE) / _AGE_DAYS_SCALE
     col += 1
 
     if comment_counts is not None:
