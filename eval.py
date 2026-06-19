@@ -414,7 +414,7 @@ def main() -> None:
     REPORT_PATH.write_text(json.dumps(report, indent=2))
     print(f"\nWritten {REPORT_PATH}")
 
-    for metric in ("ndcg_at_10", "hit_at_40", "mrr", "median_rank"):
+    for metric in ("ndcg_at_10", "hit_at_40", "median_rank"):
         print(f"\n{metric} by formula (mean ± std):")
         for f, data in report["formulas"].items():  # type: ignore[union-attr]
             for variant in ("mmr", "raw"):
