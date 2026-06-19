@@ -116,6 +116,99 @@
       color: #f8f9fa;
     }
 
+    .prob-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.05rem 0.4rem;
+      border-radius: 3px;
+      background: var(--pico-card-background-color);
+      border: 1px solid var(--pico-muted-border-color);
+      font-size: 0.7rem;
+      height: 1.1rem;
+      line-height: 1;
+    }
+
+    .prob-mini-bar {
+      display: inline-flex;
+      width: 32px;
+      height: 6px;
+      border-radius: 3px;
+      overflow: hidden;
+      background: var(--pico-muted-border-color);
+    }
+
+    .mini-segment {
+      height: 100%;
+    }
+
+    .mini-segment.down {
+      background: hsl(355, 75%, 55%); /* Soft Crimson */
+    }
+
+    .mini-segment.neutral {
+      background: hsl(40, 60%, 65%);  /* Soft Gold */
+    }
+
+    .mini-segment.up {
+      background: hsl(160, 60%, 45%);   /* Soft Teal */
+    }
+
+    .prob-mini-text {
+      font-weight: 600;
+      color: var(--pico-muted-color);
+      font-size: 0.65rem;
+      letter-spacing: 0.02em;
+    }
+
+    .uncertain-badge {
+      display: inline-block;
+      padding: 0.05rem 0.35rem;
+      border-radius: 3px;
+      font-weight: 600;
+      font-size: 0.7rem;
+      background: hsl(280, 50%, 25%); /* Deep plum/purple for uncertainty */
+      color: hsl(280, 80%, 90%);
+      border: 1px solid hsl(280, 50%, 35%);
+      line-height: 1.2;
+    }
+
+    .novel-badge {
+      display: inline-block;
+      padding: 0.05rem 0.35rem;
+      border-radius: 3px;
+      font-weight: 600;
+      font-size: 0.7rem;
+      background: hsl(170, 50%, 25%); /* Deep teal for novelty */
+      color: hsl(170, 80%, 90%);
+      border: 1px solid hsl(170, 50%, 35%);
+      line-height: 1.2;
+    }
+
+    .discussion-rich-badge {
+      display: inline-block;
+      padding: 0.05rem 0.35rem;
+      border-radius: 3px;
+      font-weight: 600;
+      font-size: 0.7rem;
+      background: hsl(35, 60%, 25%);
+      color: hsl(35, 80%, 90%);
+      border: 1px solid hsl(35, 60%, 35%);
+      line-height: 1.2;
+    }
+
+    .high-engagement-badge {
+      display: inline-block;
+      padding: 0.05rem 0.35rem;
+      border-radius: 3px;
+      font-weight: 600;
+      font-size: 0.7rem;
+      background: hsl(15, 60%, 25%);
+      color: hsl(15, 80%, 90%);
+      border: 1px solid hsl(15, 60%, 35%);
+      line-height: 1.2;
+    }
+
     .story-title {
       font-size: 1.05rem;
       margin-bottom: 0.2rem;
@@ -238,6 +331,30 @@
                data-source="{{ item.story.source }}">
         <div class="story-header">
           <span class="score-badge">{{ (item.score * 100) | int }}%</span>
+          
+          {% if item.prob_down is not none %}
+          <div class="prob-badge" title="Down: {{ (item.prob_down * 100) | round(1) }}% | Neutral: {{ (item.prob_neutral * 100) | round(1) }}% | Up: {{ (item.prob_up * 100) | round(1) }}%">
+            <span class="prob-mini-bar">
+              <span class="mini-segment down" style="width: {{ item.prob_down * 100 }}%"></span>
+              <span class="mini-segment neutral" style="width: {{ item.prob_neutral * 100 }}%"></span>
+              <span class="mini-segment up" style="width: {{ item.prob_up * 100 }}%"></span>
+            </span>
+            <span class="prob-mini-text">▼{{ (item.prob_down * 100) | int }}% · ●{{ (item.prob_neutral * 100) | int }}% · ▲{{ (item.prob_up * 100) | int }}%</span>
+          </div>
+          {% endif %}
+          
+          {% if item.is_uncertain %}
+          <span class="uncertain-badge" title="Model is highly uncertain about this story (high entropy distribution)">🤔 Unsure</span>
+          {% endif %}
+          {% if item.is_novel %}
+          <span class="novel-badge" title="Semantically distant from all your feedback, but model scores it high">✨ Novel</span>
+          {% endif %}
+          {% if item.is_discussion_rich %}
+          <span class="discussion-rich-badge" title="Many comments on this story (top 10%)">💬 Talk-worthy</span>
+          {% endif %}
+          {% if item.is_high_engagement %}
+          <span class="high-engagement-badge" title="Crowd favorite (top 10% by HN points)">🔥 Trending</span>
+          {% endif %}
           
           {% if item.story.source != "hn" %}
           <span class="source-badge">{{ item.story.source }}</span>

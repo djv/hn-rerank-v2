@@ -344,7 +344,8 @@ class Database:
         cursor = self.conn.execute(
             """
             SELECT f.story_id, f.action, s.title, s.url, s.text_content, s.source,
-                   f.updated_at, COALESCE(s.score, 0), COALESCE(s.time, 0)
+                   f.updated_at, COALESCE(s.score, 0), COALESCE(s.time, 0),
+                   COALESCE(s.comment_count, 0)
             FROM feedback f
             LEFT JOIN stories s ON s.id = f.story_id
             """
@@ -363,6 +364,7 @@ class Database:
             updated_at,
             score,
             story_time,
+            comment_count,
         ) in cursor.fetchall():
             if action not in action_to_label:
                 continue
@@ -375,6 +377,7 @@ class Database:
                     time=story_time,
                     text_content=text_content or "",
                     source=source or "hn",
+                    comment_count=comment_count,
                 )
             )
             labels.append(action_to_label[action])

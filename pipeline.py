@@ -95,6 +95,13 @@ class RankedStory:
     story: Story
     score: float
     best_match_title: str
+    prob_down: float | None = None
+    prob_neutral: float | None = None
+    prob_up: float | None = None
+    is_uncertain: bool = False
+    is_novel: bool = False
+    is_discussion_rich: bool = False
+    is_high_engagement: bool = False
 
 
 # Text processing helpers
@@ -678,7 +685,21 @@ def rank_stories(
 
     now = time.time()
     scores = None
+    probs = None
     feedback_stories, feedback_labels, vote_times = db.get_feedback_for_training()
+
+    # Surface flag thresholds — computed once, independent of feedback fitting.
+    # These stay defined if the SVM `try` below fails, so the fallback path
+    # can still set is_discussion_rich / is_high_engagement.
+    cand_scores = np.array([s.score for s in candidates])
+    cand_ages = np.array([now - s.time for s in candidates])
+    cand_comment_counts = np.array([s.comment_count or 0 for s in candidates])
+    discussion_rich_count_threshold = (
+        np.percentile(cand_comment_counts, 90) if len(cand_comment_counts) else 0
+    )
+    high_engagement_score_threshold = (
+        np.percentile(cand_scores, 90) if len(cand_scores) else 0
+    )
 
     # Multiclass SVM: 0=down, 1=neutral, 2=up
     if len(feedback_labels) >= 1:
@@ -703,18 +724,43 @@ def rank_stories(
                 else np.zeros(384, dtype=np.float32)
             )
 
+            n_up = int(up_mask.sum())
             fb_sim_to_up = fb_embeddings @ mean_up
+            if n_up > 0:
+                if n_up > 1:
+                    fb_sim_to_up[up_mask] = (n_up * fb_sim_to_up[up_mask] - 1.0) / (
+                        n_up - 1
+                    )
+                else:
+                    fb_sim_to_up[up_mask] = 0.0
+
+                sim_up_mat = fb_embeddings @ fb_up_embs.T
+                if n_up > 1:
+                    train_up_positions = np.where(up_mask)[0]
+                    for idx, tp in enumerate(train_up_positions):
+                        sim_up_mat[tp, idx] = -1.0
+                fb_closest_up = np.max(sim_up_mat, axis=1)
+            else:
+                fb_closest_up = np.zeros(len(fb_embeddings), dtype=np.float32)
+
+            n_down = int(down_mask.sum())
             fb_sim_to_down = fb_embeddings @ mean_down
-            fb_closest_up = (
-                np.max(fb_embeddings @ fb_up_embs.T, axis=1)
-                if up_mask.any()
-                else np.zeros(len(fb_embeddings))
-            )
-            fb_closest_down = (
-                np.max(fb_embeddings @ fb_down_embs.T, axis=1)
-                if down_mask.any()
-                else np.zeros(len(fb_embeddings))
-            )
+            if n_down > 0:
+                if n_down > 1:
+                    fb_sim_to_down[down_mask] = (
+                        n_down * fb_sim_to_down[down_mask] - 1.0
+                    ) / (n_down - 1)
+                else:
+                    fb_sim_to_down[down_mask] = 0.0
+
+                sim_down_mat = fb_embeddings @ fb_down_embs.T
+                if n_down > 1:
+                    train_down_positions = np.where(down_mask)[0]
+                    for idx, tp in enumerate(train_down_positions):
+                        sim_down_mat[tp, idx] = -1.0
+                fb_closest_down = np.max(sim_down_mat, axis=1)
+            else:
+                fb_closest_down = np.zeros(len(fb_embeddings), dtype=np.float32)
 
             cand_sim_to_up = candidate_embeddings @ mean_up
             cand_sim_to_down = candidate_embeddings @ mean_down
@@ -796,9 +842,8 @@ def rank_stories(
             svm.fit(fb_features_scaled, labels, sample_weight=sample_weights)
 
             # Augment candidate features: age_now = now - story_time
-            cand_scores = np.array([s.score for s in candidates])
-            cand_ages = np.array([now - s.time for s in candidates])
-            cand_comment_counts = np.array([s.comment_count or 0 for s in candidates])
+            # (cand_scores, cand_ages, cand_comment_counts hoisted above to
+            #  keep surface flag thresholds defined if this try block fails.)
             cand_text_lengths = np.array([len(s.text_content) for s in candidates])
             cand_quality = cand_scores / (np.maximum(cand_ages / 3600.0, 0) + 1)
 
@@ -824,6 +869,9 @@ def rank_stories(
             idx_up = class_order.index(2)
             idx_neutral = class_order.index(1)
             scores = probs[:, idx_up] + 0.5 * probs[:, idx_neutral]
+            cand_max_sim = np.maximum(cand_closest_up, cand_closest_down)
+            sim_threshold = np.percentile(cand_max_sim, 15)
+            cand_is_novel = (cand_max_sim <= sim_threshold) & (scores > 0.5)
         except Exception as e:
             logging.error(f"Failed to fit feedback SVM: {e}")
 
@@ -831,8 +879,45 @@ def rank_stories(
         scores = np.full(len(candidates), 0.5, dtype=np.float32)
 
     ranked = []
-    for s, score in zip(candidates, scores):
-        ranked.append(RankedStory(story=s, score=float(score), best_match_title=""))
+    if probs is not None:
+        try:
+            idx_down = class_order.index(0)
+            idx_neutral = class_order.index(1)
+            idx_up = class_order.index(2)
+            for idx, (s, score) in enumerate(zip(candidates, scores)):
+                ranked.append(
+                    RankedStory(
+                        story=s,
+                        score=float(score),
+                        best_match_title="",
+                        prob_down=float(probs[idx, idx_down]),
+                        prob_neutral=float(probs[idx, idx_neutral]),
+                        prob_up=float(probs[idx, idx_up]),
+                        is_novel=bool(cand_is_novel[idx]),
+                        is_discussion_rich=(s.comment_count or 0)
+                        >= discussion_rich_count_threshold
+                        and (s.comment_count or 0) > 0,
+                        is_high_engagement=int(s.score)
+                        >= high_engagement_score_threshold,
+                    )
+                )
+        except (ValueError, IndexError, NameError) as e:
+            logging.error(f"Error mapping probability class indices: {e}")
+            ranked = []
+
+    if not ranked:
+        for s, score in zip(candidates, scores):
+            ranked.append(
+                RankedStory(
+                    story=s,
+                    score=float(score),
+                    best_match_title="",
+                    is_discussion_rich=(s.comment_count or 0)
+                    >= discussion_rich_count_threshold
+                    and (s.comment_count or 0) > 0,
+                    is_high_engagement=int(s.score) >= high_engagement_score_threshold,
+                )
+            )
 
     if len(feedback_labels) == 0:
         return sorted(ranked, key=lambda x: x.story.score, reverse=True)
@@ -981,15 +1066,18 @@ async def run_pipeline(config: Config) -> None:
     feedback_ids = {f.story_id for f in feedback_records}
     feedback_urls = {f.url for f in feedback_records if f.url}
 
-    logging.info("Fetching candidates...")
     exclude_ids = signal_ids | feedback_ids
-    candidates = await fetch_candidates(config, exclude_ids, feedback_urls, db)
+    candidates, n_fetched = await fetch_candidates(
+        config, exclude_ids, feedback_urls, db
+    )
+    logging.info(f"Fetched {n_fetched} candidates (excluded {len(exclude_ids)})")
 
-    logging.info("Computing embeddings for candidates...")
+    t0 = time.perf_counter()
     cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
+    elapsed_ms = int((time.perf_counter() - t0) * 1000)
     embeddings_map = {s.id: vec for s, vec in zip(candidates, cand_embeddings)}
+    logging.info(f"Embedded {cand_embeddings.shape[0]} candidates in {elapsed_ms}ms")
 
-    logging.info("Ranking candidates...")
     ranked = rank_stories(
         candidates,
         cand_embeddings,
@@ -997,16 +1085,79 @@ async def run_pipeline(config: Config) -> None:
         config,
         embedder,
     )
+    top_score = max((r.score for r in ranked), default=0.0)
+    logging.info(f"Ranked {len(ranked)} stories, top_score={top_score:.3f}")
 
-    logging.info("Filtering with MMR...")
+    num_uncertain = 2 if config.count >= 10 else 0
+    limit = max(1, config.count - num_uncertain)
     final = mmr_filter(
         ranked,
         embeddings_map,
         threshold=config.model.diversity_threshold,
-        limit=config.count,
+        limit=limit,
     )
 
-    logging.info("Generating dashboard...")
+    selected_ids = {item.story.id for item in final}
+    remaining = [
+        r for r in ranked if r.story.id not in selected_ids and r.prob_down is not None
+    ]
+    if remaining and num_uncertain > 0:
+
+        def get_entropy(r: RankedStory) -> float:
+            ent = 0.0
+            for p in (r.prob_down, r.prob_neutral, r.prob_up):
+                if p is not None and p > 1e-9:
+                    ent -= p * np.log2(p)
+            return ent
+
+        remaining.sort(key=get_entropy, reverse=True)
+        high_entropy_items = [
+            replace(item, is_uncertain=True) for item in remaining[:num_uncertain]
+        ]
+        final.extend(high_entropy_items)
+        selected_ids |= {item.story.id for item in high_entropy_items}
+
+    # Surface up to 5 novel stories on top of the normal count
+    novel_pool = [r for r in ranked if r.story.id not in selected_ids and r.is_novel]
+    if novel_pool:
+        novel_pool.sort(key=lambda r: r.score, reverse=True)
+        novel_items = [replace(item, is_novel=True) for item in novel_pool[:5]]
+        final.extend(novel_items)
+        selected_ids |= {item.story.id for item in novel_items}
+
+    # Surface up to 5 discussion-rich stories on top of the normal count
+    discussion_pool = [
+        r for r in ranked if r.story.id not in selected_ids and r.is_discussion_rich
+    ]
+    if discussion_pool:
+        discussion_pool.sort(key=lambda r: r.story.comment_count or 0, reverse=True)
+        discussion_items = [
+            replace(item, is_discussion_rich=True) for item in discussion_pool[:5]
+        ]
+        final.extend(discussion_items)
+        selected_ids |= {item.story.id for item in discussion_items}
+
+    # Surface up to 5 high-engagement stories on top of the normal count
+    engagement_pool = [
+        r for r in ranked if r.story.id not in selected_ids and r.is_high_engagement
+    ]
+    if engagement_pool:
+        engagement_pool.sort(key=lambda r: r.story.score, reverse=True)
+        engagement_items = [
+            replace(item, is_high_engagement=True) for item in engagement_pool[:5]
+        ]
+        final.extend(engagement_items)
+        selected_ids |= {item.story.id for item in engagement_items}
+
+    final.sort(key=lambda r: r.score, reverse=True)
+
+    logging.info(f"Filtering with MMR: {len(final)} of {len(ranked)} stories kept")
+    pu_vals = [r.prob_up for r in final if r.prob_up is not None]
+    pu_lo = min(pu_vals) if pu_vals else 0.0
+    pu_hi = max(pu_vals) if pu_vals else 0.0
+    logging.info(
+        f"Generating dashboard: {len(final)} stories, prob_up range {pu_lo:.3f}–{pu_hi:.3f}"
+    )
     generate_dashboard(
         final,
         Path(config.output),
@@ -1016,7 +1167,7 @@ async def run_pipeline(config: Config) -> None:
         db,
     )
 
-    logging.info("Pruning old stories from DB...")
-    db.prune_stories(max_age_days=config.days * 2)
+    pruned = db.prune_stories(max_age_days=config.days * 2)
+    logging.info(f"Pruned {pruned} old stories")
     db.close()
     logging.info("Done.")
