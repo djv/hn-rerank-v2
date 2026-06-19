@@ -8,7 +8,7 @@ import re
 import time
 import tomllib
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -20,7 +20,6 @@ import onnxruntime as ort
 from bs4 import BeautifulSoup
 from jinja2 import Environment, FileSystemLoader
 from numpy.typing import NDArray
-from sklearn.calibration import CalibratedClassifierCV
 from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
 
@@ -299,8 +298,9 @@ async def fetch_candidates(
     exclude_ids: set[int],
     exclude_urls: set[str],
     db: Database,
-) -> list[Story]:
+) -> tuple[list[Story], int]:
     candidate_ids = set()
+    fresh_metadata = {}
     now_ts = int(time.time())
     cutoff_ts = now_ts - (config.days * 86400)
     live_start_ts = now_ts - (7 * 86400)
@@ -328,7 +328,7 @@ async def fetch_candidates(
                 f"created_at_i<{end_ts}",
             ]
             page = 0
-            target_hits = 150
+            target_hits = 350
             day_ids = []
 
             while len(day_ids) < target_hits:
@@ -354,6 +354,10 @@ async def fetch_candidates(
                         if points <= 5:
                             continue
                         day_ids.append(oid)
+                        fresh_metadata[oid] = {
+                            "score": points,
+                            "comment_count": h.get("num_comments"),
+                        }
                     page += 1
                     if len(hits) < 100:
                         break
@@ -365,6 +369,27 @@ async def fetch_candidates(
                     candidate_ids.add(oid)
 
         candidates = await fetch_stories_by_id(list(candidate_ids), db, client)
+
+        # Refresh points and comment counts for HN candidates using Algolia search response data
+        for i, s in enumerate(candidates):
+            if s.id in fresh_metadata:
+                meta = fresh_metadata[s.id]
+                has_changes = False
+                new_score = s.score
+                new_comments = s.comment_count
+                if s.score != meta["score"]:
+                    new_score = meta["score"]
+                    has_changes = True
+                if (
+                    meta["comment_count"] is not None
+                    and s.comment_count != meta["comment_count"]
+                ):
+                    new_comments = meta["comment_count"]
+                    has_changes = True
+                if has_changes:
+                    updated_s = replace(s, score=new_score, comment_count=new_comments)
+                    candidates[i] = updated_s
+                    db.upsert_story(updated_s)
 
     # Dedup
     deduped_candidates = []
@@ -387,7 +412,7 @@ async def fetch_candidates(
         )
         deduped_candidates.extend(rss_stories)
 
-    return deduped_candidates
+    return deduped_candidates, len(deduped_candidates)
 
 
 # RSS Fetching
@@ -756,7 +781,9 @@ def rank_stories(
             scaler = StandardScaler()
             fb_features_meta_scaled = scaler.fit_transform(fb_features[:, emb_dim:])
 
-            fb_features_scaled = np.hstack([fb_features[:, :emb_dim], fb_features_meta_scaled])
+            fb_features_scaled = np.hstack(
+                [fb_features[:, :emb_dim], fb_features_meta_scaled]
+            )
 
             svm = SVC(
                 C=config.model.svm_c,
@@ -788,7 +815,9 @@ def rank_stories(
                 closest_downvoted=cand_closest_down,
             )
             cand_features_meta_scaled = scaler.transform(cand_features[:, emb_dim:])
-            cand_features_scaled = np.hstack([cand_features[:, :emb_dim], cand_features_meta_scaled])
+            cand_features_scaled = np.hstack(
+                [cand_features[:, :emb_dim], cand_features_meta_scaled]
+            )
 
             probs = svm.predict_proba(cand_features_scaled)
             class_order = list(svm.classes_)

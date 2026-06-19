@@ -228,8 +228,6 @@ def test_mmr_output_is_subset(scores):
     assert filtered_ids == sorted(filtered_ids, key=lambda x: input_ids.index(x))
 
 
-
-
 def test_rank_no_feedback_frontpage_sort(db, embedder):
     config = Config()
     # Absolutely no feedback in DB
@@ -382,7 +380,11 @@ def test_mmr_engagement_promotion_boundaries(score_a, score_b, eng_a, eng_b):
     ),
     cand_count=st.integers(min_value=1, max_value=10),
 )
-@settings(max_examples=25, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=1000)
+@settings(
+    max_examples=25,
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+    deadline=1000,
+)
 def test_svm_fitting_robustness(tmp_path, embedder, feedback_actions, cand_count):
     import uuid
 
@@ -433,3 +435,43 @@ def test_svm_fitting_robustness(tmp_path, embedder, feedback_actions, cand_count
             db_file.unlink()
         except OSError:
             pass
+
+
+@pytest.mark.asyncio
+async def test_fetch_candidates_returns_tuple(tmp_path, monkeypatch):
+    """fetch_candidates returns (list[Story], int), not just list."""
+    from pipeline import Config, fetch_candidates
+    from database import Database
+
+    db_file = tmp_path / "test.db"
+    db = Database(str(db_file))
+    config = Config(
+        db_path=str(db_file),
+        output=str(tmp_path / "index.html"),
+        server_port=0,
+    )
+
+    class MockResp:
+        status_code = 200
+
+        def json(self):
+            return {"hits": []}
+
+    class MockClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+        async def get(self, *a, **kw):
+            return MockResp()
+
+    monkeypatch.setattr("pipeline.httpx.AsyncClient", lambda **kw: MockClient())
+    result = await fetch_candidates(config, set(), set(), db)
+    assert isinstance(result, tuple), f"expected tuple, got {type(result)}"
+    assert len(result) == 2
+    candidates, count = result
+    assert isinstance(candidates, list)
+    assert isinstance(count, int)
+    assert count == len(candidates)
