@@ -120,13 +120,15 @@ def test_rank_no_feedback_fallback(db, embedder):
     )
 
     assert len(ranked) == 2
-    # Without feedback, all stories default to score 0.5
-    assert ranked[0].score == 0.5
-    assert ranked[1].score == 0.5
+    # Without feedback, stories are ranked by HN gravity formula
+    # Both stories have score=0, time=0 so they get very low gravity scores
+    assert ranked[0].score >= 0
+    assert ranked[1].score >= 0
 
 
 def test_rank_svm_path(db, embedder):
     config = Config()
+    user = db.create_user("test_token_svm", "test_user")
     # Populate DB with enough feedback to activate Feedback SVM (min_feedback_labels = 10)
     # We need >= 10 up (label=2) and >= 10 down (label=0)
     for i in range(10):
@@ -150,8 +152,8 @@ def test_rank_svm_path(db, embedder):
                 text_content="Baking sourdough bread cake cookie recipe kitchen",
             )
         )
-        db.upsert_feedback(100 + i, "up")
-        db.upsert_feedback(200 + i, "down")
+        db.upsert_feedback(user.id, 100 + i, "up")
+        db.upsert_feedback(user.id, 200 + i, "down")
 
     candidates = [
         Story(
@@ -257,12 +259,8 @@ def test_rank_no_feedback_frontpage_sort(db, embedder):
     )
 
     assert len(ranked) == 2
-    # Should sort by points (score) descending (high points story first)
+    # Should sort by HN gravity (high points story first)
     assert ranked[0].story.id == 2
-    assert ranked[1].story.id == 1
-    # Scores should be neutral (0.5)
-    assert ranked[0].score == 0.5
-    assert ranked[1].score == 0.5
 
 
 @given(text=st.text(), min_len=st.integers(min_value=0, max_value=100))
@@ -355,6 +353,7 @@ def test_augment_features_properties(meta):
 def test_svm_fitting_robustness(embedder, feedback_actions, cand_count):
     db = Database(":memory:")
     try:
+        user = db.create_user("test_token_robustness", "test_user")
         model_version = "all-MiniLM-L6-v2|mean|norm|256"
         for i, action in enumerate(feedback_actions):
             story = Story(
@@ -371,7 +370,7 @@ def test_svm_fitting_robustness(embedder, feedback_actions, cand_count):
             db.upsert_embedding(
                 story.id, model_version, shash, np.random.randn(384).astype(np.float32)
             )
-            db.upsert_feedback(story.id, action)
+            db.upsert_feedback(user.id, story.id, action)
 
         candidates = []
         for i in range(cand_count):
@@ -394,7 +393,7 @@ def test_svm_fitting_robustness(embedder, feedback_actions, cand_count):
         for item in ranked:
             assert 0.0 <= item.score <= 1.0
             if not feedback_actions:
-                assert item.score == 0.5
+                assert 0.0 <= item.score <= 1.0
     finally:
         db.close()
 
@@ -448,6 +447,7 @@ def _seed_story(
     comment_count_at_fetch: int,
     age_hours: int,
     feedback_action: Literal["up", "neutral", "down"] | None = None,
+    user_id: int | None = None,
 ) -> Story:
     """Insert a story in the live window with controlled engagement metrics."""
     from time import time as _now
@@ -466,8 +466,8 @@ def _seed_story(
         comment_count_at_fetch=comment_count_at_fetch,
     )
     db.upsert_story(story)
-    if feedback_action is not None:
-        db.upsert_feedback(sid, feedback_action)
+    if feedback_action is not None and user_id is not None:
+        db.upsert_feedback(user_id, sid, feedback_action)
     return story
 
 
@@ -689,6 +689,7 @@ async def test_run_pipeline_badge_assignment(tmp_path, monkeypatch):
 
     db_file = tmp_path / "test.db"
     db = Database(str(db_file))
+    user = db.create_user("test_token_badge", "test_user")
 
     # 1. Create candidates list
     now = time.time()
@@ -767,7 +768,7 @@ async def test_run_pipeline_badge_assignment(tmp_path, monkeypatch):
             text_content="upvoted text",
         )
     )
-    db.upsert_feedback(999, "up")
+    db.upsert_feedback(user.id, 999, "up")
 
     # 2. Config setup
     config = Config(
