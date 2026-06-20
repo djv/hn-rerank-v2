@@ -179,7 +179,7 @@ class Handler(BaseHTTPRequestHandler):
             if token:
                 user = self.db.get_or_create_user(token)
                 self.send_response(302)
-                self.send_header("Location", "/")
+                self.send_header("Location", "../")
                 self.send_header("Set-Cookie", f"hn_token={user.token}; Path=/; Max-Age=31536000")
                 self.end_headers()
                 return
@@ -201,7 +201,7 @@ class Handler(BaseHTTPRequestHandler):
             if not user:
                 token = secrets.token_hex(4)
                 self.send_response(302)
-                self.send_header("Location", f"/u/{token}")
+                self.send_header("Location", f"u/{token}")
                 self.send_header("Set-Cookie", f"hn_token={token}; Path=/; Max-Age=31536000")
                 self.end_headers()
                 return

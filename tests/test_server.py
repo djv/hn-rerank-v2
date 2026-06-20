@@ -58,7 +58,16 @@ def test_token_redirect(test_env):
     port, _, _, _, user = test_env
     resp = httpx.get(f"http://127.0.0.1:{port}/u/{user.token}", follow_redirects=False)
     assert resp.status_code == 302
-    assert resp.headers["Location"] == "/"
+    assert resp.headers["Location"] == "../"
+    assert "hn_token" in resp.headers.get("Set-Cookie", "")
+
+
+def test_first_visit_redirect(test_env):
+    port, _, _, _, _ = test_env
+    resp = httpx.get(f"http://127.0.0.1:{port}/", follow_redirects=False)
+    assert resp.status_code == 302
+    location = resp.headers["Location"]
+    assert location.startswith("u/")
     assert "hn_token" in resp.headers.get("Set-Cookie", "")
 
 
