@@ -562,7 +562,7 @@
     // Dynamic Swap-in of new ranked stories list
     async function triggerSwap() {
       try {
-        const resp = await fetch(window.location.href);
+        const resp = await fetch(window.location.href, { cache: 'no-store' });
         if (resp.ok) {
           const htmlText = await resp.text();
           const parser = new DOMParser();
@@ -577,7 +577,7 @@
             if (mode === 'score') {
               cards.sort((a, b) => parseFloat(b.dataset.score) - parseFloat(a.dataset.score));
               cards.forEach(card => storiesContainer.appendChild(card));
-            } else if (mode === 'time') {
+            } else if (mode === 'date') {
               cards.sort((a, b) => parseInt(b.dataset.time) - parseInt(a.dataset.time));
               cards.forEach(card => storiesContainer.appendChild(card));
             }
