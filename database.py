@@ -40,6 +40,14 @@ class FeedbackRecord:
     updated_at: float
 
 
+@dataclass(frozen=True)
+class User:
+    id: int
+    token: str
+    username: str
+    created_at: float
+
+
 class Database:
     def __init__(self, path: str = "hn_rewrite.db") -> None:
         db_path = Path(path)
@@ -133,32 +141,78 @@ class Database:
                     """)
                     conn.execute("DROP TABLE article_cache")
 
+                # Users table
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        id          INTEGER PRIMARY KEY,
+                        token       TEXT UNIQUE NOT NULL,
+                        username    TEXT NOT NULL DEFAULT 'anon',
+                        created_at  REAL NOT NULL
+                    )
+                """)
+
+                # Multi-user feedback migration
                 tbl_cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='feedback'")
                 if tbl_cursor.fetchone():
                     cursor = conn.execute("PRAGMA table_info(feedback)")
                     fb_columns = {row[1] for row in cursor.fetchall()}
-                    if "title" in fb_columns:
-                        logging.info("Migrating feedback table schema to normalized version...")
+                    if "user_id" not in fb_columns:
+                        logging.info("Migrating feedback table to multi-user schema...")
                         conn.execute("""
-                            CREATE TABLE IF NOT EXISTS feedback_new (
-                                story_id     INTEGER PRIMARY KEY,
-                                action       TEXT NOT NULL CHECK(action IN ('up', 'neutral', 'down')),
-                                updated_at   REAL NOT NULL,
+                            CREATE TABLE feedback_new (
+                                user_id     INTEGER NOT NULL,
+                                story_id    INTEGER NOT NULL,
+                                action      TEXT NOT NULL CHECK(action IN ('up', 'neutral', 'down')),
+                                updated_at  REAL NOT NULL,
+                                PRIMARY KEY (user_id, story_id),
                                 FOREIGN KEY (story_id) REFERENCES stories(id)
                             )
                         """)
+                        conn.execute(
+                            "INSERT OR IGNORE INTO users (id, token, username, created_at) VALUES (1, 'default', 'user', ?)",
+                            (time.time(),)
+                        )
                         conn.execute("""
-                            INSERT OR IGNORE INTO feedback_new (story_id, action, updated_at)
-                            SELECT story_id, action, updated_at FROM feedback
+                            INSERT INTO feedback_new (user_id, story_id, action, updated_at)
+                            SELECT 1, story_id, action, updated_at FROM feedback
+                        """)
+                        conn.execute("DROP TABLE feedback")
+                        conn.execute("ALTER TABLE feedback_new RENAME TO feedback")
+                    elif "title" in fb_columns:
+                        # Legacy migration from denormalized feedback
+                        logging.info("Migrating feedback table schema to normalized version...")
+                        conn.execute("""
+                            CREATE TABLE feedback_new (
+                                user_id     INTEGER NOT NULL DEFAULT 1,
+                                story_id    INTEGER NOT NULL,
+                                action      TEXT NOT NULL CHECK(action IN ('up', 'neutral', 'down')),
+                                updated_at  REAL NOT NULL,
+                                PRIMARY KEY (user_id, story_id),
+                                FOREIGN KEY (story_id) REFERENCES stories(id)
+                            )
+                        """)
+                        conn.execute(
+                            "INSERT OR IGNORE INTO users (id, token, username, created_at) VALUES (1, 'default', 'user', ?)",
+                            (time.time(),)
+                        )
+                        conn.execute("""
+                            INSERT OR IGNORE INTO feedback_new (user_id, story_id, action, updated_at)
+                            SELECT 1, story_id, action, updated_at FROM feedback
                         """)
                         conn.execute("DROP TABLE feedback")
                         conn.execute("ALTER TABLE feedback_new RENAME TO feedback")
                 else:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO users (id, token, username, created_at) VALUES (1, 'default', 'user', ?)",
+                        (time.time(),)
+                    )
                     conn.execute("""
                         CREATE TABLE IF NOT EXISTS feedback (
-                            story_id     INTEGER PRIMARY KEY,
-                            action       TEXT NOT NULL CHECK(action IN ('up', 'neutral', 'down')),
-                            updated_at   REAL NOT NULL,
+                            user_id     INTEGER NOT NULL,
+                            story_id    INTEGER NOT NULL,
+                            action      TEXT NOT NULL CHECK(action IN ('up', 'neutral', 'down')),
+                            updated_at  REAL NOT NULL,
+                            PRIMARY KEY (user_id, story_id),
                             FOREIGN KEY (story_id) REFERENCES stories(id)
                         )
                     """)
@@ -354,6 +408,7 @@ class Database:
     # Feedback
     def upsert_feedback(
         self,
+        user_id: int,
         story_id: int,
         action: Literal["up", "neutral", "down"],
     ) -> None:
@@ -361,25 +416,37 @@ class Database:
             with conn:
                 conn.execute(
                     """
-                    INSERT INTO feedback (story_id, action, updated_at)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(story_id) DO UPDATE SET
+                    INSERT INTO feedback (user_id, story_id, action, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(user_id, story_id) DO UPDATE SET
                         action=excluded.action,
                         updated_at=excluded.updated_at
                     """,
-                    (story_id, action, time.time()),
+                    (user_id, story_id, action, time.time()),
                 )
 
-    def get_all_feedback(self) -> list[FeedbackRecord]:
+    def get_all_feedback(self, user_id: int | None = None) -> list[FeedbackRecord]:
         with self._conn() as conn:
-            cursor = conn.execute(
-                """
-                SELECT f.story_id, f.action, s.title, s.url, s.text_content, s.source, f.updated_at
-                FROM feedback f
-                LEFT JOIN stories s ON s.id = f.story_id
-                ORDER BY f.updated_at DESC
-                """
-            )
+            if user_id is not None:
+                cursor = conn.execute(
+                    """
+                    SELECT f.story_id, f.action, s.title, s.url, s.text_content, s.source, f.updated_at
+                    FROM feedback f
+                    LEFT JOIN stories s ON s.id = f.story_id
+                    WHERE f.user_id = ?
+                    ORDER BY f.updated_at DESC
+                    """,
+                    (user_id,),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    SELECT f.story_id, f.action, s.title, s.url, s.text_content, s.source, f.updated_at
+                    FROM feedback f
+                    LEFT JOIN stories s ON s.id = f.story_id
+                    ORDER BY f.updated_at DESC
+                    """
+                )
             return [
                 FeedbackRecord(
                     story_id=row[0],
@@ -393,23 +460,40 @@ class Database:
                 for row in cursor.fetchall()
             ]
 
-    def delete_feedback(self, story_id: int) -> None:
+    def delete_feedback(self, user_id: int, story_id: int) -> None:
         with self._conn() as conn:
             with conn:
-                conn.execute("DELETE FROM feedback WHERE story_id = ?", (story_id,))
+                conn.execute(
+                    "DELETE FROM feedback WHERE user_id = ? AND story_id = ?",
+                    (user_id, story_id),
+                )
 
-    def get_feedback_for_training(self) -> tuple[list[Story], list[int], list[float]]:
+    def get_feedback_for_training(self, user_id: int | None = None) -> tuple[list[Story], list[int], list[float]]:
         with self._conn() as conn:
-            cursor = conn.execute(
-                """
-                SELECT f.story_id, f.action, s.title, s.url, s.text_content, s.source,
-                       f.updated_at, COALESCE(s.score, 0), COALESCE(s.time, 0),
-                       COALESCE(s.comment_count, 0), COALESCE(s.self_text, ''),
-                       COALESCE(s.top_comments, ''), COALESCE(s.article_body, '')
-                FROM feedback f
-                LEFT JOIN stories s ON s.id = f.story_id
-                """
-            )
+            if user_id is not None:
+                cursor = conn.execute(
+                    """
+                    SELECT f.story_id, f.action, s.title, s.url, s.text_content, s.source,
+                           f.updated_at, COALESCE(s.score, 0), COALESCE(s.time, 0),
+                           COALESCE(s.comment_count, 0), COALESCE(s.self_text, ''),
+                           COALESCE(s.top_comments, ''), COALESCE(s.article_body, '')
+                    FROM feedback f
+                    LEFT JOIN stories s ON s.id = f.story_id
+                    WHERE f.user_id = ?
+                    """,
+                    (user_id,),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    SELECT f.story_id, f.action, s.title, s.url, s.text_content, s.source,
+                           f.updated_at, COALESCE(s.score, 0), COALESCE(s.time, 0),
+                           COALESCE(s.comment_count, 0), COALESCE(s.self_text, ''),
+                           COALESCE(s.top_comments, ''), COALESCE(s.article_body, '')
+                    FROM feedback f
+                    LEFT JOIN stories s ON s.id = f.story_id
+                    """
+                )
             stories: list[Story] = []
             labels: list[int] = []
             vote_times: list[float] = []
@@ -456,3 +540,35 @@ class Database:
             with conn:
                 cursor = conn.execute(sql, params)
                 return cursor.fetchall()
+
+    # Users
+    def create_user(self, token: str, username: str = "anon") -> User:
+        with self._conn() as conn:
+            with conn:
+                now = time.time()
+                conn.execute(
+                    "INSERT INTO users (token, username, created_at) VALUES (?, ?, ?)",
+                    (token, username, now),
+                )
+                row = conn.execute("SELECT id FROM users WHERE token = ?", (token,)).fetchone()
+                return User(id=row[0], token=token, username=username, created_at=now)
+
+    def get_user_by_token(self, token: str) -> User | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT id, token, username, created_at FROM users WHERE token = ?", (token,)
+            ).fetchone()
+            if row:
+                return User(id=row[0], token=row[1], username=row[2], created_at=row[3])
+            return None
+
+    def get_or_create_user(self, token: str) -> User:
+        user = self.get_user_by_token(token)
+        if user:
+            return user
+        return self.create_user(token)
+
+    def update_username(self, user_id: int, username: str) -> None:
+        with self._conn() as conn:
+            with conn:
+                conn.execute("UPDATE users SET username = ? WHERE id = ?", (username, user_id))
