@@ -305,6 +305,80 @@
       color: white;
     }
 
+    .tldr-detail-content h1,
+    .tldr-detail-content h2,
+    .tldr-detail-content h3,
+    .tldr-detail-content h4 {
+      margin-top: 0.6rem;
+      margin-bottom: 0.3rem;
+      font-weight: 700;
+      color: var(--pico-color);
+    }
+    .tldr-detail-content h1 { font-size: 1.1rem; }
+    .tldr-detail-content h2 { font-size: 1.05rem; }
+    .tldr-detail-content h3 { font-size: 1rem; }
+    .tldr-detail-content h4 { font-size: 0.95rem; }
+
+    .tldr-detail-content ul,
+    .tldr-detail-content ol {
+      margin-top: 0.2rem;
+      margin-bottom: 0.4rem;
+      padding-left: 1.25rem;
+    }
+    .tldr-detail-content ul { list-style-type: disc; }
+    .tldr-detail-content ol { list-style-type: decimal; }
+    .tldr-detail-content li {
+      margin-bottom: 0.15rem;
+      line-height: 1.4;
+    }
+
+    .tldr-detail-content pre {
+      background: var(--pico-card-background-color);
+      border: 1px solid var(--pico-muted-border-color);
+      border-radius: 4px;
+      padding: 0.4rem 0.6rem;
+      overflow-x: auto;
+      font-size: 0.8rem;
+      margin: 0.3rem 0;
+    }
+    .tldr-detail-content code {
+      font-size: 0.85em;
+      background: var(--pico-card-background-color);
+      padding: 0.1rem 0.25rem;
+      border-radius: 3px;
+    }
+    .tldr-detail-content pre code {
+      background: none;
+      padding: 0;
+    }
+
+    .tldr-detail-content blockquote {
+      border-left: 3px solid var(--pico-primary);
+      margin: 0.3rem 0;
+      padding: 0.2rem 0.6rem;
+      color: var(--pico-muted-color);
+      font-style: italic;
+    }
+
+    .tldr-detail-content hr {
+      border: none;
+      border-top: 1px solid var(--pico-muted-border-color);
+      margin: 0.5rem 0;
+    }
+
+    .tldr-detail-content p {
+      margin: 0.2rem 0;
+      line-height: 1.4;
+    }
+
+    .tldr-detail-content a {
+      color: var(--pico-primary);
+      text-decoration: none;
+    }
+    .tldr-detail-content a:hover {
+      text-decoration: underline;
+    }
+
     .feedback-btn.active[data-fb="up"] {
       background: #28a745 !important;
       color: white !important;
@@ -488,75 +562,14 @@
       cards.forEach(card => storiesContainer.appendChild(card));
     });
 
-    // Helper to parse simple markdown to HTML
+    // Snarkdown - 1KB markdown parser (https://github.com/developit/snarkdown)
+    const TAGS={'':['<em>','</em>'],_:['<strong>','</strong>'],'*':['<strong>','</strong>'],'~':['<s>','</s>'],'\n':['<br />'],' ':['<br />'],'-':['<hr />']};
+    function outdent(str){return str.replace(RegExp('^'+(str.match(/^(\t| )+/)||'')[0],'gm'),'')}
+    function encodeAttr(str){return(str+'').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+    function snarkdown(md,prevLinks){let tokenizer=/((?:^|\n+)(?:\n---+|\* \*(?: \*)+)\n)|(?:^``` *(\w*)\n([\s\S]*?)\n```$)|((?:(?:^|\n+)(?:\t|  {2,}).+)+\n*)|((?:(?:^|\n)([>*+-]|\d+\.)\s+.*)+)|(?:!\[([^\]]*?)\]\(([^)]+?)\))|(\[)|(\](?:\(([^)]+?)\))?)|(?:(?:^|\n+)([^\s].*)\n(-{3,}|={3,})(?:\n+|$))|(?:(?:^|\n+)(#{1,6})\s*(.+)(?:\n+|$))|(?:`([^`].*?)`)|(  \n\n*|\n{2,}|__|\*\*|[_*]|~~)/gm,context=[],out='',links=prevLinks||{},last=0,chunk,prev,token,inner,t;function tag(token){let desc=TAGS[token[1]||''],end=context[context.length-1]==token;if(!desc)return token;if(!desc[1])return desc[0];if(end)context.pop();else context.push(token);return desc[end|0]}function flush(){let str='';while(context.length)str+=tag(context[context.length-1]);return str}md=md.replace(/^\[(.+?)\]:\s*(.+)$/gm,(s,name,url)=>{links[name.toLowerCase()]=url;return''}).replace(/^\n+|\n+$/g,'');while((token=tokenizer.exec(md))){prev=md.substring(last,token.index);last=tokenizer.lastIndex;chunk=token[0];if(prev.match(/[^\\](\\\\)*\\$/)){}else if(t=(token[3]||token[4])){chunk='<pre class="code '+(token[4]?'poetry':token[2].toLowerCase())+'"><code'+(token[2]?` class="language-${token[2].toLowerCase()}"`:'')+'>'+outdent(encodeAttr(t).replace(/^\n+|\n+$/g,''))+'</code></pre>'}else if(t=token[6]){if(t.match(/\./)){token[5]=token[5].replace(/^\d+/gm,'')}inner=snarkdown(outdent(token[5].replace(/^\s*[>*+.-]/gm,'')));if(t=='>')t='blockquote';else{t=t.match(/\./)?'ol':'ul';inner=inner.replace(/^(.*)(\n|$)/gm,'<li>$1</li>')}chunk='<'+t+'>'+inner+'</'+t+'>'}else if(token[8]){chunk=`<img src="${encodeAttr(token[8])}" alt="${encodeAttr(token[7])}">`}else if(token[10]){out=out.replace('<a>',`<a href="${encodeAttr(token[11]||links[prev.toLowerCase()])}">`);chunk=flush()+'</a>'}else if(token[9]){chunk='<a>'}else if(token[12]||token[14]){t='h'+(token[14]?token[14].length:(token[13]>'='?1:2));chunk='<'+t+'>'+snarkdown(token[12]||token[15],links)+'</'+t+'>'}else if(token[16]){chunk='<code>'+encodeAttr(token[16])+'</code>'}else if(token[17]||token[1]){chunk=tag(token[17]||'--')}out+=prev;out+=chunk}return(out+md.substring(last)+flush()).replace(/^\n+|\n+$/g,'')}
+
     function parseSimpleMarkdown(text) {
-      const lines = text.split('\n');
-      let html = '';
-      let listType = null; // null, 'ul', 'ol'
-      
-      for (let line of lines) {
-        let trimmed = line.trim();
-        if (!trimmed) {
-          if (listType) {
-            html += `</${listType}>`;
-            listType = null;
-          }
-          html += '<p style="margin: 0.2rem 0;"></p>';
-          continue;
-        }
-        
-        let escaped = trimmed
-          .replace(/&/g, '&amp;')
-          .replace(/</g, '&lt;')
-          .replace(/>/g, '&gt;');
-          
-        escaped = escaped
-          .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-          .replace(/\*(.*?)\*/g, '<em>$1</em>');
-        
-        const headerMatch = escaped.match(/^(#{1,4})\s+(.*)$/);
-        if (headerMatch) {
-          if (listType) {
-            html += `</${listType}>`;
-            listType = null;
-          }
-          html += `<h4 style="margin-top: 0.5rem; margin-bottom: 0.25rem; font-weight: 700; color: var(--text-color);">${headerMatch[2]}</h4>`;
-          continue;
-        }
-        
-        const ulMatch = escaped.match(/^([-\*•])\s+(.*)$/);
-        if (ulMatch) {
-          if (listType !== 'ul') {
-            if (listType) html += `</${listType}>`;
-            html += '<ul style="margin-top: 0.2rem; margin-bottom: 0.4rem; padding-left: 1.25rem; list-style-type: disc;">';
-            listType = 'ul';
-          }
-          html += `<li style="margin-bottom: 0.1rem;">${ulMatch[2]}</li>`;
-          continue;
-        }
-        
-        const olMatch = escaped.match(/^(\d+)\.\s+(.*)$/);
-        if (olMatch) {
-          if (listType !== 'ol') {
-            if (listType) html += `</${listType}>`;
-            html += '<ol style="margin-top: 0.2rem; margin-bottom: 0.4rem; padding-left: 1.25rem;">';
-            listType = 'ol';
-          }
-          html += `<li style="margin-bottom: 0.1rem;">${olMatch[2]}</li>`;
-          continue;
-        }
-        
-        if (listType) {
-          html += `</${listType}>`;
-          listType = null;
-        }
-        html += `<div style="margin-bottom: 0.2rem; line-height: 1.4;">${escaped}</div>`;
-      }
-      
-      if (listType) {
-        html += `</${listType}>`;
-      }
-      return html;
+      return snarkdown(text);
     }
 
     // Dynamic Swap-in of new ranked stories list
