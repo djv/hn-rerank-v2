@@ -2,6 +2,7 @@ import os
 import asyncio
 import json
 import logging
+import secrets
 import sys
 import threading
 import time
@@ -15,8 +16,8 @@ from bs4 import BeautifulSoup
 import httpx
 
 from dataclasses import replace
-from database import Database
-from pipeline import Config, run_pipeline
+from database import Database, User
+from pipeline import Config
 
 
 def load_env() -> None:
@@ -148,48 +149,101 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "HNRewrite/1.0"
     config: Config
     db: Database
+    embedder: object
     regen_event: threading.Event
+    _dashboard_cache: dict = {}
+
+    def _get_user(self) -> User | None:
+        """Extract user from cookie token."""
+        cookie_header = self.headers.get("Cookie", "")
+        for part in cookie_header.split(";"):
+            kv = part.strip().split("=", 1)
+            if len(kv) == 2 and kv[0] == "hn_token":
+                return self.db.get_or_create_user(kv[1].strip())
+        return None
+
+    def _json_response(self, data: dict, status: int = 200) -> None:
+        body = json.dumps(data).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_GET(self) -> None:
         path = self.path.split("?")[0]
-        if path in ("/", "/index.html", "/public/", "/public/index.html"):
-            target_file = Path(self.config.output)
-        else:
-            self.send_error(HTTPStatus.NOT_FOUND)
+
+        # Token-based user session
+        if path.startswith("/u/"):
+            token = path[3:].strip("/")
+            if token:
+                user = self.db.get_or_create_user(token)
+                self.send_response(302)
+                self.send_header("Location", "/")
+                self.send_header("Set-Cookie", f"hn_token={user.token}; Path=/; Max-Age=31536000")
+                self.end_headers()
+                return
+            self.send_error(HTTPStatus.BAD_REQUEST)
             return
 
-        if not target_file.exists():
-            # Trigger generation and wait a brief moment for it to complete
-            logging.info("Dashboard HTML not found. Triggering immediate generation...")
-            self.regen_event.set()
-            # Loop-wait up to 5 seconds for generation
-            for _ in range(50):
-                time.sleep(0.1)
-                if target_file.exists():
-                    break
-
-        if not target_file.exists():
-            self.send_error(
-                HTTPStatus.SERVICE_UNAVAILABLE,
-                "Dashboard is generating, please refresh in a moment.",
-            )
+        # User info API
+        if path == "/api/user":
+            user = self._get_user()
+            if user:
+                self._json_response({"user_id": user.id, "username": user.username, "token": user.token})
+            else:
+                self._json_response({"error": "No session"}, status=401)
             return
 
-        try:
-            content = target_file.read_bytes()
+        # Dashboard — dynamic render per-user
+        if path in ("/", "/index.html"):
+            user = self._get_user()
+            if not user:
+                token = secrets.token_hex(4)
+                self.send_response(302)
+                self.send_header("Location", f"/u/{token}")
+                self.send_header("Set-Cookie", f"hn_token={token}; Path=/; Max-Age=31536000")
+                self.end_headers()
+                return
+
+            # Render personalized dashboard
+            html = self._render_dashboard(user)
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Content-Length", str(len(html)))
             self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
             self.send_header("Pragma", "no-cache")
             self.send_header("Expires", "0")
             self.end_headers()
-            self.wfile.write(content)
-        except Exception as e:
-            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
+            self.wfile.write(html)
+            return
+
+        self.send_error(HTTPStatus.NOT_FOUND)
+
+    def _render_dashboard(self, user: User) -> bytes:
+        """Render personalized dashboard for user. Uses short-lived cache."""
+        now = time.time()
+        cache_key = f"dashboard_{user.id}"
+
+        cached = self._dashboard_cache.get(cache_key)
+        if cached and now - cached[1] < 300:
+            return cached[0]
+
+        from pipeline import fast_rerank_for_user, generate_dashboard_bytes
+
+        final = fast_rerank_for_user(self.db, self.config, self.embedder, user.id)
+        html = generate_dashboard_bytes(final, self.config, user.username, self.db, user.id)
+
+        self._dashboard_cache[cache_key] = (html, now)
+        return html
 
     def do_POST(self) -> None:
         if self.path == "/api/feedback":
+            user = self._get_user()
+            if not user:
+                self._json_response({"error": "No session"}, status=401)
+                return
+
             try:
                 content_length = int(self.headers.get("Content-Length", 0))
                 body = self.rfile.read(content_length)
@@ -199,17 +253,19 @@ class Handler(BaseHTTPRequestHandler):
                 action = data["action"]
 
                 if action == "clear":
-                    self.db.delete_feedback(story_id)
+                    self.db.delete_feedback(user.id, story_id)
                 else:
                     self.db.upsert_feedback(
-                        story_id=story_id,
-                        action=action,
+                        user.id,
+                        story_id,
+                        action,
                     )
 
-                # Synchronously trigger fast re-ranking and re-rendering of index.html
-                from pipeline import fast_rerank_and_render
-                fast_rerank_and_render(self.db, self.config, self.embedder)
+                # Invalidate user's dashboard cache
+                cache_key = f"dashboard_{user.id}"
+                self._dashboard_cache.pop(cache_key, None)
 
+                # Also trigger background regen for candidate updates
                 self.regen_event.set()
                 self._json_response({"ok": True})
             except Exception as e:
@@ -294,7 +350,7 @@ class Handler(BaseHTTPRequestHandler):
         logging.info("%s - - %s" % (self.address_string(), format % args))
 
 
-def regen_loop(config: Config, event: threading.Event) -> None:
+def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
     logging.info("Starting background regeneration loop...")
     while True:
         # Wait on event or timeout
@@ -304,9 +360,10 @@ def regen_loop(config: Config, event: threading.Event) -> None:
             # Debounce click storms
             time.sleep(2)
 
-        logging.info("Regeneration triggered. Running pipeline...")
+        logging.info("Regeneration triggered. Fetching candidates...")
         try:
-            asyncio.run(run_pipeline(config))
+            from pipeline import fetch_candidates_only
+            asyncio.run(fetch_candidates_only(config, db))
             logging.info("Regeneration complete.")
         except Exception as e:
             logging.exception(f"Background regeneration failed: {e}")
@@ -331,7 +388,7 @@ def main() -> None:
     Handler.regen_event = regen_event
 
     # Start regen thread
-    t = threading.Thread(target=regen_loop, args=(config, regen_event), daemon=True)
+    t = threading.Thread(target=regen_loop, args=(config, regen_event, db), daemon=True)
     t.start()
 
     # Start HTTP server
