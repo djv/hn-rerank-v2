@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -21,6 +22,10 @@ class Story:
     comment_count: int | None = None
     discussion_url: str | None = None
     comment_count_at_fetch: int = 0
+    self_text: str = ""
+    top_comments: str = ""
+    article_body: str = ""
+    db_text_content: str = ""
 
 
 @dataclass(frozen=True)
@@ -57,7 +62,10 @@ class Database:
                     comment_count  INTEGER,
                     discussion_url TEXT,
                     fetched_at     REAL NOT NULL,
-                    comment_count_at_fetch INTEGER NOT NULL DEFAULT 0
+                    comment_count_at_fetch INTEGER NOT NULL DEFAULT 0,
+                    self_text      TEXT NOT NULL DEFAULT '',
+                    top_comments   TEXT NOT NULL DEFAULT '',
+                    article_body   TEXT NOT NULL DEFAULT ''
                 )
             """)
             cursor = self.conn.execute("PRAGMA table_info(stories)")
@@ -66,6 +74,12 @@ class Database:
                 self.conn.execute(
                     "ALTER TABLE stories ADD COLUMN comment_count_at_fetch INTEGER NOT NULL DEFAULT 0"
                 )
+            for col in ("self_text", "top_comments", "article_body"):
+                if col not in columns:
+                    self.conn.execute(
+                        f"ALTER TABLE stories ADD COLUMN {col} TEXT NOT NULL DEFAULT ''"
+                    )
+
             self.conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_stories_time ON stories(time)"
             )
@@ -82,15 +96,20 @@ class Database:
                 )
             """)
 
-            self.conn.execute("""
-                CREATE TABLE IF NOT EXISTS article_cache (
-                    story_id    INTEGER PRIMARY KEY,
-                    url         TEXT NOT NULL,
-                    article_text TEXT NOT NULL,
-                    fetched_at  REAL NOT NULL,
-                    FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE
-                )
-            """)
+            # Run migration of article_cache to stories table if article_cache exists
+            tbl_cursor = self.conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='article_cache'")
+            if tbl_cursor.fetchone():
+                logging.info("Migrating article_cache records to stories table...")
+                self.conn.execute("""
+                    UPDATE stories SET article_body = (
+                      SELECT article_text FROM article_cache 
+                      WHERE article_cache.story_id = stories.id
+                    ) WHERE EXISTS (
+                      SELECT 1 FROM article_cache WHERE article_cache.story_id = stories.id
+                    )
+                """)
+                self.conn.execute("DROP TABLE article_cache")
+                logging.info("Migration completed, article_cache table dropped.")
 
             cursor = self.conn.execute("PRAGMA table_info(feedback)")
             columns = [row[1] for row in cursor.fetchall()]
@@ -132,8 +151,9 @@ class Database:
                 INSERT INTO stories (
                     id, title, url, score, time, text_content, source,
                     comment_count, discussion_url, fetched_at,
-                    comment_count_at_fetch
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    comment_count_at_fetch, self_text, top_comments,
+                    article_body
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     title=excluded.title,
                     url=excluded.url,
@@ -144,7 +164,14 @@ class Database:
                     comment_count=excluded.comment_count,
                     discussion_url=excluded.discussion_url,
                     fetched_at=excluded.fetched_at,
-                    comment_count_at_fetch=excluded.comment_count_at_fetch
+                    comment_count_at_fetch=excluded.comment_count_at_fetch,
+                    self_text=excluded.self_text,
+                    top_comments=excluded.top_comments,
+                    article_body=CASE 
+                        WHEN COALESCE(LENGTH(excluded.article_body), 0) > COALESCE(LENGTH(stories.article_body), 0) 
+                        THEN excluded.article_body 
+                        ELSE stories.article_body 
+                    END
                 """,
                 (
                     story.id,
@@ -158,29 +185,47 @@ class Database:
                     story.discussion_url,
                     time.time(),
                     story.comment_count_at_fetch,
+                    story.self_text,
+                    story.top_comments,
+                    story.article_body,
                 ),
             )
 
     @staticmethod
     def _row_to_story(row: tuple) -> Story:
+        db_text = row[5] or ""
+        self_text = row[10] or ""
+        top_comments = row[11] or ""
+        article_body = row[12] or ""
+
+        if self_text or top_comments or article_body:
+            from pipeline import compose_story_text
+            text_content = compose_story_text(row[1], self_text, top_comments, article_body)
+        else:
+            text_content = db_text
+
         return Story(
             id=row[0],
             title=row[1],
             url=row[2],
             score=row[3],
             time=row[4],
-            text_content=row[5],
+            text_content=text_content,
             source=row[6],
             comment_count=row[7],
             discussion_url=row[8],
             comment_count_at_fetch=row[9],
+            self_text=self_text,
+            top_comments=top_comments,
+            article_body=article_body,
+            db_text_content=db_text,
         )
 
     def get_story(self, story_id: int) -> Story | None:
         cursor = self.conn.execute(
             """
             SELECT id, title, url, score, time, text_content, source, comment_count, discussion_url,
-                   comment_count_at_fetch
+                   comment_count_at_fetch, self_text, top_comments, article_body
             FROM stories WHERE id = ?
             """,
             (story_id,),
@@ -196,7 +241,7 @@ class Database:
         placeholders = ",".join("?" for _ in ids)
         query = f"""
             SELECT id, title, url, score, time, text_content, source, comment_count, discussion_url,
-                   comment_count_at_fetch
+                   comment_count_at_fetch, self_text, top_comments, article_body
             FROM stories WHERE id IN ({placeholders})
         """
         cursor = self.conn.execute(query, ids)
@@ -256,30 +301,7 @@ class Database:
             row[0]: np.frombuffer(row[1], dtype=np.float32) for row in cursor.fetchall()
         }
 
-    # Article body cache
-    def get_cached_article(self, story_id: int, url: str) -> str | None:
-        cursor = self.conn.execute(
-            "SELECT url, article_text FROM article_cache WHERE story_id = ?",
-            (story_id,),
-        )
-        row = cursor.fetchone()
-        if row and row[0] == url:
-            return row[1]
-        return None
 
-    def set_cached_article(self, story_id: int, url: str, article_text: str) -> None:
-        with self.conn:
-            self.conn.execute(
-                """
-                INSERT INTO article_cache (story_id, url, article_text, fetched_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(story_id) DO UPDATE SET
-                    url=excluded.url,
-                    article_text=excluded.article_text,
-                    fetched_at=excluded.fetched_at
-                """,
-                (story_id, url, article_text, time.time()),
-            )
 
     # Feedback
     def upsert_feedback(
@@ -330,7 +352,8 @@ class Database:
             """
             SELECT f.story_id, f.action, s.title, s.url, s.text_content, s.source,
                    f.updated_at, COALESCE(s.score, 0), COALESCE(s.time, 0),
-                   COALESCE(s.comment_count, 0)
+                   COALESCE(s.comment_count, 0), COALESCE(s.self_text, ''),
+                   COALESCE(s.top_comments, ''), COALESCE(s.article_body, '')
             FROM feedback f
             LEFT JOIN stories s ON s.id = f.story_id
             """
@@ -350,9 +373,20 @@ class Database:
             score,
             story_time,
             comment_count,
+            self_text,
+            top_comments,
+            article_body,
         ) in cursor.fetchall():
             if action not in action_to_label:
                 continue
+
+            db_text = text_content or ""
+            if self_text or top_comments or article_body:
+                from pipeline import compose_story_text
+                text_content = compose_story_text(title or "", self_text, top_comments, article_body)
+            else:
+                text_content = db_text
+
             stories.append(
                 Story(
                     id=story_id,
@@ -360,9 +394,13 @@ class Database:
                     url=url,
                     score=score,
                     time=story_time,
-                    text_content=text_content or "",
+                    text_content=text_content,
                     source=source or "hn",
                     comment_count=comment_count,
+                    self_text=self_text,
+                    top_comments=top_comments,
+                    article_body=article_body,
+                    db_text_content=db_text,
                 )
             )
             labels.append(action_to_label[action])
