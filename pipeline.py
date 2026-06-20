@@ -1449,6 +1449,18 @@ def rerank_candidates(
     engagement_items = engagement_pool[:5]
     final.extend(engagement_items)
     selected_ids |= {item.story.id for item in engagement_items}
+    remaining_decorated = [
+        r for r in remaining_decorated if r.story.id not in selected_ids
+    ]
+
+    # 6. Surface up to 5 hot stories
+    hot_pool = [r for r in remaining_decorated if r.is_hot]
+    hot_pool.sort(
+        key=lambda r: cand_velocities[story_id_to_idx[r.story.id]], reverse=True
+    )
+    hot_items = hot_pool[:5]
+    final.extend(hot_items)
+    selected_ids |= {item.story.id for item in hot_items}
 
     final.sort(key=lambda r: r.score, reverse=True)
     return final
