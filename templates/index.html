@@ -513,21 +513,22 @@
   <script>
     // Restore temporary client feedback state before regeneration updates the static file.
     // Also clean up keys that have been persisted on the server or relate to discarded cards.
+    const USER_TOKEN = document.cookie.match(/hn_token=([^;]+)/)?.[1] || '';
+    const fbKey = (sid) => USER_TOKEN + '_fb_' + sid;
+
     const presentStoryIds = new Set();
     document.querySelectorAll('.story-card').forEach(card => {
       const storyId = card.dataset.storyId;
       presentStoryIds.add(storyId);
       
-      const storedAction = localStorage.getItem('feedback_' + storyId);
+      const storedAction = localStorage.getItem(fbKey(storyId));
       if (storedAction) {
         const htmlActiveBtn = card.querySelector('.feedback-btn.active');
         const htmlActiveAction = htmlActiveBtn ? htmlActiveBtn.dataset.fb : null;
         
         if (htmlActiveAction === storedAction) {
-          // Server-side regeneration has completed and persisted this state; clear local cache.
-          localStorage.removeItem('feedback_' + storyId);
+          localStorage.removeItem(fbKey(storyId));
         } else {
-          // Server hasn't updated yet; force UI to match local stored action
           card.querySelectorAll('[data-fb]').forEach(btn => {
             btn.classList.toggle('active', btn.dataset.fb === storedAction);
           });
@@ -538,11 +539,11 @@
     // Garbage collect stale localStorage entries for stories no longer on the page
     for (let i = 0; i < localStorage.length; i++) {
       const key = localStorage.key(i);
-      if (key && key.startsWith('feedback_')) {
-        const storyId = key.replace('feedback_', '');
+      if (key && key.startsWith(USER_TOKEN + '_fb_')) {
+        const storyId = key.replace(USER_TOKEN + '_fb_', '');
         if (!presentStoryIds.has(storyId)) {
           localStorage.removeItem(key);
-          i--; // adjust index since we removed a key
+          i--;
         }
       }
     }
@@ -632,10 +633,10 @@
             card.style.maxHeight = card.offsetHeight + 'px';
             card.offsetHeight; // force reflow
             card.classList.add('fade-out');
-            localStorage.setItem('feedback_' + storyId, nextAction);
+            localStorage.setItem(fbKey(storyId), nextAction);
             collapsePromise = new Promise(resolve => setTimeout(resolve, 400));
           } else {
-            localStorage.removeItem('feedback_' + storyId);
+            localStorage.removeItem(fbKey(storyId));
           }
 
           try {
@@ -658,12 +659,12 @@
               console.error('Failed to submit feedback', resp.status);
               // Rollback UI state
               if (nextAction === 'clear') {
-                localStorage.setItem('feedback_' + storyId, action);
+                localStorage.setItem(fbKey(storyId), action);
                 card.querySelectorAll('[data-fb]').forEach(b => {
                   b.classList.toggle('active', b.dataset.fb === action);
                 });
               } else {
-                localStorage.removeItem('feedback_' + storyId);
+                localStorage.removeItem(fbKey(storyId));
                 card.style.maxHeight = '';
                 card.classList.remove('fade-out');
                 card.querySelectorAll('[data-fb]').forEach(b => {
@@ -675,12 +676,12 @@
             console.error('Network error submitting feedback', err);
             // Rollback UI state
             if (nextAction === 'clear') {
-              localStorage.setItem('feedback_' + storyId, action);
+              localStorage.setItem(fbKey(storyId), action);
               card.querySelectorAll('[data-fb]').forEach(b => {
                 b.classList.toggle('active', b.dataset.fb === action);
               });
             } else {
-              localStorage.removeItem('feedback_' + storyId);
+              localStorage.removeItem(fbKey(storyId));
               card.style.maxHeight = '';
               card.classList.remove('fade-out');
               card.querySelectorAll('[data-fb]').forEach(b => {
