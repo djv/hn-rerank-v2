@@ -140,6 +140,16 @@ To reduce SQLite connection establishment overhead and eliminate lock contention
 * **PRAGMA Settings**: Each pooled connection is initialized with `PRAGMA journal_mode=WAL` (Write-Ahead Logging), `PRAGMA foreign_keys=ON` (constraint enforcement), and `PRAGMA busy_timeout=5000` (blocking writers retry for up to 5 seconds before failing).
 * **Server-Level Reuse**: The `ThreadingHTTPServer` request handlers reuse a single global `Database` instance across threads, resolving lock issues and significantly increasing throughput.
 
+### 3.10 Multi-User Architecture
+The system supports multiple users with independent feedback histories and personalized rankings:
+* **User Identification**: Token-based via URL path (`/u/<token>`) and cookie (`hn_token`). No passwords — the URL is the identity. Users are created on first visit.
+* **Data Model**: Shared `stories` table (candidates are global), per-user `feedback` rows with `PRIMARY KEY (user_id, story_id)`. A `users` table maps tokens to user IDs and display names.
+* **Dynamic Dashboard**: Each user's dashboard is rendered on-request via `fast_rerank_for_user()` → personalized SVM training → MMR → Jinja2 template render. Rendered HTML is cached per-user for 5 minutes.
+* **Background Regen**: The background loop fetches candidates into the shared `stories` table only. It does not render per-user dashboards.
+* **SVM Training**: Per-user SVM is trained lazily on first dashboard request. Model is cached in memory (dict keyed by user_id, 5-minute TTL, max 50 entries).
+* **Feedback API**: `POST /api/feedback` requires valid session cookie. The `user_id` is extracted from the token and passed to `upsert_feedback`.
+* **Frontend**: localStorage keys are prefixed with the user token (`<token>_feedback_<story_id>`) to prevent cross-user state leakage.
+
 ---
 
 ## 4. LLM Detailed Analysis
