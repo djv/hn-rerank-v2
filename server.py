@@ -14,6 +14,7 @@ import trafilatura
 from bs4 import BeautifulSoup
 import httpx
 
+from dataclasses import replace
 from database import Database
 from pipeline import Config, run_pipeline
 
@@ -72,11 +73,12 @@ async def _fetch_article_body(url: str) -> str | None:
 
 async def generate_detailed_tldr(
     title: str,
-    text_content: str,
+    self_text: str = "",
+    top_comments: str = "",
+    article_body: str = "",
     points: int = 0,
     comment_count: int = 0,
     age_hours: float = 0.0,
-    article_body: str = "",
 ) -> str | None:
     provider = os.environ.get("LLM_PROVIDER", "mistral").lower()
     if provider == "mistral":
@@ -91,13 +93,16 @@ async def generate_detailed_tldr(
     if not api_key:
         return "Error: LLM API key not configured in environment."
 
-    source_label = "HN discussion text" if article_body else "Article text"
-    content_section = f"Title: {title}\nEngagement context: {points} points, {comment_count} comments, {age_hours:.0f} hours old\n{source_label}: {text_content[:30000]}"
+    content_section = f"Title: {title}"
+    if self_text:
+        content_section += f"\n\nAuthor's text:\n{self_text[:6000]}"
     if article_body:
-        content_section = f"Article body: {article_body[:15000]}\n\n" + content_section
+        content_section += f"\n\nArticle body:\n{article_body[:15000]}"
+    if top_comments:
+        content_section += f"\n\nHN comments:\n{top_comments[:10000]}"
 
     prompt = f"""Summarize the article and the discussion for a knowledgeable reader.
-Use ONLY information from the text below (which includes the article body and comments).
+Use ONLY information from the text below.
 Write a short 3-4 paragraph summary (under 400 words). Use Markdown formatting:
 headings (###), **bold** for key terms, and - for lists where appropriate.
 
@@ -105,9 +110,9 @@ headings (###), **bold** for key terms, and - for lists where appropriate.
 
 IMPORTANT:
 - Use ONLY information from the article text. Do not expand on the topic with outside knowledge.
-- If the article has very few or no comments, say so explicitly. Do not invent discussion.
+- If the article has very few or no comments do not invent discussion.
 - If engagement is low (under 20 points or under 5 comments), use hedging language like "the article describes...", "the author claims...", and note that the discussion is sparse.
-- If the article text appears to be just a title and no body, say "The article body was not available."
+- If the text below is just a title and no substantive content, say so explicitly.
 """
 
     payload = {
@@ -223,30 +228,29 @@ class Handler(BaseHTTPRequestHandler):
                         return
 
                     age_hours = max(0.0, (now - story.time) / 3600.0)
-                    article_body = (
-                        db.get_cached_article(story_id, story.url)
-                        if story.url
-                        else None
-                    )
+                    article_body = story.article_body or None
                 finally:
                     db.close()
 
                 if article_body is None and story.url and len(story.text_content) < 500:
                     article_body = asyncio.run(_fetch_article_body(story.url))
                     if article_body:
+                        article_body = article_body[:15000]
                         db2 = Database(self.config.db_path)
                         try:
-                            db2.set_cached_article(story_id, story.url, article_body)
+                            updated_story = replace(story, article_body=article_body)
+                            db2.upsert_story(updated_story)
                         finally:
                             db2.close()
                 tldr = asyncio.run(
                     generate_detailed_tldr(
                         story.title,
-                        story.text_content,
+                        self_text=story.self_text or "",
+                        top_comments=story.top_comments or "",
+                        article_body=article_body or "",
                         points=story.score,
                         comment_count=story.comment_count or 0,
                         age_hours=age_hours,
-                        article_body=article_body or "",
                     )
                 )
                 if tldr:

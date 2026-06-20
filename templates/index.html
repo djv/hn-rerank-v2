@@ -203,6 +203,18 @@
       border-radius: 3px;
       font-weight: 600;
       font-size: 0.7rem;
+      background: hsl(45, 60%, 25%);
+      color: hsl(45, 80%, 90%);
+      border: 1px solid hsl(45, 60%, 35%);
+      line-height: 1.2;
+    }
+
+    .hot-badge {
+      display: inline-block;
+      padding: 0.05rem 0.35rem;
+      border-radius: 3px;
+      font-weight: 600;
+      font-size: 0.7rem;
       background: hsl(15, 60%, 25%);
       color: hsl(15, 80%, 90%);
       border: 1px solid hsl(15, 60%, 35%);
@@ -219,6 +231,11 @@
       color: hsl(210, 80%, 90%);
       border: 1px solid hsl(210, 50%, 35%);
       line-height: 1.2;
+    }
+
+    .story-card.enriched {
+      background: color-mix(in srgb, var(--pico-card-background-color) 93%, hsl(120, 50%, 50%) 7%);
+      border-color: color-mix(in srgb, var(--pico-card-border-color) 90%, hsl(120, 50%, 50%) 10%);
     }
 
     .story-title {
@@ -336,7 +353,7 @@
     <div id="stories">
       {% for item in stories %}
       {% set active_fb = fb_map.get(item.story.id) %}
-      <article class="story-card" 
+      <article class="story-card{% if item.story.text_content | length >= 1000 %} enriched{% endif %}" 
                data-story-id="{{ item.story.id }}" 
                data-score="{{ item.score }}"
                data-time="{{ item.story.time }}"
@@ -365,7 +382,10 @@
           <span class="discussion-rich-badge" title="Many comments on this story (top 10%)">💬 Talk-worthy</span>
           {% endif %}
           {% if item.is_high_engagement %}
-          <span class="high-engagement-badge" title="Crowd favorite (top 10% by HN points)">🔥 Trending</span>
+          <span class="high-engagement-badge" title="Top 10% by HN points">🏆 Top</span>
+          {% endif %}
+          {% if item.is_hot %}
+          <span class="hot-badge" title="Top 10% by engagement velocity (points/hour)">🔥 Hot</span>
           {% endif %}
           {% if item.is_similar %}
           <span class="similar-badge" title="Highly similar to your upvoted stories">🎯 Similar</span>
