@@ -943,6 +943,7 @@ def rank_stories(
     db: Database,
     config: Config,
     embedder: Embedder,
+    user_id: int | None = None,
 ) -> list[RankedStory]:
     if not candidates:
         return []
@@ -950,7 +951,7 @@ def rank_stories(
     now = time.time()
     scores = None
     probs = None
-    feedback_stories, feedback_labels, vote_times = db.get_feedback_for_training()
+    feedback_stories, feedback_labels, vote_times = db.get_feedback_for_training(user_id=user_id)
 
     # Multiclass SVM: 0=down, 1=neutral, 2=up
     if len(feedback_labels) >= 1:
@@ -1148,8 +1149,38 @@ def rank_stories(
         except Exception as e:
             logging.error(f"Failed to fit feedback SVM: {e}")
 
+    # Three-tier fallback based on feedback count
+    MIN_FEEDBACK_FOR_SVM = 10
+    n_feedback = len(feedback_labels)
+
     if scores is None:
-        scores = np.full(len(candidates), 0.5, dtype=np.float32)
+        if n_feedback == 0:
+            # Tier 1: No votes → HN gravity (frontpage-like)
+            scores = np.array([
+                (s.score if s.source == "hn" else s.score * 2) /
+                max(((now - s.time) / 3600.0 + 2.0) ** 1.8, 0.1)
+                for s in candidates
+            ], dtype=np.float32)
+            if scores.max() > 0:
+                scores = scores / scores.max()
+        elif n_feedback < MIN_FEEDBACK_FOR_SVM:
+            # Tier 2: 1-9 votes → similarity to upvotes minus downvotes
+            fb_embs = get_or_compute_embeddings(feedback_stories, embedder, db)
+            fb_labels_arr = np.array(feedback_labels)
+            up_mask = fb_labels_arr == 2
+            down_mask = fb_labels_arr == 0
+
+            if up_mask.any() or down_mask.any():
+                up_emb = fb_embs[up_mask].mean(axis=0) if up_mask.any() else np.zeros(384, dtype=np.float32)
+                down_emb = fb_embs[down_mask].mean(axis=0) if down_mask.any() else np.zeros(384, dtype=np.float32)
+
+                sim_up = candidate_embeddings @ up_emb
+                sim_down = candidate_embeddings @ down_emb
+                scores = sim_up - sim_down
+                # Shift to 0-1 range
+                scores = (scores - scores.min()) / (scores.max() - scores.min() + 1e-8)
+            else:
+                scores = np.full(len(candidates), 0.5, dtype=np.float32)
 
     ranked = []
     if probs is not None:
@@ -1247,6 +1278,7 @@ def generate_dashboard(
     timestamp: str,
     server_port: int,
     db: Database,
+    user_id: int | None = None,
 ) -> None:
     env = Environment(loader=FileSystemLoader("templates"), autoescape=True)
     env.filters["time_ago"] = time_ago_filter
@@ -1257,7 +1289,7 @@ def generate_dashboard(
     )
 
     # Map user feedback in database for active UI state highlighting
-    all_fb = db.get_all_feedback()
+    all_fb = db.get_all_feedback(user_id=user_id)
     fb_map = {f.story_id: f.action for f in all_fb}
 
     template = env.get_template("index.html")
@@ -1280,6 +1312,7 @@ def rerank_candidates(
     embedder: Embedder,
     candidates: list[Story],
     cand_embeddings: NDArray[np.float32] = None,
+    user_id: int | None = None,
 ) -> list[RankedStory]:
     if not candidates:
         return []
@@ -1293,6 +1326,7 @@ def rerank_candidates(
         db,
         config,
         embedder,
+        user_id=user_id,
     )
 
     embeddings_map = {s.id: vec for s, vec in zip(candidates, cand_embeddings)}
@@ -1310,7 +1344,7 @@ def rerank_candidates(
     remaining = [r for r in ranked if r.story.id not in selected_ids]
 
     # Calculate parameters for remaining discovery passes
-    feedback_stories, feedback_labels, _ = db.get_feedback_for_training()
+    feedback_stories, feedback_labels, _ = db.get_feedback_for_training(user_id=user_id)
     fb_labels_arr = np.array(feedback_labels)
     up_mask = fb_labels_arr == 2
     down_mask = fb_labels_arr == 0
@@ -1668,4 +1702,80 @@ def fast_rerank_and_render(
         config.server_port,
         db,
     )
+
+
+def generate_dashboard_bytes(
+    ranked: list[RankedStory],
+    config: Config,
+    username: str,
+    db: Database,
+    user_id: int | None = None,
+) -> bytes:
+    """Render dashboard to bytes without writing to disk."""
+    env = Environment(loader=FileSystemLoader("templates"), autoescape=True)
+    env.filters["time_ago"] = time_ago_filter
+
+    pico_css_path = Path("templates/pico.min.css")
+    pico_css = pico_css_path.read_text(encoding="utf-8") if pico_css_path.exists() else ""
+
+    all_fb = db.get_all_feedback(user_id=user_id)
+    fb_map = {f.story_id: f.action for f in all_fb}
+
+    template = env.get_template("index.html")
+    html_content = template.render(
+        username=username,
+        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M"),
+        stories=ranked,
+        server_port=config.server_port,
+        pico_css=pico_css,
+        fb_map=fb_map,
+    )
+    return html_content.encode("utf-8")
+
+
+def fast_rerank_for_user(
+    db: Database,
+    config: Config,
+    embedder: Embedder,
+    user_id: int,
+) -> list[RankedStory]:
+    """Fast rerank for a specific user. Called on each dashboard request."""
+    now_ts = int(time.time())
+    cutoff_ts = now_ts - (config.days * 86400)
+
+    rows = db.execute(
+        "SELECT id, title, url, score, time, text_content, source, comment_count, "
+        "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
+        "FROM stories WHERE time >= ? AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?)",
+        (cutoff_ts, user_id),
+    )
+    candidates = [Database._row_to_story(row) for row in rows]
+    if not candidates:
+        return []
+
+    candidates.sort(
+        key=lambda s: (s.score if s.source == "hn" else 100) / (((time.time() - s.time) / 3600.0 + 2.0) ** 1.8),
+        reverse=True,
+    )
+    candidates = candidates[:1000]
+
+    cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
+
+    return rerank_candidates(
+        db=db, config=config, embedder=embedder,
+        candidates=candidates, cand_embeddings=cand_embeddings,
+        user_id=user_id,
+    )
+
+
+async def fetch_candidates_only(config: Config, db: Database) -> None:
+    """Fetch new candidates into shared DB. No per-user rendering."""
+    feedback_records = db.get_all_feedback()
+    feedback_ids = {f.story_id for f in feedback_records}
+    feedback_urls = {f.url for f in feedback_records if f.url}
+
+    candidates, n_fetched = await fetch_candidates(
+        config, feedback_ids, feedback_urls, db, None
+    )
+    logging.info(f"Regen: fetched {n_fetched} candidates")
 
