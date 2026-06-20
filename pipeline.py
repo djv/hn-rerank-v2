@@ -954,7 +954,8 @@ def rank_stories(
     feedback_stories, feedback_labels, vote_times = db.get_feedback_for_training(user_id=user_id)
 
     # Multiclass SVM: 0=down, 1=neutral, 2=up
-    if len(feedback_labels) >= 10:
+    unique_classes = set(feedback_labels)
+    if len(feedback_labels) >= 10 and len(unique_classes) >= 2:
         try:
             cand_scores = np.array([s.score for s in candidates])
             cand_ages = np.array([now - s.time for s in candidates])
@@ -1163,8 +1164,8 @@ def rank_stories(
             ], dtype=np.float32)
             if scores.max() > 0:
                 scores = scores / scores.max()
-        elif n_feedback < MIN_FEEDBACK_FOR_SVM:
-            # Tier 2: 1-9 votes → similarity to upvotes minus downvotes
+        else:
+            # Tier 2: At least 1 vote → similarity to upvotes minus downvotes
             fb_embs = get_or_compute_embeddings(feedback_stories, embedder, db)
             fb_labels_arr = np.array(feedback_labels)
             up_mask = fb_labels_arr == 2
