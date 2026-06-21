@@ -1091,7 +1091,7 @@ def rank_stories(
 
             emb_dim = candidate_embeddings.shape[1]
             scaler = StandardScaler()
-            fb_features_meta_scaled = scaler.fit_transform(fb_features[:, emb_dim:])
+            fb_features_meta_scaled = np.clip(scaler.fit_transform(fb_features[:, emb_dim:]), -2.5, 2.5)
 
             fb_features_scaled = np.hstack(
                 [fb_features[:, :emb_dim], fb_features_meta_scaled]
@@ -1133,7 +1133,7 @@ def rank_stories(
                 closest_downvoted=cand_closest_down,
                 comment_score_ratio=cand_csr,
             )
-            cand_features_meta_scaled = scaler.transform(cand_features[:, emb_dim:])
+            cand_features_meta_scaled = np.clip(scaler.transform(cand_features[:, emb_dim:]), -2.5, 2.5)
             cand_features_scaled = np.hstack(
                 [cand_features[:, :emb_dim], cand_features_meta_scaled]
             )
@@ -1151,7 +1151,6 @@ def rank_stories(
             logging.error(f"Failed to fit feedback SVM: {e}")
 
     # Three-tier fallback based on feedback count
-    MIN_FEEDBACK_FOR_SVM = 10
     n_feedback = len(feedback_labels)
 
     if scores is None:

@@ -386,8 +386,8 @@ def main() -> None:
 
         emb_dim = cand_emb.shape[1]
         scaler = StandardScaler()
-        X_train_meta_scaled = scaler.fit_transform(X_train[:, emb_dim:])
-        X_cand_meta_scaled = scaler.transform(X_cand[:, emb_dim:])
+        X_train_meta_scaled = np.clip(scaler.fit_transform(X_train[:, emb_dim:]), -2.5, 2.5)
+        X_cand_meta_scaled = np.clip(scaler.transform(X_cand[:, emb_dim:]), -2.5, 2.5)
 
         X_train_scaled = np.hstack([X_train[:, :emb_dim], X_train_meta_scaled])
         X_cand_scaled = np.hstack([X_cand[:, :emb_dim], X_cand_meta_scaled])
