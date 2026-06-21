@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.hypothesis/
+.ruff_cache/
+*.db
+*.db-shm
+*.db-wal
+onnx_model/
+public/
+.env
+.env.local

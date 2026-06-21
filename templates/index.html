@@ -1,0 +1,748 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HN Rerank | @{{ username }}</title>
+  <style>
+    /* Inlined Pico CSS */
+    {{ pico_css | safe }}
+
+    /* Custom tweaks for premium Hacker News aesthetic */
+    :root {
+      --pico-primary: #ff6600;
+      --pico-primary-background: #ff6600;
+      --pico-primary-hover: #e05a00;
+    }
+    
+    body {
+      padding-top: 0.5rem;
+      padding-bottom: 1rem;
+    }
+
+    header {
+      border-bottom: 1px solid var(--pico-muted-border-color);
+      margin-bottom: 0.75rem;
+      padding-bottom: 0.5rem;
+    }
+
+    .brand h1 {
+      margin-bottom: 0;
+      font-size: 1.5rem;
+      font-weight: 800;
+    }
+
+    .brand span {
+      color: var(--pico-primary);
+    }
+
+    .meta-subtitle {
+      font-size: 0.8rem;
+      color: var(--pico-muted-color);
+      margin-top: 0.2rem;
+    }
+
+    .controls-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 0.5rem;
+      gap: 1rem;
+    }
+
+    .controls-row select {
+      width: auto;
+      margin-bottom: 0;
+      padding: 0.25rem 0.5rem;
+      font-size: 0.8rem;
+      height: auto;
+    }
+
+    .story-card {
+      margin-bottom: 0.5rem;
+      padding: 0.6rem 0.8rem;
+      border-radius: 6px;
+      border: 1px solid var(--pico-card-border-color);
+      background: var(--pico-card-background-color);
+      transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1), transform 0.2s, box-shadow 0.2s;
+      opacity: 1;
+      overflow: hidden;
+    }
+
+    .story-card.fade-out {
+      opacity: 0;
+      max-height: 0 !important;
+      padding-top: 0 !important;
+      padding-bottom: 0 !important;
+      margin-top: 0 !important;
+      margin-bottom: 0 !important;
+      border-top-width: 0 !important;
+      border-bottom-width: 0 !important;
+      transform: translateY(15px);
+      pointer-events: none;
+    }
+
+    .story-card:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    }
+
+    .story-header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.4rem;
+      font-size: 0.75rem;
+      color: var(--pico-muted-color);
+      margin-bottom: 0.2rem;
+    }
+
+    .score-badge {
+      display: inline-block;
+      padding: 0.05rem 0.3rem;
+      border-radius: 3px;
+      font-weight: bold;
+      font-size: 0.75rem;
+      background: var(--pico-primary-background);
+      color: white;
+    }
+
+    .source-badge {
+      display: inline-block;
+      padding: 0.05rem 0.3rem;
+      border-radius: 3px;
+      font-size: 0.75rem;
+      background: #343a40;
+      color: #f8f9fa;
+    }
+
+    .prob-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.05rem 0.4rem;
+      border-radius: 3px;
+      background: var(--pico-card-background-color);
+      border: 1px solid var(--pico-muted-border-color);
+      font-size: 0.7rem;
+      height: 1.1rem;
+      line-height: 1;
+    }
+
+    .prob-mini-bar {
+      display: inline-flex;
+      width: 32px;
+      height: 6px;
+      border-radius: 3px;
+      overflow: hidden;
+      background: var(--pico-muted-border-color);
+    }
+
+    .mini-segment {
+      height: 100%;
+    }
+
+    .mini-segment.down {
+      background: hsl(355, 75%, 55%); /* Soft Crimson */
+    }
+
+    .mini-segment.neutral {
+      background: hsl(40, 60%, 65%);  /* Soft Gold */
+    }
+
+    .mini-segment.up {
+      background: hsl(160, 60%, 45%);   /* Soft Teal */
+    }
+
+    .prob-mini-text {
+      font-weight: 600;
+      color: var(--pico-muted-color);
+      font-size: 0.65rem;
+      letter-spacing: 0.02em;
+    }
+
+    .uncertain-badge {
+      display: inline-block;
+      padding: 0.05rem 0.35rem;
+      border-radius: 3px;
+      font-weight: 600;
+      font-size: 0.7rem;
+      background: hsl(280, 50%, 25%); /* Deep plum/purple for uncertainty */
+      color: hsl(280, 80%, 90%);
+      border: 1px solid hsl(280, 50%, 35%);
+      line-height: 1.2;
+    }
+
+    .novel-badge {
+      display: inline-block;
+      padding: 0.05rem 0.35rem;
+      border-radius: 3px;
+      font-weight: 600;
+      font-size: 0.7rem;
+      background: hsl(170, 50%, 25%); /* Deep teal for novelty */
+      color: hsl(170, 80%, 90%);
+      border: 1px solid hsl(170, 50%, 35%);
+      line-height: 1.2;
+    }
+
+    .discussion-rich-badge {
+      display: inline-block;
+      padding: 0.05rem 0.35rem;
+      border-radius: 3px;
+      font-weight: 600;
+      font-size: 0.7rem;
+      background: hsl(35, 60%, 25%);
+      color: hsl(35, 80%, 90%);
+      border: 1px solid hsl(35, 60%, 35%);
+      line-height: 1.2;
+    }
+
+    .high-engagement-badge {
+      display: inline-block;
+      padding: 0.05rem 0.35rem;
+      border-radius: 3px;
+      font-weight: 600;
+      font-size: 0.7rem;
+      background: hsl(45, 60%, 25%);
+      color: hsl(45, 80%, 90%);
+      border: 1px solid hsl(45, 60%, 35%);
+      line-height: 1.2;
+    }
+
+    .hot-badge {
+      display: inline-block;
+      padding: 0.05rem 0.35rem;
+      border-radius: 3px;
+      font-weight: 600;
+      font-size: 0.7rem;
+      background: hsl(15, 60%, 25%);
+      color: hsl(15, 80%, 90%);
+      border: 1px solid hsl(15, 60%, 35%);
+      line-height: 1.2;
+    }
+
+    .similar-badge {
+      display: inline-block;
+      padding: 0.05rem 0.35rem;
+      border-radius: 3px;
+      font-weight: 600;
+      font-size: 0.7rem;
+      background: hsl(210, 50%, 25%); /* Steel/Slate Blue for similar stories */
+      color: hsl(210, 80%, 90%);
+      border: 1px solid hsl(210, 50%, 35%);
+      line-height: 1.2;
+    }
+
+    .story-card.enriched {
+      background: color-mix(in srgb, var(--pico-card-background-color) 93%, hsl(120, 50%, 50%) 7%);
+      border-color: color-mix(in srgb, var(--pico-card-border-color) 90%, hsl(120, 50%, 50%) 10%);
+    }
+
+    .story-title {
+      font-size: 1.05rem;
+      margin-bottom: 0.2rem;
+      line-height: 1.2;
+    }
+
+    .story-title a {
+      color: var(--pico-color);
+      text-decoration: none;
+      font-weight: 600;
+    }
+
+    .story-title a:hover {
+      color: var(--pico-primary);
+      text-decoration: underline;
+    }
+
+    .match-reason {
+      font-size: 0.8rem;
+      font-style: italic;
+      color: var(--pico-muted-color);
+      margin-bottom: 0;
+      margin-top: 0.5rem;
+    }
+
+    .feedback-group {
+      display: inline-flex;
+      gap: 0.2rem;
+      margin-left: auto;
+    }
+
+    .feedback-btn {
+      padding: 0.15rem 0.5rem;
+      font-size: 0.8rem;
+      border-radius: 4px;
+      background: transparent;
+      border: 1px solid var(--pico-muted-border-color);
+      color: var(--pico-muted-color);
+      cursor: pointer;
+      line-height: 1.2;
+      transition: all 0.2s;
+      margin-bottom: 0;
+    }
+
+    .feedback-btn:hover {
+      background: #2b3035;
+      color: white;
+    }
+
+    .tldr-detail-btn {
+      padding: 0.15rem 0.5rem;
+      font-size: 0.8rem;
+      border-radius: 4px;
+      background: transparent;
+      border: 1px solid var(--pico-muted-border-color);
+      color: var(--pico-muted-color);
+      cursor: pointer;
+      line-height: 1.2;
+      transition: all 0.2s;
+      margin-bottom: 0;
+    }
+
+    .tldr-detail-btn:hover {
+      background: #2b3035;
+      color: white;
+    }
+
+    .tldr-detail-content h1,
+    .tldr-detail-content h2,
+    .tldr-detail-content h3,
+    .tldr-detail-content h4 {
+      margin-top: 0.6rem;
+      margin-bottom: 0.3rem;
+      font-weight: 700;
+      color: var(--pico-color);
+    }
+    .tldr-detail-content h1 { font-size: 1.1rem; }
+    .tldr-detail-content h2 { font-size: 1.05rem; }
+    .tldr-detail-content h3 { font-size: 1rem; }
+    .tldr-detail-content h4 { font-size: 0.95rem; }
+
+    .tldr-detail-content ul,
+    .tldr-detail-content ol {
+      margin-top: 0.2rem;
+      margin-bottom: 0.4rem;
+      padding-left: 1.25rem;
+    }
+    .tldr-detail-content ul { list-style-type: disc; }
+    .tldr-detail-content ol { list-style-type: decimal; }
+    .tldr-detail-content li {
+      margin-bottom: 0.15rem;
+      line-height: 1.4;
+    }
+
+    .tldr-detail-content pre {
+      background: var(--pico-card-background-color);
+      border: 1px solid var(--pico-muted-border-color);
+      border-radius: 4px;
+      padding: 0.4rem 0.6rem;
+      overflow-x: auto;
+      font-size: 0.8rem;
+      margin: 0.3rem 0;
+    }
+    .tldr-detail-content code {
+      font-size: 0.85em;
+      background: var(--pico-card-background-color);
+      padding: 0.1rem 0.25rem;
+      border-radius: 3px;
+    }
+    .tldr-detail-content pre code {
+      background: none;
+      padding: 0;
+    }
+
+    .tldr-detail-content blockquote {
+      border-left: 3px solid var(--pico-primary);
+      margin: 0.3rem 0;
+      padding: 0.2rem 0.6rem;
+      color: var(--pico-muted-color);
+      font-style: italic;
+    }
+
+    .tldr-detail-content hr {
+      border: none;
+      border-top: 1px solid var(--pico-muted-border-color);
+      margin: 0.5rem 0;
+    }
+
+    .tldr-detail-content p {
+      margin: 0.2rem 0;
+      line-height: 1.4;
+    }
+
+    .tldr-detail-content a {
+      color: var(--pico-primary);
+      text-decoration: none;
+    }
+    .tldr-detail-content a:hover {
+      text-decoration: underline;
+    }
+
+    .feedback-btn.active[data-fb="up"] {
+      background: #28a745 !important;
+      color: white !important;
+      border-color: #28a745 !important;
+    }
+
+    .feedback-btn.active[data-fb="neutral"] {
+      background: #ffc107 !important;
+      color: black !important;
+      border-color: #ffc107 !important;
+    }
+
+    .feedback-btn.active[data-fb="down"] {
+      background: #dc3545 !important;
+      color: white !important;
+      border-color: #dc3545 !important;
+    }
+
+    footer {
+      text-align: center;
+      margin-top: 3rem;
+      font-size: 0.8rem;
+      color: var(--pico-muted-color);
+      border-top: 1px solid var(--pico-muted-border-color);
+      padding-top: 1.5rem;
+    }
+  </style>
+</head>
+<body>
+  <main class="container">
+    <header>
+      <div class="brand">
+        <h1>HN <span>Rerank</span></h1>
+      </div>
+      <div class="controls-row">
+        <div class="meta-subtitle">
+          @{{ username }} · updated {{ timestamp }}
+        </div>
+        <select id="sort-mode" aria-label="Sort options">
+          <option value="score" selected>Sort by Score</option>
+          <option value="date">Sort by Date</option>
+        </select>
+      </div>
+    </header>
+
+    <div id="stories">
+      {% for item in stories %}
+      {% set active_fb = fb_map.get(item.story.id) %}
+      <article class="story-card{% if item.story.text_content | length >= 1000 %} enriched{% endif %}" 
+               data-story-id="{{ item.story.id }}" 
+               data-score="{{ item.score }}"
+               data-time="{{ item.story.time }}"
+               data-source="{{ item.story.source }}">
+        <div class="story-header">
+          <span class="score-badge">{{ (item.score * 100) | int }}%</span>
+          
+          {% if item.prob_down is not none %}
+          <div class="prob-badge" title="Down: {{ (item.prob_down * 100) | round(1) }}% | Neutral: {{ (item.prob_neutral * 100) | round(1) }}% | Up: {{ (item.prob_up * 100) | round(1) }}%">
+            <span class="prob-mini-bar">
+              <span class="mini-segment down" style="width: {{ item.prob_down * 100 }}%"></span>
+              <span class="mini-segment neutral" style="width: {{ item.prob_neutral * 100 }}%"></span>
+              <span class="mini-segment up" style="width: {{ item.prob_up * 100 }}%"></span>
+            </span>
+            <span class="prob-mini-text">▼{{ (item.prob_down * 100) | int }}% · ●{{ (item.prob_neutral * 100) | int }}% · ▲{{ (item.prob_up * 100) | int }}%</span>
+          </div>
+          {% endif %}
+          
+          {% if item.is_uncertain %}
+          <span class="uncertain-badge" title="Model is highly uncertain about this story (high entropy distribution)">🤔 Unsure</span>
+          {% endif %}
+          {% if item.is_novel %}
+          <span class="novel-badge" title="Semantically distant from all your feedback, but model scores it high">✨ Novel</span>
+          {% endif %}
+          {% if item.is_discussion_rich %}
+          <span class="discussion-rich-badge" title="Many comments on this story (top 7%)">💬 Talk-worthy</span>
+          {% endif %}
+          {% if item.is_high_engagement %}
+          <span class="high-engagement-badge" title="Top 5% by HN points">🏆 Top</span>
+          {% endif %}
+          {% if item.is_hot %}
+          <span class="hot-badge" title="Top 2% by engagement velocity (points/hour)">🔥 Hot</span>
+          {% endif %}
+          {% if item.is_similar %}
+          <span class="similar-badge" title="Highly similar to your upvoted stories">🎯 Similar</span>
+          {% endif %}
+          
+          {% if item.story.source != "hn" %}
+          <span class="source-badge">{{ item.story.source }}</span>
+          {% endif %}
+          
+          {% if item.story.score > 0 %}
+          <span>{{ item.story.score }} pts</span>
+          {% endif %}
+          
+          <span>{{ item.story.time | time_ago }}</span>
+          
+          {% if item.story.discussion_url %}
+          <a href="{{ item.story.discussion_url }}" target="_blank" rel="noopener">
+            💬{% if item.story.comment_count is not none %} {{ item.story.comment_count }}{% endif %} comments
+          </a>
+          {% endif %}
+
+          <div class="feedback-group">
+            <button class="feedback-btn {% if active_fb == 'up' %}active{% endif %}" data-fb="up" title="Upvote">▲</button>
+            <button class="feedback-btn {% if active_fb == 'neutral' %}active{% endif %}" data-fb="neutral" title="Neutral">✓</button>
+            <button class="feedback-btn {% if active_fb == 'down' %}active{% endif %}" data-fb="down" title="Downvote">▼</button>
+          </div>
+        </div>
+
+        <h2 class="story-title">
+          <a href="{{ item.story.url or item.story.discussion_url }}" target="_blank" rel="noopener">
+            {{ item.story.title }}
+          </a>
+        </h2>
+
+        <div class="story-footer" style="display: flex; justify-content: flex-end; margin-top: 0.25rem;">
+          <button type="button" class="tldr-detail-btn" data-tldr-detail>🔍 Detailed analysis</button>
+        </div>
+
+        {% if item.best_match_title %}
+        <p class="match-reason">Similar to: {{ item.best_match_title }}</p>
+        {% endif %}
+      </article>
+      {% endfor %}
+    </div>
+
+    <footer>
+      HN Rerank Rewrite · Local-first semantic filtering
+    </footer>
+  </main>
+
+  <script>
+    // Restore temporary client feedback state before regeneration updates the static file.
+    // Also clean up keys that have been persisted on the server or relate to discarded cards.
+    const USER_TOKEN = document.cookie.match(/hn_token=([^;]+)/)?.[1] || '';
+    const fbKey = (sid) => USER_TOKEN + '_fb_' + sid;
+
+    const presentStoryIds = new Set();
+    document.querySelectorAll('.story-card').forEach(card => {
+      const storyId = card.dataset.storyId;
+      presentStoryIds.add(storyId);
+      
+      const storedAction = localStorage.getItem(fbKey(storyId));
+      if (storedAction) {
+        const htmlActiveBtn = card.querySelector('.feedback-btn.active');
+        const htmlActiveAction = htmlActiveBtn ? htmlActiveBtn.dataset.fb : null;
+        
+        if (htmlActiveAction === storedAction) {
+          localStorage.removeItem(fbKey(storyId));
+        } else {
+          card.querySelectorAll('[data-fb]').forEach(btn => {
+            btn.classList.toggle('active', btn.dataset.fb === storedAction);
+          });
+        }
+      }
+    });
+
+    // Garbage collect stale localStorage entries for stories no longer on the page
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith(USER_TOKEN + '_fb_')) {
+        const storyId = key.replace(USER_TOKEN + '_fb_', '');
+        if (!presentStoryIds.has(storyId)) {
+          localStorage.removeItem(key);
+          i--;
+        }
+      }
+    }
+
+    // Client-side dynamic sorting
+    const sortSelect = document.getElementById('sort-mode');
+    const storiesContainer = document.getElementById('stories');
+
+    sortSelect.addEventListener('change', () => {
+      const mode = sortSelect.value;
+      const cards = Array.from(document.querySelectorAll('.story-card'));
+      if (mode === 'score') {
+        cards.sort((a, b) => parseFloat(b.dataset.score) - parseFloat(a.dataset.score));
+      } else if (mode === 'time') {
+        cards.sort((a, b) => parseInt(b.dataset.time) - parseInt(a.dataset.time));
+      }
+      cards.forEach(card => storiesContainer.appendChild(card));
+    });
+
+    // Snarkdown - 1KB markdown parser (https://github.com/developit/snarkdown)
+    const TAGS={'':['<em>','</em>'],_:['<strong>','</strong>'],'*':['<strong>','</strong>'],'~':['<s>','</s>'],'\n':['<br />'],' ':['<br />'],'-':['<hr />']};
+    function outdent(str){return str.replace(RegExp('^'+(str.match(/^(\t| )+/)||'')[0],'gm'),'')}
+    function encodeAttr(str){return(str+'').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+    function snarkdown(md,prevLinks){let tokenizer=/((?:^|\n+)(?:\n---+|\* \*(?: \*)+)\n)|(?:^``` *(\w*)\n([\s\S]*?)\n```$)|((?:(?:^|\n+)(?:\t|  {2,}).+)+\n*)|((?:(?:^|\n)([>*+-]|\d+\.)\s+.*)+)|(?:!\[([^\]]*?)\]\(([^)]+?)\))|(\[)|(\](?:\(([^)]+?)\))?)|(?:(?:^|\n+)([^\s].*)\n(-{3,}|={3,})(?:\n+|$))|(?:(?:^|\n+)(#{1,6})\s*(.+)(?:\n+|$))|(?:`([^`].*?)`)|(  \n\n*|\n{2,}|__|\*\*|[_*]|~~)/gm,context=[],out='',links=prevLinks||{},last=0,chunk,prev,token,inner,t;function tag(token){let desc=TAGS[token[1]||''],end=context[context.length-1]==token;if(!desc)return token;if(!desc[1])return desc[0];if(end)context.pop();else context.push(token);return desc[end|0]}function flush(){let str='';while(context.length)str+=tag(context[context.length-1]);return str}md=md.replace(/^\[(.+?)\]:\s*(.+)$/gm,(s,name,url)=>{links[name.toLowerCase()]=url;return''}).replace(/^\n+|\n+$/g,'');while((token=tokenizer.exec(md))){prev=md.substring(last,token.index);last=tokenizer.lastIndex;chunk=token[0];if(prev.match(/[^\\](\\\\)*\\$/)){}else if(t=(token[3]||token[4])){chunk='<pre class="code '+(token[4]?'poetry':token[2].toLowerCase())+'"><code'+(token[2]?` class="language-${token[2].toLowerCase()}"`:'')+'>'+outdent(encodeAttr(t).replace(/^\n+|\n+$/g,''))+'</code></pre>'}else if(t=token[6]){if(t.match(/\./)){token[5]=token[5].replace(/^\d+/gm,'')}inner=snarkdown(outdent(token[5].replace(/^\s*[>*+.-]/gm,'')));if(t=='>')t='blockquote';else{t=t.match(/\./)?'ol':'ul';inner=inner.replace(/^(.*)(\n|$)/gm,'<li>$1</li>')}chunk='<'+t+'>'+inner+'</'+t+'>'}else if(token[8]){chunk=`<img src="${encodeAttr(token[8])}" alt="${encodeAttr(token[7])}">`}else if(token[10]){out=out.replace('<a>',`<a href="${encodeAttr(token[11]||links[prev.toLowerCase()])}">`);chunk=flush()+'</a>'}else if(token[9]){chunk='<a>'}else if(token[12]||token[14]){t='h'+(token[14]?token[14].length:(token[13]>'='?1:2));chunk='<'+t+'>'+snarkdown(token[12]||token[15],links)+'</'+t+'>'}else if(token[16]){chunk='<code>'+encodeAttr(token[16])+'</code>'}else if(token[17]||token[1]){chunk=tag(token[17]||'--')}out+=prev;out+=chunk}return(out+md.substring(last)+flush()).replace(/^\n+|\n+$/g,'')}
+
+    function parseSimpleMarkdown(text) {
+      return snarkdown(text);
+    }
+
+    // Dynamic Swap-in of new ranked stories list
+    async function triggerSwap() {
+      try {
+        const resp = await fetch(window.location.href, { cache: 'no-store' });
+        if (resp.ok) {
+          const htmlText = await resp.text();
+          const parser = new DOMParser();
+          const newDoc = parser.parseFromString(htmlText, 'text/html');
+          const newStories = newDoc.getElementById('stories');
+          if (newStories) {
+            storiesContainer.innerHTML = newStories.innerHTML;
+            
+            // Re-apply sorting if needed
+            const mode = sortSelect.value;
+            const cards = Array.from(document.querySelectorAll('.story-card'));
+            if (mode === 'score') {
+              cards.sort((a, b) => parseFloat(b.dataset.score) - parseFloat(a.dataset.score));
+              cards.forEach(card => storiesContainer.appendChild(card));
+            } else if (mode === 'date') {
+              cards.sort((a, b) => parseInt(b.dataset.time) - parseInt(a.dataset.time));
+              cards.forEach(card => storiesContainer.appendChild(card));
+            }
+            
+            // Re-bind listeners to the newly loaded story cards
+            bindEvents();
+          }
+        }
+      } catch (err) {
+        console.error('Failed to swap stories', err);
+      }
+    }
+
+    // Function to bind click event listeners to current cards
+    function bindEvents() {
+      // 1. Feedback buttons
+      document.querySelectorAll('[data-fb]').forEach(btn => {
+        btn.onclick = async (e) => {
+          e.stopPropagation();
+          const card = btn.closest('.story-card');
+          const action = btn.dataset.fb;
+          const storyId = Number(card.dataset.storyId);
+
+          const nextAction = btn.classList.contains('active') ? 'clear' : action;
+          const apiPath = window.location.pathname.startsWith('/rewrite') ? '/rewrite/api/feedback' : '/api/feedback';
+          
+          // 1. Update button state instantly (optimistic UI)
+          card.querySelectorAll('[data-fb]').forEach(b => {
+            if (nextAction === 'clear') {
+              b.classList.remove('active');
+            } else {
+              b.classList.toggle('active', b === btn);
+            }
+          });
+
+          // 2. Start collapse transition instantly if voting (optimistic UI)
+          let collapsePromise = null;
+          if (nextAction !== 'clear') {
+            card.style.maxHeight = card.offsetHeight + 'px';
+            card.offsetHeight; // force reflow
+            card.classList.add('fade-out');
+            localStorage.setItem(fbKey(storyId), nextAction);
+            collapsePromise = new Promise(resolve => setTimeout(resolve, 400));
+          } else {
+            localStorage.removeItem(fbKey(storyId));
+          }
+
+          try {
+            const resp = await fetch(apiPath, {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({
+                story_id: storyId,
+                action: nextAction,
+              })
+            });
+
+            if (resp.ok) {
+              if (collapsePromise) {
+                await collapsePromise;
+                card.remove();
+              }
+              await triggerSwap();
+            } else {
+              console.error('Failed to submit feedback', resp.status);
+              // Rollback UI state
+              if (nextAction === 'clear') {
+                localStorage.setItem(fbKey(storyId), action);
+                card.querySelectorAll('[data-fb]').forEach(b => {
+                  b.classList.toggle('active', b.dataset.fb === action);
+                });
+              } else {
+                localStorage.removeItem(fbKey(storyId));
+                card.style.maxHeight = '';
+                card.classList.remove('fade-out');
+                card.querySelectorAll('[data-fb]').forEach(b => {
+                  b.classList.remove('active');
+                });
+              }
+            }
+          } catch (err) {
+            console.error('Network error submitting feedback', err);
+            // Rollback UI state
+            if (nextAction === 'clear') {
+              localStorage.setItem(fbKey(storyId), action);
+              card.querySelectorAll('[data-fb]').forEach(b => {
+                b.classList.toggle('active', b.dataset.fb === action);
+              });
+            } else {
+              localStorage.removeItem(fbKey(storyId));
+              card.style.maxHeight = '';
+              card.classList.remove('fade-out');
+              card.querySelectorAll('[data-fb]').forEach(b => {
+                b.classList.remove('active');
+              });
+            }
+          }
+        };
+      });
+
+      // 2. TLDR detail buttons
+      document.querySelectorAll('[data-tldr-detail]').forEach(btn => {
+        btn.onclick = async (e) => {
+          e.stopPropagation();
+          const card = btn.closest('.story-card');
+          const storyId = Number(card.dataset.storyId);
+          const storyTitle = card.querySelector('.story-title a')?.textContent || '';
+          
+          let contentDiv = card.querySelector('.tldr-detail-content');
+          if (!contentDiv) {
+            contentDiv = document.createElement('div');
+            contentDiv.className = 'tldr-detail-content';
+            contentDiv.style.marginTop = '0.5rem';
+            contentDiv.style.fontSize = '0.85rem';
+            contentDiv.style.borderTop = '1px dashed var(--pico-muted-border-color)';
+            contentDiv.style.paddingTop = '0.5rem';
+            contentDiv.style.display = 'none';
+            card.appendChild(contentDiv);
+          }
+
+          btn.disabled = true;
+          btn.textContent = '⏳ Analyzing...';
+          
+          const apiPath = window.location.pathname.startsWith('/rewrite') ? '/rewrite/api/tldr-detail' : '/api/tldr-detail';
+          try {
+            const resp = await fetch(apiPath, {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({ story_id: storyId, story_title: storyTitle })
+            });
+            if (resp.ok) {
+              const data = await resp.json();
+              contentDiv.innerHTML = parseSimpleMarkdown(data.tldr);
+              contentDiv.style.display = 'block';
+              btn.style.display = 'none';
+            } else {
+              const errData = await resp.json().catch(() => ({}));
+              btn.textContent = '❌ ' + (errData.error || 'Failed');
+              btn.disabled = false;
+            }
+          } catch (err) {
+            console.error(err);
+            btn.textContent = '❌ Error';
+            btn.disabled = false;
+          }
+        };
+      });
+    }
+
+    // Run initial event binding
+    bindEvents();
+  </script>
+</body>
+</html>
