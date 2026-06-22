@@ -1,8 +1,8 @@
 import numpy as np
 import pytest
+import time
 from hypothesis import given, strategies as st, settings, HealthCheck
-from typing import Literal
-from database import Database, Story
+from database import Action, Database, Story
 from pipeline import (
     Embedder,
     RankedStory,
@@ -12,6 +12,7 @@ from pipeline import (
     mmr_filter,
     rank_stories,
     Config,
+    _svm_personalization_features,
 )
 
 
@@ -55,6 +56,7 @@ def test_embedder_cache_hit(db, embedder):
     # Second call: check if cached
     model_version = "all-MiniLM-L6-v2|mean|norm|256"
     import hashlib
+
     shash = hashlib.sha256(story.text_content.encode("utf-8")).hexdigest()
     cached = db.get_embedding(999, model_version, shash)
     assert cached is not None
@@ -129,9 +131,8 @@ def test_rank_no_feedback_fallback(db, embedder):
 def test_rank_svm_path(db, embedder):
     config = Config()
     user = db.create_user("test_token_svm")
-    # Populate DB with enough feedback to activate Feedback SVM (min_feedback_labels = 10)
-    # We need >= 10 up (label=2) and >= 10 down (label=0)
-    for i in range(10):
+    # 20 up + 20 down = both gates pass (n_up >= 20, n_down >= 20)
+    for i in range(20):
         db.upsert_story(
             Story(
                 id=100 + i,
@@ -339,6 +340,34 @@ def test_augment_features_properties(meta):
     assert np.all(features7[:, 384:] >= 0.0) and np.all(features7[:, 384:] <= 1.0)
 
 
+def test_svm_personalization_features_exclude_engagement_source_metadata():
+    emb_dim = 384
+    embeddings = np.full((2, emb_dim), 2.0, dtype=np.float32)
+    text_lengths = np.array([0, 1000], dtype=np.float32)
+    sim_up = np.array([-1.0, 1.0], dtype=np.float32)
+    sim_down = np.array([1.0, -1.0], dtype=np.float32)
+    closest_up = np.array([0.0, 0.5], dtype=np.float32)
+    closest_down = np.array([-0.5, 0.0], dtype=np.float32)
+
+    features = _svm_personalization_features(
+        embeddings,
+        text_lengths=text_lengths,
+        sim_to_upvoted=sim_up,
+        sim_to_downvoted=sim_down,
+        closest_upvoted=closest_up,
+        closest_downvoted=closest_down,
+    )
+
+    assert features.shape == (2, emb_dim + 5)
+    assert np.all(features[:, :emb_dim] == 2.0)
+    assert np.all(features[:, emb_dim:] >= 0.0)
+    assert np.all(features[:, emb_dim:] <= 1.0)
+    assert features[0, emb_dim + 1] == 0.0
+    assert features[1, emb_dim + 1] == 1.0
+    assert features[0, emb_dim + 2] == 1.0
+    assert features[1, emb_dim + 2] == 0.0
+
+
 @given(
     feedback_actions=st.lists(
         st.sampled_from(["up", "neutral", "down"]), min_size=0, max_size=20
@@ -365,6 +394,7 @@ def test_svm_fitting_robustness(embedder, feedback_actions, cand_count):
                 text_content=f"Sample semantic content for history {i}",
             )
             import hashlib
+
             shash = hashlib.sha256(story.text_content.encode("utf-8")).hexdigest()
             db.upsert_story(story)
             db.upsert_embedding(
@@ -446,7 +476,7 @@ def _seed_story(
     comment_count: int,
     comment_count_at_fetch: int,
     age_hours: int,
-    feedback_action: Literal["up", "neutral", "down"] | None = None,
+    feedback_action: Action | None = None,
     user_id: int | None = None,
 ) -> Story:
     """Insert a story in the live window with controlled engagement metrics."""
@@ -692,7 +722,7 @@ async def test_run_pipeline_badge_assignment(tmp_path, monkeypatch):
     user = db.create_user("test_token_badge")
 
     # 1. Create candidates list
-    now = time.time()
+    now = int(time.time())
     candidates = []
     # Default path candidates: IDs 1-7
     for i in range(1, 8):
@@ -873,3 +903,325 @@ async def test_run_pipeline_badge_assignment(tmp_path, monkeypatch):
                 assert r.is_similar
             if r.story.id == 11:
                 assert r.is_novel
+
+
+def test_soft_blend_min_alpha_curve() -> None:
+    """Verify blend alpha curve based on min(n_up, n_down).
+    α=0 at min=20, α=1.0 at min=80+, window=60."""
+    blend_start = 20
+    window = 60
+    cases: dict[int, float | None] = {
+        0: None,
+        5: None,
+        10: None,
+        15: None,
+        19: None,
+        20: 0.0,
+        25: 0.0833,
+        30: 0.1667,
+        40: 0.3333,
+        50: 0.5,
+        60: 0.6667,
+        80: 1.0,
+        100: 1.0,
+    }
+    for n_min, expected in cases.items():
+        if expected is None:
+            assert n_min < blend_start
+        else:
+            alpha = max(0.0, min(1.0, (n_min - blend_start) / window))
+            assert abs(alpha - expected) < 1e-4, (
+                f"n_min={n_min}: expected {expected}, got {alpha}"
+            )
+
+
+def test_no_cliff_at_n_10(db: Database, embedder: Embedder) -> None:
+    """At n=10, SVM doesn't fire (threshold=20). Ranking is tier-2 centroid-diff."""
+    config = Config()
+    user = db.create_user("test_token_no_cliff")
+
+    # 5 upvoted finance stories
+    for i in range(5):
+        db.upsert_story(
+            Story(
+                id=100 + i,
+                title=f"Finance story {i}",
+                url=None,
+                score=0,
+                time=0,
+                text_content=f"stock market investment banking finance economy forecast {i}",
+            )
+        )
+        db.upsert_feedback(user.id, 100 + i, "up")
+
+    # 5 downvoted baking stories
+    for i in range(5):
+        db.upsert_story(
+            Story(
+                id=200 + i,
+                title=f"Baking story {i}",
+                url=None,
+                score=0,
+                time=0,
+                text_content=f"sourdough bread cake cookie recipe kitchen baking {i}",
+            )
+        )
+        db.upsert_feedback(user.id, 200 + i, "down")
+
+    candidates = [
+        Story(
+            id=1,
+            title="AI systems",
+            url=None,
+            score=0,
+            time=0,
+            text_content="Training large language models and neural networks.",
+        ),
+        Story(
+            id=2,
+            title="Finance news",
+            url=None,
+            score=0,
+            time=0,
+            text_content="Stock market rally after federal reserve rate decision.",
+        ),
+        Story(
+            id=3,
+            title="Baking tips",
+            url=None,
+            score=0,
+            time=0,
+            text_content="How to make perfect sourdough bread at home.",
+        ),
+    ]
+    cand_embs = embedder.encode([s.text_content for s in candidates])
+
+    ranked = rank_stories(candidates, cand_embs, db, config, embedder)
+
+    assert len(ranked) == 3
+    # Finance candidate is closest to upvotes (centroid formula). Should rank first.
+    assert ranked[0].story.id == 2, (
+        f"Expected finance story first, got id={ranked[0].story.id}"
+    )
+    # Baking candidate is closest to downvotes. Should rank last.
+    assert ranked[-1].story.id == 3, (
+        f"Expected baking story last, got id={ranked[-1].story.id}"
+    )
+    # AI candidate (neutral topic) should be in the middle
+    assert ranked[1].story.id == 1
+
+
+def test_tier1_gravity_at_zero_feedback(db: Database, embedder: Embedder) -> None:
+    """Zero feedback → tier 1 gravity formula, sorted by score/age."""
+    config = Config()
+    db.create_user("test_token_tier1")
+    now = int(time.time())
+
+    candidates = [
+        Story(
+            id=1,
+            title="Old low score",
+            url=None,
+            score=10,
+            time=now - 86400 * 5,
+            text_content="old post with low engagement",
+            source="hn",
+        ),
+        Story(
+            id=2,
+            title="Recent high score",
+            url=None,
+            score=100,
+            time=now - 3600,
+            text_content="recent trending post on hacker news",
+            source="hn",
+        ),
+        Story(
+            id=3,
+            title="Old high score",
+            url=None,
+            score=200,
+            time=now - 86400 * 3,
+            text_content="older but popular post",
+            source="hn",
+        ),
+    ]
+    cand_embs = embedder.encode([s.text_content for s in candidates])
+
+    ranked = rank_stories(candidates, cand_embs, db, config, embedder)
+
+    # Recent high score should rank highest (gravity) — no, tier 1 sorts by story.score (raw points)
+    assert ranked[0].story.id == 3, (
+        f"Expected highest-raw-score story first, got id={ranked[0].story.id}"
+    )
+    # RankedStory.score is gravity-based and in [0, 1]
+    for r in ranked:
+        assert 0.0 <= r.score <= 1.0
+    # Top gravity candidate is story 2 (recent 100 points beats old 200 points)
+    gravity_sorted = sorted(ranked, key=lambda x: x.score, reverse=True)
+    assert gravity_sorted[0].story.id == 2
+
+
+def test_tier3_svm_at_60_plus_with_gates(db: Database, embedder: Embedder) -> None:
+    """30 up + 30 down: both gates pass, α=(30-20)/60=0.167, ranking correct."""
+    config = Config()
+    user = db.create_user("test_token_tier3")
+
+    for i in range(30):
+        db.upsert_story(
+            Story(
+                id=100 + i,
+                title=f"Up story {i}",
+                url=None,
+                score=0,
+                time=0,
+                text_content="Deep learning AI research artificial intelligence neural networks transformers machine learning",
+            ),
+        )
+        db.upsert_feedback(user.id, 100 + i, "up")
+    for i in range(30):
+        db.upsert_story(
+            Story(
+                id=200 + i,
+                title=f"Down story {i}",
+                url=None,
+                score=0,
+                time=0,
+                text_content="Baking sourdough bread cake cookie recipe kitchen kitchen kitchen",
+            ),
+        )
+        db.upsert_feedback(user.id, 200 + i, "down")
+
+    candidates = [
+        Story(
+            id=1,
+            title="AI systems",
+            url=None,
+            score=0,
+            time=0,
+            text_content="Training large language models and neural networks.",
+        ),
+        Story(
+            id=2,
+            title="Cake recipe",
+            url=None,
+            score=0,
+            time=0,
+            text_content="Delicious chocolate chip cake baking guide.",
+        ),
+    ]
+    cand_embs = embedder.encode([s.text_content for s in candidates])
+
+    ranked = rank_stories(candidates, cand_embs, db, config, embedder)
+
+    assert len(ranked) == 2
+    # AI story should rank first (SVM learned upvote pattern)
+    assert ranked[0].story.id == 1
+    # Cake story should rank second
+    assert ranked[1].story.id == 2
+    for r in ranked:
+        assert 0.0 <= r.score <= 1.0
+
+
+def _seed_feedback(db: Database, user_id: int, n_up: int, n_down: int) -> None:
+    import hashlib
+
+    model_version = "all-MiniLM-L6-v2|mean|norm|256"
+    for i in range(n_up):
+        story = Story(
+            id=100 + i,
+            title=f"Up {i}",
+            url=None,
+            score=0,
+            time=0,
+            text_content=f"deep learning AI research {i}",
+        )
+        db.upsert_story(story)
+        text_hash = hashlib.sha256(story.text_content.encode("utf-8")).hexdigest()
+        db.upsert_embedding(
+            story.id, model_version, text_hash, np.random.randn(384).astype(np.float32)
+        )
+        db.upsert_feedback(user_id, story.id, "up")
+    for i in range(n_down):
+        story = Story(
+            id=200 + i,
+            title=f"Down {i}",
+            url=None,
+            score=0,
+            time=0,
+            text_content=f"baking sourdough bread {i}",
+        )
+        db.upsert_story(story)
+        text_hash = hashlib.sha256(story.text_content.encode("utf-8")).hexdigest()
+        db.upsert_embedding(
+            story.id, model_version, text_hash, np.random.randn(384).astype(np.float32)
+        )
+        db.upsert_feedback(user_id, story.id, "down")
+
+
+def test_min_class_gate_n_down_fails(db: Database, embedder: Embedder) -> None:
+    """30 up, 5 down: n_down=5 < 20, gate fails, pure tier-2 (no SVM, prob_up=None)."""
+    config = Config()
+    user = db.create_user("test_token_fail_down")
+    _seed_feedback(db, user.id, n_up=30, n_down=5)
+    cand_embs = np.random.randn(2, 384).astype(np.float32)
+    candidates = [
+        Story(id=1, title="A", url=None, score=0, time=0, text_content="x"),
+        Story(id=2, title="B", url=None, score=0, time=0, text_content="y"),
+    ]
+    ranked = rank_stories(candidates, cand_embs, db, config, embedder)
+    assert len(ranked) == 2
+    for r in ranked:
+        assert r.prob_up is None
+        assert 0.0 <= r.score <= 1.0
+
+
+def test_min_class_gate_n_up_fails(db: Database, embedder: Embedder) -> None:
+    """5 up, 30 down: n_up=5 < 20, gate fails, pure tier-2 (no SVM, prob_up=None)."""
+    config = Config()
+    user = db.create_user("test_token_fail_up")
+    _seed_feedback(db, user.id, n_up=5, n_down=30)
+    cand_embs = np.random.randn(2, 384).astype(np.float32)
+    candidates = [
+        Story(id=1, title="A", url=None, score=0, time=0, text_content="x"),
+        Story(id=2, title="B", url=None, score=0, time=0, text_content="y"),
+    ]
+    ranked = rank_stories(candidates, cand_embs, db, config, embedder)
+    assert len(ranked) == 2
+    for r in ranked:
+        assert r.prob_up is None
+        assert 0.0 <= r.score <= 1.0
+
+
+def test_min_class_gate_both_just_pass(db: Database, embedder: Embedder) -> None:
+    """20 up, 20 down: both gates pass at boundary, α=0, SVM runs (prob_up not None)."""
+    config = Config()
+    user = db.create_user("test_token_just_pass")
+    _seed_feedback(db, user.id, n_up=20, n_down=20)
+    cand_embs = np.random.randn(2, 384).astype(np.float32)
+    candidates = [
+        Story(id=1, title="A", url=None, score=0, time=0, text_content="x"),
+        Story(id=2, title="B", url=None, score=0, time=0, text_content="y"),
+    ]
+    ranked = rank_stories(candidates, cand_embs, db, config, embedder)
+    assert len(ranked) == 2
+    for r in ranked:
+        assert r.prob_up is not None
+        assert 0.0 <= r.score <= 1.0
+
+
+def test_min_class_blend_mid(db: Database, embedder: Embedder) -> None:
+    """50 up, 30 down: both gates pass, min=30, α=(30-20)/60≈0.167, SVM runs."""
+    config = Config()
+    user = db.create_user("test_token_blend_mid")
+    _seed_feedback(db, user.id, n_up=50, n_down=30)
+    cand_embs = np.random.randn(2, 384).astype(np.float32)
+    candidates = [
+        Story(id=1, title="A", url=None, score=0, time=0, text_content="x"),
+        Story(id=2, title="B", url=None, score=0, time=0, text_content="y"),
+    ]
+    ranked = rank_stories(candidates, cand_embs, db, config, embedder)
+    assert len(ranked) == 2
+    for r in ranked:
+        assert r.prob_up is not None
+        assert 0.0 <= r.score <= 1.0

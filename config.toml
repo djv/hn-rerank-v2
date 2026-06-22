@@ -14,7 +14,12 @@ svm_kernel = "rbf"
 neutral_weight = 0.0
 min_feedback_labels = 10
 min_signal_examples = 5
-diversity_threshold = 0.50
+diversity_threshold = 0.75
+knn_k = 10
+tier3_threshold = 20
+tier3_blend_window = 60
+min_up_for_svm = 20
+min_down_for_svm = 20
 
 
 [hn_rewrite.rss]

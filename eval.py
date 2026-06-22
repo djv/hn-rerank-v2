@@ -126,6 +126,9 @@ def _evaluate_fold(
     neutral_weight: float = 0.0,
     mmr_threshold: float = 0.50,
     mmr_limit: int = 40,
+    probs_strip: np.ndarray | None = None,
+    cand_sim_up: np.ndarray | None = None,
+    cand_sim_down: np.ndarray | None = None,
 ) -> dict:
     if formula == "current":
         scores = probs[:, 2] + neutral_weight * probs[:, 1]
@@ -133,6 +136,14 @@ def _evaluate_fold(
         scores = probs[:, 2]
     elif formula == "hn_baseline":
         scores = cand_scores.astype(np.float32)
+    elif formula == "strip_hn":
+        if probs_strip is None:
+            raise ValueError("strip_hn requires probs_strip")
+        scores = probs_strip[:, 2]
+    elif formula == "knn_diff":
+        if cand_sim_up is None or cand_sim_down is None:
+            raise ValueError("knn_diff requires candidate similarity arrays")
+        scores = cand_sim_up - cand_sim_down
     else:
         raise ValueError(f"Unknown formula: {formula}")
 
@@ -198,9 +209,14 @@ def _evaluate_fold(
 def main() -> None:
     config = Config.load()
     db = Database(config.db_path)
+    user = db.get_user_by_token("default")
+    if user is None:
+        raise RuntimeError("Missing default user token")
 
     # Feedback
-    fb_stories, fb_labels, fb_vote_times = db.get_feedback_for_training()
+    fb_stories, fb_labels, fb_vote_times = db.get_feedback_for_training(
+        user_id=user.id
+    )
     fb_labels = np.array(fb_labels, dtype=int)
     fb_vote_times = np.array(fb_vote_times, dtype=np.float64)
     print(f"Feedback: {len(fb_stories)} rows ({Counter(fb_labels)})")
@@ -239,7 +255,7 @@ def main() -> None:
     cand_scores_array = np.array([s.score for s in candidates], dtype=np.float64)
     y = fb_labels[valid]
 
-    formulas = ["current", "up_only", "hn_baseline"]
+    formulas = ["current", "up_only", "strip_hn", "hn_baseline", "knn_diff"]
     results: dict[str, list[dict]] = {f: [] for f in formulas}
 
     folds = list(
@@ -359,11 +375,8 @@ def main() -> None:
         fold_cand_csr_ratio = fold_cand_comments / np.maximum(fold_cand_scores, 1)
         fold_cand_csr = np.clip(np.log1p(fold_cand_csr_ratio), 0, 3.0) / 3.0
 
-        # New features: hour_of_day, is_hn
-        fb_train_hours = np.array([(s.time % 86400) / 86400.0 for s in fb_train_stories])
         fb_train_is_hn = np.array([1.0 if s.source == 'hn' else 0.0 for s in fb_train_stories])
 
-        fold_cand_hours = np.array([(s.time % 86400) / 86400.0 for s in fold_candidates])
         fold_cand_is_hn = np.array([1.0 if s.source == 'hn' else 0.0 for s in fold_candidates])
 
         # Build features for this fold
@@ -382,7 +395,6 @@ def main() -> None:
             closest_downvoted=fb_closest_down,
             comment_score_ratio=fb_train_csr,
             is_hn=fb_train_is_hn,
-            hour_of_day=fb_train_hours,
         )
         X_cand = _augment_features(
             fold_cand_emb,
@@ -399,7 +411,6 @@ def main() -> None:
             closest_downvoted=cand_closest_down,
             comment_score_ratio=fold_cand_csr,
             is_hn=fold_cand_is_hn,
-            hour_of_day=fold_cand_hours,
         )
 
         counts = Counter(y_train)
@@ -426,6 +437,30 @@ def main() -> None:
         svm.fit(X_train_scaled, y_train, sample_weight=weights)
         probs = svm.predict_proba(X_cand_scaled)
 
+        # SVM with HN-specific features zeroed
+        X_train_strip = X_train_scaled.copy()
+        X_cand_strip = X_cand_scaled.copy()
+        # meta cols after emb_dim:
+        # 0=score, 1=comment_count, 2=text_length, 3=hn_quality,
+        # 4=comment_score_ratio, 5=score_velocity, 6=comment_velocity,
+        # 7=sim_up, 8=sim_down, 9=closest_up, 10=closest_down, 11=is_hn
+        strip = [
+            emb_dim + 0,
+            emb_dim + 1,
+            emb_dim + 3,
+            emb_dim + 4,
+            emb_dim + 5,
+            emb_dim + 6,
+            emb_dim + 11,
+        ]
+        X_train_strip[:, strip] = 0.0
+        X_cand_strip[:, strip] = 0.0
+        svm_s = SVC(C=config.model.svm_c, kernel=config.model.svm_kernel,
+                     gamma=config.model.svm_gamma, random_state=0,
+                     decision_function_shape="ovr", probability=True)
+        svm_s.fit(X_train_strip, y_train, sample_weight=weights)
+        probs_strip = svm_s.predict_proba(X_cand_strip)
+
         # Test fold: map test positions back to stories
         test_stories = [
             fb_stories[valid_idx] for valid_idx in np.where(valid)[0][test_pos]
@@ -444,6 +479,9 @@ def main() -> None:
                     formula,
                     neutral_weight=config.model.neutral_weight,
                     mmr_threshold=config.model.diversity_threshold,
+                    probs_strip=probs_strip,
+                    cand_sim_up=cand_sim_up,
+                    cand_sim_down=cand_sim_down,
                 )
             )
 
@@ -468,6 +506,8 @@ def main() -> None:
         "config": {
             "split": "5-fold-stratified",
             "random_state": 0,
+            "user_token": user.token,
+            "user_id": user.id,
             "n_feedback": int(len(fb_labels)),
             "n_candidates": int(len(candidates)),
             "n_folds": 5,

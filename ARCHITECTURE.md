@@ -65,40 +65,47 @@ We evaluated multiple embedding models for topic-level matching:
 
 **Field-level embedding**: Each story's text is embedded as 4 separate fields (title, self_text, article_body, comments), then averaged with equal weights. This avoids truncation issues and lets each field contribute independently.
 
-#### 395-Dimensional Feature Vector
+#### 389-Dimensional Production SVM Feature Vector
 
-The SVM trains on a **395-dimensional feature vector**:
+The production SVM trains on a **389-dimensional feature vector**:
 * **`[0-383]` (384-d)**: MiniLM sentence embedding (concatenated text).
-* **`[384-387]` (4-d)**: Similarity metrics to historical feedback:
-  * Mean cosine similarity to upvoted story embeddings (global mean, LOOCV for training).
-  * Mean cosine similarity to downvoted story embeddings (global mean, LOOCV for training).
+* **`[384]` (1-d)**: Normalized log text length: `min(log1p(len), 12.0) / 12.0`.
+* **`[385-388]` (4-d)**: Similarity metrics to historical feedback:
+  * Mean cosine similarity to the top-k upvoted story embeddings (`knn_k=10`, LOOCV for training).
+  * Mean cosine similarity to the top-k downvoted story embeddings (`knn_k=10`, LOOCV for training).
   * Maximum cosine similarity to any upvoted story embedding.
   * Maximum cosine similarity to any downvoted story embedding.
-* **`[388]` (1-d)**: Normalized log points: `min(log1p(score), 8.0) / 8.0`.
-* **`[389]` (1-d)**: Normalized log comment count: `min(log1p(comments), 7.0) / 7.0`.
-* **`[390]` (1-d)**: Normalized log text length: `min(log1p(len), 12.0) / 12.0`.
-* **`[391]` (1-d)**: Normalized engagement quality (points per hour since submission): `min(log1p(quality), 8.0) / 8.0`.
-* **`[392]` (1-d)**: Normalized comment-to-score ratio: `min(log1p(comments / max(score, 1)), 3.0) / 3.0`.
-* **`[393]` (1-d)**: Normalized score velocity (points per hour, floored at 6 min): `min(log1p(score / max(hours, 0.1)), 8.0) / 8.0`.
-* **`[394]` (1-d)**: Normalized comment velocity (comments per hour, floored at 6 min): `min(log1p(comments / max(hours, 0.1)), 8.0) / 8.0`.
-* **`[395]` (1-d)**: Binary indicator `is_hn` (`1.0` if `source == "hn"`, else `0.0`).
-* **`[396]` (1-d)**: Hour of day (0-1, normalized).
 
-To prevent train-test covariate shift / feature leakage, when computing the similarity features for training stories, we explicitly exclude each story itself from its class reference set (e.g. using a self-exclusion mask to set self-similarity to `-999.0` for $k$-NN mean calculations, and setting its entry in the similarity matrix to `-1.0` before maximum reduction).
+The SVM deliberately excludes engagement/source metadata: score, comment count, HN quality, comment-to-score ratio, score velocity, comment velocity, and `is_hn`. These features produced inflated archive-wide offline metrics and worse 30-day held-out ranking than the semantic/text/similarity feature set.
 
-To avoid outlier features (like fresh stories having extremely large negative z-scores like `-4.8` for points/comments, or similarity features having blown-up z-scores due to low training variance) from completely dominating the SVM ranking decision, the 11 standard-scaled metadata features are clipped to the range `[-2.5, 2.5]`. This z-score clipping significantly improves raw ranking metrics (Raw NDCG@100 from `0.720` to `0.738`, Raw NDCG@200 from `0.691` to `0.706`) and prevents model overfitting.
+To prevent train-test covariate shift / feature leakage, when computing the similarity features for training stories, we explicitly exclude each story itself from its class reference set (using a self-exclusion mask to set self-similarity below the valid cosine range for $k$-NN mean calculations, and setting its entry in the similarity matrix to `-1.0` before maximum reduction).
 
-### 3.3 Fast SVM Personalization & Numerically Stable Softmax
-To enable fast, synchronous reranking when a user submits feedback, we avoid the slow Platt calibration path (`probability=True` in scikit-learn's `SVC`), which relies on 5-fold cross-validation and takes **~2.0s**. Instead, we train the SVM with `probability=False` (**~150ms** fit time) and approximate the class probabilities by running a numerically stable `softmax` over the raw multi-class decision values:
+To avoid outlier features (like fresh stories having extremely large negative z-scores like `-4.8` for points/comments, or similarity features having blown-up z-scores due to low training variance) from completely dominating the SVM ranking decision, the standard-scaled metadata features are clipped to the range `[-2.5, 2.5]`. This z-score clipping significantly improves raw ranking metrics (Raw NDCG@100 from `0.720` to `0.738`, Raw NDCG@200 from `0.691` to `0.706`) and prevents model overfitting.
 
-$$p_i = \frac{e^{f_i - \max(f)}}{\sum_j e^{f_j - \max(f)}}$$
+### 3.3 SVM Personalization
+When both upvote and downvote feedback pass the dual gate, the runtime trains a per-user `SVC` with `probability=True` and ranks candidates by:
 
-This configuration drops overall fitting and scoring latency from **~3.0s** to **~800ms** (or **~280ms** if candidate pruning is applied) while preserving almost identical personalization quality.
+$$p(\text{up}) + \text{neutral\_weight} \cdot p(\text{neutral})$$
+
+The model is trained synchronously on dashboard render from cached embeddings and feedback rows. This remains a known optimization target: scikit-learn deprecates `SVC(probability=True)`, and replacing calibrated probabilities with margin-score ranking would remove the internal calibration cost and likely improve small-sample stability.
 
 **Optimal hyperparameters** (grid search 2026-06-21): `C=0.3`, `gamma=0.21`, `kernel=rbf`, `neutral_weight=0.0`.
 
+#### Dual-Gate SVM Activation
+
+The SVM trains only when **both** the upvote and downvote classes have enough examples. This prevents the SVM from over-fitting to a sparse, incoherent down class.
+
+Configuration (`config.toml`):
+- `min_up_for_svm = 20`
+- `min_down_for_svm = 20`
+
+The soft blend ramp uses `n_min = min(n_up, n_down)` as its basis:
+$$\alpha = \text{clip}\left(\frac{n_{\min} - 20}{60},\ 0,\ 1\right)$$
+
+The blend starts when both classes have at least 20 feedback entries and reaches full SVM influence when both classes have at least 80 entries. A user with 50 upvotes but only 5 downvotes sees pure tier-2 (centroid-diff) regardless of total feedback count.
+
 ### 3.4 MMR & Surfacing Passes
-Standard MMR (Maximal Marginal Relevance) strictly penalizes topic duplication based on similarity. The `mmr_filter` function iterates through candidates in SVM-rank order; for each unselected candidate, it selects that candidate and discards all subsequent candidates with cosine similarity above the threshold (`config.model.diversity_threshold`, default 0.50). The highest-SVM-scored member of each similarity cluster is always the representative — cluster selection is fully driven by the personalized SVM, not HN engagement. The final set is sorted back to match original SVM relative rank order.
+Standard MMR (Maximal Marginal Relevance) strictly penalizes topic duplication based on similarity. The `mmr_filter` function iterates through candidates in SVM-rank order; for each unselected candidate, it selects that candidate and discards all subsequent candidates with cosine similarity above the threshold (`config.model.diversity_threshold`, default 0.75). The highest-SVM-scored member of each similarity cluster is always the representative — cluster selection is fully driven by the personalized SVM, not HN engagement. The final set is sorted back to match original SVM relative rank order.
 
 All candidates are evaluated for discovery badges in a single decoration pass. Thus, any story on the dashboard (whether from the default MMR path or surfaced extra slots) that meets the badge criteria will display the corresponding badge. The orchestrator then surfaces extra recommending slots from the decorated candidates not selected by the default MMR path (the remaining candidates pool) to guarantee coverage of different discovery signals:
 * **Uncertainty/Entropy Surfacing**: We compute the Shannon Entropy of the model's predicted probability distribution (Down, Neutral, Up). The orchestrator reserves up to 3 slots for the remaining candidates with the highest entropy, flagging them as `is_uncertain=True` (badge `🤔 Unsure`) to prompt active feedback.
@@ -111,7 +118,7 @@ All candidates are evaluated for discovery badges in a single decoration pass. T
 Each discovery pass selects from the decorated remaining candidates and deduplicates against previously selected IDs before appending. These default path badges do not count toward the budget of the extra recommends slots.
 
 ### 3.5 Client-side Autohide & DOM Swap
-When a user upvotes/downvotes a card, the UI writes the current card height inline, triggers a CSS collapse transition (`max-height: 0 !important; opacity: 0;`), and removes the card from the DOM after 400ms. Synchronously, the web server runs a fast, in-memory re-ranking and re-rendering pass (`fast_rerank_and_render`) in under 300ms, writing the newly ordered dashboard to disk. Once the card fade-out finishes, the client performs a background fetch of the updated HTML page and swaps the `#stories` card container in-place to present the recalculated, personalized rankings instantly without a full page reload.
+When a user upvotes/downvotes a card, the UI writes the current card height inline, triggers a CSS collapse transition (`max-height: 0 !important; opacity: 0;`), and removes the card from the DOM after 400ms. The feedback POST updates the SQLite database, clears the user's short-lived dashboard cache entry, and wakes the background regen thread. Once the card fade-out finishes, the client performs a background fetch of the dashboard HTML; the server calls `fast_rerank_for_user`, renders the personalized ranking in memory, caches it for up to 300 seconds, and returns it without writing per-user HTML to disk. The client then swaps the `#stories` card container in-place to present the recalculated rankings without a full page reload.
 
 ### 3.6 Algolia Candidate Fetch Window
 The live-window fetch (`pipeline.py:336`) queries the Algolia HN search API in 7 daily chunks. Each day's fetch collects up to **350 hits** (5 pages of 100, minus stories with `points <= 5`). This cap was raised from 150 to capture the majority of high-score stories on busy days; previously, stories on high-volume days could be dropped before the reranker evaluated them.
@@ -170,6 +177,9 @@ The system supports multiple users with independent feedback histories and perso
 * **SVM Training**: Per-user SVM is trained lazily on first dashboard request. Model is cached in memory (dict keyed by user_id, 5-minute TTL, max 50 entries).
 * **Feedback API**: `POST /api/feedback` requires valid session cookie. The `user_id` is extracted from the token and passed to `upsert_feedback`.
 * **Frontend**: localStorage keys are prefixed with the user token (`<token>_feedback_<story_id>`) to prevent cross-user state leakage.
+
+### 3.11 Evaluation Scripts
+Offline eval scripts resolve the `default` token through the `users` table and pass that `user_id` explicitly to `get_feedback_for_training()`. This keeps personalized metrics scoped to the default user's labels instead of pooling all users' feedback.
 
 ---
 
