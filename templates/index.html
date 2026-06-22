@@ -62,7 +62,7 @@
     .controls-row select {
       width: auto;
       margin-bottom: 0;
-      padding: 0.25rem 0.5rem;
+      padding: 0.25rem 1.75rem 0.25rem 0.5rem;
       font-size: 0.8rem;
       height: auto;
     }
@@ -566,7 +566,7 @@
       const cards = Array.from(document.querySelectorAll('.story-card'));
       if (mode === 'score') {
         cards.sort((a, b) => parseFloat(b.dataset.score) - parseFloat(a.dataset.score));
-      } else if (mode === 'time') {
+      } else if (mode === 'date') {
         cards.sort((a, b) => parseInt(b.dataset.time) - parseInt(a.dataset.time));
       }
       cards.forEach(card => storiesContainer.appendChild(card));
