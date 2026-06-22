@@ -1,5 +1,4 @@
 [hn_rewrite]
-username = "pure_coder"
 db_path = "hn_rewrite.db"
 output = "public/index.html"
 days = 30
@@ -9,10 +8,10 @@ server_port = 8766
 regen_interval_seconds = 10800
 
 [hn_rewrite.model]
-svm_c = 0.1
-# svm_gamma = 0.1
-svm_kernel = "linear"
-neutral_weight = 0.2
+svm_c = 0.3
+svm_gamma = 0.21
+svm_kernel = "rbf"
+neutral_weight = 0.0
 min_feedback_labels = 10
 min_signal_examples = 5
 diversity_threshold = 0.50

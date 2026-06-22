@@ -190,7 +190,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/user":
             user = self._get_user()
             if user:
-                self._json_response({"user_id": user.id, "username": user.username, "token": user.token})
+                self._json_response({"user_id": user.id, "token": user.token})
             else:
                 self._json_response({"error": "No session"}, status=401)
             return
@@ -232,7 +232,7 @@ class Handler(BaseHTTPRequestHandler):
         from pipeline import fast_rerank_for_user, generate_dashboard_bytes
 
         final = fast_rerank_for_user(self.db, self.config, self.embedder, user.id)
-        html = generate_dashboard_bytes(final, self.config, user.username, self.db, user.id)
+        html = generate_dashboard_bytes(final, self.config, self.db, user.id, user.token)
 
         self._dashboard_cache[cache_key] = (html, now)
         return html

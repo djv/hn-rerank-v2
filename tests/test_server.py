@@ -14,7 +14,7 @@ def test_env(tmp_path):
     db = Database(str(db_file))
 
     # Create test user
-    user = db.create_user("test_token", "test_user")
+    user = db.create_user("test_token")
 
     output_file = tmp_path / "public" / "index.html"
     output_file.parent.mkdir(parents=True, exist_ok=True)

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>HN Rerank | @{{ username }}</title>
+  <title>HN Rerank</title>
   <style>
     /* Inlined Pico CSS */
     {{ pico_css | safe }}
@@ -40,6 +40,15 @@
       font-size: 0.8rem;
       color: var(--pico-muted-color);
       margin-top: 0.2rem;
+    }
+
+    .share-link {
+      margin-left: 0.5rem;
+      font-size: 0.75rem;
+      opacity: 0.6;
+    }
+    .share-link:hover {
+      opacity: 1;
     }
 
     .controls-row {
@@ -415,7 +424,7 @@
       </div>
       <div class="controls-row">
         <div class="meta-subtitle">
-          @{{ username }} · updated {{ timestamp }}
+          {% if user_token %}<a href="/u/{{ user_token }}" class="share-link" title="Use this link to sync other devices">{{ user_token }}</a> · {% endif %}updated {{ timestamp }}
         </div>
         <select id="sort-mode" aria-label="Sort options">
           <option value="score" selected>Sort by Score</option>

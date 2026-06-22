@@ -47,25 +47,44 @@ To prevent constraint violations or data loss during cleanup:
 * `prune_stories` leaves feedback-associated stories intact (`id NOT IN (SELECT story_id FROM feedback)`).
 * `get_all_feedback` and `get_feedback_for_training` perform a `LEFT JOIN` against `stories` to resolve attributes dynamically.
 
-### 3.2 395-Dimensional Feature Space
-Rather than mixing semantic matches with engagement counts using arbitrary manual weights, we feed them directly into the Support Vector Machine (SVM). The model trains on a **395-dimensional feature vector**:
-* **`[0-383]` (384-d)**: MiniLM sentence embedding of `text_content`.
-* **`[384]` (1-d)**: Normalized log points: `min(log1p(score), 8.0) / 8.0`.
-* **`[385]` (1-d)**: Normalized log comment count: `min(log1p(comments), 7.0) / 7.0`.
-* **`[386]` (1-d)**: Normalized log text length: `min(log1p(len), 12.0) / 12.0`.
-* **`[387]` (1-d)**: Normalized engagement quality (points per hour since submission): `min(log1p(quality), 8.0) / 8.0`.
-  * **Quality formula**: `score / (hours_since_submission + 1)`. Raw standalone age is not directly appended, but is utilized here.
-* **`[388]` (1-d)**: Normalized comment-to-score ratio: `min(log1p(comments / max(score, 1)), 3.0) / 3.0`.
-* **`[389]` (1-d)**: Normalized score velocity (points per hour, floored at 6 min): `min(log1p(score / max(hours, 0.1)), 8.0) / 8.0`.
-* **`[390]` (1-d)**: Normalized comment velocity (comments per hour, floored at 6 min): `min(log1p(comments / max(hours, 0.1)), 8.0) / 8.0`.
-  * Velocity features differ from quality in the time floor (`max(hours, 0.1)` vs `hours + 1`), giving more weight to very fresh stories, and the comment term has no counterpart in the quality feature.
-* **`[391-394]` (4-d)**: Normalized similarity metrics to historical feedback:
-  * Mean cosine similarity to upvoted story embeddings.
-  * Mean cosine similarity to downvoted story embeddings.
+### 3.2 Embedding Model & Feature Space
+
+#### Embedding Model Choice
+
+We evaluated multiple embedding models for topic-level matching:
+
+| Model | Dims | Context | Mean Sim (unrelated) | Speed | Verdict |
+|-------|------|---------|---------------------|-------|---------|
+| MiniLM | 384 | 256 | **0.091** | **6.6ms** | **Best** ✅ |
+| BGE-small | 384 | 512 | 0.385 | ~5ms | Good |
+| Nomic | 768 | 2048 | 0.381 | 34ms | Slow |
+| BGE-base | 768 | 512 | 0.480 | 28ms | Moderate |
+| Jina v2-small | 512 | 512 | 0.646 | 5ms | Poor ❌ |
+
+**Key finding**: MiniLM has the best discrimination (0.091 mean similarity for unrelated texts). Longer context (512+ tokens) actually hurts discrimination by adding noise. The 256-token limit is optimal — it captures title + first paragraph without noise.
+
+**Field-level embedding**: Each story's text is embedded as 4 separate fields (title, self_text, article_body, comments), then averaged with equal weights. This avoids truncation issues and lets each field contribute independently.
+
+#### 395-Dimensional Feature Vector
+
+The SVM trains on a **395-dimensional feature vector**:
+* **`[0-383]` (384-d)**: MiniLM sentence embedding (concatenated text).
+* **`[384-387]` (4-d)**: Similarity metrics to historical feedback:
+  * Mean cosine similarity to upvoted story embeddings (global mean, LOOCV for training).
+  * Mean cosine similarity to downvoted story embeddings (global mean, LOOCV for training).
   * Maximum cosine similarity to any upvoted story embedding.
   * Maximum cosine similarity to any downvoted story embedding.
+* **`[388]` (1-d)**: Normalized log points: `min(log1p(score), 8.0) / 8.0`.
+* **`[389]` (1-d)**: Normalized log comment count: `min(log1p(comments), 7.0) / 7.0`.
+* **`[390]` (1-d)**: Normalized log text length: `min(log1p(len), 12.0) / 12.0`.
+* **`[391]` (1-d)**: Normalized engagement quality (points per hour since submission): `min(log1p(quality), 8.0) / 8.0`.
+* **`[392]` (1-d)**: Normalized comment-to-score ratio: `min(log1p(comments / max(score, 1)), 3.0) / 3.0`.
+* **`[393]` (1-d)**: Normalized score velocity (points per hour, floored at 6 min): `min(log1p(score / max(hours, 0.1)), 8.0) / 8.0`.
+* **`[394]` (1-d)**: Normalized comment velocity (comments per hour, floored at 6 min): `min(log1p(comments / max(hours, 0.1)), 8.0) / 8.0`.
+* **`[395]` (1-d)**: Binary indicator `is_hn` (`1.0` if `source == "hn"`, else `0.0`).
+* **`[396]` (1-d)**: Hour of day (0-1, normalized).
 
-To prevent train-test covariate shift / feature leakage, when computing the similarity features for training stories, we explicitly exclude each story itself from its class centroid/reference set (e.g. subtracting its contribution from the mean vector and setting its entry in the similarity matrix to `-1.0` before maximum reduction).
+To prevent train-test covariate shift / feature leakage, when computing the similarity features for training stories, we explicitly exclude each story itself from its class reference set (e.g. using a self-exclusion mask to set self-similarity to `-999.0` for $k$-NN mean calculations, and setting its entry in the similarity matrix to `-1.0` before maximum reduction).
 
 To avoid outlier features (like fresh stories having extremely large negative z-scores like `-4.8` for points/comments, or similarity features having blown-up z-scores due to low training variance) from completely dominating the SVM ranking decision, the 11 standard-scaled metadata features are clipped to the range `[-2.5, 2.5]`. This z-score clipping significantly improves raw ranking metrics (Raw NDCG@100 from `0.720` to `0.738`, Raw NDCG@200 from `0.691` to `0.706`) and prevents model overfitting.
 
@@ -74,9 +93,9 @@ To enable fast, synchronous reranking when a user submits feedback, we avoid the
 
 $$p_i = \frac{e^{f_i - \max(f)}}{\sum_j e^{f_j - \max(f)}}$$
 
-This configuration drops overall fitting and scoring latency from **~3.0s** to **~800ms** (or **~280ms** if candidate pruning is applied) while preserving almost identical personalization quality:
-* **RBF SVM (Platt Calibration)**: MAP = `0.7255`, Median Rank = `88.0`
-* **Fast RBF SVM (Softmax)**: MAP = `0.6963`, Median Rank = `89.1`
+This configuration drops overall fitting and scoring latency from **~3.0s** to **~800ms** (or **~280ms** if candidate pruning is applied) while preserving almost identical personalization quality.
+
+**Optimal hyperparameters** (grid search 2026-06-21): `C=0.3`, `gamma=0.21`, `kernel=rbf`, `neutral_weight=0.0`.
 
 ### 3.4 MMR & Surfacing Passes
 Standard MMR (Maximal Marginal Relevance) strictly penalizes topic duplication based on similarity. The `mmr_filter` function iterates through candidates in SVM-rank order; for each unselected candidate, it selects that candidate and discards all subsequent candidates with cosine similarity above the threshold (`config.model.diversity_threshold`, default 0.50). The highest-SVM-scored member of each similarity cluster is always the representative — cluster selection is fully driven by the personalized SVM, not HN engagement. The final set is sorted back to match original SVM relative rank order.

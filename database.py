@@ -44,7 +44,6 @@ class FeedbackRecord:
 class User:
     id: int
     token: str
-    username: str
     created_at: float
 
 
@@ -146,7 +145,6 @@ class Database:
                     CREATE TABLE IF NOT EXISTS users (
                         id          INTEGER PRIMARY KEY,
                         token       TEXT UNIQUE NOT NULL,
-                        username    TEXT NOT NULL DEFAULT 'anon',
                         created_at  REAL NOT NULL
                     )
                 """)
@@ -169,7 +167,7 @@ class Database:
                             )
                         """)
                         conn.execute(
-                            "INSERT OR IGNORE INTO users (id, token, username, created_at) VALUES (1, 'default', 'user', ?)",
+                            "INSERT OR IGNORE INTO users (id, token, created_at) VALUES (1, 'default', ?)",
                             (time.time(),)
                         )
                         conn.execute("""
@@ -192,7 +190,7 @@ class Database:
                             )
                         """)
                         conn.execute(
-                            "INSERT OR IGNORE INTO users (id, token, username, created_at) VALUES (1, 'default', 'user', ?)",
+                            "INSERT OR IGNORE INTO users (id, token, created_at) VALUES (1, 'default', ?)",
                             (time.time(),)
                         )
                         conn.execute("""
@@ -203,7 +201,7 @@ class Database:
                         conn.execute("ALTER TABLE feedback_new RENAME TO feedback")
                 else:
                     conn.execute(
-                        "INSERT OR IGNORE INTO users (id, token, username, created_at) VALUES (1, 'default', 'user', ?)",
+                        "INSERT OR IGNORE INTO users (id, token, created_at) VALUES (1, 'default', ?)",
                         (time.time(),)
                     )
                     conn.execute("""
@@ -542,24 +540,24 @@ class Database:
                 return cursor.fetchall()
 
     # Users
-    def create_user(self, token: str, username: str = "anon") -> User:
+    def create_user(self, token: str) -> User:
         with self._conn() as conn:
             with conn:
                 now = time.time()
                 conn.execute(
-                    "INSERT INTO users (token, username, created_at) VALUES (?, ?, ?)",
-                    (token, username, now),
+                    "INSERT INTO users (token, created_at) VALUES (?, ?)",
+                    (token, now),
                 )
                 row = conn.execute("SELECT id FROM users WHERE token = ?", (token,)).fetchone()
-                return User(id=row[0], token=token, username=username, created_at=now)
+                return User(id=row[0], token=token, created_at=now)
 
     def get_user_by_token(self, token: str) -> User | None:
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT id, token, username, created_at FROM users WHERE token = ?", (token,)
+                "SELECT id, token, created_at FROM users WHERE token = ?", (token,)
             ).fetchone()
             if row:
-                return User(id=row[0], token=row[1], username=row[2], created_at=row[3])
+                return User(id=row[0], token=row[1], created_at=row[2])
             return None
 
     def get_or_create_user(self, token: str) -> User:
@@ -567,8 +565,3 @@ class Database:
         if user:
             return user
         return self.create_user(token)
-
-    def update_username(self, user_id: int, username: str) -> None:
-        with self._conn() as conn:
-            with conn:
-                conn.execute("UPDATE users SET username = ? WHERE id = ?", (username, user_id))

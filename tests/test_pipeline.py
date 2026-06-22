@@ -53,7 +53,7 @@ def test_embedder_cache_hit(db, embedder):
     assert embs1.shape == (1, 384)
 
     # Second call: check if cached
-    model_version = "all-MiniLM-L6-v2|mean|norm|512"
+    model_version = "all-MiniLM-L6-v2|mean|norm|256"
     import hashlib
     shash = hashlib.sha256(story.text_content.encode("utf-8")).hexdigest()
     cached = db.get_embedding(999, model_version, shash)
@@ -128,7 +128,7 @@ def test_rank_no_feedback_fallback(db, embedder):
 
 def test_rank_svm_path(db, embedder):
     config = Config()
-    user = db.create_user("test_token_svm", "test_user")
+    user = db.create_user("test_token_svm")
     # Populate DB with enough feedback to activate Feedback SVM (min_feedback_labels = 10)
     # We need >= 10 up (label=2) and >= 10 down (label=0)
     for i in range(10):
@@ -353,8 +353,8 @@ def test_augment_features_properties(meta):
 def test_svm_fitting_robustness(embedder, feedback_actions, cand_count):
     db = Database(":memory:")
     try:
-        user = db.create_user("test_token_robustness", "test_user")
-        model_version = "all-MiniLM-L6-v2|mean|norm|512"
+        user = db.create_user("test_token_robustness")
+        model_version = "all-MiniLM-L6-v2|mean|norm|256"
         for i, action in enumerate(feedback_actions):
             story = Story(
                 id=1000 + i,
@@ -689,7 +689,7 @@ async def test_run_pipeline_badge_assignment(tmp_path, monkeypatch):
 
     db_file = tmp_path / "test.db"
     db = Database(str(db_file))
-    user = db.create_user("test_token_badge", "test_user")
+    user = db.create_user("test_token_badge")
 
     # 1. Create candidates list
     now = time.time()

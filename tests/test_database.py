@@ -121,7 +121,7 @@ def test_get_embeddings_batch(db):
 
 def test_feedback_crud(db):
     # Create a test user
-    user = db.create_user("test_token_1", "test_user")
+    user = db.create_user("test_token_1")
 
     story = Story(
         id=456,
@@ -165,7 +165,7 @@ def test_prune_stories(db):
 
 
 def test_prune_stories_preserves_feedback_stories(db):
-    user = db.create_user("test_token_2", "test_user")
+    user = db.create_user("test_token_2")
     story1 = Story(id=1, title="S1", url=None, score=10, time=100, text_content="T1")
     story2 = Story(id=2, title="S2", url=None, score=20, time=100, text_content="T2")
     db.upsert_story(story1)
@@ -180,7 +180,7 @@ def test_prune_stories_preserves_feedback_stories(db):
 
 
 def test_feedback_training_data(db):
-    user = db.create_user("test_token_3", "test_user")
+    user = db.create_user("test_token_3")
     db.upsert_story(Story(id=1, title="T1", url=None, score=100, time=1600000000, text_content="Text1", source="hn"))
     db.upsert_story(Story(id=2, title="T2", url=None, score=100, time=1600000000, text_content="Text2", source="hn"))
     db.upsert_story(Story(id=3, title="T3", url=None, score=100, time=1600000000, text_content="Text3", source="hn"))
@@ -210,7 +210,7 @@ def test_feedback_training_data(db):
 def test_story_pruning_integrity_invariants(fetched_offsets, feedback_indices):
     db = Database(":memory:")
     try:
-        user = db.create_user("test_token_hypothesis", "test_user")
+        user = db.create_user("test_token_hypothesis")
         now = time.time()
         max_age_days = 30
         cutoff = now - (max_age_days * 86400)
@@ -263,16 +263,14 @@ def test_story_pruning_integrity_invariants(fetched_offsets, feedback_indices):
 
 def test_user_management(db):
     # Test create_user
-    user = db.create_user("tok123", "user123")
+    user = db.create_user("tok123")
     assert user.id is not None
     assert user.token == "tok123"
-    assert user.username == "user123"
 
     # Test get_user_by_token
     fetched = db.get_user_by_token("tok123")
     assert fetched is not None
     assert fetched.id == user.id
-    assert fetched.username == "user123"
 
     # Test get_or_create_user
     existing = db.get_or_create_user("tok123")
@@ -280,17 +278,11 @@ def test_user_management(db):
 
     new_user = db.get_or_create_user("new_tok")
     assert new_user.token == "new_tok"
-    assert new_user.username == "anon"
-
-    # Test update_username
-    db.update_username(user.id, "new_username")
-    updated = db.get_user_by_token("tok123")
-    assert updated.username == "new_username"
 
 
 def test_per_user_feedback_isolation(db):
-    user1 = db.create_user("token_u1", "user1")
-    user2 = db.create_user("token_u2", "user2")
+    user1 = db.create_user("token_u1")
+    user2 = db.create_user("token_u2")
 
     story = Story(
         id=99,

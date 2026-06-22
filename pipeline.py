@@ -34,6 +34,7 @@ class ModelConfig:
     svm_kernel: str = "rbf"
     neutral_weight: float = 0.0
     diversity_threshold: float = 0.50
+    knn_k: int = 5
 
 
 # Comment text refetch thresholds (used during regen to refresh stale text_content)
@@ -51,7 +52,6 @@ class RssConfig:
 
 @dataclass(frozen=True)
 class Config:
-    username: str = "user"
     db_path: str = "hn_rewrite.db"
     output: str = "public/index.html"
     days: int = 30
@@ -75,7 +75,6 @@ class Config:
         rss_cfg = main_cfg.get("rss", {})
 
         return cls(
-            username=main_cfg.get("username", "user"),
             db_path=main_cfg.get("db_path", "hn_rewrite.db"),
             output=main_cfg.get("output", "public/index.html"),
             days=main_cfg.get("days", 30),
@@ -89,6 +88,7 @@ class Config:
                 svm_kernel=model_cfg.get("svm_kernel", "rbf"),
                 neutral_weight=model_cfg.get("neutral_weight", 0.0),
                 diversity_threshold=model_cfg.get("diversity_threshold", 0.50),
+                knn_k=model_cfg.get("knn_k", 5),
             ),
             rss=RssConfig(
                 enabled=rss_cfg.get("enabled", True),
@@ -373,7 +373,7 @@ async def refetch_story_text(
         new_vec = embedder.encode([new_text_content])[0]
         import hashlib
         new_hash = hashlib.sha256(new_text_content.encode("utf-8")).hexdigest()
-        db.upsert_embedding(story_id, "all-MiniLM-L6-v2|mean|norm|512", new_hash, new_vec)
+        db.upsert_embedding(story_id, "all-MiniLM-L6-v2|mean|norm|256", new_hash, new_vec)
 
         return updated
     except Exception as e:
@@ -821,7 +821,7 @@ def get_or_compute_embeddings(
     }
 
     ids = [s.id for s in stories]
-    model_version = "all-MiniLM-L6-v2|mean|norm|512"
+    model_version = "all-MiniLM-L6-v2|mean|norm|256"
 
     cached = db.get_embeddings_batch(ids, model_version, story_hashes)
     missing_stories = [s for s in stories if s.id not in cached]
@@ -847,6 +847,16 @@ _LOG_QUALITY_SCALE = 8.0  # log1p(score/(age_hours+1)) rarely exceeds 8
 _LOG_VELOCITY_SCALE = 8.0  # log1p(score/max(age_h, 0.1)) rarely exceeds 8
 
 
+def _knn_similarity(query_emb: NDArray[np.float32], ref_emb: NDArray[np.float32], k: int) -> NDArray[np.float32]:
+    """Mean of top-k cosine similarities between query and reference embeddings."""
+    if ref_emb.shape[0] == 0:
+        return np.zeros(query_emb.shape[0], dtype=np.float32)
+    sim_mat = query_emb @ ref_emb.T
+    k_actual = min(k, ref_emb.shape[0])
+    topk = np.sort(sim_mat, axis=1)[:, -k_actual:]
+    return topk.mean(axis=1).astype(np.float32)
+
+
 def _augment_features(
     embeddings: NDArray[np.float32],
     scores: list[int] | np.ndarray,
@@ -861,10 +871,13 @@ def _augment_features(
     closest_upvoted: np.ndarray | None = None,
     closest_downvoted: np.ndarray | None = None,
     comment_score_ratio: np.ndarray | None = None,
+    is_hn: np.ndarray | None = None,
+    hour_of_day: np.ndarray | None = None,
+    engagement_ratio: np.ndarray | None = None,
 ) -> NDArray[np.float32]:
     n = len(scores)
     n_meta = 1
-    for f in (comment_counts, text_lengths, hn_quality, comment_score_ratio):
+    for f in (comment_counts, text_lengths, hn_quality, comment_score_ratio, is_hn, hour_of_day, engagement_ratio):
         if f is not None:
             n_meta += 1
     if score_velocity is not None and comment_velocity is not None:
@@ -934,7 +947,20 @@ def _augment_features(
         meta[:, col] = (np.clip(closest_downvoted, -1, 1) + 1) / 2
         col += 1
 
+    if is_hn is not None:
+        meta[:, col] = is_hn
+        col += 1
+
+    if hour_of_day is not None:
+        meta[:, col] = hour_of_day
+        col += 1
+
+    if engagement_ratio is not None:
+        meta[:, col] = engagement_ratio
+        col += 1
+
     return np.concatenate([embeddings, meta], axis=1)
+
 
 
 def rank_stories(
@@ -969,57 +995,61 @@ def rank_stories(
             fb_up_embs = fb_embeddings[up_mask]
             fb_down_embs = fb_embeddings[down_mask]
 
-            mean_up = (
-                fb_up_embs.mean(axis=0)
-                if up_mask.any()
-                else np.zeros(384, dtype=np.float32)
-            )
-            mean_down = (
-                fb_down_embs.mean(axis=0)
-                if down_mask.any()
-                else np.zeros(384, dtype=np.float32)
-            )
-
             n_up = int(up_mask.sum())
-            fb_sim_to_up = fb_embeddings @ mean_up
-            if n_up > 0:
-                if n_up > 1:
-                    fb_sim_to_up[up_mask] = (n_up * fb_sim_to_up[up_mask] - 1.0) / (
-                        n_up - 1
-                    )
-                else:
-                    fb_sim_to_up[up_mask] = 0.0
+            n_down = int(down_mask.sum())
+            k = config.model.knn_k
 
+            # k-NN similarity (mean of top-k similarities to class)
+            cand_sim_to_up = _knn_similarity(candidate_embeddings, fb_up_embs, k)
+            cand_sim_to_down = _knn_similarity(candidate_embeddings, fb_down_embs, k)
+
+            # LOOCV k-NN for training: exclude self from reference set
+            fb_sim_to_up = np.zeros(len(fb_embeddings), dtype=np.float32)
+            fb_sim_to_down = np.zeros(len(fb_embeddings), dtype=np.float32)
+            if n_up > 0:
+                up_indices = np.where(up_mask)[0]
                 sim_up_mat = fb_embeddings @ fb_up_embs.T
                 if n_up > 1:
-                    train_up_positions = np.where(up_mask)[0]
-                    for idx, tp in enumerate(train_up_positions):
-                        sim_up_mat[tp, idx] = -1.0
-                fb_closest_up = np.max(sim_up_mat, axis=1)
+                    for idx, tp in enumerate(up_indices):
+                        sim_up_mat[tp, idx] = -2.0  # exclude self
+                k_eff_up = min(k, n_up)
+                for i in range(len(fb_embeddings)):
+                    sims = sim_up_mat[i]
+                    exclude = 1 if i in up_indices else 0
+                    n_available = max(1, n_up - exclude)
+                    k_use = min(k_eff_up, n_available)
+                    topk = np.sort(sims)[-k_use:]
+                    fb_sim_to_up[i] = topk.mean()
+                sim_up_mat_clean = fb_embeddings @ fb_up_embs.T
+                if n_up > 1:
+                    for idx, tp in enumerate(up_indices):
+                        sim_up_mat_clean[tp, idx] = -1.0
+                fb_closest_up = np.max(sim_up_mat_clean, axis=1)
             else:
                 fb_closest_up = np.zeros(len(fb_embeddings), dtype=np.float32)
 
-            n_down = int(down_mask.sum())
-            fb_sim_to_down = fb_embeddings @ mean_down
             if n_down > 0:
-                if n_down > 1:
-                    fb_sim_to_down[down_mask] = (
-                        n_down * fb_sim_to_down[down_mask] - 1.0
-                    ) / (n_down - 1)
-                else:
-                    fb_sim_to_down[down_mask] = 0.0
-
+                down_indices = np.where(down_mask)[0]
                 sim_down_mat = fb_embeddings @ fb_down_embs.T
                 if n_down > 1:
-                    train_down_positions = np.where(down_mask)[0]
-                    for idx, tp in enumerate(train_down_positions):
-                        sim_down_mat[tp, idx] = -1.0
-                fb_closest_down = np.max(sim_down_mat, axis=1)
+                    for idx, tp in enumerate(down_indices):
+                        sim_down_mat[tp, idx] = -2.0
+                k_eff_down = min(k, n_down)
+                for i in range(len(fb_embeddings)):
+                    sims = sim_down_mat[i]
+                    exclude = 1 if i in down_indices else 0
+                    n_available = max(1, n_down - exclude)
+                    k_use = min(k_eff_down, n_available)
+                    topk = np.sort(sims)[-k_use:]
+                    fb_sim_to_down[i] = topk.mean()
+                sim_down_mat_clean = fb_embeddings @ fb_down_embs.T
+                if n_down > 1:
+                    for idx, tp in enumerate(down_indices):
+                        sim_down_mat_clean[tp, idx] = -1.0
+                fb_closest_down = np.max(sim_down_mat_clean, axis=1)
             else:
                 fb_closest_down = np.zeros(len(fb_embeddings), dtype=np.float32)
 
-            cand_sim_to_up = candidate_embeddings @ mean_up
-            cand_sim_to_down = candidate_embeddings @ mean_down
             cand_closest_up = (
                 np.max(candidate_embeddings @ fb_up_embs.T, axis=1)
                 if up_mask.any()
@@ -1049,6 +1079,8 @@ def rank_stories(
             fb_csr_ratio = fb_comment_counts / np.maximum(fb_scores, 1)
             fb_csr = np.clip(np.log1p(fb_csr_ratio), 0, 3.0) / 3.0
 
+            fb_is_hn = np.array([1.0 if s.source == "hn" else 0.0 for s in feedback_stories], dtype=np.float32)
+            fb_hour_of_day = np.array([(s.time % 86400) / 86400.0 for s in feedback_stories], dtype=np.float32)
             fb_features = _augment_features(
                 fb_embeddings,
                 fb_scores,
@@ -1063,6 +1095,8 @@ def rank_stories(
                 closest_upvoted=fb_closest_up,
                 closest_downvoted=fb_closest_down,
                 comment_score_ratio=fb_csr,
+                is_hn=fb_is_hn,
+                hour_of_day=fb_hour_of_day,
             )
 
             # Ensure all three classes (0, 1, 2) are present
@@ -1103,7 +1137,7 @@ def rank_stories(
                 gamma=config.model.svm_gamma,
                 random_state=0,
                 decision_function_shape="ovr",
-                probability=False,
+                probability=True,
             )
             svm.fit(fb_features_scaled, labels, sample_weight=sample_weights)
 
@@ -1118,6 +1152,8 @@ def rank_stories(
             cand_csr_ratio = cand_comment_counts / np.maximum(cand_scores, 1)
             cand_csr = np.clip(np.log1p(cand_csr_ratio), 0, 3.0) / 3.0
 
+            cand_is_hn = np.array([1.0 if s.source == "hn" else 0.0 for s in candidates], dtype=np.float32)
+            cand_hour_of_day = np.array([(s.time % 86400) / 86400.0 for s in candidates], dtype=np.float32)
             cand_features = _augment_features(
                 candidate_embeddings,
                 cand_scores,
@@ -1132,15 +1168,15 @@ def rank_stories(
                 closest_upvoted=cand_closest_up,
                 closest_downvoted=cand_closest_down,
                 comment_score_ratio=cand_csr,
+                is_hn=cand_is_hn,
+                hour_of_day=cand_hour_of_day,
             )
             cand_features_meta_scaled = np.clip(scaler.transform(cand_features[:, emb_dim:]), -2.5, 2.5)
             cand_features_scaled = np.hstack(
                 [cand_features[:, :emb_dim], cand_features_meta_scaled]
             )
 
-            df_cand = svm.decision_function(cand_features_scaled)
-            e_x = np.exp(df_cand - np.max(df_cand, axis=1, keepdims=True))
-            probs = e_x / e_x.sum(axis=1, keepdims=True)
+            probs = svm.predict_proba(cand_features_scaled)
             class_order = list(svm.classes_)
             idx_up = class_order.index(2)
             idx_neutral = class_order.index(1)
@@ -1274,7 +1310,6 @@ def time_ago_filter(seconds: int) -> str:
 def generate_dashboard(
     ranked: list[RankedStory],
     output_path: Path,
-    username: str,
     timestamp: str,
     server_port: int,
     db: Database,
@@ -1294,7 +1329,6 @@ def generate_dashboard(
 
     template = env.get_template("index.html")
     html_content = template.render(
-        username=username,
         timestamp=timestamp,
         stories=ranked,
         server_port=server_port,
@@ -1596,7 +1630,7 @@ async def run_pipeline(config: Config) -> None:
                     candidates[idx] = updated_map[s.id]
 
             # Update cache embeddings in the SQLite DB
-            model_version = "all-MiniLM-L6-v2|mean|norm|512"
+            model_version = "all-MiniLM-L6-v2|mean|norm|256"
             for sid, updated in updated_map.items():
                 new_vec = embedder.encode([updated.text_content])[0]
                 import hashlib
@@ -1638,7 +1672,6 @@ async def run_pipeline(config: Config) -> None:
     generate_dashboard(
         final,
         Path(config.output),
-        config.username,
         datetime.now().strftime("%Y-%m-%d %H:%M"),
         config.server_port,
         db,
@@ -1669,7 +1702,6 @@ def fast_rerank_and_render(
         generate_dashboard(
             [],
             Path(config.output),
-            config.username,
             datetime.now().strftime("%Y-%m-%d %H:%M"),
             config.server_port,
             db,
@@ -1697,7 +1729,6 @@ def fast_rerank_and_render(
     generate_dashboard(
         final,
         Path(config.output),
-        config.username,
         datetime.now().strftime("%Y-%m-%d %H:%M"),
         config.server_port,
         db,
@@ -1707,9 +1738,9 @@ def fast_rerank_and_render(
 def generate_dashboard_bytes(
     ranked: list[RankedStory],
     config: Config,
-    username: str,
     db: Database,
     user_id: int | None = None,
+    user_token: str | None = None,
 ) -> bytes:
     """Render dashboard to bytes without writing to disk."""
     env = Environment(loader=FileSystemLoader("templates"), autoescape=True)
@@ -1723,12 +1754,12 @@ def generate_dashboard_bytes(
 
     template = env.get_template("index.html")
     html_content = template.render(
-        username=username,
         timestamp=datetime.now().strftime("%Y-%m-%d %H:%M"),
         stories=ranked,
         server_port=config.server_port,
         pico_css=pico_css,
         fb_map=fb_map,
+        user_token=user_token,
     )
     return html_content.encode("utf-8")
 

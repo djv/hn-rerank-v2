@@ -28,10 +28,11 @@ from pipeline import (
     Config,
     RankedStory,
     _augment_features,
+    _knn_similarity,
     mmr_filter,
 )
 
-MODEL_VERSION = "all-MiniLM-L6-v2|mean|norm|512"
+MODEL_VERSION = "all-MiniLM-L6-v2|mean|norm|256"
 REPORT_PATH = Path(__file__).parent / "eval_report.json"
 
 
@@ -257,6 +258,7 @@ def main() -> None:
         fb_train_comments = fb_comment_counts_arr[train_pos]
         fb_train_textlens = fb_text_lengths_arr[train_pos]
         fb_train_quality = fb_quality_arr[train_pos]
+        fb_train_stories = [fb_stories[idx] for idx in np.where(valid)[0][train_pos]]
         fb_train_age_hours = fb_train_ages / 3600.0
         fb_train_safe_h = np.maximum(fb_train_age_hours, 0.1)
         fb_train_score_vel = fb_train_scores / fb_train_safe_h
@@ -286,14 +288,12 @@ def main() -> None:
         n_up = up_mask.sum()
         n_down = down_mask.sum()
 
-        mean_up = fb_up_train.mean(axis=0) if n_up else np.zeros(384, dtype=np.float32)
-        mean_down = (
-            fb_down_train.mean(axis=0) if n_down else np.zeros(384, dtype=np.float32)
-        )
+        # k-NN similarity (replaces global mean)
+        k = config.model.knn_k
 
-        # Candidate features (from train centroids — no self issue)
-        cand_sim_up = fold_cand_emb @ mean_up
-        cand_sim_down = fold_cand_emb @ mean_down
+        # Candidate features (no self issue)
+        cand_sim_up = _knn_similarity(fold_cand_emb, fb_up_train, k)
+        cand_sim_down = _knn_similarity(fold_cand_emb, fb_down_train, k)
         cand_closest_up = (
             np.max(fold_cand_emb @ fb_up_train.T, axis=1)
             if n_up
@@ -305,39 +305,51 @@ def main() -> None:
             else np.zeros(len(fold_candidates))
         )
 
-        # Train features: exclude self-contribution (LOOCV)
-        fb_sim_up = fb_train_emb @ mean_up
-        fb_sim_down = fb_train_emb @ mean_down
+        # Train features: k-NN with LOOCV self-exclusion
+        fb_sim_up = np.zeros(len(fb_train_emb), dtype=np.float32)
+        fb_sim_down = np.zeros(len(fb_train_emb), dtype=np.float32)
 
         if n_up > 0:
-            if n_up > 1:
-                fb_sim_up[up_mask] = (n_up * fb_sim_up[up_mask] - 1.0) / (n_up - 1)
-            else:
-                fb_sim_up[up_mask] = 0.0
-
+            up_indices = np.where(up_mask)[0]
             sim_up_mat = fb_train_emb @ fb_up_train.T
             if n_up > 1:
-                train_up_positions = np.where(up_mask)[0]
-                for i, tp in enumerate(train_up_positions):
-                    sim_up_mat[tp, i] = -1.0
-            fb_closest_up = np.max(sim_up_mat, axis=1)
+                for i, tp in enumerate(up_indices):
+                    sim_up_mat[tp, i] = -2.0  # exclude self
+            k_eff = min(k, n_up)
+            for i in range(len(fb_train_emb)):
+                sims = sim_up_mat[i]
+                exclude = 1 if i in up_indices else 0
+                n_available = max(1, n_up - exclude)
+                k_use = min(k_eff, n_available)
+                topk = np.sort(sims)[-k_use:]
+                fb_sim_up[i] = topk.mean()
+            sim_up_mat_clean = fb_train_emb @ fb_up_train.T
+            if n_up > 1:
+                for i, tp in enumerate(up_indices):
+                    sim_up_mat_clean[tp, i] = -1.0
+            fb_closest_up = np.max(sim_up_mat_clean, axis=1)
         else:
             fb_closest_up = np.zeros(len(fb_train_emb))
 
         if n_down > 0:
-            if n_down > 1:
-                fb_sim_down[down_mask] = (n_down * fb_sim_down[down_mask] - 1.0) / (
-                    n_down - 1
-                )
-            else:
-                fb_sim_down[down_mask] = 0.0
-
+            down_indices = np.where(down_mask)[0]
             sim_down_mat = fb_train_emb @ fb_down_train.T
             if n_down > 1:
-                train_down_positions = np.where(down_mask)[0]
-                for i, tp in enumerate(train_down_positions):
-                    sim_down_mat[tp, i] = -1.0
-            fb_closest_down = np.max(sim_down_mat, axis=1)
+                for i, tp in enumerate(down_indices):
+                    sim_down_mat[tp, i] = -2.0
+            k_eff = min(k, n_down)
+            for i in range(len(fb_train_emb)):
+                sims = sim_down_mat[i]
+                exclude = 1 if i in down_indices else 0
+                n_available = max(1, n_down - exclude)
+                k_use = min(k_eff, n_available)
+                topk = np.sort(sims)[-k_use:]
+                fb_sim_down[i] = topk.mean()
+            sim_down_mat_clean = fb_train_emb @ fb_down_train.T
+            if n_down > 1:
+                for i, tp in enumerate(down_indices):
+                    sim_down_mat_clean[tp, i] = -1.0
+            fb_closest_down = np.max(sim_down_mat_clean, axis=1)
         else:
             fb_closest_down = np.zeros(len(fb_train_emb))
 
@@ -346,6 +358,13 @@ def main() -> None:
 
         fold_cand_csr_ratio = fold_cand_comments / np.maximum(fold_cand_scores, 1)
         fold_cand_csr = np.clip(np.log1p(fold_cand_csr_ratio), 0, 3.0) / 3.0
+
+        # New features: hour_of_day, is_hn
+        fb_train_hours = np.array([(s.time % 86400) / 86400.0 for s in fb_train_stories])
+        fb_train_is_hn = np.array([1.0 if s.source == 'hn' else 0.0 for s in fb_train_stories])
+
+        fold_cand_hours = np.array([(s.time % 86400) / 86400.0 for s in fold_candidates])
+        fold_cand_is_hn = np.array([1.0 if s.source == 'hn' else 0.0 for s in fold_candidates])
 
         # Build features for this fold
         X_train = _augment_features(
@@ -362,6 +381,8 @@ def main() -> None:
             closest_upvoted=fb_closest_up,
             closest_downvoted=fb_closest_down,
             comment_score_ratio=fb_train_csr,
+            is_hn=fb_train_is_hn,
+            hour_of_day=fb_train_hours,
         )
         X_cand = _augment_features(
             fold_cand_emb,
@@ -377,6 +398,8 @@ def main() -> None:
             closest_upvoted=cand_closest_up,
             closest_downvoted=cand_closest_down,
             comment_score_ratio=fold_cand_csr,
+            is_hn=fold_cand_is_hn,
+            hour_of_day=fold_cand_hours,
         )
 
         counts = Counter(y_train)
@@ -398,12 +421,10 @@ def main() -> None:
             gamma=config.model.svm_gamma,
             random_state=0,
             decision_function_shape="ovr",
-            probability=False,
+            probability=True,
         )
         svm.fit(X_train_scaled, y_train, sample_weight=weights)
-        df_cand = svm.decision_function(X_cand_scaled)
-        e_x = np.exp(df_cand - np.max(df_cand, axis=1, keepdims=True))
-        probs = e_x / e_x.sum(axis=1, keepdims=True)
+        probs = svm.predict_proba(X_cand_scaled)
 
         # Test fold: map test positions back to stories
         test_stories = [
