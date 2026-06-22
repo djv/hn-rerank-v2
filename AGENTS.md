@@ -61,3 +61,19 @@ sqlite3 hn_rewrite.db "PRAGMA integrity_check;"
 - `upsert_story` COALESCE only covers `article_body`. All other columns (title, score, time, self_text, top_comments, text_content) are overwritten unconditionally. This is an architectural vulnerability.
 - 1,940 stories still need comment backfill. They'll be gradually re-fetched as they appear in future Algolia search windows (100 per pipeline run).
 ```
+
+## Testing notes
+
+- **Curl and spam users**: `curl -L` without a cookie jar (`-c/-b`) creates one user per redirect hop. Every `GET /u/<token>` returns a 302 to `../`, and without cookie persistence the redirect chain creates a new user on each hop. Always use `-c cookie.txt -b cookie.txt` when testing with curl.
+- **Spam user cleanup**: 334 spam users created by curl redirect-loop testing were deleted on 2026-06-22. Users table currently has 2 real users: id=1 (token="default", 1787 feedback) and id=78 (token="new", 32 feedback).
+
+## Progress
+
+### Done
+1. **Title-embedding dedup removed** — `fast_rerank_for_user` reverted to simple gravity-sort + top-1000 pre-filter. `get_or_compute_title_embeddings`, title pre-caching, and `ModelConfig.title_similarity_*` fields deleted.
+2. **Spam users cleaned up** — 334 spam users deleted from `curl -L` testing (no feedback). 2 real users remain.
+3. **Tests passing** — 55 passed, 1 deselected (the dedup test that was removed). Lint: clean.
+
+### Known issues (not bugs, workload characteristics)
+- **Cold render for user_id=1 (1787 feedback)**: first dashboard render after restart takes 3-5s and allocates ~1GB. The SVM is retrained live from cached embeddings on every request (no DB model cache). This is expected behavior for 1787 feedback points.
+- **Memory doesn't shrink after request**: numpy/sklearn internals retain memory after training. Peak grows asymptotically to ~1GB. Systemd `Restart=on-failure` recovers if the OOM killer fires.
