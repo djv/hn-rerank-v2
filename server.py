@@ -1,7 +1,10 @@
+from __future__ import annotations
+
 import os
 import asyncio
 import json
 import logging
+import re
 import secrets
 import sys
 import threading
@@ -17,7 +20,41 @@ import httpx
 
 from dataclasses import replace
 from database import Database, User
-from pipeline import Config
+from pipeline import Config, Embedder
+
+ARTICLE_BODY_CHAR_LIMIT = 15_000
+SELF_TEXT_PROMPT_CHAR_LIMIT = 8_000
+COMMENT_PROMPT_CHAR_LIMIT = 12_000
+
+
+def _normalize_tldr_markdown(text: str) -> str:
+    """Make LLM summary Markdown predictable for the compact dashboard renderer."""
+    lines = []
+    for raw_line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if _looks_like_plain_heading(stripped):
+            lines.append(f"### {stripped}")
+            continue
+        label_match = re.match(r"^([A-Z][A-Za-z ]{1,40}):\s*(.*)$", stripped)
+        if label_match:
+            label, body = label_match.groups()
+            lines.append(f"- **{label}:** {body}" if body else f"- **{label}:**")
+        else:
+            lines.append(line)
+
+    normalized = "\n".join(lines)
+    normalized = re.sub(r"(\S)\s+-\s+(?=\S)", r"\1\n- ", normalized)
+    return normalized.strip()
+
+
+def _looks_like_plain_heading(line: str) -> bool:
+    if not line or len(line) > 48:
+        return False
+    if line.startswith(("#", "-", "*", ">", "`")) or line.endswith((".", ":", ",")):
+        return False
+    words = line.split()
+    return len(words) <= 5 and any(ch.isalpha() for ch in line)
 
 
 def load_env() -> None:
@@ -57,7 +94,7 @@ async def _fetch_article_body(url: str) -> str | None:
 
         text = trafilatura.extract(html, include_comments=False, include_tables=False)
         if text and len(text) > 200:
-            return text[:10000]
+            return text[:ARTICLE_BODY_CHAR_LIMIT]
 
         soup = BeautifulSoup(html, "html.parser")
         for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
@@ -65,11 +102,40 @@ async def _fetch_article_body(url: str) -> str | None:
         for tag in soup.find_all(["article", "main"]):
             text = tag.get_text(separator=" ", strip=True)
             if len(text) > 200:
-                return text[:10000]
+                return text[:ARTICLE_BODY_CHAR_LIMIT]
         text = soup.get_text(separator=" ", strip=True)
-        return text[:10000] if len(text) > 200 else None
+        return text[:ARTICLE_BODY_CHAR_LIMIT] if len(text) > 200 else None
 
     return None
+
+
+async def _call_llm_chat(
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    prompt: str,
+    max_tokens: int,
+) -> str:
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
+        "max_tokens": max_tokens,
+    }
+    async with httpx.AsyncClient(timeout=45.0) as client:
+        resp = await client.post(
+            base_url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]
+        return f"Error from LLM Provider: HTTP {resp.status_code} - {resp.text}"
 
 
 async def generate_detailed_tldr(
@@ -94,13 +160,73 @@ async def generate_detailed_tldr(
     if not api_key:
         return "Error: LLM API key not configured in environment."
 
+    article_section = ""
+    if self_text:
+        article_section += f"Author's text:\n{self_text[:SELF_TEXT_PROMPT_CHAR_LIMIT]}"
+    if article_body:
+        article_section += f"\n\nArticle body:\n{article_body[:ARTICLE_BODY_CHAR_LIMIT]}"
+    comments_section = top_comments[:COMMENT_PROMPT_CHAR_LIMIT]
+
+    if article_section and comments_section:
+        article_prompt = f"""Summarize the article for a knowledgeable reader.
+Use ONLY information from the text below.
+Write under 120 words.
+Return only 3-5 Markdown bullets.
+Every non-empty output line must start with "- ".
+Use **bold** key terms.
+Keep each bullet to one short sentence.
+
+Title: {title}
+
+{article_section}
+"""
+        discussion_prompt = f"""Summarize the Hacker News discussion for a knowledgeable reader.
+Use ONLY information from the comments below.
+Write under 100 words.
+Return only 2-4 Markdown bullets.
+Every non-empty output line must start with "- ".
+Use labels like **Consensus:**, **Disagreement:**, and **Caveat:** when present.
+Do not put multiple bullets on one line.
+If the comments are thin or low-signal, say so explicitly.
+
+Story title: {title}
+Points: {points}
+Comments: {comment_count}
+Age hours: {age_hours:.1f}
+
+HN comments:
+{comments_section}
+"""
+        try:
+            article_result, discussion_result = await asyncio.gather(
+                _call_llm_chat(
+                    api_key=api_key,
+                    base_url=base_url,
+                    model=model,
+                    prompt=article_prompt,
+                    max_tokens=900,
+                ),
+                _call_llm_chat(
+                    api_key=api_key,
+                    base_url=base_url,
+                    model=model,
+                    prompt=discussion_prompt,
+                    max_tokens=900,
+                ),
+            )
+            article_result = _normalize_tldr_markdown(article_result)
+            discussion_result = _normalize_tldr_markdown(discussion_result)
+            return f"### Article\n{article_result}\n\n### Discussion\n{discussion_result}"
+        except Exception as e:
+            return f"Error executing LLM call: {str(e)}"
+
     content_section = f"Title: {title}"
     if self_text:
-        content_section += f"\n\nAuthor's text:\n{self_text[:6000]}"
+        content_section += f"\n\nAuthor's text:\n{self_text[:SELF_TEXT_PROMPT_CHAR_LIMIT]}"
     if article_body:
-        content_section += f"\n\nArticle body:\n{article_body[:15000]}"
+        content_section += f"\n\nArticle body:\n{article_body[:ARTICLE_BODY_CHAR_LIMIT]}"
     if top_comments:
-        content_section += f"\n\nHN comments:\n{top_comments[:10000]}"
+        content_section += f"\n\nHN comments:\n{top_comments[:COMMENT_PROMPT_CHAR_LIMIT]}"
 
     prompt = f"""Summarize the article and the discussion for a knowledgeable reader.
 Use ONLY information from the text below.
@@ -110,6 +236,7 @@ Use Markdown formatting:
 - Short bullet points (-) with **bold** key terms.
 - No nested list levels (conserve horizontal margins).
 - Keep each bullet point to a single short sentence.
+- Do not put multiple bullets on one line.
 
 {content_section}
 
@@ -119,28 +246,15 @@ IMPORTANT:
 - If the text below is just a title and no substantive content, say so explicitly.
 """
 
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3,
-        "max_tokens": 2000,
-    }
-
     try:
-        async with httpx.AsyncClient(timeout=45.0) as client:
-            resp = await client.post(
-                base_url,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                return data["choices"][0]["message"]["content"]
-            else:
-                return f"Error from LLM Provider: HTTP {resp.status_code} - {resp.text}"
+        result = await _call_llm_chat(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            prompt=prompt,
+            max_tokens=2000,
+        )
+        return _normalize_tldr_markdown(result)
     except Exception as e:
         return f"Error executing LLM call: {str(e)}"
 
@@ -149,9 +263,11 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "HNRewrite/1.0"
     config: Config
     db: Database
-    embedder: object
+    embedder: Embedder
     regen_event: threading.Event
-    _dashboard_cache: dict = {}
+    _dashboard_cache: dict[str, tuple[bytes, float]] = {}
+    _render_locks: dict[int, threading.Lock] = {}
+    _render_locks_guard = threading.Lock()
 
     def _get_user(self) -> User | None:
         """Extract user from cookie token."""
@@ -180,7 +296,9 @@ class Handler(BaseHTTPRequestHandler):
                 user = self.db.get_or_create_user(token)
                 self.send_response(302)
                 self.send_header("Location", "../")
-                self.send_header("Set-Cookie", f"hn_token={user.token}; Path=/; Max-Age=31536000")
+                self.send_header(
+                    "Set-Cookie", f"hn_token={user.token}; Path=/; Max-Age=31536000"
+                )
                 self.end_headers()
                 return
             self.send_error(HTTPStatus.BAD_REQUEST)
@@ -202,7 +320,9 @@ class Handler(BaseHTTPRequestHandler):
                 token = secrets.token_hex(4)
                 self.send_response(302)
                 self.send_header("Location", f"u/{token}")
-                self.send_header("Set-Cookie", f"hn_token={token}; Path=/; Max-Age=31536000")
+                self.send_header(
+                    "Set-Cookie", f"hn_token={token}; Path=/; Max-Age=31536000"
+                )
                 self.end_headers()
                 return
 
@@ -216,6 +336,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Expires", "0")
             self.end_headers()
             self.wfile.write(html)
+
+            # Wake regen thread to refresh candidates in the background
+            self.regen_event.set()
             return
 
         self.send_error(HTTPStatus.NOT_FOUND)
@@ -229,13 +352,31 @@ class Handler(BaseHTTPRequestHandler):
         if cached and now - cached[1] < 300:
             return cached[0]
 
-        from pipeline import fast_rerank_for_user, generate_dashboard_bytes
+        lock = self._get_render_lock(user.id)
+        with lock:
+            now = time.time()
+            cached = self._dashboard_cache.get(cache_key)
+            if cached and now - cached[1] < 300:
+                return cached[0]
 
-        final = fast_rerank_for_user(self.db, self.config, self.embedder, user.id)
-        html = generate_dashboard_bytes(final, self.config, self.db, user.id, user.token)
+            from pipeline import fast_rerank_for_user, generate_dashboard_bytes
 
-        self._dashboard_cache[cache_key] = (html, now)
-        return html
+            final = fast_rerank_for_user(self.db, self.config, self.embedder, user.id)
+            html = generate_dashboard_bytes(
+                final, self.config, self.db, user.id, user.token
+            )
+
+            self._dashboard_cache[cache_key] = (html, now)
+            return html
+
+    @classmethod
+    def _get_render_lock(cls, user_id: int) -> threading.Lock:
+        with cls._render_locks_guard:
+            lock = cls._render_locks.get(user_id)
+            if lock is None:
+                lock = threading.Lock()
+                cls._render_locks[user_id] = lock
+            return lock
 
     def do_POST(self) -> None:
         if self.path == "/api/feedback":
@@ -288,17 +429,25 @@ class Handler(BaseHTTPRequestHandler):
                     return
 
                 # 1. If HN story has comments but top_comments is empty, dynamically fetch them
-                if story.source == "hn" and not story.top_comments and (story.comment_count or 0) > 0:
+                if (
+                    story.source == "hn"
+                    and not story.top_comments
+                    and (story.comment_count or 0) > 0
+                ):
                     try:
                         from pipeline import fetch_story
+
                         async def do_fetch():
                             async with httpx.AsyncClient(timeout=15.0) as client:
                                 return await fetch_story(client, story_id, self.db)
+
                         updated = asyncio.run(do_fetch())
                         if updated:
                             story = updated
                     except Exception as e:
-                        logging.error(f"Failed to dynamically fetch comments for TLDR: {e}")
+                        logging.error(
+                            f"Failed to dynamically fetch comments for TLDR: {e}"
+                        )
 
                 age_hours = max(0.0, (now - story.time) / 3600.0)
                 article_body = story.article_body or None
@@ -311,8 +460,9 @@ class Handler(BaseHTTPRequestHandler):
                 ):
                     article_body = asyncio.run(_fetch_article_body(story.url))
                     if article_body:
-                        article_body = article_body[:15000]
+                        article_body = article_body[:ARTICLE_BODY_CHAR_LIMIT]
                         from pipeline import compose_story_text
+
                         new_text = compose_story_text(
                             story.title,
                             story.self_text,
@@ -381,6 +531,7 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
         logging.info("Regeneration triggered. Fetching candidates...")
         try:
             from pipeline import fetch_candidates_only
+
             asyncio.run(fetch_candidates_only(config, db))
             logging.info("Regeneration complete.")
         except Exception as e:
@@ -399,6 +550,7 @@ def main() -> None:
 
     regen_event = threading.Event()
     from pipeline import Embedder
+
     embedder = Embedder(config.onnx_model_dir)
     Handler.config = config
     Handler.db = db

@@ -4,7 +4,7 @@ import pytest
 from http.server import ThreadingHTTPServer
 
 from server import Handler
-from pipeline import Config
+from pipeline import Config, Embedder
 from database import Database, Story
 
 
@@ -31,9 +31,13 @@ def test_env(tmp_path):
     class TestHandler(Handler):
         pass
 
-    class MockEmbedder:
-        def encode(self, texts, batch_size=64):
+    class MockEmbedder(Embedder):
+        def __init__(self):
+            pass
+
+        def encode(self, texts: list[str], batch_size: int = 64) -> ...:
             import numpy as np
+
             return np.zeros((len(texts), 384), dtype=np.float32)
 
     TestHandler.config = config
@@ -156,6 +160,24 @@ def test_cors_headers(test_env):
     assert "POST" in resp.headers.get("access-control-allow-methods", "")
 
 
+def test_normalize_tldr_markdown_repairs_inline_bullets():
+    import server
+
+    raw = (
+        "Article\n"
+        "Consensus: Open-source models are improving.\n"
+        "Notable Caveats:\n"
+        "- Quantization may degrade quality. - Providers reduce hardware barriers."
+    )
+
+    normalized = server._normalize_tldr_markdown(raw)
+
+    assert "### Article" in normalized
+    assert "- **Consensus:** Open-source models are improving." in normalized
+    assert "- **Notable Caveats:**" in normalized
+    assert "- Quantization may degrade quality.\n- Providers reduce hardware barriers." in normalized
+
+
 def test_tldr_detail_dynamic_fetch(test_env, monkeypatch):
     port, db, _, _, user = test_env
     db.upsert_story(
@@ -180,18 +202,26 @@ def test_tldr_detail_dynamic_fetch(test_env, monkeypatch):
     async def mock_fetch_story(client, sid, database):
         story = database.get_story(sid)
         from dataclasses import replace
-        updated = replace(story, top_comments="Fetched comments", text_content="Dynamic test. Fetched comments")
+
+        updated = replace(
+            story,
+            top_comments="Fetched comments",
+            text_content="Dynamic test. Fetched comments",
+        )
         database.upsert_story(updated)
         return updated
 
     async def mock_fetch_article_body(url):
         return "Fetched article body text"
 
-    async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body, points, comment_count, age_hours):
+    async def mock_generate_detailed_tldr(
+        title, self_text, top_comments, article_body, points, comment_count, age_hours
+    ):
         return f"TLDR: {title} | {top_comments} | {article_body}"
 
     import server
     import pipeline
+
     monkeypatch.setattr(pipeline, "fetch_story", mock_fetch_story)
     monkeypatch.setattr(server, "_fetch_article_body", mock_fetch_article_body)
     monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
@@ -213,3 +243,38 @@ def test_tldr_detail_dynamic_fetch(test_env, monkeypatch):
     assert updated_story.top_comments == "Fetched comments"
     assert updated_story.article_body == "Fetched article body text"
 
+
+@pytest.mark.asyncio
+async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
+    import server
+
+    calls = []
+
+    async def mock_call_llm_chat(*, api_key, base_url, model, prompt, max_tokens):
+        calls.append(prompt)
+        if "Summarize the article" in prompt:
+            return "- **Article** summary"
+        if "Summarize the Hacker News discussion" in prompt:
+            return "- **Discussion** summary"
+        return "- **Fallback** summary"
+
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setattr(server, "_call_llm_chat", mock_call_llm_chat)
+
+    result = await server.generate_detailed_tldr(
+        "Split summary test",
+        self_text="Author text",
+        top_comments="Comment text",
+        article_body="Article body",
+        points=42,
+        comment_count=12,
+        age_hours=3.5,
+    )
+
+    assert len(calls) == 2
+    assert "Article body" in calls[0]
+    assert "HN comments" in calls[1]
+    assert "### Article" in result
+    assert "- **Article** summary" in result
+    assert "### Discussion" in result
+    assert "- **Discussion** summary" in result

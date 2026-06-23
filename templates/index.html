@@ -69,13 +69,34 @@
 
     .story-card {
       margin-bottom: 0.5rem;
-      padding: 0.6rem 0.8rem;
+      padding: 0.6rem 0.8rem 0.6rem 1rem;
       border-radius: 6px;
       border: 1px solid var(--pico-card-border-color);
+      border-left: 8px solid transparent;
       background: var(--pico-card-background-color);
       transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1), transform 0.2s, box-shadow 0.2s;
       opacity: 1;
       overflow: hidden;
+    }
+
+    .story-card.match-strong {
+      border-left-color: hsl(150, 75%, 34%);
+      background: color-mix(in srgb, var(--pico-card-background-color) 94%, hsl(150, 75%, 42%) 6%);
+    }
+
+    .story-card.match-likely {
+      border-left-color: hsl(190, 85%, 36%);
+      background: color-mix(in srgb, var(--pico-card-background-color) 95%, hsl(190, 85%, 45%) 5%);
+    }
+
+    .story-card.match-mixed {
+      border-left-color: hsl(38, 90%, 45%);
+      background: color-mix(in srgb, var(--pico-card-background-color) 94%, hsl(38, 90%, 50%) 6%);
+    }
+
+    .story-card.match-skip {
+      border-left-color: hsl(355, 78%, 48%);
+      background: color-mix(in srgb, var(--pico-card-background-color) 94%, hsl(355, 78%, 52%) 6%);
     }
 
     .story-card.fade-out {
@@ -106,16 +127,6 @@
       margin-bottom: 0.2rem;
     }
 
-    .score-badge {
-      display: inline-block;
-      padding: 0.05rem 0.3rem;
-      border-radius: 3px;
-      font-weight: bold;
-      font-size: 0.75rem;
-      background: var(--pico-primary-background);
-      color: white;
-    }
-
     .source-badge {
       display: inline-block;
       padding: 0.05rem 0.3rem;
@@ -123,51 +134,6 @@
       font-size: 0.75rem;
       background: #343a40;
       color: #f8f9fa;
-    }
-
-    .prob-badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.35rem;
-      padding: 0.05rem 0.4rem;
-      border-radius: 3px;
-      background: var(--pico-card-background-color);
-      border: 1px solid var(--pico-muted-border-color);
-      font-size: 0.7rem;
-      height: 1.1rem;
-      line-height: 1;
-    }
-
-    .prob-mini-bar {
-      display: inline-flex;
-      width: 32px;
-      height: 6px;
-      border-radius: 3px;
-      overflow: hidden;
-      background: var(--pico-muted-border-color);
-    }
-
-    .mini-segment {
-      height: 100%;
-    }
-
-    .mini-segment.down {
-      background: hsl(355, 75%, 55%); /* Soft Crimson */
-    }
-
-    .mini-segment.neutral {
-      background: hsl(40, 60%, 65%);  /* Soft Gold */
-    }
-
-    .mini-segment.up {
-      background: hsl(160, 60%, 45%);   /* Soft Teal */
-    }
-
-    .prob-mini-text {
-      font-weight: 600;
-      color: var(--pico-muted-color);
-      font-size: 0.65rem;
-      letter-spacing: 0.02em;
     }
 
     .uncertain-badge {
@@ -244,7 +210,25 @@
 
     .story-card.enriched {
       background: color-mix(in srgb, var(--pico-card-background-color) 93%, hsl(120, 50%, 50%) 7%);
-      border-color: color-mix(in srgb, var(--pico-card-border-color) 90%, hsl(120, 50%, 50%) 10%);
+      border-top-color: color-mix(in srgb, var(--pico-card-border-color) 90%, hsl(120, 50%, 50%) 10%);
+      border-right-color: color-mix(in srgb, var(--pico-card-border-color) 90%, hsl(120, 50%, 50%) 10%);
+      border-bottom-color: color-mix(in srgb, var(--pico-card-border-color) 90%, hsl(120, 50%, 50%) 10%);
+    }
+
+    .story-card.enriched.match-strong {
+      background: color-mix(in srgb, var(--pico-card-background-color) 92%, hsl(150, 75%, 42%) 8%);
+    }
+
+    .story-card.enriched.match-likely {
+      background: color-mix(in srgb, var(--pico-card-background-color) 93%, hsl(190, 85%, 45%) 7%);
+    }
+
+    .story-card.enriched.match-mixed {
+      background: color-mix(in srgb, var(--pico-card-background-color) 92%, hsl(38, 90%, 50%) 8%);
+    }
+
+    .story-card.enriched.match-skip {
+      background: color-mix(in srgb, var(--pico-card-background-color) 92%, hsl(355, 78%, 52%) 8%);
     }
 
     .story-title {
@@ -436,25 +420,24 @@
     <div id="stories">
       {% for item in stories %}
       {% set active_fb = fb_map.get(item.story.id) %}
-      <article class="story-card{% if item.story.text_content | length >= 1000 %} enriched{% endif %}" 
+      {% set match_class = "" %}
+      {% if item.prob_down is not none %}
+        {% if item.prob_down >= 0.35 %}
+          {% set match_class = " match-skip" %}
+        {% elif item.prob_up >= 0.78 %}
+          {% set match_class = " match-strong" %}
+        {% elif item.prob_up >= 0.62 %}
+          {% set match_class = " match-likely" %}
+        {% else %}
+          {% set match_class = " match-mixed" %}
+        {% endif %}
+      {% endif %}
+      <article class="story-card{% if item.story.text_content | length >= 1000 %} enriched{% endif %}{{ match_class }}"
                data-story-id="{{ item.story.id }}" 
                data-score="{{ item.score }}"
                data-time="{{ item.story.time }}"
                data-source="{{ item.story.source }}">
         <div class="story-header">
-          <span class="score-badge">{{ (item.score * 100) | int }}%</span>
-          
-          {% if item.prob_down is not none %}
-          <div class="prob-badge" title="Down: {{ (item.prob_down * 100) | round(1) }}% | Neutral: {{ (item.prob_neutral * 100) | round(1) }}% | Up: {{ (item.prob_up * 100) | round(1) }}%">
-            <span class="prob-mini-bar">
-              <span class="mini-segment down" style="width: {{ item.prob_down * 100 }}%"></span>
-              <span class="mini-segment neutral" style="width: {{ item.prob_neutral * 100 }}%"></span>
-              <span class="mini-segment up" style="width: {{ item.prob_up * 100 }}%"></span>
-            </span>
-            <span class="prob-mini-text">▼{{ (item.prob_down * 100) | int }}% · ●{{ (item.prob_neutral * 100) | int }}% · ▲{{ (item.prob_up * 100) | int }}%</span>
-          </div>
-          {% endif %}
-          
           {% if item.is_uncertain %}
           <span class="uncertain-badge" title="Model is highly uncertain about this story (high entropy distribution)">🤔 Unsure</span>
           {% endif %}
@@ -578,8 +561,34 @@
     function encodeAttr(str){return(str+'').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
     function snarkdown(md,prevLinks){let tokenizer=/((?:^|\n+)(?:\n---+|\* \*(?: \*)+)\n)|(?:^``` *(\w*)\n([\s\S]*?)\n```$)|((?:(?:^|\n+)(?:\t|  {2,}).+)+\n*)|((?:(?:^|\n)([>*+-]|\d+\.)\s+.*)+)|(?:!\[([^\]]*?)\]\(([^)]+?)\))|(\[)|(\](?:\(([^)]+?)\))?)|(?:(?:^|\n+)([^\s].*)\n(-{3,}|={3,})(?:\n+|$))|(?:(?:^|\n+)(#{1,6})\s*(.+)(?:\n+|$))|(?:`([^`].*?)`)|(  \n\n*|\n{2,}|__|\*\*|[_*]|~~)/gm,context=[],out='',links=prevLinks||{},last=0,chunk,prev,token,inner,t;function tag(token){let desc=TAGS[token[1]||''],end=context[context.length-1]==token;if(!desc)return token;if(!desc[1])return desc[0];if(end)context.pop();else context.push(token);return desc[end|0]}function flush(){let str='';while(context.length)str+=tag(context[context.length-1]);return str}md=md.replace(/^\[(.+?)\]:\s*(.+)$/gm,(s,name,url)=>{links[name.toLowerCase()]=url;return''}).replace(/^\n+|\n+$/g,'');while((token=tokenizer.exec(md))){prev=md.substring(last,token.index);last=tokenizer.lastIndex;chunk=token[0];if(prev.match(/[^\\](\\\\)*\\$/)){}else if(t=(token[3]||token[4])){chunk='<pre class="code '+(token[4]?'poetry':token[2].toLowerCase())+'"><code'+(token[2]?` class="language-${token[2].toLowerCase()}"`:'')+'>'+outdent(encodeAttr(t).replace(/^\n+|\n+$/g,''))+'</code></pre>'}else if(t=token[6]){if(t.match(/\./)){token[5]=token[5].replace(/^\d+/gm,'')}inner=snarkdown(outdent(token[5].replace(/^\s*[>*+.-]/gm,'')));if(t=='>')t='blockquote';else{t=t.match(/\./)?'ol':'ul';inner=inner.replace(/^(.*)(\n|$)/gm,'<li>$1</li>')}chunk='<'+t+'>'+inner+'</'+t+'>'}else if(token[8]){chunk=`<img src="${encodeAttr(token[8])}" alt="${encodeAttr(token[7])}">`}else if(token[10]){out=out.replace('<a>',`<a href="${encodeAttr(token[11]||links[prev.toLowerCase()])}">`);chunk=flush()+'</a>'}else if(token[9]){chunk='<a>'}else if(token[12]||token[14]){t='h'+(token[14]?token[14].length:(token[13]>'='?1:2));chunk='<'+t+'>'+snarkdown(token[12]||token[15],links)+'</'+t+'>'}else if(token[16]){chunk='<code>'+encodeAttr(token[16])+'</code>'}else if(token[17]||token[1]){chunk=tag(token[17]||'--')}out+=prev;out+=chunk}return(out+md.substring(last)+flush()).replace(/^\n+|\n+$/g,'')}
 
+    function normalizeTldrMarkdown(text) {
+      return text
+        .replace(/\r\n?/g, '\n')
+        .split('\n')
+        .map(line => {
+          const trimmed = line.trim();
+          const isPlainHeading =
+            trimmed.length > 0 &&
+            trimmed.length <= 48 &&
+            !/^[#\-*>`]/.test(trimmed) &&
+            !/[.:,]$/.test(trimmed) &&
+            trimmed.split(/\s+/).length <= 5 &&
+            /[A-Za-z]/.test(trimmed);
+          if (isPlainHeading) {
+            return `### ${trimmed}`;
+          }
+          const labelMatch = trimmed.match(/^([A-Z][A-Za-z ]{1,40}):\s*(.*)$/);
+          if (labelMatch) {
+            return `- **${labelMatch[1]}:** ${labelMatch[2]}`;
+          }
+          return line;
+        })
+        .join('\n')
+        .replace(/(\S)\s+-\s+(?=\S)/g, '$1\n- ');
+    }
+
     function parseSimpleMarkdown(text) {
-      return snarkdown(text);
+      return snarkdown(normalizeTldrMarkdown(text));
     }
 
     // Dynamic Swap-in of new ranked stories list
