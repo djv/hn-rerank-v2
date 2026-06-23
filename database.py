@@ -5,11 +5,14 @@ import sqlite3
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal, Generator
+from typing import Literal, Generator, TypeAlias
 from contextlib import contextmanager
 import queue
 import numpy as np
 from numpy.typing import NDArray
+
+
+Action: TypeAlias = Literal["up", "neutral", "down"]
 
 
 @dataclass(frozen=True)
@@ -32,7 +35,7 @@ class Story:
 @dataclass(frozen=True)
 class FeedbackRecord:
     story_id: int
-    action: Literal["up", "neutral", "down"]
+    action: Action
     title: str
     url: str | None
     text_content: str
@@ -127,7 +130,9 @@ class Database:
                     )
 
                 # Run migration of article_cache to stories table if article_cache exists
-                tbl_cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='article_cache'")
+                tbl_cursor = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='article_cache'"
+                )
                 if tbl_cursor.fetchone():
                     logging.info("Migrating article_cache records to stories table...")
                     conn.execute("""
@@ -150,7 +155,9 @@ class Database:
                 """)
 
                 # Multi-user feedback migration
-                tbl_cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='feedback'")
+                tbl_cursor = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='feedback'"
+                )
                 if tbl_cursor.fetchone():
                     cursor = conn.execute("PRAGMA table_info(feedback)")
                     fb_columns = {row[1] for row in cursor.fetchall()}
@@ -168,7 +175,7 @@ class Database:
                         """)
                         conn.execute(
                             "INSERT OR IGNORE INTO users (id, token, created_at) VALUES (1, 'default', ?)",
-                            (time.time(),)
+                            (time.time(),),
                         )
                         conn.execute("""
                             INSERT INTO feedback_new (user_id, story_id, action, updated_at)
@@ -178,7 +185,9 @@ class Database:
                         conn.execute("ALTER TABLE feedback_new RENAME TO feedback")
                     elif "title" in fb_columns:
                         # Legacy migration from denormalized feedback
-                        logging.info("Migrating feedback table schema to normalized version...")
+                        logging.info(
+                            "Migrating feedback table schema to normalized version..."
+                        )
                         conn.execute("""
                             CREATE TABLE feedback_new (
                                 user_id     INTEGER NOT NULL DEFAULT 1,
@@ -191,7 +200,7 @@ class Database:
                         """)
                         conn.execute(
                             "INSERT OR IGNORE INTO users (id, token, created_at) VALUES (1, 'default', ?)",
-                            (time.time(),)
+                            (time.time(),),
                         )
                         conn.execute("""
                             INSERT OR IGNORE INTO feedback_new (user_id, story_id, action, updated_at)
@@ -202,7 +211,7 @@ class Database:
                 else:
                     conn.execute(
                         "INSERT OR IGNORE INTO users (id, token, created_at) VALUES (1, 'default', ?)",
-                        (time.time(),)
+                        (time.time(),),
                     )
                     conn.execute("""
                         CREATE TABLE IF NOT EXISTS feedback (
@@ -229,21 +238,38 @@ class Database:
             # Check if the story already exists and has longer cached content
             cursor = conn.execute(
                 "SELECT self_text, top_comments, article_body FROM stories WHERE id = ?",
-                (story.id,)
+                (story.id,),
             )
             row = cursor.fetchone()
             if row:
                 db_self, db_comments, db_body = row[0] or "", row[1] or "", row[2] or ""
-                
+
                 # Keep the longest available version of each field
-                final_self = story.self_text if len(story.self_text) >= len(db_self) else db_self
-                final_comments = story.top_comments if len(story.top_comments) >= len(db_comments) else db_comments
-                final_body = story.article_body if len(story.article_body) >= len(db_body) else db_body
-                
+                final_self = (
+                    story.self_text if len(story.self_text) >= len(db_self) else db_self
+                )
+                final_comments = (
+                    story.top_comments
+                    if len(story.top_comments) >= len(db_comments)
+                    else db_comments
+                )
+                final_body = (
+                    story.article_body
+                    if len(story.article_body) >= len(db_body)
+                    else db_body
+                )
+
                 # Recompose if database fields were merged
-                if final_self != story.self_text or final_comments != story.top_comments or final_body != story.article_body:
+                if (
+                    final_self != story.self_text
+                    or final_comments != story.top_comments
+                    or final_body != story.article_body
+                ):
                     from pipeline import compose_story_text
-                    new_text = compose_story_text(story.title, final_self, final_comments, final_body)
+
+                    new_text = compose_story_text(
+                        story.title, final_self, final_comments, final_body
+                    )
                     story = replace(
                         story,
                         self_text=final_self,
@@ -351,7 +377,11 @@ class Database:
                 return cursor.rowcount
 
     def upsert_embedding(
-        self, story_id: int, model_version: str, text_hash: str, vec: NDArray[np.float32]
+        self,
+        story_id: int,
+        model_version: str,
+        text_hash: str,
+        vec: NDArray[np.float32],
     ) -> None:
         blob = vec.astype(np.float32).tobytes()
         with self._conn() as conn:
@@ -401,14 +431,12 @@ class Database:
                     res[sid] = np.frombuffer(blob, dtype=np.float32)
             return res
 
-
-
     # Feedback
     def upsert_feedback(
         self,
         user_id: int,
         story_id: int,
-        action: Literal["up", "neutral", "down"],
+        action: Action,
     ) -> None:
         with self._conn() as conn:
             with conn:
@@ -466,7 +494,9 @@ class Database:
                     (user_id, story_id),
                 )
 
-    def get_feedback_for_training(self, user_id: int | None = None) -> tuple[list[Story], list[int], list[float]]:
+    def get_feedback_for_training(
+        self, user_id: int | None = None
+    ) -> tuple[list[Story], list[int], list[float]]:
         with self._conn() as conn:
             if user_id is not None:
                 cursor = conn.execute(
@@ -548,7 +578,9 @@ class Database:
                     "INSERT INTO users (token, created_at) VALUES (?, ?)",
                     (token, now),
                 )
-                row = conn.execute("SELECT id FROM users WHERE token = ?", (token,)).fetchone()
+                row = conn.execute(
+                    "SELECT id FROM users WHERE token = ?", (token,)
+                ).fetchone()
                 return User(id=row[0], token=token, created_at=now)
 
     def get_user_by_token(self, token: str) -> User | None:

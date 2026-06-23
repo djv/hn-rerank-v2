@@ -20,6 +20,7 @@ import onnxruntime as ort
 from bs4 import BeautifulSoup
 from jinja2 import Environment, FileSystemLoader
 from numpy.typing import NDArray
+from sklearn.cluster import KMeans
 from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
 
@@ -29,12 +30,14 @@ from transformers import AutoTokenizer
 
 @dataclass(frozen=True)
 class ModelConfig:
-    svm_c: float = 0.3
-    svm_gamma: float | str = 0.1
+    svm_c: float = 0.2
+    svm_gamma: float | str = 0.03
     svm_kernel: str = "rbf"
     neutral_weight: float = 0.0
+    enable_mmr: bool = False
     diversity_threshold: float = 0.75
     knn_k: int = 10
+    positive_cluster_k: int = 4
     tier3_threshold: int = 20
     tier3_blend_window: int = 60
     min_up_for_svm: int = 20
@@ -87,12 +90,14 @@ class Config:
             server_port=main_cfg.get("server_port", 8765),
             regen_interval_seconds=main_cfg.get("regen_interval_seconds", 10800),
             model=ModelConfig(
-                svm_c=model_cfg.get("svm_c", 0.3),
-                svm_gamma=model_cfg.get("svm_gamma", 0.1),
+                svm_c=model_cfg.get("svm_c", 0.2),
+                svm_gamma=model_cfg.get("svm_gamma", 0.03),
                 svm_kernel=model_cfg.get("svm_kernel", "rbf"),
                 neutral_weight=model_cfg.get("neutral_weight", 0.0),
+                enable_mmr=model_cfg.get("enable_mmr", False),
                 diversity_threshold=model_cfg.get("diversity_threshold", 0.75),
                 knn_k=model_cfg.get("knn_k", 10),
+                positive_cluster_k=model_cfg.get("positive_cluster_k", 4),
                 tier3_threshold=model_cfg.get("tier3_threshold", 20),
                 tier3_blend_window=model_cfg.get("tier3_blend_window", 60),
                 min_up_for_svm=model_cfg.get("min_up_for_svm", 20),
@@ -202,6 +207,18 @@ def compose_story_text(
     return " ".join(parts).strip()
 
 
+def story_embedding_text(story: Story) -> str:
+    """Return the exact text used for the current production embedding version."""
+    if story.text_content:
+        return story.text_content
+    return compose_story_text(
+        story.title,
+        story.self_text,
+        story.top_comments,
+        story.article_body,
+    )
+
+
 # Algolia Fetching
 def _empty_story(sid: int) -> Story:
     return Story(
@@ -251,8 +268,8 @@ async def fetch_story(
         children = item.get("children", [])
         all_comments = _extract_comments_recursive(children)
         all_comments.sort(key=lambda x: x["score"])
-        selected = all_comments[:24]
-        top_comment_texts = " ".join(c["text"] for c in selected)[:6000]
+        selected = all_comments[:40]
+        top_comment_texts = " ".join(c["text"] for c in selected)[:10000]
 
         text_content = compose_story_text(
             title=title,
@@ -338,8 +355,8 @@ async def refetch_story_text(
         children = item.get("children", [])
         all_comments = _extract_comments_recursive(children)
         all_comments.sort(key=lambda x: x["score"])
-        selected = all_comments[:24]
-        top_comment_texts = " ".join(c["text"] for c in selected)[:6000]
+        selected = all_comments[:40]
+        top_comment_texts = " ".join(c["text"] for c in selected)[:10000]
 
         existing = db.get_story(story_id)
         if existing is None:
@@ -768,13 +785,19 @@ async def fetch_rss_feeds(
 class Embedder:
     def __init__(self, model_dir: str = "onnx_model"):
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir)
+        session_options = ort.SessionOptions()
+        session_options.enable_cpu_mem_arena = False
+        session_options.enable_mem_pattern = False
+        session_options.intra_op_num_threads = 2
+        session_options.inter_op_num_threads = 1
         self.session = ort.InferenceSession(
             str(Path(model_dir) / "model.onnx"),
+            sess_options=session_options,
             providers=["CPUExecutionProvider"],
         )
         self.max_tokens = 512
 
-    def encode(self, texts: list[str], batch_size: int = 64) -> NDArray[np.float32]:
+    def encode(self, texts: list[str], batch_size: int = 32) -> NDArray[np.float32]:
         if not texts:
             return np.empty((0, 384), dtype=np.float32)
 
@@ -827,8 +850,9 @@ def get_or_compute_embeddings(
 
     import hashlib
 
+    embedding_texts = {s.id: story_embedding_text(s) for s in stories}
     story_hashes = {
-        s.id: hashlib.sha256(s.text_content.encode("utf-8")).hexdigest()
+        s.id: hashlib.sha256(embedding_texts[s.id].encode("utf-8")).hexdigest()
         for s in stories
     }
 
@@ -839,7 +863,7 @@ def get_or_compute_embeddings(
     missing_stories = [s for s in stories if s.id not in cached]
 
     if missing_stories:
-        texts = [s.text_content for s in missing_stories]
+        texts = [embedding_texts[s.id] for s in missing_stories]
         computed = embedder.encode(texts)
         for s, vec in zip(missing_stories, computed):
             db.upsert_embedding(s.id, model_version, story_hashes[s.id], vec)
@@ -867,8 +891,24 @@ def _knn_similarity(
         return np.zeros(query_emb.shape[0], dtype=np.float32)
     sim_mat = query_emb @ ref_emb.T
     k_actual = min(k, ref_emb.shape[0])
-    topk = np.sort(sim_mat, axis=1)[:, -k_actual:]
+    if k_actual <= 0:
+        return np.zeros(query_emb.shape[0], dtype=np.float32)
+    if k_actual == sim_mat.shape[1]:
+        topk = sim_mat
+    else:
+        topk = np.partition(sim_mat, sim_mat.shape[1] - k_actual, axis=1)[
+            :, -k_actual:
+        ]
     return topk.mean(axis=1).astype(np.float32)
+
+
+def _topk_mean(values: NDArray[np.float32], k: int) -> float:
+    if k <= 0 or len(values) == 0:
+        return 0.0
+    k_actual = min(k, len(values))
+    if k_actual == len(values):
+        return float(values.mean())
+    return float(np.partition(values, len(values) - k_actual)[-k_actual:].mean())
 
 
 def _augment_features(
@@ -985,9 +1025,10 @@ def _svm_personalization_features(
     sim_to_downvoted: np.ndarray,
     closest_upvoted: np.ndarray,
     closest_downvoted: np.ndarray,
+    positive_cluster_similarity: np.ndarray | None = None,
 ) -> NDArray[np.float32]:
     """Production SVM features: embeddings, text length, and feedback similarity."""
-    meta = np.zeros((len(embeddings), 5), dtype=np.float32)
+    meta = np.zeros((len(embeddings), 6), dtype=np.float32)
     meta[:, 0] = (
         np.clip(np.log1p(np.maximum(text_lengths, 0)), 0, _LOG_TEXTLEN_SCALE)
         / _LOG_TEXTLEN_SCALE
@@ -996,7 +1037,53 @@ def _svm_personalization_features(
     meta[:, 2] = (np.clip(sim_to_downvoted, -1, 1) + 1) / 2
     meta[:, 3] = (np.clip(closest_upvoted, -1, 1) + 1) / 2
     meta[:, 4] = (np.clip(closest_downvoted, -1, 1) + 1) / 2
+    if positive_cluster_similarity is not None:
+        meta[:, 5] = (np.clip(positive_cluster_similarity, -1, 1) + 1) / 2
     return np.concatenate([embeddings, meta], axis=1)
+
+
+def _positive_cluster_similarity(
+    query_embeddings: NDArray[np.float32],
+    positive_embeddings: NDArray[np.float32],
+    n_clusters: int,
+) -> NDArray[np.float32]:
+    if len(query_embeddings) == 0 or len(positive_embeddings) == 0 or n_clusters <= 0:
+        return np.zeros(len(query_embeddings), dtype=np.float32)
+    unique_positive = np.unique(positive_embeddings, axis=0)
+    if len(unique_positive) <= n_clusters:
+        centers = unique_positive
+    else:
+        kmeans = KMeans(n_clusters=n_clusters, n_init=10, random_state=0)
+        kmeans.fit(unique_positive)
+        centers = kmeans.cluster_centers_.astype(np.float32)
+        norms = np.linalg.norm(centers, axis=1, keepdims=True)
+        centers = centers / np.clip(norms, a_min=1e-12, a_max=None)
+    return np.max(query_embeddings @ centers.T, axis=1).astype(np.float32)
+
+
+def _minmax01(values: np.ndarray) -> NDArray[np.float32]:
+    values = np.asarray(values, dtype=np.float32)
+    span = float(values.max() - values.min()) if len(values) else 0.0
+    if span <= 1e-8:
+        return np.full(len(values), 0.5, dtype=np.float32)
+    return ((values - values.min()) / span).astype(np.float32)
+
+
+def _rank_percentiles(values: np.ndarray) -> NDArray[np.float32]:
+    values = np.asarray(values, dtype=np.float32)
+    if len(values) <= 1:
+        return np.ones(len(values), dtype=np.float32)
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty(len(values), dtype=np.float32)
+    ranks[order] = np.linspace(0.0, 1.0, len(values), dtype=np.float32)
+    return ranks
+
+
+def _softmax_rows(values: np.ndarray) -> NDArray[np.float32]:
+    values = np.asarray(values, dtype=np.float32)
+    shifted = values - values.max(axis=1, keepdims=True)
+    exp = np.exp(shifted)
+    return (exp / exp.sum(axis=1, keepdims=True)).astype(np.float32)
 
 
 def rank_stories(
@@ -1063,8 +1150,7 @@ def rank_stories(
                     exclude = 1 if i in up_indices else 0
                     n_available = max(1, n_up - exclude)
                     k_use = min(k_eff_up, n_available)
-                    topk = np.sort(sims)[-k_use:]
-                    fb_sim_to_up[i] = topk.mean()
+                    fb_sim_to_up[i] = _topk_mean(sims, k_use)
                 sim_up_mat_clean = fb_embeddings @ fb_up_embs.T
                 if n_up > 1:
                     for idx, tp in enumerate(up_indices):
@@ -1085,8 +1171,7 @@ def rank_stories(
                     exclude = 1 if i in down_indices else 0
                     n_available = max(1, n_down - exclude)
                     k_use = min(k_eff_down, n_available)
-                    topk = np.sort(sims)[-k_use:]
-                    fb_sim_to_down[i] = topk.mean()
+                    fb_sim_to_down[i] = _topk_mean(sims, k_use)
                 sim_down_mat_clean = fb_embeddings @ fb_down_embs.T
                 if n_down > 1:
                     for idx, tp in enumerate(down_indices):
@@ -1105,6 +1190,12 @@ def rank_stories(
                 if down_mask.any()
                 else np.zeros(len(candidates))
             )
+            fb_positive_cluster_sim = _positive_cluster_similarity(
+                fb_embeddings, fb_up_embs, config.model.positive_cluster_k
+            )
+            cand_positive_cluster_sim = _positive_cluster_similarity(
+                candidate_embeddings, fb_up_embs, config.model.positive_cluster_k
+            )
 
             fb_text_lengths = np.array([len(s.text_content) for s in feedback_stories])
 
@@ -1115,6 +1206,7 @@ def rank_stories(
                 sim_to_downvoted=fb_sim_to_down,
                 closest_upvoted=fb_closest_up,
                 closest_downvoted=fb_closest_down,
+                positive_cluster_similarity=fb_positive_cluster_sim,
             )
 
             # Ensure all three classes (0, 1, 2) are present
@@ -1157,7 +1249,6 @@ def rank_stories(
                 gamma=config.model.svm_gamma,
                 random_state=0,
                 decision_function_shape="ovr",
-                probability=True,
             )
             svm.fit(fb_features_scaled, labels, sample_weight=sample_weights)
 
@@ -1169,6 +1260,7 @@ def rank_stories(
                 sim_to_downvoted=cand_sim_to_down,
                 closest_upvoted=cand_closest_up,
                 closest_downvoted=cand_closest_down,
+                positive_cluster_similarity=cand_positive_cluster_sim,
             )
             cand_features_meta_scaled = np.clip(
                 scaler.transform(cand_features[:, emb_dim:]), -2.5, 2.5
@@ -1177,13 +1269,16 @@ def rank_stories(
                 [cand_features[:, :emb_dim], cand_features_meta_scaled]
             )
 
-            probs = svm.predict_proba(cand_features_scaled)
             class_order = list(svm.classes_)
             idx_up = class_order.index(2)
-            idx_neutral = class_order.index(1)
-            scores = (
-                probs[:, idx_up] + config.model.neutral_weight * probs[:, idx_neutral]
-            )
+            decision = svm.decision_function(cand_features_scaled)
+            if decision.ndim == 1:
+                raw_scores = decision if class_order[-1] == 2 else -decision
+                probs = np.column_stack([1 - _minmax01(raw_scores), _minmax01(raw_scores)])
+            else:
+                raw_scores = decision[:, idx_up]
+                probs = _softmax_rows(decision)
+            scores = _minmax01(raw_scores)
         except Exception as e:
             logging.error(f"Failed to fit feedback SVM: {e}")
 
@@ -1396,16 +1491,18 @@ def rerank_candidates(
         user_id=user_id,
     )
 
-    embeddings_map = {s.id: vec for s, vec in zip(candidates, cand_embeddings)}
-
     num_uncertain = 5 if config.count >= 10 else 0
     limit = max(1, config.count - num_uncertain)
-    final = mmr_filter(
-        ranked,
-        embeddings_map,
-        threshold=config.model.diversity_threshold,
-        limit=limit,
-    )
+    if config.model.enable_mmr:
+        embeddings_map = {s.id: vec for s, vec in zip(candidates, cand_embeddings)}
+        final = mmr_filter(
+            ranked,
+            embeddings_map,
+            threshold=config.model.diversity_threshold,
+            limit=limit,
+        )
+    else:
+        final = ranked[:limit]
 
     selected_ids = {item.story.id for item in final}
     remaining = [r for r in ranked if r.story.id not in selected_ids]
@@ -1445,7 +1542,7 @@ def rerank_candidates(
 
     story_id_to_idx = {s.id: idx for idx, s in enumerate(candidates)}
 
-    # Determine uncertainty IDs among remaining candidates
+    # Determine uncertainty candidates among remaining candidates
     def get_entropy(r: RankedStory) -> float:
         ent = 0.0
         for p in (r.prob_down, r.prob_neutral, r.prob_up):
@@ -1456,59 +1553,33 @@ def rerank_candidates(
     if remaining and num_uncertain > 0:
         uncertain_candidates = [r for r in remaining if r.prob_down is not None]
         uncertain_candidates.sort(key=get_entropy, reverse=True)
-        uncertain_ids = {r.story.id for r in uncertain_candidates[:num_uncertain]}
+        uncertain_candidates = uncertain_candidates[:num_uncertain]
     else:
-        uncertain_ids = set()
+        uncertain_candidates = []
 
-    # Assign badges to all candidates in ranked
+    # Compute discovery thresholds. Badges are assigned only to selected extra-slot
+    # stories, not to every story that passes these broad percentile gates.
     discussion_threshold = (
         np.percentile(cand_comment_counts, 93) if len(cand_comment_counts) else 0
     )
     engagement_threshold = np.percentile(cand_scores, 95) if len(cand_scores) else 0
 
-    cand_entropies = [get_entropy(r) for r in ranked if r.prob_down is not None]
-    uncertainty_threshold = np.percentile(cand_entropies, 90) if cand_entropies else 0.0
+    ranked_decorated = [replace(r) for r in ranked]
 
-    ranked_decorated = []
-    for r in ranked:
-        idx = story_id_to_idx[r.story.id]
-        entropy = get_entropy(r)
-        is_uncertain = bool(
-            r.prob_down is not None
-            and entropy >= 1.2
-            and (r.story.id in uncertain_ids or entropy >= uncertainty_threshold)
-        )
-        is_novel = bool(cand_max_sim[idx] <= sim_threshold and r.score > 0.1)
-        is_similar = bool(cand_closest_up[idx] >= similar_threshold)
-        is_discussion_rich = bool(
-            cand_comment_counts[idx] >= discussion_threshold
-            and cand_comment_counts[idx] > 0
-        )
-        is_high_engagement = bool(cand_scores[idx] >= engagement_threshold)
-        is_hot = bool(
-            cand_velocities[idx] >= hot_threshold and cand_velocities[idx] > 0
-        )
-        ranked_decorated.append(
-            replace(
-                r,
-                is_uncertain=is_uncertain,
-                is_novel=is_novel,
-                is_similar=is_similar,
-                is_discussion_rich=is_discussion_rich,
-                is_high_engagement=is_high_engagement,
-                is_hot=is_hot,
-            )
-        )
-
-    # Reconstruct final from the decorated candidates
+    # Reconstruct final from the undecorated ranked candidates
     final_ids = {item.story.id for item in final}
     final = [r for r in ranked_decorated if r.story.id in final_ids]
 
-    # And remaining_decorated contains the decorated candidates not in final
+    # And remaining_decorated contains candidates not in the primary path.
     remaining_decorated = [r for r in ranked_decorated if r.story.id not in final_ids]
 
     # 1. Surface uncertainty items
-    uncertain_items = [r for r in remaining_decorated if r.story.id in uncertain_ids]
+    uncertain_ids = {r.story.id for r in uncertain_candidates}
+    uncertain_items = [
+        replace(r, is_uncertain=True)
+        for r in remaining_decorated
+        if r.story.id in uncertain_ids
+    ]
     final.extend(uncertain_items)
     selected_ids = final_ids | {item.story.id for item in uncertain_items}
     remaining_decorated = [
@@ -1516,9 +1587,23 @@ def rerank_candidates(
     ]
 
     # 2. Surface up to 5 novel stories
-    novel_pool = [r for r in remaining_decorated if r.is_novel]
-    novel_pool.sort(key=lambda r: r.score, reverse=True)
-    novel_items = novel_pool[:5]
+    novel_pool = [
+        r
+        for r in remaining_decorated
+        if cand_max_sim[story_id_to_idx[r.story.id]] <= sim_threshold
+    ]
+    if novel_pool:
+        novel_scores = np.array([r.score for r in novel_pool], dtype=np.float32)
+        novel_distances = np.array(
+            [1.0 - cand_max_sim[story_id_to_idx[r.story.id]] for r in novel_pool],
+            dtype=np.float32,
+        )
+        score_pct = _rank_percentiles(novel_scores)
+        novelty_pct = _rank_percentiles(novel_distances)
+        novelty_rank = 0.7 * score_pct + 0.3 * novelty_pct
+        novel_order = np.argsort(-novelty_rank, kind="mergesort")
+        novel_pool = [novel_pool[int(i)] for i in novel_order]
+    novel_items = [replace(r, is_novel=True) for r in novel_pool[:5]]
     final.extend(novel_items)
     selected_ids |= {item.story.id for item in novel_items}
     remaining_decorated = [
@@ -1526,11 +1611,15 @@ def rerank_candidates(
     ]
 
     # 3. Surface up to 5 most similar stories
-    similar_pool = [r for r in remaining_decorated if r.is_similar]
+    similar_pool = [
+        r
+        for r in remaining_decorated
+        if cand_closest_up[story_id_to_idx[r.story.id]] >= similar_threshold
+    ]
     similar_pool.sort(
         key=lambda r: cand_closest_up[story_id_to_idx[r.story.id]], reverse=True
     )
-    similar_items = similar_pool[:5]
+    similar_items = [replace(r, is_similar=True) for r in similar_pool[:5]]
     final.extend(similar_items)
     selected_ids |= {item.story.id for item in similar_items}
     remaining_decorated = [
@@ -1538,9 +1627,16 @@ def rerank_candidates(
     ]
 
     # 4. Surface up to 5 discussion-rich stories
-    discussion_pool = [r for r in remaining_decorated if r.is_discussion_rich]
+    discussion_pool = [
+        r
+        for r in remaining_decorated
+        if cand_comment_counts[story_id_to_idx[r.story.id]] >= discussion_threshold
+        and cand_comment_counts[story_id_to_idx[r.story.id]] > 0
+    ]
     discussion_pool.sort(key=lambda r: r.story.comment_count or 0, reverse=True)
-    discussion_items = discussion_pool[:5]
+    discussion_items = [
+        replace(r, is_discussion_rich=True) for r in discussion_pool[:5]
+    ]
     final.extend(discussion_items)
     selected_ids |= {item.story.id for item in discussion_items}
     remaining_decorated = [
@@ -1548,9 +1644,15 @@ def rerank_candidates(
     ]
 
     # 5. Surface up to 5 high-engagement stories
-    engagement_pool = [r for r in remaining_decorated if r.is_high_engagement]
+    engagement_pool = [
+        r
+        for r in remaining_decorated
+        if cand_scores[story_id_to_idx[r.story.id]] >= engagement_threshold
+    ]
     engagement_pool.sort(key=lambda r: r.score, reverse=True)
-    engagement_items = engagement_pool[:5]
+    engagement_items = [
+        replace(r, is_high_engagement=True) for r in engagement_pool[:5]
+    ]
     final.extend(engagement_items)
     selected_ids |= {item.story.id for item in engagement_items}
     remaining_decorated = [
@@ -1558,11 +1660,16 @@ def rerank_candidates(
     ]
 
     # 6. Surface up to 5 hot stories
-    hot_pool = [r for r in remaining_decorated if r.is_hot]
+    hot_pool = [
+        r
+        for r in remaining_decorated
+        if cand_velocities[story_id_to_idx[r.story.id]] >= hot_threshold
+        and cand_velocities[story_id_to_idx[r.story.id]] > 0
+    ]
     hot_pool.sort(
         key=lambda r: cand_velocities[story_id_to_idx[r.story.id]], reverse=True
     )
-    hot_items = hot_pool[:5]
+    hot_items = [replace(r, is_hot=True) for r in hot_pool[:5]]
     final.extend(hot_items)
     selected_ids |= {item.story.id for item in hot_items}
 
@@ -1703,7 +1810,10 @@ async def run_pipeline(config: Config) -> None:
         cand_embeddings=cand_embeddings,
     )
 
-    logging.info(f"Filtering with MMR: {len(final)} of {len(ranked)} stories kept")
+    selection_mode = "MMR" if config.model.enable_mmr else "top-ranked"
+    logging.info(
+        f"Selected {selection_mode} stories: {len(final)} of {len(ranked)} kept"
+    )
     pu_vals = [r.prob_up for r in final if r.prob_up is not None]
     pu_lo = min(pu_vals) if pu_vals else 0.0
     pu_hi = max(pu_vals) if pu_vals else 0.0

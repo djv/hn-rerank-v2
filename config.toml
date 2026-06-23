@@ -8,14 +8,16 @@ server_port = 8766
 regen_interval_seconds = 10800
 
 [hn_rewrite.model]
-svm_c = 0.3
-svm_gamma = 0.21
+svm_c = 0.2
+svm_gamma = 0.03
 svm_kernel = "rbf"
 neutral_weight = 0.0
+enable_mmr = false
 min_feedback_labels = 10
 min_signal_examples = 5
 diversity_threshold = 0.75
 knn_k = 10
+positive_cluster_k = 4
 tier3_threshold = 20
 tier3_blend_window = 60
 min_up_for_svm = 20

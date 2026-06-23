@@ -3,8 +3,10 @@ import pytest
 import time
 from hypothesis import given, strategies as st, settings, HealthCheck
 from database import Action, Database, Story
+import pipeline
 from pipeline import (
     Embedder,
+    ModelConfig,
     RankedStory,
     clean_text,
     compose_story_text,
@@ -12,6 +14,8 @@ from pipeline import (
     mmr_filter,
     rank_stories,
     Config,
+    rerank_candidates,
+    story_embedding_text,
     _svm_personalization_features,
 )
 
@@ -75,6 +79,42 @@ def test_compose_text():
     assert "Some title" in composed
     assert "Some self text" in composed
     assert "First comment" in composed
+
+
+def test_story_embedding_text_prefers_stored_text_content():
+    story = Story(
+        id=1,
+        title="Fresh title",
+        url=None,
+        score=0,
+        time=0,
+        text_content="Stable cached embedding text.",
+        self_text="Longer self text should not change existing embedding input.",
+        top_comments="Comment text should not be used when text_content exists.",
+        article_body="Article text should not be used when text_content exists.",
+    )
+
+    assert story_embedding_text(story) == "Stable cached embedding text."
+
+
+def test_story_embedding_text_recovers_from_raw_fields_when_text_content_missing():
+    story = Story(
+        id=1,
+        title="Recovered title",
+        url=None,
+        score=0,
+        time=0,
+        text_content="",
+        self_text="Recovered self text.",
+        top_comments="Recovered comment text.",
+        article_body="Recovered article text.",
+    )
+
+    text = story_embedding_text(story)
+    assert "Recovered title" in text
+    assert "Recovered self text" in text
+    assert "Recovered article text" in text
+    assert "Recovered comment text" in text
 
 
 def test_strip_html():
@@ -187,7 +227,7 @@ def test_rank_svm_path(db, embedder):
     assert len(ranked) == 2
     # AI story should be ranked 1st
     assert ranked[0].story.id == 1
-    # Check that score is probability-based (usually between 0.0 and 1.0)
+    # Check that the normalized SVM margin score stays blend-compatible.
     assert 0.0 <= ranked[0].score <= 1.0
 
 
@@ -231,6 +271,43 @@ def test_mmr_output_is_subset(scores):
     for fid in filtered_ids:
         assert fid in input_ids
     assert filtered_ids == sorted(filtered_ids, key=lambda x: input_ids.index(x))
+
+
+def test_rerank_candidates_mmr_config_switch(db, embedder, monkeypatch):
+    candidates = [
+        Story(id=i, title=f"S{i}", url=None, score=10 - i, time=0, text_content=f"s{i}")
+        for i in range(3)
+    ]
+    embeddings = np.eye(3, 384, dtype=np.float32)
+
+    def fail_mmr(*args, **kwargs):
+        raise AssertionError("mmr_filter should not be called when enable_mmr=false")
+
+    monkeypatch.setattr(pipeline, "mmr_filter", fail_mmr)
+    rerank_candidates(
+        db=db,
+        config=Config(count=3, model=ModelConfig(enable_mmr=False)),
+        embedder=embedder,
+        candidates=candidates,
+        cand_embeddings=embeddings,
+    )
+
+    called = False
+
+    def mark_mmr(ranked, embeddings_map, threshold, limit):
+        nonlocal called
+        called = True
+        return ranked[:limit]
+
+    monkeypatch.setattr(pipeline, "mmr_filter", mark_mmr)
+    rerank_candidates(
+        db=db,
+        config=Config(count=3, model=ModelConfig(enable_mmr=True)),
+        embedder=embedder,
+        candidates=candidates,
+        cand_embeddings=embeddings,
+    )
+    assert called
 
 
 def test_rank_no_feedback_frontpage_sort(db, embedder):
@@ -348,6 +425,7 @@ def test_svm_personalization_features_exclude_engagement_source_metadata():
     sim_down = np.array([1.0, -1.0], dtype=np.float32)
     closest_up = np.array([0.0, 0.5], dtype=np.float32)
     closest_down = np.array([-0.5, 0.0], dtype=np.float32)
+    pos_cluster = np.array([-0.25, 0.75], dtype=np.float32)
 
     features = _svm_personalization_features(
         embeddings,
@@ -356,9 +434,10 @@ def test_svm_personalization_features_exclude_engagement_source_metadata():
         sim_to_downvoted=sim_down,
         closest_upvoted=closest_up,
         closest_downvoted=closest_down,
+        positive_cluster_similarity=pos_cluster,
     )
 
-    assert features.shape == (2, emb_dim + 5)
+    assert features.shape == (2, emb_dim + 6)
     assert np.all(features[:, :emb_dim] == 2.0)
     assert np.all(features[:, emb_dim:] >= 0.0)
     assert np.all(features[:, emb_dim:] <= 1.0)
@@ -366,6 +445,8 @@ def test_svm_personalization_features_exclude_engagement_source_metadata():
     assert features[1, emb_dim + 1] == 1.0
     assert features[0, emb_dim + 2] == 1.0
     assert features[1, emb_dim + 2] == 0.0
+    assert features[0, emb_dim + 5] == pytest.approx(0.375)
+    assert features[1, emb_dim + 5] == pytest.approx(0.875)
 
 
 @given(
@@ -823,8 +904,8 @@ async def test_run_pipeline_badge_assignment(tmp_path, monkeypatch):
         # We return unit embeddings.
         # ID 999 has embedding [1, 0, 0...]
         # ID 10 (sleeper) has embedding [0.6, 0...] to ensure closest_up > 0.55
-        # ID 11 (novel) has embedding [0.0, 0...] to ensure closest_up/closest_down <= sim_threshold
-        # ID 8 has embedding [0.1, 0...] to act as a low-score buffer below threshold
+            # ID 11 (novel) has embedding [0.0, 0...] to ensure closest_up/closest_down <= sim_threshold
+            # IDs 8/9 sit between novel and similar thresholds to isolate their badge passes
         # others have distinct values starting at 0.2
         embs = []
         for s in stories:
@@ -836,7 +917,9 @@ async def test_run_pipeline_badge_assignment(tmp_path, monkeypatch):
             elif s.id == 11:
                 vec[0] = 0.0
             elif s.id == 8:
-                vec[0] = 0.1
+                vec[0] = 0.25
+            elif s.id == 9:
+                vec[0] = 0.24
             else:
                 vec[0] = 0.2 + s.id * 0.01
             embs.append(vec)
@@ -861,9 +944,9 @@ async def test_run_pipeline_badge_assignment(tmp_path, monkeypatch):
                     story=s,
                     score=score,
                     best_match_title="",
-                    prob_down=0.1,
-                    prob_neutral=0.1,
-                    prob_up=0.8,
+                    prob_down=0.1 if s.id <= 7 else None,
+                    prob_neutral=0.1 if s.id <= 7 else None,
+                    prob_up=0.8 if s.id <= 7 else None,
                 )
             )
         return sorted(res, key=lambda x: x.score, reverse=True)
