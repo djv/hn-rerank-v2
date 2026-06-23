@@ -1,3 +1,4 @@
+import asyncio
 import numpy as np
 import pytest
 import time
@@ -15,7 +16,12 @@ from pipeline import (
     rank_stories,
     Config,
     rerank_candidates,
+    source_label_filter,
     story_embedding_text,
+    _extract_comments_recursive,
+    _dashboard_primary_limit,
+    _reddit_subreddit_from_feed_url,
+    _rss_source_name,
     _svm_personalization_features,
 )
 
@@ -121,6 +127,29 @@ def test_strip_html():
     raw_html = "<p>Hello &amp; welcome to <a href='#'>Hacker News</a>!</p>"
     cleaned = clean_text(raw_html)
     assert cleaned == "Hello & welcome to Hacker News!"
+
+
+def test_comment_extraction_allows_strong_replies_to_compete():
+    comments = [
+        {
+            "type": "comment",
+            "points": 100,
+            "text": "Top-level comment with enough substance to pass the minimum length.",
+            "children": [
+                {
+                    "type": "comment",
+                    "points": 130,
+                    "text": "Reply with substantially more points and enough context to stand alone.",
+                    "children": [],
+                }
+            ],
+        }
+    ]
+
+    extracted = sorted(_extract_comments_recursive(comments), key=lambda x: x["score"])
+
+    assert extracted[0]["text"].startswith("Reply with substantially more points")
+    assert extracted[1]["text"].startswith("Top-level comment")
 
 
 def test_clean_text():
@@ -253,6 +282,105 @@ def test_rss_synthetic_id():
     assert id2 < 0
 
 
+def test_reddit_feed_source_names_include_subreddit():
+    url = "https://www.reddit.com/r/LocalLLaMA/top/.rss?t=week&limit=25"
+
+    assert _reddit_subreddit_from_feed_url(url) == "localllama"
+    assert _rss_source_name(url) == "rss_reddit_localllama"
+    assert _rss_source_name("https://simonwillison.net/atom/everything/") == (
+        "rss_simonwillison_net"
+    )
+    assert _rss_source_name("https://rss.slashdot.org/Slashdot/slashdotMain") == (
+        "rss_slashdot_org"
+    )
+
+
+def test_source_label_filter_cleans_rss_prefixes():
+    assert source_label_filter("rss_rss_slashdot_org") == "Slashdot"
+    assert source_label_filter("rss_slashdot_org") == "Slashdot"
+    assert source_label_filter("rss_reddit_localllama") == "r/localllama"
+    assert source_label_filter("rss_simonwillison_net") == "Simon Willison"
+
+
+@pytest.mark.asyncio
+async def test_fetch_rss_feeds_serializes_reddit_and_sets_user_agent(
+    tmp_path, monkeypatch
+):
+    from pipeline import REDDIT_RSS_USER_AGENT, fetch_rss_feeds
+
+    db = Database(str(tmp_path / "test.db"))
+    active_reddit_requests = 0
+    max_reddit_concurrency = 0
+    seen_requests = []
+
+    class MockResp:
+        status_code = 200
+
+        def __init__(self, text: str):
+            self.text = text
+
+    def rss_doc(title: str, link: str) -> str:
+        return f"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>Test</title>
+<item><title>{title}</title><link>{link}</link><pubDate>Tue, 23 Jun 2026 12:00:00 GMT</pubDate><description>Substantial test summary text for ranking.</description></item>
+</channel></rss>"""
+
+    class MockClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, url, headers=None):
+            nonlocal active_reddit_requests, max_reddit_concurrency
+            is_reddit = "reddit.com" in url
+            if is_reddit:
+                active_reddit_requests += 1
+                max_reddit_concurrency = max(
+                    max_reddit_concurrency, active_reddit_requests
+                )
+            seen_requests.append((url, headers or {}))
+            await asyncio.sleep(0)
+            if is_reddit:
+                active_reddit_requests -= 1
+            title = "Reddit Item" if is_reddit else "Regular Item"
+            link = url.replace("/top/.rss", "/comments/test")
+            return MockResp(rss_doc(title, link))
+
+    monkeypatch.setattr("pipeline.httpx.AsyncClient", MockClient)
+
+    stories = await fetch_rss_feeds(
+        [
+            "https://www.reddit.com/r/haskell/top/.rss?t=week&limit=25",
+            "https://example.com/feed.xml",
+            "https://www.reddit.com/r/ocaml/top/.rss?t=month&limit=25",
+        ],
+        per_feed=10,
+        days=30,
+        exclude_urls=set(),
+        db=db,
+    )
+
+    assert max_reddit_concurrency == 1
+    reddit_requests = [
+        (url, headers) for url, headers in seen_requests if "reddit.com" in url
+    ]
+    assert len(reddit_requests) == 2
+    assert all(
+        headers.get("User-Agent") == REDDIT_RSS_USER_AGENT
+        for _url, headers in reddit_requests
+    )
+    assert {s.source for s in stories} >= {
+        "rss_reddit_haskell",
+        "rss_reddit_ocaml",
+        "rss_example_com",
+    }
+
+
 @given(st.lists(st.floats(0.0, 1.0, allow_nan=False), min_size=2, max_size=50))
 def test_mmr_output_is_subset(scores):
     ranked = []
@@ -308,6 +436,13 @@ def test_rerank_candidates_mmr_config_switch(db, embedder, monkeypatch):
         cand_embeddings=embeddings,
     )
     assert called
+
+
+def test_dashboard_primary_limit_reduces_ranked_slice_without_counting_uncertainty():
+    primary_limit, uncertain_slots = _dashboard_primary_limit(40)
+
+    assert primary_limit == 32
+    assert uncertain_slots == 5
 
 
 def test_rank_no_feedback_frontpage_sort(db, embedder):
@@ -792,7 +927,8 @@ async def test_refetch_updates_comment_count_at_fetch_on_success(db, embedder):
 
 
 async def test_run_pipeline_badge_assignment(tmp_path, monkeypatch):
-    """Verify that badges are only assigned to extra stories and excluded from default ones."""
+    """Verify badge criteria are applied uniformly to primary and extra-slot stories;
+    extra-slot pulls still source from remaining candidates with their per-pass caps."""
     from pipeline import Config, run_pipeline, RankedStory
     from database import Database, Story
     import numpy as np
@@ -885,7 +1021,7 @@ async def test_run_pipeline_badge_assignment(tmp_path, monkeypatch):
     config = Config(
         db_path=str(db_file),
         output=str(tmp_path / "index.html"),
-        count=10,  # 7 default path, 3 uncertain slots
+        count=9,  # 20% reduction keeps 7 primary ranked stories
     )
 
     # 3. Mock dependencies
@@ -904,8 +1040,8 @@ async def test_run_pipeline_badge_assignment(tmp_path, monkeypatch):
         # We return unit embeddings.
         # ID 999 has embedding [1, 0, 0...]
         # ID 10 (sleeper) has embedding [0.6, 0...] to ensure closest_up > 0.55
-            # ID 11 (novel) has embedding [0.0, 0...] to ensure closest_up/closest_down <= sim_threshold
-            # IDs 8/9 sit between novel and similar thresholds to isolate their badge passes
+        # ID 11 (novel) has embedding [0.0, 0...] to ensure closest_up/closest_down <= sim_threshold
+        # IDs 8/9 sit between novel and similar thresholds to isolate their badge passes
         # others have distinct values starting at 0.2
         embs = []
         for s in stories:
@@ -917,11 +1053,18 @@ async def test_run_pipeline_badge_assignment(tmp_path, monkeypatch):
             elif s.id == 11:
                 vec[0] = 0.0
             elif s.id == 8:
-                vec[0] = 0.25
+                # Above the 15th-pct novel threshold (~0.255) so the
+                # novel pass doesn't claim ID 8 first; ID 8 should reach
+                # the discussion-rich pass with comment_count=100.
+                vec[0] = 0.27
             elif s.id == 9:
-                vec[0] = 0.24
+                # Above the 15th-pct novel threshold so the novel pass
+                # doesn't claim ID 9 and prevent the engagement pass from
+                # running. ID 9 should reach the engagement pass with its
+                # raw story.score=500 above the 95th-pct threshold (~300).
+                vec[0] = 0.30
             else:
-                vec[0] = 0.2 + s.id * 0.01
+                vec[0] = 0.25 + s.id * 0.01
             embs.append(vec)
         return np.array(embs)
 
@@ -970,12 +1113,17 @@ async def test_run_pipeline_badge_assignment(tmp_path, monkeypatch):
 
     for r in captured_final:
         if r.story.id <= 7:
-            # Default path stories can have badges (e.g. is_uncertain in this uniform entropy test)
-            # but they must not have badges they don't qualify for:
-            assert not r.is_novel, f"Story {r.story.id} has novel badge"
-            assert not r.is_similar, f"Story {r.story.id} has similar badge"
-            assert not r.is_discussion_rich, f"Story {r.story.id} has discussion badge"
-            assert not r.is_high_engagement, f"Story {r.story.id} has engagement badge"
+            # Default path stories are not the focus of this test; the new
+            # behavior is that they can also receive badges, exercised in
+            # test_primary_story_gets_qualifying_badge. We don't make negative
+            # assertions here because small candidate sets can cause primary
+            # stories to incidentally clear the 90th/15th-percentile gates.
+            # The `is_similar` exclusion is invariant: primary stories never
+            # get the Similar badge regardless of whether they meet the
+            # criterion.
+            assert not r.is_similar, (
+                f"Primary story {r.story.id} should not have is_similar"
+            )
         else:
             # Extra discovery stories can have badges
             if r.story.id == 8:
@@ -986,6 +1134,172 @@ async def test_run_pipeline_badge_assignment(tmp_path, monkeypatch):
                 assert r.is_similar
             if r.story.id == 11:
                 assert r.is_novel
+
+
+async def test_primary_story_gets_qualifying_badge(tmp_path, monkeypatch):
+    """Primary-ranked stories that meet badge criteria receive those badges,
+    not just the extra-slot ones. The extra-slot pulls also keep working."""
+    from pipeline import Config, run_pipeline, RankedStory
+    from database import Database, Story
+    import numpy as np
+    import time
+
+    db_file = tmp_path / "test.db"
+    db = Database(str(db_file))
+    user = db.create_user("test_token_primary_badge")
+
+    now = int(time.time())
+    candidates = []
+
+    # Primary story that ALSO qualifies for is_discussion_rich (high comments
+    # AND high enough score to land in the primary ranked set).
+    candidates.append(
+        Story(
+            id=1,
+            title="Top Talky Story",
+            url=None,
+            score=200,
+            time=now,
+            text_content="content 1",
+            comment_count=300,
+        )
+    )
+    # Other primary stories with no qualifying properties.
+    for i in range(2, 8):
+        candidates.append(
+            Story(
+                id=i,
+                title=f"Default Story {i}",
+                url=None,
+                score=100 - i,
+                time=now,
+                text_content=f"content {i}",
+                comment_count=0,
+            )
+        )
+    # Extra-slot discussion story (outside primary by score but qualifies on
+    # the discussion-rich criterion, sourced via remaining_decorated).
+    candidates.append(
+        Story(
+            id=8,
+            title="Extra Discussion Story",
+            url=None,
+            score=5,
+            time=now,
+            text_content="content 8",
+            comment_count=250,
+        )
+    )
+
+    # Seed one upvoted feedback story so the SVM has something to train on.
+    db.upsert_story(
+        Story(
+            id=999,
+            title="Upvoted Story",
+            url=None,
+            score=100,
+            time=now,
+            text_content="upvoted text",
+        )
+    )
+    db.upsert_feedback(user.id, 999, "up")
+
+    config = Config(
+        db_path=str(db_file),
+        output=str(tmp_path / "index.html"),
+        count=8,
+    )
+
+    async def mock_fetch_candidates(*args, **kwargs):
+        return candidates, len(candidates)
+
+    monkeypatch.setattr("pipeline.fetch_candidates", mock_fetch_candidates)
+
+    class DummyEmbedder:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr("pipeline.Embedder", DummyEmbedder)
+
+    def mock_get_or_compute_embeddings(stories, embedder, db_inst):
+        embs = []
+        for s in stories:
+            vec = np.zeros(384, dtype=np.float32)
+            if s.id == 999:
+                vec[0] = 1.0
+            elif 1 <= s.id <= 7:
+                # Primary stories: high max_sim, above 15th-pct novel threshold
+                # (0.605) and below 90th-pct similar threshold (0.663).
+                # With 8 candidates, primary range [0.6, 0.66] clears novel
+                # (only 0.01 qualifies) and avoids similar (0.66 < 0.663).
+                vec[0] = 0.6 + (s.id - 1) * 0.01
+            else:
+                # ID 8 (extra-slot novel): low max_sim, qualifies for novel
+                vec[0] = 0.01
+            embs.append(vec)
+        return np.array(embs)
+
+    monkeypatch.setattr(
+        "pipeline.get_or_compute_embeddings", mock_get_or_compute_embeddings
+    )
+
+    def mock_rank_stories(candidates_list, *args, **kwargs):
+        res = []
+        for s in candidates_list:
+            if s.id == 1:
+                score = 0.95
+            elif 2 <= s.id <= 7:
+                score = 0.9 - s.id * 0.05
+            else:
+                score = 0.1
+            res.append(
+                RankedStory(
+                    story=s,
+                    score=score,
+                    best_match_title="",
+                    prob_down=0.1 if s.id <= 7 else None,
+                    prob_neutral=0.1 if s.id <= 7 else None,
+                    prob_up=0.8 if s.id <= 7 else None,
+                )
+            )
+        return sorted(res, key=lambda x: x.score, reverse=True)
+
+    monkeypatch.setattr("pipeline.rank_stories", mock_rank_stories)
+
+    captured_final = []
+
+    def mock_generate_dashboard(final_list, *args, **kwargs):
+        nonlocal captured_final
+        captured_final = list(final_list)
+
+    monkeypatch.setattr("pipeline.generate_dashboard", mock_generate_dashboard)
+
+    await run_pipeline(config)
+
+    # Primary story 1 should be in `final` AND carry is_discussion_rich.
+    primary_one = next((r for r in captured_final if r.story.id == 1), None)
+    assert primary_one is not None, "Story 1 missing from final"
+    assert primary_one.is_discussion_rich, (
+        "Primary story meeting the discussion-rich threshold should be badged"
+    )
+
+    # Other primary stories (no qualifying properties for discussion_rich
+    # or novel) should not have those badges. We don't assert against
+    # is_similar / is_high_engagement / is_hot here because small candidate
+    # sets can let one primary story incidentally clear the 90th/95th/98th
+    # percentile gates; that incidental matching is also valid new behavior.
+    for r in captured_final:
+        if 2 <= r.story.id <= 7:
+            assert not r.is_discussion_rich, f"Story {r.story.id} has discussion badge"
+            assert not r.is_novel, f"Story {r.story.id} has novel badge"
+
+    # Extra-slot story 8 qualifies for is_novel (low max_sim), verifying
+    # that the existing extra-slot discovery pass still works unchanged.
+    extra_eight = next((r for r in captured_final if r.story.id == 8), None)
+    assert extra_eight is not None, "Story 8 missing from final"
+    assert extra_eight.is_novel, (
+        "Extra-slot story meeting the novel threshold should be badged"
+    )
 
 
 def test_soft_blend_min_alpha_curve() -> None:

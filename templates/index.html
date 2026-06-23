@@ -67,36 +67,39 @@
       height: auto;
     }
 
+    .sort-toggle {
+      width: auto;
+      margin-bottom: 0;
+      padding: 0.3rem 0.85rem;
+      font-size: 0.8rem;
+      line-height: 1.2;
+      height: auto;
+      min-height: 0;
+      color: var(--pico-muted-color);
+      background: transparent;
+      border: 1px solid var(--pico-muted-border-color);
+      border-radius: 4px;
+      cursor: pointer;
+      text-transform: lowercase;
+      letter-spacing: 0.02em;
+    }
+
+    .sort-toggle:hover {
+      color: var(--pico-color);
+      border-color: var(--pico-primary);
+    }
+
     .story-card {
-      margin-bottom: 0.5rem;
-      padding: 0.6rem 0.8rem 0.6rem 1rem;
+      margin-bottom: 0.4rem;
+      padding: 0.45rem 0.65rem 0.45rem 0.65rem;
       border-radius: 6px;
       border: 1px solid var(--pico-card-border-color);
-      border-left: 8px solid transparent;
+      border-left: 7px solid transparent;
       background: var(--pico-card-background-color);
       transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1), transform 0.2s, box-shadow 0.2s;
       opacity: 1;
       overflow: hidden;
-    }
-
-    .story-card.match-strong {
-      border-left-color: hsl(150, 75%, 34%);
-      background: color-mix(in srgb, var(--pico-card-background-color) 94%, hsl(150, 75%, 42%) 6%);
-    }
-
-    .story-card.match-likely {
-      border-left-color: hsl(190, 85%, 36%);
-      background: color-mix(in srgb, var(--pico-card-background-color) 95%, hsl(190, 85%, 45%) 5%);
-    }
-
-    .story-card.match-mixed {
-      border-left-color: hsl(38, 90%, 45%);
-      background: color-mix(in srgb, var(--pico-card-background-color) 94%, hsl(38, 90%, 50%) 6%);
-    }
-
-    .story-card.match-skip {
-      border-left-color: hsl(355, 78%, 48%);
-      background: color-mix(in srgb, var(--pico-card-background-color) 94%, hsl(355, 78%, 52%) 6%);
+      cursor: pointer;
     }
 
     .story-card.fade-out {
@@ -121,10 +124,10 @@
       display: flex;
       flex-wrap: wrap;
       align-items: center;
-      gap: 0.4rem;
+      gap: 0.3rem;
       font-size: 0.75rem;
       color: var(--pico-muted-color);
-      margin-bottom: 0.2rem;
+      margin-bottom: 0.1rem;
     }
 
     .source-badge {
@@ -209,32 +212,16 @@
     }
 
     .story-card.enriched {
-      background: color-mix(in srgb, var(--pico-card-background-color) 93%, hsl(120, 50%, 50%) 7%);
       border-top-color: color-mix(in srgb, var(--pico-card-border-color) 90%, hsl(120, 50%, 50%) 10%);
       border-right-color: color-mix(in srgb, var(--pico-card-border-color) 90%, hsl(120, 50%, 50%) 10%);
       border-bottom-color: color-mix(in srgb, var(--pico-card-border-color) 90%, hsl(120, 50%, 50%) 10%);
     }
 
-    .story-card.enriched.match-strong {
-      background: color-mix(in srgb, var(--pico-card-background-color) 92%, hsl(150, 75%, 42%) 8%);
-    }
-
-    .story-card.enriched.match-likely {
-      background: color-mix(in srgb, var(--pico-card-background-color) 93%, hsl(190, 85%, 45%) 7%);
-    }
-
-    .story-card.enriched.match-mixed {
-      background: color-mix(in srgb, var(--pico-card-background-color) 92%, hsl(38, 90%, 50%) 8%);
-    }
-
-    .story-card.enriched.match-skip {
-      background: color-mix(in srgb, var(--pico-card-background-color) 92%, hsl(355, 78%, 52%) 8%);
-    }
-
     .story-title {
       font-size: 1.05rem;
-      margin-bottom: 0.2rem;
-      line-height: 1.2;
+      margin-top: 0.05rem;
+      margin-bottom: 0.05rem;
+      line-height: 1.18;
     }
 
     .story-title a {
@@ -248,12 +235,22 @@
       text-decoration: underline;
     }
 
+    .tldr-detail-content {
+      cursor: default;
+    }
+
+    .story-footer {
+      display: flex;
+      justify-content: flex-end;
+      margin-top: 0.1rem;
+    }
+
     .match-reason {
       font-size: 0.8rem;
       font-style: italic;
       color: var(--pico-muted-color);
       margin-bottom: 0;
-      margin-top: 0.5rem;
+      margin-top: 0.25rem;
     }
 
     .feedback-group {
@@ -281,7 +278,7 @@
     }
 
     .tldr-detail-btn {
-      padding: 0.15rem 0.5rem;
+      padding: 0.1rem 0.45rem;
       font-size: 0.8rem;
       border-radius: 4px;
       background: transparent;
@@ -390,6 +387,36 @@
       border-color: #dc3545 !important;
     }
 
+    .refresh-banner {
+      position: fixed;
+      top: 0.75rem;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 1000;
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      padding: 0.45rem 0.6rem 0.45rem 0.85rem;
+      border: 1px solid rgba(255, 102, 0, 0.35);
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.97);
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
+      color: #212529;
+      font-size: 0.85rem;
+    }
+
+    .refresh-banner[hidden] {
+      display: none;
+    }
+
+    .refresh-banner button {
+      width: auto;
+      margin: 0;
+      padding: 0.25rem 0.65rem;
+      font-size: 0.8rem;
+      line-height: 1.2;
+    }
+
     footer {
       text-align: center;
       margin-top: 3rem;
@@ -401,6 +428,11 @@
   </style>
 </head>
 <body>
+  <div id="refresh-banner" class="refresh-banner" hidden>
+    <span id="refresh-banner-text">Ranking updated</span>
+    <button type="button" id="refresh-now-btn">Refresh</button>
+  </div>
+
   <main class="container">
     <header>
       <div class="brand">
@@ -410,29 +442,14 @@
         <div class="meta-subtitle">
           {% if user_token %}<a href="/u/{{ user_token }}" class="share-link" title="Use this link to sync other devices">{{ user_token }}</a> · {% endif %}updated {{ timestamp }}
         </div>
-        <select id="sort-mode" aria-label="Sort options">
-          <option value="score" selected>Sort by Score</option>
-          <option value="date">Sort by Date</option>
-        </select>
+        <button type="button" id="sort-toggle" class="sort-toggle" aria-label="Toggle sort mode">Rank</button>
       </div>
     </header>
 
     <div id="stories">
       {% for item in stories %}
       {% set active_fb = fb_map.get(item.story.id) %}
-      {% set match_class = "" %}
-      {% if item.prob_down is not none %}
-        {% if item.prob_down >= 0.35 %}
-          {% set match_class = " match-skip" %}
-        {% elif item.prob_up >= 0.78 %}
-          {% set match_class = " match-strong" %}
-        {% elif item.prob_up >= 0.62 %}
-          {% set match_class = " match-likely" %}
-        {% else %}
-          {% set match_class = " match-mixed" %}
-        {% endif %}
-      {% endif %}
-      <article class="story-card{% if item.story.text_content | length >= 1000 %} enriched{% endif %}{{ match_class }}"
+      <article class="story-card{% if item.story.text_content | length >= 1000 %} enriched{% endif %}"
                data-story-id="{{ item.story.id }}" 
                data-score="{{ item.score }}"
                data-time="{{ item.story.time }}"
@@ -458,7 +475,7 @@
           {% endif %}
           
           {% if item.story.source != "hn" %}
-          <span class="source-badge">{{ item.story.source }}</span>
+          <span class="source-badge" title="{{ item.story.source }}">{{ item.story.source | source_label }}</span>
           {% endif %}
           
           {% if item.story.score > 0 %}
@@ -486,8 +503,8 @@
           </a>
         </h2>
 
-        <div class="story-footer" style="display: flex; justify-content: flex-end; margin-top: 0.25rem;">
-          <button type="button" class="tldr-detail-btn" data-tldr-detail>🔍 Detailed analysis</button>
+        <div class="story-footer">
+          <button type="button" class="tldr-detail-btn" data-tldr-detail>TLDR</button>
         </div>
 
         {% if item.best_match_title %}
@@ -541,19 +558,54 @@
     }
 
     // Client-side dynamic sorting
-    const sortSelect = document.getElementById('sort-mode');
+    const sortToggle = document.getElementById('sort-toggle');
     const storiesContainer = document.getElementById('stories');
+    const refreshBanner = document.getElementById('refresh-banner');
+    const refreshBannerText = document.getElementById('refresh-banner-text');
+    const refreshNowBtn = document.getElementById('refresh-now-btn');
+    let pendingFeedbackRequests = 0;
+    let pendingSavedVotes = 0;
+    let refreshQueued = false;
+    let isRefreshing = false;
+    let sortMode = 'rank';
 
-    sortSelect.addEventListener('change', () => {
-      const mode = sortSelect.value;
+    // Map a story's rank position (sorted by data-score desc) to a hue.
+    // Rank 1 (top) = blue, rank N (bottom) = red. Rank-percentile mapping
+    // (rather than linear-in-score) ensures visually distinguishable colors
+    // even when the score distribution clusters near 1.0.
+    function applyGradient() {
       const cards = Array.from(document.querySelectorAll('.story-card'));
-      if (mode === 'score') {
+      const N = cards.length;
+      if (N <= 1) return;
+      const ranked = cards
+        .map(card => ({ card, score: parseFloat(card.dataset.score) || 0 }))
+        .sort((a, b) => b.score - a.score);
+      ranked.forEach((entry, i) => {
+        // i=0 -> top rank -> blue (220); i=N-1 -> bottom -> red (0)
+        const hue = 220 * (N - 1 - i) / (N - 1);
+        entry.card.style.borderLeftColor = `hsl(${hue.toFixed(1)}, 70%, 40%)`;
+        entry.card.style.backgroundColor = `color-mix(in srgb, var(--pico-card-background-color) 96%, hsl(${hue.toFixed(1)}, 70%, 50%) 4%)`;
+      });
+    }
+
+    function applySort(mode) {
+      const cards = Array.from(document.querySelectorAll('.story-card'));
+      if (mode === 'rank') {
         cards.sort((a, b) => parseFloat(b.dataset.score) - parseFloat(a.dataset.score));
       } else if (mode === 'date') {
         cards.sort((a, b) => parseInt(b.dataset.time) - parseInt(a.dataset.time));
       }
       cards.forEach(card => storiesContainer.appendChild(card));
+    }
+
+    sortToggle.addEventListener('click', () => {
+      sortMode = sortMode === 'rank' ? 'date' : 'rank';
+      applySort(sortMode);
+      sortToggle.textContent = sortMode === 'rank' ? 'Rank' : 'Date';
     });
+
+    applyGradient();
+    applySort('rank');
 
     // Snarkdown - 1KB markdown parser (https://github.com/developit/snarkdown)
     const TAGS={'':['<em>','</em>'],_:['<strong>','</strong>'],'*':['<strong>','</strong>'],'~':['<s>','</s>'],'\n':['<br />'],' ':['<br />'],'-':['<hr />']};
@@ -591,36 +643,78 @@
       return snarkdown(normalizeTldrMarkdown(text));
     }
 
+    function updateRefreshBanner() {
+      const shouldShow = pendingSavedVotes > 0 || isRefreshing || refreshQueued;
+      refreshBanner.hidden = !shouldShow;
+      if (!shouldShow) {
+        refreshNowBtn.disabled = false;
+        refreshNowBtn.textContent = 'Refresh';
+        return;
+      }
+      if (isRefreshing) {
+        refreshBannerText.textContent = 'Refreshing ranking...';
+        refreshNowBtn.disabled = true;
+        refreshNowBtn.textContent = 'Refreshing';
+      } else if (refreshQueued && pendingFeedbackRequests > 0) {
+        refreshBannerText.textContent = 'Saving votes before refresh...';
+        refreshNowBtn.disabled = true;
+        refreshNowBtn.textContent = 'Refresh';
+      } else {
+        const label = pendingSavedVotes === 1 ? '1 saved vote' : `${pendingSavedVotes} saved votes`;
+        refreshBannerText.textContent = `${label} ready to apply`;
+        refreshNowBtn.disabled = false;
+        refreshNowBtn.textContent = 'Refresh';
+      }
+    }
+
+    function markRankingDirty() {
+      pendingSavedVotes += 1;
+      updateRefreshBanner();
+    }
+
+    async function refreshWhenReady() {
+      if (isRefreshing) return;
+      refreshQueued = true;
+      updateRefreshBanner();
+      if (pendingFeedbackRequests > 0) return;
+
+      isRefreshing = true;
+      updateRefreshBanner();
+      try {
+        await triggerSwap();
+        pendingSavedVotes = 0;
+      } catch (err) {
+        console.error('Failed to refresh ranking', err);
+      } finally {
+        isRefreshing = false;
+        refreshQueued = false;
+        updateRefreshBanner();
+      }
+    }
+
+    refreshNowBtn.addEventListener('click', refreshWhenReady);
+
     // Dynamic Swap-in of new ranked stories list
     async function triggerSwap() {
-      try {
-        const resp = await fetch(window.location.href, { cache: 'no-store' });
-        if (resp.ok) {
-          const htmlText = await resp.text();
-          const parser = new DOMParser();
-          const newDoc = parser.parseFromString(htmlText, 'text/html');
-          const newStories = newDoc.getElementById('stories');
-          if (newStories) {
-            storiesContainer.innerHTML = newStories.innerHTML;
-            
-            // Re-apply sorting if needed
-            const mode = sortSelect.value;
-            const cards = Array.from(document.querySelectorAll('.story-card'));
-            if (mode === 'score') {
-              cards.sort((a, b) => parseFloat(b.dataset.score) - parseFloat(a.dataset.score));
-              cards.forEach(card => storiesContainer.appendChild(card));
-            } else if (mode === 'date') {
-              cards.sort((a, b) => parseInt(b.dataset.time) - parseInt(a.dataset.time));
-              cards.forEach(card => storiesContainer.appendChild(card));
-            }
-            
-            // Re-bind listeners to the newly loaded story cards
-            bindEvents();
-          }
-        }
-      } catch (err) {
-        console.error('Failed to swap stories', err);
+      const resp = await fetch(window.location.href, { cache: 'no-store' });
+      if (!resp.ok) {
+        throw new Error(`Refresh failed: ${resp.status}`);
       }
+      const htmlText = await resp.text();
+      const parser = new DOMParser();
+      const newDoc = parser.parseFromString(htmlText, 'text/html');
+      const newStories = newDoc.getElementById('stories');
+      if (!newStories) {
+        throw new Error('Refresh failed: stories container missing');
+      }
+      storiesContainer.innerHTML = newStories.innerHTML;
+
+      // Recompute rank gradient for the new cards, then re-apply current sort.
+      applyGradient();
+      applySort(sortMode);
+
+      // Re-bind listeners to the newly loaded story cards
+      bindEvents();
     }
 
     // Function to bind click event listeners to current cards
@@ -657,6 +751,8 @@
             localStorage.removeItem(fbKey(storyId));
           }
 
+          pendingFeedbackRequests += 1;
+          updateRefreshBanner();
           try {
             const resp = await fetch(apiPath, {
               method: 'POST',
@@ -672,7 +768,7 @@
                 await collapsePromise;
                 card.remove();
               }
-              await triggerSwap();
+              markRankingDirty();
             } else {
               console.error('Failed to submit feedback', resp.status);
               // Rollback UI state
@@ -706,57 +802,102 @@
                 b.classList.remove('active');
               });
             }
+          } finally {
+            pendingFeedbackRequests = Math.max(0, pendingFeedbackRequests - 1);
+            if (refreshQueued && pendingFeedbackRequests === 0) {
+              await refreshWhenReady();
+            } else {
+              updateRefreshBanner();
+            }
           }
         };
       });
 
-      // 2. TLDR detail buttons
+      // 2. TLDR detail buttons and empty card space
+      document.querySelectorAll('.story-card').forEach(card => {
+        card.onclick = async (e) => {
+          if (
+            e.target.closest('a, button, input, textarea, select, summary, [role="button"], .feedback-group, .tldr-detail-content') ||
+            window.getSelection()?.toString()
+          ) {
+            return;
+          }
+          await openTldrDetail(card);
+        };
+      });
+
       document.querySelectorAll('[data-tldr-detail]').forEach(btn => {
         btn.onclick = async (e) => {
           e.stopPropagation();
-          const card = btn.closest('.story-card');
-          const storyId = Number(card.dataset.storyId);
-          const storyTitle = card.querySelector('.story-title a')?.textContent || '';
-          
-          let contentDiv = card.querySelector('.tldr-detail-content');
-          if (!contentDiv) {
-            contentDiv = document.createElement('div');
-            contentDiv.className = 'tldr-detail-content';
-            contentDiv.style.marginTop = '0.5rem';
-            contentDiv.style.fontSize = '0.85rem';
-            contentDiv.style.borderTop = '1px dashed var(--pico-muted-border-color)';
-            contentDiv.style.paddingTop = '0.5rem';
-            contentDiv.style.display = 'none';
-            card.appendChild(contentDiv);
-          }
-
-          btn.disabled = true;
-          btn.textContent = '⏳ Analyzing...';
-          
-          const apiPath = window.location.pathname.startsWith('/rewrite') ? '/rewrite/api/tldr-detail' : '/api/tldr-detail';
-          try {
-            const resp = await fetch(apiPath, {
-              method: 'POST',
-              headers: {'Content-Type': 'application/json'},
-              body: JSON.stringify({ story_id: storyId, story_title: storyTitle })
-            });
-            if (resp.ok) {
-              const data = await resp.json();
-              contentDiv.innerHTML = parseSimpleMarkdown(data.tldr);
-              contentDiv.style.display = 'block';
-              btn.style.display = 'none';
-            } else {
-              const errData = await resp.json().catch(() => ({}));
-              btn.textContent = '❌ ' + (errData.error || 'Failed');
-              btn.disabled = false;
-            }
-          } catch (err) {
-            console.error(err);
-            btn.textContent = '❌ Error';
-            btn.disabled = false;
-          }
+          await openTldrDetail(btn.closest('.story-card'));
         };
       });
+    }
+
+    async function openTldrDetail(card) {
+      if (!card) {
+        return;
+      }
+
+      const btn = card.querySelector('[data-tldr-detail]');
+      const storyId = Number(card.dataset.storyId);
+      const storyTitle = card.querySelector('.story-title a')?.textContent || '';
+
+      let contentDiv = card.querySelector('.tldr-detail-content');
+      if (contentDiv?.dataset.loading === 'true') {
+        return;
+      }
+      if (contentDiv && contentDiv.style.display !== 'none') {
+        return;
+      }
+      if (!contentDiv) {
+        contentDiv = document.createElement('div');
+        contentDiv.className = 'tldr-detail-content';
+        contentDiv.style.marginTop = '0.4rem';
+        contentDiv.style.fontSize = '0.85rem';
+        contentDiv.style.borderTop = '1px dashed var(--pico-muted-border-color)';
+        contentDiv.style.paddingTop = '0.4rem';
+        contentDiv.style.display = 'none';
+        card.appendChild(contentDiv);
+      }
+      contentDiv.dataset.loading = 'true';
+
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Analyzing...';
+      }
+
+      const apiPath = window.location.pathname.startsWith('/rewrite') ? '/rewrite/api/tldr-detail' : '/api/tldr-detail';
+      try {
+        const resp = await fetch(apiPath, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ story_id: storyId, story_title: storyTitle })
+        });
+        if (resp.ok) {
+          const data = await resp.json();
+          contentDiv.innerHTML = parseSimpleMarkdown(data.tldr);
+          contentDiv.style.display = 'block';
+          if (btn) {
+            btn.style.display = 'none';
+          }
+        } else {
+          const errData = await resp.json().catch(() => ({}));
+          if (btn) {
+            btn.textContent = 'Failed';
+            btn.title = errData.error || 'Failed to generate TLDR';
+            btn.disabled = false;
+          }
+        }
+      } catch (err) {
+        console.error(err);
+        if (btn) {
+          btn.textContent = 'Error';
+          btn.disabled = false;
+        }
+      } finally {
+        contentDiv.dataset.loading = 'false';
+      }
     }
 
     // Run initial event binding

@@ -34,7 +34,7 @@ The codebase consists of five primary modules:
 1. **[database.py](file:///home/dev/hn-rewrite/database.py)**: Encapsulates all SQLite interactions. Manages schemas (`stories`, `embeddings`, `feedback`), cascade-deletes, pruned retention rules, and automatic schema migrations. Staging raw inputs directly inside `stories` (`self_text`, `top_comments`, `article_body`) permits on-the-fly text composition and sync-detection. The legacy `article_cache` table is dropped and migrated directly.
 2. **[pipeline.py](file:///home/dev/hn-rewrite/pipeline.py)**: Orchestrates the background update sequence. Integrates RSS parsed feeds, computes text embeddings using ONNX, fits the SVM, and generates the final dashboard.
 3. **[server.py](file:///home/dev/hn-rewrite/server.py)**: A multi-threaded web server serving the static dashboard, handling feedback writes, proxying detailed TLDR summaries to LLM APIs, and housing the background regeneration event thread.
-4. **[templates/index.html](file:///home/dev/hn-rewrite/templates/index.html)**: Jinja2 dashboard template styled with a compact dark-theme Pico CSS layout. Includes client-side sorting, autohide transitions, and asynchronous detailed analysis rendering.
+4. **[templates/index.html](file:///home/dev/hn-rewrite/templates/index.html)**: Jinja2 dashboard template styled with a compact dark-theme Pico CSS layout. Includes client-side sorting, autohide transitions, and asynchronous TLDR rendering from the story card button or empty card-space clicks.
 5. **[migrate_feedback.py](file:///home/dev/hn-rewrite/migrate_feedback.py)**: Imports legacy feedback data from `hn_rerank` JSON files, backfilling candidate story contents and caching embeddings.
 
 ---
@@ -77,7 +77,7 @@ The production SVM trains on a **390-dimensional feature vector**:
   * Mean cosine similarity to the top-k downvoted story embeddings (`knn_k=10`, LOOCV for training).
   * Maximum cosine similarity to any upvoted story embedding.
   * Maximum cosine similarity to any downvoted story embedding.
-* **`[389]` (1-d)**: Maximum cosine similarity to a 4-cluster k-means summary of the user's upvoted feedback.
+* **`[389]` (1-d)**: Maximum cosine similarity to a 4-cluster k-means summary of the user's upvoted feedback. The runtime fits those positive-cluster centers once per render and reuses them for both feedback rows and candidate rows.
 
 The SVM deliberately excludes engagement/source metadata: score, comment count, HN quality, comment-to-score ratio, score velocity, comment velocity, and `is_hn`. These features produced inflated archive-wide offline metrics and worse 30-day held-out ranking than the semantic/text/similarity feature set.
 
@@ -90,7 +90,7 @@ When both upvote and downvote feedback pass the dual gate, the runtime trains a 
 
 $$\text{score} = \text{minmax01}(f_{\text{up}}(x))$$
 
-This avoids scikit-learn's deprecated and slower `SVC(probability=True)` calibration path. The dashboard still computes approximate probability-like fields by applying a softmax over the multi-class decision margins, but ranking itself is driven by the raw up-margin ordering. Because these softmax values are not calibrated probabilities, the UI does not show exact percentages; it uses them only for uncertainty entropy and a subtle card-left match rail.
+This avoids scikit-learn's deprecated and slower `SVC(probability=True)` calibration path. The dashboard still computes approximate probability-like fields by applying a softmax over the multi-class decision margins, but ranking itself is driven by the raw up-margin ordering. Because these softmax values are not calibrated probabilities, the UI does not show exact percentages; it uses them only for uncertainty entropy to select `🤔 Unsure` candidates. Card-left color is a smooth blue→red gradient driven by the card's rank position in the current render's sorted-by-score order (rank 1 = blue, rank N = red, evenly distributed), computed client-side from `data-score` values and applied to the border-left plus a 4% tinted background. Rank-percentile mapping (rather than linear-in-score) ensures visually distinguishable colors even when the score distribution clusters — the gradient travels with each card when the user sorts by date.
 
 **Current hyperparameters** (30-day and 365-day default-user eval, 2026-06-23): `C=0.2`, `gamma=0.03`, `kernel=rbf`, `neutral_weight=0.0`, `positive_cluster_k=4`.
 
@@ -112,26 +112,32 @@ The default dashboard selection is direct relevance order: `rerank_candidates` t
 
 The live dashboard path does not apply a hidden top-1000 prefilter. `fast_rerank_for_user()` pulls the full active story window for the user, excludes only stories already in that user's feedback set, and hands the resulting candidate pool straight to the ranker.
 
-Each story card gets a left match rail plus a faint matching tint derived from the model's approximate class distribution: teal for strong/likely match, amber for mixed, and red for likely skip. This is intentionally qualitative; exact down/neutral/up percentages are hidden because they are margin-softmax diagnostics, not calibrated probabilities, and can disagree with the raw up-margin score used for ordering.
+A 2-state sort toggle (`Rank ⇄ Date`) sits in the controls row; both modes are 1-click. Rank mode is the server's natural order (score desc); Date mode sorts by `data-time` desc. The score-based gradient is applied at render and again after refresh-swap, so the visual signal travels with each card regardless of sort mode.
 
-Discovery badges represent stories selected by extra-slot passes, not global annotations on every story that happens to cross a percentile threshold. The primary relevance path is kept unbadged for these discovery signals; each pass selects up to five additional stories from the remaining candidate pool, decorates only those selected stories, and deduplicates them from later passes:
-* **Uncertainty/Entropy Surfacing**: We compute the Shannon Entropy of the model's predicted probability distribution (Down, Neutral, Up). The orchestrator reserves up to 5 slots for the remaining candidates with the highest entropy, flagging them as `is_uncertain=True` (badge `🤔 Unsure`) to prompt active feedback.
+Discovery badges (uncertainty, novelty, talk-worthy, top, hot) are applied to any story that meets the criteria — primary or extra-slot. The **Similar badge is the exception**: it is reserved for extra-slot stories only, never for primary-ranked stories, so it always signals "surfaced from outside primary because of high semantic match" rather than a near-tautology on top-ranked stories (where score and `cand_closest_up` are correlated by construction). A primary-ranked story that crosses the talk-worthy, top, or hot percentile threshold receives that badge just as an extra-slot story would; multiple badges per card are allowed. The six discovery passes additionally source stories from the remaining candidate pool (stories not already in the primary ranked set) to surface qualifying stories that would not otherwise be shown; each pass respects its own slot cap and dedupes from later passes. The uniform badge attribution does not consume those slots:
+* **Uncertainty/Entropy Surfacing**: We compute the Shannon Entropy of the model's predicted probability distribution (Down, Neutral, Up). The orchestrator adds up to 5 extra slots for the remaining candidates with the highest entropy, flagging them as `is_uncertain=True` (badge `🤔 Unsure`) to prompt active feedback. Primary stories may also receive this badge via the same entropy threshold (derived from the extra-slot selection).
 * **Novel**: Top 15% least similar to feedback, flagged as `is_novel=True` (badge `✨ Novel`), up to 5 slots ranked by a percentile blend of model score (70%) and novelty distance from feedback (30%). This avoids a brittle raw SVM score cutoff while still preferring plausible stories.
-* **Similar**: Stories with high semantic match to upvotes (top 10% similarity, dynamic 90th percentile threshold), flagged as `is_similar=True` (badge `🎯 Similar`), up to 5 slots sorted by similarity score descending.
-* **Discussion-rich**: Top 7% by `comment_count` and comments > 0, flagged as `is_discussion_rich=True` (badge `💬 Talk-worthy`, 93rd percentile), up to 5 slots sorted by comment count descending.
-* **High-engagement**: Top 5% by `story.score`, flagged as `is_high_engagement=True` (badge `🏆 Top`, 95th percentile), up to 5 slots sorted by SVM score descending.
-* **Hot**: Top 2% by engagement velocity (points/hour), flagged as `is_hot=True` (badge `🔥 Hot`, 98th percentile).
+* **Similar** (extra-slot only): Stories with high semantic match to upvotes (top 3% similarity, dynamic 97th percentile threshold), flagged as `is_similar=True` (badge `🎯 Similar`), up to 5 slots sorted by similarity score descending. NOT applied to primary stories.
+* **Discussion-rich**: Top 2% of non-zero `comment_count` and comments > 0, flagged as `is_discussion_rich=True` (badge `💬 Talk-worthy`, 98th percentile of non-zero comments), up to 5 slots sorted by comment count descending.
+* **High-engagement**: Top 2% by `story.score`, flagged as `is_high_engagement=True` (badge `🏆 Top`, 98th percentile), up to 8 slots sorted by SVM score descending.
+* **Hot**: Top 0.5% by engagement velocity (points/hour), flagged as `is_hot=True` (badge `🔥 Hot`, 99.5th percentile), up to 8 slots.
 
-The final list can therefore exceed `config.count`: `config.count - 5` primary relevance stories, up to 5 uncertainty stories, and up to 5 stories for each later discovery pass. If a pass has no remaining qualifying candidates, it contributes fewer than five.
+The final list can therefore exceed `config.count`: the primary relevance path shows `round(config.count * 0.80)` ranked stories, then adds up to 5 uncertainty stories, up to 5 stories for each standard discovery pass, and up to 8 stories for each popularity pass (`Top` and `Hot`). With the default `count=40`, this yields 32 primary ranked stories before extras. If a pass has no remaining qualifying candidates, it contributes fewer than its cap.
 
 ### 3.5 Client-side Autohide & DOM Swap
-When a user upvotes/downvotes a card, the UI writes the current card height inline, triggers a CSS collapse transition (`max-height: 0 !important; opacity: 0;`), and removes the card from the DOM after 400ms. The feedback POST updates the SQLite database, clears the user's short-lived dashboard cache entry, and wakes the background regen thread. Once the card fade-out finishes, the client performs a background fetch of the dashboard HTML; the server calls `fast_rerank_for_user`, renders the personalized ranking in memory, caches it for up to 300 seconds, and returns it without writing per-user HTML to disk. The client then swaps the `#stories` card container in-place to present the recalculated rankings without a full page reload.
+When a user upvotes/downvotes a card, the UI writes the current card height inline, triggers a CSS collapse transition (`max-height: 0 !important; opacity: 0;`), and removes the card from the DOM after 400ms. The feedback POST updates the SQLite database, clears the user's short-lived dashboard cache entry, bumps a per-user dashboard version, schedules a debounced background cache warm, and wakes the background regen thread. The client does **not** immediately fetch a reranked dashboard after each vote; instead, it shows a floating refresh bar. Multiple consecutive votes accumulate behind that bar, so clicking **Refresh** performs one dashboard fetch after any in-flight feedback writes finish. If the debounced warm render has completed, refresh returns the already-rendered version; otherwise the GET call performs the render synchronously. Cache entries include the feedback version, so a stale warm render from an earlier vote cannot satisfy a later refresh. This avoids unexpected ranking jumps while the user is actively voting and usually moves the SVM retrain cost off the explicit refresh click.
+
+The server logs dashboard timing with stable prefixes: `dashboard_cache_invalidated`, `dashboard_warm`, and `dashboard_render`. Render logs include cache-hit vs rendered result, total elapsed time, render-lock wait time, ranking time, HTML generation time, story count, and whether the rendered HTML was written to cache. These logs are intended to diagnose cases where the floating refresh bar remains on "Refreshing ranking..." longer than expected.
 
 ### 3.6 Algolia Candidate Fetch Window
 The live-window fetch (`pipeline.py:336`) queries the Algolia HN search API in 7 daily chunks. Each day's fetch collects up to **350 hits** (5 pages of 100, minus stories with `points <= 5`). This cap was raised from 150 to capture the majority of high-score stories on busy days; previously, stories on high-volume days could be dropped before the reranker evaluated them.
 
+The configured RSS candidate pool mixes community aggregators with curated expert feeds across AI/software engineering, functional programming, infrastructure/security, FIRE/finance, urbanism/transit, health evidence, and science/culture. RSS feeds are intentionally plain feed URLs that the current pipeline can ingest directly through `feedparser`; newsletters/forums/podcasts are excluded unless they expose stable RSS or Atom items with canonical URLs. Reddit RSS feeds are fetched with a Reddit-specific User-Agent and serialized per regen to reduce `429 Too Many Requests`; their source names include the subreddit (for example `rss_reddit_haskell`) instead of collapsing every subreddit into `rss_reddit_com`.
+
+Dashboard source badges use display labels derived from stored source IDs. Historical feed-host artifacts such as `rss_rss_slashdot_org` are rendered as readable labels like `Slashdot`, while new feeds hosted at `rss.*`, `feeds.*`, or `feed.*` strip that host prefix before storing the source ID.
+
 ### 3.7 Comment Text Refetch on Growth
-By default, a story's `text_content` (the title + self-post + top-40 ranked comments baked into a single text blob) is fetched once and frozen along with its 384-dim embedding. During regen, only the integer fields (`score`, `comment_count`) are refreshed. To capture topic drift in active discussions, an opt-in growth-based refetch is applied:
+By default, a story's `text_content` (the title + self-post + top-40 ranked comments baked into a single text blob) is fetched once and frozen along with its 384-dim embedding. The ranked comment subset recursively scans comments to depth 3, drops very short/low-signal text, and sorts by `-points + depth * COMMENT_DEPTH_PENALTY`; the depth penalty is 25 points per nesting level so high-voted replies can compete with shallow comments. During regen, only the integer fields (`score`, `comment_count`) are refreshed. To capture topic drift in active discussions, an opt-in growth-based refetch is applied:
 
 - **Trigger condition** (all must hold): `comment_count` has grown by ≥ 30% since the last text fetch, story age is < 24h, the story has no user feedback, and the per-regen cap of 10 refetches has not been hit.
 - **Action**: `refetch_story_text` calls the Algolia items API, recomposes the top-40 ranked comment list (stored up to 10K chars, with `text_content` still embedding only the first 6K comment chars), recomposes `text_content`, re-embeds via the ONNX MiniLM model, and persists both the new text and the new embedding. `comment_count_at_fetch` is updated to the current `comment_count` so a story will not be refetched again until it grows another 30%.
@@ -181,6 +187,7 @@ The server is tuned to keep dashboard renders from stacking large transient allo
 * **Embedding Batch Size**: `Embedder.encode()` defaults to batches of 32 texts instead of 64, reducing peak token-embedding tensor size during candidate embedding and article-body re-embedding.
 * **Per-User Render Lock**: Dynamic dashboard renders are serialized per user ID. Concurrent refreshes for the same user re-check the 5-minute dashboard cache inside the lock, preventing multiple simultaneous SVM fits and similarity-matrix allocations for the same account.
 * **Top-k Similarity Selection**: k-NN similarity features use `np.partition` for top-k means instead of fully sorting every similarity row.
+* **Positive Cluster Reuse**: The positive-cluster feature fits one KMeans model per dashboard render, then scores both training feedback and live candidates against the same centers. This avoids a duplicate KMeans fit on every post-vote cache miss.
 
 ### 3.11 Multi-User Architecture
 The system supports multiple users with independent feedback histories and personalized rankings:
@@ -211,6 +218,30 @@ Latest 5-fold default-user evals (2026-06-23, `knn_k=10`, MMR disabled in produc
 The promoted change is the positive-cluster SVM. It keeps the leakage-safe semantic/text/similarity surface, adds a user-local positive-cluster similarity feature, and retunes the RBF SVM for the changed feature geometry. The tradeoff is a worse 30-day Down@40 guardrail versus the previous baseline.
 
 The evaluator now also reports `NDCG@40` alongside `NDCG@100`, `NDCG@200`, `P@40`, and `Down@40` so the scoreboard matches the fixed dashboard window more closely.
+
+Simple-model eval variants are available as `linear_svc_up`, `logreg_up`, and `sgd_log_up`. A 5-fold 30-day default-user run on 2026-06-23 compared them against the current RBF margin baseline on the same rolling candidate window:
+
+| Variant | Raw NDCG@40 | Raw NDCG@100 | Raw MAP | P@40 | Down@40 | Median upvote rank |
+|---------|-------------|--------------|---------|------|---------|--------------------|
+| `margin3_up` (RBF SVC) | 0.416 | 0.419 | 0.253 | 0.355 | 0.020 | 159.4 |
+| `linear_svc_up` | 0.352 | 0.366 | 0.198 | 0.325 | 0.010 | 196.1 |
+| `logreg_up` | 0.380 | 0.392 | 0.225 | 0.330 | 0.010 | 166.1 |
+| `sgd_log_up` | 0.178 | 0.203 | 0.110 | 0.165 | 0.000 | 356.8 |
+
+Conclusion: logistic regression is the least-bad faster candidate, but it still gives up meaningful `NDCG@40`, MAP, and P@40 versus the RBF SVC. Do not promote a simpler classifier without either a substantial latency requirement or another feature/scoring change that recovers the quality gap.
+
+A follow-up logistic-regression `C` sweep on the same 5-fold 30-day setup tested `C={0.01,0.03,0.05,0.1,0.2,0.4,0.8,1.5,3.0,10.0}`. Best `NDCG@40` was `C=0.1` (`NDCG@40=0.385`, `P@40=0.335`, `Down@40=0.015`, MAP `0.223`, median `167.3`). Best MAP/NDCG@100/median was `C=0.2` (`NDCG@40=0.380`, `NDCG@100=0.392`, MAP `0.225`, `P@40=0.330`, `Down@40=0.010`, median `166.1`). Larger `C` values degraded sharply. The sweep does not change the conclusion: tuned logistic regression remains below the RBF SVC baseline (`NDCG@40=0.416`, MAP `0.253`, `P@40=0.355`, median `159.4`).
+
+MLP classifier variants are available only in eval as `mlp_32_a1e-3`, `mlp_64_a1e-3`, and `mlp_64_16_a1e-3`. A 5-fold 30-day run on 2026-06-23 reused the standard leakage-safe feature matrix, kept raw embedding dimensions unscaled, scaled/clipped only metadata columns, and applied the same balanced sample weights as the simpler classifiers:
+
+| Variant | Raw NDCG@40 | Raw NDCG@100 | Raw MAP | P@40 | Down@40 | Median upvote rank |
+|---------|-------------|--------------|---------|------|---------|--------------------|
+| `margin3_up` (same run) | 0.404 | 0.403 | 0.229 | 0.345 | 0.025 | 174.5 |
+| `mlp_32_a1e-3` | 0.270 | 0.282 | 0.139 | 0.250 | 0.020 | 312.7 |
+| `mlp_64_a1e-3` | 0.306 | 0.331 | 0.177 | 0.265 | 0.025 | 237.1 |
+| `mlp_64_16_a1e-3` | 0.215 | 0.235 | 0.109 | 0.160 | 0.010 | 426.4 |
+
+Conclusion: the tested MLPs substantially underperform the RBF SVC on the main eyeball metric (`NDCG@40`), P@40, MAP, and median rank. The best MLP (`64` hidden units) is also below tuned logistic regression, so neural classifiers are not a promising replacement without a materially different architecture or much more feedback data.
 
 For expensive field-level embedding experiments, use `--max-feedback-per-class N` and `--max-candidates N` first. The evaluator keeps sampled valid feedback stories in the candidate pool and fills the rest with deterministic random background candidates, which makes small field-level smoke tests practical before attempting a full uncached field embedding run. Field-level eval embeddings use cleaned, production-budgeted field text (`title`, `self_text[:6000]`, `article_body[:4000]`, `top_comments[:6000]`) and reuse candidate field vectors for feedback stories already present in the candidate pool.
 
@@ -243,16 +274,18 @@ Fetch flow (server.py `_fetch_article_body`):
 3. **Extraction chain**: `trafilatura.extract()` first (robust against 100+ site templates); falls back to `BeautifulSoup` (strips non-content tags, prefers `<article>`/`<main>` containers).
 4. **Cache write**: Stores up to 15,000 characters of extracted text inside the `stories.article_body` column.
 
+Reddit RSS stories are treated differently. On `/api/tldr-detail`, `rss_reddit_*` rows with missing author text or comments fetch the per-post `.rss` feed and cache the first entry's Markdown body in `self_text` and up to 40 selected comment entries in `top_comments` (10K chars total). Generic article scraping is skipped for Reddit comments pages so Reddit block/error pages are not cached as `article_body`. The Reddit RSS enrichment reuses the same `top_comments` field as HN stories, so prompt construction, embeddings, and discussion-rich surfacing see Reddit discussion text through the existing schema.
+
 ### 4.2 Prompt Construction
 
-The detailed summary endpoint `/api/tldr-detail` proxies requests to Mistral or Groq. If both article text and HN comments are present, it sends two focused LLM requests in parallel: one article summary request and one discussion summary request, then combines the returned Markdown under `Article` and `Discussion` headings. If only one side is present, it falls back to a single structured prompt.
+The detailed summary endpoint `/api/tldr-detail` proxies requests to Mistral or Groq. If both article text and stored discussion comments are present, it sends two focused LLM requests in parallel: one article summary request and one discussion summary request, then combines the returned Markdown under `Article` and `Discussion` headings. If only one side is present, it falls back to a single structured prompt.
 
 The prompts are built from structured sections of the raw story fields (passed separately, not pre-composed):
 
 - Title
 - Author's text (`self_text`, up to 8K chars)
 - Article body (up to 15K chars)
-- HN comments (`top_comments`, up to 12K chars; currently stored up to 10K chars)
+- Discussion comments (`top_comments`, up to 12K chars; currently stored up to 10K chars)
 
 Each section is only included if non-empty, giving the LLM clearly separated content. If engagement is low (<20 points or <5 comments), the LLM uses cautious hedging language. Previously the prompt used a single 30K-char blob of pre-composed `text_content` — this caused the article body to appear twice (once raw, once truncated inside the composed blob). The structured approach avoids duplication and lets the LLM distinguish article content from discussion.
 

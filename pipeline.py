@@ -28,6 +28,10 @@ from database import Database, Story
 from transformers import AutoTokenizer
 
 
+RSS_USER_AGENT = "hn-rewrite/1.0 (+https://github.com/local/hn-rewrite)"
+REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dashboard"
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     svm_c: float = 0.2
@@ -48,6 +52,11 @@ class ModelConfig:
 COMMENT_GROWTH_THRESHOLD = 0.30  # 30% growth since last text fetch triggers refetch
 COMMENT_REFETCH_MAX_AGE_HOURS = 24  # Only refetch stories younger than this
 MAX_REFETCH_PER_REGEN = 10  # Bound Algolia cost per regen
+COMMENT_DEPTH_PENALTY = 25  # Points a reply must overcome per nesting level
+UNCERTAIN_DISCOVERY_SLOT_LIMIT = 5
+DISCOVERY_SLOT_LIMIT = 5
+POPULARITY_DISCOVERY_SLOT_LIMIT = 8
+PRIMARY_RANKED_FRACTION = 0.80
 
 
 @dataclass(frozen=True)
@@ -127,6 +136,13 @@ class RankedStory:
     is_similar: bool = False
 
 
+def _dashboard_primary_limit(config_count: int) -> tuple[int, int]:
+    num_uncertain = UNCERTAIN_DISCOVERY_SLOT_LIMIT if config_count >= 10 else 0
+    base_limit = max(1, config_count)
+    primary_limit = max(1, int(round(base_limit * PRIMARY_RANKED_FRACTION)))
+    return primary_limit, num_uncertain
+
+
 # Text processing helpers
 def clean_text(raw_text: str, min_len: int = 0) -> str:
     if not raw_text:
@@ -159,7 +175,6 @@ def _extract_comments_recursive(
     max_depth: int = 3,
     parent_points: int = 0,
 ) -> list[dict]:
-    DEPTH_PENALTY = 50
     MIN_COMMENT_LENGTH = 30
     results = []
     for child in children:
@@ -168,7 +183,7 @@ def _extract_comments_recursive(
         points = child.get("points") or 0
         if depth > 0 and points == 0:
             points = parent_points
-        score = -points + depth * DEPTH_PENALTY
+        score = -points + depth * COMMENT_DEPTH_PENALTY
         text = child.get("text", "")
         if text:
             clean = clean_text(text, min_len=MIN_COMMENT_LENGTH)
@@ -687,6 +702,34 @@ async def fetch_candidates(
 
 
 # RSS Fetching
+def _reddit_subreddit_from_feed_url(feed_url: str) -> str | None:
+    parsed = urlparse(feed_url)
+    domain = parsed.netloc.lower()
+    if domain.startswith("www."):
+        domain = domain[4:]
+    if domain not in {"reddit.com", "old.reddit.com"}:
+        return None
+
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) >= 2 and parts[0].lower() == "r":
+        return re.sub(r"[^a-z0-9_]+", "_", parts[1].lower()).strip("_")
+    return None
+
+
+def _rss_source_name(feed_url: str) -> str:
+    subreddit = _reddit_subreddit_from_feed_url(feed_url)
+    if subreddit:
+        return f"rss_reddit_{subreddit}"
+
+    domain = urlparse(feed_url).netloc
+    if domain.startswith("www."):
+        domain = domain[4:]
+    for prefix in ("rss.", "feeds.", "feed."):
+        if domain.startswith(prefix):
+            domain = domain[len(prefix) :]
+    return f"rss_{domain.replace('.', '_')}"
+
+
 async def fetch_rss_feeds(
     feeds: list[str],
     per_feed: int,
@@ -699,13 +742,13 @@ async def fetch_rss_feeds(
 
     async def fetch_and_parse(feed_url: str) -> list[Story]:
         try:
-            domain = urlparse(feed_url).netloc
-            if domain.startswith("www."):
-                domain = domain[4:]
-            source_name = f"rss_{domain.replace('.', '_')}"
+            source_name = _rss_source_name(feed_url)
+            headers = {"User-Agent": RSS_USER_AGENT}
+            if _reddit_subreddit_from_feed_url(feed_url):
+                headers["User-Agent"] = REDDIT_RSS_USER_AGENT
 
             async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
-                resp = await client.get(feed_url)
+                resp = await client.get(feed_url, headers=headers)
                 if resp.status_code != 200:
                     return []
                 content = resp.text
@@ -767,8 +810,16 @@ async def fetch_rss_feeds(
             logging.error(f"Failed to fetch RSS feed {feed_url}: {e}")
             return []
 
-    tasks = [fetch_and_parse(f) for f in feeds]
-    feed_results = await asyncio.gather(*tasks)
+    reddit_feeds = [f for f in feeds if _reddit_subreddit_from_feed_url(f)]
+    other_feeds = [f for f in feeds if not _reddit_subreddit_from_feed_url(f)]
+
+    tasks = [fetch_and_parse(f) for f in other_feeds]
+    feed_results = list(await asyncio.gather(*tasks)) if tasks else []
+
+    # Reddit RSS frequently returns 429 when several subreddit feeds are fetched in
+    # parallel from the same host, so keep those requests serialized.
+    for feed in reddit_feeds:
+        feed_results.append(await fetch_and_parse(feed))
 
     all_stories = []
     for res in feed_results:
@@ -896,9 +947,7 @@ def _knn_similarity(
     if k_actual == sim_mat.shape[1]:
         topk = sim_mat
     else:
-        topk = np.partition(sim_mat, sim_mat.shape[1] - k_actual, axis=1)[
-            :, -k_actual:
-        ]
+        topk = np.partition(sim_mat, sim_mat.shape[1] - k_actual, axis=1)[:, -k_actual:]
     return topk.mean(axis=1).astype(np.float32)
 
 
@@ -1042,13 +1091,12 @@ def _svm_personalization_features(
     return np.concatenate([embeddings, meta], axis=1)
 
 
-def _positive_cluster_similarity(
-    query_embeddings: NDArray[np.float32],
+def _positive_cluster_centers(
     positive_embeddings: NDArray[np.float32],
     n_clusters: int,
 ) -> NDArray[np.float32]:
-    if len(query_embeddings) == 0 or len(positive_embeddings) == 0 or n_clusters <= 0:
-        return np.zeros(len(query_embeddings), dtype=np.float32)
+    if len(positive_embeddings) == 0 or n_clusters <= 0:
+        return np.zeros((0, positive_embeddings.shape[1]), dtype=np.float32)
     unique_positive = np.unique(positive_embeddings, axis=0)
     if len(unique_positive) <= n_clusters:
         centers = unique_positive
@@ -1058,6 +1106,24 @@ def _positive_cluster_similarity(
         centers = kmeans.cluster_centers_.astype(np.float32)
         norms = np.linalg.norm(centers, axis=1, keepdims=True)
         centers = centers / np.clip(norms, a_min=1e-12, a_max=None)
+    return centers.astype(np.float32)
+
+
+def _positive_cluster_similarity(
+    query_embeddings: NDArray[np.float32],
+    positive_embeddings: NDArray[np.float32],
+    n_clusters: int,
+) -> NDArray[np.float32]:
+    centers = _positive_cluster_centers(positive_embeddings, n_clusters)
+    return _similarity_to_positive_cluster_centers(query_embeddings, centers)
+
+
+def _similarity_to_positive_cluster_centers(
+    query_embeddings: NDArray[np.float32],
+    centers: NDArray[np.float32],
+) -> NDArray[np.float32]:
+    if len(query_embeddings) == 0 or len(centers) == 0:
+        return np.zeros(len(query_embeddings), dtype=np.float32)
     return np.max(query_embeddings @ centers.T, axis=1).astype(np.float32)
 
 
@@ -1190,11 +1256,14 @@ def rank_stories(
                 if down_mask.any()
                 else np.zeros(len(candidates))
             )
-            fb_positive_cluster_sim = _positive_cluster_similarity(
-                fb_embeddings, fb_up_embs, config.model.positive_cluster_k
+            positive_cluster_centers = _positive_cluster_centers(
+                fb_up_embs, config.model.positive_cluster_k
             )
-            cand_positive_cluster_sim = _positive_cluster_similarity(
-                candidate_embeddings, fb_up_embs, config.model.positive_cluster_k
+            fb_positive_cluster_sim = _similarity_to_positive_cluster_centers(
+                fb_embeddings, positive_cluster_centers
+            )
+            cand_positive_cluster_sim = _similarity_to_positive_cluster_centers(
+                candidate_embeddings, positive_cluster_centers
             )
 
             fb_text_lengths = np.array([len(s.text_content) for s in feedback_stories])
@@ -1274,7 +1343,9 @@ def rank_stories(
             decision = svm.decision_function(cand_features_scaled)
             if decision.ndim == 1:
                 raw_scores = decision if class_order[-1] == 2 else -decision
-                probs = np.column_stack([1 - _minmax01(raw_scores), _minmax01(raw_scores)])
+                probs = np.column_stack(
+                    [1 - _minmax01(raw_scores), _minmax01(raw_scores)]
+                )
             else:
                 raw_scores = decision[:, idx_up]
                 probs = _softmax_rows(decision)
@@ -1435,6 +1506,48 @@ def time_ago_filter(seconds: int) -> str:
     return f"{days}d ago"
 
 
+def source_label_filter(source: str) -> str:
+    if not source:
+        return ""
+    if source == "hn":
+        return "HN"
+
+    label = source
+    if label.startswith("rss_"):
+        label = label[4:]
+    # Historical rows from feeds hosted at rss.* were stored as rss_rss_*.
+    if label.startswith("rss_"):
+        label = label[4:]
+    if label.startswith("reddit_"):
+        subreddit = label[len("reddit_") :]
+        return f"r/{subreddit}"
+
+    known = {
+        "slashdot_org": "Slashdot",
+        "mshibanami_github_io": "GitHub Trending",
+        "tildes_net": "Tildes",
+        "lesswrong_com": "LessWrong",
+        "lobste_rs": "Lobsters",
+        "discourse_haskell_org": "Haskell Discourse",
+        "latent_space": "Latent Space",
+        "scottaaronson_blog": "Scott Aaronson",
+        "simonwillison_net": "Simon Willison",
+        "lwn_net": "LWN",
+        "openai_com": "OpenAI",
+        "huggingface_co": "Hugging Face",
+        "blog_cloudflare_com": "Cloudflare",
+        "blog_janestreet_com": "Jane Street",
+        "well-typed_com": "Well-Typed",
+        "tweag_io": "Tweag",
+        "ocaml_org": "OCaml",
+        "quantamagazine_org": "Quanta",
+    }
+    if label in known:
+        return known[label]
+
+    return label.replace("_", ".")
+
+
 def generate_dashboard(
     ranked: list[RankedStory],
     output_path: Path,
@@ -1445,6 +1558,7 @@ def generate_dashboard(
 ) -> None:
     env = Environment(loader=FileSystemLoader("templates"), autoescape=True)
     env.filters["time_ago"] = time_ago_filter
+    env.filters["source_label"] = source_label_filter
 
     pico_css_path = Path("templates/pico.min.css")
     pico_css = (
@@ -1491,8 +1605,7 @@ def rerank_candidates(
         user_id=user_id,
     )
 
-    num_uncertain = 5 if config.count >= 10 else 0
-    limit = max(1, config.count - num_uncertain)
+    limit, num_uncertain = _dashboard_primary_limit(config.count)
     if config.model.enable_mmr:
         embeddings_map = {s.id: vec for s, vec in zip(candidates, cand_embeddings)}
         final = mmr_filter(
@@ -1528,8 +1641,10 @@ def rerank_candidates(
     )
     cand_max_sim = np.maximum(cand_closest_up, cand_closest_down)
     sim_threshold = np.percentile(cand_max_sim, 15) if len(cand_max_sim) else 0.0
+    # Similar threshold is applied to extra-slot stories only (see
+    # `is_similar` exclusion in the primary-attribution block below).
     similar_threshold = (
-        np.percentile(cand_closest_up, 90) if len(cand_closest_up) else 0.0
+        np.percentile(cand_closest_up, 97) if len(cand_closest_up) else 0.0
     )
 
     cand_comment_counts = np.array([s.comment_count or 0 for s in candidates])
@@ -1538,7 +1653,7 @@ def rerank_candidates(
     cand_velocities = np.array(
         [s.score / max((now_ts - s.time) / 3600.0, 0.1) for s in candidates]
     )
-    hot_threshold = np.percentile(cand_velocities, 98) if len(cand_velocities) else 0
+    hot_threshold = np.percentile(cand_velocities, 99.5) if len(cand_velocities) else 0
 
     story_id_to_idx = {s.id: idx for idx, s in enumerate(candidates)}
 
@@ -1557,18 +1672,58 @@ def rerank_candidates(
     else:
         uncertain_candidates = []
 
-    # Compute discovery thresholds. Badges are assigned only to selected extra-slot
-    # stories, not to every story that passes these broad percentile gates.
+    # Compute discovery thresholds. Badges are applied to any story that passes
+    # these criteria (primary or extra-slot); the extra-slot passes below
+    # additionally source from remaining_decorated to surface qualifying stories
+    # outside the primary ranked set, respecting per-pass slot caps.
+    # discussion_threshold uses 98th-pct of non-zero comments so that stories
+    # with zero comments are filtered out cleanly by the >0 guard.
+    nonzero_comments = cand_comment_counts[cand_comment_counts > 0]
     discussion_threshold = (
-        np.percentile(cand_comment_counts, 93) if len(cand_comment_counts) else 0
+        np.percentile(nonzero_comments, 98) if len(nonzero_comments) else 0
     )
-    engagement_threshold = np.percentile(cand_scores, 95) if len(cand_scores) else 0
+    engagement_threshold = np.percentile(cand_scores, 98) if len(cand_scores) else 0
 
     ranked_decorated = [replace(r) for r in ranked]
 
     # Reconstruct final from the undecorated ranked candidates
     final_ids = {item.story.id for item in final}
     final = [r for r in ranked_decorated if r.story.id in final_ids]
+
+    # Apply the same badge criteria to primary-ranked stories. Extra-slot
+    # passes below still source from remaining_decorated and respect their
+    # per-pass slot caps; this attribution only adds badges to stories
+    # already in the primary ranked set, so it does not take slots away
+    # from the extra-slot pulls. `is_similar` is intentionally NOT applied
+    # here: the Similar badge is reserved for extra-slot stories (see
+    # similar_threshold usage in the Similar discovery pass below), so it
+    # always signals "surfaced from outside primary because of high
+    # semantic match" rather than a near-tautology on top-ranked stories.
+    uncertain_entropy_threshold = (
+        get_entropy(uncertain_candidates[-1]) if uncertain_candidates else float("inf")
+    )
+    final = [
+        replace(
+            r,
+            is_uncertain=(
+                r.prob_down is not None
+                and get_entropy(r) >= uncertain_entropy_threshold
+            ),
+            is_novel=(cand_max_sim[story_id_to_idx[r.story.id]] <= sim_threshold),
+            is_discussion_rich=(
+                cand_comment_counts[story_id_to_idx[r.story.id]] >= discussion_threshold
+                and cand_comment_counts[story_id_to_idx[r.story.id]] > 0
+            ),
+            is_high_engagement=(
+                cand_scores[story_id_to_idx[r.story.id]] >= engagement_threshold
+            ),
+            is_hot=(
+                cand_velocities[story_id_to_idx[r.story.id]] >= hot_threshold
+                and cand_velocities[story_id_to_idx[r.story.id]] > 0
+            ),
+        )
+        for r in final
+    ]
 
     # And remaining_decorated contains candidates not in the primary path.
     remaining_decorated = [r for r in ranked_decorated if r.story.id not in final_ids]
@@ -1603,7 +1758,7 @@ def rerank_candidates(
         novelty_rank = 0.7 * score_pct + 0.3 * novelty_pct
         novel_order = np.argsort(-novelty_rank, kind="mergesort")
         novel_pool = [novel_pool[int(i)] for i in novel_order]
-    novel_items = [replace(r, is_novel=True) for r in novel_pool[:5]]
+    novel_items = [replace(r, is_novel=True) for r in novel_pool[:DISCOVERY_SLOT_LIMIT]]
     final.extend(novel_items)
     selected_ids |= {item.story.id for item in novel_items}
     remaining_decorated = [
@@ -1619,7 +1774,9 @@ def rerank_candidates(
     similar_pool.sort(
         key=lambda r: cand_closest_up[story_id_to_idx[r.story.id]], reverse=True
     )
-    similar_items = [replace(r, is_similar=True) for r in similar_pool[:5]]
+    similar_items = [
+        replace(r, is_similar=True) for r in similar_pool[:DISCOVERY_SLOT_LIMIT]
+    ]
     final.extend(similar_items)
     selected_ids |= {item.story.id for item in similar_items}
     remaining_decorated = [
@@ -1635,7 +1792,8 @@ def rerank_candidates(
     ]
     discussion_pool.sort(key=lambda r: r.story.comment_count or 0, reverse=True)
     discussion_items = [
-        replace(r, is_discussion_rich=True) for r in discussion_pool[:5]
+        replace(r, is_discussion_rich=True)
+        for r in discussion_pool[:DISCOVERY_SLOT_LIMIT]
     ]
     final.extend(discussion_items)
     selected_ids |= {item.story.id for item in discussion_items}
@@ -1643,7 +1801,7 @@ def rerank_candidates(
         r for r in remaining_decorated if r.story.id not in selected_ids
     ]
 
-    # 5. Surface up to 5 high-engagement stories
+    # 5. Surface up to 8 high-engagement stories
     engagement_pool = [
         r
         for r in remaining_decorated
@@ -1651,7 +1809,8 @@ def rerank_candidates(
     ]
     engagement_pool.sort(key=lambda r: r.score, reverse=True)
     engagement_items = [
-        replace(r, is_high_engagement=True) for r in engagement_pool[:5]
+        replace(r, is_high_engagement=True)
+        for r in engagement_pool[:POPULARITY_DISCOVERY_SLOT_LIMIT]
     ]
     final.extend(engagement_items)
     selected_ids |= {item.story.id for item in engagement_items}
@@ -1659,7 +1818,7 @@ def rerank_candidates(
         r for r in remaining_decorated if r.story.id not in selected_ids
     ]
 
-    # 6. Surface up to 5 hot stories
+    # 6. Surface up to 8 hot stories
     hot_pool = [
         r
         for r in remaining_decorated
@@ -1669,7 +1828,9 @@ def rerank_candidates(
     hot_pool.sort(
         key=lambda r: cand_velocities[story_id_to_idx[r.story.id]], reverse=True
     )
-    hot_items = [replace(r, is_hot=True) for r in hot_pool[:5]]
+    hot_items = [
+        replace(r, is_hot=True) for r in hot_pool[:POPULARITY_DISCOVERY_SLOT_LIMIT]
+    ]
     final.extend(hot_items)
     selected_ids |= {item.story.id for item in hot_items}
 
@@ -1844,6 +2005,7 @@ def generate_dashboard_bytes(
     """Render dashboard to bytes without writing to disk."""
     env = Environment(loader=FileSystemLoader("templates"), autoescape=True)
     env.filters["time_ago"] = time_ago_filter
+    env.filters["source_label"] = source_label_filter
 
     pico_css_path = Path("templates/pico.min.css")
     pico_css = (

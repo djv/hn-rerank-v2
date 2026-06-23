@@ -16,10 +16,11 @@ from urllib.parse import urlparse
 
 import numpy as np
 from sklearn.cluster import KMeans
-from sklearn.linear_model import SGDClassifier
+from sklearn.linear_model import LogisticRegression, SGDClassifier
 from sklearn.model_selection import StratifiedKFold
+from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
-from sklearn.svm import SVC
+from sklearn.svm import LinearSVC, SVC
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -539,6 +540,97 @@ def _scores_margin_3class(
     else:
         raise ValueError(f"Unknown margin mode: {mode}")
     return scores.astype(np.float32), None
+
+
+def _prepare_linear_model_inputs(
+    fold: FoldData, config: Config
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    train_x, cand_x = _select_matrices(fold, feature_source="base", textsplit=False)
+    x_train, x_cand = _fit_scale(train_x, cand_x, fold.cand_emb.shape[1])
+    y = fold.y_train
+    weights = _balanced_weights(y)
+    return x_train, x_cand, y, weights
+
+
+def _scores_linear_svc_up(fold: FoldData, config: Config) -> tuple[np.ndarray, None]:
+    x_train, x_cand, y, weights = _prepare_linear_model_inputs(fold, config)
+    clf = LinearSVC(
+        C=config.model.svm_c,
+        dual="auto",
+        random_state=0,
+        max_iter=5000,
+    )
+    clf.fit(x_train, y, sample_weight=weights)
+    decision = clf.decision_function(x_cand)
+    classes = list(clf.classes_)
+    if decision.ndim == 1:
+        up_sign = 1.0 if classes[-1] == 2 else -1.0
+        scores = up_sign * decision
+    else:
+        scores = decision[:, classes.index(2)]
+    return scores.astype(np.float32), None
+
+
+def _scores_logreg_up(
+    fold: FoldData, config: Config
+) -> tuple[np.ndarray, np.ndarray | None]:
+    x_train, x_cand, y, weights = _prepare_linear_model_inputs(fold, config)
+    clf = LogisticRegression(
+        C=config.model.svm_c,
+        solver="lbfgs",
+        max_iter=1000,
+        random_state=0,
+    )
+    clf.fit(x_train, y, sample_weight=weights)
+    probs = clf.predict_proba(x_cand)
+    classes = list(clf.classes_)
+    scores = probs[:, classes.index(2)]
+    return scores.astype(np.float32), probs
+
+
+def _scores_sgd_log_up(
+    fold: FoldData, config: Config
+) -> tuple[np.ndarray, np.ndarray | None]:
+    x_train, x_cand, y, weights = _prepare_linear_model_inputs(fold, config)
+    clf = SGDClassifier(
+        loss="log_loss",
+        alpha=0.0001,
+        max_iter=2000,
+        tol=1e-3,
+        random_state=0,
+    )
+    clf.fit(x_train, y, sample_weight=weights)
+    probs = clf.predict_proba(x_cand)
+    classes = list(clf.classes_)
+    scores = probs[:, classes.index(2)]
+    return scores.astype(np.float32), probs
+
+
+def _scores_mlp_up(
+    fold: FoldData,
+    config: Config,
+    hidden_layer_sizes: tuple[int, ...],
+    alpha: float,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    x_train, x_cand, y, weights = _prepare_linear_model_inputs(fold, config)
+    clf = MLPClassifier(
+        hidden_layer_sizes=hidden_layer_sizes,
+        activation="relu",
+        solver="adam",
+        alpha=alpha,
+        batch_size=min(64, len(y)),
+        learning_rate_init=0.001,
+        max_iter=500,
+        early_stopping=True,
+        validation_fraction=0.2,
+        n_iter_no_change=20,
+        random_state=0,
+    )
+    clf.fit(x_train, y, sample_weight=weights)
+    probs = clf.predict_proba(x_cand)
+    classes = list(clf.classes_)
+    scores = probs[:, classes.index(2)]
+    return scores.astype(np.float32), probs
 
 
 def _scores_margin_source_domain(fold: FoldData, config: Config) -> tuple[np.ndarray, None]:
@@ -1319,6 +1411,14 @@ def main() -> None:
         ),
         "margin3_up": lambda fold: _scores_margin_3class(
             fold, config, textsplit=False, mode="up"
+        ),
+        "linear_svc_up": lambda fold: _scores_linear_svc_up(fold, config),
+        "logreg_up": lambda fold: _scores_logreg_up(fold, config),
+        "sgd_log_up": lambda fold: _scores_sgd_log_up(fold, config),
+        "mlp_32_a1e-3": lambda fold: _scores_mlp_up(fold, config, (32,), 1e-3),
+        "mlp_64_a1e-3": lambda fold: _scores_mlp_up(fold, config, (64,), 1e-3),
+        "mlp_64_16_a1e-3": lambda fold: _scores_mlp_up(
+            fold, config, (64, 16), 1e-3
         ),
         "source_domain_margin3_up": lambda fold: _scores_margin_source_domain(
             fold, config

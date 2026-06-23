@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import asyncio
+import html
 import json
 import logging
 import re
@@ -13,18 +14,23 @@ import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse
 
+import feedparser
 import trafilatura
 from bs4 import BeautifulSoup
 import httpx
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from database import Database, User
 from pipeline import Config, Embedder
 
 ARTICLE_BODY_CHAR_LIMIT = 15_000
 SELF_TEXT_PROMPT_CHAR_LIMIT = 8_000
 COMMENT_PROMPT_CHAR_LIMIT = 12_000
+REDDIT_COMMENTS_CACHE_CHAR_LIMIT = 10_000
+REDDIT_COMMENT_LIMIT = 40
+REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dashboard"
 
 
 def _normalize_tldr_markdown(text: str) -> str:
@@ -70,6 +76,13 @@ def load_env() -> None:
                 os.environ[k.strip()] = v.strip().strip("'\"")
 
 
+@dataclass(frozen=True)
+class RedditRssContext:
+    self_text: str = ""
+    top_comments: str = ""
+    comment_count: int = 0
+
+
 async def _fetch_article_body(url: str) -> str | None:
     headers = {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -107,6 +120,101 @@ async def _fetch_article_body(url: str) -> str | None:
         return text[:ARTICLE_BODY_CHAR_LIMIT] if len(text) > 200 else None
 
     return None
+
+
+def _reddit_post_rss_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host not in {"reddit.com", "old.reddit.com"}:
+        return None
+    path = parsed.path.rstrip("/")
+    if "/comments/" not in path:
+        return None
+    if path.endswith(".rss"):
+        rss_path = path
+    else:
+        rss_path = f"{path}/.rss"
+    return urlunparse((parsed.scheme or "https", parsed.netloc, rss_path, "", "", ""))
+
+
+def _clean_reddit_rss_html(raw_html: str) -> str:
+    soup = BeautifulSoup(html.unescape(raw_html or ""), "html.parser")
+    md = soup.find("div", class_="md")
+    node = md if md else soup
+    text = node.get_text(separator=" ", strip=True)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _is_low_signal_reddit_comment(author: str, text: str) -> bool:
+    normalized_author = author.lower().removeprefix("/u/")
+    normalized_text = text.lower()
+    if normalized_author in {"automoderator", "withoutreason1729"}:
+        return True
+    if normalized_text in {"[deleted]", "[removed]"}:
+        return True
+    if "i am a bot and this action was performed automatically" in normalized_text:
+        return True
+    if "your post is getting popular" in normalized_text:
+        return True
+    return len(text) < 30
+
+
+async def _fetch_reddit_rss_context(url: str | None) -> RedditRssContext | None:
+    rss_url = _reddit_post_rss_url(url)
+    if not rss_url:
+        return None
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
+            resp = await client.get(rss_url, headers={"User-Agent": REDDIT_RSS_USER_AGENT})
+        if resp.status_code != 200:
+            return None
+    except Exception:
+        return None
+
+    parsed = feedparser.parse(resp.text)
+    entries = list(parsed.entries)
+    if not entries:
+        return None
+
+    first = entries[0]
+    post_html = ""
+    if "content" in first and first.content:
+        post_html = first.content[0].value
+    elif "summary" in first:
+        post_html = first.summary
+    self_text = _clean_reddit_rss_html(post_html)
+
+    comments: list[str] = []
+    total_len = 0
+    for entry in entries[1:]:
+        comment_html = ""
+        if "content" in entry and entry.content:
+            comment_html = entry.content[0].value
+        elif "summary" in entry:
+            comment_html = entry.summary
+        text = _clean_reddit_rss_html(comment_html)
+        author = str(entry.get("author", "")).strip()
+        if _is_low_signal_reddit_comment(author, text):
+            continue
+        label = author if author.startswith("/u/") else f"/u/{author}" if author else ""
+        formatted = f"{label}: {text}" if label else text
+        remaining = REDDIT_COMMENTS_CACHE_CHAR_LIMIT - total_len
+        if remaining <= 0 or len(comments) >= REDDIT_COMMENT_LIMIT:
+            break
+        formatted = formatted[:remaining]
+        comments.append(formatted)
+        total_len += len(formatted) + 1
+
+    return RedditRssContext(
+        self_text=self_text[:SELF_TEXT_PROMPT_CHAR_LIMIT],
+        top_comments=" ".join(comments)[:REDDIT_COMMENTS_CACHE_CHAR_LIMIT],
+        comment_count=len(comments),
+    )
 
 
 async def _call_llm_chat(
@@ -265,7 +373,9 @@ class Handler(BaseHTTPRequestHandler):
     db: Database
     embedder: Embedder
     regen_event: threading.Event
-    _dashboard_cache: dict[str, tuple[bytes, float]] = {}
+    _dashboard_cache: dict[str, tuple[bytes, float, int]] = {}
+    _dashboard_versions: dict[int, int] = {}
+    _dashboard_versions_guard = threading.Lock()
     _render_locks: dict[int, threading.Lock] = {}
     _render_locks_guard = threading.Lock()
 
@@ -345,28 +455,73 @@ class Handler(BaseHTTPRequestHandler):
 
     def _render_dashboard(self, user: User) -> bytes:
         """Render personalized dashboard for user. Uses short-lived cache."""
+        return self.__class__._render_dashboard_for_user(user)
+
+    @classmethod
+    def _render_dashboard_for_user(
+        cls, user: User, expected_version: int | None = None
+    ) -> bytes:
+        """Render personalized dashboard for user. Uses short-lived cache."""
+        request_start = time.perf_counter()
         now = time.time()
         cache_key = f"dashboard_{user.id}"
+        if expected_version is None:
+            expected_version = cls._dashboard_version(user.id)
 
-        cached = self._dashboard_cache.get(cache_key)
-        if cached and now - cached[1] < 300:
+        cached = cls._dashboard_cache.get(cache_key)
+        if cached and cached[2] == expected_version and now - cached[1] < 300:
+            logging.info(
+                "dashboard_render user_id=%s version=%s result=cache_hit elapsed_ms=%.1f cache_age_s=%.1f",
+                user.id,
+                expected_version,
+                (time.perf_counter() - request_start) * 1000,
+                now - cached[1],
+            )
             return cached[0]
 
-        lock = self._get_render_lock(user.id)
+        lock = cls._get_render_lock(user.id)
+        lock_wait_start = time.perf_counter()
         with lock:
+            lock_wait_ms = (time.perf_counter() - lock_wait_start) * 1000
             now = time.time()
-            cached = self._dashboard_cache.get(cache_key)
-            if cached and now - cached[1] < 300:
+            cached = cls._dashboard_cache.get(cache_key)
+            if cached and cached[2] == expected_version and now - cached[1] < 300:
+                logging.info(
+                    "dashboard_render user_id=%s version=%s result=cache_hit_after_lock elapsed_ms=%.1f lock_wait_ms=%.1f cache_age_s=%.1f",
+                    user.id,
+                    expected_version,
+                    (time.perf_counter() - request_start) * 1000,
+                    lock_wait_ms,
+                    now - cached[1],
+                )
                 return cached[0]
 
             from pipeline import fast_rerank_for_user, generate_dashboard_bytes
 
-            final = fast_rerank_for_user(self.db, self.config, self.embedder, user.id)
+            render_start = time.perf_counter()
+            final = fast_rerank_for_user(cls.db, cls.config, cls.embedder, user.id)
+            rank_ms = (time.perf_counter() - render_start) * 1000
+            html_start = time.perf_counter()
             html = generate_dashboard_bytes(
-                final, self.config, self.db, user.id, user.token
+                final, cls.config, cls.db, user.id, user.token
             )
+            html_ms = (time.perf_counter() - html_start) * 1000
 
-            self._dashboard_cache[cache_key] = (html, now)
+            cache_written = False
+            if cls._dashboard_version(user.id) == expected_version:
+                cls._dashboard_cache[cache_key] = (html, now, expected_version)
+                cache_written = True
+            logging.info(
+                "dashboard_render user_id=%s version=%s result=rendered elapsed_ms=%.1f lock_wait_ms=%.1f rank_ms=%.1f html_ms=%.1f stories=%s cache_written=%s",
+                user.id,
+                expected_version,
+                (time.perf_counter() - request_start) * 1000,
+                lock_wait_ms,
+                rank_ms,
+                html_ms,
+                len(final),
+                cache_written,
+            )
             return html
 
     @classmethod
@@ -377,6 +532,53 @@ class Handler(BaseHTTPRequestHandler):
                 lock = threading.Lock()
                 cls._render_locks[user_id] = lock
             return lock
+
+    @classmethod
+    def _dashboard_version(cls, user_id: int) -> int:
+        with cls._dashboard_versions_guard:
+            return cls._dashboard_versions.get(user_id, 0)
+
+    @classmethod
+    def _invalidate_dashboard_cache(cls, user_id: int) -> int:
+        cache_key = f"dashboard_{user_id}"
+        cls._dashboard_cache.pop(cache_key, None)
+        with cls._dashboard_versions_guard:
+            version = cls._dashboard_versions.get(user_id, 0) + 1
+            cls._dashboard_versions[user_id] = version
+            logging.info(
+                "dashboard_cache_invalidated user_id=%s version=%s", user_id, version
+            )
+            return version
+
+    @classmethod
+    def _schedule_dashboard_warm(cls, user: User, version: int) -> None:
+        def warm() -> None:
+            # Debounce click streaks so consecutive votes produce one warmed render.
+            warm_start = time.perf_counter()
+            time.sleep(1.0)
+            with cls._dashboard_versions_guard:
+                if cls._dashboard_versions.get(user.id) != version:
+                    logging.info(
+                        "dashboard_warm user_id=%s version=%s result=skipped_stale elapsed_ms=%.1f",
+                        user.id,
+                        version,
+                        (time.perf_counter() - warm_start) * 1000,
+                    )
+                    return
+            try:
+                cls._render_dashboard_for_user(user, expected_version=version)
+                logging.info(
+                    "dashboard_warm user_id=%s version=%s result=completed elapsed_ms=%.1f",
+                    user.id,
+                    version,
+                    (time.perf_counter() - warm_start) * 1000,
+                )
+            except Exception as e:
+                logging.exception(
+                    "Failed warming dashboard cache for user_id=%s: %s", user.id, e
+                )
+
+        threading.Thread(target=warm, daemon=True).start()
 
     def do_POST(self) -> None:
         if self.path == "/api/feedback":
@@ -402,9 +604,9 @@ class Handler(BaseHTTPRequestHandler):
                         action,
                     )
 
-                # Invalidate user's dashboard cache
-                cache_key = f"dashboard_{user.id}"
-                self._dashboard_cache.pop(cache_key, None)
+                # Invalidate user's dashboard cache and warm the next render async.
+                version = self._invalidate_dashboard_cache(user.id)
+                self._schedule_dashboard_warm(user, version)
 
                 # Also trigger background regen for candidate updates
                 self.regen_event.set()
@@ -453,8 +655,52 @@ class Handler(BaseHTTPRequestHandler):
                 article_body = story.article_body or None
 
                 if (
+                    story.source.startswith("rss_reddit_")
+                    and story.url
+                    and (not story.self_text or not story.top_comments)
+                ):
+                    reddit_context = asyncio.run(_fetch_reddit_rss_context(story.url))
+                    if reddit_context and (
+                        reddit_context.self_text or reddit_context.top_comments
+                    ):
+                        from pipeline import compose_story_text
+
+                        self_text = (
+                            reddit_context.self_text
+                            if len(reddit_context.self_text) > len(story.self_text)
+                            else story.self_text
+                        )
+                        top_comments = (
+                            reddit_context.top_comments
+                            if len(reddit_context.top_comments) > len(story.top_comments)
+                            else story.top_comments
+                        )
+                        new_text = compose_story_text(
+                            story.title,
+                            self_text,
+                            top_comments,
+                            article_body or "",
+                        )
+                        story = replace(
+                            story,
+                            self_text=self_text,
+                            top_comments=top_comments,
+                            text_content=new_text,
+                            discussion_url=story.discussion_url or story.url,
+                            comment_count=story.comment_count
+                            or reddit_context.comment_count
+                            or None,
+                            comment_count_at_fetch=max(
+                                story.comment_count_at_fetch,
+                                reddit_context.comment_count,
+                            ),
+                        )
+                        self.db.upsert_story(story)
+
+                if (
                     article_body is None
                     and story.url
+                    and not story.source.startswith("rss_reddit_")
                     and not story.url.startswith("https://news.ycombinator.com")
                     and len(story.self_text) < 500
                 ):
