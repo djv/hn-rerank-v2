@@ -67,31 +67,124 @@
       height: auto;
     }
 
-    .sort-toggle {
-      width: auto;
-      margin-bottom: 0;
-      padding: 0.3rem 0.85rem;
-      font-size: 0.8rem;
-      line-height: 1.2;
-      height: auto;
-      min-height: 0;
-      color: var(--pico-muted-color);
-      background: transparent;
-      border: 1px solid var(--pico-muted-border-color);
-      border-radius: 4px;
-      cursor: pointer;
-      text-transform: lowercase;
-      letter-spacing: 0.02em;
+    .swipe-shell {
+      max-width: 1100px;
+      margin: 0 auto;
     }
 
-    .sort-toggle:hover {
+    .swipe-layout {
+      display: flex;
+      align-items: stretch;
+      gap: 1rem;
+    }
+
+    .swipe-side {
+      flex: 0 0 150px;
+      position: sticky;
+      top: 0.75rem;
+      align-self: flex-start;
+      color: var(--pico-muted-color);
+      font-size: 0.8rem;
+    }
+
+    .queue-pill {
+      display: block;
+      margin-bottom: 0.65rem;
+      padding: 0.35rem 0.45rem;
+      border: 1px solid var(--pico-muted-border-color);
+      border-radius: 4px;
+      background: var(--pico-card-background-color);
       color: var(--pico-color);
+      line-height: 1.25;
+    }
+
+    .mode-tabs {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 0.35rem;
+      margin-bottom: 0.75rem;
+    }
+
+    .mode-tab {
+      width: 100%;
+      margin: 0;
+      padding: 0.32rem 0.45rem;
+      border-radius: 4px;
+      font-size: 0.8rem;
+      line-height: 1.2;
+      text-align: left;
+    }
+
+    .mode-tab.active {
       border-color: var(--pico-primary);
+      color: var(--pico-primary);
+      background: color-mix(in srgb, var(--pico-primary) 10%, transparent);
+    }
+
+    .swipe-keys {
+      display: grid;
+      gap: 0.35rem;
+    }
+
+    .key-row {
+      display: flex;
+      gap: 0.4rem;
+      align-items: center;
+      width: 100%;
+      margin: 0;
+      padding: 0;
+      border: 0;
+      background: transparent !important;
+      color: var(--pico-muted-color) !important;
+      font-size: 0.8rem;
+      font-weight: 400;
+      line-height: 1.2;
+      text-align: left;
+      text-transform: none;
+      letter-spacing: 0;
+      cursor: pointer;
+      box-shadow: none !important;
+    }
+
+    .key-row:hover,
+    .key-row:focus,
+    .key-row:active {
+      border: 0;
+      background: transparent !important;
+      color: var(--pico-color) !important;
+      box-shadow: none !important;
+      outline: none;
+    }
+
+    .key-row:focus-visible {
+      outline: 1px solid var(--pico-muted-border-color);
+      outline-offset: 2px;
+    }
+
+    .key-hint {
+      display: inline-flex;
+      width: 1.6rem;
+      height: 1.45rem;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid var(--pico-muted-border-color);
+      border-bottom-width: 2px;
+      border-radius: 4px;
+      color: var(--pico-color) !important;
+      background: var(--pico-card-background-color) !important;
+      font-weight: 700;
+      line-height: 1;
+    }
+
+    #stories {
+      flex: 1 1 902px;
+      min-height: calc(100vh - 1rem);
     }
 
     .story-card {
+      display: none;
       margin-bottom: 0.4rem;
-      padding: 0.45rem 0.65rem 0.45rem 0.65rem;
+      padding: 0.8rem 0.95rem 0.9rem 0.95rem;
       border-radius: 6px;
       border: 1px solid var(--pico-card-border-color);
       border-left: 7px solid transparent;
@@ -102,21 +195,20 @@
       cursor: pointer;
     }
 
+    .story-card.active {
+      display: block;
+      cursor: default;
+      min-height: calc(100vh - 1rem);
+      overflow: auto;
+    }
+
     .story-card.fade-out {
       opacity: 0;
-      max-height: 0 !important;
-      padding-top: 0 !important;
-      padding-bottom: 0 !important;
-      margin-top: 0 !important;
-      margin-bottom: 0 !important;
-      border-top-width: 0 !important;
-      border-bottom-width: 0 !important;
-      transform: translateY(15px);
+      transform: translateX(var(--swipe-exit-x, 0)) translateY(10px) rotate(var(--swipe-exit-rotate, 0deg));
       pointer-events: none;
     }
 
     .story-card:hover {
-      transform: translateY(-2px);
       box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
     }
 
@@ -242,7 +334,9 @@
     .story-footer {
       display: flex;
       justify-content: flex-end;
-      margin-top: 0.1rem;
+      align-items: center;
+      gap: 0.5rem;
+      margin-top: 0.45rem;
     }
 
     .match-reason {
@@ -417,6 +511,34 @@
       line-height: 1.2;
     }
 
+    @media (max-width: 640px) {
+      .swipe-layout {
+        flex-direction: column;
+      }
+
+      .swipe-side {
+        position: static;
+        order: -1;
+        display: flex;
+        justify-content: space-between;
+        gap: 0.75rem;
+      }
+
+      .queue-pill {
+        margin-bottom: 0;
+      }
+
+      .mode-tabs {
+        grid-template-columns: repeat(4, auto);
+        margin-bottom: 0;
+      }
+
+      .swipe-keys {
+        grid-template-columns: repeat(4, auto);
+      }
+
+    }
+
     footer {
       text-align: center;
       margin-top: 3rem;
@@ -433,27 +555,18 @@
     <button type="button" id="refresh-now-btn">Refresh</button>
   </div>
 
-  <main class="container">
-    <header>
-      <div class="brand">
-        <h1>HN <span>Rerank</span></h1>
-      </div>
-      <div class="controls-row">
-        <div class="meta-subtitle">
-          {% if user_token %}<a href="/u/{{ user_token }}" class="share-link" title="Use this link to sync other devices">{{ user_token }}</a> · {% endif %}updated {{ timestamp }}
-        </div>
-        <button type="button" id="sort-toggle" class="sort-toggle" aria-label="Toggle sort mode">Rank</button>
-      </div>
-    </header>
-
-    <div id="stories">
+  <main class="container swipe-shell">
+    <div class="swipe-layout">
+      <div id="stories">
       {% for item in stories %}
       {% set active_fb = fb_map.get(item.story.id) %}
       <article class="story-card{% if item.story.text_content | length >= 1000 %} enriched{% endif %}"
                data-story-id="{{ item.story.id }}" 
                data-score="{{ item.score }}"
                data-time="{{ item.story.time }}"
-               data-source="{{ item.story.source }}">
+               data-source="{{ item.story.source }}"
+               data-mode-popular="{{ '1' if item.is_hot or item.is_high_engagement or item.is_discussion_rich else '0' }}"
+               data-mode-explore="{{ '1' if item.is_uncertain or item.is_similar or item.is_novel else '0' }}">
         <div class="story-header">
           {% if item.is_uncertain %}
           <span class="uncertain-badge" title="Model is highly uncertain about this story (high entropy distribution)">🤔 Unsure</span>
@@ -512,6 +625,23 @@
         {% endif %}
       </article>
       {% endfor %}
+      </div>
+
+      <aside class="swipe-side" aria-label="Queue and keyboard controls">
+        <span id="queue-status" class="queue-pill">Loading queue...</span>
+        <div class="mode-tabs" aria-label="Story mode">
+          <button type="button" class="mode-tab active" data-mode="default">Default</button>
+          <button type="button" class="mode-tab" data-mode="popular">Popular</button>
+          <button type="button" class="mode-tab" data-mode="explore">Explore</button>
+          <button type="button" class="mode-tab" data-mode="date">Date</button>
+        </div>
+        <div class="swipe-keys">
+          <span class="key-row" tabindex="0" data-key-action="up"><span class="key-hint">↑</span> up</span>
+          <span class="key-row" tabindex="0" data-key-action="neutral"><span class="key-hint">→</span> neutral</span>
+          <span class="key-row" tabindex="0" data-key-action="down"><span class="key-hint">↓</span> down</span>
+          <span class="key-row" tabindex="0" data-key-action="undo"><span class="key-hint">u</span> undo</span>
+        </div>
+      </aside>
     </div>
 
     <footer>
@@ -557,17 +687,47 @@
       }
     }
 
-    // Client-side dynamic sorting
-    const sortToggle = document.getElementById('sort-toggle');
+    // Swipe deck state
     const storiesContainer = document.getElementById('stories');
+    const queueStatus = document.getElementById('queue-status');
     const refreshBanner = document.getElementById('refresh-banner');
     const refreshBannerText = document.getElementById('refresh-banner-text');
     const refreshNowBtn = document.getElementById('refresh-now-btn');
+    const modeTabs = Array.from(document.querySelectorAll('[data-mode]'));
     let pendingFeedbackRequests = 0;
-    let pendingSavedVotes = 0;
-    let refreshQueued = false;
-    let isRefreshing = false;
-    let sortMode = 'rank';
+    let refillQueued = false;
+    let isRefilling = false;
+    let activeCard = null;
+    let lastVote = null;
+    let currentMode = 'default';
+    let votesSinceRankingRefresh = 0;
+    let preloadedRefillDoc = null;
+    let isPreloadingRefill = false;
+    let preloadRefillPromise = null;
+    const MAX_QUEUE = 12;
+    const LOW_WATERMARK = 4;
+    const PREFETCH_COUNT = 3;
+    const IDLE_INACTIVE_PREFETCH_COUNT = 3;
+    const VOTES_PER_RANKING_REFRESH = 5;
+    let idleModePrefetchHandle = null;
+
+    function cards() {
+      return Array.from(storiesContainer.querySelectorAll('.story-card'));
+    }
+
+    function matchesCurrentMode(card) {
+      if (currentMode === 'popular') {
+        return card.dataset.modePopular === '1';
+      }
+      if (currentMode === 'explore') {
+        return card.dataset.modeExplore === '1';
+      }
+      return true;
+    }
+
+    function queuedCards() {
+      return cards().filter(card => !card.dataset.voted && matchesCurrentMode(card));
+    }
 
     // Map a story's rank position (sorted by data-score desc) to a hue.
     // Rank 1 (top) = blue, rank N (bottom) = red. Rank-percentile mapping
@@ -588,24 +748,67 @@
       });
     }
 
-    function applySort(mode) {
+    function orderByRank() {
       const cards = Array.from(document.querySelectorAll('.story-card'));
-      if (mode === 'rank') {
-        cards.sort((a, b) => parseFloat(b.dataset.score) - parseFloat(a.dataset.score));
-      } else if (mode === 'date') {
-        cards.sort((a, b) => parseInt(b.dataset.time) - parseInt(a.dataset.time));
-      }
+      cards.sort((a, b) => parseFloat(b.dataset.score) - parseFloat(a.dataset.score));
       cards.forEach(card => storiesContainer.appendChild(card));
     }
 
-    sortToggle.addEventListener('click', () => {
-      sortMode = sortMode === 'rank' ? 'date' : 'rank';
-      applySort(sortMode);
-      sortToggle.textContent = sortMode === 'rank' ? 'Rank' : 'Date';
-    });
+    function orderByDate() {
+      const cards = Array.from(document.querySelectorAll('.story-card'));
+      cards.sort((a, b) => Number(b.dataset.time || 0) - Number(a.dataset.time || 0));
+      cards.forEach(card => storiesContainer.appendChild(card));
+    }
+
+    function orderForCurrentMode() {
+      if (currentMode === 'date') {
+        orderByDate();
+      } else {
+        orderByRank();
+      }
+    }
+
+    function updateQueueStatus() {
+      const remaining = queuedCards().length;
+      if (remaining === 0) {
+        queueStatus.textContent = isRefilling ? 'Finding more stories...' : `No ${currentMode} stories`;
+      } else {
+        const suffix = isRefilling ? ' · refilling' : '';
+        const modeLabel = currentMode === 'default' ? '' : ` ${currentMode}`;
+        queueStatus.textContent = `${remaining}${modeLabel} queued${suffix}`;
+      }
+    }
+
+    function setActiveCard(card) {
+      cards().forEach(c => c.classList.toggle('active', c === card));
+      activeCard = card || null;
+      if (activeCard) {
+        openTldrDetail(activeCard);
+      }
+      prefetchUpcomingTldrs();
+      scheduleIdleModePrefetch();
+      updateQueueStatus();
+      maybeRefillQueue();
+    }
+
+    function showNextCard() {
+      setActiveCard(queuedCards()[0] || null);
+    }
+
+    function setMode(mode) {
+      currentMode = mode;
+      modeTabs.forEach(tab => {
+        tab.classList.toggle('active', tab.dataset.mode === currentMode);
+      });
+      if (activeCard && !matchesCurrentMode(activeCard)) {
+        activeCard.classList.remove('active');
+      }
+      orderForCurrentMode();
+      showNextCard();
+    }
 
     applyGradient();
-    applySort('rank');
+    orderByRank();
 
     // Snarkdown - 1KB markdown parser (https://github.com/developit/snarkdown)
     const TAGS={'':['<em>','</em>'],_:['<strong>','</strong>'],'*':['<strong>','</strong>'],'~':['<s>','</s>'],'\n':['<br />'],' ':['<br />'],'-':['<hr />']};
@@ -644,172 +847,157 @@
     }
 
     function updateRefreshBanner() {
-      const shouldShow = pendingSavedVotes > 0 || isRefreshing || refreshQueued;
+      const shouldShow = pendingFeedbackRequests > 0 || isRefilling || refillQueued;
       refreshBanner.hidden = !shouldShow;
       if (!shouldShow) {
         refreshNowBtn.disabled = false;
         refreshNowBtn.textContent = 'Refresh';
         return;
       }
-      if (isRefreshing) {
-        refreshBannerText.textContent = 'Refreshing ranking...';
+      if (isRefilling) {
+        refreshBannerText.textContent = 'Refilling queue...';
         refreshNowBtn.disabled = true;
-        refreshNowBtn.textContent = 'Refreshing';
-      } else if (refreshQueued && pendingFeedbackRequests > 0) {
+        refreshNowBtn.textContent = 'Refilling';
+      } else if (refillQueued && pendingFeedbackRequests > 0) {
         refreshBannerText.textContent = 'Saving votes before refresh...';
         refreshNowBtn.disabled = true;
         refreshNowBtn.textContent = 'Refresh';
-      } else {
-        const label = pendingSavedVotes === 1 ? '1 saved vote' : `${pendingSavedVotes} saved votes`;
-        refreshBannerText.textContent = `${label} ready to apply`;
+      } else if (refillQueued) {
+        refreshBannerText.textContent = 'New ranking ready';
         refreshNowBtn.disabled = false;
+        refreshNowBtn.textContent = 'Refresh';
+      } else {
+        const label = pendingFeedbackRequests === 1 ? '1 vote saving' : `${pendingFeedbackRequests} votes saving`;
+        refreshBannerText.textContent = `${label} syncing`;
+        refreshNowBtn.disabled = true;
         refreshNowBtn.textContent = 'Refresh';
       }
     }
 
-    function markRankingDirty() {
-      pendingSavedVotes += 1;
+    function markVoteSaving() {
       updateRefreshBanner();
     }
 
-    async function refreshWhenReady() {
-      if (isRefreshing) return;
-      refreshQueued = true;
+    async function refillWhenReady() {
+      if (isRefilling) return;
+      refillQueued = true;
       updateRefreshBanner();
       if (pendingFeedbackRequests > 0) return;
 
-      isRefreshing = true;
+      isRefilling = true;
       updateRefreshBanner();
+      updateQueueStatus();
       try {
-        await triggerSwap();
-        pendingSavedVotes = 0;
+        await refillQueue();
       } catch (err) {
-        console.error('Failed to refresh ranking', err);
+        console.error('Failed to refill queue', err);
       } finally {
-        isRefreshing = false;
-        refreshQueued = false;
+        isRefilling = false;
+        refillQueued = false;
+        updateQueueStatus();
         updateRefreshBanner();
       }
     }
 
-    refreshNowBtn.addEventListener('click', refreshWhenReady);
+    refreshNowBtn.addEventListener('click', refillWhenReady);
+    modeTabs.forEach(tab => {
+      tab.addEventListener('click', () => setMode(tab.dataset.mode));
+    });
+    document.querySelectorAll('[data-key-action]').forEach(btn => {
+      const runKeyAction = () => {
+        const action = btn.dataset.keyAction;
+        if (action === 'undo') {
+          undoLastVote();
+        } else {
+          submitVote(action);
+        }
+      };
+      btn.addEventListener('click', runKeyAction);
+      btn.addEventListener('keydown', e => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          runKeyAction();
+        }
+      });
+    });
 
-    // Dynamic Swap-in of new ranked stories list
-    async function triggerSwap() {
+    async function fetchRefillDoc() {
       const resp = await fetch(window.location.href, { cache: 'no-store' });
       if (!resp.ok) {
-        throw new Error(`Refresh failed: ${resp.status}`);
+        throw new Error(`Refill failed: ${resp.status}`);
       }
       const htmlText = await resp.text();
       const parser = new DOMParser();
-      const newDoc = parser.parseFromString(htmlText, 'text/html');
+      return parser.parseFromString(htmlText, 'text/html');
+    }
+
+    function scheduleRefillPreload() {
+      if (preloadRefillPromise || preloadedRefillDoc) {
+        return;
+      }
+      isPreloadingRefill = true;
+      preloadRefillPromise = new Promise(resolve => {
+        window.setTimeout(resolve, 2500);
+      }).then(async () => {
+        preloadedRefillDoc = await fetchRefillDoc();
+        return preloadedRefillDoc;
+      }).catch(err => {
+        console.error('Failed to preload refreshed queue', err);
+        return null;
+      }).finally(() => {
+        preloadRefillPromise = null;
+        isPreloadingRefill = false;
+        updateRefreshBanner();
+      });
+    }
+
+    async function refillQueue({ forceFetch = false } = {}) {
+      let newDoc = preloadedRefillDoc;
+      if (forceFetch || !newDoc) {
+        if (!forceFetch && preloadRefillPromise) {
+          newDoc = await preloadRefillPromise;
+        }
+        if (!newDoc) {
+          newDoc = await fetchRefillDoc();
+        }
+      }
+      preloadedRefillDoc = null;
       const newStories = newDoc.getElementById('stories');
       if (!newStories) {
-        throw new Error('Refresh failed: stories container missing');
+        throw new Error('Refill failed: stories container missing');
       }
-      storiesContainer.innerHTML = newStories.innerHTML;
 
-      // Recompute rank gradient for the new cards, then re-apply current sort.
+      cards().forEach(card => {
+        if (card !== activeCard) {
+          card.remove();
+        }
+      });
+      const existing = new Set(cards().map(card => card.dataset.storyId));
+      const incoming = Array.from(newStories.querySelectorAll('.story-card'));
+      for (const card of incoming) {
+        const storyId = card.dataset.storyId;
+        if (!storyId || existing.has(storyId) || localStorage.getItem(fbKey(storyId))) {
+          continue;
+        }
+        storiesContainer.appendChild(card);
+        existing.add(storyId);
+      }
+
       applyGradient();
-      applySort(sortMode);
-
-      // Re-bind listeners to the newly loaded story cards
+      orderForCurrentMode();
       bindEvents();
+      if (!activeCard || activeCard.dataset.voted) {
+        showNextCard();
+      }
     }
 
     // Function to bind click event listeners to current cards
     function bindEvents() {
       // 1. Feedback buttons
       document.querySelectorAll('[data-fb]').forEach(btn => {
-        btn.onclick = async (e) => {
+        btn.onclick = (e) => {
           e.stopPropagation();
-          const card = btn.closest('.story-card');
-          const action = btn.dataset.fb;
-          const storyId = Number(card.dataset.storyId);
-
-          const nextAction = btn.classList.contains('active') ? 'clear' : action;
-          const apiPath = window.location.pathname.startsWith('/rewrite') ? '/rewrite/api/feedback' : '/api/feedback';
-          
-          // 1. Update button state instantly (optimistic UI)
-          card.querySelectorAll('[data-fb]').forEach(b => {
-            if (nextAction === 'clear') {
-              b.classList.remove('active');
-            } else {
-              b.classList.toggle('active', b === btn);
-            }
-          });
-
-          // 2. Start collapse transition instantly if voting (optimistic UI)
-          let collapsePromise = null;
-          if (nextAction !== 'clear') {
-            card.style.maxHeight = card.offsetHeight + 'px';
-            card.offsetHeight; // force reflow
-            card.classList.add('fade-out');
-            localStorage.setItem(fbKey(storyId), nextAction);
-            collapsePromise = new Promise(resolve => setTimeout(resolve, 400));
-          } else {
-            localStorage.removeItem(fbKey(storyId));
-          }
-
-          pendingFeedbackRequests += 1;
-          updateRefreshBanner();
-          try {
-            const resp = await fetch(apiPath, {
-              method: 'POST',
-              headers: {'Content-Type': 'application/json'},
-              body: JSON.stringify({
-                story_id: storyId,
-                action: nextAction,
-              })
-            });
-
-            if (resp.ok) {
-              if (collapsePromise) {
-                await collapsePromise;
-                card.remove();
-              }
-              markRankingDirty();
-            } else {
-              console.error('Failed to submit feedback', resp.status);
-              // Rollback UI state
-              if (nextAction === 'clear') {
-                localStorage.setItem(fbKey(storyId), action);
-                card.querySelectorAll('[data-fb]').forEach(b => {
-                  b.classList.toggle('active', b.dataset.fb === action);
-                });
-              } else {
-                localStorage.removeItem(fbKey(storyId));
-                card.style.maxHeight = '';
-                card.classList.remove('fade-out');
-                card.querySelectorAll('[data-fb]').forEach(b => {
-                  b.classList.remove('active');
-                });
-              }
-            }
-          } catch (err) {
-            console.error('Network error submitting feedback', err);
-            // Rollback UI state
-            if (nextAction === 'clear') {
-              localStorage.setItem(fbKey(storyId), action);
-              card.querySelectorAll('[data-fb]').forEach(b => {
-                b.classList.toggle('active', b.dataset.fb === action);
-              });
-            } else {
-              localStorage.removeItem(fbKey(storyId));
-              card.style.maxHeight = '';
-              card.classList.remove('fade-out');
-              card.querySelectorAll('[data-fb]').forEach(b => {
-                b.classList.remove('active');
-              });
-            }
-          } finally {
-            pendingFeedbackRequests = Math.max(0, pendingFeedbackRequests - 1);
-            if (refreshQueued && pendingFeedbackRequests === 0) {
-              await refreshWhenReady();
-            } else {
-              updateRefreshBanner();
-            }
-          }
+          submitVote(btn.dataset.fb, btn.closest('.story-card'));
         };
       });
 
@@ -831,6 +1019,189 @@
           e.stopPropagation();
           await openTldrDetail(btn.closest('.story-card'));
         };
+      });
+    }
+
+    function maybeRefillQueue() {
+      if (queuedCards().length > LOW_WATERMARK || isRefilling || refillQueued) {
+        return;
+      }
+      if (!activeCard) {
+        refillWhenReady();
+      }
+    }
+
+    function prefetchUpcomingTldrs() {
+      queuedCards().slice(0, PREFETCH_COUNT).forEach(card => {
+        if (!card.querySelector('.tldr-detail-content')) {
+          openTldrDetail(card);
+        }
+      });
+    }
+
+    function cardsForMode(mode) {
+      const filtered = cards().filter(card => {
+        if (card.dataset.voted) return false;
+        if (mode === 'popular') return card.dataset.modePopular === '1';
+        if (mode === 'explore') return card.dataset.modeExplore === '1';
+        return true;
+      });
+      if (mode === 'date') {
+        filtered.sort((a, b) => Number(b.dataset.time || 0) - Number(a.dataset.time || 0));
+      }
+      return filtered;
+    }
+
+    function scheduleIdleModePrefetch() {
+      if (idleModePrefetchHandle) {
+        return;
+      }
+      const run = () => {
+        idleModePrefetchHandle = null;
+        ['default', 'popular', 'explore', 'date']
+          .filter(mode => mode !== currentMode)
+          .forEach(mode => {
+            cardsForMode(mode)
+              .slice(0, IDLE_INACTIVE_PREFETCH_COUNT)
+              .forEach(card => {
+                if (!card.querySelector('.tldr-detail-content')) {
+                  openTldrDetail(card);
+                }
+              });
+          });
+      };
+      if ('requestIdleCallback' in window) {
+        idleModePrefetchHandle = window.requestIdleCallback(run, { timeout: 2500 });
+      } else {
+        idleModePrefetchHandle = window.setTimeout(run, 1500);
+      }
+    }
+
+    function sendFeedback(storyId, action, queueRemaining, refreshRanking = false) {
+      const apiPath = window.location.pathname.startsWith('/rewrite') ? '/rewrite/api/feedback' : '/api/feedback';
+      return fetch(apiPath, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          story_id: storyId,
+          action,
+          queue_remaining: queueRemaining,
+          refresh_ranking: refreshRanking
+        })
+      }).then(resp => {
+        if (!resp.ok) {
+          throw new Error(`Feedback failed: ${resp.status}`);
+        }
+        return resp.json();
+      });
+    }
+
+    function submitVote(action, card = activeCard) {
+      if (!card || card.dataset.voted) {
+        return;
+      }
+
+      const storyId = Number(card.dataset.storyId);
+      const applyExistingRefillAfterVote = refillQueued && pendingFeedbackRequests === 0;
+      votesSinceRankingRefresh += 1;
+      const shouldRefreshRanking = votesSinceRankingRefresh >= VOTES_PER_RANKING_REFRESH;
+      if (shouldRefreshRanking) {
+        votesSinceRankingRefresh = 0;
+      }
+      card.dataset.voted = action;
+      localStorage.setItem(fbKey(storyId), action);
+      card.querySelectorAll('[data-fb]').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.fb === action);
+      });
+
+      if (action === 'up') {
+        card.style.setProperty('--swipe-exit-x', '42px');
+        card.style.setProperty('--swipe-exit-rotate', '1.5deg');
+      } else if (action === 'down') {
+        card.style.setProperty('--swipe-exit-x', '-42px');
+        card.style.setProperty('--swipe-exit-rotate', '-1.5deg');
+      } else {
+        card.style.setProperty('--swipe-exit-x', '0');
+        card.style.setProperty('--swipe-exit-rotate', '0deg');
+      }
+      card.classList.add('fade-out');
+
+      window.setTimeout(() => {
+        if (card.dataset.voted === action) {
+          card.remove();
+          showNextCard();
+        }
+      }, 150);
+
+      const queueRemaining = queuedCards().length;
+      pendingFeedbackRequests += 1;
+      markVoteSaving();
+
+      const savePromise = sendFeedback(
+        storyId,
+        action,
+        queueRemaining,
+        shouldRefreshRanking
+      ).then(data => {
+        if (data.ranking_refresh_queued) {
+          refillQueued = true;
+          scheduleRefillPreload();
+        }
+        return data;
+      }).catch(err => {
+        console.error('Network error submitting feedback', err);
+        refreshBannerText.textContent = 'Vote failed to save';
+        refreshBanner.hidden = false;
+      }).finally(() => {
+        pendingFeedbackRequests = Math.max(0, pendingFeedbackRequests - 1);
+        if (applyExistingRefillAfterVote && pendingFeedbackRequests === 0) {
+          window.setTimeout(refillWhenReady, 250);
+        } else {
+          updateRefreshBanner();
+          maybeRefillQueue();
+        }
+      });
+
+      lastVote = { storyId, action, card, savePromise };
+    }
+
+    function undoLastVote() {
+      const vote = lastVote;
+      if (!vote) {
+        return;
+      }
+      lastVote = null;
+
+      const { storyId, action, card, savePromise } = vote;
+      delete card.dataset.voted;
+      card.classList.remove('fade-out');
+      localStorage.removeItem(fbKey(storyId));
+      card.querySelectorAll('[data-fb]').forEach(btn => {
+        btn.classList.remove('active');
+      });
+      if (!card.isConnected) {
+        storiesContainer.insertBefore(card, storiesContainer.firstChild);
+      }
+      bindEvents();
+      setActiveCard(card);
+
+      pendingFeedbackRequests += 1;
+      markVoteSaving();
+      Promise.resolve(savePromise).finally(() => {
+        return sendFeedback(storyId, 'clear', queuedCards().length, true);
+      }).then(data => {
+        if (data.ranking_refresh_queued) {
+          refillQueued = true;
+          preloadedRefillDoc = null;
+          scheduleRefillPreload();
+        }
+      }).catch(err => {
+        console.error('Network error undoing feedback', err);
+        refreshBannerText.textContent = 'Undo failed to save';
+        refreshBanner.hidden = false;
+      }).finally(() => {
+        pendingFeedbackRequests = Math.max(0, pendingFeedbackRequests - 1);
+        updateRefreshBanner();
       });
     }
 
@@ -900,8 +1271,31 @@
       }
     }
 
+    document.addEventListener('keydown', (e) => {
+      if (
+        e.repeat ||
+        e.target.closest?.('input, textarea, select, button, a, [contenteditable="true"]')
+      ) {
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        submitVote('up');
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        submitVote('down');
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        submitVote('neutral');
+      } else if (e.key.toLowerCase() === 'u') {
+        e.preventDefault();
+        undoLastVote();
+      }
+    });
+
     // Run initial event binding
     bindEvents();
+    setMode('default');
   </script>
 </body>
 </html>
