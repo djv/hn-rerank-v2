@@ -330,7 +330,9 @@ def test_dashboard_cache_uses_feedback_versions(test_env, monkeypatch):
     import pipeline
 
     monkeypatch.setattr(pipeline, "fast_rerank_for_user", fake_fast_rerank_for_user)
-    monkeypatch.setattr(pipeline, "generate_dashboard_bytes", fake_generate_dashboard_bytes)
+    monkeypatch.setattr(
+        pipeline, "generate_dashboard_bytes", fake_generate_dashboard_bytes
+    )
 
     html_v0 = TestHandler._render_dashboard_for_user(user)
     assert html_v0 == b"version=0"
@@ -368,7 +370,9 @@ def test_stale_warm_render_does_not_overwrite_current_cache(test_env, monkeypatc
     import pipeline
 
     monkeypatch.setattr(pipeline, "fast_rerank_for_user", fake_fast_rerank_for_user)
-    monkeypatch.setattr(pipeline, "generate_dashboard_bytes", fake_generate_dashboard_bytes)
+    monkeypatch.setattr(
+        pipeline, "generate_dashboard_bytes", fake_generate_dashboard_bytes
+    )
 
     old_version = TestHandler._invalidate_dashboard_cache(user.id)
     new_version = TestHandler._invalidate_dashboard_cache(user.id)
@@ -380,7 +384,9 @@ def test_stale_warm_render_does_not_overwrite_current_cache(test_env, monkeypatc
     cache_key = f"dashboard_{user.id}"
     assert TestHandler._dashboard_cache[cache_key][2] == new_version
 
-    stale_html = TestHandler._render_dashboard_for_user(user, expected_version=old_version)
+    stale_html = TestHandler._render_dashboard_for_user(
+        user, expected_version=old_version
+    )
     assert stale_html == current_html
     assert TestHandler._dashboard_cache[cache_key][2] == new_version
 
@@ -411,7 +417,9 @@ def test_dashboard_cache_version_invariant_property(operations):
         def fake_fast_rerank_for_user(database, config, embedder, user_id):
             return []
 
-        def fake_generate_dashboard_bytes(ranked, config, database, user_id, user_token):
+        def fake_generate_dashboard_bytes(
+            ranked, config, database, user_id, user_token
+        ):
             return f"v={TestHandler._dashboard_version(user_id)}".encode()
 
         import pipeline
@@ -466,7 +474,10 @@ def test_normalize_tldr_markdown_repairs_inline_bullets():
     assert "### Article" in normalized
     assert "- **Consensus:** Open-source models are improving." in normalized
     assert "- **Notable Caveats:**" in normalized
-    assert "- Quantization may degrade quality.\n- Providers reduce hardware barriers." in normalized
+    assert (
+        "- Quantization may degrade quality.\n- Providers reduce hardware barriers."
+        in normalized
+    )
 
 
 def test_reddit_rss_helpers_extract_post_and_comment_text():
@@ -645,14 +656,14 @@ def test_tldr_detail_fetches_reddit_rss_comments(test_env, monkeypatch):
     async def mock_fetch_article_body(url):
         raise AssertionError("Reddit comments pages should not be scraped as articles")
 
-    async def mock_generate_detailed_tldr(
-        title, self_text, top_comments, article_body
-    ):
+    async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
         return f"TLDR: {self_text} | {top_comments}"
 
     import server
 
-    monkeypatch.setattr(server, "_fetch_reddit_rss_context", mock_fetch_reddit_rss_context)
+    monkeypatch.setattr(
+        server, "_fetch_reddit_rss_context", mock_fetch_reddit_rss_context
+    )
     monkeypatch.setattr(server, "_fetch_article_body", mock_fetch_article_body)
     monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
 
@@ -711,9 +722,7 @@ def test_tldr_detail_dynamic_fetch(test_env, monkeypatch):
     async def mock_fetch_article_body(url):
         return "Fetched article body text"
 
-    async def mock_generate_detailed_tldr(
-        title, self_text, top_comments, article_body
-    ):
+    async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
         return f"TLDR: {title} | {top_comments} | {article_body}"
 
     import server
@@ -776,9 +785,7 @@ def test_tldr_detail_dynamic_fetch_for_bq_seed(test_env, monkeypatch):
     async def mock_fetch_article_body(url):
         return None
 
-    async def mock_generate_detailed_tldr(
-        title, self_text, top_comments, article_body
-    ):
+    async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
         return f"TLDR: {title} | {top_comments}"
 
     import server
@@ -821,9 +828,7 @@ def test_tldr_detail_uses_cached_summary(test_env, monkeypatch):
 
     calls = 0
 
-    async def mock_generate_detailed_tldr(
-        title, self_text, top_comments, article_body
-    ):
+    async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
         nonlocal calls
         calls += 1
         return f"cached-result-{calls}: {title} | {article_body}"
@@ -885,3 +890,28 @@ async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
     assert "- **Article** summary" in result
     assert "### Discussion" in result
     assert "- **Discussion** summary" in result
+
+
+def test_keydown_guard_excludes_buttons_and_anchors():
+    """Regression: the global keydown handler in templates/index.html must not
+    bail out when a <button> or <a> has focus, otherwise clicking a mode tab
+    or vote button blocks the next ArrowUp/ArrowDown from registering.
+    """
+    template = (
+        Path(__file__).resolve().parents[1] / "templates" / "index.html"
+    ).read_text(encoding="utf-8")
+    assert "addEventListener('keydown'" in template, (
+        "keydown handler not found in template"
+    )
+
+    # Locate the closest(...) call in the guard
+    idx = template.index("closest?.(")
+    end = template.index(")", idx)
+    guard = template[idx : end + 1]
+
+    assert "button" not in guard, "button should not block global shortcuts"
+    assert "'a'" not in guard, "a should not block global shortcuts"
+    assert "input" in guard, "input should still block"
+    assert "textarea" in guard, "textarea should still block"
+    assert "select" in guard, "select should still block"
+    assert '[contenteditable="true"]' in guard, "contenteditable should still block"

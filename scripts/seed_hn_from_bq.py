@@ -104,7 +104,9 @@ async def hydrate_comments_from_algolia(
     top_comments = " ".join(c["text"] for c in selected)[:10000]
     comment_count = item.get("num_comments")
     story_text = clean_text(str(item.get("story_text") or item.get("text") or ""))
-    self_text = story_text if len(story_text) > len(story.self_text) else story.self_text
+    self_text = (
+        story_text if len(story_text) > len(story.self_text) else story.self_text
+    )
     text_content = compose_story_text(
         story.title,
         self_text,
@@ -155,8 +157,16 @@ def run_bq_query(
     min_score: int = 100,
 ) -> list[dict[str, Any]]:
     query = build_bq_query(months=months, min_score=min_score, limit=limit)
+    max_rows = max(int(limit) if limit is not None else 1000, 1000)
     proc = subprocess.run(
-        ["bq", "--format=json", "query", "--use_legacy_sql=false", query],
+        [
+            "bq",
+            "--format=json",
+            "query",
+            f"--max_rows={max_rows}",
+            "--use_legacy_sql=false",
+            query,
+        ],
         check=True,
         capture_output=True,
         text=True,
@@ -193,6 +203,7 @@ async def seed_rows(
 
     sem = asyncio.Semaphore(max(1, concurrency))
     async with httpx.AsyncClient(timeout=20.0) as client:
+
         async def hydrate(story: Story) -> Story:
             async with sem:
                 return await hydrate_comments_from_algolia(client, story)
@@ -229,7 +240,12 @@ async def async_main() -> None:
         )
         logging.info("bq rows=%s", len(rows))
         embedder = Embedder(config.onnx_model_dir)
-        inserted, skipped_feedback, skipped_existing, hydrated_comments = await seed_rows(
+        (
+            inserted,
+            skipped_feedback,
+            skipped_existing,
+            hydrated_comments,
+        ) = await seed_rows(
             rows,
             db=db,
             embedder=embedder,

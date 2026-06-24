@@ -1274,7 +1274,7 @@
     document.addEventListener('keydown', (e) => {
       if (
         e.repeat ||
-        e.target.closest?.('input, textarea, select, button, a, [contenteditable="true"]')
+        e.target.closest?.('input, textarea, select, [contenteditable="true"]')
       ) {
         return;
       }

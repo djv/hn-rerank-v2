@@ -1,4 +1,5 @@
 import hashlib
+import subprocess
 
 import httpx
 import numpy as np
@@ -87,7 +88,12 @@ async def test_seed_skips_feedback_story_without_update(monkeypatch):
                 raise AssertionError("feedback-protected story should not hydrate")
 
         monkeypatch.setattr(seed_hn_from_bq.httpx, "AsyncClient", MockClient)
-        inserted, skipped_feedback, skipped_existing, hydrated = await seed_hn_from_bq.seed_rows(
+        (
+            inserted,
+            skipped_feedback,
+            skipped_existing,
+            hydrated,
+        ) = await seed_hn_from_bq.seed_rows(
             [
                 {
                     "id": 123,
@@ -142,7 +148,12 @@ async def test_seed_skips_existing_story_without_feedback(monkeypatch):
                 raise AssertionError("existing story should not hydrate")
 
         monkeypatch.setattr(seed_hn_from_bq.httpx, "AsyncClient", MockClient)
-        inserted, skipped_feedback, skipped_existing, hydrated = await seed_hn_from_bq.seed_rows(
+        (
+            inserted,
+            skipped_feedback,
+            skipped_existing,
+            hydrated,
+        ) = await seed_hn_from_bq.seed_rows(
             [
                 {
                     "id": 321,
@@ -197,7 +208,12 @@ async def test_comment_hydration_success_updates_embedding(monkeypatch):
                 return httpx.Response(200, json=item)
 
         monkeypatch.setattr(seed_hn_from_bq.httpx, "AsyncClient", MockClient)
-        inserted, skipped_feedback, skipped_existing, hydrated = await seed_hn_from_bq.seed_rows(
+        (
+            inserted,
+            skipped_feedback,
+            skipped_existing,
+            hydrated,
+        ) = await seed_hn_from_bq.seed_rows(
             [
                 {
                     "id": 456,
@@ -233,6 +249,7 @@ async def test_comment_hydration_success_updates_embedding(monkeypatch):
 async def test_comment_hydration_failure_preserves_bq_skeleton(monkeypatch):
     db = Database(":memory:")
     try:
+
         class MockClient:
             def __init__(self, **kwargs):
                 pass
@@ -271,3 +288,35 @@ async def test_comment_hydration_failure_preserves_bq_skeleton(monkeypatch):
         assert story.text_content
     finally:
         db.close()
+
+
+def test_run_bq_query_passes_max_rows_to_cli(monkeypatch):
+    captured = {}
+
+    class FakeProc:
+        stdout = "[]"
+        returncode = 0
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    seed_hn_from_bq.run_bq_query(limit=1000, months=3, min_score=500)
+    assert "--max_rows=1000" in captured["cmd"]
+
+
+def test_run_bq_query_uses_default_max_rows_when_no_limit(monkeypatch):
+    captured = {}
+
+    class FakeProc:
+        stdout = "[]"
+        returncode = 0
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    seed_hn_from_bq.run_bq_query(months=3, min_score=500)
+    assert "--max_rows=1000" in captured["cmd"]
