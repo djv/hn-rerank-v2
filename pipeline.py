@@ -56,7 +56,7 @@ COMMENT_DEPTH_PENALTY = 25  # Points a reply must overcome per nesting level
 UNCERTAIN_DISCOVERY_SLOT_LIMIT = 5
 DISCOVERY_SLOT_LIMIT = 5
 POPULARITY_DISCOVERY_SLOT_LIMIT = 8
-PRIMARY_RANKED_FRACTION = 0.80
+DASHBOARD_QUEUE_SIZE = 12
 
 
 @dataclass(frozen=True)
@@ -138,8 +138,7 @@ class RankedStory:
 
 def _dashboard_primary_limit(config_count: int) -> tuple[int, int]:
     num_uncertain = UNCERTAIN_DISCOVERY_SLOT_LIMIT if config_count >= 10 else 0
-    base_limit = max(1, config_count)
-    primary_limit = max(1, int(round(base_limit * PRIMARY_RANKED_FRACTION)))
+    primary_limit = min(max(1, config_count), DASHBOARD_QUEUE_SIZE)
     return primary_limit, num_uncertain
 
 

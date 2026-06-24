@@ -33,6 +33,18 @@ def db():
     db_instance.close()
 
 
+def test_dashboard_primary_limit_is_capped_to_queue_size():
+    assert _dashboard_primary_limit(40)[0] == 12
+    assert _dashboard_primary_limit(9)[0] == 9
+
+
+def test_dashboard_primary_limit_uncertain_threshold_at_10():
+    assert _dashboard_primary_limit(1) == (1, 0)
+    assert _dashboard_primary_limit(9) == (9, 0)
+    assert _dashboard_primary_limit(10) == (10, 5)
+    assert _dashboard_primary_limit(40) == (12, 5)
+
+
 @pytest.fixture(scope="module")
 def embedder():
     # Uses the real downloaded ONNX model
@@ -441,7 +453,7 @@ def test_rerank_candidates_mmr_config_switch(db, embedder, monkeypatch):
 def test_dashboard_primary_limit_reduces_ranked_slice_without_counting_uncertainty():
     primary_limit, uncertain_slots = _dashboard_primary_limit(40)
 
-    assert primary_limit == 32
+    assert primary_limit == 12
     assert uncertain_slots == 5
 
 
@@ -1021,7 +1033,7 @@ async def test_run_pipeline_badge_assignment(tmp_path, monkeypatch):
     config = Config(
         db_path=str(db_file),
         output=str(tmp_path / "index.html"),
-        count=9,  # 20% reduction keeps 7 primary ranked stories
+        count=9,  # Below the 12-card queue size, so keeps 9 primary stories.
     )
 
     # 3. Mock dependencies
