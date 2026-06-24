@@ -741,6 +741,64 @@ def test_tldr_detail_dynamic_fetch(test_env, monkeypatch):
     assert updated_story.article_body == "Fetched article body text"
 
 
+def test_tldr_detail_dynamic_fetch_for_bq_seed(test_env, monkeypatch):
+    port, db, _, _, user = test_env
+    db.upsert_story(
+        Story(
+            id=779,
+            title="BQ dynamic test",
+            url="https://example.com/bq-dynamic-test",
+            score=100,
+            time=1600000000,
+            text_content="BQ dynamic test.",
+            source="bq_seed",
+            comment_count=5,
+            discussion_url="https://news.ycombinator.com/item?id=779",
+            comment_count_at_fetch=0,
+            self_text="",
+            top_comments="",
+            article_body="",
+        )
+    )
+
+    async def mock_fetch_story(client, sid, database):
+        story = database.get_story(sid)
+        from dataclasses import replace
+
+        updated = replace(
+            story,
+            top_comments="Fetched BQ comments",
+            text_content="BQ dynamic test. Fetched BQ comments",
+        )
+        database.upsert_story(updated)
+        return updated
+
+    async def mock_fetch_article_body(url):
+        return None
+
+    async def mock_generate_detailed_tldr(
+        title, self_text, top_comments, article_body
+    ):
+        return f"TLDR: {title} | {top_comments}"
+
+    import server
+    import pipeline
+
+    monkeypatch.setattr(pipeline, "fetch_story", mock_fetch_story)
+    monkeypatch.setattr(server, "_fetch_article_body", mock_fetch_article_body)
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    resp = httpx.post(
+        f"http://127.0.0.1:{port}/api/tldr-detail",
+        json={"story_id": 779},
+        cookies={"hn_token": user.token},
+    )
+
+    assert resp.status_code == 200
+    assert "Fetched BQ comments" in resp.json()["tldr"]
+    assert db.get_story(779).top_comments == "Fetched BQ comments"
+
+
 def test_tldr_detail_uses_cached_summary(test_env, monkeypatch):
     port, db, _, _, user = test_env
     db.upsert_story(

@@ -29,6 +29,7 @@ from pipeline import (
     RankedStory,
     _augment_features,
     _knn_similarity,
+    is_hn_source,
     mmr_filter,
 )
 
@@ -375,9 +376,13 @@ def main() -> None:
         fold_cand_csr_ratio = fold_cand_comments / np.maximum(fold_cand_scores, 1)
         fold_cand_csr = np.clip(np.log1p(fold_cand_csr_ratio), 0, 3.0) / 3.0
 
-        fb_train_is_hn = np.array([1.0 if s.source == 'hn' else 0.0 for s in fb_train_stories])
+        fb_train_is_hn = np.array(
+            [1.0 if is_hn_source(s.source) else 0.0 for s in fb_train_stories]
+        )
 
-        fold_cand_is_hn = np.array([1.0 if s.source == 'hn' else 0.0 for s in fold_candidates])
+        fold_cand_is_hn = np.array(
+            [1.0 if is_hn_source(s.source) else 0.0 for s in fold_candidates]
+        )
 
         # Build features for this fold
         X_train = _augment_features(

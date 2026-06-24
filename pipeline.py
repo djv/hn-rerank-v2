@@ -61,6 +61,12 @@ UNCERTAIN_DISCOVERY_SLOT_LIMIT = 5
 DISCOVERY_SLOT_LIMIT = 5
 POPULARITY_DISCOVERY_SLOT_LIMIT = 8
 DASHBOARD_QUEUE_SIZE = 12
+BQ_ARCHIVE_SOURCE = "bq_seed"
+BQ_ARCHIVE_CANDIDATE_LIMIT = 2000
+
+
+def is_hn_source(source: str) -> bool:
+    return source in {"hn", BQ_ARCHIVE_SOURCE}
 
 
 @dataclass(frozen=True)
@@ -407,6 +413,7 @@ async def fetch_story(
                 )
             return story if story else None
 
+        source = story.source if story is not None else "hn"
         story = Story(
             id=sid,
             title=title,
@@ -414,7 +421,7 @@ async def fetch_story(
             score=score,
             time=created_at,
             text_content=text_content,
-            source="hn",
+            source=source,
             comment_count=comment_count
             if comment_count is not None
             else len(all_comments),
@@ -496,7 +503,7 @@ async def refetch_story_text(
             score=item.get("points") or existing.score,
             time=item.get("created_at_i") or existing.time,
             text_content=new_text_content,
-            source="hn",
+            source=existing.source,
             comment_count=item.get("num_comments") or current_count,
             discussion_url=existing.discussion_url,
             comment_count_at_fetch=item.get("num_comments") or current_count,
@@ -670,6 +677,20 @@ async def fetch_candidates(
     rows = db.execute(
         "SELECT id FROM stories WHERE source = 'hn' AND time >= ? AND time < ?",
         (cutoff_ts, live_start_ts),
+    )
+    for row in rows:
+        sid = row[0]
+        if sid not in exclude_ids:
+            candidate_ids.add(sid)
+
+    rows = db.execute(
+        """
+        SELECT id FROM stories
+        WHERE source = ? AND text_content != ''
+        ORDER BY score DESC, time DESC
+        LIMIT ?
+        """,
+        (BQ_ARCHIVE_SOURCE, BQ_ARCHIVE_CANDIDATE_LIMIT),
     )
     for row in rows:
         sid = row[0]
@@ -1504,7 +1525,7 @@ def rank_stories(
         # Tier 1: No votes → HN gravity (frontpage-like)
         scores = np.array(
             [
-                (s.score if s.source == "hn" else s.score * 2)
+                (s.score if is_hn_source(s.source) else s.score * 2)
                 / max(((now - s.time) / 3600.0 + 2.0) ** 1.8, 0.1)
                 for s in candidates
             ],
@@ -1609,6 +1630,8 @@ def source_label_filter(source: str) -> str:
         return ""
     if source == "hn":
         return "HN"
+    if source == BQ_ARCHIVE_SOURCE:
+        return "BQ Seed"
 
     label = source
     if label.startswith("rss_"):
@@ -2242,12 +2265,22 @@ def fast_rerank_for_user(
     now_ts = int(time.time())
     cutoff_ts = now_ts - (config.days * 86400)
 
-    rows = db.execute(
+    recent_rows = db.execute(
         "SELECT id, title, url, score, time, text_content, source, comment_count, "
         "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
-        "FROM stories WHERE time >= ? AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?)",
-        (cutoff_ts, user_id),
+        "FROM stories WHERE time >= ? AND source != ? "
+        "AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?)",
+        (cutoff_ts, BQ_ARCHIVE_SOURCE, user_id),
     )
+    bq_rows = db.execute(
+        "SELECT id, title, url, score, time, text_content, source, comment_count, "
+        "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
+        "FROM stories WHERE source = ? AND text_content != '' "
+        "AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?) "
+        "ORDER BY score DESC, time DESC LIMIT ?",
+        (BQ_ARCHIVE_SOURCE, user_id, BQ_ARCHIVE_CANDIDATE_LIMIT),
+    )
+    rows = recent_rows + bq_rows
     candidates = [Database._row_to_story(row) for row in rows]
     if not candidates:
         return []

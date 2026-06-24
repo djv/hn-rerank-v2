@@ -248,6 +248,24 @@ def test_prune_stories_preserves_feedback_stories(db):
     assert db.get_story(2) is None
 
 
+def test_prune_stories_preserves_bq_seed_stories(db):
+    story = Story(
+        id=3,
+        title="BQ",
+        url=None,
+        score=100,
+        time=100,
+        text_content="BQ text",
+        source="bq_seed",
+    )
+    db.upsert_story(story)
+
+    deleted = db.prune_stories(max_age_days=0)
+
+    assert deleted == 0
+    assert db.get_story(3) is not None
+
+
 def test_feedback_training_data(db):
     user = db.create_user("test_token_3")
     db.upsert_story(

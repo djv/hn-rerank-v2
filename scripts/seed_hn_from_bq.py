@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from database import Database, Story
 from pipeline import (
+    BQ_ARCHIVE_SOURCE,
     Config,
     Embedder,
     clean_text,
@@ -72,7 +73,7 @@ def story_from_bq_row(row: dict[str, Any]) -> Story | None:
         score=_coerce_int(row.get("score")),
         time=_coerce_int(row.get("created_at_i")),
         text_content=text_content,
-        source="hn",
+        source=BQ_ARCHIVE_SOURCE,
         comment_count=_coerce_int(row.get("descendants")),
         discussion_url=f"https://news.ycombinator.com/item?id={sid}",
         comment_count_at_fetch=0,

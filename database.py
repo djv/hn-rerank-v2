@@ -403,7 +403,9 @@ class Database:
         with self._conn() as conn:
             with conn:
                 cursor = conn.execute(
-                    "DELETE FROM stories WHERE fetched_at < ? AND id NOT IN (SELECT story_id FROM feedback)",
+                    "DELETE FROM stories WHERE fetched_at < ? "
+                    "AND source != 'bq_seed' "
+                    "AND id NOT IN (SELECT story_id FROM feedback)",
                     (cutoff,),
                 )
                 return cursor.rowcount

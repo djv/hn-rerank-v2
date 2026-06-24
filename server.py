@@ -24,7 +24,7 @@ import httpx
 
 from dataclasses import dataclass, replace
 from database import Database, User
-from pipeline import Config, Embedder
+from pipeline import Config, Embedder, is_hn_source
 
 ARTICLE_BODY_CHAR_LIMIT = 15_000
 SELF_TEXT_PROMPT_CHAR_LIMIT = 8_000
@@ -683,7 +683,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 # 1. If HN story has comments but top_comments is empty, dynamically fetch them
                 if (
-                    story.source == "hn"
+                    is_hn_source(story.source)
                     and not story.top_comments
                     and (story.comment_count or 0) > 0
                 ):

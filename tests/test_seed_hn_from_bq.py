@@ -32,7 +32,7 @@ def test_bq_row_maps_to_hn_story_with_composed_text():
 
     assert story is not None
     assert story.id == 123
-    assert story.source == "hn"
+    assert story.source == "bq_seed"
     assert story.title == "Useful story"
     assert story.self_text == "Self text body."
     assert story.comment_count == 42

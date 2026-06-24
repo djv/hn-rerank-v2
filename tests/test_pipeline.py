@@ -6,12 +6,14 @@ from hypothesis import given, strategies as st, settings, HealthCheck
 from database import Action, Database, Story
 import pipeline
 from pipeline import (
+    BQ_ARCHIVE_SOURCE,
     Embedder,
     ModelConfig,
     RankedStory,
     clean_text,
     compose_story_text,
     get_or_compute_embeddings,
+    is_hn_source,
     mmr_filter,
     rank_stories,
     Config,
@@ -430,10 +432,17 @@ def test_reddit_feed_source_names_include_subreddit():
 
 
 def test_source_label_filter_cleans_rss_prefixes():
+    assert source_label_filter(BQ_ARCHIVE_SOURCE) == "BQ Seed"
     assert source_label_filter("rss_rss_slashdot_org") == "Slashdot"
     assert source_label_filter("rss_slashdot_org") == "Slashdot"
     assert source_label_filter("rss_reddit_localllama") == "r/localllama"
     assert source_label_filter("rss_simonwillison_net") == "Simon Willison"
+
+
+def test_is_hn_source_includes_bq_seed():
+    assert is_hn_source("hn")
+    assert is_hn_source(BQ_ARCHIVE_SOURCE)
+    assert not is_hn_source("rss_example_com")
 
 
 @pytest.mark.asyncio
@@ -816,6 +825,207 @@ async def test_fetch_candidates_returns_tuple(tmp_path, monkeypatch):
     assert isinstance(candidates, list)
     assert isinstance(count, int)
     assert count == len(candidates)
+
+
+@pytest.mark.asyncio
+async def test_fetch_candidates_includes_old_bq_archive_stories(tmp_path, monkeypatch):
+    from database import Database
+    from pipeline import Config, fetch_candidates
+
+    db_file = tmp_path / "test.db"
+    db = Database(str(db_file))
+    old_time = int(time.time()) - (180 * 86400)
+    story = Story(
+        id=9001,
+        title="Old BQ story",
+        url="https://example.com/old-bq",
+        score=500,
+        time=old_time,
+        text_content="Old high scoring BQ story.",
+        source=BQ_ARCHIVE_SOURCE,
+        comment_count=12,
+        comment_count_at_fetch=12,
+        top_comments="Already hydrated comments.",
+    )
+    db.upsert_story(story)
+
+    class MockResp:
+        status_code = 200
+
+        def json(self):
+            return {"hits": []}
+
+    class MockClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+        async def get(self, *a, **kw):
+            return MockResp()
+
+    monkeypatch.setattr("pipeline.httpx.AsyncClient", lambda **kw: MockClient())
+    candidates, count = await fetch_candidates(
+        Config(db_path=str(db_file), days=30),
+        set(),
+        set(),
+        db,
+    )
+
+    assert count == len(candidates)
+    assert {s.id for s in candidates} == {9001}
+
+
+@pytest.mark.asyncio
+async def test_fetch_candidates_caps_bq_archive_by_score(tmp_path, monkeypatch):
+    from database import Database
+    from pipeline import Config, fetch_candidates
+
+    db_file = tmp_path / "test.db"
+    db = Database(str(db_file))
+    old_time = int(time.time()) - (180 * 86400)
+    for sid, score in [(9101, 100), (9102, 300), (9103, 200)]:
+        db.upsert_story(
+            Story(
+                id=sid,
+                title=f"BQ {sid}",
+                url=f"https://example.com/{sid}",
+                score=score,
+                time=old_time,
+                text_content=f"BQ archive story {sid}.",
+                source=BQ_ARCHIVE_SOURCE,
+                comment_count=1,
+                comment_count_at_fetch=1,
+                top_comments="Hydrated.",
+            )
+        )
+
+    class MockResp:
+        status_code = 200
+
+        def json(self):
+            return {"hits": []}
+
+    class MockClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+        async def get(self, *a, **kw):
+            return MockResp()
+
+    monkeypatch.setattr("pipeline.BQ_ARCHIVE_CANDIDATE_LIMIT", 2)
+    monkeypatch.setattr("pipeline.httpx.AsyncClient", lambda **kw: MockClient())
+    candidates, _ = await fetch_candidates(
+        Config(db_path=str(db_file), days=30),
+        set(),
+        set(),
+        db,
+    )
+
+    assert {s.id for s in candidates} == {9102, 9103}
+
+
+@pytest.mark.asyncio
+async def test_bq_archive_hydration_preserves_source(tmp_path, monkeypatch):
+    from database import Database
+    from pipeline import Config, fetch_candidates
+
+    db_file = tmp_path / "test.db"
+    db = Database(str(db_file))
+    old_time = int(time.time()) - (180 * 86400)
+    db.upsert_story(
+        Story(
+            id=9201,
+            title="BQ needs comments",
+            url="https://example.com/needs-comments",
+            score=500,
+            time=old_time,
+            text_content="BQ needs comments.",
+            source=BQ_ARCHIVE_SOURCE,
+            comment_count=3,
+            comment_count_at_fetch=0,
+            top_comments="",
+        )
+    )
+
+    class MockResp:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class MockClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+        async def get(self, url, *a, **kw):
+            if "/api/v1/items/" in str(url):
+                return MockResp(
+                    {
+                        "type": "story",
+                        "title": "BQ needs comments",
+                        "url": "https://example.com/needs-comments",
+                        "points": 501,
+                        "num_comments": 3,
+                        "created_at_i": old_time,
+                        "children": [
+                            {
+                                "type": "comment",
+                                "text": "Substantive fetched comment text with enough context.",
+                                "children": [],
+                            }
+                        ],
+                    }
+                )
+            return MockResp({"hits": []})
+
+    monkeypatch.setattr("pipeline.httpx.AsyncClient", lambda **kw: MockClient())
+    await fetch_candidates(
+        Config(db_path=str(db_file), days=30),
+        set(),
+        set(),
+        db,
+    )
+
+    updated = db.get_story(9201)
+    assert updated.source == BQ_ARCHIVE_SOURCE
+    assert "Substantive fetched comment" in updated.top_comments
+
+
+def test_fast_rerank_for_user_includes_old_bq_archive_story(db, monkeypatch):
+    from pipeline import Config, fast_rerank_for_user
+
+    user = db.create_user("bq_archive_user")
+    old_time = int(time.time()) - (180 * 86400)
+    db.upsert_story(
+        Story(
+            id=9301,
+            title="Old BQ render candidate",
+            url="https://example.com/render-bq",
+            score=500,
+            time=old_time,
+            text_content="Old BQ render candidate.",
+            source=BQ_ARCHIVE_SOURCE,
+        )
+    )
+
+    def fake_embeddings(stories, embedder, db_inst):
+        return np.zeros((len(stories), 384), dtype=np.float32)
+
+    monkeypatch.setattr("pipeline.get_or_compute_embeddings", fake_embeddings)
+    ranked = fast_rerank_for_user(db, Config(days=30), object(), user.id)
+
+    assert [item.story.id for item in ranked] == [9301]
 
 
 # Tests for auto-refetch of comment text on growth (fetch_candidates refetch block)
