@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import asyncio
+import hashlib
 import html
 import json
 import logging
@@ -31,6 +32,7 @@ COMMENT_PROMPT_CHAR_LIMIT = 12_000
 REDDIT_COMMENTS_CACHE_CHAR_LIMIT = 10_000
 REDDIT_COMMENT_LIMIT = 40
 REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dashboard"
+TLDR_PROMPT_VERSION = "detail-v2"
 
 
 def _normalize_tldr_markdown(text: str) -> str:
@@ -246,15 +248,36 @@ async def _call_llm_chat(
         return f"Error from LLM Provider: HTTP {resp.status_code} - {resp.text}"
 
 
+def _llm_cache_identity() -> str:
+    provider = os.environ.get("LLM_PROVIDER", "mistral").lower()
+    model = "mistral-small-latest" if provider == "mistral" else "llama-3.3-70b-versatile"
+    return f"{provider}:{model}:{TLDR_PROMPT_VERSION}"
+
+
+def _tldr_cache_key(
+    *,
+    title: str,
+    self_text: str,
+    top_comments: str,
+    article_body: str,
+) -> str:
+    payload = {
+        "identity": _llm_cache_identity(),
+        "title": title,
+        "self_text": self_text[:SELF_TEXT_PROMPT_CHAR_LIMIT],
+        "top_comments": top_comments[:COMMENT_PROMPT_CHAR_LIMIT],
+        "article_body": article_body[:ARTICLE_BODY_CHAR_LIMIT],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 async def generate_detailed_tldr(
     title: str,
     self_text: str = "",
     top_comments: str = "",
     article_body: str = "",
-    points: int = 0,
-    comment_count: int = 0,
-    age_hours: float = 0.0,
-) -> str | None:
+) -> str:
     provider = os.environ.get("LLM_PROVIDER", "mistral").lower()
     if provider == "mistral":
         api_key = os.environ.get("MISTRAL_API_KEY")
@@ -298,9 +321,6 @@ Do not put multiple bullets on one line.
 If the comments are thin or low-signal, say so explicitly.
 
 Story title: {title}
-Points: {points}
-Comments: {comment_count}
-Age hours: {age_hours:.1f}
 
 HN comments:
 {comments_section}
@@ -580,6 +600,12 @@ class Handler(BaseHTTPRequestHandler):
 
         threading.Thread(target=warm, daemon=True).start()
 
+    @staticmethod
+    def _feedback_should_refresh(data: dict) -> bool:
+        if data.get("refresh_ranking") is True:
+            return True
+        return "queue_remaining" not in data
+
     def do_POST(self) -> None:
         if self.path == "/api/feedback":
             user = self._get_user()
@@ -604,13 +630,18 @@ class Handler(BaseHTTPRequestHandler):
                         action,
                     )
 
-                # Invalidate user's dashboard cache and warm the next render async.
-                version = self._invalidate_dashboard_cache(user.id)
-                self._schedule_dashboard_warm(user, version)
+                ranking_refresh_queued = self._feedback_should_refresh(data)
+                if ranking_refresh_queued:
+                    # Invalidate user's dashboard cache and warm the next render async.
+                    version = self._invalidate_dashboard_cache(user.id)
+                    self._schedule_dashboard_warm(user, version)
 
-                # Also trigger background regen for candidate updates
-                self.regen_event.set()
-                self._json_response({"ok": True})
+                    # Also trigger background regen for candidate updates
+                    self.regen_event.set()
+
+                self._json_response(
+                    {"ok": True, "ranking_refresh_queued": ranking_refresh_queued}
+                )
             except Exception as e:
                 logging.error(f"Error handling feedback: {e}")
                 self._json_response({"error": str(e)}, status=400)
@@ -621,7 +652,6 @@ class Handler(BaseHTTPRequestHandler):
                 data = json.loads(body)
 
                 story_id = data["story_id"]
-                now = time.time()
 
                 story = self.db.get_story(story_id)
                 if not story:
@@ -651,7 +681,6 @@ class Handler(BaseHTTPRequestHandler):
                             f"Failed to dynamically fetch comments for TLDR: {e}"
                         )
 
-                age_hours = max(0.0, (now - story.time) / 3600.0)
                 article_body = story.article_body or None
 
                 if (
@@ -721,19 +750,39 @@ class Handler(BaseHTTPRequestHandler):
                             text_content=new_text,
                         )
                         self.db.upsert_story(updated_story)
+                        story = updated_story
+                cache_key = _tldr_cache_key(
+                    title=story.title,
+                    self_text=story.self_text or "",
+                    top_comments=story.top_comments or "",
+                    article_body=article_body or "",
+                )
+                cached_tldr = self.db.get_tldr_cache(story.id, cache_key)
+                if cached_tldr:
+                    logging.info(
+                        "tldr_detail story_id=%s result=cache_hit cache_key=%s",
+                        story.id,
+                        cache_key[:12],
+                    )
+                    self._json_response({"ok": True, "tldr": cached_tldr, "cached": True})
+                    return
+
                 tldr = asyncio.run(
                     generate_detailed_tldr(
                         story.title,
                         self_text=story.self_text or "",
                         top_comments=story.top_comments or "",
                         article_body=article_body or "",
-                        points=story.score,
-                        comment_count=story.comment_count or 0,
-                        age_hours=age_hours,
                     )
                 )
                 if tldr:
-                    self._json_response({"ok": True, "tldr": tldr})
+                    self.db.upsert_tldr_cache(story.id, cache_key, tldr)
+                    logging.info(
+                        "tldr_detail story_id=%s result=generated cache_key=%s",
+                        story.id,
+                        cache_key[:12],
+                    )
+                    self._json_response({"ok": True, "tldr": tldr, "cached": False})
                 else:
                     self._json_response(
                         {"error": "Failed to generate TLDR"}, status=500

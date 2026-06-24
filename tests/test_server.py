@@ -80,6 +80,30 @@ def test_first_visit_redirect(test_env):
     assert "hn_token" in resp.headers.get("Set-Cookie", "")
 
 
+def test_dashboard_route_no_user_creates_token_and_redirects(test_env):
+    port, db, _, _, _ = test_env
+    with db._conn() as conn:
+        before = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+    resp = httpx.get(f"http://127.0.0.1:{port}/", follow_redirects=False)
+
+    assert resp.status_code == 302
+    assert resp.headers["Location"].startswith("u/")
+    assert "hn_token" in resp.headers.get("Set-Cookie", "")
+    with db._conn() as conn:
+        after = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    assert after == before
+
+    follow = httpx.get(
+        f"http://127.0.0.1:{port}/{resp.headers['Location']}",
+        follow_redirects=False,
+    )
+    assert follow.status_code == 302
+    with db._conn() as conn:
+        persisted = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    assert persisted == before + 1
+
+
 def test_static_serving(test_env):
     port, _, _, _, user = test_env
     resp = httpx.get(
@@ -90,6 +114,13 @@ def test_static_serving(test_env):
     assert resp.status_code == 200
     # Dynamic rendering returns personalized dashboard, not static file
     assert resp.status_code == 200
+    assert 'id="queue-status"' in resp.text
+    assert 'data-mode="default"' in resp.text
+    assert 'data-mode="popular"' in resp.text
+    assert 'data-mode="explore"' in resp.text
+    assert 'data-mode="date"' in resp.text
+    assert 'data-key-action="undo"' in resp.text
+    assert 'id="sort-toggle"' not in resp.text
 
 
 def test_feedback_post(test_env):
@@ -115,12 +146,98 @@ def test_feedback_post(test_env):
         cookies={"hn_token": user.token},
     )
     assert resp.status_code == 200
-    assert resp.json() == {"ok": True}
+    assert resp.json() == {"ok": True, "ranking_refresh_queued": True}
 
     records = db.get_all_feedback(user.id)
     assert len(records) == 1
     assert records[0].story_id == 999
     assert records[0].action == "up"
+    assert regen_event.is_set()
+
+
+def test_feedback_post_defers_refresh_when_queue_not_low(test_env):
+    port, db, regen_event, _, user = test_env
+    db.upsert_story(
+        Story(
+            id=1000,
+            title="Deferred refresh story",
+            url="https://example.com",
+            score=100,
+            time=1600000000,
+            text_content="Feedback body text",
+            source="hn",
+        )
+    )
+    regen_event.clear()
+
+    resp = httpx.post(
+        f"http://127.0.0.1:{port}/api/feedback",
+        json={"story_id": 1000, "action": "up", "queue_remaining": 8},
+        cookies={"hn_token": user.token},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "ranking_refresh_queued": False}
+    assert len(db.get_all_feedback(user.id)) == 1
+    assert not regen_event.is_set()
+
+
+def test_feedback_post_does_not_refresh_from_queue_depth_alone(test_env):
+    port, db, regen_event, _, user = test_env
+    db.upsert_story(
+        Story(
+            id=1001,
+            title="Low queue refresh story",
+            url="https://example.com",
+            score=100,
+            time=1600000000,
+            text_content="Feedback body text",
+            source="hn",
+        )
+    )
+    regen_event.clear()
+
+    resp = httpx.post(
+        f"http://127.0.0.1:{port}/api/feedback",
+        json={"story_id": 1001, "action": "up", "queue_remaining": 4},
+        cookies={"hn_token": user.token},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "ranking_refresh_queued": False}
+    assert len(db.get_all_feedback(user.id)) == 1
+    assert not regen_event.is_set()
+
+
+def test_feedback_post_refreshes_when_client_requests_ranking(test_env):
+    port, db, regen_event, _, user = test_env
+    db.upsert_story(
+        Story(
+            id=1002,
+            title="Batch refresh story",
+            url="https://example.com",
+            score=100,
+            time=1600000000,
+            text_content="Feedback body text",
+            source="hn",
+        )
+    )
+    regen_event.clear()
+
+    resp = httpx.post(
+        f"http://127.0.0.1:{port}/api/feedback",
+        json={
+            "story_id": 1002,
+            "action": "up",
+            "queue_remaining": 20,
+            "refresh_ranking": True,
+        },
+        cookies={"hn_token": user.token},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "ranking_refresh_queued": True}
+    assert len(db.get_all_feedback(user.id)) == 1
     assert regen_event.is_set()
 
 
@@ -152,9 +269,39 @@ def test_feedback_clear(test_env):
         cookies={"hn_token": user.token},
     )
     assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "ranking_refresh_queued": True}
 
     assert len(db.get_all_feedback(user.id)) == 0
     assert regen_event.is_set()
+
+
+def test_feedback_clear_then_revote_creates_new_record(test_env):
+    port, db, _, _, user = test_env
+    db.upsert_story(
+        Story(
+            id=1003,
+            title="Revote story",
+            url=None,
+            score=100,
+            time=1600000000,
+            text_content="Revote body",
+            source="hn",
+        )
+    )
+
+    for action in ("up", "clear", "down"):
+        resp = httpx.post(
+            f"http://127.0.0.1:{port}/api/feedback",
+            json={"story_id": 1003, "action": action},
+            cookies={"hn_token": user.token},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+
+    records = db.get_all_feedback(user.id)
+    assert len(records) == 1
+    assert records[0].story_id == 1003
+    assert records[0].action == "down"
 
 
 def test_dashboard_cache_uses_feedback_versions(test_env, monkeypatch):
@@ -341,6 +488,133 @@ def test_reddit_rss_helpers_extract_post_and_comment_text():
     assert server._clean_reddit_rss_html(raw) == "https://x.com/a/status/1"
 
 
+def test_tldr_cache_key_truncates_prompt_inputs(monkeypatch):
+    import server
+
+    monkeypatch.setattr(server, "SELF_TEXT_PROMPT_CHAR_LIMIT", 5)
+    monkeypatch.setattr(server, "COMMENT_PROMPT_CHAR_LIMIT", 6)
+    monkeypatch.setattr(server, "ARTICLE_BODY_CHAR_LIMIT", 7)
+
+    key1 = server._tldr_cache_key(
+        title="Same title",
+        self_text="abcde-left",
+        top_comments="abcdef-left",
+        article_body="abcdefg-left",
+    )
+    key2 = server._tldr_cache_key(
+        title="Same title",
+        self_text="abcde-right",
+        top_comments="abcdef-right",
+        article_body="abcdefg-right",
+    )
+    key3 = server._tldr_cache_key(
+        title="Same title",
+        self_text="xbcde-right",
+        top_comments="abcdef-right",
+        article_body="abcdefg-right",
+    )
+
+    assert key1 == key2
+    assert key1 != key3
+
+
+def test_reddit_low_signal_comment_filter():
+    import server
+
+    assert server._is_low_signal_reddit_comment(
+        "withoutreason1729",
+        "This is long enough but comes from a known noisy bot account.",
+    )
+    assert server._is_low_signal_reddit_comment("/u/AutoModerator", "Useful length.")
+    assert server._is_low_signal_reddit_comment("/u/alice", "[deleted]")
+    assert server._is_low_signal_reddit_comment("/u/alice", "[removed]")
+    assert server._is_low_signal_reddit_comment(
+        "/u/alice",
+        "I am a bot and this action was performed automatically.",
+    )
+    assert server._is_low_signal_reddit_comment(
+        "/u/alice",
+        "Your post is getting popular and something something.",
+    )
+    assert server._is_low_signal_reddit_comment("/u/alice", "too short")
+    assert not server._is_low_signal_reddit_comment(
+        "/u/alice",
+        "This is a substantive Reddit comment with enough content to summarize.",
+    )
+
+
+@pytest.mark.asyncio
+async def test_reddit_rss_context_caps_comments_and_cached_chars(monkeypatch):
+    import server
+
+    def item(title, author, body):
+        return f"""
+        <item>
+          <title>{title}</title>
+          <dc:creator>{author}</dc:creator>
+          <description><![CDATA[<div class="md"><p>{body}</p></div>]]></description>
+        </item>
+        """
+
+    comments = "\n".join(
+        item(
+            f"comment {i}",
+            f"user{i}",
+            f"This is substantive comment number {i} with enough useful detail to keep.",
+        )
+        for i in range(1, 8)
+    )
+    rss = f"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/">
+      <channel>
+        {item("post", "poster", "Post self text with an embedded link.")}
+        {comments}
+      </channel>
+    </rss>
+    """
+
+    class MockAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, *args, **kwargs):
+            return httpx.Response(200, text=rss)
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", MockAsyncClient)
+    monkeypatch.setattr(server, "REDDIT_COMMENT_LIMIT", 3)
+    monkeypatch.setattr(server, "REDDIT_COMMENTS_CACHE_CHAR_LIMIT", 160)
+
+    context = await server._fetch_reddit_rss_context(
+        "https://www.reddit.com/r/LocalLLaMA/comments/abc123/test/"
+    )
+
+    assert context is not None
+    assert context.self_text == "Post self text with an embedded link."
+    assert context.comment_count <= 3
+    assert len(context.top_comments) <= 160
+    assert "comment number 1" in context.top_comments
+    assert "comment number 4" not in context.top_comments
+
+
+def test_tldr_handler_returns_404_for_missing_story(test_env):
+    port, _, _, _, user = test_env
+
+    resp = httpx.post(
+        f"http://127.0.0.1:{port}/api/tldr-detail",
+        json={"story_id": 987654321},
+        cookies={"hn_token": user.token},
+    )
+
+    assert resp.status_code == 404
+    assert resp.json()["error"] == "Story not found in database"
+
+
 def test_tldr_detail_fetches_reddit_rss_comments(test_env, monkeypatch):
     port, db, _, _, user = test_env
     db.upsert_story(
@@ -372,9 +646,9 @@ def test_tldr_detail_fetches_reddit_rss_comments(test_env, monkeypatch):
         raise AssertionError("Reddit comments pages should not be scraped as articles")
 
     async def mock_generate_detailed_tldr(
-        title, self_text, top_comments, article_body, points, comment_count, age_hours
+        title, self_text, top_comments, article_body
     ):
-        return f"TLDR: {self_text} | {top_comments} | comments={comment_count}"
+        return f"TLDR: {self_text} | {top_comments}"
 
     import server
 
@@ -392,7 +666,6 @@ def test_tldr_detail_fetches_reddit_rss_comments(test_env, monkeypatch):
     data = resp.json()
     assert data["ok"] is True
     assert "Useful Reddit comment" in data["tldr"]
-    assert "comments=1" in data["tldr"]
 
     updated_story = db.get_story(-1234)
     assert updated_story.self_text == "https://x.com/example/status/1"
@@ -439,7 +712,7 @@ def test_tldr_detail_dynamic_fetch(test_env, monkeypatch):
         return "Fetched article body text"
 
     async def mock_generate_detailed_tldr(
-        title, self_text, top_comments, article_body, points, comment_count, age_hours
+        title, self_text, top_comments, article_body
     ):
         return f"TLDR: {title} | {top_comments} | {article_body}"
 
@@ -468,6 +741,58 @@ def test_tldr_detail_dynamic_fetch(test_env, monkeypatch):
     assert updated_story.article_body == "Fetched article body text"
 
 
+def test_tldr_detail_uses_cached_summary(test_env, monkeypatch):
+    port, db, _, _, user = test_env
+    db.upsert_story(
+        Story(
+            id=778,
+            title="Cached TLDR test",
+            url="https://example.com/cached-tldr",
+            score=12,
+            time=1600000000,
+            text_content="Cached TLDR test. Existing article body.",
+            source="hn",
+            comment_count=0,
+            discussion_url="https://news.ycombinator.com/item?id=778",
+            comment_count_at_fetch=0,
+            self_text="",
+            top_comments="",
+            article_body="Existing article body.",
+        )
+    )
+
+    calls = 0
+
+    async def mock_generate_detailed_tldr(
+        title, self_text, top_comments, article_body
+    ):
+        nonlocal calls
+        calls += 1
+        return f"cached-result-{calls}: {title} | {article_body}"
+
+    import server
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    resp1 = httpx.post(
+        f"http://127.0.0.1:{port}/api/tldr-detail",
+        json={"story_id": 778},
+        cookies={"hn_token": user.token},
+    )
+    resp2 = httpx.post(
+        f"http://127.0.0.1:{port}/api/tldr-detail",
+        json={"story_id": 778},
+        cookies={"hn_token": user.token},
+    )
+
+    assert resp1.status_code == 200
+    assert resp2.status_code == 200
+    assert calls == 1
+    assert resp1.json()["cached"] is False
+    assert resp2.json()["cached"] is True
+    assert resp2.json()["tldr"] == resp1.json()["tldr"]
+
+
 @pytest.mark.asyncio
 async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
     import server
@@ -490,14 +815,14 @@ async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
         self_text="Author text",
         top_comments="Comment text",
         article_body="Article body",
-        points=42,
-        comment_count=12,
-        age_hours=3.5,
     )
 
     assert len(calls) == 2
     assert "Article body" in calls[0]
     assert "HN comments" in calls[1]
+    assert "Points:" not in calls[1]
+    assert "Comments:" not in calls[1]
+    assert "Age hours:" not in calls[1]
     assert "### Article" in result
     assert "- **Article** summary" in result
     assert "### Discussion" in result

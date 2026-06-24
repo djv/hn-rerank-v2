@@ -56,6 +56,30 @@ _EMPTY_HTML = """\
 </html>
 """
 
+_CHROME_HTML = """\
+<!DOCTYPE html>
+<html>
+<body>
+<script>script chrome that should not be visible</script>
+<style>style chrome that should not be visible</style>
+<nav>navigation chrome that should not be visible</nav>
+<header>header chrome that should not be visible</header>
+<aside>aside chrome that should not be visible</aside>
+<main>
+<p>This main article text should survive extraction. It is deliberately long
+enough to pass the extractor threshold and to force the BeautifulSoup fallback
+to return real content rather than page chrome. The exact wording matters less
+than preserving the core article paragraph and removing navigation or footer
+material from the final result.</p>
+<p>Additional article text keeps the page comfortably over the extraction
+threshold. This paragraph represents the body content that should remain
+available to the TLDR generator after all chrome elements are removed.</p>
+</main>
+<footer>footer chrome that should not be visible</footer>
+</body>
+</html>
+"""
+
 
 async def _serve(handler, status=200, body=b"", delay=0.0):
     import asyncio
@@ -155,6 +179,22 @@ async def test_fetch_empty_body():
     body = _EMPTY_HTML.encode()
     result, calls = await _serve("empty", 200, body)
     assert result is None
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_strips_chrome_tags():
+    body = _CHROME_HTML.encode()
+    result, calls = await _serve("chrome", 200, body)
+
+    assert result is not None
+    assert "main article text should survive" in result
+    assert "script chrome" not in result
+    assert "style chrome" not in result
+    assert "navigation chrome" not in result
+    assert "header chrome" not in result
+    assert "aside chrome" not in result
+    assert "footer chrome" not in result
     assert calls == 1
 
 
