@@ -53,6 +53,10 @@ COMMENT_GROWTH_THRESHOLD = 0.30  # 30% growth since last text fetch triggers ref
 COMMENT_REFETCH_MAX_AGE_HOURS = 24  # Only refetch stories younger than this
 MAX_REFETCH_PER_REGEN = 10  # Bound Algolia cost per regen
 COMMENT_DEPTH_PENALTY = 25  # Points a reply must overcome per nesting level
+TOP_COMMENT_LIMIT = 40
+TOP_COMMENT_CORE_THREADS = 4
+TOP_COMMENT_REPLIES_PER_CORE_THREAD = 5
+TOP_COMMENT_MAX_PER_THREAD = 6
 UNCERTAIN_DISCOVERY_SLOT_LIMIT = 5
 DISCOVERY_SLOT_LIMIT = 5
 POPULARITY_DISCOVERY_SLOT_LIMIT = 8
@@ -75,6 +79,9 @@ class Config:
     onnx_model_dir: str = "onnx_model"
     server_port: int = 8765
     regen_interval_seconds: int = 10800
+    article_fetch_max_per_run: int = 100
+    article_fetch_concurrency: int = 10
+    article_fetch_max_age_days: int = 30
     model: ModelConfig = field(default_factory=ModelConfig)
     rss: RssConfig = field(default_factory=RssConfig)
 
@@ -98,6 +105,9 @@ class Config:
             onnx_model_dir=main_cfg.get("onnx_model_dir", "onnx_model"),
             server_port=main_cfg.get("server_port", 8765),
             regen_interval_seconds=main_cfg.get("regen_interval_seconds", 10800),
+            article_fetch_max_per_run=main_cfg.get("article_fetch_max_per_run", 100),
+            article_fetch_concurrency=main_cfg.get("article_fetch_concurrency", 10),
+            article_fetch_max_age_days=main_cfg.get("article_fetch_max_age_days", 30),
             model=ModelConfig(
                 svm_c=model_cfg.get("svm_c", 0.2),
                 svm_gamma=model_cfg.get("svm_gamma", 0.03),
@@ -171,30 +181,121 @@ def clean_text(raw_text: str, min_len: int = 0) -> str:
 def _extract_comments_recursive(
     children: list,
     depth: int = 0,
-    max_depth: int = 3,
     parent_points: int = 0,
+    top_thread_index: int | None = None,
+    order_path: tuple[int, ...] = (),
 ) -> list[dict]:
     MIN_COMMENT_LENGTH = 30
     results = []
-    for child in children:
+    for sibling_index, child in enumerate(children):
         if not isinstance(child, dict) or child.get("type") != "comment":
             continue
         points = child.get("points") or 0
         if depth > 0 and points == 0:
             points = parent_points
         score = -points + depth * COMMENT_DEPTH_PENALTY
+        child_top_thread_index = sibling_index if depth == 0 else top_thread_index
+        child_order_path = (*order_path, sibling_index)
+        child_comments = child.get("children") or []
+        child_results = _extract_comments_recursive(
+            child_comments,
+            depth + 1,
+            parent_points=points,
+            top_thread_index=child_top_thread_index,
+            order_path=child_order_path,
+        )
+        descendant_count = len(child_results)
         text = child.get("text", "")
         if text:
             clean = clean_text(text, min_len=MIN_COMMENT_LENGTH)
             if clean:
-                results.append({"text": clean, "score": score})
-        if depth < max_depth and child.get("children"):
-            results.extend(
-                _extract_comments_recursive(
-                    child["children"], depth + 1, max_depth, parent_points=points
+                results.append(
+                    {
+                        "id": child.get("id"),
+                        "text": clean,
+                        "score": score,
+                        "depth": depth,
+                        "top_thread_index": child_top_thread_index,
+                        "sibling_index": sibling_index,
+                        "order_path": child_order_path,
+                        "reply_count": len(child_comments),
+                        "descendant_count": descendant_count,
+                        "text_len": len(clean),
+                    }
                 )
-            )
+        results.extend(child_results)
     return results
+
+
+def _comment_rank_key(comment: dict) -> tuple:
+    return (
+        comment["score"],
+        -min(comment["descendant_count"], 50),
+        -min(comment["text_len"], 1200),
+        comment["order_path"],
+    )
+
+
+def _select_top_comments(
+    comments: list[dict],
+    limit: int = TOP_COMMENT_LIMIT,
+) -> list[dict]:
+    """Select comment text for embeddings/TLDRs.
+
+    HN comment points are not exposed in the APIs we use, and Algolia tree order
+    does not match the rendered HN order. Prefer large discussion cores while
+    keeping broad top-level coverage.
+    """
+    if not comments:
+        return []
+
+    selected = []
+    selected_indexes = set()
+    per_thread: dict[int, int] = {}
+
+    def add(comment: dict) -> None:
+        if len(selected) >= limit:
+            return
+        index = id(comment)
+        thread_index = comment["top_thread_index"]
+        if index in selected_indexes:
+            return
+        if per_thread.get(thread_index, 0) >= TOP_COMMENT_MAX_PER_THREAD:
+            return
+        selected.append(comment)
+        selected_indexes.add(index)
+        per_thread[thread_index] = per_thread.get(thread_index, 0) + 1
+
+    top_level = [c for c in comments if c["depth"] == 0]
+    core_roots = sorted(
+        top_level,
+        key=lambda c: (-c["descendant_count"], c["top_thread_index"]),
+    )[:TOP_COMMENT_CORE_THREADS]
+    core_threads = {c["top_thread_index"] for c in core_roots}
+
+    for root in sorted(core_roots, key=_comment_rank_key):
+        add(root)
+
+    for thread_index in sorted(core_threads):
+        replies = [
+            c
+            for c in comments
+            if c["top_thread_index"] == thread_index and c["depth"] > 0
+        ]
+        for reply in sorted(replies, key=_comment_rank_key)[
+            :TOP_COMMENT_REPLIES_PER_CORE_THREAD
+        ]:
+            add(reply)
+
+    for comment in sorted(top_level, key=_comment_rank_key):
+        add(comment)
+
+    for comment in sorted(comments, key=_comment_rank_key):
+        add(comment)
+        if len(selected) >= limit:
+            break
+
+    return selected
 
 
 def compose_story_text(
@@ -281,8 +382,7 @@ async def fetch_story(
 
         children = item.get("children", [])
         all_comments = _extract_comments_recursive(children)
-        all_comments.sort(key=lambda x: x["score"])
-        selected = all_comments[:40]
+        selected = _select_top_comments(all_comments)
         top_comment_texts = " ".join(c["text"] for c in selected)[:10000]
 
         text_content = compose_story_text(
@@ -368,8 +468,7 @@ async def refetch_story_text(
 
         children = item.get("children", [])
         all_comments = _extract_comments_recursive(children)
-        all_comments.sort(key=lambda x: x["score"])
-        selected = all_comments[:40]
+        selected = _select_top_comments(all_comments)
         top_comment_texts = " ".join(c["text"] for c in selected)[:10000]
 
         existing = db.get_story(story_id)
@@ -1837,6 +1936,157 @@ def rerank_candidates(
     return final
 
 
+def _article_fetch_failure_active(
+    db: Database,
+    story_id: int,
+    now_ts: float,
+) -> bool:
+    failure = db.get_article_fetch_failure(story_id)
+    if not failure:
+        return False
+    return bool(failure["permanent"]) or float(failure["next_retry_at"]) > now_ts
+
+
+def _article_fetch_extra_priority(item: RankedStory, position: int, now_ts: float) -> float:
+    story = item.story
+    age_hours = max((now_ts - story.time) / 3600.0, 0.1)
+    score_velocity = story.score / age_hours
+    comment_velocity = (story.comment_count or 0) / age_hours
+    return (
+        (1_000_000.0 / (position + 1))
+        + float(item.score) * 1_000.0
+        + story.score * 2.0
+        + (story.comment_count or 0) * 1.5
+        + score_velocity * 50.0
+        + comment_velocity * 50.0
+    )
+
+
+def select_article_fetch_candidates(
+    *,
+    ranked: list[RankedStory],
+    dashboard_selected: list[RankedStory],
+    db: Database,
+    max_per_run: int = 100,
+    max_age_days: int = 30,
+    now_ts: float | None = None,
+) -> list[Story]:
+    """Choose bounded article-body fetch targets.
+
+    Dashboard-visible stories are ordered first. Remaining budget is filled
+    from ranked extras by rank, score, comments, and engagement velocity.
+    """
+    if max_per_run <= 0:
+        return []
+    if now_ts is None:
+        now_ts = time.time()
+    min_time = now_ts - (max_age_days * 86400)
+
+    def eligible(story: Story) -> bool:
+        if not story.url or story.article_body:
+            return False
+        if story.source.startswith("rss_reddit_"):
+            return False
+        if story.url.startswith("https://news.ycombinator.com"):
+            return False
+        if story.time < min_time:
+            return False
+        if _article_fetch_failure_active(db, story.id, now_ts):
+            return False
+        return True
+
+    selected: list[Story] = []
+    selected_ids: set[int] = set()
+    for item in dashboard_selected:
+        story = item.story
+        if story.id in selected_ids or not eligible(story):
+            continue
+        selected.append(story)
+        selected_ids.add(story.id)
+        if len(selected) >= max_per_run:
+            return selected
+
+    extras: list[tuple[float, Story]] = []
+    for position, item in enumerate(ranked):
+        story = item.story
+        if story.id in selected_ids or not eligible(story):
+            continue
+        extras.append((_article_fetch_extra_priority(item, position, now_ts), story))
+
+    extras.sort(key=lambda pair: pair[0], reverse=True)
+    for _priority, story in extras:
+        selected.append(story)
+        selected_ids.add(story.id)
+        if len(selected) >= max_per_run:
+            break
+    return selected
+
+
+def _article_failure_retry_time(failure_count: int, now_ts: float) -> float:
+    delay_seconds = min(86400, 3600 * (2 ** max(0, failure_count - 1)))
+    return now_ts + delay_seconds
+
+
+async def fetch_and_cache_article_bodies(
+    *,
+    db: Database,
+    embedder: Embedder,
+    stories: list[Story],
+    concurrency: int = 10,
+) -> dict[int, Story]:
+    if not stories:
+        return {}
+
+    from server import ARTICLE_BODY_CHAR_LIMIT, _fetch_article_body_with_result
+
+    sem = asyncio.Semaphore(max(1, concurrency))
+    model_version = "all-MiniLM-L6-v2|mean|norm|256"
+
+    async def fetch_one(story: Story) -> tuple[int, Story | None]:
+        async with sem:
+            result = await _fetch_article_body_with_result(story.url or "")
+            if result.body:
+                body = result.body[:ARTICLE_BODY_CHAR_LIMIT]
+                new_text = compose_story_text(
+                    story.title,
+                    story.self_text,
+                    story.top_comments,
+                    body,
+                )
+                updated = replace(story, article_body=body, text_content=new_text)
+                db.upsert_story(updated)
+                new_vec = embedder.encode([new_text])[0]
+                new_hash = hashlib.sha256(new_text.encode("utf-8")).hexdigest()
+                db.upsert_embedding(story.id, model_version, new_hash, new_vec)
+                db.clear_article_fetch_failure(story.id)
+                return story.id, updated
+
+            now_ts = time.time()
+            previous = db.get_article_fetch_failure(story.id)
+            previous_count = int(previous["failure_count"]) if previous else 0
+            failure_count = previous_count + 1
+            permanent = result.permanent or (
+                result.error == "empty_extraction" and failure_count >= 3
+            )
+            next_retry_at = (
+                now_ts + 3650 * 86400
+                if permanent
+                else _article_failure_retry_time(failure_count, now_ts)
+            )
+            db.record_article_fetch_failure(
+                story.id,
+                story.url or "",
+                status=result.status,
+                error=result.error,
+                permanent=permanent,
+                next_retry_at=next_retry_at,
+            )
+            return story.id, None
+
+    results = await asyncio.gather(*(fetch_one(story) for story in stories))
+    return {sid: updated for sid, updated in results if updated is not None}
+
+
 # Orchestrator
 async def run_pipeline(config: Config) -> None:
     db = Database(config.db_path)
@@ -1868,87 +2118,41 @@ async def run_pipeline(config: Config) -> None:
     top_score = max((r.score for r in ranked), default=0.0)
     logging.info(f"Ranked {len(ranked)} stories, top_score={top_score:.3f}")
 
-    # -- Proactive Fetching (Top Recommendations & Popularity/Velocity Triggers) --
-    now_ts = time.time()
-    top_candidates = []
-    for pos, r in enumerate(ranked):
-        s = r.story
-        if not s.url or s.article_body:
-            continue
-
-        # Calculate velocity metrics
-        age_hours = (now_ts - s.time) / 3600.0
-        safe_hours = max(age_hours, 0.1)
-        score_vel = s.score / safe_hours
-        comment_vel = (s.comment_count or 0) / safe_hours
-
-        # Trigger 1: Highly ranked recommendation (Top 40)
-        is_top_rank = pos < 40
-
-        # Trigger 2: High virality recommendation (Top 150 with high score or velocity)
-        is_viral = (pos < 150) and (
-            s.score > 150 or score_vel > 30.0 or comment_vel > 20.0
-        )
-
-        if is_top_rank or is_viral:
-            top_candidates.append(s)
-            if len(top_candidates) >= 50:  # Cap at 50 parallel fetches per run
-                break
-
-    if top_candidates:
+    final = rerank_candidates(
+        db=db,
+        config=config,
+        embedder=embedder,
+        candidates=candidates,
+        cand_embeddings=cand_embeddings,
+    )
+    fetch_targets = select_article_fetch_candidates(
+        ranked=ranked,
+        dashboard_selected=final,
+        db=db,
+        max_per_run=config.article_fetch_max_per_run,
+        max_age_days=config.article_fetch_max_age_days,
+    )
+    if fetch_targets:
         logging.info(
-            f"Proactively fetching article bodies for top {len(top_candidates)} candidates..."
+            "Proactively fetching article bodies for %s candidates "
+            "(limit=%s, concurrency=%s)",
+            len(fetch_targets),
+            config.article_fetch_max_per_run,
+            config.article_fetch_concurrency,
         )
-        from server import _fetch_article_body
-
-        async def fetch_and_update(story: Story):
-            url = story.url
-            if not url:
-                return story.id, None
-            try:
-                body = await _fetch_article_body(url)
-                if body:
-                    new_text = compose_story_text(
-                        story.title,
-                        story.self_text,
-                        story.top_comments,
-                        body[:15000],
-                    )
-                    updated = replace(
-                        story,
-                        article_body=body[:15000],
-                        text_content=new_text,
-                    )
-                    db.upsert_story(updated)
-                    return story.id, updated
-            except Exception as e:
-                logging.warning(f"Proactive fetch failed for story {story.id}: {e!r}")
-            return story.id, None
-
-        tasks = [fetch_and_update(s) for s in top_candidates]
-        results = await asyncio.gather(*tasks)
-        updated_map = {sid: updated for sid, updated in results if updated}
+        updated_map = await fetch_and_cache_article_bodies(
+            db=db,
+            embedder=embedder,
+            stories=fetch_targets,
+            concurrency=config.article_fetch_concurrency,
+        )
 
         if updated_map:
             for idx, s in enumerate(candidates):
                 if s.id in updated_map:
                     candidates[idx] = updated_map[s.id]
 
-            # Update cache embeddings in the SQLite DB
-            model_version = "all-MiniLM-L6-v2|mean|norm|256"
-            for sid, updated in updated_map.items():
-                new_vec = embedder.encode([updated.text_content])[0]
-                import hashlib
-
-                new_hash = hashlib.sha256(
-                    updated.text_content.encode("utf-8")
-                ).hexdigest()
-                db.upsert_embedding(sid, model_version, new_hash, new_vec)
-
-            # Reload candidates' embeddings (loads updated vectors + cached vectors)
             cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
-
-            # Re-run SVM classification
             ranked = rank_stories(
                 candidates,
                 cand_embeddings,
@@ -1958,17 +2162,19 @@ async def run_pipeline(config: Config) -> None:
             )
             top_score = max((r.score for r in ranked), default=0.0)
             logging.info(
-                f"Re-ranked {len(ranked)} stories after proactive fetches, "
-                f"top_score={top_score:.3f}"
+                "Re-ranked %s stories after %s proactive article fetches, "
+                "top_score=%.3f",
+                len(ranked),
+                len(updated_map),
+                top_score,
             )
-
-    final = rerank_candidates(
-        db=db,
-        config=config,
-        embedder=embedder,
-        candidates=candidates,
-        cand_embeddings=cand_embeddings,
-    )
+            final = rerank_candidates(
+                db=db,
+                config=config,
+                embedder=embedder,
+                candidates=candidates,
+                cand_embeddings=cand_embeddings,
+            )
 
     selection_mode = "MMR" if config.model.enable_mmr else "top-ranked"
     logging.info(

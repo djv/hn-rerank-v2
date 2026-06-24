@@ -16,9 +16,11 @@ from pipeline import (
     rank_stories,
     Config,
     rerank_candidates,
+    select_article_fetch_candidates,
     source_label_filter,
     story_embedding_text,
     _extract_comments_recursive,
+    _select_top_comments,
     _dashboard_primary_limit,
     _reddit_subreddit_from_feed_url,
     _rss_source_name,
@@ -43,6 +45,63 @@ def test_dashboard_primary_limit_uncertain_threshold_at_10():
     assert _dashboard_primary_limit(9) == (9, 0)
     assert _dashboard_primary_limit(10) == (10, 5)
     assert _dashboard_primary_limit(40) == (12, 5)
+
+
+def test_article_fetch_selection_prioritizes_dashboard_and_filters(db):
+    now = 2_000_000_000.0
+
+    def story(sid, *, score=100, comments=0, age_days=1, body="", url=None):
+        return Story(
+            id=sid,
+            title=f"S{sid}",
+            url=url or f"https://example.com/{sid}",
+            score=score,
+            time=int(now - age_days * 86400),
+            text_content=f"text {sid}",
+            source="hn",
+            comment_count=comments,
+            article_body=body,
+        )
+
+    dashboard_1 = story(1, score=10)
+    dashboard_2 = story(2, score=10)
+    old = story(3, age_days=31)
+    backed_off = story(4, score=1000)
+    extra_hot = story(5, score=900, comments=90)
+    extra_cool = story(6, score=50, comments=5)
+    has_body = story(7, body="already fetched")
+
+    for s in [dashboard_1, dashboard_2, old, backed_off, extra_hot, extra_cool, has_body]:
+        db.upsert_story(s)
+    db.record_article_fetch_failure(
+        backed_off.id,
+        backed_off.url,
+        error="http_503",
+        next_retry_at=now + 3600,
+    )
+
+    ranked = [
+        RankedStory(story=s, score=float(10 - idx), best_match_title="")
+        for idx, s in enumerate(
+            [extra_hot, backed_off, extra_cool, dashboard_1, old, dashboard_2, has_body]
+        )
+    ]
+    dashboard = [
+        RankedStory(story=dashboard_1, score=1.0, best_match_title=""),
+        RankedStory(story=old, score=0.9, best_match_title=""),
+        RankedStory(story=dashboard_2, score=0.8, best_match_title=""),
+    ]
+
+    selected = select_article_fetch_candidates(
+        ranked=ranked,
+        dashboard_selected=dashboard,
+        db=db,
+        max_per_run=3,
+        max_age_days=30,
+        now_ts=now,
+    )
+
+    assert [s.id for s in selected] == [1, 2, 5]
 
 
 @pytest.fixture(scope="module")
@@ -162,6 +221,69 @@ def test_comment_extraction_allows_strong_replies_to_compete():
 
     assert extracted[0]["text"].startswith("Reply with substantially more points")
     assert extracted[1]["text"].startswith("Top-level comment")
+
+
+def test_comment_selection_includes_replies_from_large_threads():
+    comments = [
+        {
+            "type": "comment",
+            "text": "Large discussion root with enough substance to pass filtering.",
+            "children": [
+                {
+                    "type": "comment",
+                    "text": f"Substantive reply {i} with enough context to be useful.",
+                    "children": [],
+                }
+                for i in range(8)
+            ],
+        },
+        *[
+            {
+                "type": "comment",
+                "text": f"Separate top-level comment {i} with enough useful context.",
+                "children": [],
+            }
+            for i in range(8)
+        ],
+    ]
+
+    selected = _select_top_comments(_extract_comments_recursive(comments), limit=12)
+    large_thread_replies = [
+        c for c in selected if c["top_thread_index"] == 0 and c["depth"] > 0
+    ]
+
+    assert len(large_thread_replies) == 5
+
+
+def test_comment_selection_caps_comments_per_thread():
+    comments = [
+        {
+            "type": "comment",
+            "text": "Large discussion root with enough substance to pass filtering.",
+            "children": [
+                {
+                    "type": "comment",
+                    "text": f"Substantive reply {i} with enough context to be useful.",
+                    "children": [],
+                }
+                for i in range(20)
+            ],
+        },
+        *[
+            {
+                "type": "comment",
+                "text": f"Separate top-level comment {i} with enough useful context.",
+                "children": [],
+            }
+            for i in range(20)
+        ],
+    ]
+
+    selected = _select_top_comments(_extract_comments_recursive(comments), limit=20)
+    large_thread_comments = [c for c in selected if c["top_thread_index"] == 0]
+
+    assert len(large_thread_comments) == 6
+    assert len({c["top_thread_index"] for c in selected}) > 1
 
 
 def test_clean_text():

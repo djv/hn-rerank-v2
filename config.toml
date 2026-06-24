@@ -6,6 +6,9 @@ count = 40
 onnx_model_dir = "onnx_model"
 server_port = 8766
 regen_interval_seconds = 10800
+article_fetch_max_per_run = 100
+article_fetch_concurrency = 10
+article_fetch_max_age_days = 30
 
 [hn_rewrite.model]
 svm_c = 0.2

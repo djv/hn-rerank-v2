@@ -143,6 +143,24 @@ class Database:
                     "CREATE INDEX IF NOT EXISTS idx_tldr_cache_story ON tldr_cache(story_id)"
                 )
 
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS article_fetch_failures (
+                        story_id       INTEGER PRIMARY KEY,
+                        url            TEXT NOT NULL,
+                        failure_count  INTEGER NOT NULL DEFAULT 0,
+                        last_status    INTEGER,
+                        last_error     TEXT NOT NULL DEFAULT '',
+                        permanent      INTEGER NOT NULL DEFAULT 0,
+                        next_retry_at  REAL NOT NULL DEFAULT 0,
+                        updated_at     REAL NOT NULL,
+                        FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE
+                    )
+                """)
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_article_fetch_failures_url "
+                    "ON article_fetch_failures(url)"
+                )
+
                 # Run migration of article_cache to stories table if article_cache exists
                 tbl_cursor = conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name='article_cache'"
@@ -603,6 +621,81 @@ class Database:
             with conn:
                 cursor = conn.execute(sql, params)
                 return cursor.fetchall()
+
+    # Article fetch failure memory
+    def get_article_fetch_failure(self, story_id: int) -> dict | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT story_id, url, failure_count, last_status, last_error,
+                       permanent, next_retry_at, updated_at
+                FROM article_fetch_failures
+                WHERE story_id = ?
+                """,
+                (story_id,),
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "story_id": row[0],
+                "url": row[1],
+                "failure_count": row[2],
+                "last_status": row[3],
+                "last_error": row[4],
+                "permanent": bool(row[5]),
+                "next_retry_at": row[6],
+                "updated_at": row[7],
+            }
+
+    def record_article_fetch_failure(
+        self,
+        story_id: int,
+        url: str,
+        *,
+        status: int | None = None,
+        error: str = "",
+        permanent: bool = False,
+        next_retry_at: float | None = None,
+    ) -> None:
+        now = time.time()
+        if next_retry_at is None:
+            next_retry_at = now
+        with self._conn() as conn:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO article_fetch_failures (
+                        story_id, url, failure_count, last_status, last_error,
+                        permanent, next_retry_at, updated_at
+                    )
+                    VALUES (?, ?, 1, ?, ?, ?, ?, ?)
+                    ON CONFLICT(story_id) DO UPDATE SET
+                        url=excluded.url,
+                        failure_count=article_fetch_failures.failure_count + 1,
+                        last_status=excluded.last_status,
+                        last_error=excluded.last_error,
+                        permanent=excluded.permanent,
+                        next_retry_at=excluded.next_retry_at,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        story_id,
+                        url,
+                        status,
+                        error[:500],
+                        1 if permanent else 0,
+                        next_retry_at,
+                        now,
+                    ),
+                )
+
+    def clear_article_fetch_failure(self, story_id: int) -> None:
+        with self._conn() as conn:
+            with conn:
+                conn.execute(
+                    "DELETE FROM article_fetch_failures WHERE story_id = ?",
+                    (story_id,),
+                )
 
     # Users
     def create_user(self, token: str) -> User:

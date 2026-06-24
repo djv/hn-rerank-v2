@@ -85,7 +85,15 @@ class RedditRssContext:
     comment_count: int = 0
 
 
-async def _fetch_article_body(url: str) -> str | None:
+@dataclass(frozen=True)
+class ArticleFetchResult:
+    body: str | None = None
+    status: int | None = None
+    error: str = ""
+    permanent: bool = False
+
+
+async def _fetch_article_body_with_result(url: str) -> ArticleFetchResult:
     headers = {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -102,14 +110,18 @@ async def _fetch_article_body(url: str) -> str | None:
                     await asyncio.sleep(1)
                     continue
                 if resp.status_code != 200:
-                    return None
+                    return ArticleFetchResult(
+                        status=resp.status_code,
+                        error=f"http_{resp.status_code}",
+                        permanent=resp.status_code in (404, 410),
+                    )
                 html = resp.text
-        except Exception:
-            return None
+        except Exception as e:
+            return ArticleFetchResult(error=type(e).__name__)
 
         text = trafilatura.extract(html, include_comments=False, include_tables=False)
         if text and len(text) > 200:
-            return text[:ARTICLE_BODY_CHAR_LIMIT]
+            return ArticleFetchResult(body=text[:ARTICLE_BODY_CHAR_LIMIT], status=200)
 
         soup = BeautifulSoup(html, "html.parser")
         for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
@@ -117,11 +129,20 @@ async def _fetch_article_body(url: str) -> str | None:
         for tag in soup.find_all(["article", "main"]):
             text = tag.get_text(separator=" ", strip=True)
             if len(text) > 200:
-                return text[:ARTICLE_BODY_CHAR_LIMIT]
+                return ArticleFetchResult(
+                    body=text[:ARTICLE_BODY_CHAR_LIMIT],
+                    status=200,
+                )
         text = soup.get_text(separator=" ", strip=True)
-        return text[:ARTICLE_BODY_CHAR_LIMIT] if len(text) > 200 else None
+        if len(text) > 200:
+            return ArticleFetchResult(body=text[:ARTICLE_BODY_CHAR_LIMIT], status=200)
+        return ArticleFetchResult(status=200, error="empty_extraction")
 
-    return None
+    return ArticleFetchResult(status=503, error="retry_exhausted")
+
+
+async def _fetch_article_body(url: str) -> str | None:
+    return (await _fetch_article_body_with_result(url)).body
 
 
 def _reddit_post_rss_url(url: str | None) -> str | None:
