@@ -8,6 +8,7 @@ __pycache__/
 *.db-shm
 *.db-wal
 onnx_model/
+onnx_model_*/
 public/
 .env
 .env.local
