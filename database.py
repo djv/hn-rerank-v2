@@ -129,6 +129,20 @@ class Database:
                         "ALTER TABLE embeddings ADD COLUMN text_hash TEXT NOT NULL DEFAULT ''"
                     )
 
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS tldr_cache (
+                        story_id    INTEGER NOT NULL,
+                        cache_key   TEXT NOT NULL,
+                        tldr        TEXT NOT NULL,
+                        created_at  REAL NOT NULL,
+                        PRIMARY KEY (story_id, cache_key),
+                        FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE
+                    )
+                """)
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tldr_cache_story ON tldr_cache(story_id)"
+                )
+
                 # Run migration of article_cache to stories table if article_cache exists
                 tbl_cursor = conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name='article_cache'"
@@ -430,6 +444,27 @@ class Database:
                 if hashes.get(sid) == h:
                     res[sid] = np.frombuffer(blob, dtype=np.float32)
             return res
+
+    # TLDR cache
+    def get_tldr_cache(self, story_id: int, cache_key: str) -> str | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT tldr FROM tldr_cache WHERE story_id = ? AND cache_key = ?",
+                (story_id, cache_key),
+            ).fetchone()
+            return row[0] if row else None
+
+    def upsert_tldr_cache(self, story_id: int, cache_key: str, tldr: str) -> None:
+        with self._conn() as conn:
+            with conn:
+                conn.execute("DELETE FROM tldr_cache WHERE story_id = ?", (story_id,))
+                conn.execute(
+                    """
+                    INSERT INTO tldr_cache (story_id, cache_key, tldr, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (story_id, cache_key, tldr, time.time()),
+                )
 
     # Feedback
     def upsert_feedback(
