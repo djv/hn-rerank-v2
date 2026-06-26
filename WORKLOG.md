@@ -697,3 +697,40 @@ original `13:32:44` was preserved.
   "Re-embedding on dashboard render" description (the prewarm IS the
   re-embed trigger now).
 - 197/197 tests pass (was 206, removed 9 refetch tests), ruff clean.
+
+## 2026-06-26 — Revert: return to detail-v2 markdown TLDR pipeline
+
+After a day of experimenting with Pydantic-validated JSON TLDR output, the
+server curl test timed out (cold cache + json_object latency spike). Reverted
+`server.py`, `templates/index.html`, `tests/test_server.py`, `pyproject.toml`,
+`AGENTS.md`, `WORKLOG.md`, and `uv.lock` to the pre-Pydantic (detail-v2)
+markdown era. The dashboard now uses the original dual-prompt `asyncio.gather`
+(article + discussion), `_normalize_tldr_markdown`, and client-side Snarkdown
+parsing. New scripts from the benchmark/eval effort (`benchmark_tldr_llms.py`,
+`eval_top_models.py`, `eval_results/`, `benchmark_partial.json`) are deleted
+from the working tree.
+
+Tests: 178/178 pass (was 188; Pydantic tests removed, markdown tests restored),
+ruff clean.
+
+## 2026-06-26 — Recreate TLDR benchmark script (OpenRouter)
+
+- New `scripts/benchmark_tldr_llms.py` — standalone offline benchmark for
+  the detail-v2 TLDR prompt against any OpenRouter model.
+  - Reads `hn_rewrite.db` directly (read-only), samples 25 deterministic
+    mixed-source stories (HN, RSS, archive seed).
+  - Mirrors the dual-prompt `asyncio.gather` (article + discussion) and
+    fallback single-prompt paths from `server.py`. Asserts
+    `TLDR_PROMPT_VERSION == "detail-v2"` at import to detect drift.
+  - Implements format-compliance scoring: no nested lists, word caps,
+    bullet count ranges, heading structure, normalization idempotency.
+  - Stores raw model responses (`raw_article_response`,
+    `raw_discussion_response`, `raw_fallback_response`) alongside the
+    normalized `tldr` in each result entry.
+  - Partial results saved after each story; resume with `--resume`.
+  - Retry + exponential backoff on 429/5xx; skip-and-continue.
+- New `tests/test_benchmark_tldr_llms.py` — 22 tests covering sample
+  selection, prompt building, OpenRouter call, compliance scoring, partial
+  cache, and generate_tldr_for_story dual/fallback paths.
+- `AGENTS.md` — new "TLDR benchmark" section with command.
+- `.gitignore` — add `eval_results/`.

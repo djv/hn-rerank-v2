@@ -93,6 +93,7 @@ If a future experiment is added that needs a different heavy
 runtime dep (e.g. jax, tensorflow), give it its own
 `[dependency-groups]` group with a descriptive name, not a runtime
 direct dep.
+
 - Run persistent server: `systemctl --user {status|start|stop|restart} hn_rewrite.service` (or directly: `uv run python server.py`)
 - Run one-shot generation: `uv run python generate.py`
 - Migrate feedback from legacy JSON: `uv run python migrate_feedback.py`
@@ -169,6 +170,21 @@ HN_KEEP_N=7 ./scripts/backup_hn_db.sh             # keep 7
 LATEST=$(rclone lsf --dirs-only drive:hn-rewrite/backups/ | sort -r | head -1)
 rclone copy drive:hn-rewrite/backups/$LATEST/hn_rewrite.db ./hn_rewrite.db
 sqlite3 hn_rewrite.db "PRAGMA integrity_check;"
+
+## TLDR benchmark
+
+- Run TLDR output-quality benchmark against an OpenRouter model:
+  ```
+  LLM_PROVIDER=openrouter \
+  OPENROUTER_API_KEY=sk-or-... \
+  OPENROUTER_MODEL=google/gemma-4-26b-a4b-it:free \
+  uv run python scripts/benchmark_tldr_llms.py --limit 25
+  ```
+- Output goes to `eval_results/` (gitignored).
+- Each result stores both the normalized `tldr` and raw (`raw_article_response`,
+  `raw_discussion_response`, `raw_fallback_response`) model outputs.
+- Partial results are saved after each story; resume a broken run with `--resume`.
+- See `--help` for all options.
 
 ## Testing notes
 
