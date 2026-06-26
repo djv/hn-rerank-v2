@@ -57,16 +57,23 @@ TOP_COMMENT_LIMIT = 40
 TOP_COMMENT_CORE_THREADS = 4
 TOP_COMMENT_REPLIES_PER_CORE_THREAD = 5
 TOP_COMMENT_MAX_PER_THREAD = 6
+GOOD_TOPLEVEL_MIN_LEN = 200
+GOOD_TOPLEVEL_MIN_REPLIES = 3
+TOP_COMMENT_TOP_LEVEL_BUDGET = TOP_COMMENT_LIMIT // 3
 UNCERTAIN_DISCOVERY_SLOT_LIMIT = 5
 DISCOVERY_SLOT_LIMIT = 5
 POPULARITY_DISCOVERY_SLOT_LIMIT = 8
+NON_HN_DISCOVERY_SLOT_LIMIT = 8
+HOT_MIN_SCORE = 20
 DASHBOARD_QUEUE_SIZE = 12
 BQ_ARCHIVE_SOURCE = "bq_seed"
 BQ_ARCHIVE_CANDIDATE_LIMIT = 2000
+CH_ARCHIVE_SOURCE = "ch_seed"
+CH_ARCHIVE_CANDIDATE_LIMIT = 2000
 
 
 def is_hn_source(source: str) -> bool:
-    return source in {"hn", BQ_ARCHIVE_SOURCE}
+    return source in {"hn", BQ_ARCHIVE_SOURCE, CH_ARCHIVE_SOURCE}
 
 
 @dataclass(frozen=True)
@@ -150,6 +157,7 @@ class RankedStory:
     is_high_engagement: bool = False
     is_hot: bool = False
     is_similar: bool = False
+    is_non_hn: bool = False
 
 
 def _dashboard_primary_limit(config_count: int) -> tuple[int, int]:
@@ -191,7 +199,7 @@ def _extract_comments_recursive(
     top_thread_index: int | None = None,
     order_path: tuple[int, ...] = (),
 ) -> list[dict]:
-    MIN_COMMENT_LENGTH = 30
+    MIN_COMMENT_LENGTH = 60
     results = []
     for sibling_index, child in enumerate(children):
         if not isinstance(child, dict) or child.get("type") != "comment":
@@ -235,9 +243,8 @@ def _extract_comments_recursive(
 
 def _comment_rank_key(comment: dict) -> tuple:
     return (
-        comment["score"],
-        -min(comment["descendant_count"], 50),
-        -min(comment["text_len"], 1200),
+        -comment["descendant_count"],
+        -min(comment["text_len"], 3000),
         comment["order_path"],
     )
 
@@ -248,9 +255,11 @@ def _select_top_comments(
 ) -> list[dict]:
     """Select comment text for embeddings/TLDRs.
 
-    HN comment points are not exposed in the APIs we use, and Algolia tree order
-    does not match the rendered HN order. Prefer large discussion cores while
-    keeping broad top-level coverage.
+    Prefer large discussion cores (top engaged threads) and breadth of
+    substantive top-level comments.  Replies compete on equal footing with
+    top-level (no depth penalty); the previous ``score``-based rank key
+    effectively preferred top-level regardless of substance, since Algolia
+    returns ``points: null`` for HN comments.
     """
     if not comments:
         return []
@@ -273,10 +282,18 @@ def _select_top_comments(
         per_thread[thread_index] = per_thread.get(thread_index, 0) + 1
 
     top_level = [c for c in comments if c["depth"] == 0]
+    good_top_level = [
+        c
+        for c in top_level
+        if c["text_len"] >= GOOD_TOPLEVEL_MIN_LEN
+        or c["descendant_count"] >= GOOD_TOPLEVEL_MIN_REPLIES
+    ]
+
+    n_cores = min(TOP_COMMENT_CORE_THREADS, len(good_top_level))
     core_roots = sorted(
-        top_level,
+        good_top_level,
         key=lambda c: (-c["descendant_count"], c["top_thread_index"]),
-    )[:TOP_COMMENT_CORE_THREADS]
+    )[:n_cores]
     core_threads = {c["top_thread_index"] for c in core_roots}
 
     for root in sorted(core_roots, key=_comment_rank_key):
@@ -293,8 +310,12 @@ def _select_top_comments(
         ]:
             add(reply)
 
-    for comment in sorted(top_level, key=_comment_rank_key):
+    top_level_added = sum(1 for c in selected if c["depth"] == 0)
+    for comment in sorted(good_top_level, key=_comment_rank_key):
+        if top_level_added >= TOP_COMMENT_TOP_LEVEL_BUDGET:
+            break
         add(comment)
+        top_level_added += 1
 
     for comment in sorted(comments, key=_comment_rank_key):
         add(comment)
@@ -686,11 +707,15 @@ async def fetch_candidates(
     rows = db.execute(
         """
         SELECT id FROM stories
-        WHERE source = ? AND text_content != ''
+        WHERE source IN (?, ?) AND text_content != ''
         ORDER BY score DESC, time DESC
         LIMIT ?
         """,
-        (BQ_ARCHIVE_SOURCE, BQ_ARCHIVE_CANDIDATE_LIMIT),
+        (
+            BQ_ARCHIVE_SOURCE,
+            CH_ARCHIVE_SOURCE,
+            BQ_ARCHIVE_CANDIDATE_LIMIT + CH_ARCHIVE_CANDIDATE_LIMIT,
+        ),
     )
     for row in rows:
         sid = row[0]
@@ -1632,6 +1657,8 @@ def source_label_filter(source: str) -> str:
         return "HN"
     if source == BQ_ARCHIVE_SOURCE:
         return "BQ Seed"
+    if source == CH_ARCHIVE_SOURCE:
+        return "CH Seed"
 
     label = source
     if label.startswith("rss_"):
@@ -1805,7 +1832,9 @@ def rerank_candidates(
     )
     engagement_threshold = np.percentile(cand_scores, 98) if len(cand_scores) else 0
 
-    ranked_decorated = [replace(r) for r in ranked]
+    ranked_decorated = [
+        replace(r, is_non_hn=(not is_hn_source(r.story.source))) for r in ranked
+    ]
 
     # Reconstruct final from the undecorated ranked candidates
     final_ids = {item.story.id for item in final}
@@ -1841,7 +1870,9 @@ def rerank_candidates(
             is_hot=(
                 cand_velocities[story_id_to_idx[r.story.id]] >= hot_threshold
                 and cand_velocities[story_id_to_idx[r.story.id]] > 0
+                and r.story.score >= HOT_MIN_SCORE
             ),
+            is_non_hn=(not is_hn_source(r.story.source)),
         )
         for r in final
     ]
@@ -1945,6 +1976,7 @@ def rerank_candidates(
         for r in remaining_decorated
         if cand_velocities[story_id_to_idx[r.story.id]] >= hot_threshold
         and cand_velocities[story_id_to_idx[r.story.id]] > 0
+        and r.story.score >= HOT_MIN_SCORE
     ]
     hot_pool.sort(
         key=lambda r: cand_velocities[story_id_to_idx[r.story.id]], reverse=True
@@ -1954,6 +1986,15 @@ def rerank_candidates(
     ]
     final.extend(hot_items)
     selected_ids |= {item.story.id for item in hot_items}
+
+    # 7. Surface up to 8 non-HN stories to balance the dashboard
+    non_hn_pool = [r for r in remaining_decorated if not is_hn_source(r.story.source)]
+    non_hn_pool.sort(key=lambda r: r.score, reverse=True)
+    non_hn_items = [
+        replace(r, is_non_hn=True) for r in non_hn_pool[:NON_HN_DISCOVERY_SLOT_LIMIT]
+    ]
+    final.extend(non_hn_items)
+    selected_ids |= {item.story.id for item in non_hn_items}
 
     final.sort(key=lambda r: r.score, reverse=True)
     return final
@@ -1970,7 +2011,9 @@ def _article_fetch_failure_active(
     return bool(failure["permanent"]) or float(failure["next_retry_at"]) > now_ts
 
 
-def _article_fetch_extra_priority(item: RankedStory, position: int, now_ts: float) -> float:
+def _article_fetch_extra_priority(
+    item: RankedStory, position: int, now_ts: float
+) -> float:
     story = item.story
     age_hours = max((now_ts - story.time) / 3600.0, 0.1)
     score_velocity = story.score / age_hours
@@ -2268,19 +2311,24 @@ def fast_rerank_for_user(
     recent_rows = db.execute(
         "SELECT id, title, url, score, time, text_content, source, comment_count, "
         "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
-        "FROM stories WHERE time >= ? AND source != ? "
+        "FROM stories WHERE time >= ? AND source NOT IN (?, ?) "
         "AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?)",
-        (cutoff_ts, BQ_ARCHIVE_SOURCE, user_id),
+        (cutoff_ts, BQ_ARCHIVE_SOURCE, CH_ARCHIVE_SOURCE, user_id),
     )
-    bq_rows = db.execute(
+    archive_rows = db.execute(
         "SELECT id, title, url, score, time, text_content, source, comment_count, "
         "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
-        "FROM stories WHERE source = ? AND text_content != '' "
+        "FROM stories WHERE source IN (?, ?) AND text_content != '' "
         "AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?) "
         "ORDER BY score DESC, time DESC LIMIT ?",
-        (BQ_ARCHIVE_SOURCE, user_id, BQ_ARCHIVE_CANDIDATE_LIMIT),
+        (
+            BQ_ARCHIVE_SOURCE,
+            CH_ARCHIVE_SOURCE,
+            user_id,
+            BQ_ARCHIVE_CANDIDATE_LIMIT + CH_ARCHIVE_CANDIDATE_LIMIT,
+        ),
     )
-    rows = recent_rows + bq_rows
+    rows = recent_rows + archive_rows
     candidates = [Database._row_to_story(row) for row in rows]
     if not candidates:
         return []

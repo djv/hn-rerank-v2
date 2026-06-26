@@ -404,7 +404,7 @@ class Database:
             with conn:
                 cursor = conn.execute(
                     "DELETE FROM stories WHERE fetched_at < ? "
-                    "AND source != 'bq_seed' "
+                    "AND source NOT IN ('bq_seed', 'ch_seed') "
                     "AND id NOT IN (SELECT story_id FROM feedback)",
                     (cutoff,),
                 )

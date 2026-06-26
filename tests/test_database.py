@@ -248,22 +248,36 @@ def test_prune_stories_preserves_feedback_stories(db):
     assert db.get_story(2) is None
 
 
-def test_prune_stories_preserves_bq_seed_stories(db):
-    story = Story(
-        id=3,
-        title="BQ",
-        url=None,
-        score=100,
-        time=100,
-        text_content="BQ text",
-        source="bq_seed",
+def test_prune_stories_preserves_archive_stories(db):
+    for source, sid in [("bq_seed", 3), ("ch_seed", 4)]:
+        db.upsert_story(
+            Story(
+                id=sid,
+                title="Archive",
+                url=None,
+                score=100,
+                time=100,
+                text_content="Archive text",
+                source=source,
+            )
+        )
+    db.upsert_story(
+        Story(
+            id=99,
+            title="Old",
+            url=None,
+            score=1,
+            time=1,
+            text_content="Old text",
+            source="hn",
+        )
     )
-    db.upsert_story(story)
-
     deleted = db.prune_stories(max_age_days=0)
 
-    assert deleted == 0
+    assert deleted == 1
     assert db.get_story(3) is not None
+    assert db.get_story(4) is not None
+    assert db.get_story(99) is None
 
 
 def test_feedback_training_data(db):

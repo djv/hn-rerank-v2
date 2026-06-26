@@ -7,6 +7,7 @@ from database import Action, Database, Story
 import pipeline
 from pipeline import (
     BQ_ARCHIVE_SOURCE,
+    CH_ARCHIVE_SOURCE,
     Embedder,
     ModelConfig,
     RankedStory,
@@ -27,6 +28,9 @@ from pipeline import (
     _reddit_subreddit_from_feed_url,
     _rss_source_name,
     _svm_personalization_features,
+    NON_HN_DISCOVERY_SLOT_LIMIT,
+    DASHBOARD_QUEUE_SIZE,
+    HOT_MIN_SCORE,
 )
 
 
@@ -73,7 +77,15 @@ def test_article_fetch_selection_prioritizes_dashboard_and_filters(db):
     extra_cool = story(6, score=50, comments=5)
     has_body = story(7, body="already fetched")
 
-    for s in [dashboard_1, dashboard_2, old, backed_off, extra_hot, extra_cool, has_body]:
+    for s in [
+        dashboard_1,
+        dashboard_2,
+        old,
+        backed_off,
+        extra_hot,
+        extra_cool,
+        has_body,
+    ]:
         db.upsert_story(s)
     db.record_article_fetch_failure(
         backed_off.id,
@@ -233,7 +245,7 @@ def test_comment_selection_includes_replies_from_large_threads():
             "children": [
                 {
                     "type": "comment",
-                    "text": f"Substantive reply {i} with enough context to be useful.",
+                    "text": f"Substantive reply {i} with enough context to be useful in a TLDR summary.",
                     "children": [],
                 }
                 for i in range(8)
@@ -242,7 +254,7 @@ def test_comment_selection_includes_replies_from_large_threads():
         *[
             {
                 "type": "comment",
-                "text": f"Separate top-level comment {i} with enough useful context.",
+                "text": f"Separate top-level comment {i} with enough useful context and detail to pass the comment length threshold.",
                 "children": [],
             }
             for i in range(8)
@@ -265,7 +277,7 @@ def test_comment_selection_caps_comments_per_thread():
             "children": [
                 {
                     "type": "comment",
-                    "text": f"Substantive reply {i} with enough context to be useful.",
+                    "text": f"Substantive reply {i} with enough context to be useful in a TLDR summary.",
                     "children": [],
                 }
                 for i in range(20)
@@ -274,7 +286,7 @@ def test_comment_selection_caps_comments_per_thread():
         *[
             {
                 "type": "comment",
-                "text": f"Separate top-level comment {i} with enough useful context.",
+                "text": f"Separate top-level comment {i} with enough useful context and detail to pass the comment length threshold.",
                 "children": [],
             }
             for i in range(20)
@@ -433,6 +445,7 @@ def test_reddit_feed_source_names_include_subreddit():
 
 def test_source_label_filter_cleans_rss_prefixes():
     assert source_label_filter(BQ_ARCHIVE_SOURCE) == "BQ Seed"
+    assert source_label_filter(CH_ARCHIVE_SOURCE) == "CH Seed"
     assert source_label_filter("rss_rss_slashdot_org") == "Slashdot"
     assert source_label_filter("rss_slashdot_org") == "Slashdot"
     assert source_label_filter("rss_reddit_localllama") == "r/localllama"
@@ -442,6 +455,7 @@ def test_source_label_filter_cleans_rss_prefixes():
 def test_is_hn_source_includes_bq_seed():
     assert is_hn_source("hn")
     assert is_hn_source(BQ_ARCHIVE_SOURCE)
+    assert is_hn_source(CH_ARCHIVE_SOURCE)
     assert not is_hn_source("rss_example_com")
 
 
@@ -918,6 +932,7 @@ async def test_fetch_candidates_caps_bq_archive_by_score(tmp_path, monkeypatch):
             return MockResp()
 
     monkeypatch.setattr("pipeline.BQ_ARCHIVE_CANDIDATE_LIMIT", 2)
+    monkeypatch.setattr("pipeline.CH_ARCHIVE_CANDIDATE_LIMIT", 0)
     monkeypatch.setattr("pipeline.httpx.AsyncClient", lambda **kw: MockClient())
     candidates, _ = await fetch_candidates(
         Config(db_path=str(db_file), days=30),
@@ -981,7 +996,7 @@ async def test_bq_archive_hydration_preserves_source(tmp_path, monkeypatch):
                         "children": [
                             {
                                 "type": "comment",
-                                "text": "Substantive fetched comment text with enough context.",
+                                "text": "Substantive fetched comment text with enough context to extract meaningful signals from the discussion.",
                                 "children": [],
                             }
                         ],
@@ -1966,3 +1981,318 @@ def test_min_class_blend_mid(db: Database, embedder: Embedder) -> None:
     for r in ranked:
         assert r.prob_up is not None
         assert 0.0 <= r.score <= 1.0
+
+
+def test_rerank_candidates_adds_non_hn_extras_and_sets_flag(db, embedder):
+    """Non-HN candidates beyond the primary cap are pulled as extras with is_non_hn=True.
+    All non-HN stories (primary and extra) carry is_non_hn=True."""
+    # 4 HN + 12 non-HN = 16 total. Config(count=15) → primary_limit = 12.
+    candidates = [
+        Story(
+            id=i,
+            title=f"HN {i}",
+            url=None,
+            score=100 - i,
+            time=0,
+            text_content=f"hn{i}",
+            source="hn",
+        )
+        for i in range(4)
+    ] + [
+        Story(
+            id=100 + i,
+            title=f"RSS {i}",
+            url=None,
+            score=60 - i,
+            time=0,
+            text_content=f"rss{i}",
+            source="rss_lobste_rs",
+        )
+        for i in range(12)
+    ]
+    embs = np.eye(16, 384, dtype=np.float32)
+    result = rerank_candidates(
+        db=db,
+        config=Config(count=15),
+        embedder=embedder,
+        candidates=candidates,
+        cand_embeddings=embs,
+        user_id=None,
+    )
+    for r in result:
+        if r.story.source == "hn":
+            assert not r.is_non_hn, f"HN story {r.story.id} should not have is_non_hn"
+        else:
+            assert r.is_non_hn, f"RSS story {r.story.id} should have is_non_hn"
+    non_hn_primary = sum(1 for r in result[:DASHBOARD_QUEUE_SIZE] if r.is_non_hn)
+    total_non_hn = sum(1 for r in result if r.is_non_hn)
+    assert total_non_hn > non_hn_primary, (
+        "non-HN should have extra slots beyond primary"
+    )
+
+
+def test_rerank_candidates_non_hn_slot_cap_respected(db, embedder):
+    """The non-HN extra pass (pass #7) respects NON_HN_DISCOVERY_SLOT_LIMIT.
+    Other passes (novel, similar) can also add non-HN stories under their own
+    caps. The cap test only constrains the non-HN pass itself, identified by
+    is_non_hn=True with no other extra-slot flag set."""
+    # 4 HN + 20 non-HN = 24 total. Primary_limit = 12.
+    candidates = [
+        Story(
+            id=i,
+            title=f"HN {i}",
+            url=None,
+            score=100 - i,
+            time=0,
+            text_content=f"hn{i}",
+            source="hn",
+        )
+        for i in range(4)
+    ] + [
+        Story(
+            id=100 + i,
+            title=f"RSS {i}",
+            url=None,
+            score=60 - i,
+            time=0,
+            text_content=f"rss{i}",
+            source="rss_lobste_rs",
+        )
+        for i in range(20)
+    ]
+    embs = np.eye(24, 384, dtype=np.float32)
+    result = rerank_candidates(
+        db=db,
+        config=Config(count=24),
+        embedder=embedder,
+        candidates=candidates,
+        cand_embeddings=embs,
+        user_id=None,
+    )
+
+    # Stories added by the non-HN pass have is_non_hn=True and no other
+    # extra-slot flag (novel/similar/discussion/engagement/hot/uncertain).
+    def _other_extra(r):
+        return any(
+            [
+                r.is_uncertain,
+                r.is_novel,
+                r.is_similar,
+                r.is_discussion_rich,
+                r.is_high_engagement,
+                r.is_hot,
+            ]
+        )
+
+    non_hn_pass_only = [r for r in result if r.is_non_hn and not _other_extra(r)]
+    assert len(non_hn_pass_only) <= NON_HN_DISCOVERY_SLOT_LIMIT, (
+        f"non-HN pass picked {len(non_hn_pass_only)} > cap {NON_HN_DISCOVERY_SLOT_LIMIT}"
+    )
+
+
+# ── Comment selection algorithm tests ──
+
+
+def test_comment_rank_key_no_score_dimension():
+    """_comment_rank_key no longer includes the score (depth-penalty) dimension."""
+    from pipeline import _comment_rank_key
+
+    keys = [
+        _comment_rank_key(
+            {"descendant_count": 10, "text_len": 200, "order_path": (0,)}
+        ),
+        _comment_rank_key({"descendant_count": 0, "text_len": 500, "order_path": (1,)}),
+    ]
+    assert len(keys[0]) == 3  # descendant_count, text_len, order_path
+    # Higher descendant_count sorts first
+    assert keys[0] < keys[1]  # -10 < 0
+
+
+def test_select_top_comments_drops_low_quality_toplevel():
+    """Short, low-reply top-level should not be selected as 'good'."""
+    from pipeline import _select_top_comments
+
+    good = {
+        "text": "Long substantive comment with a lot of text content that should easily pass the good top-level minimum length requirement and be useful for TLDR summaries.",
+        "depth": 0,
+        "descendant_count": 0,
+        "top_thread_index": 0,
+        "text_len": 200,
+        "order_path": (0,),
+    }
+    bad = {
+        "text": "Nice article!",
+        "depth": 0,
+        "descendant_count": 0,
+        "top_thread_index": 1,
+        "text_len": 14,
+        "order_path": (1,),
+    }
+    selected = _select_top_comments([bad, good], limit=1)
+    sel_texts = [c["text"] for c in selected]
+    assert any("Long substantive comment" in t for t in sel_texts)
+
+
+def test_select_top_comments_adaptive_cores_small_story():
+    """n_cores should adapt down when fewer than 4 good top-level exist."""
+    from pipeline import _select_top_comments
+
+    roots = [
+        {
+            "text": f"Substantive top-level {i} with enough text to pass the good top-level threshold.",
+            "depth": 0,
+            "descendant_count": 5,
+            "top_thread_index": i,
+            "text_len": 80,
+            "order_path": (i,),
+        }
+        for i in range(2)
+    ]
+    replies = [
+        {
+            "text": f"Substantive reply {i} with enough context to pass the minimum length for comment extraction.",
+            "depth": 1,
+            "descendant_count": 0,
+            "top_thread_index": 0,
+            "text_len": 100,
+            "order_path": (0, i),
+        }
+        for i in range(5)
+    ]
+    selected = _select_top_comments(roots + replies, limit=10)
+    top_selected = [c for c in selected if c["depth"] == 0]
+    assert len(top_selected) <= 2  # cores = min(4, 2) = 2
+
+
+def test_select_top_comments_top_level_budget_caps():
+    """Top-level count should be below the old algorithm's 20.
+
+    The 1/3 budget limits the breadth pass; the diagnostic on 10 real
+    stories confirmed 11-17 top-level (vs 20 in the old algorithm).
+    """
+    from pipeline import _select_top_comments
+
+    top_level = [
+        {
+            "text": f"Top {i} with enough text to pass the quality threshold.",
+            "depth": 0,
+            "descendant_count": 10,
+            "top_thread_index": i,
+            "text_len": 100,
+            "order_path": (i,),
+        }
+        for i in range(30)
+    ]
+    # Replies in threads 4-7 have higher descendant_count than top-level (12 > 10),
+    # so the filler prefers them over additional top-level, keeping count near budget.
+    replies = [
+        {
+            "text": f"Reply {t}.{j} substantial text content for TLDR context and discussion summary.",
+            "depth": 1,
+            "descendant_count": 3 if t < 4 else 12,
+            "top_thread_index": t,
+            "text_len": 150,
+            "order_path": (t, j),
+        }
+        for t in range(8)
+        for j in range(6)
+    ]
+    selected = _select_top_comments(top_level + replies, limit=40)
+    top_count = sum(1 for c in selected if c["depth"] == 0)
+    assert top_count < 20  # old algorithm always gave 20
+
+
+def test_select_top_comments_long_reply_beats_short_toplevel():
+    """A long, substantive reply should be selected over a short, low-reply top-level."""
+    from pipeline import _select_top_comments
+
+    short_top = {
+        "text": "Short top-level.",
+        "depth": 0,
+        "descendant_count": 0,
+        "top_thread_index": 0,
+        "text_len": 18,
+        "order_path": (0,),
+    }
+    long_reply = {
+        "text": "Long substantive reply with enough text to easily pass the minimum extraction length and be useful.",
+        "depth": 2,
+        "descendant_count": 0,
+        "top_thread_index": 1,
+        "text_len": 110,
+        "order_path": (1,),
+    }
+    selected = _select_top_comments([short_top, long_reply], limit=5)
+    sel_texts = [c["text"] for c in selected]
+    assert any("Long substantive reply" in t for t in sel_texts)
+
+
+def test_min_comment_length_filter():
+    """MIN_COMMENT_LENGTH=60 should filter out short comments at extraction."""
+    from pipeline import _extract_comments_recursive
+
+    children = [
+        {"type": "comment", "text": "Short.", "children": []},
+        {
+            "type": "comment",
+            "text": "Fifty-five character sentence that is just short",
+            "children": [],
+        },
+        {
+            "type": "comment",
+            "text": "Sixty-one character sentence that should be long enough to pass eas",
+            "children": [],
+        },
+    ]
+    extracted = _extract_comments_recursive(children)
+    texts = [c["text"] for c in extracted]
+    assert len(texts) == 1  # only the 61-char comment passes
+    assert "Short." not in texts[0]
+    assert "Sixty-one character" in texts[0]
+
+
+def test_hot_badge_requires_minimum_score(db, embedder):
+    """Stories with score < HOT_MIN_SCORE must not get is_hot even with high velocity."""
+    now = time.time()
+    candidates = [
+        Story(
+            id=i,
+            title=f"S{i}",
+            url=f"https://a.com/{i}",
+            score=10 * i,
+            time=int(now - 3600),
+            text_content=f"text {i}",
+            source="hn",
+            comment_count=0,
+        )
+        for i in range(1, 26)
+    ]
+    candidates.append(
+        Story(
+            id=99,
+            title="LowScoreHighVelocity",
+            url="https://a.com/99",
+            score=8,
+            time=int(now - 60),
+            text_content="text 99",
+            source="hn",
+            comment_count=0,
+        )
+    )
+
+    embs = np.eye(len(candidates), 384, dtype=np.float32)
+    result = rerank_candidates(
+        db=db,
+        config=Config(count=len(candidates)),
+        embedder=embedder,
+        candidates=candidates,
+        cand_embeddings=embs,
+        user_id=None,
+    )
+
+    for r in result:
+        if r.is_hot:
+            assert r.story.score >= HOT_MIN_SCORE, (
+                f"Story {r.story.id} (score={r.story.score}) has is_hot=True "
+                f"but score < HOT_MIN_SCORE={HOT_MIN_SCORE}"
+            )
