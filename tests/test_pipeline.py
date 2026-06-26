@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 import time
 from hypothesis import given, strategies as st, settings, HealthCheck
-from database import Action, Database, Story
+from database import Database, Story
 import pipeline
 from pipeline import (
     BQ_ARCHIVE_SOURCE,
@@ -815,23 +815,7 @@ async def test_fetch_candidates_returns_tuple(tmp_path, monkeypatch):
         server_port=0,
     )
 
-    class MockResp:
-        status_code = 200
-
-        def json(self):
-            return {"hits": []}
-
-    class MockClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            pass
-
-        async def get(self, *a, **kw):
-            return MockResp()
-
-    monkeypatch.setattr("pipeline.httpx.AsyncClient", lambda **kw: MockClient())
+    monkeypatch.setattr("ch_client.query_live_window", lambda **kw: [])
     result = await fetch_candidates(config, set(), set(), db)
     assert isinstance(result, tuple), f"expected tuple, got {type(result)}"
     assert len(result) == 2
@@ -839,6 +823,117 @@ async def test_fetch_candidates_returns_tuple(tmp_path, monkeypatch):
     assert isinstance(candidates, list)
     assert isinstance(count, int)
     assert count == len(candidates)
+
+
+@pytest.mark.asyncio
+async def test_fetch_candidates_ch_live_window_inserts_new(tmp_path, monkeypatch):
+    """CH live_window returns story fields; fetch_candidates inserts them
+    into the DB with source='hn'."""
+    from database import Database
+    from pipeline import Config, fetch_candidates
+
+    db_file = tmp_path / "test.db"
+    db = Database(str(db_file))
+    config = Config(db_path=str(db_file), days=30)
+
+    ch_window = [
+        {
+            "id": 12345,
+            "type": "story",
+            "title": "Live HN story",
+            "url": "https://example.com/live",
+            "text": "Self text",
+            "points": 250,
+            "num_comments": 50,
+            "created_at_i": 1770000000,
+        }
+    ]
+    monkeypatch.setattr("ch_client.query_live_window", lambda **kw: ch_window)
+
+    candidates, count = await fetch_candidates(config, set(), set(), db)
+    assert 12345 in {s.id for s in candidates}
+    story = db.get_story(12345)
+    assert story is not None
+    assert story.source == "hn"
+    assert story.score == 250
+    assert story.comment_count == 50
+
+
+@pytest.mark.asyncio
+async def test_fetch_candidates_ch_live_window_updates_existing_score(
+    tmp_path, monkeypatch
+):
+    """If a live `hn` story is already in the DB with a different score,
+    fetch_candidates updates the score from CH."""
+    from database import Database
+    from pipeline import Config, fetch_candidates
+
+    db_file = tmp_path / "test.db"
+    db = Database(str(db_file))
+    config = Config(db_path=str(db_file), days=30)
+
+    db.upsert_story(
+        Story(
+            id=99,
+            title="Existing HN",
+            url="https://example.com/existing",
+            score=10,
+            time=1770000000,
+            text_content="Existing text",
+            source="hn",
+        )
+    )
+    ch_window = [
+        {
+            "id": 99,
+            "type": "story",
+            "title": "Existing HN",
+            "url": "https://example.com/existing",
+            "text": "Existing text",
+            "points": 999,
+            "num_comments": 5,
+            "created_at_i": 1770000000,
+        }
+    ]
+    monkeypatch.setattr("ch_client.query_live_window", lambda **kw: ch_window)
+
+    candidates, _ = await fetch_candidates(config, set(), set(), db)
+    story = db.get_story(99)
+    assert story.score == 999
+    assert any(s.id == 99 for s in candidates)
+
+
+@pytest.mark.asyncio
+async def test_fetch_candidates_ch_failure_returns_empty_live(tmp_path, monkeypatch):
+    """If CH live_window raises, fetch_candidates continues with archive
+    seeds only (does not crash)."""
+    from database import Database
+    from pipeline import Config, fetch_candidates
+
+    db_file = tmp_path / "test.db"
+    db = Database(str(db_file))
+    old_time = int(time.time()) - (180 * 86400)
+    db.upsert_story(
+        Story(
+            id=1,
+            title="Archive",
+            url="https://example.com/archive",
+            score=200,
+            time=old_time,
+            text_content="Archive text",
+            source=CH_ARCHIVE_SOURCE,
+        )
+    )
+    config = Config(db_path=str(db_file), days=30)
+
+    def fail_ch(*a, **kw):
+        raise RuntimeError("simulated CH outage")
+
+    monkeypatch.setattr("ch_client.query_live_window", fail_ch)
+
+    candidates, _ = await fetch_candidates(config, set(), set(), db)
+    # Live source is empty; archive seed still surfaces
+    assert {s.id for s in candidates} == {1}
 
 
 @pytest.mark.asyncio
@@ -863,23 +958,7 @@ async def test_fetch_candidates_includes_old_bq_archive_stories(tmp_path, monkey
     )
     db.upsert_story(story)
 
-    class MockResp:
-        status_code = 200
-
-        def json(self):
-            return {"hits": []}
-
-    class MockClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            pass
-
-        async def get(self, *a, **kw):
-            return MockResp()
-
-    monkeypatch.setattr("pipeline.httpx.AsyncClient", lambda **kw: MockClient())
+    monkeypatch.setattr("ch_client.query_live_window", lambda **kw: [])
     candidates, count = await fetch_candidates(
         Config(db_path=str(db_file), days=30),
         set(),
@@ -915,25 +994,9 @@ async def test_fetch_candidates_caps_bq_archive_by_score(tmp_path, monkeypatch):
             )
         )
 
-    class MockResp:
-        status_code = 200
-
-        def json(self):
-            return {"hits": []}
-
-    class MockClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            pass
-
-        async def get(self, *a, **kw):
-            return MockResp()
-
+    monkeypatch.setattr("ch_client.query_live_window", lambda **kw: [])
     monkeypatch.setattr("pipeline.BQ_ARCHIVE_CANDIDATE_LIMIT", 2)
     monkeypatch.setattr("pipeline.CH_ARCHIVE_CANDIDATE_LIMIT", 0)
-    monkeypatch.setattr("pipeline.httpx.AsyncClient", lambda **kw: MockClient())
     candidates, _ = await fetch_candidates(
         Config(db_path=str(db_file), days=30),
         set(),
@@ -946,6 +1009,10 @@ async def test_fetch_candidates_caps_bq_archive_by_score(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_bq_archive_hydration_preserves_source(tmp_path, monkeypatch):
+    """Pre-existing bq_seed story's source label must remain 'bq_seed' after
+    a regen that surfaces it in the candidate pool. Archive seeds are now
+    read from the DB (no per-regen refetch); `top_comments` stays as stored.
+    """
     from database import Database
     from pipeline import Config, fetch_candidates
 
@@ -962,49 +1029,12 @@ async def test_bq_archive_hydration_preserves_source(tmp_path, monkeypatch):
             text_content="BQ needs comments.",
             source=BQ_ARCHIVE_SOURCE,
             comment_count=3,
-            comment_count_at_fetch=0,
-            top_comments="",
+            comment_count_at_fetch=3,
+            top_comments="Pre-existing hydrated comments.",
         )
     )
 
-    class MockResp:
-        status_code = 200
-
-        def __init__(self, payload):
-            self._payload = payload
-
-        def json(self):
-            return self._payload
-
-    class MockClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            pass
-
-        async def get(self, url, *a, **kw):
-            if "/api/v1/items/" in str(url):
-                return MockResp(
-                    {
-                        "type": "story",
-                        "title": "BQ needs comments",
-                        "url": "https://example.com/needs-comments",
-                        "points": 501,
-                        "num_comments": 3,
-                        "created_at_i": old_time,
-                        "children": [
-                            {
-                                "type": "comment",
-                                "text": "Substantive fetched comment text with enough context to extract meaningful signals from the discussion.",
-                                "children": [],
-                            }
-                        ],
-                    }
-                )
-            return MockResp({"hits": []})
-
-    monkeypatch.setattr("pipeline.httpx.AsyncClient", lambda **kw: MockClient())
+    monkeypatch.setattr("ch_client.query_live_window", lambda **kw: [])
     await fetch_candidates(
         Config(db_path=str(db_file), days=30),
         set(),
@@ -1014,7 +1044,7 @@ async def test_bq_archive_hydration_preserves_source(tmp_path, monkeypatch):
 
     updated = db.get_story(9201)
     assert updated.source == BQ_ARCHIVE_SOURCE
-    assert "Substantive fetched comment" in updated.top_comments
+    assert "Pre-existing hydrated comments" in updated.top_comments
 
 
 def test_fast_rerank_for_user_includes_old_bq_archive_story(db, monkeypatch):
@@ -1041,248 +1071,6 @@ def test_fast_rerank_for_user_includes_old_bq_archive_story(db, monkeypatch):
     ranked = fast_rerank_for_user(db, Config(days=30), object(), user.id)
 
     assert [item.story.id for item in ranked] == [9301]
-
-
-# Tests for auto-refetch of comment text on growth (fetch_candidates refetch block)
-def _seed_story(
-    db: Database,
-    sid: int,
-    *,
-    comment_count: int,
-    comment_count_at_fetch: int,
-    age_hours: int,
-    feedback_action: Action | None = None,
-    user_id: int | None = None,
-) -> Story:
-    """Insert a story in the live window with controlled engagement metrics."""
-    from time import time as _now
-
-    story_time = int(_now()) - (age_hours * 3600)
-    story = Story(
-        id=sid,
-        title=f"Test story {sid}",
-        url=f"https://example.com/{sid}",
-        score=100,
-        time=story_time,
-        text_content=f"initial text content for story {sid}",
-        source="hn",
-        comment_count=comment_count,
-        discussion_url=f"https://news.ycombinator.com/item?id={sid}",
-        comment_count_at_fetch=comment_count_at_fetch,
-    )
-    db.upsert_story(story)
-    if feedback_action is not None and user_id is not None:
-        db.upsert_feedback(user_id, sid, feedback_action)
-    return story
-
-
-def test_refetch_eligibility_triggers_at_30pct_growth():
-    """comment_count grown from 10 to 14 (+40%) at age 1h is eligible."""
-    from pipeline import _is_refetch_eligible
-    from time import time as _now
-
-    sid = 1001
-    now = int(_now())
-    eligible, new_count = _is_refetch_eligible(
-        sid=sid,
-        comment_count_at_fetch=10,
-        new_comment_count=14,
-        story_time=now - 3600,
-        feedback_ids=set(),
-        now_ts=now,
-    )
-    assert eligible is True
-    assert new_count == 14
-
-
-def test_refetch_eligibility_skipped_below_30pct_growth():
-    """10 to 12 (+20%) is below threshold; not eligible."""
-    from pipeline import _is_refetch_eligible
-    from time import time as _now
-
-    now = int(_now())
-    eligible, _ = _is_refetch_eligible(
-        sid=1002,
-        comment_count_at_fetch=10,
-        new_comment_count=12,
-        story_time=now - 3600,
-        feedback_ids=set(),
-        now_ts=now,
-    )
-    assert eligible is False
-
-
-def test_refetch_eligibility_skipped_after_24h_age():
-    """Eligible growth but age > 24h is skipped."""
-    from pipeline import _is_refetch_eligible
-    from time import time as _now
-
-    now = int(_now())
-    eligible, _ = _is_refetch_eligible(
-        sid=1003,
-        comment_count_at_fetch=10,
-        new_comment_count=14,
-        story_time=now - (25 * 3600),
-        feedback_ids=set(),
-        now_ts=now,
-    )
-    assert eligible is False
-
-
-def test_refetch_eligibility_skipped_for_feedback_story():
-    """Stories in feedback_ids are protected from refetch (training contract)."""
-    from pipeline import _is_refetch_eligible
-    from time import time as _now
-
-    now = int(_now())
-    eligible, _ = _is_refetch_eligible(
-        sid=1004,
-        comment_count_at_fetch=10,
-        new_comment_count=14,
-        story_time=now - 3600,
-        feedback_ids={1004},
-        now_ts=now,
-    )
-    assert eligible is False
-
-
-def test_refetch_eligibility_skipped_when_baseline_zero():
-    """comment_count_at_fetch == 0 means no baseline; cannot compute growth."""
-    from pipeline import _is_refetch_eligible
-    from time import time as _now
-
-    now = int(_now())
-    eligible, _ = _is_refetch_eligible(
-        sid=1005,
-        comment_count_at_fetch=0,
-        new_comment_count=14,
-        story_time=now - 3600,
-        feedback_ids=set(),
-        now_ts=now,
-    )
-    assert eligible is False
-
-
-def test_refetch_eligibility_skipped_when_count_did_not_grow():
-    """If new_comment_count <= comment_count_at_fetch, no refetch."""
-    from pipeline import _is_refetch_eligible
-    from time import time as _now
-
-    now = int(_now())
-    eligible, _ = _is_refetch_eligible(
-        sid=1006,
-        comment_count_at_fetch=10,
-        new_comment_count=10,
-        story_time=now - 3600,
-        feedback_ids=set(),
-        now_ts=now,
-    )
-    assert eligible is False
-
-
-def test_refetch_selects_top_n_by_growth(db, embedder):
-    """Only MAX_REFETCH_PER_REGEN stories are selected, prioritized by growth."""
-    from pipeline import _select_refetch_ids, MAX_REFETCH_PER_REGEN
-    from time import time as _now
-
-    now = int(_now())
-    candidates = []
-    fresh_metadata = {}
-    for i in range(MAX_REFETCH_PER_REGEN + 5):
-        sid = 2000 + i
-        candidates.append(
-            _seed_story(
-                db,
-                sid,
-                comment_count=100 + i,
-                comment_count_at_fetch=10,
-                age_hours=1,
-            )
-        )
-        fresh_metadata[sid] = {"score": 200, "comment_count": 100 + i}
-    selected = _select_refetch_ids(
-        candidates=candidates,
-        fresh_metadata=fresh_metadata,
-        feedback_ids=set(),
-        now_ts=now,
-    )
-    assert len(selected) == MAX_REFETCH_PER_REGEN
-    # Should be the highest-growth stories (those with highest new_count, since
-    # baseline is the same for all in this test). Growth ratio is monotonic in
-    # new_count when baseline is fixed.
-    selected_set = set(selected)
-    assert max(selected_set) > min(selected_set)  # at least some spread
-
-
-async def test_refetch_failure_keeps_stale_data(db, embedder):
-    """If refetch_story_text fails, the original story is preserved (no DB change)."""
-    import httpx
-    from pipeline import refetch_story_text
-
-    _seed_story(
-        db,
-        3001,
-        comment_count=14,
-        comment_count_at_fetch=10,
-        age_hours=1,
-    )
-    original = db.get_story(3001)
-    original_text = original.text_content
-
-    def _handler(request: httpx.Request) -> httpx.Response:
-        raise RuntimeError("simulated algolia outage")
-
-    transport = httpx.MockTransport(_handler)
-    async with httpx.AsyncClient(transport=transport) as client:
-        result = await refetch_story_text(client, db, embedder, 3001, current_count=14)
-
-    assert result is None
-    after = db.get_story(3001)
-    assert after.text_content == original_text
-    assert after.comment_count == original.comment_count
-    assert after.comment_count_at_fetch == original.comment_count_at_fetch
-
-
-async def test_refetch_updates_comment_count_at_fetch_on_success(db, embedder):
-    """Successful refetch sets comment_count_at_fetch == new comment_count."""
-    import httpx
-    from pipeline import refetch_story_text
-
-    sid = 3002
-    _seed_story(
-        db,
-        sid,
-        comment_count=14,
-        comment_count_at_fetch=10,
-        age_hours=1,
-    )
-
-    fake_item = {
-        "type": "story",
-        "title": "Updated Title",
-        "url": "https://example.com/3002",
-        "points": 200,
-        "num_comments": 16,
-        "created_at_i": int(__import__("time").time()),
-        "story_text": "Updated self text",
-        "children": [
-            {"text": f"comment {i}", "score": 10 - i, "children": []} for i in range(5)
-        ],
-    }
-
-    def _handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json=fake_item)
-
-    transport = httpx.MockTransport(_handler)
-    async with httpx.AsyncClient(transport=transport) as client:
-        result = await refetch_story_text(client, db, embedder, sid, current_count=16)
-
-    assert result is not None
-    assert result.comment_count == 16
-    assert result.comment_count_at_fetch == 16
-    persisted = db.get_story(sid)
-    assert persisted.comment_count_at_fetch == 16
-    assert persisted.text_content != ""  # recomposed
 
 
 async def test_run_pipeline_badge_assignment(tmp_path, monkeypatch):
@@ -2296,3 +2084,163 @@ def test_hot_badge_requires_minimum_score(db, embedder):
                 f"Story {r.story.id} (score={r.story.score}) has is_hot=True "
                 f"but score < HOT_MIN_SCORE={HOT_MIN_SCORE}"
             )
+
+
+# ---------- prewarm_top_stories tests ----------
+
+
+class _DummyEmbedder:
+    def encode(self, texts, batch_size=32):
+        import numpy as _np
+
+        arr = _np.zeros((len(texts), 384), dtype=_np.float32)
+        if len(texts):
+            arr[:, 0] = 1.0
+        return arr
+
+
+def test_prewarm_top_stories_empty_list_returns_zero() -> None:
+    db = Database(":memory:")
+    try:
+        result = pipeline.prewarm_top_stories([], db, None)
+        assert result == 0
+    finally:
+        db.close()
+
+
+def test_prewarm_top_stories_no_ch_call_when_all_zero_ids() -> None:
+    """All-zero or non-positive IDs should be filtered out before any CH call."""
+    db = Database(":memory:")
+    try:
+        called = {"n": 0}
+
+        def fail_ch(*a, **kw):
+            called["n"] += 1
+            raise AssertionError("CH should not be called")
+
+        from unittest.mock import patch
+
+        with patch("ch_client.query_stories_with_comments", fail_ch):
+            result = pipeline.prewarm_top_stories([0, -1, 0], db, None)
+        assert result == 0
+        assert called["n"] == 0
+    finally:
+        db.close()
+
+
+def test_prewarm_top_stories_ch_failure_returns_zero() -> None:
+    """If CH query fails, prewarm returns 0 and doesn't crash the caller."""
+    db = Database(":memory:")
+    try:
+        story = Story(
+            id=1, title="T", url="u", score=100, time=1, text_content="t", source="hn"
+        )
+        db.upsert_story(story)
+        from unittest.mock import patch
+
+        with patch(
+            "ch_client.query_stories_with_comments",
+            side_effect=RuntimeError("simulated CH outage"),
+        ):
+            result = pipeline.prewarm_top_stories([1], db, None)
+        assert result == 0
+    finally:
+        db.close()
+
+
+def test_prewarm_top_stories_updates_top_comments() -> None:
+    """Happy path: CH returns a story with comments, prewarm writes them back."""
+    db = Database(":memory:")
+    try:
+        story = Story(
+            id=42,
+            title="Hello",
+            url="u",
+            score=100,
+            time=1,
+            text_content="",
+            source="hn",
+        )
+        db.upsert_story(story)
+
+        ch_item = {
+            "id": 42,
+            "type": "story",
+            "title": "Hello",
+            "url": "u",
+            "story_text": "",
+            "text": "",
+            "num_comments": 5,
+            "created_at_i": 1,
+            "points": 100,
+            "children": [
+                {
+                    "id": 100,
+                    "type": "comment",
+                    "text": "Substantive comment with enough words and length to pass the minimum comment length filtering threshold.",
+                    "children": [],
+                },
+                {
+                    "id": 101,
+                    "type": "comment",
+                    "text": "Another comment that is also long enough to qualify and should be selected for the top comments list.",
+                    "children": [],
+                },
+            ],
+        }
+        from unittest.mock import patch
+
+        with patch(
+            "ch_client.query_stories_with_comments",
+            return_value={42: ch_item},
+        ):
+            result = pipeline.prewarm_top_stories([42], db, _DummyEmbedder())
+        assert result == 1
+        updated = db.get_story(42)
+        assert updated.top_comments != ""
+        assert updated.comment_count == 5
+        assert updated.comment_count_at_fetch == 5
+        assert "Substantive comment" in updated.text_content
+    finally:
+        db.close()
+
+
+def test_prewarm_top_stories_skips_stories_not_in_db() -> None:
+    """If CH returns a story that's not in the DB, skip it."""
+    db = Database(":memory:")
+    try:
+        from unittest.mock import patch
+
+        with patch(
+            "ch_client.query_stories_with_comments",
+            return_value={
+                99: {
+                    "id": 99,
+                    "type": "story",
+                    "title": "T",
+                    "url": None,
+                    "story_text": "",
+                    "text": "",
+                    "num_comments": 0,
+                    "created_at_i": 0,
+                    "points": 0,
+                    "children": [],
+                }
+            },
+        ):
+            result = pipeline.prewarm_top_stories([99], db, None)
+        assert result == 0
+    finally:
+        db.close()
+
+
+def test_prewarm_top_stories_empty_ch_response_returns_zero() -> None:
+    db = Database(":memory:")
+    try:
+        from unittest.mock import patch
+
+        with patch("ch_client.query_stories_with_comments", return_value={}):
+            result = pipeline.prewarm_top_stories([1], db, None)
+        assert result == 0
+    finally:
+        db.close()
