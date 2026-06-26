@@ -1,3 +1,4 @@
+import socket
 import threading
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -59,6 +60,7 @@ def test_env(tmp_path):
 
     yield port, db, regen_event, output_file, user
 
+    server.socket.shutdown(socket.SHUT_RDWR)
     server.shutdown()
     db.close()
 

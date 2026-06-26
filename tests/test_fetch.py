@@ -83,6 +83,7 @@ available to the TLDR generator after all chrome elements are removed.</p>
 
 async def _serve(handler, status=200, body=b"", delay=0.0):
     import asyncio
+    import socket
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     import threading
 
@@ -113,6 +114,7 @@ async def _serve(handler, status=200, body=b"", delay=0.0):
     try:
         result = await _fetch_article_body(url)
     finally:
+        server.socket.shutdown(socket.SHUT_RDWR)
         server.shutdown()
     return result, TestHandler._call_count
 
