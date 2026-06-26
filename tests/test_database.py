@@ -188,6 +188,71 @@ def test_upsert_story_preserves_longest_text_fields_and_recomposes(db):
     )
 
 
+def test_upsert_story_preserves_time_on_reinsert(db):
+    # GitHub Trending RSS feeds have no published_parsed; pipeline.py falls
+    # back to `now` and re-stamps the time on every fetch. upsert_story must
+    # preserve the original (first-encountered) time so the date shown in
+    # the dashboard is stable across re-fetches.
+    first = Story(
+        id=9001,
+        title="First seen",
+        url="https://github.com/example/repo",
+        score=0,
+        time=1_700_000_000,
+        text_content="First seen. initial content",
+        source="rss_mshibanami_github_io",
+    )
+    db.upsert_story(first)
+    assert db.get_story(9001).time == 1_700_000_000
+
+    # Simulate a later fetch with a fresh `now` time (the GitHub Trending case).
+    later = Story(
+        id=9001,
+        title="First seen",
+        url="https://github.com/example/repo",
+        score=0,
+        time=1_700_100_000,
+        text_content="First seen. updated content",
+        source="rss_mshibanami_github_io",
+    )
+    db.upsert_story(later)
+    fetched = db.get_story(9001)
+    assert fetched.time == 1_700_000_000, (
+        f"expected original time to be preserved, got {fetched.time}"
+    )
+    # Title still updates (the only other field we changed here).
+    assert fetched.text_content == "First seen. updated content"
+
+
+def test_upsert_story_uses_new_time_for_placeholder(db):
+    # When a story was inserted as a placeholder (time=0, e.g. _empty_story
+    # for an HN ID that 200'd with no payload), the next real upsert must
+    # populate the time. We can't preserve zero as "first seen".
+    placeholder = Story(
+        id=9002,
+        title="",
+        url=None,
+        score=0,
+        time=0,
+        text_content="",
+        source="hn",
+    )
+    db.upsert_story(placeholder)
+    assert db.get_story(9002).time == 0
+
+    real = Story(
+        id=9002,
+        title="Real title",
+        url="https://example.com/real",
+        score=5,
+        time=1_700_200_000,
+        text_content="Real title. some content",
+        source="hn",
+    )
+    db.upsert_story(real)
+    assert db.get_story(9002).time == 1_700_200_000
+
+
 def test_feedback_crud(db):
     # Create a test user
     user = db.create_user("test_token_1")

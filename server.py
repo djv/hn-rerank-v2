@@ -410,6 +410,11 @@ async def generate_detailed_tldr(
 Use ONLY information from the text below.
 Write under 120 words.
 Return only 3-5 Markdown bullets.
+Use a FLAT structure — no nested list levels. If a sub-topic has multiple bullets, use a `####` heading for the sub-topic followed by top-level bullets — NEVER use `- **Label**:` to introduce a group of content bullets. Example:
+#### Criticism of US control
+- Users compare this to...
+- **Precedent exists** in...
+(NOT `- **Criticism of US control**:` followed by siblings.)
 Every non-empty output line must start with "- ".
 Use **bold** key terms.
 Keep each bullet to one short sentence.
@@ -418,10 +423,15 @@ Title: {title}
 
 {article_section}
 """
-        discussion_prompt = f"""Summarize the Hacker News discussion for a knowledgeable reader.
+        discussion_prompt = f"""Summarize the discussion for a knowledgeable reader.
 Use ONLY information from the comments below.
 Write under 100 words.
 Return only 2-4 Markdown bullets.
+Use a FLAT structure — no nested list levels. If a sub-topic has multiple bullets, use a `####` heading for the sub-topic followed by top-level bullets — NEVER use `- **Label**:` to introduce a group of content bullets. Example:
+#### Criticism of US control
+- Users compare this to...
+- **Precedent exists** in...
+(NOT `- **Criticism of US control**:` followed by siblings.)
 Every non-empty output line must start with "- ".
 Use labels like **Consensus:**, **Disagreement:**, and **Caveat:** when present.
 Do not put multiple bullets on one line.
@@ -429,7 +439,7 @@ If the comments are thin or low-signal, say so explicitly.
 
 Story title: {title}
 
-HN comments:
+Comments:
 {comments_section}
 """
         try:
@@ -467,17 +477,15 @@ HN comments:
             f"\n\nArticle body:\n{article_body[:ARTICLE_BODY_CHAR_LIMIT]}"
         )
     if top_comments:
-        content_section += (
-            f"\n\nHN comments:\n{top_comments[:COMMENT_PROMPT_CHAR_LIMIT]}"
-        )
+        content_section += f"\n\nComments:\n{top_comments[:COMMENT_PROMPT_CHAR_LIMIT]}"
 
     prompt = f"""Summarize the article and the discussion for a knowledgeable reader.
 Use ONLY information from the text below.
 Write a highly concise, scannable summary (under 240 words) optimized for an 11-inch screen to conserve vertical space.
 Use Markdown formatting:
+- FLAT structure only — no nested list levels. If a bullet ends with `:`, treat the following sub-points as separate top-level bullets, not as indented children.
 - Headings (###) for main sections.
 - Short bullet points (-) with **bold** key terms.
-- No nested list levels (conserve horizontal margins).
 - Keep each bullet point to a single short sentence.
 - Do not put multiple bullets on one line.
 
@@ -632,10 +640,17 @@ class Handler(BaseHTTPRequestHandler):
                 return cached[0]
 
             from pipeline import fast_rerank_for_user, generate_dashboard_bytes
+            from pipeline import prewarm_top_stories
 
             render_start = time.perf_counter()
             final = fast_rerank_for_user(cls.db, cls.config, cls.embedder, user.id)
             rank_ms = (time.perf_counter() - render_start) * 1000
+
+            prewarm_start = time.perf_counter()
+            prewarm_ids = [r.story.id for r in final[:20] if r.story.id > 0]
+            prewarmed = prewarm_top_stories(prewarm_ids, cls.db, cls.embedder)
+            prewarm_ms = (time.perf_counter() - prewarm_start) * 1000
+
             html_start = time.perf_counter()
             html = generate_dashboard_bytes(
                 final, cls.config, cls.db, user.id, user.token
@@ -647,12 +662,14 @@ class Handler(BaseHTTPRequestHandler):
                 cls._dashboard_cache[cache_key] = (html, now, expected_version)
                 cache_written = True
             logging.info(
-                "dashboard_render user_id=%s version=%s result=rendered elapsed_ms=%.1f lock_wait_ms=%.1f rank_ms=%.1f html_ms=%.1f stories=%s cache_written=%s",
+                "dashboard_render user_id=%s version=%s result=rendered elapsed_ms=%.1f lock_wait_ms=%.1f rank_ms=%.1f prewarm_ms=%.1f prewarmed=%s html_ms=%.1f stories=%s cache_written=%s",
                 user.id,
                 expected_version,
                 (time.perf_counter() - request_start) * 1000,
                 lock_wait_ms,
                 rank_ms,
+                prewarm_ms,
+                prewarmed,
                 html_ms,
                 len(final),
                 cache_written,

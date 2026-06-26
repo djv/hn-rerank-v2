@@ -323,7 +323,11 @@ class Database:
                         title=excluded.title,
                         url=excluded.url,
                         score=excluded.score,
-                        time=excluded.time,
+                        time = CASE
+                            WHEN stories.time > 0 THEN stories.time
+                            WHEN excluded.time > 0 THEN excluded.time
+                            ELSE 0
+                        END,
                         text_content=excluded.text_content,
                         source=excluded.source,
                         comment_count=excluded.comment_count,

@@ -922,7 +922,7 @@ async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
         calls.append(prompt)
         if "Summarize the article" in prompt:
             return "- **Article** summary"
-        if "Summarize the Hacker News discussion" in prompt:
+        if "Summarize the discussion" in prompt:
             return "- **Discussion** summary"
         return "- **Fallback** summary"
 
@@ -938,14 +938,45 @@ async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
 
     assert len(calls) == 2
     assert "Article body" in calls[0]
-    assert "HN comments" in calls[1]
+    assert "Comments:" in calls[1]
     assert "Points:" not in calls[1]
-    assert "Comments:" not in calls[1]
     assert "Age hours:" not in calls[1]
     assert "### Article" in result
     assert "- **Article** summary" in result
     assert "### Discussion" in result
     assert "- **Discussion** summary" in result
+
+
+async def test_tldr_prompt_forbids_nested_lists(monkeypatch):
+    """Regression: TLDR prompt must explicitly forbid nested list levels so the LLM
+    doesn't produce indented sub-bullets that render at the same font size as parents."""
+    import server
+
+    calls = []
+
+    async def mock_call_llm_chat(*, api_key, base_url, model, prompt, max_tokens):
+        calls.append(prompt)
+        return "Mock summary"
+
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setattr(server, "_call_llm_chat", mock_call_llm_chat)
+
+    await server.generate_detailed_tldr(
+        "Nested test",
+        self_text="",
+        top_comments="Comment text",
+        article_body="Article body",
+    )
+
+    assert len(calls) == 2
+    for prompt in calls:
+        assert "no nested list levels" in prompt.lower(), (
+            f"prompt missing no-nested rule: {prompt[:200]}"
+        )
+        assert "flat structure" in prompt.lower(), (
+            f"prompt missing flat-structure rule: {prompt[:200]}"
+        )
+        assert "####" in prompt, f"prompt missing #### sub-topic rule: {prompt[:200]}"
 
 
 def test_keydown_guard_excludes_buttons_and_anchors():

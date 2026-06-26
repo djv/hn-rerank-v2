@@ -605,6 +605,38 @@
       line-height: 1.35;
     }
 
+    /* Label bullets (parent <li> with a nested <ul>): hide disc, flush-left bold */
+    .tldr-detail-content li:has(> ul) {
+      list-style: none;
+      font-weight: 700;
+      color: var(--pico-h1-color);
+      margin-top: 0.35rem;
+    }
+    .tldr-detail-content li:has(> ul) > ul {
+      margin-top: 0.15rem;
+      margin-bottom: 0.25rem;
+      padding-left: 1.1rem;
+      list-style-type: circle;
+      font-size: 0.93em;
+    }
+    .tldr-detail-content li:has(> ul) > ul li {
+      margin-bottom: 0.08rem;
+    }
+
+    /* Backup: when the LLM emits `- **Label**:` instead of `#### Label`,
+       style the label bullet itself (no DOM restructure). */
+    .tldr-detail-content li.tldr-label {
+      list-style: none;
+      font-weight: 700;
+      color: var(--pico-h1-color);
+      margin-top: 0.35rem;
+    }
+    .tldr-detail-content li.tldr-label::before {
+      content: "▸ ";
+      color: var(--pico-muted-color);
+      font-weight: 400;
+    }
+
     .tldr-detail-content pre {
       background: var(--pico-card-background-color);
       border: 1px solid var(--pico-muted-border-color);
@@ -1128,6 +1160,16 @@
       return snarkdown(normalizeTldrMarkdown(text));
     }
 
+    function styleTldrLabels(container) {
+      // Backup for the rare case the LLM still produces `- **Label**:` despite
+      // the prompt. Adds `.tldr-label` so CSS can style it differently.
+      container.querySelectorAll('li').forEach(li => {
+        if (li.querySelector(':scope > ul, :scope > ol')) return;
+        const text = li.cloneNode(true).textContent.trim();
+        if (text.endsWith(':')) li.classList.add('tldr-label');
+      });
+    }
+
     function updateRefreshBanner() {
       const shouldShow = pendingFeedbackRequests > 0 || isRefilling || refillQueued;
       refreshBanner.hidden = !shouldShow;
@@ -1546,6 +1588,7 @@
         if (resp.ok) {
           const data = await resp.json();
           contentDiv.innerHTML = parseSimpleMarkdown(data.tldr);
+          styleTldrLabels(contentDiv);
           contentDiv.style.display = 'block';
           if (btn) {
             btn.style.display = 'none';
