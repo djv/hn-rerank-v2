@@ -15,9 +15,14 @@
       --pico-primary-hover: #e05a00;
     }
     
+    html {
+      overflow: hidden;
+    }
+
     body {
       padding-top: 0.5rem;
       padding-bottom: 1rem;
+      overflow: hidden;
     }
 
     header {
@@ -68,23 +73,24 @@
     }
 
     .swipe-shell {
-      max-width: 1100px;
+      max-width: 1280px;
       margin: 0 auto;
     }
 
     .swipe-layout {
       display: flex;
-      align-items: stretch;
+      align-items: flex-start;
       gap: 1rem;
     }
 
     .swipe-side {
-      flex: 0 0 150px;
-      position: sticky;
-      top: 0.75rem;
-      align-self: flex-start;
+      flex: 0 0 170px;
       color: var(--pico-muted-color);
       font-size: 0.8rem;
+      max-height: calc(100vh - 1.5rem);
+      overflow-y: auto;
+      overflow-x: hidden;
+      padding-right: 0.5rem;
     }
 
     .queue-pill {
@@ -94,33 +100,113 @@
       border: 1px solid var(--pico-muted-border-color);
       border-radius: 4px;
       background: var(--pico-card-background-color);
-      color: var(--pico-color);
       line-height: 1.25;
+    }
+    .queue-pill--bar {
+      padding: 0.4rem 0.45rem;
+    }
+    .refresh-progress {
+      display: flex;
+      gap: 3px;
+      height: 8px;
+    }
+    .refresh-segment {
+      flex: 1;
+      border-radius: 2px;
+      background: rgba(0, 0, 0, 0.12);
+      border: 1px solid rgba(0, 0, 0, 0.08);
+      transition: background-color 200ms ease;
+    }
+    .refresh-segment.filled {
+      background: var(--pico-primary);
+      border-color: var(--pico-primary);
+    }
+    .refresh-segment.next-refresh {
+      animation: pulse-segment 600ms ease-in-out 2;
+    }
+    @keyframes pulse-segment {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.45; }
     }
 
     .mode-tabs {
       display: grid;
       grid-template-columns: 1fr;
       gap: 0.35rem;
-      margin-bottom: 0.75rem;
+      margin-bottom: 0.6rem;
     }
 
     .mode-tab {
       width: 100%;
       margin: 0;
-      padding: 0.32rem 0.45rem;
-      border-radius: 4px;
-      font-size: 0.8rem;
+      padding: 0.4rem 0.6rem;
+      border-radius: 6px;
+      font-size: 0.85rem;
+      font-weight: 500;
       line-height: 1.2;
-      text-align: left;
+      text-align: center;
+      background: var(--pico-card-background-color);
+      border: 1px solid var(--pico-muted-border-color);
+      color: var(--pico-muted-color);
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+
+    .mode-tab:hover {
+      background: color-mix(in srgb, var(--pico-primary) 8%, var(--pico-card-background-color));
+      border-color: var(--pico-primary);
+      color: var(--pico-color);
     }
 
     .mode-tab.active {
+      background: var(--pico-primary);
+      color: white;
       border-color: var(--pico-primary);
-      color: var(--pico-primary);
-      background: color-mix(in srgb, var(--pico-primary) 10%, transparent);
+      font-weight: 600;
     }
 
+    .source-tabs {
+      display: flex;
+      gap: 0;
+      margin-bottom: 0.6rem;
+    }
+    .source-tab {
+      flex: 1;
+      margin: 0;
+      padding: 0.35rem 0.3rem;
+      border-radius: 0;
+      font-size: 0.75rem;
+      font-weight: 500;
+      line-height: 1.2;
+      text-align: center;
+      white-space: nowrap;
+      background: var(--pico-card-background-color);
+      border: 1px solid var(--pico-muted-border-color);
+      border-right: none;
+      color: var(--pico-muted-color);
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .source-tab:first-child {
+      border-top-left-radius: 6px;
+      border-bottom-left-radius: 6px;
+    }
+    .source-tab:last-child {
+      border-top-right-radius: 6px;
+      border-bottom-right-radius: 6px;
+      border-right: 1px solid var(--pico-muted-border-color);
+    }
+    .source-tab:hover {
+      background: color-mix(in srgb, #6c757d 12%, var(--pico-card-background-color));
+      border-color: #6c757d;
+      color: var(--pico-color);
+    }
+    .source-tab.active {
+      background: #6c757d;
+      color: white;
+      border-color: #6c757d;
+      font-weight: 600;
+    }
     .swipe-keys {
       display: grid;
       gap: 0.35rem;
@@ -161,6 +247,44 @@
       outline-offset: 2px;
     }
 
+    .first-time-tip-overlay {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+      background: rgba(0,0,0,0.25);
+    }
+    .first-time-tip-overlay[hidden] {
+      display: none !important;
+    }
+    .first-time-tip-inner {
+      pointer-events: auto;
+      max-width: 32rem;
+      padding: 1rem 1.25rem;
+      font-size: 0.95rem;
+      line-height: 1.5;
+      background: var(--pico-card-background-color);
+      border: 1px solid var(--pico-primary);
+      border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.2);
+    }
+    .first-time-tip-inner p {
+      margin: 0 0 0.35rem 0;
+    }
+    .first-time-tip-inner kbd {
+      font-family: inherit;
+      font-weight: 600;
+      font-size: 0.95rem;
+      padding: 0.1rem 0.3rem;
+    }
+    .first-time-tip-dismiss {
+      font-size: 0.85rem;
+      padding: 0.2rem 0.6rem;
+      cursor: pointer;
+    }
+
     .key-hint {
       display: inline-flex;
       width: 1.6rem;
@@ -178,13 +302,17 @@
 
     #stories {
       flex: 1 1 902px;
-      min-height: calc(100vh - 1rem);
     }
 
     .story-card {
       display: none;
+      margin-right: auto;
+      margin-left: auto;
       margin-bottom: 0.4rem;
-      padding: 0.8rem 0.95rem 0.9rem 0.95rem;
+      width: fit-content;
+      min-width: min(60ch, 100%);
+      max-width: 902px;
+      padding: 0.55rem 0.7rem 0.65rem 0.7rem;
       border-radius: 6px;
       border: 1px solid var(--pico-card-border-color);
       border-left: 7px solid transparent;
@@ -198,8 +326,11 @@
     .story-card.active {
       display: block;
       cursor: default;
-      min-height: calc(100vh - 1rem);
+      max-height: calc(100vh - 5rem);     /* fallback for older browsers */
+      max-height: calc(100dvh - 5rem);    /* preferred */
+      min-height: 18rem;
       overflow: auto;
+      padding-bottom: 4rem;
     }
 
     .story-card.fade-out {
@@ -219,7 +350,8 @@
       gap: 0.3rem;
       font-size: 0.75rem;
       color: var(--pico-muted-color);
-      margin-bottom: 0.1rem;
+      margin-bottom: 0.05rem;
+      overflow-wrap: anywhere;
     }
 
     .source-badge {
@@ -304,6 +436,8 @@
     }
 
     .story-card.enriched {
+      width: 100%;
+      max-width: none;
       border-top-color: color-mix(in srgb, var(--pico-card-border-color) 90%, hsl(120, 50%, 50%) 10%);
       border-right-color: color-mix(in srgb, var(--pico-card-border-color) 90%, hsl(120, 50%, 50%) 10%);
       border-bottom-color: color-mix(in srgb, var(--pico-card-border-color) 90%, hsl(120, 50%, 50%) 10%);
@@ -320,6 +454,7 @@
       color: var(--pico-color);
       text-decoration: none;
       font-weight: 600;
+      overflow-wrap: anywhere;
     }
 
     .story-title a:hover {
@@ -329,6 +464,7 @@
 
     .tldr-detail-content {
       cursor: default;
+      overflow-wrap: anywhere;
     }
 
     .story-footer {
@@ -336,7 +472,7 @@
       justify-content: flex-end;
       align-items: center;
       gap: 0.5rem;
-      margin-top: 0.45rem;
+      margin-top: 0.25rem;
     }
 
     .match-reason {
@@ -345,30 +481,83 @@
       color: var(--pico-muted-color);
       margin-bottom: 0;
       margin-top: 0.25rem;
+      overflow-wrap: anywhere;
     }
 
     .feedback-group {
       display: inline-flex;
       gap: 0.2rem;
-      margin-left: auto;
+    }
+
+    .vote-bar {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      z-index: 100;
+      background: color-mix(in srgb, var(--pico-card-background-color) 92%, transparent);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      border-top: 1px solid var(--pico-muted-border-color);
+      padding: 0.5rem 0.8rem;
+      padding-bottom: calc(0.5rem + env(safe-area-inset-bottom, 0));
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.6rem;
+      max-width: 1280px;
+      margin: 0 auto;
+    }
+    .vote-bar[hidden] { display: none; }
+
+    .vote-bar .refresh-wrapper {
+      display: flex;
+      flex-direction: column;
+      gap: 0.3rem;
+      align-items: flex-start;
+    }
+
+    .vote-bar .refresh-label {
+      font-size: 0.75rem;
+      color: var(--pico-muted-color);
+      white-space: nowrap;
+      font-weight: 500;
+    }
+
+    .vote-bar .refresh-progress {
+      display: flex;
+      gap: 3px;
+      width: 120px;
+      height: 6px;
     }
 
     .feedback-btn {
-      padding: 0.15rem 0.5rem;
-      font-size: 0.8rem;
-      border-radius: 4px;
-      background: transparent;
+      padding: 0.5rem 0.9rem;
+      font-size: 0.95rem;
+      font-weight: 500;
+      border-radius: 6px;
+      background: color-mix(in srgb, var(--pico-muted-border-color) 50%, var(--pico-card-background-color));
       border: 1px solid var(--pico-muted-border-color);
-      color: var(--pico-muted-color);
+      color: var(--pico-h1-color);
       cursor: pointer;
       line-height: 1.2;
-      transition: all 0.2s;
       margin-bottom: 0;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+      transition: all 0.2s;
+      min-width: 2.75rem;
     }
 
     .feedback-btn:hover {
-      background: #2b3035;
-      color: white;
+      background: color-mix(in srgb, var(--pico-primary) 10%, var(--pico-card-background-color));
+      border-color: var(--pico-primary);
+      color: var(--pico-primary);
+      transform: translateY(-1px);
+      box-shadow: 0 2px 4px rgba(0, 0, 0, 0.12);
+    }
+
+    .feedback-btn:active {
+      transform: translateY(0);
+      box-shadow: 0 1px 1px rgba(0, 0, 0, 0.1);
     }
 
     .tldr-detail-btn {
@@ -393,8 +582,8 @@
     .tldr-detail-content h2,
     .tldr-detail-content h3,
     .tldr-detail-content h4 {
-      margin-top: 0.6rem;
-      margin-bottom: 0.3rem;
+      margin-top: 0.4rem;
+      margin-bottom: 0.2rem;
       font-weight: 700;
       color: var(--pico-color);
     }
@@ -405,15 +594,15 @@
 
     .tldr-detail-content ul,
     .tldr-detail-content ol {
-      margin-top: 0.2rem;
-      margin-bottom: 0.4rem;
+      margin-top: 0.1rem;
+      margin-bottom: 0.2rem;
       padding-left: 1.25rem;
     }
     .tldr-detail-content ul { list-style-type: disc; }
     .tldr-detail-content ol { list-style-type: decimal; }
     .tldr-detail-content li {
-      margin-bottom: 0.15rem;
-      line-height: 1.4;
+      margin-bottom: 0.1rem;
+      line-height: 1.35;
     }
 
     .tldr-detail-content pre {
@@ -423,7 +612,7 @@
       padding: 0.4rem 0.6rem;
       overflow-x: auto;
       font-size: 0.8rem;
-      margin: 0.3rem 0;
+      margin: 0.2rem 0;
     }
     .tldr-detail-content code {
       font-size: 0.85em;
@@ -438,7 +627,7 @@
 
     .tldr-detail-content blockquote {
       border-left: 3px solid var(--pico-primary);
-      margin: 0.3rem 0;
+      margin: 0.2rem 0;
       padding: 0.2rem 0.6rem;
       color: var(--pico-muted-color);
       font-style: italic;
@@ -447,12 +636,12 @@
     .tldr-detail-content hr {
       border: none;
       border-top: 1px solid var(--pico-muted-border-color);
-      margin: 0.5rem 0;
+      margin: 0.3rem 0;
     }
 
     .tldr-detail-content p {
-      margin: 0.2rem 0;
-      line-height: 1.4;
+      margin: 0.1rem 0;
+      line-height: 1.35;
     }
 
     .tldr-detail-content a {
@@ -519,34 +708,63 @@
       .swipe-side {
         position: static;
         order: -1;
+        flex: 0 0 auto;
+        width: 100%;
+        max-width: 100%;
+        max-height: none;
         display: flex;
-        justify-content: space-between;
-        gap: 0.75rem;
-      }
-
-      .queue-pill {
-        margin-bottom: 0;
+        flex-direction: column;
+        gap: 0.5rem;
+        padding-bottom: 0.4rem;
+        border-bottom: 1px solid var(--pico-muted-border-color);
+        margin-bottom: 0.4rem;
       }
 
       .mode-tabs {
-        grid-template-columns: repeat(4, auto);
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 0.3rem;
         margin-bottom: 0;
       }
 
-      .swipe-keys {
-        grid-template-columns: repeat(4, auto);
+      .source-tabs {
+        grid-template-columns: repeat(3, 1fr);
+        margin-bottom: 0;
+      }
+
+      .swipe-keys { display: none; }
+
+      .feedback-btn {
+        padding: 0.6rem 0.9rem;
+        font-size: 1.05rem;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
+      }
+      .feedback-group {
+        gap: 0.4rem;
+      }
+
+      .swipe-shell {
+        height: calc(100vh - 1.5rem);    /* fallback for older browsers */
+        height: calc(100dvh - 1.5rem);   /* preferred: accounts for mobile URL bar */
+        display: flex;
+        flex-direction: column;
+      }
+      .swipe-layout {
+        flex: 1;
+        min-height: 0;
+      }
+      #stories {
+        flex: 1;
+        min-height: 0;
+      }
+      .story-card.active {
+        max-height: 100%;
       }
 
     }
 
-    footer {
-      text-align: center;
-      margin-top: 3rem;
-      font-size: 0.8rem;
-      color: var(--pico-muted-color);
-      border-top: 1px solid var(--pico-muted-border-color);
-      padding-top: 1.5rem;
-    }
+
   </style>
 </head>
 <body>
@@ -563,10 +781,13 @@
       <article class="story-card{% if item.story.text_content | length >= 1000 %} enriched{% endif %}"
                data-story-id="{{ item.story.id }}" 
                data-score="{{ item.score }}"
+               data-voted="{{ active_fb or '' }}"
                data-time="{{ item.story.time }}"
                data-source="{{ item.story.source }}"
                data-mode-popular="{{ '1' if item.is_hot or item.is_high_engagement or item.is_discussion_rich else '0' }}"
-               data-mode-explore="{{ '1' if item.is_uncertain or item.is_similar or item.is_novel else '0' }}">
+               data-mode-explore="{{ '1' if item.is_uncertain or item.is_similar or item.is_novel else '0' }}"
+               data-article-url="{{ item.story.url or '' }}"
+               data-comments-url="{{ item.story.discussion_url or '' }}">
         <div class="story-header">
           {% if item.is_uncertain %}
           <span class="uncertain-badge" title="Model is highly uncertain about this story (high entropy distribution)">🤔 Unsure</span>
@@ -581,7 +802,7 @@
           <span class="high-engagement-badge" title="Top 5% by HN points">🏆 Top</span>
           {% endif %}
           {% if item.is_hot %}
-          <span class="hot-badge" title="Top 2% by engagement velocity (points/hour)">🔥 Hot</span>
+          <span class="hot-badge" title="Top 2% by engagement velocity (points/hour) and score ≥ 20">🔥 Hot</span>
           {% endif %}
           {% if item.is_similar %}
           <span class="similar-badge" title="Highly similar to your upvoted stories">🎯 Similar</span>
@@ -603,11 +824,6 @@
           </a>
           {% endif %}
 
-          <div class="feedback-group">
-            <button class="feedback-btn {% if active_fb == 'up' %}active{% endif %}" data-fb="up" title="Upvote">▲</button>
-            <button class="feedback-btn {% if active_fb == 'neutral' %}active{% endif %}" data-fb="neutral" title="Neutral">✓</button>
-            <button class="feedback-btn {% if active_fb == 'down' %}active{% endif %}" data-fb="down" title="Downvote">▼</button>
-          </div>
         </div>
 
         <h2 class="story-title">
@@ -628,26 +844,53 @@
       </div>
 
       <aside class="swipe-side" aria-label="Queue and keyboard controls">
-        <span id="queue-status" class="queue-pill">Loading queue...</span>
         <div class="mode-tabs" aria-label="Story mode">
           <button type="button" class="mode-tab active" data-mode="default">Default</button>
           <button type="button" class="mode-tab" data-mode="popular">Popular</button>
           <button type="button" class="mode-tab" data-mode="explore">Explore</button>
           <button type="button" class="mode-tab" data-mode="date">Date</button>
         </div>
+        <div class="source-tabs" aria-label="Source filter">
+          <button type="button" class="source-tab active" data-source="mixed">Mixed</button>
+          <button type="button" class="source-tab" data-source="hn">HN</button>
+          <button type="button" class="source-tab" data-source="non-hn">Non-HN</button>
+        </div>
         <div class="swipe-keys">
-          <span class="key-row" tabindex="0" data-key-action="up"><span class="key-hint">↑</span> up</span>
-          <span class="key-row" tabindex="0" data-key-action="neutral"><span class="key-hint">→</span> neutral</span>
-          <span class="key-row" tabindex="0" data-key-action="down"><span class="key-hint">↓</span> down</span>
-          <span class="key-row" tabindex="0" data-key-action="undo"><span class="key-hint">u</span> undo</span>
+          <span class="key-row" tabindex="0" data-key-action="up"><span class="key-hint">k</span> upvote</span>
+          <span class="key-row" tabindex="0" data-key-action="neutral"><span class="key-hint">l</span> skip (neutral)</span>
+          <span class="key-row" tabindex="0" data-key-action="down"><span class="key-hint">j</span> downvote</span>
+          <span class="key-row" tabindex="0" data-key-action="open-article"><span class="key-hint">o</span> open article</span>
+          <span class="key-row" tabindex="0" data-key-action="open-comments"><span class="key-hint">c</span> open comments</span>
         </div>
       </aside>
     </div>
 
-    <footer>
-      HN Rerank Rewrite · Local-first semantic filtering
-    </footer>
   </main>
+
+  <div class="vote-bar" hidden>
+    <div class="refresh-wrapper">
+      <span class="refresh-label">Votes until refresh</span>
+      <div class="refresh-progress" aria-label="Ranking refresh progress" role="progressbar" aria-valuemin="0" aria-valuemax="5" aria-valuenow="0">
+        <span class="refresh-segment" data-segment="1"></span>
+        <span class="refresh-segment" data-segment="2"></span>
+        <span class="refresh-segment" data-segment="3"></span>
+        <span class="refresh-segment" data-segment="4"></span>
+        <span class="refresh-segment" data-segment="5"></span>
+      </div>
+    </div>
+    <div class="feedback-group">
+      <button class="feedback-btn" data-fb="up" title="Upvote">▲</button>
+      <button class="feedback-btn" data-fb="neutral" title="Skip (neutral)">✓</button>
+      <button class="feedback-btn" data-fb="down" title="Downvote">▼</button>
+    </div>
+  </div>
+
+    <div id="first-time-tip" class="first-time-tip-overlay" hidden aria-label="Keyboard shortcuts">
+      <div class="first-time-tip-inner">
+        <p><strong>Tip:</strong> arrows scroll inside the card. Press <kbd>k</kbd> to upvote, <kbd>j</kbd> to downvote, <kbd>l</kbd> to skip (neutral), <kbd>u</kbd> to undo. Press <kbd>o</kbd> to open the article, <kbd>c</kbd> to open the comments.</p>
+        <button type="button" class="first-time-tip-dismiss" data-dismiss-tip>Got it</button>
+      </div>
+    </div>
 
   <script>
     // Restore temporary client feedback state before regeneration updates the static file.
@@ -662,15 +905,12 @@
       
       const storedAction = localStorage.getItem(fbKey(storyId));
       if (storedAction) {
-        const htmlActiveBtn = card.querySelector('.feedback-btn.active');
-        const htmlActiveAction = htmlActiveBtn ? htmlActiveBtn.dataset.fb : null;
-        
-        if (htmlActiveAction === storedAction) {
+        const htmlVotedAction = card.dataset.voted;
+
+        if (htmlVotedAction === storedAction) {
           localStorage.removeItem(fbKey(storyId));
         } else {
-          card.querySelectorAll('[data-fb]').forEach(btn => {
-            btn.classList.toggle('active', btn.dataset.fb === storedAction);
-          });
+          card.dataset.voted = storedAction;
         }
       }
     });
@@ -689,17 +929,19 @@
 
     // Swipe deck state
     const storiesContainer = document.getElementById('stories');
-    const queueStatus = document.getElementById('queue-status');
     const refreshBanner = document.getElementById('refresh-banner');
     const refreshBannerText = document.getElementById('refresh-banner-text');
     const refreshNowBtn = document.getElementById('refresh-now-btn');
     const modeTabs = Array.from(document.querySelectorAll('[data-mode]'));
+    const sourceTabs = Array.from(document.querySelectorAll('[data-source]'));
+    const voteBar = document.querySelector('.vote-bar');
     let pendingFeedbackRequests = 0;
     let refillQueued = false;
     let isRefilling = false;
     let activeCard = null;
     let lastVote = null;
     let currentMode = 'default';
+    let currentSource = 'mixed';
     let votesSinceRankingRefresh = 0;
     let preloadedRefillDoc = null;
     let isPreloadingRefill = false;
@@ -715,7 +957,19 @@
       return Array.from(storiesContainer.querySelectorAll('.story-card'));
     }
 
+    function matchesCurrentSource(card) {
+      if (currentSource === 'hn') {
+        const s = card.dataset.source;
+        return s === 'hn' || s === 'bq_seed';
+      }
+      if (currentSource === 'non-hn') {
+        return (card.dataset.source || '').startsWith('rss_');
+      }
+      return true;
+    }
+
     function matchesCurrentMode(card) {
+      if (!matchesCurrentSource(card)) return false;
       if (currentMode === 'popular') {
         return card.dataset.modePopular === '1';
       }
@@ -768,15 +1022,20 @@
       }
     }
 
+    function updateRefreshProgress() {
+      const filledCount = votesSinceRankingRefresh;
+      const segments = document.querySelectorAll('.vote-bar .refresh-segment');
+      segments.forEach((seg, idx) => {
+        const isFilled = idx < filledCount;
+        seg.classList.toggle('filled', isFilled);
+        seg.classList.toggle('next-refresh', filledCount === VOTES_PER_RANKING_REFRESH && isFilled);
+      });
+      const progressBar = document.querySelector('.vote-bar .refresh-progress');
+      progressBar?.setAttribute('aria-valuenow', String(Math.min(filledCount, VOTES_PER_RANKING_REFRESH)));
+    }
+
     function updateQueueStatus() {
-      const remaining = queuedCards().length;
-      if (remaining === 0) {
-        queueStatus.textContent = isRefilling ? 'Finding more stories...' : `No ${currentMode} stories`;
-      } else {
-        const suffix = isRefilling ? ' · refilling' : '';
-        const modeLabel = currentMode === 'default' ? '' : ` ${currentMode}`;
-        queueStatus.textContent = `${remaining}${modeLabel} queued${suffix}`;
-      }
+      updateRefreshProgress();
     }
 
     function setActiveCard(card) {
@@ -784,11 +1043,22 @@
       activeCard = card || null;
       if (activeCard) {
         openTldrDetail(activeCard);
+        voteBar.hidden = false;
+        updateVoteBar();
+      } else {
+        document.querySelectorAll('[data-fb]').forEach(btn => btn.classList.remove('active'));
+        voteBar.hidden = true;
       }
       prefetchUpcomingTldrs();
       scheduleIdleModePrefetch();
       updateQueueStatus();
       maybeRefillQueue();
+    }
+
+    function updateVoteBar() {
+      document.querySelectorAll('[data-fb]').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.fb === activeCard?.dataset.voted);
+      });
     }
 
     function showNextCard() {
@@ -805,6 +1075,18 @@
       }
       orderForCurrentMode();
       showNextCard();
+    }
+
+    function setSource(source) {
+      currentSource = source;
+      sourceTabs.forEach(tab => {
+        tab.classList.toggle('active', tab.dataset.source === currentSource);
+      });
+      if (activeCard && !matchesCurrentMode(activeCard)) {
+        activeCard.classList.remove('active');
+      }
+      showNextCard();
+      updateQueueStatus();
     }
 
     applyGradient();
@@ -903,6 +1185,9 @@
     modeTabs.forEach(tab => {
       tab.addEventListener('click', () => setMode(tab.dataset.mode));
     });
+    sourceTabs.forEach(tab => {
+      tab.addEventListener('click', () => setSource(tab.dataset.source));
+    });
     document.querySelectorAll('[data-key-action]').forEach(btn => {
       const runKeyAction = () => {
         const action = btn.dataset.keyAction;
@@ -995,9 +1280,8 @@
     function bindEvents() {
       // 1. Feedback buttons
       document.querySelectorAll('[data-fb]').forEach(btn => {
-        btn.onclick = (e) => {
-          e.stopPropagation();
-          submitVote(btn.dataset.fb, btn.closest('.story-card'));
+        btn.onclick = () => {
+          submitVote(btn.dataset.fb);
         };
       });
 
@@ -1005,7 +1289,7 @@
       document.querySelectorAll('.story-card').forEach(card => {
         card.onclick = async (e) => {
           if (
-            e.target.closest('a, button, input, textarea, select, summary, [role="button"], .feedback-group, .tldr-detail-content') ||
+            e.target.closest('a, button, input, textarea, select, summary, [role="button"], .tldr-detail-content') ||
             window.getSelection()?.toString()
           ) {
             return;
@@ -1021,6 +1305,8 @@
         };
       });
     }
+
+    
 
     function maybeRefillQueue() {
       if (queuedCards().length > LOW_WATERMARK || isRefilling || refillQueued) {
@@ -1104,13 +1390,15 @@
       const storyId = Number(card.dataset.storyId);
       const applyExistingRefillAfterVote = refillQueued && pendingFeedbackRequests === 0;
       votesSinceRankingRefresh += 1;
+      updateRefreshProgress();
       const shouldRefreshRanking = votesSinceRankingRefresh >= VOTES_PER_RANKING_REFRESH;
       if (shouldRefreshRanking) {
         votesSinceRankingRefresh = 0;
+        updateRefreshProgress();
       }
       card.dataset.voted = action;
       localStorage.setItem(fbKey(storyId), action);
-      card.querySelectorAll('[data-fb]').forEach(btn => {
+      document.querySelectorAll('[data-fb]').forEach(btn => {
         btn.classList.toggle('active', btn.dataset.fb === action);
       });
 
@@ -1176,7 +1464,7 @@
       delete card.dataset.voted;
       card.classList.remove('fade-out');
       localStorage.removeItem(fbKey(storyId));
-      card.querySelectorAll('[data-fb]').forEach(btn => {
+      document.querySelectorAll('[data-fb]').forEach(btn => {
         btn.classList.remove('active');
       });
       if (!card.isConnected) {
@@ -1203,6 +1491,16 @@
         pendingFeedbackRequests = Math.max(0, pendingFeedbackRequests - 1);
         updateRefreshBanner();
       });
+    }
+
+    function openStoryUrl(kind) {
+      const card = document.querySelector('.story-card.active, .story-card[data-active]')
+                || document.querySelector('.story-card');
+      if (!card) return;
+      const attr = kind === 'article' ? 'articleUrl' : 'commentsUrl';
+      const url = card.dataset[attr];
+      if (!url) return;
+      window.open(url, '_blank', 'noopener,noreferrer');
     }
 
     async function openTldrDetail(card) {
@@ -1274,24 +1572,56 @@
     document.addEventListener('keydown', (e) => {
       if (
         e.repeat ||
+        e.ctrlKey || e.metaKey || e.altKey ||
         e.target.closest?.('input, textarea, select, [contenteditable="true"]')
       ) {
         return;
       }
-      if (e.key === 'ArrowUp') {
+      const key = e.key.toLowerCase();
+      if (key === 'arrowup' || key === 'arrowdown') {
+        e.preventDefault();
+        const card = document.querySelector('.story-card.active');
+        if (card) {
+          const scrollAmount = card.clientHeight * 0.8;
+          card.scrollBy({ top: key === 'arrowdown' ? scrollAmount : -scrollAmount });
+        }
+      } else if (key === 'k') {
         e.preventDefault();
         submitVote('up');
-      } else if (e.key === 'ArrowDown') {
+      } else if (key === 'j') {
         e.preventDefault();
         submitVote('down');
-      } else if (e.key === 'ArrowRight') {
+      } else if (key === 'l') {
         e.preventDefault();
         submitVote('neutral');
-      } else if (e.key.toLowerCase() === 'u') {
+      } else if (key === 'o') {
+        e.preventDefault();
+        openStoryUrl('article');
+      } else if (key === 'c') {
+        e.preventDefault();
+        openStoryUrl('comments');
+      } else if (key === 'u') {
         e.preventDefault();
         undoLastVote();
       }
     });
+
+    // First-time tip dismissal
+    (function() {
+      const tip = document.getElementById('first-time-tip');
+      const flag = 'hn_first_tip_seen_v2';
+      if (tip && !localStorage.getItem(flag)) {
+        tip.hidden = false;
+        tip.querySelector('[data-dismiss-tip]')?.focus();
+        const dismiss = () => {
+          tip.hidden = true;
+          localStorage.setItem(flag, '1');
+        };
+        tip.querySelector('[data-dismiss-tip]')?.addEventListener('click', dismiss);
+        tip.addEventListener('click', (e) => { if (e.target === tip) dismiss(); });
+        tip.addEventListener('keydown', (e) => { if (e.key === 'Escape') dismiss(); });
+      }
+    })();
 
     // Run initial event binding
     bindEvents();

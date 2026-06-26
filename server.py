@@ -86,6 +86,13 @@ class RedditRssContext:
 
 
 @dataclass(frozen=True)
+class LessWrongContext:
+    self_text: str = ""
+    top_comments: str = ""
+    comment_count: int = 0
+
+
+@dataclass(frozen=True)
 class ArticleFetchResult:
     body: str | None = None
     status: int | None = None
@@ -186,6 +193,26 @@ def _is_low_signal_reddit_comment(author: str, text: str) -> bool:
     return len(text) < 30
 
 
+LESSWRONG_COMMENT_LIMIT = 20
+
+
+def _extract_lesswrong_post_id(url: str | None) -> str | None:
+    if not url:
+        return None
+    parts = urlparse(url).path.strip("/").split("/")
+    if len(parts) >= 2 and parts[0] == "posts":
+        return parts[1]
+    return None
+
+
+def _clean_lesswrong_html(raw_html: str | None) -> str:
+    if not raw_html:
+        return ""
+    soup = BeautifulSoup(html.unescape(raw_html), "html.parser")
+    text = soup.get_text(separator=" ", strip=True)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 async def _fetch_reddit_rss_context(url: str | None) -> RedditRssContext | None:
     rss_url = _reddit_post_rss_url(url)
     if not rss_url:
@@ -193,7 +220,9 @@ async def _fetch_reddit_rss_context(url: str | None) -> RedditRssContext | None:
 
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
-            resp = await client.get(rss_url, headers={"User-Agent": REDDIT_RSS_USER_AGENT})
+            resp = await client.get(
+                rss_url, headers={"User-Agent": REDDIT_RSS_USER_AGENT}
+            )
         if resp.status_code != 200:
             return None
     except Exception:
@@ -240,6 +269,59 @@ async def _fetch_reddit_rss_context(url: str | None) -> RedditRssContext | None:
     )
 
 
+async def _fetch_lesswrong_context(post_id: str) -> LessWrongContext | None:
+    query = (
+        '{ post(input: { selector: { _id: "%s" } }) { result { _id '
+        "commentCount contents { html } } } "
+        'comments(input: { terms: { view: "postCommentsTop", '
+        'postId: "%s" } }) { results { _id author baseScore '
+        "htmlBody postedAt } } }"
+    ) % (post_id, post_id)
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                "https://www.lesswrong.com/graphql",
+                json={"query": query},
+            )
+        if resp.status_code != 200:
+            return None
+        payload = resp.json()
+    except Exception as e:
+        logging.error(f"LessWrong fetch failed: {e}")
+        return None
+    if not payload.get("data"):
+        return None
+    data = payload["data"]
+    post = (data.get("post") or {}).get("result") or {}
+    comments_data = data.get("comments") or {}
+    if not post:
+        return None
+
+    self_text = _clean_lesswrong_html((post.get("contents") or {}).get("html", ""))[
+        :SELF_TEXT_PROMPT_CHAR_LIMIT
+    ]
+
+    comments: list[str] = []
+    total_len = 0
+    for c in comments_data.get("results") or []:
+        text = _clean_lesswrong_html(c.get("htmlBody") or "")
+        author = (c.get("author") or "").strip()
+        label = f"/u/{author}" if author else ""
+        line = f"{label}: {text}" if label else text
+        remaining = COMMENT_PROMPT_CHAR_LIMIT - total_len
+        if remaining <= 0 or len(comments) >= LESSWRONG_COMMENT_LIMIT:
+            break
+        line = line[:remaining]
+        comments.append(line)
+        total_len += len(line) + 1
+
+    return LessWrongContext(
+        self_text=self_text,
+        top_comments=" ".join(comments)[:COMMENT_PROMPT_CHAR_LIMIT],
+        comment_count=len(comments),
+    )
+
+
 async def _call_llm_chat(
     *,
     api_key: str,
@@ -271,7 +353,9 @@ async def _call_llm_chat(
 
 def _llm_cache_identity() -> str:
     provider = os.environ.get("LLM_PROVIDER", "mistral").lower()
-    model = "mistral-small-latest" if provider == "mistral" else "llama-3.3-70b-versatile"
+    model = (
+        "mistral-small-latest" if provider == "mistral" else "llama-3.3-70b-versatile"
+    )
     return f"{provider}:{model}:{TLDR_PROMPT_VERSION}"
 
 
@@ -316,7 +400,9 @@ async def generate_detailed_tldr(
     if self_text:
         article_section += f"Author's text:\n{self_text[:SELF_TEXT_PROMPT_CHAR_LIMIT]}"
     if article_body:
-        article_section += f"\n\nArticle body:\n{article_body[:ARTICLE_BODY_CHAR_LIMIT]}"
+        article_section += (
+            f"\n\nArticle body:\n{article_body[:ARTICLE_BODY_CHAR_LIMIT]}"
+        )
     comments_section = top_comments[:COMMENT_PROMPT_CHAR_LIMIT]
 
     if article_section and comments_section:
@@ -365,21 +451,29 @@ HN comments:
             )
             article_result = _normalize_tldr_markdown(article_result)
             discussion_result = _normalize_tldr_markdown(discussion_result)
-            return f"### Article\n{article_result}\n\n### Discussion\n{discussion_result}"
+            return (
+                f"### Article\n{article_result}\n\n### Discussion\n{discussion_result}"
+            )
         except Exception as e:
             return f"Error executing LLM call: {str(e)}"
 
     content_section = f"Title: {title}"
     if self_text:
-        content_section += f"\n\nAuthor's text:\n{self_text[:SELF_TEXT_PROMPT_CHAR_LIMIT]}"
+        content_section += (
+            f"\n\nAuthor's text:\n{self_text[:SELF_TEXT_PROMPT_CHAR_LIMIT]}"
+        )
     if article_body:
-        content_section += f"\n\nArticle body:\n{article_body[:ARTICLE_BODY_CHAR_LIMIT]}"
+        content_section += (
+            f"\n\nArticle body:\n{article_body[:ARTICLE_BODY_CHAR_LIMIT]}"
+        )
     if top_comments:
-        content_section += f"\n\nHN comments:\n{top_comments[:COMMENT_PROMPT_CHAR_LIMIT]}"
+        content_section += (
+            f"\n\nHN comments:\n{top_comments[:COMMENT_PROMPT_CHAR_LIMIT]}"
+        )
 
     prompt = f"""Summarize the article and the discussion for a knowledgeable reader.
 Use ONLY information from the text below.
-Write a highly concise, scannable summary (under 180 words) optimized for an 11-inch screen to conserve vertical space.
+Write a highly concise, scannable summary (under 240 words) optimized for an 11-inch screen to conserve vertical space.
 Use Markdown formatting:
 - Headings (###) for main sections.
 - Short bullet points (-) with **bold** key terms.
@@ -722,7 +816,8 @@ class Handler(BaseHTTPRequestHandler):
                         )
                         top_comments = (
                             reddit_context.top_comments
-                            if len(reddit_context.top_comments) > len(story.top_comments)
+                            if len(reddit_context.top_comments)
+                            > len(story.top_comments)
                             else story.top_comments
                         )
                         new_text = compose_story_text(
@@ -748,9 +843,58 @@ class Handler(BaseHTTPRequestHandler):
                         self.db.upsert_story(story)
 
                 if (
+                    story.source == "rss_lesswrong_com"
+                    and story.url
+                    and (not story.self_text or not story.top_comments)
+                ):
+                    post_id = _extract_lesswrong_post_id(story.url)
+                    if post_id:
+                        lw_context = asyncio.run(_fetch_lesswrong_context(post_id))
+                        if lw_context and (
+                            lw_context.self_text or lw_context.top_comments
+                        ):
+                            from pipeline import compose_story_text
+
+                            self_text = (
+                                lw_context.self_text
+                                if len(lw_context.self_text) > len(story.self_text)
+                                else story.self_text
+                            )
+                            top_comments = (
+                                lw_context.top_comments
+                                if len(lw_context.top_comments)
+                                > len(story.top_comments)
+                                else story.top_comments
+                            )
+                            new_text = compose_story_text(
+                                story.title,
+                                self_text,
+                                top_comments,
+                                article_body or "",
+                            )
+                            story = replace(
+                                story,
+                                self_text=self_text,
+                                top_comments=top_comments,
+                                text_content=new_text,
+                                discussion_url=story.discussion_url or story.url,
+                                comment_count=(
+                                    story.comment_count
+                                    or lw_context.comment_count
+                                    or None
+                                ),
+                                comment_count_at_fetch=max(
+                                    story.comment_count_at_fetch,
+                                    lw_context.comment_count,
+                                ),
+                            )
+                            self.db.upsert_story(story)
+
+                if (
                     article_body is None
                     and story.url
                     and not story.source.startswith("rss_reddit_")
+                    and not story.source == "rss_lesswrong_com"
                     and not story.url.startswith("https://news.ycombinator.com")
                     and len(story.self_text) < 500
                 ):
@@ -785,7 +929,9 @@ class Handler(BaseHTTPRequestHandler):
                         story.id,
                         cache_key[:12],
                     )
-                    self._json_response({"ok": True, "tldr": cached_tldr, "cached": True})
+                    self._json_response(
+                        {"ok": True, "tldr": cached_tldr, "cached": True}
+                    )
                     return
 
                 tldr = asyncio.run(

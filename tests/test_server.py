@@ -114,12 +114,12 @@ def test_static_serving(test_env):
     assert resp.status_code == 200
     # Dynamic rendering returns personalized dashboard, not static file
     assert resp.status_code == 200
-    assert 'id="queue-status"' in resp.text
+    assert 'id="queue-status"' not in resp.text
     assert 'data-mode="default"' in resp.text
     assert 'data-mode="popular"' in resp.text
     assert 'data-mode="explore"' in resp.text
     assert 'data-mode="date"' in resp.text
-    assert 'data-key-action="undo"' in resp.text
+    assert 'class="refresh-progress"' in resp.text
     assert 'id="sort-toggle"' not in resp.text
 
 
@@ -806,6 +806,62 @@ def test_tldr_detail_dynamic_fetch_for_bq_seed(test_env, monkeypatch):
     assert db.get_story(779).top_comments == "Fetched BQ comments"
 
 
+def test_tldr_detail_dynamic_fetch_for_ch_seed(test_env, monkeypatch):
+    port, db, _, _, user = test_env
+    db.upsert_story(
+        Story(
+            id=771,
+            title="CH dynamic test",
+            url="https://example.com/ch-dynamic-test",
+            score=100,
+            time=1600000000,
+            text_content="CH dynamic test.",
+            source="ch_seed",
+            comment_count=5,
+            discussion_url="https://news.ycombinator.com/item?id=771",
+            comment_count_at_fetch=0,
+            self_text="",
+            top_comments="",
+            article_body="",
+        )
+    )
+
+    async def mock_fetch_story(client, sid, database):
+        story = database.get_story(sid)
+        from dataclasses import replace
+
+        updated = replace(
+            story,
+            top_comments="Fetched CH comments",
+            text_content="CH dynamic test. Fetched CH comments",
+        )
+        database.upsert_story(updated)
+        return updated
+
+    async def mock_fetch_article_body(url):
+        return None
+
+    async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
+        return f"TLDR: {title} | {top_comments}"
+
+    import server
+    import pipeline
+
+    monkeypatch.setattr(pipeline, "fetch_story", mock_fetch_story)
+    monkeypatch.setattr(server, "_fetch_article_body", mock_fetch_article_body)
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    resp = httpx.post(
+        f"http://127.0.0.1:{port}/api/tldr-detail",
+        json={"story_id": 771},
+        cookies={"hn_token": user.token},
+    )
+
+    assert resp.status_code == 200
+    assert "Fetched CH comments" in resp.json()["tldr"]
+    assert db.get_story(771).top_comments == "Fetched CH comments"
+
+
 def test_tldr_detail_uses_cached_summary(test_env, monkeypatch):
     port, db, _, _, user = test_env
     db.upsert_story(
@@ -915,3 +971,308 @@ def test_keydown_guard_excludes_buttons_and_anchors():
     assert "textarea" in guard, "textarea should still block"
     assert "select" in guard, "select should still block"
     assert '[contenteditable="true"]' in guard, "contenteditable should still block"
+
+
+def test_dashboard_has_segmented_refresh_progress_bar():
+    """Regression: the queue-status element must be a 5-segment progress bar
+    that fills as the user votes toward the ranking refresh threshold,
+    not a text field showing story counts.
+    """
+    template = (
+        Path(__file__).resolve().parents[1] / "templates" / "index.html"
+    ).read_text(encoding="utf-8")
+    # New bar element present
+    assert 'id="queue-status"' not in template
+    assert 'class="refresh-progress"' in template
+    # Exactly 5 segments
+    segment_count = template.count('class="refresh-segment"')
+    assert segment_count == 5, f"expected 5 segments, found {segment_count}"
+    # Pulse animation present
+    assert "pulse-segment" in template
+    # Bar role for accessibility
+    assert 'role="progressbar"' in template
+    # 'u undo' hint removed from the legend
+    assert '<span class="key-hint">u</span> undo' not in template, (
+        "undo hint should be hidden from the visible legend"
+    )
+    # Old text "Loading queue..." should be gone from the template
+    assert "Loading queue..." not in template
+
+
+def test_extract_lesswrong_post_id():
+    import server
+
+    assert (
+        server._extract_lesswrong_post_id(
+            "https://www.lesswrong.com/posts/3TpvKNKAvFGDc5b5k/and-what-happens-next"
+        )
+        == "3TpvKNKAvFGDc5b5k"
+    )
+    assert (
+        server._extract_lesswrong_post_id("https://www.lesswrong.com/posts/abc123/slug")
+        == "abc123"
+    )
+    assert server._extract_lesswrong_post_id("https://example.com/foo") is None
+    assert server._extract_lesswrong_post_id("") is None
+    assert server._extract_lesswrong_post_id(None) is None
+
+
+def test_clean_lesswrong_html():
+    import server
+
+    raw = '<p>See also: <a href="https://example.com">a post</a>.</p>'
+    cleaned = server._clean_lesswrong_html(raw)
+    assert "See also:" in cleaned
+    assert "a post" in cleaned
+
+    assert server._clean_lesswrong_html("") == ""
+    assert server._clean_lesswrong_html(None) == ""
+    assert (
+        server._clean_lesswrong_html("<p>  <b>Hello</b>   world  </p>") == "Hello world"
+    )
+
+
+async def test_lesswrong_context_fetches_post_and_comments(monkeypatch):
+    import server
+
+    graphql_response = {
+        "data": {
+            "post": {
+                "result": {
+                    "_id": "3TpvKNKAvFGDc5b5k",
+                    "commentCount": 4,
+                    "contents": {"html": "<p>Post body with <b>key</b> insight.</p>"},
+                }
+            },
+            "comments": {
+                "results": [
+                    {
+                        "_id": "c1",
+                        "postId": "3TpvKNKAvFGDc5b5k",
+                        "author": "gwern",
+                        "baseScore": 5,
+                        "htmlBody": "<p>Great point about X.</p>",
+                        "postedAt": "2026-06-23T20:20:47.723Z",
+                    },
+                    {
+                        "_id": "c2",
+                        "postId": "3TpvKNKAvFGDc5b5k",
+                        "author": "",
+                        "baseScore": 3,
+                        "htmlBody": "<p>Short reply.</p>",
+                        "postedAt": "2026-06-23T21:00:00.000Z",
+                    },
+                ]
+            },
+        }
+    }
+
+    class MockAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, *args, **kwargs):
+            return httpx.Response(200, json=graphql_response)
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", MockAsyncClient)
+
+    ctx = await server._fetch_lesswrong_context("3TpvKNKAvFGDc5b5k")
+
+    assert ctx is not None
+    assert "key insight" in ctx.self_text
+    assert "gwern" in ctx.top_comments
+    assert "Great point about X" in ctx.top_comments
+    assert "/u/gwern" in ctx.top_comments
+    assert ctx.comment_count == 2
+
+
+def test_tldr_detail_fetches_lesswrong_comments(test_env, monkeypatch):
+    import server
+
+    port, db, _, _, user = test_env
+    db.upsert_story(
+        Story(
+            id=-3000,
+            title="And What Happens Next",
+            url="https://www.lesswrong.com/posts/3TpvKNKAvFGDc5b5k/and-what-happens-next",
+            score=0,
+            time=1600000000,
+            text_content="And What Happens Next.",
+            source="rss_lesswrong_com",
+            comment_count=None,
+            discussion_url=None,
+            comment_count_at_fetch=0,
+            self_text="",
+            top_comments="",
+            article_body="",
+        )
+    )
+
+    async def mock_fetch_lesswrong_context(post_id):
+        return server.LessWrongContext(
+            self_text="Post body with key insight.",
+            top_comments="/u/gwern: Great point about X.",
+            comment_count=1,
+        )
+
+    async def mock_fetch_article_body(url):
+        raise AssertionError("LessWrong should not be scraped as articles")
+
+    async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
+        return f"TLDR: {self_text} | {top_comments}"
+
+    monkeypatch.setattr(
+        server, "_fetch_lesswrong_context", mock_fetch_lesswrong_context
+    )
+    monkeypatch.setattr(server, "_fetch_article_body", mock_fetch_article_body)
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    resp = httpx.post(
+        f"http://127.0.0.1:{port}/api/tldr-detail",
+        json={"story_id": -3000},
+        cookies={"hn_token": user.token},
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True
+    assert "Great point about X" in data["tldr"]
+
+    updated_story = db.get_story(-3000)
+    assert updated_story.self_text == "Post body with key insight."
+    assert "Great point about X" in updated_story.top_comments
+    assert updated_story.discussion_url == (
+        "https://www.lesswrong.com/posts/3TpvKNKAvFGDc5b5k/and-what-happens-next"
+    )
+    assert updated_story.comment_count == 1
+
+
+def test_dashboard_has_source_filter_toggle():
+    """The side rail must expose a 3-way source filter (Mixed/HN/Non-HN)
+    that narrows the deck by story source. Mixed is the default.
+    """
+    template = (
+        Path(__file__).resolve().parents[1] / "templates" / "index.html"
+    ).read_text(encoding="utf-8")
+    assert 'class="source-tabs"' in template
+    assert 'data-source="mixed"' in template
+    assert 'data-source="hn"' in template
+    assert 'data-source="non-hn"' in template
+    # Mixed is the default active tab
+    assert 'class="source-tab active" data-source="mixed"' in template
+    # Source filter appears before swipe keys in the DOM
+    assert template.index("source-tabs") < template.index("swipe-keys")
+
+
+def test_keydown_uses_letter_keys():
+    """The global keydown handler maps j/k/l to down/up/neutral
+    and ArrowUp/ArrowDown scroll the active card.
+    """
+    template = (
+        Path(__file__).resolve().parents[1] / "templates" / "index.html"
+    ).read_text(encoding="utf-8")
+    assert "key === 'j'" in template
+    assert "key === 'k'" in template
+    assert "key === 'l'" in template
+    # arrow bindings present for card scrolling
+    handler = template.split("document.addEventListener('keydown'")[1].split("});", 1)[
+        0
+    ]
+    assert "arrowup" in handler
+    assert "arrowdown" in handler
+    assert "ArrowRight" not in handler
+    # legend shows the new label
+    assert "skip (neutral)" in template.lower()
+    # first-time tip present and uses floating overlay
+    assert "first-time-tip" in template
+    assert "position: fixed" in template
+    assert 'aria-label="Keyboard shortcuts"' in template
+    assert "first-time-tip-inner" in template
+    # open article / open comments keys present
+    assert "key === 'o'" in template
+    assert "key === 'c'" in template
+    assert "open article" in template.lower()
+    assert "open comments" in template.lower()
+    assert "data-article-url" in template
+    assert "data-comments-url" in template
+    # card sizing: shrink-to-fit for short, full width for enriched,
+    # max-height caps at viewport so page never scrolls
+    assert "width: fit-content" in template
+    assert "max-width: 902px" in template
+    assert "max-width: none" in template
+    # page never scrolls — overflow hidden on html and body
+    assert "html {\n      overflow: hidden;\n    }" in template
+    assert "overflow: hidden;" in template.split("body {")[1].split("}")[0]
+    active_block = template.split(".story-card.active {", 1)[1].split("}", 1)[0]
+    assert "max-height: calc(100vh - 5rem)" in active_block
+    assert "min-height: 18rem;" in active_block
+    # active card has bottom padding to clear the fixed vote bar
+    assert "padding-bottom: 4rem;" in active_block
+    enriched_block = template.split(".story-card.enriched {", 1)[1].split("}", 1)[0]
+    assert "width: 100%" in enriched_block
+    # long unbroken text wraps instead of overflowing the card
+    assert (
+        "overflow-wrap: anywhere;"
+        in template.split(".story-title a {", 1)[1].split("}", 1)[0]
+    )
+    assert (
+        "overflow-wrap: anywhere;"
+        in template.split(".match-reason {", 1)[1].split("}", 1)[0]
+    )
+    assert (
+        "overflow-wrap: anywhere;"
+        in template.split(".tldr-detail-content {", 1)[1].split("}", 1)[0]
+    )
+    assert (
+        "overflow-wrap: anywhere;"
+        in template.split(".story-header {", 1)[1].split("}", 1)[0]
+    )
+    # no min-height on #stories, rail caps via max-height
+    stories_block = template.split("#stories {", 1)[1].split("}", 1)[0]
+    assert "min-height" not in stories_block
+    side_block = template.split(".swipe-side {", 1)[1].split("}", 1)[0]
+    assert "max-height: calc(100vh - 1.5rem)" in side_block
+    assert "overflow-y: auto" in side_block
+    assert "sticky" not in side_block
+    # layout uses flex-start, not stretch
+    assert "align-items: flex-start" in template
+    # mobile side-rail stack (column, keys hidden)
+    assert ".swipe-keys { display: none; }" in template
+    assert "width: 100%;" in template
+    assert "flex-direction: column" in template
+    # bigger touch buttons on mobile
+    assert "padding: 0.6rem 0.9rem" in template
+    assert "min-width: 2.75rem" in template
+    assert "min-height: 2.75rem" in template
+    # flex scroll container on mobile
+    assert "height: calc(100vh - 1.5rem)" in template
+    assert "100dvh" in template
+    assert ".story-card.active {\n        max-height: 100%;" in template
+    # global vote bar at the bottom of the viewport
+    assert (
+        "position: fixed;\n      bottom: 0;\n      left: 0;\n      right: 0;"
+        in template
+    )
+    assert ".vote-bar[hidden]" in template
+    assert '<div class="vote-bar" hidden>' in template
+    # progress bar lives in the vote bar now, not the side rail
+    assert template.count('<div class="refresh-progress"') == 1
+    assert '<div class="refresh-progress"' in template.split('<div class="vote-bar"')[1]
+    # "Votes until refresh" label and 120px bar
+    assert 'class="refresh-label"' in template
+    assert "Votes until refresh" in template
+    assert "width: 120px" in template
+    # mode and source tabs have filled active style
+    assert ".mode-tab.active {\n      background: var(--pico-primary);" in template
+    assert ".source-tab.active {\n      background: #6c757d;" in template
+    # feedback button has filled, shadowed style
+    assert "box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);" in template
+    # click handler no longer passes null card
+    assert "submitVote(btn.dataset.fb, btn.closest('.story-card'))" not in template
+    assert "submitVote(btn.dataset.fb);" in template
