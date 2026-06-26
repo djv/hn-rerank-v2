@@ -1,6 +1,5 @@
 import hashlib
 import json
-import subprocess
 import sys
 from pathlib import Path
 
@@ -10,7 +9,7 @@ import pytest
 
 from database import Database, Story
 from pipeline import Config, story_embedding_text
-from scripts import seed_hn_from_bq
+from scripts import seed_hn_from_clickhouse
 from scripts._seed_common import (
     seed_rows,
     story_from_bq_row,
@@ -25,7 +24,7 @@ class DummyEmbedder:
         return arr
 
 
-def test_bq_row_maps_to_hn_story_with_composed_text():
+def test_ch_row_maps_to_hn_story_with_composed_text():
     story = story_from_bq_row(
         {
             "id": "123",
@@ -35,12 +34,13 @@ def test_bq_row_maps_to_hn_story_with_composed_text():
             "score": "150",
             "descendants": "42",
             "created_at_i": "1760000000",
-        }
+        },
+        source="ch_seed",
     )
 
     assert story is not None
     assert story.id == 123
-    assert story.source == "bq_seed"
+    assert story.source == "ch_seed"
     assert story.title == "Useful story"
     assert story.self_text == "Self text body."
     assert story.comment_count == 42
@@ -49,19 +49,19 @@ def test_bq_row_maps_to_hn_story_with_composed_text():
     assert "Self text body" in story.text_content
 
 
-def test_build_bq_query_accepts_months_min_score_and_limit():
-    query = seed_hn_from_bq.build_bq_query(months=9, min_score=250, limit=500)
+def test_build_ch_query_accepts_months_min_score_and_limit():
+    query = seed_hn_from_clickhouse.build_ch_query(months=9, min_score=250, limit=500)
 
     assert "INTERVAL 9 MONTH" in query
-    assert "score >= 250" in query
+    assert "AND score >= 250" in query
     assert query.rstrip().endswith("LIMIT 500")
 
 
-def test_build_bq_query_validates_bounds():
+def test_build_ch_query_validates_bounds():
     with pytest.raises(ValueError, match="months"):
-        seed_hn_from_bq.build_bq_query(months=0)
+        seed_hn_from_clickhouse.build_ch_query(months=0)
     with pytest.raises(ValueError, match="min-score"):
-        seed_hn_from_bq.build_bq_query(min_score=-1)
+        seed_hn_from_clickhouse.build_ch_query(min_score=-1)
 
 
 @pytest.mark.asyncio
@@ -112,7 +112,7 @@ async def test_seed_skips_feedback_story_without_update(monkeypatch):
                     "created_at_i": 1760000000,
                 }
             ],
-            source="bq_seed",
+            source="ch_seed",
             db=db,
             embedder=DummyEmbedder(),
         )
@@ -173,7 +173,7 @@ async def test_seed_skips_existing_story_without_feedback(monkeypatch):
                     "created_at_i": 1760000000,
                 }
             ],
-            source="bq_seed",
+            source="ch_seed",
             db=db,
             embedder=DummyEmbedder(),
         )
@@ -234,7 +234,7 @@ async def test_comment_hydration_success_updates_embedding(monkeypatch):
                     "created_at_i": 1760000000,
                 }
             ],
-            source="bq_seed",
+            source="ch_seed",
             db=db,
             embedder=DummyEmbedder(),
         )
@@ -256,7 +256,7 @@ async def test_comment_hydration_success_updates_embedding(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_comment_hydration_failure_preserves_bq_skeleton(monkeypatch):
+async def test_comment_hydration_failure_preserves_ch_skeleton(monkeypatch):
     db = Database(":memory:")
     try:
 
@@ -280,20 +280,20 @@ async def test_comment_hydration_failure_preserves_bq_skeleton(monkeypatch):
                     "id": 789,
                     "title": "Skeleton",
                     "url": "https://example.com/s",
-                    "text": "BQ self text",
+                    "text": "CH self text",
                     "score": 130,
                     "descendants": 7,
                     "created_at_i": 1760000000,
                 }
             ],
-            source="bq_seed",
+            source="ch_seed",
             db=db,
             embedder=DummyEmbedder(),
         )
 
         story = db.get_story(789)
         assert story.title == "Skeleton"
-        assert story.self_text == "BQ self text"
+        assert story.self_text == "CH self text"
         assert story.top_comments == ""
         assert story.comment_count == 7
         assert story.text_content
@@ -301,36 +301,33 @@ async def test_comment_hydration_failure_preserves_bq_skeleton(monkeypatch):
         db.close()
 
 
-def test_run_bq_query_passes_max_rows_to_cli(monkeypatch):
+def test_run_ch_query_uses_correct_endpoint(monkeypatch):
     captured = {}
 
-    class FakeProc:
-        stdout = "[]"
-        returncode = 0
+    class MockResponse:
+        def __init__(self, status_code=200, json_data=None):
+            self.status_code = status_code
+            self._json_data = json_data or []
 
-    def fake_run(cmd, **kwargs):
-        captured["cmd"] = cmd
-        return FakeProc()
+        def raise_for_status(self):
+            pass
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    seed_hn_from_bq.run_bq_query(limit=1000, months=3, min_score=500)
-    assert "--max_rows=1000" in captured["cmd"]
+        def json(self):
+            return self._json_data
 
+    def fake_post(url, **kwargs):
+        captured["url"] = url
+        captured["query"] = kwargs.get("data", "")
+        return MockResponse(200, {"data": []})
 
-def test_run_bq_query_uses_default_max_rows_when_no_limit(monkeypatch):
-    captured = {}
-
-    class FakeProc:
-        stdout = "[]"
-        returncode = 0
-
-    def fake_run(cmd, **kwargs):
-        captured["cmd"] = cmd
-        return FakeProc()
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    seed_hn_from_bq.run_bq_query(months=3, min_score=500)
-    assert "--max_rows=1000" in captured["cmd"]
+    monkeypatch.setattr(httpx, "post", fake_post)
+    seed_hn_from_clickhouse.run_ch_query(limit=500, months=6, min_score=200)
+    assert (
+        captured["url"] == "https://play.clickhouse.com/?user=play&default_format=JSON"
+    )
+    assert "LIMIT 500" in captured["query"]
+    assert "INTERVAL 6 MONTH" in captured["query"]
+    assert "AND score >= 200" in captured["query"]
 
 
 def test_dry_run_skips_config_and_db(
@@ -338,8 +335,8 @@ def test_dry_run_skips_config_and_db(
 ) -> None:
     """--dry-run writes rows to file and does not load Config or Database."""
     monkeypatch.setattr(
-        seed_hn_from_bq,
-        "run_bq_query",
+        seed_hn_from_clickhouse,
+        "run_ch_query",
         lambda *a, **kw: [
             {
                 "id": 1,
@@ -356,14 +353,14 @@ def test_dry_run_skips_config_and_db(
 
     monkeypatch.setattr(Config, "load", fail_load)
 
-    out = tmp_path / "bq_dryrun.jsonl"
+    out = tmp_path / "ch_dryrun.jsonl"
     monkeypatch.setattr(sys, "argv", ["x", "--dry-run", "--dry-run-output", str(out)])
-    seed_hn_from_bq.main()
+    seed_hn_from_clickhouse.main()
 
     assert out.exists()
     lines = out.read_text().splitlines()
     meta = json.loads(lines[0])
-    assert meta["_meta"]["source"] == "bq_seed"
+    assert meta["_meta"]["source"] == "ch_seed"
     assert meta["_meta"]["rows"] == 1
     row = json.loads(lines[1])
     assert row["id"] == 1
