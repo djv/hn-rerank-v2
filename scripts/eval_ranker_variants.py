@@ -24,6 +24,12 @@ from sklearn.svm import LinearSVC, SVC
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from pipeline_dl import fit_attention_mlp, predict_attention_mlp
+from pipeline_dl_t0 import (
+    fit_attention_mlp_t0,
+    predict_attention_mlp_t0,
+)
+
 from database import Database, Story
 from pipeline import (
     Config,
@@ -31,6 +37,7 @@ from pipeline import (
     ModelConfig,
     RankedStory,
     _knn_similarity,
+    _positive_cluster_centers,
     clean_text,
     mmr_filter,
 )
@@ -245,12 +252,12 @@ def _feature_matrix(
             _normalize_sims(closest_down),
         ]
     )
-    return np.concatenate([embeddings, text_meta, sim_meta], axis=1).astype(
-        np.float32
-    )
+    return np.concatenate([embeddings, text_meta, sim_meta], axis=1).astype(np.float32)
 
 
-def _fit_scale(train_x: np.ndarray, cand_x: np.ndarray, emb_dim: int) -> tuple[np.ndarray, np.ndarray]:
+def _fit_scale(
+    train_x: np.ndarray, cand_x: np.ndarray, emb_dim: int
+) -> tuple[np.ndarray, np.ndarray]:
     scaler = StandardScaler()
     train_meta = np.clip(scaler.fit_transform(train_x[:, emb_dim:]), -2.5, 2.5)
     cand_meta = np.clip(scaler.transform(cand_x[:, emb_dim:]), -2.5, 2.5)
@@ -329,10 +336,14 @@ def _candidate_similarity_features(
     return sim_up, sim_down, closest_up, closest_down
 
 
-def _tier2_scores(cand_emb: np.ndarray, train_emb: np.ndarray, y_train: np.ndarray) -> np.ndarray:
+def _tier2_scores(
+    cand_emb: np.ndarray, train_emb: np.ndarray, y_train: np.ndarray
+) -> np.ndarray:
     up_emb = train_emb[y_train == 2]
     down_emb = train_emb[y_train == 0]
-    up_centroid = up_emb.mean(axis=0) if len(up_emb) else np.zeros(384, dtype=np.float32)
+    up_centroid = (
+        up_emb.mean(axis=0) if len(up_emb) else np.zeros(384, dtype=np.float32)
+    )
     down_centroid = (
         down_emb.mean(axis=0) if len(down_emb) else np.zeros(384, dtype=np.float32)
     )
@@ -477,9 +488,10 @@ def _scores_prob_3class(
     svm.fit(x_train, y, sample_weight=weights)
     probs = svm.predict_proba(x_cand)
     classes = list(svm.classes_)
-    scores = probs[:, classes.index(2)] + config.model.neutral_weight * probs[
-        :, classes.index(1)
-    ]
+    scores = (
+        probs[:, classes.index(2)]
+        + config.model.neutral_weight * probs[:, classes.index(1)]
+    )
     return scores.astype(np.float32), probs
 
 
@@ -532,9 +544,10 @@ def _scores_margin_3class(
     elif mode == "up":
         scores = decision[:, classes.index(2)]
     elif mode == "up_neutral":
-        scores = decision[:, classes.index(2)] + config.model.neutral_weight * decision[
-            :, classes.index(1)
-        ]
+        scores = (
+            decision[:, classes.index(2)]
+            + config.model.neutral_weight * decision[:, classes.index(1)]
+        )
     elif mode == "up_minus_down":
         scores = decision[:, classes.index(2)] - decision[:, classes.index(0)]
     else:
@@ -633,7 +646,365 @@ def _scores_mlp_up(
     return scores.astype(np.float32), probs
 
 
-def _scores_margin_source_domain(fold: FoldData, config: Config) -> tuple[np.ndarray, None]:
+def _scores_attention_mlp_up(
+    fold: FoldData, config: Config
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """T1: multi-head, wide MLP, cosine sims (full Tier 1)."""
+    return _scores_attention_mlp_v1(fold, config, extra_dim=5, hidden_dim=256)
+
+
+def _scores_attention_mlp_v1_nocos_up(
+    fold: FoldData, config: Config
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """T1 without cosine-sim features."""
+    return _scores_attention_mlp_v1(fold, config, extra_dim=0, hidden_dim=256)
+
+
+def _scores_attention_mlp_v1_h64_up(
+    fold: FoldData, config: Config
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """T1 with hidden_dim=64 (same as T0)."""
+    return _scores_attention_mlp_v1(fold, config, extra_dim=5, hidden_dim=64)
+
+
+def _scores_attention_mlp_v1(
+    fold: FoldData, config: Config, *, extra_dim: int, hidden_dim: int
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Configurable T1 scorer.
+
+    Args:
+        extra_dim: number of cosine-sim features (0 to disable)
+        hidden_dim: MLP hidden layer width
+    """
+    return _scores_attention_mlp_v2(
+        fold,
+        config,
+        extra_dim=extra_dim,
+        hidden_dim=hidden_dim,
+        use_meta_per_class=False,
+        use_ranking=False,
+        use_mixup=False,
+    )
+
+
+# Tier 2 wrappers
+def _scores_attention_mlp_v2_rank_up(
+    fold: FoldData, config: Config
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """T1 + ranking loss only."""
+    return _scores_attention_mlp_v2(
+        fold,
+        config,
+        extra_dim=0,
+        hidden_dim=256,
+        use_meta_per_class=False,
+        use_ranking=True,
+        use_mixup=False,
+    )
+
+
+def _scores_attention_mlp_v2_meta_up(
+    fold: FoldData, config: Config
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """T1 + per-class meta only."""
+    return _scores_attention_mlp_v2(
+        fold,
+        config,
+        extra_dim=0,
+        hidden_dim=256,
+        use_meta_per_class=True,
+        use_ranking=False,
+        use_mixup=False,
+    )
+
+
+def _scores_attention_mlp_v2_mixup_up(
+    fold: FoldData, config: Config
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """T1 + mixup only."""
+    return _scores_attention_mlp_v2(
+        fold,
+        config,
+        extra_dim=0,
+        hidden_dim=256,
+        use_meta_per_class=False,
+        use_ranking=False,
+        use_mixup=True,
+    )
+
+
+def _scores_attention_mlp_v2_all_up(
+    fold: FoldData, config: Config
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """T1 + all Tier 2 features (ranking + meta + mixup)."""
+    return _scores_attention_mlp_v2(
+        fold,
+        config,
+        extra_dim=0,
+        hidden_dim=256,
+        use_meta_per_class=True,
+        use_ranking=True,
+        use_mixup=True,
+    )
+
+
+def _scores_attention_mlp_v2(
+    fold: FoldData,
+    config: Config,
+    *,
+    extra_dim: int,
+    hidden_dim: int,
+    use_meta_per_class: bool,
+    use_ranking: bool,
+    use_mixup: bool,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Configurable T2 scorer.
+
+    Args:
+        extra_dim: number of cosine-sim features (0 to disable)
+        hidden_dim: MLP hidden layer width
+        use_meta_per_class: concatenate per-class mean meta
+        use_ranking: enable pairwise ranking loss
+        use_mixup: enable mixup augmentation
+    """
+    emb_dim = fold.cand_emb.shape[1]
+
+    train_x, cand_x = _select_matrices(fold, feature_source="base", textsplit=False)
+
+    try:
+        scaler = StandardScaler()
+        train_meta = np.clip(scaler.fit_transform(train_x[:, emb_dim:]), -2.5, 2.5)
+        cand_meta = np.clip(scaler.transform(cand_x[:, emb_dim:]), -2.5, 2.5)
+    except Exception:
+        train_meta = train_x[:, emb_dim:].copy()
+        cand_meta = cand_x[:, emb_dim:].copy()
+
+    train_emb = train_x[:, :emb_dim].astype(np.float32)
+    cand_emb = cand_x[:, :emb_dim].astype(np.float32)
+    train_labels = fold.y_train
+
+    train_extra = None
+    cand_extra = None
+    if extra_dim > 0:
+        k = config.model.knn_k
+        n_clusters = config.model.positive_cluster_k
+        up_emb = train_emb[train_labels == 2]
+        down_emb = train_emb[train_labels == 0]
+
+        def _cosine_sims(query: np.ndarray) -> np.ndarray:
+            N = len(query)
+            out = np.zeros((N, 5), dtype=np.float32)
+            if len(up_emb):
+                out[:, 0] = _knn_similarity(query, up_emb, k=min(k, len(up_emb)))
+                out[:, 1] = np.max(query @ up_emb.T, axis=1)
+            if len(down_emb):
+                out[:, 2] = _knn_similarity(query, down_emb, k=min(k, len(down_emb)))
+                out[:, 3] = np.max(query @ down_emb.T, axis=1)
+            if len(up_emb) >= n_clusters:
+                centers = _positive_cluster_centers(up_emb, n_clusters)
+                out[:, 4] = np.max(query @ centers.T, axis=1)
+            return np.clip(out, -1.0, 1.0)
+
+        train_extra = _cosine_sims(train_emb).astype(np.float32)
+        cand_extra = _cosine_sims(cand_emb).astype(np.float32)
+
+    train_meta_per_class = None
+    cand_meta_per_class = None
+    if use_meta_per_class:
+        up_meta = train_meta[train_labels == 2].mean(axis=0, keepdims=True)
+        down_meta = train_meta[train_labels == 0].mean(axis=0, keepdims=True)
+        meta_pc = np.concatenate([up_meta, down_meta], axis=1).astype(np.float32)
+        train_meta_per_class = np.tile(meta_pc, (len(train_emb), 1))
+        cand_meta_per_class = np.tile(meta_pc, (len(cand_emb), 1))
+
+    kw: dict = dict(
+        train_extra=train_extra,
+        hidden_dim=hidden_dim,
+        n_epochs=100,
+        lr=1e-3,
+        patience=15,
+        val_frac=0.2,
+        seed=0,
+    )
+    if use_ranking:
+        kw["ranking_lambda"] = 0.5
+        kw["ranking_margin"] = 0.5
+        kw["ranking_pairs"] = 256
+    if use_mixup:
+        kw["mixup_alpha"] = 0.4
+
+    model = fit_attention_mlp(
+        train_emb,
+        train_labels,
+        train_meta.astype(np.float32),
+        train_meta_per_class=train_meta_per_class,
+        **kw,
+    )
+
+    if model is None:
+        return np.full(len(cand_emb), 0.5, dtype=np.float32), None
+
+    scores, probs = predict_attention_mlp(
+        model,
+        cand_emb,
+        cand_meta.astype(np.float32),
+        train_emb,
+        train_labels,
+        cand_extra=cand_extra,
+        cand_meta_per_class=cand_meta_per_class,
+        batch_size=128,
+    )
+    return scores.astype(np.float32), probs.astype(np.float32)
+
+
+def _rank_ascending(scores: np.ndarray) -> np.ndarray:
+    """Rank items ascending (1=worst, N=best)."""
+    from scipy.stats import rankdata
+
+    return rankdata(scores, method="average").astype(np.float32)
+
+
+def _scores_blend_up(
+    fold: FoldData, config: Config, alpha: float, *, kind: str
+) -> tuple[np.ndarray, None]:
+    """Blend SVM + MLP scores.
+
+    Args:
+        alpha: weight for SVM score (0 = pure MLP, 1 = pure SVM)
+        kind: 'score' for raw-score blend, 'rank' for rank blend
+    """
+    svm_scores, _ = _scores_margin_3class(fold, config, textsplit=False, mode="up")
+    mlp_scores, _ = _scores_attention_mlp_v2_meta_up(fold, config)
+    svm_scores = svm_scores.astype(np.float32)
+    mlp_scores = mlp_scores.astype(np.float32)
+
+    if kind == "rank":
+        svm_ranks = _rank_ascending(svm_scores)
+        mlp_ranks = _rank_ascending(mlp_scores)
+        blended = alpha * svm_ranks + (1 - alpha) * mlp_ranks
+    else:  # score blend (default)
+        blended = alpha * svm_scores + (1 - alpha) * mlp_scores
+
+    return blended.astype(np.float32), None
+
+
+def _scores_attention_mlp_t0_up(
+    fold: FoldData, config: Config
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """T0 baseline: single-head, narrow MLP, no cosine sims."""
+    emb_dim = fold.cand_emb.shape[1]
+
+    train_x, cand_x = _select_matrices(fold, feature_source="base", textsplit=False)
+
+    try:
+        scaler = StandardScaler()
+        train_meta = np.clip(scaler.fit_transform(train_x[:, emb_dim:]), -2.5, 2.5)
+        cand_meta = np.clip(scaler.transform(cand_x[:, emb_dim:]), -2.5, 2.5)
+    except Exception:
+        train_meta = train_x[:, emb_dim:].copy()
+        cand_meta = cand_x[:, emb_dim:].copy()
+
+    train_emb = train_x[:, :emb_dim].astype(np.float32)
+    cand_emb = cand_x[:, :emb_dim].astype(np.float32)
+    train_labels = fold.y_train
+
+    model = fit_attention_mlp_t0(
+        train_emb,
+        train_labels,
+        train_meta.astype(np.float32),
+        n_epochs=100,
+        lr=1e-3,
+        patience=15,
+        val_frac=0.2,
+        seed=0,
+    )
+
+    if model is None:
+        return np.full(len(cand_emb), 0.5, dtype=np.float32), None
+
+    scores, probs = predict_attention_mlp_t0(
+        model,
+        cand_emb,
+        cand_meta.astype(np.float32),
+        train_emb,
+        train_labels,
+        batch_size=128,
+    )
+    return scores.astype(np.float32), probs.astype(np.float32)
+
+
+def _scores_attention_mlp_t0_cos_up(
+    fold: FoldData, config: Config
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """T0 baseline + cosine sim features."""
+    emb_dim = fold.cand_emb.shape[1]
+
+    train_x, cand_x = _select_matrices(fold, feature_source="base", textsplit=False)
+
+    try:
+        scaler = StandardScaler()
+        train_meta = np.clip(scaler.fit_transform(train_x[:, emb_dim:]), -2.5, 2.5)
+        cand_meta = np.clip(scaler.transform(cand_x[:, emb_dim:]), -2.5, 2.5)
+    except Exception:
+        train_meta = train_x[:, emb_dim:].copy()
+        cand_meta = cand_x[:, emb_dim:].copy()
+
+    train_emb = train_x[:, :emb_dim].astype(np.float32)
+    cand_emb = cand_x[:, :emb_dim].astype(np.float32)
+    train_labels = fold.y_train
+
+    k = config.model.knn_k
+    n_clusters = config.model.positive_cluster_k
+    up_emb = train_emb[train_labels == 2]
+    down_emb = train_emb[train_labels == 0]
+
+    def _cosine_sims(query: np.ndarray) -> np.ndarray:
+        N = len(query)
+        out = np.zeros((N, 5), dtype=np.float32)
+        if len(up_emb):
+            out[:, 0] = _knn_similarity(query, up_emb, k=min(k, len(up_emb)))
+            out[:, 1] = np.max(query @ up_emb.T, axis=1)
+        if len(down_emb):
+            out[:, 2] = _knn_similarity(query, down_emb, k=min(k, len(down_emb)))
+            out[:, 3] = np.max(query @ down_emb.T, axis=1)
+        if len(up_emb) >= n_clusters:
+            centers = _positive_cluster_centers(up_emb, n_clusters)
+            out[:, 4] = np.max(query @ centers.T, axis=1)
+        return np.clip(out, -1.0, 1.0)
+
+    train_extra = _cosine_sims(train_emb).astype(np.float32)
+    cand_extra = _cosine_sims(cand_emb).astype(np.float32)
+
+    model = fit_attention_mlp_t0(
+        train_emb,
+        train_labels,
+        train_meta.astype(np.float32),
+        train_extra=train_extra,
+        n_epochs=100,
+        lr=1e-3,
+        patience=15,
+        val_frac=0.2,
+        seed=0,
+    )
+
+    if model is None:
+        return np.full(len(cand_emb), 0.5, dtype=np.float32), None
+
+    scores, probs = predict_attention_mlp_t0(
+        model,
+        cand_emb,
+        cand_meta.astype(np.float32),
+        train_emb,
+        train_labels,
+        cand_extra=cand_extra,
+        batch_size=128,
+    )
+    return scores.astype(np.float32), probs.astype(np.float32)
+
+
+def _scores_margin_source_domain(
+    fold: FoldData, config: Config
+) -> tuple[np.ndarray, None]:
     train_extra = _source_domain_feature_matrix(
         fold.train_stories, fold.train_stories, fold.y_train, loocv=True
     )
@@ -665,9 +1036,7 @@ def _scores_margin_source_domain(fold: FoldData, config: Config) -> tuple[np.nda
 def _scores_margin_rank_calibrated(
     fold: FoldData, config: Config, *, tier2_weight: float
 ) -> tuple[np.ndarray, None]:
-    margin, _ = _scores_margin_3class(
-        fold, config, textsplit=False, mode="up"
-    )
+    margin, _ = _scores_margin_3class(fold, config, textsplit=False, mode="up")
     calibrated = _percentile_scores(margin)
     tier2 = _percentile_scores(fold.tier2_scores)
     return ((1.0 - tier2_weight) * calibrated + tier2_weight * tier2).astype(
@@ -943,7 +1312,9 @@ def _scores_pairwise(
     fold: FoldData, *, textsplit: bool, strict_up_only: bool = False
 ) -> tuple[np.ndarray, None]:
     rel = np.array([{0: 0.0, 1: 0.2, 2: 1.0}[int(y)] for y in fold.y_train])
-    train_raw, cand_raw = _select_matrices(fold, feature_source="base", textsplit=textsplit)
+    train_raw, cand_raw = _select_matrices(
+        fold, feature_source="base", textsplit=textsplit
+    )
     train_x, cand_x = _fit_scale(train_raw, cand_raw, fold.cand_emb.shape[1])
     rng = np.random.default_rng(0)
     pairs: list[np.ndarray] = []
@@ -997,7 +1368,9 @@ def _metrics(
 ) -> dict:
     order = np.argsort(-scores)
     ranked = [
-        RankedStory(story=fold.candidates[i], score=float(scores[i]), best_match_title="")
+        RankedStory(
+            story=fold.candidates[i], score=float(scores[i]), best_match_title=""
+        )
         for i in order
     ]
     emb_map = {s.id: fold.cand_emb[i] for i, s in enumerate(fold.candidates)}
@@ -1181,22 +1554,22 @@ def _make_fold(
             loocv=False,
         )
         train_base_meta = _feature_matrix(
-                train_emb,
-                train_stories,
-                train_sim_up,
-                train_sim_down,
-                train_closest_up,
-                train_closest_down,
-                textsplit=True,
+            train_emb,
+            train_stories,
+            train_sim_up,
+            train_sim_down,
+            train_closest_up,
+            train_closest_down,
+            textsplit=True,
         )[:, train_emb.shape[1] :]
         cand_base_meta = _feature_matrix(
-                fold_cand_emb,
-                fold_candidates,
-                cand_sim_up,
-                cand_sim_down,
-                cand_closest_up,
-                cand_closest_down,
-                textsplit=True,
+            fold_cand_emb,
+            fold_candidates,
+            cand_sim_up,
+            cand_sim_down,
+            cand_closest_up,
+            cand_closest_down,
+            textsplit=True,
         )[:, fold_cand_emb.shape[1] :]
         x_train_field_sims = np.hstack(
             [train_emb, train_base_meta, train_field_sim_features]
@@ -1306,8 +1679,14 @@ def main() -> None:
     if user is None:
         raise RuntimeError("Missing default user token")
 
-    requested = [name.strip() for name in args.variants.split(",") if name.strip()] if args.variants else []
-    needs_field = (not requested) or any(name.startswith("field_") for name in requested)
+    requested = (
+        [name.strip() for name in args.variants.split(",") if name.strip()]
+        if args.variants
+        else []
+    )
+    needs_field = (not requested) or any(
+        name.startswith("field_") for name in requested
+    )
     embedder = Embedder(config.onnx_model_dir) if needs_field else None
 
     window_days = args.window_days if args.window_days is not None else config.days
@@ -1377,7 +1756,9 @@ def main() -> None:
             fb_to_cand[valid_fb_positions]
         ]
     else:
-        fb_field_parts = np.empty((len(fb_stories), 4, cand_emb.shape[1]), dtype=np.float32)
+        fb_field_parts = np.empty(
+            (len(fb_stories), 4, cand_emb.shape[1]), dtype=np.float32
+        )
     cand_field_emb = _average_field_embeddings(cand_field_parts)
     fb_field_emb = _average_field_embeddings(fb_field_parts)
     valid_positions = np.where(valid_mask)[0]
@@ -1417,9 +1798,40 @@ def main() -> None:
         "sgd_log_up": lambda fold: _scores_sgd_log_up(fold, config),
         "mlp_32_a1e-3": lambda fold: _scores_mlp_up(fold, config, (32,), 1e-3),
         "mlp_64_a1e-3": lambda fold: _scores_mlp_up(fold, config, (64,), 1e-3),
-        "mlp_64_16_a1e-3": lambda fold: _scores_mlp_up(
-            fold, config, (64, 16), 1e-3
+        "mlp_64_16_a1e-3": lambda fold: _scores_mlp_up(fold, config, (64, 16), 1e-3),
+        "attention_mlp": lambda fold: _scores_attention_mlp_up(fold, config),
+        "attn_mlp_t0": lambda fold: _scores_attention_mlp_t0_up(fold, config),
+        "attn_mlp_t0_cos": lambda fold: _scores_attention_mlp_t0_cos_up(fold, config),
+        "attn_mlp_v1_nocos": lambda fold: _scores_attention_mlp_v1_nocos_up(
+            fold, config
         ),
+        "attn_mlp_v1_h64": lambda fold: _scores_attention_mlp_v1_h64_up(fold, config),
+        "attn_mlp_v2_rank": lambda fold: _scores_attention_mlp_v2_rank_up(fold, config),
+        "attn_mlp_v2_meta": lambda fold: _scores_attention_mlp_v2_meta_up(fold, config),
+        "attn_mlp_v2_mixup": lambda fold: _scores_attention_mlp_v2_mixup_up(
+            fold, config
+        ),
+        "attn_mlp_v2_all": lambda fold: _scores_attention_mlp_v2_all_up(fold, config),
+        "blend_score_10": lambda fold: _scores_blend_up(
+            fold, config, 0.10, kind="score"
+        ),
+        "blend_score_25": lambda fold: _scores_blend_up(
+            fold, config, 0.25, kind="score"
+        ),
+        "blend_score_50": lambda fold: _scores_blend_up(
+            fold, config, 0.50, kind="score"
+        ),
+        "blend_score_75": lambda fold: _scores_blend_up(
+            fold, config, 0.75, kind="score"
+        ),
+        "blend_score_90": lambda fold: _scores_blend_up(
+            fold, config, 0.90, kind="score"
+        ),
+        "blend_rank_10": lambda fold: _scores_blend_up(fold, config, 0.10, kind="rank"),
+        "blend_rank_25": lambda fold: _scores_blend_up(fold, config, 0.25, kind="rank"),
+        "blend_rank_50": lambda fold: _scores_blend_up(fold, config, 0.50, kind="rank"),
+        "blend_rank_75": lambda fold: _scores_blend_up(fold, config, 0.75, kind="rank"),
+        "blend_rank_90": lambda fold: _scores_blend_up(fold, config, 0.90, kind="rank"),
         "source_domain_margin3_up": lambda fold: _scores_margin_source_domain(
             fold, config
         ),
@@ -1432,9 +1844,7 @@ def main() -> None:
         "rank_calibrated_tier2_30": lambda fold: _scores_margin_rank_calibrated(
             fold, config, tier2_weight=0.30
         ),
-        "field_margin3_up": lambda fold: _scores_margin_3class_field(
-            fold, config
-        ),
+        "field_margin3_up": lambda fold: _scores_margin_3class_field(fold, config),
         "field_sims_margin3_up": lambda fold: _scores_margin_3class_field_sims(
             fold, config
         ),
@@ -1496,7 +1906,11 @@ def main() -> None:
             fold, config, n_clusters=4, method="kmeans", feature_names=("neg_cluster",)
         ),
         "cluster_margin_feat_kmeans4": lambda fold: _scores_margin_with_cluster_features(
-            fold, config, n_clusters=4, method="kmeans", feature_names=("cluster_margin",)
+            fold,
+            config,
+            n_clusters=4,
+            method="kmeans",
+            feature_names=("cluster_margin",),
         ),
         "pos_cluster_entropy_kmeans4": lambda fold: _scores_margin_with_cluster_features(
             fold,
@@ -1684,15 +2098,11 @@ def main() -> None:
         "binary_prob_textsplit": lambda fold: _scores_binary_margin(
             fold, config, textsplit=True, probability=True
         ),
-        "pairwise_base": lambda fold: _scores_pairwise(
-            fold, textsplit=False
-        ),
+        "pairwise_base": lambda fold: _scores_pairwise(fold, textsplit=False),
         "pairwise_up_only": lambda fold: _scores_pairwise(
             fold, textsplit=False, strict_up_only=True
         ),
-        "pairwise_textsplit": lambda fold: _scores_pairwise(
-            fold, textsplit=True
-        ),
+        "pairwise_textsplit": lambda fold: _scores_pairwise(fold, textsplit=True),
         "tier2_centroid": lambda fold: (fold.tier2_scores.copy(), None),
     }
     if requested:
@@ -1701,9 +2111,9 @@ def main() -> None:
             raise ValueError(f"Unknown variants: {', '.join(missing)}")
         variants = {name: variants[name] for name in requested}
     results: dict[str, list[dict]] = {name: [] for name in variants}
-    splits = StratifiedKFold(
-        n_splits=args.folds, shuffle=True, random_state=0
-    ).split(np.zeros((len(y), 1)), y)
+    splits = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=0).split(
+        np.zeros((len(y), 1)), y
+    )
 
     for fold_no, (train_pos, test_pos) in enumerate(splits, start=1):
         fold = _make_fold(
