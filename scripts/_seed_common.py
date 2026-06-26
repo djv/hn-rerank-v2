@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-import asyncio
+import json
+import logging
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-import httpx
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from ch_client import query_stories_with_comments as _ch_query_stories_with_comments
 from database import Database, Story
 from pipeline import (
     BQ_ARCHIVE_SOURCE,
@@ -20,11 +21,6 @@ from pipeline import (
     _extract_comments_recursive,
     _select_top_comments,
 )
-
-
-import json
-import logging
-import time
 
 
 def _write_dryrun(
@@ -89,26 +85,14 @@ def story_from_bq_row(
     )
 
 
-async def hydrate_comments_from_algolia(
-    client: httpx.AsyncClient,
-    story: Story,
-) -> Story:
-    try:
-        resp = await client.get(f"https://hn.algolia.com/api/v1/items/{story.id}")
-        if resp.status_code != 200:
-            return story
-        item = resp.json()
-    except Exception:
-        return story
-
-    if not item or item.get("type") != "story":
-        return story
-
+def _apply_ch_comments_to_story(story: Story, item: dict[str, Any]) -> Story:
+    """Apply the comments + score from a CH item dict to a skeleton Story."""
+    comment_count = _coerce_int(item.get("num_comments"), story.comment_count or 0)
     children = item.get("children") or []
     all_comments = _extract_comments_recursive(children)
     selected = _select_top_comments(all_comments)
     top_comments = " ".join(c["text"] for c in selected)[:10000]
-    comment_count = item.get("num_comments")
+
     story_text = clean_text(str(item.get("story_text") or item.get("text") or ""))
     self_text = (
         story_text if len(story_text) > len(story.self_text) else story.self_text
@@ -127,8 +111,8 @@ async def hydrate_comments_from_algolia(
         self_text=self_text,
         top_comments=top_comments,
         text_content=text_content,
-        comment_count=_coerce_int(comment_count, story.comment_count or 0),
-        comment_count_at_fetch=_coerce_int(comment_count, story.comment_count or 0),
+        comment_count=comment_count,
+        comment_count_at_fetch=comment_count,
     )
 
 
@@ -150,6 +134,14 @@ async def seed_rows(
     embedder: Embedder,
     concurrency: int = 10,
 ) -> tuple[int, int, int, int]:
+    """Skeleton -> bulk-CH-hydrate -> upsert.
+
+    Replaces the previous per-story parallel Algolia hydration. The CH bulk
+    path is one query for the entire skeleton set (vs N parallel Algolia
+    calls), and the comment-selection logic is identical to the previous
+    implementation (re-uses _extract_comments_recursive / _select_top_comments).
+    """
+    del concurrency  # bulk path is single-query; concurrency no longer used
     protected_ids = feedback_story_ids(db)
     existing_ids = existing_story_ids(db)
     skeletons: list[Story] = []
@@ -167,18 +159,32 @@ async def seed_rows(
             continue
         skeletons.append(story)
 
-    sem = asyncio.Semaphore(max(1, concurrency))
-    async with httpx.AsyncClient(timeout=20.0) as client:
+    if not skeletons:
+        return 0, skipped_feedback, skipped_existing, 0
 
-        async def hydrate(story: Story) -> Story:
-            async with sem:
-                return await hydrate_comments_from_algolia(client, story)
+    skeleton_ids = [s.id for s in skeletons]
+    try:
+        ch_items = _ch_query_stories_with_comments(skeleton_ids, max_levels=5)
+    except Exception as exc:
+        logging.warning(
+            "bulk CH hydration failed (%r); falling back to skeleton-only", exc
+        )
+        ch_items = {}
 
-        hydrated = await asyncio.gather(*(hydrate(story) for story in skeletons))
+    hydrated: list[Story] = []
+    hydrated_count = 0
+    for skeleton in skeletons:
+        item = ch_items.get(skeleton.id)
+        if item is None:
+            hydrated.append(skeleton)
+            continue
+        story = _apply_ch_comments_to_story(skeleton, item)
+        hydrated.append(story)
+        if story.top_comments:
+            hydrated_count += 1
 
     for story in hydrated:
         db.upsert_story(story)
 
     get_or_compute_embeddings(hydrated, embedder, db)
-    hydrated_comments = sum(1 for story in hydrated if story.top_comments)
-    return len(hydrated), skipped_feedback, skipped_existing, hydrated_comments
+    return len(hydrated), skipped_feedback, skipped_existing, hydrated_count

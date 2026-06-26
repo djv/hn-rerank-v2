@@ -81,20 +81,12 @@ async def test_seed_skips_feedback_story_without_update(monkeypatch):
         db.upsert_story(original)
         db.upsert_feedback(user.id, 123, "up")
 
-        class MockClient:
-            def __init__(self, **kwargs):
-                pass
+        def fail_bulk(*a, **kw):
+            raise AssertionError("feedback-protected story should not hydrate")
 
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                pass
-
-            async def get(self, url):
-                raise AssertionError("feedback-protected story should not hydrate")
-
-        monkeypatch.setattr(httpx, "AsyncClient", MockClient)
+        monkeypatch.setattr(
+            "scripts._seed_common._ch_query_stories_with_comments", fail_bulk
+        )
         (
             inserted,
             skipped_feedback,
@@ -142,20 +134,12 @@ async def test_seed_skips_existing_story_without_feedback(monkeypatch):
         )
         db.upsert_story(original)
 
-        class MockClient:
-            def __init__(self, **kwargs):
-                pass
+        def fail_bulk(*a, **kw):
+            raise AssertionError("existing story should not hydrate")
 
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                pass
-
-            async def get(self, url):
-                raise AssertionError("existing story should not hydrate")
-
-        monkeypatch.setattr(httpx, "AsyncClient", MockClient)
+        monkeypatch.setattr(
+            "scripts._seed_common._ch_query_stories_with_comments", fail_bulk
+        )
         (
             inserted,
             skipped_feedback,
@@ -191,11 +175,19 @@ async def test_seed_skips_existing_story_without_feedback(monkeypatch):
 async def test_comment_hydration_success_updates_embedding(monkeypatch):
     db = Database(":memory:")
     try:
-        item = {
+        ch_item = {
+            "id": 456,
             "type": "story",
+            "title": "Hydrate me",
+            "url": "https://example.com/h",
+            "story_text": "",
+            "text": "",
             "num_comments": 2,
+            "created_at_i": 1760000000,
+            "points": 120,
             "children": [
                 {
+                    "id": 1001,
                     "type": "comment",
                     "text": "Substantive comment with enough words and length to pass the minimum comment length filtering.",
                     "children": [],
@@ -203,20 +195,12 @@ async def test_comment_hydration_success_updates_embedding(monkeypatch):
             ],
         }
 
-        class MockClient:
-            def __init__(self, **kwargs):
-                pass
+        def fake_bulk(story_ids, max_levels=5):
+            return {456: ch_item}
 
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                pass
-
-            async def get(self, url):
-                return httpx.Response(200, json=item)
-
-        monkeypatch.setattr(httpx, "AsyncClient", MockClient)
+        monkeypatch.setattr(
+            "scripts._seed_common._ch_query_stories_with_comments", fake_bulk
+        )
         (
             inserted,
             skipped_feedback,
@@ -260,20 +244,12 @@ async def test_comment_hydration_failure_preserves_ch_skeleton(monkeypatch):
     db = Database(":memory:")
     try:
 
-        class MockClient:
-            def __init__(self, **kwargs):
-                pass
+        def fail_bulk(*a, **kw):
+            raise RuntimeError("simulated CH outage")
 
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                pass
-
-            async def get(self, url):
-                return httpx.Response(503)
-
-        monkeypatch.setattr(httpx, "AsyncClient", MockClient)
+        monkeypatch.setattr(
+            "scripts._seed_common._ch_query_stories_with_comments", fail_bulk
+        )
         await seed_rows(
             [
                 {
