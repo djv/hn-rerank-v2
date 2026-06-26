@@ -12,3 +12,7 @@ onnx_model_*/
 public/
 .env
 .env.local
+.mimocode/
+eval_ranker_*.json
+calibration_plot.png
+hn_rewrite.db.*
