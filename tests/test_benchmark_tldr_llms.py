@@ -6,14 +6,11 @@ import pytest
 
 from scripts.benchmark_tldr_llms import (
     StoryRecord,
-    _build_article_section,
-    _build_content_section,
     _call_openrouter_chat,
     _count_bullets,
     _has_nested_lists,
     _sanitize_model_id,
     _source_bucket,
-    _split_sections,
     _word_count,
     generate_tldr_for_story,
     load_partial,
@@ -76,7 +73,6 @@ def test_select_sample_respects_limit(tmp_path):
             article_body TEXT DEFAULT ''
         )
     """)
-    # Insert a mix of sources
     for i in range(8):
         conn.execute(
             "INSERT INTO stories (id, title, text_content, source, self_text) "
@@ -101,30 +97,6 @@ def test_select_sample_respects_limit(tmp_path):
     sample = select_sample(str(db_path), limit=10)
     assert len(sample) == 10
     assert all(isinstance(s, StoryRecord) for s in sample)
-
-
-# ── Prompt building ─────────────────────────────────────────────────────
-
-
-def test_build_article_section_only_self_text():
-    result = _build_article_section("Author text", "")
-    assert "Author's text:" in result
-    assert "Author text" in result
-    assert "Article body:" not in result
-
-
-def test_build_article_section_both():
-    result = _build_article_section("Author text", "Article body text")
-    assert "Author's text:" in result
-    assert "Article body:" in result
-
-
-def test_build_content_section_all_fields():
-    result = _build_content_section("My Title", "Self", "Body", "Comments")
-    assert "Title: My Title" in result
-    assert "Self" in result
-    assert "Body" in result
-    assert "Comments" in result
 
 
 # ── OpenRouter call ─────────────────────────────────────────────────────
@@ -173,7 +145,7 @@ async def test_call_openrouter_chat_error(monkeypatch):
     assert "Error: HTTP 429" in result
 
 
-# ── Utility: word count, bullet count, nested lists, sections ───────────
+# ── Utility: word count, bullet count, nested lists ─────────────────────
 
 
 def test_word_count_empty():
@@ -206,27 +178,10 @@ def test_has_nested_lists_false():
     assert not _has_nested_lists("- Top level\n- Another")
 
 
-def test_split_sections_dual():
-    text = "### Article\n- Bullet 1\n\n### Discussion\n- Bullet 2"
-    sections = _split_sections(text)
-    assert "article" in sections
-    assert "discussion" in sections
-    assert "Bullet 1" in sections["article"]
-    assert "Bullet 2" in sections["discussion"]
+# ── Format compliance scoring (unified path) ────────────────────────────
 
 
-def test_split_sections_preamble():
-    text = "### Article\n- Point"
-    sections = _split_sections(text)
-    # preamble should be empty; only article present
-    assert len(sections) == 1
-    assert "article" in sections
-
-
-# ── Format compliance scoring ───────────────────────────────────────────
-
-
-def test_score_compliance_dual_perfect():
+def test_score_compliance_perfect():
     tldr = (
         "### Article\n"
         "- **Key finding:** Great results\n"
@@ -237,88 +192,88 @@ def test_score_compliance_dual_perfect():
         "- **Consensus:** People agree\n"
         "- Important nuance emerges\n"
     )
-    result = score_compliance(tldr, path="dual")
+    result = score_compliance(tldr)
     assert result.passes, f"Expected no violations, got: {result.violations}"
     assert result.score == 1.0
 
 
-def test_score_compliance_dual_missing_headings():
-    tldr = "- Some orphan bullet\n- Another"
-    result = score_compliance(tldr, path="dual")
+def test_score_compliance_accepts_no_discussion():
+    """Discussion section is optional; only ### Article is required."""
+    tldr = (
+        "### Article\n- Only point one\n- Only point two\n- Point three\n- Point four\n"
+    )
+    result = score_compliance(tldr)
+    assert result.passes, f"Expected no violations, got: {result.violations}"
+    assert result.score == 1.0
+
+
+def test_score_compliance_missing_article_heading():
+    tldr = "### Discussion\n- Comment\n- Another comment\n"
+    result = score_compliance(tldr)
     assert not result.passes
     assert "missing_article_heading" in result.violations
-    assert "missing_discussion_heading" in result.violations
 
 
-def test_score_compliance_dual_nested_lists():
-    tldr = (
-        "### Article\n"
-        "- Top bullet\n"
-        "  - Nested bullet\n"
-        "- Another top bullet\n"
-        "\n"
-        "### Discussion\n"
-        "- Comment summary\n"
-        "- More discussion\n"
-    )
-    result = score_compliance(tldr, path="dual")
+def test_score_compliance_no_bullets():
+    tldr = "### Article\nJust a paragraph without any bullets."
+    result = score_compliance(tldr)
+    assert not result.passes
+    assert "no_bullets" in result.violations
+
+
+def test_score_compliance_word_cap_exceeded():
+    tldr = "### Article\n" + "- " + "word " * 250 + "\n"
+    result = score_compliance(tldr)
+    assert not result.passes
+    assert any(v.startswith("word_count_") for v in result.violations)
+
+
+def test_score_compliance_nested_lists():
+    tldr = "### Article\n- Top bullet\n  - Nested bullet\n- Another top bullet\n"
+    result = score_compliance(tldr)
     assert not result.passes
     assert "nested_lists" in result.violations
 
 
-def test_score_compliance_fallback_perfect():
-    tldr = (
-        "### Summary\n"
-        "- **Key insight:** Something important\n"
-        "- Supporting point here\n"
-        "- Another relevant fact\n"
-        "- Final thought to round out\n"
-    )
-    result = score_compliance(tldr, path="fallback")
-    assert result.passes, f"Expected no violations, got: {result.violations}"
-    assert result.score == 1.0
-
-
-def test_score_compliance_fallback_no_bullets():
-    tldr = "### Summary\nJust a paragraph without any bullets."
-    result = score_compliance(tldr, path="fallback")
-    assert not result.passes
-    assert "fallback_no_bullets" in result.violations
-
-
 def test_score_compliance_nonempty_fail():
-    result = score_compliance("Error: HTTP 500", path="dual")
+    result = score_compliance("Error: HTTP 500")
     assert not result.passes
     assert result.score == 0.0
 
 
-def test_score_compliance_article_line_not_bullet():
+def test_score_compliance_unexpected_format():
+    tldr = "### Article\n- Valid bullet\norphan text without prefix\n- Another bullet\n"
+    result = score_compliance(tldr)
+    assert "unexpected_format" in str(result.violations)
+
+
+def test_score_compliance_idempotent_check():
     tldr = (
         "### Article\n"
-        "This is a prose line, not a bullet\n"
-        "- Valid bullet\n"
-        "- Another\n"
+        "- Normalized line\n"
+        "- Another bullet\n"
+        "- Third point\n"
         "\n"
         "### Discussion\n"
-        "- Comment\n"
-        "- Another comment\n"
+        "- Good summary\n"
+        "- Second point\n"
     )
-    result = score_compliance(tldr, path="dual")
-    assert not result.passes
-    assert "article_line_not_bullet" in result.violations
+    result = score_compliance(tldr)
+    assert "normalization_not_idempotent" not in result.violations
 
 
-# ── generate_tldr_for_story dual path ───────────────────────────────────
+# ── generate_tldr_for_story (unified path) ──────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_generate_tldr_for_story_dual_path_success(monkeypatch):
+async def test_generate_tldr_for_story_success(monkeypatch):
     async def mock_call(*, api_key, model, prompt, max_tokens, base_url):
-        if "Summarize the article" in prompt:
-            return "- Article summary mock"
-        if "Summarize the discussion" in prompt:
-            return "- Discussion summary mock"
-        return "- Fallback mock"
+        return (
+            "### Article\n"
+            "- Article point one\n"
+            "- Article point two\n"
+            "- Article point three\n"
+        )
 
     monkeypatch.setattr("scripts.benchmark_tldr_llms._call_openrouter_chat", mock_call)
     story = StoryRecord(
@@ -339,24 +294,59 @@ async def test_generate_tldr_for_story_dual_path_success(monkeypatch):
         rate_sleep=0.0,
     )
     assert result.status == "ok"
-    assert result.path == "dual"
     assert "### Article" in result.tldr
-    assert "### Discussion" in result.tldr
-    assert result.raw_article_response == "- Article summary mock"
-    assert result.raw_discussion_response == "- Discussion summary mock"
-    assert result.raw_fallback_response == ""
+    assert "### Article" in result.raw_response
     assert result.compliance is not None
 
 
 @pytest.mark.asyncio
-async def test_generate_tldr_for_story_fallback_path(monkeypatch):
+async def test_generate_tldr_for_story_includes_discussion_when_comments_present(
+    monkeypatch,
+):
     async def mock_call(*, api_key, model, prompt, max_tokens, base_url):
-        return "- Single fallback bullet\n- Second bullet"
+        return (
+            "### Article\n"
+            "- Article point\n"
+            "- Second article point\n"
+            "- Third article point\n"
+            "\n"
+            "### Discussion\n"
+            "- Comment summary\n"
+            "- Nuance point\n"
+        )
 
     monkeypatch.setattr("scripts.benchmark_tldr_llms._call_openrouter_chat", mock_call)
     story = StoryRecord(
         id=2,
-        title="Fallback Only",
+        title="With Comments",
+        url="https://example.com",
+        source="hn",
+        self_text="Some author text",
+        top_comments="/u/a: Good comment\n/u/b: Another one",
+        article_body="Some article",
+        text_content="Full content",
+    )
+    result = await generate_tldr_for_story(
+        story,
+        api_key="sk-test",
+        model="test/model",
+        base_url="https://api.example.com/v1",
+        rate_sleep=0.0,
+    )
+    assert result.status == "ok"
+    assert "### Article" in result.tldr
+    assert "### Discussion" in result.tldr
+
+
+@pytest.mark.asyncio
+async def test_generate_tldr_for_story_exception(monkeypatch):
+    async def mock_call(*, api_key, model, prompt, max_tokens, base_url):
+        raise RuntimeError("Connection error")
+
+    monkeypatch.setattr("scripts.benchmark_tldr_llms._call_openrouter_chat", mock_call)
+    story = StoryRecord(
+        id=3,
+        title="Failing",
         url=None,
         source="ch_seed",
         self_text="",
@@ -371,12 +361,8 @@ async def test_generate_tldr_for_story_fallback_path(monkeypatch):
         base_url="https://api.example.com/v1",
         rate_sleep=0.0,
     )
-    assert result.status == "ok"
-    assert result.path == "fallback"
-    assert result.raw_fallback_response is not None
-    assert result.raw_article_response == ""
-    assert result.raw_discussion_response == ""
-    assert result.compliance is not None
+    assert result.status == "exception"
+    assert result.tldr == ""
 
 
 # ── Partial cache ───────────────────────────────────────────────────────
@@ -405,36 +391,3 @@ def test_save_and_load_partial_roundtrip(tmp_path):
     assert p.exists()
     loaded = load_partial(p)
     assert loaded[99]["tldr"] == "test"
-
-
-# ── Score compliance edge cases ─────────────────────────────────────────
-
-
-def test_score_compliance_idempotent_check():
-    tldr = (
-        "### Article\n"
-        "- Normalized line\n"
-        "- Another bullet\n"
-        "- Third point\n"
-        "\n"
-        "### Discussion\n"
-        "- Good summary\n"
-        "- Second point\n"
-    )
-    result = score_compliance(tldr, path="dual")
-    assert "normalization_not_idempotent" not in result.violations
-
-
-def test_score_compliance_unexpected_format():
-    tldr = (
-        "### Article\n"
-        "- Valid bullet\n"
-        "orphan text without prefix\n"
-        "- Another bullet\n"
-        "\n"
-        "### Discussion\n"
-        "- Comment\n"
-        "- More\n"
-    )
-    result = score_compliance(tldr, path="dual")
-    assert "unexpected_format" in str(result.violations)
