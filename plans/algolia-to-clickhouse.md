@@ -1,6 +1,8 @@
 # Algolia → ClickHouse Migration (Future Work)
 
-> Recorded 2026-06-26. Not implemented; deferred until value/cost is reassessed.
+> Recorded 2026-06-26. **Partially implemented 2026-06-26** — see "Status"
+> section below. Algolia is no longer used for bulk comment hydration;
+> single-story items calls remain on Algolia by design.
 
 ## Why
 
@@ -77,3 +79,49 @@ Algolia wins on raw latency. CH wins on ownership, no rate limit, no third-party
 - Mock CH responses in `tests/test_pipeline.py` to match Algolia item shape; verify `fetch_story` accepts both formats
 - New `tests/test_hydrate_comments_from_ch.py` with BFS, CTE, and edge-case (deleted/empty/poll) scenarios
 - Live smoke test: pick 3 stories from the recent CH seed (167 rows), compare BFS comments vs Algolia items API comments
+
+## Status (2026-06-26)
+
+**Phase 1 (2026-06-26)**: bulk-hydration Option B + bulk-prewarm feature.
+
+- `ch_client.py` added with 5 query functions + in-memory LRU cache.
+- `scripts/_seed_common.seed_rows` now uses one bulk CH query for the
+  entire skeleton set instead of one Algolia call per story. Measured
+  speedup: ~30s (Algolia parallel) → ~0.3s (CH bulk) for 100 stories.
+- Old per-story parallel Algolia hydration preserved in
+  `scripts/_archive/algolia/hydrate_comments_algolia.py` as a fallback.
+- New `pipeline.prewarm_top_stories` runs on every dashboard render for
+  the top-20 ranked stories. Pre-populates `top_comments` so the first
+  4 cards skip the lazy Algolia fetch.
+
+**Phase 2 (2026-06-26)**: live `hn` source consolidation.
+
+- `pipeline.fetch_candidates` rewritten to use one CH query for the
+  live 7-day window (`ch_client.query_live_window`) instead of the
+  previous 25-call Algolia search loop.
+- Per-story Algolia items calls for live candidates (was ~100/regen)
+  are no longer needed — the CH live window already returns all fields
+  (title, url, score, descendants, time, text) in the same query.
+- ~~Growth-triggered comment refetch~~ (removed 2026-06-26): the per-regen
+  refetch was mostly redundant with the render-time
+  `prewarm_top_stories(top_20_ids, ...)` call. Both use the same CH bulk
+  path; the render-time prewarm covers the cards the user actually
+  clicks. Stories that grow fast but stay outside the top-20 have stale
+  embeddings for ≤3h until they surface.
+- Net per regen: ~125 Algolia calls → 1 CH call. Wall time
+  ~30-60s parallel → ~0.5s sequential.
+
+**Algolia remaining in the codebase**:
+
+- `pipeline.fetch_story` (single-story items API) is still defined and
+  used as a **fallback** in `server.py`'s `/api/tldr-detail` handler
+  for `ch_seed`/`bq_seed` stories whose `top_comments` is empty (i.e.,
+  outside the prewarm top-20). Low frequency; only the long tail of
+  stories the user actually clicks.
+- `pipeline.refetch_story_text` (single-story items API) is still
+  defined and tested but no longer called from `fetch_candidates`.
+
+**Tradeoff accepted**: 1-24h CH latency for brand-new stories. With a
+3h regen cycle, worst case is 4h lag for a story posted in the last
+hour. Acceptable for a "best of HN" view; the swipe deck mostly shows
+older stories anyway.

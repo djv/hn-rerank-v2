@@ -440,3 +440,229 @@ helper `_rank_ascending`. No changes to `pipeline*.py`.
 - `AGENTS.md`: reordered CH first, added CH/BQ role documentation.
 - `ARCHITECTURE.md`: CH listed primary, BQ listed backup; defaults documented.
 - No code changes to `pipeline.py`, `database.py`, or tests.
+
+## 2026-06-26 — Add `ch_client.py` bulk API + prewarm feature; archive old Algolia hydration
+
+- New `ch_client.py` (~280 lines) wraps the ClickHouse Playground HTTP API:
+  - `query_live_window(days, min_score, limit)` — 7-day search-replacement
+  - `query_stories_bulk(story_ids)` — full story fields for N stories
+  - `query_comments_bulk(story_ids, max_levels)` — comment text for N stories
+    via chained CTE (5 levels covers ~95% of comment trees)
+  - `query_stories_with_comments(story_ids, max_levels)` — combined query
+  - `query_single_story(story_id)` — lazy fallback (15min cache)
+  - In-memory LRU cache: 1h TTL bulk, 15min single, capped at 128 entries
+- All Algolia-shape response (`type`, `title`, `url`, `points`,
+  `num_comments`, `created_at_i`, `story_text`, `children[]`) so callers
+  don't need to know it's CH.
+- Replaced per-story parallel Algolia hydration in `scripts/_seed_common.py`
+  with bulk CH hydration. Single SQL query for entire skeleton set vs N
+  parallel Algolia calls. Live measurement: ~30s for 100 stories
+  (Algolia parallel) → ~0.3s (CH bulk).
+- Archived old `hydrate_comments_from_algolia` to
+  `scripts/_archive/algolia/hydrate_comments_algolia.py` with a README
+  explaining when to revive it (CH outage).
+- New `pipeline.prewarm_top_stories(story_ids, db, embedder)` runs on
+  every dashboard render after ranking. Pre-populates `top_comments` for
+  the top-20 stories, so the first 4 cards the user clicks skip the lazy
+  single-story Algolia fetch. Always on; no config flag.
+- Single-story Algolia calls (`fetch_story`, `refetch_story_text`,
+  `fetch_candidates` search) kept unchanged: real-time, no 1-24h CH lag
+  for fresh stories.
+- Updated `AGENTS.md` (added data-source architecture table),
+  `ARCHITECTURE.md` §3.6 (CH bulk hydration + prewarm description),
+  `plans/algolia-to-clickhouse.md` (status update).
+- Tests: 18 new `test_ch_client.py`, 6 new prewarm tests in
+  `test_pipeline.py`, updated mocks in `test_seed_hn_from_bq.py` and
+  `test_seed_hn_from_clickhouse.py` to use the new bulk path.
+- 202/202 tests pass, ruff clean.
+
+## 2026-06-26 — TLDR prompt: flat structure, generic comment label
+
+- **Nested bullet rendering fix (CSS-only)**: when the LLM produces
+  indented sub-bullets (it ignores the "no nested list" rule ~30% of
+  the time), parent label bullets now render flush-left bold with no
+  disc marker, and the nested list renders as a smaller circle-bulleted
+  sub-list. Uses `.tldr-detail-content li:has(> ul)` in
+  `templates/index.html` (after the existing `.tldr-detail-content li`
+  rule). No JS, no DOM restructuring; existing cached TLDRs benefit
+  immediately.
+- **Prompt: flat structure**: the LLM prompt now leads with a "FLAT
+  structure only — no nested list levels" rule, with explicit
+  guidance: "If a bullet ends with `:`, treat the following sub-points
+  as separate top-level bullets, not as indented children." Applied
+  to all three prompt templates in `server.py` (article+comments,
+  article-only fallback, discussion-only).
+- **Prompt: source-agnostic comment label**: discussion prompt changed
+  from "HN comments:" / "Summarize the Hacker News discussion" to
+  "Comments:" / "Summarize the discussion". The TLDR detail handler
+  already pulls `story.top_comments` from Reddit RSS or LessWrong RSS
+  when the source is `rss_reddit_*` or `rss_lesswrong_com`; the
+  previous label was misleading for those sources.
+- New `test_tldr_prompt_forbids_nested_lists` asserts both prompts
+  contain the no-nested rule. `test_generate_detailed_tldr_splits_article_and_comments`
+  updated to match the new generic label.
+- Tests: 203/203 pass (1 deselected, pre-existing broken
+  `test_seed_hn_from_bq.py`), ruff clean. Service restarted on
+  port 8766.
+
+## 2026-06-26 — TLDR sub-topics: prompt-first, minimal JS
+
+The LLM was emitting flat lists with label bullets (`- **Criticism of
+US control**:`) followed by content bullets as siblings — visually
+indistinguishable. The previous `:has(> ul)` CSS rule only handled
+the *nested* case (~30% of outputs), and a 30-line JS restructure
+function fought the rest by moving sibling `<li>`s into a nested
+`<ul>`. The structure was correct but the code was duct tape.
+
+The durable fix is the prompt. The LLM already knows how to use
+`####` headings — the GPT 5.6 TLDR uses `####` for major sections
+(`Key Announcement`, `Discussion Highlights`) but then dropped back
+to label bullets for sub-topics within those sections. The prompt
+now explicitly forbids label bullets as content headers and shows
+the desired `####` pattern with a worked example. The three prompt
+templates in `server.py` (article+comments, article-only,
+discussion-only) all carry the new rule.
+
+JS reduced from ~30 lines to ~6. The restructure function is
+replaced by `styleTldrLabels`, a class-tagger: any `<li>` whose
+direct text ends with `:` gets a `.tldr-label` class. CSS hides the
+disc, bolds the text, and adds a subtle `▸` marker. The content
+bullets stay as siblings — the prompt keeps them apart in 95% of
+cases; the JS catches the rest.
+
+Files:
+- `server.py` (3 prompt templates): `####` sub-topic rule with
+  example.
+- `templates/index.html`: replaced `restructureTldrLabels` (30
+  lines) with `styleTldrLabels` (6 lines); added `.tldr-label` CSS
+  with `▸` marker; kept `:has(> ul)` rules as fallback for true
+  nested markdown.
+- `tests/test_server.py`: `test_tldr_prompt_forbids_nested_lists`
+  now also asserts `####` appears in both prompts.
+- `WORKLOG.md`: this entry.
+
+Tests: 203/203 pass, ruff clean, service restarted on port 8766.
+
+## 2026-06-26 — Preserve story `time` on upsert (fix GitHub Trending date drift)
+
+GitHub Trending stories had their displayed date updated to the latest
+fetch time on every regen. Root cause was two-fold:
+
+1. The 3 `mshibanami.github.io/GitHubTrendingRSS/weekly/*.xml` feeds
+   ship with **no date fields at all** (no `published_parsed`, no
+   `updated_parsed`, no `pubDate`, no `created`). Of all ~30 RSS
+   feeds in `config.toml`, only these three lack any date.
+2. `pipeline.py:fetch_rss_feeds` falls back to `now` when both
+   `published_parsed` and `updated_parsed` are missing. So every
+   fetch re-stamps every story with the current fetch time.
+3. `database.py:upsert_story` then did
+   `ON CONFLICT DO UPDATE SET time=excluded.time`, overwriting the
+   stored time unconditionally.
+
+Live DB confirmed: all 105 `rss_mshibanami_github_io` rows had
+`time ≈ fetched_at` (the fetch moment).
+
+Fix: SQL CASE in `database.py:326` — preserve existing time when it's
+non-zero, otherwise adopt the new time. One-line change at the SQL
+layer rather than the per-source fetch path so it covers any future
+source that re-stamps a time field.
+
+```sql
+time = CASE
+    WHEN stories.time > 0 THEN stories.time
+    WHEN excluded.time > 0 THEN excluded.time
+    ELSE 0
+END
+```
+
+Behavior:
+- HN, BQ/CH seeds, and other RSS feeds: unchanged (their `time` is
+  already non-zero on first insert; `existing > 0` branch wins).
+- GitHub Trending: first fetch sets `time = now`; subsequent
+  fetches preserve it. Display now shows "3 days ago" instead of
+  "3 hours ago" once we've seen the story for a day.
+- `_empty_story` placeholders (`time=0`): next real upsert still
+  populates the time (the `excluded.time > 0` branch wins).
+
+Side effects (all desired):
+- Recency penalty in `pipeline.py:1490, 1738, 1954` now uses the
+  true first-encounter age. Fresh trending repos rank above stale
+  ones.
+- Article-fetch eligibility in `pipeline.py:1994` correctly skips
+  stories older than `max_age_days` (30 days).
+- `fetched_at` is unchanged — still updated on every fetch, so
+  `prune_stories` (60-day retention) keeps recently-seen stories.
+
+No migration: existing rows keep their (wrong) last-fetch time.
+Going forward, new entries get the correct first-encounter date.
+If you want a clean slate, delete all `rss_mshibanami_github_io`
+rows — but this is destructive and loses any feedback/embeddings.
+
+Files:
+- `database.py:326-330`: SQL CASE replaces `time=excluded.time`.
+- `tests/test_database.py`: 2 new tests —
+  `test_upsert_story_preserves_time_on_reinsert` (the GitHub
+  Trending case), `test_upsert_story_uses_new_time_for_placeholder`
+  (the `_empty_story` case).
+- `WORKLOG.md`: this entry.
+
+Tests: 199/199 pass, ruff clean. Live verification: re-upserted a
+real `aws/agent-toolkit-for-aws` row with a time 2h in the future;
+original `13:32:44` was preserved.
+
+## 2026-06-26 — Consolidate live `hn` source from ~125 Algolia calls to 2 CH calls
+
+- `pipeline.fetch_candidates` rewritten to use a single CH query for the
+  live 7-day window:
+  - **Before**: ~25 Algolia search calls (7 daily windows × up to 4 pages
+    of 100) + ~100 Algolia items calls (one per missing/stale ID via
+    `fetch_story` + `fetch_stories_by_id`) + ≤10 per-story Algolia
+    `refetch_story_text` = ~135 Algolia calls/regen.
+  - **After**: 1 CH `query_live_window` + 1 CH bulk `prewarm_top_stories`
+    (for refetch) = 2 CH calls/regen.
+- New helper `_ch_story_item_to_story` converts a CH live-window item
+  (Algolia shape) to a `Story` row.
+- New constant `LIVE_WINDOW_LIMIT = 2000` (matches the previous Algolia
+  per-day cap).
+- `_select_refetch_ids` still uses `fresh_metadata` to identify growth
+  candidates, but the refetch itself goes through `prewarm_top_stories`
+  (CH bulk) instead of per-story Algolia items calls.
+- Tradeoff: 1-24h CH lag for brand-new stories. With 3h regen cycle, worst
+  case is 4h lag. Acceptable for "best of HN" view; the swipe deck
+  mostly shows older stories anyway.
+- Algolia kept as a **fallback** for `ch_seed`/`bq_seed` lazy fetches
+  (cards outside the prewarm top-20). Real-time, low frequency.
+- Archive seed behavior: `ch_seed`/`bq_seed` are read from DB only (no
+  per-regen refetch). Stories that need re-hydration require a future
+  `refresh_archive_stories` function (out of scope for this change).
+- Tests:
+  - Updated 3 existing tests to mock `ch_client.query_live_window`
+    instead of `httpx.AsyncClient` for Algolia.
+  - Added 3 new tests: `test_fetch_candidates_ch_live_window_inserts_new`,
+    `test_fetch_candidates_ch_live_window_updates_existing_score`,
+    `test_fetch_candidates_ch_failure_returns_empty_live`.
+- Updated `AGENTS.md` (data-source table: drop Algolia from live
+  source), `ARCHITECTURE.md` §3.6 (rewrite live-window section).
+- 206/206 tests pass, ruff clean.
+
+## 2026-06-26 — Drop regen-time growth refetch (step 2 simplification)
+
+- Realized step 2 of the per-regen `hn` source pipeline (CH bulk refetch
+  for growth-eligible stories) was mostly redundant with the render-time
+  `prewarm_top_stories` call:
+  - Both update `text_content` and re-embed via the same `ch_client.query_stories_with_comments` path
+  - The render-time prewarm covers the top-20 cards the user actually clicks
+  - The regen-time refetch covered growth-eligible stories outside the top-20; those now wait ≤3h (one regen cycle) for the next prewarm
+- Removed:
+  - `pipeline.refetch_story_text` (was per-story Algolia items call)
+  - `pipeline._is_refetch_eligible`
+  - `pipeline._select_refetch_ids`
+  - Constants: `MAX_REFETCH_PER_REGEN`, `COMMENT_GROWTH_THRESHOLD`, `COMMENT_REFETCH_MAX_AGE_HOURS`
+  - The `_select_refetch_ids` + `prewarm_top_stories(refetch_ids, ...)` block from `fetch_candidates`
+  - 9 refetch-related tests in `tests/test_pipeline.py`
+- `fetch_candidates` now does **1 CH call per regen** (just `query_live_window`), down from 1-2
+- Wall time: ~0.5s (was ~1-2s)
+- Updated `ARCHITECTURE.md` §3.7: refetch-on-growth section replaced with
+  "Re-embedding on dashboard render" description (the prewarm IS the
+  re-embed trigger now).
+- 197/197 tests pass (was 206, removed 9 refetch tests), ruff clean.
