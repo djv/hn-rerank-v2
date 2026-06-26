@@ -65,6 +65,34 @@
   diagnostics are tracked in the baseline; new code must introduce
   zero new diagnostics. LSP errors must be fixed or `# type: ignore`
   with a documented reason)
+
+## Dependency groups
+
+`pyproject.toml` ships two groups beyond the runtime deps. Default
+`uv sync` installs only `dev` (linters, pytest, type checker). The
+`dl-experiment` group is opt-in.
+
+- `dev` — pytest, pytest-asyncio, hypothesis, ruff, ty. Always
+  installed by `uv sync`.
+- `dl-experiment` — `torch>=2.12`. Pulls in the ~700MB torch +
+  triton + nvidia-cu* wheels. **Required only by** `pipeline_dl.py`,
+  `pipeline_dl_t0.py`, `tests/test_pipeline_dl.py`, and
+  `scripts/eval_ranker_variants.py` — the unshipped attention-MLP
+  ranker experiment (loses to SVM on every metric; see WORKLOG
+  2026-06-25).
+  - Install on demand: `uv sync --group dl-experiment`
+  - Run the experiment tests: `uv run --group dl-experiment pytest tests/test_pipeline_dl.py`
+  - Run the offline eval: `uv run --group dl-experiment python scripts/eval_ranker_variants.py ...`
+  - Without the group, `scripts/eval_ranker_variants.py` exits 1 with
+    a friendly error pointing at this command.
+  - The 21 `test_pipeline_dl.py` tests are skipped (not failed) by
+    `pytest.importorskip("torch")` at the top of the file when the
+    group is not active.
+
+If a future experiment is added that needs a different heavy
+runtime dep (e.g. jax, tensorflow), give it its own
+`[dependency-groups]` group with a descriptive name, not a runtime
+direct dep.
 - Run persistent server: `systemctl --user {status|start|stop|restart} hn_rewrite.service` (or directly: `uv run python server.py`)
 - Run one-shot generation: `uv run python generate.py`
 - Migrate feedback from legacy JSON: `uv run python migrate_feedback.py`

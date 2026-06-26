@@ -1,8 +1,13 @@
 """Tests for pipeline_dl (AttentionMLP)."""
 
-import numpy as np
-import torch
-from pipeline_dl import AttentionMLP, fit_attention_mlp, predict_attention_mlp
+from __future__ import annotations
+
+import pytest
+
+torch = pytest.importorskip("torch")  # noqa: E402
+
+import numpy as np  # noqa: E402
+from pipeline_dl import AttentionMLP, fit_attention_mlp, predict_attention_mlp  # noqa: E402
 
 
 def test_forward_shape():

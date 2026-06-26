@@ -5,6 +5,37 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-26 — Dep cleanup: torch → optional group; drop unused duckdb + matplotlib
+
+- `pyproject.toml`: `torch>=2.12` moved out of runtime `dependencies` into a
+  new optional `[dependency-groups] dl-experiment = ["torch>=2.12"]` group.
+  The live path (server / pipeline / database / ch_client / generate) does
+  not import torch; only the unshipped `pipeline_dl.py` + `pipeline_dl_t0.py`
+  experiment and the `scripts/eval_ranker_variants.py` offline eval do.
+  See 2026-06-25 below for why the experiment is unshipped.
+- `pyproject.toml`: removed `duckdb>=1.0.0` and `matplotlib>=3.11.0`. Audit
+  found zero `import duckdb` or `import matplotlib` in the repo — both
+  pins were stale from prior analytics experiments and never wired up.
+- `tests/test_pipeline_dl.py`: added `pytest.importorskip("torch")` at
+  the top of the file. The 21 DL-experiment tests now skip (not fail) in
+  the default `uv run pytest` run, and execute normally with
+  `uv run --group dl-experiment pytest tests/test_pipeline_dl.py`.
+- `scripts/eval_ranker_variants.py`: added a friendly `sys.exit(...)` at
+  the top of the script that explains how to install the missing group
+  (`uv sync --group dl-experiment`) instead of crashing with
+  `ModuleNotFoundError: No module named 'torch'`.
+- `uv.lock` regenerated. Default `uv sync` no longer pulls in the
+  `torch` (532MB) + `triton` (198MB) + 12 `nvidia-cu*` wheels. Venv
+  shrunk from 91 → 66 packages for new clones.
+- `AGENTS.md` new "Dependency groups" section documents the policy
+  and the install command.
+- Verification: `uv run pytest tests/` (default group) → 178 passed, 1
+  skipped (the DL group), 1 deselected (slow marker). `uv run --group
+  dl-experiment pytest tests/test_pipeline_dl.py` → 21/21 passed.
+  `uv run ruff check .` → clean. The DL-experiment entry point
+  (`scripts/eval_ranker_variants.py`) prints the friendly error and
+  exits 1 when torch is missing.
+
 ## 2026-06-26 — Add ClickHouse seeder as alternative to BigQuery
 
 - New `scripts/seed_hn_from_clickhouse.py` queries the public ClickHouse

@@ -24,6 +24,14 @@ from sklearn.svm import LinearSVC, SVC
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+try:
+    import torch  # noqa: F401
+except ImportError:
+    sys.exit(
+        "scripts/eval_ranker_variants.py requires torch. "
+        "Install with: uv sync --group dl-experiment"
+    )
+
 from pipeline_dl import fit_attention_mlp, predict_attention_mlp
 from pipeline_dl_t0 import (
     fit_attention_mlp_t0,
