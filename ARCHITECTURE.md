@@ -29,14 +29,14 @@ graph TD
 
 ## 2. Component Layout
 
-The codebase consists of five primary modules:
+The codebase consists of six primary modules:
 
 1. **[database.py](file:///home/dev/hn-rewrite/database.py)**: Encapsulates all SQLite interactions. Manages schemas (`stories`, `embeddings`, `feedback`), cascade-deletes, pruned retention rules, and automatic schema migrations. Staging raw inputs directly inside `stories` (`self_text`, `top_comments`, `article_body`) permits on-the-fly text composition and sync-detection. The legacy `article_cache` table is dropped and migrated directly.
 2. **[pipeline.py](file:///home/dev/hn-rewrite/pipeline.py)**: Orchestrates the background update sequence. Integrates RSS parsed feeds, computes text embeddings using ONNX, fits the SVM, and generates the final dashboard.
 3. **[server.py](file:///home/dev/hn-rewrite/server.py)**: A multi-threaded web server serving the static dashboard, handling feedback writes, proxying detailed TLDR summaries to LLM APIs, and housing the background regeneration event thread.
 4. **[templates/index.html](file:///home/dev/hn-rewrite/templates/index.html)**: Jinja2 dashboard template styled with a compact dark-theme Pico CSS layout. Presents a Tinder-style single-card deck with keyboard voting, a capped preloaded queue, and asynchronous TLDR rendering that auto-expands for the active story.
 5. **[migrate_feedback.py](file:///home/dev/hn-rewrite/migrate_feedback.py)**: Imports legacy feedback data from `hn_rerank` JSON files, backfilling candidate story contents and caching embeddings.
-6. **[scripts/seed_hn_from_bq.py](file:///home/dev/hn-rewrite/scripts/seed_hn_from_bq.py)**: One-off archive seed using the authenticated `bq` CLI against `bigquery-public-data.hacker_news.full`. It imports high-score HN stories as `source="bq_seed"` rows, hydrates selected Algolia comments when available, and computes embeddings without fetching article bodies.
+6. **[scripts/seed_hn_from_clickhouse.py](file:///home/dev/hn-rewrite/scripts/seed_hn_from_clickhouse.py)** (primary) / **[scripts/seed_hn_from_bq.py](file:///home/dev/hn-rewrite/scripts/seed_hn_from_bq.py)** (backup): One-off archive seeders. The ClickHouse variant queries the public Playground over HTTP (no auth) against `hackernews_history FINAL` (defaults: 6 months, score ≥ 200); the BigQuery backup uses the authenticated `bq` CLI against `bigquery-public-data.hacker_news.full`. Both import common logic from `_seed_common` — they import high-score HN stories as `source="ch_seed"` or `source="bq_seed"` rows, hydrate selected Algolia comments when available, and compute embeddings without fetching article bodies.
 
 ---
 
@@ -86,6 +86,8 @@ To prevent train-test covariate shift / feature leakage, when computing the simi
 
 To avoid outlier features (like fresh stories having extremely large negative z-scores like `-4.8` for points/comments, or similarity features having blown-up z-scores due to low training variance) from completely dominating the SVM ranking decision, the standard-scaled metadata features are clipped to the range `[-2.5, 2.5]`. This z-score clipping significantly improves raw ranking metrics (Raw NDCG@100 from `0.720` to `0.738`, Raw NDCG@200 from `0.691` to `0.706`) and prevents model overfitting.
 
+**Raw embeddings must not be standard-scaled.** The 384-d MiniLM vectors are L2-normalized — each dimension is on the same unit scale by construction. StandardScaler is applied only to metadata columns (from `emb_dim:` onward in the feature vector). Scaling raw embedding dimensions independently breaks their cosine similarity structure and collapses ranking performance, because a dimension with small-magnitude signal across the training set gets inflated to the same variance as a dimension with genuine semantic signal.
+
 ### 3.3 SVM Personalization
 When both upvote and downvote feedback pass the dual gate, the runtime trains a per-user `SVC` with `probability=False` and ranks candidates by the normalized one-vs-rest up-class margin:
 
@@ -115,18 +117,19 @@ The live dashboard path does not apply a hidden top-1000 prefilter. `fast_rerank
 
 The dashboard consumes the server-ranked order as a swipe deck instead of a visible list. The ranker emits 12 primary/default stories plus all generated discovery/popularity extra slots, and the template renders that whole returned pool so local modes can filter without another server round trip. The browser still shows only the first unvoted card for the active mode and refills from a freshly rendered dashboard when that mode's queue drops to 4 or fewer cards. The score-based gradient is applied client-side from `data-score`; it remains a rank-position signal over the currently loaded pool.
 
-Discovery badges (uncertainty, novelty, talk-worthy, top, hot) are applied to any story that meets the criteria — primary or extra-slot. The **Similar badge is the exception**: it is reserved for extra-slot stories only, never for primary-ranked stories, so it always signals "surfaced from outside primary because of high semantic match" rather than a near-tautology on top-ranked stories (where score and `cand_closest_up` are correlated by construction). A primary-ranked story that crosses the talk-worthy, top, or hot percentile threshold receives that badge just as an extra-slot story would; multiple badges per card are allowed. The six discovery passes additionally source stories from the remaining candidate pool (stories not already in the primary ranked set) to surface qualifying stories that would not otherwise be shown; each pass respects its own slot cap and dedupes from later passes. The uniform badge attribution does not consume those slots:
+Discovery badges (uncertainty, novelty, talk-worthy, top, hot) are applied to any story that meets the criteria — primary or extra-slot. The **Similar badge is the exception**: it is reserved for extra-slot stories only, never for primary-ranked stories, so it always signals "surfaced from outside primary because of high semantic match" rather than a near-tautology on top-ranked stories (where score and `cand_closest_up` are correlated by construction). A primary-ranked story that crosses the talk-worthy, top, or hot percentile threshold receives that badge just as an extra-slot story would; multiple badges per card are allowed. The seven discovery passes additionally source stories from the remaining candidate pool (stories not already in the primary ranked set) to surface qualifying stories that would not otherwise be shown; each pass respects its own slot cap and dedupes from later passes. The uniform badge attribution does not consume those slots:
 * **Uncertainty/Entropy Surfacing**: We compute the Shannon Entropy of the model's predicted probability distribution (Down, Neutral, Up). The orchestrator adds up to 5 extra slots for the remaining candidates with the highest entropy, flagging them as `is_uncertain=True` (badge `🤔 Unsure`) to prompt active feedback. Primary stories may also receive this badge via the same entropy threshold (derived from the extra-slot selection).
 * **Novel**: Top 15% least similar to feedback, flagged as `is_novel=True` (badge `✨ Novel`), up to 5 slots ranked by a percentile blend of model score (70%) and novelty distance from feedback (30%). This avoids a brittle raw SVM score cutoff while still preferring plausible stories.
 * **Similar** (extra-slot only): Stories with high semantic match to upvotes (top 3% similarity, dynamic 97th percentile threshold), flagged as `is_similar=True` (badge `🎯 Similar`), up to 5 slots sorted by similarity score descending. NOT applied to primary stories.
 * **Discussion-rich**: Top 2% of non-zero `comment_count` and comments > 0, flagged as `is_discussion_rich=True` (badge `💬 Talk-worthy`, 98th percentile of non-zero comments), up to 5 slots sorted by comment count descending.
 * **High-engagement**: Top 2% by `story.score`, flagged as `is_high_engagement=True` (badge `🏆 Top`, 98th percentile), up to 8 slots sorted by SVM score descending.
 * **Hot**: Top 0.5% by engagement velocity (points/hour), flagged as `is_hot=True` (badge `🔥 Hot`, 99.5th percentile), up to 8 slots.
+* **Non-HN**: Stories with `source` not in `{hn, bq_seed}` (all RSS feeds), up to 8 slots sorted by SVM score descending. The `is_non_hn=True` flag is applied to primary non-HN stories as well; the existing source-label badge (`source-badge`) already distinguishes them visually without a new badge.
 
-The final list can therefore exceed `config.count`: the primary relevance path shows `round(config.count * 0.80)` ranked stories, then adds up to 5 uncertainty stories, up to 5 stories for each standard discovery pass, and up to 8 stories for each popularity pass (`Top` and `Hot`). With the default `count=40`, this yields 32 primary ranked stories before extras. If a pass has no remaining qualifying candidates, it contributes fewer than its cap.
+The final list can therefore exceed `config.count`: the primary relevance path shows `round(config.count * 0.80)` ranked stories, then adds up to 5 uncertainty stories, up to 5 stories for each standard discovery pass, up to 8 stories for each popularity pass (`Top` and `Hot`), and up to 8 non-HN stories. With the default `count=40`, this yields 32 primary ranked stories before extras. If a pass has no remaining qualifying candidates, it contributes fewer than its cap.
 
 ### 3.5 Swipe Deck & Warm Refill
-The dashboard uses Tinder-like mechanics. Only one story card is visible at a time, and its TLDR opens automatically. The first few TLDRs for the active mode are prefetched immediately so advancing is usually instant. During browser idle time, the client also prefetches the first three TLDRs for each inactive mode (`Popular`, `Explore`, and `Date` while in `Default`, etc.) so switching modes is often warm without making dashboard rendering wait on LLM calls. Keyboard shortcuts mirror the clickable side-rail legend: `ArrowUp` upvotes, `ArrowDown` downvotes, `ArrowRight` marks neutral, and `u` undoes the most recent vote. The global `keydown` guard only blocks true text-input controls (`input`, `textarea`, `select`, `[contenteditable]`); `<button>` and `<a>` focus does not suppress shortcuts, so clicking a mode tab or vote button and then pressing an arrow key immediately registers the vote. The side rail exposes four local deck modes: `Default` shows the normal ranked pool, `Popular` filters to Hot/Top/Talk-worthy stories, `Explore` filters to Unsure/Similar/Novel stories, and `Date` shows the loaded pool newest-first.
+The dashboard uses Tinder-like mechanics. Only one story card is visible at a time, and its TLDR opens automatically. The first few TLDRs for the active mode are prefetched immediately so advancing is usually instant. During browser idle time, the client also prefetches the first three TLDRs for each inactive mode (`Popular`, `Explore`, and `Date` while in `Default`, etc.) so switching modes is often warm without making dashboard rendering wait on LLM calls. Keyboard shortcuts mirror the clickable side-rail legend: `k` upvotes, `j` downvotes, `l` skips (neutral), and `u` undoes the most recent vote (the `u` keybinding is preserved but the visual hint is hidden). Beyond voting, `o` opens the active story's article URL and `c` opens the comments URL in a new tab; both silently no-op when the corresponding URL is missing. Arrow keys now scroll inside the open TLDR instead of voting. The global `keydown` guard only blocks true text-input controls (`input`, `textarea`, `select`, `[contenteditable]`) and rejects modifier-accelerated keys (`Ctrl`/`Cmd`/`Alt`) to avoid browser shortcut collisions; `<button>` and `<a>` focus does not suppress shortcuts, so clicking a mode tab or vote button and then pressing `j`/`k`/`l` immediately registers the vote. The side rail also shows a 5-segment progress bar that fills as votes accumulate toward the ranking refresh threshold (5 votes); when all 5 segments are filled, the next vote triggers a refresh and the bar resets. A 3-way source filter (`Mixed` / `HN` / `Non-HN`) narrows the deck by story source: `Mixed` is the default (full pool), `HN` shows only `hn` or `bq_seed` stories, and `Non-HN` shows only `rss_*` stories. The source filter stacks on top of the active mode. The side rail exposes four local deck modes: `Default` shows the normal ranked pool, `Popular` filters to Hot/Top/Talk-worthy stories, `Explore` filters to Unsure/Similar/Novel stories, and `Date` shows the loaded pool newest-first.
 
 When a user votes, the visible card exits immediately and the next queued card becomes active without waiting for the feedback POST. Feedback writes always update SQLite, but the client requests a personalized ranking refresh only after every 5 non-undo votes. Undo explicitly requests a refresh after clearing the vote, and older clients that omit queue depth still refresh by default. When the server accepts a refresh request, it invalidates the user's dashboard cache, warms a new render in the background, and wakes the candidate regen thread. The browser then preloads the refreshed dashboard HTML in the background but does not merge it into the active deck until the next user action or an explicit Refresh click, so the visible queue does not shift underneath active reading. If the queue is fully exhausted, the browser refills immediately. Cache entries include the feedback version, so a stale warm render from an earlier vote cannot satisfy a later refill.
 
@@ -135,9 +138,9 @@ The server logs dashboard timing with stable prefixes: `dashboard_cache_invalida
 ### 3.6 Algolia Candidate Fetch Window
 The live-window fetch (`pipeline.py:336`) queries the Algolia HN search API in 7 daily chunks. Each day's fetch collects up to **350 hits** (5 pages of 100, minus stories with `points <= 5`). This cap was raised from 150 to capture the majority of high-score stories on busy days; previously, stories on high-volume days could be dropped before the reranker evaluated them.
 
-Older HN candidates can be backfilled with `uv run python scripts/seed_hn_from_bq.py`. The seed query reads public Hacker News BigQuery rows where `type='story'`, the row is not deleted/dead, and the default filters are the last 3 months with `score >= 100`; override them with `--months N` and `--min-score N`. The seed is pure backfill: any story ID already present in `stories`, and any story ID referenced by feedback, is skipped before Algolia hydration or embedding work. New BQ rows are stored as `source="bq_seed"` with title, URL, score, timestamp, self-text, `descendants` as `comment_count`, and composed text from title + self-text. The script opportunistically calls the Algolia items API to populate `top_comments`, `comment_count_at_fetch`, and recomposed `text_content`; if Algolia fails, the BQ skeleton is preserved. Embeddings are batch-computed after comment hydration through the same `get_or_compute_embeddings()` cache path used by production.
+Older HN candidates can be backfilled with `uv run python scripts/seed_hn_from_clickhouse.py` (ClickHouse Playground, plain HTTP, no auth, queries `hackernews_history FINAL`, default 6 months / score ≥ 200, ~4,400 stories) — this is the **primary** archive seeder. The BigQuery seeder (`scripts/seed_hn_from_bq.py`) is kept as a backup: it uses the authenticated `bq` CLI against `bigquery-public-data.hacker_news.full` and produces a stale snapshot. Both use the same shared logic in `_seed_common`: seed rows are created with `source="ch_seed"` or `source="bq_seed"`, any story ID already present in `stories` or referenced by feedback is skipped before Algolia hydration or embedding work. The scripts opportunistically call the Algolia items API to populate `top_comments`, `comment_count_at_fetch`, and recomposed `text_content`; if Algolia fails, the skeleton is preserved. Embeddings are batch-computed after comment hydration through the same `get_or_compute_embeddings()` cache path used by production.
 
-`bq_seed` rows are a permanent archive candidate pool, not part of the normal recency window. Candidate refresh and per-user dashboard rendering add up to 2,000 BQ archive stories ordered by `score DESC, time DESC`, excluding stories already in that user's feedback set. They are HN-compatible for ranking gravity, TLDR comment fetching, and eval/source features, but the source label remains `BQ Seed` for provenance. Normal age pruning skips `bq_seed` rows so old high-score stories can continue to surface.
+`bq_seed` and `ch_seed` rows are a permanent archive candidate pool, not part of the normal recency window. Candidate refresh and per-user dashboard rendering add up to 4,000 archive stories (2,000 per source) ordered by `score DESC, time DESC`, excluding stories already in that user's feedback set. They are HN-compatible for ranking gravity, TLDR comment fetching, and eval/source features, but the source label remains `BQ Seed` or `CH Seed` for provenance. Normal age pruning skips both `bq_seed` and `ch_seed` rows so old high-score stories can continue to surface.
 
 The configured RSS candidate pool mixes community aggregators with curated expert feeds across AI/software engineering, functional programming, infrastructure/security, FIRE/finance, urbanism/transit, health evidence, and science/culture. RSS feeds are intentionally plain feed URLs that the current pipeline can ingest directly through `feedparser`; newsletters/forums/podcasts are excluded unless they expose stable RSS or Atom items with canonical URLs. Reddit RSS feeds are fetched with a Reddit-specific User-Agent and serialized per regen to reduce `429 Too Many Requests`; their source names include the subreddit (for example `rss_reddit_haskell`) instead of collapsing every subreddit into `rss_reddit_com`.
 
@@ -174,13 +177,13 @@ The Algolia items API (`/api/v1/items/{sid}`) returns a story's full data includ
 3. Valid API but empty composed text → return cached story if exists
 4. Exception → return cached story if exists
 
-### 3.8 Self-Healing Embedding Cache Invalidation (text_hash)
+### 3.9 Self-Healing Embedding Cache Invalidation (text_hash)
 To automatically invalidate and refresh cached embeddings whenever a story's text changes (e.g. following an article body fetch, growth-triggered comment refetch, or comment backfill), we track `text_hash` within the `embeddings` table:
 * **Schema Migration**: Added a `text_hash TEXT NOT NULL DEFAULT ''` column to the `embeddings` table schema (implemented as a safe, backwards-compatible, in-place migration check).
 * **Validation Check**: The caching queries (`get_embedding` and `get_embeddings_batch`) enforce that the computed SHA-256 hash of `story_embedding_text(story)` matches the `text_hash` stored in the DB.
 * **Self-Healing Invalidation**: Any mismatch (or default empty string `''` for pre-existing records) forces a cache miss, triggering automatic re-computation and cache-update on demand without manual table deletions.
 
-### 3.9 Database Connection Pooling & Thread Safety
+### 3.10 Database Connection Pooling & Thread Safety
 To reduce SQLite connection establishment overhead and eliminate lock contention in concurrent web environments:
 * **Connection Pooling**: The `Database` class maintains an internal thread-safe queue of 5 SQLite connections (`queue.Queue`). In-memory databases automatically scale the pool size to 1 to preserve test schema isolation.
 * **Safe Connection Leasing**: Method executions lease connections from the pool via the private context manager `_conn(self)` and release them in a `finally` block, ensuring no leaked connections.
@@ -189,7 +192,7 @@ To reduce SQLite connection establishment overhead and eliminate lock contention
 * **Server-Level Reuse**: The `ThreadingHTTPServer` request handlers reuse a single global `Database` instance across threads, resolving lock issues and significantly increasing throughput.
 * **Longest Text Merge**: `upsert_story()` preserves the longest known `self_text`, `top_comments`, and `article_body` values for an existing story, then recomposes `text_content` from those merged raw fields. This protects dynamically fetched comments and article bodies from being overwritten by later lightweight candidate refreshes.
 
-### 3.10 Runtime Memory Controls
+### 3.11 Runtime Memory Controls
 The server is tuned to keep dashboard renders from stacking large transient allocations:
 * **ONNX Runtime Session Options**: The local embedder disables ORT CPU memory arenas and memory-pattern caching (`enable_cpu_mem_arena=false`, `enable_mem_pattern=false`) and caps CPU execution to two intra-op threads / one inter-op thread. This trades a little throughput for lower retained RSS after embedding bursts.
 * **Embedding Batch Size**: `Embedder.encode()` defaults to batches of 32 texts instead of 64, reducing peak token-embedding tensor size during candidate embedding and article-body re-embedding.
@@ -197,7 +200,7 @@ The server is tuned to keep dashboard renders from stacking large transient allo
 * **Top-k Similarity Selection**: k-NN similarity features use `np.partition` for top-k means instead of fully sorting every similarity row.
 * **Positive Cluster Reuse**: The positive-cluster feature fits one KMeans model per dashboard render, then scores both training feedback and live candidates against the same centers. This avoids a duplicate KMeans fit on every post-vote cache miss.
 
-### 3.11 Multi-User Architecture
+### 3.12 Multi-User Architecture
 The system supports multiple users with independent feedback histories and personalized rankings:
 * **User Identification**: Token-based via URL path (`/u/<token>`) and cookie (`hn_token`). No passwords — the URL is the identity. Users are created on first visit.
 * **Data Model**: Shared `stories` table (candidates are global), per-user `feedback` rows with `PRIMARY KEY (user_id, story_id)`. A `users` table maps tokens to user IDs and display names.
@@ -207,7 +210,7 @@ The system supports multiple users with independent feedback histories and perso
 * **Feedback API**: `POST /api/feedback` requires valid session cookie. The `user_id` is extracted from the token and passed to `upsert_feedback`.
 * **Frontend**: localStorage keys are prefixed with the user token (`<token>_feedback_<story_id>`) to prevent cross-user state leakage.
 
-### 3.12 Evaluation Scripts
+### 3.13 Evaluation Scripts
 Offline eval scripts resolve the `default` token through the `users` table and pass that `user_id` explicitly to `get_feedback_for_training()`. This keeps personalized metrics scoped to the default user's labels instead of pooling all users' feedback.
 
 The leakage-safe variant evaluator is `scripts/eval_ranker_variants.py`. By default it uses the configured live window (`days = 30`), removes training-feedback stories from each fold's candidate pool, leaves held-out feedback stories in the pool as unknown candidates, and computes all feedback-similarity features from the training fold only. Use `--window-days N` to widen the candidate story-age window for offline evaluation without changing production dashboard behavior.
@@ -285,6 +288,8 @@ Fetch flow (server.py `_fetch_article_body`):
 
 Reddit RSS stories are treated differently. On `/api/tldr-detail`, `rss_reddit_*` rows with missing author text or comments fetch the per-post `.rss` feed and cache the first entry's Markdown body in `self_text` and up to 40 selected comment entries in `top_comments` (10K chars total). Generic article scraping is skipped for Reddit comments pages so Reddit block/error pages are not cached as `article_body`. The Reddit RSS enrichment reuses the same `top_comments` field as HN stories, so prompt construction, embeddings, and discussion-rich surfacing see Reddit discussion text through the existing schema.
 
+LessWrong RSS stories (`rss_lesswrong_com`) follow the same lazy-enrichment pattern but use LessWrong's public GraphQL endpoint (`https://www.lesswrong.com/graphql`) instead of RSS feeds. On `/api/tldr-detail`, the post ID is extracted from the URL (`/posts/<postId>/<slug>`), then a single GraphQL request fetches both the post body (`contents.html`) and top-voted comments (`view: "postCommentsTop"`) in parallel. Results are cached in `self_text`, `top_comments`, and `comment_count`. Generic article scraping is skipped for LessWrong stories since there's no standalone article URL to scrape.
+
 ### 4.2 Prompt Construction
 
 The detailed summary endpoint `/api/tldr-detail` proxies requests to Mistral or Groq. If both article text and stored discussion comments are present, it sends two focused LLM requests in parallel: one article summary request and one discussion summary request, then combines the returned Markdown under `Article` and `Discussion` headings. If only one side is present, it falls back to a single structured prompt.
@@ -302,30 +307,20 @@ Each section is only included if non-empty, giving the LLM clearly separated con
 
 The returned Markdown is normalized before display with format-oriented rules only: short plain heading lines are upgraded to Markdown headings, short `Label: text` lines become bold-label bullets, and inline ` - ` bullet runs are split onto separate lines. The same generic cleanup exists in the browser renderer so older malformed responses still render as readable bullets without hardcoding story-specific labels.
 
+### 3.5.1 Mobile layout & vote buttons
+On viewports ≤ 640px (or coarse pointers), the side rail is reordered above
+the cards and stacks vertically: a full-width queue progress bar, a 4-column
+mode tab row, a 3-column source tab row, and a thin bottom border. The
+keyboard-shortcut legend is hidden — it is meaningless on touch.
+
+Vote buttons (▲ / ✓ / ▼) gain larger touch targets on mobile
+(`padding: 0.6rem 0.9rem`, `min-height: 2.75rem` for 44px WCAG compliance)
+and stay inside the `.story-header`. The card area is a flex child of the
+viewport so it fills remaining vertical space and scrolls internally via
+`.story-card.active { overflow: auto; max-height: 100%; }`.
+
 ### 4.3 Client-side Rendering
 
 The raw Markdown response is formatted on the fly using a robust, line-by-line parser (`parseSimpleMarkdown`) to render headers, bold text, and lists safely.
 
----
 
-## 5. Maintenance Guide
-
-### 5.1 Service Control
-The server runs as a systemd user service.
-```bash
-# Manage the service
-systemctl --user {status|start|stop|restart} hn_rewrite.service
-
-# View active logs
-journalctl --user -u hn_rewrite.service -f -n 100
-```
-
-### 5.2 Verification Suite
-Ruff and Pytest are configured for standard validation.
-```bash
-# Run all unit tests
-uv run pytest tests/
-
-# Check styling and types
-uv run ruff check .
-```
