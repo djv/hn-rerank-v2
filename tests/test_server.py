@@ -393,6 +393,14 @@ def test_stale_warm_render_does_not_overwrite_current_cache(test_env, monkeypatc
     assert TestHandler._dashboard_cache[cache_key][2] == new_version
 
 
+@pytest.fixture(scope="module")
+def prop_db():
+    with TemporaryDirectory() as temp_dir:
+        db = Database(str(Path(temp_dir) / "prop_server.db"))
+        yield db
+        db.close()
+
+
 @given(
     operations=st.lists(
         st.sampled_from(["invalidate", "render_current", "render_stale"]),
@@ -401,56 +409,59 @@ def test_stale_warm_render_does_not_overwrite_current_cache(test_env, monkeypatc
     )
 )
 @settings(max_examples=60, deadline=None)
-def test_dashboard_cache_version_invariant_property(operations):
-    with TemporaryDirectory() as temp_dir:
-        db = Database(str(Path(temp_dir) / "prop_server.db"))
-        user = db.create_user("prop_user")
+def test_dashboard_cache_version_invariant_property(operations, prop_db):
+    with prop_db._conn() as conn:
+        with conn:
+            conn.execute("DELETE FROM users")
+            conn.execute("DELETE FROM stories")
+            conn.execute("DELETE FROM feedback")
+            conn.execute("DELETE FROM embeddings")
+            conn.execute("DELETE FROM tldr_cache")
+            conn.execute("DELETE FROM article_fetch_failures")
+    user = prop_db.create_user("prop_user")
 
-        class TestHandler(Handler):
-            pass
+    class TestHandler(Handler):
+        pass
 
-        TestHandler.config = Config(db_path=db.db_path, server_port=0)
-        TestHandler.db = db
-        TestHandler.embedder = object()
-        TestHandler._dashboard_cache = {}
-        TestHandler._dashboard_versions = {}
-        TestHandler._render_locks = {}
+    TestHandler.config = Config(db_path=prop_db.db_path, server_port=0)
+    TestHandler.db = prop_db
+    TestHandler.embedder = object()
+    TestHandler._dashboard_cache = {}
+    TestHandler._dashboard_versions = {}
+    TestHandler._render_locks = {}
 
-        def fake_fast_rerank_for_user(database, config, embedder, user_id):
-            return []
+    def fake_fast_rerank_for_user(database, config, embedder, user_id):
+        return []
 
-        def fake_generate_dashboard_bytes(
-            ranked, config, database, user_id, user_token
-        ):
-            return f"v={TestHandler._dashboard_version(user_id)}".encode()
+    def fake_generate_dashboard_bytes(ranked, config, database, user_id, user_token):
+        return f"v={TestHandler._dashboard_version(user_id)}".encode()
 
-        import pipeline
+    import pipeline
 
-        old_rank = pipeline.fast_rerank_for_user
-        old_render = pipeline.generate_dashboard_bytes
-        pipeline.fast_rerank_for_user = fake_fast_rerank_for_user
-        pipeline.generate_dashboard_bytes = fake_generate_dashboard_bytes
-        try:
-            for operation in operations:
-                current_version = TestHandler._dashboard_version(user.id)
-                if operation == "invalidate":
-                    TestHandler._invalidate_dashboard_cache(user.id)
-                elif operation == "render_current":
-                    TestHandler._render_dashboard_for_user(user)
-                else:
-                    stale_version = max(0, current_version - 1)
-                    TestHandler._render_dashboard_for_user(
-                        user, expected_version=stale_version
-                    )
+    old_rank = pipeline.fast_rerank_for_user
+    old_render = pipeline.generate_dashboard_bytes
+    pipeline.fast_rerank_for_user = fake_fast_rerank_for_user
+    pipeline.generate_dashboard_bytes = fake_generate_dashboard_bytes
+    try:
+        for operation in operations:
+            current_version = TestHandler._dashboard_version(user.id)
+            if operation == "invalidate":
+                TestHandler._invalidate_dashboard_cache(user.id)
+            elif operation == "render_current":
+                TestHandler._render_dashboard_for_user(user)
+            else:
+                stale_version = max(0, current_version - 1)
+                TestHandler._render_dashboard_for_user(
+                    user, expected_version=stale_version
+                )
 
-                cache_key = f"dashboard_{user.id}"
-                cached = TestHandler._dashboard_cache.get(cache_key)
-                if cached is not None:
-                    assert cached[2] == TestHandler._dashboard_version(user.id)
-        finally:
-            pipeline.fast_rerank_for_user = old_rank
-            pipeline.generate_dashboard_bytes = old_render
-            db.close()
+            cache_key = f"dashboard_{user.id}"
+            cached = TestHandler._dashboard_cache.get(cache_key)
+            if cached is not None:
+                assert cached[2] == TestHandler._dashboard_version(user.id)
+    finally:
+        pipeline.fast_rerank_for_user = old_rank
+        pipeline.generate_dashboard_bytes = old_render
 
 
 def test_cors_headers(test_env):
