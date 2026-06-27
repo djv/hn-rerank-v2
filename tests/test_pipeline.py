@@ -550,6 +550,40 @@ def test_is_summarizable_non_hn_no_content():
     assert not pipeline.is_summarizable(s)
 
 
+def test_is_summarizable_lesswrong_with_comments():
+    """LessWrong stories with comment_count > 0 are summarizable (prewarmed)."""
+    from pipeline import Story
+
+    s = Story(
+        id=1,
+        title="X",
+        url=None,
+        score=5,
+        time=100,
+        text_content="x",
+        source="rss_lesswrong_com",
+        comment_count=3,
+        comment_count_at_fetch=3,
+    )
+    assert pipeline.is_summarizable(s)
+
+
+def test_is_summarizable_lesswrong_zero_comments():
+    """LessWrong stories with 0 comments and no text are NOT summarizable."""
+    from pipeline import Story
+
+    s = Story(
+        id=1,
+        title="X",
+        url=None,
+        score=5,
+        time=100,
+        text_content="x",
+        source="rss_lesswrong_com",
+    )
+    assert not pipeline.is_summarizable(s)
+
+
 @pytest.mark.asyncio
 async def test_fetch_rss_feeds_serializes_reddit_and_sets_user_agent(
     tmp_path, monkeypatch
@@ -2656,6 +2690,76 @@ def test_fetch_candidates_only_falls_back_to_top_n_when_disabled(monkeypatch) ->
         assert len(captured_ids) == 1
         # Top 2 by score (HN only): 2(50), 3(30)
         assert captured_ids[0] == [2, 3]
+
+    finally:
+        db.close()
+
+
+def test_fetch_candidates_only_prewarms_all_lesswrong_when_full(monkeypatch) -> None:
+    """Regen prewarms all LessWrong candidates when prewarm_lesswrong_full=True."""
+    db = Database(":memory:")
+    try:
+        config = Config(
+            db_path=db.db_path,
+            prewarm_hn_full=False,
+            regen_prewarm_top_n=0,
+            prewarm_reddit_full=False,
+            prewarm_lesswrong_full=True,
+        )
+
+        stories = [
+            Story(
+                id=10,
+                title="LW1",
+                url="https://www.lesswrong.com/posts/abc123/slug-1",
+                score=10,
+                time=100,
+                text_content="lw1",
+                source="rss_lesswrong_com",
+            ),
+            Story(
+                id=11,
+                title="LW2",
+                url="https://www.lesswrong.com/posts/def456/slug-2",
+                score=5,
+                time=100,
+                text_content="lw2",
+                source="rss_lesswrong_com",
+            ),
+            Story(
+                id=12,
+                title="LW3",
+                url="https://www.lesswrong.com/posts/ghi789/slug-3",
+                score=20,
+                time=100,
+                text_content="lw3",
+                source="rss_lesswrong_com",
+                top_comments="Already hydrated.",
+            ),
+        ]
+        for s in stories:
+            db.upsert_story(s)
+
+        async def fake_fetch_candidates(
+            config, exclude_ids, exclude_urls, db, embedder
+        ):
+            return stories, 3
+
+        captured_ids: list[list[int]] = []
+
+        async def fake_lw_prewarm(ids, db_, embedder):
+            captured_ids.append(list(ids))
+            return len(ids)
+
+        monkeypatch.setattr(pipeline, "fetch_candidates", fake_fetch_candidates)
+        monkeypatch.setattr(pipeline, "prewarm_lesswrong_stories", fake_lw_prewarm)
+
+        asyncio.run(
+            pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
+        )
+        assert len(captured_ids) == 1
+        # Stories without top_comments: 10, 11
+        assert sorted(captured_ids[0]) == [10, 11]
 
     finally:
         db.close()

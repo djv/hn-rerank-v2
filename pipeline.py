@@ -123,11 +123,17 @@ def is_summarizable(story: Story) -> bool:
     """True if the story has enough text to generate a TLDR (or can fetch it).
 
     A story is summarizable if it already has any text content, or if it's
-    an HN story with comments that can be fetched on-demand or prewarmed.
+    an HN or LessWrong story with comments that can be fetched on-demand
+    or prewarmed.
     """
     if story.self_text or story.top_comments or story.article_body:
         return True
     if is_hn_source(story.source):
+        if (story.comment_count or 0) > 0:
+            return True
+        if (story.comment_count_at_fetch or 0) > 0:
+            return True
+    if story.source == "rss_lesswrong_com":
         if (story.comment_count or 0) > 0:
             return True
         if (story.comment_count_at_fetch or 0) > 0:
@@ -154,6 +160,7 @@ class Config:
     reddit_prewarm_top_n: int = 20
     prewarm_hn_full: bool = True
     prewarm_reddit_full: bool = True
+    prewarm_lesswrong_full: bool = True
     article_fetch_max_per_run: int = 100
     article_fetch_concurrency: int = 10
     article_fetch_max_age_days: int = 30
@@ -184,6 +191,7 @@ class Config:
             reddit_prewarm_top_n=main_cfg.get("reddit_prewarm_top_n", 20),
             prewarm_hn_full=main_cfg.get("prewarm_hn_full", True),
             prewarm_reddit_full=main_cfg.get("prewarm_reddit_full", True),
+            prewarm_lesswrong_full=main_cfg.get("prewarm_lesswrong_full", True),
             article_fetch_max_per_run=main_cfg.get("article_fetch_max_per_run", 100),
             article_fetch_concurrency=main_cfg.get("article_fetch_concurrency", 10),
             article_fetch_max_age_days=main_cfg.get("article_fetch_max_age_days", 30),
@@ -772,6 +780,85 @@ async def prewarm_reddit_top_stories(
 
         # Idempotent: skip if already populated with equal or richer data
         if story.top_comments and len(ctx.top_comments) <= len(story.top_comments):
+            continue
+
+        new_self_text = (
+            ctx.self_text
+            if len(ctx.self_text) > len(story.self_text)
+            else story.self_text
+        )
+        new_text_content = compose_story_text(
+            story.title,
+            new_self_text,
+            ctx.top_comments,
+            story.article_body or "",
+        )
+        if not new_text_content:
+            continue
+
+        updated = replace(
+            story,
+            self_text=new_self_text,
+            top_comments=ctx.top_comments,
+            text_content=new_text_content,
+            comment_count=story.comment_count or ctx.comment_count or None,
+            comment_count_at_fetch=max(story.comment_count_at_fetch, ctx.comment_count),
+            discussion_url=story.discussion_url or story.url,
+        )
+        db.upsert_story(updated)
+        prewarmed.append(updated)
+
+    if prewarmed and embedder is not None:
+        get_or_compute_embeddings(prewarmed, embedder, db)
+
+    return len(prewarmed)
+
+
+async def prewarm_lesswrong_stories(
+    story_ids: list[int],
+    db: Database,
+    embedder: Embedder | None = None,
+) -> int:
+    """Prewarm top_comments and self_text for LessWrong RSS stories.
+
+    Fetches each post's body and top-voted comments via LessWrong's GraphQL
+    endpoint (one request per story). Serialized to avoid rate limits.
+
+    Returns number of stories whose top_comments or self_text changed.
+    """
+    if not story_ids:
+        return 0
+    from server import _extract_lesswrong_post_id, _fetch_lesswrong_context
+
+    prewarmed: list[Story] = []
+    for sid in story_ids:
+        story = db.get_story(sid)
+        if not story or not story.url:
+            continue
+        if story.source != "rss_lesswrong_com":
+            continue
+
+        post_id = _extract_lesswrong_post_id(story.url)
+        if not post_id:
+            continue
+
+        try:
+            ctx = await _fetch_lesswrong_context(post_id)
+        except Exception as exc:
+            logging.warning(
+                "prewarm_lesswrong: fetch failed for story_id=%s: %r",
+                sid,
+                exc,
+            )
+            continue
+
+        if ctx is None or not (ctx.self_text or ctx.top_comments):
+            continue
+
+        # Idempotent: skip if already populated with equal or richer data
+        if story.top_comments and len(ctx.top_comments) <= len(story.top_comments):
+            continue
+        if story.self_text and len(ctx.self_text) <= len(story.self_text):
             continue
 
         new_self_text = (
@@ -2425,3 +2512,18 @@ async def fetch_candidates_only(
                     prewarmed,
                     len(top_reddit),
                 )
+
+    # LessWrong prewarm
+    if config.prewarm_lesswrong_full:
+        needs_prewarm_lw = [
+            s.id
+            for s in candidates
+            if s.source == "rss_lesswrong_com" and not s.top_comments
+        ]
+        if needs_prewarm_lw:
+            prewarmed = await prewarm_lesswrong_stories(needs_prewarm_lw, db, embedder)
+            logging.info(
+                "Regen: prewarmed %d/%d LessWrong candidates (full mode)",
+                prewarmed,
+                len(needs_prewarm_lw),
+            )

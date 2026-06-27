@@ -8,6 +8,7 @@ regen_interval_seconds = 10800
 regen_prewarm_top_n = 50
 prewarm_hn_full = true
 prewarm_reddit_full = true
+prewarm_lesswrong_full = true
 max_cached_models = 20
 article_fetch_max_per_run = 100
 article_fetch_concurrency = 10

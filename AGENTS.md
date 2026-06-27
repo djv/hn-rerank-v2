@@ -133,9 +133,10 @@ prewarm latency.
 
 Stories with no content to summarize (self_text, top_comments, and article_body
 all empty, and no HN comment_count > 0) are filtered out by `is_summarizable()`
-in `fetch_candidates`. Config knobs `prewarm_hn_full` and `prewarm_reddit_full`
-(default true) control prewarm scope; set to false to revert to top-by-score
-prewarm (`regen_prewarm_top_n=50` / `reddit_prewarm_top_n=20` default).
+in `fetch_candidates`. Config knobs `prewarm_hn_full`, `prewarm_reddit_full`,
+and `prewarm_lesswrong_full` (default true) control prewarm scope; set to false
+to revert to top-by-score prewarm (`regen_prewarm_top_n=50` /
+`reddit_prewarm_top_n=20` default).
 
 CH has 1-24h latency for brand-new content (vs Algolia's real-time).
 With a 3h regen cycle, worst case is 4h lag for stories posted in the
