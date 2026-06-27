@@ -1002,3 +1002,36 @@ AGENTS.md requires zero new diagnostics.
 
 **Verification**: `ruff check .` — clean. `ty check` — 0 diagnostics (was 66).
 `pytest tests/ -x -q` — 201 passed, 1 skipped (torch-dependent), 0 failed.
+
+## 2026-06-27 — Fresh-user first load 5-10s → ~1.5-2.0s
+
+**Problem**: Brand-new user dashboard load took 5-10s. Profiled warm-thread
+work in `fast_rerank_for_user` with 6425 candidates (30d window) and
+identified four optimizations.
+
+**Root causes**:
+- `ranked_decorated = [replace(r, is_non_hn=...) for r in ranked]` — 6425
+  `dataclasses.replace` calls per render (~200ms). Verified dead after
+  tracing every consumer: `is_non_hn` is never read; primary items get it
+  re-set in the badge pass, discovery pass #7 calls `is_hn_source` directly,
+  and the template doesn't read `.is_non_hn`. A final ~80-item `is_non_hn`
+  pass was added to maintain correctness for discovery items.
+- `_WARM_DEBOUNCE_S = 1.0` — 1s sleep at start of warm. Reduced to 0.2s.
+- Skeleton `meta http-equiv="refresh" content="3"` — forced 0-3s wait
+  between warm completion and dashboard visible. Reduced to `content="1"`.
+- `pico.min.css` re-read on every render. Moved to module-level lazy cache.
+
+**Changes**:
+- `pipeline.py:rerank_candidates` — removed `ranked_decorated` construction;
+  filter `ranked` directly; added final `is_non_hn` pass on final items.
+- `pipeline.py:generate_dashboard_bytes` — `pico.min.css` read moved to
+  module-level `_get_pico_css()` lazy cache.
+- `server.py:Handler._WARM_DEBOUNCE_S` — 1.0 → 0.2.
+- `server.py:SKELETON_HTML` — `content="3"` → `content="1"`.
+
+**Impact**:
+- Warm-thread (6425-candidate render): 1.3s → 1.1s
+- End-to-end fresh user: 5-10s → 1.4-2.1s
+
+**Verification**: `pytest tests/ -x -q` = 209 passed, 1 skipped.
+`ruff check .` clean. `ty check` 0 diagnostics.
