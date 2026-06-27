@@ -545,6 +545,18 @@ class Database:
                 for row in cursor.fetchall()
             ]
 
+    def count_feedback_by_action(self, user_id: int) -> dict[str, int]:
+        """Return per-action counts for a user. Unknown actions are ignored."""
+        rows = self.execute(
+            "SELECT action, COUNT(*) FROM feedback WHERE user_id = ? GROUP BY action",
+            (user_id,),
+        )
+        counts: dict[str, int] = {"up": 0, "neutral": 0, "down": 0}
+        for action, n in rows:
+            if action in counts:
+                counts[action] = n
+        return counts
+
     def delete_feedback(self, user_id: int, story_id: int) -> None:
         with self._conn() as conn:
             with conn:

@@ -527,3 +527,27 @@ def test_per_user_feedback_isolation(db):
     db.delete_feedback(user1.id, 99)
     assert len(db.get_all_feedback(user1.id)) == 0
     assert len(db.get_all_feedback(user2.id)) == 1
+
+
+def test_count_feedback_by_action(db):
+    """count_feedback_by_action returns per-action buckets."""
+    user = db.create_user("test_count")
+    assert db.count_feedback_by_action(user.id) == {"up": 0, "neutral": 0, "down": 0}
+
+    db.upsert_story(
+        Story(id=1, title="S1", url=None, score=10, time=0, text_content="T1")
+    )
+    db.upsert_story(
+        Story(id=2, title="S2", url=None, score=10, time=0, text_content="T2")
+    )
+    db.upsert_story(
+        Story(id=3, title="S3", url=None, score=10, time=0, text_content="T3")
+    )
+
+    db.upsert_feedback(user.id, 1, "up")
+    db.upsert_feedback(user.id, 2, "neutral")
+    db.upsert_feedback(user.id, 3, "down")
+    assert db.count_feedback_by_action(user.id) == {"up": 1, "neutral": 1, "down": 1}
+
+    db.upsert_feedback(user.id, 1, "down")  # change vote
+    assert db.count_feedback_by_action(user.id) == {"up": 0, "neutral": 1, "down": 2}

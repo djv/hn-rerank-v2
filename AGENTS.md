@@ -12,7 +12,7 @@
 - **Do NOT standard-scale raw embeddings** (384-d MiniLM vectors are L2-normalized; StandardScaler must only touch metadata columns from `emb_dim:` onward).
 - **Never delete or destructively modify the local database** (`hn_rewrite.db`, `hn.db`, or any `*.db` file in the working tree). The DB holds the user's accumulated feedback and is the single source of truth for personalization. No `rm`, no `DELETE FROM` without a `WHERE` clause that excludes all rows, no schema migrations that drop tables or columns with data. The pipeline's own `prune_stories` and `prune_*` operations are fine — they have explicit retention rules and `id NOT IN (SELECT story_id FROM feedback)` guards. When in doubt, ask before running any command that touches the DB file.
   - **Exception (2026-06-22):** 756 test/empty stories (time=0) were deleted with explicit user permission. This included 2 test stories (id=999 "Test", id=99999998 "Test regen live") that received 2 upvotes from user 1. Backup retained at `hn_rewrite.db.pre_test_removal_20260622T163344Z`.
-- Keep test execution times optimized (target under 10 seconds total).
+- Keep test execution times optimized (target under 10 seconds total). Run the full suite with `uv run pytest tests/ -n 4` (4 cores; `pytest-xdist` is in `dev`). Single-process takes ~17s; `-n 4` brings it to ~12s on this host. Per-test ONNX model loads are amortized per worker, not per test.
 - **Always update relevant documentation** (e.g., [ARCHITECTURE.md](file:///home/dev/hn-rewrite/ARCHITECTURE.md), [WORKLOG.md](file:///home/dev/hn-rewrite/WORKLOG.md)) after making code or behavior changes.
 
 ## Running scripts

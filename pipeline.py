@@ -45,10 +45,16 @@ class ModelConfig:
     diversity_threshold: float = 0.75
     knn_k: int = 10
     positive_cluster_k: int = 4
+    tier2_blend_window: int = 50
     tier3_threshold: int = 20
     tier3_blend_window: int = 60
     min_up_for_svm: int = 20
     min_down_for_svm: int = 20
+    non_hn_ramp_window: int = 30
+    top_badge_percentile: float = 90.0
+    top_badge_min_score: int = 100
+    discussion_badge_percentile: float = 90.0
+    discussion_badge_min_comments: int = 0
 
 
 # SVM model cache: keyed on (user_id, feedback_signature) to skip SVC.fit().
@@ -205,10 +211,12 @@ class Config:
                 diversity_threshold=model_cfg.get("diversity_threshold", 0.75),
                 knn_k=model_cfg.get("knn_k", 10),
                 positive_cluster_k=model_cfg.get("positive_cluster_k", 4),
+                tier2_blend_window=model_cfg.get("tier2_blend_window", 50),
                 tier3_threshold=model_cfg.get("tier3_threshold", 20),
                 tier3_blend_window=model_cfg.get("tier3_blend_window", 60),
                 min_up_for_svm=model_cfg.get("min_up_for_svm", 20),
                 min_down_for_svm=model_cfg.get("min_down_for_svm", 20),
+                non_hn_ramp_window=model_cfg.get("non_hn_ramp_window", 30),
             ),
             rss=RssConfig(
                 enabled=rss_cfg.get("enabled", True),
@@ -239,6 +247,16 @@ def _dashboard_primary_limit(config_count: int) -> tuple[int, int]:
     num_uncertain = UNCERTAIN_DISCOVERY_SLOT_LIMIT if config_count >= 10 else 0
     primary_limit = min(max(1, config_count), DASHBOARD_QUEUE_SIZE)
     return primary_limit, num_uncertain
+
+
+def _non_hn_slot_count(
+    n_feedback: int,
+    cap: int = NON_HN_DISCOVERY_SLOT_LIMIT,
+    threshold: int = 20,
+    window: int = 30,
+) -> int:
+    """Number of non-HN discovery slots given a user's feedback count."""
+    return max(0, round(cap * min((n_feedback - threshold) / window, 1.0)))
 
 
 # Text processing helpers
@@ -1500,7 +1518,7 @@ def _softmax_rows(values: np.ndarray) -> NDArray[np.float32]:
     return (exp / exp.sum(axis=1, keepdims=True)).astype(np.float32)
 
 
-def rank_stories(
+def _score_and_rank(
     candidates: list[Story],
     candidate_embeddings: NDArray[np.float32],
     db: Database,
@@ -1744,35 +1762,49 @@ def rank_stories(
         else:
             tier2_scores = np.full(len(candidates), 0.5, dtype=np.float32)
 
-    # Soft blend between tier 2 and SVM (tier 3)
+    # Tier 1: HN gravity (frontpage-like) — always computed for cold-start blend
+    tier1_scores = np.array(
+        [
+            (s.score if is_hn_source(s.source) else s.score * 2)
+            / max(((now - s.time) / 3600.0 + 2.0) ** 1.8, 0.1)
+            for s in candidates
+        ],
+        dtype=np.float32,
+    )
+    if tier1_scores.max() > 0:
+        tier1_scores = tier1_scores / tier1_scores.max()
+
+    # Three-way blend between tier 1 (gravity), tier 2 (centroid), tier 3 (SVM)
+    # α_2 ramps from 0→1 as n_feedback grows; tier 1 fades out smoothly.
+    alpha_2 = float(np.clip(n_feedback / config.model.tier2_blend_window, 0.0, 1.0))
+
     if svm_scores is not None and tier2_scores is not None:
         n_min = min(n_up, n_down)
         blend_start = min(config.model.min_up_for_svm, config.model.min_down_for_svm)
-        alpha = float(
+        alpha_3 = float(
             np.clip(
                 (n_min - blend_start) / config.model.tier3_blend_window,
-                0,
-                1,
+                0.0,
+                1.0,
             )
         )
+        t1_weight = 1.0 - alpha_2
+        t2_weight = alpha_2 * (1.0 - alpha_3)
+        t3_weight = alpha_2 * alpha_3
         scores = np.asarray(
-            (1 - alpha) * tier2_scores + alpha * svm_scores,
+            t1_weight * tier1_scores
+            + t2_weight * tier2_scores
+            + t3_weight * svm_scores,
             dtype=np.float32,
         )
     elif tier2_scores is not None:
-        scores = tier2_scores
-    else:
-        # Tier 1: No votes → HN gravity (frontpage-like)
-        scores = np.array(
-            [
-                (s.score if is_hn_source(s.source) else s.score * 2)
-                / max(((now - s.time) / 3600.0 + 2.0) ** 1.8, 0.1)
-                for s in candidates
-            ],
+        t1_weight = 1.0 - alpha_2
+        scores = np.asarray(
+            t1_weight * tier1_scores + alpha_2 * tier2_scores,
             dtype=np.float32,
         )
-        if scores.max() > 0:
-            scores = scores / scores.max()
+    else:
+        scores = tier1_scores
 
     assert scores is not None
 
@@ -1923,13 +1955,22 @@ def rerank_candidates(
     cand_embeddings: NDArray[np.float32] | None = None,
     user_id: int | None = None,
 ) -> list[RankedStory]:
+    """Rank candidates and attach discovery badges.
+
+    This wraps :func:`_score_and_rank` (which only does tier blend + sort)
+    and adds badge attribution + 7 discovery passes (uncertainty, novelty,
+    similarity, discussion-rich, high-engagement, hot, non-HN).
+
+    Use this in production; the private ``_score_and_rank`` is intended for
+    tier-blend tests that need to assert on ranking without badge side effects.
+    """
     if not candidates:
         return []
 
     if cand_embeddings is None:
         cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
 
-    ranked = rank_stories(
+    ranked = _score_and_rank(
         candidates,
         cand_embeddings,
         db,
@@ -2018,13 +2059,21 @@ def rerank_candidates(
     # these criteria (primary or extra-slot); the extra-slot passes below
     # additionally source from remaining_decorated to surface qualifying stories
     # outside the primary ranked set, respecting per-pass slot caps.
-    # discussion_threshold uses 98th-pct of non-zero comments so that stories
+    # discussion_threshold uses config percentiles so that stories
     # with zero comments are filtered out cleanly by the >0 guard.
     nonzero_comments = cand_comment_counts[cand_comment_counts > 0]
-    discussion_threshold = (
-        np.percentile(nonzero_comments, 98) if len(nonzero_comments) else 0
+    discussion_pct = config.model.discussion_badge_percentile
+    discussion_min = config.model.discussion_badge_min_comments
+    raw_discussion_pct = (
+        np.percentile(nonzero_comments, discussion_pct)
+        if len(nonzero_comments)
+        else 0.0
     )
-    engagement_threshold = np.percentile(cand_scores, 98) if len(cand_scores) else 0
+    discussion_threshold = max(raw_discussion_pct, float(discussion_min))
+    pct = config.model.top_badge_percentile
+    min_score = config.model.top_badge_min_score
+    raw_pct_threshold = np.percentile(cand_scores, pct) if len(cand_scores) else 0.0
+    engagement_threshold = max(raw_pct_threshold, float(min_score))
 
     # final already contains the primary-ranked items
     final_ids = {item.story.id for item in final}
@@ -2176,14 +2225,23 @@ def rerank_candidates(
     final.extend(hot_items)
     selected_ids |= {item.story.id for item in hot_items}
 
-    # 7. Surface up to 8 non-HN stories to balance the dashboard
-    non_hn_pool = [r for r in remaining_decorated if not is_hn_source(r.story.source)]
-    non_hn_pool.sort(key=lambda r: r.score, reverse=True)
-    non_hn_items = [
-        replace(r, is_non_hn=True) for r in non_hn_pool[:NON_HN_DISCOVERY_SLOT_LIMIT]
-    ]
-    final.extend(non_hn_items)
-    selected_ids |= {item.story.id for item in non_hn_items}
+    # 7. Surface non-HN stories, ramping in after 20 votes of personalization
+    n_non_hn_slots = _non_hn_slot_count(
+        len(feedback_labels),
+        cap=NON_HN_DISCOVERY_SLOT_LIMIT,
+        threshold=20,
+        window=config.model.non_hn_ramp_window,
+    )
+    if n_non_hn_slots > 0:
+        non_hn_pool = [
+            r for r in remaining_decorated if not is_hn_source(r.story.source)
+        ]
+        non_hn_pool.sort(key=lambda r: r.score, reverse=True)
+        non_hn_items = [
+            replace(r, is_non_hn=True) for r in non_hn_pool[:n_non_hn_slots]
+        ]
+        final.extend(non_hn_items)
+        selected_ids |= {item.story.id for item in non_hn_items}
 
     # Ensure is_non_hn is correct for all items (discovery passes don't set it)
     final = [replace(r, is_non_hn=(not is_hn_source(r.story.source))) for r in final]
@@ -2373,6 +2431,12 @@ def generate_dashboard_bytes(
     all_fb = db.get_all_feedback(user_id=user_id)
     fb_map = {f.story_id: f.action for f in all_fb}
 
+    vote_counts = (
+        db.count_feedback_by_action(user_id)
+        if user_id
+        else {"up": 0, "neutral": 0, "down": 0}
+    )
+
     template = env.get_template("index.html")
     html_content = template.render(
         timestamp=datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -2381,6 +2445,13 @@ def generate_dashboard_bytes(
         pico_css=pico_css,
         fb_map=fb_map,
         user_token=user_token,
+        vote_count_up=vote_counts["up"],
+        vote_count_neutral=vote_counts["neutral"],
+        vote_count_down=vote_counts["down"],
+        top_badge_percentile=int(round(config.model.top_badge_percentile)),
+        discussion_badge_percentile=int(
+            round(config.model.discussion_badge_percentile)
+        ),
     )
     return html_content.encode("utf-8")
 
@@ -2417,6 +2488,7 @@ def fast_rerank_for_user(
     )
     rows = recent_rows + archive_rows
     candidates = [Database._row_to_story(row) for row in rows]
+    candidates = [s for s in candidates if is_summarizable(s)]
     if not candidates:
         return []
 

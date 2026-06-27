@@ -12,7 +12,7 @@ This document outlines the architecture, core design decisions, database schema,
 graph TD
     subgraph Core Pipeline
         A[fetch_candidates] --> B[get_or_compute_embeddings]
-        B --> C[rank_stories]
+        B --> C[_score_and_rank]
         C --> D[rerank_candidates]
     end
 
@@ -108,7 +108,7 @@ $$\alpha = \text{clip}\left(\frac{n_{\min} - 20}{60},\ 0,\ 1\right)$$
 The blend starts when both classes have at least 20 feedback entries and reaches full SVM influence when both classes have at least 80 entries. A user with 50 upvotes but only 5 downvotes sees pure tier-2 (centroid-diff) regardless of total feedback count.
 
 ### 3.4 Selection & Surfacing Passes
-The default dashboard selection is direct relevance order: `rerank_candidates` takes the top ranked stories after `rank_stories` and does not remove near-duplicates. MMR remains available behind `config.model.enable_mmr`; when enabled, `mmr_filter` iterates through candidates in SVM-rank order and discards subsequent candidates with cosine similarity above `config.model.diversity_threshold` (default 0.75).
+The default dashboard selection is direct relevance order: `rerank_candidates` takes the top ranked stories after `_score_and_rank` and does not remove near-duplicates. MMR remains available behind `config.model.enable_mmr`; when enabled, `mmr_filter` iterates through candidates in SVM-rank order and discards subsequent candidates with cosine similarity above `config.model.diversity_threshold` (default 0.75).
 
 The live dashboard path does not apply a hidden top-1000 prefilter. `fast_rerank_for_user()` pulls the full active story window for the user, excludes only stories already in that user's feedback set, and hands the resulting candidate pool straight to the ranker.
 
@@ -118,8 +118,8 @@ Discovery badges (uncertainty, novelty, talk-worthy, top, hot) are applied to an
 * **Uncertainty/Entropy Surfacing**: We compute the Shannon Entropy of the model's predicted probability distribution (Down, Neutral, Up). The orchestrator adds up to 5 extra slots for the remaining candidates with the highest entropy, flagging them as `is_uncertain=True` (badge `🤔 Unsure`) to prompt active feedback. Primary stories may also receive this badge via the same entropy threshold (derived from the extra-slot selection).
 * **Novel**: Top 15% least similar to feedback, flagged as `is_novel=True` (badge `✨ Novel`), up to 5 slots ranked by a percentile blend of model score (70%) and novelty distance from feedback (30%). This avoids a brittle raw SVM score cutoff while still preferring plausible stories.
 * **Similar** (extra-slot only): Stories with high semantic match to upvotes (top 3% similarity, dynamic 97th percentile threshold), flagged as `is_similar=True` (badge `🎯 Similar`), up to 5 slots sorted by similarity score descending. NOT applied to primary stories.
-* **Discussion-rich**: Top 2% of non-zero `comment_count` and comments > 0, flagged as `is_discussion_rich=True` (badge `💬 Talk-worthy`, 98th percentile of non-zero comments), up to 5 slots sorted by comment count descending.
-* **High-engagement**: Top 2% by `story.score`, flagged as `is_high_engagement=True` (badge `🏆 Top`, 98th percentile), up to 8 slots sorted by SVM score descending.
+* **Discussion-rich**: Top 10% of non-zero `comment_count` and comments > 0, flagged as `is_discussion_rich=True` (badge `💬 Talk-worthy`, configurable via `discussion_badge_percentile`, default 90%), up to 5 slots sorted by comment count descending.
+* **High-engagement**: Top 10% by `story.score` (configurable via `top_badge_percentile`, default 90%), flagged as `is_high_engagement=True` (badge `🏆 Top`), with an absolute floor (`top_badge_min_score`, default 100) and up to 8 slots sorted by SVM score descending.
 * **Hot**: Top 0.5% by engagement velocity (points/hour), flagged as `is_hot=True` (badge `🔥 Hot`, 99.5th percentile), up to 8 slots.
 * **Non-HN**: Stories with `source` not in `{hn, bq_seed}` (all RSS feeds), up to 8 slots sorted by SVM score descending. The `is_non_hn=True` flag is applied to primary non-HN stories as well; the existing source-label badge (`source-badge`) already distinguishes them visually without a new badge.
 

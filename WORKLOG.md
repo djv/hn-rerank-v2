@@ -5,6 +5,27 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-27 — Config-driven Discussion-rich badge threshold (default 90th pct)
+
+- **New config knobs `discussion_badge_percentile` (default 90.0) and `discussion_badge_min_comments` (default 0)** in `ModelConfig` and `config.toml`. The Discussion-rich threshold is now `max(np.percentile(nonzero_comments, pct), float(min_comments))` instead of hard-coded `np.percentile(nonzero_comments, 98)`.
+- **Template tooltip now dynamic**: renders "Top {{ discussion_badge_percentile }}% by HN comments" instead of the stale "top 7%".
+- **ARCHITECTURE.md:121** updated to reflect the config knobs.
+- New test `test_discussion_badge_threshold_uses_config_percentile_and_floor` verifies the threshold responds to both knobs.
+
+## 2026-06-27 — Rename `rank_stories` → `_score_and_rank` for clarity
+
+- Renamed internal scoring function from `rank_stories` to `_score_and_rank` to signal that it's private and to distinguish it from the public `rerank_candidates` (which wraps it and adds badges + discovery passes).
+- Added docstring layering note to `rerank_candidates`.
+- Updated all call sites in `pipeline.py`, `tests/test_pipeline.py`, `ARCHITECTURE.md`, and `WORKLOG.md`. Skipped `plans/` (historical design docs).
+- Zero behavioral change; all 237 tests pass.
+
+## 2026-06-27 — Config-driven Top badge threshold (default 90th pct, min 100)
+
+- **New config knobs `top_badge_percentile` (default 90.0) and `top_badge_min_score` (default 100)** in `ModelConfig` and `config.toml`. The engagement_threshold is now `max(np.percentile(scores, pct), min_score)` instead of hard-coded `np.percentile(scores, 98)`.
+- **Template tooltip now dynamic**: renders "Top {{ top_badge_percentile }}% by HN points" from config instead of the stale "Top 5%".
+- **ARCHITECTURE.md:122** updated to reflect the config knobs.
+- New test `test_top_badge_threshold_uses_config_percentile_and_floor` verifies the threshold responds to both knobs.
+
 ## 2026-06-27 — Filter unsummarizable stories; expand regen prewarm (HN + Reddit full mode)
 
 - **Filter unsummarizable stories from the dashboard:** `fetch_candidates` now drops stories with no self_text, no top_comments, no article_body, and (for HN) zero comments. They would only ever produce a "No article body or discussion available to summarize for this story." placeholder in tldr-detail. Covers ~965 HN stories with `comment_count==0` and ~180 non-HN stories with no content.
@@ -923,7 +944,7 @@ was dead code — not used by the running service, not served, not part of deplo
 - `test_run_pipeline_badge_assignment` and `test_primary_story_gets_qualifying_badge`
   in `tests/test_pipeline.py`. Both tests existed solely to exercise badge assignment
   through the `run_pipeline` → `generate_dashboard` path. Without those functions,
-  the tests were dead. Badge logic is covered elsewhere via `rank_stories`/`rerank_candidates`.
+  the tests were dead. Badge logic is covered elsewhere via `_score_and_rank`/`rerank_candidates`.
 
 **Updated**:
 - `scripts/test_svm_variants.py` — removed DASHBOARD constant, generate.py subprocess call,

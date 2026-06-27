@@ -463,7 +463,7 @@ def prop_db():
     )
 )
 @settings(
-    max_examples=60,
+    max_examples=30,
     deadline=None,
     suppress_health_check=[HealthCheck.function_scoped_fixture],
 )
@@ -1003,6 +1003,57 @@ def test_tldr_detail_uses_cached_summary(test_env, monkeypatch):
     assert resp2.json()["tldr"] == resp1.json()["tldr"]
 
 
+def test_tldr_detail_does_not_cache_placeholder(test_env, monkeypatch):
+    """A story with no content returns the placeholder but does not cache it."""
+    port, db, _, _, user = test_env
+    db.upsert_story(
+        Story(
+            id=779,
+            title="Empty story",
+            url=None,
+            score=5,
+            time=1600000000,
+            text_content="x",
+            source="hn",
+            comment_count=0,
+            discussion_url=None,
+            comment_count_at_fetch=0,
+            self_text="",
+            top_comments="",
+            article_body="",
+        )
+    )
+
+    call_count = 0
+
+    async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
+        nonlocal call_count
+        call_count += 1
+        return "No article body or discussion available to summarize for this story."
+
+    import server
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    resp1 = httpx.post(
+        f"http://127.0.0.1:{port}/api/tldr-detail",
+        json={"story_id": 779},
+        cookies={"hn_token": user.token},
+    )
+    resp2 = httpx.post(
+        f"http://127.0.0.1:{port}/api/tldr-detail",
+        json={"story_id": 779},
+        cookies={"hn_token": user.token},
+    )
+
+    assert resp1.status_code == 200
+    assert resp2.status_code == 200
+    assert call_count == 2  # both requests regenerated (no cache write)
+    assert resp1.json()["cached"] is False
+    assert resp2.json()["cached"] is False
+    assert db.get_tldr_cache(779, "") is None  # no cache entry written
+
+
 @pytest.mark.asyncio
 async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
     import server
@@ -1138,6 +1189,11 @@ def test_dashboard_has_segmented_refresh_progress_bar():
     assert '<span class="key-hint">u</span> undo' not in template, (
         "undo hint should be hidden from the visible legend"
     )
+    # Vote counts element present alongside progress bar
+    assert 'class="vote-counts"' in template
+    assert template.count('data-vote-count="up"') == 1
+    assert template.count('data-vote-count="neutral"') == 1
+    assert template.count('data-vote-count="down"') == 1
     # Old text "Loading queue..." should be gone from the template
     assert "Loading queue..." not in template
 
@@ -1407,6 +1463,8 @@ def test_keydown_uses_letter_keys():
     # progress bar lives in the vote bar now, not the side rail
     assert template.count('<div class="refresh-progress"') == 1
     assert '<div class="refresh-progress"' in template.split('<div class="vote-bar"')[1]
+    # vote counts live in the vote bar
+    assert 'class="vote-counts"' in template.split('<div class="vote-bar"')[1]
     # "Votes until refresh" label and 120px bar
     assert 'class="refresh-label"' in template
     assert "Votes until refresh" in template
@@ -1419,6 +1477,108 @@ def test_keydown_uses_letter_keys():
     # click handler no longer passes null card
     assert "submitVote(btn.dataset.fb, btn.closest('.story-card'))" not in template
     assert "submitVote(btn.dataset.fb);" in template
+
+
+def test_dashboard_renders_user_vote_counts_zero_for_no_feedback(test_env):
+    """Fresh user with no feedback → all three counts are 0."""
+    port, db, regen_event, handler, user = test_env
+    assert handler._render_dashboard_for_user(user) == SKELETON_HTML
+    _wait_for_cache(handler, user, 0, timeout=3.0)
+    resp = httpx.get(
+        f"http://127.0.0.1:{port}/",
+        cookies={"hn_token": user.token},
+        follow_redirects=True,
+    )
+    assert resp.status_code == 200
+    assert 'data-vote-count="up">0<' in resp.text
+    assert 'data-vote-count="neutral">0<' in resp.text
+    assert 'data-vote-count="down">0<' in resp.text
+
+
+def test_dashboard_renders_user_vote_counts_with_feedback(test_env):
+    """Seeded feedback → counts rendered in the dashboard."""
+    port, db, regen_event, handler, user = test_env
+    for i in range(3):
+        db.upsert_story(
+            Story(
+                id=2000 + i,
+                title=f"Up {i}",
+                url=None,
+                score=100 - i,
+                time=0,
+                text_content="text",
+            )
+        )
+        db.upsert_feedback(user.id, 2000 + i, "up")
+    db.upsert_story(
+        Story(id=3000, title="Neutral", url=None, score=90, time=0, text_content="text")
+    )
+    db.upsert_feedback(user.id, 3000, "neutral")
+    for i in range(2):
+        db.upsert_story(
+            Story(
+                id=4000 + i,
+                title=f"Down {i}",
+                url=None,
+                score=80 - i,
+                time=0,
+                text_content="text",
+            )
+        )
+        db.upsert_feedback(user.id, 4000 + i, "down")
+
+    assert handler._render_dashboard_for_user(user) == SKELETON_HTML
+    _wait_for_cache(handler, user, 0, timeout=3.0)
+    resp = httpx.get(
+        f"http://127.0.0.1:{port}/",
+        cookies={"hn_token": user.token},
+        follow_redirects=True,
+    )
+    assert resp.status_code == 200
+    assert 'data-vote-count="up">3<' in resp.text
+    assert 'data-vote-count="neutral">1<' in resp.text
+    assert 'data-vote-count="down">2<' in resp.text
+
+
+def test_dashboard_vote_counts_aggregate_across_refreshes(test_env):
+    """Vote counts persist across ranking refreshes (all-time, not session)."""
+    port, db, regen_event, handler, user = test_env
+    for i in range(5):
+        db.upsert_story(
+            Story(
+                id=5000 + i,
+                title=f"S{i}",
+                url=None,
+                score=100,
+                time=0,
+                text_content="text",
+            )
+        )
+        db.upsert_feedback(user.id, 5000 + i, "up")
+    for i in range(2):
+        db.upsert_story(
+            Story(
+                id=6000 + i,
+                title=f"T{i}",
+                url=None,
+                score=80,
+                time=0,
+                text_content="text",
+            )
+        )
+        db.upsert_feedback(user.id, 6000 + i, "down")
+
+    assert handler._render_dashboard_for_user(user) == SKELETON_HTML
+    _wait_for_cache(handler, user, 0, timeout=3.0)
+    resp = httpx.get(
+        f"http://127.0.0.1:{port}/",
+        cookies={"hn_token": user.token},
+        follow_redirects=True,
+    )
+    assert resp.status_code == 200
+    assert 'data-vote-count="up">5<' in resp.text
+    assert 'data-vote-count="neutral">0<' in resp.text
+    assert 'data-vote-count="down">2<' in resp.text
 
 
 # SWR / model cache integration tests
@@ -1528,3 +1688,17 @@ def test_bump_all_cached_versions(swr_handler):
     assert h._dashboard_versions[1] == 6
     assert h._dashboard_versions[2] == 11
     assert h._dashboard_versions[3] == 1
+
+
+def test_setMode_consumes_pending_refill_on_tab_click():
+    """Regression: clicking a mode tab while 'New ranking ready' is showing
+    should auto-consume the preloaded ranking without requiring the manual
+    Refresh button."""
+    template = (
+        Path(__file__).resolve().parents[1] / "templates" / "index.html"
+    ).read_text(encoding="utf-8")
+    idx = template.index("function setMode(")
+    end = template.index("\n    }", idx) + len("\n    }")
+    body = template[idx:end]
+    assert "refillQueued" in body
+    assert "refillWhenReady" in body

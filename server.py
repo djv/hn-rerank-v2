@@ -1111,25 +1111,27 @@ class Handler(BaseHTTPRequestHandler):
                         article_body=article_body or "",
                     )
                 )
-                if tldr and not tldr.startswith("Error"):
-                    self.db.upsert_tldr_cache(story.id, cache_key, tldr)
-                    logging.info(
-                        "tldr_detail story_id=%s result=generated cache_key=%s",
-                        story.id,
-                        cache_key[:12],
+                if not tldr:
+                    self._json_response(
+                        {"error": "Failed to generate TLDR"}, status=500
                     )
-                    self._json_response({"ok": True, "tldr": tldr, "cached": False})
-                elif tldr:
+                    return
+                if tldr.startswith("Error"):
                     logging.warning(
                         "tldr_detail story_id=%s result=llm_error cache_key=%s",
                         story.id,
                         cache_key[:12],
                     )
                     self._json_response({"error": tldr}, status=503)
-                else:
-                    self._json_response(
-                        {"error": "Failed to generate TLDR"}, status=500
+                    return
+                if not tldr.startswith("No article body"):
+                    self.db.upsert_tldr_cache(story.id, cache_key, tldr)
+                    logging.info(
+                        "tldr_detail story_id=%s result=generated cache_key=%s",
+                        story.id,
+                        cache_key[:12],
                     )
+                self._json_response({"ok": True, "tldr": tldr, "cached": False})
             except Exception as e:
                 logging.error(f"Error handling tldr-detail: {e}")
                 self._json_response({"error": str(e)}, status=400)

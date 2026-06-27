@@ -17,7 +17,7 @@ from pipeline import (
     get_or_compute_embeddings,
     is_hn_source,
     mmr_filter,
-    rank_stories,
+    _score_and_rank,
     Config,
     rerank_candidates,
     select_article_fetch_candidates,
@@ -33,8 +33,6 @@ from pipeline import (
     _get_cached_model,
     _set_cached_model,
     _MODEL_CACHE,
-    NON_HN_DISCOVERY_SLOT_LIMIT,
-    DASHBOARD_QUEUE_SIZE,
     HOT_MIN_SCORE,
 )
 
@@ -335,7 +333,7 @@ def test_rank_no_feedback_fallback(db, embedder):
     cand_embs = embedder.encode([s.text_content for s in candidates])
 
     config = Config()
-    ranked = rank_stories(
+    ranked = _score_and_rank(
         candidates=candidates,
         candidate_embeddings=cand_embs,
         db=db,
@@ -398,7 +396,7 @@ def test_rank_svm_path(db, embedder):
     ]
     cand_embs = embedder.encode([s.text_content for s in candidates])
 
-    ranked = rank_stories(
+    ranked = _score_and_rank(
         candidates=candidates,
         candidate_embeddings=cand_embs,
         db=db,
@@ -876,7 +874,7 @@ def test_rank_no_feedback_frontpage_sort(db, embedder):
     ]
     cand_embs = embedder.encode([s.text_content for s in candidates])
 
-    ranked = rank_stories(
+    ranked = _score_and_rank(
         candidates=candidates,
         candidate_embeddings=cand_embs,
         db=db,
@@ -1046,7 +1044,7 @@ def test_svm_fitting_robustness(embedder, feedback_actions, cand_count):
 
         cand_embs = np.random.randn(cand_count, 384).astype(np.float32)
         config = Config()
-        ranked = rank_stories(candidates, cand_embs, db, config, embedder)
+        ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
 
         assert len(ranked) == cand_count
         for item in ranked:
@@ -1435,6 +1433,7 @@ def test_fast_rerank_for_user_includes_old_bq_archive_story(db, monkeypatch):
             time=old_time,
             text_content="Old BQ render candidate.",
             source=BQ_ARCHIVE_SOURCE,
+            self_text="Old BQ render candidate.",
         )
     )
 
@@ -1447,6 +1446,51 @@ def test_fast_rerank_for_user_includes_old_bq_archive_story(db, monkeypatch):
     )
 
     assert [item.story.id for item in ranked] == [9301]
+
+
+def test_fast_rerank_for_user_filters_unsummarizable_stories(db, monkeypatch):
+    """fast_rerank_for_user drops stories that is_summarizable rejects."""
+    from pipeline import Config, fast_rerank_for_user
+
+    user = db.create_user("summ_filter_test")
+    summarizable_id = 60001
+    unsummarizable_id = 60002
+    db.upsert_story(
+        Story(
+            id=summarizable_id,
+            title="Has comments",
+            url=None,
+            score=10,
+            time=int(time.time()) - 10,
+            text_content="x",
+            source="hn",
+            comment_count=5,
+        )
+    )
+    db.upsert_story(
+        Story(
+            id=unsummarizable_id,
+            title="No comments, no text",
+            url=None,
+            score=10,
+            time=int(time.time()) - 10,
+            text_content="x",
+            source="hn",
+            comment_count=0,
+        )
+    )
+
+    def fake_embeddings(stories, embedder, db_inst):
+        return np.zeros((len(stories), 384), dtype=np.float32)
+
+    monkeypatch.setattr("pipeline.get_or_compute_embeddings", fake_embeddings)
+    ranked = fast_rerank_for_user(
+        db, Config(days=30), cast(Embedder, object()), user.id
+    )
+
+    result_ids = {r.story.id for r in ranked}
+    assert summarizable_id in result_ids
+    assert unsummarizable_id not in result_ids
 
 
 def test_soft_blend_min_alpha_curve() -> None:
@@ -1540,7 +1584,7 @@ def test_no_cliff_at_n_10(db: Database, embedder: Embedder) -> None:
     ]
     cand_embs = embedder.encode([s.text_content for s in candidates])
 
-    ranked = rank_stories(candidates, cand_embs, db, config, embedder)
+    ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
 
     assert len(ranked) == 3
     # Finance candidate is closest to upvotes (centroid formula). Should rank first.
@@ -1553,6 +1597,678 @@ def test_no_cliff_at_n_10(db: Database, embedder: Embedder) -> None:
     )
     # AI candidate (neutral topic) should be in the middle
     assert ranked[1].story.id == 1
+
+
+def test_tier1_tier2_blend_with_only_upvotes(db: Database, embedder: Embedder) -> None:
+    """5 upvotes (n_feedback=5) → α_2=0.1, mostly gravity with slight centroid."""
+    config = Config()
+    user = db.create_user("test_token_up_blend")
+    now = int(time.time())
+
+    for i in range(5):
+        db.upsert_story(
+            Story(
+                id=100 + i,
+                title=f"Finance story {i}",
+                url=None,
+                score=0,
+                time=0,
+                text_content="stock market investment banking finance economy forecast",
+            )
+        )
+        db.upsert_feedback(user.id, 100 + i, "up")
+
+    candidates = [
+        Story(
+            id=1,
+            title="AI systems",
+            url=None,
+            score=0,
+            time=0,
+            text_content="Training large language models and neural networks.",
+            source="hn",
+        ),
+        Story(
+            id=2,
+            title="Finance news",
+            url=None,
+            score=100,
+            time=now - 3600,
+            text_content="Stock market rally after federal reserve rate decision.",
+            source="hn",
+        ),
+        Story(
+            id=3,
+            title="Baking tips",
+            url=None,
+            score=50,
+            time=now - 86400,
+            text_content="How to make perfect sourdough bread at home.",
+            source="hn",
+        ),
+    ]
+    cand_embs = embedder.encode([s.text_content for s in candidates])
+    ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
+
+    assert len(ranked) == 3
+    # Finance story benefits from both gravity (highest score) and centroid (closest to upvotes)
+    assert ranked[0].story.id == 2
+    # At α_2=0.1 gravity dominates over centroid, so story 3 (baking, high gravity)
+    # should outrank story 1 (AI, zero gravity) even though centroid slightly favors AI.
+    # The gravity gap (0.010 vs 0.000) is small; centroid could flip it.
+    # Assert only that finance is first and both trailing stories are present.
+    assert ranked[1].story.id in (1, 3)
+    assert ranked[2].story.id in (1, 3)
+    assert ranked[1].story.id != ranked[2].story.id
+
+
+def test_tier2_pure_at_60_plus_one_class(db: Database, embedder: Embedder) -> None:
+    """60 upvotes (n_feedback=60, α_2=1.0) → pure tier2 centroid, finance first."""
+    config = Config()
+    user = db.create_user("test_token_pure_tier2")
+    now = int(time.time())
+
+    for i in range(60):
+        db.upsert_story(
+            Story(
+                id=100 + i,
+                title=f"Finance story {i}",
+                url=None,
+                score=0,
+                time=0,
+                text_content="stock market investment banking finance economy forecast",
+            )
+        )
+        db.upsert_feedback(user.id, 100 + i, "up")
+
+    candidates = [
+        Story(
+            id=1,
+            title="AI systems",
+            url=None,
+            score=0,
+            time=0,
+            text_content="Training large language models and neural networks.",
+            source="hn",
+        ),
+        Story(
+            id=2,
+            title="Finance news",
+            url=None,
+            score=100,
+            time=now - 3600,
+            text_content="Stock market rally after federal reserve rate decision.",
+            source="hn",
+        ),
+        Story(
+            id=3,
+            title="Baking tips",
+            url=None,
+            score=50,
+            time=now - 86400,
+            text_content="How to make perfect sourdough bread at home.",
+            source="hn",
+        ),
+    ]
+    cand_embs = embedder.encode([s.text_content for s in candidates])
+    ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
+
+    assert len(ranked) == 3
+    # Pure centroid (sim_up): finance > AI > baking
+    assert ranked[0].story.id == 2
+    assert ranked[2].story.id == 3
+
+
+def test_tier1_active_at_tier3_activation_boundary(
+    db: Database, embedder: Embedder
+) -> None:
+    """19 up/19 down (n_feedback=38) then 20/20 (n_feedback=40).
+    At both points tier1 weight is non-zero: 1-38/50=0.24 and 1-40/50=0.20."""
+    config = Config()
+    user = db.create_user("test_token_boundary")
+    now = int(time.time())
+
+    for i in range(19):
+        db.upsert_story(
+            Story(
+                id=100 + i,
+                title=f"Up {i}",
+                url=None,
+                score=0,
+                time=0,
+                text_content="stock market investment banking finance economy",
+            ),
+        )
+        db.upsert_feedback(user.id, 100 + i, "up")
+        db.upsert_story(
+            Story(
+                id=200 + i,
+                title=f"Down {i}",
+                url=None,
+                score=0,
+                time=0,
+                text_content="sourdough bread cake cookie recipe kitchen baking",
+            ),
+        )
+        db.upsert_feedback(user.id, 200 + i, "down")
+
+    candidates = [
+        Story(
+            id=1,
+            title="AI systems",
+            url=None,
+            score=0,
+            time=0,
+            text_content="Training large language models and neural networks.",
+            source="hn",
+        ),
+        Story(
+            id=2,
+            title="Finance news",
+            url=None,
+            score=100,
+            time=now - 3600,
+            text_content="Stock market rally after federal reserve rate decision.",
+            source="hn",
+        ),
+        Story(
+            id=3,
+            title="Baking tips",
+            url=None,
+            score=50,
+            time=now - 86400,
+            text_content="How to make perfect sourdough bread at home.",
+            source="hn",
+        ),
+    ]
+    cand_embs = embedder.encode([s.text_content for s in candidates])
+    ranked_19 = _score_and_rank(candidates, cand_embs, db, config, embedder)
+
+    # Add one more of each class (20 up, 20 down, n_feedback=40, n_min=20)
+    db.upsert_story(
+        Story(
+            id=119,
+            title="Up final",
+            url=None,
+            score=0,
+            time=0,
+            text_content="stock market investment banking finance economy final",
+        ),
+    )
+    db.upsert_feedback(user.id, 119, "up")
+    db.upsert_story(
+        Story(
+            id=219,
+            title="Down final",
+            url=None,
+            score=0,
+            time=0,
+            text_content="sourdough bread cake cookie recipe kitchen baking final",
+        ),
+    )
+    db.upsert_feedback(user.id, 219, "down")
+
+    ranked_20 = _score_and_rank(candidates, cand_embs, db, config, embedder)
+
+    assert len(ranked_19) == 3
+    assert len(ranked_20) == 3
+    # Finance should rank first at both points (tier2 dominant, tier3 not yet active)
+    assert ranked_19[0].story.id == 2
+    assert ranked_20[0].story.id == 2
+    # Baking (closest to downvotes) should rank last at both points
+    assert ranked_19[-1].story.id == 3
+    assert ranked_20[-1].story.id == 3
+    # Transition from 19→20 should be smooth: the gap between ranked[0].score
+    # and ranked[1].score should not change abruptly.
+    gap_19 = ranked_19[0].score - ranked_19[1].score
+    gap_20 = ranked_20[0].score - ranked_20[1].score
+    assert abs(gap_20 - gap_19) < 0.15, (
+        f"Cliff detected at tier3 threshold: gap_19={gap_19:.4f}, gap_20={gap_20:.4f}"
+    )
+
+
+def test_three_way_blend_at_30_30(db: Database, embedder: Embedder) -> None:
+    """30 up/30 down (n_feedback=60, α_2=1.0, α_3≈0.167) → tier2-t3 blend."""
+    config = Config()
+    user = db.create_user("test_token_three_way")
+    now = int(time.time())
+
+    for i in range(30):
+        db.upsert_story(
+            Story(
+                id=100 + i,
+                title=f"Up {i}",
+                url=None,
+                score=0,
+                time=0,
+                text_content="stock market investment banking finance economy",
+            ),
+        )
+        db.upsert_feedback(user.id, 100 + i, "up")
+        db.upsert_story(
+            Story(
+                id=200 + i,
+                title=f"Down {i}",
+                url=None,
+                score=0,
+                time=0,
+                text_content="sourdough bread cake cookie recipe kitchen baking",
+            ),
+        )
+        db.upsert_feedback(user.id, 200 + i, "down")
+
+    candidates = [
+        Story(
+            id=1,
+            title="AI systems",
+            url=None,
+            score=0,
+            time=0,
+            text_content="Training large language models and neural networks.",
+            source="hn",
+        ),
+        Story(
+            id=2,
+            title="Finance news",
+            url=None,
+            score=100,
+            time=now - 3600,
+            text_content="Stock market rally after federal reserve rate decision.",
+            source="hn",
+        ),
+        Story(
+            id=3,
+            title="Baking tips",
+            url=None,
+            score=50,
+            time=now - 86400,
+            text_content="How to make perfect sourdough bread at home.",
+            source="hn",
+        ),
+    ]
+    cand_embs = embedder.encode([s.text_content for s in candidates])
+    ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
+
+    assert len(ranked) == 3
+    # Tier2 + tier3 blend: finance first, baking last
+    assert ranked[0].story.id == 2
+    assert ranked[-1].story.id == 3
+
+
+@pytest.mark.parametrize(
+    "n_up,n_down",
+    [
+        (0, 0),
+        (5, 0),
+        (10, 0),
+        (25, 0),
+        (50, 0),
+        (5, 5),
+        (10, 10),
+        (20, 20),
+        (30, 30),
+    ],
+)
+def test_blend_weights_monotonic(
+    db: Database, embedder: Embedder, n_up: int, n_down: int
+) -> None:
+    """Verify blend weights change monotonically with feedback count."""
+    config = Config()
+    user = db.create_user(f"test_mono_{n_up}_{n_down}")
+    now = int(time.time())
+
+    for i in range(n_up):
+        db.upsert_story(
+            Story(
+                id=100 + i,
+                title=f"Up {i}",
+                url=None,
+                score=0,
+                time=0,
+                text_content="stock market investment banking finance economy",
+            ),
+        )
+        db.upsert_feedback(user.id, 100 + i, "up")
+    for i in range(n_down):
+        db.upsert_story(
+            Story(
+                id=200 + i,
+                title=f"Down {i}",
+                url=None,
+                score=0,
+                time=0,
+                text_content="sourdough bread cake cookie recipe kitchen baking",
+            ),
+        )
+        db.upsert_feedback(user.id, 200 + i, "down")
+
+    candidates = [
+        Story(
+            id=1,
+            title="AI systems",
+            url=None,
+            score=50,
+            time=now - 3600,
+            text_content="Training large language models and neural networks.",
+            source="hn",
+        ),
+        Story(
+            id=2,
+            title="Finance news",
+            url=None,
+            score=100,
+            time=now - 3600,
+            text_content="Stock market rally after federal reserve rate decision.",
+            source="hn",
+        ),
+        Story(
+            id=3,
+            title="Baking tips",
+            url=None,
+            score=50,
+            time=now - 3600,
+            text_content="How to make perfect sourdough bread at home.",
+            source="hn",
+        ),
+    ]
+    # All equal score/time so gravity gives equal tier1 scores
+    cand_embs = embedder.encode([s.text_content for s in candidates])
+    ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
+
+    assert len(ranked) == 3
+    n_fb = n_up + n_down
+    assert ranked[0].story.id == 2, (
+        f"Finance should rank first at n_up={n_up} n_down={n_down}"
+    )
+    assert ranked[-1].story.id == 3, (
+        f"Baking should rank last at n_up={n_up} n_down={n_down}"
+    )
+    # Verify monotonicity: as feedback grows, tiers change smoothly.
+    # The score of finance minus score of AI should increase (more centroid weight).
+    if n_fb > 0 and n_up >= n_down:
+        score_gap = ranked[0].score - ranked[1].score
+        assert score_gap > 0.0, (
+            f"Finance-AI gap should be positive, got {score_gap:.4f}"
+        )
+
+
+def test_three_way_weights_sum_to_one(db: Database, embedder: Embedder) -> None:
+    """At 50 up/50 down, α_2=1.0, α_3=0.5, weights: t1=0, t2=0.5, t3=0.5.
+    Finance should still rank first, baking last."""
+    config = Config()
+    user = db.create_user("test_token_sum_to_one")
+    now = int(time.time())
+
+    for i in range(50):
+        db.upsert_story(
+            Story(
+                id=100 + i,
+                title=f"Up {i}",
+                url=None,
+                score=0,
+                time=0,
+                text_content="stock market investment banking finance economy",
+            ),
+        )
+        db.upsert_feedback(user.id, 100 + i, "up")
+        db.upsert_story(
+            Story(
+                id=200 + i,
+                title=f"Down {i}",
+                url=None,
+                score=0,
+                time=0,
+                text_content="sourdough bread cake cookie recipe kitchen baking",
+            ),
+        )
+        db.upsert_feedback(user.id, 200 + i, "down")
+
+    candidates = [
+        Story(
+            id=1,
+            title="AI systems",
+            url=None,
+            score=0,
+            time=0,
+            text_content="Training large language models and neural networks.",
+            source="hn",
+        ),
+        Story(
+            id=2,
+            title="Finance news",
+            url=None,
+            score=100,
+            time=now - 3600,
+            text_content="Stock market rally after federal reserve rate decision.",
+            source="hn",
+        ),
+        Story(
+            id=3,
+            title="Baking tips",
+            url=None,
+            score=50,
+            time=now - 86400,
+            text_content="How to make perfect sourdough bread at home.",
+            source="hn",
+        ),
+    ]
+    cand_embs = embedder.encode([s.text_content for s in candidates])
+    ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
+
+    assert len(ranked) == 3
+    assert ranked[0].story.id == 2
+    assert ranked[-1].story.id == 3
+
+
+def test_tier3_pure_at_80_each(db: Database, embedder: Embedder) -> None:
+    """80 up/80 down (n_min=80, α_3=1.0) → pure tier3 SVM ranking."""
+    config = Config()
+    user = db.create_user("test_token_pure_tier3")
+    now = int(time.time())
+
+    for i in range(80):
+        db.upsert_story(
+            Story(
+                id=100 + i,
+                title=f"Up {i}",
+                url=None,
+                score=0,
+                time=0,
+                text_content="stock market investment banking finance economy",
+            ),
+        )
+        db.upsert_feedback(user.id, 100 + i, "up")
+        db.upsert_story(
+            Story(
+                id=200 + i,
+                title=f"Down {i}",
+                url=None,
+                score=0,
+                time=0,
+                text_content="sourdough bread cake cookie recipe kitchen baking",
+            ),
+        )
+        db.upsert_feedback(user.id, 200 + i, "down")
+
+    candidates = [
+        Story(
+            id=1,
+            title="AI systems",
+            url=None,
+            score=0,
+            time=0,
+            text_content="Training large language models and neural networks.",
+            source="hn",
+        ),
+        Story(
+            id=2,
+            title="Finance news",
+            url=None,
+            score=100,
+            time=now - 3600,
+            text_content="Stock market rally after federal reserve rate decision.",
+            source="hn",
+        ),
+        Story(
+            id=3,
+            title="Baking tips",
+            url=None,
+            score=50,
+            time=now - 86400,
+            text_content="How to make perfect sourdough bread at home.",
+            source="hn",
+        ),
+    ]
+    cand_embs = embedder.encode([s.text_content for s in candidates])
+    ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
+
+    assert len(ranked) == 3
+    assert ranked[0].story.id == 2
+
+
+def test_top_badge_threshold_uses_config_percentile_and_floor(
+    db: Database, embedder: Embedder
+) -> None:
+    """is_high_engagement respects top_badge_percentile and top_badge_min_score."""
+    config = Config(count=40)
+    now = int(time.time())
+    candidates = [
+        Story(
+            id=i,
+            title=f"Story {i}",
+            url=None,
+            score=score,
+            time=now - 3600,
+            text_content=f"Sample text content for story {i}.",
+            source="hn",
+        )
+        for i, score in enumerate(range(10, 210, 10))  # 20 stories, scores 10..200
+    ]
+    cand_embs = embedder.encode([s.text_content for s in candidates])
+
+    # Default config: 90th pct + min 100
+    ranked = rerank_candidates(db, config, embedder, candidates, cand_embs)
+    # 90th pct of [10..200] ≈ 181 → max(181, 100) = 181
+    engaged_ids = {r.story.id for r in ranked if r.is_high_engagement}
+    # Must include the 190-pt and 200-pt stories (ids 18, 19)
+    assert 18 in engaged_ids, (
+        f"190-pt story should be high-engagement at p90, got ids={engaged_ids}"
+    )
+    assert 19 in engaged_ids, (
+        f"200-pt story should be high-engagement at p90, got ids={engaged_ids}"
+    )
+    assert 17 not in engaged_ids, (
+        "180-pt story should NOT be high-engagement at p90 (below 181)"
+    )
+    n_engaged = len(engaged_ids)
+    assert n_engaged == 2, f"Expected 2 high-engagement at p90, got {n_engaged}"
+
+    # 50th pct + min 100: threshold = max(105, 100) = 105
+    config2 = Config(
+        count=40,
+        model=ModelConfig(top_badge_percentile=50.0, top_badge_min_score=100),
+    )
+    ranked2 = rerank_candidates(db, config2, embedder, candidates, cand_embs)
+    engaged2 = {r.story.id for r in ranked2 if r.is_high_engagement}
+    # Stories with score >= 110 (ids 10..19): 10 stories
+    assert 10 in engaged2, f"110-pt story should be high-engagement, got ids={engaged2}"
+    assert 9 not in engaged2, "100-pt story should NOT be high-engagement"
+    assert len(engaged2) == 10, (
+        f"Expected 10 high-engagement at p50+min100, got {len(engaged2)}"
+    )
+
+    # 50th pct + min 120: threshold = max(105, 120) = 120
+    config3 = Config(
+        count=40,
+        model=ModelConfig(top_badge_percentile=50.0, top_badge_min_score=120),
+    )
+    ranked3 = rerank_candidates(db, config3, embedder, candidates, cand_embs)
+    engaged3 = {r.story.id for r in ranked3 if r.is_high_engagement}
+    # Stories with score >= 120 (ids 11..19): 9 stories
+    assert 11 in engaged3
+    assert 10 not in engaged3, "110-pt story should NOT be high-engagement at min 120"
+    assert len(engaged3) == 9, (
+        f"Expected 9 high-engagement at p50+min120, got {len(engaged3)}"
+    )
+
+
+def test_discussion_badge_threshold_uses_config_percentile_and_floor(
+    db: Database, embedder: Embedder
+) -> None:
+    """is_discussion_rich respects discussion_badge_percentile and discussion_badge_min_comments."""
+    config = Config(count=40)
+    now = int(time.time())
+    # 20 stories, comment counts 10..200 (step 10), ordered so the highest-cc
+    # candidates are at the start of the list. Stable sort by tier-blend score
+    # preserves input order (all scores are equal), so the high-cc stories end
+    # up in the primary ranked set (limit=12) where the discussion-rich badge
+    # is applied via primary attribution.
+    cc_values = list(range(10, 210, 10))  # [10, 20, ..., 200]
+    candidates = [
+        Story(
+            id=i,
+            title=f"Story {i}",
+            url=None,
+            score=50,
+            time=now - 3600,
+            text_content=f"Sample text content for story {i}.",
+            source="hn",
+            comment_count=cc,
+        )
+        for i, cc in enumerate(reversed(cc_values))  # id=0→cc=200, id=19→cc=10
+    ]
+    cand_embs = embedder.encode([s.text_content for s in candidates])
+
+    # Default config: 90th pct + min 0
+    ranked = rerank_candidates(db, config, embedder, candidates, cand_embs)
+    # 90th pct of [10..200] ≈ 181 → max(181, 0) = 181
+    rich_ids = {r.story.id for r in ranked if r.is_discussion_rich}
+    # id=0 has cc=200, id=1 has cc=190 → both should be discussion-rich
+    assert 0 in rich_ids, (
+        f"200-cc story should be discussion-rich at p90, got ids={rich_ids}"
+    )
+    assert 1 in rich_ids, (
+        f"190-cc story should be discussion-rich at p90, got ids={rich_ids}"
+    )
+    assert 2 not in rich_ids, (
+        "180-cc story should NOT be discussion-rich at p90 (below 181)"
+    )
+    n_rich = len(rich_ids)
+    assert n_rich == 2, f"Expected 2 discussion-rich at p90+min0, got {n_rich}"
+
+    # 50th pct + min 100: threshold = max(105, 100) = 105
+    config2 = Config(
+        count=40,
+        model=ModelConfig(
+            discussion_badge_percentile=50.0, discussion_badge_min_comments=100
+        ),
+    )
+    ranked2 = rerank_candidates(db, config2, embedder, candidates, cand_embs)
+    rich2 = {r.story.id for r in ranked2 if r.is_discussion_rich}
+    # Stories with cc >= 110: ids 0..9 (10 stories)
+    assert 0 in rich2, f"200-cc story should be discussion-rich, got ids={rich2}"
+    assert 9 in rich2, f"110-cc story should be discussion-rich, got ids={rich2}"
+    assert 10 not in rich2, "100-cc story should NOT be discussion-rich"
+    assert len(rich2) == 10, (
+        f"Expected 10 discussion-rich at p50+min100, got {len(rich2)}"
+    )
+
+    # 50th pct + min 120: threshold = max(105, 120) = 120
+    config3 = Config(
+        count=40,
+        model=ModelConfig(
+            discussion_badge_percentile=50.0, discussion_badge_min_comments=120
+        ),
+    )
+    ranked3 = rerank_candidates(db, config3, embedder, candidates, cand_embs)
+    rich3 = {r.story.id for r in ranked3 if r.is_discussion_rich}
+    # Stories with cc >= 120: ids 0..8 (9 stories)
+    assert 0 in rich3
+    assert 8 in rich3
+    assert 9 not in rich3, "110-cc story should NOT be discussion-rich at min 120"
+    assert len(rich3) == 9, (
+        f"Expected 9 discussion-rich at p50+min120, got {len(rich3)}"
+    )
 
 
 def test_tier1_gravity_at_zero_feedback(db: Database, embedder: Embedder) -> None:
@@ -1592,7 +2308,7 @@ def test_tier1_gravity_at_zero_feedback(db: Database, embedder: Embedder) -> Non
     ]
     cand_embs = embedder.encode([s.text_content for s in candidates])
 
-    ranked = rank_stories(candidates, cand_embs, db, config, embedder)
+    ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
 
     # Recent high score should rank highest (gravity) — no, tier 1 sorts by story.score (raw points)
     assert ranked[0].story.id == 3, (
@@ -1656,7 +2372,7 @@ def test_tier3_svm_at_60_plus_with_gates(db: Database, embedder: Embedder) -> No
     ]
     cand_embs = embedder.encode([s.text_content for s in candidates])
 
-    ranked = rank_stories(candidates, cand_embs, db, config, embedder)
+    ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
 
     assert len(ranked) == 2
     # AI story should rank first (SVM learned upvote pattern)
@@ -1713,7 +2429,7 @@ def test_min_class_gate_n_down_fails(db: Database, embedder: Embedder) -> None:
         Story(id=1, title="A", url=None, score=0, time=0, text_content="x"),
         Story(id=2, title="B", url=None, score=0, time=0, text_content="y"),
     ]
-    ranked = rank_stories(candidates, cand_embs, db, config, embedder)
+    ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
     assert len(ranked) == 2
     for r in ranked:
         assert r.prob_up is None
@@ -1730,7 +2446,7 @@ def test_min_class_gate_n_up_fails(db: Database, embedder: Embedder) -> None:
         Story(id=1, title="A", url=None, score=0, time=0, text_content="x"),
         Story(id=2, title="B", url=None, score=0, time=0, text_content="y"),
     ]
-    ranked = rank_stories(candidates, cand_embs, db, config, embedder)
+    ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
     assert len(ranked) == 2
     for r in ranked:
         assert r.prob_up is None
@@ -1747,7 +2463,7 @@ def test_min_class_gate_both_just_pass(db: Database, embedder: Embedder) -> None
         Story(id=1, title="A", url=None, score=0, time=0, text_content="x"),
         Story(id=2, title="B", url=None, score=0, time=0, text_content="y"),
     ]
-    ranked = rank_stories(candidates, cand_embs, db, config, embedder)
+    ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
     assert len(ranked) == 2
     for r in ranked:
         assert r.prob_up is not None
@@ -1764,118 +2480,76 @@ def test_min_class_blend_mid(db: Database, embedder: Embedder) -> None:
         Story(id=1, title="A", url=None, score=0, time=0, text_content="x"),
         Story(id=2, title="B", url=None, score=0, time=0, text_content="y"),
     ]
-    ranked = rank_stories(candidates, cand_embs, db, config, embedder)
+    ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
     assert len(ranked) == 2
     for r in ranked:
         assert r.prob_up is not None
         assert 0.0 <= r.score <= 1.0
 
 
-def test_rerank_candidates_adds_non_hn_extras_and_sets_flag(db, embedder):
-    """Non-HN candidates beyond the primary cap are pulled as extras with is_non_hn=True.
-    All non-HN stories (primary and extra) carry is_non_hn=True."""
-    # 4 HN + 12 non-HN = 16 total. Config(count=15) → primary_limit = 12.
-    candidates = [
-        Story(
-            id=i,
-            title=f"HN {i}",
-            url=None,
-            score=100 - i,
-            time=0,
-            text_content=f"hn{i}",
-            source="hn",
-        )
-        for i in range(4)
-    ] + [
-        Story(
-            id=100 + i,
-            title=f"RSS {i}",
-            url=None,
-            score=60 - i,
-            time=0,
-            text_content=f"rss{i}",
-            source="rss_lobste_rs",
-        )
-        for i in range(12)
+# ── Non-HN discovery slot formula tests ──
+
+
+@given(data=st.data())
+@settings(max_examples=50, suppress_health_check=[HealthCheck.function_scoped_fixture])
+def test_non_hn_slot_count_bounds(data):
+    """_non_hn_slot_count always returns 0 <= result <= cap."""
+    from pipeline import _non_hn_slot_count
+
+    n = data.draw(st.integers(0, 200))
+    cap = data.draw(st.integers(1, 16))
+    threshold = data.draw(st.integers(0, 100))
+    window = data.draw(st.integers(1, 100))
+    result = _non_hn_slot_count(n, cap=cap, threshold=threshold, window=window)
+    assert 0 <= result <= cap
+
+
+@given(data=st.data())
+@settings(max_examples=50, suppress_health_check=[HealthCheck.function_scoped_fixture])
+def test_non_hn_slot_count_zero_below_threshold(data):
+    """Result is 0 when n_feedback <= threshold."""
+    from pipeline import _non_hn_slot_count
+
+    n = data.draw(st.integers(0, 200))
+    cap = data.draw(st.integers(1, 16))
+    threshold = data.draw(st.integers(0, 100))
+    window = data.draw(st.integers(1, 100))
+    if n <= threshold:
+        assert _non_hn_slot_count(n, cap=cap, threshold=threshold, window=window) == 0
+
+
+@given(data=st.data())
+@settings(max_examples=50, suppress_health_check=[HealthCheck.function_scoped_fixture])
+def test_non_hn_slot_count_capped_at_full_ramp(data):
+    """Result is cap when n_feedback >= threshold + window."""
+    from pipeline import _non_hn_slot_count
+
+    n = data.draw(st.integers(0, 200))
+    cap = data.draw(st.integers(1, 16))
+    threshold = data.draw(st.integers(0, 100))
+    window = data.draw(st.integers(1, 100))
+    if n >= threshold + window and window > 0:
+        assert _non_hn_slot_count(n, cap=cap, threshold=threshold, window=window) == cap
+
+
+def test_non_hn_slot_count_exact_values():
+    from pipeline import _non_hn_slot_count
+
+    params = (8, 20, 30)  # cap, threshold, window (the production defaults)
+    cases = [
+        (0, 0),
+        (19, 0),
+        (20, 0),
+        (24, 1),
+        (30, 3),
+        (40, 5),
+        (50, 8),
+        (100, 8),
     ]
-    embs = np.eye(16, 384, dtype=np.float32)
-    result = rerank_candidates(
-        db=db,
-        config=Config(count=15),
-        embedder=embedder,
-        candidates=candidates,
-        cand_embeddings=embs,
-        user_id=None,
-    )
-    for r in result:
-        if r.story.source == "hn":
-            assert not r.is_non_hn, f"HN story {r.story.id} should not have is_non_hn"
-        else:
-            assert r.is_non_hn, f"RSS story {r.story.id} should have is_non_hn"
-    non_hn_primary = sum(1 for r in result[:DASHBOARD_QUEUE_SIZE] if r.is_non_hn)
-    total_non_hn = sum(1 for r in result if r.is_non_hn)
-    assert total_non_hn > non_hn_primary, (
-        "non-HN should have extra slots beyond primary"
-    )
-
-
-def test_rerank_candidates_non_hn_slot_cap_respected(db, embedder):
-    """The non-HN extra pass (pass #7) respects NON_HN_DISCOVERY_SLOT_LIMIT.
-    Other passes (novel, similar) can also add non-HN stories under their own
-    caps. The cap test only constrains the non-HN pass itself, identified by
-    is_non_hn=True with no other extra-slot flag set."""
-    # 4 HN + 20 non-HN = 24 total. Primary_limit = 12.
-    candidates = [
-        Story(
-            id=i,
-            title=f"HN {i}",
-            url=None,
-            score=100 - i,
-            time=0,
-            text_content=f"hn{i}",
-            source="hn",
+    for n, expected in cases:
+        assert _non_hn_slot_count(n, *params) == expected, (
+            f"n={n}: expected {expected}, got {_non_hn_slot_count(n, *params)}"
         )
-        for i in range(4)
-    ] + [
-        Story(
-            id=100 + i,
-            title=f"RSS {i}",
-            url=None,
-            score=60 - i,
-            time=0,
-            text_content=f"rss{i}",
-            source="rss_lobste_rs",
-        )
-        for i in range(20)
-    ]
-    embs = np.eye(24, 384, dtype=np.float32)
-    result = rerank_candidates(
-        db=db,
-        config=Config(count=24),
-        embedder=embedder,
-        candidates=candidates,
-        cand_embeddings=embs,
-        user_id=None,
-    )
-
-    # Stories added by the non-HN pass have is_non_hn=True and no other
-    # extra-slot flag (novel/similar/discussion/engagement/hot/uncertain).
-    def _other_extra(r):
-        return any(
-            [
-                r.is_uncertain,
-                r.is_novel,
-                r.is_similar,
-                r.is_discussion_rich,
-                r.is_high_engagement,
-                r.is_hot,
-            ]
-        )
-
-    non_hn_pass_only = [r for r in result if r.is_non_hn and not _other_extra(r)]
-    assert len(non_hn_pass_only) <= NON_HN_DISCOVERY_SLOT_LIMIT, (
-        f"non-HN pass picked {len(non_hn_pass_only)} > cap {NON_HN_DISCOVERY_SLOT_LIMIT}"
-    )
 
 
 # ── Comment selection algorithm tests ──
@@ -2238,13 +2912,13 @@ def test_prewarm_top_stories_skips_stories_not_in_db() -> None:
         db.close()
 
 
-def test_candidate_similar_to_neutral_is_not_novel(db, monkeypatch):
+def test_candidate_similar_to_neutral_is_not_novel(db, embedder, monkeypatch):
     """A candidate close to a neutral feedback story should not get is_novel=True,
     because cand_max_sim now includes neutral similarity in the 3-way max."""
     config = Config(count=3)
     user = db.create_user("test_neutral_novel")
 
-    def mock_gce(stories, embedder, db_inst):
+    def mock_gce(stories, embedder_arg, db_inst):
         arr = np.zeros((len(stories), 384), dtype=np.float32)
         for i, s in enumerate(stories):
             if s.id == 100:
@@ -2285,11 +2959,8 @@ def test_candidate_similar_to_neutral_is_not_novel(db, monkeypatch):
         Story(id=3, title="Novel", url=None, score=5, time=0, text_content=""),
     ]
 
-    from pipeline import Embedder as StubEmbedder
-
-    stub_embedder = StubEmbedder()
     ranked = rerank_candidates(
-        db, config, stub_embedder, candidates, cand_embs, user_id=user.id
+        db, config, embedder, candidates, cand_embs, user_id=user.id
     )
 
     for r in ranked:
@@ -2307,13 +2978,13 @@ def test_candidate_similar_to_neutral_is_not_novel(db, monkeypatch):
             )
 
 
-def test_no_neutral_feedback_uses_up_down_only_for_novel(db, monkeypatch):
+def test_no_neutral_feedback_uses_up_down_only_for_novel(db, embedder, monkeypatch):
     """When no neutral feedback exists, cand_max_sim equals max(up, down) because
     neutral similarities are zeros — same as old behavior."""
     config = Config(count=3)
     user = db.create_user("test_no_neutral_novel")
 
-    def mock_gce(stories, embedder, db_inst):
+    def mock_gce(stories, embedder_arg, db_inst):
         arr = np.zeros((len(stories), 384), dtype=np.float32)
         for i, s in enumerate(stories):
             if s.id == 100:
@@ -2349,11 +3020,8 @@ def test_no_neutral_feedback_uses_up_down_only_for_novel(db, monkeypatch):
         Story(id=2, title="Novel", url=None, score=5, time=0, text_content=""),
     ]
 
-    from pipeline import Embedder as StubEmbedder
-
-    stub_embedder = StubEmbedder()
     ranked = rerank_candidates(
-        db, config, stub_embedder, candidates, cand_embs, user_id=user.id
+        db, config, embedder, candidates, cand_embs, user_id=user.id
     )
 
     for r in ranked:

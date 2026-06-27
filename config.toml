@@ -25,10 +25,16 @@ min_signal_examples = 5
 diversity_threshold = 0.75
 knn_k = 10
 positive_cluster_k = 4
+tier2_blend_window = 50
 tier3_threshold = 20
 tier3_blend_window = 60
 min_up_for_svm = 20
 min_down_for_svm = 20
+non_hn_ramp_window = 30
+top_badge_percentile = 90.0
+top_badge_min_score = 100
+discussion_badge_percentile = 90.0
+discussion_badge_min_comments = 0
 
 
 [hn_rewrite.rss]

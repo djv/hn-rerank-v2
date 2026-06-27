@@ -524,6 +524,28 @@
       font-weight: 500;
     }
 
+    .vote-counts {
+      display: flex;
+      gap: 0.7rem;
+      font-size: 0.78rem;
+      font-weight: 500;
+      color: var(--pico-muted-color);
+      align-items: center;
+      margin-left: auto;
+    }
+    .vote-count {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.15rem;
+      font-variant-numeric: tabular-nums;
+    }
+    .vote-count-glyph {
+      font-size: 0.85em;
+    }
+    .vote-count--up { color: #28a745; }
+    .vote-count--neutral { color: #ffc107; }
+    .vote-count--down { color: #dc3545; }
+
     .vote-bar .refresh-progress {
       display: flex;
       gap: 3px;
@@ -828,10 +850,10 @@
           <span class="novel-badge" title="Semantically distant from all your feedback, but model scores it high">✨ Novel</span>
           {% endif %}
           {% if item.is_discussion_rich %}
-          <span class="discussion-rich-badge" title="Many comments on this story (top 7%)">💬 Talk-worthy</span>
+          <span class="discussion-rich-badge" title="Top {{ discussion_badge_percentile }}% by HN comments">💬 Talk-worthy</span>
           {% endif %}
           {% if item.is_high_engagement %}
-          <span class="high-engagement-badge" title="Top 5% by HN points">🏆 Top</span>
+          <span class="high-engagement-badge" title="Top {{ top_badge_percentile }}% by HN points">🏆 Top</span>
           {% endif %}
           {% if item.is_hot %}
           <span class="hot-badge" title="Top 2% by engagement velocity (points/hour) and score ≥ 20">🔥 Hot</span>
@@ -909,6 +931,20 @@
         <span class="refresh-segment" data-segment="4"></span>
         <span class="refresh-segment" data-segment="5"></span>
       </div>
+    </div>
+    <div class="vote-counts" aria-label="Your all-time vote counts">
+      <span class="vote-count vote-count--up">
+        <span class="vote-count-glyph" aria-hidden="true">▲</span>
+        <span class="vote-count-num" data-vote-count="up">{{ vote_count_up or 0 }}</span>
+      </span>
+      <span class="vote-count vote-count--neutral">
+        <span class="vote-count-glyph" aria-hidden="true">●</span>
+        <span class="vote-count-num" data-vote-count="neutral">{{ vote_count_neutral or 0 }}</span>
+      </span>
+      <span class="vote-count vote-count--down">
+        <span class="vote-count-glyph" aria-hidden="true">▼</span>
+        <span class="vote-count-num" data-vote-count="down">{{ vote_count_down or 0 }}</span>
+      </span>
     </div>
     <div class="feedback-group">
       <button class="feedback-btn" data-fb="up" title="Upvote">▲</button>
@@ -1111,6 +1147,9 @@
       });
       if (activeCard && !matchesCurrentMode(activeCard)) {
         activeCard.classList.remove('active');
+      }
+      if (refillQueued) {
+        refillWhenReady();
       }
       orderForCurrentMode();
       showNextCard();
@@ -1450,6 +1489,10 @@
       document.querySelectorAll('[data-fb]').forEach(btn => {
         btn.classList.toggle('active', btn.dataset.fb === action);
       });
+      const countEl = document.querySelector(`[data-vote-count="${action}"]`);
+      if (countEl) {
+        countEl.textContent = String(Number(countEl.textContent || '0') + 1);
+      }
 
       if (action === 'up') {
         card.style.setProperty('--swipe-exit-x', '42px');
