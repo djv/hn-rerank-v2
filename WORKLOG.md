@@ -5,6 +5,43 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-26 — detail-v3: tighten unified fallback prompt; bump discussion budget to 150w
+
+- Bug report: story 48689028 ("Previewing GPT-5.6 Sol") yielded a TLDR dominated by
+  a fabricated "Article Overview" (synthesized from the title alone) with 11+
+  discussion bullets organized into 5 sub-categories. Root cause: 1) `article_body`
+  fetch returned 403 from openai.com; 2) the dual-prompt path is gated on
+  `article_section and comments_section`, so control fell through to the single
+  unified fallback prompt; 3) the unified fallback had no structural enforcement
+  (no bullet limit, vague "under 240 words" budget, no detection of missing
+  article text). 3,952 / 5,153 HN stories (77%) have no `self_text` or
+  `article_body` and were affected.
+- User preference: discussion-only stories must not produce any article/story
+  section. The `### Article` section was being fabricated from the title alone.
+- **Fix**: replaced the unified fallback prompt (`server.py:482-498`) with a
+  conditional prompt that has three explicit cases:
+  - Article text + comments → `### Article` (120w) + `### Discussion` (150w)
+  - Only comments → `### Discussion` only (150w, 3-5 bullets)
+  - Only article text → `### Article` only (120w, 3-5 bullets)
+  The discussion-only path explicitly instructs the model not to write an
+  Article or Story section and not to summarize the title as if it were
+  article content.
+- Added a stub short-circuit at `server.py:408-409` — when both article_section
+  and top_comments are empty, return a self-explanatory stub string instead of
+  calling the LLM at all.
+- Bumped the dual-prompt discussion budget from 100w to 150w (`server.py:428`),
+  giving richer comment threads more room to breathe.
+- `TLDR_PROMPT_VERSION` bumped from `"detail-v2"` to `"detail-v3"` so the old
+  cache keys are invalidated and the new prompt takes effect on next click.
+  ~3,952 cached entries will be regenerated lazily.
+- `max_tokens` left at 2000 for the unified fallback (rely on prompt word
+  limits for enforcement).
+- New tests: `test_unified_fallback_omits_article_when_no_article_body`
+  (asserts prompt has the conditional instruction, no article/story section in
+  output), `test_generate_detailed_tldr_returns_stub_when_no_content` (zero
+  LLM calls for empty content). 180/180 tests pass, ruff clean.
+- ARCHITECTURE.md §4.2 updated with the 4-path TLDR table.
+
 ## 2026-06-26 — Dep cleanup: torch → optional group; drop unused duckdb + matplotlib
 
 - `pyproject.toml`: `torch>=2.12` moved out of runtime `dependencies` into a
@@ -734,3 +771,20 @@ ruff clean.
   cache, and generate_tldr_for_story dual/fallback paths.
 - `AGENTS.md` — new "TLDR benchmark" section with command.
 - `.gitignore` — add `eval_results/`.
+
+## 2026-06-27 — tighten novel criterion (3-way max, 10th-pct) + client shuffle for popular/explore
+
+- **Pipeline** (`pipeline.py:1707-1730`): novel `cand_max_sim` now includes neutral
+  similarity (`cand_closest_neutral`), making the 3-way `max(up, down, neutral)`.
+  Threshold lowered from 15th to 10th percentile. Both changes make the Novel
+  badge stricter — a story must be semantically distant from ALL feedback (up,
+  down, AND neutral) to qualify.
+- **Client** (`templates/index.html`): added `shuffleStories()` (Fisher-Yates)
+  that fires once on initial page load and once after each dashboard refill.
+  Mode switches (default/popular/explore/date) no longer re-order the DOM; the
+  shuffled order is preserved across mode changes. Date mode still sorts by time.
+- **Tests** (`tests/test_pipeline.py`): added `test_candidate_similar_to_neutral_is_not_novel`
+  and `test_no_neutral_feedback_uses_up_down_only_for_novel` using controlled
+  embeddings via monkeypatch. Updated existing test comments from "15th-pct" to "10th-pct".
+- Diagnostics: `uv run pytest tests/ -q` = 182 passed, 9.25s.
+  `ruff check .` = all clear. No new `ty` diagnostics.

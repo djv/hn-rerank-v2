@@ -1709,9 +1709,11 @@ def rerank_candidates(
     fb_labels_arr = np.array(feedback_labels)
     up_mask = fb_labels_arr == 2
     down_mask = fb_labels_arr == 0
+    neutral_mask = fb_labels_arr == 1
     fb_embeddings = get_or_compute_embeddings(feedback_stories, embedder, db)
     fb_up_embs = fb_embeddings[up_mask]
     fb_down_embs = fb_embeddings[down_mask]
+    fb_neutral_embs = fb_embeddings[neutral_mask]
 
     cand_closest_up = (
         np.max(cand_embeddings @ fb_up_embs.T, axis=1)
@@ -1723,8 +1725,15 @@ def rerank_candidates(
         if down_mask.any()
         else np.zeros(len(candidates))
     )
-    cand_max_sim = np.maximum(cand_closest_up, cand_closest_down)
-    sim_threshold = np.percentile(cand_max_sim, 15) if len(cand_max_sim) else 0.0
+    cand_closest_neutral = (
+        np.max(cand_embeddings @ fb_neutral_embs.T, axis=1)
+        if neutral_mask.any()
+        else np.zeros(len(candidates))
+    )
+    cand_max_sim = np.maximum.reduce(
+        [cand_closest_up, cand_closest_down, cand_closest_neutral]
+    )
+    sim_threshold = np.percentile(cand_max_sim, 10) if len(cand_max_sim) else 0.0
     # Similar threshold is applied to extra-slot stories only (see
     # `is_similar` exclusion in the primary-attribution block below).
     similar_threshold = (

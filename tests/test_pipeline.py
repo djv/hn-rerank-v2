@@ -1200,12 +1200,12 @@ async def test_run_pipeline_badge_assignment(tmp_path, monkeypatch):
             elif s.id == 11:
                 vec[0] = 0.0
             elif s.id == 8:
-                # Above the 15th-pct novel threshold (~0.255) so the
+                # Above the 10th-pct novel threshold so the
                 # novel pass doesn't claim ID 8 first; ID 8 should reach
                 # the discussion-rich pass with comment_count=100.
                 vec[0] = 0.27
             elif s.id == 9:
-                # Above the 15th-pct novel threshold so the novel pass
+                # Above the 10th-pct novel threshold so the novel pass
                 # doesn't claim ID 9 and prevent the engagement pass from
                 # running. ID 9 should reach the engagement pass with its
                 # raw story.score=500 above the 95th-pct threshold (~300).
@@ -1264,7 +1264,7 @@ async def test_run_pipeline_badge_assignment(tmp_path, monkeypatch):
             # behavior is that they can also receive badges, exercised in
             # test_primary_story_gets_qualifying_badge. We don't make negative
             # assertions here because small candidate sets can cause primary
-            # stories to incidentally clear the 90th/15th-percentile gates.
+            # stories to incidentally clear the 90th/10th-percentile gates.
             # The `is_similar` exclusion is invariant: primary stories never
             # get the Similar badge regardless of whether they meet the
             # criterion.
@@ -1375,10 +1375,10 @@ async def test_primary_story_gets_qualifying_badge(tmp_path, monkeypatch):
             if s.id == 999:
                 vec[0] = 1.0
             elif 1 <= s.id <= 7:
-                # Primary stories: high max_sim, above 15th-pct novel threshold
-                # (0.605) and below 90th-pct similar threshold (0.663).
+                # Primary stories: high max_sim, above 10th-pct novel threshold
+                # and below 97th-pct similar threshold (0.663).
                 # With 8 candidates, primary range [0.6, 0.66] clears novel
-                # (only 0.01 qualifies) and avoids similar (0.66 < 0.663).
+                # (only 0.01 qualifies for novel) and avoids similar (0.66 < 0.663).
                 vec[0] = 0.6 + (s.id - 1) * 0.01
             else:
                 # ID 8 (extra-slot novel): low max_sim, qualifies for novel
@@ -2232,6 +2232,135 @@ def test_prewarm_top_stories_skips_stories_not_in_db() -> None:
         assert result == 0
     finally:
         db.close()
+
+
+def test_candidate_similar_to_neutral_is_not_novel(db, monkeypatch):
+    """A candidate close to a neutral feedback story should not get is_novel=True,
+    because cand_max_sim now includes neutral similarity in the 3-way max."""
+    config = Config(count=3)
+    user = db.create_user("test_neutral_novel")
+
+    def mock_gce(stories, embedder, db_inst):
+        arr = np.zeros((len(stories), 384), dtype=np.float32)
+        for i, s in enumerate(stories):
+            if s.id == 100:
+                arr[i, 0] = 1.0  # up
+            elif s.id == 200:
+                arr[i, 1] = 1.0  # down
+            elif s.id == 300:
+                arr[i, 2] = 1.0  # neutral
+        return arr
+
+    monkeypatch.setattr("pipeline.get_or_compute_embeddings", mock_gce)
+
+    for sid, action in [(100, "up"), (200, "down"), (300, "neutral")]:
+        db.upsert_story(
+            Story(
+                id=sid,
+                title=f"S{sid}",
+                url=None,
+                score=100 - sid,
+                time=0,
+                text_content=f"feedback {sid}",
+            )
+        )
+        db.upsert_feedback(user.id, sid, action)
+
+    # Controlled candidate embeddings:
+    # 1 -> close to neutral (axis 2)
+    # 2 -> close to up (axis 0)
+    # 3 -> far from all (axis 3, orthogonal to all feedback)
+    cand_embs = np.zeros((3, 384), dtype=np.float32)
+    cand_embs[0, 2] = 0.95  # close to neutral
+    cand_embs[1, 0] = 0.95  # close to up
+    cand_embs[2, 3] = 1.0  # far from all feedback
+
+    candidates = [
+        Story(id=1, title="Neutral-like", url=None, score=15, time=0, text_content=""),
+        Story(id=2, title="Up-like", url=None, score=20, time=0, text_content=""),
+        Story(id=3, title="Novel", url=None, score=5, time=0, text_content=""),
+    ]
+
+    from pipeline import Embedder as StubEmbedder
+
+    stub_embedder = StubEmbedder()
+    ranked = rerank_candidates(
+        db, config, stub_embedder, candidates, cand_embs, user_id=user.id
+    )
+
+    for r in ranked:
+        if r.story.id == 1:
+            assert not r.is_novel, (
+                f"Candidate {r.story.id} (similar to neutral) should not be novel"
+            )
+        elif r.story.id == 2:
+            assert not r.is_novel, (
+                f"Candidate {r.story.id} (similar to up) should not be novel"
+            )
+        elif r.story.id == 3:
+            assert r.is_novel, (
+                f"Candidate {r.story.id} (not similar to any feedback) should be novel"
+            )
+
+
+def test_no_neutral_feedback_uses_up_down_only_for_novel(db, monkeypatch):
+    """When no neutral feedback exists, cand_max_sim equals max(up, down) because
+    neutral similarities are zeros — same as old behavior."""
+    config = Config(count=3)
+    user = db.create_user("test_no_neutral_novel")
+
+    def mock_gce(stories, embedder, db_inst):
+        arr = np.zeros((len(stories), 384), dtype=np.float32)
+        for i, s in enumerate(stories):
+            if s.id == 100:
+                arr[i, 0] = 1.0  # up
+            elif s.id == 200:
+                arr[i, 1] = 1.0  # down
+        return arr
+
+    monkeypatch.setattr("pipeline.get_or_compute_embeddings", mock_gce)
+
+    for sid, action in [(100, "up"), (200, "down")]:
+        db.upsert_story(
+            Story(
+                id=sid,
+                title=f"S{sid}",
+                url=None,
+                score=100 - sid,
+                time=0,
+                text_content=f"feedback {sid}",
+            )
+        )
+        db.upsert_feedback(user.id, sid, action)
+
+    # Controlled candidate embeddings:
+    # 1 -> close to up (axis 0)
+    # 2 -> far from all (axis 3, orthogonal to both up/down)
+    cand_embs = np.zeros((2, 384), dtype=np.float32)
+    cand_embs[0, 0] = 0.95  # close to up
+    cand_embs[1, 3] = 1.0  # far from all feedback
+
+    candidates = [
+        Story(id=1, title="Up-like", url=None, score=20, time=0, text_content=""),
+        Story(id=2, title="Novel", url=None, score=5, time=0, text_content=""),
+    ]
+
+    from pipeline import Embedder as StubEmbedder
+
+    stub_embedder = StubEmbedder()
+    ranked = rerank_candidates(
+        db, config, stub_embedder, candidates, cand_embs, user_id=user.id
+    )
+
+    for r in ranked:
+        if r.story.id == 1:
+            assert not r.is_novel, (
+                f"Candidate {r.story.id} (similar to up AI) should not be novel"
+            )
+        elif r.story.id == 2:
+            assert r.is_novel, (
+                f"Candidate {r.story.id} (not similar to any) should be novel"
+            )
 
 
 def test_prewarm_top_stories_empty_ch_response_returns_zero() -> None:
