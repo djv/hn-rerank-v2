@@ -5,6 +5,8 @@ count = 40
 onnx_model_dir = "onnx_model"
 server_port = 8766
 regen_interval_seconds = 10800
+regen_prewarm_top_n = 50
+max_cached_models = 20
 article_fetch_max_per_run = 100
 article_fetch_concurrency = 10
 article_fetch_max_age_days = 30
@@ -52,6 +54,47 @@ feeds = [
     "https://www.reddit.com/r/ExpatFIRE/top/.rss?t=month&limit=25",
     "https://www.reddit.com/r/urbanplanning/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/transit/top/.rss?t=week&limit=25",
+
+    # r/devops
+    "https://www.reddit.com/r/devops/.rss",
+    "https://www.reddit.com/r/kubernetes/.rss",
+    "https://www.reddit.com/r/dataengineering/.rss",
+    "https://www.reddit.com/r/statistics/.rss",
+    "https://www.reddit.com/r/gis/.rss",
+    "https://www.reddit.com/r/Maps/.rss",
+    "https://www.reddit.com/r/Ultralight/.rss",
+    "https://www.reddit.com/r/ManyBaggers/.rss",
+    "https://www.reddit.com/r/awardtravel/.rss",
+    "https://www.reddit.com/r/CreditCards/.rss",
+
+    # AI / coding agents
+    "https://www.reddit.com/r/AI_Agents/.rss",
+    "https://www.reddit.com/r/ChatGPTCoding/.rss",
+    "https://www.reddit.com/r/LanguageTechnology/.rss",
+
+    # Programming languages / CS depth
+    "https://www.reddit.com/r/ProgrammingLanguages/.rss",
+    "https://www.reddit.com/r/Compilers/.rss",
+    "https://www.reddit.com/r/sre/.rss",
+
+    # Finance / tax / nomad money
+    "https://www.reddit.com/r/financialindependence/.rss",
+    "https://www.reddit.com/r/tax/.rss",
+    "https://www.reddit.com/r/USExpatTaxes/.rss",
+    "https://www.reddit.com/r/fatFIRE/.rss",
+
+    # Urbanism / cities
+    "https://www.reddit.com/r/Urbanism/.rss",
+    "https://www.reddit.com/r/urbandesign/.rss",
+    "https://www.reddit.com/r/WalkableStreets/.rss",
+
+    # Travel / gear / nomad logistics
+    "https://www.reddit.com/r/onebag/.rss",
+    "https://www.reddit.com/r/digitalnomad/.rss",
+
+    # Evidence-ish health
+    "https://www.reddit.com/r/medicine/.rss",
+
     "https://simonwillison.net/atom/everything/",
     "https://www.interconnects.ai/feed",
     "https://jack-clark.net/feed/",
@@ -88,4 +131,21 @@ feeds = [
     "https://www.quantamagazine.org/feed/",
     "https://aeon.co/feed.rss",
     "https://discourse.haskell.org/latest.rss",
+
+    # Software / systems / AI coding
+    "https://martinfowler.com/feed.atom",
+    "https://danluu.com/atom.xml",
+    "https://jvns.ca/atom.xml",
+    "https://pluralistic.net/feed/",
+
+    # Progress / cities / infrastructure
+    "https://worksinprogress.co/rss.xml",
+    "https://www.worksinprogress.news/feed",
+    "https://asteriskmag.com/feed",
+    "https://marginalrevolution.com/feed",
+
+    # Health / medicine
+    "https://erictopol.substack.com/feed",
+    "https://theskepticalcardiologist.substack.com/feed",
+    "https://sciencebasedmedicine.org/feed/",
 ]

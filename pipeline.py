@@ -5,13 +5,15 @@ import hashlib
 import html
 import logging
 import re
+import threading
 import time
 import tomllib
-from collections import Counter
+from collections import Counter, OrderedDict
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 import feedparser
 import httpx
@@ -46,6 +48,48 @@ class ModelConfig:
     tier3_blend_window: int = 60
     min_up_for_svm: int = 20
     min_down_for_svm: int = 20
+
+
+# SVM model cache: keyed on (user_id, feedback_signature) to skip SVC.fit().
+_MODEL_CACHE: OrderedDict[tuple[int, str], tuple[SVC, StandardScaler]] = OrderedDict()
+_MODEL_CACHE_LOCK = threading.Lock()
+
+
+def _feedback_signature(db: Database, user_id: int) -> str:
+    feedback = db.get_all_feedback(user_id=user_id)
+    hasher = hashlib.sha256()
+    for f in sorted(feedback, key=lambda x: x.story_id):
+        hasher.update(f"{f.story_id}:{f.action}:{f.updated_at}".encode())
+    return hasher.hexdigest()
+
+
+def _get_cached_model(
+    user_id: int | None, signature: str
+) -> tuple[SVC, StandardScaler] | None:
+    if user_id is None:
+        return None
+    with _MODEL_CACHE_LOCK:
+        key = (user_id, signature)
+        if key in _MODEL_CACHE:
+            _MODEL_CACHE.move_to_end(key)
+            return _MODEL_CACHE[key]
+    return None
+
+
+def _set_cached_model(
+    user_id: int | None,
+    signature: str,
+    svm: SVC,
+    scaler: StandardScaler,
+    maxsize: int = 20,
+) -> None:
+    if user_id is None:
+        return
+    with _MODEL_CACHE_LOCK:
+        key = (user_id, signature)
+        _MODEL_CACHE[key] = (svm, scaler)
+        while len(_MODEL_CACHE) > maxsize:
+            _MODEL_CACHE.popitem(last=False)
 
 
 # Comment selection and depth tuning
@@ -89,9 +133,12 @@ class Config:
     onnx_model_dir: str = "onnx_model"
     server_port: int = 8765
     regen_interval_seconds: int = 10800
+    regen_prewarm_top_n: int = 50
+    reddit_prewarm_top_n: int = 20
     article_fetch_max_per_run: int = 100
     article_fetch_concurrency: int = 10
     article_fetch_max_age_days: int = 30
+    max_cached_models: int = 20
     model: ModelConfig = field(default_factory=ModelConfig)
     rss: RssConfig = field(default_factory=RssConfig)
 
@@ -114,9 +161,12 @@ class Config:
             onnx_model_dir=main_cfg.get("onnx_model_dir", "onnx_model"),
             server_port=main_cfg.get("server_port", 8765),
             regen_interval_seconds=main_cfg.get("regen_interval_seconds", 10800),
+            regen_prewarm_top_n=main_cfg.get("regen_prewarm_top_n", 50),
+            reddit_prewarm_top_n=main_cfg.get("reddit_prewarm_top_n", 20),
             article_fetch_max_per_run=main_cfg.get("article_fetch_max_per_run", 100),
             article_fetch_concurrency=main_cfg.get("article_fetch_concurrency", 10),
             article_fetch_max_age_days=main_cfg.get("article_fetch_max_age_days", 30),
+            max_cached_models=main_cfg.get("max_cached_models", 20),
             model=ModelConfig(
                 svm_c=model_cfg.get("svm_c", 0.2),
                 svm_gamma=model_cfg.get("svm_gamma", 0.03),
@@ -661,6 +711,80 @@ def prewarm_top_stories(
     return len(updated)
 
 
+async def prewarm_reddit_top_stories(
+    story_ids: list[int],
+    db: Database,
+    embedder: Embedder | None = None,
+) -> int:
+    """Bulk-prewarm Reddit RSS comment text for top-N stories.
+
+    Fetches each post's RSS feed, extracts self_text and top_comments,
+    recomposes text_content, and writes back to the stories table.
+    Serialized (one at a time) to avoid Reddit 429 rate limits.
+
+    Returns number of stories whose top_comments or self_text changed.
+    """
+    if not story_ids:
+        return 0
+    from server import _fetch_reddit_rss_context  # late import to avoid circular
+
+    prewarmed: list[Story] = []
+    for sid in story_ids:
+        story = db.get_story(sid)
+        if not story or not story.url:
+            continue
+        if not story.source.startswith("rss_reddit_"):
+            continue
+
+        try:
+            ctx = await _fetch_reddit_rss_context(story.url)
+        except Exception as exc:
+            logging.warning(
+                "prewarm_reddit: fetch failed for story_id=%s: %r",
+                sid,
+                exc,
+            )
+            continue
+
+        if ctx is None or not ctx.top_comments:
+            continue
+
+        # Idempotent: skip if already populated with equal or richer data
+        if story.top_comments and len(ctx.top_comments) <= len(story.top_comments):
+            continue
+
+        new_self_text = (
+            ctx.self_text
+            if len(ctx.self_text) > len(story.self_text)
+            else story.self_text
+        )
+        new_text_content = compose_story_text(
+            story.title,
+            new_self_text,
+            ctx.top_comments,
+            story.article_body or "",
+        )
+        if not new_text_content:
+            continue
+
+        updated = replace(
+            story,
+            self_text=new_self_text,
+            top_comments=ctx.top_comments,
+            text_content=new_text_content,
+            comment_count=story.comment_count or ctx.comment_count or None,
+            comment_count_at_fetch=max(story.comment_count_at_fetch, ctx.comment_count),
+            discussion_url=story.discussion_url or story.url,
+        )
+        db.upsert_story(updated)
+        prewarmed.append(updated)
+
+    if prewarmed and embedder is not None:
+        get_or_compute_embeddings(prewarmed, embedder, db)
+
+    return len(prewarmed)
+
+
 async def fetch_candidates(
     config: Config,
     exclude_ids: set[int],
@@ -808,6 +932,15 @@ def _rss_source_name(feed_url: str) -> str:
     return f"rss_{domain.replace('.', '_')}"
 
 
+def _urllib_fetch(url: str, user_agent: str) -> tuple[int, str]:
+    """Sync fetch via urllib.
+    Used as fallback when httpx is blocked by Cloudflare (different TLS
+    fingerprint — system OpenSSL handshake often gets through)."""
+    req = Request(url, headers={"User-Agent": user_agent})
+    with urlopen(req, timeout=15) as resp:
+        return resp.status, resp.read().decode("utf-8", errors="replace")
+
+
 async def fetch_rss_feeds(
     feeds: list[str],
     per_feed: int,
@@ -827,9 +960,28 @@ async def fetch_rss_feeds(
 
             async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
                 resp = await client.get(feed_url, headers=headers)
-                if resp.status_code != 200:
+                content: str | None = None
+                if resp.status_code == 200:
+                    content = resp.text
+                elif resp.status_code in (403, 503):
+                    logging.info(
+                        "RSS %s: httpx %d, retrying with urllib",
+                        feed_url,
+                        resp.status_code,
+                    )
+                    status, body = await asyncio.to_thread(
+                        _urllib_fetch, feed_url, headers["User-Agent"]
+                    )
+                    if status == 200:
+                        content = body
+                    else:
+                        logging.warning(
+                            "RSS %s: urllib fallback returned %d",
+                            feed_url,
+                            status,
+                        )
+                if content is None:
                     return []
-                content = resp.text
 
             parsed = feedparser.parse(content)
             stories = []
@@ -864,7 +1016,8 @@ async def fetch_rss_feeds(
 
                 clean_summary = clean_text(summary)
                 snippet = clean_summary[:1000]
-                text_content = f"{title}. {snippet}".strip()
+                self_text = snippet
+                text_content = compose_story_text(title, self_text)
 
                 h = hashlib.md5(link.encode("utf-8")).digest()
                 val = int.from_bytes(h[:4], "big")
@@ -877,6 +1030,7 @@ async def fetch_rss_feeds(
                     score=0,
                     time=int(pub_time),
                     text_content=text_content,
+                    self_text=self_text,
                     source=source_name,
                     comment_count=None,
                     discussion_url=None,
@@ -1381,23 +1535,34 @@ def rank_stories(
             sample_weights = np.array(weights, dtype=np.float64)
 
             emb_dim = candidate_embeddings.shape[1]
-            scaler = StandardScaler()
-            fb_features_meta_scaled = np.clip(
-                scaler.fit_transform(fb_features[:, emb_dim:]), -2.5, 2.5
-            )
 
-            fb_features_scaled = np.hstack(
-                [fb_features[:, :emb_dim], fb_features_meta_scaled]
-            )
-
-            svm = SVC(
-                C=config.model.svm_c,
-                kernel=config.model.svm_kernel,
-                gamma=config.model.svm_gamma,
-                random_state=0,
-                decision_function_shape="ovr",
-            )
-            svm.fit(fb_features_scaled, labels, sample_weight=sample_weights)
+            # Model cache: skip SVC.fit() when feedback is unchanged
+            fb_sig = _feedback_signature(db, user_id) if user_id is not None else ""
+            cached_model: tuple[SVC, StandardScaler] | None = None
+            if fb_sig:
+                cached_model = _get_cached_model(user_id, fb_sig)
+            if cached_model is not None:
+                svm, scaler = cached_model
+            else:
+                scaler = StandardScaler()
+                fb_features_meta_scaled = np.clip(
+                    scaler.fit_transform(fb_features[:, emb_dim:]), -2.5, 2.5
+                )
+                fb_features_scaled = np.hstack(
+                    [fb_features[:, :emb_dim], fb_features_meta_scaled]
+                )
+                svm = SVC(
+                    C=config.model.svm_c,
+                    kernel=config.model.svm_kernel,
+                    gamma=config.model.svm_gamma,
+                    random_state=0,
+                    decision_function_shape="ovr",
+                )
+                svm.fit(fb_features_scaled, labels, sample_weight=sample_weights)
+                if fb_sig:
+                    _set_cached_model(
+                        user_id, fb_sig, svm, scaler, config.max_cached_models
+                    )
 
             cand_text_lengths = np.array([len(s.text_content) for s in candidates])
             cand_features = _svm_personalization_features(
@@ -1623,6 +1788,10 @@ def source_label_filter(source: str) -> str:
         "tweag_io": "Tweag",
         "ocaml_org": "OCaml",
         "quantamagazine_org": "Quanta",
+        "www_worksinprogress_news": "Works in Progress",
+        "erictopol_substack_com": "Ground Truths",
+        "theskepticalcardiologist_substack_com": "Skeptical Cardiologist",
+        "sciencebasedmedicine_org": "Science-Based Medicine",
     }
     if label in known:
         return known[label]
@@ -2141,8 +2310,13 @@ def fast_rerank_for_user(
     )
 
 
-async def fetch_candidates_only(config: Config, db: Database) -> None:
-    """Fetch new candidates into shared DB. No per-user rendering."""
+async def fetch_candidates_only(
+    config: Config,
+    db: Database,
+    embedder: Embedder | None = None,
+    prewarm_top_n: int | None = None,
+) -> None:
+    """Fetch new candidates into shared DB; prewarm top-N by score."""
     feedback_records = db.get_all_feedback()
     feedback_ids = {f.story_id for f in feedback_records}
     feedback_urls = {f.url for f in feedback_records if f.url}
@@ -2151,3 +2325,32 @@ async def fetch_candidates_only(config: Config, db: Database) -> None:
         config, feedback_ids, feedback_urls, db, None
     )
     logging.info(f"Regen: fetched {n_fetched} candidates")
+
+    if prewarm_top_n is None:
+        prewarm_top_n = config.regen_prewarm_top_n
+    if prewarm_top_n > 0 and embedder is not None:
+        hn_ids = [s.id for s in candidates if s.id > 0]
+        hn_ids.sort(
+            key=lambda sid: next(s.score for s in candidates if s.id == sid),
+            reverse=True,
+        )
+        top_ids = hn_ids[:prewarm_top_n]
+        if top_ids:
+            prewarmed = prewarm_top_stories(top_ids, db, embedder)
+            logging.info(
+                "Regen: prewarmed %d/%d top-by-score stories",
+                prewarmed,
+                len(top_ids),
+            )
+
+    reddit_prewarm_top_n = config.reddit_prewarm_top_n
+    if reddit_prewarm_top_n > 0:
+        reddit_ids = [s.id for s in candidates if s.source.startswith("rss_reddit_")]
+        top_reddit = reddit_ids[:reddit_prewarm_top_n]
+        if top_reddit:
+            prewarmed = await prewarm_reddit_top_stories(top_reddit, db, embedder)
+            logging.info(
+                "Regen: prewarmed %d/%d Reddit RSS stories",
+                prewarmed,
+                len(top_reddit),
+            )
