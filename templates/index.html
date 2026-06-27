@@ -1055,6 +1055,12 @@
       cards.forEach(card => storiesContainer.appendChild(card));
     }
 
+    function orderForCurrentMode() {
+      if (currentMode === 'date') orderByDate();
+      else if (currentMode === 'default') orderByRank();
+      else shuffleStories();
+    }
+
     function updateRefreshProgress() {
       const filledCount = votesSinceRankingRefresh;
       const segments = document.querySelectorAll('.vote-bar .refresh-segment');
@@ -1106,9 +1112,7 @@
       if (activeCard && !matchesCurrentMode(activeCard)) {
         activeCard.classList.remove('active');
       }
-      if (currentMode === 'date') {
-        orderByDate();
-      }
+      orderForCurrentMode();
       showNextCard();
     }
 
@@ -1125,7 +1129,6 @@
     }
 
     applyGradient();
-    shuffleStories();
 
     // Snarkdown - 1KB markdown parser (https://github.com/developit/snarkdown)
     const TAGS={'':['<em>','</em>'],_:['<strong>','</strong>'],'*':['<strong>','</strong>'],'~':['<s>','</s>'],'\n':['<br />'],' ':['<br />'],'-':['<hr />']};
@@ -1314,7 +1317,6 @@
       }
 
       applyGradient();
-      shuffleStories();
       bindEvents();
       if (!activeCard || activeCard.dataset.voted) {
         showNextCard();
