@@ -959,3 +959,38 @@ user's first render runs.
 
 **Verification**: `pytest tests/ -q` = 184 passed. `ruff check .` = clean.
 New `ty` diagnostics: 0 (all 44 seen are pre-existing in other files).
+
+## 2026-06-27 — Type-discipline cleanup: 66 → 0 ty diagnostics
+
+**Context**: The codebase had accumulated 66 `ty` type-checker diagnostics across
+12 files (44 pre-existing + 22 from recent changes before this cleanup). The
+AGENTS.md requires zero new diagnostics.
+
+**Bug fix (real behavior change)**:
+- `ch_client.py` and `scripts/seed_hn_from_clickhouse.py`: changed `httpx.post(url,
+  data=query, ...)` to `content=query`. At runtime httpx accepts `str` in `data=`
+  (sends as form-urlencoded body), but `data=` is typed for form-field dicts.
+  `content=` is the correct parameter for a raw SQL body. CH Playground is
+  lenient about content-type, so behavior is identical.
+- Test mocks in `tests/test_ch_client.py` and `tests/test_seed_hn_from_clickhouse.py`
+  updated to check `kwargs.get("content", "")` instead of `kwargs.get("data", "")`.
+
+**Type-cleanup patterns (across 12+ files)**:
+
+| Pattern | Files fixed | Count |
+|---|---|---|
+| `Story \| None` — add `assert story is not None` before field access | test_pipeline.py, seed_hn tests | ~22 |
+| `object()` → `MockEmbedder(Embedder)` for embedder fixture | test_server.py, test_pipeline.py | ~5 |
+| `DummyEmbedder` → `DummyEmbedder(Embedder)` | seed_hn test files | 2 |
+| `-> ...` → `-> Any` | test_server.py | 1 |
+| `log_message(self, *a)` → match parent sig | test_fetch.py | 1 |
+| `embedder: object` → `embedder: Embedder` | eval_ranker_variants.py | 2 |
+| `# type: ignore` for torch imports (dl-experiment) | pipeline_dl.py, pipeline_dl_t0.py | 7 |
+| `SGDClassifier.classes_` — `# type: ignore` where ty can't resolve | eval_ranker_variants.py | 1 |
+| Nested dict access — `# type: ignore` for ty union resolution limit | eval_rss.py, eval_no_hn_features.py | 6 |
+| Lambda assignment — `# type: ignore` for ty function-type limitation | test_server.py | 2 |
+| `np.ndarray \| None` subtraction guards | eval_rss.py | 3 |
+| `Embedder.__init__` — `self.tokenizer: Any` annotation | pipeline.py | 1 |
+
+**Verification**: `ruff check .` — clean. `ty check` — 0 diagnostics (was 66).
+`pytest tests/ -x -q` — 201 passed, 1 skipped (torch-dependent), 0 failed.

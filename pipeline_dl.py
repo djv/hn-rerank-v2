@@ -6,9 +6,9 @@ import logging
 from typing import Optional, Tuple
 
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import torch  # type: ignore
+import torch.nn as nn  # type: ignore
+import torch.nn.functional as F  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -317,7 +317,7 @@ def fit_attention_mlp(
         opt.zero_grad()
         if use_mixup:
             log_probs = F.log_softmax(logits_mlp, dim=1)
-            ce_loss = -(log_probs * tr_labels_mix.to(device)).sum(dim=1).mean()
+            ce_loss = -(log_probs * tr_labels_mix.to(device)).sum(dim=1).mean()  # type: ignore
         else:
             ce_loss = criterion(logits_mlp, tr_labels)
 

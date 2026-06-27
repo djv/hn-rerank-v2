@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from database import Database, Story
-from pipeline import Config, story_embedding_text
+from pipeline import Config, Embedder, story_embedding_text
 from scripts import seed_hn_from_bq
 from scripts._seed_common import (
     seed_rows,
@@ -16,7 +16,7 @@ from scripts._seed_common import (
 )
 
 
-class DummyEmbedder:
+class DummyEmbedder(Embedder):
     def encode(self, texts: list[str], batch_size: int = 32):
         arr = np.zeros((len(texts), 384), dtype=np.float32)
         if len(texts):
@@ -224,6 +224,7 @@ async def test_comment_hydration_success_updates_embedding(monkeypatch):
 
         assert (inserted, skipped_feedback, skipped_existing, hydrated) == (1, 0, 0, 1)
         story = db.get_story(456)
+        assert story is not None
         assert story.top_comments
         assert story.comment_count == 2
         assert story.comment_count_at_fetch == 2
@@ -267,6 +268,7 @@ async def test_comment_hydration_failure_preserves_bq_skeleton(monkeypatch):
         )
 
         story = db.get_story(789)
+        assert story is not None
         assert story.title == "Skeleton"
         assert story.self_text == "BQ self text"
         assert story.top_comments == ""

@@ -10,6 +10,8 @@ score_velocity, comment_velocity, is_hn.
 Compares against full-feature baseline in eval_report.json.
 """
 
+from typing import Any
+
 import hashlib
 import json
 import math
@@ -195,9 +197,7 @@ def main() -> None:
     if user is None:
         raise RuntimeError("Missing default user token")
 
-    fb_stories, fb_labels, fb_vote_times = db.get_feedback_for_training(
-        user_id=user.id
-    )
+    fb_stories, fb_labels, fb_vote_times = db.get_feedback_for_training(user_id=user.id)
     fb_labels = np.array(fb_labels, dtype=int)
     fb_vote_times = np.array(fb_vote_times, dtype=np.float64)
     print(f"Feedback: {len(fb_stories)} rows ({Counter(fb_labels)})")
@@ -427,10 +427,9 @@ def main() -> None:
         "p75_rank",
     )
 
-    report = {
+    report: dict[str, Any] = {
         "config": {
             "split": "5-fold-stratified",
-            "random_state": 0,
             "user_token": user.token,
             "user_id": user.id,
             "n_feedback": int(len(fb_labels)),
@@ -484,7 +483,7 @@ def main() -> None:
         print(f"  {'formula':14s} {'no-HN':>8s} {'full':>8s} {'Δ':>8s}")
         print(f"  {'-' * 14} {'-' * 8} {'-' * 8} {'-' * 8}")
         for f in formulas:
-            no_hn_val = report["formulas"][f]["mean"]["mmr"][metric]
+            no_hn_val = report["formulas"][f]["mean"]["mmr"][metric]  # type: ignore
             full_val = (
                 (
                     base["formulas"]
@@ -505,7 +504,7 @@ def main() -> None:
         print(f"  {'formula':14s} {'no-HN':>8s} {'full':>8s} {'Δ':>8s}")
         print(f"  {'-' * 14} {'-' * 8} {'-' * 8} {'-' * 8}")
         for f in formulas:
-            no_hn_val = report["formulas"][f]["mean"]["raw"][metric]
+            no_hn_val = report["formulas"][f]["mean"]["raw"][metric]  # type: ignore
             full_val = (
                 (
                     base["formulas"]

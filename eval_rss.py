@@ -6,6 +6,8 @@ filtered to non-HN test items. Reports per-source breakdown.
 Writes eval_report_rss.json (not committed; separate from eval_report.json).
 """
 
+from typing import Any
+
 import hashlib
 import json
 import math
@@ -137,10 +139,18 @@ def _evaluate_fold(
     elif formula == "hn_baseline":
         scores = cand_scores.astype(np.float32)
     elif formula == "centroid_diff":
+        if cand_sim_up is None or cand_sim_down is None:
+            raise ValueError("centroid_diff requires cand_sim_up and cand_sim_down")
         scores = cand_sim_up - cand_sim_down
     elif formula == "knn_diff":
+        if cand_sim_up is None or cand_sim_down is None:
+            raise ValueError("knn_diff requires cand_sim_up and cand_sim_down")
         scores = cand_sim_up - cand_sim_down
     elif formula == "closest_diff":
+        if cand_closest_up is None or cand_closest_down is None:
+            raise ValueError(
+                "closest_diff requires cand_closest_up and cand_closest_down"
+            )
         scores = cand_closest_up - cand_closest_down
     else:
         raise ValueError(f"Unknown formula: {formula}")
@@ -208,9 +218,7 @@ def main() -> None:
     now = time.time()
 
     # Feedback
-    fb_stories, fb_labels, fb_vote_times = db.get_feedback_for_training(
-        user_id=user.id
-    )
+    fb_stories, fb_labels, fb_vote_times = db.get_feedback_for_training(user_id=user.id)
     fb_labels = np.array(fb_labels, dtype=int)
     fb_vote_times = np.array(fb_vote_times, dtype=np.float64)
     print(f"Total feedback: {len(fb_stories)} ({Counter(fb_labels)})")
@@ -506,7 +514,7 @@ def main() -> None:
         "p75_rank",
     )
 
-    report = {
+    report: dict[str, Any] = {
         "config": {
             "split": "5-fold-stratified-rss",
             "user_token": user.token,
@@ -598,9 +606,9 @@ def main() -> None:
     print("\n=== Non-HN eval metrics (5-fold stratified) ===")
     for metric in metric_keys:
         print(f"\n{metric}:")
-        for f, data in report["formulas"].items():
+        for f, data in report["formulas"].items():  # type: ignore[union-attr]
             for variant in ("mmr", "raw"):
-                m, s = data["mean"][variant][metric], data["std"][variant][metric]
+                m, s = data["mean"][variant][metric], data["std"][variant][metric]  # type: ignore
                 print(f"  {f:15s} {variant:4s}  {m:.4f} ± {s:.4f}")
 
     print("\n=== Per-source breakdown (current MMR) ===")

@@ -1,12 +1,16 @@
+from typing import Any
 import pytest
 import asyncio
 from server import _fetch_article_body
+
 
 @pytest.fixture(autouse=True)
 def mock_asyncio_sleep(monkeypatch):
     async def mock_sleep(delay):
         pass
+
     monkeypatch.setattr(asyncio, "sleep", mock_sleep)
+
 
 _ARTICLE_HTML = """\
 <!DOCTYPE html>
@@ -103,7 +107,7 @@ async def _serve(handler, status=200, body=b"", delay=0.0):
             self.end_headers()
             self.wfile.write(b)
 
-        def log_message(self, *a):
+        def log_message(self, format: str, *args: Any) -> None:
             pass
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)

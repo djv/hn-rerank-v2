@@ -10,6 +10,7 @@ import math
 import sys
 import time
 from collections import Counter
+from typing import Any
 from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import urlparse
@@ -25,7 +26,7 @@ from sklearn.svm import LinearSVC, SVC
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 try:
-    import torch  # noqa: F401
+    import torch  # noqa: F401  # type: ignore
 except ImportError:
     sys.exit(
         "scripts/eval_ranker_variants.py requires torch. "
@@ -106,7 +107,7 @@ def _load_recent_candidates(
 
 
 def _field_embeddings_by_field(
-    stories: list[Story], embedder: object, batch_size: int = 64
+    stories: list[Story], embedder: Embedder, batch_size: int = 64
 ) -> np.ndarray:
     if not stories:
         return np.empty((0, 4, 384), dtype=np.float32)
@@ -149,7 +150,7 @@ def _average_field_embeddings(field_parts: np.ndarray) -> np.ndarray:
 
 
 def _field_level_embeddings(
-    stories: list[Story], embedder: object, batch_size: int = 64
+    stories: list[Story], embedder: Embedder, batch_size: int = 64
 ) -> np.ndarray:
     return _average_field_embeddings(
         _field_embeddings_by_field(stories, embedder, batch_size)
@@ -622,7 +623,7 @@ def _scores_sgd_log_up(
     )
     clf.fit(x_train, y, sample_weight=weights)
     probs = clf.predict_proba(x_cand)
-    classes = list(clf.classes_)
+    classes = list(clf.classes_)  # type: ignore  # sklearn SGDClassifier.classes_ not recognized by ty after fit
     scores = probs[:, classes.index(2)]
     return scores.astype(np.float32), probs
 
@@ -2159,7 +2160,7 @@ def main() -> None:
         "p75_rank",
         "brier_up",
     ]
-    report = {
+    report: dict[str, Any] = {
         "config": {
             "split": f"{args.folds}-fold-stratified",
             "window_days": window_days,

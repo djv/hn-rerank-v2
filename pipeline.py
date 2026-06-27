@@ -10,6 +10,7 @@ import time
 import tomllib
 from collections import Counter, OrderedDict
 from dataclasses import dataclass, field, replace
+from typing import Any
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -1067,7 +1068,7 @@ async def fetch_rss_feeds(
 
 class Embedder:
     def __init__(self, model_dir: str = "onnx_model"):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_dir)
+        self.tokenizer: Any = AutoTokenizer.from_pretrained(model_dir)
         session_options = ort.SessionOptions()
         session_options.enable_cpu_mem_arena = False
         session_options.enable_mem_pattern = False

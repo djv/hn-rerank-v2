@@ -8,9 +8,21 @@ import pytest
 from http.server import ThreadingHTTPServer
 from hypothesis import HealthCheck, given, settings, strategies as st
 
+from typing import Any
+
 from server import Handler, SKELETON_HTML
 from pipeline import Config, Embedder
 from database import Database, Story
+
+
+class MockEmbedder(Embedder):
+    def __init__(self) -> None:
+        pass
+
+    def encode(self, texts: list[str], batch_size: int = 64) -> Any:
+        import numpy as _np
+
+        return _np.zeros((len(texts), 384), dtype=_np.float32)
 
 
 @pytest.fixture
@@ -30,15 +42,6 @@ def test_env(tmp_path):
 
     class TestHandler(Handler):
         pass
-
-    class MockEmbedder(Embedder):
-        def __init__(self):
-            pass
-
-        def encode(self, texts: list[str], batch_size: int = 64) -> ...:
-            import numpy as np
-
-            return np.zeros((len(texts), 384), dtype=np.float32)
 
     TestHandler.config = config
     TestHandler.db = db
@@ -337,7 +340,7 @@ def test_dashboard_cache_uses_feedback_versions(test_env, monkeypatch):
 
     TestHandler.config = Config(db_path=db.db_path, server_port=0)
     TestHandler.db = db
-    TestHandler.embedder = object()
+    TestHandler.embedder = MockEmbedder()
     TestHandler._dashboard_cache = {}
     TestHandler._dashboard_versions = {}
     TestHandler._render_locks = {}
@@ -397,7 +400,7 @@ def test_stale_warm_render_does_not_overwrite_current_cache(test_env, monkeypatc
 
     TestHandler.config = Config(db_path=db.db_path, server_port=0)
     TestHandler.db = db
-    TestHandler.embedder = object()
+    TestHandler.embedder = MockEmbedder()
     TestHandler._dashboard_cache = {}
     TestHandler._dashboard_versions = {}
     TestHandler._render_locks = {}
@@ -480,7 +483,7 @@ def test_dashboard_cache_version_invariant_property(operations, prop_db, monkeyp
 
     TestHandler.config = Config(db_path=prop_db.db_path, server_port=0)
     TestHandler.db = prop_db
-    TestHandler.embedder = object()
+    TestHandler.embedder = MockEmbedder()
     TestHandler._dashboard_cache = {}
     TestHandler._dashboard_versions = {}
     TestHandler._render_locks = {}
@@ -1443,7 +1446,7 @@ def swr_handler(test_env):
 
     SwrHandler.config = Config(db_path=db.db_path, server_port=0)
     SwrHandler.db = db
-    SwrHandler.embedder = object()
+    SwrHandler.embedder = MockEmbedder()
     SwrHandler._dashboard_cache = {}
     SwrHandler._dashboard_versions = {}
     SwrHandler._render_locks = {}
@@ -1455,8 +1458,8 @@ def swr_handler(test_env):
 
     old_fast_rerank = pipeline.fast_rerank_for_user
     old_gen_bytes = pipeline.generate_dashboard_bytes
-    pipeline.fast_rerank_for_user = lambda db, c, e, uid: []
-    pipeline.generate_dashboard_bytes = lambda *a, **kw: b""
+    pipeline.fast_rerank_for_user = lambda db, c, e, uid: []  # type: ignore
+    pipeline.generate_dashboard_bytes = lambda *a, **kw: b""  # type: ignore
 
     yield user, SwrHandler
 

@@ -1,3 +1,4 @@
+from typing import cast
 import asyncio
 import numpy as np
 import pytest
@@ -1033,6 +1034,7 @@ async def test_fetch_candidates_ch_live_window_updates_existing_score(
 
     candidates, _ = await fetch_candidates(config, set(), set(), db)
     story = db.get_story(99)
+    assert story is not None
     assert story.score == 999
     assert any(s.id == 99 for s in candidates)
 
@@ -1177,6 +1179,7 @@ async def test_bq_archive_hydration_preserves_source(tmp_path, monkeypatch):
     )
 
     updated = db.get_story(9201)
+    assert updated is not None
     assert updated.source == BQ_ARCHIVE_SOURCE
     assert "Pre-existing hydrated comments" in updated.top_comments
 
@@ -1202,7 +1205,9 @@ def test_fast_rerank_for_user_includes_old_bq_archive_story(db, monkeypatch):
         return np.zeros((len(stories), 384), dtype=np.float32)
 
     monkeypatch.setattr("pipeline.get_or_compute_embeddings", fake_embeddings)
-    ranked = fast_rerank_for_user(db, Config(days=30), object(), user.id)
+    ranked = fast_rerank_for_user(
+        db, Config(days=30), cast(Embedder, object()), user.id
+    )
 
     assert [item.story.id for item in ranked] == [9301]
 
@@ -1958,6 +1963,7 @@ def test_prewarm_top_stories_updates_top_comments() -> None:
             result = pipeline.prewarm_top_stories([42], db, _DummyEmbedder())
         assert result == 1
         updated = db.get_story(42)
+        assert updated is not None
         assert updated.top_comments != ""
         assert updated.comment_count == 5
         assert updated.comment_count_at_fetch == 5
