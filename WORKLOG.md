@@ -5,6 +5,89 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-27 — TLDR prompt fix: structural separation of article-only and comments-only code paths
+
+- **Bug:** The TLDR prompt had overlapping triggers for the "article + discussion" and "article-only" output branches. Both branches fired on the same input (article body present, no comments). The LLM always chose the richer "two sections" branch and hallucinated a Discussion section from nothing.
+- **Fix (code):** The unified `else` branch in `generate_detailed_tldr` was split into two separate code paths with two separate prompts:
+  - **Article-only path:** prompt never mentions "Discussion", "Consensus", "Disagreement", or "Caveat". The words physically do not appear.
+  - **Comments-only path:** prompt only mentions "Discussion" and discussion labels, effectively unchanged.
+  - **Both (defensive):** preserved for the edge case where both arrive via the wrong branch.
+- **Cache clear:** `tldr_cache` deleted (801 rows). Version bumped to `detail-v4`. All existing TLDRs will regenerate on next request with the new structural prompt.
+
+## 2026-06-27 — Reddit RSS comment pre-warm in regen, plus RSS self_text fix
+
+- **Pre-warm:** New `pipeline.prewarm_reddit_top_stories(story_ids, db, embedder)`
+  fetches Reddit RSS comments for top-N (default 20) Reddit candidates during
+  regen, matching the HN prewarm pattern. Called from `fetch_candidates_only`
+  after the HN prewarm loop, serialized to avoid 429 rate limits.
+- **Config:** `Config.reddit_prewarm_top_n: int = 20` added.
+
+## 2026-06-27 — fix RSS TLDR stub; populate self_text at ingestion
+
+- **Bug:** Reddit RSS stories showed "No article body or discussion" in the
+  TLDR card. Root cause: RSS pipeline (`pipeline.py:fetch_rss_feeds`) stored
+  the post body in `text_content` but left `self_text` empty. The `/api/tldr-detail`
+  endpoint feeds only `self_text + top_comments + article_body` to the LLM,
+  so when the runtime Reddit RSS context fetch failed (429 rate limit), all
+  inputs were empty and the stub was returned.
+- **Fix:** RSS pipeline now populates `story.self_text` from the feed body
+  and derives `text_content` via `compose_story_text(title, self_text)`,
+  matching the HN pipeline convention.
+- **Backfill:** `scripts/backfill_rss_self_text.py` — one-shot idempotent
+  backfill that strips the `"{title}. "` prefix from existing `text_content`
+  to populate `self_text` for 1709 RSS stories (44 edge cases with no real
+  body content flagged as warnings). 3 stories with unicode/emoji title
+  normalization mismatches fall back to `clean_text(title)` — all covered.
+- **New regression test:** `test_fetch_rss_feeds_populates_self_text` in
+  `tests/test_pipeline.py`.
+
+## 2026-06-27 — SWR render path + SVM model cache; fix stale-cache pop bug
+
+- Stale-while-revalidate dashboard rendering: first request for a user
+  returns a 3s meta-refresh skeleton immediately, background thread
+  renders the real dashboard. Subsequent requests within the same version
+  return cache hit; version bump (from feedback or regen) returns stale
+  data while triggering a fresh warm.
+- SVM model cache (`pipeline.py`): module-level `OrderedDict` keyed on
+  `(user_id, feedback_signature)`. `feedback_signature` is SHA-256 of
+  `(story_id, action, updated_at)` tuples. Cache hit skips the 3-5s
+  `SVC.fit()` and reuses the trained model; LOOCV k-NN is still
+  recomputed. `max_cached_models=20` (LRU eviction). Eliminates the
+  per-render retrain cost that was OOMing the 8GB box with 10 concurrent
+  high-feedback users.
+- Prewarm moved from render path to regen path. `fetch_candidates_only`
+  now prewarms the top-50 by score; `_render_dashboard_for_user` no
+  longer calls `prewarm_top_stories`. The first dashboard render after
+  regen finds the top-scored candidates already populated.
+- Regen bumps all cached-user versions via `_bump_all_cached_versions`,
+  so every cached user gets a fresh warm after each candidate fetch.
+- `_render_dashboard_for_user` now writes structured logs: result
+  (`cache_hit` / `stale_hit` / `skeleton`), version, elapsed_ms,
+  cache_age_s.
+- **Bug fix**: `_invalidate_dashboard_cache` was popping the cache
+  entry, which broke SWR semantics — after feedback, the next render
+  got a skeleton instead of stale data while the warm ran. Fix: drop
+  the `pop`; the warm thread now overwrites the cache entry under
+  the render lock, which is what the dedup check at `server.py:723`
+  was already designed to handle.
+- Tests: 3 new SWR tests (skeleton, stale hit, cache hit), 1 warm
+  dedup test, 1 different-versions-not-deduped test, 1 cache cap test,
+  1 bump-all-versions test, 1 SWR cache-uses-versions test, 1 stale
+  warm overwrites cache test, 1 version invariant property test
+  (hypothesis). The property test now uses `monkeypatch` fixture with
+  the `function_scoped_fixture` health check suppressed.
+- Test fixture hardening: `test_env` teardown now drains
+  `_warmup_in_flight` before tearing down the server. Without this,
+  warm threads from `test_feedback_post` (1s debounce) would outlive
+  the fixture, monkeypatch onto the next test's `pipeline` functions,
+  and inflate the next test's call counts. Diagnosed via
+  `threading.get_ident()` — saw 2 different thread IDs appending to
+  the same `calls` list with the same stack frame.
+- **Test speed optimization**: replaced hardcoded `time.sleep(1.0)` in
+  `_trigger_warm` with class attribute `_WARM_DEBOUNCE_S = 1.0`. Test
+  fixtures override to 0.01, cutting the warm-thread sleep from 1000ms
+  to 10ms. Combined effect: test suite 76s → 15s (5x faster).
+
 ## 2026-06-26 — detail-v3: tighten unified fallback prompt; bump discussion budget to 150w
 
 - Bug report: story 48689028 ("Previewing GPT-5.6 Sol") yielded a TLDR dominated by
@@ -843,3 +926,36 @@ was dead code — not used by the running service, not served, not part of deplo
 **Verification**: `pytest tests/ -q` = 180 passed (2 removed). `ruff check .` = all clear.
 `ls generate.py public/` = both gone. Server restarted cleanly. `curl` confirms
 refresh button bug fix is live.
+
+## 2026-06-27 — Move prewarm from render-path to regen-path (fresh user first load 15.6s → ~2s)
+
+**Problem**: Fresh session first load took 15.6s. The render-path prewarm
+`prewarm_top_stories` (called on every dashboard render) dominated at 13.5s
+(87%): one CH bulk comments query for the personalized top-20, then 8-17
+`upsert_story` + `upsert_embedding` single-row writes + embedding re-encode.
+
+**Fix**: Prewarm happens at regen time, not render time. The regen loop
+(`fetch_candidates_only`) now accepts an `embedder` and prewarms the top-N
+(default 50) HN candidates by score descending before the regen completes.
+All candidate rows in the DB already have `top_comments` populated when any
+user's first render runs.
+
+**Changes**:
+- `pipeline.py:Config` — added `regen_prewarm_top_n: int = 50` field
+- `pipeline.py:fetch_candidates_only` — accepts `embedder` and `prewarm_top_n`;
+  sorts HN candidates by score desc, takes top N, calls `prewarm_top_stories`
+- `server.py:regen_loop` — passes `Handler.embedder` to `fetch_candidates_only`
+- `server.py:_render_dashboard_for_user` — **removed** per-render
+  `prewarm_top_stories` call (was 13s of the fresh-user first load)
+- `config.toml` — added `regen_prewarm_top_n = 50`
+- `tests/test_pipeline.py` — 4 new tests: prewarms top N by score, skips
+  when n=0, skips when embedder=None, handles empty candidate list
+
+**Impact**:
+- Fresh user first render: **15.6s → ~2.0s** (just the ranker)
+- CH bulk calls: 1/render → 1/3h (shared across all users)
+- Embedding recompute: 8-17/render → 8-17/3h (amortized)
+- Per-render `prewarm_top_stories` removed from every dashboard render
+
+**Verification**: `pytest tests/ -q` = 184 passed. `ruff check .` = clean.
+New `ty` diagnostics: 0 (all 44 seen are pre-existing in other files).

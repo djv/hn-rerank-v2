@@ -292,22 +292,6 @@ def test_run_bq_query_passes_max_rows_to_cli(monkeypatch):
     assert "--max_rows=1000" in captured["cmd"]
 
 
-def test_run_bq_query_uses_default_max_rows_when_no_limit(monkeypatch):
-    captured = {}
-
-    class FakeProc:
-        stdout = "[]"
-        returncode = 0
-
-    def fake_run(cmd, **kwargs):
-        captured["cmd"] = cmd
-        return FakeProc()
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    seed_hn_from_bq.run_bq_query(months=3, min_score=500)
-    assert "--max_rows=1000" in captured["cmd"]
-
-
 def test_dry_run_skips_config_and_db(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

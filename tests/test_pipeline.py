@@ -28,6 +28,10 @@ from pipeline import (
     _reddit_subreddit_from_feed_url,
     _rss_source_name,
     _svm_personalization_features,
+    _feedback_signature,
+    _get_cached_model,
+    _set_cached_model,
+    _MODEL_CACHE,
     NON_HN_DISCOVERY_SLOT_LIMIT,
     DASHBOARD_QUEUE_SIZE,
     HOT_MIN_SCORE,
@@ -536,6 +540,137 @@ async def test_fetch_rss_feeds_serializes_reddit_and_sets_user_agent(
         "rss_reddit_ocaml",
         "rss_example_com",
     }
+
+
+async def test_fetch_rss_feeds_populates_self_text(tmp_path, monkeypatch):
+    """Regression: RSS stories must set self_text from the feed body, not leave it empty."""
+    from pipeline import fetch_rss_feeds
+
+    db = Database(str(tmp_path / "test.db"))
+
+    body = "The K line is cute but smells a bit. Stations feel like nowhere."
+
+    def rss_doc(title, link):
+        return f"""<?xml version="1.0"?>
+<rss><channel>
+<item><title>{title}</title><link>{link}</link>
+<pubDate>Tue, 23 Jun 2026 12:00:00 GMT</pubDate>
+<description>{body}</description>
+</item></channel></rss>"""
+
+    class MockResp:
+        status_code = 200
+
+        def __init__(self, t):
+            self.text = t
+
+    class MockClient:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+        async def get(self, url, headers=None):
+            return MockResp(rss_doc("LA transit", url + "/comments/x/"))
+
+    monkeypatch.setattr("pipeline.httpx.AsyncClient", MockClient)
+
+    stories = await fetch_rss_feeds(
+        ["https://www.reddit.com/r/transit/top/.rss"],
+        per_feed=5,
+        days=30,
+        exclude_urls=set(),
+        db=db,
+    )
+
+    assert len(stories) == 1
+    s = stories[0]
+    assert s.source == "rss_reddit_transit"
+    assert "K line is cute but smells" in s.self_text
+    assert s.text_content.startswith("LA transit. ")
+    assert "K line is cute but smells" in s.text_content
+
+
+async def test_prewarm_reddit_top_stories_fetches_comments(tmp_path, monkeypatch):
+    """prewarm_reddit_top_stories fetches and stores Reddit RSS comments."""
+    import server
+
+    db = Database(str(tmp_path / "test.db"))
+    db.upsert_story(
+        Story(
+            id=-100,
+            title="LA transit",
+            url="https://www.reddit.com/r/transit/comments/abc123/la_transit/",
+            score=0,
+            time=2000000000,
+            text_content="LA transit. body",
+            self_text="body",
+            source="rss_reddit_transit",
+        )
+    )
+
+    async def mock_fetch(url):
+        return server.RedditRssContext(
+            self_text="body",
+            top_comments="/u/alice: Useful comment about transit",
+            comment_count=3,
+        )
+
+    monkeypatch.setattr(server, "_fetch_reddit_rss_context", mock_fetch)
+
+    n = await pipeline.prewarm_reddit_top_stories([-100], db)
+
+    assert n == 1
+    updated = db.get_story(-100)
+    assert updated is not None
+    assert "Useful comment about transit" in updated.top_comments
+    assert updated.comment_count == 3
+    assert updated.discussion_url == (
+        "https://www.reddit.com/r/transit/comments/abc123/la_transit/"
+    )
+
+
+async def test_prewarm_reddit_top_stories_skips_if_already_populated(
+    tmp_path, monkeypatch
+):
+    """prewarm_reddit_top_stories is idempotent: skips if top_comments already populated."""
+    import server
+
+    db = Database(str(tmp_path / "test.db"))
+    db.upsert_story(
+        Story(
+            id=-101,
+            title="LA transit",
+            url="https://www.reddit.com/r/transit/comments/abc123/la_transit/",
+            score=0,
+            time=2000000000,
+            text_content="LA transit. body with existing comments",
+            self_text="body",
+            top_comments="/u/alice: Existing rich comment content that is quite long",
+            source="rss_reddit_transit",
+        )
+    )
+
+    async def mock_fetch(url):
+        return server.RedditRssContext(
+            self_text="body",
+            top_comments="shorter",
+            comment_count=1,
+        )
+
+    monkeypatch.setattr(server, "_fetch_reddit_rss_context", mock_fetch)
+
+    n = await pipeline.prewarm_reddit_top_stories([-101], db)
+
+    assert n == 0
+    updated = db.get_story(-101)
+    assert updated is not None
+    assert "Existing rich comment" in updated.top_comments
+    assert updated.comment_count is None  # unchanged
 
 
 @given(st.lists(st.floats(0.0, 1.0, allow_nan=False), min_size=2, max_size=50))
@@ -1712,7 +1847,10 @@ def test_hot_badge_requires_minimum_score(db, embedder):
 # ---------- prewarm_top_stories tests ----------
 
 
-class _DummyEmbedder:
+class _DummyEmbedder(Embedder):
+    def __init__(self):
+        pass
+
     def encode(self, texts, batch_size=32):
         import numpy as _np
 
@@ -1996,3 +2134,271 @@ def test_prewarm_top_stories_empty_ch_response_returns_zero() -> None:
         assert result == 0
     finally:
         db.close()
+
+
+def test_fetch_candidates_only_prewarms_top_n_by_score(monkeypatch) -> None:
+    """Regen prewarm selects top N HN candidates by score descending."""
+    db = Database(":memory:")
+    try:
+        config = Config(db_path=db.db_path, regen_prewarm_top_n=3)
+
+        stories = [
+            Story(id=1, title="A", url="", score=10, time=100, text_content="a"),
+            Story(id=2, title="B", url="", score=50, time=100, text_content="b"),
+            Story(id=3, title="C", url="", score=30, time=100, text_content="c"),
+            Story(
+                id=4,
+                title="D",
+                url="http://reddit.com/r/test",
+                score=5,
+                time=100,
+                text_content="d",
+                source="rss_reddit_test",
+            ),
+        ]
+        for s in stories:
+            db.upsert_story(s)
+
+        async def fake_fetch_candidates(
+            config, exclude_ids, exclude_urls, db, embedder
+        ):
+            return stories, 4
+
+        captured_ids: list[list[int]] = []
+
+        def fake_prewarm(ids, db_, embedder):
+            captured_ids.append(list(ids))
+            return len(ids)
+
+        monkeypatch.setattr(pipeline, "fetch_candidates", fake_fetch_candidates)
+        monkeypatch.setattr(pipeline, "prewarm_top_stories", fake_prewarm)
+
+        asyncio.run(
+            pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
+        )
+        assert len(captured_ids) == 1
+        # Top 3 by score (HN only): ids 2(50), 3(30), 1(10)
+        assert captured_ids[0] == [2, 3, 1]
+
+    finally:
+        db.close()
+
+
+def test_fetch_candidates_only_skips_prewarm_when_n_is_zero(monkeypatch) -> None:
+    """Regen prewarm is disabled when regen_prewarm_top_n is 0."""
+    db = Database(":memory:")
+    try:
+        config = Config(db_path=db.db_path, regen_prewarm_top_n=0)
+
+        async def fake_fetch_candidates(
+            config, exclude_ids, exclude_urls, db, embedder
+        ):
+            return [], 0
+
+        called = False
+
+        def fake_prewarm(ids, db_, embedder):
+            nonlocal called
+            called = True
+            return len(ids)
+
+        monkeypatch.setattr(pipeline, "fetch_candidates", fake_fetch_candidates)
+        monkeypatch.setattr(pipeline, "prewarm_top_stories", fake_prewarm)
+
+        asyncio.run(
+            pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
+        )
+        assert not called
+
+    finally:
+        db.close()
+
+
+def test_fetch_candidates_only_skips_prewarm_when_no_embedder(monkeypatch) -> None:
+    """Regen prewarm is skipped when embedder is None."""
+    db = Database(":memory:")
+    try:
+        config = Config(db_path=db.db_path, regen_prewarm_top_n=5)
+
+        async def fake_fetch_candidates(
+            config, exclude_ids, exclude_urls, db, embedder
+        ):
+            return [], 0
+
+        called = False
+
+        def fake_prewarm(ids, db_, embedder):
+            nonlocal called
+            called = True
+            return len(ids)
+
+        monkeypatch.setattr(pipeline, "fetch_candidates", fake_fetch_candidates)
+        monkeypatch.setattr(pipeline, "prewarm_top_stories", fake_prewarm)
+
+        asyncio.run(pipeline.fetch_candidates_only(config, db, embedder=None))
+        assert not called
+
+    finally:
+        db.close()
+
+
+def test_fetch_candidates_only_prewarm_empty_candidates(monkeypatch) -> None:
+    """Regen prewarm handles empty candidate list gracefully."""
+    db = Database(":memory:")
+    try:
+        config = Config(db_path=db.db_path, regen_prewarm_top_n=3)
+
+        async def fake_fetch_candidates(
+            config, exclude_ids, exclude_urls, db, embedder
+        ):
+            return [], 0
+
+        called = False
+
+        def fake_prewarm(ids, db_, embedder):
+            nonlocal called
+            called = True
+            return len(ids)
+
+        monkeypatch.setattr(pipeline, "fetch_candidates", fake_fetch_candidates)
+        monkeypatch.setattr(pipeline, "prewarm_top_stories", fake_prewarm)
+
+        asyncio.run(
+            pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
+        )
+        assert not called
+
+    finally:
+        db.close()
+
+
+# Model cache tests
+
+
+def _clear_model_cache() -> None:
+    _MODEL_CACHE.clear()
+
+
+def _make_story(db: Database, sid: int) -> None:
+    db.upsert_story(
+        Story(
+            id=sid,
+            title=f"story{sid}",
+            url=None,
+            score=10,
+            time=1000,
+            text_content="hello",
+            source="hn",
+        )
+    )
+
+
+def test_feedback_signature_consistency(db: Database) -> None:
+    user = db.create_user("sig_test")
+    _make_story(db, 1)
+    db.upsert_feedback(user.id, 1, "up")
+    sig1 = _feedback_signature(db, user.id)
+    sig2 = _feedback_signature(db, user.id)
+    assert sig1 == sig2
+
+
+def test_feedback_signature_changes_on_new_feedback(db: Database) -> None:
+    user = db.create_user("sig_test2")
+    _make_story(db, 1)
+    _make_story(db, 2)
+    db.upsert_feedback(user.id, 1, "up")
+    sig1 = _feedback_signature(db, user.id)
+    db.upsert_feedback(user.id, 2, "down")
+    sig2 = _feedback_signature(db, user.id)
+    assert sig1 != sig2
+
+
+def test_feedback_signature_changes_on_update(db: Database) -> None:
+    user = db.create_user("sig_test3")
+    _make_story(db, 1)
+    db.upsert_feedback(user.id, 1, "up")
+    sig1 = _feedback_signature(db, user.id)
+    db.upsert_feedback(user.id, 1, "down")
+    sig2 = _feedback_signature(db, user.id)
+    assert sig1 != sig2
+
+
+def test_feedback_signature_empty_user(db: Database) -> None:
+    user = db.create_user("sig_test4")
+    sig = _feedback_signature(db, user.id)
+    assert isinstance(sig, str)
+    assert len(sig) == 64
+
+
+def test_model_cache_hit() -> None:
+    _clear_model_cache()
+    from sklearn.svm import SVC
+    from sklearn.preprocessing import StandardScaler
+
+    svm = SVC(kernel="linear")
+    scaler = StandardScaler()
+    svm.fit([[0, 0], [1, 1]], [0, 1])
+    scaler.fit([[1.0], [2.0]])
+
+    _set_cached_model(42, "sig1", svm, scaler, maxsize=10)
+    result = _get_cached_model(42, "sig1")
+    assert result is not None
+    cached_svm, cached_scaler = result
+    assert cached_svm is svm
+    assert cached_scaler is scaler
+
+
+def test_model_cache_miss() -> None:
+    _clear_model_cache()
+    result = _get_cached_model(42, "nonexistent")
+    assert result is None
+
+
+def test_model_cache_user_isolation() -> None:
+    _clear_model_cache()
+    from sklearn.svm import SVC
+    from sklearn.preprocessing import StandardScaler
+
+    svm1 = SVC(kernel="linear")
+    scaler1 = StandardScaler()
+    svm1.fit([[0, 0], [1, 1]], [0, 1])
+    scaler1.fit([[1.0], [2.0]])
+    _set_cached_model(42, "sig", svm1, scaler1, maxsize=10)
+
+    result_other = _get_cached_model(99, "sig")
+    assert result_other is None
+
+
+def test_model_cache_none_user() -> None:
+    _clear_model_cache()
+    from sklearn.svm import SVC
+    from sklearn.preprocessing import StandardScaler
+
+    svm = SVC(kernel="linear")
+    scaler = StandardScaler()
+    svm.fit([[0, 0], [1, 1]], [0, 1])
+    scaler.fit([[1.0], [2.0]])
+
+    _set_cached_model(None, "sig", svm, scaler)
+    assert _get_cached_model(None, "sig") is None
+
+
+def test_model_cache_eviction() -> None:
+    _clear_model_cache()
+    from sklearn.svm import SVC
+    from sklearn.preprocessing import StandardScaler
+
+    svm = SVC(kernel="linear")
+    scaler = StandardScaler()
+    svm.fit([[0, 0], [1, 1]], [0, 1])
+    scaler.fit([[1.0], [2.0]])
+
+    maxsize = 3
+    for i in range(5):
+        _set_cached_model(1, f"sig{i}", svm, scaler, maxsize=maxsize)
+
+    assert _get_cached_model(1, "sig0") is None
+    assert _get_cached_model(1, "sig1") is None
+    assert _get_cached_model(1, "sig2") is not None
+    assert _get_cached_model(1, "sig3") is not None
+    assert _get_cached_model(1, "sig4") is not None

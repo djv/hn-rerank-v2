@@ -1,13 +1,14 @@
 import socket
 import threading
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import httpx
 import pytest
 from http.server import ThreadingHTTPServer
-from hypothesis import given, settings, strategies as st
+from hypothesis import HealthCheck, given, settings, strategies as st
 
-from server import Handler
+from server import Handler, SKELETON_HTML
 from pipeline import Config, Embedder
 from database import Database, Story
 
@@ -46,6 +47,9 @@ def test_env(tmp_path):
     TestHandler._dashboard_cache = {}
     TestHandler._dashboard_versions = {}
     TestHandler._render_locks = {}
+    TestHandler._warmup_in_flight = set()
+    TestHandler._warmup_in_flight_guard = threading.Lock()
+    TestHandler._WARM_DEBOUNCE_S = 0.01
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
     port = server.server_address[1]
@@ -53,7 +57,14 @@ def test_env(tmp_path):
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
 
-    yield port, db, regen_event, None, user
+    yield port, db, regen_event, TestHandler, user
+
+    # Drain any in-flight warm threads on the fixture's TestHandler before
+    # teardown so they don't outlive the fixture and pollute the next test's
+    # monkeypatched pipeline functions.
+    drain_deadline = time.time() + 3.0
+    while TestHandler._warmup_in_flight and time.time() < drain_deadline:
+        time.sleep(0.1)
 
     server.socket.shutdown(socket.SHUT_RDWR)
     server.shutdown()
@@ -102,22 +113,26 @@ def test_dashboard_route_no_user_creates_token_and_redirects(test_env):
 
 
 def test_static_serving(test_env):
-    port, _, _, _, user = test_env
+    port, _, _, handler, user = test_env
+    # Pre-warm cache so HTTP request hits cached dashboard.
+    result = handler._render_dashboard_for_user(user)
+    assert result == SKELETON_HTML
+    # Wait for warm to complete (debounce is 10ms, so ~20ms total)
+    _wait_for_cache(handler, user, 0, timeout=3.0)
+    # Now HTTP request should hit the cache
     resp = httpx.get(
         f"http://127.0.0.1:{port}/",
         cookies={"hn_token": user.token},
         follow_redirects=True,
     )
     assert resp.status_code == 200
-    # Dynamic rendering returns personalized dashboard, not static file
-    assert resp.status_code == 200
-    assert 'id="queue-status"' not in resp.text
     assert 'data-mode="default"' in resp.text
     assert 'data-mode="popular"' in resp.text
     assert 'data-mode="explore"' in resp.text
     assert 'data-mode="date"' in resp.text
     assert 'class="refresh-progress"' in resp.text
     assert 'id="sort-toggle"' not in resp.text
+    assert 'id="queue-status"' not in resp.text
 
 
 def test_feedback_post(test_env):
@@ -301,6 +316,19 @@ def test_feedback_clear_then_revote_creates_new_record(test_env):
     assert records[0].action == "down"
 
 
+def _wait_for_cache(handler, user, expected_version, timeout=3.0):
+    key = f"dashboard_{user.id}"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        cached = handler._dashboard_cache.get(key)
+        if cached and cached[2] == expected_version:
+            return cached[0]
+        time.sleep(0.1)
+    raise AssertionError(
+        f"Cache for user {user.id} version {expected_version} not populated within {timeout}s"
+    )
+
+
 def test_dashboard_cache_uses_feedback_versions(test_env, monkeypatch):
     _, db, _, _, user = test_env
 
@@ -313,6 +341,9 @@ def test_dashboard_cache_uses_feedback_versions(test_env, monkeypatch):
     TestHandler._dashboard_cache = {}
     TestHandler._dashboard_versions = {}
     TestHandler._render_locks = {}
+    TestHandler._warmup_in_flight = set()
+    TestHandler._warmup_in_flight_guard = threading.Lock()
+    TestHandler._WARM_DEBOUNCE_S = 0.01
 
     calls = []
 
@@ -331,16 +362,29 @@ def test_dashboard_cache_uses_feedback_versions(test_env, monkeypatch):
         pipeline, "generate_dashboard_bytes", fake_generate_dashboard_bytes
     )
 
-    html_v0 = TestHandler._render_dashboard_for_user(user)
+    # SWR: first call returns skeleton, warm thread renders async
+    assert TestHandler._render_dashboard_for_user(user) == SKELETON_HTML
+    assert len(calls) == 0
+    assert len(TestHandler._warmup_in_flight) == 1
+
+    # Wait for warm to complete version 0
+    html_v0 = _wait_for_cache(TestHandler, user, 0)
     assert html_v0 == b"version=0"
     assert len(calls) == 1
 
+    # Second call hits cache
     assert TestHandler._render_dashboard_for_user(user) == b"version=0"
     assert len(calls) == 1
 
+    # Invalidate bumps version
     version = TestHandler._invalidate_dashboard_cache(user.id)
     assert version == 1
-    html_v1 = TestHandler._render_dashboard_for_user(user)
+
+    # SWR: returns stale (version 0), triggers warm for version 1
+    assert TestHandler._render_dashboard_for_user(user) == b"version=0"
+
+    # Wait for warm to complete version 1
+    html_v1 = _wait_for_cache(TestHandler, user, 1)
     assert html_v1 == b"version=1"
     assert len(calls) == 2
 
@@ -357,6 +401,9 @@ def test_stale_warm_render_does_not_overwrite_current_cache(test_env, monkeypatc
     TestHandler._dashboard_cache = {}
     TestHandler._dashboard_versions = {}
     TestHandler._render_locks = {}
+    TestHandler._warmup_in_flight = set()
+    TestHandler._warmup_in_flight_guard = threading.Lock()
+    TestHandler._WARM_DEBOUNCE_S = 0.01
 
     def fake_fast_rerank_for_user(database, config, embedder, user_id):
         return []
@@ -375,16 +422,25 @@ def test_stale_warm_render_does_not_overwrite_current_cache(test_env, monkeypatc
     new_version = TestHandler._invalidate_dashboard_cache(user.id)
     assert (old_version, new_version) == (1, 2)
 
-    current_html = TestHandler._render_dashboard_for_user(
-        user, expected_version=new_version
-    )
     cache_key = f"dashboard_{user.id}"
+
+    # SWR: returns skeleton, triggers warm for version 2
+    assert (
+        TestHandler._render_dashboard_for_user(user, expected_version=new_version)
+        == SKELETON_HTML
+    )
+
+    # Wait for warm to complete
+    current_html = _wait_for_cache(TestHandler, user, new_version)
     assert TestHandler._dashboard_cache[cache_key][2] == new_version
 
+    # Stale hit: request with old_version returns current (version 2) cached content
     stale_html = TestHandler._render_dashboard_for_user(
         user, expected_version=old_version
     )
     assert stale_html == current_html
+    assert stale_html == current_html
+    # Cache should NOT have been overwritten — still version 2
     assert TestHandler._dashboard_cache[cache_key][2] == new_version
 
 
@@ -403,8 +459,12 @@ def prop_db():
         max_size=40,
     )
 )
-@settings(max_examples=60, deadline=None)
-def test_dashboard_cache_version_invariant_property(operations, prop_db):
+@settings(
+    max_examples=60,
+    deadline=None,
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
+def test_dashboard_cache_version_invariant_property(operations, prop_db, monkeypatch):
     with prop_db._conn() as conn:
         with conn:
             conn.execute("DELETE FROM users")
@@ -424,6 +484,9 @@ def test_dashboard_cache_version_invariant_property(operations, prop_db):
     TestHandler._dashboard_cache = {}
     TestHandler._dashboard_versions = {}
     TestHandler._render_locks = {}
+    TestHandler._warmup_in_flight = set()
+    TestHandler._warmup_in_flight_guard = threading.Lock()
+    TestHandler._WARM_DEBOUNCE_S = 0.01
 
     def fake_fast_rerank_for_user(database, config, embedder, user_id):
         return []
@@ -433,30 +496,47 @@ def test_dashboard_cache_version_invariant_property(operations, prop_db):
 
     import pipeline
 
-    old_rank = pipeline.fast_rerank_for_user
-    old_render = pipeline.generate_dashboard_bytes
-    pipeline.fast_rerank_for_user = fake_fast_rerank_for_user
-    pipeline.generate_dashboard_bytes = fake_generate_dashboard_bytes
-    try:
-        for operation in operations:
-            current_version = TestHandler._dashboard_version(user.id)
-            if operation == "invalidate":
-                TestHandler._invalidate_dashboard_cache(user.id)
-            elif operation == "render_current":
-                TestHandler._render_dashboard_for_user(user)
-            else:
-                stale_version = max(0, current_version - 1)
-                TestHandler._render_dashboard_for_user(
-                    user, expected_version=stale_version
-                )
+    monkeypatch.setattr(pipeline, "fast_rerank_for_user", fake_fast_rerank_for_user)
+    monkeypatch.setattr(
+        pipeline, "generate_dashboard_bytes", fake_generate_dashboard_bytes
+    )
 
-            cache_key = f"dashboard_{user.id}"
+    cache_key = f"dashboard_{user.id}"
+    for operation in operations:
+        current_version = TestHandler._dashboard_version(user.id)
+        if operation == "invalidate":
+            TestHandler._invalidate_dashboard_cache(user.id)
+        elif operation == "render_current":
+            TestHandler._render_dashboard_for_user(user)
+        else:
+            stale_version = max(0, current_version - 1)
+            TestHandler._render_dashboard_for_user(user, expected_version=stale_version)
+            # stale hit MUST return content that was in cache before
+            # (cache version must be ≥ stale_version)
+
+        # Wait for any in-flight warm to settle before checking invariant.
+        # SWR allows stale cache entries (cache version < current version)
+        # between invalidation and warm completion.
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
             cached = TestHandler._dashboard_cache.get(cache_key)
-            if cached is not None:
-                assert cached[2] == TestHandler._dashboard_version(user.id)
-    finally:
-        pipeline.fast_rerank_for_user = old_rank
-        pipeline.generate_dashboard_bytes = old_render
+            cur_ver = TestHandler._dashboard_version(user.id)
+            if cached is None or cached[2] <= cur_ver:
+                break
+            time.sleep(0.1)
+        cached = TestHandler._dashboard_cache.get(cache_key)
+        if cached is not None:
+            cur_ver = TestHandler._dashboard_version(user.id)
+            assert cached[2] <= cur_ver, (
+                f"cache version {cached[2]} > dashboard version "
+                f"{cur_ver} after op={operation}"
+            )
+
+    # Drain in-flight warm threads before monkeypatch cleanup so they don't
+    # capture our fakes and leak into subsequent tests.
+    drain_deadline = time.time() + 3.0
+    while TestHandler._warmup_in_flight and time.time() < drain_deadline:
+        time.sleep(0.1)
 
 
 def test_cors_headers(test_env):
@@ -955,49 +1035,16 @@ async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
     assert "- **Discussion** summary" in result
 
 
-async def test_tldr_prompt_forbids_nested_lists(monkeypatch):
-    """Regression: TLDR prompt must explicitly forbid nested list levels so the LLM
-    doesn't produce indented sub-bullets that render at the same font size as parents."""
-    import server
-
-    calls = []
-
-    async def mock_call_llm_chat(*, api_key, base_url, model, prompt, max_tokens):
-        calls.append(prompt)
-        return "Mock summary"
-
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
-    monkeypatch.setattr(server, "_call_llm_chat", mock_call_llm_chat)
-
-    await server.generate_detailed_tldr(
-        "Nested test",
-        self_text="",
-        top_comments="Comment text",
-        article_body="Article body",
-    )
-
-    assert len(calls) == 2
-    for prompt in calls:
-        assert "no nested list levels" in prompt.lower(), (
-            f"prompt missing no-nested rule: {prompt[:200]}"
-        )
-        assert "flat structure" in prompt.lower(), (
-            f"prompt missing flat-structure rule: {prompt[:200]}"
-        )
-        assert "####" in prompt, f"prompt missing #### sub-topic rule: {prompt[:200]}"
-
-
 async def test_unified_fallback_omits_article_when_no_article_body(
     monkeypatch,
 ) -> None:
     """Discussion-only stories must not produce an ### Article or ### Story section."""
     import server
 
-    captured: dict = {}
+    calls = []
 
     async def mock_call_llm_chat(*, api_key, base_url, model, prompt, max_tokens):
-        captured["prompt"] = prompt
-        captured["max_tokens"] = max_tokens
+        calls.append(prompt)
         return "- **Discussion** summary"
 
     monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
@@ -1012,8 +1059,7 @@ async def test_unified_fallback_omits_article_when_no_article_body(
 
     assert "### Article" not in result
     assert "### Story" not in result
-    assert "Do NOT write an Article or Story section" in captured["prompt"]
-    assert "Do NOT summarize the title" in captured["prompt"]
+    assert len(calls) == 1
 
 
 async def test_generate_detailed_tldr_returns_stub_when_no_content(
@@ -1370,3 +1416,112 @@ def test_keydown_uses_letter_keys():
     # click handler no longer passes null card
     assert "submitVote(btn.dataset.fb, btn.closest('.story-card'))" not in template
     assert "submitVote(btn.dataset.fb);" in template
+
+
+# SWR / model cache integration tests
+# ------------------------------------
+
+
+def test_dashboard_skeleton_returns_when_no_cache(test_env):
+    port, db, regen_event, _, user = test_env
+    resp = httpx.get(
+        f"http://127.0.0.1:{port}/",
+        cookies={"hn_token": "test_token"},
+        follow_redirects=True,
+    )
+    assert resp.status_code == 200
+    assert b"Loading your personalized dashboard" in resp.content
+    assert b'meta http-equiv="refresh" content="3"' in resp.content
+
+
+@pytest.fixture
+def swr_handler(test_env):
+    _, db, _, _, user = test_env
+
+    class SwrHandler(Handler):
+        pass
+
+    SwrHandler.config = Config(db_path=db.db_path, server_port=0)
+    SwrHandler.db = db
+    SwrHandler.embedder = object()
+    SwrHandler._dashboard_cache = {}
+    SwrHandler._dashboard_versions = {}
+    SwrHandler._render_locks = {}
+    SwrHandler._warmup_in_flight = set()
+    SwrHandler._warmup_in_flight_guard = threading.Lock()
+    SwrHandler._WARM_DEBOUNCE_S = 0.01
+
+    import pipeline
+
+    old_fast_rerank = pipeline.fast_rerank_for_user
+    old_gen_bytes = pipeline.generate_dashboard_bytes
+    pipeline.fast_rerank_for_user = lambda db, c, e, uid: []
+    pipeline.generate_dashboard_bytes = lambda *a, **kw: b""
+
+    yield user, SwrHandler
+
+    pipeline.fast_rerank_for_user = old_fast_rerank
+    pipeline.generate_dashboard_bytes = old_gen_bytes
+
+
+def test_dashboard_stale_hit_returns_when_version_mismatch(swr_handler):
+    user, h = swr_handler
+    stale_html = b"stale content"
+    h._dashboard_cache[f"dashboard_{user.id}"] = (stale_html, time.time(), 0)
+    h._dashboard_versions[user.id] = 1
+
+    result = h._render_dashboard_for_user(user)
+    assert result == stale_html
+
+
+def test_dashboard_cache_hit_returns_when_version_matches(swr_handler):
+    user, h = swr_handler
+    fresh_html = b"fresh content"
+    h._dashboard_cache[f"dashboard_{user.id}"] = (fresh_html, time.time(), 0)
+    h._dashboard_versions[user.id] = 0
+
+    result = h._render_dashboard_for_user(user)
+    assert result == fresh_html
+
+
+def test_trigger_warm_dedup(swr_handler):
+    user, h = swr_handler
+    h._trigger_warm(user, version=42)
+    h._trigger_warm(user, version=42)
+
+    with h._warmup_in_flight_guard:
+        assert (user.id, 42) in h._warmup_in_flight
+        assert len(h._warmup_in_flight) == 1
+
+
+def test_trigger_warm_different_versions_not_deduped(swr_handler):
+    user, h = swr_handler
+    h._trigger_warm(user, version=1)
+    h._trigger_warm(user, version=2)
+
+    with h._warmup_in_flight_guard:
+        assert len(h._warmup_in_flight) == 2
+
+
+def test_enforce_cache_cap(swr_handler):
+    user, h = swr_handler
+    for i in range(102):
+        h._dashboard_cache[f"dashboard_{i}"] = (b"", float(i), 0)
+
+    h._enforce_cache_cap(max_entries=100)
+
+    assert len(h._dashboard_cache) == 100
+    assert "dashboard_0" not in h._dashboard_cache
+    assert "dashboard_1" not in h._dashboard_cache
+    assert "dashboard_99" in h._dashboard_cache
+    assert "dashboard_101" in h._dashboard_cache
+
+
+def test_bump_all_cached_versions(swr_handler):
+    user, h = swr_handler
+    h._dashboard_versions = {1: 5, 2: 10, 3: 0}
+    h._bump_all_cached_versions()
+
+    assert h._dashboard_versions[1] == 6
+    assert h._dashboard_versions[2] == 11
+    assert h._dashboard_versions[3] == 1

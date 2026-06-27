@@ -113,7 +113,7 @@ sole source for the live 7-day window and bulk operations.
 
 | Source | Used for | Why |
 |---|---|---|
-| **ClickHouse** (`hackernews_history`) | Live 7-day window (`query_live_window`), bulk comment hydration (archive seed), bulk prewarm (top-20 ranked) | Single SQL query for N stories; 10-100× faster than per-story Algolia |
+| **ClickHouse** (`hackernews_history`) | Live 7-day window (`query_live_window`), bulk comment hydration (archive seed), bulk prewarm (top-50 ranked) | Single SQL query for N stories; 10-100× faster than per-story Algolia |
 | **Algolia** (`hn.algolia.com`) | Single-story items fallback (lazy TLDR detail for stories outside prewarm) | Real-time, no CH equivalent for one-off fetches; used only as fallback |
 | **BigQuery** (`bigquery-public-data.hacker_news.full`) | Backup archive seeder (manual) | Same data as CH; slower; requires `gcloud`/`bq` auth |
 
@@ -124,9 +124,11 @@ issues **1 CH call per regen**:
    live HN story from the past 7 days with all fields (title, url,
    score, descendants, time, text).
 
-The per-render prewarm (top-20 ranked stories' comment text) is a
-third CH call, gated by the dashboard render. The first 4 cards the
-user sees have `top_comments` already populated — no Algolia wait.
+The prewarm (comment text for top-50 ranked by score) is a second CH call
+inside `fetch_candidates_only`, at regen time — not on the render path.
+Every user's first dashboard render finds the top-scored candidates already
+populated. The first 4 cards any user sees have `top_comments` already
+populated — no Algolia wait and no render-time prewarm latency.
 
 CH has 1-24h latency for brand-new content (vs Algolia's real-time).
 With a 3h regen cycle, worst case is 4h lag for stories posted in the
