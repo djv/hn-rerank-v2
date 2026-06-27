@@ -18,8 +18,7 @@ from sklearn.preprocessing import StandardScaler
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from database import Database, Story
 from eval import _load_candidates, _evaluate_fold
-from legacy_features import _augment_features
-from pipeline import Config
+from pipeline import Config, _augment_features
 
 LOG_POINTS_SCALE = 2.0
 LOG_COMMENTS_SCALE = 1.0

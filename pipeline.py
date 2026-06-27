@@ -10,10 +10,11 @@ import time
 import tomllib
 from collections import Counter, OrderedDict
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable
+from typing import Any
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 import feedparser
 import httpx
@@ -54,9 +55,6 @@ class ModelConfig:
     top_badge_min_score: int = 100
     discussion_badge_percentile: float = 90.0
     discussion_badge_min_comments: int = 0
-    hot_badge_percentile: float = 99.5
-    similar_badge_percentile: float = 97.0
-    novel_badge_percentile: float = 10.0
 
 
 # SVM model cache: keyed on (user_id, feedback_signature) to skip SVC.fit().
@@ -243,22 +241,6 @@ class RankedStory:
     is_hot: bool = False
     is_similar: bool = False
     is_non_hn: bool = False
-
-
-@dataclass(frozen=True)
-class DiscoveryPass:
-    """A single extra-slot discovery pass in the rerank loop.
-
-    Each pass filters `remaining_decorated` by `predicate`, sorts the pool
-    by `sort_key` (descending), and takes the top `slot_limit` stories. The
-    matched stories are added to `final` and `remaining_decorated` is pruned.
-    """
-
-    name: str
-    attr: str
-    predicate: Callable[[RankedStory], bool]
-    sort_key: Callable[[RankedStory], float]
-    slot_limit: int
 
 
 def _dashboard_primary_limit(config_count: int) -> tuple[int, int]:
@@ -1086,12 +1068,11 @@ def _rss_source_name(feed_url: str) -> str:
 
 def _urllib_fetch(url: str, user_agent: str) -> tuple[int, str]:
     """Sync fetch via urllib.
-    Re-exported from http_fetch for backward compatibility with
-    callers that import it from pipeline (e.g. server.py). Prefer
-    `http_fetch.urllib_fetch` for new code."""
-    from http_fetch import urllib_fetch as _impl
-
-    return _impl(url, user_agent)
+    Used as fallback when httpx is blocked by Cloudflare (different TLS
+    fingerprint — system OpenSSL handshake often gets through)."""
+    req = Request(url, headers={"User-Agent": user_agent})
+    with urlopen(req, timeout=15) as resp:
+        return resp.status, resp.read().decode("utf-8", errors="replace")
 
 
 async def fetch_rss_feeds(
@@ -1106,18 +1087,34 @@ async def fetch_rss_feeds(
 
     async def fetch_and_parse(feed_url: str) -> list[Story]:
         try:
-            from http_fetch import fetch_with_urllib_fallback
-
             source_name = _rss_source_name(feed_url)
             headers = {"User-Agent": RSS_USER_AGENT}
             if _reddit_subreddit_from_feed_url(feed_url):
                 headers["User-Agent"] = REDDIT_RSS_USER_AGENT
 
             async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
-                status, content = await fetch_with_urllib_fallback(
-                    client, feed_url, headers
-                )
-                if status != 200:
+                resp = await client.get(feed_url, headers=headers)
+                content: str | None = None
+                if resp.status_code == 200:
+                    content = resp.text
+                elif resp.status_code in (403, 503):
+                    logging.info(
+                        "RSS %s: httpx %d, retrying with urllib",
+                        feed_url,
+                        resp.status_code,
+                    )
+                    status, body = await asyncio.to_thread(
+                        _urllib_fetch, feed_url, headers["User-Agent"]
+                    )
+                    if status == 200:
+                        content = body
+                    else:
+                        logging.warning(
+                            "RSS %s: urllib fallback returned %d",
+                            feed_url,
+                            status,
+                        )
+                if content is None:
                     return []
 
             parsed = feedparser.parse(content)
@@ -1294,8 +1291,13 @@ def get_or_compute_embeddings(
 
 # Ranking
 
-# Normalization constant for text-length metadata feature
+# Normalization constants for metadata features
+_LOG_POINTS_SCALE = 8.0  # log1p(~3000) ≈ 8
+_AGE_DAYS_SCALE = 30.0  # cap at 30 days
+_LOG_COMMENTS_SCALE = 7.0  # log1p(~1000) ≈ 6.9
 _LOG_TEXTLEN_SCALE = 12.0  # log1p(~100000) ≈ 11.5
+_LOG_QUALITY_SCALE = 8.0  # log1p(score/(age_hours+1)) rarely exceeds 8
+_LOG_VELOCITY_SCALE = 8.0  # log1p(score/max(age_h, 0.1)) rarely exceeds 8
 
 
 def _knn_similarity(
@@ -1322,6 +1324,113 @@ def _topk_mean(values: NDArray[np.float32], k: int) -> float:
     if k_actual == len(values):
         return float(values.mean())
     return float(np.partition(values, len(values) - k_actual)[-k_actual:].mean())
+
+
+def _augment_features(
+    embeddings: NDArray[np.float32],
+    scores: list[int] | np.ndarray,
+    age_seconds: list[float] | np.ndarray,
+    comment_counts: np.ndarray | None = None,
+    text_lengths: np.ndarray | None = None,
+    hn_quality: np.ndarray | None = None,
+    score_velocity: np.ndarray | None = None,
+    comment_velocity: np.ndarray | None = None,
+    sim_to_upvoted: np.ndarray | None = None,
+    sim_to_downvoted: np.ndarray | None = None,
+    closest_upvoted: np.ndarray | None = None,
+    closest_downvoted: np.ndarray | None = None,
+    comment_score_ratio: np.ndarray | None = None,
+    is_hn: np.ndarray | None = None,
+    engagement_ratio: np.ndarray | None = None,
+) -> NDArray[np.float32]:
+    n = len(scores)
+    n_meta = 1
+    for f in (
+        comment_counts,
+        text_lengths,
+        hn_quality,
+        comment_score_ratio,
+        is_hn,
+        engagement_ratio,
+    ):
+        if f is not None:
+            n_meta += 1
+    if score_velocity is not None and comment_velocity is not None:
+        n_meta += 2
+    if sim_to_upvoted is not None:
+        n_meta += 4
+
+    meta = np.zeros((n, n_meta), dtype=np.float32)
+    col = 0
+
+    # log points
+    meta[:, col] = (
+        np.clip(np.log1p(np.maximum(scores, 0)), 0, _LOG_POINTS_SCALE)
+        / _LOG_POINTS_SCALE
+    )
+    col += 1
+
+    if comment_counts is not None:
+        meta[:, col] = (
+            np.clip(np.log1p(np.maximum(comment_counts, 0)), 0, _LOG_COMMENTS_SCALE)
+            / _LOG_COMMENTS_SCALE
+        )
+        col += 1
+
+    if text_lengths is not None:
+        meta[:, col] = (
+            np.clip(np.log1p(np.maximum(text_lengths, 0)), 0, _LOG_TEXTLEN_SCALE)
+            / _LOG_TEXTLEN_SCALE
+        )
+        col += 1
+
+    if hn_quality is not None:
+        meta[:, col] = (
+            np.clip(np.log1p(np.maximum(hn_quality, 0)), 0, _LOG_QUALITY_SCALE)
+            / _LOG_QUALITY_SCALE
+        )
+        col += 1
+
+    if comment_score_ratio is not None:
+        meta[:, col] = comment_score_ratio
+        col += 1
+
+    if score_velocity is not None and comment_velocity is not None:
+        meta[:, col] = (
+            np.clip(np.log1p(np.maximum(score_velocity, 0)), 0, _LOG_VELOCITY_SCALE)
+            / _LOG_VELOCITY_SCALE
+        )
+        col += 1
+        meta[:, col] = (
+            np.clip(np.log1p(np.maximum(comment_velocity, 0)), 0, _LOG_VELOCITY_SCALE)
+            / _LOG_VELOCITY_SCALE
+        )
+        col += 1
+
+    if sim_to_upvoted is not None:
+        assert (
+            sim_to_downvoted is not None
+            and closest_upvoted is not None
+            and closest_downvoted is not None
+        )
+        meta[:, col] = (np.clip(sim_to_upvoted, -1, 1) + 1) / 2
+        col += 1
+        meta[:, col] = (np.clip(sim_to_downvoted, -1, 1) + 1) / 2
+        col += 1
+        meta[:, col] = (np.clip(closest_upvoted, -1, 1) + 1) / 2
+        col += 1
+        meta[:, col] = (np.clip(closest_downvoted, -1, 1) + 1) / 2
+        col += 1
+
+    if is_hn is not None:
+        meta[:, col] = is_hn
+        col += 1
+
+    if engagement_ratio is not None:
+        meta[:, col] = engagement_ratio
+        col += 1
+
+    return np.concatenate([embeddings, meta], axis=1)
 
 
 def _svm_personalization_features(
@@ -1914,17 +2023,11 @@ def rerank_candidates(
     cand_max_sim = np.maximum.reduce(
         [cand_closest_up, cand_closest_down, cand_closest_neutral]
     )
-    sim_threshold = (
-        np.percentile(cand_max_sim, config.model.novel_badge_percentile)
-        if len(cand_max_sim)
-        else 0.0
-    )
+    sim_threshold = np.percentile(cand_max_sim, 10) if len(cand_max_sim) else 0.0
     # Similar threshold is applied to extra-slot stories only (see
     # `is_similar` exclusion in the primary-attribution block below).
     similar_threshold = (
-        np.percentile(cand_closest_up, config.model.similar_badge_percentile)
-        if len(cand_closest_up)
-        else 0.0
+        np.percentile(cand_closest_up, 97) if len(cand_closest_up) else 0.0
     )
 
     cand_comment_counts = np.array([s.comment_count or 0 for s in candidates])
@@ -1933,11 +2036,7 @@ def rerank_candidates(
     cand_velocities = np.array(
         [s.score / max((now_ts - s.time) / 3600.0, 0.1) for s in candidates]
     )
-    hot_threshold = (
-        np.percentile(cand_velocities, config.model.hot_badge_percentile)
-        if len(cand_velocities)
-        else 0
-    )
+    hot_threshold = np.percentile(cand_velocities, 99.5) if len(cand_velocities) else 0
 
     story_id_to_idx = {s.id: idx for idx, s in enumerate(candidates)}
 
@@ -2019,106 +2118,130 @@ def rerank_candidates(
     # remaining_decorated contains candidates not in the primary path.
     remaining_decorated = [r for r in ranked if r.story.id not in final_ids]
 
-    # Novel pool ranked purely by distance to feedback (1 - max_similarity).
-    # Score is intentionally not blended in: "novel" means "semantically
-    # distant from anything you've voted on" and should surface regardless of
-    # how the model would have ranked the story.
+    # 1. Surface uncertainty items
     uncertain_ids = {r.story.id for r in uncertain_candidates}
-    idx_for = story_id_to_idx.__getitem__
+    uncertain_items = [
+        replace(r, is_uncertain=True)
+        for r in remaining_decorated
+        if r.story.id in uncertain_ids
+    ]
+    final.extend(uncertain_items)
+    selected_ids = final_ids | {item.story.id for item in uncertain_items}
+    remaining_decorated = [
+        r for r in remaining_decorated if r.story.id not in selected_ids
+    ]
 
-    def _novel_sort_key(r: RankedStory) -> float:
-        return float(1.0 - cand_max_sim[idx_for(r.story.id)])
+    # 2. Surface up to 5 novel stories
+    novel_pool = [
+        r
+        for r in remaining_decorated
+        if cand_max_sim[story_id_to_idx[r.story.id]] <= sim_threshold
+    ]
+    if novel_pool:
+        novel_scores = np.array([r.score for r in novel_pool], dtype=np.float32)
+        novel_distances = np.array(
+            [1.0 - cand_max_sim[story_id_to_idx[r.story.id]] for r in novel_pool],
+            dtype=np.float32,
+        )
+        score_pct = _rank_percentiles(novel_scores)
+        novelty_pct = _rank_percentiles(novel_distances)
+        novelty_rank = 0.7 * score_pct + 0.3 * novelty_pct
+        novel_order = np.argsort(-novelty_rank, kind="mergesort")
+        novel_pool = [novel_pool[int(i)] for i in novel_order]
+    novel_items = [replace(r, is_novel=True) for r in novel_pool[:DISCOVERY_SLOT_LIMIT]]
+    final.extend(novel_items)
+    selected_ids |= {item.story.id for item in novel_items}
+    remaining_decorated = [
+        r for r in remaining_decorated if r.story.id not in selected_ids
+    ]
 
-    def _similar_sort_key(r: RankedStory) -> float:
-        return float(cand_closest_up[idx_for(r.story.id)])
+    # 3. Surface up to 5 most similar stories
+    similar_pool = [
+        r
+        for r in remaining_decorated
+        if cand_closest_up[story_id_to_idx[r.story.id]] >= similar_threshold
+    ]
+    similar_pool.sort(
+        key=lambda r: cand_closest_up[story_id_to_idx[r.story.id]], reverse=True
+    )
+    similar_items = [
+        replace(r, is_similar=True) for r in similar_pool[:DISCOVERY_SLOT_LIMIT]
+    ]
+    final.extend(similar_items)
+    selected_ids |= {item.story.id for item in similar_items}
+    remaining_decorated = [
+        r for r in remaining_decorated if r.story.id not in selected_ids
+    ]
 
-    def _discussion_sort_key(r: RankedStory) -> float:
-        return float(r.story.comment_count or 0)
+    # 4. Surface up to 5 discussion-rich stories
+    discussion_pool = [
+        r
+        for r in remaining_decorated
+        if cand_comment_counts[story_id_to_idx[r.story.id]] >= discussion_threshold
+        and cand_comment_counts[story_id_to_idx[r.story.id]] > 0
+    ]
+    discussion_pool.sort(key=lambda r: r.story.comment_count or 0, reverse=True)
+    discussion_items = [
+        replace(r, is_discussion_rich=True)
+        for r in discussion_pool[:DISCOVERY_SLOT_LIMIT]
+    ]
+    final.extend(discussion_items)
+    selected_ids |= {item.story.id for item in discussion_items}
+    remaining_decorated = [
+        r for r in remaining_decorated if r.story.id not in selected_ids
+    ]
 
-    def _engagement_sort_key(r: RankedStory) -> float:
-        return float(cand_scores[idx_for(r.story.id)])
+    # 5. Surface up to 8 high-engagement stories
+    engagement_pool = [
+        r
+        for r in remaining_decorated
+        if cand_scores[story_id_to_idx[r.story.id]] >= engagement_threshold
+    ]
+    engagement_pool.sort(key=lambda r: r.score, reverse=True)
+    engagement_items = [
+        replace(r, is_high_engagement=True)
+        for r in engagement_pool[:POPULARITY_DISCOVERY_SLOT_LIMIT]
+    ]
+    final.extend(engagement_items)
+    selected_ids |= {item.story.id for item in engagement_items}
+    remaining_decorated = [
+        r for r in remaining_decorated if r.story.id not in selected_ids
+    ]
 
-    def _hot_sort_key(r: RankedStory) -> float:
-        return float(cand_velocities[idx_for(r.story.id)])
+    # 6. Surface up to 8 hot stories
+    hot_pool = [
+        r
+        for r in remaining_decorated
+        if cand_velocities[story_id_to_idx[r.story.id]] >= hot_threshold
+        and cand_velocities[story_id_to_idx[r.story.id]] > 0
+        and r.story.score >= HOT_MIN_SCORE
+    ]
+    hot_pool.sort(
+        key=lambda r: cand_velocities[story_id_to_idx[r.story.id]], reverse=True
+    )
+    hot_items = [
+        replace(r, is_hot=True) for r in hot_pool[:POPULARITY_DISCOVERY_SLOT_LIMIT]
+    ]
+    final.extend(hot_items)
+    selected_ids |= {item.story.id for item in hot_items}
 
+    # 7. Surface non-HN stories, ramping in after 20 votes of personalization
     n_non_hn_slots = _non_hn_slot_count(
         len(feedback_labels),
         cap=NON_HN_DISCOVERY_SLOT_LIMIT,
         threshold=20,
         window=config.model.non_hn_ramp_window,
     )
-
-    discovery_passes: list[DiscoveryPass] = [
-        DiscoveryPass(
-            name="uncertain",
-            attr="is_uncertain",
-            predicate=lambda r: r.story.id in uncertain_ids,
-            sort_key=lambda r: float(get_entropy(r)),
-            slot_limit=UNCERTAIN_DISCOVERY_SLOT_LIMIT,
-        ),
-        DiscoveryPass(
-            name="novel",
-            attr="is_novel",
-            predicate=lambda r: cand_max_sim[idx_for(r.story.id)] <= sim_threshold,
-            sort_key=_novel_sort_key,
-            slot_limit=DISCOVERY_SLOT_LIMIT,
-        ),
-        DiscoveryPass(
-            name="similar",
-            attr="is_similar",
-            predicate=lambda r: cand_closest_up[idx_for(r.story.id)]
-            >= similar_threshold,
-            sort_key=_similar_sort_key,
-            slot_limit=DISCOVERY_SLOT_LIMIT,
-        ),
-        DiscoveryPass(
-            name="discussion-rich",
-            attr="is_discussion_rich",
-            predicate=lambda r: cand_comment_counts[idx_for(r.story.id)]
-            >= discussion_threshold
-            and cand_comment_counts[idx_for(r.story.id)] > 0,
-            sort_key=_discussion_sort_key,
-            slot_limit=DISCOVERY_SLOT_LIMIT,
-        ),
-        DiscoveryPass(
-            name="high-engagement",
-            attr="is_high_engagement",
-            predicate=lambda r: cand_scores[idx_for(r.story.id)]
-            >= engagement_threshold,
-            sort_key=_engagement_sort_key,
-            slot_limit=POPULARITY_DISCOVERY_SLOT_LIMIT,
-        ),
-        DiscoveryPass(
-            name="hot",
-            attr="is_hot",
-            predicate=lambda r: cand_velocities[idx_for(r.story.id)] >= hot_threshold
-            and cand_velocities[idx_for(r.story.id)] > 0
-            and r.story.score >= HOT_MIN_SCORE,
-            sort_key=_hot_sort_key,
-            slot_limit=POPULARITY_DISCOVERY_SLOT_LIMIT,
-        ),
-        DiscoveryPass(
-            name="non-hn",
-            attr="is_non_hn",
-            predicate=lambda r: not is_hn_source(r.story.source),
-            sort_key=lambda r: float(r.score),
-            slot_limit=n_non_hn_slots,
-        ),
-    ]
-
-    for pass_ in discovery_passes:
-        if pass_.slot_limit <= 0:
-            continue
-        pool = [r for r in remaining_decorated if pass_.predicate(r)]
-        if not pool:
-            continue
-        pool.sort(key=pass_.sort_key, reverse=True)
-        items = [replace(r, **{pass_.attr: True}) for r in pool[: pass_.slot_limit]]
-        final.extend(items)
-        selected_ids |= {item.story.id for item in items}
-        remaining_decorated = [
-            r for r in remaining_decorated if r.story.id not in selected_ids
+    if n_non_hn_slots > 0:
+        non_hn_pool = [
+            r for r in remaining_decorated if not is_hn_source(r.story.source)
         ]
+        non_hn_pool.sort(key=lambda r: r.score, reverse=True)
+        non_hn_items = [
+            replace(r, is_non_hn=True) for r in non_hn_pool[:n_non_hn_slots]
+        ]
+        final.extend(non_hn_items)
+        selected_ids |= {item.story.id for item in non_hn_items}
 
     # Ensure is_non_hn is correct for all items (discovery passes don't set it)
     final = [replace(r, is_non_hn=(not is_hn_source(r.story.source))) for r in final]
@@ -2329,9 +2452,6 @@ def generate_dashboard_bytes(
         discussion_badge_percentile=int(
             round(config.model.discussion_badge_percentile)
         ),
-        hot_badge_percentile=int(round(config.model.hot_badge_percentile)),
-        similar_badge_percentile=int(round(config.model.similar_badge_percentile)),
-        novel_badge_percentile=int(round(config.model.novel_badge_percentile)),
     )
     return html_content.encode("utf-8")
 
