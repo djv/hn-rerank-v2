@@ -1939,13 +1939,8 @@ def rerank_candidates(
     )
     engagement_threshold = np.percentile(cand_scores, 98) if len(cand_scores) else 0
 
-    ranked_decorated = [
-        replace(r, is_non_hn=(not is_hn_source(r.story.source))) for r in ranked
-    ]
-
-    # Reconstruct final from the undecorated ranked candidates
+    # final already contains the primary-ranked items
     final_ids = {item.story.id for item in final}
-    final = [r for r in ranked_decorated if r.story.id in final_ids]
 
     # Apply the same badge criteria to primary-ranked stories. Extra-slot
     # passes below still source from remaining_decorated and respect their
@@ -1984,8 +1979,8 @@ def rerank_candidates(
         for r in final
     ]
 
-    # And remaining_decorated contains candidates not in the primary path.
-    remaining_decorated = [r for r in ranked_decorated if r.story.id not in final_ids]
+    # remaining_decorated contains candidates not in the primary path.
+    remaining_decorated = [r for r in ranked if r.story.id not in final_ids]
 
     # 1. Surface uncertainty items
     uncertain_ids = {r.story.id for r in uncertain_candidates}
@@ -2102,6 +2097,9 @@ def rerank_candidates(
     ]
     final.extend(non_hn_items)
     selected_ids |= {item.story.id for item in non_hn_items}
+
+    # Ensure is_non_hn is correct for all items (discovery passes don't set it)
+    final = [replace(r, is_non_hn=(not is_hn_source(r.story.source))) for r in final]
 
     final.sort(key=lambda r: r.score, reverse=True)
     return final
@@ -2260,6 +2258,17 @@ async def fetch_and_cache_article_bodies(
     return {sid: updated for sid, updated in results if updated is not None}
 
 
+_pico_css_cache: str | None = None
+
+
+def _get_pico_css() -> str:
+    global _pico_css_cache
+    if _pico_css_cache is None:
+        path = Path("templates/pico.min.css")
+        _pico_css_cache = path.read_text(encoding="utf-8") if path.exists() else ""
+    return _pico_css_cache
+
+
 def generate_dashboard_bytes(
     ranked: list[RankedStory],
     config: Config,
@@ -2272,10 +2281,7 @@ def generate_dashboard_bytes(
     env.filters["time_ago"] = time_ago_filter
     env.filters["source_label"] = source_label_filter
 
-    pico_css_path = Path("templates/pico.min.css")
-    pico_css = (
-        pico_css_path.read_text(encoding="utf-8") if pico_css_path.exists() else ""
-    )
+    pico_css = _get_pico_css()
 
     all_fb = db.get_all_feedback(user_id=user_id)
     fb_map = {f.story_id: f.action for f in all_fb}

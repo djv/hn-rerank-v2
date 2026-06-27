@@ -1434,7 +1434,7 @@ def test_dashboard_skeleton_returns_when_no_cache(test_env):
     )
     assert resp.status_code == 200
     assert b"Loading your personalized dashboard" in resp.content
-    assert b'meta http-equiv="refresh" content="3"' in resp.content
+    assert b'meta http-equiv="refresh" content="1"' in resp.content
 
 
 @pytest.fixture

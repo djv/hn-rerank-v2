@@ -630,7 +630,7 @@ IMPORTANT:
 
 
 SKELETON_HTML = b"""<!DOCTYPE html>
-<html><head><meta http-equiv="refresh" content="3"></head>
+<html><head><meta http-equiv="refresh" content="1"></head>
 <body><p>Loading your personalized dashboard...</p></body></html>"""
 
 
@@ -647,7 +647,7 @@ class Handler(BaseHTTPRequestHandler):
     _render_locks_guard = threading.Lock()
     _warmup_in_flight: set[tuple[int, int]] = set()
     _warmup_in_flight_guard = threading.Lock()
-    _WARM_DEBOUNCE_S: float = 1.0
+    _WARM_DEBOUNCE_S: float = 0.2
 
     def _get_user(self) -> User | None:
         """Extract user from cookie token."""
