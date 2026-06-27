@@ -119,6 +119,22 @@ def is_hn_source(source: str) -> bool:
     return source in {"hn", BQ_ARCHIVE_SOURCE, CH_ARCHIVE_SOURCE}
 
 
+def is_summarizable(story: Story) -> bool:
+    """True if the story has enough text to generate a TLDR (or can fetch it).
+
+    A story is summarizable if it already has any text content, or if it's
+    an HN story with comments that can be fetched on-demand or prewarmed.
+    """
+    if story.self_text or story.top_comments or story.article_body:
+        return True
+    if is_hn_source(story.source):
+        if (story.comment_count or 0) > 0:
+            return True
+        if (story.comment_count_at_fetch or 0) > 0:
+            return True
+    return False
+
+
 @dataclass(frozen=True)
 class RssConfig:
     enabled: bool = True
@@ -136,6 +152,8 @@ class Config:
     regen_interval_seconds: int = 10800
     regen_prewarm_top_n: int = 50
     reddit_prewarm_top_n: int = 20
+    prewarm_hn_full: bool = True
+    prewarm_reddit_full: bool = True
     article_fetch_max_per_run: int = 100
     article_fetch_concurrency: int = 10
     article_fetch_max_age_days: int = 30
@@ -164,6 +182,8 @@ class Config:
             regen_interval_seconds=main_cfg.get("regen_interval_seconds", 10800),
             regen_prewarm_top_n=main_cfg.get("regen_prewarm_top_n", 50),
             reddit_prewarm_top_n=main_cfg.get("reddit_prewarm_top_n", 20),
+            prewarm_hn_full=main_cfg.get("prewarm_hn_full", True),
+            prewarm_reddit_full=main_cfg.get("prewarm_reddit_full", True),
             article_fetch_max_per_run=main_cfg.get("article_fetch_max_per_run", 100),
             article_fetch_concurrency=main_cfg.get("article_fetch_concurrency", 10),
             article_fetch_max_age_days=main_cfg.get("article_fetch_max_age_days", 30),
@@ -901,7 +921,15 @@ async def fetch_candidates(
         )
         deduped_candidates.extend(rss_stories)
 
-    return deduped_candidates, len(deduped_candidates)
+    # 6. Filter to summarizable stories (no content = no TLDR possible)
+    summarizable = [s for s in deduped_candidates if is_summarizable(s)]
+    n_filtered = len(deduped_candidates) - len(summarizable)
+    if n_filtered:
+        logging.info(
+            "fetch_candidates: filtered %d unsummarizable stories",
+            n_filtered,
+        )
+    return summarizable, len(summarizable)
 
 
 # RSS Fetching
@@ -2327,31 +2355,67 @@ async def fetch_candidates_only(
     )
     logging.info(f"Regen: fetched {n_fetched} candidates")
 
-    if prewarm_top_n is None:
-        prewarm_top_n = config.regen_prewarm_top_n
-    if prewarm_top_n > 0 and embedder is not None:
-        hn_ids = [s.id for s in candidates if s.id > 0]
-        hn_ids.sort(
-            key=lambda sid: next(s.score for s in candidates if s.id == sid),
-            reverse=True,
-        )
-        top_ids = hn_ids[:prewarm_top_n]
-        if top_ids:
-            prewarmed = prewarm_top_stories(top_ids, db, embedder)
+    # HN prewarm
+    if config.prewarm_hn_full and embedder is not None:
+        needs_prewarm = [
+            s.id
+            for s in candidates
+            if is_hn_source(s.source)
+            and not s.top_comments
+            and (s.comment_count or 0) > 0
+        ]
+        if needs_prewarm:
+            prewarmed = prewarm_top_stories(needs_prewarm, db, embedder)
             logging.info(
-                "Regen: prewarmed %d/%d top-by-score stories",
+                "Regen: prewarmed %d/%d HN candidates (full mode)",
                 prewarmed,
-                len(top_ids),
+                len(needs_prewarm),
             )
+    else:
+        if prewarm_top_n is None:
+            prewarm_top_n = config.regen_prewarm_top_n
+        if prewarm_top_n > 0 and embedder is not None:
+            hn_ids = [s.id for s in candidates if s.id > 0]
+            hn_ids.sort(
+                key=lambda sid: next(s.score for s in candidates if s.id == sid),
+                reverse=True,
+            )
+            top_ids = hn_ids[:prewarm_top_n]
+            if top_ids:
+                prewarmed = prewarm_top_stories(top_ids, db, embedder)
+                logging.info(
+                    "Regen: prewarmed %d/%d top-by-score stories",
+                    prewarmed,
+                    len(top_ids),
+                )
 
-    reddit_prewarm_top_n = config.reddit_prewarm_top_n
-    if reddit_prewarm_top_n > 0:
-        reddit_ids = [s.id for s in candidates if s.source.startswith("rss_reddit_")]
-        top_reddit = reddit_ids[:reddit_prewarm_top_n]
-        if top_reddit:
-            prewarmed = await prewarm_reddit_top_stories(top_reddit, db, embedder)
-            logging.info(
-                "Regen: prewarmed %d/%d Reddit RSS stories",
-                prewarmed,
-                len(top_reddit),
+    # Reddit prewarm
+    if config.prewarm_reddit_full:
+        needs_prewarm_reddit = [
+            s.id
+            for s in candidates
+            if s.source.startswith("rss_reddit_") and not s.top_comments
+        ]
+        if needs_prewarm_reddit:
+            prewarmed = await prewarm_reddit_top_stories(
+                needs_prewarm_reddit, db, embedder
             )
+            logging.info(
+                "Regen: prewarmed %d/%d Reddit candidates (full mode)",
+                prewarmed,
+                len(needs_prewarm_reddit),
+            )
+    else:
+        reddit_prewarm_top_n = config.reddit_prewarm_top_n
+        if reddit_prewarm_top_n > 0:
+            reddit_ids = [
+                s.id for s in candidates if s.source.startswith("rss_reddit_")
+            ]
+            top_reddit = reddit_ids[:reddit_prewarm_top_n]
+            if top_reddit:
+                prewarmed = await prewarm_reddit_top_stories(top_reddit, db, embedder)
+                logging.info(
+                    "Regen: prewarmed %d/%d Reddit RSS stories",
+                    prewarmed,
+                    len(top_reddit),
+                )

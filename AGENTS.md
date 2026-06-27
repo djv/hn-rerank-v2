@@ -124,11 +124,18 @@ issues **1 CH call per regen**:
    live HN story from the past 7 days with all fields (title, url,
    score, descendants, time, text).
 
-The prewarm (comment text for top-50 ranked by score) is a second CH call
-inside `fetch_candidates_only`, at regen time — not on the render path.
-Every user's first dashboard render finds the top-scored candidates already
-populated. The first 4 cards any user sees have `top_comments` already
-populated — no Algolia wait and no render-time prewarm latency.
+The prewarm (comment text for all HN candidates with `comment_count > 0` and
+empty `top_comments`) is a second CH call inside `fetch_candidates_only`,
+at regen time — not on the render path. Every user's first dashboard render
+finds the candidate rows already populated. The first 4 cards any user sees
+have `top_comments` already populated — no Algolia wait and no render-time
+prewarm latency.
+
+Stories with no content to summarize (self_text, top_comments, and article_body
+all empty, and no HN comment_count > 0) are filtered out by `is_summarizable()`
+in `fetch_candidates`. Config knobs `prewarm_hn_full` and `prewarm_reddit_full`
+(default true) control prewarm scope; set to false to revert to top-by-score
+prewarm (`regen_prewarm_top_n=50` / `reddit_prewarm_top_n=20` default).
 
 CH has 1-24h latency for brand-new content (vs Algolia's real-time).
 With a 3h regen cycle, worst case is 4h lag for stories posted in the

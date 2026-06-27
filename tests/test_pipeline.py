@@ -464,6 +464,92 @@ def test_is_hn_source_includes_bq_seed():
     assert not is_hn_source("rss_example_com")
 
 
+def test_is_summarizable_with_content():
+    """Stories with self_text, top_comments, or article_body are summarizable."""
+    from pipeline import Story
+
+    s = Story(
+        id=1,
+        title="X",
+        url=None,
+        score=5,
+        time=100,
+        text_content="x",
+        source="rss",
+        self_text="Some text",
+    )
+    assert pipeline.is_summarizable(s)
+
+    s = Story(
+        id=2,
+        title="X",
+        url=None,
+        score=5,
+        time=100,
+        text_content="x",
+        source="rss",
+        top_comments="Some comments",
+    )
+    assert pipeline.is_summarizable(s)
+
+    s = Story(
+        id=3,
+        title="X",
+        url=None,
+        score=5,
+        time=100,
+        text_content="x",
+        source="rss",
+        article_body="Some body",
+    )
+    assert pipeline.is_summarizable(s)
+
+
+def test_is_summarizable_hn_with_comments():
+    """HN stories with comment_count > 0 but no inline text are summarizable
+    (comments can be fetched on-demand or prewarmed at regen)."""
+    from pipeline import Story
+
+    s = Story(
+        id=1,
+        title="X",
+        url=None,
+        score=5,
+        time=100,
+        text_content="x",
+        source="hn",
+        comment_count=10,
+        comment_count_at_fetch=10,
+    )
+    assert pipeline.is_summarizable(s)
+
+
+def test_is_summarizable_hn_zero_comments_no_content():
+    """HN stories with 0 comments and no text content are NOT summarizable."""
+    from pipeline import Story
+
+    s = Story(
+        id=1, title="X", url=None, score=5, time=100, text_content="x", source="hn"
+    )
+    assert not pipeline.is_summarizable(s)
+
+
+def test_is_summarizable_non_hn_no_content():
+    """Non-HN stories with no text content are NOT summarizable."""
+    from pipeline import Story
+
+    s = Story(
+        id=1,
+        title="X",
+        url=None,
+        score=5,
+        time=100,
+        text_content="x",
+        source="rss_reddit_test",
+    )
+    assert not pipeline.is_summarizable(s)
+
+
 @pytest.mark.asyncio
 async def test_fetch_rss_feeds_serializes_reddit_and_sets_user_agent(
     tmp_path, monkeypatch
@@ -1057,6 +1143,7 @@ async def test_fetch_candidates_ch_failure_returns_empty_live(tmp_path, monkeypa
             score=200,
             time=old_time,
             text_content="Archive text",
+            self_text="Archive seed self text",
             source=CH_ARCHIVE_SOURCE,
         )
     )
@@ -1182,6 +1269,122 @@ async def test_bq_archive_hydration_preserves_source(tmp_path, monkeypatch):
     assert updated is not None
     assert updated.source == BQ_ARCHIVE_SOURCE
     assert "Pre-existing hydrated comments" in updated.top_comments
+
+
+@pytest.mark.asyncio
+async def test_fetch_candidates_filters_unsummarizable(tmp_path, monkeypatch):
+    """fetch_candidates drops stories with no content and no fetchable comments."""
+    from database import Database
+    from pipeline import Config, fetch_candidates
+
+    db_file = tmp_path / "test.db"
+    db = Database(str(db_file))
+    now = int(time.time())
+    db.upsert_story(
+        Story(
+            id=1,
+            title="Has comments",
+            url="https://example.com/1",
+            score=100,
+            time=now - 86400,
+            text_content="Has comments.",
+            source="hn",
+            comment_count=5,
+            comment_count_at_fetch=5,
+            top_comments="Already hydrated comments.",
+        )
+    )
+    db.upsert_story(
+        Story(
+            id=2,
+            title="No comments but has self_text",
+            url="https://example.com/2",
+            score=50,
+            time=now - 86400,
+            text_content="No comments but has self_text.",
+            source="hn",
+            self_text="Some author text.",
+        )
+    )
+    db.upsert_story(
+        Story(
+            id=3,
+            title="Truly empty HN",
+            url="https://example.com/3",
+            score=10,
+            time=now - 86400,
+            text_content="Truly empty HN.",
+            source="hn",
+        )
+    )
+    db.upsert_story(
+        Story(
+            id=4,
+            title="Non-HN with no content",
+            url="https://example.com/4",
+            score=5,
+            time=now - 86400,
+            text_content="Non-HN with no content.",
+            source="rss",
+        )
+    )
+
+    # Mock CH live window to return the 4 stories (preexisting in DB)
+    monkeypatch.setattr(
+        "ch_client.query_live_window",
+        lambda **kw: [
+            {
+                "id": 1,
+                "title": "Has comments",
+                "url": "https://example.com/1",
+                "points": 100,
+                "num_comments": 5,
+                "created_at_i": now - 86400,
+                "text": "",
+            },
+            {
+                "id": 2,
+                "title": "No comments but has self_text",
+                "url": "https://example.com/2",
+                "points": 50,
+                "num_comments": 0,
+                "created_at_i": now - 86400,
+                "text": "Some author text.",
+            },
+            {
+                "id": 3,
+                "title": "Truly empty HN",
+                "url": "https://example.com/3",
+                "points": 10,
+                "num_comments": 0,
+                "created_at_i": now - 86400,
+                "text": "",
+            },
+            {
+                "id": 4,
+                "title": "Non-HN with no content",
+                "url": "https://example.com/4",
+                "points": 5,
+                "num_comments": 0,
+                "created_at_i": now - 86400,
+                "text": "",
+            },
+        ],
+    )
+
+    candidates, _ = await fetch_candidates(
+        Config(db_path=str(db_file), days=30),
+        set(),
+        set(),
+        db,
+    )
+    candidate_ids = {s.id for s in candidates}
+    # Stories with content or HN comments: 1, 2
+    assert 1 in candidate_ids, "Has comments should survive"
+    assert 2 in candidate_ids, "Has self_text should survive"
+    # Stories with no content and no comments: 3, 4
+    assert 3 not in candidate_ids, "Truly empty HN should be filtered"
+    assert 4 not in candidate_ids, "Non-HN with no content should be filtered"
 
 
 def test_fast_rerank_for_user_includes_old_bq_archive_story(db, monkeypatch):
@@ -2146,7 +2349,12 @@ def test_fetch_candidates_only_prewarms_top_n_by_score(monkeypatch) -> None:
     """Regen prewarm selects top N HN candidates by score descending."""
     db = Database(":memory:")
     try:
-        config = Config(db_path=db.db_path, regen_prewarm_top_n=3)
+        config = Config(
+            db_path=db.db_path,
+            regen_prewarm_top_n=3,
+            prewarm_hn_full=False,
+            prewarm_reddit_full=False,
+        )
 
         stories = [
             Story(id=1, title="A", url="", score=10, time=100, text_content="a"),
@@ -2278,7 +2486,179 @@ def test_fetch_candidates_only_prewarm_empty_candidates(monkeypatch) -> None:
         db.close()
 
 
-# Model cache tests
+def test_fetch_candidates_only_prewarms_all_hn_when_full(monkeypatch) -> None:
+    """Regen prewarms all HN candidates needing comments when prewarm_hn_full=True."""
+    db = Database(":memory:")
+    try:
+        config = Config(
+            db_path=db.db_path,
+            prewarm_hn_full=True,
+            prewarm_reddit_full=False,
+        )
+
+        stories = [
+            Story(id=1, title="A", url="", score=10, time=100, text_content="a"),
+            Story(
+                id=2,
+                title="B",
+                url="",
+                score=50,
+                time=100,
+                text_content="b",
+                comment_count=5,
+                top_comments="",
+            ),
+            Story(
+                id=3,
+                title="C",
+                url="",
+                score=30,
+                time=100,
+                text_content="c",
+                comment_count=3,
+                top_comments="",
+            ),
+            Story(id=4, title="D", url="", score=5, time=100, text_content="d"),
+        ]
+        for s in stories:
+            db.upsert_story(s)
+
+        async def fake_fetch_candidates(
+            config, exclude_ids, exclude_urls, db, embedder
+        ):
+            return stories, 4
+
+        captured_ids: list[list[int]] = []
+
+        def fake_prewarm(ids, db_, embedder):
+            captured_ids.append(list(ids))
+            return len(ids)
+
+        monkeypatch.setattr(pipeline, "fetch_candidates", fake_fetch_candidates)
+        monkeypatch.setattr(pipeline, "prewarm_top_stories", fake_prewarm)
+
+        asyncio.run(
+            pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
+        )
+        assert len(captured_ids) == 1
+        # Only stories with comment_count > 0 and empty top_comments: 2, 3
+        assert sorted(captured_ids[0]) == [2, 3]
+
+    finally:
+        db.close()
+
+
+def test_fetch_candidates_only_prewarms_all_reddit_when_full(monkeypatch) -> None:
+    """Regen prewarms all Reddit candidates when prewarm_reddit_full=True."""
+    db = Database(":memory:")
+    try:
+        config = Config(
+            db_path=db.db_path,
+            prewarm_hn_full=False,
+            regen_prewarm_top_n=0,
+            prewarm_reddit_full=True,
+        )
+
+        stories = [
+            Story(
+                id=10,
+                title="R1",
+                url="http://reddit.com/r/test/1",
+                score=10,
+                time=100,
+                text_content="r1",
+                source="rss_reddit_test",
+            ),
+            Story(
+                id=11,
+                title="R2",
+                url="http://reddit.com/r/test/2",
+                score=5,
+                time=100,
+                text_content="r2",
+                source="rss_reddit_test",
+            ),
+            Story(
+                id=12,
+                title="R3",
+                url="http://reddit.com/r/test/3",
+                score=20,
+                time=100,
+                text_content="r3",
+                source="rss_reddit_test",
+                top_comments="Already hydrated.",
+            ),
+        ]
+        for s in stories:
+            db.upsert_story(s)
+
+        async def fake_fetch_candidates(
+            config, exclude_ids, exclude_urls, db, embedder
+        ):
+            return stories, 3
+
+        captured_ids: list[list[int]] = []
+
+        async def fake_reddit_prewarm(ids, db_, embedder):
+            captured_ids.append(list(ids))
+            return len(ids)
+
+        monkeypatch.setattr(pipeline, "fetch_candidates", fake_fetch_candidates)
+        monkeypatch.setattr(pipeline, "prewarm_reddit_top_stories", fake_reddit_prewarm)
+
+        asyncio.run(
+            pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
+        )
+        assert len(captured_ids) == 1
+        # Stories without top_comments: 10, 11
+        assert sorted(captured_ids[0]) == [10, 11]
+
+    finally:
+        db.close()
+
+
+def test_fetch_candidates_only_falls_back_to_top_n_when_disabled(monkeypatch) -> None:
+    """Regen falls back to top-N by score when prewarm_hn_full=False."""
+    db = Database(":memory:")
+    try:
+        config = Config(
+            db_path=db.db_path,
+            prewarm_hn_full=False,
+            regen_prewarm_top_n=2,
+            prewarm_reddit_full=False,
+        )
+
+        stories = [
+            Story(id=1, title="A", url="", score=10, time=100, text_content="a"),
+            Story(id=2, title="B", url="", score=50, time=100, text_content="b"),
+            Story(id=3, title="C", url="", score=30, time=100, text_content="c"),
+        ]
+        for s in stories:
+            db.upsert_story(s)
+
+        async def fake_fetch_candidates(
+            config, exclude_ids, exclude_urls, db, embedder
+        ):
+            return stories, 3
+
+        captured_ids: list[list[int]] = []
+
+        def fake_prewarm(ids, db_, embedder):
+            captured_ids.append(list(ids))
+            return len(ids)
+
+        monkeypatch.setattr(pipeline, "fetch_candidates", fake_fetch_candidates)
+        monkeypatch.setattr(pipeline, "prewarm_top_stories", fake_prewarm)
+
+        asyncio.run(
+            pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
+        )
+        assert len(captured_ids) == 1
+        # Top 2 by score (HN only): 2(50), 3(30)
+        assert captured_ids[0] == [2, 3]
+
+    finally:
+        db.close()
 
 
 def _clear_model_cache() -> None:

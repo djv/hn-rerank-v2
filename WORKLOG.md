@@ -5,6 +5,14 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-27 — Filter unsummarizable stories; expand regen prewarm (HN + Reddit full mode)
+
+- **Filter unsummarizable stories from the dashboard:** `fetch_candidates` now drops stories with no self_text, no top_comments, no article_body, and (for HN) zero comments. They would only ever produce a "No article body or discussion available to summarize for this story." placeholder in tldr-detail. Covers ~965 HN stories with `comment_count==0` and ~180 non-HN stories with no content.
+- **Expand regen prewarm to all candidates (not just top-N by score):** `fetch_candidates_only` now prewarms `top_comments` for all HN candidates with `comment_count > 0` and empty `top_comments` (~2149 stories), and all Reddit RSS candidates with empty `top_comments`. New config knobs `prewarm_hn_full` and `prewarm_reddit_full` (default true) control scope; set false to revert to top-by-score prewarm.
+- **Purged 20 orphan tldr_cache rows** holding the literal "No article body..." placeholder (one-off SQL DELETE).
+- Added `is_summarizable(story)` helper in pipeline.py.
+- Expanded test coverage: 8 new tests for `is_summarizable`, candidate filter, and full-mode prewarm; fixed 1 existing test fixture (archive seed needed `self_text` to survive the filter).
+
 ## 2026-06-27 — TLDR prompt fix: structural separation of article-only and comments-only code paths
 
 - **Bug:** The TLDR prompt had overlapping triggers for the "article + discussion" and "article-only" output branches. Both branches fired on the same input (article body present, no comments). The LLM always chose the richer "two sections" branch and hallucinated a Discussion section from nothing.
