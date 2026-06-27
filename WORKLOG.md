@@ -5,6 +5,36 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-27 — JS extraction rolled back (item 7a from cleanup commit)
+
+The JS extraction in `4b731ec` (move the 758-line inline `<script>` to `static/dashboard.js` and serve via `<script src="/static/dashboard.js">`) caused a real-world regression that **was not reproducible in jsdom**:
+- jsdom (Node.js + jsdom) reported `cards=43 active=1` after bootstrap on every test run.
+- A real browser reported `cards=43 active=0` after bootstrap (no console error).
+
+Bisect identified the extraction itself as the culprit (not the `data-is-hn` rewrite, the `if (refillQueued)` setMode addition, the vote-count tracking, or the new comment header — all four were ruled out by inline-`script` testing on the live server).
+
+**What I rolled back:**
+- `static/dashboard.js` deleted.
+- `/static/` route handler removed from `server.py`.
+- `<script>` tag is now inline again in `templates/index.html` (with the 4b731ec JS changes: `data-is-hn` `matchesCurrentSource`, `if (refillQueued)` setMode, vote-count tracking).
+- 2 static-endpoint tests adapted to check the inline `<script>` instead of the file (`test_dashboard_js_loaded_via_static_endpoint`, `test_static_dashboard_js_has_no_jinja`).
+- `_read_template_and_static()` helper now extracts the inline `<script>` block from the template.
+
+**What I kept from 4b731ec:** everything except the JS extraction:
+- 1. `data-is-hn` template attribute + `matchesCurrentSource` rewrite (fixes `ch_seed` source invisibility to HN filter)
+- 2. 3 new config knobs (`hot_badge_percentile`, `similar_badge_percentile`, `novel_badge_percentile`) + dynamic tooltips
+- 2b. Novel pass now purely distance-based
+- 3. `_augment_features` → `legacy_features.py`
+- 4. Table-driven discovery passes
+- 5. Prompt extraction → `prompts/*.txt`
+- 6. `http_fetch.py` consolidation
+
+**Why I'm not pursuing the extraction bug further:** jsdom doesn't reproduce, the fix needs a real browser to verify, and the inline version is functionally correct. The 758-line script is ugly but the readability cost of inlining is bounded by a single 758-line block; we can revisit extraction later (e.g., split the script into multiple modules and bundle, or use a `<script type="module">` for better cache semantics).
+
+**Cosmetic reminder:** `pipeline.py:2332` does `int(round(99.5))` = 100 (banker's rounding) for `hot_badge_percentile`, so the Hot badge tooltip still renders `"Top 100%"`. Not user-visible breakage, but worth fixing when we touch the badge config rendering next.
+
+243 tests pass, ruff+ty clean.
+
 ## 2026-06-27 — Badges + UI cleanup (6 items + novel pass simplification)
 
 Big readability sweep across `pipeline.py`, `server.py`, `templates/index.html`, and supporting modules. The user said the system was "becoming complicated" — this addresses the accidental complexity while leaving the conceptual structure intact.

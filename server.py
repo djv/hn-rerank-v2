@@ -572,36 +572,6 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = self.path.split("?")[0]
 
-        # Static files (e.g. /static/dashboard.js)
-        if path.startswith("/static/"):
-            static_dir = Path(__file__).parent / "static"
-            rel = path[len("/static/") :]
-            if ".." in rel or rel.startswith("/"):
-                self.send_error(HTTPStatus.BAD_REQUEST)
-                return
-            file_path = static_dir / rel
-            if not file_path.is_file():
-                self.send_error(HTTPStatus.NOT_FOUND)
-                return
-            ext = file_path.suffix.lower()
-            mime = {
-                ".js": "application/javascript; charset=utf-8",
-                ".css": "text/css; charset=utf-8",
-                ".svg": "image/svg+xml",
-                ".png": "image/png",
-                ".ico": "image/x-icon",
-            }.get(ext, "application/octet-stream")
-            body = file_path.read_bytes()
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", mime)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
-            self.send_header("Pragma", "no-cache")
-            self.send_header("Expires", "0")
-            self.end_headers()
-            self.wfile.write(body)
-            return
-
         # Token-based user session
         if path.startswith("/u/"):
             token = path[3:].strip("/")
@@ -616,6 +586,27 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_error(HTTPStatus.BAD_REQUEST)
             return
+
+        # User info API
+        if path == "/api/user":
+            user = self._get_user()
+            if user:
+                self._json_response({"user_id": user.id, "token": user.token})
+            else:
+                self._json_response({"error": "No session"}, status=401)
+            return
+
+        # Dashboard — dynamic render per-user
+        if path in ("/", "/index.html"):
+            user = self._get_user()
+            if not user:
+                token = secrets.token_hex(4)
+                self.send_response(302)
+                self.send_header("Location", f"u/{token}")
+                self.send_header(
+                    "Set-Cookie", f"hn_token={token}; Path=/; Max-Age=31536000"
+                )
+                self.end_headers()
 
         # User info API
         if path == "/api/user":

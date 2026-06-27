@@ -20,15 +20,19 @@ class MockEmbedder(Embedder):
 
 
 def _read_template_and_static() -> tuple[str, str]:
-    """Read both the Jinja2 template and the extracted static JS.
+    """Read both the Jinja2 template and the inline <script> block.
 
-    Tests that look for JS code should check the static file, while tests
-    that look for HTML attributes / Jinja2 directives check the template.
+    Tests that look for JS code should check the inline script returned here,
+    while tests that look for HTML attributes / Jinja2 directives check the
+    template. (The script is inline again after the static extraction was
+    rolled back — see WORKLOG 2026-06-27.)
     """
     repo_root = Path(__file__).resolve().parents[1]
     template = (repo_root / "templates" / "index.html").read_text(encoding="utf-8")
-    static = (repo_root / "static" / "dashboard.js").read_text(encoding="utf-8")
-    return template, static
+    start = template.find("  <script>\n")
+    end = template.find("  </script>\n", start)
+    inline_script = template[start:end] if start >= 0 and end >= 0 else ""
+    return template, inline_script
 
     def __init__(self) -> None:
         pass
@@ -1398,33 +1402,27 @@ def test_story_cards_emit_is_hn_attribute():
 
 
 def test_dashboard_js_loaded_via_static_endpoint():
-    """The 700-line inline <script> has been extracted to static/dashboard.js
-    and is loaded via a <script src="/static/dashboard.js"> tag. The static
-    file must exist and the template must reference it (not the inline code).
-    """
+    """The inline <script> is served from the template (the static/dashboard.js
+    extraction was rolled back — see WORKLOG 2026-06-27)."""
     repo_root = Path(__file__).resolve().parents[1]
     template = (repo_root / "templates" / "index.html").read_text(encoding="utf-8")
-    static_js = repo_root / "static" / "dashboard.js"
-    assert static_js.is_file(), f"{static_js} must exist"
-    assert 'src="/static/dashboard.js"' in template
-    # The template must NOT contain the old inline IIFEs (snarkdown parser is
-    # a 700-char blob that would only appear in the inline script).
-    assert "function snarkdown" not in template, (
-        "snarkdown parser should have moved to static/dashboard.js"
-    )
-    assert "const TAGS=" not in template, (
-        "TAGS constant should have moved to static/dashboard.js"
-    )
+    # The template must contain an inline <script> block
+    assert "  <script>\n" in template
+    # The template must NOT reference a /static/ JS file
+    assert 'src="/static/dashboard.js"' not in template
 
 
 def test_static_dashboard_js_has_no_jinja():
-    """static/dashboard.js is served as-is; it must not contain Jinja2
-    directives (which would be served as literal text to the browser)."""
-    static_js = (
-        Path(__file__).resolve().parents[1] / "static" / "dashboard.js"
+    """The inline <script> in the template is served as-is by Jinja2, so it
+    must not contain Jinja2 directives."""
+    template = (
+        Path(__file__).resolve().parents[1] / "templates" / "index.html"
     ).read_text(encoding="utf-8")
-    assert "{{" not in static_js, "static/dashboard.js must not contain Jinja2 {{ }}"
-    assert "{%" not in static_js, "static/dashboard.js must not contain Jinja2 {% %}"
+    start = template.find("  <script>\n")
+    end = template.find("  </script>\n", start)
+    inline_script = template[start:end] if start >= 0 and end >= 0 else ""
+    assert "{{" not in inline_script, "inline script must not contain Jinja2 {{ }}"
+    assert "{%" not in inline_script, "inline script must not contain Jinja2 {% %}"
 
 
 def test_keydown_uses_letter_keys():
