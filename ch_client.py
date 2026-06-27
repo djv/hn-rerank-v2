@@ -89,7 +89,7 @@ def _post_ch(query: str) -> list[dict[str, Any]]:
     """Execute a CH query and return the data rows."""
     resp = httpx.post(
         CH_PLAYGROUND_URL,
-        data=query,
+        content=query,
         timeout=CH_TIMEOUT_SECONDS,
     )
     resp.raise_for_status()

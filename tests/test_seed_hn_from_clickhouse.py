@@ -293,7 +293,7 @@ def test_run_ch_query_uses_correct_endpoint(monkeypatch):
 
     def fake_post(url, **kwargs):
         captured["url"] = url
-        captured["query"] = kwargs.get("data", "")
+        captured["query"] = kwargs.get("content", "")
         return MockResponse(200, {"data": []})
 
     monkeypatch.setattr(httpx, "post", fake_post)

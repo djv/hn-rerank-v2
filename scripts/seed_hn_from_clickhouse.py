@@ -61,7 +61,7 @@ def run_ch_query(
     query = build_ch_query(months=months, min_score=min_score, limit=limit)
     resp = httpx.post(
         CH_PLAYGROUND_URL,
-        data=query,
+        content=query,
         timeout=30.0,
     )
     resp.raise_for_status()

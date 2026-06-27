@@ -59,7 +59,7 @@ def test_query_live_window_returns_algolia_shape(
 
     def fake_post(url, **kwargs):
         captured["url"] = url
-        captured["query"] = kwargs.get("data", "")
+        captured["query"] = kwargs.get("content", "")
         return _MockResponse(
             200,
             {
@@ -238,7 +238,9 @@ def test_query_stories_with_comments_combines_stories_and_children(
 
     def fake_post(url, **kwargs):
         call_count["n"] += 1
-        if "SELECT" in kwargs.get("data", "") and "IN (" in kwargs.get("data", ""):
+        if "SELECT" in kwargs.get("content", "") and "IN (" in kwargs.get(
+            "content", ""
+        ):
             # Could be either stories query or comments; just return both shapes
             return _MockResponse(
                 200,
