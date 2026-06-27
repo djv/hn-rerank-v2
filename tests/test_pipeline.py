@@ -923,7 +923,7 @@ def test_clean_text_properties(text, min_len):
 )
 @settings(max_examples=25)
 def test_augment_features_properties(meta):
-    from pipeline import _augment_features
+    from legacy_features import _augment_features
 
     n = len(meta)
     embeddings = np.random.randn(n, 384).astype(np.float32)
@@ -2271,6 +2271,48 @@ def test_discussion_badge_threshold_uses_config_percentile_and_floor(
     )
 
 
+def test_hot_badge_threshold_uses_config_percentile(
+    db: Database, embedder: Embedder
+) -> None:
+    """is_hot respects hot_badge_percentile from config."""
+    now = int(time.time())
+    # 20 stories, scores 10..200 (step 10), all 1h old so velocity = score.
+    # Ordered so high-score stories are at the start (stable sort preserves order).
+    score_values = list(range(10, 210, 10))  # [10, 20, ..., 200]
+    candidates = [
+        Story(
+            id=i,
+            title=f"Story {i}",
+            url=None,
+            score=score,
+            time=now - 3600,
+            text_content=f"Sample text content for story {i}.",
+            source="hn",
+            comment_count=0,
+        )
+        for i, score in enumerate(reversed(score_values))  # id=0→score=200
+    ]
+    cand_embs = embedder.encode([s.text_content for s in candidates])
+
+    # Default: 99.5th pct → only id=0 (score=200) gets is_hot
+    config = Config(count=40)
+    ranked = rerank_candidates(db, config, embedder, candidates, cand_embs)
+    hot_ids = {r.story.id for r in ranked if r.is_hot}
+    assert 0 in hot_ids
+    assert 1 not in hot_ids, "190-score story should NOT be hot at p99.5"
+    assert len(hot_ids) == 1, f"Expected 1 hot at p99.5, got {len(hot_ids)}"
+
+    # 50th pct → half the stories (score >= 110)
+    config2 = Config(count=40, model=ModelConfig(hot_badge_percentile=50.0))
+    ranked2 = rerank_candidates(db, config2, embedder, candidates, cand_embs)
+    hot2 = {r.story.id for r in ranked2 if r.is_hot}
+    assert 0 in hot2
+    # 50th pct of [10..200] = 105 → score >= 110 → 10 stories (id 0..9)
+    assert 9 in hot2
+    assert 10 not in hot2, "100-score story should NOT be hot at p50"
+    assert len(hot2) == 10, f"Expected 10 hot at p50, got {len(hot2)}"
+
+
 def test_tier1_gravity_at_zero_feedback(db: Database, embedder: Embedder) -> None:
     """Zero feedback → tier 1 gravity formula, sorted by score/age."""
     config = Config()
@@ -3033,6 +3075,124 @@ def test_no_neutral_feedback_uses_up_down_only_for_novel(db, embedder, monkeypat
             assert r.is_novel, (
                 f"Candidate {r.story.id} (not similar to any) should be novel"
             )
+
+
+def test_novel_pass_ranks_purely_by_distance_not_score(
+    db, embedder, monkeypatch
+) -> None:
+    """The Novel extra-slot pass ranks candidates by distance (1 - max_similarity)
+    only — score is intentionally NOT blended in. A low-score, high-distance
+    story in the extra-slot pool should be picked over a higher-score,
+    lower-distance story when the slot cap forces a cut.
+
+    Setup: 20 candidates. Primary = top 12 by score. Extra-slot = bottom 8.
+    Of the 8 extra-slot, 6 have sim <= threshold (the novel pool). DISCOVERY_SLOT_LIMIT=5.
+    The 5th by distance is the cut boundary. We construct scores so that the
+    5th-by-distance story has the lowest score of the pool: pure-distance
+    ranking keeps it; the old 0.7*score + 0.3*novelty blend would have dropped
+    it for a higher-score story at the bottom of the distance ranking.
+    """
+    # Higher novel_badge_percentile → larger pool → slot cap cuts.
+    config = Config(
+        count=40,
+        model=ModelConfig(novel_badge_percentile=60.0),
+    )
+    user = db.create_user("test_novel_distance")
+
+    # Feedback at axis 0 (one upvoted story).
+    def mock_gce(stories, embedder_arg, db_inst):
+        arr = np.zeros((len(stories), 384), dtype=np.float32)
+        for i, s in enumerate(stories):
+            if s.id == 100:
+                arr[i, 0] = 1.0
+        return arr
+
+    monkeypatch.setattr("pipeline.get_or_compute_embeddings", mock_gce)
+    db.upsert_story(
+        Story(
+            id=100,
+            title="fb",
+            url=None,
+            score=10,
+            time=0,
+            text_content="",
+        )
+    )
+    db.upsert_feedback(user.id, 100, "up")
+
+    # 20 candidates. First 12 (high scores) are in the primary set.
+    # Last 8 (low scores) are in the extra-slot pool. The novel pool is
+    # drawn from the extra-slot set; the 5th-by-distance cut is the boundary.
+    # We arrange so that the cut candidate has the lowest score of the pool.
+    now = int(time.time())
+    candidates = []
+    # Primary: 12 candidates, scores 100-120, all sim > threshold (so no is_novel
+    # from primary attribution).
+    for i in range(12):
+        candidates.append(
+            Story(
+                id=i,
+                title=f"P{i}",
+                url=None,
+                score=100 + i,
+                time=now - 3600,
+                text_content=f"primary {i}",
+                source="hn",
+                comment_count=0,
+            )
+        )
+    # Extra-slot: 8 candidates, scores 1-50. Of these, 6 have sims below the
+    # 60th-percentile threshold (i.e. qualify for the novel pool).
+    # Cut candidate (5th by distance) = id=14, score=1 (lowest in pool).
+    # 6th by distance (cut) = id=15, score=50 (highest in pool).
+    extra_scores = [10, 10, 10, 10, 1, 50, 10, 10]
+    extra_sims = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.45, 0.50]
+    for i, sc in enumerate(extra_scores):
+        candidates.append(
+            Story(
+                id=12 + i,
+                title=f"E{i}",
+                url=None,
+                score=sc,
+                time=now - 3600,
+                text_content=f"extra {i}",
+                source="hn",
+                comment_count=0,
+            )
+        )
+
+    cand_embs = np.zeros((20, 384), dtype=np.float32)
+    # Primary candidates: all have axis 0 = 0.5 (sim=0.5, above any threshold).
+    for i in range(12):
+        cand_embs[i, 0] = 0.5
+        cand_embs[i, 50 + i] = np.sqrt(0.75)
+    # Extra-slot candidates: axis 0 = their sim value; rest on unique axes.
+    for i, s in enumerate(extra_sims):
+        cand_embs[12 + i, 0] = s
+        cand_embs[12 + i, 100 + i] = np.sqrt(max(1.0 - s * s, 0.0))
+
+    ranked = rerank_candidates(
+        db, config, embedder, candidates, cand_embs, user_id=user.id
+    )
+
+    by_id = {r.story.id: r for r in ranked}
+    # id=16 is the 5th-by-distance in the extra-slot pool (sim=0.25, dist=0.75,
+    # score=1). Pure-distance ranking keeps it; old score-blended ranking
+    # would have dropped it (lowest score → lowest score_pct in pool).
+    assert 16 in by_id, "id=16 should be in the final result"
+    assert by_id[16].is_novel, (
+        f"id=16 (sim=0.25, dist=0.75, score=1) should be in novel extra-slot "
+        f"(5th by distance); got is_novel={by_id[16].is_novel}"
+    )
+    # id=17 is the 6th-by-distance (sim=0.30, dist=0.70, score=50). The
+    # extra-slot novel pass cuts at K=5, so this one is dropped by the
+    # novel pass. It may still appear in the final via the primary set
+    # if its score is high enough, but it must NOT have is_novel=True from
+    # the novel extra-slot pull. Since id=17 is in the extra-slot (low score),
+    # it never enters the primary set, so is_novel must be False.
+    assert 17 not in by_id, (
+        "id=17 (cut by novel pass, low score) should not be in final result"
+    )
 
 
 def test_prewarm_top_stories_empty_ch_response_returns_zero() -> None:

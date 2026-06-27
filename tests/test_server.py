@@ -16,6 +16,20 @@ from database import Database, Story
 
 
 class MockEmbedder(Embedder):
+    pass
+
+
+def _read_template_and_static() -> tuple[str, str]:
+    """Read both the Jinja2 template and the extracted static JS.
+
+    Tests that look for JS code should check the static file, while tests
+    that look for HTML attributes / Jinja2 directives check the template.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    template = (repo_root / "templates" / "index.html").read_text(encoding="utf-8")
+    static = (repo_root / "static" / "dashboard.js").read_text(encoding="utf-8")
+    return template, static
+
     def __init__(self) -> None:
         pass
 
@@ -1143,21 +1157,19 @@ async def test_generate_detailed_tldr_returns_stub_when_no_content(
 
 
 def test_keydown_guard_excludes_buttons_and_anchors():
-    """Regression: the global keydown handler in templates/index.html must not
+    """Regression: the global keydown handler in static/dashboard.js must not
     bail out when a <button> or <a> has focus, otherwise clicking a mode tab
     or vote button blocks the next ArrowUp/ArrowDown from registering.
     """
-    template = (
-        Path(__file__).resolve().parents[1] / "templates" / "index.html"
-    ).read_text(encoding="utf-8")
-    assert "addEventListener('keydown'" in template, (
-        "keydown handler not found in template"
+    _, static = _read_template_and_static()
+    assert "addEventListener('keydown'" in static, (
+        "keydown handler not found in static/dashboard.js"
     )
 
     # Locate the closest(...) call in the guard
-    idx = template.index("closest?.(")
-    end = template.index(")", idx)
-    guard = template[idx : end + 1]
+    idx = static.index("closest?.(")
+    end = static.index(")", idx)
+    guard = static[idx : end + 1]
 
     assert "button" not in guard, "button should not block global shortcuts"
     assert "'a'" not in guard, "a should not block global shortcuts"
@@ -1369,20 +1381,62 @@ def test_dashboard_has_source_filter_toggle():
     assert template.index("source-tabs") < template.index("swipe-keys")
 
 
+def test_story_cards_emit_is_hn_attribute():
+    """Each .story-card must carry a data-is-hn flag so the client source
+    filter can use a single source of truth (matches is_hn_source on the
+    server). HN/CH-archive/BQ-archive → 1; RSS → 0.
+    """
+    template, static = _read_template_and_static()
+    assert (
+        "data-is-hn=\"{{ '0' if item.is_non_hn else '1' }}\"".replace("{{", "{{")
+        in template
+    )
+    # The client filter must use data-is-hn, not the old prefix-based check
+    assert "card.dataset.isHn" in static
+    assert "s.startsWith('rss_')" not in static
+    assert "s === 'hn' || s === 'bq_seed'" not in static
+
+
+def test_dashboard_js_loaded_via_static_endpoint():
+    """The 700-line inline <script> has been extracted to static/dashboard.js
+    and is loaded via a <script src="/static/dashboard.js"> tag. The static
+    file must exist and the template must reference it (not the inline code).
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    template = (repo_root / "templates" / "index.html").read_text(encoding="utf-8")
+    static_js = repo_root / "static" / "dashboard.js"
+    assert static_js.is_file(), f"{static_js} must exist"
+    assert 'src="/static/dashboard.js"' in template
+    # The template must NOT contain the old inline IIFEs (snarkdown parser is
+    # a 700-char blob that would only appear in the inline script).
+    assert "function snarkdown" not in template, (
+        "snarkdown parser should have moved to static/dashboard.js"
+    )
+    assert "const TAGS=" not in template, (
+        "TAGS constant should have moved to static/dashboard.js"
+    )
+
+
+def test_static_dashboard_js_has_no_jinja():
+    """static/dashboard.js is served as-is; it must not contain Jinja2
+    directives (which would be served as literal text to the browser)."""
+    static_js = (
+        Path(__file__).resolve().parents[1] / "static" / "dashboard.js"
+    ).read_text(encoding="utf-8")
+    assert "{{" not in static_js, "static/dashboard.js must not contain Jinja2 {{ }}"
+    assert "{%" not in static_js, "static/dashboard.js must not contain Jinja2 {% %}"
+
+
 def test_keydown_uses_letter_keys():
     """The global keydown handler maps j/k/l to down/up/neutral
     and ArrowUp/ArrowDown scroll the active card.
     """
-    template = (
-        Path(__file__).resolve().parents[1] / "templates" / "index.html"
-    ).read_text(encoding="utf-8")
-    assert "key === 'j'" in template
-    assert "key === 'k'" in template
-    assert "key === 'l'" in template
+    template, static = _read_template_and_static()
+    assert "key === 'j'" in static
+    assert "key === 'k'" in static
+    assert "key === 'l'" in static
     # arrow bindings present for card scrolling
-    handler = template.split("document.addEventListener('keydown'")[1].split("});", 1)[
-        0
-    ]
+    handler = static.split("document.addEventListener('keydown'")[1].split("});", 1)[0]
     assert "arrowup" in handler
     assert "arrowdown" in handler
     assert "ArrowRight" not in handler
@@ -1394,8 +1448,8 @@ def test_keydown_uses_letter_keys():
     assert 'aria-label="Keyboard shortcuts"' in template
     assert "first-time-tip-inner" in template
     # open article / open comments keys present
-    assert "key === 'o'" in template
-    assert "key === 'c'" in template
+    assert "key === 'o'" in static
+    assert "key === 'c'" in static
     assert "open article" in template.lower()
     assert "open comments" in template.lower()
     assert "data-article-url" in template
@@ -1475,8 +1529,8 @@ def test_keydown_uses_letter_keys():
     # feedback button has filled, shadowed style
     assert "box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);" in template
     # click handler no longer passes null card
-    assert "submitVote(btn.dataset.fb, btn.closest('.story-card'))" not in template
-    assert "submitVote(btn.dataset.fb);" in template
+    assert "submitVote(btn.dataset.fb, btn.closest('.story-card'))" not in static
+    assert "submitVote(btn.dataset.fb);" in static
 
 
 def test_dashboard_renders_user_vote_counts_zero_for_no_feedback(test_env):
@@ -1694,11 +1748,9 @@ def test_setMode_consumes_pending_refill_on_tab_click():
     """Regression: clicking a mode tab while 'New ranking ready' is showing
     should auto-consume the preloaded ranking without requiring the manual
     Refresh button."""
-    template = (
-        Path(__file__).resolve().parents[1] / "templates" / "index.html"
-    ).read_text(encoding="utf-8")
-    idx = template.index("function setMode(")
-    end = template.index("\n    }", idx) + len("\n    }")
-    body = template[idx:end]
+    _, static = _read_template_and_static()
+    idx = static.index("function setMode(")
+    end = static.index("function setSource(", idx)
+    body = static[idx:end]
     assert "refillQueued" in body
     assert "refillWhenReady" in body
