@@ -5,6 +5,51 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-27 — Badges + UI cleanup (6 items + novel pass simplification)
+
+Big readability sweep across `pipeline.py`, `server.py`, `templates/index.html`, and supporting modules. The user said the system was "becoming complicated" — this addresses the accidental complexity while leaving the conceptual structure intact.
+
+### 1. Fix `ch_seed` source invisible to client filter (latent bug)
+- `ch_seed` source was treated as neither HN nor Non-HN by the client filter (only `hn` and `bq_seed` matched the HN bucket). Fixed by emitting a server-side `data-is-hn` flag on every card (derived from `is_hn_source`) and switching the client filter to read it.
+- `templates/index.html:836` now emits `data-is-hn="{{ '0' if item.is_non_hn else '1' }}"`.
+- New test `test_story_cards_emit_is_hn_attribute` enforces the new contract.
+
+### 2. Add 5 missing badge/weight config knobs (consistency)
+- New `ModelConfig` fields: `hot_badge_percentile=99.5`, `similar_badge_percentile=97.0`, `novel_badge_percentile=10.0`. Defaults match the old hard-coded magic numbers; behavior unchanged unless config overrides.
+- Tooltips for the Hot, Similar, and Novel badges are now template-driven: `"Top {{ hot_badge_percentile }}% by engagement velocity..."`, `"Top {{ similar_badge_percentile }}% most similar to your upvoted stories"`, `"Bottom {{ novel_badge_percentile }}% by similarity to your feedback, but model scores it high"`.
+- New test `test_hot_badge_threshold_uses_config_percentile` verifies the knob is honored.
+
+### 2b. Make Novel badge purely distance-based (no score blend)
+- The Novel extra-slot pass previously ranked by `0.7 * score_pct + 0.3 * novelty_pct` — a blend that let high-score stories crowd out genuinely novel ones. Now it sorts by distance only: `argsort(-novel_distances)`.
+- The `novel_score_weight` / `novel_distance_weight` config knobs are removed (no longer meaningful). Net behavior: a story that is semantically distant from your feedback will be surfaced regardless of how the model would have ranked it.
+- New test `test_novel_pass_ranks_purely_by_distance_not_score` verifies the cut.
+
+### 3. Move `_augment_features` to `legacy_features.py` (research-code isolation)
+- 108-line `_augment_features` was dead code in the production path but still used by 4 offline eval scripts (`eval.py`, `eval_rss.py`, `eval_no_hn_features.py`, `scripts/feature_ablation.py`). Moved to a new top-level `legacy_features.py` module with its own log-scale constants; production `pipeline.py` now only contains `_svm_personalization_features` (the slim version actually called by `_score_and_rank`).
+- Also removed the unused `_AGE_DAYS_SCALE` constant.
+- `tests/test_pipeline.py::test_augment_features_properties` now imports from `legacy_features`. All 4 eval scripts updated to do the same.
+
+### 4. Collapse 7 discovery passes to a table-driven loop
+- The 7 numbered passes in `rerank_candidates` (uncertain / novel / similar / discussion-rich / high-engagement / hot / non-hn) were 95% identical boilerplate (filter → sort → take K → extend → prune). Replaced with a `DiscoveryPass` dataclass and a single loop over a list of 7 entries. ~130 lines → ~50 lines, and the 7 slot caps + predicates are visible in one place.
+- Public behavior unchanged; all 243 tests pass.
+
+### 5. Extract inline `<script>` to `static/dashboard.js`
+- 758-line inline `<script>` block extracted from `templates/index.html` to `static/dashboard.js`. Template shrank from 1726 → 968 lines; the script is now a real, syntax-highlightable, grep-able file. No build step.
+- Added a `/static/<path>` route handler in `server.py` (mimetype per `.js`/`.css`/`.svg`/`.png`/`.ico`, `no-cache` headers to match the dashboard HTML).
+- New helpers in `tests/test_server.py`: `_read_template_and_static()` and 2 new tests (`test_dashboard_js_loaded_via_static_endpoint`, `test_static_dashboard_js_has_no_jinja`).
+
+### 6. Extract prompt strings to `prompts/*.txt`
+- The 5 inline LLM prompt strings inside `generate_detailed_tldr` (server.py) are now 5 files in `prompts/`: `article_v4.txt`, `discussion_v4.txt`, `article_only_v4.txt`, `discussion_only_v4.txt`, `combined_v4.txt`. Loaded via a small cached `_load_prompt(name)` helper. Filenames are pinned to `TLDR_PROMPT_VERSION = "detail-v4"` so the cache key and file name stay in sync.
+- `server.py` shrank by ~150 lines.
+
+### 7. Consolidate HTTP fetch fallback
+- `_urllib_fetch` (Cloudflare TLS fingerprint workaround) and the "try httpx, fall back to urllib on 403/503" decision were duplicated in `pipeline.py` (RSS fetch) and `server.py` (article fetch). Extracted to a new `http_fetch.py` module with `urllib_fetch(url, ua)` and `fetch_with_urllib_fallback(client, url, headers)` helpers. Both call sites use the helper.
+- `_urllib_fetch` is re-exported from `pipeline.py` for backward compatibility with `server.py` and any other callers.
+
+### Final state
+- 243 tests pass, ruff clean, ty clean, server restarted cleanly.
+- LOC change: `pipeline.py` -108, `server.py` -150, `templates/index.html` -758, `eval*.py` +4 imports each, `legacy_features.py` +113 (new), `http_fetch.py` +60 (new), `static/dashboard.js` +760 (new), `prompts/*.txt` +145 (new).
+
 ## 2026-06-27 — Config-driven Discussion-rich badge threshold (default 90th pct)
 
 - **New config knobs `discussion_badge_percentile` (default 90.0) and `discussion_badge_min_comments` (default 0)** in `ModelConfig` and `config.toml`. The Discussion-rich threshold is now `max(np.percentile(nonzero_comments, pct), float(min_comments))` instead of hard-coded `np.percentile(nonzero_comments, 98)`.

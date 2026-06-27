@@ -24,7 +24,8 @@ import httpx
 
 from dataclasses import dataclass, replace
 from database import Database, User
-from pipeline import Config, Embedder, is_hn_source, _urllib_fetch
+from pipeline import Config, Embedder, is_hn_source
+from http_fetch import fetch_with_urllib_fallback
 
 ARTICLE_BODY_CHAR_LIMIT = 15_000
 SELF_TEXT_PROMPT_CHAR_LIMIT = 8_000
@@ -33,6 +34,15 @@ REDDIT_COMMENTS_CACHE_CHAR_LIMIT = 10_000
 REDDIT_COMMENT_LIMIT = 40
 REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dashboard"
 TLDR_PROMPT_VERSION = "detail-v4"
+_PROMPTS_DIR = Path(__file__).parent / "prompts"
+_PROMPT_CACHE: dict[str, str] = {}
+
+
+def _load_prompt(name: str) -> str:
+    """Read a prompt template from the prompts/ directory (cached after first load)."""
+    if name not in _PROMPT_CACHE:
+        _PROMPT_CACHE[name] = (_PROMPTS_DIR / name).read_text(encoding="utf-8")
+    return _PROMPT_CACHE[name]
 
 
 def _parse_retry_after(header_value: str | None, default: float = 1.0) -> float:
@@ -129,22 +139,10 @@ async def _fetch_article_body_with_result(url: str) -> ArticleFetchResult:
                 if resp.status_code == 200:
                     html = resp.text
                 elif resp.status_code in (403, 503) and attempt == 0:
-                    logging.info(
-                        "article %s: httpx %d, retrying with urllib",
-                        url,
-                        resp.status_code,
+                    status, html = await fetch_with_urllib_fallback(
+                        client, url, headers
                     )
-                    status, body = await asyncio.to_thread(
-                        _urllib_fetch, url, headers["User-Agent"]
-                    )
-                    if status == 200:
-                        html = body
-                    else:
-                        logging.warning(
-                            "article %s: urllib fallback returned %d",
-                            url,
-                            status,
-                        )
+                    if status != 200:
                         return ArticleFetchResult(
                             status=status,
                             error=f"http_{status}",
@@ -449,42 +447,12 @@ async def generate_detailed_tldr(
         return "No article body or discussion available to summarize for this story."
 
     if article_section and comments_section:
-        article_prompt = f"""Summarize the article for a knowledgeable reader.
-Use ONLY information from the text below.
-Write under 120 words.
-Return only 3-5 Markdown bullets.
-Use a FLAT structure — no nested list levels. If a sub-topic has multiple bullets, use a `####` heading for the sub-topic followed by top-level bullets — NEVER use `- **Label**:` to introduce a group of content bullets. Example:
-#### Criticism of US control
-- Users compare this to...
-- **Precedent exists** in...
-(NOT `- **Criticism of US control**:` followed by siblings.)
-Every non-empty output line must start with "- ".
-Use **bold** key terms.
-Keep each bullet to one short sentence.
-
-Title: {title}
-
-{article_section}
-"""
-        discussion_prompt = f"""Summarize the discussion for a knowledgeable reader.
-Use ONLY information from the comments below.
-Write under 150 words.
-Return only 2-4 Markdown bullets.
-Use a FLAT structure — no nested list levels. If a sub-topic has multiple bullets, use a `####` heading for the sub-topic followed by top-level bullets — NEVER use `- **Label**:` to introduce a group of content bullets. Example:
-#### Criticism of US control
-- Users compare this to...
-- **Precedent exists** in...
-(NOT `- **Criticism of US control**:` followed by siblings.)
-Every non-empty output line must start with "- ".
-Use labels like **Consensus:**, **Disagreement:**, and **Caveat:** when present.
-Do not put multiple bullets on one line.
-If the comments are thin or low-signal, say so explicitly.
-
-Story title: {title}
-
-Comments:
-{comments_section}
-"""
+        article_prompt = _load_prompt("article_v4.txt").format(
+            title=title, article_section=article_section
+        )
+        discussion_prompt = _load_prompt("discussion_v4.txt").format(
+            title=title, comments_section=comments_section
+        )
         try:
             article_result, discussion_result = await asyncio.gather(
                 _call_llm_chat(
@@ -527,54 +495,13 @@ Comments:
 
     # Article-only: no Discussion/Consensus mention in prompt at all
     if article_section_str and not comments_section_str:
-        prompt = f"""Summarize the article for a knowledgeable reader.
-Use ONLY information from the article below.
-
-Output ONE section only:
-
-### Article
-3-5 bullets, max 120 words.
-
-Markdown formatting:
-- FLAT structure only — no nested list levels.
-- Short bullet points (-) with **bold** key terms.
-- Keep each bullet point to a single short sentence.
-- Do not put multiple bullets on one line.
-
-Title: {title}
-{article_section_str}
-
-IMPORTANT:
-- Use ONLY information present in the article below. Do not expand on the topic with outside knowledge.
-- Do not invent content from the title alone.
-- Do NOT write a Discussion section. Do NOT use labels like **Consensus:**, **Disagreement:**, or **Caveat:**.
-"""
+        prompt = _load_prompt("article_only_v4.txt").format(
+            title=title, article_section=article_section_str
+        )
     elif comments_section_str and not article_section_str:
-        prompt = f"""Summarize the discussion for a knowledgeable reader.
-Use ONLY information from the comments below.
-
-Output ONE section only:
-
-### Discussion
-3-5 bullets, max 150 words, summarizing the comments.
-
-Markdown formatting:
-- FLAT structure only — no nested list levels.
-- Short bullet points (-) with **bold** key terms.
-- Keep each bullet point to a single short sentence.
-- Do not put multiple bullets on one line.
-- Use labels like **Consensus:**, **Disagreement:**, **Caveat:** when present.
-- If comments are thin or low-signal, say so explicitly.
-
-Story title: {title}
-
-Comments:
-{comments_section_str}
-
-IMPORTANT:
-- Use ONLY information present in the comments below. Do not expand on the topic with outside knowledge.
-- Do NOT write an Article or Story section. Do NOT summarize the title as if it were article content.
-"""
+        prompt = _load_prompt("discussion_only_v4.txt").format(
+            title=title, comments_section=comments_section_str
+        )
     else:
         content_section = f"Title: {title}"
         if self_text:
@@ -590,31 +517,7 @@ IMPORTANT:
                 f"\n\nComments:\n{top_comments[:COMMENT_PROMPT_CHAR_LIMIT]}"
             )
 
-        prompt = f"""Summarize for a knowledgeable reader.
-Use ONLY information from the text below.
-
-Output TWO sections:
-
-### Article
-2-3 bullets, max 120 words.
-### Discussion
-3-5 bullets, max 150 words, summarizing the comments.
-
-Markdown formatting:
-- FLAT structure only — no nested list levels.
-- Short bullet points (-) with **bold** key terms.
-- Keep each bullet point to a single short sentence.
-- Do not put multiple bullets on one line.
-- Use labels like **Consensus:**, **Disagreement:**, **Caveat:** when present in the discussion.
-- If comments are thin or low-signal, say so explicitly.
-
-{content_section}
-
-IMPORTANT:
-- Use ONLY information present in the text below. Do not expand on the topic with outside knowledge.
-- Do not invent article content from the title alone.
-- Do not exceed the per-section word and bullet limits above.
-"""
+        prompt = _load_prompt("combined_v4.txt").format(content_section=content_section)
 
     try:
         result = await _call_llm_chat(
@@ -668,6 +571,36 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = self.path.split("?")[0]
+
+        # Static files (e.g. /static/dashboard.js)
+        if path.startswith("/static/"):
+            static_dir = Path(__file__).parent / "static"
+            rel = path[len("/static/") :]
+            if ".." in rel or rel.startswith("/"):
+                self.send_error(HTTPStatus.BAD_REQUEST)
+                return
+            file_path = static_dir / rel
+            if not file_path.is_file():
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            ext = file_path.suffix.lower()
+            mime = {
+                ".js": "application/javascript; charset=utf-8",
+                ".css": "text/css; charset=utf-8",
+                ".svg": "image/svg+xml",
+                ".png": "image/png",
+                ".ico": "image/x-icon",
+            }.get(ext, "application/octet-stream")
+            body = file_path.read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+            self.end_headers()
+            self.wfile.write(body)
+            return
 
         # Token-based user session
         if path.startswith("/u/"):

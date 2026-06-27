@@ -21,10 +21,10 @@ from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
 
 from database import Database, Story
+from legacy_features import _augment_features
 from pipeline import (
     Config,
     RankedStory,
-    _augment_features,
     _knn_similarity,
     is_hn_source,
     mmr_filter,

@@ -24,10 +24,10 @@ from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
 
 from database import Database, Story
+from legacy_features import _augment_features
 from pipeline import (
     Config,
     RankedStory,
-    _augment_features,
     _knn_similarity,
     is_hn_source,
     mmr_filter,
@@ -49,16 +49,16 @@ def _load_candidates(db: Database) -> tuple[list[Story], np.ndarray]:
         "       self_text, top_comments, article_body "
         "FROM stories WHERE text_content != ''"
     )
-    stories = [
-        Database._row_to_story(row)
-        for row in rows
-    ]
+    stories = [Database._row_to_story(row) for row in rows]
     import hashlib
+
     story_hashes = {
         s.id: hashlib.sha256(s.text_content.encode("utf-8")).hexdigest()
         for s in stories
     }
-    cached = db.get_embeddings_batch([s.id for s in stories], MODEL_VERSION, story_hashes)
+    cached = db.get_embeddings_batch(
+        [s.id for s in stories], MODEL_VERSION, story_hashes
+    )
     embeddings = np.array(
         [cached.get(s.id, np.zeros(384, dtype=np.float32)) for s in stories],
         dtype=np.float32,
@@ -215,9 +215,7 @@ def main() -> None:
         raise RuntimeError("Missing default user token")
 
     # Feedback
-    fb_stories, fb_labels, fb_vote_times = db.get_feedback_for_training(
-        user_id=user.id
-    )
+    fb_stories, fb_labels, fb_vote_times = db.get_feedback_for_training(user_id=user.id)
     fb_labels = np.array(fb_labels, dtype=int)
     fb_vote_times = np.array(fb_vote_times, dtype=np.float64)
     print(f"Feedback: {len(fb_stories)} rows ({Counter(fb_labels)})")
@@ -425,7 +423,9 @@ def main() -> None:
 
         emb_dim = cand_emb.shape[1]
         scaler = StandardScaler()
-        X_train_meta_scaled = np.clip(scaler.fit_transform(X_train[:, emb_dim:]), -2.5, 2.5)
+        X_train_meta_scaled = np.clip(
+            scaler.fit_transform(X_train[:, emb_dim:]), -2.5, 2.5
+        )
         X_cand_meta_scaled = np.clip(scaler.transform(X_cand[:, emb_dim:]), -2.5, 2.5)
 
         X_train_scaled = np.hstack([X_train[:, :emb_dim], X_train_meta_scaled])
@@ -460,9 +460,14 @@ def main() -> None:
         ]
         X_train_strip[:, strip] = 0.0
         X_cand_strip[:, strip] = 0.0
-        svm_s = SVC(C=config.model.svm_c, kernel=config.model.svm_kernel,
-                     gamma=config.model.svm_gamma, random_state=0,
-                     decision_function_shape="ovr", probability=True)
+        svm_s = SVC(
+            C=config.model.svm_c,
+            kernel=config.model.svm_kernel,
+            gamma=config.model.svm_gamma,
+            random_state=0,
+            decision_function_shape="ovr",
+            probability=True,
+        )
         svm_s.fit(X_train_strip, y_train, sample_weight=weights)
         probs_strip = svm_s.predict_proba(X_cand_strip)
 
