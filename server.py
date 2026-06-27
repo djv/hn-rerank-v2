@@ -24,7 +24,7 @@ import httpx
 
 from dataclasses import dataclass, replace
 from database import Database, User
-from pipeline import Config, Embedder, is_hn_source
+from pipeline import Config, Embedder, is_hn_source, _urllib_fetch
 
 ARTICLE_BODY_CHAR_LIMIT = 15_000
 SELF_TEXT_PROMPT_CHAR_LIMIT = 8_000
@@ -32,7 +32,17 @@ COMMENT_PROMPT_CHAR_LIMIT = 12_000
 REDDIT_COMMENTS_CACHE_CHAR_LIMIT = 10_000
 REDDIT_COMMENT_LIMIT = 40
 REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dashboard"
-TLDR_PROMPT_VERSION = "detail-v3"
+TLDR_PROMPT_VERSION = "detail-v4"
+
+
+def _parse_retry_after(header_value: str | None, default: float = 1.0) -> float:
+    if not header_value:
+        return default
+    try:
+        seconds = float(header_value)
+    except ValueError:
+        return default
+    return max(0.0, min(seconds, 10.0))
 
 
 def _normalize_tldr_markdown(text: str) -> str:
@@ -116,13 +126,35 @@ async def _fetch_article_body_with_result(url: str) -> ArticleFetchResult:
                 if resp.status_code in (429, 503) and attempt == 0:
                     await asyncio.sleep(1)
                     continue
-                if resp.status_code != 200:
+                if resp.status_code == 200:
+                    html = resp.text
+                elif resp.status_code in (403, 503) and attempt == 0:
+                    logging.info(
+                        "article %s: httpx %d, retrying with urllib",
+                        url,
+                        resp.status_code,
+                    )
+                    status, body = await asyncio.to_thread(
+                        _urllib_fetch, url, headers["User-Agent"]
+                    )
+                    if status == 200:
+                        html = body
+                    else:
+                        logging.warning(
+                            "article %s: urllib fallback returned %d",
+                            url,
+                            status,
+                        )
+                        return ArticleFetchResult(
+                            status=status,
+                            error=f"http_{status}",
+                        )
+                else:
                     return ArticleFetchResult(
                         status=resp.status_code,
                         error=f"http_{resp.status_code}",
                         permanent=resp.status_code in (404, 410),
                     )
-                html = resp.text
         except Exception as e:
             return ArticleFetchResult(error=type(e).__name__)
 
@@ -337,17 +369,25 @@ async def _call_llm_chat(
         "max_tokens": max_tokens,
     }
     async with httpx.AsyncClient(timeout=45.0) as client:
-        resp = await client.post(
-            base_url,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            return data["choices"][0]["message"]["content"]
+        for attempt in range(3):
+            resp = await client.post(
+                base_url,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return data["choices"][0]["message"]["content"]
+            if resp.status_code in (429, 503) and attempt < 2:
+                delay = _parse_retry_after(
+                    resp.headers.get("Retry-After"), default=2**attempt
+                )
+                await asyncio.sleep(delay)
+                continue
+            break
         return f"Error from LLM Provider: HTTP {resp.status_code} - {resp.text}"
 
 
@@ -462,6 +502,10 @@ Comments:
                     max_tokens=900,
                 ),
             )
+            if article_result.startswith("Error"):
+                return article_result
+            if discussion_result.startswith("Error"):
+                return discussion_result
             article_result = _normalize_tldr_markdown(article_result)
             discussion_result = _normalize_tldr_markdown(discussion_result)
             return (
@@ -470,37 +514,94 @@ Comments:
         except Exception as e:
             return f"Error executing LLM call: {str(e)}"
 
-    content_section = f"Title: {title}"
+    article_section_str = ""
     if self_text:
-        content_section += (
+        article_section_str += (
             f"\n\nAuthor's text:\n{self_text[:SELF_TEXT_PROMPT_CHAR_LIMIT]}"
         )
     if article_body:
-        content_section += (
+        article_section_str += (
             f"\n\nArticle body:\n{article_body[:ARTICLE_BODY_CHAR_LIMIT]}"
         )
-    if top_comments:
-        content_section += f"\n\nComments:\n{top_comments[:COMMENT_PROMPT_CHAR_LIMIT]}"
+    comments_section_str = top_comments[:COMMENT_PROMPT_CHAR_LIMIT]
 
-    prompt = f"""Summarize for a knowledgeable reader.
+    # Article-only: no Discussion/Consensus mention in prompt at all
+    if article_section_str and not comments_section_str:
+        prompt = f"""Summarize the article for a knowledgeable reader.
+Use ONLY information from the article below.
+
+Output ONE section only:
+
+### Article
+3-5 bullets, max 120 words.
+
+Markdown formatting:
+- FLAT structure only — no nested list levels.
+- Short bullet points (-) with **bold** key terms.
+- Keep each bullet point to a single short sentence.
+- Do not put multiple bullets on one line.
+
+Title: {title}
+{article_section_str}
+
+IMPORTANT:
+- Use ONLY information present in the article below. Do not expand on the topic with outside knowledge.
+- Do not invent content from the title alone.
+- Do NOT write a Discussion section. Do NOT use labels like **Consensus:**, **Disagreement:**, or **Caveat:**.
+"""
+    elif comments_section_str and not article_section_str:
+        prompt = f"""Summarize the discussion for a knowledgeable reader.
+Use ONLY information from the comments below.
+
+Output ONE section only:
+
+### Discussion
+3-5 bullets, max 150 words, summarizing the comments.
+
+Markdown formatting:
+- FLAT structure only — no nested list levels.
+- Short bullet points (-) with **bold** key terms.
+- Keep each bullet point to a single short sentence.
+- Do not put multiple bullets on one line.
+- Use labels like **Consensus:**, **Disagreement:**, **Caveat:** when present.
+- If comments are thin or low-signal, say so explicitly.
+
+Story title: {title}
+
+Comments:
+{comments_section_str}
+
+IMPORTANT:
+- Use ONLY information present in the comments below. Do not expand on the topic with outside knowledge.
+- Do NOT write an Article or Story section. Do NOT summarize the title as if it were article content.
+"""
+    else:
+        content_section = f"Title: {title}"
+        if self_text:
+            content_section += (
+                f"\n\nAuthor's text:\n{self_text[:SELF_TEXT_PROMPT_CHAR_LIMIT]}"
+            )
+        if article_body:
+            content_section += (
+                f"\n\nArticle body:\n{article_body[:ARTICLE_BODY_CHAR_LIMIT]}"
+            )
+        if top_comments:
+            content_section += (
+                f"\n\nComments:\n{top_comments[:COMMENT_PROMPT_CHAR_LIMIT]}"
+            )
+
+        prompt = f"""Summarize for a knowledgeable reader.
 Use ONLY information from the text below.
 
-Output structure (STRICT — follow exactly):
-- If "Article body" or "Author's text" is present in the content below, output TWO sections:
-    ### Article
-    2-3 bullets, max 120 words, summarizing the article.
-    ### Discussion
-    3-5 bullets, max 150 words, summarizing the comments.
-- If ONLY "Title" and "Comments" are present (no article text), output ONE section:
-    ### Discussion
-    3-5 bullets, max 150 words, summarizing the comments.
-  Do NOT write an Article or Story section. Do NOT summarize the title as if it were article content.
-- If ONLY "Article body" or "Author's text" is present (no comments), output ONE section:
-    ### Article
-    3-5 bullets, max 120 words.
+Output TWO sections:
 
-Markdown formatting (apply to all sections):
-- FLAT structure only — no nested list levels. If a bullet ends with `:`, treat the following sub-points as separate top-level bullets, not as indented children.
+### Article
+2-3 bullets, max 120 words.
+### Discussion
+3-5 bullets, max 150 words, summarizing the comments.
+
+Markdown formatting:
+- FLAT structure only — no nested list levels.
 - Short bullet points (-) with **bold** key terms.
 - Keep each bullet point to a single short sentence.
 - Do not put multiple bullets on one line.
@@ -528,6 +629,11 @@ IMPORTANT:
         return f"Error executing LLM call: {str(e)}"
 
 
+SKELETON_HTML = b"""<!DOCTYPE html>
+<html><head><meta http-equiv="refresh" content="3"></head>
+<body><p>Loading your personalized dashboard...</p></body></html>"""
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "HNRewrite/1.0"
     config: Config
@@ -539,6 +645,9 @@ class Handler(BaseHTTPRequestHandler):
     _dashboard_versions_guard = threading.Lock()
     _render_locks: dict[int, threading.Lock] = {}
     _render_locks_guard = threading.Lock()
+    _warmup_in_flight: set[tuple[int, int]] = set()
+    _warmup_in_flight_guard = threading.Lock()
+    _WARM_DEBOUNCE_S: float = 1.0
 
     def _get_user(self) -> User | None:
         """Extract user from cookie token."""
@@ -622,77 +731,46 @@ class Handler(BaseHTTPRequestHandler):
     def _render_dashboard_for_user(
         cls, user: User, expected_version: int | None = None
     ) -> bytes:
-        """Render personalized dashboard for user. Uses short-lived cache."""
+        """Render personalized dashboard with SWR semantics."""
         request_start = time.perf_counter()
-        now = time.time()
         cache_key = f"dashboard_{user.id}"
         if expected_version is None:
             expected_version = cls._dashboard_version(user.id)
 
         cached = cls._dashboard_cache.get(cache_key)
-        if cached and cached[2] == expected_version and now - cached[1] < 300:
+
+        # Cache hit with matching version → return immediately
+        if cached and cached[2] == expected_version:
             logging.info(
                 "dashboard_render user_id=%s version=%s result=cache_hit elapsed_ms=%.1f cache_age_s=%.1f",
                 user.id,
                 expected_version,
                 (time.perf_counter() - request_start) * 1000,
-                now - cached[1],
+                time.time() - cached[1],
             )
             return cached[0]
 
-        lock = cls._get_render_lock(user.id)
-        lock_wait_start = time.perf_counter()
-        with lock:
-            lock_wait_ms = (time.perf_counter() - lock_wait_start) * 1000
-            now = time.time()
-            cached = cls._dashboard_cache.get(cache_key)
-            if cached and cached[2] == expected_version and now - cached[1] < 300:
-                logging.info(
-                    "dashboard_render user_id=%s version=%s result=cache_hit_after_lock elapsed_ms=%.1f lock_wait_ms=%.1f cache_age_s=%.1f",
-                    user.id,
-                    expected_version,
-                    (time.perf_counter() - request_start) * 1000,
-                    lock_wait_ms,
-                    now - cached[1],
-                )
-                return cached[0]
-
-            from pipeline import fast_rerank_for_user, generate_dashboard_bytes
-            from pipeline import prewarm_top_stories
-
-            render_start = time.perf_counter()
-            final = fast_rerank_for_user(cls.db, cls.config, cls.embedder, user.id)
-            rank_ms = (time.perf_counter() - render_start) * 1000
-
-            prewarm_start = time.perf_counter()
-            prewarm_ids = [r.story.id for r in final[:20] if r.story.id > 0]
-            prewarmed = prewarm_top_stories(prewarm_ids, cls.db, cls.embedder)
-            prewarm_ms = (time.perf_counter() - prewarm_start) * 1000
-
-            html_start = time.perf_counter()
-            html = generate_dashboard_bytes(
-                final, cls.config, cls.db, user.id, user.token
-            )
-            html_ms = (time.perf_counter() - html_start) * 1000
-
-            cache_written = False
-            if cls._dashboard_version(user.id) == expected_version:
-                cls._dashboard_cache[cache_key] = (html, now, expected_version)
-                cache_written = True
+        # Stale cache (wrong version) → return stale, trigger warm
+        if cached:
             logging.info(
-                "dashboard_render user_id=%s version=%s result=rendered elapsed_ms=%.1f lock_wait_ms=%.1f rank_ms=%.1f prewarm_ms=%.1f prewarmed=%s html_ms=%.1f stories=%s cache_written=%s",
+                "dashboard_render user_id=%s version=%s result=stale_hit cache_version=%s elapsed_ms=%.1f",
                 user.id,
                 expected_version,
+                cached[2],
                 (time.perf_counter() - request_start) * 1000,
-                lock_wait_ms,
-                rank_ms,
-                prewarm_ms,
-                prewarmed,
-                html_ms,
-                len(final),
-                cache_written,
             )
-            return html
+            cls._trigger_warm(user, expected_version)
+            return cached[0]
+
+        # No cache → return skeleton, trigger warm
+        logging.info(
+            "dashboard_render user_id=%s version=%s result=skeleton elapsed_ms=%.1f",
+            user.id,
+            expected_version,
+            (time.perf_counter() - request_start) * 1000,
+        )
+        cls._trigger_warm(user, expected_version)
+        return SKELETON_HTML
 
     @classmethod
     def _get_render_lock(cls, user_id: int) -> threading.Lock:
@@ -710,8 +788,6 @@ class Handler(BaseHTTPRequestHandler):
 
     @classmethod
     def _invalidate_dashboard_cache(cls, user_id: int) -> int:
-        cache_key = f"dashboard_{user_id}"
-        cls._dashboard_cache.pop(cache_key, None)
         with cls._dashboard_versions_guard:
             version = cls._dashboard_versions.get(user_id, 0) + 1
             cls._dashboard_versions[user_id] = version
@@ -721,34 +797,92 @@ class Handler(BaseHTTPRequestHandler):
             return version
 
     @classmethod
-    def _schedule_dashboard_warm(cls, user: User, version: int) -> None:
+    def _trigger_warm(cls, user: User, version: int) -> None:
+        key = (user.id, version)
+        with cls._warmup_in_flight_guard:
+            if key in cls._warmup_in_flight:
+                return
+            cls._warmup_in_flight.add(key)
+
         def warm() -> None:
-            # Debounce click streaks so consecutive votes produce one warmed render.
             warm_start = time.perf_counter()
-            time.sleep(1.0)
-            with cls._dashboard_versions_guard:
-                if cls._dashboard_versions.get(user.id) != version:
+            try:
+                time.sleep(cls._WARM_DEBOUNCE_S)
+                with cls._dashboard_versions_guard:
+                    if cls._dashboard_versions.get(user.id, 0) != version:
+                        logging.info(
+                            "dashboard_warm user_id=%s version=%s result=skipped_stale elapsed_ms=%.1f",
+                            user.id,
+                            version,
+                            (time.perf_counter() - warm_start) * 1000,
+                        )
+                        return
+
+                lock = cls._get_render_lock(user.id)
+                with lock:
+                    cached = cls._dashboard_cache.get(f"dashboard_{user.id}")
+                    if cached and cached[2] == version:
+                        return
+
+                    from pipeline import fast_rerank_for_user, generate_dashboard_bytes
+
+                    render_start = time.perf_counter()
+                    final = fast_rerank_for_user(
+                        cls.db, cls.config, cls.embedder, user.id
+                    )
+                    rank_ms = (time.perf_counter() - render_start) * 1000
+
+                    html_start = time.perf_counter()
+                    html = generate_dashboard_bytes(
+                        final, cls.config, cls.db, user.id, user.token
+                    )
+                    html_ms = (time.perf_counter() - html_start) * 1000
+
+                    cls._dashboard_cache[f"dashboard_{user.id}"] = (
+                        html,
+                        time.time(),
+                        version,
+                    )
+                    cls._enforce_cache_cap()
+
                     logging.info(
-                        "dashboard_warm user_id=%s version=%s result=skipped_stale elapsed_ms=%.1f",
+                        "dashboard_warm user_id=%s version=%s result=completed rank_ms=%.1f html_ms=%.1f stories=%s",
                         user.id,
                         version,
-                        (time.perf_counter() - warm_start) * 1000,
+                        rank_ms,
+                        html_ms,
+                        len(final),
                     )
-                    return
-            try:
-                cls._render_dashboard_for_user(user, expected_version=version)
-                logging.info(
-                    "dashboard_warm user_id=%s version=%s result=completed elapsed_ms=%.1f",
-                    user.id,
-                    version,
-                    (time.perf_counter() - warm_start) * 1000,
-                )
             except Exception as e:
                 logging.exception(
                     "Failed warming dashboard cache for user_id=%s: %s", user.id, e
                 )
+            finally:
+                with cls._warmup_in_flight_guard:
+                    cls._warmup_in_flight.discard(key)
 
         threading.Thread(target=warm, daemon=True).start()
+
+    @classmethod
+    def _enforce_cache_cap(cls, max_entries: int = 100) -> None:
+        if len(cls._dashboard_cache) <= max_entries:
+            return
+        keys = sorted(
+            cls._dashboard_cache.keys(),
+            key=lambda k: cls._dashboard_cache[k][1],
+        )
+        for k in keys[:-max_entries]:
+            del cls._dashboard_cache[k]
+
+    @classmethod
+    def _bump_all_cached_versions(cls) -> None:
+        with cls._dashboard_versions_guard:
+            for uid in list(cls._dashboard_versions.keys()):
+                cls._dashboard_versions[uid] += 1
+        logging.info(
+            "bump_all_cached_versions count=%s",
+            len(cls._dashboard_versions),
+        )
 
     @staticmethod
     def _feedback_should_refresh(data: dict) -> bool:
@@ -784,7 +918,7 @@ class Handler(BaseHTTPRequestHandler):
                 if ranking_refresh_queued:
                     # Invalidate user's dashboard cache and warm the next render async.
                     version = self._invalidate_dashboard_cache(user.id)
-                    self._schedule_dashboard_warm(user, version)
+                    self._trigger_warm(user, version)
 
                     # Also trigger background regen for candidate updates
                     self.regen_event.set()
@@ -977,7 +1111,7 @@ class Handler(BaseHTTPRequestHandler):
                         article_body=article_body or "",
                     )
                 )
-                if tldr:
+                if tldr and not tldr.startswith("Error"):
                     self.db.upsert_tldr_cache(story.id, cache_key, tldr)
                     logging.info(
                         "tldr_detail story_id=%s result=generated cache_key=%s",
@@ -985,6 +1119,13 @@ class Handler(BaseHTTPRequestHandler):
                         cache_key[:12],
                     )
                     self._json_response({"ok": True, "tldr": tldr, "cached": False})
+                elif tldr:
+                    logging.warning(
+                        "tldr_detail story_id=%s result=llm_error cache_key=%s",
+                        story.id,
+                        cache_key[:12],
+                    )
+                    self._json_response({"error": tldr}, status=503)
                 else:
                     self._json_response(
                         {"error": "Failed to generate TLDR"}, status=500
@@ -1017,6 +1158,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
     logging.info("Starting background regeneration loop...")
+    embedder = Handler.embedder
     while True:
         # Wait on event or timeout
         triggered = event.wait(timeout=config.regen_interval_seconds)
@@ -1029,7 +1171,8 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
         try:
             from pipeline import fetch_candidates_only
 
-            asyncio.run(fetch_candidates_only(config, db))
+            asyncio.run(fetch_candidates_only(config, db, embedder=embedder))
+            Handler._bump_all_cached_versions()
             logging.info("Regeneration complete.")
         except Exception as e:
             logging.exception(f"Background regeneration failed: {e}")
