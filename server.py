@@ -32,7 +32,7 @@ COMMENT_PROMPT_CHAR_LIMIT = 12_000
 REDDIT_COMMENTS_CACHE_CHAR_LIMIT = 10_000
 REDDIT_COMMENT_LIMIT = 40
 REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dashboard"
-TLDR_PROMPT_VERSION = "detail-v2"
+TLDR_PROMPT_VERSION = "detail-v3"
 
 
 def _normalize_tldr_markdown(text: str) -> str:
@@ -405,6 +405,9 @@ async def generate_detailed_tldr(
         )
     comments_section = top_comments[:COMMENT_PROMPT_CHAR_LIMIT]
 
+    if not article_section and not top_comments:
+        return "No article body or discussion available to summarize for this story."
+
     if article_section and comments_section:
         article_prompt = f"""Summarize the article for a knowledgeable reader.
 Use ONLY information from the text below.
@@ -425,7 +428,7 @@ Title: {title}
 """
         discussion_prompt = f"""Summarize the discussion for a knowledgeable reader.
 Use ONLY information from the comments below.
-Write under 100 words.
+Write under 150 words.
 Return only 2-4 Markdown bullets.
 Use a FLAT structure — no nested list levels. If a sub-topic has multiple bullets, use a `####` heading for the sub-topic followed by top-level bullets — NEVER use `- **Label**:` to introduce a group of content bullets. Example:
 #### Criticism of US control
@@ -479,22 +482,37 @@ Comments:
     if top_comments:
         content_section += f"\n\nComments:\n{top_comments[:COMMENT_PROMPT_CHAR_LIMIT]}"
 
-    prompt = f"""Summarize the article and the discussion for a knowledgeable reader.
+    prompt = f"""Summarize for a knowledgeable reader.
 Use ONLY information from the text below.
-Write a highly concise, scannable summary (under 240 words) optimized for an 11-inch screen to conserve vertical space.
-Use Markdown formatting:
+
+Output structure (STRICT — follow exactly):
+- If "Article body" or "Author's text" is present in the content below, output TWO sections:
+    ### Article
+    2-3 bullets, max 120 words, summarizing the article.
+    ### Discussion
+    3-5 bullets, max 150 words, summarizing the comments.
+- If ONLY "Title" and "Comments" are present (no article text), output ONE section:
+    ### Discussion
+    3-5 bullets, max 150 words, summarizing the comments.
+  Do NOT write an Article or Story section. Do NOT summarize the title as if it were article content.
+- If ONLY "Article body" or "Author's text" is present (no comments), output ONE section:
+    ### Article
+    3-5 bullets, max 120 words.
+
+Markdown formatting (apply to all sections):
 - FLAT structure only — no nested list levels. If a bullet ends with `:`, treat the following sub-points as separate top-level bullets, not as indented children.
-- Headings (###) for main sections.
 - Short bullet points (-) with **bold** key terms.
 - Keep each bullet point to a single short sentence.
 - Do not put multiple bullets on one line.
+- Use labels like **Consensus:**, **Disagreement:**, **Caveat:** when present in the discussion.
+- If comments are thin or low-signal, say so explicitly.
 
 {content_section}
 
 IMPORTANT:
-- Use ONLY information from the article text. Do not expand on the topic with outside knowledge.
-- If the article has very few or no comments do not invent discussion.
-- If the text below is just a title and no substantive content, say so explicitly.
+- Use ONLY information present in the text below. Do not expand on the topic with outside knowledge.
+- Do not invent article content from the title alone.
+- Do not exceed the per-section word and bullet limits above.
 """
 
     try:

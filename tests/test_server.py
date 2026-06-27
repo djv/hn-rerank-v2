@@ -20,13 +20,8 @@ def test_env(tmp_path):
     # Create test user
     user = db.create_user("test_token")
 
-    output_file = tmp_path / "public" / "index.html"
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    output_file.write_text("<html>Test Dashboard</html>", encoding="utf-8")
-
     config = Config(
         db_path=str(db_file),
-        output=str(output_file),
         server_port=0,
     )
 
@@ -58,7 +53,7 @@ def test_env(tmp_path):
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
 
-    yield port, db, regen_event, output_file, user
+    yield port, db, regen_event, None, user
 
     server.socket.shutdown(socket.SHUT_RDWR)
     server.shutdown()
@@ -990,6 +985,61 @@ async def test_tldr_prompt_forbids_nested_lists(monkeypatch):
             f"prompt missing flat-structure rule: {prompt[:200]}"
         )
         assert "####" in prompt, f"prompt missing #### sub-topic rule: {prompt[:200]}"
+
+
+async def test_unified_fallback_omits_article_when_no_article_body(
+    monkeypatch,
+) -> None:
+    """Discussion-only stories must not produce an ### Article or ### Story section."""
+    import server
+
+    captured: dict = {}
+
+    async def mock_call_llm_chat(*, api_key, base_url, model, prompt, max_tokens):
+        captured["prompt"] = prompt
+        captured["max_tokens"] = max_tokens
+        return "- **Discussion** summary"
+
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setattr(server, "_call_llm_chat", mock_call_llm_chat)
+
+    result = await server.generate_detailed_tldr(
+        "Story links to OpenAI",
+        self_text="",
+        top_comments="comment 1\ncomment 2",
+        article_body="",
+    )
+
+    assert "### Article" not in result
+    assert "### Story" not in result
+    assert "Do NOT write an Article or Story section" in captured["prompt"]
+    assert "Do NOT summarize the title" in captured["prompt"]
+
+
+async def test_generate_detailed_tldr_returns_stub_when_no_content(
+    monkeypatch,
+) -> None:
+    """No article + no comments → short stub, zero LLM calls."""
+    import server
+
+    calls: list = []
+
+    async def mock_call_llm_chat(*, api_key, base_url, model, prompt, max_tokens):
+        calls.append(prompt)
+        return "should not be called"
+
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setattr(server, "_call_llm_chat", mock_call_llm_chat)
+
+    result = await server.generate_detailed_tldr(
+        "Empty story",
+        self_text="",
+        top_comments="",
+        article_body="",
+    )
+
+    assert calls == []
+    assert "No article body or discussion" in result
 
 
 def test_keydown_guard_excludes_buttons_and_anchors():

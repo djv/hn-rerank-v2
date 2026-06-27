@@ -4,8 +4,6 @@
 
 - This repository is a minimalist, local-first Hacker News reranking dashboard rewrite.
 - Use `uv run python <script>.py` or standard `uv` commands to execute scripts and run tests.
-- Treat `public/` as generated output unless a task explicitly targets it.
-
 ## Working rules
 
 - Make minimal, behavior-preserving changes unless the user asks for a broader refactor.
@@ -95,7 +93,6 @@ runtime dep (e.g. jax, tensorflow), give it its own
 direct dep.
 
 - Run persistent server: `systemctl --user {status|start|stop|restart} hn_rewrite.service` (or directly: `uv run python server.py`)
-- Run one-shot generation: `uv run python generate.py`
 - Migrate feedback from legacy JSON: `uv run python migrate_feedback.py`
 - **Primary archive seeder** — ClickHouse (no GCP auth, 10-30x faster, real-time scores):
   `uv run python scripts/seed_hn_from_clickhouse.py` (default: 6 months, score ≥ 200)

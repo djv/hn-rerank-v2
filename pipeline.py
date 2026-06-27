@@ -84,7 +84,6 @@ class RssConfig:
 @dataclass(frozen=True)
 class Config:
     db_path: str = "hn_rewrite.db"
-    output: str = "public/index.html"
     days: int = 30
     count: int = 40
     onnx_model_dir: str = "onnx_model"
@@ -110,7 +109,6 @@ class Config:
 
         return cls(
             db_path=main_cfg.get("db_path", "hn_rewrite.db"),
-            output=main_cfg.get("output", "public/index.html"),
             days=main_cfg.get("days", 30),
             count=main_cfg.get("count", 40),
             onnx_model_dir=main_cfg.get("onnx_model_dir", "onnx_model"),
@@ -1632,40 +1630,6 @@ def source_label_filter(source: str) -> str:
     return label.replace("_", ".")
 
 
-def generate_dashboard(
-    ranked: list[RankedStory],
-    output_path: Path,
-    timestamp: str,
-    server_port: int,
-    db: Database,
-    user_id: int | None = None,
-) -> None:
-    env = Environment(loader=FileSystemLoader("templates"), autoescape=True)
-    env.filters["time_ago"] = time_ago_filter
-    env.filters["source_label"] = source_label_filter
-
-    pico_css_path = Path("templates/pico.min.css")
-    pico_css = (
-        pico_css_path.read_text(encoding="utf-8") if pico_css_path.exists() else ""
-    )
-
-    # Map user feedback in database for active UI state highlighting
-    all_fb = db.get_all_feedback(user_id=user_id)
-    fb_map = {f.story_id: f.action for f in all_fb}
-
-    template = env.get_template("index.html")
-    html_content = template.render(
-        timestamp=timestamp,
-        stories=ranked,
-        server_port=server_port,
-        pico_css=pico_css,
-        fb_map=fb_map,
-    )
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(html_content, encoding="utf-8")
-
-
 def rerank_candidates(
     db: Database,
     config: Config,
@@ -2096,119 +2060,6 @@ async def fetch_and_cache_article_bodies(
 
     results = await asyncio.gather(*(fetch_one(story) for story in stories))
     return {sid: updated for sid, updated in results if updated is not None}
-
-
-# Orchestrator
-async def run_pipeline(config: Config) -> None:
-    db = Database(config.db_path)
-    embedder = Embedder(config.onnx_model_dir)
-
-    # Exclude stories that already have user feedback (voted on via dashboard)
-    feedback_records = db.get_all_feedback()
-    feedback_ids = {f.story_id for f in feedback_records}
-    feedback_urls = {f.url for f in feedback_records if f.url}
-
-    exclude_ids = feedback_ids
-    candidates, n_fetched = await fetch_candidates(
-        config, exclude_ids, feedback_urls, db, embedder
-    )
-    logging.info(f"Fetched {n_fetched} candidates (excluded {len(exclude_ids)})")
-
-    t0 = time.perf_counter()
-    cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
-    elapsed_ms = int((time.perf_counter() - t0) * 1000)
-    logging.info(f"Embedded {cand_embeddings.shape[0]} candidates in {elapsed_ms}ms")
-
-    ranked = rank_stories(
-        candidates,
-        cand_embeddings,
-        db,
-        config,
-        embedder,
-    )
-    top_score = max((r.score for r in ranked), default=0.0)
-    logging.info(f"Ranked {len(ranked)} stories, top_score={top_score:.3f}")
-
-    final = rerank_candidates(
-        db=db,
-        config=config,
-        embedder=embedder,
-        candidates=candidates,
-        cand_embeddings=cand_embeddings,
-    )
-    fetch_targets = select_article_fetch_candidates(
-        ranked=ranked,
-        dashboard_selected=final,
-        db=db,
-        max_per_run=config.article_fetch_max_per_run,
-        max_age_days=config.article_fetch_max_age_days,
-    )
-    if fetch_targets:
-        logging.info(
-            "Proactively fetching article bodies for %s candidates "
-            "(limit=%s, concurrency=%s)",
-            len(fetch_targets),
-            config.article_fetch_max_per_run,
-            config.article_fetch_concurrency,
-        )
-        updated_map = await fetch_and_cache_article_bodies(
-            db=db,
-            embedder=embedder,
-            stories=fetch_targets,
-            concurrency=config.article_fetch_concurrency,
-        )
-
-        if updated_map:
-            for idx, s in enumerate(candidates):
-                if s.id in updated_map:
-                    candidates[idx] = updated_map[s.id]
-
-            cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
-            ranked = rank_stories(
-                candidates,
-                cand_embeddings,
-                db,
-                config,
-                embedder,
-            )
-            top_score = max((r.score for r in ranked), default=0.0)
-            logging.info(
-                "Re-ranked %s stories after %s proactive article fetches, "
-                "top_score=%.3f",
-                len(ranked),
-                len(updated_map),
-                top_score,
-            )
-            final = rerank_candidates(
-                db=db,
-                config=config,
-                embedder=embedder,
-                candidates=candidates,
-                cand_embeddings=cand_embeddings,
-            )
-
-    selection_mode = "MMR" if config.model.enable_mmr else "top-ranked"
-    logging.info(
-        f"Selected {selection_mode} stories: {len(final)} of {len(ranked)} kept"
-    )
-    pu_vals = [r.prob_up for r in final if r.prob_up is not None]
-    pu_lo = min(pu_vals) if pu_vals else 0.0
-    pu_hi = max(pu_vals) if pu_vals else 0.0
-    logging.info(
-        f"Generating dashboard: {len(final)} stories, prob_up range {pu_lo:.3f}–{pu_hi:.3f}"
-    )
-    generate_dashboard(
-        final,
-        Path(config.output),
-        datetime.now().strftime("%Y-%m-%d %H:%M"),
-        config.server_port,
-        db,
-    )
-
-    pruned = db.prune_stories(max_age_days=config.days * 2)
-    logging.info(f"Pruned {pruned} old stories")
-    db.close()
-    logging.info("Done.")
 
 
 def generate_dashboard_bytes(

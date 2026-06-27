@@ -1177,30 +1177,32 @@
     }
 
     function updateRefreshBanner() {
-      const shouldShow = pendingFeedbackRequests > 0 || isRefilling || refillQueued;
+      const hasPending = pendingFeedbackRequests > 0;
+      const isReady =
+        refillQueued &&
+        preloadedRefillDoc !== null &&
+        !isRefilling &&
+        !hasPending;
+      const isPreparing =
+        refillQueued &&
+        !isReady &&
+        !isRefilling &&
+        !hasPending;
+      const shouldShow = hasPending || isRefilling || isPreparing || isReady;
+
       refreshBanner.hidden = !shouldShow;
-      if (!shouldShow) {
-        refreshNowBtn.disabled = false;
-        refreshNowBtn.textContent = 'Refresh';
-        return;
-      }
+      refreshNowBtn.hidden = !isReady;
+
+      if (!shouldShow) return;
       if (isRefilling) {
         refreshBannerText.textContent = 'Refilling queue...';
-        refreshNowBtn.disabled = true;
-        refreshNowBtn.textContent = 'Refilling';
-      } else if (refillQueued && pendingFeedbackRequests > 0) {
-        refreshBannerText.textContent = 'Saving votes before refresh...';
-        refreshNowBtn.disabled = true;
-        refreshNowBtn.textContent = 'Refresh';
-      } else if (refillQueued) {
-        refreshBannerText.textContent = 'New ranking ready';
-        refreshNowBtn.disabled = false;
-        refreshNowBtn.textContent = 'Refresh';
-      } else {
+      } else if (hasPending) {
         const label = pendingFeedbackRequests === 1 ? '1 vote saving' : `${pendingFeedbackRequests} votes saving`;
         refreshBannerText.textContent = `${label} syncing`;
-        refreshNowBtn.disabled = true;
-        refreshNowBtn.textContent = 'Refresh';
+      } else if (isPreparing) {
+        refreshBannerText.textContent = 'Preparing refresh...';
+      } else if (isReady) {
+        refreshBannerText.textContent = 'New ranking ready';
       }
     }
 
@@ -1487,6 +1489,7 @@
         console.error('Network error submitting feedback', err);
         refreshBannerText.textContent = 'Vote failed to save';
         refreshBanner.hidden = false;
+        refreshNowBtn.hidden = true;
       }).finally(() => {
         pendingFeedbackRequests = Math.max(0, pendingFeedbackRequests - 1);
         if (applyExistingRefillAfterVote && pendingFeedbackRequests === 0) {
@@ -1534,6 +1537,7 @@
         console.error('Network error undoing feedback', err);
         refreshBannerText.textContent = 'Undo failed to save';
         refreshBanner.hidden = false;
+        refreshNowBtn.hidden = true;
       }).finally(() => {
         pendingFeedbackRequests = Math.max(0, pendingFeedbackRequests - 1);
         updateRefreshBanner();

@@ -1,6 +1,5 @@
 [hn_rewrite]
 db_path = "hn_rewrite.db"
-output = "public/index.html"
 days = 30
 count = 40
 onnx_model_dir = "onnx_model"

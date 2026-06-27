@@ -788,3 +788,58 @@ ruff clean.
   embeddings via monkeypatch. Updated existing test comments from "15th-pct" to "10th-pct".
 - Diagnostics: `uv run pytest tests/ -q` = 182 passed, 9.25s.
   `ruff check .` = all clear. No new `ty` diagnostics.
+
+## 2026-06-27 — Refresh button hidden until preloaded doc is ready
+
+**Problem**: The refresh button at the top of the dashboard was shown as soon as the
+server confirmed `ranking_refresh_queued: true`, but the preloaded refill document
+wasn't ready until 2.5s + fetch later. Clicking during this window awaited the
+in-flight preload, producing a 10s+ perceived delay (worse in the cold-cache case).
+
+**Fix**: Refined `updateRefreshBanner` in the HTML's inline JS to a four-state
+machine based on `preloadedRefillDoc !== null`:
+- "X votes syncing" — feedback in flight, button hidden
+- "Preparing refresh..." — server confirmed, preload in progress, button hidden
+- "New ranking ready" — preload done, button visible (click is instant)
+- "Refilling queue..." — refill in progress, button hidden
+
+`refreshNowBtn.hidden` now tracks `preloadedRefillDoc !== null` exactly. Error
+branches (vote save failure, undo failure) explicitly hide the button to prevent
+the user from clicking into a broken state.
+
+Single 30-line diff in `templates/index.html`. No backend changes.
+
+## 2026-06-27 — Remove static-export code path (`generate.py`, `public/`, `run_pipeline`)
+
+**Motivation**: The queue-based app (server.py) renders `templates/index.html` via
+Jinja2 per request using `generate_dashboard_bytes`. The one-shot static-export
+path (`generate.py` → `run_pipeline` → `generate_dashboard` → `public/index.html`)
+was dead code — not used by the running service, not served, not part of deployment.
+
+**Deleted**:
+- `generate.py` — the one-shot CLI entrypoint
+- `public/index.html` and the empty `public/` directory (gitignored; only residual)
+- `PLAN.md` — historical v1 design doc; current architecture is queue-based
+
+**Removed from `pipeline.py`**:
+- `output` field from `Config` dataclass (and its `config.toml` key)
+- `generate_dashboard()` function (wrote HTML to disk; `generate_dashboard_bytes`
+  is unchanged and used by the live server)
+- `async def run_pipeline()` function (orchestrator for the one-shot path; no callers
+  after `generate.py` deletion)
+
+**Removed from tests**:
+- `test_run_pipeline_badge_assignment` and `test_primary_story_gets_qualifying_badge`
+  in `tests/test_pipeline.py`. Both tests existed solely to exercise badge assignment
+  through the `run_pipeline` → `generate_dashboard` path. Without those functions,
+  the tests were dead. Badge logic is covered elsewhere via `rank_stories`/`rerank_candidates`.
+
+**Updated**:
+- `scripts/test_svm_variants.py` — removed DASHBOARD constant, generate.py subprocess call,
+  and score-spread scrape block
+- `AGENTS.md` — removed `public/` and `generate.py` mentions
+- `ARCHITECTURE.md` — simplified mermaid diagram (removed `generate_dashboard`/`run_pipeline`)
+
+**Verification**: `pytest tests/ -q` = 180 passed (2 removed). `ruff check .` = all clear.
+`ls generate.py public/` = both gone. Server restarted cleanly. `curl` confirms
+refresh button bug fix is live.

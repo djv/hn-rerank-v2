@@ -14,14 +14,11 @@ graph TD
         A[fetch_candidates] --> B[get_or_compute_embeddings]
         B --> C[rank_stories]
         C --> D[rerank_candidates]
-        D --> E[generate_dashboard]
     end
 
     subgraph Service Layer
-        F[server.py] -->|1. GET /| E
-        F -->|2. POST /api/feedback| G[(Database)]
-        F -->|3. POST /api/tldr-detail| H[LLM Provider]
-        F -->|4. Thread| CorePipeline[run_pipeline]
+        F[server.py] -->|POST /api/feedback| G[(Database)]
+        F -->|POST /api/tldr-detail| H[LLM Provider]
     end
 ```
 
@@ -294,7 +291,16 @@ LessWrong RSS stories (`rss_lesswrong_com`) follow the same lazy-enrichment patt
 
 ### 4.2 Prompt Construction
 
-The detailed summary endpoint `/api/tldr-detail` proxies requests to Mistral or Groq. If both article text and stored discussion comments are present, it sends two focused LLM requests in parallel: one article summary request and one discussion summary request, then combines the returned Markdown under `Article` and `Discussion` headings. If only one side is present, it falls back to a single structured prompt.
+The detailed summary endpoint `/api/tldr-detail` proxies requests to Mistral or Groq. It uses four different prompt paths depending on what content is available:
+
+| Input | Path | Output format |
+|---|---|---|
+| Article text + comments | **Dual** (two parallel LLM calls) | `### Article` (120w max, 2-3 bullets) + `### Discussion` (150w max, 2-4 bullets) |
+| Only comments | **Discussion-only** (one call) | `### Discussion` (150w max, 3-5 bullets) — no article section |
+| Only article text | **Article-only** (one call) | `### Article` (120w max, 3-5 bullets) — no discussion section |
+| Neither | **Stub** (no LLM call) | `"No article body or discussion available to summarize for this story."` |
+
+The dual path sends two focused LLM requests in parallel: one article summary and one discussion summary. The discussion budget was raised from 100w to 150w to give richer comment threads more room. The discussion-only path uses the same discussion prompt as the dual path but omits the article call entirely, preventing fabrication of article content from the title alone.
 
 Detailed TLDR output is cached in SQLite in `tldr_cache` after any dynamic HN comment fetch, Reddit RSS enrichment, or article-body scrape has completed. The cache is keyed by story ID plus a SHA-256 fingerprint of the prompt/model identity and prompt-truncated text inputs (`title`, `self_text`, `top_comments`, and `article_body`). Wall-clock age and engagement metadata are intentionally excluded so cached TLDRs remain reusable as time passes and scores change; refreshed comments, article bodies, or prompt/model versions naturally miss the cache. Only the newest cache entry for a story is retained.
 

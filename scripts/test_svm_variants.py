@@ -9,7 +9,6 @@ from pathlib import Path
 CONFIG = Path("/home/dev/hn-rewrite/config.toml")
 PIPELINE = Path("/home/dev/hn-rewrite/pipeline.py")
 EVAL = Path("/home/dev/hn-rewrite/eval.py")
-DASHBOARD = Path("/home/dev/hn-rewrite/public/index.html")
 REPORT = Path("/home/dev/hn-rewrite/eval_report.json")
 
 config_base = CONFIG.read_text()
@@ -89,34 +88,6 @@ for label, kernel, c, method, margin_mode in trials:
         PIPELINE.write_text(pipeline_base)
         EVAL.write_text(eval_base)
 
-    # Run generate.py
-    print("\n--- generate.py ---")
-    gen = subprocess.run(
-        [sys.executable, "generate.py"],
-        capture_output=True,
-        text=True,
-        timeout=240,
-    )
-    if gen.returncode != 0:
-        print(f"ERR: {gen.stderr[-500:]}")
-        results[label] = {"error": gen.stderr[-200:]}
-        # Restore files for next trial
-        PIPELINE.write_text(pipeline_base)
-        EVAL.write_text(eval_base)
-        continue
-
-    # Extract scores
-    scores = []
-    if DASHBOARD.exists():
-        dash = DASHBOARD.read_text()
-        found = re.findall(r'data-score="([^"]*)"', dash)
-        scores = [float(s) for s in found[:40]]
-        print(
-            f"Score spread (top 40): min={min(scores):.4f}  max={max(scores):.4f}  median={sorted(scores)[len(scores) // 2]:.4f}"
-        )
-        distinct = len(set(round(s, 3) for s in scores))
-        print(f"Distinct tiers (0.1% resolution): {distinct}")
-
     # Run eval
     print("\n--- eval.py ---")
     eval_run = subprocess.run(
@@ -133,7 +104,7 @@ for label, kernel, c, method, margin_mode in trials:
         continue
 
     # Parse metrics
-    if REPORT.exists() and scores:
+    if REPORT.exists():
         r = json.loads(REPORT.read_text())
         soft = r["formulas"]["soft"]
         results[label] = {
@@ -141,16 +112,9 @@ for label, kernel, c, method, margin_mode in trials:
             "soft_ndcg10_std": soft["std"]["ndcg_at_10"],
             "soft_p10": soft["mean"]["precision_at_10"],
             "soft_median_rank": soft["mean"]["median_rank"],
-            "score_max": max(scores),
-            "score_min": min(scores),
-            "score_median": sorted(scores)[len(scores) // 2],
-            "tiers": distinct,
         }
         print(
             f">>> soft NDCG@10: {results[label]['soft_ndcg10']:.4f} ± {results[label]['soft_ndcg10_std']:.4f}"
-        )
-        print(
-            f">>> score spread: [{results[label]['score_min']:.4f}, {results[label]['score_max']:.4f}] median={results[label]['score_median']:.4f}"
         )
 
     # Restore files
