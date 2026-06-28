@@ -3126,3 +3126,101 @@ update), `WORKLOG.md` (this entry).
 - Migrate the 3 remaining `legacy_features` consumers
 - C (chunked similarity matrices in `pipeline.py:rerank_candidates`)
 - B (tracemalloc `--profile-mem` flag in eval.py)
+
+---
+
+## 2026-06-28 — B8: `--leak-check` flag in `scripts/eval_ranker_variants.py`
+
+**Goal**: B8 from the eval.py memory work plan — turn the ad-hoc
+leakage-check methodology used to validate the RBF lift (commit
+`81bde6d`) into a reusable flag. The methodology: after running the
+normal variant suite, run it again with `y` (labels) shuffled using
+a fixed seed. A trustworthy harness should see shuffled NDCG@40 drop
+to random baseline (~0.10 for n_test=80/n_cand=7000); high
+shuffled values indicate data leakage in the offline harness.
+
+**Changes**:
+
+- **`scripts/eval_ranker_variants.py`**:
+  - Added `--leak-check` argparse flag (action='store_true').
+  - Refactored the variant loop into a local `_run_variants(y_label, label)`
+    function (closure over `candidates`, `cand_emb`, `cand_field_emb`,
+    `cand_field_parts`, `fb_*`, `config`, `variants`, `args`). Can
+    now be called with a shuffled `y`.
+  - After the normal run, if `--leak-check` is set:
+    - Shuffle `y` with `np.random.default_rng(0).permutation(y)` (fixed
+      seed=0 for reproducibility).
+    - Run the same variant suite again with the shuffled labels.
+    - Store the shuffled run in `report["leak_check"]["variants"]` with
+      the same per-variant structure (mean / std / per_fold).
+    - Print a summary table at the end showing normal raw_ndcg@40,
+      shuffled raw_ndcg@40, and the ratio for each variant.
+    - Print a `WARNING: possible data leakage` line for any variant
+      with ratio > 0.5.
+  - Per-fold progress lines are prefixed with `[leak-check] ` to
+    distinguish them from the main run.
+- **`tests/test_eval_ranker_variants.py`** (new, 2 tests):
+  - `test_leak_check_flag_in_help`: subprocess `--help` check; locks
+    the flag in place.
+  - `test_leak_check_smoke`: end-to-end run with `--max-candidates
+    5000 --folds 2 --variants margin3_up --leak-check` (~10s).
+    Verifies (a) `report["leak_check"]` key exists, (b) the
+    shuffled/normal structure is the same, (c) `shuffled/raw ratio
+    < 0.5` (clean harness typically gives <0.2).
+
+**Smoke test result** (the test itself, not a separate run):
+```
+margin3_up                 normal raw40=0.7574  shuffled raw40=0.1197  ratio=0.16
+```
+Ratio 0.16 is well below the 0.5 warning threshold — confirms the
+harness is clean. Shuffled 0.12 is close to the random baseline
+(0.10 for n_test=80/n_cand=7000).
+
+**Design notes**:
+
+- The flag is **opt-in**: default behavior (no flag) is identical
+  to before; no perf impact.
+- Doubles runtime when enabled (two full variant passes). For the
+  full 62-variant suite with RBF this is ~60-100 min. For typical
+  ad-hoc use, pass `--variants` to limit to a smoke set.
+- Uses a fixed seed (0) for both the shuffle and the original
+  StratifiedKFold split, so results are reproducible across runs.
+- The shuffled run uses `np.random.default_rng(0).permutation(y)`;
+  the same labels distribution (counts of 0/1/2) is preserved, only
+  the per-story assignment is randomized. A real leakage signal
+  would still produce a high NDCG even with random labels.
+
+**Verification**:
+- `uv run pytest tests/test_eval_ranker_variants.py -v` = 2 passed
+  in ~10s.
+- `uv run pytest tests/test_eval.py tests/test_eval_ranker_variants.py
+  -v` = 12 passed in ~17s.
+- `uv run ruff check .` = clean.
+- `uv run ty check` = no new diagnostics (1 pre-existing in
+  `pipeline.py:1343`).
+
+**Not fixed (pre-existing WIP, not mine)**: 4 tests in
+`tests/test_pipeline.py` fail with `'MockResp' object has no
+attribute 'headers'`. Caused by an uncommitted WIP change to
+`http_fetch.py` that makes `fetch_with_urllib_fallback` return
+3 values (added `dict(resp.headers)`) without updating the test
+fixture. Pre-dates this commit; not blocking. (See "Open" below
+for the WIP cleanup.)
+
+**Files**: `scripts/eval_ranker_variants.py` (refactor + new flag
++ summary table), `tests/test_eval_ranker_variants.py` (new file),
+`WORKLOG.md` (this entry).
+
+**Open** (deferred per user "ship, document, stop"):
+- **Add `domain_onehot` to production features** (B7's biggest
+  winner; +0.053 in offline test → expected +0.03-0.05 in
+  final_queue NDCG@40 in production)
+- Resolve the half-open circuit breaker WIP in
+  `reddit_limiter.py` / `http_fetch.py` / `pipeline.py` /
+  `tests/test_pipeline.py` / `config.toml` (4 test_pipeline.py
+  tests are currently failing because of the WIP's signature
+  change to `fetch_with_urllib_fallback`)
+- Migrate the 3 remaining `legacy_features` consumers
+  (`eval_rss.py`, `eval_no_hn_features.py`, `tests/test_pipeline.py`)
+- C (chunked similarity matrices in `pipeline.py:rerank_candidates`)
+- B (tracemalloc `--profile-mem` flag in eval.py)

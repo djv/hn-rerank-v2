@@ -1675,6 +1675,17 @@ def main() -> None:
         type=int,
         help="Sample at most this many valid feedback stories per label class.",
     )
+    parser.add_argument(
+        "--leak-check",
+        action="store_true",
+        help=(
+            "After running the normal variant suite, run it again with "
+            "y (labels) shuffled (fixed seed). A trustworthy harness should "
+            "see shuffled NDCG@40 drop to random baseline (~0.10 for "
+            "n_test=80/n_cand=7000). High shuffled values indicate data "
+            "leakage in the offline harness."
+        ),
+    )
     args = parser.parse_args()
 
     config = Config.load(args.config)
@@ -2158,33 +2169,42 @@ def main() -> None:
                 )
             raise ValueError(f"Unknown variants: {', '.join(missing)}")
         variants = {name: variants[name] for name in requested}
-    results: dict[str, list[dict]] = {name: [] for name in variants}
-    splits = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=0).split(
-        np.zeros((len(y), 1)), y
-    )
 
-    for fold_no, (train_pos, test_pos) in enumerate(splits, start=1):
-        fold = _make_fold(
-            candidates,
-            cand_emb,
-            cand_field_emb,
-            cand_field_parts,
-            fb_stories,
-            fb_to_cand,
-            fb_field_emb,
-            fb_field_parts,
-            fb_vote_times,
-            y,
-            valid_positions,
-            train_pos,
-            test_pos,
-            config,
-            needs_field=needs_field,
-        )
-        for name, scorer in variants.items():
-            scores, probs = scorer(fold)
-            results[name].append(_metrics(scores, fold, config, probs))
-        print(f"fold {fold_no}/{args.folds} done")
+    def _run_variants(y_label: np.ndarray, label: str = "") -> dict[str, list[dict]]:
+        """Run the variant suite on a given label vector.
+
+        label is a prefix prepended to per-fold progress lines (used by
+        the leak check pass to distinguish its output from the main run).
+        """
+        results: dict[str, list[dict]] = {name: [] for name in variants}
+        splits = StratifiedKFold(
+            n_splits=args.folds, shuffle=True, random_state=0
+        ).split(np.zeros((len(y_label), 1)), y_label)
+        for fold_no, (train_pos, test_pos) in enumerate(splits, start=1):
+            fold = _make_fold(
+                candidates,
+                cand_emb,
+                cand_field_emb,
+                cand_field_parts,
+                fb_stories,
+                fb_to_cand,
+                fb_field_emb,
+                fb_field_parts,
+                fb_vote_times,
+                y_label,
+                valid_positions,
+                train_pos,
+                test_pos,
+                config,
+                needs_field=needs_field,
+            )
+            for name, scorer in variants.items():
+                scores, probs = scorer(fold)
+                results[name].append(_metrics(scores, fold, config, probs))
+            print(f"{label}fold {fold_no}/{args.folds} done")
+        return results
+
+    results = _run_variants(y)
 
     metric_keys = [
         "ndcg_at_100",
@@ -2238,6 +2258,37 @@ def main() -> None:
             "per_fold": rows,
         }
 
+    if args.leak_check:
+        print(f"\n=== Leak check: shuffling y (n={len(y)}, seed=0) ===")
+        y_shuffled = np.random.default_rng(0).permutation(y)
+        leak_results = _run_variants(y_shuffled, label="[leak-check] ")
+        report["leak_check"] = {
+            "config": {
+                "y_seed": 0,
+                "n_feedback_valid": len(y_shuffled),
+                "labels": {str(k): int(v) for k, v in Counter(y_shuffled).items()},
+            },
+            "variants": {},
+        }
+        for name, rows in leak_results.items():
+            report["leak_check"]["variants"][name] = {
+                "mean": {
+                    side: {
+                        key: float(np.mean([row[side][key] for row in rows]))
+                        for key in metric_keys
+                    }
+                    for side in ("raw", "mmr")
+                },
+                "std": {
+                    side: {
+                        key: float(np.std([row[side][key] for row in rows]))
+                        for key in metric_keys
+                    }
+                    for side in ("raw", "mmr")
+                },
+                "per_fold": rows,
+            }
+
     Path(args.output).write_text(json.dumps(report, indent=2))
     print(f"wrote {args.output}")
     for name, data in report["variants"].items():
@@ -2250,6 +2301,29 @@ def main() -> None:
             f"raw_map={raw['map']:.3f} mmr_map={mmr['map']:.3f} "
             f"median={raw['median_rank']:.1f}"
         )
+
+    if args.leak_check and "leak_check" in report:
+        print(f"\n{'=' * 80}")
+        print(
+            f"{'Variant':26s} {'normal raw40':>14s} {'shuffled raw40':>16s} {'ratio':>8s}"
+        )
+        print("-" * 80)
+        for name in report["variants"]:
+            if name not in report["leak_check"]["variants"]:
+                continue
+            normal_n = report["variants"][name]["mean"]["raw"]["ndcg_at_40"]
+            # ty loses dict nesting through the long subscript chain; Any cast
+            # at the variants level lets it find the ndcg_at_40 leaf.
+            leak_variants: Any = report["leak_check"]["variants"]
+            shuffled_n = leak_variants[name]["mean"]["raw"]["ndcg_at_40"]
+            ratio = shuffled_n / normal_n if normal_n > 1e-9 else float("inf")
+            print(f"{name:26s} {normal_n:14.4f} {shuffled_n:16.4f} {ratio:8.2f}")
+            if ratio > 0.5:
+                print(
+                    f"{'':26s} WARNING: shuffled/raw ratio > 0.5, "
+                    f"possible data leakage in harness"
+                )
+        print("=" * 80)
 
 
 if __name__ == "__main__":
