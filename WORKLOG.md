@@ -77,6 +77,271 @@ implied localStorage was the (non-)source of the problem, both wrong.
 
 ---
 
+## 2026-06-28 — Limiter concurrency race fix (reserve slots inside the lock)
+
+**Symptom (this session):** Gemini (and a deeper investigation by me)
+flagged that `reddit_limiter.acquire()` had a thread-safety hole
+masked by the single-threaded queue worker:
+
+```python
+async def acquire(self) -> bool:
+    with self._lock:
+        ...
+        wait = self._next_allowed_at - now   # read stale value
+    if wait > 0:
+        await asyncio.sleep(wait)             # lock released here
+    return True
+```
+
+`_next_allowed_at` was advanced only in `on_success`/`on_429` —
+*after* the HTTP response arrived. Two concurrent `acquire()`
+callers (queue worker thread + HTTP handler thread on a TLDR
+click) both read the same stale value, both slept 0, and both
+fired HTTP. This re-introduced the burst pattern that originally
+caused the 2026-06-28 37-consecutive-429s incident.
+
+**Reproduction mechanism** (verified against server.py:252 +
+reddit_fetch_queue.py:218 + ThreadingHTTPServer):
+
+- Queue worker (daemon thread, fresh `asyncio.run` per task) calls
+  `await reddit_limiter.acquire()` inside `factory()`. Acquires
+  lock, reads `_next_allowed_at = X` (last `on_success` set it),
+  releases lock to `asyncio.sleep(wait)`. Worker is now inside
+  `httpx.AsyncClient.get(...)`, still in flight.
+- HTTP handler (ThreadingHTTPServer spawn, fresh `asyncio.run`
+  per request) calls `await reddit_limiter.acquire()` inside
+  `_fetch_reddit_rss_context` while user clicks TLDR on an
+  under-hydrated Reddit card. Reads the same stale `_next_allowed_at
+  = X` (no HTTP has completed since the queue worker's `acquire`),
+  releases lock, sleeps 0, fires HTTP.
+- Both HTTPs within 100ms → 1 req per 45s budget exhausted,
+  both 429.
+
+**Fix:** reserve the slot inside the lock so the next caller
+entering the lock sees a bumped `_next_allowed_at`:
+
+```python
+async def acquire(self) -> bool:
+    with self._lock:
+        ...
+        delay = self.INTER_REQUEST_DELAY + jitter
+        slot = max(now, self._next_allowed_at)
+        self._next_allowed_at = slot + delay   # <-- reserve for next caller
+        wait = slot - now
+    if wait > 0:
+        await asyncio.sleep(wait)
+    return True
+```
+
+Companion changes:
+
+- `on_success()` no longer advances `_next_allowed_at` (it only
+  resets circuit state). The reservation was already made in
+  `acquire()`, so post-HTTP state is correct.
+- `on_429()` uses `max(self._next_allowed_at, now + delay)` —
+  never earlier than what `acquire()` reserved. Pushes the next
+  slot further out on backoff, but cannot invalidate callers
+  mid-`asyncio.sleep`.
+
+**Prewarm double-acquire cleanup (related):**
+`build_reddit_prewarm_factories` factory body had `await
+reddit_limiter.acquire()` *followed by* `_fetch_reddit_rss_context`
+which itself calls `acquire()`. Two acquires per prewarm HTTP.
+Under the OLD design this was benign — the first absorbed the
+wait, the second was a no-op. Under the NEW design each acquire
+reserves a slot, so prewarm would have consumed **2 rate-limit
+slots per HTTP** and added ~2s of extra wait per prewarm. For 200
+prewarms that's 200 × 2s = 400s extra wall-clock per cycle. Fixed
+by replacing the outer `await acquire()` with a cheap
+`reddit_limiter.circuit_open` property check (the inner
+`_fetch_reddit_rss_context → acquire` remains the actual gate).
+
+**Invariant tests** in `tests/test_reddit_limiter.py`:
+
+- `test_concurrent_acquire_staggers_reservations` (new): two
+  back-to-back acquires with no `on_success` between them observe
+  a 2s gap. Without the fix, the second acquire would see
+  `_next_allowed_at = 0` (stale) and sleep 0.
+- `test_on_429_pushes_reservation_never_pulls` (new): a 429 with
+  a small backoff does not pull `_next_allowed_at` earlier than
+  what `acquire()` already reserved.
+- `test_acquire_waits_inter_request_delay_after_on_success` →
+  renamed to `test_acquire_reserves_slot_for_next_caller` with
+  the on_success call removed (acquire is now the bump site).
+- `test_jitter_stays_within_bounds` and
+  `test_jitter_zero_is_deterministic` → rewrote to call
+  `await limiter.acquire()` instead of `limiter.on_success()`
+  (jitter is now applied at acquire time, not on_success time).
+  Same `[1.5, 2.5]` bounds hold.
+- 23 other tests unchanged (the `on_429` `max()` guard, circuit
+  logic, half-open probe, jitter-doesn't-affect-429, etc. all
+  preserve their assertions).
+
+**Verification**:
+
+- `uv run pytest tests/test_reddit_limiter.py -v` = 28 passed
+  (was 26; +2 new invariant tests).
+- `uv run pytest tests/ -n 4` = 315 passed, 1 skipped.
+- `uv run ruff check .` = clean.
+- `uv run ty check` = no new diagnostics.
+- Production deploy pending (log-check after restart below).
+
+**Files**:
+
+- `reddit_limiter.py` (~30 line edit across `acquire`, `on_success`,
+  `on_429`).
+- `pipeline.py` (`build_reddit_prewarm_factories` factory body: 1
+  line changed — outer `await acquire()` → `circuit_open`
+  property check).
+- `tests/test_reddit_limiter.py` (2 rewrites, 1 rename, 2 new
+  tests = 28 total, was 26).
+- `ARCHITECTURE.md` (new "Slot-reservation under the lock" bullet
+  under section 3.4.2 describing the invariant and the prewarm
+  double-acquire cleanup).
+
+**Risk in production** (small):
+
+- Worst case: N concurrent `acquire()` callers (queue worker + 1
+  HTTP handler) are mid-`asyncio.sleep` and can't be cancelled by
+  a 429 override. They still fire HTTP at their reserved times.
+  Bounded by N≈2 in the current architecture. Strictly better than
+  today (unbounded concurrent fires from the same stale slot read).
+- Failed HTTP (non-429) still advances `_next_allowed_at` (wasted
+  slot ≈ 2s). No functional impact; the queue's 50s stride dominates.
+- `on_success` no longer adjusts `_next_allowed_at` — the rate-limit
+  cadence is now anchored entirely to `acquire()` calls. If a
+  caller skips the `on_success` callback after a successful HTTP
+  (no caller does this today), the next `acquire()` still waits
+  the reserved delay. Conservative.
+
+---
+
+## 2026-06-28 — Reddit fetch queue as single coordinator (topfeed + prewarm interleaved)
+
+**Symptom (this session):** The earlier Phase 1A+C+E deploy spread
+topfeed and prewarm on separate windows with separate
+`wait_until_empty` calls inside `fetch_rss_feeds` (1200s ceiling) and
+`prewarm_reddit_top_stories` (1500s ceiling). This made them serial
+despite using the same shared queue: prewarm could not even enqueue
+until the topfeed drain returned. Total regen Reddit time was ~74 min
+serial (36 min topfeed + 38 min prewarm), and a 429 storm on either
+kind could still stall the other (the limiter's 2s spacing pushed the
+next task's `target_at` later, but the heap ordering didn't help
+because the kinds had separate windows).
+
+**Fix:** make the queue the single coordinator. New
+`RedditFetchQueue.enqueue_all_reddit_fetches(topfeed_factories,
+prewarm_factories, *, min_stride_seconds=...)` interleaves both
+factory lists alternately on a single shared window. The regen
+pipeline's `fetch_candidates_only` now:
+1. Calls `fetch_candidates` (CH + archive + non-Reddit RSS; no
+   Reddit yet)
+2. Builds topfeed factories via new
+   `build_reddit_topfeed_factories(feeds, per_feed, days, exclude_urls)`
+3. Gathers prewarm IDs from the DB (Option A: all
+   `rss_reddit_*` stories lacking `top_comments` and with
+   `text_content != ''`) — see trade-off below
+4. Builds prewarm factories via new
+   `build_reddit_prewarm_factories(story_ids, db)`
+5. Calls
+   `queue.enqueue_all_reddit_fetches(topfeed, prewarm,
+   min_stride_seconds=config.reddit_min_fetch_spacing_seconds)`
+6. Single `queue.wait_until_empty(timeout=5400.0)` (90 min ceiling)
+7. Post-drain: collects Reddit topfeed stories from
+   `reddit_feed_cache` and `db.upsert_story` them; recomputes
+   embeddings for prewarm-updated stories
+
+**Trade-off (Option A):** new Reddit stories from this cycle's
+topfeed are ranked in this cycle (their stories are upserted post-
+drain so the summarizable filter saw them on the next render) but
+are prewarmed on the next regen cycle (~3h later). They appear with
+`self_text` immediately, which is enough for ranking; they just lack
+`top_comments` for one cycle (affects only the TLDR detail view). The
+DB query that gathers prewarm IDs runs *before* topfeed, so it sees
+the prior cycle's prewarmed-or-not Reddit stories but not this
+cycle's brand-new ones. Alternative would be two drains (topfeed
+drain first, then prewarm drain) but that preserves the serial
+behavior and gains nothing.
+
+**Backlog cap (added after first deploy):** the first run of the
+coordinator enqueued 1145 prewarm IDs from the DB (the full backlog
+of `rss_reddit_*` stories accumulated over weeks of slow prewarm).
+At 50s stride, that produced a 16.5-hour combined window, well past
+the 90-min drain timeout. Most backlog items were never processed.
+Added `config.reddit_prewarm_max_per_cycle` (default 200) to cap
+the per-cycle prewarm set, ordered by `score DESC, time DESC` so
+the highest-value backlog drains first. With the cap, a cycle sees
+~241 combined tasks (41 topfeed + 200 prewarm) at 50s stride =
+~3.4-hour nominal window, still past the 90-min timeout but
+proportionally the same; the cap is the lever if the timeout starts
+firing. The 200 default assumes 30-50% prewarm success rate; bump
+to 500+ once the backlog is empty and prewarm is keeping up.
+
+**Knob consolidation:** replaced
+`reddit_spread_window_topfeeds_seconds` (2100s) +
+`reddit_spread_window_prewarm_seconds` (2100s) with a single
+`reddit_min_fetch_spacing_seconds` (50.0). The combined rate is
+`1/50s = 0.02 req/s`, within the observed ~1/45s Reddit rate limit
+(11% headroom). 41 topfeed + 46 prewarm = 87 tasks × 50s stride =
+~72 min total window, with topfeed and prewarm alternating at 100s
+effective stride each.
+
+**API changes**:
+- `fetch_rss_feeds` now handles only non-Reddit feeds synchronously;
+  Reddit feeds are built (not fetched) and returned via
+  `build_reddit_topfeed_factories`. The Reddit-specific User-Agent,
+  429/`x-ratelimit-reset` handling, and `reddit_feed_cache`
+  integration moved into the factory closures.
+- `prewarm_reddit_top_stories` is now a convenience wrapper around
+  `build_reddit_prewarm_factories` + `enqueue_spread` +
+  `wait_until_empty` + embedding recompute. Returns
+  `len(updated_ids)`. Preserved for the 2 direct test callers and
+  any future ad-hoc prewarm invocations.
+- New `RedditFetchQueue.MIN_FETCH_SPACING` class attr (50.0 default;
+  conftest overrides to 0.01 for tests).
+- `enqueue_spread` fallback to `SPREAD_WINDOW_TOPFEEDS` /
+  `SPREAD_WINDOW_PREWARM` preserved for any non-coordinated callers.
+
+**Tests**: 4 `test_fetch_rss_feeds_*` tests converted to
+`test_build_reddit_topfeed_*` (factory builder + queue enqueue +
+drain + cache read); 1
+`test_fetch_candidates_only_prewarms_all_reddit_when_full` updated
+to mock the factory builders (not the wrapper) and the queue
+enqueue/drain (to no-ops); 4 new
+`test_enqueue_all_reddit_fetches_*` tests for the new queue method
+(interleave, uneven lengths, empty input, class-default fallback).
+
+**Verification**:
+- `uv run pytest tests/ -n 4` = 311 passed, 1 skipped in ~36s (was
+  307; +4 new topfeed tests, +4 new queue tests; the 4 old
+  `test_fetch_rss_feeds_*` tests are removed and replaced by
+  `test_build_reddit_topfeed_*`).
+- `uv run ruff check .` = clean.
+- `uv run ty check` = no new diagnostics.
+- `tests/test_reddit_limiter.py` (26 tests) and
+  `tests/test_reddit_fetch_queue.py` (14 tests, was 10) pass without
+  changes.
+
+**Files**:
+- `reddit_fetch_queue.py` (+`enqueue_all_reddit_fetches` method,
+  +`MIN_FETCH_SPACING` class attr, +interleaving docstring).
+- `pipeline.py` (extract `build_reddit_topfeed_factories` +
+  `build_reddit_prewarm_factories` + `_fetch_and_parse_feed` helpers,
+  simplify `fetch_rss_feeds` to non-Reddit, convert
+  `prewarm_reddit_top_stories` to a wrapper, refactor
+  `fetch_candidates_only` to use `enqueue_all_reddit_fetches` and a
+  single drain, Config: drop 2 `reddit_spread_window_*` knobs add
+  `reddit_min_fetch_spacing_seconds` + `reddit_prewarm_max_per_cycle`).
+- `config.toml` (drop 2 lines, add 2).
+- `tests/conftest.py` (override `MIN_FETCH_SPACING` instead of
+  `SPREAD_WINDOW_*`).
+- `tests/test_pipeline.py` (4 test rewrites, 1 test update).
+- `tests/test_reddit_fetch_queue.py` (4 new tests).
+- `ARCHITECTURE.md` (Phase 1E bullet rewritten to describe the
+  coordinator refactor + new-knob consolidation + Option A trade-off).
+
+---
+>>>>>>> theirs
 ## 2026-06-28 — Reddit rate-limit adaptation: config-driven spread + x-ratelimit-reset on 429
 
 **Symptom (this session):** The Phase 1A+C+E deploy at 16:49 spread

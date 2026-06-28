@@ -75,16 +75,28 @@ async def test_acquire_no_wait_initially(
 
 
 @pytest.mark.asyncio
-async def test_acquire_waits_inter_request_delay_after_on_success(
+async def test_acquire_reserves_slot_for_next_caller(
     limiter: RedditRateLimiter, fake_clock: FakeClock, sleep_recorder: SleepRecorder
 ) -> None:
+    """The first acquire reserves a slot by bumping ``_next_allowed_at``
+    inside the lock. The next acquire entering the lock immediately
+    after sees the bumped value and waits the inter-request delay.
+
+    Replaces the old ``test_acquire_waits_inter_request_delay_after_on_success``
+    contract: on_success used to bump ``_next_allowed_at``, but that
+    caused concurrent callers to fire HTTP simultaneously. The bump
+    is now in ``acquire()`` so reservation happens under the lock.
+    """
     limiter.JITTER_SECONDS = 0.0  # deterministic
-    limiter.on_success()
-    assert sleep_recorder.calls == []
-    # _next_allowed_at = fake_clock.now + INTER_REQUEST_DELAY = 1002.0
+    # Initial: _next_allowed_at = 0.0, now = 1000.0
+    # First acquire: slot = max(1000, 0) = 1000, _next = 1002, wait = 0
     assert await limiter.acquire() is True
-    # Should have slept (1002.0 - 1000.0) = 2.0s
+    assert sleep_recorder.calls == []
+    assert limiter._next_allowed_at == pytest.approx(1002.0)
+    # Second acquire immediately after: slot = max(1000, 1002) = 1002, wait = 2
+    assert await limiter.acquire() is True
     assert sleep_recorder.calls == [2.0]
+    assert limiter._next_allowed_at == pytest.approx(1004.0)
 
 
 @pytest.mark.asyncio
@@ -227,29 +239,41 @@ def test_instance_attributes_can_be_overridden(monkeypatch: pytest.MonkeyPatch) 
     rl.MAX_CONSECUTIVE_429 = 3
 
 
-def test_jitter_stays_within_bounds(
+@pytest.mark.asyncio
+async def test_jitter_stays_within_bounds(
     limiter: RedditRateLimiter, fake_clock: FakeClock
 ) -> None:
-    """Jitter keeps on_success delays in [INTER-JITTER, INTER+JITTER]."""
+    """Jitter keeps inter-request delays in [INTER-JITTER, INTER+JITTER].
+
+    With the slot-reservation contract, jitter is applied in
+    ``acquire()`` (not ``on_success()``) so the bump-to-``_next_allowed_at``
+    is what carries the jitter. We assert against that bump here.
+    """
     limiter.JITTER_SECONDS = 0.5
     for _ in range(1000):
         limiter._next_allowed_at = 0.0
         t_before = fake_clock.now
-        limiter.on_success()
+        await limiter.acquire()
         delay = limiter._next_allowed_at - t_before
         assert 1.5 <= delay <= 2.5, f"delay {delay} outside [1.5, 2.5]"
     # No assertion on exact distribution; just that the bounds hold
 
 
-def test_jitter_zero_is_deterministic(
+@pytest.mark.asyncio
+async def test_jitter_zero_is_deterministic(
     limiter: RedditRateLimiter, fake_clock: FakeClock
 ) -> None:
-    """With JITTER_SECONDS=0, on_success uses the exact INTER_REQUEST_DELAY."""
+    """With JITTER_SECONDS=0, acquire uses the exact INTER_REQUEST_DELAY.
+
+    Jitter is now applied in ``acquire()`` (the slot reservation), so
+    the bump-to-``_next_allowed_at`` is exactly INTER_REQUEST_DELAY
+    when JITTER_SECONDS=0.
+    """
     limiter.JITTER_SECONDS = 0.0
     for _ in range(10):
         limiter._next_allowed_at = 0.0
         t_before = fake_clock.now
-        limiter.on_success()
+        await limiter.acquire()
         assert limiter._next_allowed_at - t_before == pytest.approx(2.0)
 
 
@@ -395,6 +419,62 @@ async def test_probe_failure_resets_cooldown(
     assert await limiter.acquire() is False
     fake_clock.advance(2.0)
     assert await limiter.acquire() is True
+
+
+@pytest.mark.asyncio
+async def test_concurrent_acquire_staggers_reservations(
+    limiter: RedditRateLimiter, fake_clock: FakeClock, sleep_recorder: SleepRecorder
+) -> None:
+    """The fix for the limiter concurrency race.
+
+    Previously ``acquire()`` read ``_next_allowed_at`` under the lock,
+    released the lock to await ``asyncio.sleep``, and the HTTP response
+    callback (``on_success``/``on_429``) advanced ``_next_allowed_at``
+    AFTER the request completed. Two concurrent ``acquire()`` callers
+    (queue worker thread + HTTP handler thread on a TLDR click) both
+    saw the same stale value, both slept 0, both fired HTTP
+    simultaneously — bypassing the 2s spacing.
+
+    The fix: ``acquire()`` reserves the slot by bumping
+    ``_next_allowed_at = slot + INTER_REQUEST_DELAY + jitter`` *inside*
+    the lock. The next caller entering the lock immediately after
+    sees the bumped value and waits the inter-request delay. This test
+    exercises the invariant directly: two back-to-back acquires with
+    no ``on_success`` between them must observe a 2s gap.
+    """
+    limiter.JITTER_SECONDS = 0.0
+    # Initial: _next_allowed_at = 0.0, now = 1000.0
+    # First acquire: slot = max(1000, 0) = 1000, _next = 1002, wait = 0
+    assert await limiter.acquire() is True
+    assert sleep_recorder.calls == []
+    assert limiter._next_allowed_at == pytest.approx(1002.0)
+    # Second acquire without on_success: must see the reservation
+    # from the first acquire and wait 2s. Without the fix, this
+    # second acquire would see _next_allowed_at = 0 (stale) and
+    # sleep 0.
+    assert await limiter.acquire() is True
+    assert sleep_recorder.calls == [2.0]
+    assert limiter._next_allowed_at == pytest.approx(1004.0)
+
+
+@pytest.mark.asyncio
+async def test_on_429_pushes_reservation_never_pulls(
+    limiter: RedditRateLimiter, fake_clock: FakeClock
+) -> None:
+    """A 429 override must push ``_next_allowed_at`` further out, but
+    never earlier than what ``acquire()`` already reserved. Protects
+    callers mid-``asyncio.sleep`` from being pulled back.
+    """
+    limiter.JITTER_SECONDS = 0.0
+    # First acquire reserves _next_allowed_at = 1002 (slot at 1000, +2s)
+    assert await limiter.acquire() is True
+    assert limiter._next_allowed_at == pytest.approx(1002.0)
+    # A 429 with 5s backoff at t=1000 must push to max(1002, 1000+5) = 1005
+    limiter.on_429(retry_after=5.0)
+    assert limiter._next_allowed_at == pytest.approx(1005.0)
+    # A 429 with 1s backoff must NOT pull back to 1001
+    limiter.on_429(retry_after=1.0)
+    assert limiter._next_allowed_at == pytest.approx(1005.0)
 
 
 def test_on_429_records_open_time_only_on_transition(

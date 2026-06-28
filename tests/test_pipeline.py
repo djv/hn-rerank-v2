@@ -583,12 +583,16 @@ def test_is_summarizable_lesswrong_zero_comments():
 
 
 @pytest.mark.asyncio
-async def test_fetch_rss_feeds_serializes_reddit_and_sets_user_agent(
+async def test_build_reddit_topfeed_serializes_and_sets_user_agent(
     tmp_path, monkeypatch
 ):
-    from pipeline import REDDIT_RSS_USER_AGENT, fetch_rss_feeds
+    """Reddit topfeed factories must serialize HTTP requests (max
+    concurrency = 1) and use the Reddit user agent. Replaces the old
+    `test_fetch_rss_feeds_serializes_reddit_and_sets_user_agent` after
+    Reddit topfeed was split out of `fetch_rss_feeds`."""
+    from pipeline import REDDIT_RSS_USER_AGENT, build_reddit_topfeed_factories
+    from reddit_fetch_queue import queue as reddit_fetch_queue
 
-    db = Database(str(tmp_path / "test.db"))
     active_reddit_requests = 0
     max_reddit_concurrency = 0
     seen_requests = []
@@ -638,17 +642,23 @@ async def test_fetch_rss_feeds_serializes_reddit_and_sets_user_agent(
     monkeypatch.setattr("pipeline.reddit_limiter", pipeline.reddit_limiter)
     pipeline.reddit_limiter.INTER_REQUEST_DELAY = 0.0
 
-    stories = await fetch_rss_feeds(
-        [
-            "https://www.reddit.com/r/haskell/top/.rss?t=week&limit=25",
-            "https://example.com/feed.xml",
-            "https://www.reddit.com/r/ocaml/top/.rss?t=month&limit=25",
-        ],
-        per_feed=10,
-        days=30,
-        exclude_urls=set(),
-        db=db,
+    feeds = [
+        "https://www.reddit.com/r/haskell/top/.rss?t=week&limit=25",
+        "https://example.com/feed.xml",
+        "https://www.reddit.com/r/ocaml/top/.rss?t=month&limit=25",
+    ]
+    factories, reddit_feed_urls = build_reddit_topfeed_factories(
+        feeds, per_feed=10, days=30, exclude_urls=set()
     )
+    assert len(factories) == 2
+    assert set(reddit_feed_urls) == {
+        "https://www.reddit.com/r/haskell/top/.rss?t=week&limit=25",
+        "https://www.reddit.com/r/ocaml/top/.rss?t=month&limit=25",
+    }
+    reddit_fetch_queue.enqueue_spread(
+        len(factories), time.monotonic(), "topfeed", factories
+    )
+    assert reddit_fetch_queue.wait_until_empty(timeout=2.0) is True
 
     assert max_reddit_concurrency == 1
     reddit_requests = [
@@ -659,18 +669,28 @@ async def test_fetch_rss_feeds_serializes_reddit_and_sets_user_agent(
         headers.get("User-Agent") == REDDIT_RSS_USER_AGENT
         for _url, headers in reddit_requests
     )
-    assert {s.source for s in stories} >= {
+
+    # The non-Reddit feed is NOT handled here — it's the caller's
+    # responsibility to fetch it via `fetch_rss_feeds`. This test
+    # focuses on Reddit serialization, so we don't call it.
+    reddit_stories = [
+        s
+        for feed_url in reddit_feed_urls
+        for s in pipeline.reddit_feed_cache.get(feed_url) or []
+    ]
+    assert {s.source for s in reddit_stories} >= {
         "rss_reddit_haskell",
         "rss_reddit_ocaml",
-        "rss_example_com",
     }
 
 
-async def test_fetch_rss_feeds_populates_self_text(tmp_path, monkeypatch):
-    """Regression: RSS stories must set self_text from the feed body, not leave it empty."""
-    from pipeline import fetch_rss_feeds
-
-    db = Database(str(tmp_path / "test.db"))
+async def test_build_reddit_topfeed_populates_self_text(tmp_path, monkeypatch):
+    """Regression: Reddit topfeed stories must set self_text from the
+    feed body. Replaces the old
+    `test_fetch_rss_feeds_populates_self_text` after Reddit topfeed was
+    split out of `fetch_rss_feeds`."""
+    from pipeline import build_reddit_topfeed_factories
+    from reddit_fetch_queue import queue as reddit_fetch_queue
 
     body = "The K line is cute but smells a bit. Stations feel like nowhere."
 
@@ -703,31 +723,33 @@ async def test_fetch_rss_feeds_populates_self_text(tmp_path, monkeypatch):
             return MockResp(rss_doc("LA transit", url + "/comments/x/"))
 
     monkeypatch.setattr("pipeline.httpx.AsyncClient", MockClient)
-    # Disable the 2s inter-request delay so the test runs fast;
-    # the conftest fixture resets the limiter before/after each test.
     pipeline.reddit_limiter.INTER_REQUEST_DELAY = 0.0
 
-    stories = await fetch_rss_feeds(
-        ["https://www.reddit.com/r/transit/top/.rss"],
-        per_feed=5,
-        days=30,
-        exclude_urls=set(),
-        db=db,
+    feeds = ["https://www.reddit.com/r/transit/top/.rss"]
+    factories, reddit_feed_urls = build_reddit_topfeed_factories(
+        feeds, per_feed=5, days=30, exclude_urls=set()
     )
+    reddit_fetch_queue.enqueue_spread(
+        len(factories), time.monotonic(), "topfeed", factories
+    )
+    assert reddit_fetch_queue.wait_until_empty(timeout=2.0) is True
 
-    assert len(stories) == 1
-    s = stories[0]
+    cached = pipeline.reddit_feed_cache.get(reddit_feed_urls[0])
+    assert cached is not None
+    assert len(cached) == 1
+    s = cached[0]
     assert s.source == "rss_reddit_transit"
     assert "K line is cute but smells" in s.self_text
     assert s.text_content.startswith("LA transit. ")
     assert "K line is cute but smells" in s.text_content
 
 
-async def test_fetch_rss_feeds_cache_hit_skips_http(tmp_path, monkeypatch):
-    """Cache hit should return cached stories without making any HTTP request."""
-    from pipeline import fetch_rss_feeds, reddit_feed_cache
-
-    db = Database(str(tmp_path / "test.db"))
+async def test_build_reddit_topfeed_cache_hit_skips_http(tmp_path, monkeypatch):
+    """Cache hit should skip the HTTP call. Replaces the old
+    `test_fetch_rss_feeds_cache_hit_skips_http` after Reddit topfeed
+    was split out of `fetch_rss_feeds`."""
+    from pipeline import build_reddit_topfeed_factories
+    from reddit_fetch_queue import queue as reddit_fetch_queue
 
     cached_stories = [
         Story(
@@ -740,10 +762,8 @@ async def test_fetch_rss_feeds_cache_hit_skips_http(tmp_path, monkeypatch):
             source="rss_reddit_test",
         )
     ]
-    reddit_feed_cache.set(
-        "https://www.reddit.com/r/test/top/.rss?t=week&limit=25",
-        cached_stories,
-    )
+    feed_url = "https://www.reddit.com/r/test/top/.rss?t=week&limit=25"
+    pipeline.reddit_feed_cache.set(feed_url, cached_stories)
 
     class FailClient:
         def __init__(self, **kw):
@@ -761,23 +781,29 @@ async def test_fetch_rss_feeds_cache_hit_skips_http(tmp_path, monkeypatch):
     monkeypatch.setattr("pipeline.httpx.AsyncClient", FailClient)
     pipeline.reddit_limiter.INTER_REQUEST_DELAY = 0.0
 
-    stories = await fetch_rss_feeds(
-        ["https://www.reddit.com/r/test/top/.rss?t=week&limit=25"],
-        per_feed=10,
-        days=30,
-        exclude_urls=set(),
-        db=db,
+    factories, reddit_feed_urls = build_reddit_topfeed_factories(
+        [feed_url], per_feed=10, days=30, exclude_urls=set()
     )
+    reddit_fetch_queue.enqueue_spread(
+        len(factories), time.monotonic(), "topfeed", factories
+    )
+    assert reddit_fetch_queue.wait_until_empty(timeout=2.0) is True
 
-    assert len(stories) == 1
-    assert stories[0].title == "Cached Story"
+    cached = pipeline.reddit_feed_cache.get(reddit_feed_urls[0])
+    assert cached is not None
+    assert len(cached) == 1
+    assert cached[0].title == "Cached Story"
 
 
-async def test_fetch_rss_feeds_cache_miss_fetches_and_caches(tmp_path, monkeypatch):
-    """Cache miss should fetch, cache, and return stories."""
-    from pipeline import fetch_rss_feeds, reddit_feed_cache
-
-    db = Database(str(tmp_path / "test.db"))
+async def test_build_reddit_topfeed_cache_miss_fetches_and_caches(
+    tmp_path, monkeypatch
+):
+    """Cache miss should fetch, cache, and make stories available in
+    `reddit_feed_cache`. Replaces the old
+    `test_fetch_rss_feeds_cache_miss_fetches_and_caches` after Reddit
+    topfeed was split out of `fetch_rss_feeds`."""
+    from pipeline import build_reddit_topfeed_factories
+    from reddit_fetch_queue import queue as reddit_fetch_queue
 
     def rss_doc(title: str, link: str) -> str:
         return f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -807,23 +833,18 @@ async def test_fetch_rss_feeds_cache_miss_fetches_and_caches(tmp_path, monkeypat
 
     monkeypatch.setattr("pipeline.httpx.AsyncClient", MockClient)
     pipeline.reddit_limiter.INTER_REQUEST_DELAY = 0.0
+    pipeline.reddit_feed_cache.reset()
 
-    reddit_feed_cache.reset()
-
-    stories = await fetch_rss_feeds(
-        ["https://www.reddit.com/r/test/top/.rss?t=week&limit=25"],
-        per_feed=10,
-        days=30,
-        exclude_urls=set(),
-        db=db,
+    feed_url = "https://www.reddit.com/r/test/top/.rss?t=week&limit=25"
+    factories, reddit_feed_urls = build_reddit_topfeed_factories(
+        [feed_url], per_feed=10, days=30, exclude_urls=set()
     )
-
-    assert len(stories) == 1
-    assert stories[0].title == "Fresh Story"
-
-    cached = reddit_feed_cache.get(
-        "https://www.reddit.com/r/test/top/.rss?t=week&limit=25"
+    reddit_fetch_queue.enqueue_spread(
+        len(factories), time.monotonic(), "topfeed", factories
     )
+    assert reddit_fetch_queue.wait_until_empty(timeout=2.0) is True
+
+    cached = pipeline.reddit_feed_cache.get(reddit_feed_urls[0])
     assert cached is not None
     assert cached[0].title == "Fresh Story"
 
@@ -4073,7 +4094,17 @@ def test_fetch_candidates_only_prewarms_all_hn_when_full(monkeypatch) -> None:
 
 
 def test_fetch_candidates_only_prewarms_all_reddit_when_full(monkeypatch) -> None:
-    """Regen prewarms all Reddit candidates when prewarm_reddit_full=True."""
+    """Regen prewarms all Reddit candidates when prewarm_reddit_full=True.
+
+    Verifies the DB-driven prewarm ID selection: stories 10 and 11
+    (lacking `top_comments`, source=rss_reddit_*) are gathered from
+    the DB. Story 12 (with `top_comments="Already hydrated."`) is
+    excluded. The query is capped by
+    `config.reddit_prewarm_max_per_cycle` to bound the combined
+    Reddit-fetch window.
+    """
+    from reddit_fetch_queue import queue as reddit_fetch_queue
+
     db = Database(":memory:")
     try:
         config = Config(
@@ -4123,12 +4154,38 @@ def test_fetch_candidates_only_prewarms_all_reddit_when_full(monkeypatch) -> Non
 
         captured_ids: list[list[int]] = []
 
-        async def fake_reddit_prewarm(ids, db_, embedder, **kwargs):
-            captured_ids.append(list(ids))
-            return len(ids)
+        def fake_build_reddit_topfeed_factories(feeds, per_feed, days, exclude_urls):
+            return [], []
+
+        def fake_build_reddit_prewarm_factories(story_ids, db_):
+            captured_ids.append(list(story_ids))
+            return [], []
+
+        # Block the queue from enqueueing anything (factories are empty
+        # anyway, but we want a no-op wait).
+        def fake_enqueue_all(*a, **kw):
+            return None
+
+        def fake_wait_until_empty(timeout=None):
+            return True
 
         monkeypatch.setattr(pipeline, "fetch_candidates", fake_fetch_candidates)
-        monkeypatch.setattr(pipeline, "prewarm_reddit_top_stories", fake_reddit_prewarm)
+        monkeypatch.setattr(
+            pipeline,
+            "build_reddit_topfeed_factories",
+            fake_build_reddit_topfeed_factories,
+        )
+        monkeypatch.setattr(
+            pipeline,
+            "build_reddit_prewarm_factories",
+            fake_build_reddit_prewarm_factories,
+        )
+        monkeypatch.setattr(
+            reddit_fetch_queue, "enqueue_all_reddit_fetches", fake_enqueue_all
+        )
+        monkeypatch.setattr(
+            reddit_fetch_queue, "wait_until_empty", fake_wait_until_empty
+        )
 
         asyncio.run(
             pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())

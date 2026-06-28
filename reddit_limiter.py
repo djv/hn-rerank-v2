@@ -60,6 +60,21 @@ class RedditRateLimiter:
             return self._consecutive_429 >= self.MAX_CONSECUTIVE_429
 
     async def acquire(self) -> bool:
+        """Reserve a rate-limit slot for the next Reddit request.
+
+        Inside the lock, atomically computes this caller's slot time
+        (``max(now, _next_allowed_at)``) and reserves the FOLLOWING slot
+        by bumping ``_next_allowed_at = slot + delay``. The next caller
+        to enter the lock will see the bumped value and stagger itself
+        correctly, even if it's in a different OS thread (queue worker
+        vs HTTP handler).
+
+        Previously ``_next_allowed_at`` was advanced only in
+        ``on_success``/``on_429`` (after the HTTP response), so two
+        concurrent ``acquire()`` callers both saw the same stale value
+        and fired HTTP simultaneously. See WORKLOG 2026-06-28
+        "Limiter concurrency race fix" for the full analysis.
+        """
         with self._lock:
             if self._consecutive_429 >= self.MAX_CONSECUTIVE_429:
                 if self._probing:
@@ -73,7 +88,13 @@ class RedditRateLimiter:
                     now - self._circuit_opened_at,
                 )
             now = time.monotonic()
-            wait = self._next_allowed_at - now
+            delay = self.INTER_REQUEST_DELAY + random.uniform(
+                -self.JITTER_SECONDS, self.JITTER_SECONDS
+            )
+            delay = max(0.0, delay)
+            slot = max(now, self._next_allowed_at)
+            self._next_allowed_at = slot + delay
+            wait = slot - now
         if wait > 0:
             await asyncio.sleep(wait)
         return True
@@ -97,12 +118,19 @@ class RedditRateLimiter:
             else:
                 idx = min(self._consecutive_429 - 1, len(self.BACKOFF) - 1)
                 delay = self.BACKOFF[idx]
-            self._next_allowed_at = time.monotonic() + delay
+            # ``max(_next_allowed_at, now + delay)`` — never earlier than
+            # what ``acquire()`` already reserved. A successful prior
+            # acquire may have set the next slot to a time < now + delay;
+            # the 429 backoff can only push it further out, never pull it
+            # back. This protects callers who are mid-``asyncio.sleep``
+            # against invalidation.
+            now = time.monotonic()
+            self._next_allowed_at = max(self._next_allowed_at, now + delay)
             if prev < self.MAX_CONSECUTIVE_429 <= self._consecutive_429:
-                self._circuit_opened_at = time.monotonic()
+                self._circuit_opened_at = now
                 self._probing = False
             elif self._probing:
-                self._circuit_opened_at = time.monotonic()
+                self._circuit_opened_at = now
                 self._probing = False
         logger.warning(
             "reddit_limiter 429 consecutive=%d next_delay=%.1fs",
@@ -111,13 +139,17 @@ class RedditRateLimiter:
         )
 
     def on_success(self) -> None:
+        """Record a successful request and close the circuit if it was probing.
+
+        Note: ``_next_allowed_at`` is NOT advanced here. The slot
+        reservation is made in :meth:`acquire` (inside the lock) so
+        concurrent callers are staggered correctly *before* the HTTP
+        response is known. This method only resets the circuit state
+        (``_consecutive_429``, ``_circuit_opened_at``, ``_probing``).
+        """
         with self._lock:
             was_open = self._consecutive_429 >= self.MAX_CONSECUTIVE_429
             self._consecutive_429 = 0
-            delay = self.INTER_REQUEST_DELAY + random.uniform(
-                -self.JITTER_SECONDS, self.JITTER_SECONDS
-            )
-            self._next_allowed_at = time.monotonic() + max(0.0, delay)
             self._circuit_opened_at = 0.0
             self._probing = False
         if was_open:

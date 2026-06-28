@@ -60,6 +60,15 @@ class _Task:
 class RedditFetchQueue:
     """Threadsafe scheduled-queue of Reddit fetch coroutine factories."""
 
+    # Minimum spacing (seconds) between any two Reddit fetches scheduled
+    # via `enqueue_all_reddit_fetches`. The combined topfeed + prewarm rate
+    # is `1 / MIN_FETCH_SPACING` requests/second, bounded by the limiter's
+    # 2s+jitter floor. Reddit's observed rate limit is ~1 req per 45s, so
+    # 50s spacing leaves 11% headroom (the limiter adds further slack).
+    MIN_FETCH_SPACING: float = 50.0
+    # Legacy per-kind windows. Kept for `enqueue_spread` callers that
+    # don't pre-compute a window (tests, on-demand paths). The regen
+    # pipeline uses `enqueue_all_reddit_fetches` and does not rely on these.
     SPREAD_WINDOW_TOPFEEDS: float = 2100.0
     SPREAD_WINDOW_PREWARM: float = 2100.0
     POLL_INTERVAL: float = 0.01
@@ -128,6 +137,64 @@ class RedditFetchQueue:
     def wait_until_empty(self, timeout: float | None = None) -> bool:
         """Block until the heap drains. Returns True if drained, False on timeout."""
         return self._idle_event.wait(timeout=timeout)
+
+    def enqueue_all_reddit_fetches(
+        self,
+        topfeed_factories: list[CoroFactory],
+        prewarm_factories: list[CoroFactory],
+        *,
+        min_stride_seconds: float | None = None,
+    ) -> None:
+        """Interleave topfeed + prewarm factories on a single shared window.
+
+        Schedules all `N = len(topfeed) + len(prewarm)` tasks alternately
+        (topfeed[0], prewarm[0], topfeed[1], prewarm[1], ...) with each
+        task `min_stride_seconds` apart. The combined rate is
+        `1 / min_stride_seconds` requests/second, bounded below by the
+        limiter's 2s+jitter floor.
+
+        This is the single coordination point for Reddit fetches during
+        regen: enqueueing topfeed and prewarm via separate
+        `enqueue_spread` calls with overlapping windows would cause
+        timestamp collisions and defeat the purpose of the queue's
+        `target_at` ordering.
+
+        Args:
+            topfeed_factories: topfeed fetcher closures.
+            prewarm_factories: per-story prewarm closures.
+            min_stride_seconds: spacing between consecutive tasks. If
+                None, falls back to the class `MIN_FETCH_SPACING` (50s
+                in production, 0.01s in tests via conftest override).
+        """
+        if min_stride_seconds is None:
+            min_stride_seconds = self.MIN_FETCH_SPACING
+        interleaved: list[CoroFactory] = []
+        n_top = len(topfeed_factories)
+        n_pre = len(prewarm_factories)
+        for i in range(max(n_top, n_pre)):
+            if i < n_top:
+                interleaved.append(topfeed_factories[i])
+            if i < n_pre:
+                interleaved.append(prewarm_factories[i])
+        if not interleaved:
+            return
+        window = len(interleaved) * min_stride_seconds
+        self.enqueue_spread(
+            len(interleaved),
+            time.monotonic(),
+            "combined",
+            interleaved,
+            window_seconds=window,
+        )
+        logger.info(
+            "reddit_fetch_queue: enqueued %d combined tasks (topfeed=%d, "
+            "prewarm=%d) over %.0fs (stride=%.1fs)",
+            len(interleaved),
+            n_top,
+            n_pre,
+            window,
+            min_stride_seconds,
+        )
 
     def _pop_ready(self, now: float) -> _Task | None:
         with self._lock:

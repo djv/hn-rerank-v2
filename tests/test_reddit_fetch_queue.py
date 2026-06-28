@@ -211,3 +211,72 @@ def test_shutdown_stops_worker() -> None:
     q.shutdown(timeout=1.0)
     assert q._stop.is_set() is True
     assert q._thread.is_alive() is False
+
+
+def test_enqueue_all_reddit_fetches_interleaves() -> None:
+    """enqueue_all_reddit_fetches alternates topfeed/prewarm factories on a
+    single shared window. With equal-length lists, the run order is
+    [t0, p0, t1, p1, ...]. The combined stride is min_stride_seconds,
+    so each task is `min_stride` apart.
+    """
+    q = RedditFetchQueue()
+    q.reset()
+    q.POLL_INTERVAL = 0.001
+    q.MIN_FETCH_SPACING = 0.01
+    marker: list[str] = []
+    topfeed = [_marker(marker, f"t{i}") for i in range(3)]
+    prewarm = [_marker(marker, f"p{i}") for i in range(3)]
+    q.enqueue_all_reddit_fetches(topfeed, prewarm, min_stride_seconds=0.01)
+    assert q.wait_until_empty(timeout=2.0) is True
+    # With min_stride=0.01s and 6 tasks, the limiter (2s+jitter
+    # override below) doesn't delay; the queue runs in target order.
+    assert marker == ["t0", "p0", "t1", "p1", "t2", "p2"]
+    assert q.stats()["pending"] == 0
+    assert q.stats()["completed"] == 6
+
+
+def test_enqueue_all_reddit_fetches_uneven_lengths() -> None:
+    """When the lists are uneven, the longer one fills the tail.
+
+    2 topfeed + 4 prewarm → [t0, p0, t1, p1, p2, p3]
+    """
+    q = RedditFetchQueue()
+    q.reset()
+    q.POLL_INTERVAL = 0.001
+    q.MIN_FETCH_SPACING = 0.01
+    marker: list[str] = []
+    topfeed = [_marker(marker, f"t{i}") for i in range(2)]
+    prewarm = [_marker(marker, f"p{i}") for i in range(4)]
+    q.enqueue_all_reddit_fetches(topfeed, prewarm, min_stride_seconds=0.01)
+    assert q.wait_until_empty(timeout=2.0) is True
+    assert marker == ["t0", "p0", "t1", "p1", "p2", "p3"]
+
+
+def test_enqueue_all_reddit_fetches_empty_inputs_noop() -> None:
+    q = RedditFetchQueue()
+    q.reset()
+    q.enqueue_all_reddit_fetches([], [])
+    assert q.wait_until_empty(timeout=0.1) is True
+    assert q.stats()["pending"] == 0
+
+
+def test_enqueue_all_reddit_fetches_uses_class_default_when_no_min_stride() -> None:
+    """Falls back to the class-level MIN_FETCH_SPACING when caller omits
+    the kwarg. For this test we set the class attr to 0.01 so the
+    tasks run in 60ms total.
+    """
+    q = RedditFetchQueue()
+    q.reset()
+    q.POLL_INTERVAL = 0.001
+    orig = RedditFetchQueue.MIN_FETCH_SPACING
+    RedditFetchQueue.MIN_FETCH_SPACING = 0.01
+    try:
+        q.MIN_FETCH_SPACING = 0.01
+        marker: list[str] = []
+        topfeed = [_marker(marker, f"t{i}") for i in range(2)]
+        prewarm = [_marker(marker, f"p{i}") for i in range(2)]
+        q.enqueue_all_reddit_fetches(topfeed, prewarm)
+        assert q.wait_until_empty(timeout=2.0) is True
+        assert marker == ["t0", "p0", "t1", "p1"]
+    finally:
+        RedditFetchQueue.MIN_FETCH_SPACING = orig
