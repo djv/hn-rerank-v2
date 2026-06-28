@@ -142,7 +142,35 @@ A shared `RedditRateLimiter` singleton in `reddit_limiter.py` is consulted by bo
 
 Logging: a WARNING per 429 (`reddit_limiter 429 consecutive=N next_delay=Ns`) and an INFO when the loop short-circuits (`fetch_rss_feeds: reddit circuit open, skipping remaining N feeds` / `prewarm_reddit: circuit open, skipping remaining N stories`). The state attributes (`_next_allowed_at`, `_consecutive_429`) are reset by an autouse `tests/conftest.py` fixture between tests to prevent pollution; tests that exercise the limiter run with a fake monotonic clock and a recording-but-no-op `asyncio.sleep`.
 
-Trade-off: ~100s added per regen (50 feeds × 2s), well within the 3h cycle budget. If regen cadence is later increased, drop `INTER_REQUEST_DELAY` to 1.0s or add an in-process 1h cache of parsed subreddit feed responses as a separate optimization.
+Trade-off: ~100s added per regen (50 feeds × 2s), well within the 3h cycle budget.
+
+#### 3.4.3 Reddit topfeed RSS cache
+
+Added 2026-06-28. An in-memory `RedditFeedCache` singleton in
+`reddit_feed_cache.py` sits in front of the limiter in `fetch_rss_feeds`:
+before each Reddit feed's `reddit_limiter.acquire()`, the cache is queried
+by feed URL.  On hit (`list[Story]` within TTL), the stories are appended
+directly to `feed_results` and the loop continues to the next feed — no
+HTTP request, no limiter consultation, no 429 risk.  On miss, the normal
+fetch + limiter flow runs and the result is stored for `TTL_SECONDS=7200`
+(2h).
+
+**Impact**: Reddit req/hour dropped from ~410 (41 feeds × ~10 regens/h) to
+~4 (41 feeds / 2h TTL × ~1/5 regen windows/h).  Cache hit rate is ~98%
+during the 2h window; misses occur only every 2h when the entire feed list
+expires, or on server restart.
+
+**Design constants**: `TTL_SECONDS=7200` (2h, user-confirmed),
+`MAX_ENTRIES=100` (lazy-eviction on overflow by insertion timestamp).
+`get()` logs one DEBUG line per query (`hit|miss|expired feed=<url>
+age=<s>`).  `reset()` clears all entries and counters — wired into the
+`conftest.py` autouse `reset_reddit_singletons` fixture (renamed from
+`reset_reddit_limiter` to cover both limiter and cache).
+
+The per-story comments-RSS path (server.py `_fetch_reddit_rss_context`,
+called from `prewarm_reddit_top_stories`) does NOT use the cache — each
+story's comment RSS is fetched at most once per lifetime (prewarm filter
+is `not s.top_comments`), so a cache would have near-zero hit rate.
 
 The live dashboard path does not apply a hidden top-1000 prefilter. `fast_rerank_for_user()` pulls the full active story window for the user, excludes only stories already in that user's feedback set, and hands the resulting candidate pool straight to the ranker.
 

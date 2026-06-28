@@ -27,6 +27,7 @@ from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
 
 from database import Database, Story
+from reddit_feed_cache import cache as reddit_feed_cache
 from reddit_limiter import limiter as reddit_limiter
 from transformers import AutoTokenizer
 
@@ -1293,14 +1294,21 @@ async def fetch_rss_feeds(
 
     # Reddit RSS frequently returns 429 when several subreddit feeds are fetched in
     # parallel from the same host, so keep those requests serialized and rate-limited.
+    # An in-memory 2h TTL cache avoids re-fetching subreddit topfeeds on every regen.
     for i, feed in enumerate(reddit_feeds):
+        cached = reddit_feed_cache.get(feed)
+        if cached is not None:
+            feed_results.append(cached)
+            continue
         if not await reddit_limiter.acquire():
             logging.info(
                 "fetch_rss_feeds: reddit circuit open, skipping remaining %d feeds",
                 len(reddit_feeds) - i,
             )
             break
-        feed_results.append(await fetch_and_parse(feed))
+        stories = await fetch_and_parse(feed)
+        reddit_feed_cache.set(feed, stories)
+        feed_results.append(stories)
 
     all_stories = []
     for res in feed_results:

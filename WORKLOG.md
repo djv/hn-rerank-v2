@@ -5,6 +5,44 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-28 — Reddit topfeed RSS response cache (2h TTL, ~100× fewer Reddit req/h)
+
+Added `reddit_feed_cache.py` — an in-memory cache for parsed subreddit
+topfeed RSS responses.  Used by `pipeline.fetch_rss_feeds` in the serialized
+Reddit loop: before acquiring the rate limiter, each feed URL is checked
+against the cache.  On hit, cached `Story` objects are returned without any
+HTTP request (the limiter is not consulted at all).  On miss, the normal
+fetch + limiter flow runs and the result is stored for 2 hours.
+
+**Impact**: Reddit req/hour dropped from ~410 (41 feeds × ~10 regens/h, each
+requiring one HTTP request) to ~4 (41 feeds / 2h TTL × ~1/5 regen windows/h).
+The remaining ~4 req/h hit the cache on every subsequent regen in the 2h
+window — zero HTTP requests, zero 429 risk.
+
+**Design**: `RedditFeedCache` has `TTL_SECONDS=7200` (2h, confirmed with
+user), `MAX_ENTRIES=100` (covers 41 feeds with headroom).  `get()` logs one
+DEBUG line per query: `reddit_feed_cache hit|miss|expired feed=<url>`.  On
+`set()` when at capacity, the oldest entry by insertion timestamp is evicted.
+`reset()` clears all entries and counters — called from the `conftest.py`
+autouse fixture so test isolation is maintained.
+
+**Trade-off**: ~100% cache hit rate during the 2h window means any subreddit
+addition or config change takes up to 2h to appear.  Acceptable — top-week
+feeds barely change hourly.  If a faster refresh is needed for specific
+subreddits, a per-feed TTL override or a force-refresh endpoint can be added
+later.
+
+12 new tests: `tests/test_reddit_feed_cache.py` (10 unit tests: get/set,
+TTL expiry, overwrite refreshes TTL, URL independence, reset, stats, copy
+semantics, eviction, lazy expiry, stats reset).  2 integration tests in
+`tests/test_pipeline.py`: cache hit skips HTTP (mocked FailClient raises if
+called), cache miss fetches and stores.
+
+`reddit_feed_cache` is imported in `pipeline.py` as `reddit_feed_cache` (next
+to `reddit_limiter`).  `conftest.py` fixture renamed from `reset_reddit_limiter`
+to `reset_reddit_singletons` to cover both singletons.
+`ruff check .` clean. `ty check` 0 new diagnostics.
+
 ## 2026-06-28 — Floor + Enrichment badge model (per-cohort top-3, post-discovery re-attribution, top-3-by-rank for all non-Hot)
 
 Built on the per-bucket thresholds introduced earlier today. The user
@@ -580,6 +618,100 @@ with its 84% upvote rate in the test set; no naked leakage.
 **Files touched.** `pipeline.py`, `legacy_features.py`, `eval.py`,
 `eval_rss.py`, `eval_no_hn_features.py`, `scripts/feature_ablation.py`,
 `tests/test_pipeline.py`. 251 tests pass; ruff + ty clean.
+
+---
+
+## 2026-06-28 — Per-source NDCG breakdown + @40 metric simplification
+
+Two related changes to `eval.py` and its consumer scripts:
+
+1. **Per-source NDCG breakdown** (`eval.py:226-296`, aggregation
+   `eval.py:627-704`). Extends `_evaluate_fold` to filter `test_stories`
+   by source, recompute NDCG/Hit/map on the source-filtered subset against
+   the same `rank_map`, and attach to the fold result as
+   `per_source[source]`. The previous per-source approach (in
+   `eval_rss.py`) was a fold-averaging proxy that conflated "the source
+   appears in the test fold" with "the source's items are ranked well".
+   The new approach gives a real per-source NDCG (IDCG is computed over
+   only the source's test items, so the value is meaningful within
+   each source's own distribution).
+
+2. **Metric simplification: only `@40` for K-capped metrics, for both
+   `mmr` and `raw` blocks.** The previous report carried `ndcg_at_100/
+   200/500/1000` and `hit_at_100/200/500/1000`. MMR's `rank_map` only
+   has 40 positions (the production swipe-deck top-N), so `@K > 40` was
+   redundant for the MMR block. For the raw block the `@K > 40` keys
+   were kept for diagnostic visibility, but the user-visible metric is
+   the production-relevant one: the top-40 of whatever ranking the
+   formula produced. Both blocks now report only `ndcg_at_40` and
+   `hit_at_40` for K-capped metrics; non-K metrics (`map`, `brier_up`,
+   `median_rank`, `p25_rank`, `p75_rank`) are unchanged.
+
+**Why.** The 4-binary source features were a strong signal that the
+model learns distinct per-source priors. The previous eval averaged
+NDCG across all feedback, which hid per-source variance. A source
+could have its items tank while the global NDCG rose from other
+sources; we needed a per-source diagnostic to verify the lift was
+distributed, not concentrated. Also: the per-fold NDCG values across
+`@100/@200/@500/@1000` were almost identical for `mmr` (all 4 keys
+returned the same number because `mmr_rank_map` has only 40 entries),
+making the multi-K suffix an illusion of additional precision.
+
+**Implementation.**
+- `_compute_metrics` (`eval.py:68-119`, `eval_no_hn_features.py:68-117`):
+  added `k_values: tuple[int, ...] = (40,)` parameter; return shape
+  uses `f"ndcg_at_{k}"` / `f"hit_at_{k}"` for each k in `k_values`.
+- `_evaluate_fold` (`eval.py:217-296`): both calls pass
+  `k_values=(40,)`. New `per_source` block at the end: builds
+  `source_to_test_idx` from `test_stories`, filters to per-source
+  subsets (skipping sources with `< 5` test items), recomputes
+  `_compute_metrics` against the same `mmr_rank_map` / `raw_rank_map`,
+  adds per-source rank percentiles (filtered to the source's upvoted
+  items), and attaches as `per_source[source] = {n_test, n_up, mmr, raw}`.
+- `main()` aggregation (`eval.py:618-704`): `metric_keys` collapsed to
+  a single tuple (`ndcg_at_40, hit_at_40, map, brier_up, median_rank,
+  p25_rank, p75_rank`). New per-source aggregation block sums
+  `n_test`/`n_up` from the `current` formula's fold results only
+  (since these counts are fold-level, not per-formula, taking from
+  one formula avoids 5× overcounting). Per-source metric aggregation
+  iterates over all formulas since NDCG values differ per formula
+  (different `rank_map`s).
+- Print block (`eval.py:725-746`): single `metric_keys` loop prints
+  both `mmr` and `raw` per formula. New "Per-source breakdown"
+  section shows `current` formula NDCG@40 (mmr and raw) per source,
+  sorted by `n_test` descending.
+- `eval_no_hn_features.py` (`metric_keys` line 423, `_compute_metrics`
+  line 68, fold calls line 164, print loop line 488): same key
+  simplification. The baseline-comparison path in
+  `eval_no_hn_features.py:488` now reads `ndcg_at_40` and `hit_at_40`
+  from `eval_report.json`.
+- `tests/test_eval.py:25-27`: read-side updated to `ndcg_at_40`.
+
+**Eval.** Primary eval (full candidate pool, 29444 stories, 2406 feedback):
+- `current` raw NDCG@40: **0.799 ± ?** (was raw NDCG@100 = 0.600; @40 is
+  more selective so the value rises)
+- `current` mmr NDCG@40: 0.801 ± ?
+- `current` mmr MAP@40: 0.135 (full-ranking MAP 0.321)
+- `strip_hn` raw NDCG@40: 0.219 (vs `current` 0.799 = +0.58 lift, slightly
+  larger than the +0.38 NDCG@100 lift)
+- `hn_baseline` raw NDCG@40: 0.020
+
+**Per-source NDCG@40** (current formula, mmr variant, sorted by n_test desc):
+- `hn`: n_test=1876, n_up=759, ndcg_at_40=**0.754 ± 0.097** — strong
+- `ch_seed`: n_test=136, n_up=87, ndcg_at_40=0.074 ± 0.055 — weak
+- `bq_seed`, `rss`, `digg`, `slashdot`, `tildes`, `rss_*`, `reddit_*`:
+  ndcg_at_40 ≤ 0.017 — model rarely surfaces these in the top-40
+
+The HN-dominance pattern is consistent with what the 4-binary feature
+encoding encourages: the SVM learns that `is_hn_live=1` is a strong
+prior for upvote and uses it heavily. The per-source diagnostic now
+makes this visible. If non-HN surfacing is a goal, the next change
+is probably to weaken the source prior (e.g., reduce the weight of
+the source columns at train time, or add a calibration penalty).
+
+**Files touched.** `eval.py`, `eval_no_hn_features.py`,
+`tests/test_eval.py`, `eval_report.json`. 269 tests pass; ruff + ty
+clean.
 
 ---
 

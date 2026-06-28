@@ -721,6 +721,110 @@ async def test_fetch_rss_feeds_populates_self_text(tmp_path, monkeypatch):
     assert "K line is cute but smells" in s.text_content
 
 
+async def test_fetch_rss_feeds_cache_hit_skips_http(tmp_path, monkeypatch):
+    """Cache hit should return cached stories without making any HTTP request."""
+    from pipeline import fetch_rss_feeds, reddit_feed_cache
+
+    db = Database(str(tmp_path / "test.db"))
+
+    cached_stories = [
+        Story(
+            id=-1,
+            title="Cached Story",
+            url="http://example.com/1",
+            score=10,
+            time=1_000_000,
+            text_content="cached",
+            source="rss_reddit_test",
+        )
+    ]
+    reddit_feed_cache.set(
+        "https://www.reddit.com/r/test/top/.rss?t=week&limit=25",
+        cached_stories,
+    )
+
+    class FailClient:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+        async def get(self, url, headers=None):
+            raise RuntimeError("HTTP call made despite cache hit")
+
+    monkeypatch.setattr("pipeline.httpx.AsyncClient", FailClient)
+    pipeline.reddit_limiter.INTER_REQUEST_DELAY = 0.0
+
+    stories = await fetch_rss_feeds(
+        ["https://www.reddit.com/r/test/top/.rss?t=week&limit=25"],
+        per_feed=10,
+        days=30,
+        exclude_urls=set(),
+        db=db,
+    )
+
+    assert len(stories) == 1
+    assert stories[0].title == "Cached Story"
+
+
+async def test_fetch_rss_feeds_cache_miss_fetches_and_caches(tmp_path, monkeypatch):
+    """Cache miss should fetch, cache, and return stories."""
+    from pipeline import fetch_rss_feeds, reddit_feed_cache
+
+    db = Database(str(tmp_path / "test.db"))
+
+    def rss_doc(title: str, link: str) -> str:
+        return f"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>Test</title>
+<item><title>{title}</title><link>{link}</link><pubDate>Tue, 23 Jun 2026 12:00:00 GMT</pubDate><description>test body</description></item>
+</channel></rss>"""
+
+    class MockResp:
+        status_code = 200
+
+        def __init__(self, t: str):
+            self.text = t
+
+    class MockClient:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+        async def get(self, url, headers=None):
+            return MockResp(rss_doc("Fresh Story", url + "/comments/x/"))
+
+    monkeypatch.setattr("pipeline.httpx.AsyncClient", MockClient)
+    pipeline.reddit_limiter.INTER_REQUEST_DELAY = 0.0
+
+    reddit_feed_cache.reset()
+
+    stories = await fetch_rss_feeds(
+        ["https://www.reddit.com/r/test/top/.rss?t=week&limit=25"],
+        per_feed=10,
+        days=30,
+        exclude_urls=set(),
+        db=db,
+    )
+
+    assert len(stories) == 1
+    assert stories[0].title == "Fresh Story"
+
+    cached = reddit_feed_cache.get(
+        "https://www.reddit.com/r/test/top/.rss?t=week&limit=25"
+    )
+    assert cached is not None
+    assert cached[0].title == "Fresh Story"
+
+
 async def test_prewarm_reddit_top_stories_fetches_comments(tmp_path, monkeypatch):
     """prewarm_reddit_top_stories fetches and stores Reddit RSS comments."""
     import server
