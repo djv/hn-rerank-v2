@@ -797,12 +797,6 @@ class Handler(BaseHTTPRequestHandler):
             len(cls._dashboard_versions),
         )
 
-    @staticmethod
-    def _feedback_should_refresh(data: dict) -> bool:
-        if data.get("refresh_ranking") is True:
-            return True
-        return "queue_remaining" not in data
-
     def do_POST(self) -> None:
         if self.path == "/api/feedback":
             user = self._get_user()
@@ -827,18 +821,24 @@ class Handler(BaseHTTPRequestHandler):
                         action,
                     )
 
-                ranking_refresh_queued = self._feedback_should_refresh(data)
-                if ranking_refresh_queued:
-                    # Invalidate user's dashboard cache and warm the next render async.
-                    version = self._invalidate_dashboard_cache(user.id)
-                    self._trigger_warm(user, version)
+                # Invalidate the user's dashboard cache and kick a warm for
+                # the new version on every vote, so a subsequent refill cannot
+                # serve an HTML deck that includes a story the user just voted
+                # on. The previous "defer until queue low / every 5 votes"
+                # gating left the cached HTML stale for up to ~9s per burst;
+                # the SWR stale-hit path then re-injected already-voted
+                # stories via refillQueue (the bug observed on 2026-06-28).
+                # Bursty votes still produce N sequential warm threads per
+                # user; the existing version-skip check in _trigger_warm
+                # discards obsolete results, and the render lock serializes
+                # them, so only the latest version lands in the cache.
+                version = self._invalidate_dashboard_cache(user.id)
+                self._trigger_warm(user, version)
 
-                    # Also trigger background regen for candidate updates
-                    self.regen_event.set()
+                # Also trigger background regen for candidate updates
+                self.regen_event.set()
 
-                self._json_response(
-                    {"ok": True, "ranking_refresh_queued": ranking_refresh_queued}
-                )
+                self._json_response({"ok": True, "ranking_refresh_queued": True})
             except Exception as e:
                 logging.error(f"Error handling feedback: {e}")
                 self._json_response({"error": str(e)}, status=400)

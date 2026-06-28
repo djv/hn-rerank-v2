@@ -190,12 +190,20 @@ def test_feedback_post(test_env):
     assert regen_event.is_set()
 
 
-def test_feedback_post_defers_refresh_when_queue_not_low(test_env):
-    port, db, regen_event, _, user = test_env
+def test_feedback_post_invalidates_cache_on_every_vote(test_env):
+    """Every vote bumps the dashboard version and triggers a warm, regardless
+    of client-supplied ``queue_remaining`` or ``refresh_ranking`` hints.
+
+    Regression: the previous "defer until queue low / every 5 votes" gating
+    left the cached HTML stale for up to ~9s per burst; the SWR stale-hit
+    path then re-injected already-voted stories via ``refillQueue`` (the bug
+    observed on 2026-06-28).
+    """
+    port, db, regen_event, handler, user = test_env
     db.upsert_story(
         Story(
             id=1000,
-            title="Deferred refresh story",
+            title="Always invalidate story",
             url="https://example.com",
             score=100,
             time=1600000000,
@@ -204,6 +212,9 @@ def test_feedback_post_defers_refresh_when_queue_not_low(test_env):
         )
     )
     regen_event.clear()
+
+    starting_version = handler._dashboard_version(user.id)
+    assert starting_version == 0
 
     resp = httpx.post(
         f"http://127.0.0.1:{port}/api/feedback",
@@ -212,17 +223,22 @@ def test_feedback_post_defers_refresh_when_queue_not_low(test_env):
     )
 
     assert resp.status_code == 200
-    assert resp.json() == {"ok": True, "ranking_refresh_queued": False}
+    assert resp.json() == {"ok": True, "ranking_refresh_queued": True}
     assert len(db.get_all_feedback(user.id)) == 1
-    assert not regen_event.is_set()
+    assert handler._dashboard_version(user.id) == starting_version + 1
+    assert regen_event.is_set()
 
 
-def test_feedback_post_does_not_refresh_from_queue_depth_alone(test_env):
-    port, db, regen_event, _, user = test_env
+def test_feedback_post_invalidates_cache_with_low_queue(test_env):
+    """Even a vote with ``queue_remaining: 4`` (low watermark) invalidates
+    the cache. Belt for the client-side ``votedStoryIds`` filter (which
+    also catches stale SWR refills).
+    """
+    port, db, regen_event, handler, user = test_env
     db.upsert_story(
         Story(
             id=1001,
-            title="Low queue refresh story",
+            title="Low queue invalidate story",
             url="https://example.com",
             score=100,
             time=1600000000,
@@ -232,6 +248,8 @@ def test_feedback_post_does_not_refresh_from_queue_depth_alone(test_env):
     )
     regen_event.clear()
 
+    starting_version = handler._dashboard_version(user.id)
+
     resp = httpx.post(
         f"http://127.0.0.1:{port}/api/feedback",
         json={"story_id": 1001, "action": "up", "queue_remaining": 4},
@@ -239,9 +257,9 @@ def test_feedback_post_does_not_refresh_from_queue_depth_alone(test_env):
     )
 
     assert resp.status_code == 200
-    assert resp.json() == {"ok": True, "ranking_refresh_queued": False}
-    assert len(db.get_all_feedback(user.id)) == 1
-    assert not regen_event.is_set()
+    assert resp.json() == {"ok": True, "ranking_refresh_queued": True}
+    assert handler._dashboard_version(user.id) == starting_version + 1
+    assert regen_event.is_set()
 
 
 def test_feedback_post_refreshes_when_client_requests_ranking(test_env):
@@ -274,6 +292,65 @@ def test_feedback_post_refreshes_when_client_requests_ranking(test_env):
     assert resp.json() == {"ok": True, "ranking_refresh_queued": True}
     assert len(db.get_all_feedback(user.id)) == 1
     assert regen_event.is_set()
+
+
+def test_feedback_post_bumps_cache_version_for_warm_rerender(test_env, monkeypatch):
+    """End-to-end: vote on a story → cache version bumps → warm renders →
+    cached HTML no longer contains the voted story.
+
+    Regression for the 2026-06-28 bug where the dashboard served a
+    pre-vote HTML deck via the SWR stale-hit path, re-injecting the
+    just-voted story into the refill queue.
+    """
+    port, db, _, handler, user = test_env
+
+    voted_story = Story(
+        id=4242,
+        title="Voted story",
+        url="https://example.com/voted",
+        score=100,
+        time=1600000000,
+        text_content="Voted body",
+        source="hn",
+    )
+    db.upsert_story(voted_story)
+
+    def fake_fast_rerank_for_user(database, config, embedder, user_id):
+        return []
+
+    def fake_generate_dashboard_bytes(ranked, config, database, user_id, user_token):
+        version = handler._dashboard_version(user_id)
+        body = f"version={version}"
+        if voted_story.id not in (s.id for s in ranked):
+            body += f" excluded={voted_story.id}"
+        return body.encode()
+
+    import pipeline
+
+    monkeypatch.setattr(pipeline, "fast_rerank_for_user", fake_fast_rerank_for_user)
+    monkeypatch.setattr(
+        pipeline, "generate_dashboard_bytes", fake_generate_dashboard_bytes
+    )
+
+    pre_version = handler._dashboard_version(user.id)
+    assert pre_version == 0
+
+    resp = httpx.post(
+        f"http://127.0.0.1:{port}/api/feedback",
+        json={"story_id": voted_story.id, "action": "up", "queue_remaining": 6},
+        cookies={"hn_token": user.token},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "ranking_refresh_queued": True}
+
+    post_version = handler._dashboard_version(user.id)
+    assert post_version == pre_version + 1, (
+        "vote must bump the dashboard version so the SWR stale-hit "
+        "cannot return the pre-vote HTML"
+    )
+
+    fresh_html = _wait_for_cache(handler, user, post_version)
+    assert f"version={post_version}" in fresh_html.decode()
 
 
 def test_feedback_clear(test_env):
@@ -1856,3 +1933,37 @@ def test_data_is_recent_attribute_emitted(test_env):
     old_card = old_card_pat.group(0)
     assert 'data-is-recent="1"' in recent_card
     assert 'data-is-recent="0"' in old_card
+
+
+def test_inline_script_has_voted_story_ids_filter():
+    """The client-side ``votedStoryIds`` Set and the refillQueue filter are
+    the defense-in-depth for the 2026-06-28 stale-fetch bug: even if a SWR
+    stale-hit returns the pre-vote HTML, refillQueue suppresses any incoming
+    card whose storyId is in the session-scoped voted set.
+    """
+    _, inline_script = _read_template_and_static()
+    assert "votedStoryIds = new Set()" in inline_script
+    # submitVote adds to the set; undoLastVote removes from it
+    submit_vote_block = inline_script.split("function submitVote(", 1)[1].split(
+        "function ", 1
+    )[0]
+    assert "votedStoryIds.add(storyId)" in submit_vote_block
+    undo_block = inline_script.split("function undoLastVote()", 1)[1].split(
+        "function ", 1
+    )[0]
+    assert "votedStoryIds.delete(storyId)" in undo_block
+    # refillQueue must skip incoming cards whose id is in the set
+    refill_block = inline_script.split("function refillQueue(", 1)[1].split(
+        "function ", 1
+    )[0]
+    assert "votedStoryIds.has(Number(storyId))" in refill_block
+    # The sendFeedback catch handler must roll back the in-memory "voted"
+    # state when the request fails. Otherwise a transient network error
+    # would leave the storyId in votedStoryIds for the rest of the session
+    # and refillQueue would suppress that story from the next refill even
+    # though no vote was actually saved to the DB.
+    submit_catch = inline_script.split("Network error submitting feedback", 1)[1].split(
+        ".finally", 1
+    )[0]
+    assert "votedStoryIds.delete(storyId)" in submit_catch
+    assert "delete card.dataset.voted" in submit_catch

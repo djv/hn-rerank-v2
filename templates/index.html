@@ -1008,6 +1008,7 @@
     let preloadedRefillDoc = null;
     let isPreloadingRefill = false;
     let preloadRefillPromise = null;
+    const votedStoryIds = new Set();
     const MAX_QUEUE = 12;
     const LOW_WATERMARK = 4;
     const PREFETCH_COUNT = 3;
@@ -1358,13 +1359,23 @@
       });
       const existing = new Set(cards().map(card => card.dataset.storyId));
       const incoming = Array.from(newStories.querySelectorAll('.story-card'));
+      let suppressedVoted = 0;
       for (const card of incoming) {
         const storyId = card.dataset.storyId;
         if (!storyId || existing.has(storyId)) {
           continue;
         }
+        if (votedStoryIds.has(Number(storyId))) {
+          suppressedVoted += 1;
+          continue;
+        }
         storiesContainer.appendChild(card);
         existing.add(storyId);
+      }
+      if (suppressedVoted > 0) {
+        console.debug(
+          `refillQueue: suppressed ${suppressedVoted} already-voted card(s) from stale fetch`
+        );
       }
 
       applyGradient();
@@ -1478,6 +1489,7 @@
       }
 
       const storyId = Number(card.dataset.storyId);
+      votedStoryIds.add(storyId);
       const applyExistingRefillAfterVote = refillQueued && pendingFeedbackRequests === 0;
       votesSinceRankingRefresh += 1;
       updateRefreshProgress();
@@ -1531,6 +1543,8 @@
         return data;
       }).catch(err => {
         console.error('Network error submitting feedback', err);
+        votedStoryIds.delete(storyId);
+        delete card.dataset.voted;
         refreshBannerText.textContent = 'Vote failed to save';
         refreshBanner.hidden = false;
         refreshNowBtn.hidden = true;
@@ -1555,6 +1569,7 @@
       lastVote = null;
 
       const { storyId, action, card, savePromise } = vote;
+      votedStoryIds.delete(storyId);
       delete card.dataset.voted;
       card.classList.remove('fade-out');
       document.querySelectorAll('[data-fb]').forEach(btn => {

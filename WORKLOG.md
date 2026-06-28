@@ -5,6 +5,78 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-28 — Voting no longer leaves the just-voted story in the next refill
+
+**Symptom:** Voting on a story, then waiting for the swipe deck to
+auto-refill (low queue, sort/age tab switch, or "Refresh" button),
+showed the just-voted story again at the top of the new cards. The
+"already voted" badge was not present; the story was being treated as
+fresh by the refill queue. Reproduced live with the `default` token
+against the running service: story 48680260 (voted neutral at
+`18:53:16`) appeared in the dashboard fetched at `18:55:17` — 1 of 2481
+feedback rows leaked into the served HTML.
+
+**Root cause:** `POST /api/feedback` only invalidated the user's
+dashboard cache when the client sent `refresh_ranking=true` (every 5th
+vote) or omitted `queue_remaining` (older clients). For every other
+vote the cache version stayed at the pre-vote value, the SWR
+`result=stale_hit cache_version=N` path returned the *pre-vote* HTML
+for the next ~9s, and the client's `refillQueue` appended the stale
+card back into the DOM. The dedup set in `refillQueue` was built from
+`cards()` — voted-and-`remove()`d cards are not in the DOM, so their
+story IDs were not in the set, and the stale card passed through. Not
+a `localStorage` issue: `localStorage` was only ever used for the
+first-time tip overlay flag.
+
+**Fix:** two-part change.
+
+1. `server.py:do_POST /api/feedback` — drop the
+   `_feedback_should_refresh` gate. Every successful vote (including
+   `action: "clear"`) calls `_invalidate_dashboard_cache` and
+   `_trigger_warm` for the new version, and sets the regen event. The
+   existing per-`(user_id, version)` in-flight set and version-skip
+   check coalesce bursty votes; the per-user render lock serializes
+   them. Bursty votes still produce N sequential warm threads per
+   user (the latest version's warm is the only one that lands in the
+   cache), but the prior "defer for up to 4 votes" window during which
+   the bug was reproducible is closed.
+
+2. `templates/index.html:refillQueue` — maintain a session-scoped
+   `votedStoryIds = new Set()`. `submitVote` adds the story ID;
+   `undoLastVote` removes it. `refillQueue` skips any incoming card
+   whose `storyId` is in the set. This is defense-in-depth: even if
+   the SWR stale-hit path returns the pre-vote HTML for any reason
+   (e.g. a new prewarm window hasn't completed), the voted story
+   cannot re-enter the deck.
+
+**Tests:** `tests/test_server.py` flipped the two defer tests
+(`test_feedback_post_defers_refresh_when_queue_not_low`,
+`test_feedback_post_does_not_refresh_from_queue_depth_alone`) into
+`test_feedback_post_invalidates_cache_on_every_vote` and
+`test_feedback_post_invalidates_cache_with_low_queue` — both assert
+that the dashboard version is bumped and the regen event is set for
+every vote, regardless of `queue_remaining` or `refresh_ranking` hints.
+Added `test_feedback_post_bumps_cache_version_for_warm_rerender` for
+end-to-end: vote → version bump → wait for warm → cached HTML has the
+new version. Added `test_inline_script_has_voted_story_ids_filter` to
+guard the client-side filter against accidental removal during future
+refactors.
+
+**Cost:** 1 invalidation + 1 `_trigger_warm` per vote. With 5 votes
+in 30s, this is 5 sequential warm threads (5 × ~9s of CPU each, of
+which only the last lands in the cache) versus the old 1 warm per
+5-vote burst. Async, non-blocking from the user's perspective. The
+5-segment refresh progress bar still fills 0 → 5 → reset every vote
+(now cosmetic — the threshold is met on every vote) but the user
+didn't ask to remove the bar.
+
+**ARCHITECTURE.md:** updated §3.12 "Feedback API" and "Frontend"
+to reflect the new behavior and the session-scoped `votedStoryIds`
+set; the previous comment claimed `data-voted` was "always empty" and
+implied localStorage was the (non-)source of the problem, both wrong.
+
+---
+
 ## 2026-06-28 — Reddit rate-limit adaptation: config-driven spread + x-ratelimit-reset on 429
 
 **Symptom (this session):** The Phase 1A+C+E deploy at 16:49 spread
