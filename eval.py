@@ -17,6 +17,7 @@ import math
 import time
 from collections import Counter
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from sklearn.model_selection import StratifiedKFold
@@ -27,9 +28,12 @@ from database import Database, Story
 from legacy_features import _augment_features
 from pipeline import (
     Config,
+    Embedder,
     RankedStory,
     _knn_similarity,
     mmr_filter,
+    rerank_candidates,
+    story_embedding_text,
 )
 
 MODEL_VERSION = "all-MiniLM-L6-v2|mean|norm|256"
@@ -72,6 +76,7 @@ def _compute_metrics(
     test_rel: np.ndarray,
     all_test_rels: list[float],
     brier_up: float = 0.0,
+    k_values: tuple[int, ...] = (40,),
 ) -> dict:
     rel_by_pos = {}
     for i, ts in enumerate(test_stories):
@@ -104,15 +109,12 @@ def _compute_metrics(
         ap = 0.0
 
     return {
-        "ndcg_at_100": _ndcg(rel_by_pos, all_test_rels, 100),
-        "ndcg_at_200": _ndcg(rel_by_pos, all_test_rels, 200),
-        "ndcg_at_500": _ndcg(rel_by_pos, all_test_rels, 500),
-        "ndcg_at_1000": _ndcg(rel_by_pos, all_test_rels, 1000),
-        "hit_at_100": sum(1 for p in rel_by_pos if p < 100) / max(len(test_stories), 1),
-        "hit_at_200": sum(1 for p in rel_by_pos if p < 200) / max(len(test_stories), 1),
-        "hit_at_500": sum(1 for p in rel_by_pos if p < 500) / max(len(test_stories), 1),
-        "hit_at_1000": sum(1 for p in rel_by_pos if p < 1000)
-        / max(len(test_stories), 1),
+        **{f"ndcg_at_{k}": _ndcg(rel_by_pos, all_test_rels, k) for k in k_values},
+        **{
+            f"hit_at_{k}": sum(1 for p in rel_by_pos if p < k)
+            / max(len(test_stories), 1)
+            for k in k_values
+        },
         "map": ap,
         "brier_up": brier_up,
     }
@@ -180,14 +182,26 @@ def _evaluate_fold(
     top40 = mmr_filter(ranked, emb_map, threshold=mmr_threshold, limit=mmr_limit)
     mmr_rank_map = {rs.story.id: pos for pos, rs in enumerate(top40)}
     mmr_metrics = _compute_metrics(
-        mmr_rank_map, test_stories, test_actions, test_rel, all_test_rels, brier_up
+        mmr_rank_map,
+        test_stories,
+        test_actions,
+        test_rel,
+        all_test_rels,
+        brier_up,
+        k_values=(40,),
     )
 
     # Raw ranking (no MMR, diagnostic) — full ranking for meaningful MAP
     raw_ranked = ranked
     raw_rank_map = {rs.story.id: pos for pos, rs in enumerate(raw_ranked)}
     raw_metrics = _compute_metrics(
-        raw_rank_map, test_stories, test_actions, test_rel, all_test_rels, brier_up
+        raw_rank_map,
+        test_stories,
+        test_actions,
+        test_rel,
+        all_test_rels,
+        brier_up,
+        k_values=(40,),
     )
 
     # Calculate rank statistics of upvoted test stories in overall ranked candidates
@@ -206,7 +220,234 @@ def _evaluate_fold(
     raw_metrics["p25_rank"] = p25_rank
     raw_metrics["p75_rank"] = p75_rank
 
-    return {"mmr": mmr_metrics, "raw": raw_metrics}
+    # Per-source NDCG: filter test_stories by source and recompute metrics on
+    # the source-filtered subset, against the same rank_map. This gives a real
+    # per-source NDCG (not a fold-averaged proxy).
+    source_to_test_idx: dict[str, list[int]] = {}
+    for i, ts in enumerate(test_stories):
+        source_to_test_idx.setdefault(ts.source, []).append(i)
+
+    per_source: dict[str, dict] = {}
+    for source, indices in source_to_test_idx.items():
+        n_test = len(indices)
+        if n_test < 5:
+            continue
+        n_up = sum(1 for i in indices if test_actions[i] == 2)
+        src_stories = [test_stories[i] for i in indices]
+        src_actions = test_actions[indices]
+        src_rel = test_rel[indices]
+        src_all_rels = src_rel.tolist()
+        # brier_up is a fold-level calibration metric; not meaningful per-source.
+        src_mmr = _compute_metrics(
+            mmr_rank_map,
+            src_stories,
+            src_actions,
+            src_rel,
+            src_all_rels,
+            brier_up=0.0,
+            k_values=(40,),
+        )
+        src_raw = _compute_metrics(
+            raw_rank_map,
+            src_stories,
+            src_actions,
+            src_rel,
+            src_all_rels,
+            brier_up=0.0,
+            k_values=(40,),
+        )
+        # Per-source rank percentiles of upvoted test items
+        src_upvote_ranks_raw = sorted(
+            raw_rank_map[test_stories[i].id]
+            for i in indices
+            if test_actions[i] == 2 and test_stories[i].id in raw_rank_map
+        )
+        src_raw["median_rank"] = (
+            float(np.median(src_upvote_ranks_raw)) if src_upvote_ranks_raw else 0.0
+        )
+        src_raw["p25_rank"] = (
+            float(np.percentile(src_upvote_ranks_raw, 25))
+            if src_upvote_ranks_raw
+            else 0.0
+        )
+        src_raw["p75_rank"] = (
+            float(np.percentile(src_upvote_ranks_raw, 75))
+            if src_upvote_ranks_raw
+            else 0.0
+        )
+        src_upvote_ranks_mmr = sorted(
+            mmr_rank_map[test_stories[i].id]
+            for i in indices
+            if test_actions[i] == 2 and test_stories[i].id in mmr_rank_map
+        )
+        src_mmr["median_rank"] = (
+            float(np.median(src_upvote_ranks_mmr)) if src_upvote_ranks_mmr else 0.0
+        )
+        src_mmr["p25_rank"] = (
+            float(np.percentile(src_upvote_ranks_mmr, 25))
+            if src_upvote_ranks_mmr
+            else 0.0
+        )
+        src_mmr["p75_rank"] = (
+            float(np.percentile(src_upvote_ranks_mmr, 75))
+            if src_upvote_ranks_mmr
+            else 0.0
+        )
+        per_source[source] = {
+            "n_test": n_test,
+            "n_up": n_up,
+            "mmr": src_mmr,
+            "raw": src_raw,
+        }
+
+    return {"mmr": mmr_metrics, "raw": raw_metrics, "per_source": per_source}
+
+
+def _compute_final_queue_metrics(
+    fold_candidates: list[Story],
+    fold_cand_emb: np.ndarray,
+    fb_train_stories: list[Story],
+    y_train: np.ndarray,
+    cand_emb: np.ndarray,
+    cand_id_to_idx: dict[int, int],
+    config: Config,
+    embedder: Embedder,
+    fold_idx: int,
+    test_stories: list[Story],
+    test_actions: np.ndarray,
+) -> dict:
+    """Run the production pipeline (rerank_candidates) per fold and measure
+    NDCG@40 on the final queue (post-MMR, post-discovery-passes, post-sort).
+
+    Returns {"mmr": metrics, "per_source": {source: ...}}.
+    Returns empty dict on failure.
+    """
+    db = Database(":memory:")
+    uid = 1000 + fold_idx
+
+    sid_to_emb: dict[int, np.ndarray] = {}
+    for s, emb in zip(fold_candidates, fold_cand_emb):
+        sid_to_emb[s.id] = emb
+    for s in fb_train_stories:
+        idx = cand_id_to_idx.get(s.id)
+        if idx is not None:
+            sid_to_emb[s.id] = cand_emb[idx]
+
+    all_stories: dict[int, Story] = {s.id: s for s in fold_candidates}
+    for s in fb_train_stories:
+        all_stories[s.id] = s
+
+    for s in all_stories.values():
+        db.upsert_story(s)
+
+    for sid, emb in sid_to_emb.items():
+        s = all_stories[sid]
+        text = story_embedding_text(s)
+        text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        db.upsert_embedding(sid, MODEL_VERSION, text_hash, emb)
+
+    for s, a in zip(fb_train_stories, y_train):
+        action = "down" if int(a) == 0 else "neutral" if int(a) == 1 else "up"
+        db.upsert_feedback(uid, s.id, action)
+
+    try:
+        final = rerank_candidates(
+            db, config, embedder, fold_candidates, fold_cand_emb, user_id=uid
+        )
+    except Exception:
+        # Final queue unavailable (e.g. embedder model dir missing, backend error)
+        db.close()
+        return {}
+
+    if not final:
+        db.close()
+        return {}
+
+    final_top40 = final[:40]
+    final_rank_map = {r.story.id: pos for pos, r in enumerate(final_top40)}
+
+    rel_map = {0: 0.0, 1: 0.2, 2: 1.0}
+    test_rel = np.array([rel_map[int(a)] for a in test_actions])
+    all_test_rels = test_rel.tolist()
+
+    final_cand_id_to_idx = {r.story.id: i for i, r in enumerate(final)}
+    test_probs_up: list[float] = []
+    test_binary_up: list[float] = []
+    for i, ts in enumerate(test_stories):
+        fi = final_cand_id_to_idx.get(ts.id)
+        if fi is not None:
+            p = final[fi].prob_up
+            if p is not None:
+                test_probs_up.append(p)
+                test_binary_up.append(1.0 if test_actions[i] == 2 else 0.0)
+    brier_up = (
+        float(np.mean((np.array(test_probs_up) - np.array(test_binary_up)) ** 2))
+        if test_probs_up
+        else 0.0
+    )
+
+    metrics = _compute_metrics(
+        final_rank_map,
+        test_stories,
+        test_actions,
+        test_rel,
+        all_test_rels,
+        brier_up,
+        k_values=(40,),
+    )
+
+    # Rank percentiles across the full final queue (not just top-40)
+    test_upvote_ids = {s.id for i, s in enumerate(test_stories) if test_actions[i] == 2}
+    upvote_ranks = [pos for pos, r in enumerate(final) if r.story.id in test_upvote_ids]
+    metrics["median_rank"] = float(np.median(upvote_ranks)) if upvote_ranks else 0.0
+    metrics["p25_rank"] = (
+        float(np.percentile(upvote_ranks, 25)) if upvote_ranks else 0.0
+    )
+    metrics["p75_rank"] = (
+        float(np.percentile(upvote_ranks, 75)) if upvote_ranks else 0.0
+    )
+
+    source_to_test_idx: dict[str, list[int]] = {}
+    for i, ts in enumerate(test_stories):
+        source_to_test_idx.setdefault(ts.source, []).append(i)
+
+    per_source: dict[str, dict] = {}
+    for source, indices in source_to_test_idx.items():
+        n_test = len(indices)
+        if n_test < 5:
+            continue
+        n_up = sum(1 for i in indices if test_actions[i] == 2)
+        src_stories = [test_stories[i] for i in indices]
+        src_actions = test_actions[indices]
+        src_rel = test_rel[indices]
+        src_all_rels = src_rel.tolist()
+        src_mmr = _compute_metrics(
+            final_rank_map,
+            src_stories,
+            src_actions,
+            src_rel,
+            src_all_rels,
+            brier_up=0.0,
+            k_values=(40,),
+        )
+        src_upvote_ranks = sorted(
+            final_rank_map[test_stories[i].id]
+            for i in indices
+            if test_actions[i] == 2 and test_stories[i].id in final_rank_map
+        )
+        src_mmr["median_rank"] = (
+            float(np.median(src_upvote_ranks)) if src_upvote_ranks else 0.0
+        )
+        src_mmr["p25_rank"] = (
+            float(np.percentile(src_upvote_ranks, 25)) if src_upvote_ranks else 0.0
+        )
+        src_mmr["p75_rank"] = (
+            float(np.percentile(src_upvote_ranks, 75)) if src_upvote_ranks else 0.0
+        )
+        per_source[source] = {"n_test": n_test, "n_up": n_up, "mmr": src_mmr}
+
+    db.close()
+    return {"mmr": metrics, "per_source": per_source}
 
 
 def main() -> None:
@@ -243,6 +484,12 @@ def main() -> None:
     user = db.get_user_by_token("default")
     if user is None:
         raise RuntimeError("Missing default user token")
+
+    try:
+        embedder: Embedder | None = Embedder("onnx_model")
+    except Exception as exc:
+        print(f"Warning: Embedder not available ({exc}); skipping final_queue metrics.")
+        embedder = None
 
     # Feedback
     fb_stories, fb_labels, fb_vote_times = db.get_feedback_for_training(user_id=user.id)
@@ -304,6 +551,7 @@ def main() -> None:
 
     formulas = ["current", "up_only", "strip_hn", "hn_baseline", "knn_diff"]
     results: dict[str, list[dict]] = {f: [] for f in formulas}
+    final_queue_results: list[dict] = []
 
     folds = list(
         StratifiedKFold(n_splits=5, shuffle=True, random_state=0).split(
@@ -550,18 +798,35 @@ def main() -> None:
                 )
             )
 
+        # Final queue: production pipeline (tier blend + MMR/slice +
+        # 13 discovery passes + enrichment + sort).
+        # Single metric per fold (not per-formula).
+        # Skipped when embedder failed to load (model dir missing); the
+        # main 5-formula report is unaffected.
+        if embedder is not None:
+            fq = _compute_final_queue_metrics(
+                fold_candidates=fold_candidates,
+                fold_cand_emb=fold_cand_emb,
+                fb_train_stories=fb_train_stories,
+                y_train=y_train,
+                cand_emb=cand_emb,
+                cand_id_to_idx=cand_id_to_idx,
+                config=config,
+                embedder=embedder,
+                fold_idx=fold_idx,
+                test_stories=test_stories,
+                test_actions=test_actions,
+            )
+            final_queue_results.append(fq)
+        else:
+            final_queue_results.append({})
+
         print(f"Fold {fold_idx + 1}/5 done")
 
     # Aggregate
     metric_keys = (
-        "ndcg_at_100",
-        "ndcg_at_200",
-        "ndcg_at_500",
-        "ndcg_at_1000",
-        "hit_at_100",
-        "hit_at_200",
-        "hit_at_500",
-        "hit_at_1000",
+        "ndcg_at_40",
+        "hit_at_40",
         "map",
         "brier_up",
         "median_rank",
@@ -612,27 +877,161 @@ def main() -> None:
         },
     }
 
+    # Per-source aggregation across folds.
+    # n_test/n_up are fold-level (depend on test_stories only, identical across
+    # formulas within a fold) — take from the "current" formula's fold results
+    # to avoid 5x overcounting.
+    source_n_test: dict[str, int] = {}
+    source_n_up: dict[str, int] = {}
+    for fold_result in results["current"]:
+        for source, ps in fold_result.get("per_source", {}).items():
+            source_n_test[source] = source_n_test.get(source, 0) + ps["n_test"]
+            source_n_up[source] = source_n_up.get(source, 0) + ps["n_up"]
+
+    per_source_aggregated: dict[str, dict] = {}
+    for source in sorted(source_n_test.keys(), key=lambda s: -source_n_test[s]):
+        fold_ps_per_formula: dict[str, list[dict]] = {f: [] for f in formulas}
+        for f, rs in results.items():
+            for fold_result in rs:
+                ps = fold_result.get("per_source", {}).get(source)
+                if ps is None:
+                    continue
+                fold_ps_per_formula[f].append(ps)
+        if not any(fold_ps_per_formula.values()):
+            continue
+        source_formulas: dict[str, dict] = {}
+        for f, fold_ps_list in fold_ps_per_formula.items():
+            if not fold_ps_list:
+                continue
+            source_formulas[f] = {
+                "mean": {
+                    "mmr": {
+                        k: float(np.mean([ps["mmr"][k] for ps in fold_ps_list]))
+                        for k in metric_keys
+                    },
+                    "raw": {
+                        k: float(np.mean([ps["raw"][k] for ps in fold_ps_list]))
+                        for k in metric_keys
+                    },
+                },
+                "std": {
+                    "mmr": {
+                        k: float(np.std([ps["mmr"][k] for ps in fold_ps_list]))
+                        for k in metric_keys
+                    },
+                    "raw": {
+                        k: float(np.std([ps["raw"][k] for ps in fold_ps_list]))
+                        for k in metric_keys
+                    },
+                },
+            }
+        per_source_aggregated[source] = {
+            "n_test": source_n_test[source],
+            "n_up": source_n_up[source],
+            "formulas": source_formulas,
+        }
+
+    report["per_source"] = per_source_aggregated
+
+    # Aggregate final queue metrics across folds.
+    # A fold may have an empty `fr` dict if the production pipeline failed
+    # (e.g. ONNX model missing) — filter those out before aggregating so
+    # the report still writes for the 5 main formula folds even if all
+    # final_queue folds failed.
+    valid_fq = [fr for fr in final_queue_results if fr]
+    if valid_fq:
+        fq_mean_mmr = {
+            k: float(np.mean([fr["mmr"][k] for fr in valid_fq])) for k in metric_keys
+        }
+        fq_std_mmr = {
+            k: float(np.std([fr["mmr"][k] for fr in valid_fq])) for k in metric_keys
+        }
+        source_n_test_fq: dict[str, int] = {}
+        source_n_up_fq: dict[str, int] = {}
+        for fr in valid_fq:
+            for source, ps in fr.get("per_source", {}).items():
+                source_n_test_fq[source] = (
+                    source_n_test_fq.get(source, 0) + ps["n_test"]
+                )
+                source_n_up_fq[source] = source_n_up_fq.get(source, 0) + ps["n_up"]
+        per_source_fq: dict[str, dict] = {}
+        for source in sorted(
+            source_n_test_fq.keys(), key=lambda s: -source_n_test_fq[s]
+        ):
+            fold_ps_list = [
+                fr["per_source"][source]
+                for fr in valid_fq
+                if source in fr.get("per_source", {})
+            ]
+            if not fold_ps_list:
+                continue
+            ps_mean_mmr = {
+                k: float(np.mean([pso["mmr"][k] for pso in fold_ps_list]))
+                for k in metric_keys
+            }
+            ps_std_mmr = {
+                k: float(np.std([pso["mmr"][k] for pso in fold_ps_list]))
+                for k in metric_keys
+            }
+            per_source_fq[source] = {
+                "n_test": source_n_test_fq[source],
+                "n_up": source_n_up_fq[source],
+                "mean": {"mmr": ps_mean_mmr},
+                "std": {"mmr": ps_std_mmr},
+            }
+        report["final_queue"] = {
+            "mean": {"mmr": fq_mean_mmr},
+            "std": {"mmr": fq_std_mmr},
+            "per_fold": final_queue_results,
+            "per_source": per_source_fq,
+        }
+
     REPORT_PATH.write_text(json.dumps(report, indent=2))
     print(f"\nWritten {REPORT_PATH}")
 
-    for metric in (
-        "ndcg_at_100",
-        "ndcg_at_200",
-        "ndcg_at_500",
-        "hit_at_100",
-        "hit_at_200",
-        "hit_at_500",
-        "map",
-        "brier_up",
-        "median_rank",
-        "p25_rank",
-        "p75_rank",
-    ):
+    for metric in metric_keys:
         print(f"\n{metric} by formula (mean ± std):")
         for f, data in report["formulas"].items():  # type: ignore[union-attr]
             for variant in ("mmr", "raw"):
                 m, s = data["mean"][variant][metric], data["std"][variant][metric]  # type: ignore
                 print(f"  {f:12s} {variant:4s} {m:.3f} ± {s:.3f}")
+
+    print("\n=== Per-source breakdown (current formula, ndcg_at_40 + hit_at_40) ===")
+    print(
+        f"  {'source':<30s} {'n_test':>6s} {'n_up':>5s}  "
+        f"{'mmr40':>6s} ± {'mmr40_std':<6s}  "
+        f"{'raw40':>6s} ± {'raw40_std':<6s}"
+    )
+    for source, data in report["per_source"].items():
+        cur = data["formulas"].get("current", {})
+        mmr_mean = cur.get("mean", {}).get("mmr", {}).get("ndcg_at_40")
+        mmr_std = cur.get("std", {}).get("mmr", {}).get("ndcg_at_40")
+        raw_mean = cur.get("mean", {}).get("raw", {}).get("ndcg_at_40")
+        raw_std = cur.get("std", {}).get("raw", {}).get("ndcg_at_40")
+        if mmr_mean is None:
+            continue
+        print(
+            f"  {source:<30s} {data['n_test']:>6d} {data['n_up']:>5d}  "
+            f"{mmr_mean:>6.3f} ± {mmr_std:<6.3f}  "
+            f"{raw_mean:>6.3f} ± {raw_std:<6.3f}"
+        )
+
+    if "final_queue" in report:
+        fq: Any = report["final_queue"]
+        print("\n=== Final queue (production pipeline, top 40) ===")
+        for metric in metric_keys:
+            m = fq["mean"]["mmr"][metric]
+            s = fq["std"]["mmr"][metric]
+            print(f"  {metric:15s} mmr {m:.3f} ± {s:.3f}")
+        per_src: Any = fq.get("per_source", {})
+        if per_src:
+            print("\n  Per-source breakdown (ndcg_at_40):")
+            for source, data in per_src.items():
+                m = data["mean"]["mmr"]["ndcg_at_40"]
+                s = data["std"]["mmr"]["ndcg_at_40"]
+                n_test = data["n_test"]
+                n_up = data["n_up"]
+                print(f"  {source:<30s} {n_test:>6d} {n_up:>5d}  {m:>6.3f} ± {s:<6.3f}")
 
 
 if __name__ == "__main__":

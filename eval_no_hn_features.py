@@ -72,6 +72,7 @@ def _compute_metrics(
     test_rel: np.ndarray,
     all_test_rels: list[float],
     brier_up: float = 0.0,
+    k_values: tuple[int, ...] = (40,),
 ) -> dict:
     rel_by_pos = {}
     for i, ts in enumerate(test_stories):
@@ -104,12 +105,12 @@ def _compute_metrics(
         ap = 0.0
 
     return {
-        "ndcg_at_100": _ndcg(rel_by_pos, all_test_rels, 100),
-        "ndcg_at_200": _ndcg(rel_by_pos, all_test_rels, 200),
-        "ndcg_at_500": _ndcg(rel_by_pos, all_test_rels, 500),
-        "hit_at_100": sum(1 for p in rel_by_pos if p < 100) / max(len(test_stories), 1),
-        "hit_at_200": sum(1 for p in rel_by_pos if p < 200) / max(len(test_stories), 1),
-        "hit_at_500": sum(1 for p in rel_by_pos if p < 500) / max(len(test_stories), 1),
+        **{f"ndcg_at_{k}": _ndcg(rel_by_pos, all_test_rels, k) for k in k_values},
+        **{
+            f"hit_at_{k}": sum(1 for p in rel_by_pos if p < k)
+            / max(len(test_stories), 1)
+            for k in k_values
+        },
         "map": ap,
         "brier_up": brier_up,
     }
@@ -164,13 +165,25 @@ def _evaluate_fold(
     top40 = mmr_filter(ranked, emb_map, threshold=mmr_threshold, limit=mmr_limit)
     mmr_rank_map = {rs.story.id: pos for pos, rs in enumerate(top40)}
     mmr_metrics = _compute_metrics(
-        mmr_rank_map, test_stories, test_actions, test_rel, all_test_rels, brier_up
+        mmr_rank_map,
+        test_stories,
+        test_actions,
+        test_rel,
+        all_test_rels,
+        brier_up,
+        k_values=(40,),
     )
 
     raw_ranked = ranked
     raw_rank_map = {rs.story.id: pos for pos, rs in enumerate(raw_ranked)}
     raw_metrics = _compute_metrics(
-        raw_rank_map, test_stories, test_actions, test_rel, all_test_rels, brier_up
+        raw_rank_map,
+        test_stories,
+        test_actions,
+        test_rel,
+        all_test_rels,
+        brier_up,
+        k_values=(40,),
     )
 
     test_upvote_ids = {s.id for i, s in enumerate(test_stories) if test_actions[i] == 2}
@@ -421,12 +434,8 @@ def main() -> None:
         print(f"Fold {fold_idx + 1}/5 done")
 
     metric_keys = (
-        "ndcg_at_100",
-        "ndcg_at_200",
-        "ndcg_at_500",
-        "hit_at_100",
-        "hit_at_200",
-        "hit_at_500",
+        "ndcg_at_40",
+        "hit_at_40",
         "map",
         "brier_up",
         "median_rank",
@@ -485,7 +494,7 @@ def main() -> None:
     else:
         base = None
 
-    for metric in ("ndcg_at_100", "ndcg_at_200", "map", "brier_up", "median_rank"):
+    for metric in ("ndcg_at_40", "hit_at_40", "map", "brier_up", "median_rank"):
         print(f"\n{metric} (MMR):")
         print(f"  {'formula':14s} {'no-HN':>8s} {'full':>8s} {'Δ':>8s}")
         print(f"  {'-' * 14} {'-' * 8} {'-' * 8} {'-' * 8}")

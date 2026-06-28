@@ -715,6 +715,119 @@ clean.
 
 ---
 
+## 2026-06-28 — Final queue metrics: NDCG@40 on production pipeline end-to-end
+
+Added a **top-level `final_queue` metric** to `eval.py` that measures NDCG@40
+on the actual production final queue (post-tier-blend, post-primary-slice,
+post-13-discovery-passes, post-enrichment, post-sort) — not on the SVM's
+raw `rank_map`. This closes the gap between "what the SVM ranks at the top"
+and "what the user actually sees in the dashboard."
+
+**Why.** The existing per-source NDCG@40 = 0.000 for non-HN sources
+(bq_seed, rss, digg, slashdot) was the SVM never ranking them in its top-40.
+But the production pipeline has a non-HN discovery pass (`cap=8`, ramped
+0→8 between 20 and 50 feedback) that rescues these items for the final queue.
+The eval didn't measure that rescue, so the 0.000 numbers gave a misleading
+impression of the user experience.
+
+**Implementation.** Five conceptual parts:
+
+1. **New `_compute_final_queue_metrics()` helper** (`eval.py:303-463`)
+   — builds a per-fold in-memory SQLite DB with `fold_candidates` +
+   training feedback stories + pre-populated `embeddings` table (to avoid
+   re-encoding via ONNX), then calls `rerank_candidates()` with a per-fold
+   `user_id` to prevent `_MODEL_CACHE` cross-fold leakage. Returns
+   `{"mmr": metrics, "per_source": {...}}` on success, empty dict on
+   failure (caught exception or empty result).
+
+2. **Pre-populated embeddings** — builds `sid_to_emb` from both
+   `fold_cand_emb` (candidate embeddings, pre-computed by eval) and
+   `cand_emb` (full list, for feedback stories excluded from fold candidates).
+   Pre-populates the in-memory DB's `embeddings` table via `upsert_embedding`
+   with correct `model_version` + `text_hash` (computed via
+   `story_embedding_text` + SHA-256). The production `get_or_compute_embeddings`
+   call inside `rerank_candidates` then finds the cached entry and returns it
+   without touching the ONNX model.
+
+3. **Per-fold `user_id = 1000 + fold_idx`** — prevents the production
+   pipeline's internal `_MODEL_CACHE` from returning fold 0's SVM for fold 1.
+   The cache key `(user_id, fb_signature, _MODEL_SCHEMA_VERSION)` differs per
+   fold, forcing a fresh `SVC.fit()` each time.
+
+4. **Metrics** — `_compute_metrics` on the top-40 of `final` (post-sort), with
+   per-source breakdown (same source-filtered test-subset approach, `n_test >= 5`
+   threshold). Brier score computed from the final queue's `prob_up` fields.
+
+5. **Aggregation and printing** — mean ± std across 5 folds in `report["final_queue"]`
+   with the same 7-key metric tuple; per-source aggregated in `per_source` sub-block.
+   Print block shows all 7 metrics plus per-source NDCG@40 breakdown.
+
+**Design decisions.**
+- **Top-level key, not per-formula.** The 13 discovery passes don't depend on the
+  SVM formula; the same `final` queue is produced regardless. Each fold produces
+  one `final_queue` block (not one per formula). Match the existing `mmr`/`raw`
+  block structure internally (both have `mmr` variant only — no separate `raw`
+  for final queue since `final` is already post-slice/MMR).
+- **Call `rerank_candidates()` not `fast_rerank_for_user()`** — the former accepts
+  pre-fetched candidates and embeddings; the latter does its own DB query and dedup.
+- **Skip dedup** — not part of `rerank_candidates`; `_apply_dedup_to_ranked` is
+  only in `fast_rerank_for_user` and is a UI concern.
+- **`Embedder` instantiated once at `main()` startup** — standard `Embedder("onnx_model")`
+  call; adds ~2s startup cost. The embedder is only used implicitly by
+  `get_or_compute_embeddings` for feedback stories; with pre-populated embeddings
+  it's never actually called, but the parameter is required by the type signature.
+
+**Eval.** Full 5-fold eval on production config (`enable_mmr=false`, primary slice
+= top 12, then 13 discovery passes, enrichment, sort by score):
+
+| Metric | SVM mmr (rank_map) | Final queue (top 40) |
+|---|---|---|
+| NDCG@40 | 0.814 ± 0.064 | **0.482 ± 0.098** |
+| MAP | 0.138 ± 0.019 | **0.053 ± 0.022** |
+| Brier_up | 0.175 ± 0.007 | **0.173 ± 0.019** |
+| Median rank | 494.8 ± 105.8 | **12.8 ± 3.6** |
+
+The final queue NDCG is lower because the discovery passes trade relevance for
+diversity: 12 primary slots + 30-50 discovery slots add diverse content (uncertain,
+novel, similar, discussion-rich, high-engagement, hot, non-HN) at the cost of some
+relevance.
+
+**Per-source NDCG@40: final queue vs SVM rank_map** (current formula):
+
+| Source | SVM mmr | Final queue | Δ |
+|---|---|---|---|
+| hn | 0.764 | 0.279 | −0.485 |
+| ch_seed | 0.078 | 0.060 | −0.018 |
+| **bq_seed** | **0.000** | **0.021** | **+0.021** |
+| **rss** | **0.000** | **0.090** | **+0.090** |
+| **digg** | **0.000** | **0.073** | **+0.073** |
+| slashdot | 0.000 | 0.033 | +0.033 |
+| **rss_latent_space** | **0.000** | **0.081** | **+0.081** |
+| tildes | 0.015 | 0.000 | −0.015 |
+
+**Key finding: the user was right.** The non-HN discovery pass DOES rescue
+non-HN sources. The SVM's rank_map had bq_seed/rss/digg/slashdot/rss_latent_space
+all at 0.000 — never in the top 40. The production final queue shows all of them
+at non-zero NDCG (0.021–0.090). The discovery pass is working.
+
+The cost: HN NDCG drops from 0.764 to 0.279 as the pipeline reserves 0-8 slots
+for non-HN items (depending on feedback count). The overall NDCG tradeoff
+(0.814 → 0.482) is the price of diversity.
+
+Remaining zero-per-source in the final queue:
+- tildes (n_test=27, n_up=7) — small pool, rarely surfaces
+- reddit_machinelearning (n_test=5, n_up=2) — too few items to hit top-40
+- rss_lesswrong_com (n_test=5, n_up=1) — same
+- rss_mshibanami_github_io (n_test=5, n_up=2) — same
+
+These are consistent with the `n_test >= 5` filter; with only 5 test items across
+5 folds, any single fold can miss the top-40 entirely.
+
+**Files touched.** `eval.py`, `tests/test_eval.py`, `eval_report.json`,
+`WORKLOG.md`. 284 tests pass; ruff + ty clean.
+
+---
+
 ## 2026-06-28 — Two-axis UX redesign (Sort × Age)
 
 Replaced the single 5-tab mode row (Default/Popular/Explore/Archive/Date)
