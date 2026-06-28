@@ -874,68 +874,90 @@ async def prewarm_reddit_top_stories(
     if not story_ids:
         return 0
     from server import _fetch_reddit_rss_context  # late import to avoid circular
+    from reddit_fetch_queue import queue as reddit_fetch_queue
 
-    prewarmed: list[Story] = []
-    for i, sid in enumerate(story_ids):
-        if reddit_limiter.circuit_open:
-            logging.info(
-                "prewarm_reddit: circuit open, skipping remaining %d stories",
-                len(story_ids) - i,
+    # Spread per-story fetches over SPREAD_WINDOW_PREWARM (15 min) to avoid
+    # the burst pattern that triggers Reddit's anti-abuse (see 2026-06-28
+    # incident in WORKLOG). The shared reddit_limiter inside each factory
+    # still enforces 2s+jitter spacing.
+    counter_lock = threading.Lock()
+    updated_ids: list[int] = []
+    prewarmed_count = 0
+
+    def make_prewarm_factory(sid: int):
+        async def factory() -> None:
+            nonlocal prewarmed_count
+            if not await reddit_limiter.acquire():
+                return
+            story = db.get_story(sid)
+            if not story or not story.url:
+                return
+            if not story.source.startswith("rss_reddit_"):
+                return
+            try:
+                ctx = await _fetch_reddit_rss_context(story.url)
+            except Exception as exc:
+                logging.warning(
+                    "prewarm_reddit: fetch failed for story_id=%s: %r",
+                    sid,
+                    exc,
+                )
+                return
+            if ctx is None or not ctx.top_comments:
+                return
+            if story.top_comments and len(ctx.top_comments) <= len(story.top_comments):
+                return
+            new_self_text = (
+                ctx.self_text
+                if len(ctx.self_text) > len(story.self_text)
+                else story.self_text
             )
-            break
-        story = db.get_story(sid)
-        if not story or not story.url:
-            continue
-        if not story.source.startswith("rss_reddit_"):
-            continue
-
-        try:
-            ctx = await _fetch_reddit_rss_context(story.url)
-        except Exception as exc:
-            logging.warning(
-                "prewarm_reddit: fetch failed for story_id=%s: %r",
-                sid,
-                exc,
+            new_text_content = compose_story_text(
+                story.title,
+                new_self_text,
+                ctx.top_comments,
+                story.article_body or "",
             )
-            continue
+            if not new_text_content:
+                return
+            updated = replace(
+                story,
+                self_text=new_self_text,
+                top_comments=ctx.top_comments,
+                text_content=new_text_content,
+                comment_count=story.comment_count or ctx.comment_count or None,
+                comment_count_at_fetch=max(
+                    story.comment_count_at_fetch, ctx.comment_count
+                ),
+                discussion_url=story.discussion_url or story.url,
+            )
+            db.upsert_story(updated)
+            with counter_lock:
+                updated_ids.append(updated.id)
+                prewarmed_count += 1
 
-        if ctx is None or not ctx.top_comments:
-            continue
+        return factory
 
-        # Idempotent: skip if already populated with equal or richer data
-        if story.top_comments and len(ctx.top_comments) <= len(story.top_comments):
-            continue
-
-        new_self_text = (
-            ctx.self_text
-            if len(ctx.self_text) > len(story.self_text)
-            else story.self_text
+    factories = [make_prewarm_factory(sid) for sid in story_ids]
+    reddit_fetch_queue.enqueue_spread(
+        len(factories), time.monotonic(), "prewarm", factories
+    )
+    # 25 min ceiling: 15 min spread + 10 min slack for the limiter
+    drained = reddit_fetch_queue.wait_until_empty(timeout=1500.0)
+    if not drained:
+        logging.warning(
+            "prewarm_reddit: queue did not drain in 1500s, returning partial count"
         )
-        new_text_content = compose_story_text(
-            story.title,
-            new_self_text,
-            ctx.top_comments,
-            story.article_body or "",
-        )
-        if not new_text_content:
-            continue
 
-        updated = replace(
-            story,
-            self_text=new_self_text,
-            top_comments=ctx.top_comments,
-            text_content=new_text_content,
-            comment_count=story.comment_count or ctx.comment_count or None,
-            comment_count_at_fetch=max(story.comment_count_at_fetch, ctx.comment_count),
-            discussion_url=story.discussion_url or story.url,
-        )
-        db.upsert_story(updated)
-        prewarmed.append(updated)
+    # Recompute embeddings in a single batched call (re-read from DB so
+    # the embedder sees the freshly-written top_comments).
+    if updated_ids and embedder is not None:
+        updated_stories = [db.get_story(sid) for sid in updated_ids]
+        updated_stories = [s for s in updated_stories if s is not None]
+        if updated_stories:
+            get_or_compute_embeddings(updated_stories, embedder, db)
 
-    if prewarmed and embedder is not None:
-        get_or_compute_embeddings(prewarmed, embedder, db)
-
-    return len(prewarmed)
+    return prewarmed_count
 
 
 async def prewarm_lesswrong_stories(
@@ -1276,23 +1298,42 @@ async def fetch_rss_feeds(
     tasks = [fetch_and_parse(f) for f in other_feeds]
     feed_results = list(await asyncio.gather(*tasks)) if tasks else []
 
-    # Reddit RSS frequently returns 429 when several subreddit feeds are fetched in
-    # parallel from the same host, so keep those requests serialized and rate-limited.
-    # An in-memory 2h TTL cache avoids re-fetching subreddit topfeeds on every regen.
-    for i, feed in enumerate(reddit_feeds):
-        cached = reddit_feed_cache.get(feed)
-        if cached is not None:
-            feed_results.append(cached)
-            continue
-        if not await reddit_limiter.acquire():
-            logging.info(
-                "fetch_rss_feeds: reddit circuit open, skipping remaining %d feeds",
-                len(reddit_feeds) - i,
+    # Reddit RSS feeds are rate-limited to ~30 req/min per IP. Bursting 41
+    # feeds at the start of a regen trips Reddit's anti-abuse (the 2026-06-28
+    # incident: 37 consecutive 429s in 3s). Schedule them through the shared
+    # RedditFetchQueue, which spreads them evenly over a 10-min window
+    # (configurable via RedditFetchQueue.SPREAD_WINDOW_TOPFEEDS) and lets the
+    # shared reddit_limiter pace them at 2s+jitter between requests.
+    if reddit_feeds:
+        from reddit_fetch_queue import queue as reddit_fetch_queue
+
+        def make_topfeed_factory(feed_url: str):
+            async def factory() -> None:
+                cached = reddit_feed_cache.get(feed_url)
+                if cached is not None:
+                    return
+                if not await reddit_limiter.acquire():
+                    return
+                stories = await fetch_and_parse(feed_url)
+                if stories:
+                    reddit_feed_cache.set(feed_url, stories)
+
+            return factory
+
+        factories = [make_topfeed_factory(f) for f in reddit_feeds]
+        reddit_fetch_queue.enqueue_spread(
+            len(factories), time.monotonic(), "topfeed", factories
+        )
+        # 20 min ceiling: 10 min spread + 10 min slack for the limiter's 2s spacing
+        drained = reddit_fetch_queue.wait_until_empty(timeout=1200.0)
+        if not drained:
+            logging.warning(
+                "fetch_rss_feeds: reddit topfeed queue did not drain in 1200s"
             )
-            break
-        stories = await fetch_and_parse(feed)
-        reddit_feed_cache.set(feed, stories)
-        feed_results.append(stories)
+        for feed in reddit_feeds:
+            cached = reddit_feed_cache.get(feed)
+            if cached is not None:
+                feed_results.append(cached)
 
     all_stories = []
     for res in feed_results:

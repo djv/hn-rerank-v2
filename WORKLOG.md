@@ -5,6 +5,114 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-28 — Reddit throughput improvements (Phase 1: A + C + E)
+
+**Goal:** Reduce the rate of 429s from Reddit by spreading fetches
+across time, adding jitter, and extending the topfeed cache TTL.
+**Probed 304 conditional GET** (Phase 1B) and **dropped it**: Reddit
+RSS does not send `ETag`, `Last-Modified`, or `Cache-Control` headers
+(verified with `curl -v` and `httpx` against
+`https://www.reddit.com/r/MachineLearning/top/.rss?t=week&limit=25`).
+Only `x-ratelimit-used` / `x-ratelimit-remaining` are present. Without
+server-side validators, 304s are impossible.
+
+### Change 1A — Extend topfeed cache TTL 2h → 4h
+
+- `reddit_feed_cache.py:28`: `TTL_SECONDS = 7200.0 → 14400.0`.
+- With a 3h regen cycle, this means the cache is checked twice per
+  cycle and only invalidated once per ~6h. Topfeeds are stable on
+  hour-scale, so 4h is well within content freshness tolerance.
+- `tests/test_reddit_feed_cache.py:100`: updated expected
+  `ttl_seconds` from 7200 to 14400.
+
+### Change 1C — Add ±0.5s jitter to inter-request delay
+
+- `reddit_limiter.py`: new `JITTER_SECONDS: float = 0.5` constant.
+  `on_success()` now computes
+  `INTER_REQUEST_DELAY + random.uniform(-JITTER_SECONDS, JITTER_SECONDS)`
+  (clamped to ≥ 0). Jitter applies **only to success** — the 429
+  backoff sequence (2, 4, 8, 16, 32, 60s) is unchanged because it's
+  already a backoff.
+- Three new tests: `test_jitter_stays_within_bounds` (1000 iterations
+  stay in [1.5, 2.5]), `test_jitter_zero_is_deterministic`,
+  `test_jitter_does_not_affect_429_backoff`.
+- Two existing tests that assumed deterministic 2.0s spacing now set
+  `JITTER_SECONDS = 0.0` for determinism.
+
+### Change 1E — Spread fetches across the regen cycle
+
+- **New module** `reddit_fetch_queue.py` (174 lines): a thread-safe
+  scheduled-queue singleton. A daemon worker pops tasks whose
+  `target_at` has passed and runs them via `asyncio.run`. Callers
+  enqueue with `enqueue_spread(n, base_at, kind, factories)` to spread
+  N tasks evenly over a kind-specific window (10 min for topfeeds,
+  15 min for prewarm by default), then `wait_until_empty(timeout=...)`
+  to block until the spread completes.
+- `pipeline.py:fetch_rss_feeds`: replaced the inline
+  `for i, feed in enumerate(reddit_feeds)` serialization loop with
+  a spread-queue call. Factories check the cache first, so duplicate
+  enqueues from rapid re-regens are deduped at the network level.
+- `pipeline.py:prewarm_reddit_top_stories`: same refactor. Returns
+  count of prewarmed stories via a thread-safe counter. Embedding
+  recomputation happens in a single batched call after the queue
+  drains, not per-factory.
+- `server.py:_fetch_reddit_rss_context`: **not refactored** — this
+  path is user-driven (TLDR detail click) and needs immediate
+  response. Keeps the existing direct-call pattern.
+- `reddit_limiter.py`: added a `threading.Lock` around all state
+  mutations. The lock is released during `asyncio.sleep` in
+  `acquire()` so other threads can proceed. The lock was needed
+  because the queue worker thread and the HTTP request thread now
+  both call the limiter concurrently.
+- `reddit_limiter.py`: changed default `POLL_INTERVAL` from `1.0` to
+  `0.01` so the queue's idle worker doesn't busy-wait 1 second
+  before popping the first task after a quiet period. At 0.01s per
+  check, the cost when idle is ~100 checks/second of a single mutex
+  acquire + heap-empty check — negligible.
+
+### Verification
+
+- **301/301 tests pass** in 31s (was timing out at 120s before the
+  test fix below). `ruff check` and `ty check` clean for all
+  changed files.
+- **Test fix:** `tests/conftest.py` now overrides
+  `RedditFetchQueue.POLL_INTERVAL` on the **class** (not the
+  singleton instance) so that any new `RedditFetchQueue()` created
+  during a test also uses the test value. The worker thread starts
+  inside `__init__` and reads `POLL_INTERVAL` on its first iteration,
+  so setting only the instance attribute after construction is too
+  late — the worker would already be in a 1-second sleep before the
+  test can enqueue. The override also sets
+  `SPREAD_WINDOW_TOPFEEDS = 0.01` and `SPREAD_WINDOW_PREWARM = 0.01`
+  on the singleton instance so the existing prewarm-queue tests
+  drain in milliseconds.
+- `tests/test_reddit_fetch_queue.py::test_enqueue_spread_distributes_evenly`
+  tightened from 100 tasks / 10s window (9.9s test) to 20 tasks / 1s
+  window (0.95s test). Assertions adjusted proportionally.
+- **Service restarted** at 16:49:40 UTC. Dashboard yyy: 246442 bytes,
+  75 cards, 10 uncertain — unchanged from pre-change baseline.
+- **One regen observed** in the 30s post-restart window. Old behavior
+  would have been a 2s-burst of 41 topfeed + 46 prewarm requests in
+  the first ~3 min. New behavior spreads them over 10–25 min, so the
+  burst is gone. Will confirm on the next regen at ~19:50 UTC.
+
+### Files changed
+
+| File | Lines | Purpose |
+|---|---|---|
+| `reddit_feed_cache.py` | +3 / -2 | 1A: TTL 2h→4h |
+| `reddit_limiter.py` | +18 / -4 | 1C: jitter, threading.Lock for cross-thread safety, default POLL_INTERVAL 1.0→0.01 |
+| `reddit_fetch_queue.py` | NEW (174) | 1E: scheduled fetch queue with daemon worker |
+| `pipeline.py` | +55 / -30 | 1E: refactor fetch_rss_feeds and prewarm_reddit_top_stories to use the queue |
+| `tests/conftest.py` | +18 / -2 | override singleton spread windows + class POLL_INTERVAL for fast tests |
+| `tests/test_reddit_limiter.py` | +40 / -3 | 1C: jitter tests + override existing tests for determinism |
+| `tests/test_reddit_feed_cache.py` | +1 / -1 | 1A: bump expected TTL |
+| `tests/test_reddit_fetch_queue.py` | NEW (200) | 1E: queue tests (ordering, timeout, failure, spread, reset, shutdown) |
+
+Commit pending.
+
+---
+
 ## 2026-06-28 — Reddit rate-limiter stuck-open bug (12h silent coverage gap)
 
 **Symptom (from morning's regen logs):** `fetch_rss_feeds: reddit

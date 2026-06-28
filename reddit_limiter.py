@@ -4,7 +4,8 @@ Both `pipeline.py:fetch_rss_feeds` (subreddit topfeeds) and
 `server.py:_fetch_reddit_rss_context` (per-story comments RSS) call the
 module-level `limiter` before each Reddit request. The limiter enforces:
 
-  - 2s spacing between requests (Reddit's ~1 req/2s unauth IP limit)
+  - 2s spacing between requests (Reddit's ~1 req/2s unauth IP limit),
+    with uniform ±JITTER_SECONDS jitter to break robotic timing
   - Exponential backoff on 429 (2, 4, 8, 16, 32, 60s, capped at 60s)
   - Honors `Retry-After` header when present
   - Circuit opens after `MAX_CONSECUTIVE_429` (default 3) consecutive
@@ -20,64 +21,79 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
+import threading
 import time
 
 logger = logging.getLogger(__name__)
 
 
 class RedditRateLimiter:
-    """Single-bucket rate limiter for all reddit.com requests from one IP."""
+    """Single-bucket rate limiter for all reddit.com requests from one IP.
+
+    Thread-safe: state mutations are guarded by a lock so the queue
+    worker thread (which drives scheduled fetches) and the HTTP request
+    threads (which drive on-demand fetches) can both call this class
+    without races. The lock is released during asyncio.sleep in
+    acquire() so other threads can proceed.
+    """
 
     def __init__(self) -> None:
         self.INTER_REQUEST_DELAY: float = 2.0
+        self.JITTER_SECONDS: float = 0.5
         self.MAX_CONSECUTIVE_429: int = 3
         self.CIRCUIT_COOLDOWN: float = 300.0
         self.BACKOFF: tuple[float, ...] = (2.0, 4.0, 8.0, 16.0, 32.0, 60.0)
+        self._lock = threading.Lock()
         self.reset()
 
     def reset(self) -> None:
-        self._next_allowed_at: float = 0.0
-        self._consecutive_429: int = 0
-        self._circuit_opened_at: float = 0.0
-        self._probing: bool = False
+        with self._lock:
+            self._next_allowed_at: float = 0.0
+            self._consecutive_429: int = 0
+            self._circuit_opened_at: float = 0.0
+            self._probing: bool = False
 
     @property
     def circuit_open(self) -> bool:
-        return self._consecutive_429 >= self.MAX_CONSECUTIVE_429
+        with self._lock:
+            return self._consecutive_429 >= self.MAX_CONSECUTIVE_429
 
     async def acquire(self) -> bool:
-        if self.circuit_open:
-            if self._probing:
-                return False
+        with self._lock:
+            if self._consecutive_429 >= self.MAX_CONSECUTIVE_429:
+                if self._probing:
+                    return False
+                now = time.monotonic()
+                if now - self._circuit_opened_at < self.CIRCUIT_COOLDOWN:
+                    return False
+                self._probing = True
+                logger.info(
+                    "reddit_limiter half-open probe admitted (cooldown=%.1fs elapsed)",
+                    now - self._circuit_opened_at,
+                )
             now = time.monotonic()
-            if now - self._circuit_opened_at < self.CIRCUIT_COOLDOWN:
-                return False
-            self._probing = True
-            logger.info(
-                "reddit_limiter half-open probe admitted (cooldown=%.1fs elapsed)",
-                now - self._circuit_opened_at,
-            )
-        now = time.monotonic()
-        wait = self._next_allowed_at - now
+            wait = self._next_allowed_at - now
         if wait > 0:
             await asyncio.sleep(wait)
         return True
 
     def on_429(self, retry_after: float | None = None) -> None:
-        prev = self._consecutive_429
-        self._consecutive_429 += 1
-        if retry_after is not None and retry_after > 0:
-            delay = retry_after
-        else:
-            idx = min(self._consecutive_429 - 1, len(self.BACKOFF) - 1)
-            delay = self.BACKOFF[idx]
-        self._next_allowed_at = time.monotonic() + delay
-        if prev < self.MAX_CONSECUTIVE_429 <= self._consecutive_429:
-            self._circuit_opened_at = time.monotonic()
-            self._probing = False
-        elif self._probing:
-            self._circuit_opened_at = time.monotonic()
-            self._probing = False
+        with self._lock:
+            prev = self._consecutive_429
+            self._consecutive_429 += 1
+            if retry_after is not None and retry_after > 0:
+                delay = retry_after
+            else:
+                idx = min(self._consecutive_429 - 1, len(self.BACKOFF) - 1)
+                delay = self.BACKOFF[idx]
+            self._next_allowed_at = time.monotonic() + delay
+            if prev < self.MAX_CONSECUTIVE_429 <= self._consecutive_429:
+                self._circuit_opened_at = time.monotonic()
+                self._probing = False
+            elif self._probing:
+                self._circuit_opened_at = time.monotonic()
+                self._probing = False
         logger.warning(
             "reddit_limiter 429 consecutive=%d next_delay=%.1fs",
             self._consecutive_429,
@@ -85,11 +101,15 @@ class RedditRateLimiter:
         )
 
     def on_success(self) -> None:
-        was_open = self.circuit_open
-        self._consecutive_429 = 0
-        self._next_allowed_at = time.monotonic() + self.INTER_REQUEST_DELAY
-        self._circuit_opened_at = 0.0
-        self._probing = False
+        with self._lock:
+            was_open = self._consecutive_429 >= self.MAX_CONSECUTIVE_429
+            self._consecutive_429 = 0
+            delay = self.INTER_REQUEST_DELAY + random.uniform(
+                -self.JITTER_SECONDS, self.JITTER_SECONDS
+            )
+            self._next_allowed_at = time.monotonic() + max(0.0, delay)
+            self._circuit_opened_at = 0.0
+            self._probing = False
         if was_open:
             logger.info("reddit_limiter circuit closed after successful probe")
 

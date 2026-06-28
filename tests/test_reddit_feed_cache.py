@@ -97,7 +97,7 @@ def test_stats_counts() -> None:
     s = cache.stats()
     assert s["size"] == 1
     assert s["max_entries"] == 100
-    assert s["ttl_seconds"] == 7200
+    assert s["ttl_seconds"] == 14400
 
 
 def test_returns_copy() -> None:

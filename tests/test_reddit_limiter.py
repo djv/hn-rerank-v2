@@ -78,6 +78,7 @@ async def test_acquire_no_wait_initially(
 async def test_acquire_waits_inter_request_delay_after_on_success(
     limiter: RedditRateLimiter, fake_clock: FakeClock, sleep_recorder: SleepRecorder
 ) -> None:
+    limiter.JITTER_SECONDS = 0.0  # deterministic
     limiter.on_success()
     assert sleep_recorder.calls == []
     # _next_allowed_at = fake_clock.now + INTER_REQUEST_DELAY = 1002.0
@@ -203,6 +204,7 @@ async def test_sequential_calls_enforce_2s_spacing(
     limiter: RedditRateLimiter, fake_clock: FakeClock, sleep_recorder: SleepRecorder
 ) -> None:
     """Three sequential acquire+on_success cycles should each wait 2s (after the first)."""
+    limiter.JITTER_SECONDS = 0.0  # deterministic for this test
     for _ in range(3):
         assert await limiter.acquire() is True
         limiter.on_success()
@@ -223,6 +225,50 @@ def test_instance_attributes_can_be_overridden(monkeypatch: pytest.MonkeyPatch) 
     assert rl.circuit_open is True
     rl.reset()
     rl.MAX_CONSECUTIVE_429 = 3
+
+
+def test_jitter_stays_within_bounds(
+    limiter: RedditRateLimiter, fake_clock: FakeClock
+) -> None:
+    """Jitter keeps on_success delays in [INTER-JITTER, INTER+JITTER]."""
+    limiter.JITTER_SECONDS = 0.5
+    for _ in range(1000):
+        limiter._next_allowed_at = 0.0
+        t_before = fake_clock.now
+        limiter.on_success()
+        delay = limiter._next_allowed_at - t_before
+        assert 1.5 <= delay <= 2.5, f"delay {delay} outside [1.5, 2.5]"
+    # No assertion on exact distribution; just that the bounds hold
+
+
+def test_jitter_zero_is_deterministic(
+    limiter: RedditRateLimiter, fake_clock: FakeClock
+) -> None:
+    """With JITTER_SECONDS=0, on_success uses the exact INTER_REQUEST_DELAY."""
+    limiter.JITTER_SECONDS = 0.0
+    for _ in range(10):
+        limiter._next_allowed_at = 0.0
+        t_before = fake_clock.now
+        limiter.on_success()
+        assert limiter._next_allowed_at - t_before == pytest.approx(2.0)
+
+
+def test_jitter_does_not_affect_429_backoff(
+    limiter: RedditRateLimiter, fake_clock: FakeClock
+) -> None:
+    """Jitter applies only to on_success; 429 backoff is exactly the table value."""
+    limiter.JITTER_SECONDS = 0.5
+    t_before = fake_clock.now
+    limiter.on_429(retry_after=None)
+    delay = limiter._next_allowed_at - t_before
+    # First 429 → BACKOFF[0] = 2.0, no jitter
+    assert delay == pytest.approx(2.0)
+
+    t_before = fake_clock.now
+    limiter.on_429(retry_after=None)
+    delay = limiter._next_allowed_at - t_before
+    # Second 429 → BACKOFF[1] = 4.0, no jitter
+    assert delay == pytest.approx(4.0)
 
 
 def test_reset_clears_half_open_state(

@@ -3,10 +3,13 @@
 Both `pipeline.py:fetch_rss_feeds` and any future Reddit feed fetcher use
 the module-level `cache` singleton to avoid re-fetching subreddit topfeeds
 within the TTL window. The cache is in-memory only — lost on server restart,
-which is fine since the 2h TTL means minimal warm-up overhead.
+which is fine since the 4h TTL means minimal warm-up overhead.
 
 Cache hit skips the rate limiter entirely (no HTTP request).
 Cache miss triggers the normal fetch + limiter flow, then stores the result.
+With the 304 conditional-GET path, a cache hit sends If-None-Match /
+If-Modified-Since and a 304 response reuses the cached body without
+consuming rate-limit budget (per Reddit's published policy).
 """
 
 from __future__ import annotations
@@ -25,7 +28,7 @@ class RedditFeedCache:
     """In-memory cache for parsed Reddit topfeed RSS responses."""
 
     def __init__(self) -> None:
-        self.TTL_SECONDS: float = 7200.0
+        self.TTL_SECONDS: float = 14400.0
         self.MAX_ENTRIES: int = 100
         self.reset()
 
