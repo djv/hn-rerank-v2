@@ -865,19 +865,19 @@
           <span class="uncertain-badge" title="Model is highly uncertain about this story (high entropy distribution)">🤔 Unsure</span>
           {% endif %}
           {% if item.is_novel %}
-          <span class="novel-badge" title="Bottom {{ novel_badge_percentile }}% by similarity to your feedback, but model scores it high">✨ Novel</span>
+          <span class="novel-badge" title="Semantically distant from anything you've voted on">✨ Novel</span>
           {% endif %}
           {% if item.is_discussion_rich %}
-          <span class="discussion-rich-badge" title="Top {{ discussion_badge_percentile }}% by HN comments">💬 Talk-worthy</span>
+          <span class="discussion-rich-badge" title="High HN comment count for its age cohort">💬 Talk-worthy</span>
           {% endif %}
           {% if item.is_high_engagement %}
-          <span class="high-engagement-badge" title="Top {{ top_badge_percentile }}% by HN points">🏆 Top</span>
+          <span class="high-engagement-badge" title="High HN score for its age cohort">🏆 Top</span>
           {% endif %}
           {% if item.is_hot %}
           <span class="hot-badge" title="Top {{ hot_badge_percentile }}% by engagement velocity (points/hour) and score ≥ 20">🔥 Hot</span>
           {% endif %}
           {% if item.is_similar %}
-          <span class="similar-badge" title="Top {{ similar_badge_percentile }}% most similar to your upvoted stories">🎯 Similar</span>
+          <span class="similar-badge" title="Most similar to your upvoted stories for its age cohort">🎯 Similar</span>
           {% endif %}
           
           {% if item.story.source != "hn" %}

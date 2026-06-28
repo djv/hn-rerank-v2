@@ -10,7 +10,7 @@ import time
 import tomllib
 from collections import Counter, OrderedDict
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable
+from typing import Any, Callable, cast
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -52,13 +52,7 @@ class ModelConfig:
     min_up_for_svm: int = 20
     min_down_for_svm: int = 20
     non_hn_ramp_window: int = 30
-    top_badge_percentile: float = 90.0
-    top_badge_min_score: int = 100
-    discussion_badge_percentile: float = 90.0
-    discussion_badge_min_comments: int = 0
     hot_badge_percentile: float = 99.5
-    similar_badge_percentile: float = 97.0
-    novel_badge_percentile: float = 10.0
     dedup_render_enabled: bool = True
     dedup_title_fuzzy_enabled: bool = False
     dedup_title_fuzzy_hamming: int = 2
@@ -126,22 +120,22 @@ TOP_COMMENT_TOP_LEVEL_BUDGET = TOP_COMMENT_LIMIT // 3
 # Discovery slot budget. Each non-Hot badge gets per-cohort top-N slots
 # (recent + archive). Hot stays a single global pass; archive never gets
 # Hot because velocity is structurally ~0 for >30-day stories.
-UNCERTAIN_DISCOVERY_SLOT_LIMIT = (
-    5  # used by primary-attribution entropy cutoff (enrichment, not slot cap)
-)
-UNCERTAIN_DISCOVERY_RECENT_SLOTS = 3
-UNCERTAIN_DISCOVERY_ARCHIVE_SLOTS = 3
-NOVEL_DISCOVERY_RECENT_SLOTS = 3
-NOVEL_DISCOVERY_ARCHIVE_SLOTS = 3
-SIMILAR_DISCOVERY_RECENT_SLOTS = 3
-SIMILAR_DISCOVERY_ARCHIVE_SLOTS = 3
-DISCUSSION_DISCOVERY_RECENT_SLOTS = 3
-DISCUSSION_DISCOVERY_ARCHIVE_SLOTS = 3
-HIGH_ENGAGEMENT_DISCOVERY_RECENT_SLOTS = 3
-HIGH_ENGAGEMENT_DISCOVERY_ARCHIVE_SLOTS = 3
+# The rank-based cascade (see rerank_candidates) feeds Hot → Top → Talk in
+# sequence (mutually exclusive) and Novel / Similar / Unsure in parallel
+# (can stack with each other and with the cascade group).
+UNCERTAIN_DISCOVERY_SLOT_LIMIT = 5
+UNCERTAIN_DISCOVERY_RECENT_SLOTS = 5
+UNCERTAIN_DISCOVERY_ARCHIVE_SLOTS = 5
+NOVEL_DISCOVERY_RECENT_SLOTS = 5
+NOVEL_DISCOVERY_ARCHIVE_SLOTS = 5
+SIMILAR_DISCOVERY_RECENT_SLOTS = 5
+SIMILAR_DISCOVERY_ARCHIVE_SLOTS = 5
+DISCUSSION_DISCOVERY_RECENT_SLOTS = 5
+DISCUSSION_DISCOVERY_ARCHIVE_SLOTS = 5
+HIGH_ENGAGEMENT_DISCOVERY_RECENT_SLOTS = 5
+HIGH_ENGAGEMENT_DISCOVERY_ARCHIVE_SLOTS = 5
 NON_HN_DISCOVERY_SLOT_LIMIT = 8
-ARCHIVE_TOP_DISCOVERY_SLOT_LIMIT = 12
-HOT_DISCOVERY_SLOT_LIMIT = 8
+HOT_DISCOVERY_SLOT_LIMIT = 5
 HOT_MIN_SCORE = 20
 DASHBOARD_QUEUE_SIZE = 12
 BQ_ARCHIVE_SOURCE = "bq_seed"
@@ -283,19 +277,7 @@ class Config:
                 min_up_for_svm=model_cfg.get("min_up_for_svm", 20),
                 min_down_for_svm=model_cfg.get("min_down_for_svm", 20),
                 non_hn_ramp_window=model_cfg.get("non_hn_ramp_window", 30),
-                top_badge_percentile=model_cfg.get("top_badge_percentile", 90.0),
-                top_badge_min_score=model_cfg.get("top_badge_min_score", 100),
-                discussion_badge_percentile=model_cfg.get(
-                    "discussion_badge_percentile", 90.0
-                ),
-                discussion_badge_min_comments=model_cfg.get(
-                    "discussion_badge_min_comments", 0
-                ),
                 hot_badge_percentile=model_cfg.get("hot_badge_percentile", 99.5),
-                similar_badge_percentile=model_cfg.get(
-                    "similar_badge_percentile", 97.0
-                ),
-                novel_badge_percentile=model_cfg.get("novel_badge_percentile", 10.0),
                 dedup_render_enabled=model_cfg.get("dedup_render_enabled", True),
                 dedup_title_fuzzy_enabled=model_cfg.get(
                     "dedup_title_fuzzy_enabled", False
@@ -2042,7 +2024,7 @@ def rerank_candidates(
         user_id=user_id,
     )
 
-    limit, num_uncertain = _dashboard_primary_limit(config.count)
+    limit, _num_uncertain = _dashboard_primary_limit(config.count)
     if config.model.enable_mmr:
         embeddings_map = {s.id: vec for s, vec in zip(candidates, cand_embeddings)}
         final = mmr_filter(
@@ -2055,7 +2037,6 @@ def rerank_candidates(
         final = ranked[:limit]
 
     selected_ids = {item.story.id for item in final}
-    remaining = [r for r in ranked if r.story.id not in selected_ids]
 
     # Calculate parameters for remaining discovery passes
     feedback_stories, feedback_labels, _ = db.get_feedback_for_training(user_id=user_id)
@@ -2114,114 +2095,15 @@ def rerank_candidates(
         else 0
     )
 
-    def _bucket_pct(values: np.ndarray, mask: np.ndarray, pct: float) -> float:
-        sub = values[mask]
-        return float(np.percentile(sub, pct)) if len(sub) else 0.0
-
-    # Per-bucket threshold for the Novel badge (bottom-pct by max similarity
-    # to any feedback story). Recent and archive cohorts are judged
-    # independently so the badge is meaningful within each age group.
-    sim_thresholds = np.where(
-        recent_mask,
-        _bucket_pct(cand_max_sim, recent_mask, config.model.novel_badge_percentile),
-        _bucket_pct(cand_max_sim, ~recent_mask, config.model.novel_badge_percentile),
-    )
-    # Note: is_similar is pass-only (top-3-by-rank per cohort). No per-bucket
-    # threshold is computed because the discovery pass sorts by similarity and
-    # takes the top 3 per cohort unconditionally.
-
     story_id_to_idx = {s.id: idx for idx, s in enumerate(candidates)}
+    idx_for = story_id_to_idx.__getitem__
 
-    # Determine uncertainty candidates among remaining candidates
     def get_entropy(r: RankedStory) -> float:
         ent = 0.0
         for p in (r.prob_down, r.prob_neutral, r.prob_up):
             if p is not None and p > 1e-9:
                 ent -= p * np.log2(p)
         return ent
-
-    if remaining and num_uncertain > 0:
-        uncertain_candidates = [r for r in remaining if r.prob_down is not None]
-        uncertain_candidates.sort(key=get_entropy, reverse=True)
-        uncertain_candidates = uncertain_candidates[:num_uncertain]
-    else:
-        uncertain_candidates = []
-
-    # Per-bucket discovery thresholds. Badges are applied to any story
-    # that passes these criteria (primary or extra-slot); the extra-slot
-    # passes below additionally source from remaining_decorated to surface
-    # qualifying stories outside the primary ranked set, respecting
-    # per-pass slot caps.
-    #
-    # Per-bucket because archive candidates have structurally higher
-    # absolute scores/comment counts than recent ones, so a global
-    # threshold would be archive-dominated and recent stories would
-    # never qualify. Each candidate uses the threshold of its own age
-    # bucket; a per-candidate array is built via np.where for vectorized
-    # lookup.
-    # discussion_thresholds: max(percentile, min) per bucket; the
-    # per-candidate array still has the >0 comment guard applied
-    # separately in the predicate.
-    discussion_pct = config.model.discussion_badge_percentile
-    discussion_min = float(config.model.discussion_badge_min_comments)
-    recent_disc_raw = _bucket_pct(
-        cand_comment_counts[cand_comment_counts > 0],
-        recent_mask[cand_comment_counts > 0],
-        discussion_pct,
-    )
-    archive_disc_raw = _bucket_pct(
-        cand_comment_counts[cand_comment_counts > 0],
-        ~recent_mask[cand_comment_counts > 0],
-        discussion_pct,
-    )
-    discussion_thresholds = np.where(
-        recent_mask,
-        max(recent_disc_raw, discussion_min),
-        max(archive_disc_raw, discussion_min),
-    )
-    pct = config.model.top_badge_percentile
-    min_score = float(config.model.top_badge_min_score)
-    recent_eng_raw = _bucket_pct(cand_scores, recent_mask, pct)
-    archive_eng_raw = _bucket_pct(cand_scores, ~recent_mask, pct)
-    engagement_thresholds = np.where(
-        recent_mask,
-        max(recent_eng_raw, min_score),
-        max(archive_eng_raw, min_score),
-    )
-
-    # final already contains the primary-ranked items
-    final_ids = {item.story.id for item in final}
-
-    # Per-bucket Unsure entropy cutoff. The Unsure badge fires when a
-    # story's entropy >= the Nth-most-uncertain entropy in its age
-    # bucket. Using a single global cutoff would let archive stories
-    # dominate the high-entropy tail and starve recent candidates of
-    # the badge. If a bucket has no scored candidates, its cutoff is
-    # infinity (no story can qualify).
-    def _bucket_entropy_cutoff(mask: np.ndarray) -> float:
-        bucket = [
-            r
-            for r in remaining
-            if r.prob_down is not None and bool(mask[story_id_to_idx[r.story.id]])
-        ]
-        bucket.sort(key=get_entropy, reverse=True)
-        bucket = bucket[:num_uncertain] if num_uncertain else []
-        return get_entropy(bucket[-1]) if bucket else float("inf")
-
-    recent_ent_cutoff = _bucket_entropy_cutoff(recent_mask)
-    archive_ent_cutoff = _bucket_entropy_cutoff(~recent_mask)
-    uncertain_entropy_thresholds = np.where(
-        recent_mask, recent_ent_cutoff, archive_ent_cutoff
-    )
-
-    # remaining_decorated contains candidates not in the primary path.
-    remaining_decorated = [r for r in ranked if r.story.id not in final_ids]
-
-    # Novel pool ranked purely by distance to feedback (1 - max_similarity).
-    # Score is intentionally not blended in: "novel" means "semantically
-    # distant from anything you've voted on" and should surface regardless of
-    # how the model would have ranked the story.
-    idx_for = story_id_to_idx.__getitem__
 
     def _novel_sort_key(r: RankedStory) -> float:
         return float(1.0 - cand_max_sim[idx_for(r.story.id)])
@@ -2238,6 +2120,11 @@ def rerank_candidates(
     def _hot_sort_key(r: RankedStory) -> float:
         return float(cand_velocities[idx_for(r.story.id)])
 
+    # final already contains the primary-ranked items
+    final_ids = {item.story.id for item in final}
+    # remaining_decorated contains candidates not in the primary path.
+    remaining_decorated = [r for r in ranked if r.story.id not in final_ids]
+
     n_non_hn_slots = _non_hn_slot_count(
         len(feedback_labels),
         cap=NON_HN_DISCOVERY_SLOT_LIMIT,
@@ -2245,46 +2132,150 @@ def rerank_candidates(
         window=config.model.non_hn_ramp_window,
     )
 
-    # Per-cohort top-N discovery passes for every non-Hot badge. Each pass
-    # takes the top `slot_limit` stories in its cohort by the badge metric,
-    # unconditionally — the per-bucket percentile thresholds are NOT used as
-    # gates here. This guarantees a floor of `slot_limit` badged stories per
-    # cohort whenever the cohort has enough remaining candidates, which is
-    # the "Floor" half of the Floor+Enrichment model (see ARCHITECTURE.md).
-    # The percentile thresholds (engagement_thresholds etc.) are still used
-    # in the post-discovery re-attribution block below for the "Enrichment"
-    # half: they badge any story in the complete final that clears the
-    # cohort's quality bar, preserving the current top-decile richness on
-    # large pools.
+    # Rank-based cascade: Hot (global) runs first against the FULL candidate
+    # pool (not just `remaining_decorated`) so a primary-ranked high-velocity
+    # story gets the Hot badge too. After Hot, the Top → Talk cascade runs
+    # against `remaining_decorated` (candidates not in primary and not picked
+    # by Hot). Novel, Similar, Unsure run in parallel against the post-
+    # cascade pool and can stack with each other and with the cascade group
+    # (so e.g. Top+Unsure is allowed).
     #
-    # Predicate for each pass is reduced to a minimal membership guard so
-    # the pass can fill its slots even when the cohort's quality is low
-    # (e.g., small synthetic pools).
-    discovery_passes: list[DiscoveryPass] = [
+    # Each pass takes the top `slot_limit` stories in its age cohort by
+    # the badge metric, unconditionally. Predicates are reduced to a
+    # minimal membership guard so the pass can fill its slots even when
+    # the cohort's quality is low (e.g., small synthetic pools).
+    hot_pass = DiscoveryPass(
+        name="hot",
+        attr="is_hot",
+        predicate=lambda r: cand_velocities[idx_for(r.story.id)] >= hot_threshold
+        and cand_velocities[idx_for(r.story.id)] > 0
+        and r.story.score >= HOT_MIN_SCORE,
+        sort_key=_hot_sort_key,
+        slot_limit=HOT_DISCOVERY_SLOT_LIMIT,
+    )
+    if hot_pass.slot_limit > 0:
+        hot_pool = [r for r in ranked if hot_pass.predicate(r)]
+        if hot_pool:
+            hot_pool.sort(key=hot_pass.sort_key, reverse=True)
+            hot_attr = cast(str, hot_pass.attr)
+            hot_items = [
+                replace(r, **{hot_attr: True}) for r in hot_pool[: hot_pass.slot_limit]
+            ]
+            # If a story is already in `final` (from primary), update its
+            # is_hot flag in place. Otherwise append.
+            for item in hot_items:
+                existing_idx = next(
+                    (i for i, f in enumerate(final) if f.story.id == item.story.id),
+                    None,
+                )
+                if existing_idx is not None:
+                    final[existing_idx] = replace(final[existing_idx], is_hot=True)
+                else:
+                    final.append(item)
+            hot_picked_ids = {item.story.id for item in hot_items}
+            selected_ids |= hot_picked_ids
+            remaining_decorated = [
+                r for r in remaining_decorated if r.story.id not in hot_picked_ids
+            ]
+
+    cascade_passes: list[DiscoveryPass] = [
         DiscoveryPass(
-            name="uncertain-recent",
-            attr="is_uncertain",
-            predicate=lambda r: r.prob_down is not None,
-            sort_key=lambda r: float(get_entropy(r)),
-            slot_limit=UNCERTAIN_DISCOVERY_RECENT_SLOTS,
+            name="high-engagement-recent",
+            attr="is_high_engagement",
+            predicate=lambda r: True,
+            sort_key=_engagement_sort_key,
+            slot_limit=HIGH_ENGAGEMENT_DISCOVERY_RECENT_SLOTS,
             age="recent",
         ),
         DiscoveryPass(
-            name="uncertain-archive",
-            attr="is_uncertain",
-            predicate=lambda r: r.prob_down is not None,
-            sort_key=lambda r: float(get_entropy(r)),
-            slot_limit=UNCERTAIN_DISCOVERY_ARCHIVE_SLOTS,
+            name="high-engagement-archive",
+            attr="is_high_engagement",
+            predicate=lambda r: True,
+            sort_key=_engagement_sort_key,
+            slot_limit=HIGH_ENGAGEMENT_DISCOVERY_ARCHIVE_SLOTS,
             age="archive",
         ),
         DiscoveryPass(
-            name="archive-top",
-            attr=None,
-            predicate=lambda r: r.story.source in {BQ_ARCHIVE_SOURCE, CH_ARCHIVE_SOURCE}
-            and r.story.time < recent_cutoff,
-            sort_key=lambda r: float(r.story.score),
-            slot_limit=ARCHIVE_TOP_DISCOVERY_SLOT_LIMIT,
+            name="discussion-recent",
+            attr="is_discussion_rich",
+            predicate=lambda r: (cand_comment_counts[idx_for(r.story.id)] or 0) > 0,
+            sort_key=_discussion_sort_key,
+            slot_limit=DISCUSSION_DISCOVERY_RECENT_SLOTS,
+            age="recent",
         ),
+        DiscoveryPass(
+            name="discussion-archive",
+            attr="is_discussion_rich",
+            predicate=lambda r: (cand_comment_counts[idx_for(r.story.id)] or 0) > 0,
+            sort_key=_discussion_sort_key,
+            slot_limit=DISCUSSION_DISCOVERY_ARCHIVE_SLOTS,
+            age="archive",
+        ),
+    ]
+
+    for pass_ in cascade_passes:
+        if pass_.slot_limit <= 0:
+            continue
+        if pass_.age == "recent":
+            age_mask = recent_mask
+        elif pass_.age == "archive":
+            age_mask = ~recent_mask
+        else:
+            age_mask = None
+        pool = [
+            r
+            for r in remaining_decorated
+            if pass_.predicate(r)
+            and (age_mask is None or bool(age_mask[idx_for(r.story.id)]))
+        ]
+        if not pool:
+            continue
+        pool.sort(key=pass_.sort_key, reverse=True)
+        attr = cast(str, pass_.attr)
+        items = [replace(r, **{attr: True}) for r in pool[: pass_.slot_limit]]
+        final.extend(items)
+        selected_ids |= {item.story.id for item in items}
+        remaining_decorated = [
+            r for r in remaining_decorated if r.story.id not in selected_ids
+        ]
+
+    # Phase 2: parallel passes (Novel, Similar, Unsure). Each pass sees
+    # the FULL ranked pool (not just `remaining_decorated`) so a primary-
+    # ranked story can also receive a parallel badge. The picks are
+    # accumulated in a dict so multiple parallel passes can stack on the
+    # same story (e.g. Novel+Similar). After all parallel passes run, we
+    # merge into `final`: stories already present (from primary, Hot, or
+    # the cascade) get their `is_novel`/`is_similar`/`is_uncertain` flag
+    # OR'd in; new stories are appended.
+    parallel_picks: dict[int, RankedStory] = {}
+
+    def _record_parallel_pick(pass_: DiscoveryPass) -> None:
+        if pass_.slot_limit <= 0:
+            return
+        if pass_.age == "recent":
+            age_mask = recent_mask
+        elif pass_.age == "archive":
+            age_mask = ~recent_mask
+        else:
+            age_mask = None
+        pool = [
+            r
+            for r in ranked
+            if pass_.predicate(r)
+            and (age_mask is None or bool(age_mask[idx_for(r.story.id)]))
+        ]
+        if not pool:
+            return
+        pool.sort(key=pass_.sort_key, reverse=True)
+        attr = cast(str, pass_.attr)
+        for r in pool[: pass_.slot_limit]:
+            sid = r.story.id
+            if sid in parallel_picks:
+                parallel_picks[sid] = replace(parallel_picks[sid], **{attr: True})
+            else:
+                parallel_picks[sid] = replace(r, **{attr: True})
+
+    parallel_passes: list[DiscoveryPass] = [
         DiscoveryPass(
             name="novel-recent",
             attr="is_novel",
@@ -2318,142 +2309,58 @@ def rerank_candidates(
             age="archive",
         ),
         DiscoveryPass(
-            name="discussion-recent",
-            attr="is_discussion_rich",
-            predicate=lambda r: (cand_comment_counts[idx_for(r.story.id)] or 0) > 0,
-            sort_key=_discussion_sort_key,
-            slot_limit=DISCUSSION_DISCOVERY_RECENT_SLOTS,
+            name="uncertain-recent",
+            attr="is_uncertain",
+            predicate=lambda r: r.prob_down is not None,
+            sort_key=lambda r: float(get_entropy(r)),
+            slot_limit=UNCERTAIN_DISCOVERY_RECENT_SLOTS,
             age="recent",
         ),
         DiscoveryPass(
-            name="discussion-archive",
-            attr="is_discussion_rich",
-            predicate=lambda r: (cand_comment_counts[idx_for(r.story.id)] or 0) > 0,
-            sort_key=_discussion_sort_key,
-            slot_limit=DISCUSSION_DISCOVERY_ARCHIVE_SLOTS,
+            name="uncertain-archive",
+            attr="is_uncertain",
+            predicate=lambda r: r.prob_down is not None,
+            sort_key=lambda r: float(get_entropy(r)),
+            slot_limit=UNCERTAIN_DISCOVERY_ARCHIVE_SLOTS,
             age="archive",
-        ),
-        DiscoveryPass(
-            name="high-engagement-recent",
-            attr="is_high_engagement",
-            predicate=lambda r: True,
-            sort_key=_engagement_sort_key,
-            slot_limit=HIGH_ENGAGEMENT_DISCOVERY_RECENT_SLOTS,
-            age="recent",
-        ),
-        DiscoveryPass(
-            name="high-engagement-archive",
-            attr="is_high_engagement",
-            predicate=lambda r: True,
-            sort_key=_engagement_sort_key,
-            slot_limit=HIGH_ENGAGEMENT_DISCOVERY_ARCHIVE_SLOTS,
-            age="archive",
-        ),
-        DiscoveryPass(
-            name="hot",
-            attr="is_hot",
-            predicate=lambda r: cand_velocities[idx_for(r.story.id)] >= hot_threshold
-            and cand_velocities[idx_for(r.story.id)] > 0
-            and r.story.score >= HOT_MIN_SCORE,
-            sort_key=_hot_sort_key,
-            slot_limit=HOT_DISCOVERY_SLOT_LIMIT,
-        ),
-        DiscoveryPass(
-            name="non-hn",
-            attr="is_non_hn",
-            predicate=lambda r: not is_hn_source(r.story.source),
-            sort_key=lambda r: float(r.score),
-            slot_limit=n_non_hn_slots,
         ),
     ]
+    for pass_ in parallel_passes:
+        _record_parallel_pick(pass_)
 
-    for pass_ in discovery_passes:
-        if pass_.slot_limit <= 0:
-            continue
-        if pass_.age == "recent":
-            age_mask = recent_mask
-        elif pass_.age == "archive":
-            age_mask = ~recent_mask
+    # Merge parallel picks into `final`. Cascade picks are already in `final`;
+    # if a parallel pass also badges them, we update their `is_X` flag. New
+    # parallel-only stories are appended.
+    for sid, ranked_pick in parallel_picks.items():
+        existing_idx = next(
+            (i for i, item in enumerate(final) if item.story.id == sid), None
+        )
+        if existing_idx is not None:
+            existing = final[existing_idx]
+            final[existing_idx] = replace(
+                existing,
+                is_novel=existing.is_novel or ranked_pick.is_novel,
+                is_similar=existing.is_similar or ranked_pick.is_similar,
+                is_uncertain=existing.is_uncertain or ranked_pick.is_uncertain,
+            )
         else:
-            age_mask = None
-        pool = [
-            r
-            for r in remaining_decorated
-            if pass_.predicate(r)
-            and (age_mask is None or bool(age_mask[idx_for(r.story.id)]))
-        ]
-        if not pool:
-            continue
-        pool.sort(key=pass_.sort_key, reverse=True)
-        items = [
-            replace(r, **{pass_.attr: True}) if pass_.attr else r
-            for r in pool[: pass_.slot_limit]
-        ]
-        final.extend(items)
-        selected_ids |= {item.story.id for item in items}
-        remaining_decorated = [
-            r for r in remaining_decorated if r.story.id not in selected_ids
-        ]
+            final.append(ranked_pick)
 
-    # Re-attribute every story in the *complete* `final` (primary-ranked +
-    # all discovery-pass additions) with the per-bucket percentile
-    # thresholds. This is the "Enrichment" half of the Floor+Enrichment
-    # model: the per-cohort top-3 discovery passes above guarantee a floor
-    # of `slot_limit` badged stories per cohort, and this re-attribution
-    # also badges any story (esp. the 12 archive-top stories surfaced with
-    # attr=None) that clears the cohort's quality bar.
-    #
-    # Stories stay stackable: a story surfaced by a discovery pass keeps
-    # the pass-specific badge AND gains any other badge it qualifies for
-    # here (so archive-top's 12 high-score archive stories earn 🏆 Top,
-    # and if they have lots of comments, 💬 Talk-worthy, etc.).
-    #
-    # `is_similar` is intentionally NOT set here: it is pass-only by design
-    # (the Similar badge signals "surfaced from outside primary because of
-    # high semantic match" rather than being a near-tautology on
-    # top-ranked stories). The similar-recent/archive passes already set
-    # it where it should appear.
+    # Non-hn pass: sorts non-HN candidates by their rerank score. Runs last
+    # so the cascade + parallel picks can claim HN candidates first.
+    if n_non_hn_slots > 0:
+        pool = [r for r in remaining_decorated if not is_hn_source(r.story.source)]
+        if pool:
+            pool.sort(key=lambda r: float(r.score), reverse=True)
+            for r in pool[:n_non_hn_slots]:
+                final.append(replace(r, is_non_hn=True))
+
+    # Set is_recent and is_non_hn on every story in `final` (these flags are
+    # source/time based, not rank-based, so they always reflect the current
+    # candidate's metadata regardless of how it was selected).
     final = [
         replace(
             r,
-            is_uncertain=(
-                r.is_uncertain
-                or (
-                    r.prob_down is not None
-                    and get_entropy(r)
-                    >= uncertain_entropy_thresholds[story_id_to_idx[r.story.id]]
-                )
-            ),
-            is_novel=(
-                r.is_novel
-                or (
-                    cand_max_sim[story_id_to_idx[r.story.id]]
-                    <= sim_thresholds[story_id_to_idx[r.story.id]]
-                )
-            ),
-            is_discussion_rich=(
-                r.is_discussion_rich
-                or (
-                    cand_comment_counts[story_id_to_idx[r.story.id]]
-                    >= discussion_thresholds[story_id_to_idx[r.story.id]]
-                    and cand_comment_counts[story_id_to_idx[r.story.id]] > 0
-                )
-            ),
-            is_high_engagement=(
-                r.is_high_engagement
-                or (
-                    cand_scores[story_id_to_idx[r.story.id]]
-                    >= engagement_thresholds[story_id_to_idx[r.story.id]]
-                )
-            ),
-            is_hot=(
-                r.is_hot
-                or (
-                    cand_velocities[story_id_to_idx[r.story.id]] >= hot_threshold
-                    and cand_velocities[story_id_to_idx[r.story.id]] > 0
-                    and r.story.score >= HOT_MIN_SCORE
-                )
-            ),
             is_non_hn=(not is_hn_source(r.story.source)),
             is_recent=(r.story.time >= recent_cutoff),
         )
@@ -2662,13 +2569,7 @@ def generate_dashboard_bytes(
         vote_count_up=vote_counts["up"],
         vote_count_neutral=vote_counts["neutral"],
         vote_count_down=vote_counts["down"],
-        top_badge_percentile=int(round(config.model.top_badge_percentile)),
-        discussion_badge_percentile=int(
-            round(config.model.discussion_badge_percentile)
-        ),
         hot_badge_percentile=int(round(config.model.hot_badge_percentile)),
-        similar_badge_percentile=int(round(config.model.similar_badge_percentile)),
-        novel_badge_percentile=int(round(config.model.novel_badge_percentile)),
     )
     return html_content.encode("utf-8")
 

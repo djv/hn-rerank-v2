@@ -2245,261 +2245,6 @@ def test_tier3_pure_at_80_each(db: Database, embedder: Embedder) -> None:
     assert ranked[0].story.id == 2
 
 
-def test_top_badge_threshold_uses_config_percentile_and_floor(
-    db: Database, embedder: Embedder
-) -> None:
-    """is_high_engagement respects top_badge_percentile and top_badge_min_score.
-
-    With the Floor+Enrichment model, the badge is set by either:
-    (a) the high-engagement-recent discovery pass (top-3 by score in the
-        recent cohort from ``remaining_decorated``), or
-    (b) the post-discovery enrichment re-check against the per-bucket
-        percentile threshold (with the absolute floor).
-    This test verifies the threshold mechanic in (b): the percentile and
-    floor still gate which primary-ranked stories receive the badge, and
-    stories above the threshold are badged while the one just below is not.
-    The pass contribution (a) adds additional badged stories from the
-    remaining pool; the test asserts that the enrichment set is present
-    and the not-enriched boundary story is excluded.
-    """
-    config = Config(count=40)
-    now = int(time.time())
-    candidates = [
-        Story(
-            id=i,
-            title=f"Story {i}",
-            url=None,
-            score=score,
-            time=now - 3600,
-            text_content=f"Sample text content for story {i}.",
-            source="hn",
-        )
-        for i, score in enumerate(range(10, 210, 10))  # 20 stories, scores 10..200
-    ]
-    cand_embs = embedder.encode([s.text_content for s in candidates])
-
-    # Default config: 90th pct + min 100
-    ranked = rerank_candidates(db, config, embedder, candidates, cand_embs)
-    # 90th pct of [10..200] ≈ 181 → max(181, 100) = 181
-    engaged_ids = {r.story.id for r in ranked if r.is_high_engagement}
-    # Must include the 190-pt and 200-pt stories (ids 18, 19)
-    assert 18 in engaged_ids, (
-        f"190-pt story should be high-engagement at p90, got ids={engaged_ids}"
-    )
-    assert 19 in engaged_ids, (
-        f"200-pt story should be high-engagement at p90, got ids={engaged_ids}"
-    )
-    # The 180-pt story (id=17) is just below the p90 threshold (181) and
-    # must NOT be badged by enrichment. The high-engagement-recent pass
-    # (top-3 by score in the remaining pool) may or may not surface id=17
-    # depending on the rerank order; we only assert it is not badged via
-    # the enrichment threshold, so this assertion is strict.
-    assert 17 not in engaged_ids, (
-        "180-pt story should NOT be high-engagement at p90 (below 181)"
-    )
-    # The enrichment set (ids 18, 19) must be a subset of the badged set.
-    assert {18, 19} <= engaged_ids
-
-    # 50th pct + min 100: threshold = max(105, 100) = 105
-    config2 = Config(
-        count=40,
-        model=ModelConfig(top_badge_percentile=50.0, top_badge_min_score=100),
-    )
-    ranked2 = rerank_candidates(db, config2, embedder, candidates, cand_embs)
-    engaged2 = {r.story.id for r in ranked2 if r.is_high_engagement}
-    # Stories with score >= 110 (ids 10..19): these are the enrichment set
-    # (score 100 → id=9 is below the threshold 105).
-    assert 10 in engaged2, f"110-pt story should be high-engagement, got ids={engaged2}"
-    assert 9 not in engaged2, "100-pt story should NOT be high-engagement"
-    # Every id with score >= 110 must be badged (enrichment covers them
-    # all since they are in the primary ranked set).
-    assert {10, 11, 12, 13, 14, 15, 16, 17, 18, 19} <= engaged2
-
-    # 50th pct + min 120: threshold = max(105, 120) = 120
-    config3 = Config(
-        count=40,
-        model=ModelConfig(top_badge_percentile=50.0, top_badge_min_score=120),
-    )
-    ranked3 = rerank_candidates(db, config3, embedder, candidates, cand_embs)
-    engaged3 = {r.story.id for r in ranked3 if r.is_high_engagement}
-    # Stories with score >= 120 (ids 11..19): the enrichment set.
-    assert 11 in engaged3
-    assert 10 not in engaged3, "110-pt story should NOT be high-engagement at min 120"
-    assert {11, 12, 13, 14, 15, 16, 17, 18, 19} <= engaged3
-
-
-def test_discussion_badge_threshold_uses_config_percentile_and_floor(
-    db: Database, embedder: Embedder
-) -> None:
-    """is_discussion_rich respects discussion_badge_percentile and discussion_badge_min_comments.
-
-    With the Floor+Enrichment model, the badge is set by either:
-    (a) the discussion-recent discovery pass (top-3 by comment_count in the
-        recent cohort from ``remaining_decorated``), or
-    (b) the post-discovery enrichment re-check against the per-bucket
-        percentile threshold (with the absolute floor).
-    This test verifies the threshold mechanic in (b): the percentile and
-    floor still gate which stories receive the enrichment badge, and the
-    boundary story just below the threshold is excluded.
-    """
-    config = Config(count=40)
-    now = int(time.time())
-    # 20 stories, comment counts 10..200 (step 10), ordered so the highest-cc
-    # candidates are at the start of the list. Stable sort by tier-blend score
-    # preserves input order (all scores are equal), so the high-cc stories end
-    # up in the primary ranked set (limit=12) where the discussion-rich badge
-    # is applied via enrichment.
-    cc_values = list(range(10, 210, 10))  # [10, 20, ..., 200]
-    candidates = [
-        Story(
-            id=i,
-            title=f"Story {i}",
-            url=None,
-            score=50,
-            time=now - 3600,
-            text_content=f"Sample text content for story {i}.",
-            source="hn",
-            comment_count=cc,
-        )
-        for i, cc in enumerate(reversed(cc_values))  # id=0→cc=200, id=19→cc=10
-    ]
-    cand_embs = embedder.encode([s.text_content for s in candidates])
-
-    # Default config: 90th pct + min 0
-    ranked = rerank_candidates(db, config, embedder, candidates, cand_embs)
-    # 90th pct of [10..200] ≈ 181 → max(181, 0) = 181
-    rich_ids = {r.story.id for r in ranked if r.is_discussion_rich}
-    # id=0 has cc=200, id=1 has cc=190 → both should be discussion-rich
-    assert 0 in rich_ids, (
-        f"200-cc story should be discussion-rich at p90, got ids={rich_ids}"
-    )
-    assert 1 in rich_ids, (
-        f"190-cc story should be discussion-rich at p90, got ids={rich_ids}"
-    )
-    assert 2 not in rich_ids, (
-        "180-cc story should NOT be discussion-rich at p90 (below 181)"
-    )
-    assert {0, 1} <= rich_ids
-
-    # 50th pct + min 100: threshold = max(105, 100) = 105
-    config2 = Config(
-        count=40,
-        model=ModelConfig(
-            discussion_badge_percentile=50.0, discussion_badge_min_comments=100
-        ),
-    )
-    ranked2 = rerank_candidates(db, config2, embedder, candidates, cand_embs)
-    rich2 = {r.story.id for r in ranked2 if r.is_discussion_rich}
-    # Stories with cc >= 110: ids 0..9 (10 stories) — enrichment covers all
-    # of them since they are in the primary ranked set.
-    assert 0 in rich2, f"200-cc story should be discussion-rich, got ids={rich2}"
-    assert 9 in rich2, f"110-cc story should be discussion-rich, got ids={rich2}"
-    assert 10 not in rich2, "100-cc story should NOT be discussion-rich"
-    assert set(range(0, 10)) <= rich2
-
-    # 50th pct + min 120: threshold = max(105, 120) = 120
-    config3 = Config(
-        count=40,
-        model=ModelConfig(
-            discussion_badge_percentile=50.0, discussion_badge_min_comments=120
-        ),
-    )
-    ranked3 = rerank_candidates(db, config3, embedder, candidates, cand_embs)
-    rich3 = {r.story.id for r in ranked3 if r.is_discussion_rich}
-    # Stories with cc >= 120: ids 0..8 (9 stories)
-    assert 0 in rich3
-    assert 8 in rich3
-    assert 9 not in rich3, "110-cc story should NOT be discussion-rich at min 120"
-    assert set(range(0, 9)) <= rich3
-
-
-def test_badge_thresholds_computed_per_age_bucket(
-    db: Database, embedder: Embedder
-) -> None:
-    """Top (🏆) and Talk-worthy (💬) thresholds are computed per age bucket.
-
-    Archive candidates have structurally higher absolute scores and comment
-    counts (months/years of accumulation) than recent ones. A single global
-    threshold would be archive-dominated and make it nearly impossible for
-    recent stories to earn these badges. Per-bucket thresholds (recent and
-    archive computed independently) ensure "top 10%" means "top 10% within
-    your age cohort."
-
-    This test mixes recent (low score/comments) and archive (high) candidates
-    and asserts a recent story qualifies for 🏆/💬 that would have been
-    excluded by the old global threshold.
-    """
-    config = Config(count=40)
-    now = int(time.time())
-
-    # 10 recent stories (1h old, scores 10..100 step 10, comments 10..100
-    # step 10) and 10 archive stories (60d old, scores 1000..5500 step 500,
-    # comments 1000..5500 step 500). With default config:
-    #   global engagement_threshold = max(p90(all scores), 100) = 5000
-    #   recent engagement_threshold  = max(p90(recent scores), 100) = 100
-    #   global discussion_threshold = max(p90(all nonzero comments), 0) = 5000
-    #   recent discussion_threshold  = max(p90(recent comments), 0) = 100
-    # A recent story with score=100 and cc=100 qualifies per-bucket but
-    # would fail the old global threshold.
-    candidates = []
-    for i in range(10):
-        score = 10 + i * 10  # 10, 20, ..., 100
-        candidates.append(
-            Story(
-                id=i,
-                title=f"Recent {i}",
-                url=None,
-                score=score,
-                time=now - 3600,  # 1h old → recent
-                text_content=f"recent story {i}",
-                source="hn",
-                comment_count=score,
-            )
-        )
-    for i in range(10):
-        score = 1000 + i * 500  # 1000, 1500, ..., 5500
-        candidates.append(
-            Story(
-                id=10 + i,
-                title=f"Archive {i}",
-                url=None,
-                score=score,
-                time=now - 60 * 86400,  # 60d old → archive
-                text_content=f"archive story {i}",
-                source="ch_seed",
-                comment_count=score,
-            )
-        )
-
-    cand_embs = embedder.encode([s.text_content for s in candidates])
-    ranked = rerank_candidates(db, config, embedder, candidates, cand_embs)
-
-    by_id = {r.story.id: r for r in ranked}
-    # id=9 is the highest-score recent (score=100, cc=100). Per-bucket
-    # recent engagement_threshold = 100, so 100 >= 100 → is_high_engagement.
-    # Per-bucket recent discussion_threshold = 100, so cc=100 >= 100 → is_discussion_rich.
-    assert 9 in by_id, "id=9 (highest recent) should be in final"
-    assert by_id[9].is_high_engagement, (
-        f"Recent story with score=100 should get 🏆 Top under per-bucket "
-        f"threshold (100); got is_high_engagement={by_id[9].is_high_engagement}"
-    )
-    assert by_id[9].is_discussion_rich, (
-        f"Recent story with cc=100 should get 💬 Talk-worthy under per-bucket "
-        f"threshold (100); got is_discussion_rich={by_id[9].is_discussion_rich}"
-    )
-    # id=8 is a recent story with score=90, cc=90. Below per-bucket
-    # threshold (100), so neither badge should fire.
-    assert 8 in by_id, "id=8 should be in final"
-    assert not by_id[8].is_high_engagement, (
-        f"Recent story with score=90 should NOT get 🏆 Top (below p90=100); "
-        f"got is_high_engagement={by_id[8].is_high_engagement}"
-    )
-    assert not by_id[8].is_discussion_rich, (
-        f"Recent story with cc=90 should NOT get 💬 Talk-worthy; "
-        f"got is_discussion_rich={by_id[8].is_discussion_rich}"
-    )
-
-
 def test_novel_archive_pass_surfaces_archive_novel(
     db: Database, embedder: Embedder, monkeypatch: "pytest.MonkeyPatch"
 ) -> None:
@@ -2507,20 +2252,15 @@ def test_novel_archive_pass_surfaces_archive_novel(
 
     The novel pass is split per-age (novel-recent + novel-archive) so the
     ✨ badge actually appears in both age buckets. Archive extras (low
-    score) are not in the primary ranked set and not selected by the
-    archive-top pass (which sorts by score). The novel-archive pass is
-    the only path for an archive story to enter `final` with is_novel.
+    score) are not in the primary ranked set; without a dedicated
+    novel-archive pass they would never be surfaced with ✨.
 
     This test constructs archive candidates with low max_sim (novel-
     qualifying) and asserts they appear in `final` with is_novel=True.
-    It also verifies the per-bucket threshold excludes archive stories
-    whose sim exceeds the archive cohort's p50 — proving the per-bucket
-    threshold is doing real work, not just a global pass-through.
+    The top 2 by distance (sim 0.05, 0.10) are picked by the
+    novel-archive pass (slot_limit=5).
     """
-    config = Config(
-        count=40,
-        model=ModelConfig(novel_badge_percentile=50.0),
-    )
+    config = Config(count=40)
     user = db.create_user("test_novel_archive")
 
     def mock_gce(stories, embedder_arg, db_inst):
@@ -2539,13 +2279,18 @@ def test_novel_archive_pass_surfaces_archive_novel(
     now = int(time.time())
     # Setup:
     #   12 recent primary (high score, sim 0.5) fill the primary ranked set.
-    #   12 archive fillers (high score, sim 0.5) — consumed by the
-    #     archive-top pass (slot_limit=12, score-sorted), keeping the
-    #     novel-target archive in `remaining_decorated` for novel-archive.
+    #   12 archive fillers (high score, sim 0.5) — they have sim 0.5 too,
+    #     so they don't qualify as novel and are not picked by novel-archive
+    #     (which sorts by distance desc).
     #   4 archive novel targets (low score, sim 0.05..0.20) — the test target.
-    # Archive novel sims: [0.05, 0.10, 0.15, 0.20]. With novel_badge_percentile=50,
-    # archive p50 = 0.125, so sim <= 0.125 qualifies → ids with sim 0.05
-    # and 0.10 get is_novel; sim 0.15 and 0.20 do not.
+    # Archive novel sims: [0.05, 0.10, 0.15, 0.20]. The novel-archive pass
+    # sorts by distance (= 1 - sim) desc and takes the top 5. All 4 novel
+    # targets have higher distance than the archive fillers (sim 0.5 →
+    # dist 0.5), so the top of the novel-archive pool is the 4 novel
+    # targets; the pass picks 4 of them and (with slot_limit=5) leaves room
+    # for an additional 1 archive filler (the 4th filler is the 5th by
+    # distance, with sim 0.5 → dist 0.5, tied with the others — last pick
+    # depends on stable sort order).
     candidates = []
     for i in range(12):
         candidates.append(
@@ -2603,11 +2348,9 @@ def test_novel_archive_pass_surfaces_archive_novel(
     )
 
     by_id = {r.story.id: r for r in ranked}
-    # Archive novel targets with low max_sim get is_novel via the
-    # novel-archive pass. This proves the per-age split surfaces ✨
-    # in archive mode — without the split, these would compete with
-    # recent stories in the global novel pass and likely be cut.
-    for aid in (24, 25):
+    # All 4 archive novel targets have higher distance than the fillers,
+    # so they all get is_novel via the novel-archive pass.
+    for aid in (24, 25, 26, 27):
         assert aid in by_id, (
             f"Archive novel id={aid} should be in final via novel-archive pass"
         )
@@ -2620,44 +2363,42 @@ def test_novel_archive_pass_surfaces_archive_novel(
         )
 
 
-def test_each_badge_floored_at_three_per_cohort(
+def test_each_badge_floored_at_five_per_cohort(
     db: Database, embedder: Embedder
 ) -> None:
-    """Every non-Hot badge must appear >=3 times in recent AND >=3 times
-    in archive of the final deck (the user's explicit "at least (3,3)
+    """Every non-Hot badge must appear >=5 times in recent AND >=5 times
+    in archive of the final deck (the user's explicit "at least (5,5)
     for each" expectation).
 
-    The Floor+Enrichment model guarantees this via per-cohort top-3
-    discovery passes (the "Floor") plus a post-discovery enrichment
-    re-check (the "Enrichment") that adds more on large pools. Hot
-    stays global by design and is not asserted here.
+    The rank-based cascade guarantees this via per-cohort top-5
+    discovery passes for each non-Hot badge:
+      cascade: hot, high-engagement-recent/archive, discussion-recent/archive
+      parallel (with stacking): novel-recent/archive, similar-recent/archive,
+                                 uncertain-recent/archive
+    Each pass takes the top 5 stories in its age cohort by the badge
+    metric. The cascade passes are mutually exclusive; the parallel
+    passes can stack with each other and with cascade picks.
 
     Pool sizing: 30 recent + 30 archive is the minimum safe cohort size
-    for the structural floor to hold under any primary-rerank
-    distribution. With ``primary_limit=12`` and 5 per-cohort passes
-    consuming up to 12 candidates, the worst case (primary takes 12
-    from one cohort) leaves ``30 - 12 = 18`` in that cohort, and
-    ``18 - 12 (4 earlier passes) = 6`` for the last pass
-    (high-engagement-recent) — still enough to fill its 3-slot cap.
+    for the structural floor to hold. With ``primary_limit=12`` and 3
+    cascade passes per cohort consuming up to 15 candidates (5+5+5),
+    the worst case (primary takes 12 + cascade takes 15 = 27) leaves
+    ``30 - 27 = 3`` in the cohort for the parallel group — still
+    enough to fill the 5-slot cap (the cap is the *target*; if the
+    cohort has fewer candidates we get fewer). For this test we size
+    the cohorts so the floor (5 per cohort per badge) holds.
 
-    Feedback: 20 ups and 20 downs on two distinct stories so the SVM
-    fits (it requires both ``n_up >= min_up_for_svm=20`` and
-    ``n_down >= min_down_for_svm=20``) and ``predict_proba`` returns
-    varied probabilities, which drives the entropy signal for the
-    Unsure badge and the Similar/Novel similarity signal.
+    Feedback: 20 distinct upvotes, 20 distinct downvotes, 20 distinct
+    neutral. The feedback table has a UNIQUE(user_id, story_id, action)
+    constraint, so 20 votes of the same story collapse to 1 row. The
+    SVM requires ``n_up >= 20`` and ``n_down >= 20`` distinct stories
+    to fit and produce ``predict_proba`` output, which drives the
+    entropy signal for the Unsure badge and the similarity signals
+    for Novel and Similar.
     """
     config = Config(count=40)
-    user = db.create_user("test_each_badge_floor")
+    user = db.create_user("test_each_badge_floor_5")
 
-    # Feedback: 20 DISTINCT upvoted stories, 20 DISTINCT downvoted,
-    # 20 DISTINCT neutral. The feedback table has a UNIQUE
-    # (user_id, story_id, action) constraint, so 20 votes of the same
-    # story collapse to 1 row. The SVM requires ``n_up >= 20`` and
-    # ``n_down >= 20`` distinct stories to fit and produce
-    # ``predict_proba`` output (which drives the entropy signal for
-    # is_uncertain). With 60 distinct feedback stories across 3 classes,
-    # candidates near the decision boundary get high entropy and the
-    # per-cohort top-3 Unsure pass surfaces ≥3 in each cohort.
     for i in range(20):
         db.upsert_story(
             Story(
@@ -2748,11 +2489,8 @@ def test_each_badge_floored_at_three_per_cohort(
 
     recent = [r for r in ranked if r.is_recent]
     archive = [r for r in ranked if not r.is_recent]
-    # Both cohorts must remain after primary rerank + all 5 per-cohort
-    # passes consume their 3-slot caps. The 30-per-cohort size is the
-    # floor that guarantees this.
-    assert len(recent) >= 3, f"recent cohort too small in final: {len(recent)}"
-    assert len(archive) >= 3, f"archive cohort too small in final: {len(archive)}"
+    assert len(recent) >= 5, f"recent cohort too small in final: {len(recent)}"
+    assert len(archive) >= 5, f"archive cohort too small in final: {len(archive)}"
 
     for attr in (
         "is_high_engagement",
@@ -2763,120 +2501,374 @@ def test_each_badge_floored_at_three_per_cohort(
     ):
         n_recent = sum(1 for r in recent if getattr(r, attr))
         n_archive = sum(1 for r in archive if getattr(r, attr))
-        assert n_recent >= 3, f"{attr} must appear >=3 times in recent (got {n_recent})"
-        assert n_archive >= 3, (
-            f"{attr} must appear >=3 times in archive (got {n_archive})"
+        assert n_recent >= 5, f"{attr} must appear >=5 times in recent (got {n_recent})"
+        assert n_archive >= 5, (
+            f"{attr} must appear >=5 times in archive (got {n_archive})"
         )
 
 
-def test_archive_top_stories_get_stackable_badges(
-    db: Database, embedder: Embedder
-) -> None:
-    """Archive-top's 12 high-score archive stories (surfaced with attr=None)
-    enter `final` and earn is_high_engagement via the post-discovery
-    enrichment re-attribution (Change A), proving badges are stackable
-    across the complete final.
+def test_cascade_badges_mutually_exclusive(db: Database, embedder: Embedder) -> None:
+    """Hot (🔥), Top (🏆), and Talk-worthy (💬) badges are mutually exclusive.
 
-    The 12 archive-top stories are the 12 highest-score archive
-    candidates. The number of archive-top stories whose score exceeds
-    the archive p90 threshold (and so receive is_high_engagement via
-    enrichment) is approximately ``0.1 × N_archive``. With 30 archive
-    candidates, the top-3 archive-top (scores 2900/3000/3100) all
-    exceed the interpolated p90 ≈ 2810, so they reliably receive
-    is_high_engagement through the post-discovery re-attribution.
+    The cascade order is Hot → Top → Talk, with each pass excluding prior
+    picks from its pool. A story picked by Hot cannot also be picked by
+    Top (Hot is excluded from Top's pool), and a story picked by Top
+    cannot also be picked by Talk. This is the property that prevents
+    the "too many badges" feel — a Hot story shows 🔥 only, a Top
+    story shows 🏆 only, a Talk story shows 💬 only.
 
-    This test asserts:
-    - All 12 archive-top stories are in `final` (archive-top slot cap).
-    - The top-3-by-score archive-top are `is_high_engagement`, proving
-      the post-discovery enrichment badges archive-top's attr=None stories.
+    The test builds a 30-recent pool where the top 5 by velocity, the
+    top 5 by score, and the top 5 by comment_count overlap heavily.
     """
     config = Config(count=40)
-    user = db.create_user("test_archive_top_stackable")
-
-    db.upsert_story(
-        Story(id=900, title="fb", url=None, score=10, time=0, text_content="x")
-    )
-    db.upsert_feedback(user.id, 900, "up")
-
     now = int(time.time())
     candidates: list[Story] = []
-    # 30 archive: 12 archive-top (high score) + 18 fillers (low score).
-    # The 18 fillers (scores 10..180) sit below the top-12 and pull
-    # the archive p90 down to ~2810, so the top-3 archive-top
-    # (209=2900, 210=3000, 211=3100) exceed it and get enriched.
-    for i in range(12):
+    # 30 recent stories, all 1h old, with scores and comment counts that
+    # make the top-5 by velocity / score / comment_count largely
+    # overlap. Velocity ≈ score/age, so high-score stories are also
+    # high-velocity.
+    for i in range(30):
+        # Score 200..100 (desc), comment_count 200..100 (desc): the
+        # top-5 by score and top-5 by cc overlap exactly; the top-5
+        # by velocity (= score/age) also overlap with them since all
+        # stories are the same age.
+        score = max(10, 200 - i * 7)
+        cc = max(5, 200 - i * 7)
         candidates.append(
             Story(
-                id=200 + i,
-                title=f"ATop {i}",
+                id=i,
+                title=f"S{i}",
                 url=None,
-                score=2000 + i * 100,  # 2000..3100
-                time=now - 60 * 86400,
-                text_content=f"top archive story {i}",
-                source="ch_seed",
-                comment_count=100 + i * 10,
+                score=score,
+                time=now - 3600,
+                text_content=f"story {i}",
+                source="hn",
+                comment_count=cc,
             )
         )
-    for i in range(18):
+    cand_embs = embedder.encode([s.text_content for s in candidates])
+    ranked = rerank_candidates(db, config, embedder, candidates, cand_embs)
+    by_id = {r.story.id: r for r in ranked}
+
+    # No story in final can have both Hot and Top, or Top and Talk.
+    # (Hot/Top overlap: Hot picks first, Top excludes Hot, so the 5 Hot
+    # stories must NOT be in the 5 Top. Top/Talk: same.)
+    for sid, r in by_id.items():
+        cascade = [r.is_hot, r.is_high_engagement, r.is_discussion_rich]
+        cascade_count = sum(cascade)
+        assert cascade_count <= 1, (
+            f"id={sid} has multiple cascade badges: "
+            f"is_hot={r.is_hot}, is_high_engagement={r.is_high_engagement}, "
+            f"is_discussion_rich={r.is_discussion_rich}"
+        )
+
+
+def test_cascade_top_excluded_from_talk(db: Database, embedder: Embedder) -> None:
+    """The Top-archive pass's 5 picks do not appear in the Talk-archive
+    pass's 5 picks, even when the top-5 by score and top-5 by comment
+    count in the archive cohort overlap exactly.
+
+    This is a stricter version of test_cascade_badges_mutually_exclusive
+    for the Top/Talk boundary in archive mode.
+    """
+    config = Config(count=40)
+    now = int(time.time())
+    candidates: list[Story] = []
+    # 30 archive (60d old) stories. High score == high cc so the top-5
+    # by score = the top-5 by cc; the cascade ensures they are
+    # different sets.
+    for i in range(30):
+        score = max(10, 2000 - i * 70)
+        cc = max(5, 2000 - i * 70)
         candidates.append(
             Story(
-                id=400 + i,
-                title=f"AFill {i}",
+                id=i,
+                title=f"Archive {i}",
                 url=None,
-                score=10 + i * 10,  # 10..180
+                score=score,
                 time=now - 60 * 86400,
-                text_content=f"archive filler {i}",
+                text_content=f"archive story {i}",
                 source="ch_seed",
-                comment_count=2,
+                comment_count=cc,
             )
         )
-    for i in range(6):
+    cand_embs = embedder.encode([s.text_content for s in candidates])
+    ranked = rerank_candidates(db, config, embedder, candidates, cand_embs)
+    archive = [r for r in ranked if not r.is_recent]
+
+    top_archive_ids = {r.story.id for r in archive if r.is_high_engagement}
+    talk_archive_ids = {r.story.id for r in archive if r.is_discussion_rich}
+    assert top_archive_ids, "expected Top-archive to surface some stories"
+    assert talk_archive_ids, "expected Talk-archive to surface some stories"
+    assert top_archive_ids.isdisjoint(talk_archive_ids), (
+        f"Top-archive and Talk-archive must be disjoint sets, got overlap: "
+        f"{top_archive_ids & talk_archive_ids}"
+    )
+
+
+def test_cascade_hot_excluded_from_top(db: Database, embedder: Embedder) -> None:
+    """The Hot pass's 5 picks do not appear in the high-engagement-recent
+    pass's 5 picks, even when velocity and score overlap.
+
+    Hot is global (recent-only by velocity) and runs first. Top-recent
+    runs second and excludes Hot picks. A high-velocity recent story
+    that is also high-score must be Hot, not Top.
+    """
+    config = Config(count=40)
+    now = int(time.time())
+    candidates: list[Story] = []
+    # 30 recent stories, 1h old. Velocity = score/1h. Top 5 by velocity
+    # and top 5 by score should overlap (since all have the same age).
+    for i in range(30):
+        score = max(10, 200 - i * 7)
         candidates.append(
             Story(
-                id=300 + i,
-                title=f"Recent {i}",
+                id=i,
+                title=f"S{i}",
                 url=None,
-                score=50,
-                time=now - 86400,
-                text_content=f"recent filler {i}",
+                score=score,
+                time=now - 3600,
+                text_content=f"story {i}",
                 source="hn",
                 comment_count=5,
             )
         )
-
     cand_embs = embedder.encode([s.text_content for s in candidates])
+    ranked = rerank_candidates(db, config, embedder, candidates, cand_embs)
+
+    hot_ids = {r.story.id for r in ranked if r.is_hot}
+    top_recent_ids = {
+        r.story.id for r in ranked if r.is_high_engagement and r.is_recent
+    }
+    assert hot_ids, "expected Hot to surface some stories"
+    assert top_recent_ids, "expected Top-recent to surface some stories"
+    assert hot_ids.isdisjoint(top_recent_ids), (
+        f"Hot and Top-recent must be disjoint sets, got overlap: "
+        f"{hot_ids & top_recent_ids}"
+    )
+
+
+def test_cascade_can_stack_with_parallel(
+    db: Database, embedder: Embedder, monkeypatch
+) -> None:
+    """A cascade-badge story (e.g. Top) can also be badged by a parallel
+    pass (e.g. Unsure) — the parallel group sees the full ranked pool
+    and can pick the same story a cascade pass picked.
+
+    Setup: 20 distinct upvotes on "topic A" axis, 20 distinct downvotes
+    on "topic B" axis. Stories with embeddings close to a 50/50 mix of
+    the two axes have max entropy. We build 30 recent stories that all
+    have a 50/50 mix and varied scores. The SVM puts them all near the
+    decision boundary → high entropy. The top 12 by SVM score fill
+    primary; ids 12..16 are the Top-recent picks (highest score in
+    remaining_decorated). The parallel Unsure pass picks 5 from
+    `ranked` by entropy desc — these are the same stories the cascade
+    ranked high, so the parallel picks overlap with the Top picks.
+    """
+    config = Config(count=40)
+    user = db.create_user("test_cascade_stack")
+    for i in range(20):
+        db.upsert_story(
+            Story(
+                id=500 + i,
+                title=f"fb_up_{i}",
+                url=None,
+                score=10,
+                time=0,
+                text_content=f"upvote {i}",
+            )
+        )
+        db.upsert_feedback(user.id, 500 + i, "up")
+    for i in range(20):
+        db.upsert_story(
+            Story(
+                id=600 + i,
+                title=f"fb_down_{i}",
+                url=None,
+                score=10,
+                time=0,
+                text_content=f"downvote {i}",
+            )
+        )
+        db.upsert_feedback(user.id, 600 + i, "down")
+
+    def mock_gce(stories, embedder_arg, db_inst):
+        arr = np.zeros((len(stories), 384), dtype=np.float32)
+        for i, s in enumerate(stories):
+            if s.id < 500:
+                # 50/50 mix of axis A (upvotes) and axis B (downvotes)
+                # → max entropy. The unique-axis component keeps the
+                # embeddings distinct so the SVM gets a meaningful
+                # signal for ranking.
+                arr[i, 0] = 0.5
+                arr[i, 1] = 0.5
+                arr[i, 200 + s.id] = np.sqrt(0.5)
+        return arr
+
+    monkeypatch.setattr("pipeline.get_or_compute_embeddings", mock_gce)
+
+    now = int(time.time())
+    candidates: list[Story] = []
+    for i in range(30):
+        score = 200 - i * 5
+        candidates.append(
+            Story(
+                id=i,
+                title=f"S{i}",
+                url=None,
+                score=max(10, score),
+                time=now - 3 * 86400,
+                text_content=f"text {i}",
+                source="hn",
+                comment_count=20,
+            )
+        )
+
+    cand_embs = np.zeros((30, 384), dtype=np.float32)
+    for i in range(30):
+        cand_embs[i, 0] = 0.5
+        cand_embs[i, 1] = 0.5
+        cand_embs[i, 200 + i] = np.sqrt(0.5)
+
+    ranked = rerank_candidates(
+        db, config, embedder, candidates, cand_embs, user_id=user.id
+    )
+
+    # There must be at least one story that ends up with both
+    # is_high_engagement AND is_uncertain, proving the parallel pass
+    # can stack onto a cascade pick.
+    stacked = [r for r in ranked if r.is_high_engagement and r.is_uncertain]
+    assert stacked, (
+        f"expected at least one story with both Top and Unsure, got none; "
+        f"top_ids={[r.story.id for r in ranked if r.is_high_engagement]}, "
+        f"unsure_ids={[r.story.id for r in ranked if r.is_uncertain]}"
+    )
+
+
+def test_parallel_can_stack_within(
+    db: Database, embedder: Embedder, monkeypatch
+) -> None:
+    """Novel (✨), Similar (🎯), and Unsure (🤔) run in parallel and can
+    stack on the same story. A story that's both low-similarity-to-
+    feedback (novel) and high-similarity-to-upvoted (similar) gets
+    both badges.
+
+    Uses a controlled embedder (mocked ``get_or_compute_embeddings``)
+    so the feedback embeddings sit on a known axis (axis 0 for up,
+    axis 1 for down) and the candidate embeddings can be placed
+    relative to that.
+    """
+    config = Config(count=40)
+    user = db.create_user("test_parallel_stack")
+    for i in range(20):
+        db.upsert_story(
+            Story(
+                id=700 + i,
+                title=f"fb_up_{i}",
+                url=None,
+                score=10,
+                time=0,
+                text_content=f"upvote topic A {i}",
+            )
+        )
+        db.upsert_feedback(user.id, 700 + i, "up")
+    for i in range(20):
+        db.upsert_story(
+            Story(
+                id=720 + i,
+                title=f"fb_down_{i}",
+                url=None,
+                score=10,
+                time=0,
+                text_content=f"downvote topic B {i}",
+            )
+        )
+        db.upsert_feedback(user.id, 720 + i, "down")
+
+    def mock_gce(stories, embedder_arg, db_inst):
+        arr = np.zeros((len(stories), 384), dtype=np.float32)
+        for i, s in enumerate(stories):
+            sid = s.id
+            if 700 <= sid < 720:
+                arr[i, 0] = 0.95  # upvote on axis 0
+                arr[i, 50 + (sid - 700)] = np.sqrt(1 - 0.95**2)
+            elif 720 <= sid < 740:
+                arr[i, 1] = 0.95  # downvote on axis 1
+                arr[i, 80 + (sid - 720)] = np.sqrt(1 - 0.95**2)
+        return arr
+
+    monkeypatch.setattr("pipeline.get_or_compute_embeddings", mock_gce)
+
+    now = int(time.time())
+    candidates: list[Story] = []
+    # 5 candidates (matching the novel pass's slot_limit). id=0 is
+    # on axis A (similar to upvoted). id=1 is on axis C (novel, far
+    # from feedback). id=2 is on axis A + axis C combined — high sim
+    # to upvoted (axis A) AND high distance to all feedback (the A+C
+    # combination). This is the stacking target. ids 3 and 4 are
+    # fillers with low sim to upvoted.
+    for i in range(5):
+        candidates.append(
+            Story(
+                id=i,
+                title=f"S{i}",
+                url=None,
+                score=50,
+                time=now - 3600,
+                text_content=f"candidate {i}",
+                source="hn",
+                comment_count=5,
+            )
+        )
+    cand_embs = np.zeros((5, 384), dtype=np.float32)
+    cand_embs[0, 0] = 0.95  # axis A: similar to upvoted
+    cand_embs[1, 1] = 0.95  # axis C: novel (orthogonal to feedback)
+    # id=2: combine moderate up-similarity (0.5 on axis 0) with a
+    # strong orthogonal component (0.86 on axis 1). max_sim = 0.5
+    # (from up), distance = 0.5. With only 5 candidates and slot=5,
+    # the novel pass picks all 5 by distance; the order is by
+    # distance desc so id=2 (dist 0.5) is in the top 5 along with
+    # id=1 (dist 0.05) and ids 3, 4 (dist 1.0). id=2 ends up with
+    # both is_similar (from similar pass, top 5 by cand_closest_up
+    # includes id=0 (0.95), id=2 (0.5), and ids 1, 3, 4 (0.0)) and
+    # is_novel (from novel pass, top 5 by distance includes id=2).
+    cand_embs[2, 0] = 0.5
+    cand_embs[2, 1] = 0.86
+    for i in range(3, 5):
+        cand_embs[i, 50 + i] = 0.6
+        cand_embs[i, 200 + i] = 0.8
+
     ranked = rerank_candidates(
         db, config, embedder, candidates, cand_embs, user_id=user.id
     )
     by_id = {r.story.id: r for r in ranked}
 
-    # All 12 archive-top stories should be in final (archive-top slot cap=12).
-    for i in range(12):
-        aid = 200 + i
-        assert aid in by_id, (
-            f"archive-top story id={aid} should be in final (slot cap=12)"
+    # id=2 should have BOTH is_similar (close to upvoted axis) AND
+    # is_novel (high distance to all feedback, since axis 1 is
+    # orthogonal to both upvoted and downvoted).
+    if 2 in by_id:
+        r = by_id[2]
+        assert r.is_similar, (
+            f"id=2 (similar to upvoted) should be is_similar=True; "
+            f"got is_similar={r.is_similar}"
         )
-        assert not by_id[aid].is_recent, (
-            f"archive-top story id={aid} should be is_recent=False"
-        )
-
-    # The top-3-by-score archive-top exceed the archive p90 (≈2810 in
-    # this 30-archive pool) and must receive is_high_engagement via
-    # the post-discovery enrichment, proving stackable re-attribution
-    # works for the archive-top pass's attr=None stories.
-    for aid in (209, 210, 211):
-        assert by_id[aid].is_high_engagement, (
-            f"archive-top top-by-score id={aid} "
-            f"(score={by_id[aid].story.score}) should be is_high_engagement "
-            f"via post-discovery enrichment; got "
-            f"is_high_engagement={by_id[aid].is_high_engagement}"
+        assert r.is_novel, (
+            f"id=2 (also has unique axis) should be is_novel=True; "
+            f"got is_novel={r.is_novel}"
         )
 
 
 def test_hot_badge_threshold_uses_config_percentile(
     db: Database, embedder: Embedder
 ) -> None:
-    """is_hot respects hot_badge_percentile from config."""
+    """is_hot respects hot_badge_percentile from config.
+
+    The Hot pass runs against the FULL candidate pool (not just
+    remaining_decorated) and gates on the velocity percentile + score
+    floor. The slot_limit caps how many can be picked, but with a tight
+    percentile (99.5), only 1-2 stories clear the threshold on a small
+    pool.
+    """
     now = int(time.time())
     # 20 stories, scores 10..200 (step 10), all 1h old so velocity = score.
     # Ordered so high-score stories are at the start (stable sort preserves order).
@@ -2896,7 +2888,8 @@ def test_hot_badge_threshold_uses_config_percentile(
     ]
     cand_embs = embedder.encode([s.text_content for s in candidates])
 
-    # Default: 99.5th pct → only id=0 (score=200) gets is_hot
+    # Default: 99.5th pct of velocity. With velocity ∈ [10, 200] step 10,
+    # p99.5 = 199.55. Only id=0 (velocity 200) clears the threshold.
     config = Config(count=40)
     ranked = rerank_candidates(db, config, embedder, candidates, cand_embs)
     hot_ids = {r.story.id for r in ranked if r.is_hot}
@@ -2904,15 +2897,18 @@ def test_hot_badge_threshold_uses_config_percentile(
     assert 1 not in hot_ids, "190-score story should NOT be hot at p99.5"
     assert len(hot_ids) == 1, f"Expected 1 hot at p99.5, got {len(hot_ids)}"
 
-    # 50th pct → half the stories (score >= 110)
+    # 50th pct: p50 of [10..200] = 105. Velocity >= 110 clears the
+    # threshold for ids 0..9 (scores 200..110). Slot cap is 5, so the
+    # top 5 by velocity get the badge.
     config2 = Config(count=40, model=ModelConfig(hot_badge_percentile=50.0))
     ranked2 = rerank_candidates(db, config2, embedder, candidates, cand_embs)
     hot2 = {r.story.id for r in ranked2 if r.is_hot}
     assert 0 in hot2
-    # 50th pct of [10..200] = 105 → score >= 110 → 10 stories (id 0..9)
-    assert 9 in hot2
-    assert 10 not in hot2, "100-score story should NOT be hot at p50"
-    assert len(hot2) == 10, f"Expected 10 hot at p50, got {len(hot2)}"
+    # 50th pct of [10..200] = 105 → score >= 110 → 10 candidates qualify,
+    # but slot cap is 5, so top 5 by velocity (ids 0..4) get the badge.
+    assert 4 in hot2
+    assert 5 not in hot2, "150-score story should NOT be hot at p50 (slot cap=5)"
+    assert len(hot2) == 5, f"Expected 5 hot at p50 (slot cap), got {len(hot2)}"
 
 
 def test_tier1_gravity_at_zero_feedback(db: Database, embedder: Embedder) -> None:
@@ -3588,44 +3584,74 @@ def test_candidate_similar_to_neutral_is_not_novel(db, embedder, monkeypatch):
         )
         db.upsert_feedback(user.id, sid, action)
 
-    # Controlled candidate embeddings:
-    # 1 -> close to neutral (axis 2)
-    # 2 -> close to up (axis 0)
-    # 3 -> far from all (axis 3, orthogonal to all feedback)
-    cand_embs = np.zeros((3, 384), dtype=np.float32)
+    # Controlled candidate embeddings. Pool has 3 target stories + 7
+    # fillers (with small overlap on feedback axes so they have
+    # non-zero max_sim but lower than id=3's distance 1.0).
+    # 1 -> close to neutral (axis 2), max_sim=0.95
+    # 2 -> close to up (axis 0), max_sim=0.95
+    # 3 -> far from all (axis 3), max_sim=0
+    # 4..10 -> small overlap with feedback axes 0,1,2 (max_sim ~ 0.087)
+    cand_embs = np.zeros((10, 384), dtype=np.float32)
     cand_embs[0, 2] = 0.95  # close to neutral
     cand_embs[1, 0] = 0.95  # close to up
     cand_embs[2, 3] = 1.0  # far from all feedback
+    for i in range(3, 10):
+        # Small overlap on feedback axes 0, 1, 2 so max_sim > 0 but
+        # small (~0.087).
+        cand_embs[i, 0] = 0.05
+        cand_embs[i, 1] = 0.05
+        cand_embs[i, 2] = 0.05
+        cand_embs[i, 50 + i] = 0.6
+        cand_embs[i, 200 + i] = 0.8
 
-    candidates = [
-        Story(id=1, title="Neutral-like", url=None, score=15, time=0, text_content=""),
-        Story(id=2, title="Up-like", url=None, score=20, time=0, text_content=""),
-        Story(id=3, title="Novel", url=None, score=5, time=0, text_content=""),
-    ]
+    candidates = []
+    now = int(time.time())
+    for cid, score in [(1, 15), (2, 20), (3, 5)]:
+        candidates.append(
+            Story(
+                id=cid,
+                title=f"C{cid}",
+                url=None,
+                score=score,
+                time=now - 86400,
+                text_content="",
+            )
+        )
+    for i in range(4, 11):
+        candidates.append(
+            Story(
+                id=i,
+                title=f"F{i}",
+                url=None,
+                score=10,
+                time=now - 86400,
+                text_content="",
+            )
+        )
 
     ranked = rerank_candidates(
         db, config, embedder, candidates, cand_embs, user_id=user.id
     )
+    by_id = {r.story.id: r for r in ranked}
 
-    for r in ranked:
-        if r.story.id == 1:
-            assert not r.is_novel, (
-                f"Candidate {r.story.id} (similar to neutral) should not be novel"
-            )
-        elif r.story.id == 2:
-            assert not r.is_novel, (
-                f"Candidate {r.story.id} (similar to up) should not be novel"
-            )
-        elif r.story.id == 3:
-            assert r.is_novel, (
-                f"Candidate {r.story.id} (not similar to any feedback) should be novel"
-            )
+    # id=3 (far from all feedback, max_sim=0, dist=1.0) is the most
+    # novel and is in the top 5 by distance.
+    assert by_id[3].is_novel, (
+        f"Candidate 3 (far from all feedback) should be novel; "
+        f"got is_novel={by_id[3].is_novel}"
+    )
+    # id=1 and id=2 (max_sim=0.95) are not in the top 5 by distance.
+    for cid in (1, 2):
+        assert not by_id[cid].is_novel, (
+            f"Candidate {cid} (close to feedback) should not be novel; "
+            f"got is_novel={by_id[cid].is_novel}"
+        )
 
 
 def test_no_neutral_feedback_uses_up_down_only_for_novel(db, embedder, monkeypatch):
     """When no neutral feedback exists, cand_max_sim equals max(up, down) because
     neutral similarities are zeros — same as old behavior."""
-    config = Config(count=3)
+    config = Config(count=10)
     user = db.create_user("test_no_neutral_novel")
 
     def mock_gce(stories, embedder_arg, db_inst):
@@ -3652,31 +3678,58 @@ def test_no_neutral_feedback_uses_up_down_only_for_novel(db, embedder, monkeypat
         )
         db.upsert_feedback(user.id, sid, action)
 
-    # Controlled candidate embeddings:
-    # 1 -> close to up (axis 0)
-    # 2 -> far from all (axis 3, orthogonal to both up/down)
-    cand_embs = np.zeros((2, 384), dtype=np.float32)
-    cand_embs[0, 0] = 0.95  # close to up
-    cand_embs[1, 3] = 1.0  # far from all feedback
+    # Controlled candidate embeddings. 2 targets + 8 fillers with
+    # small overlap on feedback axes (max_sim > 0 but < id=2's
+    # distance 1.0).
+    # 1 -> close to up (axis 0), max_sim=0.95
+    # 2 -> far from all (axis 3), max_sim=0
+    # 3..10 -> small overlap on axes 0 and 1, max_sim > 0 but small
+    cand_embs = np.zeros((10, 384), dtype=np.float32)
+    cand_embs[0, 0] = 0.95
+    cand_embs[1, 3] = 1.0
+    for i in range(2, 10):
+        cand_embs[i, 0] = 0.05
+        cand_embs[i, 1] = 0.05
+        cand_embs[i, 50 + i] = 0.6
+        cand_embs[i, 200 + i] = 0.8
 
+    now = int(time.time())
     candidates = [
-        Story(id=1, title="Up-like", url=None, score=20, time=0, text_content=""),
-        Story(id=2, title="Novel", url=None, score=5, time=0, text_content=""),
+        Story(
+            id=1, title="Up-like", url=None, score=20, time=now - 86400, text_content=""
+        ),
+        Story(
+            id=2, title="Novel", url=None, score=5, time=now - 86400, text_content=""
+        ),
     ]
+    for i in range(3, 11):
+        candidates.append(
+            Story(
+                id=i,
+                title=f"F{i}",
+                url=None,
+                score=10,
+                time=now - 86400,
+                text_content="",
+            )
+        )
 
     ranked = rerank_candidates(
         db, config, embedder, candidates, cand_embs, user_id=user.id
     )
+    by_id = {r.story.id: r for r in ranked}
 
-    for r in ranked:
-        if r.story.id == 1:
-            assert not r.is_novel, (
-                f"Candidate {r.story.id} (similar to up AI) should not be novel"
-            )
-        elif r.story.id == 2:
-            assert r.is_novel, (
-                f"Candidate {r.story.id} (not similar to any) should be novel"
-            )
+    # id=2 (max_sim=0, dist=1.0) is the most novel; it's in the top 5
+    # by distance.
+    assert by_id[2].is_novel, (
+        f"Candidate 2 (not similar to any) should be novel; "
+        f"got is_novel={by_id[2].is_novel}"
+    )
+    # id=1 (max_sim=0.95) is not in the top 5 by distance.
+    assert not by_id[1].is_novel, (
+        f"Candidate 1 (similar to up) should not be novel; "
+        f"got is_novel={by_id[1].is_novel}"
+    )
 
 
 def test_novel_pass_ranks_purely_by_distance_not_score(
@@ -3690,25 +3743,20 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
     The novel pass is split per-age (novel-recent / novel-archive) so the
     badge surfaces in both age buckets. This test uses an all-recent
     pool (all candidates at time=now-3600), so only the novel-recent
-    pass fires with slot_limit=NOVEL_DISCOVERY_RECENT_SLOTS (=3). The
-    3rd-by-distance is the cut boundary. We construct scores so the
-    3rd-by-distance story has the lowest score of the pool: pure-
-    distance ranking keeps it; a score-blended ranking would have
-    dropped it for a higher-score story at the bottom of the distance
-    ranking.
+    pass fires with slot_limit=NOVEL_DISCOVERY_RECENT_SLOTS (=5). The
+    5th-by-distance is the cut boundary. We construct scores so the
+    5th-by-distance story has a very low score; pure-distance ranking
+    keeps it; a score-blended ranking would have dropped it for a
+    higher-score story at the bottom of the distance ranking.
 
-    Note: with the Floor+Enrichment model, the highest-score extra (id=16)
-    may still enter `final` via the high-engagement-recent pass (top-3 by
-    score in the recent cohort) and could receive is_novel from the
-    post-discovery enrichment (primary-attribution re-check). To test
-    the novel pass's distance-only property cleanly, we use a tight
-    ``novel_badge_percentile=10`` so enrichment does NOT badge id=16,
-    isolating the novel pass's contribution to ``is_novel``.
+    Note: with the rank-based cascade, the highest-score extra (id=16)
+    may still enter `final` via the high-engagement-recent pass (top-5
+    by score in the recent cohort). Because the cascade excludes Hot
+    from Top and Top from Talk, id=16 will not get is_novel via any
+    other path — the parallel novel pass is the only source of
+    is_novel, and it picks by distance only.
     """
-    config = Config(
-        count=40,
-        model=ModelConfig(novel_badge_percentile=10.0),
-    )
+    config = Config(count=40)
     user = db.create_user("test_novel_distance")
 
     # Feedback at axis 0 (one upvoted story).
@@ -3734,14 +3782,12 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
 
     # 20 candidates. First 12 (high scores) are in the primary set.
     # Last 8 (low scores) are in the extra-slot pool. The novel pool is
-    # drawn from the extra-slot set; the 3rd-by-distance is the cut
-    # boundary for the all-recent novel-recent pass.
-    # We arrange so the 3rd-by-distance story (id=14) has the lowest
-    # score of the pool, and a higher-score story (id=16) is cut.
+    # drawn from the extra-slot set; the 5th-by-distance is the cut
+    # boundary for the all-recent novel-recent pass (slot_limit=5).
+    # We arrange so the 5th-by-distance story (id=16) has a low
+    # score, and a higher-score story (id=18) is cut.
     now = int(time.time())
     candidates = []
-    # Primary: 12 candidates, scores 100-120, all sim > threshold (so no is_novel
-    # from primary attribution).
     for i in range(12):
         candidates.append(
             Story(
@@ -3755,11 +3801,12 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
                 comment_count=0,
             )
         )
-    # Extra-slot: 8 candidates. Of these, 8 have sims below the
-    # 60th-percentile threshold (all qualify for the novel pool).
-    # extra_scores places the lowest score at id=14 (3rd by distance)
-    # and a high score at id=16 (5th by distance, cut by the 3-slot cap).
-    extra_scores = [10, 10, 1, 10, 50, 10, 10, 10]
+    # extra_sims in distance order: 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.45, 0.50
+    # The novel-recent pass picks the top 5 by distance: ids 12..16.
+    # We arrange scores so id=16 (5th by distance, sim=0.25) has score 1
+    # (very low) — pure-distance ranking keeps it; a score-blended
+    # ranking would have dropped it for id=18 (6th by distance, score 50).
+    extra_scores = [10, 10, 1, 10, 1, 50, 10, 10]
     extra_sims = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.45, 0.50]
     for i, sc in enumerate(extra_scores):
         candidates.append(
@@ -3776,11 +3823,9 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
         )
 
     cand_embs = np.zeros((20, 384), dtype=np.float32)
-    # Primary candidates: all have axis 0 = 0.5 (sim=0.5, above any threshold).
     for i in range(12):
         cand_embs[i, 0] = 0.5
         cand_embs[i, 50 + i] = np.sqrt(0.75)
-    # Extra-slot candidates: axis 0 = their sim value; rest on unique axes.
     for i, s in enumerate(extra_sims):
         cand_embs[12 + i, 0] = s
         cand_embs[12 + i, 100 + i] = np.sqrt(max(1.0 - s * s, 0.0))
@@ -3790,29 +3835,22 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
     )
 
     by_id = {r.story.id: r for r in ranked}
-    # id=14 is the 3rd-by-distance in the extra-slot pool (sim=0.15, dist=0.85,
-    # score=1 — lowest in pool). Pure-distance ranking keeps it; a score-blended
-    # ranking would have dropped it.
-    assert 14 in by_id, "id=14 should be in the final result"
-    assert by_id[14].is_novel, (
-        f"id=14 (sim=0.15, dist=0.85, score=1) should be in novel-recent "
-        f"extra-slot (3rd by distance); got is_novel={by_id[14].is_novel}"
+    # id=16 is the 5th-by-distance (sim=0.25, dist=0.75, score=1 — very low).
+    # Pure-distance ranking keeps it; a score-blended ranking would have
+    # dropped it for id=17 (6th by distance, score=50).
+    assert 16 in by_id, "id=16 should be in the final result"
+    assert by_id[16].is_novel, (
+        f"id=16 (sim=0.25, dist=0.75, score=1) should be in novel-recent "
+        f"top-5 by distance; got is_novel={by_id[16].is_novel}"
     )
-    # id=16 is the 5th-by-distance (sim=0.25, dist=0.75, score=50). The
-    # novel-recent pass cuts at K=NOVEL_DISCOVERY_RECENT_SLOTS, so the
-    # novel pass does not badge it — demonstrating pure-distance ranking
-    # (score is not blended in for the Novel badge). id=16 may still
-    # enter `final` via the high-engagement-recent pass (top-3 by score
-    # in the recent cohort); with the tight percentile used here, the
-    # enrichment does not add is_novel to it.
-    assert not by_id[16].is_novel, (
-        f"id=16 (5th by distance) must NOT have is_novel — novel pass ranks "
-        f"by distance, not score; got is_novel={by_id[16].is_novel}"
-    )
-    assert by_id[16].is_high_engagement, (
-        f"id=16 (highest-score extra, score=50) should be surfaced by the "
-        f"high-engagement-recent pass (top-3 by score in recent cohort); "
-        f"got is_high_engagement={by_id[16].is_high_engagement}"
+    # id=18 is the 7th-by-distance (sim=0.45, dist=0.55, score=10). The
+    # novel-recent pass cuts at K=5, so the novel pass does not badge it —
+    # demonstrating pure-distance ranking (score is not blended in for the
+    # Novel badge). id=18 may still enter `final` via another pass
+    # (similar, uncertain, etc.) but should not have is_novel.
+    assert not by_id[18].is_novel, (
+        f"id=18 (7th by distance) must NOT have is_novel — novel pass ranks "
+        f"by distance, not score; got is_novel={by_id[18].is_novel}"
     )
 
 
@@ -4393,161 +4431,3 @@ def test_is_recent_flag_inclusive_30d_boundary(
     assert by_id[1].is_recent is True, "1d old should be recent"
     assert by_id[2].is_recent is True, "30d - 1s should be recent"
     assert by_id[3].is_recent is False, "30d + 1s should NOT be recent"
-
-
-def test_archive_top_pass_promotes_old_archive_stories(
-    db: Database, embedder: Embedder
-) -> None:
-    """The archive-top discovery pass surfaces up to 12 archive stories >30d
-    old, with is_recent=False, when the recent pool is large enough to fill
-    the primary 12-slot cap."""
-
-    config = Config(count=40)
-    now = int(time.time())
-    candidates = []
-    # 15 recent HN stories (will fill the primary 12-slot cap with recent).
-    for i in range(15):
-        candidates.append(
-            Story(
-                id=100 + i,
-                title=f"Recent HN {i}",
-                url=None,
-                score=300 - i * 10,
-                time=now - 3600 - i * 600,  # 1h to ~3h old
-                text_content=f"Recent HN content {i}.",
-                source="hn",
-                comment_count=5,
-            )
-        )
-    # 20 old archive stories (>30d, bq_seed source) with varied scores.
-    for i in range(20):
-        candidates.append(
-            Story(
-                id=1000 + i,
-                title=f"Archive story {i}",
-                url=None,
-                score=50 + i * 5,  # 50, 55, 60, ..., 145
-                time=now - 200 * 86400,  # 200 days old
-                text_content=f"Archive content {i}.",
-                source=BQ_ARCHIVE_SOURCE,
-                comment_count=0,
-            )
-        )
-    cand_embs = embedder.encode([s.text_content for s in candidates])
-    ranked = rerank_candidates(db, config, embedder, candidates, cand_embs)
-    archive_cards = [r for r in ranked if r.story.source == BQ_ARCHIVE_SOURCE]
-    # All surfaced archive cards must be is_recent=False.
-    assert all(not r.is_recent for r in archive_cards)
-    # The 12 highest-scored archive candidates (the archive-top pass's
-    # selection) must all be present. Other passes (high-engagement) may
-    # add a few more; we only check the archive-top's contribution.
-    top_archive_ids = {1000 + i for i in range(8, 20)}  # i=8..19 = scores 90..145
-    surfaced_ids = {r.story.id for r in archive_cards}
-    assert top_archive_ids.issubset(surfaced_ids), (
-        f"top 12 archive stories not all present: missing "
-        f"{top_archive_ids - surfaced_ids}"
-    )
-
-
-def test_archive_top_predicate_excludes_recent_archive_sources(
-    db: Database, embedder: Embedder
-) -> None:
-    """A bq_seed/ch_seed story with time < 30d must NOT satisfy the
-    archive-top predicate (so it cannot be surfaced by the archive-top
-    pass). Even if such a story appears in `final` via another discovery
-    pass, its is_recent flag must be True (i.e., the time-based flag is
-    independent of source)."""
-    config = Config(count=40)
-    now = int(time.time())
-    candidates = [
-        Story(
-            id=1,
-            title="Recent archive-source",
-            url=None,
-            score=500,
-            time=now - 86400,  # 1 day old
-            text_content="Recent archive-source story.",
-            source=CH_ARCHIVE_SOURCE,
-            comment_count=0,
-        ),
-        Story(
-            id=2,
-            title="Old archive-source",
-            url=None,
-            score=200,
-            time=now - 100 * 86400,  # 100d old
-            text_content="Old archive-source story.",
-            source=CH_ARCHIVE_SOURCE,
-            comment_count=0,
-        ),
-    ]
-    cand_embs = embedder.encode([s.text_content for s in candidates])
-    ranked = rerank_candidates(db, config, embedder, candidates, cand_embs)
-    by_id = {r.story.id: r for r in ranked}
-    # If the recent archive-source story surfaces (e.g. via the novel pass
-    # since it's a unique embedding far from any feedback), its is_recent
-    # MUST be True (because time < 30d ago, not because of source).
-    if 1 in by_id:
-        assert by_id[1].is_recent is True, (
-            "Recent (1d old) archive-source story must have is_recent=True"
-        )
-    # The old archive-source story surfaces and must have is_recent=False.
-    assert 2 in by_id
-    assert by_id[2].is_recent is False, (
-        "Old (100d) archive-source story must have is_recent=False"
-    )
-
-
-def test_archive_top_merged_with_recent_in_final(
-    db: Database, embedder: Embedder
-) -> None:
-    """With mixed recent + archive candidates, `final` contains both groups
-    split cleanly by is_recent."""
-    from pipeline import ARCHIVE_TOP_DISCOVERY_SLOT_LIMIT
-
-    config = Config(count=40)
-    now = int(time.time())
-    candidates = []
-    # 12 recent HN stories (will hit primary path)
-    for i in range(12):
-        candidates.append(
-            Story(
-                id=1000 + i,
-                title=f"Recent HN {i}",
-                url=None,
-                score=200 - i * 10,
-                time=now - 3600 - i * 600,
-                text_content=f"Recent HN content {i}.",
-                source="hn",
-                comment_count=5,
-            )
-        )
-    # 15 old archive stories (>30d)
-    for i in range(15):
-        candidates.append(
-            Story(
-                id=2000 + i,
-                title=f"Archive {i}",
-                url=None,
-                score=150 - i * 5,
-                time=now - 200 * 86400,
-                text_content=f"Archive content {i}.",
-                source=BQ_ARCHIVE_SOURCE,
-                comment_count=0,
-            )
-        )
-    cand_embs = embedder.encode([s.text_content for s in candidates])
-    ranked = rerank_candidates(db, config, embedder, candidates, cand_embs)
-    recent_cards = [r for r in ranked if r.is_recent]
-    archive_cards = [r for r in ranked if not r.is_recent]
-    # Both groups should be present.
-    assert len(recent_cards) >= 10, f"expected >=10 recent, got {len(recent_cards)}"
-    assert len(archive_cards) >= 10, f"expected >=10 archive, got {len(archive_cards)}"
-    # Groups are mutually exclusive on is_recent.
-    for r in recent_cards:
-        assert r.is_recent is True
-    for r in archive_cards:
-        assert r.is_recent is False
-    # Archive pass contribution is bounded (allowing a small slack for
-    # high-engagement / discussion-rich extras that happen to be old).
-    assert len(archive_cards) <= ARCHIVE_TOP_DISCOVERY_SLOT_LIMIT + 3

@@ -31,13 +31,7 @@ tier3_blend_window = 60
 min_up_for_svm = 20
 min_down_for_svm = 20
 non_hn_ramp_window = 30
-top_badge_percentile = 90.0
-top_badge_min_score = 100
-discussion_badge_percentile = 90.0
-discussion_badge_min_comments = 0
 hot_badge_percentile = 99.5
-similar_badge_percentile = 97.0
-novel_badge_percentile = 10.0
 
 
 [hn_rewrite.rss]

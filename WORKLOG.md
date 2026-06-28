@@ -5,6 +5,241 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-28 — Rank-based cascade badge model (5 per cohort, no knobs, no archive-top)
+
+The Floor+Enrichment model landed earlier today got us to
+🏆(7,15) 💬(5,7) ✨(4,4) 🎯(3,3) 🤔(4,5) 🔥(1,0). The user then looked at
+popular-recent and reported the badge density still felt too high —
+many cards stacked 💬🏆🔥. The user's mental model was different:
+"rank-based, top X by metric, no fixed floors like 200 and 100." The
+p90 percentiles + min_score/min_comments floors were exactly what they
+wanted gone.
+
+**New design (cascade).** For each non-Hot badge, take the top X
+stories in each cohort by that badge's metric, in order. No percentile
+threshold, no min floor — just rank. Predicates reduce to a trivial
+membership guard so the pass can fill its slots even when the cohort
+is small. The five non-Hot badges are split into two groups:
+
+- **Cascade group (mutually exclusive).** Hot → Top → Talk run
+  sequentially. Each pass excludes prior picks from its pool, so a
+  story with 🔥 never also has 🏆, and a story with 🏆 never has 💬.
+  Hot runs first against the **full** `ranked` pool (not
+  `remaining_decorated`) so a primary-ranked high-velocity story also
+  gets the badge. Top and Talk run against `remaining_decorated` so
+  the mutual-exclusion is preserved.
+- **Parallel group (stackable).** Novel, Similar, Unsure run against
+  the same shrunk pool after the cascade. They can stack with each
+  other (a story can be ✨+🎯) and with the cascade group (Top+Unsure
+  is allowed: "high score but model uncertain"). Picks are accumulated
+  in a `dict[story_id, RankedStory]` so multiple parallel passes can
+  update the same entry with `replace(... is_novel=True)` then
+  `replace(... is_similar=True)`.
+
+**Slot counts (5 per cohort, the user's choice).**
+- Hot: 5 global (recent-only by velocity).
+- Top-recent, Top-archive: 5 each.
+- Talk-recent, Talk-archive: 5 each.
+- Novel-recent, Novel-archive: 5 each.
+- Similar-recent, Similar-archive: 5 each.
+- Unsure-recent, Unsure-archive: 5 each.
+- Total cascade+parallel: 53 badged stories per regen (plus non-hn).
+
+**Knobs removed.** Six `ModelConfig` fields deleted:
+- `top_badge_percentile`, `top_badge_min_score`,
+  `discussion_badge_percentile`, `discussion_badge_min_comments`,
+  `novel_badge_percentile`, `similar_badge_percentile`. The per-bucket
+  threshold arrays (`engagement_thresholds`, `discussion_thresholds`,
+  `sim_thresholds`, `uncertain_entropy_thresholds`) and the
+  `_bucket_pct` helper are gone — pure rank, no threshold gate.
+- `_dashboard_primary_limit` still returns `(primary, num_uncertain)`
+  for the primary-rerank cap; the second return value is no longer
+  consulted.
+- `config.toml` updated to drop the same keys (5 lines removed).
+
+**Archive-top removed.** The pass that surfaced 12 high-score archive
+stories with `attr=None` (relied on Enrichment for 🏆) is gone. The
+cascade's Top-archive pass already picks the top 5 archive by score;
+Talk-archive picks the top 5 by comment_count (which overlaps rank
+5-10 by score due to the score/comment correlation). The cascade
+captures 7-10 of the top 12 archive by score with badges, vs. 12
+without under the old model — a 2-5-story reduction in archive
+coverage. The user accepted this in exchange for dropping archive-top
+(along with its 12-slot knob and the deferred `attr=None` →
+`is_high_engagement` follow-up from 2026-06-26).
+`ARCHIVE_TOP_DISCOVERY_SLOT_LIMIT` is deleted from `pipeline.py`.
+
+**What shipped in `pipeline.py`.**
+- All 5 non-Hot per-cohort slot constants bumped 3→5
+  (`UNCERTAIN_DISCOVERY_*_SLOTS`, `NOVEL_DISCOVERY_*_SLOTS`,
+  `SIMILAR_DISCOVERY_*_SLOTS`, `DISCUSSION_DISCOVERY_*_SLOTS`,
+  `HIGH_ENGAGEMENT_DISCOVERY_*_SLOTS`).
+- `HOT_DISCOVERY_SLOT_LIMIT` 8→5.
+- `ARCHIVE_TOP_DISCOVERY_SLOT_LIMIT` deleted.
+- Hot pass lifted out of the cascade loop; runs first against `ranked`
+  and OR's `is_hot=True` into existing `final` entries when a
+  primary-ranked story qualifies. Uses `cast(str, pass_.attr)` to
+  satisfy the ty checker on the `DiscoveryPass.attr: str | None`
+  field.
+- Cascade loop (`cascade_passes`) reduced to Top-recent,
+  Top-archive, Talk-recent, Talk-archive. Each pass excludes prior
+  picks; `replace(... is_high_engagement=True)` / `is_discussion_rich=True`.
+- Parallel loop (`parallel_passes`) reduced to Novel-recent,
+  Novel-archive, Similar-recent, Similar-archive, Unsure-recent,
+  Unsure-archive. Each pass sees the **full** `ranked` pool (so a
+  cascade pick can be re-picked) and accumulates into
+  `parallel_picks: dict[int, RankedStory]`. After all parallel passes
+  run, the dict is merged into `final`: existing entries get the
+  parallel flag OR'd in; new entries are appended.
+- Non-hn pass: unchanged structure, moved to after the parallel merge
+  so the cascade + parallel picks can claim HN candidates first.
+- `is_recent` and `is_non_hn` set in a small post-merge loop on every
+  `final` entry (these are source/time based, not rank-based, so they
+  always reflect the candidate's metadata).
+- `_dashboard_primary_limit` still returns `(primary, num_uncertain)`
+  for the primary cap; `num_uncertain` no longer drives a separate
+  attribution (Enrichment was the only consumer).
+- `replace(...)` calls: `DiscoveryPass.attr: str | None` is asserted
+  via `cast(str, pass_.attr)` inside each loop. The remaining
+  `attr=None` use case (the deleted `archive-top` pass) is gone, so
+  no `# type: ignore` is needed elsewhere.
+
+**Test changes.**
+- **Dropped** (the per-bucket percentile / archive-top model is gone):
+  - `test_top_badge_threshold_uses_config_percentile_and_floor`
+  - `test_discussion_badge_threshold_uses_config_percentile_and_floor`
+  - `test_badge_thresholds_computed_per_age_bucket`
+  - `test_archive_top_stories_get_stackable_badges`
+  - `test_archive_top_pass_promotes_old_archive_stories`
+  - `test_archive_top_predicate_excludes_recent_archive_sources`
+  - `test_archive_top_merged_with_recent_in_final`
+- **Updated:**
+  - `test_each_badge_floored_at_three_per_cohort` →
+    `test_each_badge_floored_at_five_per_cohort` (asserts ≥5 per
+    cohort per non-Hot badge, pool 30 recent + 30 archive, 20 distinct
+    up/down/neutral feedback each).
+  - `test_hot_badge_threshold_uses_config_percentile` — slot cap is
+    now 5, so the test asserts exactly 5 hot at p50 (was 10 with the
+    old slot=8) and 1 hot at p99.5 (the threshold cuts to id=0).
+  - `test_novel_pass_ranks_purely_by_distance_not_score` — slot cap
+    is now 5, so the cut boundary moved from 3rd-by-distance to
+    5th-by-distance. Pure-distance property preserved.
+  - `test_novel_archive_pass_surfaces_archive_novel` — `novel_badge_percentile`
+    knob removed; 4 archive novel targets all get `is_novel=True`
+    (slot cap 5 ≥ 4 novel targets).
+  - `test_candidate_similar_to_neutral_is_not_novel` and
+    `test_no_neutral_feedback_uses_up_down_only_for_novel` —
+    expanded to 10 candidates with controlled distances so the novel
+    pass has a non-trivial pool; id=2 (the most novel) lands in top
+    5 by distance.
+- **Added:**
+  - `test_cascade_badges_mutually_exclusive` — 30 recent stories with
+    high score == high cc; asserts no story in `final` has more than
+    one of `is_hot`, `is_high_engagement`, `is_discussion_rich`.
+  - `test_cascade_hot_excluded_from_top` — 30 recent with all same
+    age; asserts Hot and Top-recent are disjoint sets.
+  - `test_cascade_top_excluded_from_talk` — 30 archive with high
+    score == high cc; asserts Top-archive and Talk-archive are
+    disjoint.
+  - `test_cascade_can_stack_with_parallel` — controlled embedder
+    with 50/50 mix on up/down axes → max entropy; asserts at least
+    one story ends up with both `is_high_engagement=True` and
+    `is_uncertain=True`.
+  - `test_parallel_can_stack_within` — 5 candidates, id=2 has both
+    high up-similarity (0.5) and a strong orthogonal axis (0.86);
+    asserts `is_similar=True` AND `is_novel=True`.
+
+**Verification.**
+- `uv run pytest tests/ -n 4 --ignore=tests/test_dedup.py` → **282
+  passed, 1 skipped** (torch importorskip).
+- `uv run ruff check .` clean. `uv run ty check` clean.
+- Diagnostic on `/tmp/diag.db` (see "Diagnostic" section at the end
+  of this entry for the full table).
+
+**Decisions confirmed by the user in plan mode.**
+- Top-3-by-rank (then changed to 5): "I thought we were doing top X
+  stories sorted by the different criteria, not fixed floors like 200
+  and 100."
+- Hot stays global; not per-cohort.
+- Archive-top removed: "why do we need archive-top" — user accepted
+  the simpler pipeline and 2-5 fewer archive stories in `final` as
+  the trade.
+- Cascade badge stacking: NO (Hot/Top/Talk mutually exclusive).
+- Parallel badge stacking: YES (Novel/Similar/Unsure can stack with
+  each other and with the cascade group, so Top+Unsure is allowed).
+
+**Latent flag (not acted on).** The parallel group runs against
+`ranked` (full pool). If a user has lots of feedback, the SVM-ranked
+primary set is dominated by high-confidence picks, and the
+`remaining_decorated` pool can be small. The cascade's Top/Talk
+passes also pull from `remaining_decorated` first, so the parallel
+group's effective pool is the post-cascade remainder. On production
+(60+ recent, 100+ archive) this is fine; on a very slow week the
+parallel group might underfill. Noted for future sizing review.
+
+**Template.** Tooltips for the per-badges were updated to drop the
+percentile references (the knobs no longer exist): "Top {{ hot_badge_percentile }}% by engagement velocity..." is unchanged for Hot, but Top, Talk, Novel, and Similar lost the percentile annotation. "Top {{ hot_badge_percentile }}%" is still rendered for Hot.
+
+**Diagnostic (`/tmp/diag.db`, 7911 candidates → final size 75, 2404 feedback for user 1).**
+
+| Badge | Recent | Archive |
+|---|---:|---:|
+| 🏆 Top | 5 | 5 |
+| 💬 Talk-worthy | 5 | 5 |
+| ✨ Novel | 5 | 5 |
+| 🎯 Similar | 5 | 5 |
+| 🤔 Unsure | 5 | 5 |
+| 🔥 Hot | 5 | 0 |
+
+Cascade-exclusion check: zero stories with `is_hot ∧ is_high_engagement`,
+zero with `is_high_engagement ∧ is_discussion_rich`, zero with
+`is_hot ∧ is_discussion_rich`. Parallel-stacking stats (parallel
+group is rank-based, so on production data the Novel/Similar/Unsure
+picks rarely overlap with each other — they each pick the top 5 by
+their distinct metric, and the metrics don't correlate): 0
+Novel∧Similar, 0 Novel∧Unsure, 0 Similar∧Unsure, 0 all three. Cascade
++ parallel: 0 Top∧Unsure, 0 Top∧Novel, 0 Hot∧Novel in production
+(the parallel picks are the entropy-top-5 / novelty-top-5, which are
+different stories from the score-top-5 / velocity-top-5). The
+`test_cascade_can_stack_with_parallel` test artificially constructs a
+pool with 50/50 up/down mix so the SVM produces varied entropy
+including on the score-top stories, forcing a Top+Unsure overlap —
+proving the stacking is mechanically possible even if rare in
+production.
+
+Badge count distribution per card in `final`: 0 badges = 20 cards
+(mostly non-hn fillers), 1 badge = 55 cards. No card has >1 badge in
+this run because the parallel group doesn't overlap with the cascade
+group on production data.
+
+**Before/after side-by-side (same DB, same user):**
+
+```
+Previous (Floor+Enrichment, slot_limit=3, with Enrichment):
+  🏆 Top         (7, 15)
+  💬 Talk-worthy (5, 7)
+  ✨ Novel       (4, 4)
+  🎯 Similar     (3, 3)
+  🤔 Unsure      (4, 5)
+  🔥 Hot         (1, 0)
+Current (rank-based cascade, slot_limit=5, no Enrichment):
+  🏆 Top         (5, 5)
+  💬 Talk-worthy (5, 5)
+  ✨ Novel       (5, 5)
+  🎯 Similar     (5, 5)
+  🤔 Unsure      (5, 5)
+  🔥 Hot         (5, 0)
+```
+
+The previous Floor+Enrichment had 7 Top-recent because Enrichment
+added 4 more on top of the 3 from the pass. The new model has
+exactly 5 per cohort (the slot cap) — no extras, no surprise
+qualification. The user's "top X by rank" expectation is now
+literally true: 5 by score in recent is the Top-recent set, full
+stop.
+
+---
+
 ## 2026-06-28 — Reddit topfeed RSS response cache (2h TTL, ~100× fewer Reddit req/h)
 
 Added `reddit_feed_cache.py` — an in-memory cache for parsed subreddit
@@ -43,7 +278,7 @@ to `reddit_limiter`).  `conftest.py` fixture renamed from `reset_reddit_limiter`
 to `reset_reddit_singletons` to cover both singletons.
 `ruff check .` clean. `ty check` 0 new diagnostics.
 
-## 2026-06-28 — Floor + Enrichment badge model (per-cohort top-3, post-discovery re-attribution, top-3-by-rank for all non-Hot)
+## 2026-06-28 — Floor + Enrichment badge model (SUPERSEDED — see "Rank-based cascade, 5 per cohort, no knobs" below)
 
 Built on the per-bucket thresholds introduced earlier today. The user
 expects **at least (3,3) — three of each badge in Recent AND three in
