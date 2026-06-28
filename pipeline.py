@@ -1354,16 +1354,21 @@ async def _fetch_and_parse_feed(
             val = int.from_bytes(h[:4], "big")
             synthetic_id = -(val % (2**31))
 
+            score, num_comments = _extract_reddit_score_and_comments(
+                entry if is_reddit else None
+            )
+
             story = Story(
                 id=synthetic_id,
                 title=title,
                 url=link,
-                score=0,
+                score=score,
                 time=int(pub_time),
                 text_content=text_content,
                 self_text=self_text,
                 source=source_name,
-                comment_count=None,
+                comment_count=num_comments,
+                comment_count_at_fetch=num_comments or 0,
                 discussion_url=None,
             )
             stories.append(story)
@@ -1372,6 +1377,49 @@ async def _fetch_and_parse_feed(
     except Exception as e:
         logging.error(f"Failed to fetch RSS feed {feed_url}: {e}")
         return []
+
+
+def _extract_reddit_score_and_comments(
+    entry: Any,
+) -> tuple[int, int]:
+    """Extract ``(score, num_comments)`` from a Reddit RSS entry.
+
+    Reddit's topfeed Atom feed puts ``<score>`` and ``<num_comments>``
+    as direct children of ``<entry>``. feedparser surfaces them as
+    ``entry["score"]`` / ``entry["num_comments"]`` (and as ``.score`` /
+    ``.num_comments`` attributes). The exact element name Reddit uses
+    has shifted over time, so this helper also tries a few legacy
+    aliases (``<points>``, ``<comments>``) and falls back to ``(0, 0)``
+    if the entry doesn't expose any of them.
+
+    Returns ``(0, 0)`` for non-Reddit callers (``entry`` is None) so
+    the existing non-Reddit behavior is preserved.
+    """
+    if entry is None:
+        return 0, 0
+
+    def _coerce(raw: Any) -> int:
+        if raw is None or raw == "":
+            return 0
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 0
+
+    score = 0
+    num_comments = 0
+    for key in ("score", "points", "likes"):
+        v = _coerce(entry.get(key)) if hasattr(entry, "get") else 0
+        if v:
+            score = v
+            break
+    for key in ("num_comments", "comments"):
+        v = _coerce(entry.get(key)) if hasattr(entry, "get") else 0
+        if v:
+            num_comments = v
+            break
+
+    return score, num_comments
 
 
 def build_reddit_topfeed_factories(

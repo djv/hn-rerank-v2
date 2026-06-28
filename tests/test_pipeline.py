@@ -849,6 +849,129 @@ async def test_build_reddit_topfeed_cache_miss_fetches_and_caches(
     assert cached[0].title == "Fresh Story"
 
 
+def test_extract_reddit_score_and_comments_reads_atom_fields() -> None:
+    """``_extract_reddit_score_and_comments`` pulls <score>/<num_comments>
+    from a parsed Atom entry. Regression: the pre-fix parser hardcoded
+    ``score=0, comment_count=None`` and lost the Reddit RSS metadata."""
+    import feedparser
+
+    sample = b"""<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <title>x</title>
+    <link href="https://www.reddit.com/r/test/comments/abc/x/"/>
+    <score>42</score>
+    <num_comments>15</num_comments>
+  </entry>
+</feed>"""
+    entry = feedparser.parse(sample).entries[0]
+    score, num_comments = pipeline._extract_reddit_score_and_comments(entry)
+    assert score == 42
+    assert num_comments == 15
+
+
+def test_extract_reddit_score_and_comments_falls_back_on_missing() -> None:
+    """Non-Atom or no-score feeds return ``(0, 0)`` instead of raising."""
+    import feedparser
+
+    sample = b"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel>
+<item><title>x</title><link>https://example.com/</link></item>
+</channel></rss>"""
+    entries = feedparser.parse(sample).entries
+    if entries:
+        score, num_comments = pipeline._extract_reddit_score_and_comments(entries[0])
+        assert score == 0
+        assert num_comments == 0
+    # Non-Reddit caller (entry=None) must also be a clean no-op.
+    assert pipeline._extract_reddit_score_and_comments(None) == (0, 0)
+
+
+def test_extract_reddit_score_and_comments_legacy_aliases() -> None:
+    """Older Reddit RSS variants used ``<points>`` and ``<comments>``
+    instead of ``<score>`` / ``<num_comments>``. The helper tries the
+    legacy names as fallbacks."""
+    import feedparser
+
+    sample = b"""<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <title>x</title>
+    <link href="https://www.reddit.com/r/test/comments/abc/x/"/>
+    <points>99</points>
+    <comments>7</comments>
+  </entry>
+</feed>"""
+    entry = feedparser.parse(sample).entries[0]
+    score, num_comments = pipeline._extract_reddit_score_and_comments(entry)
+    assert score == 99
+    assert num_comments == 7
+
+
+async def test_build_reddit_topfeed_populates_score_and_comment_count(
+    monkeypatch,
+) -> None:
+    """End-to-end: a real Reddit Atom feed body (with ``<score>`` and
+    ``<num_comments>``) populates the Story fields. The pre-fix parser
+    left them at 0 / None, which broke the prewarm ``comment_count > 0``
+    filter and the ``score DESC`` sort."""
+    from pipeline import build_reddit_topfeed_factories
+    from reddit_fetch_queue import queue as reddit_fetch_queue
+
+    body = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <title>Real Reddit Story</title>
+    <link href="https://www.reddit.com/r/test/comments/abc/real_reddit_story/"/>
+    <updated>2026-06-28T17:00:00+00:00</updated>
+    <content type="html">body text</content>
+    <score>123</score>
+    <num_comments>4</num_comments>
+  </entry>
+</feed>"""
+
+    class MockResp:
+        status_code = 200
+
+        def __init__(self, t):
+            self.text = t
+            self.headers: dict[str, str] = {}
+
+    class MockClient:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+        async def get(self, url, headers=None):
+            return MockResp(body)
+
+    monkeypatch.setattr("pipeline.httpx.AsyncClient", MockClient)
+    pipeline.reddit_limiter.INTER_REQUEST_DELAY = 0.0
+    pipeline.reddit_feed_cache.reset()
+
+    feed_url = "https://www.reddit.com/r/test/top/.rss?t=week&limit=25"
+    factories, reddit_feed_urls = build_reddit_topfeed_factories(
+        [feed_url], per_feed=10, days=30, exclude_urls=set()
+    )
+    reddit_fetch_queue.enqueue_spread(
+        len(factories), time.monotonic(), "topfeed", factories
+    )
+    assert reddit_fetch_queue.wait_until_empty(timeout=2.0) is True
+
+    cached = pipeline.reddit_feed_cache.get(feed_url)
+    assert cached is not None
+    assert len(cached) == 1
+    s = cached[0]
+    assert s.score == 123
+    assert s.comment_count == 4
+    assert s.comment_count_at_fetch == 4
+
+
 async def test_prewarm_reddit_top_stories_fetches_comments(tmp_path, monkeypatch):
     """prewarm_reddit_top_stories fetches and stores Reddit RSS comments."""
     import server
