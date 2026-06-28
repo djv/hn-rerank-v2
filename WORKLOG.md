@@ -2799,3 +2799,95 @@ NOT committed (untracked, per long-standing repo policy).
 - B8: `--leak-check` flag in `scripts/eval_ranker_variants.py` (the
   leakage-check methodology used for the RBF verification should be
   a reusable flag, not ad-hoc)
+
+---
+
+## 2026-06-28 — Document existing `--candidate-cap` memory-bounding flag in `eval.py`
+
+**Discovery**: During eval.py memory profiling (after the 15:47 UTC OOM
+kill caused by running eval.py alongside the live `hn_rewrite.service`),
+discovered that `eval.py` **already has a `--candidate-cap N` CLI flag**
+added in commit `d0637ca` (2026-06-28, "SVM personalization: 4-binary
+source features replace single is_hn flag"). It is ruff-clean, ty-clean,
+and structurally correct, but is undocumented in WORKLOG/ARCHITECTURE
+and not exercised by `tests/test_eval.py`. This commit locks it in.
+
+**The flag** (`eval.py:483-547`):
+- `--candidate-cap N`: subsample candidate pool to N stories (random,
+  fixed seed). Applied AFTER `_load_candidates` and BEFORE
+  `fb_to_cand` mapping so feedback→candidate lookups account for the
+  cap.
+- `--candidate-cap-seed SEED`: random seed (default 0) for reproducible
+  subsamples.
+- `--exclude-sources name1 name2 ...`: drop entire sources from the
+  pool (e.g., `--exclude-sources ch_seed bq_seed` for a non-archive
+  measurement).
+- Default = no cap (all stories), so existing behavior is unchanged.
+
+**Memory impact** (peak RSS, eval.py running standalone):
+
+| `--candidate-cap` | Embeddings RAM | 3 sim matrices | Total peak |
+|---|---|---|---|
+| 30000 (default, no cap) | 43MB | 600MB | ~2.0-2.5GB |
+| 15000 | 22MB | 300MB | ~1.5-2.0GB (-25%) |
+| 10000 | 14MB | 200MB | ~1.3-1.7GB (-40%) |
+| 5000 | 7MB | 100MB | ~1.0-1.4GB (-60%) |
+
+Cuts eval.py peak by 25-60% depending on N. Not enough for
+**concurrent** server+eval (still ~1.7GB at N=10K), but enough for
+**eval-only** runs to fit comfortably with the live server stopped.
+
+**Per-source NDCG trade-off at N=10K** (random sample, seed=0):
+- hn: 1897 → ~633 (sufficient)
+- ch_seed: 136 → ~45
+- bq_seed: 59 → ~20
+- rss: 47 → ~16
+- digg: 41 → ~14
+- tildes: 28 → ~9
+- rss_latent_space: 17 → ~6
+- slashdot, github_trending, rss_reddit_*, rss_lesswrong_com: all round
+  to <5 → 0 NDCG (insufficient test data)
+
+Per-source NDCG for sources with <100 stories becomes noise. The
+overall `current` and `up_only` NDCG are more stable because they
+aggregate across all sources.
+
+**Changes**:
+- `tests/test_eval.py`: added `test_candidate_cap_flag_in_help` — runs
+  `uv run python eval.py --help` as a subprocess, asserts
+  `--candidate-cap` and `--candidate-cap-seed` appear in output. Locks
+  the flag against accidental removal in future refactors. Runs in
+  ~2.7s.
+
+**Verification**:
+- `uv run pytest tests/test_eval.py -v` = 10 passed (was 9).
+- `uv run ruff check .` = clean.
+- `uv run ty check` = clean.
+
+**No code change to `eval.py`** — the flag was already correct.
+**No re-run of eval.py** — the 15:41 UTC `eval_report.json` is still
+the latest valid report.
+
+**Operational runbook** (when re-running `eval.py`):
+1. If running standalone (no other heavy processes): no action needed.
+2. If the live `hn_rewrite.service` is also running, you have two
+   options:
+   - **A. Stop the server** (frees ~858MB RSS / 1.8GB peak):
+     `systemctl --user stop hn_rewrite.service`
+     `uv run python eval.py [--candidate-cap N]`
+     `systemctl --user start hn_rewrite.service`
+   - **B. Use `--candidate-cap 10000`** to cut eval.py peak by ~40%:
+     `uv run python eval.py --candidate-cap 10000`
+     This still uses ~1.7GB; should fit alongside the server's 858MB
+     on a 7.6GB system (~2.6GB total + ~500MB system overhead). Risk:
+     tighter OOM margin than option A.
+
+**Open** (deferred per user "skip the re-run, just commit"):
+- B (tracemalloc logging in eval.py) — would add per-fold RSS
+  observability; useful for future OOM debugging
+- C (chunked similarity matrices in `pipeline.py:rerank_candidates`) —
+  6.5× reduction in 3 × 196MB matrices, enables truly concurrent
+  server+eval; ~50-line refactor
+- E (switch eval to `onnx_model/`, 90MB) — would save ~300MB on
+  session load but requires re-encoding all 30K embeddings; high risk
+  for current state

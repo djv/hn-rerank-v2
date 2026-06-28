@@ -1,11 +1,35 @@
 import json
+import subprocess
 from pathlib import Path
 
 REPORT = Path(__file__).parent.parent / "eval_report.json"
+EVAL_PY = Path(__file__).parent.parent / "eval.py"
 
 
 def test_report_exists():
     assert REPORT.exists(), "Run `uv run python eval.py` first."
+
+
+def test_candidate_cap_flag_in_help() -> None:
+    """--candidate-cap must be exposed in --help output.
+
+    Locks the memory-bounding CLI flag in place; regression test against
+    accidental removal in future refactors. Added 2026-06-28 when this
+    flag was discovered during eval.py memory profiling (see WORKLOG).
+    """
+    result = subprocess.run(
+        ["uv", "run", "python", str(EVAL_PY), "--help"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, f"--help failed: {result.stderr}"
+    assert "--candidate-cap" in result.stdout, (
+        "--candidate-cap not in --help output; memory-bounding flag is missing"
+    )
+    assert "--candidate-cap-seed" in result.stdout, (
+        "--candidate-cap-seed not in --help output"
+    )
 
 
 def test_report_has_expected_formulas():
