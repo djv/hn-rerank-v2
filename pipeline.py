@@ -2551,9 +2551,6 @@ def generate_dashboard_bytes(
 
     pico_css = _get_pico_css()
 
-    all_fb = db.get_all_feedback(user_id=user_id)
-    fb_map = {f.story_id: f.action for f in all_fb}
-
     vote_counts = (
         db.count_feedback_by_action(user_id)
         if user_id
@@ -2566,7 +2563,6 @@ def generate_dashboard_bytes(
         stories=ranked,
         server_port=config.server_port,
         pico_css=pico_css,
-        fb_map=fb_map,
         user_token=user_token,
         vote_count_up=vote_counts["up"],
         vote_count_neutral=vote_counts["neutral"],

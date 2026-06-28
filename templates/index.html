@@ -847,11 +847,9 @@
     <div class="swipe-layout">
       <div id="stories">
       {% for item in stories %}
-      {% set active_fb = fb_map.get(item.story.id) %}
       <article class="story-card{% if item.story.text_content | length >= 1000 %} enriched{% endif %}"
                data-story-id="{{ item.story.id }}"
                data-score="{{ item.score }}"
-               data-voted="{{ active_fb or '' }}"
                data-time="{{ item.story.time }}"
                data-source="{{ item.story.source }}"
                data-is-hn="{{ '0' if item.is_non_hn else '1' }}"
@@ -983,37 +981,11 @@
     </div>
 
   <script>
-    const USER_TOKEN = document.cookie.match(/hn_token=([^;]+)/)?.[1] || '';
-    const fbKey = (sid) => USER_TOKEN + '_fb_' + sid;
-
     const presentStoryIds = new Set();
     document.querySelectorAll('.story-card').forEach(card => {
       const storyId = card.dataset.storyId;
       presentStoryIds.add(storyId);
-
-      const storedAction = localStorage.getItem(fbKey(storyId));
-      if (storedAction) {
-        const htmlVotedAction = card.dataset.voted;
-
-        if (htmlVotedAction === storedAction) {
-          localStorage.removeItem(fbKey(storyId));
-        } else {
-          card.dataset.voted = storedAction;
-        }
-      }
     });
-
-    // Garbage collect stale localStorage entries for stories no longer on the page
-    for (let i = 0; i < localStorage.length; i++) {
-      const key = localStorage.key(i);
-      if (key && key.startsWith(USER_TOKEN + '_fb_')) {
-        const storyId = key.replace(USER_TOKEN + '_fb_', '');
-        if (!presentStoryIds.has(storyId)) {
-          localStorage.removeItem(key);
-          i--;
-        }
-      }
-    }
 
     // Swipe deck state
     const storiesContainer = document.getElementById('stories');
@@ -1388,7 +1360,7 @@
       const incoming = Array.from(newStories.querySelectorAll('.story-card'));
       for (const card of incoming) {
         const storyId = card.dataset.storyId;
-        if (!storyId || existing.has(storyId) || localStorage.getItem(fbKey(storyId))) {
+        if (!storyId || existing.has(storyId)) {
           continue;
         }
         storiesContainer.appendChild(card);
@@ -1515,7 +1487,6 @@
         updateRefreshProgress();
       }
       card.dataset.voted = action;
-      localStorage.setItem(fbKey(storyId), action);
       document.querySelectorAll('[data-fb]').forEach(btn => {
         btn.classList.toggle('active', btn.dataset.fb === action);
       });
@@ -1586,7 +1557,6 @@
       const { storyId, action, card, savePromise } = vote;
       delete card.dataset.voted;
       card.classList.remove('fade-out');
-      localStorage.removeItem(fbKey(storyId));
       document.querySelectorAll('[data-fb]').forEach(btn => {
         btn.classList.remove('active');
       });
