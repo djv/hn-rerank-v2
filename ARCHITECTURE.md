@@ -283,7 +283,7 @@ The system supports multiple users with independent feedback histories and perso
 * **Background Regen**: The background loop fetches candidates into the shared `stories` table only. It does not render per-user dashboards.
 * **SVM Training**: Per-user SVM is trained lazily on uncached dashboard requests. The rendered HTML is cached for 5 minutes, but the fitted SVM model itself is not retained after the render returns.
 * **Feedback API**: `POST /api/feedback` requires valid session cookie. The `user_id` is extracted from the token and passed to `upsert_feedback`.
-* **Frontend**: localStorage keys are prefixed with the user token (`<token>_feedback_<story_id>`) to prevent cross-user state leakage.
+* **Frontend**: localStorage is used only for the first-time tip overlay flag (`<token>_tip_v2`). Vote state is not cached client-side: voted stories are excluded from the candidate pool by the SQL `id NOT IN (SELECT story_id FROM feedback WHERE user_id=?)` clause in `fast_rerank_for_user`, so the `data-voted` attribute would always be empty and a client-side vote cache would be GC'd on every page load. Vote state is set on the DOM element directly (`card.dataset.voted = action`) for post-vote UI only.
 
 ### 3.13 Evaluation Scripts
 Offline eval scripts resolve the `default` token through the `users` table and pass that `user_id` explicitly to `get_feedback_for_training()`. This keeps personalized metrics scoped to the default user's labels instead of pooling all users' feedback.

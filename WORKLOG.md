@@ -5,6 +5,57 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-28 — Remove dead `data-voted` / localStorage vote cache
+
+**Symptom (from user yyy QA report):** `data-voted=""` on all 75 cards for
+a user with 97 votes. Diagnosed as three "bugs" in the report; all three
+were symptoms of the same root cause: the SQL candidate exclusion in
+`fast_rerank_for_user` (`pipeline.py:2593, 2600`) removes all voted
+stories from the candidate pool, making the server-side `data-voted`
+attribute and the client-side localStorage vote cache unreachable.
+
+**What was dead:**
+
+- `pipeline.py`: `all_fb = db.get_all_feedback(user_id=...)` and
+  `fb_map = {f.story_id: f.action for f in all_fb}` in
+  `generate_dashboard_bytes` — the `fb_map` was passed to the template
+  but `active_fb = fb_map.get(item.story.id)` always returned `None`
+  because voted stories were never in `ranked`.
+- `templates/index.html`:
+  - `data-voted="{{ active_fb or '' }}"` attribute on every card (always
+    `""`).
+  - Page-load sync block (lines 994-1003): read `localStorage.getItem`,
+    compare to `card.dataset.voted`, reconcile. Never fired because
+    voted stories were never in `presentStoryIds`.
+  - GC block (lines 1006-1016): removed localStorage entries for stories
+    not on the page. Removed ALL vote entries on every page load
+    (because voted stories are never on the page).
+  - `localStorage.getItem(fbKey(storyId))` in the refresh-skip check
+    (line 1391) — redundant with the SQL exclusion.
+  - `localStorage.setItem` / `localStorage.removeItem` on vote/undo
+    (lines 1518, 1589) — write-only cache that the GC immediately
+    cleared.
+  - `USER_TOKEN` cookie extraction (line 986) and `fbKey` helper
+    (line 987) — only used by the dead localStorage code.
+
+**What was kept (still used):**
+
+- Client-side `card.dataset.voted = action` in `submitVote()` and
+  `delete card.dataset.voted` in `undoLastVote()` — these set the
+  property on the DOM element, not the HTML attribute. They're read by
+  `queuedCards()`, `updateVoteBar()`, `cardsForAge()`, and the
+  active-card checks to power post-vote UI state.
+- All other `localStorage` usage (first-time tip overlay `_v2` flag) —
+  unrelated to vote storage.
+
+**Stats:** −35 lines, +1 line. Dashboard size 250155 → 246442 bytes
+(−3713, −1.5%). 282 tests pass, `ty check` clean, `ruff check` clean for
+changed files. Local = prod (sha256:11fbef88bebe).
+
+Commit: `a681bb5`.
+
+---
+
 ## 2026-06-28 — Regen-warm death loop eliminated + initial-delay startup regen
 
 **Symptom (this morning):** "Just reloaded app without recent server
