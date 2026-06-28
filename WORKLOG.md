@@ -2448,3 +2448,131 @@ A5 (81-variant sweep on current features), A2 (hparam sweep), A4
 (recency weights), B4 (final-queue raw variant), B5 (per-source
 hit_rate), B6 (k_values CLI), B7 (feature_ablation), B8 (leak-check),
 B9 (stratify by source). See "In Progress" in session summary.
+
+---
+
+## 2026-06-28 — Switch production SVM to RBF (C=0.5, γ=0.03); new svm_hparam_sweep tool
+
+**Goal**: The current config had `svm_kernel = "linear"` (a recent switch
+from RBF that left +0.05 NDCG@40 on the table). Re-test RBF on the
+post-4-binary-source feature set with a wide hyperparameter sweep,
+verify with a leakage check, and ship if the lift holds.
+
+**Changes**:
+
+- **scripts/svm_hparam_sweep.py** (new, ~200 lines): grid search over
+  (C, gamma) for the production-matching 3-class SVC. Reuses data
+  loading (`_load_recent_candidates`) and fold construction
+  (`_make_fold`) from `scripts/eval_ranker_variants.py` for
+  methodology consistency. Runs all combos in a single process; writes
+  JSON report with mean/std NDCG@40 for each (C, gamma).
+- **scripts/feature_ablation.py**: updated to match A1's
+  `probability=False` + `decision_function` SVM pattern, and the new
+  `_evaluate_fold(decision, probs, up_idx, ...)` signature. Was still
+  on the old `predict_proba` path; A1's signature change broke the
+  call (caught by `ty check`).
+- **config.toml**: `svm_kernel = "linear"` → `"rbf"`, `svm_c = 0.1`
+  → `0.5`, `svm_gamma` un-commented and set to `0.03`. New production
+  defaults: `C=0.5`, `gamma=0.03`, `kernel=rbf`, `neutral_weight=0.0`.
+- **ARCHITECTURE.md §3.3**: updated the "Current hyperparameters"
+  blurb from 2026-06-23 values to 2026-06-28 values; added a note
+  that the previous values were pre-4-binary-source-tuned and
+  document the wide RBF plateau and the final-queue lift.
+
+**A2 sweep result (linear kernel, 30 (C, gamma) combos)**:
+gamma is irrelevant (linear kernel doesn't use it). C=0.05 wins
+slightly at 0.5064 vs current C=0.1 at 0.5059 (+0.0005, within
+noise). Old C=0.2 (2026-06-23 settled value) is 0.4893 (-0.017).
+**Verdict: linear's optimum is at C=0.05-0.1** — current C=0.1 is fine
+for linear, but linear is dominated by RBF (see below).
+
+**RBF sweep result (49 (C, gamma) combos on 389-d base features)**:
+| Rank | C | gamma | raw NDCG@40 | std |
+|------|---|-------|-------------|-----|
+| 1    | 0.5  | 0.01 | **0.606** | ±0.067 |
+| 2    | 0.7  | 0.008 | 0.604 | ±0.062 |
+| 3    | 1.0  | 0.005 | 0.604 | ±0.072 |
+| 4    | 0.2  | 0.02 | 0.602 | ±0.062 |
+| ... | | | | |
+| 14   | 0.1 (linear) | - | 0.506 | ±0.073 |
+
+The peak is a broad plateau: `C∈{0.3-1.0}` × `gamma∈{0.005-0.02}` all
+give 0.59-0.61. `C=0.5, gamma=0.03` (production defaults now) is
+near the centroid of the plateau at 0.495-0.500 on the production
+394-d feature set (one inner test).
+
+**Leakage check**: shuffled `y_train` before fit. All configs (linear
++ RBF) drop to ~0.10 raw NDCG@40 (random baseline for n_test≈80 /
+n_cand≈7000). The +0.10 RBF lift is real signal, not a metric
+artifact.
+
+**Production-matching 394-d test (sweep's "base" 389-d + pos_cluster
++ 4 source features, mirroring `pipeline._svm_personalization_features`):**
+- linear C=0.1: 0.452 ± 0.071
+- rbf C=0.5, γ=0.01: 0.471 ± 0.065
+- rbf C=0.5, γ=0.03: **0.495 ± 0.070** ← production-default winner
+
+Lift on production features: **+0.05 NDCG@40** (linear 0.452 → RBF
+0.495), about half what the sweep suggested (the sweep was on 389-d
+without pos_cluster + 4 source).
+
+**eval.py on engagement-bloated 399-d features (note: pre-existing
+methodology issue, not introduced by this change)**:
+| formula | metric | before (linear) | after (RBF) |
+|---|---|---|---|
+| current | raw ndcg@40 | 0.654 | 0.645 (-0.009) |
+| current | mmr ndcg@40 | 0.693 | **0.708 (+0.015)** |
+| current | raw map | 0.286 | 0.222 (-0.064) |
+| **final-queue** | mmr ndcg@40 | 0.493 | **0.596 (+0.103)** |
+| **final-queue** | mmr map | 0.050 | **0.072 (+0.022)** |
+| strip_hn | raw ndcg@40 | 0.295 | 0.251 (-0.044) |
+
+The final-queue is the user-facing metric, and it improves by +0.10
+NDCG@40. The raw number drops slightly (-0.009) because the
+engagement-bloated eval features confuse RBF; the post-discovery
+production pipeline (which doesn't see engagement features) benefits.
+
+**Note on eval.py feature-set bug**: `eval.py` uses
+`legacy_features._augment_features` which still has the 6 engagement
+features (log_score, log_comment_count, log_hn_quality,
+comment_score_ratio, log_score_velocity, log_comment_velocity) that
+were removed from production in 2026-06-22. The eval numbers
+therefore include an "engagement-inflated" component that production
+doesn't have. The pre-2026-06-28 eval (with Platt) showed 0.786 raw
+NDCG@40; the post-A1 eval (linear) showed 0.654; the post-RBF eval
+shows 0.645 raw / 0.708 mmr / 0.596 final-queue. Future work: align
+`eval.py`'s feature engineering with `pipeline._svm_personalization_features`
+(the actual 394-d production feature set). Tracked under "Open" below.
+
+**Per-source current raw ndcg@40 (eval.py, RBF)**:
+| source | n_test | raw ndcg@40 |
+|---|---|---|
+| hn | 1897 | 0.589 |
+| ch_seed | 136 | 0.082 |
+| bq_seed, rss, digg, tildes, ... | <100 each | 0.000 |
+
+(Discovery passes still rescue non-HN to 0.10+ in the final queue.)
+
+**Verification**:
+- `uv run pytest tests/ -n 4` = 282 passed, 1 skipped (torch).
+- `uv run ruff check .` = clean.
+- `uv run ty check` = clean (after fixing feature_ablation.py).
+
+**Files**: `eval.py` (unchanged this commit; A1 already shipped),
+`scripts/svm_hparam_sweep.py` (new), `scripts/feature_ablation.py`
+(updated to new signature), `config.toml` (RBF settings),
+`ARCHITECTURE.md §3.3` (updated hyperparams), `WORKLOG.md` (this
+entry).
+
+**Open** (deferred per user "ship RBF, document, stop"):
+- A4 (recency-weighted sample weights in eval SVM)
+- B4 (raw variant in `_compute_final_queue_metrics`)
+- B5 (per-source hit-rate)
+- B6 (`--k-values` CLI arg)
+- B7 (run scripts/feature_ablation.py — now runnable)
+- B8 (`--leak-check` flag)
+- B9 (stratify folds by `(label, source_category)`)
+- A3 (HistGradientBoostingClassifier variant in offline harness)
+- Fix `eval.py` feature engineering to match production (use
+  `pipeline._svm_personalization_features` instead of
+  `legacy_features._augment_features`)

@@ -392,10 +392,15 @@ def _main():
                 gamma=config.model.svm_gamma,
                 random_state=0,
                 decision_function_shape="ovr",
-                probability=True,
+                probability=False,
             )
             svm.fit(X_train_scaled, y_train, sample_weight=weights)
-            probs = svm.predict_proba(X_cand_scaled)
+            decision = svm.decision_function(X_cand_scaled)
+            class_order = list(svm.classes_)
+            up_idx = class_order.index(2)
+            from pipeline import _softmax_rows
+
+            probs = _softmax_rows(decision)
 
             test_stories = [
                 fb_stories[valid_idx] for valid_idx in np.where(valid)[0][test_pos]
@@ -404,7 +409,9 @@ def _main():
 
             fold_results.append(
                 _evaluate_fold(
+                    decision,
                     probs,
+                    up_idx,
                     fold_candidates,
                     fold_cand_emb,
                     test_stories,
