@@ -5,6 +5,120 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-28 — Reddit backlog: prewarm query + parser fix + dead-row cleanup
+
+**Symptom.** Checked the Reddit backlog: 1,134 stories with empty
+`top_comments`, every one with `comment_count=0` (or `NULL`) and
+`score=0`. The prewarm `reddit_prewarm_max_per_cycle=200` cap was
+selecting 200 of them every cycle, but each per-post RSS HTTP call
+returned an empty feed (Reddit's per-post RSS for a 0-comment post
+has no `<entry>` children). The cap was masking the damage, not
+eliminating it.
+
+**Root cause #1 — parser.** `_fetch_and_parse_feed` (pipeline.py:1281)
+hardcoded `score=0, comment_count=None` when constructing the Story
+for each feed entry. The intent was to extract them from the RSS,
+but the lines were never written. Pre-existing limitation, not
+introduced by the recent fetch-queue refactor.
+
+**Root cause #2 — RSS format.** Reddit's topfeed RSS
+(`/r/X/top/.rss?t=week&limit=25`) is an Atom feed with
+`<title>`, `<link>`, `<author>`, `<content>` (HTML), `<id>`,
+`<published>` — but **no `<score>` or `<num_comments>` elements**.
+Those metrics are only in Reddit's JSON API
+(`/r/X/top.json`). Confirmed by saving a real
+`r/MachineLearning/top/.rss?t=week&limit=2` body to `/tmp/reddit_real.rss`
+and dumping the entry keys via feedparser: 0 of the
+17 keys contain "score" or "comm" or "point".
+
+**Consequences.**
+- 100% of Reddit stories in the DB (1,403 / 1,403) had `score=0`.
+- `ORDER BY score DESC, time DESC` in the prewarm query collapsed
+  to `ORDER BY time DESC` only.
+- The 1,134 backlog were 0-comment posts that the parser had
+  identified as "summarizable" (they have `self_text`) but had
+  no comments to fetch — the per-post RSS is genuinely empty.
+- New Reddit stories from the topfeed kept accumulating as
+  `score=0, comment_count=0` rows. Without filtering, the backlog
+  was growing every cycle.
+
+**Fix #1 — `commit 1787d54`.** Added `AND comment_count > 0` to
+the prewarm query (`pipeline.py:2898-2920`). Skips the 0-comment
+posts at the DB level. Prewarm pool immediately dropped from
+1,134 candidates to 0 in the next regen (verified in the journal
+at 20:05:42: "enqueued 41 combined tasks (topfeed=41, prewarm=0)").
+The 200/cycle cap becomes dormant until either (a) the parser
+starts populating real `comment_count` values, or (b) a different
+code path produces Reddit stories with `comment_count > 0` and
+empty `top_comments`.
+
+**Fix #2 — `commit 3624edf`.** Added
+`_extract_reddit_score_and_comments` helper
+(`pipeline.py:1377-1416`) that tries `entry.get("score")` and
+`entry.get("num_comments")` first, then legacy aliases
+(`<points>`, `<comments>`) for older Reddit RSS variants. Returns
+`(0, 0)` for non-Reddit callers. Wired into the entry loop in
+`_fetch_and_parse_feed`. **For real Reddit data this is a no-op**
+— the topfeed RSS simply doesn't carry these elements. The change
+is still defensible: it's correct for legacy RSS variants, and it
+gives us a single chokepoint if/when Reddit adds the elements
+back. The real fix for engagement metrics is to switch the topfeed
+to the JSON API — see "Open questions" below.
+
+**Fix #3 — bulk cleanup.** `DELETE FROM stories WHERE source LIKE
+'rss_reddit_%' AND (top_comments IS NULL OR top_comments = '') AND
+(comment_count IS NULL OR comment_count = 0) AND id NOT IN (SELECT
+story_id FROM feedback)` removed 1,095 unvoted dead Reddit rows
+in a single transaction. The 34 voted dead rows are preserved to
+keep the `feedback.story_id` references intact. After cleanup:
+Reddit story count went from 1,403 → 308 (274 alive + 34 voted
+dead). DB went from 29,726 → 28,597 rows. Backup retained at
+`hn_rewrite.db.pre_reddit_backlog_cleanup_20260628T200901Z`
+(484 MB). `PRAGMA integrity_check` ok after. No WAL frames
+remaining. Service uninterrupted (200 in 4 ms throughout).
+
+User explicitly approved the destructive op
+(AGENTS.md "Never delete or destructively modify the local
+database" rule, with the 2026-06-22 test-removal exception as
+precedent). Skipped VACUUM since the savings (~5-10% of 484 MB)
+isn't worth blocking the live regen for the full table rewrite.
+
+**Open questions.**
+- Should the topfeed switch to Reddit's JSON API
+  (`/r/X/top.json?limit=25&t=week`) to get real `score` and
+  `num_comments`? The JSON API has the same 1-req-per-2s
+  unauth rate limit, so it would compose with the existing
+  queue+limiter. The JSON shape is `{"data": {"children":
+  [{"data": {"score": N, "num_comments": N, ...}}]}}`.
+  Decision deferred — not in scope for this fix.
+- Without engagement metrics, the 308 remaining Reddit stories
+  are ranked by `time DESC` only on the dashboard. This is the
+  same as before the fix; the fix just stops the waste of
+  prewarm HTTP calls on stories that can never benefit.
+
+**Tests.**
+- `test_extract_reddit_score_and_comments_reads_atom_fields` —
+  end-to-end via feedparser on a synthetic Atom entry.
+- `test_extract_reddit_score_and_comments_falls_back_on_missing` —
+  non-Atom feeds and `entry=None` both return `(0, 0)`.
+- `test_extract_reddit_score_and_comments_legacy_aliases` —
+  `<points>`/`<comments>` aliases.
+- `test_build_reddit_topfeed_populates_score_and_comment_count` —
+  end-to-end via the topfeed factory + queue + cache; verifies
+  `score`, `comment_count`, and `comment_count_at_fetch` on the
+  Story.
+- `test_fetch_candidates_only_skips_reddit_with_zero_comments` —
+  new test for the `comment_count > 0` query filter
+  (cc=0 excluded, cc=None excluded, cc=5 included).
+- Updated `test_fetch_candidates_only_prewarms_all_reddit_when_full`
+  to set `comment_count` on the test stories so they pass the
+  new filter.
+
+Total suite: 320 passed, 1 skipped (was 313 + 2 broken + 1 skipped
+= 316). Net +4 tests, 0 regressions.
+
+---
+
 ## 2026-06-28 — Test suite speedup: per-test ONNX reloads eliminated + eval.py lazy imports
 
 **Symptom:** `uv run pytest tests/ -n 4` was spiking CPU and memory,
