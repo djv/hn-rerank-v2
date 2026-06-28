@@ -9,7 +9,7 @@ that were removed from production in 2026-06-22.
 
 **Status of importers (as of 2026-06-28):**
 - `eval.py` — MIGRATED to `_svm_personalization_features`
-- `scripts/feature_ablation.py` — still uses this (TODO)
+- `scripts/feature_ablation.py` — MIGRATED to `_svm_personalization_features`
 - `eval_rss.py` — still uses this (TODO)
 - `eval_no_hn_features.py` — still uses this (TODO)
 - `tests/test_pipeline.py` — still uses this (TODO)
