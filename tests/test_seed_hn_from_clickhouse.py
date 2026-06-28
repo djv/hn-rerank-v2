@@ -17,6 +17,9 @@ from scripts._seed_common import (
 
 
 class DummyEmbedder(Embedder):
+    def __init__(self) -> None:
+        pass
+
     def encode(self, texts: list[str], batch_size: int = 32):
         arr = np.zeros((len(texts), 384), dtype=np.float32)
         if len(texts):

@@ -5,6 +5,89 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-28 — Test suite speedup: per-test ONNX reloads eliminated + eval.py lazy imports
+
+**Symptom:** `uv run pytest tests/ -n 4` was spiking CPU and memory,
+clocking ~28.5s. The largest single test
+(`test_dashboard_cache_version_invariant_property`) was 12.67s by itself
+because it instantiated `MockEmbedder()` 30× in a hypothesis loop, and
+each instantiation ran `AutoTokenizer.from_pretrained` + a fresh
+`ort.InferenceSession` (~0.2s + ~30MB arena). The same pattern was
+present in the two seed test files (`DummyEmbedder` instantiated 4× per
+test) and in `eval.py`, where the module-level `from pipeline import
+(...)` + `from sklearn...` blocks meant `python eval.py --help` paid
+~5s for the transformers + onnxruntime cold start despite never using
+them.
+
+**Fix (4 changes):**
+
+1. **`tests/test_server.py:18` — `MockEmbedder` now overrides `__init__`**
+   and `encode`, returning zero vectors without loading ONNX. Mirrors the
+   `_DummyEmbedder` pattern in `tests/test_pipeline.py:3430`. The previous
+   `class MockEmbedder(Embedder): pass` inherited `Embedder.__init__`,
+   which called `AutoTokenizer.from_pretrained` + `ort.InferenceSession`
+   on every instance. Also added a module-scoped `mock_embedder` fixture
+   so the 27+ test invocations share a single MockEmbedder instance.
+
+2. **`tests/test_seed_hn_from_bq.py:19` + `tests/test_seed_hn_from_clickhouse.py:19` —
+   `DummyEmbedder` gets the same `__init__` override`.** 8 fewer ONNX
+   sessions allocated per test run.
+
+3. **`eval.py` — heavy imports moved inside `main()`** after
+   `parser.parse_args()`. The `--help` path now completes in ~170ms
+   (down from ~5s). Stdlib + numpy stay at module top; sklearn, database,
+   and pipeline imports are deferred via `TYPE_CHECKING` for static
+   type-checking + runtime lazy-import inside the functions that need
+   them. Added `from __future__ import annotations` to make
+   function-signature annotations string-lazy.
+
+4. **`tests/test_server.py:46` — `test_env` split into
+   module-scoped `app_env` (shared server for 5 read-only HTTP tests:
+   redirects, static, CORS, tldr 404) + per-test `test_env` (for the
+   stateful tests that mutate cache/DB/stories).** Extracted the
+   handler+server wiring into a `_start_handler_server` helper.
+   The 5 read-only tests now share one `ThreadingHTTPServer` and one
+   database file, instead of spinning up a fresh one per test.
+
+**Measured impact:**
+- `uv run pytest tests/ -n 4 --durations=15` — **28.5s → 22.4s**
+  (~21% faster).
+- `test_dashboard_cache_version_invariant_property`: **12.67s → 3.16s**
+  (single biggest win).
+- `uv run python eval.py --help`: **5.02s → 0.17s** (~30× faster).
+- Single-process `uv run pytest tests/ -n 1`: **~50s → 32s** (still
+  dominated by the subprocess-based leak-check tests, which were not
+  addressed in this pass — they're next on the list, but the
+  `--max-candidates`/`--folds` reduction would change eval-report
+  numbers and is gated on a separate decision).
+- Memory: the 30+ ONNX sessions that used to sit in worker heaps
+  during the property test are now zero (the MockEmbedder doesn't
+  allocate a session at all).
+
+**Risks / things to watch:**
+- The `app_env` module-scoped fixture deliberately omits a cache-reset
+  autouse hook. The 5 read-only tests don't touch the handler cache,
+  so per-test state is unnecessary. If a future test is routed to
+  `app_env` and starts touching `_dashboard_cache` /
+  `_dashboard_versions`, it will see leftover state from prior tests
+  in the same worker and fail. The fix is to add the test to
+  `test_env` (per-test fresh DB+server) or restore the autouse reset
+  fixture.
+- The `test_env` signature still yields a 5-tuple
+  `(port, db, regen_event, handler, user)`. `app_env` yields the
+  same shape with `regen_event=None`. Tests that swap `test_env` →
+  `app_env` keep their unpacking unchanged.
+
+**Followups (deferred per user):**
+- `test_leak_check_smoke` (10s) and `test_leak_check_flag_in_help` (3s)
+  in `tests/test_eval_ranker_variants.py` still run a full sklearn
+  eval in a subprocess. Lowering `--max-candidates`/`--folds` would
+  save ~5-7s but changes the numbers reported in `eval_report.json`;
+  needs a separate decision on whether the smoke test should be
+  "fast" or "representative".
+
+---
+
 ## 2026-06-28 — Voting no longer leaves the just-voted story in the next refill
 
 **Symptom:** Voting on a story, then waiting for the swipe deck to

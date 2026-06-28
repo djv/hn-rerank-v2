@@ -14,9 +14,24 @@ from server import Handler, SKELETON_HTML
 from pipeline import Config, Embedder
 from database import Database, Story
 
+import numpy as np
+
 
 class MockEmbedder(Embedder):
-    pass
+    """Drop-in stand-in for pipeline.Embedder with no model load.
+
+    Subclasses Embedder for type compatibility with Handler.embedder (typed
+    as Embedder), but overrides __init__ to skip the real
+    AutoTokenizer.from_pretrained + ort.InferenceSession path — that's
+    ~0.2s and a fresh ~30MB ONNX arena per instance, paid 30× in the
+    cache-version property test alone.
+    """
+
+    def __init__(self) -> None:
+        pass
+
+    def encode(self, texts: list[str], batch_size: int = 64) -> Any:
+        return np.zeros((len(texts), 384), dtype=np.float32)
 
 
 def _read_template_and_static() -> tuple[str, str]:
@@ -34,36 +49,35 @@ def _read_template_and_static() -> tuple[str, str]:
     inline_script = template[start:end] if start >= 0 and end >= 0 else ""
     return template, inline_script
 
-    def __init__(self) -> None:
-        pass
 
-    def encode(self, texts: list[str], batch_size: int = 64) -> Any:
-        import numpy as _np
+@pytest.fixture(scope="module")
+def mock_embedder() -> MockEmbedder:
+    """One MockEmbedder for the whole test_server module.
 
-        return _np.zeros((len(texts), 384), dtype=_np.float32)
+    Avoids re-allocating the (cheap) instance, but more importantly keeps
+    embedding-dependent handler state (warmup-in-flight threads, dashboard
+    caches keyed by user) consistent across tests that share the module.
+    """
+    return MockEmbedder()
 
 
-@pytest.fixture
-def test_env(tmp_path):
-    db_file = tmp_path / "test_server.db"
-    db = Database(str(db_file))
+def _start_handler_server(
+    db: Database, embedder: MockEmbedder, port: int = 0
+) -> tuple[ThreadingHTTPServer, int, type[Handler]]:
+    """Spin up a ThreadingHTTPServer on 127.0.0.1:<port>.
 
-    # Create test user
-    user = db.create_user("test_token")
-
-    config = Config(
-        db_path=str(db_file),
-        server_port=0,
-    )
-
+    Returns (server, port, TestHandler). The TestHandler is dynamically
+    created with a fresh cache state and bound to (db, embedder, regen_event).
+    Caller is responsible for cleanup (drain warmup, shutdown, db.close).
+    """
     regen_event = threading.Event()
 
     class TestHandler(Handler):
         pass
 
-    TestHandler.config = config
+    TestHandler.config = Config(db_path=db.db_path, server_port=port)
     TestHandler.db = db
-    TestHandler.embedder = MockEmbedder()
+    TestHandler.embedder = embedder
     TestHandler.regen_event = regen_event
     TestHandler._dashboard_cache = {}
     TestHandler._dashboard_versions = {}
@@ -72,36 +86,88 @@ def test_env(tmp_path):
     TestHandler._warmup_in_flight_guard = threading.Lock()
     TestHandler._WARM_DEBOUNCE_S = 0.01
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
-    port = server.server_address[1]
+    server = ThreadingHTTPServer(("127.0.0.1", port), TestHandler)
+    bound_port = server.server_address[1]
+    return server, bound_port, TestHandler
 
+
+def _drain_and_shutdown(server: ThreadingHTTPServer, handler: type[Handler]) -> None:
+    drain_deadline = time.time() + 3.0
+    while handler._warmup_in_flight and time.time() < drain_deadline:
+        time.sleep(0.1)
+    server.socket.shutdown(socket.SHUT_RDWR)
+    server.shutdown()
+
+
+@pytest.fixture(scope="module")
+def app_env(tmp_path_factory, mock_embedder):
+    """Module-scoped HTTP server for the small set of read-only server tests
+    (redirects, static serving, CORS, tldr 404).
+
+    Yields the same 5-tuple shape as test_env: (port, db, regen_event,
+    TestHandler, user). regen_event is None here because no read-only test
+    uses it; the rest of the positional shape is preserved so test bodies
+    can swap `test_env` -> `app_env` with no other change.
+
+    The TestHandler and server live for the whole module; cache state is
+    reset between tests by a function-scoped autouse fixture
+    (see _reset_app_env). Stateful tests (feedback POST/clear, dashboard
+    renders that depend on cache state) must use test_env instead.
+    """
+    tmp_dir = tmp_path_factory.mktemp("app_env")
+    db_file = tmp_dir / "app_env.db"
+    db = Database(str(db_file))
+    user = db.create_user("test_token")
+    server, port, handler = _start_handler_server(db, mock_embedder)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    yield port, db, None, handler, user
+
+    _drain_and_shutdown(server, handler)
+    db.close()
+
+
+@pytest.fixture
+def test_env(tmp_path, mock_embedder):
+    """Per-test fresh DB + server. Used by stateful tests that mutate the
+    cache, feedback table, or story table (the autouse app_env reset would
+    not give them a clean DB).
+
+    Reuses the module-scoped mock_embedder so we don't re-allocate the
+    (cheap) instance per test.
+    """
+    db_file = tmp_path / "test_server.db"
+    db = Database(str(db_file))
+
+    # Create test user
+    user = db.create_user("test_token")
+
+    server, port, TestHandler = _start_handler_server(db, mock_embedder)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
+
+    regen_event = TestHandler.regen_event
 
     yield port, db, regen_event, TestHandler, user
 
     # Drain any in-flight warm threads on the fixture's TestHandler before
     # teardown so they don't outlive the fixture and pollute the next test's
     # monkeypatched pipeline functions.
-    drain_deadline = time.time() + 3.0
-    while TestHandler._warmup_in_flight and time.time() < drain_deadline:
-        time.sleep(0.1)
-
-    server.socket.shutdown(socket.SHUT_RDWR)
-    server.shutdown()
+    _drain_and_shutdown(server, TestHandler)
     db.close()
 
 
-def test_token_redirect(test_env):
-    port, _, _, _, user = test_env
+def test_token_redirect(app_env):
+    port, _, _, _, user = app_env
     resp = httpx.get(f"http://127.0.0.1:{port}/u/{user.token}", follow_redirects=False)
     assert resp.status_code == 302
     assert resp.headers["Location"] == "../"
     assert "hn_token" in resp.headers.get("Set-Cookie", "")
 
 
-def test_first_visit_redirect(test_env):
-    port, _, _, _, _ = test_env
+def test_first_visit_redirect(app_env):
+    port, _, _, _, _ = app_env
     resp = httpx.get(f"http://127.0.0.1:{port}/", follow_redirects=False)
     assert resp.status_code == 302
     location = resp.headers["Location"]
@@ -109,8 +175,8 @@ def test_first_visit_redirect(test_env):
     assert "hn_token" in resp.headers.get("Set-Cookie", "")
 
 
-def test_dashboard_route_no_user_creates_token_and_redirects(test_env):
-    port, db, _, _, _ = test_env
+def test_dashboard_route_no_user_creates_token_and_redirects(app_env):
+    port, db, _, _, _ = app_env
     with db._conn() as conn:
         before = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
 
@@ -429,7 +495,7 @@ def _wait_for_cache(handler, user, expected_version, timeout=3.0):
     )
 
 
-def test_dashboard_cache_uses_feedback_versions(test_env, monkeypatch):
+def test_dashboard_cache_uses_feedback_versions(test_env, mock_embedder, monkeypatch):
     _, db, _, _, user = test_env
 
     class TestHandler(Handler):
@@ -437,7 +503,7 @@ def test_dashboard_cache_uses_feedback_versions(test_env, monkeypatch):
 
     TestHandler.config = Config(db_path=db.db_path, server_port=0)
     TestHandler.db = db
-    TestHandler.embedder = MockEmbedder()
+    TestHandler.embedder = mock_embedder
     TestHandler._dashboard_cache = {}
     TestHandler._dashboard_versions = {}
     TestHandler._render_locks = {}
@@ -489,7 +555,9 @@ def test_dashboard_cache_uses_feedback_versions(test_env, monkeypatch):
     assert len(calls) == 2
 
 
-def test_stale_warm_render_does_not_overwrite_current_cache(test_env, monkeypatch):
+def test_stale_warm_render_does_not_overwrite_current_cache(
+    test_env, mock_embedder, monkeypatch
+):
     _, db, _, _, user = test_env
 
     class TestHandler(Handler):
@@ -497,7 +565,7 @@ def test_stale_warm_render_does_not_overwrite_current_cache(test_env, monkeypatc
 
     TestHandler.config = Config(db_path=db.db_path, server_port=0)
     TestHandler.db = db
-    TestHandler.embedder = MockEmbedder()
+    TestHandler.embedder = mock_embedder
     TestHandler._dashboard_cache = {}
     TestHandler._dashboard_versions = {}
     TestHandler._render_locks = {}
@@ -564,7 +632,9 @@ def prop_db():
     deadline=None,
     suppress_health_check=[HealthCheck.function_scoped_fixture],
 )
-def test_dashboard_cache_version_invariant_property(operations, prop_db, monkeypatch):
+def test_dashboard_cache_version_invariant_property(
+    operations, prop_db, mock_embedder, monkeypatch
+):
     with prop_db._conn() as conn:
         with conn:
             conn.execute("DELETE FROM users")
@@ -580,7 +650,7 @@ def test_dashboard_cache_version_invariant_property(operations, prop_db, monkeyp
 
     TestHandler.config = Config(db_path=prop_db.db_path, server_port=0)
     TestHandler.db = prop_db
-    TestHandler.embedder = MockEmbedder()
+    TestHandler.embedder = mock_embedder
     TestHandler._dashboard_cache = {}
     TestHandler._dashboard_versions = {}
     TestHandler._render_locks = {}
@@ -639,8 +709,8 @@ def test_dashboard_cache_version_invariant_property(operations, prop_db, monkeyp
         time.sleep(0.1)
 
 
-def test_cors_headers(test_env):
-    port, _, _, _, _ = test_env
+def test_cors_headers(app_env):
+    port, _, _, _, _ = app_env
     resp = httpx.options(f"http://127.0.0.1:{port}/api/feedback")
     assert resp.status_code == 204
     assert resp.headers.get("access-control-allow-origin") == "*"
@@ -801,8 +871,8 @@ async def test_reddit_rss_context_caps_comments_and_cached_chars(monkeypatch):
     assert "comment number 4" not in context.top_comments
 
 
-def test_tldr_handler_returns_404_for_missing_story(test_env):
-    port, _, _, _, user = test_env
+def test_tldr_handler_returns_404_for_missing_story(app_env):
+    port, _, _, _, user = app_env
 
     resp = httpx.post(
         f"http://127.0.0.1:{port}/api/tldr-detail",
@@ -1732,7 +1802,7 @@ def test_dashboard_skeleton_returns_when_no_cache(test_env):
 
 
 @pytest.fixture
-def swr_handler(test_env):
+def swr_handler(test_env, mock_embedder):
     _, db, _, _, user = test_env
 
     class SwrHandler(Handler):
@@ -1740,7 +1810,7 @@ def swr_handler(test_env):
 
     SwrHandler.config = Config(db_path=db.db_path, server_port=0)
     SwrHandler.db = db
-    SwrHandler.embedder = MockEmbedder()
+    SwrHandler.embedder = mock_embedder
     SwrHandler._dashboard_cache = {}
     SwrHandler._dashboard_versions = {}
     SwrHandler._render_locks = {}

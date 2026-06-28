@@ -17,31 +17,28 @@ to avoid train-test leakage. MMR and raw (pre-MMR) metrics both reported.
 Writes eval_report.json (committed to git for tracking).
 """
 
+from __future__ import annotations
+
 import hashlib
 import json
 import math
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
-from sklearn.model_selection import StratifiedKFold
-from sklearn.svm import SVC
-from sklearn.preprocessing import StandardScaler
 
-from database import Database, Story
-from legacy_features import _augment_features  # noqa: F401  (deprecated 2026-06-28; use pipeline._svm_personalization_features)
-from pipeline import (
-    Config,
-    Embedder,
-    RankedStory,
-    _knn_similarity,
-    _softmax_rows,
-    _svm_personalization_features,
-    mmr_filter,
-    rerank_candidates,
-    story_embedding_text,
-)
+if TYPE_CHECKING:
+    from database import Database, Story
+    from legacy_features import _augment_features  # noqa: F401  (deprecated 2026-06-28; use pipeline._svm_personalization_features)
+    from pipeline import (
+        Config,
+        Embedder,
+        RankedStory,
+        mmr_filter,
+        rerank_candidates,
+        story_embedding_text,
+    )
 
 MODEL_VERSION = "all-MiniLM-L6-v2|mean|norm|256"
 REPORT_PATH = Path(__file__).parent / "eval_report.json"
@@ -53,13 +50,15 @@ def _db_sha256(db_path: str) -> str:
 
 def _load_candidates(db: Database) -> tuple[list[Story], np.ndarray]:
     """Read all non-negative-cached stories + their embeddings."""
+    from database import Database as _Database
+
     rows = db.execute(
         "SELECT id, title, url, score, time, text_content, source, "
         "       comment_count, discussion_url, comment_count_at_fetch, "
         "       self_text, top_comments, article_body "
         "FROM stories WHERE text_content != ''"
     )
-    stories = [Database._row_to_story(row) for row in rows]
+    stories = [_Database._row_to_story(row) for row in rows]
     import hashlib
 
     story_hashes = {
@@ -505,6 +504,20 @@ def main() -> None:
         "non-archive pool).",
     )
     args = parser.parse_args()
+
+    # Heavy imports deferred until after parse_args() so `eval.py --help`
+    # doesn't pay the ~2s transformers+onnxruntime cold-start cost.
+    from sklearn.model_selection import StratifiedKFold
+    from sklearn.svm import SVC
+    from sklearn.preprocessing import StandardScaler
+    from database import Database
+    from pipeline import (
+        Config,
+        Embedder,
+        _knn_similarity,
+        _softmax_rows,
+        _svm_personalization_features,
+    )
 
     config = Config.load()
     db = Database(config.db_path)
