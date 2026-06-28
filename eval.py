@@ -1,9 +1,15 @@
 """Ranking evaluation. OFFLINE-ONLY: reads hn_rewrite.db exclusively.
 
 Compares 3 score formulas via 5-fold stratified CV:
-  current:     P(up) + 0.5 * P(neutral)   [production]
-  up_only:     P(up)
+  current:     raw up-margin + 0.5 * raw neutral-margin   [production]
+  up_only:     raw up-margin
   hn_baseline: raw HN points (no SVM)
+
+Ranks by the SVM's raw one-vs-rest decision margin on the up class
+(matches `pipeline.py:1761-1772` production path; `probability=False`
+avoids the deprecated Platt-scaling path). Softmax over the 3-class
+decision matrix is used to derive a soft P(up) for the brier_up
+calibration metric, matching what production does for UI entropy.
 
 Personalization features are computed per-fold (LOOCV self-exclusion)
 to avoid train-test leakage. MMR and raw (pre-MMR) metrics both reported.
@@ -31,6 +37,7 @@ from pipeline import (
     Embedder,
     RankedStory,
     _knn_similarity,
+    _softmax_rows,
     mmr_filter,
     rerank_candidates,
     story_embedding_text,
@@ -121,7 +128,9 @@ def _compute_metrics(
 
 
 def _evaluate_fold(
+    decision: np.ndarray,
     probs: np.ndarray,
+    up_idx: int,
     candidates: list[Story],
     cand_emb: np.ndarray,
     test_stories: list[Story],
@@ -131,20 +140,31 @@ def _evaluate_fold(
     neutral_weight: float = 0.0,
     mmr_threshold: float = 0.50,
     mmr_limit: int = 40,
+    decision_strip: np.ndarray | None = None,
     probs_strip: np.ndarray | None = None,
     cand_sim_up: np.ndarray | None = None,
     cand_sim_down: np.ndarray | None = None,
 ) -> dict:
     if formula == "current":
-        scores = probs[:, 2] + neutral_weight * probs[:, 1]
+        if neutral_weight != 0.0:
+            class_order = list(range(decision.shape[1]))
+            if 1 in class_order:
+                scores = (
+                    decision[:, up_idx]
+                    + neutral_weight * decision[:, class_order.index(1)]
+                )
+            else:
+                scores = decision[:, up_idx]
+        else:
+            scores = decision[:, up_idx]
     elif formula == "up_only":
-        scores = probs[:, 2]
+        scores = decision[:, up_idx]
     elif formula == "hn_baseline":
         scores = cand_scores.astype(np.float32)
     elif formula == "strip_hn":
-        if probs_strip is None:
-            raise ValueError("strip_hn requires probs_strip")
-        scores = probs_strip[:, 2]
+        if decision_strip is None:
+            raise ValueError("strip_hn requires decision_strip")
+        scores = decision_strip[:, up_idx]
     elif formula == "knn_diff":
         if cand_sim_up is None or cand_sim_down is None:
             raise ValueError("knn_diff requires candidate similarity arrays")
@@ -238,6 +258,8 @@ def _evaluate_fold(
         src_rel = test_rel[indices]
         src_all_rels = src_rel.tolist()
         # brier_up is a fold-level calibration metric; not meaningful per-source.
+        # Pop the per-call default (0.0) so it doesn't show up as a fake 0.0 in
+        # the per-source breakdown.
         src_mmr = _compute_metrics(
             mmr_rank_map,
             src_stories,
@@ -247,6 +269,7 @@ def _evaluate_fold(
             brier_up=0.0,
             k_values=(40,),
         )
+        src_mmr.pop("brier_up", None)
         src_raw = _compute_metrics(
             raw_rank_map,
             src_stories,
@@ -256,6 +279,7 @@ def _evaluate_fold(
             brier_up=0.0,
             k_values=(40,),
         )
+        src_raw.pop("brier_up", None)
         # Per-source rank percentiles of upvoted test items
         src_upvote_ranks_raw = sorted(
             raw_rank_map[test_stories[i].id]
@@ -430,6 +454,9 @@ def _compute_final_queue_metrics(
             brier_up=0.0,
             k_values=(40,),
         )
+        # brier_up is fold-level only; drop the per-call default to keep
+        # per-source output honest.
+        src_mmr.pop("brier_up", None)
         src_upvote_ranks = sorted(
             final_rank_map[test_stories[i].id]
             for i in indices
@@ -552,6 +579,9 @@ def main() -> None:
     formulas = ["current", "up_only", "strip_hn", "hn_baseline", "knn_diff"]
     results: dict[str, list[dict]] = {f: [] for f in formulas}
     final_queue_results: list[dict] = []
+    # Accumulated binary upvote labels across all folds; used to compute the
+    # class-prior brier baseline (brier_const = p*(1-p)) at the end.
+    all_y_binary: list[np.ndarray] = []
 
     folds = list(
         StratifiedKFold(n_splits=5, shuffle=True, random_state=0).split(
@@ -736,10 +766,19 @@ def main() -> None:
             gamma=config.model.svm_gamma,
             random_state=0,
             decision_function_shape="ovr",
-            probability=True,
+            probability=False,
         )
         svm.fit(X_train_scaled, y_train, sample_weight=weights)
-        probs = svm.predict_proba(X_cand_scaled)
+        # Production path (`pipeline.py:1761-1772`): rank by raw one-vs-rest
+        # up-margin from `decision_function`. `probability=True` would add a
+        # 5-fold internal Platt-scaling step and is the deprecated path.
+        decision = svm.decision_function(X_cand_scaled)
+        class_order = list(svm.classes_)
+        up_idx = class_order.index(2)
+        # Softmax(decision) provides soft P(up) for the brier_up calibration
+        # metric, matching the UI's entropy convention. Not a true calibrated
+        # probability.
+        probs = _softmax_rows(decision)
 
         # SVM with HN-specific features zeroed
         X_train_strip = X_train_scaled.copy()
@@ -769,21 +808,25 @@ def main() -> None:
             gamma=config.model.svm_gamma,
             random_state=0,
             decision_function_shape="ovr",
-            probability=True,
+            probability=False,
         )
         svm_s.fit(X_train_strip, y_train, sample_weight=weights)
-        probs_strip = svm_s.predict_proba(X_cand_strip)
+        decision_strip = svm_s.decision_function(X_cand_strip)
+        probs_strip = _softmax_rows(decision_strip)
 
         # Test fold: map test positions back to stories
         test_stories = [
             fb_stories[valid_idx] for valid_idx in np.where(valid)[0][test_pos]
         ]
         test_actions = y[test_pos]
+        all_y_binary.append((test_actions == 2).astype(np.float32))
 
         for formula in formulas:
             results[formula].append(
                 _evaluate_fold(
+                    decision,
                     probs,
+                    up_idx,
                     fold_candidates,
                     fold_cand_emb,
                     test_stories,
@@ -792,6 +835,7 @@ def main() -> None:
                     formula,
                     neutral_weight=config.model.neutral_weight,
                     mmr_threshold=config.model.diversity_threshold,
+                    decision_strip=decision_strip,
                     probs_strip=probs_strip,
                     cand_sim_up=cand_sim_up,
                     cand_sim_down=cand_sim_down,
@@ -821,7 +865,13 @@ def main() -> None:
         else:
             final_queue_results.append({})
 
-        print(f"Fold {fold_idx + 1}/5 done")
+        print(
+            f"Fold {fold_idx + 1}/5 done  "
+            f"n_test={len(test_stories)}  "
+            f"n_up={int((test_actions == 2).sum())}  "
+            f"n_neutral={int((test_actions == 1).sum())}  "
+            f"n_down={int((test_actions == 0).sum())}"
+        )
 
     # Aggregate
     metric_keys = (
@@ -833,6 +883,10 @@ def main() -> None:
         "p25_rank",
         "p75_rank",
     )
+    # Per-source breakdown: brier_up is fold-level only (calibration is
+    # measured against the full test set, not per-source). Drop it from the
+    # per-source metric set so aggregation doesn't try to read a missing key.
+    per_source_metric_keys = tuple(k for k in metric_keys if k != "brier_up")
 
     report = {
         "config": {
@@ -907,21 +961,21 @@ def main() -> None:
                 "mean": {
                     "mmr": {
                         k: float(np.mean([ps["mmr"][k] for ps in fold_ps_list]))
-                        for k in metric_keys
+                        for k in per_source_metric_keys
                     },
                     "raw": {
                         k: float(np.mean([ps["raw"][k] for ps in fold_ps_list]))
-                        for k in metric_keys
+                        for k in per_source_metric_keys
                     },
                 },
                 "std": {
                     "mmr": {
                         k: float(np.std([ps["mmr"][k] for ps in fold_ps_list]))
-                        for k in metric_keys
+                        for k in per_source_metric_keys
                     },
                     "raw": {
                         k: float(np.std([ps["raw"][k] for ps in fold_ps_list]))
-                        for k in metric_keys
+                        for k in per_source_metric_keys
                     },
                 },
             }
@@ -967,11 +1021,11 @@ def main() -> None:
                 continue
             ps_mean_mmr = {
                 k: float(np.mean([pso["mmr"][k] for pso in fold_ps_list]))
-                for k in metric_keys
+                for k in per_source_metric_keys
             }
             ps_std_mmr = {
                 k: float(np.std([pso["mmr"][k] for pso in fold_ps_list]))
-                for k in metric_keys
+                for k in per_source_metric_keys
             }
             per_source_fq[source] = {
                 "n_test": source_n_test_fq[source],
@@ -988,6 +1042,17 @@ def main() -> None:
 
     REPORT_PATH.write_text(json.dumps(report, indent=2))
     print(f"\nWritten {REPORT_PATH}")
+
+    # Brier baseline: best constant predictor is the class prior p, giving
+    # brier_const = p * (1 - p). A well-calibrated model should beat this.
+    if all_y_binary:
+        y_all = np.concatenate(all_y_binary)
+        p = float(y_all.mean())
+        brier_const = p * (1.0 - p)
+        print(
+            f"\nClass prior: p(up) = {p:.4f}  |  "
+            f"brier_const (constant predictor) = {brier_const:.4f}"
+        )
 
     for metric in metric_keys:
         print(f"\n{metric} by formula (mean ± std):")
