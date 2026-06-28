@@ -27,17 +27,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 try:
     import torch  # noqa: F401  # type: ignore
-except ImportError:
-    sys.exit(
-        "scripts/eval_ranker_variants.py requires torch. "
-        "Install with: uv sync --group dl-experiment"
-    )
 
-from pipeline_dl import fit_attention_mlp, predict_attention_mlp
-from pipeline_dl_t0 import (
-    fit_attention_mlp_t0,
-    predict_attention_mlp_t0,
-)
+    _TORCH_AVAILABLE = True
+except ImportError:
+    _TORCH_AVAILABLE = False
+    torch = None  # type: ignore[assignment]
+
+# DL imports are deferred; only loaded if a DL variant is requested.
+# This lets the harness run all sklearn / SVM / cluster variants without
+# pulling in the ~700MB torch dependency.
+if _TORCH_AVAILABLE:
+    from pipeline_dl import fit_attention_mlp, predict_attention_mlp
+    from pipeline_dl_t0 import (
+        fit_attention_mlp_t0,
+        predict_attention_mlp_t0,
+    )
 
 from database import Database, Story
 from pipeline import (
@@ -1808,39 +1812,6 @@ def main() -> None:
         "mlp_32_a1e-3": lambda fold: _scores_mlp_up(fold, config, (32,), 1e-3),
         "mlp_64_a1e-3": lambda fold: _scores_mlp_up(fold, config, (64,), 1e-3),
         "mlp_64_16_a1e-3": lambda fold: _scores_mlp_up(fold, config, (64, 16), 1e-3),
-        "attention_mlp": lambda fold: _scores_attention_mlp_up(fold, config),
-        "attn_mlp_t0": lambda fold: _scores_attention_mlp_t0_up(fold, config),
-        "attn_mlp_t0_cos": lambda fold: _scores_attention_mlp_t0_cos_up(fold, config),
-        "attn_mlp_v1_nocos": lambda fold: _scores_attention_mlp_v1_nocos_up(
-            fold, config
-        ),
-        "attn_mlp_v1_h64": lambda fold: _scores_attention_mlp_v1_h64_up(fold, config),
-        "attn_mlp_v2_rank": lambda fold: _scores_attention_mlp_v2_rank_up(fold, config),
-        "attn_mlp_v2_meta": lambda fold: _scores_attention_mlp_v2_meta_up(fold, config),
-        "attn_mlp_v2_mixup": lambda fold: _scores_attention_mlp_v2_mixup_up(
-            fold, config
-        ),
-        "attn_mlp_v2_all": lambda fold: _scores_attention_mlp_v2_all_up(fold, config),
-        "blend_score_10": lambda fold: _scores_blend_up(
-            fold, config, 0.10, kind="score"
-        ),
-        "blend_score_25": lambda fold: _scores_blend_up(
-            fold, config, 0.25, kind="score"
-        ),
-        "blend_score_50": lambda fold: _scores_blend_up(
-            fold, config, 0.50, kind="score"
-        ),
-        "blend_score_75": lambda fold: _scores_blend_up(
-            fold, config, 0.75, kind="score"
-        ),
-        "blend_score_90": lambda fold: _scores_blend_up(
-            fold, config, 0.90, kind="score"
-        ),
-        "blend_rank_10": lambda fold: _scores_blend_up(fold, config, 0.10, kind="rank"),
-        "blend_rank_25": lambda fold: _scores_blend_up(fold, config, 0.25, kind="rank"),
-        "blend_rank_50": lambda fold: _scores_blend_up(fold, config, 0.50, kind="rank"),
-        "blend_rank_75": lambda fold: _scores_blend_up(fold, config, 0.75, kind="rank"),
-        "blend_rank_90": lambda fold: _scores_blend_up(fold, config, 0.90, kind="rank"),
         "source_domain_margin3_up": lambda fold: _scores_margin_source_domain(
             fold, config
         ),
@@ -2114,9 +2085,77 @@ def main() -> None:
         "pairwise_textsplit": lambda fold: _scores_pairwise(fold, textsplit=True),
         "tier2_centroid": lambda fold: (fold.tier2_scores.copy(), None),
     }
+    # Register DL variants only if torch is available. This lets the
+    # harness run all 65 non-DL variants on a stock install; DL/blend
+    # variants are opt-in via `uv sync --group dl-experiment`.
+    if _TORCH_AVAILABLE:
+        variants.update(
+            {
+                "attention_mlp": lambda fold: _scores_attention_mlp_up(fold, config),
+                "attn_mlp_t0": lambda fold: _scores_attention_mlp_t0_up(fold, config),
+                "attn_mlp_t0_cos": lambda fold: _scores_attention_mlp_t0_cos_up(
+                    fold, config
+                ),
+                "attn_mlp_v1_nocos": lambda fold: _scores_attention_mlp_v1_nocos_up(
+                    fold, config
+                ),
+                "attn_mlp_v1_h64": lambda fold: _scores_attention_mlp_v1_h64_up(
+                    fold, config
+                ),
+                "attn_mlp_v2_rank": lambda fold: _scores_attention_mlp_v2_rank_up(
+                    fold, config
+                ),
+                "attn_mlp_v2_meta": lambda fold: _scores_attention_mlp_v2_meta_up(
+                    fold, config
+                ),
+                "attn_mlp_v2_mixup": lambda fold: _scores_attention_mlp_v2_mixup_up(
+                    fold, config
+                ),
+                "attn_mlp_v2_all": lambda fold: _scores_attention_mlp_v2_all_up(
+                    fold, config
+                ),
+                "blend_score_10": lambda fold: _scores_blend_up(
+                    fold, config, 0.10, kind="score"
+                ),
+                "blend_score_25": lambda fold: _scores_blend_up(
+                    fold, config, 0.25, kind="score"
+                ),
+                "blend_score_50": lambda fold: _scores_blend_up(
+                    fold, config, 0.50, kind="score"
+                ),
+                "blend_score_75": lambda fold: _scores_blend_up(
+                    fold, config, 0.75, kind="score"
+                ),
+                "blend_score_90": lambda fold: _scores_blend_up(
+                    fold, config, 0.90, kind="score"
+                ),
+                "blend_rank_10": lambda fold: _scores_blend_up(
+                    fold, config, 0.10, kind="rank"
+                ),
+                "blend_rank_25": lambda fold: _scores_blend_up(
+                    fold, config, 0.25, kind="rank"
+                ),
+                "blend_rank_50": lambda fold: _scores_blend_up(
+                    fold, config, 0.50, kind="rank"
+                ),
+                "blend_rank_75": lambda fold: _scores_blend_up(
+                    fold, config, 0.75, kind="rank"
+                ),
+                "blend_rank_90": lambda fold: _scores_blend_up(
+                    fold, config, 0.90, kind="rank"
+                ),
+            }
+        )
     if requested:
         missing = sorted(set(requested) - set(variants))
         if missing:
+            if any(
+                m.startswith(("attention_mlp", "attn_mlp", "blend_")) for m in missing
+            ):
+                raise RuntimeError(
+                    f"Requested DL/blend variants not available: {', '.join(missing)}. "
+                    "Install torch with `uv sync --group dl-experiment`."
+                )
             raise ValueError(f"Unknown variants: {', '.join(missing)}")
         variants = {name: variants[name] for name in requested}
     results: dict[str, list[dict]] = {name: [] for name in variants}
