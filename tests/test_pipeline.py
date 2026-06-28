@@ -4123,6 +4123,7 @@ def test_fetch_candidates_only_prewarms_all_reddit_when_full(monkeypatch) -> Non
                 time=100,
                 text_content="r1",
                 source="rss_reddit_test",
+                comment_count=5,
             ),
             Story(
                 id=11,
@@ -4132,6 +4133,7 @@ def test_fetch_candidates_only_prewarms_all_reddit_when_full(monkeypatch) -> Non
                 time=100,
                 text_content="r2",
                 source="rss_reddit_test",
+                comment_count=3,
             ),
             Story(
                 id=12,
@@ -4193,6 +4195,112 @@ def test_fetch_candidates_only_prewarms_all_reddit_when_full(monkeypatch) -> Non
         assert len(captured_ids) == 1
         # Stories without top_comments: 10, 11
         assert sorted(captured_ids[0]) == [10, 11]
+
+    finally:
+        db.close()
+
+
+def test_fetch_candidates_only_skips_reddit_with_zero_comments(
+    monkeypatch,
+) -> None:
+    """Prewarm query filters out Reddit stories with `comment_count <= 0`.
+
+    Reddit's per-post RSS for a 0-comment post returns an empty feed, so
+    the prewarm HTTP call would never populate `top_comments`. Filtering
+    at the query level saves the rate budget for stories that can
+    actually benefit from prewarm.
+    """
+    from reddit_fetch_queue import queue as reddit_fetch_queue
+
+    db = Database(":memory:")
+    try:
+        config = Config(
+            db_path=db.db_path,
+            prewarm_hn_full=False,
+            regen_prewarm_top_n=0,
+            prewarm_reddit_full=True,
+        )
+
+        stories = [
+            Story(
+                id=20,
+                title="Prewarmable",
+                url="http://reddit.com/r/test/20",
+                score=50,
+                time=100,
+                text_content="x",
+                source="rss_reddit_test",
+                comment_count=5,
+            ),
+            Story(
+                id=21,
+                title="Zero comments",
+                url="http://reddit.com/r/test/21",
+                score=100,
+                time=200,
+                text_content="x",
+                source="rss_reddit_test",
+                comment_count=0,
+            ),
+            Story(
+                id=22,
+                title="No comment count known",
+                url="http://reddit.com/r/test/22",
+                score=200,
+                time=300,
+                text_content="x",
+                source="rss_reddit_test",
+                comment_count=None,
+            ),
+        ]
+        for s in stories:
+            db.upsert_story(s)
+
+        async def fake_fetch_candidates(
+            config, exclude_ids, exclude_urls, db, embedder
+        ):
+            return stories, 3
+
+        captured_ids: list[list[int]] = []
+
+        def fake_build_reddit_topfeed_factories(feeds, per_feed, days, exclude_urls):
+            return [], []
+
+        def fake_build_reddit_prewarm_factories(story_ids, db_):
+            captured_ids.append(list(story_ids))
+            return [], []
+
+        def fake_enqueue_all(*a, **kw):
+            return None
+
+        def fake_wait_until_empty(timeout=None):
+            return True
+
+        monkeypatch.setattr(pipeline, "fetch_candidates", fake_fetch_candidates)
+        monkeypatch.setattr(
+            pipeline,
+            "build_reddit_topfeed_factories",
+            fake_build_reddit_topfeed_factories,
+        )
+        monkeypatch.setattr(
+            pipeline,
+            "build_reddit_prewarm_factories",
+            fake_build_reddit_prewarm_factories,
+        )
+        monkeypatch.setattr(
+            reddit_fetch_queue, "enqueue_all_reddit_fetches", fake_enqueue_all
+        )
+        monkeypatch.setattr(
+            reddit_fetch_queue, "wait_until_empty", fake_wait_until_empty
+        )
+
+        asyncio.run(
+            pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
+        )
+        assert len(captured_ids) == 1
+        # Only story 20 (cc=5) is picked. 21 (cc=0) and 22 (cc=None) are
+        # excluded — `comment_count > 0` is SQL-strict.
+        assert sorted(captured_ids[0]) == [20]
 
     finally:
         db.close()

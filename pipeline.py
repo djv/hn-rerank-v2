@@ -2895,12 +2895,20 @@ async def fetch_candidates_only(
         # are enqueued, not in the pool) — see WORKLOG 2026-06-28
         # "Reddit fetch queue as single coordinator" for the full
         # rationale.
+        #
+        # The `comment_count > 0` filter skips Reddit stories that have
+        # no comments to fetch (Reddit's per-post RSS for a 0-comment
+        # post returns an empty feed, so the prewarm HTTP call would
+        # never populate `top_comments`). See WORKLOG 2026-06-28
+        # "Reddit RSS parser: extract score and num_comments" for why
+        # cc=0 was over-represented in the backlog.
         rows = db.execute(
             """
             SELECT id FROM stories
             WHERE source LIKE 'rss_reddit_%'
               AND (top_comments IS NULL OR top_comments = '')
               AND text_content != ''
+              AND comment_count > 0
             ORDER BY score DESC, time DESC
             LIMIT ?
             """,
