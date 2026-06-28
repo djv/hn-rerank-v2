@@ -25,6 +25,7 @@ import httpx
 from dataclasses import dataclass, replace
 from database import Database, User
 from pipeline import Config, Embedder, is_hn_source
+from reddit_limiter import limiter as reddit_limiter
 from http_fetch import fetch_with_urllib_fallback
 
 ARTICLE_BODY_CHAR_LIMIT = 15_000
@@ -248,15 +249,24 @@ async def _fetch_reddit_rss_context(url: str | None) -> RedditRssContext | None:
     if not rss_url:
         return None
 
+    if not await reddit_limiter.acquire():
+        return None
+
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
             resp = await client.get(
                 rss_url, headers={"User-Agent": REDDIT_RSS_USER_AGENT}
             )
-        if resp.status_code != 200:
-            return None
     except Exception:
         return None
+
+    if resp.status_code == 429:
+        retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+        reddit_limiter.on_429(retry_after)
+        return None
+    if resp.status_code != 200:
+        return None
+    reddit_limiter.on_success()
 
     parsed = feedparser.parse(resp.text)
     entries = list(parsed.entries)

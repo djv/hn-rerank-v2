@@ -27,6 +27,7 @@ from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
 
 from database import Database, Story
+from reddit_limiter import limiter as reddit_limiter
 from transformers import AutoTokenizer
 
 
@@ -882,7 +883,13 @@ async def prewarm_reddit_top_stories(
     from server import _fetch_reddit_rss_context  # late import to avoid circular
 
     prewarmed: list[Story] = []
-    for sid in story_ids:
+    for i, sid in enumerate(story_ids):
+        if reddit_limiter.circuit_open:
+            logging.info(
+                "prewarm_reddit: circuit open, skipping remaining %d stories",
+                len(story_ids) - i,
+            )
+            break
         story = db.get_story(sid)
         if not story or not story.url:
             continue
@@ -1190,18 +1197,24 @@ async def fetch_rss_feeds(
     cutoff = now - (days * 86400)
 
     async def fetch_and_parse(feed_url: str) -> list[Story]:
+        is_reddit = bool(_reddit_subreddit_from_feed_url(feed_url))
         try:
             from http_fetch import fetch_with_urllib_fallback
 
             source_name = _rss_source_name(feed_url)
             headers = {"User-Agent": RSS_USER_AGENT}
-            if _reddit_subreddit_from_feed_url(feed_url):
+            if is_reddit:
                 headers["User-Agent"] = REDDIT_RSS_USER_AGENT
 
             async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
                 status, content = await fetch_with_urllib_fallback(
                     client, feed_url, headers
                 )
+                if is_reddit:
+                    if status == 429:
+                        reddit_limiter.on_429()
+                    elif status == 200:
+                        reddit_limiter.on_success()
                 if status != 200:
                     return []
 
@@ -1271,8 +1284,14 @@ async def fetch_rss_feeds(
     feed_results = list(await asyncio.gather(*tasks)) if tasks else []
 
     # Reddit RSS frequently returns 429 when several subreddit feeds are fetched in
-    # parallel from the same host, so keep those requests serialized.
-    for feed in reddit_feeds:
+    # parallel from the same host, so keep those requests serialized and rate-limited.
+    for i, feed in enumerate(reddit_feeds):
+        if not await reddit_limiter.acquire():
+            logging.info(
+                "fetch_rss_feeds: reddit circuit open, skipping remaining %d feeds",
+                len(reddit_feeds) - i,
+            )
+            break
         feed_results.append(await fetch_and_parse(feed))
 
     all_stories = []

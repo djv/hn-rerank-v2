@@ -632,6 +632,10 @@ async def test_fetch_rss_feeds_serializes_reddit_and_sets_user_agent(
             return MockResp(rss_doc(title, link))
 
     monkeypatch.setattr("pipeline.httpx.AsyncClient", MockClient)
+    # Disable the 2s inter-request delay so the test runs fast;
+    # the conftest fixture resets the limiter before/after each test.
+    monkeypatch.setattr("pipeline.reddit_limiter", pipeline.reddit_limiter)
+    pipeline.reddit_limiter.INTER_REQUEST_DELAY = 0.0
 
     stories = await fetch_rss_feeds(
         [
@@ -697,6 +701,9 @@ async def test_fetch_rss_feeds_populates_self_text(tmp_path, monkeypatch):
             return MockResp(rss_doc("LA transit", url + "/comments/x/"))
 
     monkeypatch.setattr("pipeline.httpx.AsyncClient", MockClient)
+    # Disable the 2s inter-request delay so the test runs fast;
+    # the conftest fixture resets the limiter before/after each test.
+    pipeline.reddit_limiter.INTER_REQUEST_DELAY = 0.0
 
     stories = await fetch_rss_feeds(
         ["https://www.reddit.com/r/transit/top/.rss"],
