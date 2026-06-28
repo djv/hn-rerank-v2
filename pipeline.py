@@ -122,17 +122,25 @@ TOP_COMMENT_MAX_PER_THREAD = 6
 GOOD_TOPLEVEL_MIN_LEN = 200
 GOOD_TOPLEVEL_MIN_REPLIES = 3
 TOP_COMMENT_TOP_LEVEL_BUDGET = TOP_COMMENT_LIMIT // 3
-UNCERTAIN_DISCOVERY_SLOT_LIMIT = 5
+# Discovery slot budget. Each non-Hot badge gets per-cohort top-N slots
+# (recent + archive). Hot stays a single global pass; archive never gets
+# Hot because velocity is structurally ~0 for >30-day stories.
+UNCERTAIN_DISCOVERY_SLOT_LIMIT = (
+    5  # used by primary-attribution entropy cutoff (enrichment, not slot cap)
+)
 UNCERTAIN_DISCOVERY_RECENT_SLOTS = 3
-UNCERTAIN_DISCOVERY_ARCHIVE_SLOTS = 2
-DISCOVERY_SLOT_LIMIT = 5
+UNCERTAIN_DISCOVERY_ARCHIVE_SLOTS = 3
 NOVEL_DISCOVERY_RECENT_SLOTS = 3
 NOVEL_DISCOVERY_ARCHIVE_SLOTS = 3
 SIMILAR_DISCOVERY_RECENT_SLOTS = 3
 SIMILAR_DISCOVERY_ARCHIVE_SLOTS = 3
-POPULARITY_DISCOVERY_SLOT_LIMIT = 8
+DISCUSSION_DISCOVERY_RECENT_SLOTS = 3
+DISCUSSION_DISCOVERY_ARCHIVE_SLOTS = 3
+HIGH_ENGAGEMENT_DISCOVERY_RECENT_SLOTS = 3
+HIGH_ENGAGEMENT_DISCOVERY_ARCHIVE_SLOTS = 3
 NON_HN_DISCOVERY_SLOT_LIMIT = 8
 ARCHIVE_TOP_DISCOVERY_SLOT_LIMIT = 12
+HOT_DISCOVERY_SLOT_LIMIT = 8
 HOT_MIN_SCORE = 20
 DASHBOARD_QUEUE_SIZE = 12
 BQ_ARCHIVE_SOURCE = "bq_seed"
@@ -2110,19 +2118,9 @@ def rerank_candidates(
         _bucket_pct(cand_max_sim, recent_mask, config.model.novel_badge_percentile),
         _bucket_pct(cand_max_sim, ~recent_mask, config.model.novel_badge_percentile),
     )
-    # Per-bucket threshold for the Similar badge (top-pct by similarity to
-    # your upvotes). Applied to extra-slot stories only (see
-    # `is_similar` exclusion in the primary-attribution block below).
-    # Falls back to 0.0 when a bucket has no candidates.
-    similar_thresholds = np.where(
-        recent_mask,
-        _bucket_pct(
-            cand_closest_up, recent_mask, config.model.similar_badge_percentile
-        ),
-        _bucket_pct(
-            cand_closest_up, ~recent_mask, config.model.similar_badge_percentile
-        ),
-    )
+    # Note: is_similar is pass-only (top-3-by-rank per cohort). No per-bucket
+    # threshold is computed because the discovery pass sorts by similarity and
+    # takes the top 3 per cohort unconditionally.
 
     story_id_to_idx = {s.id: idx for idx, s in enumerate(candidates)}
 
@@ -2208,46 +2206,6 @@ def rerank_candidates(
         recent_mask, recent_ent_cutoff, archive_ent_cutoff
     )
 
-    # Apply the same badge criteria to primary-ranked stories. Extra-slot
-    # passes below still source from remaining_decorated and respect their
-    # per-pass slot caps; this attribution only adds badges to stories
-    # already in the primary ranked set, so it does not take slots away
-    # from the extra-slot pulls. `is_similar` is intentionally NOT applied
-    # here: the Similar badge is reserved for extra-slot stories (see
-    # similar_thresholds usage in the Similar discovery pass below), so it
-    # always signals "surfaced from outside primary because of high
-    # semantic match" rather than a near-tautology on top-ranked stories.
-    final = [
-        replace(
-            r,
-            is_uncertain=(
-                r.prob_down is not None
-                and get_entropy(r)
-                >= uncertain_entropy_thresholds[story_id_to_idx[r.story.id]]
-            ),
-            is_novel=(
-                cand_max_sim[story_id_to_idx[r.story.id]]
-                <= sim_thresholds[story_id_to_idx[r.story.id]]
-            ),
-            is_discussion_rich=(
-                cand_comment_counts[story_id_to_idx[r.story.id]]
-                >= discussion_thresholds[story_id_to_idx[r.story.id]]
-                and cand_comment_counts[story_id_to_idx[r.story.id]] > 0
-            ),
-            is_high_engagement=(
-                cand_scores[story_id_to_idx[r.story.id]]
-                >= engagement_thresholds[story_id_to_idx[r.story.id]]
-            ),
-            is_hot=(
-                cand_velocities[story_id_to_idx[r.story.id]] >= hot_threshold
-                and cand_velocities[story_id_to_idx[r.story.id]] > 0
-                and r.story.score >= HOT_MIN_SCORE
-            ),
-            is_non_hn=(not is_hn_source(r.story.source)),
-        )
-        for r in final
-    ]
-
     # remaining_decorated contains candidates not in the primary path.
     remaining_decorated = [r for r in ranked if r.story.id not in final_ids]
 
@@ -2279,15 +2237,37 @@ def rerank_candidates(
         window=config.model.non_hn_ramp_window,
     )
 
+    # Per-cohort top-N discovery passes for every non-Hot badge. Each pass
+    # takes the top `slot_limit` stories in its cohort by the badge metric,
+    # unconditionally — the per-bucket percentile thresholds are NOT used as
+    # gates here. This guarantees a floor of `slot_limit` badged stories per
+    # cohort whenever the cohort has enough remaining candidates, which is
+    # the "Floor" half of the Floor+Enrichment model (see ARCHITECTURE.md).
+    # The percentile thresholds (engagement_thresholds etc.) are still used
+    # in the post-discovery re-attribution block below for the "Enrichment"
+    # half: they badge any story in the complete final that clears the
+    # cohort's quality bar, preserving the current top-decile richness on
+    # large pools.
+    #
+    # Predicate for each pass is reduced to a minimal membership guard so
+    # the pass can fill its slots even when the cohort's quality is low
+    # (e.g., small synthetic pools).
     discovery_passes: list[DiscoveryPass] = [
         DiscoveryPass(
             name="uncertain-recent",
             attr="is_uncertain",
-            predicate=lambda r: r.prob_down is not None
-            and get_entropy(r) >= uncertain_entropy_thresholds[idx_for(r.story.id)],
+            predicate=lambda r: r.prob_down is not None,
             sort_key=lambda r: float(get_entropy(r)),
             slot_limit=UNCERTAIN_DISCOVERY_RECENT_SLOTS,
             age="recent",
+        ),
+        DiscoveryPass(
+            name="uncertain-archive",
+            attr="is_uncertain",
+            predicate=lambda r: r.prob_down is not None,
+            sort_key=lambda r: float(get_entropy(r)),
+            slot_limit=UNCERTAIN_DISCOVERY_ARCHIVE_SLOTS,
+            age="archive",
         ),
         DiscoveryPass(
             name="archive-top",
@@ -2300,8 +2280,7 @@ def rerank_candidates(
         DiscoveryPass(
             name="novel-recent",
             attr="is_novel",
-            predicate=lambda r: cand_max_sim[idx_for(r.story.id)]
-            <= sim_thresholds[idx_for(r.story.id)],
+            predicate=lambda r: True,
             sort_key=_novel_sort_key,
             slot_limit=NOVEL_DISCOVERY_RECENT_SLOTS,
             age="recent",
@@ -2309,8 +2288,7 @@ def rerank_candidates(
         DiscoveryPass(
             name="novel-archive",
             attr="is_novel",
-            predicate=lambda r: cand_max_sim[idx_for(r.story.id)]
-            <= sim_thresholds[idx_for(r.story.id)],
+            predicate=lambda r: True,
             sort_key=_novel_sort_key,
             slot_limit=NOVEL_DISCOVERY_ARCHIVE_SLOTS,
             age="archive",
@@ -2318,8 +2296,7 @@ def rerank_candidates(
         DiscoveryPass(
             name="similar-recent",
             attr="is_similar",
-            predicate=lambda r: cand_closest_up[idx_for(r.story.id)]
-            >= similar_thresholds[idx_for(r.story.id)],
+            predicate=lambda r: True,
             sort_key=_similar_sort_key,
             slot_limit=SIMILAR_DISCOVERY_RECENT_SLOTS,
             age="recent",
@@ -2327,28 +2304,42 @@ def rerank_candidates(
         DiscoveryPass(
             name="similar-archive",
             attr="is_similar",
-            predicate=lambda r: cand_closest_up[idx_for(r.story.id)]
-            >= similar_thresholds[idx_for(r.story.id)],
+            predicate=lambda r: True,
             sort_key=_similar_sort_key,
             slot_limit=SIMILAR_DISCOVERY_ARCHIVE_SLOTS,
             age="archive",
         ),
         DiscoveryPass(
-            name="discussion-rich",
+            name="discussion-recent",
             attr="is_discussion_rich",
-            predicate=lambda r: cand_comment_counts[idx_for(r.story.id)]
-            >= discussion_thresholds[idx_for(r.story.id)]
-            and cand_comment_counts[idx_for(r.story.id)] > 0,
+            predicate=lambda r: (cand_comment_counts[idx_for(r.story.id)] or 0) > 0,
             sort_key=_discussion_sort_key,
-            slot_limit=DISCOVERY_SLOT_LIMIT,
+            slot_limit=DISCUSSION_DISCOVERY_RECENT_SLOTS,
+            age="recent",
         ),
         DiscoveryPass(
-            name="high-engagement",
+            name="discussion-archive",
+            attr="is_discussion_rich",
+            predicate=lambda r: (cand_comment_counts[idx_for(r.story.id)] or 0) > 0,
+            sort_key=_discussion_sort_key,
+            slot_limit=DISCUSSION_DISCOVERY_ARCHIVE_SLOTS,
+            age="archive",
+        ),
+        DiscoveryPass(
+            name="high-engagement-recent",
             attr="is_high_engagement",
-            predicate=lambda r: cand_scores[idx_for(r.story.id)]
-            >= engagement_thresholds[idx_for(r.story.id)],
+            predicate=lambda r: True,
             sort_key=_engagement_sort_key,
-            slot_limit=POPULARITY_DISCOVERY_SLOT_LIMIT,
+            slot_limit=HIGH_ENGAGEMENT_DISCOVERY_RECENT_SLOTS,
+            age="recent",
+        ),
+        DiscoveryPass(
+            name="high-engagement-archive",
+            attr="is_high_engagement",
+            predicate=lambda r: True,
+            sort_key=_engagement_sort_key,
+            slot_limit=HIGH_ENGAGEMENT_DISCOVERY_ARCHIVE_SLOTS,
+            age="archive",
         ),
         DiscoveryPass(
             name="hot",
@@ -2357,7 +2348,7 @@ def rerank_candidates(
             and cand_velocities[idx_for(r.story.id)] > 0
             and r.story.score >= HOT_MIN_SCORE,
             sort_key=_hot_sort_key,
-            slot_limit=POPULARITY_DISCOVERY_SLOT_LIMIT,
+            slot_limit=HOT_DISCOVERY_SLOT_LIMIT,
         ),
         DiscoveryPass(
             name="non-hn",
@@ -2396,15 +2387,65 @@ def rerank_candidates(
             r for r in remaining_decorated if r.story.id not in selected_ids
         ]
 
-    # Ensure is_non_hn and is_recent are correct for all items. Discovery
-    # passes do not write these — the archive-top pass has attr=None, and
-    # is_recent is derived from the story's `time` regardless of which pass
-    # surfaced it. `int(now_ts)` is used so the 30d cutoff is an integer
-    # second, matching the storage format of `story.time`.
-    recent_cutoff = int(now_ts) - 30 * 86400
+    # Re-attribute every story in the *complete* `final` (primary-ranked +
+    # all discovery-pass additions) with the per-bucket percentile
+    # thresholds. This is the "Enrichment" half of the Floor+Enrichment
+    # model: the per-cohort top-3 discovery passes above guarantee a floor
+    # of `slot_limit` badged stories per cohort, and this re-attribution
+    # also badges any story (esp. the 12 archive-top stories surfaced with
+    # attr=None) that clears the cohort's quality bar.
+    #
+    # Stories stay stackable: a story surfaced by a discovery pass keeps
+    # the pass-specific badge AND gains any other badge it qualifies for
+    # here (so archive-top's 12 high-score archive stories earn 🏆 Top,
+    # and if they have lots of comments, 💬 Talk-worthy, etc.).
+    #
+    # `is_similar` is intentionally NOT set here: it is pass-only by design
+    # (the Similar badge signals "surfaced from outside primary because of
+    # high semantic match" rather than being a near-tautology on
+    # top-ranked stories). The similar-recent/archive passes already set
+    # it where it should appear.
     final = [
         replace(
             r,
+            is_uncertain=(
+                r.is_uncertain
+                or (
+                    r.prob_down is not None
+                    and get_entropy(r)
+                    >= uncertain_entropy_thresholds[story_id_to_idx[r.story.id]]
+                )
+            ),
+            is_novel=(
+                r.is_novel
+                or (
+                    cand_max_sim[story_id_to_idx[r.story.id]]
+                    <= sim_thresholds[story_id_to_idx[r.story.id]]
+                )
+            ),
+            is_discussion_rich=(
+                r.is_discussion_rich
+                or (
+                    cand_comment_counts[story_id_to_idx[r.story.id]]
+                    >= discussion_thresholds[story_id_to_idx[r.story.id]]
+                    and cand_comment_counts[story_id_to_idx[r.story.id]] > 0
+                )
+            ),
+            is_high_engagement=(
+                r.is_high_engagement
+                or (
+                    cand_scores[story_id_to_idx[r.story.id]]
+                    >= engagement_thresholds[story_id_to_idx[r.story.id]]
+                )
+            ),
+            is_hot=(
+                r.is_hot
+                or (
+                    cand_velocities[story_id_to_idx[r.story.id]] >= hot_threshold
+                    and cand_velocities[story_id_to_idx[r.story.id]] > 0
+                    and r.story.score >= HOT_MIN_SCORE
+                )
+            ),
             is_non_hn=(not is_hn_source(r.story.source)),
             is_recent=(r.story.time >= recent_cutoff),
         )

@@ -2144,7 +2144,20 @@ def test_tier3_pure_at_80_each(db: Database, embedder: Embedder) -> None:
 def test_top_badge_threshold_uses_config_percentile_and_floor(
     db: Database, embedder: Embedder
 ) -> None:
-    """is_high_engagement respects top_badge_percentile and top_badge_min_score."""
+    """is_high_engagement respects top_badge_percentile and top_badge_min_score.
+
+    With the Floor+Enrichment model, the badge is set by either:
+    (a) the high-engagement-recent discovery pass (top-3 by score in the
+        recent cohort from ``remaining_decorated``), or
+    (b) the post-discovery enrichment re-check against the per-bucket
+        percentile threshold (with the absolute floor).
+    This test verifies the threshold mechanic in (b): the percentile and
+    floor still gate which primary-ranked stories receive the badge, and
+    stories above the threshold are badged while the one just below is not.
+    The pass contribution (a) adds additional badged stories from the
+    remaining pool; the test asserts that the enrichment set is present
+    and the not-enriched boundary story is excluded.
+    """
     config = Config(count=40)
     now = int(time.time())
     candidates = [
@@ -2172,11 +2185,16 @@ def test_top_badge_threshold_uses_config_percentile_and_floor(
     assert 19 in engaged_ids, (
         f"200-pt story should be high-engagement at p90, got ids={engaged_ids}"
     )
+    # The 180-pt story (id=17) is just below the p90 threshold (181) and
+    # must NOT be badged by enrichment. The high-engagement-recent pass
+    # (top-3 by score in the remaining pool) may or may not surface id=17
+    # depending on the rerank order; we only assert it is not badged via
+    # the enrichment threshold, so this assertion is strict.
     assert 17 not in engaged_ids, (
         "180-pt story should NOT be high-engagement at p90 (below 181)"
     )
-    n_engaged = len(engaged_ids)
-    assert n_engaged == 2, f"Expected 2 high-engagement at p90, got {n_engaged}"
+    # The enrichment set (ids 18, 19) must be a subset of the badged set.
+    assert {18, 19} <= engaged_ids
 
     # 50th pct + min 100: threshold = max(105, 100) = 105
     config2 = Config(
@@ -2185,12 +2203,13 @@ def test_top_badge_threshold_uses_config_percentile_and_floor(
     )
     ranked2 = rerank_candidates(db, config2, embedder, candidates, cand_embs)
     engaged2 = {r.story.id for r in ranked2 if r.is_high_engagement}
-    # Stories with score >= 110 (ids 10..19): 10 stories
+    # Stories with score >= 110 (ids 10..19): these are the enrichment set
+    # (score 100 → id=9 is below the threshold 105).
     assert 10 in engaged2, f"110-pt story should be high-engagement, got ids={engaged2}"
     assert 9 not in engaged2, "100-pt story should NOT be high-engagement"
-    assert len(engaged2) == 10, (
-        f"Expected 10 high-engagement at p50+min100, got {len(engaged2)}"
-    )
+    # Every id with score >= 110 must be badged (enrichment covers them
+    # all since they are in the primary ranked set).
+    assert {10, 11, 12, 13, 14, 15, 16, 17, 18, 19} <= engaged2
 
     # 50th pct + min 120: threshold = max(105, 120) = 120
     config3 = Config(
@@ -2199,25 +2218,33 @@ def test_top_badge_threshold_uses_config_percentile_and_floor(
     )
     ranked3 = rerank_candidates(db, config3, embedder, candidates, cand_embs)
     engaged3 = {r.story.id for r in ranked3 if r.is_high_engagement}
-    # Stories with score >= 120 (ids 11..19): 9 stories
+    # Stories with score >= 120 (ids 11..19): the enrichment set.
     assert 11 in engaged3
     assert 10 not in engaged3, "110-pt story should NOT be high-engagement at min 120"
-    assert len(engaged3) == 9, (
-        f"Expected 9 high-engagement at p50+min120, got {len(engaged3)}"
-    )
+    assert {11, 12, 13, 14, 15, 16, 17, 18, 19} <= engaged3
 
 
 def test_discussion_badge_threshold_uses_config_percentile_and_floor(
     db: Database, embedder: Embedder
 ) -> None:
-    """is_discussion_rich respects discussion_badge_percentile and discussion_badge_min_comments."""
+    """is_discussion_rich respects discussion_badge_percentile and discussion_badge_min_comments.
+
+    With the Floor+Enrichment model, the badge is set by either:
+    (a) the discussion-recent discovery pass (top-3 by comment_count in the
+        recent cohort from ``remaining_decorated``), or
+    (b) the post-discovery enrichment re-check against the per-bucket
+        percentile threshold (with the absolute floor).
+    This test verifies the threshold mechanic in (b): the percentile and
+    floor still gate which stories receive the enrichment badge, and the
+    boundary story just below the threshold is excluded.
+    """
     config = Config(count=40)
     now = int(time.time())
     # 20 stories, comment counts 10..200 (step 10), ordered so the highest-cc
     # candidates are at the start of the list. Stable sort by tier-blend score
     # preserves input order (all scores are equal), so the high-cc stories end
     # up in the primary ranked set (limit=12) where the discussion-rich badge
-    # is applied via primary attribution.
+    # is applied via enrichment.
     cc_values = list(range(10, 210, 10))  # [10, 20, ..., 200]
     candidates = [
         Story(
@@ -2248,8 +2275,7 @@ def test_discussion_badge_threshold_uses_config_percentile_and_floor(
     assert 2 not in rich_ids, (
         "180-cc story should NOT be discussion-rich at p90 (below 181)"
     )
-    n_rich = len(rich_ids)
-    assert n_rich == 2, f"Expected 2 discussion-rich at p90+min0, got {n_rich}"
+    assert {0, 1} <= rich_ids
 
     # 50th pct + min 100: threshold = max(105, 100) = 105
     config2 = Config(
@@ -2260,13 +2286,12 @@ def test_discussion_badge_threshold_uses_config_percentile_and_floor(
     )
     ranked2 = rerank_candidates(db, config2, embedder, candidates, cand_embs)
     rich2 = {r.story.id for r in ranked2 if r.is_discussion_rich}
-    # Stories with cc >= 110: ids 0..9 (10 stories)
+    # Stories with cc >= 110: ids 0..9 (10 stories) — enrichment covers all
+    # of them since they are in the primary ranked set.
     assert 0 in rich2, f"200-cc story should be discussion-rich, got ids={rich2}"
     assert 9 in rich2, f"110-cc story should be discussion-rich, got ids={rich2}"
     assert 10 not in rich2, "100-cc story should NOT be discussion-rich"
-    assert len(rich2) == 10, (
-        f"Expected 10 discussion-rich at p50+min100, got {len(rich2)}"
-    )
+    assert set(range(0, 10)) <= rich2
 
     # 50th pct + min 120: threshold = max(105, 120) = 120
     config3 = Config(
@@ -2281,9 +2306,7 @@ def test_discussion_badge_threshold_uses_config_percentile_and_floor(
     assert 0 in rich3
     assert 8 in rich3
     assert 9 not in rich3, "110-cc story should NOT be discussion-rich at min 120"
-    assert len(rich3) == 9, (
-        f"Expected 9 discussion-rich at p50+min120, got {len(rich3)}"
-    )
+    assert set(range(0, 9)) <= rich3
 
 
 def test_badge_thresholds_computed_per_age_bucket(
@@ -2490,6 +2513,259 @@ def test_novel_archive_pass_surfaces_archive_novel(
         )
         assert not by_id[aid].is_recent, (
             f"Archive novel id={aid} should be is_recent=False"
+        )
+
+
+def test_each_badge_floored_at_three_per_cohort(
+    db: Database, embedder: Embedder
+) -> None:
+    """Every non-Hot badge must appear >=3 times in recent AND >=3 times
+    in archive of the final deck (the user's explicit "at least (3,3)
+    for each" expectation).
+
+    The Floor+Enrichment model guarantees this via per-cohort top-3
+    discovery passes (the "Floor") plus a post-discovery enrichment
+    re-check (the "Enrichment") that adds more on large pools. Hot
+    stays global by design and is not asserted here.
+
+    Pool sizing: 30 recent + 30 archive is the minimum safe cohort size
+    for the structural floor to hold under any primary-rerank
+    distribution. With ``primary_limit=12`` and 5 per-cohort passes
+    consuming up to 12 candidates, the worst case (primary takes 12
+    from one cohort) leaves ``30 - 12 = 18`` in that cohort, and
+    ``18 - 12 (4 earlier passes) = 6`` for the last pass
+    (high-engagement-recent) — still enough to fill its 3-slot cap.
+
+    Feedback: 20 ups and 20 downs on two distinct stories so the SVM
+    fits (it requires both ``n_up >= min_up_for_svm=20`` and
+    ``n_down >= min_down_for_svm=20``) and ``predict_proba`` returns
+    varied probabilities, which drives the entropy signal for the
+    Unsure badge and the Similar/Novel similarity signal.
+    """
+    config = Config(count=40)
+    user = db.create_user("test_each_badge_floor")
+
+    # Feedback: 20 DISTINCT upvoted stories, 20 DISTINCT downvoted,
+    # 20 DISTINCT neutral. The feedback table has a UNIQUE
+    # (user_id, story_id, action) constraint, so 20 votes of the same
+    # story collapse to 1 row. The SVM requires ``n_up >= 20`` and
+    # ``n_down >= 20`` distinct stories to fit and produce
+    # ``predict_proba`` output (which drives the entropy signal for
+    # is_uncertain). With 60 distinct feedback stories across 3 classes,
+    # candidates near the decision boundary get high entropy and the
+    # per-cohort top-3 Unsure pass surfaces ≥3 in each cohort.
+    for i in range(20):
+        db.upsert_story(
+            Story(
+                id=800 + i,
+                title=f"fb_up_{i}",
+                url=None,
+                score=10,
+                time=0,
+                text_content=(
+                    f"liked story number {i} about programming and "
+                    f"software engineering topic {chr(97 + (i % 26))}"
+                ),
+            )
+        )
+        db.upsert_feedback(user.id, 800 + i, "up")
+    for i in range(20):
+        db.upsert_story(
+            Story(
+                id=840 + i,
+                title=f"fb_down_{i}",
+                url=None,
+                score=10,
+                time=0,
+                text_content=(
+                    f"disliked story number {i} about cooking and "
+                    f"kitchen topic {chr(65 + (i % 26))}"
+                ),
+            )
+        )
+        db.upsert_feedback(user.id, 840 + i, "down")
+    for i in range(20):
+        db.upsert_story(
+            Story(
+                id=880 + i,
+                title=f"fb_neutral_{i}",
+                url=None,
+                score=10,
+                time=0,
+                text_content=(
+                    f"neutral story number {i} about travel and "
+                    f"tourism topic {chr(48 + (i % 10))}"
+                ),
+            )
+        )
+        db.upsert_feedback(user.id, 880 + i, "neutral")
+
+    now = int(time.time())
+    candidates: list[Story] = []
+    # 30 recent (3d old), distinct texts, scores 100..390, cc 20..165.
+    for i in range(30):
+        candidates.append(
+            Story(
+                id=i,
+                title=f"Recent {i}",
+                url=None,
+                score=100 + i * 10,
+                time=now - 3 * 86400,
+                text_content=(
+                    f"recent topic about number {i} and theme "
+                    f"{chr(97 + (i % 26))}{chr(65 + ((i * 7) % 26))}"
+                ),
+                source="hn",
+                comment_count=20 + i * 5,
+            )
+        )
+    # 30 archive (90d old), distinct texts, scores 500..1950, cc 200..780.
+    for i in range(30):
+        candidates.append(
+            Story(
+                id=100 + i,
+                title=f"Archive {i}",
+                url=None,
+                score=500 + i * 50,
+                time=now - 90 * 86400,
+                text_content=(
+                    f"archive topic about subject {i} and angle "
+                    f"{chr(65 + (i % 26))}{chr(97 + ((i * 11) % 26))}"
+                ),
+                source="ch_seed",
+                comment_count=200 + i * 20,
+            )
+        )
+
+    cand_embs = embedder.encode([s.text_content for s in candidates])
+    ranked = rerank_candidates(
+        db, config, embedder, candidates, cand_embs, user_id=user.id
+    )
+
+    recent = [r for r in ranked if r.is_recent]
+    archive = [r for r in ranked if not r.is_recent]
+    # Both cohorts must remain after primary rerank + all 5 per-cohort
+    # passes consume their 3-slot caps. The 30-per-cohort size is the
+    # floor that guarantees this.
+    assert len(recent) >= 3, f"recent cohort too small in final: {len(recent)}"
+    assert len(archive) >= 3, f"archive cohort too small in final: {len(archive)}"
+
+    for attr in (
+        "is_high_engagement",
+        "is_discussion_rich",
+        "is_novel",
+        "is_similar",
+        "is_uncertain",
+    ):
+        n_recent = sum(1 for r in recent if getattr(r, attr))
+        n_archive = sum(1 for r in archive if getattr(r, attr))
+        assert n_recent >= 3, f"{attr} must appear >=3 times in recent (got {n_recent})"
+        assert n_archive >= 3, (
+            f"{attr} must appear >=3 times in archive (got {n_archive})"
+        )
+
+
+def test_archive_top_stories_get_stackable_badges(
+    db: Database, embedder: Embedder
+) -> None:
+    """Archive-top's 12 high-score archive stories (surfaced with attr=None)
+    enter `final` and earn is_high_engagement via the post-discovery
+    enrichment re-attribution (Change A), proving badges are stackable
+    across the complete final.
+
+    The 12 archive-top stories are the 12 highest-score archive
+    candidates. The number of archive-top stories whose score exceeds
+    the archive p90 threshold (and so receive is_high_engagement via
+    enrichment) is approximately ``0.1 × N_archive``. With 30 archive
+    candidates, the top-3 archive-top (scores 2900/3000/3100) all
+    exceed the interpolated p90 ≈ 2810, so they reliably receive
+    is_high_engagement through the post-discovery re-attribution.
+
+    This test asserts:
+    - All 12 archive-top stories are in `final` (archive-top slot cap).
+    - The top-3-by-score archive-top are `is_high_engagement`, proving
+      the post-discovery enrichment badges archive-top's attr=None stories.
+    """
+    config = Config(count=40)
+    user = db.create_user("test_archive_top_stackable")
+
+    db.upsert_story(
+        Story(id=900, title="fb", url=None, score=10, time=0, text_content="x")
+    )
+    db.upsert_feedback(user.id, 900, "up")
+
+    now = int(time.time())
+    candidates: list[Story] = []
+    # 30 archive: 12 archive-top (high score) + 18 fillers (low score).
+    # The 18 fillers (scores 10..180) sit below the top-12 and pull
+    # the archive p90 down to ~2810, so the top-3 archive-top
+    # (209=2900, 210=3000, 211=3100) exceed it and get enriched.
+    for i in range(12):
+        candidates.append(
+            Story(
+                id=200 + i,
+                title=f"ATop {i}",
+                url=None,
+                score=2000 + i * 100,  # 2000..3100
+                time=now - 60 * 86400,
+                text_content=f"top archive story {i}",
+                source="ch_seed",
+                comment_count=100 + i * 10,
+            )
+        )
+    for i in range(18):
+        candidates.append(
+            Story(
+                id=400 + i,
+                title=f"AFill {i}",
+                url=None,
+                score=10 + i * 10,  # 10..180
+                time=now - 60 * 86400,
+                text_content=f"archive filler {i}",
+                source="ch_seed",
+                comment_count=2,
+            )
+        )
+    for i in range(6):
+        candidates.append(
+            Story(
+                id=300 + i,
+                title=f"Recent {i}",
+                url=None,
+                score=50,
+                time=now - 86400,
+                text_content=f"recent filler {i}",
+                source="hn",
+                comment_count=5,
+            )
+        )
+
+    cand_embs = embedder.encode([s.text_content for s in candidates])
+    ranked = rerank_candidates(
+        db, config, embedder, candidates, cand_embs, user_id=user.id
+    )
+    by_id = {r.story.id: r for r in ranked}
+
+    # All 12 archive-top stories should be in final (archive-top slot cap=12).
+    for i in range(12):
+        aid = 200 + i
+        assert aid in by_id, (
+            f"archive-top story id={aid} should be in final (slot cap=12)"
+        )
+        assert not by_id[aid].is_recent, (
+            f"archive-top story id={aid} should be is_recent=False"
+        )
+
+    # The top-3-by-score archive-top exceed the archive p90 (≈2810 in
+    # this 30-archive pool) and must receive is_high_engagement via
+    # the post-discovery enrichment, proving stackable re-attribution
+    # works for the archive-top pass's attr=None stories.
+    for aid in (209, 210, 211):
+        assert by_id[aid].is_high_engagement, (
+            f"archive-top top-by-score id={aid} "
+            f"(score={by_id[aid].story.score}) should be is_high_engagement "
+            f"via post-discovery enrichment; got "
+            f"is_high_engagement={by_id[aid].is_high_engagement}"
         )
 
 
@@ -3316,11 +3592,18 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
     distance ranking keeps it; a score-blended ranking would have
     dropped it for a higher-score story at the bottom of the distance
     ranking.
+
+    Note: with the Floor+Enrichment model, the highest-score extra (id=16)
+    may still enter `final` via the high-engagement-recent pass (top-3 by
+    score in the recent cohort) and could receive is_novel from the
+    post-discovery enrichment (primary-attribution re-check). To test
+    the novel pass's distance-only property cleanly, we use a tight
+    ``novel_badge_percentile=10`` so enrichment does NOT badge id=16,
+    isolating the novel pass's contribution to ``is_novel``.
     """
-    # Higher novel_badge_percentile → larger pool → slot cap cuts.
     config = Config(
         count=40,
-        model=ModelConfig(novel_badge_percentile=60.0),
+        model=ModelConfig(novel_badge_percentile=10.0),
     )
     user = db.create_user("test_novel_distance")
 
@@ -3412,12 +3695,20 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
         f"extra-slot (3rd by distance); got is_novel={by_id[14].is_novel}"
     )
     # id=16 is the 5th-by-distance (sim=0.25, dist=0.75, score=50). The
-    # novel-recent pass cuts at K=NOVEL_DISCOVERY_RECENT_SLOTS, so this
-    # one is dropped despite having the highest score of the pool —
-    # demonstrating pure-distance ranking (score is not blended in).
-    assert 16 not in by_id, (
-        "id=16 (cut by novel-recent pass despite highest score in pool) "
-        "should not be in final result"
+    # novel-recent pass cuts at K=NOVEL_DISCOVERY_RECENT_SLOTS, so the
+    # novel pass does not badge it — demonstrating pure-distance ranking
+    # (score is not blended in for the Novel badge). id=16 may still
+    # enter `final` via the high-engagement-recent pass (top-3 by score
+    # in the recent cohort); with the tight percentile used here, the
+    # enrichment does not add is_novel to it.
+    assert not by_id[16].is_novel, (
+        f"id=16 (5th by distance) must NOT have is_novel — novel pass ranks "
+        f"by distance, not score; got is_novel={by_id[16].is_novel}"
+    )
+    assert by_id[16].is_high_engagement, (
+        f"id=16 (highest-score extra, score=50) should be surfaced by the "
+        f"high-engagement-recent pass (top-3 by score in recent cohort); "
+        f"got is_high_engagement={by_id[16].is_high_engagement}"
     )
 
 

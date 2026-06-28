@@ -5,6 +5,242 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-28 — Floor + Enrichment badge model (per-cohort top-3, post-discovery re-attribution, top-3-by-rank for all non-Hot)
+
+Built on the per-bucket thresholds introduced earlier today. The user
+expects **at least (3,3) — three of each badge in Recent AND three in
+Archive — for 🏆💬✨🎯🤔**, with 🔥 Hot staying global (archive has no
+🔥 by velocity definition). The prior per-bucket-threshold split only
+got us to 🏆(5,0) 💬(2,6) ✨(3,3) 🎯(1,3) 🤔(3,0) 🔥(1,0) on the
+diagnostic. Three structural problems remained.
+
+**Root causes (confirmed by reading the code).**
+
+1. 🏆 **archive = 0** — the primary-attribution block ran *before* the
+   discovery loop on the primary-ranked `final` only. The 12
+   `archive-top` stories (surfaced with `attr=None`) entered `final`
+   after that block ran, so they never got primary attribution. The
+   only path to archive 🏆 was the (un-emitted at the time) enrichment.
+
+2. 💬 **recent = 2** — the `discussion-rich` pass was `age=None` with
+   5 slots sorted by comment_count desc. Archive (older, accumulated
+   comments) dominated all 5 slots; recent 💬 only came from primary
+   attribution (2 stories). No age split, mirroring what novel/similar/
+   uncertain had.
+
+3. 🤔 **archive = 0** — *the uncertain-archive pass did not exist*.
+   `discovery_passes` had `uncertain-recent` (3 slots) but no
+   `uncertain-archive` despite the `UNCERTAIN_DISCOVERY_ARCHIVE_SLOTS`
+   constant being defined. The earlier session's WORKLOG claimed the
+   split shipped; it hadn't. (Worse, the constant was 2, not 3, for
+   parity.) 🎯 recent = 1 was the same shape — a hard p97
+   `similar_thresholds` predicate on a 60-recent pool that primary
+   ranking then consumed.
+
+**Decisions locked in.**
+
+- **Top-3-by-rank for all 5 non-Hot badges.** The user explicitly chose
+  "Fill top-3 by rank per cohort" for the Similar pass and extended it
+  to every non-Hot badge: each per-cohort pass takes the top 3 by
+  the badge metric, no hard absolute-threshold gate. Guarantees ≥(3,3)
+  on any cohort with ≥3 remaining candidates.
+- **🔥 Hot in archive: nothing.** Archive never renders 🔥; the
+  `data-sort-popular` filter OR-s `is_high_engagement OR is_discussion_rich
+  OR is_hot`, so Popular still works in archive via 🏆/💬.
+
+**The Floor + Enrichment model.**
+
+- **Floor (per-cohort top-3 passes).** Each of the 5 non-Hot badges
+  gets a recent + archive discovery pass with `slot_limit=3`. Pass
+  predicates reduced to trivial membership (`prob_down is not None` for
+  🤔, `comment_count > 0` for 💬, `True` for the rest) so the pass
+  always fills 3 when the cohort has ≥3 remaining. This is the
+  guaranteed floor of 3 per cohort per badge.
+- **Enrichment (post-discovery re-attribution, OR with existing).** The
+  per-bucket percentile threshold check now runs over the *complete*
+  `final` (primary + all discovery-pass additions) and OR-s into the
+  pass-set badge: `is_X = r.is_X or (threshold_predicate)`. The OR
+  preserves the floor (a story badged by a pass keeps the badge even
+  if the enrichment threshold excludes it) while letting the enrichment
+  add 🏆/💬/✨/🤔 to any story in the complete final that clears the
+  cohort's quality bar. The 12 archive-top stories (high-score by
+  construction) now earn 🏆 and 💬 via enrichment. `is_similar` stays
+  pass-only by existing design.
+
+**What shipped in `pipeline.py`.**
+
+- Added the missing `uncertain-archive` pass; bumped
+  `UNCERTAIN_DISCOVERY_ARCHIVE_SLOTS` 2→3.
+- Split `discussion-rich` (5, age=None) → `discussion-recent` (3) +
+  `discussion-archive` (3).
+- Split `high-engagement` (8, age=None) → `high-engagement-recent` (3) +
+  `high-engagement-archive` (3).
+- Dropped the hard predicates on every non-Hot pass; the per-bucket
+  `engagement_thresholds` / `discussion_thresholds` / `sim_thresholds` /
+  `uncertain_entropy_thresholds` arrays now feed the Enrichment phase
+  only.
+- Removed the now-dead `similar_thresholds` computation (the similar
+  pass is rank-only and is_similar is excluded from Enrichment).
+  `similar_badge_percentile` is left in `ModelConfig` for backwards
+  compat with `config.toml` but no longer read at runtime.
+- Moved the primary-attribution block from before the discovery loop
+  to after it, merged with the `is_non_hn`/`is_recent` re-attribution,
+  and rewrote each badge line as `r.is_X or (predicate)`.
+- Removed the old `DISCOVERY_SLOT_LIMIT` and `POPULARITY_DISCOVERY_SLOT_LIMIT`
+  constants (no remaining users); added `HOT_DISCOVERY_SLOT_LIMIT`.
+
+**Test changes.**
+
+- `test_novel_pass_ranks_purely_by_distance_not_score`: switched to
+  `novel_badge_percentile=10` (tight) so the Enrichment doesn't badge
+  id=16. Assertion moved to the badge (`by_id[14].is_novel`,
+  `not by_id[16].is_novel`, `by_id[16].is_high_engagement`) since the
+  new high-engagement-recent pass legitimately surfaces id=16.
+- `test_top_badge_threshold_uses_config_percentile_and_floor` and
+  `test_discussion_badge_threshold_uses_config_percentile_and_floor`:
+  dropped the exact-count assertions (which assumed the old
+  single-mechanism model) and replaced with enrichment-set subset
+  assertions plus the strict not-enriched boundary checks. The
+  percentile+floor mechanic is still asserted; the pass contribution
+  is acknowledged as additional.
+- New `test_each_badge_floored_at_three_per_cohort` — 30 recent +
+  30 archive + 20 distinct upvoted + 20 distinct downvoted + 20
+  distinct neutral feedback stories (the SVM requires both
+  `n_up >= 20` and `n_down >= 20` to fit and emit `predict_proba`,
+  and the feedback table has a UNIQUE(user_id, story_id, action)
+  constraint so 20 votes of the same story collapse to one row).
+  Asserts all 5 non-Hot badges ≥3 in each cohort.
+- New `test_archive_top_stories_get_stackable_badges` — 12 archive-top
+  + 18 archive fillers + 6 recent (30 archive total so the top-3
+  archive-top by score exceed the archive p90 and earn 🏆 via
+  Enrichment). Asserts all 12 archive-top are in `final` and the
+  top-3 by score (ids 209, 210, 211) are `is_high_engagement`,
+  proving the post-discovery Enrichment re-attributes archive-top's
+  `attr=None` stories.
+
+**Verification.**
+
+- `uv run pytest tests/ -n 4 -q --ignore=tests/test_dedup.py` →
+  **269 passed, 1 skipped**.
+- `uv run ruff check .` clean. `uv run ty check` clean.
+- `/tmp/diag_verify.py` on `/tmp/diag.db` (60 recent + 120 archive):
+
+  | Badge          | Recent | Archive |
+  | -------------- | -----: | ------: |
+  | 🏆 Top         |      7 |      15 |
+  | 💬 Talk-worthy |      5 |       7 |
+  | ✨ Novel       |      4 |       4 |
+  | 🎯 Similar     |      3 |       3 |
+  | 🤔 Unsure      |      4 |       5 |
+  | 🔥 Hot         |      1 |       0 |
+
+  All 5 non-Hot badges ≥(3,3); 🔥 (1,0) accepted per design.
+
+**Drive-by.** Removed 2 unused imports (`asyncio`, `time`) in
+`tests/test_reddit_limiter.py` to keep `ruff check .` clean.
+
+**Latent observation (not acted on).** The 5 per-recent passes share
+one `remaining_decorated` pool and compete in fixed order; the last
+pass (high-engagement-recent) can underfill on a very slow week with
+few recent stories, because the 4 earlier passes exhaust the pool.
+Fine on production data (60+ recent); flagged for future pass-order
+or sizing review if it ever shows up in a diagnostic.
+
+---
+
+## 2026-06-28 — Reddit RSS rate limiter (2s spacing + backoff + circuit breaker)
+
+Reddit's unauth IP rate limit is ~1 req / 2s. Two code paths hit Reddit
+every regen: `pipeline.fetch_rss_feeds` (50 subreddit topfeeds, serialized
+but with no spacing) and `server._fetch_reddit_rss_context` (50 per-story
+comments-RSS, also back-to-back). Neither path had 429 handling or
+backoff. Measured at the current state:
+
+  - 208 429s in 30 minutes (110 subreddit topfeeds, 99 per-story comments,
+    from `journalctl --since "30m ago" | grep "reddit.com" | grep "429"`)
+  - Almost every Reddit request in the cycle 429s eventually; regen
+    re-tries with no memory of the failure on the next cycle.
+
+**Fix.** New `reddit_limiter.py` (~75 lines) with a single shared
+`RedditRateLimiter` singleton consumed by both paths:
+
+  - **`INTER_REQUEST_DELAY = 2.0`**: `acquire()` blocks (via
+    `asyncio.sleep`) until the next allowed time. On success, next
+    allowed time = `now + 2.0`. On 429, = `now + backoff`.
+  - **Exponential backoff** `BACKOFF = (2, 4, 8, 16, 32, 60)` seconds,
+    capped at 60s. Index by `min(_consecutive_429 - 1, len(BACKOFF) - 1)`.
+  - **Retry-After honored** when present (server.py path only — the
+    pipeline.py topfeed path uses the backoff table since
+    `fetch_with_urllib_fallback` doesn't surface headers).
+  - **Circuit breaker** `MAX_CONSECUTIVE_429 = 3`: after 3 consecutive
+    429s, `acquire()` returns False immediately (no sleep) and the
+    caller's loop short-circuits. Remaining Reddit feeds this regen are
+    skipped; next regen the limiter resets.
+  - **State persists** across regen cycles (cumulative backoff intent).
+    Wiped on server restart.
+  - **One bucket for all of reddit.com** (IP-wide, not per-subreddit).
+
+**Call sites** (3 edits, all minimal):
+- `pipeline.py:fetch_and_parse` — on Reddit feed, `status == 429` →
+  `reddit_limiter.on_429()`; `status == 200` → `reddit_limiter.on_success()`.
+  Non-Reddit feeds unaffected.
+- `pipeline.py` Reddit serial loop (fetch_rss_feeds) — `await
+  reddit_limiter.acquire()` before each feed; break with INFO log on
+  `False`.
+- `pipeline.py:prewarm_reddit_top_stories` loop — `if
+  reddit_limiter.circuit_open: log+break` at top of each iteration.
+- `server.py:_fetch_reddit_rss_context` — `await reddit_limiter.acquire()`
+  pre-call; on 429, `reddit_limiter.on_429(_parse_retry_after(...))`.
+
+**Tests** (`tests/test_reddit_limiter.py`, 14 tests):
+- FakeClock + SleepRecorder fixtures — deterministic time control.
+- `acquire` returns True immediately on fresh state; waits
+  `INTER_REQUEST_DELAY` after `on_success`.
+- `on_429` uses BACKOFF table (2/4/8/16/32/60s).
+- `on_429` honors `retry_after`; ignores 0/None.
+- 7th and 20th consecutive 429 cap at 60s.
+- Circuit opens after `MAX_CONSECUTIVE_429`; `acquire` returns False
+  without sleeping.
+- `on_success` resets counter; `reset()` clears all state.
+- Circuit reopens after `reset`; sequential acquire+on_success cycles
+  enforce 2s spacing each.
+- Instance attributes are patchable (test override pattern).
+
+**Test infrastructure** (`tests/conftest.py`, new):
+- Autouse `reset_reddit_limiter` fixture calls `reddit_limiter.reset()`
+  before and after every test in the suite. Prevents pollution between
+  tests (e.g. a 429 in one test shouldn't propagate).
+- The two `fetch_rss_feeds` tests in `tests/test_pipeline.py` set
+  `pipeline.reddit_limiter.INTER_REQUEST_DELAY = 0.0` so they run
+  fast (otherwise the 2 Reddit feeds × 2s = 4s real sleep would
+  slow the test suite noticeably).
+
+**Verification**:
+- `uv run pytest tests/test_reddit_limiter.py -n 4` → 14 pass.
+- `uv run pytest tests/ -n 4` → 307 pass, 1 skip (torch).
+- `uv run ruff check .` clean.
+- `uv run ty check` 0 new diagnostics.
+- Server restarted; live journal shows the new WARNING line
+  `reddit_limiter 429 consecutive=N next_delay=Ns` if a 429 lands.
+
+**Trade-off**: ~100s added per regen (50 feeds × 2s). Within the 3h
+cycle budget. If regen cadence is later increased, drop
+`INTER_REQUEST_DELAY` to 1.0s or add a 1h parsed-feed cache as a
+separate optimization.
+
+**Files**:
+- `reddit_limiter.py` (new, ~75 lines)
+- `tests/test_reddit_limiter.py` (new, 14 tests)
+- `tests/conftest.py` (new, autouse fixture)
+- `tests/test_pipeline.py` (2 fetch tests set `INTER_REQUEST_DELAY=0.0`)
+- `pipeline.py` (import, fetch_and_parse on_429/on_success, Reddit loop
+  acquire+break, prewarm loop circuit_open check)
+- `server.py` (import, _fetch_reddit_rss_context acquire + on_429/on_success)
+- `ARCHITECTURE.md` §3.4.2 "Reddit RSS rate limiting"
+- This WORKLOG entry.
+
+---
+
 ## 2026-06-28 — Per-age-bucket badge thresholds + age-split discovery passes
 
 Fixed two related bugs surfaced by the Sort×Age UX:
