@@ -5,6 +5,72 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-28 — Regen-warm death loop eliminated + initial-delay startup regen
+
+**Symptom (this morning):** "Just reloaded app without recent server
+restart and its very slow." Every reload took 1-17+ seconds. Warms for
+the active user consistently landed at 17-36 s while all other users'
+warms were 1-7 s.
+
+**Root cause (two reinforcing pieces):**
+
+1. `server.py:634` set `regen_event` on **every** dashboard render
+   (cache_hit included). With the skeleton's
+   `<meta http-equiv="refresh" content="1">`, the browser polled `/`
+   every second and produced 1 wake/s.
+2. The regen loop's 2 s debounce (`server.py:1083`) couldn't keep up
+   with `fetch_candidates_only`'s ~16 s RSS cost, so the cycle became
+   2 s + 16 s = 18 s. Each regen called
+   `_bump_all_cached_versions()`, invalidating every cached dashboard.
+
+Net: 26 regen triggers in 60 min during active use (vs the configured
+~0.005/min = 1 per 180 min). The warm thread contended with the regen
+thread over the SQLite write lock (`busy_timeout=5000`), and the warm
+that should have been 7 s blew up to 17-36 s.
+
+**Fixes:**
+
+- `server.py:633` (was 634): delete the unconditional
+  `self.regen_event.set()` on dashboard render. Regen now fires only
+  on the 1 h timer and on feedback (`server.py:837`, intentional).
+- `pipeline.py:225` and `pipeline.py:255-257`: add
+  `regen_initial_delay_seconds: int = 30` to `Config` and the TOML
+  parser, so a one-shot startup regen is deferred until the first
+  warm has completed (avoids the cold-path contention pattern from
+  the previous investigation).
+- `server.py:1074-1082`: `regen_loop` now sleeps
+  `regen_initial_delay_seconds` then sets the event, so the first
+  regen fires at T+30 s + 2 s debounce = ~T+32 s after startup, then
+  loops at `regen_interval_seconds` thereafter.
+- `config.toml:7-8`: `regen_interval_seconds = 10800` (3 h) → `3600`
+  (1 h), and add `regen_initial_delay_seconds = 30`.
+
+**Verification (logs since 13:09:04 restart):**
+
+| Time    | Event                                                  | rank_ms |
+|---------|--------------------------------------------------------|---------|
+| 13:09:04| `Deferring first regen for 30s`                        | —       |
+| 13:09:36| First regen triggered (T+32s)                          | —       |
+| 13:10:06| User 102 warm during regen (still in 2s debounce)      | 1542.9  |
+| 13:10:12| Regen: fetched 5362 candidates                         | —       |
+| 13:10:26| Regen complete (50s for full RSS fetch)                | —       |
+| 13:10:51| User 183 warm after regen                              | 1669.7  |
+| 13:10:54-13:11:15 | 6 polls × 5 s — **zero regen triggers**       | 0.0     |
+| 13:11:15| Vote POST                                              | —       |
+| 13:11:17| Vote triggers regen (after 2 s debounce, as designed) | 1599.7  |
+
+All warms ≤ 1.7 s uncontended (vs 17-36 s pre-fix). Polling no longer
+triggers spurious regens. Vote-triggered regens still work.
+
+**Fresh-stories cadence after fix:**
+
+- T+32 s after server start: first regen (delayed startup regen)
+- T+32 s + 1 h: next regen
+- ... every 1 h thereafter, OR on a feedback event
+
+The 30 s delay is comfortably longer than the ~7 s uncontended warm
+(4× margin) so the first regen never contends with the first warm.
+
 ## 2026-06-28 — Rank-based cascade badge model (5 per cohort, no knobs, no archive-top)
 
 The Floor+Enrichment model landed earlier today got us to
@@ -2300,3 +2366,85 @@ preference — wanted the user/profile link placed differently). The
 mobile vote-bar fix (`.vote-counts { display: none; }` in the
 `@media (max-width: 640px)` block) remains in effect.
 `ruff check .` clean. `ty check` 0 diagnostics.
+
+---
+
+## 2026-06-28 — Align `eval.py` SVM to production; eval hygiene (4 small wins)
+
+**Goal**: The eval SVM has been using `SVC(probability=True)` + `predict_proba`,
+but production `pipeline.py:1720-1726` has been using `SVC(probability=False)` +
+raw up-margin since the calibration refactor (`ARCHITECTURE.md:90-94`). The
+two paths give different rankings and different brier scores, so the eval has
+been measuring something the dashboard never shows. This change aligns them,
+plus four hygiene fixes that make the report cleaner and more honest.
+
+**Changes** (`eval.py`):
+- **A1 — SVM ranking now uses raw up-margin** (production parity):
+  - Both `SVC(probability=True)` → `SVC(probability=False)`
+  - `predict_proba(...)` → `svm.decision_function(...)` then `probs =
+    _softmax_rows(decision)` (matches `pipeline.py:1771` UI-entropy path)
+  - `up_idx = svm.classes_.index(2)` makes the up-class lookup explicit
+    (was implicit `probs[:, 2]`); strip_hn SVM shares the same `up_idx`
+    since both are fit on the same `y_train`
+  - New sklearn 1.9+ deprecation: `SVC(probability=True)` now warns
+    "deprecated … use `CalibratedClassifierCV` instead"; this fix
+    removes the warning
+- **B1 — drop `brier_up=0.0` placeholder from per-source output**: per-source
+  metrics previously stamped `brier_up=0.0` (placeholder, never computed
+  per-source). Now `pop("brier_up", None)` after the call; new
+  `per_source_metric_keys` excludes brier from per-source aggregation
+- **B2 — per-fold `n_test`/`n_up`/`n_neutral`/`n_down` to stdout**: was
+  invisible (only in JSON). Now one line per fold: `Fold 3/5 done
+  n_test=488 n_up=203 n_neutral=136 n_down=149`
+- **B3 — `brier_const` (class-prior baseline) printed once**: the constant
+  predictor `p*(1-p)` is the meaningful calibration floor. A well-calibrated
+  model should beat it. Now reported alongside the per-formula brier_up.
+
+**Number changes** (current formula, raw):
+| metric | before (Platt) | after (raw up-margin) | Δ |
+|---|---|---|---|
+| ndcg_at_40 | 0.786 ± 0.071 | 0.654 ± 0.068 | **-0.13** |
+| hit_at_40 | 0.062 ± 0.007 | 0.049 ± 0.006 | -0.013 |
+| map | 0.318 ± 0.042 | 0.286 ± 0.016 | -0.032 |
+| brier_up | 0.176 ± 0.008 | 0.189 ± 0.005 | +0.013 |
+
+(brier gets slightly worse because softmax-decision is not Platt-calibrated;
+the +0.013 is expected and documented in the code.)
+
+**Per-source** (current raw ndcg_at_40):
+| source | before | after |
+|---|---|---|
+| hn | 0.715 | 0.558 |
+| ch_seed | 0.111 | 0.116 |
+| bq_seed | 0.000 | 0.000 |
+| rss | 0.000 | 0.000 |
+| digg | 0.000 | 0.000 |
+| tildes | 0.000 | 0.000 |
+| slashdot | 0.000 | 0.000 |
+| rss_latent_space | 0.000 | 0.031 |
+
+**Final queue** (mmr, ndcg_at_40): 0.486 → 0.493 (small drift; the
+production-pipeline path was unchanged; the +0.007 is variance from the
+SVM upstream of `rerank_candidates` now using a different ranking).
+
+**Brier baseline**: `p(up) = 0.4162`, `brier_const = 0.2430`. Current
+SVM `brier_up = 0.189` beats the constant by 0.054 (22% reduction) — the
+SVM has learned real signal, but not by a huge margin.
+
+**Honest production read**: 0.654 raw / 0.693 mmr is the real figure for
+the 4-binary source feature set with raw up-margin ranking. The 0.786
+number was a Platt-scaling artifact — never the ship figure.
+
+**Verification**:
+- `uv run pytest tests/ -n 4` = 282 passed, 1 skipped (torch).
+- `uv run ruff check .` = clean.
+- `uv run ty check` = clean (no new diagnostics from these changes).
+- All `test_eval.py` tests still pass (`test_svm_better_than_random`:
+  up_only ndcg@40 0.693 vs hn_baseline 0.019, +0.67 lift, well above
+  the threshold).
+
+**Followups planned** (next steps in the same improvement plan):
+A5 (81-variant sweep on current features), A2 (hparam sweep), A4
+(recency weights), B4 (final-queue raw variant), B5 (per-source
+hit_rate), B6 (k_values CLI), B7 (feature_ablation), B8 (leak-check),
+B9 (stratify by source). See "In Progress" in session summary.

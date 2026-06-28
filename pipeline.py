@@ -222,6 +222,7 @@ class Config:
     onnx_model_dir: str = "onnx_model"
     server_port: int = 8765
     regen_interval_seconds: int = 10800
+    regen_initial_delay_seconds: int = 30
     regen_prewarm_top_n: int = 50
     reddit_prewarm_top_n: int = 20
     prewarm_hn_full: bool = True
@@ -253,6 +254,7 @@ class Config:
             onnx_model_dir=main_cfg.get("onnx_model_dir", "onnx_model"),
             server_port=main_cfg.get("server_port", 8765),
             regen_interval_seconds=main_cfg.get("regen_interval_seconds", 10800),
+            regen_initial_delay_seconds=main_cfg.get("regen_initial_delay_seconds", 30),
             regen_prewarm_top_n=main_cfg.get("regen_prewarm_top_n", 50),
             reddit_prewarm_top_n=main_cfg.get("reddit_prewarm_top_n", 20),
             prewarm_hn_full=main_cfg.get("prewarm_hn_full", True),

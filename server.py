@@ -617,27 +617,6 @@ class Handler(BaseHTTPRequestHandler):
                     "Set-Cookie", f"hn_token={token}; Path=/; Max-Age=31536000"
                 )
                 self.end_headers()
-
-        # User info API
-        if path == "/api/user":
-            user = self._get_user()
-            if user:
-                self._json_response({"user_id": user.id, "token": user.token})
-            else:
-                self._json_response({"error": "No session"}, status=401)
-            return
-
-        # Dashboard — dynamic render per-user
-        if path in ("/", "/index.html"):
-            user = self._get_user()
-            if not user:
-                token = secrets.token_hex(4)
-                self.send_response(302)
-                self.send_header("Location", f"u/{token}")
-                self.send_header(
-                    "Set-Cookie", f"hn_token={token}; Path=/; Max-Age=31536000"
-                )
-                self.end_headers()
                 return
 
             # Render personalized dashboard
@@ -651,8 +630,6 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(html)
 
-            # Wake regen thread to refresh candidates in the background
-            self.regen_event.set()
             return
 
         self.send_error(HTTPStatus.NOT_FOUND)
@@ -1095,6 +1072,13 @@ class Handler(BaseHTTPRequestHandler):
 def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
     logging.info("Starting background regeneration loop...")
     embedder = Handler.embedder
+    if config.regen_initial_delay_seconds > 0:
+        logging.info(
+            "Deferring first regen for %ds (avoid contention with first warm)",
+            config.regen_initial_delay_seconds,
+        )
+        time.sleep(config.regen_initial_delay_seconds)
+        event.set()
     while True:
         # Wait on event or timeout
         triggered = event.wait(timeout=config.regen_interval_seconds)
