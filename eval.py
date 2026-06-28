@@ -20,7 +20,6 @@ Writes eval_report.json (committed to git for tracking).
 import hashlib
 import json
 import math
-import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -31,13 +30,14 @@ from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
 
 from database import Database, Story
-from legacy_features import _augment_features
+from legacy_features import _augment_features  # noqa: F401  (deprecated 2026-06-28; use pipeline._svm_personalization_features)
 from pipeline import (
     Config,
     Embedder,
     RankedStory,
     _knn_similarity,
     _softmax_rows,
+    _svm_personalization_features,
     mmr_filter,
     rerank_candidates,
     story_embedding_text,
@@ -556,22 +556,11 @@ def main() -> None:
         )
 
     # Candidate features (age = now - story.time)
-    now = time.time()
-    cand_comment_counts = np.array([s.comment_count or 0 for s in candidates])
     cand_text_lengths = np.array([len(s.text_content) for s in candidates])
-    cand_ages_arr = np.array([now - max(s.time, 1) for s in candidates])
-    cand_scores_arr = np.array([s.score for s in candidates])
-    cand_quality_arr = cand_scores_arr / (np.maximum(cand_ages_arr / 3600.0, 0) + 1)
 
     # Feedback metadata (age = vote_time - story.time)
     fb_emb = cand_emb[fb_to_cand[valid]]
-    fb_scores_arr = np.array([s.score for s in fb_stories])[valid]
-    fb_ages_arr = np.array(
-        [float(vt) - max(s.time, 1) for vt, s in zip(fb_vote_times, fb_stories)]
-    )[valid]
-    fb_comment_counts_arr = np.array([s.comment_count or 0 for s in fb_stories])[valid]
     fb_text_lengths_arr = np.array([len(s.text_content) for s in fb_stories])[valid]
-    fb_quality_arr = fb_scores_arr / (np.maximum(fb_ages_arr / 3600.0, 0) + 1)
 
     cand_scores_array = np.array([s.score for s in candidates], dtype=np.float64)
     y = fb_labels[valid]
@@ -594,31 +583,15 @@ def main() -> None:
         fb_train_emb = fb_emb[train_pos]
         y_train = y[train_pos]
 
-        fb_train_scores = fb_scores_arr[train_pos]
-        fb_train_ages = fb_ages_arr[train_pos]
-        fb_train_comments = fb_comment_counts_arr[train_pos]
         fb_train_textlens = fb_text_lengths_arr[train_pos]
-        fb_train_quality = fb_quality_arr[train_pos]
         fb_train_stories = [fb_stories[idx] for idx in np.where(valid)[0][train_pos]]
-        fb_train_age_hours = fb_train_ages / 3600.0
-        fb_train_safe_h = np.maximum(fb_train_age_hours, 0.1)
-        fb_train_score_vel = fb_train_scores / fb_train_safe_h
-        fb_train_comment_vel = fb_train_comments / fb_train_safe_h
 
         # Exclude training story IDs from candidate pool to prevent leakage
         train_ids = {fb_stories[idx].id for idx in np.where(valid)[0][train_pos]}
         cand_mask = np.array([s.id not in train_ids for s in candidates])
         fold_candidates = [s for idx, s in enumerate(candidates) if cand_mask[idx]]
         fold_cand_emb = cand_emb[cand_mask]
-        fold_cand_scores = cand_scores_arr[cand_mask]
-        fold_cand_ages = cand_ages_arr[cand_mask]
-        fold_cand_comments = cand_comment_counts[cand_mask]
         fold_cand_textlens = cand_text_lengths[cand_mask]
-        fold_cand_quality = cand_quality_arr[cand_mask]
-        fold_cand_age_hours = fold_cand_ages / 3600.0
-        fold_cand_safe_h = np.maximum(fold_cand_age_hours, 0.1)
-        fold_cand_score_vel = fold_cand_scores / fold_cand_safe_h
-        fold_cand_comment_vel = fold_cand_comments / fold_cand_safe_h
         fold_cand_scores_array = cand_scores_array[cand_mask]
 
         # Per-fold personalization with LOOCV self-exclusion
@@ -694,51 +667,34 @@ def main() -> None:
         else:
             fb_closest_down = np.zeros(len(fb_train_emb))
 
-        fb_train_csr_ratio = fb_train_comments / np.maximum(fb_train_scores, 1)
-        fb_train_csr = np.clip(np.log1p(fb_train_csr_ratio), 0, 3.0) / 3.0
-
-        fold_cand_csr_ratio = fold_cand_comments / np.maximum(fold_cand_scores, 1)
-        fold_cand_csr = np.clip(np.log1p(fold_cand_csr_ratio), 0, 3.0) / 3.0
-
         from pipeline import source_category_stack
 
         fb_train_source = source_category_stack([s.source for s in fb_train_stories])
         fold_cand_source = source_category_stack([s.source for s in fold_candidates])
 
-        # Build features for this fold
-        X_train = _augment_features(
+        # Build features for this fold (production 394-d feature set;
+        # matches pipeline._svm_personalization_features used at runtime)
+        X_train = _svm_personalization_features(
             fb_train_emb,
-            fb_train_scores,
-            fb_train_ages,
-            comment_counts=fb_train_comments,
             text_lengths=fb_train_textlens,
-            hn_quality=fb_train_quality,
-            score_velocity=fb_train_score_vel,
-            comment_velocity=fb_train_comment_vel,
             sim_to_upvoted=fb_sim_up,
             sim_to_downvoted=fb_sim_down,
             closest_upvoted=fb_closest_up,
             closest_downvoted=fb_closest_down,
-            comment_score_ratio=fb_train_csr,
+            positive_cluster_similarity=None,
             is_hn_live=fb_train_source[:, 0],
             is_archive=fb_train_source[:, 1],
             is_reddit=fb_train_source[:, 2],
             is_rss=fb_train_source[:, 3],
         )
-        X_cand = _augment_features(
+        X_cand = _svm_personalization_features(
             fold_cand_emb,
-            fold_cand_scores,
-            fold_cand_ages,
-            comment_counts=fold_cand_comments,
             text_lengths=fold_cand_textlens,
-            hn_quality=fold_cand_quality,
-            score_velocity=fold_cand_score_vel,
-            comment_velocity=fold_cand_comment_vel,
             sim_to_upvoted=cand_sim_up,
             sim_to_downvoted=cand_sim_down,
             closest_upvoted=cand_closest_up,
             closest_downvoted=cand_closest_down,
-            comment_score_ratio=fold_cand_csr,
+            positive_cluster_similarity=None,
             is_hn_live=fold_cand_source[:, 0],
             is_archive=fold_cand_source[:, 1],
             is_reddit=fold_cand_source[:, 2],
@@ -780,25 +736,20 @@ def main() -> None:
         # probability.
         probs = _softmax_rows(decision)
 
-        # SVM with HN-specific features zeroed
+        # SVM with HN-specific features zeroed (production 394-d layout:
+        # strips text_length + the 4 source-category dummies)
         X_train_strip = X_train_scaled.copy()
         X_cand_strip = X_cand_scaled.copy()
-        # meta cols after emb_dim:
-        # 0=score, 1=comment_count, 2=text_length, 3=hn_quality,
-        # 4=comment_score_ratio, 5=score_velocity, 6=comment_velocity,
-        # 7=sim_up, 8=sim_down, 9=closest_up, 10=closest_down,
-        # 11=is_hn_live, 12=is_archive, 13=is_reddit, 14=is_rss
+        # meta cols after emb_dim (production 394-d feature set):
+        # 0=text_length, 1=sim_up, 2=sim_down, 3=closest_up, 4=closest_down,
+        # 5=positive_cluster_similarity, 6=is_hn_live, 7=is_archive,
+        # 8=is_reddit, 9=is_rss
         strip = [
-            emb_dim + 0,
-            emb_dim + 1,
-            emb_dim + 3,
-            emb_dim + 4,
-            emb_dim + 5,
-            emb_dim + 6,
-            emb_dim + 11,
-            emb_dim + 12,
-            emb_dim + 13,
-            emb_dim + 14,
+            emb_dim + 0,  # text_length
+            emb_dim + 6,  # is_hn_live
+            emb_dim + 7,  # is_archive
+            emb_dim + 8,  # is_reddit
+            emb_dim + 9,  # is_rss
         ]
         X_train_strip[:, strip] = 0.0
         X_cand_strip[:, strip] = 0.0

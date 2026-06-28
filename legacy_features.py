@@ -1,10 +1,23 @@
-"""Legacy feature assembler for offline eval / ablation scripts.
+"""DEPRECATED 2026-06-28: Replaced by pipeline._svm_personalization_features.
 
 `_augment_features` was the original 15-parameter feature builder that
-preceded `_svm_personalization_features` (in `pipeline.py`). The production
-personalization path uses the slim version; this richer assembler is kept
-for the offline eval scripts (`eval.py`, `eval_rss.py`, `eval_no_hn_features.py`)
-and the feature-ablation script (`scripts/feature_ablation.py`).
+preceded `_svm_personalization_features` (in `pipeline.py`). It produces
+a 399-d feature set that includes 6 engagement features
+(`log_score`, `log_comment_count`, `log_hn_quality`,
+`comment_score_ratio`, `log_score_velocity`, `log_comment_velocity`)
+that were removed from production in 2026-06-22.
+
+**Status of importers (as of 2026-06-28):**
+- `eval.py` — MIGRATED to `_svm_personalization_features`
+- `scripts/feature_ablation.py` — still uses this (TODO)
+- `eval_rss.py` — still uses this (TODO)
+- `eval_no_hn_features.py` — still uses this (TODO)
+- `tests/test_pipeline.py` — still uses this (TODO)
+
+If you need the production feature set, call
+`pipeline._svm_personalization_features` directly. If you need a
+specific subset for an ablation, use the explicit kwargs (the function
+takes the same `sim_to_*`, `closest_*`, source dummies as this one did).
 """
 
 from __future__ import annotations
