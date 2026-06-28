@@ -228,6 +228,8 @@ class Config:
     prewarm_hn_full: bool = True
     prewarm_reddit_full: bool = True
     prewarm_lesswrong_full: bool = True
+    reddit_spread_window_topfeeds_seconds: float = 2100.0
+    reddit_spread_window_prewarm_seconds: float = 2100.0
     article_fetch_max_per_run: int = 100
     article_fetch_concurrency: int = 10
     article_fetch_max_age_days: int = 30
@@ -260,6 +262,12 @@ class Config:
             prewarm_hn_full=main_cfg.get("prewarm_hn_full", True),
             prewarm_reddit_full=main_cfg.get("prewarm_reddit_full", True),
             prewarm_lesswrong_full=main_cfg.get("prewarm_lesswrong_full", True),
+            reddit_spread_window_topfeeds_seconds=main_cfg.get(
+                "reddit_spread_window_topfeeds_seconds", 2100.0
+            ),
+            reddit_spread_window_prewarm_seconds=main_cfg.get(
+                "reddit_spread_window_prewarm_seconds", 2100.0
+            ),
             article_fetch_max_per_run=main_cfg.get("article_fetch_max_per_run", 100),
             article_fetch_concurrency=main_cfg.get("article_fetch_concurrency", 10),
             article_fetch_max_age_days=main_cfg.get("article_fetch_max_age_days", 30),
@@ -862,6 +870,8 @@ async def prewarm_reddit_top_stories(
     story_ids: list[int],
     db: Database,
     embedder: Embedder | None = None,
+    *,
+    spread_window_seconds: float | None = None,
 ) -> int:
     """Bulk-prewarm Reddit RSS comment text for top-N stories.
 
@@ -940,7 +950,11 @@ async def prewarm_reddit_top_stories(
 
     factories = [make_prewarm_factory(sid) for sid in story_ids]
     reddit_fetch_queue.enqueue_spread(
-        len(factories), time.monotonic(), "prewarm", factories
+        len(factories),
+        time.monotonic(),
+        "prewarm",
+        factories,
+        window_seconds=spread_window_seconds,
     )
     # 25 min ceiling: 15 min spread + 10 min slack for the limiter
     drained = reddit_fetch_queue.wait_until_empty(timeout=1500.0)
@@ -1146,6 +1160,7 @@ async def fetch_candidates(
             days=config.days,
             exclude_urls=exclude_urls,
             db=db,
+            reddit_spread_window_seconds=config.reddit_spread_window_topfeeds_seconds,
         )
         deduped_candidates: list[Story] = list(candidates) + rss_stories
     else:
@@ -1201,12 +1216,28 @@ def _urllib_fetch(url: str, user_agent: str) -> tuple[int, str]:
     return _impl(url, user_agent)
 
 
+def _parse_rate_limit_reset(headers: dict[str, str]) -> float | None:
+    """Extract Reddit's x-ratelimit-reset value (seconds) from response headers.
+
+    Returns None if the header is missing or unparseable.
+    """
+    raw = headers.get("x-ratelimit-reset")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 async def fetch_rss_feeds(
     feeds: list[str],
     per_feed: int,
     days: int,
     exclude_urls: set[str],
     db: Database,
+    *,
+    reddit_spread_window_seconds: float | None = None,
 ) -> list[Story]:
     now = time.time()
     cutoff = now - (days * 86400)
@@ -1222,12 +1253,13 @@ async def fetch_rss_feeds(
                 headers["User-Agent"] = REDDIT_RSS_USER_AGENT
 
             async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
-                status, content = await fetch_with_urllib_fallback(
+                status, content, resp_headers = await fetch_with_urllib_fallback(
                     client, feed_url, headers
                 )
                 if is_reddit:
                     if status == 429:
-                        reddit_limiter.on_429()
+                        rl_reset = _parse_rate_limit_reset(resp_headers)
+                        reddit_limiter.on_429(rate_limit_reset=rl_reset)
                     elif status == 200:
                         reddit_limiter.on_success()
                 if status != 200:
@@ -1322,7 +1354,11 @@ async def fetch_rss_feeds(
 
         factories = [make_topfeed_factory(f) for f in reddit_feeds]
         reddit_fetch_queue.enqueue_spread(
-            len(factories), time.monotonic(), "topfeed", factories
+            len(factories),
+            time.monotonic(),
+            "topfeed",
+            factories,
+            window_seconds=reddit_spread_window_seconds,
         )
         # 20 min ceiling: 10 min spread + 10 min slack for the limiter's 2s spacing
         drained = reddit_fetch_queue.wait_until_empty(timeout=1200.0)
@@ -2752,7 +2788,10 @@ async def fetch_candidates_only(
         ]
         if needs_prewarm_reddit:
             prewarmed = await prewarm_reddit_top_stories(
-                needs_prewarm_reddit, db, embedder
+                needs_prewarm_reddit,
+                db,
+                embedder,
+                spread_window_seconds=config.reddit_spread_window_prewarm_seconds,
             )
             logging.info(
                 "Regen: prewarmed %d/%d Reddit candidates (full mode)",
@@ -2767,7 +2806,12 @@ async def fetch_candidates_only(
             ]
             top_reddit = reddit_ids[:reddit_prewarm_top_n]
             if top_reddit:
-                prewarmed = await prewarm_reddit_top_stories(top_reddit, db, embedder)
+                prewarmed = await prewarm_reddit_top_stories(
+                    top_reddit,
+                    db,
+                    embedder,
+                    spread_window_seconds=config.reddit_spread_window_prewarm_seconds,
+                )
                 logging.info(
                     "Regen: prewarmed %d/%d Reddit RSS stories",
                     prewarmed,

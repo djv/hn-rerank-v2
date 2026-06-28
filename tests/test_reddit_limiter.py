@@ -271,6 +271,42 @@ def test_jitter_does_not_affect_429_backoff(
     assert delay == pytest.approx(4.0)
 
 
+def test_on_429_uses_rate_limit_reset_header(
+    limiter: RedditRateLimiter, fake_clock: FakeClock
+) -> None:
+    """x-ratelimit-reset header is preferred over the BACKOFF table when present."""
+    t_before = fake_clock.now
+    limiter.on_429(rate_limit_reset=45.0)
+    assert limiter._next_allowed_at - t_before == pytest.approx(45.0)
+
+
+def test_on_429_caps_rate_limit_reset_at_120s(
+    limiter: RedditRateLimiter, fake_clock: FakeClock
+) -> None:
+    """Huge reset values are capped to avoid waiting forever."""
+    t_before = fake_clock.now
+    limiter.on_429(rate_limit_reset=3600.0)
+    assert limiter._next_allowed_at - t_before == pytest.approx(120.0)
+
+
+def test_on_429_falls_back_to_backoff_when_no_reset(
+    limiter: RedditRateLimiter, fake_clock: FakeClock
+) -> None:
+    """Without rate_limit_reset (or retry_after), fall back to BACKOFF table."""
+    t_before = fake_clock.now
+    limiter.on_429()
+    assert limiter._next_allowed_at - t_before == pytest.approx(2.0)
+
+
+def test_on_429_retry_after_takes_precedence_over_table(
+    limiter: RedditRateLimiter, fake_clock: FakeClock
+) -> None:
+    """retry_after (HTTP standard) is used when rate_limit_reset is absent."""
+    t_before = fake_clock.now
+    limiter.on_429(retry_after=7.5)
+    assert limiter._next_allowed_at - t_before == pytest.approx(7.5)
+
+
 def test_reset_clears_half_open_state(
     limiter: RedditRateLimiter, fake_clock: FakeClock
 ) -> None:

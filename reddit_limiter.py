@@ -78,11 +78,21 @@ class RedditRateLimiter:
             await asyncio.sleep(wait)
         return True
 
-    def on_429(self, retry_after: float | None = None) -> None:
+    def on_429(
+        self,
+        retry_after: float | None = None,
+        *,
+        rate_limit_reset: float | None = None,
+    ) -> None:
         with self._lock:
             prev = self._consecutive_429
             self._consecutive_429 += 1
-            if retry_after is not None and retry_after > 0:
+            if rate_limit_reset is not None and rate_limit_reset > 0:
+                # Reddit's x-ratelimit-reset header gives the server's actual
+                # remaining window until the rate-limit budget refills. Prefer
+                # it over the BACKOFF table when present.
+                delay = min(rate_limit_reset, 120.0)
+            elif retry_after is not None and retry_after > 0:
                 delay = retry_after
             else:
                 idx = min(self._consecutive_429 - 1, len(self.BACKOFF) - 1)

@@ -5,6 +5,115 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-28 — Reddit rate-limit adaptation: config-driven spread + x-ratelimit-reset on 429
+
+**Symptom (this session):** The Phase 1A+C+E deploy at 16:49 spread
+topfeed fetches over 600s, giving a 14.6s stride. But Reddit's actual
+unauth rate limit is ~1 req per 45s (probed via
+`curl -I https://www.reddit.com/r/MachineLearning/top/.rss` →
+`x-ratelimit-remaining: 0.0, x-ratelimit-reset: 48`). At 14.6s stride
+we hit 429s almost every other request, the circuit opened, the
+half-open probe fired, the circuit closed, and the cycle repeated —
+saturating the 300s cooldown with constant re-openings.
+
+Observed at 16:50-16:58:
+```
+16:50:34 enqueued 41 topfeed tasks over 600s (stride=14.6s)
+16:50:34 MachineLearning:  200 OK    ← first
+16:50:48 programming:      429       ← 14s later
+16:51:03 compsci:          200 OK    ← 29s later
+16:51:18 LocalLLaMA:       429       ← 44s
+16:51:32 ExperiencedDevs:  429       ← 58s
+16:51:47 haskell:          429       ← 73s (circuit opens)
+16:56:54 half-open probe admitted
+16:56:55 ChatGPTCoding:    200 OK
+16:57:09 LanguageTechnology: 200 OK
+16:57:23 ProgrammingLanguages: 429   ← 14s after probe
+16:57:38 Compilers:        429
+16:57:53 sre:              429       (circuit reopens)
+```
+
+**Root cause:** stride (14.6s) << actual rate-limit spacing (~45s).
+And the 429 backoff used the hardcoded BACKOFF table (2, 4, 8, 16, 32,
+60s) instead of the server's actual `x-ratelimit-reset` value, so
+recovery was slower than necessary.
+
+**Fix (simplified, ~25 lines of production code):**
+
+1. **Config-driven spread windows.** Moved
+   `SPREAD_WINDOW_TOPFEEDS` and `SPREAD_WINDOW_PREWARM` from
+   hardcoded class attributes (600s/900s) to `config.toml` with new
+   defaults of **2100s** each. Stride becomes 2100/41 ≈ **51s** for
+   topfeeds and 2100/46 ≈ **46s** for prewarm — safely above the
+   observed ~45s rate limit.
+   - `Config` dataclass gets two new fields
+     (`reddit_spread_window_topfeeds_seconds`,
+     `reddit_spread_window_prewarm_seconds`).
+   - `enqueue_spread()` now takes an explicit
+     `window_seconds: float | None = None` kwarg; falls back to the
+     class attribute only if None.
+   - `fetch_rss_feeds` and `prewarm_reddit_top_stories` accept the
+     window as a kwarg and pass it through.
+   - The two regen call sites in `pipeline.py` read from `config`.
+   - Class-attribute defaults updated to 2100.0 so non-test callers
+     (none currently) get the same behavior as the config-driven path.
+
+2. **`x-ratelimit-reset` on 429.** Reddit sends this header on every
+   response (200, 429, all). When the limiter sees a 429, it now
+   uses that header value as the next delay (capped at 120s),
+   instead of the BACKOFF table. This matches the server's actual
+   reset window and avoids the 2s-too-short backoff that was
+   re-triggering 429s in tight loops.
+   - `http_fetch.fetch_with_urllib_fallback` now returns
+     `(status, body, headers)` for all responses (was returning `{}`
+     for non-200 non-fallback). Bug fix — the 429 path was
+     discarding headers.
+   - `reddit_limiter.on_429` accepts a new
+     `rate_limit_reset: float | None = None` kwarg.
+     Precedence: `rate_limit_reset` > `retry_after` > BACKOFF table.
+   - `pipeline.py:fetch_and_parse` and
+     `server.py:_fetch_reddit_rss_context` parse the header via a
+     new `_parse_rate_limit_reset(headers) -> float | None` helper
+     and pass it to `on_429`.
+
+3. **Tests:** 4 new tests for the `rate_limit_reset` path (uses
+   header, caps at 120s, falls back to BACKOFF, `retry_after` still
+   works). 2 test mock classes updated to include a `headers` dict
+   on the mock response.
+
+**Verification:**
+
+- 307/307 tests pass in 23s. `ruff` + `ty` clean.
+- Service restarted at 17:15:44 UTC. First regen at 17:16:19.
+  Observed at 17:16:35-17:17:27:
+  ```
+  17:16:35 enqueued 41 topfeed tasks over 2100s (stride=51.2s)
+  17:16:35 MachineLearning:  200 OK
+  17:17:27 programming:      200 OK    ← 51s later, NOT 429
+  ```
+  First two fetches succeeded with 51s spacing — no 429s yet. Will
+  watch the next burst (around 17:18:18) to confirm the
+  `x-ratelimit-reset` path is hit if/when 429s do occur.
+- Dashboard yyy verified: 246339 bytes, 75 cards, 10 uncertain —
+  behavior unchanged.
+
+**Files changed:**
+
+| File | Lines | Purpose |
+|---|---|---|
+| `config.toml` | +2 | 2 new knobs |
+| `pipeline.py` | +25 / -8 | Config fields + fetch_rss_feeds kwarg + prewarm kwarg + _parse_rate_limit_reset helper + 2 Reddit-branch header parses + 2 regen-site kwarg passes |
+| `server.py` | +6 / -3 | _fetch_reddit_rss_context parses x-ratelimit-reset + fetch_with_urllib_fallback call site updated |
+| `http_fetch.py` | +4 / -3 | fetch_with_urllib_fallback returns headers for all responses (bug fix) |
+| `reddit_fetch_queue.py` | +6 / -3 | enqueue_spread accepts window_seconds kwarg; class defaults raised to 2100 |
+| `reddit_limiter.py` | +6 / -2 | on_429 accepts rate_limit_reset kwarg (precedence: header > retry_after > BACKOFF) |
+| `tests/test_reddit_limiter.py` | +35 / -0 | 4 new tests for the 429 path |
+| `tests/test_pipeline.py` | +9 / -0 | 3 MockResp classes get `headers: {}`, fake_reddit_prewarm gets `**kwargs` |
+
+Commit pending.
+
+---
+
 ## 2026-06-28 — Reddit throughput improvements (Phase 1: A + C + E)
 
 **Goal:** Reduce the rate of 429s from Reddit by spreading fetches

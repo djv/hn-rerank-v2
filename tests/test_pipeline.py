@@ -598,6 +598,7 @@ async def test_fetch_rss_feeds_serializes_reddit_and_sets_user_agent(
 
         def __init__(self, text: str):
             self.text = text
+            self.headers: dict[str, str] = {}
 
     def rss_doc(title: str, link: str) -> str:
         return f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -686,6 +687,7 @@ async def test_fetch_rss_feeds_populates_self_text(tmp_path, monkeypatch):
 
         def __init__(self, t):
             self.text = t
+            self.headers: dict[str, str] = {}
 
     class MockClient:
         def __init__(self, **kw):
@@ -788,6 +790,7 @@ async def test_fetch_rss_feeds_cache_miss_fetches_and_caches(tmp_path, monkeypat
 
         def __init__(self, t: str):
             self.text = t
+            self.headers: dict[str, str] = {}
 
     class MockClient:
         def __init__(self, **kw):
@@ -4120,7 +4123,7 @@ def test_fetch_candidates_only_prewarms_all_reddit_when_full(monkeypatch) -> Non
 
         captured_ids: list[list[int]] = []
 
-        async def fake_reddit_prewarm(ids, db_, embedder):
+        async def fake_reddit_prewarm(ids, db_, embedder, **kwargs):
             captured_ids.append(list(ids))
             return len(ids)
 

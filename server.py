@@ -140,7 +140,7 @@ async def _fetch_article_body_with_result(url: str) -> ArticleFetchResult:
                 if resp.status_code == 200:
                     html = resp.text
                 elif resp.status_code in (403, 503) and attempt == 0:
-                    status, html = await fetch_with_urllib_fallback(
+                    status, html, _headers = await fetch_with_urllib_fallback(
                         client, url, headers
                     )
                     if status != 200:
@@ -262,7 +262,9 @@ async def _fetch_reddit_rss_context(url: str | None) -> RedditRssContext | None:
 
     if resp.status_code == 429:
         retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
-        reddit_limiter.on_429(retry_after)
+        rl_reset_raw = resp.headers.get("x-ratelimit-reset")
+        rl_reset = float(rl_reset_raw) if rl_reset_raw else None
+        reddit_limiter.on_429(retry_after, rate_limit_reset=rl_reset)
         return None
     if resp.status_code != 200:
         return None

@@ -60,8 +60,8 @@ class _Task:
 class RedditFetchQueue:
     """Threadsafe scheduled-queue of Reddit fetch coroutine factories."""
 
-    SPREAD_WINDOW_TOPFEEDS: float = 600.0
-    SPREAD_WINDOW_PREWARM: float = 900.0
+    SPREAD_WINDOW_TOPFEEDS: float = 2100.0
+    SPREAD_WINDOW_PREWARM: float = 2100.0
     POLL_INTERVAL: float = 0.01
     WORKER_JOIN_TIMEOUT: float = 5.0
 
@@ -84,6 +84,8 @@ class RedditFetchQueue:
         base_at: float,
         kind: str,
         factories: list[CoroFactory],
+        *,
+        window_seconds: float | None = None,
     ) -> None:
         """Schedule N tasks evenly over the kind-specific spread window.
 
@@ -92,19 +94,22 @@ class RedditFetchQueue:
             base_at: monotonic time (e.g. `time.monotonic()`) for the
                 first task's target. Subsequent tasks are staggered
                 `window / n` seconds apart.
-            kind: "topfeed" (10 min window) or "prewarm" (15 min).
+            kind: "topfeed" or "prewarm" (used for logging + default window).
             factories: list of no-arg callables returning awaitables.
+            window_seconds: override the spread window (in seconds). If
+                None, falls back to the class default for the given kind.
         """
         if n == 0:
             return
         if n != len(factories):
             raise ValueError(f"n={n} != len(factories)={len(factories)}")
-        window = (
-            self.SPREAD_WINDOW_TOPFEEDS
-            if kind == "topfeed"
-            else self.SPREAD_WINDOW_PREWARM
-        )
-        stride = window / n
+        if window_seconds is None:
+            window_seconds = (
+                self.SPREAD_WINDOW_TOPFEEDS
+                if kind == "topfeed"
+                else self.SPREAD_WINDOW_PREWARM
+            )
+        stride = window_seconds / n
         with self._lock:
             self._idle_event.clear()
             for i, factory in enumerate(factories):
@@ -116,7 +121,7 @@ class RedditFetchQueue:
             "reddit_fetch_queue enqueued %d %s tasks over %.0fs (stride=%.1fs)",
             n,
             kind,
-            window,
+            window_seconds,
             stride,
         )
 

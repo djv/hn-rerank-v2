@@ -27,14 +27,16 @@ async def fetch_with_urllib_fallback(
     headers: dict[str, str],
     *,
     fallback_statuses: tuple[int, ...] = (403, 503),
-) -> tuple[int, str]:
+) -> tuple[int, str, dict[str, str]]:
     """Try an httpx client.get(); on a fallback status code, retry via urllib.
 
-    Returns (status, body). body is "" for non-200 responses.
+    Returns (status, body, response_headers). body is "" for non-200
+    responses, but headers are always populated (relevant for
+    x-ratelimit-* on 429s).
     """
     resp = await client.get(url, headers=headers)
     if resp.status_code == 200:
-        return resp.status_code, resp.text
+        return resp.status_code, resp.text, dict(resp.headers)
     if resp.status_code in fallback_statuses:
         logging.info(
             "%s: httpx %d, retrying with urllib",
@@ -43,7 +45,7 @@ async def fetch_with_urllib_fallback(
         )
         status, body = await asyncio.to_thread(urllib_fetch, url, headers["User-Agent"])
         if status == 200:
-            return status, body
+            return status, body, {}
         logging.warning("%s: urllib fallback returned %d", url, status)
-        return status, ""
-    return resp.status_code, ""
+        return status, "", {}
+    return resp.status_code, "", dict(resp.headers)
