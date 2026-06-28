@@ -5,6 +5,68 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-28 — Reddit rate-limiter stuck-open bug (12h silent coverage gap)
+
+**Symptom (from morning's regen logs):** `fetch_rss_feeds: reddit
+circuit open, skipping remaining 36 feeds` and
+`prewarm_reddit: circuit open, skipping remaining 46 stories` appearing
+in every regen from 10:47 to 15:56. 100 "circuit open" log lines in
+~6 hours. Reddit RSS topfeeds and per-story comment fetches were
+silently dropped for 12+ hours.
+
+**Root cause:** `RedditRateLimiter` (reddit_limiter.py) opened its
+circuit after 3 consecutive 429s but had **no half-open / cooldown-close
+behavior**. `acquire()` returns `False` while the circuit is open, so
+`on_success()` could never be called to reset `_consecutive_429`. The
+only ways to close the circuit were (a) service restart (re-initializes
+the singleton) or (b) `limiter.reset()` (only called from tests).
+
+The docstring on the limiter said *"next cycle the limiter resets"* —
+that behavior was either never implemented or was lost in a refactor.
+
+**Fix:** Add standard half-open probe logic.
+
+- New state: `_circuit_opened_at: float` and `_probing: bool` (both
+  zeroed in `reset()`).
+- New constant: `CIRCUIT_COOLDOWN: float = 300.0` (5 min; configurable
+  per-instance like the existing constants).
+- `acquire()`: if circuit is open and `now - _circuit_opened_at >=
+  CIRCUIT_COOLDOWN`, admit ONE probe request (`_probing = True`);
+  subsequent callers during the probe still get `False`.
+- `on_success()`: clears `_circuit_opened_at` and `_probing`, logs
+  "circuit closed after successful probe".
+- `on_429()`: if a probe just failed, reset `_circuit_opened_at` to
+  `now` (start a fresh cooldown). The existing transition check
+  (closed → open) also sets `_circuit_opened_at` on first opening.
+- `circuit_open` property: unchanged.
+
+**Verification:**
+
+- 19/19 tests in `test_reddit_limiter.py` pass (5 new: cooldown
+  admission, probe success closes, probe failure resets cooldown,
+  transition-once-only, reset clears half-open state).
+- 287/287 full suite pass (was 282; +5 new tests).
+- `ruff check reddit_limiter.py tests/test_reddit_limiter.py` clean.
+- `ty check reddit_limiter.py tests/test_reddit_limiter.py` clean.
+- Service restarted at 16:05:05 UTC; first regen at 16:05:58. Reddit
+  returned 200 for `MachineLearning` and `programming` (2 successes),
+  then 429 for `compsci`, `LocalLLaMA`, `ExperiencedDevs` (3 in a row).
+  Circuit opened, remaining 36 feeds + 46 prewarm stories short-
+  circuited. **Behavior identical to before the fix in the stuck-open
+  case; the half-open probe will fire on the next regen (~19:05 UTC).**
+- Dashboard yyy@16:08: 246442 bytes, 75 cards, 10 uncertain, 0
+  data-voted. Matches pre-restart snapshot (different sha256 due to
+  fresh server PID / cache version).
+
+**Cost of fix:** +18 lines in `reddit_limiter.py`, +89 lines in
+`tests/test_reddit_limiter.py`. Zero call-site changes
+(`pipeline.py:1287`, `pipeline.py:880`, `server.py:252` use the
+unchanged public API).
+
+Commit pending.
+
+---
+
 ## 2026-06-28 — Remove dead `data-voted` / localStorage vote cache
 
 **Symptom (from user yyy QA report):** `data-voted=""` on all 75 cards for

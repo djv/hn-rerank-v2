@@ -223,4 +223,113 @@ def test_instance_attributes_can_be_overridden(monkeypatch: pytest.MonkeyPatch) 
     assert rl.circuit_open is True
     rl.reset()
     rl.MAX_CONSECUTIVE_429 = 3
-    assert rl.circuit_open is False
+
+
+def test_reset_clears_half_open_state(
+    limiter: RedditRateLimiter, fake_clock: FakeClock
+) -> None:
+    """reset() must zero _circuit_opened_at and clear the _probing flag."""
+    limiter.on_429()
+    limiter.on_429()
+    limiter.on_429()
+    assert limiter.circuit_open is True
+    assert limiter._circuit_opened_at == pytest.approx(fake_clock.now)
+    fake_clock.advance(1000.0)
+    limiter._probing = True
+    limiter.reset()
+    assert limiter._circuit_opened_at == 0.0
+    assert limiter._probing is False
+    assert limiter.circuit_open is False
+
+
+@pytest.mark.asyncio
+async def test_circuit_half_opens_after_cooldown(
+    limiter: RedditRateLimiter, fake_clock: FakeClock
+) -> None:
+    """After CIRCUIT_COOLDOWN elapses, acquire admits one probe request."""
+    limiter.CIRCUIT_COOLDOWN = 300.0
+    limiter.on_429()
+    limiter.on_429()
+    limiter.on_429()
+    assert limiter.circuit_open is True
+    assert await limiter.acquire() is False
+
+    fake_clock.advance(299.0)
+    assert await limiter.acquire() is False
+
+    fake_clock.advance(2.0)
+    assert await limiter.acquire() is True
+    assert limiter._probing is True
+    assert limiter.circuit_open is True
+
+    # Probe already in flight; subsequent callers during the probe are rejected
+    assert await limiter.acquire() is False
+
+
+@pytest.mark.asyncio
+async def test_probe_success_closes_circuit(
+    limiter: RedditRateLimiter, fake_clock: FakeClock
+) -> None:
+    """A successful on_success() during half-open probe closes the circuit."""
+    limiter.CIRCUIT_COOLDOWN = 300.0
+    limiter.on_429()
+    limiter.on_429()
+    limiter.on_429()
+    fake_clock.advance(300.0)
+    assert await limiter.acquire() is True
+
+    limiter.on_success()
+    assert limiter.circuit_open is False
+    assert limiter._circuit_opened_at == 0.0
+    assert limiter._probing is False
+
+    # Normal operation resumes: 2s spacing
+    assert await limiter.acquire() is True
+    fake_clock.advance(2.0)
+    assert await limiter.acquire() is True
+
+
+@pytest.mark.asyncio
+async def test_probe_failure_resets_cooldown(
+    limiter: RedditRateLimiter, fake_clock: FakeClock
+) -> None:
+    """A 429 during half-open probe re-opens the circuit and resets the cooldown."""
+    limiter.CIRCUIT_COOLDOWN = 300.0
+    limiter.on_429()
+    limiter.on_429()
+    limiter.on_429()
+    opened_at = fake_clock.now
+    fake_clock.advance(300.0)
+    assert await limiter.acquire() is True
+
+    limiter.on_429()
+    assert limiter.circuit_open is True
+    assert limiter._circuit_opened_at == pytest.approx(fake_clock.now)
+    assert limiter._circuit_opened_at > opened_at
+    assert limiter._probing is False
+
+    # Must wait another full cooldown for the next probe
+    fake_clock.advance(299.0)
+    assert await limiter.acquire() is False
+    fake_clock.advance(2.0)
+    assert await limiter.acquire() is True
+
+
+def test_on_429_records_open_time_only_on_transition(
+    limiter: RedditRateLimiter, fake_clock: FakeClock
+) -> None:
+    """_circuit_opened_at is set once when the circuit transitions closed -> open,
+    not on every subsequent 429 while already open."""
+    limiter.on_429()
+    limiter.on_429()
+    assert limiter.circuit_open is False
+    assert limiter._circuit_opened_at == 0.0
+
+    limiter.on_429()
+    assert limiter.circuit_open is True
+    t_open = fake_clock.now
+    assert limiter._circuit_opened_at == pytest.approx(t_open)
+
+    fake_clock.advance(10.0)
+    limiter.on_429()
+    assert limiter._circuit_opened_at == pytest.approx(t_open)
