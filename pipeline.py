@@ -57,11 +57,22 @@ class ModelConfig:
     hot_badge_percentile: float = 99.5
     similar_badge_percentile: float = 97.0
     novel_badge_percentile: float = 10.0
+    dedup_render_enabled: bool = True
+    dedup_title_fuzzy_enabled: bool = False
+    dedup_title_fuzzy_hamming: int = 2
+    dedup_title_fuzzy_same_domain: bool = True
+    dedup_exclude_actions: tuple[str, ...] = ("up", "neutral")
 
 
-# SVM model cache: keyed on (user_id, feedback_signature) to skip SVC.fit().
-_MODEL_CACHE: OrderedDict[tuple[int, str], tuple[SVC, StandardScaler]] = OrderedDict()
+# SVM model cache: keyed on (user_id, feedback_signature, schema_version)
+# to skip SVC.fit(). Bump _MODEL_SCHEMA_VERSION whenever the feature schema
+# (number / semantics of meta columns appended to the embedding) changes;
+# the cache key then changes for every user, forcing a clean re-fit.
+_MODEL_CACHE: OrderedDict[tuple[int, str, int], tuple[SVC, StandardScaler]] = (
+    OrderedDict()
+)
 _MODEL_CACHE_LOCK = threading.Lock()
+_MODEL_SCHEMA_VERSION = 2  # +1 whenever meta-column schema changes (see ARCHITECTURE)
 
 
 def _feedback_signature(db: Database, user_id: int) -> str:
@@ -78,7 +89,7 @@ def _get_cached_model(
     if user_id is None:
         return None
     with _MODEL_CACHE_LOCK:
-        key = (user_id, signature)
+        key = (user_id, signature, _MODEL_SCHEMA_VERSION)
         if key in _MODEL_CACHE:
             _MODEL_CACHE.move_to_end(key)
             return _MODEL_CACHE[key]
@@ -95,7 +106,7 @@ def _set_cached_model(
     if user_id is None:
         return
     with _MODEL_CACHE_LOCK:
-        key = (user_id, signature)
+        key = (user_id, signature, _MODEL_SCHEMA_VERSION)
         _MODEL_CACHE[key] = (svm, scaler)
         while len(_MODEL_CACHE) > maxsize:
             _MODEL_CACHE.popitem(last=False)
@@ -111,9 +122,16 @@ GOOD_TOPLEVEL_MIN_LEN = 200
 GOOD_TOPLEVEL_MIN_REPLIES = 3
 TOP_COMMENT_TOP_LEVEL_BUDGET = TOP_COMMENT_LIMIT // 3
 UNCERTAIN_DISCOVERY_SLOT_LIMIT = 5
+UNCERTAIN_DISCOVERY_RECENT_SLOTS = 3
+UNCERTAIN_DISCOVERY_ARCHIVE_SLOTS = 2
 DISCOVERY_SLOT_LIMIT = 5
+NOVEL_DISCOVERY_RECENT_SLOTS = 3
+NOVEL_DISCOVERY_ARCHIVE_SLOTS = 3
+SIMILAR_DISCOVERY_RECENT_SLOTS = 3
+SIMILAR_DISCOVERY_ARCHIVE_SLOTS = 3
 POPULARITY_DISCOVERY_SLOT_LIMIT = 8
 NON_HN_DISCOVERY_SLOT_LIMIT = 8
+ARCHIVE_TOP_DISCOVERY_SLOT_LIMIT = 12
 HOT_MIN_SCORE = 20
 DASHBOARD_QUEUE_SIZE = 12
 BQ_ARCHIVE_SOURCE = "bq_seed"
@@ -125,6 +143,42 @@ LIVE_WINDOW_LIMIT = 2000
 
 def is_hn_source(source: str) -> bool:
     return source in {"hn", BQ_ARCHIVE_SOURCE, CH_ARCHIVE_SOURCE}
+
+
+# Source category one-hot. Order is significant: callers index into the
+# returned vector and tests assert specific positions.
+SOURCE_CATEGORIES: tuple[str, ...] = ("hn_live", "archive", "reddit", "rss")
+
+
+def source_category_onehot(source: str) -> NDArray[np.float32]:
+    """Return a length-4 binary vector classifying ``source`` into one of
+    ``SOURCE_CATEGORIES`` (live HN, archive seed, reddit, generic RSS).
+
+    Sources that do not match any category return an all-zero vector rather
+    than a 5th negative class — the model is expected to learn the implicit
+    "other" prior from the absence of all four bits.
+    """
+    if source == "hn":
+        idx = 0
+    elif source in {BQ_ARCHIVE_SOURCE, CH_ARCHIVE_SOURCE}:
+        idx = 1
+    elif source.startswith("rss_reddit_"):
+        idx = 2
+    elif source.startswith("rss_") or source.startswith("reddit_"):
+        idx = 3
+    else:
+        return np.zeros(len(SOURCE_CATEGORIES), dtype=np.float32)
+    out = np.zeros(len(SOURCE_CATEGORIES), dtype=np.float32)
+    out[idx] = 1.0
+    return out
+
+
+def source_category_stack(sources: list[str]) -> NDArray[np.float32]:
+    """Vectorized helper: stack ``source_category_onehot`` for a list of
+    sources. Returns an (n, 4) float32 array."""
+    if not sources:
+        return np.zeros((0, len(SOURCE_CATEGORIES)), dtype=np.float32)
+    return np.stack([source_category_onehot(s) for s in sources], axis=0)
 
 
 def is_summarizable(story: Story) -> bool:
@@ -219,6 +273,30 @@ class Config:
                 min_up_for_svm=model_cfg.get("min_up_for_svm", 20),
                 min_down_for_svm=model_cfg.get("min_down_for_svm", 20),
                 non_hn_ramp_window=model_cfg.get("non_hn_ramp_window", 30),
+                top_badge_percentile=model_cfg.get("top_badge_percentile", 90.0),
+                top_badge_min_score=model_cfg.get("top_badge_min_score", 100),
+                discussion_badge_percentile=model_cfg.get(
+                    "discussion_badge_percentile", 90.0
+                ),
+                discussion_badge_min_comments=model_cfg.get(
+                    "discussion_badge_min_comments", 0
+                ),
+                hot_badge_percentile=model_cfg.get("hot_badge_percentile", 99.5),
+                similar_badge_percentile=model_cfg.get(
+                    "similar_badge_percentile", 97.0
+                ),
+                novel_badge_percentile=model_cfg.get("novel_badge_percentile", 10.0),
+                dedup_render_enabled=model_cfg.get("dedup_render_enabled", True),
+                dedup_title_fuzzy_enabled=model_cfg.get(
+                    "dedup_title_fuzzy_enabled", False
+                ),
+                dedup_title_fuzzy_hamming=model_cfg.get("dedup_title_fuzzy_hamming", 2),
+                dedup_title_fuzzy_same_domain=model_cfg.get(
+                    "dedup_title_fuzzy_same_domain", True
+                ),
+                dedup_exclude_actions=tuple(
+                    model_cfg.get("dedup_exclude_actions", ("up", "neutral"))
+                ),
             ),
             rss=RssConfig(
                 enabled=rss_cfg.get("enabled", True),
@@ -243,22 +321,32 @@ class RankedStory:
     is_hot: bool = False
     is_similar: bool = False
     is_non_hn: bool = False
+    is_recent: bool = False
 
 
 @dataclass(frozen=True)
 class DiscoveryPass:
     """A single extra-slot discovery pass in the rerank loop.
 
-    Each pass filters `remaining_decorated` by `predicate`, sorts the pool
-    by `sort_key` (descending), and takes the top `slot_limit` stories. The
-    matched stories are added to `final` and `remaining_decorated` is pruned.
+    Each pass filters `remaining_decorated` by `predicate` (and by `age`
+    when set, see below), sorts the pool by `sort_key` (descending), and
+    takes the top `slot_limit` stories. The matched stories are added to
+    `final` and `remaining_decorated` is pruned.
+
+    `age`: when set to "recent" or "archive", the pass only considers
+    stories in that age bucket. This lets a single badge have two
+    dedicated passes (e.g. novel-recent and novel-archive) so the badge
+    surfaces in both age groups even when one bucket's stories would
+    otherwise dominate. The age filter uses the 30-day cutoff that the
+    badge's threshold also uses, so the two stay in lockstep.
     """
 
     name: str
-    attr: str
+    attr: str | None
     predicate: Callable[[RankedStory], bool]
     sort_key: Callable[[RankedStory], float]
     slot_limit: int
+    age: str | None = None
 
 
 def _dashboard_primary_limit(config_count: int) -> tuple[int, int]:
@@ -1023,15 +1111,10 @@ async def fetch_candidates(
         archive_stories = db.get_stories(archive_ids)
         candidates.extend(archive_stories)
 
-    # 4. Dedup by URL
-    deduped_candidates = []
-    seen_urls = set()
-    for s in candidates:
-        if s.url:
-            if s.url in exclude_urls or s.url in seen_urls:
-                continue
-            seen_urls.add(s.url)
-        deduped_candidates.append(s)
+    # 4. Skip fetch-time dedup — duplicate resolution is centralized at
+    #    render time in `_apply_dedup_to_ranked` (see dedup.py). We still
+    #    pass `exclude_urls` (built from the user's feedback set) into the
+    #    RSS fetch so we don't re-pull URLs the user has already voted on.
 
     # 5. RSS feeds
     if config.rss.enabled:
@@ -1039,10 +1122,12 @@ async def fetch_candidates(
             feeds=list(config.rss.feeds),
             per_feed=config.rss.per_feed_limit,
             days=config.days,
-            exclude_urls=exclude_urls | seen_urls,
+            exclude_urls=exclude_urls,
             db=db,
         )
-        deduped_candidates.extend(rss_stories)
+        deduped_candidates: list[Story] = list(candidates) + rss_stories
+    else:
+        deduped_candidates = list(candidates)
 
     # 6. Filter to summarizable stories (no content = no TLDR possible)
     summarizable = [s for s in deduped_candidates if is_summarizable(s)]
@@ -1332,9 +1417,27 @@ def _svm_personalization_features(
     closest_upvoted: np.ndarray,
     closest_downvoted: np.ndarray,
     positive_cluster_similarity: np.ndarray | None = None,
+    is_hn_live: np.ndarray | None = None,
+    is_archive: np.ndarray | None = None,
+    is_reddit: np.ndarray | None = None,
+    is_rss: np.ndarray | None = None,
 ) -> NDArray[np.float32]:
-    """Production SVM features: embeddings, text length, and feedback similarity."""
-    meta = np.zeros((len(embeddings), 6), dtype=np.float32)
+    """Production SVM features: embeddings, text length, feedback similarity,
+    and 4-binary source category.
+
+    Meta column layout (after the 384-d embedding):
+      0  text_length (log1p, [0, 1])
+      1  sim_to_upvoted        ([-1, 1] → [0, 1])
+      2  sim_to_downvoted      ([-1, 1] → [0, 1])
+      3  closest_upvoted       ([-1, 1] → [0, 1])
+      4  closest_downvoted     ([-1, 1] → [0, 1])
+      5  positive_cluster_similarity ([-1, 1] → [0, 1])
+      6  is_hn_live            (0/1)
+      7  is_archive            (0/1)
+      8  is_reddit             (0/1)
+      9  is_rss                (0/1)
+    """
+    meta = np.zeros((len(embeddings), 10), dtype=np.float32)
     meta[:, 0] = (
         np.clip(np.log1p(np.maximum(text_lengths, 0)), 0, _LOG_TEXTLEN_SCALE)
         / _LOG_TEXTLEN_SCALE
@@ -1345,6 +1448,14 @@ def _svm_personalization_features(
     meta[:, 4] = (np.clip(closest_downvoted, -1, 1) + 1) / 2
     if positive_cluster_similarity is not None:
         meta[:, 5] = (np.clip(positive_cluster_similarity, -1, 1) + 1) / 2
+    if is_hn_live is not None:
+        meta[:, 6] = is_hn_live
+    if is_archive is not None:
+        meta[:, 7] = is_archive
+    if is_reddit is not None:
+        meta[:, 8] = is_reddit
+    if is_rss is not None:
+        meta[:, 9] = is_rss
     return np.concatenate([embeddings, meta], axis=1)
 
 
@@ -1525,6 +1636,15 @@ def _score_and_rank(
 
             fb_text_lengths = np.array([len(s.text_content) for s in feedback_stories])
 
+            # 4-binary source category one-hot per feedback / candidate story
+            fb_source_onehot = source_category_stack(
+                [s.source for s in feedback_stories]
+            )
+            fb_is_hn_live = fb_source_onehot[:, 0]
+            fb_is_archive = fb_source_onehot[:, 1]
+            fb_is_reddit = fb_source_onehot[:, 2]
+            fb_is_rss = fb_source_onehot[:, 3]
+
             fb_features = _svm_personalization_features(
                 fb_embeddings,
                 text_lengths=fb_text_lengths,
@@ -1533,6 +1653,10 @@ def _score_and_rank(
                 closest_upvoted=fb_closest_up,
                 closest_downvoted=fb_closest_down,
                 positive_cluster_similarity=fb_positive_cluster_sim,
+                is_hn_live=fb_is_hn_live,
+                is_archive=fb_is_archive,
+                is_reddit=fb_is_reddit,
+                is_rss=fb_is_rss,
             )
 
             # Ensure all three classes (0, 1, 2) are present
@@ -1590,6 +1714,13 @@ def _score_and_rank(
                     )
 
             cand_text_lengths = np.array([len(s.text_content) for s in candidates])
+
+            cand_source_onehot = source_category_stack([s.source for s in candidates])
+            cand_is_hn_live = cand_source_onehot[:, 0]
+            cand_is_archive = cand_source_onehot[:, 1]
+            cand_is_reddit = cand_source_onehot[:, 2]
+            cand_is_rss = cand_source_onehot[:, 3]
+
             cand_features = _svm_personalization_features(
                 candidate_embeddings,
                 text_lengths=cand_text_lengths,
@@ -1598,6 +1729,10 @@ def _score_and_rank(
                 closest_upvoted=cand_closest_up,
                 closest_downvoted=cand_closest_down,
                 positive_cluster_similarity=cand_positive_cluster_sim,
+                is_hn_live=cand_is_hn_live,
+                is_archive=cand_is_archive,
+                is_reddit=cand_is_reddit,
+                is_rss=cand_is_rss,
             )
             cand_features_meta_scaled = np.clip(
                 scaler.transform(cand_features[:, emb_dim:]), -2.5, 2.5
@@ -1653,11 +1788,13 @@ def _score_and_rank(
         else:
             tier2_scores = np.full(len(candidates), 0.5, dtype=np.float32)
 
-    # Tier 1: HN gravity (frontpage-like) — always computed for cold-start blend
+    # Tier 1: HN gravity (frontpage-like) — always computed for cold-start blend.
+    # Per-source priors are now learned by the SVM via the 4-binary source
+    # category features; the previous `* 2` non-HN boost was removed since the
+    # SVM already has the prior signal directly and the boost double-counted.
     tier1_scores = np.array(
         [
-            (s.score if is_hn_source(s.source) else s.score * 2)
-            / max(((now - s.time) / 3600.0 + 2.0) ** 1.8, 0.1)
+            s.score / max(((now - s.time) / 3600.0 + 2.0) ** 1.8, 0.1)
             for s in candidates
         ],
         dtype=np.float32,
@@ -1914,22 +2051,25 @@ def rerank_candidates(
     cand_max_sim = np.maximum.reduce(
         [cand_closest_up, cand_closest_down, cand_closest_neutral]
     )
-    sim_threshold = (
-        np.percentile(cand_max_sim, config.model.novel_badge_percentile)
-        if len(cand_max_sim)
-        else 0.0
-    )
-    # Similar threshold is applied to extra-slot stories only (see
-    # `is_similar` exclusion in the primary-attribution block below).
-    similar_threshold = (
-        np.percentile(cand_closest_up, config.model.similar_badge_percentile)
-        if len(cand_closest_up)
-        else 0.0
-    )
 
+    # Hoist now_ts and compute per-age-bucket metadata early so all
+    # threshold computations below can produce per-candidate arrays.
+    # Per-bucket thresholds are required because archive candidates have
+    # structurally higher absolute scores/comment counts (months/years of
+    # accumulation) than recent candidates; a single global threshold
+    # would be archive-dominated and make it nearly impossible for
+    # recent stories to earn Top/Talk-worthy badges. Similar logic
+    # applies to Novel/Similar/Unsure so badges remain meaningful
+    # within each age cohort.
     cand_comment_counts = np.array([s.comment_count or 0 for s in candidates])
     cand_scores = np.array([s.score for s in candidates])
     now_ts = time.time()
+    recent_cutoff = int(now_ts) - 30 * 86400
+    recent_mask = np.fromiter(
+        (s.time >= recent_cutoff for s in candidates),
+        dtype=bool,
+        count=len(candidates),
+    )
     cand_velocities = np.array(
         [s.score / max((now_ts - s.time) / 3600.0, 0.1) for s in candidates]
     )
@@ -1937,6 +2077,32 @@ def rerank_candidates(
         np.percentile(cand_velocities, config.model.hot_badge_percentile)
         if len(cand_velocities)
         else 0
+    )
+
+    def _bucket_pct(values: np.ndarray, mask: np.ndarray, pct: float) -> float:
+        sub = values[mask]
+        return float(np.percentile(sub, pct)) if len(sub) else 0.0
+
+    # Per-bucket threshold for the Novel badge (bottom-pct by max similarity
+    # to any feedback story). Recent and archive cohorts are judged
+    # independently so the badge is meaningful within each age group.
+    sim_thresholds = np.where(
+        recent_mask,
+        _bucket_pct(cand_max_sim, recent_mask, config.model.novel_badge_percentile),
+        _bucket_pct(cand_max_sim, ~recent_mask, config.model.novel_badge_percentile),
+    )
+    # Per-bucket threshold for the Similar badge (top-pct by similarity to
+    # your upvotes). Applied to extra-slot stories only (see
+    # `is_similar` exclusion in the primary-attribution block below).
+    # Falls back to 0.0 when a bucket has no candidates.
+    similar_thresholds = np.where(
+        recent_mask,
+        _bucket_pct(
+            cand_closest_up, recent_mask, config.model.similar_badge_percentile
+        ),
+        _bucket_pct(
+            cand_closest_up, ~recent_mask, config.model.similar_badge_percentile
+        ),
     )
 
     story_id_to_idx = {s.id: idx for idx, s in enumerate(candidates)}
@@ -1956,28 +2122,72 @@ def rerank_candidates(
     else:
         uncertain_candidates = []
 
-    # Compute discovery thresholds. Badges are applied to any story that passes
-    # these criteria (primary or extra-slot); the extra-slot passes below
-    # additionally source from remaining_decorated to surface qualifying stories
-    # outside the primary ranked set, respecting per-pass slot caps.
-    # discussion_threshold uses config percentiles so that stories
-    # with zero comments are filtered out cleanly by the >0 guard.
-    nonzero_comments = cand_comment_counts[cand_comment_counts > 0]
+    # Per-bucket discovery thresholds. Badges are applied to any story
+    # that passes these criteria (primary or extra-slot); the extra-slot
+    # passes below additionally source from remaining_decorated to surface
+    # qualifying stories outside the primary ranked set, respecting
+    # per-pass slot caps.
+    #
+    # Per-bucket because archive candidates have structurally higher
+    # absolute scores/comment counts than recent ones, so a global
+    # threshold would be archive-dominated and recent stories would
+    # never qualify. Each candidate uses the threshold of its own age
+    # bucket; a per-candidate array is built via np.where for vectorized
+    # lookup.
+    # discussion_thresholds: max(percentile, min) per bucket; the
+    # per-candidate array still has the >0 comment guard applied
+    # separately in the predicate.
     discussion_pct = config.model.discussion_badge_percentile
-    discussion_min = config.model.discussion_badge_min_comments
-    raw_discussion_pct = (
-        np.percentile(nonzero_comments, discussion_pct)
-        if len(nonzero_comments)
-        else 0.0
+    discussion_min = float(config.model.discussion_badge_min_comments)
+    recent_disc_raw = _bucket_pct(
+        cand_comment_counts[cand_comment_counts > 0],
+        recent_mask[cand_comment_counts > 0],
+        discussion_pct,
     )
-    discussion_threshold = max(raw_discussion_pct, float(discussion_min))
+    archive_disc_raw = _bucket_pct(
+        cand_comment_counts[cand_comment_counts > 0],
+        ~recent_mask[cand_comment_counts > 0],
+        discussion_pct,
+    )
+    discussion_thresholds = np.where(
+        recent_mask,
+        max(recent_disc_raw, discussion_min),
+        max(archive_disc_raw, discussion_min),
+    )
     pct = config.model.top_badge_percentile
-    min_score = config.model.top_badge_min_score
-    raw_pct_threshold = np.percentile(cand_scores, pct) if len(cand_scores) else 0.0
-    engagement_threshold = max(raw_pct_threshold, float(min_score))
+    min_score = float(config.model.top_badge_min_score)
+    recent_eng_raw = _bucket_pct(cand_scores, recent_mask, pct)
+    archive_eng_raw = _bucket_pct(cand_scores, ~recent_mask, pct)
+    engagement_thresholds = np.where(
+        recent_mask,
+        max(recent_eng_raw, min_score),
+        max(archive_eng_raw, min_score),
+    )
 
     # final already contains the primary-ranked items
     final_ids = {item.story.id for item in final}
+
+    # Per-bucket Unsure entropy cutoff. The Unsure badge fires when a
+    # story's entropy >= the Nth-most-uncertain entropy in its age
+    # bucket. Using a single global cutoff would let archive stories
+    # dominate the high-entropy tail and starve recent candidates of
+    # the badge. If a bucket has no scored candidates, its cutoff is
+    # infinity (no story can qualify).
+    def _bucket_entropy_cutoff(mask: np.ndarray) -> float:
+        bucket = [
+            r
+            for r in remaining
+            if r.prob_down is not None and bool(mask[story_id_to_idx[r.story.id]])
+        ]
+        bucket.sort(key=get_entropy, reverse=True)
+        bucket = bucket[:num_uncertain] if num_uncertain else []
+        return get_entropy(bucket[-1]) if bucket else float("inf")
+
+    recent_ent_cutoff = _bucket_entropy_cutoff(recent_mask)
+    archive_ent_cutoff = _bucket_entropy_cutoff(~recent_mask)
+    uncertain_entropy_thresholds = np.where(
+        recent_mask, recent_ent_cutoff, archive_ent_cutoff
+    )
 
     # Apply the same badge criteria to primary-ranked stories. Extra-slot
     # passes below still source from remaining_decorated and respect their
@@ -1985,26 +2195,29 @@ def rerank_candidates(
     # already in the primary ranked set, so it does not take slots away
     # from the extra-slot pulls. `is_similar` is intentionally NOT applied
     # here: the Similar badge is reserved for extra-slot stories (see
-    # similar_threshold usage in the Similar discovery pass below), so it
+    # similar_thresholds usage in the Similar discovery pass below), so it
     # always signals "surfaced from outside primary because of high
     # semantic match" rather than a near-tautology on top-ranked stories.
-    uncertain_entropy_threshold = (
-        get_entropy(uncertain_candidates[-1]) if uncertain_candidates else float("inf")
-    )
     final = [
         replace(
             r,
             is_uncertain=(
                 r.prob_down is not None
-                and get_entropy(r) >= uncertain_entropy_threshold
+                and get_entropy(r)
+                >= uncertain_entropy_thresholds[story_id_to_idx[r.story.id]]
             ),
-            is_novel=(cand_max_sim[story_id_to_idx[r.story.id]] <= sim_threshold),
+            is_novel=(
+                cand_max_sim[story_id_to_idx[r.story.id]]
+                <= sim_thresholds[story_id_to_idx[r.story.id]]
+            ),
             is_discussion_rich=(
-                cand_comment_counts[story_id_to_idx[r.story.id]] >= discussion_threshold
+                cand_comment_counts[story_id_to_idx[r.story.id]]
+                >= discussion_thresholds[story_id_to_idx[r.story.id]]
                 and cand_comment_counts[story_id_to_idx[r.story.id]] > 0
             ),
             is_high_engagement=(
-                cand_scores[story_id_to_idx[r.story.id]] >= engagement_threshold
+                cand_scores[story_id_to_idx[r.story.id]]
+                >= engagement_thresholds[story_id_to_idx[r.story.id]]
             ),
             is_hot=(
                 cand_velocities[story_id_to_idx[r.story.id]] >= hot_threshold
@@ -2023,7 +2236,6 @@ def rerank_candidates(
     # Score is intentionally not blended in: "novel" means "semantically
     # distant from anything you've voted on" and should surface regardless of
     # how the model would have ranked the story.
-    uncertain_ids = {r.story.id for r in uncertain_candidates}
     idx_for = story_id_to_idx.__getitem__
 
     def _novel_sort_key(r: RankedStory) -> float:
@@ -2050,32 +2262,63 @@ def rerank_candidates(
 
     discovery_passes: list[DiscoveryPass] = [
         DiscoveryPass(
-            name="uncertain",
+            name="uncertain-recent",
             attr="is_uncertain",
-            predicate=lambda r: r.story.id in uncertain_ids,
+            predicate=lambda r: r.prob_down is not None
+            and get_entropy(r) >= uncertain_entropy_thresholds[idx_for(r.story.id)],
             sort_key=lambda r: float(get_entropy(r)),
-            slot_limit=UNCERTAIN_DISCOVERY_SLOT_LIMIT,
+            slot_limit=UNCERTAIN_DISCOVERY_RECENT_SLOTS,
+            age="recent",
         ),
         DiscoveryPass(
-            name="novel",
+            name="archive-top",
+            attr=None,
+            predicate=lambda r: r.story.source in {BQ_ARCHIVE_SOURCE, CH_ARCHIVE_SOURCE}
+            and r.story.time < recent_cutoff,
+            sort_key=lambda r: float(r.story.score),
+            slot_limit=ARCHIVE_TOP_DISCOVERY_SLOT_LIMIT,
+        ),
+        DiscoveryPass(
+            name="novel-recent",
             attr="is_novel",
-            predicate=lambda r: cand_max_sim[idx_for(r.story.id)] <= sim_threshold,
+            predicate=lambda r: cand_max_sim[idx_for(r.story.id)]
+            <= sim_thresholds[idx_for(r.story.id)],
             sort_key=_novel_sort_key,
-            slot_limit=DISCOVERY_SLOT_LIMIT,
+            slot_limit=NOVEL_DISCOVERY_RECENT_SLOTS,
+            age="recent",
         ),
         DiscoveryPass(
-            name="similar",
+            name="novel-archive",
+            attr="is_novel",
+            predicate=lambda r: cand_max_sim[idx_for(r.story.id)]
+            <= sim_thresholds[idx_for(r.story.id)],
+            sort_key=_novel_sort_key,
+            slot_limit=NOVEL_DISCOVERY_ARCHIVE_SLOTS,
+            age="archive",
+        ),
+        DiscoveryPass(
+            name="similar-recent",
             attr="is_similar",
             predicate=lambda r: cand_closest_up[idx_for(r.story.id)]
-            >= similar_threshold,
+            >= similar_thresholds[idx_for(r.story.id)],
             sort_key=_similar_sort_key,
-            slot_limit=DISCOVERY_SLOT_LIMIT,
+            slot_limit=SIMILAR_DISCOVERY_RECENT_SLOTS,
+            age="recent",
+        ),
+        DiscoveryPass(
+            name="similar-archive",
+            attr="is_similar",
+            predicate=lambda r: cand_closest_up[idx_for(r.story.id)]
+            >= similar_thresholds[idx_for(r.story.id)],
+            sort_key=_similar_sort_key,
+            slot_limit=SIMILAR_DISCOVERY_ARCHIVE_SLOTS,
+            age="archive",
         ),
         DiscoveryPass(
             name="discussion-rich",
             attr="is_discussion_rich",
             predicate=lambda r: cand_comment_counts[idx_for(r.story.id)]
-            >= discussion_threshold
+            >= discussion_thresholds[idx_for(r.story.id)]
             and cand_comment_counts[idx_for(r.story.id)] > 0,
             sort_key=_discussion_sort_key,
             slot_limit=DISCOVERY_SLOT_LIMIT,
@@ -2084,7 +2327,7 @@ def rerank_candidates(
             name="high-engagement",
             attr="is_high_engagement",
             predicate=lambda r: cand_scores[idx_for(r.story.id)]
-            >= engagement_threshold,
+            >= engagement_thresholds[idx_for(r.story.id)],
             sort_key=_engagement_sort_key,
             slot_limit=POPULARITY_DISCOVERY_SLOT_LIMIT,
         ),
@@ -2109,19 +2352,45 @@ def rerank_candidates(
     for pass_ in discovery_passes:
         if pass_.slot_limit <= 0:
             continue
-        pool = [r for r in remaining_decorated if pass_.predicate(r)]
+        if pass_.age == "recent":
+            age_mask = recent_mask
+        elif pass_.age == "archive":
+            age_mask = ~recent_mask
+        else:
+            age_mask = None
+        pool = [
+            r
+            for r in remaining_decorated
+            if pass_.predicate(r)
+            and (age_mask is None or bool(age_mask[idx_for(r.story.id)]))
+        ]
         if not pool:
             continue
         pool.sort(key=pass_.sort_key, reverse=True)
-        items = [replace(r, **{pass_.attr: True}) for r in pool[: pass_.slot_limit]]
+        items = [
+            replace(r, **{pass_.attr: True}) if pass_.attr else r
+            for r in pool[: pass_.slot_limit]
+        ]
         final.extend(items)
         selected_ids |= {item.story.id for item in items}
         remaining_decorated = [
             r for r in remaining_decorated if r.story.id not in selected_ids
         ]
 
-    # Ensure is_non_hn is correct for all items (discovery passes don't set it)
-    final = [replace(r, is_non_hn=(not is_hn_source(r.story.source))) for r in final]
+    # Ensure is_non_hn and is_recent are correct for all items. Discovery
+    # passes do not write these — the archive-top pass has attr=None, and
+    # is_recent is derived from the story's `time` regardless of which pass
+    # surfaced it. `int(now_ts)` is used so the 30d cutoff is an integer
+    # second, matching the storage format of `story.time`.
+    recent_cutoff = int(now_ts) - 30 * 86400
+    final = [
+        replace(
+            r,
+            is_non_hn=(not is_hn_source(r.story.source)),
+            is_recent=(r.story.time >= recent_cutoff),
+        )
+        for r in final
+    ]
 
     final.sort(key=lambda r: r.score, reverse=True)
     return final
@@ -2374,7 +2643,7 @@ def fast_rerank_for_user(
 
     cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
 
-    return rerank_candidates(
+    ranked = rerank_candidates(
         db=db,
         config=config,
         embedder=embedder,
@@ -2382,6 +2651,38 @@ def fast_rerank_for_user(
         cand_embeddings=cand_embeddings,
         user_id=user_id,
     )
+
+    return _apply_dedup_to_ranked(ranked, db, config, user_id)
+
+
+def _apply_dedup_to_ranked(
+    ranked: list[RankedStory],
+    db: Database,
+    config: Config,
+    user_id: int,
+) -> list[RankedStory]:
+    """Filter *ranked* through :func:`dedup.dedup_ranked`.
+
+    Pulls this user's feedback (so the URL/title-exclusion logic has
+    data) and applies a :class:`dedup.DedupConfig` built from the
+    :class:`ModelConfig`. Preserves the caller's rank order.
+    """
+    from dedup import DedupConfig, dedup_ranked
+
+    model_cfg = config.model
+    dedup_cfg = DedupConfig(
+        render_enabled=model_cfg.dedup_render_enabled,
+        title_fuzzy_enabled=model_cfg.dedup_title_fuzzy_enabled,
+        title_fuzzy_hamming=model_cfg.dedup_title_fuzzy_hamming,
+        require_same_domain_for_fuzzy=model_cfg.dedup_title_fuzzy_same_domain,
+        exclude_actions=tuple(model_cfg.dedup_exclude_actions),
+    )
+    feedback = db.get_all_feedback(user_id=user_id)
+    survivor_stories = dedup_ranked(
+        [r.story for r in ranked], feedback, dedup_cfg, user_id=user_id
+    )
+    survivors_by_id = {s.id: s for s in survivor_stories}
+    return [r for r in ranked if r.story.id in survivors_by_id]
 
 
 async def fetch_candidates_only(

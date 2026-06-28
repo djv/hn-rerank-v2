@@ -147,10 +147,12 @@ def test_static_serving(test_env):
         follow_redirects=True,
     )
     assert resp.status_code == 200
-    assert 'data-mode="default"' in resp.text
-    assert 'data-mode="popular"' in resp.text
-    assert 'data-mode="explore"' in resp.text
-    assert 'data-mode="date"' in resp.text
+    assert 'data-sort="recommended"' in resp.text
+    assert 'data-sort="popular"' in resp.text
+    assert 'data-sort="explore"' in resp.text
+    assert 'data-sort="date"' in resp.text
+    assert 'data-age="recent"' in resp.text
+    assert 'data-age="archive"' in resp.text
     assert 'class="refresh-progress"' in resp.text
     assert 'id="sort-toggle"' not in resp.text
     assert 'id="queue-status"' not in resp.text
@@ -1522,7 +1524,10 @@ def test_keydown_uses_letter_keys():
     assert "Votes until refresh" in template
     assert "width: 120px" in template
     # mode and source tabs have filled active style
-    assert ".mode-tab.active {\n      background: var(--pico-primary);" in template
+    assert (
+        ".sort-tab.active, .age-tab.active {\n      background: var(--pico-primary);"
+        in template
+    )
     assert ".source-tab.active {\n      background: #6c757d;" in template
     # feedback button has filled, shadowed style
     assert "box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);" in template
@@ -1742,13 +1747,112 @@ def test_bump_all_cached_versions(swr_handler):
     assert h._dashboard_versions[3] == 1
 
 
-def test_setMode_consumes_pending_refill_on_tab_click():
-    """Regression: clicking a mode tab while 'New ranking ready' is showing
+def test_setSort_consumes_pending_refill_on_tab_click():
+    """Regression: clicking a sort tab while 'New ranking ready' is showing
     should auto-consume the preloaded ranking without requiring the manual
     Refresh button."""
     _, static = _read_template_and_static()
-    idx = static.index("function setMode(")
-    end = static.index("function setSource(", idx)
+    idx = static.index("function setSort(")
+    end = static.index("function setAge(", idx)
     body = static[idx:end]
     assert "refillQueued" in body
     assert "refillWhenReady" in body
+
+
+def test_archive_age_tab_button_exists():
+    """Archive age-tab button exists and idle prefetch pre-warms the other age."""
+    template, static = _read_template_and_static()
+    assert 'data-age="archive"' in template
+    # Idle prefetch uses other-age logic.
+    assert "function scheduleIdleAgePrefetch" in static
+    assert "otherAge" in static
+    assert "cardsForAge" in static
+
+
+def test_matchesCurrentAxes_filters_by_age_and_sort():
+    """matchesCurrentAxes filters by age (currentAge + data-is-recent)
+    and sort (currentSort + data-sort-popular / data-sort-explore)."""
+    _, static = _read_template_and_static()
+    idx = static.index("function matchesCurrentAxes(")
+    end = static.index("function queuedCards(", idx)
+    body = static[idx:end]
+    # Age checks: archive/recent branches reference isRecent.
+    assert "currentAge === 'archive'" in body
+    assert "currentAge === 'recent'" in body
+    assert "card.dataset.isRecent" in body
+    # Sort checks: popular/explore reference sortPopular / sortExplore.
+    assert "card.dataset.sortPopular" in body
+    assert "card.dataset.sortExplore" in body
+
+
+def test_orderForCurrentSort_uses_orderByRank_for_recommended():
+    """Recommended sort uses orderByRank (score desc); popular/explore shuffle."""
+    _, static = _read_template_and_static()
+    idx = static.index("function orderForCurrentSort(")
+    end = static.index("function updateRefreshProgress(", idx)
+    body = static[idx:end]
+    assert "currentSort === 'recommended'" in body
+    assert "orderByRank" in body
+    assert "shuffleStories" in body
+
+
+def test_data_is_recent_attribute_emitted(test_env):
+    """Per-card data-is-recent attribute is set correctly based on story age."""
+    import re
+
+    port, db, regen_event, handler, user = test_env
+    now = int(time.time())
+    # 2 recent HN stories, 2 old archive stories. The reranker should
+    # surface at least one of each group in the final deck.
+    recent_id = 5001
+    old_id = 5002
+    db.upsert_story(
+        Story(
+            id=recent_id,
+            title="Recent HN story",
+            url=None,
+            score=300,
+            time=now - 3600,  # 1h old
+            text_content="A recent HN story with content.",
+            source="hn",
+            comment_count=10,
+        )
+    )
+    db.upsert_story(
+        Story(
+            id=old_id,
+            title="Old archive story",
+            url=None,
+            score=200,
+            time=now - 365 * 86400,  # 1 year old
+            text_content="An old archive story with content.",
+            source="ch_seed",
+            comment_count=5,
+        )
+    )
+    handler._render_dashboard_for_user(user)
+    _wait_for_cache(handler, user, 0, timeout=3.0)
+    resp = httpx.get(
+        f"http://127.0.0.1:{port}/",
+        cookies={"hn_token": user.token},
+        follow_redirects=True,
+    )
+    assert resp.status_code == 200
+    text = resp.text
+    # Both cards should be in the HTML.
+    recent_card_pat = re.search(
+        rf'<article class="story-card[^"]*"[^>]*data-story-id="{recent_id}"[^>]*>',
+        text,
+        re.DOTALL,
+    )
+    old_card_pat = re.search(
+        rf'<article class="story-card[^"]*"[^>]*data-story-id="{old_id}"[^>]*>',
+        text,
+        re.DOTALL,
+    )
+    assert recent_card_pat is not None, "Recent story card not in HTML"
+    assert old_card_pat is not None, "Old story card not in HTML"
+    recent_card = recent_card_pat.group(0)
+    old_card = old_card_pat.group(0)
+    assert 'data-is-recent="1"' in recent_card
+    assert 'data-is-recent="0"' in old_card

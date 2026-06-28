@@ -5,7 +5,8 @@ and 4 k-NN similarity features (sim_to_upvoted, sim_to_downvoted,
 closest_upvoted, closest_downvoted) = 389-dim.
 
 Removed: scores, comment_counts, hn_quality, comment_score_ratio,
-score_velocity, comment_velocity, is_hn.
+score_velocity, comment_velocity, is_hn_live, is_archive, is_reddit,
+is_rss.
 
 Compares against full-feature baseline in eval_report.json.
 """
@@ -340,7 +341,10 @@ def main() -> None:
             closest_upvoted=fb_closest_up,
             closest_downvoted=fb_closest_down,
             comment_score_ratio=None,
-            is_hn=None,
+            is_hn_live=None,
+            is_archive=None,
+            is_reddit=None,
+            is_rss=None,
         )
         X_cand = _augment_features(
             fold_cand_emb,
@@ -356,7 +360,10 @@ def main() -> None:
             closest_upvoted=cand_closest_up,
             closest_downvoted=cand_closest_down,
             comment_score_ratio=None,
-            is_hn=None,
+            is_hn_live=None,
+            is_archive=None,
+            is_reddit=None,
+            is_rss=None,
         )
 
         emb_dim = cand_emb.shape[1]
@@ -440,7 +447,7 @@ def main() -> None:
             "relevance_grade": "up=1, neutral=0.2, down=0",
             "db_sha256": _db_sha256(config.db_path),
             "feature_set": "common-only (embeddings + text_length + 4 sim)",
-            "removed": "scores, comment_counts, hn_quality, comment_score_ratio, score_velocity, comment_velocity, is_hn",
+            "removed": "scores, comment_counts, hn_quality, comment_score_ratio, score_velocity, comment_velocity, is_hn_live, is_archive, is_reddit, is_rss",
             "n_features": int(X_train_scaled.shape[1]),
         },
         "formulas": {

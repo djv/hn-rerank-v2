@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from database import Database, Story
 from eval import _load_candidates, _evaluate_fold
 from legacy_features import _augment_features
-from pipeline import Config
+from pipeline import Config, source_category_stack
 
 LOG_POINTS_SCALE = 2.0
 LOG_COMMENTS_SCALE = 1.0
@@ -325,6 +325,16 @@ def _main():
             else:
                 fb_closest_down = np.zeros(len(fb_train_emb))
 
+            fb_train_source = source_category_stack(
+                [
+                    s.source
+                    for s in (fb_stories[i] for i in np.where(valid)[0][train_pos])
+                ]
+            )
+            fold_cand_source = source_category_stack(
+                [s.source for s in fold_candidates]
+            )
+
             X_train = _augment_features(
                 fb_train_emb,
                 fb_train_scores,
@@ -336,6 +346,10 @@ def _main():
                 sim_to_downvoted=fb_sim_down,
                 closest_upvoted=fb_closest_up,
                 closest_downvoted=fb_closest_down,
+                is_hn_live=fb_train_source[:, 0],
+                is_archive=fb_train_source[:, 1],
+                is_reddit=fb_train_source[:, 2],
+                is_rss=fb_train_source[:, 3],
             )
             X_cand = _augment_features(
                 fold_cand_emb,
@@ -348,6 +362,10 @@ def _main():
                 sim_to_downvoted=cand_sim_down,
                 closest_upvoted=cand_closest_up,
                 closest_downvoted=cand_closest_down,
+                is_hn_live=fold_cand_source[:, 0],
+                is_archive=fold_cand_source[:, 1],
+                is_reddit=fold_cand_source[:, 2],
+                is_rss=fold_cand_source[:, 3],
             )
 
             # Add extra features

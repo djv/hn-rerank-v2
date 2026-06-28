@@ -26,7 +26,6 @@ from pipeline import (
     Config,
     RankedStory,
     _knn_similarity,
-    is_hn_source,
     mmr_filter,
 )
 
@@ -406,13 +405,10 @@ def main() -> None:
         fold_cand_csr_ratio = fold_cand_comments / np.maximum(fold_cand_scores, 1)
         fold_cand_csr = np.clip(np.log1p(fold_cand_csr_ratio), 0, 3.0) / 3.0
 
-        fb_train_is_hn = np.array(
-            [1.0 if is_hn_source(s.source) else 0.0 for s in fb_train_stories]
-        )
+        from pipeline import source_category_stack
 
-        fold_cand_is_hn = np.array(
-            [1.0 if is_hn_source(s.source) else 0.0 for s in fold_candidates]
-        )
+        fb_train_source = source_category_stack([s.source for s in fb_train_stories])
+        fold_cand_source = source_category_stack([s.source for s in fold_candidates])
 
         X_train = _augment_features(
             fb_train_emb,
@@ -428,7 +424,10 @@ def main() -> None:
             closest_upvoted=fb_closest_up,
             closest_downvoted=fb_closest_down,
             comment_score_ratio=fb_train_csr,
-            is_hn=fb_train_is_hn,
+            is_hn_live=fb_train_source[:, 0],
+            is_archive=fb_train_source[:, 1],
+            is_reddit=fb_train_source[:, 2],
+            is_rss=fb_train_source[:, 3],
         )
         X_cand = _augment_features(
             fold_cand_emb,
@@ -444,7 +443,10 @@ def main() -> None:
             closest_upvoted=cand_closest_up,
             closest_downvoted=cand_closest_down,
             comment_score_ratio=fold_cand_csr,
-            is_hn=fold_cand_is_hn,
+            is_hn_live=fold_cand_source[:, 0],
+            is_archive=fold_cand_source[:, 1],
+            is_reddit=fold_cand_source[:, 2],
+            is_rss=fold_cand_source[:, 3],
         )
 
         counts = Counter(y_train)

@@ -129,14 +129,21 @@
       50% { opacity: 0.45; }
     }
 
-    .mode-tabs {
+    .sort-tabs {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 0.35rem;
+      margin-bottom: 0.3rem;
+    }
+
+    .age-tabs {
       display: grid;
       grid-template-columns: 1fr;
       gap: 0.35rem;
       margin-bottom: 0.6rem;
     }
 
-    .mode-tab {
+    .sort-tab, .age-tab {
       width: 100%;
       margin: 0;
       padding: 0.4rem 0.6rem;
@@ -152,13 +159,13 @@
       transition: all 0.15s;
     }
 
-    .mode-tab:hover {
+    .sort-tab:hover, .age-tab:hover {
       background: color-mix(in srgb, var(--pico-primary) 8%, var(--pico-card-background-color));
       border-color: var(--pico-primary);
       color: var(--pico-color);
     }
 
-    .mode-tab.active {
+    .sort-tab.active, .age-tab.active {
       background: var(--pico-primary);
       color: white;
       border-color: var(--pico-primary);
@@ -774,9 +781,16 @@
         margin-bottom: 0.4rem;
       }
 
-      .mode-tabs {
+      .sort-tabs {
         display: grid;
         grid-template-columns: repeat(4, 1fr);
+        gap: 0.3rem;
+        margin-bottom: 0;
+      }
+
+      .age-tabs {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
         gap: 0.3rem;
         margin-bottom: 0;
       }
@@ -816,6 +830,8 @@
         max-height: 100%;
       }
 
+      .vote-counts { display: none; }
+
     }
 
 
@@ -839,8 +855,9 @@
                data-time="{{ item.story.time }}"
                data-source="{{ item.story.source }}"
                data-is-hn="{{ '0' if item.is_non_hn else '1' }}"
-               data-mode-popular="{{ '1' if item.is_hot or item.is_high_engagement or item.is_discussion_rich else '0' }}"
-               data-mode-explore="{{ '1' if item.is_uncertain or item.is_similar or item.is_novel else '0' }}"
+                data-sort-popular="{{ '1' if item.is_hot or item.is_high_engagement or item.is_discussion_rich else '0' }}"
+                data-sort-explore="{{ '1' if item.is_uncertain or item.is_similar or item.is_novel else '0' }}"
+                data-is-recent="{{ '1' if item.is_recent else '0' }}"
                data-article-url="{{ item.story.url or '' }}"
                data-comments-url="{{ item.story.discussion_url or '' }}">
         <div class="story-header">
@@ -899,11 +916,15 @@
       </div>
 
       <aside class="swipe-side" aria-label="Queue and keyboard controls">
-        <div class="mode-tabs" aria-label="Story mode">
-          <button type="button" class="mode-tab active" data-mode="default">Default</button>
-          <button type="button" class="mode-tab" data-mode="popular">Popular</button>
-          <button type="button" class="mode-tab" data-mode="explore">Explore</button>
-          <button type="button" class="mode-tab" data-mode="date">Date</button>
+        <div class="sort-tabs" aria-label="Sort order">
+          <button type="button" class="sort-tab active" data-sort="recommended">Recommended</button>
+          <button type="button" class="sort-tab" data-sort="popular">Popular</button>
+          <button type="button" class="sort-tab" data-sort="explore">Explore</button>
+          <button type="button" class="sort-tab" data-sort="date">Date</button>
+        </div>
+        <div class="age-tabs" aria-label="Age filter">
+          <button type="button" class="age-tab active" data-age="recent">Recent</button>
+          <button type="button" class="age-tab" data-age="archive">Archive</button>
         </div>
         <div class="source-tabs" aria-label="Source filter">
           <button type="button" class="source-tab active" data-source="mixed">Mixed</button>
@@ -999,7 +1020,8 @@
     const refreshBanner = document.getElementById('refresh-banner');
     const refreshBannerText = document.getElementById('refresh-banner-text');
     const refreshNowBtn = document.getElementById('refresh-now-btn');
-    const modeTabs = Array.from(document.querySelectorAll('[data-mode]'));
+    const sortTabs = Array.from(document.querySelectorAll('[data-sort]'));
+    const ageTabs = Array.from(document.querySelectorAll('[data-age]'));
     const sourceTabs = Array.from(document.querySelectorAll('[data-source]'));
     const voteBar = document.querySelector('.vote-bar');
     let pendingFeedbackRequests = 0;
@@ -1007,7 +1029,8 @@
     let isRefilling = false;
     let activeCard = null;
     let lastVote = null;
-    let currentMode = 'default';
+    let currentSort = 'recommended';
+    let currentAge = 'recent';
     let currentSource = 'mixed';
     let votesSinceRankingRefresh = 0;
     let preloadedRefillDoc = null;
@@ -1018,7 +1041,7 @@
     const PREFETCH_COUNT = 3;
     const IDLE_INACTIVE_PREFETCH_COUNT = 3;
     const VOTES_PER_RANKING_REFRESH = 5;
-    let idleModePrefetchHandle = null;
+    let idleAgePrefetchHandle = null;
 
     function cards() {
       return Array.from(storiesContainer.querySelectorAll('.story-card'));
@@ -1034,19 +1057,17 @@
       return true;
     }
 
-    function matchesCurrentMode(card) {
+    function matchesCurrentAxes(card) {
       if (!matchesCurrentSource(card)) return false;
-      if (currentMode === 'popular') {
-        return card.dataset.modePopular === '1';
-      }
-      if (currentMode === 'explore') {
-        return card.dataset.modeExplore === '1';
-      }
+      if (currentAge === 'archive' && card.dataset.isRecent !== '0') return false;
+      if (currentAge === 'recent' && card.dataset.isRecent !== '1') return false;
+      if (currentSort === 'popular' && card.dataset.sortPopular !== '1') return false;
+      if (currentSort === 'explore' && card.dataset.sortExplore !== '1') return false;
       return true;
     }
 
     function queuedCards() {
-      return cards().filter(card => !card.dataset.voted && matchesCurrentMode(card));
+      return cards().filter(card => !card.dataset.voted && matchesCurrentAxes(card));
     }
 
     // Map a story's rank position (sorted by data-score desc) to a hue.
@@ -1089,9 +1110,9 @@
       cards.forEach(card => storiesContainer.appendChild(card));
     }
 
-    function orderForCurrentMode() {
-      if (currentMode === 'date') orderByDate();
-      else if (currentMode === 'default') orderByRank();
+    function orderForCurrentSort() {
+      if (currentSort === 'date') orderByDate();
+      else if (currentSort === 'recommended') orderByRank();
       else shuffleStories();
     }
 
@@ -1123,7 +1144,7 @@
         voteBar.hidden = true;
       }
       prefetchUpcomingTldrs();
-      scheduleIdleModePrefetch();
+      scheduleIdleAgePrefetch();
       updateQueueStatus();
       maybeRefillQueue();
     }
@@ -1138,19 +1159,35 @@
       setActiveCard(queuedCards()[0] || null);
     }
 
-    function setMode(mode) {
-      currentMode = mode;
-      modeTabs.forEach(tab => {
-        tab.classList.toggle('active', tab.dataset.mode === currentMode);
+    function setSort(sort) {
+      currentSort = sort;
+      sortTabs.forEach(tab => {
+        tab.classList.toggle('active', tab.dataset.sort === currentSort);
       });
-      if (activeCard && !matchesCurrentMode(activeCard)) {
+      if (activeCard && !matchesCurrentAxes(activeCard)) {
         activeCard.classList.remove('active');
       }
       if (refillQueued) {
         refillWhenReady();
       }
-      orderForCurrentMode();
+      orderForCurrentSort();
       showNextCard();
+      scheduleIdleAgePrefetch();
+    }
+
+    function setAge(age) {
+      currentAge = age;
+      ageTabs.forEach(tab => {
+        tab.classList.toggle('active', tab.dataset.age === currentAge);
+      });
+      if (activeCard && !matchesCurrentAxes(activeCard)) {
+        activeCard.classList.remove('active');
+      }
+      if (refillQueued) {
+        refillWhenReady();
+      }
+      showNextCard();
+      scheduleIdleAgePrefetch();
     }
 
     function setSource(source) {
@@ -1158,7 +1195,7 @@
       sourceTabs.forEach(tab => {
         tab.classList.toggle('active', tab.dataset.source === currentSource);
       });
-      if (activeCard && !matchesCurrentMode(activeCard)) {
+      if (activeCard && !matchesCurrentAxes(activeCard)) {
         activeCard.classList.remove('active');
       }
       showNextCard();
@@ -1269,8 +1306,11 @@
     }
 
     refreshNowBtn.addEventListener('click', refillWhenReady);
-    modeTabs.forEach(tab => {
-      tab.addEventListener('click', () => setMode(tab.dataset.mode));
+    sortTabs.forEach(tab => {
+      tab.addEventListener('click', () => setSort(tab.dataset.sort));
+    });
+    ageTabs.forEach(tab => {
+      tab.addEventListener('click', () => setAge(tab.dataset.age));
     });
     sourceTabs.forEach(tab => {
       tab.addEventListener('click', () => setSource(tab.dataset.source));
@@ -1411,41 +1451,33 @@
       });
     }
 
-    function cardsForMode(mode) {
-      const filtered = cards().filter(card => {
+    function cardsForAge(age) {
+      return cards().filter(card => {
         if (card.dataset.voted) return false;
-        if (mode === 'popular') return card.dataset.modePopular === '1';
-        if (mode === 'explore') return card.dataset.modeExplore === '1';
-        return true;
+        if (age === 'archive') return card.dataset.isRecent === '0';
+        return card.dataset.isRecent === '1';
       });
-      if (mode === 'date') {
-        filtered.sort((a, b) => Number(b.dataset.time || 0) - Number(a.dataset.time || 0));
-      }
-      return filtered;
     }
 
-    function scheduleIdleModePrefetch() {
-      if (idleModePrefetchHandle) {
+    function scheduleIdleAgePrefetch() {
+      if (idleAgePrefetchHandle) {
         return;
       }
+      const otherAge = currentAge === 'recent' ? 'archive' : 'recent';
       const run = () => {
-        idleModePrefetchHandle = null;
-        ['default', 'popular', 'explore', 'date']
-          .filter(mode => mode !== currentMode)
-          .forEach(mode => {
-            cardsForMode(mode)
-              .slice(0, IDLE_INACTIVE_PREFETCH_COUNT)
-              .forEach(card => {
-                if (!card.querySelector('.tldr-detail-content')) {
-                  openTldrDetail(card);
-                }
-              });
+        idleAgePrefetchHandle = null;
+        cardsForAge(otherAge)
+          .slice(0, IDLE_INACTIVE_PREFETCH_COUNT)
+          .forEach(card => {
+            if (!card.querySelector('.tldr-detail-content')) {
+              openTldrDetail(card);
+            }
           });
       };
       if ('requestIdleCallback' in window) {
-        idleModePrefetchHandle = window.requestIdleCallback(run, { timeout: 2500 });
+        idleAgePrefetchHandle = window.requestIdleCallback(run, { timeout: 2500 });
       } else {
-        idleModePrefetchHandle = window.setTimeout(run, 1500);
+        idleAgePrefetchHandle = window.setTimeout(run, 1500);
       }
     }
 
@@ -1718,7 +1750,8 @@
 
     // Run initial event binding
     bindEvents();
-    setMode('default');
+    setSort('recommended');
+    setAge('recent');
   </script>
 </body>
 </html>

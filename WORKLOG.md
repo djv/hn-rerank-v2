@@ -5,6 +5,425 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-28 — Per-age-bucket badge thresholds + age-split discovery passes
+
+Fixed two related bugs surfaced by the Sort×Age UX:
+
+1. **Recent+Popular was missing 🏆 Top and 💬 Talk-worthy.** The
+   `engagement_threshold` and `discussion_threshold` were computed as
+   percentiles over *all* candidates (recent + archive combined). Archive
+   candidates have structurally higher absolute scores and comment counts
+   (months/years of accumulation), so the global p90 of scores was 912
+   and p90 of comments was 592 — both dominated by archive stories.
+   Recent stories (p90 score ≈ 143, p90 comments ≈ 161) almost never
+   crossed the global threshold: only 35/6957 recent stories qualified
+   for 🏆, 31/6957 for 💬.
+
+2. **Archive mode showed zero ✨ Novel stories.** The novel discovery
+   pass (single global, 5 slots) was dominated by recent stories
+   (recent is more semantically diverse relative to feedback), and the
+   `archive-top` pass selected by **score** — which anti-correlates
+   with novelty (only 1/12 archive-top stories qualified as novel even
+   with a per-bucket threshold). The two mechanisms combined to keep
+   ✨ out of archive entirely.
+
+**Fix.** Compute the percentile-based thresholds for Top, Talk-worthy,
+Novel, Similar, and Unsure **per age bucket** (recent <30d vs archive
+≥30d) rather than as a single global percentile. Each candidate is
+judged against the threshold of its own cohort via a per-candidate
+`np.ndarray` built with `np.where(recent_mask, recent_th, archive_th)`.
+Additionally, the Unsure, Novel, and Similar discovery passes are
+**split per age** (e.g. `novel-recent` 3 slots + `novel-archive` 3
+slots) via a new `age: str | None = None` field on `DiscoveryPass` —
+the execute loop filters `remaining_decorated` by `story.time` against
+the hoisted `recent_cutoff` when `age` is set. This guarantees the
+badge surfaces in *both* age buckets.
+
+**🔥 Hot stays global.** Its metric is engagement velocity
+(`score / age_hours`), which is structurally near-zero for archive
+stories (months of accumulation divide today's score). A global
+threshold preserves Hot's rarity, and the `HOT_MIN_SCORE=20` floor
+keeps old stories from qualifying. Per-bucketing Hot would wrongly
+mark high-score archive stories as "hot" (their velocities cluster
+near zero, so the archive p99.5 of near-zero is a tiny number).
+
+**Changes in `pipeline.py`:**
+- Hoisted `now_ts = time.time()` + `recent_cutoff = int(now_ts) - 30*86400` +
+  `recent_mask` to before the novel/similar threshold block so all
+  thresholds can use them.
+- New `_bucket_pct(values, mask, pct)` helper.
+- Replaced 5 scalar thresholds with per-bucket arrays:
+  `engagement_thresholds`, `discussion_thresholds`, `sim_thresholds`,
+  `similar_thresholds`, `uncertain_entropy_thresholds`. `hot_threshold`
+  stays scalar global.
+- Primary-attribution block indexes into the per-candidate arrays.
+- New constants: `UNCERTAIN_DISCOVERY_{RECENT,ARCHIVE}_SLOTS`,
+  `NOVEL_DISCOVERY_{RECENT,ARCHIVE}_SLOTS`,
+  `SIMILAR_DISCOVERY_{RECENT,ARCHIVE}_SLOTS`.
+- Added `age: str | None = None` to `DiscoveryPass`; execute loop
+  filters `remaining_decorated` by age when set.
+- Replaced single `uncertain`, `novel`, `similar` discovery passes
+  with per-age variants (`uncertain-recent` + `uncertain-archive`,
+  `novel-recent` + `novel-archive`, `similar-recent` + `similar-archive`).
+- Removed unused `uncertain_ids` set (predicate now uses
+  `get_entropy(r) >= uncertain_entropy_thresholds[idx]`).
+- Reused hoisted `recent_cutoff` in `archive-top` predicate (was
+  recomputed inline as `int(now_ts) - 30 * 86400`).
+- The `non-hn` pass still uses `>= 20` feedback threshold; no change.
+
+**Slot budget change:** Net +2 slots (Novel 5→6, Similar 5→6; Unsure
+stays 5 split 3/2). Final size grows ~2.
+
+**Tests (`tests/test_pipeline.py`):**
+- New `test_badge_thresholds_computed_per_age_bucket`: mixes 10 recent
+  (score 10..100) + 10 archive (score 1000..5500) candidates; asserts
+  a recent story with score=100 gets 🏆/💬 under the per-bucket
+  threshold (100) that it would not have under the old global
+  threshold (5000).
+- New `test_novel_archive_pass_surfaces_archive_novel`: 12 recent
+  primary + 12 archive fillers (consumed by `archive-top`) + 4 archive
+  novel targets; asserts the archive novel targets reach `final` with
+  `is_novel=True` via the `novel-archive` pass — proving the split
+  actually surfaces ✨ in archive mode.
+- Updated `test_novel_pass_ranks_purely_by_distance_not_score`: the
+  all-recent pool now exercises `novel-recent` (slot_limit=3 instead
+  of the old 5), so the cut boundary moved from 5th-by-distance to
+  3rd-by-distance. The pure-distance property is preserved (lowest-
+  score qualifier at the 3rd slot is picked, highest-score qualifier
+  beyond the cut is dropped).
+- Existing `test_top_badge_threshold_uses_config_percentile_and_floor`
+  and `test_discussion_badge_threshold_uses_config_percentile_and_floor`
+  use all-recent candidates, so per-bucket = global → pass unchanged.
+
+**Diagnostic verification** (60 recent + 120 archive, before vs after):
+
+| Badge | Before (recent, archive) | After (recent, archive) |
+|---|---|---|
+| 🏆 Top | (0, 0) | **(5, 0)** |
+| 💬 Talk-worthy | (0, 5) | (2, 6) |
+| ✨ Novel | (0, 4) | **(3, 3)** |
+| 🎯 Similar | (0, 0) | (1, 3) |
+| 🤔 Unsure | (0, 8) | (3, 0) |
+| 🔥 Hot | (1, 0) | (1, 0) — unchanged |
+
+Recent+Popular now shows 🏆/💬; Archive mode now shows ✨/🎯.
+
+**Docs:**
+- `ARCHITECTURE.md:135-148` rewritten to describe per-bucket thresholds
+  + per-age-split passes; Hot documented as the sole global exception
+  with the reasoning.
+- `ARCHITECTURE.md:148` updated to reflect the new slot budget
+  (3+2=5 uncertain, 3+3=6 novel, 3+3=6 similar).
+
+**Known follow-up (not fixed):** The `archive-top` discovery pass has
+`attr=None` and does not set `is_high_engagement=True` on the 12
+archive stories it surfaces. Since these are by definition the
+highest-score archive candidates, they should logically carry 🏆 Top.
+Adding `attr="is_high_engagement"` to the `archive-top` pass would
+make this self-consistent, but is deferred as out of scope for the
+per-bucket fix (the user's reported bugs are resolved without it).
+
+---
+
+## 2026-06-28 — Dedup logging (per-render summary + per-suppression DEBUG)
+
+`dedup_ranked` now emits a single INFO summary line per call and a DEBUG
+line per suppressed story, so the dedup pass is debuggable from the
+server journal without rerunning the pipeline.
+
+**Files:**
+- `dedup.py`: new `import logging`, `logger = logging.getLogger(__name__)`,
+  `dedup_ranked` accepts `user_id: int | None = None` kwarg (logging-only),
+  two helpers `_log_summary` (INFO) and `_log_suppressions` (DEBUG). The
+  function tracks `url_dup_suppressed`, `fb_url_excluded`,
+  `title_fuzzy_suppressed`, `fb_title_excluded` lists during the run and
+  emits structured key=value log lines at the end.
+- `pipeline.py:_apply_dedup_to_ranked`: passes `user_id=user_id` through.
+- `tests/test_dedup.py`: 7 new tests using `caplog` — INFO summary shape,
+  DEBUG per-suppression, fb_url reason, title-fuzzy reason, no-suppression
+  still logs, user_id rendering, user_id placeholder when omitted.
+- `ARCHITECTURE.md §3.4.1`: new "Logging" bullet documenting the format
+  and how to enable DEBUG detail.
+
+**Log format:**
+
+INFO summary (always on at server INFO level):
+```
+dedup user_id=153 in=57 out=57 suppressed=0 url_dups=0 fb_url=0
+      title_fuzzy=off title_fuzzy_dups=0 fb_title=0 buckets>1=0
+      largest_bucket=1 fb_url_pool=0
+```
+
+DEBUG per suppression (off by default):
+```
+dedup-suppress user_id=42 reason=url_dup dropped_id=2
+      dropped_source=rss_reddit_ dropped_url=https://example.com/x
+      kept_id=1 kept_source=hn
+dedup-suppress user_id=42 reason=fb_url dropped_id=11
+      dropped_source=ch_seed dropped_url=https://... fb_url=example.com/x
+dedup-suppress user_id=42 reason=title_fuzzy dropped_id=33
+      dropped_source=rss_reddit_ dropped_title='Show HN: Foo'
+      kept_id=44 kept_source=hn
+dedup-suppress user_id=42 reason=fb_title dropped_id=55
+      dropped_source=ch_seed dropped_title='My Project' fb_title='My Project'
+```
+
+**Why structured.** Server logs are read with `journalctl --user -u
+hn_rewrite.service | grep '^.*dedup '` to see per-render dedup activity;
+DEBUG details are inspected after flipping
+`logging.getLogger("dedup").setLevel(logging.DEBUG)` when triaging a
+specific duplicate or feedback-exclusion issue. The user_id field is the
+render's `Database.user_id`, so multi-user logs (if ever enabled) are
+diff-able.
+
+**Why INFO+DEBUG, not INFO-only.** Per-suppression at INFO would flood
+the journal on busy days (5-15 events/render, 4-5 users = 20-75 lines
+per cycle). The summary is the always-on "did dedup do anything
+interesting?" line; the DEBUG stream is for forensic "why did THIS story
+get dropped?" queries.
+
+**Verification:**
+- `uv run pytest tests/test_dedup.py -n 4` → 40 passed in 4.2s
+- `uv run pytest tests/ -n 4` → 293 passed, 1 skipped (torch)
+- `uv run ruff check .` and `uv run ty check` → clean
+- Live server: INFO summary line visible in
+  `journalctl --user -u hn_rewrite.service --since "5m ago" | grep dedup`
+  with correct in/out counts matching the rendered deck (57 input, 57
+  output, 0 suppressed on the test pass).
+- DEBUG suppression line confirmed via
+  `uv run python -c "..."` repro with two stories sharing a URL.
+
+---
+## 2026-06-28 — Cross-source URL & title dedup at render time
+
+The same article can arrive from multiple sources — two HN submissions
+of the same Verge article (the well-known `[dupe]` pattern on the HN
+thread, e.g. https://news.ycombinator.com/item?id=48680194 → 48678789),
+an HN story linking a Reddit thread plus a Reddit RSS feed catching
+the same thread, etc. Without explicit handling, the same canonical
+URL rendered twice in the deck. New `dedup.py` module centralizes
+duplicate resolution at the end of `fast_rerank_for_user` so the policy
+covers all primary-ranked and extra-slot stories, including ones that
+arrived in different regen cycles.
+
+**Why at render time, not fetch.** Old code did a one-shot within-fetch
+URL-equality pass inside `fetch_candidates` (raw string equality,
+order-dependent, no source preference). That doesn't catch the two-HN-
+submissions case, doesn't catch `www.`/scheme/utm-param variations,
+and can't express the "vote on the Reddit version, hide the HN version"
+policy. The fetch-time block is removed; dedup is now a single render-
+time pass with a typed policy.
+
+**What it does** (see `dedup.py` for the typed API):
+
+* `normalize_url(raw)` — strips scheme, lowercases host, drops `www.`,
+  strips trailing `/`, drops ~30 known tracking query params
+  (`utm_*`, `fbclid`, `gclid`, `ref`, `ref_src`, ...), drops fragment,
+  sorts remaining query params. Idempotent. Real-world test: the two
+  HN item 48680194/48678789 story URLs to the same Verge article with
+  different `utm_source` → normalize to identical.
+* `canonical_domain(url)` — last two host labels as a poor-man's
+  eTLD+1. Used to gate the optional title-fuzzy layer. Deliberately
+  avoids a Public Suffix List dep.
+* `normalize_title(raw)` — lowercase, strip `Show HN:`/`Ask HN:`/
+  `Tell HN:` lead-ins, strip punctuation, collapse whitespace.
+* `simhash64(text)` + `hamming64(a, b)` — 64-bit word-token SimHash for
+  near-duplicate title detection. Standard property: hamming distance
+  approximates (1 − cosine_similarity).
+* `dedup_ranked(stories, feedback, cfg)` — given a rank-ordered
+  candidate list and the user's feedback, returns a deduped list
+  preserving caller's order outside duplicate buckets.
+
+**Policy** (configurable via `config.toml` `[hn_rewrite.model] dedup_*`):
+
+* Source preference, lowest-rank wins: `hn` → `bq_seed`/`ch_seed` →
+  `rss_reddit_*` → `rss_lesswrong_com` → other `rss_*`. Within the
+  same source, higher `score` wins; final tiebreak on `id asc` for
+  determinism.
+* `dedup_render_enabled = true` (default). When false, dedup is a
+  no-op and the function returns the input unchanged.
+* `dedup_exclude_actions = ("up", "neutral")` (default). Per design
+  call: a *downvote* on one version of an article is intentionally NOT
+  propagated to the alternate source. The user may still want to see
+  the HN version of an article whose Reddit thread they disliked.
+* `dedup_title_fuzzy_enabled = false` (default). When off, only URL
+  dedup runs. When on, near-duplicate titles (SimHash hamming ≤
+  `dedup_title_fuzzy_hamming`, default 2 bits) are also collapsed,
+  gated by `dedup_title_fuzzy_same_domain` (default true) to avoid
+  accidental cross-domain collisions.
+* Same `exclude_actions` / `same_domain` rules apply to title-based
+  feedback exclusion: an upvoted title suppresses near-identical
+  future titles on the same canonical domain.
+
+**Files**:
+
+* `dedup.py` (new, ~280 lines): typed pure-function module.
+  `NormalizedUrl`/`NormalizedTitle`/`SimHash64`/`Domain` `NewType`s;
+  `DedupConfig` dataclass; no I/O, no DB, no global state. Idempotent
+  URL normalization + 64-bit SimHash (no new deps — stdlib only).
+* `pipeline.py`:
+  * `ModelConfig` gets 5 new fields: `dedup_render_enabled`,
+    `dedup_title_fuzzy_enabled`, `dedup_title_fuzzy_hamming`,
+    `dedup_title_fuzzy_same_domain`, `dedup_exclude_actions`.
+  * `Config.load` plumbs them through from `config.toml`.
+  * `_apply_dedup_to_ranked(ranked, db, config, user_id)` runs
+    `dedup_ranked` after `rerank_candidates` and filters the
+    `RankedStory` list. Fast lookup via the user's `get_all_feedback`
+    (no extra DB round-trip).
+  * `fetch_candidates` no longer does in-line URL dedup (the old
+    `seen_urls` block is gone). The user's feedback URLs still flow
+    into `fetch_rss_feeds.exclude_urls` as a network-cost guard
+    (don't re-pull RSS entries the user has voted on).
+* `tests/test_dedup.py` (new, 33 tests): property tests for URL/title
+  normalization, SimHash determinism, hamming-distance properties,
+  and unit tests for `dedup_ranked` covering all policy branches
+  (URL dedup, source preference, feedback URL exclusion by action,
+  title-fuzzy on/off, domain guard on/off, feedback title
+  exclusion). Two end-to-end tests go through `fast_rerank_for_user`
+  to confirm the wiring.
+* `ARCHITECTURE.md`: new §3.4.1 "Cross-source URL & title dedup"
+  documenting the policy and config knobs.
+
+**Verification** (this branch's working tree, 2026-06-28):
+
+* `uv run pytest tests/ -n 4` = 285 passed, 1 skipped (torch), 1
+  pre-existing failure (`test_novel_archive_pass_surfaces_archive_novel`,
+  in-progress `_MODEL_SCHEMA_VERSION=2`/4-binary source-category
+  refactor — unrelated to dedup).
+* `uv run pytest tests/test_dedup.py -n 4` = 33 passed in 9.2s.
+* `uv run ruff check .` = clean (one pre-existing unused-variable
+  warning in `tests/test_pipeline.py:2300` is from the same in-progress
+  refactor, not from dedup code).
+* `uv run ty check` = clean.
+
+---
+
+## 2026-06-28 — 4-binary source category features + non-HN boost removal
+
+Replaced the single `is_hn` flag in the SVM feature schema with four
+binary source-category features (`is_hn_live`, `is_archive`, `is_reddit`,
+`is_rss`) and removed the `score * 2` non-HN boost from the tier-1
+gravity blend.
+
+**Why.** The old `is_hn` flag conflated live HN with archive seeds
+(`bq_seed`/`ch_seed`), so the SVM had no way to learn distinct per-source
+priors. Archive candidates dominated the pool (~70% by count) and
+diluted the candidate ranking. The 4-binary schema lets the model learn
+a separate prior for each source; "other" sources (Slashdot without the
+`rss_` prefix, Tildes, etc.) get the all-zero vector and inherit the
+implicit "other" prior from absence of all four bits.
+
+**Implementation.**
+- New `source_category_onehot()` and `source_category_stack()` in
+  `pipeline.py:127-160` next to the existing `is_hn_source()` helper.
+- `_svm_personalization_features()` now takes 4 source arrays;
+  feature dim goes from `emb_dim + 6` to `emb_dim + 10`.
+- `_augment_features()` (legacy, eval/ablation paths) replaced `is_hn`
+  with 4 source arrays; feature dim goes from 392 to 396 in the
+  full-feature test case.
+- `_MODEL_CACHE` now keyed on `(user_id, signature, _MODEL_SCHEMA_VERSION)`.
+  Bumped to 2 — every active user gets a clean re-fit on next request
+  (this is the correct behavior after a schema change; stale scaler +
+  new feature dim would otherwise produce NaN scores).
+- `tier1_scores` (line 1659 of pipeline.py) no longer multiplies non-HN
+  sources by 2. The 4-binary features carry the prior directly; the
+  heuristic was double-counting.
+
+**Eval.** Primary eval (full candidate pool, 29364 stories, 2404 feedback):
+- `current` raw NDCG@100: **0.600 ± 0.041** (was 0.15 floor pre-change)
+- `current` mmr NDCG@100: 0.425 ± 0.046
+- `strip_hn` raw NDCG@100 (4 binaries zeroed at inference): 0.220 ± 0.044
+- `hn_baseline` raw NDCG@100: 0.015 ± 0.013
+
+`strip_hn` showing a 0.38 NDCG drop vs `current` confirms the 4 binaries
+contribute meaningful signal, not just leakage — the model genuinely
+learns different priors for each source. Per-source hit-rate breakdown
+(not in the report) shows archive hit rate 13.3% at top-100, consistent
+with its 84% upvote rate in the test set; no naked leakage.
+
+**Files touched.** `pipeline.py`, `legacy_features.py`, `eval.py`,
+`eval_rss.py`, `eval_no_hn_features.py`, `scripts/feature_ablation.py`,
+`tests/test_pipeline.py`. 251 tests pass; ruff + ty clean.
+
+---
+
+## 2026-06-28 — Two-axis UX redesign (Sort × Age)
+
+Replaced the single 5-tab mode row (Default/Popular/Explore/Archive/Date)
+with two orthogonal axes: Sort (Recommended/Popular/Explore/Date) and
+Age (Recent/Archive). This makes explicit that Date is a sort (not a filter),
+Archive is an age partition (not a peer mode), and Default was redundant
+(Recommended + Recent).
+
+**Changes:**
+- `templates/index.html`: 5 mode-tabs → 4 sort-tabs + 2 age-tabs; card attrs
+  `data-mode-{popular,explore,recent,archive}` → `data-sort-{popular,explore}`
+  + `data-is-recent`; JS `currentMode`/`matchesCurrentMode`/`orderForCurrentMode`
+  → `{currentSort,currentAge}`/`matchesCurrentAxes`/`orderForCurrentSort`;
+  `scheduleIdleModePrefetch` (5-mode cross product) → `scheduleIdleAgePrefetch`
+  (other-age-only, 3 cards).
+- `tests/test_server.py`: 5 test functions renamed/rewritten to match new
+  function names and data attrs; CSS selector updated.
+- `ARCHITECTURE.md:129`: paragraph rewritten to describe the two-axis model.
+- `pipeline.py` / `tests/test_pipeline.py`: no changes (backend unchanged).
+
+**No badge changes.** The 6 per-card emoji badges (🔥🏆💬🤔🎯✨) still stack
+independently as before.
+
+---
+
+The four existing local deck modes (`Default`, `Popular`, `Explore`, `Date`) now
+filter to stories within the last 30 days only. A new fifth mode `Archive` shows
+stories older than 30 days, sourced primarily from the `bq_seed` / `ch_seed`
+archive pool.
+
+**Decisions:**
+- Boundary is inclusive (`time >= now - 30d` → recent).
+- Per-card attributes `data-mode-recent` and `data-mode-archive` are mutually
+  exclusive. The 4 non-archive modes require `data-mode-recent="1"`; `Archive`
+  requires `data-mode-archive="1"`.
+- `Archive` mode uses score-desc sort with no shuffle (same as `Default`,
+  but no `orderByRank` ties to engagement/freshness).
+
+**Server (`pipeline.py`):**
+- New `RankedStory.is_recent: bool` field (set during the final re-attribution
+  block at the end of `rerank_candidates`, so both primary and extra-slot
+  cards get the correct value).
+- New `ARCHIVE_TOP_DISCOVERY_SLOT_LIMIT = 12` constant.
+- New `archive-top` discovery pass in `rerank_candidates`: predicate
+  `source in {bq_seed, ch_seed} AND time < now - 30d`, sort key
+  `story.score` (no gravity), slot limit 12. This surfaces old archive
+  stories that the gravity-heavy primary path would otherwise down-weight
+  into oblivion.
+
+**Template (`templates/index.html`):**
+- Per-card `data-mode-recent` and `data-mode-archive` attributes.
+- New 5th tab button `<button data-mode="archive">Archive</button>`.
+- `matchesCurrentMode` updated: default/popular/explore/date require
+  `modeRecent="1"`; archive requires `modeArchive="1"`.
+- `orderForCurrentMode` updated: archive uses `orderByRank()` (no shuffle).
+- Idle-prefetch list extended to include `'archive'`.
+
+**Tests added (5 total):**
+- `test_pipeline.py::test_is_recent_flag_inclusive_30d_boundary` — 1d, 30d, 60d
+- `test_pipeline.py::test_archive_top_pass_promotes_old_archive_stories` — top-12, score-desc, no recent
+- `test_pipeline.py::test_archive_top_pass_excludes_recent_archive_sources` — predicate time check
+- `test_pipeline.py::test_archive_top_merged_with_recent_in_final` — both groups present
+- `test_server.py::test_data_mode_recent_and_archive_attributes_emitted` — end-to-end render check
+- Plus 3 JS-only static-template assertions in `test_server.py` (prefetch list, matchesCurrentMode, orderForCurrentMode).
+- Updated existing `test_server.py::test_dashboard_route_no_user_creates_token_and_redirects` to assert `data-mode="archive"` in rendered HTML.
+
+**Docs:**
+- `ARCHITECTURE.md:129` — 4 modes → 5 modes; documented `Archive` semantics.
+- `ARCHITECTURE.md:126` — fixed stale `32 primary` → `12 primary` and added `archive-top` to the discovery-pass list.
+
+**Pool sizing (default `count=40`):**
+- Recent deck (`is_recent=True`): ~12-15 cards (12 primary + 0-3 extras).
+- Archive deck (`is_recent=False`): ~12-14 cards (12 archive-top + 0-2 extras).
+- Total `final` size: ~24-29.
+
+---
+
 ## 2026-06-27 — JS extraction rolled back (item 7a from cleanup commit)
 
 The JS extraction in `4b731ec` (move the 758-line inline `<script>` to `static/dashboard.js` and serve via `<script src="/static/dashboard.js">`) caused a real-world regression that **was not reproducible in jsdom**:
@@ -1130,4 +1549,38 @@ identified four optimizations.
 - End-to-end fresh user: 5-10s → 1.4-2.1s
 
 **Verification**: `pytest tests/ -x -q` = 209 passed, 1 skipped.
+
+---
+
+## 2026-06-28 — User-token link in header + mobile vote-bar fix
+
+Two small UX improvements to `templates/index.html` only (no Python / no
+new CSS classes — reuses already-defined-but-unused `header`,
+`.meta-subtitle`, `.share-link`).
+
+**Changes**:
+- **Top header bar**: new `<header>` inserted right after `<body>`,
+  containing the dashboard timestamp and a `your profile` link to
+  `/u/<user_token>`. `user_token` was already passed to the template
+  by `pipeline.py:2349`; the template just never rendered it. Guarded
+  with `{% if user_token %}` so the skeleton path stays safe.
+- **Mobile vote-bar**: appended `.vote-counts { display: none; }` to the
+  existing `@media (max-width: 640px)` block. The fixed-bottom bar has
+  three flex children (refresh-wrapper, vote-counts, feedback-group) that
+  total ~380-420px; on 360-400px viewports the counts (`margin-left:
+  auto`) were squashing the vote buttons against the right edge. Hiding
+  the counts on mobile frees ~100px so the three feedback buttons have
+  room to breathe. Desktop unchanged.
+
+**Verification**:
+- `uv run pytest tests/ -n 4` = 251 passed, 1 skipped (torch).
+- `uv run ruff check .` and `uv run ty check` = clean.
+- Live curl after server restart (port 8766, persistent cookie jar):
+  HTML contains `href="/u/a736cb16"` (matches the actual session token)
+  and `<small class="meta-subtitle">…`. 73 story cards render normally.
+
+**Reversed**: The top header bar was removed the same day (user
+preference — wanted the user/profile link placed differently). The
+mobile vote-bar fix (`.vote-counts { display: none; }` in the
+`@media (max-width: 640px)` block) remains in effect.
 `ruff check .` clean. `ty check` 0 diagnostics.

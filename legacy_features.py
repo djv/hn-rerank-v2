@@ -33,7 +33,10 @@ def _augment_features(
     closest_upvoted: np.ndarray | None = None,
     closest_downvoted: np.ndarray | None = None,
     comment_score_ratio: np.ndarray | None = None,
-    is_hn: np.ndarray | None = None,
+    is_hn_live: np.ndarray | None = None,
+    is_archive: np.ndarray | None = None,
+    is_reddit: np.ndarray | None = None,
+    is_rss: np.ndarray | None = None,
     engagement_ratio: np.ndarray | None = None,
 ) -> NDArray[np.float32]:
     n = len(scores)
@@ -43,7 +46,10 @@ def _augment_features(
         text_lengths,
         hn_quality,
         comment_score_ratio,
-        is_hn,
+        is_hn_live,
+        is_archive,
+        is_reddit,
+        is_rss,
         engagement_ratio,
     ):
         if f is not None:
@@ -112,8 +118,17 @@ def _augment_features(
         meta[:, col] = (np.clip(closest_downvoted, -1, 1) + 1) / 2
         col += 1
 
-    if is_hn is not None:
-        meta[:, col] = is_hn
+    if is_hn_live is not None:
+        meta[:, col] = is_hn_live
+        col += 1
+    if is_archive is not None:
+        meta[:, col] = is_archive
+        col += 1
+    if is_reddit is not None:
+        meta[:, col] = is_reddit
+        col += 1
+    if is_rss is not None:
+        meta[:, col] = is_rss
         col += 1
 
     if engagement_ratio is not None:

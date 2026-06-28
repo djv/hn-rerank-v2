@@ -29,7 +29,6 @@ from pipeline import (
     Config,
     RankedStory,
     _knn_similarity,
-    is_hn_source,
     mmr_filter,
 )
 
@@ -108,9 +107,12 @@ def _compute_metrics(
         "ndcg_at_100": _ndcg(rel_by_pos, all_test_rels, 100),
         "ndcg_at_200": _ndcg(rel_by_pos, all_test_rels, 200),
         "ndcg_at_500": _ndcg(rel_by_pos, all_test_rels, 500),
+        "ndcg_at_1000": _ndcg(rel_by_pos, all_test_rels, 1000),
         "hit_at_100": sum(1 for p in rel_by_pos if p < 100) / max(len(test_stories), 1),
         "hit_at_200": sum(1 for p in rel_by_pos if p < 200) / max(len(test_stories), 1),
         "hit_at_500": sum(1 for p in rel_by_pos if p < 500) / max(len(test_stories), 1),
+        "hit_at_1000": sum(1 for p in rel_by_pos if p < 1000)
+        / max(len(test_stories), 1),
         "map": ap,
         "brier_up": brier_up,
     }
@@ -208,6 +210,34 @@ def _evaluate_fold(
 
 
 def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="5-fold offline eval. Pass --candidate-cap N to subsample "
+        "candidates for an apples-to-apples comparison against a prior run."
+    )
+    parser.add_argument(
+        "--candidate-cap",
+        type=int,
+        default=None,
+        help="Subsample candidates to this many stories (random, fixed seed).",
+    )
+    parser.add_argument(
+        "--candidate-cap-seed",
+        type=int,
+        default=0,
+        help="Random seed for --candidate-cap subsampling (default 0).",
+    )
+    parser.add_argument(
+        "--exclude-sources",
+        nargs="*",
+        default=None,
+        help="Source names to drop from the candidate pool "
+        "(e.g., --exclude-sources ch_seed bq_seed to measure on a "
+        "non-archive pool).",
+    )
+    args = parser.parse_args()
+
     config = Config.load()
     db = Database(config.db_path)
     user = db.get_user_by_token("default")
@@ -223,6 +253,24 @@ def main() -> None:
     # Candidates
     candidates, cand_emb = _load_candidates(db)
     print(f"Candidates: {len(candidates)}")
+    if args.exclude_sources:
+        excluded = set(args.exclude_sources)
+        before = len(candidates)
+        keep_idx = np.array([s.source not in excluded for s in candidates], dtype=bool)
+        candidates = [s for s, k in zip(candidates, keep_idx) if k]
+        cand_emb = cand_emb[keep_idx]
+        print(f"  Excluded sources {sorted(excluded)}: {before} -> {len(candidates)}")
+    if args.candidate_cap is not None and len(candidates) > args.candidate_cap:
+        rng = np.random.default_rng(args.candidate_cap_seed)
+        keep_idx = np.sort(
+            rng.choice(len(candidates), size=args.candidate_cap, replace=False)
+        )
+        candidates = [candidates[i] for i in keep_idx]
+        cand_emb = cand_emb[keep_idx]
+        print(
+            f"  Subsampled to {len(candidates)} candidates "
+            f"(seed={args.candidate_cap_seed}) for apples-to-apples comparison"
+        )
 
     # Map feedback stories → candidate indices
     cand_id_to_idx = {s.id: i for i, s in enumerate(candidates)}
@@ -374,13 +422,10 @@ def main() -> None:
         fold_cand_csr_ratio = fold_cand_comments / np.maximum(fold_cand_scores, 1)
         fold_cand_csr = np.clip(np.log1p(fold_cand_csr_ratio), 0, 3.0) / 3.0
 
-        fb_train_is_hn = np.array(
-            [1.0 if is_hn_source(s.source) else 0.0 for s in fb_train_stories]
-        )
+        from pipeline import source_category_stack
 
-        fold_cand_is_hn = np.array(
-            [1.0 if is_hn_source(s.source) else 0.0 for s in fold_candidates]
-        )
+        fb_train_source = source_category_stack([s.source for s in fb_train_stories])
+        fold_cand_source = source_category_stack([s.source for s in fold_candidates])
 
         # Build features for this fold
         X_train = _augment_features(
@@ -397,7 +442,10 @@ def main() -> None:
             closest_upvoted=fb_closest_up,
             closest_downvoted=fb_closest_down,
             comment_score_ratio=fb_train_csr,
-            is_hn=fb_train_is_hn,
+            is_hn_live=fb_train_source[:, 0],
+            is_archive=fb_train_source[:, 1],
+            is_reddit=fb_train_source[:, 2],
+            is_rss=fb_train_source[:, 3],
         )
         X_cand = _augment_features(
             fold_cand_emb,
@@ -413,7 +461,10 @@ def main() -> None:
             closest_upvoted=cand_closest_up,
             closest_downvoted=cand_closest_down,
             comment_score_ratio=fold_cand_csr,
-            is_hn=fold_cand_is_hn,
+            is_hn_live=fold_cand_source[:, 0],
+            is_archive=fold_cand_source[:, 1],
+            is_reddit=fold_cand_source[:, 2],
+            is_rss=fold_cand_source[:, 3],
         )
 
         counts = Counter(y_train)
@@ -448,7 +499,8 @@ def main() -> None:
         # meta cols after emb_dim:
         # 0=score, 1=comment_count, 2=text_length, 3=hn_quality,
         # 4=comment_score_ratio, 5=score_velocity, 6=comment_velocity,
-        # 7=sim_up, 8=sim_down, 9=closest_up, 10=closest_down, 11=is_hn
+        # 7=sim_up, 8=sim_down, 9=closest_up, 10=closest_down,
+        # 11=is_hn_live, 12=is_archive, 13=is_reddit, 14=is_rss
         strip = [
             emb_dim + 0,
             emb_dim + 1,
@@ -457,6 +509,9 @@ def main() -> None:
             emb_dim + 5,
             emb_dim + 6,
             emb_dim + 11,
+            emb_dim + 12,
+            emb_dim + 13,
+            emb_dim + 14,
         ]
         X_train_strip[:, strip] = 0.0
         X_cand_strip[:, strip] = 0.0
@@ -502,9 +557,11 @@ def main() -> None:
         "ndcg_at_100",
         "ndcg_at_200",
         "ndcg_at_500",
+        "ndcg_at_1000",
         "hit_at_100",
         "hit_at_200",
         "hit_at_500",
+        "hit_at_1000",
         "map",
         "brier_up",
         "median_rank",
@@ -525,6 +582,9 @@ def main() -> None:
             "mmr_limit": 40,
             "relevance_grade": "up=1, neutral=0.2, down=0",
             "db_sha256": _db_sha256(config.db_path),
+            "candidate_cap": args.candidate_cap,
+            "candidate_cap_seed": args.candidate_cap_seed,
+            "exclude_sources": args.exclude_sources,
         },
         "formulas": {
             f: {
