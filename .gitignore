@@ -8,6 +8,14 @@ __pycache__/
 *.db-shm
 *.db-wal
 onnx_model/
+onnx_model_*/
 public/
 .env
 .env.local
+.mimocode/
+eval_ranker_*.json
+*_sweep_*.json
+eval_results/
+cookie.txt
+calibration_plot.png
+hn_rewrite.db.*

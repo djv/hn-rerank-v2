@@ -14,7 +14,13 @@ def db():
 
 def test_upsert_and_get_story(db):
     from pipeline import compose_story_text
-    expected_text = compose_story_text("Test Story", "Some self text content", "Some top comments here", "Some article body here")
+
+    expected_text = compose_story_text(
+        "Test Story",
+        "Some self text content",
+        "Some top comments here",
+        "Some article body here",
+    )
     story = Story(
         id=123,
         title="Test Story",
@@ -38,8 +44,10 @@ def test_upsert_and_get_story(db):
     assert fetched.url == story.url
     assert fetched.score == story.score
     assert fetched.time == story.time
-    
-    expected_text = compose_story_text(story.title, story.self_text, story.top_comments, story.article_body)
+
+    expected_text = compose_story_text(
+        story.title, story.self_text, story.top_comments, story.article_body
+    )
     assert fetched.text_content == expected_text
     assert fetched.source == story.source
     assert fetched.comment_count == story.comment_count
@@ -119,9 +127,135 @@ def test_get_embeddings_batch(db):
     assert 2 not in batch2
 
 
+def test_tldr_cache_roundtrip_replaces_stale_entries(db):
+    story = Story(id=10, title="S1", url=None, score=10, time=100, text_content="T1")
+    db.upsert_story(story)
+
+    db.upsert_tldr_cache(10, "hash1", "first summary")
+    assert db.get_tldr_cache(10, "hash1") == "first summary"
+    assert db.get_tldr_cache(10, "hash2") is None
+
+    db.upsert_tldr_cache(10, "hash2", "updated summary")
+    assert db.get_tldr_cache(10, "hash1") is None
+    assert db.get_tldr_cache(10, "hash2") == "updated summary"
+
+
+def test_upsert_story_preserves_longest_text_fields_and_recomposes(db):
+    from pipeline import compose_story_text
+
+    initial = Story(
+        id=11,
+        title="Long cached story",
+        url="https://example.com/long",
+        score=10,
+        time=100,
+        text_content=compose_story_text(
+            "Long cached story",
+            "Long self text with details.",
+            "/u/a: Long useful comment with details.",
+            "Long article body with details.",
+        ),
+        self_text="Long self text with details.",
+        top_comments="/u/a: Long useful comment with details.",
+        article_body="Long article body with details.",
+    )
+    db.upsert_story(initial)
+
+    shorter_update = Story(
+        id=11,
+        title="Updated title",
+        url="https://example.com/long",
+        score=12,
+        time=101,
+        text_content="Updated title. short",
+        self_text="short",
+        top_comments="short",
+        article_body="short",
+    )
+    db.upsert_story(shorter_update)
+
+    fetched = db.get_story(11)
+    assert fetched.title == "Updated title"
+    assert fetched.score == 12
+    assert fetched.self_text == initial.self_text
+    assert fetched.top_comments == initial.top_comments
+    assert fetched.article_body == initial.article_body
+    assert fetched.text_content == compose_story_text(
+        "Updated title",
+        initial.self_text,
+        initial.top_comments,
+        initial.article_body,
+    )
+
+
+def test_upsert_story_preserves_time_on_reinsert(db):
+    # GitHub Trending RSS feeds have no published_parsed; pipeline.py falls
+    # back to `now` and re-stamps the time on every fetch. upsert_story must
+    # preserve the original (first-encountered) time so the date shown in
+    # the dashboard is stable across re-fetches.
+    first = Story(
+        id=9001,
+        title="First seen",
+        url="https://github.com/example/repo",
+        score=0,
+        time=1_700_000_000,
+        text_content="First seen. initial content",
+        source="rss_mshibanami_github_io",
+    )
+    db.upsert_story(first)
+    assert db.get_story(9001).time == 1_700_000_000
+
+    # Simulate a later fetch with a fresh `now` time (the GitHub Trending case).
+    later = Story(
+        id=9001,
+        title="First seen",
+        url="https://github.com/example/repo",
+        score=0,
+        time=1_700_100_000,
+        text_content="First seen. updated content",
+        source="rss_mshibanami_github_io",
+    )
+    db.upsert_story(later)
+    fetched = db.get_story(9001)
+    assert fetched.time == 1_700_000_000, (
+        f"expected original time to be preserved, got {fetched.time}"
+    )
+    # Title still updates (the only other field we changed here).
+    assert fetched.text_content == "First seen. updated content"
+
+
+def test_upsert_story_uses_new_time_for_placeholder(db):
+    # When a story was inserted as a placeholder (time=0, e.g. _empty_story
+    # for an HN ID that 200'd with no payload), the next real upsert must
+    # populate the time. We can't preserve zero as "first seen".
+    placeholder = Story(
+        id=9002,
+        title="",
+        url=None,
+        score=0,
+        time=0,
+        text_content="",
+        source="hn",
+    )
+    db.upsert_story(placeholder)
+    assert db.get_story(9002).time == 0
+
+    real = Story(
+        id=9002,
+        title="Real title",
+        url="https://example.com/real",
+        score=5,
+        time=1_700_200_000,
+        text_content="Real title. some content",
+        source="hn",
+    )
+    db.upsert_story(real)
+    assert db.get_story(9002).time == 1_700_200_000
+
+
 def test_feedback_crud(db):
     # Create a test user
-    user = db.create_user("test_token_1", "test_user")
+    user = db.create_user("test_token_1")
 
     story = Story(
         id=456,
@@ -165,7 +299,7 @@ def test_prune_stories(db):
 
 
 def test_prune_stories_preserves_feedback_stories(db):
-    user = db.create_user("test_token_2", "test_user")
+    user = db.create_user("test_token_2")
     story1 = Story(id=1, title="S1", url=None, score=10, time=100, text_content="T1")
     story2 = Story(id=2, title="S2", url=None, score=20, time=100, text_content="T2")
     db.upsert_story(story1)
@@ -179,11 +313,73 @@ def test_prune_stories_preserves_feedback_stories(db):
     assert db.get_story(2) is None
 
 
+def test_prune_stories_preserves_archive_stories(db):
+    for source, sid in [("bq_seed", 3), ("ch_seed", 4)]:
+        db.upsert_story(
+            Story(
+                id=sid,
+                title="Archive",
+                url=None,
+                score=100,
+                time=100,
+                text_content="Archive text",
+                source=source,
+            )
+        )
+    db.upsert_story(
+        Story(
+            id=99,
+            title="Old",
+            url=None,
+            score=1,
+            time=1,
+            text_content="Old text",
+            source="hn",
+        )
+    )
+    deleted = db.prune_stories(max_age_days=0)
+
+    assert deleted == 1
+    assert db.get_story(3) is not None
+    assert db.get_story(4) is not None
+    assert db.get_story(99) is None
+
+
 def test_feedback_training_data(db):
-    user = db.create_user("test_token_3", "test_user")
-    db.upsert_story(Story(id=1, title="T1", url=None, score=100, time=1600000000, text_content="Text1", source="hn"))
-    db.upsert_story(Story(id=2, title="T2", url=None, score=100, time=1600000000, text_content="Text2", source="hn"))
-    db.upsert_story(Story(id=3, title="T3", url=None, score=100, time=1600000000, text_content="Text3", source="hn"))
+    user = db.create_user("test_token_3")
+    db.upsert_story(
+        Story(
+            id=1,
+            title="T1",
+            url=None,
+            score=100,
+            time=1600000000,
+            text_content="Text1",
+            source="hn",
+        )
+    )
+    db.upsert_story(
+        Story(
+            id=2,
+            title="T2",
+            url=None,
+            score=100,
+            time=1600000000,
+            text_content="Text2",
+            source="hn",
+        )
+    )
+    db.upsert_story(
+        Story(
+            id=3,
+            title="T3",
+            url=None,
+            score=100,
+            time=1600000000,
+            text_content="Text3",
+            source="hn",
+        )
+    )
 
     db.upsert_feedback(user.id, 1, "up")
     db.upsert_feedback(user.id, 2, "down")
@@ -202,19 +398,23 @@ def test_feedback_training_data(db):
 
 @given(
     # Timestamps relative to now (in days offset around the threshold)
-    fetched_offsets=st.lists(st.integers(min_value=-100, max_value=100).filter(lambda x: x != 0), min_size=5, max_size=50),
+    fetched_offsets=st.lists(
+        st.integers(min_value=-100, max_value=100).filter(lambda x: x != 0),
+        min_size=5,
+        max_size=50,
+    ),
     # Indices of stories to attach feedback to
-    feedback_indices=st.sets(st.integers(min_value=0, max_value=49))
+    feedback_indices=st.sets(st.integers(min_value=0, max_value=49)),
 )
 @settings(max_examples=25, suppress_health_check=[HealthCheck.function_scoped_fixture])
 def test_story_pruning_integrity_invariants(fetched_offsets, feedback_indices):
     db = Database(":memory:")
     try:
-        user = db.create_user("test_token_hypothesis", "test_user")
+        user = db.create_user("test_token_hypothesis")
         now = time.time()
         max_age_days = 30
         cutoff = now - (max_age_days * 86400)
-        
+
         stories_meta = []
         # Insert stories with variable ages
         for i, offset_days in enumerate(fetched_offsets):
@@ -226,34 +426,40 @@ def test_story_pruning_integrity_invariants(fetched_offsets, feedback_indices):
                 url=None,
                 score=100,
                 time=int(now),
-                text_content="Content"
+                text_content="Content",
             )
             db.upsert_story(story)
-            
+
             # Override fetched_at directly in DB to simulate temporal aging
-            db.execute("UPDATE stories SET fetched_at = ? WHERE id = ?", (fetched_at, i))
-            
+            db.execute(
+                "UPDATE stories SET fetched_at = ? WHERE id = ?", (fetched_at, i)
+            )
+
             # Apply feedback if indexed
             has_feedback = i in feedback_indices and i < len(fetched_offsets)
             if has_feedback:
                 db.upsert_feedback(user.id, i, "up")
-                
+
             stories_meta.append((i, fetched_at, has_feedback))
-            
+
         db.prune_stories(max_age_days=max_age_days)
-        
+
         # Assert temporal and referential invariants
         for sid, fetched_at, has_feedback in stories_meta:
             story = db.get_story(sid)
             is_older = fetched_at < cutoff
-            
+
             if is_older:
                 if has_feedback:
                     # Invariant: Must survive despite age due to referential link
-                    assert story is not None, f"Story {sid} with feedback was pruned despite relative age."
+                    assert story is not None, (
+                        f"Story {sid} with feedback was pruned despite relative age."
+                    )
                 else:
                     # Invariant: Must be deleted
-                    assert story is None, f"Old story {sid} without feedback survived pruning."
+                    assert story is None, (
+                        f"Old story {sid} without feedback survived pruning."
+                    )
             else:
                 # Invariant: Young stories always survive
                 assert story is not None, f"Young story {sid} was incorrectly pruned."
@@ -263,16 +469,14 @@ def test_story_pruning_integrity_invariants(fetched_offsets, feedback_indices):
 
 def test_user_management(db):
     # Test create_user
-    user = db.create_user("tok123", "user123")
+    user = db.create_user("tok123")
     assert user.id is not None
     assert user.token == "tok123"
-    assert user.username == "user123"
 
     # Test get_user_by_token
     fetched = db.get_user_by_token("tok123")
     assert fetched is not None
     assert fetched.id == user.id
-    assert fetched.username == "user123"
 
     # Test get_or_create_user
     existing = db.get_or_create_user("tok123")
@@ -280,17 +484,11 @@ def test_user_management(db):
 
     new_user = db.get_or_create_user("new_tok")
     assert new_user.token == "new_tok"
-    assert new_user.username == "anon"
-
-    # Test update_username
-    db.update_username(user.id, "new_username")
-    updated = db.get_user_by_token("tok123")
-    assert updated.username == "new_username"
 
 
 def test_per_user_feedback_isolation(db):
-    user1 = db.create_user("token_u1", "user1")
-    user2 = db.create_user("token_u2", "user2")
+    user1 = db.create_user("token_u1")
+    user2 = db.create_user("token_u2")
 
     story = Story(
         id=99,
@@ -330,3 +528,26 @@ def test_per_user_feedback_isolation(db):
     assert len(db.get_all_feedback(user1.id)) == 0
     assert len(db.get_all_feedback(user2.id)) == 1
 
+
+def test_count_feedback_by_action(db):
+    """count_feedback_by_action returns per-action buckets."""
+    user = db.create_user("test_count")
+    assert db.count_feedback_by_action(user.id) == {"up": 0, "neutral": 0, "down": 0}
+
+    db.upsert_story(
+        Story(id=1, title="S1", url=None, score=10, time=0, text_content="T1")
+    )
+    db.upsert_story(
+        Story(id=2, title="S2", url=None, score=10, time=0, text_content="T2")
+    )
+    db.upsert_story(
+        Story(id=3, title="S3", url=None, score=10, time=0, text_content="T3")
+    )
+
+    db.upsert_feedback(user.id, 1, "up")
+    db.upsert_feedback(user.id, 2, "neutral")
+    db.upsert_feedback(user.id, 3, "down")
+    assert db.count_feedback_by_action(user.id) == {"up": 1, "neutral": 1, "down": 1}
+
+    db.upsert_feedback(user.id, 1, "down")  # change vote
+    assert db.count_feedback_by_action(user.id) == {"up": 0, "neutral": 1, "down": 2}

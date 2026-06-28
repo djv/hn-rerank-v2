@@ -1,9 +1,12 @@
 """Feature ablation: compare baseline vs. extra meta-features.
 
-Each variant adds extra columns to the 392-dim feature vector.
-Runs 5-fold CV and prints comparison. No file writes.
+Each variant adds extra columns to the 394-dim production feature
+vector (384-d MiniLM embedding + 10 production meta features: text
+length, sim/closest-to-upvoted/downvoted, positive cluster similarity,
+4 source dummies). Runs 5-fold CV and prints comparison. No file writes.
 """
 
+import argparse
 import sys
 import time
 from collections import Counter
@@ -18,12 +21,11 @@ from sklearn.preprocessing import StandardScaler
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from database import Database, Story
 from eval import _load_candidates, _evaluate_fold
-from pipeline import Config, _augment_features
-
-LOG_POINTS_SCALE = 2.0
-LOG_COMMENTS_SCALE = 1.0
-LOG_TEXTLEN_SCALE = 2.0
-LOG_QUALITY_SCALE = 8.0
+from pipeline import (
+    Config,
+    _svm_personalization_features,
+    source_category_stack,
+)
 
 
 def _title_lexical(stories: list[Story]) -> np.ndarray:
@@ -88,7 +90,24 @@ def _comment_score_ratio(comment_counts: np.ndarray, scores: np.ndarray) -> np.n
 
 
 def _main():
-    config = Config.load()
+    parser = argparse.ArgumentParser(
+        description=(
+            "Feature ablation: compare baseline vs. extra meta-features under RBF. "
+            "Each variant adds extra columns to the 394-dim production feature vector."
+        )
+    )
+    parser.add_argument("--config", default="config.toml", help="Path to config.toml")
+    parser.add_argument("--folds", type=int, default=5, help="Number of CV folds")
+    parser.add_argument(
+        "--max-candidates",
+        type=int,
+        default=None,
+        help="Sample at most this many candidate stories after loading. "
+        "Useful for bounding memory when running alongside the live server.",
+    )
+    args = parser.parse_args()
+
+    config = Config.load(args.config)
     db = Database(config.db_path)
     print(f"DB: {config.db_path}")
 
@@ -99,6 +118,14 @@ def _main():
 
     candidates, cand_emb = _load_candidates(db)
     print(f"Candidates: {len(candidates)}")
+    if args.max_candidates is not None and len(candidates) > args.max_candidates:
+        rng = np.random.default_rng(0)
+        keep_idx = np.sort(
+            rng.choice(len(candidates), size=args.max_candidates, replace=False)
+        )
+        candidates = [candidates[i] for i in keep_idx]
+        cand_emb = cand_emb[keep_idx]
+        print(f"  Subsampled to {len(candidates)} candidates (seed=0) for memory bound")
 
     cand_id_to_idx = {s.id: i for i, s in enumerate(candidates)}
     fb_to_cand = np.array([cand_id_to_idx.get(s.id, -1) for s in fb_stories], dtype=int)
@@ -107,12 +134,16 @@ def _main():
         print(f"Warning: {(~valid).sum()} feedback stories missing")
 
     now = time.time()
+    # Engagement-feature arrays (kept because the +velocity and
+    # +comment_score_ratio variants test whether these help when added
+    # to the production baseline; they are NOT used by the baseline).
     cand_comment_counts = np.array([s.comment_count or 0 for s in candidates])
     cand_text_lengths = np.array([len(s.text_content) for s in candidates])
     cand_ages_arr = np.array([now - max(s.time, 1) for s in candidates])
     cand_scores_arr = np.array([s.score for s in candidates])
-    cand_quality_arr = cand_scores_arr / (np.maximum(cand_ages_arr / 3600.0, 0) + 1)
-
+    # cand_scores_array (float64) is used by _evaluate_fold for the
+    # hn_baseline sort key, not by the production feature builder.
+    cand_scores_array = np.array([s.score for s in candidates], dtype=np.float64)
     fb_emb = cand_emb[fb_to_cand[valid]]
     fb_scores_arr = np.array([s.score for s in fb_stories])[valid]
     fb_ages_arr = np.array(
@@ -120,9 +151,7 @@ def _main():
     )[valid]
     fb_comment_counts_arr = np.array([s.comment_count or 0 for s in fb_stories])[valid]
     fb_text_lengths_arr = np.array([len(s.text_content) for s in fb_stories])[valid]
-    fb_quality_arr = fb_scores_arr / (np.maximum(fb_ages_arr / 3600.0, 0) + 1)
 
-    cand_scores_array = np.array([s.score for s in candidates], dtype=np.float64)
     y = fb_labels[valid]
 
     # Precompute fold-independent extra features for all candidates + feedback
@@ -139,7 +168,7 @@ def _main():
     fb_csr = _comment_score_ratio(fb_comment_counts_arr, fb_scores_arr)
 
     folds = list(
-        StratifiedKFold(n_splits=5, shuffle=True, random_state=0).split(
+        StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=0).split(
             np.zeros((len(y), 1)), y
         )
     )
@@ -247,21 +276,13 @@ def _main():
         for fold_idx, (train_pos, test_pos) in enumerate(folds):
             fb_train_emb = fb_emb[train_pos]
             y_train = y[train_pos]
-            fb_train_scores = fb_scores_arr[train_pos]
-            fb_train_ages = fb_ages_arr[train_pos]
-            fb_train_comments = fb_comment_counts_arr[train_pos]
             fb_train_textlens = fb_text_lengths_arr[train_pos]
-            fb_train_quality = fb_quality_arr[train_pos]
 
             train_ids = {fb_stories[idx].id for idx in np.where(valid)[0][train_pos]}
             cand_mask = np.array([s.id not in train_ids for s in candidates])
             fold_candidates = [s for idx, s in enumerate(candidates) if cand_mask[idx]]
             fold_cand_emb = cand_emb[cand_mask]
-            fold_cand_scores = cand_scores_arr[cand_mask]
-            fold_cand_ages = cand_ages_arr[cand_mask]
-            fold_cand_comments = cand_comment_counts[cand_mask]
             fold_cand_textlens = cand_text_lengths[cand_mask]
-            fold_cand_quality = cand_quality_arr[cand_mask]
             fold_cand_scores_array = cand_scores_array[cand_mask]
 
             up_mask = y_train == 2
@@ -324,29 +345,41 @@ def _main():
             else:
                 fb_closest_down = np.zeros(len(fb_train_emb))
 
-            X_train = _augment_features(
+            fb_train_source = source_category_stack(
+                [
+                    s.source
+                    for s in (fb_stories[i] for i in np.where(valid)[0][train_pos])
+                ]
+            )
+            fold_cand_source = source_category_stack(
+                [s.source for s in fold_candidates]
+            )
+
+            X_train = _svm_personalization_features(
                 fb_train_emb,
-                fb_train_scores,
-                fb_train_ages,
-                comment_counts=fb_train_comments,
                 text_lengths=fb_train_textlens,
-                hn_quality=fb_train_quality,
                 sim_to_upvoted=fb_sim_up,
                 sim_to_downvoted=fb_sim_down,
                 closest_upvoted=fb_closest_up,
                 closest_downvoted=fb_closest_down,
+                positive_cluster_similarity=None,
+                is_hn_live=fb_train_source[:, 0],
+                is_archive=fb_train_source[:, 1],
+                is_reddit=fb_train_source[:, 2],
+                is_rss=fb_train_source[:, 3],
             )
-            X_cand = _augment_features(
+            X_cand = _svm_personalization_features(
                 fold_cand_emb,
-                fold_cand_scores,
-                fold_cand_ages,
-                comment_counts=fold_cand_comments,
                 text_lengths=fold_cand_textlens,
-                hn_quality=fold_cand_quality,
                 sim_to_upvoted=cand_sim_up,
                 sim_to_downvoted=cand_sim_down,
                 closest_upvoted=cand_closest_up,
                 closest_downvoted=cand_closest_down,
+                positive_cluster_similarity=None,
+                is_hn_live=fold_cand_source[:, 0],
+                is_archive=fold_cand_source[:, 1],
+                is_reddit=fold_cand_source[:, 2],
+                is_rss=fold_cand_source[:, 3],
             )
 
             # Add extra features
@@ -373,10 +406,15 @@ def _main():
                 gamma=config.model.svm_gamma,
                 random_state=0,
                 decision_function_shape="ovr",
-                probability=True,
+                probability=False,
             )
             svm.fit(X_train_scaled, y_train, sample_weight=weights)
-            probs = svm.predict_proba(X_cand_scaled)
+            decision = svm.decision_function(X_cand_scaled)
+            class_order = list(svm.classes_)
+            up_idx = class_order.index(2)
+            from pipeline import _softmax_rows
+
+            probs = _softmax_rows(decision)
 
             test_stories = [
                 fb_stories[valid_idx] for valid_idx in np.where(valid)[0][test_pos]
@@ -385,7 +423,9 @@ def _main():
 
             fold_results.append(
                 _evaluate_fold(
+                    decision,
                     probs,
+                    up_idx,
                     fold_candidates,
                     fold_cand_emb,
                     test_stories,

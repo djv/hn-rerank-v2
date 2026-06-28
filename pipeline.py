@@ -5,10 +5,12 @@ import hashlib
 import html
 import logging
 import re
+import threading
 import time
 import tomllib
-from collections import Counter
+from collections import Counter, OrderedDict
 from dataclasses import dataclass, field, replace
+from typing import Any, Callable, cast
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -20,26 +22,190 @@ import onnxruntime as ort
 from bs4 import BeautifulSoup
 from jinja2 import Environment, FileSystemLoader
 from numpy.typing import NDArray
+from sklearn.cluster import KMeans
 from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
 
 from database import Database, Story
+from reddit_fetch_queue import CoroFactory
+from reddit_feed_cache import cache as reddit_feed_cache
+from reddit_limiter import limiter as reddit_limiter
 from transformers import AutoTokenizer
+
+
+RSS_USER_AGENT = "hn-rewrite/1.0 (+https://github.com/local/hn-rewrite)"
+REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dashboard"
 
 
 @dataclass(frozen=True)
 class ModelConfig:
-    svm_c: float = 0.3
-    svm_gamma: float | str = 0.1
+    svm_c: float = 0.2
+    svm_gamma: float | str = 0.03
     svm_kernel: str = "rbf"
     neutral_weight: float = 0.0
-    diversity_threshold: float = 0.50
+    enable_mmr: bool = False
+    diversity_threshold: float = 0.75
+    knn_k: int = 10
+    positive_cluster_k: int = 4
+    tier2_blend_window: int = 50
+    tier3_threshold: int = 20
+    tier3_blend_window: int = 60
+    min_up_for_svm: int = 20
+    min_down_for_svm: int = 20
+    non_hn_ramp_window: int = 30
+    hot_badge_percentile: float = 99.5
+    dedup_render_enabled: bool = True
+    dedup_title_fuzzy_enabled: bool = False
+    dedup_title_fuzzy_hamming: int = 2
+    dedup_title_fuzzy_same_domain: bool = True
+    dedup_exclude_actions: tuple[str, ...] = ("up", "neutral")
 
 
-# Comment text refetch thresholds (used during regen to refresh stale text_content)
-COMMENT_GROWTH_THRESHOLD = 0.30  # 30% growth since last text fetch triggers refetch
-COMMENT_REFETCH_MAX_AGE_HOURS = 24  # Only refetch stories younger than this
-MAX_REFETCH_PER_REGEN = 10  # Bound Algolia cost per regen
+# SVM model cache: keyed on (user_id, feedback_signature, schema_version)
+# to skip SVC.fit(). Bump _MODEL_SCHEMA_VERSION whenever the feature schema
+# (number / semantics of meta columns appended to the embedding) changes;
+# the cache key then changes for every user, forcing a clean re-fit.
+_MODEL_CACHE: OrderedDict[tuple[int, str, int], tuple[SVC, StandardScaler]] = (
+    OrderedDict()
+)
+_MODEL_CACHE_LOCK = threading.Lock()
+_MODEL_SCHEMA_VERSION = 2  # +1 whenever meta-column schema changes (see ARCHITECTURE)
+
+
+def _feedback_signature(db: Database, user_id: int) -> str:
+    feedback = db.get_all_feedback(user_id=user_id)
+    hasher = hashlib.sha256()
+    for f in sorted(feedback, key=lambda x: x.story_id):
+        hasher.update(f"{f.story_id}:{f.action}:{f.updated_at}".encode())
+    return hasher.hexdigest()
+
+
+def _get_cached_model(
+    user_id: int | None, signature: str
+) -> tuple[SVC, StandardScaler] | None:
+    if user_id is None:
+        return None
+    with _MODEL_CACHE_LOCK:
+        key = (user_id, signature, _MODEL_SCHEMA_VERSION)
+        if key in _MODEL_CACHE:
+            _MODEL_CACHE.move_to_end(key)
+            return _MODEL_CACHE[key]
+    return None
+
+
+def _set_cached_model(
+    user_id: int | None,
+    signature: str,
+    svm: SVC,
+    scaler: StandardScaler,
+    maxsize: int = 20,
+) -> None:
+    if user_id is None:
+        return
+    with _MODEL_CACHE_LOCK:
+        key = (user_id, signature, _MODEL_SCHEMA_VERSION)
+        _MODEL_CACHE[key] = (svm, scaler)
+        while len(_MODEL_CACHE) > maxsize:
+            _MODEL_CACHE.popitem(last=False)
+
+
+# Comment selection and depth tuning
+COMMENT_DEPTH_PENALTY = 25  # Points a reply must overcome per nesting level
+TOP_COMMENT_LIMIT = 40
+TOP_COMMENT_CORE_THREADS = 4
+TOP_COMMENT_REPLIES_PER_CORE_THREAD = 5
+TOP_COMMENT_MAX_PER_THREAD = 6
+GOOD_TOPLEVEL_MIN_LEN = 200
+GOOD_TOPLEVEL_MIN_REPLIES = 3
+TOP_COMMENT_TOP_LEVEL_BUDGET = TOP_COMMENT_LIMIT // 3
+# Discovery slot budget. Each non-Hot badge gets per-cohort top-N slots
+# (recent + archive). Hot stays a single global pass; archive never gets
+# Hot because velocity is structurally ~0 for >30-day stories.
+# The rank-based cascade (see rerank_candidates) feeds Hot → Top → Talk in
+# sequence (mutually exclusive) and Novel / Similar / Unsure in parallel
+# (can stack with each other and with the cascade group).
+UNCERTAIN_DISCOVERY_SLOT_LIMIT = 5
+UNCERTAIN_DISCOVERY_RECENT_SLOTS = 5
+UNCERTAIN_DISCOVERY_ARCHIVE_SLOTS = 5
+NOVEL_DISCOVERY_RECENT_SLOTS = 5
+NOVEL_DISCOVERY_ARCHIVE_SLOTS = 5
+SIMILAR_DISCOVERY_RECENT_SLOTS = 5
+SIMILAR_DISCOVERY_ARCHIVE_SLOTS = 5
+DISCUSSION_DISCOVERY_RECENT_SLOTS = 5
+DISCUSSION_DISCOVERY_ARCHIVE_SLOTS = 5
+HIGH_ENGAGEMENT_DISCOVERY_RECENT_SLOTS = 5
+HIGH_ENGAGEMENT_DISCOVERY_ARCHIVE_SLOTS = 5
+NON_HN_DISCOVERY_SLOT_LIMIT = 8
+HOT_DISCOVERY_SLOT_LIMIT = 5
+HOT_MIN_SCORE = 20
+DASHBOARD_QUEUE_SIZE = 12
+BQ_ARCHIVE_SOURCE = "bq_seed"
+BQ_ARCHIVE_CANDIDATE_LIMIT = 2000
+CH_ARCHIVE_SOURCE = "ch_seed"
+CH_ARCHIVE_CANDIDATE_LIMIT = 2000
+LIVE_WINDOW_LIMIT = 2000
+
+
+def is_hn_source(source: str) -> bool:
+    return source in {"hn", BQ_ARCHIVE_SOURCE, CH_ARCHIVE_SOURCE}
+
+
+# Source category one-hot. Order is significant: callers index into the
+# returned vector and tests assert specific positions.
+SOURCE_CATEGORIES: tuple[str, ...] = ("hn_live", "archive", "reddit", "rss")
+
+
+def source_category_onehot(source: str) -> NDArray[np.float32]:
+    """Return a length-4 binary vector classifying ``source`` into one of
+    ``SOURCE_CATEGORIES`` (live HN, archive seed, reddit, generic RSS).
+
+    Sources that do not match any category return an all-zero vector rather
+    than a 5th negative class — the model is expected to learn the implicit
+    "other" prior from the absence of all four bits.
+    """
+    if source == "hn":
+        idx = 0
+    elif source in {BQ_ARCHIVE_SOURCE, CH_ARCHIVE_SOURCE}:
+        idx = 1
+    elif source.startswith("rss_reddit_"):
+        idx = 2
+    elif source.startswith("rss_") or source.startswith("reddit_"):
+        idx = 3
+    else:
+        return np.zeros(len(SOURCE_CATEGORIES), dtype=np.float32)
+    out = np.zeros(len(SOURCE_CATEGORIES), dtype=np.float32)
+    out[idx] = 1.0
+    return out
+
+
+def source_category_stack(sources: list[str]) -> NDArray[np.float32]:
+    """Vectorized helper: stack ``source_category_onehot`` for a list of
+    sources. Returns an (n, 4) float32 array."""
+    if not sources:
+        return np.zeros((0, len(SOURCE_CATEGORIES)), dtype=np.float32)
+    return np.stack([source_category_onehot(s) for s in sources], axis=0)
+
+
+def is_summarizable(story: Story) -> bool:
+    """True if the story has enough text to generate a TLDR (or can fetch it).
+
+    A story is summarizable if it already has any text content, or if it's
+    an HN or LessWrong story with comments that can be fetched on-demand
+    or prewarmed.
+    """
+    if story.self_text or story.top_comments or story.article_body:
+        return True
+    if is_hn_source(story.source):
+        if (story.comment_count or 0) > 0:
+            return True
+        if (story.comment_count_at_fetch or 0) > 0:
+            return True
+    if story.source == "rss_lesswrong_com":
+        if (story.comment_count or 0) > 0:
+            return True
+        if (story.comment_count_at_fetch or 0) > 0:
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -51,14 +217,35 @@ class RssConfig:
 
 @dataclass(frozen=True)
 class Config:
-    username: str = "user"
     db_path: str = "hn_rewrite.db"
-    output: str = "public/index.html"
     days: int = 30
     count: int = 40
     onnx_model_dir: str = "onnx_model"
     server_port: int = 8765
     regen_interval_seconds: int = 10800
+    regen_initial_delay_seconds: int = 30
+    regen_prewarm_top_n: int = 50
+    reddit_prewarm_top_n: int = 20
+    prewarm_hn_full: bool = True
+    prewarm_reddit_full: bool = True
+    prewarm_lesswrong_full: bool = True
+    # Cap on the number of Reddit stories prewarmed per regen cycle, even
+    # when `prewarm_reddit_full=True`. Prevents a large backlog (e.g. 1000+
+    # stories accumulated over weeks of slow prewarm) from blowing the
+    # combined Reddit-fetch window past the 90-min drain timeout. Top
+    # stories by `score DESC, time DESC` get prewarmed first. Backlog
+    # stories wait for the next cycle, where they re-rank and may
+    # re-qualify.
+    reddit_prewarm_max_per_cycle: int = 200
+    # Minimum spacing (seconds) between any two Reddit fetches scheduled
+    # via `reddit_fetch_queue.enqueue_all_reddit_fetches`. Replaces the
+    # legacy per-kind `reddit_spread_window_*` knobs; combined topfeed
+    # and prewarm now share a single `min_stride_seconds` window.
+    reddit_min_fetch_spacing_seconds: float = 50.0
+    article_fetch_max_per_run: int = 100
+    article_fetch_concurrency: int = 10
+    article_fetch_max_age_days: int = 30
+    max_cached_models: int = 20
     model: ModelConfig = field(default_factory=ModelConfig)
     rss: RssConfig = field(default_factory=RssConfig)
 
@@ -75,20 +262,55 @@ class Config:
         rss_cfg = main_cfg.get("rss", {})
 
         return cls(
-            username=main_cfg.get("username", "user"),
             db_path=main_cfg.get("db_path", "hn_rewrite.db"),
-            output=main_cfg.get("output", "public/index.html"),
             days=main_cfg.get("days", 30),
             count=main_cfg.get("count", 40),
             onnx_model_dir=main_cfg.get("onnx_model_dir", "onnx_model"),
             server_port=main_cfg.get("server_port", 8765),
             regen_interval_seconds=main_cfg.get("regen_interval_seconds", 10800),
+            regen_initial_delay_seconds=main_cfg.get("regen_initial_delay_seconds", 30),
+            regen_prewarm_top_n=main_cfg.get("regen_prewarm_top_n", 50),
+            reddit_prewarm_top_n=main_cfg.get("reddit_prewarm_top_n", 20),
+            prewarm_hn_full=main_cfg.get("prewarm_hn_full", True),
+            prewarm_reddit_full=main_cfg.get("prewarm_reddit_full", True),
+            prewarm_lesswrong_full=main_cfg.get("prewarm_lesswrong_full", True),
+            reddit_prewarm_max_per_cycle=main_cfg.get(
+                "reddit_prewarm_max_per_cycle", 200
+            ),
+            reddit_min_fetch_spacing_seconds=main_cfg.get(
+                "reddit_min_fetch_spacing_seconds", 50.0
+            ),
+            article_fetch_max_per_run=main_cfg.get("article_fetch_max_per_run", 100),
+            article_fetch_concurrency=main_cfg.get("article_fetch_concurrency", 10),
+            article_fetch_max_age_days=main_cfg.get("article_fetch_max_age_days", 30),
+            max_cached_models=main_cfg.get("max_cached_models", 20),
             model=ModelConfig(
-                svm_c=model_cfg.get("svm_c", 0.3),
-                svm_gamma=model_cfg.get("svm_gamma", 0.1),
+                svm_c=model_cfg.get("svm_c", 0.2),
+                svm_gamma=model_cfg.get("svm_gamma", 0.03),
                 svm_kernel=model_cfg.get("svm_kernel", "rbf"),
                 neutral_weight=model_cfg.get("neutral_weight", 0.0),
-                diversity_threshold=model_cfg.get("diversity_threshold", 0.50),
+                enable_mmr=model_cfg.get("enable_mmr", False),
+                diversity_threshold=model_cfg.get("diversity_threshold", 0.75),
+                knn_k=model_cfg.get("knn_k", 10),
+                positive_cluster_k=model_cfg.get("positive_cluster_k", 4),
+                tier2_blend_window=model_cfg.get("tier2_blend_window", 50),
+                tier3_threshold=model_cfg.get("tier3_threshold", 20),
+                tier3_blend_window=model_cfg.get("tier3_blend_window", 60),
+                min_up_for_svm=model_cfg.get("min_up_for_svm", 20),
+                min_down_for_svm=model_cfg.get("min_down_for_svm", 20),
+                non_hn_ramp_window=model_cfg.get("non_hn_ramp_window", 30),
+                hot_badge_percentile=model_cfg.get("hot_badge_percentile", 99.5),
+                dedup_render_enabled=model_cfg.get("dedup_render_enabled", True),
+                dedup_title_fuzzy_enabled=model_cfg.get(
+                    "dedup_title_fuzzy_enabled", False
+                ),
+                dedup_title_fuzzy_hamming=model_cfg.get("dedup_title_fuzzy_hamming", 2),
+                dedup_title_fuzzy_same_domain=model_cfg.get(
+                    "dedup_title_fuzzy_same_domain", True
+                ),
+                dedup_exclude_actions=tuple(
+                    model_cfg.get("dedup_exclude_actions", ("up", "neutral"))
+                ),
             ),
             rss=RssConfig(
                 enabled=rss_cfg.get("enabled", True),
@@ -112,6 +334,49 @@ class RankedStory:
     is_high_engagement: bool = False
     is_hot: bool = False
     is_similar: bool = False
+    is_non_hn: bool = False
+    is_recent: bool = False
+
+
+@dataclass(frozen=True)
+class DiscoveryPass:
+    """A single extra-slot discovery pass in the rerank loop.
+
+    Each pass filters `remaining_decorated` by `predicate` (and by `age`
+    when set, see below), sorts the pool by `sort_key` (descending), and
+    takes the top `slot_limit` stories. The matched stories are added to
+    `final` and `remaining_decorated` is pruned.
+
+    `age`: when set to "recent" or "archive", the pass only considers
+    stories in that age bucket. This lets a single badge have two
+    dedicated passes (e.g. novel-recent and novel-archive) so the badge
+    surfaces in both age groups even when one bucket's stories would
+    otherwise dominate. The age filter uses the 30-day cutoff that the
+    badge's threshold also uses, so the two stay in lockstep.
+    """
+
+    name: str
+    attr: str | None
+    predicate: Callable[[RankedStory], bool]
+    sort_key: Callable[[RankedStory], float]
+    slot_limit: int
+    age: str | None = None
+
+
+def _dashboard_primary_limit(config_count: int) -> tuple[int, int]:
+    num_uncertain = UNCERTAIN_DISCOVERY_SLOT_LIMIT if config_count >= 10 else 0
+    primary_limit = min(max(1, config_count), DASHBOARD_QUEUE_SIZE)
+    return primary_limit, num_uncertain
+
+
+def _non_hn_slot_count(
+    n_feedback: int,
+    cap: int = NON_HN_DISCOVERY_SLOT_LIMIT,
+    threshold: int = 20,
+    window: int = 30,
+) -> int:
+    """Number of non-HN discovery slots given a user's feedback count."""
+    return max(0, round(cap * min((n_feedback - threshold) / window, 1.0)))
 
 
 # Text processing helpers
@@ -143,31 +408,134 @@ def clean_text(raw_text: str, min_len: int = 0) -> str:
 def _extract_comments_recursive(
     children: list,
     depth: int = 0,
-    max_depth: int = 3,
     parent_points: int = 0,
+    top_thread_index: int | None = None,
+    order_path: tuple[int, ...] = (),
 ) -> list[dict]:
-    DEPTH_PENALTY = 50
-    MIN_COMMENT_LENGTH = 30
+    MIN_COMMENT_LENGTH = 60
     results = []
-    for child in children:
+    for sibling_index, child in enumerate(children):
         if not isinstance(child, dict) or child.get("type") != "comment":
             continue
         points = child.get("points") or 0
         if depth > 0 and points == 0:
             points = parent_points
-        score = -points + depth * DEPTH_PENALTY
+        score = -points + depth * COMMENT_DEPTH_PENALTY
+        child_top_thread_index = sibling_index if depth == 0 else top_thread_index
+        child_order_path = (*order_path, sibling_index)
+        child_comments = child.get("children") or []
+        child_results = _extract_comments_recursive(
+            child_comments,
+            depth + 1,
+            parent_points=points,
+            top_thread_index=child_top_thread_index,
+            order_path=child_order_path,
+        )
+        descendant_count = len(child_results)
         text = child.get("text", "")
         if text:
             clean = clean_text(text, min_len=MIN_COMMENT_LENGTH)
             if clean:
-                results.append({"text": clean, "score": score})
-        if depth < max_depth and child.get("children"):
-            results.extend(
-                _extract_comments_recursive(
-                    child["children"], depth + 1, max_depth, parent_points=points
+                results.append(
+                    {
+                        "id": child.get("id"),
+                        "text": clean,
+                        "score": score,
+                        "depth": depth,
+                        "top_thread_index": child_top_thread_index,
+                        "sibling_index": sibling_index,
+                        "order_path": child_order_path,
+                        "reply_count": len(child_comments),
+                        "descendant_count": descendant_count,
+                        "text_len": len(clean),
+                    }
                 )
-            )
+        results.extend(child_results)
     return results
+
+
+def _comment_rank_key(comment: dict) -> tuple:
+    return (
+        -comment["descendant_count"],
+        -min(comment["text_len"], 3000),
+        comment["order_path"],
+    )
+
+
+def _select_top_comments(
+    comments: list[dict],
+    limit: int = TOP_COMMENT_LIMIT,
+) -> list[dict]:
+    """Select comment text for embeddings/TLDRs.
+
+    Prefer large discussion cores (top engaged threads) and breadth of
+    substantive top-level comments.  Replies compete on equal footing with
+    top-level (no depth penalty); the previous ``score``-based rank key
+    effectively preferred top-level regardless of substance, since Algolia
+    returns ``points: null`` for HN comments.
+    """
+    if not comments:
+        return []
+
+    selected = []
+    selected_indexes = set()
+    per_thread: dict[int, int] = {}
+
+    def add(comment: dict) -> None:
+        if len(selected) >= limit:
+            return
+        index = id(comment)
+        thread_index = comment["top_thread_index"]
+        if index in selected_indexes:
+            return
+        if per_thread.get(thread_index, 0) >= TOP_COMMENT_MAX_PER_THREAD:
+            return
+        selected.append(comment)
+        selected_indexes.add(index)
+        per_thread[thread_index] = per_thread.get(thread_index, 0) + 1
+
+    top_level = [c for c in comments if c["depth"] == 0]
+    good_top_level = [
+        c
+        for c in top_level
+        if c["text_len"] >= GOOD_TOPLEVEL_MIN_LEN
+        or c["descendant_count"] >= GOOD_TOPLEVEL_MIN_REPLIES
+    ]
+
+    n_cores = min(TOP_COMMENT_CORE_THREADS, len(good_top_level))
+    core_roots = sorted(
+        good_top_level,
+        key=lambda c: (-c["descendant_count"], c["top_thread_index"]),
+    )[:n_cores]
+    core_threads = {c["top_thread_index"] for c in core_roots}
+
+    for root in sorted(core_roots, key=_comment_rank_key):
+        add(root)
+
+    for thread_index in sorted(core_threads):
+        replies = [
+            c
+            for c in comments
+            if c["top_thread_index"] == thread_index and c["depth"] > 0
+        ]
+        for reply in sorted(replies, key=_comment_rank_key)[
+            :TOP_COMMENT_REPLIES_PER_CORE_THREAD
+        ]:
+            add(reply)
+
+    top_level_added = sum(1 for c in selected if c["depth"] == 0)
+    for comment in sorted(good_top_level, key=_comment_rank_key):
+        if top_level_added >= TOP_COMMENT_TOP_LEVEL_BUDGET:
+            break
+        add(comment)
+        top_level_added += 1
+
+    for comment in sorted(comments, key=_comment_rank_key):
+        add(comment)
+        if len(selected) >= limit:
+            break
+
+    return selected
 
 
 def compose_story_text(
@@ -194,7 +562,61 @@ def compose_story_text(
     return " ".join(parts).strip()
 
 
+def story_embedding_text(story: Story) -> str:
+    """Return the exact text used for the current production embedding version."""
+    if story.text_content:
+        return story.text_content
+    return compose_story_text(
+        story.title,
+        story.self_text,
+        story.top_comments,
+        story.article_body,
+    )
+
+
 # Algolia Fetching
+def _coerce_int(value, default: int = 0) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _ch_story_item_to_story(item: dict) -> Story | None:
+    """Convert a CH live-window item dict (Algolia shape) to a Story row.
+
+    The CH live_window query returns the same fields as Algolia items
+    (id, type, title, url, points, num_comments, created_at_i, text,
+    children). For live `hn` source, we insert directly with the CH
+    data; comment hydration is handled later by the bulk prewarm path.
+    """
+    sid = _coerce_int(item.get("id"))
+    title = clean_text(str(item.get("title") or ""))
+    if sid <= 0 or not title:
+        return None
+    self_text = clean_text(str(item.get("text") or ""))
+    text_content = compose_story_text(title, self_text)
+    if not text_content:
+        return None
+    return Story(
+        id=sid,
+        title=title,
+        url=item.get("url") or None,
+        score=_coerce_int(item.get("points")),
+        time=_coerce_int(item.get("created_at_i")),
+        text_content=text_content,
+        source="hn",
+        comment_count=_coerce_int(item.get("num_comments")),
+        discussion_url=f"https://news.ycombinator.com/item?id={sid}",
+        comment_count_at_fetch=_coerce_int(item.get("num_comments")),
+        self_text=self_text,
+        top_comments="",
+        article_body="",
+    )
+
+
 def _empty_story(sid: int) -> Story:
     return Story(
         id=sid, title="", url=None, score=0, time=0, text_content="", source="hn"
@@ -242,9 +664,8 @@ async def fetch_story(
 
         children = item.get("children", [])
         all_comments = _extract_comments_recursive(children)
-        all_comments.sort(key=lambda x: x["score"])
-        selected = all_comments[:24]
-        top_comment_texts = " ".join(c["text"] for c in selected)[:6000]
+        selected = _select_top_comments(all_comments)
+        top_comment_texts = " ".join(c["text"] for c in selected)[:10000]
 
         text_content = compose_story_text(
             title=title,
@@ -268,6 +689,7 @@ async def fetch_story(
                 )
             return story if story else None
 
+        source = story.source if story is not None else "hn"
         story = Story(
             id=sid,
             title=title,
@@ -275,7 +697,7 @@ async def fetch_story(
             score=score,
             time=created_at,
             text_content=text_content,
-            source="hn",
+            source=source,
             comment_count=comment_count
             if comment_count is not None
             else len(all_comments),
@@ -293,94 +715,6 @@ async def fetch_story(
     except Exception as e:
         logging.error(f"Error fetching story {sid}: {e}")
         return story if story else None
-
-
-async def refetch_story_text(
-    client: httpx.AsyncClient,
-    db: Database,
-    embedder: Embedder,
-    story_id: int,
-    current_count: int,
-) -> Story | None:
-    """Re-fetch comment text from Algolia items API, recompose text_content, re-embed.
-
-    Used during regen when a story's comment_count has grown >= 30% since the last
-    text fetch. Returns the updated Story, or None on failure (caller keeps stale data).
-
-    Safety: caller is responsible for excluding stories with feedback to avoid
-    invalidating the cached embedding for voted stories.
-    """
-    try:
-        resp = await client.get(f"https://hn.algolia.com/api/v1/items/{story_id}")
-        if resp.status_code != 200:
-            logging.warning(
-                f"refetch_story_text({story_id}): algolia status={resp.status_code}, "
-                f"keeping stale text_content"
-            )
-            return None
-
-        item = resp.json()
-        if not item or item.get("type") != "story":
-            logging.warning(
-                f"refetch_story_text({story_id}): algolia returned non-story, "
-                f"keeping stale text_content"
-            )
-            return None
-
-        children = item.get("children", [])
-        all_comments = _extract_comments_recursive(children)
-        all_comments.sort(key=lambda x: x["score"])
-        selected = all_comments[:24]
-        top_comment_texts = " ".join(c["text"] for c in selected)[:6000]
-
-        existing = db.get_story(story_id)
-        if existing is None:
-            return None
-
-        story_text = clean_text(str(item.get("story_text") or item.get("text") or ""))
-        new_text_content = compose_story_text(
-            title=item.get("title", "") or existing.title,
-            self_text=story_text,
-            comments=top_comment_texts,
-            article_body=existing.article_body,
-        )
-        if not new_text_content:
-            logging.warning(
-                f"refetch_story_text({story_id}): empty composed text, "
-                f"keeping stale text_content"
-            )
-            return None
-
-        updated = Story(
-            id=story_id,
-            title=html.unescape(item.get("title", "")) or existing.title,
-            url=item.get("url") or existing.url,
-            score=item.get("points") or existing.score,
-            time=item.get("created_at_i") or existing.time,
-            text_content=new_text_content,
-            source="hn",
-            comment_count=item.get("num_comments") or current_count,
-            discussion_url=existing.discussion_url,
-            comment_count_at_fetch=item.get("num_comments") or current_count,
-            self_text=story_text,
-            top_comments=top_comment_texts,
-            article_body=existing.article_body,
-        )
-        db.upsert_story(updated)
-
-        # Re-embed the new text_content. Force a fresh computation by
-        # overwriting the cached embedding.
-        new_vec = embedder.encode([new_text_content])[0]
-        import hashlib
-        new_hash = hashlib.sha256(new_text_content.encode("utf-8")).hexdigest()
-        db.upsert_embedding(story_id, "all-MiniLM-L6-v2|mean|norm|512", new_hash, new_vec)
-
-        return updated
-    except Exception as e:
-        logging.warning(
-            f"refetch_story_text({story_id}): failed ({e!r}), keeping stale text_content"
-        )
-        return None
 
 
 async def fetch_stories_by_id(
@@ -453,63 +787,319 @@ async def fetch_stories_by_id(
     return valid_stories
 
 
-def _is_refetch_eligible(
-    sid: int,
-    comment_count_at_fetch: int,
-    new_comment_count: int | None,
-    story_time: int,
-    feedback_ids: set[int],
-    now_ts: int,
-) -> tuple[bool, int]:
-    """Pure eligibility check for refetch_story_text.
+def prewarm_top_stories(
+    story_ids: list[int],
+    db: Database,
+    embedder: Embedder | None = None,
+    max_levels: int = 5,
+) -> int:
+    """Bulk-prewarm comment text for the top-N stories.
 
-    Returns (eligible, new_comment_count). When new_comment_count is None
-    (algolia search did not include num_comments), the story is not eligible
-    and 0 is returned for the new count.
+    Fetches full comment trees for the given story IDs in a single ClickHouse
+    query, selects top comments using the same logic as Algolia, recomposes
+    text_content, and writes back to the stories table. Skips stories that
+    already have a recent comment fetch (no need to redo the work).
+
+    Always-on; called from `render_dashboard` after ranking. The CH bulk path
+    handles up to 200 stories in <1s vs ~30s for parallel Algolia.
+
+    Args:
+        story_ids: ordered list of story IDs to prewarm (e.g., top-20 ranked).
+        db: Database instance for read + write.
+        embedder: Optional Embedder; if provided, recomputes the embedding
+            for any story whose text_content changed.
+        max_levels: comment tree depth (default 5; covers ~95% of trees).
+
+    Returns:
+        Number of stories whose top_comments was updated.
     """
-    if new_comment_count is None or new_comment_count <= comment_count_at_fetch:
-        return False, 0
-    if comment_count_at_fetch <= 0:
-        return False, 0
-    growth = (new_comment_count - comment_count_at_fetch) / comment_count_at_fetch
-    if growth < COMMENT_GROWTH_THRESHOLD:
-        return False, 0
-    max_age_seconds = COMMENT_REFETCH_MAX_AGE_HOURS * 3600
-    if (now_ts - story_time) >= max_age_seconds:
-        return False, 0
-    if sid in feedback_ids:
-        return False, 0
-    return True, new_comment_count
+    from ch_client import query_stories_with_comments
 
+    def _coerce_int_safe(value, default):
+        if value is None:
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
 
-def _select_refetch_ids(
-    candidates: list[Story],
-    fresh_metadata: dict[int, dict],
-    feedback_ids: set[int],
-    now_ts: int,
-) -> list[int]:
-    """Select up to MAX_REFETCH_PER_REGEN story IDs to refetch, ordered by
-    growth ratio (highest first)."""
-    eligible: list[tuple[float, int, int]] = []
-    for s in candidates:
-        if s.id not in fresh_metadata:
+    if not story_ids:
+        return 0
+
+    target_ids = [int(s) for s in story_ids if int(s) > 0]
+    if not target_ids:
+        return 0
+
+    try:
+        ch_items = query_stories_with_comments(target_ids, max_levels=max_levels)
+    except Exception as exc:
+        logging.warning("prewarm_top_stories: CH bulk query failed (%r)", exc)
+        return 0
+
+    if not ch_items:
+        return 0
+
+    existing_map = {s.id: s for s in db.get_stories(target_ids)}
+    updated: list[Story] = []
+    for sid, item in ch_items.items():
+        existing = existing_map.get(sid)
+        if existing is None:
             continue
-        meta = fresh_metadata[s.id]
-        new_comments = meta.get("comment_count")
-        is_ok, new_count = _is_refetch_eligible(
-            sid=s.id,
-            comment_count_at_fetch=s.comment_count_at_fetch,
-            new_comment_count=new_comments,
-            story_time=s.time,
-            feedback_ids=feedback_ids,
-            now_ts=now_ts,
+        children = item.get("children") or []
+        all_comments = _extract_comments_recursive(children)
+        selected = _select_top_comments(all_comments)
+        top_comments = " ".join(c["text"] for c in selected)[:10000]
+        if not top_comments:
+            continue
+        comment_count = _coerce_int_safe(
+            item.get("num_comments"), existing.comment_count or 0
         )
-        if is_ok:
-            growth = (new_count - s.comment_count_at_fetch) / s.comment_count_at_fetch
-            eligible.append((growth, s.id, new_count))
+        new_text_content = compose_story_text(
+            title=existing.title,
+            self_text=existing.self_text,
+            comments=top_comments,
+            article_body=existing.article_body,
+        )
+        if not new_text_content:
+            continue
+        updated_story = replace(
+            existing,
+            top_comments=top_comments,
+            text_content=new_text_content,
+            comment_count=comment_count,
+            comment_count_at_fetch=comment_count,
+        )
+        db.upsert_story(updated_story)
+        updated.append(updated_story)
 
-    eligible.sort(key=lambda x: x[0], reverse=True)
-    return [sid for _, sid, _ in eligible[:MAX_REFETCH_PER_REGEN]]
+    if updated and embedder is not None:
+        get_or_compute_embeddings(updated, embedder, db)
+
+    return len(updated)
+
+
+async def prewarm_reddit_top_stories(
+    story_ids: list[int],
+    db: Database,
+    embedder: Embedder | None = None,
+    *,
+    spread_window_seconds: float | None = None,
+) -> int:
+    """Bulk-prewarm Reddit RSS comment text for top-N stories.
+
+    Convenience wrapper: builds prewarm factories via
+    :func:`build_reddit_prewarm_factories`, enqueues them on the shared
+    queue, waits for the queue to drain, then recomputes embeddings for
+    the stories whose ``top_comments`` or ``self_text`` changed.
+
+    The regen path uses :func:`fetch_candidates_only` directly, which
+    interleaves topfeed and prewarm factories via
+    :func:`reddit_fetch_queue.enqueue_all_reddit_fetches` and drains
+    once. This standalone wrapper exists for tests and ad-hoc callers
+    that want a simple blocking prewarm.
+
+    Returns number of stories whose top_comments or self_text changed.
+    """
+    if not story_ids:
+        return 0
+    from reddit_fetch_queue import queue as reddit_fetch_queue
+
+    factories, updated_ids = build_reddit_prewarm_factories(story_ids, db)
+    window = (
+        spread_window_seconds
+        if spread_window_seconds is not None
+        else (len(factories) * reddit_fetch_queue.MIN_FETCH_SPACING)
+    )
+    reddit_fetch_queue.enqueue_spread(
+        len(factories),
+        time.monotonic(),
+        "prewarm",
+        factories,
+        window_seconds=window,
+    )
+    drained = reddit_fetch_queue.wait_until_empty(timeout=1500.0)
+    if not drained:
+        logging.warning(
+            "prewarm_reddit: queue did not drain in 1500s, returning partial count"
+        )
+
+    if updated_ids and embedder is not None:
+        updated_stories = [db.get_story(sid) for sid in updated_ids]
+        updated_stories = [s for s in updated_stories if s is not None]
+        if updated_stories:
+            get_or_compute_embeddings(updated_stories, embedder, db)
+
+    return len(updated_ids)
+
+
+def build_reddit_prewarm_factories(
+    story_ids: list[int], db: Database
+) -> tuple[list[CoroFactory], list[int]]:
+    """Build Reddit prewarm coroutine factories for the given story IDs.
+
+    Each factory fetches the story's per-post RSS feed, extracts
+    self_text and top_comments, recomposes text_content, and writes
+    back to the stories table. Factories are NO-OPs for stories that
+    don't need prewarming (already-hydrated, non-Reddit, or no URL).
+
+    Returns:
+        (factories, updated_ids) where ``updated_ids`` is a shared list
+        that each factory appends to as it successfully writes back to
+        the DB. Read ``len(updated_ids)`` after the queue drains to get
+        the prewarm count.
+
+    The regen pipeline uses
+    :func:`reddit_fetch_queue.enqueue_all_reddit_fetches` to interleave
+    prewarm factories with topfeed factories on a single shared window,
+    so the returned list is enqueued rather than awaited in-place.
+    """
+    if not story_ids:
+        return [], []
+    from server import _fetch_reddit_rss_context  # late import to avoid circular
+
+    counter_lock = threading.Lock()
+    updated_ids: list[int] = []
+
+    def make_prewarm_factory(sid: int) -> CoroFactory:
+        async def factory() -> None:
+            # Cheap circuit-open short-circuit to avoid db.get_story and
+            # the inner fetch path when the limiter has opened. The
+            # inner `_fetch_reddit_rss_context → acquire` is the actual
+            # rate-limit gate; calling `acquire()` here would reserve
+            # a second slot per HTTP (acquire + _fetch_reddit_rss_context
+            # both call it), wasting rate-limit budget under the
+            # concurrent-reservation contract. See WORKLOG 2026-06-28
+            # "Limiter concurrency race fix".
+            if reddit_limiter.circuit_open:
+                return
+            story = db.get_story(sid)
+            if not story or not story.url:
+                return
+            if not story.source.startswith("rss_reddit_"):
+                return
+            try:
+                ctx = await _fetch_reddit_rss_context(story.url)
+            except Exception as exc:
+                logging.warning(
+                    "prewarm_reddit: fetch failed for story_id=%s: %r",
+                    sid,
+                    exc,
+                )
+                return
+            if ctx is None or not ctx.top_comments:
+                return
+            if story.top_comments and len(ctx.top_comments) <= len(story.top_comments):
+                return
+            new_self_text = (
+                ctx.self_text
+                if len(ctx.self_text) > len(story.self_text)
+                else story.self_text
+            )
+            new_text_content = compose_story_text(
+                story.title,
+                new_self_text,
+                ctx.top_comments,
+                story.article_body or "",
+            )
+            if not new_text_content:
+                return
+            updated = replace(
+                story,
+                self_text=new_self_text,
+                top_comments=ctx.top_comments,
+                text_content=new_text_content,
+                comment_count=story.comment_count or ctx.comment_count or None,
+                comment_count_at_fetch=max(
+                    story.comment_count_at_fetch, ctx.comment_count
+                ),
+                discussion_url=story.discussion_url or story.url,
+            )
+            db.upsert_story(updated)
+            with counter_lock:
+                updated_ids.append(updated.id)
+
+        return factory
+
+    return [make_prewarm_factory(sid) for sid in story_ids], updated_ids
+
+
+async def prewarm_lesswrong_stories(
+    story_ids: list[int],
+    db: Database,
+    embedder: Embedder | None = None,
+) -> int:
+    """Prewarm top_comments and self_text for LessWrong RSS stories.
+
+    Fetches each post's body and top-voted comments via LessWrong's GraphQL
+    endpoint (one request per story). Serialized to avoid rate limits.
+
+    Returns number of stories whose top_comments or self_text changed.
+    """
+    if not story_ids:
+        return 0
+    from server import _extract_lesswrong_post_id, _fetch_lesswrong_context
+
+    prewarmed: list[Story] = []
+    for sid in story_ids:
+        story = db.get_story(sid)
+        if not story or not story.url:
+            continue
+        if story.source != "rss_lesswrong_com":
+            continue
+
+        post_id = _extract_lesswrong_post_id(story.url)
+        if not post_id:
+            continue
+
+        try:
+            ctx = await _fetch_lesswrong_context(post_id)
+        except Exception as exc:
+            logging.warning(
+                "prewarm_lesswrong: fetch failed for story_id=%s: %r",
+                sid,
+                exc,
+            )
+            continue
+
+        if ctx is None or not (ctx.self_text or ctx.top_comments):
+            continue
+
+        # Idempotent: skip if already populated with equal or richer data
+        if story.top_comments and len(ctx.top_comments) <= len(story.top_comments):
+            continue
+        if story.self_text and len(ctx.self_text) <= len(story.self_text):
+            continue
+
+        new_self_text = (
+            ctx.self_text
+            if len(ctx.self_text) > len(story.self_text)
+            else story.self_text
+        )
+        new_text_content = compose_story_text(
+            story.title,
+            new_self_text,
+            ctx.top_comments,
+            story.article_body or "",
+        )
+        if not new_text_content:
+            continue
+
+        updated = replace(
+            story,
+            self_text=new_self_text,
+            top_comments=ctx.top_comments,
+            text_content=new_text_content,
+            comment_count=story.comment_count or ctx.comment_count or None,
+            comment_count_at_fetch=max(story.comment_count_at_fetch, ctx.comment_count),
+            discussion_url=story.discussion_url or story.url,
+        )
+        db.upsert_story(updated)
+        prewarmed.append(updated)
+
+    if prewarmed and embedder is not None:
+        get_or_compute_embeddings(prewarmed, embedder, db)
+
+    return len(prewarmed)
 
 
 async def fetch_candidates(
@@ -519,146 +1109,365 @@ async def fetch_candidates(
     db: Database,
     embedder: Embedder | None = None,
 ) -> tuple[list[Story], int]:
-    candidate_ids = set()
-    fresh_metadata = {}
-    now_ts = int(time.time())
-    cutoff_ts = now_ts - (config.days * 86400)
-    live_start_ts = now_ts - (7 * 86400)
+    """Fetch candidate stories for the dashboard.
 
-    # 1. Archive Window from DB
-    rows = db.execute(
-        "SELECT id FROM stories WHERE source = 'hn' AND time >= ? AND time < ?",
-        (cutoff_ts, live_start_ts),
-    )
-    for row in rows:
-        sid = row[0]
-        if sid not in exclude_ids:
-            candidate_ids.add(sid)
+    One CH call does the work the old code did with ~125 Algolia calls:
 
-    # 2. Live Window daily chunks from Algolia
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        for day in range(7):
-            end_ts = now_ts - (day * 86400)
-            start_ts = now_ts - ((day + 1) * 86400)
-            filters = [
-                f"created_at_i>={start_ts}",
-                f"created_at_i<{end_ts}",
-            ]
-            page = 0
-            target_hits = 350
-            day_ids = []
+    `ch_client.query_live_window(days=7, min_score=5, limit=2000)` returns
+    every live HN story from the past 7 days with all fields populated
+    (title, url, score, descendants, time, text). No per-story items
+    call needed.
 
-            while len(day_ids) < target_hits:
-                params = {
-                    "tags": "story",
-                    "numericFilters": ",".join(filters),
-                    "hitsPerPage": 100,
-                    "page": page,
-                }
-                try:
-                    resp = await client.get(
-                        "https://hn.algolia.com/api/v1/search", params=params
-                    )
-                    if resp.status_code != 200:
-                        break
-                    data = resp.json()
-                    hits = data.get("hits", [])
-                    if not hits:
-                        break
-                    for h in hits:
-                        oid = int(h["objectID"])
-                        points = int(h.get("points") or 0)
-                        if points <= 5:
-                            continue
-                        day_ids.append(oid)
-                        fresh_metadata[oid] = {
-                            "score": points,
-                            "comment_count": h.get("num_comments"),
-                        }
-                    page += 1
-                    if len(hits) < 100:
-                        break
-                except Exception:
-                    break
+    Archive seeds (`ch_seed`, `bq_seed`) are read from the DB only.
 
-            for oid in day_ids:
-                if oid not in exclude_ids:
-                    candidate_ids.add(oid)
+    The 1-24h CH lag is acceptable: a 3h regen cycle means brand-new
+    stories surface within 4h. Algolia's single-story items API is
+    preserved as a fallback for `ch_seed`/`bq_seed` lazy fetches.
 
-        candidates = await fetch_stories_by_id(list(candidate_ids), db, client)
+    Comment text for the top-20 ranked cards is fetched by
+    `prewarm_top_stories` on every dashboard render (not here).
+    """
+    from ch_client import query_live_window
 
-        # Refresh points and comment counts for HN candidates using Algolia search response data
-        for i, s in enumerate(candidates):
-            if s.id in fresh_metadata:
-                meta = fresh_metadata[s.id]
-                has_changes = False
-                new_score = s.score
-                new_comments = s.comment_count
-                if s.score != meta["score"]:
-                    new_score = meta["score"]
-                    has_changes = True
-                if (
-                    meta["comment_count"] is not None
-                    and s.comment_count != meta["comment_count"]
-                ):
-                    new_comments = meta["comment_count"]
-                    has_changes = True
-                if has_changes:
-                    updated_s = replace(s, score=new_score, comment_count=new_comments)
-                    candidates[i] = updated_s
-                    db.upsert_story(updated_s)
+    # 1. Live window from CH (replaces ~125 Algolia search + items calls)
+    try:
+        live_window = query_live_window(
+            days=7,
+            min_score=5,
+            limit=LIVE_WINDOW_LIMIT,
+        )
+    except Exception as exc:
+        logging.error(
+            "fetch_candidates: CH live_window failed (%r); live source empty", exc
+        )
+        live_window = []
 
-        # Detect growth candidates and refetch comment text for top stories.
-        # Triggers refetch when comment_count has grown >= COMMENT_GROWTH_THRESHOLD
-        # since the last text fetch, story is < 24h old, and story has no feedback
-        # (feedback exclusion protects the 1,647-row training contract from
-        # embedding churn).
-        if embedder is not None and candidates:
-            now_ts_local = int(time.time())
-            refetch_ids = _select_refetch_ids(
-                candidates=candidates,
-                fresh_metadata=fresh_metadata,
-                feedback_ids=exclude_ids,
-                now_ts=now_ts_local,
+    # 2. Build candidates from live window: insert new, update existing scores
+    candidates: list[Story] = []
+    fresh_metadata: dict[int, dict] = {}
+    existing_stories = {
+        s.id: s for s in db.get_stories([item["id"] for item in live_window])
+    }
+    for item in live_window:
+        sid = _coerce_int(item.get("id"))
+        if sid <= 0 or sid in exclude_ids:
+            continue
+        fresh_metadata[sid] = {
+            "score": _coerce_int(item.get("points")),
+            "comment_count": _coerce_int(item.get("num_comments")),
+        }
+        existing = existing_stories.get(sid)
+        if existing is not None:
+            new_score = _coerce_int(item.get("points"), existing.score)
+            new_comments = _coerce_int(
+                item.get("num_comments"), existing.comment_count or 0
             )
-            for sid in refetch_ids:
-                try:
-                    updated = await refetch_story_text(
-                        client, db, embedder, sid, fresh_metadata[sid]["comment_count"]
-                    )
-                    if updated is not None:
-                        for i, c in enumerate(candidates):
-                            if c.id == sid:
-                                candidates[i] = updated
-                                break
-                except Exception as e:
-                    logging.warning(f"refetch_story_text({sid}) raised: {e!r}")
+            has_changes = new_score != existing.score or new_comments != (
+                existing.comment_count or 0
+            )
+            if has_changes:
+                updated = replace(existing, score=new_score, comment_count=new_comments)
+                db.upsert_story(updated)
+                candidates.append(updated)
+            else:
+                candidates.append(existing)
+        else:
+            new_story = _ch_story_item_to_story(item)
+            if new_story is not None:
+                db.upsert_story(new_story)
+                candidates.append(new_story)
 
-    # Dedup
-    deduped_candidates = []
-    seen_urls = set()
-    for s in candidates:
-        if s.url:
-            if s.url in exclude_urls or s.url in seen_urls:
-                continue
-            seen_urls.add(s.url)
-        deduped_candidates.append(s)
+    # 3. Archive seeds from DB (read-only)
+    rows = db.execute(
+        """
+        SELECT id FROM stories
+        WHERE source IN (?, ?) AND text_content != ''
+        ORDER BY score DESC, time DESC
+        LIMIT ?
+        """,
+        (
+            BQ_ARCHIVE_SOURCE,
+            CH_ARCHIVE_SOURCE,
+            BQ_ARCHIVE_CANDIDATE_LIMIT + CH_ARCHIVE_CANDIDATE_LIMIT,
+        ),
+    )
+    archive_ids = [row[0] for row in rows if row[0] not in exclude_ids]
+    if archive_ids:
+        archive_stories = db.get_stories(archive_ids)
+        candidates.extend(archive_stories)
 
-    # 3. RSS feeds
+    # 4. Skip fetch-time dedup — duplicate resolution is centralized at
+    #    render time in `_apply_dedup_to_ranked` (see dedup.py). We still
+    #    pass `exclude_urls` (built from the user's feedback set) into the
+    #    RSS fetch so we don't re-pull URLs the user has already voted on.
+
+    # 5. RSS feeds
     if config.rss.enabled:
         rss_stories = await fetch_rss_feeds(
             feeds=list(config.rss.feeds),
             per_feed=config.rss.per_feed_limit,
             days=config.days,
-            exclude_urls=exclude_urls | seen_urls,
+            exclude_urls=exclude_urls,
             db=db,
         )
-        deduped_candidates.extend(rss_stories)
+        deduped_candidates: list[Story] = list(candidates) + rss_stories
+    else:
+        deduped_candidates = list(candidates)
 
-    return deduped_candidates, len(deduped_candidates)
+    # 6. Filter to summarizable stories (no content = no TLDR possible)
+    summarizable = [s for s in deduped_candidates if is_summarizable(s)]
+    n_filtered = len(deduped_candidates) - len(summarizable)
+    if n_filtered:
+        logging.info(
+            "fetch_candidates: filtered %d unsummarizable stories",
+            n_filtered,
+        )
+    return summarizable, len(summarizable)
 
 
 # RSS Fetching
+def _reddit_subreddit_from_feed_url(feed_url: str) -> str | None:
+    parsed = urlparse(feed_url)
+    domain = parsed.netloc.lower()
+    if domain.startswith("www."):
+        domain = domain[4:]
+    if domain not in {"reddit.com", "old.reddit.com"}:
+        return None
+
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) >= 2 and parts[0].lower() == "r":
+        return re.sub(r"[^a-z0-9_]+", "_", parts[1].lower()).strip("_")
+    return None
+
+
+def _rss_source_name(feed_url: str) -> str:
+    subreddit = _reddit_subreddit_from_feed_url(feed_url)
+    if subreddit:
+        return f"rss_reddit_{subreddit}"
+
+    domain = urlparse(feed_url).netloc
+    if domain.startswith("www."):
+        domain = domain[4:]
+    for prefix in ("rss.", "feeds.", "feed."):
+        if domain.startswith(prefix):
+            domain = domain[len(prefix) :]
+    return f"rss_{domain.replace('.', '_')}"
+
+
+def _urllib_fetch(url: str, user_agent: str) -> tuple[int, str]:
+    """Sync fetch via urllib.
+    Re-exported from http_fetch for backward compatibility with
+    callers that import it from pipeline (e.g. server.py). Prefer
+    `http_fetch.urllib_fetch` for new code."""
+    from http_fetch import urllib_fetch as _impl
+
+    return _impl(url, user_agent)
+
+
+def _parse_rate_limit_reset(headers: dict[str, str]) -> float | None:
+    """Extract Reddit's x-ratelimit-reset value (seconds) from response headers.
+
+    Returns None if the header is missing or unparseable.
+    """
+    raw = headers.get("x-ratelimit-reset")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _fetch_and_parse_feed(
+    feed_url: str,
+    per_feed: int,
+    cutoff: float,
+    now: float,
+    exclude_urls: set[str],
+) -> list[Story]:
+    """Fetch a single RSS feed (Reddit or non-Reddit) and parse to Stories.
+
+    Returns an empty list on any failure. Used by both ``fetch_rss_feeds``
+    (non-Reddit sync) and the Reddit topfeed factories. Reddit responses
+    notify the shared ``reddit_limiter`` on 429 (with
+    ``x-ratelimit-reset``) and on 200.
+    """
+    is_reddit = bool(_reddit_subreddit_from_feed_url(feed_url))
+    try:
+        from http_fetch import fetch_with_urllib_fallback
+
+        source_name = _rss_source_name(feed_url)
+        headers = {"User-Agent": RSS_USER_AGENT}
+        if is_reddit:
+            headers["User-Agent"] = REDDIT_RSS_USER_AGENT
+
+        async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
+            status, content, resp_headers = await fetch_with_urllib_fallback(
+                client, feed_url, headers
+            )
+            if is_reddit:
+                if status == 429:
+                    rl_reset = _parse_rate_limit_reset(resp_headers)
+                    reddit_limiter.on_429(rate_limit_reset=rl_reset)
+                elif status == 200:
+                    reddit_limiter.on_success()
+            if status != 200:
+                return []
+
+        parsed = feedparser.parse(content)
+        stories: list[Story] = []
+
+        for entry in parsed.entries[:per_feed]:
+            link = entry.get("link")
+            if not link:
+                continue
+            if link in exclude_urls:
+                continue
+
+            published_parsed = entry.get("published_parsed")
+            if published_parsed:
+                pub_time = time.mktime(published_parsed)
+            else:
+                updated_parsed = entry.get("updated_parsed")
+                if updated_parsed:
+                    pub_time = time.mktime(updated_parsed)
+                else:
+                    pub_time = now
+
+            if pub_time < cutoff:
+                continue
+
+            title = entry.get("title", "Untitled")
+
+            summary = ""
+            if "content" in entry and entry.content:
+                summary = entry.content[0].value
+            elif "summary" in entry:
+                summary = entry.summary
+
+            clean_summary = clean_text(summary)
+            snippet = clean_summary[:1000]
+            self_text = snippet
+            text_content = compose_story_text(title, self_text)
+
+            h = hashlib.md5(link.encode("utf-8")).digest()
+            val = int.from_bytes(h[:4], "big")
+            synthetic_id = -(val % (2**31))
+
+            score, num_comments = _extract_reddit_score_and_comments(
+                entry if is_reddit else None
+            )
+
+            story = Story(
+                id=synthetic_id,
+                title=title,
+                url=link,
+                score=score,
+                time=int(pub_time),
+                text_content=text_content,
+                self_text=self_text,
+                source=source_name,
+                comment_count=num_comments,
+                comment_count_at_fetch=num_comments or 0,
+                discussion_url=None,
+            )
+            stories.append(story)
+
+        return stories
+    except Exception as e:
+        logging.error(f"Failed to fetch RSS feed {feed_url}: {e}")
+        return []
+
+
+def _extract_reddit_score_and_comments(
+    entry: Any,
+) -> tuple[int, int]:
+    """Extract ``(score, num_comments)`` from a Reddit RSS entry.
+
+    Reddit's topfeed Atom feed puts ``<score>`` and ``<num_comments>``
+    as direct children of ``<entry>``. feedparser surfaces them as
+    ``entry["score"]`` / ``entry["num_comments"]`` (and as ``.score`` /
+    ``.num_comments`` attributes). The exact element name Reddit uses
+    has shifted over time, so this helper also tries a few legacy
+    aliases (``<points>``, ``<comments>``) and falls back to ``(0, 0)``
+    if the entry doesn't expose any of them.
+
+    Returns ``(0, 0)`` for non-Reddit callers (``entry`` is None) so
+    the existing non-Reddit behavior is preserved.
+    """
+    if entry is None:
+        return 0, 0
+
+    def _coerce(raw: Any) -> int:
+        if raw is None or raw == "":
+            return 0
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 0
+
+    score = 0
+    num_comments = 0
+    for key in ("score", "points", "likes"):
+        v = _coerce(entry.get(key)) if hasattr(entry, "get") else 0
+        if v:
+            score = v
+            break
+    for key in ("num_comments", "comments"):
+        v = _coerce(entry.get(key)) if hasattr(entry, "get") else 0
+        if v:
+            num_comments = v
+            break
+
+    return score, num_comments
+
+
+def build_reddit_topfeed_factories(
+    feeds: list[str],
+    per_feed: int,
+    days: int,
+    exclude_urls: set[str],
+) -> tuple[list[CoroFactory], list[str]]:
+    """Build Reddit topfeed coroutine factories + their feed URLs.
+
+    Each factory checks ``reddit_feed_cache`` first (skip if hit),
+    acquires the shared ``reddit_limiter``, fetches via
+    :func:`_fetch_and_parse_feed`, and writes to ``reddit_feed_cache``.
+
+    Returns ``(factories, reddit_feed_urls)``. Factories are NOT enqueued
+    here; the regen pipeline uses
+    :func:`reddit_fetch_queue.enqueue_all_reddit_fetches` to interleave
+    them with prewarm factories on a single shared window. Test callers
+    can enqueue via the regular ``enqueue_spread`` path.
+
+    The ``days``, ``per_feed``, and ``exclude_urls`` arguments are
+    captured by the closures so each factory has the same filtering
+    behavior as the legacy in-line ``fetch_rss_feeds`` path.
+    """
+    reddit_feeds = [f for f in feeds if _reddit_subreddit_from_feed_url(f)]
+    if not reddit_feeds:
+        return [], []
+    now = time.time()
+    cutoff = now - (days * 86400)
+
+    def make_topfeed_factory(feed_url: str) -> CoroFactory:
+        async def factory() -> None:
+            cached = reddit_feed_cache.get(feed_url)
+            if cached is not None:
+                return
+            if not await reddit_limiter.acquire():
+                return
+            stories = await _fetch_and_parse_feed(
+                feed_url, per_feed, cutoff, now, exclude_urls
+            )
+            if stories:
+                reddit_feed_cache.set(feed_url, stories)
+
+        return factory
+
+    return [make_topfeed_factory(f) for f in reddit_feeds], reddit_feeds
+
+
 async def fetch_rss_feeds(
     feeds: list[str],
     per_feed: int,
@@ -666,83 +1475,27 @@ async def fetch_rss_feeds(
     exclude_urls: set[str],
     db: Database,
 ) -> list[Story]:
+    """Fetch non-Reddit RSS feeds synchronously and upsert to DB.
+
+    Reddit RSS feeds are NOT fetched here — they are rate-limited and
+    must be enqueued via :func:`build_reddit_topfeed_factories` plus
+    :func:`reddit_fetch_queue.enqueue_all_reddit_fetches` by the regen
+    pipeline. Calling this function with a feed list that includes
+    Reddit URLs is safe: they are filtered out.
+
+    Returns the list of Stories upserted (non-Reddit only).
+    """
     now = time.time()
     cutoff = now - (days * 86400)
 
-    async def fetch_and_parse(feed_url: str) -> list[Story]:
-        try:
-            domain = urlparse(feed_url).netloc
-            if domain.startswith("www."):
-                domain = domain[4:]
-            source_name = f"rss_{domain.replace('.', '_')}"
+    other_feeds = [f for f in feeds if not _reddit_subreddit_from_feed_url(f)]
+    tasks = [
+        _fetch_and_parse_feed(f, per_feed, cutoff, now, exclude_urls)
+        for f in other_feeds
+    ]
+    feed_results = list(await asyncio.gather(*tasks)) if tasks else []
 
-            async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
-                resp = await client.get(feed_url)
-                if resp.status_code != 200:
-                    return []
-                content = resp.text
-
-            parsed = feedparser.parse(content)
-            stories = []
-
-            for entry in parsed.entries[:per_feed]:
-                link = entry.get("link")
-                if not link:
-                    continue
-                if link in exclude_urls:
-                    continue
-
-                published_parsed = entry.get("published_parsed")
-                if published_parsed:
-                    pub_time = time.mktime(published_parsed)
-                else:
-                    updated_parsed = entry.get("updated_parsed")
-                    if updated_parsed:
-                        pub_time = time.mktime(updated_parsed)
-                    else:
-                        pub_time = now
-
-                if pub_time < cutoff:
-                    continue
-
-                title = entry.get("title", "Untitled")
-
-                summary = ""
-                if "content" in entry and entry.content:
-                    summary = entry.content[0].value
-                elif "summary" in entry:
-                    summary = entry.summary
-
-                clean_summary = clean_text(summary)
-                snippet = clean_summary[:1000]
-                text_content = f"{title}. {snippet}".strip()
-
-                h = hashlib.md5(link.encode("utf-8")).digest()
-                val = int.from_bytes(h[:4], "big")
-                synthetic_id = -(val % (2**31))
-
-                story = Story(
-                    id=synthetic_id,
-                    title=title,
-                    url=link,
-                    score=0,
-                    time=int(pub_time),
-                    text_content=text_content,
-                    source=source_name,
-                    comment_count=None,
-                    discussion_url=None,
-                )
-                stories.append(story)
-
-            return stories
-        except Exception as e:
-            logging.error(f"Failed to fetch RSS feed {feed_url}: {e}")
-            return []
-
-    tasks = [fetch_and_parse(f) for f in feeds]
-    feed_results = await asyncio.gather(*tasks)
-
-    all_stories = []
+    all_stories: list[Story] = []
     for res in feed_results:
         for s in res:
             db.upsert_story(s)
@@ -756,14 +1509,20 @@ async def fetch_rss_feeds(
 
 class Embedder:
     def __init__(self, model_dir: str = "onnx_model"):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_dir)
+        self.tokenizer: Any = AutoTokenizer.from_pretrained(model_dir)
+        session_options = ort.SessionOptions()
+        session_options.enable_cpu_mem_arena = False
+        session_options.enable_mem_pattern = False
+        session_options.intra_op_num_threads = 2
+        session_options.inter_op_num_threads = 1
         self.session = ort.InferenceSession(
             str(Path(model_dir) / "model.onnx"),
+            sess_options=session_options,
             providers=["CPUExecutionProvider"],
         )
         self.max_tokens = 512
 
-    def encode(self, texts: list[str], batch_size: int = 64) -> NDArray[np.float32]:
+    def encode(self, texts: list[str], batch_size: int = 32) -> NDArray[np.float32]:
         if not texts:
             return np.empty((0, 384), dtype=np.float32)
 
@@ -815,19 +1574,21 @@ def get_or_compute_embeddings(
         return np.empty((0, 384), dtype=np.float32)
 
     import hashlib
+
+    embedding_texts = {s.id: story_embedding_text(s) for s in stories}
     story_hashes = {
-        s.id: hashlib.sha256(s.text_content.encode("utf-8")).hexdigest()
+        s.id: hashlib.sha256(embedding_texts[s.id].encode("utf-8")).hexdigest()
         for s in stories
     }
 
     ids = [s.id for s in stories]
-    model_version = "all-MiniLM-L6-v2|mean|norm|512"
+    model_version = "all-MiniLM-L6-v2|mean|norm|256"
 
     cached = db.get_embeddings_batch(ids, model_version, story_hashes)
     missing_stories = [s for s in stories if s.id not in cached]
 
     if missing_stories:
-        texts = [s.text_content for s in missing_stories]
+        texts = [embedding_texts[s.id] for s in missing_stories]
         computed = embedder.encode(texts)
         for s, vec in zip(missing_stories, computed):
             db.upsert_embedding(s.id, model_version, story_hashes[s.id], vec)
@@ -838,106 +1599,148 @@ def get_or_compute_embeddings(
 
 # Ranking
 
-# Normalization constants for metadata features
-_LOG_POINTS_SCALE = 8.0  # log1p(~3000) ≈ 8
-_AGE_DAYS_SCALE = 30.0  # cap at 30 days
-_LOG_COMMENTS_SCALE = 7.0  # log1p(~1000) ≈ 6.9
+# Normalization constant for text-length metadata feature
 _LOG_TEXTLEN_SCALE = 12.0  # log1p(~100000) ≈ 11.5
-_LOG_QUALITY_SCALE = 8.0  # log1p(score/(age_hours+1)) rarely exceeds 8
-_LOG_VELOCITY_SCALE = 8.0  # log1p(score/max(age_h, 0.1)) rarely exceeds 8
 
 
-def _augment_features(
-    embeddings: NDArray[np.float32],
-    scores: list[int] | np.ndarray,
-    age_seconds: list[float] | np.ndarray,
-    comment_counts: np.ndarray | None = None,
-    text_lengths: np.ndarray | None = None,
-    hn_quality: np.ndarray | None = None,
-    score_velocity: np.ndarray | None = None,
-    comment_velocity: np.ndarray | None = None,
-    sim_to_upvoted: np.ndarray | None = None,
-    sim_to_downvoted: np.ndarray | None = None,
-    closest_upvoted: np.ndarray | None = None,
-    closest_downvoted: np.ndarray | None = None,
-    comment_score_ratio: np.ndarray | None = None,
+def _knn_similarity(
+    query_emb: NDArray[np.float32], ref_emb: NDArray[np.float32], k: int
 ) -> NDArray[np.float32]:
-    n = len(scores)
-    n_meta = 1
-    for f in (comment_counts, text_lengths, hn_quality, comment_score_ratio):
-        if f is not None:
-            n_meta += 1
-    if score_velocity is not None and comment_velocity is not None:
-        n_meta += 2
-    if sim_to_upvoted is not None:
-        n_meta += 4
+    """Mean of top-k cosine similarities between query and reference embeddings."""
+    if ref_emb.shape[0] == 0:
+        return np.zeros(query_emb.shape[0], dtype=np.float32)
+    sim_mat = query_emb @ ref_emb.T
+    k_actual = min(k, ref_emb.shape[0])
+    if k_actual <= 0:
+        return np.zeros(query_emb.shape[0], dtype=np.float32)
+    if k_actual == sim_mat.shape[1]:
+        topk = sim_mat
+    else:
+        topk = np.partition(sim_mat, sim_mat.shape[1] - k_actual, axis=1)[:, -k_actual:]
+    return topk.mean(axis=1).astype(np.float32)
 
-    meta = np.zeros((n, n_meta), dtype=np.float32)
-    col = 0
 
-    # log points
-    meta[:, col] = (
-        np.clip(np.log1p(np.maximum(scores, 0)), 0, _LOG_POINTS_SCALE)
-        / _LOG_POINTS_SCALE
+def _topk_mean(values: NDArray[np.float32], k: int) -> float:
+    if k <= 0 or len(values) == 0:
+        return 0.0
+    k_actual = min(k, len(values))
+    if k_actual == len(values):
+        return float(values.mean())
+    return float(np.partition(values, len(values) - k_actual)[-k_actual:].mean())
+
+
+def _svm_personalization_features(
+    embeddings: NDArray[np.float32],
+    text_lengths: np.ndarray,
+    sim_to_upvoted: np.ndarray,
+    sim_to_downvoted: np.ndarray,
+    closest_upvoted: np.ndarray,
+    closest_downvoted: np.ndarray,
+    positive_cluster_similarity: np.ndarray | None = None,
+    is_hn_live: np.ndarray | None = None,
+    is_archive: np.ndarray | None = None,
+    is_reddit: np.ndarray | None = None,
+    is_rss: np.ndarray | None = None,
+) -> NDArray[np.float32]:
+    """Production SVM features: embeddings, text length, feedback similarity,
+    and 4-binary source category.
+
+    Meta column layout (after the 384-d embedding):
+      0  text_length (log1p, [0, 1])
+      1  sim_to_upvoted        ([-1, 1] → [0, 1])
+      2  sim_to_downvoted      ([-1, 1] → [0, 1])
+      3  closest_upvoted       ([-1, 1] → [0, 1])
+      4  closest_downvoted     ([-1, 1] → [0, 1])
+      5  positive_cluster_similarity ([-1, 1] → [0, 1])
+      6  is_hn_live            (0/1)
+      7  is_archive            (0/1)
+      8  is_reddit             (0/1)
+      9  is_rss                (0/1)
+    """
+    meta = np.zeros((len(embeddings), 10), dtype=np.float32)
+    meta[:, 0] = (
+        np.clip(np.log1p(np.maximum(text_lengths, 0)), 0, _LOG_TEXTLEN_SCALE)
+        / _LOG_TEXTLEN_SCALE
     )
-    col += 1
-
-    if comment_counts is not None:
-        meta[:, col] = (
-            np.clip(np.log1p(np.maximum(comment_counts, 0)), 0, _LOG_COMMENTS_SCALE)
-            / _LOG_COMMENTS_SCALE
-        )
-        col += 1
-
-    if text_lengths is not None:
-        meta[:, col] = (
-            np.clip(np.log1p(np.maximum(text_lengths, 0)), 0, _LOG_TEXTLEN_SCALE)
-            / _LOG_TEXTLEN_SCALE
-        )
-        col += 1
-
-    if hn_quality is not None:
-        meta[:, col] = (
-            np.clip(np.log1p(np.maximum(hn_quality, 0)), 0, _LOG_QUALITY_SCALE)
-            / _LOG_QUALITY_SCALE
-        )
-        col += 1
-
-    if comment_score_ratio is not None:
-        meta[:, col] = comment_score_ratio
-        col += 1
-
-    if score_velocity is not None and comment_velocity is not None:
-        meta[:, col] = (
-            np.clip(np.log1p(np.maximum(score_velocity, 0)), 0, _LOG_VELOCITY_SCALE)
-            / _LOG_VELOCITY_SCALE
-        )
-        col += 1
-        meta[:, col] = (
-            np.clip(np.log1p(np.maximum(comment_velocity, 0)), 0, _LOG_VELOCITY_SCALE)
-            / _LOG_VELOCITY_SCALE
-        )
-        col += 1
-
-    if sim_to_upvoted is not None:
-        assert (
-            sim_to_downvoted is not None
-            and closest_upvoted is not None
-            and closest_downvoted is not None
-        )
-        meta[:, col] = (np.clip(sim_to_upvoted, -1, 1) + 1) / 2
-        col += 1
-        meta[:, col] = (np.clip(sim_to_downvoted, -1, 1) + 1) / 2
-        col += 1
-        meta[:, col] = (np.clip(closest_upvoted, -1, 1) + 1) / 2
-        col += 1
-        meta[:, col] = (np.clip(closest_downvoted, -1, 1) + 1) / 2
-        col += 1
-
+    meta[:, 1] = (np.clip(sim_to_upvoted, -1, 1) + 1) / 2
+    meta[:, 2] = (np.clip(sim_to_downvoted, -1, 1) + 1) / 2
+    meta[:, 3] = (np.clip(closest_upvoted, -1, 1) + 1) / 2
+    meta[:, 4] = (np.clip(closest_downvoted, -1, 1) + 1) / 2
+    if positive_cluster_similarity is not None:
+        meta[:, 5] = (np.clip(positive_cluster_similarity, -1, 1) + 1) / 2
+    if is_hn_live is not None:
+        meta[:, 6] = is_hn_live
+    if is_archive is not None:
+        meta[:, 7] = is_archive
+    if is_reddit is not None:
+        meta[:, 8] = is_reddit
+    if is_rss is not None:
+        meta[:, 9] = is_rss
     return np.concatenate([embeddings, meta], axis=1)
 
 
-def rank_stories(
+def _positive_cluster_centers(
+    positive_embeddings: NDArray[np.float32],
+    n_clusters: int,
+) -> NDArray[np.float32]:
+    if len(positive_embeddings) == 0 or n_clusters <= 0:
+        return np.zeros((0, positive_embeddings.shape[1]), dtype=np.float32)
+    unique_positive = np.unique(positive_embeddings, axis=0)
+    if len(unique_positive) <= n_clusters:
+        centers = unique_positive
+    else:
+        kmeans = KMeans(n_clusters=n_clusters, n_init=10, random_state=0)
+        kmeans.fit(unique_positive)
+        centers = kmeans.cluster_centers_.astype(np.float32)
+        norms = np.linalg.norm(centers, axis=1, keepdims=True)
+        centers = centers / np.clip(norms, a_min=1e-12, a_max=None)
+    return centers.astype(np.float32)
+
+
+def _positive_cluster_similarity(
+    query_embeddings: NDArray[np.float32],
+    positive_embeddings: NDArray[np.float32],
+    n_clusters: int,
+) -> NDArray[np.float32]:
+    centers = _positive_cluster_centers(positive_embeddings, n_clusters)
+    return _similarity_to_positive_cluster_centers(query_embeddings, centers)
+
+
+def _similarity_to_positive_cluster_centers(
+    query_embeddings: NDArray[np.float32],
+    centers: NDArray[np.float32],
+) -> NDArray[np.float32]:
+    if len(query_embeddings) == 0 or len(centers) == 0:
+        return np.zeros(len(query_embeddings), dtype=np.float32)
+    return np.max(query_embeddings @ centers.T, axis=1).astype(np.float32)
+
+
+def _minmax01(values: np.ndarray) -> NDArray[np.float32]:
+    values = np.asarray(values, dtype=np.float32)
+    span = float(values.max() - values.min()) if len(values) else 0.0
+    if span <= 1e-8:
+        return np.full(len(values), 0.5, dtype=np.float32)
+    return ((values - values.min()) / span).astype(np.float32)
+
+
+def _rank_percentiles(values: np.ndarray) -> NDArray[np.float32]:
+    values = np.asarray(values, dtype=np.float32)
+    if len(values) <= 1:
+        return np.ones(len(values), dtype=np.float32)
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty(len(values), dtype=np.float32)
+    ranks[order] = np.linspace(0.0, 1.0, len(values), dtype=np.float32)
+    return ranks
+
+
+def _softmax_rows(values: np.ndarray) -> NDArray[np.float32]:
+    values = np.asarray(values, dtype=np.float32)
+    shifted = values - values.max(axis=1, keepdims=True)
+    exp = np.exp(shifted)
+    return (exp / exp.sum(axis=1, keepdims=True)).astype(np.float32)
+
+
+def _score_and_rank(
     candidates: list[Story],
     candidate_embeddings: NDArray[np.float32],
     db: Database,
@@ -951,15 +1754,24 @@ def rank_stories(
     now = time.time()
     scores = None
     probs = None
-    feedback_stories, feedback_labels, vote_times = db.get_feedback_for_training(user_id=user_id)
+    feedback_stories, feedback_labels, _vote_times = db.get_feedback_for_training(
+        user_id=user_id
+    )
+
+    n_feedback = len(feedback_labels)
 
     # Multiclass SVM: 0=down, 1=neutral, 2=up
     unique_classes = set(feedback_labels)
-    if len(feedback_labels) >= 10 and len(unique_classes) >= 2:
+    fb_labels_arr = np.array(feedback_labels)
+    n_up = int((fb_labels_arr == 2).sum())
+    n_down = int((fb_labels_arr == 0).sum())
+
+    if (
+        n_up >= config.model.min_up_for_svm
+        and n_down >= config.model.min_down_for_svm
+        and len(unique_classes) >= 2
+    ):
         try:
-            cand_scores = np.array([s.score for s in candidates])
-            cand_ages = np.array([now - s.time for s in candidates])
-            cand_comment_counts = np.array([s.comment_count or 0 for s in candidates])
             fb_embeddings = get_or_compute_embeddings(feedback_stories, embedder, db)
 
             # Personalization: mean/closest per class from ALL real feedback
@@ -969,57 +1781,59 @@ def rank_stories(
             fb_up_embs = fb_embeddings[up_mask]
             fb_down_embs = fb_embeddings[down_mask]
 
-            mean_up = (
-                fb_up_embs.mean(axis=0)
-                if up_mask.any()
-                else np.zeros(384, dtype=np.float32)
-            )
-            mean_down = (
-                fb_down_embs.mean(axis=0)
-                if down_mask.any()
-                else np.zeros(384, dtype=np.float32)
-            )
-
             n_up = int(up_mask.sum())
-            fb_sim_to_up = fb_embeddings @ mean_up
-            if n_up > 0:
-                if n_up > 1:
-                    fb_sim_to_up[up_mask] = (n_up * fb_sim_to_up[up_mask] - 1.0) / (
-                        n_up - 1
-                    )
-                else:
-                    fb_sim_to_up[up_mask] = 0.0
+            n_down = int(down_mask.sum())
+            k = config.model.knn_k
 
+            # k-NN similarity (mean of top-k similarities to class)
+            cand_sim_to_up = _knn_similarity(candidate_embeddings, fb_up_embs, k)
+            cand_sim_to_down = _knn_similarity(candidate_embeddings, fb_down_embs, k)
+
+            # LOOCV k-NN for training: exclude self from reference set
+            fb_sim_to_up = np.zeros(len(fb_embeddings), dtype=np.float32)
+            fb_sim_to_down = np.zeros(len(fb_embeddings), dtype=np.float32)
+            if n_up > 0:
+                up_indices = np.where(up_mask)[0]
                 sim_up_mat = fb_embeddings @ fb_up_embs.T
                 if n_up > 1:
-                    train_up_positions = np.where(up_mask)[0]
-                    for idx, tp in enumerate(train_up_positions):
-                        sim_up_mat[tp, idx] = -1.0
-                fb_closest_up = np.max(sim_up_mat, axis=1)
+                    for idx, tp in enumerate(up_indices):
+                        sim_up_mat[tp, idx] = -2.0  # exclude self
+                k_eff_up = min(k, n_up)
+                for i in range(len(fb_embeddings)):
+                    sims = sim_up_mat[i]
+                    exclude = 1 if i in up_indices else 0
+                    n_available = max(1, n_up - exclude)
+                    k_use = min(k_eff_up, n_available)
+                    fb_sim_to_up[i] = _topk_mean(sims, k_use)
+                sim_up_mat_clean = fb_embeddings @ fb_up_embs.T
+                if n_up > 1:
+                    for idx, tp in enumerate(up_indices):
+                        sim_up_mat_clean[tp, idx] = -1.0
+                fb_closest_up = np.max(sim_up_mat_clean, axis=1)
             else:
                 fb_closest_up = np.zeros(len(fb_embeddings), dtype=np.float32)
 
-            n_down = int(down_mask.sum())
-            fb_sim_to_down = fb_embeddings @ mean_down
             if n_down > 0:
-                if n_down > 1:
-                    fb_sim_to_down[down_mask] = (
-                        n_down * fb_sim_to_down[down_mask] - 1.0
-                    ) / (n_down - 1)
-                else:
-                    fb_sim_to_down[down_mask] = 0.0
-
+                down_indices = np.where(down_mask)[0]
                 sim_down_mat = fb_embeddings @ fb_down_embs.T
                 if n_down > 1:
-                    train_down_positions = np.where(down_mask)[0]
-                    for idx, tp in enumerate(train_down_positions):
-                        sim_down_mat[tp, idx] = -1.0
-                fb_closest_down = np.max(sim_down_mat, axis=1)
+                    for idx, tp in enumerate(down_indices):
+                        sim_down_mat[tp, idx] = -2.0
+                k_eff_down = min(k, n_down)
+                for i in range(len(fb_embeddings)):
+                    sims = sim_down_mat[i]
+                    exclude = 1 if i in down_indices else 0
+                    n_available = max(1, n_down - exclude)
+                    k_use = min(k_eff_down, n_available)
+                    fb_sim_to_down[i] = _topk_mean(sims, k_use)
+                sim_down_mat_clean = fb_embeddings @ fb_down_embs.T
+                if n_down > 1:
+                    for idx, tp in enumerate(down_indices):
+                        sim_down_mat_clean[tp, idx] = -1.0
+                fb_closest_down = np.max(sim_down_mat_clean, axis=1)
             else:
                 fb_closest_down = np.zeros(len(fb_embeddings), dtype=np.float32)
 
-            cand_sim_to_up = candidate_embeddings @ mean_up
-            cand_sim_to_down = candidate_embeddings @ mean_down
             cand_closest_up = (
                 np.max(candidate_embeddings @ fb_up_embs.T, axis=1)
                 if up_mask.any()
@@ -1030,39 +1844,39 @@ def rank_stories(
                 if down_mask.any()
                 else np.zeros(len(candidates))
             )
+            positive_cluster_centers = _positive_cluster_centers(
+                fb_up_embs, config.model.positive_cluster_k
+            )
+            fb_positive_cluster_sim = _similarity_to_positive_cluster_centers(
+                fb_embeddings, positive_cluster_centers
+            )
+            cand_positive_cluster_sim = _similarity_to_positive_cluster_centers(
+                candidate_embeddings, positive_cluster_centers
+            )
 
-            # Augment training features: age_at_vote = vote_time - story_time
-            fb_scores = np.array([s.score for s in feedback_stories])
-            fb_ages = np.array(
-                [vt - s.time for vt, s in zip(vote_times, feedback_stories)]
-            )
-            fb_comment_counts = np.array(
-                [s.comment_count or 0 for s in feedback_stories]
-            )
             fb_text_lengths = np.array([len(s.text_content) for s in feedback_stories])
-            fb_quality = fb_scores / (np.maximum(fb_ages / 3600.0, 0) + 1)
-            fb_age_hours = fb_ages / 3600.0
-            fb_safe_h = np.maximum(fb_age_hours, 0.1)
-            fb_score_vel = fb_scores / fb_safe_h
-            fb_comment_vel = fb_comment_counts / fb_safe_h
 
-            fb_csr_ratio = fb_comment_counts / np.maximum(fb_scores, 1)
-            fb_csr = np.clip(np.log1p(fb_csr_ratio), 0, 3.0) / 3.0
+            # 4-binary source category one-hot per feedback / candidate story
+            fb_source_onehot = source_category_stack(
+                [s.source for s in feedback_stories]
+            )
+            fb_is_hn_live = fb_source_onehot[:, 0]
+            fb_is_archive = fb_source_onehot[:, 1]
+            fb_is_reddit = fb_source_onehot[:, 2]
+            fb_is_rss = fb_source_onehot[:, 3]
 
-            fb_features = _augment_features(
+            fb_features = _svm_personalization_features(
                 fb_embeddings,
-                fb_scores,
-                fb_ages,
-                comment_counts=fb_comment_counts,
                 text_lengths=fb_text_lengths,
-                hn_quality=fb_quality,
-                score_velocity=fb_score_vel,
-                comment_velocity=fb_comment_vel,
                 sim_to_upvoted=fb_sim_to_up,
                 sim_to_downvoted=fb_sim_to_down,
                 closest_upvoted=fb_closest_up,
                 closest_downvoted=fb_closest_down,
-                comment_score_ratio=fb_csr,
+                positive_cluster_similarity=fb_positive_cluster_sim,
+                is_hn_live=fb_is_hn_live,
+                is_archive=fb_is_archive,
+                is_reddit=fb_is_reddit,
+                is_rss=fb_is_rss,
             )
 
             # Ensure all three classes (0, 1, 2) are present
@@ -1090,100 +1904,160 @@ def rank_stories(
             sample_weights = np.array(weights, dtype=np.float64)
 
             emb_dim = candidate_embeddings.shape[1]
-            scaler = StandardScaler()
-            fb_features_meta_scaled = np.clip(scaler.fit_transform(fb_features[:, emb_dim:]), -2.5, 2.5)
 
-            fb_features_scaled = np.hstack(
-                [fb_features[:, :emb_dim], fb_features_meta_scaled]
-            )
+            # Model cache: skip SVC.fit() when feedback is unchanged
+            fb_sig = _feedback_signature(db, user_id) if user_id is not None else ""
+            cached_model: tuple[SVC, StandardScaler] | None = None
+            if fb_sig:
+                cached_model = _get_cached_model(user_id, fb_sig)
+            if cached_model is not None:
+                svm, scaler = cached_model
+            else:
+                scaler = StandardScaler()
+                fb_features_meta_scaled = np.clip(
+                    scaler.fit_transform(fb_features[:, emb_dim:]), -2.5, 2.5
+                )
+                fb_features_scaled = np.hstack(
+                    [fb_features[:, :emb_dim], fb_features_meta_scaled]
+                )
+                svm = SVC(
+                    C=config.model.svm_c,
+                    kernel=config.model.svm_kernel,
+                    gamma=config.model.svm_gamma,
+                    random_state=0,
+                    decision_function_shape="ovr",
+                )
+                svm.fit(fb_features_scaled, labels, sample_weight=sample_weights)
+                if fb_sig:
+                    _set_cached_model(
+                        user_id, fb_sig, svm, scaler, config.max_cached_models
+                    )
 
-            svm = SVC(
-                C=config.model.svm_c,
-                kernel=config.model.svm_kernel,
-                gamma=config.model.svm_gamma,
-                random_state=0,
-                decision_function_shape="ovr",
-                probability=False,
-            )
-            svm.fit(fb_features_scaled, labels, sample_weight=sample_weights)
-
-            # Augment candidate features: age_now = now - story_time
             cand_text_lengths = np.array([len(s.text_content) for s in candidates])
-            cand_quality = cand_scores / (np.maximum(cand_ages / 3600.0, 0) + 1)
-            cand_age_hours = cand_ages / 3600.0
-            cand_safe_h = np.maximum(cand_age_hours, 0.1)
-            cand_score_vel = cand_scores / cand_safe_h
-            cand_comment_vel = cand_comment_counts / cand_safe_h
 
-            cand_csr_ratio = cand_comment_counts / np.maximum(cand_scores, 1)
-            cand_csr = np.clip(np.log1p(cand_csr_ratio), 0, 3.0) / 3.0
+            cand_source_onehot = source_category_stack([s.source for s in candidates])
+            cand_is_hn_live = cand_source_onehot[:, 0]
+            cand_is_archive = cand_source_onehot[:, 1]
+            cand_is_reddit = cand_source_onehot[:, 2]
+            cand_is_rss = cand_source_onehot[:, 3]
 
-            cand_features = _augment_features(
+            cand_features = _svm_personalization_features(
                 candidate_embeddings,
-                cand_scores,
-                cand_ages,
-                comment_counts=cand_comment_counts,
                 text_lengths=cand_text_lengths,
-                hn_quality=cand_quality,
-                score_velocity=cand_score_vel,
-                comment_velocity=cand_comment_vel,
                 sim_to_upvoted=cand_sim_to_up,
                 sim_to_downvoted=cand_sim_to_down,
                 closest_upvoted=cand_closest_up,
                 closest_downvoted=cand_closest_down,
-                comment_score_ratio=cand_csr,
+                positive_cluster_similarity=cand_positive_cluster_sim,
+                is_hn_live=cand_is_hn_live,
+                is_archive=cand_is_archive,
+                is_reddit=cand_is_reddit,
+                is_rss=cand_is_rss,
             )
-            cand_features_meta_scaled = np.clip(scaler.transform(cand_features[:, emb_dim:]), -2.5, 2.5)
+            cand_features_meta_scaled = np.clip(
+                scaler.transform(cand_features[:, emb_dim:]), -2.5, 2.5
+            )
             cand_features_scaled = np.hstack(
                 [cand_features[:, :emb_dim], cand_features_meta_scaled]
             )
 
-            df_cand = svm.decision_function(cand_features_scaled)
-            e_x = np.exp(df_cand - np.max(df_cand, axis=1, keepdims=True))
-            probs = e_x / e_x.sum(axis=1, keepdims=True)
             class_order = list(svm.classes_)
             idx_up = class_order.index(2)
-            idx_neutral = class_order.index(1)
-            scores = (
-                probs[:, idx_up] + config.model.neutral_weight * probs[:, idx_neutral]
-            )
+            decision = svm.decision_function(cand_features_scaled)
+            if decision.ndim == 1:
+                raw_scores = decision if class_order[-1] == 2 else -decision
+                probs = np.column_stack(
+                    [1 - _minmax01(raw_scores), _minmax01(raw_scores)]
+                )
+            else:
+                raw_scores = decision[:, idx_up]
+                probs = _softmax_rows(decision)
+            scores = _minmax01(raw_scores)
         except Exception as e:
             logging.error(f"Failed to fit feedback SVM: {e}")
 
-    # Three-tier fallback based on feedback count
-    n_feedback = len(feedback_labels)
+    svm_scores = scores
+    svm_probs = probs
 
-    if scores is None:
-        if n_feedback == 0:
-            # Tier 1: No votes → HN gravity (frontpage-like)
-            scores = np.array([
-                (s.score if s.source == "hn" else s.score * 2) /
-                max(((now - s.time) / 3600.0 + 2.0) ** 1.8, 0.1)
-                for s in candidates
-            ], dtype=np.float32)
-            if scores.max() > 0:
-                scores = scores / scores.max()
+    # Tier 2: centroid-based scores (always compute when feedback exists)
+    tier2_scores: NDArray[np.float32] | None = None
+    if n_feedback > 0:
+        fb_embs = get_or_compute_embeddings(feedback_stories, embedder, db)
+        fb_labels_arr = np.array(feedback_labels)
+        up_mask = fb_labels_arr == 2
+        down_mask = fb_labels_arr == 0
+
+        if up_mask.any() or down_mask.any():
+            up_emb = (
+                fb_embs[up_mask].mean(axis=0)
+                if up_mask.any()
+                else np.zeros(384, dtype=np.float32)
+            )
+            down_emb = (
+                fb_embs[down_mask].mean(axis=0)
+                if down_mask.any()
+                else np.zeros(384, dtype=np.float32)
+            )
+
+            sim_up = candidate_embeddings @ up_emb
+            sim_down = candidate_embeddings @ down_emb
+            tier2_scores = sim_up - sim_down
+            tier2_scores = (tier2_scores - tier2_scores.min()) / (
+                tier2_scores.max() - tier2_scores.min() + 1e-8
+            )
         else:
-            # Tier 2: At least 1 vote → similarity to upvotes minus downvotes
-            fb_embs = get_or_compute_embeddings(feedback_stories, embedder, db)
-            fb_labels_arr = np.array(feedback_labels)
-            up_mask = fb_labels_arr == 2
-            down_mask = fb_labels_arr == 0
+            tier2_scores = np.full(len(candidates), 0.5, dtype=np.float32)
 
-            if up_mask.any() or down_mask.any():
-                up_emb = fb_embs[up_mask].mean(axis=0) if up_mask.any() else np.zeros(384, dtype=np.float32)
-                down_emb = fb_embs[down_mask].mean(axis=0) if down_mask.any() else np.zeros(384, dtype=np.float32)
+    # Tier 1: HN gravity (frontpage-like) — always computed for cold-start blend.
+    # Per-source priors are now learned by the SVM via the 4-binary source
+    # category features; the previous `* 2` non-HN boost was removed since the
+    # SVM already has the prior signal directly and the boost double-counted.
+    tier1_scores = np.array(
+        [
+            s.score / max(((now - s.time) / 3600.0 + 2.0) ** 1.8, 0.1)
+            for s in candidates
+        ],
+        dtype=np.float32,
+    )
+    if tier1_scores.max() > 0:
+        tier1_scores = tier1_scores / tier1_scores.max()
 
-                sim_up = candidate_embeddings @ up_emb
-                sim_down = candidate_embeddings @ down_emb
-                scores = sim_up - sim_down
-                # Shift to 0-1 range
-                scores = (scores - scores.min()) / (scores.max() - scores.min() + 1e-8)
-            else:
-                scores = np.full(len(candidates), 0.5, dtype=np.float32)
+    # Three-way blend between tier 1 (gravity), tier 2 (centroid), tier 3 (SVM)
+    # α_2 ramps from 0→1 as n_feedback grows; tier 1 fades out smoothly.
+    alpha_2 = float(np.clip(n_feedback / config.model.tier2_blend_window, 0.0, 1.0))
 
-    ranked = []
-    if probs is not None:
+    if svm_scores is not None and tier2_scores is not None:
+        n_min = min(n_up, n_down)
+        blend_start = min(config.model.min_up_for_svm, config.model.min_down_for_svm)
+        alpha_3 = float(
+            np.clip(
+                (n_min - blend_start) / config.model.tier3_blend_window,
+                0.0,
+                1.0,
+            )
+        )
+        t1_weight = 1.0 - alpha_2
+        t2_weight = alpha_2 * (1.0 - alpha_3)
+        t3_weight = alpha_2 * alpha_3
+        scores = np.asarray(
+            t1_weight * tier1_scores
+            + t2_weight * tier2_scores
+            + t3_weight * svm_scores,
+            dtype=np.float32,
+        )
+    elif tier2_scores is not None:
+        t1_weight = 1.0 - alpha_2
+        scores = np.asarray(
+            t1_weight * tier1_scores + alpha_2 * tier2_scores,
+            dtype=np.float32,
+        )
+    else:
+        scores = tier1_scores
+
+    assert scores is not None
+
+    ranked: list[RankedStory] = []
+    if svm_probs is not None:
         try:
             idx_down = class_order.index(0)
             idx_neutral = class_order.index(1)
@@ -1194,9 +2068,9 @@ def rank_stories(
                         story=s,
                         score=float(score),
                         best_match_title="",
-                        prob_down=float(probs[idx, idx_down]),
-                        prob_neutral=float(probs[idx, idx_neutral]),
-                        prob_up=float(probs[idx, idx_up]),
+                        prob_down=float(svm_probs[idx, idx_down]),
+                        prob_neutral=float(svm_probs[idx, idx_neutral]),
+                        prob_up=float(svm_probs[idx, idx_up]),
                     )
                 )
         except (ValueError, IndexError, NameError) as e:
@@ -1213,7 +2087,7 @@ def rank_stories(
                 )
             )
 
-    if len(feedback_labels) == 0:
+    if n_feedback == 0:
         return sorted(ranked, key=lambda x: x.story.score, reverse=True)
     else:
         return sorted(ranked, key=lambda x: x.score, reverse=True)
@@ -1271,39 +2145,54 @@ def time_ago_filter(seconds: int) -> str:
     return f"{days}d ago"
 
 
-def generate_dashboard(
-    ranked: list[RankedStory],
-    output_path: Path,
-    username: str,
-    timestamp: str,
-    server_port: int,
-    db: Database,
-    user_id: int | None = None,
-) -> None:
-    env = Environment(loader=FileSystemLoader("templates"), autoescape=True)
-    env.filters["time_ago"] = time_ago_filter
+def source_label_filter(source: str) -> str:
+    if not source:
+        return ""
+    if source == "hn":
+        return "HN"
+    if source == BQ_ARCHIVE_SOURCE:
+        return "BQ Seed"
+    if source == CH_ARCHIVE_SOURCE:
+        return "CH Seed"
 
-    pico_css_path = Path("templates/pico.min.css")
-    pico_css = (
-        pico_css_path.read_text(encoding="utf-8") if pico_css_path.exists() else ""
-    )
+    label = source
+    if label.startswith("rss_"):
+        label = label[4:]
+    # Historical rows from feeds hosted at rss.* were stored as rss_rss_*.
+    if label.startswith("rss_"):
+        label = label[4:]
+    if label.startswith("reddit_"):
+        subreddit = label[len("reddit_") :]
+        return f"r/{subreddit}"
 
-    # Map user feedback in database for active UI state highlighting
-    all_fb = db.get_all_feedback(user_id=user_id)
-    fb_map = {f.story_id: f.action for f in all_fb}
+    known = {
+        "slashdot_org": "Slashdot",
+        "mshibanami_github_io": "GitHub Trending",
+        "tildes_net": "Tildes",
+        "lesswrong_com": "LessWrong",
+        "lobste_rs": "Lobsters",
+        "discourse_haskell_org": "Haskell Discourse",
+        "latent_space": "Latent Space",
+        "scottaaronson_blog": "Scott Aaronson",
+        "simonwillison_net": "Simon Willison",
+        "lwn_net": "LWN",
+        "openai_com": "OpenAI",
+        "huggingface_co": "Hugging Face",
+        "blog_cloudflare_com": "Cloudflare",
+        "blog_janestreet_com": "Jane Street",
+        "well-typed_com": "Well-Typed",
+        "tweag_io": "Tweag",
+        "ocaml_org": "OCaml",
+        "quantamagazine_org": "Quanta",
+        "www_worksinprogress_news": "Works in Progress",
+        "erictopol_substack_com": "Ground Truths",
+        "theskepticalcardiologist_substack_com": "Skeptical Cardiologist",
+        "sciencebasedmedicine_org": "Science-Based Medicine",
+    }
+    if label in known:
+        return known[label]
 
-    template = env.get_template("index.html")
-    html_content = template.render(
-        username=username,
-        timestamp=timestamp,
-        stories=ranked,
-        server_port=server_port,
-        pico_css=pico_css,
-        fb_map=fb_map,
-    )
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(html_content, encoding="utf-8")
+    return label.replace("_", ".")
 
 
 def rerank_candidates(
@@ -1311,16 +2200,25 @@ def rerank_candidates(
     config: Config,
     embedder: Embedder,
     candidates: list[Story],
-    cand_embeddings: NDArray[np.float32] = None,
+    cand_embeddings: NDArray[np.float32] | None = None,
     user_id: int | None = None,
 ) -> list[RankedStory]:
+    """Rank candidates and attach discovery badges.
+
+    This wraps :func:`_score_and_rank` (which only does tier blend + sort)
+    and adds badge attribution + 7 discovery passes (uncertainty, novelty,
+    similarity, discussion-rich, high-engagement, hot, non-HN).
+
+    Use this in production; the private ``_score_and_rank`` is intended for
+    tier-blend tests that need to assert on ranking without badge side effects.
+    """
     if not candidates:
         return []
 
     if cand_embeddings is None:
         cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
 
-    ranked = rank_stories(
+    ranked = _score_and_rank(
         candidates,
         cand_embeddings,
         db,
@@ -1329,28 +2227,30 @@ def rerank_candidates(
         user_id=user_id,
     )
 
-    embeddings_map = {s.id: vec for s, vec in zip(candidates, cand_embeddings)}
-
-    num_uncertain = 5 if config.count >= 10 else 0
-    limit = max(1, config.count - num_uncertain)
-    final = mmr_filter(
-        ranked,
-        embeddings_map,
-        threshold=config.model.diversity_threshold,
-        limit=limit,
-    )
+    limit, _num_uncertain = _dashboard_primary_limit(config.count)
+    if config.model.enable_mmr:
+        embeddings_map = {s.id: vec for s, vec in zip(candidates, cand_embeddings)}
+        final = mmr_filter(
+            ranked,
+            embeddings_map,
+            threshold=config.model.diversity_threshold,
+            limit=limit,
+        )
+    else:
+        final = ranked[:limit]
 
     selected_ids = {item.story.id for item in final}
-    remaining = [r for r in ranked if r.story.id not in selected_ids]
 
     # Calculate parameters for remaining discovery passes
     feedback_stories, feedback_labels, _ = db.get_feedback_for_training(user_id=user_id)
     fb_labels_arr = np.array(feedback_labels)
     up_mask = fb_labels_arr == 2
     down_mask = fb_labels_arr == 0
+    neutral_mask = fb_labels_arr == 1
     fb_embeddings = get_or_compute_embeddings(feedback_stories, embedder, db)
     fb_up_embs = fb_embeddings[up_mask]
     fb_down_embs = fb_embeddings[down_mask]
+    fb_neutral_embs = fb_embeddings[neutral_mask]
 
     cand_closest_up = (
         np.max(cand_embeddings @ fb_up_embs.T, axis=1)
@@ -1362,21 +2262,45 @@ def rerank_candidates(
         if down_mask.any()
         else np.zeros(len(candidates))
     )
-    cand_max_sim = np.maximum(cand_closest_up, cand_closest_down)
-    sim_threshold = np.percentile(cand_max_sim, 15) if len(cand_max_sim) else 0.0
-    similar_threshold = np.percentile(cand_closest_up, 90) if len(cand_closest_up) else 0.0
+    cand_closest_neutral = (
+        np.max(cand_embeddings @ fb_neutral_embs.T, axis=1)
+        if neutral_mask.any()
+        else np.zeros(len(candidates))
+    )
+    cand_max_sim = np.maximum.reduce(
+        [cand_closest_up, cand_closest_down, cand_closest_neutral]
+    )
 
+    # Hoist now_ts and compute per-age-bucket metadata early so all
+    # threshold computations below can produce per-candidate arrays.
+    # Per-bucket thresholds are required because archive candidates have
+    # structurally higher absolute scores/comment counts (months/years of
+    # accumulation) than recent candidates; a single global threshold
+    # would be archive-dominated and make it nearly impossible for
+    # recent stories to earn Top/Talk-worthy badges. Similar logic
+    # applies to Novel/Similar/Unsure so badges remain meaningful
+    # within each age cohort.
     cand_comment_counts = np.array([s.comment_count or 0 for s in candidates])
     cand_scores = np.array([s.score for s in candidates])
     now_ts = time.time()
+    recent_cutoff = int(now_ts) - 30 * 86400
+    recent_mask = np.fromiter(
+        (s.time >= recent_cutoff for s in candidates),
+        dtype=bool,
+        count=len(candidates),
+    )
     cand_velocities = np.array(
         [s.score / max((now_ts - s.time) / 3600.0, 0.1) for s in candidates]
     )
-    hot_threshold = np.percentile(cand_velocities, 98) if len(cand_velocities) else 0
+    hot_threshold = (
+        np.percentile(cand_velocities, config.model.hot_badge_percentile)
+        if len(cand_velocities)
+        else 0
+    )
 
     story_id_to_idx = {s.id: idx for idx, s in enumerate(candidates)}
+    idx_for = story_id_to_idx.__getitem__
 
-    # Determine uncertainty IDs among remaining candidates
     def get_entropy(r: RankedStory) -> float:
         ent = 0.0
         for p in (r.prob_down, r.prob_neutral, r.prob_up):
@@ -1384,351 +2308,467 @@ def rerank_candidates(
                 ent -= p * np.log2(p)
         return ent
 
-    if remaining and num_uncertain > 0:
-        uncertain_candidates = [r for r in remaining if r.prob_down is not None]
-        uncertain_candidates.sort(key=get_entropy, reverse=True)
-        uncertain_ids = {r.story.id for r in uncertain_candidates[:num_uncertain]}
-    else:
-        uncertain_ids = set()
+    def _novel_sort_key(r: RankedStory) -> float:
+        return float(1.0 - cand_max_sim[idx_for(r.story.id)])
 
-    # Assign badges to all candidates in ranked
-    discussion_threshold = (
-        np.percentile(cand_comment_counts, 93) if len(cand_comment_counts) else 0
-    )
-    engagement_threshold = np.percentile(cand_scores, 95) if len(cand_scores) else 0
+    def _similar_sort_key(r: RankedStory) -> float:
+        return float(cand_closest_up[idx_for(r.story.id)])
 
-    cand_entropies = [get_entropy(r) for r in ranked if r.prob_down is not None]
-    uncertainty_threshold = np.percentile(cand_entropies, 90) if cand_entropies else 0.0
+    def _discussion_sort_key(r: RankedStory) -> float:
+        return float(r.story.comment_count or 0)
 
-    ranked_decorated = []
-    for r in ranked:
-        idx = story_id_to_idx[r.story.id]
-        entropy = get_entropy(r)
-        is_uncertain = bool(
-            r.prob_down is not None
-            and entropy >= 1.2
-            and (r.story.id in uncertain_ids or entropy >= uncertainty_threshold)
-        )
-        is_novel = bool(cand_max_sim[idx] <= sim_threshold and r.score > 0.1)
-        is_similar = bool(cand_closest_up[idx] >= similar_threshold)
-        is_discussion_rich = bool(
-            cand_comment_counts[idx] >= discussion_threshold
-            and cand_comment_counts[idx] > 0
-        )
-        is_high_engagement = bool(cand_scores[idx] >= engagement_threshold)
-        is_hot = bool(
-            cand_velocities[idx] >= hot_threshold and cand_velocities[idx] > 0
-        )
-        ranked_decorated.append(
-            replace(
-                r,
-                is_uncertain=is_uncertain,
-                is_novel=is_novel,
-                is_similar=is_similar,
-                is_discussion_rich=is_discussion_rich,
-                is_high_engagement=is_high_engagement,
-                is_hot=is_hot,
-            )
-        )
+    def _engagement_sort_key(r: RankedStory) -> float:
+        return float(cand_scores[idx_for(r.story.id)])
 
-    # Reconstruct final from the decorated candidates
+    def _hot_sort_key(r: RankedStory) -> float:
+        return float(cand_velocities[idx_for(r.story.id)])
+
+    # final already contains the primary-ranked items
     final_ids = {item.story.id for item in final}
-    final = [r for r in ranked_decorated if r.story.id in final_ids]
+    # remaining_decorated contains candidates not in the primary path.
+    remaining_decorated = [r for r in ranked if r.story.id not in final_ids]
 
-    # And remaining_decorated contains the decorated candidates not in final
-    remaining_decorated = [r for r in ranked_decorated if r.story.id not in final_ids]
-
-    # 1. Surface uncertainty items
-    uncertain_items = [r for r in remaining_decorated if r.story.id in uncertain_ids]
-    final.extend(uncertain_items)
-    selected_ids = final_ids | {item.story.id for item in uncertain_items}
-    remaining_decorated = [
-        r for r in remaining_decorated if r.story.id not in selected_ids
-    ]
-
-    # 2. Surface up to 5 novel stories
-    novel_pool = [r for r in remaining_decorated if r.is_novel]
-    novel_pool.sort(key=lambda r: r.score, reverse=True)
-    novel_items = novel_pool[:5]
-    final.extend(novel_items)
-    selected_ids |= {item.story.id for item in novel_items}
-    remaining_decorated = [
-        r for r in remaining_decorated if r.story.id not in selected_ids
-    ]
-
-    # 3. Surface up to 5 most similar stories
-    similar_pool = [r for r in remaining_decorated if r.is_similar]
-    similar_pool.sort(
-        key=lambda r: cand_closest_up[story_id_to_idx[r.story.id]], reverse=True
+    n_non_hn_slots = _non_hn_slot_count(
+        len(feedback_labels),
+        cap=NON_HN_DISCOVERY_SLOT_LIMIT,
+        threshold=20,
+        window=config.model.non_hn_ramp_window,
     )
-    similar_items = similar_pool[:5]
-    final.extend(similar_items)
-    selected_ids |= {item.story.id for item in similar_items}
-    remaining_decorated = [
-        r for r in remaining_decorated if r.story.id not in selected_ids
-    ]
 
-    # 4. Surface up to 5 discussion-rich stories
-    discussion_pool = [r for r in remaining_decorated if r.is_discussion_rich]
-    discussion_pool.sort(key=lambda r: r.story.comment_count or 0, reverse=True)
-    discussion_items = discussion_pool[:5]
-    final.extend(discussion_items)
-    selected_ids |= {item.story.id for item in discussion_items}
-    remaining_decorated = [
-        r for r in remaining_decorated if r.story.id not in selected_ids
-    ]
-
-    # 5. Surface up to 5 high-engagement stories
-    engagement_pool = [r for r in remaining_decorated if r.is_high_engagement]
-    engagement_pool.sort(key=lambda r: r.score, reverse=True)
-    engagement_items = engagement_pool[:5]
-    final.extend(engagement_items)
-    selected_ids |= {item.story.id for item in engagement_items}
-    remaining_decorated = [
-        r for r in remaining_decorated if r.story.id not in selected_ids
-    ]
-
-    # 6. Surface up to 5 hot stories
-    hot_pool = [r for r in remaining_decorated if r.is_hot]
-    hot_pool.sort(
-        key=lambda r: cand_velocities[story_id_to_idx[r.story.id]], reverse=True
+    # Rank-based cascade: Hot (global) runs first against the FULL candidate
+    # pool (not just `remaining_decorated`) so a primary-ranked high-velocity
+    # story gets the Hot badge too. After Hot, the Top → Talk cascade runs
+    # against `remaining_decorated` (candidates not in primary and not picked
+    # by Hot). Novel, Similar, Unsure run in parallel against the post-
+    # cascade pool and can stack with each other and with the cascade group
+    # (so e.g. Top+Unsure is allowed).
+    #
+    # Each pass takes the top `slot_limit` stories in its age cohort by
+    # the badge metric, unconditionally. Predicates are reduced to a
+    # minimal membership guard so the pass can fill its slots even when
+    # the cohort's quality is low (e.g., small synthetic pools).
+    hot_pass = DiscoveryPass(
+        name="hot",
+        attr="is_hot",
+        predicate=lambda r: cand_velocities[idx_for(r.story.id)] >= hot_threshold
+        and cand_velocities[idx_for(r.story.id)] > 0
+        and r.story.score >= HOT_MIN_SCORE,
+        sort_key=_hot_sort_key,
+        slot_limit=HOT_DISCOVERY_SLOT_LIMIT,
     )
-    hot_items = hot_pool[:5]
-    final.extend(hot_items)
-    selected_ids |= {item.story.id for item in hot_items}
+    if hot_pass.slot_limit > 0:
+        hot_pool = [r for r in ranked if hot_pass.predicate(r)]
+        if hot_pool:
+            hot_pool.sort(key=hot_pass.sort_key, reverse=True)
+            hot_attr = cast(str, hot_pass.attr)
+            hot_items = [
+                replace(r, **{hot_attr: True}) for r in hot_pool[: hot_pass.slot_limit]
+            ]
+            # If a story is already in `final` (from primary), update its
+            # is_hot flag in place. Otherwise append.
+            for item in hot_items:
+                existing_idx = next(
+                    (i for i, f in enumerate(final) if f.story.id == item.story.id),
+                    None,
+                )
+                if existing_idx is not None:
+                    final[existing_idx] = replace(final[existing_idx], is_hot=True)
+                else:
+                    final.append(item)
+            hot_picked_ids = {item.story.id for item in hot_items}
+            selected_ids |= hot_picked_ids
+            remaining_decorated = [
+                r for r in remaining_decorated if r.story.id not in hot_picked_ids
+            ]
+
+    cascade_passes: list[DiscoveryPass] = [
+        DiscoveryPass(
+            name="high-engagement-recent",
+            attr="is_high_engagement",
+            predicate=lambda r: True,
+            sort_key=_engagement_sort_key,
+            slot_limit=HIGH_ENGAGEMENT_DISCOVERY_RECENT_SLOTS,
+            age="recent",
+        ),
+        DiscoveryPass(
+            name="high-engagement-archive",
+            attr="is_high_engagement",
+            predicate=lambda r: True,
+            sort_key=_engagement_sort_key,
+            slot_limit=HIGH_ENGAGEMENT_DISCOVERY_ARCHIVE_SLOTS,
+            age="archive",
+        ),
+        DiscoveryPass(
+            name="discussion-recent",
+            attr="is_discussion_rich",
+            predicate=lambda r: (cand_comment_counts[idx_for(r.story.id)] or 0) > 0,
+            sort_key=_discussion_sort_key,
+            slot_limit=DISCUSSION_DISCOVERY_RECENT_SLOTS,
+            age="recent",
+        ),
+        DiscoveryPass(
+            name="discussion-archive",
+            attr="is_discussion_rich",
+            predicate=lambda r: (cand_comment_counts[idx_for(r.story.id)] or 0) > 0,
+            sort_key=_discussion_sort_key,
+            slot_limit=DISCUSSION_DISCOVERY_ARCHIVE_SLOTS,
+            age="archive",
+        ),
+    ]
+
+    for pass_ in cascade_passes:
+        if pass_.slot_limit <= 0:
+            continue
+        if pass_.age == "recent":
+            age_mask = recent_mask
+        elif pass_.age == "archive":
+            age_mask = ~recent_mask
+        else:
+            age_mask = None
+        pool = [
+            r
+            for r in remaining_decorated
+            if pass_.predicate(r)
+            and (age_mask is None or bool(age_mask[idx_for(r.story.id)]))
+        ]
+        if not pool:
+            continue
+        pool.sort(key=pass_.sort_key, reverse=True)
+        attr = cast(str, pass_.attr)
+        items = [replace(r, **{attr: True}) for r in pool[: pass_.slot_limit]]
+        final.extend(items)
+        selected_ids |= {item.story.id for item in items}
+        remaining_decorated = [
+            r for r in remaining_decorated if r.story.id not in selected_ids
+        ]
+
+    # Phase 2: parallel passes (Novel, Similar, Unsure). Each pass sees
+    # the FULL ranked pool (not just `remaining_decorated`) so a primary-
+    # ranked story can also receive a parallel badge. The picks are
+    # accumulated in a dict so multiple parallel passes can stack on the
+    # same story (e.g. Novel+Similar). After all parallel passes run, we
+    # merge into `final`: stories already present (from primary, Hot, or
+    # the cascade) get their `is_novel`/`is_similar`/`is_uncertain` flag
+    # OR'd in; new stories are appended.
+    parallel_picks: dict[int, RankedStory] = {}
+
+    def _record_parallel_pick(pass_: DiscoveryPass) -> None:
+        if pass_.slot_limit <= 0:
+            return
+        if pass_.age == "recent":
+            age_mask = recent_mask
+        elif pass_.age == "archive":
+            age_mask = ~recent_mask
+        else:
+            age_mask = None
+        pool = [
+            r
+            for r in ranked
+            if pass_.predicate(r)
+            and (age_mask is None or bool(age_mask[idx_for(r.story.id)]))
+        ]
+        if not pool:
+            return
+        pool.sort(key=pass_.sort_key, reverse=True)
+        attr = cast(str, pass_.attr)
+        for r in pool[: pass_.slot_limit]:
+            sid = r.story.id
+            if sid in parallel_picks:
+                parallel_picks[sid] = replace(parallel_picks[sid], **{attr: True})
+            else:
+                parallel_picks[sid] = replace(r, **{attr: True})
+
+    parallel_passes: list[DiscoveryPass] = [
+        DiscoveryPass(
+            name="novel-recent",
+            attr="is_novel",
+            predicate=lambda r: True,
+            sort_key=_novel_sort_key,
+            slot_limit=NOVEL_DISCOVERY_RECENT_SLOTS,
+            age="recent",
+        ),
+        DiscoveryPass(
+            name="novel-archive",
+            attr="is_novel",
+            predicate=lambda r: True,
+            sort_key=_novel_sort_key,
+            slot_limit=NOVEL_DISCOVERY_ARCHIVE_SLOTS,
+            age="archive",
+        ),
+        DiscoveryPass(
+            name="similar-recent",
+            attr="is_similar",
+            predicate=lambda r: True,
+            sort_key=_similar_sort_key,
+            slot_limit=SIMILAR_DISCOVERY_RECENT_SLOTS,
+            age="recent",
+        ),
+        DiscoveryPass(
+            name="similar-archive",
+            attr="is_similar",
+            predicate=lambda r: True,
+            sort_key=_similar_sort_key,
+            slot_limit=SIMILAR_DISCOVERY_ARCHIVE_SLOTS,
+            age="archive",
+        ),
+        DiscoveryPass(
+            name="uncertain-recent",
+            attr="is_uncertain",
+            predicate=lambda r: r.prob_down is not None,
+            sort_key=lambda r: float(get_entropy(r)),
+            slot_limit=UNCERTAIN_DISCOVERY_RECENT_SLOTS,
+            age="recent",
+        ),
+        DiscoveryPass(
+            name="uncertain-archive",
+            attr="is_uncertain",
+            predicate=lambda r: r.prob_down is not None,
+            sort_key=lambda r: float(get_entropy(r)),
+            slot_limit=UNCERTAIN_DISCOVERY_ARCHIVE_SLOTS,
+            age="archive",
+        ),
+    ]
+    for pass_ in parallel_passes:
+        _record_parallel_pick(pass_)
+
+    # Merge parallel picks into `final`. Cascade picks are already in `final`;
+    # if a parallel pass also badges them, we update their `is_X` flag. New
+    # parallel-only stories are appended.
+    for sid, ranked_pick in parallel_picks.items():
+        existing_idx = next(
+            (i for i, item in enumerate(final) if item.story.id == sid), None
+        )
+        if existing_idx is not None:
+            existing = final[existing_idx]
+            final[existing_idx] = replace(
+                existing,
+                is_novel=existing.is_novel or ranked_pick.is_novel,
+                is_similar=existing.is_similar or ranked_pick.is_similar,
+                is_uncertain=existing.is_uncertain or ranked_pick.is_uncertain,
+            )
+        else:
+            final.append(ranked_pick)
+
+    # Non-hn pass: sorts non-HN candidates by their rerank score. Runs last
+    # so the cascade + parallel picks can claim HN candidates first.
+    if n_non_hn_slots > 0:
+        pool = [r for r in remaining_decorated if not is_hn_source(r.story.source)]
+        if pool:
+            pool.sort(key=lambda r: float(r.score), reverse=True)
+            for r in pool[:n_non_hn_slots]:
+                final.append(replace(r, is_non_hn=True))
+
+    # Set is_recent and is_non_hn on every story in `final` (these flags are
+    # source/time based, not rank-based, so they always reflect the current
+    # candidate's metadata regardless of how it was selected).
+    final = [
+        replace(
+            r,
+            is_non_hn=(not is_hn_source(r.story.source)),
+            is_recent=(r.story.time >= recent_cutoff),
+        )
+        for r in final
+    ]
 
     final.sort(key=lambda r: r.score, reverse=True)
     return final
 
 
-# Orchestrator
-async def run_pipeline(config: Config) -> None:
-    db = Database(config.db_path)
-    embedder = Embedder(config.onnx_model_dir)
+def _article_fetch_failure_active(
+    db: Database,
+    story_id: int,
+    now_ts: float,
+) -> bool:
+    failure = db.get_article_fetch_failure(story_id)
+    if not failure:
+        return False
+    return bool(failure["permanent"]) or float(failure["next_retry_at"]) > now_ts
 
-    # Exclude stories that already have user feedback (voted on via dashboard)
-    feedback_records = db.get_all_feedback()
-    feedback_ids = {f.story_id for f in feedback_records}
-    feedback_urls = {f.url for f in feedback_records if f.url}
 
-    exclude_ids = feedback_ids
-    candidates, n_fetched = await fetch_candidates(
-        config, exclude_ids, feedback_urls, db, embedder
+def _article_fetch_extra_priority(
+    item: RankedStory, position: int, now_ts: float
+) -> float:
+    story = item.story
+    age_hours = max((now_ts - story.time) / 3600.0, 0.1)
+    score_velocity = story.score / age_hours
+    comment_velocity = (story.comment_count or 0) / age_hours
+    return (
+        (1_000_000.0 / (position + 1))
+        + float(item.score) * 1_000.0
+        + story.score * 2.0
+        + (story.comment_count or 0) * 1.5
+        + score_velocity * 50.0
+        + comment_velocity * 50.0
     )
-    logging.info(f"Fetched {n_fetched} candidates (excluded {len(exclude_ids)})")
 
-    t0 = time.perf_counter()
-    cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
-    elapsed_ms = int((time.perf_counter() - t0) * 1000)
-    logging.info(f"Embedded {cand_embeddings.shape[0]} candidates in {elapsed_ms}ms")
 
-    ranked = rank_stories(
-        candidates,
-        cand_embeddings,
-        db,
-        config,
-        embedder,
-    )
-    top_score = max((r.score for r in ranked), default=0.0)
-    logging.info(f"Ranked {len(ranked)} stories, top_score={top_score:.3f}")
+def select_article_fetch_candidates(
+    *,
+    ranked: list[RankedStory],
+    dashboard_selected: list[RankedStory],
+    db: Database,
+    max_per_run: int = 100,
+    max_age_days: int = 30,
+    now_ts: float | None = None,
+) -> list[Story]:
+    """Choose bounded article-body fetch targets.
 
-    # -- Proactive Fetching (Top Recommendations & Popularity/Velocity Triggers) --
-    now_ts = time.time()
-    top_candidates = []
-    for pos, r in enumerate(ranked):
-        s = r.story
-        if not s.url or s.article_body:
+    Dashboard-visible stories are ordered first. Remaining budget is filled
+    from ranked extras by rank, score, comments, and engagement velocity.
+    """
+    if max_per_run <= 0:
+        return []
+    if now_ts is None:
+        now_ts = time.time()
+    min_time = now_ts - (max_age_days * 86400)
+
+    def eligible(story: Story) -> bool:
+        if not story.url or story.article_body:
+            return False
+        if story.source.startswith("rss_reddit_"):
+            return False
+        if story.url.startswith("https://news.ycombinator.com"):
+            return False
+        if story.time < min_time:
+            return False
+        if _article_fetch_failure_active(db, story.id, now_ts):
+            return False
+        return True
+
+    selected: list[Story] = []
+    selected_ids: set[int] = set()
+    for item in dashboard_selected:
+        story = item.story
+        if story.id in selected_ids or not eligible(story):
             continue
+        selected.append(story)
+        selected_ids.add(story.id)
+        if len(selected) >= max_per_run:
+            return selected
 
-        # Calculate velocity metrics
-        age_hours = (now_ts - s.time) / 3600.0
-        safe_hours = max(age_hours, 0.1)
-        score_vel = s.score / safe_hours
-        comment_vel = (s.comment_count or 0) / safe_hours
+    extras: list[tuple[float, Story]] = []
+    for position, item in enumerate(ranked):
+        story = item.story
+        if story.id in selected_ids or not eligible(story):
+            continue
+        extras.append((_article_fetch_extra_priority(item, position, now_ts), story))
 
-        # Trigger 1: Highly ranked recommendation (Top 40)
-        is_top_rank = pos < 40
+    extras.sort(key=lambda pair: pair[0], reverse=True)
+    for _priority, story in extras:
+        selected.append(story)
+        selected_ids.add(story.id)
+        if len(selected) >= max_per_run:
+            break
+    return selected
 
-        # Trigger 2: High virality recommendation (Top 150 with high score or velocity)
-        is_viral = (pos < 150) and (
-            s.score > 150 or score_vel > 30.0 or comment_vel > 20.0
-        )
 
-        if is_top_rank or is_viral:
-            top_candidates.append(s)
-            if len(top_candidates) >= 50:  # Cap at 50 parallel fetches per run
-                break
+def _article_failure_retry_time(failure_count: int, now_ts: float) -> float:
+    delay_seconds = min(86400, 3600 * (2 ** max(0, failure_count - 1)))
+    return now_ts + delay_seconds
 
-    if top_candidates:
-        logging.info(
-            f"Proactively fetching article bodies for top {len(top_candidates)} candidates..."
-        )
-        from server import _fetch_article_body
 
-        async def fetch_and_update(story: Story):
-            try:
-                body = await _fetch_article_body(story.url)
-                if body:
-                    new_text = compose_story_text(
-                        story.title,
-                        story.self_text,
-                        story.top_comments,
-                        body[:15000],
-                    )
-                    updated = replace(
-                        story,
-                        article_body=body[:15000],
-                        text_content=new_text,
-                    )
-                    db.upsert_story(updated)
-                    return story.id, updated
-            except Exception as e:
-                logging.warning(f"Proactive fetch failed for story {story.id}: {e!r}")
+async def fetch_and_cache_article_bodies(
+    *,
+    db: Database,
+    embedder: Embedder,
+    stories: list[Story],
+    concurrency: int = 10,
+) -> dict[int, Story]:
+    if not stories:
+        return {}
+
+    from server import ARTICLE_BODY_CHAR_LIMIT, _fetch_article_body_with_result
+
+    sem = asyncio.Semaphore(max(1, concurrency))
+    model_version = "all-MiniLM-L6-v2|mean|norm|256"
+
+    async def fetch_one(story: Story) -> tuple[int, Story | None]:
+        async with sem:
+            result = await _fetch_article_body_with_result(story.url or "")
+            if result.body:
+                body = result.body[:ARTICLE_BODY_CHAR_LIMIT]
+                new_text = compose_story_text(
+                    story.title,
+                    story.self_text,
+                    story.top_comments,
+                    body,
+                )
+                updated = replace(story, article_body=body, text_content=new_text)
+                db.upsert_story(updated)
+                new_vec = embedder.encode([new_text])[0]
+                new_hash = hashlib.sha256(new_text.encode("utf-8")).hexdigest()
+                db.upsert_embedding(story.id, model_version, new_hash, new_vec)
+                db.clear_article_fetch_failure(story.id)
+                return story.id, updated
+
+            now_ts = time.time()
+            previous = db.get_article_fetch_failure(story.id)
+            previous_count = int(previous["failure_count"]) if previous else 0
+            failure_count = previous_count + 1
+            permanent = result.permanent or (
+                result.error == "empty_extraction" and failure_count >= 3
+            )
+            next_retry_at = (
+                now_ts + 3650 * 86400
+                if permanent
+                else _article_failure_retry_time(failure_count, now_ts)
+            )
+            db.record_article_fetch_failure(
+                story.id,
+                story.url or "",
+                status=result.status,
+                error=result.error,
+                permanent=permanent,
+                next_retry_at=next_retry_at,
+            )
             return story.id, None
 
-        tasks = [fetch_and_update(s) for s in top_candidates]
-        results = await asyncio.gather(*tasks)
-        updated_map = {sid: updated for sid, updated in results if updated}
-
-        if updated_map:
-            for idx, s in enumerate(candidates):
-                if s.id in updated_map:
-                    candidates[idx] = updated_map[s.id]
-
-            # Update cache embeddings in the SQLite DB
-            model_version = "all-MiniLM-L6-v2|mean|norm|512"
-            for sid, updated in updated_map.items():
-                new_vec = embedder.encode([updated.text_content])[0]
-                import hashlib
-                new_hash = hashlib.sha256(updated.text_content.encode("utf-8")).hexdigest()
-                db.upsert_embedding(sid, model_version, new_hash, new_vec)
-
-            # Reload candidates' embeddings (loads updated vectors + cached vectors)
-            cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
-
-            # Re-run SVM classification
-            ranked = rank_stories(
-                candidates,
-                cand_embeddings,
-                db,
-                config,
-                embedder,
-            )
-            top_score = max((r.score for r in ranked), default=0.0)
-            logging.info(
-                f"Re-ranked {len(ranked)} stories after proactive fetches, "
-                f"top_score={top_score:.3f}"
-            )
-
-    final = rerank_candidates(
-        db=db,
-        config=config,
-        embedder=embedder,
-        candidates=candidates,
-        cand_embeddings=cand_embeddings,
-    )
-
-    logging.info(f"Filtering with MMR: {len(final)} of {len(ranked)} stories kept")
-    pu_vals = [r.prob_up for r in final if r.prob_up is not None]
-    pu_lo = min(pu_vals) if pu_vals else 0.0
-    pu_hi = max(pu_vals) if pu_vals else 0.0
-    logging.info(
-        f"Generating dashboard: {len(final)} stories, prob_up range {pu_lo:.3f}–{pu_hi:.3f}"
-    )
-    generate_dashboard(
-        final,
-        Path(config.output),
-        config.username,
-        datetime.now().strftime("%Y-%m-%d %H:%M"),
-        config.server_port,
-        db,
-    )
-
-    pruned = db.prune_stories(max_age_days=config.days * 2)
-    logging.info(f"Pruned {pruned} old stories")
-    db.close()
-    logging.info("Done.")
+    results = await asyncio.gather(*(fetch_one(story) for story in stories))
+    return {sid: updated for sid, updated in results if updated is not None}
 
 
-def fast_rerank_and_render(
-    db: Database,
-    config: Config,
-    embedder: Embedder,
-) -> None:
-    now_ts = int(time.time())
-    cutoff_ts = now_ts - (config.days * 86400)
-    rows = db.execute(
-        "SELECT id, title, url, score, time, text_content, source, comment_count, "
-        "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
-        "FROM stories WHERE time >= ? AND id NOT IN (SELECT story_id FROM feedback)",
-        (cutoff_ts,)
-    )
-    candidates = [Database._row_to_story(row) for row in rows]
+_pico_css_cache: str | None = None
 
-    if not candidates:
-        generate_dashboard(
-            [],
-            Path(config.output),
-            config.username,
-            datetime.now().strftime("%Y-%m-%d %H:%M"),
-            config.server_port,
-            db,
-        )
-        return
 
-    # Candidate Pruning: Sort by standard HN gravity formula and take top 1000
-    # to keep evaluation time under 300ms.
-    candidates.sort(
-        key=lambda s: (s.score if s.source == "hn" else 100) / (((time.time() - s.time) / 3600.0 + 2.0) ** 1.8),
-        reverse=True,
-    )
-    candidates = candidates[:1000]
-
-    cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
-
-    final = rerank_candidates(
-        db=db,
-        config=config,
-        embedder=embedder,
-        candidates=candidates,
-        cand_embeddings=cand_embeddings,
-    )
-
-    generate_dashboard(
-        final,
-        Path(config.output),
-        config.username,
-        datetime.now().strftime("%Y-%m-%d %H:%M"),
-        config.server_port,
-        db,
-    )
+def _get_pico_css() -> str:
+    global _pico_css_cache
+    if _pico_css_cache is None:
+        path = Path("templates/pico.min.css")
+        _pico_css_cache = path.read_text(encoding="utf-8") if path.exists() else ""
+    return _pico_css_cache
 
 
 def generate_dashboard_bytes(
     ranked: list[RankedStory],
     config: Config,
-    username: str,
     db: Database,
     user_id: int | None = None,
+    user_token: str | None = None,
 ) -> bytes:
     """Render dashboard to bytes without writing to disk."""
     env = Environment(loader=FileSystemLoader("templates"), autoescape=True)
     env.filters["time_ago"] = time_ago_filter
+    env.filters["source_label"] = source_label_filter
 
-    pico_css_path = Path("templates/pico.min.css")
-    pico_css = pico_css_path.read_text(encoding="utf-8") if pico_css_path.exists() else ""
+    pico_css = _get_pico_css()
 
-    all_fb = db.get_all_feedback(user_id=user_id)
-    fb_map = {f.story_id: f.action for f in all_fb}
+    vote_counts = (
+        db.count_feedback_by_action(user_id)
+        if user_id
+        else {"up": 0, "neutral": 0, "down": 0}
+    )
 
     template = env.get_template("index.html")
     html_content = template.render(
-        username=username,
         timestamp=datetime.now().strftime("%Y-%m-%d %H:%M"),
         stories=ranked,
         server_port=config.server_port,
         pico_css=pico_css,
-        fb_map=fb_map,
+        user_token=user_token,
+        vote_count_up=vote_counts["up"],
+        vote_count_neutral=vote_counts["neutral"],
+        vote_count_down=vote_counts["down"],
+        hot_badge_percentile=int(round(config.model.hot_badge_percentile)),
     )
     return html_content.encode("utf-8")
 
@@ -1743,33 +2783,100 @@ def fast_rerank_for_user(
     now_ts = int(time.time())
     cutoff_ts = now_ts - (config.days * 86400)
 
-    rows = db.execute(
+    recent_rows = db.execute(
         "SELECT id, title, url, score, time, text_content, source, comment_count, "
         "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
-        "FROM stories WHERE time >= ? AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?)",
-        (cutoff_ts, user_id),
+        "FROM stories WHERE time >= ? AND source NOT IN (?, ?) "
+        "AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?)",
+        (cutoff_ts, BQ_ARCHIVE_SOURCE, CH_ARCHIVE_SOURCE, user_id),
     )
+    archive_rows = db.execute(
+        "SELECT id, title, url, score, time, text_content, source, comment_count, "
+        "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
+        "FROM stories WHERE source IN (?, ?) AND text_content != '' "
+        "AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?) "
+        "ORDER BY score DESC, time DESC LIMIT ?",
+        (
+            BQ_ARCHIVE_SOURCE,
+            CH_ARCHIVE_SOURCE,
+            user_id,
+            BQ_ARCHIVE_CANDIDATE_LIMIT + CH_ARCHIVE_CANDIDATE_LIMIT,
+        ),
+    )
+    rows = recent_rows + archive_rows
     candidates = [Database._row_to_story(row) for row in rows]
+    candidates = [s for s in candidates if is_summarizable(s)]
     if not candidates:
         return []
 
-    candidates.sort(
-        key=lambda s: (s.score if s.source == "hn" else 100) / (((time.time() - s.time) / 3600.0 + 2.0) ** 1.8),
-        reverse=True,
-    )
-    candidates = candidates[:1000]
-
     cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
 
-    return rerank_candidates(
-        db=db, config=config, embedder=embedder,
-        candidates=candidates, cand_embeddings=cand_embeddings,
+    ranked = rerank_candidates(
+        db=db,
+        config=config,
+        embedder=embedder,
+        candidates=candidates,
+        cand_embeddings=cand_embeddings,
         user_id=user_id,
     )
 
+    return _apply_dedup_to_ranked(ranked, db, config, user_id)
 
-async def fetch_candidates_only(config: Config, db: Database) -> None:
-    """Fetch new candidates into shared DB. No per-user rendering."""
+
+def _apply_dedup_to_ranked(
+    ranked: list[RankedStory],
+    db: Database,
+    config: Config,
+    user_id: int,
+) -> list[RankedStory]:
+    """Filter *ranked* through :func:`dedup.dedup_ranked`.
+
+    Pulls this user's feedback (so the URL/title-exclusion logic has
+    data) and applies a :class:`dedup.DedupConfig` built from the
+    :class:`ModelConfig`. Preserves the caller's rank order.
+    """
+    from dedup import DedupConfig, dedup_ranked
+
+    model_cfg = config.model
+    dedup_cfg = DedupConfig(
+        render_enabled=model_cfg.dedup_render_enabled,
+        title_fuzzy_enabled=model_cfg.dedup_title_fuzzy_enabled,
+        title_fuzzy_hamming=model_cfg.dedup_title_fuzzy_hamming,
+        require_same_domain_for_fuzzy=model_cfg.dedup_title_fuzzy_same_domain,
+        exclude_actions=tuple(model_cfg.dedup_exclude_actions),
+    )
+    feedback = db.get_all_feedback(user_id=user_id)
+    survivor_stories = dedup_ranked(
+        [r.story for r in ranked], feedback, dedup_cfg, user_id=user_id
+    )
+    survivors_by_id = {s.id: s for s in survivor_stories}
+    return [r for r in ranked if r.story.id in survivors_by_id]
+
+
+async def fetch_candidates_only(
+    config: Config,
+    db: Database,
+    embedder: Embedder | None = None,
+    prewarm_top_n: int | None = None,
+) -> None:
+    """Fetch new candidates into shared DB; prewarm top-N by score.
+
+    Reddit topfeed (subreddit RSS) and Reddit prewarm (per-post RSS) are
+    coordinated through a single shared window via
+    :func:`reddit_fetch_queue.enqueue_all_reddit_fetches`. The two factory
+    lists are interleaved at ``config.reddit_min_fetch_spacing_seconds``
+    apart so 429 backoffs on one kind do not block the other, and the
+    single ``wait_until_empty`` at the end means we never serialize one
+    kind's full window behind the other's.
+
+    New Reddit stories discovered by this cycle's topfeed are ranked in
+    this cycle (their stories are upserted post-drain) but are prewarmed
+    on the next regen cycle (~3h later). Old Reddit stories already in
+    the DB lacking ``top_comments`` are prewarmed this cycle via the
+    DB query in step 4 below.
+    """
+    from reddit_fetch_queue import queue as reddit_fetch_queue
+
     feedback_records = db.get_all_feedback()
     feedback_ids = {f.story_id for f in feedback_records}
     feedback_urls = {f.url for f in feedback_records if f.url}
@@ -1779,3 +2886,152 @@ async def fetch_candidates_only(config: Config, db: Database) -> None:
     )
     logging.info(f"Regen: fetched {n_fetched} candidates")
 
+    # HN prewarm
+    if config.prewarm_hn_full and embedder is not None:
+        needs_prewarm = [
+            s.id
+            for s in candidates
+            if is_hn_source(s.source)
+            and not s.top_comments
+            and (s.comment_count or 0) > 0
+        ]
+        if needs_prewarm:
+            prewarmed = prewarm_top_stories(needs_prewarm, db, embedder)
+            logging.info(
+                "Regen: prewarmed %d/%d HN candidates (full mode)",
+                prewarmed,
+                len(needs_prewarm),
+            )
+    else:
+        if prewarm_top_n is None:
+            prewarm_top_n = config.regen_prewarm_top_n
+        if prewarm_top_n > 0 and embedder is not None:
+            hn_ids = [s.id for s in candidates if s.id > 0]
+            hn_ids.sort(
+                key=lambda sid: next(s.score for s in candidates if s.id == sid),
+                reverse=True,
+            )
+            top_ids = hn_ids[:prewarm_top_n]
+            if top_ids:
+                prewarmed = prewarm_top_stories(top_ids, db, embedder)
+                logging.info(
+                    "Regen: prewarmed %d/%d top-by-score stories",
+                    prewarmed,
+                    len(top_ids),
+                )
+
+    # Reddit topfeed + prewarm via the shared queue. Both are enqueued
+    # together via `enqueue_all_reddit_fetches` so they interleave on a
+    # single `min_stride_seconds` window. The single drain at the end of
+    # the regen flow handles the case where the queue never fully drains
+    # (we log a warning but continue — prewarm counts reflect only what
+    # ran).
+    topfeed_factories, reddit_feed_urls = build_reddit_topfeed_factories(
+        list(config.rss.feeds),
+        config.rss.per_feed_limit,
+        config.days,
+        feedback_urls,
+    )
+
+    if config.prewarm_reddit_full:
+        # Gather prewarm IDs from the DB, capped by
+        # `config.reddit_prewarm_max_per_cycle` to keep the combined
+        # window under the 90-min drain timeout. Top stories by
+        # `score DESC, time DESC` get prewarmed first so the highest-
+        # value backlog drains before lower-value items. The candidate
+        # pool is too narrow to drive prewarm (Reddit topfeed stories
+        # are enqueued, not in the pool) — see WORKLOG 2026-06-28
+        # "Reddit fetch queue as single coordinator" for the full
+        # rationale.
+        #
+        # The `comment_count > 0` filter skips Reddit stories that have
+        # no comments to fetch (Reddit's per-post RSS for a 0-comment
+        # post returns an empty feed, so the prewarm HTTP call would
+        # never populate `top_comments`). See WORKLOG 2026-06-28
+        # "Reddit RSS parser: extract score and num_comments" for why
+        # cc=0 was over-represented in the backlog.
+        rows = db.execute(
+            """
+            SELECT id FROM stories
+            WHERE source LIKE 'rss_reddit_%'
+              AND (top_comments IS NULL OR top_comments = '')
+              AND text_content != ''
+              AND comment_count > 0
+            ORDER BY score DESC, time DESC
+            LIMIT ?
+            """,
+            (config.reddit_prewarm_max_per_cycle,),
+        )
+        prewarm_ids = [row[0] for row in rows]
+    else:
+        top_reddit_n = config.reddit_prewarm_top_n
+        if top_reddit_n > 0:
+            reddit_ids = sorted(
+                (s.id for s in candidates if s.source.startswith("rss_reddit_")),
+                key=lambda sid: next(s.score for s in candidates if s.id == sid),
+                reverse=True,
+            )
+            prewarm_ids = reddit_ids[:top_reddit_n]
+        else:
+            prewarm_ids = []
+
+    prewarm_factories, prewarm_updated_ids = build_reddit_prewarm_factories(
+        prewarm_ids, db
+    )
+
+    if topfeed_factories or prewarm_factories:
+        reddit_fetch_queue.enqueue_all_reddit_fetches(
+            topfeed_factories,
+            prewarm_factories,
+            min_stride_seconds=config.reddit_min_fetch_spacing_seconds,
+        )
+        # 90 min ceiling: 87 tasks × 50s stride = ~72 min nominal, plus
+        # slack for 429 backoffs the limiter absorbs.
+        drained = reddit_fetch_queue.wait_until_empty(timeout=5400.0)
+        if not drained:
+            logging.warning(
+                "fetch_candidates_only: reddit queue did not drain in 5400s, "
+                "continuing with partial results"
+            )
+
+        # Post-drain: collect Reddit topfeed stories from cache and
+        # upsert them. The summarizable filter applied inside
+        # `fetch_candidates` did not see these (they were enqueued, not
+        # returned), so we persist them here for the next regen cycle.
+        for feed_url in reddit_feed_urls:
+            cached = reddit_feed_cache.get(feed_url)
+            if cached:
+                for story in cached:
+                    db.upsert_story(story)
+                candidates.extend(cached)
+
+        # Post-drain: recompute embeddings for stories whose
+        # `top_comments`/`self_text` changed during prewarm.
+        if prewarm_updated_ids and embedder is not None:
+            updated_stories = [db.get_story(sid) for sid in prewarm_updated_ids]
+            updated_stories = [s for s in updated_stories if s is not None]
+            if updated_stories:
+                get_or_compute_embeddings(updated_stories, embedder, db)
+
+        logging.info(
+            "Regen: reddit topfeed=%d prewarm=%d (full=%s, prewarm_ids=%d)",
+            len(reddit_feed_urls),
+            len(prewarm_updated_ids),
+            config.prewarm_reddit_full,
+            len(prewarm_ids),
+        )
+
+    # LessWrong prewarm
+    if config.prewarm_lesswrong_full:
+        needs_prewarm_lw = [
+            s.id
+            for s in candidates
+            if s.source == "rss_lesswrong_com" and not s.top_comments
+        ]
+        if needs_prewarm_lw:
+            prewarmed = await prewarm_lesswrong_stories(needs_prewarm_lw, db, embedder)
+            logging.info(
+                "Regen: prewarmed %d/%d LessWrong candidates (full mode)",
+                prewarmed,
+                len(needs_prewarm_lw),
+            )
