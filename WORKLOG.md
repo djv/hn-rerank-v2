@@ -5,6 +5,30 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-29 — Warm polling uses completed decks, not timer fallback
+
+**Problem.** The 3s SWR fallback commit made `waitForRankingReady()` return
+true on a timer. That could fetch a stale cached deck sooner, but it also
+blurred the meaning of readiness and treated speculative time as equivalent to
+completed server work.
+
+**Fix.**
+- `templates/index.html`: removed the timer-based success fallback. The warm
+  poll now returns true only when `/api/ranking-ready?version=N` reports cached
+  HTML for that version or newer. Active warm work is still drained first, and
+  each completed warm version enqueues a non-advancing refill before polling the
+  latest queued version.
+- `tests/test_server.py`: added a static regression that rejects a timer-based
+  success fallback in `waitForRankingReady()`.
+- `ARCHITECTURE.md`: documented the completion-driven contract: rapid votes load
+  the best available completed warm deck as it lands while the server may keep
+  rendering a newer queued refresh in the background.
+
+**Files**: `templates/index.html`, `tests/test_server.py`, `ARCHITECTURE.md`,
+`WORKLOG.md`.
+
+---
+
 ## 2026-06-29 — Rapid-vote warm drain keeps early results
 
 **Problem.** The vote-triggered warm poll lane superseded an active poll when

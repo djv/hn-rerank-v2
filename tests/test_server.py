@@ -2722,6 +2722,17 @@ def test_waitForRankingReady_poll_is_not_aborted_by_newer_warm() -> None:
     assert "activeWarmVersion" not in block
 
 
+def test_waitForRankingReady_has_no_timer_success_fallback() -> None:
+    _, inline_script = _read_template_and_static()
+    block = inline_script.split("async function waitForRankingReady(", 1)[1].split(
+        "sortTabs.forEach", 1
+    )[0]
+    assert "> 3000" not in block
+    assert "return true" in block
+    assert "if (data.ready)" in block
+    assert "if (data.ready) {\n            return true;" in block
+
+
 def test_waitForRankingReady_timeout_does_not_refill() -> None:
     _, inline_script = _read_template_and_static()
     block = inline_script.split("async function waitForRankingReady(", 1)[1].split(
