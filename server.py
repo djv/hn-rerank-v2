@@ -332,7 +332,7 @@ async def _fetch_lesswrong_context(post_id: str) -> LessWrongContext | None:
             return None
         payload = resp.json()
     except Exception as e:
-        logging.error(f"LessWrong fetch failed: {e}")
+        logging.error("LessWrong fetch failed: %r", e)
         return None
     if not payload.get("data"):
         return None
@@ -865,7 +865,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 self._json_response({"ok": True, "ranking_refresh_queued": True})
             except Exception as e:
-                logging.error(f"Error handling feedback: {e}")
+                logging.error("Error handling feedback: %r", e)
                 self._json_response({"error": "Internal error"}, status=400)
         elif self.path == "/api/tldr-detail":
             try:
@@ -1075,7 +1075,7 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 self._json_response({"ok": True, "tldr": tldr, "cached": False})
             except Exception as e:
-                logging.error(f"Error handling tldr-detail: {e}")
+                logging.error("Error handling tldr-detail: %r", e)
                 self._json_response({"error": "Internal error"}, status=400)
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
@@ -1126,7 +1126,7 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
             Handler._bump_all_cached_versions()
             logging.info("Regeneration complete.")
         except Exception as e:
-            logging.exception(f"Background regeneration failed: {e}")
+            logging.exception("Background regeneration failed: %r", e)
 
 
 def main() -> None:

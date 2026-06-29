@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Import feedback from hn_rerank's JSON format into the rewrite's SQLite DB."""
 
+from __future__ import annotations
+
 import json
 import sys
 from pathlib import Path

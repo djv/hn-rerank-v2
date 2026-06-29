@@ -11,6 +11,8 @@ is_rss.
 Compares against full-feature baseline in eval_report.json.
 """
 
+from __future__ import annotations
+
 from typing import Any
 
 import hashlib

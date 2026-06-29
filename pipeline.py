@@ -805,7 +805,7 @@ async def fetch_story(
         db.upsert_story(story)
         return story
     except Exception as e:
-        logging.error(f"Error fetching story {sid}: {e}")
+        logging.error("Error fetching story %s: %r", sid, e)
         return story if story else None
 
 
@@ -907,14 +907,6 @@ def prewarm_top_stories(
     """
     from ch_client import query_stories_with_comments
 
-    def _coerce_int_safe(value, default):
-        if value is None:
-            return default
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return default
-
     if not story_ids:
         return 0
 
@@ -943,7 +935,7 @@ def prewarm_top_stories(
         top_comments = " ".join(c["text"] for c in selected)[:10000]
         if not top_comments:
             continue
-        comment_count = _coerce_int_safe(
+        comment_count = _coerce_int(
             item.get("num_comments"), existing.comment_count or 0
         )
         new_text_content = compose_story_text(
@@ -1490,7 +1482,7 @@ async def _fetch_and_parse_feed(
 
         return stories
     except Exception as e:
-        logging.error(f"Failed to fetch RSS feed {feed_url}: {e}")
+        logging.error("Failed to fetch RSS feed %s: %r", feed_url, e)
         return []
 
 
@@ -2109,7 +2101,7 @@ def _score_and_rank(
                 probs = _softmax_rows(decision)
             scores = _minmax01(raw_scores)
         except Exception as e:
-            logging.error(f"Failed to fit feedback SVM: {e}")
+            logging.error("Failed to fit feedback SVM: %r", e)
     elif trace is not None:
         trace.set_label("model_cache", "skipped")
 
@@ -2212,7 +2204,7 @@ def _score_and_rank(
                     )
                 )
         except (ValueError, IndexError, NameError) as e:
-            logging.error(f"Error mapping probability class indices: {e}")
+            logging.error("Error mapping probability class indices: %r", e)
             ranked = []
 
     if not ranked:
@@ -3082,7 +3074,7 @@ async def fetch_candidates_only(
     candidates, n_fetched = await fetch_candidates(
         config, feedback_ids, feedback_urls, db, None
     )
-    logging.info(f"Regen: fetched {n_fetched} candidates")
+    logging.info("Regen: fetched %d candidates", n_fetched)
 
     # HN prewarm
     if config.prewarm_hn_full and embedder is not None:

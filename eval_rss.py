@@ -6,6 +6,8 @@ filtered to non-HN test items. Reports per-source breakdown.
 Writes eval_report_rss.json (not committed; separate from eval_report.json).
 """
 
+from __future__ import annotations
+
 from typing import Any
 
 import hashlib
