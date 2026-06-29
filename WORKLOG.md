@@ -5,6 +5,142 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-29 — NullTrace sentinel + do_POST split + GraphQL parameterization
+
+Three structural cleanups from the improvement-areas plan.
+
+**NullTrace sentinel (pipeline.py).** Added a `_NullTrace` no-op class
+with `stage()` returning `@contextmanager` that yields once, and
+no-op `set_count` / `set_label`. Module-level singleton `NULL_TRACE`.
+Changed the three functions that took `trace: RankTrace | None = None`
+(`_score_and_rank`, `rerank_candidates`, `fast_rerank_for_user`) to
+default to `NULL_TRACE` so callers can write `with trace.stage("x"):`
+unconditionally. Removed all 7 sites of
+`with trace.stage("X") if trace is not None else nullcontext():`
+boilerplate. Dropped the `nullcontext` import. Behavior-preserving:
+the sentinel no-ops match the real `RankTrace` semantics.
+
+**do_POST split (server.py).** Mechanically extracted the two
+endpoints into `_handle_feedback()` and `_handle_tldr_detail()`.
+`do_POST` is now a 7-line dispatcher. Endpoints are 2 (was 3 in
+the plan — `/api/user` is in `do_GET` at L600, not POST). All
+bodies are byte-identical to the pre-split versions; comments
+preserved.
+
+**GraphQL parameterization (server.py).** `_fetch_lesswrong_context`
+was interpolating `post_id` via `%` into the GraphQL query string.
+Replaced with a `$id: String!` variable and `variables={"id":
+post_id}`. Existing mock test (`test_server.py:1519`) does not
+validate the request payload, so it still passes unchanged.
+
+**Deferred (C2 prewarm write-back helper).** Plan item P2 #7b
+proposed extracting a helper for the 3 sites that do
+`compose_story_text` + `replace` + `db.upsert_story`. The 3 sites
+in pipeline.py (`_hydrate_ch_comments_batch`, `prewarm_reddit_*`,
+`prewarm_lesswrong_stories`) are structurally similar but the
+per-site field semantics differ:
+- CH bulk: `comment_count_at_fetch = comment_count` (overwrite)
+- Reddit/LW: `comment_count_at_fetch = max(story.comment_count_at_fetch, ctx.comment_count)`
+- Reddit/LW: `comment_count = story.comment_count or ctx.comment_count or None` (only if missing)
+- LW only: `score = max(story.score, ctx.score)`
+
+A single helper that handles all 3 would either need conditional
+flags (ugly) or change behavior at one or more sites. Per the
+"minimal, behavior-preserving changes" rule in AGENTS.md, this
+refactor is deferred. A future session can either (a) accept the
+behavior change in `comment_count_at_fetch` (small win — never
+drops a higher observed count) or (b) extract the smaller
+`_pick_richer_self_text` helper used in Reddit/LW for the
+`len(new) > len(story.self_text)` selection.
+
+**Verification.** `uv run pytest tests/ -n 4` → 392 passed,
+1 skipped, 26.12s. `uv run ruff check .` clean. `uv run ty check`
+clean.
+
+---
+
+## 2026-06-29 — Security: harden tokens, cookies, error responses
+
+The remaining three P0 security items from the improvement-areas
+plan. (S3 — Content-Length cap — was applied in the top-3 round
+earlier today.)
+
+**S2 — Token entropy (server.py:611).** `secrets.token_hex(4)` (32
+bits) → `secrets.token_hex(16)` (128 bits) for new-session tokens.
+The old value was brute-forceable given even modest persistence.
+
+**S1 — Cookie flags (server.py:591, :615).** Both `Set-Cookie`
+sites now include `SameSite=Lax; HttpOnly`. `Secure` was
+deliberately omitted (server runs on plain HTTP locally; would
+break sessions). `SameSite=Lax` blocks cross-origin POSTs (CSRF
+for `/api/feedback`) while still allowing top-level navigations
+from external links.
+
+**S5 — Exception string leakage (server.py:868, :1078).** Both
+`/api/feedback` and `/api/tldr-detail` error responses were
+returning `{"error": str(e)}` to API clients. Replaced with the
+generic `{"error": "Internal error"}`. The full exception is still
+captured server-side via `logging.error("... : %r", e)` (also
+converted to %-style in this commit — see Tier A below for the
+other 7 sites).
+
+**S4 — GraphQL injection (deferred).** `post_id` is regex-
+extracted from `story.url` (validated as digits-only) before
+reaching `_fetch_lesswrong_context`. Real risk is low; deferred
+from this commit and parameterized in the follow-up commit (see
+"NullTrace sentinel + do_POST split + GraphQL parameterization"
+above).
+
+**Verification.** `uv run pytest tests/ -n 4` → 392 passed,
+1 skipped, 18.91s (5 more tests now passing than the 387 baseline
+from S3; likely cookie-format assertions). `uv run ruff check .`
+clean. `uv run ty check` clean.
+
+**Files:** `server.py` (5 hunks), `WORKLOG.md` (this entry).
+
+---
+
+## 2026-06-29 — Cleanup trifecta: annotations, dead code, f-string logging
+
+Three P2 items from the improvement-areas plan, all
+mechanical and behavior-preserving.
+
+**`from __future__ import annotations`** added to 4 files
+that were missing it: `eval_no_hn_features.py`,
+`eval_rss.py`, `migrate_feedback.py`, `setup_model.py`. The
+project targets Python 3.12 and uses lazy annotations
+everywhere else; this brings the 4 outliers in line.
+
+**Dead `_coerce_int_safe` removed (pipeline.py).** Local
+inner function in `_hydrate_ch_comments_batch` was an
+exact duplicate of the module-level `_coerce_int` (L670)
+minus the type hints. Single call site at L946 now uses
+`_coerce_int` directly.
+
+**f-string → %-style logging (9 calls).** Converted the
+remaining `logging.(error|warning|info|exception)(f"...")`
+calls in `server.py` (4) and `pipeline.py` (5) to
+%-style. Previously the f-string args were eagerly
+interpolated even when the level was disabled. Plan claimed
+8 calls; actual was 9. The 2 server.py calls at L868 and
+L1078 are inside the S5 try/except that now returns
+"Internal error" to the client but still logs the full
+exception via `%r, e`.
+
+**Stale plan item removed.** The "Duplicated source-category
+onehot extraction at 1905-1911 vs 1996-2002" sub-item in
+plan P2 #6 was a phantom: those two blocks are label
+partitioning and LOOCV k-NN respectively, not onehot
+extraction. The actual `source_category_stack` calls at
+L1944 and L2009 use the same helper but on different data
+(candidates vs feedback), not duplicated.
+
+**Verification.** `uv run pytest tests/ -n 4` → 392
+passed, 1 skipped, 20.39s. `uv run ruff check .` clean.
+`uv run ty check` clean.
+
+---
+
 ## 2026-06-29 — Top-3 quick wins from improvement-areas review
 
 Applied the three highest-ROI items from

@@ -10,7 +10,7 @@ import time
 import tomllib
 from collections import Counter, OrderedDict
 from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, cast
 from datetime import datetime
@@ -110,6 +110,25 @@ class RankTrace:
     def format_log_fields(self) -> str:
         fields = self.to_log_fields()
         return " ".join(f"{key}={fields[key]}" for key in sorted(fields))
+
+
+class _NullTrace:
+    """No-op RankTrace sentinel. Used as the default trace argument so callers
+    can write ``with trace.stage(\"x\"):`` unconditionally and skip
+    ``if trace is not None else nullcontext()`` boilerplate at every site."""
+
+    @contextmanager
+    def stage(self, name: str) -> Iterator[None]:
+        yield
+
+    def set_count(self, name: str, value: int) -> None:
+        pass
+
+    def set_label(self, name: str, value: str) -> None:
+        pass
+
+
+NULL_TRACE: _NullTrace = _NullTrace()
 
 
 @dataclass
@@ -1838,7 +1857,7 @@ def _score_and_rank(
     config: Config,
     embedder: Embedder,
     user_id: int | None = None,
-    trace: RankTrace | None = None,
+    trace: RankTrace | _NullTrace = NULL_TRACE,
     score_context: RankScoreContext | None = None,
 ) -> list[RankedStory]:
     if not candidates:
@@ -1906,11 +1925,7 @@ def _score_and_rank(
             k = config.model.knn_k
             emb_dim = candidate_embeddings.shape[1]
 
-            with (
-                trace.stage("svm_candidate_feature_prep")
-                if trace is not None
-                else nullcontext()
-            ):
+            with trace.stage("svm_candidate_feature_prep"):
                 # k-NN similarity (mean of top-k similarities to class)
                 cand_sim_to_up = _knn_similarity(candidate_embeddings, fb_up_embs, k)
                 cand_sim_to_down = _knn_similarity(
@@ -1965,11 +1980,7 @@ def _score_and_rank(
             else:
                 if trace is not None:
                     trace.set_label("model_cache", "miss")
-                with (
-                    trace.stage("svm_training_feature_prep")
-                    if trace is not None
-                    else nullcontext()
-                ):
+                with trace.stage("svm_training_feature_prep"):
                     # LOOCV k-NN for training: exclude self from reference set
                     fb_sim_to_up = np.zeros(len(fb_embeddings), dtype=np.float32)
                     fb_sim_to_down = np.zeros(len(fb_embeddings), dtype=np.float32)
@@ -2072,11 +2083,7 @@ def _score_and_rank(
                         user_id, fb_sig, svm, scaler, config.max_cached_models
                     )
 
-            with (
-                trace.stage("svm_candidate_scale")
-                if trace is not None
-                else nullcontext()
-            ):
+            with trace.stage("svm_candidate_scale"):
                 cand_features_meta_scaled = np.clip(
                     scaler.transform(cand_features[:, emb_dim:]), -2.5, 2.5
                 )
@@ -2111,7 +2118,7 @@ def _score_and_rank(
     # Tier 2: centroid-based scores (always compute when feedback exists)
     tier2_scores: NDArray[np.float32] | None = None
     if n_feedback > 0:
-        with trace.stage("tier2") if trace is not None else nullcontext():
+        with trace.stage("tier2"):
             fb_embs = get_or_compute_embeddings(feedback_stories, embedder, db)
             fb_labels_arr = np.array(feedback_labels)
             up_mask = fb_labels_arr == 2
@@ -2332,7 +2339,7 @@ def rerank_candidates(
     candidates: list[Story],
     cand_embeddings: NDArray[np.float32] | None = None,
     user_id: int | None = None,
-    trace: RankTrace | None = None,
+    trace: RankTrace | _NullTrace = NULL_TRACE,
 ) -> list[RankedStory]:
     """Rank candidates and attach discovery badges.
 
@@ -2379,7 +2386,7 @@ def rerank_candidates(
 
     selected_ids = {item.story.id for item in final}
 
-    with trace.stage("badge_similarity") if trace is not None else nullcontext():
+    with trace.stage("badge_similarity"):
         # Calculate parameters for remaining discovery passes
         feedback_stories, feedback_labels, _ = db.get_feedback_for_training(
             user_id=user_id
@@ -2919,15 +2926,14 @@ def fast_rerank_for_user(
     config: Config,
     embedder: Embedder,
     user_id: int,
-    trace: RankTrace | None = None,
+    trace: RankTrace | _NullTrace = NULL_TRACE,
 ) -> list[RankedStory]:
     """Fast rerank for a specific user. Called on each dashboard request."""
-    if trace is not None:
-        trace.set_count("user_id", user_id)
+    trace.set_count("user_id", user_id)
     now_ts = int(time.time())
     cutoff_ts = now_ts - (config.days * 86400)
 
-    with trace.stage("candidate_sql") if trace is not None else nullcontext():
+    with trace.stage("candidate_sql"):
         # Two-leg recent query: HN stories ordered by tier-1 gravity
         # (score/age^1.8, mirroring the cold-start tier-1 blend in
         # _score_and_rank); non-HN RSS stories ordered by recency only
@@ -2983,7 +2989,7 @@ def fast_rerank_for_user(
     if not candidates:
         return []
 
-    with trace.stage("candidate_embedding") if trace is not None else nullcontext():
+    with trace.stage("candidate_embedding"):
         cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
 
     ranked = rerank_candidates(
@@ -2996,7 +3002,7 @@ def fast_rerank_for_user(
         trace=trace,
     )
 
-    with trace.stage("dedup") if trace is not None else nullcontext():
+    with trace.stage("dedup"):
         return _apply_dedup_to_ranked(ranked, db, config, user_id)
 
 

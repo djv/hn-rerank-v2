@@ -315,18 +315,21 @@ async def _fetch_reddit_rss_context(url: str | None) -> RedditRssContext | None:
 
 
 async def _fetch_lesswrong_context(post_id: str) -> LessWrongContext | None:
-    query = (
-        '{ post(input: { selector: { _id: "%s" } }) { result { _id '
-        "commentCount baseScore contents { html } } } "
-        'comments(input: { terms: { view: "postCommentsTop", '
-        'postId: "%s" } }) { results { _id author baseScore '
-        "htmlBody postedAt } } }"
-    ) % (post_id, post_id)
+    query = """
+    query($id: String!) {
+      post(input: { selector: { _id: $id } }) {
+        result { _id commentCount baseScore contents { html } }
+      }
+      comments(input: { terms: { view: "postCommentsTop", postId: $id } }) {
+        results { _id author baseScore htmlBody postedAt }
+      }
+    }
+    """
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
                 "https://www.lesswrong.com/graphql",
-                json={"query": query},
+                json={"query": query, "variables": {"id": post_id}},
             )
         if resp.status_code != 200:
             return None
@@ -821,113 +824,161 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         if self.path == "/api/feedback":
-            user = self._get_user()
-            if not user:
-                self._json_response({"error": "No session"}, status=401)
+            self._handle_feedback()
+        elif self.path == "/api/tldr-detail":
+            self._handle_tldr_detail()
+        else:
+            self.send_error(HTTPStatus.NOT_FOUND)
+
+    def _handle_feedback(self) -> None:
+        user = self._get_user()
+        if not user:
+            self._json_response({"error": "No session"}, status=401)
+            return
+
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+            if content_length > MAX_CONTENT_LENGTH:
+                self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                return
+            body = self.rfile.read(content_length)
+            data = json.loads(body)
+
+            story_id = data["story_id"]
+            action = data["action"]
+
+            if action == "clear":
+                self.db.delete_feedback(user.id, story_id)
+            else:
+                self.db.upsert_feedback(
+                    user.id,
+                    story_id,
+                    action,
+                )
+
+            # Invalidate the user's dashboard cache and kick a warm for
+            # the new version on every vote, so a subsequent refill cannot
+            # serve an HTML deck that includes a story the user just voted
+            # on. The previous "defer until queue low / every 5 votes"
+            # gating left the cached HTML stale for up to ~9s per burst;
+            # the SWR stale-hit path then re-injected already-voted
+            # stories via refillQueue (the bug observed on 2026-06-28).
+            # Bursty votes still produce N sequential warm threads per
+            # user; the existing version-skip check in _trigger_warm
+            # discards obsolete results, and the render lock serializes
+            # them, so only the latest version lands in the cache.
+            version = self._invalidate_dashboard_cache(user.id)
+            self._trigger_warm(user, version)
+
+            # Also trigger background regen for candidate updates
+            self.regen_event.set()
+
+            self._json_response({"ok": True, "ranking_refresh_queued": True})
+        except Exception as e:
+            logging.error("Error handling feedback: %r", e)
+            self._json_response({"error": "Internal error"}, status=400)
+
+    def _handle_tldr_detail(self) -> None:
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+            if content_length > MAX_CONTENT_LENGTH:
+                self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                return
+            body = self.rfile.read(content_length)
+            data = json.loads(body)
+
+            story_id = data["story_id"]
+
+            story = self.db.get_story(story_id)
+            if not story:
+                self._json_response(
+                    {"error": "Story not found in database"}, status=404
+                )
                 return
 
-            try:
-                content_length = int(self.headers.get("Content-Length", 0))
-                if content_length > MAX_CONTENT_LENGTH:
-                    self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
-                    return
-                body = self.rfile.read(content_length)
-                data = json.loads(body)
+            # 1. If HN story has comments but top_comments is empty, dynamically fetch them
+            if (
+                is_hn_source(story.source)
+                and not story.top_comments
+                and (story.comment_count or 0) > 0
+            ):
+                try:
+                    from pipeline import fetch_story
 
-                story_id = data["story_id"]
-                action = data["action"]
+                    async def do_fetch():
+                        async with httpx.AsyncClient(timeout=15.0) as client:
+                            return await fetch_story(client, story_id, self.db)
 
-                if action == "clear":
-                    self.db.delete_feedback(user.id, story_id)
-                else:
-                    self.db.upsert_feedback(
-                        user.id,
-                        story_id,
-                        action,
-                    )
+                    updated = asyncio.run(do_fetch())
+                    if updated:
+                        story = updated
+                except Exception as e:
+                    logging.error(f"Failed to dynamically fetch comments for TLDR: {e}")
 
-                # Invalidate the user's dashboard cache and kick a warm for
-                # the new version on every vote, so a subsequent refill cannot
-                # serve an HTML deck that includes a story the user just voted
-                # on. The previous "defer until queue low / every 5 votes"
-                # gating left the cached HTML stale for up to ~9s per burst;
-                # the SWR stale-hit path then re-injected already-voted
-                # stories via refillQueue (the bug observed on 2026-06-28).
-                # Bursty votes still produce N sequential warm threads per
-                # user; the existing version-skip check in _trigger_warm
-                # discards obsolete results, and the render lock serializes
-                # them, so only the latest version lands in the cache.
-                version = self._invalidate_dashboard_cache(user.id)
-                self._trigger_warm(user, version)
+            article_body = story.article_body or None
 
-                # Also trigger background regen for candidate updates
-                self.regen_event.set()
-
-                self._json_response({"ok": True, "ranking_refresh_queued": True})
-            except Exception as e:
-                logging.error("Error handling feedback: %r", e)
-                self._json_response({"error": "Internal error"}, status=400)
-        elif self.path == "/api/tldr-detail":
-            try:
-                content_length = int(self.headers.get("Content-Length", 0))
-                if content_length > MAX_CONTENT_LENGTH:
-                    self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
-                    return
-                body = self.rfile.read(content_length)
-                data = json.loads(body)
-
-                story_id = data["story_id"]
-
-                story = self.db.get_story(story_id)
-                if not story:
-                    self._json_response(
-                        {"error": "Story not found in database"}, status=404
-                    )
-                    return
-
-                # 1. If HN story has comments but top_comments is empty, dynamically fetch them
-                if (
-                    is_hn_source(story.source)
-                    and not story.top_comments
-                    and (story.comment_count or 0) > 0
+            if (
+                story.source.startswith("rss_reddit_")
+                and story.url
+                and (not story.self_text or not story.top_comments)
+            ):
+                reddit_context = asyncio.run(_fetch_reddit_rss_context(story.url))
+                if reddit_context and (
+                    reddit_context.self_text or reddit_context.top_comments
                 ):
-                    try:
-                        from pipeline import fetch_story
+                    from pipeline import compose_story_text
 
-                        async def do_fetch():
-                            async with httpx.AsyncClient(timeout=15.0) as client:
-                                return await fetch_story(client, story_id, self.db)
+                    self_text = (
+                        reddit_context.self_text
+                        if len(reddit_context.self_text) > len(story.self_text)
+                        else story.self_text
+                    )
+                    top_comments = (
+                        reddit_context.top_comments
+                        if len(reddit_context.top_comments) > len(story.top_comments)
+                        else story.top_comments
+                    )
+                    new_text = compose_story_text(
+                        story.title,
+                        self_text,
+                        top_comments,
+                        article_body or "",
+                    )
+                    story = replace(
+                        story,
+                        self_text=self_text,
+                        top_comments=top_comments,
+                        text_content=new_text,
+                        discussion_url=story.discussion_url or story.url,
+                        comment_count=story.comment_count
+                        or reddit_context.comment_count
+                        or None,
+                        comment_count_at_fetch=max(
+                            story.comment_count_at_fetch,
+                            reddit_context.comment_count,
+                        ),
+                    )
+                    self.db.upsert_story(story)
 
-                        updated = asyncio.run(do_fetch())
-                        if updated:
-                            story = updated
-                    except Exception as e:
-                        logging.error(
-                            f"Failed to dynamically fetch comments for TLDR: {e}"
-                        )
-
-                article_body = story.article_body or None
-
-                if (
-                    story.source.startswith("rss_reddit_")
-                    and story.url
-                    and (not story.self_text or not story.top_comments)
-                ):
-                    reddit_context = asyncio.run(_fetch_reddit_rss_context(story.url))
-                    if reddit_context and (
-                        reddit_context.self_text or reddit_context.top_comments
-                    ):
+            if (
+                story.source == "rss_lesswrong_com"
+                and story.url
+                and (not story.self_text or not story.top_comments)
+            ):
+                post_id = _extract_lesswrong_post_id(story.url)
+                if post_id:
+                    lw_context = asyncio.run(_fetch_lesswrong_context(post_id))
+                    if lw_context and (lw_context.self_text or lw_context.top_comments):
                         from pipeline import compose_story_text
 
                         self_text = (
-                            reddit_context.self_text
-                            if len(reddit_context.self_text) > len(story.self_text)
+                            lw_context.self_text
+                            if len(lw_context.self_text) > len(story.self_text)
                             else story.self_text
                         )
                         top_comments = (
-                            reddit_context.top_comments
-                            if len(reddit_context.top_comments)
-                            > len(story.top_comments)
+                            lw_context.top_comments
+                            if len(lw_context.top_comments) > len(story.top_comments)
                             else story.top_comments
                         )
                         new_text = compose_story_text(
@@ -942,143 +993,89 @@ class Handler(BaseHTTPRequestHandler):
                             top_comments=top_comments,
                             text_content=new_text,
                             discussion_url=story.discussion_url or story.url,
-                            comment_count=story.comment_count
-                            or reddit_context.comment_count
-                            or None,
+                            comment_count=(
+                                story.comment_count or lw_context.comment_count or None
+                            ),
                             comment_count_at_fetch=max(
                                 story.comment_count_at_fetch,
-                                reddit_context.comment_count,
+                                lw_context.comment_count,
                             ),
+                            score=max(story.score, lw_context.score),
                         )
                         self.db.upsert_story(story)
 
-                if (
-                    story.source == "rss_lesswrong_com"
-                    and story.url
-                    and (not story.self_text or not story.top_comments)
-                ):
-                    post_id = _extract_lesswrong_post_id(story.url)
-                    if post_id:
-                        lw_context = asyncio.run(_fetch_lesswrong_context(post_id))
-                        if lw_context and (
-                            lw_context.self_text or lw_context.top_comments
-                        ):
-                            from pipeline import compose_story_text
+            if (
+                article_body is None
+                and story.url
+                and not story.source.startswith("rss_reddit_")
+                and not story.source == "rss_lesswrong_com"
+                and not story.url.startswith("https://news.ycombinator.com")
+                and len(story.self_text) < 500
+            ):
+                article_body = asyncio.run(_fetch_article_body(story.url))
+                if article_body:
+                    article_body = article_body[:ARTICLE_BODY_CHAR_LIMIT]
+                    from pipeline import compose_story_text
 
-                            self_text = (
-                                lw_context.self_text
-                                if len(lw_context.self_text) > len(story.self_text)
-                                else story.self_text
-                            )
-                            top_comments = (
-                                lw_context.top_comments
-                                if len(lw_context.top_comments)
-                                > len(story.top_comments)
-                                else story.top_comments
-                            )
-                            new_text = compose_story_text(
-                                story.title,
-                                self_text,
-                                top_comments,
-                                article_body or "",
-                            )
-                            story = replace(
-                                story,
-                                self_text=self_text,
-                                top_comments=top_comments,
-                                text_content=new_text,
-                                discussion_url=story.discussion_url or story.url,
-                                comment_count=(
-                                    story.comment_count
-                                    or lw_context.comment_count
-                                    or None
-                                ),
-                                comment_count_at_fetch=max(
-                                    story.comment_count_at_fetch,
-                                    lw_context.comment_count,
-                                ),
-                                score=max(story.score, lw_context.score),
-                            )
-                            self.db.upsert_story(story)
+                    new_text = compose_story_text(
+                        story.title,
+                        story.self_text,
+                        story.top_comments,
+                        article_body,
+                    )
+                    updated_story = replace(
+                        story,
+                        article_body=article_body,
+                        text_content=new_text,
+                    )
+                    self.db.upsert_story(updated_story)
+                    story = updated_story
+            cache_key = _tldr_cache_key(
+                title=story.title,
+                self_text=story.self_text or "",
+                top_comments=story.top_comments or "",
+                article_body=article_body or "",
+            )
+            cached_tldr = self.db.get_tldr_cache(story.id, cache_key)
+            if cached_tldr:
+                logging.info(
+                    "tldr_detail story_id=%s result=cache_hit cache_key=%s",
+                    story.id,
+                    cache_key[:12],
+                )
+                self._json_response({"ok": True, "tldr": cached_tldr, "cached": True})
+                return
 
-                if (
-                    article_body is None
-                    and story.url
-                    and not story.source.startswith("rss_reddit_")
-                    and not story.source == "rss_lesswrong_com"
-                    and not story.url.startswith("https://news.ycombinator.com")
-                    and len(story.self_text) < 500
-                ):
-                    article_body = asyncio.run(_fetch_article_body(story.url))
-                    if article_body:
-                        article_body = article_body[:ARTICLE_BODY_CHAR_LIMIT]
-                        from pipeline import compose_story_text
-
-                        new_text = compose_story_text(
-                            story.title,
-                            story.self_text,
-                            story.top_comments,
-                            article_body,
-                        )
-                        updated_story = replace(
-                            story,
-                            article_body=article_body,
-                            text_content=new_text,
-                        )
-                        self.db.upsert_story(updated_story)
-                        story = updated_story
-                cache_key = _tldr_cache_key(
-                    title=story.title,
+            tldr = asyncio.run(
+                generate_detailed_tldr(
+                    story.title,
                     self_text=story.self_text or "",
                     top_comments=story.top_comments or "",
                     article_body=article_body or "",
                 )
-                cached_tldr = self.db.get_tldr_cache(story.id, cache_key)
-                if cached_tldr:
-                    logging.info(
-                        "tldr_detail story_id=%s result=cache_hit cache_key=%s",
-                        story.id,
-                        cache_key[:12],
-                    )
-                    self._json_response(
-                        {"ok": True, "tldr": cached_tldr, "cached": True}
-                    )
-                    return
-
-                tldr = asyncio.run(
-                    generate_detailed_tldr(
-                        story.title,
-                        self_text=story.self_text or "",
-                        top_comments=story.top_comments or "",
-                        article_body=article_body or "",
-                    )
+            )
+            if not tldr:
+                self._json_response({"error": "Failed to generate TLDR"}, status=500)
+                return
+            if tldr.startswith("Error"):
+                logging.warning(
+                    "tldr_detail story_id=%s result=llm_error cache_key=%s",
+                    story.id,
+                    cache_key[:12],
                 )
-                if not tldr:
-                    self._json_response(
-                        {"error": "Failed to generate TLDR"}, status=500
-                    )
-                    return
-                if tldr.startswith("Error"):
-                    logging.warning(
-                        "tldr_detail story_id=%s result=llm_error cache_key=%s",
-                        story.id,
-                        cache_key[:12],
-                    )
-                    self._json_response({"error": tldr}, status=503)
-                    return
-                if not tldr.startswith("No article body"):
-                    self.db.upsert_tldr_cache(story.id, cache_key, tldr)
-                    logging.info(
-                        "tldr_detail story_id=%s result=generated cache_key=%s",
-                        story.id,
-                        cache_key[:12],
-                    )
-                self._json_response({"ok": True, "tldr": tldr, "cached": False})
-            except Exception as e:
-                logging.error("Error handling tldr-detail: %r", e)
-                self._json_response({"error": "Internal error"}, status=400)
-        else:
-            self.send_error(HTTPStatus.NOT_FOUND)
+                self._json_response({"error": tldr}, status=503)
+                return
+            if not tldr.startswith("No article body"):
+                self.db.upsert_tldr_cache(story.id, cache_key, tldr)
+                logging.info(
+                    "tldr_detail story_id=%s result=generated cache_key=%s",
+                    story.id,
+                    cache_key[:12],
+                )
+            self._json_response({"ok": True, "tldr": tldr, "cached": False})
+        except Exception as e:
+            logging.error("Error handling tldr-detail: %r", e)
+            self._json_response({"error": "Internal error"}, status=400)
 
     def do_OPTIONS(self) -> None:
         self.send_response(HTTPStatus.NO_CONTENT)
