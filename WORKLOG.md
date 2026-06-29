@@ -4913,3 +4913,59 @@ for the WIP cleanup.)
   (`eval_rss.py`, `eval_no_hn_features.py`, `tests/test_pipeline.py`)
 - C (chunked similarity matrices in `pipeline.py:rerank_candidates`)
 - B (tracemalloc `--profile-mem` flag in eval.py)
+
+---
+
+## 2026-06-29 — Cross-source title dedup for LessWrong cross-posts
+
+**Symptom.** User reported two cards for the same story: the
+LessWrong RSS story (url=`lesswrong.com/posts/...`) and the HN
+submission of the same dynomight article (url=`dynomight.net/vitamin-d/`).
+Same content, different domains.
+
+**Root cause.** Dedup is a 4-phase pipeline in `dedup.py`:
+- Phase 1 (URL dedup) — bucket by `normalize_url()`. No match:
+  different hostnames, different paths.
+- Phase 3 (title fuzzy) — SimHash64 + Hamming distance, gated by
+  `require_same_domain_for_fuzzy=True` (default). Titles normalize
+  to identical strings (Hamming = 0) but the domain guard
+  (`lesswrong.com` ≠ `dynomight.net`) blocks the merge.
+
+**Fix.** Two-line config change in `config.toml` under
+`[hn_rewrite.model]`:
+```toml
+dedup_title_fuzzy_enabled = true
+dedup_title_fuzzy_same_domain = false
+```
+
+The pipeline already reads these (`pipeline.py:415-421`) and passes
+them to `DedupConfig` at `_apply_dedup_to_ranked` →
+`dedup_ranked`. No code change required.
+
+**Winner selection.** When two stories cluster, the representative
+is the one with the lower `_story_sort_key` (`dedup.py:262`):
+1. Source preference rank — `hn` (0) beats `rss_lesswrong_com`
+   (3), so the HN card always wins over the LW cross-post.
+2. Higher score wins within the same source.
+3. Earlier position in the ranked list wins as tiebreak.
+
+For the vitamin D case: HN (score 383, source pref 0) beats LW
+(score 123, source pref 3) → HN card kept, LW suppressed.
+
+**False-positive risk at Hamming ≤ 2.** Two genuinely different
+articles from different domains would need near-identical titles
+to collide. SimHash word-shingling makes a single-word difference
+typically produce Hamming 3-10. The source-preference rank also
+guarantees that when such a collision does happen, the HN version
+wins — usually the right call since HN carries the discussion
+thread.
+
+**Verification.**
+- `uv run pytest tests/ -n 4` = 394 passed, 1 skipped.
+- `uv run ruff check .` = clean.
+- `uv run ty check` = no new diagnostics.
+- End-to-end on the live vitamin D pair: 2 stories in, 1 out,
+  HN card (id 48647486) kept, LW card (id -830332906) suppressed.
+
+**Files**: `config.toml` (2 added keys, 4 comment lines),
+`WORKLOG.md` (this entry).
