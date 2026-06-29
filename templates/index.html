@@ -1292,6 +1292,13 @@
       const startedAt = Date.now();
       let delayMs = 400;
       while (Date.now() - startedAt <= 30000) {
+        // Fallback: after 3s without the exact version, use whatever
+        // cached HTML the server can serve via SWR. This gives the user
+        // an intermediate deck update during rapid-vote bursts when
+        // some (but not all) intermediate warms have completed.
+        if (Date.now() - startedAt > 3000) {
+          return true;
+        }
         await new Promise(resolve => window.setTimeout(resolve, delayMs));
         try {
           const resp = await fetch(rankingReadyPath(version), { cache: 'no-store' });
