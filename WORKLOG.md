@@ -5,6 +5,122 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-29 — Reddit refresh: fix HTTPError stall, topfeed `?t=week`, top-N-hot per sub, multi-cycle prewarm
+
+**Symptom.** Multiple Reddit-related issues surfaced after the 2026-06-28
+backlog fixes were deployed. The user reported "i just want to get fresh
+reddit stories and be able to fetch their text and comments". Investigation
+uncovered:
+
+1. **Topfeed stall.** 41 topfeed tasks were enqueued at 03:45:19 UTC and
+   **zero Reddit fetches logged in the next 25+ minutes** — the live
+   service's topfeed was silently broken. Other HTTP sources (HN Algolia,
+   lesswrong, mistral) worked fine. Diagnosis: `urllib_fetch` in
+   `http_fetch.py:20` did not catch `urllib.error.HTTPError`. When both
+   httpx (Cloudflare TLS fingerprint) and urllib (same IP) got 403 from
+   Reddit's IP block, the exception propagated uncaught; the factory's
+   broad `except Exception` logged and dropped the task, and the worker
+   kept dequeuing topfeeds that all immediately failed.
+
+2. **No engagement data in RSS.** Reddit's topfeed RSS body has no
+   `<score>` or `<num_comments>` elements in any retrievable form. Saved a
+   real `r/MachineLearning/top/.rss?t=week&limit=2` body to
+   `/tmp/reddit_real.rss` and grepped: zero matches for `score|points|
+   votes|likes|comments|num_comments|upvotes|downvotes|view_count`. The
+   Reddit JSON API carries these metrics but is fully blocked for this
+   IP — 403 with 190 KB HTML block page on every sub tested, every
+   User-Agent tried (browser, Googlebot, curl, Python, no UA),
+   `old.reddit.com` and `www.reddit.com`, with and without Accept headers.
+   No path to engagement data without OAuth.
+
+3. **Half the Reddit URLs weren't using the "top of the week" sort.** 2
+   subs used `?t=month` (r/ocaml, r/ExpatFIRE), 26 subs used no `?t=`
+   at all (the bare `r/X/.rss` is "new" sort, not "top of the week").
+   User wanted all 41 on the same window.
+
+**Fixes (4 atomic commits).**
+
+1. `547eed9 fix(http): catch HTTPError in urllib_fetch` — A. The
+   `urllib_fetch` helper catches `HTTPError` and returns `(e.code, "")`
+   instead of raising. URLError (network/DNS/timeout) still propagates so
+   the caller's broad `except` in the factory body can log it. The 25-min
+   stall would have recovered on its own once the IP block cleared, but
+   the new code at least logs the 403 (`logging.warning("%s: urllib
+   fallback returned %d", url, status)` at `http_fetch.py:49`) instead
+   of silently dropping. 5 new tests in `tests/test_http_fetch.py` cover
+   200/403/429/500/URLError paths.
+
+2. `?? config: all Reddit topfeeds to ?t=week&limit=25` — B. Converted 28
+   URLs in `config.toml` (the 2 `?t=month` and 26 bare) to use the same
+   `top/.rss?t=week&limit=25` pattern as the existing 13. All 41 Reddit
+   feeds now return the same "top of the week" sort. No code change.
+
+3. `f68b3ff Reddit refresh: top-N-hot per sub, 30s stride, multi-cycle` —
+   C. The biggest change. Refactored `fetch_candidates_only` to run the
+   Reddit fetch in two phases:
+
+   - **Phase 1 (topfeed, fixed 50s stride):** All 41 subreddit topfeeds
+     are enqueued and drained before phase 2 starts. The factory writes
+     parsed Stories to `reddit_feed_cache` in the order Reddit returned
+     them (hot/score-desc).
+   - **Phase 2 (prewarm, 30s stride):** Read the cache and take the
+     first `config.reddit_prewarm_top_per_sub` (default 10) stories per
+     subreddit. With 41 subs × N=10 = 410 prewarm candidates. Per-post
+     RSS fetches for their comments are enqueued and drained with a
+     90-min timeout. The queue covers ~180/410 per cycle; the rest finish
+     in subsequent cycles (multi-cycle completion is by design).
+
+   Removed:
+   - `_extract_reddit_score_and_comments` (no-op for real Reddit RSS;
+     kept defensively for legacy variants, but the user opted to delete
+     for clarity).
+   - 3 tests for the deleted helper.
+   - 2 SQL-query-based prewarm tests (the old "WHERE comment_count > 0
+     ORDER BY score DESC" query is no longer used).
+   - `reddit_prewarm_max_per_cycle` knob (replaced by derived 41 ×
+     per_sub).
+
+   Added:
+   - `reddit_prewarm_top_per_sub` knob (default 10).
+   - `reddit_min_fetch_spacing_seconds`: 50.0 → 30.0.
+   - 3 new tests in `tests/test_pipeline.py`:
+     - `test_fetch_candidates_only_prewarms_top_n_per_sub_from_cache`:
+       3 subs × 5 stories each, N=2, verify first 2 per sub picked in
+       cache order (= hot order).
+     - `test_fetch_candidates_only_skips_reddit_prewarm_when_disabled`:
+       `prewarm_reddit_full=False` skips phase 2 entirely.
+     - `test_fetch_candidates_only_skips_reddit_prewarm_with_empty_cache`:
+       empty cache (all topfeeds failed) skips phase 2.
+
+4. WORKLOG: this entry.
+
+**Results.**
+
+- `urllib_fetch` 403 handling: fixed; stall won't recur.
+- All 41 topfeeds on `?t=week&limit=25` (consistent content window).
+- Top-N-hot per sub from cache (no engagement data needed, no JSON
+  needed).
+- Multi-cycle prewarm: 41 topfeeds + 410 prewarms enqueued per regen
+  cycle. 90-min drain covers all 41 topfeeds + ~139 prewarms
+  (≈3.4 per sub). After 3 cycles, all 410 land.
+- 329 tests pass, 1 skipped. ruff + ty clean.
+
+**Open questions (deferred).**
+
+- Engagement metrics (real `score`/`num_comments` per topfeed story)
+  would require Reddit OAuth for the JSON API. Not in scope.
+- The 34 voted Reddit stories in the DB with `comment_count=0` are
+  inert: their `comment_count` will stay 0 forever (RSS doesn't
+  carry it) until the user clicks them, at which point the on-demand
+  per-post RSS path at `server.py:247` populates the real count.
+  Pre-fix these were excluded from the prewarm by the
+  `comment_count > 0` filter; with the new cache-based prewarm they
+  are still excluded (cache only contains topfeed-parsed stories,
+  which always have `comment_count=0`). The user's actual click on
+  such a story will populate `top_comments` then.
+
+---
+
 ## 2026-06-29 — Hide refresh button + 5-vote progress bar; silent auto-refill
 
 **Symptom.** After commit 74b34d1 (every vote invalidates the cache),
