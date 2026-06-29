@@ -51,22 +51,29 @@ class User:
 
 
 class Database:
-    def __init__(self, path: str = "hn_rewrite.db") -> None:
+    def __init__(self, path: str = "hn_rewrite.db", *, read_only: bool = False) -> None:
+        self.read_only = read_only
         db_path = Path(path)
-        db_path.parent.mkdir(parents=True, exist_ok=True)
+        if not read_only:
+            db_path.parent.mkdir(parents=True, exist_ok=True)
         self.db_path = str(db_path)
         self._pool = queue.Queue()
         pool_size = 1 if self.db_path == ":memory:" else 5
         for _ in range(pool_size):
-            conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            conn.execute("PRAGMA journal_mode=WAL")
+            if read_only:
+                uri = f"file:{db_path.resolve()}?mode=ro"
+                conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+            else:
+                conn = sqlite3.connect(self.db_path, check_same_thread=False)
+                conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("PRAGMA busy_timeout=5000")
             self._pool.put(conn)
-        self._create_tables()
+        if not read_only:
+            self._create_tables()
 
     @contextmanager
-    def _conn(self) -> Generator[sqlite3.Connection, None, None]:
+    def conn(self) -> Generator[sqlite3.Connection, None, None]:
         conn = self._pool.get()
         try:
             yield conn
@@ -74,7 +81,7 @@ class Database:
             self._pool.put(conn)
 
     def _create_tables(self) -> None:
-        with self._conn() as conn:
+        with self.conn() as conn:
             with conn:
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS stories (
@@ -111,6 +118,11 @@ class Database:
                 )
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_stories_source ON stories(source)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_stories_archive_score_time "
+                    "ON stories(score DESC, time DESC) "
+                    "WHERE source IN ('bq_seed', 'ch_seed') AND text_content != ''"
                 )
 
                 conn.execute("""
@@ -266,7 +278,7 @@ class Database:
 
     # Stories
     def upsert_story(self, story: Story) -> None:
-        with self._conn() as conn:
+        with self.conn() as conn:
             # Check if the story already exists and has longer cached content
             cursor = conn.execute(
                 "SELECT self_text, top_comments, article_body FROM stories WHERE id = ?",
@@ -375,7 +387,7 @@ class Database:
         )
 
     def get_story(self, story_id: int) -> Story | None:
-        with self._conn() as conn:
+        with self.conn() as conn:
             cursor = conn.execute(
                 """
                 SELECT id, title, url, score, time, text_content, source, comment_count, discussion_url,
@@ -398,13 +410,13 @@ class Database:
                    comment_count_at_fetch, self_text, top_comments, article_body
             FROM stories WHERE id IN ({placeholders})
         """
-        with self._conn() as conn:
+        with self.conn() as conn:
             cursor = conn.execute(query, ids)
             return [self._row_to_story(row) for row in cursor.fetchall()]
 
     def prune_stories(self, max_age_days: int = 60) -> int:
         cutoff = time.time() - (max_age_days * 86400)
-        with self._conn() as conn:
+        with self.conn() as conn:
             with conn:
                 cursor = conn.execute(
                     "DELETE FROM stories WHERE fetched_at < ? "
@@ -422,7 +434,7 @@ class Database:
         vec: NDArray[np.float32],
     ) -> None:
         blob = vec.astype(np.float32).tobytes()
-        with self._conn() as conn:
+        with self.conn() as conn:
             with conn:
                 conn.execute(
                     """
@@ -439,7 +451,7 @@ class Database:
     def get_embedding(
         self, story_id: int, model_version: str, text_hash: str
     ) -> NDArray[np.float32] | None:
-        with self._conn() as conn:
+        with self.conn() as conn:
             cursor = conn.execute(
                 "SELECT embedding FROM embeddings WHERE story_id = ? AND model_version = ? AND text_hash = ?",
                 (story_id, model_version, text_hash),
@@ -460,7 +472,7 @@ class Database:
             WHERE model_version = ? AND story_id IN ({placeholders})
         """
         params = [model_version] + ids
-        with self._conn() as conn:
+        with self.conn() as conn:
             cursor = conn.execute(query, params)
             res = {}
             for row in cursor.fetchall():
@@ -471,7 +483,7 @@ class Database:
 
     # TLDR cache
     def get_tldr_cache(self, story_id: int, cache_key: str) -> str | None:
-        with self._conn() as conn:
+        with self.conn() as conn:
             row = conn.execute(
                 "SELECT tldr FROM tldr_cache WHERE story_id = ? AND cache_key = ?",
                 (story_id, cache_key),
@@ -479,7 +491,7 @@ class Database:
             return row[0] if row else None
 
     def upsert_tldr_cache(self, story_id: int, cache_key: str, tldr: str) -> None:
-        with self._conn() as conn:
+        with self.conn() as conn:
             with conn:
                 conn.execute("DELETE FROM tldr_cache WHERE story_id = ?", (story_id,))
                 conn.execute(
@@ -497,7 +509,7 @@ class Database:
         story_id: int,
         action: Action,
     ) -> None:
-        with self._conn() as conn:
+        with self.conn() as conn:
             with conn:
                 conn.execute(
                     """
@@ -511,7 +523,7 @@ class Database:
                 )
 
     def get_all_feedback(self, user_id: int | None = None) -> list[FeedbackRecord]:
-        with self._conn() as conn:
+        with self.conn() as conn:
             if user_id is not None:
                 cursor = conn.execute(
                     """
@@ -558,7 +570,7 @@ class Database:
         return counts
 
     def delete_feedback(self, user_id: int, story_id: int) -> None:
-        with self._conn() as conn:
+        with self.conn() as conn:
             with conn:
                 conn.execute(
                     "DELETE FROM feedback WHERE user_id = ? AND story_id = ?",
@@ -568,7 +580,7 @@ class Database:
     def get_feedback_for_training(
         self, user_id: int | None = None
     ) -> tuple[list[Story], list[int], list[float]]:
-        with self._conn() as conn:
+        with self.conn() as conn:
             if user_id is not None:
                 cursor = conn.execute(
                     """
@@ -635,14 +647,14 @@ class Database:
             return stories, labels, vote_times
 
     def execute(self, sql: str, params: tuple = ()) -> list[tuple]:
-        with self._conn() as conn:
+        with self.conn() as conn:
             with conn:
                 cursor = conn.execute(sql, params)
                 return cursor.fetchall()
 
     # Article fetch failure memory
     def get_article_fetch_failure(self, story_id: int) -> dict | None:
-        with self._conn() as conn:
+        with self.conn() as conn:
             row = conn.execute(
                 """
                 SELECT story_id, url, failure_count, last_status, last_error,
@@ -678,7 +690,7 @@ class Database:
         now = time.time()
         if next_retry_at is None:
             next_retry_at = now
-        with self._conn() as conn:
+        with self.conn() as conn:
             with conn:
                 conn.execute(
                     """
@@ -708,7 +720,7 @@ class Database:
                 )
 
     def clear_article_fetch_failure(self, story_id: int) -> None:
-        with self._conn() as conn:
+        with self.conn() as conn:
             with conn:
                 conn.execute(
                     "DELETE FROM article_fetch_failures WHERE story_id = ?",
@@ -717,7 +729,7 @@ class Database:
 
     # Users
     def create_user(self, token: str) -> User:
-        with self._conn() as conn:
+        with self.conn() as conn:
             with conn:
                 now = time.time()
                 conn.execute(
@@ -730,7 +742,7 @@ class Database:
                 return User(id=row[0], token=token, created_at=now)
 
     def get_user_by_token(self, token: str) -> User | None:
-        with self._conn() as conn:
+        with self.conn() as conn:
             row = conn.execute(
                 "SELECT id, token, created_at FROM users WHERE token = ?", (token,)
             ).fetchone()

@@ -1,4 +1,5 @@
 import time
+import sqlite3
 import numpy as np
 import pytest
 from hypothesis import given, strategies as st, settings, HealthCheck
@@ -72,6 +73,58 @@ def test_upsert_and_get_story(db):
     fetched2 = db.get_story(123)
     assert fetched2.title == "Updated Title"
     assert fetched2.score == 105
+
+
+def test_read_only_database_opens_existing_db_without_writes(tmp_path) -> None:
+    db_path = tmp_path / "readonly.db"
+    writable = Database(str(db_path))
+    writable.upsert_story(
+        Story(id=1, title="Stored", url=None, score=1, time=1, text_content="Text")
+    )
+    writable.close()
+
+    readonly = Database(str(db_path), read_only=True)
+    try:
+        assert readonly.get_story(1) is not None
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            readonly.upsert_story(
+                Story(
+                    id=2,
+                    title="Rejected",
+                    url=None,
+                    score=1,
+                    time=1,
+                    text_content="Text",
+                )
+            )
+    finally:
+        readonly.close()
+
+
+def test_archive_score_time_index_created(db: Database) -> None:
+    rows = db.execute(
+        """
+        SELECT sql FROM sqlite_master
+        WHERE type = 'index' AND name = 'idx_stories_archive_score_time'
+        """
+    )
+    assert rows
+    assert "score DESC" in rows[0][0]
+    assert "source IN ('bq_seed', 'ch_seed')" in rows[0][0]
+
+
+def test_archive_candidate_plan_uses_score_time_index(db: Database) -> None:
+    plan = db.execute(
+        """
+        EXPLAIN QUERY PLAN
+        SELECT id FROM stories INDEXED BY idx_stories_archive_score_time
+        WHERE source IN ('bq_seed', 'ch_seed') AND text_content != ''
+        ORDER BY score DESC, time DESC LIMIT 10
+        """
+    )
+    plan_text = "\n".join(str(row) for row in plan)
+    assert "idx_stories_archive_score_time" in plan_text
+    assert "USE TEMP B-TREE" not in plan_text
 
 
 def test_get_stories(db):

@@ -177,7 +177,7 @@ def test_first_visit_redirect(app_env):
 
 def test_dashboard_route_no_user_creates_token_and_redirects(app_env):
     port, db, _, _, _ = app_env
-    with db._conn() as conn:
+    with db.conn() as conn:
         before = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
 
     resp = httpx.get(f"http://127.0.0.1:{port}/", follow_redirects=False)
@@ -185,7 +185,7 @@ def test_dashboard_route_no_user_creates_token_and_redirects(app_env):
     assert resp.status_code == 302
     assert resp.headers["Location"].startswith("u/")
     assert "hn_token" in resp.headers.get("Set-Cookie", "")
-    with db._conn() as conn:
+    with db.conn() as conn:
         after = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     assert after == before
 
@@ -194,7 +194,7 @@ def test_dashboard_route_no_user_creates_token_and_redirects(app_env):
         follow_redirects=False,
     )
     assert follow.status_code == 302
-    with db._conn() as conn:
+    with db.conn() as conn:
         persisted = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     assert persisted == before + 1
 
@@ -638,7 +638,7 @@ def prop_db():
 def test_dashboard_cache_version_invariant_property(
     operations, prop_db, mock_embedder, monkeypatch
 ):
-    with prop_db._conn() as conn:
+    with prop_db.conn() as conn:
         with conn:
             conn.execute("DELETE FROM users")
             conn.execute("DELETE FROM stories")

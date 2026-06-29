@@ -46,7 +46,7 @@ async def main_async() -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     db = Database()
 
-    with db._conn() as conn:
+    with db.conn() as conn:
         rows = conn.execute(
             "SELECT id, url, score, comment_count, comment_count_at_fetch "
             "FROM stories WHERE source = 'rss_lesswrong_com' AND url IS NOT NULL"
