@@ -5411,6 +5411,15 @@ def test_rank_trace_reports_svm_cache_miss_then_hit(
         return np.array(rows, dtype=np.float32)
 
     monkeypatch.setattr("pipeline.get_or_compute_embeddings", fake_embeddings)
+    topk_calls = 0
+    real_topk_mean = pipeline._topk_mean
+
+    def counting_topk_mean(values: np.ndarray, k: int) -> float:
+        nonlocal topk_calls
+        topk_calls += 1
+        return real_topk_mean(values, k)
+
+    monkeypatch.setattr("pipeline._topk_mean", counting_topk_mean)
     candidate_embeddings = fake_embeddings(candidates, embedder, db)
     config = Config()
 
@@ -5426,6 +5435,9 @@ def test_rank_trace_reports_svm_cache_miss_then_hit(
     )
     assert miss_trace.labels["model_cache"] == "miss"
     assert miss_trace.timings_ms["svm_fit"] >= 0
+    assert miss_trace.timings_ms["svm_training_feature_prep"] >= 0
+    miss_topk_calls = topk_calls
+    assert miss_topk_calls > 0
 
     hit_trace = RankTrace()
     _score_and_rank(
@@ -5439,7 +5451,9 @@ def test_rank_trace_reports_svm_cache_miss_then_hit(
     )
     assert hit_trace.labels["model_cache"] == "hit"
     assert "svm_fit" not in hit_trace.timings_ms
+    assert "svm_training_feature_prep" not in hit_trace.timings_ms
     assert hit_trace.timings_ms["decision"] >= 0
+    assert topk_calls == miss_topk_calls
 
 
 def test_is_recent_flag_inclusive_30d_boundary(

@@ -5,6 +5,21 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-29 — RankTrace cache-hit LOOCV recovery repair
+
+**Fix.** The first `RankTrace` recovery accidentally left the old untraced
+SVM training-feature block duplicated after the new cache-aware branch in
+`_score_and_rank`. Model-cache hits skipped `SVC.fit()` but still rebuilt
+LOOCV feedback features, and the trace under-reported that work. Removed the
+duplicate block so cache hits now do only candidate feature prep, candidate
+scaling, and `decision_function`.
+
+**Tests.** Strengthened the miss→hit trace regression to count LOOCV
+`_topk_mean` calls and assert cache hits do not emit
+`svm_training_feature_prep_ms`.
+
+---
+
 ## 2026-06-29 — Rank-path instrumentation and cold/warm SVM benchmark
 
 **Goal.** Make heavy-vote reload latency diagnosable before changing the
