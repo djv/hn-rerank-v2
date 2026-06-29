@@ -5,6 +5,36 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-29 — Cap-size sweep tooling + recommendation (hn=2000)
+
+**Goal.** Find the smallest `recent_candidate_hn_limit` value that
+recovers the lost primary stories from the shipped default of 1500,
+without sacrificing the latency win.
+
+**Tools added.** `scripts/cap_loss_check.py` (single-cap diff by
+title and source) and `scripts/cap_sweep.py` (multi-cap sweep with
+per-badge loss breakdown). Both use `dataclasses.replace(config, ...)`
+to override the two cap fields; no DB or pipeline monkey-patching.
+
+**Findings.** See `notes/cap-sweep-2026-06-29.md` for the full table
+and vibecheck. The shipped `hn=1500` default loses 2–3 primary
+stories (e.g. "Alzheimer's patient gets back speech…") that rank just
+past the SQL cutoff; the gained replacements are `ch_seed` archive
+stories, some of which are years old. Bumping to `hn=2000` keeps the
+latency win (candidates go 5,808 → 6,188) and recovers the discovery
+pass losses (0 similar / 0 uncertain). Bumping to `hn=5000` recovers
+all primary losses but doubles the candidate count. **Recommended
+default: `hn=2000`.**
+
+The 5 non-HN losses are invariant across all HN caps; they're bound
+by `rss_limit=500`. Bump that separately if non-HN representation
+matters.
+
+**No code change in this commit** — just the tooling and findings doc.
+The `hn=2000` default is pending a follow-up commit.
+
+---
+
 ## 2026-06-29 — NullTrace sentinel + do_POST split + GraphQL parameterization
 
 Three structural cleanups from the improvement-areas plan.
