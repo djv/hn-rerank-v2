@@ -2488,7 +2488,7 @@ def rerank_candidates(
         if not combo_pool:
             continue
 
-        source_key = age + ("_hn" if source == "hn" else "_nonhn")
+        source_key = age + ("_hn" if source == "hn" else "_non-hn")
         mixed_key = age + "_mixed"
 
         # --- Primary selection ---
