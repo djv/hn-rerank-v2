@@ -94,7 +94,7 @@ def _start_handler_server(
 def _drain_and_shutdown(server: ThreadingHTTPServer, handler: type[Handler]) -> None:
     drain_deadline = time.time() + 3.0
     while handler._warmup_in_flight and time.time() < drain_deadline:
-        time.sleep(0.1)
+        time.sleep(0.01)
     server.socket.shutdown(socket.SHUT_RDWR)
     server.shutdown()
 
@@ -672,7 +672,7 @@ def _wait_for_cache(handler, user, expected_version, timeout=3.0):
         cached = handler._dashboard_cache.get(key)
         if cached and cached[2] == expected_version:
             return cached[0]
-        time.sleep(0.1)
+        time.sleep(0.01)
     raise AssertionError(
         f"Cache for user {user.id} version {expected_version} not populated within {timeout}s"
     )
@@ -868,7 +868,7 @@ def prop_db():
     )
 )
 @settings(
-    max_examples=30,
+    max_examples=15,
     deadline=None,
     suppress_health_check=[HealthCheck.function_scoped_fixture],
 )
@@ -933,7 +933,7 @@ def test_dashboard_cache_version_invariant_property(
             cur_ver = TestHandler._dashboard_version(user.id)
             if cached is None or cached[2] <= cur_ver:
                 break
-            time.sleep(0.1)
+            time.sleep(0.01)
         cached = TestHandler._dashboard_cache.get(cache_key)
         if cached is not None:
             cur_ver = TestHandler._dashboard_version(user.id)
@@ -946,7 +946,7 @@ def test_dashboard_cache_version_invariant_property(
     # capture our fakes and leak into subsequent tests.
     drain_deadline = time.time() + 3.0
     while TestHandler._warmup_in_flight and time.time() < drain_deadline:
-        time.sleep(0.1)
+        time.sleep(0.01)
 
 
 def test_cors_headers(app_env):

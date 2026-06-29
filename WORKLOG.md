@@ -5017,3 +5017,53 @@ thread.
 
 **Files**: `config.toml` (2 added keys, 4 comment lines),
 `WORKLOG.md` (this entry).
+
+---
+
+## 2026-06-29 — Test suite profile + 4 quick wins (18.6s → 13.1s, -30%)
+
+**Profile.** Single-run durations and cProfile
+(`tests/test_eval_ranker_variants.py` = 10.3s, `test_server.py` = 11.75s,
+`test_pipeline.py` = 8.31s with module-scoped embedder) flagged four
+hotspots: the `eval_ranker_variants` smoke test (subprocess + 5000
+candidates), the `--help` subprocess (pays full sklearn + onnx import
+for argparse), the cache-version property test (30 Hypothesis examples
+with 0.1s polling), and per-test 0.1s sleep loops in
+`_drain_and_shutdown` / `_wait_for_cache`.
+
+**Fixes.**
+1. `tests/test_eval_ranker_variants.py`: dropped
+   `--max-candidates` from 5000 → 2000 in `test_leak_check_smoke`
+   (TSCV is linear in N; 2000 is still ample for the `<0.5` leak
+   ratio). Docstring updated to match.
+2. `tests/test_eval_ranker_variants.py`: replaced
+   `test_leak_check_flag_in_help`'s `subprocess.run(["uv", "run",
+   "python", ..., "--help"])` with `ast.parse(SCRIPT.read_text())`
+   walk over `argparse.ArgumentParser.add_argument` calls looking
+   for the `--leak-check` constant. Still catches accidental flag
+   removal; drops the 2.5s sklearn+onnx import cost.
+3. `tests/test_server.py`: 4× `time.sleep(0.1)` → `time.sleep(0.01)`
+   in `_drain_and_shutdown` (line 97), `_wait_for_cache` (line 675),
+   and both polling loops of the cache-version property test
+   (lines 936, 949). Line 848 (`test_stale_warm_does_not_overwrite_…`)
+   kept at 0.05s — it waits for a real blocking thread, not a fast
+   fake. `_WARM_DEBOUNCE_S` was already 0.01 in the test handlers.
+4. `tests/test_server.py`: `@settings(max_examples=30)` → `15` on
+   `test_dashboard_cache_version_invariant_property`. The invariant
+   is monotonic; 15 examples still give solid coverage.
+
+**Verification.**
+- `uv run pytest tests/ -n 4` = 411 passed, 1 skipped in **13.08s**
+  (was 18.61s).
+- `test_eval_ranker_variants.py::test_leak_check_smoke`: 8.4s → 6.7s.
+- `test_server.py::test_dashboard_cache_version_invariant_property`:
+  3.07s → 0.34s.
+- `uv run ruff check tests/test_server.py tests/test_eval_ranker_variants.py`
+  = clean.
+- `uv run ty check tests/test_server.py tests/test_eval_ranker_variants.py`
+  = clean.
+
+**Files**: `tests/test_server.py` (4 sleep edits, 1
+`max_examples` edit), `tests/test_eval_ranker_variants.py` (1
+docstring, 1 candidates count, 1 `--help` test rewrite to AST),
+`WORKLOG.md` (this entry).

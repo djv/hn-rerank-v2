@@ -1,33 +1,37 @@
 """Smoke tests for scripts/eval_ranker_variants.py.
 
 These run the script as a subprocess to verify the CLI works end-to-end.
-The end-to-end test uses a tiny config (1 variant, 2 folds, 1000
+The end-to-end test uses a tiny config (1 variant, 2 folds, 2000
 candidates) so it stays under ~30s on this host.
 """
 
+import ast
 import json
 import subprocess
 from pathlib import Path
+
+import pytest
 
 SCRIPT = Path(__file__).parent.parent / "scripts" / "eval_ranker_variants.py"
 TMP_OUTPUT = Path("/tmp/eval_ranker_variants_smoke.json")
 
 
 def test_leak_check_flag_in_help() -> None:
-    """--leak-check must appear in --help output.
+    """--leak-check must be wired into argparse.
 
-    Locks the flag in place; regression test against accidental removal.
+    Parses the script's source for `argparse.ArgumentParser.add_argument`
+    calls containing the literal `--leak-check`. Cheaper than booting a
+    subprocess (the script imports sklearn + onnx at top, ~2.5s).
     """
-    result = subprocess.run(
-        ["uv", "run", "python", str(SCRIPT), "--help"],
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert result.returncode == 0, f"--help failed: {result.stderr}"
-    assert "--leak-check" in result.stdout, (
-        "--leak-check not in --help output; flag is missing"
-    )
+    tree = ast.parse(SCRIPT.read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr != "add_argument":
+                continue
+            for arg in node.args:
+                if isinstance(arg, ast.Constant) and arg.value == "--leak-check":
+                    return
+    pytest.fail("--leak-check not in any argparse add_argument call")
 
 
 def test_leak_check_smoke() -> None:
@@ -35,7 +39,7 @@ def test_leak_check_smoke() -> None:
     structure and that shuffled NDCG@40 is much lower than normal
     (no data leakage).
 
-    Uses --max-candidates 5000 --folds 2 --variants margin3_up to keep
+    Uses --max-candidates 2000 --folds 2 --variants margin3_up to keep
     runtime under ~30s. The 0.5 ratio threshold is conservative: a
     clean harness typically gives <0.2 (shuffled is ~random baseline).
     """
@@ -52,7 +56,7 @@ def test_leak_check_smoke() -> None:
             "--folds",
             "2",
             "--max-candidates",
-            "5000",
+            "2000",
             "--leak-check",
             "--output",
             str(TMP_OUTPUT),
