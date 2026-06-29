@@ -5,6 +5,23 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-29 — Make SVM variant experiment import-safe
+
+**Fix.** Renamed `scripts/test_svm_variants.py` to
+`scripts/run_svm_variants.py` so pytest no longer treats the manual
+experiment as a test module. Moved all execution behind `main()` and the
+`__name__ == "__main__"` guard, replaced host-absolute paths with
+repo-root-relative paths, and added a tracked dirty-worktree preflight
+before the script writes `config.toml`, `pipeline.py`, or `eval.py`.
+
+**Safety.** Manual runs now restore those three tracked files in a
+`finally` block even if an eval trial fails or times out. Untracked files
+are reported but do not block; tracked changes require `--force-dirty`.
+
+**Command.** `uv run python scripts/run_svm_variants.py`
+
+---
+
 ## 2026-06-29 — RankTrace cache-hit LOOCV recovery repair
 
 **Fix.** The first `RankTrace` recovery accidentally left the old untraced
