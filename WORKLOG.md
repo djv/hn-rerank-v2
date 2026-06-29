@@ -5,6 +5,107 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-29 — Hide refresh button + 5-vote progress bar; silent auto-refill
+
+**Symptom.** After commit 74b34d1 (every vote invalidates the cache),
+the server started returning `ranking_refresh_queued: true` on every
+vote. The client still treated that as a "user should see the refresh
+banner" signal, so every vote now triggered a 2.5s preload followed by
+a "New ranking ready" button. The 5-vote progress bar (which the same
+commit had flagged as cosmetic — "the threshold is met on every vote")
+was still filling on every vote. The result: a refresh button on every
+vote, and a progress bar that the user has to mentally re-zero.
+
+**Design.** Decouple the user-facing "ranking refresh" UI from the
+server's cache-invalidation signal. The server still invalidates the
+cache and warms on every vote (the correctness guarantee from 74b34d1
+is preserved). The client no longer surfaces a banner, button, or
+progress bar. Instead, after every successful vote save the client
+silently fetches the new dashboard HTML and replaces the non-active
+cards; on every sort/age/source tab click it does the same. The
+defense-in-depth `votedStoryIds` filter (the SWR stale-hit fix from
+74b34d1) is kept — it's still the safety net if the server's warm
+hasn't completed by the time the client fetches.
+
+**Files.**
+- `templates/index.html` — removed the `<div id="refresh-banner">`,
+  the 5-segment progress bar, the refresh-wrapper/label/segments CSS,
+  the `updateRefreshBanner` / `markVoteSaving` / `refillWhenReady` /
+  `scheduleRefillPreload` / `updateRefreshProgress` /
+  `updateQueueStatus` functions, the 2.5s preload state, and the
+  `pendingFeedbackRequests` / `refillQueued` / `votesSinceRankingRefresh`
+  / `preloadedRefillDoc` / `isPreloadingRefill` / `preloadRefillPromise`
+  state. Added a `<div id="toast" role="status" aria-live="polite">`
+  element (~30 lines of CSS, auto-dismisses after 3s) and a
+  `showToast(message, variant)` function. Added a `silentRefill()`
+  function that calls `refillQueue({ forceFetch: true })` with an
+  `isRefilling` re-entry guard. Wired `silentRefill()` into the
+  `.then` of both `submitVote` and `undoLastVote`, and into
+  `setSort` / `setAge` / `setSource` and `maybeRefillQueue`.
+  Simplified `refillQueue` to drop the preloaded-doc branch (always
+  fetches fresh now). On errors, the `submitVote` and `undoLastVote`
+  catch handlers call `showToast('… failed to save', 'error')` instead
+  of updating the now-removed banner. Dropped the 4th `refreshRanking`
+  argument from `sendFeedback` (no caller used it after the 5-vote
+  counter was removed). Vote-bar layout: changed `justify-content`
+  from `space-between` to `flex-end` and removed `margin-left: auto`
+  from `.vote-counts` (the two remaining children are counts + buttons,
+  both right-aligned). `refillQueue` now re-applies the active sort
+  for the deterministic modes (recommended/date) after appending new
+  cards from the server; popular/explore (shuffle) are intentionally
+  skipped to avoid reshuffling on every vote.
+- `server.py` — **untouched**. `do_POST /api/feedback` continues to
+  invalidate the cache and warm on every vote, and continues to
+  return `ranking_refresh_queued: true` in the response. The field
+  is now unused on the client (no banner to gate) but harmless and
+  preserved for any future feature that wants the signal.
+- `tests/test_server.py` — replaced `test_dashboard_has_segmented_refresh_progress_bar`
+  with `test_dashboard_has_no_refresh_button_or_progress_bar` (asserts
+  all old refresh-* elements/classes are gone and the new toast +
+  showToast + silentRefill are present). Replaced
+  `test_setSort_consumes_pending_refill_on_tab_click` with
+  `test_setSort_triggers_silent_refill_on_tab_click` (and parity
+  tests for setAge and setSource). Updated
+  `test_static_serving` to assert `id="toast"` is present and
+  `id="refresh-banner"` / `id="refresh-now-btn"` /
+  `class="refresh-progress"` are absent. Updated
+  `test_static_template_structure` to drop the 4 progress-bar/label
+  assertions and add toast + flex-end + margin-left-auto checks.
+  Added `test_submitVote_silently_refills_on_success`,
+  `test_undoLastVote_silently_refills_on_success`,
+  `test_silentRefill_serializes_concurrent_calls`,
+  `test_refillQueue_reorders_deterministic_modes_only`, and
+  `test_showToast_dismisses_after_3s`. `test_inline_script_has_voted_story_ids_filter`
+  is unchanged — the defense-in-depth rollback in the submitVote
+  catch handler is still present.
+
+**Impact.** The user-facing refresh UI is gone. Every vote and every
+mode change does a silent refill in the background (~200 ms in the
+warm-cache case). The 5-vote counter is gone (it was cosmetic since
+74b34d1). Vote/undo save errors are surfaced as a 3-second toast
+instead of a sticky banner.
+
+**Verification.** `uv run pytest tests/ -n 4` = 367 passed, 1 skipped
+(in 21.84s — same as the pre-change baseline; no ONNX loads added).
+`uv run ruff check .` = all clear. `uv run ty check` = all clear.
+No new `ty` diagnostics.
+
+**Open questions.**
+- The `ranking_refresh_queued: true` response field is now unused on
+  the client. It's harmless to leave (one bool in a JSON response)
+  and keeps the door open for a future client-side feature that
+  wants the signal. If we ever drop the field, `server.py` is the
+  only file that needs to change.
+- `orderForCurrentSort` in the shuffle modes (popular/explore) does
+  not run after a refill, by design (see comment in `refillQueue`).
+  Users on those modes will see new cards arrive in recommended
+  order; clicking the sort tab again re-shuffles. This is a
+  conscious trade-off — the alternative (reshuffle on every vote)
+  was judged worse. If a future refactor adds server-side sort
+  awareness, this can be revisited.
+
+---
+
 ## 2026-06-28 — Reddit backlog: prewarm query + parser fix + dead-row cleanup
 
 **Symptom.** Checked the Reddit backlog: 1,134 stories with empty

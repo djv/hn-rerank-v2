@@ -105,28 +105,30 @@
     .queue-pill--bar {
       padding: 0.4rem 0.45rem;
     }
-    .refresh-progress {
-      display: flex;
-      gap: 3px;
-      height: 8px;
+
+    .toast {
+      position: fixed;
+      top: 0.75rem;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 1000;
+      max-width: min(90vw, 360px);
+      padding: 0.5rem 0.85rem;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.97);
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
+      color: #212529;
+      font-size: 0.85rem;
+      border: 1px solid rgba(0, 0, 0, 0.12);
+      text-align: center;
     }
-    .refresh-segment {
-      flex: 1;
-      border-radius: 2px;
-      background: rgba(0, 0, 0, 0.12);
-      border: 1px solid rgba(0, 0, 0, 0.08);
-      transition: background-color 200ms ease;
+    .toast[hidden] { display: none; }
+    .toast--error {
+      border-color: #dc3545;
+      color: #842029;
     }
-    .refresh-segment.filled {
-      background: var(--pico-primary);
-      border-color: var(--pico-primary);
-    }
-    .refresh-segment.next-refresh {
-      animation: pulse-segment 600ms ease-in-out 2;
-    }
-    @keyframes pulse-segment {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.45; }
+    .toast--info {
+      border-color: rgba(0, 0, 0, 0.12);
     }
 
     .sort-tabs {
@@ -510,26 +512,12 @@
       padding-bottom: calc(0.5rem + env(safe-area-inset-bottom, 0));
       display: flex;
       align-items: center;
-      justify-content: space-between;
+      justify-content: flex-end;
       gap: 0.6rem;
       max-width: 1280px;
       margin: 0 auto;
     }
     .vote-bar[hidden] { display: none; }
-
-    .vote-bar .refresh-wrapper {
-      display: flex;
-      flex-direction: column;
-      gap: 0.3rem;
-      align-items: flex-start;
-    }
-
-    .vote-bar .refresh-label {
-      font-size: 0.75rem;
-      color: var(--pico-muted-color);
-      white-space: nowrap;
-      font-weight: 500;
-    }
 
     .vote-counts {
       display: flex;
@@ -538,7 +526,6 @@
       font-weight: 500;
       color: var(--pico-muted-color);
       align-items: center;
-      margin-left: auto;
     }
     .vote-count {
       display: inline-flex;
@@ -552,13 +539,6 @@
     .vote-count--up { color: #28a745; }
     .vote-count--neutral { color: #ffc107; }
     .vote-count--down { color: #dc3545; }
-
-    .vote-bar .refresh-progress {
-      display: flex;
-      gap: 3px;
-      width: 120px;
-      height: 6px;
-    }
 
     .feedback-btn {
       padding: 0.5rem 0.9rem;
@@ -838,10 +818,7 @@
   </style>
 </head>
 <body>
-  <div id="refresh-banner" class="refresh-banner" hidden>
-    <span id="refresh-banner-text">Ranking updated</span>
-    <button type="button" id="refresh-now-btn">Refresh</button>
-  </div>
+  <div id="toast" class="toast" hidden role="status" aria-live="polite"></div>
 
   <main class="container swipe-shell">
     <div class="swipe-layout">
@@ -942,16 +919,6 @@
   </main>
 
   <div class="vote-bar" hidden>
-    <div class="refresh-wrapper">
-      <span class="refresh-label">Votes until refresh</span>
-      <div class="refresh-progress" aria-label="Ranking refresh progress" role="progressbar" aria-valuemin="0" aria-valuemax="5" aria-valuenow="0">
-        <span class="refresh-segment" data-segment="1"></span>
-        <span class="refresh-segment" data-segment="2"></span>
-        <span class="refresh-segment" data-segment="3"></span>
-        <span class="refresh-segment" data-segment="4"></span>
-        <span class="refresh-segment" data-segment="5"></span>
-      </div>
-    </div>
     <div class="vote-counts" aria-label="Your all-time vote counts">
       <span class="vote-count vote-count--up">
         <span class="vote-count-glyph" aria-hidden="true">▲</span>
@@ -989,32 +956,24 @@
 
     // Swipe deck state
     const storiesContainer = document.getElementById('stories');
-    const refreshBanner = document.getElementById('refresh-banner');
-    const refreshBannerText = document.getElementById('refresh-banner-text');
-    const refreshNowBtn = document.getElementById('refresh-now-btn');
+    const toastEl = document.getElementById('toast');
     const sortTabs = Array.from(document.querySelectorAll('[data-sort]'));
     const ageTabs = Array.from(document.querySelectorAll('[data-age]'));
     const sourceTabs = Array.from(document.querySelectorAll('[data-source]'));
     const voteBar = document.querySelector('.vote-bar');
-    let pendingFeedbackRequests = 0;
-    let refillQueued = false;
     let isRefilling = false;
     let activeCard = null;
     let lastVote = null;
     let currentSort = 'recommended';
     let currentAge = 'recent';
     let currentSource = 'mixed';
-    let votesSinceRankingRefresh = 0;
-    let preloadedRefillDoc = null;
-    let isPreloadingRefill = false;
-    let preloadRefillPromise = null;
     const votedStoryIds = new Set();
     const MAX_QUEUE = 12;
     const LOW_WATERMARK = 4;
     const PREFETCH_COUNT = 3;
     const IDLE_INACTIVE_PREFETCH_COUNT = 3;
-    const VOTES_PER_RANKING_REFRESH = 5;
     let idleAgePrefetchHandle = null;
+    let toastTimer = null;
 
     function cards() {
       return Array.from(storiesContainer.querySelectorAll('.story-card'));
@@ -1089,22 +1048,6 @@
       else shuffleStories();
     }
 
-    function updateRefreshProgress() {
-      const filledCount = votesSinceRankingRefresh;
-      const segments = document.querySelectorAll('.vote-bar .refresh-segment');
-      segments.forEach((seg, idx) => {
-        const isFilled = idx < filledCount;
-        seg.classList.toggle('filled', isFilled);
-        seg.classList.toggle('next-refresh', filledCount === VOTES_PER_RANKING_REFRESH && isFilled);
-      });
-      const progressBar = document.querySelector('.vote-bar .refresh-progress');
-      progressBar?.setAttribute('aria-valuenow', String(Math.min(filledCount, VOTES_PER_RANKING_REFRESH)));
-    }
-
-    function updateQueueStatus() {
-      updateRefreshProgress();
-    }
-
     function setActiveCard(card) {
       cards().forEach(c => c.classList.toggle('active', c === card));
       activeCard = card || null;
@@ -1118,7 +1061,6 @@
       }
       prefetchUpcomingTldrs();
       scheduleIdleAgePrefetch();
-      updateQueueStatus();
       maybeRefillQueue();
     }
 
@@ -1140,10 +1082,7 @@
       if (activeCard && !matchesCurrentAxes(activeCard)) {
         activeCard.classList.remove('active');
       }
-      if (refillQueued) {
-        refillWhenReady();
-      }
-      orderForCurrentSort();
+      silentRefill();
       showNextCard();
       scheduleIdleAgePrefetch();
     }
@@ -1156,9 +1095,7 @@
       if (activeCard && !matchesCurrentAxes(activeCard)) {
         activeCard.classList.remove('active');
       }
-      if (refillQueued) {
-        refillWhenReady();
-      }
+      silentRefill();
       showNextCard();
       scheduleIdleAgePrefetch();
     }
@@ -1171,8 +1108,8 @@
       if (activeCard && !matchesCurrentAxes(activeCard)) {
         activeCard.classList.remove('active');
       }
+      silentRefill();
       showNextCard();
-      updateQueueStatus();
     }
 
     applyGradient();
@@ -1223,62 +1160,32 @@
       });
     }
 
-    function updateRefreshBanner() {
-      const hasPending = pendingFeedbackRequests > 0;
-      const isReady =
-        refillQueued &&
-        preloadedRefillDoc !== null &&
-        !isRefilling &&
-        !hasPending;
-      const isPreparing =
-        refillQueued &&
-        !isReady &&
-        !isRefilling &&
-        !hasPending;
-      const shouldShow = hasPending || isRefilling || isPreparing || isReady;
-
-      refreshBanner.hidden = !shouldShow;
-      refreshNowBtn.hidden = !isReady;
-
-      if (!shouldShow) return;
-      if (isRefilling) {
-        refreshBannerText.textContent = 'Refilling queue...';
-      } else if (hasPending) {
-        const label = pendingFeedbackRequests === 1 ? '1 vote saving' : `${pendingFeedbackRequests} votes saving`;
-        refreshBannerText.textContent = `${label} syncing`;
-      } else if (isPreparing) {
-        refreshBannerText.textContent = 'Preparing refresh...';
-      } else if (isReady) {
-        refreshBannerText.textContent = 'New ranking ready';
+    function showToast(message, variant) {
+      const kind = variant || 'info';
+      toastEl.textContent = message;
+      toastEl.className = `toast toast--${kind}`;
+      toastEl.hidden = false;
+      if (toastTimer) {
+        clearTimeout(toastTimer);
       }
+      toastTimer = window.setTimeout(() => {
+        toastEl.hidden = true;
+        toastTimer = null;
+      }, 3000);
     }
 
-    function markVoteSaving() {
-      updateRefreshBanner();
-    }
-
-    async function refillWhenReady() {
+    async function silentRefill() {
       if (isRefilling) return;
-      refillQueued = true;
-      updateRefreshBanner();
-      if (pendingFeedbackRequests > 0) return;
-
       isRefilling = true;
-      updateRefreshBanner();
-      updateQueueStatus();
       try {
-        await refillQueue();
+        await refillQueue({ forceFetch: true });
       } catch (err) {
-        console.error('Failed to refill queue', err);
+        console.error('Failed to silently refill queue', err);
       } finally {
         isRefilling = false;
-        refillQueued = false;
-        updateQueueStatus();
-        updateRefreshBanner();
       }
     }
 
-    refreshNowBtn.addEventListener('click', refillWhenReady);
     sortTabs.forEach(tab => {
       tab.addEventListener('click', () => setSort(tab.dataset.sort));
     });
@@ -1316,37 +1223,8 @@
       return parser.parseFromString(htmlText, 'text/html');
     }
 
-    function scheduleRefillPreload() {
-      if (preloadRefillPromise || preloadedRefillDoc) {
-        return;
-      }
-      isPreloadingRefill = true;
-      preloadRefillPromise = new Promise(resolve => {
-        window.setTimeout(resolve, 2500);
-      }).then(async () => {
-        preloadedRefillDoc = await fetchRefillDoc();
-        return preloadedRefillDoc;
-      }).catch(err => {
-        console.error('Failed to preload refreshed queue', err);
-        return null;
-      }).finally(() => {
-        preloadRefillPromise = null;
-        isPreloadingRefill = false;
-        updateRefreshBanner();
-      });
-    }
-
-    async function refillQueue({ forceFetch = false } = {}) {
-      let newDoc = preloadedRefillDoc;
-      if (forceFetch || !newDoc) {
-        if (!forceFetch && preloadRefillPromise) {
-          newDoc = await preloadRefillPromise;
-        }
-        if (!newDoc) {
-          newDoc = await fetchRefillDoc();
-        }
-      }
-      preloadedRefillDoc = null;
+    async function refillQueue({ forceFetch: _forceFetch = false } = {}) {
+      const newDoc = await fetchRefillDoc();
       const newStories = newDoc.getElementById('stories');
       if (!newStories) {
         throw new Error('Refill failed: stories container missing');
@@ -1380,6 +1258,12 @@
 
       applyGradient();
       bindEvents();
+      // The server returns cards in recommended order. Re-apply the active
+      // sort for the deterministic modes (recommended/date). Skip popular/
+      // explore (shuffle) to avoid reshuffling on every vote.
+      if (currentSort === 'recommended' || currentSort === 'date') {
+        orderForCurrentSort();
+      }
       if (!activeCard || activeCard.dataset.voted) {
         showNextCard();
       }
@@ -1418,11 +1302,11 @@
 
 
     function maybeRefillQueue() {
-      if (queuedCards().length > LOW_WATERMARK || isRefilling || refillQueued) {
+      if (queuedCards().length > LOW_WATERMARK || isRefilling) {
         return;
       }
       if (!activeCard) {
-        refillWhenReady();
+        silentRefill();
       }
     }
 
@@ -1464,7 +1348,7 @@
       }
     }
 
-    function sendFeedback(storyId, action, queueRemaining, refreshRanking = false) {
+    function sendFeedback(storyId, action, queueRemaining) {
       const apiPath = window.location.pathname.startsWith('/rewrite') ? '/rewrite/api/feedback' : '/api/feedback';
       return fetch(apiPath, {
         method: 'POST',
@@ -1473,7 +1357,6 @@
           story_id: storyId,
           action,
           queue_remaining: queueRemaining,
-          refresh_ranking: refreshRanking
         })
       }).then(resp => {
         if (!resp.ok) {
@@ -1490,14 +1373,6 @@
 
       const storyId = Number(card.dataset.storyId);
       votedStoryIds.add(storyId);
-      const applyExistingRefillAfterVote = refillQueued && pendingFeedbackRequests === 0;
-      votesSinceRankingRefresh += 1;
-      updateRefreshProgress();
-      const shouldRefreshRanking = votesSinceRankingRefresh >= VOTES_PER_RANKING_REFRESH;
-      if (shouldRefreshRanking) {
-        votesSinceRankingRefresh = 0;
-        updateRefreshProgress();
-      }
       card.dataset.voted = action;
       document.querySelectorAll('[data-fb]').forEach(btn => {
         btn.classList.toggle('active', btn.dataset.fb === action);
@@ -1527,36 +1402,17 @@
       }, 150);
 
       const queueRemaining = queuedCards().length;
-      pendingFeedbackRequests += 1;
-      markVoteSaving();
-
-      const savePromise = sendFeedback(
-        storyId,
-        action,
-        queueRemaining,
-        shouldRefreshRanking
-      ).then(data => {
-        if (data.ranking_refresh_queued) {
-          refillQueued = true;
-          scheduleRefillPreload();
-        }
-        return data;
-      }).catch(err => {
-        console.error('Network error submitting feedback', err);
-        votedStoryIds.delete(storyId);
-        delete card.dataset.voted;
-        refreshBannerText.textContent = 'Vote failed to save';
-        refreshBanner.hidden = false;
-        refreshNowBtn.hidden = true;
-      }).finally(() => {
-        pendingFeedbackRequests = Math.max(0, pendingFeedbackRequests - 1);
-        if (applyExistingRefillAfterVote && pendingFeedbackRequests === 0) {
-          window.setTimeout(refillWhenReady, 250);
-        } else {
-          updateRefreshBanner();
-          maybeRefillQueue();
-        }
-      });
+      const savePromise = sendFeedback(storyId, action, queueRemaining)
+        .then(data => {
+          silentRefill();
+          return data;
+        })
+        .catch(err => {
+          console.error('Network error submitting feedback', err);
+          votedStoryIds.delete(storyId);
+          delete card.dataset.voted;
+          showToast('Vote failed to save', 'error');
+        });
 
       lastVote = { storyId, action, card, savePromise };
     }
@@ -1581,24 +1437,14 @@
       bindEvents();
       setActiveCard(card);
 
-      pendingFeedbackRequests += 1;
-      markVoteSaving();
       Promise.resolve(savePromise).finally(() => {
-        return sendFeedback(storyId, 'clear', queuedCards().length, true);
+        return sendFeedback(storyId, 'clear', queuedCards().length);
       }).then(data => {
-        if (data.ranking_refresh_queued) {
-          refillQueued = true;
-          preloadedRefillDoc = null;
-          scheduleRefillPreload();
-        }
+        silentRefill();
+        return data;
       }).catch(err => {
         console.error('Network error undoing feedback', err);
-        refreshBannerText.textContent = 'Undo failed to save';
-        refreshBanner.hidden = false;
-        refreshNowBtn.hidden = true;
-      }).finally(() => {
-        pendingFeedbackRequests = Math.max(0, pendingFeedbackRequests - 1);
-        updateRefreshBanner();
+        showToast('Undo failed to save', 'error');
       });
     }
 

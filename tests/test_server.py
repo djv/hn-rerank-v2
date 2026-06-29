@@ -219,9 +219,12 @@ def test_static_serving(test_env):
     assert 'data-sort="date"' in resp.text
     assert 'data-age="recent"' in resp.text
     assert 'data-age="archive"' in resp.text
-    assert 'class="refresh-progress"' in resp.text
+    assert 'id="toast"' in resp.text
+    assert 'class="refresh-progress"' not in resp.text
     assert 'id="sort-toggle"' not in resp.text
     assert 'id="queue-status"' not in resp.text
+    assert 'id="refresh-banner"' not in resp.text
+    assert 'id="refresh-now-btn"' not in resp.text
 
 
 def test_feedback_post(test_env):
@@ -1332,29 +1335,38 @@ def test_keydown_guard_excludes_buttons_and_anchors():
     assert '[contenteditable="true"]' in guard, "contenteditable should still block"
 
 
-def test_dashboard_has_segmented_refresh_progress_bar():
-    """Regression: the queue-status element must be a 5-segment progress bar
-    that fills as the user votes toward the ranking refresh threshold,
-    not a text field showing story counts.
+def test_dashboard_has_no_refresh_button_or_progress_bar():
+    """The refresh button and the 5-vote progress bar were removed (2026-06-29):
+    the server still invalidates the cache on every vote, but the client
+    silently refills the queue on every successful vote save and on every
+    sort/age/source tab click — no user-facing button or bar to wait for.
     """
     template = (
         Path(__file__).resolve().parents[1] / "templates" / "index.html"
     ).read_text(encoding="utf-8")
-    # New bar element present
-    assert 'id="queue-status"' not in template
-    assert 'class="refresh-progress"' in template
-    # Exactly 5 segments
-    segment_count = template.count('class="refresh-segment"')
-    assert segment_count == 5, f"expected 5 segments, found {segment_count}"
-    # Pulse animation present
-    assert "pulse-segment" in template
-    # Bar role for accessibility
-    assert 'role="progressbar"' in template
+    # Old refresh UI is gone
+    assert 'id="refresh-banner"' not in template
+    assert 'id="refresh-now-btn"' not in template
+    assert 'class="refresh-progress"' not in template
+    assert 'class="refresh-segment"' not in template
+    assert 'class="refresh-wrapper"' not in template
+    assert 'class="refresh-label"' not in template
+    assert "pulse-segment" not in template
+    assert 'role="progressbar"' not in template
+    assert "VOTES_PER_RANKING_REFRESH" not in template
+    assert "refresh-progress" not in template.split("</style>", 1)[0]
+    # New toast element is present and accessible
+    assert 'id="toast"' in template
+    assert 'role="status"' in template
+    assert 'aria-live="polite"' in template
+    assert 'class="toast"' in template
+    assert "showToast" in template
+    assert "silentRefill" in template
     # 'u undo' hint removed from the legend
     assert '<span class="key-hint">u</span> undo' not in template, (
         "undo hint should be hidden from the visible legend"
     )
-    # Vote counts element present alongside progress bar
+    # Vote counts element still present
     assert 'class="vote-counts"' in template
     assert template.count('data-vote-count="up"') == 1
     assert template.count('data-vote-count="neutral"') == 1
@@ -1661,15 +1673,21 @@ def test_keydown_uses_letter_keys():
     )
     assert ".vote-bar[hidden]" in template
     assert '<div class="vote-bar" hidden>' in template
-    # progress bar lives in the vote bar now, not the side rail
-    assert template.count('<div class="refresh-progress"') == 1
-    assert '<div class="refresh-progress"' in template.split('<div class="vote-bar"')[1]
-    # vote counts live in the vote bar
+    # vote counts live in the vote bar; no refresh bar/label/progress
     assert 'class="vote-counts"' in template.split('<div class="vote-bar"')[1]
-    # "Votes until refresh" label and 120px bar
-    assert 'class="refresh-label"' in template
-    assert "Votes until refresh" in template
-    assert "width: 120px" in template
+    assert 'class="refresh-progress"' not in template
+    assert 'class="refresh-label"' not in template
+    assert "Votes until refresh" not in template
+    assert "width: 120px" not in template
+    # vote bar is flex-end (no wrapper on the left after removing the progress bar)
+    assert "justify-content: flex-end" in template
+    assert (
+        "margin-left: auto" not in template.split(".vote-counts", 1)[1].split("}", 1)[0]
+    )
+    # toast is positioned fixed at the top
+    assert ".toast {" in template
+    assert 'role="status"' in template
+    assert 'aria-live="polite"' in template
     # mode and source tabs have filled active style
     assert (
         ".sort-tab.active, .age-tab.active {\n      background: var(--pico-primary);"
@@ -1894,16 +1912,41 @@ def test_bump_all_cached_versions(swr_handler):
     assert h._dashboard_versions[3] == 1
 
 
-def test_setSort_consumes_pending_refill_on_tab_click():
-    """Regression: clicking a sort tab while 'New ranking ready' is showing
-    should auto-consume the preloaded ranking without requiring the manual
-    Refresh button."""
+def test_setSort_triggers_silent_refill_on_tab_click() -> None:
+    """Clicking a sort tab silently refills the queue (no manual refresh
+    button — the user picks a sort, the new ranking is fetched in the
+    background)."""
     _, static = _read_template_and_static()
     idx = static.index("function setSort(")
     end = static.index("function setAge(", idx)
     body = static[idx:end]
-    assert "refillQueued" in body
-    assert "refillWhenReady" in body
+    assert "silentRefill" in body
+    assert "refillQueued" not in body
+    assert "refillWhenReady" not in body
+
+
+def test_setAge_triggers_silent_refill_on_tab_click() -> None:
+    """Clicking an age tab silently refills the queue."""
+    _, static = _read_template_and_static()
+    idx = static.index("function setAge(")
+    end = static.index("function setSource(", idx)
+    body = static[idx:end]
+    assert "silentRefill" in body
+    assert "refillQueued" not in body
+    assert "refillWhenReady" not in body
+
+
+def test_setSource_triggers_silent_refill_on_tab_click() -> None:
+    """Clicking a source tab silently refills the queue."""
+    _, static = _read_template_and_static()
+    idx = static.index("function setSource(")
+    # setSource is the last function in the file's first script block; the
+    # body ends with the next blank line.
+    end = static.index("\n\n    applyGradient();", idx)
+    body = static[idx:end]
+    assert "silentRefill" in body
+    assert "refillQueued" not in body
+    assert "refillWhenReady" not in body
 
 
 def test_archive_age_tab_button_exists():
@@ -1936,7 +1979,9 @@ def test_orderForCurrentSort_uses_orderByRank_for_recommended():
     """Recommended sort uses orderByRank (score desc); popular/explore shuffle."""
     _, static = _read_template_and_static()
     idx = static.index("function orderForCurrentSort(")
-    end = static.index("function updateRefreshProgress(", idx)
+    # orderForCurrentSort is now the last function in its block (no
+    # updateRefreshProgress follows). End at the blank line.
+    end = static.index("\n\n    function setActiveCard(", idx)
     body = static[idx:end]
     assert "currentSort === 'recommended'" in body
     assert "orderByRank" in body
@@ -2037,3 +2082,73 @@ def test_inline_script_has_voted_story_ids_filter():
     )[0]
     assert "votedStoryIds.delete(storyId)" in submit_catch
     assert "delete card.dataset.voted" in submit_catch
+
+
+def test_submitVote_silently_refills_on_success() -> None:
+    """A successful vote save triggers a silent queue refill (no manual
+    refresh button — the user voted, the next queue is fetched in the
+    background)."""
+    _, inline_script = _read_template_and_static()
+    submit_vote_block = inline_script.split("function submitVote(", 1)[1].split(
+        "function ", 1
+    )[0]
+    assert "silentRefill()" in submit_vote_block
+    # On a failed save, the catch handler must surface a toast (not the old
+    # refresh banner, which is gone).
+    submit_catch = submit_vote_block.split("Network error submitting feedback", 1)[1]
+    assert "showToast(" in submit_catch
+    assert "refreshBannerText" not in submit_catch
+    assert "refreshBanner.hidden" not in submit_catch
+
+
+def test_undoLastVote_silently_refills_on_success() -> None:
+    """A successful undo triggers a silent queue refill; a failed undo
+    surfaces a toast."""
+    _, inline_script = _read_template_and_static()
+    undo_block = inline_script.split("function undoLastVote()", 1)[1].split(
+        "function ", 1
+    )[0]
+    assert "silentRefill()" in undo_block
+    undo_catch = undo_block.split("Network error undoing feedback", 1)[1]
+    assert "showToast(" in undo_catch
+    assert "refreshBannerText" not in undo_catch
+
+
+def test_silentRefill_serializes_concurrent_calls() -> None:
+    """silentRefill returns early if a refill is already in flight, so
+    bursty votes coalesce into one fetch per cycle instead of N parallel
+    fetches."""
+    _, inline_script = _read_template_and_static()
+    block = inline_script.split("async function silentRefill()", 1)[1].split(
+        "function ", 1
+    )[0]
+    assert "if (isRefilling) return" in block
+    assert "refillQueue({ forceFetch: true })" in block
+
+
+def test_refillQueue_reorders_deterministic_modes_only() -> None:
+    """After appending new cards from the server (which always returns them
+    in recommended order), refillQueue re-applies the active sort for the
+    deterministic modes (recommended/date). Popular/explore (shuffle) are
+    skipped to avoid reshuffling on every vote."""
+    _, inline_script = _read_template_and_static()
+    block = inline_script.split("async function refillQueue(", 1)[1].split(
+        "function ", 1
+    )[0]
+    # The reorder call must be guarded by the deterministic modes.
+    assert "orderForCurrentSort()" in block
+    assert "currentSort === 'recommended'" in block
+    assert "currentSort === 'date'" in block
+    assert "if (currentSort === 'recommended' || currentSort === 'date')" in block
+
+
+def test_showToast_dismisses_after_3s() -> None:
+    """showToast shows the toast and auto-dismisses after 3000ms."""
+    _, inline_script = _read_template_and_static()
+    block = inline_script.split("function showToast(message, variant)", 1)[1].split(
+        "function ", 1
+    )[0]
+    assert "toastEl.hidden = false" in block
+    assert "toastEl.hidden = true" in block
+    assert "3000" in block
+    assert "clearTimeout(toastTimer)" in block
