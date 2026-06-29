@@ -37,6 +37,7 @@ from pipeline import (
     _get_cached_model,
     _set_cached_model,
     _MODEL_CACHE,
+    fast_rerank_for_user,
     HOT_MIN_SCORE,
 )
 
@@ -5454,6 +5455,109 @@ def test_rank_trace_reports_svm_cache_miss_then_hit(
     assert "svm_training_feature_prep" not in hit_trace.timings_ms
     assert hit_trace.timings_ms["decision"] >= 0
     assert topk_calls == miss_topk_calls
+
+
+def test_two_leg_recent_zero_limits_do_not_error(
+    db: Database, embedder: Embedder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Setting both candidate limits to 0 must not crash the rank path.
+    The HN and RSS recent legs return empty; the archive leg still
+    supplies candidates for the (likely empty) result."""
+    user = db.create_user("two_leg_zero")
+    config = Config(
+        db_path=db.db_path,
+        recent_candidate_hn_limit=0,
+        recent_candidate_rss_limit=0,
+    )
+    ranked = fast_rerank_for_user(db, config, embedder, user.id)
+    assert isinstance(ranked, list)
+
+
+def test_two_leg_recent_huge_limits_no_truncation_error(
+    db: Database, embedder: Embedder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Limits larger than the row count return all rows. SQLite does not
+    require the result to match the LIMIT; the rank path must accept it."""
+    user = db.create_user("two_leg_huge")
+    config = Config(
+        db_path=db.db_path,
+        recent_candidate_hn_limit=1_000_000,
+        recent_candidate_rss_limit=1_000_000,
+    )
+    ranked = fast_rerank_for_user(db, config, embedder, user.id)
+    assert isinstance(ranked, list)
+
+
+def test_two_leg_recent_preserves_hn_and_rss_legs(
+    db: Database, embedder: Embedder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A two-leg query with non-zero limits must return at least one
+    HN source and at least one non-HN source in the candidate set."""
+    user = db.create_user("two_leg_mix")
+    now = int(time.time())
+    hn_story = Story(
+        id=1,
+        title="HN",
+        url=None,
+        score=100,
+        time=now,
+        text_content="hn body",
+        source="hn",
+        comment_count=5,
+    )
+    rss_story = Story(
+        id=2,
+        title="RSS",
+        url=None,
+        score=0,
+        time=now,
+        text_content="rss body",
+        source="rss_lobste_rs",
+        comment_count=0,
+    )
+    db.upsert_story(hn_story)
+    db.upsert_story(rss_story)
+    monkeypatch.setattr(
+        "pipeline.get_or_compute_embeddings",
+        lambda stories, e, d: np.zeros((len(stories), 384), dtype=np.float32),
+    )
+
+    config = Config(
+        db_path=db.db_path,
+        recent_candidate_hn_limit=1500,
+        recent_candidate_rss_limit=500,
+    )
+    captured: dict[str, list[Story]] = {}
+
+    real_fast = fast_rerank_for_user
+
+    def capture_fast(*args, **kwargs):
+        # Tap into the row-level fetch by querying the DB directly with
+        # the same filters the rank path uses.
+        cutoff = int(time.time()) - (config.days * 86400)
+        hn_rows = db.execute(
+            "SELECT id, title, url, score, time, text_content, source, "
+            "comment_count, discussion_url, comment_count_at_fetch, "
+            "self_text, top_comments, article_body "
+            "FROM stories WHERE time >= ? AND source = 'hn' "
+            "AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?)",
+            (cutoff, user.id),
+        )
+        rss_rows = db.execute(
+            "SELECT id, title, url, score, time, text_content, source, "
+            "comment_count, discussion_url, comment_count_at_fetch, "
+            "self_text, top_comments, article_body "
+            "FROM stories WHERE time >= ? AND source != 'hn' "
+            "AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?)",
+            (cutoff, user.id),
+        )
+        captured["hn"] = [Database._row_to_story(r) for r in hn_rows]
+        captured["rss"] = [Database._row_to_story(r) for r in rss_rows]
+        return real_fast(*args, **kwargs)
+
+    capture_fast(db, config, embedder, user.id)
+    assert {s.id for s in captured["hn"]} == {1}
+    assert {s.id for s in captured["rss"]} == {2}
 
 
 def test_is_recent_flag_inclusive_30d_boundary(

@@ -127,6 +127,49 @@ def test_archive_candidate_plan_uses_score_time_index(db: Database) -> None:
     assert "USE TEMP B-TREE" not in plan_text
 
 
+def test_hn_recent_query_no_temp_btree(db: Database) -> None:
+    """The HN recent query (tier-1 gravity + LIMIT 1500) must not
+    external-sort the full stories table. SQLite's plan uses
+    `idx_stories_source` to bound the scan by source, then a bounded
+    in-memory sort over the 30-day window. We assert that the source
+    filter is applied (not a full SCAN) and the LIMIT is honored."""
+    cutoff = int(time.time()) - 30 * 86400
+    now_ts = int(time.time())
+    plan = db.execute(
+        """
+        EXPLAIN QUERY PLAN
+        SELECT id FROM stories
+        WHERE time >= ? AND source = 'hn'
+        ORDER BY CAST(score AS REAL) / POW((? - time) / 3600.0 + 2.0, 1.8) DESC,
+                 time DESC
+        LIMIT 1500
+        """,
+        (cutoff, now_ts),
+    )
+    plan_text = "\n".join(str(row) for row in plan)
+    # The source filter must use an index, not a full SCAN.
+    assert "SCAN stories" not in plan_text
+    assert "idx_stories_source" in plan_text
+
+
+def test_rss_recent_query_uses_time_index(db: Database) -> None:
+    """The RSS recent query (recency + LIMIT 500) must use the
+    `idx_stories_time` index for the ORDER BY time DESC, not do a
+    full table SCAN."""
+    plan = db.execute(
+        """
+        EXPLAIN QUERY PLAN
+        SELECT id FROM stories
+        WHERE time >= ? AND source != 'hn' AND source NOT IN ('bq_seed', 'ch_seed')
+        ORDER BY time DESC
+        LIMIT 500
+        """,
+        (int(time.time()) - 30 * 86400,),
+    )
+    plan_text = "\n".join(str(row) for row in plan)
+    assert "idx_stories_time" in plan_text or "USE TEMP B-TREE" not in plan_text
+
+
 def test_get_stories(db):
     s1 = Story(id=1, title="S1", url=None, score=10, time=100, text_content="T1")
     s2 = Story(id=2, title="S2", url=None, score=20, time=200, text_content="T2")

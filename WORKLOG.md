@@ -39,6 +39,67 @@ check` clean. Net change: +35 / −55 lines (pipeline.py),
 
 ---
 
+## 2026-06-29 — Two-leg recent candidate cap (hn=1500 + rss=500)
+
+**Goal.** The RankTrace benchmark showed `rank_total_ms` warm p50 ≈ 9.4s
+for the heaviest user (10,401 candidates, 2,558 feedback). The dominant
+stages — `decision_ms` (5.1s) and `svm_candidate_feature_prep_ms`
+(1.9s) — both scale with the number of candidates, so capping the
+candidate fetch at the SQL level is the cheapest way to cut them.
+
+**Symptom of doing it wrong.** A naive `ORDER BY score DESC` cap
+discriminates against RSS sources: most non-HN rows have `score=0` in
+the DB (RSS feeds don't carry engagement metrics), so a score-based
+ordering clusters them at the bottom of the result and a SQL-level
+LIMIT drops the entire `is_non_hn` discovery pass's input.
+
+**Fix.** Split the recent query into two legs. The HN leg
+(`source='hn'`) is ordered by `score / age^1.8` (the cold-start
+tier-1 formula in `_score_and_rank`), capped at
+`recent_candidate_hn_limit` (default 1500). The RSS leg
+(`source != 'hn' AND NOT IN archive`) is ordered by `time DESC` (the
+only honest SQL-only signal for non-HN sources), capped at
+`recent_candidate_rss_limit` (default 500). The archive leg remains
+unchanged. The two queries run sequentially inside the same
+`with trace.stage("candidate_sql")` block so the timing is one number.
+
+**Benchmark before/after** (heaviest user, warm p50):
+
+| stage | uncapped | capped (1500+500) | delta |
+|---|---:|---:|---:|
+| candidates (post-filter) | 10,401 | 5,808 | **-44%** |
+| rank_total_ms | 9,368.1 | 6,295.5 | **-33%** |
+| decision_ms | 5,333.2 | 2,864.0 | -46% |
+| svm_candidate_feature_prep_ms | 1,854.6 | 1,601.8 | -14% |
+| candidate_embedding_ms | 135.3 | 92.0 | -32% |
+| badge_similarity_ms | 218.0 | 141.7 | -35% |
+| candidate_sql_ms | 1,051.3 | 1,355.1 | **+29%** |
+
+**SQL cost goes up because the HN leg has a complex `ORDER BY` over
+the full bounded recent window** (SQLite uses `idx_stories_source` for
+the source filter then a temp B-tree for the sort), but the downstream
+savings — primarily `decision_function` over 5,000 fewer rows — dwarf
+the SQL cost. Net warm path is ~3s faster on the heaviest user.
+
+**Tests.** Plan checks verify the HN leg uses `idx_stories_source`
+(no full SCAN) and the RSS leg uses `idx_stories_time`. Edge-case
+tests verify zero-limits and large-limits don't error. The new
+benchmark flags `--hn-candidate-limit` / `--rss-candidate-limit` let
+future runs sweep cap sizes.
+
+**Risk acknowledged.** The `is_uncertain` discovery pass is
+orthogonal to tier-1 gravity / recency; a SQL-level cap reduces the
+pool available to that pass. For the heaviest user the impact is
+small (uncertainties are dominated by recent low-engagement HN
+stories, which the HN leg still includes), but a future change that
+increases the weight of `is_uncertain` should re-evaluate the cap.
+
+**Default chosen.** hn=1500, rss=500. Total 2000 recent candidates +
+~4000 archive candidates ≈ 6000 rows scored per rank. The cap is
+configurable per-leg in `config.toml`.
+
+---
+
 ## 2026-06-29 — Make SVM variant experiment import-safe
 
 **Fix.** Renamed `scripts/test_svm_variants.py` to

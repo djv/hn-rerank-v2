@@ -325,6 +325,16 @@ class Config:
     article_fetch_concurrency: int = 10
     article_fetch_max_age_days: int = 30
     max_cached_models: int = 20
+    # Two-leg candidate cap: the HN recent query uses tier-1 gravity
+    # (score/age^1.8) so top-scoring stories are fetched first; the RSS
+    # recent query uses pure recency because RSS sources have no
+    # engagement score in the DB. Total fetched rows = hn_limit +
+    # rss_limit + archive-leg-size, which is what flows into candidate
+    # embedding, SVM feature prep, and decision_function. The
+    # is_uncertain discovery pass is allowed to shift because that
+    # signal is orthogonal to the SQL ordering.
+    recent_candidate_hn_limit: int = 1500
+    recent_candidate_rss_limit: int = 500
     model: ModelConfig = field(default_factory=ModelConfig)
     rss: RssConfig = field(default_factory=RssConfig)
 
@@ -364,6 +374,8 @@ class Config:
             article_fetch_concurrency=main_cfg.get("article_fetch_concurrency", 10),
             article_fetch_max_age_days=main_cfg.get("article_fetch_max_age_days", 30),
             max_cached_models=main_cfg.get("max_cached_models", 20),
+            recent_candidate_hn_limit=main_cfg.get("recent_candidate_hn_limit", 1500),
+            recent_candidate_rss_limit=main_cfg.get("recent_candidate_rss_limit", 500),
             model=ModelConfig(
                 svm_c=model_cfg.get("svm_c", 0.2),
                 svm_gamma=model_cfg.get("svm_gamma", 0.03),
@@ -2924,12 +2936,38 @@ def fast_rerank_for_user(
     cutoff_ts = now_ts - (config.days * 86400)
 
     with trace.stage("candidate_sql") if trace is not None else nullcontext():
-        recent_rows = db.execute(
+        # Two-leg recent query: HN stories ordered by tier-1 gravity
+        # (score/age^1.8, mirroring the cold-start tier-1 blend in
+        # _score_and_rank); non-HN RSS stories ordered by recency only
+        # (RSS sources have score=0 in the DB so tier-1 is uninformative
+        # there, and recency keeps the non-HN discovery passes from
+        # losing representation). Cap sizes come from Config.
+        hn_rows = db.execute(
             "SELECT id, title, url, score, time, text_content, source, comment_count, "
             "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
-            "FROM stories WHERE time >= ? AND source NOT IN (?, ?) "
-            "AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?)",
-            (cutoff_ts, BQ_ARCHIVE_SOURCE, CH_ARCHIVE_SOURCE, user_id),
+            "FROM stories "
+            "WHERE time >= ? AND source = 'hn' "
+            "  AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?) "
+            "ORDER BY CAST(score AS REAL) / POW((? - time) / 3600.0 + 2.0, 1.8) DESC, "
+            "         time DESC "
+            "LIMIT ?",
+            (cutoff_ts, user_id, now_ts, config.recent_candidate_hn_limit),
+        )
+        rss_rows = db.execute(
+            "SELECT id, title, url, score, time, text_content, source, comment_count, "
+            "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
+            "FROM stories "
+            "WHERE time >= ? AND source != 'hn' AND source NOT IN (?, ?) "
+            "  AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?) "
+            "ORDER BY time DESC "
+            "LIMIT ?",
+            (
+                cutoff_ts,
+                BQ_ARCHIVE_SOURCE,
+                CH_ARCHIVE_SOURCE,
+                user_id,
+                config.recent_candidate_rss_limit,
+            ),
         )
         archive_rows = db.execute(
             "SELECT id, title, url, score, time, text_content, source, comment_count, "
@@ -2944,7 +2982,7 @@ def fast_rerank_for_user(
                 BQ_ARCHIVE_CANDIDATE_LIMIT + CH_ARCHIVE_CANDIDATE_LIMIT,
             ),
         )
-    rows = recent_rows + archive_rows
+    rows = hn_rows + rss_rows + archive_rows
     candidates = [Database._row_to_story(row) for row in rows]
     candidates = [s for s in candidates if is_summarizable(s)]
     if trace is not None:

@@ -6,6 +6,7 @@ import json
 import statistics
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -175,9 +176,25 @@ def main() -> None:
     parser.add_argument("--allow-writes", action="store_true")
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--json-only", action="store_true")
+    parser.add_argument(
+        "--hn-candidate-limit",
+        type=int,
+        default=None,
+        help="Override Config.recent_candidate_hn_limit for this run.",
+    )
+    parser.add_argument(
+        "--rss-candidate-limit",
+        type=int,
+        default=None,
+        help="Override Config.recent_candidate_rss_limit for this run.",
+    )
     args = parser.parse_args()
 
     config = Config.load(args.config)
+    if args.hn_candidate_limit is not None:
+        config = replace(config, recent_candidate_hn_limit=args.hn_candidate_limit)
+    if args.rss_candidate_limit is not None:
+        config = replace(config, recent_candidate_rss_limit=args.rss_candidate_limit)
     db = Database(args.db, read_only=not args.allow_writes)
     try:
         user_id = args.user_id if args.user_id is not None else _heaviest_user_id(db)
@@ -214,7 +231,7 @@ def main() -> None:
         for _ in range(max(args.warm_runs, 0)):
             warm.append(_run_once(db, config, embedder, user_id))
 
-        result = {
+        result: dict[str, Any] = {
             "user_id": user_id,
             "preflight": preflight,
             "cold_runs": cold,

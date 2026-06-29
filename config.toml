@@ -17,6 +17,12 @@ max_cached_models = 20
 article_fetch_max_per_run = 100
 article_fetch_concurrency = 10
 article_fetch_max_age_days = 30
+# Two-leg recent candidate cap. HN stories are ordered by tier-1
+# gravity (score/age^1.8); non-HN RSS sources are ordered by recency
+# only (RSS carries no engagement score in the DB). Defaults match
+# the benchmark-tested safe values; set to a large number to disable.
+recent_candidate_hn_limit = 1500
+recent_candidate_rss_limit = 500
 
 [hn_rewrite.model]
 svm_c = 0.5
