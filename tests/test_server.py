@@ -615,6 +615,63 @@ def test_stale_warm_render_does_not_overwrite_current_cache(
     assert TestHandler._dashboard_cache[cache_key][2] == new_version
 
 
+def test_stale_warm_does_not_overwrite_newer_cache_version(
+    test_env, mock_embedder, monkeypatch
+) -> None:
+    _, db, _, _, user = test_env
+
+    class TestHandler(Handler):
+        pass
+
+    TestHandler.config = Config(db_path=db.db_path, server_port=0)
+    TestHandler.db = db
+    TestHandler.embedder = mock_embedder
+    TestHandler._dashboard_cache = {}
+    TestHandler._dashboard_versions = {}
+    TestHandler._render_locks = {}
+    TestHandler._warmup_in_flight = set()
+    TestHandler._warmup_in_flight_guard = threading.Lock()
+    TestHandler._WARM_DEBOUNCE_S = 0.01
+
+    rank_started = threading.Event()
+    allow_rank_to_finish = threading.Event()
+
+    def fake_fast_rerank_for_user(database, config, embedder, user_id):
+        rank_started.set()
+        assert allow_rank_to_finish.wait(timeout=2.0)
+        return []
+
+    def fake_generate_dashboard_bytes(ranked, config, database, user_id, user_token):
+        return b"fresh content"
+
+    import pipeline
+
+    monkeypatch.setattr(pipeline, "fast_rerank_for_user", fake_fast_rerank_for_user)
+    monkeypatch.setattr(
+        pipeline, "generate_dashboard_bytes", fake_generate_dashboard_bytes
+    )
+
+    cache_key = f"dashboard_{user.id}"
+    TestHandler._dashboard_cache[cache_key] = (b"stale content", time.time(), 0)
+    TestHandler._dashboard_versions[user.id] = 1
+
+    TestHandler._trigger_warm(user, version=1)
+    assert rank_started.wait(timeout=2.0)
+
+    bumped_version = TestHandler._invalidate_dashboard_cache(user.id)
+    assert bumped_version == 2
+
+    allow_rank_to_finish.set()
+
+    deadline = time.time() + 3.0
+    while TestHandler._warmup_in_flight and time.time() < deadline:
+        time.sleep(0.05)
+
+    cached = TestHandler._dashboard_cache[cache_key]
+    assert cached[0] == b"stale content"
+    assert cached[2] == 0
+
+
 @pytest.fixture(scope="module")
 def prop_db():
     with TemporaryDirectory() as temp_dir:

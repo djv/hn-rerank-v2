@@ -109,19 +109,19 @@ direct dep.
 
 The dashboard uses two external data sources for HN stories. Algolia was
 removed from the live `hn` source pipeline on 2026-06-26; CH is now the
-sole source for the live 7-day window and bulk operations.
+sole source for the live 30-day window and bulk operations.
 
 | Source | Used for | Why |
 |---|---|---|
-| **ClickHouse** (`hackernews_history`) | Live 7-day window (`query_live_window`), bulk comment hydration (archive seed), bulk prewarm (top-50 ranked) | Single SQL query for N stories; 10-100× faster than per-story Algolia |
+| **ClickHouse** (`hackernews_history`) | Live 30-day window (`query_live_window`), bulk comment hydration (archive seed), bulk prewarm (top-50 ranked) | Single SQL query for N stories; 10-100× faster than per-story Algolia |
 | **Algolia** (`hn.algolia.com`) | Single-story items fallback (lazy TLDR detail for stories outside prewarm) | Real-time, no CH equivalent for one-off fetches; used only as fallback |
 | **BigQuery** (`bigquery-public-data.hacker_news.full`) | Backup archive seeder (manual) | Same data as CH; slower; requires `gcloud`/`bq` auth |
 
 The live `hn` source pipeline (`fetch_candidates` in `pipeline.py`) now
 issues **1 CH call per regen**:
 
-1. `ch_client.query_live_window(days=7, min_score=5, limit=2000)` — every
-   live HN story from the past 7 days with all fields (title, url,
+1. `ch_client.query_live_window(days=30, min_score=5, limit=5000)` — every
+   live HN story from the past 30 days with all fields (title, url,
    score, descendants, time, text).
 
 The prewarm (comment text for all HN candidates with `comment_count > 0` and

@@ -144,15 +144,16 @@ A shared `RedditRateLimiter` singleton in `reddit_limiter.py` is consulted by bo
 * **Server-driven 429 backoff (2026-06-28)**: when Reddit sends `x-ratelimit-reset` on a 429, the limiter uses that value (capped at 120s) as the next delay instead of the hardcoded BACKOFF table. Precedence: `x-ratelimit-reset` > `Retry-After` > BACKOFF table. Matches the server's actual reset window and avoids the 2s-too-short backoff that re-triggers 429s in tight loops.
 * **Thread-safe**: all state mutations are guarded by a `threading.Lock` because the queue worker thread (driving scheduled fetches) and the HTTP request threads (driving on-demand fetches) now both call the limiter concurrently. The lock is released during `asyncio.sleep` in `acquire()` so other threads can proceed.
 * **Slot-reservation under the lock (2026-06-28)**: `acquire()` reserves the next slot by bumping `_next_allowed_at = max(now, _next_allowed_at) + INTER_REQUEST_DELAY + jitter` *inside* the lock. The next caller entering the lock immediately after sees the bumped value and staggers itself correctly, even when it's a different OS thread (queue worker vs HTTP handler on a TLDR click). Previously `_next_allowed_at` was advanced only in `on_success`/`on_429` (post-HTTP), so two concurrent `acquire()` callers both saw the same stale value, both slept 0, and both fired HTTP simultaneously — re-introducing the burst pattern that originally caused the 2026-06-28 37-consecutive-429s incident. The invariant is asserted by `test_concurrent_acquire_staggers_reservations` in `tests/test_reddit_limiter.py`. `on_success()` no longer advances `_next_allowed_at` — it only resets circuit state. `on_429()` uses `max(self._next_allowed_at, now + delay)` to push the next slot further out, but never earlier than what `acquire()` already reserved, so callers mid-`asyncio.sleep` are not invalidated. Companion change in `pipeline.py`: `build_reddit_prewarm_factories` factory used to call `acquire()` redundantly (the inner `_fetch_reddit_rss_context → acquire` is the actual rate-limit gate). Replaced the outer call with a cheap `reddit_limiter.circuit_open` property check to short-circuit early without reserving a second slot per HTTP.
-* **Fetch queue (coordinator refactor 2026-06-28; two-phase 2026-06-29)**: Reddit fetches are scheduled through a `RedditFetchQueue` singleton that spreads them across the regen cycle instead of bursting them at the start. The 2026-06-29 refresh split the fetch into two sequential phases inside `fetch_candidates_only` so prewarm candidates can be picked from the topfeed's own output (Reddit's topfeed RSS has no engagement data, so prewarm IDs must come from what we just fetched, not from a stale DB query):
+* **Fetch queue (coordinator refactor 2026-06-28; bounded two-phase flow 2026-06-29)**: Reddit fetches are scheduled through a `RedditFetchQueue` singleton that spreads them across the regen cycle instead of bursting them at the start. The current flow runs topfeed first, persists its rows, then hydrates a bounded set of missing comment threads from that same topfeed output:
   - **Phase 1 — topfeed (fixed 50s stride, 41 tasks):** All 41 subreddit topfeeds are enqueued via `queue.enqueue_spread(n, base_at, kind=TOPFEED, factories, window_seconds=2100.0)` and drained with `wait_until_empty(timeout=5400.0)`. The factory writes parsed `Story` rows to `reddit_feed_cache` in the order Reddit returned them (hot/score-desc; RSS doesn't carry `score` so the order is the only signal).
-  - **Phase 2 — prewarm (configurable stride, ~410 tasks):** Read `reddit_feed_cache` for each `reddit_feed_url`; take the first `config.reddit_prewarm_top_per_sub` (default 10) stories per sub. With 41 subs × N=10 = 410 prewarm candidates. Per-post RSS fetches for their comments are enqueued and drained with a 90-min timeout. The queue covers ~180/410 per cycle; the rest finish in subsequent cycles — multi-cycle completion is by design. The phase is skipped entirely when `prewarm_reddit_full=False` or the cache is empty (all topfeeds failed).
+  - **Phase 1.5 — persist:** cached topfeed stories are upserted before prewarm factories are built. This is required because prewarm factories load the story row from SQLite.
+  - **Phase 2 — prewarm (configurable stride, capped at 80 tasks by default):** Read `reddit_feed_cache` for each `reddit_feed_url`; consider the first `config.reddit_prewarm_top_per_sub` (default 10) stories per sub, skip rows whose DB copy already has `top_comments`, and stop at `config.reddit_prewarm_max_per_cycle` (default 80). Per-post RSS fetches for their comments are enqueued and drained with a 90-min timeout. At the default 30s stride, the capped phase is about 40 minutes before retry/backoff overhead. The phase is skipped when `prewarm_reddit_full=False`, the cache is empty, or the cap is non-positive.
   - **Stride knobs:** `reddit_min_fetch_spacing_seconds` (default 30.0s) sets the prewarm phase's per-task stride; the topfeed phase uses a hardcoded 50s stride (one subreddit per fetch at the limiter's natural 2s+jitter cadence, but the queue spreads them out at 50s for 429-backoff headroom).
-  - **Why two phases instead of interleave?** The prewarm IDs depend on phase 1's output (topfeed writes to cache; phase 2 reads from cache). True interleaving on a single shared window was the 2026-06-28 design, but it had to do a DB prewarm-ID query before any fetches, so brand-new topfeed stories from the current cycle missed their prewarm. Splitting into two phases lets the same cycle both enqueue and prewarm each story.
-  - **Removed (2026-06-29):** `reddit_prewarm_max_per_cycle` cap (the DB prewarm-ID query is gone; the per-sub cache is the new selection mechanism) and the `_fetch_reddit_rss_context → acquire → topfeed_upsert` interleave dance. The `SPREAD_WINDOW_TOPFEEDS=2100.0` and `SPREAD_WINDOW_PREWARM=2100.0` constants are kept on the queue for backward compat with `enqueue_spread` callers.
+  - **Why two phases instead of interleave?** The prewarm IDs depend on phase 1's output (topfeed writes to cache; phase 2 reads from cache). True interleaving on a single shared window was the 2026-06-28 design, but it had to do a DB prewarm-ID query before any fetches, so brand-new topfeed stories from the current cycle missed their prewarm.
+  - **Bounded work:** `reddit_prewarm_max_per_cycle` replaced the attempted 410-task full sweep because hourly or 3-6h refresh intervals cannot reliably absorb 410 per-post Reddit RSS requests plus 41 topfeeds under current rate limits.
   - **`urllib_fetch` HTTPError handling (2026-06-29):** the `http_fetch.urllib_fetch` helper catches `urllib.error.HTTPError` and returns `(e.code, "")` instead of raising. `URLError` (network/DNS/timeout) still propagates. Without this, an IP block on Reddit returned unhandled `HTTPError` to the queue worker's broad `except Exception`, which logged and dropped the task — the worker kept dequeuing topfeeds that all immediately failed, and the live service went 25+ min with zero Reddit fetches. The 5-test `tests/test_http_fetch.py` suite covers 200/403/429/500/URLError paths.
 * **`?t=week&limit=25` consistency (2026-06-29)**: All 41 Reddit topfeed URLs in `config.toml` use the same `top/.rss?t=week&limit=25` pattern. 28 URLs were converted from 2 `?t=month` variants and 26 bare `r/X/.rss` (which is the "new" sort, not "top of the week"). This unifies the content window so all 41 topfeeds return "top of the week" stories of consistent freshness. No code change — pure config.
-* **New Reddit stories this cycle** are now prewarmed in the **same** cycle (phase 2 of the same regen), not the next one — phase 1's topfeed writes the cache, phase 2 reads the first N per sub. New stories are upserted from `reddit_feed_cache` after the drain with their `top_comments` populated by the per-post RSS fetch, so the dashboard sees the fully-enriched row on its next render. Stories that don't make the per-sub cut (positions N+1..25 in the topfeed) get prewarmed on a later cycle as the topfeed rotates.
+* **New Reddit stories this cycle** are eligible for same-cycle prewarm only after phase 1.5 persists them. Stories that fit within the per-cycle cap can land with `top_comments` before the regen completes; uncapped tail stories remain usable from feed self text and still hydrate on `/api/tldr-detail` when opened.
 
 Logging: a WARNING per 429 (`reddit_limiter 429 consecutive=N next_delay=Ns`), an INFO when the loop short-circuits (`fetch_rss_feeds: reddit circuit open, skipping remaining N feeds` / `prewarm_reddit: circuit open, skipping remaining N stories`), and an INFO when the half-open probe is admitted / when a successful probe closes the circuit. The state attributes (`_next_allowed_at`, `_consecutive_429`, `_circuit_opened_at`, `_probing`) are reset by an autouse `tests/conftest.py` fixture between tests to prevent pollution; tests that exercise the limiter run with a fake monotonic clock and a recording-but-no-op `asyncio.sleep`.
 
@@ -161,20 +162,20 @@ Trade-off: ~100s added per regen (50 feeds × 2s), well within the 3h cycle budg
 #### 3.4.3 Reddit topfeed RSS cache
 
 Added 2026-06-28. An in-memory `RedditFeedCache` singleton in
-`reddit_feed_cache.py` sits in front of the limiter in `fetch_rss_feeds`:
+`reddit_feed_cache.py` sits in front of the limiter in the Reddit topfeed factories:
 before each Reddit feed's `reddit_limiter.acquire()`, the cache is queried
 by feed URL.  On hit (`list[Story]` within TTL), the stories are appended
 directly to `feed_results` and the loop continues to the next feed — no
 HTTP request, no limiter consultation, no 429 risk.  On miss, the normal
-fetch + limiter flow runs and the result is stored for `TTL_SECONDS=7200`
-(2h).
+fetch + limiter flow runs and the result is stored for `TTL_SECONDS=14400`
+(4h).
 
-**Impact**: Reddit req/hour dropped from ~410 (41 feeds × ~10 regens/h) to
-~4 (41 feeds / 2h TTL × ~1/5 regen windows/h).  Cache hit rate is ~98%
-during the 2h window; misses occur only every 2h when the entire feed list
-expires, or on server restart.
+**Impact**: topfeed HTTP requests are bounded to about 41 per 4-hour cache
+window, plus at most `reddit_prewarm_max_per_cycle` per-post comment RSS
+requests when Reddit prewarm is enabled. Misses occur when the feed list
+expires or on server restart.
 
-**Design constants**: `TTL_SECONDS=7200` (2h, user-confirmed),
+**Design constants**: `TTL_SECONDS=14400` (4h, aligned with the default regen cadence),
 `MAX_ENTRIES=100` (lazy-eviction on overflow by insertion timestamp).
 `get()` logs one DEBUG line per query (`hit|miss|expired feed=<url>
 age=<s>`).  `reset()` clears all entries and counters — wired into the
@@ -218,10 +219,43 @@ The dashboard uses two orthogonal axes: **Sort** (Recommended/Popular/Explore/Da
 
 When a user votes, the visible card exits immediately and the next queued card becomes active without waiting for the feedback POST. The server invalidates the user's dashboard cache and kicks a personalized warm render on every successful vote, then returns `ranking_refresh_queued: true` in the response. The client treats the response as a signal to silently refetch the dashboard HTML in the background and replace the non-active cards (`silentRefill`); there is no user-facing "Refresh" button or progress bar. Undo and every sort/age/source tab click also trigger a silent refill. The session-scoped `votedStoryIds` set in `index.html` is the defense-in-depth — if a SWR stale-hit returns the pre-vote HTML, `refillQueue` suppresses any incoming card whose `storyId` is in the set. The server still returns the warm render's HTML with a feedback-versioned cache key, so a stale warm cannot satisfy a later refill. See `WORKLOG.md` 2026-06-28 and 2026-06-29 for the full history.
 
-The server logs dashboard timing with stable prefixes: `dashboard_cache_invalidated`, `dashboard_warm`, and `dashboard_render`. Render logs include cache-hit vs rendered result, total elapsed time, render-lock wait time, ranking time, HTML generation time, story count, and whether the rendered HTML was written to cache. These logs are intended to diagnose cases where a silent refill is taking longer than the typical warm-cache ~200 ms.
+The server logs dashboard timing with stable prefixes: `dashboard_cache_invalidated`, `dashboard_warm`, `dashboard_render`, and `rank_perf`. Render logs include cache-hit/stale/skeleton results, cache age, ranking time, HTML generation time, and story count. `rank_perf` is emitted once per completed warm render and carries the stage breakdown for personalized ranking: candidate SQL, candidate embedding lookup/compute, feedback embedding lookup/compute, SVM feature preparation, `SVC.fit` when the model cache misses, `decision_function`, tier-2 centroid scoring, badge similarity work, dedup, total rank time, feedback counts by class, candidate counts, and `model_cache=hit|miss|skipped`. These logs are intended to diagnose cases where a silent refill is taking longer than the typical warm-cache path.
+
+For offline timing, run `uv run python scripts/benchmark_rank_cold_cache.py`. By default it opens `hn_rewrite.db` read-only, selects the user with the most feedback, clears the in-process SVM model cache before cold runs, and then repeats warm runs against the same process cache. If read-only ranking would need to compute missing embeddings, the script exits with a preflight summary instead of writing to the live DB; run `uv run python scripts/embed_remaining.py` first or pass `--allow-writes` explicitly.
+
+**Heavy-vote reload finding (2026-06-29).** The current bottleneck is not
+warm-cache `SVC.fit`; it is scoring the full candidate pool with the RBF
+SVM. A live benchmark for user 1 with 2,517 feedback rows and 8,915
+candidates measured warm-cache reloads at ~6.5s, with
+`decision_function` alone at ~4.3s and candidate SVM feature prep at
+~1.5s. Exact-path cleanup brought `candidate_sql` down to ~100ms and
+badge similarity to ~30ms, but cannot make reloads sub-3s while every
+candidate is sent through the RBF SVM.
+
+The saved follow-up options are:
+
+* **Bounded RBF shortlist**: use a cheap first pass over the full pool,
+  keep a deterministic ~2k candidate shortlist with recent/archive/non-HN
+  coverage, then run RBF SVM and discovery passes on that shortlist. This
+  is the largest compute lever but changes ranking semantics and needs
+  offline eval before becoming default.
+* **Vote coalescing / stale-while-revalidate**: preserve instant card
+  removal in the browser, but avoid forcing a full server rerank after
+  every vote. Return the current deck immediately when acceptable and warm
+  the updated deck in the background.
+* **Candidate policy reduction**: shrink the 30-day render window, lower
+  archive caps, or add source quotas. Simple, but it directly changes what
+  can surface.
+* **Richer per-user cache**: cache candidate feature matrices or
+  candidate-feedback dot products keyed by the feedback signature and
+  candidate-pool signature. Useful for reloads without fresh feedback,
+  less useful for one-rerank-per-vote behavior.
+* **Approximate/capped model**: evaluate Random Fourier Features or
+  class-balanced training/support-vector caps. Simpler linear/logistic
+  replacements have already measured worse, so this needs quality eval.
 
 ### 3.6 ClickHouse Candidate Fetch Window
-The live-window fetch (`pipeline.fetch_candidates`) uses `ch_client.query_live_window(days=7, min_score=5, limit=2000)` to pull all live HN stories from the past 7 days. This single SQL query returns every story with title, url, score, descendants, time, and self-text — no pagination, no per-story items call needed. Stories with `score < 5` are filtered at the query level. Result count is typically 500-2000 rows; query time <1s on CH Playground.
+The live-window fetch (`pipeline.fetch_candidates`) uses `ch_client.query_live_window(days=30, min_score=5, limit=5000)` to pull all live HN stories from the past 30 days. This single SQL query returns every story with title, url, score, descendants, time, and self-text — no pagination, no per-story items call needed. Stories with `score < 5` are filtered at the query level. Result count is typically 2000-5000 rows; query time <2s on CH Playground. The 30-day window (widened from 7d on 2026-06-29) gives 7-30d HN stories a "second chance" to be re-discovered, re-scored, and re-ranked on every regen; without it, stories that fell out of the live window would stay frozen in the DB with stale scores and never re-enter the candidate pool.
 
 The same function reads `bq_seed` and `ch_seed` archive rows from the SQLite DB (no network) ordered by `score DESC, time DESC` and capped at 4,000 total (2,000 per source). Both archive sources are HN-compatible for ranking gravity, TLDR comment fetching, and eval/source features. Source label `BQ Seed` or `CH Seed` is preserved for provenance. Normal age pruning skips both.
 
@@ -275,7 +309,7 @@ To automatically invalidate and refresh cached embeddings whenever a story's tex
 ### 3.10 Database Connection Pooling & Thread Safety
 To reduce SQLite connection establishment overhead and eliminate lock contention in concurrent web environments:
 * **Connection Pooling**: The `Database` class maintains an internal thread-safe queue of 5 SQLite connections (`queue.Queue`). In-memory databases automatically scale the pool size to 1 to preserve test schema isolation.
-* **Safe Connection Leasing**: Method executions lease connections from the pool via the private context manager `_conn(self)` and release them in a `finally` block, ensuring no leaked connections.
+* **Safe Connection Leasing**: Method executions lease connections from the pool via the public context manager `conn(self)` and release them in a `finally` block, ensuring no leaked connections.
 * **Auto Commit/Rollback**: All database write operations wrap queries in a transaction context (`with conn:`) to ensure automatic rollback on failure and commit on success.
 * **PRAGMA Settings**: Each pooled connection is initialized with `PRAGMA journal_mode=WAL` (Write-Ahead Logging), `PRAGMA foreign_keys=ON` (constraint enforcement), and `PRAGMA busy_timeout=5000` (blocking writers retry for up to 5 seconds before failing).
 * **Server-Level Reuse**: The `ThreadingHTTPServer` request handlers reuse a single global `Database` instance across threads, resolving lock issues and significantly increasing throughput.
@@ -420,5 +454,3 @@ viewport so it fills remaining vertical space and scrolls internally via
 ### 4.3 Client-side Rendering
 
 The raw Markdown response is formatted on the fly using a robust, line-by-line parser (`parseSimpleMarkdown`) to render headers, bold text, and lists safely.
-
-

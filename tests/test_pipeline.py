@@ -5,13 +5,16 @@ import pytest
 import time
 from hypothesis import given, strategies as st, settings, HealthCheck
 from database import Database, Story
+from dataclasses import replace
 import pipeline
 from pipeline import (
     BQ_ARCHIVE_SOURCE,
     CH_ARCHIVE_SOURCE,
     Embedder,
     ModelConfig,
+    RankTrace,
     RankedStory,
+    RssConfig,
     clean_text,
     compose_story_text,
     get_or_compute_embeddings,
@@ -4195,6 +4198,304 @@ def test_fetch_candidates_only_prewarms_all_hn_when_full(monkeypatch) -> None:
         db.close()
 
 
+def test_fetch_candidates_only_persists_topfeed_before_prewarm(
+    monkeypatch,
+) -> None:
+    """Topfeed cache entries are upserted into SQLite before the prewarm
+    phase is built. Otherwise the prewarm factory's `db.get_story` would
+    return None for brand-new topfeed discoveries and the factory would
+    no-op."""
+    db = Database(":memory:")
+    try:
+        config = Config(
+            db_path=db.db_path,
+            prewarm_hn_full=False,
+            prewarm_reddit_full=True,
+            reddit_prewarm_top_per_sub=2,
+            reddit_prewarm_max_per_cycle=10,
+        )
+        config = replace(
+            config,
+            rss=RssConfig(
+                enabled=True,
+                per_feed_limit=70,
+                feeds=("https://www.reddit.com/r/x/top/.rss?t=week&limit=25",),
+            ),
+        )
+
+        async def fake_fetch_candidates(
+            config, exclude_ids, exclude_urls, db, embedder
+        ):
+            return [], 0
+
+        new_story = Story(
+            id=42,
+            title="New topfeed story",
+            url="https://reddit.com/r/x/comments/42",
+            score=100,
+            time=1_000_000,
+            text_content="",
+            source="rss_reddit_r_x",
+            comment_count=0,
+        )
+
+        def fake_topfeed_factories(feeds, per_feed, days, exclude_urls):
+            from reddit_feed_cache import cache as reddit_feed_cache
+
+            # The real topfeed factory writes to the cache when called by
+            # the queue worker. The mock queue never invokes factories, so
+            # we pre-populate the cache synchronously to simulate the
+            # post-drain state.
+            reddit_feed_cache.set(feeds[0], [new_story])
+
+            async def factory() -> None:
+                return None
+
+            return [factory], [feeds[0]]
+
+        captured_factory_ids: list[list[int]] = []
+
+        def fake_build_reddit_prewarm_factories(story_ids, db_):
+            captured_factory_ids.append(list(story_ids))
+
+            async def noop() -> None:
+                return None
+
+            return [noop], []
+
+        class _NoopQueue:
+            def enqueue_all_reddit_fetches(self, *args, **kwargs) -> None:
+                return None
+
+            def wait_until_empty(self, timeout: float = 5400.0) -> bool:
+                return True
+
+        monkeypatch.setattr(pipeline, "fetch_candidates", fake_fetch_candidates)
+        monkeypatch.setattr(
+            pipeline, "build_reddit_topfeed_factories", fake_topfeed_factories
+        )
+        monkeypatch.setattr(
+            pipeline,
+            "build_reddit_prewarm_factories",
+            fake_build_reddit_prewarm_factories,
+        )
+        monkeypatch.setattr("reddit_fetch_queue.queue", _NoopQueue())
+
+        asyncio.run(
+            pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
+        )
+        # Story was persisted in phase 1.5 before prewarm was built.
+        assert db.get_story(42) is not None
+        # And the prewarm factory was given the story's id.
+        assert captured_factory_ids and captured_factory_ids[0] == [42]
+    finally:
+        db.close()
+
+
+def test_fetch_candidates_only_caps_reddit_prewarm(monkeypatch) -> None:
+    """`reddit_prewarm_max_per_cycle` caps the total prewarm ids selected
+    across all subreddit feeds, even when `reddit_prewarm_top_per_sub`
+    would suggest more."""
+    db = Database(":memory:")
+    try:
+        # Two subreddit feeds, each carrying 3 stories. With per_sub=10
+        # the unconstrained selection would be 6 ids; the cap at 4
+        # should fire after the first 4 from the first feed.
+        feed_a = "https://www.reddit.com/r/aaa/top/.rss"
+        feed_b = "https://www.reddit.com/r/bbb/top/.rss"
+
+        config = Config(
+            db_path=db.db_path,
+            prewarm_hn_full=False,
+            prewarm_reddit_full=True,
+            reddit_prewarm_top_per_sub=10,
+            reddit_prewarm_max_per_cycle=4,
+        )
+        config = replace(
+            config,
+            rss=RssConfig(
+                enabled=True,
+                per_feed_limit=70,
+                feeds=(feed_a, feed_b),
+            ),
+        )
+
+        async def fake_fetch_candidates(
+            config, exclude_ids, exclude_urls, db, embedder
+        ):
+            return [], 0
+
+        stories_a = [
+            Story(
+                id=100 + i,
+                title=f"a{i}",
+                url=f"https://reddit.com/r/aaa/comments/{100 + i}",
+                score=100 - i,
+                time=1_000_000,
+                text_content="",
+                source="rss_reddit_r_aaa",
+            )
+            for i in range(3)
+        ]
+        stories_b = [
+            Story(
+                id=200 + i,
+                title=f"b{i}",
+                url=f"https://reddit.com/r/bbb/comments/{200 + i}",
+                score=100 - i,
+                time=1_000_000,
+                text_content="",
+                source="rss_reddit_r_bbb",
+            )
+            for i in range(3)
+        ]
+
+        def fake_topfeed_factories(feeds, per_feed, days, exclude_urls):
+            from reddit_feed_cache import cache as reddit_feed_cache
+
+            for feed_url, story_set in zip(feeds, (stories_a, stories_b)):
+                reddit_feed_cache.set(feed_url, story_set)
+
+            async def factory() -> None:
+                return None
+
+            return [factory], list(feeds)
+
+        captured_factory_ids: list[list[int]] = []
+
+        def fake_build_reddit_prewarm_factories(story_ids, db_):
+            captured_factory_ids.append(list(story_ids))
+
+            async def noop() -> None:
+                return None
+
+            return [noop], []
+
+        class _NoopQueue:
+            def enqueue_all_reddit_fetches(self, *args, **kwargs) -> None:
+                return None
+
+            def wait_until_empty(self, timeout: float = 5400.0) -> bool:
+                return True
+
+        monkeypatch.setattr(pipeline, "fetch_candidates", fake_fetch_candidates)
+        monkeypatch.setattr(
+            pipeline, "build_reddit_topfeed_factories", fake_topfeed_factories
+        )
+        monkeypatch.setattr(
+            pipeline,
+            "build_reddit_prewarm_factories",
+            fake_build_reddit_prewarm_factories,
+        )
+        monkeypatch.setattr("reddit_fetch_queue.queue", _NoopQueue())
+
+        asyncio.run(
+            pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
+        )
+        assert captured_factory_ids
+        assert len(captured_factory_ids[0]) == 4
+    finally:
+        db.close()
+
+
+def test_fetch_candidates_only_skips_already_hydrated_reddit(monkeypatch) -> None:
+    """Cached topfeed stories whose DB row already has top_comments are
+    excluded from the prewarm id list."""
+    db = Database(":memory:")
+    try:
+        feed = "https://www.reddit.com/r/x/top/.rss?t=week&limit=25"
+        config = Config(
+            db_path=db.db_path,
+            prewarm_hn_full=False,
+            prewarm_reddit_full=True,
+            reddit_prewarm_top_per_sub=10,
+            reddit_prewarm_max_per_cycle=10,
+        )
+        config = replace(
+            config,
+            rss=RssConfig(
+                enabled=True,
+                per_feed_limit=70,
+                feeds=(feed,),
+            ),
+        )
+
+        async def fake_fetch_candidates(
+            config, exclude_ids, exclude_urls, db, embedder
+        ):
+            return [], 0
+
+        # Pre-existing DB row with `top_comments` populated — should be skipped.
+        already_hydrated = Story(
+            id=10,
+            title="hydrated",
+            url="https://reddit.com/r/x/comments/10",
+            score=100,
+            time=1_000_000,
+            text_content="",
+            source="rss_reddit_r_x",
+            top_comments="existing",
+        )
+        # Brand-new story — should be selected.
+        new_story = Story(
+            id=20,
+            title="new",
+            url="https://reddit.com/r/x/comments/20",
+            score=50,
+            time=1_000_000,
+            text_content="",
+            source="rss_reddit_r_x",
+        )
+        db.upsert_story(already_hydrated)
+
+        def fake_topfeed_factories(feeds, per_feed, days, exclude_urls):
+            from reddit_feed_cache import cache as reddit_feed_cache
+
+            reddit_feed_cache.set(feeds[0], [already_hydrated, new_story])
+
+            async def factory() -> None:
+                return None
+
+            return [factory], [feeds[0]]
+
+        captured_factory_ids: list[list[int]] = []
+
+        def fake_build_reddit_prewarm_factories(story_ids, db_):
+            captured_factory_ids.append(list(story_ids))
+
+            async def noop() -> None:
+                return None
+
+            return [noop], []
+
+        class _NoopQueue:
+            def enqueue_all_reddit_fetches(self, *args, **kwargs) -> None:
+                return None
+
+            def wait_until_empty(self, timeout: float = 5400.0) -> bool:
+                return True
+
+        monkeypatch.setattr(pipeline, "fetch_candidates", fake_fetch_candidates)
+        monkeypatch.setattr(
+            pipeline, "build_reddit_topfeed_factories", fake_topfeed_factories
+        )
+        monkeypatch.setattr(
+            pipeline,
+            "build_reddit_prewarm_factories",
+            fake_build_reddit_prewarm_factories,
+        )
+        monkeypatch.setattr("reddit_fetch_queue.queue", _NoopQueue())
+
+        asyncio.run(
+            pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
+        )
+        assert captured_factory_ids
+        assert 10 not in captured_factory_ids[0]
+        assert 20 in captured_factory_ids[0]
+    finally:
+        db.close()
+
+
 def test_needs_hn_prewarm() -> None:
     """Table-driven: stale, fresh, never-prewarmed, and edge cases.
 
@@ -5029,6 +5330,116 @@ def test_model_cache_eviction() -> None:
     assert _get_cached_model(1, "sig2") is not None
     assert _get_cached_model(1, "sig3") is not None
     assert _get_cached_model(1, "sig4") is not None
+
+
+def test_rank_trace_records_and_formats_fields() -> None:
+    trace = RankTrace()
+    trace.set_count("candidates", 12)
+    trace.set_label("model_cache", "miss")
+    trace.add_timing("svm_fit", 1.24)
+    trace.add_timing("svm_fit", 2.26)
+
+    fields = trace.to_log_fields()
+    assert fields["candidates"] == 12
+    assert fields["model_cache"] == "miss"
+    assert fields["svm_fit_ms"] == 3.5
+    assert "candidates=12" in trace.format_log_fields()
+    assert "model_cache=miss" in trace.format_log_fields()
+
+
+def test_rank_trace_reports_svm_cache_miss_then_hit(
+    db: Database, embedder: Embedder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_model_cache()
+    user = db.create_user("trace_cache")
+    now = int(time.time())
+    feedback_stories: list[Story] = []
+    for i in range(20):
+        up = Story(
+            id=10_000 + i,
+            title=f"up {i}",
+            url=None,
+            score=10,
+            time=now,
+            text_content=f"up story {i}",
+            source="hn",
+            comment_count=1,
+        )
+        down = Story(
+            id=20_000 + i,
+            title=f"down {i}",
+            url=None,
+            score=10,
+            time=now,
+            text_content=f"down story {i}",
+            source="hn",
+            comment_count=1,
+        )
+        db.upsert_story(up)
+        db.upsert_story(down)
+        db.upsert_feedback(user.id, up.id, "up")
+        db.upsert_feedback(user.id, down.id, "down")
+        feedback_stories.extend([up, down])
+
+    candidates = [
+        Story(
+            id=30_000 + i,
+            title=f"candidate {i}",
+            url=None,
+            score=100 - i,
+            time=now,
+            text_content=f"candidate story {i}",
+            source="hn",
+            comment_count=1,
+        )
+        for i in range(3)
+    ]
+
+    def fake_embeddings(
+        stories: list[Story], embedder_arg: Embedder, db_inst: Database
+    ) -> np.ndarray:
+        rows: list[np.ndarray] = []
+        for story in stories:
+            vec = np.zeros(384, dtype=np.float32)
+            if story.id >= 30_000:
+                vec[0] = 1.0
+            elif story.id >= 20_000:
+                vec[1] = 1.0
+            else:
+                vec[0] = 1.0
+            rows.append(vec)
+        return np.array(rows, dtype=np.float32)
+
+    monkeypatch.setattr("pipeline.get_or_compute_embeddings", fake_embeddings)
+    candidate_embeddings = fake_embeddings(candidates, embedder, db)
+    config = Config()
+
+    miss_trace = RankTrace()
+    _score_and_rank(
+        candidates,
+        candidate_embeddings,
+        db,
+        config,
+        embedder,
+        user_id=user.id,
+        trace=miss_trace,
+    )
+    assert miss_trace.labels["model_cache"] == "miss"
+    assert miss_trace.timings_ms["svm_fit"] >= 0
+
+    hit_trace = RankTrace()
+    _score_and_rank(
+        candidates,
+        candidate_embeddings,
+        db,
+        config,
+        embedder,
+        user_id=user.id,
+        trace=hit_trace,
+    )
+    assert hit_trace.labels["model_cache"] == "hit"
+    assert "svm_fit" not in hit_trace.timings_ms
+    assert hit_trace.timings_ms["decision"] >= 0
 
 
 def test_is_recent_flag_inclusive_30d_boundary(

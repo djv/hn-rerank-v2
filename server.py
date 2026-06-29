@@ -4,6 +4,7 @@ import os
 import asyncio
 import hashlib
 import html
+import inspect
 import json
 import logging
 import re
@@ -739,12 +740,26 @@ class Handler(BaseHTTPRequestHandler):
                     if cached and cached[2] == version:
                         return
 
-                    from pipeline import fast_rerank_for_user, generate_dashboard_bytes
-
-                    render_start = time.perf_counter()
-                    final = fast_rerank_for_user(
-                        cls.db, cls.config, cls.embedder, user.id
+                    from pipeline import (
+                        RankTrace,
+                        fast_rerank_for_user,
+                        generate_dashboard_bytes,
                     )
+
+                    trace = RankTrace()
+                    render_start = time.perf_counter()
+                    with trace.stage("rank_total"):
+                        if (
+                            "trace"
+                            in inspect.signature(fast_rerank_for_user).parameters
+                        ):
+                            final = fast_rerank_for_user(
+                                cls.db, cls.config, cls.embedder, user.id, trace=trace
+                            )
+                        else:
+                            final = fast_rerank_for_user(
+                                cls.db, cls.config, cls.embedder, user.id
+                            )
                     rank_ms = (time.perf_counter() - render_start) * 1000
 
                     html_start = time.perf_counter()
@@ -753,11 +768,20 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     html_ms = (time.perf_counter() - html_start) * 1000
 
-                    cls._dashboard_cache[f"dashboard_{user.id}"] = (
-                        html,
-                        time.time(),
-                        version,
-                    )
+                    with cls._dashboard_versions_guard:
+                        if cls._dashboard_versions.get(user.id, 0) != version:
+                            logging.info(
+                                "dashboard_warm user_id=%s version=%s result=skipped_stale_after_rank elapsed_ms=%.1f",
+                                user.id,
+                                version,
+                                (time.perf_counter() - warm_start) * 1000,
+                            )
+                            return
+                        cls._dashboard_cache[f"dashboard_{user.id}"] = (
+                            html,
+                            time.time(),
+                            version,
+                        )
                     cls._enforce_cache_cap()
 
                     logging.info(
@@ -768,6 +792,7 @@ class Handler(BaseHTTPRequestHandler):
                         html_ms,
                         len(final),
                     )
+                    logging.info("rank_perf %s", trace.format_log_fields())
             except Exception as e:
                 logging.exception(
                     "Failed warming dashboard cache for user_id=%s: %s", user.id, e

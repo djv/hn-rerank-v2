@@ -9,6 +9,8 @@ import threading
 import time
 import tomllib
 from collections import Counter, OrderedDict
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, cast
 from datetime import datetime
@@ -70,6 +72,54 @@ _MODEL_CACHE: OrderedDict[tuple[int, str, int], tuple[SVC, StandardScaler]] = (
 )
 _MODEL_CACHE_LOCK = threading.Lock()
 _MODEL_SCHEMA_VERSION = 2  # +1 whenever meta-column schema changes (see ARCHITECTURE)
+
+
+@dataclass
+class RankTrace:
+    """Low-overhead timing and counters for one personalized rank run."""
+
+    timings_ms: dict[str, float] = field(default_factory=dict)
+    counts: dict[str, int] = field(default_factory=dict)
+    labels: dict[str, str] = field(default_factory=dict)
+
+    @contextmanager
+    def stage(self, name: str) -> Iterator[None]:
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.add_timing(name, (time.perf_counter() - start) * 1000)
+
+    def add_timing(self, name: str, elapsed_ms: float) -> None:
+        self.timings_ms[name] = self.timings_ms.get(name, 0.0) + elapsed_ms
+
+    def set_count(self, name: str, value: int) -> None:
+        self.counts[name] = value
+
+    def set_label(self, name: str, value: str) -> None:
+        self.labels[name] = value
+
+    def to_log_fields(self) -> dict[str, int | float | str]:
+        fields: dict[str, int | float | str] = {}
+        fields.update(self.counts)
+        fields.update(self.labels)
+        for name, value in self.timings_ms.items():
+            fields[f"{name}_ms"] = round(value, 1)
+        return fields
+
+    def format_log_fields(self) -> str:
+        fields = self.to_log_fields()
+        return " ".join(f"{key}={fields[key]}" for key in sorted(fields))
+
+
+@dataclass
+class RankScoreContext:
+    """Reusable arrays from one rank pass for downstream discovery badges."""
+
+    feedback_labels: list[int] = field(default_factory=list)
+    feedback_embeddings: NDArray[np.float32] | None = None
+    cand_closest_up: NDArray[np.float32] | None = None
+    cand_closest_down: NDArray[np.float32] | None = None
 
 
 def _feedback_signature(db: Database, user_id: int) -> str:
@@ -253,20 +303,18 @@ class Config:
     count: int = 40
     onnx_model_dir: str = "onnx_model"
     server_port: int = 8765
-    regen_interval_seconds: int = 10800
+    regen_interval_seconds: int = 14400
     regen_initial_delay_seconds: int = 30
     regen_prewarm_top_n: int = 50
     reddit_prewarm_top_n: int = 20
     prewarm_hn_full: bool = True
     prewarm_reddit_full: bool = True
     prewarm_lesswrong_full: bool = True
-    # Number of top-hot stories per subreddit to prewarm each cycle. With
-    # 41 subs in the topfeed, this yields 41 * N total prewarm candidates
-    # (e.g. 41 * 10 = 410). Multi-cycle completion is expected — see
-    # ``fetch_candidates_only`` for the 90-min drain semantics. The
-    # previous ``reddit_prewarm_max_per_cycle`` cap is now derived from
-    # this knob (no separate cap needed).
+    # Number of top-hot stories per subreddit considered for Reddit
+    # comment hydration each cycle. The hard per-cycle cap below keeps
+    # the total runtime bounded even with 41 subreddit feeds.
     reddit_prewarm_top_per_sub: int = 10
+    reddit_prewarm_max_per_cycle: int = 80
     # Minimum spacing (seconds) between any two Reddit fetches scheduled
     # via `reddit_fetch_queue.enqueue_all_reddit_fetches`. Used for the
     # prewarm phase; the topfeed phase uses a fixed 50s stride (one
@@ -298,7 +346,7 @@ class Config:
             count=main_cfg.get("count", 40),
             onnx_model_dir=main_cfg.get("onnx_model_dir", "onnx_model"),
             server_port=main_cfg.get("server_port", 8765),
-            regen_interval_seconds=main_cfg.get("regen_interval_seconds", 10800),
+            regen_interval_seconds=main_cfg.get("regen_interval_seconds", 14400),
             regen_initial_delay_seconds=main_cfg.get("regen_initial_delay_seconds", 30),
             regen_prewarm_top_n=main_cfg.get("regen_prewarm_top_n", 50),
             reddit_prewarm_top_n=main_cfg.get("reddit_prewarm_top_n", 20),
@@ -306,6 +354,9 @@ class Config:
             prewarm_reddit_full=main_cfg.get("prewarm_reddit_full", True),
             prewarm_lesswrong_full=main_cfg.get("prewarm_lesswrong_full", True),
             reddit_prewarm_top_per_sub=main_cfg.get("reddit_prewarm_top_per_sub", 10),
+            reddit_prewarm_max_per_cycle=main_cfg.get(
+                "reddit_prewarm_max_per_cycle", 80
+            ),
             reddit_min_fetch_spacing_seconds=main_cfg.get(
                 "reddit_min_fetch_spacing_seconds", 30.0
             ),
@@ -1756,6 +1807,8 @@ def _score_and_rank(
     config: Config,
     embedder: Embedder,
     user_id: int | None = None,
+    trace: RankTrace | None = None,
+    score_context: RankScoreContext | None = None,
 ) -> list[RankedStory]:
     if not candidates:
         return []
@@ -1768,12 +1821,21 @@ def _score_and_rank(
     )
 
     n_feedback = len(feedback_labels)
+    if trace is not None:
+        trace.set_count("feedback_total", n_feedback)
+    if score_context is not None:
+        score_context.feedback_labels = list(feedback_labels)
 
     # Multiclass SVM: 0=down, 1=neutral, 2=up
     unique_classes = set(feedback_labels)
     fb_labels_arr = np.array(feedback_labels)
     n_up = int((fb_labels_arr == 2).sum())
     n_down = int((fb_labels_arr == 0).sum())
+    n_neutral = int((fb_labels_arr == 1).sum())
+    if trace is not None:
+        trace.set_count("feedback_up", n_up)
+        trace.set_count("feedback_down", n_down)
+        trace.set_count("feedback_neutral", n_neutral)
 
     if (
         n_up >= config.model.min_up_for_svm
@@ -1781,7 +1843,25 @@ def _score_and_rank(
         and len(unique_classes) >= 2
     ):
         try:
-            fb_embeddings = get_or_compute_embeddings(feedback_stories, embedder, db)
+            # Model cache lookup is intentionally before training-feature
+            # construction. Cache hits still need candidate-side features,
+            # but they do not need LOOCV training matrices.
+            fb_sig = _feedback_signature(db, user_id) if user_id is not None else ""
+            cached_model: tuple[SVC, StandardScaler] | None = None
+            if fb_sig:
+                cached_model = _get_cached_model(user_id, fb_sig)
+
+            if trace is not None:
+                with trace.stage("feedback_embedding"):
+                    fb_embeddings = get_or_compute_embeddings(
+                        feedback_stories, embedder, db
+                    )
+            else:
+                fb_embeddings = get_or_compute_embeddings(
+                    feedback_stories, embedder, db
+                )
+            if score_context is not None:
+                score_context.feedback_embeddings = fb_embeddings
 
             # Personalization: mean/closest per class from ALL real feedback
             fb_labels_arr = np.array(feedback_labels)
@@ -1793,10 +1873,199 @@ def _score_and_rank(
             n_up = int(up_mask.sum())
             n_down = int(down_mask.sum())
             k = config.model.knn_k
+            emb_dim = candidate_embeddings.shape[1]
 
-            # k-NN similarity (mean of top-k similarities to class)
-            cand_sim_to_up = _knn_similarity(candidate_embeddings, fb_up_embs, k)
-            cand_sim_to_down = _knn_similarity(candidate_embeddings, fb_down_embs, k)
+            with (
+                trace.stage("svm_candidate_feature_prep")
+                if trace is not None
+                else nullcontext()
+            ):
+                # k-NN similarity (mean of top-k similarities to class)
+                cand_sim_to_up = _knn_similarity(candidate_embeddings, fb_up_embs, k)
+                cand_sim_to_down = _knn_similarity(
+                    candidate_embeddings, fb_down_embs, k
+                )
+                cand_closest_up = (
+                    np.max(candidate_embeddings @ fb_up_embs.T, axis=1)
+                    if up_mask.any()
+                    else np.zeros(len(candidates), dtype=np.float32)
+                )
+                cand_closest_down = (
+                    np.max(candidate_embeddings @ fb_down_embs.T, axis=1)
+                    if down_mask.any()
+                    else np.zeros(len(candidates), dtype=np.float32)
+                )
+                positive_cluster_centers = _positive_cluster_centers(
+                    fb_up_embs, config.model.positive_cluster_k
+                )
+                cand_positive_cluster_sim = _similarity_to_positive_cluster_centers(
+                    candidate_embeddings, positive_cluster_centers
+                )
+                cand_text_lengths = np.array([len(s.text_content) for s in candidates])
+                cand_source_onehot = source_category_stack(
+                    [s.source for s in candidates]
+                )
+                cand_is_hn_live = cand_source_onehot[:, 0]
+                cand_is_archive = cand_source_onehot[:, 1]
+                cand_is_reddit = cand_source_onehot[:, 2]
+                cand_is_rss = cand_source_onehot[:, 3]
+
+                cand_features = _svm_personalization_features(
+                    candidate_embeddings,
+                    text_lengths=cand_text_lengths,
+                    sim_to_upvoted=cand_sim_to_up,
+                    sim_to_downvoted=cand_sim_to_down,
+                    closest_upvoted=cand_closest_up,
+                    closest_downvoted=cand_closest_down,
+                    positive_cluster_similarity=cand_positive_cluster_sim,
+                    is_hn_live=cand_is_hn_live,
+                    is_archive=cand_is_archive,
+                    is_reddit=cand_is_reddit,
+                    is_rss=cand_is_rss,
+                )
+            if score_context is not None:
+                score_context.cand_closest_up = cand_closest_up.astype(np.float32)
+                score_context.cand_closest_down = cand_closest_down.astype(np.float32)
+
+            if cached_model is not None:
+                if trace is not None:
+                    trace.set_label("model_cache", "hit")
+                svm, scaler = cached_model
+            else:
+                if trace is not None:
+                    trace.set_label("model_cache", "miss")
+                with (
+                    trace.stage("svm_training_feature_prep")
+                    if trace is not None
+                    else nullcontext()
+                ):
+                    # LOOCV k-NN for training: exclude self from reference set
+                    fb_sim_to_up = np.zeros(len(fb_embeddings), dtype=np.float32)
+                    fb_sim_to_down = np.zeros(len(fb_embeddings), dtype=np.float32)
+                    if n_up > 0:
+                        up_indices = np.where(up_mask)[0]
+                        sim_up_mat = fb_embeddings @ fb_up_embs.T
+                        if n_up > 1:
+                            for idx, tp in enumerate(up_indices):
+                                sim_up_mat[tp, idx] = -2.0  # exclude self
+                        k_eff_up = min(k, n_up)
+                        for i in range(len(fb_embeddings)):
+                            sims = sim_up_mat[i]
+                            exclude = 1 if i in up_indices else 0
+                            n_available = max(1, n_up - exclude)
+                            k_use = min(k_eff_up, n_available)
+                            fb_sim_to_up[i] = _topk_mean(sims, k_use)
+                        sim_up_mat_clean = fb_embeddings @ fb_up_embs.T
+                        if n_up > 1:
+                            for idx, tp in enumerate(up_indices):
+                                sim_up_mat_clean[tp, idx] = -1.0
+                        fb_closest_up = np.max(sim_up_mat_clean, axis=1)
+                    else:
+                        fb_closest_up = np.zeros(len(fb_embeddings), dtype=np.float32)
+
+                    if n_down > 0:
+                        down_indices = np.where(down_mask)[0]
+                        sim_down_mat = fb_embeddings @ fb_down_embs.T
+                        if n_down > 1:
+                            for idx, tp in enumerate(down_indices):
+                                sim_down_mat[tp, idx] = -2.0
+                        k_eff_down = min(k, n_down)
+                        for i in range(len(fb_embeddings)):
+                            sims = sim_down_mat[i]
+                            exclude = 1 if i in down_indices else 0
+                            n_available = max(1, n_down - exclude)
+                            k_use = min(k_eff_down, n_available)
+                            fb_sim_to_down[i] = _topk_mean(sims, k_use)
+                        sim_down_mat_clean = fb_embeddings @ fb_down_embs.T
+                        if n_down > 1:
+                            for idx, tp in enumerate(down_indices):
+                                sim_down_mat_clean[tp, idx] = -1.0
+                        fb_closest_down = np.max(sim_down_mat_clean, axis=1)
+                    else:
+                        fb_closest_down = np.zeros(len(fb_embeddings), dtype=np.float32)
+
+                    fb_positive_cluster_sim = _similarity_to_positive_cluster_centers(
+                        fb_embeddings, positive_cluster_centers
+                    )
+
+                    fb_text_lengths = np.array(
+                        [len(s.text_content) for s in feedback_stories]
+                    )
+
+                    # 4-binary source category one-hot per feedback story.
+                    fb_source_onehot = source_category_stack(
+                        [s.source for s in feedback_stories]
+                    )
+                    fb_is_hn_live = fb_source_onehot[:, 0]
+                    fb_is_archive = fb_source_onehot[:, 1]
+                    fb_is_reddit = fb_source_onehot[:, 2]
+                    fb_is_rss = fb_source_onehot[:, 3]
+
+                    fb_features = _svm_personalization_features(
+                        fb_embeddings,
+                        text_lengths=fb_text_lengths,
+                        sim_to_upvoted=fb_sim_to_up,
+                        sim_to_downvoted=fb_sim_to_down,
+                        closest_upvoted=fb_closest_up,
+                        closest_downvoted=fb_closest_down,
+                        positive_cluster_similarity=fb_positive_cluster_sim,
+                        is_hn_live=fb_is_hn_live,
+                        is_archive=fb_is_archive,
+                        is_reddit=fb_is_reddit,
+                        is_rss=fb_is_rss,
+                    )
+
+                # Ensure all three classes (0, 1, 2) are present
+                missing = {0, 1, 2} - set(feedback_labels)
+                if missing:
+                    fb_features = np.concatenate(
+                        [
+                            fb_features,
+                            np.zeros(
+                                (len(missing), fb_features.shape[1]), dtype=np.float32
+                            ),
+                        ],
+                        axis=0,
+                    )
+                    labels = list(feedback_labels) + list(missing)
+                else:
+                    labels = list(feedback_labels)
+
+                # Compute balanced weights for real feedback; 1e-6 for dummies
+                counts = Counter(feedback_labels)
+                n_classes = len(counts)
+                n_real = len(feedback_labels)
+                weights = [
+                    n_real / (n_classes * counts[lbl]) for lbl in feedback_labels
+                ]
+                weights.extend([1e-6] * len(missing))
+                sample_weights = np.array(weights, dtype=np.float64)
+
+                scaler = StandardScaler()
+                fb_features_meta_scaled = np.clip(
+                    scaler.fit_transform(fb_features[:, emb_dim:]), -2.5, 2.5
+                )
+                fb_features_scaled = np.hstack(
+                    [fb_features[:, :emb_dim], fb_features_meta_scaled]
+                )
+                svm = SVC(
+                    C=config.model.svm_c,
+                    kernel=config.model.svm_kernel,
+                    gamma=config.model.svm_gamma,
+                    random_state=0,
+                    decision_function_shape="ovr",
+                )
+                if trace is not None:
+                    with trace.stage("svm_fit"):
+                        svm.fit(
+                            fb_features_scaled, labels, sample_weight=sample_weights
+                        )
+                else:
+                    svm.fit(fb_features_scaled, labels, sample_weight=sample_weights)
+                if fb_sig:
+                    _set_cached_model(
+                        user_id, fb_sig, svm, scaler, config.max_cached_models
+                    )
 
             # LOOCV k-NN for training: exclude self from reference set
             fb_sim_to_up = np.zeros(len(fb_embeddings), dtype=np.float32)
@@ -1942,37 +2211,25 @@ def _score_and_rank(
                         user_id, fb_sig, svm, scaler, config.max_cached_models
                     )
 
-            cand_text_lengths = np.array([len(s.text_content) for s in candidates])
-
-            cand_source_onehot = source_category_stack([s.source for s in candidates])
-            cand_is_hn_live = cand_source_onehot[:, 0]
-            cand_is_archive = cand_source_onehot[:, 1]
-            cand_is_reddit = cand_source_onehot[:, 2]
-            cand_is_rss = cand_source_onehot[:, 3]
-
-            cand_features = _svm_personalization_features(
-                candidate_embeddings,
-                text_lengths=cand_text_lengths,
-                sim_to_upvoted=cand_sim_to_up,
-                sim_to_downvoted=cand_sim_to_down,
-                closest_upvoted=cand_closest_up,
-                closest_downvoted=cand_closest_down,
-                positive_cluster_similarity=cand_positive_cluster_sim,
-                is_hn_live=cand_is_hn_live,
-                is_archive=cand_is_archive,
-                is_reddit=cand_is_reddit,
-                is_rss=cand_is_rss,
-            )
-            cand_features_meta_scaled = np.clip(
-                scaler.transform(cand_features[:, emb_dim:]), -2.5, 2.5
-            )
-            cand_features_scaled = np.hstack(
-                [cand_features[:, :emb_dim], cand_features_meta_scaled]
-            )
+            with (
+                trace.stage("svm_candidate_scale")
+                if trace is not None
+                else nullcontext()
+            ):
+                cand_features_meta_scaled = np.clip(
+                    scaler.transform(cand_features[:, emb_dim:]), -2.5, 2.5
+                )
+                cand_features_scaled = np.hstack(
+                    [cand_features[:, :emb_dim], cand_features_meta_scaled]
+                )
 
             class_order = list(svm.classes_)
             idx_up = class_order.index(2)
-            decision = svm.decision_function(cand_features_scaled)
+            if trace is not None:
+                with trace.stage("decision"):
+                    decision = svm.decision_function(cand_features_scaled)
+            else:
+                decision = svm.decision_function(cand_features_scaled)
             if decision.ndim == 1:
                 raw_scores = decision if class_order[-1] == 2 else -decision
                 probs = np.column_stack(
@@ -1984,6 +2241,8 @@ def _score_and_rank(
             scores = _minmax01(raw_scores)
         except Exception as e:
             logging.error(f"Failed to fit feedback SVM: {e}")
+    elif trace is not None:
+        trace.set_label("model_cache", "skipped")
 
     svm_scores = scores
     svm_probs = probs
@@ -1991,31 +2250,32 @@ def _score_and_rank(
     # Tier 2: centroid-based scores (always compute when feedback exists)
     tier2_scores: NDArray[np.float32] | None = None
     if n_feedback > 0:
-        fb_embs = get_or_compute_embeddings(feedback_stories, embedder, db)
-        fb_labels_arr = np.array(feedback_labels)
-        up_mask = fb_labels_arr == 2
-        down_mask = fb_labels_arr == 0
+        with trace.stage("tier2") if trace is not None else nullcontext():
+            fb_embs = get_or_compute_embeddings(feedback_stories, embedder, db)
+            fb_labels_arr = np.array(feedback_labels)
+            up_mask = fb_labels_arr == 2
+            down_mask = fb_labels_arr == 0
 
-        if up_mask.any() or down_mask.any():
-            up_emb = (
-                fb_embs[up_mask].mean(axis=0)
-                if up_mask.any()
-                else np.zeros(384, dtype=np.float32)
-            )
-            down_emb = (
-                fb_embs[down_mask].mean(axis=0)
-                if down_mask.any()
-                else np.zeros(384, dtype=np.float32)
-            )
+            if up_mask.any() or down_mask.any():
+                up_emb = (
+                    fb_embs[up_mask].mean(axis=0)
+                    if up_mask.any()
+                    else np.zeros(384, dtype=np.float32)
+                )
+                down_emb = (
+                    fb_embs[down_mask].mean(axis=0)
+                    if down_mask.any()
+                    else np.zeros(384, dtype=np.float32)
+                )
 
-            sim_up = candidate_embeddings @ up_emb
-            sim_down = candidate_embeddings @ down_emb
-            tier2_scores = sim_up - sim_down
-            tier2_scores = (tier2_scores - tier2_scores.min()) / (
-                tier2_scores.max() - tier2_scores.min() + 1e-8
-            )
-        else:
-            tier2_scores = np.full(len(candidates), 0.5, dtype=np.float32)
+                sim_up = candidate_embeddings @ up_emb
+                sim_down = candidate_embeddings @ down_emb
+                tier2_scores = sim_up - sim_down
+                tier2_scores = (tier2_scores - tier2_scores.min()) / (
+                    tier2_scores.max() - tier2_scores.min() + 1e-8
+                )
+            else:
+                tier2_scores = np.full(len(candidates), 0.5, dtype=np.float32)
 
     # Tier 1: HN gravity (frontpage-like) — always computed for cold-start blend.
     # Per-source priors are now learned by the SVM via the 4-binary source
@@ -2211,6 +2471,7 @@ def rerank_candidates(
     candidates: list[Story],
     cand_embeddings: NDArray[np.float32] | None = None,
     user_id: int | None = None,
+    trace: RankTrace | None = None,
 ) -> list[RankedStory]:
     """Rank candidates and attach discovery badges.
 
@@ -2223,9 +2484,15 @@ def rerank_candidates(
     """
     if not candidates:
         return []
+    if trace is not None:
+        trace.set_count("candidates", len(candidates))
 
     if cand_embeddings is None:
-        cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
+        if trace is not None:
+            with trace.stage("candidate_embedding"):
+                cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
+        else:
+            cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
 
     ranked = _score_and_rank(
         candidates,
@@ -2234,6 +2501,7 @@ def rerank_candidates(
         config,
         embedder,
         user_id=user_id,
+        trace=trace,
     )
 
     limit, _num_uncertain = _dashboard_primary_limit(config.count)
@@ -2250,35 +2518,38 @@ def rerank_candidates(
 
     selected_ids = {item.story.id for item in final}
 
-    # Calculate parameters for remaining discovery passes
-    feedback_stories, feedback_labels, _ = db.get_feedback_for_training(user_id=user_id)
-    fb_labels_arr = np.array(feedback_labels)
-    up_mask = fb_labels_arr == 2
-    down_mask = fb_labels_arr == 0
-    neutral_mask = fb_labels_arr == 1
-    fb_embeddings = get_or_compute_embeddings(feedback_stories, embedder, db)
-    fb_up_embs = fb_embeddings[up_mask]
-    fb_down_embs = fb_embeddings[down_mask]
-    fb_neutral_embs = fb_embeddings[neutral_mask]
+    with trace.stage("badge_similarity") if trace is not None else nullcontext():
+        # Calculate parameters for remaining discovery passes
+        feedback_stories, feedback_labels, _ = db.get_feedback_for_training(
+            user_id=user_id
+        )
+        fb_labels_arr = np.array(feedback_labels)
+        up_mask = fb_labels_arr == 2
+        down_mask = fb_labels_arr == 0
+        neutral_mask = fb_labels_arr == 1
+        fb_embeddings = get_or_compute_embeddings(feedback_stories, embedder, db)
+        fb_up_embs = fb_embeddings[up_mask]
+        fb_down_embs = fb_embeddings[down_mask]
+        fb_neutral_embs = fb_embeddings[neutral_mask]
 
-    cand_closest_up = (
-        np.max(cand_embeddings @ fb_up_embs.T, axis=1)
-        if up_mask.any()
-        else np.zeros(len(candidates))
-    )
-    cand_closest_down = (
-        np.max(cand_embeddings @ fb_down_embs.T, axis=1)
-        if down_mask.any()
-        else np.zeros(len(candidates))
-    )
-    cand_closest_neutral = (
-        np.max(cand_embeddings @ fb_neutral_embs.T, axis=1)
-        if neutral_mask.any()
-        else np.zeros(len(candidates))
-    )
-    cand_max_sim = np.maximum.reduce(
-        [cand_closest_up, cand_closest_down, cand_closest_neutral]
-    )
+        cand_closest_up = (
+            np.max(cand_embeddings @ fb_up_embs.T, axis=1)
+            if up_mask.any()
+            else np.zeros(len(candidates))
+        )
+        cand_closest_down = (
+            np.max(cand_embeddings @ fb_down_embs.T, axis=1)
+            if down_mask.any()
+            else np.zeros(len(candidates))
+        )
+        cand_closest_neutral = (
+            np.max(cand_embeddings @ fb_neutral_embs.T, axis=1)
+            if neutral_mask.any()
+            else np.zeros(len(candidates))
+        )
+        cand_max_sim = np.maximum.reduce(
+            [cand_closest_up, cand_closest_down, cand_closest_neutral]
+        )
 
     # Hoist now_ts and compute per-age-bucket metadata early so all
     # threshold computations below can produce per-candidate arrays.
@@ -2787,38 +3058,46 @@ def fast_rerank_for_user(
     config: Config,
     embedder: Embedder,
     user_id: int,
+    trace: RankTrace | None = None,
 ) -> list[RankedStory]:
     """Fast rerank for a specific user. Called on each dashboard request."""
+    if trace is not None:
+        trace.set_count("user_id", user_id)
     now_ts = int(time.time())
     cutoff_ts = now_ts - (config.days * 86400)
 
-    recent_rows = db.execute(
-        "SELECT id, title, url, score, time, text_content, source, comment_count, "
-        "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
-        "FROM stories WHERE time >= ? AND source NOT IN (?, ?) "
-        "AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?)",
-        (cutoff_ts, BQ_ARCHIVE_SOURCE, CH_ARCHIVE_SOURCE, user_id),
-    )
-    archive_rows = db.execute(
-        "SELECT id, title, url, score, time, text_content, source, comment_count, "
-        "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
-        "FROM stories WHERE source IN (?, ?) AND text_content != '' "
-        "AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?) "
-        "ORDER BY score DESC, time DESC LIMIT ?",
-        (
-            BQ_ARCHIVE_SOURCE,
-            CH_ARCHIVE_SOURCE,
-            user_id,
-            BQ_ARCHIVE_CANDIDATE_LIMIT + CH_ARCHIVE_CANDIDATE_LIMIT,
-        ),
-    )
+    with trace.stage("candidate_sql") if trace is not None else nullcontext():
+        recent_rows = db.execute(
+            "SELECT id, title, url, score, time, text_content, source, comment_count, "
+            "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
+            "FROM stories WHERE time >= ? AND source NOT IN (?, ?) "
+            "AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?)",
+            (cutoff_ts, BQ_ARCHIVE_SOURCE, CH_ARCHIVE_SOURCE, user_id),
+        )
+        archive_rows = db.execute(
+            "SELECT id, title, url, score, time, text_content, source, comment_count, "
+            "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
+            "FROM stories WHERE source IN (?, ?) AND text_content != '' "
+            "AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?) "
+            "ORDER BY score DESC, time DESC LIMIT ?",
+            (
+                BQ_ARCHIVE_SOURCE,
+                CH_ARCHIVE_SOURCE,
+                user_id,
+                BQ_ARCHIVE_CANDIDATE_LIMIT + CH_ARCHIVE_CANDIDATE_LIMIT,
+            ),
+        )
     rows = recent_rows + archive_rows
     candidates = [Database._row_to_story(row) for row in rows]
     candidates = [s for s in candidates if is_summarizable(s)]
+    if trace is not None:
+        trace.set_count("candidate_rows", len(rows))
+        trace.set_count("candidates", len(candidates))
     if not candidates:
         return []
 
-    cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
+    with trace.stage("candidate_embedding") if trace is not None else nullcontext():
+        cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
 
     ranked = rerank_candidates(
         db=db,
@@ -2827,9 +3106,11 @@ def fast_rerank_for_user(
         candidates=candidates,
         cand_embeddings=cand_embeddings,
         user_id=user_id,
+        trace=trace,
     )
 
-    return _apply_dedup_to_ranked(ranked, db, config, user_id)
+    with trace.stage("dedup") if trace is not None else nullcontext():
+        return _apply_dedup_to_ranked(ranked, db, config, user_id)
 
 
 def _apply_dedup_to_ranked(
@@ -2973,18 +3254,40 @@ async def fetch_candidates_only(
                 "in 5400s, continuing with partial cache"
             )
 
+    # Phase 1.5: persist cached topfeed stories into SQLite. The prewarm
+    # factories load each story row from the DB with `db.get_story`, so
+    # the rows must exist before prewarm is enqueued. Without this step
+    # brand-new topfeed discoveries would no-op through the prewarm
+    # factory's missing-row short-circuit.
+    if topfeed_factories and reddit_feed_urls:
+        for feed_url in reddit_feed_urls:
+            cached = reddit_feed_cache.get(feed_url)
+            if cached:
+                for story in cached:
+                    db.upsert_story(story)
+
     if config.prewarm_reddit_full and reddit_feed_urls:
         # Phase 2: prewarm. After the topfeed phase, read the cache and
         # take the first ``reddit_prewarm_top_per_sub`` stories per
         # subreddit. These are the hottest N per sub across all 41 subs.
-        # With N=10, that's 410 total candidates. Per-post RSS fetches
-        # for their comments are enqueued at the configured stride.
+        # Skip rows whose DB copy already has `top_comments` (already
+        # hydrated by a previous cycle), and stop at
+        # ``reddit_prewarm_max_per_cycle`` to keep the per-cycle work
+        # bounded under current rate limits.
         n_per_sub = config.reddit_prewarm_top_per_sub
+        max_per_cycle = config.reddit_prewarm_max_per_cycle
         for feed_url in reddit_feed_urls:
+            if max_per_cycle <= 0 or len(prewarm_ids) >= max_per_cycle:
+                break
             cached = reddit_feed_cache.get(feed_url)
             if not cached:
                 continue
             for story in cached[:n_per_sub]:
+                if len(prewarm_ids) >= max_per_cycle:
+                    break
+                existing = db.get_story(story.id)
+                if existing and existing.top_comments:
+                    continue
                 prewarm_ids.append(story.id)
 
         if prewarm_ids:

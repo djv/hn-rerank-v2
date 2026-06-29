@@ -5,6 +5,80 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-29 — Rank-path instrumentation and cold/warm SVM benchmark
+
+**Goal.** Make heavy-vote reload latency diagnosable before changing the
+model or caching strategy. The suspected bottleneck was cold RBF SVM
+training, but the live path also rebuilds feedback/candidate similarity
+features on model-cache hits.
+
+**Changes.** Added `pipeline.RankTrace`, an optional low-overhead timing
+collector passed through `fast_rerank_for_user`, `rerank_candidates`, and
+`_score_and_rank`. Completed dashboard warms now emit one `rank_perf`
+line with candidate counts, feedback counts by class,
+`model_cache=hit|miss|skipped`, and timings for candidate SQL, candidate
+embeddings, feedback embeddings, SVM feature prep, `SVC.fit`,
+`decision_function`, tier-2 scoring, badge similarity work, dedup, and
+total rank time. The `_score_and_rank` refactor also moves training-
+feature construction (LOOCV k-NN) into the cache-miss branch so cache
+hits skip the ~O(n_feedback²) work entirely.
+
+**Benchmark.** New `scripts/benchmark_rank_cold_cache.py` opens the live
+DB read-only by default, selects the heaviest feedback user unless
+`--user-id` is provided, clears `_MODEL_CACHE` for cold runs, then repeats
+warm runs in-process. It preflights candidate/feedback embedding cache
+coverage and refuses to write in read-only mode; use
+`uv run python scripts/embed_remaining.py` first or pass `--allow-writes`
+explicitly.
+
+**Tests.** Added focused tests for trace formatting, SVM cache miss→hit
+trace labels, read-only DB opening, and benchmark JSON output with the
+rank function mocked.
+
+**Recovery note.** The original prior-session working tree also contained
+uncommitted `pipeline.py` changes for this work; those changes were lost
+when I (the agent on 2026-06-29) reverted `pipeline.py` to HEAD with
+`git checkout HEAD -- pipeline.py` while separating the WIP from the
+RSS `discussion_url` change. The missing `pipeline.py` content was
+recovered from the codex session JSONL
+`/home/dev/.codex/sessions/2026/06/29/rollout-2026-06-29T05-07-37-019f11c6-9fd3-7b53-905f-7c6cf9e9a083.jsonl`
+(plan mode, 1701 lines, 62 `RankTrace` references). The diff was mirrored
+structurally rather than verbatim (the codex session was generated
+against an older `pipeline.py` snapshot; line numbers and surrounding
+code have since shifted).
+
+---
+
+## 2026-06-29 — Reddit prewarm: persist topfeed before hydration, cap cycle work
+
+**Symptom.** Server logs showed Reddit topfeeds fetching regularly, but
+completed regens reported `Regen: reddit topfeed=41 prewarm=0`. A DB
+spot check found most Reddit rows still had empty `top_comments`, including
+fresh rows from the current day. The feed refresh was working; background
+comment hydration was not.
+
+**Root cause.** The two-phase Reddit flow read prewarm IDs from
+`reddit_feed_cache`, but `build_reddit_prewarm_factories` loads each story
+from SQLite with `db.get_story`. Topfeed rows were only upserted after the
+prewarm phase, so brand-new cached stories no-oped before any per-post RSS
+request could run. The attempted 410-task per-cycle prewarm was also too
+large for an hourly or 3-6h refresh cadence under the current Reddit rate
+limits.
+
+**Fix.** `fetch_candidates_only` now upserts cached Reddit topfeed stories
+before building prewarm factories (Phase 1.5). Prewarm selection skips rows
+whose DB copy already has `top_comments` and stops at
+`reddit_prewarm_max_per_cycle` (default 80). The default regen interval is
+now 4 hours (`regen_interval_seconds=14400`), and the docs describe the
+bounded same-cycle behavior instead of promising a 410-task multi-cycle
+sweep.
+
+**Tests.** Added focused coverage for same-cycle topfeed upsert before
+prewarm, the per-cycle prewarm cap, and the existing disabled/empty-cache
+branches.
+
+---
+
 ## 2026-06-29 — RSS discussion_url: capture `<comments>` element
 
 **Symptom.** Tildes and Lobsters stories in the dashboard showed no comments
