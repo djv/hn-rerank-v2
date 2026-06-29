@@ -5,6 +5,29 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-29 — Harden optimistic vote, undo, and revote ordering
+
+**Symptom.** The browser sent vote and undo saves as independent
+fetches. A quick `vote → undo → revote` on the same story could race on
+the server as `vote → revote → clear`, and stale failed-save handlers
+could also clear newer `lastVote`, `votedStoryIds`, or count state.
+
+**Fix.** Client feedback writes now serialize per story through a
+promise chain, so same-story operations reach `/api/feedback` in user
+intent order. `lastVote` is now a vote-state object with a unique ID,
+an `undone` flag, and a one-shot `countApplied` flag. Failed vote
+handlers only clear undo/voted state when their vote ID is still
+current, and count rollbacks skip votes that were already undone.
+Vote counts now use helpers for optimistic increment, undo decrement,
+and failed-save rollback.
+
+**Server guard.** `/api/feedback` now validates payloads explicitly:
+`story_id` must be a JSON integer (not bool), and `action` must be one
+of `up`, `neutral`, `down`, or `clear`; invalid payloads return 400
+without touching feedback, cache versions, warm renders, or regen state.
+
+---
+
 ## 2026-06-29 — Ready-gated post-vote refill without active-card advance
 
 **Symptom.** A successful vote could briefly flash or advance the next

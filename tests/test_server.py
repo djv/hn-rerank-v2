@@ -263,6 +263,52 @@ def test_feedback_post(test_env):
     assert regen_event.is_set()
 
 
+def test_feedback_post_rejects_invalid_action(test_env: Any) -> None:
+    port, db, regen_event, handler, user = test_env
+    db.upsert_story(
+        Story(
+            id=998,
+            title="Invalid action story",
+            url="https://example.com/invalid-action",
+            score=100,
+            time=1600000000,
+            text_content="Feedback body text",
+            source="hn",
+        )
+    )
+    regen_event.clear()
+
+    resp = httpx.post(
+        f"http://127.0.0.1:{port}/api/feedback",
+        json={"story_id": 998, "action": "sideways"},
+        cookies={"hn_token": user.token},
+    )
+
+    assert resp.status_code == 400
+    assert resp.json() == {"error": "Invalid feedback"}
+    assert db.get_all_feedback(user.id) == []
+    assert handler._dashboard_version(user.id) == 0
+    assert not regen_event.is_set()
+
+
+def test_feedback_post_rejects_malformed_story_id(test_env: Any) -> None:
+    port, db, regen_event, handler, user = test_env
+    regen_event.clear()
+
+    for story_id in ("999", None, True):
+        resp = httpx.post(
+            f"http://127.0.0.1:{port}/api/feedback",
+            json={"story_id": story_id, "action": "up"},
+            cookies={"hn_token": user.token},
+        )
+        assert resp.status_code == 400
+        assert resp.json() == {"error": "Invalid feedback"}
+
+    assert db.get_all_feedback(user.id) == []
+    assert handler._dashboard_version(user.id) == 0
+    assert not regen_event.is_set()
+
+
 def test_feedback_post_invalidates_cache_on_every_vote(test_env):
     """Every vote bumps the dashboard version and triggers a warm, regardless
     of client-supplied ``queue_remaining`` or ``refresh_ranking`` hints.
@@ -2312,6 +2358,102 @@ def test_undoLastVote_schedules_ready_gated_refill_on_success() -> None:
     undo_catch = undo_block.split("Network error undoing feedback", 1)[1]
     assert "showToast(" in undo_catch
     assert "refreshBannerText" not in undo_catch
+
+
+def test_feedback_client_serializes_per_story_operations() -> None:
+    """Same-story vote/undo/revote requests share one promise chain."""
+    _, inline_script = _read_template_and_static()
+    enqueue_block = inline_script.split("function enqueueFeedback(", 1)[1].split(
+        "function ", 1
+    )[0]
+    assert "feedbackChains = new Map()" in inline_script
+    assert "feedbackChains.get(storyId) || Promise.resolve()" in enqueue_block
+    assert ".catch(() => {})" in enqueue_block
+    assert ".then(() => sendFeedback(storyId, action))" in enqueue_block
+    assert "feedbackChains.set(storyId, tracked)" in enqueue_block
+
+    submit_vote_block = inline_script.split("function submitVote(", 1)[1].split(
+        "function ", 1
+    )[0]
+    undo_block = inline_script.split("function undoLastVote()", 1)[1].split(
+        "function ", 1
+    )[0]
+    assert "enqueueFeedback(storyId, action)" in submit_vote_block
+    assert "enqueueFeedback(storyId, 'clear')" in undo_block
+    assert "Promise.resolve(savePromise).finally" not in undo_block
+    assert "sendFeedback(storyId, 'clear'" not in undo_block
+
+
+def test_failed_vote_clears_last_vote_only_when_current() -> None:
+    """A failed save can clear undo state only for the current vote id."""
+    _, inline_script = _read_template_and_static()
+    assert "let nextVoteId = 1" in inline_script
+    submit_vote_block = inline_script.split("function submitVote(", 1)[1].split(
+        "function ", 1
+    )[0]
+    assert "id: nextVoteId++" in submit_vote_block
+    submit_catch = submit_vote_block.split("Network error submitting feedback", 1)[1]
+    assert "if (lastVote?.id === vote.id)" in submit_catch
+    guarded_block = submit_catch.split("if (lastVote?.id === vote.id)", 1)[1].split(
+        "showToast", 1
+    )[0]
+    assert "lastVote = null" in guarded_block
+    assert "votedStoryIds.delete(storyId)" in guarded_block
+    assert "delete card.dataset.voted" in guarded_block
+
+
+def test_stale_failed_vote_handler_does_not_remove_newer_vote_state() -> None:
+    """The failed-save rollback is guarded so stale handlers cannot undo revotes."""
+    _, inline_script = _read_template_and_static()
+    submit_vote_block = inline_script.split("function submitVote(", 1)[1].split(
+        "function ", 1
+    )[0]
+    submit_catch = submit_vote_block.split("Network error submitting feedback", 1)[1]
+    pre_guard = submit_catch.split("if (lastVote?.id === vote.id)", 1)[0]
+    assert "votedStoryIds.delete(storyId)" not in pre_guard
+    assert "delete card.dataset.voted" not in pre_guard
+
+
+def test_vote_count_helpers_apply_and_rollback_once() -> None:
+    """Vote counts increment optimistically, decrement on undo, and roll back
+    a failed save only when that vote was not already undone.
+    """
+    _, inline_script = _read_template_and_static()
+    assert "function adjustVoteCount(action, delta)" in inline_script
+    assert "function incrementVoteCount(vote)" in inline_script
+    assert "function decrementVoteCount(vote)" in inline_script
+    assert "if (vote.countApplied)" in inline_script
+    assert "if (!vote.countApplied)" in inline_script
+
+    submit_vote_block = inline_script.split("function submitVote(", 1)[1].split(
+        "function ", 1
+    )[0]
+    undo_block = inline_script.split("function undoLastVote()", 1)[1].split(
+        "function ", 1
+    )[0]
+    assert "incrementVoteCount(vote)" in submit_vote_block
+    assert "if (!vote.undone)" in submit_vote_block
+    assert "decrementVoteCount(vote)" in submit_vote_block
+    assert "vote.undone = true" in undo_block
+    assert "decrementVoteCount(vote)" in undo_block
+
+
+def test_revote_after_undo_cannot_be_followed_by_stale_clear() -> None:
+    """Undo clears through the per-story chain, so revote queues after clear."""
+    _, inline_script = _read_template_and_static()
+    undo_block = inline_script.split("function undoLastVote()", 1)[1].split(
+        "function ", 1
+    )[0]
+    assert "vote.undone = true" in undo_block
+    assert "delete card.dataset.voted" in undo_block
+    assert "setActiveCard(card)" in undo_block
+    assert "enqueueFeedback(storyId, 'clear')" in undo_block
+
+    submit_vote_block = inline_script.split("function submitVote(", 1)[1].split(
+        "function ", 1
+    )[0]
+    assert "if (!card || card.dataset.voted)" in submit_vote_block
+    assert "enqueueFeedback(storyId, action)" in submit_vote_block
 
 
 def test_silentRefill_serializes_concurrent_calls() -> None:

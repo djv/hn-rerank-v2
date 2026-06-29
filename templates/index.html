@@ -964,10 +964,12 @@
     let isRefilling = false;
     let activeCard = null;
     let lastVote = null;
+    let nextVoteId = 1;
     let currentSort = 'recommended';
     let currentAge = 'recent';
     let currentSource = 'mixed';
     const votedStoryIds = new Set();
+    const feedbackChains = new Map();
     const MAX_QUEUE = 12;
     const LOW_WATERMARK = 4;
     const PREFETCH_COUNT = 3;
@@ -1434,14 +1436,14 @@
       }
     }
 
-    function sendFeedback(storyId, action, queueRemaining) {
+    function sendFeedback(storyId, action) {
       return fetch(feedbackPath(), {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
           story_id: storyId,
           action,
-          queue_remaining: queueRemaining,
+          queue_remaining: queuedCards().length,
         })
       }).then(resp => {
         if (!resp.ok) {
@@ -1451,21 +1453,65 @@
       });
     }
 
+    function enqueueFeedback(storyId, action) {
+      const previous = feedbackChains.get(storyId) || Promise.resolve();
+      const next = previous
+        .catch(() => {})
+        .then(() => sendFeedback(storyId, action));
+      const tracked = next.finally(() => {
+        if (feedbackChains.get(storyId) === tracked) {
+          feedbackChains.delete(storyId);
+        }
+      });
+      feedbackChains.set(storyId, tracked);
+      return next;
+    }
+
+    function adjustVoteCount(action, delta) {
+      const countEl = document.querySelector(`[data-vote-count="${action}"]`);
+      if (!countEl) {
+        return;
+      }
+      const nextCount = Math.max(0, Number(countEl.textContent || '0') + delta);
+      countEl.textContent = String(nextCount);
+    }
+
+    function incrementVoteCount(vote) {
+      if (vote.countApplied) {
+        return;
+      }
+      adjustVoteCount(vote.action, 1);
+      vote.countApplied = true;
+    }
+
+    function decrementVoteCount(vote) {
+      if (!vote.countApplied) {
+        return;
+      }
+      adjustVoteCount(vote.action, -1);
+      vote.countApplied = false;
+    }
+
     function submitVote(action, card = activeCard) {
       if (!card || card.dataset.voted) {
         return;
       }
 
       const storyId = Number(card.dataset.storyId);
+      const vote = {
+        id: nextVoteId++,
+        storyId,
+        action,
+        card,
+        countApplied: false,
+        undone: false,
+      };
       votedStoryIds.add(storyId);
       card.dataset.voted = action;
       document.querySelectorAll('[data-fb]').forEach(btn => {
         btn.classList.toggle('active', btn.dataset.fb === action);
       });
-      const countEl = document.querySelector(`[data-vote-count="${action}"]`);
-      if (countEl) {
-        countEl.textContent = String(Number(countEl.textContent || '0') + 1);
-      }
+      incrementVoteCount(vote);
 
       if (action === 'up') {
         card.style.setProperty('--swipe-exit-x', '42px');
@@ -1486,8 +1532,7 @@
         }
       }, 150);
 
-      const queueRemaining = queuedCards().length;
-      const savePromise = sendFeedback(storyId, action, queueRemaining)
+      const savePromise = enqueueFeedback(storyId, action)
         .then(data => {
           if (typeof data.target_version === 'number') {
             scheduleRefillWhenRankingReady(data.target_version);
@@ -1496,12 +1541,19 @@
         })
         .catch(err => {
           console.error('Network error submitting feedback', err);
-          votedStoryIds.delete(storyId);
-          delete card.dataset.voted;
+          if (!vote.undone) {
+            decrementVoteCount(vote);
+          }
+          if (lastVote?.id === vote.id) {
+            lastVote = null;
+            votedStoryIds.delete(storyId);
+            delete card.dataset.voted;
+          }
           showToast('Vote failed to save', 'error');
         });
 
-      lastVote = { storyId, action, card, savePromise };
+      vote.savePromise = savePromise;
+      lastVote = vote;
     }
 
     function undoLastVote() {
@@ -1511,9 +1563,11 @@
       }
       lastVote = null;
 
-      const { storyId, action, card, savePromise } = vote;
+      const { storyId, card } = vote;
+      vote.undone = true;
       votedStoryIds.delete(storyId);
       delete card.dataset.voted;
+      decrementVoteCount(vote);
       card.classList.remove('fade-out');
       document.querySelectorAll('[data-fb]').forEach(btn => {
         btn.classList.remove('active');
@@ -1524,9 +1578,7 @@
       bindEvents();
       setActiveCard(card);
 
-      Promise.resolve(savePromise).finally(() => {
-        return sendFeedback(storyId, 'clear', queuedCards().length);
-      }).then(data => {
+      enqueueFeedback(storyId, 'clear').then(data => {
         if (typeof data.target_version === 'number') {
           scheduleRefillWhenRankingReady(data.target_version);
         }

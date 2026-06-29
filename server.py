@@ -848,8 +848,15 @@ class Handler(BaseHTTPRequestHandler):
             body = self.rfile.read(content_length)
             data = json.loads(body)
 
-            story_id = data["story_id"]
-            action = data["action"]
+            story_id = data.get("story_id")
+            action = data.get("action")
+            if (
+                not isinstance(story_id, int)
+                or isinstance(story_id, bool)
+                or action not in {"up", "neutral", "down", "clear"}
+            ):
+                self._json_response({"error": "Invalid feedback"}, status=400)
+                return
 
             if action == "clear":
                 self.db.delete_feedback(user.id, story_id)
