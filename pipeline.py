@@ -1089,10 +1089,18 @@ async def prewarm_lesswrong_stories(
         if ctx is None or not (ctx.self_text or ctx.top_comments):
             continue
 
-        # Idempotent: skip if already populated with equal or richer data
-        if story.top_comments and len(ctx.top_comments) <= len(story.top_comments):
-            continue
-        if story.self_text and len(ctx.self_text) <= len(story.self_text):
+        # Idempotent: skip only if BOTH top_comments and self_text are
+        # already populated with equal or richer data. Otherwise, the new
+        # data may have richer top_comments even when self_text is shorter
+        # (e.g. RSS snippet was truncated to SELF_TEXT_PROMPT_CHAR_LIMIT
+        # but the GraphQL body fits in fewer chars).
+        top_comments_fresh = not story.top_comments or len(ctx.top_comments) > len(
+            story.top_comments
+        )
+        self_text_fresh = not story.self_text or len(ctx.self_text) > len(
+            story.self_text
+        )
+        if not (top_comments_fresh or self_text_fresh):
             continue
 
         new_self_text = (
@@ -1116,6 +1124,7 @@ async def prewarm_lesswrong_stories(
             text_content=new_text_content,
             comment_count=story.comment_count or ctx.comment_count or None,
             comment_count_at_fetch=max(story.comment_count_at_fetch, ctx.comment_count),
+            score=max(story.score, ctx.score),
             discussion_url=story.discussion_url or story.url,
         )
         db.upsert_story(updated)

@@ -4687,6 +4687,113 @@ def test_fetch_candidates_only_prewarms_all_lesswrong_when_full(monkeypatch) -> 
         db.close()
 
 
+def test_prewarm_lesswrong_stories_refetches_when_only_one_field_is_stale(
+    monkeypatch,
+) -> None:
+    """Idempotency check must skip only when BOTH top_comments and self_text
+    are already populated with equal or richer data. If top_comments is
+    empty but self_text is already saturated (e.g. an RSS snippet was
+    truncated to SELF_TEXT_PROMPT_CHAR_LIMIT), the prewarm should still
+    fetch the new top_comments.
+    """
+    from server import LessWrongContext
+
+    db = Database(":memory:")
+    try:
+        # self_text already at the 8k cap (RSS-saturated); top_comments empty.
+        # The new GraphQL body is shorter than 8k so the OLD idempotency
+        # logic would skip this — but top_comments has fresh data, so we
+        # should still upsert.
+        db.upsert_story(
+            Story(
+                id=42,
+                title="saturated-rss-body",
+                url="https://www.lesswrong.com/posts/abc123/saturated",
+                score=0,
+                time=100,
+                text_content="placeholder",
+                source="rss_lesswrong_com",
+                self_text="x" * 8000,
+                top_comments="",
+            )
+        )
+
+        async def fake_fetch(post_id):
+            return LessWrongContext(
+                self_text="shorter new body from graphql",
+                top_comments="fresh comment from graphql",
+                comment_count=5,
+                score=42,
+            )
+
+        monkeypatch.setattr("server._fetch_lesswrong_context", fake_fetch)
+
+        updated = asyncio.run(
+            pipeline.prewarm_lesswrong_stories([42], db, embedder=None)
+        )
+        assert updated == 1
+        row = db.get_story(42)
+        assert row is not None
+        # Old behavior: skipped (no upsert). New behavior: upserted.
+        assert row.top_comments == "fresh comment from graphql"
+        assert row.score == 42
+        # self_text uses the longer of the two
+        assert len(row.self_text) == 8000
+
+    finally:
+        db.close()
+
+
+def test_prewarm_lesswrong_stories_skips_when_both_fields_already_richer(
+    monkeypatch,
+) -> None:
+    """If both top_comments and self_text are already populated and the
+    new data is no richer, skip (no upsert)."""
+    from server import LessWrongContext
+
+    db = Database(":memory:")
+    try:
+        long_body = "x" * 5000
+        long_comments = "y" * 5000
+        db.upsert_story(
+            Story(
+                id=43,
+                title="already-prewarmed",
+                url="https://www.lesswrong.com/posts/def456/already",
+                score=100,
+                time=100,
+                text_content="placeholder",
+                source="rss_lesswrong_com",
+                self_text=long_body,
+                top_comments=long_comments,
+            )
+        )
+
+        async def fake_fetch(post_id):
+            return LessWrongContext(
+                self_text="x" * 100,
+                top_comments="y" * 100,
+                comment_count=1,
+                score=10,
+            )
+
+        monkeypatch.setattr("server._fetch_lesswrong_context", fake_fetch)
+
+        updated = asyncio.run(
+            pipeline.prewarm_lesswrong_stories([43], db, embedder=None)
+        )
+        assert updated == 0
+        row = db.get_story(43)
+        assert row is not None
+        # Untouched
+        assert row.self_text == long_body
+        assert row.top_comments == long_comments
+        # score: max(100, 10) = 100 (no change)
+
+    finally:
+        db.close()
+
+
 def _clear_model_cache() -> None:
     _MODEL_CACHE.clear()
 

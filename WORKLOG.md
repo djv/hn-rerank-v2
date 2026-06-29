@@ -88,8 +88,26 @@ from `score=0, comment_count=7, comment_count_at_fetch=0` to
 
 **Tests.** `test_lesswrong_context_fetches_post_and_comments` and
 `test_tldr_detail_fetches_lesswrong_comments` updated to assert
-`ctx.score == 132` and `ctx.comment_count == 39`. Full suite:
-369 passed, 1 skipped (torch), 19.07s on `-n 4`.
+`ctx.score == 132` and `ctx.comment_count == 39`. Two new tests in
+`tests/test_pipeline.py` for the prewarm idempotency:
+`test_prewarm_lesswrong_stories_refetches_when_only_one_field_is_stale`
+(regression: stories with self_text already at the 8k cap but empty
+top_comments were being skipped), and
+`test_prewarm_lesswrong_stories_skips_when_both_fields_already_richer`
+(preserves the original skip behavior). Full suite: 375 passed, 1
+skipped (torch), 18.59s on `-n 4`.
+
+**Followup: prewarm idempotency fix.** First regen pass after the
+backfill populated 32/37 stories; the remaining 5 included 2 that
+had `self_text` already at `SELF_TEXT_PROMPT_CHAR_LIMIT=8000` from
+the RSS snippet. The old `if story.self_text and len(ctx.self_text) <=
+len(story.self_text): continue` check skipped them even though
+`top_comments` was empty and the new GraphQL body was richer. Replaced
+the OR'd `continue`s with: skip only if BOTH `top_comments` and
+`self_text` are already populated with equal or richer data. Re-ran
+the prewarm; 10/10 of the remaining stories updated (the 9 that
+didn't get top_comments are genuinely 0-comment posts on LW; the
+1 with cc=1 has a deleted comment with `htmlBody: None`).
 
 ---
 

@@ -111,6 +111,7 @@ class LessWrongContext:
     self_text: str = ""
     top_comments: str = ""
     comment_count: int = 0
+    score: int = 0
 
 
 @dataclass(frozen=True)
@@ -314,7 +315,7 @@ async def _fetch_reddit_rss_context(url: str | None) -> RedditRssContext | None:
 async def _fetch_lesswrong_context(post_id: str) -> LessWrongContext | None:
     query = (
         '{ post(input: { selector: { _id: "%s" } }) { result { _id '
-        "commentCount contents { html } } } "
+        "commentCount baseScore contents { html } } } "
         'comments(input: { terms: { view: "postCommentsTop", '
         'postId: "%s" } }) { results { _id author baseScore '
         "htmlBody postedAt } } }"
@@ -360,7 +361,8 @@ async def _fetch_lesswrong_context(post_id: str) -> LessWrongContext | None:
     return LessWrongContext(
         self_text=self_text,
         top_comments=" ".join(comments)[:COMMENT_PROMPT_CHAR_LIMIT],
-        comment_count=len(comments),
+        comment_count=int(post.get("commentCount") or len(comments)),
+        score=int(post.get("baseScore") or 0),
     )
 
 
@@ -969,6 +971,7 @@ class Handler(BaseHTTPRequestHandler):
                                     story.comment_count_at_fetch,
                                     lw_context.comment_count,
                                 ),
+                                score=max(story.score, lw_context.score),
                             )
                             self.db.upsert_story(story)
 

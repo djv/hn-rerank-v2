@@ -1416,7 +1416,8 @@ async def test_lesswrong_context_fetches_post_and_comments(monkeypatch):
             "post": {
                 "result": {
                     "_id": "3TpvKNKAvFGDc5b5k",
-                    "commentCount": 4,
+                    "commentCount": 39,
+                    "baseScore": 132,
                     "contents": {"html": "<p>Post body with <b>key</b> insight.</p>"},
                 }
             },
@@ -1465,7 +1466,8 @@ async def test_lesswrong_context_fetches_post_and_comments(monkeypatch):
     assert "gwern" in ctx.top_comments
     assert "Great point about X" in ctx.top_comments
     assert "/u/gwern" in ctx.top_comments
-    assert ctx.comment_count == 2
+    assert ctx.comment_count == 39
+    assert ctx.score == 132
 
 
 def test_tldr_detail_fetches_lesswrong_comments(test_env, monkeypatch):
@@ -1494,7 +1496,8 @@ def test_tldr_detail_fetches_lesswrong_comments(test_env, monkeypatch):
         return server.LessWrongContext(
             self_text="Post body with key insight.",
             top_comments="/u/gwern: Great point about X.",
-            comment_count=1,
+            comment_count=39,
+            score=132,
         )
 
     async def mock_fetch_article_body(url):
@@ -1526,7 +1529,8 @@ def test_tldr_detail_fetches_lesswrong_comments(test_env, monkeypatch):
     assert updated_story.discussion_url == (
         "https://www.lesswrong.com/posts/3TpvKNKAvFGDc5b5k/and-what-happens-next"
     )
-    assert updated_story.comment_count == 1
+    assert updated_story.comment_count == 39
+    assert updated_story.score == 132
 
 
 def test_dashboard_has_source_filter_toggle():
