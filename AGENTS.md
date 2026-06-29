@@ -13,6 +13,57 @@
 - **Never delete or destructively modify the local database** (`hn_rewrite.db`, `hn.db`, or any `*.db` file in the working tree). The DB holds the user's accumulated feedback and is the single source of truth for personalization. No `rm`, no `DELETE FROM` without a `WHERE` clause that excludes all rows, no schema migrations that drop tables or columns with data. The pipeline's own `prune_stories` and `prune_*` operations are fine — they have explicit retention rules and `id NOT IN (SELECT story_id FROM feedback)` guards. When in doubt, ask before running any command that touches the DB file.
   - **Exception (2026-06-22):** 756 test/empty stories (time=0) were deleted with explicit user permission. This included 2 test stories (id=999 "Test", id=99999998 "Test regen live") that received 2 upvotes from user 1. Backup retained at `hn_rewrite.db.pre_test_removal_20260622T163344Z`.
 - Keep test execution times optimized (target under 12 seconds total at `-n 4`). Run the full suite with `uv run pytest tests/ -n 4` (4 cores; `pytest-xdist` is in `dev`). Single-process takes ~32s; `-n 4` brings it to ~22s on this host. Per-test ONNX model loads are avoided entirely by `MockEmbedder(Embedder)` in `tests/test_server.py:18` (overrides `__init__` to skip the `AutoTokenizer.from_pretrained` + `ort.InferenceSession` path) and `DummyEmbedder(Embedder)` in the two seed test files — they share a module-scoped `mock_embedder` fixture in `test_server.py`. The remaining ~22s is dominated by `test_leak_check_smoke` (10s) and `test_leak_check_flag_in_help` (3s) in `test_eval_ranker_variants.py` (subprocesses that run real sklearn). Do not regress this: any new "mock" embedder that subclasses `pipeline.Embedder` MUST override `__init__` or it will silently reload ONNX per test.
+- **Never silently lose uncommitted work.** The working tree can hold
+  modifications from a prior session (Codex, codex, opencode, human
+  hand-edits). Treat any pre-existing uncommitted change as load-bearing
+  until proven otherwise. Three operational rules:
+
+  1. **Inventory before any `git stash`, `git checkout`, `git restore`,
+     `git reset`, or `git clean` operation.** Run `git status --short`
+     and `git diff --stat` first, write down (or paste into the chat)
+     the full set of modified and untracked files. If the operation
+     targets a subset, confirm the subset is exhaustive — i.e. that no
+     file outside the subset holds uncommitted changes you need.
+
+  2. **Never `git checkout HEAD -- <file>` on a file that has uncommitted
+     changes in the working tree unless the file is explicitly listed
+     in a fresh stash and you've just verified it with `git diff <file>`
+     showing no diff.** A bare `git checkout HEAD -- file` discards the
+     file's working-tree state with no warning, no backup, no recovery
+     short of `git fsck --unreachable`.
+
+  3. **Default to `git stash push -u` with no file list** when the goal
+     is "save the entire WIP before doing something different." If you
+     need a partial stash, use `git stash push -- <file1> <file2> ...`
+     *only after* step 1 confirms those are the only files with WIP.
+     For surgical hunk selection, prefer `git stash -p` so every hunk is
+     visible. Never combine a partial stash with a `git checkout HEAD`
+     on the un-stashed files in the same logical operation.
+
+  - **Use a worktree for parallel work on an existing WIP.** When you
+    need to make a separate change on top of an uncommitted WIP, prefer
+    `git worktree add ../hn-rewrite-<branch> -b <branch>` to a second
+    working tree. The WIP stays untouched in the original tree, and
+    you can `git stash`/commit at your own pace in the new tree without
+    risking a partial-loss operation in the original.
+
+  - **Recovery hint**: even after a bad `git checkout`, the pre-checkout
+    blob may still exist in the object store as an unreachable object.
+    `git fsck --unreachable --no-reflogs` lists candidates. `git show
+    <sha>:<path>` recovers the file. This is best-effort — `git gc`
+    prunes unreachable objects after the default 30-day window, and a
+    subsequent `git add` may have overwritten the index entry.
+
+  - **Codex/codex session logs are recovery hints, not source of truth.**
+    If a prior codex or Codex session exists for a WIP, it may help
+    reconstruct lost code, but: (a) the diffs are against an older
+    snapshot of the tree, (b) line numbers and surrounding code may have
+    shifted, (c) the session may show *attempted* patches that were
+    never applied cleanly. Mirror structurally, not verbatim, and verify
+    with tests. Record the recovery (and the loss) in WORKLOG.md so the
+    git history is self-documenting — the next person reading the blame
+    should see what happened and what was reconstructed.
+
 - **Always update relevant documentation** (e.g., [ARCHITECTURE.md](file:///home/dev/hn-rewrite/ARCHITECTURE.md), [WORKLOG.md](file:///home/dev/hn-rewrite/WORKLOG.md)) after making code or behavior changes.
 
 ## Running scripts
