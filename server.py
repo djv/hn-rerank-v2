@@ -738,6 +738,16 @@ class Handler(BaseHTTPRequestHandler):
 
                 lock = cls._get_render_lock(user.id)
                 with lock:
+                    with cls._dashboard_versions_guard:
+                        if cls._dashboard_versions.get(user.id, 0) != version:
+                            logging.info(
+                                "dashboard_warm user_id=%s version=%s result=skipped_stale_after_lock elapsed_ms=%.1f",
+                                user.id,
+                                version,
+                                (time.perf_counter() - warm_start) * 1000,
+                            )
+                            return
+
                     cached = cls._dashboard_cache.get(f"dashboard_{user.id}")
                     if cached and cached[2] == version:
                         return
@@ -874,10 +884,11 @@ class Handler(BaseHTTPRequestHandler):
             # gating left the cached HTML stale for up to ~9s per burst;
             # the SWR stale-hit path then re-injected already-voted
             # stories via refillQueue (the bug observed on 2026-06-28).
-            # Bursty votes still produce N sequential warm threads per
-            # user; the existing version-skip check in _trigger_warm
-            # discards obsolete results, and the render lock serializes
-            # them, so only the latest version lands in the cache.
+            # Bursty votes still produce N warm threads per user; the
+            # version checks in _trigger_warm discard obsolete jobs before
+            # ranking, including jobs that became stale while waiting on
+            # the per-user render lock, so only the latest version ranks
+            # and lands in the cache.
             version = self._invalidate_dashboard_cache(user.id)
             self._trigger_warm(user, version)
 

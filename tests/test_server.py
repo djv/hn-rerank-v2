@@ -852,6 +852,58 @@ def test_stale_warm_does_not_overwrite_newer_cache_version(
     assert cached[2] == 0
 
 
+def test_stale_warm_after_lock_wait_does_not_rank(
+    test_env, mock_embedder, monkeypatch
+) -> None:
+    _, db, _, _, user = test_env
+
+    class TestHandler(Handler):
+        pass
+
+    TestHandler.config = Config(db_path=db.db_path, server_port=0)
+    TestHandler.db = db
+    TestHandler.embedder = mock_embedder
+    TestHandler._dashboard_cache = {}
+    TestHandler._dashboard_versions = {}
+    TestHandler._render_locks = {}
+    TestHandler._warmup_in_flight = set()
+    TestHandler._warmup_in_flight_guard = threading.Lock()
+    TestHandler._WARM_DEBOUNCE_S = 0.01
+
+    rank_called = threading.Event()
+
+    def fake_fast_rerank_for_user(database, config, embedder, user_id):
+        rank_called.set()
+        return []
+
+    def fake_generate_dashboard_bytes(ranked, config, database, user_id, user_token):
+        return b"stale warm content"
+
+    import pipeline
+
+    monkeypatch.setattr(pipeline, "fast_rerank_for_user", fake_fast_rerank_for_user)
+    monkeypatch.setattr(
+        pipeline, "generate_dashboard_bytes", fake_generate_dashboard_bytes
+    )
+
+    cache_key = f"dashboard_{user.id}"
+    lock = TestHandler._get_render_lock(user.id)
+    TestHandler._dashboard_versions[user.id] = 1
+
+    with lock:
+        TestHandler._trigger_warm(user, version=1)
+        time.sleep(0.05)
+        TestHandler._dashboard_versions[user.id] = 2
+
+    deadline = time.time() + 3.0
+    while TestHandler._warmup_in_flight and time.time() < deadline:
+        time.sleep(0.05)
+
+    assert not TestHandler._warmup_in_flight
+    assert not rank_called.is_set()
+    assert cache_key not in TestHandler._dashboard_cache
+
+
 @pytest.fixture(scope="module")
 def prop_db():
     with TemporaryDirectory() as temp_dir:

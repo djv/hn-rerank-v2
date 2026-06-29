@@ -565,6 +565,29 @@ user version, and verifies the stale warm does not replace the existing cache.
 
 ---
 
+## 2026-06-29 — Skip stale warm jobs after the per-user render lock
+
+**Symptom.** Rapid voting could queue multiple same-user warm jobs behind the
+per-user render lock. Older jobs passed the debounce-time version check, waited
+behind an active render, became stale, and still spent several seconds in
+`fast_rerank_for_user()` before the later pre-commit stale guard discarded
+their result. Enough stale jobs in front of the latest version could delay the
+client's 30s readiness poll.
+
+**Fix.** `_trigger_warm()` now rechecks `_dashboard_versions[user.id]` under
+`_dashboard_versions_guard` immediately after acquiring the per-user render
+lock and before cache lookup or ranking. Stale jobs log
+`result=skipped_stale_after_lock` and return without ranking. The existing
+debounce-time `skipped_stale` guard and post-rank
+`skipped_stale_after_rank` cache-commit guard remain in place.
+
+**Tests.** Added `test_stale_warm_after_lock_wait_does_not_rank`, which holds
+the render lock, starts a version-1 warm, bumps the user to version 2 while the
+warm is queued, releases the lock, and verifies ranking is not called and no
+version-1 cache entry is written.
+
+---
+
 ## 2026-06-29 — Widen CH live window from 7d to 30d; raise limit to 5000
 
 **Change.** `pipeline.LIVE_WINDOW_LIMIT` 2000 → 5000; `fetch_candidates`
