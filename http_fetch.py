@@ -11,14 +11,25 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 
 def urllib_fetch(url: str, user_agent: str) -> tuple[int, str]:
-    """Sync fetch via urllib (used as fallback when httpx is blocked)."""
+    """Sync fetch via urllib (used as fallback when httpx is blocked).
+
+    Returns ``(status, body)``. On HTTP error status (4xx/5xx), the
+    ``HTTPError`` is caught and the status code is returned with an
+    empty body so callers can handle 403/429/etc. uniformly without
+    exceptions. Network-level errors (URLError, TimeoutError) still
+    propagate.
+    """
     req = Request(url, headers={"User-Agent": user_agent})
-    with urlopen(req, timeout=15) as resp:
-        return resp.status, resp.read().decode("utf-8", errors="replace")
+    try:
+        with urlopen(req, timeout=15) as resp:
+            return resp.status, resp.read().decode("utf-8", errors="replace")
+    except HTTPError as e:
+        return e.code, ""
 
 
 async def fetch_with_urllib_fallback(
