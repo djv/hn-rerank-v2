@@ -588,7 +588,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(302)
                 self.send_header("Location", "../")
                 self.send_header(
-                    "Set-Cookie", f"hn_token={user.token}; Path=/; Max-Age=31536000"
+                    "Set-Cookie",
+                    f"hn_token={user.token}; Path=/; Max-Age=31536000; SameSite=Lax; HttpOnly",
                 )
                 self.end_headers()
                 return
@@ -608,11 +609,12 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/", "/index.html"):
             user = self._get_user()
             if not user:
-                token = secrets.token_hex(4)
+                token = secrets.token_hex(16)
                 self.send_response(302)
                 self.send_header("Location", f"u/{token}")
                 self.send_header(
-                    "Set-Cookie", f"hn_token={token}; Path=/; Max-Age=31536000"
+                    "Set-Cookie",
+                    f"hn_token={token}; Path=/; Max-Age=31536000; SameSite=Lax; HttpOnly",
                 )
                 self.end_headers()
                 return
@@ -864,7 +866,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json_response({"ok": True, "ranking_refresh_queued": True})
             except Exception as e:
                 logging.error(f"Error handling feedback: {e}")
-                self._json_response({"error": str(e)}, status=400)
+                self._json_response({"error": "Internal error"}, status=400)
         elif self.path == "/api/tldr-detail":
             try:
                 content_length = int(self.headers.get("Content-Length", 0))
@@ -1074,7 +1076,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json_response({"ok": True, "tldr": tldr, "cached": False})
             except Exception as e:
                 logging.error(f"Error handling tldr-detail: {e}")
-                self._json_response({"error": str(e)}, status=400)
+                self._json_response({"error": "Internal error"}, status=400)
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
 
