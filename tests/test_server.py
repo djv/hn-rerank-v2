@@ -812,7 +812,7 @@ def test_stale_warm_render_does_not_overwrite_current_cache(
     assert TestHandler._dashboard_cache[cache_key][2] == new_version
 
 
-def test_stale_warm_does_not_overwrite_newer_cache_version(
+def test_active_warm_commits_when_dashboard_version_advances(
     test_env, mock_embedder, monkeypatch
 ) -> None:
     _, db, _, _, user = test_env
@@ -861,11 +861,11 @@ def test_stale_warm_does_not_overwrite_newer_cache_version(
     _drain_warms(TestHandler)
 
     cached = TestHandler._dashboard_cache[cache_key]
-    assert cached[0] == b"stale content"
-    assert cached[2] == 0
+    assert cached[0] == b"fresh content"
+    assert cached[2] == 1
 
 
-def test_stale_warm_after_lock_wait_does_not_rank(
+def test_active_warm_after_lock_wait_still_ranks_and_commits(
     test_env, mock_embedder, monkeypatch
 ) -> None:
     _, db, _, _, user = test_env
@@ -909,8 +909,9 @@ def test_stale_warm_after_lock_wait_does_not_rank(
     _drain_warms(TestHandler)
 
     assert not _has_pending_warm(TestHandler)
-    assert not rank_called.is_set()
-    assert cache_key not in TestHandler._dashboard_cache
+    assert rank_called.is_set()
+    assert TestHandler._dashboard_cache[cache_key][0] == b"stale warm content"
+    assert TestHandler._dashboard_cache[cache_key][2] == 1
 
 
 def test_rapid_vote_warms_coalesce_to_latest_version(
@@ -2684,9 +2685,41 @@ def test_ready_gated_refill_uses_non_advancing_refill() -> None:
         "async function waitForRankingReady", 1
     )[0]
     assert "const ready = await waitForRankingReady(version)" in block
-    assert "latestWarmVersionSeen === version" in block
     assert "await waitForVoteRemoval()" in block
     assert "queueRefill(false)" in block
+    assert "activeWarmVersion = queuedWarmVersion" in block
+    assert "queuedWarmVersion = null" in block
+
+
+def test_ready_gated_refill_drains_active_before_queued_version() -> None:
+    _, inline_script = _read_template_and_static()
+    schedule_block = inline_script.split("function scheduleDeckRefresh(", 1)[1].split(
+        "function queueRefill", 1
+    )[0]
+    assert "lastScheduledWarmVersion" in schedule_block
+    assert "targetVersion <= lastScheduledWarmVersion" in schedule_block
+    assert "activeWarmVersion === null" in schedule_block
+    assert "activeWarmVersion = targetVersion" in schedule_block
+    assert "queuedWarmVersion = targetVersion" in schedule_block
+
+    loop_block = inline_script.split("async function runWarmPollLoop()", 1)[1].split(
+        "async function waitForRankingReady", 1
+    )[0]
+    assert "while (activeWarmVersion !== null)" in loop_block
+    assert "const version = activeWarmVersion" in loop_block
+    assert "queueRefill(false)" in loop_block
+    assert "activeWarmVersion = queuedWarmVersion" in loop_block
+
+
+def test_waitForRankingReady_poll_is_not_aborted_by_newer_warm() -> None:
+    _, inline_script = _read_template_and_static()
+    block = inline_script.split("async function waitForRankingReady(", 1)[1].split(
+        "sortTabs.forEach", 1
+    )[0]
+    assert "rankingReadyPath(version)" in block
+    assert "latestWarmVersionSeen" not in block
+    assert "lastScheduledWarmVersion" not in block
+    assert "activeWarmVersion" not in block
 
 
 def test_waitForRankingReady_timeout_does_not_refill() -> None:

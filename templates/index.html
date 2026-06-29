@@ -977,8 +977,9 @@
     let refillInFlight = false;
     let queuedRefillAdvance = null;
     let warmPollInFlight = false;
-    let pendingWarmVersion = null;
-    let latestWarmVersionSeen = null;
+    let activeWarmVersion = null;
+    let queuedWarmVersion = null;
+    let lastScheduledWarmVersion = null;
 
     function cards() {
       return Array.from(storiesContainer.querySelectorAll('.story-card'));
@@ -1222,12 +1223,16 @@
         if (typeof targetVersion !== 'number' || !Number.isFinite(targetVersion) || targetVersion < 0) {
           return;
         }
-        if (latestWarmVersionSeen !== null && targetVersion <= latestWarmVersionSeen) {
+        if (lastScheduledWarmVersion !== null && targetVersion <= lastScheduledWarmVersion) {
           return;
         }
-        latestWarmVersionSeen = targetVersion;
-        pendingWarmVersion = targetVersion;
-        runWarmPollLoop();
+        lastScheduledWarmVersion = targetVersion;
+        if (activeWarmVersion === null) {
+          activeWarmVersion = targetVersion;
+          runWarmPollLoop();
+        } else {
+          queuedWarmVersion = targetVersion;
+        }
         return;
       }
 
@@ -1265,20 +1270,19 @@
       }
       warmPollInFlight = true;
       try {
-        while (pendingWarmVersion !== null) {
-          const version = pendingWarmVersion;
-          pendingWarmVersion = null;
+        while (activeWarmVersion !== null) {
+          const version = activeWarmVersion;
           const ready = await waitForRankingReady(version);
-          if (ready && latestWarmVersionSeen === version && pendingWarmVersion === null) {
+          if (ready) {
             await waitForVoteRemoval();
-            if (latestWarmVersionSeen === version && pendingWarmVersion === null) {
-              queueRefill(false);
-            }
+            queueRefill(false);
           }
+          activeWarmVersion = queuedWarmVersion;
+          queuedWarmVersion = null;
         }
       } finally {
         warmPollInFlight = false;
-        if (pendingWarmVersion !== null) {
+        if (activeWarmVersion !== null) {
           runWarmPollLoop();
         }
       }
@@ -1287,20 +1291,14 @@
     async function waitForRankingReady(version) {
       const startedAt = Date.now();
       let delayMs = 400;
-      while (latestWarmVersionSeen === version && Date.now() - startedAt <= 30000) {
+      while (Date.now() - startedAt <= 30000) {
         await new Promise(resolve => window.setTimeout(resolve, delayMs));
-        if (latestWarmVersionSeen !== version) {
-          return false;
-        }
         try {
           const resp = await fetch(rankingReadyPath(version), { cache: 'no-store' });
           if (!resp.ok) {
             throw new Error(`Ranking readiness failed: ${resp.status}`);
           }
           const data = await resp.json();
-          if (latestWarmVersionSeen !== version) {
-            return false;
-          }
           if (data.ready) {
             return true;
           }

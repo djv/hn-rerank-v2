@@ -779,9 +779,14 @@ class Handler(BaseHTTPRequestHandler):
     @classmethod
     def _run_warm_attempt(cls, user: User, requested_version: int) -> None:
         warm_start = time.perf_counter()
+        cache_key = f"dashboard_{user.id}"
+
+        cached = cls._dashboard_cache.get(cache_key)
+        if cached and cached[2] >= requested_version:
+            return
 
         with cls._dashboard_versions_guard:
-            if cls._dashboard_versions.get(user.id, 0) != requested_version:
+            if cls._dashboard_versions.get(user.id, 0) < requested_version:
                 logging.info(
                     "dashboard_warm user_id=%s version=%s result=skipped_stale elapsed_ms=%.1f",
                     user.id,
@@ -792,18 +797,8 @@ class Handler(BaseHTTPRequestHandler):
 
         lock = cls._get_render_lock(user.id)
         with lock:
-            with cls._dashboard_versions_guard:
-                if cls._dashboard_versions.get(user.id, 0) != requested_version:
-                    logging.info(
-                        "dashboard_warm user_id=%s version=%s result=skipped_stale_after_lock elapsed_ms=%.1f",
-                        user.id,
-                        requested_version,
-                        (time.perf_counter() - warm_start) * 1000,
-                    )
-                    return
-
-            cached = cls._dashboard_cache.get(f"dashboard_{user.id}")
-            if cached and cached[2] == requested_version:
+            cached = cls._dashboard_cache.get(cache_key)
+            if cached and cached[2] >= requested_version:
                 return
 
             from pipeline import (
@@ -836,15 +831,17 @@ class Handler(BaseHTTPRequestHandler):
             html_ms = (time.perf_counter() - html_start) * 1000
 
             with cls._dashboard_versions_guard:
-                if cls._dashboard_versions.get(user.id, 0) != requested_version:
+                cached = cls._dashboard_cache.get(cache_key)
+                if cached and cached[2] > requested_version:
                     logging.info(
-                        "dashboard_warm user_id=%s version=%s result=skipped_stale_after_rank elapsed_ms=%.1f",
+                        "dashboard_warm user_id=%s version=%s result=skipped_newer_cache_after_rank elapsed_ms=%.1f cache_version=%s",
                         user.id,
                         requested_version,
                         (time.perf_counter() - warm_start) * 1000,
+                        cached[2],
                     )
                     return
-                cls._dashboard_cache[f"dashboard_{user.id}"] = (
+                cls._dashboard_cache[cache_key] = (
                     html,
                     time.time(),
                     requested_version,

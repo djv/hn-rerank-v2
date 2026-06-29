@@ -5,6 +5,42 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-29 — Rapid-vote warm drain keeps early results
+
+**Problem.** The vote-triggered warm poll lane superseded an active poll when
+a newer vote version arrived. On the server, a warm that was already ranking
+also skipped cache commit if the dashboard version advanced mid-rank. In a
+rapid-vote burst this suppressed usable older warm HTML and forced the client
+to wait for the latest version before any background refill.
+
+**Fix.**
+- `templates/index.html`: replaced superseding warm polling with a drain:
+  `activeWarmVersion`, `queuedWarmVersion`, and `lastScheduledWarmVersion`.
+  A ready active warm now always enqueues `queueRefill(false)`, even when a
+  newer version is queued; after it resolves, polling continues with only the
+  newest queued version. Timeout still returns false and does not refill for
+  that version.
+- `server.py`: active warm renders may commit cache HTML for the version they
+  started, even if a newer dashboard version is requested while ranking. A
+  newer cached version is still never overwritten, and readiness remains
+  version-correct (`version=N+1` is false while only `N` is cached).
+- `tests/test_server.py`: updated stale-warm expectations and added static
+  client assertions for queueing, non-aborting active polls, queued-version
+  drain, and timeout behavior.
+- `ARCHITECTURE.md`: documented the rapid-vote behavior: early older
+  non-advancing refill, then a latest-version non-advancing refill.
+
+**Verification.**
+- `uv run pytest tests/test_server.py -n 4` = 91 passed.
+- `uv run pytest tests/ -n 4` = 420 passed, 1 skipped.
+- `uv run ruff check .` = clean.
+- `uv run ty check` = clean.
+
+**Files**: `server.py`, `templates/index.html`, `tests/test_server.py`,
+`ARCHITECTURE.md`, `WORKLOG.md`.
+
+---
+
 ## 2026-06-29 — Simplify client deck refresh scheduling
 
 **Change.** The browser now has one public refresh entrypoint:
