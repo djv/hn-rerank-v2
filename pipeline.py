@@ -1388,6 +1388,11 @@ async def _fetch_and_parse_feed(
             self_text = snippet
             text_content = compose_story_text(title, self_text)
 
+            # RSS <comments> element — Tildes and Lobsters provide a
+            # separate discussion URL. Reddit, LessWrong, and personal
+            # blogs don't have one (entry.comments is None).
+            comments_url = entry.get("comments")
+
             h = hashlib.md5(link.encode("utf-8")).digest()
             val = int.from_bytes(h[:4], "big")
             synthetic_id = -(val % (2**31))
@@ -1416,7 +1421,7 @@ async def _fetch_and_parse_feed(
                 source=source_name,
                 comment_count=num_comments,
                 comment_count_at_fetch=num_comments,
-                discussion_url=None,
+                discussion_url=comments_url,
             )
             stories.append(story)
 

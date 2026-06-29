@@ -4,13 +4,14 @@ days = 30
 count = 40
 onnx_model_dir = "onnx_model"
 server_port = 8766
-regen_interval_seconds = 3600
+regen_interval_seconds = 14400
 regen_initial_delay_seconds = 30
 regen_prewarm_top_n = 50
 prewarm_hn_full = true
 prewarm_reddit_full = true
 prewarm_lesswrong_full = true
 reddit_prewarm_top_per_sub = 10
+reddit_prewarm_max_per_cycle = 80
 reddit_min_fetch_spacing_seconds = 30.0
 max_cached_models = 20
 article_fetch_max_per_run = 100
@@ -69,7 +70,6 @@ feeds = [
     "https://www.reddit.com/r/kubernetes/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/dataengineering/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/statistics/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/gis/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/Maps/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/Ultralight/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/ManyBaggers/top/.rss?t=week&limit=25",

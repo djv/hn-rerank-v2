@@ -463,6 +463,107 @@ def test_is_hn_source_includes_bq_seed():
     assert not is_hn_source("rss_example_com")
 
 
+@pytest.mark.asyncio
+async def test_rss_feed_captures_comments_url(monkeypatch):
+    """RSS <comments> element is captured as discussion_url.
+
+    Tildes and Lobsters provide a <comments> element distinct from
+    <link>. The Story constructor must populate discussion_url from it
+    so the UI can render a comments link.
+    """
+    from pipeline import _fetch_and_parse_feed
+
+    class MockResp:
+        status_code = 200
+        text = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>Test</title>
+<item>
+  <title>Black Shirt</title>
+  <link>https://example.com/article</link>
+  <comments>https://tildes.net/~group/topic_id</comments>
+  <pubDate>Tue, 23 Jun 2026 12:00:00 GMT</pubDate>
+  <description>A great article about shirts.</description>
+</item>
+</channel></rss>"""
+        headers: dict[str, str] = {}
+
+    class MockClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, url, headers=None):
+            return MockResp()
+
+    monkeypatch.setattr("pipeline.httpx.AsyncClient", MockClient)
+
+    stories = await _fetch_and_parse_feed(
+        "https://tildes.net/topics.rss",
+        per_feed=10,
+        cutoff=0,
+        now=1_000_000,
+        exclude_urls=set(),
+    )
+    assert len(stories) == 1
+    assert stories[0].url == "https://example.com/article"
+    assert stories[0].discussion_url == "https://tildes.net/~group/topic_id"
+
+
+@pytest.mark.asyncio
+async def test_rss_feed_no_comments_url(monkeypatch):
+    """RSS feeds without <comments> element leave discussion_url as None.
+
+    Reddit, LessWrong, and personal blog feeds don't have a <comments>
+    element. The link is the article URL, not a separate discussion
+    page, so discussion_url should remain None.
+    """
+    from pipeline import _fetch_and_parse_feed
+
+    class MockResp:
+        status_code = 200
+        text = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>Test</title>
+<item>
+  <title>Some Blog Post</title>
+  <link>https://example.com/blog</link>
+  <pubDate>Tue, 23 Jun 2026 12:00:00 GMT</pubDate>
+  <description>A blog post about something interesting.</description>
+</item>
+</channel></rss>"""
+        headers: dict[str, str] = {}
+
+    class MockClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, url, headers=None):
+            return MockResp()
+
+    monkeypatch.setattr("pipeline.httpx.AsyncClient", MockClient)
+
+    stories = await _fetch_and_parse_feed(
+        "https://example.com/feed.xml",
+        per_feed=10,
+        cutoff=0,
+        now=1_000_000,
+        exclude_urls=set(),
+    )
+    assert len(stories) == 1
+    assert stories[0].url == "https://example.com/blog"
+    assert stories[0].discussion_url is None
+
+
 def test_is_summarizable_with_content():
     """Stories with self_text, top_comments, or article_body are summarizable."""
     from pipeline import Story

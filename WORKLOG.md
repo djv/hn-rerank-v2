@@ -5,6 +5,273 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-29 — RSS discussion_url: capture `<comments>` element
+
+**Symptom.** Tildes and Lobsters stories in the dashboard showed no comments
+link — the 💬 "N comments" badge and `c` keyboard shortcut both required
+`discussion_url`, but RSS-sourced stories were always created with
+`discussion_url=None`.
+
+**Cause.** `_fetch_and_parse_feed()` in `pipeline.py` read `entry.link` for
+the article URL but discarded the RSS `<comments>` element, which Tildes and
+Lobsters populate with the discussion page URL (distinct from the article).
+Reddit, LessWrong, and personal blog feeds don't have a `<comments>` element.
+
+**Fix.** Capture `entry.get("comments")` and pass it as `discussion_url` in
+the `Story` constructor. Feeds that don't provide it (Reddit, LessWrong,
+blogs) still get `None`, so behavior is unchanged for them. Tildes and
+Lobsters now surface a working discussion link in the UI.
+
+**Backfill.** Existing Tildes stories in the DB pick up the new value on
+the next regen cycle (regen upserts Story rows by id, and synthetic id
+derives from `link`, so the same story row is re-fetched and updated).
+
+**Tests.** Added two tests in `tests/test_pipeline.py`:
+- `test_rss_feed_captures_comments_url` — RSS with `<comments>` sets
+  `discussion_url` to the comments URL
+- `test_rss_feed_no_comments_url` — RSS without `<comments>` leaves
+  `discussion_url=None`
+
+**Verification.** `uv run pytest tests/ -n 4` → 386 passed. `uv run ruff
+check pipeline.py tests/test_pipeline.py` and `uv run ty check pipeline.py
+tests/test_pipeline.py` → clean.
+
+---
+
+## 2026-06-29 — Remove rss_reddit_gis from config; purge 37 stories from DB
+
+**Symptom.** r/gis was a low-signal subreddit that wasn't producing
+useful recommendations.
+
+**Action.** Removed `r/gis` line from `config.toml:73` (was the 22nd
+entry in the `feeds` list). Wrote `scripts/remove_source_stories.py`
+to delete all stories for a given source, preserving feedback-guarded
+rows by default. Ran with `--source rss_reddit_gis` against the local
+DB; deleted 37 stories and 1 feedback row (per explicit user
+permission). Backup retained at `hn_rewrite.db.pre_gis_removal`.
+
+**Verification.** `SELECT COUNT(*) FROM stories WHERE source='rss_reddit_gis'`
+→ 0. `SELECT COUNT(*) FROM feedback WHERE story_id=-399158102` → 0.
+Skipped VACUUM (negligible space gain for 37 rows in a ~483MB DB; free
+pages will be reused by future inserts).
+
+---
+
+
+---
+
+## 2026-06-29 — Guard SWR cache writes against stale warm completions
+
+**Symptom.** Default-user recommended queue could briefly surface an older
+story after a burst of feedback, even though newer warms had already been
+queued.
+
+**Cause.** The warm thread checked dashboard version before ranking, but it
+still wrote `cls._dashboard_cache[...]` after `fast_rerank_for_user()` and
+`generate_dashboard_bytes()` completed. A newer feedback event could advance
+the user's version while that warm was in flight, letting the stale warm
+overwrite the newer cache entry.
+
+**Fix.** `_trigger_warm()` now rechecks the dashboard version under the
+version lock immediately before cache commit and skips stale completions
+after ranking.
+
+**Tests.** Added a regression test that blocks ranking mid-flight, bumps the
+user version, and verifies the stale warm does not replace the existing cache.
+
+---
+
+## 2026-06-29 — Widen CH live window from 7d to 30d; raise limit to 5000
+
+**Change.** `pipeline.LIVE_WINDOW_LIMIT` 2000 → 5000; `fetch_candidates`
+calls `ch_client.query_live_window(days=30, min_score=5, limit=LIVE_WINDOW_LIMIT)`.
+ARCHITECTURE.md §3.6 and AGENTS.md HN data-sources table updated to match.
+
+**Why.** Once a story falls out of the live window, it stays frozen in the
+SQLite DB with the score/comment_count it had at the time of first
+discovery — `fetch_candidates` only re-reads HN candidates from CH, never
+re-reads existing `hn`-source rows from the DB. So the live window
+determines the *maximum lifetime* of a story in the dashboard's candidate
+pool, and 7 days is too short for personalization recall.
+
+A live-DB scan (`hn` source only) showed 1,838 unvoted HN stories 7-30d
+old with score≥5; only 111 (6%) had score≥200, the rest would never be
+picked up by the `ch_seed`/`bq_seed` archive seeder (default min_score=200,
+6mo window) and were effectively dead. Vote-lag analysis on 2,751
+`hn`-source feedback rows: 132 upvotes happened 7-14d after the story
+was posted, 152 happened 14-30d after — i.e. 284 upvotes on stories the
+production 7d window would have *prevented the user from discovering* in
+the current architecture. Upvote rate on 7-30d hn stories is 9-18%, well
+above the 5.4% rate on 3-7d stories, suggesting time as a quality filter
+for these.
+
+**Why 30d, not 14d.** The 7-14d cohort (1,823 stories, 9.1% upvote rate,
+165 upvotes) carries the strongest second-chance signal. The 14-30d
+cohort (1,068 stories, 18.0%, 192 upvotes) is incremental but real. Going
+to 30d captures both for ~2.5x the candidate pool. The CH query stays a
+single SQL statement with no pagination (per CH Playground benchmarks,
+<2s for 30d/5000 vs <1s for 7d/2000); the 1-24h CH lag only matters for
+stories <24h old, so a 30d window has no completeness penalty.
+
+**Cost.** Prewarm (`prewarm_hn_full=True`) goes from ~2000 to ~5000
+candidate comment bulk-fetches per regen, off the render path. Render
+path is unchanged: ranker runs MMR over `count=40`, so the visible top-12
+is unaffected by candidate-pool size beyond the marginal increase in
+embedding-cache lookups. Tier-1 gravity (`pipeline.py:2104-2112`) already
+normalizes by max(score) and the `Hot` badge requires recent velocity, so
+older stories do not dominate the top deck by construction.
+
+**Verification.** Full test suite (`uv run pytest tests/ -n 4`), `ruff`,
+and `ty` clean. CH Playground smoke-tested with
+`scripts/seed_smoke_test.py` separately if needed; this change does not
+alter the SQL contract.
+
+**Follow-up candidate.** `eval_ranker_variants.py` already defaults to
+`--window-days=30`; running it against the 7d/30d window as a
+leakage-safe A/B is the natural next measurement. Not done in this
+commit per request.
+
+---
+
+## 2026-06-29 — Fix date-mode activation after mode switches and refills
+
+**Symptom.** Date mode could display an older card after a tab switch or
+silent refill even when a newer story was already present in the DOM.
+
+**Cause.** The client reordered cards only during some refill paths, but
+it chose the next active card before applying the deterministic date sort.
+That let the previous DOM order leak into the visible card selection.
+
+**Fix.** Date and recommended modes now reorder before selecting the next
+active card, and deterministic refills reselect the first queued card
+after the server appends new stories. Popular/explore remain shuffled and
+are not reshuffled on every refill.
+
+**Tests.** Updated the template JS assertions so `setSort`, `setAge`,
+`setSource`, and `refillQueue` all enforce the deterministic order/selection
+sequence.
+
+---
+
+## 2026-06-29 — Heavy-vote reload speed findings and next options
+
+**Finding.** After the exact-path cleanup and archive SQL/index work, the
+live heavy-vote benchmark still does not meet an interactive reload target.
+For user 1 with 2,517 feedback rows and 8,915 candidates, a measured
+write-enabled benchmark reported:
+
+- Cold run: `rank_total_ms=8164.1`, `model_cache=miss`,
+  `svm_fit_ms=766.8`, `decision_ms=4013.8`,
+  `svm_candidate_feature_prep_ms=1910.0`, `candidate_sql_ms=106.7`.
+- Warm runs: `rank_total_ms=6454.6` and `6653.2`, `model_cache=hit`,
+  `decision_ms=4292.8` and `4385.5`,
+  `svm_candidate_feature_prep_ms=1448.8` and `1616.6`,
+  `candidate_sql_ms=108.0` and `102.9`.
+
+This changes the optimization priority. Cold `SVC.fit` is not the reload
+bottleneck once the model cache is warm; `decision_function` over the full
+candidate pool is. Exact cleanup reduced SQL and badge-similarity overhead,
+but warm reloads remain ~6.5s because the RBF SVM scores ~9k candidates
+against a large support-vector set.
+
+**Ideas saved for follow-up.**
+
+1. **Bound RBF scoring with a shortlist.** Score the full pool cheaply with
+   gravity + centroid/semantic features, keep a deterministic ~2k candidate
+   shortlist with reserved recent/archive/non-HN lanes, and run the RBF SVM
+   plus discovery passes only on that shortlist. This is the largest compute
+   lever, but it changes candidate semantics and needs an offline eval before
+   becoming default.
+2. **Coalesce vote-triggered warms.** Keep removing the voted card
+   immediately in the client, but debounce server reranking for 10-30s so a
+   short vote streak produces one warm instead of one warm per vote.
+3. **Serve stale while revalidating.** Return the current deck immediately
+   when it is recent enough and let the new personalized deck replace it in
+   the background. This improves perceived reload latency without changing
+   model quality.
+4. **Reduce candidate policy.** Lower the live render window from 30 days,
+   reduce archive cap, or apply source quotas. Simple and fast, but directly
+   changes what can surface.
+5. **Cache richer per-user state.** Cache candidate feature matrices or
+   candidate-feedback dot products keyed by `(user_id, feedback_signature,
+   candidate_pool_signature)`. Useful for true reloads without new feedback,
+   less useful immediately after every vote.
+6. **Approximate or cap the RBF model.** Try Random Fourier Features +
+   linear scoring, or class-balanced support/training caps. Potentially fast,
+   but must be measured against the current RBF baseline because simpler
+   linear/logistic models previously lost meaningful ranking quality.
+7. **Lazy mode-specific work.** Render the initial Recommended/Recent deck
+   first and fill Popular/Explore/Archive extras later or on mode switch.
+   This targets perceived latency and changes server/template flow.
+
+**Decision.** The interrupted `SVM_SHORTLIST_*` constants were removed until
+there is an actual evaluated shortlist implementation. The next speed pass
+should either be a UX/perceived-latency change (stale-while-revalidate or
+vote coalescing) or a measured shortlist experiment, not more `SVC.fit`
+tuning.
+
+---
+
+## 2026-06-29 — Rank-path instrumentation and cold/warm SVM benchmark
+
+**Goal.** Make heavy-vote reload latency diagnosable before changing the
+model or caching strategy. The suspected bottleneck was cold RBF SVM
+training, but the live path also rebuilds feedback/candidate similarity
+features on model-cache hits.
+
+**Changes.** Added `pipeline.RankTrace`, an optional low-overhead timing
+collector passed through `fast_rerank_for_user`, `rerank_candidates`, and
+`_score_and_rank`. Completed dashboard warms now emit one `rank_perf`
+line with candidate counts, feedback counts by class,
+`model_cache=hit|miss|skipped`, and timings for candidate SQL, candidate
+embeddings, feedback embeddings, SVM feature prep, `SVC.fit`,
+`decision_function`, tier-2 scoring, badge similarity work, dedup, and
+total rank time.
+
+**Benchmark.** New `scripts/benchmark_rank_cold_cache.py` opens the live
+DB read-only by default, selects the heaviest feedback user unless
+`--user-id` is provided, clears `_MODEL_CACHE` for cold runs, then repeats
+warm runs in-process. It preflights candidate/feedback embedding cache
+coverage and refuses to write in read-only mode; use
+`uv run python scripts/embed_remaining.py` first or pass `--allow-writes`
+explicitly.
+
+**Tests.** Added focused tests for trace formatting, SVM cache miss→hit
+trace labels, read-only DB opening, and benchmark JSON output with the
+rank function mocked.
+
+---
+
+## 2026-06-29 — Reddit prewarm: persist topfeed before hydration, cap cycle work
+
+**Symptom.** Server logs showed Reddit topfeeds fetching regularly, but
+completed regens reported `Regen: reddit topfeed=41 prewarm=0`. A DB
+spot check found most Reddit rows still had empty `top_comments`, including
+fresh rows from the current day. The feed refresh was working; background
+comment hydration was not.
+
+**Root cause.** The two-phase Reddit flow read prewarm IDs from
+`reddit_feed_cache`, but `build_reddit_prewarm_factories` loads each story
+from SQLite with `db.get_story`. Topfeed rows were only upserted after the
+prewarm phase, so brand-new cached stories no-oped before any per-post RSS
+request could run. The attempted 410-task per-cycle prewarm was also too
+large for an hourly or 3-6h refresh cadence under the current Reddit rate
+limits.
+
+**Fix.** `fetch_candidates_only` now upserts cached Reddit topfeed stories
+before building prewarm factories. Prewarm selection skips rows whose DB
+copy already has `top_comments` and stops at
+`reddit_prewarm_max_per_cycle` (default 80). The default regen interval is
+now 4 hours (`regen_interval_seconds=14400`), and the docs describe the
+bounded same-cycle behavior instead of promising a 410-task multi-cycle
+sweep.
+
+**Tests.** Added focused coverage for same-cycle topfeed upsert before
+prewarm, the per-cycle prewarm cap, and the existing disabled/empty-cache
+branches.
+
+---
+
 ## 2026-06-29 — Regen prewarm: refresh stale `top_comments`, not just empty ones
 
 **Symptom.** User reported TLDR discussion thin for HN 48709670
