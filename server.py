@@ -567,7 +567,8 @@ class Handler(BaseHTTPRequestHandler):
     _dashboard_versions_guard = threading.Lock()
     _render_locks: dict[int, threading.Lock] = {}
     _render_locks_guard = threading.Lock()
-    _warmup_in_flight: set[tuple[int, int]] = set()
+    _warmup_active_users: set[int] = set()
+    _warmup_requested_versions: dict[int, int] = {}
     _warmup_in_flight_guard = threading.Lock()
     _WARM_DEBOUNCE_S: float = 0.2
 
@@ -716,104 +717,143 @@ class Handler(BaseHTTPRequestHandler):
 
     @classmethod
     def _trigger_warm(cls, user: User, version: int) -> None:
-        key = (user.id, version)
         with cls._warmup_in_flight_guard:
-            if key in cls._warmup_in_flight:
+            cls._warmup_requested_versions[user.id] = version
+            if user.id in cls._warmup_active_users:
                 return
-            cls._warmup_in_flight.add(key)
+            cls._warmup_active_users.add(user.id)
 
         def warm() -> None:
-            warm_start = time.perf_counter()
             try:
                 time.sleep(cls._WARM_DEBOUNCE_S)
-                with cls._dashboard_versions_guard:
-                    if cls._dashboard_versions.get(user.id, 0) != version:
+                while True:
+                    warm_start = time.perf_counter()
+                    with cls._warmup_in_flight_guard:
+                        requested_version = cls._warmup_requested_versions[user.id]
+
+                    with cls._dashboard_versions_guard:
+                        if cls._dashboard_versions.get(user.id, 0) != requested_version:
+                            logging.info(
+                                "dashboard_warm user_id=%s version=%s result=skipped_stale elapsed_ms=%.1f",
+                                user.id,
+                                requested_version,
+                                (time.perf_counter() - warm_start) * 1000,
+                            )
+                            if not cls._finish_warm_attempt(user.id, requested_version):
+                                break
+                            continue
+
+                    lock = cls._get_render_lock(user.id)
+                    with lock:
+                        with cls._dashboard_versions_guard:
+                            if (
+                                cls._dashboard_versions.get(user.id, 0)
+                                != requested_version
+                            ):
+                                logging.info(
+                                    "dashboard_warm user_id=%s version=%s result=skipped_stale_after_lock elapsed_ms=%.1f",
+                                    user.id,
+                                    requested_version,
+                                    (time.perf_counter() - warm_start) * 1000,
+                                )
+                                if not cls._finish_warm_attempt(
+                                    user.id, requested_version
+                                ):
+                                    break
+                                continue
+
+                        cached = cls._dashboard_cache.get(f"dashboard_{user.id}")
+                        if cached and cached[2] == requested_version:
+                            if not cls._finish_warm_attempt(user.id, requested_version):
+                                break
+                            continue
+
+                        from pipeline import (
+                            RankTrace,
+                            fast_rerank_for_user,
+                            generate_dashboard_bytes,
+                        )
+
+                        trace = RankTrace()
+                        render_start = time.perf_counter()
+                        with trace.stage("rank_total"):
+                            if (
+                                "trace"
+                                in inspect.signature(fast_rerank_for_user).parameters
+                            ):
+                                final = fast_rerank_for_user(
+                                    cls.db,
+                                    cls.config,
+                                    cls.embedder,
+                                    user.id,
+                                    trace=trace,
+                                )
+                            else:
+                                final = fast_rerank_for_user(
+                                    cls.db, cls.config, cls.embedder, user.id
+                                )
+                        rank_ms = (time.perf_counter() - render_start) * 1000
+
+                        html_start = time.perf_counter()
+                        html = generate_dashboard_bytes(
+                            final, cls.config, cls.db, user.id, user.token
+                        )
+                        html_ms = (time.perf_counter() - html_start) * 1000
+
+                        with cls._dashboard_versions_guard:
+                            if (
+                                cls._dashboard_versions.get(user.id, 0)
+                                != requested_version
+                            ):
+                                logging.info(
+                                    "dashboard_warm user_id=%s version=%s result=skipped_stale_after_rank elapsed_ms=%.1f",
+                                    user.id,
+                                    requested_version,
+                                    (time.perf_counter() - warm_start) * 1000,
+                                )
+                                if not cls._finish_warm_attempt(
+                                    user.id, requested_version
+                                ):
+                                    break
+                                continue
+                            cls._dashboard_cache[f"dashboard_{user.id}"] = (
+                                html,
+                                time.time(),
+                                requested_version,
+                            )
+                        cls._enforce_cache_cap()
+
                         logging.info(
-                            "dashboard_warm user_id=%s version=%s result=skipped_stale elapsed_ms=%.1f",
+                            "dashboard_warm user_id=%s version=%s result=completed rank_ms=%.1f html_ms=%.1f stories=%s",
                             user.id,
-                            version,
-                            (time.perf_counter() - warm_start) * 1000,
+                            requested_version,
+                            rank_ms,
+                            html_ms,
+                            len(final),
                         )
-                        return
+                        logging.info("rank_perf %s", trace.format_log_fields())
 
-                lock = cls._get_render_lock(user.id)
-                with lock:
-                    with cls._dashboard_versions_guard:
-                        if cls._dashboard_versions.get(user.id, 0) != version:
-                            logging.info(
-                                "dashboard_warm user_id=%s version=%s result=skipped_stale_after_lock elapsed_ms=%.1f",
-                                user.id,
-                                version,
-                                (time.perf_counter() - warm_start) * 1000,
-                            )
-                            return
-
-                    cached = cls._dashboard_cache.get(f"dashboard_{user.id}")
-                    if cached and cached[2] == version:
-                        return
-
-                    from pipeline import (
-                        RankTrace,
-                        fast_rerank_for_user,
-                        generate_dashboard_bytes,
-                    )
-
-                    trace = RankTrace()
-                    render_start = time.perf_counter()
-                    with trace.stage("rank_total"):
-                        if (
-                            "trace"
-                            in inspect.signature(fast_rerank_for_user).parameters
-                        ):
-                            final = fast_rerank_for_user(
-                                cls.db, cls.config, cls.embedder, user.id, trace=trace
-                            )
-                        else:
-                            final = fast_rerank_for_user(
-                                cls.db, cls.config, cls.embedder, user.id
-                            )
-                    rank_ms = (time.perf_counter() - render_start) * 1000
-
-                    html_start = time.perf_counter()
-                    html = generate_dashboard_bytes(
-                        final, cls.config, cls.db, user.id, user.token
-                    )
-                    html_ms = (time.perf_counter() - html_start) * 1000
-
-                    with cls._dashboard_versions_guard:
-                        if cls._dashboard_versions.get(user.id, 0) != version:
-                            logging.info(
-                                "dashboard_warm user_id=%s version=%s result=skipped_stale_after_rank elapsed_ms=%.1f",
-                                user.id,
-                                version,
-                                (time.perf_counter() - warm_start) * 1000,
-                            )
-                            return
-                        cls._dashboard_cache[f"dashboard_{user.id}"] = (
-                            html,
-                            time.time(),
-                            version,
-                        )
-                    cls._enforce_cache_cap()
-
-                    logging.info(
-                        "dashboard_warm user_id=%s version=%s result=completed rank_ms=%.1f html_ms=%.1f stories=%s",
-                        user.id,
-                        version,
-                        rank_ms,
-                        html_ms,
-                        len(final),
-                    )
-                    logging.info("rank_perf %s", trace.format_log_fields())
+                    if not cls._finish_warm_attempt(user.id, requested_version):
+                        break
             except Exception as e:
                 logging.exception(
                     "Failed warming dashboard cache for user_id=%s: %s", user.id, e
                 )
-            finally:
                 with cls._warmup_in_flight_guard:
-                    cls._warmup_in_flight.discard(key)
+                    cls._warmup_active_users.discard(user.id)
+                    cls._warmup_requested_versions.pop(user.id, None)
 
         threading.Thread(target=warm, daemon=True).start()
+
+    @classmethod
+    def _finish_warm_attempt(cls, user_id: int, completed_version: int) -> bool:
+        with cls._warmup_in_flight_guard:
+            requested_version = cls._warmup_requested_versions.get(user_id)
+            if requested_version is not None and requested_version != completed_version:
+                return True
+            cls._warmup_active_users.discard(user_id)
+            cls._warmup_requested_versions.pop(user_id, None)
+            return False
 
     @classmethod
     def _enforce_cache_cap(cls, max_entries: int = 100) -> None:
@@ -884,11 +924,9 @@ class Handler(BaseHTTPRequestHandler):
             # gating left the cached HTML stale for up to ~9s per burst;
             # the SWR stale-hit path then re-injected already-voted
             # stories via refillQueue (the bug observed on 2026-06-28).
-            # Bursty votes still produce N warm threads per user; the
-            # version checks in _trigger_warm discard obsolete jobs before
-            # ranking, including jobs that became stale while waiting on
-            # the per-user render lock, so only the latest version ranks
-            # and lands in the cache.
+            # Bursty votes coalesce into one warm worker per user. The
+            # worker keeps the newest requested version and stale guards
+            # prevent obsolete ranks from landing in cache.
             version = self._invalidate_dashboard_cache(user.id)
             self._trigger_warm(user, version)
 

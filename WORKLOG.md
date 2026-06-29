@@ -5,6 +5,27 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-29 — Coalesce same-user dashboard warm renders
+
+**Symptom.** The ready-gated vote path invalidated and warmed the dashboard on
+every successful vote. Duplicate warm requests for the same `(user, version)`
+were deduped, but a quick vote burst still spawned one warm thread per bumped
+version. Stale guards kept old versions from committing, but the burst could
+queue redundant workers behind the same per-user render lock.
+
+**Fix.** `_trigger_warm()` now keeps one active warm worker per user plus the
+latest requested dashboard version. New vote or readiness-poll requests update
+that latest version instead of creating another thread. After the debounce, the
+worker ranks only when the latest requested version still equals the user's
+current dashboard version; the existing stale-before-lock, stale-after-lock,
+and stale-after-rank guards remain in place. If a newer version arrives while a
+rank is already running, the worker loops once more for the newest request
+instead of leaving a separate queued thread to do it.
+
+**Tests.** Updated warm dedupe assertions for the per-user active/latest state
+and added `test_rapid_vote_warms_coalesce_to_latest_version`, which triggers
+versions 1, 2, and 3 rapidly and verifies only version 3 is ranked and cached.
+
 ## 2026-06-29 — Harden optimistic vote, undo, and revote ordering
 
 **Symptom.** The browser sent vote and undo saves as independent
