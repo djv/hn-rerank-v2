@@ -1755,7 +1755,7 @@ def test_dashboard_has_no_refresh_button_or_progress_bar():
     assert 'aria-live="polite"' in template
     assert 'class="toast"' in template
     assert "showToast" in template
-    assert "silentRefill" in template
+    assert "scheduleDeckRefresh" in template
     # 'u undo' hint removed from the legend
     assert '<span class="key-hint">u</span> undo' not in template, (
         "undo hint should be hidden from the visible legend"
@@ -2351,7 +2351,7 @@ def test_bump_all_cached_versions(swr_handler):
     assert h._dashboard_versions[3] == 1
 
 
-def test_setSort_triggers_silent_refill_on_tab_click() -> None:
+def test_setSort_schedules_advancing_refresh_on_tab_click() -> None:
     """Clicking a sort tab silently refills the queue (no manual refresh
     button — the user picks a sort, the new ranking is fetched in the
     background)."""
@@ -2359,36 +2359,38 @@ def test_setSort_triggers_silent_refill_on_tab_click() -> None:
     idx = static.index("function setSort(")
     end = static.index("function setAge(", idx)
     body = static[idx:end]
-    assert "silentRefill" in body
+    assert "scheduleDeckRefresh({ advance: true })" in body
     assert "orderForCurrentSort()" in body
-    assert body.index("orderForCurrentSort()") < body.index("showNextCard()")
+    assert body.index("orderForCurrentSort()") < body.index(
+        "showNextCard({ allowRefresh: false })"
+    )
     assert "refillQueued" not in body
     assert "refillWhenReady" not in body
 
 
-def test_setAge_triggers_silent_refill_on_tab_click() -> None:
-    """Clicking an age tab silently refills the queue."""
+def test_setAge_schedules_advancing_refresh_on_tab_click() -> None:
+    """Clicking an age tab schedules an advancing deck refresh."""
     _, static = _read_template_and_static()
     idx = static.index("function setAge(")
     end = static.index("function setSource(", idx)
     body = static[idx:end]
-    assert "silentRefill" in body
-    assert "showNextCard()" in body
+    assert "scheduleDeckRefresh({ advance: true })" in body
+    assert "showNextCard({ allowRefresh: false })" in body
     assert "if (currentSort === 'recommended' || currentSort === 'date')" in body
     assert "refillQueued" not in body
     assert "refillWhenReady" not in body
 
 
-def test_setSource_triggers_silent_refill_on_tab_click() -> None:
-    """Clicking a source tab silently refills the queue."""
+def test_setSource_schedules_advancing_refresh_on_tab_click() -> None:
+    """Clicking a source tab schedules an advancing deck refresh."""
     _, static = _read_template_and_static()
     idx = static.index("function setSource(")
     # setSource is the last function in the file's first script block; the
     # body ends with the next blank line.
     end = static.index("\n\n    applyGradient();", idx)
     body = static[idx:end]
-    assert "silentRefill" in body
-    assert "showNextCard()" in body
+    assert "scheduleDeckRefresh({ advance: true })" in body
+    assert "showNextCard({ allowRefresh: false })" in body
     assert "if (currentSort === 'recommended' || currentSort === 'date')" in body
     assert "refillQueued" not in body
     assert "refillWhenReady" not in body
@@ -2536,7 +2538,10 @@ def test_submitVote_schedules_ready_gated_refill_on_success() -> None:
         "function ", 1
     )[0]
     assert "silentRefill()" not in submit_vote_block
-    assert "scheduleRefillWhenRankingReady(data.target_version)" in submit_vote_block
+    assert "scheduleDeckRefresh({" in submit_vote_block
+    assert "waitForWarm: true" in submit_vote_block
+    assert "targetVersion: data.target_version" in submit_vote_block
+    assert "advance: false" in submit_vote_block
     # On a failed save, the catch handler must surface a toast (not the old
     # refresh banner, which is gone).
     submit_catch = submit_vote_block.split("Network error submitting feedback", 1)[1]
@@ -2552,7 +2557,10 @@ def test_undoLastVote_schedules_ready_gated_refill_on_success() -> None:
         "function ", 1
     )[0]
     assert "silentRefill()" not in undo_block
-    assert "scheduleRefillWhenRankingReady(data.target_version)" in undo_block
+    assert "scheduleDeckRefresh({" in undo_block
+    assert "waitForWarm: true" in undo_block
+    assert "targetVersion: data.target_version" in undo_block
+    assert "advance: false" in undo_block
     undo_catch = undo_block.split("Network error undoing feedback", 1)[1]
     assert "showToast(" in undo_catch
     assert "refreshBannerText" not in undo_catch
@@ -2654,27 +2662,43 @@ def test_revote_after_undo_cannot_be_followed_by_stale_clear() -> None:
     assert "enqueueFeedback(storyId, action)" in submit_vote_block
 
 
-def test_silentRefill_serializes_concurrent_calls() -> None:
-    """silentRefill returns early if a refill is already in flight, so
-    bursty votes coalesce into one fetch per cycle instead of N parallel
-    fetches."""
+def test_scheduleDeckRefresh_serializes_refill_lane() -> None:
+    """The refill lane serializes fetches while coalescing queued advance
+    requests."""
     _, inline_script = _read_template_and_static()
-    block = inline_script.split("async function silentRefill()", 1)[1].split(
+    block = inline_script.split("async function runRefillLoop()", 1)[1].split(
         "function ", 1
     )[0]
-    assert "if (isRefilling) return" in block
-    assert "refillQueue({ forceFetch: true, advance: true })" in block
+    assert "if (refillInFlight)" in block
+    assert "while (queuedRefillAdvance !== null)" in block
+    assert "await refillQueue({ advance })" in block
+    queue_block = inline_script.split("function queueRefill(", 1)[1].split(
+        "async function runRefillLoop", 1
+    )[0]
+    assert "queuedRefillAdvance || advance" in queue_block
 
 
 def test_ready_gated_refill_uses_non_advancing_refill() -> None:
     _, inline_script = _read_template_and_static()
-    block = inline_script.split("async function pollRankingReady(", 1)[1].split(
-        "async function silentRefill()", 1
+    block = inline_script.split("async function runWarmPollLoop()", 1)[1].split(
+        "async function waitForRankingReady", 1
+    )[0]
+    assert "const ready = await waitForRankingReady(version)" in block
+    assert "latestWarmVersionSeen === version" in block
+    assert "await waitForVoteRemoval()" in block
+    assert "queueRefill(false)" in block
+
+
+def test_waitForRankingReady_timeout_does_not_refill() -> None:
+    _, inline_script = _read_template_and_static()
+    block = inline_script.split("async function waitForRankingReady(", 1)[1].split(
+        "sortTabs.forEach", 1
     )[0]
     assert "rankingReadyPath(version)" in block
-    assert "latestPendingRankingVersion !== version" in block
-    assert "await waitForVoteRemoval()" in block
-    assert "refillQueue({ forceFetch: true, advance: false })" in block
+    assert "Date.now() - startedAt <= 30000" in block
+    assert "return false" in block
+    assert "refillQueue" not in block
+    assert "queueRefill" not in block
 
 
 def test_refillQueue_reorders_deterministic_modes_only() -> None:
@@ -2691,8 +2715,10 @@ def test_refillQueue_reorders_deterministic_modes_only() -> None:
     assert "currentSort === 'recommended'" in block
     assert "currentSort === 'date'" in block
     assert "if (currentSort === 'recommended' || currentSort === 'date')" in block
-    assert "showNextCard()" in block
-    assert block.index("orderForCurrentSort()") < block.index("showNextCard()")
+    assert "showNextCard({ allowRefresh: false })" in block
+    assert block.index("orderForCurrentSort()") < block.index(
+        "showNextCard({ allowRefresh: false })"
+    )
 
 
 def test_refillQueue_advance_false_path_does_not_show_next_card() -> None:
@@ -2701,8 +2727,24 @@ def test_refillQueue_advance_false_path_does_not_show_next_card() -> None:
         "function ", 1
     )[0]
     assert "advance = true" in block
-    assert "if (advance) {\n          showNextCard();" in block
+    assert "if (advance) {\n          showNextCard({ allowRefresh: false });" in block
     assert "} else if (advance && (!activeCard || activeCard.dataset.voted))" in block
+
+
+def test_removed_refresh_names_are_gone() -> None:
+    _, inline_script = _read_template_and_static()
+    removed_names = [
+        "silentRefill",
+        "pollRankingReady",
+        "scheduleRefillWhenRankingReady",
+        "maybeRefillQueue",
+        "LOW_WATERMARK",
+        "latestPendingRankingVersion",
+        "forceFetch",
+        "isRefilling",
+    ]
+    for name in removed_names:
+        assert name not in inline_script
 
 
 def test_showToast_dismisses_after_3s() -> None:

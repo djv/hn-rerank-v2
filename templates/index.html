@@ -961,7 +961,6 @@
     const ageTabs = Array.from(document.querySelectorAll('[data-age]'));
     const sourceTabs = Array.from(document.querySelectorAll('[data-source]'));
     const voteBar = document.querySelector('.vote-bar');
-    let isRefilling = false;
     let activeCard = null;
     let lastVote = null;
     let nextVoteId = 1;
@@ -971,12 +970,15 @@
     const votedStoryIds = new Set();
     const feedbackChains = new Map();
     const MAX_QUEUE = 12;
-    const LOW_WATERMARK = 4;
     const PREFETCH_COUNT = 3;
     const IDLE_INACTIVE_PREFETCH_COUNT = 3;
     let idleAgePrefetchHandle = null;
     let toastTimer = null;
-    let latestPendingRankingVersion = null;
+    let refillInFlight = false;
+    let queuedRefillAdvance = null;
+    let warmPollInFlight = false;
+    let pendingWarmVersion = null;
+    let latestWarmVersionSeen = null;
 
     function cards() {
       return Array.from(storiesContainer.querySelectorAll('.story-card'));
@@ -1064,7 +1066,6 @@
       }
       prefetchUpcomingTldrs();
       scheduleIdleAgePrefetch();
-      maybeRefillQueue();
     }
 
     function updateVoteBar() {
@@ -1073,8 +1074,16 @@
       });
     }
 
-    function showNextCard() {
-      setActiveCard(queuedCards()[0] || null);
+    function showNextCard({ allowRefresh = true } = {}) {
+      const next = queuedCards()[0];
+      if (next) {
+        setActiveCard(next);
+        return;
+      }
+      setActiveCard(null);
+      if (allowRefresh) {
+        scheduleDeckRefresh({ advance: true });
+      }
     }
 
     function setSort(sort) {
@@ -1086,8 +1095,8 @@
         activeCard.classList.remove('active');
       }
       orderForCurrentSort();
-      showNextCard();
-      silentRefill();
+      showNextCard({ allowRefresh: false });
+      scheduleDeckRefresh({ advance: true });
       scheduleIdleAgePrefetch();
     }
 
@@ -1102,8 +1111,8 @@
       if (currentSort === 'recommended' || currentSort === 'date') {
         orderForCurrentSort();
       }
-      showNextCard();
-      silentRefill();
+      showNextCard({ allowRefresh: false });
+      scheduleDeckRefresh({ advance: true });
       scheduleIdleAgePrefetch();
     }
 
@@ -1118,8 +1127,8 @@
       if (currentSort === 'recommended' || currentSort === 'date') {
         orderForCurrentSort();
       }
-      showNextCard();
-      silentRefill();
+      showNextCard({ allowRefresh: false });
+      scheduleDeckRefresh({ advance: true });
     }
 
     applyGradient();
@@ -1208,24 +1217,80 @@
       });
     }
 
-    function scheduleRefillWhenRankingReady(version) {
-      if (typeof version !== 'number' || !Number.isFinite(version) || version < 0) {
+    function scheduleDeckRefresh({ advance = true, waitForWarm = false, targetVersion = null } = {}) {
+      if (waitForWarm) {
+        if (typeof targetVersion !== 'number' || !Number.isFinite(targetVersion) || targetVersion < 0) {
+          return;
+        }
+        if (latestWarmVersionSeen !== null && targetVersion <= latestWarmVersionSeen) {
+          return;
+        }
+        latestWarmVersionSeen = targetVersion;
+        pendingWarmVersion = targetVersion;
+        runWarmPollLoop();
         return;
       }
-      latestPendingRankingVersion = version;
-      pollRankingReady(version, 400, Date.now());
+
+      queueRefill(advance);
     }
 
-    async function pollRankingReady(version, delayMs, startedAt) {
-      if (latestPendingRankingVersion !== version) {
+    function queueRefill(advance) {
+      queuedRefillAdvance = queuedRefillAdvance === null ? advance : queuedRefillAdvance || advance;
+      runRefillLoop();
+    }
+
+    async function runRefillLoop() {
+      if (refillInFlight) {
         return;
       }
-      if (Date.now() - startedAt > 30000) {
+      refillInFlight = true;
+      try {
+        while (queuedRefillAdvance !== null) {
+          const advance = queuedRefillAdvance;
+          queuedRefillAdvance = null;
+          try {
+            await refillQueue({ advance });
+          } catch (err) {
+            console.error('Failed to refresh deck', err);
+          }
+        }
+      } finally {
+        refillInFlight = false;
+      }
+    }
+
+    async function runWarmPollLoop() {
+      if (warmPollInFlight) {
         return;
       }
-      window.setTimeout(async () => {
-        if (latestPendingRankingVersion !== version) {
-          return;
+      warmPollInFlight = true;
+      try {
+        while (pendingWarmVersion !== null) {
+          const version = pendingWarmVersion;
+          pendingWarmVersion = null;
+          const ready = await waitForRankingReady(version);
+          if (ready && latestWarmVersionSeen === version && pendingWarmVersion === null) {
+            await waitForVoteRemoval();
+            if (latestWarmVersionSeen === version && pendingWarmVersion === null) {
+              queueRefill(false);
+            }
+          }
+        }
+      } finally {
+        warmPollInFlight = false;
+        if (pendingWarmVersion !== null) {
+          runWarmPollLoop();
+        }
+      }
+    }
+
+    async function waitForRankingReady(version) {
+      const startedAt = Date.now();
+      let delayMs = 400;
+      while (latestWarmVersionSeen === version && Date.now() - startedAt <= 30000) {
+        await new Promise(resolve => window.setTimeout(resolve, delayMs));
+        if (latestWarmVersionSeen !== version) {
+          return false;
         }
         try {
           const resp = await fetch(rankingReadyPath(version), { cache: 'no-store' });
@@ -1233,43 +1298,18 @@
             throw new Error(`Ranking readiness failed: ${resp.status}`);
           }
           const data = await resp.json();
-          if (latestPendingRankingVersion !== version) {
-            return;
+          if (latestWarmVersionSeen !== version) {
+            return false;
           }
           if (data.ready) {
-            await waitForVoteRemoval();
-            if (latestPendingRankingVersion !== version) {
-              return;
-            }
-            if (isRefilling) {
-              pollRankingReady(version, Math.min(delayMs * 2, 2500), startedAt);
-              return;
-            }
-            isRefilling = true;
-            try {
-              await refillQueue({ forceFetch: true, advance: false });
-            } finally {
-              isRefilling = false;
-            }
-            return;
+            return true;
           }
         } catch (err) {
           console.error('Failed checking ranking readiness', err);
         }
-        pollRankingReady(version, Math.min(delayMs * 2, 2500), startedAt);
-      }, delayMs);
-    }
-
-    async function silentRefill() {
-      if (isRefilling) return;
-      isRefilling = true;
-      try {
-        await refillQueue({ forceFetch: true, advance: true });
-      } catch (err) {
-        console.error('Failed to silently refill queue', err);
-      } finally {
-        isRefilling = false;
+        delayMs = Math.min(delayMs * 2, 2500);
       }
+      return false;
     }
 
     sortTabs.forEach(tab => {
@@ -1309,7 +1349,7 @@
       return parser.parseFromString(htmlText, 'text/html');
     }
 
-    async function refillQueue({ forceFetch: _forceFetch = false, advance = true } = {}) {
+    async function refillQueue({ advance = true } = {}) {
       const newDoc = await fetchRefillDoc();
       const newStories = newDoc.getElementById('stories');
       if (!newStories) {
@@ -1350,10 +1390,10 @@
       if (currentSort === 'recommended' || currentSort === 'date') {
         orderForCurrentSort();
         if (advance) {
-          showNextCard();
+          showNextCard({ allowRefresh: false });
         }
       } else if (advance && (!activeCard || activeCard.dataset.voted)) {
-        showNextCard();
+        showNextCard({ allowRefresh: false });
       }
     }
 
@@ -1385,17 +1425,6 @@
           await openTldrDetail(btn.closest('.story-card'));
         };
       });
-    }
-
-
-
-    function maybeRefillQueue() {
-      if (queuedCards().length > LOW_WATERMARK || isRefilling) {
-        return;
-      }
-      if (!activeCard) {
-        silentRefill();
-      }
     }
 
     function prefetchUpcomingTldrs() {
@@ -1534,9 +1563,11 @@
 
       const savePromise = enqueueFeedback(storyId, action)
         .then(data => {
-          if (typeof data.target_version === 'number') {
-            scheduleRefillWhenRankingReady(data.target_version);
-          }
+          scheduleDeckRefresh({
+            waitForWarm: true,
+            targetVersion: data.target_version,
+            advance: false,
+          });
           return data;
         })
         .catch(err => {
@@ -1579,9 +1610,11 @@
       setActiveCard(card);
 
       enqueueFeedback(storyId, 'clear').then(data => {
-        if (typeof data.target_version === 'number') {
-          scheduleRefillWhenRankingReady(data.target_version);
-        }
+        scheduleDeckRefresh({
+          waitForWarm: true,
+          targetVersion: data.target_version,
+          advance: false,
+        });
         return data;
       }).catch(err => {
         console.error('Network error undoing feedback', err);

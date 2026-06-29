@@ -5,6 +5,30 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-29 — Simplify client deck refresh scheduling
+
+**Change.** The browser now has one public refresh entrypoint:
+`scheduleDeckRefresh()`. Internally it keeps two lanes: a serialized refill
+lane for dashboard HTML fetches and a separate warm-poll lane for vote/undo
+readiness checks.
+
+**Behavior.** Vote and undo success handlers schedule
+`waitForWarm: true` with the returned `target_version`, keep only the newest
+warm version, wait for `/api/ranking-ready` before fetching, and enqueue a
+non-advancing refill only when the warmed version is ready. Sort/age/source
+tabs and empty-queue recovery enqueue advancing refills immediately, so a
+sleeping vote readiness poll does not block user-initiated tab/source refreshes.
+Readiness timeout or supersession returns without fetching stale dashboard
+HTML. The old `silentRefill`, `pollRankingReady`,
+`scheduleRefillWhenRankingReady`, `maybeRefillQueue`, low-watermark, and
+`forceFetch` client paths were removed.
+
+**Tests.** Updated template regressions to pin vote/undo warm scheduling,
+advancing tab/source refreshes, non-advancing warmed refills, stale-timeout
+behavior, and removal of the old client helper names.
+
+---
+
 ## 2026-06-29 — Trailing debounce for rapid vote warm renders
 
 **Symptom.** Same-user warm coalescing kept only one worker active, but the
