@@ -1925,6 +1925,8 @@ def test_setSort_triggers_silent_refill_on_tab_click() -> None:
     end = static.index("function setAge(", idx)
     body = static[idx:end]
     assert "silentRefill" in body
+    assert "orderForCurrentSort()" in body
+    assert body.index("orderForCurrentSort()") < body.index("showNextCard()")
     assert "refillQueued" not in body
     assert "refillWhenReady" not in body
 
@@ -1936,6 +1938,8 @@ def test_setAge_triggers_silent_refill_on_tab_click() -> None:
     end = static.index("function setSource(", idx)
     body = static[idx:end]
     assert "silentRefill" in body
+    assert "showNextCard()" in body
+    assert "if (currentSort === 'recommended' || currentSort === 'date')" in body
     assert "refillQueued" not in body
     assert "refillWhenReady" not in body
 
@@ -1949,6 +1953,8 @@ def test_setSource_triggers_silent_refill_on_tab_click() -> None:
     end = static.index("\n\n    applyGradient();", idx)
     body = static[idx:end]
     assert "silentRefill" in body
+    assert "showNextCard()" in body
+    assert "if (currentSort === 'recommended' || currentSort === 'date')" in body
     assert "refillQueued" not in body
     assert "refillWhenReady" not in body
 
@@ -2144,6 +2150,8 @@ def test_refillQueue_reorders_deterministic_modes_only() -> None:
     assert "currentSort === 'recommended'" in block
     assert "currentSort === 'date'" in block
     assert "if (currentSort === 'recommended' || currentSort === 'date')" in block
+    assert "showNextCard()" in block
+    assert block.index("orderForCurrentSort()") < block.index("showNextCard()")
 
 
 def test_showToast_dismisses_after_3s() -> None:

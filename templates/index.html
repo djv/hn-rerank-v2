@@ -1082,8 +1082,9 @@
       if (activeCard && !matchesCurrentAxes(activeCard)) {
         activeCard.classList.remove('active');
       }
-      silentRefill();
+      orderForCurrentSort();
       showNextCard();
+      silentRefill();
       scheduleIdleAgePrefetch();
     }
 
@@ -1095,8 +1096,11 @@
       if (activeCard && !matchesCurrentAxes(activeCard)) {
         activeCard.classList.remove('active');
       }
-      silentRefill();
+      if (currentSort === 'recommended' || currentSort === 'date') {
+        orderForCurrentSort();
+      }
       showNextCard();
+      silentRefill();
       scheduleIdleAgePrefetch();
     }
 
@@ -1108,8 +1112,11 @@
       if (activeCard && !matchesCurrentAxes(activeCard)) {
         activeCard.classList.remove('active');
       }
-      silentRefill();
+      if (currentSort === 'recommended' || currentSort === 'date') {
+        orderForCurrentSort();
+      }
       showNextCard();
+      silentRefill();
     }
 
     applyGradient();
@@ -1263,8 +1270,8 @@
       // explore (shuffle) to avoid reshuffling on every vote.
       if (currentSort === 'recommended' || currentSort === 'date') {
         orderForCurrentSort();
-      }
-      if (!activeCard || activeCard.dataset.voted) {
+        showNextCard();
+      } else if (!activeCard || activeCard.dataset.voted) {
         showNextCard();
       }
     }
