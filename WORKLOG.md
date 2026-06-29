@@ -5,6 +5,31 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-29 — Ready-gated post-vote refill without active-card advance
+
+**Symptom.** A successful vote could briefly flash or advance the next
+card twice: the local 150 ms removal timer advanced the deck, while the
+feedback response immediately kicked `silentRefill()`, which could fetch
+stale-or-not-yet-warmed dashboard HTML and call `showNextCard()` again.
+
+**Fix.** `POST /api/feedback` now returns the bumped dashboard
+`target_version`. The browser polls authenticated
+`GET /api/ranking-ready?version=N`, which reports ready only when the
+rendered dashboard cache contains HTML at version `N` or newer. If the
+version counter has advanced but the rendered cache is missing or older,
+the endpoint returns `ready: false` and nudges `_trigger_warm()` for the
+current version; warm dedupe keeps repeated polls cheap.
+
+**Frontend behavior.** Vote and undo success no longer call
+`silentRefill()` directly. They schedule the ready poll, then perform a
+background `refillQueue({forceFetch: true, advance: false})` after the
+warm render lands. That refill replaces inactive cards, reapplies
+deterministic ordering, rebinds events, and updates gradients without
+calling `showNextCard()`. Sort/age/source tabs and empty-queue recovery
+still use the advancing `silentRefill()` path.
+
+---
+
 ## 2026-06-29 — RSS story metadata clobber: comment_count and discussion_url
 
 **Symptom.** Reddit and LessWrong cards in the dashboard rendered

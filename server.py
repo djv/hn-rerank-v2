@@ -16,7 +16,7 @@ import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import parse_qs, urlparse, urlunparse
 
 import feedparser
 import trafilatura
@@ -608,6 +608,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json_response({"error": "No session"}, status=401)
             return
 
+        if path == "/api/ranking-ready":
+            self._handle_ranking_ready()
+            return
+
         # Dashboard — dynamic render per-user
         if path in ("/", "/index.html"):
             user = self._get_user()
@@ -873,10 +877,54 @@ class Handler(BaseHTTPRequestHandler):
             # Also trigger background regen for candidate updates
             self.regen_event.set()
 
-            self._json_response({"ok": True, "ranking_refresh_queued": True})
+            self._json_response(
+                {
+                    "ok": True,
+                    "ranking_refresh_queued": True,
+                    "target_version": version,
+                }
+            )
         except Exception as e:
             logging.error("Error handling feedback: %r", e)
             self._json_response({"error": "Internal error"}, status=400)
+
+    def _handle_ranking_ready(self) -> None:
+        user = self._get_user()
+        if not user:
+            self._json_response({"error": "No session"}, status=401)
+            return
+
+        query = parse_qs(urlparse(self.path).query)
+        raw_versions = query.get("version", [])
+        if len(raw_versions) != 1:
+            self._json_response({"error": "Invalid version"}, status=400)
+            return
+
+        try:
+            target_version = int(raw_versions[0])
+        except ValueError:
+            self._json_response({"error": "Invalid version"}, status=400)
+            return
+        if target_version < 0:
+            self._json_response({"error": "Invalid version"}, status=400)
+            return
+
+        current_version = self._dashboard_version(user.id)
+        cached = self._dashboard_cache.get(f"dashboard_{user.id}")
+        cached_version = cached[2] if cached is not None else None
+        ready = cached is not None and cached[2] >= target_version
+        if not ready and current_version >= target_version:
+            self._trigger_warm(user, current_version)
+
+        self._json_response(
+            {
+                "ok": True,
+                "ready": ready,
+                "target_version": target_version,
+                "current_version": current_version,
+                "cached_version": cached_version,
+            }
+        )
 
     def _handle_tldr_detail(self) -> None:
         try:

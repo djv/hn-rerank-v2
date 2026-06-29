@@ -974,6 +974,7 @@
     const IDLE_INACTIVE_PREFETCH_COUNT = 3;
     let idleAgePrefetchHandle = null;
     let toastTimer = null;
+    let latestPendingRankingVersion = null;
 
     function cards() {
       return Array.from(storiesContainer.querySelectorAll('.story-card'));
@@ -1181,11 +1182,87 @@
       }, 3000);
     }
 
+    function feedbackPath() {
+      return window.location.pathname.startsWith('/rewrite') ? '/rewrite/api/feedback' : '/api/feedback';
+    }
+
+    function rankingReadyPath(version) {
+      const apiPath = window.location.pathname.startsWith('/rewrite') ? '/rewrite/api/ranking-ready' : '/api/ranking-ready';
+      return `${apiPath}?version=${encodeURIComponent(version)}`;
+    }
+
+    function waitForVoteRemoval() {
+      if (!activeCard?.dataset.voted) {
+        return Promise.resolve();
+      }
+      return new Promise(resolve => {
+        window.requestAnimationFrame(() => {
+          if (!activeCard?.dataset.voted) {
+            resolve();
+            return;
+          }
+          window.setTimeout(resolve, 180);
+        });
+      });
+    }
+
+    function scheduleRefillWhenRankingReady(version) {
+      if (typeof version !== 'number' || !Number.isFinite(version) || version < 0) {
+        return;
+      }
+      latestPendingRankingVersion = version;
+      pollRankingReady(version, 400, Date.now());
+    }
+
+    async function pollRankingReady(version, delayMs, startedAt) {
+      if (latestPendingRankingVersion !== version) {
+        return;
+      }
+      if (Date.now() - startedAt > 30000) {
+        return;
+      }
+      window.setTimeout(async () => {
+        if (latestPendingRankingVersion !== version) {
+          return;
+        }
+        try {
+          const resp = await fetch(rankingReadyPath(version), { cache: 'no-store' });
+          if (!resp.ok) {
+            throw new Error(`Ranking readiness failed: ${resp.status}`);
+          }
+          const data = await resp.json();
+          if (latestPendingRankingVersion !== version) {
+            return;
+          }
+          if (data.ready) {
+            await waitForVoteRemoval();
+            if (latestPendingRankingVersion !== version) {
+              return;
+            }
+            if (isRefilling) {
+              pollRankingReady(version, Math.min(delayMs * 2, 2500), startedAt);
+              return;
+            }
+            isRefilling = true;
+            try {
+              await refillQueue({ forceFetch: true, advance: false });
+            } finally {
+              isRefilling = false;
+            }
+            return;
+          }
+        } catch (err) {
+          console.error('Failed checking ranking readiness', err);
+        }
+        pollRankingReady(version, Math.min(delayMs * 2, 2500), startedAt);
+      }, delayMs);
+    }
+
     async function silentRefill() {
       if (isRefilling) return;
       isRefilling = true;
       try {
-        await refillQueue({ forceFetch: true });
+        await refillQueue({ forceFetch: true, advance: true });
       } catch (err) {
         console.error('Failed to silently refill queue', err);
       } finally {
@@ -1230,7 +1307,7 @@
       return parser.parseFromString(htmlText, 'text/html');
     }
 
-    async function refillQueue({ forceFetch: _forceFetch = false } = {}) {
+    async function refillQueue({ forceFetch: _forceFetch = false, advance = true } = {}) {
       const newDoc = await fetchRefillDoc();
       const newStories = newDoc.getElementById('stories');
       if (!newStories) {
@@ -1270,8 +1347,10 @@
       // explore (shuffle) to avoid reshuffling on every vote.
       if (currentSort === 'recommended' || currentSort === 'date') {
         orderForCurrentSort();
-        showNextCard();
-      } else if (!activeCard || activeCard.dataset.voted) {
+        if (advance) {
+          showNextCard();
+        }
+      } else if (advance && (!activeCard || activeCard.dataset.voted)) {
         showNextCard();
       }
     }
@@ -1356,8 +1435,7 @@
     }
 
     function sendFeedback(storyId, action, queueRemaining) {
-      const apiPath = window.location.pathname.startsWith('/rewrite') ? '/rewrite/api/feedback' : '/api/feedback';
-      return fetch(apiPath, {
+      return fetch(feedbackPath(), {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
@@ -1411,7 +1489,9 @@
       const queueRemaining = queuedCards().length;
       const savePromise = sendFeedback(storyId, action, queueRemaining)
         .then(data => {
-          silentRefill();
+          if (typeof data.target_version === 'number') {
+            scheduleRefillWhenRankingReady(data.target_version);
+          }
           return data;
         })
         .catch(err => {
@@ -1447,7 +1527,9 @@
       Promise.resolve(savePromise).finally(() => {
         return sendFeedback(storyId, 'clear', queuedCards().length);
       }).then(data => {
-        silentRefill();
+        if (typeof data.target_version === 'number') {
+          scheduleRefillWhenRankingReady(data.target_version);
+        }
         return data;
       }).catch(err => {
         console.error('Network error undoing feedback', err);

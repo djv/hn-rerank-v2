@@ -250,7 +250,11 @@ def test_feedback_post(test_env):
         cookies={"hn_token": user.token},
     )
     assert resp.status_code == 200
-    assert resp.json() == {"ok": True, "ranking_refresh_queued": True}
+    assert resp.json() == {
+        "ok": True,
+        "ranking_refresh_queued": True,
+        "target_version": 1,
+    }
 
     records = db.get_all_feedback(user.id)
     assert len(records) == 1
@@ -292,7 +296,11 @@ def test_feedback_post_invalidates_cache_on_every_vote(test_env):
     )
 
     assert resp.status_code == 200
-    assert resp.json() == {"ok": True, "ranking_refresh_queued": True}
+    assert resp.json() == {
+        "ok": True,
+        "ranking_refresh_queued": True,
+        "target_version": starting_version + 1,
+    }
     assert len(db.get_all_feedback(user.id)) == 1
     assert handler._dashboard_version(user.id) == starting_version + 1
     assert regen_event.is_set()
@@ -326,7 +334,11 @@ def test_feedback_post_invalidates_cache_with_low_queue(test_env):
     )
 
     assert resp.status_code == 200
-    assert resp.json() == {"ok": True, "ranking_refresh_queued": True}
+    assert resp.json() == {
+        "ok": True,
+        "ranking_refresh_queued": True,
+        "target_version": starting_version + 1,
+    }
     assert handler._dashboard_version(user.id) == starting_version + 1
     assert regen_event.is_set()
 
@@ -358,7 +370,11 @@ def test_feedback_post_refreshes_when_client_requests_ranking(test_env):
     )
 
     assert resp.status_code == 200
-    assert resp.json() == {"ok": True, "ranking_refresh_queued": True}
+    assert resp.json() == {
+        "ok": True,
+        "ranking_refresh_queued": True,
+        "target_version": 1,
+    }
     assert len(db.get_all_feedback(user.id)) == 1
     assert regen_event.is_set()
 
@@ -410,7 +426,11 @@ def test_feedback_post_bumps_cache_version_for_warm_rerender(test_env, monkeypat
         cookies={"hn_token": user.token},
     )
     assert resp.status_code == 200
-    assert resp.json() == {"ok": True, "ranking_refresh_queued": True}
+    assert resp.json() == {
+        "ok": True,
+        "ranking_refresh_queued": True,
+        "target_version": pre_version + 1,
+    }
 
     post_version = handler._dashboard_version(user.id)
     assert post_version == pre_version + 1, (
@@ -450,7 +470,11 @@ def test_feedback_clear(test_env):
         cookies={"hn_token": user.token},
     )
     assert resp.status_code == 200
-    assert resp.json() == {"ok": True, "ranking_refresh_queued": True}
+    assert resp.json() == {
+        "ok": True,
+        "ranking_refresh_queued": True,
+        "target_version": 1,
+    }
 
     assert len(db.get_all_feedback(user.id)) == 0
     assert regen_event.is_set()
@@ -483,6 +507,116 @@ def test_feedback_clear_then_revote_creates_new_record(test_env):
     assert len(records) == 1
     assert records[0].story_id == 1003
     assert records[0].action == "down"
+
+
+def test_ranking_ready_requires_session(test_env) -> None:
+    port, _, _, _, _ = test_env
+
+    resp = httpx.get(f"http://127.0.0.1:{port}/api/ranking-ready?version=0")
+
+    assert resp.status_code == 401
+
+
+@pytest.mark.parametrize("version", ["", "abc", "-1", "1.2"])
+def test_ranking_ready_rejects_invalid_version(test_env, version: str) -> None:
+    port, _, _, _, user = test_env
+
+    resp = httpx.get(
+        f"http://127.0.0.1:{port}/api/ranking-ready?version={version}",
+        cookies={"hn_token": user.token},
+    )
+
+    assert resp.status_code == 400
+
+
+def test_ranking_ready_false_when_cache_missing_or_older(test_env, monkeypatch) -> None:
+    port, _, _, handler, user = test_env
+    calls: list[tuple[int, int]] = []
+
+    def fake_trigger_warm(cls, warm_user, version: int) -> None:
+        calls.append((warm_user.id, version))
+
+    monkeypatch.setattr(handler, "_trigger_warm", classmethod(fake_trigger_warm))
+    target_version = handler._invalidate_dashboard_cache(user.id)
+
+    missing_resp = httpx.get(
+        f"http://127.0.0.1:{port}/api/ranking-ready?version={target_version}",
+        cookies={"hn_token": user.token},
+    )
+
+    assert missing_resp.status_code == 200
+    assert missing_resp.json() == {
+        "ok": True,
+        "ready": False,
+        "target_version": target_version,
+        "current_version": target_version,
+        "cached_version": None,
+    }
+
+    handler._dashboard_cache[f"dashboard_{user.id}"] = (
+        b"older",
+        time.time(),
+        target_version - 1,
+    )
+    older_resp = httpx.get(
+        f"http://127.0.0.1:{port}/api/ranking-ready?version={target_version}",
+        cookies={"hn_token": user.token},
+    )
+
+    assert older_resp.status_code == 200
+    assert older_resp.json()["ready"] is False
+    assert older_resp.json()["cached_version"] == target_version - 1
+    assert calls == [(user.id, target_version), (user.id, target_version)]
+
+
+def test_ranking_ready_true_only_from_cached_version(test_env, monkeypatch) -> None:
+    port, _, _, handler, user = test_env
+    calls: list[tuple[int, int]] = []
+
+    def fake_trigger_warm(cls, warm_user, version: int) -> None:
+        calls.append((warm_user.id, version))
+
+    monkeypatch.setattr(handler, "_trigger_warm", classmethod(fake_trigger_warm))
+    target_version = handler._invalidate_dashboard_cache(user.id)
+    handler._dashboard_cache[f"dashboard_{user.id}"] = (
+        b"fresh",
+        time.time(),
+        target_version,
+    )
+
+    resp = httpx.get(
+        f"http://127.0.0.1:{port}/api/ranking-ready?version={target_version}",
+        cookies={"hn_token": user.token},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "ok": True,
+        "ready": True,
+        "target_version": target_version,
+        "current_version": target_version,
+        "cached_version": target_version,
+    }
+    assert calls == []
+
+
+def test_ranking_ready_true_for_older_requested_version(test_env) -> None:
+    port, _, _, handler, user = test_env
+    newer_version = handler._invalidate_dashboard_cache(user.id)
+    handler._dashboard_cache[f"dashboard_{user.id}"] = (
+        b"newer",
+        time.time(),
+        newer_version,
+    )
+
+    resp = httpx.get(
+        f"http://127.0.0.1:{port}/api/ranking-ready?version={newer_version - 1}",
+        cookies={"hn_token": user.token},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["ready"] is True
+    assert resp.json()["cached_version"] == newer_version
 
 
 def _wait_for_cache(handler, user, expected_version, timeout=3.0):
@@ -2151,15 +2285,14 @@ def test_inline_script_has_voted_story_ids_filter():
     assert "delete card.dataset.voted" in submit_catch
 
 
-def test_submitVote_silently_refills_on_success() -> None:
-    """A successful vote save triggers a silent queue refill (no manual
-    refresh button — the user voted, the next queue is fetched in the
-    background)."""
+def test_submitVote_schedules_ready_gated_refill_on_success() -> None:
+    """A successful vote save waits for warmed ranking HTML before refill."""
     _, inline_script = _read_template_and_static()
     submit_vote_block = inline_script.split("function submitVote(", 1)[1].split(
         "function ", 1
     )[0]
-    assert "silentRefill()" in submit_vote_block
+    assert "silentRefill()" not in submit_vote_block
+    assert "scheduleRefillWhenRankingReady(data.target_version)" in submit_vote_block
     # On a failed save, the catch handler must surface a toast (not the old
     # refresh banner, which is gone).
     submit_catch = submit_vote_block.split("Network error submitting feedback", 1)[1]
@@ -2168,14 +2301,14 @@ def test_submitVote_silently_refills_on_success() -> None:
     assert "refreshBanner.hidden" not in submit_catch
 
 
-def test_undoLastVote_silently_refills_on_success() -> None:
-    """A successful undo triggers a silent queue refill; a failed undo
-    surfaces a toast."""
+def test_undoLastVote_schedules_ready_gated_refill_on_success() -> None:
+    """A successful undo waits for warmed ranking HTML before refill."""
     _, inline_script = _read_template_and_static()
     undo_block = inline_script.split("function undoLastVote()", 1)[1].split(
         "function ", 1
     )[0]
-    assert "silentRefill()" in undo_block
+    assert "silentRefill()" not in undo_block
+    assert "scheduleRefillWhenRankingReady(data.target_version)" in undo_block
     undo_catch = undo_block.split("Network error undoing feedback", 1)[1]
     assert "showToast(" in undo_catch
     assert "refreshBannerText" not in undo_catch
@@ -2190,7 +2323,18 @@ def test_silentRefill_serializes_concurrent_calls() -> None:
         "function ", 1
     )[0]
     assert "if (isRefilling) return" in block
-    assert "refillQueue({ forceFetch: true })" in block
+    assert "refillQueue({ forceFetch: true, advance: true })" in block
+
+
+def test_ready_gated_refill_uses_non_advancing_refill() -> None:
+    _, inline_script = _read_template_and_static()
+    block = inline_script.split("async function pollRankingReady(", 1)[1].split(
+        "async function silentRefill()", 1
+    )[0]
+    assert "rankingReadyPath(version)" in block
+    assert "latestPendingRankingVersion !== version" in block
+    assert "await waitForVoteRemoval()" in block
+    assert "refillQueue({ forceFetch: true, advance: false })" in block
 
 
 def test_refillQueue_reorders_deterministic_modes_only() -> None:
@@ -2209,6 +2353,16 @@ def test_refillQueue_reorders_deterministic_modes_only() -> None:
     assert "if (currentSort === 'recommended' || currentSort === 'date')" in block
     assert "showNextCard()" in block
     assert block.index("orderForCurrentSort()") < block.index("showNextCard()")
+
+
+def test_refillQueue_advance_false_path_does_not_show_next_card() -> None:
+    _, inline_script = _read_template_and_static()
+    block = inline_script.split("async function refillQueue(", 1)[1].split(
+        "function ", 1
+    )[0]
+    assert "advance = true" in block
+    assert "if (advance) {\n          showNextCard();" in block
+    assert "} else if (advance && (!activeCard || activeCard.dataset.voted))" in block
 
 
 def test_showToast_dismisses_after_3s() -> None:
