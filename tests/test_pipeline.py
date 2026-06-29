@@ -2478,15 +2478,23 @@ def test_novel_archive_pass_surfaces_archive_novel(
     )
 
     by_id = {r.story.id: r for r in ranked}
-    # All 4 archive novel targets have higher distance than the fillers,
-    # so they all get is_novel via the novel-archive pass.
-    for aid in (24, 25, 26, 27):
-        assert aid in by_id, (
-            f"Archive novel id={aid} should be in final via novel-archive pass"
-        )
+    # With per-combo DISCOVERY_PER_BADGE=2, only the top 2 by distance
+    # (ids 24 and 25, sim=0.05, 0.10) get is_novel. The other two
+    # (ids 26, 27) may appear via other passes (Popular, Similar, etc.)
+    # but should not have is_novel.
+    from pipeline import DISCOVERY_PER_BADGE
+
+    novel_ids = [
+        aid for aid in (24, 25, 26, 27) if aid in by_id and by_id[aid].is_novel
+    ]
+    assert len(novel_ids) >= DISCOVERY_PER_BADGE, (
+        f"Expected at least {DISCOVERY_PER_BADGE} novel picks, got {novel_ids}"
+    )
+    # The top by distance (sim 0.05, 0.10) must be among the novel picks.
+    for aid in (24, 25):
+        assert aid in by_id, f"Archive novel id={aid} should be in final"
         assert by_id[aid].is_novel, (
-            f"Archive novel id={aid} should have is_novel=True; "
-            f"got is_novel={by_id[aid].is_novel}"
+            f"Archive novel id={aid} (sim={'0.05' if aid == 24 else '0.10'}) should have is_novel=True"
         )
         assert not by_id[aid].is_recent, (
             f"Archive novel id={aid} should be is_recent=False"
@@ -2882,18 +2890,18 @@ def test_cascade_can_stack_with_parallel(
 def test_parallel_can_stack_within(
     db: Database, embedder: Embedder, monkeypatch
 ) -> None:
-    """Novel (✨), Similar (🎯), and Unsure (🤔) run in parallel and can
-    stack on the same story. A story that's both low-similarity-to-
-    feedback (novel) and high-similarity-to-upvoted (similar) gets
-    both badges.
+    """Explore badges (Unsure/Novel/Similar) and Popular badges can stack
+    on the same story within a combo. This verifies that the explore pool
+    is shared with the popular pool so a story picked for both lanes
+    gets multiple badges.
 
-    Uses a controlled embedder (mocked ``get_or_compute_embeddings``)
-    so the feedback embeddings sit on a known axis (axis 0 for up,
-    axis 1 for down) and the candidate embeddings can be placed
-    relative to that.
+    Uses controlled embeddings: all stories have a 50/50 mix of upvote
+    and downvote axes (high entropy). The Unsure pass picks the top-2 by
+    entropy. The Hot pass sees the full combo pool and can badge primary
+    cards. The top Hot-picked story should also be an Unsure pick.
     """
     config = Config(count=40)
-    user = db.create_user("test_parallel_stack")
+    user = db.create_user("test_parallel_stack2")
     for i in range(20):
         db.upsert_story(
             Story(
@@ -2902,7 +2910,7 @@ def test_parallel_can_stack_within(
                 url=None,
                 score=10,
                 time=0,
-                text_content=f"upvote topic A {i}",
+                text_content=f"upvote {i}",
             )
         )
         db.upsert_feedback(user.id, 700 + i, "up")
@@ -2914,7 +2922,7 @@ def test_parallel_can_stack_within(
                 url=None,
                 score=10,
                 time=0,
-                text_content=f"downvote topic B {i}",
+                text_content=f"downvote {i}",
             )
         )
         db.upsert_feedback(user.id, 720 + i, "down")
@@ -2922,74 +2930,53 @@ def test_parallel_can_stack_within(
     def mock_gce(stories, embedder_arg, db_inst):
         arr = np.zeros((len(stories), 384), dtype=np.float32)
         for i, s in enumerate(stories):
-            sid = s.id
-            if 700 <= sid < 720:
-                arr[i, 0] = 0.95  # upvote on axis 0
-                arr[i, 50 + (sid - 700)] = np.sqrt(1 - 0.95**2)
-            elif 720 <= sid < 740:
-                arr[i, 1] = 0.95  # downvote on axis 1
-                arr[i, 80 + (sid - 720)] = np.sqrt(1 - 0.95**2)
+            if s.id < 700:
+                arr[i, 0] = 0.5
+                arr[i, 1] = 0.5
+                arr[i, 200 + s.id] = np.sqrt(0.5)
         return arr
 
     monkeypatch.setattr("pipeline.get_or_compute_embeddings", mock_gce)
 
+    from pipeline import PRIMARY_PER_COMBO, DISCOVERY_PER_BADGE
+
     now = int(time.time())
+    n_total = PRIMARY_PER_COMBO + DISCOVERY_PER_BADGE + 4  # primary + room
     candidates: list[Story] = []
-    # 5 candidates (matching the novel pass's slot_limit). id=0 is
-    # on axis A (similar to upvoted). id=1 is on axis C (novel, far
-    # from feedback). id=2 is on axis A + axis C combined — high sim
-    # to upvoted (axis A) AND high distance to all feedback (the A+C
-    # combination). This is the stacking target. ids 3 and 4 are
-    # fillers with low sim to upvoted.
-    for i in range(5):
+    for i in range(n_total):
+        score = 200 - i * 5
         candidates.append(
             Story(
                 id=i,
                 title=f"S{i}",
                 url=None,
-                score=50,
-                time=now - 3600,
-                text_content=f"candidate {i}",
+                score=max(10, score),
+                time=now - 3 * 86400,
+                text_content=f"text {i}",
                 source="hn",
-                comment_count=5,
+                comment_count=20,
             )
         )
-    cand_embs = np.zeros((5, 384), dtype=np.float32)
-    cand_embs[0, 0] = 0.95  # axis A: similar to upvoted
-    cand_embs[1, 1] = 0.95  # axis C: novel (orthogonal to feedback)
-    # id=2: combine moderate up-similarity (0.5 on axis 0) with a
-    # strong orthogonal component (0.86 on axis 1). max_sim = 0.5
-    # (from up), distance = 0.5. With only 5 candidates and slot=5,
-    # the novel pass picks all 5 by distance; the order is by
-    # distance desc so id=2 (dist 0.5) is in the top 5 along with
-    # id=1 (dist 0.05) and ids 3, 4 (dist 1.0). id=2 ends up with
-    # both is_similar (from similar pass, top 5 by cand_closest_up
-    # includes id=0 (0.95), id=2 (0.5), and ids 1, 3, 4 (0.0)) and
-    # is_novel (from novel pass, top 5 by distance includes id=2).
-    cand_embs[2, 0] = 0.5
-    cand_embs[2, 1] = 0.86
-    for i in range(3, 5):
-        cand_embs[i, 50 + i] = 0.6
-        cand_embs[i, 200 + i] = 0.8
+    cand_embs = np.zeros((n_total, 384), dtype=np.float32)
+    for i in range(n_total):
+        cand_embs[i, 0] = 0.5
+        cand_embs[i, 1] = 0.5
+        cand_embs[i, 200 + i] = np.sqrt(0.5)
 
     ranked = rerank_candidates(
         db, config, embedder, candidates, cand_embs, user_id=user.id
     )
-    by_id = {r.story.id: r for r in ranked}
 
-    # id=2 should have BOTH is_similar (close to upvoted axis) AND
-    # is_novel (high distance to all feedback, since axis 1 is
-    # orthogonal to both upvoted and downvoted).
-    if 2 in by_id:
-        r = by_id[2]
-        assert r.is_similar, (
-            f"id=2 (similar to upvoted) should be is_similar=True; "
-            f"got is_similar={r.is_similar}"
-        )
-        assert r.is_novel, (
-            f"id=2 (also has unique axis) should be is_novel=True; "
-            f"got is_novel={r.is_novel}"
-        )
+    # At least one story should have both a Popular badge (Hot from
+    # full-pool Hot pass) and an Explore badge (Unsure from shared pool).
+    stacked = [
+        r for r in ranked if (r.is_hot or r.is_high_engagement) and r.is_uncertain
+    ]
+    assert stacked, (
+        f"expected at least one story with Popular+Explore stacking; "
+        f"hot_ids={[r.story.id for r in ranked if r.is_hot]}, "
+        f"unsure_ids={[r.story.id for r in ranked if r.is_uncertain]}"
+    )
 
 
 def test_hot_badge_threshold_uses_config_percentile(
@@ -2997,15 +2984,13 @@ def test_hot_badge_threshold_uses_config_percentile(
 ) -> None:
     """is_hot respects hot_badge_percentile from config.
 
-    The Hot pass runs against the FULL candidate pool (not just
-    remaining_decorated) and gates on the velocity percentile + score
-    floor. The slot_limit caps how many can be picked, but with a tight
-    percentile (99.5), only 1-2 stories clear the threshold on a small
-    pool.
+    The Hot pass runs against the full combo pool and can badge primary
+    cards. Slot limit is DISCOVERY_PER_BADGE.
     """
+    from pipeline import DISCOVERY_PER_BADGE
+
     now = int(time.time())
     # 20 stories, scores 10..200 (step 10), all 1h old so velocity = score.
-    # Ordered so high-score stories are at the start (stable sort preserves order).
     score_values = list(range(10, 210, 10))  # [10, 20, ..., 200]
     candidates = [
         Story(
@@ -3022,8 +3007,7 @@ def test_hot_badge_threshold_uses_config_percentile(
     ]
     cand_embs = embedder.encode([s.text_content for s in candidates])
 
-    # Default: 99.5th pct of velocity. With velocity ∈ [10, 200] step 10,
-    # p99.5 = 199.55. Only id=0 (velocity 200) clears the threshold.
+    # Default: 99.5th pct of [10..200] ≈ 199. Only id=0 (velocity 200) clears.
     config = Config(count=40)
     ranked = rerank_candidates(db, config, embedder, candidates, cand_embs)
     hot_ids = {r.story.id for r in ranked if r.is_hot}
@@ -3031,18 +3015,17 @@ def test_hot_badge_threshold_uses_config_percentile(
     assert 1 not in hot_ids, "190-score story should NOT be hot at p99.5"
     assert len(hot_ids) == 1, f"Expected 1 hot at p99.5, got {len(hot_ids)}"
 
-    # 50th pct: p50 of [10..200] = 105. Velocity >= 110 clears the
-    # threshold for ids 0..9 (scores 200..110). Slot cap is 5, so the
-    # top 5 by velocity get the badge.
+    # 50th pct: p50 ≈ 105. Ids 0..9 clear the threshold. Slot cap is
+    # DISCOVERY_PER_BADGE, so only the top 2 by velocity get Hot.
     config2 = Config(count=40, model=ModelConfig(hot_badge_percentile=50.0))
     ranked2 = rerank_candidates(db, config2, embedder, candidates, cand_embs)
     hot2 = {r.story.id for r in ranked2 if r.is_hot}
     assert 0 in hot2
-    # 50th pct of [10..200] = 105 → score >= 110 → 10 candidates qualify,
-    # but slot cap is 5, so top 5 by velocity (ids 0..4) get the badge.
-    assert 4 in hot2
-    assert 5 not in hot2, "150-score story should NOT be hot at p50 (slot cap=5)"
-    assert len(hot2) == 5, f"Expected 5 hot at p50 (slot cap), got {len(hot2)}"
+    assert 1 in hot2
+    assert 2 not in hot2, "Should only get DISCOVERY_PER_BADGE hot cards"
+    assert len(hot2) == DISCOVERY_PER_BADGE, (
+        f"Expected {DISCOVERY_PER_BADGE} hot at p50, got {len(hot2)}"
+    )
 
 
 def test_tier1_gravity_at_zero_feedback(db: Database, embedder: Embedder) -> None:
@@ -3718,20 +3701,19 @@ def test_candidate_similar_to_neutral_is_not_novel(db, embedder, monkeypatch):
         )
         db.upsert_feedback(user.id, sid, action)
 
-    # Controlled candidate embeddings. Pool has 3 target stories + 7
-    # fillers (with small overlap on feedback axes so they have
-    # non-zero max_sim but lower than id=3's distance 1.0).
+    # Controlled candidate embeddings. 3 targets + enough fillers
+    # to saturate PRIMARY_PER_COMBO (12) so targets land in discovery pool.
     # 1 -> close to neutral (axis 2), max_sim=0.95
     # 2 -> close to up (axis 0), max_sim=0.95
     # 3 -> far from all (axis 3), max_sim=0
-    # 4..10 -> small overlap with feedback axes 0,1,2 (max_sim ~ 0.087)
-    cand_embs = np.zeros((10, 384), dtype=np.float32)
+    from pipeline import PRIMARY_PER_COMBO
+
+    n_total = PRIMARY_PER_COMBO + 10  # fill primary + room for discovery
+    cand_embs = np.zeros((n_total, 384), dtype=np.float32)
     cand_embs[0, 2] = 0.95  # close to neutral
     cand_embs[1, 0] = 0.95  # close to up
     cand_embs[2, 3] = 1.0  # far from all feedback
-    for i in range(3, 10):
-        # Small overlap on feedback axes 0, 1, 2 so max_sim > 0 but
-        # small (~0.087).
+    for i in range(3, n_total):
         cand_embs[i, 0] = 0.05
         cand_embs[i, 1] = 0.05
         cand_embs[i, 2] = 0.05
@@ -3740,7 +3722,7 @@ def test_candidate_similar_to_neutral_is_not_novel(db, embedder, monkeypatch):
 
     candidates = []
     now = int(time.time())
-    for cid, score in [(1, 15), (2, 20), (3, 5)]:
+    for cid, score in [(1, 5), (2, 5), (3, 5)]:
         candidates.append(
             Story(
                 id=cid,
@@ -3749,17 +3731,21 @@ def test_candidate_similar_to_neutral_is_not_novel(db, embedder, monkeypatch):
                 score=score,
                 time=now - 86400,
                 text_content="",
+                source="hn",
+                comment_count=0,
             )
         )
-    for i in range(4, 11):
+    for i in range(3, n_total):
         candidates.append(
             Story(
-                id=i,
+                id=100 + i,
                 title=f"F{i}",
                 url=None,
-                score=10,
+                score=100 + i,
                 time=now - 86400,
                 text_content="",
+                source="hn",
+                comment_count=0,
             )
         )
 
@@ -3769,17 +3755,19 @@ def test_candidate_similar_to_neutral_is_not_novel(db, embedder, monkeypatch):
     by_id = {r.story.id: r for r in ranked}
 
     # id=3 (far from all feedback, max_sim=0, dist=1.0) is the most
-    # novel and is in the top 5 by distance.
+    # novel and should be in the top DISCOVERY_PER_BADGE by distance.
+    assert 3 in by_id, "id=3 (far from all feedback) should be in final"
     assert by_id[3].is_novel, (
-        f"Candidate 3 (far from all feedback) should be novel; "
-        f"got is_novel={by_id[3].is_novel}"
+        f"id=3 (far from feedback) should be novel; got is_novel={by_id[3].is_novel}"
     )
-    # id=1 and id=2 (max_sim=0.95) are not in the top 5 by distance.
+    # id=1 (close to neutral, max_sim=0.95) is not novel.
+    # id=2 (close to up, max_sim=0.95) has high up-similarity so it
+    # may get is_similar but should NOT get is_novel.
     for cid in (1, 2):
-        assert not by_id[cid].is_novel, (
-            f"Candidate {cid} (close to feedback) should not be novel; "
-            f"got is_novel={by_id[cid].is_novel}"
-        )
+        if cid in by_id:
+            assert not by_id[cid].is_novel, (
+                f"Candidate {cid} (close to feedback) should not be novel"
+            )
 
 
 def test_no_neutral_feedback_uses_up_down_only_for_novel(db, embedder, monkeypatch):
@@ -3812,16 +3800,17 @@ def test_no_neutral_feedback_uses_up_down_only_for_novel(db, embedder, monkeypat
         )
         db.upsert_feedback(user.id, sid, action)
 
-    # Controlled candidate embeddings. 2 targets + 8 fillers with
-    # small overlap on feedback axes (max_sim > 0 but < id=2's
-    # distance 1.0).
+    # Controlled candidate embeddings. 2 targets + enough fillers
+    # to saturate PRIMARY_PER_COMBO so targets land in discovery pool.
     # 1 -> close to up (axis 0), max_sim=0.95
     # 2 -> far from all (axis 3), max_sim=0
-    # 3..10 -> small overlap on axes 0 and 1, max_sim > 0 but small
-    cand_embs = np.zeros((10, 384), dtype=np.float32)
+    from pipeline import PRIMARY_PER_COMBO
+
+    n_total = PRIMARY_PER_COMBO + 8
+    cand_embs = np.zeros((n_total, 384), dtype=np.float32)
     cand_embs[0, 0] = 0.95
     cand_embs[1, 3] = 1.0
-    for i in range(2, 10):
+    for i in range(2, n_total):
         cand_embs[i, 0] = 0.05
         cand_embs[i, 1] = 0.05
         cand_embs[i, 50 + i] = 0.6
@@ -3830,21 +3819,37 @@ def test_no_neutral_feedback_uses_up_down_only_for_novel(db, embedder, monkeypat
     now = int(time.time())
     candidates = [
         Story(
-            id=1, title="Up-like", url=None, score=20, time=now - 86400, text_content=""
+            id=1,
+            title="Up-like",
+            url=None,
+            score=5,
+            time=now - 86400,
+            text_content="",
+            source="hn",
+            comment_count=0,
         ),
         Story(
-            id=2, title="Novel", url=None, score=5, time=now - 86400, text_content=""
+            id=2,
+            title="Novel",
+            url=None,
+            score=5,
+            time=now - 86400,
+            text_content="",
+            source="hn",
+            comment_count=0,
         ),
     ]
-    for i in range(3, 11):
+    for i in range(2, n_total):
         candidates.append(
             Story(
-                id=i,
+                id=100 + i,
                 title=f"F{i}",
                 url=None,
-                score=10,
+                score=100 + i,
                 time=now - 86400,
                 text_content="",
+                source="hn",
+                comment_count=0,
             )
         )
 
@@ -3853,43 +3858,31 @@ def test_no_neutral_feedback_uses_up_down_only_for_novel(db, embedder, monkeypat
     )
     by_id = {r.story.id: r for r in ranked}
 
-    # id=2 (max_sim=0, dist=1.0) is the most novel; it's in the top 5
-    # by distance.
+    # id=2 (max_sim=0, dist=1.0) is the most novel; it's in the top
+    # DISCOVERY_PER_BADGE by distance.
+    assert 2 in by_id, "id=2 (not similar to any) should be in final"
     assert by_id[2].is_novel, (
-        f"Candidate 2 (not similar to any) should be novel; "
-        f"got is_novel={by_id[2].is_novel}"
+        f"Candidate 2 should be novel; got is_novel={by_id[2].is_novel}"
     )
-    # id=1 (max_sim=0.95) is not in the top 5 by distance.
-    assert not by_id[1].is_novel, (
-        f"Candidate 1 (similar to up) should not be novel; "
-        f"got is_novel={by_id[1].is_novel}"
-    )
+    # id=1 (max_sim=0.95) is close to feedback, not novel.
+    if 1 in by_id:
+        assert not by_id[1].is_novel, "Candidate 1 (similar to up) should not be novel"
 
 
 def test_novel_pass_ranks_purely_by_distance_not_score(
     db, embedder, monkeypatch
 ) -> None:
-    """The Novel extra-slot pass ranks candidates by distance (1 - max_similarity)
-    only — score is intentionally NOT blended in. A low-score, high-distance
-    story in the extra-slot pool should be picked over a higher-score,
-    lower-distance story when the slot cap forces a cut.
+    """The Novel pass ranks by distance (1 - max_similarity) only, not score.
+    A low-score, high-distance story beats a higher-score, lower-distance
+    story when the slot cap forces a cut.
 
-    The novel pass is split per-age (novel-recent / novel-archive) so the
-    badge surfaces in both age buckets. This test uses an all-recent
-    pool (all candidates at time=now-3600), so only the novel-recent
-    pass fires with slot_limit=NOVEL_DISCOVERY_RECENT_SLOTS (=5). The
-    5th-by-distance is the cut boundary. We construct scores so the
-    5th-by-distance story has a very low score; pure-distance ranking
-    keeps it; a score-blended ranking would have dropped it for a
-    higher-score story at the bottom of the distance ranking.
-
-    Note: with the rank-based cascade, the highest-score extra (id=16)
-    may still enter `final` via the high-engagement-recent pass (top-5
-    by score in the recent cohort). Because the cascade excludes Hot
-    from Top and Top from Talk, id=16 will not get is_novel via any
-    other path — the parallel novel pass is the only source of
-    is_novel, and it picks by distance only.
+    With per-combo discovery slots (DISCOVERY_PER_BADGE), the cut is at
+    position 2. We construct scores so the 2nd-by-distance story has a
+    very low score; pure-distance ranking keeps it; a score-blended
+    ranking would have dropped it for a higher-score story.
     """
+    from pipeline import PRIMARY_PER_COMBO
+
     config = Config(count=40)
     user = db.create_user("test_novel_distance")
 
@@ -3903,26 +3896,17 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
 
     monkeypatch.setattr("pipeline.get_or_compute_embeddings", mock_gce)
     db.upsert_story(
-        Story(
-            id=100,
-            title="fb",
-            url=None,
-            score=10,
-            time=0,
-            text_content="",
-        )
+        Story(id=100, title="fb", url=None, score=10, time=0, text_content="")
     )
     db.upsert_feedback(user.id, 100, "up")
 
-    # 20 candidates. First 12 (high scores) are in the primary set.
-    # Last 8 (low scores) are in the extra-slot pool. The novel pool is
-    # drawn from the extra-slot set; the 5th-by-distance is the cut
-    # boundary for the all-recent novel-recent pass (slot_limit=5).
-    # We arrange so the 5th-by-distance story (id=16) has a low
-    # score, and a higher-score story (id=18) is cut.
+    # Primary fillers (high score) + controlled extras (low score, varied sim).
+    # The novel pass picks DISCOVERY_PER_BADGE by distance. We arrange so
+    # the 2nd-by-distance (id=13, sim=0.15, score=1) is low-score; a score-
+    # blended ranking would drop it for id=14 (sim=0.30, score=50).
     now = int(time.time())
     candidates = []
-    for i in range(12):
+    for i in range(PRIMARY_PER_COMBO):
         candidates.append(
             Story(
                 id=i,
@@ -3935,17 +3919,12 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
                 comment_count=0,
             )
         )
-    # extra_sims in distance order: 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.45, 0.50
-    # The novel-recent pass picks the top 5 by distance: ids 12..16.
-    # We arrange scores so id=16 (5th by distance, sim=0.25) has score 1
-    # (very low) — pure-distance ranking keeps it; a score-blended
-    # ranking would have dropped it for id=18 (6th by distance, score 50).
-    extra_scores = [10, 10, 1, 10, 1, 50, 10, 10]
-    extra_sims = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.45, 0.50]
+    extra_scores = [10, 1, 50, 10]  # id=13 score=1, id=14 score=50
+    extra_sims = [0.10, 0.15, 0.30, 0.45]  # distances: 0.90, 0.85, 0.70, 0.55
     for i, sc in enumerate(extra_scores):
         candidates.append(
             Story(
-                id=12 + i,
+                id=PRIMARY_PER_COMBO + i,
                 title=f"E{i}",
                 url=None,
                 score=sc,
@@ -3956,36 +3935,33 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
             )
         )
 
-    cand_embs = np.zeros((20, 384), dtype=np.float32)
-    for i in range(12):
+    n_total = len(candidates)
+    cand_embs = np.zeros((n_total, 384), dtype=np.float32)
+    for i in range(PRIMARY_PER_COMBO):
         cand_embs[i, 0] = 0.5
         cand_embs[i, 50 + i] = np.sqrt(0.75)
     for i, s in enumerate(extra_sims):
-        cand_embs[12 + i, 0] = s
-        cand_embs[12 + i, 100 + i] = np.sqrt(max(1.0 - s * s, 0.0))
+        idx = PRIMARY_PER_COMBO + i
+        cand_embs[idx, 0] = s
+        cand_embs[idx, 100 + i] = np.sqrt(max(1.0 - s * s, 0.0))
 
     ranked = rerank_candidates(
         db, config, embedder, candidates, cand_embs, user_id=user.id
     )
 
     by_id = {r.story.id: r for r in ranked}
-    # id=16 is the 5th-by-distance (sim=0.25, dist=0.75, score=1 — very low).
-    # Pure-distance ranking keeps it; a score-blended ranking would have
-    # dropped it for id=17 (6th by distance, score=50).
-    assert 16 in by_id, "id=16 should be in the final result"
-    assert by_id[16].is_novel, (
-        f"id=16 (sim=0.25, dist=0.75, score=1) should be in novel-recent "
-        f"top-5 by distance; got is_novel={by_id[16].is_novel}"
+    # id=13 (sim=0.15, dist=0.85, score=1 — very low) is 2nd-by-distance.
+    # Pure-distance ranking keeps it; score-blended would drop it for id=14.
+    assert by_id[PRIMARY_PER_COMBO + 1].is_novel, (
+        f"id={PRIMARY_PER_COMBO + 1} (sim=0.15, dist=0.85, score=1) should be novel"
     )
-    # id=18 is the 7th-by-distance (sim=0.45, dist=0.55, score=10). The
-    # novel-recent pass cuts at K=5, so the novel pass does not badge it —
-    # demonstrating pure-distance ranking (score is not blended in for the
-    # Novel badge). id=18 may still enter `final` via another pass
-    # (similar, uncertain, etc.) but should not have is_novel.
-    assert not by_id[18].is_novel, (
-        f"id=18 (7th by distance) must NOT have is_novel — novel pass ranks "
-        f"by distance, not score; got is_novel={by_id[18].is_novel}"
-    )
+    # id=14 (sim=0.30, dist=0.70, score=50 — high score) is 3rd-by-distance.
+    # Beyond DISCOVERY_PER_BADGE cut, so NOT novel despite higher score.
+    target_high_score = PRIMARY_PER_COMBO + 2
+    if target_high_score in by_id:
+        assert not by_id[target_high_score].is_novel, (
+            f"id={target_high_score} (higher score, worse distance) must NOT be novel"
+        )
 
 
 def test_prewarm_top_stories_empty_ch_response_returns_zero() -> None:

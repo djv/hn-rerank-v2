@@ -2513,40 +2513,77 @@ def rerank_candidates(
         primary_ids = {r.story.id for r in primary}
 
         # --- Popular (HN only): Hot + Top + Talk ---
+        # Each pass sees the full combo_pool and can OR badges onto stories
+        # already in primary, matching the old global Hot/Top/Talk behavior.
+        # Cascade: Hot → Top → Talk (each excludes prior picks).
         if source == "hn":
-            remaining = [r for r in combo_pool if r.story.id not in primary_ids]
-
-            hot_pool = [r for r in remaining if r.story.score >= HOT_MIN_SCORE]
-            if hot_pool:
-                hot_pool.sort(key=_hot_sort_key, reverse=True)
-                final.extend(
-                    replace(r, is_hot=True, combo_keys=f"{source_key} {mixed_key}")
-                    for r in hot_pool[:DISCOVERY_PER_BADGE]
-                )
-
-            hot_ids = {r.story.id for r in final if r.is_hot} | primary_ids
-            remaining = [r for r in combo_pool if r.story.id not in hot_ids]
-            remaining.sort(key=_engagement_sort_key, reverse=True)
-            final.extend(
-                replace(
-                    r, is_high_engagement=True, combo_keys=f"{source_key} {mixed_key}"
-                )
-                for r in remaining[:DISCOVERY_PER_BADGE]
+            # Hot: full combo_pool, gated by velocity percentile + score floor
+            hot_threshold = (
+                np.percentile(cand_velocities, config.model.hot_badge_percentile)
+                if len(cand_velocities)
+                else 0
             )
-
-            top_ids = {r.story.id for r in final} | primary_ids
-            remaining = [
+            hot_pool = [
                 r
                 for r in combo_pool
-                if r.story.id not in top_ids and (r.story.comment_count or 0) > 0
+                if r.story.score >= HOT_MIN_SCORE
+                and cand_velocities[idx_for(r.story.id)] >= hot_threshold
             ]
-            remaining.sort(key=_discussion_sort_key, reverse=True)
-            final.extend(
-                replace(
-                    r, is_discussion_rich=True, combo_keys=f"{source_key} {mixed_key}"
+            if hot_pool:
+                hot_pool.sort(key=_hot_sort_key, reverse=True)
+                for r in hot_pool[:DISCOVERY_PER_BADGE]:
+                    existing = next(
+                        (i for i, f in enumerate(final) if f.story.id == r.story.id),
+                        None,
+                    )
+                    new_r = replace(
+                        r, is_hot=True, combo_keys=f"{source_key} {mixed_key}"
+                    )
+                    if existing is not None:
+                        final[existing] = replace(
+                            final[existing],
+                            is_hot=True,
+                            combo_keys=f"{source_key} {mixed_key}",
+                        )
+                    else:
+                        final.append(new_r)
+
+            # Top: full combo_pool minus Hot picks, sorted by engagement score
+            hot_and_primary = {r.story.id for r in final if r.is_hot} | primary_ids
+            top_pool = sorted(
+                [r for r in combo_pool if r.story.id not in hot_and_primary],
+                key=_engagement_sort_key,
+                reverse=True,
+            )[:DISCOVERY_PER_BADGE]
+            for r in top_pool:
+                final.append(
+                    replace(
+                        r,
+                        is_high_engagement=True,
+                        combo_keys=f"{source_key} {mixed_key}",
+                    )
                 )
-                for r in remaining[:DISCOVERY_PER_BADGE]
-            )
+
+            # Talk: full combo_pool minus Hot+Top picks, sorted by discussion
+            hot_top_and_primary = {r.story.id for r in final} | primary_ids
+            talk_pool = sorted(
+                [
+                    r
+                    for r in combo_pool
+                    if r.story.id not in hot_top_and_primary
+                    and (r.story.comment_count or 0) > 0
+                ],
+                key=_discussion_sort_key,
+                reverse=True,
+            )[:DISCOVERY_PER_BADGE]
+            for r in talk_pool:
+                final.append(
+                    replace(
+                        r,
+                        is_discussion_rich=True,
+                        combo_keys=f"{source_key} {mixed_key}",
+                    )
+                )
 
         # --- Explore: Unsure + Novel + Similar ---
         # Explore passes see the full combo pool (minus primary) and can
