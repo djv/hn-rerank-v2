@@ -469,7 +469,9 @@ def test_feedback_post_bumps_cache_version_for_warm_rerender(test_env, monkeypat
     def fake_fast_rerank_for_user(database, config, embedder, user_id):
         return []
 
-    def fake_generate_dashboard_bytes(ranked, config, database, user_id, user_token):
+    def fake_generate_dashboard_bytes(
+        ranked, config, database, user_id, user_token, **kwargs
+    ):
         version = handler._dashboard_version(user_id)
         body = f"version={version}"
         if voted_story.id not in (s.id for s in ranked):
@@ -718,7 +720,9 @@ def test_dashboard_cache_uses_feedback_versions(test_env, mock_embedder, monkeyp
         calls.append(("rank", user_id))
         return []
 
-    def fake_generate_dashboard_bytes(ranked, config, database, user_id, user_token):
+    def fake_generate_dashboard_bytes(
+        ranked, config, database, user_id, user_token, **kwargs
+    ):
         version = TestHandler._dashboard_version(user_id)
         return f"version={version}".encode()
 
@@ -776,7 +780,9 @@ def test_stale_warm_render_does_not_overwrite_current_cache(
     def fake_fast_rerank_for_user(database, config, embedder, user_id):
         return []
 
-    def fake_generate_dashboard_bytes(ranked, config, database, user_id, user_token):
+    def fake_generate_dashboard_bytes(
+        ranked, config, database, user_id, user_token, **kwargs
+    ):
         return f"requested={user_token}".encode()
 
     import pipeline
@@ -836,7 +842,9 @@ def test_active_warm_commits_when_dashboard_version_advances(
         assert allow_rank_to_finish.wait(timeout=2.0)
         return []
 
-    def fake_generate_dashboard_bytes(ranked, config, database, user_id, user_token):
+    def fake_generate_dashboard_bytes(
+        ranked, config, database, user_id, user_token, **kwargs
+    ):
         return b"fresh content"
 
     import pipeline
@@ -887,7 +895,9 @@ def test_active_warm_after_lock_wait_still_ranks_and_commits(
         rank_called.set()
         return []
 
-    def fake_generate_dashboard_bytes(ranked, config, database, user_id, user_token):
+    def fake_generate_dashboard_bytes(
+        ranked, config, database, user_id, user_token, **kwargs
+    ):
         return b"stale warm content"
 
     import pipeline
@@ -936,7 +946,9 @@ def test_rapid_vote_warms_coalesce_to_latest_version(
         ranked_versions.append(TestHandler._dashboard_version(user_id))
         return []
 
-    def fake_generate_dashboard_bytes(ranked, config, database, user_id, user_token):
+    def fake_generate_dashboard_bytes(
+        ranked, config, database, user_id, user_token, **kwargs
+    ):
         version = TestHandler._dashboard_version(user_id)
         return f"version={version}".encode()
 
@@ -986,7 +998,9 @@ def test_warm_loops_to_newer_version_requested_while_ranking(
             assert allow_first_rank_to_finish.wait(timeout=2.0)
         return []
 
-    def fake_generate_dashboard_bytes(ranked, config, database, user_id, user_token):
+    def fake_generate_dashboard_bytes(
+        ranked, config, database, user_id, user_token, **kwargs
+    ):
         version = TestHandler._dashboard_version(user_id)
         return f"version={version}".encode()
 
@@ -1061,7 +1075,9 @@ def test_dashboard_cache_version_invariant_property(
     def fake_fast_rerank_for_user(database, config, embedder, user_id):
         return []
 
-    def fake_generate_dashboard_bytes(ranked, config, database, user_id, user_token):
+    def fake_generate_dashboard_bytes(
+        ranked, config, database, user_id, user_token, **kwargs
+    ):
         return f"v={TestHandler._dashboard_version(user_id)}".encode()
 
     import pipeline
@@ -1945,18 +1961,16 @@ def test_dashboard_has_source_filter_toggle():
     assert template.index("source-tabs") < template.index("swipe-keys")
 
 
-def test_story_cards_emit_is_hn_attribute():
-    """Each .story-card must carry a data-is-hn flag so the client source
-    filter can use a single source of truth (matches is_hn_source on the
-    server). HN/CH-archive/BQ-archive → 1; RSS → 0.
-    """
+def test_story_cards_emit_combo_keys_and_is_hn_attribute():
+    """Each .story-card carries data-combo for client age+source filtering
+    and data-is-hn for server-side is_non_hn tracking."""
     template, static = _read_template_and_static()
+    assert 'data-combo="{{ item.combo_keys }}"' in template
     assert (
         "data-is-hn=\"{{ '0' if item.is_non_hn else '1' }}\"".replace("{{", "{{")
         in template
     )
-    # The client filter must use data-is-hn, not the old prefix-based check
-    assert "card.dataset.isHn" in static
+    assert "card.dataset.combo" in static
     assert "s.startsWith('rss_')" not in static
     assert "s === 'hn' || s === 'bq_seed'" not in static
 
@@ -2088,10 +2102,8 @@ def test_keydown_uses_letter_keys():
     assert 'role="status"' in template
     assert 'aria-live="polite"' in template
     # mode and source tabs have filled active style
-    assert (
-        ".sort-tab.active, .age-tab.active {\n      background: var(--pico-primary);"
-        in template
-    )
+    assert ".sort-tab.active {\n      background: var(--pico-primary);" in template
+    assert ".age-tab.active {\n      background: #6c757d;" in template
     assert ".source-tab.active {\n      background: #6c757d;" in template
     # feedback button has filled, shadowed style
     assert "box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);" in template
@@ -2353,9 +2365,8 @@ def test_bump_all_cached_versions(swr_handler):
 
 
 def test_setSort_schedules_advancing_refresh_on_tab_click() -> None:
-    """Clicking a sort tab silently refills the queue (no manual refresh
-    button — the user picks a sort, the new ranking is fetched in the
-    background)."""
+    """Clicking a sort tab schedules an advancing deck refresh. Popular
+    is blocked when the source is non-HN."""
     _, static = _read_template_and_static()
     idx = static.index("function setSort(")
     end = static.index("function setAge(", idx)
@@ -2365,6 +2376,7 @@ def test_setSort_schedules_advancing_refresh_on_tab_click() -> None:
     assert body.index("orderForCurrentSort()") < body.index(
         "showNextCard({ allowRefresh: false })"
     )
+    assert "'popular' && currentSource === 'non-hn'" in body
     assert "refillQueued" not in body
     assert "refillWhenReady" not in body
 
@@ -2378,21 +2390,24 @@ def test_setAge_schedules_advancing_refresh_on_tab_click() -> None:
     assert "scheduleDeckRefresh({ advance: true })" in body
     assert "showNextCard({ allowRefresh: false })" in body
     assert "if (currentSort === 'recommended' || currentSort === 'date')" in body
+    assert "matchesCurrentCombo(activeCard)" in body
     assert "refillQueued" not in body
     assert "refillWhenReady" not in body
 
 
 def test_setSource_schedules_advancing_refresh_on_tab_click() -> None:
-    """Clicking a source tab schedules an advancing deck refresh."""
+    """Clicking a source tab schedules an advancing deck refresh.
+    Popular tab is disabled on non-HN and the sort auto-switches."""
     _, static = _read_template_and_static()
     idx = static.index("function setSource(")
-    # setSource is the last function in the file's first script block; the
-    # body ends with the next blank line.
     end = static.index("\n\n    applyGradient();", idx)
     body = static[idx:end]
     assert "scheduleDeckRefresh({ advance: true })" in body
     assert "showNextCard({ allowRefresh: false })" in body
     assert "if (currentSort === 'recommended' || currentSort === 'date')" in body
+    assert "popularTab.disabled = (source === 'non-hn')" in body
+    assert "setSort('recommended')" in body
+    assert "matchesCurrentCombo(activeCard)" in body
     assert "refillQueued" not in body
     assert "refillWhenReady" not in body
 
@@ -2407,20 +2422,17 @@ def test_archive_age_tab_button_exists():
     assert "cardsForAge" in static
 
 
-def test_matchesCurrentAxes_filters_by_age_and_sort():
-    """matchesCurrentAxes filters by age (currentAge + data-is-recent)
-    and sort (currentSort + data-sort-popular / data-sort-explore)."""
+def test_matchesCurrentAxes_filters_by_badge_only():
+    """matchesCurrentAxes filters by sort badge only (popular/explore).
+    Age and source filtering moved to matchesCurrentCombo."""
     _, static = _read_template_and_static()
     idx = static.index("function matchesCurrentAxes(")
     end = static.index("function queuedCards(", idx)
     body = static[idx:end]
-    # Age checks: archive/recent branches reference isRecent.
-    assert "currentAge === 'archive'" in body
-    assert "currentAge === 'recent'" in body
-    assert "card.dataset.isRecent" in body
-    # Sort checks: popular/explore reference sortPopular / sortExplore.
     assert "card.dataset.sortPopular" in body
     assert "card.dataset.sortExplore" in body
+    assert "currentAge" not in body
+    assert "card.dataset.isRecent" not in body
 
 
 def test_orderForCurrentSort_uses_orderByRank_for_recommended():
@@ -2786,6 +2798,7 @@ def test_removed_refresh_names_are_gone() -> None:
         "latestPendingRankingVersion",
         "forceFetch",
         "isRefilling",
+        "matchesCurrentSource",
     ]
     for name in removed_names:
         assert name not in inline_script

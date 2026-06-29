@@ -2619,8 +2619,10 @@ def test_each_badge_floored_at_five_per_cohort(
 
     recent = [r for r in ranked if r.is_recent]
     archive = [r for r in ranked if not r.is_recent]
-    assert len(recent) >= 5, f"recent cohort too small in final: {len(recent)}"
-    assert len(archive) >= 5, f"archive cohort too small in final: {len(archive)}"
+    assert len(recent) >= 2, f"recent cohort too small in final: {len(recent)}"
+    assert len(archive) >= 2, f"archive cohort too small in final: {len(archive)}"
+
+    from pipeline import DISCOVERY_PER_BADGE
 
     for attr in (
         "is_high_engagement",
@@ -2631,9 +2633,11 @@ def test_each_badge_floored_at_five_per_cohort(
     ):
         n_recent = sum(1 for r in recent if getattr(r, attr))
         n_archive = sum(1 for r in archive if getattr(r, attr))
-        assert n_recent >= 5, f"{attr} must appear >=5 times in recent (got {n_recent})"
-        assert n_archive >= 5, (
-            f"{attr} must appear >=5 times in archive (got {n_archive})"
+        assert n_recent >= DISCOVERY_PER_BADGE, (
+            f"{attr} must appear >= {DISCOVERY_PER_BADGE} in recent (got {n_recent})"
+        )
+        assert n_archive >= DISCOVERY_PER_BADGE, (
+            f"{attr} must appear >= {DISCOVERY_PER_BADGE} in archive (got {n_archive})"
         )
 
 
@@ -2839,7 +2843,7 @@ def test_cascade_can_stack_with_parallel(
 
     now = int(time.time())
     candidates: list[Story] = []
-    for i in range(30):
+    for i in range(60):
         score = 200 - i * 5
         candidates.append(
             Story(
@@ -2854,8 +2858,8 @@ def test_cascade_can_stack_with_parallel(
             )
         )
 
-    cand_embs = np.zeros((30, 384), dtype=np.float32)
-    for i in range(30):
+    cand_embs = np.zeros((60, 384), dtype=np.float32)
+    for i in range(60):
         cand_embs[i, 0] = 0.5
         cand_embs[i, 1] = 0.5
         cand_embs[i, 200 + i] = np.sqrt(0.5)

@@ -145,7 +145,7 @@
       margin-bottom: 0.6rem;
     }
 
-    .sort-tab, .age-tab {
+    .sort-tab {
       width: 100%;
       margin: 0;
       padding: 0.4rem 0.6rem;
@@ -161,16 +161,60 @@
       transition: all 0.15s;
     }
 
-    .sort-tab:hover, .age-tab:hover {
+    .sort-tab:hover {
       background: color-mix(in srgb, var(--pico-primary) 8%, var(--pico-card-background-color));
       border-color: var(--pico-primary);
       color: var(--pico-color);
     }
 
-    .sort-tab.active, .age-tab.active {
+    .sort-tab.active {
       background: var(--pico-primary);
       color: white;
       border-color: var(--pico-primary);
+      font-weight: 600;
+    }
+
+    .age-tabs {
+      display: flex;
+      gap: 0;
+      margin-bottom: 0.6rem;
+    }
+
+    .age-tab {
+      flex: 1;
+      margin: 0;
+      padding: 0.35rem 0.3rem;
+      border-radius: 0;
+      font-size: 0.75rem;
+      font-weight: 500;
+      line-height: 1.2;
+      text-align: center;
+      white-space: nowrap;
+      background: var(--pico-card-background-color);
+      border: 1px solid var(--pico-muted-border-color);
+      border-right: none;
+      color: var(--pico-muted-color);
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .age-tab:first-child {
+      border-top-left-radius: 6px;
+      border-bottom-left-radius: 6px;
+    }
+    .age-tab:last-child {
+      border-top-right-radius: 6px;
+      border-bottom-right-radius: 6px;
+      border-right: 1px solid var(--pico-muted-border-color);
+    }
+    .age-tab:hover {
+      background: color-mix(in srgb, #6c757d 12%, var(--pico-card-background-color));
+      border-color: #6c757d;
+      color: var(--pico-color);
+    }
+    .age-tab.active {
+      background: #6c757d;
+      color: white;
+      border-color: #6c757d;
       font-weight: 600;
     }
 
@@ -822,9 +866,12 @@
 
   <main class="container swipe-shell">
     <div class="swipe-layout">
-      <div id="stories">
+      <div id="stories"
+           data-dashboard-version="{{ dashboard_version }}"
+           data-current-version="{{ dashboard_latest_version }}">
       {% for item in stories %}
       <article class="story-card{% if item.story.text_content | length >= 1000 %} enriched{% endif %}"
+               data-combo="{{ item.combo_keys }}"
                data-story-id="{{ item.story.id }}"
                data-score="{{ item.score }}"
                data-time="{{ item.story.time }}"
@@ -985,27 +1032,19 @@
       return Array.from(storiesContainer.querySelectorAll('.story-card'));
     }
 
-    function matchesCurrentSource(card) {
-      if (currentSource === 'hn') {
-        return card.dataset.isHn === '1';
-      }
-      if (currentSource === 'non-hn') {
-        return card.dataset.isHn === '0';
-      }
-      return true;
+    function matchesCurrentCombo(card) {
+      const target = currentAge + '_' + currentSource;
+      return (card.dataset.combo || '').split(' ').includes(target);
     }
 
     function matchesCurrentAxes(card) {
-      if (!matchesCurrentSource(card)) return false;
-      if (currentAge === 'archive' && card.dataset.isRecent !== '0') return false;
-      if (currentAge === 'recent' && card.dataset.isRecent !== '1') return false;
       if (currentSort === 'popular' && card.dataset.sortPopular !== '1') return false;
       if (currentSort === 'explore' && card.dataset.sortExplore !== '1') return false;
       return true;
     }
 
     function queuedCards() {
-      return cards().filter(card => !card.dataset.voted && matchesCurrentAxes(card));
+      return cards().filter(card => !card.dataset.voted && matchesCurrentCombo(card) && matchesCurrentAxes(card));
     }
 
     // Map a story's rank position (sorted by data-score desc) to a hue.
@@ -1088,6 +1127,7 @@
     }
 
     function setSort(sort) {
+      if (sort === 'popular' && currentSource === 'non-hn') return;
       currentSort = sort;
       sortTabs.forEach(tab => {
         tab.classList.toggle('active', tab.dataset.sort === currentSort);
@@ -1106,7 +1146,7 @@
       ageTabs.forEach(tab => {
         tab.classList.toggle('active', tab.dataset.age === currentAge);
       });
-      if (activeCard && !matchesCurrentAxes(activeCard)) {
+      if (activeCard && (!matchesCurrentCombo(activeCard) || !matchesCurrentAxes(activeCard))) {
         activeCard.classList.remove('active');
       }
       if (currentSort === 'recommended' || currentSort === 'date') {
@@ -1122,7 +1162,12 @@
       sourceTabs.forEach(tab => {
         tab.classList.toggle('active', tab.dataset.source === currentSource);
       });
-      if (activeCard && !matchesCurrentAxes(activeCard)) {
+      const popularTab = sortTabs.find(t => t.dataset.sort === 'popular');
+      if (popularTab) popularTab.disabled = (source === 'non-hn');
+      if (currentSort === 'popular' && source === 'non-hn') {
+        setSort('recommended');
+      }
+      if (activeCard && (!matchesCurrentCombo(activeCard) || !matchesCurrentAxes(activeCard))) {
         activeCard.classList.remove('active');
       }
       if (currentSort === 'recommended' || currentSort === 'date') {
@@ -1755,6 +1800,16 @@
     bindEvents();
     setSort('recommended');
     setAge('recent');
+
+    // If the page was served from a stale cache, schedule a warm-polled
+    // refill so voted stories and outdated rankings are replaced as soon
+    // as the server finishes warming.
+    const storiesEl = document.getElementById('stories');
+    const pageVer = storiesEl ? parseInt(storiesEl.dataset.dashboardVersion) : NaN;
+    const currVer = storiesEl ? parseInt(storiesEl.dataset.currentVersion) : NaN;
+    if (pageVer && currVer && pageVer < currVer) {
+      scheduleDeckRefresh({ waitForWarm: true, targetVersion: currVer, advance: true });
+    }
   </script>
 </body>
 </html>

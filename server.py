@@ -826,7 +826,13 @@ class Handler(BaseHTTPRequestHandler):
 
             html_start = time.perf_counter()
             html = generate_dashboard_bytes(
-                final, cls.config, cls.db, user.id, user.token
+                final,
+                cls.config,
+                cls.db,
+                user.id,
+                user.token,
+                dashboard_version=requested_version,
+                dashboard_latest_version=cls._dashboard_version(user.id),
             )
             html_ms = (time.perf_counter() - html_start) * 1000
 
@@ -877,7 +883,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             last_request_at = cls._warmup_last_request_at.get(user_id, time.monotonic())
-            remaining_s = max(0.0, cls._WARM_DEBOUNCE_S - (time.monotonic() - last_request_at))
+            remaining_s = max(
+                0.0, cls._WARM_DEBOUNCE_S - (time.monotonic() - last_request_at)
+            )
             cls._schedule_warm_timer_locked(user, remaining_s)
 
     @classmethod

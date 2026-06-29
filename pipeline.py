@@ -12,7 +12,7 @@ from collections import Counter, OrderedDict
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, cast
+from typing import Any, Callable
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -208,6 +208,8 @@ NON_HN_DISCOVERY_SLOT_LIMIT = 8
 HOT_DISCOVERY_SLOT_LIMIT = 5
 HOT_MIN_SCORE = 20
 DASHBOARD_QUEUE_SIZE = 12
+PRIMARY_PER_COMBO = 12
+DISCOVERY_PER_BADGE = 2
 BQ_ARCHIVE_SOURCE = "bq_seed"
 BQ_ARCHIVE_CANDIDATE_LIMIT = 2000
 CH_ARCHIVE_SOURCE = "ch_seed"
@@ -447,6 +449,7 @@ class RankedStory:
     is_similar: bool = False
     is_non_hn: bool = False
     is_recent: bool = False
+    combo_keys: str = ""
 
 
 @dataclass(frozen=True)
@@ -2372,19 +2375,10 @@ def rerank_candidates(
         trace=trace,
     )
 
-    limit, _num_uncertain = _dashboard_primary_limit(config.count)
+    # Build MMR embeddings map once (used per combo)
+    embeddings_map: dict[int, NDArray[np.float32]] = {}
     if config.model.enable_mmr:
         embeddings_map = {s.id: vec for s, vec in zip(candidates, cand_embeddings)}
-        final = mmr_filter(
-            ranked,
-            embeddings_map,
-            threshold=config.model.diversity_threshold,
-            limit=limit,
-        )
-    else:
-        final = ranked[:limit]
-
-    selected_ids = {item.story.id for item in final}
 
     with trace.stage("badge_similarity"):
         # Calculate parameters for remaining discovery passes
@@ -2428,22 +2422,11 @@ def rerank_candidates(
     # recent stories to earn Top/Talk-worthy badges. Similar logic
     # applies to Novel/Similar/Unsure so badges remain meaningful
     # within each age cohort.
-    cand_comment_counts = np.array([s.comment_count or 0 for s in candidates])
     cand_scores = np.array([s.score for s in candidates])
     now_ts = time.time()
     recent_cutoff = int(now_ts) - 30 * 86400
-    recent_mask = np.fromiter(
-        (s.time >= recent_cutoff for s in candidates),
-        dtype=bool,
-        count=len(candidates),
-    )
     cand_velocities = np.array(
         [s.score / max((now_ts - s.time) / 3600.0, 0.1) for s in candidates]
-    )
-    hot_threshold = (
-        np.percentile(cand_velocities, config.model.hot_badge_percentile)
-        if len(cand_velocities)
-        else 0
     )
 
     story_id_to_idx = {s.id: idx for idx, s in enumerate(candidates)}
@@ -2471,240 +2454,151 @@ def rerank_candidates(
     def _hot_sort_key(r: RankedStory) -> float:
         return float(cand_velocities[idx_for(r.story.id)])
 
-    # final already contains the primary-ranked items
-    final_ids = {item.story.id for item in final}
-    # remaining_decorated contains candidates not in the primary path.
-    remaining_decorated = [r for r in ranked if r.story.id not in final_ids]
+    def _entropy_sort_key(r: RankedStory) -> float:
+        return float(get_entropy(r))
 
-    n_non_hn_slots = _non_hn_slot_count(
-        len(feedback_labels),
-        cap=NON_HN_DISCOVERY_SLOT_LIMIT,
-        threshold=20,
-        window=config.model.non_hn_ramp_window,
-    )
-
-    # Rank-based cascade: Hot (global) runs first against the FULL candidate
-    # pool (not just `remaining_decorated`) so a primary-ranked high-velocity
-    # story gets the Hot badge too. After Hot, the Top → Talk cascade runs
-    # against `remaining_decorated` (candidates not in primary and not picked
-    # by Hot). Novel, Similar, Unsure run in parallel against the post-
-    # cascade pool and can stack with each other and with the cascade group
-    # (so e.g. Top+Unsure is allowed).
+    # Per-combo deck construction. Three combos: recent_hn, recent_nonhn,
+    # archive_hn. Each combo gets PRIMARY_PER_COMBO primary cards (MMR if
+    # enabled, otherwise top-score), plus DISCOVERY_PER_BADGE cards for each
+    # of Hot/Top/Talk (Popular, HN only) and Unsure/Novel/Similar (Explore).
     #
-    # Each pass takes the top `slot_limit` stories in its age cohort by
-    # the badge metric, unconditionally. Predicates are reduced to a
-    # minimal membership guard so the pass can fill its slots even when
-    # the cohort's quality is low (e.g., small synthetic pools).
-    hot_pass = DiscoveryPass(
-        name="hot",
-        attr="is_hot",
-        predicate=lambda r: cand_velocities[idx_for(r.story.id)] >= hot_threshold
-        and cand_velocities[idx_for(r.story.id)] > 0
-        and r.story.score >= HOT_MIN_SCORE,
-        sort_key=_hot_sort_key,
-        slot_limit=HOT_DISCOVERY_SLOT_LIMIT,
-    )
-    if hot_pass.slot_limit > 0:
-        hot_pool = [r for r in ranked if hot_pass.predicate(r)]
-        if hot_pool:
-            hot_pool.sort(key=hot_pass.sort_key, reverse=True)
-            hot_attr = cast(str, hot_pass.attr)
-            hot_items = [
-                replace(r, **{hot_attr: True}) for r in hot_pool[: hot_pass.slot_limit]
-            ]
-            # If a story is already in `final` (from primary), update its
-            # is_hot flag in place. Otherwise append.
-            for item in hot_items:
-                existing_idx = next(
-                    (i for i, f in enumerate(final) if f.story.id == item.story.id),
-                    None,
+    # Cards carry space-separated combo_keys so the client can filter by
+    # age+source without computing offsets (e.g. "recent_hn recent_mixed").
+    COMBO_DEFS: list[tuple[str, str, int]] = [
+        ("recent", "hn", PRIMARY_PER_COMBO),
+        ("recent", "nonhn", PRIMARY_PER_COMBO),
+        ("archive", "hn", PRIMARY_PER_COMBO),
+        ("archive", "nonhn", 0),  # placeholder: no non-HN archive candidates
+    ]
+
+    final: list[RankedStory] = []
+
+    for age, source, primary_limit in COMBO_DEFS:
+        # Filter candidate pool to this combo
+        if age == "recent":
+            age_pool = [r for r in ranked if r.story.time >= recent_cutoff]
+        else:
+            age_pool = [r for r in ranked if r.story.time < recent_cutoff]
+
+        if source == "hn":
+            combo_pool = [r for r in age_pool if is_hn_source(r.story.source)]
+        else:
+            combo_pool = [r for r in age_pool if not is_hn_source(r.story.source)]
+
+        if not combo_pool:
+            continue
+
+        source_key = age + ("_hn" if source == "hn" else "_nonhn")
+        mixed_key = age + "_mixed"
+
+        # --- Primary selection ---
+        if primary_limit > 0:
+            if config.model.enable_mmr and embeddings_map:
+                primary = mmr_filter(
+                    combo_pool,
+                    embeddings_map,
+                    threshold=config.model.diversity_threshold,
+                    limit=primary_limit,
                 )
-                if existing_idx is not None:
-                    final[existing_idx] = replace(final[existing_idx], is_hot=True)
-                else:
-                    final.append(item)
-            hot_picked_ids = {item.story.id for item in hot_items}
-            selected_ids |= hot_picked_ids
-            remaining_decorated = [
-                r for r in remaining_decorated if r.story.id not in hot_picked_ids
-            ]
-
-    cascade_passes: list[DiscoveryPass] = [
-        DiscoveryPass(
-            name="high-engagement-recent",
-            attr="is_high_engagement",
-            predicate=lambda r: True,
-            sort_key=_engagement_sort_key,
-            slot_limit=HIGH_ENGAGEMENT_DISCOVERY_RECENT_SLOTS,
-            age="recent",
-        ),
-        DiscoveryPass(
-            name="high-engagement-archive",
-            attr="is_high_engagement",
-            predicate=lambda r: True,
-            sort_key=_engagement_sort_key,
-            slot_limit=HIGH_ENGAGEMENT_DISCOVERY_ARCHIVE_SLOTS,
-            age="archive",
-        ),
-        DiscoveryPass(
-            name="discussion-recent",
-            attr="is_discussion_rich",
-            predicate=lambda r: (cand_comment_counts[idx_for(r.story.id)] or 0) > 0,
-            sort_key=_discussion_sort_key,
-            slot_limit=DISCUSSION_DISCOVERY_RECENT_SLOTS,
-            age="recent",
-        ),
-        DiscoveryPass(
-            name="discussion-archive",
-            attr="is_discussion_rich",
-            predicate=lambda r: (cand_comment_counts[idx_for(r.story.id)] or 0) > 0,
-            sort_key=_discussion_sort_key,
-            slot_limit=DISCUSSION_DISCOVERY_ARCHIVE_SLOTS,
-            age="archive",
-        ),
-    ]
-
-    for pass_ in cascade_passes:
-        if pass_.slot_limit <= 0:
-            continue
-        if pass_.age == "recent":
-            age_mask = recent_mask
-        elif pass_.age == "archive":
-            age_mask = ~recent_mask
-        else:
-            age_mask = None
-        pool = [
-            r
-            for r in remaining_decorated
-            if pass_.predicate(r)
-            and (age_mask is None or bool(age_mask[idx_for(r.story.id)]))
-        ]
-        if not pool:
-            continue
-        pool.sort(key=pass_.sort_key, reverse=True)
-        attr = cast(str, pass_.attr)
-        items = [replace(r, **{attr: True}) for r in pool[: pass_.slot_limit]]
-        final.extend(items)
-        selected_ids |= {item.story.id for item in items}
-        remaining_decorated = [
-            r for r in remaining_decorated if r.story.id not in selected_ids
-        ]
-
-    # Phase 2: parallel passes (Novel, Similar, Unsure). Each pass sees
-    # the FULL ranked pool (not just `remaining_decorated`) so a primary-
-    # ranked story can also receive a parallel badge. The picks are
-    # accumulated in a dict so multiple parallel passes can stack on the
-    # same story (e.g. Novel+Similar). After all parallel passes run, we
-    # merge into `final`: stories already present (from primary, Hot, or
-    # the cascade) get their `is_novel`/`is_similar`/`is_uncertain` flag
-    # OR'd in; new stories are appended.
-    parallel_picks: dict[int, RankedStory] = {}
-
-    def _record_parallel_pick(pass_: DiscoveryPass) -> None:
-        if pass_.slot_limit <= 0:
-            return
-        if pass_.age == "recent":
-            age_mask = recent_mask
-        elif pass_.age == "archive":
-            age_mask = ~recent_mask
-        else:
-            age_mask = None
-        pool = [
-            r
-            for r in ranked
-            if pass_.predicate(r)
-            and (age_mask is None or bool(age_mask[idx_for(r.story.id)]))
-        ]
-        if not pool:
-            return
-        pool.sort(key=pass_.sort_key, reverse=True)
-        attr = cast(str, pass_.attr)
-        for r in pool[: pass_.slot_limit]:
-            sid = r.story.id
-            if sid in parallel_picks:
-                parallel_picks[sid] = replace(parallel_picks[sid], **{attr: True})
             else:
-                parallel_picks[sid] = replace(r, **{attr: True})
+                combo_sort = sorted(combo_pool, key=lambda r: r.score, reverse=True)
+                primary = combo_sort[:primary_limit]
 
-    parallel_passes: list[DiscoveryPass] = [
-        DiscoveryPass(
-            name="novel-recent",
-            attr="is_novel",
-            predicate=lambda r: True,
-            sort_key=_novel_sort_key,
-            slot_limit=NOVEL_DISCOVERY_RECENT_SLOTS,
-            age="recent",
-        ),
-        DiscoveryPass(
-            name="novel-archive",
-            attr="is_novel",
-            predicate=lambda r: True,
-            sort_key=_novel_sort_key,
-            slot_limit=NOVEL_DISCOVERY_ARCHIVE_SLOTS,
-            age="archive",
-        ),
-        DiscoveryPass(
-            name="similar-recent",
-            attr="is_similar",
-            predicate=lambda r: True,
-            sort_key=_similar_sort_key,
-            slot_limit=SIMILAR_DISCOVERY_RECENT_SLOTS,
-            age="recent",
-        ),
-        DiscoveryPass(
-            name="similar-archive",
-            attr="is_similar",
-            predicate=lambda r: True,
-            sort_key=_similar_sort_key,
-            slot_limit=SIMILAR_DISCOVERY_ARCHIVE_SLOTS,
-            age="archive",
-        ),
-        DiscoveryPass(
-            name="uncertain-recent",
-            attr="is_uncertain",
-            predicate=lambda r: r.prob_down is not None,
-            sort_key=lambda r: float(get_entropy(r)),
-            slot_limit=UNCERTAIN_DISCOVERY_RECENT_SLOTS,
-            age="recent",
-        ),
-        DiscoveryPass(
-            name="uncertain-archive",
-            attr="is_uncertain",
-            predicate=lambda r: r.prob_down is not None,
-            sort_key=lambda r: float(get_entropy(r)),
-            slot_limit=UNCERTAIN_DISCOVERY_ARCHIVE_SLOTS,
-            age="archive",
-        ),
-    ]
-    for pass_ in parallel_passes:
-        _record_parallel_pick(pass_)
-
-    # Merge parallel picks into `final`. Cascade picks are already in `final`;
-    # if a parallel pass also badges them, we update their `is_X` flag. New
-    # parallel-only stories are appended.
-    for sid, ranked_pick in parallel_picks.items():
-        existing_idx = next(
-            (i for i, item in enumerate(final) if item.story.id == sid), None
-        )
-        if existing_idx is not None:
-            existing = final[existing_idx]
-            final[existing_idx] = replace(
-                existing,
-                is_novel=existing.is_novel or ranked_pick.is_novel,
-                is_similar=existing.is_similar or ranked_pick.is_similar,
-                is_uncertain=existing.is_uncertain or ranked_pick.is_uncertain,
+            final.extend(
+                replace(r, combo_keys=f"{source_key} {mixed_key}") for r in primary
             )
         else:
-            final.append(ranked_pick)
+            primary = []
 
-    # Non-hn pass: sorts non-HN candidates by their rerank score. Runs last
-    # so the cascade + parallel picks can claim HN candidates first.
-    if n_non_hn_slots > 0:
-        pool = [r for r in remaining_decorated if not is_hn_source(r.story.source)]
-        if pool:
-            pool.sort(key=lambda r: float(r.score), reverse=True)
-            for r in pool[:n_non_hn_slots]:
-                final.append(replace(r, is_non_hn=True))
+        primary_ids = {r.story.id for r in primary}
+
+        # --- Popular (HN only): Hot + Top + Talk ---
+        if source == "hn":
+            remaining = [r for r in combo_pool if r.story.id not in primary_ids]
+
+            hot_pool = [r for r in remaining if r.story.score >= HOT_MIN_SCORE]
+            if hot_pool:
+                hot_pool.sort(key=_hot_sort_key, reverse=True)
+                final.extend(
+                    replace(r, is_hot=True, combo_keys=f"{source_key} {mixed_key}")
+                    for r in hot_pool[:DISCOVERY_PER_BADGE]
+                )
+
+            hot_ids = {r.story.id for r in final if r.is_hot} | primary_ids
+            remaining = [r for r in combo_pool if r.story.id not in hot_ids]
+            remaining.sort(key=_engagement_sort_key, reverse=True)
+            final.extend(
+                replace(
+                    r, is_high_engagement=True, combo_keys=f"{source_key} {mixed_key}"
+                )
+                for r in remaining[:DISCOVERY_PER_BADGE]
+            )
+
+            top_ids = {r.story.id for r in final} | primary_ids
+            remaining = [
+                r
+                for r in combo_pool
+                if r.story.id not in top_ids and (r.story.comment_count or 0) > 0
+            ]
+            remaining.sort(key=_discussion_sort_key, reverse=True)
+            final.extend(
+                replace(
+                    r, is_discussion_rich=True, combo_keys=f"{source_key} {mixed_key}"
+                )
+                for r in remaining[:DISCOVERY_PER_BADGE]
+            )
+
+        # --- Explore: Unsure + Novel + Similar ---
+        # Explore passes see the full combo pool (minus primary) and can
+        # stack badges on stories already picked by Popular, matching the
+        # old parallel-pass design. Within Explore, Unsure/Novel/Similar
+        # are serial (mutually exclusive) to keep the badge mix varied.
+        explore_pool = [r for r in combo_pool if r.story.id not in primary_ids]
+        explore_picked = set[int]()  # only track Explore picks, not Popular
+
+        unsure_items = sorted(
+            [r for r in explore_pool if r.prob_down is not None],
+            key=_entropy_sort_key,
+            reverse=True,
+        )[:DISCOVERY_PER_BADGE]
+        for r in unsure_items:
+            existing = next(
+                (i for i, f in enumerate(final) if f.story.id == r.story.id), None
+            )
+            new_r = replace(
+                r, is_uncertain=True, combo_keys=f"{source_key} {mixed_key}"
+            )
+            if existing is not None:
+                final[existing] = replace(
+                    final[existing],
+                    is_uncertain=True,
+                    combo_keys=f"{source_key} {mixed_key}",
+                )
+            else:
+                final.append(new_r)
+            explore_picked.add(r.story.id)
+
+        novel_items = sorted(
+            [r for r in explore_pool if r.story.id not in explore_picked],
+            key=_novel_sort_key,
+            reverse=True,
+        )[:DISCOVERY_PER_BADGE]
+        for r in novel_items:
+            final.append(
+                replace(r, is_novel=True, combo_keys=f"{source_key} {mixed_key}")
+            )
+            explore_picked.add(r.story.id)
+
+        similar_items = sorted(
+            [r for r in explore_pool if r.story.id not in explore_picked],
+            key=_similar_sort_key,
+            reverse=True,
+        )[:DISCOVERY_PER_BADGE]
+        for r in similar_items:
+            final.append(
+                replace(r, is_similar=True, combo_keys=f"{source_key} {mixed_key}")
+            )
+            explore_picked.add(r.story.id)
 
     # Set is_recent and is_non_hn on every story in `final` (these flags are
     # source/time based, not rank-based, so they always reflect the current
@@ -2892,6 +2786,8 @@ def generate_dashboard_bytes(
     db: Database,
     user_id: int | None = None,
     user_token: str | None = None,
+    dashboard_version: int | None = None,
+    dashboard_latest_version: int | None = None,
 ) -> bytes:
     """Render dashboard to bytes without writing to disk."""
     env = Environment(loader=FileSystemLoader("templates"), autoescape=True)
@@ -2917,6 +2813,8 @@ def generate_dashboard_bytes(
         vote_count_neutral=vote_counts["neutral"],
         vote_count_down=vote_counts["down"],
         hot_badge_percentile=int(round(config.model.hot_badge_percentile)),
+        dashboard_version=dashboard_version or 0,
+        dashboard_latest_version=dashboard_latest_version or 0,
     )
     return html_content.encode("utf-8")
 
