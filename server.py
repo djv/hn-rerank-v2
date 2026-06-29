@@ -227,6 +227,7 @@ def _is_low_signal_reddit_comment(author: str, text: str) -> bool:
 
 
 LESSWRONG_COMMENT_LIMIT = 20
+MAX_CONTENT_LENGTH = 10**6  # 1MB cap on POST bodies
 
 
 def _extract_lesswrong_post_id(url: str | None) -> str | None:
@@ -576,14 +577,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self.db.get_or_create_user(kv[1].strip())
         return None
 
-    def _json_response(self, data: dict, status: int = 200) -> None:
-        body = json.dumps(data).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(body)
-
     def do_GET(self) -> None:
         path = self.path.split("?")[0]
 
@@ -833,6 +826,9 @@ class Handler(BaseHTTPRequestHandler):
 
             try:
                 content_length = int(self.headers.get("Content-Length", 0))
+                if content_length > MAX_CONTENT_LENGTH:
+                    self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                    return
                 body = self.rfile.read(content_length)
                 data = json.loads(body)
 
@@ -872,6 +868,9 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/tldr-detail":
             try:
                 content_length = int(self.headers.get("Content-Length", 0))
+                if content_length > MAX_CONTENT_LENGTH:
+                    self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                    return
                 body = self.rfile.read(content_length)
                 data = json.loads(body)
 

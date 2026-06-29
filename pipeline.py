@@ -1800,6 +1800,33 @@ def _softmax_rows(values: np.ndarray) -> NDArray[np.float32]:
     return (exp / exp.sum(axis=1, keepdims=True)).astype(np.float32)
 
 
+def _loocv_knn_features(
+    fb_embeddings: np.ndarray,
+    class_embs: np.ndarray,
+    class_indices: np.ndarray,
+    k: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    n = len(class_embs)
+    sim_mat = fb_embeddings @ class_embs.T
+    if n > 1:
+        for idx, tp in enumerate(class_indices):
+            sim_mat[tp, idx] = -2.0
+    sim_to = np.zeros(len(fb_embeddings), dtype=np.float32)
+    k_eff = min(k, n)
+    for i in range(len(fb_embeddings)):
+        sims = sim_mat[i]
+        exclude = 1 if i in class_indices else 0
+        n_available = max(1, n - exclude)
+        k_use = min(k_eff, n_available)
+        sim_to[i] = _topk_mean(sims, k_use)
+    sim_mat_clean = fb_embeddings @ class_embs.T
+    if n > 1:
+        for idx, tp in enumerate(class_indices):
+            sim_mat_clean[tp, idx] = -1.0
+    closest = np.max(sim_mat_clean, axis=1)
+    return sim_to, closest
+
+
 def _score_and_rank(
     candidates: list[Story],
     candidate_embeddings: NDArray[np.float32],
@@ -1944,43 +1971,17 @@ def _score_and_rank(
                     fb_sim_to_down = np.zeros(len(fb_embeddings), dtype=np.float32)
                     if n_up > 0:
                         up_indices = np.where(up_mask)[0]
-                        sim_up_mat = fb_embeddings @ fb_up_embs.T
-                        if n_up > 1:
-                            for idx, tp in enumerate(up_indices):
-                                sim_up_mat[tp, idx] = -2.0  # exclude self
-                        k_eff_up = min(k, n_up)
-                        for i in range(len(fb_embeddings)):
-                            sims = sim_up_mat[i]
-                            exclude = 1 if i in up_indices else 0
-                            n_available = max(1, n_up - exclude)
-                            k_use = min(k_eff_up, n_available)
-                            fb_sim_to_up[i] = _topk_mean(sims, k_use)
-                        sim_up_mat_clean = fb_embeddings @ fb_up_embs.T
-                        if n_up > 1:
-                            for idx, tp in enumerate(up_indices):
-                                sim_up_mat_clean[tp, idx] = -1.0
-                        fb_closest_up = np.max(sim_up_mat_clean, axis=1)
+                        fb_sim_to_up, fb_closest_up = _loocv_knn_features(
+                            fb_embeddings, fb_up_embs, up_indices, k
+                        )
                     else:
                         fb_closest_up = np.zeros(len(fb_embeddings), dtype=np.float32)
 
                     if n_down > 0:
                         down_indices = np.where(down_mask)[0]
-                        sim_down_mat = fb_embeddings @ fb_down_embs.T
-                        if n_down > 1:
-                            for idx, tp in enumerate(down_indices):
-                                sim_down_mat[tp, idx] = -2.0
-                        k_eff_down = min(k, n_down)
-                        for i in range(len(fb_embeddings)):
-                            sims = sim_down_mat[i]
-                            exclude = 1 if i in down_indices else 0
-                            n_available = max(1, n_down - exclude)
-                            k_use = min(k_eff_down, n_available)
-                            fb_sim_to_down[i] = _topk_mean(sims, k_use)
-                        sim_down_mat_clean = fb_embeddings @ fb_down_embs.T
-                        if n_down > 1:
-                            for idx, tp in enumerate(down_indices):
-                                sim_down_mat_clean[tp, idx] = -1.0
-                        fb_closest_down = np.max(sim_down_mat_clean, axis=1)
+                        fb_sim_to_down, fb_closest_down = _loocv_knn_features(
+                            fb_embeddings, fb_down_embs, down_indices, k
+                        )
                     else:
                         fb_closest_down = np.zeros(len(fb_embeddings), dtype=np.float32)
 

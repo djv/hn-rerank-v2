@@ -5,6 +5,40 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-29 — Top-3 quick wins from improvement-areas review
+
+Applied the three highest-ROI items from
+`.mimocode/plans/1782729029858-witty-planet.md`.
+
+**S3 — Content-Length cap (server.py).** Added
+`MAX_CONTENT_LENGTH = 10**6` and a 413 check at both POST sites
+(`/api/feedback`, `/api/tldr-detail`) before `self.rfile.read(...)`.
+Prevents a single oversized body from OOMing the process. Used
+`HTTPStatus.REQUEST_ENTITY_TOO_LARGE` (413) since `PAYLOAD_TOO_LARGE`
+is not a stdlib alias.
+
+**P1 #2 — LOOCV k-NN helper (pipeline.py).** Extracted the twin
+up/down LOOCV blocks (~44 lines, structurally identical apart from
+class name) into `_loocv_knn_features(fb_embeddings, class_embs,
+class_indices, k) -> (sim_to, closest)`. Calling site now does
+two helper calls plus zero-fallbacks. Behavior-preserving: the
+self-exclusion mask, top-k mean, and max closest computation
+match exactly. The recompute-then-mask with `-1.0` for `closest`
+is preserved (kept redundant for now to minimize diff; future
+optimization to fold the two matmuls is orthogonal).
+
+**P2 #6 — Dead `_json_response` (server.py).** Deleted the
+shadowed definition at L579-585 (lacked `Content-Length` header
+and `encode("utf-8")`; superseded by the L1089 def via MRO). All
+12 callers use the surviving definition.
+
+**Verification.** `uv run pytest tests/ -n 4 -x` → 387 passed,
+1 skipped, 20.13s. `uv run ruff check .` clean. `uv run ty
+check` clean. Net change: +35 / −55 lines (pipeline.py),
++7 / −7 lines (server.py).
+
+---
+
 ## 2026-06-29 — Make SVM variant experiment import-safe
 
 **Fix.** Renamed `scripts/test_svm_variants.py` to
