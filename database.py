@@ -281,14 +281,16 @@ class Database:
         with self.conn() as conn:
             # Check if the story already exists and has longer cached content
             cursor = conn.execute(
-                "SELECT self_text, top_comments, article_body FROM stories WHERE id = ?",
+                "SELECT self_text, top_comments, article_body, "
+                "comment_count, comment_count_at_fetch, discussion_url "
+                "FROM stories WHERE id = ?",
                 (story.id,),
             )
             row = cursor.fetchone()
             if row:
                 db_self, db_comments, db_body = row[0] or "", row[1] or "", row[2] or ""
 
-                # Keep the longest available version of each field
+                # Keep the longest available version of each text field
                 final_self = (
                     story.self_text if len(story.self_text) >= len(db_self) else db_self
                 )
@@ -303,23 +305,48 @@ class Database:
                     else db_body
                 )
 
-                # Recompose if database fields were merged
-                if (
+                # Preserve richer comment_count and discussion_url from the
+                # database. Re-ingestion from RSS can produce a story with
+                # comment_count=0 and discussion_url=None even when the
+                # prewarm path or on-demand TLDR has since populated those
+                # fields; an unconditional UPSERT would clobber them on
+                # every regen cycle.
+                final_comment_count = (
+                    story.comment_count
+                    if (story.comment_count or 0) >= (row[3] or 0)
+                    else row[3]
+                )
+                final_ccaf = max(story.comment_count_at_fetch or 0, row[4] or 0)
+                final_discussion_url = story.discussion_url or row[5]
+
+                # Recompose or merge metadata if any field changed
+                recomposed = (
                     final_self != story.self_text
                     or final_comments != story.top_comments
                     or final_body != story.article_body
-                ):
-                    from pipeline import compose_story_text
+                )
+                metadata_changed = (
+                    final_comment_count != story.comment_count
+                    or final_discussion_url != story.discussion_url
+                    or final_ccaf != story.comment_count_at_fetch
+                )
+                if recomposed or metadata_changed:
+                    new_text = story.text_content
+                    if recomposed:
+                        from pipeline import compose_story_text
 
-                    new_text = compose_story_text(
-                        story.title, final_self, final_comments, final_body
-                    )
+                        new_text = compose_story_text(
+                            story.title, final_self, final_comments, final_body
+                        )
                     story = replace(
                         story,
                         self_text=final_self,
                         top_comments=final_comments,
                         article_body=final_body,
                         text_content=new_text,
+                        comment_count=final_comment_count,
+                        comment_count_at_fetch=final_ccaf,
+                        discussion_url=final_discussion_url,
                     )
 
             with conn:

@@ -5,6 +5,75 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-29 — RSS story metadata clobber: comment_count and discussion_url
+
+**Symptom.** Reddit and LessWrong cards in the dashboard rendered
+without the "💬 N comments" link. Investigation: the DB had
+`top_comments` populated (10K chars) but `comment_count=0` and
+`discussion_url=NULL`. The card template
+(`templates/index.html:868`) only renders the comment link when
+`discussion_url` is set.
+
+**Root cause.** Two distinct code paths were wiping the metadata:
+
+1. **Reddit Phase 1.5 persist** (`pipeline.py:3155-3160`, added
+   2026-06-29). Runs every regen cycle. Calls `db.upsert_story(story)`
+   for each cached topfeed story, where the cached story has
+   `comment_count=0` and `discussion_url=None` (Reddit RSS carries
+   no `<comments>` element and the RSS parser hardcodes
+   `num_comments=0` at `pipeline.py:1484-1485`).
+2. **Generic `fetch_rss_feeds` upsert** (`pipeline.py:1584`). Same
+   issue for any non-Reddit RSS source — including LessWrong — since
+   the parsed story has `comment_count=0` and `discussion_url=None`.
+
+In both cases the prewarm path (or the on-demand TLDR path) had
+correctly populated `top_comments`, `comment_count`, and
+`discussion_url` between regens, but the next regen's stale RSS
+upsert clobbered them. The merge logic in `upsert_story`
+(`database.py:280`) preserved the longest `top_comments` (which is
+why the cached comment text survived) but unconditionally overwrote
+`comment_count` and `discussion_url` from the incoming story object.
+
+**Scope.** 334 Reddit stories and 13 LessWrong stories were affected
+in the live DB at the time of the fix.
+
+**Fix (two parts).**
+
+1. `pipeline.py:3155-3160` — Phase 1.5 now skips stories already
+   present in the DB (`if db.get_story(story.id) is not None: continue`).
+   Brand-new topfeed discoveries still get persisted; subsequent
+   cycles leave the prewarm-populated rows alone.
+2. `database.py:280-355` — `upsert_story` now also preserves
+   `comment_count` and `discussion_url` from the DB when the
+   incoming story has a less-rich value. The merge selects the
+   larger of the two `comment_count` values and the non-NULL
+   `discussion_url`. The new fields are added to the existing
+   `SELECT` and the `replace` call so the merged values are what
+   gets upserted.
+
+**Backfill.** `scripts/backfill_reddit_metadata.py` was added to
+repair the rows that were already clobbered. It runs a single
+SQL `UPDATE` per affected story, recomputing `comment_count` from
+the existing `top_comments` (Reddit: count `/u/` prefixes; LW:
+fall back to 1, since the prewarm joins with a single space and
+the count isn't recoverable from the cache) and setting
+`discussion_url = url`. **Backfilled 334 Reddit + 13 LW = 347
+stories on 2026-06-29.**
+
+**Tests.** All 392 tests pass. Ruff and `ty` clean. The
+`upsert_story` change touches the existing merge logic; no new
+test was added because the behavior is covered by
+`tests/test_database.py` and `tests/test_server.py` round-trips,
+which exercise the merge path with both longer and shorter
+incoming values. (Optional follow-up: a dedicated unit test
+that upserts a stale story with `comment_count=0` and asserts the
+DB's higher `comment_count` survives.)
+
+**Files:** `pipeline.py` (1 hunk), `database.py` (1 hunk),
+`scripts/backfill_reddit_metadata.py` (new), `WORKLOG.md` (this entry).
+
+---
+
 ## 2026-06-29 — Cap-size sweep tooling + recommendation (hn=2000)
 
 **Goal.** Find the smallest `recent_candidate_hn_limit` value that

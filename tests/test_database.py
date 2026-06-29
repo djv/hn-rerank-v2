@@ -349,6 +349,119 @@ def test_upsert_story_uses_new_time_for_placeholder(db):
     assert db.get_story(9002).time == 1_700_200_000
 
 
+def test_upsert_story_preserves_richer_comment_metadata(db) -> None:
+    """Regression: the merge logic in upsert_story must preserve
+    comment_count and discussion_url from the existing row when an
+    incoming RSS re-fetch carries zeroed metadata.
+
+    Background: Reddit and LessWrong RSS feeds lack <comments> and
+    num_comments elements. The RSS parser hardcodes comment_count=0
+    and discussion_url=None. The Reddit prewarm / LW prewarm / on-demand
+    TLDR paths correctly populate these after the RSS upsert — but
+    without metadata-aware merge, the next regen's stale RSS upsert
+    would clobber the populated values. See WORKLOG 2026-06-29.
+    """
+    from pipeline import compose_story_text
+
+    initial = Story(
+        id=9100,
+        title="Reddit story",
+        url="https://www.reddit.com/r/test/comments/abc/title",
+        score=0,
+        time=1_700_000_000,
+        text_content=compose_story_text(
+            "Reddit story",
+            "Self text from RSS",
+            "/u/a: comment one /u/b: comment two /u/c: comment three",
+            "",
+        ),
+        source="rss_reddit_test",
+        comment_count=3,
+        comment_count_at_fetch=3,
+        discussion_url="https://www.reddit.com/r/test/comments/abc/title",
+        self_text="Self text from RSS",
+        top_comments="/u/a: comment one /u/b: comment two /u/c: comment three",
+        article_body="",
+    )
+    db.upsert_story(initial)
+
+    # Simulate the next regen's stale RSS upsert: a freshly-parsed
+    # Reddit RSS row with the zeroed metadata that the parser always
+    # produces (pipeline.py:1484-1485, 1496-1498).
+    stale_rss = Story(
+        id=9100,
+        title="Reddit story",
+        url="https://www.reddit.com/r/test/comments/abc/title",
+        score=0,
+        time=1_700_000_000,
+        text_content="Reddit story. Self text from RSS",
+        source="rss_reddit_test",
+        comment_count=0,
+        comment_count_at_fetch=0,
+        discussion_url=None,
+        self_text="Self text from RSS",
+        top_comments="",
+        article_body="",
+    )
+    db.upsert_story(stale_rss)
+
+    fetched = db.get_story(9100)
+    assert fetched.comment_count == 3, (
+        f"expected DB's comment_count=3 to survive, got {fetched.comment_count}"
+    )
+    assert fetched.comment_count_at_fetch == 3
+    assert fetched.discussion_url == (
+        "https://www.reddit.com/r/test/comments/abc/title"
+    )
+    assert fetched.top_comments == initial.top_comments
+
+
+def test_upsert_story_keeps_newer_comment_count_when_higher(db) -> None:
+    """Counterpart to the regression test: if the incoming story has
+    a HIGHER comment_count than the existing row, the merge should
+    take the incoming value (not silently discard it).
+    """
+    initial = Story(
+        id=9101,
+        title="LW story",
+        url="https://www.lesswrong.com/posts/abc/slug",
+        score=10,
+        time=1_700_000_000,
+        text_content="LW story. body",
+        source="rss_lesswrong_com",
+        comment_count=2,
+        comment_count_at_fetch=2,
+        discussion_url="https://www.lesswrong.com/posts/abc/slug",
+        self_text="body",
+        top_comments="older comment one older comment two",
+    )
+    db.upsert_story(initial)
+
+    fresh = Story(
+        id=9101,
+        title="LW story",
+        url="https://www.lesswrong.com/posts/abc/slug",
+        score=15,
+        time=1_700_000_000,
+        text_content="LW story. body newer comment one newer comment two newer comment three",
+        source="rss_lesswrong_com",
+        comment_count=5,
+        comment_count_at_fetch=5,
+        discussion_url="https://www.lesswrong.com/posts/abc/slug",
+        self_text="body",
+        top_comments=(
+            "newer comment one newer comment two "
+            "newer comment three newer comment four newer comment five"
+        ),
+    )
+    db.upsert_story(fresh)
+
+    fetched = db.get_story(9101)
+    assert fetched.comment_count == 5
+    assert fetched.top_comments == fresh.top_comments
+    assert fetched.discussion_url == "https://www.lesswrong.com/posts/abc/slug"
+
+
 def test_feedback_crud(db):
     # Create a test user
     user = db.create_user("test_token_1")

@@ -3157,6 +3157,8 @@ async def fetch_candidates_only(
             cached = reddit_feed_cache.get(feed_url)
             if cached:
                 for story in cached:
+                    if db.get_story(story.id) is not None:
+                        continue
                     db.upsert_story(story)
 
     if config.prewarm_reddit_full and reddit_feed_urls:
