@@ -4097,7 +4097,8 @@ def test_fetch_candidates_only_prewarms_all_hn_when_full(monkeypatch) -> None:
 def test_needs_hn_prewarm() -> None:
     """Table-driven: stale, fresh, never-prewarmed, and edge cases.
 
-    Threshold is ``max(50, fetched // 2, 10)``. growth >= threshold -> True.
+    Threshold is ``max(fetched // 3, 5)`` (~33% growth, 5-comment floor).
+    growth >= threshold -> True.
     """
     base_id = 1
 
@@ -4129,16 +4130,22 @@ def test_needs_hn_prewarm() -> None:
         (make_story("hn", 1, ""), True),
         # No fetch history (comment_count_at_fetch=0) -> True
         (make_story("hn", 1, "x", comment_count_at_fetch=0), True),
-        # Fresh: growth=40 < 50 -> False (max(50, 50//2, 10) = 50)
-        (make_story("hn", 50, "x", comment_count_at_fetch=10), False),
-        # growth=50, threshold=50 -> True
+        # Stale: growth=40, fetched=10, threshold=max(10//3, 5) = 5 -> True
+        # (was False under max(50, fetched//2, 10); small stories used to
+        # need 50+ new comments to trigger, so 10->50 sat stale.)
+        (make_story("hn", 50, "x", comment_count_at_fetch=10), True),
+        # growth=50, threshold=max(5//3, 5) = 5 -> True
         (make_story("hn", 55, "x", comment_count_at_fetch=5), True),
-        # 1->284 (the original bug case): growth=283 >= 50 -> True
+        # 1->284 (the original bug case): growth=283, threshold=5 -> True
         (make_story("hn", 284, "x", comment_count_at_fetch=1), True),
-        # 100->105: growth=5 < 50 -> False
+        # 100->105: growth=5, threshold=max(100//3, 5) = 33 -> False
         (make_story("hn", 105, "x", comment_count_at_fetch=100), False),
-        # 100->200: growth=100 >= 50 -> True
+        # 100->200: growth=100, threshold=max(100//3, 5) = 33 -> True
         (make_story("hn", 200, "x", comment_count_at_fetch=100), True),
+        # Small-stale: 10->16, growth=6, threshold=max(10//3, 5) = 5 -> True.
+        # Locks in the new behavior: 10-comment stories now refresh on
+        # +6 new comments instead of needing +50.
+        (make_story("hn", 16, "x", comment_count_at_fetch=10), True),
         # Non-HN source -> False even with stale-looking shape
         (
             make_story("rss_reddit_test", 284, "", comment_count_at_fetch=1),

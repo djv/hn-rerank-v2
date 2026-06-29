@@ -53,6 +53,26 @@ atomic (replaces `top_comments`, `text_content`, `comment_count`,
 Threshold caps re-fires to tens of stories per 3h regen. No DB
 schema change.
 
+**Followup: lower threshold for small stories.** The original
+`max(50, fetched // 2, 10)` ceiling dominated the linear term
+until `fetched >= 100`, so small HN stories (10-50 fetched
+comments) sat on stale `top_comments` indefinitely — a
+10-comment story needed to grow to 60 before re-prewarm
+fired, and a 20-comment story needed to reach 70. Lowered the
+ceiling to `max(fetched // 3, 5)`: roughly 33% growth with a
+5-comment floor. Same shape, drops the global 50-comment
+ceiling and the `fetched // 2` constant so growth scales with
+the story. Worked examples: 10→16 (growth=6) now triggers;
+100→133 (growth=33) triggers; 1→284 (growth=283) still
+triggers; 100→105 (growth=5) still does not. The 1→284
+regression case in `test_needs_hn_prewarm` is preserved as-is.
+Updated the docstring on `_needs_hn_prewarm` to spell out the
+new formula. The three `test_fetch_candidates_only_*_hn` regen
+tests cover the 1→284, 50→50, 120→120, and empty-top_comments
+branches — all pass unchanged. Manual cross-check on
+`hn_rewrite.db`: 48709670 and the 9 siblings still flip
+correctly. No DB schema change.
+
 ---
 
 ## 2026-06-29 — LessWrong: extract real `score` and `comment_count` from GraphQL

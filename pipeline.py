@@ -156,12 +156,16 @@ def _needs_hn_prewarm(s: Story) -> bool:
     Triggers when (a) ``top_comments`` is empty, (b) we have no fetch
     history (``comment_count_at_fetch <= 0``), or (c) the live comment
     count has grown meaningfully since the last prewarm: at least
-    ``max(50, fetched // 2, 10)`` new comments.
+    ``max(fetched // 3, 5)`` new comments — roughly 33% growth with a
+    5-comment floor.
 
     The threshold catches the 1->284 "stale single-comment stub" case
-    (WORKLOG 2026-06-29) without thrashing on small week-over-week
-    growth. ``prewarm_top_stories`` rewrites ``comment_count_at_fetch``
-    on every run, so this helper self-clears after a single regen cycle.
+    (WORKLOG 2026-06-29) and keeps small stories (10-50 fetched comments)
+    from sitting on stale ``top_comments`` while the ceiling-only
+    ``max(50, ...)`` previously dominated ``fetched // 2`` until
+    ``fetched >= 100``. ``prewarm_top_stories`` rewrites
+    ``comment_count_at_fetch`` on every run, so this helper self-clears
+    after a single regen cycle.
     """
     if not is_hn_source(s.source):
         return False
@@ -173,7 +177,7 @@ def _needs_hn_prewarm(s: Story) -> bool:
     if fetched <= 0:
         return True
     growth = (s.comment_count or 0) - fetched
-    threshold = max(50, fetched // 2, 10)
+    threshold = max(fetched // 3, 5)
     return growth >= threshold
 
 
