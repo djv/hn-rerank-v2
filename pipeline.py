@@ -150,6 +150,33 @@ def is_hn_source(source: str) -> bool:
     return source in {"hn", BQ_ARCHIVE_SOURCE, CH_ARCHIVE_SOURCE}
 
 
+def _needs_hn_prewarm(s: Story) -> bool:
+    """Whether the regen prewarm should refresh this HN story's ``top_comments``.
+
+    Triggers when (a) ``top_comments`` is empty, (b) we have no fetch
+    history (``comment_count_at_fetch <= 0``), or (c) the live comment
+    count has grown meaningfully since the last prewarm: at least
+    ``max(50, fetched // 2, 10)`` new comments.
+
+    The threshold catches the 1->284 "stale single-comment stub" case
+    (WORKLOG 2026-06-29) without thrashing on small week-over-week
+    growth. ``prewarm_top_stories`` rewrites ``comment_count_at_fetch``
+    on every run, so this helper self-clears after a single regen cycle.
+    """
+    if not is_hn_source(s.source):
+        return False
+    if (s.comment_count or 0) <= 0:
+        return False
+    if not s.top_comments:
+        return True
+    fetched = s.comment_count_at_fetch or 0
+    if fetched <= 0:
+        return True
+    growth = (s.comment_count or 0) - fetched
+    threshold = max(50, fetched // 2, 10)
+    return growth >= threshold
+
+
 # Source category one-hot. Order is significant: callers index into the
 # returned vector and tests assert specific positions.
 SOURCE_CATEGORIES: tuple[str, ...] = ("hn_live", "archive", "reddit", "rss")
@@ -2865,13 +2892,7 @@ async def fetch_candidates_only(
 
     # HN prewarm
     if config.prewarm_hn_full and embedder is not None:
-        needs_prewarm = [
-            s.id
-            for s in candidates
-            if is_hn_source(s.source)
-            and not s.top_comments
-            and (s.comment_count or 0) > 0
-        ]
+        needs_prewarm = [s.id for s in candidates if _needs_hn_prewarm(s)]
         if needs_prewarm:
             prewarmed = prewarm_top_stories(needs_prewarm, db, embedder)
             logging.info(

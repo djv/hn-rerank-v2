@@ -5,6 +5,94 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-29 — Regen prewarm: refresh stale `top_comments`, not just empty ones
+
+**Symptom.** User reported TLDR discussion thin for HN 48709670
+("Semgrep: GLM 5.2 beats Claude in our Cyber Benchmarks") despite
+284 comments. `top_comments` was 277 chars (a single promo comment)
+and `comment_count_at_fetch=1`. Same root cause affected ~9 other
+stories (48648550, 48579013, 48707146, 48614097, 48675295, 48614715,
+48610475, 48710437, 48660021) plus ~9 large stories with
+`top_comments=""` that had never been prewarmed at all (Trump 2057,
+"How to Earn a Billion" 1920, Googlebook 1571, etc.).
+
+**Root cause.** `fetch_candidates_only`'s `needs_prewarm` filter
+(`pipeline.py:2868-2877`) only included stories with `not
+s.top_comments`. Any story that had a successful prewarm — even a
+1-comment stub — was skipped on all subsequent regens. As the
+comment count grew from 1 → 284 across cycles, the stale single-
+comment `top_comments` was never refreshed. The lazy
+single-story fallback (`fetch_story`, `pipeline.py:634-640`) has a
+`comment_count > comment_count_at_fetch` stale check, but live-
+window stories never hit that path.
+
+**Fix.** New `pipeline._needs_hn_prewarm(Story) -> bool` helper
+re-prewarms on (a) empty `top_comments`, (b) missing fetch history
+(`comment_count_at_fetch <= 0`), or (c) meaningful comment growth
+since the last prewarm: `growth >= max(50, fetched // 2, 10)`.
+The regen-site filter becomes `[s.id for s in candidates if
+_needs_hn_prewarm(s)]`. `prewarm_top_stories` is unchanged — it
+remains a pure "rewrite whatever I fetched" function; the stale
+policy lives in one place. The threshold self-clears after a
+single regen cycle because `prewarm_top_stories` writes back
+`comment_count_at_fetch=comment_count`.
+
+**Verification.** Four new tests in `tests/test_pipeline.py`:
+`test_needs_hn_prewarm` (table-driven across the threshold
+boundaries, including the 1→284 regression case and a non-HN
+negative), `test_fetch_candidates_only_reprewarms_stale_hn_when_full`,
+`test_fetch_candidates_only_skips_fresh_hn_when_full`, and
+`test_fetch_candidates_only_reprewarms_empty_top_comments_hn_when_full`
+(preserves the pre-fix behavior). Manual check on
+`hn_rewrite.db`: 48709670 + the 9 siblings flip from `not in
+needs_prewarm` to `in needs_prewarm` after the change.
+
+**Risk.** Low. `prewarm_top_stories` is idempotent and per-row
+atomic (replaces `top_comments`, `text_content`, `comment_count`,
+`comment_count_at_fetch` together via `dataclasses.replace()`).
+Threshold caps re-fires to tens of stories per 3h regen. No DB
+schema change.
+
+---
+
+## 2026-06-29 — LessWrong: extract real `score` and `comment_count` from GraphQL
+
+**Symptom.** LessWrong stories (e.g. `aoqhszdEWqcFWbnda`) showed in the
+dashboard with `score=0` and a comment count that was the number of
+comments actually fetched into `top_comments` (capped by
+`LESSWRONG_COMMENT_LIMIT=20` and `COMMENT_PROMPT_CHAR_LIMIT=12000`) — not
+the real totals from the post. The example post was displaying "7
+comments" while LW showed 39.
+
+**Root cause.** Two bugs in `server.py:_fetch_lesswrong_context`:
+1. The GraphQL post query fetched `commentCount` but the result was
+   ignored — `comment_count` was set to `len(comments)` instead.
+2. The post query never asked for `baseScore`, so the score could not
+   be extracted at all (LW's RSS feed has no score field).
+
+**Fix.**
+- `server.py:109-113` — added `score: int = 0` to `LessWrongContext`.
+- `server.py:315-321` — added `baseScore` to the GraphQL post query.
+- `server.py:360-364` — use `post.commentCount` (with `len(comments)`
+  fallback) and `post.baseScore` when building the context.
+- `pipeline.py:1087-1095` — `prewarm_lesswrong_stories` now also
+  stores `score=max(story.score, ctx.score)` in its `replace()`.
+- `server.py:957-973` — same `score=` propagation in the lazy
+  `/api/tldr-detail` fetch path.
+
+**Migration.** Added `scripts/backfill_lesswrong_score.py` to refresh
+existing rows. One-shot, idempotent, non-destructive (UPDATE only).
+Updated 48 of 57 LW rows in the live DB. The user's example row went
+from `score=0, comment_count=7, comment_count_at_fetch=0` to
+`score=132, comment_count=39, comment_count_at_fetch=39`.
+
+**Tests.** `test_lesswrong_context_fetches_post_and_comments` and
+`test_tldr_detail_fetches_lesswrong_comments` updated to assert
+`ctx.score == 132` and `ctx.comment_count == 39`. Full suite:
+369 passed, 1 skipped (torch), 19.07s on `-n 4`.
+
+---
+
 ## 2026-06-29 — Reddit refresh: fix HTTPError stall, topfeed `?t=week`, top-N-hot per sub, multi-cycle prewarm
 
 **Symptom.** Multiple Reddit-related issues surfaced after the 2026-06-28

@@ -25,6 +25,7 @@ from pipeline import (
     story_embedding_text,
     _extract_comments_recursive,
     _select_top_comments,
+    _needs_hn_prewarm,
     _dashboard_primary_limit,
     _reddit_subreddit_from_feed_url,
     _rss_source_name,
@@ -4088,6 +4089,246 @@ def test_fetch_candidates_only_prewarms_all_hn_when_full(monkeypatch) -> None:
         assert len(captured_ids) == 1
         # Only stories with comment_count > 0 and empty top_comments: 2, 3
         assert sorted(captured_ids[0]) == [2, 3]
+
+    finally:
+        db.close()
+
+
+def test_needs_hn_prewarm() -> None:
+    """Table-driven: stale, fresh, never-prewarmed, and edge cases.
+
+    Threshold is ``max(50, fetched // 2, 10)``. growth >= threshold -> True.
+    """
+    base_id = 1
+
+    def make_story(
+        source: str,
+        comment_count: int,
+        top_comments: str,
+        comment_count_at_fetch: int = 0,
+    ) -> Story:
+        return Story(
+            id=base_id,
+            title="t",
+            url="",
+            score=1,
+            time=1,
+            text_content="t",
+            source=source,
+            comment_count=comment_count,
+            top_comments=top_comments,
+            comment_count_at_fetch=comment_count_at_fetch,
+        )
+
+    cases: list[tuple[Story, bool]] = [
+        # Zero comment_count -> False regardless of top_comments
+        (make_story("hn", 0, ""), False),
+        # 10 comments, fresh, no growth -> False
+        (make_story("hn", 10, "x", comment_count_at_fetch=10), False),
+        # Empty top_comments + comment_count > 0 -> True (never prewarmed)
+        (make_story("hn", 1, ""), True),
+        # No fetch history (comment_count_at_fetch=0) -> True
+        (make_story("hn", 1, "x", comment_count_at_fetch=0), True),
+        # Fresh: growth=40 < 50 -> False (max(50, 50//2, 10) = 50)
+        (make_story("hn", 50, "x", comment_count_at_fetch=10), False),
+        # growth=50, threshold=50 -> True
+        (make_story("hn", 55, "x", comment_count_at_fetch=5), True),
+        # 1->284 (the original bug case): growth=283 >= 50 -> True
+        (make_story("hn", 284, "x", comment_count_at_fetch=1), True),
+        # 100->105: growth=5 < 50 -> False
+        (make_story("hn", 105, "x", comment_count_at_fetch=100), False),
+        # 100->200: growth=100 >= 50 -> True
+        (make_story("hn", 200, "x", comment_count_at_fetch=100), True),
+        # Non-HN source -> False even with stale-looking shape
+        (
+            make_story("rss_reddit_test", 284, "", comment_count_at_fetch=1),
+            False,
+        ),
+    ]
+    for s, expected in cases:
+        actual = _needs_hn_prewarm(s)
+        assert actual is expected, f"failed for {s}: expected {expected}, got {actual}"
+
+
+def test_fetch_candidates_only_reprewarms_stale_hn_when_full(monkeypatch) -> None:
+    """Stories with non-empty top_comments but stale comment_count are re-prewarmed.
+
+    Regression for the 1->284 case on story 48709670: top_comments is set
+    (1-comment stub) but the live comment count has grown well past the
+    threshold. The regen prewarm must refresh it.
+    """
+    db = Database(":memory:")
+    try:
+        config = Config(
+            db_path=db.db_path,
+            prewarm_hn_full=True,
+            prewarm_reddit_full=False,
+        )
+
+        fresh = Story(
+            id=2,
+            title="Fresh",
+            url="",
+            score=10,
+            time=100,
+            text_content="f",
+            comment_count=50,
+            top_comments="recently prewarmed",
+            comment_count_at_fetch=50,
+        )
+        stale = Story(
+            id=3,
+            title="Stale 1->284",
+            url="",
+            score=20,
+            time=100,
+            text_content="s",
+            comment_count=284,
+            top_comments="old single comment",
+            comment_count_at_fetch=1,
+        )
+        no_comments = Story(
+            id=4,
+            title="No comments",
+            url="",
+            score=5,
+            time=100,
+            text_content="n",
+            comment_count=0,
+        )
+        stories = [fresh, stale, no_comments]
+        for s in stories:
+            db.upsert_story(s)
+
+        async def fake_fetch_candidates(
+            config, exclude_ids, exclude_urls, db, embedder
+        ):
+            return stories, 3
+
+        captured_ids: list[list[int]] = []
+
+        def fake_prewarm(ids, db_, embedder):
+            captured_ids.append(list(ids))
+            return len(ids)
+
+        monkeypatch.setattr(pipeline, "fetch_candidates", fake_fetch_candidates)
+        monkeypatch.setattr(pipeline, "prewarm_top_stories", fake_prewarm)
+
+        asyncio.run(
+            pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
+        )
+        assert len(captured_ids) == 1
+        # Stale 1->284 fires; fresh 50->50 does not; no_comments has 0.
+        assert sorted(captured_ids[0]) == [3]
+
+    finally:
+        db.close()
+
+
+def test_fetch_candidates_only_skips_fresh_hn_when_full(monkeypatch) -> None:
+    """Stories with top_comments already up to date are not re-prewarmed.
+
+    Without this guard, the new stale-criterion would re-prewarm the
+    entire live window every regen cycle.
+    """
+    db = Database(":memory:")
+    try:
+        config = Config(
+            db_path=db.db_path,
+            prewarm_hn_full=True,
+            prewarm_reddit_full=False,
+        )
+
+        stories = [
+            Story(
+                id=2,
+                title="Up to date",
+                url="",
+                score=10,
+                time=100,
+                text_content="f",
+                comment_count=120,
+                top_comments="recently prewarmed",
+                comment_count_at_fetch=120,
+            ),
+        ]
+        for s in stories:
+            db.upsert_story(s)
+
+        async def fake_fetch_candidates(
+            config, exclude_ids, exclude_urls, db, embedder
+        ):
+            return stories, 1
+
+        captured_ids: list[list[int]] = []
+
+        def fake_prewarm(ids, db_, embedder):
+            captured_ids.append(list(ids))
+            return len(ids)
+
+        monkeypatch.setattr(pipeline, "fetch_candidates", fake_fetch_candidates)
+        monkeypatch.setattr(pipeline, "prewarm_top_stories", fake_prewarm)
+
+        asyncio.run(
+            pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
+        )
+        # Up to date -> no prewarm at all this cycle
+        assert captured_ids == []
+
+    finally:
+        db.close()
+
+
+def test_fetch_candidates_only_reprewarms_empty_top_comments_hn_when_full(
+    monkeypatch,
+) -> None:
+    """Empty top_comments + comment_count > 0 still triggers prewarm.
+
+    Preserves the pre-2026-06-29 behavior; the new stale-criterion is
+    additive, not a replacement.
+    """
+    db = Database(":memory:")
+    try:
+        config = Config(
+            db_path=db.db_path,
+            prewarm_hn_full=True,
+            prewarm_reddit_full=False,
+        )
+
+        stories = [
+            Story(
+                id=7,
+                title="Never prewarmed",
+                url="",
+                score=10,
+                time=100,
+                text_content="n",
+                comment_count=42,
+                top_comments="",
+                comment_count_at_fetch=0,
+            ),
+        ]
+        for s in stories:
+            db.upsert_story(s)
+
+        async def fake_fetch_candidates(
+            config, exclude_ids, exclude_urls, db, embedder
+        ):
+            return stories, 1
+
+        captured_ids: list[list[int]] = []
+
+        def fake_prewarm(ids, db_, embedder):
+            captured_ids.append(list(ids))
+            return len(ids)
+
+        monkeypatch.setattr(pipeline, "fetch_candidates", fake_fetch_candidates)
+        monkeypatch.setattr(pipeline, "prewarm_top_stories", fake_prewarm)
+
+        asyncio.run(
+            pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
+        )
+        assert captured_ids == [[7]]
 
     finally:
         db.close()
