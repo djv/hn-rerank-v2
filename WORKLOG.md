@@ -5,6 +5,31 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-29 — Trailing debounce for rapid vote warm renders
+
+**Symptom.** Same-user warm coalescing kept only one worker active, but the
+debounce was leading-edge: the first vote in a burst started the 0.2s wait, and
+later vote versions inside that window could still be pulled into a render too
+early for the burst. Readiness polling for the same version could also keep
+touching the warm state without an explicit quiet-window contract.
+
+**Fix.** `_trigger_warm()` now uses a per-user trailing quiet-window debounce
+(`_WARM_DEBOUNCE_S=1.0`). Each user tracks the latest requested dashboard
+version, the monotonic time of the last distinct newer request, a registered
+timer, and a running marker. Newer versions restart the timer; duplicate
+same-version readiness polls and older stale requests do not extend the
+deadline. The timer rechecks that it is still registered, honors the remaining
+quiet window, marks the user running under the warm-state lock, then keeps the
+existing stale-before-rank, stale-after-lock, and stale-after-rank guards. If a
+newer version arrives while ranking is already in progress, the stale render
+skips cache commit and the next version is scheduled after its remaining quiet
+window.
+
+**Tests.** Added regressions for rapid versions `1 -> 2 -> 3`, duplicate
+same-version poll requests, stale older requests, and the newer-version-while-
+ranking path. Updated warm-state fixtures to reset and drain requested
+versions, last request times, timers, running markers, and the shared lock.
+
 ## 2026-06-29 — Coalesce same-user dashboard warm renders
 
 **Symptom.** The ready-gated vote path invalidated and warmed the dashboard on

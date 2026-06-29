@@ -61,6 +61,30 @@ def mock_embedder() -> MockEmbedder:
     return MockEmbedder()
 
 
+def _reset_warm_state(handler: type[Handler], debounce_s: float = 0.01) -> None:
+    handler._warmup_requested_versions = {}
+    handler._warmup_last_request_at = {}
+    handler._warmup_timers = {}
+    handler._warmup_running_users = set()
+    handler._warmup_in_flight_guard = threading.Lock()
+    handler._WARM_DEBOUNCE_S = debounce_s
+
+
+def _has_pending_warm(handler: type[Handler]) -> bool:
+    with handler._warmup_in_flight_guard:
+        return bool(
+            handler._warmup_requested_versions
+            or handler._warmup_timers
+            or handler._warmup_running_users
+        )
+
+
+def _drain_warms(handler: type[Handler], timeout_s: float = 3.0) -> None:
+    drain_deadline = time.time() + timeout_s
+    while _has_pending_warm(handler) and time.time() < drain_deadline:
+        time.sleep(0.01)
+
+
 def _start_handler_server(
     db: Database, embedder: MockEmbedder, port: int = 0
 ) -> tuple[ThreadingHTTPServer, int, type[Handler]]:
@@ -82,10 +106,7 @@ def _start_handler_server(
     TestHandler._dashboard_cache = {}
     TestHandler._dashboard_versions = {}
     TestHandler._render_locks = {}
-    TestHandler._warmup_active_users = set()
-    TestHandler._warmup_requested_versions = {}
-    TestHandler._warmup_in_flight_guard = threading.Lock()
-    TestHandler._WARM_DEBOUNCE_S = 0.01
+    _reset_warm_state(TestHandler)
 
     server = ThreadingHTTPServer(("127.0.0.1", port), TestHandler)
     bound_port = server.server_address[1]
@@ -93,9 +114,7 @@ def _start_handler_server(
 
 
 def _drain_and_shutdown(server: ThreadingHTTPServer, handler: type[Handler]) -> None:
-    drain_deadline = time.time() + 3.0
-    while handler._warmup_active_users and time.time() < drain_deadline:
-        time.sleep(0.01)
+    _drain_warms(handler)
     server.socket.shutdown(socket.SHUT_RDWR)
     server.shutdown()
 
@@ -691,10 +710,7 @@ def test_dashboard_cache_uses_feedback_versions(test_env, mock_embedder, monkeyp
     TestHandler._dashboard_cache = {}
     TestHandler._dashboard_versions = {}
     TestHandler._render_locks = {}
-    TestHandler._warmup_active_users = set()
-    TestHandler._warmup_requested_versions = {}
-    TestHandler._warmup_in_flight_guard = threading.Lock()
-    TestHandler._WARM_DEBOUNCE_S = 0.01
+    _reset_warm_state(TestHandler)
 
     calls = []
 
@@ -716,7 +732,8 @@ def test_dashboard_cache_uses_feedback_versions(test_env, mock_embedder, monkeyp
     # SWR: first call returns skeleton, warm thread renders async
     assert TestHandler._render_dashboard_for_user(user) == SKELETON_HTML
     assert len(calls) == 0
-    assert len(TestHandler._warmup_active_users) == 1
+    with TestHandler._warmup_in_flight_guard:
+        assert user.id in TestHandler._warmup_timers
 
     # Wait for warm to complete version 0
     html_v0 = _wait_for_cache(TestHandler, user, 0)
@@ -754,10 +771,7 @@ def test_stale_warm_render_does_not_overwrite_current_cache(
     TestHandler._dashboard_cache = {}
     TestHandler._dashboard_versions = {}
     TestHandler._render_locks = {}
-    TestHandler._warmup_active_users = set()
-    TestHandler._warmup_requested_versions = {}
-    TestHandler._warmup_in_flight_guard = threading.Lock()
-    TestHandler._WARM_DEBOUNCE_S = 0.01
+    _reset_warm_state(TestHandler)
 
     def fake_fast_rerank_for_user(database, config, embedder, user_id):
         return []
@@ -812,10 +826,7 @@ def test_stale_warm_does_not_overwrite_newer_cache_version(
     TestHandler._dashboard_cache = {}
     TestHandler._dashboard_versions = {}
     TestHandler._render_locks = {}
-    TestHandler._warmup_active_users = set()
-    TestHandler._warmup_requested_versions = {}
-    TestHandler._warmup_in_flight_guard = threading.Lock()
-    TestHandler._WARM_DEBOUNCE_S = 0.01
+    _reset_warm_state(TestHandler)
 
     rank_started = threading.Event()
     allow_rank_to_finish = threading.Event()
@@ -847,9 +858,7 @@ def test_stale_warm_does_not_overwrite_newer_cache_version(
 
     allow_rank_to_finish.set()
 
-    deadline = time.time() + 3.0
-    while TestHandler._warmup_active_users and time.time() < deadline:
-        time.sleep(0.05)
+    _drain_warms(TestHandler)
 
     cached = TestHandler._dashboard_cache[cache_key]
     assert cached[0] == b"stale content"
@@ -870,10 +879,7 @@ def test_stale_warm_after_lock_wait_does_not_rank(
     TestHandler._dashboard_cache = {}
     TestHandler._dashboard_versions = {}
     TestHandler._render_locks = {}
-    TestHandler._warmup_active_users = set()
-    TestHandler._warmup_requested_versions = {}
-    TestHandler._warmup_in_flight_guard = threading.Lock()
-    TestHandler._WARM_DEBOUNCE_S = 0.01
+    _reset_warm_state(TestHandler)
 
     rank_called = threading.Event()
 
@@ -900,11 +906,9 @@ def test_stale_warm_after_lock_wait_does_not_rank(
         time.sleep(0.05)
         TestHandler._dashboard_versions[user.id] = 2
 
-    deadline = time.time() + 3.0
-    while TestHandler._warmup_active_users and time.time() < deadline:
-        time.sleep(0.05)
+    _drain_warms(TestHandler)
 
-    assert not TestHandler._warmup_active_users
+    assert not _has_pending_warm(TestHandler)
     assert not rank_called.is_set()
     assert cache_key not in TestHandler._dashboard_cache
 
@@ -923,10 +927,7 @@ def test_rapid_vote_warms_coalesce_to_latest_version(
     TestHandler._dashboard_cache = {}
     TestHandler._dashboard_versions = {}
     TestHandler._render_locks = {}
-    TestHandler._warmup_active_users = set()
-    TestHandler._warmup_requested_versions = {}
-    TestHandler._warmup_in_flight_guard = threading.Lock()
-    TestHandler._WARM_DEBOUNCE_S = 0.05
+    _reset_warm_state(TestHandler, debounce_s=0.05)
 
     ranked_versions: list[int] = []
 
@@ -971,10 +972,7 @@ def test_warm_loops_to_newer_version_requested_while_ranking(
     TestHandler._dashboard_cache = {}
     TestHandler._dashboard_versions = {}
     TestHandler._render_locks = {}
-    TestHandler._warmup_active_users = set()
-    TestHandler._warmup_requested_versions = {}
-    TestHandler._warmup_in_flight_guard = threading.Lock()
-    TestHandler._WARM_DEBOUNCE_S = 0.01
+    _reset_warm_state(TestHandler)
 
     rank_started = threading.Event()
     allow_first_rank_to_finish = threading.Event()
@@ -1057,10 +1055,7 @@ def test_dashboard_cache_version_invariant_property(
     TestHandler._dashboard_cache = {}
     TestHandler._dashboard_versions = {}
     TestHandler._render_locks = {}
-    TestHandler._warmup_active_users = set()
-    TestHandler._warmup_requested_versions = {}
-    TestHandler._warmup_in_flight_guard = threading.Lock()
-    TestHandler._WARM_DEBOUNCE_S = 0.01
+    _reset_warm_state(TestHandler)
 
     def fake_fast_rerank_for_user(database, config, embedder, user_id):
         return []
@@ -1108,9 +1103,7 @@ def test_dashboard_cache_version_invariant_property(
 
     # Drain in-flight warm threads before monkeypatch cleanup so they don't
     # capture our fakes and leak into subsequent tests.
-    drain_deadline = time.time() + 3.0
-    while TestHandler._warmup_active_users and time.time() < drain_deadline:
-        time.sleep(0.01)
+    _drain_warms(TestHandler)
 
 
 def test_cors_headers(app_env):
@@ -2237,10 +2230,7 @@ def swr_handler(test_env, mock_embedder):
     SwrHandler._dashboard_cache = {}
     SwrHandler._dashboard_versions = {}
     SwrHandler._render_locks = {}
-    SwrHandler._warmup_active_users = set()
-    SwrHandler._warmup_requested_versions = {}
-    SwrHandler._warmup_in_flight_guard = threading.Lock()
-    SwrHandler._WARM_DEBOUNCE_S = 0.01
+    _reset_warm_state(SwrHandler)
 
     import pipeline
 
@@ -2251,6 +2241,7 @@ def swr_handler(test_env, mock_embedder):
 
     yield user, SwrHandler
 
+    _drain_warms(SwrHandler)
     pipeline.fast_rerank_for_user = old_fast_rerank
     pipeline.generate_dashboard_bytes = old_gen_bytes
 
@@ -2281,9 +2272,9 @@ def test_trigger_warm_dedup(swr_handler):
     h._trigger_warm(user, version=42)
 
     with h._warmup_in_flight_guard:
-        assert user.id in h._warmup_active_users
+        assert user.id in h._warmup_timers
         assert h._warmup_requested_versions[user.id] == 42
-        assert len(h._warmup_active_users) == 1
+        assert len(h._warmup_timers) == 1
 
 
 def test_trigger_warm_different_versions_coalesce(swr_handler):
@@ -2292,9 +2283,48 @@ def test_trigger_warm_different_versions_coalesce(swr_handler):
     h._trigger_warm(user, version=2)
 
     with h._warmup_in_flight_guard:
-        assert user.id in h._warmup_active_users
+        assert user.id in h._warmup_timers
         assert h._warmup_requested_versions[user.id] == 2
-        assert len(h._warmup_active_users) == 1
+        assert len(h._warmup_timers) == 1
+
+
+def test_trigger_warm_same_version_does_not_extend_deadline(swr_handler):
+    user, h = swr_handler
+    h._WARM_DEBOUNCE_S = 0.2
+    h._trigger_warm(user, version=1)
+
+    with h._warmup_in_flight_guard:
+        first_request_at = h._warmup_last_request_at[user.id]
+        first_timer = h._warmup_timers[user.id]
+
+    time.sleep(0.03)
+    for _ in range(3):
+        h._trigger_warm(user, version=1)
+        time.sleep(0.01)
+
+    with h._warmup_in_flight_guard:
+        assert h._warmup_requested_versions[user.id] == 1
+        assert h._warmup_last_request_at[user.id] == first_request_at
+        assert h._warmup_timers[user.id] is first_timer
+
+
+def test_trigger_warm_stale_request_does_not_restart_timer(swr_handler):
+    user, h = swr_handler
+    h._WARM_DEBOUNCE_S = 0.2
+    h._dashboard_versions[user.id] = 2
+    h._trigger_warm(user, version=2)
+
+    with h._warmup_in_flight_guard:
+        first_request_at = h._warmup_last_request_at[user.id]
+        first_timer = h._warmup_timers[user.id]
+
+    time.sleep(0.03)
+    h._trigger_warm(user, version=1)
+
+    with h._warmup_in_flight_guard:
+        assert h._warmup_requested_versions[user.id] == 2
+        assert h._warmup_last_request_at[user.id] == first_request_at
+        assert h._warmup_timers[user.id] is first_timer
 
 
 def test_enforce_cache_cap(swr_handler):
