@@ -1168,6 +1168,15 @@
       sortTabs.forEach(tab => {
         tab.classList.toggle('active', tab.dataset.sort === currentSort);
       });
+      sourceTabs.forEach(tab => {
+        tab.disabled = (sort === 'popular' && tab.dataset.source !== 'hn');
+      });
+      if (sort === 'popular' && currentSource !== 'hn') {
+        currentSource = 'hn';
+        sourceTabs.forEach(tab => {
+          tab.classList.toggle('active', tab.dataset.source === 'hn');
+        });
+      }
       if (activeCard && !matchesCurrentAxes(activeCard)) {
         activeCard.classList.remove('active');
       }
