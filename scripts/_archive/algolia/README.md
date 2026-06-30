@@ -44,5 +44,5 @@ are real-time (no 1-24h CH lag):
 - `pipeline.refetch_story_text` — single-story refetch for growth-triggered comment update
 - `pipeline.fetch_candidates` — 7-day search (no CH equivalent)
 
-See `/home/dev/hn-rewrite/main/pipeline.py` and the
+See `../../pipeline.py` and the
 `plans/algolia-to-clickhouse.md` document for the full architecture.
