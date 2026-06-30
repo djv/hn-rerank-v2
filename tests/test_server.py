@@ -841,20 +841,22 @@ def test_no_cache_user_gets_cold_deck_and_warm_is_scheduled(
     )
     db.upsert_story(story)
     db.upsert_feedback(user.id, 991, "up")
-    cold = [
-        RankedStory(
-            story=story,
-            score=99.0,
-            best_match_title="",
-            is_recent=True,
-            combo_keys="recent_hn recent_mixed",
-        )
-    ]
+    # Unvoted story that survives the per-user cold-deck filter.
+    unvoted = Story(
+        id=992,
+        title="Remaining story",
+        url="https://example.com/remain",
+        score=50,
+        time=int(time.time()) - 3600,
+        text_content="Remaining body",
+        source="hn",
+        comment_count=1,
+    )
+    db.upsert_story(unvoted)
     calls: list[tuple[int, int]] = []
     rendered: list[dict[str, object]] = []
     handler._dashboard_cache = {}
     handler._dashboard_versions = {user.id: 3}
-    handler._cold_stories = cold
 
     def fake_generate_dashboard_bytes(
         ranked: list[RankedStory],
@@ -888,15 +890,15 @@ def test_no_cache_user_gets_cold_deck_and_warm_is_scheduled(
 
     assert html == b"cold html"
     assert calls == [(user.id, 3)]
-    assert rendered == [
-        {
-            "ranked": cold,
-            "user_id": user.id,
-            "user_token": user.token,
-            "dashboard_version": 0,
-            "dashboard_latest_version": 3,
-        }
-    ]
+    rank = rendered[0]
+    ranked_list: list[RankedStory] = rank["ranked"]  # type: ignore[assignment]
+    story_ids = [rs.story.id for rs in ranked_list]
+    assert story_ids == [992]
+    assert 991 not in story_ids
+    assert rank["user_id"] == user.id
+    assert rank["user_token"] == user.token
+    assert rank["dashboard_version"] == 0
+    assert rank["dashboard_latest_version"] == 3
 
 
 def test_no_cache_zero_feedback_user_gets_cold_deck_no_warm(
@@ -2231,7 +2233,7 @@ def test_keydown_uses_letter_keys():
     assert "max-width: 902px" in template
     assert "max-width: none" in template
     story_card_block = template.split(".story-card {", 1)[1].split("}", 1)[0]
-    assert "padding: 0.7rem;" in story_card_block
+    assert "padding: 0.5rem 0.5rem 0.7rem;" in story_card_block
     # page never scrolls — overflow hidden on html and body
     assert "html {\n      overflow: hidden;\n    }" in template
     assert "overflow: hidden;" in template.split("body {")[1].split("}")[0]
@@ -2271,9 +2273,9 @@ def test_keydown_uses_letter_keys():
     # fullscreen hides side controls and lets the active card fill viewport height
     assert ".fullscreen .swipe-side { display: none; }" in template
     assert ".fullscreen .vote-bar { display: none; }" in template
-    fullscreen_shell_block = template.split(".fullscreen .swipe-shell {", 1)[
-        1
-    ].split("}", 1)[0]
+    fullscreen_shell_block = template.split(".fullscreen .swipe-shell {", 1)[1].split(
+        "}", 1
+    )[0]
     assert "height: calc(100vh - 1rem);" in fullscreen_shell_block
     assert "height: calc(100dvh - 1rem);" in fullscreen_shell_block
     assert "display: flex;" in fullscreen_shell_block
@@ -2283,12 +2285,21 @@ def test_keydown_uses_letter_keys():
     )[1].split("}", 1)[0]
     assert "flex: 1;" in fullscreen_flex_block
     assert "min-height: 0;" in fullscreen_flex_block
+    fullscreen_layout_block = template.split(".fullscreen .swipe-layout {", 1)[1].split(
+        "}", 1
+    )[0]
+    assert "align-items: stretch;" in fullscreen_layout_block
+    assert (
+        ".fullscreen #stories {\n      display: flex;\n      flex-direction: column;"
+        in template
+    )
     fullscreen_active_block = template.split(".fullscreen .story-card.active {", 1)[
         1
     ].split("}", 1)[0]
     assert "height: 100%;" in fullscreen_active_block
     assert "max-height: 100%;" in fullscreen_active_block
     assert "overflow: auto;" in fullscreen_active_block
+    assert "padding-bottom: 0.5rem;" in fullscreen_active_block
     # mobile side-rail stack (column, keys hidden)
     assert ".swipe-keys { display: none; }" in template
     assert "width: 100%;" in template
@@ -2302,10 +2313,7 @@ def test_keydown_uses_letter_keys():
         "--mobile-vote-bar-clearance: calc(3.75rem + env(safe-area-inset-bottom, 0px));"
         in template
     )
-    assert (
-        "height: calc(100vh - 1.5rem - var(--mobile-vote-bar-clearance))"
-        in template
-    )
+    assert "height: calc(100vh - 1.5rem - var(--mobile-vote-bar-clearance))" in template
     assert "100dvh" in template
     mobile_active_block = template.split(
         ".story-card.active {\n        max-height: 100%;", 1
@@ -2338,21 +2346,14 @@ def test_keydown_uses_letter_keys():
     assert ".sort-tab.active {\n      background: var(--pico-primary);" in template
     assert ".age-tab.active {\n      background: #6c757d;" in template
     assert ".source-tab.active {\n      background: #6c757d;" in template
-    assert "padding: 0.45rem;" in template.split(".queue-pill {", 1)[1].split(
-        "}", 1
-    )[0]
-    assert "padding: 0.45rem;" in template.split(".queue-pill--bar {", 1)[1].split(
-        "}", 1
-    )[0]
-    assert "padding: 0.6rem;" in template.split(".sort-tab {", 1)[1].split(
-        "}", 1
-    )[0]
-    assert "padding: 0.3rem;" in template.split(".age-tab {", 1)[1].split(
-        "}", 1
-    )[0]
-    assert "padding: 0.3rem;" in template.split(".source-tab {", 1)[1].split(
-        "}", 1
-    )[0]
+    assert "padding: 0.45rem;" in template.split(".queue-pill {", 1)[1].split("}", 1)[0]
+    assert (
+        "padding: 0.45rem;"
+        in template.split(".queue-pill--bar {", 1)[1].split("}", 1)[0]
+    )
+    assert "padding: 0.6rem;" in template.split(".sort-tab {", 1)[1].split("}", 1)[0]
+    assert "padding: 0.3rem;" in template.split(".age-tab {", 1)[1].split("}", 1)[0]
+    assert "padding: 0.3rem;" in template.split(".source-tab {", 1)[1].split("}", 1)[0]
     # feedback button has filled, shadowed style
     assert "box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);" in template
     # click handler no longer passes null card

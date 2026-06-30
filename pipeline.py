@@ -229,23 +229,38 @@ def _combo_keys_for_story(story: Story, recent_cutoff: int) -> str:
     return f"{age}_{source} {age}_mixed"
 
 
-def build_cold_deck(db: Database) -> list[RankedStory]:
-    """Build a global gravity-sorted fallback deck from existing SQLite rows.
+def build_cold_deck(db: Database, user_id: int | None = None) -> list[RankedStory]:
+    """Build a gravity-sorted fallback deck from existing SQLite rows.
 
     Uses the same tier-1 gravity formula as ``_score_and_rank`` so a
     zero-vote user sees the same ranking as the cold deck.  See
     ``fast_rerank_for_user`` for the 0-vote short-circuit.
+
+    When *user_id* is provided, the SQL filters out stories the user
+    has already voted on.
     """
     now_ts = int(time.time())
-    rows = db.execute(
-        "SELECT id, title, url, score, time, text_content, source, comment_count, "
-        "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
-        "FROM stories "
-        "ORDER BY CAST(score AS REAL) / POW((? - time) / 3600.0 + 2.0, 1.8) DESC, "
-        "         time DESC "
-        "LIMIT ?",
-        (now_ts, COLD_DECK_QUERY_LIMIT),
-    )
+    if user_id is not None:
+        rows = db.execute(
+            "SELECT id, title, url, score, time, text_content, source, comment_count, "
+            "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
+            "FROM stories "
+            "WHERE id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?) "
+            "ORDER BY CAST(score AS REAL) / POW((? - time) / 3600.0 + 2.0, 1.8) DESC, "
+            "         time DESC "
+            "LIMIT ?",
+            (user_id, now_ts, COLD_DECK_QUERY_LIMIT),
+        )
+    else:
+        rows = db.execute(
+            "SELECT id, title, url, score, time, text_content, source, comment_count, "
+            "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
+            "FROM stories "
+            "ORDER BY CAST(score AS REAL) / POW((? - time) / 3600.0 + 2.0, 1.8) DESC, "
+            "         time DESC "
+            "LIMIT ?",
+            (now_ts, COLD_DECK_QUERY_LIMIT),
+        )
     stories = [Database._row_to_story(row) for row in rows]
     recent_cutoff = now_ts - (30 * 86400)
     cold: list[RankedStory] = []

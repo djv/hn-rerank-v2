@@ -767,9 +767,15 @@ class Handler(BaseHTTPRequestHandler):
             cls._trigger_warm(user, expected_version)
             return cached[0]
 
-        # No per-user cache → render the global cold deck, then warm the
+        # No per-user cache → render the cold deck, then warm the
         # personalized version in the background.
-        cold_stories = cls._cold_stories
+        n_feedback = sum(cls.db.count_feedback_by_action(user.id).values())
+        if n_feedback > 0:
+            from pipeline import build_cold_deck
+
+            cold_stories = build_cold_deck(cls.db, user_id=user.id)
+        else:
+            cold_stories = cls._cold_stories
         if cold_stories:
             from pipeline import generate_dashboard_bytes
 
@@ -789,7 +795,6 @@ class Handler(BaseHTTPRequestHandler):
                 len(cold_stories),
                 (time.perf_counter() - request_start) * 1000,
             )
-            n_feedback = sum(cls.db.count_feedback_by_action(user.id).values())
             if n_feedback > 0:
                 cls._trigger_warm(user, expected_version)
             return html
