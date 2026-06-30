@@ -563,6 +563,24 @@
     }
     .vote-bar[hidden] { display: none; }
 
+    .filter-toggle-btn {
+      display: none;
+      margin-right: auto;
+      padding: 0.5rem 0.7rem;
+      font-size: 1.15rem;
+      line-height: 1;
+      min-width: 2.75rem;
+      min-height: 2.75rem;
+      background: transparent;
+      border: 1px solid var(--pico-muted-border-color);
+      border-radius: 6px;
+      cursor: pointer;
+      color: var(--pico-color);
+    }
+    .filter-toggle-btn:active {
+      background: color-mix(in srgb, var(--pico-muted-border-color) 40%, transparent);
+    }
+
     .vote-counts {
       display: flex;
       gap: 0.7rem;
@@ -791,18 +809,27 @@
       }
 
       .swipe-side {
-        position: static;
-        order: -1;
-        flex: 0 0 auto;
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        z-index: 99;
+        transform: translateY(-100%);
+        transition: transform 0.2s ease;
         width: 100%;
         max-width: 100%;
         max-height: none;
         display: flex;
         flex-direction: column;
         gap: 0.5rem;
-        padding-bottom: 0.4rem;
+        padding: 0.6rem 0.8rem 0.6rem 0.8rem;
+        background: var(--pico-card-background-color);
         border-bottom: 1px solid var(--pico-muted-border-color);
-        margin-bottom: 0.4rem;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+        overflow-y: auto;
+      }
+      .swipe-side.visible {
+        transform: translateY(0);
       }
 
       .sort-tabs {
@@ -825,6 +852,8 @@
       }
 
       .swipe-keys { display: none; }
+
+      .filter-toggle-btn { display: inline-flex; align-items: center; justify-content: center; }
 
       .feedback-btn {
         padding: 0.6rem 0.9rem;
@@ -966,6 +995,7 @@
   </main>
 
   <div class="vote-bar" hidden>
+    <button class="filter-toggle-btn" title="Filters" aria-label="Toggle filters">☰</button>
     <div class="vote-counts" aria-label="Your all-time vote counts">
       <span class="vote-count vote-count--up">
         <span class="vote-count-glyph" aria-hidden="true">▲</span>
@@ -1008,6 +1038,8 @@
     const ageTabs = Array.from(document.querySelectorAll('[data-age]'));
     const sourceTabs = Array.from(document.querySelectorAll('[data-source]'));
     const voteBar = document.querySelector('.vote-bar');
+    const sidePanel = document.querySelector('.swipe-side');
+    const filterToggleBtn = document.querySelector('.filter-toggle-btn');
     let activeCard = null;
     let lastVote = null;
     let nextVoteId = 1;
@@ -1129,6 +1161,7 @@
 
     function setSort(sort) {
       if (sort === 'popular' && currentSource === 'non-hn') return;
+      sidePanel.classList.remove('visible');
       currentSort = sort;
       sortTabs.forEach(tab => {
         tab.classList.toggle('active', tab.dataset.sort === currentSort);
@@ -1143,6 +1176,7 @@
     }
 
     function setAge(age) {
+      sidePanel.classList.remove('visible');
       currentAge = age;
       ageTabs.forEach(tab => {
         tab.classList.toggle('active', tab.dataset.age === currentAge);
@@ -1159,6 +1193,7 @@
     }
 
     function setSource(source) {
+      sidePanel.classList.remove('visible');
       currentSource = source;
       sourceTabs.forEach(tab => {
         tab.classList.toggle('active', tab.dataset.source === currentSource);
@@ -1365,6 +1400,19 @@
     sourceTabs.forEach(tab => {
       tab.addEventListener('click', () => setSource(tab.dataset.source));
     });
+
+    filterToggleBtn.addEventListener('click', () => {
+      sidePanel.classList.toggle('visible');
+    });
+
+    document.addEventListener('click', (e) => {
+      if (sidePanel.classList.contains('visible') &&
+          !sidePanel.contains(e.target) &&
+          e.target !== filterToggleBtn) {
+        sidePanel.classList.remove('visible');
+      }
+    });
+
     document.querySelectorAll('[data-key-action]').forEach(btn => {
       const runKeyAction = () => {
         const action = btn.dataset.keyAction;
