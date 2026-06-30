@@ -7,6 +7,7 @@ import html
 import inspect
 import json
 import logging
+import random
 import re
 import secrets
 import sys
@@ -386,7 +387,7 @@ async def _call_llm_chat(
         "max_tokens": max_tokens,
     }
     async with httpx.AsyncClient(timeout=45.0) as client:
-        for attempt in range(3):
+        for attempt in range(4):
             resp = await client.post(
                 base_url,
                 headers={
@@ -398,9 +399,11 @@ async def _call_llm_chat(
             if resp.status_code == 200:
                 data = resp.json()
                 return data["choices"][0]["message"]["content"]
-            if resp.status_code in (429, 503) and attempt < 2:
+            if resp.status_code in (429, 503) and attempt < 3:
+                base = 2 ** (attempt + 1)
+                jitter = random.uniform(0, base * 0.5)
                 delay = _parse_retry_after(
-                    resp.headers.get("Retry-After"), default=2**attempt
+                    resp.headers.get("Retry-After"), default=base + jitter
                 )
                 await asyncio.sleep(delay)
                 continue
