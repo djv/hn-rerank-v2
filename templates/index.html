@@ -969,19 +969,19 @@
 
       <aside class="swipe-side" aria-label="Queue and keyboard controls">
         <div class="sort-tabs" aria-label="Sort order">
-          <button type="button" class="sort-tab active" data-sort="recommended">Recommended</button>
-          <button type="button" class="sort-tab" data-sort="popular">Popular</button>
-          <button type="button" class="sort-tab" data-sort="explore">Explore</button>
-          <button type="button" class="sort-tab" data-sort="date">Date</button>
+          <button type="button" class="sort-tab active" data-sort="recommended"><u>R</u>ecommended</button>
+          <button type="button" class="sort-tab" data-sort="popular"><u>P</u>opular</button>
+          <button type="button" class="sort-tab" data-sort="explore">E<u>x</u>plore</button>
+          <button type="button" class="sort-tab" data-sort="date"><u>D</u>ate</button>
         </div>
         <div class="age-tabs" aria-label="Age filter">
-          <button type="button" class="age-tab active" data-age="recent">Recent</button>
-          <button type="button" class="age-tab" data-age="archive">Archive</button>
+          <button type="button" class="age-tab active" data-age="recent">R<u>e</u>cent</button>
+          <button type="button" class="age-tab" data-age="archive"><u>A</u>rchive</button>
         </div>
         <div class="source-tabs" aria-label="Source filter">
-          <button type="button" class="source-tab active" data-source="mixed">Mixed</button>
-          <button type="button" class="source-tab" data-source="hn">HN</button>
-          <button type="button" class="source-tab" data-source="non-hn">Non-HN</button>
+          <button type="button" class="source-tab active" data-source="mixed"><u>M</u>ixed</button>
+          <button type="button" class="source-tab" data-source="hn"><u>H</u>N</button>
+          <button type="button" class="source-tab" data-source="non-hn"><u>N</u>on-HN</button>
         </div>
         <div class="swipe-keys">
           <span class="key-row" tabindex="0" data-key-action="up"><span class="key-hint">k</span> upvote</span>
@@ -1912,6 +1912,17 @@
       } else if (key === 'u') {
         e.preventDefault();
         undoLastVote();
+      } else if (key === 'r') { e.preventDefault(); setSort('recommended');
+      } else if (key === 'p') { e.preventDefault(); setSort('popular');
+      } else if (key === 'x') { e.preventDefault(); setSort('explore');
+      } else if (key === 'd') { e.preventDefault(); setSort('date');
+      } else if (key === 'e') { e.preventDefault(); setAge('recent');
+      } else if (key === 'a') { e.preventDefault(); setAge('archive');
+      } else if (key === 'm') { e.preventDefault(); setSource('mixed');
+      } else if (key === 'h') { e.preventDefault(); setSource('hn');
+      } else if (key === 'n') { e.preventDefault(); setSource('non-hn');
+      } else if (key === 'f') { e.preventDefault();
+        document.querySelector('.swipe-side').classList.toggle('visible');
       }
     });
 
