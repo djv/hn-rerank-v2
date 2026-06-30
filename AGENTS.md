@@ -64,7 +64,7 @@
     git history is self-documenting — the next person reading the blame
     should see what happened and what was reconstructed.
 
-- **Always update relevant documentation** (e.g., [ARCHITECTURE.md](file:///home/dev/hn-rewrite/ARCHITECTURE.md), [WORKLOG.md](file:///home/dev/hn-rewrite/WORKLOG.md)) after making code or behavior changes.
+- **Always update relevant documentation** (e.g., [ARCHITECTURE.md](file:///home/dev/hn-rewrite/main/ARCHITECTURE.md), [WORKLOG.md](file:///home/dev/hn-rewrite/main/WORKLOG.md)) after making code or behavior changes.
 
 ## Running scripts
 
@@ -195,14 +195,14 @@ With a 3h regen cycle, worst case is 4h lag for stories posted in the
 last hour. Acceptable for "best of HN" view; the swipe deck mostly
 shows older stories anyway.
 
-The CH bulk client lives in `/home/dev/hn-rewrite/ch_client.py`. The
+The CH bulk client lives in `/home/dev/hn-rewrite/main/ch_client.py`. The
 previous per-story parallel Algolia hydration (used for archive seeding
 before 2026-06-26) is preserved in
-`/home/dev/hn-rewrite/scripts/_archive/algolia/` as a fallback if CH
+`/home/dev/hn-rewrite/main/scripts/_archive/algolia/` as a fallback if CH
 becomes unavailable.
 
 ## See also
-- [WORKLOG.md](file:///home/dev/hn-rewrite/WORKLOG.md) — recent changes and operational events
+- [WORKLOG.md](file:///home/dev/hn-rewrite/main/WORKLOG.md) — recent changes and operational events
 
 ## Backup
 
