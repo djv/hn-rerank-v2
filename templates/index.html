@@ -581,9 +581,8 @@
       background: color-mix(in srgb, var(--pico-muted-border-color) 40%, transparent);
     }
 
-    @media (min-width: 641px) {
-      .swipe-side.sidebar-collapsed { display: none; }
-    }
+    .fullscreen .swipe-side { display: none; }
+    .fullscreen .vote-bar { display: none; }
 
     .vote-counts {
       display: flex;
@@ -1928,7 +1927,7 @@
       } else if (key === 'f') { e.preventDefault();
         const panel = document.querySelector('.swipe-side');
         panel.classList.toggle('visible');
-        panel.classList.toggle('sidebar-collapsed');
+        document.body.classList.toggle('fullscreen');
       }
     });
 
