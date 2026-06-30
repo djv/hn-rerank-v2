@@ -366,7 +366,7 @@
       width: fit-content;
       min-width: min(60ch, 100%);
       max-width: 902px;
-      padding: 0.7rem;
+      padding: 0.5rem 0.5rem 0.7rem;
       border-radius: 6px;
       border: 1px solid var(--pico-card-border-color);
       border-left: 7px solid transparent;
@@ -595,10 +595,18 @@
       flex: 1;
       min-height: 0;
     }
+    .fullscreen .swipe-layout {
+      align-items: stretch;
+    }
+    .fullscreen #stories {
+      display: flex;
+      flex-direction: column;
+    }
     .fullscreen .story-card.active {
       height: 100%;
       max-height: 100%;
       overflow: auto;
+      padding-bottom: 0.5rem;
     }
 
     .vote-counts {
