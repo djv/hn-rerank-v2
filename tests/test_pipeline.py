@@ -126,6 +126,109 @@ def test_article_fetch_selection_prioritizes_dashboard_and_filters(db):
     assert [s.id for s in selected] == [1, 2, 5]
 
 
+def _cold_story(
+    sid: int,
+    *,
+    score: int,
+    time_ts: int,
+    source: str = "hn",
+    text_content: str = "story text",
+    comment_count: int | None = 1,
+) -> Story:
+    return Story(
+        id=sid,
+        title=f"Cold {sid}",
+        url=f"https://example.com/{sid}",
+        score=score,
+        time=time_ts,
+        text_content=text_content,
+        source=source,
+        comment_count=comment_count,
+    )
+
+
+def test_build_cold_deck_empty_db(db: Database) -> None:
+    assert pipeline.build_cold_deck(db) == []
+
+
+def test_build_cold_deck_score_order_and_summarizable_filter(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 2_000_000_000
+    monkeypatch.setattr(pipeline.time, "time", lambda: float(now))
+    unsummarizable = _cold_story(
+        1,
+        score=1000,
+        time_ts=now - 3600,
+        text_content="",
+        comment_count=0,
+    )
+    low = _cold_story(2, score=10, time_ts=now - 3600)
+    high = _cold_story(3, score=100, time_ts=now - 3600)
+    for story in (unsummarizable, low, high):
+        db.upsert_story(story)
+
+    cold = pipeline.build_cold_deck(db)
+
+    assert [item.story.id for item in cold] == [3, 2]
+    assert [item.score for item in cold] == [100.0, 10.0]
+
+
+def test_build_cold_deck_combo_keys_and_flags(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 2_000_000_000
+    monkeypatch.setattr(pipeline.time, "time", lambda: float(now))
+    recent_hn = _cold_story(1, score=30, time_ts=now - 3600, source="hn")
+    archive_hn = _cold_story(
+        2,
+        score=20,
+        time_ts=now - (31 * 86400),
+        source=BQ_ARCHIVE_SOURCE,
+    )
+    recent_non_hn = _cold_story(
+        3,
+        score=10,
+        time_ts=now - 3600,
+        source="rss_blog",
+        text_content="rss body",
+        comment_count=0,
+    )
+    recent_non_hn = replace(recent_non_hn, article_body="rss body")
+    for story in (recent_hn, archive_hn, recent_non_hn):
+        db.upsert_story(story)
+
+    cold = pipeline.build_cold_deck(db)
+    by_id = {item.story.id: item for item in cold}
+
+    assert by_id[1].combo_keys == "recent_hn recent_mixed"
+    assert by_id[1].is_recent is True
+    assert by_id[1].is_non_hn is False
+    assert by_id[2].combo_keys == "archive_hn archive_mixed"
+    assert by_id[2].is_recent is False
+    assert by_id[2].is_non_hn is False
+    assert by_id[3].combo_keys == "recent_non-hn recent_mixed"
+    assert by_id[3].is_recent is True
+    assert by_id[3].is_non_hn is True
+
+
+def test_build_cold_deck_uses_badge_defaults(db: Database) -> None:
+    db.upsert_story(_cold_story(1, score=100, time_ts=int(time.time()) - 3600))
+
+    item = pipeline.build_cold_deck(db)[0]
+
+    assert item.best_match_title == ""
+    assert item.prob_down is None
+    assert item.prob_neutral is None
+    assert item.prob_up is None
+    assert item.is_uncertain is False
+    assert item.is_novel is False
+    assert item.is_discussion_rich is False
+    assert item.is_high_engagement is False
+    assert item.is_hot is False
+    assert item.is_similar is False
+
+
 @pytest.fixture(scope="module")
 def embedder():
     # Uses the real downloaded ONNX model

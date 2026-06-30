@@ -896,6 +896,7 @@
   <main class="container swipe-shell">
     <div class="swipe-layout">
       <div id="stories"
+           data-user-id="{{ user_id or 0 }}"
            data-dashboard-version="{{ dashboard_version }}"
            data-current-version="{{ dashboard_latest_version }}">
       {% for item in stories %}
@@ -1057,9 +1058,10 @@
     let refillInFlight = false;
     let queuedRefillAdvance = null;
     let warmPollInFlight = false;
-    let activeWarmVersion = null;
-    let queuedWarmVersion = null;
+    let warmMinVersion = null;
+    let latestWarmTargetVersion = null;
     let lastScheduledWarmVersion = null;
+    const VOTED_STORAGE_LIMIT = 1000;
 
     function cards() {
       return Array.from(storiesContainer.querySelectorAll('.story-card'));
@@ -1279,9 +1281,68 @@
       return window.location.pathname.startsWith('/rewrite') ? '/rewrite/api/feedback' : '/api/feedback';
     }
 
-    function rankingReadyPath(version) {
+    function rankingReadyPath(minVersion, targetVersion) {
       const apiPath = window.location.pathname.startsWith('/rewrite') ? '/rewrite/api/ranking-ready' : '/api/ranking-ready';
-      return `${apiPath}?version=${encodeURIComponent(version)}`;
+      return `${apiPath}?min_version=${encodeURIComponent(minVersion)}&target_version=${encodeURIComponent(targetVersion)}`;
+    }
+
+    function votedStorageKey() {
+      const userId = storiesContainer?.dataset.userId || '0';
+      return `hnRewrite:votedStoryIds:${userId}`;
+    }
+
+    function readStoredVotedStoryIds() {
+      try {
+        const raw = window.localStorage.getItem(votedStorageKey());
+        if (!raw) return [];
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) return [];
+        return parsed
+          .map(value => Number(value))
+          .filter(value => Number.isSafeInteger(value));
+      } catch (err) {
+        console.debug('Unable to read persisted voted story ids', err);
+        return [];
+      }
+    }
+
+    function writeStoredVotedStoryIds() {
+      try {
+        const ids = Array.from(votedStoryIds)
+          .filter(value => Number.isSafeInteger(value))
+          .slice(-VOTED_STORAGE_LIMIT);
+        window.localStorage.setItem(votedStorageKey(), JSON.stringify(ids));
+      } catch (err) {
+        console.debug('Unable to persist voted story ids', err);
+      }
+    }
+
+    function rememberVotedStoryId(storyId) {
+      votedStoryIds.add(storyId);
+      writeStoredVotedStoryIds();
+    }
+
+    function forgetVotedStoryId(storyId) {
+      votedStoryIds.delete(storyId);
+      writeStoredVotedStoryIds();
+    }
+
+    function seedVotedStoryIdsFromStorage() {
+      readStoredVotedStoryIds().forEach(storyId => votedStoryIds.add(storyId));
+      let removedStoredVotes = 0;
+      cards().forEach(card => {
+        const storyId = Number(card.dataset.storyId);
+        if (votedStoryIds.has(storyId)) {
+          card.dataset.voted = 'stored';
+          card.remove();
+          removedStoredVotes += 1;
+        }
+      });
+      if (removedStoredVotes > 0) {
+        console.debug(
+          `removed ${removedStoredVotes} persisted voted card(s) from stale page cache`
+        );
+      }
     }
 
     function waitForVoteRemoval() {
@@ -1308,12 +1369,11 @@
           return;
         }
         lastScheduledWarmVersion = targetVersion;
-        if (activeWarmVersion === null) {
-          activeWarmVersion = targetVersion;
-          runWarmPollLoop();
-        } else {
-          queuedWarmVersion = targetVersion;
+        latestWarmTargetVersion = Math.max(latestWarmTargetVersion || 0, targetVersion);
+        if (warmMinVersion === null) {
+          warmMinVersion = targetVersion;
         }
+        runWarmPollLoop();
         return;
       }
 
@@ -1351,44 +1411,52 @@
       }
       warmPollInFlight = true;
       try {
-        while (activeWarmVersion !== null) {
-          const version = activeWarmVersion;
-          const ready = await waitForRankingReady(version);
-          if (ready) {
+        while (warmMinVersion !== null && latestWarmTargetVersion !== null) {
+          const minVersion = warmMinVersion;
+          const targetVersion = latestWarmTargetVersion;
+          const readyVersion = await waitForRankingReady(minVersion, targetVersion);
+          if (readyVersion !== null) {
             await waitForVoteRemoval();
             queueRefill(false);
+            if (readyVersion >= latestWarmTargetVersion) {
+              warmMinVersion = null;
+              latestWarmTargetVersion = null;
+            } else {
+              warmMinVersion = readyVersion + 1;
+            }
+          } else if (targetVersion === latestWarmTargetVersion) {
+            warmMinVersion = null;
+            latestWarmTargetVersion = null;
           }
-          activeWarmVersion = queuedWarmVersion;
-          queuedWarmVersion = null;
         }
       } finally {
         warmPollInFlight = false;
-        if (activeWarmVersion !== null) {
+        if (warmMinVersion !== null && latestWarmTargetVersion !== null) {
           runWarmPollLoop();
         }
       }
     }
 
-    async function waitForRankingReady(version) {
+    async function waitForRankingReady(minVersion, targetVersion) {
       const startedAt = Date.now();
       let delayMs = 400;
       while (Date.now() - startedAt <= 30000) {
         await new Promise(resolve => window.setTimeout(resolve, delayMs));
         try {
-          const resp = await fetch(rankingReadyPath(version), { cache: 'no-store' });
+          const resp = await fetch(rankingReadyPath(minVersion, targetVersion), { cache: 'no-store' });
           if (!resp.ok) {
             throw new Error(`Ranking readiness failed: ${resp.status}`);
           }
           const data = await resp.json();
-          if (data.ready) {
-            return true;
+          if (data.ready && typeof data.ready_version === 'number') {
+            return data.ready_version;
           }
         } catch (err) {
           console.error('Failed checking ranking readiness', err);
         }
         delayMs = Math.min(delayMs * 2, 2500);
       }
-      return false;
+      return null;
     }
 
     sortTabs.forEach(tab => {
@@ -1627,7 +1695,7 @@
         countApplied: false,
         undone: false,
       };
-      votedStoryIds.add(storyId);
+      rememberVotedStoryId(storyId);
       card.dataset.voted = action;
       document.querySelectorAll('[data-fb]').forEach(btn => {
         btn.classList.toggle('active', btn.dataset.fb === action);
@@ -1669,7 +1737,7 @@
           }
           if (lastVote?.id === vote.id) {
             lastVote = null;
-            votedStoryIds.delete(storyId);
+            forgetVotedStoryId(storyId);
             delete card.dataset.voted;
           }
           showToast('Vote failed to save', 'error');
@@ -1688,7 +1756,7 @@
 
       const { storyId, card } = vote;
       vote.undone = true;
-      votedStoryIds.delete(storyId);
+      forgetVotedStoryId(storyId);
       delete card.dataset.voted;
       decrementVoteCount(vote);
       card.classList.remove('fade-out');
@@ -1856,6 +1924,7 @@
     })();
 
     // Run initial event binding
+    seedVotedStoryIdsFromStorage();
     bindEvents();
     setSort('recommended');
     setAge('recent');
@@ -1866,7 +1935,7 @@
     const storiesEl = document.getElementById('stories');
     const pageVer = storiesEl ? parseInt(storiesEl.dataset.dashboardVersion) : NaN;
     const currVer = storiesEl ? parseInt(storiesEl.dataset.currentVersion) : NaN;
-    if (pageVer && currVer && pageVer < currVer) {
+    if (Number.isFinite(pageVer) && Number.isFinite(currVer) && pageVer < currVer) {
       scheduleDeckRefresh({ waitForWarm: true, targetVersion: currVer, advance: true });
     }
   </script>

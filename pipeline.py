@@ -210,6 +210,8 @@ HOT_MIN_SCORE = 20
 DASHBOARD_QUEUE_SIZE = 12
 PRIMARY_PER_COMBO = 12
 DISCOVERY_PER_BADGE = 2
+COLD_DECK_LIMIT = 500
+COLD_DECK_QUERY_LIMIT = 2000
 BQ_ARCHIVE_SOURCE = "bq_seed"
 BQ_ARCHIVE_CANDIDATE_LIMIT = 2000
 CH_ARCHIVE_SOURCE = "ch_seed"
@@ -219,6 +221,43 @@ LIVE_WINDOW_LIMIT = 2000
 
 def is_hn_source(source: str) -> bool:
     return source in {"hn", BQ_ARCHIVE_SOURCE, CH_ARCHIVE_SOURCE}
+
+
+def _combo_keys_for_story(story: Story, recent_cutoff: int) -> str:
+    age = "recent" if story.time >= recent_cutoff else "archive"
+    source = "hn" if is_hn_source(story.source) else "non-hn"
+    return f"{age}_{source} {age}_mixed"
+
+
+def build_cold_deck(db: Database) -> list[RankedStory]:
+    """Build a global score-sorted fallback deck from existing SQLite rows."""
+    rows = db.execute(
+        "SELECT id, title, url, score, time, text_content, source, comment_count, "
+        "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
+        "FROM stories "
+        "ORDER BY score DESC, time DESC "
+        "LIMIT ?",
+        (COLD_DECK_QUERY_LIMIT,),
+    )
+    stories = [Database._row_to_story(row) for row in rows]
+    recent_cutoff = int(time.time()) - (30 * 86400)
+    cold: list[RankedStory] = []
+    for story in stories:
+        if not is_summarizable(story):
+            continue
+        cold.append(
+            RankedStory(
+                story=story,
+                score=float(story.score),
+                best_match_title="",
+                is_non_hn=(not is_hn_source(story.source)),
+                is_recent=(story.time >= recent_cutoff),
+                combo_keys=_combo_keys_for_story(story, recent_cutoff),
+            )
+        )
+        if len(cold) >= COLD_DECK_LIMIT:
+            break
+    return cold
 
 
 def _needs_hn_prewarm(s: Story) -> bool:
@@ -2845,6 +2884,7 @@ def generate_dashboard_bytes(
         stories=ranked,
         server_port=config.server_port,
         pico_css=pico_css,
+        user_id=user_id,
         user_token=user_token,
         vote_count_up=vote_counts["up"],
         vote_count_neutral=vote_counts["neutral"],

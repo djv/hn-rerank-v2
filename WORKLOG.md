@@ -5,6 +5,34 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-30 — Cold deck fallback for no-cache dashboard loads
+
+**Problem.** A user with no rendered dashboard cache still received the
+skeleton page while the personalized SVM render warmed in the background.
+That made cold restarts and cache evictions feel blank even though the local
+SQLite database already had enough scored stories to show immediately.
+
+**Fix.**
+- Added `pipeline.build_cold_deck(db)`: a score-sorted global fallback deck
+  capped at 500 summarizable stories. It emits normal `RankedStory` rows with
+  source/age combo keys and no personalized discovery badges.
+- `Handler._render_dashboard_for_user()` now serves exact cache first, stale
+  cache second, then the cold deck with `dashboard_version=0` and the user's
+  latest version in `dashboard_latest_version`; it still schedules the
+  personalized warm render. The skeleton remains only when the cold deck is
+  empty.
+- The server builds the cold deck once at startup and rebuilds it after every
+  successful regen before bumping dashboard versions.
+- The startup stale-page check now uses `Number.isFinite(...)` so version `0`
+  cold HTML correctly triggers warm polling when the latest user version is
+  newer.
+
+**Files**: `pipeline.py`, `server.py`, `templates/index.html`,
+`tests/test_pipeline.py`, `tests/test_server.py`, `ARCHITECTURE.md`,
+`WORKLOG.md`.
+
+---
+
 ## 2026-06-29 — Warm polling uses completed decks, not timer fallback
 
 **Problem.** The 3s SWR fallback commit made `waitForRankingReady()` return
@@ -5170,6 +5198,43 @@ thread.
 
 **Files**: `config.toml` (2 added keys, 4 comment lines),
 `WORKLOG.md` (this entry).
+
+---
+
+## 2026-06-30 — Vote refresh drain and stale reload suppression
+
+**Problem.** Rapid vote bursts could leave the browser waiting for the
+latest target dashboard version even when an intermediate warmed cache was
+already ready to render. A reload before the server warm completed could
+also serve pre-vote SWR HTML and re-show stories the browser had just voted
+on.
+
+**Fix.**
+1. `/api/ranking-ready` now accepts `min_version` plus optional
+   `target_version` while keeping `version` as a compatibility alias. It
+   reports `ready_version` for any cached dashboard at or above the minimum
+   useful version, and still triggers warming toward the latest/current
+   version when the cache is behind.
+2. The client warm loop now tracks the earliest useful version separately
+   from the latest requested target. It refills as soon as any useful cache
+   version is ready, then keeps polling only if newer vote versions still
+   need warming.
+3. The client persists voted story IDs in per-user `localStorage` and seeds
+   `votedStoryIds` on load before selecting the first card. Stale cached
+   pages and stale refill fetches now suppress stories voted by that browser
+   immediately, while SQLite feedback remains authoritative for ranking.
+
+**Verification.**
+- `uv run python -m pytest tests/test_server.py -q` = 94 passed.
+- `uv run python -m pytest tests/ -n 4` = 422 passed, 1 skipped,
+  1 existing leakage-smoke failure:
+  `tests/test_eval_ranker_variants.py::test_leak_check_smoke`
+  (`shuffled/raw ratio = 0.551`, threshold `< 0.5`).
+- `uv run ruff check .` = clean.
+- `uv run ty check` = clean.
+
+**Files**: `server.py`, `templates/index.html`, `pipeline.py`,
+`tests/test_server.py`, `ARCHITECTURE.md`, `WORKLOG.md`.
 
 ---
 

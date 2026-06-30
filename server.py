@@ -25,7 +25,7 @@ import httpx
 
 from dataclasses import dataclass, replace
 from database import Database, User
-from pipeline import Config, Embedder, is_hn_source
+from pipeline import Config, Embedder, RankedStory, is_hn_source
 from reddit_limiter import limiter as reddit_limiter
 from http_fetch import fetch_with_urllib_fallback
 
@@ -565,6 +565,7 @@ class Handler(BaseHTTPRequestHandler):
     _dashboard_cache: dict[str, tuple[bytes, float, int]] = {}
     _dashboard_versions: dict[int, int] = {}
     _dashboard_versions_guard = threading.Lock()
+    _cold_stories: list[RankedStory] = []
     _render_locks: dict[int, threading.Lock] = {}
     _render_locks_guard = threading.Lock()
     _warmup_requested_versions: dict[int, int] = {}
@@ -683,7 +684,32 @@ class Handler(BaseHTTPRequestHandler):
             cls._trigger_warm(user, expected_version)
             return cached[0]
 
-        # No cache → return skeleton, trigger warm
+        # No per-user cache → render the global cold deck, then warm the
+        # personalized version in the background.
+        cold_stories = cls._cold_stories
+        if cold_stories:
+            from pipeline import generate_dashboard_bytes
+
+            html = generate_dashboard_bytes(
+                cold_stories,
+                cls.config,
+                cls.db,
+                user.id,
+                user.token,
+                dashboard_version=0,
+                dashboard_latest_version=cls._dashboard_version(user.id),
+            )
+            logging.info(
+                "dashboard_render user_id=%s version=%s result=cold_deck stories=%s elapsed_ms=%.1f",
+                user.id,
+                expected_version,
+                len(cold_stories),
+                (time.perf_counter() - request_start) * 1000,
+            )
+            cls._trigger_warm(user, expected_version)
+            return html
+
+        # No cache and no cold deck → return skeleton, trigger warm
         logging.info(
             "dashboard_render user_id=%s version=%s result=skeleton elapsed_ms=%.1f",
             user.id,
@@ -909,6 +935,14 @@ class Handler(BaseHTTPRequestHandler):
             len(cls._dashboard_versions),
         )
 
+    @classmethod
+    def _rebuild_cold_deck(cls) -> None:
+        from pipeline import build_cold_deck
+
+        cold_stories = build_cold_deck(cls.db)
+        cls._cold_stories = cold_stories
+        logging.info("cold_deck_rebuilt stories=%s", len(cold_stories))
+
     def do_POST(self) -> None:
         if self.path == "/api/feedback":
             self._handle_feedback()
@@ -984,13 +1018,33 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         query = parse_qs(urlparse(self.path).query)
-        raw_versions = query.get("version", [])
+        raw_min_versions = query.get("min_version", [])
+        raw_legacy_versions = query.get("version", [])
+        if raw_min_versions and raw_legacy_versions:
+            self._json_response({"error": "Invalid version"}, status=400)
+            return
+        raw_versions = raw_min_versions or raw_legacy_versions
         if len(raw_versions) != 1:
             self._json_response({"error": "Invalid version"}, status=400)
             return
 
         try:
-            target_version = int(raw_versions[0])
+            min_version = int(raw_versions[0])
+        except ValueError:
+            self._json_response({"error": "Invalid version"}, status=400)
+            return
+        if min_version < 0:
+            self._json_response({"error": "Invalid version"}, status=400)
+            return
+
+        raw_target_versions = query.get("target_version", [])
+        if len(raw_target_versions) > 1:
+            self._json_response({"error": "Invalid version"}, status=400)
+            return
+        try:
+            target_version = (
+                int(raw_target_versions[0]) if raw_target_versions else min_version
+            )
         except ValueError:
             self._json_response({"error": "Invalid version"}, status=400)
             return
@@ -1001,14 +1055,20 @@ class Handler(BaseHTTPRequestHandler):
         current_version = self._dashboard_version(user.id)
         cached = self._dashboard_cache.get(f"dashboard_{user.id}")
         cached_version = cached[2] if cached is not None else None
-        ready = cached is not None and cached[2] >= target_version
-        if not ready and current_version >= target_version:
-            self._trigger_warm(user, current_version)
+        ready = cached is not None and cached[2] >= min_version
+        ready_version = cached_version if ready else None
+        warm_version = current_version
+        if (cached_version is None or cached_version < warm_version) and (
+            current_version >= min_version
+        ):
+            self._trigger_warm(user, warm_version)
 
         self._json_response(
             {
                 "ok": True,
                 "ready": ready,
+                "ready_version": ready_version,
+                "min_version": min_version,
                 "target_version": target_version,
                 "current_version": current_version,
                 "cached_version": cached_version,
@@ -1257,6 +1317,7 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
             from pipeline import fetch_candidates_only
 
             asyncio.run(fetch_candidates_only(config, db, embedder=embedder))
+            Handler._rebuild_cold_deck()
             Handler._bump_all_cached_versions()
             logging.info("Regeneration complete.")
         except Exception as e:
@@ -1281,6 +1342,7 @@ def main() -> None:
     Handler.db = db
     Handler.embedder = embedder
     Handler.regen_event = regen_event
+    Handler._rebuild_cold_deck()
 
     # Start regen thread
     t = threading.Thread(target=regen_loop, args=(config, regen_event, db), daemon=True)

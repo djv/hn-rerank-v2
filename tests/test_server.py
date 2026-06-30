@@ -11,7 +11,7 @@ from hypothesis import HealthCheck, given, settings, strategies as st
 from typing import Any
 
 from server import Handler, SKELETON_HTML
-from pipeline import Config, Embedder
+from pipeline import Config, Embedder, RankedStory
 from database import Database, Story
 
 import numpy as np
@@ -105,6 +105,7 @@ def _start_handler_server(
     TestHandler.regen_event = regen_event
     TestHandler._dashboard_cache = {}
     TestHandler._dashboard_versions = {}
+    TestHandler._cold_stories = []
     TestHandler._render_locks = {}
     _reset_warm_state(TestHandler)
 
@@ -616,6 +617,8 @@ def test_ranking_ready_false_when_cache_missing_or_older(test_env, monkeypatch) 
     assert missing_resp.json() == {
         "ok": True,
         "ready": False,
+        "ready_version": None,
+        "min_version": target_version,
         "target_version": target_version,
         "current_version": target_version,
         "cached_version": None,
@@ -661,6 +664,8 @@ def test_ranking_ready_true_only_from_cached_version(test_env, monkeypatch) -> N
     assert resp.json() == {
         "ok": True,
         "ready": True,
+        "ready_version": target_version,
+        "min_version": target_version,
         "target_version": target_version,
         "current_version": target_version,
         "cached_version": target_version,
@@ -684,7 +689,65 @@ def test_ranking_ready_true_for_older_requested_version(test_env) -> None:
 
     assert resp.status_code == 200
     assert resp.json()["ready"] is True
+    assert resp.json()["ready_version"] == newer_version
+    assert resp.json()["min_version"] == newer_version - 1
     assert resp.json()["cached_version"] == newer_version
+
+
+def test_ranking_ready_returns_intermediate_cached_version(
+    test_env, monkeypatch
+) -> None:
+    port, _, _, handler, user = test_env
+    calls: list[tuple[int, int]] = []
+
+    def fake_trigger_warm(cls, warm_user, version: int) -> None:
+        calls.append((warm_user.id, version))
+
+    monkeypatch.setattr(handler, "_trigger_warm", classmethod(fake_trigger_warm))
+    for expected_version in (1, 2, 3):
+        assert handler._invalidate_dashboard_cache(user.id) == expected_version
+    handler._dashboard_cache[f"dashboard_{user.id}"] = (
+        b"intermediate",
+        time.time(),
+        2,
+    )
+
+    resp = httpx.get(
+        f"http://127.0.0.1:{port}/api/ranking-ready?min_version=1&target_version=3",
+        cookies={"hn_token": user.token},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "ok": True,
+        "ready": True,
+        "ready_version": 2,
+        "min_version": 1,
+        "target_version": 3,
+        "current_version": 3,
+        "cached_version": 2,
+    }
+    assert calls == [(user.id, 3)]
+
+
+def test_ranking_ready_version_param_remains_compat_alias(test_env) -> None:
+    port, _, _, handler, user = test_env
+    target_version = handler._invalidate_dashboard_cache(user.id)
+    handler._dashboard_cache[f"dashboard_{user.id}"] = (
+        b"fresh",
+        time.time(),
+        target_version,
+    )
+
+    resp = httpx.get(
+        f"http://127.0.0.1:{port}/api/ranking-ready?version={target_version}",
+        cookies={"hn_token": user.token},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["ready"] is True
+    assert resp.json()["ready_version"] == target_version
+    assert resp.json()["min_version"] == target_version
 
 
 def _wait_for_cache(handler, user, expected_version, timeout=3.0):
@@ -711,6 +774,7 @@ def test_dashboard_cache_uses_feedback_versions(test_env, mock_embedder, monkeyp
     TestHandler.embedder = mock_embedder
     TestHandler._dashboard_cache = {}
     TestHandler._dashboard_versions = {}
+    TestHandler._cold_stories = []
     TestHandler._render_locks = {}
     _reset_warm_state(TestHandler)
 
@@ -761,6 +825,78 @@ def test_dashboard_cache_uses_feedback_versions(test_env, mock_embedder, monkeyp
     assert len(calls) == 2
 
 
+def test_no_cache_user_gets_cold_deck_and_warm_is_scheduled(
+    test_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, db, _, handler, user = test_env
+    story = Story(
+        id=991,
+        title="Cold fallback",
+        url="https://example.com/cold",
+        score=99,
+        time=int(time.time()) - 3600,
+        text_content="Cold fallback body",
+        source="hn",
+        comment_count=1,
+    )
+    cold = [
+        RankedStory(
+            story=story,
+            score=99.0,
+            best_match_title="",
+            is_recent=True,
+            combo_keys="recent_hn recent_mixed",
+        )
+    ]
+    calls: list[tuple[int, int]] = []
+    rendered: list[dict[str, object]] = []
+    handler._dashboard_cache = {}
+    handler._dashboard_versions = {user.id: 3}
+    handler._cold_stories = cold
+
+    def fake_generate_dashboard_bytes(
+        ranked: list[RankedStory],
+        config: Config,
+        database: Database,
+        user_id: int | None,
+        user_token: str | None,
+        **kwargs: object,
+    ) -> bytes:
+        rendered.append(
+            {
+                "ranked": ranked,
+                "user_id": user_id,
+                "user_token": user_token,
+                **kwargs,
+            }
+        )
+        return b"cold html"
+
+    def fake_trigger_warm(cls, warm_user, version: int) -> None:
+        calls.append((warm_user.id, version))
+
+    import pipeline
+
+    monkeypatch.setattr(
+        pipeline, "generate_dashboard_bytes", fake_generate_dashboard_bytes
+    )
+    monkeypatch.setattr(handler, "_trigger_warm", classmethod(fake_trigger_warm))
+
+    html = handler._render_dashboard_for_user(user)
+
+    assert html == b"cold html"
+    assert calls == [(user.id, 3)]
+    assert rendered == [
+        {
+            "ranked": cold,
+            "user_id": user.id,
+            "user_token": user.token,
+            "dashboard_version": 0,
+            "dashboard_latest_version": 3,
+        }
+    ]
+
+
 def test_stale_warm_render_does_not_overwrite_current_cache(
     test_env, mock_embedder, monkeypatch
 ):
@@ -774,6 +910,7 @@ def test_stale_warm_render_does_not_overwrite_current_cache(
     TestHandler.embedder = mock_embedder
     TestHandler._dashboard_cache = {}
     TestHandler._dashboard_versions = {}
+    TestHandler._cold_stories = []
     TestHandler._render_locks = {}
     _reset_warm_state(TestHandler)
 
@@ -831,6 +968,7 @@ def test_active_warm_commits_when_dashboard_version_advances(
     TestHandler.embedder = mock_embedder
     TestHandler._dashboard_cache = {}
     TestHandler._dashboard_versions = {}
+    TestHandler._cold_stories = []
     TestHandler._render_locks = {}
     _reset_warm_state(TestHandler)
 
@@ -886,6 +1024,7 @@ def test_active_warm_after_lock_wait_still_ranks_and_commits(
     TestHandler.embedder = mock_embedder
     TestHandler._dashboard_cache = {}
     TestHandler._dashboard_versions = {}
+    TestHandler._cold_stories = []
     TestHandler._render_locks = {}
     _reset_warm_state(TestHandler)
 
@@ -937,6 +1076,7 @@ def test_rapid_vote_warms_coalesce_to_latest_version(
     TestHandler.embedder = mock_embedder
     TestHandler._dashboard_cache = {}
     TestHandler._dashboard_versions = {}
+    TestHandler._cold_stories = []
     TestHandler._render_locks = {}
     _reset_warm_state(TestHandler, debounce_s=0.05)
 
@@ -984,6 +1124,7 @@ def test_warm_loops_to_newer_version_requested_while_ranking(
     TestHandler.embedder = mock_embedder
     TestHandler._dashboard_cache = {}
     TestHandler._dashboard_versions = {}
+    TestHandler._cold_stories = []
     TestHandler._render_locks = {}
     _reset_warm_state(TestHandler)
 
@@ -1069,6 +1210,7 @@ def test_dashboard_cache_version_invariant_property(
     TestHandler.embedder = mock_embedder
     TestHandler._dashboard_cache = {}
     TestHandler._dashboard_versions = {}
+    TestHandler._cold_stories = []
     TestHandler._render_locks = {}
     _reset_warm_state(TestHandler)
 
@@ -2242,6 +2384,7 @@ def swr_handler(test_env, mock_embedder):
     SwrHandler.embedder = mock_embedder
     SwrHandler._dashboard_cache = {}
     SwrHandler._dashboard_versions = {}
+    SwrHandler._cold_stories = []
     SwrHandler._render_locks = {}
     _reset_warm_state(SwrHandler)
 
@@ -2516,17 +2659,25 @@ def test_inline_script_has_voted_story_ids_filter():
     stale-hit returns the pre-vote HTML, refillQueue suppresses any incoming
     card whose storyId is in the session-scoped voted set.
     """
-    _, inline_script = _read_template_and_static()
+    template, inline_script = _read_template_and_static()
     assert "votedStoryIds = new Set()" in inline_script
+    assert 'data-user-id="{{ user_id or 0 }}"' in template
+    assert "function seedVotedStoryIdsFromStorage()" in inline_script
+    assert "readStoredVotedStoryIds().forEach" in inline_script
+    assert "card.dataset.voted = 'stored'" in inline_script
+    assert "card.remove()" in inline_script
+    assert "seedVotedStoryIdsFromStorage();" in inline_script
     # submitVote adds to the set; undoLastVote removes from it
     submit_vote_block = inline_script.split("function submitVote(", 1)[1].split(
         "function ", 1
     )[0]
-    assert "votedStoryIds.add(storyId)" in submit_vote_block
+    assert "rememberVotedStoryId(storyId)" in submit_vote_block
     undo_block = inline_script.split("function undoLastVote()", 1)[1].split(
         "function ", 1
     )[0]
-    assert "votedStoryIds.delete(storyId)" in undo_block
+    assert "forgetVotedStoryId(storyId)" in undo_block
+    assert "hnRewrite:votedStoryIds:${userId}" in inline_script
+    assert "window.localStorage.setItem" in inline_script
     # refillQueue must skip incoming cards whose id is in the set
     refill_block = inline_script.split("function refillQueue(", 1)[1].split(
         "function ", 1
@@ -2540,7 +2691,7 @@ def test_inline_script_has_voted_story_ids_filter():
     submit_catch = inline_script.split("Network error submitting feedback", 1)[1].split(
         ".finally", 1
     )[0]
-    assert "votedStoryIds.delete(storyId)" in submit_catch
+    assert "forgetVotedStoryId(storyId)" in submit_catch
     assert "delete card.dataset.voted" in submit_catch
 
 
@@ -2617,7 +2768,7 @@ def test_failed_vote_clears_last_vote_only_when_current() -> None:
         "showToast", 1
     )[0]
     assert "lastVote = null" in guarded_block
-    assert "votedStoryIds.delete(storyId)" in guarded_block
+    assert "forgetVotedStoryId(storyId)" in guarded_block
     assert "delete card.dataset.voted" in guarded_block
 
 
@@ -2629,7 +2780,7 @@ def test_stale_failed_vote_handler_does_not_remove_newer_vote_state() -> None:
     )[0]
     submit_catch = submit_vote_block.split("Network error submitting feedback", 1)[1]
     pre_guard = submit_catch.split("if (lastVote?.id === vote.id)", 1)[0]
-    assert "votedStoryIds.delete(storyId)" not in pre_guard
+    assert "forgetVotedStoryId(storyId)" not in pre_guard
     assert "delete card.dataset.voted" not in pre_guard
 
 
@@ -2696,11 +2847,11 @@ def test_ready_gated_refill_uses_non_advancing_refill() -> None:
     block = inline_script.split("async function runWarmPollLoop()", 1)[1].split(
         "async function waitForRankingReady", 1
     )[0]
-    assert "const ready = await waitForRankingReady(version)" in block
+    assert "const readyVersion = await waitForRankingReady(minVersion, targetVersion)" in block
     assert "await waitForVoteRemoval()" in block
     assert "queueRefill(false)" in block
-    assert "activeWarmVersion = queuedWarmVersion" in block
-    assert "queuedWarmVersion = null" in block
+    assert "warmMinVersion = readyVersion + 1" in block
+    assert "latestWarmTargetVersion = null" in block
 
 
 def test_ready_gated_refill_drains_active_before_queued_version() -> None:
@@ -2710,17 +2861,18 @@ def test_ready_gated_refill_drains_active_before_queued_version() -> None:
     )[0]
     assert "lastScheduledWarmVersion" in schedule_block
     assert "targetVersion <= lastScheduledWarmVersion" in schedule_block
-    assert "activeWarmVersion === null" in schedule_block
-    assert "activeWarmVersion = targetVersion" in schedule_block
-    assert "queuedWarmVersion = targetVersion" in schedule_block
+    assert "latestWarmTargetVersion = Math.max" in schedule_block
+    assert "warmMinVersion === null" in schedule_block
+    assert "warmMinVersion = targetVersion" in schedule_block
 
     loop_block = inline_script.split("async function runWarmPollLoop()", 1)[1].split(
         "async function waitForRankingReady", 1
     )[0]
-    assert "while (activeWarmVersion !== null)" in loop_block
-    assert "const version = activeWarmVersion" in loop_block
+    assert "while (warmMinVersion !== null && latestWarmTargetVersion !== null)" in loop_block
+    assert "const minVersion = warmMinVersion" in loop_block
+    assert "const targetVersion = latestWarmTargetVersion" in loop_block
     assert "queueRefill(false)" in loop_block
-    assert "activeWarmVersion = queuedWarmVersion" in loop_block
+    assert "if (readyVersion >= latestWarmTargetVersion)" in loop_block
 
 
 def test_waitForRankingReady_poll_is_not_aborted_by_newer_warm() -> None:
@@ -2728,10 +2880,11 @@ def test_waitForRankingReady_poll_is_not_aborted_by_newer_warm() -> None:
     block = inline_script.split("async function waitForRankingReady(", 1)[1].split(
         "sortTabs.forEach", 1
     )[0]
-    assert "rankingReadyPath(version)" in block
+    assert "rankingReadyPath(minVersion, targetVersion)" in block
     assert "latestWarmVersionSeen" not in block
     assert "lastScheduledWarmVersion" not in block
-    assert "activeWarmVersion" not in block
+    assert "activeWarmVersion" not in inline_script
+    assert "queuedWarmVersion" not in inline_script
 
 
 def test_waitForRankingReady_has_no_timer_success_fallback() -> None:
@@ -2740,9 +2893,9 @@ def test_waitForRankingReady_has_no_timer_success_fallback() -> None:
         "sortTabs.forEach", 1
     )[0]
     assert "> 3000" not in block
-    assert "return true" in block
-    assert "if (data.ready)" in block
-    assert "if (data.ready) {\n            return true;" in block
+    assert "return data.ready_version" in block
+    assert "if (data.ready && typeof data.ready_version === 'number')" in block
+    assert "typeof data.ready_version === 'number'" in block
 
 
 def test_waitForRankingReady_timeout_does_not_refill() -> None:
@@ -2750,11 +2903,21 @@ def test_waitForRankingReady_timeout_does_not_refill() -> None:
     block = inline_script.split("async function waitForRankingReady(", 1)[1].split(
         "sortTabs.forEach", 1
     )[0]
-    assert "rankingReadyPath(version)" in block
+    assert "rankingReadyPath(minVersion, targetVersion)" in block
     assert "Date.now() - startedAt <= 30000" in block
-    assert "return false" in block
+    assert "return null" in block
     assert "refillQueue" not in block
     assert "queueRefill" not in block
+
+
+def test_stale_page_check_treats_version_zero_as_finite() -> None:
+    _, inline_script = _read_template_and_static()
+    block = inline_script.split(
+        "// If the page was served from a stale cache", 1
+    )[1].split("</script>", 1)[0]
+    assert "Number.isFinite(pageVer)" in block
+    assert "Number.isFinite(currVer)" in block
+    assert "pageVer && currVer" not in block
 
 
 def test_refillQueue_reorders_deterministic_modes_only() -> None:
