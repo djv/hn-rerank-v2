@@ -97,14 +97,14 @@
     .queue-pill {
       display: block;
       margin-bottom: 0.65rem;
-      padding: 0.35rem 0.45rem;
+      padding: 0.45rem;
       border: 1px solid var(--pico-muted-border-color);
       border-radius: 4px;
       background: var(--pico-card-background-color);
       line-height: 1.25;
     }
     .queue-pill--bar {
-      padding: 0.4rem 0.45rem;
+      padding: 0.45rem;
     }
 
     .toast {
@@ -149,7 +149,7 @@
     .sort-tab {
       width: 100%;
       margin: 0;
-      padding: 0.4rem 0.6rem;
+      padding: 0.6rem;
       border-radius: 6px;
       font-size: 0.85rem;
       font-weight: 500;
@@ -184,7 +184,7 @@
     .age-tab {
       flex: 1;
       margin: 0;
-      padding: 0.35rem 0.3rem;
+      padding: 0.3rem;
       border-radius: 0;
       font-size: 0.75rem;
       font-weight: 500;
@@ -227,7 +227,7 @@
     .source-tab {
       flex: 1;
       margin: 0;
-      padding: 0.35rem 0.3rem;
+      padding: 0.3rem;
       border-radius: 0;
       font-size: 0.75rem;
       font-weight: 500;
@@ -366,7 +366,7 @@
       width: fit-content;
       min-width: min(60ch, 100%);
       max-width: 902px;
-      padding: 0.55rem 0.7rem 0.65rem 0.7rem;
+      padding: 0.7rem;
       border-radius: 6px;
       border: 1px solid var(--pico-card-border-color);
       border-left: 7px solid transparent;
@@ -584,6 +584,22 @@
 
     .fullscreen .swipe-side { display: none; }
     .fullscreen .vote-bar { display: none; }
+    .fullscreen .swipe-shell {
+      height: calc(100vh - 1rem);
+      height: calc(100dvh - 1rem);
+      display: flex;
+      flex-direction: column;
+    }
+    .fullscreen .swipe-layout,
+    .fullscreen #stories {
+      flex: 1;
+      min-height: 0;
+    }
+    .fullscreen .story-card.active {
+      height: 100%;
+      max-height: 100%;
+      overflow: auto;
+    }
 
     .vote-counts {
       display: flex;
@@ -885,7 +901,7 @@
       }
       .story-card.active {
         max-height: 100%;
-        padding-bottom: 0.65rem;
+        padding-bottom: 0.7rem;
       }
 
       .vote-counts { display: none; }

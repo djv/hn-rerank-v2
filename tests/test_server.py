@@ -2220,6 +2220,7 @@ def test_keydown_uses_letter_keys():
     # open article / open comments keys present
     assert "key === 'o'" in static
     assert "key === 'c'" in static
+    assert "document.body.classList.toggle('fullscreen')" in static
     assert "open article" in template.lower()
     assert "open comments" in template.lower()
     assert "data-article-url" in template
@@ -2229,6 +2230,8 @@ def test_keydown_uses_letter_keys():
     assert "width: fit-content" in template
     assert "max-width: 902px" in template
     assert "max-width: none" in template
+    story_card_block = template.split(".story-card {", 1)[1].split("}", 1)[0]
+    assert "padding: 0.7rem;" in story_card_block
     # page never scrolls — overflow hidden on html and body
     assert "html {\n      overflow: hidden;\n    }" in template
     assert "overflow: hidden;" in template.split("body {")[1].split("}")[0]
@@ -2265,6 +2268,27 @@ def test_keydown_uses_letter_keys():
     assert "sticky" not in side_block
     # layout uses flex-start, not stretch
     assert "align-items: flex-start" in template
+    # fullscreen hides side controls and lets the active card fill viewport height
+    assert ".fullscreen .swipe-side { display: none; }" in template
+    assert ".fullscreen .vote-bar { display: none; }" in template
+    fullscreen_shell_block = template.split(".fullscreen .swipe-shell {", 1)[
+        1
+    ].split("}", 1)[0]
+    assert "height: calc(100vh - 1rem);" in fullscreen_shell_block
+    assert "height: calc(100dvh - 1rem);" in fullscreen_shell_block
+    assert "display: flex;" in fullscreen_shell_block
+    assert "flex-direction: column;" in fullscreen_shell_block
+    fullscreen_flex_block = template.split(
+        ".fullscreen .swipe-layout,\n    .fullscreen #stories {", 1
+    )[1].split("}", 1)[0]
+    assert "flex: 1;" in fullscreen_flex_block
+    assert "min-height: 0;" in fullscreen_flex_block
+    fullscreen_active_block = template.split(".fullscreen .story-card.active {", 1)[
+        1
+    ].split("}", 1)[0]
+    assert "height: 100%;" in fullscreen_active_block
+    assert "max-height: 100%;" in fullscreen_active_block
+    assert "overflow: auto;" in fullscreen_active_block
     # mobile side-rail stack (column, keys hidden)
     assert ".swipe-keys { display: none; }" in template
     assert "width: 100%;" in template
@@ -2286,7 +2310,7 @@ def test_keydown_uses_letter_keys():
     mobile_active_block = template.split(
         ".story-card.active {\n        max-height: 100%;", 1
     )[1].split("}", 1)[0]
-    assert "padding-bottom: 0.65rem;" in mobile_active_block
+    assert "padding-bottom: 0.7rem;" in mobile_active_block
     assert "padding-bottom: 6rem;" not in mobile_active_block
     # global vote bar at the bottom of the viewport
     assert (
@@ -2314,6 +2338,21 @@ def test_keydown_uses_letter_keys():
     assert ".sort-tab.active {\n      background: var(--pico-primary);" in template
     assert ".age-tab.active {\n      background: #6c757d;" in template
     assert ".source-tab.active {\n      background: #6c757d;" in template
+    assert "padding: 0.45rem;" in template.split(".queue-pill {", 1)[1].split(
+        "}", 1
+    )[0]
+    assert "padding: 0.45rem;" in template.split(".queue-pill--bar {", 1)[1].split(
+        "}", 1
+    )[0]
+    assert "padding: 0.6rem;" in template.split(".sort-tab {", 1)[1].split(
+        "}", 1
+    )[0]
+    assert "padding: 0.3rem;" in template.split(".age-tab {", 1)[1].split(
+        "}", 1
+    )[0]
+    assert "padding: 0.3rem;" in template.split(".source-tab {", 1)[1].split(
+        "}", 1
+    )[0]
     # feedback button has filled, shadowed style
     assert "box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);" in template
     # click handler no longer passes null card

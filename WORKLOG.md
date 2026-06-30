@@ -5,6 +5,18 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-30 — Normalize card padding and desktop fullscreen height
+
+Card-like dashboard surfaces now use matching vertical and horizontal padding:
+story cards, queue pills, sort tabs, age tabs, and source tabs. Desktop
+fullscreen keeps the existing centered card width but makes the swipe shell,
+layout, stories column, and active story card fill the available viewport
+height when toggled with `f`.
+
+**Files:** `templates/index.html`, `tests/test_server.py`, `WORKLOG.md`.
+
+---
+
 ## 2026-06-30 — Mobile story card vote-bar clearance
 
 Mobile story cards no longer carry extra blank bottom padding to clear the
