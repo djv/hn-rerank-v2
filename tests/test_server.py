@@ -839,6 +839,8 @@ def test_no_cache_user_gets_cold_deck_and_warm_is_scheduled(
         source="hn",
         comment_count=1,
     )
+    db.upsert_story(story)
+    db.upsert_feedback(user.id, 991, "up")
     cold = [
         RankedStory(
             story=story,
@@ -895,6 +897,60 @@ def test_no_cache_user_gets_cold_deck_and_warm_is_scheduled(
             "dashboard_latest_version": 3,
         }
     ]
+
+
+def test_no_cache_zero_feedback_user_gets_cold_deck_no_warm(
+    test_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cold deck for a 0-feedback user — instant, no redundant warm."""
+    _, db, _, handler, user = test_env
+    cold = [
+        RankedStory(
+            story=Story(
+                id=992,
+                title="Cold zero",
+                url="https://example.com/cold0",
+                score=50,
+                time=int(time.time()) - 3600,
+                text_content="body",
+                source="hn",
+                comment_count=1,
+            ),
+            score=50.0,
+            best_match_title="",
+            is_recent=True,
+            combo_keys="recent_hn recent_mixed",
+        )
+    ]
+    calls: list[tuple[int, int]] = []
+    handler._dashboard_cache = {}
+    handler._dashboard_versions = {user.id: 0}
+    handler._cold_stories = cold
+
+    def fake_generate_dashboard_bytes(
+        ranked: list[RankedStory],
+        config: Config,
+        database: Database,
+        user_id: int | None,
+        user_token: str | None,
+        **kwargs: object,
+    ) -> bytes:
+        return b"cold html"
+
+    def fake_trigger_warm(cls, warm_user, version: int) -> None:
+        calls.append((warm_user.id, version))
+
+    import pipeline
+
+    monkeypatch.setattr(
+        pipeline, "generate_dashboard_bytes", fake_generate_dashboard_bytes
+    )
+    monkeypatch.setattr(handler, "_trigger_warm", classmethod(fake_trigger_warm))
+
+    html = handler._render_dashboard_for_user(user)
+
+    assert html == b"cold html"
+    assert calls == []
 
 
 def test_stale_warm_render_does_not_overwrite_current_cache(
@@ -2847,7 +2903,10 @@ def test_ready_gated_refill_uses_non_advancing_refill() -> None:
     block = inline_script.split("async function runWarmPollLoop()", 1)[1].split(
         "async function waitForRankingReady", 1
     )[0]
-    assert "const readyVersion = await waitForRankingReady(minVersion, targetVersion)" in block
+    assert (
+        "const readyVersion = await waitForRankingReady(minVersion, targetVersion)"
+        in block
+    )
     assert "await waitForVoteRemoval()" in block
     assert "queueRefill(false)" in block
     assert "warmMinVersion = readyVersion + 1" in block
@@ -2868,7 +2927,10 @@ def test_ready_gated_refill_drains_active_before_queued_version() -> None:
     loop_block = inline_script.split("async function runWarmPollLoop()", 1)[1].split(
         "async function waitForRankingReady", 1
     )[0]
-    assert "while (warmMinVersion !== null && latestWarmTargetVersion !== null)" in loop_block
+    assert (
+        "while (warmMinVersion !== null && latestWarmTargetVersion !== null)"
+        in loop_block
+    )
     assert "const minVersion = warmMinVersion" in loop_block
     assert "const targetVersion = latestWarmTargetVersion" in loop_block
     assert "queueRefill(false)" in loop_block
@@ -2912,9 +2974,9 @@ def test_waitForRankingReady_timeout_does_not_refill() -> None:
 
 def test_stale_page_check_treats_version_zero_as_finite() -> None:
     _, inline_script = _read_template_and_static()
-    block = inline_script.split(
-        "// If the page was served from a stale cache", 1
-    )[1].split("</script>", 1)[0]
+    block = inline_script.split("// If the page was served from a stale cache", 1)[
+        1
+    ].split("</script>", 1)[0]
     assert "Number.isFinite(pageVer)" in block
     assert "Number.isFinite(currVer)" in block
     assert "pageVer && currVer" not in block

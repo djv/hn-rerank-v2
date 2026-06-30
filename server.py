@@ -706,7 +706,9 @@ class Handler(BaseHTTPRequestHandler):
                 len(cold_stories),
                 (time.perf_counter() - request_start) * 1000,
             )
-            cls._trigger_warm(user, expected_version)
+            n_feedback = sum(cls.db.count_feedback_by_action(user.id).values())
+            if n_feedback > 0:
+                cls._trigger_warm(user, expected_version)
             return html
 
         # No cache and no cold deck → return skeleton, trigger warm

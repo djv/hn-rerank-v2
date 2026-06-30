@@ -5,6 +5,33 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-30 — Cold deck gravity sort, limit reduction, 0-vote unification
+
+**Problem.** The cold deck used raw `score DESC` ordering and included up
+to 500 stories (878 KB HTML), which was heavy for a transient fallback.
+The gravity formula `score / (age_hours+2)^1.8` appeared in two separate
+code paths (`build_cold_deck` SQL and `fast_rerank_for_user` → tier1),
+and a zero-vote user's warm produced the same result as the cold deck
+through the full SVM pipeline — wasteful.
+
+**Fix.**
+- `COLD_DECK_LIMIT` 500 → 100, `COLD_DECK_QUERY_LIMIT` 2000 → 400.
+  HTML size dropped from 878 KB to 284 KB.
+- `build_cold_deck` now uses the same tier-1 gravity SQL and sets
+  `RankedStory.score` to the raw gravity value, so the client-side
+  `orderByRank()` preserves the gravity order as a no-op sort.
+- `fast_rerank_for_user` short-circuits for zero-feedback users:
+  `return build_cold_deck(db)` — no candidate SQL, no embeddings,
+  no SVM.  The cold deck IS the personalized deck for cold-start users.
+- `_render_dashboard_for_user` skips `_trigger_warm` when serving the
+  cold deck to a zero-feedback user (the warm would produce the same
+  result anyway).
+
+**Files:** `pipeline.py`, `server.py`, `tests/test_pipeline.py`,
+`tests/test_server.py`, `WORKLOG.md`.
+
+---
+
 ## 2026-06-30 — Cold deck fallback for no-cache dashboard loads
 
 **Problem.** A user with no rendered dashboard cache still received the

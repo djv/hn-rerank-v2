@@ -171,7 +171,10 @@ def test_build_cold_deck_score_order_and_summarizable_filter(
     cold = pipeline.build_cold_deck(db)
 
     assert [item.story.id for item in cold] == [3, 2]
-    assert [item.score for item in cold] == [100.0, 10.0]
+    gravity_div = 3.0**1.8
+    assert [item.score for item in cold] == pytest.approx(
+        [100.0 / gravity_div, 10.0 / gravity_div]
+    )
 
 
 def test_build_cold_deck_combo_keys_and_flags(
@@ -1843,6 +1846,29 @@ def test_fast_rerank_for_user_filters_unsummarizable_stories(db, monkeypatch):
     result_ids = {r.story.id for r in ranked}
     assert summarizable_id in result_ids
     assert unsummarizable_id not in result_ids
+
+
+def test_fast_rerank_for_user_zero_vote_returns_cold_deck(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """0-feedback users get build_cold_deck directly — no embeddings, no SVM."""
+    from pipeline import Config, fast_rerank_for_user
+
+    user = db.create_user("zero_vote_cold")
+    now = 2_000_000_000
+    monkeypatch.setattr(pipeline.time, "time", lambda: float(now))
+    db.upsert_story(_cold_story(1, score=50, time_ts=now - 3600, source="hn"))
+
+    ranked = fast_rerank_for_user(
+        db, Config(days=30), cast(Embedder, object()), user.id
+    )
+
+    gravity_div = 3.0**1.8
+    assert len(ranked) == 1
+    assert ranked[0].story.id == 1
+    assert ranked[0].score == pytest.approx(50.0 / gravity_div)
+    assert ranked[0].is_recent is True
+    assert ranked[0].is_non_hn is False
 
 
 def test_soft_blend_min_alpha_curve() -> None:

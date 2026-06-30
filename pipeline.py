@@ -210,8 +210,8 @@ HOT_MIN_SCORE = 20
 DASHBOARD_QUEUE_SIZE = 12
 PRIMARY_PER_COMBO = 12
 DISCOVERY_PER_BADGE = 2
-COLD_DECK_LIMIT = 500
-COLD_DECK_QUERY_LIMIT = 2000
+COLD_DECK_LIMIT = 100
+COLD_DECK_QUERY_LIMIT = 400
 BQ_ARCHIVE_SOURCE = "bq_seed"
 BQ_ARCHIVE_CANDIDATE_LIMIT = 2000
 CH_ARCHIVE_SOURCE = "ch_seed"
@@ -230,17 +230,24 @@ def _combo_keys_for_story(story: Story, recent_cutoff: int) -> str:
 
 
 def build_cold_deck(db: Database) -> list[RankedStory]:
-    """Build a global score-sorted fallback deck from existing SQLite rows."""
+    """Build a global gravity-sorted fallback deck from existing SQLite rows.
+
+    Uses the same tier-1 gravity formula as ``_score_and_rank`` so a
+    zero-vote user sees the same ranking as the cold deck.  See
+    ``fast_rerank_for_user`` for the 0-vote short-circuit.
+    """
+    now_ts = int(time.time())
     rows = db.execute(
         "SELECT id, title, url, score, time, text_content, source, comment_count, "
         "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
         "FROM stories "
-        "ORDER BY score DESC, time DESC "
+        "ORDER BY CAST(score AS REAL) / POW((? - time) / 3600.0 + 2.0, 1.8) DESC, "
+        "         time DESC "
         "LIMIT ?",
-        (COLD_DECK_QUERY_LIMIT,),
+        (now_ts, COLD_DECK_QUERY_LIMIT),
     )
     stories = [Database._row_to_story(row) for row in rows]
-    recent_cutoff = int(time.time()) - (30 * 86400)
+    recent_cutoff = now_ts - (30 * 86400)
     cold: list[RankedStory] = []
     for story in stories:
         if not is_summarizable(story):
@@ -248,7 +255,7 @@ def build_cold_deck(db: Database) -> list[RankedStory]:
         cold.append(
             RankedStory(
                 story=story,
-                score=float(story.score),
+                score=story.score / ((now_ts - story.time) / 3600.0 + 2.0) ** 1.8,
                 best_match_title="",
                 is_non_hn=(not is_hn_source(story.source)),
                 is_recent=(story.time >= recent_cutoff),
@@ -2905,6 +2912,13 @@ def fast_rerank_for_user(
 ) -> list[RankedStory]:
     """Fast rerank for a specific user. Called on each dashboard request."""
     trace.set_count("user_id", user_id)
+
+    n_feedback = sum(db.count_feedback_by_action(user_id).values())
+    trace.set_count("feedback_total", n_feedback)
+    if n_feedback == 0:
+        trace.set_label("model_cache", "skipped_cold_deck")
+        return build_cold_deck(db)
+
     now_ts = int(time.time())
     cutoff_ts = now_ts - (config.days * 86400)
 
