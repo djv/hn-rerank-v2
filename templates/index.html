@@ -1019,6 +1019,7 @@
     const MAX_QUEUE = 12;
     const PREFETCH_COUNT = 3;
     const IDLE_INACTIVE_PREFETCH_COUNT = 3;
+    const tldrCache = new Map(); // storyId (number) → raw TLDR markdown (string)
     let idleAgePrefetchHandle = null;
     let toastTimer = null;
     let refillInFlight = false;
@@ -1701,6 +1702,15 @@
         contentDiv.style.display = 'none';
         card.appendChild(contentDiv);
       }
+      const cached = tldrCache.get(storyId);
+      if (cached !== undefined) {
+        contentDiv.innerHTML = parseSimpleMarkdown(cached);
+        styleTldrLabels(contentDiv);
+        contentDiv.style.display = 'block';
+        if (btn) btn.style.display = 'none';
+        return;
+      }
+
       contentDiv.dataset.loading = 'true';
 
       if (btn) {
@@ -1717,6 +1727,7 @@
         });
         if (resp.ok) {
           const data = await resp.json();
+          tldrCache.set(storyId, data.tldr);
           contentDiv.innerHTML = parseSimpleMarkdown(data.tldr);
           styleTldrLabels(contentDiv);
           contentDiv.style.display = 'block';
