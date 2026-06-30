@@ -402,6 +402,7 @@ class Config:
     # signal is orthogonal to the SQL ordering.
     recent_candidate_hn_limit: int = 1500
     recent_candidate_rss_limit: int = 500
+    tldr_prefetch_per_combo: int = 5
     model: ModelConfig = field(default_factory=ModelConfig)
     rss: RssConfig = field(default_factory=RssConfig)
 
@@ -443,6 +444,7 @@ class Config:
             max_cached_models=main_cfg.get("max_cached_models", 20),
             recent_candidate_hn_limit=main_cfg.get("recent_candidate_hn_limit", 1500),
             recent_candidate_rss_limit=main_cfg.get("recent_candidate_rss_limit", 500),
+            tldr_prefetch_per_combo=main_cfg.get("tldr_prefetch_per_combo", 5),
             model=ModelConfig(
                 svm_c=model_cfg.get("svm_c", 0.2),
                 svm_gamma=model_cfg.get("svm_gamma", 0.03),

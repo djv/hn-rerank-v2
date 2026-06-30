@@ -551,6 +551,86 @@ async def generate_detailed_tldr(
         return f"Error executing LLM call: {str(e)}"
 
 
+async def _prefetch_tldrs_for_ranked(
+    ranked_stories: list[RankedStory],
+    db: Database,
+    per_combo: int,
+) -> int:
+    if per_combo <= 0 or not ranked_stories:
+        return 0
+
+    combo_groups: dict[str, list[int]] = {}
+    for rs in ranked_stories:
+        for combo_key in rs.combo_keys.split():
+            if combo_key.endswith("_mixed"):
+                continue
+            group = combo_groups.setdefault(combo_key, [])
+            if len(group) < per_combo:
+                group.append(rs.story.id)
+            break
+
+    seen: set[int] = set()
+    story_ids: list[int] = []
+    for combo_key in ["recent_hn", "recent_non-hn", "archive_hn", "archive_non-hn"]:
+        for sid in combo_groups.get(combo_key, []):
+            if sid not in seen:
+                seen.add(sid)
+                story_ids.append(sid)
+
+    if not story_ids:
+        return 0
+
+    sem = asyncio.Semaphore(2)
+
+    async def _prefetch_one(story_id: int) -> bool:
+        story = db.get_story(story_id)
+        if not story:
+            return False
+
+        title = story.title
+        self_text = story.self_text or ""
+        top_comments = story.top_comments or ""
+        article_body = story.article_body or ""
+
+        if not (self_text or top_comments or article_body):
+            return False
+
+        cache_key = _tldr_cache_key(
+            title=title,
+            self_text=self_text,
+            top_comments=top_comments,
+            article_body=article_body,
+        )
+        if db.get_tldr_cache(story_id, cache_key):
+            return False
+
+        async with sem:
+            tldr = await generate_detailed_tldr(
+                title,
+                self_text=self_text,
+                top_comments=top_comments,
+                article_body=article_body,
+            )
+        if not tldr or tldr.startswith("Error") or tldr.startswith("No article body"):
+            return False
+        db.upsert_tldr_cache(story_id, cache_key, tldr)
+        return True
+
+    results = await asyncio.gather(
+        *(_prefetch_one(sid) for sid in story_ids), return_exceptions=True
+    )
+    generated = sum(1 for r in results if r is True)
+
+    if generated:
+        logging.info(
+            "tldr_prefetch generated=%s candidates=%s per_combo=%s",
+            generated,
+            len(story_ids),
+            per_combo,
+        )
+    return generated
+
+
 SKELETON_HTML = b"""<!DOCTYPE html>
 <html><head><meta http-equiv="refresh" content="1"></head>
 <body><p>Loading your personalized dashboard...</p></body></html>"""
@@ -891,6 +971,16 @@ class Handler(BaseHTTPRequestHandler):
                 len(final),
             )
             logging.info("rank_perf %s", trace.format_log_fields())
+
+            per_combo = cls.config.tldr_prefetch_per_combo
+            if per_combo > 0 and final:
+                t = threading.Thread(
+                    target=lambda: asyncio.run(
+                        _prefetch_tldrs_for_ranked(final, cls.db, per_combo)
+                    ),
+                    daemon=True,
+                )
+                t.start()
 
     @classmethod
     def _finish_warm_attempt(cls, user: User, completed_version: int) -> None:
@@ -1321,6 +1411,16 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
             asyncio.run(fetch_candidates_only(config, db, embedder=embedder))
             Handler._rebuild_cold_deck()
             Handler._bump_all_cached_versions()
+            per_combo = config.tldr_prefetch_per_combo
+            if per_combo > 0 and Handler._cold_stories:
+                cold = list(Handler._cold_stories)
+                t = threading.Thread(
+                    target=lambda: asyncio.run(
+                        _prefetch_tldrs_for_ranked(cold, db, per_combo)
+                    ),
+                    daemon=True,
+                )
+                t.start()
             logging.info("Regeneration complete.")
         except Exception as e:
             logging.exception("Background regeneration failed: %r", e)
