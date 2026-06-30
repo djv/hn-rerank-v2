@@ -2516,7 +2516,7 @@ def rerank_candidates(
         ("recent", "hn", PRIMARY_PER_COMBO),
         ("recent", "nonhn", PRIMARY_PER_COMBO),
         ("archive", "hn", PRIMARY_PER_COMBO),
-        ("archive", "nonhn", 0),  # placeholder: no non-HN archive candidates
+        ("archive", "nonhn", PRIMARY_PER_COMBO),
     ]
 
     final: list[RankedStory] = []
@@ -2971,7 +2971,22 @@ def fast_rerank_for_user(
                 BQ_ARCHIVE_CANDIDATE_LIMIT + CH_ARCHIVE_CANDIDATE_LIMIT,
             ),
         )
-    rows = hn_rows + rss_rows + archive_rows
+        archive_rss_rows = db.execute(
+            "SELECT id, title, url, score, time, text_content, source, comment_count, "
+            "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
+            "FROM stories "
+            "WHERE source != 'hn' AND source NOT IN (?, ?) AND time < ? "
+            "  AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?) "
+            "ORDER BY time DESC LIMIT ?",
+            (
+                BQ_ARCHIVE_SOURCE,
+                CH_ARCHIVE_SOURCE,
+                cutoff_ts,
+                user_id,
+                config.recent_candidate_rss_limit,
+            ),
+        )
+    rows = hn_rows + rss_rows + archive_rows + archive_rss_rows
     candidates = [Database._row_to_story(row) for row in rows]
     candidates = [s for s in candidates if is_summarizable(s)]
     if trace is not None:
