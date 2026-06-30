@@ -5,6 +5,18 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-30 — Mobile story card vote-bar clearance
+
+Mobile story cards no longer carry extra blank bottom padding to clear the
+fixed vote bar. The mobile `.swipe-shell` height now reserves the vote-bar
+clearance, including `safe-area-inset-bottom`, and the active card resets to
+normal card bottom padding so short and medium cards end above the bar without
+a large empty scroll tail.
+
+**Files:** `templates/index.html`, `tests/test_server.py`, `WORKLOG.md`.
+
+---
+
 ## 2026-06-30 — Cold deck gravity sort, limit reduction, 0-vote unification
 
 **Problem.** The cold deck used raw `score DESC` ordering and included up

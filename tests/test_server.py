@@ -2274,9 +2274,20 @@ def test_keydown_uses_letter_keys():
     assert "min-width: 2.75rem" in template
     assert "min-height: 2.75rem" in template
     # flex scroll container on mobile
-    assert "height: calc(100vh - 1.5rem)" in template
+    assert (
+        "--mobile-vote-bar-clearance: calc(3.75rem + env(safe-area-inset-bottom, 0px));"
+        in template
+    )
+    assert (
+        "height: calc(100vh - 1.5rem - var(--mobile-vote-bar-clearance))"
+        in template
+    )
     assert "100dvh" in template
-    assert ".story-card.active {\n        max-height: 100%;" in template
+    mobile_active_block = template.split(
+        ".story-card.active {\n        max-height: 100%;", 1
+    )[1].split("}", 1)[0]
+    assert "padding-bottom: 0.65rem;" in mobile_active_block
+    assert "padding-bottom: 6rem;" not in mobile_active_block
     # global vote bar at the bottom of the viewport
     assert (
         "position: fixed;\n      bottom: 0;\n      left: 0;\n      right: 0;"
