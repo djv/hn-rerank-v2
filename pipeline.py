@@ -3044,7 +3044,7 @@ def _build_tab_groups() -> tuple[TabGroupView, ...]:
         TabGroupView(
             key="sort",
             aria_label="Sort order",
-            css_class="tab-bar tab-bar--sort tab-bar--grid-4",
+            css_class="tab-bar tab-bar--sort",
             data_attr="sort",
             segmented=False,
             tabs=(

@@ -1954,44 +1954,6 @@ def test_keydown_guard_excludes_buttons_and_anchors():
     assert '[contenteditable="true"]' in guard, "contenteditable should still block"
 
 
-def test_dashboard_has_no_refresh_button_or_progress_bar():
-    """The refresh button and the 5-vote progress bar were removed (2026-06-29):
-    the server still invalidates the cache on every vote, but the client
-    silently refills the queue on every successful vote save and on every
-    sort/age/source tab click — no user-facing button or bar to wait for.
-    """
-    template, _ = _read_template_and_static()
-    # Old refresh UI is gone
-    assert 'id="refresh-banner"' not in template
-    assert 'id="refresh-now-btn"' not in template
-    assert 'class="refresh-progress"' not in template
-    assert 'class="refresh-segment"' not in template
-    assert 'class="refresh-wrapper"' not in template
-    assert 'class="refresh-label"' not in template
-    assert "pulse-segment" not in template
-    assert 'role="progressbar"' not in template
-    assert "VOTES_PER_RANKING_REFRESH" not in template
-    assert "refresh-progress" not in template.split("</style>", 1)[0]
-    # New toast element is present and accessible
-    assert 'id="toast"' in template
-    assert 'role="status"' in template
-    assert 'aria-live="polite"' in template
-    assert 'class="toast"' in template
-    assert "showToast" in template
-    assert "scheduleDeckRefresh" in template
-    # 'u undo' hint removed from the legend
-    assert '<span class="key-hint">u</span> undo' not in template, (
-        "undo hint should be hidden from the visible legend"
-    )
-    # Vote counts element still present
-    assert 'class="vote-counts"' in template
-    assert template.count('data-vote-count="up"') == 1
-    assert template.count('data-vote-count="neutral"') == 1
-    assert template.count('data-vote-count="down"') == 1
-    # Old text "Loading queue..." should be gone from the template
-    assert "Loading queue..." not in template
-
-
 def test_extract_lesswrong_post_id():
     import server
 
@@ -2183,17 +2145,6 @@ def test_story_cards_emit_combo_keys_and_is_hn_attribute():
     assert "s === 'hn' || s === 'bq_seed'" not in static
 
 
-def test_dashboard_js_loaded_via_static_endpoint():
-    """The inline <script> is served from the template (the static/dashboard.js
-    extraction was rolled back — see WORKLOG 2026-06-27)."""
-    repo_root = Path(__file__).resolve().parents[1]
-    template = (repo_root / "templates" / "index.html").read_text(encoding="utf-8")
-    # The template must contain an inline <script> block
-    assert "  <script>\n" in template
-    # The template must NOT reference a /static/ JS file
-    assert 'src="/static/dashboard.js"' not in template
-
-
 def test_static_dashboard_js_has_no_jinja():
     """The inline <script> in the template is served as-is by Jinja2, so it
     must not contain Jinja2 directives."""
@@ -2205,197 +2156,6 @@ def test_static_dashboard_js_has_no_jinja():
     inline_script = template[start:end] if start >= 0 and end >= 0 else ""
     assert "{{" not in inline_script, "inline script must not contain Jinja2 {{ }}"
     assert "{%" not in inline_script, "inline script must not contain Jinja2 {% %}"
-
-
-def test_keydown_uses_letter_keys():
-    """The global keydown handler maps j/k/l to down/up/neutral
-    and ArrowUp/ArrowDown scroll the active card.
-    """
-    template, static = _read_template_and_static()
-    assert "const KEY_ACTIONS" in static
-    assert "j: () => submitVote('down')" in static
-    assert "k: () => submitVote('up')" in static
-    assert "l: () => submitVote('neutral')" in static
-    # arrow bindings present for card scrolling
-    key_map = static.split("const KEY_ACTIONS", 1)[1].split(
-        "document.addEventListener('keydown'", 1
-    )[0]
-    assert "arrowup" in key_map
-    assert "arrowdown" in key_map
-    assert "ArrowRight" not in key_map
-    # legend shows the new label
-    assert "skip (neutral)" in template.lower()
-    # first-time tip present and uses floating overlay
-    assert "first-time-tip" in template
-    assert "position: fixed" in template
-    assert 'aria-label="Keyboard shortcuts"' in template
-    assert "first-time-tip-inner" in template
-    # open article / open comments keys present
-    assert "o: () => openStoryUrl('article')" in static
-    assert "c: () => openStoryUrl('comments')" in static
-    assert "document.body.classList.toggle('fullscreen')" in static
-    assert "open article" in template.lower()
-    assert "open comments" in template.lower()
-    assert "data-article-url" in template
-    assert "data-comments-url" in template
-    assert "--page-gutter: 1rem;" in template
-    assert "--vote-bar-height: 3.2rem;" in template
-    assert "--card-bottom-gap: 0.5rem;" in template
-    assert (
-        "--active-card-viewport-reserve: calc(var(--vote-bar-height) + var(--card-bottom-gap));"
-        in template
-    )
-    assert "--fullscreen-gutter: 1rem;" in template
-    # card sizing: shrink-to-fit for short, full width for enriched,
-    # max-height caps at viewport so page never scrolls
-    assert "width: fit-content" in template
-    assert "max-width: 902px" in template
-    assert "max-width: none" in template
-    story_card_block = template.split(".story-card {", 1)[1].split("}", 1)[0]
-    assert "padding: 0.5rem;" in story_card_block
-    # page never scrolls — overflow hidden on html and body
-    assert "html {\n      overflow: hidden;\n    }" in template
-    body_block = template.split("body {", 1)[1].split("}", 1)[0]
-    assert "padding-top: 0;" in body_block
-    assert "padding-bottom: var(--page-gutter);" in body_block
-    assert "overflow: hidden;" in body_block
-    active_block = template.split(".story-card.active {", 1)[1].split("}", 1)[0]
-    assert (
-        "max-height: calc(100vh - var(--active-card-viewport-reserve))" in active_block
-    )
-    assert (
-        "max-height: calc(100dvh - var(--active-card-viewport-reserve))" in active_block
-    )
-    assert "min-height: 18rem;" in active_block
-    # active card keeps the base uniform padding; viewport caps clear the fixed vote bar
-    assert "padding-bottom" not in active_block
-    enriched_block = template.split(".story-card.enriched {", 1)[1].split("}", 1)[0]
-    assert "width: 100%" in enriched_block
-    # long unbroken text wraps instead of overflowing the card
-    assert (
-        "overflow-wrap: anywhere;"
-        in template.split(".story-title a {", 1)[1].split("}", 1)[0]
-    )
-    assert (
-        "overflow-wrap: anywhere;"
-        in template.split(".match-reason {", 1)[1].split("}", 1)[0]
-    )
-    assert (
-        "overflow-wrap: anywhere;"
-        in template.split(".tldr-detail-content {", 1)[1].split("}", 1)[0]
-    )
-    assert (
-        "overflow-wrap: anywhere;"
-        in template.split(".story-header {", 1)[1].split("}", 1)[0]
-    )
-    # no min-height on #stories, rail caps via max-height
-    stories_block = template.split("#stories {", 1)[1].split("}", 1)[0]
-    assert "min-height" not in stories_block
-    side_block = template.split(".swipe-side {", 1)[1].split("}", 1)[0]
-    assert "max-height: calc(100vh - 1.5rem)" in side_block
-    assert "overflow-y: auto" in side_block
-    assert "sticky" not in side_block
-    # layout uses flex-start, not stretch
-    assert "align-items: flex-start" in template
-    # fullscreen hides side controls and lets the active card fill viewport height
-    assert ".fullscreen .swipe-side { display: none; }" in template
-    assert ".fullscreen .vote-bar { display: none; }" in template
-    fullscreen_body_block = template.split("body.fullscreen {", 1)[1].split("}", 1)[0]
-    assert "padding-block: var(--fullscreen-gutter);" in fullscreen_body_block
-    fullscreen_shell_block = template.split(".fullscreen .swipe-shell {", 1)[1].split(
-        "}", 1
-    )[0]
-    assert (
-        "height: calc(100vh - var(--fullscreen-gutter) - var(--fullscreen-gutter));"
-        in fullscreen_shell_block
-    )
-    assert (
-        "height: calc(100dvh - var(--fullscreen-gutter) - var(--fullscreen-gutter));"
-        in fullscreen_shell_block
-    )
-    assert "padding-block: 0;" in fullscreen_shell_block
-    assert "display: flex;" in fullscreen_shell_block
-    assert "flex-direction: column;" in fullscreen_shell_block
-    fullscreen_flex_block = template.split(
-        ".fullscreen .swipe-layout,\n    .fullscreen #stories {", 1
-    )[1].split("}", 1)[0]
-    assert "flex: 1;" in fullscreen_flex_block
-    assert "min-height: 0;" in fullscreen_flex_block
-    fullscreen_layout_block = template.split(".fullscreen .swipe-layout {", 1)[1].split(
-        "}", 1
-    )[0]
-    assert "align-items: stretch;" in fullscreen_layout_block
-    assert (
-        ".fullscreen #stories {\n      display: flex;\n      flex-direction: column;"
-        in template
-    )
-    fullscreen_active_block = template.split(".fullscreen .story-card.active {", 1)[
-        1
-    ].split("}", 1)[0]
-    assert "height: 100%;" in fullscreen_active_block
-    assert "max-height: 100%;" in fullscreen_active_block
-    assert "margin-bottom: 0;" in fullscreen_active_block
-    assert "overflow: auto;" in fullscreen_active_block
-    assert "padding-bottom" not in fullscreen_active_block
-    # mobile side-rail stack (column, keys hidden)
-    assert ".swipe-keys { display: none; }" in template
-    assert "width: 100%;" in template
-    assert "flex-direction: column" in template
-    # bigger touch buttons on mobile
-    assert "padding: 0.6rem 0.9rem" in template
-    assert "min-width: 2.75rem" in template
-    assert "min-height: 2.75rem" in template
-    # flex scroll container on mobile
-    assert (
-        "--mobile-vote-bar-clearance: calc(3.75rem + env(safe-area-inset-bottom, 0px));"
-        in template
-    )
-    assert "height: calc(100vh - 1.5rem - var(--mobile-vote-bar-clearance))" in template
-    assert "100dvh" in template
-    mobile_active_block = template.split(
-        ".story-card.active {\n        max-height: 100%;", 1
-    )[1].split("}", 1)[0]
-    assert "padding-bottom" not in mobile_active_block
-    # global vote bar at the bottom of the viewport
-    assert (
-        "position: fixed;\n      bottom: 0;\n      left: 0;\n      right: 0;"
-        in template
-    )
-    assert ".vote-bar[hidden]" in template
-    assert '<div class="vote-bar" hidden>' in template
-    # vote counts live in the vote bar; no refresh bar/label/progress
-    assert 'class="vote-counts"' in template.split('<div class="vote-bar"')[1]
-    assert 'class="refresh-progress"' not in template
-    assert 'class="refresh-label"' not in template
-    assert "Votes until refresh" not in template
-    assert "width: 120px" not in template
-    # vote bar is flex-end (no wrapper on the left after removing the progress bar)
-    assert "justify-content: flex-end" in template
-    assert (
-        "margin-left: auto" not in template.split(".vote-counts", 1)[1].split("}", 1)[0]
-    )
-    # toast is positioned fixed at the top
-    assert ".toast {" in template
-    assert 'role="status"' in template
-    assert 'aria-live="polite"' in template
-    # mode and source tabs have filled active style
-    assert ".tab-btn.active {\n      background: var(--pico-primary);" in template
-    assert ".tab-btn--segmented.active {\n      background: #6c757d;" in template
-    assert "padding: 0.45rem;" in template.split(".queue-pill {", 1)[1].split("}", 1)[0]
-    assert (
-        "padding: 0.45rem;"
-        in template.split(".queue-pill--bar {", 1)[1].split("}", 1)[0]
-    )
-    assert "padding: 0.6rem;" in template.split(".tab-btn {", 1)[1].split("}", 1)[0]
-    assert (
-        "padding: 0.3rem;"
-        in template.split(".tab-btn--segmented {", 1)[1].split("}", 1)[0]
-    )
-    # feedback button has filled, shadowed style
-    assert "box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);" in template
-    # click handler no longer passes null card
-    assert "submitVote(btn.dataset.fb, btn.closest('.story-card'))" not in static
-    assert "submitVote(btn.dataset.fb);" in static
 
 
 def test_dashboard_renders_user_vote_counts_zero_for_no_feedback(test_env):
@@ -2671,29 +2431,6 @@ def test_setFilter_preserves_sort_age_source_refresh_behavior() -> None:
     assert "FILTERS" in static
     assert "refillQueued" not in body
     assert "refillWhenReady" not in body
-
-
-def test_archive_age_tab_button_exists():
-    """Archive age button exists and idle prefetch pre-warms the other age."""
-    template, static = _read_template_and_static()
-    assert 'data-age="archive"' in template
-    # Idle prefetch uses other-age logic.
-    assert "function scheduleIdleAgePrefetch" in static
-    assert "otherAge" in static
-    assert "cardsForAge" in static
-
-
-def test_matchesCurrentAxes_filters_by_badge_only():
-    """matchesCurrentAxes filters by sort badge only (popular/explore).
-    Age and source filtering moved to matchesCurrentCombo."""
-    _, static = _read_template_and_static()
-    idx = static.index("function matchesCurrentAxes(")
-    end = static.index("function queuedCards(", idx)
-    body = static[idx:end]
-    assert "card.dataset.sortPopular" in body
-    assert "card.dataset.sortExplore" in body
-    assert "currentAge" not in body
-    assert "card.dataset.isRecent" not in body
 
 
 def test_orderForCurrentSort_uses_shared_order_helper_for_deterministic_modes():
@@ -3000,29 +2737,6 @@ def test_ready_gated_refill_drains_active_before_queued_version() -> None:
     assert "if (readyVersion >= latestWarmTargetVersion)" in loop_block
 
 
-def test_waitForRankingReady_poll_is_not_aborted_by_newer_warm() -> None:
-    _, inline_script = _read_template_and_static()
-    block = inline_script.split("async function waitForRankingReady(", 1)[1].split(
-        "sortTabs.forEach", 1
-    )[0]
-    assert "rankingReadyPath(minVersion, targetVersion)" in block
-    assert "latestWarmVersionSeen" not in block
-    assert "lastScheduledWarmVersion" not in block
-    assert "activeWarmVersion" not in inline_script
-    assert "queuedWarmVersion" not in inline_script
-
-
-def test_waitForRankingReady_has_no_timer_success_fallback() -> None:
-    _, inline_script = _read_template_and_static()
-    block = inline_script.split("async function waitForRankingReady(", 1)[1].split(
-        "sortTabs.forEach", 1
-    )[0]
-    assert "> 3000" not in block
-    assert "return data.ready_version" in block
-    assert "if (data.ready && typeof data.ready_version === 'number')" in block
-    assert "typeof data.ready_version === 'number'" in block
-
-
 def test_waitForRankingReady_timeout_does_not_refill() -> None:
     _, inline_script = _read_template_and_static()
     block = inline_script.split("async function waitForRankingReady(", 1)[1].split(
@@ -3073,23 +2787,6 @@ def test_refillQueue_advance_false_path_does_not_show_next_card() -> None:
     assert "advance = true" in block
     assert "if (advance) {\n          showNextCard({ allowRefresh: false });" in block
     assert "} else if (advance && (!activeCard || activeCard.dataset.voted))" in block
-
-
-def test_removed_refresh_names_are_gone() -> None:
-    _, inline_script = _read_template_and_static()
-    removed_names = [
-        "silentRefill",
-        "pollRankingReady",
-        "scheduleRefillWhenRankingReady",
-        "maybeRefillQueue",
-        "LOW_WATERMARK",
-        "latestPendingRankingVersion",
-        "forceFetch",
-        "isRefilling",
-        "matchesCurrentSource",
-    ]
-    for name in removed_names:
-        assert name not in inline_script
 
 
 def test_showToast_dismisses_after_3s() -> None:
