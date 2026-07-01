@@ -1878,6 +1878,65 @@ async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
     assert "- **Discussion** summary" in result
 
 
+@pytest.mark.asyncio
+async def test_call_llm_chat_uses_limiter(monkeypatch):
+    import server
+
+    calls = []
+
+    class FakeLimiter:
+        async def acquire(self):
+            calls.append(("acquire", None))
+            return True
+
+        def record_response(self, *, status, headers):
+            calls.append(("record_response", status, dict(headers)))
+
+    class FakeResponse:
+        status_code = 200
+        headers = {"x-ratelimit-remaining-req-minute": "49"}
+        text = '{"ok": true}'
+
+        def json(self):
+            return {"choices": [{"message": {"content": "summary"}}]}
+
+    class FakeClient:
+        def __init__(self, *, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, base_url, *, headers, json):
+            calls.append(("post", base_url))
+            return FakeResponse()
+
+    monkeypatch.setattr(server, "llm_limiter", FakeLimiter())
+    monkeypatch.setattr(server.httpx, "AsyncClient", FakeClient)
+
+    result = await server._call_llm_chat(
+        api_key="test-key",
+        base_url="https://example.test/chat",
+        model="test-model",
+        prompt="hello",
+        max_tokens=10,
+    )
+
+    assert result == "summary"
+    assert calls == [
+        ("acquire", None),
+        ("post", "https://example.test/chat"),
+        (
+            "record_response",
+            200,
+            {"x-ratelimit-remaining-req-minute": "49"},
+        ),
+    ]
+
+
 async def test_unified_fallback_omits_article_when_no_article_body(
     monkeypatch,
 ) -> None:

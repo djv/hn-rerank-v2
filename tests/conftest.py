@@ -9,6 +9,7 @@ import pytest
 from reddit_feed_cache import cache as reddit_feed_cache
 from reddit_fetch_queue import queue as reddit_fetch_queue
 from reddit_limiter import limiter as reddit_limiter
+from llm_limiter import limiter as llm_limiter
 
 
 @pytest.fixture(autouse=True)
@@ -31,6 +32,7 @@ def reset_reddit_singletons() -> Iterator[None]:
     """
     from reddit_fetch_queue import RedditFetchQueue
 
+    llm_limiter.reset()
     reddit_limiter.reset()
     reddit_feed_cache.reset()
     reddit_fetch_queue.reset()
@@ -51,4 +53,5 @@ def reset_reddit_singletons() -> Iterator[None]:
     RedditFetchQueue.POLL_INTERVAL = orig_poll
     reddit_fetch_queue.reset()
     reddit_limiter.reset()
+    llm_limiter.reset()
     reddit_feed_cache.reset()

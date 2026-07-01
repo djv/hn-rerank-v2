@@ -28,6 +28,7 @@ import httpx
 from dataclasses import dataclass, replace
 from database import Database, User
 from pipeline import Config, Embedder, RankedStory, is_hn_source
+from llm_limiter import limiter as llm_limiter
 from reddit_limiter import limiter as reddit_limiter
 from http_fetch import fetch_with_urllib_fallback
 
@@ -486,6 +487,7 @@ async def _call_llm_chat(
     }
     async with httpx.AsyncClient(timeout=45.0) as client:
         for attempt in range(4):
+            await llm_limiter.acquire()
             resp = await client.post(
                 base_url,
                 headers={
@@ -494,10 +496,16 @@ async def _call_llm_chat(
                 },
                 json=payload,
             )
+            llm_limiter.record_response(
+                status=resp.status_code,
+                headers=resp.headers,
+            )
             if resp.status_code == 200:
                 data = resp.json()
                 return data["choices"][0]["message"]["content"]
-            if resp.status_code in (429, 503) and attempt < 3:
+            if resp.status_code == 429 and attempt < 3:
+                continue
+            if resp.status_code == 503 and attempt < 3:
                 base = 2 ** (attempt + 1)
                 jitter = random.uniform(0, base * 0.5)
                 delay = _parse_retry_after(
@@ -574,24 +582,22 @@ async def generate_detailed_tldr(
             title=title, comments_section=comments_section
         )
         try:
-            article_result, discussion_result = await asyncio.gather(
-                _call_llm_chat(
-                    api_key=api_key,
-                    base_url=base_url,
-                    model=model,
-                    prompt=article_prompt,
-                    max_tokens=900,
-                ),
-                _call_llm_chat(
-                    api_key=api_key,
-                    base_url=base_url,
-                    model=model,
-                    prompt=discussion_prompt,
-                    max_tokens=900,
-                ),
+            article_result = await _call_llm_chat(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                prompt=article_prompt,
+                max_tokens=900,
             )
             if article_result.startswith("Error"):
                 return article_result
+            discussion_result = await _call_llm_chat(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                prompt=discussion_prompt,
+                max_tokens=900,
+            )
             if discussion_result.startswith("Error"):
                 return discussion_result
             article_result = _normalize_tldr_markdown(article_result)
@@ -1454,11 +1460,16 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if tldr.startswith("Error"):
                 logging.warning(
-                    "tldr_detail story_id=%s result=llm_error cache_key=%s",
+                    "tldr_detail story_id=%s result=llm_error cache_key=%s error=%s",
                     story.id,
                     cache_key[:12],
+                    tldr,
                 )
-                self._json_response({"error": tldr}, status=503)
+                if "HTTP 429" in tldr:
+                    error = "Rate limit exceeded. Please try again in a moment."
+                else:
+                    error = "Failed to generate TLDR. Please try again later."
+                self._json_response({"error": error}, status=503)
                 return
             if not tldr.startswith("No article body"):
                 self.db.upsert_tldr_cache(story.id, cache_key, tldr)
