@@ -2233,15 +2233,15 @@ def test_keydown_uses_letter_keys():
     assert "max-width: 902px" in template
     assert "max-width: none" in template
     story_card_block = template.split(".story-card {", 1)[1].split("}", 1)[0]
-    assert "padding: 0.5rem 0.5rem 0.7rem;" in story_card_block
+    assert "padding: 0.5rem;" in story_card_block
     # page never scrolls — overflow hidden on html and body
     assert "html {\n      overflow: hidden;\n    }" in template
     assert "overflow: hidden;" in template.split("body {")[1].split("}")[0]
     active_block = template.split(".story-card.active {", 1)[1].split("}", 1)[0]
     assert "max-height: calc(100vh - 5rem)" in active_block
     assert "min-height: 18rem;" in active_block
-    # active card has bottom padding to clear the fixed vote bar
-    assert "padding-bottom: 4rem;" in active_block
+    # active card keeps the base uniform padding; viewport caps clear the fixed vote bar
+    assert "padding-bottom" not in active_block
     enriched_block = template.split(".story-card.enriched {", 1)[1].split("}", 1)[0]
     assert "width: 100%" in enriched_block
     # long unbroken text wraps instead of overflowing the card
@@ -2306,7 +2306,7 @@ def test_keydown_uses_letter_keys():
     assert "max-height: 100%;" in fullscreen_active_block
     assert "margin-bottom: 0;" in fullscreen_active_block
     assert "overflow: auto;" in fullscreen_active_block
-    assert "padding-bottom: 0.5rem;" in fullscreen_active_block
+    assert "padding-bottom" not in fullscreen_active_block
     # mobile side-rail stack (column, keys hidden)
     assert ".swipe-keys { display: none; }" in template
     assert "width: 100%;" in template
@@ -2325,8 +2325,7 @@ def test_keydown_uses_letter_keys():
     mobile_active_block = template.split(
         ".story-card.active {\n        max-height: 100%;", 1
     )[1].split("}", 1)[0]
-    assert "padding-bottom: 0.7rem;" in mobile_active_block
-    assert "padding-bottom: 6rem;" not in mobile_active_block
+    assert "padding-bottom" not in mobile_active_block
     # global vote bar at the bottom of the viewport
     assert (
         "position: fixed;\n      bottom: 0;\n      left: 0;\n      right: 0;"

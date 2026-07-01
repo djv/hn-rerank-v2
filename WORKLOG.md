@@ -5,6 +5,17 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-07-01 — Uniform story-card padding
+
+Story cards now use the same internal padding on all four sides in normal,
+fullscreen, and mobile active states. Active-card padding exceptions were
+removed so vote-bar clearance stays in the existing viewport/shell sizing
+rather than appearing as extra blank space inside the card.
+
+**Files:** `templates/index.html`, `tests/test_server.py`, `WORKLOG.md`.
+
+---
+
 ## 2026-06-30 — Tightened fullscreen vertical gutters
 
 **Change.** Desktop fullscreen now keeps the page body's top and bottom
