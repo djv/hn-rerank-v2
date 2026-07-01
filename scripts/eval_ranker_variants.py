@@ -52,6 +52,7 @@ from pipeline import (
     _knn_similarity,
     _positive_cluster_centers,
     clean_text,
+    load_production_candidate_stories,
     mmr_filter,
 )
 
@@ -83,21 +84,26 @@ class FoldData:
     tier2_scores: np.ndarray
 
 
+@dataclass(frozen=True)
+class FoldSplit:
+    fold_no: int
+    train_pos: np.ndarray
+    test_pos: np.ndarray
+
+
 def _db_sha256(db_path: str) -> str:
     return hashlib.sha256(Path(db_path).read_bytes()).hexdigest()[:16]
 
 
-def _load_recent_candidates(
-    db: Database, cutoff_ts: int
+def _load_production_candidates(
+    db: Database, config: Config, user_id: int
 ) -> tuple[list[Story], np.ndarray]:
-    rows = db.execute(
-        "SELECT id, title, url, score, time, text_content, source, "
-        "       comment_count, discussion_url, comment_count_at_fetch, "
-        "       self_text, top_comments, article_body "
-        "FROM stories WHERE time >= ? AND text_content != ''",
-        (cutoff_ts,),
+    stories = load_production_candidate_stories(
+        db,
+        config,
+        user_id=user_id,
+        exclude_feedback=False,
     )
-    stories = [Database._row_to_story(row) for row in rows]
     hashes = {
         s.id: hashlib.sha256(s.text_content.encode("utf-8")).hexdigest()
         for s in stories
@@ -364,6 +370,37 @@ def _tier2_scores(
     return ((scores - scores.min()) / (scores.max() - scores.min() + 1e-8)).astype(
         np.float32
     )
+
+
+def _scores_candidate_order(fold: FoldData) -> tuple[np.ndarray, None]:
+    return (-np.arange(len(fold.candidates), dtype=np.float32), None)
+
+
+def _scores_gravity(
+    fold: FoldData, now_ts: float | None = None
+) -> tuple[np.ndarray, None]:
+    now = time.time() if now_ts is None else now_ts
+    ages_hours = np.array(
+        [max((now - story.time) / 3600.0, 1.0) for story in fold.candidates],
+        dtype=np.float64,
+    )
+    hn_scores = np.array(
+        [max(float(story.score), 0.0) for story in fold.candidates],
+        dtype=np.float64,
+    )
+    recency_tiebreak = np.array(
+        [float(story.time) for story in fold.candidates],
+        dtype=np.float64,
+    )
+    if len(recency_tiebreak):
+        recency_tiebreak = _percentile_scores(recency_tiebreak).astype(np.float64)
+    return (hn_scores / np.power(ages_hours, 1.8) + recency_tiebreak * 1e-9).astype(
+        np.float32
+    ), None
+
+
+def _scores_centroid_up_minus_down(fold: FoldData) -> tuple[np.ndarray, None]:
+    return fold.tier2_scores.copy(), None
 
 
 def _balanced_weights(y: np.ndarray) -> np.ndarray:
@@ -1423,13 +1460,29 @@ def _metrics(
             for i, s in enumerate(fold.test_stories)
             if fold.test_actions[i] == 0 and s.id in rank_map
         }
+        surfaced_positions = [
+            rank_map[s.id] for s in fold.test_stories if s.id in rank_map
+        ]
+
+        def up_recall(k: int) -> float:
+            return (
+                sum(1 for p in up_by_pos if p < k) / n_up
+                if n_up
+                else 0.0
+            )
+
         return {
+            "ndcg_at_12": ndcg(12),
             "ndcg_at_100": ndcg(100),
             "ndcg_at_40": ndcg(40),
             "ndcg_at_200": ndcg(200),
             "map": ap,
             "precision_at_40": sum(1 for p in up_by_pos if p < 40) / 40.0,
+            "up_recall_at_12": up_recall(12),
+            "up_recall_at_40": up_recall(40),
             "downvote_rate_at_40": sum(1 for p in down_positions if p < 40) / 40.0,
+            "hit_at_40": sum(1 for p in surfaced_positions if p < 40)
+            / max(len(fold.test_stories), 1),
             "hit_at_100": sum(1 for p in rel_by_pos if p < 100)
             / max(len(fold.test_stories), 1),
         }
@@ -1649,11 +1702,143 @@ def _make_fold(
     )
 
 
+def _temporal_splits(
+    y: np.ndarray,
+    vote_times: np.ndarray,
+    *,
+    folds: int,
+    initial_train_frac: float = 0.5,
+) -> list[FoldSplit]:
+    if folds < 1:
+        raise ValueError("--folds must be at least 1")
+    if len(y) < 2:
+        raise RuntimeError("Need at least 2 valid feedback rows for temporal evaluation")
+    order = np.argsort(vote_times, kind="mergesort")
+    initial_train_size = int(math.floor(len(order) * initial_train_frac))
+    initial_train_size = min(max(initial_train_size, 1), len(order) - 1)
+    test_blocks = [
+        block.astype(int)
+        for block in np.array_split(order[initial_train_size:], folds)
+        if len(block)
+    ]
+    splits = []
+    train_end = initial_train_size
+    for fold_no, block in enumerate(test_blocks, start=1):
+        splits.append(
+            FoldSplit(
+                fold_no=fold_no,
+                train_pos=order[:train_end],
+                test_pos=block,
+            )
+        )
+        train_end += len(block)
+    return splits
+
+
+def _stratified_splits(y: np.ndarray, *, folds: int) -> list[FoldSplit]:
+    splits = StratifiedKFold(n_splits=folds, shuffle=True, random_state=0).split(
+        np.zeros((len(y), 1)), y
+    )
+    return [
+        FoldSplit(fold_no=fold_no, train_pos=train_pos, test_pos=test_pos)
+        for fold_no, (train_pos, test_pos) in enumerate(splits, start=1)
+    ]
+
+
+def _variant_requires_all_labels(name: str) -> bool:
+    all_label_prefixes = (
+        "legacy_prob_3class",
+        "prob_3class",
+        "margin3",
+        "linear_svc",
+        "logreg",
+        "sgd_log",
+        "mlp_",
+        "source_domain",
+        "rank_calibrated",
+        "field_",
+        "pos_cluster_feat",
+        "neg_cluster_feat",
+        "cluster_margin",
+        "pos_cluster_entropy",
+        "centroid_residual",
+        "down_up_interaction",
+        "cluster_combo",
+        "attention_mlp",
+        "attn_mlp",
+        "blend_",
+    )
+    return name.startswith(all_label_prefixes)
+
+
+def _required_labels_for_variants(variant_names: list[str]) -> set[int]:
+    labels = {0, 2}
+    if any(_variant_requires_all_labels(name) for name in variant_names):
+        labels.add(1)
+    return labels
+
+
+def _validate_splits(
+    splits: list[FoldSplit],
+    y: np.ndarray,
+    *,
+    split_mode: str,
+    required_train_labels: set[int],
+) -> None:
+    if not splits:
+        raise RuntimeError(f"No folds produced for {split_mode} split")
+    for split in splits:
+        train_labels = set(int(label) for label in y[split.train_pos])
+        missing = sorted(required_train_labels - train_labels)
+        if missing:
+            raise RuntimeError(
+                f"{split_mode} fold {split.fold_no} training labels are missing "
+                f"{missing}; need labels {sorted(required_train_labels)} for requested "
+                "variants. Use --split stratified for shuffled diagnostics, request "
+                "variants with looser label requirements, or add more feedback history."
+            )
+
+
+def _aggregate_results(
+    rows_by_name: dict[str, list[dict]],
+    metric_keys: list[str],
+) -> dict[str, dict[str, Any]]:
+    return {
+        name: {
+            "mean": {
+                side: {
+                    key: float(np.mean([row[side][key] for row in rows]))
+                    for key in metric_keys
+                }
+                for side in ("raw", "mmr")
+            },
+            "std": {
+                side: {
+                    key: float(np.std([row[side][key] for row in rows]))
+                    for key in metric_keys
+                }
+                for side in ("raw", "mmr")
+            },
+            "per_fold": rows,
+        }
+        for name, rows in rows_by_name.items()
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.toml")
     parser.add_argument("--output", default="eval_ranker_variants.json")
     parser.add_argument("--folds", type=int, default=5)
+    parser.add_argument(
+        "--split",
+        choices=("temporal", "stratified"),
+        default="temporal",
+        help=(
+            "Evaluation split. temporal uses expanding-window chronological folds; "
+            "stratified preserves the previous shuffled class-balanced split."
+        ),
+    )
     parser.add_argument(
         "--window-days",
         type=int,
@@ -1714,8 +1899,8 @@ def main() -> None:
     embedder = Embedder(config.onnx_model_dir) if needs_field else None
 
     window_days = args.window_days if args.window_days is not None else config.days
-    cutoff_ts = int(time.time()) - window_days * 86400
-    candidates, cand_emb = _load_recent_candidates(db, cutoff_ts)
+    eval_config = replace(config, days=window_days)
+    candidates, cand_emb = _load_production_candidates(db, eval_config, user.id)
     cand_id_to_idx = {s.id: i for i, s in enumerate(candidates)}
     fb_stories, fb_labels, fb_vote_times = db.get_feedback_for_training(user_id=user.id)
     all_y = np.array(fb_labels, dtype=int)
@@ -1804,8 +1989,6 @@ def main() -> None:
         f"valid_feedback={len(y)} labels={Counter(y)}"
     )
     print(f"candidate_recall={candidate_recall}")
-    if len(set(y)) < 3:
-        raise RuntimeError("Need all three labels for stratified evaluation")
 
     variants = {
         "legacy_prob_3class": lambda fold: _scores_prob_3class(
@@ -2170,17 +2353,51 @@ def main() -> None:
             raise ValueError(f"Unknown variants: {', '.join(missing)}")
         variants = {name: variants[name] for name in requested}
 
-    def _run_variants(y_label: np.ndarray, label: str = "") -> dict[str, list[dict]]:
-        """Run the variant suite on a given label vector.
+    required_train_labels = _required_labels_for_variants(list(variants))
+    missing_global_labels = sorted(
+        required_train_labels - set(int(label) for label in y)
+    )
+    if missing_global_labels:
+        raise RuntimeError(
+            f"Need labels {sorted(required_train_labels)} for requested variants; "
+            f"valid feedback is missing {missing_global_labels}"
+        )
+
+    split_label = (
+        "temporal-expanding"
+        if args.split == "temporal"
+        else f"{args.folds}-fold-stratified"
+    )
+    splits = (
+        _temporal_splits(y, fb_vote_times, folds=args.folds)
+        if args.split == "temporal"
+        else _stratified_splits(y, folds=args.folds)
+    )
+    _validate_splits(
+        splits,
+        y,
+        split_mode=split_label,
+        required_train_labels=required_train_labels,
+    )
+
+    baselines = {
+        "candidate_order": lambda fold: _scores_candidate_order(fold),
+        "gravity": lambda fold: _scores_gravity(fold),
+        "centroid_up_minus_down": lambda fold: _scores_centroid_up_minus_down(fold),
+    }
+
+    def _run_scorers(
+        scorers: dict[str, Any],
+        y_label: np.ndarray,
+        label: str = "",
+    ) -> dict[str, list[dict]]:
+        """Run scorers on a given label vector.
 
         label is a prefix prepended to per-fold progress lines (used by
         the leak check pass to distinguish its output from the main run).
         """
-        results: dict[str, list[dict]] = {name: [] for name in variants}
-        splits = StratifiedKFold(
-            n_splits=args.folds, shuffle=True, random_state=0
-        ).split(np.zeros((len(y_label), 1)), y_label)
-        for fold_no, (train_pos, test_pos) in enumerate(splits, start=1):
+        results: dict[str, list[dict]] = {name: [] for name in scorers}
+        for split in splits:
             fold = _make_fold(
                 candidates,
                 cand_emb,
@@ -2193,26 +2410,31 @@ def main() -> None:
                 fb_vote_times,
                 y_label,
                 valid_positions,
-                train_pos,
-                test_pos,
+                split.train_pos,
+                split.test_pos,
                 config,
                 needs_field=needs_field,
             )
-            for name, scorer in variants.items():
+            for name, scorer in scorers.items():
                 scores, probs = scorer(fold)
                 results[name].append(_metrics(scores, fold, config, probs))
-            print(f"{label}fold {fold_no}/{args.folds} done")
+            print(f"{label}fold {split.fold_no}/{len(splits)} done")
         return results
 
-    results = _run_variants(y)
+    results = _run_scorers(variants, y)
+    baseline_results = _run_scorers(baselines, y, label="[baseline] ")
 
     metric_keys = [
+        "ndcg_at_12",
         "ndcg_at_100",
         "ndcg_at_40",
         "ndcg_at_200",
         "map",
         "precision_at_40",
+        "up_recall_at_12",
+        "up_recall_at_40",
         "downvote_rate_at_40",
+        "hit_at_40",
         "hit_at_100",
         "median_rank",
         "p25_rank",
@@ -2221,7 +2443,10 @@ def main() -> None:
     ]
     report: dict[str, Any] = {
         "config": {
-            "split": f"{args.folds}-fold-stratified",
+            "split": split_label,
+            "split_mode": args.split,
+            "temporal_initial_train_frac": 0.5 if args.split == "temporal" else None,
+            "candidate_loader": "production_legs",
             "window_days": window_days,
             "user_token": user.token,
             "user_id": user.id,
@@ -2238,30 +2463,26 @@ def main() -> None:
             "db_sha256": _db_sha256(config.db_path),
         },
         "variants": {},
+        "baselines": {},
     }
-    for name, rows in results.items():
-        report["variants"][name] = {
-            "mean": {
-                side: {
-                    key: float(np.mean([row[side][key] for row in rows]))
-                    for key in metric_keys
-                }
-                for side in ("raw", "mmr")
-            },
-            "std": {
-                side: {
-                    key: float(np.std([row[side][key] for row in rows]))
-                    for key in metric_keys
-                }
-                for side in ("raw", "mmr")
-            },
-            "per_fold": rows,
-        }
+    if args.split == "stratified":
+        del report["config"]["temporal_initial_train_frac"]
+    report["variants"] = _aggregate_results(results, metric_keys)
+    report["baselines"] = _aggregate_results(baseline_results, metric_keys)
 
     if args.leak_check:
         print(f"\n=== Leak check: shuffling y (n={len(y)}, seed=0) ===")
         y_shuffled = np.random.default_rng(0).permutation(y)
-        leak_results = _run_variants(y_shuffled, label="[leak-check] ")
+        _validate_splits(
+            splits,
+            y_shuffled,
+            split_mode=f"{split_label} leak-check",
+            required_train_labels=required_train_labels,
+        )
+        leak_results = _run_scorers(variants, y_shuffled, label="[leak-check] ")
+        leak_baseline_results = _run_scorers(
+            baselines, y_shuffled, label="[leak-check baseline] "
+        )
         report["leak_check"] = {
             "config": {
                 "y_seed": 0,
@@ -2269,36 +2490,24 @@ def main() -> None:
                 "labels": {str(k): int(v) for k, v in Counter(y_shuffled).items()},
             },
             "variants": {},
+            "baselines": {},
         }
-        for name, rows in leak_results.items():
-            report["leak_check"]["variants"][name] = {
-                "mean": {
-                    side: {
-                        key: float(np.mean([row[side][key] for row in rows]))
-                        for key in metric_keys
-                    }
-                    for side in ("raw", "mmr")
-                },
-                "std": {
-                    side: {
-                        key: float(np.std([row[side][key] for row in rows]))
-                        for key in metric_keys
-                    }
-                    for side in ("raw", "mmr")
-                },
-                "per_fold": rows,
-            }
+        report["leak_check"]["variants"] = _aggregate_results(
+            leak_results, metric_keys
+        )
+        report["leak_check"]["baselines"] = _aggregate_results(
+            leak_baseline_results, metric_keys
+        )
 
     Path(args.output).write_text(json.dumps(report, indent=2))
     print(f"wrote {args.output}")
     for name, data in report["variants"].items():
         raw = data["mean"]["raw"]
-        mmr = data["mean"]["mmr"]
         print(
-            f"{name:26s} raw_ndcg100={raw['ndcg_at_100']:.3f} "
+            f"{name:26s} raw_ndcg12={raw['ndcg_at_12']:.3f} "
             f"raw_ndcg40={raw['ndcg_at_40']:.3f} "
-            f"mmr_ndcg100={mmr['ndcg_at_100']:.3f} "
-            f"raw_map={raw['map']:.3f} mmr_map={mmr['map']:.3f} "
+            f"up_recall40={raw['up_recall_at_40']:.3f} "
+            f"down40={raw['downvote_rate_at_40']:.3f} "
             f"median={raw['median_rank']:.1f}"
         )
 

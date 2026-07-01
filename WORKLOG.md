@@ -5,6 +5,51 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-07-01 — Time-forward offline ranking metrics
+
+**Change.** `scripts/eval_ranker_variants.py` now defaults to
+`--split temporal`: valid feedback is ordered by `updated_at`, the first
+50% is initial training history, and the remaining feedback is evaluated
+in expanding-window chronological folds. The previous shuffled
+`StratifiedKFold` behavior remains available with `--split stratified`.
+
+**Metrics.** Raw and MMR reports now include `ndcg_at_12`,
+`up_recall_at_12`, `up_recall_at_40`, and `hit_at_40` while preserving
+the old metric names. Reports also include top-level `baselines` for
+candidate order, HN gravity, and centroid up-minus-down using the same
+folds and aggregation shape as variants.
+
+**Verification.**
+- `uv run pytest tests/test_eval_ranker_variants.py -q` = 8 passed.
+- `uv run pytest tests/ -n 4` = 448 passed, 1 skipped.
+- `uv run ruff check .` = clean.
+- `uv run ty check` = clean.
+- `uv run python scripts/eval_ranker_variants.py --output /tmp/eval_ranker_variants_metrics.json --variants margin3_up,binary_margin_no_neutral --folds 5 --svm-c 0.1 --leak-check` = clean. Temporal raw NDCG@40: `margin3_up` 0.2155, `binary_margin_no_neutral` 0.2112. Shuffled/raw ratios: 0.05 and 0.37.
+
+---
+
+## 2026-07-01 — Offline eval candidate pool aligned with production legs
+
+**Change.** Extracted the personalized dashboard candidate SQL into
+`load_production_candidate_stories()`, preserving the four production
+legs: recent HN gravity order, recent non-HN recency order, archive HN
+seed score order, and archive non-HN recency order. Runtime ranking now
+uses the helper with feedback exclusion unchanged.
+
+**Eval.** `scripts/eval_ranker_variants.py` now loads candidates through
+the same production legs with `exclude_feedback=False`, so held-out
+feedback stories can remain measurable. Fold construction still removes
+only training feedback IDs from that fold's candidate list. The output
+config records `candidate_loader = "production_legs"`.
+
+**Verification.**
+- `uv run pytest tests/ -n 4` = 441 passed, 1 skipped.
+- `uv run ruff check .` = clean.
+- `uv run ty check` = clean.
+- `uv run python scripts/eval_ranker_variants.py --output /tmp/eval_ranker_variants_user1_prodlegs.json --variants margin3_up,binary_margin_no_neutral --folds 5 --svm-c 0.1 --leak-check` = clean. Normal raw NDCG@40: `margin3_up` 0.4198, `binary_margin_no_neutral` 0.4105. Shuffled/raw ratios: 0.09 and 0.08.
+
+---
+
 ## 2026-07-01 — Replace trafilatura with jusText-primary extraction cascade
 
 trafilatura extracts the "MOST POPULAR" sidebar from The Register as the
