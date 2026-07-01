@@ -1526,8 +1526,17 @@ class Handler(BaseHTTPRequestHandler):
                             int(previous["failure_count"]) if previous else 0
                         )
                         failure_count = previous_count + 1
-                        permanent = result.permanent or (
-                            result.error == "empty_extraction" and failure_count >= 3
+                        permanent = (
+                            result.permanent
+                            or (
+                                result.error == "empty_extraction"
+                                and failure_count >= 3
+                            )
+                            or (
+                                result.error is not None
+                                and result.error in ("http_401", "http_403")
+                                and failure_count >= 3
+                            )
                         )
                         next_retry_at = (
                             now_ts + 3650 * 86400

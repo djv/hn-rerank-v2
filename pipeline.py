@@ -281,6 +281,103 @@ def build_cold_deck(db: Database, user_id: int | None = None) -> list[RankedStor
     return cold
 
 
+def load_production_candidate_stories(
+    db: Database,
+    config: Config,
+    *,
+    user_id: int | None,
+    exclude_feedback: bool,
+    now_ts: int | None = None,
+) -> list[Story]:
+    """Load the same four candidate legs used by the personalized dashboard.
+
+    ``exclude_feedback=False`` is for offline evaluation: the initial pool
+    needs feedback stories present so held-out folds can be measured.
+    """
+    if exclude_feedback and user_id is None:
+        raise ValueError("user_id is required when exclude_feedback=True")
+
+    now = now_ts if now_ts is not None else int(time.time())
+    cutoff_ts = now - (config.days * 86400)
+    feedback_filter = (
+        "  AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?) "
+        if exclude_feedback
+        else ""
+    )
+    feedback_params: tuple[int, ...] = (
+        (user_id,) if exclude_feedback and user_id else ()
+    )
+
+    # Four production legs: recent HN by gravity, recent non-HN by recency,
+    # archive HN seeds by score, and archive non-HN by recency.
+    hn_rows = db.execute(
+        "SELECT id, title, url, score, time, text_content, source, comment_count, "
+        "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
+        "FROM stories "
+        "WHERE time >= ? AND source = 'hn' "
+        f"{feedback_filter}"
+        "ORDER BY CAST(score AS REAL) / POW((? - time) / 3600.0 + 2.0, 1.8) DESC, "
+        "         time DESC "
+        "LIMIT ?",
+        (
+            cutoff_ts,
+            *feedback_params,
+            now,
+            config.recent_candidate_hn_limit,
+        ),
+    )
+    rss_rows = db.execute(
+        "SELECT id, title, url, score, time, text_content, source, comment_count, "
+        "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
+        "FROM stories "
+        "WHERE time >= ? AND source != 'hn' AND source NOT IN (?, ?) "
+        f"{feedback_filter}"
+        "ORDER BY time DESC "
+        "LIMIT ?",
+        (
+            cutoff_ts,
+            BQ_ARCHIVE_SOURCE,
+            CH_ARCHIVE_SOURCE,
+            *feedback_params,
+            config.recent_candidate_rss_limit,
+        ),
+    )
+    archive_rows = db.execute(
+        "SELECT id, title, url, score, time, text_content, source, comment_count, "
+        "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
+        "FROM stories WHERE source IN (?, ?) AND text_content != '' "
+        f"{feedback_filter}"
+        "ORDER BY score DESC, time DESC LIMIT ?",
+        (
+            BQ_ARCHIVE_SOURCE,
+            CH_ARCHIVE_SOURCE,
+            *feedback_params,
+            BQ_ARCHIVE_CANDIDATE_LIMIT + CH_ARCHIVE_CANDIDATE_LIMIT,
+        ),
+    )
+    archive_rss_rows = db.execute(
+        "SELECT id, title, url, score, time, text_content, source, comment_count, "
+        "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
+        "FROM stories "
+        "WHERE source != 'hn' AND source NOT IN (?, ?) AND time < ? "
+        f"{feedback_filter}"
+        "ORDER BY time DESC LIMIT ?",
+        (
+            BQ_ARCHIVE_SOURCE,
+            CH_ARCHIVE_SOURCE,
+            cutoff_ts,
+            *feedback_params,
+            config.recent_candidate_rss_limit,
+        ),
+    )
+    rows = hn_rows + rss_rows + archive_rows + archive_rss_rows
+    return [
+        story
+        for story in (Database._row_to_story(row) for row in rows)
+        if is_summarizable(story)
+    ]
+
+
 def _needs_hn_prewarm(s: Story) -> bool:
     """Whether the regen prewarm should refresh this HN story's ``top_comments``.
 
@@ -2796,7 +2893,15 @@ def _article_fetch_extra_priority(
 
 
 _PAYWALL_DOMAINS: frozenset[str] = frozenset(
-    {"bloomberg.com", "economist.com", "ft.com", "nytimes.com", "wsj.com"}
+    {
+        "bloomberg.com",
+        "economist.com",
+        "ft.com",
+        "nytimes.com",
+        "wsj.com",
+        "reuters.com",
+        "axios.com",
+    }
 )
 
 
@@ -2930,8 +3035,14 @@ async def fetch_and_cache_article_bodies(
             previous = db.get_article_fetch_failure(story.id)
             previous_count = int(previous["failure_count"]) if previous else 0
             failure_count = previous_count + 1
-            permanent = result.permanent or (
-                result.error == "empty_extraction" and failure_count >= 3
+            permanent = (
+                result.permanent
+                or (result.error == "empty_extraction" and failure_count >= 3)
+                or (
+                    result.error is not None
+                    and result.error in ("http_401", "http_403")
+                    and failure_count >= 3
+                )
             )
             next_retry_at = (
                 now_ts + 3650 * 86400
@@ -3180,76 +3291,14 @@ def fast_rerank_for_user(
         trace.set_label("model_cache", "skipped_cold_deck")
         return build_cold_deck(db)
 
-    now_ts = int(time.time())
-    cutoff_ts = now_ts - (config.days * 86400)
-
     with trace.stage("candidate_sql"):
-        # Two-leg recent query: HN stories ordered by tier-1 gravity
-        # (score/age^1.8, mirroring the cold-start tier-1 blend in
-        # _score_and_rank); non-HN RSS stories ordered by recency only
-        # (RSS sources have score=0 in the DB so tier-1 is uninformative
-        # there, and recency keeps the non-HN discovery passes from
-        # losing representation). Cap sizes come from Config.
-        hn_rows = db.execute(
-            "SELECT id, title, url, score, time, text_content, source, comment_count, "
-            "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
-            "FROM stories "
-            "WHERE time >= ? AND source = 'hn' "
-            "  AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?) "
-            "ORDER BY CAST(score AS REAL) / POW((? - time) / 3600.0 + 2.0, 1.8) DESC, "
-            "         time DESC "
-            "LIMIT ?",
-            (cutoff_ts, user_id, now_ts, config.recent_candidate_hn_limit),
+        candidates = load_production_candidate_stories(
+            db,
+            config,
+            user_id=user_id,
+            exclude_feedback=True,
         )
-        rss_rows = db.execute(
-            "SELECT id, title, url, score, time, text_content, source, comment_count, "
-            "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
-            "FROM stories "
-            "WHERE time >= ? AND source != 'hn' AND source NOT IN (?, ?) "
-            "  AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?) "
-            "ORDER BY time DESC "
-            "LIMIT ?",
-            (
-                cutoff_ts,
-                BQ_ARCHIVE_SOURCE,
-                CH_ARCHIVE_SOURCE,
-                user_id,
-                config.recent_candidate_rss_limit,
-            ),
-        )
-        archive_rows = db.execute(
-            "SELECT id, title, url, score, time, text_content, source, comment_count, "
-            "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
-            "FROM stories WHERE source IN (?, ?) AND text_content != '' "
-            "AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?) "
-            "ORDER BY score DESC, time DESC LIMIT ?",
-            (
-                BQ_ARCHIVE_SOURCE,
-                CH_ARCHIVE_SOURCE,
-                user_id,
-                BQ_ARCHIVE_CANDIDATE_LIMIT + CH_ARCHIVE_CANDIDATE_LIMIT,
-            ),
-        )
-        archive_rss_rows = db.execute(
-            "SELECT id, title, url, score, time, text_content, source, comment_count, "
-            "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
-            "FROM stories "
-            "WHERE source != 'hn' AND source NOT IN (?, ?) AND time < ? "
-            "  AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?) "
-            "ORDER BY time DESC LIMIT ?",
-            (
-                BQ_ARCHIVE_SOURCE,
-                CH_ARCHIVE_SOURCE,
-                cutoff_ts,
-                user_id,
-                config.recent_candidate_rss_limit,
-            ),
-        )
-    rows = hn_rows + rss_rows + archive_rows + archive_rss_rows
-    candidates = [Database._row_to_story(row) for row in rows]
-    candidates = [s for s in candidates if is_summarizable(s)]
     if trace is not None:
-        trace.set_count("candidate_rows", len(rows))
         trace.set_count("candidates", len(candidates))
     if not candidates:
         return []

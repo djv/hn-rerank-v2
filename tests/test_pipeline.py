@@ -20,6 +20,7 @@ from pipeline import (
     compose_story_text,
     get_or_compute_embeddings,
     is_hn_source,
+    load_production_candidate_stories,
     mmr_filter,
     _score_and_rank,
     Config,
@@ -1916,6 +1917,97 @@ def test_fast_rerank_for_user_filters_unsummarizable_stories(db, monkeypatch):
     result_ids = {r.story.id for r in ranked}
     assert summarizable_id in result_ids
     assert unsummarizable_id not in result_ids
+
+
+def _candidate_story(
+    sid: int,
+    *,
+    source: str,
+    score: int,
+    time_ts: int,
+    comment_count: int | None = 0,
+    article_body: str = "body",
+    text_content: str = "story text",
+) -> Story:
+    return Story(
+        id=sid,
+        title=f"Candidate {sid}",
+        url=f"https://example.com/candidate/{sid}",
+        score=score,
+        time=time_ts,
+        text_content=text_content,
+        source=source,
+        comment_count=comment_count,
+        article_body=article_body,
+    )
+
+
+def test_load_production_candidate_stories_preserves_leg_order_and_limits(
+    db: Database,
+) -> None:
+    user = db.create_user("candidate_leg_order")
+    now = 2_000_000_000
+    old = now - 60 * 86400
+    config = Config(days=30, recent_candidate_hn_limit=2, recent_candidate_rss_limit=2)
+    for story in (
+        _candidate_story(
+            1, source="hn", score=100, time_ts=now - 3600, comment_count=1
+        ),
+        _candidate_story(
+            2, source="hn", score=500, time_ts=now - 100 * 3600, comment_count=1
+        ),
+        _candidate_story(3, source="hn", score=0, time_ts=now - 60, comment_count=1),
+        _candidate_story(10, source="rss_a", score=0, time_ts=now - 60),
+        _candidate_story(11, source="rss_a", score=0, time_ts=now - 120),
+        _candidate_story(12, source="rss_a", score=0, time_ts=now - 30_000),
+        _candidate_story(20, source=BQ_ARCHIVE_SOURCE, score=900, time_ts=old),
+        _candidate_story(21, source=CH_ARCHIVE_SOURCE, score=950, time_ts=old - 1),
+        _candidate_story(30, source="rss_old", score=0, time_ts=old),
+        _candidate_story(31, source="rss_old", score=0, time_ts=old - 10),
+        _candidate_story(32, source="rss_old", score=0, time_ts=old - 20),
+    ):
+        db.upsert_story(story)
+
+    candidates = load_production_candidate_stories(
+        db, config, user_id=user.id, exclude_feedback=True, now_ts=now
+    )
+
+    assert [story.id for story in candidates] == [1, 2, 10, 11, 21, 20, 30, 31]
+
+
+def test_load_production_candidate_stories_feedback_switch_and_summarizable_filter(
+    db: Database,
+) -> None:
+    user = db.create_user("candidate_feedback_switch")
+    now = 2_000_000_000
+    config = Config(
+        days=30, recent_candidate_hn_limit=10, recent_candidate_rss_limit=10
+    )
+    db.upsert_story(
+        _candidate_story(1, source="hn", score=10, time_ts=now - 60, comment_count=1)
+    )
+    db.upsert_story(
+        _candidate_story(
+            2,
+            source="hn",
+            score=20,
+            time_ts=now - 120,
+            comment_count=0,
+            article_body="",
+            text_content="unsummarizable text cache",
+        )
+    )
+    db.upsert_feedback(user.id, 1, "up")
+
+    excluded = load_production_candidate_stories(
+        db, config, user_id=user.id, exclude_feedback=True, now_ts=now
+    )
+    included = load_production_candidate_stories(
+        db, config, user_id=user.id, exclude_feedback=False, now_ts=now
+    )
+
+    assert [story.id for story in excluded] == []
+    assert [story.id for story in included] == [1]
 
 
 def test_fast_rerank_for_user_zero_vote_returns_cold_deck(
@@ -5873,7 +5965,15 @@ def test_article_fetch_batch_logs_summary(db, caplog, monkeypatch):
 def test_select_article_fetch_excludes_paywall_domains(db):
     """Hard-paywall domain articles must not be selected for body fetch."""
     now = 2_000_000_000.0
-    domains = ["bloomberg.com", "economist.com", "ft.com", "nytimes.com", "wsj.com"]
+    domains = [
+        "bloomberg.com",
+        "economist.com",
+        "ft.com",
+        "nytimes.com",
+        "wsj.com",
+        "reuters.com",
+        "axios.com",
+    ]
     for i, domain in enumerate(domains):
         s = Story(
             id=400 + i,
@@ -5940,6 +6040,10 @@ def test_is_fetchable_article_url():
     assert not _is_fetchable_article_url("https://www.economist.com/article/123")
     assert not _is_fetchable_article_url("https://ft.com/content/abc123")
     assert not _is_fetchable_article_url("https://www.wsj.com/articles/123")
+    assert not _is_fetchable_article_url("https://reuters.com/world/example-article")
+    assert not _is_fetchable_article_url(
+        "https://www.axios.com/2026/06/12/some-article"
+    )
 
     # YouTube
     assert not _is_fetchable_article_url("https://www.youtube.com/watch?v=abc123")
@@ -5953,3 +6057,59 @@ def test_is_fetchable_article_url():
 
     # Empty/None
     assert not _is_fetchable_article_url("")
+
+
+def test_article_fetch_http_4xx_becomes_permanent(db, monkeypatch):
+    """401 and 403 failures become permanent after 3 attempts (batch path)."""
+    import server
+
+    story = Story(
+        id=601,
+        title="Paywalled article",
+        url="https://reuters.com/example/article",
+        score=10,
+        time=int(time.time()) - 3600,
+        text_content="text",
+        source="hn",
+    )
+    db.upsert_story(story)
+    db.record_article_fetch_failure(
+        story_id=story.id,
+        url=story.url or "",
+        status=401,
+        error="http_401",
+        permanent=False,
+        next_retry_at=0.0,
+    )
+    # Bump count to 2 so the next fetch triggers the failure_count >= 3 gate
+    with db.conn() as conn:
+        conn.execute(
+            "UPDATE article_fetch_failures SET failure_count = 2 WHERE story_id = ?",
+            (story.id,),
+        )
+
+    async def failing_401(_url: str) -> server.ArticleFetchResult:
+        return server.ArticleFetchResult(
+            body=None,
+            status=401,
+            error="http_401",
+            permanent=False,
+        )
+
+    monkeypatch.setattr(server, "_fetch_article_body_with_result", failing_401)
+
+    import asyncio
+
+    asyncio.run(
+        pipeline.fetch_and_cache_article_bodies(
+            db=db,
+            embedder=_DummyEmbedder(),
+            stories=[story],
+            concurrency=1,
+        )
+    )
+
+    failure = db.get_article_fetch_failure(story.id)
+    assert failure is not None
+    assert failure["failure_count"] == 3
+    assert failure["permanent"] == 1
