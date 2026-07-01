@@ -5,6 +5,30 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-06-30 — Tightened fullscreen vertical gutters
+
+**Change.** Desktop fullscreen now keeps the page body's top and bottom
+gutters at 0.5rem, removes extra block padding from the swipe shell, and drops
+the active card's base bottom margin only in fullscreen. The fullscreen shell
+height remains `calc(100vh - 1rem)` / `calc(100dvh - 1rem)`, so the viewport
+math still accounts for the 0.5rem body gutter on both edges.
+
+**Scope.** Normal desktop and mobile active-card padding are unchanged, so the
+fixed vote-bar clearance outside fullscreen is preserved.
+
+**Verification.**
+- `uv run pytest tests/test_server.py::test_keydown_uses_letter_keys` = passed.
+- `uv run pytest tests/ -n 4` = 431 passed, 1 skipped.
+- `uv run ruff check .` = clean.
+- `uv run ty check` = clean.
+- `git diff --check` = clean.
+- Restarted `hn_rewrite.service` and verified `http://127.0.0.1:8766/` with
+  Playwright at 1440x1000. Screenshots saved under `/tmp/hn-visual-check/`.
+  Fullscreen measured `cardTop=10px`, `bottomGutter=10px`,
+  `voteBarDisplay=none`, and `sideDisplay=none`.
+
+---
+
 ## 2026-06-30 — Normalize card padding and desktop fullscreen height
 
 Card-like dashboard surfaces now use calmer padding: queue pills, sort tabs,

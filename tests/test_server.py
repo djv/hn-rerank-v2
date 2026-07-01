@@ -8,7 +8,7 @@ import pytest
 from http.server import ThreadingHTTPServer
 from hypothesis import HealthCheck, given, settings, strategies as st
 
-from typing import Any
+from typing import Any, cast
 
 from server import Handler, SKELETON_HTML
 from pipeline import Config, Embedder, RankedStory
@@ -891,7 +891,7 @@ def test_no_cache_user_gets_cold_deck_and_warm_is_scheduled(
     assert html == b"cold html"
     assert calls == [(user.id, 3)]
     rank = rendered[0]
-    ranked_list: list[RankedStory] = rank["ranked"]  # type: ignore[assignment]
+    ranked_list = cast(list[RankedStory], rank["ranked"])
     story_ids = [rs.story.id for rs in ranked_list]
     assert story_ids == [992]
     assert 991 not in story_ids
@@ -2273,11 +2273,17 @@ def test_keydown_uses_letter_keys():
     # fullscreen hides side controls and lets the active card fill viewport height
     assert ".fullscreen .swipe-side { display: none; }" in template
     assert ".fullscreen .vote-bar { display: none; }" in template
+    fullscreen_body_block = template.split("body.fullscreen {", 1)[1].split(
+        "}", 1
+    )[0]
+    assert "padding-top: 0.5rem;" in fullscreen_body_block
+    assert "padding-bottom: 0.5rem;" in fullscreen_body_block
     fullscreen_shell_block = template.split(".fullscreen .swipe-shell {", 1)[1].split(
         "}", 1
     )[0]
     assert "height: calc(100vh - 1rem);" in fullscreen_shell_block
     assert "height: calc(100dvh - 1rem);" in fullscreen_shell_block
+    assert "padding-block: 0;" in fullscreen_shell_block
     assert "display: flex;" in fullscreen_shell_block
     assert "flex-direction: column;" in fullscreen_shell_block
     fullscreen_flex_block = template.split(
@@ -2298,6 +2304,7 @@ def test_keydown_uses_letter_keys():
     ].split("}", 1)[0]
     assert "height: 100%;" in fullscreen_active_block
     assert "max-height: 100%;" in fullscreen_active_block
+    assert "margin-bottom: 0;" in fullscreen_active_block
     assert "overflow: auto;" in fullscreen_active_block
     assert "padding-bottom: 0.5rem;" in fullscreen_active_block
     # mobile side-rail stack (column, keys hidden)
