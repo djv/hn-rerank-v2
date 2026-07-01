@@ -4,16 +4,13 @@ import time
 from dataclasses import replace
 from typing import Literal, cast
 
+import numpy as np
 import pytest
 from database import Database, FeedbackRecord, Story
 from dedup import (
     DedupConfig,
-    canonical_domain,
     dedup_ranked,
-    hamming64,
-    normalize_title,
     normalize_url,
-    simhash64,
 )
 from hypothesis import HealthCheck, given, settings, strategies as st
 from pipeline import Config, Embedder, fast_rerank_for_user
@@ -114,90 +111,6 @@ def test_normalize_url_property_idempotent_on_variants(raw: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# canonical_domain
-# ---------------------------------------------------------------------------
-
-
-def test_canonical_domain_strips_www() -> None:
-    assert canonical_domain("https://www.theverge.com/x") == "theverge.com"
-    assert canonical_domain("https://theverge.com/x") == "theverge.com"
-
-
-def test_canonical_domain_handles_reddit_subdomains() -> None:
-    assert canonical_domain("https://old.reddit.com/r/foo") == "reddit.com"
-    assert canonical_domain("https://www.reddit.com/r/foo") == "reddit.com"
-
-
-def test_canonical_domain_unparseable() -> None:
-    assert canonical_domain(None) is None
-    assert canonical_domain("") is None
-    assert canonical_domain("not a url") is None
-
-
-# ---------------------------------------------------------------------------
-# normalize_title
-# ---------------------------------------------------------------------------
-
-
-def test_normalize_title_strips_hn_leadins() -> None:
-    assert normalize_title("Show HN: My new tool") == normalize_title("my new tool")
-    assert normalize_title("Ask HN: best editor?") == normalize_title("best editor")
-    assert normalize_title("Tell HN: story time") == normalize_title("story time")
-
-
-def test_normalize_title_idempotent() -> None:
-    sample = "Show HN: A Cool Project! (Part 1)  "
-    once = normalize_title(sample)
-    twice = normalize_title(once)
-    assert once == twice
-    assert once == "a cool project part 1"
-
-
-# ---------------------------------------------------------------------------
-# simhash64
-# ---------------------------------------------------------------------------
-
-
-def test_simhash64_deterministic() -> None:
-    text = "OpenAI will delay GPT-5.6 after Trump administration request"
-    assert simhash64(text) == simhash64(text)
-
-
-def test_simhash64_near_duplicates_within_budget() -> None:
-    base = "OpenAI will delay GPT-5.6 after Trump administration request"
-    near = "openai will delay gpt-5.6 after Trump Administration Request"
-    hamming = hamming64(simhash64(base), simhash64(near))
-    assert hamming <= 4, f"near-titles should be within 4 bits, got {hamming}"
-
-
-def test_simhash64_one_word_difference_large_hamming() -> None:
-    """Differing by one word out of N produces ~64/N bits of hamming — typically 8+.
-
-    This is the expected behavior of SimHash: it preserves cosine
-    similarity, not edit distance. Useful to know when choosing a
-    threshold.
-    """
-    base = "OpenAI will delay GPT-5.6 after Trump administration request"
-    near = "OpenAI will delay GPT-5.6 after Trump administration"
-    hamming = hamming64(simhash64(base), simhash64(near))
-    # We expect hamming around 8-12 (one word of ~8 differs).
-    assert hamming > 4, f"one-word difference should be > 4 bits, got {hamming}"
-
-
-def test_simhash64_unrelated_far_apart() -> None:
-    a = "Recipe for chocolate chip cookies"
-    b = "Quantum supremacy paper from Google"
-    hamming = hamming64(simhash64(a), simhash64(b))
-    assert hamming > 8, f"unrelated titles should be far apart, got {hamming}"
-
-
-def test_simhash64_empty_returns_zero() -> None:
-    assert simhash64("") == 0
-    assert simhash64("   ") == 0
-    assert simhash64("!@#$%^&*()") == 0
-
-
-# ---------------------------------------------------------------------------
 # dedup_ranked — URL dedup
 # ---------------------------------------------------------------------------
 
@@ -216,6 +129,10 @@ def _story(sid: int, *, url: str | None, source: str, score: int = 100) -> Story
 
 def _with_title(story: Story, title: str) -> Story:
     return replace(story, title=title)
+
+
+def _with_text(story: Story, text_content: str) -> Story:
+    return replace(story, text_content=text_content)
 
 
 def test_dedup_ranked_disabled_returns_input_unchanged() -> None:
@@ -318,135 +235,93 @@ def test_dedup_ranked_url_exclusion_uses_normalization() -> None:
 
 
 # ---------------------------------------------------------------------------
-# dedup_ranked — title fuzzy (off by default)
+# dedup_ranked — embedding cosine dedup
 # ---------------------------------------------------------------------------
 
 
-def test_dedup_ranked_title_fuzzy_off_by_default() -> None:
-    """Title fuzzy dedup is gated by the flag — off default → no merge."""
-    a = _story(
-        1,
-        url="https://www.theverge.com/x",
-        source="hn",
-        score=10,
-    )
-    b = _story(
-        2,
-        url="https://www.theverge.com/y",  # different URL
-        source="rss_reddit_x",
-        score=10,
-    )
-    a = _with_title(a, "OpenAI Delays GPT-5.6 Announcement")
-    b = _with_title(b, "OpenAI delays GPT 5 6 announcement")
-    cfg = DedupConfig(title_fuzzy_enabled=False)
-    assert [s.id for s in dedup_ranked([a, b], [], cfg)] == [1, 2]
+def _unit_vec(bits: int) -> np.ndarray:
+    """Return a unit-norm vector encoding *bits* (or zeros if bits==0)."""
+    if bits == 0:
+        return np.zeros(384, dtype=np.float32)
+    vec = np.array([float(bits & (1 << i) and 1) for i in range(384)], dtype=np.float32)
+    norm = np.linalg.norm(vec)
+    return (vec / norm).astype(np.float32) if norm > 0 else vec
 
 
-def test_dedup_ranked_title_fuzzy_merges_same_domain() -> None:
-    a = _story(
-        1,
-        url="https://www.theverge.com/x",
-        source="hn",
-        score=10,
-    )
-    b = _story(
-        2,
-        url="https://www.theverge.com/y",
-        source="rss_reddit_x",
-        score=10,
-    )
-    # Titles differ only in punctuation/case — same tokens.
-    a = _with_title(a, "OpenAI Delays GPT-5.6 Announcement")
-    b = _with_title(b, "OpenAI delays GPT 5 6 announcement")
-    cfg = DedupConfig(title_fuzzy_enabled=True, title_fuzzy_hamming=2)
-    out = dedup_ranked([a, b], [], cfg)
+def _emb_map(stories: list[Story], vec_fn) -> dict[int, np.ndarray]:
+    """Build an id→embedding map from stories using *vec_fn(story.id)*."""
+    return {s.id: vec_fn(s.id) for s in stories}
+
+
+def test_embedding_cosine_merges_near_identical() -> None:
+    """Stories with identical-content embeddings are deduped."""
+    # Same vector = cosine 1.0, well above 0.87 threshold
+    a = _story(1, url="https://a.com/x", source="hn", score=50)
+    b = _story(2, url="https://b.com/x", source="rss_slashdot_org", score=10)
+    v = _unit_vec(1)
+    embeddings = {1: v, 2: v}
+    out = dedup_ranked([a, b], [], DedupConfig(), embeddings=embeddings)
     assert len(out) == 1
-    # HN wins on source preference
-    assert out[0].id == 1
+    assert out[0].id == 1  # HN wins source preference
 
 
-def test_dedup_ranked_title_fuzzy_does_not_merge_different_domains() -> None:
-    a = _story(
-        1,
-        url="https://www.theverge.com/x",
-        source="hn",
-        score=10,
-    )
-    b = _story(
-        2,
-        url="https://www.wired.com/y",
-        source="rss_reddit_x",
-        score=10,
-    )
-    a = _with_title(a, "OpenAI Delays GPT-5.6 Announcement")
-    b = _with_title(b, "OpenAI delays GPT 5 6 announcement")
-    cfg = DedupConfig(title_fuzzy_enabled=True, title_fuzzy_hamming=2)
-    out = dedup_ranked([a, b], [], cfg)
+def test_embedding_cosine_keeps_different_content() -> None:
+    """Stories with different embeddings (low cosine sim) are not merged."""
+    a = _story(1, url="https://a.com/x", source="hn")
+    b = _story(2, url="https://b.com/y", source="rss_slashdot_org")
+    # Orthogonal vectors → cos ~ 0.0, below 0.87
+    embeddings = {1: _unit_vec(1), 2: _unit_vec(2)}
+    out = dedup_ranked([a, b], [], DedupConfig(), embeddings=embeddings)
     assert [s.id for s in out] == [1, 2]
 
 
-def test_dedup_ranked_title_fuzzy_can_disable_domain_guard() -> None:
-    a = _story(
-        1,
-        url="https://www.theverge.com/x",
-        source="hn",
-        score=10,
-    )
-    b = _story(
-        2,
-        url="https://www.wired.com/y",
-        source="rss_reddit_x",
-        score=10,
-    )
-    a = _with_title(a, "OpenAI Delays GPT-5.6 Announcement")
-    b = _with_title(b, "OpenAI delays GPT 5 6 announcement")
-    cfg = DedupConfig(
-        title_fuzzy_enabled=True,
-        title_fuzzy_hamming=2,
-        require_same_domain_for_fuzzy=False,
-    )
-    out = dedup_ranked([a, b], [], cfg)
+def test_embedding_cosine_below_threshold_not_merged() -> None:
+    """Stories whose cosine sim is below the threshold are kept separate."""
+    a = _story(1, url="https://a.com/x", source="hn")
+    b = _story(2, url="https://b.com/y", source="rss_slashdot_org")
+    # Build two vectors with controlled cosine sim ~0.80 (< 0.87)
+    # v1 = [1, 0, 0, ...], v2 = [0.8, 0.6, 0, ...] → dot = 0.8
+    v1 = np.zeros(384, dtype=np.float32)
+    v1[0] = 1.0
+    v2 = np.zeros(384, dtype=np.float32)
+    v2[0] = 0.8
+    v2[1] = 0.6
+    cos_sim = float(np.dot(v1, v2))
+    assert 0.75 < cos_sim < 0.87, f"cosine sim {cos_sim:.4f} should be in (0.75, 0.87)"
+    embeddings = {1: v1, 2: v2}
+    out = dedup_ranked([a, b], [], DedupConfig(), embeddings=embeddings)
+    assert [s.id for s in out] == [1, 2]
+
+
+def test_embedding_cosine_disabled() -> None:
+    """When embedding cosine is disabled, different-url stories pass through."""
+    a = _story(1, url="https://a.com/x", source="hn")
+    b = _story(2, url="https://b.com/x", source="rss_slashdot_org")
+    v = _unit_vec(1)
+    embeddings = {1: v, 2: v}
+    cfg = DedupConfig(embedding_cosine_enabled=False)
+    out = dedup_ranked([a, b], [], cfg, embeddings=embeddings)
+    assert [s.id for s in out] == [1, 2]
+
+
+def test_embedding_cosine_source_preference_tiebreak() -> None:
+    """When a slashdot story appears first, the later HN story wins the swap."""
+    a = _story(1, url="https://slashdot.org/story", source="rss_slashdot_org", score=50)
+    b = _story(2, url="https://arstechnica.com/article", source="hn", score=100)
+    v = _unit_vec(1)
+    embeddings = {1: v, 2: v}
+    out = dedup_ranked([a, b], [], DedupConfig(), embeddings=embeddings)
     assert len(out) == 1
+    assert out[0].id == 2  # HN wins even though slashdot was first
 
 
-# ---------------------------------------------------------------------------
-# dedup_ranked — feedback title exclusion (only with fuzzy enabled)
-# ---------------------------------------------------------------------------
-
-
-def test_dedup_ranked_feedback_title_exclusion_only_with_fuzzy() -> None:
-    a = _story(
-        1,
-        url="https://www.theverge.com/x",
-        source="hn",
-        score=10,
-    )
-    a = _with_title(a, "OpenAI Delays GPT-5.6 Announcement")
-    feedback = [
-        _fb(
-            99,
-            "up",
-            url="https://www.wired.com/y",
-            title="OpenAI delays GPT 5 6 announcement",
-        )
-    ]
-    # Fuzzy disabled → no title-based feedback exclusion.
-    out_off = dedup_ranked([a], feedback, DedupConfig(title_fuzzy_enabled=False))
-    assert [s.id for s in out_off] == [1]
-    # Fuzzy enabled with same-domain guard → different domains, no exclusion.
-    out_on = dedup_ranked(
-        [a],
-        feedback,
-        DedupConfig(title_fuzzy_enabled=True, require_same_domain_for_fuzzy=True),
-    )
-    assert [s.id for s in out_on] == [1]
-    # Fuzzy enabled without domain guard → exclusion kicks in.
-    out_fuzzy = dedup_ranked(
-        [a],
-        feedback,
-        DedupConfig(title_fuzzy_enabled=True, require_same_domain_for_fuzzy=False),
-    )
-    assert out_fuzzy == []
+def test_embedding_cosine_no_embedding_for_story() -> None:
+    """Stories missing from the embedding map are kept (not deduped)."""
+    a = _story(1, url="https://a.com/x", source="hn")
+    b = _story(2, url="https://b.com/x", source="rss_slashdot_org")
+    embeddings = {1: _unit_vec(1)}  # b has no embedding
+    out = dedup_ranked([a, b], [], DedupConfig(), embeddings=embeddings)
+    assert [s.id for s in out] == [1, 2]
 
 
 # ---------------------------------------------------------------------------
@@ -587,7 +462,7 @@ def test_dedup_ranked_emits_info_summary(caplog) -> None:
     assert "suppressed=1" in msg
     assert "url_dups=1" in msg
     assert "fb_url=0" in msg
-    assert "title_fuzzy=off" in msg
+    assert "embedding=off" in msg
 
 
 def test_dedup_ranked_emits_debug_per_suppression(caplog) -> None:
@@ -632,34 +507,36 @@ def test_dedup_ranked_logs_fb_url_suppression(caplog) -> None:
     assert "fb_url=1" in summary.message
 
 
-def test_dedup_ranked_logs_title_fuzzy_when_enabled(caplog) -> None:
-    """Title-fuzzy suppressions get reason=title_fuzzy DEBUG lines."""
-    a = _make_story(1, "hn", "https://a.com/p", "Show HN: My Project")
-    b = _make_story(2, "ch_seed", "https://a.com/p2", "Show HN: My Project (Repost)")
-    a_url = _make_story(3, "hn", "https://a.com/q", "Unrelated story")
-    # a and b share neither URL nor domain, so URL dedup leaves them.
-    # Normalized titles differ only in the "(Repost)" suffix → SimHash
-    # hamming should be small, but they share domain 'a.com' so the
-    # title-fuzzy layer (if on) clusters them.
+def test_dedup_ranked_logs_embedding_cosine_when_enabled(caplog) -> None:
+    """Embedding-cosine suppressions get reason=embedding_cosine DEBUG lines."""
+    a = _make_story(1, "hn", "https://a.com/p", "South Korea chips")
+    b = _make_story(
+        2, "rss_slashdot_org", "https://slashdot.org/story", "South Korea To Spend $1T"
+    )
+    # Same embedding → cosine 1.0, above 0.87 threshold
+    v = np.ones(384, dtype=np.float32) / np.sqrt(384)  # unit norm
+    embeddings = {1: v, 2: v}
     with caplog.at_level("DEBUG", logger="dedup"):
         dedup_ranked(
-            [a, b, a_url],
+            [a, b],
             [],
-            DedupConfig(title_fuzzy_enabled=True, title_fuzzy_hamming=4),
+            DedupConfig(),
             user_id=3,
+            embeddings=embeddings,
         )
     summary = [r for r in caplog.records if r.message.startswith("dedup user_id=")][0]
-    assert "title_fuzzy=on" in summary.message
-    # Reason lines for title-fuzzy should appear when a match occurs.
-    fuzzy_lines = [
+    assert "embedding=on" in summary.message
+    assert "embedding_dups=1" in summary.message
+    cosine_lines = [
         r
         for r in caplog.records
-        if r.message.startswith("dedup-suppress ") and "reason=title_fuzzy" in r.message
+        if r.message.startswith("dedup-suppress ")
+        and "reason=embedding_cosine" in r.message
     ]
-    # We don't assert exact count (depends on SimHash hamming of the
-    # specific test titles) — just that the layer was engaged and a
-    # summary line was emitted.
-    assert isinstance(fuzzy_lines, list)
+    assert len(cosine_lines) == 1
+    assert "dropped_source=rss_slashdot_org" in cosine_lines[0].message
+    assert "kept_source=hn" in cosine_lines[0].message
+    assert "cosine_sim=" in cosine_lines[0].message
 
 
 def test_dedup_ranked_no_suppression_still_logs_summary(caplog) -> None:

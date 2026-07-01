@@ -57,9 +57,8 @@ class ModelConfig:
     non_hn_ramp_window: int = 30
     hot_badge_percentile: float = 99.5
     dedup_render_enabled: bool = True
-    dedup_title_fuzzy_enabled: bool = False
-    dedup_title_fuzzy_hamming: int = 2
-    dedup_title_fuzzy_same_domain: bool = True
+    dedup_embedding_cosine_enabled: bool = True
+    dedup_embedding_cosine_threshold: float = 0.87
     dedup_exclude_actions: tuple[str, ...] = ("up", "neutral")
 
 
@@ -477,12 +476,11 @@ class Config:
                 non_hn_ramp_window=model_cfg.get("non_hn_ramp_window", 30),
                 hot_badge_percentile=model_cfg.get("hot_badge_percentile", 99.5),
                 dedup_render_enabled=model_cfg.get("dedup_render_enabled", True),
-                dedup_title_fuzzy_enabled=model_cfg.get(
-                    "dedup_title_fuzzy_enabled", False
+                dedup_embedding_cosine_enabled=model_cfg.get(
+                    "dedup_embedding_cosine_enabled", True
                 ),
-                dedup_title_fuzzy_hamming=model_cfg.get("dedup_title_fuzzy_hamming", 2),
-                dedup_title_fuzzy_same_domain=model_cfg.get(
-                    "dedup_title_fuzzy_same_domain", True
+                dedup_embedding_cosine_threshold=model_cfg.get(
+                    "dedup_embedding_cosine_threshold", 0.87
                 ),
                 dedup_exclude_actions=tuple(
                     model_cfg.get("dedup_exclude_actions", ("up", "neutral"))
@@ -3024,7 +3022,10 @@ def fast_rerank_for_user(
     )
 
     with trace.stage("dedup"):
-        return _apply_dedup_to_ranked(ranked, db, config, user_id)
+        id_to_emb: dict[int, NDArray[np.float32]] = {
+            s.id: vec for s, vec in zip(candidates, cand_embeddings)
+        }
+        return _apply_dedup_to_ranked(ranked, db, config, user_id, embeddings=id_to_emb)
 
 
 def _apply_dedup_to_ranked(
@@ -3032,10 +3033,11 @@ def _apply_dedup_to_ranked(
     db: Database,
     config: Config,
     user_id: int,
+    embeddings: dict[int, NDArray[np.float32]] | None = None,
 ) -> list[RankedStory]:
     """Filter *ranked* through :func:`dedup.dedup_ranked`.
 
-    Pulls this user's feedback (so the URL/title-exclusion logic has
+    Pulls this user's feedback (so the URL exclusion logic has
     data) and applies a :class:`dedup.DedupConfig` built from the
     :class:`ModelConfig`. Preserves the caller's rank order.
     """
@@ -3044,14 +3046,17 @@ def _apply_dedup_to_ranked(
     model_cfg = config.model
     dedup_cfg = DedupConfig(
         render_enabled=model_cfg.dedup_render_enabled,
-        title_fuzzy_enabled=model_cfg.dedup_title_fuzzy_enabled,
-        title_fuzzy_hamming=model_cfg.dedup_title_fuzzy_hamming,
-        require_same_domain_for_fuzzy=model_cfg.dedup_title_fuzzy_same_domain,
+        embedding_cosine_enabled=model_cfg.dedup_embedding_cosine_enabled,
+        embedding_cosine_threshold=model_cfg.dedup_embedding_cosine_threshold,
         exclude_actions=tuple(model_cfg.dedup_exclude_actions),
     )
     feedback = db.get_all_feedback(user_id=user_id)
     survivor_stories = dedup_ranked(
-        [r.story for r in ranked], feedback, dedup_cfg, user_id=user_id
+        [r.story for r in ranked],
+        feedback,
+        dedup_cfg,
+        user_id=user_id,
+        embeddings=embeddings,
     )
     survivors_by_id = {s.id: s for s in survivor_stories}
     return [r for r in ranked if r.story.id in survivors_by_id]
