@@ -243,19 +243,15 @@ def dedup_ranked(
     survivors: list[tuple[int, Story]] = []
     for nurl, members in url_buckets.items():
         members.sort(key=lambda m: _story_sort_key(m[1], m[0], cfg))
-        if nurl in fb_norm_urls:
-            for _, dropped in members:
-                fb_url_excluded.append((dropped, nurl))
-            continue
         kept_pos, kept_story = members[0]
         survivors.append((kept_pos, kept_story))
         for _, dropped in members[1:]:
             url_dup_suppressed.append((dropped, kept_story))
     survivors.extend(none_url_stories)
-
     survivors.sort(key=lambda ps: ps[0])
 
-    # Step 3: Embedding cosine dedup
+    # Step 2: Embedding cosine dedup (runs before FB URL exclusion so that
+    # feedback stories can suppress cross-source duplicates via embedding).
     if cfg.embedding_cosine_enabled and embeddings is not None:
         threshold = cfg.embedding_cosine_threshold
         kept: list[tuple[int, Story, NDArray[np.float32] | None]] = []
@@ -284,6 +280,18 @@ def dedup_ranked(
                 kept.append((pos, s, vec))
 
         survivors = [(pos, s) for pos, s, _ in kept]
+        survivors.sort(key=lambda ps: ps[0])
+
+    # Step 3: Feedback URL exclusion — drop any survivor whose normalized URL
+    # matches a story the user has already voted on.
+    if fb_norm_urls:
+        excluded_ids: set[int] = set()
+        for pos, s in survivors:
+            nurl = normalize_url(s.url)
+            if nurl is not None and nurl in fb_norm_urls:
+                fb_url_excluded.append((s, nurl))
+                excluded_ids.add(s.id)
+        survivors = [(pos, s) for pos, s in survivors if s.id not in excluded_ids]
         survivors.sort(key=lambda ps: ps[0])
 
     result = [s for _, s in survivors]

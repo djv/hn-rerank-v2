@@ -3009,17 +3009,13 @@ def _build_dashboard_cards(
                 story=story,
                 score=item.score,
                 best_match_title=item.best_match_title,
-                badges=_build_badges(
-                    item, hot_badge_percentile=hot_badge_percentile
-                ),
+                badges=_build_badges(item, hot_badge_percentile=hot_badge_percentile),
                 combo_keys=item.combo_keys,
                 is_enriched=len(story.text_content) >= 1000,
                 is_hn_attr="0" if item.is_non_hn else "1",
                 sort_popular_attr=(
                     "1"
-                    if item.is_hot
-                    or item.is_high_engagement
-                    or item.is_discussion_rich
+                    if item.is_hot or item.is_high_engagement or item.is_discussion_rich
                     else "0"
                 ),
                 sort_explore_attr=(
@@ -3111,9 +3107,7 @@ def generate_dashboard_bytes(
     template = env.get_template("index.html")
     html_content = template.render(
         timestamp=datetime.now().strftime("%Y-%m-%d %H:%M"),
-        cards=_build_dashboard_cards(
-            ranked, hot_badge_percentile=hot_badge_percentile
-        ),
+        cards=_build_dashboard_cards(ranked, hot_badge_percentile=hot_badge_percentile),
         tab_groups=_build_tab_groups(),
         server_port=config.server_port,
         pico_css=pico_css,
@@ -3233,7 +3227,14 @@ def fast_rerank_for_user(
         id_to_emb: dict[int, NDArray[np.float32]] = {
             s.id: vec for s, vec in zip(candidates, cand_embeddings)
         }
-        return _apply_dedup_to_ranked(ranked, db, config, user_id, embeddings=id_to_emb)
+        return _apply_dedup_to_ranked(
+            ranked,
+            db,
+            config,
+            user_id,
+            embeddings=id_to_emb,
+            embedder=embedder,
+        )
 
 
 def _apply_dedup_to_ranked(
@@ -3242,6 +3243,7 @@ def _apply_dedup_to_ranked(
     config: Config,
     user_id: int,
     embeddings: dict[int, NDArray[np.float32]] | None = None,
+    embedder: Embedder | None = None,
 ) -> list[RankedStory]:
     """Filter *ranked* through :func:`dedup.dedup_ranked`.
 
@@ -3259,12 +3261,31 @@ def _apply_dedup_to_ranked(
         exclude_actions=tuple(model_cfg.dedup_exclude_actions),
     )
     feedback = db.get_all_feedback(user_id=user_id)
+
+    # Merge feedback story embeddings so cross-source duplicates (e.g.
+    # Slashdot rewriting an HN story the user has already voted on) can
+    # be suppressed by the embedding dedup step. Feedback stories get
+    # score=-1 so they always lose same-source tiebreaks against real
+    # candidates.
+    all_stories = [r.story for r in ranked]
+    all_embeddings = dict(embeddings) if embeddings else {}
+    if embedder is not None:
+        fb_stories = db.get_feedback_stories(
+            user_id,
+            actions=tuple(model_cfg.dedup_exclude_actions),
+        )
+        if fb_stories:
+            fb_embs = get_or_compute_embeddings(fb_stories, embedder, db)
+            for s, vec in zip(fb_stories, fb_embs):
+                all_embeddings[s.id] = vec
+            all_stories.extend(fb_stories)
+
     survivor_stories = dedup_ranked(
-        [r.story for r in ranked],
+        all_stories,
         feedback,
         dedup_cfg,
         user_id=user_id,
-        embeddings=embeddings,
+        embeddings=all_embeddings if all_embeddings else None,
     )
     survivors_by_id = {s.id: s for s in survivor_stories}
     return [r for r in ranked if r.story.id in survivors_by_id]

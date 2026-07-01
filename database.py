@@ -584,6 +584,41 @@ class Database:
                 for row in cursor.fetchall()
             ]
 
+    def get_feedback_stories(
+        self, user_id: int, actions: tuple[str, ...]
+    ) -> list[Story]:
+        """Return Story objects for feedback rows matching *actions*.
+
+        Score is forced to -1 so these stories always lose same-source
+        tiebreaks in dedup — they participate only as suppressors, never
+        as survivors.
+        """
+        if not actions:
+            return []
+        placeholders = ",".join("?" for _ in actions)
+        with self.conn() as conn:
+            cursor = conn.execute(
+                f"SELECT DISTINCT s.id, s.title, s.url, s.time, "
+                f"       s.text_content, s.source "
+                f"FROM stories s "
+                f"JOIN feedback f ON f.story_id = s.id "
+                f"WHERE f.user_id = ? AND f.action IN ({placeholders}) "
+                f"ORDER BY s.id",
+                (user_id, *actions),
+            )
+            return [
+                Story(
+                    id=row[0],
+                    title=row[1] or "",
+                    url=row[2],
+                    score=-1,  # always lose same-source tiebreaks
+                    time=row[3] or 0,
+                    text_content=row[4] or "",
+                    source=row[5] or "hn",
+                )
+                for row in cursor.fetchall()
+            ]
+
     def count_feedback_by_action(self, user_id: int) -> dict[str, int]:
         """Return per-action counts for a user. Unknown actions are ignored."""
         rows = self.execute(
