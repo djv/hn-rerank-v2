@@ -5859,3 +5859,58 @@ def test_article_fetch_batch_logs_summary(db, caplog, monkeypatch):
     assert any("article_fetch: fetching" in m for m in logs)
     assert any("article_fetch: ok=" in m for m in logs)
     assert any("errors=[" in m for m in logs)
+
+
+def test_select_article_fetch_excludes_paywall_domains(db):
+    """Hard-paywall domain articles must not be selected for body fetch."""
+    now = 2_000_000_000.0
+    domains = ["bloomberg.com", "economist.com", "ft.com", "nytimes.com", "wsj.com"]
+    for i, domain in enumerate(domains):
+        s = Story(
+            id=400 + i,
+            title=f"Article on {domain}",
+            url=f"https://www.{domain}/article/123",
+            score=100,
+            time=int(now - 3600),
+            text_content="text",
+            source="hn",
+        )
+        db.upsert_story(s)
+        ranked = [pipeline.RankedStory(story=s, score=1.0, best_match_title="")]
+        result = pipeline.select_article_fetch_candidates(
+            ranked=ranked,
+            dashboard_selected=ranked,
+            db=db,
+            max_per_run=10,
+            now_ts=now,
+        )
+        assert result == [], f"{domain} should be excluded"
+
+
+def test_select_article_fetch_excludes_youtube_urls(db):
+    """YouTube watch pages must not be selected for body fetch."""
+    now = 2_000_000_000.0
+    urls = [
+        "https://www.youtube.com/watch?v=abc123",
+        "https://youtu.be/xyz456",
+    ]
+    for i, url in enumerate(urls):
+        s = Story(
+            id=500 + i,
+            title="Video",
+            url=url,
+            score=100,
+            time=int(now - 3600),
+            text_content="video",
+            source="hn",
+        )
+        db.upsert_story(s)
+        ranked = [pipeline.RankedStory(story=s, score=1.0, best_match_title="")]
+        result = pipeline.select_article_fetch_candidates(
+            ranked=ranked,
+            dashboard_selected=ranked,
+            db=db,
+            max_per_run=10,
+            now_ts=now,
+        )
+        assert result == [], f"should skip {url}"

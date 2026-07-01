@@ -447,8 +447,7 @@ class Config:
         unknown_root = set(root_values) - root_field_names
         if unknown_root:
             raise ValueError(
-                "Unknown hn_rewrite config key(s): "
-                + ", ".join(sorted(unknown_root))
+                "Unknown hn_rewrite config key(s): " + ", ".join(sorted(unknown_root))
             )
 
         model = _overlay_dataclass_config(
@@ -2795,6 +2794,11 @@ def _article_fetch_extra_priority(
     )
 
 
+_PAYWALL_DOMAINS: frozenset[str] = frozenset(
+    {"bloomberg.com", "economist.com", "ft.com", "nytimes.com", "wsj.com"}
+)
+
+
 def select_article_fetch_candidates(
     *,
     ranked: list[RankedStory],
@@ -2823,6 +2827,11 @@ def select_article_fetch_candidates(
         if story.source == "rss_lesswrong_com":
             return False
         if story.url.startswith("https://news.ycombinator.com"):
+            return False
+        host = urlparse(story.url).hostname or ""
+        if any(host == d or host.endswith("." + d) for d in _PAYWALL_DOMAINS):
+            return False
+        if "youtube.com/watch" in story.url or "youtu.be/" in story.url:
             return False
         if story.time < min_time:
             return False
