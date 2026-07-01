@@ -94,7 +94,7 @@ def test_config_load_checked_in_config_contains_only_runtime_overrides():
 
     assert config.server_port == 8766
     assert config.article_fetch_max_per_run == 50
-    assert config.model.svm_c == 0.5
+    assert config.model.svm_c == 0.1
     assert config.model.svm_gamma == 0.03
     assert len(config.rss.feeds) >= 40
 
