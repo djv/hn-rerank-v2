@@ -15,28 +15,9 @@ from pipeline import (
     get_or_compute_embeddings,
     _urllib_fetch,
 )
-import trafilatura
-from bs4 import BeautifulSoup
+from server import _extract_article_body
 
 ARTICLE_BODY_CHAR_LIMIT = 15_000
-
-
-def _extract_article_body(html: str) -> str | None:
-    text = trafilatura.extract(html, include_comments=False, include_tables=False)
-    if text and len(text) > 200:
-        return text[:ARTICLE_BODY_CHAR_LIMIT]
-
-    soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
-        tag.decompose()
-    for tag in soup.find_all(["article", "main"]):
-        text = tag.get_text(separator=" ", strip=True)
-        if len(text) > 200:
-            return text[:ARTICLE_BODY_CHAR_LIMIT]
-    text = soup.get_text(separator=" ", strip=True)
-    if len(text) > 200:
-        return text[:ARTICLE_BODY_CHAR_LIMIT]
-    return None
 
 
 def rows_to_stories(rows: list[tuple]) -> list[Story]:
@@ -108,6 +89,7 @@ async def main() -> None:
             if not article_body:
                 logging.warning("  id=%s no extraction", s.id)
                 continue
+            article_body = article_body[:ARTICLE_BODY_CHAR_LIMIT]
 
             new_text = compose_story_text(
                 s.title, s.self_text, s.top_comments, article_body

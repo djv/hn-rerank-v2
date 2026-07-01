@@ -5,6 +5,64 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-07-01 — Replace trafilatura with jusText-primary extraction cascade
+
+trafilatura extracts the "MOST POPULAR" sidebar from The Register as the
+primary article content (3.7k chars of identical boilerplate across all
+articles), producing cos=1.0000 between unrelated articles. Every
+trafilatura parameter tweak (favor_precision, no_fallback, deduplicate,
+XML filtering) fails — the library fundamentally misclassifies Register
+page structure.
+
+Fix (four files):
+- **pyproject.toml**: `justext>=3.0` as explicit dep (was transitive via
+  trafilatura; fragile).
+- **server.py**: new 4-tier extraction cascade:
+  1. jusText (statistical stopword/link-density classification) with
+     chrome-tag decomposition, min 2 good paragraphs
+  2. BS unclassed `<article>` / `<main>` semantic extraction
+  3. trafilatura with `favor_precision=True, deduplicate=True`
+  4. raw body text (stripped)
+  Structural quality guards (min 200 chars, min 80 words) replace bare
+  `len(text) > 200` checks. `_extract_article_body()` is a reusable
+  standalone function.
+- **scripts/fetch_articles_for_source.py**: imports `_extract_article_body`
+  from server instead of duplicating the extraction logic.
+- **tests/test_server.py**: `test_justext_rejects_sidebar_boilerplate`
+  verifies sidebar `<article>` tags are stripped and main content survives.
+
+DB cleanup: 54 article bodies contaminated by "MOST POPULAR" boilerplate
+cleared (`UPDATE stories SET article_body='' WHERE article_body LIKE
+'%MOST POPULAR%'`). Next regen re-fetches with the new cascade.
+
+Verification: The Register false-positive pair cos dropped from 1.0000 →
+0.21-0.23. 412 tests pass.
+
+---
+
+## 2026-07-01 — Fix cross-source dedup: merge feedback stories into dedup input
+
+Root cause: a slashdot URL rewriting an HN story appeared in the dashboard
+because the HN story (which user 1 had upvoted) was excluded from the
+candidate pool by `id NOT IN (SELECT story_id FROM feedback...)` at the SQL
+level before dedup ran. The slashdot copy entered dedup alone with nothing to
+pair against.
+
+Fix (three files, commit 92a4a8b):
+- **dedup.py**: swap steps — embedding cosine dedup now runs **before** FB URL
+  exclusion. Pipeline: URL dedup → embedding dedup → FB URL exclusion.
+- **database.py**: `get_feedback_stories()` returns feedback stories with
+  `score=-1` (always loses same-source tiebreaks) and real `text_content`
+  (so cached embedding hashes match).
+- **pipeline.py**: `_apply_dedup_to_ranked` merges feedback stories +
+  embeddings into dedup input; feedback stories suppressed by step 3.
+
+Verification: 411 tests pass. Two regen cycles confirm `embedding_dups=24`
+cross-source pairs suppressed. Same-source tiebreaks safe: feedback story
+with score=-1 always loses to candidate with score≥0.
+
+---
+
 ## 2026-07-01 — Refactor dashboard presentation layer
 
 Dashboard rendering now uses typed view models in `pipeline.py` and small Jinja

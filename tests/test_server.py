@@ -2799,3 +2799,73 @@ def test_showToast_dismisses_after_3s() -> None:
     assert "toastEl.hidden = true" in block
     assert "3000" in block
     assert "clearTimeout(toastTimer)" in block
+
+
+def test_justext_rejects_sidebar_boilerplate() -> None:
+    """jusText must classify navigation/sidebar <article> fragments as
+    boilerplate and extract only the main content paragraph."""
+    import server as srv
+    import justext
+
+    # Simulate a page where the actual article is a single <p> in an
+    # unclassed <article>, surrounded by many classed <article> sidebar
+    # widgets.
+    html = """\
+<!DOCTYPE html>
+<html>
+<head><title>Test Page</title></head>
+<body>
+<nav><a href="/">Home</a> <a href="/news">News</a> <a href="/about">About</a></nav>
+<article>
+  <h1>Climate Scientists Discover New Approach to Carbon Capture</h1>
+  <p>A team of researchers at MIT has developed a novel electrochemical
+  process that removes carbon dioxide from seawater at half the energy cost
+  of existing methods. The technique, published this week in Nature, uses a
+  bismuth-based electrode that selectively binds CO2 molecules even at the
+  low concentrations found in ocean water. Scaling the process could help
+  mitigate the 30% of anthropogenic CO2 currently absorbed by the oceans.</p>
+  <p>Dr. Sarah Chen, lead author, noted that "the electrode material is
+  abundant and the process operates at room temperature — this is not a
+  lab curiosity, it is an engineering challenge now." The team is working
+  with a spin-off company to build a pilot plant by 2028.</p>
+</article>
+<article class="column sidebar">
+  <h2>MOST POPULAR</h2>
+  <ul>
+    <li><a href="/article/1">Tech Giant Lays Off 5000 Workers</a></li>
+    <li><a href="/article/2">New Programming Language Gains Traction</a></li>
+    <li><a href="/article/3">Mars Rover Discovers Ancient Lake Bed</a></li>
+  </ul>
+</article>
+<article class="column sidebar">
+  <h2>RELATED STORIES</h2>
+  <ul>
+    <li><a href="/article/4">Ocean Acidification Study Released</a></li>
+    <li><a href="/article/5">Renewable Energy Hits Record Output</a></li>
+  </ul>
+</article>
+<footer>Copyright 2026. All rights reserved. Contact us. Privacy Policy.</footer>
+</body>
+</html>"""
+
+    text = srv._extract_with_justext(html)
+    assert text is not None
+    assert len(text) >= 500
+    assert "Carbon Capture" in text
+    assert "MOST POPULAR" not in text
+    assert "RELATED STORIES" not in text
+    assert "Tech Giant" not in text
+    assert "Privacy Policy" not in text
+
+    # Also verify jusText paragraph classification directly
+    paragraphs = justext.justext(html, justext.get_stoplist("English"))
+    good_count = sum(1 for p in paragraphs if not p.is_boilerplate)
+    assert good_count >= 2  # the two main content paragraphs
+    boilerplate_count = sum(1 for p in paragraphs if p.is_boilerplate)
+    assert boilerplate_count > good_count  # sidebar dominates the page
+
+    # Verify BS semantic also works as fallback
+    text_bs = srv._extract_with_bs_semantic(html)
+    assert text_bs is not None
+    assert "Carbon Capture" in text_bs
+    assert "MOST POPULAR" not in text_bs

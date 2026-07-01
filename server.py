@@ -20,6 +20,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 import feedparser
+import justext
 import trafilatura
 from bs4 import BeautifulSoup
 import httpx
@@ -124,6 +125,117 @@ class ArticleFetchResult:
     permanent: bool = False
 
 
+MIN_ARTICLE_CHARS = 200
+MIN_GOOD_PARAS = 2
+
+
+def _normalize_article_text(text: str) -> str:
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
+    return text.strip()
+
+
+def _looks_bad_extraction(text: str) -> bool:
+    """Structural quality check — rejects extractions where the tier itself
+    indicates the text is likely dominated by boilerplate.
+
+    No content-based blocklists; only structural signal (length, word count).
+    """
+    if not text or len(text) < MIN_ARTICLE_CHARS:  # noqa: SIM103
+        return True
+    words = text.split()
+    if len(words) < 80:
+        return True
+    return False
+
+
+def _extract_with_justext(html: str) -> str | None:
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+        tag.decompose()
+    paragraphs = justext.justext(str(soup), justext.get_stoplist("English"))
+    good = [
+        p.text.strip()
+        for p in paragraphs
+        if not p.is_boilerplate and p.text and p.text.strip()
+    ]
+    if len(good) < MIN_GOOD_PARAS:
+        return None
+    text = _normalize_article_text("\n\n".join(good))
+    if _looks_bad_extraction(text):
+        return None
+    return text
+
+
+def _extract_with_bs_semantic(html: str) -> str | None:
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+        tag.decompose()
+
+    candidates: list = []
+
+    # Prefer unclassed <article> (main content on e.g. The Register)
+    for art in soup.find_all("article"):
+        if not art.get("class"):
+            candidates.append(art)
+
+    main = soup.find("main")
+    if main:
+        candidates.append(main)
+
+    candidates.extend(soup.find_all("article"))
+
+    for node in candidates:
+        text = _normalize_article_text(node.get_text(separator=" ", strip=True))
+        if not _looks_bad_extraction(text):
+            return text
+    return None
+
+
+def _extract_with_trafilatura(html: str) -> str | None:
+    text = trafilatura.extract(
+        html,
+        include_comments=False,
+        include_tables=False,
+        favor_precision=True,
+        deduplicate=True,
+    )
+    if not text:
+        return None
+    text = _normalize_article_text(text)
+    if _looks_bad_extraction(text):
+        return None
+    return text
+
+
+def _extract_raw_body(html: str) -> str | None:
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+        tag.decompose()
+    text = _normalize_article_text(soup.get_text(separator=" ", strip=True))
+    if len(text) < MIN_ARTICLE_CHARS:
+        return None
+    return text
+
+
+def _extract_article_body(html: str) -> str | None:
+    """Try each extraction strategy in order of quality.
+
+    jusText (statistical boilerplate classification) → BS semantic
+    (unclassed <article>/<main>) → trafilatura (precision mode) → raw body.
+    """
+    for extractor in (
+        _extract_with_justext,
+        _extract_with_bs_semantic,
+        _extract_with_trafilatura,
+        _extract_raw_body,
+    ):
+        text = extractor(html)
+        if text:
+            return text
+    return None
+
+
 async def _fetch_article_body_with_result(url: str) -> ArticleFetchResult:
     headers = {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -160,22 +272,8 @@ async def _fetch_article_body_with_result(url: str) -> ArticleFetchResult:
         except Exception as e:
             return ArticleFetchResult(error=type(e).__name__)
 
-        text = trafilatura.extract(html, include_comments=False, include_tables=False)
-        if text and len(text) > 200:
-            return ArticleFetchResult(body=text[:ARTICLE_BODY_CHAR_LIMIT], status=200)
-
-        soup = BeautifulSoup(html, "html.parser")
-        for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
-            tag.decompose()
-        for tag in soup.find_all(["article", "main"]):
-            text = tag.get_text(separator=" ", strip=True)
-            if len(text) > 200:
-                return ArticleFetchResult(
-                    body=text[:ARTICLE_BODY_CHAR_LIMIT],
-                    status=200,
-                )
-        text = soup.get_text(separator=" ", strip=True)
-        if len(text) > 200:
+        text = _extract_article_body(html)
+        if text:
             return ArticleFetchResult(body=text[:ARTICLE_BODY_CHAR_LIMIT], status=200)
         return ArticleFetchResult(status=200, error="empty_extraction")
 
