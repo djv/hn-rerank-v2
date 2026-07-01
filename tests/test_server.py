@@ -2228,7 +2228,12 @@ def test_keydown_uses_letter_keys():
     assert "data-article-url" in template
     assert "data-comments-url" in template
     assert "--page-gutter: 1rem;" in template
-    assert "--active-card-viewport-reserve: 6rem;" in template
+    assert "--vote-bar-height: 3.2rem;" in template
+    assert "--card-bottom-gap: 0.5rem;" in template
+    assert (
+        "--active-card-viewport-reserve: calc(var(--vote-bar-height) + var(--card-bottom-gap));"
+        in template
+    )
     assert "--fullscreen-gutter: 1rem;" in template
     # card sizing: shrink-to-fit for short, full width for enriched,
     # max-height caps at viewport so page never scrolls
@@ -2245,12 +2250,10 @@ def test_keydown_uses_letter_keys():
     assert "overflow: hidden;" in body_block
     active_block = template.split(".story-card.active {", 1)[1].split("}", 1)[0]
     assert (
-        "max-height: calc(100vh - var(--active-card-viewport-reserve))"
-        in active_block
+        "max-height: calc(100vh - var(--active-card-viewport-reserve))" in active_block
     )
     assert (
-        "max-height: calc(100dvh - var(--active-card-viewport-reserve))"
-        in active_block
+        "max-height: calc(100dvh - var(--active-card-viewport-reserve))" in active_block
     )
     assert "min-height: 18rem;" in active_block
     # active card keeps the base uniform padding; viewport caps clear the fixed vote bar
