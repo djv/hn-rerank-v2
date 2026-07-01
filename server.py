@@ -26,7 +26,7 @@ from bs4 import BeautifulSoup
 import httpx
 
 from dataclasses import dataclass, replace
-from database import Database, User
+from database import Database, Story, User
 from pipeline import Config, Embedder, RankedStory, is_hn_source
 from llm_limiter import limiter as llm_limiter
 from reddit_limiter import limiter as reddit_limiter
@@ -753,6 +753,8 @@ class Handler(BaseHTTPRequestHandler):
     _dashboard_versions: dict[int, int] = {}
     _dashboard_versions_guard = threading.Lock()
     _cold_stories: list[RankedStory] = []
+    _article_fetch_in_flight: set[int] = set()
+    _warm_bg_lock = threading.Lock()
     _render_locks: dict[int, threading.Lock] = {}
     _render_locks_guard = threading.Lock()
     _warmup_requested_versions: dict[int, int] = {}
@@ -1085,10 +1087,14 @@ class Handler(BaseHTTPRequestHandler):
             logging.info("rank_perf %s", trace.format_log_fields())
 
             per_combo = cls.config.tldr_prefetch_per_combo
-            if per_combo > 0 and final:
+            if cls.config.article_fetch_max_per_run > 0 or (per_combo > 0 and final):
                 t = threading.Thread(
-                    target=lambda: asyncio.run(
-                        _prefetch_tldrs_for_ranked(final, cls.db, per_combo)
+                    target=lambda: cls._warm_background_tasks(
+                        final,
+                        cls.db,
+                        cls.embedder,
+                        cls.config,
+                        per_combo,
                     ),
                     daemon=True,
                 )
@@ -1146,6 +1152,54 @@ class Handler(BaseHTTPRequestHandler):
         cold_stories = build_cold_deck(cls.db)
         cls._cold_stories = cold_stories
         logging.info("cold_deck_rebuilt stories=%s", len(cold_stories))
+
+    @classmethod
+    def _warm_background_tasks(
+        cls,
+        final: list[RankedStory],
+        db: Database,
+        embedder: Embedder,
+        config: Config,
+        per_combo: int,
+    ) -> None:
+        """Article body fetch (deduped by story ID) -> TLDR prefetch."""
+        from pipeline import (
+            select_article_fetch_candidates,
+            fetch_and_cache_article_bodies,
+        )
+
+        if config.article_fetch_max_per_run > 0 and final:
+            fetch_targets = select_article_fetch_candidates(
+                ranked=final,
+                dashboard_selected=final[: config.count],
+                db=db,
+                max_per_run=config.article_fetch_max_per_run,
+                max_age_days=config.article_fetch_max_age_days,
+            )
+            runnable: list[Story] = []
+            with cls._warm_bg_lock:
+                for s in fetch_targets:
+                    if s.id not in cls._article_fetch_in_flight:
+                        runnable.append(s)
+                cls._article_fetch_in_flight.update(s.id for s in runnable)
+            try:
+                if runnable:
+                    asyncio.run(
+                        fetch_and_cache_article_bodies(
+                            db=db,
+                            embedder=embedder,
+                            stories=runnable,
+                            concurrency=config.article_fetch_concurrency,
+                        )
+                    )
+            finally:
+                with cls._warm_bg_lock:
+                    cls._article_fetch_in_flight.difference_update(
+                        s.id for s in runnable
+                    )
+
+        if per_combo > 0 and final:
+            asyncio.run(_prefetch_tldrs_for_ranked(final, db, per_combo))
 
     def do_POST(self) -> None:
         if self.path == "/api/feedback":
@@ -1413,11 +1467,15 @@ class Handler(BaseHTTPRequestHandler):
                 and not story.url.startswith("https://news.ycombinator.com")
                 and len(story.self_text) < 500
             ):
-                article_body = asyncio.run(_fetch_article_body(story.url))
-                if article_body:
-                    article_body = article_body[:ARTICLE_BODY_CHAR_LIMIT]
-                    from pipeline import compose_story_text
+                import hashlib
+                from pipeline import (
+                    compose_story_text,
+                    _article_failure_retry_time,
+                )
 
+                result = asyncio.run(_fetch_article_body_with_result(story.url))
+                if result.body:
+                    article_body = result.body[:ARTICLE_BODY_CHAR_LIMIT]
                     new_text = compose_story_text(
                         story.title,
                         story.self_text,
@@ -1430,7 +1488,39 @@ class Handler(BaseHTTPRequestHandler):
                         text_content=new_text,
                     )
                     self.db.upsert_story(updated_story)
+                    self.db.clear_article_fetch_failure(story.id)
+
+                    embedder = type(self).embedder
+                    if embedder is not None:
+                        model_version = "all-MiniLM-L6-v2|mean|norm|256"
+                        new_vec = embedder.encode([new_text])[0]
+                        new_hash = hashlib.sha256(new_text.encode("utf-8")).hexdigest()
+                        self.db.upsert_embedding(
+                            story.id, model_version, new_hash, new_vec
+                        )
+
                     story = updated_story
+                else:
+                    now_ts = time.time()
+                    previous = self.db.get_article_fetch_failure(story.id)
+                    previous_count = int(previous["failure_count"]) if previous else 0
+                    failure_count = previous_count + 1
+                    permanent = result.permanent or (
+                        result.error == "empty_extraction" and failure_count >= 3
+                    )
+                    next_retry_at = (
+                        now_ts + 3650 * 86400
+                        if permanent
+                        else _article_failure_retry_time(failure_count, now_ts)
+                    )
+                    self.db.record_article_fetch_failure(
+                        story.id,
+                        story.url or "",
+                        status=result.status,
+                        error=result.error,
+                        permanent=permanent,
+                        next_retry_at=next_retry_at,
+                    )
             cache_key = _tldr_cache_key(
                 title=story.title,
                 self_text=story.self_text or "",
@@ -1528,6 +1618,32 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
             asyncio.run(fetch_candidates_only(config, db, embedder=embedder))
             Handler._rebuild_cold_deck()
             Handler._bump_all_cached_versions()
+
+            # Proactive article body fetch for cold deck stories
+            if config.article_fetch_max_per_run > 0 and Handler._cold_stories:
+                cold = list(Handler._cold_stories)
+                from pipeline import (
+                    select_article_fetch_candidates,
+                    fetch_and_cache_article_bodies,
+                )
+
+                fetch_targets = select_article_fetch_candidates(
+                    ranked=cold,
+                    dashboard_selected=cold[: config.count],
+                    db=db,
+                    max_per_run=config.article_fetch_max_per_run,
+                    max_age_days=config.article_fetch_max_age_days,
+                )
+                if fetch_targets:
+                    asyncio.run(
+                        fetch_and_cache_article_bodies(
+                            db=db,
+                            embedder=embedder,
+                            stories=fetch_targets,
+                            concurrency=config.article_fetch_concurrency,
+                        )
+                    )
+
             per_combo = config.tldr_prefetch_per_combo
             if per_combo > 0 and Handler._cold_stories:
                 cold = list(Handler._cold_stories)

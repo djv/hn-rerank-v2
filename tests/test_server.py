@@ -1533,7 +1533,7 @@ def test_tldr_detail_fetches_reddit_rss_comments(test_env, monkeypatch):
             comment_count=1,
         )
 
-    async def mock_fetch_article_body(url):
+    async def mock_fetch_article_body_with_result(url):
         raise AssertionError("Reddit comments pages should not be scraped as articles")
 
     async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
@@ -1544,7 +1544,9 @@ def test_tldr_detail_fetches_reddit_rss_comments(test_env, monkeypatch):
     monkeypatch.setattr(
         server, "_fetch_reddit_rss_context", mock_fetch_reddit_rss_context
     )
-    monkeypatch.setattr(server, "_fetch_article_body", mock_fetch_article_body)
+    monkeypatch.setattr(
+        server, "_fetch_article_body_with_result", mock_fetch_article_body_with_result
+    )
     monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
 
     resp = httpx.post(
@@ -1599,8 +1601,8 @@ def test_tldr_detail_dynamic_fetch(test_env, monkeypatch):
         database.upsert_story(updated)
         return updated
 
-    async def mock_fetch_article_body(url):
-        return "Fetched article body text"
+    async def mock_fetch_article_body_with_result(url):
+        return server.ArticleFetchResult(body="Fetched article body text", status=200)
 
     async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
         return f"TLDR: {title} | {top_comments} | {article_body}"
@@ -1609,7 +1611,9 @@ def test_tldr_detail_dynamic_fetch(test_env, monkeypatch):
     import pipeline
 
     monkeypatch.setattr(pipeline, "fetch_story", mock_fetch_story)
-    monkeypatch.setattr(server, "_fetch_article_body", mock_fetch_article_body)
+    monkeypatch.setattr(
+        server, "_fetch_article_body_with_result", mock_fetch_article_body_with_result
+    )
     monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
 
     # Request TLDR
@@ -1662,8 +1666,8 @@ def test_tldr_detail_dynamic_fetch_for_bq_seed(test_env, monkeypatch):
         database.upsert_story(updated)
         return updated
 
-    async def mock_fetch_article_body(url):
-        return None
+    async def mock_fetch_article_body_with_result(url):
+        return server.ArticleFetchResult(error="empty_extraction")
 
     async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
         return f"TLDR: {title} | {top_comments}"
@@ -1672,7 +1676,9 @@ def test_tldr_detail_dynamic_fetch_for_bq_seed(test_env, monkeypatch):
     import pipeline
 
     monkeypatch.setattr(pipeline, "fetch_story", mock_fetch_story)
-    monkeypatch.setattr(server, "_fetch_article_body", mock_fetch_article_body)
+    monkeypatch.setattr(
+        server, "_fetch_article_body_with_result", mock_fetch_article_body_with_result
+    )
     monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
 
     resp = httpx.post(
@@ -1718,8 +1724,8 @@ def test_tldr_detail_dynamic_fetch_for_ch_seed(test_env, monkeypatch):
         database.upsert_story(updated)
         return updated
 
-    async def mock_fetch_article_body(url):
-        return None
+    async def mock_fetch_article_body_with_result(url):
+        return server.ArticleFetchResult(error="empty_extraction")
 
     async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
         return f"TLDR: {title} | {top_comments}"
@@ -1728,7 +1734,9 @@ def test_tldr_detail_dynamic_fetch_for_ch_seed(test_env, monkeypatch):
     import pipeline
 
     monkeypatch.setattr(pipeline, "fetch_story", mock_fetch_story)
-    monkeypatch.setattr(server, "_fetch_article_body", mock_fetch_article_body)
+    monkeypatch.setattr(
+        server, "_fetch_article_body_with_result", mock_fetch_article_body_with_result
+    )
     monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
 
     resp = httpx.post(
@@ -2138,7 +2146,7 @@ def test_tldr_detail_fetches_lesswrong_comments(test_env, monkeypatch):
             score=132,
         )
 
-    async def mock_fetch_article_body(url):
+    async def mock_fetch_article_body_with_result(url):
         raise AssertionError("LessWrong should not be scraped as articles")
 
     async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
@@ -2147,7 +2155,9 @@ def test_tldr_detail_fetches_lesswrong_comments(test_env, monkeypatch):
     monkeypatch.setattr(
         server, "_fetch_lesswrong_context", mock_fetch_lesswrong_context
     )
-    monkeypatch.setattr(server, "_fetch_article_body", mock_fetch_article_body)
+    monkeypatch.setattr(
+        server, "_fetch_article_body_with_result", mock_fetch_article_body_with_result
+    )
     monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
 
     resp = httpx.post(
@@ -2928,3 +2938,179 @@ def test_justext_rejects_sidebar_boilerplate() -> None:
     assert text_bs is not None
     assert "Carbon Capture" in text_bs
     assert "MOST POPULAR" not in text_bs
+
+
+def test_on_demand_tldr_records_fetch_failure(test_env, monkeypatch):
+    """On-demand article fetch failure records in article_fetch_failures."""
+    import server
+    import time as time_mod
+
+    port, db, _, _, user = test_env
+    db.upsert_story(
+        Story(
+            id=1001,
+            title="Failure test",
+            url="https://example.com/failing",
+            score=10,
+            time=int(time_mod.time()) - 3600,
+            text_content="Failure test.",
+            source="hn",
+            comment_count=0,
+            discussion_url=None,
+            comment_count_at_fetch=0,
+            self_text="",
+            top_comments="",
+            article_body="",
+        )
+    )
+
+    async def mock_fetch(url):
+        return server.ArticleFetchResult(status=403, error="http_403")
+
+    async def mock_generate_tldr(title, self_text, top_comments, article_body):
+        return f"TLDR: {title}"
+
+    monkeypatch.setattr(server, "_fetch_article_body_with_result", mock_fetch)
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_tldr)
+
+    resp = httpx.post(
+        f"http://127.0.0.1:{port}/api/tldr-detail",
+        json={"story_id": 1001},
+        cookies={"hn_token": user.token},
+    )
+    assert resp.status_code == 200
+
+    failure = db.get_article_fetch_failure(1001)
+    assert failure is not None
+    assert failure["last_status"] == 403
+    assert failure["last_error"] == "http_403"
+    assert failure["failure_count"] == 1
+
+
+def test_on_demand_tldr_clears_failure_on_success(test_env, monkeypatch):
+    """On-demand success clears prior failure record."""
+    import server
+    import time as time_mod
+
+    port, db, _, _, user = test_env
+    sid = 1002
+    db.upsert_story(
+        Story(
+            id=sid,
+            title="Success test",
+            url="https://example.com/recovering",
+            score=10,
+            time=int(time_mod.time()) - 3600,
+            text_content="Success test.",
+            source="hn",
+            comment_count=0,
+            discussion_url=None,
+            comment_count_at_fetch=0,
+            self_text="",
+            top_comments="",
+            article_body="",
+        )
+    )
+
+    # Pre-populate a failure record
+    db.record_article_fetch_failure(
+        sid, "https://example.com/recovering", status=503, error="http_503"
+    )
+    assert db.get_article_fetch_failure(sid) is not None
+
+    async def mock_fetch(url):
+        return server.ArticleFetchResult(
+            body="Recovered article body content here",
+            status=200,
+        )
+
+    async def mock_generate_tldr(title, self_text, top_comments, article_body):
+        return f"TLDR: {title} | {article_body}"
+
+    monkeypatch.setattr(server, "_fetch_article_body_with_result", mock_fetch)
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_tldr)
+
+    resp = httpx.post(
+        f"http://127.0.0.1:{port}/api/tldr-detail",
+        json={"story_id": sid},
+        cookies={"hn_token": user.token},
+    )
+    assert resp.status_code == 200
+
+    # Failure record should be cleared
+    assert db.get_article_fetch_failure(sid) is None
+
+    # Article body should be stored
+    updated = db.get_story(sid)
+    assert updated is not None
+    assert updated.article_body == "Recovered article body content here"
+
+
+def test_warm_background_task_dedupes_in_flight_ids(test_env, monkeypatch):
+    """Overlapping warm tasks skip stories already in-flight."""
+    import server as srv
+    from pipeline import RankedStory, Config
+
+    port, db, _, _, _ = test_env
+
+    now = int(time.time())
+    s1 = Story(
+        id=3001,
+        title="S1",
+        url="https://example.com/s1",
+        score=10,
+        time=now - 3600,
+        text_content="s1",
+        source="hn",
+    )
+    s2 = Story(
+        id=3002,
+        title="S2",
+        url="https://example.com/s2",
+        score=10,
+        time=now - 3600,
+        text_content="s2",
+        source="hn",
+    )
+    s3 = Story(
+        id=3003,
+        title="S3",
+        url="https://example.com/s3",
+        score=10,
+        time=now - 3600,
+        text_content="s3",
+        source="hn",
+    )
+    for s in [s1, s2, s3]:
+        db.upsert_story(s)
+
+    ranked = [
+        RankedStory(story=s, score=1.0, best_match_title="") for s in [s1, s2, s3]
+    ]
+
+    cfg = Config.load()
+
+    # Mark s1 and s2 as in-flight, leave s3 free
+    srv.Handler._article_fetch_in_flight = {3001, 3002}
+
+    # Mock the fetch to be a no-op
+    async def noop_fetch(*args, **kwargs):
+        return {}
+
+    import pipeline
+
+    monkeypatch.setattr(pipeline, "fetch_and_cache_article_bodies", noop_fetch)
+
+    srv.Handler._warm_background_tasks(
+        ranked,
+        db,
+        MockEmbedder(),
+        cfg,
+        per_combo=0,
+    )
+
+    # Only s3 should have been added to in-flight during the task (then cleared)
+    # s1 and s2 remain unchanged since they were already in-flight
+    assert 3001 in srv.Handler._article_fetch_in_flight
+    assert 3002 in srv.Handler._article_fetch_in_flight
+    assert 3003 not in srv.Handler._article_fetch_in_flight

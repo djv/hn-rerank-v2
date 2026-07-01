@@ -5719,3 +5719,73 @@ def test_is_recent_flag_inclusive_30d_boundary(
     assert by_id[1].is_recent is True, "1d old should be recent"
     assert by_id[2].is_recent is True, "30d - 1s should be recent"
     assert by_id[3].is_recent is False, "30d + 1s should NOT be recent"
+
+
+def test_select_article_fetch_excludes_lesswrong(db):
+    """LessWrong source stories must not be selected for article body fetch."""
+    now = 2_000_000_000.0
+
+    lw_story = Story(
+        id=101,
+        title="Some LW Post",
+        url="https://www.lesswrong.com/posts/abc/xyz",
+        score=50,
+        time=int(now - 86400),
+        text_content="LW text",
+        source="rss_lesswrong_com",
+    )
+    db.upsert_story(lw_story)
+
+    ranked = [pipeline.RankedStory(story=lw_story, score=0.8, best_match_title="")]
+    result = pipeline.select_article_fetch_candidates(
+        ranked=ranked,
+        dashboard_selected=ranked,
+        db=db,
+        max_per_run=10,
+        now_ts=now,
+    )
+    assert result == []
+
+
+def test_article_fetch_batch_logs_summary(db, caplog, monkeypatch):
+    """fetch_and_cache_article_bodies emits ok/failed/errors summary."""
+    import logging
+    import server
+
+    caplog.set_level(logging.INFO)
+
+    a1 = Story(
+        id=201,
+        title="Article 1",
+        url="https://example.com/a1",
+        score=10,
+        time=int(time.time()) - 3600,
+        text_content="a1",
+        source="hn",
+    )
+    db.upsert_story(a1)
+
+    async def dummy_fetch(url):
+        return server.ArticleFetchResult(
+            body="Test article body text that is long enough",
+            status=200,
+        )
+
+    monkeypatch.setattr(server, "_fetch_article_body_with_result", dummy_fetch)
+
+    async def runner():
+        await pipeline.fetch_and_cache_article_bodies(
+            db=db,
+            embedder=_DummyEmbedder(),
+            stories=[a1],
+            concurrency=1,
+        )
+
+    import asyncio
+
+    asyncio.run(runner())
+
+    logs = [r.message for r in caplog.records]
+    assert any("article_fetch: fetching" in m for m in logs)
+    assert any("article_fetch: ok=" in m for m in logs)
+    assert any("errors=[" in m for m in logs)

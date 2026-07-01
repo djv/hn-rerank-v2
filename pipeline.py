@@ -402,7 +402,7 @@ class Config:
     # subreddit per fetch at the limiter's natural 2s+jitter cadence,
     # but the queue spreads them out at 50s for 429 backoff headroom).
     reddit_min_fetch_spacing_seconds: float = 30.0
-    article_fetch_max_per_run: int = 100
+    article_fetch_max_per_run: int = 50
     article_fetch_concurrency: int = 10
     article_fetch_max_age_days: int = 30
     max_cached_models: int = 20
@@ -452,7 +452,7 @@ class Config:
             reddit_min_fetch_spacing_seconds=main_cfg.get(
                 "reddit_min_fetch_spacing_seconds", 30.0
             ),
-            article_fetch_max_per_run=main_cfg.get("article_fetch_max_per_run", 100),
+            article_fetch_max_per_run=main_cfg.get("article_fetch_max_per_run", 50),
             article_fetch_concurrency=main_cfg.get("article_fetch_concurrency", 10),
             article_fetch_max_age_days=main_cfg.get("article_fetch_max_age_days", 30),
             max_cached_models=main_cfg.get("max_cached_models", 20),
@@ -2823,6 +2823,8 @@ def select_article_fetch_candidates(
             return False
         if story.source.startswith("rss_reddit_"):
             return False
+        if story.source == "rss_lesswrong_com":
+            return False
         if story.url.startswith("https://news.ycombinator.com"):
             return False
         if story.time < min_time:
@@ -2873,10 +2875,19 @@ async def fetch_and_cache_article_bodies(
     if not stories:
         return {}
 
+    logging.info(
+        "article_fetch: fetching %d candidate bodies (concurrency=%d)",
+        len(stories),
+        concurrency,
+    )
+
     from server import ARTICLE_BODY_CHAR_LIMIT, _fetch_article_body_with_result
 
     sem = asyncio.Semaphore(max(1, concurrency))
     model_version = "all-MiniLM-L6-v2|mean|norm|256"
+
+    success = [0]
+    error_counts: dict[str, int] = {}
 
     async def fetch_one(story: Story) -> tuple[int, Story | None]:
         async with sem:
@@ -2895,6 +2906,7 @@ async def fetch_and_cache_article_bodies(
                 new_hash = hashlib.sha256(new_text.encode("utf-8")).hexdigest()
                 db.upsert_embedding(story.id, model_version, new_hash, new_vec)
                 db.clear_article_fetch_failure(story.id)
+                success[0] += 1
                 return story.id, updated
 
             now_ts = time.time()
@@ -2917,9 +2929,24 @@ async def fetch_and_cache_article_bodies(
                 permanent=permanent,
                 next_retry_at=next_retry_at,
             )
+            error_key = result.error or (
+                f"http_{result.status}" if result.status else "unknown"
+            )
+            error_counts[error_key] = error_counts.get(error_key, 0) + 1
             return story.id, None
 
     results = await asyncio.gather(*(fetch_one(story) for story in stories))
+    error_summary = (
+        " ".join(f"{k}={v}" for k, v in sorted(error_counts.items()))
+        if error_counts
+        else "(none)"
+    )
+    logging.info(
+        "article_fetch: ok=%d failed=%d errors=[%s]",
+        success[0],
+        len(stories) - success[0],
+        error_summary,
+    )
     return {sid: updated for sid, updated in results if updated is not None}
 
 
