@@ -3,6 +3,7 @@ import asyncio
 import numpy as np
 import pytest
 import time
+from pathlib import Path
 from hypothesis import given, strategies as st, settings, HealthCheck
 from database import Database, Story
 from dataclasses import replace
@@ -47,6 +48,75 @@ def db():
     db_instance = Database(":memory:")
     yield db_instance
     db_instance.close()
+
+
+def test_config_load_missing_file_returns_dataclass_defaults(tmp_path):
+    missing = tmp_path / "missing.toml"
+
+    assert Config.load(str(missing)) == Config()
+
+
+def test_config_load_partial_toml_overlays_defaults(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        """
+[hn_rewrite]
+server_port = 9999
+
+[hn_rewrite.model]
+svm_c = 0.7
+dedup_exclude_actions = ["down"]
+
+[hn_rewrite.rss]
+feeds = ["https://example.com/a.xml", "https://example.com/b.xml"]
+""",
+        encoding="utf-8",
+    )
+
+    config = Config.load(str(path))
+
+    assert config.server_port == 9999
+    assert config.article_fetch_max_per_run == 50
+    assert config.model.svm_c == 0.7
+    assert config.model.svm_gamma == 0.03
+    assert config.model.dedup_exclude_actions == ("down",)
+    assert config.rss.per_feed_limit == 70
+    assert config.rss.feeds == (
+        "https://example.com/a.xml",
+        "https://example.com/b.xml",
+    )
+
+
+def test_config_load_checked_in_config_contains_only_runtime_overrides():
+    config_path = Path(__file__).resolve().parents[1] / "config.toml"
+
+    config = Config.load(str(config_path))
+
+    assert config.server_port == 8766
+    assert config.article_fetch_max_per_run == 50
+    assert config.model.svm_c == 0.5
+    assert config.model.svm_gamma == 0.03
+    assert len(config.rss.feeds) >= 40
+
+
+@pytest.mark.parametrize(
+    "toml_text, error",
+    [
+        ("[other]\nvalue = 1\n", "Unknown config section"),
+        ("[hn_rewrite]\nunknown = 1\n", "Unknown hn_rewrite config key"),
+        (
+            "[hn_rewrite.model]\nunknown = 1\n",
+            "Unknown hn_rewrite.model config key",
+        ),
+        ("[hn_rewrite.rss]\nunknown = 1\n", "Unknown hn_rewrite.rss config key"),
+    ],
+)
+def test_config_load_rejects_unknown_keys(tmp_path, toml_text, error):
+    path = tmp_path / "config.toml"
+    path.write_text(toml_text, encoding="utf-8")
+
+    with pytest.raises(ValueError, match=error):
+        Config.load(str(path))
 
 
 def test_dashboard_primary_limit_is_capped_to_queue_size():

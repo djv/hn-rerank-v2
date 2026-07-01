@@ -1192,6 +1192,8 @@ class Handler(BaseHTTPRequestHandler):
                             concurrency=config.article_fetch_concurrency,
                         )
                     )
+            except Exception:
+                logging.exception("warm_background article_fetch failed")
             finally:
                 with cls._warm_bg_lock:
                     cls._article_fetch_in_flight.difference_update(

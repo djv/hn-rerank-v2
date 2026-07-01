@@ -1,58 +1,10 @@
 [hn_rewrite]
-db_path = "hn_rewrite.db"
-days = 30
-count = 40
-onnx_model_dir = "onnx_model"
 server_port = 8766
-regen_interval_seconds = 14400
-regen_initial_delay_seconds = 30
-regen_prewarm_top_n = 50
-prewarm_hn_full = true
-prewarm_reddit_full = true
-prewarm_lesswrong_full = true
-reddit_prewarm_top_per_sub = 10
-reddit_prewarm_max_per_cycle = 80
-reddit_min_fetch_spacing_seconds = 30.0
-max_cached_models = 20
-article_fetch_max_per_run = 50
-article_fetch_concurrency = 10
-article_fetch_max_age_days = 30
-# Two-leg recent candidate cap. HN stories are ordered by tier-1
-# gravity (score/age^1.8); non-HN RSS sources are ordered by recency
-# only (RSS carries no engagement score in the DB). Defaults match
-# the benchmark-tested safe values; set to a large number to disable.
-recent_candidate_hn_limit = 1500
-recent_candidate_rss_limit = 500
 
 [hn_rewrite.model]
 svm_c = 0.5
-svm_gamma = 0.03
-svm_kernel = "rbf"
-neutral_weight = 0.0
-enable_mmr = false
-min_feedback_labels = 10
-min_signal_examples = 5
-diversity_threshold = 0.75
-knn_k = 10
-positive_cluster_k = 4
-tier2_blend_window = 50
-tier3_threshold = 20
-tier3_blend_window = 60
-min_up_for_svm = 20
-min_down_for_svm = 20
-non_hn_ramp_window = 30
-hot_badge_percentile = 99.5
-# Dedupe cross-source duplicates (e.g. LessWrong cross-posts, Slashdot
-# rewrites of the same HN article) by full-content MiniLM cosine similarity.
-# Threshold 0.87 was empirically selected to suppress only true cross-posts
-# with <0.2% false-positive rate across 24k non-HN stories.
-dedup_embedding_cosine_enabled = true
-dedup_embedding_cosine_threshold = 0.87
-
 
 [hn_rewrite.rss]
-enabled = true
-per_feed_limit = 70
 feeds = [
     "https://lobste.rs/top/rss",
     "https://tildes.net/topics.rss",

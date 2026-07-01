@@ -11,7 +11,7 @@ import tomllib
 from collections import Counter, OrderedDict
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from typing import Any, Callable
 from datetime import datetime
 from pathlib import Path
@@ -428,70 +428,67 @@ class Config:
         except FileNotFoundError:
             return cls()
 
-        main_cfg = data.get("hn_rewrite", {})
-        model_cfg = main_cfg.get("model", {})
-        rss_cfg = main_cfg.get("rss", {})
+        unknown_sections = set(data) - {"hn_rewrite"}
+        if unknown_sections:
+            raise ValueError(
+                "Unknown config section(s): " + ", ".join(sorted(unknown_sections))
+            )
 
-        return cls(
-            db_path=main_cfg.get("db_path", "hn_rewrite.db"),
-            days=main_cfg.get("days", 30),
-            count=main_cfg.get("count", 40),
-            onnx_model_dir=main_cfg.get("onnx_model_dir", "onnx_model"),
-            server_port=main_cfg.get("server_port", 8765),
-            regen_interval_seconds=main_cfg.get("regen_interval_seconds", 14400),
-            regen_initial_delay_seconds=main_cfg.get("regen_initial_delay_seconds", 30),
-            regen_prewarm_top_n=main_cfg.get("regen_prewarm_top_n", 50),
-            reddit_prewarm_top_n=main_cfg.get("reddit_prewarm_top_n", 20),
-            prewarm_hn_full=main_cfg.get("prewarm_hn_full", True),
-            prewarm_reddit_full=main_cfg.get("prewarm_reddit_full", True),
-            prewarm_lesswrong_full=main_cfg.get("prewarm_lesswrong_full", True),
-            reddit_prewarm_top_per_sub=main_cfg.get("reddit_prewarm_top_per_sub", 10),
-            reddit_prewarm_max_per_cycle=main_cfg.get(
-                "reddit_prewarm_max_per_cycle", 80
-            ),
-            reddit_min_fetch_spacing_seconds=main_cfg.get(
-                "reddit_min_fetch_spacing_seconds", 30.0
-            ),
-            article_fetch_max_per_run=main_cfg.get("article_fetch_max_per_run", 50),
-            article_fetch_concurrency=main_cfg.get("article_fetch_concurrency", 10),
-            article_fetch_max_age_days=main_cfg.get("article_fetch_max_age_days", 30),
-            max_cached_models=main_cfg.get("max_cached_models", 20),
-            recent_candidate_hn_limit=main_cfg.get("recent_candidate_hn_limit", 1500),
-            recent_candidate_rss_limit=main_cfg.get("recent_candidate_rss_limit", 500),
-            tldr_prefetch_per_combo=main_cfg.get("tldr_prefetch_per_combo", 5),
-            model=ModelConfig(
-                svm_c=model_cfg.get("svm_c", 0.2),
-                svm_gamma=model_cfg.get("svm_gamma", 0.03),
-                svm_kernel=model_cfg.get("svm_kernel", "rbf"),
-                neutral_weight=model_cfg.get("neutral_weight", 0.0),
-                enable_mmr=model_cfg.get("enable_mmr", False),
-                diversity_threshold=model_cfg.get("diversity_threshold", 0.75),
-                knn_k=model_cfg.get("knn_k", 10),
-                positive_cluster_k=model_cfg.get("positive_cluster_k", 4),
-                tier2_blend_window=model_cfg.get("tier2_blend_window", 50),
-                tier3_threshold=model_cfg.get("tier3_threshold", 20),
-                tier3_blend_window=model_cfg.get("tier3_blend_window", 60),
-                min_up_for_svm=model_cfg.get("min_up_for_svm", 20),
-                min_down_for_svm=model_cfg.get("min_down_for_svm", 20),
-                non_hn_ramp_window=model_cfg.get("non_hn_ramp_window", 30),
-                hot_badge_percentile=model_cfg.get("hot_badge_percentile", 99.5),
-                dedup_render_enabled=model_cfg.get("dedup_render_enabled", True),
-                dedup_embedding_cosine_enabled=model_cfg.get(
-                    "dedup_embedding_cosine_enabled", True
-                ),
-                dedup_embedding_cosine_threshold=model_cfg.get(
-                    "dedup_embedding_cosine_threshold", 0.87
-                ),
-                dedup_exclude_actions=tuple(
-                    model_cfg.get("dedup_exclude_actions", ("up", "neutral"))
-                ),
-            ),
-            rss=RssConfig(
-                enabled=rss_cfg.get("enabled", True),
-                per_feed_limit=rss_cfg.get("per_feed_limit", 70),
-                feeds=tuple(rss_cfg.get("feeds", [])),
-            ),
+        main_cfg = data.get("hn_rewrite", {})
+        if not isinstance(main_cfg, dict):
+            raise ValueError("[hn_rewrite] must be a table")
+
+        defaults = cls()
+        root_values = dict(main_cfg)
+        model_cfg = root_values.pop("model", {})
+        rss_cfg = root_values.pop("rss", {})
+
+        root_field_names = {f.name for f in fields(cls)} - {"model", "rss"}
+        unknown_root = set(root_values) - root_field_names
+        if unknown_root:
+            raise ValueError(
+                "Unknown hn_rewrite config key(s): "
+                + ", ".join(sorted(unknown_root))
+            )
+
+        model = _overlay_dataclass_config(
+            defaults.model,
+            model_cfg,
+            section="hn_rewrite.model",
+            tuple_fields={"dedup_exclude_actions"},
         )
+        rss = _overlay_dataclass_config(
+            defaults.rss,
+            rss_cfg,
+            section="hn_rewrite.rss",
+            tuple_fields={"feeds"},
+        )
+
+        return replace(defaults, **root_values, model=model, rss=rss)
+
+
+def _overlay_dataclass_config(
+    defaults: Any,
+    config: Any,
+    *,
+    section: str,
+    tuple_fields: set[str] | None = None,
+) -> Any:
+    if not isinstance(config, dict):
+        raise ValueError(f"[{section}] must be a table")
+
+    field_names = {f.name for f in fields(defaults)}
+    unknown = set(config) - field_names
+    if unknown:
+        raise ValueError(
+            f"Unknown {section} config key(s): " + ", ".join(sorted(unknown))
+        )
+
+    values = dict(config)
+    for name in tuple_fields or set():
+        if name in values:
+            values[name] = tuple(values[name])
+    return replace(defaults, **values)
 
 
 @dataclass(frozen=True)
@@ -2803,7 +2800,7 @@ def select_article_fetch_candidates(
     ranked: list[RankedStory],
     dashboard_selected: list[RankedStory],
     db: Database,
-    max_per_run: int = 100,
+    max_per_run: int,
     max_age_days: int = 30,
     now_ts: float | None = None,
 ) -> list[Story]:

@@ -2989,6 +2989,7 @@ def test_on_demand_tldr_records_fetch_failure(test_env, monkeypatch):
 
 def test_on_demand_tldr_clears_failure_on_success(test_env, monkeypatch):
     """On-demand success clears prior failure record."""
+    import hashlib
     import server
     import time as time_mod
 
@@ -3044,6 +3045,9 @@ def test_on_demand_tldr_clears_failure_on_success(test_env, monkeypatch):
     updated = db.get_story(sid)
     assert updated is not None
     assert updated.article_body == "Recovered article body content here"
+    model_version = "all-MiniLM-L6-v2|mean|norm|256"
+    text_hash = hashlib.sha256(updated.text_content.encode("utf-8")).hexdigest()
+    assert db.get_embedding(sid, model_version, text_hash) is not None
 
 
 def test_warm_background_task_dedupes_in_flight_ids(test_env, monkeypatch):
@@ -3093,8 +3097,10 @@ def test_warm_background_task_dedupes_in_flight_ids(test_env, monkeypatch):
     # Mark s1 and s2 as in-flight, leave s3 free
     srv.Handler._article_fetch_in_flight = {3001, 3002}
 
-    # Mock the fetch to be a no-op
+    fetched_ids: list[int] = []
+
     async def noop_fetch(*args, **kwargs):
+        fetched_ids.extend(s.id for s in kwargs["stories"])
         return {}
 
     import pipeline
@@ -3111,6 +3117,53 @@ def test_warm_background_task_dedupes_in_flight_ids(test_env, monkeypatch):
 
     # Only s3 should have been added to in-flight during the task (then cleared)
     # s1 and s2 remain unchanged since they were already in-flight
+    assert fetched_ids == [3003]
     assert 3001 in srv.Handler._article_fetch_in_flight
     assert 3002 in srv.Handler._article_fetch_in_flight
     assert 3003 not in srv.Handler._article_fetch_in_flight
+
+
+def test_warm_background_article_fetch_failure_still_prefetches_tldrs(
+    test_env, monkeypatch
+):
+    """Article fetch is best-effort; TLDR prefetch must still run on failure."""
+    import pipeline
+    import server as srv
+    from pipeline import Config, RankedStory
+
+    _port, db, _, _, _ = test_env
+    story = Story(
+        id=3010,
+        title="Failure should not block TLDR",
+        url="https://example.com/failure",
+        score=10,
+        time=int(time.time()) - 3600,
+        text_content="failure should not block tldr",
+        source="hn",
+    )
+    db.upsert_story(story)
+    ranked = [RankedStory(story=story, score=1.0, best_match_title="")]
+    srv.Handler._article_fetch_in_flight = set()
+
+    async def failing_fetch(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    prefetch_calls: list[list[int]] = []
+
+    async def capture_prefetch(ranked_stories, database, per_combo):
+        prefetch_calls.append([rs.story.id for rs in ranked_stories])
+        return 1
+
+    monkeypatch.setattr(pipeline, "fetch_and_cache_article_bodies", failing_fetch)
+    monkeypatch.setattr(srv, "_prefetch_tldrs_for_ranked", capture_prefetch)
+
+    srv.Handler._warm_background_tasks(
+        ranked,
+        db,
+        MockEmbedder(),
+        Config(article_fetch_max_per_run=10),
+        per_combo=1,
+    )
+
+    assert prefetch_calls == [[3010]]
+    assert srv.Handler._article_fetch_in_flight == set()
