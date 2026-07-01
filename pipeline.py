@@ -2184,6 +2184,7 @@ def _score_and_rank(
                     C=config.model.svm_c,
                     kernel=config.model.svm_kernel,
                     gamma=config.model.svm_gamma,
+                    cache_size=16,
                     random_state=0,
                     decision_function_shape="ovr",
                 )
@@ -2799,6 +2800,20 @@ _PAYWALL_DOMAINS: frozenset[str] = frozenset(
 )
 
 
+def _is_fetchable_article_url(url: str) -> bool:
+    """Return False for URLs that will never yield extractable article text."""
+    if not url:
+        return False
+    if url.startswith("https://news.ycombinator.com"):
+        return False
+    host = urlparse(url).hostname or ""
+    if any(host == d or host.endswith("." + d) for d in _PAYWALL_DOMAINS):
+        return False
+    if "youtube.com/watch" in url or "youtu.be/" in url:
+        return False
+    return True
+
+
 def select_article_fetch_candidates(
     *,
     ranked: list[RankedStory],
@@ -2822,16 +2837,12 @@ def select_article_fetch_candidates(
     def eligible(story: Story) -> bool:
         if not story.url or story.article_body:
             return False
-        if story.source.startswith("rss_reddit_"):
+        if not _is_fetchable_article_url(story.url):
             return False
-        if story.source == "rss_lesswrong_com":
-            return False
-        if story.url.startswith("https://news.ycombinator.com"):
-            return False
-        host = urlparse(story.url).hostname or ""
-        if any(host == d or host.endswith("." + d) for d in _PAYWALL_DOMAINS):
-            return False
-        if "youtube.com/watch" in story.url or "youtu.be/" in story.url:
+        if (
+            story.source.startswith("rss_reddit_")
+            or story.source == "rss_lesswrong_com"
+        ):
             return False
         if story.time < min_time:
             return False

@@ -5600,6 +5600,14 @@ def test_rank_trace_reports_svm_cache_miss_then_hit(
         return real_topk_mean(values, k)
 
     monkeypatch.setattr("pipeline._topk_mean", counting_topk_mean)
+    seen_svc_cache_sizes: list[int | None] = []
+    real_svc = pipeline.SVC
+
+    def tracking_svc(*args, **kwargs):
+        seen_svc_cache_sizes.append(kwargs.get("cache_size"))
+        return real_svc(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "SVC", tracking_svc)
     candidate_embeddings = fake_embeddings(candidates, embedder, db)
     config = Config()
 
@@ -5618,6 +5626,7 @@ def test_rank_trace_reports_svm_cache_miss_then_hit(
     assert miss_trace.timings_ms["svm_training_feature_prep"] >= 0
     miss_topk_calls = topk_calls
     assert miss_topk_calls > 0
+    assert seen_svc_cache_sizes == [16]
 
     hit_trace = RankTrace()
     _score_and_rank(
@@ -5914,3 +5923,33 @@ def test_select_article_fetch_excludes_youtube_urls(db):
             now_ts=now,
         )
         assert result == [], f"should skip {url}"
+
+
+def test_is_fetchable_article_url():
+    """Unit test for the shared URL filter used by both batch and on-demand paths."""
+    from pipeline import _is_fetchable_article_url
+
+    # Fetchable URLs
+    assert _is_fetchable_article_url("https://example.com/article")
+    assert _is_fetchable_article_url("https://github.com/org/repo")
+    assert _is_fetchable_article_url("https://simonwillison.net/2026/01/01/post")
+
+    # Paywall domains
+    assert not _is_fetchable_article_url("https://www.nytimes.com/2026/01/01/article")
+    assert not _is_fetchable_article_url("https://bloomberg.com/news/articles/2026")
+    assert not _is_fetchable_article_url("https://www.economist.com/article/123")
+    assert not _is_fetchable_article_url("https://ft.com/content/abc123")
+    assert not _is_fetchable_article_url("https://www.wsj.com/articles/123")
+
+    # YouTube
+    assert not _is_fetchable_article_url("https://www.youtube.com/watch?v=abc123")
+    assert not _is_fetchable_article_url("https://youtu.be/xyz456")
+
+    # HN discussion URLs
+    assert not _is_fetchable_article_url("https://news.ycombinator.com/item?id=12345")
+    assert not _is_fetchable_article_url(
+        "https://news.ycombinator.com/item?id=99999999"
+    )
+
+    # Empty/None
+    assert not _is_fetchable_article_url("")

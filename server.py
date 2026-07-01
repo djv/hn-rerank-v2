@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import os
 import asyncio
+import gc
 import hashlib
 import html
 import inspect
 import json
 import logging
+import os
 import random
 import re
 import secrets
@@ -996,7 +997,19 @@ class Handler(BaseHTTPRequestHandler):
                 "Failed warming dashboard cache for user_id=%s: %s", user.id, e
             )
         finally:
-            cls._finish_warm_attempt(user, requested_version)
+            try:
+                cls._finish_warm_attempt(user, requested_version)
+            finally:
+                cls._collect_after_warm_attempt()
+
+    @classmethod
+    def _collect_after_warm_attempt(cls) -> None:
+        try:
+            collected = gc.collect()
+        except Exception:
+            logging.debug("warm_gc result=failed", exc_info=True)
+            return
+        logging.debug("warm_gc result=completed collected=%s", collected)
 
     @classmethod
     def _run_warm_attempt(cls, user: User, requested_version: int) -> None:
@@ -1466,63 +1479,69 @@ class Handler(BaseHTTPRequestHandler):
                 and story.url
                 and not story.source.startswith("rss_reddit_")
                 and not story.source == "rss_lesswrong_com"
-                and not story.url.startswith("https://news.ycombinator.com")
                 and len(story.self_text) < 500
             ):
-                import hashlib
-                from pipeline import (
-                    compose_story_text,
-                    _article_failure_retry_time,
-                )
+                from pipeline import _is_fetchable_article_url
 
-                result = asyncio.run(_fetch_article_body_with_result(story.url))
-                if result.body:
-                    article_body = result.body[:ARTICLE_BODY_CHAR_LIMIT]
-                    new_text = compose_story_text(
-                        story.title,
-                        story.self_text,
-                        story.top_comments,
-                        article_body,
+                if _is_fetchable_article_url(story.url):
+                    import hashlib
+                    from pipeline import (
+                        compose_story_text,
+                        _article_failure_retry_time,
                     )
-                    updated_story = replace(
-                        story,
-                        article_body=article_body,
-                        text_content=new_text,
-                    )
-                    self.db.upsert_story(updated_story)
-                    self.db.clear_article_fetch_failure(story.id)
 
-                    embedder = type(self).embedder
-                    if embedder is not None:
-                        model_version = "all-MiniLM-L6-v2|mean|norm|256"
-                        new_vec = embedder.encode([new_text])[0]
-                        new_hash = hashlib.sha256(new_text.encode("utf-8")).hexdigest()
-                        self.db.upsert_embedding(
-                            story.id, model_version, new_hash, new_vec
+                    result = asyncio.run(_fetch_article_body_with_result(story.url))
+                    if result.body:
+                        article_body = result.body[:ARTICLE_BODY_CHAR_LIMIT]
+                        new_text = compose_story_text(
+                            story.title,
+                            story.self_text,
+                            story.top_comments,
+                            article_body,
                         )
+                        updated_story = replace(
+                            story,
+                            article_body=article_body,
+                            text_content=new_text,
+                        )
+                        self.db.upsert_story(updated_story)
+                        self.db.clear_article_fetch_failure(story.id)
 
-                    story = updated_story
-                else:
-                    now_ts = time.time()
-                    previous = self.db.get_article_fetch_failure(story.id)
-                    previous_count = int(previous["failure_count"]) if previous else 0
-                    failure_count = previous_count + 1
-                    permanent = result.permanent or (
-                        result.error == "empty_extraction" and failure_count >= 3
-                    )
-                    next_retry_at = (
-                        now_ts + 3650 * 86400
-                        if permanent
-                        else _article_failure_retry_time(failure_count, now_ts)
-                    )
-                    self.db.record_article_fetch_failure(
-                        story.id,
-                        story.url or "",
-                        status=result.status,
-                        error=result.error,
-                        permanent=permanent,
-                        next_retry_at=next_retry_at,
-                    )
+                        embedder = type(self).embedder
+                        if embedder is not None:
+                            model_version = "all-MiniLM-L6-v2|mean|norm|256"
+                            new_vec = embedder.encode([new_text])[0]
+                            new_hash = hashlib.sha256(
+                                new_text.encode("utf-8")
+                            ).hexdigest()
+                            self.db.upsert_embedding(
+                                story.id, model_version, new_hash, new_vec
+                            )
+
+                        story = updated_story
+                    else:
+                        now_ts = time.time()
+                        previous = self.db.get_article_fetch_failure(story.id)
+                        previous_count = (
+                            int(previous["failure_count"]) if previous else 0
+                        )
+                        failure_count = previous_count + 1
+                        permanent = result.permanent or (
+                            result.error == "empty_extraction" and failure_count >= 3
+                        )
+                        next_retry_at = (
+                            now_ts + 3650 * 86400
+                            if permanent
+                            else _article_failure_retry_time(failure_count, now_ts)
+                        )
+                        self.db.record_article_fetch_failure(
+                            story.id,
+                            story.url or "",
+                            status=result.status,
+                            error=result.error,
+                            permanent=permanent,
+                            next_retry_at=next_retry_at,
+                        )
             cache_key = _tldr_cache_key(
                 title=story.title,
                 self_text=story.self_text or "",
