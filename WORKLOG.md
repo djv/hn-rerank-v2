@@ -5,6 +5,19 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-07-01 — Fix card outer gutters
+
+Normal dashboard mode now lets Pico's main padding provide the top page gutter,
+keeps the bottom page gutter explicit, and reserves card height with a named
+`--active-card-viewport-reserve` variable so the active card ends with a
+side-gutter-sized gap above the fixed vote bar. Fullscreen mode now uses a
+named `--fullscreen-gutter` for balanced top and bottom body padding, with the
+swipe shell height subtracting both fullscreen gutters.
+
+**Files:** `templates/index.html`, `tests/test_server.py`, `WORKLOG.md`.
+
+---
+
 ## 2026-07-01 — Uniform story-card padding
 
 Story cards now use the same internal padding on all four sides in normal,

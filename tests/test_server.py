@@ -2227,6 +2227,9 @@ def test_keydown_uses_letter_keys():
     assert "open comments" in template.lower()
     assert "data-article-url" in template
     assert "data-comments-url" in template
+    assert "--page-gutter: 1rem;" in template
+    assert "--active-card-viewport-reserve: 6rem;" in template
+    assert "--fullscreen-gutter: 1rem;" in template
     # card sizing: shrink-to-fit for short, full width for enriched,
     # max-height caps at viewport so page never scrolls
     assert "width: fit-content" in template
@@ -2236,9 +2239,19 @@ def test_keydown_uses_letter_keys():
     assert "padding: 0.5rem;" in story_card_block
     # page never scrolls — overflow hidden on html and body
     assert "html {\n      overflow: hidden;\n    }" in template
-    assert "overflow: hidden;" in template.split("body {")[1].split("}")[0]
+    body_block = template.split("body {", 1)[1].split("}", 1)[0]
+    assert "padding-top: 0;" in body_block
+    assert "padding-bottom: var(--page-gutter);" in body_block
+    assert "overflow: hidden;" in body_block
     active_block = template.split(".story-card.active {", 1)[1].split("}", 1)[0]
-    assert "max-height: calc(100vh - 5rem)" in active_block
+    assert (
+        "max-height: calc(100vh - var(--active-card-viewport-reserve))"
+        in active_block
+    )
+    assert (
+        "max-height: calc(100dvh - var(--active-card-viewport-reserve))"
+        in active_block
+    )
     assert "min-height: 18rem;" in active_block
     # active card keeps the base uniform padding; viewport caps clear the fixed vote bar
     assert "padding-bottom" not in active_block
@@ -2273,16 +2286,19 @@ def test_keydown_uses_letter_keys():
     # fullscreen hides side controls and lets the active card fill viewport height
     assert ".fullscreen .swipe-side { display: none; }" in template
     assert ".fullscreen .vote-bar { display: none; }" in template
-    fullscreen_body_block = template.split("body.fullscreen {", 1)[1].split(
-        "}", 1
-    )[0]
-    assert "padding-top: 0.5rem;" in fullscreen_body_block
-    assert "padding-bottom: 0.5rem;" in fullscreen_body_block
+    fullscreen_body_block = template.split("body.fullscreen {", 1)[1].split("}", 1)[0]
+    assert "padding-block: var(--fullscreen-gutter);" in fullscreen_body_block
     fullscreen_shell_block = template.split(".fullscreen .swipe-shell {", 1)[1].split(
         "}", 1
     )[0]
-    assert "height: calc(100vh - 1rem);" in fullscreen_shell_block
-    assert "height: calc(100dvh - 1rem);" in fullscreen_shell_block
+    assert (
+        "height: calc(100vh - var(--fullscreen-gutter) - var(--fullscreen-gutter));"
+        in fullscreen_shell_block
+    )
+    assert (
+        "height: calc(100dvh - var(--fullscreen-gutter) - var(--fullscreen-gutter));"
+        in fullscreen_shell_block
+    )
     assert "padding-block: 0;" in fullscreen_shell_block
     assert "display: flex;" in fullscreen_shell_block
     assert "flex-direction: column;" in fullscreen_shell_block

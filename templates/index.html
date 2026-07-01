@@ -13,6 +13,9 @@
       --pico-primary: #ff6600;
       --pico-primary-background: #ff6600;
       --pico-primary-hover: #e05a00;
+      --page-gutter: 1rem;
+      --active-card-viewport-reserve: 6rem;
+      --fullscreen-gutter: 1rem;
       --mobile-vote-bar-clearance: calc(3.75rem + env(safe-area-inset-bottom, 0px));
     }
     
@@ -21,14 +24,13 @@
     }
 
     body {
-      padding-top: 0.5rem;
-      padding-bottom: 1rem;
+      padding-top: 0;
+      padding-bottom: var(--page-gutter);
       overflow: hidden;
     }
 
     body.fullscreen {
-      padding-top: 0.5rem;
-      padding-bottom: 0.5rem;
+      padding-block: var(--fullscreen-gutter);
     }
 
     header {
@@ -385,8 +387,8 @@
     .story-card.active {
       display: block;
       cursor: default;
-      max-height: calc(100vh - 5rem);     /* fallback for older browsers */
-      max-height: calc(100dvh - 5rem);    /* preferred */
+      max-height: calc(100vh - var(--active-card-viewport-reserve));     /* fallback for older browsers; clears fixed vote bar */
+      max-height: calc(100dvh - var(--active-card-viewport-reserve));    /* preferred */
       min-height: 18rem;
       overflow: auto;
     }
@@ -589,8 +591,8 @@
     .fullscreen .swipe-side { display: none; }
     .fullscreen .vote-bar { display: none; }
     .fullscreen .swipe-shell {
-      height: calc(100vh - 1rem);
-      height: calc(100dvh - 1rem);
+      height: calc(100vh - var(--fullscreen-gutter) - var(--fullscreen-gutter));
+      height: calc(100dvh - var(--fullscreen-gutter) - var(--fullscreen-gutter));
       padding-block: 0;
       display: flex;
       flex-direction: column;
