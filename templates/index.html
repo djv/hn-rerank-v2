@@ -962,23 +962,20 @@
       cards.forEach(card => storiesContainer.appendChild(card));
     }
 
-    function shuffleCards() {
-      const cards = Array.from(document.querySelectorAll('.story-card'));
-      for (let i = cards.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [cards[i], cards[j]] = [cards[j], cards[i]];
-      }
-      cards.forEach(card => storiesContainer.appendChild(card));
-    }
-
     function orderForCurrentSort() {
       if (currentSort === 'date') {
         orderCards((a, b) => Number(b.dataset.time || 0) - Number(a.dataset.time || 0));
-      } else if (currentSort === 'recommended') {
-        orderCards((a, b) => parseFloat(b.dataset.score) - parseFloat(a.dataset.score));
       } else {
-        shuffleCards();
+        orderCards((a, b) => parseFloat(b.dataset.score) - parseFloat(a.dataset.score));
       }
+    }
+
+    function advanceToNextCard() {
+      const q = queuedCards();
+      if (q.length === 0) return;
+      const idx = activeCard ? q.indexOf(activeCard) : -1;
+      const next = q[(idx + 1) % q.length];
+      setActiveCard(next);
     }
 
     function setActiveCard(card) {
@@ -1034,6 +1031,10 @@
       sidePanel.classList.remove('visible');
 
       if (filterName === 'sort') {
+        if (value === currentSort) {
+          advanceToNextCard();
+          return;
+        }
         currentSort = value;
         updateFilterTabs('sort', currentSort);
         sourceTabs.forEach(tab => {
@@ -1059,9 +1060,7 @@
         if (activeCard && (!matchesCurrentCombo(activeCard) || !matchesCurrentAxes(activeCard))) {
           activeCard.classList.remove('active');
         }
-        if (currentSort === 'recommended' || currentSort === 'date') {
-          orderForCurrentSort();
-        }
+        orderForCurrentSort();
         showNextCard({ allowRefresh: false });
         scheduleDeckRefresh({ advance: true });
         scheduleIdleAgePrefetch();
@@ -1083,9 +1082,7 @@
       if (activeCard && (!matchesCurrentCombo(activeCard) || !matchesCurrentAxes(activeCard))) {
         activeCard.classList.remove('active');
       }
-      if (currentSort === 'recommended' || currentSort === 'date') {
-        orderForCurrentSort();
-      }
+      orderForCurrentSort();
       showNextCard({ allowRefresh: false });
       scheduleDeckRefresh({ advance: true });
     }
@@ -1418,15 +1415,8 @@
       }
 
       applyGradient();
-      // The server returns cards in recommended order. Re-apply the active
-      // sort for the deterministic modes (recommended/date). Skip popular/
-      // explore (shuffle) to avoid reshuffling on every vote.
-      if (currentSort === 'recommended' || currentSort === 'date') {
-        orderForCurrentSort();
-        if (advance) {
-          showNextCard({ allowRefresh: false });
-        }
-      } else if (advance && (!activeCard || activeCard.dataset.voted)) {
+      orderForCurrentSort();
+      if (advance) {
         showNextCard({ allowRefresh: false });
       }
     }
@@ -1730,7 +1720,7 @@
           btn.disabled = false;
         }
       } finally {
-        contentDiv.dataset.loading = 'false';
+        delete contentDiv.dataset.loading;
       }
     }
 

@@ -93,6 +93,52 @@ def _drain_warms(handler: type[Handler], timeout_s: float = 3.0) -> None:
         time.sleep(0.01)
 
 
+def test_warm_timer_collects_after_failed_warm(
+    prop_db: Database, mock_embedder: MockEmbedder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class TestHandler(Handler):
+        pass
+
+    TestHandler.config = Config(db_path=prop_db.db_path, server_port=0)
+    TestHandler.db = prop_db
+    TestHandler.embedder = mock_embedder
+    TestHandler._dashboard_cache = {}
+    TestHandler._dashboard_versions = {}
+    TestHandler._cold_stories = []
+    TestHandler._render_locks = {}
+    _reset_warm_state(TestHandler)
+
+    user = prop_db.create_user("warm_gc")
+    TestHandler._warmup_requested_versions[user.id] = 1
+    TestHandler._warmup_last_request_at[user.id] = (
+        time.monotonic() - TestHandler._WARM_DEBOUNCE_S
+    )
+    TestHandler._warmup_timers[user.id] = cast(
+        threading.Timer, threading.current_thread()
+    )
+    calls: list[str] = []
+
+    def fake_run(cls, user_arg, version):
+        calls.append(f"run:{version}")
+        raise RuntimeError("boom")
+
+    def fake_finish(cls, user_arg, version):
+        calls.append(f"finish:{version}")
+
+    def fake_collect(cls):
+        calls.append("collect")
+
+    monkeypatch.setattr(TestHandler, "_run_warm_attempt", classmethod(fake_run))
+    monkeypatch.setattr(TestHandler, "_finish_warm_attempt", classmethod(fake_finish))
+    monkeypatch.setattr(
+        TestHandler, "_collect_after_warm_attempt", classmethod(fake_collect)
+    )
+
+    TestHandler._warm_timer_fired(user)
+
+    assert calls == ["run:1", "finish:1", "collect"]
+
+
 def _start_handler_server(
     db: Database, embedder: MockEmbedder, port: int = 0
 ) -> tuple[ThreadingHTTPServer, int, type[Handler]]:
@@ -2489,7 +2535,6 @@ def test_setFilter_preserves_sort_age_source_refresh_behavior() -> None:
     assert "scheduleDeckRefresh({ advance: true })" in body
     assert "orderForCurrentSort()" in body
     assert "showNextCard({ allowRefresh: false })" in body
-    assert "if (currentSort === 'recommended' || currentSort === 'date')" in body
     assert "matchesCurrentCombo(activeCard)" in body
     assert "filterName === 'sort' && value === 'popular'" in body
     assert "currentSource === 'non-hn'" in body
@@ -2503,17 +2548,17 @@ def test_setFilter_preserves_sort_age_source_refresh_behavior() -> None:
 
 
 def test_orderForCurrentSort_uses_shared_order_helper_for_deterministic_modes():
-    """Recommended/date use deterministic comparators; popular/explore shuffle."""
+    """All sort modes use deterministic ordering; no shuffling."""
     _, static = _read_template_and_static()
     idx = static.index("function orderForCurrentSort(")
-    end = static.index("\n\n    function setActiveCard(", idx)
+    end = static.index("\n\n    function advanceToNextCard(", idx)
     body = static[idx:end]
-    assert "currentSort === 'recommended'" in body
     assert "currentSort === 'date'" in body
     assert "orderCards((a, b) => parseFloat(b.dataset.score)" in body
     assert "orderCards((a, b) => Number(b.dataset.time || 0)" in body
-    assert "shuffleCards()" in body
-    assert "Math.floor(Math.random() * (i + 1))" in static
+    assert "shuffleCards()" not in body
+    assert "Math.floor(Math.random() * (i + 1))" not in static
+    assert "advanceToNextCard()" in static
 
 
 def test_data_is_recent_attribute_emitted(test_env):
@@ -2829,19 +2874,13 @@ def test_stale_page_check_treats_version_zero_as_finite() -> None:
 
 
 def test_refillQueue_reorders_deterministic_modes_only() -> None:
-    """After appending new cards from the server (which always returns them
-    in recommended order), refillQueue re-applies the active sort for the
-    deterministic modes (recommended/date). Popular/explore (shuffle) are
-    skipped to avoid reshuffling on every vote."""
+    """After appending new cards, refillQueue always re-applies the active
+    sort for all modes (no more shuffle special-case)."""
     _, inline_script = _read_template_and_static()
     block = inline_script.split("async function refillQueue(", 1)[1].split(
         "function ", 1
     )[0]
-    # The reorder call must be guarded by the deterministic modes.
     assert "orderForCurrentSort()" in block
-    assert "currentSort === 'recommended'" in block
-    assert "currentSort === 'date'" in block
-    assert "if (currentSort === 'recommended' || currentSort === 'date')" in block
     assert "showNextCard({ allowRefresh: false })" in block
     assert block.index("orderForCurrentSort()") < block.index(
         "showNextCard({ allowRefresh: false })"
@@ -2854,8 +2893,7 @@ def test_refillQueue_advance_false_path_does_not_show_next_card() -> None:
         "function ", 1
     )[0]
     assert "advance = true" in block
-    assert "if (advance) {\n          showNextCard({ allowRefresh: false });" in block
-    assert "} else if (advance && (!activeCard || activeCard.dataset.voted))" in block
+    assert "if (advance) {\n        showNextCard({ allowRefresh: false });" in block
 
 
 def test_showToast_dismisses_after_3s() -> None:
