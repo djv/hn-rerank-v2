@@ -38,15 +38,23 @@ def _read_template_and_static() -> tuple[str, str]:
     """Read both the Jinja2 template and the inline <script> block.
 
     Tests that look for JS code should check the inline script returned here,
-    while tests that look for HTML attributes / Jinja2 directives check the
-    template. (The script is inline again after the static extraction was
-    rolled back — see WORKLOG 2026-06-27.)
+    while tests that look for HTML attributes / Jinja2 directives check the full
+    template source, including component partials. (The script is inline again
+    after the static extraction was rolled back — see WORKLOG 2026-06-27.)
     """
     repo_root = Path(__file__).resolve().parents[1]
-    template = (repo_root / "templates" / "index.html").read_text(encoding="utf-8")
-    start = template.find("  <script>\n")
-    end = template.find("  </script>\n", start)
-    inline_script = template[start:end] if start >= 0 and end >= 0 else ""
+    index_template = (repo_root / "templates" / "index.html").read_text(
+        encoding="utf-8"
+    )
+    component_dir = repo_root / "templates" / "components"
+    component_sources = [
+        path.read_text(encoding="utf-8")
+        for path in sorted(component_dir.glob("*.html"))
+    ]
+    template = "\n".join([index_template, *component_sources])
+    start = index_template.find("  <script>\n")
+    end = index_template.find("  </script>\n", start)
+    inline_script = index_template[start:end] if start >= 0 and end >= 0 else ""
     return template, inline_script
 
 
@@ -1952,9 +1960,7 @@ def test_dashboard_has_no_refresh_button_or_progress_bar():
     silently refills the queue on every successful vote save and on every
     sort/age/source tab click — no user-facing button or bar to wait for.
     """
-    template = (
-        Path(__file__).resolve().parents[1] / "templates" / "index.html"
-    ).read_text(encoding="utf-8")
+    template, _ = _read_template_and_static()
     # Old refresh UI is gone
     assert 'id="refresh-banner"' not in template
     assert 'id="refresh-now-btn"' not in template
@@ -2148,28 +2154,30 @@ def test_dashboard_has_source_filter_toggle():
     """The side rail must expose a 3-way source filter (Mixed/HN/Non-HN)
     that narrows the deck by story source. Mixed is the default.
     """
-    template = (
-        Path(__file__).resolve().parents[1] / "templates" / "index.html"
-    ).read_text(encoding="utf-8")
-    assert 'class="source-tabs"' in template
-    assert 'data-source="mixed"' in template
-    assert 'data-source="hn"' in template
-    assert 'data-source="non-hn"' in template
+    template, _ = _read_template_and_static()
+    assert 'data-filter="source"' in template
     # Mixed is the default active tab
-    assert 'class="source-tab active" data-source="mixed"' in template
+    assert 'TabView("mixed", "<u>M</u>ixed", True)' in (
+        Path(__file__).resolve().parents[1] / "pipeline.py"
+    ).read_text(encoding="utf-8")
     # Source filter appears before swipe keys in the DOM
-    assert template.index("source-tabs") < template.index("swipe-keys")
+    side_rail = (
+        Path(__file__).resolve().parents[1]
+        / "templates"
+        / "components"
+        / "side_rail.html"
+    ).read_text(encoding="utf-8")
+    assert side_rail.index('include "components/tab_group.html"') < side_rail.index(
+        "swipe-keys"
+    )
 
 
 def test_story_cards_emit_combo_keys_and_is_hn_attribute():
     """Each .story-card carries data-combo for client age+source filtering
     and data-is-hn for server-side is_non_hn tracking."""
     template, static = _read_template_and_static()
-    assert 'data-combo="{{ item.combo_keys }}"' in template
-    assert (
-        "data-is-hn=\"{{ '0' if item.is_non_hn else '1' }}\"".replace("{{", "{{")
-        in template
-    )
+    assert 'data-combo="{{ card.combo_keys }}"' in template
+    assert 'data-is-hn="{{ card.is_hn_attr }}"' in template
     assert "card.dataset.combo" in static
     assert "s.startsWith('rss_')" not in static
     assert "s === 'hn' || s === 'bq_seed'" not in static
@@ -2204,14 +2212,17 @@ def test_keydown_uses_letter_keys():
     and ArrowUp/ArrowDown scroll the active card.
     """
     template, static = _read_template_and_static()
-    assert "key === 'j'" in static
-    assert "key === 'k'" in static
-    assert "key === 'l'" in static
+    assert "const KEY_ACTIONS" in static
+    assert "j: () => submitVote('down')" in static
+    assert "k: () => submitVote('up')" in static
+    assert "l: () => submitVote('neutral')" in static
     # arrow bindings present for card scrolling
-    handler = static.split("document.addEventListener('keydown'")[1].split("});", 1)[0]
-    assert "arrowup" in handler
-    assert "arrowdown" in handler
-    assert "ArrowRight" not in handler
+    key_map = static.split("const KEY_ACTIONS", 1)[1].split(
+        "document.addEventListener('keydown'", 1
+    )[0]
+    assert "arrowup" in key_map
+    assert "arrowdown" in key_map
+    assert "ArrowRight" not in key_map
     # legend shows the new label
     assert "skip (neutral)" in template.lower()
     # first-time tip present and uses floating overlay
@@ -2220,8 +2231,8 @@ def test_keydown_uses_letter_keys():
     assert 'aria-label="Keyboard shortcuts"' in template
     assert "first-time-tip-inner" in template
     # open article / open comments keys present
-    assert "key === 'o'" in static
-    assert "key === 'c'" in static
+    assert "o: () => openStoryUrl('article')" in static
+    assert "c: () => openStoryUrl('comments')" in static
     assert "document.body.classList.toggle('fullscreen')" in static
     assert "open article" in template.lower()
     assert "open comments" in template.lower()
@@ -2368,17 +2379,18 @@ def test_keydown_uses_letter_keys():
     assert 'role="status"' in template
     assert 'aria-live="polite"' in template
     # mode and source tabs have filled active style
-    assert ".sort-tab.active {\n      background: var(--pico-primary);" in template
-    assert ".age-tab.active {\n      background: #6c757d;" in template
-    assert ".source-tab.active {\n      background: #6c757d;" in template
+    assert ".tab-btn.active {\n      background: var(--pico-primary);" in template
+    assert ".tab-btn--segmented.active {\n      background: #6c757d;" in template
     assert "padding: 0.45rem;" in template.split(".queue-pill {", 1)[1].split("}", 1)[0]
     assert (
         "padding: 0.45rem;"
         in template.split(".queue-pill--bar {", 1)[1].split("}", 1)[0]
     )
-    assert "padding: 0.6rem;" in template.split(".sort-tab {", 1)[1].split("}", 1)[0]
-    assert "padding: 0.3rem;" in template.split(".age-tab {", 1)[1].split("}", 1)[0]
-    assert "padding: 0.3rem;" in template.split(".source-tab {", 1)[1].split("}", 1)[0]
+    assert "padding: 0.6rem;" in template.split(".tab-btn {", 1)[1].split("}", 1)[0]
+    assert (
+        "padding: 0.3rem;"
+        in template.split(".tab-btn--segmented {", 1)[1].split("}", 1)[0]
+    )
     # feedback button has filled, shadowed style
     assert "box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);" in template
     # click handler no longer passes null card
@@ -2639,56 +2651,30 @@ def test_bump_all_cached_versions(swr_handler):
     assert h._dashboard_versions[3] == 1
 
 
-def test_setSort_schedules_advancing_refresh_on_tab_click() -> None:
-    """Clicking a sort tab schedules an advancing deck refresh. Popular
-    is blocked when the source is non-HN."""
+def test_setFilter_preserves_sort_age_source_refresh_behavior() -> None:
+    """Tab changes share setFilter while preserving refresh and filter rules."""
     _, static = _read_template_and_static()
-    idx = static.index("function setSort(")
-    end = static.index("function setAge(", idx)
-    body = static[idx:end]
-    assert "scheduleDeckRefresh({ advance: true })" in body
-    assert "orderForCurrentSort()" in body
-    assert body.index("orderForCurrentSort()") < body.index(
-        "showNextCard({ allowRefresh: false })"
-    )
-    assert "'popular' && currentSource === 'non-hn'" in body
-    assert "refillQueued" not in body
-    assert "refillWhenReady" not in body
-
-
-def test_setAge_schedules_advancing_refresh_on_tab_click() -> None:
-    """Clicking an age tab schedules an advancing deck refresh."""
-    _, static = _read_template_and_static()
-    idx = static.index("function setAge(")
-    end = static.index("function setSource(", idx)
-    body = static[idx:end]
-    assert "scheduleDeckRefresh({ advance: true })" in body
-    assert "showNextCard({ allowRefresh: false })" in body
-    assert "if (currentSort === 'recommended' || currentSort === 'date')" in body
-    assert "matchesCurrentCombo(activeCard)" in body
-    assert "refillQueued" not in body
-    assert "refillWhenReady" not in body
-
-
-def test_setSource_schedules_advancing_refresh_on_tab_click() -> None:
-    """Clicking a source tab schedules an advancing deck refresh.
-    Popular tab is disabled on non-HN and the sort auto-switches."""
-    _, static = _read_template_and_static()
-    idx = static.index("function setSource(")
+    idx = static.index("function setFilter(")
     end = static.index("\n\n    applyGradient();", idx)
     body = static[idx:end]
     assert "scheduleDeckRefresh({ advance: true })" in body
+    assert "orderForCurrentSort()" in body
     assert "showNextCard({ allowRefresh: false })" in body
     assert "if (currentSort === 'recommended' || currentSort === 'date')" in body
-    assert "popularTab.disabled = (source === 'non-hn')" in body
-    assert "setSort('recommended')" in body
     assert "matchesCurrentCombo(activeCard)" in body
+    assert "filterName === 'sort' && value === 'popular'" in body
+    assert "currentSource === 'non-hn'" in body
+    assert "popularTab.disabled = (value === 'non-hn')" in body
+    assert "currentSort = 'recommended'" in body
+    assert "updateFilterTabs('sort', currentSort)" in body
+    assert "scheduleIdleAgePrefetch()" in body
+    assert "FILTERS" in static
     assert "refillQueued" not in body
     assert "refillWhenReady" not in body
 
 
 def test_archive_age_tab_button_exists():
-    """Archive age-tab button exists and idle prefetch pre-warms the other age."""
+    """Archive age button exists and idle prefetch pre-warms the other age."""
     template, static = _read_template_and_static()
     assert 'data-age="archive"' in template
     # Idle prefetch uses other-age logic.
@@ -2710,17 +2696,18 @@ def test_matchesCurrentAxes_filters_by_badge_only():
     assert "card.dataset.isRecent" not in body
 
 
-def test_orderForCurrentSort_uses_orderByRank_for_recommended():
-    """Recommended sort uses orderByRank (score desc); popular/explore shuffle."""
+def test_orderForCurrentSort_uses_shared_order_helper_for_deterministic_modes():
+    """Recommended/date use deterministic comparators; popular/explore shuffle."""
     _, static = _read_template_and_static()
     idx = static.index("function orderForCurrentSort(")
-    # orderForCurrentSort is now the last function in its block (no
-    # updateRefreshProgress follows). End at the blank line.
     end = static.index("\n\n    function setActiveCard(", idx)
     body = static[idx:end]
     assert "currentSort === 'recommended'" in body
-    assert "orderByRank" in body
-    assert "shuffleStories" in body
+    assert "currentSort === 'date'" in body
+    assert "orderCards((a, b) => parseFloat(b.dataset.score)" in body
+    assert "orderCards((a, b) => Number(b.dataset.time || 0)" in body
+    assert "shuffleCards()" in body
+    assert "Math.floor(Math.random() * (i + 1))" in static
 
 
 def test_data_is_recent_attribute_emitted(test_env):

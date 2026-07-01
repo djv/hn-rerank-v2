@@ -5,6 +5,20 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-07-01 — Refactor dashboard presentation layer
+
+Dashboard rendering now uses typed view models in `pipeline.py` and small Jinja
+component includes for story cards, badges, tab groups, the side rail, vote
+bar, and first-time tip. Badge and tab CSS were consolidated into shared
+component classes, TLDR detail box styling moved out of JS inline assignments,
+and the client-side tab/key/order helpers were simplified while preserving the
+existing UI behavior.
+
+**Files:** `pipeline.py`, `templates/index.html`, `templates/components/`,
+`tests/test_server.py`, `WORKLOG.md`.
+
+---
+
 ## 2026-07-01 — Fix card outer gutters
 
 Normal dashboard mode now lets Pico's main padding provide the top page gutter,

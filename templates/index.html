@@ -141,21 +141,24 @@
       border-color: rgba(0, 0, 0, 0.12);
     }
 
-    .sort-tabs {
+    .tab-bar {
+      display: flex;
+      gap: 0;
+      margin-bottom: 0.6rem;
+    }
+
+    .tab-bar--sort {
       display: grid;
       grid-template-columns: 1fr;
       gap: 0.35rem;
       margin-bottom: 0.3rem;
     }
 
-    .age-tabs {
-      display: grid;
-      grid-template-columns: 1fr;
-      gap: 0.35rem;
-      margin-bottom: 0.6rem;
+    .tab-bar--grid-4 {
+      grid-template-columns: repeat(4, 1fr);
     }
 
-    .sort-tab {
+    .tab-btn {
       width: 100%;
       margin: 0;
       padding: 0.6rem;
@@ -171,100 +174,42 @@
       transition: all 0.15s;
     }
 
-    .sort-tab:hover {
+    .tab-btn:hover {
       background: color-mix(in srgb, var(--pico-primary) 8%, var(--pico-card-background-color));
       border-color: var(--pico-primary);
       color: var(--pico-color);
     }
 
-    .sort-tab.active {
+    .tab-btn.active {
       background: var(--pico-primary);
       color: white;
       border-color: var(--pico-primary);
       font-weight: 600;
     }
 
-    .age-tabs {
-      display: flex;
-      gap: 0;
-      margin-bottom: 0.6rem;
-    }
-
-    .age-tab {
+    .tab-btn--segmented {
       flex: 1;
-      margin: 0;
       padding: 0.3rem;
       border-radius: 0;
       font-size: 0.75rem;
-      font-weight: 500;
-      line-height: 1.2;
-      text-align: center;
       white-space: nowrap;
-      background: var(--pico-card-background-color);
-      border: 1px solid var(--pico-muted-border-color);
       border-right: none;
-      color: var(--pico-muted-color);
-      cursor: pointer;
-      transition: all 0.15s;
     }
-    .age-tab:first-child {
+    .tab-btn--segmented:first-child {
       border-top-left-radius: 6px;
       border-bottom-left-radius: 6px;
     }
-    .age-tab:last-child {
+    .tab-btn--segmented:last-child {
       border-top-right-radius: 6px;
       border-bottom-right-radius: 6px;
       border-right: 1px solid var(--pico-muted-border-color);
     }
-    .age-tab:hover {
+    .tab-btn--segmented:hover {
       background: color-mix(in srgb, #6c757d 12%, var(--pico-card-background-color));
       border-color: #6c757d;
       color: var(--pico-color);
     }
-    .age-tab.active {
-      background: #6c757d;
-      color: white;
-      border-color: #6c757d;
-      font-weight: 600;
-    }
-
-    .source-tabs {
-      display: flex;
-      gap: 0;
-      margin-bottom: 0.6rem;
-    }
-    .source-tab {
-      flex: 1;
-      margin: 0;
-      padding: 0.3rem;
-      border-radius: 0;
-      font-size: 0.75rem;
-      font-weight: 500;
-      line-height: 1.2;
-      text-align: center;
-      white-space: nowrap;
-      background: var(--pico-card-background-color);
-      border: 1px solid var(--pico-muted-border-color);
-      border-right: none;
-      color: var(--pico-muted-color);
-      cursor: pointer;
-      transition: all 0.15s;
-    }
-    .source-tab:first-child {
-      border-top-left-radius: 6px;
-      border-bottom-left-radius: 6px;
-    }
-    .source-tab:last-child {
-      border-top-right-radius: 6px;
-      border-bottom-right-radius: 6px;
-      border-right: 1px solid var(--pico-muted-border-color);
-    }
-    .source-tab:hover {
-      background: color-mix(in srgb, #6c757d 12%, var(--pico-card-background-color));
-      border-color: #6c757d;
-      color: var(--pico-color);
-    }
-    .source-tab.active {
+    .tab-btn--segmented.active {
       background: #6c757d;
       color: white;
       border-color: #6c757d;
@@ -425,76 +370,49 @@
       color: #f8f9fa;
     }
 
-    .uncertain-badge {
+    .badge {
       display: inline-block;
       padding: 0.05rem 0.35rem;
       border-radius: 3px;
       font-weight: 600;
       font-size: 0.7rem;
-      background: hsl(280, 50%, 25%); /* Deep plum/purple for uncertainty */
+      line-height: 1.2;
+    }
+
+    .badge--uncertain {
+      background: hsl(280, 50%, 25%);
       color: hsl(280, 80%, 90%);
       border: 1px solid hsl(280, 50%, 35%);
-      line-height: 1.2;
     }
 
-    .novel-badge {
-      display: inline-block;
-      padding: 0.05rem 0.35rem;
-      border-radius: 3px;
-      font-weight: 600;
-      font-size: 0.7rem;
-      background: hsl(170, 50%, 25%); /* Deep teal for novelty */
+    .badge--novel {
+      background: hsl(170, 50%, 25%);
       color: hsl(170, 80%, 90%);
       border: 1px solid hsl(170, 50%, 35%);
-      line-height: 1.2;
     }
 
-    .discussion-rich-badge {
-      display: inline-block;
-      padding: 0.05rem 0.35rem;
-      border-radius: 3px;
-      font-weight: 600;
-      font-size: 0.7rem;
+    .badge--talk {
       background: hsl(35, 60%, 25%);
       color: hsl(35, 80%, 90%);
       border: 1px solid hsl(35, 60%, 35%);
-      line-height: 1.2;
     }
 
-    .high-engagement-badge {
-      display: inline-block;
-      padding: 0.05rem 0.35rem;
-      border-radius: 3px;
-      font-weight: 600;
-      font-size: 0.7rem;
+    .badge--top {
       background: hsl(45, 60%, 25%);
       color: hsl(45, 80%, 90%);
       border: 1px solid hsl(45, 60%, 35%);
-      line-height: 1.2;
     }
 
-    .hot-badge {
-      display: inline-block;
-      padding: 0.05rem 0.35rem;
-      border-radius: 3px;
-      font-weight: 600;
-      font-size: 0.7rem;
+    .badge--hot {
       background: hsl(15, 60%, 25%);
       color: hsl(15, 80%, 90%);
       border: 1px solid hsl(15, 60%, 35%);
-      line-height: 1.2;
     }
 
-    .similar-badge {
-      display: inline-block;
-      padding: 0.05rem 0.35rem;
-      border-radius: 3px;
-      font-weight: 600;
-      font-size: 0.7rem;
-      background: hsl(210, 50%, 25%); /* Steel/Slate Blue for similar stories */
+    .badge--similar {
+      background: hsl(210, 50%, 25%);
       color: hsl(210, 80%, 90%);
       border: 1px solid hsl(210, 50%, 35%);
-      line-height: 1.2;
     }
 
     .story-card.enriched {
@@ -526,6 +444,10 @@
 
     .tldr-detail-content {
       cursor: default;
+      margin-top: 0.4rem;
+      padding-top: 0.4rem;
+      border-top: 1px dashed var(--pico-muted-border-color);
+      font-size: 0.85rem;
       overflow-wrap: anywhere;
     }
 
@@ -869,23 +791,30 @@
         transform: translateY(0);
       }
 
-      .sort-tabs {
+      .tab-bar--sort {
         display: grid;
         grid-template-columns: repeat(4, 1fr);
         gap: 0.3rem;
         margin-bottom: 0;
       }
 
-      .age-tabs {
+      .tab-bar--segmented {
         display: grid;
-        grid-template-columns: repeat(2, 1fr);
         gap: 0.3rem;
         margin-bottom: 0;
       }
 
-      .source-tabs {
+      .tab-bar[data-filter="age"] {
+        grid-template-columns: repeat(2, 1fr);
+      }
+
+      .tab-bar[data-filter="source"] {
         grid-template-columns: repeat(3, 1fr);
-        margin-bottom: 0;
+      }
+
+      .tab-btn--segmented {
+        border-right: 1px solid var(--pico-muted-border-color);
+        border-radius: 6px;
       }
 
       .swipe-keys { display: none; }
@@ -936,131 +865,18 @@
            data-user-id="{{ user_id or 0 }}"
            data-dashboard-version="{{ dashboard_version }}"
            data-current-version="{{ dashboard_latest_version }}">
-      {% for item in stories %}
-      <article class="story-card{% if item.story.text_content | length >= 1000 %} enriched{% endif %}"
-               data-combo="{{ item.combo_keys }}"
-               data-story-id="{{ item.story.id }}"
-               data-score="{{ item.score }}"
-               data-time="{{ item.story.time }}"
-               data-source="{{ item.story.source }}"
-               data-is-hn="{{ '0' if item.is_non_hn else '1' }}"
-                data-sort-popular="{{ '1' if item.is_hot or item.is_high_engagement or item.is_discussion_rich else '0' }}"
-                data-sort-explore="{{ '1' if item.is_uncertain or item.is_similar or item.is_novel else '0' }}"
-                data-is-recent="{{ '1' if item.is_recent else '0' }}"
-               data-article-url="{{ item.story.url or '' }}"
-               data-comments-url="{{ item.story.discussion_url or '' }}">
-        <div class="story-header">
-          {% if item.is_uncertain %}
-          <span class="uncertain-badge" title="Model is highly uncertain about this story (high entropy distribution)">🤔 Unsure</span>
-          {% endif %}
-          {% if item.is_novel %}
-          <span class="novel-badge" title="Semantically distant from anything you've voted on">✨ Novel</span>
-          {% endif %}
-          {% if item.is_discussion_rich %}
-          <span class="discussion-rich-badge" title="High HN comment count for its age cohort">💬 Talk-worthy</span>
-          {% endif %}
-          {% if item.is_high_engagement %}
-          <span class="high-engagement-badge" title="High HN score for its age cohort">🏆 Top</span>
-          {% endif %}
-          {% if item.is_hot %}
-          <span class="hot-badge" title="Top {{ hot_badge_percentile }}% by engagement velocity (points/hour) and score ≥ 20">🔥 Hot</span>
-          {% endif %}
-          {% if item.is_similar %}
-          <span class="similar-badge" title="Most similar to your upvoted stories for its age cohort">🎯 Similar</span>
-          {% endif %}
-          
-          {% if item.story.source != "hn" %}
-          <span class="source-badge" title="{{ item.story.source }}">{{ item.story.source | source_label }}</span>
-          {% endif %}
-          
-          {% if item.story.score > 0 %}
-          <span>{{ item.story.score }} pts</span>
-          {% endif %}
-          
-          <span>{{ item.story.time | time_ago }}</span>
-          
-          {% if item.story.discussion_url %}
-          <a href="{{ item.story.discussion_url }}" target="_blank" rel="noopener">
-            💬{% if item.story.comment_count is not none %} {{ item.story.comment_count }}{% endif %} comments
-          </a>
-          {% endif %}
-
-        </div>
-
-        <h2 class="story-title">
-          <a href="{{ item.story.url or item.story.discussion_url }}" target="_blank" rel="noopener">
-            {{ item.story.title }}
-          </a>
-        </h2>
-
-        <div class="story-footer">
-          <button type="button" class="tldr-detail-btn" data-tldr-detail>TLDR</button>
-        </div>
-
-        {% if item.best_match_title %}
-        <p class="match-reason">Similar to: {{ item.best_match_title }}</p>
-        {% endif %}
-      </article>
+      {% for card in cards %}
+      {% include "components/story_card.html" %}
       {% endfor %}
       </div>
 
-      <aside class="swipe-side" aria-label="Queue and keyboard controls">
-        <div class="sort-tabs" aria-label="Sort order">
-          <button type="button" class="sort-tab active" data-sort="recommended"><u>R</u>ecommended</button>
-          <button type="button" class="sort-tab" data-sort="popular"><u>P</u>opular</button>
-          <button type="button" class="sort-tab" data-sort="explore">E<u>x</u>plore</button>
-          <button type="button" class="sort-tab" data-sort="date"><u>D</u>ate</button>
-        </div>
-        <div class="age-tabs" aria-label="Age filter">
-          <button type="button" class="age-tab active" data-age="recent">R<u>e</u>cent</button>
-          <button type="button" class="age-tab" data-age="archive"><u>A</u>rchive</button>
-        </div>
-        <div class="source-tabs" aria-label="Source filter">
-          <button type="button" class="source-tab active" data-source="mixed"><u>M</u>ixed</button>
-          <button type="button" class="source-tab" data-source="hn"><u>H</u>N</button>
-          <button type="button" class="source-tab" data-source="non-hn"><u>N</u>on-HN</button>
-        </div>
-        <div class="swipe-keys">
-          <span class="key-row" tabindex="0" data-key-action="up"><span class="key-hint">k</span> upvote</span>
-          <span class="key-row" tabindex="0" data-key-action="neutral"><span class="key-hint">l</span> skip (neutral)</span>
-          <span class="key-row" tabindex="0" data-key-action="down"><span class="key-hint">j</span> downvote</span>
-          <span class="key-row" tabindex="0" data-key-action="open-article"><span class="key-hint">o</span> open article</span>
-          <span class="key-row" tabindex="0" data-key-action="open-comments"><span class="key-hint">c</span> open comments</span>
-        </div>
-      </aside>
+      {% include "components/side_rail.html" %}
     </div>
 
   </main>
 
-  <div class="vote-bar" hidden>
-    <button class="filter-toggle-btn" title="Filters" aria-label="Toggle filters">☰</button>
-    <div class="vote-counts" aria-label="Your all-time vote counts">
-      <span class="vote-count vote-count--up">
-        <span class="vote-count-glyph" aria-hidden="true">▲</span>
-        <span class="vote-count-num" data-vote-count="up">{{ vote_count_up or 0 }}</span>
-      </span>
-      <span class="vote-count vote-count--neutral">
-        <span class="vote-count-glyph" aria-hidden="true">●</span>
-        <span class="vote-count-num" data-vote-count="neutral">{{ vote_count_neutral or 0 }}</span>
-      </span>
-      <span class="vote-count vote-count--down">
-        <span class="vote-count-glyph" aria-hidden="true">▼</span>
-        <span class="vote-count-num" data-vote-count="down">{{ vote_count_down or 0 }}</span>
-      </span>
-    </div>
-    <div class="feedback-group">
-      <button class="feedback-btn" data-fb="up" title="Upvote">▲</button>
-      <button class="feedback-btn" data-fb="neutral" title="Skip (neutral)">✓</button>
-      <button class="feedback-btn" data-fb="down" title="Downvote">▼</button>
-    </div>
-  </div>
-
-    <div id="first-time-tip" class="first-time-tip-overlay" hidden aria-label="Keyboard shortcuts">
-      <div class="first-time-tip-inner">
-        <p><strong>Tip:</strong> arrows scroll inside the card. Press <kbd>k</kbd> to upvote, <kbd>j</kbd> to downvote, <kbd>l</kbd> to skip (neutral), <kbd>u</kbd> to undo. Press <kbd>o</kbd> to open the article, <kbd>c</kbd> to open the comments.</p>
-        <button type="button" class="first-time-tip-dismiss" data-dismiss-tip>Got it</button>
-      </div>
-    </div>
+  {% include "components/vote_bar.html" %}
+  {% include "components/first_time_tip.html" %}
 
   <script>
     const presentStoryIds = new Set();
@@ -1138,19 +954,13 @@
       });
     }
 
-    function orderByRank() {
+    function orderCards(comparator) {
       const cards = Array.from(document.querySelectorAll('.story-card'));
-      cards.sort((a, b) => parseFloat(b.dataset.score) - parseFloat(a.dataset.score));
+      cards.sort(comparator);
       cards.forEach(card => storiesContainer.appendChild(card));
     }
 
-    function orderByDate() {
-      const cards = Array.from(document.querySelectorAll('.story-card'));
-      cards.sort((a, b) => Number(b.dataset.time || 0) - Number(a.dataset.time || 0));
-      cards.forEach(card => storiesContainer.appendChild(card));
-    }
-
-    function shuffleStories() {
+    function shuffleCards() {
       const cards = Array.from(document.querySelectorAll('.story-card'));
       for (let i = cards.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
@@ -1160,9 +970,13 @@
     }
 
     function orderForCurrentSort() {
-      if (currentSort === 'date') orderByDate();
-      else if (currentSort === 'recommended') orderByRank();
-      else shuffleStories();
+      if (currentSort === 'date') {
+        orderCards((a, b) => Number(b.dataset.time || 0) - Number(a.dataset.time || 0));
+      } else if (currentSort === 'recommended') {
+        orderCards((a, b) => parseFloat(b.dataset.score) - parseFloat(a.dataset.score));
+      } else {
+        shuffleCards();
+      }
     }
 
     function setActiveCard(card) {
@@ -1198,58 +1012,71 @@
       }
     }
 
-    function setSort(sort) {
-      if (sort === 'popular' && currentSource === 'non-hn') return;
+    const FILTERS = {
+      sort: { tabs: sortTabs, attr: 'data-sort' },
+      age: { tabs: ageTabs, attr: 'data-age' },
+      source: { tabs: sourceTabs, attr: 'data-source' },
+    };
+
+    function updateFilterTabs(filterName, value) {
+      const filter = FILTERS[filterName];
+      filter.tabs.forEach(tab => {
+        tab.classList.toggle('active', tab.getAttribute(filter.attr) === value);
+      });
+    }
+
+    function setFilter(filterName, value) {
+      if (filterName === 'sort' && value === 'popular' && currentSource === 'non-hn') {
+        return;
+      }
       sidePanel.classList.remove('visible');
-      currentSort = sort;
-      sortTabs.forEach(tab => {
-        tab.classList.toggle('active', tab.dataset.sort === currentSort);
-      });
-      sourceTabs.forEach(tab => {
-        tab.disabled = (sort === 'popular' && tab.dataset.source !== 'hn');
-      });
-      if (sort === 'popular' && currentSource !== 'hn') {
-        currentSource = 'hn';
+
+      if (filterName === 'sort') {
+        currentSort = value;
+        updateFilterTabs('sort', currentSort);
         sourceTabs.forEach(tab => {
-          tab.classList.toggle('active', tab.dataset.source === 'hn');
+          tab.disabled = (value === 'popular' && tab.dataset.source !== 'hn');
         });
-      }
-      if (activeCard && !matchesCurrentAxes(activeCard)) {
-        activeCard.classList.remove('active');
-      }
-      orderForCurrentSort();
-      showNextCard({ allowRefresh: false });
-      scheduleDeckRefresh({ advance: true });
-      scheduleIdleAgePrefetch();
-    }
-
-    function setAge(age) {
-      sidePanel.classList.remove('visible');
-      currentAge = age;
-      ageTabs.forEach(tab => {
-        tab.classList.toggle('active', tab.dataset.age === currentAge);
-      });
-      if (activeCard && (!matchesCurrentCombo(activeCard) || !matchesCurrentAxes(activeCard))) {
-        activeCard.classList.remove('active');
-      }
-      if (currentSort === 'recommended' || currentSort === 'date') {
+        if (value === 'popular' && currentSource !== 'hn') {
+          currentSource = 'hn';
+          updateFilterTabs('source', currentSource);
+        }
+        if (activeCard && !matchesCurrentAxes(activeCard)) {
+          activeCard.classList.remove('active');
+        }
         orderForCurrentSort();
+        showNextCard({ allowRefresh: false });
+        scheduleDeckRefresh({ advance: true });
+        scheduleIdleAgePrefetch();
+        return;
       }
-      showNextCard({ allowRefresh: false });
-      scheduleDeckRefresh({ advance: true });
-      scheduleIdleAgePrefetch();
-    }
 
-    function setSource(source) {
-      sidePanel.classList.remove('visible');
-      currentSource = source;
-      sourceTabs.forEach(tab => {
-        tab.classList.toggle('active', tab.dataset.source === currentSource);
-      });
+      if (filterName === 'age') {
+        currentAge = value;
+        updateFilterTabs('age', currentAge);
+        if (activeCard && (!matchesCurrentCombo(activeCard) || !matchesCurrentAxes(activeCard))) {
+          activeCard.classList.remove('active');
+        }
+        if (currentSort === 'recommended' || currentSort === 'date') {
+          orderForCurrentSort();
+        }
+        showNextCard({ allowRefresh: false });
+        scheduleDeckRefresh({ advance: true });
+        scheduleIdleAgePrefetch();
+        return;
+      }
+
+      if (filterName !== 'source') {
+        return;
+      }
+
+      currentSource = value;
+      updateFilterTabs('source', currentSource);
       const popularTab = sortTabs.find(t => t.dataset.sort === 'popular');
-      if (popularTab) popularTab.disabled = (source === 'non-hn');
-      if (currentSort === 'popular' && source === 'non-hn') {
-        setSort('recommended');
+      if (popularTab) popularTab.disabled = (value === 'non-hn');
+      if (currentSort === 'popular' && value === 'non-hn') {
+        currentSort = 'recommended';
+        updateFilterTabs('sort', currentSort);
       }
       if (activeCard && (!matchesCurrentCombo(activeCard) || !matchesCurrentAxes(activeCard))) {
         activeCard.classList.remove('active');
@@ -1506,13 +1333,13 @@
     }
 
     sortTabs.forEach(tab => {
-      tab.addEventListener('click', () => setSort(tab.dataset.sort));
+      tab.addEventListener('click', () => setFilter('sort', tab.dataset.sort));
     });
     ageTabs.forEach(tab => {
-      tab.addEventListener('click', () => setAge(tab.dataset.age));
+      tab.addEventListener('click', () => setFilter('age', tab.dataset.age));
     });
     sourceTabs.forEach(tab => {
-      tab.addEventListener('click', () => setSource(tab.dataset.source));
+      tab.addEventListener('click', () => setFilter('source', tab.dataset.source));
     });
 
     filterToggleBtn.addEventListener('click', () => {
@@ -1589,7 +1416,6 @@
       }
 
       applyGradient();
-      bindEvents();
       // The server returns cards in recommended order. Re-apply the active
       // sort for the deterministic modes (recommended/date). Skip popular/
       // explore (shuffle) to avoid reshuffling on every vote.
@@ -1603,35 +1429,31 @@
       }
     }
 
-    // Function to bind click event listeners to current cards
-    function bindEvents() {
-      // 1. Feedback buttons
-      document.querySelectorAll('[data-fb]').forEach(btn => {
-        btn.onclick = () => {
-          submitVote(btn.dataset.fb);
-        };
+    document.querySelectorAll('[data-fb]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        submitVote(btn.dataset.fb);
       });
+    });
 
-      // 2. TLDR detail buttons and empty card space
-      document.querySelectorAll('.story-card').forEach(card => {
-        card.onclick = async (e) => {
-          if (
-            e.target.closest('a, button, input, textarea, select, summary, [role="button"], .tldr-detail-content') ||
-            window.getSelection()?.toString()
-          ) {
-            return;
-          }
-          await openTldrDetail(card);
-        };
-      });
-
-      document.querySelectorAll('[data-tldr-detail]').forEach(btn => {
-        btn.onclick = async (e) => {
-          e.stopPropagation();
-          await openTldrDetail(btn.closest('.story-card'));
-        };
-      });
-    }
+    storiesContainer.addEventListener('click', async (e) => {
+      const tldrButton = e.target.closest('[data-tldr-detail]');
+      if (tldrButton) {
+        e.stopPropagation();
+        await openTldrDetail(tldrButton.closest('.story-card'));
+        return;
+      }
+      const card = e.target.closest('.story-card');
+      if (!card) {
+        return;
+      }
+      if (
+        e.target.closest('a, button, input, textarea, select, summary, [role="button"], .tldr-detail-content') ||
+        window.getSelection()?.toString()
+      ) {
+        return;
+      }
+      await openTldrDetail(card);
+    });
 
     function prefetchUpcomingTldrs() {
       queuedCards().slice(0, PREFETCH_COUNT).forEach(card => {
@@ -1812,7 +1634,6 @@
       if (!card.isConnected) {
         storiesContainer.insertBefore(card, storiesContainer.firstChild);
       }
-      bindEvents();
       setActiveCard(card);
 
       enqueueFeedback(storyId, 'clear').then(data => {
@@ -1857,10 +1678,6 @@
       if (!contentDiv) {
         contentDiv = document.createElement('div');
         contentDiv.className = 'tldr-detail-content';
-        contentDiv.style.marginTop = '0.4rem';
-        contentDiv.style.fontSize = '0.85rem';
-        contentDiv.style.borderTop = '1px dashed var(--pico-muted-border-color)';
-        contentDiv.style.paddingTop = '0.4rem';
         contentDiv.style.display = 'none';
         card.appendChild(contentDiv);
       }
@@ -1915,6 +1732,39 @@
       }
     }
 
+    function scrollActiveCard(direction) {
+      const card = document.querySelector('.story-card.active');
+      if (!card) {
+        return;
+      }
+      card.scrollBy({ top: card.clientHeight * 0.8 * direction });
+    }
+
+    const KEY_ACTIONS = {
+      arrowup: () => scrollActiveCard(-1),
+      arrowdown: () => scrollActiveCard(1),
+      k: () => submitVote('up'),
+      j: () => submitVote('down'),
+      l: () => submitVote('neutral'),
+      o: () => openStoryUrl('article'),
+      c: () => openStoryUrl('comments'),
+      u: () => undoLastVote(),
+      r: () => setFilter('sort', 'recommended'),
+      p: () => setFilter('sort', 'popular'),
+      x: () => setFilter('sort', 'explore'),
+      d: () => setFilter('sort', 'date'),
+      e: () => setFilter('age', 'recent'),
+      a: () => setFilter('age', 'archive'),
+      m: () => setFilter('source', 'mixed'),
+      h: () => setFilter('source', 'hn'),
+      n: () => setFilter('source', 'non-hn'),
+      f: () => {
+        const panel = document.querySelector('.swipe-side');
+        panel.classList.toggle('visible');
+        document.body.classList.toggle('fullscreen');
+      },
+    };
+
     document.addEventListener('keydown', (e) => {
       if (
         e.repeat ||
@@ -1924,44 +1774,10 @@
         return;
       }
       const key = e.key.toLowerCase();
-      if (key === 'arrowup' || key === 'arrowdown') {
+      const action = KEY_ACTIONS[key];
+      if (action) {
         e.preventDefault();
-        const card = document.querySelector('.story-card.active');
-        if (card) {
-          const scrollAmount = card.clientHeight * 0.8;
-          card.scrollBy({ top: key === 'arrowdown' ? scrollAmount : -scrollAmount });
-        }
-      } else if (key === 'k') {
-        e.preventDefault();
-        submitVote('up');
-      } else if (key === 'j') {
-        e.preventDefault();
-        submitVote('down');
-      } else if (key === 'l') {
-        e.preventDefault();
-        submitVote('neutral');
-      } else if (key === 'o') {
-        e.preventDefault();
-        openStoryUrl('article');
-      } else if (key === 'c') {
-        e.preventDefault();
-        openStoryUrl('comments');
-      } else if (key === 'u') {
-        e.preventDefault();
-        undoLastVote();
-      } else if (key === 'r') { e.preventDefault(); setSort('recommended');
-      } else if (key === 'p') { e.preventDefault(); setSort('popular');
-      } else if (key === 'x') { e.preventDefault(); setSort('explore');
-      } else if (key === 'd') { e.preventDefault(); setSort('date');
-      } else if (key === 'e') { e.preventDefault(); setAge('recent');
-      } else if (key === 'a') { e.preventDefault(); setAge('archive');
-      } else if (key === 'm') { e.preventDefault(); setSource('mixed');
-      } else if (key === 'h') { e.preventDefault(); setSource('hn');
-      } else if (key === 'n') { e.preventDefault(); setSource('non-hn');
-      } else if (key === 'f') { e.preventDefault();
-        const panel = document.querySelector('.swipe-side');
-        panel.classList.toggle('visible');
-        document.body.classList.toggle('fullscreen');
+        action();
       }
     });
 
@@ -1982,11 +1798,9 @@
       }
     })();
 
-    // Run initial event binding
     seedVotedStoryIdsFromStorage();
-    bindEvents();
-    setSort('recommended');
-    setAge('recent');
+    setFilter('sort', 'recommended');
+    setFilter('age', 'recent');
 
     // If the page was served from a stale cache, schedule a warm-polled
     // refill so voted stories and outdated rankings are replaced as soon
