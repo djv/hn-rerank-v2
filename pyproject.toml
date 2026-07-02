@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Minimalist HN reranking dashboard"
 requires-python = ">=3.12"
 dependencies = [
+    "flask>=3.1",
     "httpx>=0.28",
     "beautifulsoup4>=4.14",
     "trafilatura>=1.6",

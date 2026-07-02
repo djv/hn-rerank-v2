@@ -5,6 +5,68 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-07-02 — Flask bridge cleanup
+
+**Change.** Removed the inactive `BaseHTTPRequestHandler`-style compatibility
+surface left behind by the first Flask migration.
+
+- `server.py` no longer carries legacy `do_GET`, `do_POST`, `do_OPTIONS`,
+  `send_response`, `send_header`, `end_headers`, `wfile`, or `rfile`
+  plumbing.
+- Flask remains the only active HTTP layer. A small request context now bridges
+  Flask headers/body/response construction into the remaining feedback,
+  ranking-ready, and TLDR handlers.
+- `create_app()` dispatches through the supplied runtime subclass instance, so
+  test runtimes and future subclasses no longer route via hard-coded
+  `Handler._handle_*` calls.
+- Flask `app.test_client()` coverage now includes ranking-ready validation,
+  feedback cross-site/no-session behavior, and missing-story TLDR response
+  shape.
+
+**Semantics preserved.** Dashboard rendering, warm-cache versioning, feedback
+invalidation, TLDR enrichment/cache/quota behavior, CORS/options, and the
+background regen thread are unchanged.
+
+**Verification.**
+- `uv run pytest tests/test_server.py -q` = 114 passed.
+- `uv run pytest tests/ -n 4` = 468 passed, 1 skipped.
+- `uv run ruff check .` = clean.
+- `uv run ty check` = clean.
+- `git diff --check` = clean.
+- Restarted `hn_rewrite.service`; live smoke returned expected 401 JSON from
+  `/api/user`, expected 204 CORS response from `OPTIONS /api/feedback`, and no
+  new request-path errors in the restart-window logs.
+
+---
+
+## 2026-07-02 — Flask HTTP shell with preserved runtime state
+
+**Change.** Replaced the direct `BaseHTTPRequestHandler`/`ThreadingHTTPServer`
+HTTP shell with Flask routing while keeping the existing sync/threaded runtime
+state intact.
+
+- `server.py` now exposes `create_app()` and routes dashboard, profile-link,
+  user, ranking-ready, feedback, TLDR-detail, and CORS/options requests through
+  Flask responses.
+- The existing `Handler` class remains the transitional runtime owner for the
+  dashboard cache, version counters, render locks, warm timers, public-demo
+  limiter, DB, embedder, and regen event.
+- Tests now start the Flask app through Werkzeug's test server for HTTP parity
+  and include small `app.test_client()` smoke coverage for session, CORS, and
+  first-visit cookie behavior.
+
+**Semantics preserved.** Warm-cache/version behavior, `_trigger_warm()`,
+`/api/ranking-ready` cache-backed readiness, feedback invalidation, TLDR
+enrichment/cache/quota behavior, and the background regen thread are unchanged.
+
+**Verification.**
+- `uv run pytest tests/test_server.py -q` = 109 passed.
+- `uv run pytest tests/ -n 4` = 463 passed, 1 skipped.
+- `uv run ruff check .` = clean.
+- `uv run ty check` = clean.
+
+---
+
 ## 2026-07-02 — Cookie-first sessions with import-only profile links
 
 **Change.** Removed the normal first-visit token redirect chain while keeping

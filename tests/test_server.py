@@ -1,4 +1,3 @@
-import socket
 import threading
 import time
 from dataclasses import replace
@@ -6,12 +5,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import httpx
 import pytest
-from http.server import ThreadingHTTPServer
 from hypothesis import HealthCheck, given, settings, strategies as st
+from werkzeug.serving import make_server
 
 from typing import Any, cast
 
-from server import Handler, SKELETON_HTML
+from server import Handler, SKELETON_HTML, create_app
 from pipeline import Config, Embedder, RankedStory
 from database import Database, Story
 
@@ -142,8 +141,8 @@ def test_warm_timer_collects_after_failed_warm(
 
 def _start_handler_server(
     db: Database, embedder: MockEmbedder, port: int = 0
-) -> tuple[ThreadingHTTPServer, int, type[Handler]]:
-    """Spin up a ThreadingHTTPServer on 127.0.0.1:<port>.
+) -> tuple[Any, int, type[Handler]]:
+    """Spin up a Flask server on 127.0.0.1:<port>.
 
     Returns (server, port, TestHandler). The TestHandler is dynamically
     created with a fresh cache state and bound to (db, embedder, regen_event).
@@ -165,14 +164,14 @@ def _start_handler_server(
     _reset_warm_state(TestHandler)
     TestHandler.reset_public_demo_limiter()
 
-    server = ThreadingHTTPServer(("127.0.0.1", port), TestHandler)
-    bound_port = server.server_address[1]
+    app = create_app(TestHandler)
+    server = make_server("127.0.0.1", port, app, threaded=True)
+    bound_port = server.server_port
     return server, bound_port, TestHandler
 
 
-def _drain_and_shutdown(server: ThreadingHTTPServer, handler: type[Handler]) -> None:
+def _drain_and_shutdown(server: Any, handler: type[Handler]) -> None:
     _drain_warms(handler)
-    server.socket.shutdown(socket.SHUT_RDWR)
     server.shutdown()
 
 
@@ -1597,6 +1596,102 @@ def test_cors_headers(app_env):
     assert resp.status_code == 204
     assert resp.headers.get("access-control-allow-origin") == "*"
     assert "POST" in resp.headers.get("access-control-allow-methods", "")
+
+
+def test_flask_test_client_user_requires_session(app_env) -> None:
+    _, _, _, handler, _ = app_env
+    client = create_app(handler).test_client()
+
+    resp = client.get("/api/user")
+
+    assert resp.status_code == 401
+    assert resp.get_json() == {"error": "No session"}
+
+
+def test_flask_test_client_options_preserves_cors(app_env) -> None:
+    _, _, _, handler, _ = app_env
+    client = create_app(handler).test_client()
+
+    resp = client.options("/api/feedback")
+
+    assert resp.status_code == 204
+    assert resp.headers.get("access-control-allow-origin") == "*"
+    assert "POST" in resp.headers.get("access-control-allow-methods", "")
+
+
+def test_flask_test_client_first_visit_sets_cookie(app_env) -> None:
+    _, db, _, handler, _ = app_env
+    client = create_app(handler).test_client()
+    with db.conn() as conn:
+        before = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+    resp = client.get("/")
+
+    assert resp.status_code == 200
+    assert resp.headers.get("Set-Cookie", "").startswith("hn_token=")
+    assert resp.data
+    with db.conn() as conn:
+        after = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    assert after == before + 1
+
+
+def test_flask_test_client_ranking_ready_requires_session(app_env: Any) -> None:
+    _, _, _, handler, _ = app_env
+    client = create_app(handler).test_client()
+
+    resp = client.get("/api/ranking-ready?version=0")
+
+    assert resp.status_code == 401
+    assert resp.get_json() == {"error": "No session"}
+
+
+def test_flask_test_client_ranking_ready_validates_version(app_env: Any) -> None:
+    _, _, _, handler, user = app_env
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+
+    resp = client.get("/api/ranking-ready?version=-1")
+
+    assert resp.status_code == 400
+    assert resp.get_json() == {"error": "Invalid version"}
+
+
+def test_flask_test_client_feedback_rejects_cross_site(app_env: Any) -> None:
+    _, _, _, handler, _ = app_env
+    client = create_app(handler).test_client()
+
+    resp = client.post(
+        "/api/feedback",
+        json={"story_id": 1, "action": "up"},
+        headers={"Origin": "https://evil.example", "Host": "localhost"},
+    )
+
+    assert resp.status_code == 403
+    assert resp.get_json() == {"error": "Cross-site POSTs are not allowed"}
+
+
+def test_flask_test_client_feedback_requires_session(app_env: Any) -> None:
+    _, _, _, handler, _ = app_env
+    client = create_app(handler).test_client()
+
+    resp = client.post(
+        "/api/feedback",
+        json={"story_id": 1, "action": "up"},
+        headers={"Origin": "http://localhost"},
+    )
+
+    assert resp.status_code == 401
+    assert resp.get_json() == {"error": "No session"}
+
+
+def test_flask_test_client_tldr_missing_story(app_env: Any) -> None:
+    _, _, _, handler, _ = app_env
+    client = create_app(handler).test_client()
+
+    resp = client.post("/api/tldr-detail", json={"story_id": 999999})
+
+    assert resp.status_code == 404
+    assert resp.get_json() == {"error": "Story not found in database"}
 
 
 def test_normalize_tldr_markdown_repairs_inline_bullets():

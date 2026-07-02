@@ -14,19 +14,19 @@ import secrets
 import sys
 import threading
 import time
-
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 import feedparser
 import justext
 import trafilatura
 from bs4 import BeautifulSoup
+from flask import Flask, Response, jsonify, redirect, request
 import httpx
 
 from database import Database, Story, User
@@ -787,12 +787,14 @@ SKELETON_HTML = b"""<!DOCTYPE html>
 <body><p>Loading your personalized dashboard...</p></body></html>"""
 
 
-class Handler(BaseHTTPRequestHandler):
-    server_version = "HNRewrite/1.0"
+class Handler:
     config: Config
     db: Database
     embedder: Embedder
     regen_event: threading.Event
+    headers: Mapping[str, str]
+    path: str
+    client_address: tuple[str, int]
     _dashboard_cache: dict[str, tuple[bytes, float, int]] = {}
     _dashboard_versions: dict[int, int] = {}
     _dashboard_versions_guard = threading.Lock()
@@ -808,6 +810,17 @@ class Handler(BaseHTTPRequestHandler):
     _warmup_in_flight_guard = threading.Lock()
     _WARM_DEBOUNCE_S: float = 1.0
     _public_demo_limiter = FixedWindowLimiter()
+
+    def _request_body(self) -> bytes:
+        raise NotImplementedError
+
+    def _json_response(
+        self, data: dict, status: int = 200, headers: dict[str, str] | None = None
+    ) -> None:
+        raise NotImplementedError
+
+    def _error_response(self, code: int, message: str | None = None) -> None:
+        raise NotImplementedError
 
     @classmethod
     def reset_public_demo_limiter(cls) -> None:
@@ -939,96 +952,6 @@ class Handler(BaseHTTPRequestHandler):
                 ),
             )
         )
-
-    def _send_dashboard_response(
-        self, user: User, *, set_session_cookie: bool = False
-    ) -> None:
-        html = self._render_dashboard(user)
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(html)))
-        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
-        self.send_header("Pragma", "no-cache")
-        self.send_header("Expires", "0")
-        if set_session_cookie:
-            self.send_header(
-                "Set-Cookie",
-                f"hn_token={user.token}; Path=/; Max-Age=31536000; SameSite=Lax; HttpOnly",
-            )
-        self.end_headers()
-        self.wfile.write(html)
-
-    def do_GET(self) -> None:
-        path = self.path.split("?")[0]
-
-        # Existing profile import link for opening the same profile on another
-        # device. Unknown tokens are not a user-creation path.
-        if path.startswith("/u/"):
-            token = path[3:].strip("/")
-            if not token:
-                self.send_error(HTTPStatus.BAD_REQUEST)
-                return
-
-            quota = self._acquire_profile_link_quota()
-            if not quota.allowed:
-                self._rate_limit_response(
-                    "Too many profile-link attempts. Please try again later.",
-                    quota.retry_after_seconds,
-                )
-                return
-
-            user = self.db.get_user_by_token(token)
-            if not user:
-                self.send_error(HTTPStatus.NOT_FOUND)
-                return
-
-            self.send_response(302)
-            self.send_header("Location", "../")
-            self.send_header(
-                "Set-Cookie",
-                f"hn_token={user.token}; Path=/; Max-Age=31536000; SameSite=Lax; HttpOnly",
-            )
-            self.end_headers()
-            return
-
-        # User info API
-        if path == "/api/user":
-            user = self._get_user()
-            if user:
-                self._json_response({"user_id": user.id, "token": user.token})
-            else:
-                self._json_response({"error": "No session"}, status=401)
-            return
-
-        if path == "/api/ranking-ready":
-            self._handle_ranking_ready()
-            return
-
-        # Dashboard — dynamic render per-user
-        if path in ("/", "/index.html"):
-            user = self._get_user()
-            if not user:
-                quota = self._acquire_session_create_quota()
-                if not quota.allowed:
-                    self._rate_limit_response(
-                        "Too many new demo sessions from this address. Please try again later.",
-                        quota.retry_after_seconds,
-                    )
-                    return
-
-                token = secrets.token_hex(16)
-                user = self.db.create_user(token)
-                self._send_dashboard_response(user, set_session_cookie=True)
-                return
-
-            self._send_dashboard_response(user)
-            return
-
-        self.send_error(HTTPStatus.NOT_FOUND)
-
-    def _render_dashboard(self, user: User) -> bytes:
-        """Render personalized dashboard for user. Uses short-lived cache."""
-        return self.__class__._render_dashboard_for_user(user)
 
     @classmethod
     def _render_dashboard_for_user(
@@ -1407,16 +1330,6 @@ class Handler(BaseHTTPRequestHandler):
         if per_combo > 0 and final:
             asyncio.run(_prefetch_tldrs_for_ranked(final, db, per_combo))
 
-    def do_POST(self) -> None:
-        if self._reject_cross_site_post():
-            return
-        if self.path == "/api/feedback":
-            self._handle_feedback()
-        elif self.path == "/api/tldr-detail":
-            self._handle_tldr_detail()
-        else:
-            self.send_error(HTTPStatus.NOT_FOUND)
-
     def _handle_feedback(self) -> None:
         user = self._get_user()
         if not user:
@@ -1424,11 +1337,10 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            content_length = int(self.headers.get("Content-Length", 0))
-            if content_length > MAX_CONTENT_LENGTH:
-                self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+            body = self._request_body()
+            if len(body) > MAX_CONTENT_LENGTH:
+                self._error_response(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
                 return
-            body = self.rfile.read(content_length)
             data = json.loads(body)
 
             story_id = data.get("story_id")
@@ -1552,11 +1464,10 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_tldr_detail(self) -> None:
         try:
             user = self._get_user()
-            content_length = int(self.headers.get("Content-Length", 0))
-            if content_length > MAX_CONTENT_LENGTH:
-                self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+            body = self._request_body()
+            if len(body) > MAX_CONTENT_LENGTH:
+                self._error_response(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
                 return
-            body = self.rfile.read(content_length)
             data = json.loads(body)
 
             story_id = data["story_id"]
@@ -1830,28 +1741,169 @@ class Handler(BaseHTTPRequestHandler):
             logging.error("Error handling tldr-detail: %r", e)
             self._json_response({"error": "Internal error"}, status=400)
 
-    def do_OPTIONS(self) -> None:
-        self.send_response(HTTPStatus.NO_CONTENT)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.end_headers()
+
+class FlaskRequestContext:
+    """Run existing Handler request logic against Flask request data."""
+
+    def __init__(self) -> None:
+        self._flask_response: Response | None = None
+        self.headers = request.headers
+        self.path = request.full_path.rstrip("?")
+        self._body = request.get_data(cache=True)
+        self.client_address = (request.remote_addr or "127.0.0.1", 0)
+
+    def _request_body(self) -> bytes:
+        return self._body
 
     def _json_response(
         self, data: dict, status: int = 200, headers: dict[str, str] | None = None
     ) -> None:
-        body = json.dumps(data).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        response = jsonify(data)
+        response.status_code = int(status)
+        response.headers["Access-Control-Allow-Origin"] = "*"
         for name, value in (headers or {}).items():
-            self.send_header(name, value)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+            response.headers[name] = value
+        self._flask_response = response
 
-    def log_message(self, format, *args) -> None:
-        logging.info("%s - - %s" % (self.address_string(), format % args))
+    def _error_response(self, code: int, message: str | None = None) -> None:
+        self._flask_response = Response(
+            message or HTTPStatus(code).phrase,
+            status=code,
+            content_type="text/plain; charset=utf-8",
+        )
+
+    def response(self) -> Response:
+        if self._flask_response is None:
+            raise RuntimeError("Handler did not produce a Flask response")
+        return self._flask_response
+
+
+def _no_cache_dashboard_response(
+    html: bytes, *, user: User | None = None, set_session_cookie: bool = False
+) -> Response:
+    response = Response(html, status=HTTPStatus.OK, content_type="text/html; charset=utf-8")
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    if set_session_cookie and user is not None:
+        response.set_cookie(
+            "hn_token",
+            user.token,
+            max_age=31536000,
+            path="/",
+            samesite="Lax",
+            httponly=True,
+        )
+    return response
+
+
+def create_app(runtime: type[Handler] = Handler) -> Flask:
+    app = Flask(__name__)
+    request_adapter_type = type(
+        "FlaskRuntimeRequest",
+        (FlaskRequestContext, runtime),
+        {},
+    )
+
+    def adapter() -> Any:
+        return request_adapter_type()
+
+    @app.get("/u/<path:token>")
+    def profile_link(token: str) -> Any:
+        token = token.strip("/")
+        if not token:
+            return Response(status=HTTPStatus.BAD_REQUEST)
+
+        req = adapter()
+        quota = req._acquire_profile_link_quota()
+        if not quota.allowed:
+            req._rate_limit_response(
+                "Too many profile-link attempts. Please try again later.",
+                quota.retry_after_seconds,
+            )
+            return req.response()
+
+        user = runtime.db.get_user_by_token(token)
+        if not user:
+            return Response(status=HTTPStatus.NOT_FOUND)
+
+        response = redirect("../", code=302)
+        response.set_cookie(
+            "hn_token",
+            user.token,
+            max_age=31536000,
+            path="/",
+            samesite="Lax",
+            httponly=True,
+        )
+        return response
+
+    @app.get("/api/user")
+    def api_user() -> Any:
+        req = adapter()
+        user = req._get_user()
+        if user:
+            req._json_response({"user_id": user.id, "token": user.token})
+        else:
+            req._json_response({"error": "No session"}, status=401)
+        return req.response()
+
+    @app.get("/api/ranking-ready")
+    def ranking_ready() -> Any:
+        req = adapter()
+        req._handle_ranking_ready()
+        return req.response()
+
+    @app.get("/")
+    @app.get("/index.html")
+    def dashboard() -> Any:
+        req = adapter()
+        user = req._get_user()
+        if not user:
+            quota = req._acquire_session_create_quota()
+            if not quota.allowed:
+                req._rate_limit_response(
+                    "Too many new demo sessions from this address. Please try again later.",
+                    quota.retry_after_seconds,
+                )
+                return req.response()
+
+            token = secrets.token_hex(16)
+            user = runtime.db.create_user(token)
+            html = runtime._render_dashboard_for_user(user)
+            return _no_cache_dashboard_response(
+                html, user=user, set_session_cookie=True
+            )
+
+        html = runtime._render_dashboard_for_user(user)
+        return _no_cache_dashboard_response(html)
+
+    @app.route("/api/feedback", methods=["POST"], provide_automatic_options=False)
+    def feedback() -> Any:
+        req = adapter()
+        if req._reject_cross_site_post():
+            return req.response()
+        req._handle_feedback()
+        return req.response()
+
+    @app.route("/api/tldr-detail", methods=["POST"], provide_automatic_options=False)
+    def tldr_detail() -> Any:
+        req = adapter()
+        if req._reject_cross_site_post():
+            return req.response()
+        req._handle_tldr_detail()
+        return req.response()
+
+    @app.route("/api/feedback", methods=["OPTIONS"])
+    @app.route("/api/tldr-detail", methods=["OPTIONS"])
+    def api_options() -> Response:
+        response = Response(status=HTTPStatus.NO_CONTENT)
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        return response
+
+    return app
 
 
 def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
@@ -1946,14 +1998,18 @@ def main() -> None:
 
     # Start HTTP server
     server_host = "127.0.0.1"
-    server = ThreadingHTTPServer((server_host, config.server_port), Handler)
+    app = create_app(Handler)
     logging.info("Serving on http://%s:%d", server_host, config.server_port)
     try:
-        server.serve_forever()
+        app.run(
+            host=server_host,
+            port=config.server_port,
+            threaded=True,
+            use_reloader=False,
+        )
     except KeyboardInterrupt:
         logging.info("Shutting down...")
     finally:
-        server.server_close()
         db.close()
 
 
