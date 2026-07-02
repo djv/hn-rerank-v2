@@ -8,7 +8,7 @@ import re
 import threading
 import time
 import tomllib
-from collections import Counter, OrderedDict
+from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, replace
@@ -22,6 +22,7 @@ import httpx
 import numpy as np
 import onnxruntime as ort
 from bs4 import BeautifulSoup
+from cachetools import LRUCache
 from jinja2 import Environment, FileSystemLoader
 from numpy.typing import NDArray
 from sklearn.cluster import KMeans
@@ -66,8 +67,9 @@ class ModelConfig:
 # to skip SVC.fit(). Bump _MODEL_SCHEMA_VERSION whenever the feature schema
 # (number / semantics of meta columns appended to the embedding) changes;
 # the cache key then changes for every user, forcing a clean re-fit.
-_MODEL_CACHE: OrderedDict[tuple[int, str, int], tuple[SVC, StandardScaler]] = (
-    OrderedDict()
+_MODEL_CACHE_STORAGE_MAXSIZE = 10_000
+_MODEL_CACHE: LRUCache[tuple[int, str, int], tuple[SVC, StandardScaler]] = LRUCache(
+    maxsize=_MODEL_CACHE_STORAGE_MAXSIZE
 )
 _MODEL_CACHE_LOCK = threading.Lock()
 _MODEL_SCHEMA_VERSION = 2  # +1 whenever meta-column schema changes (see ARCHITECTURE)
@@ -155,9 +157,9 @@ def _get_cached_model(
         return None
     with _MODEL_CACHE_LOCK:
         key = (user_id, signature, _MODEL_SCHEMA_VERSION)
-        if key in _MODEL_CACHE:
-            _MODEL_CACHE.move_to_end(key)
-            return _MODEL_CACHE[key]
+        cached = _MODEL_CACHE.get(key)
+        if cached is not None:
+            return cached
     return None
 
 
@@ -174,7 +176,7 @@ def _set_cached_model(
         key = (user_id, signature, _MODEL_SCHEMA_VERSION)
         _MODEL_CACHE[key] = (svm, scaler)
         while len(_MODEL_CACHE) > maxsize:
-            _MODEL_CACHE.popitem(last=False)
+            _MODEL_CACHE.popitem()
 
 
 # Comment selection and depth tuning

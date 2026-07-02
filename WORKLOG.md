@@ -2,6 +2,36 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-02 — Use cachetools for small in-memory caches
+
+**Change.** Replaced three hand-rolled in-process cache implementations with
+`cachetools` while keeping the existing public helpers and behavior.
+
+- Added runtime dependency `cachetools>=7.1`.
+- `reddit_feed_cache.py` now uses a lock-guarded `TTLCache` for the 4h Reddit
+  topfeed cache while preserving hit/miss stats and copy-in/copy-out story
+  lists.
+- `ch_client.py` now uses a lock-guarded `TLRUCache` for CH responses,
+  preserving the 1h bulk-query TTL, 15m single-story TTL, and 128-entry cap.
+- `_MODEL_CACHE` in `pipeline.py` now uses `cachetools.LRUCache`; the existing
+  helper still enforces `Config.max_cached_models` and the schema-versioned
+  cache key.
+
+**Verification.**
+- `uv run pytest tests/test_reddit_feed_cache.py tests/test_ch_client.py tests/test_pipeline.py -q -k cache` = 27 passed, 157 deselected.
+- `uv run pytest tests/ -n 4` = 478 passed, 1 skipped.
+- `uv run ruff check .` = clean.
+- `uv run ty check` = clean.
+- `git diff --check` = clean.
+- Live service restarted with `systemctl --user restart hn_rewrite.service`;
+  `GET /` returned 200 with a session cookie, `GET /api/user` returned 200,
+  `OPTIONS /api/tldr-detail` returned 204 with CORS headers, and
+  `POST /api/tldr-detail` for a missing story returned 404 JSON. Post-start
+  logs show the Flask server serving on `127.0.0.1:8766` and the first regen
+  issuing its ClickHouse request without cache/import errors.
+
+---
+
 ## 2026-07-02 — Move TLDR detail fully into Flask
 
 **Change.** Finished the Flask routing migration by removing the final

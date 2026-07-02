@@ -30,15 +30,17 @@ Each result item matches the Algolia items shape:
 Caching:
 - Bulk queries: 1h TTL, keyed by (tuple(sorted_ids), max_levels)
 - Single story: 15min TTL, keyed by story_id
-- Capped at 128 entries; oldest evicted on overflow
+- Capped at 128 entries; LRU eviction on overflow
 - Process-local; lost on restart (regen rebuilds)
 """
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any
 
+from cachetools import TLRUCache
 import httpx
 
 
@@ -49,30 +51,29 @@ _CACHE_TTL_BULK_SECONDS = 3600
 _CACHE_TTL_SINGLE_SECONDS = 900
 _CACHE_MAX_ENTRIES = 128
 
-# Internal: (timestamp, value) tuples
-_cache: dict[tuple, tuple[float, Any]] = {}
+def _cache_ttu(key: tuple[Any, ...], _value: Any, now: float) -> float:
+    return now + _ttl_for_key(key)
+
+
+_cache: TLRUCache[tuple[Any, ...], Any] = TLRUCache(
+    maxsize=_CACHE_MAX_ENTRIES,
+    ttu=_cache_ttu,
+    timer=lambda: time.monotonic(),
+)
+_cache_lock = threading.Lock()
 
 
 def _cache_get(key: tuple) -> Any | None:
-    entry = _cache.get(key)
-    if entry is None:
-        return None
-    ts, value = entry
-    ttl = _ttl_for_key(key)
-    if time.time() - ts > ttl:
-        del _cache[key]
-        return None
-    return value
+    with _cache_lock:
+        return _cache.get(key)
 
 
 def _cache_put(key: tuple, value: Any) -> None:
-    _cache[key] = (time.time(), value)
-    while len(_cache) > _CACHE_MAX_ENTRIES:
-        oldest_key = min(_cache, key=lambda k: _cache[k][0])
-        del _cache[oldest_key]
+    with _cache_lock:
+        _cache[key] = value
 
 
-def _ttl_for_key(key: tuple) -> int:
+def _ttl_for_key(key: tuple[Any, ...]) -> int:
     return (
         _CACHE_TTL_SINGLE_SECONDS
         if key[0] == "single_story"
@@ -82,7 +83,8 @@ def _ttl_for_key(key: tuple) -> int:
 
 def clear_cache() -> None:
     """Drop all cached entries. Test helper."""
-    _cache.clear()
+    with _cache_lock:
+        _cache.clear()
 
 
 def _post_ch(query: str) -> list[dict[str, Any]]:

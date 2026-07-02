@@ -97,7 +97,7 @@ This avoids scikit-learn's deprecated and slower `SVC(probability=True)` calibra
 
 #### Per-User SVM Model Cache (Schema-Versioned)
 
-The trained `(SVC, StandardScaler)` tuple is cached in-process in `_MODEL_CACHE` (an `OrderedDict`, max 20 entries, LRU eviction) keyed on `(user_id, feedback_signature, _MODEL_SCHEMA_VERSION)`. The signature is a SHA-256 of the user's feedback story IDs + actions + update timestamps; the schema version is bumped whenever the feature schema changes. Bumping `_MODEL_SCHEMA_VERSION = 2` (2026-06-28, 4-binary source categories) invalidates every active user's cached model on next request — the correct behavior, since a stale scaler fit on 6 meta columns would be applied to a 10-column input and produce NaN scores. Schema version is the only viable invalidation key: the cache is in-memory only, so a runtime dim check would mask future schema bugs.
+The trained `(SVC, StandardScaler)` tuple is cached in-process in `_MODEL_CACHE` (a lock-guarded `cachetools.LRUCache`, max 20 active entries by default) keyed on `(user_id, feedback_signature, _MODEL_SCHEMA_VERSION)`. The signature is a SHA-256 of the user's feedback story IDs + actions + update timestamps; the schema version is bumped whenever the feature schema changes. Bumping `_MODEL_SCHEMA_VERSION = 2` (2026-06-28, 4-binary source categories) invalidates every active user's cached model on next request — the correct behavior, since a stale scaler fit on 6 meta columns would be applied to a 10-column input and produce NaN scores. Schema version is the only viable invalidation key: the cache is in-memory only, so a runtime dim check would mask future schema bugs.
 
 #### Dual-Gate SVM Activation
 
@@ -168,7 +168,9 @@ by feed URL.  On hit (`list[Story]` within TTL), the stories are appended
 directly to `feed_results` and the loop continues to the next feed — no
 HTTP request, no limiter consultation, no 429 risk.  On miss, the normal
 fetch + limiter flow runs and the result is stored for `TTL_SECONDS=14400`
-(4h).
+(4h). The cache uses a lock-guarded `cachetools.TTLCache`, so expiry and
+LRU overflow are handled by a standard library object while the wrapper keeps
+copy-in/copy-out story-list semantics and hit/miss counters.
 
 **Impact**: topfeed HTTP requests are bounded to about 41 per 4-hour cache
 window, plus at most `reddit_prewarm_max_per_cycle` per-post comment RSS
@@ -265,6 +267,11 @@ The same function reads `bq_seed` and `ch_seed` archive rows from the SQLite DB 
 
 **Why CH instead of Algolia for the live window**: the previous implementation used Algolia's `/api/v1/search` for live discovery (7 daily chunks × up to 4 pages of 100 hits = ~25 calls/regen) plus Algolia's `/api/v1/items/{id}` for each missing/stale candidate (~100 calls/regen). Consolidating both into one CH SQL query removes ~125 third-party HTTP calls per regen, drops the search-loop complexity, and removes one of two real-time external dependencies. Tradeoff: CH has 1-24h latency for new content (vs Algolia's real-time), so a brand-new story posted in the last hour may not surface until the next regen cycle (3h).
 
+**ClickHouse response cache**: `ch_client.py` keeps process-local CH responses in
+a lock-guarded `cachetools.TLRUCache`, capped at 128 entries. Bulk story/comment
+queries keep a 1h TTL; single-story lazy fallback entries keep a 15m TTL. The
+cache is performance-only and is cleared on process restart.
+
 **Candidate filter — `is_summarizable`**: after live + archive + RSS candidates are merged and deduped, `fetch_candidates` filters out stories with no text content (self_text, top_comments, article_body all empty) and no path to content (HN/LessWrong stories with zero comments, or non-HN/non-LessWrong sources). The `is_summarizable(story)` invariant ensures every shown story can produce a meaningful TLDR — either from inline content, from prewarmed/on-demand HN/LessWrong comments, or from already-hydrated top_comments. Stories with `comment_count > 0` (HN or LessWrong) survive the filter even if text fields are empty, because the regen prewarm or the on-demand tldr-detail path will fetch comments.
 
 **Archive seeders**: `uv run python scripts/seed_hn_from_clickhouse.py` (ClickHouse, primary) and `uv run python scripts/seed_hn_from_bq.py` (BigQuery, backup) populate `ch_seed` / `bq_seed` rows. Both use the same shared logic in `_seed_common`: skeleton → bulk CH hydration (`ch_client.query_stories_with_comments`, one query for the entire set) → DB upsert → embedding. Comment hydration no longer uses Algolia — it's a single bulk CH SQL query. If CH fails, the skeleton is preserved (the previous per-story parallel Algolia path is archived in `scripts/_archive/algolia/hydrate_comments_algolia.py` as a fallback).
@@ -330,7 +337,7 @@ The server is tuned to keep dashboard renders from stacking large transient allo
 ### 3.12 Multi-User Architecture
 The system supports multiple users with independent feedback histories and personalized rankings:
 * **Public edge**: The public demo is served behind Tailscale Funnel and the local Caddy route under `/hn/*`, while `server.py` binds to `127.0.0.1`. Caddy caps request bodies at 950KB on both bare `/api/*` and public `/hn/*` proxy paths as an edge defense-in-depth layer; the application still enforces its own 1MB POST cap and owns all rate limiting because the installed Caddy build does not depend on a rate-limit module.
-* **HTTP layer**: Flask owns routing, request bodies, cookies, JSON responses, redirects, CORS/options responses, dashboard/session/profile-link requests, feedback POSTs, ranking-ready polling, and threaded request handling. The current `Handler` class is not a `BaseHTTPRequestHandler`; it is the runtime-state owner for dashboard cache versions, warm scheduling, render locks, rate limiters, and the shared DB/embedder. A small Flask request context remains only for the TLDR detail handler while its enrichment/cache/quota flow is still being untangled from request response construction.
+* **HTTP layer**: Flask owns routing, request bodies, cookies, JSON responses, redirects, CORS/options responses, dashboard/session/profile-link requests, feedback POSTs, ranking-ready polling, TLDR detail requests, and threaded request handling. The current `Handler` class is not a `BaseHTTPRequestHandler`; it is the runtime-state owner for dashboard cache versions, warm scheduling, render locks, rate limiters, and the shared DB/embedder.
 * **User Identification**: Token-based via the `hn_token` cookie. Anonymous dashboard visits create the user row, set the cookie, and serve the dashboard in one response. `/u/<token>` remains an import-only profile link for opening an existing profile on another device; unknown profile-link tokens return 404 and do not create users. Anonymous session creation and profile-link attempts are IP-throttled in the app, preferring the leftmost `X-Forwarded-For` value and falling back to the socket address.
 * **Data Model**: Shared `stories` table (candidates are global), per-user `feedback` rows with `PRIMARY KEY (user_id, story_id)`. A `users` table maps tokens to user IDs and display names.
 * **Dynamic Dashboard**: Each user's dashboard is rendered on-request via `fast_rerank_for_user()` → personalized SVM training → top-ranked selection (`enable_mmr=false` by default) → Jinja2 template render. Rendered HTML is cached per-user for 5 minutes. If no exact or stale per-user HTML exists yet, the server renders a global cold deck from existing SQLite stories ordered by raw score (`build_cold_deck`, capped at 500 summarizable stories) with `dashboard_version=0`, then schedules the personalized warm render; the skeleton is now only an emergency fallback when that cold deck is empty.

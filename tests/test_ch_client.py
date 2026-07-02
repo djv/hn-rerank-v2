@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import time
-
 import httpx
 import pytest
 
@@ -369,6 +367,7 @@ def test_query_single_story_returns_item(
 
 
 def test_cache_ttl_expiry(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = [100.0]
     call_count = {"n": 0}
 
     def fake_post(url, **kwargs):
@@ -391,15 +390,13 @@ def test_cache_ttl_expiry(monkeypatch: pytest.MonkeyPatch) -> None:
             },
         )
 
+    monkeypatch.setattr(ch_client.time, "monotonic", lambda: now[0])
     monkeypatch.setattr(ch_client.httpx, "post", fake_post)
     # First call: cache miss
     query_stories_with_comments([1])
     assert call_count["n"] == 2  # stories + comments
 
-    # Manually expire cache by adjusting the timestamp
-    for key in ch_client._cache:
-        ts, val = ch_client._cache[key]
-        ch_client._cache[key] = (ts - 10000, val)
+    now[0] += ch_client._CACHE_TTL_BULK_SECONDS + 1
 
     # Second call: should re-fetch
     query_stories_with_comments([1])
@@ -407,21 +404,16 @@ def test_cache_ttl_expiry(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_cache_lru_eviction() -> None:
-    """Insert > MAX entries; oldest should be evicted."""
-    # Pre-fill cache with timestamps in the past so they don't TTL out
+    """Insert > MAX entries; the cache cap should hold."""
     for i in range(ch_client._CACHE_MAX_ENTRIES + 5):
-        ch_client._cache[("bulk", (i,), 5)] = (time.time() - i, "v")
-
-    # Trigger a put
-    ch_client._cache_put(("bulk", (9999,), 5), "new")
-    # Cap should hold
+        ch_client._cache_put(("bulk", (i,), 5), "v")
     assert len(ch_client._cache) <= ch_client._CACHE_MAX_ENTRIES
 
 
 def test_cache_clear() -> None:
-    ch_client._cache[("foo",)] = (time.time(), "bar")
+    ch_client._cache_put(("foo",), "bar")
     ch_client.clear_cache()
-    assert ch_client._cache == {}
+    assert len(ch_client._cache) == 0
 
 
 def test_cache_key_normalization(monkeypatch: pytest.MonkeyPatch) -> None:
