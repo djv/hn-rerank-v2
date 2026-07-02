@@ -3196,7 +3196,7 @@ def test_dashboard_has_source_filter_toggle():
     assert 'data-filter="source"' in template
     # Mixed is the default active tab
     assert 'TabView("mixed", "<u>M</u>ixed", True)' in (
-        Path(__file__).resolve().parents[1] / "pipeline" / "__init__.py"
+        Path(__file__).resolve().parents[1] / "pipeline" / "render.py"
     ).read_text(encoding="utf-8")
     # Source filter appears before swipe keys in the DOM
     side_rail = (
