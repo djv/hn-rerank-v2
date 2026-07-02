@@ -511,7 +511,7 @@ class Config:
     # embedding, SVM feature prep, and decision_function. The
     # is_uncertain discovery pass is allowed to shift because that
     # signal is orthogonal to the SQL ordering.
-    recent_candidate_hn_limit: int = 1500
+    recent_candidate_hn_limit: int = 5000
     recent_candidate_rss_limit: int = 500
     tldr_prefetch_per_combo: int = 5
     # Public demo abuse limits. Cached TLDR hits bypass the uncached TLDR

@@ -68,6 +68,39 @@ ranking-ready, and TLDR detail behavior are unchanged.
 
 ---
 
+## 2026-07-02 — Raise recent_candidate_hn_limit 1500 → 5000
+
+**Problem.** A `cap_sweep.py` run against the heaviest feedback user showed that
+`hn=1500` kept only 24/50 uncapped top-50 stories, losing 10 primary (un-badged)
+stories. The original plan to raise to 2000 turned out to be a no-op:
+hn=1500, 2000, and 2500 all produced identical top-50 overlap.
+
+**Sweep results** (RSS fixed at 500, uncapped=100k, 11,231 candidates):
+
+```
+hn_cap  shared  lost  L_pri  candidates
+  1000      24    26     10       5,398
+  1500      24    26     10       5,818
+  2000      24    26     10       6,251   ← identical to 1500
+  2500      24    26     10       6,655
+  3000      27    23      8       7,011
+  5000      37    13      1       8,348
+ 10000      38    12      0       8,844
+```
+
+5000 recovers 9 of the 10 lost primary stories (leaving only 1) with an
+~8.3k candidate pool — well within what the system already handles when
+warm (uncapped peak ≈ 11.2k). The remaining 12 lost non_hn stories are
+gated by `recent_candidate_rss_limit=500`, not by the HN cap.
+
+**Change.** `Config.recent_candidate_hn_limit`: 1500 → 5000 in
+`pipeline.py`, `scripts/cap_loss_check.py`, and one test fixture.
+
+**Verification.**
+- `uv run pytest tests/ -n 4` = 475 passed, 1 skipped, 1 pre-existing
+  failure in `test_server.py` (unrelated WIP in `http_fetch.py` / rate
+  limiter).
+
 ## 2026-07-02 — Move feedback and ranking-ready fully into Flask
 
 **Change.** Shrank the transitional Flask bridge by moving the simple API

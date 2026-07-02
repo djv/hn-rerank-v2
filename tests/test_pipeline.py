@@ -5739,7 +5739,7 @@ def test_two_leg_recent_preserves_hn_and_rss_legs(
 
     config = Config(
         db_path=db.db_path,
-        recent_candidate_hn_limit=1500,
+        recent_candidate_hn_limit=5000,
         recent_candidate_rss_limit=500,
     )
     captured: dict[str, list[Story]] = {}

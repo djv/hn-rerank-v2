@@ -103,7 +103,7 @@ def main() -> None:
     parser.add_argument("--db", default="hn_rewrite.db")
     parser.add_argument("--config", default="config.toml")
     parser.add_argument("--user-id", type=int)
-    parser.add_argument("--hn-limit", type=int, default=1500)
+    parser.add_argument("--hn-limit", type=int, default=5000)
     parser.add_argument("--rss-limit", type=int, default=500)
     parser.add_argument("--uncapped", type=int, default=100_000)
     args = parser.parse_args()
