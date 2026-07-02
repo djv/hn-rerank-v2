@@ -51,6 +51,7 @@ _CACHE_TTL_BULK_SECONDS = 3600
 _CACHE_TTL_SINGLE_SECONDS = 900
 _CACHE_MAX_ENTRIES = 128
 
+
 def _cache_ttu(key: tuple[Any, ...], _value: Any, now: float) -> float:
     return now + _ttl_for_key(key)
 
@@ -165,9 +166,9 @@ LIMIT {int(limit)}
 
 
 def query_live_window(
-    days: int = 7,
+    days: int = 30,
     min_score: int = 5,
-    limit: int = 2000,
+    limit: int = 5000,
 ) -> list[dict[str, Any]]:
     """Return list of recent high-score story metadata dicts (no comments)."""
     if days <= 0:

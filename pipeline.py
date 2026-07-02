@@ -218,7 +218,7 @@ BQ_ARCHIVE_SOURCE = "bq_seed"
 BQ_ARCHIVE_CANDIDATE_LIMIT = 2000
 CH_ARCHIVE_SOURCE = "ch_seed"
 CH_ARCHIVE_CANDIDATE_LIMIT = 2000
-LIVE_WINDOW_LIMIT = 2000
+LIVE_WINDOW_LIMIT = 5000
 
 
 def is_hn_source(source: str) -> bool:
@@ -517,6 +517,11 @@ class Config:
     recent_candidate_hn_limit: int = 5000
     recent_candidate_rss_limit: int = 500
     tldr_prefetch_per_combo: int = 5
+    # After the top-per-combo pass, regenerate up to this many additional
+    # cold-deck stories whose cached TLDR's cache_key no longer matches
+    # current story content (e.g. article_body was enriched after the TLDR
+    # was generated). 0 disables. See server.py::_prefetch_tldrs_for_ranked.
+    tldr_prefetch_stale_per_run: int = 3
     # Public demo abuse limits. Cached TLDR hits bypass the uncached TLDR
     # quota; these limits protect only new enrichment/LLM work and vote writes.
     tldr_uncached_per_user_limit: int = 12
@@ -1455,8 +1460,8 @@ async def fetch_candidates(
 
     One CH call does the work the old code did with ~125 Algolia calls:
 
-    `ch_client.query_live_window(days=7, min_score=5, limit=2000)` returns
-    every live HN story from the past 7 days with all fields populated
+    `ch_client.query_live_window(days=30, min_score=5, limit=5000)` returns
+    every live HN story from the past 30 days with all fields populated
     (title, url, score, descendants, time, text). No per-story items
     call needed.
 
@@ -1474,7 +1479,7 @@ async def fetch_candidates(
     # 1. Live window from CH (replaces ~125 Algolia search + items calls)
     try:
         live_window = query_live_window(
-            days=7,
+            days=30,
             min_score=5,
             limit=LIVE_WINDOW_LIMIT,
         )
