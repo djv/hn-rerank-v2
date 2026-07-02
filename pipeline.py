@@ -519,7 +519,7 @@ class Config:
     tldr_prefetch_per_combo: int = 5
     # Public demo abuse limits. Cached TLDR hits bypass the uncached TLDR
     # quota; these limits protect only new enrichment/LLM work and vote writes.
-    tldr_uncached_per_user_limit: int = 8
+    tldr_uncached_per_user_limit: int = 12
     tldr_uncached_per_user_window_seconds: int = 3600
     tldr_uncached_global_limit: int = 60
     tldr_uncached_global_window_seconds: int = 3600

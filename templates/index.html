@@ -1668,7 +1668,7 @@
       if (contentDiv?.dataset.loading === 'true') {
         return;
       }
-      if (contentDiv && contentDiv.style.display !== 'none') {
+      if (contentDiv && contentDiv.style.display !== 'none' && !contentDiv.dataset.error) {
         return;
       }
       if (!contentDiv) {
@@ -1679,12 +1679,15 @@
       }
       const cached = tldrCache.get(storyId);
       if (cached !== undefined) {
+        delete contentDiv.dataset.error;
         contentDiv.innerHTML = parseSimpleMarkdown(cached);
         styleTldrLabels(contentDiv);
         contentDiv.style.display = 'block';
         return;
       }
 
+      contentDiv.textContent = 'Loading TLDR...';
+      contentDiv.style.display = 'block';
       contentDiv.dataset.loading = 'true';
 
       const detailApiPath = apiPath('/api/tldr-detail');
@@ -1697,14 +1700,22 @@
         if (resp.ok) {
           const data = await resp.json();
           tldrCache.set(storyId, data.tldr);
+          delete contentDiv.dataset.error;
           contentDiv.innerHTML = parseSimpleMarkdown(data.tldr);
           styleTldrLabels(contentDiv);
           contentDiv.style.display = 'block';
         } else {
           const errData = await resp.json().catch(() => ({}));
-          console.warn('openTldrDetail failed:', errData.error || `HTTP ${resp.status}`);
+          const errorMsg = errData.error || `HTTP ${resp.status}`;
+          contentDiv.textContent = 'TLDR: ' + errorMsg;
+          contentDiv.dataset.error = 'true';
+          contentDiv.style.display = 'block';
+          console.warn('openTldrDetail failed:', errorMsg);
         }
       } catch (err) {
+        contentDiv.textContent = 'TLDR: ' + (err.message || 'Network error');
+        contentDiv.dataset.error = 'true';
+        contentDiv.style.display = 'block';
         console.error(err);
       } finally {
         delete contentDiv.dataset.loading;
