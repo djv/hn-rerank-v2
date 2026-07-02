@@ -1,23 +1,17 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from dataclasses import replace
-from datetime import datetime
-from pathlib import Path
 
-import feedparser
 import httpx
 import numpy as np
-from bs4 import BeautifulSoup
 from numpy.typing import NDArray
 
 from database import Database, Story
 from reddit_fetch_queue import CoroFactory
 
-# ruff: noqa: F401 — all imports below are intentional re-exports for the
-# public pipeline namespace. Consumers import from `pipeline` directly.
+# ruff: noqa: F401 — re-exports for the public pipeline namespace.
 from .config import (
     BQ_ARCHIVE_CANDIDATE_LIMIT,
     BQ_ARCHIVE_SOURCE,
@@ -322,10 +316,6 @@ def _needs_hn_prewarm(s: Story) -> bool:
     return growth >= threshold
 
 
-# Source category one-hot. Order is significant: callers index into the
-# returned vector and tests assert specific positions.
-
-
 def is_summarizable(story: Story) -> bool:
     """True if the story has enough text to generate a TLDR (or can fetch it).
 
@@ -346,9 +336,6 @@ def is_summarizable(story: Story) -> bool:
         if (story.comment_count_at_fetch or 0) > 0:
             return True
     return False
-
-
-# Text processing helpers
 
 
 async def fetch_candidates(
@@ -474,7 +461,6 @@ async def fetch_candidates(
     return summarizable, len(summarizable)
 
 
-# RSS Fetching
 def fast_rerank_for_user(
     db: Database,
     config: Config,
