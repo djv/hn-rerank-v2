@@ -95,7 +95,7 @@
     parsed result is immediately normalized into a typed model.
   - Feature dicts in ML pipelines where keys are dynamic (but the
     *value type* must still be explicit, e.g. `dict[str, np.ndarray]`).
-- **Type hints are mandatory for new code** in `pipeline.py`,
+- **Type hints are mandatory for new code** in the `pipeline/` package,
   `ch_client.py`, `server.py`, `database.py`. Existing code without
   hints gets hints when you touch it.
 - **Tests get hints too** — public test functions should have
