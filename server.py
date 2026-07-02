@@ -4,7 +4,6 @@ import asyncio
 import gc
 import hashlib
 import html
-import inspect
 import json
 import logging
 import os
@@ -1018,18 +1017,13 @@ class Handler:
             trace = RankTrace()
             render_start = time.perf_counter()
             with trace.stage("rank_total"):
-                if "trace" in inspect.signature(fast_rerank_for_user).parameters:
-                    final = fast_rerank_for_user(
-                        cls.db,
-                        cls.config,
-                        cls.embedder,
-                        user.id,
-                        trace=trace,
-                    )
-                else:
-                    final = fast_rerank_for_user(
-                        cls.db, cls.config, cls.embedder, user.id
-                    )
+                final = fast_rerank_for_user(
+                    cls.db,
+                    cls.config,
+                    cls.embedder,
+                    user.id,
+                    trace=trace,
+                )
             rank_ms = (time.perf_counter() - render_start) * 1000
 
             html_start = time.perf_counter()
@@ -1190,11 +1184,12 @@ class Handler:
             asyncio.run(_prefetch_tldrs_for_ranked(final, db, per_combo))
 
 
-
 def _no_cache_dashboard_response(
     html: bytes, *, user: User | None = None, set_session_cookie: bool = False
 ) -> Response:
-    response = Response(html, status=HTTPStatus.OK, content_type="text/html; charset=utf-8")
+    response = Response(
+        html, status=HTTPStatus.OK, content_type="text/html; charset=utf-8"
+    )
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
@@ -1223,9 +1218,7 @@ def _flask_json_response(
     return response
 
 
-def _flask_text_error(
-    code: int | HTTPStatus, message: str | None = None
-) -> Response:
+def _flask_text_error(code: int | HTTPStatus, message: str | None = None) -> Response:
     return Response(
         message or HTTPStatus(code).phrase,
         status=int(code),
@@ -1313,9 +1306,7 @@ def _flask_cross_site_post_response() -> Response | None:
     )
 
 
-def _flask_rate_limit_response(
-    message: str, retry_after_seconds: int
-) -> Response:
+def _flask_rate_limit_response(message: str, retry_after_seconds: int) -> Response:
     return _flask_json_response(
         {"error": message, "retry_after": retry_after_seconds},
         status=HTTPStatus.TOO_MANY_REQUESTS,
@@ -1323,9 +1314,7 @@ def _flask_rate_limit_response(
     )
 
 
-def _acquire_feedback_quota(
-    runtime: type[Handler], user: User
-) -> RateLimitResult:
+def _acquire_feedback_quota(runtime: type[Handler], user: User) -> RateLimitResult:
     config = runtime.config
     return runtime._public_demo_limiter.try_acquire(
         (
@@ -1611,9 +1600,7 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
                     if embedder is not None:
                         model_version = "all-MiniLM-L6-v2|mean|norm|256"
                         new_vec = embedder.encode([new_text])[0]
-                        new_hash = hashlib.sha256(
-                            new_text.encode("utf-8")
-                        ).hexdigest()
+                        new_hash = hashlib.sha256(new_text.encode("utf-8")).hexdigest()
                         runtime.db.upsert_embedding(
                             story.id, model_version, new_hash, new_vec
                         )

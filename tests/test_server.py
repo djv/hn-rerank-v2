@@ -586,7 +586,9 @@ def test_feedback_post_limit_returns_429_without_write(test_env) -> None:
         {"Origin": "https://attacker.example"},
     ],
 )
-def test_feedback_post_rejects_cross_site_posts(test_env, headers: dict[str, str]) -> None:
+def test_feedback_post_rejects_cross_site_posts(
+    test_env, headers: dict[str, str]
+) -> None:
     port, db, regen_event, handler, user = test_env
     db.upsert_story(
         Story(
@@ -734,7 +736,7 @@ def test_feedback_post_bumps_cache_version_for_warm_rerender(test_env, monkeypat
     )
     db.upsert_story(voted_story)
 
-    def fake_fast_rerank_for_user(database, config, embedder, user_id):
+    def fake_fast_rerank_for_user(database, config, embedder, user_id, **kwargs):
         return []
 
     def fake_generate_dashboard_bytes(
@@ -1047,7 +1049,7 @@ def test_dashboard_cache_uses_feedback_versions(test_env, mock_embedder, monkeyp
 
     calls = []
 
-    def fake_fast_rerank_for_user(database, config, embedder, user_id):
+    def fake_fast_rerank_for_user(database, config, embedder, user_id, **kwargs):
         calls.append(("rank", user_id))
         return []
 
@@ -1239,7 +1241,7 @@ def test_stale_warm_render_does_not_overwrite_current_cache(
     TestHandler._render_locks = {}
     _reset_warm_state(TestHandler)
 
-    def fake_fast_rerank_for_user(database, config, embedder, user_id):
+    def fake_fast_rerank_for_user(database, config, embedder, user_id, **kwargs):
         return []
 
     def fake_generate_dashboard_bytes(
@@ -1300,7 +1302,7 @@ def test_active_warm_commits_when_dashboard_version_advances(
     rank_started = threading.Event()
     allow_rank_to_finish = threading.Event()
 
-    def fake_fast_rerank_for_user(database, config, embedder, user_id):
+    def fake_fast_rerank_for_user(database, config, embedder, user_id, **kwargs):
         rank_started.set()
         assert allow_rank_to_finish.wait(timeout=2.0)
         return []
@@ -1355,7 +1357,7 @@ def test_active_warm_after_lock_wait_still_ranks_and_commits(
 
     rank_called = threading.Event()
 
-    def fake_fast_rerank_for_user(database, config, embedder, user_id):
+    def fake_fast_rerank_for_user(database, config, embedder, user_id, **kwargs):
         rank_called.set()
         return []
 
@@ -1407,7 +1409,7 @@ def test_rapid_vote_warms_coalesce_to_latest_version(
 
     ranked_versions: list[int] = []
 
-    def fake_fast_rerank_for_user(database, config, embedder, user_id):
+    def fake_fast_rerank_for_user(database, config, embedder, user_id, **kwargs):
         ranked_versions.append(TestHandler._dashboard_version(user_id))
         return []
 
@@ -1457,7 +1459,7 @@ def test_warm_loops_to_newer_version_requested_while_ranking(
     allow_first_rank_to_finish = threading.Event()
     ranked_versions: list[int] = []
 
-    def fake_fast_rerank_for_user(database, config, embedder, user_id):
+    def fake_fast_rerank_for_user(database, config, embedder, user_id, **kwargs):
         ranked_versions.append(TestHandler._dashboard_version(user_id))
         if len(ranked_versions) == 1:
             rank_started.set()
@@ -1539,7 +1541,7 @@ def test_dashboard_cache_version_invariant_property(
     TestHandler._render_locks = {}
     _reset_warm_state(TestHandler)
 
-    def fake_fast_rerank_for_user(database, config, embedder, user_id):
+    def fake_fast_rerank_for_user(database, config, embedder, user_id, **kwargs):
         return []
 
     def fake_generate_dashboard_bytes(
