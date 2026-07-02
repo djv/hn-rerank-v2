@@ -6,6 +6,10 @@
 - Use `uv run python <script>.py` or standard `uv` commands to execute scripts and run tests.
 ## Working rules
 
+- **Trust the live tree, not stale docs or session logs.** When reviewing
+  a plan or answering a "check" question, verify claims against the current
+  checkout. Documentation and session history describe what was true
+  at write time; the source tree is the ground truth.
 - Make minimal, behavior-preserving changes unless the user asks for a broader refactor.
 - Keep the runtime path local-first; do not add new external dependencies unless needed.
 - **Be very skeptical of unusually high metrics** (e.g. NDCG > 0.40). We are unlikely to beat the Hacker News baseline by a large margin; high metrics often indicate feature leakage, train-test contamination, or metric saturation artifacts.
@@ -64,6 +68,10 @@
     git history is self-documenting — the next person reading the blame
     should see what happened and what was reconstructed.
 
+- **Focused commits.** When asked to commit, stage only the intended
+  files. Verify with `git status --short` and `git diff --stat` first.
+  Leave unrelated workspace state (including `.opencode/`) alone.
+  Do not amend or force-push unless explicitly asked.
 - **Always update relevant documentation** (e.g., [ARCHITECTURE.md](ARCHITECTURE.md), [WORKLOG.md](WORKLOG.md)) after making code or behavior changes.
 
 ## Running scripts
@@ -115,6 +123,19 @@
   zero new diagnostics. LSP errors must be fixed or `# type: ignore`
   with a documented reason)
 
+## Verification protocol
+
+Before reporting completion of any code or template change:
+
+1. `uv run pytest tests/ -n 4` — full suite must pass
+2. `uv run ruff check .` — lint must be clean
+3. `uv run ty check` — zero new type diagnostics
+4. If the change affects runtime behavior: restart the service, then
+   live smoke test with endpoint requests plus a bounded
+   `journalctl --user -u hn_rewrite.service --since '1 min ago'` scan
+5. If UI templates changed: update corresponding assertions in
+   `tests/test_server.py`
+
 ## Dependency groups
 
 `pyproject.toml` ships two groups beyond the runtime deps. Default
@@ -141,9 +162,8 @@
 If a future experiment is added that needs a different heavy
 runtime dep (e.g. jax, tensorflow), give it its own
 `[dependency-groups]` group with a descriptive name, not a runtime
-direct dep.
+  direct dep.
 
-- Run persistent server: `systemctl --user {status|start|stop|restart} hn_rewrite.service` (or directly: `uv run python server.py`)
 - Migrate feedback from legacy JSON: `uv run python migrate_feedback.py`
 - **Primary archive seeder** — ClickHouse (no GCP auth, 10-30x faster, real-time scores):
   `uv run python scripts/seed_hn_from_clickhouse.py` (default: 6 months, score ≥ 200)
@@ -155,6 +175,33 @@ direct dep.
 - Compare ClickHouse vs BigQuery output: `uv run python scripts/seed_smoke_test.py --bq-file bq.jsonl --ch-file ch.jsonl`
   or live: `uv run python scripts/seed_smoke_test.py --limit 50 --min-score 200 --skip-bq`
 - Run leakage-safe offline eval: `uv run python scripts/eval_ranker_variants.py --window-days N`
+
+## Service & runtime
+
+- Run persistent server: `systemctl --user {status|start|stop|restart} hn_rewrite.service`
+  (or directly: `uv run python server.py`)
+- **Restart before verifying**: live behavior can differ from the checkout until
+  `hn_rewrite.service` is restarted. Deployed code and the working tree can diverge;
+  verify with `git log`, `systemctl --user status hn_rewrite.service`, then
+  `journalctl` before concluding runtime behavior from code alone.
+- Live smoke test shape: after restart, hit the dashboard plus cached/uncached
+  `POST /api/tldr-detail`, then scan `journalctl --user -u hn_rewrite.service
+  --since '1 min ago'` for errors.
+
+## Frontend notes
+
+- **Data-attribute collisions**: `data-*` attributes on story cards (e.g.
+  `data-story-source`, `data-story-id` in `templates/components/story_card.html`)
+  can be accidentally matched by generic `querySelectorAll('[data-*]')` selectors
+  in `templates/index.html`. Tab buttons use `data-source`, `data-sort`,
+  `data-age` — scope selectors to `.tab-btn[data-*]`. When adding `data-*` to
+  templates, verify no JS selector collides with them.
+- **Template tests**: `tests/test_server.py` pins CSS/JS contracts via
+  template-string assertions. Update them when `templates/index.html` changes.
+  Avoid adding tests that only check exact strings without validating runtime
+  behavior (the user will request their removal).
+- **Version semantics**: `dashboard_version=0` is valid cold-deck data.
+  Client-side version comparisons must use `Number.isFinite()`, not truthiness.
 
 ## HN data sources (architecture overview)
 

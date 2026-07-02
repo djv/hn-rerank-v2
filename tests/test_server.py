@@ -2020,6 +2020,141 @@ def test_flask_test_client_tldr_uncached_limit_sets_retry_after(
     assert calls == ["Flask per-user TLDR story 1716"]
 
 
+def test_flask_test_client_tldr_stale_fallback_on_quota_denied(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cache-key mismatch (e.g. article_body enriched after TLDR was
+    cached) must not surface as a 429/error when quota is exhausted -- the
+    stale-but-cached TLDR should be served instead."""
+    import server
+
+    _, db, _, handler, user = test_env
+    handler.config = replace(
+        handler.config,
+        tldr_uncached_per_user_limit=1,
+        tldr_uncached_per_user_window_seconds=3600,
+        tldr_uncached_global_limit=100,
+    )
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+    for story_id in (1720, 1721):
+        db.upsert_story(
+            Story(
+                id=story_id,
+                title=f"Flask stale-fallback story {story_id}",
+                url=f"https://example.com/flask-stale-fallback-{story_id}",
+                score=10,
+                time=1600000000,
+                text_content="Story body.",
+                source="hn",
+                comment_count=0,
+                self_text="",
+                top_comments="",
+                article_body="Body enriched after TLDR was cached.",
+            )
+        )
+    stale_key = server._tldr_cache_key(
+        title="Flask stale-fallback story 1721",
+        self_text="",
+        top_comments="",
+        article_body="Body before enrichment.",
+    )
+    db.upsert_tldr_cache(1721, stale_key, "Stale summary from before enrichment")
+
+    async def mock_generate_detailed_tldr(
+        title: str, self_text: str, top_comments: str, article_body: str
+    ) -> str:
+        return f"TLDR: {title}"
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    first = client.post("/api/tldr-detail", json={"story_id": 1720})
+    second = client.post("/api/tldr-detail", json={"story_id": 1721})
+
+    assert first.status_code == 200
+    assert first.get_json()["cached"] is False
+    assert second.status_code == 200
+    assert second.get_json() == {
+        "ok": True,
+        "tldr": "Stale summary from before enrichment",
+        "cached": True,
+        "stale": True,
+    }
+
+
+async def test_prefetch_tldrs_for_ranked_regenerates_stale_beyond_top_combo(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Side B: the top-per-combo prefetch alone never reaches a story ranked
+    below the cutoff, so a stale-key story there is stuck until it re-enters
+    the top N. `stale_per_run` scans the remainder of the cold deck for
+    cache-key mismatches and regenerates a bounded number of them."""
+    import server as srv
+    from pipeline import RankedStory
+
+    _, db, _, _, _ = test_env
+
+    stories = [
+        Story(
+            id=3100 + i,
+            title=f"Stale scan story {i}",
+            url=f"https://example.com/stale-scan-{i}",
+            score=10,
+            time=1600000000,
+            text_content="body",
+            source="hn",
+            comment_count=0,
+            self_text="",
+            top_comments="",
+            article_body="New body.",
+        )
+        for i in range(3)
+    ]
+    for s in stories:
+        db.upsert_story(s)
+
+    ranked = [
+        RankedStory(story=s, score=1.0, best_match_title="", combo_keys="recent_hn")
+        for s in stories
+    ]
+
+    # stories[1]: beyond the per_combo=1 cutoff, cached under a stale key
+    # (article_body changed since it was cached) -> must be regenerated.
+    stale_key = srv._tldr_cache_key(
+        title=stories[1].title,
+        self_text="",
+        top_comments="",
+        article_body="Old body before enrichment.",
+    )
+    db.upsert_tldr_cache(stories[1].id, stale_key, "Stale TLDR")
+
+    # stories[2]: beyond the cutoff, cached under the *current* key ->
+    # must NOT be regenerated even with the stale scan enabled.
+    fresh_key = srv._tldr_cache_key(
+        title=stories[2].title,
+        self_text="",
+        top_comments="",
+        article_body="New body.",
+    )
+    db.upsert_tldr_cache(stories[2].id, fresh_key, "Fresh TLDR")
+
+    calls: list[str] = []
+
+    async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
+        calls.append(title)
+        return f"TLDR: {title}"
+
+    monkeypatch.setattr(srv, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    generated = await srv._prefetch_tldrs_for_ranked(
+        ranked, db, per_combo=1, stale_per_run=2
+    )
+
+    assert generated == 2
+    assert sorted(calls) == sorted([stories[0].title, stories[1].title])
+    assert db.get_any_tldr_for_story(stories[2].id) == "Fresh TLDR"
+
+
 def test_normalize_tldr_markdown_repairs_inline_bullets():
     import server
 
@@ -4014,7 +4149,7 @@ def test_warm_background_article_fetch_failure_still_prefetches_tldrs(
 
     prefetch_calls: list[list[int]] = []
 
-    async def capture_prefetch(ranked_stories, database, per_combo):
+    async def capture_prefetch(ranked_stories, database, per_combo, stale_per_run=0):
         prefetch_calls.append([rs.story.id for rs in ranked_stories])
         return 1
 

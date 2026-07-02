@@ -517,6 +517,33 @@ class Database:
             ).fetchone()
             return row[0] if row else None
 
+    def get_any_tldr_for_story(self, story_id: int) -> str | None:
+        """Return the cached TLDR for a story regardless of cache key.
+
+        `upsert_tldr_cache` deletes any prior row before inserting, so at
+        most one row exists per story_id; this is a stale-tolerant fallback
+        for when story content changed after the TLDR was generated (see
+        `_handle_flask_tldr_detail` fallback in server.py).
+        """
+        with self.conn() as conn:
+            row = conn.execute(
+                "SELECT tldr FROM tldr_cache WHERE story_id = ?",
+                (story_id,),
+            ).fetchone()
+            return row[0] if row else None
+
+    def get_tldr_cache_keys(self, story_ids: list[int]) -> dict[int, str]:
+        """Bulk lookup of cache_key for stories that have a cached TLDR."""
+        if not story_ids:
+            return {}
+        with self.conn() as conn:
+            placeholders = ",".join("?" for _ in story_ids)
+            rows = conn.execute(
+                f"SELECT story_id, cache_key FROM tldr_cache WHERE story_id IN ({placeholders})",
+                story_ids,
+            ).fetchall()
+            return {row[0]: row[1] for row in rows}
+
     def upsert_tldr_cache(self, story_id: int, cache_key: str, tldr: str) -> None:
         with self.conn() as conn:
             with conn:

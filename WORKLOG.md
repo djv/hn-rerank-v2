@@ -2,6 +2,50 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-02 — Fix orphaned TLDR cache after post-cache enrichment
+
+**Bug.** `_tldr_cache_key` hashes title/self_text/top_comments/article_body.
+When a story's `article_body` is enriched *after* its TLDR was already
+generated and cached, the cache key changes, the exact-key lookup in
+`_handle_flask_tldr_detail` misses, and the server tries to regenerate. If
+quota is exhausted or the LLM 429s, the user sees an error even though a
+perfectly usable (if slightly stale) TLDR already exists in `tldr_cache`.
+The top-per-combo regen prefetch (`_prefetch_tldrs_for_ranked`) never
+catches these because it only ever looks at the top `tldr_prefetch_per_combo`
+stories per source combo — a story ranked below that cutoff stays orphaned
+indefinitely.
+
+**Fix — two-sided.**
+- `Database.get_any_tldr_for_story(story_id)` — cache-key-agnostic lookup.
+  `upsert_tldr_cache` deletes any prior row before inserting, so at most one
+  row exists per story; this is exact for "the" cached TLDR.
+- `_handle_flask_tldr_detail` falls back to this at the three points where a
+  fresh-key miss previously surfaced as an error: quota denied, LLM
+  error/429, and empty LLM result. Response includes `"stale": true`; the
+  frontend already renders any 200 response with a `tldr` field, so no
+  template/JS change was needed. The exact-key regen attempt itself is
+  unchanged — enriched content still gets a fresh TLDR when quota allows.
+- `_prefetch_tldrs_for_ranked` gained `stale_per_run` (config:
+  `tldr_prefetch_stale_per_run`, default 3): after the top-per-combo pass,
+  it bulk-fetches cache keys for the remaining cold-deck stories
+  (`Database.get_tldr_cache_keys`) and regenerates up to `stale_per_run`
+  whose stored key no longer matches current content — bounded LLM cost,
+  eventually heals every stale story regardless of rank. Stories with no
+  cached row at all are left to the existing per-combo path (unchanged
+  scope: stale-only, not missing-only).
+
+**Verification.**
+- Added `test_flask_test_client_tldr_stale_fallback_on_quota_denied` and
+  `test_prefetch_tldrs_for_ranked_regenerates_stale_beyond_top_combo` to
+  `tests/test_server.py`.
+- `uv run pytest tests/ -n 4` = 480 passed, 1 skipped.
+- `uv run ruff check .` = clean.
+- `uv run ty check` = clean.
+- Live service restarted with `systemctl --user restart hn_rewrite.service`;
+  `GET /` returned 200, `OPTIONS /api/tldr-detail` returned 204,
+  `POST /api/tldr-detail` for a missing story returned 404 JSON, and a
+  post-restart journalctl scan showed no errors.
+
 ## 2026-07-02 — Use cachetools for small in-memory caches
 
 **Change.** Replaced three hand-rolled in-process cache implementations with

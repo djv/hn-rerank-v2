@@ -705,19 +705,21 @@ async def _prefetch_tldrs_for_ranked(
     ranked_stories: list[RankedStory],
     db: Database,
     per_combo: int,
+    stale_per_run: int = 0,
 ) -> int:
-    if per_combo <= 0 or not ranked_stories:
+    if (per_combo <= 0 and stale_per_run <= 0) or not ranked_stories:
         return 0
 
     combo_groups: dict[str, list[int]] = {}
-    for rs in ranked_stories:
-        for combo_key in rs.combo_keys.split():
-            if combo_key.endswith("_mixed"):
-                continue
-            group = combo_groups.setdefault(combo_key, [])
-            if len(group) < per_combo:
-                group.append(rs.story.id)
-            break
+    if per_combo > 0:
+        for rs in ranked_stories:
+            for combo_key in rs.combo_keys.split():
+                if combo_key.endswith("_mixed"):
+                    continue
+                group = combo_groups.setdefault(combo_key, [])
+                if len(group) < per_combo:
+                    group.append(rs.story.id)
+                break
 
     seen: set[int] = set()
     story_ids: list[int] = []
@@ -726,6 +728,27 @@ async def _prefetch_tldrs_for_ranked(
             if sid not in seen:
                 seen.add(sid)
                 story_ids.append(sid)
+
+    stale_added = 0
+    if stale_per_run > 0:
+        remaining = [rs for rs in ranked_stories if rs.story.id not in seen]
+        cached_keys = db.get_tldr_cache_keys([rs.story.id for rs in remaining])
+        for rs in remaining:
+            if stale_added >= stale_per_run:
+                break
+            stored_key = cached_keys.get(rs.story.id)
+            if stored_key is None:
+                continue
+            current_key = _tldr_cache_key(
+                title=rs.story.title,
+                self_text=rs.story.self_text or "",
+                top_comments=rs.story.top_comments or "",
+                article_body=rs.story.article_body or "",
+            )
+            if current_key != stored_key:
+                seen.add(rs.story.id)
+                story_ids.append(rs.story.id)
+                stale_added += 1
 
     if not story_ids:
         return 0
@@ -773,10 +796,11 @@ async def _prefetch_tldrs_for_ranked(
 
     if generated:
         logging.info(
-            "tldr_prefetch generated=%s candidates=%s per_combo=%s",
+            "tldr_prefetch generated=%s candidates=%s per_combo=%s stale_added=%s",
             generated,
             len(story_ids),
             per_combo,
+            stale_added,
         )
     return generated
 
@@ -1067,7 +1091,10 @@ class Handler:
             logging.info("rank_perf %s", trace.format_log_fields())
 
             per_combo = cls.config.tldr_prefetch_per_combo
-            if cls.config.article_fetch_max_per_run > 0 or (per_combo > 0 and final):
+            stale_per_run = cls.config.tldr_prefetch_stale_per_run
+            if cls.config.article_fetch_max_per_run > 0 or (
+                (per_combo > 0 or stale_per_run > 0) and final
+            ):
                 t = threading.Thread(
                     target=lambda: cls._warm_background_tasks(
                         final,
@@ -1180,9 +1207,9 @@ class Handler:
                         s.id for s in runnable
                     )
 
-        if per_combo > 0 and final:
-            asyncio.run(_prefetch_tldrs_for_ranked(final, db, per_combo))
-
+        stale_per_run = config.tldr_prefetch_stale_per_run
+        if (per_combo > 0 or stale_per_run > 0) and final:
+            asyncio.run(_prefetch_tldrs_for_ranked(final, db, per_combo, stale_per_run))
 
 def _no_cache_dashboard_response(
     html: bytes, *, user: User | None = None, set_session_cookie: bool = False
@@ -1431,6 +1458,19 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
                 {"error": "Story not found in database"}, status=HTTPStatus.NOT_FOUND
             )
 
+        def _stale_tldr_fallback(reason: str) -> Response | None:
+            stale_tldr = runtime.db.get_any_tldr_for_story(story.id)
+            if not stale_tldr:
+                return None
+            logging.info(
+                "tldr_detail story_id=%s result=stale_fallback reason=%s",
+                story.id,
+                reason,
+            )
+            return _flask_json_response(
+                {"ok": True, "tldr": stale_tldr, "cached": True, "stale": True}
+            )
+
         article_body = story.article_body or None
         cache_key = _tldr_cache_key(
             title=story.title,
@@ -1451,6 +1491,9 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
 
         quota = _acquire_tldr_uncached_quota(runtime, user)
         if not quota.allowed:
+            fallback = _stale_tldr_fallback("quota_denied")
+            if fallback:
+                return fallback
             return _flask_rate_limit_response(
                 "Demo TLDR quota reached. Cached summaries still work; please try a new summary later.",
                 quota.retry_after_seconds,
@@ -1660,6 +1703,9 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             )
         )
         if not tldr:
+            fallback = _stale_tldr_fallback("empty_result")
+            if fallback:
+                return fallback
             return _flask_json_response(
                 {"error": "Failed to generate TLDR"},
                 status=HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -1671,6 +1717,9 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
                 cache_key[:12],
                 tldr,
             )
+            fallback = _stale_tldr_fallback("llm_error")
+            if fallback:
+                return fallback
             if "HTTP 429" in tldr:
                 error = "Rate limit exceeded. Please try again in a moment."
             else:
@@ -1906,11 +1955,12 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
                     )
 
             per_combo = config.tldr_prefetch_per_combo
-            if per_combo > 0 and Handler._cold_stories:
+            stale_per_run = config.tldr_prefetch_stale_per_run
+            if (per_combo > 0 or stale_per_run > 0) and Handler._cold_stories:
                 cold = list(Handler._cold_stories)
                 t = threading.Thread(
                     target=lambda: asyncio.run(
-                        _prefetch_tldrs_for_ranked(cold, db, per_combo)
+                        _prefetch_tldrs_for_ranked(cold, db, per_combo, stale_per_run)
                     ),
                     daemon=True,
                 )
