@@ -1211,6 +1211,7 @@ class Handler:
         if (per_combo > 0 or stale_per_run > 0) and final:
             asyncio.run(_prefetch_tldrs_for_ranked(final, db, per_combo, stale_per_run))
 
+
 def _no_cache_dashboard_response(
     html: bytes, *, user: User | None = None, set_session_cookie: bool = False
 ) -> Response:
@@ -1929,38 +1930,14 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
             Handler._rebuild_cold_deck()
             Handler._bump_all_cached_versions()
 
-            # Proactive article body fetch for cold deck stories
-            if config.article_fetch_max_per_run > 0 and Handler._cold_stories:
-                cold = list(Handler._cold_stories)
-                from pipeline import (
-                    select_article_fetch_candidates,
-                    fetch_and_cache_article_bodies,
-                )
-
-                fetch_targets = select_article_fetch_candidates(
-                    ranked=cold,
-                    dashboard_selected=cold[: config.count],
-                    db=db,
-                    max_per_run=config.article_fetch_max_per_run,
-                    max_age_days=config.article_fetch_max_age_days,
-                )
-                if fetch_targets:
-                    asyncio.run(
-                        fetch_and_cache_article_bodies(
-                            db=db,
-                            embedder=embedder,
-                            stories=fetch_targets,
-                            concurrency=config.article_fetch_concurrency,
-                        )
-                    )
-
-            per_combo = config.tldr_prefetch_per_combo
-            stale_per_run = config.tldr_prefetch_stale_per_run
-            if (per_combo > 0 or stale_per_run > 0) and Handler._cold_stories:
-                cold = list(Handler._cold_stories)
+            if Handler._cold_stories:
                 t = threading.Thread(
-                    target=lambda: asyncio.run(
-                        _prefetch_tldrs_for_ranked(cold, db, per_combo, stale_per_run)
+                    target=lambda: Handler._warm_background_tasks(
+                        list(Handler._cold_stories),
+                        db,
+                        embedder,
+                        config,
+                        per_combo=config.tldr_prefetch_per_combo,
                     ),
                     daemon=True,
                 )

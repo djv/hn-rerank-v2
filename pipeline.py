@@ -12,7 +12,7 @@ from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, replace
-from typing import Any, Callable
+from typing import Any
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -51,11 +51,9 @@ class ModelConfig:
     knn_k: int = 10
     positive_cluster_k: int = 4
     tier2_blend_window: int = 50
-    tier3_threshold: int = 20
     tier3_blend_window: int = 60
     min_up_for_svm: int = 20
     min_down_for_svm: int = 20
-    non_hn_ramp_window: int = 30
     hot_badge_percentile: float = 99.5
     dedup_render_enabled: bool = True
     dedup_embedding_cosine_enabled: bool = True
@@ -189,25 +187,6 @@ TOP_COMMENT_MAX_PER_THREAD = 6
 GOOD_TOPLEVEL_MIN_LEN = 200
 GOOD_TOPLEVEL_MIN_REPLIES = 3
 TOP_COMMENT_TOP_LEVEL_BUDGET = TOP_COMMENT_LIMIT // 3
-# Discovery slot budget. Each non-Hot badge gets per-cohort top-N slots
-# (recent + archive). Hot stays a single global pass; archive never gets
-# Hot because velocity is structurally ~0 for >30-day stories.
-# The rank-based cascade (see rerank_candidates) feeds Hot → Top → Talk in
-# sequence (mutually exclusive) and Novel / Similar / Unsure in parallel
-# (can stack with each other and with the cascade group).
-UNCERTAIN_DISCOVERY_SLOT_LIMIT = 5
-UNCERTAIN_DISCOVERY_RECENT_SLOTS = 5
-UNCERTAIN_DISCOVERY_ARCHIVE_SLOTS = 5
-NOVEL_DISCOVERY_RECENT_SLOTS = 5
-NOVEL_DISCOVERY_ARCHIVE_SLOTS = 5
-SIMILAR_DISCOVERY_RECENT_SLOTS = 5
-SIMILAR_DISCOVERY_ARCHIVE_SLOTS = 5
-DISCUSSION_DISCOVERY_RECENT_SLOTS = 5
-DISCUSSION_DISCOVERY_ARCHIVE_SLOTS = 5
-HIGH_ENGAGEMENT_DISCOVERY_RECENT_SLOTS = 5
-HIGH_ENGAGEMENT_DISCOVERY_ARCHIVE_SLOTS = 5
-NON_HN_DISCOVERY_SLOT_LIMIT = 8
-HOT_DISCOVERY_SLOT_LIMIT = 5
 HOT_MIN_SCORE = 20
 DASHBOARD_QUEUE_SIZE = 12
 PRIMARY_PER_COMBO = 12
@@ -487,7 +466,6 @@ class Config:
     regen_interval_seconds: int = 14400
     regen_initial_delay_seconds: int = 30
     regen_prewarm_top_n: int = 50
-    reddit_prewarm_top_n: int = 20
     prewarm_hn_full: bool = True
     prewarm_reddit_full: bool = True
     prewarm_lesswrong_full: bool = True
@@ -682,47 +660,6 @@ class DashboardCardView:
     time_ago: str
     show_source_badge: bool
     show_score: bool
-
-
-@dataclass(frozen=True)
-class DiscoveryPass:
-    """A single extra-slot discovery pass in the rerank loop.
-
-    Each pass filters `remaining_decorated` by `predicate` (and by `age`
-    when set, see below), sorts the pool by `sort_key` (descending), and
-    takes the top `slot_limit` stories. The matched stories are added to
-    `final` and `remaining_decorated` is pruned.
-
-    `age`: when set to "recent" or "archive", the pass only considers
-    stories in that age bucket. This lets a single badge have two
-    dedicated passes (e.g. novel-recent and novel-archive) so the badge
-    surfaces in both age groups even when one bucket's stories would
-    otherwise dominate. The age filter uses the 30-day cutoff that the
-    badge's threshold also uses, so the two stay in lockstep.
-    """
-
-    name: str
-    attr: str | None
-    predicate: Callable[[RankedStory], bool]
-    sort_key: Callable[[RankedStory], float]
-    slot_limit: int
-    age: str | None = None
-
-
-def _dashboard_primary_limit(config_count: int) -> tuple[int, int]:
-    num_uncertain = UNCERTAIN_DISCOVERY_SLOT_LIMIT if config_count >= 10 else 0
-    primary_limit = min(max(1, config_count), DASHBOARD_QUEUE_SIZE)
-    return primary_limit, num_uncertain
-
-
-def _non_hn_slot_count(
-    n_feedback: int,
-    cap: int = NON_HN_DISCOVERY_SLOT_LIMIT,
-    threshold: int = 20,
-    window: int = 30,
-) -> int:
-    """Number of non-HN discovery slots given a user's feedback count."""
-    return max(0, round(cap * min((n_feedback - threshold) / window, 1.0)))
 
 
 # Text processing helpers
@@ -1061,76 +998,6 @@ async def fetch_story(
     except Exception as e:
         logging.error("Error fetching story %s: %r", sid, e)
         return story if story else None
-
-
-async def fetch_stories_by_id(
-    ids: list[int], db: Database, client: httpx.AsyncClient | None = None
-) -> list[Story]:
-    if not ids:
-        return []
-
-    stories = db.get_stories(ids)
-    valid_stories: list[Story] = []
-    found_ids: set[int] = set()
-    for s in stories:
-        if s.text_content == "":
-            continue
-        valid_stories.append(s)
-        comments_fresh = s.top_comments != "" and (s.comment_count or 0) <= (
-            s.comment_count_at_fetch or 0
-        )
-        if comments_fresh:
-            found_ids.add(s.id)
-    missing_ids = [sid for sid in ids if sid not in found_ids]
-
-    # Corrupted stories first, then cap stale-comment refetches at 100
-    if missing_ids:
-        db_ids = {s.id for s in stories}
-        story_map = {s.id: s for s in stories}
-        corrupted_refetch = [
-            sid
-            for sid in missing_ids
-            if sid in db_ids
-            and story_map[sid].title == ""
-            and story_map[sid].text_content != ""
-        ]
-        stale_refetch = sorted(
-            [
-                sid
-                for sid in missing_ids
-                if sid in db_ids and sid not in corrupted_refetch
-            ],
-            reverse=True,
-        )[:100]
-        new_ids = [sid for sid in missing_ids if sid not in db_ids]
-        missing_ids = corrupted_refetch + stale_refetch + new_ids
-
-    if not missing_ids:
-        return valid_stories
-
-    created_client = False
-    if client is None:
-        client = httpx.AsyncClient(timeout=30.0)
-        created_client = True
-
-    try:
-        sem = asyncio.Semaphore(10)
-
-        async def _fetch_and_cache(sid: int) -> Story | None:
-            async with sem:
-                return await fetch_story(client, sid, db)
-
-        tasks = [_fetch_and_cache(sid) for sid in missing_ids]
-        fetched = await asyncio.gather(*tasks)
-
-        for s in fetched:
-            if s:
-                valid_stories.append(s)
-    finally:
-        if created_client:
-            await client.aclose()
-
-    return valid_stories
 
 
 def prewarm_top_stories(
@@ -3611,14 +3478,11 @@ async def fetch_candidates_only(
 
     if topfeed_factories or prewarm_factories:
         # Post-drain: collect Reddit topfeed stories from cache and
-        # upsert them. The summarizable filter applied inside
-        # `fetch_candidates` did not see these (they were enqueued, not
-        # returned), so we persist them here for the next regen cycle.
+        # extend the candidates list. Persistence was handled by the
+        # Phase 1.5 upsert loop above; re-upsert here is redundant.
         for feed_url in reddit_feed_urls:
             cached = reddit_feed_cache.get(feed_url)
             if cached:
-                for story in cached:
-                    db.upsert_story(story)
                 candidates.extend(cached)
 
         # Post-drain: recompute embeddings for stories whose

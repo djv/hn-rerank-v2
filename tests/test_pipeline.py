@@ -31,7 +31,6 @@ from pipeline import (
     _extract_comments_recursive,
     _select_top_comments,
     _needs_hn_prewarm,
-    _dashboard_primary_limit,
     _reddit_subreddit_from_feed_url,
     _rss_source_name,
     _svm_personalization_features,
@@ -118,18 +117,6 @@ def test_config_load_rejects_unknown_keys(tmp_path, toml_text, error):
 
     with pytest.raises(ValueError, match=error):
         Config.load(str(path))
-
-
-def test_dashboard_primary_limit_is_capped_to_queue_size():
-    assert _dashboard_primary_limit(40)[0] == 12
-    assert _dashboard_primary_limit(9)[0] == 9
-
-
-def test_dashboard_primary_limit_uncertain_threshold_at_10():
-    assert _dashboard_primary_limit(1) == (1, 0)
-    assert _dashboard_primary_limit(9) == (9, 0)
-    assert _dashboard_primary_limit(10) == (10, 5)
-    assert _dashboard_primary_limit(40) == (12, 5)
 
 
 def test_article_fetch_selection_prioritizes_dashboard_and_filters(db):
@@ -1265,13 +1252,6 @@ def test_rerank_candidates_mmr_config_switch(db, embedder, monkeypatch):
         cand_embeddings=embeddings,
     )
     assert called
-
-
-def test_dashboard_primary_limit_reduces_ranked_slice_without_counting_uncertainty():
-    primary_limit, uncertain_slots = _dashboard_primary_limit(40)
-
-    assert primary_limit == 12
-    assert uncertain_slots == 5
 
 
 def test_rank_no_feedback_frontpage_sort(db, embedder):
@@ -3468,71 +3448,6 @@ def test_min_class_blend_mid(db: Database, embedder: Embedder) -> None:
     for r in ranked:
         assert r.prob_up is not None
         assert 0.0 <= r.score <= 1.0
-
-
-# ── Non-HN discovery slot formula tests ──
-
-
-@given(data=st.data())
-@settings(max_examples=50, suppress_health_check=[HealthCheck.function_scoped_fixture])
-def test_non_hn_slot_count_bounds(data):
-    """_non_hn_slot_count always returns 0 <= result <= cap."""
-    from pipeline import _non_hn_slot_count
-
-    n = data.draw(st.integers(0, 200))
-    cap = data.draw(st.integers(1, 16))
-    threshold = data.draw(st.integers(0, 100))
-    window = data.draw(st.integers(1, 100))
-    result = _non_hn_slot_count(n, cap=cap, threshold=threshold, window=window)
-    assert 0 <= result <= cap
-
-
-@given(data=st.data())
-@settings(max_examples=50, suppress_health_check=[HealthCheck.function_scoped_fixture])
-def test_non_hn_slot_count_zero_below_threshold(data):
-    """Result is 0 when n_feedback <= threshold."""
-    from pipeline import _non_hn_slot_count
-
-    n = data.draw(st.integers(0, 200))
-    cap = data.draw(st.integers(1, 16))
-    threshold = data.draw(st.integers(0, 100))
-    window = data.draw(st.integers(1, 100))
-    if n <= threshold:
-        assert _non_hn_slot_count(n, cap=cap, threshold=threshold, window=window) == 0
-
-
-@given(data=st.data())
-@settings(max_examples=50, suppress_health_check=[HealthCheck.function_scoped_fixture])
-def test_non_hn_slot_count_capped_at_full_ramp(data):
-    """Result is cap when n_feedback >= threshold + window."""
-    from pipeline import _non_hn_slot_count
-
-    n = data.draw(st.integers(0, 200))
-    cap = data.draw(st.integers(1, 16))
-    threshold = data.draw(st.integers(0, 100))
-    window = data.draw(st.integers(1, 100))
-    if n >= threshold + window and window > 0:
-        assert _non_hn_slot_count(n, cap=cap, threshold=threshold, window=window) == cap
-
-
-def test_non_hn_slot_count_exact_values():
-    from pipeline import _non_hn_slot_count
-
-    params = (8, 20, 30)  # cap, threshold, window (the production defaults)
-    cases = [
-        (0, 0),
-        (19, 0),
-        (20, 0),
-        (24, 1),
-        (30, 3),
-        (40, 5),
-        (50, 8),
-        (100, 8),
-    ]
-    for n, expected in cases:
-        assert _non_hn_slot_count(n, *params) == expected, (
-            f"n={n}: expected {expected}, got {_non_hn_slot_count(n, *params)}"
-        )
 
 
 # ── Comment selection algorithm tests ──
