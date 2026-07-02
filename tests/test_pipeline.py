@@ -1227,7 +1227,7 @@ def test_rerank_candidates_mmr_config_switch(db, embedder, monkeypatch):
     def fail_mmr(*args, **kwargs):
         raise AssertionError("mmr_filter should not be called when enable_mmr=false")
 
-    monkeypatch.setattr(pipeline, "mmr_filter", fail_mmr)
+    monkeypatch.setattr(pipeline.ranking, "mmr_filter", fail_mmr)
     rerank_candidates(
         db=db,
         config=Config(count=3, model=ModelConfig(enable_mmr=False)),
@@ -1243,7 +1243,7 @@ def test_rerank_candidates_mmr_config_switch(db, embedder, monkeypatch):
         called = True
         return ranked[:limit]
 
-    monkeypatch.setattr(pipeline, "mmr_filter", mark_mmr)
+    monkeypatch.setattr(pipeline.ranking, "mmr_filter", mark_mmr)
     rerank_candidates(
         db=db,
         config=Config(count=3, model=ModelConfig(enable_mmr=True)),
@@ -1781,7 +1781,7 @@ def test_fast_rerank_for_user_includes_old_bq_archive_story(db, monkeypatch):
     def fake_embeddings(stories, embedder, db_inst):
         return np.zeros((len(stories), 384), dtype=np.float32)
 
-    monkeypatch.setattr("pipeline.get_or_compute_embeddings", fake_embeddings)
+    monkeypatch.setattr("pipeline.ranking.get_or_compute_embeddings", fake_embeddings)
     ranked = fast_rerank_for_user(
         db, Config(days=30), cast(Embedder, object()), user.id
     )
@@ -1824,7 +1824,7 @@ def test_fast_rerank_for_user_filters_unsummarizable_stories(db, monkeypatch):
     def fake_embeddings(stories, embedder, db_inst):
         return np.zeros((len(stories), 384), dtype=np.float32)
 
-    monkeypatch.setattr("pipeline.get_or_compute_embeddings", fake_embeddings)
+    monkeypatch.setattr("pipeline.ranking.get_or_compute_embeddings", fake_embeddings)
     ranked = fast_rerank_for_user(
         db, Config(days=30), cast(Embedder, object()), user.id
     )
@@ -2606,7 +2606,7 @@ def test_novel_archive_pass_surfaces_archive_novel(
                 arr[i, 0] = 1.0
         return arr
 
-    monkeypatch.setattr("pipeline.get_or_compute_embeddings", mock_gce)
+    monkeypatch.setattr("pipeline.ranking.get_or_compute_embeddings", mock_gce)
     db.upsert_story(
         Story(id=100, title="fb", url=None, score=10, time=0, text_content="")
     )
@@ -3053,7 +3053,7 @@ def test_cascade_can_stack_with_parallel(
                 arr[i, 200 + s.id] = np.sqrt(0.5)
         return arr
 
-    monkeypatch.setattr("pipeline.get_or_compute_embeddings", mock_gce)
+    monkeypatch.setattr("pipeline.ranking.get_or_compute_embeddings", mock_gce)
 
     now = int(time.time())
     candidates: list[Story] = []
@@ -3142,7 +3142,7 @@ def test_parallel_can_stack_within(
                 arr[i, 200 + s.id] = np.sqrt(0.5)
         return arr
 
-    monkeypatch.setattr("pipeline.get_or_compute_embeddings", mock_gce)
+    monkeypatch.setattr("pipeline.ranking.get_or_compute_embeddings", mock_gce)
 
     from pipeline import PRIMARY_PER_COMBO, DISCOVERY_PER_BADGE
 
@@ -3827,7 +3827,7 @@ def test_candidate_similar_to_neutral_is_not_novel(db, embedder, monkeypatch):
                 arr[i, 2] = 1.0  # neutral
         return arr
 
-    monkeypatch.setattr("pipeline.get_or_compute_embeddings", mock_gce)
+    monkeypatch.setattr("pipeline.ranking.get_or_compute_embeddings", mock_gce)
 
     for sid, action in [(100, "up"), (200, "down"), (300, "neutral")]:
         db.upsert_story(
@@ -3926,7 +3926,7 @@ def test_no_neutral_feedback_uses_up_down_only_for_novel(db, embedder, monkeypat
                 arr[i, 1] = 1.0  # down
         return arr
 
-    monkeypatch.setattr("pipeline.get_or_compute_embeddings", mock_gce)
+    monkeypatch.setattr("pipeline.ranking.get_or_compute_embeddings", mock_gce)
 
     for sid, action in [(100, "up"), (200, "down")]:
         db.upsert_story(
@@ -4035,7 +4035,7 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
                 arr[i, 0] = 1.0
         return arr
 
-    monkeypatch.setattr("pipeline.get_or_compute_embeddings", mock_gce)
+    monkeypatch.setattr("pipeline.ranking.get_or_compute_embeddings", mock_gce)
     db.upsert_story(
         Story(id=100, title="fb", url=None, score=10, time=0, text_content="")
     )
@@ -5532,7 +5532,7 @@ def test_rank_trace_reports_svm_cache_miss_then_hit(
             rows.append(vec)
         return np.array(rows, dtype=np.float32)
 
-    monkeypatch.setattr("pipeline.get_or_compute_embeddings", fake_embeddings)
+    monkeypatch.setattr("pipeline.ranking.get_or_compute_embeddings", fake_embeddings)
     topk_calls = 0
     real_topk_mean = pipeline._topk_mean
 
@@ -5541,15 +5541,15 @@ def test_rank_trace_reports_svm_cache_miss_then_hit(
         topk_calls += 1
         return real_topk_mean(values, k)
 
-    monkeypatch.setattr("pipeline._topk_mean", counting_topk_mean)
+    monkeypatch.setattr("pipeline.ranking._topk_mean", counting_topk_mean)
     seen_svc_cache_sizes: list[int | None] = []
-    real_svc = pipeline.SVC
+    real_svc = pipeline.ranking.SVC
 
     def tracking_svc(*args, **kwargs):
         seen_svc_cache_sizes.append(kwargs.get("cache_size"))
         return real_svc(*args, **kwargs)
 
-    monkeypatch.setattr(pipeline, "SVC", tracking_svc)
+    monkeypatch.setattr(pipeline.ranking, "SVC", tracking_svc)
     candidate_embeddings = fake_embeddings(candidates, embedder, db)
     config = Config()
 
@@ -5648,7 +5648,7 @@ def test_two_leg_recent_preserves_hn_and_rss_legs(
     db.upsert_story(hn_story)
     db.upsert_story(rss_story)
     monkeypatch.setattr(
-        "pipeline.get_or_compute_embeddings",
+        "pipeline.ranking.get_or_compute_embeddings",
         lambda stories, e, d: np.zeros((len(stories), 384), dtype=np.float32),
     )
 
