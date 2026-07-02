@@ -1608,6 +1608,17 @@ def test_flask_test_client_user_requires_session(app_env) -> None:
     assert resp.get_json() == {"error": "No session"}
 
 
+def test_flask_test_client_user_returns_session(app_env: Any) -> None:
+    _, _, _, handler, user = app_env
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+
+    resp = client.get("/api/user")
+
+    assert resp.status_code == 200
+    assert resp.get_json() == {"user_id": user.id, "token": user.token}
+
+
 def test_flask_test_client_options_preserves_cors(app_env) -> None:
     _, _, _, handler, _ = app_env
     client = create_app(handler).test_client()
@@ -1635,6 +1646,67 @@ def test_flask_test_client_first_visit_sets_cookie(app_env) -> None:
     assert after == before + 1
 
 
+def test_flask_test_client_first_visit_limit_sets_retry_after(
+    test_env: Any,
+) -> None:
+    _, _, _, handler, _ = test_env
+    handler.config = replace(
+        handler.config,
+        session_create_per_ip_limit=1,
+        session_create_per_ip_window_seconds=3600,
+    )
+    client = create_app(handler).test_client(use_cookies=False)
+    headers = {"X-Forwarded-For": "203.0.113.30, 127.0.0.1"}
+
+    first = client.get("/", headers=headers)
+    second = client.get("/", headers=headers)
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+    assert second.headers["Retry-After"] == "3600"
+    assert second.get_json() == {
+        "error": "Too many new demo sessions from this address. Please try again later.",
+        "retry_after": 3600,
+    }
+
+
+def test_flask_test_client_profile_link_sets_existing_session(
+    app_env: Any,
+) -> None:
+    _, _, _, handler, user = app_env
+    client = create_app(handler).test_client()
+
+    resp = client.get(f"/u/{user.token}")
+
+    assert resp.status_code == 302
+    assert resp.headers["Location"] == "../"
+    assert resp.headers.get("Set-Cookie", "").startswith(f"hn_token={user.token}")
+
+
+def test_flask_test_client_profile_link_limit_uses_forwarded_for(
+    test_env: Any,
+) -> None:
+    _, _, _, handler, user = test_env
+    handler.config = replace(
+        handler.config,
+        profile_link_per_ip_limit=1,
+        profile_link_per_ip_window_seconds=3600,
+    )
+    client = create_app(handler).test_client()
+    headers = {"X-Forwarded-For": "203.0.113.31, 127.0.0.1"}
+
+    first = client.get(f"/u/{user.token}", headers=headers)
+    second = client.get(f"/u/{user.token}", headers=headers)
+
+    assert first.status_code == 302
+    assert second.status_code == 429
+    assert second.headers["Retry-After"] == "3600"
+    assert second.get_json() == {
+        "error": "Too many profile-link attempts. Please try again later.",
+        "retry_after": 3600,
+    }
+
+
 def test_flask_test_client_ranking_ready_requires_session(app_env: Any) -> None:
     _, _, _, handler, _ = app_env
     client = create_app(handler).test_client()
@@ -1654,6 +1726,35 @@ def test_flask_test_client_ranking_ready_validates_version(app_env: Any) -> None
 
     assert resp.status_code == 400
     assert resp.get_json() == {"error": "Invalid version"}
+
+
+def test_flask_test_client_ranking_ready_reports_missing_cache(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, _, handler, user = test_env
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+    calls: list[tuple[int, int]] = []
+
+    def fake_trigger_warm(cls: type[Handler], warm_user: Any, version: int) -> None:
+        calls.append((warm_user.id, version))
+
+    monkeypatch.setattr(handler, "_trigger_warm", classmethod(fake_trigger_warm))
+    version = handler._invalidate_dashboard_cache(user.id)
+
+    resp = client.get(f"/api/ranking-ready?min_version={version}&target_version=3")
+
+    assert resp.status_code == 200
+    assert resp.get_json() == {
+        "ok": True,
+        "ready": False,
+        "ready_version": None,
+        "min_version": version,
+        "target_version": 3,
+        "current_version": version,
+        "cached_version": None,
+    }
+    assert calls == [(user.id, version)]
 
 
 def test_flask_test_client_feedback_rejects_cross_site(app_env: Any) -> None:
@@ -1684,6 +1785,87 @@ def test_flask_test_client_feedback_requires_session(app_env: Any) -> None:
     assert resp.get_json() == {"error": "No session"}
 
 
+def test_flask_test_client_feedback_writes_and_queues_refresh(test_env: Any) -> None:
+    _, db, regen_event, handler, user = test_env
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+    db.upsert_story(
+        Story(
+            id=1710,
+            title="Flask feedback story",
+            url="https://example.com/flask-feedback",
+            score=100,
+            time=1600000000,
+            text_content="Feedback body text",
+            source="hn",
+        )
+    )
+    regen_event.clear()
+
+    resp = client.post("/api/feedback", json={"story_id": 1710, "action": "up"})
+
+    assert resp.status_code == 200
+    assert resp.get_json() == {
+        "ok": True,
+        "ranking_refresh_queued": True,
+        "target_version": 1,
+    }
+    records = db.get_all_feedback(user.id)
+    assert [(record.story_id, record.action) for record in records] == [(1710, "up")]
+    assert handler._dashboard_version(user.id) == 1
+    assert regen_event.is_set()
+
+
+def test_flask_test_client_feedback_rejects_invalid_payload(test_env: Any) -> None:
+    _, db, regen_event, handler, user = test_env
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+    regen_event.clear()
+
+    resp = client.post("/api/feedback", json={"story_id": "1711", "action": "up"})
+
+    assert resp.status_code == 400
+    assert resp.get_json() == {"error": "Invalid feedback"}
+    assert db.get_all_feedback(user.id) == []
+    assert handler._dashboard_version(user.id) == 0
+    assert not regen_event.is_set()
+
+
+def test_flask_test_client_feedback_limit_sets_retry_after(test_env: Any) -> None:
+    _, db, regen_event, handler, user = test_env
+    handler.config = replace(
+        handler.config,
+        feedback_per_user_limit=1,
+        feedback_per_user_window_seconds=600,
+        feedback_global_limit=100,
+    )
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+    for story_id in (1712, 1713):
+        db.upsert_story(
+            Story(
+                id=story_id,
+                title=f"Flask limited feedback story {story_id}",
+                url=f"https://example.com/flask-limited-feedback-{story_id}",
+                score=100,
+                time=1600000000,
+                text_content="Feedback body text",
+                source="hn",
+            )
+        )
+    regen_event.clear()
+
+    first = client.post("/api/feedback", json={"story_id": 1712, "action": "up"})
+    second = client.post("/api/feedback", json={"story_id": 1713, "action": "down"})
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+    assert int(second.headers["Retry-After"]) > 0
+    assert second.get_json()["retry_after"] == int(second.headers["Retry-After"])
+    records = db.get_all_feedback(user.id)
+    assert [(record.story_id, record.action) for record in records] == [(1712, "up")]
+
+
 def test_flask_test_client_tldr_missing_story(app_env: Any) -> None:
     _, _, _, handler, _ = app_env
     client = create_app(handler).test_client()
@@ -1692,6 +1874,148 @@ def test_flask_test_client_tldr_missing_story(app_env: Any) -> None:
 
     assert resp.status_code == 404
     assert resp.get_json() == {"error": "Story not found in database"}
+
+
+def test_flask_test_client_tldr_rejects_cross_site_before_handler(
+    app_env: Any,
+) -> None:
+    _, _, _, handler, _ = app_env
+    client = create_app(handler).test_client()
+
+    resp = client.post(
+        "/api/tldr-detail",
+        json={"story_id": 999999},
+        headers={"Sec-Fetch-Site": "cross-site"},
+    )
+
+    assert resp.status_code == 403
+    assert resp.get_json() == {"error": "Cross-site POSTs are not allowed"}
+
+
+def test_flask_test_client_tldr_cached_bypasses_uncached_quota(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import server
+
+    _, db, _, handler, user = test_env
+    handler.config = replace(
+        handler.config,
+        tldr_uncached_per_user_limit=1,
+        tldr_uncached_per_user_window_seconds=3600,
+        tldr_uncached_global_limit=100,
+    )
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+    uncached_story = Story(
+        id=1714,
+        title="Flask uncached quota consumer",
+        url="https://example.com/flask-uncached-quota",
+        score=10,
+        time=1600000000,
+        text_content="Flask uncached quota consumer. Body.",
+        source="hn",
+        comment_count=0,
+        self_text="",
+        top_comments="",
+        article_body="Body.",
+    )
+    cached_story = Story(
+        id=1715,
+        title="Flask cached quota bypass",
+        url="https://example.com/flask-cached-quota",
+        score=10,
+        time=1600000000,
+        text_content="Flask cached quota bypass. Cached body.",
+        source="hn",
+        comment_count=0,
+        self_text="",
+        top_comments="",
+        article_body="Cached body.",
+    )
+    db.upsert_story(uncached_story)
+    db.upsert_story(cached_story)
+    cached_key = server._tldr_cache_key(
+        title=cached_story.title,
+        self_text="",
+        top_comments="",
+        article_body="Cached body.",
+    )
+    db.upsert_tldr_cache(cached_story.id, cached_key, "Already cached")
+
+    calls = 0
+
+    async def mock_generate_detailed_tldr(
+        title: str, self_text: str, top_comments: str, article_body: str
+    ) -> str:
+        nonlocal calls
+        calls += 1
+        return f"generated-{calls}: {title}"
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    first = client.post("/api/tldr-detail", json={"story_id": uncached_story.id})
+    second = client.post("/api/tldr-detail", json={"story_id": cached_story.id})
+
+    assert first.status_code == 200
+    assert first.get_json()["cached"] is False
+    assert second.status_code == 200
+    assert second.get_json() == {
+        "ok": True,
+        "tldr": "Already cached",
+        "cached": True,
+    }
+    assert calls == 1
+
+
+def test_flask_test_client_tldr_uncached_limit_sets_retry_after(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import server
+
+    _, db, _, handler, user = test_env
+    handler.config = replace(
+        handler.config,
+        tldr_uncached_per_user_limit=1,
+        tldr_uncached_per_user_window_seconds=3600,
+        tldr_uncached_global_limit=100,
+    )
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+    for story_id in (1716, 1717):
+        db.upsert_story(
+            Story(
+                id=story_id,
+                title=f"Flask per-user TLDR story {story_id}",
+                url=f"https://example.com/flask-per-user-tldr-{story_id}",
+                score=10,
+                time=1600000000,
+                text_content="Story body.",
+                source="hn",
+                comment_count=0,
+                self_text="",
+                top_comments="",
+                article_body="Story body.",
+            )
+        )
+
+    calls: list[str] = []
+
+    async def mock_generate_detailed_tldr(
+        title: str, self_text: str, top_comments: str, article_body: str
+    ) -> str:
+        calls.append(title)
+        return f"TLDR: {title}"
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    first = client.post("/api/tldr-detail", json={"story_id": 1716})
+    second = client.post("/api/tldr-detail", json={"story_id": 1717})
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+    assert int(second.headers["Retry-After"]) > 0
+    assert second.get_json()["retry_after"] == int(second.headers["Retry-After"])
+    assert calls == ["Flask per-user TLDR story 1716"]
 
 
 def test_normalize_tldr_markdown_repairs_inline_bullets():

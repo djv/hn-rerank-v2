@@ -2,6 +2,108 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-02 — Move TLDR detail fully into Flask
+
+**Change.** Finished the Flask routing migration by removing the final
+request-adapter path.
+
+- `/api/tldr-detail` now reads cookies/body, enforces uncached TLDR quota,
+  performs cache checks, enriches story context, calls the LLM, and returns
+  JSON directly in the Flask route path.
+- The transitional `FlaskRequestContext` bridge and legacy handler
+  request/response shim methods were removed.
+- TLDR quota keys, cache lookup/write ordering, lazy HN/Reddit/LessWrong
+  enrichment, article fetch failure recording, embedding refresh, response
+  JSON, CORS/options, and cross-site rejection behavior are preserved.
+- Flask `app.test_client()` coverage now includes cached TLDR quota bypass and
+  uncached TLDR rate-limit headers.
+
+**Verification.**
+- `uv run pytest tests/test_server.py -q` = 125 passed.
+- `uv run pytest tests/ -n 4` = 478 passed, 1 skipped.
+- `uv run ruff check .` = clean.
+- `uv run ty check` = clean.
+- `git diff --check` = clean.
+- Live service restarted with `systemctl --user restart hn_rewrite.service`;
+  cookie-preserving smoke checks returned `GET /` 200 with `Set-Cookie`,
+  `GET /api/user` 200, `POST /api/tldr-detail` 404 JSON for a missing story,
+  and `OPTIONS /api/tldr-detail` 204. Recent service logs show those request
+  paths succeeding after restart.
+
+---
+
+## 2026-07-02 — Move session and dashboard routes fully into Flask
+
+**Change.** Continued shrinking the transitional request bridge by moving the
+remaining simple GET routes into direct Flask code.
+
+- `/`, `/index.html`, `/api/user`, and `/u/<token>` now use Flask cookies,
+  headers, redirects, and JSON responses directly instead of instantiating the
+  request adapter.
+- Session-creation and profile-link throttles now use Flask-native client-IP
+  extraction, preserving the leftmost `X-Forwarded-For` behavior and the
+  existing `Retry-After` response shape.
+- The `Handler` compatibility methods for session creation and profile-link
+  quotas were removed. The `FlaskRequestContext` bridge remains only for
+  `/api/tldr-detail`.
+- Flask `app.test_client()` coverage now includes authenticated `/api/user`,
+  first-visit session throttling, profile-link cookie import, and profile-link
+  throttling.
+
+**Semantics preserved.** Dashboard first-visit behavior, profile-link imports,
+session cookies, no-cache dashboard responses, public-demo throttles, feedback,
+ranking-ready, and TLDR detail behavior are unchanged.
+
+**Verification.**
+- `uv run pytest tests/test_server.py -q` = 123 passed.
+- `uv run pytest tests/ -n 4` = 476 passed, 1 skipped.
+- `uv run ruff check .` = clean.
+- `uv run ty check` = clean.
+- `git diff --check` = clean.
+- Live service restarted with `systemctl --user restart hn_rewrite.service`;
+  cookie-preserving smoke checks returned `GET /` 200 with `Set-Cookie`,
+  `GET /api/user` 200, `GET /api/ranking-ready?version=0` 200, and
+  `OPTIONS /api/feedback` 204. Recent service logs show those request paths
+  succeeding after restart.
+
+---
+
+## 2026-07-02 — Move feedback and ranking-ready fully into Flask
+
+**Change.** Shrank the transitional Flask bridge by moving the simple API
+routes into direct Flask request/response code.
+
+- `/api/feedback` now reads cookies/body, validates JSON, enforces same-origin
+  POST checks, applies feedback quotas, writes feedback, invalidates dashboard
+  cache, schedules warm renders, and returns JSON directly in the Flask route
+  path.
+- `/api/ranking-ready` now parses `request.args` directly while preserving the
+  `version` compatibility alias, `min_version`, `target_version`, and warm-nudge
+  semantics.
+- The small `FlaskRequestContext` bridge now remains only for
+  `/api/tldr-detail`, whose enrichment/cache/LLM flow is intentionally left for
+  a later lower-risk extraction pass.
+- Flask `app.test_client()` coverage now includes feedback success, invalid
+  feedback, feedback rate limit headers, ranking-ready missing-cache shape, and
+  cross-site TLDR rejection before the bridged handler runs.
+
+**Semantics preserved.** CORS/options, feedback response shapes, ranking-ready
+response shapes, cache versioning, warm scheduling, and TLDR behavior are
+unchanged.
+
+**Verification.**
+- `uv run pytest tests/test_server.py -q` = 119 passed.
+- `uv run pytest tests/ -n 4` = 472 passed, 1 skipped.
+- `uv run ruff check .` = clean.
+- `uv run ty check` = clean.
+- `git diff --check` = clean.
+- Live service restarted with `systemctl --user restart hn_rewrite.service`;
+  smoke checks returned `GET /api/user` 401, `OPTIONS /api/feedback` 204, and
+  `GET /api/ranking-ready?version=0` 401 with no post-restart request-path
+  errors in `journalctl --user -u hn_rewrite.service`.
+
+---
+
 ## 2026-07-02 — Collapse eval scripts; remove legacy_features and archived Algolia
 
 **Goal**: Reduce eval sprawl (3 scripts → 1) and remove dead code.

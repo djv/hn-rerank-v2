@@ -15,18 +15,18 @@ import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any
-from urllib.parse import parse_qs, urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse
 
 import feedparser
 import justext
 import trafilatura
 from bs4 import BeautifulSoup
 from flask import Flask, Response, jsonify, redirect, request
+from flask.typing import ResponseReturnValue
 import httpx
 
 from database import Database, Story, User
@@ -792,9 +792,6 @@ class Handler:
     db: Database
     embedder: Embedder
     regen_event: threading.Event
-    headers: Mapping[str, str]
-    path: str
-    client_address: tuple[str, int]
     _dashboard_cache: dict[str, tuple[bytes, float, int]] = {}
     _dashboard_versions: dict[int, int] = {}
     _dashboard_versions_guard = threading.Lock()
@@ -811,147 +808,9 @@ class Handler:
     _WARM_DEBOUNCE_S: float = 1.0
     _public_demo_limiter = FixedWindowLimiter()
 
-    def _request_body(self) -> bytes:
-        raise NotImplementedError
-
-    def _json_response(
-        self, data: dict, status: int = 200, headers: dict[str, str] | None = None
-    ) -> None:
-        raise NotImplementedError
-
-    def _error_response(self, code: int, message: str | None = None) -> None:
-        raise NotImplementedError
-
     @classmethod
     def reset_public_demo_limiter(cls) -> None:
         cls._public_demo_limiter = FixedWindowLimiter()
-
-    def _get_user(self) -> User | None:
-        """Extract user from cookie token."""
-        cookie_header = self.headers.get("Cookie", "")
-        for part in cookie_header.split(";"):
-            kv = part.strip().split("=", 1)
-            if len(kv) == 2 and kv[0] == "hn_token":
-                return self.db.get_user_by_token(kv[1].strip())
-        return None
-
-    def _client_ip(self) -> str:
-        forwarded_for = self.headers.get("X-Forwarded-For", "")
-        if forwarded_for:
-            first = forwarded_for.split(",", 1)[0].strip()
-            if first:
-                return first
-        host, _port = self.client_address
-        return host
-
-    def _session_limit_key(self, user: User | None) -> str:
-        if user is not None:
-            return f"user:{user.id}"
-        return f"addr:{self._client_ip()}"
-
-    def _request_origin(self) -> tuple[str, str] | None:
-        host = self.headers.get("X-Forwarded-Host") or self.headers.get("Host")
-        if not host:
-            return None
-        proto = self.headers.get("X-Forwarded-Proto") or "http"
-        if "," in proto:
-            proto = proto.split(",", 1)[0].strip()
-        return proto, host
-
-    def _is_same_origin_post(self) -> bool:
-        fetch_site = self.headers.get("Sec-Fetch-Site")
-        if fetch_site == "cross-site":
-            return False
-
-        origin = self.headers.get("Origin")
-        if not origin:
-            return True
-        parsed = urlparse(origin)
-        if not parsed.scheme or not parsed.netloc:
-            return False
-        request_origin = self._request_origin()
-        if request_origin is None:
-            return False
-        request_scheme, request_host = request_origin
-        # When behind a reverse proxy (X-Forwarded-Host is present),
-        # TLS was terminated upstream so the scheme observed at the
-        # origin can differ from the browser's view.  Only compare
-        # hostname in that case.
-        if self.headers.get("X-Forwarded-Host"):
-            return parsed.netloc == request_host
-        return parsed.scheme == request_scheme and parsed.netloc == request_host
-
-    def _reject_cross_site_post(self) -> bool:
-        if self._is_same_origin_post():
-            return False
-        self._json_response({"error": "Cross-site POSTs are not allowed"}, status=403)
-        return True
-
-    def _rate_limit_response(self, message: str, retry_after_seconds: int) -> None:
-        self._json_response(
-            {"error": message, "retry_after": retry_after_seconds},
-            status=HTTPStatus.TOO_MANY_REQUESTS,
-            headers={"Retry-After": str(retry_after_seconds)},
-        )
-
-    def _acquire_tldr_uncached_quota(self, user: User | None) -> RateLimitResult:
-        session_key = self._session_limit_key(user)
-        config = type(self).config
-        return type(self)._public_demo_limiter.try_acquire(
-            (
-                (
-                    f"tldr:user:{session_key}",
-                    config.tldr_uncached_per_user_limit,
-                    config.tldr_uncached_per_user_window_seconds,
-                ),
-                (
-                    "tldr:global",
-                    config.tldr_uncached_global_limit,
-                    config.tldr_uncached_global_window_seconds,
-                ),
-            )
-        )
-
-    def _acquire_feedback_quota(self, user: User) -> RateLimitResult:
-        config = type(self).config
-        return type(self)._public_demo_limiter.try_acquire(
-            (
-                (
-                    f"feedback:user:{user.id}",
-                    config.feedback_per_user_limit,
-                    config.feedback_per_user_window_seconds,
-                ),
-                (
-                    "feedback:global",
-                    config.feedback_global_limit,
-                    config.feedback_global_window_seconds,
-                ),
-            )
-        )
-
-    def _acquire_session_create_quota(self) -> RateLimitResult:
-        config = type(self).config
-        return type(self)._public_demo_limiter.try_acquire(
-            (
-                (
-                    f"session-create:ip:{self._client_ip()}",
-                    config.session_create_per_ip_limit,
-                    config.session_create_per_ip_window_seconds,
-                ),
-            )
-        )
-
-    def _acquire_profile_link_quota(self) -> RateLimitResult:
-        config = type(self).config
-        return type(self)._public_demo_limiter.try_acquire(
-            (
-                (
-                    f"profile-link:ip:{self._client_ip()}",
-                    config.profile_link_per_ip_limit,
-                    config.profile_link_per_ip_window_seconds,
-                ),
-            )
-        )
 
     @classmethod
     def _render_dashboard_for_user(
@@ -1330,452 +1189,6 @@ class Handler:
         if per_combo > 0 and final:
             asyncio.run(_prefetch_tldrs_for_ranked(final, db, per_combo))
 
-    def _handle_feedback(self) -> None:
-        user = self._get_user()
-        if not user:
-            self._json_response({"error": "No session"}, status=401)
-            return
-
-        try:
-            body = self._request_body()
-            if len(body) > MAX_CONTENT_LENGTH:
-                self._error_response(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
-                return
-            data = json.loads(body)
-
-            story_id = data.get("story_id")
-            action = data.get("action")
-            if (
-                not isinstance(story_id, int)
-                or isinstance(story_id, bool)
-                or action not in {"up", "neutral", "down", "clear"}
-            ):
-                self._json_response({"error": "Invalid feedback"}, status=400)
-                return
-
-            quota = self._acquire_feedback_quota(user)
-            if not quota.allowed:
-                self._rate_limit_response(
-                    "Too many votes from this demo session. Please try again later.",
-                    quota.retry_after_seconds,
-                )
-                return
-
-            if action == "clear":
-                self.db.delete_feedback(user.id, story_id)
-            else:
-                self.db.upsert_feedback(
-                    user.id,
-                    story_id,
-                    action,
-                )
-
-            # Invalidate the user's dashboard cache and kick a warm for
-            # the new version on every vote, so a subsequent refill cannot
-            # serve an HTML deck that includes a story the user just voted
-            # on. The previous "defer until queue low / every 5 votes"
-            # gating left the cached HTML stale for up to ~9s per burst;
-            # the SWR stale-hit path then re-injected already-voted
-            # stories via refillQueue (the bug observed on 2026-06-28).
-            # Bursty votes coalesce into one warm worker per user. The
-            # worker keeps the newest requested version and stale guards
-            # prevent obsolete ranks from landing in cache.
-            version = self._invalidate_dashboard_cache(user.id)
-            self._trigger_warm(user, version)
-
-            # Also trigger background regen for candidate updates
-            self.regen_event.set()
-
-            self._json_response(
-                {
-                    "ok": True,
-                    "ranking_refresh_queued": True,
-                    "target_version": version,
-                }
-            )
-        except Exception as e:
-            logging.error("Error handling feedback: %r", e)
-            self._json_response({"error": "Internal error"}, status=400)
-
-    def _handle_ranking_ready(self) -> None:
-        user = self._get_user()
-        if not user:
-            self._json_response({"error": "No session"}, status=401)
-            return
-
-        query = parse_qs(urlparse(self.path).query)
-        raw_min_versions = query.get("min_version", [])
-        raw_legacy_versions = query.get("version", [])
-        if raw_min_versions and raw_legacy_versions:
-            self._json_response({"error": "Invalid version"}, status=400)
-            return
-        raw_versions = raw_min_versions or raw_legacy_versions
-        if len(raw_versions) != 1:
-            self._json_response({"error": "Invalid version"}, status=400)
-            return
-
-        try:
-            min_version = int(raw_versions[0])
-        except ValueError:
-            self._json_response({"error": "Invalid version"}, status=400)
-            return
-        if min_version < 0:
-            self._json_response({"error": "Invalid version"}, status=400)
-            return
-
-        raw_target_versions = query.get("target_version", [])
-        if len(raw_target_versions) > 1:
-            self._json_response({"error": "Invalid version"}, status=400)
-            return
-        try:
-            target_version = (
-                int(raw_target_versions[0]) if raw_target_versions else min_version
-            )
-        except ValueError:
-            self._json_response({"error": "Invalid version"}, status=400)
-            return
-        if target_version < 0:
-            self._json_response({"error": "Invalid version"}, status=400)
-            return
-
-        current_version = self._dashboard_version(user.id)
-        cached = self._dashboard_cache.get(f"dashboard_{user.id}")
-        cached_version = cached[2] if cached is not None else None
-        ready = cached is not None and cached[2] >= min_version
-        ready_version = cached_version if ready else None
-        warm_version = current_version
-        if (cached_version is None or cached_version < warm_version) and (
-            current_version >= min_version
-        ):
-            self._trigger_warm(user, warm_version)
-
-        self._json_response(
-            {
-                "ok": True,
-                "ready": ready,
-                "ready_version": ready_version,
-                "min_version": min_version,
-                "target_version": target_version,
-                "current_version": current_version,
-                "cached_version": cached_version,
-            }
-        )
-
-    def _handle_tldr_detail(self) -> None:
-        try:
-            user = self._get_user()
-            body = self._request_body()
-            if len(body) > MAX_CONTENT_LENGTH:
-                self._error_response(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
-                return
-            data = json.loads(body)
-
-            story_id = data["story_id"]
-
-            story = self.db.get_story(story_id)
-            if not story:
-                self._json_response(
-                    {"error": "Story not found in database"}, status=404
-                )
-                return
-
-            article_body = story.article_body or None
-            cache_key = _tldr_cache_key(
-                title=story.title,
-                self_text=story.self_text or "",
-                top_comments=story.top_comments or "",
-                article_body=article_body or "",
-            )
-            cached_tldr = self.db.get_tldr_cache(story.id, cache_key)
-            if cached_tldr:
-                logging.info(
-                    "tldr_detail story_id=%s result=cache_hit cache_key=%s",
-                    story.id,
-                    cache_key[:12],
-                )
-                self._json_response({"ok": True, "tldr": cached_tldr, "cached": True})
-                return
-
-            quota = self._acquire_tldr_uncached_quota(user)
-            if not quota.allowed:
-                self._rate_limit_response(
-                    "Demo TLDR quota reached. Cached summaries still work; please try a new summary later.",
-                    quota.retry_after_seconds,
-                )
-                return
-
-            # 1. If HN story has comments but top_comments is empty, dynamically fetch them
-            if (
-                is_hn_source(story.source)
-                and not story.top_comments
-                and (story.comment_count or 0) > 0
-            ):
-                try:
-                    from pipeline import fetch_story
-
-                    async def do_fetch():
-                        async with httpx.AsyncClient(timeout=15.0) as client:
-                            return await fetch_story(client, story_id, self.db)
-
-                    updated = asyncio.run(do_fetch())
-                    if updated:
-                        story = updated
-                except Exception as e:
-                    logging.error(f"Failed to dynamically fetch comments for TLDR: {e}")
-
-            article_body = story.article_body or article_body
-
-            if (
-                story.source.startswith("rss_reddit_")
-                and story.url
-                and (not story.self_text or not story.top_comments)
-            ):
-                reddit_context = asyncio.run(_fetch_reddit_rss_context(story.url))
-                if reddit_context and (
-                    reddit_context.self_text or reddit_context.top_comments
-                ):
-                    from pipeline import compose_story_text
-
-                    self_text = (
-                        reddit_context.self_text
-                        if len(reddit_context.self_text) > len(story.self_text)
-                        else story.self_text
-                    )
-                    top_comments = (
-                        reddit_context.top_comments
-                        if len(reddit_context.top_comments) > len(story.top_comments)
-                        else story.top_comments
-                    )
-                    new_text = compose_story_text(
-                        story.title,
-                        self_text,
-                        top_comments,
-                        article_body or "",
-                    )
-                    story = replace(
-                        story,
-                        self_text=self_text,
-                        top_comments=top_comments,
-                        text_content=new_text,
-                        discussion_url=story.discussion_url or story.url,
-                        comment_count=story.comment_count
-                        or reddit_context.comment_count
-                        or None,
-                        comment_count_at_fetch=max(
-                            story.comment_count_at_fetch,
-                            reddit_context.comment_count,
-                        ),
-                    )
-                    self.db.upsert_story(story)
-
-            if (
-                story.source == "rss_lesswrong_com"
-                and story.url
-                and (not story.self_text or not story.top_comments)
-            ):
-                post_id = _extract_lesswrong_post_id(story.url)
-                if post_id:
-                    lw_context = asyncio.run(_fetch_lesswrong_context(post_id))
-                    if lw_context and (lw_context.self_text or lw_context.top_comments):
-                        from pipeline import compose_story_text
-
-                        self_text = (
-                            lw_context.self_text
-                            if len(lw_context.self_text) > len(story.self_text)
-                            else story.self_text
-                        )
-                        top_comments = (
-                            lw_context.top_comments
-                            if len(lw_context.top_comments) > len(story.top_comments)
-                            else story.top_comments
-                        )
-                        new_text = compose_story_text(
-                            story.title,
-                            self_text,
-                            top_comments,
-                            article_body or "",
-                        )
-                        story = replace(
-                            story,
-                            self_text=self_text,
-                            top_comments=top_comments,
-                            text_content=new_text,
-                            discussion_url=story.discussion_url or story.url,
-                            comment_count=(
-                                story.comment_count or lw_context.comment_count or None
-                            ),
-                            comment_count_at_fetch=max(
-                                story.comment_count_at_fetch,
-                                lw_context.comment_count,
-                            ),
-                            score=max(story.score, lw_context.score),
-                        )
-                        self.db.upsert_story(story)
-
-            if (
-                article_body is None
-                and story.url
-                and not story.source.startswith("rss_reddit_")
-                and not story.source == "rss_lesswrong_com"
-                and len(story.self_text) < 500
-            ):
-                from pipeline import _is_fetchable_article_url
-
-                if _is_fetchable_article_url(story.url):
-                    import hashlib
-                    from pipeline import (
-                        compose_story_text,
-                        _article_failure_retry_time,
-                    )
-
-                    result = asyncio.run(_fetch_article_body_with_result(story.url))
-                    if result.body:
-                        article_body = result.body[:ARTICLE_BODY_CHAR_LIMIT]
-                        new_text = compose_story_text(
-                            story.title,
-                            story.self_text,
-                            story.top_comments,
-                            article_body,
-                        )
-                        updated_story = replace(
-                            story,
-                            article_body=article_body,
-                            text_content=new_text,
-                        )
-                        self.db.upsert_story(updated_story)
-                        self.db.clear_article_fetch_failure(story.id)
-
-                        embedder = type(self).embedder
-                        if embedder is not None:
-                            model_version = "all-MiniLM-L6-v2|mean|norm|256"
-                            new_vec = embedder.encode([new_text])[0]
-                            new_hash = hashlib.sha256(
-                                new_text.encode("utf-8")
-                            ).hexdigest()
-                            self.db.upsert_embedding(
-                                story.id, model_version, new_hash, new_vec
-                            )
-
-                        story = updated_story
-                    else:
-                        now_ts = time.time()
-                        previous = self.db.get_article_fetch_failure(story.id)
-                        previous_count = (
-                            int(previous["failure_count"]) if previous else 0
-                        )
-                        failure_count = previous_count + 1
-                        permanent = (
-                            result.permanent
-                            or (
-                                result.error == "empty_extraction"
-                                and failure_count >= 3
-                            )
-                            or (
-                                result.error is not None
-                                and result.error in ("http_401", "http_403")
-                                and failure_count >= 3
-                            )
-                        )
-                        next_retry_at = (
-                            now_ts + 3650 * 86400
-                            if permanent
-                            else _article_failure_retry_time(failure_count, now_ts)
-                        )
-                        self.db.record_article_fetch_failure(
-                            story.id,
-                            story.url or "",
-                            status=result.status,
-                            error=result.error,
-                            permanent=permanent,
-                            next_retry_at=next_retry_at,
-                        )
-            cache_key = _tldr_cache_key(
-                title=story.title,
-                self_text=story.self_text or "",
-                top_comments=story.top_comments or "",
-                article_body=article_body or "",
-            )
-            cached_tldr = self.db.get_tldr_cache(story.id, cache_key)
-            if cached_tldr:
-                logging.info(
-                    "tldr_detail story_id=%s result=post_enrich_cache_hit cache_key=%s",
-                    story.id,
-                    cache_key[:12],
-                )
-                self._json_response({"ok": True, "tldr": cached_tldr, "cached": True})
-                return
-
-            tldr = asyncio.run(
-                generate_detailed_tldr(
-                    story.title,
-                    self_text=story.self_text or "",
-                    top_comments=story.top_comments or "",
-                    article_body=article_body or "",
-                )
-            )
-            if not tldr:
-                self._json_response({"error": "Failed to generate TLDR"}, status=500)
-                return
-            if tldr.startswith("Error"):
-                logging.warning(
-                    "tldr_detail story_id=%s result=llm_error cache_key=%s error=%s",
-                    story.id,
-                    cache_key[:12],
-                    tldr,
-                )
-                if "HTTP 429" in tldr:
-                    error = "Rate limit exceeded. Please try again in a moment."
-                else:
-                    error = "Failed to generate TLDR. Please try again later."
-                self._json_response({"error": error}, status=503)
-                return
-            if not tldr.startswith("No article body"):
-                self.db.upsert_tldr_cache(story.id, cache_key, tldr)
-                logging.info(
-                    "tldr_detail story_id=%s result=generated cache_key=%s",
-                    story.id,
-                    cache_key[:12],
-                )
-            self._json_response({"ok": True, "tldr": tldr, "cached": False})
-        except Exception as e:
-            logging.error("Error handling tldr-detail: %r", e)
-            self._json_response({"error": "Internal error"}, status=400)
-
-
-class FlaskRequestContext:
-    """Run existing Handler request logic against Flask request data."""
-
-    def __init__(self) -> None:
-        self._flask_response: Response | None = None
-        self.headers = request.headers
-        self.path = request.full_path.rstrip("?")
-        self._body = request.get_data(cache=True)
-        self.client_address = (request.remote_addr or "127.0.0.1", 0)
-
-    def _request_body(self) -> bytes:
-        return self._body
-
-    def _json_response(
-        self, data: dict, status: int = 200, headers: dict[str, str] | None = None
-    ) -> None:
-        response = jsonify(data)
-        response.status_code = int(status)
-        response.headers["Access-Control-Allow-Origin"] = "*"
-        for name, value in (headers or {}).items():
-            response.headers[name] = value
-        self._flask_response = response
-
-    def _error_response(self, code: int, message: str | None = None) -> None:
-        self._flask_response = Response(
-            message or HTTPStatus(code).phrase,
-            status=code,
-            content_type="text/plain; charset=utf-8",
-        )
-
-    def response(self) -> Response:
-        if self._flask_response is None:
-            raise RuntimeError("Handler did not produce a Flask response")
-        return self._flask_response
 
 
 def _no_cache_dashboard_response(
@@ -1797,31 +1210,586 @@ def _no_cache_dashboard_response(
     return response
 
 
-def create_app(runtime: type[Handler] = Handler) -> Flask:
-    app = Flask(__name__)
-    request_adapter_type = type(
-        "FlaskRuntimeRequest",
-        (FlaskRequestContext, runtime),
-        {},
+def _flask_json_response(
+    data: dict[str, object],
+    status: int | HTTPStatus = HTTPStatus.OK,
+    headers: dict[str, str] | None = None,
+) -> Response:
+    response = jsonify(data)
+    response.status_code = int(status)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    for name, value in (headers or {}).items():
+        response.headers[name] = value
+    return response
+
+
+def _flask_text_error(
+    code: int | HTTPStatus, message: str | None = None
+) -> Response:
+    return Response(
+        message or HTTPStatus(code).phrase,
+        status=int(code),
+        content_type="text/plain; charset=utf-8",
     )
 
-    def adapter() -> Any:
-        return request_adapter_type()
+
+def _flask_user(runtime: type[Handler]) -> User | None:
+    token = request.cookies.get("hn_token")
+    if not token:
+        return None
+    return runtime.db.get_user_by_token(token)
+
+
+def _flask_client_ip() -> str:
+    forwarded_for = request.headers.get("X-Forwarded-For", "")
+    if forwarded_for:
+        first = forwarded_for.split(",", 1)[0].strip()
+        if first:
+            return first
+    return request.remote_addr or "127.0.0.1"
+
+
+def _acquire_session_create_quota(runtime: type[Handler]) -> RateLimitResult:
+    config = runtime.config
+    return runtime._public_demo_limiter.try_acquire(
+        (
+            (
+                f"session-create:ip:{_flask_client_ip()}",
+                config.session_create_per_ip_limit,
+                config.session_create_per_ip_window_seconds,
+            ),
+        )
+    )
+
+
+def _acquire_profile_link_quota(runtime: type[Handler]) -> RateLimitResult:
+    config = runtime.config
+    return runtime._public_demo_limiter.try_acquire(
+        (
+            (
+                f"profile-link:ip:{_flask_client_ip()}",
+                config.profile_link_per_ip_limit,
+                config.profile_link_per_ip_window_seconds,
+            ),
+        )
+    )
+
+
+def _flask_request_origin() -> tuple[str, str] | None:
+    host = request.headers.get("X-Forwarded-Host") or request.headers.get("Host")
+    if not host:
+        return None
+    proto = request.headers.get("X-Forwarded-Proto") or "http"
+    if "," in proto:
+        proto = proto.split(",", 1)[0].strip()
+    return proto, host
+
+
+def _flask_is_same_origin_post() -> bool:
+    fetch_site = request.headers.get("Sec-Fetch-Site")
+    if fetch_site == "cross-site":
+        return False
+
+    origin = request.headers.get("Origin")
+    if not origin:
+        return True
+    parsed = urlparse(origin)
+    if not parsed.scheme or not parsed.netloc:
+        return False
+    request_origin = _flask_request_origin()
+    if request_origin is None:
+        return False
+    request_scheme, request_host = request_origin
+    if request.headers.get("X-Forwarded-Host"):
+        return parsed.netloc == request_host
+    return parsed.scheme == request_scheme and parsed.netloc == request_host
+
+
+def _flask_cross_site_post_response() -> Response | None:
+    if _flask_is_same_origin_post():
+        return None
+    return _flask_json_response(
+        {"error": "Cross-site POSTs are not allowed"}, status=HTTPStatus.FORBIDDEN
+    )
+
+
+def _flask_rate_limit_response(
+    message: str, retry_after_seconds: int
+) -> Response:
+    return _flask_json_response(
+        {"error": message, "retry_after": retry_after_seconds},
+        status=HTTPStatus.TOO_MANY_REQUESTS,
+        headers={"Retry-After": str(retry_after_seconds)},
+    )
+
+
+def _acquire_feedback_quota(
+    runtime: type[Handler], user: User
+) -> RateLimitResult:
+    config = runtime.config
+    return runtime._public_demo_limiter.try_acquire(
+        (
+            (
+                f"feedback:user:{user.id}",
+                config.feedback_per_user_limit,
+                config.feedback_per_user_window_seconds,
+            ),
+            (
+                "feedback:global",
+                config.feedback_global_limit,
+                config.feedback_global_window_seconds,
+            ),
+        )
+    )
+
+
+def _flask_session_limit_key(user: User | None) -> str:
+    if user is not None:
+        return f"user:{user.id}"
+    return f"addr:{_flask_client_ip()}"
+
+
+def _acquire_tldr_uncached_quota(
+    runtime: type[Handler], user: User | None
+) -> RateLimitResult:
+    session_key = _flask_session_limit_key(user)
+    config = runtime.config
+    return runtime._public_demo_limiter.try_acquire(
+        (
+            (
+                f"tldr:user:{session_key}",
+                config.tldr_uncached_per_user_limit,
+                config.tldr_uncached_per_user_window_seconds,
+            ),
+            (
+                "tldr:global",
+                config.tldr_uncached_global_limit,
+                config.tldr_uncached_global_window_seconds,
+            ),
+        )
+    )
+
+
+def _handle_flask_feedback(runtime: type[Handler]) -> Response:
+    user = _flask_user(runtime)
+    if not user:
+        return _flask_json_response(
+            {"error": "No session"}, status=HTTPStatus.UNAUTHORIZED
+        )
+
+    try:
+        body = request.get_data(cache=True)
+        if len(body) > MAX_CONTENT_LENGTH:
+            return _flask_text_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+        data = json.loads(body)
+
+        story_id = data.get("story_id")
+        action = data.get("action")
+        if (
+            not isinstance(story_id, int)
+            or isinstance(story_id, bool)
+            or action not in {"up", "neutral", "down", "clear"}
+        ):
+            return _flask_json_response(
+                {"error": "Invalid feedback"}, status=HTTPStatus.BAD_REQUEST
+            )
+
+        quota = _acquire_feedback_quota(runtime, user)
+        if not quota.allowed:
+            return _flask_rate_limit_response(
+                "Too many votes from this demo session. Please try again later.",
+                quota.retry_after_seconds,
+            )
+
+        if action == "clear":
+            runtime.db.delete_feedback(user.id, story_id)
+        else:
+            runtime.db.upsert_feedback(user.id, story_id, action)
+
+        # Every vote invalidates and warms the next dashboard version so refillQueue
+        # cannot reintroduce a story the user has just acted on.
+        version = runtime._invalidate_dashboard_cache(user.id)
+        runtime._trigger_warm(user, version)
+        runtime.regen_event.set()
+
+        return _flask_json_response(
+            {
+                "ok": True,
+                "ranking_refresh_queued": True,
+                "target_version": version,
+            }
+        )
+    except Exception as e:
+        logging.error("Error handling feedback: %r", e)
+        return _flask_json_response(
+            {"error": "Internal error"}, status=HTTPStatus.BAD_REQUEST
+        )
+
+
+def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
+    try:
+        user = _flask_user(runtime)
+        body = request.get_data(cache=True)
+        if len(body) > MAX_CONTENT_LENGTH:
+            return _flask_text_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+        data = json.loads(body)
+
+        story_id = data["story_id"]
+
+        story = runtime.db.get_story(story_id)
+        if not story:
+            return _flask_json_response(
+                {"error": "Story not found in database"}, status=HTTPStatus.NOT_FOUND
+            )
+
+        article_body = story.article_body or None
+        cache_key = _tldr_cache_key(
+            title=story.title,
+            self_text=story.self_text or "",
+            top_comments=story.top_comments or "",
+            article_body=article_body or "",
+        )
+        cached_tldr = runtime.db.get_tldr_cache(story.id, cache_key)
+        if cached_tldr:
+            logging.info(
+                "tldr_detail story_id=%s result=cache_hit cache_key=%s",
+                story.id,
+                cache_key[:12],
+            )
+            return _flask_json_response(
+                {"ok": True, "tldr": cached_tldr, "cached": True}
+            )
+
+        quota = _acquire_tldr_uncached_quota(runtime, user)
+        if not quota.allowed:
+            return _flask_rate_limit_response(
+                "Demo TLDR quota reached. Cached summaries still work; please try a new summary later.",
+                quota.retry_after_seconds,
+            )
+
+        # If an HN story has comments but no cached comment text, fetch them lazily.
+        if (
+            is_hn_source(story.source)
+            and not story.top_comments
+            and (story.comment_count or 0) > 0
+        ):
+            try:
+                from pipeline import fetch_story
+
+                async def do_fetch() -> Story | None:
+                    async with httpx.AsyncClient(timeout=15.0) as client:
+                        return await fetch_story(client, story_id, runtime.db)
+
+                updated = asyncio.run(do_fetch())
+                if updated:
+                    story = updated
+            except Exception as e:
+                logging.error("Failed to dynamically fetch comments for TLDR: %r", e)
+
+        article_body = story.article_body or article_body
+
+        if (
+            story.source.startswith("rss_reddit_")
+            and story.url
+            and (not story.self_text or not story.top_comments)
+        ):
+            reddit_context = asyncio.run(_fetch_reddit_rss_context(story.url))
+            if reddit_context and (
+                reddit_context.self_text or reddit_context.top_comments
+            ):
+                from pipeline import compose_story_text
+
+                self_text = (
+                    reddit_context.self_text
+                    if len(reddit_context.self_text) > len(story.self_text)
+                    else story.self_text
+                )
+                top_comments = (
+                    reddit_context.top_comments
+                    if len(reddit_context.top_comments) > len(story.top_comments)
+                    else story.top_comments
+                )
+                new_text = compose_story_text(
+                    story.title,
+                    self_text,
+                    top_comments,
+                    article_body or "",
+                )
+                story = replace(
+                    story,
+                    self_text=self_text,
+                    top_comments=top_comments,
+                    text_content=new_text,
+                    discussion_url=story.discussion_url or story.url,
+                    comment_count=story.comment_count
+                    or reddit_context.comment_count
+                    or None,
+                    comment_count_at_fetch=max(
+                        story.comment_count_at_fetch,
+                        reddit_context.comment_count,
+                    ),
+                )
+                runtime.db.upsert_story(story)
+
+        if (
+            story.source == "rss_lesswrong_com"
+            and story.url
+            and (not story.self_text or not story.top_comments)
+        ):
+            post_id = _extract_lesswrong_post_id(story.url)
+            if post_id:
+                lw_context = asyncio.run(_fetch_lesswrong_context(post_id))
+                if lw_context and (lw_context.self_text or lw_context.top_comments):
+                    from pipeline import compose_story_text
+
+                    self_text = (
+                        lw_context.self_text
+                        if len(lw_context.self_text) > len(story.self_text)
+                        else story.self_text
+                    )
+                    top_comments = (
+                        lw_context.top_comments
+                        if len(lw_context.top_comments) > len(story.top_comments)
+                        else story.top_comments
+                    )
+                    new_text = compose_story_text(
+                        story.title,
+                        self_text,
+                        top_comments,
+                        article_body or "",
+                    )
+                    story = replace(
+                        story,
+                        self_text=self_text,
+                        top_comments=top_comments,
+                        text_content=new_text,
+                        discussion_url=story.discussion_url or story.url,
+                        comment_count=story.comment_count
+                        or lw_context.comment_count
+                        or None,
+                        comment_count_at_fetch=max(
+                            story.comment_count_at_fetch,
+                            lw_context.comment_count,
+                        ),
+                        score=max(story.score, lw_context.score),
+                    )
+                    runtime.db.upsert_story(story)
+
+        if (
+            article_body is None
+            and story.url
+            and not story.source.startswith("rss_reddit_")
+            and story.source != "rss_lesswrong_com"
+            and len(story.self_text) < 500
+        ):
+            from pipeline import _is_fetchable_article_url
+
+            if _is_fetchable_article_url(story.url):
+                from pipeline import (
+                    _article_failure_retry_time,
+                    compose_story_text,
+                )
+
+                result = asyncio.run(_fetch_article_body_with_result(story.url))
+                if result.body:
+                    article_body = result.body[:ARTICLE_BODY_CHAR_LIMIT]
+                    new_text = compose_story_text(
+                        story.title,
+                        story.self_text,
+                        story.top_comments,
+                        article_body,
+                    )
+                    updated_story = replace(
+                        story,
+                        article_body=article_body,
+                        text_content=new_text,
+                    )
+                    runtime.db.upsert_story(updated_story)
+                    runtime.db.clear_article_fetch_failure(story.id)
+
+                    embedder = runtime.embedder
+                    if embedder is not None:
+                        model_version = "all-MiniLM-L6-v2|mean|norm|256"
+                        new_vec = embedder.encode([new_text])[0]
+                        new_hash = hashlib.sha256(
+                            new_text.encode("utf-8")
+                        ).hexdigest()
+                        runtime.db.upsert_embedding(
+                            story.id, model_version, new_hash, new_vec
+                        )
+
+                    story = updated_story
+                else:
+                    now_ts = time.time()
+                    previous = runtime.db.get_article_fetch_failure(story.id)
+                    previous_count = int(previous["failure_count"]) if previous else 0
+                    failure_count = previous_count + 1
+                    permanent = (
+                        result.permanent
+                        or (result.error == "empty_extraction" and failure_count >= 3)
+                        or (
+                            result.error is not None
+                            and result.error in ("http_401", "http_403")
+                            and failure_count >= 3
+                        )
+                    )
+                    next_retry_at = (
+                        now_ts + 3650 * 86400
+                        if permanent
+                        else _article_failure_retry_time(failure_count, now_ts)
+                    )
+                    runtime.db.record_article_fetch_failure(
+                        story.id,
+                        story.url or "",
+                        status=result.status,
+                        error=result.error,
+                        permanent=permanent,
+                        next_retry_at=next_retry_at,
+                    )
+
+        cache_key = _tldr_cache_key(
+            title=story.title,
+            self_text=story.self_text or "",
+            top_comments=story.top_comments or "",
+            article_body=article_body or "",
+        )
+        cached_tldr = runtime.db.get_tldr_cache(story.id, cache_key)
+        if cached_tldr:
+            logging.info(
+                "tldr_detail story_id=%s result=post_enrich_cache_hit cache_key=%s",
+                story.id,
+                cache_key[:12],
+            )
+            return _flask_json_response(
+                {"ok": True, "tldr": cached_tldr, "cached": True}
+            )
+
+        tldr = asyncio.run(
+            generate_detailed_tldr(
+                story.title,
+                self_text=story.self_text or "",
+                top_comments=story.top_comments or "",
+                article_body=article_body or "",
+            )
+        )
+        if not tldr:
+            return _flask_json_response(
+                {"error": "Failed to generate TLDR"},
+                status=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+        if tldr.startswith("Error"):
+            logging.warning(
+                "tldr_detail story_id=%s result=llm_error cache_key=%s error=%s",
+                story.id,
+                cache_key[:12],
+                tldr,
+            )
+            if "HTTP 429" in tldr:
+                error = "Rate limit exceeded. Please try again in a moment."
+            else:
+                error = "Failed to generate TLDR. Please try again later."
+            return _flask_json_response(
+                {"error": error}, status=HTTPStatus.SERVICE_UNAVAILABLE
+            )
+        if not tldr.startswith("No article body"):
+            runtime.db.upsert_tldr_cache(story.id, cache_key, tldr)
+            logging.info(
+                "tldr_detail story_id=%s result=generated cache_key=%s",
+                story.id,
+                cache_key[:12],
+            )
+        return _flask_json_response({"ok": True, "tldr": tldr, "cached": False})
+    except Exception as e:
+        logging.error("Error handling tldr-detail: %r", e)
+        return _flask_json_response(
+            {"error": "Internal error"}, status=HTTPStatus.BAD_REQUEST
+        )
+
+
+def _invalid_version_response() -> Response:
+    return _flask_json_response(
+        {"error": "Invalid version"}, status=HTTPStatus.BAD_REQUEST
+    )
+
+
+def _parse_non_negative_version(raw: str) -> int | None:
+    try:
+        version = int(raw)
+    except ValueError:
+        return None
+    if version < 0:
+        return None
+    return version
+
+
+def _handle_flask_ranking_ready(runtime: type[Handler]) -> Response:
+    user = _flask_user(runtime)
+    if not user:
+        return _flask_json_response(
+            {"error": "No session"}, status=HTTPStatus.UNAUTHORIZED
+        )
+
+    raw_min_versions = request.args.getlist("min_version")
+    raw_legacy_versions = request.args.getlist("version")
+    if raw_min_versions and raw_legacy_versions:
+        return _invalid_version_response()
+    raw_versions = raw_min_versions or raw_legacy_versions
+    if len(raw_versions) != 1:
+        return _invalid_version_response()
+
+    min_version = _parse_non_negative_version(raw_versions[0])
+    if min_version is None:
+        return _invalid_version_response()
+
+    raw_target_versions = request.args.getlist("target_version")
+    if len(raw_target_versions) > 1:
+        return _invalid_version_response()
+    target_version = min_version
+    if raw_target_versions:
+        parsed_target = _parse_non_negative_version(raw_target_versions[0])
+        if parsed_target is None:
+            return _invalid_version_response()
+        target_version = parsed_target
+
+    current_version = runtime._dashboard_version(user.id)
+    cached = runtime._dashboard_cache.get(f"dashboard_{user.id}")
+    cached_version = cached[2] if cached is not None else None
+    ready = cached is not None and cached[2] >= min_version
+    ready_version = cached_version if ready else None
+    warm_version = current_version
+    if (cached_version is None or cached_version < warm_version) and (
+        current_version >= min_version
+    ):
+        runtime._trigger_warm(user, warm_version)
+
+    return _flask_json_response(
+        {
+            "ok": True,
+            "ready": ready,
+            "ready_version": ready_version,
+            "min_version": min_version,
+            "target_version": target_version,
+            "current_version": current_version,
+            "cached_version": cached_version,
+        }
+    )
+
+
+def create_app(runtime: type[Handler] = Handler) -> Flask:
+    app = Flask(__name__)
 
     @app.get("/u/<path:token>")
-    def profile_link(token: str) -> Any:
+    def profile_link(token: str) -> ResponseReturnValue:
         token = token.strip("/")
         if not token:
             return Response(status=HTTPStatus.BAD_REQUEST)
 
-        req = adapter()
-        quota = req._acquire_profile_link_quota()
+        quota = _acquire_profile_link_quota(runtime)
         if not quota.allowed:
-            req._rate_limit_response(
+            return _flask_rate_limit_response(
                 "Too many profile-link attempts. Please try again later.",
                 quota.retry_after_seconds,
             )
-            return req.response()
 
         user = runtime.db.get_user_by_token(token)
         if not user:
@@ -1839,34 +1807,29 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
         return response
 
     @app.get("/api/user")
-    def api_user() -> Any:
-        req = adapter()
-        user = req._get_user()
+    def api_user() -> ResponseReturnValue:
+        user = _flask_user(runtime)
         if user:
-            req._json_response({"user_id": user.id, "token": user.token})
-        else:
-            req._json_response({"error": "No session"}, status=401)
-        return req.response()
+            return _flask_json_response({"user_id": user.id, "token": user.token})
+        return _flask_json_response(
+            {"error": "No session"}, status=HTTPStatus.UNAUTHORIZED
+        )
 
     @app.get("/api/ranking-ready")
-    def ranking_ready() -> Any:
-        req = adapter()
-        req._handle_ranking_ready()
-        return req.response()
+    def ranking_ready() -> ResponseReturnValue:
+        return _handle_flask_ranking_ready(runtime)
 
     @app.get("/")
     @app.get("/index.html")
-    def dashboard() -> Any:
-        req = adapter()
-        user = req._get_user()
+    def dashboard() -> ResponseReturnValue:
+        user = _flask_user(runtime)
         if not user:
-            quota = req._acquire_session_create_quota()
+            quota = _acquire_session_create_quota(runtime)
             if not quota.allowed:
-                req._rate_limit_response(
+                return _flask_rate_limit_response(
                     "Too many new demo sessions from this address. Please try again later.",
                     quota.retry_after_seconds,
                 )
-                return req.response()
 
             token = secrets.token_hex(16)
             user = runtime.db.create_user(token)
@@ -1879,20 +1842,18 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
         return _no_cache_dashboard_response(html)
 
     @app.route("/api/feedback", methods=["POST"], provide_automatic_options=False)
-    def feedback() -> Any:
-        req = adapter()
-        if req._reject_cross_site_post():
-            return req.response()
-        req._handle_feedback()
-        return req.response()
+    def feedback() -> ResponseReturnValue:
+        cross_site_response = _flask_cross_site_post_response()
+        if cross_site_response is not None:
+            return cross_site_response
+        return _handle_flask_feedback(runtime)
 
     @app.route("/api/tldr-detail", methods=["POST"], provide_automatic_options=False)
-    def tldr_detail() -> Any:
-        req = adapter()
-        if req._reject_cross_site_post():
-            return req.response()
-        req._handle_tldr_detail()
-        return req.response()
+    def tldr_detail() -> ResponseReturnValue:
+        cross_site_response = _flask_cross_site_post_response()
+        if cross_site_response is not None:
+            return cross_site_response
+        return _handle_flask_tldr_detail(runtime)
 
     @app.route("/api/feedback", methods=["OPTIONS"])
     @app.route("/api/tldr-detail", methods=["OPTIONS"])
