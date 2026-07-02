@@ -1,6 +1,32 @@
 # Worklog: hn-rewrite
 
 Append-only log of notable changes, fixes, and operational events.
+
+## 2026-07-02 — Collapse eval scripts; remove legacy_features and archived Algolia
+
+**Goal**: Reduce eval sprawl (3 scripts → 1) and remove dead code.
+
+**Changes**:
+- **`eval.py`**: Added `closest_diff` formula, MRR metric, `--k-values` flag
+  (previously only in `eval_rss.py`). Metric keys and per-source reporting
+  now parameterized on k-values. Covers all eval_rss use cases.
+- **Deleted `eval_rss.py`** (634 lines): RSS-only eval with different k-values,
+  extra formulas, and MRR — all now in `eval.py` via `--k-values 100 200 500`
+  and per-source breakdown. Fold-construction difference (RSS-only stratification)
+  judged immaterial; per-source metrics from the same rank_map are equivalent.
+- **Deleted `eval_no_hn_features.py`** (545 lines): HN-feature ablation.
+  Abandoned (no output file on disk, last meaningful change 2026-06-28).
+  `eval.py` already has `strip_hn` formula covering this.
+- **Deleted `legacy_features.py`** (151 lines): `_augment_features` was
+  deprecated 2026-06-28 in favor of `_svm_personalization_features`. All 3
+  remaining consumers migrated or removed: `eval.py` (TYPE_CHECKING only),
+  `eval_rss.py` (deleted), `eval_no_hn_features.py` (deleted),
+  `test_pipeline.py::test_augment_features_properties` (deleted).
+- **Deleted `scripts/_archive/algolia/`** (2 files, 118 lines): Per-story
+  Algolia hydration replaced by bulk ClickHouse on 2026-06-26. No active
+  imports. No archive tests existed.
+
+**Result**: 3 eval scripts → 1, -1,448 lines deleted, 0 test regressions.
 Each entry is dated and self-contained.
 
 ---

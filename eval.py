@@ -30,7 +30,6 @@ import numpy as np
 
 if TYPE_CHECKING:
     from database import Database, Story
-    from legacy_features import _augment_features  # noqa: F401  (deprecated 2026-06-28; use pipeline._svm_personalization_features)
     from pipeline import (
         Config,
         Embedder,
@@ -114,6 +113,13 @@ def _compute_metrics(
     else:
         ap = 0.0
 
+    upvoted_rrs = [
+        1.0 / (rank_map[ts.id] + 1)
+        for i, ts in enumerate(test_stories)
+        if test_actions[i] == 2 and ts.id in rank_map
+    ]
+    mrr = float(np.mean(upvoted_rrs)) if upvoted_rrs else 0.0
+
     return {
         **{f"ndcg_at_{k}": _ndcg(rel_by_pos, all_test_rels, k) for k in k_values},
         **{
@@ -122,6 +128,7 @@ def _compute_metrics(
             for k in k_values
         },
         "map": ap,
+        "mrr": mrr,
         "brier_up": brier_up,
     }
 
@@ -143,6 +150,9 @@ def _evaluate_fold(
     probs_strip: np.ndarray | None = None,
     cand_sim_up: np.ndarray | None = None,
     cand_sim_down: np.ndarray | None = None,
+    cand_closest_up: np.ndarray | None = None,
+    cand_closest_down: np.ndarray | None = None,
+    k_values: tuple[int, ...] = (40,),
 ) -> dict:
     if formula == "current":
         if neutral_weight != 0.0:
@@ -168,6 +178,12 @@ def _evaluate_fold(
         if cand_sim_up is None or cand_sim_down is None:
             raise ValueError("knn_diff requires candidate similarity arrays")
         scores = cand_sim_up - cand_sim_down
+    elif formula == "closest_diff":
+        if cand_closest_up is None or cand_closest_down is None:
+            raise ValueError(
+                "closest_diff requires candidate closest similarity arrays"
+            )
+        scores = cand_closest_up - cand_closest_down
     else:
         raise ValueError(f"Unknown formula: {formula}")
 
@@ -207,7 +223,7 @@ def _evaluate_fold(
         test_rel,
         all_test_rels,
         brier_up,
-        k_values=(40,),
+        k_values=k_values,
     )
 
     # Raw ranking (no MMR, diagnostic) — full ranking for meaningful MAP
@@ -220,7 +236,7 @@ def _evaluate_fold(
         test_rel,
         all_test_rels,
         brier_up,
-        k_values=(40,),
+        k_values=k_values,
     )
 
     # Calculate rank statistics of upvoted test stories in overall ranked candidates
@@ -266,7 +282,7 @@ def _evaluate_fold(
             src_rel,
             src_all_rels,
             brier_up=0.0,
-            k_values=(40,),
+            k_values=k_values,
         )
         src_mmr.pop("brier_up", None)
         src_raw = _compute_metrics(
@@ -276,7 +292,7 @@ def _evaluate_fold(
             src_rel,
             src_all_rels,
             brier_up=0.0,
-            k_values=(40,),
+            k_values=k_values,
         )
         src_raw.pop("brier_up", None)
         # Per-source rank percentiles of upvoted test items
@@ -503,7 +519,16 @@ def main() -> None:
         "(e.g., --exclude-sources ch_seed bq_seed to measure on a "
         "non-archive pool).",
     )
+    parser.add_argument(
+        "--k-values",
+        nargs="*",
+        type=int,
+        default=[40],
+        help="k values for NDCG/Hit metrics (default: 40). "
+        "Use --k-values 100 200 500 for sparse eval.",
+    )
     args = parser.parse_args()
+    k_values: tuple[int, ...] = tuple(sorted(args.k_values))
 
     # Heavy imports deferred until after parse_args() so `eval.py --help`
     # doesn't pay the ~2s transformers+onnxruntime cold-start cost.
@@ -578,7 +603,14 @@ def main() -> None:
     cand_scores_array = np.array([s.score for s in candidates], dtype=np.float64)
     y = fb_labels[valid]
 
-    formulas = ["current", "up_only", "strip_hn", "hn_baseline", "knn_diff"]
+    formulas = [
+        "current",
+        "up_only",
+        "strip_hn",
+        "hn_baseline",
+        "knn_diff",
+        "closest_diff",
+    ]
     results: dict[str, list[dict]] = {f: [] for f in formulas}
     final_queue_results: list[dict] = []
     # Accumulated binary upvote labels across all folds; used to compute the
@@ -803,6 +835,9 @@ def main() -> None:
                     probs_strip=probs_strip,
                     cand_sim_up=cand_sim_up,
                     cand_sim_down=cand_sim_down,
+                    cand_closest_up=cand_closest_up,
+                    cand_closest_down=cand_closest_down,
+                    k_values=k_values,
                 )
             )
 
@@ -838,10 +873,13 @@ def main() -> None:
         )
 
     # Aggregate
+    k_metric_keys = tuple(
+        kf for k in k_values for kf in (f"ndcg_at_{k}", f"hit_at_{k}")
+    )
     metric_keys = (
-        "ndcg_at_40",
-        "hit_at_40",
+        *k_metric_keys,
         "map",
+        "mrr",
         "brier_up",
         "median_rank",
         "p25_rank",
@@ -1025,18 +1063,22 @@ def main() -> None:
                 m, s = data["mean"][variant][metric], data["std"][variant][metric]  # type: ignore
                 print(f"  {f:12s} {variant:4s} {m:.3f} ± {s:.3f}")
 
-    print("\n=== Per-source breakdown (current formula, ndcg_at_40 + hit_at_40) ===")
+    first_ndcg = k_metric_keys[0]
+    first_hit = k_metric_keys[1]
+    print(
+        f"\n=== Per-source breakdown (current formula, {first_ndcg} + {first_hit}) ==="
+    )
     print(
         f"  {'source':<30s} {'n_test':>6s} {'n_up':>5s}  "
-        f"{'mmr40':>6s} ± {'mmr40_std':<6s}  "
-        f"{'raw40':>6s} ± {'raw40_std':<6s}"
+        f"{'mmr':>6s} ± {'mmr_std':<6s}  "
+        f"{'raw':>6s} ± {'raw_std':<6s}"
     )
     for source, data in report["per_source"].items():
         cur = data["formulas"].get("current", {})
-        mmr_mean = cur.get("mean", {}).get("mmr", {}).get("ndcg_at_40")
-        mmr_std = cur.get("std", {}).get("mmr", {}).get("ndcg_at_40")
-        raw_mean = cur.get("mean", {}).get("raw", {}).get("ndcg_at_40")
-        raw_std = cur.get("std", {}).get("raw", {}).get("ndcg_at_40")
+        mmr_mean = cur.get("mean", {}).get("mmr", {}).get(first_ndcg)
+        mmr_std = cur.get("std", {}).get("mmr", {}).get(first_ndcg)
+        raw_mean = cur.get("mean", {}).get("raw", {}).get(first_ndcg)
+        raw_std = cur.get("std", {}).get("raw", {}).get(first_ndcg)
         if mmr_mean is None:
             continue
         print(
@@ -1054,10 +1096,10 @@ def main() -> None:
             print(f"  {metric:15s} mmr {m:.3f} ± {s:.3f}")
         per_src: Any = fq.get("per_source", {})
         if per_src:
-            print("\n  Per-source breakdown (ndcg_at_40):")
+            print(f"\n  Per-source breakdown ({first_ndcg}):")
             for source, data in per_src.items():
-                m = data["mean"]["mmr"]["ndcg_at_40"]
-                s = data["std"]["mmr"]["ndcg_at_40"]
+                m = data["mean"]["mmr"][first_ndcg]
+                s = data["std"]["mmr"][first_ndcg]
                 n_test = data["n_test"]
                 n_up = data["n_up"]
                 print(f"  {source:<30s} {n_test:>6d} {n_up:>5d}  {m:>6.3f} ± {s:<6.3f}")
