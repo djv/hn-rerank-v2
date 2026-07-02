@@ -16,7 +16,7 @@ from typing import NamedTuple
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIG = REPO_ROOT / "config.toml"
-PIPELINE = REPO_ROOT / "pipeline.py"
+PIPELINE = REPO_ROOT / "pipeline" / "__init__.py"
 EVAL = REPO_ROOT / "eval.py"
 REPORT = REPO_ROOT / "eval_report.json"
 TEMP_FILES = ("_test_kernels.py", "_diag_scores.py")
