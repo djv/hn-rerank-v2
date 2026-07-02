@@ -231,4 +231,4 @@ rclone copy drive:hn-rewrite/backups/$LATEST/hn_rewrite.db ./hn_rewrite.db
 sqlite3 hn_rewrite.db "PRAGMA integrity_check;"
 ## Testing notes
 
-- **Curl and spam users**: `curl -L` without a cookie jar (`-c/-b`) creates one user per redirect hop. Every `GET /u/<token>` returns a 302 to `../`, and without cookie persistence the redirect chain creates a new user on each hop. Always use `-c cookie.txt -b cookie.txt` when testing with curl.
+- **Curl sessions**: first-visit `GET /` creates one user, sets `hn_token`, and serves the dashboard directly. `/u/<token>` only imports an existing profile onto a new device. Always use `-c cookie.txt -b cookie.txt` when testing live API flows with curl so subsequent requests keep the same profile.

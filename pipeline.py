@@ -514,6 +514,20 @@ class Config:
     recent_candidate_hn_limit: int = 1500
     recent_candidate_rss_limit: int = 500
     tldr_prefetch_per_combo: int = 5
+    # Public demo abuse limits. Cached TLDR hits bypass the uncached TLDR
+    # quota; these limits protect only new enrichment/LLM work and vote writes.
+    tldr_uncached_per_user_limit: int = 8
+    tldr_uncached_per_user_window_seconds: int = 3600
+    tldr_uncached_global_limit: int = 60
+    tldr_uncached_global_window_seconds: int = 3600
+    feedback_per_user_limit: int = 120
+    feedback_per_user_window_seconds: int = 600
+    feedback_global_limit: int = 2000
+    feedback_global_window_seconds: int = 3600
+    session_create_per_ip_limit: int = 60
+    session_create_per_ip_window_seconds: int = 3600
+    profile_link_per_ip_limit: int = 120
+    profile_link_per_ip_window_seconds: int = 3600
     model: ModelConfig = field(default_factory=ModelConfig)
     rss: RssConfig = field(default_factory=RssConfig)
 

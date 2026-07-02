@@ -15,6 +15,9 @@ import sys
 import threading
 import time
 
+from collections import deque
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -26,7 +29,6 @@ import trafilatura
 from bs4 import BeautifulSoup
 import httpx
 
-from dataclasses import dataclass, replace
 from database import Database, Story, User
 from pipeline import Config, Embedder, RankedStory, is_hn_source
 from llm_limiter import limiter as llm_limiter
@@ -42,6 +44,47 @@ REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dash
 TLDR_PROMPT_VERSION = "detail-v4"
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
 _PROMPT_CACHE: dict[str, str] = {}
+
+
+@dataclass(frozen=True)
+class RateLimitResult:
+    allowed: bool
+    retry_after_seconds: int = 0
+
+
+class FixedWindowLimiter:
+    """Thread-safe fixed-window limiter for local public-demo protection."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._buckets: dict[str, deque[float]] = {}
+
+    def try_acquire(
+        self, checks: Sequence[tuple[str, int, int]], now: float | None = None
+    ) -> RateLimitResult:
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            retry_after = 0
+            normalized: list[tuple[str, int, int, deque[float]]] = []
+            for key, limit, window_seconds in checks:
+                if limit <= 0 or window_seconds <= 0:
+                    continue
+                bucket = self._buckets.setdefault(key, deque())
+                cutoff = now - window_seconds
+                while bucket and bucket[0] <= cutoff:
+                    bucket.popleft()
+                normalized.append((key, limit, window_seconds, bucket))
+                if len(bucket) >= limit:
+                    oldest = bucket[0]
+                    retry_after = max(
+                        retry_after,
+                        max(1, int((oldest + window_seconds) - now + 0.999)),
+                    )
+            if retry_after > 0:
+                return RateLimitResult(False, retry_after)
+            for _key, _limit, _window_seconds, bucket in normalized:
+                bucket.append(now)
+        return RateLimitResult(True)
 
 
 def _load_prompt(name: str) -> str:
@@ -764,6 +807,11 @@ class Handler(BaseHTTPRequestHandler):
     _warmup_running_users: set[int] = set()
     _warmup_in_flight_guard = threading.Lock()
     _WARM_DEBOUNCE_S: float = 1.0
+    _public_demo_limiter = FixedWindowLimiter()
+
+    @classmethod
+    def reset_public_demo_limiter(cls) -> None:
+        cls._public_demo_limiter = FixedWindowLimiter()
 
     def _get_user(self) -> User | None:
         """Extract user from cookie token."""
@@ -771,26 +819,176 @@ class Handler(BaseHTTPRequestHandler):
         for part in cookie_header.split(";"):
             kv = part.strip().split("=", 1)
             if len(kv) == 2 and kv[0] == "hn_token":
-                return self.db.get_or_create_user(kv[1].strip())
+                return self.db.get_user_by_token(kv[1].strip())
         return None
+
+    def _client_ip(self) -> str:
+        forwarded_for = self.headers.get("X-Forwarded-For", "")
+        if forwarded_for:
+            first = forwarded_for.split(",", 1)[0].strip()
+            if first:
+                return first
+        host, _port = self.client_address
+        return host
+
+    def _session_limit_key(self, user: User | None) -> str:
+        if user is not None:
+            return f"user:{user.id}"
+        return f"addr:{self._client_ip()}"
+
+    def _request_origin(self) -> tuple[str, str] | None:
+        host = self.headers.get("X-Forwarded-Host") or self.headers.get("Host")
+        if not host:
+            return None
+        proto = self.headers.get("X-Forwarded-Proto") or "http"
+        if "," in proto:
+            proto = proto.split(",", 1)[0].strip()
+        return proto, host
+
+    def _is_same_origin_post(self) -> bool:
+        fetch_site = self.headers.get("Sec-Fetch-Site")
+        if fetch_site == "cross-site":
+            return False
+
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        parsed = urlparse(origin)
+        if not parsed.scheme or not parsed.netloc:
+            return False
+        request_origin = self._request_origin()
+        if request_origin is None:
+            return False
+        request_scheme, request_host = request_origin
+        # When behind a reverse proxy (X-Forwarded-Host is present),
+        # TLS was terminated upstream so the scheme observed at the
+        # origin can differ from the browser's view.  Only compare
+        # hostname in that case.
+        if self.headers.get("X-Forwarded-Host"):
+            return parsed.netloc == request_host
+        return parsed.scheme == request_scheme and parsed.netloc == request_host
+
+    def _reject_cross_site_post(self) -> bool:
+        if self._is_same_origin_post():
+            return False
+        self._json_response({"error": "Cross-site POSTs are not allowed"}, status=403)
+        return True
+
+    def _rate_limit_response(self, message: str, retry_after_seconds: int) -> None:
+        self._json_response(
+            {"error": message, "retry_after": retry_after_seconds},
+            status=HTTPStatus.TOO_MANY_REQUESTS,
+            headers={"Retry-After": str(retry_after_seconds)},
+        )
+
+    def _acquire_tldr_uncached_quota(self, user: User | None) -> RateLimitResult:
+        session_key = self._session_limit_key(user)
+        config = type(self).config
+        return type(self)._public_demo_limiter.try_acquire(
+            (
+                (
+                    f"tldr:user:{session_key}",
+                    config.tldr_uncached_per_user_limit,
+                    config.tldr_uncached_per_user_window_seconds,
+                ),
+                (
+                    "tldr:global",
+                    config.tldr_uncached_global_limit,
+                    config.tldr_uncached_global_window_seconds,
+                ),
+            )
+        )
+
+    def _acquire_feedback_quota(self, user: User) -> RateLimitResult:
+        config = type(self).config
+        return type(self)._public_demo_limiter.try_acquire(
+            (
+                (
+                    f"feedback:user:{user.id}",
+                    config.feedback_per_user_limit,
+                    config.feedback_per_user_window_seconds,
+                ),
+                (
+                    "feedback:global",
+                    config.feedback_global_limit,
+                    config.feedback_global_window_seconds,
+                ),
+            )
+        )
+
+    def _acquire_session_create_quota(self) -> RateLimitResult:
+        config = type(self).config
+        return type(self)._public_demo_limiter.try_acquire(
+            (
+                (
+                    f"session-create:ip:{self._client_ip()}",
+                    config.session_create_per_ip_limit,
+                    config.session_create_per_ip_window_seconds,
+                ),
+            )
+        )
+
+    def _acquire_profile_link_quota(self) -> RateLimitResult:
+        config = type(self).config
+        return type(self)._public_demo_limiter.try_acquire(
+            (
+                (
+                    f"profile-link:ip:{self._client_ip()}",
+                    config.profile_link_per_ip_limit,
+                    config.profile_link_per_ip_window_seconds,
+                ),
+            )
+        )
+
+    def _send_dashboard_response(
+        self, user: User, *, set_session_cookie: bool = False
+    ) -> None:
+        html = self._render_dashboard(user)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(html)))
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+        if set_session_cookie:
+            self.send_header(
+                "Set-Cookie",
+                f"hn_token={user.token}; Path=/; Max-Age=31536000; SameSite=Lax; HttpOnly",
+            )
+        self.end_headers()
+        self.wfile.write(html)
 
     def do_GET(self) -> None:
         path = self.path.split("?")[0]
 
-        # Token-based user session
+        # Existing profile import link for opening the same profile on another
+        # device. Unknown tokens are not a user-creation path.
         if path.startswith("/u/"):
             token = path[3:].strip("/")
-            if token:
-                user = self.db.get_or_create_user(token)
-                self.send_response(302)
-                self.send_header("Location", "../")
-                self.send_header(
-                    "Set-Cookie",
-                    f"hn_token={user.token}; Path=/; Max-Age=31536000; SameSite=Lax; HttpOnly",
-                )
-                self.end_headers()
+            if not token:
+                self.send_error(HTTPStatus.BAD_REQUEST)
                 return
-            self.send_error(HTTPStatus.BAD_REQUEST)
+
+            quota = self._acquire_profile_link_quota()
+            if not quota.allowed:
+                self._rate_limit_response(
+                    "Too many profile-link attempts. Please try again later.",
+                    quota.retry_after_seconds,
+                )
+                return
+
+            user = self.db.get_user_by_token(token)
+            if not user:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+
+            self.send_response(302)
+            self.send_header("Location", "../")
+            self.send_header(
+                "Set-Cookie",
+                f"hn_token={user.token}; Path=/; Max-Age=31536000; SameSite=Lax; HttpOnly",
+            )
+            self.end_headers()
             return
 
         # User info API
@@ -810,27 +1008,20 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/", "/index.html"):
             user = self._get_user()
             if not user:
+                quota = self._acquire_session_create_quota()
+                if not quota.allowed:
+                    self._rate_limit_response(
+                        "Too many new demo sessions from this address. Please try again later.",
+                        quota.retry_after_seconds,
+                    )
+                    return
+
                 token = secrets.token_hex(16)
-                self.send_response(302)
-                self.send_header("Location", f"u/{token}")
-                self.send_header(
-                    "Set-Cookie",
-                    f"hn_token={token}; Path=/; Max-Age=31536000; SameSite=Lax; HttpOnly",
-                )
-                self.end_headers()
+                user = self.db.create_user(token)
+                self._send_dashboard_response(user, set_session_cookie=True)
                 return
 
-            # Render personalized dashboard
-            html = self._render_dashboard(user)
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(html)))
-            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
-            self.send_header("Pragma", "no-cache")
-            self.send_header("Expires", "0")
-            self.end_headers()
-            self.wfile.write(html)
-
+            self._send_dashboard_response(user)
             return
 
         self.send_error(HTTPStatus.NOT_FOUND)
@@ -1217,6 +1408,8 @@ class Handler(BaseHTTPRequestHandler):
             asyncio.run(_prefetch_tldrs_for_ranked(final, db, per_combo))
 
     def do_POST(self) -> None:
+        if self._reject_cross_site_post():
+            return
         if self.path == "/api/feedback":
             self._handle_feedback()
         elif self.path == "/api/tldr-detail":
@@ -1246,6 +1439,14 @@ class Handler(BaseHTTPRequestHandler):
                 or action not in {"up", "neutral", "down", "clear"}
             ):
                 self._json_response({"error": "Invalid feedback"}, status=400)
+                return
+
+            quota = self._acquire_feedback_quota(user)
+            if not quota.allowed:
+                self._rate_limit_response(
+                    "Too many votes from this demo session. Please try again later.",
+                    quota.retry_after_seconds,
+                )
                 return
 
             if action == "clear":
@@ -1350,6 +1551,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_tldr_detail(self) -> None:
         try:
+            user = self._get_user()
             content_length = int(self.headers.get("Content-Length", 0))
             if content_length > MAX_CONTENT_LENGTH:
                 self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
@@ -1363,6 +1565,31 @@ class Handler(BaseHTTPRequestHandler):
             if not story:
                 self._json_response(
                     {"error": "Story not found in database"}, status=404
+                )
+                return
+
+            article_body = story.article_body or None
+            cache_key = _tldr_cache_key(
+                title=story.title,
+                self_text=story.self_text or "",
+                top_comments=story.top_comments or "",
+                article_body=article_body or "",
+            )
+            cached_tldr = self.db.get_tldr_cache(story.id, cache_key)
+            if cached_tldr:
+                logging.info(
+                    "tldr_detail story_id=%s result=cache_hit cache_key=%s",
+                    story.id,
+                    cache_key[:12],
+                )
+                self._json_response({"ok": True, "tldr": cached_tldr, "cached": True})
+                return
+
+            quota = self._acquire_tldr_uncached_quota(user)
+            if not quota.allowed:
+                self._rate_limit_response(
+                    "Demo TLDR quota reached. Cached summaries still work; please try a new summary later.",
+                    quota.retry_after_seconds,
                 )
                 return
 
@@ -1385,7 +1612,7 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as e:
                     logging.error(f"Failed to dynamically fetch comments for TLDR: {e}")
 
-            article_body = story.article_body or None
+            article_body = story.article_body or article_body
 
             if (
                 story.source.startswith("rss_reddit_")
@@ -1560,7 +1787,7 @@ class Handler(BaseHTTPRequestHandler):
             cached_tldr = self.db.get_tldr_cache(story.id, cache_key)
             if cached_tldr:
                 logging.info(
-                    "tldr_detail story_id=%s result=cache_hit cache_key=%s",
+                    "tldr_detail story_id=%s result=post_enrich_cache_hit cache_key=%s",
                     story.id,
                     cache_key[:12],
                 )
@@ -1610,11 +1837,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
-    def _json_response(self, data: dict, status: int = 200) -> None:
+    def _json_response(
+        self, data: dict, status: int = 200, headers: dict[str, str] | None = None
+    ) -> None:
         body = json.dumps(data).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -1714,8 +1945,9 @@ def main() -> None:
     t.start()
 
     # Start HTTP server
-    server = ThreadingHTTPServer(("0.0.0.0", config.server_port), Handler)
-    logging.info("Serving on http://0.0.0.0:%d", config.server_port)
+    server_host = "127.0.0.1"
+    server = ThreadingHTTPServer((server_host, config.server_port), Handler)
+    logging.info("Serving on http://%s:%d", server_host, config.server_port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

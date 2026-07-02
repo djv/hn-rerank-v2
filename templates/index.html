@@ -60,9 +60,16 @@
     }
 
     .share-link {
-      margin-left: 0.5rem;
+      display: block;
+      margin: 0.2rem 0 0.65rem;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: var(--pico-primary);
       font-size: 0.75rem;
+      text-align: left;
       opacity: 0.6;
+      cursor: pointer;
     }
     .share-link:hover {
       opacity: 1;
@@ -499,19 +506,6 @@
     .filter-toggle-btn {
       display: none;
       margin-right: auto;
-      padding: 0.5rem 0.7rem;
-      font-size: 1.15rem;
-      line-height: 1;
-      min-width: 2.75rem;
-      min-height: 2.75rem;
-      background: var(--pico-card-background-color);
-      border: 1px solid var(--pico-muted-border-color);
-      border-radius: 6px;
-      cursor: pointer;
-      color: var(--pico-color);
-    }
-    .filter-toggle-btn:active {
-      background: color-mix(in srgb, var(--pico-muted-border-color) 40%, transparent);
     }
 
     .fullscreen .swipe-side { display: none; }
@@ -563,7 +557,8 @@
     .vote-count--neutral { color: #ffc107; }
     .vote-count--down { color: #dc3545; }
 
-    .feedback-btn {
+    .feedback-btn,
+    .filter-toggle-btn {
       padding: 0.5rem 0.9rem;
       font-size: 0.95rem;
       font-weight: 500;
@@ -789,6 +784,7 @@
         box-shadow: 0 2px 8px rgba(0,0,0,0.15);
         overflow-y: auto;
       }
+
       .swipe-side.visible {
         transform: translateY(0);
       }
@@ -821,7 +817,7 @@
 
       .swipe-keys { display: none; }
 
-      .filter-toggle-btn { display: inline-flex; align-items: center; justify-content: center; }
+      .filter-toggle-btn { display: inline-flex; }
 
       .feedback-btn {
         padding: 0.6rem 0.9rem;
@@ -865,6 +861,7 @@
     <div class="swipe-layout">
       <div id="stories"
            data-user-id="{{ user_id or 0 }}"
+           data-user-token="{{ user_token or '' }}"
            data-dashboard-version="{{ dashboard_version }}"
            data-current-version="{{ dashboard_latest_version }}">
       {% for card in cards %}
@@ -1149,13 +1146,41 @@
       }, 3000);
     }
 
+    const copyProfileLinkButton = document.getElementById('copyProfileLink');
+    if (copyProfileLinkButton) {
+      copyProfileLinkButton.addEventListener('click', async () => {
+        const link = profileLink();
+        if (!link) return;
+        try {
+          await navigator.clipboard.writeText(link);
+          showToast('Profile link copied', 'success');
+        } catch {
+          showToast(link, 'info');
+        }
+      });
+    }
+
+    function routePrefix() {
+      if (window.location.pathname.startsWith('/hn')) return '/hn';
+      return '';
+    }
+
+    function apiPath(path) {
+      return `${routePrefix()}${path}`;
+    }
+
     function feedbackPath() {
-      return window.location.pathname.startsWith('/rewrite') ? '/rewrite/api/feedback' : '/api/feedback';
+      return apiPath('/api/feedback');
+    }
+
+    function profileLink() {
+      const token = storiesContainer?.dataset.userToken || '';
+      if (!token) return '';
+      return `${window.location.origin}${routePrefix()}/u/${encodeURIComponent(token)}`;
     }
 
     function rankingReadyPath(minVersion, targetVersion) {
-      const apiPath = window.location.pathname.startsWith('/rewrite') ? '/rewrite/api/ranking-ready' : '/api/ranking-ready';
-      return `${apiPath}?min_version=${encodeURIComponent(minVersion)}&target_version=${encodeURIComponent(targetVersion)}`;
+      return `${apiPath('/api/ranking-ready')}?min_version=${encodeURIComponent(minVersion)}&target_version=${encodeURIComponent(targetVersion)}`;
     }
 
     function votedStorageKey() {
@@ -1358,6 +1383,9 @@
         const action = btn.dataset.keyAction;
         if (action === 'undo') {
           undoLastVote();
+        } else if (action === 'toggle-panel') {
+          sidePanel.classList.toggle('visible');
+          document.body.classList.toggle('fullscreen');
         } else {
           submitVote(action);
         }
@@ -1689,9 +1717,9 @@
         btn.textContent = 'Analyzing...';
       }
 
-      const apiPath = window.location.pathname.startsWith('/rewrite') ? '/rewrite/api/tldr-detail' : '/api/tldr-detail';
+      const detailApiPath = apiPath('/api/tldr-detail');
       try {
-        const resp = await fetch(apiPath, {
+        const resp = await fetch(detailApiPath, {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({ story_id: storyId, story_title: storyTitle })

@@ -5,6 +5,172 @@ Each entry is dated and self-contained.
 
 ---
 
+## 2026-07-02 — Cookie-first sessions with import-only profile links
+
+**Change.** Removed the normal first-visit token redirect chain while keeping
+cross-device profile links.
+
+- Anonymous `GET /` now rate-limits session creation by client IP, creates the
+  user row immediately, sets `hn_token`, and serves the dashboard in a single
+  `200` response.
+- `/u/<token>` is now import-only for existing users. It sets the cookie and
+  redirects to `/` for known tokens, but unknown tokens return 404 and do not
+  create users.
+- Session creation and profile-link attempts use the existing in-memory
+  fixed-window limiter. Defaults are 60 new sessions per IP per hour and 120
+  profile-link attempts per IP per hour; the client IP prefers the leftmost
+  `X-Forwarded-For` value.
+- The side rail now exposes a compact copy-profile-link button for opening the
+  same profile on another device.
+
+**Verification.**
+- `uv run pytest tests/test_server.py -q` = 106 passed.
+- `uv run pytest tests/test_server.py tests/test_eval_ranker_variants.py -q`
+  = 114 passed.
+- `uv run ruff check .` = clean.
+- `uv run ty check` = clean.
+- `git diff --check` = clean.
+
+---
+
+## 2026-07-02 — Public demo abuse hardening
+
+**Change.** Added dependency-free public-demo protections around the live
+`/hn/` Funnel route while keeping live TLDR generation enabled and the current
+SQLite DB in place.
+
+- `server.py` now has a locked in-memory fixed-window limiter. Cached
+  `/api/tldr-detail` responses bypass quota; uncached TLDR misses acquire
+  quota before HN/Reddit/LessWrong/article enrichment or LLM generation.
+  Defaults are 8 uncached TLDRs per session per hour and 60 globally per hour.
+- `POST /api/feedback` now applies per-session/global vote limits before DB
+  writes. Defaults are 120 votes per session per 10 minutes and 2000 globally
+  per hour.
+- Cross-site POSTs are rejected before body parsing when
+  `Sec-Fetch-Site: cross-site` is present or `Origin` does not match the
+  request origin. Missing `Origin` remains allowed for curl/script tests.
+- The side rail now includes the public-demo cue: "Vote to teach a local
+  model. The deck starts gravity-sorted, then personalizes as you rate
+  stories."
+- Caddy now caps request bodies at 950KB for both bare `/api/*` and public
+  `/hn/*` proxy paths, below the app's existing 1MB POST cap.
+
+**Backup.** Ran `./scripts/backup_hn_db.sh`; it reported:
+`drive:hn-rewrite/backups/20260702T062548Z/`. Rclone logged read-only config
+temp-file warnings from the sandboxed home config path, but the backup command
+exited 0 and printed the backup destination.
+
+**Verification.**
+- `uv run pytest tests/test_server.py -q` = 101 passed.
+- `uv run pytest tests/test_server.py tests/test_eval_ranker_variants.py -q`
+  = 109 passed.
+- `uv run ruff check .` = clean.
+- `uv run ty check` = clean.
+- `caddy validate --config /home/dev/hn_rerank/Caddyfile` = valid; Caddy
+  reloaded successfully.
+- `systemctl --user restart hn_rewrite.service`; service active and serving on
+  `http://127.0.0.1:8766`.
+- `tailscale funnel status` still routes `/` to `127.0.0.1:8000` and keeps
+  `/v1` plus `/transit` on `127.0.0.1:8787/v1`.
+- Cookie-preserving `curl -L` to
+  `https://ubuntu-8gb-nbg1-1.tailca4726.ts.net:8443/hn/` returned `200`.
+- Cached TLDR live check for story `-271835101140445` returned `200` with
+  `"cached": true`.
+- Repeated no-content TLDR requests for story `48545664` returned `429` on the
+  9th request with `Retry-After: 3600`, without spending LLM calls.
+- Oversized 1,000,001-byte POST to `/hn/api/tldr-detail` returned `413` through
+  both the public Funnel route and local Caddy.
+- `journalctl --user -u hn_rewrite.service` after restart showed the expected
+  TLDR cache hit and `429`, no traceback or DB errors. The only new errors were
+  transient external RSS feed read failures during background regen.
+
+---
+
+## 2026-07-02 — Funnel/Caddy edge cleanup
+
+**Change.** Removed the stale `/public/*` file-server handler from the
+active Caddy config at `/home/dev/hn_rerank/Caddyfile` and reloaded the
+running `hn-dashboard.service` Caddy instance through `caddy reload --config
+/home/dev/hn_rerank/Caddyfile`. The active dashboard edge now keeps the
+dashboard under `/hn/*` and proxies `/api/*` to `127.0.0.1:8766`.
+
+**Initial verified topology.** Tailscale Funnel was on
+`https://ubuntu-8gb-nbg1-1.tailca4726.ts.net:8443`, with `/` proxied to
+`127.0.0.1:8000/` and `/v1` proxied to `127.0.0.1:8787/v1`.
+`hn-dashboard.service` is active and running `/usr/bin/caddy run --config
+/home/dev/hn_rerank/Caddyfile`; `hn_rewrite.service` is active on the user
+service path. TLS on the Funnel hostname verified with a Tailscale cert.
+
+**Dead path removed.** The system `caddy.service` was disabled/reset and is
+now `disabled` + `inactive (dead)`, so it no longer tries to bind `:8443`.
+The unmanaged `/etc/caddy/Caddyfile` plus
+`ubuntu-8gb-nbg1-1.tailca4726.ts.net.{crt,key}` were moved out of
+`/etc/caddy`; `/etc/caddy` is now empty. The installed Tailscale `1.98.4`
+`tailscale cert` help has no `--remove` flag, so this cleanup correctly used
+file/service cleanup rather than `tailscale cert --remove`.
+
+**Verification.**
+- `caddy validate --config /home/dev/hn_rerank/Caddyfile` = valid.
+- `caddy reload --config /home/dev/hn_rerank/Caddyfile` = loaded via admin API.
+- `tailscale funnel status` and `tailscale serve status` = `/` to `:8000`,
+  `/v1` to `:8787/v1`.
+- `systemctl status hn-dashboard.service --no-pager` = active; journal shows
+  the reload completed.
+- `systemctl status caddy.service --no-pager` = disabled and inactive.
+- `ls -la /etc/caddy` = empty directory.
+- `systemctl --user status hn_rewrite.service --no-pager` = active.
+- `openssl s_client` to the Funnel hostname on `:8443` = TLSv1.3,
+  verification OK.
+- `curl https://ubuntu-8gb-nbg1-1.tailca4726.ts.net:8443/hn/api/user`
+  = `401` without a session cookie.
+- `curl http://127.0.0.1:8000/public/index.html` = empty Caddy `200`
+  (`Content-Length: 0`), confirming the old static file server is no longer
+  serving that path.
+
+**Funnel repair.** After the dead Caddy cleanup, tailnet/private access to
+`:8443` still worked but public Funnel edge IPs (`185.40.234.55`,
+`185.40.234.75`, `185.40.234.198`) closed TLS with `SSL_ERROR_SYSCALL`.
+Toggling Funnel off and re-registering both handlers fixed the public edge:
+`sudo tailscale funnel --https=8443 off`, then
+`sudo tailscale funnel --bg --https=8443 --set-path=/ http://127.0.0.1:8000/`
+and
+`sudo tailscale funnel --bg --https=8443 --set-path=/v1 http://127.0.0.1:8787/v1`.
+Forced-edge `curl --resolve` and `openssl s_client` checks now succeed on all
+three public IPs, and the browser loads the app again.
+
+**Topology tightening.** Caddy now listens only on `127.0.0.1:8000` via
+`bind 127.0.0.1`, strips `/hn/*` and proxies to hn-rewrite on
+`127.0.0.1:8766`, and returns explicit `404` for unmatched paths.
+`server.py` now binds `hn_rewrite.service` to `127.0.0.1` instead of
+`0.0.0.0`. The transit proxy is still intentionally exposed through Funnel:
+`/v1` remains as the compatibility route to `127.0.0.1:8787/v1`, and
+`/transit` was added as a clearer alias to the same backend path.
+
+**Dashboard route rename.** The dashboard route was renamed to `/hn/`.
+The frontend now derives API paths from the `/hn` prefix, and Caddy only
+serves the dashboard under `/hn/*`.
+
+**Verification after tightening.**
+- `tailscale funnel status` = `/` proxying to `127.0.0.1:8000`, `/v1`
+  proxying to `127.0.0.1:8787/v1`, and `/transit` proxying to
+  `127.0.0.1:8787/v1`.
+- `ss -ltnp` = `127.0.0.1:8000`, `127.0.0.1:8766`, and the restored transit
+  proxy on `0.0.0.0:8787`.
+- `curl https://ubuntu-8gb-nbg1-1.tailca4726.ts.net:8443/hn/` = `302`
+  from Caddy + HNRewrite.
+- Cookie-preserving `curl -L` to `/hn/` = `200` dashboard HTML.
+- The previous dashboard route now returns `404`.
+- `curl https://ubuntu-8gb-nbg1-1.tailca4726.ts.net:8443/transit/nearby-stop-candidates?...`
+  = `200` JSON from the transit proxy.
+- The same nearby-stop request under `/v1` = `200` JSON for compatibility.
+- `systemctl --user status sofia-transit-proxy.service --no-pager` =
+  enabled and active.
+- `uv run pytest tests/ -n 4` = 448 passed, 1 skipped.
+- `uv run ruff check .` = clean.
+- `uv run ty check` = clean.
+
+---
+
 ## 2026-07-01 — Time-forward offline ranking metrics
 
 **Change.** `scripts/eval_ranker_variants.py` now defaults to

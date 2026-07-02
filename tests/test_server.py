@@ -1,6 +1,7 @@
 import socket
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import httpx
@@ -162,6 +163,7 @@ def _start_handler_server(
     TestHandler._cold_stories = []
     TestHandler._render_locks = {}
     _reset_warm_state(TestHandler)
+    TestHandler.reset_public_demo_limiter()
 
     server = ThreadingHTTPServer(("127.0.0.1", port), TestHandler)
     bound_port = server.server_address[1]
@@ -241,37 +243,146 @@ def test_token_redirect(app_env):
     assert "hn_token" in resp.headers.get("Set-Cookie", "")
 
 
-def test_first_visit_redirect(app_env):
+def test_token_redirect_unknown_token_does_not_create_user(app_env):
+    port, db, _, _, _ = app_env
+    with db.conn() as conn:
+        before = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+    resp = httpx.get(
+        f"http://127.0.0.1:{port}/u/not-a-real-token",
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 404
+    with db.conn() as conn:
+        after = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    assert after == before
+
+
+def test_first_visit_serves_dashboard_and_sets_cookie(app_env):
     port, _, _, _, _ = app_env
     resp = httpx.get(f"http://127.0.0.1:{port}/", follow_redirects=False)
-    assert resp.status_code == 302
-    location = resp.headers["Location"]
-    assert location.startswith("u/")
+    assert resp.status_code == 200
+    assert "Location" not in resp.headers
     assert "hn_token" in resp.headers.get("Set-Cookie", "")
+    assert resp.content
 
 
-def test_dashboard_route_no_user_creates_token_and_redirects(app_env):
+def test_dashboard_route_no_user_creates_token_inline(app_env):
     port, db, _, _, _ = app_env
     with db.conn() as conn:
         before = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
 
     resp = httpx.get(f"http://127.0.0.1:{port}/", follow_redirects=False)
 
-    assert resp.status_code == 302
-    assert resp.headers["Location"].startswith("u/")
+    assert resp.status_code == 200
+    assert "Location" not in resp.headers
     assert "hn_token" in resp.headers.get("Set-Cookie", "")
+    with db.conn() as conn:
+        after = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    assert after == before + 1
+
+    cookie = resp.headers["Set-Cookie"].split(";", 1)[0].split("=", 1)[1]
+    follow = httpx.get(f"http://127.0.0.1:{port}/", cookies={"hn_token": cookie})
+    assert follow.status_code == 200
+    with db.conn() as conn:
+        persisted = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    assert persisted == after
+
+
+def test_unknown_cookie_does_not_create_user(app_env) -> None:
+    port, db, _, _, _ = app_env
+    with db.conn() as conn:
+        before = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+    resp = httpx.get(
+        f"http://127.0.0.1:{port}/api/user",
+        cookies={"hn_token": "forged-token"},
+    )
+
+    assert resp.status_code == 401
     with db.conn() as conn:
         after = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     assert after == before
 
-    follow = httpx.get(
-        f"http://127.0.0.1:{port}/{resp.headers['Location']}",
+
+def test_dashboard_route_session_creation_limit_uses_forwarded_for(
+    test_env,
+) -> None:
+    port, _, _, TestHandler, _ = test_env
+    TestHandler.config = replace(
+        TestHandler.config,
+        session_create_per_ip_limit=1,
+        session_create_per_ip_window_seconds=3600,
+    )
+    headers = {"X-Forwarded-For": "203.0.113.10, 127.0.0.1"}
+
+    first = httpx.get(
+        f"http://127.0.0.1:{port}/",
+        headers=headers,
         follow_redirects=False,
     )
-    assert follow.status_code == 302
-    with db.conn() as conn:
-        persisted = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    assert persisted == before + 1
+    second = httpx.get(
+        f"http://127.0.0.1:{port}/",
+        headers=headers,
+        follow_redirects=False,
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+    assert second.headers["Retry-After"] == "3600"
+
+
+def test_dashboard_authenticated_visit_does_not_consume_session_creation_quota(
+    test_env,
+) -> None:
+    port, _, _, TestHandler, user = test_env
+    TestHandler.config = replace(
+        TestHandler.config,
+        session_create_per_ip_limit=1,
+        session_create_per_ip_window_seconds=3600,
+    )
+    headers = {"X-Forwarded-For": "203.0.113.11"}
+
+    authenticated = httpx.get(
+        f"http://127.0.0.1:{port}/",
+        headers=headers,
+        cookies={"hn_token": user.token},
+        follow_redirects=False,
+    )
+    anonymous = httpx.get(
+        f"http://127.0.0.1:{port}/",
+        headers=headers,
+        follow_redirects=False,
+    )
+
+    assert authenticated.status_code == 200
+    assert anonymous.status_code == 200
+
+
+def test_token_redirect_profile_link_limit_uses_forwarded_for(test_env) -> None:
+    port, _, _, TestHandler, user = test_env
+    TestHandler.config = replace(
+        TestHandler.config,
+        profile_link_per_ip_limit=1,
+        profile_link_per_ip_window_seconds=3600,
+    )
+    headers = {"X-Forwarded-For": "203.0.113.12, 127.0.0.1"}
+
+    first = httpx.get(
+        f"http://127.0.0.1:{port}/u/{user.token}",
+        headers=headers,
+        follow_redirects=False,
+    )
+    second = httpx.get(
+        f"http://127.0.0.1:{port}/u/{user.token}",
+        headers=headers,
+        follow_redirects=False,
+    )
+
+    assert first.status_code == 302
+    assert second.status_code == 429
+    assert second.headers["Retry-After"] == "3600"
 
 
 def test_static_serving(test_env):
@@ -425,6 +536,109 @@ def test_feedback_post_invalidates_cache_on_every_vote(test_env):
     assert len(db.get_all_feedback(user.id)) == 1
     assert handler._dashboard_version(user.id) == starting_version + 1
     assert regen_event.is_set()
+
+
+def test_feedback_post_limit_returns_429_without_write(test_env) -> None:
+    port, db, regen_event, handler, user = test_env
+    handler.config = Config(
+        db_path=db.db_path,
+        server_port=port,
+        feedback_per_user_limit=1,
+        feedback_per_user_window_seconds=600,
+        feedback_global_limit=100,
+    )
+    for story_id in (1100, 1101):
+        db.upsert_story(
+            Story(
+                id=story_id,
+                title=f"Limited feedback story {story_id}",
+                url=f"https://example.com/limited-feedback-{story_id}",
+                score=100,
+                time=1600000000,
+                text_content="Feedback body text",
+                source="hn",
+            )
+        )
+    regen_event.clear()
+
+    first = httpx.post(
+        f"http://127.0.0.1:{port}/api/feedback",
+        json={"story_id": 1100, "action": "up"},
+        cookies={"hn_token": user.token},
+    )
+    second = httpx.post(
+        f"http://127.0.0.1:{port}/api/feedback",
+        json={"story_id": 1101, "action": "down"},
+        cookies={"hn_token": user.token},
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+    assert int(second.headers["Retry-After"]) > 0
+    assert second.json()["retry_after"] == int(second.headers["Retry-After"])
+    records = db.get_all_feedback(user.id)
+    assert [(record.story_id, record.action) for record in records] == [(1100, "up")]
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"Sec-Fetch-Site": "cross-site"},
+        {"Origin": "https://attacker.example"},
+    ],
+)
+def test_feedback_post_rejects_cross_site_posts(test_env, headers: dict[str, str]) -> None:
+    port, db, regen_event, handler, user = test_env
+    db.upsert_story(
+        Story(
+            id=1102,
+            title="Cross-site feedback story",
+            url="https://example.com/cross-site-feedback",
+            score=100,
+            time=1600000000,
+            text_content="Feedback body text",
+            source="hn",
+        )
+    )
+    regen_event.clear()
+
+    resp = httpx.post(
+        f"http://127.0.0.1:{port}/api/feedback",
+        json={"story_id": 1102, "action": "up"},
+        headers=headers,
+        cookies={"hn_token": user.token},
+    )
+
+    assert resp.status_code == 403
+    assert resp.json() == {"error": "Cross-site POSTs are not allowed"}
+    assert db.get_all_feedback(user.id) == []
+    assert handler._dashboard_version(user.id) == 0
+    assert not regen_event.is_set()
+
+
+def test_feedback_post_accepts_same_origin_post(test_env) -> None:
+    port, db, _, _, user = test_env
+    db.upsert_story(
+        Story(
+            id=1103,
+            title="Same-origin feedback story",
+            url="https://example.com/same-origin-feedback",
+            score=100,
+            time=1600000000,
+            text_content="Feedback body text",
+            source="hn",
+        )
+    )
+
+    resp = httpx.post(
+        f"http://127.0.0.1:{port}/api/feedback",
+        json={"story_id": 1103, "action": "up"},
+        headers={"Origin": f"http://127.0.0.1:{port}", "Sec-Fetch-Site": "same-origin"},
+        cookies={"hn_token": user.token},
+    )
+
+    assert resp.status_code == 200
+    assert len(db.get_all_feedback(user.id)) == 1
 
 
 def test_feedback_post_invalidates_cache_with_low_queue(test_env):
@@ -1844,6 +2058,197 @@ def test_tldr_detail_uses_cached_summary(test_env, monkeypatch):
     assert resp1.json()["cached"] is False
     assert resp2.json()["cached"] is True
     assert resp2.json()["tldr"] == resp1.json()["tldr"]
+
+
+def test_tldr_cached_response_bypasses_uncached_quota(test_env, monkeypatch) -> None:
+    import server
+
+    port, db, _, handler, user = test_env
+    handler.config = Config(
+        db_path=db.db_path,
+        server_port=port,
+        tldr_uncached_per_user_limit=1,
+        tldr_uncached_per_user_window_seconds=3600,
+        tldr_uncached_global_limit=100,
+    )
+    uncached_story = Story(
+        id=780,
+        title="Uncached quota consumer",
+        url="https://example.com/uncached-quota",
+        score=10,
+        time=1600000000,
+        text_content="Uncached quota consumer. Body.",
+        source="hn",
+        comment_count=0,
+        self_text="",
+        top_comments="",
+        article_body="Body.",
+    )
+    cached_story = Story(
+        id=781,
+        title="Cached quota bypass",
+        url="https://example.com/cached-quota",
+        score=10,
+        time=1600000000,
+        text_content="Cached quota bypass. Cached body.",
+        source="hn",
+        comment_count=0,
+        self_text="",
+        top_comments="",
+        article_body="Cached body.",
+    )
+    db.upsert_story(uncached_story)
+    db.upsert_story(cached_story)
+    cached_key = server._tldr_cache_key(
+        title=cached_story.title,
+        self_text="",
+        top_comments="",
+        article_body="Cached body.",
+    )
+    db.upsert_tldr_cache(cached_story.id, cached_key, "Already cached")
+
+    calls = 0
+
+    async def mock_generate_detailed_tldr(
+        title: str, self_text: str, top_comments: str, article_body: str
+    ) -> str:
+        nonlocal calls
+        calls += 1
+        return f"generated-{calls}: {title}"
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    first = httpx.post(
+        f"http://127.0.0.1:{port}/api/tldr-detail",
+        json={"story_id": uncached_story.id},
+        cookies={"hn_token": user.token},
+    )
+    second = httpx.post(
+        f"http://127.0.0.1:{port}/api/tldr-detail",
+        json={"story_id": cached_story.id},
+        cookies={"hn_token": user.token},
+    )
+
+    assert first.status_code == 200
+    assert first.json()["cached"] is False
+    assert second.status_code == 200
+    assert second.json() == {"ok": True, "tldr": "Already cached", "cached": True}
+    assert calls == 1
+
+
+def test_tldr_uncached_per_session_limit_blocks_generation(
+    test_env, monkeypatch
+) -> None:
+    port, db, _, handler, user = test_env
+    handler.config = Config(
+        db_path=db.db_path,
+        server_port=port,
+        tldr_uncached_per_user_limit=1,
+        tldr_uncached_per_user_window_seconds=3600,
+        tldr_uncached_global_limit=100,
+    )
+    for story_id in (782, 783):
+        db.upsert_story(
+            Story(
+                id=story_id,
+                title=f"Per-user TLDR story {story_id}",
+                url=f"https://example.com/per-user-tldr-{story_id}",
+                score=10,
+                time=1600000000,
+                text_content="Story body.",
+                source="hn",
+                comment_count=0,
+                self_text="",
+                top_comments="",
+                article_body="Story body.",
+            )
+        )
+
+    calls: list[str] = []
+
+    async def mock_generate_detailed_tldr(
+        title: str, self_text: str, top_comments: str, article_body: str
+    ) -> str:
+        calls.append(title)
+        return f"TLDR: {title}"
+
+    import server
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    first = httpx.post(
+        f"http://127.0.0.1:{port}/api/tldr-detail",
+        json={"story_id": 782},
+        cookies={"hn_token": user.token},
+    )
+    second = httpx.post(
+        f"http://127.0.0.1:{port}/api/tldr-detail",
+        json={"story_id": 783},
+        cookies={"hn_token": user.token},
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+    assert int(second.headers["Retry-After"]) > 0
+    assert second.json()["retry_after"] == int(second.headers["Retry-After"])
+    assert calls == ["Per-user TLDR story 782"]
+
+
+def test_tldr_uncached_global_limit_blocks_second_session(
+    test_env, monkeypatch
+) -> None:
+    port, db, _, handler, user = test_env
+    other_user = db.create_user("other_tldr_user")
+    handler.config = Config(
+        db_path=db.db_path,
+        server_port=port,
+        tldr_uncached_per_user_limit=100,
+        tldr_uncached_global_limit=1,
+        tldr_uncached_global_window_seconds=3600,
+    )
+    for story_id in (784, 785):
+        db.upsert_story(
+            Story(
+                id=story_id,
+                title=f"Global TLDR story {story_id}",
+                url=f"https://example.com/global-tldr-{story_id}",
+                score=10,
+                time=1600000000,
+                text_content="Story body.",
+                source="hn",
+                comment_count=0,
+                self_text="",
+                top_comments="",
+                article_body="Story body.",
+            )
+        )
+
+    calls: list[str] = []
+
+    async def mock_generate_detailed_tldr(
+        title: str, self_text: str, top_comments: str, article_body: str
+    ) -> str:
+        calls.append(title)
+        return f"TLDR: {title}"
+
+    import server
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    first = httpx.post(
+        f"http://127.0.0.1:{port}/api/tldr-detail",
+        json={"story_id": 784},
+        cookies={"hn_token": user.token},
+    )
+    second = httpx.post(
+        f"http://127.0.0.1:{port}/api/tldr-detail",
+        json={"story_id": 785},
+        cookies={"hn_token": other_user.token},
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+    assert calls == ["Global TLDR story 784"]
 
 
 def test_tldr_detail_does_not_cache_placeholder(test_env, monkeypatch):
