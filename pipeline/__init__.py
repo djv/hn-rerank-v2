@@ -1,37 +1,23 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import html
 import logging
-import re
-import threading
 import time
-import tomllib
-from collections import Counter
-from collections.abc import Iterator
-from contextlib import contextmanager
-from dataclasses import dataclass, field, fields, replace
-from typing import Any
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
 
 import feedparser
 import httpx
 import numpy as np
-import onnxruntime as ort
 from bs4 import BeautifulSoup
-from cachetools import LRUCache
-from jinja2 import Environment, FileSystemLoader
 from numpy.typing import NDArray
-from sklearn.cluster import KMeans
-from sklearn.svm import SVC
-from sklearn.preprocessing import StandardScaler
 
 from database import Database, Story
 from reddit_fetch_queue import CoroFactory
 
+# ruff: noqa: F401 — all imports below are intentional re-exports for the
+# public pipeline namespace. Consumers import from `pipeline` directly.
 from .config import (
     BQ_ARCHIVE_CANDIDATE_LIMIT,
     BQ_ARCHIVE_SOURCE,

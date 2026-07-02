@@ -7,36 +7,24 @@ import logging
 import re
 import threading
 import time
-from collections.abc import Iterator
 from dataclasses import replace
-from pathlib import Path
-from typing import Any
 from urllib.parse import urlparse
 
 import feedparser
 import httpx
-from bs4 import BeautifulSoup
 
 from database import Database, Story
 from reddit_fetch_queue import CoroFactory
 from reddit_feed_cache import cache as reddit_feed_cache
 from reddit_limiter import limiter as reddit_limiter
-from .config import (
-    BQ_ARCHIVE_SOURCE,
-    CH_ARCHIVE_SOURCE,
-    Config,
-    is_hn_source,
-)
 from .ranking import (
     Embedder,
     RankedStory,
     get_or_compute_embeddings,
     clean_text,
     compose_story_text,
-    story_embedding_text,
     _extract_comments_recursive,
     _select_top_comments,
-    TOP_COMMENT_LIMIT,
 )
 
 

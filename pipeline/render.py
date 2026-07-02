@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from jinja2 import Environment, FileSystemLoader
 

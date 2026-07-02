@@ -28,8 +28,6 @@ from .config import (
     BQ_ARCHIVE_SOURCE,
     CH_ARCHIVE_SOURCE,
     Config,
-    LIVE_WINDOW_LIMIT,
-    ModelConfig,
     is_hn_source,
 )
 
