@@ -3,7 +3,7 @@
          data-story-id="{{ card.story.id }}"
          data-score="{{ card.score }}"
          data-time="{{ card.story.time }}"
-         data-source="{{ card.story.source }}"
+         data-story-source="{{ card.story.source }}"
          data-is-hn="{{ card.is_hn_attr }}"
          data-sort-popular="{{ card.sort_popular_attr }}"
          data-sort-explore="{{ card.sort_explore_attr }}"
@@ -38,9 +38,7 @@
     </a>
   </h2>
 
-  <div class="story-footer">
-    <button type="button" class="tldr-detail-btn" data-tldr-detail>TLDR</button>
-  </div>
+  <div class="story-footer"></div>
 
   {% if card.best_match_title %}
   <p class="match-reason">Similar to: {{ card.best_match_title }}</p>

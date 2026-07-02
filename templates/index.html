@@ -587,24 +587,6 @@
       box-shadow: 0 1px 1px rgba(0, 0, 0, 0.1);
     }
 
-    .tldr-detail-btn {
-      padding: 0.1rem 0.45rem;
-      font-size: 0.8rem;
-      border-radius: 4px;
-      background: transparent;
-      border: 1px solid var(--pico-muted-border-color);
-      color: var(--pico-muted-color);
-      cursor: pointer;
-      line-height: 1.2;
-      transition: all 0.2s;
-      margin-bottom: 0;
-    }
-
-    .tldr-detail-btn:hover {
-      background: #2b3035;
-      color: white;
-    }
-
     .tldr-detail-content h1,
     .tldr-detail-content h2,
     .tldr-detail-content h3,
@@ -902,8 +884,8 @@
     const votedStoryIds = new Set();
     const feedbackChains = new Map();
     const MAX_QUEUE = 12;
-    const PREFETCH_COUNT = 3;
-    const IDLE_INACTIVE_PREFETCH_COUNT = 3;
+    const PREFETCH_COUNT = 2;
+    const IDLE_INACTIVE_PREFETCH_COUNT = 2;
     const tldrCache = new Map(); // storyId (number) → raw TLDR markdown (string)
     let idleAgePrefetchHandle = null;
     let toastTimer = null;
@@ -1052,6 +1034,7 @@
       }
 
       if (filterName === 'age') {
+        if (value === currentAge) return;
         currentAge = value;
         updateFilterTabs('age', currentAge);
         if (activeCard && (!matchesCurrentCombo(activeCard) || !matchesCurrentAxes(activeCard))) {
@@ -1456,12 +1439,6 @@
     });
 
     storiesContainer.addEventListener('click', async (e) => {
-      const tldrButton = e.target.closest('[data-tldr-detail]');
-      if (tldrButton) {
-        e.stopPropagation();
-        await openTldrDetail(tldrButton.closest('.story-card'));
-        return;
-      }
       const card = e.target.closest('.story-card');
       if (!card) {
         return;
@@ -1684,7 +1661,6 @@
         return;
       }
 
-      const btn = card.querySelector('[data-tldr-detail]');
       const storyId = Number(card.dataset.storyId);
       const storyTitle = card.querySelector('.story-title a')?.textContent || '';
 
@@ -1706,16 +1682,10 @@
         contentDiv.innerHTML = parseSimpleMarkdown(cached);
         styleTldrLabels(contentDiv);
         contentDiv.style.display = 'block';
-        if (btn) btn.style.display = 'none';
         return;
       }
 
       contentDiv.dataset.loading = 'true';
-
-      if (btn) {
-        btn.disabled = true;
-        btn.textContent = 'Analyzing...';
-      }
 
       const detailApiPath = apiPath('/api/tldr-detail');
       try {
@@ -1730,23 +1700,12 @@
           contentDiv.innerHTML = parseSimpleMarkdown(data.tldr);
           styleTldrLabels(contentDiv);
           contentDiv.style.display = 'block';
-          if (btn) {
-            btn.style.display = 'none';
-          }
         } else {
           const errData = await resp.json().catch(() => ({}));
-          if (btn) {
-            btn.textContent = 'Failed';
-            btn.title = errData.error || 'Failed to generate TLDR';
-            btn.disabled = false;
-          }
+          console.warn('openTldrDetail failed:', errData.error || `HTTP ${resp.status}`);
         }
       } catch (err) {
         console.error(err);
-        if (btn) {
-          btn.textContent = 'Error';
-          btn.disabled = false;
-        }
       } finally {
         delete contentDiv.dataset.loading;
       }
