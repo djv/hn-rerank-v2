@@ -140,6 +140,7 @@ class RankScoreContext:
     feedback_embeddings: NDArray[np.float32] | None = None
     cand_closest_up: NDArray[np.float32] | None = None
     cand_closest_down: NDArray[np.float32] | None = None
+    cand_closest_neutral: NDArray[np.float32] | None = None
 
 
 def _feedback_signature(db: Database, user_id: int) -> str:
@@ -1915,21 +1916,49 @@ def get_or_compute_embeddings(
 _LOG_TEXTLEN_SCALE = 12.0  # log1p(~100000) ≈ 11.5
 
 
+_SIM_CHUNK_SIZE = 1024
+
+
 def _knn_similarity(
-    query_emb: NDArray[np.float32], ref_emb: NDArray[np.float32], k: int
+    query_emb: NDArray[np.float32],
+    ref_emb: NDArray[np.float32],
+    k: int,
+    chunk_size: int = _SIM_CHUNK_SIZE,
 ) -> NDArray[np.float32]:
-    """Mean of top-k cosine similarities between query and reference embeddings."""
+    """Mean of top-k cosine similarities, chunked over queries for low memory."""
     if ref_emb.shape[0] == 0:
         return np.zeros(query_emb.shape[0], dtype=np.float32)
-    sim_mat = query_emb @ ref_emb.T
     k_actual = min(k, ref_emb.shape[0])
     if k_actual <= 0:
         return np.zeros(query_emb.shape[0], dtype=np.float32)
-    if k_actual == sim_mat.shape[1]:
-        topk = sim_mat
-    else:
-        topk = np.partition(sim_mat, sim_mat.shape[1] - k_actual, axis=1)[:, -k_actual:]
-    return topk.mean(axis=1).astype(np.float32)
+    n_ref = ref_emb.shape[0]
+    n = query_emb.shape[0]
+    result = np.empty(n, dtype=np.float32)
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        sim_chunk = query_emb[start:end] @ ref_emb.T
+        if k_actual == n_ref:
+            topk = sim_chunk
+        else:
+            topk = np.partition(sim_chunk, n_ref - k_actual, axis=1)[:, -k_actual:]
+        result[start:end] = topk.mean(axis=1)
+    return result.astype(np.float32)
+
+
+def _chunked_max_dot(
+    query: NDArray[np.float32],
+    ref: NDArray[np.float32],
+    chunk_size: int = _SIM_CHUNK_SIZE,
+) -> NDArray[np.float32]:
+    """Chunked max-similarity: equivalent to np.max(query @ ref.T, axis=1)."""
+    if ref.shape[0] == 0:
+        return np.zeros(query.shape[0], dtype=np.float32)
+    n = query.shape[0]
+    result = np.empty(n, dtype=np.float32)
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        result[start:end] = np.max(query[start:end] @ ref.T, axis=1)
+    return result.astype(np.float32)
 
 
 def _topk_mean(values: NDArray[np.float32], k: int) -> float:
@@ -2146,8 +2175,10 @@ def _score_and_rank(
             fb_labels_arr = np.array(feedback_labels)
             up_mask = fb_labels_arr == 2
             down_mask = fb_labels_arr == 0
+            neutral_mask = fb_labels_arr == 1
             fb_up_embs = fb_embeddings[up_mask]
             fb_down_embs = fb_embeddings[down_mask]
+            fb_neutral_embs = fb_embeddings[neutral_mask]
 
             n_up = int(up_mask.sum())
             n_down = int(down_mask.sum())
@@ -2155,20 +2186,14 @@ def _score_and_rank(
             emb_dim = candidate_embeddings.shape[1]
 
             with trace.stage("svm_candidate_feature_prep"):
-                # k-NN similarity (mean of top-k similarities to class)
                 cand_sim_to_up = _knn_similarity(candidate_embeddings, fb_up_embs, k)
                 cand_sim_to_down = _knn_similarity(
                     candidate_embeddings, fb_down_embs, k
                 )
-                cand_closest_up = (
-                    np.max(candidate_embeddings @ fb_up_embs.T, axis=1)
-                    if up_mask.any()
-                    else np.zeros(len(candidates), dtype=np.float32)
-                )
-                cand_closest_down = (
-                    np.max(candidate_embeddings @ fb_down_embs.T, axis=1)
-                    if down_mask.any()
-                    else np.zeros(len(candidates), dtype=np.float32)
+                cand_closest_up = _chunked_max_dot(candidate_embeddings, fb_up_embs)
+                cand_closest_down = _chunked_max_dot(candidate_embeddings, fb_down_embs)
+                cand_closest_neutral = _chunked_max_dot(
+                    candidate_embeddings, fb_neutral_embs
                 )
                 positive_cluster_centers = _positive_cluster_centers(
                     fb_up_embs, config.model.positive_cluster_k
@@ -2201,6 +2226,9 @@ def _score_and_rank(
             if score_context is not None:
                 score_context.cand_closest_up = cand_closest_up.astype(np.float32)
                 score_context.cand_closest_down = cand_closest_down.astype(np.float32)
+                score_context.cand_closest_neutral = cand_closest_neutral.astype(
+                    np.float32
+                )
 
             if cached_model is not None:
                 if trace is not None:
@@ -2592,6 +2620,7 @@ def rerank_candidates(
         else:
             cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
 
+    score_context = RankScoreContext()
     ranked = _score_and_rank(
         candidates,
         cand_embeddings,
@@ -2600,6 +2629,7 @@ def rerank_candidates(
         embedder,
         user_id=user_id,
         trace=trace,
+        score_context=score_context,
     )
 
     # Build MMR embeddings map once (used per combo)
@@ -2608,34 +2638,38 @@ def rerank_candidates(
         embeddings_map = {s.id: vec for s, vec in zip(candidates, cand_embeddings)}
 
     with trace.stage("badge_similarity"):
-        # Calculate parameters for remaining discovery passes
-        feedback_stories, feedback_labels, _ = db.get_feedback_for_training(
-            user_id=user_id
-        )
-        fb_labels_arr = np.array(feedback_labels)
-        up_mask = fb_labels_arr == 2
-        down_mask = fb_labels_arr == 0
-        neutral_mask = fb_labels_arr == 1
-        fb_embeddings = get_or_compute_embeddings(feedback_stories, embedder, db)
-        fb_up_embs = fb_embeddings[up_mask]
-        fb_down_embs = fb_embeddings[down_mask]
-        fb_neutral_embs = fb_embeddings[neutral_mask]
+        # Reuse vectors from _score_and_rank when SVM was trained;
+        # otherwise compute them (chunked) on demand.
+        if score_context.cand_closest_up is not None:
+            cand_closest_up = score_context.cand_closest_up
+            cand_closest_down = score_context.cand_closest_down
+            cand_closest_neutral = score_context.cand_closest_neutral
+        else:
+            feedback_stories, feedback_labels, _ = db.get_feedback_for_training(
+                user_id=user_id
+            )
+            fb_labels_arr = np.array(feedback_labels)
+            up_mask = fb_labels_arr == 2
+            down_mask = fb_labels_arr == 0
+            neutral_mask = fb_labels_arr == 1
+            fb_embs = get_or_compute_embeddings(feedback_stories, embedder, db)
+            cand_closest_up = (
+                _chunked_max_dot(cand_embeddings, fb_embs[up_mask])
+                if up_mask.any()
+                else np.zeros(len(candidates), dtype=np.float32)
+            )
+            cand_closest_down = (
+                _chunked_max_dot(cand_embeddings, fb_embs[down_mask])
+                if down_mask.any()
+                else np.zeros(len(candidates), dtype=np.float32)
+            )
+            cand_closest_neutral = (
+                _chunked_max_dot(cand_embeddings, fb_embs[neutral_mask])
+                if neutral_mask.any()
+                else np.zeros(len(candidates), dtype=np.float32)
+            )
 
-        cand_closest_up = (
-            np.max(cand_embeddings @ fb_up_embs.T, axis=1)
-            if up_mask.any()
-            else np.zeros(len(candidates))
-        )
-        cand_closest_down = (
-            np.max(cand_embeddings @ fb_down_embs.T, axis=1)
-            if down_mask.any()
-            else np.zeros(len(candidates))
-        )
-        cand_closest_neutral = (
-            np.max(cand_embeddings @ fb_neutral_embs.T, axis=1)
-            if neutral_mask.any()
-            else np.zeros(len(candidates))
-        )
+        assert cand_closest_down is not None and cand_closest_neutral is not None
         cand_max_sim = np.maximum.reduce(
             [cand_closest_up, cand_closest_down, cand_closest_neutral]
         )
