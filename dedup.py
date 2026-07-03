@@ -255,6 +255,12 @@ def dedup_ranked(
     if cfg.embedding_cosine_enabled and embeddings is not None:
         threshold = cfg.embedding_cosine_threshold
         kept: list[tuple[int, Story, NDArray[np.float32] | None]] = []
+
+        max_kept = len(survivors)
+        K = np.empty((max_kept, 384), dtype=np.float32)
+        n_vecs = 0
+        vec_to_kept: list[int] = []
+
         for pos, s in survivors:
             vec = embeddings.get(s.id)
             if vec is None:
@@ -262,21 +268,27 @@ def dedup_ranked(
                 continue
 
             discarded = False
-            for ki, (kpos, kstory, kvec) in enumerate(kept):
-                if kvec is None:
-                    continue
-                cos_sim = float(np.dot(vec, kvec))
+            if n_vecs > 0:
+                sims = K[:n_vecs] @ vec
+                best = int(np.argmax(sims))
+                cos_sim = float(sims[best])
                 if cos_sim >= threshold:
+                    ki = vec_to_kept[best]
+                    kpos, kstory, kvec = kept[ki]
                     skey = _story_sort_key(s, pos, cfg)
                     ckey = _story_sort_key(kstory, kpos, cfg)
                     if skey < ckey:
                         embedding_suppressed.append((kstory, s, cos_sim))
                         kept[ki] = (pos, s, vec)
+                        K[best] = vec
                     else:
                         embedding_suppressed.append((s, kstory, cos_sim))
                     discarded = True
-                    break
+
             if not discarded:
+                K[n_vecs] = vec
+                vec_to_kept.append(len(kept))
+                n_vecs += 1
                 kept.append((pos, s, vec))
 
         survivors = [(pos, s) for pos, s, _ in kept]
