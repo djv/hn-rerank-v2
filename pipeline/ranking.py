@@ -45,7 +45,13 @@ EmbeddingOrtVariant: TypeAlias = Literal[
 # (number / semantics of meta columns appended to the embedding) changes;
 # the cache key then changes for every user, forcing a clean re-fit.
 _MODEL_CACHE_STORAGE_MAXSIZE = 10_000
-_MODEL_CACHE: LRUCache[tuple[int, str, int], tuple[SVC, StandardScaler]] = LRUCache(
+# Cached value: (svm, scaler, positive_cluster_centers). The centers depend
+# only on the up-voted feedback embeddings — same invalidation as the SVM —
+# so they are cached alongside it to skip the per-regen KMeans on cache hits.
+# ``centers`` may be None for entries written before this field existed (or by
+# tests); callers must fall back to recomputing when it is None.
+_CachedModel = tuple[SVC, StandardScaler, "NDArray[np.float32] | None"]
+_MODEL_CACHE: LRUCache[tuple[int, str, int], _CachedModel] = LRUCache(
     maxsize=_MODEL_CACHE_STORAGE_MAXSIZE
 )
 _MODEL_CACHE_LOCK = threading.Lock()
@@ -130,7 +136,7 @@ def _feedback_signature(db: Database, user_id: int) -> str:
 
 def _get_cached_model(
     user_id: int | None, signature: str
-) -> tuple[SVC, StandardScaler] | None:
+) -> _CachedModel | None:
     if user_id is None:
         return None
     with _MODEL_CACHE_LOCK:
@@ -147,12 +153,14 @@ def _set_cached_model(
     svm: SVC,
     scaler: StandardScaler,
     maxsize: int = 20,
+    *,
+    centers: NDArray[np.float32] | None = None,
 ) -> None:
     if user_id is None:
         return
     with _MODEL_CACHE_LOCK:
         key = (user_id, signature, _MODEL_SCHEMA_VERSION)
-        _MODEL_CACHE[key] = (svm, scaler)
+        _MODEL_CACHE[key] = (svm, scaler, centers)
         while len(_MODEL_CACHE) > maxsize:
             _MODEL_CACHE.popitem()
 
@@ -582,6 +590,41 @@ def _knn_similarity(
     return result.astype(np.float32)
 
 
+def _knn_mean_and_max(
+    query_emb: NDArray[np.float32],
+    ref_emb: NDArray[np.float32],
+    k: int,
+    chunk_size: int = _SIM_CHUNK_SIZE,
+) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+    """Fused (top-k mean, max) cosine similarity in a single dot pass.
+
+    Exactly equivalent to the pair
+    ``(_knn_similarity(query, ref, k), _chunked_max_dot(query, ref))`` but
+    computes the ``query @ ref.T`` matrix once instead of twice — the max is
+    just the top-1 of the same similarity rows the k-NN mean already reduces.
+    """
+    n = query_emb.shape[0]
+    if ref_emb.shape[0] == 0:
+        zeros = np.zeros(n, dtype=np.float32)
+        return zeros, zeros.copy()
+    n_ref = ref_emb.shape[0]
+    k_actual = min(k, n_ref)
+    mean_out = np.zeros(n, dtype=np.float32)
+    max_out = np.zeros(n, dtype=np.float32)
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        sim_chunk = query_emb[start:end] @ ref_emb.T
+        max_out[start:end] = np.max(sim_chunk, axis=1)
+        if k_actual <= 0:
+            continue
+        if k_actual == n_ref:
+            topk = sim_chunk
+        else:
+            topk = np.partition(sim_chunk, n_ref - k_actual, axis=1)[:, -k_actual:]
+        mean_out[start:end] = topk.mean(axis=1)
+    return mean_out.astype(np.float32), max_out.astype(np.float32)
+
+
 def _chunked_max_dot(
     query: NDArray[np.float32],
     ref: NDArray[np.float32],
@@ -792,7 +835,7 @@ def _score_and_rank(
             # construction. Cache hits still need candidate-side features,
             # but they do not need LOOCV training matrices.
             fb_sig = _feedback_signature(db, user_id) if user_id is not None else ""
-            cached_model: tuple[SVC, StandardScaler] | None = None
+            cached_model: _CachedModel | None = None
             if fb_sig:
                 cached_model = _get_cached_model(user_id, fb_sig)
 
@@ -823,18 +866,26 @@ def _score_and_rank(
             emb_dim = candidate_embeddings.shape[1]
 
             with trace.stage("svm_candidate_feature_prep"):
-                cand_sim_to_up = _knn_similarity(candidate_embeddings, fb_up_embs, k)
-                cand_sim_to_down = _knn_similarity(
+                # Fused (top-k mean, max) per class — one dot pass each instead
+                # of the two _knn_similarity/_chunked_max_dot recomputed the
+                # same candidate @ feedback matrix twice.
+                cand_sim_to_up, cand_closest_up = _knn_mean_and_max(
+                    candidate_embeddings, fb_up_embs, k
+                )
+                cand_sim_to_down, cand_closest_down = _knn_mean_and_max(
                     candidate_embeddings, fb_down_embs, k
                 )
-                cand_closest_up = _chunked_max_dot(candidate_embeddings, fb_up_embs)
-                cand_closest_down = _chunked_max_dot(candidate_embeddings, fb_down_embs)
                 cand_closest_neutral = _chunked_max_dot(
                     candidate_embeddings, fb_neutral_embs
                 )
-                positive_cluster_centers = _positive_cluster_centers(
-                    fb_up_embs, config.model.positive_cluster_k
-                )
+                # Cluster centers depend only on up-voted feedback, so reuse the
+                # cached ones on a model-cache hit instead of rerunning KMeans.
+                if cached_model is not None and cached_model[2] is not None:
+                    positive_cluster_centers = cached_model[2]
+                else:
+                    positive_cluster_centers = _positive_cluster_centers(
+                        fb_up_embs, config.model.positive_cluster_k
+                    )
                 cand_positive_cluster_sim = _similarity_to_positive_cluster_centers(
                     candidate_embeddings, positive_cluster_centers
                 )
@@ -870,7 +921,7 @@ def _score_and_rank(
             if cached_model is not None:
                 if trace is not None:
                     trace.set_label("model_cache", "hit")
-                svm, scaler = cached_model
+                svm, scaler, _ = cached_model
             else:
                 if trace is not None:
                     trace.set_label("model_cache", "miss")
@@ -975,7 +1026,12 @@ def _score_and_rank(
                     svm.fit(fb_features_scaled, labels, sample_weight=sample_weights)
                 if fb_sig:
                     _set_cached_model(
-                        user_id, fb_sig, svm, scaler, config.max_cached_models
+                        user_id,
+                        fb_sig,
+                        svm,
+                        scaler,
+                        config.max_cached_models,
+                        centers=positive_cluster_centers,
                     )
 
             with trace.stage("svm_candidate_scale"):

@@ -2,6 +2,34 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-03 — Rank hot-path: fuse sim matmuls + cache cluster centers
+
+Two behavior-preserving perf changes to `svm_candidate_feature_prep` (was
+~1.9–3.5s warm/cold for user 1 with 2955 feedback rows):
+
+1. **Fused (top-k mean, max) similarity.** `_knn_mean_and_max` computes the
+   `candidate @ feedback.T` matrix once and derives both the k-NN mean and the
+   max (top-1) from it, replacing the separate `_knn_similarity` +
+   `_chunked_max_dot` calls that recomputed the same matrix twice per class
+   (up/down). Neutral still uses `_chunked_max_dot` (max only).
+   `_knn_similarity`/`_chunked_max_dot` are retained (used by `eval.py` and
+   `scripts/eval_ranker_variants.py`). A hypothesis test asserts the fused
+   helper is bit-for-bit equal to the pair it replaces.
+
+2. **Cached positive cluster centers.** `KMeans(n_init=10)` on up-voted
+   feedback was rerun every regen even on a model-cache hit, despite depending
+   only on `fb_up_embs` (same invalidation as the cached SVM). The cache value
+   is now `(svm, scaler, centers)`; on a hit with non-None centers the KMeans
+   is skipped. Entries with `centers=None` (pre-existing/test) fall back to
+   recomputing. Reuse == recompute because `KMeans(random_state=0)` is
+   deterministic over the identical `fb_up_embs`.
+
+Companion to the earlier dedup vectorization (dedup ~2900ms → ~360ms). Remaining
+headline cost is `decision_ms` (~5s, libsvm RBF scalar loop) — deferred, needs a
+numerical-equivalence-guarded BLAS reformulation.
+
+**Files**: `pipeline/ranking.py`, `tests/test_pipeline.py`, `WORKLOG.md`.
+
 ## 2026-07-03 — Config-gated embedding runtime knobs
 
 Added production-safe embedding knobs with defaults matching the previous
