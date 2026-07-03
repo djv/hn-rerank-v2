@@ -122,7 +122,7 @@ def _normalize_tldr_markdown(text: str) -> str:
             lines.append(line)
 
     normalized = "\n".join(lines)
-    normalized = re.sub(r"(\S)\s+-\s+(?=\S)", r"\1\n- ", normalized)
+    normalized = re.sub(r"([.!;?:])\s+-\s+(?=\S)", r"\1\n- ", normalized)
     return normalized.strip()
 
 
@@ -167,7 +167,7 @@ class LessWrongContext:
 class ArticleFetchResult:
     body: str | None = None
     status: int | None = None
-    error: str = ""
+    error: str | None = None
     permanent: bool = False
 
 

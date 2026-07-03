@@ -6060,3 +6060,16 @@ tldr=...)`. Direct `_call_llm_chat` mock assertions updated to check
 
 **Files**: `server.py`, `tests/test_server.py`, `prompts/combined_v4.txt`
 (deleted), `WORKLOG.md`.
+
+## 2026-07-03 — Contract cleanup + hyphen regex fix
+
+- `ArticleFetchResult.error` type changed from `str = ""` to `str | None = None`.
+  The `None` sentinel means "no error"; callers that check `if result.error:`
+  or `result.error == "..."` continue to work. Updated `record_article_fetch_failure`
+  to accept `str | None` and guard the `[:500]` slice.
+- `_normalize_tldr_markdown` inline-bullet regex tightened from `(\S)\s+-\s+(?=\S)`
+  to `([.!;?:])\s+-\s+(?=\S)`, requiring sentence-ending punctuation before ` - `
+  to prevent false splits (e.g. "range 5 - 10", "technology - new breakthrough").
+- Updated test assertions from `result.error == ""` to `result.error is None`.
+
+**Files**: `server.py`, `database.py`, `tests/test_fetch.py`, `WORKLOG.md`.

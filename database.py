@@ -772,7 +772,7 @@ class Database:
         url: str,
         *,
         status: int | None = None,
-        error: str = "",
+        error: str | None = None,
         permanent: bool = False,
         next_retry_at: float | None = None,
     ) -> None:
@@ -801,7 +801,7 @@ class Database:
                         story_id,
                         url,
                         status,
-                        error[:500],
+                        (error or "")[:500],
                         1 if permanent else 0,
                         next_retry_at,
                         now,

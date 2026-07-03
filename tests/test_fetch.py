@@ -279,7 +279,7 @@ async def test_fetch_allows_text_plain(monkeypatch):
 
     result = await _fetch_article_body_with_result("https://example.com/plain")
     assert result.body is not None
-    assert result.error == ""
+    assert result.error is None
 
 
 @pytest.mark.asyncio
@@ -333,4 +333,4 @@ async def test_fetch_allows_missing_content_type(monkeypatch):
 
     result = await _fetch_article_body_with_result("https://example.com/noct")
     assert result.body is not None
-    assert result.error == ""
+    assert result.error is None
