@@ -783,6 +783,46 @@ _PAYWALL_DOMAINS: frozenset[str] = frozenset(
     }
 )
 
+_BINARY_SUFFIXES: tuple[str, ...] = (
+    ".pdf",
+    ".doc",
+    ".docx",
+    ".ppt",
+    ".pptx",
+    ".xls",
+    ".xlsx",
+    ".ps",
+    ".zip",
+    ".tar",
+    ".gz",
+    ".bz2",
+    ".xz",
+    ".tgz",
+    ".rar",
+    ".7z",
+    ".dmg",
+    ".iso",
+    ".deb",
+    ".rpm",
+    ".apk",
+    ".exe",
+    ".mp3",
+    ".wav",
+    ".flac",
+    ".ogg",
+    ".mp4",
+    ".mkv",
+    ".avi",
+    ".mov",
+    ".webm",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".svg",
+)
+
 
 def _is_fetchable_article_url(url: str) -> bool:
     """Return False for URLs that will never yield extractable article text."""
@@ -794,6 +834,8 @@ def _is_fetchable_article_url(url: str) -> bool:
     if any(host == d or host.endswith("." + d) for d in _PAYWALL_DOMAINS):
         return False
     if "youtube.com/watch" in url or "youtu.be/" in url:
+        return False
+    if urlparse(url).path.lower().endswith(_BINARY_SUFFIXES):
         return False
     return True
 
@@ -892,55 +934,78 @@ async def fetch_and_cache_article_bodies(
 
     async def fetch_one(story: Story) -> tuple[int, Story | None]:
         async with sem:
-            result = await _fetch_article_body_with_result(story.url or "")
-            if result.body:
-                body = result.body[:ARTICLE_BODY_CHAR_LIMIT]
-                new_text = compose_story_text(
-                    story.title,
-                    story.self_text,
-                    story.top_comments,
-                    body,
-                )
-                updated = replace(story, article_body=body, text_content=new_text)
-                db.upsert_story(updated)
-                new_vec = embedder.encode([new_text])[0]
-                new_hash = hashlib.sha256(new_text.encode("utf-8")).hexdigest()
-                db.upsert_embedding(story.id, model_version, new_hash, new_vec)
-                db.clear_article_fetch_failure(story.id)
-                success[0] += 1
-                return story.id, updated
+            try:
+                result = await _fetch_article_body_with_result(story.url or "")
+                if result.body:
+                    body = result.body[:ARTICLE_BODY_CHAR_LIMIT]
+                    new_text = compose_story_text(
+                        story.title,
+                        story.self_text,
+                        story.top_comments,
+                        body,
+                    )
+                    updated = replace(story, article_body=body, text_content=new_text)
+                    db.upsert_story(updated)
+                    new_vec = embedder.encode([new_text])[0]
+                    new_hash = hashlib.sha256(new_text.encode("utf-8")).hexdigest()
+                    db.upsert_embedding(story.id, model_version, new_hash, new_vec)
+                    db.clear_article_fetch_failure(story.id)
+                    success[0] += 1
+                    return story.id, updated
 
-            now_ts = time.time()
-            previous = db.get_article_fetch_failure(story.id)
-            previous_count = int(previous["failure_count"]) if previous else 0
-            failure_count = previous_count + 1
-            permanent = (
-                result.permanent
-                or (result.error == "empty_extraction" and failure_count >= 3)
-                or (
-                    result.error is not None
-                    and result.error in ("http_401", "http_403")
-                    and failure_count >= 3
+                now_ts = time.time()
+                previous = db.get_article_fetch_failure(story.id)
+                previous_count = int(previous["failure_count"]) if previous else 0
+                failure_count = previous_count + 1
+                permanent = (
+                    result.permanent
+                    or (result.error == "empty_extraction" and failure_count >= 3)
+                    or (
+                        result.error is not None
+                        and result.error in ("http_401", "http_403")
+                        and failure_count >= 3
+                    )
                 )
-            )
-            next_retry_at = (
-                now_ts + 3650 * 86400
-                if permanent
-                else _article_failure_retry_time(failure_count, now_ts)
-            )
-            db.record_article_fetch_failure(
-                story.id,
-                story.url or "",
-                status=result.status,
-                error=result.error,
-                permanent=permanent,
-                next_retry_at=next_retry_at,
-            )
-            error_key = result.error or (
-                f"http_{result.status}" if result.status else "unknown"
-            )
-            error_counts[error_key] = error_counts.get(error_key, 0) + 1
-            return story.id, None
+                next_retry_at = (
+                    now_ts + 3650 * 86400
+                    if permanent
+                    else _article_failure_retry_time(failure_count, now_ts)
+                )
+                db.record_article_fetch_failure(
+                    story.id,
+                    story.url or "",
+                    status=result.status,
+                    error=result.error,
+                    permanent=permanent,
+                    next_retry_at=next_retry_at,
+                )
+                error_key = result.error or (
+                    f"http_{result.status}" if result.status else "unknown"
+                )
+                error_counts[error_key] = error_counts.get(error_key, 0) + 1
+                return story.id, None
+            except Exception:
+                logging.exception(
+                    "article_fetch: unexpected exception story_id=%d url=%s",
+                    story.id,
+                    story.url or "",
+                )
+                now_ts = time.time()
+                previous = db.get_article_fetch_failure(story.id)
+                previous_count = int(previous["failure_count"]) if previous else 0
+                failure_count = previous_count + 1
+                db.record_article_fetch_failure(
+                    story.id,
+                    story.url or "",
+                    status=None,
+                    error="internal_exception",
+                    permanent=False,
+                    next_retry_at=_article_failure_retry_time(failure_count, now_ts),
+                )
+                error_counts["internal_exception"] = (
+                    error_counts.get("internal_exception", 0) + 1
+                )
+                return story.id, None
 
     results = await asyncio.gather(*(fetch_one(story) for story in stories))
     error_summary = (

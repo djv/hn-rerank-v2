@@ -297,7 +297,18 @@ async def _fetch_article_body_with_result(url: str) -> ArticleFetchResult:
                     await asyncio.sleep(1)
                     continue
                 if resp.status_code == 200:
+                    ct = (resp.headers.get("content-type") or "").lower()
+                    if ct and not ct.startswith(
+                        ("text/html", "application/xhtml+xml", "text/xml", "text/plain")
+                    ):
+                        return ArticleFetchResult(
+                            status=200, error="non_html", permanent=True
+                        )
                     html = resp.text
+                    if "\x00" in html:
+                        return ArticleFetchResult(
+                            status=200, error="non_html", permanent=True
+                        )
                 elif resp.status_code in (403, 503) and attempt == 0:
                     status, html, _headers = await fetch_with_urllib_fallback(
                         client, url, headers
@@ -306,6 +317,10 @@ async def _fetch_article_body_with_result(url: str) -> ArticleFetchResult:
                         return ArticleFetchResult(
                             status=status,
                             error=f"http_{status}",
+                        )
+                    if "\x00" in html:
+                        return ArticleFetchResult(
+                            status=200, error="non_html", permanent=True
                         )
                 else:
                     return ArticleFetchResult(
@@ -316,7 +331,11 @@ async def _fetch_article_body_with_result(url: str) -> ArticleFetchResult:
         except Exception as e:
             return ArticleFetchResult(error=type(e).__name__)
 
-        text = _extract_article_body(html)
+        try:
+            text = _extract_article_body(html)
+        except Exception as e:
+            logging.warning("extract_article_body failed for %s: %s", url, e)
+            return ArticleFetchResult(error=f"extract_{type(e).__name__}")
         if text:
             return ArticleFetchResult(body=text[:ARTICLE_BODY_CHAR_LIMIT], status=200)
         return ArticleFetchResult(status=200, error="empty_extraction")
@@ -1451,7 +1470,13 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             return _flask_text_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
         data = json.loads(body)
 
-        story_id = data["story_id"]
+        story_id_raw = data.get("story_id")
+        if not isinstance(story_id_raw, int) or isinstance(story_id_raw, bool):
+            return _flask_json_response(
+                {"error": "Invalid request: story_id must be an integer"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+        story_id: int = story_id_raw
 
         story = runtime.db.get_story(story_id)
         if not story:
@@ -1736,10 +1761,10 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
                 cache_key[:12],
             )
         return _flask_json_response({"ok": True, "tldr": tldr, "cached": False})
-    except Exception as e:
-        logging.error("Error handling tldr-detail: %r", e)
+    except Exception:
+        logging.exception("Error handling tldr-detail")
         return _flask_json_response(
-            {"error": "Internal error"}, status=HTTPStatus.BAD_REQUEST
+            {"error": "Internal error"}, status=HTTPStatus.INTERNAL_SERVER_ERROR
         )
 
 
