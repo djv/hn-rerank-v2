@@ -678,31 +678,59 @@ async def generate_detailed_tldr(
         discussion_prompt = _load_prompt("discussion_v4.txt").format(
             title=title, comments_section=comments_section
         )
-        article_result = await _call_llm_chat(
+        article_task = _call_llm_chat(
             api_key=api_key,
             base_url=base_url,
             model=model,
             prompt=article_prompt,
             max_tokens=900,
         )
-        if not article_result.ok:
-            return _llm_error_from(article_result)
-        discussion_result = await _call_llm_chat(
+        discussion_task = _call_llm_chat(
             api_key=api_key,
             base_url=base_url,
             model=model,
             prompt=discussion_prompt,
             max_tokens=900,
         )
-        if not discussion_result.ok:
-            return _llm_error_from(discussion_result)
-        article_text = _normalize_tldr_markdown(article_result.content)
-        discussion_text = _normalize_tldr_markdown(discussion_result.content)
-        if not article_text.strip() and not discussion_text.strip():
-            return TldrResult(kind="llm_error", error_text="empty LLM response")
+        article_result, discussion_result = await asyncio.gather(
+            article_task,
+            discussion_task,
+        )
+
+        if article_result.ok and discussion_result.ok:
+            article_text = _normalize_tldr_markdown(article_result.content)
+            discussion_text = _normalize_tldr_markdown(discussion_result.content)
+            if not article_text.strip() and not discussion_text.strip():
+                return TldrResult(kind="llm_error", error_text="empty LLM response")
+            return TldrResult(
+                kind="ok",
+                tldr=f"### Article\n{article_text}\n\n### Discussion\n{discussion_text}",
+            )
+
+        if article_result.ok and not discussion_result.ok:
+            logging.warning(
+                "tldr: discussion call failed (status=%s), salvaging article-only",
+                discussion_result.status,
+            )
+            article_text = _normalize_tldr_markdown(article_result.content)
+            if not article_text.strip():
+                return TldrResult(kind="llm_error", error_text="empty LLM response")
+            return TldrResult(kind="ok", tldr=f"### Article\n{article_text}")
+
+        if not article_result.ok and discussion_result.ok:
+            logging.warning(
+                "tldr: article call failed (status=%s), salvaging discussion-only",
+                article_result.status,
+            )
+            discussion_text = _normalize_tldr_markdown(discussion_result.content)
+            if not discussion_text.strip():
+                return TldrResult(kind="llm_error", error_text="empty LLM response")
+            return TldrResult(kind="ok", tldr=f"### Discussion\n{discussion_text}")
+
         return TldrResult(
-            kind="ok",
-            tldr=f"### Article\n{article_text}\n\n### Discussion\n{discussion_text}",
+            kind="llm_error",
+            error_status=article_result.status or discussion_result.status,
+            error_text=f"Article: {article_result.content}; Discussion: {discussion_result.content}",
         )
 
     if article_section and not comments_section:
