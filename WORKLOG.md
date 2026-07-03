@@ -2,6 +2,48 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-03 — Config-gated embedding runtime knobs
+
+Added production-safe embedding knobs with defaults matching the previous
+runtime behavior:
+
+- `embedding_batch_size = 32`
+- `embedding_ort_variant = "current"`
+
+`Embedder` now accepts `batch_size` and `ort_variant`; `encode()` uses the
+configured batch size unless a caller explicitly overrides it. Supported ORT
+variants are `current`, `spin_off`, `spin_off_graph_all`, and
+`spin_off_auto_threads`. Runtime/server and embedding maintenance scripts pass
+the loaded config through to `Embedder`, while defaults keep existing behavior
+unchanged unless `config.toml` opts in.
+
+`scripts/benchmark_rank_cold_cache.py` gained
+`--embedding-batch-size` and `--embedding-ort-variant` so candidate settings can
+be tested against the real ranking path without editing `config.toml`.
+
+**Files**: `pipeline/config.py`, `pipeline/ranking.py`, `server.py`,
+embedding scripts, `scripts/benchmark_rank_cold_cache.py`, tests, `WORKLOG.md`.
+
+## 2026-07-03 — Read-only ONNX embedding benchmark
+
+Added `scripts/benchmark_embeddings.py` for comparing local `Embedder`
+session and batch-size choices without changing production embedding
+behavior. The script samples real story embedding text from SQLite in
+read-only mode, benchmarks tokenizer + ONNX + pooling together, and reports
+JSON plus a compact human table for the current session options, spinning-off
+variants, graph optimization, and auto intra-op threading.
+
+The benchmark uses `current` with batch size 32 as the numerical baseline and
+reports output shape, finite/norm checks, cosine drift, and max absolute vector
+drift for every variant. Added mocked tests covering JSON shape,
+deterministic sampling, variant session options, empty-text filtering, drift
+calculation, and read-only DB opening.
+
+**Command**: `uv run python scripts/benchmark_embeddings.py --sample-size 512 --runs 3`
+
+**Files**: `scripts/benchmark_embeddings.py`,
+`tests/test_benchmark_embeddings.py`, `WORKLOG.md`.
+
 ## 2026-07-02 — Fix orphaned TLDR cache after post-cache enrichment
 
 **Bug.** `_tldr_cache_key` hashes title/self_text/top_comments/article_body.

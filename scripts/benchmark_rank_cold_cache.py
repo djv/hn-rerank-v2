@@ -8,7 +8,7 @@ import sys
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -188,6 +188,23 @@ def main() -> None:
         default=None,
         help="Override Config.recent_candidate_rss_limit for this run.",
     )
+    parser.add_argument(
+        "--embedding-batch-size",
+        type=int,
+        default=None,
+        help="Override Config.embedding_batch_size for this run.",
+    )
+    parser.add_argument(
+        "--embedding-ort-variant",
+        choices=[
+            "current",
+            "spin_off",
+            "spin_off_graph_all",
+            "spin_off_auto_threads",
+        ],
+        default=None,
+        help="Override Config.embedding_ort_variant for this run.",
+    )
     args = parser.parse_args()
 
     config = Config.load(args.config)
@@ -195,6 +212,13 @@ def main() -> None:
         config = replace(config, recent_candidate_hn_limit=args.hn_candidate_limit)
     if args.rss_candidate_limit is not None:
         config = replace(config, recent_candidate_rss_limit=args.rss_candidate_limit)
+    if args.embedding_batch_size is not None:
+        config = replace(config, embedding_batch_size=args.embedding_batch_size)
+    if args.embedding_ort_variant is not None:
+        config = replace(
+            config,
+            embedding_ort_variant=cast(Any, args.embedding_ort_variant),
+        )
     db = Database(args.db, read_only=not args.allow_writes)
     try:
         user_id = args.user_id if args.user_id is not None else _heaviest_user_id(db)
@@ -221,7 +245,11 @@ def main() -> None:
                 "or pass --allow-writes for an explicit write-enabled benchmark."
             )
 
-        embedder = Embedder(config.onnx_model_dir)
+        embedder = Embedder(
+            config.onnx_model_dir,
+            batch_size=config.embedding_batch_size,
+            ort_variant=config.embedding_ort_variant,
+        )
         cold: list[dict[str, Any]] = []
         warm: list[dict[str, Any]] = []
 

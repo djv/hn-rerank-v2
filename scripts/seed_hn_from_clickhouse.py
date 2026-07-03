@@ -119,7 +119,11 @@ async def async_main() -> None:
     config = Config.load(args.config)
     db = Database(config.db_path)
     try:
-        embedder = Embedder(config.onnx_model_dir)
+        embedder = Embedder(
+            config.onnx_model_dir,
+            batch_size=config.embedding_batch_size,
+            ort_variant=config.embedding_ort_variant,
+        )
         (
             inserted,
             skipped_feedback,

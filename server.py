@@ -2032,7 +2032,11 @@ def main() -> None:
     regen_event = threading.Event()
     from pipeline import Embedder
 
-    embedder = Embedder(config.onnx_model_dir)
+    embedder = Embedder(
+        config.onnx_model_dir,
+        batch_size=config.embedding_batch_size,
+        ort_variant=config.embedding_ort_variant,
+    )
     Handler.config = config
     Handler.db = db
     Handler.embedder = embedder

@@ -11,7 +11,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, TypeAlias
 
 import numpy as np
 import onnxruntime as ort
@@ -30,6 +30,14 @@ from .config import (
     Config,
     is_hn_source,
 )
+
+
+EmbeddingOrtVariant: TypeAlias = Literal[
+    "current",
+    "spin_off",
+    "spin_off_graph_all",
+    "spin_off_auto_threads",
+]
 
 
 # SVM model cache: keyed on (user_id, feedback_signature, schema_version)
@@ -409,15 +417,48 @@ def story_embedding_text(story: Story) -> str:
     )
 
 
+def _embedding_session_options(ort_variant: EmbeddingOrtVariant) -> ort.SessionOptions:
+    session_options = ort.SessionOptions()
+    session_options.enable_cpu_mem_arena = False
+    session_options.enable_mem_pattern = False
+    session_options.intra_op_num_threads = 2
+    session_options.inter_op_num_threads = 1
+
+    if ort_variant == "current":
+        return session_options
+    if ort_variant == "spin_off":
+        session_options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        session_options.add_session_config_entry("session.inter_op.allow_spinning", "0")
+        return session_options
+    if ort_variant == "spin_off_graph_all":
+        session_options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        session_options.add_session_config_entry("session.inter_op.allow_spinning", "0")
+        session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        return session_options
+    if ort_variant == "spin_off_auto_threads":
+        session_options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        session_options.add_session_config_entry("session.inter_op.allow_spinning", "0")
+        session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        session_options.intra_op_num_threads = 0
+        session_options.inter_op_num_threads = 1
+        return session_options
+    raise ValueError(f"Unknown embedding ORT variant: {ort_variant}")
+
+
 # Algolia Fetching
 class Embedder:
-    def __init__(self, model_dir: str = "onnx_model"):
+    def __init__(
+        self,
+        model_dir: str = "onnx_model",
+        *,
+        batch_size: int = 32,
+        ort_variant: EmbeddingOrtVariant = "current",
+    ) -> None:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        self.batch_size = batch_size
         self.tokenizer: Any = AutoTokenizer.from_pretrained(model_dir)
-        session_options = ort.SessionOptions()
-        session_options.enable_cpu_mem_arena = False
-        session_options.enable_mem_pattern = False
-        session_options.intra_op_num_threads = 2
-        session_options.inter_op_num_threads = 1
+        session_options = _embedding_session_options(ort_variant)
         self.session = ort.InferenceSession(
             str(Path(model_dir) / "model.onnx"),
             sess_options=session_options,
@@ -425,13 +466,19 @@ class Embedder:
         )
         self.max_tokens = 512
 
-    def encode(self, texts: list[str], batch_size: int = 32) -> NDArray[np.float32]:
+    def encode(
+        self, texts: list[str], batch_size: int | None = None
+    ) -> NDArray[np.float32]:
         if not texts:
             return np.empty((0, 384), dtype=np.float32)
 
+        effective_batch_size = batch_size if batch_size is not None else self.batch_size
+        if effective_batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+
         embeddings = []
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i : i + batch_size]
+        for i in range(0, len(texts), effective_batch_size):
+            batch_texts = texts[i : i + effective_batch_size]
             inputs = self.tokenizer(
                 batch_texts,
                 padding=True,

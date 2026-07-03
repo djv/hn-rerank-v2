@@ -1,13 +1,15 @@
-from typing import cast
+from typing import Any, cast
 import asyncio
 import numpy as np
 import pytest
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from hypothesis import given, strategies as st, settings, HealthCheck
 from database import Database, Story
 from dataclasses import replace
 import pipeline
+import pipeline.ranking as ranking
 from pipeline import (
     BQ_ARCHIVE_SOURCE,
     CH_ARCHIVE_SOURCE,
@@ -62,6 +64,8 @@ def test_config_load_partial_toml_overlays_defaults(tmp_path):
         """
 [hn_rewrite]
 server_port = 9999
+embedding_batch_size = 8
+embedding_ort_variant = "spin_off_auto_threads"
 
 [hn_rewrite.model]
 svm_c = 0.7
@@ -76,6 +80,8 @@ feeds = ["https://example.com/a.xml", "https://example.com/b.xml"]
     config = Config.load(str(path))
 
     assert config.server_port == 9999
+    assert config.embedding_batch_size == 8
+    assert config.embedding_ort_variant == "spin_off_auto_threads"
     assert config.article_fetch_max_per_run == 50
     assert config.model.svm_c == 0.7
     assert config.model.svm_gamma == 0.03
@@ -85,6 +91,16 @@ feeds = ["https://example.com/a.xml", "https://example.com/b.xml"]
         "https://example.com/a.xml",
         "https://example.com/b.xml",
     )
+
+
+def test_config_rejects_invalid_embedding_batch_size():
+    with pytest.raises(ValueError, match="embedding_batch_size must be positive"):
+        Config(embedding_batch_size=0)
+
+
+def test_config_rejects_invalid_embedding_ort_variant():
+    with pytest.raises(ValueError, match="embedding_ort_variant must be one of"):
+        Config(embedding_ort_variant=cast(Any, "approximate_gelu"))
 
 
 def test_config_load_checked_in_config_contains_only_runtime_overrides():
@@ -294,6 +310,92 @@ def test_build_cold_deck_uses_badge_defaults(db: Database) -> None:
 def embedder():
     # Uses the real downloaded ONNX model
     return Embedder("onnx_model")
+
+
+def test_embedder_uses_configured_batch_and_ort_variant(monkeypatch):
+    class FakeTokenizer:
+        @classmethod
+        def from_pretrained(cls, model_dir):
+            assert model_dir == "onnx_model"
+            return cls()
+
+        def __call__(
+            self,
+            texts,
+            *,
+            padding,
+            truncation,
+            max_length,
+            return_tensors,
+        ):
+            assert padding is True
+            assert truncation is True
+            assert max_length == 512
+            assert return_tensors == "np"
+            width = max(1, max(len(text) for text in texts))
+            input_ids = np.ones((len(texts), width), dtype=np.int64)
+            attention_mask = np.ones((len(texts), width), dtype=np.int64)
+            return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    class FakeSessionOptions:
+        def __init__(self):
+            self.enable_cpu_mem_arena = None
+            self.enable_mem_pattern = None
+            self.intra_op_num_threads = None
+            self.inter_op_num_threads = None
+            self.graph_optimization_level = None
+            self.entries = {}
+
+        def add_session_config_entry(self, key, value):
+            self.entries[key] = value
+
+    class FakeSession:
+        def __init__(self, model_path, *, sess_options, providers):
+            assert model_path.endswith("model.onnx")
+            assert providers == ["CPUExecutionProvider"]
+            self.options = sess_options
+            self.run_calls = 0
+
+        def get_inputs(self):
+            return [
+                SimpleNamespace(name="input_ids"),
+                SimpleNamespace(name="attention_mask"),
+            ]
+
+        def run(self, output_names, onnx_inputs):
+            assert output_names is None
+            self.run_calls += 1
+            batch, tokens = onnx_inputs["input_ids"].shape
+            return [np.ones((batch, tokens, 384), dtype=np.float32)]
+
+    monkeypatch.setattr(ranking, "AutoTokenizer", FakeTokenizer)
+    monkeypatch.setattr(
+        ranking,
+        "ort",
+        SimpleNamespace(
+            SessionOptions=FakeSessionOptions,
+            InferenceSession=FakeSession,
+            GraphOptimizationLevel=SimpleNamespace(ORT_ENABLE_ALL="all"),
+        ),
+    )
+
+    embedder = Embedder(
+        "onnx_model",
+        batch_size=2,
+        ort_variant="spin_off_auto_threads",
+    )
+    embeddings = embedder.encode(["a", "bb", "ccc"])
+    session = cast(Any, embedder.session)
+
+    assert embeddings.shape == (3, 384)
+    assert session.run_calls == 2
+    assert session.options.entries == {
+        "session.intra_op.allow_spinning": "0",
+        "session.inter_op.allow_spinning": "0",
+    }
+    assert session.options.graph_optimization_level == "all"
+    assert session.options.intra_op_num_threads == 0
+    assert session.options.inter_op_num_threads == 1
 
 
 def test_embedder_output_shape(embedder):

@@ -54,7 +54,11 @@ async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     config = Config.load("config.toml")
-    embedder = Embedder(config.onnx_model_dir)
+    embedder = Embedder(
+        config.onnx_model_dir,
+        batch_size=config.embedding_batch_size,
+        ort_variant=config.embedding_ort_variant,
+    )
 
     sources = sys.argv[1:] or [
         "rss_theskepticalcardiologist_substack_com",

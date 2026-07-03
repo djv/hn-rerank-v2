@@ -44,7 +44,11 @@ def main() -> None:
 
     config = Config.load("config.toml")
     db = Database(config.db_path)
-    embedder = Embedder(config.onnx_model_dir)
+    embedder = Embedder(
+        config.onnx_model_dir,
+        batch_size=config.embedding_batch_size,
+        ort_variant=config.embedding_ort_variant,
+    )
 
     rows = db.execute(
         "SELECT s.id FROM stories s "

@@ -1896,7 +1896,15 @@ def main() -> None:
     needs_field = (not requested) or any(
         name.startswith("field_") for name in requested
     )
-    embedder = Embedder(config.onnx_model_dir) if needs_field else None
+    embedder = (
+        Embedder(
+            config.onnx_model_dir,
+            batch_size=config.embedding_batch_size,
+            ort_variant=config.embedding_ort_variant,
+        )
+        if needs_field
+        else None
+    )
 
     window_days = args.window_days if args.window_days is not None else config.days
     eval_config = replace(config, days=window_days)

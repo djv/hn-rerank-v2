@@ -33,7 +33,6 @@ feeds = [
     "https://www.reddit.com/r/devops/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/kubernetes/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/dataengineering/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/statistics/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/Maps/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/Ultralight/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/ManyBaggers/top/.rss?t=week&limit=25",

@@ -30,7 +30,7 @@ class MockEmbedder(Embedder):
     def __init__(self) -> None:
         pass
 
-    def encode(self, texts: list[str], batch_size: int = 64) -> Any:
+    def encode(self, texts: list[str], batch_size: int | None = None) -> Any:
         return np.zeros((len(texts), 384), dtype=np.float32)
 
 

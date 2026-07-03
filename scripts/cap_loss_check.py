@@ -123,7 +123,11 @@ def main() -> None:
     db = Database(args.db, read_only=False)
     try:
         user_id = args.user_id if args.user_id is not None else _heaviest_user_id(db)
-        embedder = Embedder(base.onnx_model_dir)
+        embedder = Embedder(
+            base.onnx_model_dir,
+            batch_size=base.embedding_batch_size,
+            ort_variant=base.embedding_ort_variant,
+        )
 
         # warmup — populates the model cache and embeddings
         print("warmup ...", end="", flush=True)

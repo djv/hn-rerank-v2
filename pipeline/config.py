@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import tomllib
 from dataclasses import dataclass, field, fields, replace
-from typing import Any
+from typing import Any, Literal
 
 
 @dataclass(frozen=True)
@@ -52,6 +52,13 @@ class Config:
     days: int = 30
     count: int = 40
     onnx_model_dir: str = "onnx_model"
+    embedding_batch_size: int = 32
+    embedding_ort_variant: Literal[
+        "current",
+        "spin_off",
+        "spin_off_graph_all",
+        "spin_off_auto_threads",
+    ] = "current"
     server_port: int = 8765
     regen_interval_seconds: int = 14400
     regen_initial_delay_seconds: int = 30
@@ -106,6 +113,20 @@ class Config:
     profile_link_per_ip_window_seconds: int = 3600
     model: ModelConfig = field(default_factory=ModelConfig)
     rss: RssConfig = field(default_factory=RssConfig)
+
+    def __post_init__(self) -> None:
+        if self.embedding_batch_size <= 0:
+            raise ValueError("embedding_batch_size must be positive")
+        if self.embedding_ort_variant not in {
+            "current",
+            "spin_off",
+            "spin_off_graph_all",
+            "spin_off_auto_threads",
+        }:
+            raise ValueError(
+                "embedding_ort_variant must be one of: current, spin_off, "
+                "spin_off_graph_all, spin_off_auto_threads"
+            )
 
     @classmethod
     def load(cls, path: str = "config.toml") -> Config:

@@ -69,12 +69,14 @@ def test_benchmark_rank_cold_cache_outputs_json(
         _ = (config_arg, embedder_arg)
         assert user_id == user.id
         assert db_arg.read_only
+        assert config_arg.embedding_batch_size == 1
+        assert config_arg.embedding_ort_variant == "spin_off_auto_threads"
         if trace is not None:
             trace.set_label("model_cache", "miss")
             trace.add_timing("candidate_sql", 1.0)
         return [object()]
 
-    monkeypatch.setattr(bench, "Embedder", lambda _model_dir: object())
+    monkeypatch.setattr(bench, "Embedder", lambda *args, **kwargs: object())
     monkeypatch.setattr(bench, "fast_rerank_for_user", fake_fast_rerank_for_user)
     monkeypatch.setattr(
         sys,
@@ -87,6 +89,10 @@ def test_benchmark_rank_cold_cache_outputs_json(
             "1",
             "--warm-runs",
             "0",
+            "--embedding-batch-size",
+            "1",
+            "--embedding-ort-variant",
+            "spin_off_auto_threads",
             "--json-only",
         ],
     )
