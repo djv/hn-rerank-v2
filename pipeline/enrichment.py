@@ -8,6 +8,7 @@ import re
 import threading
 import time
 from dataclasses import replace
+from typing import Protocol
 from urllib.parse import urlparse
 
 import feedparser
@@ -311,6 +312,60 @@ async def prewarm_reddit_top_stories(
     return len(updated_ids)
 
 
+class _SourceContext(Protocol):
+    """Structural shape shared by RedditRssContext and LessWrongContext."""
+
+    self_text: str
+    top_comments: str
+    comment_count: int
+
+
+def _merge_source_context(
+    story: Story,
+    ctx: _SourceContext,
+    article_body: str | None,
+    *,
+    prefer_longer_comments: bool,
+) -> Story:
+    """Merge a fetched source context (Reddit/LessWrong) into ``story``.
+
+    ``article_body`` must already be the caller's best-known body string
+    (on-demand callers pre-merge ``story.article_body or article_body``
+    themselves; prewarm callers pass ``story.article_body`` directly) —
+    this helper does not re-derive it.
+
+    ``prefer_longer_comments`` — on-demand paths keep whichever of
+    story/ctx top_comments is longer (True); prewarm callers have already
+    established ctx is richer and take ctx.top_comments outright (False).
+
+    ``score`` is merged via ``max`` only when ``ctx`` carries one
+    (LessWrongContext); RedditRssContext has no ``score`` field, so it
+    falls back to ``story.score`` and the max is a no-op.
+    """
+    self_text = (
+        ctx.self_text if len(ctx.self_text) > len(story.self_text) else story.self_text
+    )
+    if prefer_longer_comments:
+        top_comments = (
+            ctx.top_comments
+            if len(ctx.top_comments) > len(story.top_comments)
+            else story.top_comments
+        )
+    else:
+        top_comments = ctx.top_comments
+    new_text = compose_story_text(story.title, self_text, top_comments, article_body or "")
+    return replace(
+        story,
+        self_text=self_text,
+        top_comments=top_comments,
+        text_content=new_text,
+        discussion_url=story.discussion_url or story.url,
+        comment_count=story.comment_count or ctx.comment_count or None,
+        comment_count_at_fetch=max(story.comment_count_at_fetch, ctx.comment_count),
+        score=max(story.score, getattr(ctx, "score", story.score)),
+    )
+
+
 def build_reddit_prewarm_factories(
     story_ids: list[int], db: Database
 ) -> tuple[list[CoroFactory], list[int]]:
@@ -369,30 +424,11 @@ def build_reddit_prewarm_factories(
                 return
             if story.top_comments and len(ctx.top_comments) <= len(story.top_comments):
                 return
-            new_self_text = (
-                ctx.self_text
-                if len(ctx.self_text) > len(story.self_text)
-                else story.self_text
+            updated = _merge_source_context(
+                story, ctx, story.article_body, prefer_longer_comments=False
             )
-            new_text_content = compose_story_text(
-                story.title,
-                new_self_text,
-                ctx.top_comments,
-                story.article_body or "",
-            )
-            if not new_text_content:
+            if not updated.text_content:
                 return
-            updated = replace(
-                story,
-                self_text=new_self_text,
-                top_comments=ctx.top_comments,
-                text_content=new_text_content,
-                comment_count=story.comment_count or ctx.comment_count or None,
-                comment_count_at_fetch=max(
-                    story.comment_count_at_fetch, ctx.comment_count
-                ),
-                discussion_url=story.discussion_url or story.url,
-            )
             db.upsert_story(updated)
             with counter_lock:
                 updated_ids.append(updated.id)
@@ -457,30 +493,12 @@ async def prewarm_lesswrong_stories(
         if not (top_comments_fresh or self_text_fresh):
             continue
 
-        new_self_text = (
-            ctx.self_text
-            if len(ctx.self_text) > len(story.self_text)
-            else story.self_text
+        updated = _merge_source_context(
+            story, ctx, story.article_body, prefer_longer_comments=False
         )
-        new_text_content = compose_story_text(
-            story.title,
-            new_self_text,
-            ctx.top_comments,
-            story.article_body or "",
-        )
-        if not new_text_content:
+        if not updated.text_content:
             continue
 
-        updated = replace(
-            story,
-            self_text=new_self_text,
-            top_comments=ctx.top_comments,
-            text_content=new_text_content,
-            comment_count=story.comment_count or ctx.comment_count or None,
-            comment_count_at_fetch=max(story.comment_count_at_fetch, ctx.comment_count),
-            score=max(story.score, ctx.score),
-            discussion_url=story.discussion_url or story.url,
-        )
         db.upsert_story(updated)
         prewarmed.append(updated)
 

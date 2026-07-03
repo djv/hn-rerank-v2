@@ -1602,37 +1602,10 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             if reddit_context and (
                 reddit_context.self_text or reddit_context.top_comments
             ):
-                from pipeline import compose_story_text
+                from pipeline import _merge_source_context
 
-                self_text = (
-                    reddit_context.self_text
-                    if len(reddit_context.self_text) > len(story.self_text)
-                    else story.self_text
-                )
-                top_comments = (
-                    reddit_context.top_comments
-                    if len(reddit_context.top_comments) > len(story.top_comments)
-                    else story.top_comments
-                )
-                new_text = compose_story_text(
-                    story.title,
-                    self_text,
-                    top_comments,
-                    article_body or "",
-                )
-                story = replace(
-                    story,
-                    self_text=self_text,
-                    top_comments=top_comments,
-                    text_content=new_text,
-                    discussion_url=story.discussion_url or story.url,
-                    comment_count=story.comment_count
-                    or reddit_context.comment_count
-                    or None,
-                    comment_count_at_fetch=max(
-                        story.comment_count_at_fetch,
-                        reddit_context.comment_count,
-                    ),
+                story = _merge_source_context(
+                    story, reddit_context, article_body, prefer_longer_comments=True
                 )
                 runtime.db.upsert_story(story)
 
@@ -1645,38 +1618,10 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             if post_id:
                 lw_context = asyncio.run(_fetch_lesswrong_context(post_id))
                 if lw_context and (lw_context.self_text or lw_context.top_comments):
-                    from pipeline import compose_story_text
+                    from pipeline import _merge_source_context
 
-                    self_text = (
-                        lw_context.self_text
-                        if len(lw_context.self_text) > len(story.self_text)
-                        else story.self_text
-                    )
-                    top_comments = (
-                        lw_context.top_comments
-                        if len(lw_context.top_comments) > len(story.top_comments)
-                        else story.top_comments
-                    )
-                    new_text = compose_story_text(
-                        story.title,
-                        self_text,
-                        top_comments,
-                        article_body or "",
-                    )
-                    story = replace(
-                        story,
-                        self_text=self_text,
-                        top_comments=top_comments,
-                        text_content=new_text,
-                        discussion_url=story.discussion_url or story.url,
-                        comment_count=story.comment_count
-                        or lw_context.comment_count
-                        or None,
-                        comment_count_at_fetch=max(
-                            story.comment_count_at_fetch,
-                            lw_context.comment_count,
-                        ),
-                        score=max(story.score, lw_context.score),
+                    story = _merge_source_context(
+                        story, lw_context, article_body, prefer_longer_comments=True
                     )
                     runtime.db.upsert_story(story)
 

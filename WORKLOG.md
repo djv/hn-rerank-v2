@@ -2,6 +2,30 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-03 — Dedup Reddit/LessWrong enrichment kernel
+
+Four near-identical sites built a fresh `Story` from a fetched source context
+(Reddit RSS or LessWrong GraphQL) via copy-pasted compose+`replace()` logic:
+`server.py` on-demand TLDR blocks for Reddit and LessWrong, and
+`pipeline/enrichment.py`'s Reddit prewarm factory and LessWrong prewarm loop.
+
+Extracted the shared kernel into `pipeline.enrichment._merge_source_context(
+story, ctx, article_body, *, prefer_longer_comments)`, keyed on a structural
+`_SourceContext` Protocol (`RedditRssContext`/`LessWrongContext` share
+`self_text`/`top_comments`/`comment_count`; only LessWrong has `score`, merged
+via `getattr(ctx, "score", story.score)` so Reddit's `max` is a no-op). The
+distinct guards, fetch calls, and prewarm concurrency models (Reddit's
+coroutine-factory + circuit-breaker on a shared queue vs. LessWrong's serial
+loop + embedding compute) stayed inline — only the compose+`replace` tail was
+deduplicated, per explicit scope decision to avoid a callable-driven mega-helper.
+
+Net ~35 lines removed. Verified: bit-for-bit spot-check script (old inline
+logic vs. new helper, all 4 site/flag combinations) passed; full suite (486
+passed, 1 skipped), ruff, and ty clean; live smoke test after service restart
+— hit `/api/tldr-detail` for one uncached Reddit and one uncached LessWrong
+story, both returned 200 with real TLDR content, DB rows confirmed enriched
+(`self_text`/`top_comments` populated), no errors in journalctl.
+
 ## 2026-07-03 — Rank hot-path: fuse sim matmuls + cache cluster centers
 
 Two behavior-preserving perf changes to `svm_candidate_feature_prep` (was

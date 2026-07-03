@@ -85,6 +85,7 @@ from .enrichment import (
     _coerce_int,
     _fetch_and_parse_feed,
     _is_fetchable_article_url,
+    _merge_source_context,
     _reddit_subreddit_from_feed_url,
     _rss_source_name,
     _urllib_fetch,
