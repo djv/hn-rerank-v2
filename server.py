@@ -37,6 +37,7 @@ from http_fetch import fetch_with_urllib_fallback
 ARTICLE_BODY_CHAR_LIMIT = 15_000
 SELF_TEXT_PROMPT_CHAR_LIMIT = 8_000
 COMMENT_PROMPT_CHAR_LIMIT = 12_000
+SELF_TEXT_PROMPT_MIN_CHARS = 300
 REDDIT_COMMENTS_CACHE_CHAR_LIMIT = 10_000
 REDDIT_COMMENT_LIMIT = 40
 REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dashboard"
@@ -625,7 +626,7 @@ async def generate_detailed_tldr(
         return "Error: LLM API key not configured in environment."
 
     article_section = ""
-    if self_text:
+    if self_text and len(self_text) >= SELF_TEXT_PROMPT_MIN_CHARS:
         article_section += f"Author's text:\n{self_text[:SELF_TEXT_PROMPT_CHAR_LIMIT]}"
     if article_body:
         article_section += (
@@ -671,7 +672,7 @@ async def generate_detailed_tldr(
             return f"Error executing LLM call: {str(e)}"
 
     article_section_str = ""
-    if self_text:
+    if self_text and len(self_text) >= SELF_TEXT_PROMPT_MIN_CHARS:
         article_section_str += (
             f"\n\nAuthor's text:\n{self_text[:SELF_TEXT_PROMPT_CHAR_LIMIT]}"
         )
@@ -1417,7 +1418,12 @@ def _handle_flask_feedback(runtime: type[Handler]) -> Response:
         body = request.get_data(cache=True)
         if len(body) > MAX_CONTENT_LENGTH:
             return _flask_text_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
-        data = json.loads(body)
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            return _flask_json_response(
+                {"error": "Invalid JSON body"}, status=HTTPStatus.BAD_REQUEST
+            )
 
         story_id = data.get("story_id")
         action = data.get("action")
@@ -1455,10 +1461,10 @@ def _handle_flask_feedback(runtime: type[Handler]) -> Response:
                 "target_version": version,
             }
         )
-    except Exception as e:
-        logging.error("Error handling feedback: %r", e)
+    except Exception:
+        logging.exception("Error handling feedback")
         return _flask_json_response(
-            {"error": "Internal error"}, status=HTTPStatus.BAD_REQUEST
+            {"error": "Internal error"}, status=HTTPStatus.INTERNAL_SERVER_ERROR
         )
 
 
@@ -1468,7 +1474,12 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
         body = request.get_data(cache=True)
         if len(body) > MAX_CONTENT_LENGTH:
             return _flask_text_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
-        data = json.loads(body)
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            return _flask_json_response(
+                {"error": "Invalid JSON body"}, status=HTTPStatus.BAD_REQUEST
+            )
 
         story_id_raw = data.get("story_id")
         if not isinstance(story_id_raw, int) or isinstance(story_id_raw, bool):

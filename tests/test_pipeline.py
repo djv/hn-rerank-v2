@@ -5908,6 +5908,17 @@ def test_is_fetchable_article_url():
     # Empty/None
     assert not _is_fetchable_article_url("")
 
+    # Binary file extensions
+    assert not _is_fetchable_article_url("https://example.com/report.pdf")
+    assert not _is_fetchable_article_url("https://example.com/paper.PDF")
+    assert not _is_fetchable_article_url("https://example.com/report.pdf?download=1")
+    assert not _is_fetchable_article_url("https://example.com/image.png")
+    assert not _is_fetchable_article_url("https://example.com/doc.docx")
+    assert not _is_fetchable_article_url("https://example.com/deb.deb")
+
+    # PDF as path segment (not extension) is still fetchable
+    assert _is_fetchable_article_url("https://example.com/pdf/article")
+
 
 def test_article_fetch_http_4xx_becomes_permanent(db, monkeypatch):
     """401 and 403 failures become permanent after 3 attempts (batch path)."""

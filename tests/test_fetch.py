@@ -1,7 +1,11 @@
 from typing import Any
 import pytest
 import asyncio
-from server import _fetch_article_body
+import httpx
+from server import (
+    _fetch_article_body,
+    _fetch_article_body_with_result,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -217,3 +221,116 @@ async def test_fetch_real_urls():
         # The test passes as long as no exception is thrown.
         if result is not None:
             assert len(result) >= 100, f"body too short ({len(result)} chars) for {url}"
+
+
+@pytest.mark.asyncio
+async def test_fetch_rejects_non_html_content_type(monkeypatch):
+    """Content-Type guard: non-HTML types return non_html/permanent."""
+    import server
+
+    class MockClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, url, headers=None):
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/pdf"},
+                text="%PDF-1.4\n\x00\x00\x00",
+            )
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", MockClient)
+
+    result = await _fetch_article_body_with_result("https://example.com/doc.pdf")
+    assert result.body is None
+    assert result.error == "non_html"
+    assert result.permanent is True
+
+
+@pytest.mark.asyncio
+async def test_fetch_allows_text_plain(monkeypatch):
+    """Content-Type guard: text/plain is allowed."""
+    import server
+
+    class MockClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, url, headers=None):
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/plain"},
+                text=_ARTICLE_HTML,
+            )
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", MockClient)
+
+    result = await _fetch_article_body_with_result("https://example.com/plain")
+    assert result.body is not None
+    assert result.error == ""
+
+
+@pytest.mark.asyncio
+async def test_fetch_rejects_uppercase_content_type(monkeypatch):
+    """Content-Type guard: mixed-case is handled via .lower()."""
+    import server
+
+    class MockClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, url, headers=None):
+            return httpx.Response(
+                200,
+                headers={"content-type": "Application/PDF"},
+                text="%PDF",
+            )
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", MockClient)
+
+    result = await _fetch_article_body_with_result("https://example.com/Doc.PDF")
+    assert result.error == "non_html"
+    assert result.permanent is True
+
+
+@pytest.mark.asyncio
+async def test_fetch_allows_missing_content_type(monkeypatch):
+    """Content-Type guard: missing header falls through to extraction."""
+    import server
+
+    class MockClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, url, headers=None):
+            return httpx.Response(200, headers={}, text=_ARTICLE_HTML)
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", MockClient)
+
+    result = await _fetch_article_body_with_result("https://example.com/noct")
+    assert result.body is not None
+    assert result.error == ""
