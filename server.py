@@ -18,6 +18,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from http import HTTPStatus
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlparse, urlunparse
 
 import feedparser
@@ -168,6 +169,25 @@ class ArticleFetchResult:
     status: int | None = None
     error: str = ""
     permanent: bool = False
+
+
+@dataclass(frozen=True)
+class LlmChatResult:
+    content: str
+    ok: bool
+    status: int | None = None
+
+
+@dataclass(frozen=True)
+class TldrResult:
+    kind: Literal["ok", "no_content", "llm_error"]
+    tldr: str = ""
+    error_status: int | None = None
+    error_text: str = ""
+
+
+def _llm_error_from(r: LlmChatResult) -> TldrResult:
+    return TldrResult(kind="llm_error", error_status=r.status, error_text=r.content)
 
 
 MIN_ARTICLE_CHARS = 200
@@ -541,43 +561,54 @@ async def _call_llm_chat(
     model: str,
     prompt: str,
     max_tokens: int,
-) -> str:
+) -> LlmChatResult:
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3,
         "max_tokens": max_tokens,
     }
-    async with httpx.AsyncClient(timeout=45.0) as client:
-        for attempt in range(4):
-            await llm_limiter.acquire()
-            resp = await client.post(
-                base_url,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
-            llm_limiter.record_response(
-                status=resp.status_code,
-                headers=resp.headers,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                return data["choices"][0]["message"]["content"]
-            if resp.status_code == 429 and attempt < 3:
-                continue
-            if resp.status_code == 503 and attempt < 3:
-                base = 2 ** (attempt + 1)
-                jitter = random.uniform(0, base * 0.5)
-                delay = _parse_retry_after(
-                    resp.headers.get("Retry-After"), default=base + jitter
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            for attempt in range(4):
+                await llm_limiter.acquire()
+                resp = await client.post(
+                    base_url,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
                 )
-                await asyncio.sleep(delay)
-                continue
-            break
-        return f"Error from LLM Provider: HTTP {resp.status_code} - {resp.text}"
+                llm_limiter.record_response(
+                    status=resp.status_code,
+                    headers=resp.headers,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return LlmChatResult(
+                        content=data["choices"][0]["message"]["content"],
+                        ok=True,
+                    )
+                if resp.status_code == 429 and attempt < 3:
+                    continue
+                if resp.status_code == 503 and attempt < 3:
+                    base = 2 ** (attempt + 1)
+                    jitter = random.uniform(0, base * 0.5)
+                    delay = _parse_retry_after(
+                        resp.headers.get("Retry-After"), default=base + jitter
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                break
+            return LlmChatResult(
+                content=f"Error from LLM Provider: HTTP {resp.status_code} - {resp.text}",
+                ok=False,
+                status=resp.status_code,
+            )
+    except Exception as e:
+        logging.exception("_call_llm_chat: unexpected exception")
+        return LlmChatResult(content=str(e), ok=False)
 
 
 def _llm_cache_identity() -> str:
@@ -611,7 +642,7 @@ async def generate_detailed_tldr(
     self_text: str = "",
     top_comments: str = "",
     article_body: str = "",
-) -> str:
+) -> TldrResult:
     provider = os.environ.get("LLM_PROVIDER", "mistral").lower()
     if provider == "mistral":
         api_key = os.environ.get("MISTRAL_API_KEY")
@@ -623,7 +654,10 @@ async def generate_detailed_tldr(
         model = "llama-3.3-70b-versatile"
 
     if not api_key:
-        return "Error: LLM API key not configured in environment."
+        return TldrResult(
+            kind="llm_error",
+            error_text="LLM API key not configured in environment.",
+        )
 
     article_section = ""
     if self_text and len(self_text) >= SELF_TEXT_PROMPT_MIN_CHARS:
@@ -635,7 +669,7 @@ async def generate_detailed_tldr(
     comments_section = top_comments[:COMMENT_PROMPT_CHAR_LIMIT]
 
     if not article_section and not top_comments:
-        return "No article body or discussion available to summarize for this story."
+        return TldrResult(kind="no_content")
 
     if article_section and comments_section:
         article_prompt = _load_prompt("article_v4.txt").format(
@@ -644,81 +678,55 @@ async def generate_detailed_tldr(
         discussion_prompt = _load_prompt("discussion_v4.txt").format(
             title=title, comments_section=comments_section
         )
-        try:
-            article_result = await _call_llm_chat(
-                api_key=api_key,
-                base_url=base_url,
-                model=model,
-                prompt=article_prompt,
-                max_tokens=900,
-            )
-            if article_result.startswith("Error"):
-                return article_result
-            discussion_result = await _call_llm_chat(
-                api_key=api_key,
-                base_url=base_url,
-                model=model,
-                prompt=discussion_prompt,
-                max_tokens=900,
-            )
-            if discussion_result.startswith("Error"):
-                return discussion_result
-            article_result = _normalize_tldr_markdown(article_result)
-            discussion_result = _normalize_tldr_markdown(discussion_result)
-            return (
-                f"### Article\n{article_result}\n\n### Discussion\n{discussion_result}"
-            )
-        except Exception as e:
-            return f"Error executing LLM call: {str(e)}"
-
-    article_section_str = ""
-    if self_text and len(self_text) >= SELF_TEXT_PROMPT_MIN_CHARS:
-        article_section_str += (
-            f"\n\nAuthor's text:\n{self_text[:SELF_TEXT_PROMPT_CHAR_LIMIT]}"
-        )
-    if article_body:
-        article_section_str += (
-            f"\n\nArticle body:\n{article_body[:ARTICLE_BODY_CHAR_LIMIT]}"
-        )
-    comments_section_str = top_comments[:COMMENT_PROMPT_CHAR_LIMIT]
-
-    # Article-only: no Discussion/Consensus mention in prompt at all
-    if article_section_str and not comments_section_str:
-        prompt = _load_prompt("article_only_v4.txt").format(
-            title=title, article_section=article_section_str
-        )
-    elif comments_section_str and not article_section_str:
-        prompt = _load_prompt("discussion_only_v4.txt").format(
-            title=title, comments_section=comments_section_str
-        )
-    else:
-        content_section = f"Title: {title}"
-        if self_text:
-            content_section += (
-                f"\n\nAuthor's text:\n{self_text[:SELF_TEXT_PROMPT_CHAR_LIMIT]}"
-            )
-        if article_body:
-            content_section += (
-                f"\n\nArticle body:\n{article_body[:ARTICLE_BODY_CHAR_LIMIT]}"
-            )
-        if top_comments:
-            content_section += (
-                f"\n\nComments:\n{top_comments[:COMMENT_PROMPT_CHAR_LIMIT]}"
-            )
-
-        prompt = _load_prompt("combined_v4.txt").format(content_section=content_section)
-
-    try:
-        result = await _call_llm_chat(
+        article_result = await _call_llm_chat(
             api_key=api_key,
             base_url=base_url,
             model=model,
-            prompt=prompt,
-            max_tokens=2000,
+            prompt=article_prompt,
+            max_tokens=900,
         )
-        return _normalize_tldr_markdown(result)
-    except Exception as e:
-        return f"Error executing LLM call: {str(e)}"
+        if not article_result.ok:
+            return _llm_error_from(article_result)
+        discussion_result = await _call_llm_chat(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            prompt=discussion_prompt,
+            max_tokens=900,
+        )
+        if not discussion_result.ok:
+            return _llm_error_from(discussion_result)
+        article_text = _normalize_tldr_markdown(article_result.content)
+        discussion_text = _normalize_tldr_markdown(discussion_result.content)
+        if not article_text.strip() and not discussion_text.strip():
+            return TldrResult(kind="llm_error", error_text="empty LLM response")
+        return TldrResult(
+            kind="ok",
+            tldr=f"### Article\n{article_text}\n\n### Discussion\n{discussion_text}",
+        )
+
+    if article_section and not comments_section:
+        prompt = _load_prompt("article_only_v4.txt").format(
+            title=title, article_section=article_section
+        )
+    else:
+        prompt = _load_prompt("discussion_only_v4.txt").format(
+            title=title, comments_section=comments_section
+        )
+
+    result = await _call_llm_chat(
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        prompt=prompt,
+        max_tokens=2000,
+    )
+    if result.ok:
+        tldr_text = _normalize_tldr_markdown(result.content)
+        if not tldr_text.strip():
+            return TldrResult(kind="llm_error", error_text="empty LLM response")
+        return TldrResult(kind="ok", tldr=tldr_text)
+    return _llm_error_from(result)
 
 
 async def _prefetch_tldrs_for_ranked(
@@ -798,15 +806,15 @@ async def _prefetch_tldrs_for_ranked(
             return False
 
         async with sem:
-            tldr = await generate_detailed_tldr(
+            result = await generate_detailed_tldr(
                 title,
                 self_text=self_text,
                 top_comments=top_comments,
                 article_body=article_body,
             )
-        if not tldr or tldr.startswith("Error") or tldr.startswith("No article body"):
+        if result.kind != "ok":
             return False
-        db.upsert_tldr_cache(story_id, cache_key, tldr)
+        db.upsert_tldr_cache(story_id, cache_key, result.tldr)
         return True
 
     results = await asyncio.gather(
@@ -1731,7 +1739,7 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
                 {"ok": True, "tldr": cached_tldr, "cached": True}
             )
 
-        tldr = asyncio.run(
+        result = asyncio.run(
             generate_detailed_tldr(
                 story.title,
                 self_text=story.self_text or "",
@@ -1739,39 +1747,39 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
                 article_body=article_body or "",
             )
         )
-        if not tldr:
-            fallback = _stale_tldr_fallback("empty_result")
-            if fallback:
-                return fallback
+        if result.kind == "no_content":
             return _flask_json_response(
-                {"error": "Failed to generate TLDR"},
-                status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                {
+                    "ok": True,
+                    "tldr": "No article body or discussion available to summarize for this story.",
+                    "cached": False,
+                }
             )
-        if tldr.startswith("Error"):
+        if result.kind == "llm_error":
             logging.warning(
-                "tldr_detail story_id=%s result=llm_error cache_key=%s error=%s",
+                "tldr_detail story_id=%s result=llm_error cache_key=%s status=%s error=%s",
                 story.id,
                 cache_key[:12],
-                tldr,
+                result.error_status,
+                result.error_text,
             )
             fallback = _stale_tldr_fallback("llm_error")
             if fallback:
                 return fallback
-            if "HTTP 429" in tldr:
+            if result.error_status == 429:
                 error = "Rate limit exceeded. Please try again in a moment."
             else:
                 error = "Failed to generate TLDR. Please try again later."
             return _flask_json_response(
                 {"error": error}, status=HTTPStatus.SERVICE_UNAVAILABLE
             )
-        if not tldr.startswith("No article body"):
-            runtime.db.upsert_tldr_cache(story.id, cache_key, tldr)
-            logging.info(
-                "tldr_detail story_id=%s result=generated cache_key=%s",
-                story.id,
-                cache_key[:12],
-            )
-        return _flask_json_response({"ok": True, "tldr": tldr, "cached": False})
+        runtime.db.upsert_tldr_cache(story.id, cache_key, result.tldr)
+        logging.info(
+            "tldr_detail story_id=%s result=generated cache_key=%s",
+            story.id,
+            cache_key[:12],
+        )
+        return _flask_json_response({"ok": True, "tldr": result.tldr, "cached": False})
     except Exception:
         logging.exception("Error handling tldr-detail")
         return _flask_json_response(

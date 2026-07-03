@@ -1948,10 +1948,10 @@ def test_flask_test_client_tldr_cached_bypasses_uncached_quota(
 
     async def mock_generate_detailed_tldr(
         title: str, self_text: str, top_comments: str, article_body: str
-    ) -> str:
+    ) -> "server.TldrResult":
         nonlocal calls
         calls += 1
-        return f"generated-{calls}: {title}"
+        return server.TldrResult(kind="ok", tldr=f"generated-{calls}: {title}")
 
     monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
 
@@ -2004,9 +2004,9 @@ def test_flask_test_client_tldr_uncached_limit_sets_retry_after(
 
     async def mock_generate_detailed_tldr(
         title: str, self_text: str, top_comments: str, article_body: str
-    ) -> str:
+    ) -> "server.TldrResult":
         calls.append(title)
-        return f"TLDR: {title}"
+        return server.TldrResult(kind="ok", tldr=f"TLDR: {title}")
 
     monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
 
@@ -2063,8 +2063,8 @@ def test_flask_test_client_tldr_stale_fallback_on_quota_denied(
 
     async def mock_generate_detailed_tldr(
         title: str, self_text: str, top_comments: str, article_body: str
-    ) -> str:
-        return f"TLDR: {title}"
+    ) -> "server.TldrResult":
+        return server.TldrResult(kind="ok", tldr=f"TLDR: {title}")
 
     monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
 
@@ -2142,7 +2142,7 @@ async def test_prefetch_tldrs_for_ranked_regenerates_stale_beyond_top_combo(
 
     async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
         calls.append(title)
-        return f"TLDR: {title}"
+        return srv.TldrResult(kind="ok", tldr=f"TLDR: {title}")
 
     monkeypatch.setattr(srv, "generate_detailed_tldr", mock_generate_detailed_tldr)
 
@@ -2353,7 +2353,7 @@ def test_tldr_detail_fetches_reddit_rss_comments(test_env, monkeypatch):
         raise AssertionError("Reddit comments pages should not be scraped as articles")
 
     async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
-        return f"TLDR: {self_text} | {top_comments}"
+        return server.TldrResult(kind="ok", tldr=f"TLDR: {self_text} | {top_comments}")
 
     import server
 
@@ -2421,7 +2421,9 @@ def test_tldr_detail_dynamic_fetch(test_env, monkeypatch):
         return server.ArticleFetchResult(body="Fetched article body text", status=200)
 
     async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
-        return f"TLDR: {title} | {top_comments} | {article_body}"
+        return server.TldrResult(
+            kind="ok", tldr=f"TLDR: {title} | {top_comments} | {article_body}"
+        )
 
     import server
     import pipeline
@@ -2486,7 +2488,7 @@ def test_tldr_detail_dynamic_fetch_for_bq_seed(test_env, monkeypatch):
         return server.ArticleFetchResult(error="empty_extraction")
 
     async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
-        return f"TLDR: {title} | {top_comments}"
+        return server.TldrResult(kind="ok", tldr=f"TLDR: {title} | {top_comments}")
 
     import server
     import pipeline
@@ -2544,7 +2546,7 @@ def test_tldr_detail_dynamic_fetch_for_ch_seed(test_env, monkeypatch):
         return server.ArticleFetchResult(error="empty_extraction")
 
     async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
-        return f"TLDR: {title} | {top_comments}"
+        return server.TldrResult(kind="ok", tldr=f"TLDR: {title} | {top_comments}")
 
     import server
     import pipeline
@@ -2591,7 +2593,9 @@ def test_tldr_detail_uses_cached_summary(test_env, monkeypatch):
     async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
         nonlocal calls
         calls += 1
-        return f"cached-result-{calls}: {title} | {article_body}"
+        return server.TldrResult(
+            kind="ok", tldr=f"cached-result-{calls}: {title} | {article_body}"
+        )
 
     import server
 
@@ -2667,10 +2671,10 @@ def test_tldr_cached_response_bypasses_uncached_quota(test_env, monkeypatch) -> 
 
     async def mock_generate_detailed_tldr(
         title: str, self_text: str, top_comments: str, article_body: str
-    ) -> str:
+    ) -> "server.TldrResult":
         nonlocal calls
         calls += 1
-        return f"generated-{calls}: {title}"
+        return server.TldrResult(kind="ok", tldr=f"generated-{calls}: {title}")
 
     monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
 
@@ -2724,9 +2728,9 @@ def test_tldr_uncached_per_session_limit_blocks_generation(
 
     async def mock_generate_detailed_tldr(
         title: str, self_text: str, top_comments: str, article_body: str
-    ) -> str:
+    ) -> "server.TldrResult":
         calls.append(title)
-        return f"TLDR: {title}"
+        return server.TldrResult(kind="ok", tldr=f"TLDR: {title}")
 
     import server
 
@@ -2783,9 +2787,9 @@ def test_tldr_uncached_global_limit_blocks_second_session(
 
     async def mock_generate_detailed_tldr(
         title: str, self_text: str, top_comments: str, article_body: str
-    ) -> str:
+    ) -> "server.TldrResult":
         calls.append(title)
-        return f"TLDR: {title}"
+        return server.TldrResult(kind="ok", tldr=f"TLDR: {title}")
 
     import server
 
@@ -2833,7 +2837,7 @@ def test_tldr_detail_does_not_cache_placeholder(test_env, monkeypatch):
     async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
         nonlocal call_count
         call_count += 1
-        return "No article body or discussion available to summarize for this story."
+        return server.TldrResult(kind="no_content")
 
     import server
 
@@ -2867,10 +2871,10 @@ async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
     async def mock_call_llm_chat(*, api_key, base_url, model, prompt, max_tokens):
         calls.append(prompt)
         if "Summarize the article" in prompt:
-            return "- **Article** summary"
+            return server.LlmChatResult(content="- **Article** summary", ok=True)
         if "Summarize the discussion" in prompt:
-            return "- **Discussion** summary"
-        return "- **Fallback** summary"
+            return server.LlmChatResult(content="- **Discussion** summary", ok=True)
+        return server.LlmChatResult(content="- **Fallback** summary", ok=True)
 
     monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
     monkeypatch.setattr(server, "_call_llm_chat", mock_call_llm_chat)
@@ -2887,10 +2891,10 @@ async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
     assert "Comments:" in calls[1]
     assert "Points:" not in calls[1]
     assert "Age hours:" not in calls[1]
-    assert "### Article" in result
-    assert "- **Article** summary" in result
-    assert "### Discussion" in result
-    assert "- **Discussion** summary" in result
+    assert "### Article" in result.tldr
+    assert "- **Article** summary" in result.tldr
+    assert "### Discussion" in result.tldr
+    assert "- **Discussion** summary" in result.tldr
 
 
 @pytest.mark.asyncio
@@ -2940,7 +2944,8 @@ async def test_call_llm_chat_uses_limiter(monkeypatch):
         max_tokens=10,
     )
 
-    assert result == "summary"
+    assert result.content == "summary"
+    assert result.ok is True
     assert calls == [
         ("acquire", None),
         ("post", "https://example.test/chat"),
@@ -2962,7 +2967,7 @@ async def test_unified_fallback_omits_article_when_no_article_body(
 
     async def mock_call_llm_chat(*, api_key, base_url, model, prompt, max_tokens):
         calls.append(prompt)
-        return "- **Discussion** summary"
+        return server.LlmChatResult(content="- **Discussion** summary", ok=True)
 
     monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
     monkeypatch.setattr(server, "_call_llm_chat", mock_call_llm_chat)
@@ -2974,8 +2979,8 @@ async def test_unified_fallback_omits_article_when_no_article_body(
         article_body="",
     )
 
-    assert "### Article" not in result
-    assert "### Story" not in result
+    assert "### Article" not in result.tldr
+    assert "### Story" not in result.tldr
     assert len(calls) == 1
 
 
@@ -3002,7 +3007,7 @@ async def test_generate_detailed_tldr_returns_stub_when_no_content(
     )
 
     assert calls == []
-    assert "No article body or discussion" in result
+    assert result.kind == "no_content"
 
 
 def test_keydown_guard_excludes_buttons_and_anchors():
@@ -3157,7 +3162,7 @@ def test_tldr_detail_fetches_lesswrong_comments(test_env, monkeypatch):
         raise AssertionError("LessWrong should not be scraped as articles")
 
     async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
-        return f"TLDR: {self_text} | {top_comments}"
+        return server.TldrResult(kind="ok", tldr=f"TLDR: {self_text} | {top_comments}")
 
     monkeypatch.setattr(
         server, "_fetch_lesswrong_context", mock_fetch_lesswrong_context
@@ -3967,7 +3972,7 @@ def test_on_demand_tldr_records_fetch_failure(test_env, monkeypatch):
         return server.ArticleFetchResult(status=403, error="http_403")
 
     async def mock_generate_tldr(title, self_text, top_comments, article_body):
-        return f"TLDR: {title}"
+        return server.TldrResult(kind="ok", tldr=f"TLDR: {title}")
 
     monkeypatch.setattr(server, "_fetch_article_body_with_result", mock_fetch)
     monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_tldr)
@@ -4025,7 +4030,7 @@ def test_on_demand_tldr_clears_failure_on_success(test_env, monkeypatch):
         )
 
     async def mock_generate_tldr(title, self_text, top_comments, article_body):
-        return f"TLDR: {title} | {article_body}"
+        return server.TldrResult(kind="ok", tldr=f"TLDR: {title} | {article_body}")
 
     monkeypatch.setattr(server, "_fetch_article_body_with_result", mock_fetch)
     monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_tldr)

@@ -4091,7 +4091,7 @@ Big readability sweep across `pipeline.py`, `server.py`, `templates/index.html`,
 - New helpers in `tests/test_server.py`: `_read_template_and_static()` and 2 new tests (`test_dashboard_js_loaded_via_static_endpoint`, `test_static_dashboard_js_has_no_jinja`).
 
 ### 6. Extract prompt strings to `prompts/*.txt`
-- The 5 inline LLM prompt strings inside `generate_detailed_tldr` (server.py) are now 5 files in `prompts/`: `article_v4.txt`, `discussion_v4.txt`, `article_only_v4.txt`, `discussion_only_v4.txt`, `combined_v4.txt`. Loaded via a small cached `_load_prompt(name)` helper. Filenames are pinned to `TLDR_PROMPT_VERSION = "detail-v4"` so the cache key and file name stay in sync.
+- The 5 inline LLM prompt strings inside `generate_detailed_tldr` (server.py) are now 4 files in `prompts/`: `article_v4.txt`, `discussion_v4.txt`, `article_only_v4.txt`, `discussion_only_v4.txt`. (`combined_v4.txt` was removed 2026-07-03 — its branch was unreachable.) Loaded via a small cached `_load_prompt(name)` helper. Filenames are pinned to `TLDR_PROMPT_VERSION = "detail-v4"` so the cache key and file name stay in sync.
 - `server.py` shrank by ~150 lines.
 
 ### 7. Consolidate HTTP fetch fallback
@@ -5967,3 +5967,54 @@ with 0.1s polling), and per-test 0.1s sleep loops in
 `max_examples` edit), `tests/test_eval_ranker_variants.py` (1
 docstring, 1 candidates count, 1 `--help` test rewrite to AST),
 `WORKLOG.md` (this entry).
+
+## 2026-07-03 — Typed result contract for TLDR generation
+
+`generate_detailed_tldr` (server.py) no longer returns error strings
+(checked via `startswith("Error")` / `"HTTP 429" in` substring tests).
+It now returns `TldrResult`:
+
+```python
+@dataclass(frozen=True)
+class TldrResult:
+    kind: Literal["ok", "no_content", "llm_error"]
+    tldr: str = ""
+    error_status: int | None = None
+    error_text: str = ""
+```
+
+`_call_llm_chat` also returns a typed result (`LlmChatResult`) instead of
+raw strings or string-formatted errors, eliminating the `"Error from LLM
+Provider: HTTP 429 - ..."` parsing.
+
+**Rationale.** A legitimate TLDR that begins with "Error" (a story about
+error handling) was previously classified as failure — never cached,
+quota burned on every retry. The typed contract eliminates all fragile
+string checks across 5 call sites.
+
+**Collateral changes.**
+- Removed dead `combined_v4.txt` branch and prompt file (the `else`
+  in the single-prompt path was unreachable).
+- `_call_llm_chat` now wraps its body in try/except with
+  `logging.exception` — connection/timeout errors become
+  `LlmChatResult(ok=False)` instead of propagating, enabling
+  `asyncio.gather` without `return_exceptions=True` (planned).
+- Added `_llm_error_from(r: LlmChatResult) -> TldrResult` helper
+  to deduplicate the 3 identical error-construction blocks.
+- Removed dead try/except wrappers around the LLM call sites (they
+  no longer catch anything since `_call_llm_chat` never raises).
+- Added empty-LLM-response guard: normalization followed by
+  `.strip()` check; empty normalized output returns `llm_error`
+  instead of being cached as an empty success.
+- Deduplicated `article_section`/`comments_section` building
+  (the single-prompt path reuses the same variables built earlier
+  for the dual-prompt gate, instead of rebuilding identically).
+- Updated WORKLOG.md prompt count (5 → 4, `combined_v4.txt` removed).
+
+**Test impact.** 20 test mocks returned `str` from
+`generate_detailed_tldr`; updated to return `TldrResult(kind="ok",
+tldr=...)`. Direct `_call_llm_chat` mock assertions updated to check
+`.content` and `.ok` fields.
+
+**Files**: `server.py`, `tests/test_server.py`, `prompts/combined_v4.txt`
+(deleted), `WORKLOG.md`.
