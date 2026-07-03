@@ -770,7 +770,7 @@ async def test_rss_feed_captures_comments_url(monkeypatch):
         async def get(self, url, headers=None):
             return MockResp()
 
-    monkeypatch.setattr("pipeline.httpx.AsyncClient", MockClient)
+    monkeypatch.setattr("pipeline.enrichment.httpx.AsyncClient", MockClient)
 
     stories = await _fetch_and_parse_feed(
         "https://tildes.net/topics.rss",
@@ -820,7 +820,7 @@ async def test_rss_feed_no_comments_url(monkeypatch):
         async def get(self, url, headers=None):
             return MockResp()
 
-    monkeypatch.setattr("pipeline.httpx.AsyncClient", MockClient)
+    monkeypatch.setattr("pipeline.enrichment.httpx.AsyncClient", MockClient)
 
     stories = await _fetch_and_parse_feed(
         "https://example.com/feed.xml",
@@ -1008,7 +1008,7 @@ async def test_build_reddit_topfeed_serializes_and_sets_user_agent(
             link = url.replace("/top/.rss", "/comments/test")
             return MockResp(rss_doc(title, link))
 
-    monkeypatch.setattr("pipeline.httpx.AsyncClient", MockClient)
+    monkeypatch.setattr("pipeline.enrichment.httpx.AsyncClient", MockClient)
     # Disable the 2s inter-request delay so the test runs fast;
     # the conftest fixture resets the limiter before/after each test.
     monkeypatch.setattr("pipeline.reddit_limiter", pipeline.reddit_limiter)
@@ -1094,7 +1094,7 @@ async def test_build_reddit_topfeed_populates_self_text(tmp_path, monkeypatch):
         async def get(self, url, headers=None):
             return MockResp(rss_doc("LA transit", url + "/comments/x/"))
 
-    monkeypatch.setattr("pipeline.httpx.AsyncClient", MockClient)
+    monkeypatch.setattr("pipeline.enrichment.httpx.AsyncClient", MockClient)
     pipeline.reddit_limiter.INTER_REQUEST_DELAY = 0.0
 
     feeds = ["https://www.reddit.com/r/transit/top/.rss"]
@@ -1150,7 +1150,7 @@ async def test_build_reddit_topfeed_cache_hit_skips_http(tmp_path, monkeypatch):
         async def get(self, url, headers=None):
             raise RuntimeError("HTTP call made despite cache hit")
 
-    monkeypatch.setattr("pipeline.httpx.AsyncClient", FailClient)
+    monkeypatch.setattr("pipeline.enrichment.httpx.AsyncClient", FailClient)
     pipeline.reddit_limiter.INTER_REQUEST_DELAY = 0.0
 
     factories, reddit_feed_urls = build_reddit_topfeed_factories(
@@ -1203,7 +1203,7 @@ async def test_build_reddit_topfeed_cache_miss_fetches_and_caches(
         async def get(self, url, headers=None):
             return MockResp(rss_doc("Fresh Story", url + "/comments/x/"))
 
-    monkeypatch.setattr("pipeline.httpx.AsyncClient", MockClient)
+    monkeypatch.setattr("pipeline.enrichment.httpx.AsyncClient", MockClient)
     pipeline.reddit_limiter.INTER_REQUEST_DELAY = 0.0
     pipeline.reddit_feed_cache.reset()
 
@@ -5495,7 +5495,7 @@ def test_model_cache_hit() -> None:
     _set_cached_model(42, "sig1", svm, scaler, maxsize=10)
     result = _get_cached_model(42, "sig1")
     assert result is not None
-    cached_svm, cached_scaler = result
+    cached_svm, cached_scaler, _ = result
     assert cached_svm is svm
     assert cached_scaler is scaler
 
@@ -5554,6 +5554,33 @@ def test_model_cache_eviction() -> None:
     assert _get_cached_model(1, "sig2") is not None
     assert _get_cached_model(1, "sig3") is not None
     assert _get_cached_model(1, "sig4") is not None
+
+
+@settings(max_examples=50, deadline=None)
+@given(
+    n_query=st.integers(min_value=0, max_value=40),
+    n_ref=st.integers(min_value=0, max_value=40),
+    dim=st.integers(min_value=1, max_value=8),
+    k=st.integers(min_value=1, max_value=40),
+    chunk_size=st.integers(min_value=1, max_value=16),
+    seed=st.integers(min_value=0, max_value=2**31 - 1),
+)
+def test_knn_mean_and_max_matches_separate_helpers(
+    n_query: int, n_ref: int, dim: int, k: int, chunk_size: int, seed: int
+) -> None:
+    """The fused helper must be bit-for-bit equivalent to the pair it replaces."""
+    rng = np.random.default_rng(seed)
+    query = rng.standard_normal((n_query, dim)).astype(np.float32)
+    ref = rng.standard_normal((n_ref, dim)).astype(np.float32)
+
+    fused_mean, fused_max = ranking._knn_mean_and_max(
+        query, ref, k, chunk_size=chunk_size
+    )
+    sep_mean = ranking._knn_similarity(query, ref, k, chunk_size=chunk_size)
+    sep_max = ranking._chunked_max_dot(query, ref, chunk_size=chunk_size)
+
+    np.testing.assert_allclose(fused_mean, sep_mean, rtol=0, atol=1e-6)
+    np.testing.assert_allclose(fused_max, sep_max, rtol=0, atol=1e-6)
 
 
 def test_rank_trace_records_and_formats_fields() -> None:
