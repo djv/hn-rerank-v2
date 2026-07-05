@@ -4,26 +4,252 @@
 
 - This repository is a minimalist, local-first Hacker News reranking dashboard rewrite.
 - Use `uv run python <script>.py` or standard `uv` commands to execute scripts and run tests.
-- Treat `public/` as generated output unless a task explicitly targets it.
-
 ## Working rules
 
+- **Trust the live tree, not stale docs or session logs.** When reviewing
+  a plan or answering a "check" question, verify claims against the current
+  checkout. Documentation and session history describe what was true
+  at write time; the source tree is the ground truth.
 - Make minimal, behavior-preserving changes unless the user asks for a broader refactor.
 - Keep the runtime path local-first; do not add new external dependencies unless needed.
 - **Be very skeptical of unusually high metrics** (e.g. NDCG > 0.40). We are unlikely to beat the Hacker News baseline by a large margin; high metrics often indicate feature leakage, train-test contamination, or metric saturation artifacts.
-- **Do NOT standard-scale raw embeddings**: StandardScaler must only be applied to metadata columns (indices `emb_dim:` onward), leaving the 384-dimensional unit-normed raw embeddings untouched. Scaling raw embedding dimensions independently distorts their semantic cosine similarity structure and collapses ranking performance.
+- **Do NOT standard-scale raw embeddings** (384-d MiniLM vectors are L2-normalized; StandardScaler must only touch metadata columns from `emb_dim:` onward).
 - **Never delete or destructively modify the local database** (`hn_rewrite.db`, `hn.db`, or any `*.db` file in the working tree). The DB holds the user's accumulated feedback and is the single source of truth for personalization. No `rm`, no `DELETE FROM` without a `WHERE` clause that excludes all rows, no schema migrations that drop tables or columns with data. The pipeline's own `prune_stories` and `prune_*` operations are fine — they have explicit retention rules and `id NOT IN (SELECT story_id FROM feedback)` guards. When in doubt, ask before running any command that touches the DB file.
-- Keep test execution times optimized (target under 10 seconds total).
-- **Always update relevant documentation** (e.g., [ARCHITECTURE.md](file:///home/dev/hn-rewrite/ARCHITECTURE.md)) after making code or behavior changes.
+  - **Exception (2026-06-22):** 756 test/empty stories (time=0) were deleted with explicit user permission. This included 2 test stories (id=999 "Test", id=99999998 "Test regen live") that received 2 upvotes from user 1. Backup retained at `hn_rewrite.db.pre_test_removal_20260622T163344Z`.
+- Keep test execution times optimized (target under 12 seconds total at `-n 4`). Run the full suite with `uv run pytest tests/ -n 4` (4 cores; `pytest-xdist` is in `dev`). Single-process takes ~32s; `-n 4` brings it to ~22s on this host. Per-test ONNX model loads are avoided entirely by `MockEmbedder(Embedder)` in `tests/test_server.py:18` (overrides `__init__` to skip the `AutoTokenizer.from_pretrained` + `ort.InferenceSession` path) and `DummyEmbedder(Embedder)` in the two seed test files — they share a module-scoped `mock_embedder` fixture in `test_server.py`. The remaining ~22s is dominated by `test_leak_check_smoke` (10s) and `test_leak_check_flag_in_help` (3s) in `test_eval_ranker_variants.py` (subprocesses that run real sklearn). Do not regress this: any new "mock" embedder that subclasses `pipeline.Embedder` MUST override `__init__` or it will silently reload ONNX per test.
+- **Never silently lose uncommitted work.** The working tree can hold
+  modifications from a prior session (Codex, codex, opencode, human
+  hand-edits). Treat any pre-existing uncommitted change as load-bearing
+  until proven otherwise. Three operational rules:
+
+  1. **Inventory before any `git stash`, `git checkout`, `git restore`,
+     `git reset`, or `git clean` operation.** Run `git status --short`
+     and `git diff --stat` first, write down (or paste into the chat)
+     the full set of modified and untracked files. If the operation
+     targets a subset, confirm the subset is exhaustive — i.e. that no
+     file outside the subset holds uncommitted changes you need.
+
+  2. **Never `git checkout HEAD -- <file>` on a file that has uncommitted
+     changes in the working tree unless the file is explicitly listed
+     in a fresh stash and you've just verified it with `git diff <file>`
+     showing no diff.** A bare `git checkout HEAD -- file` discards the
+     file's working-tree state with no warning, no backup, no recovery
+     short of `git fsck --unreachable`.
+
+  3. **Default to `git stash push -u` with no file list** when the goal
+     is "save the entire WIP before doing something different." If you
+     need a partial stash, use `git stash push -- <file1> <file2> ...`
+     *only after* step 1 confirms those are the only files with WIP.
+     For surgical hunk selection, prefer `git stash -p` so every hunk is
+     visible. Never combine a partial stash with a `git checkout HEAD`
+     on the un-stashed files in the same logical operation.
+
+  - **Use a worktree for parallel work on an existing WIP.** When you
+    need to make a separate change on top of an uncommitted WIP, prefer
+    `git worktree add ../hn-rewrite-<branch> -b <branch>` to a second
+    working tree. The WIP stays untouched in the original tree, and
+    you can `git stash`/commit at your own pace in the new tree without
+    risking a partial-loss operation in the original.
+
+  - **Recovery hint**: even after a bad `git checkout`, the pre-checkout
+    blob may still exist in the object store as an unreachable object.
+    `git fsck --unreachable --no-reflogs` lists candidates. `git show
+    <sha>:<path>` recovers the file. This is best-effort — `git gc`
+    prunes unreachable objects after the default 30-day window, and a
+    subsequent `git add` may have overwritten the index entry.
+
+  - **Codex/codex session logs are recovery hints, not source of truth.**
+    If a prior codex or Codex session exists for a WIP, it may help
+    reconstruct lost code, but: (a) the diffs are against an older
+    snapshot of the tree, (b) line numbers and surrounding code may have
+    shifted, (c) the session may show *attempted* patches that were
+    never applied cleanly. Mirror structurally, not verbatim, and verify
+    with tests. Record the recovery (and the loss) in WORKLOG.md so the
+    git history is self-documenting — the next person reading the blame
+    should see what happened and what was reconstructed.
+
+- **Focused commits.** When asked to commit, stage only the intended
+  files. Verify with `git status --short` and `git diff --stat` first.
+  Leave unrelated workspace state (including `.opencode/`) alone.
+  Do not amend or force-push unless explicitly asked.
+- **Always update relevant documentation** (e.g., [ARCHITECTURE.md](ARCHITECTURE.md), [WORKLOG.md](WORKLOG.md)) after making code or behavior changes.
+
+## Running scripts
+
+- **Always run Python via `uv run python <script>.py`.** Never invoke `python` or `python3` directly — the project uses `uv` to manage the venv and dependencies. Direct invocations will use the system Python, missing project dependencies.
+- For one-liners, use `uv run python -c "..."`.
+- For ad-hoc tools, prefer writing a script in `scripts/` (tracked, testable) over `-c` one-liners (ephemeral, untracked).
+- Interactive REPL: `uv run python` (drops you into the project venv).
+- Do not bypass the venv. If you need a new package, add it to `pyproject.toml` and re-run `uv sync`.
+
+## Type discipline
+
+- **Strongly typed systems are the default.** Use explicit domain models
+  (dataclasses, `NewType`, `Literal`, enums) for any value that crosses a
+  module boundary, gets stored, or represents a meaningful domain concept.
+- **No `dict[str, Any]` for core data flow.** Story rows, score maps,
+  CH response rows, etc. should be `Story`, `dict[int, float]`,
+  `list[ChStoryItem]`, or a typed dataclass. `Any` and untyped dicts
+  are acceptable for:
+  - Parsing JSON from external APIs (the boundary), as long as the
+    parsed result is immediately normalized into a typed model.
+  - Feature dicts in ML pipelines where keys are dynamic (but the
+    *value type* must still be explicit, e.g. `dict[str, np.ndarray]`).
+- **Type hints are mandatory for new code** in the `pipeline/` package,
+  `ch_client.py`, `server.py`, `database.py`. Existing code without
+  hints gets hints when you touch it.
+- **Tests get hints too** — public test functions should have
+  parameter and return type annotations, even if the body is short.
+- **LSP errors are not optional.** If your editor (or `uv run ruff check`)
+  flags a type mismatch, fix it. Don't `# type: ignore` to silence it
+  unless the alternative is genuinely worse and the reason is documented
+  inline.
+- **Validation at the boundary, not deep in the code.** Functions that
+  accept external data (CH responses, HTTP requests) should validate
+  types/shapes and raise a clear error. Don't let `None` propagate
+  through 5 layers.
+- **The `from __future__ import annotations` directive is already at the
+  top of every module** — keep it. New modules should add it too. It
+  makes all annotations lazy strings, which avoids forward-reference
+  issues and is required for Python 3.9+ compatibility (we target 3.12).
 
 ## Common commands
 
 - Install or refresh the environment: `uv sync`
 - Run tests: `uv run pytest tests/`
 - Run linting: `uv run ruff check .`
-- Run persistent server: `systemctl --user {status|start|stop|restart} hn_rewrite.service` (or directly: `uv run python server.py`)
-- Run one-shot generation: `uv run python generate.py`
+- Run type checking: `uv run ty check` (Astral's `ty`; pre-existing
+  diagnostics are tracked in the baseline; new code must introduce
+  zero new diagnostics. LSP errors must be fixed or `# type: ignore`
+  with a documented reason)
+
+## Verification protocol
+
+Before reporting completion of any code or template change:
+
+1. `uv run pytest tests/ -n 4` — full suite must pass
+2. `uv run ruff check .` — lint must be clean
+3. `uv run ty check` — zero new type diagnostics
+4. If the change affects runtime behavior: restart the service, then
+   live smoke test with endpoint requests plus a bounded
+   `journalctl --user -u hn_rewrite.service --since '1 min ago'` scan
+5. If UI templates changed: update corresponding assertions in
+   `tests/test_server.py`
+
+## Dependency groups
+
+`pyproject.toml` ships two groups beyond the runtime deps. Default
+`uv sync` installs only `dev` (linters, pytest, type checker). The
+`dl-experiment` group is opt-in.
+
+- `dev` — pytest, pytest-asyncio, hypothesis, ruff, ty. Always
+  installed by `uv sync`.
+- `dl-experiment` — `torch>=2.12`. Pulls in the ~700MB torch +
+  triton + nvidia-cu* wheels. **Required only by** `pipeline_dl.py`,
+  `pipeline_dl_t0.py`, `tests/test_pipeline_dl.py`, and
+  `scripts/eval_ranker_variants.py` — the unshipped attention-MLP
+  ranker experiment (loses to SVM on every metric; see WORKLOG
+  2026-06-25).
+  - Install on demand: `uv sync --group dl-experiment`
+  - Run the experiment tests: `uv run --group dl-experiment pytest tests/test_pipeline_dl.py`
+  - Run the offline eval: `uv run --group dl-experiment python scripts/eval_ranker_variants.py ...`
+  - Without the group, `scripts/eval_ranker_variants.py` exits 1 with
+    a friendly error pointing at this command.
+  - The 21 `test_pipeline_dl.py` tests are skipped (not failed) by
+    `pytest.importorskip("torch")` at the top of the file when the
+    group is not active.
+
+If a future experiment is added that needs a different heavy
+runtime dep (e.g. jax, tensorflow), give it its own
+`[dependency-groups]` group with a descriptive name, not a runtime
+  direct dep.
+
 - Migrate feedback from legacy JSON: `uv run python migrate_feedback.py`
+- **Primary archive seeder** — ClickHouse (no GCP auth, 10-30x faster, real-time scores):
+  `uv run python scripts/seed_hn_from_clickhouse.py` (default: 6 months, score ≥ 200)
+- **Backup archive seeder** — BigQuery (requires `gcloud`/`bq` auth, stale snapshot):
+  `uv run python scripts/seed_hn_from_bq.py --months N --min-score N`
+- Dry-run archive seeders (fetch rows to JSONL, skip DB/Algolia):
+  `uv run python scripts/seed_hn_from_clickhouse.py --dry-run --limit N --min-score N`
+  `uv run python scripts/seed_hn_from_bq.py --dry-run --limit N --min-score N`
+- Compare ClickHouse vs BigQuery output: `uv run python scripts/seed_smoke_test.py --bq-file bq.jsonl --ch-file ch.jsonl`
+  or live: `uv run python scripts/seed_smoke_test.py --limit 50 --min-score 200 --skip-bq`
+- Run leakage-safe offline eval: `uv run python scripts/eval_ranker_variants.py --window-days N`
+
+## Service & runtime
+
+- Run persistent server: `systemctl --user {status|start|stop|restart} hn_rewrite.service`
+  (or directly: `uv run python server.py`)
+- **Restart before verifying**: live behavior can differ from the checkout until
+  `hn_rewrite.service` is restarted. Deployed code and the working tree can diverge;
+  verify with `git log`, `systemctl --user status hn_rewrite.service`, then
+  `journalctl` before concluding runtime behavior from code alone.
+- Live smoke test shape: after restart, hit the dashboard plus cached/uncached
+  `POST /api/tldr-detail`, then scan `journalctl --user -u hn_rewrite.service
+  --since '1 min ago'` for errors.
+
+## Frontend notes
+
+- **Data-attribute collisions**: `data-*` attributes on story cards (e.g.
+  `data-story-source`, `data-story-id` in `templates/components/story_card.html`)
+  can be accidentally matched by generic `querySelectorAll('[data-*]')` selectors
+  in `templates/index.html`. Tab buttons use `data-source`, `data-sort`,
+  `data-age` — scope selectors to `.tab-btn[data-*]`. When adding `data-*` to
+  templates, verify no JS selector collides with them.
+- **Template tests**: `tests/test_server.py` pins CSS/JS contracts via
+  template-string assertions. Update them when `templates/index.html` changes.
+  Avoid adding tests that only check exact strings without validating runtime
+  behavior (the user will request their removal).
+- **Version semantics**: `dashboard_version=0` is valid cold-deck data.
+  Client-side version comparisons must use `Number.isFinite()`, not truthiness.
+
+## HN data sources (architecture overview)
+
+The dashboard uses two external data sources for HN stories. Algolia was
+removed from the live `hn` source pipeline on 2026-06-26; CH is now the
+sole source for the live 30-day window and bulk operations.
+
+| Source | Used for | Why |
+|---|---|---|
+| **ClickHouse** (`hackernews_history`) | Live 30-day window (`query_live_window`), bulk comment hydration (archive seed), bulk prewarm (top-50 ranked) | Single SQL query for N stories; 10-100× faster than per-story Algolia |
+| **Algolia** (`hn.algolia.com`) | Single-story items fallback (lazy TLDR detail for stories outside prewarm) | Real-time, no CH equivalent for one-off fetches; used only as fallback |
+| **BigQuery** (`bigquery-public-data.hacker_news.full`) | Backup archive seeder (manual) | Same data as CH; slower; requires `gcloud`/`bq` auth |
+
+The live `hn` source pipeline (`fetch_candidates` in `pipeline.py`) now
+issues **1 CH call per regen**:
+
+1. `ch_client.query_live_window(days=30, min_score=5, limit=5000)` — every
+   live HN story from the past 30 days with all fields (title, url,
+   score, descendants, time, text).
+
+The prewarm (comment text for all HN candidates with `comment_count > 0` and
+empty `top_comments`) is a second CH call inside `fetch_candidates_only`,
+at regen time — not on the render path. Every user's first dashboard render
+finds the candidate rows already populated. The first 4 cards any user sees
+have `top_comments` already populated — no Algolia wait and no render-time
+prewarm latency.
+
+Stories with no content to summarize (self_text, top_comments, and article_body
+all empty, and no HN comment_count > 0) are filtered out by `is_summarizable()`
+in `fetch_candidates`. Config knobs `prewarm_hn_full`, `prewarm_reddit_full`,
+and `prewarm_lesswrong_full` (default true) control prewarm scope; set to false
+to revert to top-by-score prewarm (`regen_prewarm_top_n=50` default; Reddit
+prewarm is now driven by `reddit_prewarm_top_per_sub=10` — top 10 hot per sub
+from the topfeed cache, not by score from a DB query).
+
+CH has 1-24h latency for brand-new content (vs Algolia's real-time).
+With a 3h regen cycle, worst case is 4h lag for stories posted in the
+last hour. Acceptable for "best of HN" view; the swipe deck mostly
+shows older stories anyway.
+
+The CH bulk client lives in `ch_client.py`. The
+previous per-story parallel Algolia hydration (used for archive seeding
+before 2026-06-26) is preserved in
+`scripts/_archive/algolia/` as a fallback if CH
+becomes unavailable.
+
+## See also
+- [WORKLOG.md](WORKLOG.md) — recent changes and operational events
 
 ## Backup
 
@@ -50,14 +276,6 @@ HN_KEEP_N=7 ./scripts/backup_hn_db.sh             # keep 7
 LATEST=$(rclone lsf --dirs-only drive:hn-rewrite/backups/ | sort -r | head -1)
 rclone copy drive:hn-rewrite/backups/$LATEST/hn_rewrite.db ./hn_rewrite.db
 sqlite3 hn_rewrite.db "PRAGMA integrity_check;"
+## Testing notes
 
-## Comment Backfill
-
-- `fetch_story` short-circuits on cached stories with stale/missing `top_comments`. Fixed: `comments_stale` check falls through to Algolia items API. Comment re-fetch capped at 100 per pipeline run (`fetch_stories_by_id` sorts stale IDs descending, takes top 100).
-- Error paths in `fetch_story` (non-200, invalid item, exception) preserve existing cached rows — `if story is None` guard prevents `_empty_story(sid)` from overwriting real data on transient failures.
-- Corrupted stories (`title=""` but `text_content` preserved from COALESCE) are detected and given priority in the re-fetch queue, ahead of the 100-slot stale-comment cap.
-- `_empty_story` is destructive: zeros `title`, `time`, `score`, `self_text`, `top_comments`, `text_content`. Only `article_body` survives (COALESCE in `upsert_story`). A single transient 403 on the Algolia items API can permanently damage cached stories if error paths call `_empty_story`.
-- `_row_to_story` recomposes `text_content` live from raw parts on every read. This hides corruption — zeroed `title`/`time` with preserved `article_body` produces non-empty `text_content`, so the story passes filtering but shows blank title and epoch timestamp ("20624d ago").
-- `upsert_story` COALESCE only covers `article_body`. All other columns (title, score, time, self_text, top_comments, text_content) are overwritten unconditionally. This is an architectural vulnerability.
-- 1,940 stories still need comment backfill. They'll be gradually re-fetched as they appear in future Algolia search windows (100 per pipeline run).
-```
+- **Curl sessions**: first-visit `GET /` creates one user, sets `hn_token`, and serves the dashboard directly. `/u/<token>` only imports an existing profile onto a new device. Always use `-c cookie.txt -b cookie.txt` when testing live API flows with curl so subsequent requests keep the same profile.

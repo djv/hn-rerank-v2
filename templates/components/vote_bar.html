@@ -1,0 +1,22 @@
+<div class="vote-bar" hidden>
+  <button class="filter-toggle-btn" title="Filters" aria-label="Toggle filters">☰</button>
+  <div class="vote-counts" aria-label="Your all-time vote counts">
+    <span class="vote-count vote-count--up">
+      <span class="vote-count-glyph" aria-hidden="true">▲</span>
+      <span class="vote-count-num" data-vote-count="up">{{ vote_counts.up }}</span>
+    </span>
+    <span class="vote-count vote-count--neutral">
+      <span class="vote-count-glyph" aria-hidden="true">●</span>
+      <span class="vote-count-num" data-vote-count="neutral">{{ vote_counts.neutral }}</span>
+    </span>
+    <span class="vote-count vote-count--down">
+      <span class="vote-count-glyph" aria-hidden="true">▼</span>
+      <span class="vote-count-num" data-vote-count="down">{{ vote_counts.down }}</span>
+    </span>
+  </div>
+  <div class="feedback-group">
+    <button class="feedback-btn" data-fb="up" title="Upvote">▲</button>
+    <button class="feedback-btn" data-fb="neutral" title="Skip (neutral)">✓</button>
+    <button class="feedback-btn" data-fb="down" title="Downvote">▼</button>
+  </div>
+</div>

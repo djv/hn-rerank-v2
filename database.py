@@ -5,11 +5,14 @@ import sqlite3
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal, Generator
+from typing import Literal, Generator, TypeAlias
 from contextlib import contextmanager
 import queue
 import numpy as np
 from numpy.typing import NDArray
+
+
+Action: TypeAlias = Literal["up", "neutral", "down"]
 
 
 @dataclass(frozen=True)
@@ -32,7 +35,7 @@ class Story:
 @dataclass(frozen=True)
 class FeedbackRecord:
     story_id: int
-    action: Literal["up", "neutral", "down"]
+    action: Action
     title: str
     url: str | None
     text_content: str
@@ -48,22 +51,29 @@ class User:
 
 
 class Database:
-    def __init__(self, path: str = "hn_rewrite.db") -> None:
+    def __init__(self, path: str = "hn_rewrite.db", *, read_only: bool = False) -> None:
+        self.read_only = read_only
         db_path = Path(path)
-        db_path.parent.mkdir(parents=True, exist_ok=True)
+        if not read_only:
+            db_path.parent.mkdir(parents=True, exist_ok=True)
         self.db_path = str(db_path)
         self._pool = queue.Queue()
         pool_size = 1 if self.db_path == ":memory:" else 5
         for _ in range(pool_size):
-            conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            conn.execute("PRAGMA journal_mode=WAL")
+            if read_only:
+                uri = f"file:{db_path.resolve()}?mode=ro"
+                conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+            else:
+                conn = sqlite3.connect(self.db_path, check_same_thread=False)
+                conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("PRAGMA busy_timeout=5000")
             self._pool.put(conn)
-        self._create_tables()
+        if not read_only:
+            self._create_tables()
 
     @contextmanager
-    def _conn(self) -> Generator[sqlite3.Connection, None, None]:
+    def conn(self) -> Generator[sqlite3.Connection, None, None]:
         conn = self._pool.get()
         try:
             yield conn
@@ -71,7 +81,7 @@ class Database:
             self._pool.put(conn)
 
     def _create_tables(self) -> None:
-        with self._conn() as conn:
+        with self.conn() as conn:
             with conn:
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS stories (
@@ -109,6 +119,11 @@ class Database:
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_stories_source ON stories(source)"
                 )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_stories_archive_score_time "
+                    "ON stories(score DESC, time DESC) "
+                    "WHERE source IN ('bq_seed', 'ch_seed') AND text_content != ''"
+                )
 
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS embeddings (
@@ -126,8 +141,42 @@ class Database:
                         "ALTER TABLE embeddings ADD COLUMN text_hash TEXT NOT NULL DEFAULT ''"
                     )
 
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS tldr_cache (
+                        story_id    INTEGER NOT NULL,
+                        cache_key   TEXT NOT NULL,
+                        tldr        TEXT NOT NULL,
+                        created_at  REAL NOT NULL,
+                        PRIMARY KEY (story_id, cache_key),
+                        FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE
+                    )
+                """)
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tldr_cache_story ON tldr_cache(story_id)"
+                )
+
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS article_fetch_failures (
+                        story_id       INTEGER PRIMARY KEY,
+                        url            TEXT NOT NULL,
+                        failure_count  INTEGER NOT NULL DEFAULT 0,
+                        last_status    INTEGER,
+                        last_error     TEXT NOT NULL DEFAULT '',
+                        permanent      INTEGER NOT NULL DEFAULT 0,
+                        next_retry_at  REAL NOT NULL DEFAULT 0,
+                        updated_at     REAL NOT NULL,
+                        FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE
+                    )
+                """)
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_article_fetch_failures_url "
+                    "ON article_fetch_failures(url)"
+                )
+
                 # Run migration of article_cache to stories table if article_cache exists
-                tbl_cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='article_cache'")
+                tbl_cursor = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='article_cache'"
+                )
                 if tbl_cursor.fetchone():
                     logging.info("Migrating article_cache records to stories table...")
                     conn.execute("""
@@ -150,7 +199,9 @@ class Database:
                 """)
 
                 # Multi-user feedback migration
-                tbl_cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='feedback'")
+                tbl_cursor = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='feedback'"
+                )
                 if tbl_cursor.fetchone():
                     cursor = conn.execute("PRAGMA table_info(feedback)")
                     fb_columns = {row[1] for row in cursor.fetchall()}
@@ -168,7 +219,7 @@ class Database:
                         """)
                         conn.execute(
                             "INSERT OR IGNORE INTO users (id, token, created_at) VALUES (1, 'default', ?)",
-                            (time.time(),)
+                            (time.time(),),
                         )
                         conn.execute("""
                             INSERT INTO feedback_new (user_id, story_id, action, updated_at)
@@ -178,7 +229,9 @@ class Database:
                         conn.execute("ALTER TABLE feedback_new RENAME TO feedback")
                     elif "title" in fb_columns:
                         # Legacy migration from denormalized feedback
-                        logging.info("Migrating feedback table schema to normalized version...")
+                        logging.info(
+                            "Migrating feedback table schema to normalized version..."
+                        )
                         conn.execute("""
                             CREATE TABLE feedback_new (
                                 user_id     INTEGER NOT NULL DEFAULT 1,
@@ -191,7 +244,7 @@ class Database:
                         """)
                         conn.execute(
                             "INSERT OR IGNORE INTO users (id, token, created_at) VALUES (1, 'default', ?)",
-                            (time.time(),)
+                            (time.time(),),
                         )
                         conn.execute("""
                             INSERT OR IGNORE INTO feedback_new (user_id, story_id, action, updated_at)
@@ -202,7 +255,7 @@ class Database:
                 else:
                     conn.execute(
                         "INSERT OR IGNORE INTO users (id, token, created_at) VALUES (1, 'default', ?)",
-                        (time.time(),)
+                        (time.time(),),
                     )
                     conn.execute("""
                         CREATE TABLE IF NOT EXISTS feedback (
@@ -225,31 +278,75 @@ class Database:
 
     # Stories
     def upsert_story(self, story: Story) -> None:
-        with self._conn() as conn:
+        with self.conn() as conn:
             # Check if the story already exists and has longer cached content
             cursor = conn.execute(
-                "SELECT self_text, top_comments, article_body FROM stories WHERE id = ?",
-                (story.id,)
+                "SELECT self_text, top_comments, article_body, "
+                "comment_count, comment_count_at_fetch, discussion_url "
+                "FROM stories WHERE id = ?",
+                (story.id,),
             )
             row = cursor.fetchone()
             if row:
                 db_self, db_comments, db_body = row[0] or "", row[1] or "", row[2] or ""
-                
-                # Keep the longest available version of each field
-                final_self = story.self_text if len(story.self_text) >= len(db_self) else db_self
-                final_comments = story.top_comments if len(story.top_comments) >= len(db_comments) else db_comments
-                final_body = story.article_body if len(story.article_body) >= len(db_body) else db_body
-                
-                # Recompose if database fields were merged
-                if final_self != story.self_text or final_comments != story.top_comments or final_body != story.article_body:
-                    from pipeline import compose_story_text
-                    new_text = compose_story_text(story.title, final_self, final_comments, final_body)
+
+                # Keep the longest available version of each text field
+                final_self = (
+                    story.self_text if len(story.self_text) >= len(db_self) else db_self
+                )
+                final_comments = (
+                    story.top_comments
+                    if len(story.top_comments) >= len(db_comments)
+                    else db_comments
+                )
+                final_body = (
+                    story.article_body
+                    if len(story.article_body) >= len(db_body)
+                    else db_body
+                )
+
+                # Preserve richer comment_count and discussion_url from the
+                # database. Re-ingestion from RSS can produce a story with
+                # comment_count=0 and discussion_url=None even when the
+                # prewarm path or on-demand TLDR has since populated those
+                # fields; an unconditional UPSERT would clobber them on
+                # every regen cycle.
+                final_comment_count = (
+                    story.comment_count
+                    if (story.comment_count or 0) >= (row[3] or 0)
+                    else row[3]
+                )
+                final_ccaf = max(story.comment_count_at_fetch or 0, row[4] or 0)
+                final_discussion_url = story.discussion_url or row[5]
+
+                # Recompose or merge metadata if any field changed
+                recomposed = (
+                    final_self != story.self_text
+                    or final_comments != story.top_comments
+                    or final_body != story.article_body
+                )
+                metadata_changed = (
+                    final_comment_count != story.comment_count
+                    or final_discussion_url != story.discussion_url
+                    or final_ccaf != story.comment_count_at_fetch
+                )
+                if recomposed or metadata_changed:
+                    new_text = story.text_content
+                    if recomposed:
+                        from pipeline import compose_story_text
+
+                        new_text = compose_story_text(
+                            story.title, final_self, final_comments, final_body
+                        )
                     story = replace(
                         story,
                         self_text=final_self,
                         top_comments=final_comments,
                         article_body=final_body,
                         text_content=new_text,
+                        comment_count=final_comment_count,
+                        comment_count_at_fetch=final_ccaf,
+                        discussion_url=final_discussion_url,
                     )
 
             with conn:
@@ -265,7 +362,11 @@ class Database:
                         title=excluded.title,
                         url=excluded.url,
                         score=excluded.score,
-                        time=excluded.time,
+                        time = CASE
+                            WHEN stories.time > 0 THEN stories.time
+                            WHEN excluded.time > 0 THEN excluded.time
+                            ELSE 0
+                        END,
                         text_content=excluded.text_content,
                         source=excluded.source,
                         comment_count=excluded.comment_count,
@@ -313,7 +414,7 @@ class Database:
         )
 
     def get_story(self, story_id: int) -> Story | None:
-        with self._conn() as conn:
+        with self.conn() as conn:
             cursor = conn.execute(
                 """
                 SELECT id, title, url, score, time, text_content, source, comment_count, discussion_url,
@@ -336,25 +437,31 @@ class Database:
                    comment_count_at_fetch, self_text, top_comments, article_body
             FROM stories WHERE id IN ({placeholders})
         """
-        with self._conn() as conn:
+        with self.conn() as conn:
             cursor = conn.execute(query, ids)
             return [self._row_to_story(row) for row in cursor.fetchall()]
 
     def prune_stories(self, max_age_days: int = 60) -> int:
         cutoff = time.time() - (max_age_days * 86400)
-        with self._conn() as conn:
+        with self.conn() as conn:
             with conn:
                 cursor = conn.execute(
-                    "DELETE FROM stories WHERE fetched_at < ? AND id NOT IN (SELECT story_id FROM feedback)",
+                    "DELETE FROM stories WHERE fetched_at < ? "
+                    "AND source NOT IN ('bq_seed', 'ch_seed') "
+                    "AND id NOT IN (SELECT story_id FROM feedback)",
                     (cutoff,),
                 )
                 return cursor.rowcount
 
     def upsert_embedding(
-        self, story_id: int, model_version: str, text_hash: str, vec: NDArray[np.float32]
+        self,
+        story_id: int,
+        model_version: str,
+        text_hash: str,
+        vec: NDArray[np.float32],
     ) -> None:
         blob = vec.astype(np.float32).tobytes()
-        with self._conn() as conn:
+        with self.conn() as conn:
             with conn:
                 conn.execute(
                     """
@@ -371,7 +478,7 @@ class Database:
     def get_embedding(
         self, story_id: int, model_version: str, text_hash: str
     ) -> NDArray[np.float32] | None:
-        with self._conn() as conn:
+        with self.conn() as conn:
             cursor = conn.execute(
                 "SELECT embedding FROM embeddings WHERE story_id = ? AND model_version = ? AND text_hash = ?",
                 (story_id, model_version, text_hash),
@@ -392,7 +499,7 @@ class Database:
             WHERE model_version = ? AND story_id IN ({placeholders})
         """
         params = [model_version] + ids
-        with self._conn() as conn:
+        with self.conn() as conn:
             cursor = conn.execute(query, params)
             res = {}
             for row in cursor.fetchall():
@@ -401,16 +508,62 @@ class Database:
                     res[sid] = np.frombuffer(blob, dtype=np.float32)
             return res
 
+    # TLDR cache
+    def get_tldr_cache(self, story_id: int, cache_key: str) -> str | None:
+        with self.conn() as conn:
+            row = conn.execute(
+                "SELECT tldr FROM tldr_cache WHERE story_id = ? AND cache_key = ?",
+                (story_id, cache_key),
+            ).fetchone()
+            return row[0] if row else None
 
+    def get_any_tldr_for_story(self, story_id: int) -> str | None:
+        """Return the cached TLDR for a story regardless of cache key.
+
+        `upsert_tldr_cache` deletes any prior row before inserting, so at
+        most one row exists per story_id; this is a stale-tolerant fallback
+        for when story content changed after the TLDR was generated (see
+        `_handle_flask_tldr_detail` fallback in server.py).
+        """
+        with self.conn() as conn:
+            row = conn.execute(
+                "SELECT tldr FROM tldr_cache WHERE story_id = ?",
+                (story_id,),
+            ).fetchone()
+            return row[0] if row else None
+
+    def get_tldr_cache_keys(self, story_ids: list[int]) -> dict[int, str]:
+        """Bulk lookup of cache_key for stories that have a cached TLDR."""
+        if not story_ids:
+            return {}
+        with self.conn() as conn:
+            placeholders = ",".join("?" for _ in story_ids)
+            rows = conn.execute(
+                f"SELECT story_id, cache_key FROM tldr_cache WHERE story_id IN ({placeholders})",
+                story_ids,
+            ).fetchall()
+            return {row[0]: row[1] for row in rows}
+
+    def upsert_tldr_cache(self, story_id: int, cache_key: str, tldr: str) -> None:
+        with self.conn() as conn:
+            with conn:
+                conn.execute("DELETE FROM tldr_cache WHERE story_id = ?", (story_id,))
+                conn.execute(
+                    """
+                    INSERT INTO tldr_cache (story_id, cache_key, tldr, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (story_id, cache_key, tldr, time.time()),
+                )
 
     # Feedback
     def upsert_feedback(
         self,
         user_id: int,
         story_id: int,
-        action: Literal["up", "neutral", "down"],
+        action: Action,
     ) -> None:
-        with self._conn() as conn:
+        with self.conn() as conn:
             with conn:
                 conn.execute(
                     """
@@ -424,7 +577,7 @@ class Database:
                 )
 
     def get_all_feedback(self, user_id: int | None = None) -> list[FeedbackRecord]:
-        with self._conn() as conn:
+        with self.conn() as conn:
             if user_id is not None:
                 cursor = conn.execute(
                     """
@@ -458,16 +611,65 @@ class Database:
                 for row in cursor.fetchall()
             ]
 
+    def get_feedback_stories(
+        self, user_id: int, actions: tuple[str, ...]
+    ) -> list[Story]:
+        """Return Story objects for feedback rows matching *actions*.
+
+        Score is forced to -1 so these stories always lose same-source
+        tiebreaks in dedup — they participate only as suppressors, never
+        as survivors.
+        """
+        if not actions:
+            return []
+        placeholders = ",".join("?" for _ in actions)
+        with self.conn() as conn:
+            cursor = conn.execute(
+                f"SELECT DISTINCT s.id, s.title, s.url, s.time, "
+                f"       s.text_content, s.source "
+                f"FROM stories s "
+                f"JOIN feedback f ON f.story_id = s.id "
+                f"WHERE f.user_id = ? AND f.action IN ({placeholders}) "
+                f"ORDER BY s.id",
+                (user_id, *actions),
+            )
+            return [
+                Story(
+                    id=row[0],
+                    title=row[1] or "",
+                    url=row[2],
+                    score=-1,  # always lose same-source tiebreaks
+                    time=row[3] or 0,
+                    text_content=row[4] or "",
+                    source=row[5] or "hn",
+                )
+                for row in cursor.fetchall()
+            ]
+
+    def count_feedback_by_action(self, user_id: int) -> dict[str, int]:
+        """Return per-action counts for a user. Unknown actions are ignored."""
+        rows = self.execute(
+            "SELECT action, COUNT(*) FROM feedback WHERE user_id = ? GROUP BY action",
+            (user_id,),
+        )
+        counts: dict[str, int] = {"up": 0, "neutral": 0, "down": 0}
+        for action, n in rows:
+            if action in counts:
+                counts[action] = n
+        return counts
+
     def delete_feedback(self, user_id: int, story_id: int) -> None:
-        with self._conn() as conn:
+        with self.conn() as conn:
             with conn:
                 conn.execute(
                     "DELETE FROM feedback WHERE user_id = ? AND story_id = ?",
                     (user_id, story_id),
                 )
 
-    def get_feedback_for_training(self, user_id: int | None = None) -> tuple[list[Story], list[int], list[float]]:
-        with self._conn() as conn:
+    def get_feedback_for_training(
+        self, user_id: int | None = None
+    ) -> tuple[list[Story], list[int], list[float]]:
+        with self.conn() as conn:
             if user_id is not None:
                 cursor = conn.execute(
                     """
@@ -534,25 +736,102 @@ class Database:
             return stories, labels, vote_times
 
     def execute(self, sql: str, params: tuple = ()) -> list[tuple]:
-        with self._conn() as conn:
+        with self.conn() as conn:
             with conn:
                 cursor = conn.execute(sql, params)
                 return cursor.fetchall()
 
+    # Article fetch failure memory
+    def get_article_fetch_failure(self, story_id: int) -> dict | None:
+        with self.conn() as conn:
+            row = conn.execute(
+                """
+                SELECT story_id, url, failure_count, last_status, last_error,
+                       permanent, next_retry_at, updated_at
+                FROM article_fetch_failures
+                WHERE story_id = ?
+                """,
+                (story_id,),
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "story_id": row[0],
+                "url": row[1],
+                "failure_count": row[2],
+                "last_status": row[3],
+                "last_error": row[4],
+                "permanent": bool(row[5]),
+                "next_retry_at": row[6],
+                "updated_at": row[7],
+            }
+
+    def record_article_fetch_failure(
+        self,
+        story_id: int,
+        url: str,
+        *,
+        status: int | None = None,
+        error: str | None = None,
+        permanent: bool = False,
+        next_retry_at: float | None = None,
+    ) -> None:
+        now = time.time()
+        if next_retry_at is None:
+            next_retry_at = now
+        with self.conn() as conn:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO article_fetch_failures (
+                        story_id, url, failure_count, last_status, last_error,
+                        permanent, next_retry_at, updated_at
+                    )
+                    VALUES (?, ?, 1, ?, ?, ?, ?, ?)
+                    ON CONFLICT(story_id) DO UPDATE SET
+                        url=excluded.url,
+                        failure_count=article_fetch_failures.failure_count + 1,
+                        last_status=excluded.last_status,
+                        last_error=excluded.last_error,
+                        permanent=excluded.permanent,
+                        next_retry_at=excluded.next_retry_at,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        story_id,
+                        url,
+                        status,
+                        (error or "")[:500],
+                        1 if permanent else 0,
+                        next_retry_at,
+                        now,
+                    ),
+                )
+
+    def clear_article_fetch_failure(self, story_id: int) -> None:
+        with self.conn() as conn:
+            with conn:
+                conn.execute(
+                    "DELETE FROM article_fetch_failures WHERE story_id = ?",
+                    (story_id,),
+                )
+
     # Users
     def create_user(self, token: str) -> User:
-        with self._conn() as conn:
+        with self.conn() as conn:
             with conn:
                 now = time.time()
                 conn.execute(
                     "INSERT INTO users (token, created_at) VALUES (?, ?)",
                     (token, now),
                 )
-                row = conn.execute("SELECT id FROM users WHERE token = ?", (token,)).fetchone()
+                row = conn.execute(
+                    "SELECT id FROM users WHERE token = ?", (token,)
+                ).fetchone()
                 return User(id=row[0], token=token, created_at=now)
 
     def get_user_by_token(self, token: str) -> User | None:
-        with self._conn() as conn:
+        with self.conn() as conn:
             row = conn.execute(
                 "SELECT id, token, created_at FROM users WHERE token = ?", (token,)
             ).fetchone()

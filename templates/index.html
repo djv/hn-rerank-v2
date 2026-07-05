@@ -13,12 +13,29 @@
       --pico-primary: #ff6600;
       --pico-primary-background: #ff6600;
       --pico-primary-hover: #e05a00;
+      --page-gutter: 1rem;
+      --vote-bar-height: 3.2rem;
+      --card-bottom-gap: 0.5rem;
+      --active-card-viewport-reserve: calc(var(--vote-bar-height) + var(--card-bottom-gap));
+      --fullscreen-gutter: 1rem;
+      --mobile-vote-bar-clearance: calc(3.75rem + env(safe-area-inset-bottom, 0px));
     }
     
-    body {
-      padding-top: 0.5rem;
-      padding-bottom: 1rem;
+    html {
+      overflow: hidden;
     }
+
+    body {
+      padding-top: 0;
+      padding-bottom: var(--page-gutter);
+      overflow: hidden;
+    }
+
+    body.fullscreen {
+      padding-block: var(--fullscreen-gutter);
+    }
+
+    main { padding-block: 0; }
 
     header {
       border-bottom: 1px solid var(--pico-muted-border-color);
@@ -43,9 +60,16 @@
     }
 
     .share-link {
-      margin-left: 0.5rem;
+      display: block;
+      margin: 0.2rem 0 0.65rem;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: var(--pico-primary);
       font-size: 0.75rem;
+      text-align: left;
       opacity: 0.6;
+      cursor: pointer;
     }
     .share-link:hover {
       opacity: 1;
@@ -62,37 +86,276 @@
     .controls-row select {
       width: auto;
       margin-bottom: 0;
-      padding: 0.25rem 0.5rem;
+      padding: 0.25rem 1.75rem 0.25rem 0.5rem;
       font-size: 0.8rem;
       height: auto;
     }
 
+    .swipe-shell {
+      max-width: 1280px;
+      margin: 0 auto;
+    }
+
+    .swipe-layout {
+      display: flex;
+      align-items: flex-start;
+      gap: 1rem;
+    }
+
+    .swipe-side {
+      flex: 0 0 170px;
+      color: var(--pico-muted-color);
+      font-size: 0.8rem;
+      max-height: calc(100vh - 1.5rem);
+      overflow-y: auto;
+      overflow-x: hidden;
+      padding-right: 0.5rem;
+    }
+
+    .queue-pill {
+      display: block;
+      margin-bottom: 0.65rem;
+      padding: 0.45rem;
+      border: 1px solid var(--pico-muted-border-color);
+      border-radius: 4px;
+      background: var(--pico-card-background-color);
+      line-height: 1.25;
+    }
+    .queue-pill--bar {
+      padding: 0.45rem;
+    }
+
+    .toast {
+      position: fixed;
+      top: 0.75rem;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 1000;
+      max-width: min(90vw, 360px);
+      padding: 0.5rem 0.85rem;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.97);
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
+      color: #212529;
+      font-size: 0.85rem;
+      border: 1px solid rgba(0, 0, 0, 0.12);
+      text-align: center;
+    }
+    .toast[hidden] { display: none; }
+    .toast--error {
+      border-color: #dc3545;
+      color: #842029;
+    }
+    .toast--info {
+      border-color: rgba(0, 0, 0, 0.12);
+    }
+
+    .tab-bar {
+      display: flex;
+      gap: 0;
+      margin-bottom: 0.6rem;
+    }
+
+    .tab-bar--sort {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 0.35rem;
+      margin-bottom: 0.3rem;
+    }
+
+    .tab-bar--grid-4 {
+      grid-template-columns: repeat(4, 1fr);
+    }
+
+    .tab-btn {
+      width: 100%;
+      margin: 0;
+      padding: 0.6rem;
+      border-radius: 6px;
+      font-size: 0.85rem;
+      font-weight: 500;
+      line-height: 1.2;
+      text-align: center;
+      background: var(--pico-card-background-color);
+      border: 1px solid var(--pico-muted-border-color);
+      color: var(--pico-muted-color);
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+
+    .tab-btn:hover {
+      background: color-mix(in srgb, var(--pico-primary) 8%, var(--pico-card-background-color));
+      border-color: var(--pico-primary);
+      color: var(--pico-color);
+    }
+
+    .tab-btn.active {
+      background: var(--pico-primary);
+      color: white;
+      border-color: var(--pico-primary);
+      font-weight: 600;
+    }
+
+    .tab-btn--segmented {
+      flex: 1;
+      padding: 0.3rem;
+      border-radius: 0;
+      font-size: 0.75rem;
+      white-space: nowrap;
+      border-right: none;
+    }
+    .tab-btn--segmented:first-child {
+      border-top-left-radius: 6px;
+      border-bottom-left-radius: 6px;
+    }
+    .tab-btn--segmented:last-child {
+      border-top-right-radius: 6px;
+      border-bottom-right-radius: 6px;
+      border-right: 1px solid var(--pico-muted-border-color);
+    }
+    .tab-btn--segmented:hover {
+      background: color-mix(in srgb, #6c757d 12%, var(--pico-card-background-color));
+      border-color: #6c757d;
+      color: var(--pico-color);
+    }
+    .tab-btn--segmented.active {
+      background: #6c757d;
+      color: white;
+      border-color: #6c757d;
+      font-weight: 600;
+    }
+    .swipe-keys {
+      display: grid;
+      gap: 0.35rem;
+    }
+
+    .key-row {
+      display: flex;
+      gap: 0.4rem;
+      align-items: center;
+      width: 100%;
+      margin: 0;
+      padding: 0;
+      border: 0;
+      background: transparent !important;
+      color: var(--pico-muted-color) !important;
+      font-size: 0.8rem;
+      font-weight: 400;
+      line-height: 1.2;
+      text-align: left;
+      text-transform: none;
+      letter-spacing: 0;
+      cursor: pointer;
+      box-shadow: none !important;
+    }
+
+    .key-row:hover,
+    .key-row:focus,
+    .key-row:active {
+      border: 0;
+      background: transparent !important;
+      color: var(--pico-color) !important;
+      box-shadow: none !important;
+      outline: none;
+    }
+
+    .key-row:focus-visible {
+      outline: 1px solid var(--pico-muted-border-color);
+      outline-offset: 2px;
+    }
+
+    .first-time-tip-overlay {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+      background: rgba(0,0,0,0.25);
+    }
+    .first-time-tip-overlay[hidden] {
+      display: none !important;
+    }
+    .first-time-tip-inner {
+      pointer-events: auto;
+      max-width: 32rem;
+      padding: 1rem 1.25rem;
+      font-size: 0.95rem;
+      line-height: 1.5;
+      background: var(--pico-card-background-color);
+      border: 1px solid var(--pico-primary);
+      border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.2);
+    }
+    .first-time-tip-inner p {
+      margin: 0 0 0.35rem 0;
+    }
+    .first-time-tip-inner kbd {
+      font-family: inherit;
+      font-weight: 600;
+      font-size: 0.95rem;
+      padding: 0.1rem 0.3rem;
+    }
+    .first-time-tip-dismiss {
+      font-size: 0.85rem;
+      padding: 0.2rem 0.6rem;
+      cursor: pointer;
+    }
+
+    .key-hint {
+      display: inline-flex;
+      width: 1.6rem;
+      height: 1.45rem;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid var(--pico-muted-border-color);
+      border-bottom-width: 2px;
+      border-radius: 4px;
+      color: var(--pico-color) !important;
+      background: var(--pico-card-background-color) !important;
+      font-weight: 700;
+      line-height: 1;
+    }
+
+    #stories {
+      flex: 1 1 902px;
+    }
+
     .story-card {
-      margin-bottom: 0.5rem;
-      padding: 0.6rem 0.8rem;
+      display: none;
+      margin-right: auto;
+      margin-left: auto;
+      margin-bottom: 0.4rem;
+      width: fit-content;
+      min-width: min(60ch, 100%);
+      max-width: 902px;
+      padding: 0.5rem;
       border-radius: 6px;
       border: 1px solid var(--pico-card-border-color);
+      border-left: 7px solid transparent;
       background: var(--pico-card-background-color);
       transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1), transform 0.2s, box-shadow 0.2s;
       opacity: 1;
       overflow: hidden;
+      cursor: pointer;
+    }
+
+    .story-card.active {
+      display: block;
+      cursor: default;
+      max-height: calc(100vh - var(--active-card-viewport-reserve));     /* fallback for older browsers; clears fixed vote bar */
+      max-height: calc(100dvh - var(--active-card-viewport-reserve));    /* preferred */
+      min-height: 18rem;
+      overflow: auto;
     }
 
     .story-card.fade-out {
       opacity: 0;
-      max-height: 0 !important;
-      padding-top: 0 !important;
-      padding-bottom: 0 !important;
-      margin-top: 0 !important;
-      margin-bottom: 0 !important;
-      border-top-width: 0 !important;
-      border-bottom-width: 0 !important;
-      transform: translateY(15px);
+      transform: translateX(var(--swipe-exit-x, 0)) translateY(10px) rotate(var(--swipe-exit-rotate, 0deg));
       pointer-events: none;
     }
 
     .story-card:hover {
-      transform: translateY(-2px);
       box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
     }
 
@@ -100,20 +363,11 @@
       display: flex;
       flex-wrap: wrap;
       align-items: center;
-      gap: 0.4rem;
+      gap: 0.3rem;
       font-size: 0.75rem;
       color: var(--pico-muted-color);
-      margin-bottom: 0.2rem;
-    }
-
-    .score-badge {
-      display: inline-block;
-      padding: 0.05rem 0.3rem;
-      border-radius: 3px;
-      font-weight: bold;
-      font-size: 0.75rem;
-      background: var(--pico-primary-background);
-      color: white;
+      margin-bottom: 0.05rem;
+      overflow-wrap: anywhere;
     }
 
     .source-badge {
@@ -125,138 +379,71 @@
       color: #f8f9fa;
     }
 
-    .prob-badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.35rem;
-      padding: 0.05rem 0.4rem;
-      border-radius: 3px;
-      background: var(--pico-card-background-color);
-      border: 1px solid var(--pico-muted-border-color);
-      font-size: 0.7rem;
-      height: 1.1rem;
-      line-height: 1;
-    }
-
-    .prob-mini-bar {
-      display: inline-flex;
-      width: 32px;
-      height: 6px;
-      border-radius: 3px;
-      overflow: hidden;
-      background: var(--pico-muted-border-color);
-    }
-
-    .mini-segment {
-      height: 100%;
-    }
-
-    .mini-segment.down {
-      background: hsl(355, 75%, 55%); /* Soft Crimson */
-    }
-
-    .mini-segment.neutral {
-      background: hsl(40, 60%, 65%);  /* Soft Gold */
-    }
-
-    .mini-segment.up {
-      background: hsl(160, 60%, 45%);   /* Soft Teal */
-    }
-
-    .prob-mini-text {
-      font-weight: 600;
-      color: var(--pico-muted-color);
-      font-size: 0.65rem;
-      letter-spacing: 0.02em;
-    }
-
-    .uncertain-badge {
+    .badge {
       display: inline-block;
       padding: 0.05rem 0.35rem;
       border-radius: 3px;
       font-weight: 600;
       font-size: 0.7rem;
-      background: hsl(280, 50%, 25%); /* Deep plum/purple for uncertainty */
+      line-height: 1.2;
+    }
+
+    .badge--uncertain {
+      background: hsl(280, 50%, 25%);
       color: hsl(280, 80%, 90%);
       border: 1px solid hsl(280, 50%, 35%);
-      line-height: 1.2;
     }
 
-    .novel-badge {
-      display: inline-block;
-      padding: 0.05rem 0.35rem;
-      border-radius: 3px;
-      font-weight: 600;
-      font-size: 0.7rem;
-      background: hsl(170, 50%, 25%); /* Deep teal for novelty */
+    .badge--novel {
+      background: hsl(170, 50%, 25%);
       color: hsl(170, 80%, 90%);
       border: 1px solid hsl(170, 50%, 35%);
-      line-height: 1.2;
     }
 
-    .discussion-rich-badge {
-      display: inline-block;
-      padding: 0.05rem 0.35rem;
-      border-radius: 3px;
-      font-weight: 600;
-      font-size: 0.7rem;
+    .badge--talk {
       background: hsl(35, 60%, 25%);
       color: hsl(35, 80%, 90%);
       border: 1px solid hsl(35, 60%, 35%);
-      line-height: 1.2;
     }
 
-    .high-engagement-badge {
-      display: inline-block;
-      padding: 0.05rem 0.35rem;
-      border-radius: 3px;
-      font-weight: 600;
-      font-size: 0.7rem;
+    .badge--top {
       background: hsl(45, 60%, 25%);
       color: hsl(45, 80%, 90%);
       border: 1px solid hsl(45, 60%, 35%);
-      line-height: 1.2;
     }
 
-    .hot-badge {
-      display: inline-block;
-      padding: 0.05rem 0.35rem;
-      border-radius: 3px;
-      font-weight: 600;
-      font-size: 0.7rem;
+    .badge--hot {
       background: hsl(15, 60%, 25%);
       color: hsl(15, 80%, 90%);
       border: 1px solid hsl(15, 60%, 35%);
-      line-height: 1.2;
     }
 
-    .similar-badge {
-      display: inline-block;
-      padding: 0.05rem 0.35rem;
-      border-radius: 3px;
-      font-weight: 600;
-      font-size: 0.7rem;
-      background: hsl(210, 50%, 25%); /* Steel/Slate Blue for similar stories */
+    .badge--similar {
+      background: hsl(210, 50%, 25%);
       color: hsl(210, 80%, 90%);
       border: 1px solid hsl(210, 50%, 35%);
-      line-height: 1.2;
     }
 
     .story-card.enriched {
-      background: color-mix(in srgb, var(--pico-card-background-color) 93%, hsl(120, 50%, 50%) 7%);
-      border-color: color-mix(in srgb, var(--pico-card-border-color) 90%, hsl(120, 50%, 50%) 10%);
+      width: 100%;
+      max-width: none;
+      border-top-color: color-mix(in srgb, var(--pico-card-border-color) 90%, hsl(120, 50%, 50%) 10%);
+      border-right-color: color-mix(in srgb, var(--pico-card-border-color) 90%, hsl(120, 50%, 50%) 10%);
+      border-bottom-color: color-mix(in srgb, var(--pico-card-border-color) 90%, hsl(120, 50%, 50%) 10%);
     }
 
     .story-title {
       font-size: 1.05rem;
-      margin-bottom: 0.2rem;
-      line-height: 1.2;
+      margin-top: 0.05rem;
+      margin-bottom: 0.05rem;
+      line-height: 1.18;
     }
 
     .story-title a {
       color: var(--pico-color);
       text-decoration: none;
       font-weight: 600;
+      overflow-wrap: anywhere;
     }
 
     .story-title a:hover {
@@ -264,62 +451,148 @@
       text-decoration: underline;
     }
 
+    .tldr-detail-content {
+      cursor: default;
+      margin-top: 0.4rem;
+      padding-top: 0.4rem;
+      border-top: 1px dashed var(--pico-muted-border-color);
+      font-size: 0.85rem;
+      overflow-wrap: anywhere;
+    }
+
+    .story-footer {
+      display: flex;
+      justify-content: flex-end;
+      align-items: center;
+      gap: 0.5rem;
+      margin-top: 0.25rem;
+    }
+
     .match-reason {
       font-size: 0.8rem;
       font-style: italic;
       color: var(--pico-muted-color);
       margin-bottom: 0;
-      margin-top: 0.5rem;
+      margin-top: 0.25rem;
+      overflow-wrap: anywhere;
     }
 
     .feedback-group {
       display: inline-flex;
       gap: 0.2rem;
-      margin-left: auto;
     }
 
-    .feedback-btn {
-      padding: 0.15rem 0.5rem;
-      font-size: 0.8rem;
-      border-radius: 4px;
-      background: transparent;
-      border: 1px solid var(--pico-muted-border-color);
+    .vote-bar {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      z-index: 100;
+      background: color-mix(in srgb, var(--pico-card-background-color) 92%, transparent);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      border-top: 1px solid var(--pico-muted-border-color);
+      padding: 0.5rem 0.8rem;
+      padding-bottom: calc(0.5rem + env(safe-area-inset-bottom, 0));
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 0.6rem;
+      max-width: 1280px;
+      margin: 0 auto;
+    }
+    .vote-bar[hidden] { display: none; }
+
+    .filter-toggle-btn {
+      display: none;
+      margin-right: auto;
+    }
+
+    .fullscreen .swipe-side { display: none; }
+    .fullscreen .vote-bar { display: none; }
+    .fullscreen .swipe-shell {
+      height: calc(100vh - var(--fullscreen-gutter) - var(--fullscreen-gutter));
+      height: calc(100dvh - var(--fullscreen-gutter) - var(--fullscreen-gutter));
+      padding-block: 0;
+      display: flex;
+      flex-direction: column;
+    }
+    .fullscreen .swipe-layout,
+    .fullscreen #stories {
+      flex: 1;
+      min-height: 0;
+    }
+    .fullscreen .swipe-layout {
+      align-items: stretch;
+    }
+    .fullscreen #stories {
+      display: flex;
+      flex-direction: column;
+    }
+    .fullscreen .story-card.active {
+      height: 100%;
+      max-height: 100%;
+      margin-bottom: 0;
+      overflow: auto;
+    }
+
+    .vote-counts {
+      display: flex;
+      gap: 0.7rem;
+      font-size: 0.78rem;
+      font-weight: 500;
       color: var(--pico-muted-color);
+      align-items: center;
+    }
+    .vote-count {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.15rem;
+      font-variant-numeric: tabular-nums;
+    }
+    .vote-count-glyph {
+      font-size: 0.85em;
+    }
+    .vote-count--up { color: #28a745; }
+    .vote-count--neutral { color: #ffc107; }
+    .vote-count--down { color: #dc3545; }
+
+    .feedback-btn,
+    .filter-toggle-btn {
+      padding: 0.5rem 0.9rem;
+      font-size: 0.95rem;
+      font-weight: 500;
+      border-radius: 6px;
+      background: color-mix(in srgb, var(--pico-muted-border-color) 50%, var(--pico-card-background-color));
+      border: 1px solid var(--pico-muted-border-color);
+      color: var(--pico-h1-color);
       cursor: pointer;
       line-height: 1.2;
-      transition: all 0.2s;
       margin-bottom: 0;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+      transition: all 0.2s;
+      min-width: 2.75rem;
     }
 
     .feedback-btn:hover {
-      background: #2b3035;
-      color: white;
+      background: color-mix(in srgb, var(--pico-primary) 10%, var(--pico-card-background-color));
+      border-color: var(--pico-primary);
+      color: var(--pico-primary);
+      transform: translateY(-1px);
+      box-shadow: 0 2px 4px rgba(0, 0, 0, 0.12);
     }
 
-    .tldr-detail-btn {
-      padding: 0.15rem 0.5rem;
-      font-size: 0.8rem;
-      border-radius: 4px;
-      background: transparent;
-      border: 1px solid var(--pico-muted-border-color);
-      color: var(--pico-muted-color);
-      cursor: pointer;
-      line-height: 1.2;
-      transition: all 0.2s;
-      margin-bottom: 0;
-    }
-
-    .tldr-detail-btn:hover {
-      background: #2b3035;
-      color: white;
+    .feedback-btn:active {
+      transform: translateY(0);
+      box-shadow: 0 1px 1px rgba(0, 0, 0, 0.1);
     }
 
     .tldr-detail-content h1,
     .tldr-detail-content h2,
     .tldr-detail-content h3,
     .tldr-detail-content h4 {
-      margin-top: 0.6rem;
-      margin-bottom: 0.3rem;
+      margin-top: 0.4rem;
+      margin-bottom: 0.2rem;
       font-weight: 700;
       color: var(--pico-color);
     }
@@ -330,15 +603,47 @@
 
     .tldr-detail-content ul,
     .tldr-detail-content ol {
-      margin-top: 0.2rem;
-      margin-bottom: 0.4rem;
+      margin-top: 0.1rem;
+      margin-bottom: 0.2rem;
       padding-left: 1.25rem;
     }
     .tldr-detail-content ul { list-style-type: disc; }
     .tldr-detail-content ol { list-style-type: decimal; }
     .tldr-detail-content li {
-      margin-bottom: 0.15rem;
-      line-height: 1.4;
+      margin-bottom: 0.1rem;
+      line-height: 1.35;
+    }
+
+    /* Label bullets (parent <li> with a nested <ul>): hide disc, flush-left bold */
+    .tldr-detail-content li:has(> ul) {
+      list-style: none;
+      font-weight: 700;
+      color: var(--pico-h1-color);
+      margin-top: 0.35rem;
+    }
+    .tldr-detail-content li:has(> ul) > ul {
+      margin-top: 0.15rem;
+      margin-bottom: 0.25rem;
+      padding-left: 1.1rem;
+      list-style-type: circle;
+      font-size: 0.93em;
+    }
+    .tldr-detail-content li:has(> ul) > ul li {
+      margin-bottom: 0.08rem;
+    }
+
+    /* Backup: when the LLM emits `- **Label**:` instead of `#### Label`,
+       style the label bullet itself (no DOM restructure). */
+    .tldr-detail-content li.tldr-label {
+      list-style: none;
+      font-weight: 700;
+      color: var(--pico-h1-color);
+      margin-top: 0.35rem;
+    }
+    .tldr-detail-content li.tldr-label::before {
+      content: "▸ ";
+      color: var(--pico-muted-color);
+      font-weight: 400;
     }
 
     .tldr-detail-content pre {
@@ -348,7 +653,7 @@
       padding: 0.4rem 0.6rem;
       overflow-x: auto;
       font-size: 0.8rem;
-      margin: 0.3rem 0;
+      margin: 0.2rem 0;
     }
     .tldr-detail-content code {
       font-size: 0.85em;
@@ -363,7 +668,7 @@
 
     .tldr-detail-content blockquote {
       border-left: 3px solid var(--pico-primary);
-      margin: 0.3rem 0;
+      margin: 0.2rem 0;
       padding: 0.2rem 0.6rem;
       color: var(--pico-muted-color);
       font-style: italic;
@@ -372,12 +677,12 @@
     .tldr-detail-content hr {
       border: none;
       border-top: 1px solid var(--pico-muted-border-color);
-      margin: 0.5rem 0;
+      margin: 0.3rem 0;
     }
 
     .tldr-detail-content p {
-      margin: 0.2rem 0;
-      line-height: 1.4;
+      margin: 0.1rem 0;
+      line-height: 1.35;
     }
 
     .tldr-detail-content a {
@@ -406,171 +711,363 @@
       border-color: #dc3545 !important;
     }
 
-    footer {
-      text-align: center;
-      margin-top: 3rem;
-      font-size: 0.8rem;
-      color: var(--pico-muted-color);
-      border-top: 1px solid var(--pico-muted-border-color);
-      padding-top: 1.5rem;
+    .refresh-banner {
+      position: fixed;
+      top: 0.75rem;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 1000;
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      padding: 0.45rem 0.6rem 0.45rem 0.85rem;
+      border: 1px solid rgba(255, 102, 0, 0.35);
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.97);
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
+      color: #212529;
+      font-size: 0.85rem;
     }
+
+    .refresh-banner[hidden] {
+      display: none;
+    }
+
+    .refresh-banner button {
+      width: auto;
+      margin: 0;
+      padding: 0.25rem 0.65rem;
+      font-size: 0.8rem;
+      line-height: 1.2;
+    }
+
+    @media (max-width: 640px) {
+      .swipe-layout {
+        flex-direction: column;
+      }
+
+      .swipe-side {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        z-index: 99;
+        transform: translateY(-100%);
+        transition: transform 0.2s ease;
+        width: 100%;
+        max-width: 100%;
+        max-height: none;
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+        padding: 0.6rem 0.8rem 0.6rem 0.8rem;
+        background: var(--pico-card-background-color);
+        border-bottom: 1px solid var(--pico-muted-border-color);
+        box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+        overflow-y: auto;
+      }
+
+      .swipe-side.visible {
+        transform: translateY(0);
+      }
+
+      .tab-bar--sort {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 0.3rem;
+        margin-bottom: 0;
+      }
+
+      .tab-bar--segmented {
+        display: grid;
+        gap: 0.3rem;
+        margin-bottom: 0;
+      }
+
+      .tab-bar[data-filter="age"] {
+        grid-template-columns: repeat(2, 1fr);
+      }
+
+      .tab-bar[data-filter="source"] {
+        grid-template-columns: repeat(3, 1fr);
+      }
+
+      .tab-btn--segmented {
+        border-right: 1px solid var(--pico-muted-border-color);
+        border-radius: 6px;
+      }
+
+      .swipe-keys { display: none; }
+
+      .filter-toggle-btn { display: inline-flex; }
+
+      .feedback-btn {
+        padding: 0.6rem 0.9rem;
+        font-size: 1.05rem;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
+      }
+      .feedback-group {
+        gap: 0.4rem;
+      }
+
+      .swipe-shell {
+        height: calc(100vh - 1.5rem - var(--mobile-vote-bar-clearance));    /* fallback for older browsers */
+        height: calc(100dvh - 1.5rem - var(--mobile-vote-bar-clearance));   /* preferred: accounts for mobile URL bar */
+        display: flex;
+        flex-direction: column;
+      }
+      .swipe-layout {
+        flex: 1;
+        min-height: 0;
+      }
+      #stories {
+        flex: 1;
+        min-height: 0;
+      }
+      .story-card.active {
+        max-height: 100%;
+      }
+
+      .vote-counts { display: none; }
+
+    }
+
+
   </style>
 </head>
 <body>
-  <main class="container">
-    <header>
-      <div class="brand">
-        <h1>HN <span>Rerank</span></h1>
-      </div>
-      <div class="controls-row">
-        <div class="meta-subtitle">
-          {% if user_token %}<a href="/u/{{ user_token }}" class="share-link" title="Use this link to sync other devices">{{ user_token }}</a> · {% endif %}updated {{ timestamp }}
-        </div>
-        <select id="sort-mode" aria-label="Sort options">
-          <option value="score" selected>Sort by Score</option>
-          <option value="date">Sort by Date</option>
-        </select>
-      </div>
-    </header>
+  <div id="toast" class="toast" hidden role="status" aria-live="polite"></div>
 
-    <div id="stories">
-      {% for item in stories %}
-      {% set active_fb = fb_map.get(item.story.id) %}
-      <article class="story-card{% if item.story.text_content | length >= 1000 %} enriched{% endif %}" 
-               data-story-id="{{ item.story.id }}" 
-               data-score="{{ item.score }}"
-               data-time="{{ item.story.time }}"
-               data-source="{{ item.story.source }}">
-        <div class="story-header">
-          <span class="score-badge">{{ (item.score * 100) | int }}%</span>
-          
-          {% if item.prob_down is not none %}
-          <div class="prob-badge" title="Down: {{ (item.prob_down * 100) | round(1) }}% | Neutral: {{ (item.prob_neutral * 100) | round(1) }}% | Up: {{ (item.prob_up * 100) | round(1) }}%">
-            <span class="prob-mini-bar">
-              <span class="mini-segment down" style="width: {{ item.prob_down * 100 }}%"></span>
-              <span class="mini-segment neutral" style="width: {{ item.prob_neutral * 100 }}%"></span>
-              <span class="mini-segment up" style="width: {{ item.prob_up * 100 }}%"></span>
-            </span>
-            <span class="prob-mini-text">▼{{ (item.prob_down * 100) | int }}% · ●{{ (item.prob_neutral * 100) | int }}% · ▲{{ (item.prob_up * 100) | int }}%</span>
-          </div>
-          {% endif %}
-          
-          {% if item.is_uncertain %}
-          <span class="uncertain-badge" title="Model is highly uncertain about this story (high entropy distribution)">🤔 Unsure</span>
-          {% endif %}
-          {% if item.is_novel %}
-          <span class="novel-badge" title="Semantically distant from all your feedback, but model scores it high">✨ Novel</span>
-          {% endif %}
-          {% if item.is_discussion_rich %}
-          <span class="discussion-rich-badge" title="Many comments on this story (top 7%)">💬 Talk-worthy</span>
-          {% endif %}
-          {% if item.is_high_engagement %}
-          <span class="high-engagement-badge" title="Top 5% by HN points">🏆 Top</span>
-          {% endif %}
-          {% if item.is_hot %}
-          <span class="hot-badge" title="Top 2% by engagement velocity (points/hour)">🔥 Hot</span>
-          {% endif %}
-          {% if item.is_similar %}
-          <span class="similar-badge" title="Highly similar to your upvoted stories">🎯 Similar</span>
-          {% endif %}
-          
-          {% if item.story.source != "hn" %}
-          <span class="source-badge">{{ item.story.source }}</span>
-          {% endif %}
-          
-          {% if item.story.score > 0 %}
-          <span>{{ item.story.score }} pts</span>
-          {% endif %}
-          
-          <span>{{ item.story.time | time_ago }}</span>
-          
-          {% if item.story.discussion_url %}
-          <a href="{{ item.story.discussion_url }}" target="_blank" rel="noopener">
-            💬{% if item.story.comment_count is not none %} {{ item.story.comment_count }}{% endif %} comments
-          </a>
-          {% endif %}
-
-          <div class="feedback-group">
-            <button class="feedback-btn {% if active_fb == 'up' %}active{% endif %}" data-fb="up" title="Upvote">▲</button>
-            <button class="feedback-btn {% if active_fb == 'neutral' %}active{% endif %}" data-fb="neutral" title="Neutral">✓</button>
-            <button class="feedback-btn {% if active_fb == 'down' %}active{% endif %}" data-fb="down" title="Downvote">▼</button>
-          </div>
-        </div>
-
-        <h2 class="story-title">
-          <a href="{{ item.story.url or item.story.discussion_url }}" target="_blank" rel="noopener">
-            {{ item.story.title }}
-          </a>
-        </h2>
-
-        <div class="story-footer" style="display: flex; justify-content: flex-end; margin-top: 0.25rem;">
-          <button type="button" class="tldr-detail-btn" data-tldr-detail>🔍 Detailed analysis</button>
-        </div>
-
-        {% if item.best_match_title %}
-        <p class="match-reason">Similar to: {{ item.best_match_title }}</p>
-        {% endif %}
-      </article>
+  <main class="container swipe-shell">
+    <div class="swipe-layout">
+      <div id="stories"
+           data-user-id="{{ user_id or 0 }}"
+           data-user-token="{{ user_token or '' }}"
+           data-dashboard-version="{{ dashboard_version }}"
+           data-current-version="{{ dashboard_latest_version }}">
+      {% for card in cards %}
+      {% include "components/story_card.html" %}
       {% endfor %}
+      </div>
+
+      {% include "components/side_rail.html" %}
     </div>
 
-    <footer>
-      HN Rerank Rewrite · Local-first semantic filtering
-    </footer>
   </main>
 
-  <script>
-    // Restore temporary client feedback state before regeneration updates the static file.
-    // Also clean up keys that have been persisted on the server or relate to discarded cards.
-    const USER_TOKEN = document.cookie.match(/hn_token=([^;]+)/)?.[1] || '';
-    const fbKey = (sid) => USER_TOKEN + '_fb_' + sid;
+  {% include "components/vote_bar.html" %}
+  {% include "components/first_time_tip.html" %}
 
+  <script>
     const presentStoryIds = new Set();
     document.querySelectorAll('.story-card').forEach(card => {
       const storyId = card.dataset.storyId;
       presentStoryIds.add(storyId);
-      
-      const storedAction = localStorage.getItem(fbKey(storyId));
-      if (storedAction) {
-        const htmlActiveBtn = card.querySelector('.feedback-btn.active');
-        const htmlActiveAction = htmlActiveBtn ? htmlActiveBtn.dataset.fb : null;
-        
-        if (htmlActiveAction === storedAction) {
-          localStorage.removeItem(fbKey(storyId));
-        } else {
-          card.querySelectorAll('[data-fb]').forEach(btn => {
-            btn.classList.toggle('active', btn.dataset.fb === storedAction);
-          });
-        }
-      }
     });
 
-    // Garbage collect stale localStorage entries for stories no longer on the page
-    for (let i = 0; i < localStorage.length; i++) {
-      const key = localStorage.key(i);
-      if (key && key.startsWith(USER_TOKEN + '_fb_')) {
-        const storyId = key.replace(USER_TOKEN + '_fb_', '');
-        if (!presentStoryIds.has(storyId)) {
-          localStorage.removeItem(key);
-          i--;
-        }
+    // Swipe deck state
+    const storiesContainer = document.getElementById('stories');
+    const toastEl = document.getElementById('toast');
+    const sortTabs = Array.from(document.querySelectorAll('[data-sort]'));
+    const ageTabs = Array.from(document.querySelectorAll('[data-age]'));
+    const sourceTabs = Array.from(document.querySelectorAll('.tab-btn[data-source]'));
+    const voteBar = document.querySelector('.vote-bar');
+    const sidePanel = document.querySelector('.swipe-side');
+    const filterToggleBtn = document.querySelector('.filter-toggle-btn');
+    let activeCard = null;
+    let lastVote = null;
+    let nextVoteId = 1;
+    let currentSort = 'recommended';
+    let currentAge = 'recent';
+    let currentSource = 'mixed';
+    const votedStoryIds = new Set();
+    const feedbackChains = new Map();
+    const MAX_QUEUE = 12;
+    const PREFETCH_COUNT = 2;
+    const IDLE_INACTIVE_PREFETCH_COUNT = 2;
+    const tldrCache = new Map(); // storyId (number) → raw TLDR markdown (string)
+    let idleAgePrefetchHandle = null;
+    let toastTimer = null;
+    let refillInFlight = false;
+    let queuedRefillAdvance = null;
+    let warmPollInFlight = false;
+    let warmMinVersion = null;
+    let latestWarmTargetVersion = null;
+    let lastScheduledWarmVersion = null;
+    const VOTED_STORAGE_LIMIT = 1000;
+
+    function cards() {
+      return Array.from(storiesContainer.querySelectorAll('.story-card'));
+    }
+
+    function matchesCurrentCombo(card) {
+      const target = currentAge + '_' + currentSource;
+      return (card.dataset.combo || '').split(' ').includes(target);
+    }
+
+    function matchesCurrentAxes(card) {
+      if (currentSort === 'popular' && card.dataset.sortPopular !== '1') return false;
+      if (currentSort === 'explore' && card.dataset.sortExplore !== '1') return false;
+      return true;
+    }
+
+    function queuedCards() {
+      return cards().filter(card => !card.dataset.voted && matchesCurrentCombo(card) && matchesCurrentAxes(card));
+    }
+
+    // Map a story's rank position (sorted by data-score desc) to a hue.
+    // Rank 1 (top) = blue, rank N (bottom) = red. Rank-percentile mapping
+    // (rather than linear-in-score) ensures visually distinguishable colors
+    // even when the score distribution clusters near 1.0.
+    function applyGradient() {
+      const cards = Array.from(document.querySelectorAll('.story-card'));
+      const N = cards.length;
+      if (N <= 1) return;
+      const ranked = cards
+        .map(card => ({ card, score: parseFloat(card.dataset.score) || 0 }))
+        .sort((a, b) => b.score - a.score);
+      ranked.forEach((entry, i) => {
+        // i=0 -> top rank -> blue (220); i=N-1 -> bottom -> red (0)
+        const hue = 220 * (N - 1 - i) / (N - 1);
+        entry.card.style.borderLeftColor = `hsl(${hue.toFixed(1)}, 70%, 40%)`;
+        entry.card.style.backgroundColor = `color-mix(in srgb, var(--pico-card-background-color) 96%, hsl(${hue.toFixed(1)}, 70%, 50%) 4%)`;
+      });
+    }
+
+    function orderCards(comparator) {
+      const cards = Array.from(document.querySelectorAll('.story-card'));
+      cards.sort(comparator);
+      cards.forEach(card => storiesContainer.appendChild(card));
+    }
+
+    function orderForCurrentSort() {
+      if (currentSort === 'date') {
+        orderCards((a, b) => Number(b.dataset.time || 0) - Number(a.dataset.time || 0));
+      } else {
+        orderCards((a, b) => parseFloat(b.dataset.score) - parseFloat(a.dataset.score));
       }
     }
 
-    // Client-side dynamic sorting
-    const sortSelect = document.getElementById('sort-mode');
-    const storiesContainer = document.getElementById('stories');
+    function advanceToNextCard() {
+      const q = queuedCards();
+      if (q.length === 0) return;
+      const idx = activeCard ? q.indexOf(activeCard) : -1;
+      const next = q[(idx + 1) % q.length];
+      setActiveCard(next);
+    }
 
-    sortSelect.addEventListener('change', () => {
-      const mode = sortSelect.value;
-      const cards = Array.from(document.querySelectorAll('.story-card'));
-      if (mode === 'score') {
-        cards.sort((a, b) => parseFloat(b.dataset.score) - parseFloat(a.dataset.score));
-      } else if (mode === 'time') {
-        cards.sort((a, b) => parseInt(b.dataset.time) - parseInt(a.dataset.time));
+    function setActiveCard(card) {
+      cards().forEach(c => c.classList.toggle('active', c === card));
+      activeCard = card || null;
+      if (activeCard) {
+        openTldrDetail(activeCard);
+        voteBar.hidden = false;
+        updateVoteBar();
+      } else {
+        document.querySelectorAll('[data-fb]').forEach(btn => btn.classList.remove('active'));
+        voteBar.hidden = true;
       }
-      cards.forEach(card => storiesContainer.appendChild(card));
-    });
+      prefetchUpcomingTldrs();
+      scheduleIdleAgePrefetch();
+    }
+
+    function updateVoteBar() {
+      document.querySelectorAll('[data-fb]').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.fb === activeCard?.dataset.voted);
+      });
+    }
+
+    function showNextCard({ allowRefresh = true } = {}) {
+      const next = queuedCards()[0];
+      if (next) {
+        setActiveCard(next);
+        return;
+      }
+      setActiveCard(null);
+      if (allowRefresh) {
+        scheduleDeckRefresh({ advance: true });
+      }
+    }
+
+    const FILTERS = {
+      sort: { tabs: sortTabs, attr: 'data-sort' },
+      age: { tabs: ageTabs, attr: 'data-age' },
+      source: { tabs: sourceTabs, attr: 'data-source' },
+    };
+
+    function updateFilterTabs(filterName, value) {
+      const filter = FILTERS[filterName];
+      filter.tabs.forEach(tab => {
+        tab.classList.toggle('active', tab.getAttribute(filter.attr) === value);
+      });
+    }
+
+    function setFilter(filterName, value) {
+      if (filterName === 'sort' && value === 'popular' && currentSource === 'non-hn') {
+        return;
+      }
+      sidePanel.classList.remove('visible');
+
+      if (filterName === 'sort') {
+        if (value === currentSort) {
+          advanceToNextCard();
+          return;
+        }
+        currentSort = value;
+        updateFilterTabs('sort', currentSort);
+        sourceTabs.forEach(tab => {
+          tab.disabled = (value === 'popular' && tab.dataset.source !== 'hn');
+        });
+        if (value === 'popular' && currentSource !== 'hn') {
+          currentSource = 'hn';
+          updateFilterTabs('source', currentSource);
+        }
+        if (activeCard && !matchesCurrentAxes(activeCard)) {
+          activeCard.classList.remove('active');
+        }
+        orderForCurrentSort();
+        showNextCard({ allowRefresh: false });
+        scheduleDeckRefresh({ advance: true });
+        scheduleIdleAgePrefetch();
+        return;
+      }
+
+      if (filterName === 'age') {
+        if (value === currentAge) return;
+        currentAge = value;
+        updateFilterTabs('age', currentAge);
+        if (activeCard && (!matchesCurrentCombo(activeCard) || !matchesCurrentAxes(activeCard))) {
+          activeCard.classList.remove('active');
+        }
+        orderForCurrentSort();
+        showNextCard({ allowRefresh: false });
+        scheduleDeckRefresh({ advance: true });
+        scheduleIdleAgePrefetch();
+        return;
+      }
+
+      if (filterName !== 'source') {
+        return;
+      }
+
+      currentSource = value;
+      updateFilterTabs('source', currentSource);
+      const popularTab = sortTabs.find(t => t.dataset.sort === 'popular');
+      if (popularTab) popularTab.disabled = (value === 'non-hn');
+      if (currentSort === 'popular' && value === 'non-hn') {
+        currentSort = 'recommended';
+        updateFilterTabs('sort', currentSort);
+      }
+      if (activeCard && (!matchesCurrentCombo(activeCard) || !matchesCurrentAxes(activeCard))) {
+        activeCard.classList.remove('active');
+      }
+      orderForCurrentSort();
+      showNextCard({ allowRefresh: false });
+      scheduleDeckRefresh({ advance: true });
+    }
+
+    applyGradient();
 
     // Snarkdown - 1KB markdown parser (https://github.com/developit/snarkdown)
     const TAGS={'':['<em>','</em>'],_:['<strong>','</strong>'],'*':['<strong>','</strong>'],'~':['<s>','</s>'],'\n':['<br />'],' ':['<br />'],'-':['<hr />']};
@@ -578,180 +1075,732 @@
     function encodeAttr(str){return(str+'').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
     function snarkdown(md,prevLinks){let tokenizer=/((?:^|\n+)(?:\n---+|\* \*(?: \*)+)\n)|(?:^``` *(\w*)\n([\s\S]*?)\n```$)|((?:(?:^|\n+)(?:\t|  {2,}).+)+\n*)|((?:(?:^|\n)([>*+-]|\d+\.)\s+.*)+)|(?:!\[([^\]]*?)\]\(([^)]+?)\))|(\[)|(\](?:\(([^)]+?)\))?)|(?:(?:^|\n+)([^\s].*)\n(-{3,}|={3,})(?:\n+|$))|(?:(?:^|\n+)(#{1,6})\s*(.+)(?:\n+|$))|(?:`([^`].*?)`)|(  \n\n*|\n{2,}|__|\*\*|[_*]|~~)/gm,context=[],out='',links=prevLinks||{},last=0,chunk,prev,token,inner,t;function tag(token){let desc=TAGS[token[1]||''],end=context[context.length-1]==token;if(!desc)return token;if(!desc[1])return desc[0];if(end)context.pop();else context.push(token);return desc[end|0]}function flush(){let str='';while(context.length)str+=tag(context[context.length-1]);return str}md=md.replace(/^\[(.+?)\]:\s*(.+)$/gm,(s,name,url)=>{links[name.toLowerCase()]=url;return''}).replace(/^\n+|\n+$/g,'');while((token=tokenizer.exec(md))){prev=md.substring(last,token.index);last=tokenizer.lastIndex;chunk=token[0];if(prev.match(/[^\\](\\\\)*\\$/)){}else if(t=(token[3]||token[4])){chunk='<pre class="code '+(token[4]?'poetry':token[2].toLowerCase())+'"><code'+(token[2]?` class="language-${token[2].toLowerCase()}"`:'')+'>'+outdent(encodeAttr(t).replace(/^\n+|\n+$/g,''))+'</code></pre>'}else if(t=token[6]){if(t.match(/\./)){token[5]=token[5].replace(/^\d+/gm,'')}inner=snarkdown(outdent(token[5].replace(/^\s*[>*+.-]/gm,'')));if(t=='>')t='blockquote';else{t=t.match(/\./)?'ol':'ul';inner=inner.replace(/^(.*)(\n|$)/gm,'<li>$1</li>')}chunk='<'+t+'>'+inner+'</'+t+'>'}else if(token[8]){chunk=`<img src="${encodeAttr(token[8])}" alt="${encodeAttr(token[7])}">`}else if(token[10]){out=out.replace('<a>',`<a href="${encodeAttr(token[11]||links[prev.toLowerCase()])}">`);chunk=flush()+'</a>'}else if(token[9]){chunk='<a>'}else if(token[12]||token[14]){t='h'+(token[14]?token[14].length:(token[13]>'='?1:2));chunk='<'+t+'>'+snarkdown(token[12]||token[15],links)+'</'+t+'>'}else if(token[16]){chunk='<code>'+encodeAttr(token[16])+'</code>'}else if(token[17]||token[1]){chunk=tag(token[17]||'--')}out+=prev;out+=chunk}return(out+md.substring(last)+flush()).replace(/^\n+|\n+$/g,'')}
 
-    function parseSimpleMarkdown(text) {
-      return snarkdown(text);
+    function normalizeTldrMarkdown(text) {
+      return text
+        .replace(/\r\n?/g, '\n')
+        .split('\n')
+        .map(line => {
+          const trimmed = line.trim();
+          const isPlainHeading =
+            trimmed.length > 0 &&
+            trimmed.length <= 48 &&
+            !/^[#\-*>`]/.test(trimmed) &&
+            !/[.:,]$/.test(trimmed) &&
+            trimmed.split(/\s+/).length <= 5 &&
+            /[A-Za-z]/.test(trimmed);
+          if (isPlainHeading) {
+            return `### ${trimmed}`;
+          }
+          const labelMatch = trimmed.match(/^([A-Z][A-Za-z ]{1,40}):\s*(.*)$/);
+          if (labelMatch) {
+            return `- **${labelMatch[1]}:** ${labelMatch[2]}`;
+          }
+          return line;
+        })
+        .join('\n')
+        .replace(/(\S)\s+-\s+(?=\S)/g, '$1\n- ');
     }
 
-    // Dynamic Swap-in of new ranked stories list
-    async function triggerSwap() {
-      try {
-        const resp = await fetch(window.location.href, { cache: 'no-store' });
-        if (resp.ok) {
-          const htmlText = await resp.text();
-          const parser = new DOMParser();
-          const newDoc = parser.parseFromString(htmlText, 'text/html');
-          const newStories = newDoc.getElementById('stories');
-          if (newStories) {
-            storiesContainer.innerHTML = newStories.innerHTML;
-            
-            // Re-apply sorting if needed
-            const mode = sortSelect.value;
-            const cards = Array.from(document.querySelectorAll('.story-card'));
-            if (mode === 'score') {
-              cards.sort((a, b) => parseFloat(b.dataset.score) - parseFloat(a.dataset.score));
-              cards.forEach(card => storiesContainer.appendChild(card));
-            } else if (mode === 'date') {
-              cards.sort((a, b) => parseInt(b.dataset.time) - parseInt(a.dataset.time));
-              cards.forEach(card => storiesContainer.appendChild(card));
-            }
-            
-            // Re-bind listeners to the newly loaded story cards
-            bindEvents();
-          }
+    function parseSimpleMarkdown(text) {
+      return snarkdown(normalizeTldrMarkdown(text));
+    }
+
+    function styleTldrLabels(container) {
+      // Backup for the rare case the LLM still produces `- **Label**:` despite
+      // the prompt. Adds `.tldr-label` so CSS can style it differently.
+      container.querySelectorAll('li').forEach(li => {
+        if (li.querySelector(':scope > ul, :scope > ol')) return;
+        const text = li.cloneNode(true).textContent.trim();
+        if (text.endsWith(':')) li.classList.add('tldr-label');
+      });
+    }
+
+    function showToast(message, variant) {
+      const kind = variant || 'info';
+      toastEl.textContent = message;
+      toastEl.className = `toast toast--${kind}`;
+      toastEl.hidden = false;
+      if (toastTimer) {
+        clearTimeout(toastTimer);
+      }
+      toastTimer = window.setTimeout(() => {
+        toastEl.hidden = true;
+        toastTimer = null;
+      }, 3000);
+    }
+
+    const copyProfileLinkButton = document.getElementById('copyProfileLink');
+    if (copyProfileLinkButton) {
+      copyProfileLinkButton.addEventListener('click', async () => {
+        const link = profileLink();
+        if (!link) return;
+        try {
+          await navigator.clipboard.writeText(link);
+          showToast('Profile link copied', 'success');
+        } catch {
+          showToast(link, 'info');
         }
+      });
+    }
+
+    function routePrefix() {
+      if (window.location.pathname.startsWith('/hn')) return '/hn';
+      return '';
+    }
+
+    function apiPath(path) {
+      return `${routePrefix()}${path}`;
+    }
+
+    function feedbackPath() {
+      return apiPath('/api/feedback');
+    }
+
+    function profileLink() {
+      const token = storiesContainer?.dataset.userToken || '';
+      if (!token) return '';
+      return `${window.location.origin}${routePrefix()}/u/${encodeURIComponent(token)}`;
+    }
+
+    function rankingReadyPath(minVersion, targetVersion) {
+      return `${apiPath('/api/ranking-ready')}?min_version=${encodeURIComponent(minVersion)}&target_version=${encodeURIComponent(targetVersion)}`;
+    }
+
+    function votedStorageKey() {
+      const userId = storiesContainer?.dataset.userId || '0';
+      return `hnRewrite:votedStoryIds:${userId}`;
+    }
+
+    function readStoredVotedStoryIds() {
+      try {
+        const raw = window.localStorage.getItem(votedStorageKey());
+        if (!raw) return [];
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) return [];
+        return parsed
+          .map(value => Number(value))
+          .filter(value => Number.isSafeInteger(value));
       } catch (err) {
-        console.error('Failed to swap stories', err);
+        console.debug('Unable to read persisted voted story ids', err);
+        return [];
       }
     }
 
-    // Function to bind click event listeners to current cards
-    function bindEvents() {
-      // 1. Feedback buttons
-      document.querySelectorAll('[data-fb]').forEach(btn => {
-        btn.onclick = async (e) => {
-          e.stopPropagation();
-          const card = btn.closest('.story-card');
-          const action = btn.dataset.fb;
-          const storyId = Number(card.dataset.storyId);
+    function writeStoredVotedStoryIds() {
+      try {
+        const ids = Array.from(votedStoryIds)
+          .filter(value => Number.isSafeInteger(value))
+          .slice(-VOTED_STORAGE_LIMIT);
+        window.localStorage.setItem(votedStorageKey(), JSON.stringify(ids));
+      } catch (err) {
+        console.debug('Unable to persist voted story ids', err);
+      }
+    }
 
-          const nextAction = btn.classList.contains('active') ? 'clear' : action;
-          const apiPath = window.location.pathname.startsWith('/rewrite') ? '/rewrite/api/feedback' : '/api/feedback';
-          
-          // 1. Update button state instantly (optimistic UI)
-          card.querySelectorAll('[data-fb]').forEach(b => {
-            if (nextAction === 'clear') {
-              b.classList.remove('active');
-            } else {
-              b.classList.toggle('active', b === btn);
-            }
-          });
+    function rememberVotedStoryId(storyId) {
+      votedStoryIds.add(storyId);
+      writeStoredVotedStoryIds();
+    }
 
-          // 2. Start collapse transition instantly if voting (optimistic UI)
-          let collapsePromise = null;
-          if (nextAction !== 'clear') {
-            card.style.maxHeight = card.offsetHeight + 'px';
-            card.offsetHeight; // force reflow
-            card.classList.add('fade-out');
-            localStorage.setItem(fbKey(storyId), nextAction);
-            collapsePromise = new Promise(resolve => setTimeout(resolve, 400));
-          } else {
-            localStorage.removeItem(fbKey(storyId));
-          }
+    function forgetVotedStoryId(storyId) {
+      votedStoryIds.delete(storyId);
+      writeStoredVotedStoryIds();
+    }
 
-          try {
-            const resp = await fetch(apiPath, {
-              method: 'POST',
-              headers: {'Content-Type': 'application/json'},
-              body: JSON.stringify({
-                story_id: storyId,
-                action: nextAction,
-              })
-            });
-
-            if (resp.ok) {
-              if (collapsePromise) {
-                await collapsePromise;
-                card.remove();
-              }
-              await triggerSwap();
-            } else {
-              console.error('Failed to submit feedback', resp.status);
-              // Rollback UI state
-              if (nextAction === 'clear') {
-                localStorage.setItem(fbKey(storyId), action);
-                card.querySelectorAll('[data-fb]').forEach(b => {
-                  b.classList.toggle('active', b.dataset.fb === action);
-                });
-              } else {
-                localStorage.removeItem(fbKey(storyId));
-                card.style.maxHeight = '';
-                card.classList.remove('fade-out');
-                card.querySelectorAll('[data-fb]').forEach(b => {
-                  b.classList.remove('active');
-                });
-              }
-            }
-          } catch (err) {
-            console.error('Network error submitting feedback', err);
-            // Rollback UI state
-            if (nextAction === 'clear') {
-              localStorage.setItem(fbKey(storyId), action);
-              card.querySelectorAll('[data-fb]').forEach(b => {
-                b.classList.toggle('active', b.dataset.fb === action);
-              });
-            } else {
-              localStorage.removeItem(fbKey(storyId));
-              card.style.maxHeight = '';
-              card.classList.remove('fade-out');
-              card.querySelectorAll('[data-fb]').forEach(b => {
-                b.classList.remove('active');
-              });
-            }
-          }
-        };
+    function seedVotedStoryIdsFromStorage() {
+      readStoredVotedStoryIds().forEach(storyId => votedStoryIds.add(storyId));
+      let removedStoredVotes = 0;
+      cards().forEach(card => {
+        const storyId = Number(card.dataset.storyId);
+        if (votedStoryIds.has(storyId)) {
+          card.dataset.voted = 'stored';
+          card.remove();
+          removedStoredVotes += 1;
+        }
       });
+      if (removedStoredVotes > 0) {
+        console.debug(
+          `removed ${removedStoredVotes} persisted voted card(s) from stale page cache`
+        );
+      }
+    }
 
-      // 2. TLDR detail buttons
-      document.querySelectorAll('[data-tldr-detail]').forEach(btn => {
-        btn.onclick = async (e) => {
-          e.stopPropagation();
-          const card = btn.closest('.story-card');
-          const storyId = Number(card.dataset.storyId);
-          const storyTitle = card.querySelector('.story-title a')?.textContent || '';
-          
-          let contentDiv = card.querySelector('.tldr-detail-content');
-          if (!contentDiv) {
-            contentDiv = document.createElement('div');
-            contentDiv.className = 'tldr-detail-content';
-            contentDiv.style.marginTop = '0.5rem';
-            contentDiv.style.fontSize = '0.85rem';
-            contentDiv.style.borderTop = '1px dashed var(--pico-muted-border-color)';
-            contentDiv.style.paddingTop = '0.5rem';
-            contentDiv.style.display = 'none';
-            card.appendChild(contentDiv);
+    function waitForVoteRemoval() {
+      if (!activeCard?.dataset.voted) {
+        return Promise.resolve();
+      }
+      return new Promise(resolve => {
+        window.requestAnimationFrame(() => {
+          if (!activeCard?.dataset.voted) {
+            resolve();
+            return;
           }
-
-          btn.disabled = true;
-          btn.textContent = '⏳ Analyzing...';
-          
-          const apiPath = window.location.pathname.startsWith('/rewrite') ? '/rewrite/api/tldr-detail' : '/api/tldr-detail';
-          try {
-            const resp = await fetch(apiPath, {
-              method: 'POST',
-              headers: {'Content-Type': 'application/json'},
-              body: JSON.stringify({ story_id: storyId, story_title: storyTitle })
-            });
-            if (resp.ok) {
-              const data = await resp.json();
-              contentDiv.innerHTML = parseSimpleMarkdown(data.tldr);
-              contentDiv.style.display = 'block';
-              btn.style.display = 'none';
-            } else {
-              const errData = await resp.json().catch(() => ({}));
-              btn.textContent = '❌ ' + (errData.error || 'Failed');
-              btn.disabled = false;
-            }
-          } catch (err) {
-            console.error(err);
-            btn.textContent = '❌ Error';
-            btn.disabled = false;
-          }
-        };
+          window.setTimeout(resolve, 180);
+        });
       });
     }
 
-    // Run initial event binding
-    bindEvents();
+    function scheduleDeckRefresh({ advance = true, waitForWarm = false, targetVersion = null } = {}) {
+      if (waitForWarm) {
+        if (typeof targetVersion !== 'number' || !Number.isFinite(targetVersion) || targetVersion < 0) {
+          return;
+        }
+        if (lastScheduledWarmVersion !== null && targetVersion <= lastScheduledWarmVersion) {
+          return;
+        }
+        lastScheduledWarmVersion = targetVersion;
+        latestWarmTargetVersion = Math.max(latestWarmTargetVersion || 0, targetVersion);
+        if (warmMinVersion === null) {
+          warmMinVersion = targetVersion;
+        }
+        runWarmPollLoop();
+        return;
+      }
+
+      queueRefill(advance);
+    }
+
+    function queueRefill(advance) {
+      queuedRefillAdvance = queuedRefillAdvance === null ? advance : queuedRefillAdvance || advance;
+      runRefillLoop();
+    }
+
+    async function runRefillLoop() {
+      if (refillInFlight) {
+        return;
+      }
+      refillInFlight = true;
+      try {
+        while (queuedRefillAdvance !== null) {
+          const advance = queuedRefillAdvance;
+          queuedRefillAdvance = null;
+          try {
+            await refillQueue({ advance });
+          } catch (err) {
+            console.error('Failed to refresh deck', err);
+          }
+        }
+      } finally {
+        refillInFlight = false;
+      }
+    }
+
+    async function runWarmPollLoop() {
+      if (warmPollInFlight) {
+        return;
+      }
+      warmPollInFlight = true;
+      try {
+        while (warmMinVersion !== null && latestWarmTargetVersion !== null) {
+          const minVersion = warmMinVersion;
+          const targetVersion = latestWarmTargetVersion;
+          const readyVersion = await waitForRankingReady(minVersion, targetVersion);
+          if (readyVersion !== null) {
+            await waitForVoteRemoval();
+            queueRefill(false);
+            if (readyVersion >= latestWarmTargetVersion) {
+              warmMinVersion = null;
+              latestWarmTargetVersion = null;
+            } else {
+              warmMinVersion = readyVersion + 1;
+            }
+          } else if (targetVersion === latestWarmTargetVersion) {
+            warmMinVersion = null;
+            latestWarmTargetVersion = null;
+          }
+        }
+      } finally {
+        warmPollInFlight = false;
+        if (warmMinVersion !== null && latestWarmTargetVersion !== null) {
+          runWarmPollLoop();
+        }
+      }
+    }
+
+    async function waitForRankingReady(minVersion, targetVersion) {
+      const startedAt = Date.now();
+      let delayMs = 400;
+      while (Date.now() - startedAt <= 30000) {
+        await new Promise(resolve => window.setTimeout(resolve, delayMs));
+        try {
+          const resp = await fetch(rankingReadyPath(minVersion, targetVersion), { cache: 'no-store' });
+          if (!resp.ok) {
+            throw new Error(`Ranking readiness failed: ${resp.status}`);
+          }
+          const data = await resp.json();
+          if (data.ready && typeof data.ready_version === 'number') {
+            return data.ready_version;
+          }
+        } catch (err) {
+          console.error('Failed checking ranking readiness', err);
+        }
+        delayMs = Math.min(delayMs * 2, 2500);
+      }
+      return null;
+    }
+
+    sortTabs.forEach(tab => {
+      tab.addEventListener('click', () => setFilter('sort', tab.dataset.sort));
+    });
+    ageTabs.forEach(tab => {
+      tab.addEventListener('click', () => setFilter('age', tab.dataset.age));
+    });
+    sourceTabs.forEach(tab => {
+      tab.addEventListener('click', () => setFilter('source', tab.dataset.source));
+    });
+
+    filterToggleBtn.addEventListener('click', () => {
+      sidePanel.classList.toggle('visible');
+    });
+
+    document.addEventListener('click', (e) => {
+      if (sidePanel.classList.contains('visible') &&
+          !sidePanel.contains(e.target) &&
+          e.target !== filterToggleBtn) {
+        sidePanel.classList.remove('visible');
+      }
+    });
+
+    document.querySelectorAll('[data-key-action]').forEach(btn => {
+      const runKeyAction = () => {
+        const action = btn.dataset.keyAction;
+        if (action === 'undo') {
+          undoLastVote();
+        } else if (action === 'toggle-panel') {
+          sidePanel.classList.toggle('visible');
+          document.body.classList.toggle('fullscreen');
+        } else {
+          submitVote(action);
+        }
+      };
+      btn.addEventListener('click', runKeyAction);
+      btn.addEventListener('keydown', e => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          runKeyAction();
+        }
+      });
+    });
+
+    async function fetchRefillDoc() {
+      const resp = await fetch(window.location.href, { cache: 'no-store' });
+      if (!resp.ok) {
+        throw new Error(`Refill failed: ${resp.status}`);
+      }
+      const htmlText = await resp.text();
+      const parser = new DOMParser();
+      return parser.parseFromString(htmlText, 'text/html');
+    }
+
+    async function refillQueue({ advance = true } = {}) {
+      const newDoc = await fetchRefillDoc();
+      const newStories = newDoc.getElementById('stories');
+      if (!newStories) {
+        throw new Error('Refill failed: stories container missing');
+      }
+
+      cards().forEach(card => {
+        if (card !== activeCard) {
+          card.remove();
+        }
+      });
+      const existing = new Set(cards().map(card => card.dataset.storyId));
+      const incoming = Array.from(newStories.querySelectorAll('.story-card'));
+      let suppressedVoted = 0;
+      for (const card of incoming) {
+        const storyId = card.dataset.storyId;
+        if (!storyId || existing.has(storyId)) {
+          continue;
+        }
+        if (votedStoryIds.has(Number(storyId))) {
+          suppressedVoted += 1;
+          continue;
+        }
+        storiesContainer.appendChild(card);
+        existing.add(storyId);
+      }
+      if (suppressedVoted > 0) {
+        console.debug(
+          `refillQueue: suppressed ${suppressedVoted} already-voted card(s) from stale fetch`
+        );
+      }
+
+      applyGradient();
+      orderForCurrentSort();
+      if (advance) {
+        showNextCard({ allowRefresh: false });
+      }
+    }
+
+    document.querySelectorAll('[data-fb]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        submitVote(btn.dataset.fb);
+      });
+    });
+
+    storiesContainer.addEventListener('click', async (e) => {
+      const card = e.target.closest('.story-card');
+      if (!card) {
+        return;
+      }
+      if (
+        e.target.closest('a, button, input, textarea, select, summary, [role="button"], .tldr-detail-content') ||
+        window.getSelection()?.toString()
+      ) {
+        return;
+      }
+      await openTldrDetail(card);
+    });
+
+    function prefetchUpcomingTldrs() {
+      queuedCards().slice(0, PREFETCH_COUNT).forEach(card => {
+        if (!card.querySelector('.tldr-detail-content')) {
+          openTldrDetail(card);
+        }
+      });
+    }
+
+    function cardsForAge(age) {
+      return cards().filter(card => {
+        if (card.dataset.voted) return false;
+        if (age === 'archive') return card.dataset.isRecent === '0';
+        return card.dataset.isRecent === '1';
+      });
+    }
+
+    function scheduleIdleAgePrefetch() {
+      if (idleAgePrefetchHandle) {
+        return;
+      }
+      const otherAge = currentAge === 'recent' ? 'archive' : 'recent';
+      const run = () => {
+        idleAgePrefetchHandle = null;
+        cardsForAge(otherAge)
+          .slice(0, IDLE_INACTIVE_PREFETCH_COUNT)
+          .forEach(card => {
+            if (!card.querySelector('.tldr-detail-content')) {
+              openTldrDetail(card);
+            }
+          });
+      };
+      if ('requestIdleCallback' in window) {
+        idleAgePrefetchHandle = window.requestIdleCallback(run, { timeout: 2500 });
+      } else {
+        idleAgePrefetchHandle = window.setTimeout(run, 1500);
+      }
+    }
+
+    function sendFeedback(storyId, action) {
+      return fetch(feedbackPath(), {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          story_id: storyId,
+          action,
+          queue_remaining: queuedCards().length,
+        })
+      }).then(resp => {
+        if (!resp.ok) {
+          throw new Error(`Feedback failed: ${resp.status}`);
+        }
+        return resp.json();
+      });
+    }
+
+    function enqueueFeedback(storyId, action) {
+      const previous = feedbackChains.get(storyId) || Promise.resolve();
+      const next = previous
+        .catch(() => {})
+        .then(() => sendFeedback(storyId, action));
+      const tracked = next.finally(() => {
+        if (feedbackChains.get(storyId) === tracked) {
+          feedbackChains.delete(storyId);
+        }
+      });
+      feedbackChains.set(storyId, tracked);
+      return next;
+    }
+
+    function adjustVoteCount(action, delta) {
+      const countEl = document.querySelector(`[data-vote-count="${action}"]`);
+      if (!countEl) {
+        return;
+      }
+      const nextCount = Math.max(0, Number(countEl.textContent || '0') + delta);
+      countEl.textContent = String(nextCount);
+    }
+
+    function incrementVoteCount(vote) {
+      if (vote.countApplied) {
+        return;
+      }
+      adjustVoteCount(vote.action, 1);
+      vote.countApplied = true;
+    }
+
+    function decrementVoteCount(vote) {
+      if (!vote.countApplied) {
+        return;
+      }
+      adjustVoteCount(vote.action, -1);
+      vote.countApplied = false;
+    }
+
+    function submitVote(action, card = activeCard) {
+      if (!card || card.dataset.voted) {
+        return;
+      }
+
+      const storyId = Number(card.dataset.storyId);
+      const vote = {
+        id: nextVoteId++,
+        storyId,
+        action,
+        card,
+        countApplied: false,
+        undone: false,
+      };
+      rememberVotedStoryId(storyId);
+      card.dataset.voted = action;
+      document.querySelectorAll('[data-fb]').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.fb === action);
+      });
+      incrementVoteCount(vote);
+
+      if (action === 'up') {
+        card.style.setProperty('--swipe-exit-x', '42px');
+        card.style.setProperty('--swipe-exit-rotate', '1.5deg');
+      } else if (action === 'down') {
+        card.style.setProperty('--swipe-exit-x', '-42px');
+        card.style.setProperty('--swipe-exit-rotate', '-1.5deg');
+      } else {
+        card.style.setProperty('--swipe-exit-x', '0');
+        card.style.setProperty('--swipe-exit-rotate', '0deg');
+      }
+      card.classList.add('fade-out');
+
+      window.setTimeout(() => {
+        if (card.dataset.voted === action) {
+          card.remove();
+          showNextCard();
+        }
+      }, 150);
+
+      const savePromise = enqueueFeedback(storyId, action)
+        .then(data => {
+          scheduleDeckRefresh({
+            waitForWarm: true,
+            targetVersion: data.target_version,
+            advance: false,
+          });
+          return data;
+        })
+        .catch(err => {
+          console.error('Network error submitting feedback', err);
+          if (!vote.undone) {
+            decrementVoteCount(vote);
+          }
+          if (lastVote?.id === vote.id) {
+            lastVote = null;
+            forgetVotedStoryId(storyId);
+            delete card.dataset.voted;
+          }
+          showToast('Vote failed to save', 'error');
+        });
+
+      vote.savePromise = savePromise;
+      lastVote = vote;
+    }
+
+    function undoLastVote() {
+      const vote = lastVote;
+      if (!vote) {
+        return;
+      }
+      lastVote = null;
+
+      const { storyId, card } = vote;
+      vote.undone = true;
+      forgetVotedStoryId(storyId);
+      delete card.dataset.voted;
+      decrementVoteCount(vote);
+      card.classList.remove('fade-out');
+      document.querySelectorAll('[data-fb]').forEach(btn => {
+        btn.classList.remove('active');
+      });
+      if (!card.isConnected) {
+        storiesContainer.insertBefore(card, storiesContainer.firstChild);
+      }
+      setActiveCard(card);
+
+      enqueueFeedback(storyId, 'clear').then(data => {
+        scheduleDeckRefresh({
+          waitForWarm: true,
+          targetVersion: data.target_version,
+          advance: false,
+        });
+        return data;
+      }).catch(err => {
+        console.error('Network error undoing feedback', err);
+        showToast('Undo failed to save', 'error');
+      });
+    }
+
+    function openStoryUrl(kind) {
+      const card = document.querySelector('.story-card.active, .story-card[data-active]')
+                || document.querySelector('.story-card');
+      if (!card) return;
+      const attr = kind === 'article' ? 'articleUrl' : 'commentsUrl';
+      const url = card.dataset[attr];
+      if (!url) return;
+      window.open(url, '_blank', 'noopener,noreferrer');
+    }
+
+    async function openTldrDetail(card) {
+      if (!card) {
+        return;
+      }
+
+      const storyId = Number(card.dataset.storyId);
+      const storyTitle = card.querySelector('.story-title a')?.textContent || '';
+
+      let contentDiv = card.querySelector('.tldr-detail-content');
+      if (contentDiv?.dataset.loading === 'true') {
+        return;
+      }
+      if (contentDiv && contentDiv.style.display !== 'none' && !contentDiv.dataset.error) {
+        return;
+      }
+      if (!contentDiv) {
+        contentDiv = document.createElement('div');
+        contentDiv.className = 'tldr-detail-content';
+        contentDiv.style.display = 'none';
+        card.appendChild(contentDiv);
+      }
+      const cached = tldrCache.get(storyId);
+      if (cached !== undefined) {
+        delete contentDiv.dataset.error;
+        contentDiv.innerHTML = parseSimpleMarkdown(cached);
+        styleTldrLabels(contentDiv);
+        contentDiv.style.display = 'block';
+        return;
+      }
+
+      contentDiv.textContent = 'Loading TLDR...';
+      contentDiv.style.display = 'block';
+      contentDiv.dataset.loading = 'true';
+
+      const detailApiPath = apiPath('/api/tldr-detail');
+      try {
+        const resp = await fetch(detailApiPath, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ story_id: storyId, story_title: storyTitle })
+        });
+        if (resp.ok) {
+          const data = await resp.json();
+          tldrCache.set(storyId, data.tldr);
+          delete contentDiv.dataset.error;
+          contentDiv.innerHTML = parseSimpleMarkdown(data.tldr);
+          styleTldrLabels(contentDiv);
+          contentDiv.style.display = 'block';
+        } else {
+          const errData = await resp.json().catch(() => ({}));
+          const errorMsg = errData.error || `HTTP ${resp.status}`;
+          contentDiv.textContent = 'TLDR: ' + errorMsg;
+          contentDiv.dataset.error = 'true';
+          contentDiv.style.display = 'block';
+          console.warn('openTldrDetail failed:', errorMsg);
+        }
+      } catch (err) {
+        contentDiv.textContent = 'TLDR: ' + (err.message || 'Network error');
+        contentDiv.dataset.error = 'true';
+        contentDiv.style.display = 'block';
+        console.error(err);
+      } finally {
+        delete contentDiv.dataset.loading;
+      }
+    }
+
+    function scrollActiveCard(direction) {
+      const card = document.querySelector('.story-card.active');
+      if (!card) {
+        return;
+      }
+      card.scrollBy({ top: card.clientHeight * 0.8 * direction });
+    }
+
+    const KEY_ACTIONS = {
+      arrowup: () => scrollActiveCard(-1),
+      arrowdown: () => scrollActiveCard(1),
+      k: () => submitVote('up'),
+      j: () => submitVote('down'),
+      l: () => submitVote('neutral'),
+      o: () => openStoryUrl('article'),
+      c: () => openStoryUrl('comments'),
+      u: () => undoLastVote(),
+      r: () => setFilter('sort', 'recommended'),
+      p: () => setFilter('sort', 'popular'),
+      x: () => setFilter('sort', 'explore'),
+      d: () => setFilter('sort', 'date'),
+      e: () => setFilter('age', 'recent'),
+      a: () => setFilter('age', 'archive'),
+      m: () => setFilter('source', 'mixed'),
+      h: () => setFilter('source', 'hn'),
+      n: () => setFilter('source', 'non-hn'),
+      f: () => {
+        const panel = document.querySelector('.swipe-side');
+        panel.classList.toggle('visible');
+        document.body.classList.toggle('fullscreen');
+      },
+    };
+
+    document.addEventListener('keydown', (e) => {
+      if (
+        e.repeat ||
+        e.ctrlKey || e.metaKey || e.altKey ||
+        e.target.closest?.('input, textarea, select, [contenteditable="true"]')
+      ) {
+        return;
+      }
+      const key = e.key.toLowerCase();
+      const action = KEY_ACTIONS[key];
+      if (action) {
+        e.preventDefault();
+        action();
+      }
+    });
+
+    // First-time tip dismissal
+    (function() {
+      const tip = document.getElementById('first-time-tip');
+      const flag = 'hn_first_tip_seen_v2';
+      if (tip && !localStorage.getItem(flag)) {
+        tip.hidden = false;
+        tip.querySelector('[data-dismiss-tip]')?.focus();
+        const dismiss = () => {
+          tip.hidden = true;
+          localStorage.setItem(flag, '1');
+        };
+        tip.querySelector('[data-dismiss-tip]')?.addEventListener('click', dismiss);
+        tip.addEventListener('click', (e) => { if (e.target === tip) dismiss(); });
+        tip.addEventListener('keydown', (e) => { if (e.key === 'Escape') dismiss(); });
+      }
+    })();
+
+    seedVotedStoryIdsFromStorage();
+    setFilter('sort', 'recommended');
+    setFilter('age', 'recent');
+
+    // If the page was served from a stale cache, schedule a warm-polled
+    // refill so voted stories and outdated rankings are replaced as soon
+    // as the server finishes warming.
+    const storiesEl = document.getElementById('stories');
+    const pageVer = storiesEl ? parseInt(storiesEl.dataset.dashboardVersion) : NaN;
+    const currVer = storiesEl ? parseInt(storiesEl.dataset.currentVersion) : NaN;
+    if (Number.isFinite(pageVer) && Number.isFinite(currVer) && pageVer < currVer) {
+      scheduleDeckRefresh({ waitForWarm: true, targetVersion: currVer, advance: true });
+    }
   </script>
 </body>
 </html>

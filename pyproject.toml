@@ -4,17 +4,18 @@ version = "0.1.0"
 description = "Minimalist HN reranking dashboard"
 requires-python = ">=3.12"
 dependencies = [
+    "cachetools>=7.1",
+    "flask>=3.1",
     "httpx>=0.28",
     "beautifulsoup4>=4.14",
     "trafilatura>=1.6",
+    "justext>=3.0",
     "numpy<2.4",
     "onnxruntime>=1.23",
     "transformers>=4.57",
     "scikit-learn>=1.8",
     "jinja2>=3.1",
     "feedparser>=6.0",
-    "duckdb>=1.0.0",
-    "matplotlib>=3.11.0",
 ]
 
 [dependency-groups]
@@ -22,7 +23,12 @@ dev = [
     "pytest>=9.0",
     "pytest-asyncio>=1.3",
     "hypothesis>=6.150",
+    "pytest-xdist>=3.6",
     "ruff>=0.14",
+    "ty>=0.0.10",
+]
+dl-experiment = [
+    "torch>=2.12",
 ]
 
 [tool.pytest.ini_options]

@@ -1,0 +1,22 @@
+Summarize the discussion for a knowledgeable reader.
+Use ONLY information from the comments below.
+Write under 150 words.
+Return only 2-4 Markdown bullets.
+Use a FLAT structure — no nested list levels. If a sub-topic has multiple bullets, use a `####` heading for the sub-topic followed by top-level bullets — NEVER use `- **Label**:` to introduce a group of content bullets. Example:
+#### Criticism of US control
+- Users compare this to...
+- **Precedent exists** in...
+(NOT `- **Criticism of US control**:` followed by siblings.)
+Every non-empty output line must start with "- ".
+Use labels like **Consensus:**, **Disagreement:**, and **Caveat:** when present.
+Do not put multiple bullets on one line.
+If the comments are thin or low-signal, say so explicitly.
+
+Story title: {title}
+
+Comments:
+{comments_section}
+
+IMPORTANT: Summarize what commenters are saying, NOT what the article claims.
+If commenters reference article claims to disagree, describe their disagreement —
+do not re-summarize the article's claims as if they were discussion points.

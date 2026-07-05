@@ -1,0 +1,16 @@
+<aside class="swipe-side" aria-label="Queue and keyboard controls">
+  {% for group in tab_groups %}
+  {% include "components/tab_group.html" %}
+  {% endfor %}
+  {% if user_token %}
+  <button type="button" class="share-link" id="copyProfileLink">Copy profile link</button>
+  {% endif %}
+  <div class="swipe-keys">
+    <span class="key-row" tabindex="0" data-key-action="up"><span class="key-hint">k</span> upvote</span>
+    <span class="key-row" tabindex="0" data-key-action="neutral"><span class="key-hint">l</span> skip (neutral)</span>
+    <span class="key-row" tabindex="0" data-key-action="down"><span class="key-hint">j</span> downvote</span>
+    <span class="key-row" tabindex="0" data-key-action="open-article"><span class="key-hint">o</span> open article</span>
+    <span class="key-row" tabindex="0" data-key-action="open-comments"><span class="key-hint">c</span> open comments</span>
+    <span class="key-row" tabindex="0" data-key-action="toggle-panel"><span class="key-hint">f</span> fullscreen</span>
+  </div>
+</aside>

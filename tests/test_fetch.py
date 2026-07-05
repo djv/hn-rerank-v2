@@ -1,12 +1,20 @@
+from typing import Any
 import pytest
 import asyncio
-from server import _fetch_article_body
+import httpx
+from server import (
+    _fetch_article_body,
+    _fetch_article_body_with_result,
+)
+
 
 @pytest.fixture(autouse=True)
 def mock_asyncio_sleep(monkeypatch):
     async def mock_sleep(delay):
         pass
+
     monkeypatch.setattr(asyncio, "sleep", mock_sleep)
+
 
 _ARTICLE_HTML = """\
 <!DOCTYPE html>
@@ -56,9 +64,34 @@ _EMPTY_HTML = """\
 </html>
 """
 
+_CHROME_HTML = """\
+<!DOCTYPE html>
+<html>
+<body>
+<script>script chrome that should not be visible</script>
+<style>style chrome that should not be visible</style>
+<nav>navigation chrome that should not be visible</nav>
+<header>header chrome that should not be visible</header>
+<aside>aside chrome that should not be visible</aside>
+<main>
+<p>This main article text should survive extraction. It is deliberately long
+enough to pass the extractor threshold and to force the BeautifulSoup fallback
+to return real content rather than page chrome. The exact wording matters less
+than preserving the core article paragraph and removing navigation or footer
+material from the final result.</p>
+<p>Additional article text keeps the page comfortably over the extraction
+threshold. This paragraph represents the body content that should remain
+available to the TLDR generator after all chrome elements are removed.</p>
+</main>
+<footer>footer chrome that should not be visible</footer>
+</body>
+</html>
+"""
+
 
 async def _serve(handler, status=200, body=b"", delay=0.0):
     import asyncio
+    import socket
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     import threading
 
@@ -78,7 +111,7 @@ async def _serve(handler, status=200, body=b"", delay=0.0):
             self.end_headers()
             self.wfile.write(b)
 
-        def log_message(self, *a):
+        def log_message(self, format: str, *args: Any) -> None:
             pass
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
@@ -89,6 +122,7 @@ async def _serve(handler, status=200, body=b"", delay=0.0):
     try:
         result = await _fetch_article_body(url)
     finally:
+        server.socket.shutdown(socket.SHUT_RDWR)
         server.shutdown()
     return result, TestHandler._call_count
 
@@ -158,6 +192,22 @@ async def test_fetch_empty_body():
     assert calls == 1
 
 
+@pytest.mark.asyncio
+async def test_fetch_strips_chrome_tags():
+    body = _CHROME_HTML.encode()
+    result, calls = await _serve("chrome", 200, body)
+
+    assert result is not None
+    assert "main article text should survive" in result
+    assert "script chrome" not in result
+    assert "style chrome" not in result
+    assert "navigation chrome" not in result
+    assert "header chrome" not in result
+    assert "aside chrome" not in result
+    assert "footer chrome" not in result
+    assert calls == 1
+
+
 @pytest.mark.slow
 @pytest.mark.asyncio
 async def test_fetch_real_urls():
@@ -171,3 +221,116 @@ async def test_fetch_real_urls():
         # The test passes as long as no exception is thrown.
         if result is not None:
             assert len(result) >= 100, f"body too short ({len(result)} chars) for {url}"
+
+
+@pytest.mark.asyncio
+async def test_fetch_rejects_non_html_content_type(monkeypatch):
+    """Content-Type guard: non-HTML types return non_html/permanent."""
+    import server
+
+    class MockClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, url, headers=None):
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/pdf"},
+                text="%PDF-1.4\n\x00\x00\x00",
+            )
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", MockClient)
+
+    result = await _fetch_article_body_with_result("https://example.com/doc.pdf")
+    assert result.body is None
+    assert result.error == "non_html"
+    assert result.permanent is True
+
+
+@pytest.mark.asyncio
+async def test_fetch_allows_text_plain(monkeypatch):
+    """Content-Type guard: text/plain is allowed."""
+    import server
+
+    class MockClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, url, headers=None):
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/plain"},
+                text=_ARTICLE_HTML,
+            )
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", MockClient)
+
+    result = await _fetch_article_body_with_result("https://example.com/plain")
+    assert result.body is not None
+    assert result.error is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_rejects_uppercase_content_type(monkeypatch):
+    """Content-Type guard: mixed-case is handled via .lower()."""
+    import server
+
+    class MockClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, url, headers=None):
+            return httpx.Response(
+                200,
+                headers={"content-type": "Application/PDF"},
+                text="%PDF",
+            )
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", MockClient)
+
+    result = await _fetch_article_body_with_result("https://example.com/Doc.PDF")
+    assert result.error == "non_html"
+    assert result.permanent is True
+
+
+@pytest.mark.asyncio
+async def test_fetch_allows_missing_content_type(monkeypatch):
+    """Content-Type guard: missing header falls through to extraction."""
+    import server
+
+    class MockClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, url, headers=None):
+            return httpx.Response(200, headers={}, text=_ARTICLE_HTML)
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", MockClient)
+
+    result = await _fetch_article_body_with_result("https://example.com/noct")
+    assert result.body is not None
+    assert result.error is None

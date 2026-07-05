@@ -1,0 +1,21 @@
+Summarize the article for a knowledgeable reader.
+Use ONLY information from the article below.
+
+Output ONE section only:
+
+### Article
+3-5 bullets, max 120 words.
+
+Markdown formatting:
+- FLAT structure only — no nested list levels.
+- Short bullet points (-) with **bold** key terms.
+- Keep each bullet point to a single short sentence.
+- Do not put multiple bullets on one line.
+
+Title: {title}
+{article_section}
+
+IMPORTANT:
+- Use ONLY information present in the article below. Do not expand on the topic with outside knowledge.
+- Do not invent content from the title alone.
+- Do NOT write a Discussion section. Do NOT use labels like **Consensus:**, **Disagreement:**, or **Caveat:**.

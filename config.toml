@@ -1,25 +1,10 @@
 [hn_rewrite]
-db_path = "hn_rewrite.db"
-output = "public/index.html"
-days = 30
-count = 40
-onnx_model_dir = "onnx_model"
 server_port = 8766
-regen_interval_seconds = 10800
 
 [hn_rewrite.model]
-svm_c = 0.3
-svm_gamma = 0.21
-svm_kernel = "rbf"
-neutral_weight = 0.0
-min_feedback_labels = 10
-min_signal_examples = 5
-diversity_threshold = 0.50
-
+svm_c = 0.1
 
 [hn_rewrite.rss]
-enabled = true
-per_feed_limit = 70
 feeds = [
     "https://lobste.rs/top/rss",
     "https://tildes.net/topics.rss",
@@ -31,12 +16,81 @@ feeds = [
     "https://www.reddit.com/r/MachineLearning/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/programming/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/compsci/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/LocalLLaMA/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/ExperiencedDevs/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/haskell/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/ocaml/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/rust/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/linux/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/selfhosted/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/netsec/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/Bogleheads/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/ExpatFIRE/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/urbanplanning/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/transit/top/.rss?t=week&limit=25",
+
+    # r/devops
+    "https://www.reddit.com/r/devops/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/kubernetes/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/dataengineering/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/Maps/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/Ultralight/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/ManyBaggers/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/awardtravel/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/CreditCards/top/.rss?t=week&limit=25",
+
+    # AI / coding agents
+    "https://www.reddit.com/r/AI_Agents/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/ChatGPTCoding/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/LanguageTechnology/top/.rss?t=week&limit=25",
+
+    # Programming languages / CS depth
+    "https://www.reddit.com/r/ProgrammingLanguages/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/Compilers/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/sre/top/.rss?t=week&limit=25",
+
+    # Finance / tax / nomad money
+    "https://www.reddit.com/r/financialindependence/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/tax/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/USExpatTaxes/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/fatFIRE/top/.rss?t=week&limit=25",
+
+    # Urbanism / cities
+    "https://www.reddit.com/r/Urbanism/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/urbandesign/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/WalkableStreets/top/.rss?t=week&limit=25",
+
+    # Travel / gear / nomad logistics
+    "https://www.reddit.com/r/onebag/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/digitalnomad/top/.rss?t=week&limit=25",
+
+    # Evidence-ish health
+    "https://www.reddit.com/r/medicine/top/.rss?t=week&limit=25",
+
+    "https://simonwillison.net/atom/everything/",
+    "https://www.interconnects.ai/feed",
     "https://jack-clark.net/feed/",
+    "https://openai.com/news/rss.xml",
+    "https://research.google/blog/rss/",
+    "https://deepmind.google/blog/rss.xml",
+    "https://huggingface.co/blog/feed.xml",
+    "https://github.blog/engineering/feed/",
+    "https://blog.cloudflare.com/rss/",
     "https://www.construction-physics.com/feed",
     "https://www.bitsaboutmoney.com/archive/rss/",
+    "https://earlyretirementnow.com/feed/",
+    "https://www.kitces.com/feed/",
+    "https://pedestrianobservations.com/feed/",
+    "https://humantransit.org/feed",
+    "https://www.londonreconnections.com/feed/",
     "https://eugeneyan.com/rss/",
     "https://huyenchip.com/feed.xml",
     "https://www.latent.space/feed",
+    "https://lwn.net/headlines/rss",
+    "https://blog.janestreet.com/feed.xml",
+    "https://www.tweag.io/rss.xml",
+    "https://well-typed.com/blog/rss2.xml",
+    "https://ocaml.org/feed.xml",
     "https://bartoszmilewski.com/feed/",
     "https://aphyr.com/posts.atom",
     "https://googleprojectzero.blogspot.com/feeds/posts/default",
@@ -44,5 +98,26 @@ feeds = [
     "https://pudding.cool/feed.xml",
     "https://scottaaronson.blog/?feed=rss2",
     "https://erikbern.com/feed",
+    "https://blogs.bmj.com/bjsm/feed/",
+    "https://evidence.nihr.ac.uk/feed/",
+    "https://www.quantamagazine.org/feed/",
+    "https://aeon.co/feed.rss",
     "https://discourse.haskell.org/latest.rss",
+
+    # Software / systems / AI coding
+    "https://martinfowler.com/feed.atom",
+    "https://danluu.com/atom.xml",
+    "https://jvns.ca/atom.xml",
+    "https://pluralistic.net/feed/",
+
+    # Progress / cities / infrastructure
+    "https://worksinprogress.co/rss.xml",
+    "https://www.worksinprogress.news/feed",
+    "https://asteriskmag.com/feed",
+    "https://marginalrevolution.com/feed",
+
+    # Health / medicine
+    "https://erictopol.substack.com/feed",
+    "https://theskepticalcardiologist.substack.com/feed",
+    "https://sciencebasedmedicine.org/feed/",
 ]

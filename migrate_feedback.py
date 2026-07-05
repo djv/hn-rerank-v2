@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """Import feedback from hn_rerank's JSON format into the rewrite's SQLite DB."""
 
+from __future__ import annotations
+
 import json
 import sys
 from pathlib import Path
 from database import Database, Story
 
-DEFAULT_SOURCE_PATH = Path.home() / "hn_rerank/.cache/user_feedback/dashboard_feedback.json"
+DEFAULT_SOURCE_PATH = (
+    Path.home() / "hn_rerank/.cache/user_feedback/dashboard_feedback.json"
+)
 
 
-def migrate(source_path: Path, db_path: str) -> None:
+def migrate(source_path: Path, db_path: str, user_id: int = 1) -> None:
     if not source_path.exists():
         print(f"Source feedback file not found at {source_path}", file=sys.stderr)
         return
@@ -58,6 +62,7 @@ def migrate(source_path: Path, db_path: str) -> None:
 
         # Insert into feedback
         db.upsert_feedback(
+            user_id=user_id,
             story_id=story_id,
             action=action,
         )
@@ -73,5 +78,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", default=str(DEFAULT_SOURCE_PATH))
     parser.add_argument("--db", default="hn_rewrite.db")
+    parser.add_argument("--user-id", type=int, default=1)
     args = parser.parse_args()
-    migrate(Path(args.source), args.db)
+    migrate(Path(args.source), args.db, args.user_id)
