@@ -1480,7 +1480,16 @@ def _handle_flask_feedback(runtime: type[Handler]) -> Response:
             )
 
         if action == "clear":
-            runtime.db.delete_feedback(user.id, story_id)
+            # Clearing a vote that doesn't exist is a no-op: no state
+            # changed, so no dashboard refresh should be queued.
+            if not runtime.db.delete_feedback(user.id, story_id):
+                return _flask_json_response(
+                    {
+                        "ok": True,
+                        "ranking_refresh_queued": False,
+                        "target_version": runtime._dashboard_version(user.id),
+                    }
+                )
         else:
             runtime.db.upsert_feedback(user.id, story_id, action)
 

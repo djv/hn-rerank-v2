@@ -41,9 +41,16 @@ entity User {
     up_votes: votes where reaction = up
     down_votes: votes where reaction = down
 
+    -- This gates only the SVM (tier-3) scoring path, not personalization
+    -- as a whole: the centroid (tier-2) score ramps in continuously
+    -- starting from the user's very first vote (see @guarantee
+    -- PersonalizationRampsIn on Dashboard). Named is_svm_personalization_ready
+    -- rather than is_personalization_ready to avoid implying a hard cutover.
     -- The real gate also requires >= 2 unique feedback classes (up/down/neutral);
     -- that's subsumed here since both counts >= 20 implies both classes exist.
-    is_personalization_ready:
+    -- Counts are global across all sources (HN/Reddit/LessWrong), not
+    -- per-source: is_svm_personalization_ready is a global-per-user gate.
+    is_svm_personalization_ready:
         up_votes.count >= config.min_up_votes_for_personalization
         and down_votes.count >= config.min_down_votes_for_personalization
 }
@@ -133,7 +140,6 @@ surface Dashboard {
         card.story.url
         card.badges
         card.rank_score
-        viewer.is_personalization_ready
 
     provides:
         CastVote(viewer, card.story, reaction)
@@ -141,10 +147,11 @@ surface Dashboard {
             when exists Vote{user: viewer, story: card.story}
 
     @guarantee PersonalizationRampsIn
-        -- Before `viewer.is_personalization_ready`, ranking favors
-        -- cold-start ordering. As votes accumulate, ranking shifts
-        -- continuously toward the viewer's learned preferences; there
-        -- is no hard cutover.
+        -- Ranking blends three tiers: cold-start (gravity), a feedback
+        -- centroid that ramps in continuously from the viewer's very
+        -- first vote, and SVM preference scoring that ramps in once
+        -- `viewer.is_svm_personalization_ready`. There is no hard
+        -- cutover at any stage.
 }
 
 invariant OneCardPerStoryPerSegment {
@@ -154,4 +161,6 @@ invariant OneCardPerStoryPerSegment {
                 implies a.story != b.story
 }
 
-open question "Should is_personalization_ready be per-source (e.g. enough HN votes but not enough Reddit votes) or global per-user?"
+-- Resolved: is_svm_personalization_ready is global per-user, not per-source.
+-- The SVM gate counts votes across all sources (HN/Reddit/LessWrong)
+-- together; there is no per-source readiness threshold.

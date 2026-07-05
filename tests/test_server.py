@@ -818,6 +818,39 @@ def test_feedback_clear(test_env):
     assert regen_event.is_set()
 
 
+def test_feedback_clear_without_existing_vote_is_noop(test_env) -> None:
+    """Spec (specs/ranking-feedback.allium ClearVote): clearing a story with
+    no existing vote must not queue a dashboard refresh, since nothing
+    changed.
+    """
+    port, db, regen_event, _, user = test_env
+    db.upsert_story(
+        Story(
+            id=4242,
+            title="No vote yet",
+            url=None,
+            score=1,
+            time=1_600_000_000,
+            text_content="Text",
+            source="hn",
+        )
+    )
+    assert db.get_all_feedback(user.id) == []
+    regen_event.clear()
+
+    resp = httpx.post(
+        f"http://127.0.0.1:{port}/api/feedback",
+        json={"story_id": 4242, "action": "clear"},
+        cookies={"hn_token": user.token},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+    assert resp.json()["ranking_refresh_queued"] is False
+    assert db.get_all_feedback(user.id) == []
+    assert not regen_event.is_set()
+
+
 def test_feedback_clear_then_revote_creates_new_record(test_env):
     port, db, _, _, user = test_env
     db.upsert_story(

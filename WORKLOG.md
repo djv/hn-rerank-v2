@@ -2,6 +2,70 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-05 — fix: ClearVote no-op when no existing vote (weed finding)
+
+`/allium:weed` against `specs/ranking-feedback.allium` re-confirmed the
+standing divergence: `ClearVote` has `requires: exists Vote{user, story}`,
+but `_handle_flask_feedback`'s `clear` branch (`server.py`) called
+`db.delete_feedback` unconditionally and always invalidated the dashboard
+cache + set `regen_event`, even when no feedback row existed for that
+(user, story) pair.
+
+Classified as a code bug (the spec's no-op-when-nothing-to-clear semantics
+is the more defensible domain rule) and fixed:
+
+- `database.py::delete_feedback` now returns `bool` (`cursor.rowcount > 0`)
+  instead of `None`.
+- `server.py::_handle_flask_feedback`'s `clear` branch checks the return
+  value; when no row was deleted, it returns
+  `{"ok": True, "ranking_refresh_queued": False, "target_version": <current>}`
+  without invalidating the cache, triggering a warm, or setting
+  `regen_event` — matching `ClearVote`'s precondition.
+
+Added `tests/test_server.py::test_feedback_clear_without_existing_vote_is_noop`
+pinning the new no-op response. Verified: full suite (489 passed, 1 skipped),
+`ruff check .` and `ty check` clean; live smoke test after
+`systemctl --user restart hn_rewrite.service` — clear-with-no-vote →
+`ranking_refresh_queued: false`, cast-then-clear → `true`, clear-again →
+`false` again; `journalctl` scan clean (no tracebacks/exceptions).
+
+The weed pass also confirmed several other spec constructs match code
+exactly with no action needed (CastVote upsert, RankingInvalidated chain,
+DiversityFilter's primary-only guidance, OneCardPerStoryPerSegment now
+enforced) and flagged `DiscoveryBadgeKind` internal naming
+(`top`/`talk`/`uncertain` vs. spec's `popular`/`talked_about`/`unsure`) as an
+intentional, cosmetic-only gap — no action taken.
+
+## 2026-07-05 — ranking-feedback.allium: second-pass spec refinements
+
+Follow-up review of `specs/ranking-feedback.allium` against the live code
+(no runtime changes, spec-only):
+
+- Renamed `User.is_personalization_ready` to `is_svm_personalization_ready`.
+  The boolean only gates tier-3/SVM scoring (`ranking.py:829-831`, the
+  `alpha_3` ramp at `1118-1129`); tier-2 (centroid) personalization ramps in
+  continuously from the user's first vote (`alpha_2`, `ranking.py:1115`).
+  The old name contradicted the surface's own `@guarantee
+  PersonalizationRampsIn` ("no hard cutover"). Updated the guarantee's prose
+  to describe all three blend tiers.
+- Dropped `viewer.is_personalization_ready` from `Dashboard.exposes` — grepped
+  `server.py`/`templates/` and found no readiness signal actually sent to the
+  client, unlike every other exposed field (badges, rank_score, title, url,
+  segment), which are all rendered in `story_card.html`. Reintroduces one
+  info-level "unused field" diagnostic on `allium check`, which is expected
+  and acceptable (info, not error).
+- Resolved the standing `open question` (per-source vs. global readiness):
+  the tier-3 gate counts `n_up`/`n_down` globally across all sources
+  (`ranking.py:820-831`), so it's global-per-user. Replaced the open
+  question with a settled comment.
+- The `ClearVote`-noop divergence (clearing a nonexistent vote still queues a
+  dashboard refresh, contradicting the spec's `requires: exists Vote`)
+  remains a standing, unresolved `/allium:weed` item — not touched here.
+
+Verified: `allium check` — no new error-level diagnostics (info/warning
+baseline as expected); `uv run pytest tests/test_pipeline.py -q` — 154
+passed (spec-only change, no code/tests reference the renamed field).
+
 ## 2026-07-05 — Allium spec for ranking/feedback; fixed duplicate-card bug it surfaced
 
 Distilled `specs/ranking-feedback.allium` (story ranking + the vote/feedback

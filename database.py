@@ -658,13 +658,18 @@ class Database:
                 counts[action] = n
         return counts
 
-    def delete_feedback(self, user_id: int, story_id: int) -> None:
+    def delete_feedback(self, user_id: int, story_id: int) -> bool:
+        """Delete the feedback row for (user_id, story_id).
+
+        Returns True if a row was deleted, False if none existed.
+        """
         with self.conn() as conn:
             with conn:
-                conn.execute(
+                cursor = conn.execute(
                     "DELETE FROM feedback WHERE user_id = ? AND story_id = ?",
                     (user_id, story_id),
                 )
+                return cursor.rowcount > 0
 
     def get_feedback_for_training(
         self, user_id: int | None = None
