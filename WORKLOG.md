@@ -6171,3 +6171,18 @@ tldr=...)`. Direct `_call_llm_chat` mock assertions updated to check
 - Updated test assertions from `result.error == ""` to `result.error is None`.
 
 **Files**: `server.py`, `database.py`, `tests/test_fetch.py`, `WORKLOG.md`.
+
+## 2026-07-05 — Test suite: kill the 0.5s server-shutdown tax
+
+- The `app_env` and `test_env` fixtures in `tests/test_server.py` start a
+  `werkzeug.serving.make_server` on a background thread via
+  `server.serve_forever()`. `serve_forever()` defaults to a 0.5s
+  `poll_interval`; `server.shutdown()` blocks until the loop notices the
+  shutdown flag, so every fixture teardown paid a ~0.51s tax. With ~40
+  function-scoped `test_env` uses, this dominated wall time.
+- Passed `poll_interval=0.01` explicitly to both `serve_forever()` calls
+  (module-scoped `app_env` and per-test `test_env`). No behavior change —
+  purely how quickly the serve loop notices shutdown was requested.
+- Full suite (`uv run pytest tests/ -n 4`): 20.3s → 11.1s.
+
+**Files**: `tests/test_server.py`, `WORKLOG.md`.
