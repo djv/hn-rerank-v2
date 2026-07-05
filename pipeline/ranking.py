@@ -1480,26 +1480,33 @@ def rerank_candidates(
         explore_pool = [r for r in combo_pool if r.story.id not in primary_ids]
         explore_picked = set[int]()  # only track Explore picks, not Popular
 
+        def _merge_or_append(r: RankedStory, **badge_flags: bool) -> None:
+            # A story already present in `final` (e.g. badged by Hot/Top/Talk,
+            # or by an earlier Explore pass) gets the new badge OR'd onto its
+            # existing card instead of appending a duplicate — one card per
+            # story per segment (see specs/ranking-feedback.allium invariant
+            # OneCardPerStoryPerSegment).
+            existing = next(
+                (i for i, f in enumerate(final) if f.story.id == r.story.id), None
+            )
+            if existing is not None:
+                final[existing] = replace(
+                    final[existing],
+                    combo_keys=f"{source_key} {mixed_key}",
+                    **badge_flags,
+                )
+            else:
+                final.append(
+                    replace(r, combo_keys=f"{source_key} {mixed_key}", **badge_flags)
+                )
+
         unsure_items = sorted(
             [r for r in explore_pool if r.prob_down is not None],
             key=_entropy_sort_key,
             reverse=True,
         )[:DISCOVERY_PER_BADGE]
         for r in unsure_items:
-            existing = next(
-                (i for i, f in enumerate(final) if f.story.id == r.story.id), None
-            )
-            new_r = replace(
-                r, is_uncertain=True, combo_keys=f"{source_key} {mixed_key}"
-            )
-            if existing is not None:
-                final[existing] = replace(
-                    final[existing],
-                    is_uncertain=True,
-                    combo_keys=f"{source_key} {mixed_key}",
-                )
-            else:
-                final.append(new_r)
+            _merge_or_append(r, is_uncertain=True)
             explore_picked.add(r.story.id)
 
         novel_items = sorted(
@@ -1508,9 +1515,7 @@ def rerank_candidates(
             reverse=True,
         )[:DISCOVERY_PER_BADGE]
         for r in novel_items:
-            final.append(
-                replace(r, is_novel=True, combo_keys=f"{source_key} {mixed_key}")
-            )
+            _merge_or_append(r, is_novel=True)
             explore_picked.add(r.story.id)
 
         similar_items = sorted(
@@ -1519,9 +1524,7 @@ def rerank_candidates(
             reverse=True,
         )[:DISCOVERY_PER_BADGE]
         for r in similar_items:
-            final.append(
-                replace(r, is_similar=True, combo_keys=f"{source_key} {mixed_key}")
-            )
+            _merge_or_append(r, is_similar=True)
             explore_picked.add(r.story.id)
 
     # Set is_recent and is_non_hn on every story in `final` (these flags are

@@ -2,6 +2,52 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-05 — Allium spec for ranking/feedback; fixed duplicate-card bug it surfaced
+
+Distilled `specs/ranking-feedback.allium` (story ranking + the vote/feedback
+loop) via `/allium:distill`, scoped to Story ranking & feedback (excludes
+ingestion and the swipe UI). Config defaults were cross-checked against
+`pipeline/config.py::ModelConfig` and corrected where they'd drifted
+(`diversity_similarity_threshold` was wrongly copied as 0.85 from an unused
+`mmr_filter` function-signature default; actual production default is 0.75).
+`DiversityFilter` gained an explicit `config.enable_diversity_filter` guard
+after confirming `enable_mmr` defaults to `False` in production.
+
+`/allium:propagate` generated 3 tests against the spec's obligations. Review
+before landing (per project convention — tests were inspected before adding
+to `tests/`) found:
+
+- **`test_personalization_and_diversity_config_defaults`** — landed in
+  `tests/test_pipeline.py`. Regression guard tying the spec's declared config
+  defaults to `ModelConfig`'s actual values.
+- **`test_no_duplicate_story_within_segment_when_badge_and_primary_overlap`**
+  — landed in `tests/test_pipeline.py`. Encodes the spec's
+  `OneCardPerStoryPerSegment` invariant. This test failed against the
+  pre-fix codebase (see below) — confirmed to fail first, then pass after
+  the fix, to rule out a vacuous test.
+- **A third test** (`ClearVote` on a story with no existing vote) was
+  **not** landed — it would pin current behavior (clearing a nonexistent
+  vote still queues a dashboard refresh) that contradicts the spec's
+  `requires: exists Vote{user, story}` on `ClearVote`. This is a genuine
+  spec/code divergence, not a test gap; tracked as an open `/allium:weed`
+  item rather than greenlit as a passing test.
+
+**Bug found and fixed**: `rerank_candidates` (`pipeline/ranking.py`)'s
+Explore pass (Novel/Similar) appended a duplicate `RankedStory` card for a
+story already badged by the Popular pass (Hot/Top/Talk) in the same
+`(age, source)` segment — `explore_pool`/`explore_picked` excluded prior
+Explore picks but not prior Popular picks. Reproduced concretely: story ids
+appeared twice in the `recent_hn` segment, once as `is_high_engagement` and
+once as a separate `is_novel` card. Fixed by extracting the merge-if-existing
+pattern already used by `Hot`/`Unsure` into a shared `_merge_or_append`
+closure and applying it uniformly to `Unsure`/`Novel`/`Similar`, so a story
+already present in `final` gets badges OR'd onto its existing card instead of
+appending a duplicate.
+
+Verified: full suite (488 passed, 1 skipped, ~21s at `-n 4`), `ruff check .`
+and `ty check` both clean, `allium check specs/ranking-feedback.allium`
+unchanged (pre-existing info/warning-level findings only, no errors).
+
 ## 2026-07-03 — Dedup Reddit/LessWrong enrichment kernel
 
 Four near-identical sites built a fresh `Story` from a fetched source context

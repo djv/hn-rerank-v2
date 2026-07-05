@@ -1356,6 +1356,71 @@ def test_rerank_candidates_mmr_config_switch(db, embedder, monkeypatch):
     assert called
 
 
+def test_personalization_and_diversity_config_defaults() -> None:
+    """Pins the production defaults specs/ranking-feedback.allium's config
+    block asserts (min_up/down_votes_for_personalization,
+    enable_diversity_filter, diversity_similarity_threshold map to
+    ModelConfig's min_up_for_svm/min_down_for_svm/enable_mmr/diversity_threshold).
+    Regression guard: the spec originally declared 0.85 for the threshold,
+    copied from mmr_filter's unused function-signature default; the real
+    ModelConfig default is 0.75.
+    """
+    defaults = ModelConfig()
+    assert defaults.min_up_for_svm == 20
+    assert defaults.min_down_for_svm == 20
+    assert defaults.enable_mmr is False
+    assert defaults.diversity_threshold == 0.75
+
+
+def test_no_duplicate_story_within_segment_when_badge_and_primary_overlap(
+    db, embedder
+) -> None:
+    """A story that qualifies for both a primary/Popular badge slot and an
+    Explore badge (Novel/Similar) within the same (age, source) segment must
+    appear as a single card with both properties reflected, not as two cards.
+    Spec invariant: OneCardPerStoryPerSegment in specs/ranking-feedback.allium.
+    """
+    now = int(time.time())
+    candidates = [
+        Story(
+            id=0,
+            title="Best and hottest story",
+            url=None,
+            score=500,
+            time=now - 3600,  # 1h old -> highest velocity AND highest score
+            text_content="Sample text content for story zero.",
+            source="hn",
+            comment_count=0,
+        ),
+    ] + [
+        Story(
+            id=i,
+            title=f"Filler story {i}",
+            url=None,
+            score=10,
+            time=now - 3600 * 24,
+            text_content=f"Sample filler text content for story {i}.",
+            source="hn",
+            comment_count=0,
+        )
+        for i in range(1, 15)
+    ]
+    cand_embs = embedder.encode([s.text_content for s in candidates])
+
+    config = Config(count=40, model=ModelConfig(hot_badge_percentile=50.0))
+    ranked = rerank_candidates(db, config, embedder, candidates, cand_embs)
+
+    recent_hn_cards = [r for r in ranked if "recent_hn" in r.combo_keys]
+    ids = [r.story.id for r in recent_hn_cards]
+    assert len(ids) == len(set(ids)), (
+        f"story id(s) appear more than once within the recent_hn segment: {ids}"
+    )
+
+    zero_cards = [r for r in recent_hn_cards if r.story.id == 0]
+    assert len(zero_cards) == 1
+    assert zero_cards[0].is_hot is True
+
+
 def test_rank_no_feedback_frontpage_sort(db, embedder):
     config = Config()
     # Absolutely no feedback in DB

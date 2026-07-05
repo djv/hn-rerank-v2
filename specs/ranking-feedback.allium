@@ -1,0 +1,157 @@
+-- allium: 3
+-- ranking-feedback.allium
+
+-- Scope: personalized story ranking and the feedback (voting) loop that
+-- drives it.
+-- Includes:
+--   - Casting / changing / clearing a vote on a story
+--   - The cold-start -> personalized transition as accumulated votes grow
+--   - Discovery categorization (Hot / Popular / Talked-about / Unsure /
+--     Novel / Similar) shown to the user
+--   - Diversity: near-duplicate suppression within a served deck
+--     (config-gated; disabled by default in production)
+--   - Segmentation of the dashboard by recency and source
+-- Excludes:
+--   - Story ingestion/sourcing from HN, Reddit, LessWrong, RSS (separate
+--     ingestion spec; Story is modelled here as external)
+--   - The specific ML technique used to learn preference (SVM, k-NN,
+--     clustering, embedding model) - these are implementation, not
+--     domain-level decisions, and are free to change without affecting
+--     this spec
+--   - TLDR/summary generation
+--   - Authentication / device linking (`/u/<token>`)
+
+external entity Story {
+    title: String
+    url: String?
+}
+
+enum SegmentAge { recent | archive }
+enum SegmentSource { hn | non_hn }
+
+value DashboardSegment {
+    age: SegmentAge
+    source: SegmentSource
+}
+
+enum DiscoveryBadgeKind { hot | popular | talked_about | unsure | novel | similar }
+
+entity User {
+    votes: Vote with user = this
+    up_votes: votes where reaction = up
+    down_votes: votes where reaction = down
+
+    -- The real gate also requires >= 2 unique feedback classes (up/down/neutral);
+    -- that's subsumed here since both counts >= 20 implies both classes exist.
+    is_personalization_ready:
+        up_votes.count >= config.min_up_votes_for_personalization
+        and down_votes.count >= config.min_down_votes_for_personalization
+}
+
+entity Vote {
+    user: User
+    story: Story
+    reaction: up | neutral | down
+    cast_at: Timestamp
+}
+
+entity RankedCard {
+    story: Story
+    for_user: User
+    segment: DashboardSegment
+    badges: Set<DiscoveryBadgeKind>
+    rank_score: Decimal
+}
+
+config {
+    min_up_votes_for_personalization: Integer = 20
+    min_down_votes_for_personalization: Integer = 20
+    enable_diversity_filter: Boolean = false
+    diversity_similarity_threshold: Decimal = 0.75
+    recent_window: Duration = 30.days
+}
+
+rule CastVote {
+    when: CastVote(user, story, reaction)
+
+    let existing = Vote{user, story}
+
+    ensures:
+        if exists existing:
+            existing.reaction = reaction
+            existing.cast_at = now
+        else:
+            Vote.created(user: user, story: story, reaction: reaction, cast_at: now)
+    ensures: RankingInvalidated(user)
+}
+
+rule ClearVote {
+    when: ClearVote(user, story)
+    requires: exists Vote{user, story}
+
+    ensures:
+        for v in Votes where v.user = user and v.story = story:
+            not exists v
+    ensures: RankingInvalidated(user)
+}
+
+-- A vote of any kind (cast, changed, or cleared) invalidates the user's
+-- current dashboard so the next view reflects the vote immediately, and
+-- queues a background refresh so subsequent views don't pay the
+-- recomputation cost.
+rule RankingInvalidated {
+    when: RankingInvalidated(user)
+    ensures: DashboardRefreshQueued(user)
+}
+
+rule DiversityFilter {
+    when: card: RankedCard.created
+    requires: config.enable_diversity_filter
+
+    for other in RankedCards where
+        other.for_user = card.for_user
+        and other.segment = card.segment
+        and other != card:
+        ensures:
+            if similarity(card.story, other.story) > config.diversity_similarity_threshold:
+                not exists other
+
+    @guidance
+        -- Applied only within the primary (non-badge) selection of a
+        -- segment, in ranked order, so the higher-scored of two
+        -- near-duplicate stories survives.
+}
+
+surface Dashboard {
+    facing viewer: User
+
+    context card: RankedCard where for_user = viewer
+
+    exposes:
+        card.segment
+        card.story.title
+        card.story.url
+        card.badges
+        card.rank_score
+        viewer.is_personalization_ready
+
+    provides:
+        CastVote(viewer, card.story, reaction)
+        ClearVote(viewer, card.story)
+            when exists Vote{user: viewer, story: card.story}
+
+    @guarantee PersonalizationRampsIn
+        -- Before `viewer.is_personalization_ready`, ranking favors
+        -- cold-start ordering. As votes accumulate, ranking shifts
+        -- continuously toward the viewer's learned preferences; there
+        -- is no hard cutover.
+}
+
+invariant OneCardPerStoryPerSegment {
+    for a in RankedCards:
+        for b in RankedCards:
+            a != b and a.for_user = b.for_user and a.segment = b.segment
+                implies a.story != b.story
+}
+
+open question "Should is_personalization_ready be per-source (e.g. enough HN votes but not enough Reddit votes) or global per-user?"
