@@ -1,0 +1,7 @@
+<div class="{{ group.css_class }}" data-filter="{{ group.key }}" aria-label="{{ group.aria_label }}">
+  {% for tab in group.tabs %}
+  <button type="button"
+          class="tab-btn{% if group.segmented %} tab-btn--segmented{% endif %}{% if tab.active %} active{% endif %}"
+          data-{{ group.data_attr }}="{{ tab.value }}">{{ tab.label_html | safe }}</button>
+  {% endfor %}
+</div>

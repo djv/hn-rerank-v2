@@ -70,7 +70,11 @@ async def main() -> None:
 
     config = Config.load("config.toml")
     db = Database(config.db_path)
-    embedder = Embedder(config.onnx_model_dir)
+    embedder = Embedder(
+        config.onnx_model_dir,
+        batch_size=config.embedding_batch_size,
+        ort_variant=config.embedding_ort_variant,
+    )
 
     # --- Step 1: Hydrate comments for skeleton ch_seed stories ---
     skeletons = get_skeleton_stories(db, CH_ARCHIVE_SOURCE)

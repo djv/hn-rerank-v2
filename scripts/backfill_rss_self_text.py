@@ -35,7 +35,7 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     db = Database()
 
-    with db._conn() as conn:
+    with db.conn() as conn:
         rows = conn.execute(
             "SELECT id, title, text_content FROM stories "
             "WHERE source LIKE 'rss_%' AND self_text = '' AND text_content != ''"

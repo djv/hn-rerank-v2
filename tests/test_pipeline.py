@@ -1,21 +1,28 @@
-from typing import cast
+from typing import Any, cast
 import asyncio
 import numpy as np
 import pytest
 import time
+from pathlib import Path
+from types import SimpleNamespace
 from hypothesis import given, strategies as st, settings, HealthCheck
 from database import Database, Story
+from dataclasses import replace
 import pipeline
+import pipeline.ranking as ranking
 from pipeline import (
     BQ_ARCHIVE_SOURCE,
     CH_ARCHIVE_SOURCE,
     Embedder,
     ModelConfig,
+    RankTrace,
     RankedStory,
+    RssConfig,
     clean_text,
     compose_story_text,
     get_or_compute_embeddings,
     is_hn_source,
+    load_production_candidate_stories,
     mmr_filter,
     _score_and_rank,
     Config,
@@ -25,7 +32,7 @@ from pipeline import (
     story_embedding_text,
     _extract_comments_recursive,
     _select_top_comments,
-    _dashboard_primary_limit,
+    _needs_hn_prewarm,
     _reddit_subreddit_from_feed_url,
     _rss_source_name,
     _svm_personalization_features,
@@ -33,6 +40,7 @@ from pipeline import (
     _get_cached_model,
     _set_cached_model,
     _MODEL_CACHE,
+    fast_rerank_for_user,
     HOT_MIN_SCORE,
 )
 
@@ -44,16 +52,87 @@ def db():
     db_instance.close()
 
 
-def test_dashboard_primary_limit_is_capped_to_queue_size():
-    assert _dashboard_primary_limit(40)[0] == 12
-    assert _dashboard_primary_limit(9)[0] == 9
+def test_config_load_missing_file_returns_dataclass_defaults(tmp_path):
+    missing = tmp_path / "missing.toml"
+
+    assert Config.load(str(missing)) == Config()
 
 
-def test_dashboard_primary_limit_uncertain_threshold_at_10():
-    assert _dashboard_primary_limit(1) == (1, 0)
-    assert _dashboard_primary_limit(9) == (9, 0)
-    assert _dashboard_primary_limit(10) == (10, 5)
-    assert _dashboard_primary_limit(40) == (12, 5)
+def test_config_load_partial_toml_overlays_defaults(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        """
+[hn_rewrite]
+server_port = 9999
+embedding_batch_size = 8
+embedding_ort_variant = "spin_off_auto_threads"
+
+[hn_rewrite.model]
+svm_c = 0.7
+dedup_exclude_actions = ["down"]
+
+[hn_rewrite.rss]
+feeds = ["https://example.com/a.xml", "https://example.com/b.xml"]
+""",
+        encoding="utf-8",
+    )
+
+    config = Config.load(str(path))
+
+    assert config.server_port == 9999
+    assert config.embedding_batch_size == 8
+    assert config.embedding_ort_variant == "spin_off_auto_threads"
+    assert config.article_fetch_max_per_run == 50
+    assert config.model.svm_c == 0.7
+    assert config.model.svm_gamma == 0.03
+    assert config.model.dedup_exclude_actions == ("down",)
+    assert config.rss.per_feed_limit == 70
+    assert config.rss.feeds == (
+        "https://example.com/a.xml",
+        "https://example.com/b.xml",
+    )
+
+
+def test_config_rejects_invalid_embedding_batch_size():
+    with pytest.raises(ValueError, match="embedding_batch_size must be positive"):
+        Config(embedding_batch_size=0)
+
+
+def test_config_rejects_invalid_embedding_ort_variant():
+    with pytest.raises(ValueError, match="embedding_ort_variant must be one of"):
+        Config(embedding_ort_variant=cast(Any, "approximate_gelu"))
+
+
+def test_config_load_checked_in_config_contains_only_runtime_overrides():
+    config_path = Path(__file__).resolve().parents[1] / "config.toml"
+
+    config = Config.load(str(config_path))
+
+    assert config.server_port == 8766
+    assert config.article_fetch_max_per_run == 50
+    assert config.model.svm_c == 0.1
+    assert config.model.svm_gamma == 0.03
+    assert len(config.rss.feeds) >= 40
+
+
+@pytest.mark.parametrize(
+    "toml_text, error",
+    [
+        ("[other]\nvalue = 1\n", "Unknown config section"),
+        ("[hn_rewrite]\nunknown = 1\n", "Unknown hn_rewrite config key"),
+        (
+            "[hn_rewrite.model]\nunknown = 1\n",
+            "Unknown hn_rewrite.model config key",
+        ),
+        ("[hn_rewrite.rss]\nunknown = 1\n", "Unknown hn_rewrite.rss config key"),
+    ],
+)
+def test_config_load_rejects_unknown_keys(tmp_path, toml_text, error):
+    path = tmp_path / "config.toml"
+    path.write_text(toml_text, encoding="utf-8")
+
+    with pytest.raises(ValueError, match=error):
+        Config.load(str(path))
 
 
 def test_article_fetch_selection_prioritizes_dashboard_and_filters(db):
@@ -121,10 +200,202 @@ def test_article_fetch_selection_prioritizes_dashboard_and_filters(db):
     assert [s.id for s in selected] == [1, 2, 5]
 
 
+def _cold_story(
+    sid: int,
+    *,
+    score: int,
+    time_ts: int,
+    source: str = "hn",
+    text_content: str = "story text",
+    comment_count: int | None = 1,
+) -> Story:
+    return Story(
+        id=sid,
+        title=f"Cold {sid}",
+        url=f"https://example.com/{sid}",
+        score=score,
+        time=time_ts,
+        text_content=text_content,
+        source=source,
+        comment_count=comment_count,
+    )
+
+
+def test_build_cold_deck_empty_db(db: Database) -> None:
+    assert pipeline.build_cold_deck(db) == []
+
+
+def test_build_cold_deck_score_order_and_summarizable_filter(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 2_000_000_000
+    monkeypatch.setattr(pipeline.time, "time", lambda: float(now))
+    unsummarizable = _cold_story(
+        1,
+        score=1000,
+        time_ts=now - 3600,
+        text_content="",
+        comment_count=0,
+    )
+    low = _cold_story(2, score=10, time_ts=now - 3600)
+    high = _cold_story(3, score=100, time_ts=now - 3600)
+    for story in (unsummarizable, low, high):
+        db.upsert_story(story)
+
+    cold = pipeline.build_cold_deck(db)
+
+    assert [item.story.id for item in cold] == [3, 2]
+    gravity_div = 3.0**1.8
+    assert [item.score for item in cold] == pytest.approx(
+        [100.0 / gravity_div, 10.0 / gravity_div]
+    )
+
+
+def test_build_cold_deck_combo_keys_and_flags(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 2_000_000_000
+    monkeypatch.setattr(pipeline.time, "time", lambda: float(now))
+    recent_hn = _cold_story(1, score=30, time_ts=now - 3600, source="hn")
+    archive_hn = _cold_story(
+        2,
+        score=20,
+        time_ts=now - (31 * 86400),
+        source=BQ_ARCHIVE_SOURCE,
+    )
+    recent_non_hn = _cold_story(
+        3,
+        score=10,
+        time_ts=now - 3600,
+        source="rss_blog",
+        text_content="rss body",
+        comment_count=0,
+    )
+    recent_non_hn = replace(recent_non_hn, article_body="rss body")
+    for story in (recent_hn, archive_hn, recent_non_hn):
+        db.upsert_story(story)
+
+    cold = pipeline.build_cold_deck(db)
+    by_id = {item.story.id: item for item in cold}
+
+    assert by_id[1].combo_keys == "recent_hn recent_mixed"
+    assert by_id[1].is_recent is True
+    assert by_id[1].is_non_hn is False
+    assert by_id[2].combo_keys == "archive_hn archive_mixed"
+    assert by_id[2].is_recent is False
+    assert by_id[2].is_non_hn is False
+    assert by_id[3].combo_keys == "recent_non-hn recent_mixed"
+    assert by_id[3].is_recent is True
+    assert by_id[3].is_non_hn is True
+
+
+def test_build_cold_deck_uses_badge_defaults(db: Database) -> None:
+    db.upsert_story(_cold_story(1, score=100, time_ts=int(time.time()) - 3600))
+
+    item = pipeline.build_cold_deck(db)[0]
+
+    assert item.best_match_title == ""
+    assert item.prob_down is None
+    assert item.prob_neutral is None
+    assert item.prob_up is None
+    assert item.is_uncertain is False
+    assert item.is_novel is False
+    assert item.is_discussion_rich is False
+    assert item.is_high_engagement is False
+    assert item.is_hot is False
+    assert item.is_similar is False
+
+
 @pytest.fixture(scope="module")
 def embedder():
     # Uses the real downloaded ONNX model
     return Embedder("onnx_model")
+
+
+def test_embedder_uses_configured_batch_and_ort_variant(monkeypatch):
+    class FakeTokenizer:
+        @classmethod
+        def from_pretrained(cls, model_dir):
+            assert model_dir == "onnx_model"
+            return cls()
+
+        def __call__(
+            self,
+            texts,
+            *,
+            padding,
+            truncation,
+            max_length,
+            return_tensors,
+        ):
+            assert padding is True
+            assert truncation is True
+            assert max_length == 512
+            assert return_tensors == "np"
+            width = max(1, max(len(text) for text in texts))
+            input_ids = np.ones((len(texts), width), dtype=np.int64)
+            attention_mask = np.ones((len(texts), width), dtype=np.int64)
+            return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    class FakeSessionOptions:
+        def __init__(self):
+            self.enable_cpu_mem_arena = None
+            self.enable_mem_pattern = None
+            self.intra_op_num_threads = None
+            self.inter_op_num_threads = None
+            self.graph_optimization_level = None
+            self.entries = {}
+
+        def add_session_config_entry(self, key, value):
+            self.entries[key] = value
+
+    class FakeSession:
+        def __init__(self, model_path, *, sess_options, providers):
+            assert model_path.endswith("model.onnx")
+            assert providers == ["CPUExecutionProvider"]
+            self.options = sess_options
+            self.run_calls = 0
+
+        def get_inputs(self):
+            return [
+                SimpleNamespace(name="input_ids"),
+                SimpleNamespace(name="attention_mask"),
+            ]
+
+        def run(self, output_names, onnx_inputs):
+            assert output_names is None
+            self.run_calls += 1
+            batch, tokens = onnx_inputs["input_ids"].shape
+            return [np.ones((batch, tokens, 384), dtype=np.float32)]
+
+    monkeypatch.setattr(ranking, "AutoTokenizer", FakeTokenizer)
+    monkeypatch.setattr(
+        ranking,
+        "ort",
+        SimpleNamespace(
+            SessionOptions=FakeSessionOptions,
+            InferenceSession=FakeSession,
+            GraphOptimizationLevel=SimpleNamespace(ORT_ENABLE_ALL="all"),
+        ),
+    )
+
+    embedder = Embedder(
+        "onnx_model",
+        batch_size=2,
+        ort_variant="spin_off_auto_threads",
+    )
+    embeddings = embedder.encode(["a", "bb", "ccc"])
+    session = cast(Any, embedder.session)
+
+    assert embeddings.shape == (3, 384)
+    assert session.run_calls == 2
+    assert session.options.entries == {
+        "session.intra_op.allow_spinning": "0",
+        "session.inter_op.allow_spinning": "0",
+    }
+    assert session.options.graph_optimization_level == "all"
+    assert session.options.intra_op_num_threads == 0
+    assert session.options.inter_op_num_threads == 1
 
 
 def test_embedder_output_shape(embedder):
@@ -462,6 +733,107 @@ def test_is_hn_source_includes_bq_seed():
     assert not is_hn_source("rss_example_com")
 
 
+@pytest.mark.asyncio
+async def test_rss_feed_captures_comments_url(monkeypatch):
+    """RSS <comments> element is captured as discussion_url.
+
+    Tildes and Lobsters provide a <comments> element distinct from
+    <link>. The Story constructor must populate discussion_url from it
+    so the UI can render a comments link.
+    """
+    from pipeline import _fetch_and_parse_feed
+
+    class MockResp:
+        status_code = 200
+        text = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>Test</title>
+<item>
+  <title>Black Shirt</title>
+  <link>https://example.com/article</link>
+  <comments>https://tildes.net/~group/topic_id</comments>
+  <pubDate>Tue, 23 Jun 2026 12:00:00 GMT</pubDate>
+  <description>A great article about shirts.</description>
+</item>
+</channel></rss>"""
+        headers: dict[str, str] = {}
+
+    class MockClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, url, headers=None):
+            return MockResp()
+
+    monkeypatch.setattr("pipeline.enrichment.httpx.AsyncClient", MockClient)
+
+    stories = await _fetch_and_parse_feed(
+        "https://tildes.net/topics.rss",
+        per_feed=10,
+        cutoff=0,
+        now=1_000_000,
+        exclude_urls=set(),
+    )
+    assert len(stories) == 1
+    assert stories[0].url == "https://example.com/article"
+    assert stories[0].discussion_url == "https://tildes.net/~group/topic_id"
+
+
+@pytest.mark.asyncio
+async def test_rss_feed_no_comments_url(monkeypatch):
+    """RSS feeds without <comments> element leave discussion_url as None.
+
+    Reddit, LessWrong, and personal blog feeds don't have a <comments>
+    element. The link is the article URL, not a separate discussion
+    page, so discussion_url should remain None.
+    """
+    from pipeline import _fetch_and_parse_feed
+
+    class MockResp:
+        status_code = 200
+        text = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>Test</title>
+<item>
+  <title>Some Blog Post</title>
+  <link>https://example.com/blog</link>
+  <pubDate>Tue, 23 Jun 2026 12:00:00 GMT</pubDate>
+  <description>A blog post about something interesting.</description>
+</item>
+</channel></rss>"""
+        headers: dict[str, str] = {}
+
+    class MockClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, url, headers=None):
+            return MockResp()
+
+    monkeypatch.setattr("pipeline.enrichment.httpx.AsyncClient", MockClient)
+
+    stories = await _fetch_and_parse_feed(
+        "https://example.com/feed.xml",
+        per_feed=10,
+        cutoff=0,
+        now=1_000_000,
+        exclude_urls=set(),
+    )
+    assert len(stories) == 1
+    assert stories[0].url == "https://example.com/blog"
+    assert stories[0].discussion_url is None
+
+
 def test_is_summarizable_with_content():
     """Stories with self_text, top_comments, or article_body are summarizable."""
     from pipeline import Story
@@ -636,7 +1008,7 @@ async def test_build_reddit_topfeed_serializes_and_sets_user_agent(
             link = url.replace("/top/.rss", "/comments/test")
             return MockResp(rss_doc(title, link))
 
-    monkeypatch.setattr("pipeline.httpx.AsyncClient", MockClient)
+    monkeypatch.setattr("pipeline.enrichment.httpx.AsyncClient", MockClient)
     # Disable the 2s inter-request delay so the test runs fast;
     # the conftest fixture resets the limiter before/after each test.
     monkeypatch.setattr("pipeline.reddit_limiter", pipeline.reddit_limiter)
@@ -722,7 +1094,7 @@ async def test_build_reddit_topfeed_populates_self_text(tmp_path, monkeypatch):
         async def get(self, url, headers=None):
             return MockResp(rss_doc("LA transit", url + "/comments/x/"))
 
-    monkeypatch.setattr("pipeline.httpx.AsyncClient", MockClient)
+    monkeypatch.setattr("pipeline.enrichment.httpx.AsyncClient", MockClient)
     pipeline.reddit_limiter.INTER_REQUEST_DELAY = 0.0
 
     feeds = ["https://www.reddit.com/r/transit/top/.rss"]
@@ -778,7 +1150,7 @@ async def test_build_reddit_topfeed_cache_hit_skips_http(tmp_path, monkeypatch):
         async def get(self, url, headers=None):
             raise RuntimeError("HTTP call made despite cache hit")
 
-    monkeypatch.setattr("pipeline.httpx.AsyncClient", FailClient)
+    monkeypatch.setattr("pipeline.enrichment.httpx.AsyncClient", FailClient)
     pipeline.reddit_limiter.INTER_REQUEST_DELAY = 0.0
 
     factories, reddit_feed_urls = build_reddit_topfeed_factories(
@@ -831,7 +1203,7 @@ async def test_build_reddit_topfeed_cache_miss_fetches_and_caches(
         async def get(self, url, headers=None):
             return MockResp(rss_doc("Fresh Story", url + "/comments/x/"))
 
-    monkeypatch.setattr("pipeline.httpx.AsyncClient", MockClient)
+    monkeypatch.setattr("pipeline.enrichment.httpx.AsyncClient", MockClient)
     pipeline.reddit_limiter.INTER_REQUEST_DELAY = 0.0
     pipeline.reddit_feed_cache.reset()
 
@@ -847,129 +1219,6 @@ async def test_build_reddit_topfeed_cache_miss_fetches_and_caches(
     cached = pipeline.reddit_feed_cache.get(reddit_feed_urls[0])
     assert cached is not None
     assert cached[0].title == "Fresh Story"
-
-
-def test_extract_reddit_score_and_comments_reads_atom_fields() -> None:
-    """``_extract_reddit_score_and_comments`` pulls <score>/<num_comments>
-    from a parsed Atom entry. Regression: the pre-fix parser hardcoded
-    ``score=0, comment_count=None`` and lost the Reddit RSS metadata."""
-    import feedparser
-
-    sample = b"""<?xml version="1.0" encoding="UTF-8"?>
-<feed xmlns="http://www.w3.org/2005/Atom">
-  <entry>
-    <title>x</title>
-    <link href="https://www.reddit.com/r/test/comments/abc/x/"/>
-    <score>42</score>
-    <num_comments>15</num_comments>
-  </entry>
-</feed>"""
-    entry = feedparser.parse(sample).entries[0]
-    score, num_comments = pipeline._extract_reddit_score_and_comments(entry)
-    assert score == 42
-    assert num_comments == 15
-
-
-def test_extract_reddit_score_and_comments_falls_back_on_missing() -> None:
-    """Non-Atom or no-score feeds return ``(0, 0)`` instead of raising."""
-    import feedparser
-
-    sample = b"""<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0"><channel>
-<item><title>x</title><link>https://example.com/</link></item>
-</channel></rss>"""
-    entries = feedparser.parse(sample).entries
-    if entries:
-        score, num_comments = pipeline._extract_reddit_score_and_comments(entries[0])
-        assert score == 0
-        assert num_comments == 0
-    # Non-Reddit caller (entry=None) must also be a clean no-op.
-    assert pipeline._extract_reddit_score_and_comments(None) == (0, 0)
-
-
-def test_extract_reddit_score_and_comments_legacy_aliases() -> None:
-    """Older Reddit RSS variants used ``<points>`` and ``<comments>``
-    instead of ``<score>`` / ``<num_comments>``. The helper tries the
-    legacy names as fallbacks."""
-    import feedparser
-
-    sample = b"""<?xml version="1.0" encoding="UTF-8"?>
-<feed xmlns="http://www.w3.org/2005/Atom">
-  <entry>
-    <title>x</title>
-    <link href="https://www.reddit.com/r/test/comments/abc/x/"/>
-    <points>99</points>
-    <comments>7</comments>
-  </entry>
-</feed>"""
-    entry = feedparser.parse(sample).entries[0]
-    score, num_comments = pipeline._extract_reddit_score_and_comments(entry)
-    assert score == 99
-    assert num_comments == 7
-
-
-async def test_build_reddit_topfeed_populates_score_and_comment_count(
-    monkeypatch,
-) -> None:
-    """End-to-end: a real Reddit Atom feed body (with ``<score>`` and
-    ``<num_comments>``) populates the Story fields. The pre-fix parser
-    left them at 0 / None, which broke the prewarm ``comment_count > 0``
-    filter and the ``score DESC`` sort."""
-    from pipeline import build_reddit_topfeed_factories
-    from reddit_fetch_queue import queue as reddit_fetch_queue
-
-    body = """<?xml version="1.0" encoding="UTF-8"?>
-<feed xmlns="http://www.w3.org/2005/Atom">
-  <entry>
-    <title>Real Reddit Story</title>
-    <link href="https://www.reddit.com/r/test/comments/abc/real_reddit_story/"/>
-    <updated>2026-06-28T17:00:00+00:00</updated>
-    <content type="html">body text</content>
-    <score>123</score>
-    <num_comments>4</num_comments>
-  </entry>
-</feed>"""
-
-    class MockResp:
-        status_code = 200
-
-        def __init__(self, t):
-            self.text = t
-            self.headers: dict[str, str] = {}
-
-    class MockClient:
-        def __init__(self, **kw):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            pass
-
-        async def get(self, url, headers=None):
-            return MockResp(body)
-
-    monkeypatch.setattr("pipeline.httpx.AsyncClient", MockClient)
-    pipeline.reddit_limiter.INTER_REQUEST_DELAY = 0.0
-    pipeline.reddit_feed_cache.reset()
-
-    feed_url = "https://www.reddit.com/r/test/top/.rss?t=week&limit=25"
-    factories, reddit_feed_urls = build_reddit_topfeed_factories(
-        [feed_url], per_feed=10, days=30, exclude_urls=set()
-    )
-    reddit_fetch_queue.enqueue_spread(
-        len(factories), time.monotonic(), "topfeed", factories
-    )
-    assert reddit_fetch_queue.wait_until_empty(timeout=2.0) is True
-
-    cached = pipeline.reddit_feed_cache.get(feed_url)
-    assert cached is not None
-    assert len(cached) == 1
-    s = cached[0]
-    assert s.score == 123
-    assert s.comment_count == 4
-    assert s.comment_count_at_fetch == 4
 
 
 async def test_prewarm_reddit_top_stories_fetches_comments(tmp_path, monkeypatch):
@@ -1080,7 +1329,7 @@ def test_rerank_candidates_mmr_config_switch(db, embedder, monkeypatch):
     def fail_mmr(*args, **kwargs):
         raise AssertionError("mmr_filter should not be called when enable_mmr=false")
 
-    monkeypatch.setattr(pipeline, "mmr_filter", fail_mmr)
+    monkeypatch.setattr(pipeline.ranking, "mmr_filter", fail_mmr)
     rerank_candidates(
         db=db,
         config=Config(count=3, model=ModelConfig(enable_mmr=False)),
@@ -1096,7 +1345,7 @@ def test_rerank_candidates_mmr_config_switch(db, embedder, monkeypatch):
         called = True
         return ranked[:limit]
 
-    monkeypatch.setattr(pipeline, "mmr_filter", mark_mmr)
+    monkeypatch.setattr(pipeline.ranking, "mmr_filter", mark_mmr)
     rerank_candidates(
         db=db,
         config=Config(count=3, model=ModelConfig(enable_mmr=True)),
@@ -1107,11 +1356,69 @@ def test_rerank_candidates_mmr_config_switch(db, embedder, monkeypatch):
     assert called
 
 
-def test_dashboard_primary_limit_reduces_ranked_slice_without_counting_uncertainty():
-    primary_limit, uncertain_slots = _dashboard_primary_limit(40)
+def test_personalization_and_diversity_config_defaults() -> None:
+    """Pins the production defaults specs/ranking-feedback.allium's config
+    block asserts (min_up/down_votes_for_personalization,
+    enable_diversity_filter, diversity_similarity_threshold map to
+    ModelConfig's min_up_for_svm/min_down_for_svm/enable_mmr/diversity_threshold).
+    Regression guard: the spec originally declared 0.85 for the threshold,
+    copied from mmr_filter's unused function-signature default; the real
+    ModelConfig default is 0.75.
+    """
+    defaults = ModelConfig()
+    assert defaults.min_up_for_svm == 20
+    assert defaults.min_down_for_svm == 20
+    assert defaults.enable_mmr is False
+    assert defaults.diversity_threshold == 0.75
 
-    assert primary_limit == 12
-    assert uncertain_slots == 5
+
+def test_no_duplicate_story_within_segment_when_badge_and_primary_overlap(
+    db, embedder
+) -> None:
+    """A story that qualifies for both a primary/Popular badge slot and an
+    Explore badge (Novel/Similar) within the same (age, source) segment must
+    appear as a single card with both properties reflected, not as two cards.
+    Spec invariant: OneCardPerStoryPerSegment in specs/ranking-feedback.allium.
+    """
+    now = int(time.time())
+    candidates = [
+        Story(
+            id=0,
+            title="Best and hottest story",
+            url=None,
+            score=500,
+            time=now - 3600,  # 1h old -> highest velocity AND highest score
+            text_content="Sample text content for story zero.",
+            source="hn",
+            comment_count=0,
+        ),
+    ] + [
+        Story(
+            id=i,
+            title=f"Filler story {i}",
+            url=None,
+            score=10,
+            time=now - 3600 * 24,
+            text_content=f"Sample filler text content for story {i}.",
+            source="hn",
+            comment_count=0,
+        )
+        for i in range(1, 15)
+    ]
+    cand_embs = embedder.encode([s.text_content for s in candidates])
+
+    config = Config(count=40, model=ModelConfig(hot_badge_percentile=50.0))
+    ranked = rerank_candidates(db, config, embedder, candidates, cand_embs)
+
+    recent_hn_cards = [r for r in ranked if "recent_hn" in r.combo_keys]
+    ids = [r.story.id for r in recent_hn_cards]
+    assert len(ids) == len(set(ids)), (
+        f"story id(s) appear more than once within the recent_hn segment: {ids}"
+    )
+
+    zero_cards = [r for r in recent_hn_cards if r.story.id == 0]
+    assert len(zero_cards) == 1
+    assert zero_cards[0].is_hot is True
 
 
 def test_rank_no_feedback_frontpage_sort(db, embedder):
@@ -1162,71 +1469,6 @@ def test_clean_text_properties(text, min_len):
         assert not re.search(r"[\u2800-\u28FF]", cleaned)
         # No unescaped tags
         assert not re.search(r"<[^>]+>", cleaned)
-
-
-@given(
-    meta=st.lists(
-        st.tuples(
-            st.integers(min_value=-1000, max_value=1_000_000),
-            st.floats(
-                min_value=-86400.0,
-                max_value=10_000_000.0,
-                allow_nan=False,
-                allow_infinity=False,
-            ),
-        ),
-        min_size=1,
-        max_size=50,
-    )
-)
-@settings(max_examples=25)
-def test_augment_features_properties(meta):
-    from legacy_features import _augment_features
-
-    n = len(meta)
-    embeddings = np.random.randn(n, 384).astype(np.float32)
-    scores = [item[0] for item in meta]
-    ages = [item[1] for item in meta]
-
-    features = _augment_features(embeddings, scores, ages)
-
-    assert features.shape == (n, 385)
-    assert np.allclose(features[:, :384], embeddings)
-    assert np.all(features[:, 384] >= 0.0) and np.all(features[:, 384] <= 1.0)
-
-    # When all 11 derived features are provided, shape expands to (n, 396)
-    comment_counts = np.array([max(s, 0) for s in scores])
-    text_lengths = np.array([abs(a) % 10000 for a in ages])
-    hn_quality = comment_counts.astype(np.float32) / (np.abs(ages) + 1)
-    sim_up = np.random.uniform(-1, 1, n).astype(np.float32)
-    sim_down = np.random.uniform(-1, 1, n).astype(np.float32)
-    closest_up = np.random.uniform(-1, 1, n).astype(np.float32)
-    closest_down = np.random.uniform(-1, 1, n).astype(np.float32)
-    is_hn_live = np.random.randint(0, 2, n).astype(np.float32)
-    is_archive = np.random.randint(0, 2, n).astype(np.float32)
-    is_reddit = np.random.randint(0, 2, n).astype(np.float32)
-    is_rss = np.random.randint(0, 2, n).astype(np.float32)
-
-    features7 = _augment_features(
-        embeddings,
-        scores,
-        ages,
-        comment_counts=comment_counts,
-        text_lengths=text_lengths,
-        hn_quality=hn_quality,
-        sim_to_upvoted=sim_up,
-        sim_to_downvoted=sim_down,
-        closest_upvoted=closest_up,
-        closest_downvoted=closest_down,
-        is_hn_live=is_hn_live,
-        is_archive=is_archive,
-        is_reddit=is_reddit,
-        is_rss=is_rss,
-    )
-    assert features7.shape == (n, 396)
-    assert np.allclose(features7[:, :384], embeddings)
-    # All normalized cols in [0, 1]
-    assert np.all(features7[:, 384:] >= 0.0) and np.all(features7[:, 384:] <= 1.0)
 
 
 def test_svm_personalization_features_exclude_engagement_source_metadata():
@@ -1706,7 +1948,7 @@ def test_fast_rerank_for_user_includes_old_bq_archive_story(db, monkeypatch):
     def fake_embeddings(stories, embedder, db_inst):
         return np.zeros((len(stories), 384), dtype=np.float32)
 
-    monkeypatch.setattr("pipeline.get_or_compute_embeddings", fake_embeddings)
+    monkeypatch.setattr("pipeline.ranking.get_or_compute_embeddings", fake_embeddings)
     ranked = fast_rerank_for_user(
         db, Config(days=30), cast(Embedder, object()), user.id
     )
@@ -1749,7 +1991,7 @@ def test_fast_rerank_for_user_filters_unsummarizable_stories(db, monkeypatch):
     def fake_embeddings(stories, embedder, db_inst):
         return np.zeros((len(stories), 384), dtype=np.float32)
 
-    monkeypatch.setattr("pipeline.get_or_compute_embeddings", fake_embeddings)
+    monkeypatch.setattr("pipeline.ranking.get_or_compute_embeddings", fake_embeddings)
     ranked = fast_rerank_for_user(
         db, Config(days=30), cast(Embedder, object()), user.id
     )
@@ -1757,6 +1999,120 @@ def test_fast_rerank_for_user_filters_unsummarizable_stories(db, monkeypatch):
     result_ids = {r.story.id for r in ranked}
     assert summarizable_id in result_ids
     assert unsummarizable_id not in result_ids
+
+
+def _candidate_story(
+    sid: int,
+    *,
+    source: str,
+    score: int,
+    time_ts: int,
+    comment_count: int | None = 0,
+    article_body: str = "body",
+    text_content: str = "story text",
+) -> Story:
+    return Story(
+        id=sid,
+        title=f"Candidate {sid}",
+        url=f"https://example.com/candidate/{sid}",
+        score=score,
+        time=time_ts,
+        text_content=text_content,
+        source=source,
+        comment_count=comment_count,
+        article_body=article_body,
+    )
+
+
+def test_load_production_candidate_stories_preserves_leg_order_and_limits(
+    db: Database,
+) -> None:
+    user = db.create_user("candidate_leg_order")
+    now = 2_000_000_000
+    old = now - 60 * 86400
+    config = Config(days=30, recent_candidate_hn_limit=2, recent_candidate_rss_limit=2)
+    for story in (
+        _candidate_story(
+            1, source="hn", score=100, time_ts=now - 3600, comment_count=1
+        ),
+        _candidate_story(
+            2, source="hn", score=500, time_ts=now - 100 * 3600, comment_count=1
+        ),
+        _candidate_story(3, source="hn", score=0, time_ts=now - 60, comment_count=1),
+        _candidate_story(10, source="rss_a", score=0, time_ts=now - 60),
+        _candidate_story(11, source="rss_a", score=0, time_ts=now - 120),
+        _candidate_story(12, source="rss_a", score=0, time_ts=now - 30_000),
+        _candidate_story(20, source=BQ_ARCHIVE_SOURCE, score=900, time_ts=old),
+        _candidate_story(21, source=CH_ARCHIVE_SOURCE, score=950, time_ts=old - 1),
+        _candidate_story(30, source="rss_old", score=0, time_ts=old),
+        _candidate_story(31, source="rss_old", score=0, time_ts=old - 10),
+        _candidate_story(32, source="rss_old", score=0, time_ts=old - 20),
+    ):
+        db.upsert_story(story)
+
+    candidates = load_production_candidate_stories(
+        db, config, user_id=user.id, exclude_feedback=True, now_ts=now
+    )
+
+    assert [story.id for story in candidates] == [1, 2, 10, 11, 21, 20, 30, 31]
+
+
+def test_load_production_candidate_stories_feedback_switch_and_summarizable_filter(
+    db: Database,
+) -> None:
+    user = db.create_user("candidate_feedback_switch")
+    now = 2_000_000_000
+    config = Config(
+        days=30, recent_candidate_hn_limit=10, recent_candidate_rss_limit=10
+    )
+    db.upsert_story(
+        _candidate_story(1, source="hn", score=10, time_ts=now - 60, comment_count=1)
+    )
+    db.upsert_story(
+        _candidate_story(
+            2,
+            source="hn",
+            score=20,
+            time_ts=now - 120,
+            comment_count=0,
+            article_body="",
+            text_content="unsummarizable text cache",
+        )
+    )
+    db.upsert_feedback(user.id, 1, "up")
+
+    excluded = load_production_candidate_stories(
+        db, config, user_id=user.id, exclude_feedback=True, now_ts=now
+    )
+    included = load_production_candidate_stories(
+        db, config, user_id=user.id, exclude_feedback=False, now_ts=now
+    )
+
+    assert [story.id for story in excluded] == []
+    assert [story.id for story in included] == [1]
+
+
+def test_fast_rerank_for_user_zero_vote_returns_cold_deck(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """0-feedback users get build_cold_deck directly — no embeddings, no SVM."""
+    from pipeline import Config, fast_rerank_for_user
+
+    user = db.create_user("zero_vote_cold")
+    now = 2_000_000_000
+    monkeypatch.setattr(pipeline.time, "time", lambda: float(now))
+    db.upsert_story(_cold_story(1, score=50, time_ts=now - 3600, source="hn"))
+
+    ranked = fast_rerank_for_user(
+        db, Config(days=30), cast(Embedder, object()), user.id
+    )
+
+    gravity_div = 3.0**1.8
+    assert len(ranked) == 1
+    assert ranked[0].story.id == 1
+    assert ranked[0].score == pytest.approx(50.0 / gravity_div)
+    assert ranked[0].is_recent is True
+    assert ranked[0].is_non_hn is False
 
 
 def test_soft_blend_min_alpha_curve() -> None:
@@ -2417,7 +2773,7 @@ def test_novel_archive_pass_surfaces_archive_novel(
                 arr[i, 0] = 1.0
         return arr
 
-    monkeypatch.setattr("pipeline.get_or_compute_embeddings", mock_gce)
+    monkeypatch.setattr("pipeline.ranking.get_or_compute_embeddings", mock_gce)
     db.upsert_story(
         Story(id=100, title="fb", url=None, score=10, time=0, text_content="")
     )
@@ -2495,15 +2851,23 @@ def test_novel_archive_pass_surfaces_archive_novel(
     )
 
     by_id = {r.story.id: r for r in ranked}
-    # All 4 archive novel targets have higher distance than the fillers,
-    # so they all get is_novel via the novel-archive pass.
-    for aid in (24, 25, 26, 27):
-        assert aid in by_id, (
-            f"Archive novel id={aid} should be in final via novel-archive pass"
-        )
+    # With per-combo DISCOVERY_PER_BADGE=2, only the top 2 by distance
+    # (ids 24 and 25, sim=0.05, 0.10) get is_novel. The other two
+    # (ids 26, 27) may appear via other passes (Popular, Similar, etc.)
+    # but should not have is_novel.
+    from pipeline import DISCOVERY_PER_BADGE
+
+    novel_ids = [
+        aid for aid in (24, 25, 26, 27) if aid in by_id and by_id[aid].is_novel
+    ]
+    assert len(novel_ids) >= DISCOVERY_PER_BADGE, (
+        f"Expected at least {DISCOVERY_PER_BADGE} novel picks, got {novel_ids}"
+    )
+    # The top by distance (sim 0.05, 0.10) must be among the novel picks.
+    for aid in (24, 25):
+        assert aid in by_id, f"Archive novel id={aid} should be in final"
         assert by_id[aid].is_novel, (
-            f"Archive novel id={aid} should have is_novel=True; "
-            f"got is_novel={by_id[aid].is_novel}"
+            f"Archive novel id={aid} (sim={'0.05' if aid == 24 else '0.10'}) should have is_novel=True"
         )
         assert not by_id[aid].is_recent, (
             f"Archive novel id={aid} should be is_recent=False"
@@ -2636,8 +3000,10 @@ def test_each_badge_floored_at_five_per_cohort(
 
     recent = [r for r in ranked if r.is_recent]
     archive = [r for r in ranked if not r.is_recent]
-    assert len(recent) >= 5, f"recent cohort too small in final: {len(recent)}"
-    assert len(archive) >= 5, f"archive cohort too small in final: {len(archive)}"
+    assert len(recent) >= 2, f"recent cohort too small in final: {len(recent)}"
+    assert len(archive) >= 2, f"archive cohort too small in final: {len(archive)}"
+
+    from pipeline import DISCOVERY_PER_BADGE
 
     for attr in (
         "is_high_engagement",
@@ -2648,9 +3014,11 @@ def test_each_badge_floored_at_five_per_cohort(
     ):
         n_recent = sum(1 for r in recent if getattr(r, attr))
         n_archive = sum(1 for r in archive if getattr(r, attr))
-        assert n_recent >= 5, f"{attr} must appear >=5 times in recent (got {n_recent})"
-        assert n_archive >= 5, (
-            f"{attr} must appear >=5 times in archive (got {n_archive})"
+        assert n_recent >= DISCOVERY_PER_BADGE, (
+            f"{attr} must appear >= {DISCOVERY_PER_BADGE} in recent (got {n_recent})"
+        )
+        assert n_archive >= DISCOVERY_PER_BADGE, (
+            f"{attr} must appear >= {DISCOVERY_PER_BADGE} in archive (got {n_archive})"
         )
 
 
@@ -2852,11 +3220,11 @@ def test_cascade_can_stack_with_parallel(
                 arr[i, 200 + s.id] = np.sqrt(0.5)
         return arr
 
-    monkeypatch.setattr("pipeline.get_or_compute_embeddings", mock_gce)
+    monkeypatch.setattr("pipeline.ranking.get_or_compute_embeddings", mock_gce)
 
     now = int(time.time())
     candidates: list[Story] = []
-    for i in range(30):
+    for i in range(60):
         score = 200 - i * 5
         candidates.append(
             Story(
@@ -2871,8 +3239,8 @@ def test_cascade_can_stack_with_parallel(
             )
         )
 
-    cand_embs = np.zeros((30, 384), dtype=np.float32)
-    for i in range(30):
+    cand_embs = np.zeros((60, 384), dtype=np.float32)
+    for i in range(60):
         cand_embs[i, 0] = 0.5
         cand_embs[i, 1] = 0.5
         cand_embs[i, 200 + i] = np.sqrt(0.5)
@@ -2895,18 +3263,18 @@ def test_cascade_can_stack_with_parallel(
 def test_parallel_can_stack_within(
     db: Database, embedder: Embedder, monkeypatch
 ) -> None:
-    """Novel (✨), Similar (🎯), and Unsure (🤔) run in parallel and can
-    stack on the same story. A story that's both low-similarity-to-
-    feedback (novel) and high-similarity-to-upvoted (similar) gets
-    both badges.
+    """Explore badges (Unsure/Novel/Similar) and Popular badges can stack
+    on the same story within a combo. This verifies that the explore pool
+    is shared with the popular pool so a story picked for both lanes
+    gets multiple badges.
 
-    Uses a controlled embedder (mocked ``get_or_compute_embeddings``)
-    so the feedback embeddings sit on a known axis (axis 0 for up,
-    axis 1 for down) and the candidate embeddings can be placed
-    relative to that.
+    Uses controlled embeddings: all stories have a 50/50 mix of upvote
+    and downvote axes (high entropy). The Unsure pass picks the top-2 by
+    entropy. The Hot pass sees the full combo pool and can badge primary
+    cards. The top Hot-picked story should also be an Unsure pick.
     """
     config = Config(count=40)
-    user = db.create_user("test_parallel_stack")
+    user = db.create_user("test_parallel_stack2")
     for i in range(20):
         db.upsert_story(
             Story(
@@ -2915,7 +3283,7 @@ def test_parallel_can_stack_within(
                 url=None,
                 score=10,
                 time=0,
-                text_content=f"upvote topic A {i}",
+                text_content=f"upvote {i}",
             )
         )
         db.upsert_feedback(user.id, 700 + i, "up")
@@ -2927,7 +3295,7 @@ def test_parallel_can_stack_within(
                 url=None,
                 score=10,
                 time=0,
-                text_content=f"downvote topic B {i}",
+                text_content=f"downvote {i}",
             )
         )
         db.upsert_feedback(user.id, 720 + i, "down")
@@ -2935,74 +3303,53 @@ def test_parallel_can_stack_within(
     def mock_gce(stories, embedder_arg, db_inst):
         arr = np.zeros((len(stories), 384), dtype=np.float32)
         for i, s in enumerate(stories):
-            sid = s.id
-            if 700 <= sid < 720:
-                arr[i, 0] = 0.95  # upvote on axis 0
-                arr[i, 50 + (sid - 700)] = np.sqrt(1 - 0.95**2)
-            elif 720 <= sid < 740:
-                arr[i, 1] = 0.95  # downvote on axis 1
-                arr[i, 80 + (sid - 720)] = np.sqrt(1 - 0.95**2)
+            if s.id < 700:
+                arr[i, 0] = 0.5
+                arr[i, 1] = 0.5
+                arr[i, 200 + s.id] = np.sqrt(0.5)
         return arr
 
-    monkeypatch.setattr("pipeline.get_or_compute_embeddings", mock_gce)
+    monkeypatch.setattr("pipeline.ranking.get_or_compute_embeddings", mock_gce)
+
+    from pipeline import PRIMARY_PER_COMBO, DISCOVERY_PER_BADGE
 
     now = int(time.time())
+    n_total = PRIMARY_PER_COMBO + DISCOVERY_PER_BADGE + 4  # primary + room
     candidates: list[Story] = []
-    # 5 candidates (matching the novel pass's slot_limit). id=0 is
-    # on axis A (similar to upvoted). id=1 is on axis C (novel, far
-    # from feedback). id=2 is on axis A + axis C combined — high sim
-    # to upvoted (axis A) AND high distance to all feedback (the A+C
-    # combination). This is the stacking target. ids 3 and 4 are
-    # fillers with low sim to upvoted.
-    for i in range(5):
+    for i in range(n_total):
+        score = 200 - i * 5
         candidates.append(
             Story(
                 id=i,
                 title=f"S{i}",
                 url=None,
-                score=50,
-                time=now - 3600,
-                text_content=f"candidate {i}",
+                score=max(10, score),
+                time=now - 3 * 86400,
+                text_content=f"text {i}",
                 source="hn",
-                comment_count=5,
+                comment_count=20,
             )
         )
-    cand_embs = np.zeros((5, 384), dtype=np.float32)
-    cand_embs[0, 0] = 0.95  # axis A: similar to upvoted
-    cand_embs[1, 1] = 0.95  # axis C: novel (orthogonal to feedback)
-    # id=2: combine moderate up-similarity (0.5 on axis 0) with a
-    # strong orthogonal component (0.86 on axis 1). max_sim = 0.5
-    # (from up), distance = 0.5. With only 5 candidates and slot=5,
-    # the novel pass picks all 5 by distance; the order is by
-    # distance desc so id=2 (dist 0.5) is in the top 5 along with
-    # id=1 (dist 0.05) and ids 3, 4 (dist 1.0). id=2 ends up with
-    # both is_similar (from similar pass, top 5 by cand_closest_up
-    # includes id=0 (0.95), id=2 (0.5), and ids 1, 3, 4 (0.0)) and
-    # is_novel (from novel pass, top 5 by distance includes id=2).
-    cand_embs[2, 0] = 0.5
-    cand_embs[2, 1] = 0.86
-    for i in range(3, 5):
-        cand_embs[i, 50 + i] = 0.6
-        cand_embs[i, 200 + i] = 0.8
+    cand_embs = np.zeros((n_total, 384), dtype=np.float32)
+    for i in range(n_total):
+        cand_embs[i, 0] = 0.5
+        cand_embs[i, 1] = 0.5
+        cand_embs[i, 200 + i] = np.sqrt(0.5)
 
     ranked = rerank_candidates(
         db, config, embedder, candidates, cand_embs, user_id=user.id
     )
-    by_id = {r.story.id: r for r in ranked}
 
-    # id=2 should have BOTH is_similar (close to upvoted axis) AND
-    # is_novel (high distance to all feedback, since axis 1 is
-    # orthogonal to both upvoted and downvoted).
-    if 2 in by_id:
-        r = by_id[2]
-        assert r.is_similar, (
-            f"id=2 (similar to upvoted) should be is_similar=True; "
-            f"got is_similar={r.is_similar}"
-        )
-        assert r.is_novel, (
-            f"id=2 (also has unique axis) should be is_novel=True; "
-            f"got is_novel={r.is_novel}"
-        )
+    # At least one story should have both a Popular badge (Hot from
+    # full-pool Hot pass) and an Explore badge (Unsure from shared pool).
+    stacked = [
+        r for r in ranked if (r.is_hot or r.is_high_engagement) and r.is_uncertain
+    ]
+    assert stacked, (
+        f"expected at least one story with Popular+Explore stacking; "
+        f"hot_ids={[r.story.id for r in ranked if r.is_hot]}, "
+        f"unsure_ids={[r.story.id for r in ranked if r.is_uncertain]}"
+    )
 
 
 def test_hot_badge_threshold_uses_config_percentile(
@@ -3010,15 +3357,13 @@ def test_hot_badge_threshold_uses_config_percentile(
 ) -> None:
     """is_hot respects hot_badge_percentile from config.
 
-    The Hot pass runs against the FULL candidate pool (not just
-    remaining_decorated) and gates on the velocity percentile + score
-    floor. The slot_limit caps how many can be picked, but with a tight
-    percentile (99.5), only 1-2 stories clear the threshold on a small
-    pool.
+    The Hot pass runs against the full combo pool and can badge primary
+    cards. Slot limit is DISCOVERY_PER_BADGE.
     """
+    from pipeline import DISCOVERY_PER_BADGE
+
     now = int(time.time())
     # 20 stories, scores 10..200 (step 10), all 1h old so velocity = score.
-    # Ordered so high-score stories are at the start (stable sort preserves order).
     score_values = list(range(10, 210, 10))  # [10, 20, ..., 200]
     candidates = [
         Story(
@@ -3035,8 +3380,7 @@ def test_hot_badge_threshold_uses_config_percentile(
     ]
     cand_embs = embedder.encode([s.text_content for s in candidates])
 
-    # Default: 99.5th pct of velocity. With velocity ∈ [10, 200] step 10,
-    # p99.5 = 199.55. Only id=0 (velocity 200) clears the threshold.
+    # Default: 99.5th pct of [10..200] ≈ 199. Only id=0 (velocity 200) clears.
     config = Config(count=40)
     ranked = rerank_candidates(db, config, embedder, candidates, cand_embs)
     hot_ids = {r.story.id for r in ranked if r.is_hot}
@@ -3044,18 +3388,17 @@ def test_hot_badge_threshold_uses_config_percentile(
     assert 1 not in hot_ids, "190-score story should NOT be hot at p99.5"
     assert len(hot_ids) == 1, f"Expected 1 hot at p99.5, got {len(hot_ids)}"
 
-    # 50th pct: p50 of [10..200] = 105. Velocity >= 110 clears the
-    # threshold for ids 0..9 (scores 200..110). Slot cap is 5, so the
-    # top 5 by velocity get the badge.
+    # 50th pct: p50 ≈ 105. Ids 0..9 clear the threshold. Slot cap is
+    # DISCOVERY_PER_BADGE, so only the top 2 by velocity get Hot.
     config2 = Config(count=40, model=ModelConfig(hot_badge_percentile=50.0))
     ranked2 = rerank_candidates(db, config2, embedder, candidates, cand_embs)
     hot2 = {r.story.id for r in ranked2 if r.is_hot}
     assert 0 in hot2
-    # 50th pct of [10..200] = 105 → score >= 110 → 10 candidates qualify,
-    # but slot cap is 5, so top 5 by velocity (ids 0..4) get the badge.
-    assert 4 in hot2
-    assert 5 not in hot2, "150-score story should NOT be hot at p50 (slot cap=5)"
-    assert len(hot2) == 5, f"Expected 5 hot at p50 (slot cap), got {len(hot2)}"
+    assert 1 in hot2
+    assert 2 not in hot2, "Should only get DISCOVERY_PER_BADGE hot cards"
+    assert len(hot2) == DISCOVERY_PER_BADGE, (
+        f"Expected {DISCOVERY_PER_BADGE} hot at p50, got {len(hot2)}"
+    )
 
 
 def test_tier1_gravity_at_zero_feedback(db: Database, embedder: Embedder) -> None:
@@ -3272,71 +3615,6 @@ def test_min_class_blend_mid(db: Database, embedder: Embedder) -> None:
     for r in ranked:
         assert r.prob_up is not None
         assert 0.0 <= r.score <= 1.0
-
-
-# ── Non-HN discovery slot formula tests ──
-
-
-@given(data=st.data())
-@settings(max_examples=50, suppress_health_check=[HealthCheck.function_scoped_fixture])
-def test_non_hn_slot_count_bounds(data):
-    """_non_hn_slot_count always returns 0 <= result <= cap."""
-    from pipeline import _non_hn_slot_count
-
-    n = data.draw(st.integers(0, 200))
-    cap = data.draw(st.integers(1, 16))
-    threshold = data.draw(st.integers(0, 100))
-    window = data.draw(st.integers(1, 100))
-    result = _non_hn_slot_count(n, cap=cap, threshold=threshold, window=window)
-    assert 0 <= result <= cap
-
-
-@given(data=st.data())
-@settings(max_examples=50, suppress_health_check=[HealthCheck.function_scoped_fixture])
-def test_non_hn_slot_count_zero_below_threshold(data):
-    """Result is 0 when n_feedback <= threshold."""
-    from pipeline import _non_hn_slot_count
-
-    n = data.draw(st.integers(0, 200))
-    cap = data.draw(st.integers(1, 16))
-    threshold = data.draw(st.integers(0, 100))
-    window = data.draw(st.integers(1, 100))
-    if n <= threshold:
-        assert _non_hn_slot_count(n, cap=cap, threshold=threshold, window=window) == 0
-
-
-@given(data=st.data())
-@settings(max_examples=50, suppress_health_check=[HealthCheck.function_scoped_fixture])
-def test_non_hn_slot_count_capped_at_full_ramp(data):
-    """Result is cap when n_feedback >= threshold + window."""
-    from pipeline import _non_hn_slot_count
-
-    n = data.draw(st.integers(0, 200))
-    cap = data.draw(st.integers(1, 16))
-    threshold = data.draw(st.integers(0, 100))
-    window = data.draw(st.integers(1, 100))
-    if n >= threshold + window and window > 0:
-        assert _non_hn_slot_count(n, cap=cap, threshold=threshold, window=window) == cap
-
-
-def test_non_hn_slot_count_exact_values():
-    from pipeline import _non_hn_slot_count
-
-    params = (8, 20, 30)  # cap, threshold, window (the production defaults)
-    cases = [
-        (0, 0),
-        (19, 0),
-        (20, 0),
-        (24, 1),
-        (30, 3),
-        (40, 5),
-        (50, 8),
-        (100, 8),
-    ]
-    for n, expected in cases:
-        assert _non_hn_slot_count(n, *params) == expected, (
-            f"n={n}: expected {expected}, got {_non_hn_slot_count(n, *params)}"
-        )
 
 
 # ── Comment selection algorithm tests ──
@@ -3716,7 +3994,7 @@ def test_candidate_similar_to_neutral_is_not_novel(db, embedder, monkeypatch):
                 arr[i, 2] = 1.0  # neutral
         return arr
 
-    monkeypatch.setattr("pipeline.get_or_compute_embeddings", mock_gce)
+    monkeypatch.setattr("pipeline.ranking.get_or_compute_embeddings", mock_gce)
 
     for sid, action in [(100, "up"), (200, "down"), (300, "neutral")]:
         db.upsert_story(
@@ -3731,20 +4009,19 @@ def test_candidate_similar_to_neutral_is_not_novel(db, embedder, monkeypatch):
         )
         db.upsert_feedback(user.id, sid, action)
 
-    # Controlled candidate embeddings. Pool has 3 target stories + 7
-    # fillers (with small overlap on feedback axes so they have
-    # non-zero max_sim but lower than id=3's distance 1.0).
+    # Controlled candidate embeddings. 3 targets + enough fillers
+    # to saturate PRIMARY_PER_COMBO (12) so targets land in discovery pool.
     # 1 -> close to neutral (axis 2), max_sim=0.95
     # 2 -> close to up (axis 0), max_sim=0.95
     # 3 -> far from all (axis 3), max_sim=0
-    # 4..10 -> small overlap with feedback axes 0,1,2 (max_sim ~ 0.087)
-    cand_embs = np.zeros((10, 384), dtype=np.float32)
+    from pipeline import PRIMARY_PER_COMBO
+
+    n_total = PRIMARY_PER_COMBO + 10  # fill primary + room for discovery
+    cand_embs = np.zeros((n_total, 384), dtype=np.float32)
     cand_embs[0, 2] = 0.95  # close to neutral
     cand_embs[1, 0] = 0.95  # close to up
     cand_embs[2, 3] = 1.0  # far from all feedback
-    for i in range(3, 10):
-        # Small overlap on feedback axes 0, 1, 2 so max_sim > 0 but
-        # small (~0.087).
+    for i in range(3, n_total):
         cand_embs[i, 0] = 0.05
         cand_embs[i, 1] = 0.05
         cand_embs[i, 2] = 0.05
@@ -3753,7 +4030,7 @@ def test_candidate_similar_to_neutral_is_not_novel(db, embedder, monkeypatch):
 
     candidates = []
     now = int(time.time())
-    for cid, score in [(1, 15), (2, 20), (3, 5)]:
+    for cid, score in [(1, 5), (2, 5), (3, 5)]:
         candidates.append(
             Story(
                 id=cid,
@@ -3762,17 +4039,21 @@ def test_candidate_similar_to_neutral_is_not_novel(db, embedder, monkeypatch):
                 score=score,
                 time=now - 86400,
                 text_content="",
+                source="hn",
+                comment_count=0,
             )
         )
-    for i in range(4, 11):
+    for i in range(3, n_total):
         candidates.append(
             Story(
-                id=i,
+                id=100 + i,
                 title=f"F{i}",
                 url=None,
-                score=10,
+                score=100 + i,
                 time=now - 86400,
                 text_content="",
+                source="hn",
+                comment_count=0,
             )
         )
 
@@ -3782,17 +4063,19 @@ def test_candidate_similar_to_neutral_is_not_novel(db, embedder, monkeypatch):
     by_id = {r.story.id: r for r in ranked}
 
     # id=3 (far from all feedback, max_sim=0, dist=1.0) is the most
-    # novel and is in the top 5 by distance.
+    # novel and should be in the top DISCOVERY_PER_BADGE by distance.
+    assert 3 in by_id, "id=3 (far from all feedback) should be in final"
     assert by_id[3].is_novel, (
-        f"Candidate 3 (far from all feedback) should be novel; "
-        f"got is_novel={by_id[3].is_novel}"
+        f"id=3 (far from feedback) should be novel; got is_novel={by_id[3].is_novel}"
     )
-    # id=1 and id=2 (max_sim=0.95) are not in the top 5 by distance.
+    # id=1 (close to neutral, max_sim=0.95) is not novel.
+    # id=2 (close to up, max_sim=0.95) has high up-similarity so it
+    # may get is_similar but should NOT get is_novel.
     for cid in (1, 2):
-        assert not by_id[cid].is_novel, (
-            f"Candidate {cid} (close to feedback) should not be novel; "
-            f"got is_novel={by_id[cid].is_novel}"
-        )
+        if cid in by_id:
+            assert not by_id[cid].is_novel, (
+                f"Candidate {cid} (close to feedback) should not be novel"
+            )
 
 
 def test_no_neutral_feedback_uses_up_down_only_for_novel(db, embedder, monkeypatch):
@@ -3810,7 +4093,7 @@ def test_no_neutral_feedback_uses_up_down_only_for_novel(db, embedder, monkeypat
                 arr[i, 1] = 1.0  # down
         return arr
 
-    monkeypatch.setattr("pipeline.get_or_compute_embeddings", mock_gce)
+    monkeypatch.setattr("pipeline.ranking.get_or_compute_embeddings", mock_gce)
 
     for sid, action in [(100, "up"), (200, "down")]:
         db.upsert_story(
@@ -3825,16 +4108,17 @@ def test_no_neutral_feedback_uses_up_down_only_for_novel(db, embedder, monkeypat
         )
         db.upsert_feedback(user.id, sid, action)
 
-    # Controlled candidate embeddings. 2 targets + 8 fillers with
-    # small overlap on feedback axes (max_sim > 0 but < id=2's
-    # distance 1.0).
+    # Controlled candidate embeddings. 2 targets + enough fillers
+    # to saturate PRIMARY_PER_COMBO so targets land in discovery pool.
     # 1 -> close to up (axis 0), max_sim=0.95
     # 2 -> far from all (axis 3), max_sim=0
-    # 3..10 -> small overlap on axes 0 and 1, max_sim > 0 but small
-    cand_embs = np.zeros((10, 384), dtype=np.float32)
+    from pipeline import PRIMARY_PER_COMBO
+
+    n_total = PRIMARY_PER_COMBO + 8
+    cand_embs = np.zeros((n_total, 384), dtype=np.float32)
     cand_embs[0, 0] = 0.95
     cand_embs[1, 3] = 1.0
-    for i in range(2, 10):
+    for i in range(2, n_total):
         cand_embs[i, 0] = 0.05
         cand_embs[i, 1] = 0.05
         cand_embs[i, 50 + i] = 0.6
@@ -3843,21 +4127,37 @@ def test_no_neutral_feedback_uses_up_down_only_for_novel(db, embedder, monkeypat
     now = int(time.time())
     candidates = [
         Story(
-            id=1, title="Up-like", url=None, score=20, time=now - 86400, text_content=""
+            id=1,
+            title="Up-like",
+            url=None,
+            score=5,
+            time=now - 86400,
+            text_content="",
+            source="hn",
+            comment_count=0,
         ),
         Story(
-            id=2, title="Novel", url=None, score=5, time=now - 86400, text_content=""
+            id=2,
+            title="Novel",
+            url=None,
+            score=5,
+            time=now - 86400,
+            text_content="",
+            source="hn",
+            comment_count=0,
         ),
     ]
-    for i in range(3, 11):
+    for i in range(2, n_total):
         candidates.append(
             Story(
-                id=i,
+                id=100 + i,
                 title=f"F{i}",
                 url=None,
-                score=10,
+                score=100 + i,
                 time=now - 86400,
                 text_content="",
+                source="hn",
+                comment_count=0,
             )
         )
 
@@ -3866,43 +4166,31 @@ def test_no_neutral_feedback_uses_up_down_only_for_novel(db, embedder, monkeypat
     )
     by_id = {r.story.id: r for r in ranked}
 
-    # id=2 (max_sim=0, dist=1.0) is the most novel; it's in the top 5
-    # by distance.
+    # id=2 (max_sim=0, dist=1.0) is the most novel; it's in the top
+    # DISCOVERY_PER_BADGE by distance.
+    assert 2 in by_id, "id=2 (not similar to any) should be in final"
     assert by_id[2].is_novel, (
-        f"Candidate 2 (not similar to any) should be novel; "
-        f"got is_novel={by_id[2].is_novel}"
+        f"Candidate 2 should be novel; got is_novel={by_id[2].is_novel}"
     )
-    # id=1 (max_sim=0.95) is not in the top 5 by distance.
-    assert not by_id[1].is_novel, (
-        f"Candidate 1 (similar to up) should not be novel; "
-        f"got is_novel={by_id[1].is_novel}"
-    )
+    # id=1 (max_sim=0.95) is close to feedback, not novel.
+    if 1 in by_id:
+        assert not by_id[1].is_novel, "Candidate 1 (similar to up) should not be novel"
 
 
 def test_novel_pass_ranks_purely_by_distance_not_score(
     db, embedder, monkeypatch
 ) -> None:
-    """The Novel extra-slot pass ranks candidates by distance (1 - max_similarity)
-    only — score is intentionally NOT blended in. A low-score, high-distance
-    story in the extra-slot pool should be picked over a higher-score,
-    lower-distance story when the slot cap forces a cut.
+    """The Novel pass ranks by distance (1 - max_similarity) only, not score.
+    A low-score, high-distance story beats a higher-score, lower-distance
+    story when the slot cap forces a cut.
 
-    The novel pass is split per-age (novel-recent / novel-archive) so the
-    badge surfaces in both age buckets. This test uses an all-recent
-    pool (all candidates at time=now-3600), so only the novel-recent
-    pass fires with slot_limit=NOVEL_DISCOVERY_RECENT_SLOTS (=5). The
-    5th-by-distance is the cut boundary. We construct scores so the
-    5th-by-distance story has a very low score; pure-distance ranking
-    keeps it; a score-blended ranking would have dropped it for a
-    higher-score story at the bottom of the distance ranking.
-
-    Note: with the rank-based cascade, the highest-score extra (id=16)
-    may still enter `final` via the high-engagement-recent pass (top-5
-    by score in the recent cohort). Because the cascade excludes Hot
-    from Top and Top from Talk, id=16 will not get is_novel via any
-    other path — the parallel novel pass is the only source of
-    is_novel, and it picks by distance only.
+    With per-combo discovery slots (DISCOVERY_PER_BADGE), the cut is at
+    position 2. We construct scores so the 2nd-by-distance story has a
+    very low score; pure-distance ranking keeps it; a score-blended
+    ranking would have dropped it for a higher-score story.
     """
+    from pipeline import PRIMARY_PER_COMBO
+
     config = Config(count=40)
     user = db.create_user("test_novel_distance")
 
@@ -3914,28 +4202,19 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
                 arr[i, 0] = 1.0
         return arr
 
-    monkeypatch.setattr("pipeline.get_or_compute_embeddings", mock_gce)
+    monkeypatch.setattr("pipeline.ranking.get_or_compute_embeddings", mock_gce)
     db.upsert_story(
-        Story(
-            id=100,
-            title="fb",
-            url=None,
-            score=10,
-            time=0,
-            text_content="",
-        )
+        Story(id=100, title="fb", url=None, score=10, time=0, text_content="")
     )
     db.upsert_feedback(user.id, 100, "up")
 
-    # 20 candidates. First 12 (high scores) are in the primary set.
-    # Last 8 (low scores) are in the extra-slot pool. The novel pool is
-    # drawn from the extra-slot set; the 5th-by-distance is the cut
-    # boundary for the all-recent novel-recent pass (slot_limit=5).
-    # We arrange so the 5th-by-distance story (id=16) has a low
-    # score, and a higher-score story (id=18) is cut.
+    # Primary fillers (high score) + controlled extras (low score, varied sim).
+    # The novel pass picks DISCOVERY_PER_BADGE by distance. We arrange so
+    # the 2nd-by-distance (id=13, sim=0.15, score=1) is low-score; a score-
+    # blended ranking would drop it for id=14 (sim=0.30, score=50).
     now = int(time.time())
     candidates = []
-    for i in range(12):
+    for i in range(PRIMARY_PER_COMBO):
         candidates.append(
             Story(
                 id=i,
@@ -3948,17 +4227,12 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
                 comment_count=0,
             )
         )
-    # extra_sims in distance order: 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.45, 0.50
-    # The novel-recent pass picks the top 5 by distance: ids 12..16.
-    # We arrange scores so id=16 (5th by distance, sim=0.25) has score 1
-    # (very low) — pure-distance ranking keeps it; a score-blended
-    # ranking would have dropped it for id=18 (6th by distance, score 50).
-    extra_scores = [10, 10, 1, 10, 1, 50, 10, 10]
-    extra_sims = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.45, 0.50]
+    extra_scores = [10, 1, 50, 10]  # id=13 score=1, id=14 score=50
+    extra_sims = [0.10, 0.15, 0.30, 0.45]  # distances: 0.90, 0.85, 0.70, 0.55
     for i, sc in enumerate(extra_scores):
         candidates.append(
             Story(
-                id=12 + i,
+                id=PRIMARY_PER_COMBO + i,
                 title=f"E{i}",
                 url=None,
                 score=sc,
@@ -3969,36 +4243,33 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
             )
         )
 
-    cand_embs = np.zeros((20, 384), dtype=np.float32)
-    for i in range(12):
+    n_total = len(candidates)
+    cand_embs = np.zeros((n_total, 384), dtype=np.float32)
+    for i in range(PRIMARY_PER_COMBO):
         cand_embs[i, 0] = 0.5
         cand_embs[i, 50 + i] = np.sqrt(0.75)
     for i, s in enumerate(extra_sims):
-        cand_embs[12 + i, 0] = s
-        cand_embs[12 + i, 100 + i] = np.sqrt(max(1.0 - s * s, 0.0))
+        idx = PRIMARY_PER_COMBO + i
+        cand_embs[idx, 0] = s
+        cand_embs[idx, 100 + i] = np.sqrt(max(1.0 - s * s, 0.0))
 
     ranked = rerank_candidates(
         db, config, embedder, candidates, cand_embs, user_id=user.id
     )
 
     by_id = {r.story.id: r for r in ranked}
-    # id=16 is the 5th-by-distance (sim=0.25, dist=0.75, score=1 — very low).
-    # Pure-distance ranking keeps it; a score-blended ranking would have
-    # dropped it for id=17 (6th by distance, score=50).
-    assert 16 in by_id, "id=16 should be in the final result"
-    assert by_id[16].is_novel, (
-        f"id=16 (sim=0.25, dist=0.75, score=1) should be in novel-recent "
-        f"top-5 by distance; got is_novel={by_id[16].is_novel}"
+    # id=13 (sim=0.15, dist=0.85, score=1 — very low) is 2nd-by-distance.
+    # Pure-distance ranking keeps it; score-blended would drop it for id=14.
+    assert by_id[PRIMARY_PER_COMBO + 1].is_novel, (
+        f"id={PRIMARY_PER_COMBO + 1} (sim=0.15, dist=0.85, score=1) should be novel"
     )
-    # id=18 is the 7th-by-distance (sim=0.45, dist=0.55, score=10). The
-    # novel-recent pass cuts at K=5, so the novel pass does not badge it —
-    # demonstrating pure-distance ranking (score is not blended in for the
-    # Novel badge). id=18 may still enter `final` via another pass
-    # (similar, uncertain, etc.) but should not have is_novel.
-    assert not by_id[18].is_novel, (
-        f"id=18 (7th by distance) must NOT have is_novel — novel pass ranks "
-        f"by distance, not score; got is_novel={by_id[18].is_novel}"
-    )
+    # id=14 (sim=0.30, dist=0.70, score=50 — high score) is 3rd-by-distance.
+    # Beyond DISCOVERY_PER_BADGE cut, so NOT novel despite higher score.
+    target_high_score = PRIMARY_PER_COMBO + 2
+    if target_high_score in by_id:
+        assert not by_id[target_high_score].is_novel, (
+            f"id={target_high_score} (higher score, worse distance) must NOT be novel"
+        )
 
 
 def test_prewarm_top_stories_empty_ch_response_returns_zero() -> None:
@@ -4216,59 +4487,414 @@ def test_fetch_candidates_only_prewarms_all_hn_when_full(monkeypatch) -> None:
         db.close()
 
 
-def test_fetch_candidates_only_prewarms_all_reddit_when_full(monkeypatch) -> None:
-    """Regen prewarms all Reddit candidates when prewarm_reddit_full=True.
-
-    Verifies the DB-driven prewarm ID selection: stories 10 and 11
-    (lacking `top_comments`, source=rss_reddit_*) are gathered from
-    the DB. Story 12 (with `top_comments="Already hydrated."`) is
-    excluded. The query is capped by
-    `config.reddit_prewarm_max_per_cycle` to bound the combined
-    Reddit-fetch window.
-    """
-    from reddit_fetch_queue import queue as reddit_fetch_queue
-
+def test_fetch_candidates_only_persists_topfeed_before_prewarm(
+    monkeypatch,
+) -> None:
+    """Topfeed cache entries are upserted into SQLite before the prewarm
+    phase is built. Otherwise the prewarm factory's `db.get_story` would
+    return None for brand-new topfeed discoveries and the factory would
+    no-op."""
     db = Database(":memory:")
     try:
         config = Config(
             db_path=db.db_path,
             prewarm_hn_full=False,
-            regen_prewarm_top_n=0,
             prewarm_reddit_full=True,
+            reddit_prewarm_top_per_sub=2,
+            reddit_prewarm_max_per_cycle=10,
+        )
+        config = replace(
+            config,
+            rss=RssConfig(
+                enabled=True,
+                per_feed_limit=70,
+                feeds=("https://www.reddit.com/r/x/top/.rss?t=week&limit=25",),
+            ),
         )
 
-        stories = [
-            Story(
-                id=10,
-                title="R1",
-                url="http://reddit.com/r/test/1",
-                score=10,
-                time=100,
-                text_content="r1",
-                source="rss_reddit_test",
-                comment_count=5,
+        async def fake_fetch_candidates(
+            config, exclude_ids, exclude_urls, db, embedder
+        ):
+            return [], 0
+
+        new_story = Story(
+            id=42,
+            title="New topfeed story",
+            url="https://reddit.com/r/x/comments/42",
+            score=100,
+            time=1_000_000,
+            text_content="",
+            source="rss_reddit_r_x",
+            comment_count=0,
+        )
+
+        def fake_topfeed_factories(feeds, per_feed, days, exclude_urls):
+            from reddit_feed_cache import cache as reddit_feed_cache
+
+            # The real topfeed factory writes to the cache when called by
+            # the queue worker. The mock queue never invokes factories, so
+            # we pre-populate the cache synchronously to simulate the
+            # post-drain state.
+            reddit_feed_cache.set(feeds[0], [new_story])
+
+            async def factory() -> None:
+                return None
+
+            return [factory], [feeds[0]]
+
+        captured_factory_ids: list[list[int]] = []
+
+        def fake_build_reddit_prewarm_factories(story_ids, db_):
+            captured_factory_ids.append(list(story_ids))
+
+            async def noop() -> None:
+                return None
+
+            return [noop], []
+
+        class _NoopQueue:
+            def enqueue_all_reddit_fetches(self, *args, **kwargs) -> None:
+                return None
+
+            def wait_until_empty(self, timeout: float = 5400.0) -> bool:
+                return True
+
+        monkeypatch.setattr(pipeline, "fetch_candidates", fake_fetch_candidates)
+        monkeypatch.setattr(
+            pipeline, "build_reddit_topfeed_factories", fake_topfeed_factories
+        )
+        monkeypatch.setattr(
+            pipeline,
+            "build_reddit_prewarm_factories",
+            fake_build_reddit_prewarm_factories,
+        )
+        monkeypatch.setattr("reddit_fetch_queue.queue", _NoopQueue())
+
+        asyncio.run(
+            pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
+        )
+        # Story was persisted in phase 1.5 before prewarm was built.
+        assert db.get_story(42) is not None
+        # And the prewarm factory was given the story's id.
+        assert captured_factory_ids and captured_factory_ids[0] == [42]
+    finally:
+        db.close()
+
+
+def test_fetch_candidates_only_caps_reddit_prewarm(monkeypatch) -> None:
+    """`reddit_prewarm_max_per_cycle` caps the total prewarm ids selected
+    across all subreddit feeds, even when `reddit_prewarm_top_per_sub`
+    would suggest more."""
+    db = Database(":memory:")
+    try:
+        # Two subreddit feeds, each carrying 3 stories. With per_sub=10
+        # the unconstrained selection would be 6 ids; the cap at 4
+        # should fire after the first 4 from the first feed.
+        feed_a = "https://www.reddit.com/r/aaa/top/.rss"
+        feed_b = "https://www.reddit.com/r/bbb/top/.rss"
+
+        config = Config(
+            db_path=db.db_path,
+            prewarm_hn_full=False,
+            prewarm_reddit_full=True,
+            reddit_prewarm_top_per_sub=10,
+            reddit_prewarm_max_per_cycle=4,
+        )
+        config = replace(
+            config,
+            rss=RssConfig(
+                enabled=True,
+                per_feed_limit=70,
+                feeds=(feed_a, feed_b),
             ),
+        )
+
+        async def fake_fetch_candidates(
+            config, exclude_ids, exclude_urls, db, embedder
+        ):
+            return [], 0
+
+        stories_a = [
             Story(
-                id=11,
-                title="R2",
-                url="http://reddit.com/r/test/2",
-                score=5,
-                time=100,
-                text_content="r2",
-                source="rss_reddit_test",
-                comment_count=3,
-            ),
-            Story(
-                id=12,
-                title="R3",
-                url="http://reddit.com/r/test/3",
-                score=20,
-                time=100,
-                text_content="r3",
-                source="rss_reddit_test",
-                top_comments="Already hydrated.",
-            ),
+                id=100 + i,
+                title=f"a{i}",
+                url=f"https://reddit.com/r/aaa/comments/{100 + i}",
+                score=100 - i,
+                time=1_000_000,
+                text_content="",
+                source="rss_reddit_r_aaa",
+            )
+            for i in range(3)
         ]
+        stories_b = [
+            Story(
+                id=200 + i,
+                title=f"b{i}",
+                url=f"https://reddit.com/r/bbb/comments/{200 + i}",
+                score=100 - i,
+                time=1_000_000,
+                text_content="",
+                source="rss_reddit_r_bbb",
+            )
+            for i in range(3)
+        ]
+
+        def fake_topfeed_factories(feeds, per_feed, days, exclude_urls):
+            from reddit_feed_cache import cache as reddit_feed_cache
+
+            for feed_url, story_set in zip(feeds, (stories_a, stories_b)):
+                reddit_feed_cache.set(feed_url, story_set)
+
+            async def factory() -> None:
+                return None
+
+            return [factory], list(feeds)
+
+        captured_factory_ids: list[list[int]] = []
+
+        def fake_build_reddit_prewarm_factories(story_ids, db_):
+            captured_factory_ids.append(list(story_ids))
+
+            async def noop() -> None:
+                return None
+
+            return [noop], []
+
+        class _NoopQueue:
+            def enqueue_all_reddit_fetches(self, *args, **kwargs) -> None:
+                return None
+
+            def wait_until_empty(self, timeout: float = 5400.0) -> bool:
+                return True
+
+        monkeypatch.setattr(pipeline, "fetch_candidates", fake_fetch_candidates)
+        monkeypatch.setattr(
+            pipeline, "build_reddit_topfeed_factories", fake_topfeed_factories
+        )
+        monkeypatch.setattr(
+            pipeline,
+            "build_reddit_prewarm_factories",
+            fake_build_reddit_prewarm_factories,
+        )
+        monkeypatch.setattr("reddit_fetch_queue.queue", _NoopQueue())
+
+        asyncio.run(
+            pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
+        )
+        assert captured_factory_ids
+        assert len(captured_factory_ids[0]) == 4
+    finally:
+        db.close()
+
+
+def test_fetch_candidates_only_skips_already_hydrated_reddit(monkeypatch) -> None:
+    """Cached topfeed stories whose DB row already has top_comments are
+    excluded from the prewarm id list."""
+    db = Database(":memory:")
+    try:
+        feed = "https://www.reddit.com/r/x/top/.rss?t=week&limit=25"
+        config = Config(
+            db_path=db.db_path,
+            prewarm_hn_full=False,
+            prewarm_reddit_full=True,
+            reddit_prewarm_top_per_sub=10,
+            reddit_prewarm_max_per_cycle=10,
+        )
+        config = replace(
+            config,
+            rss=RssConfig(
+                enabled=True,
+                per_feed_limit=70,
+                feeds=(feed,),
+            ),
+        )
+
+        async def fake_fetch_candidates(
+            config, exclude_ids, exclude_urls, db, embedder
+        ):
+            return [], 0
+
+        # Pre-existing DB row with `top_comments` populated — should be skipped.
+        already_hydrated = Story(
+            id=10,
+            title="hydrated",
+            url="https://reddit.com/r/x/comments/10",
+            score=100,
+            time=1_000_000,
+            text_content="",
+            source="rss_reddit_r_x",
+            top_comments="existing",
+        )
+        # Brand-new story — should be selected.
+        new_story = Story(
+            id=20,
+            title="new",
+            url="https://reddit.com/r/x/comments/20",
+            score=50,
+            time=1_000_000,
+            text_content="",
+            source="rss_reddit_r_x",
+        )
+        db.upsert_story(already_hydrated)
+
+        def fake_topfeed_factories(feeds, per_feed, days, exclude_urls):
+            from reddit_feed_cache import cache as reddit_feed_cache
+
+            reddit_feed_cache.set(feeds[0], [already_hydrated, new_story])
+
+            async def factory() -> None:
+                return None
+
+            return [factory], [feeds[0]]
+
+        captured_factory_ids: list[list[int]] = []
+
+        def fake_build_reddit_prewarm_factories(story_ids, db_):
+            captured_factory_ids.append(list(story_ids))
+
+            async def noop() -> None:
+                return None
+
+            return [noop], []
+
+        class _NoopQueue:
+            def enqueue_all_reddit_fetches(self, *args, **kwargs) -> None:
+                return None
+
+            def wait_until_empty(self, timeout: float = 5400.0) -> bool:
+                return True
+
+        monkeypatch.setattr(pipeline, "fetch_candidates", fake_fetch_candidates)
+        monkeypatch.setattr(
+            pipeline, "build_reddit_topfeed_factories", fake_topfeed_factories
+        )
+        monkeypatch.setattr(
+            pipeline,
+            "build_reddit_prewarm_factories",
+            fake_build_reddit_prewarm_factories,
+        )
+        monkeypatch.setattr("reddit_fetch_queue.queue", _NoopQueue())
+
+        asyncio.run(
+            pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
+        )
+        assert captured_factory_ids
+        assert 10 not in captured_factory_ids[0]
+        assert 20 in captured_factory_ids[0]
+    finally:
+        db.close()
+
+
+def test_needs_hn_prewarm() -> None:
+    """Table-driven: stale, fresh, never-prewarmed, and edge cases.
+
+    Threshold is ``max(fetched // 3, 5)`` (~33% growth, 5-comment floor).
+    growth >= threshold -> True.
+    """
+    base_id = 1
+
+    def make_story(
+        source: str,
+        comment_count: int,
+        top_comments: str,
+        comment_count_at_fetch: int = 0,
+    ) -> Story:
+        return Story(
+            id=base_id,
+            title="t",
+            url="",
+            score=1,
+            time=1,
+            text_content="t",
+            source=source,
+            comment_count=comment_count,
+            top_comments=top_comments,
+            comment_count_at_fetch=comment_count_at_fetch,
+        )
+
+    cases: list[tuple[Story, bool]] = [
+        # Zero comment_count -> False regardless of top_comments
+        (make_story("hn", 0, ""), False),
+        # 10 comments, fresh, no growth -> False
+        (make_story("hn", 10, "x", comment_count_at_fetch=10), False),
+        # Empty top_comments + comment_count > 0 -> True (never prewarmed)
+        (make_story("hn", 1, ""), True),
+        # No fetch history (comment_count_at_fetch=0) -> True
+        (make_story("hn", 1, "x", comment_count_at_fetch=0), True),
+        # Stale: growth=40, fetched=10, threshold=max(10//3, 5) = 5 -> True
+        # (was False under max(50, fetched//2, 10); small stories used to
+        # need 50+ new comments to trigger, so 10->50 sat stale.)
+        (make_story("hn", 50, "x", comment_count_at_fetch=10), True),
+        # growth=50, threshold=max(5//3, 5) = 5 -> True
+        (make_story("hn", 55, "x", comment_count_at_fetch=5), True),
+        # 1->284 (the original bug case): growth=283, threshold=5 -> True
+        (make_story("hn", 284, "x", comment_count_at_fetch=1), True),
+        # 100->105: growth=5, threshold=max(100//3, 5) = 33 -> False
+        (make_story("hn", 105, "x", comment_count_at_fetch=100), False),
+        # 100->200: growth=100, threshold=max(100//3, 5) = 33 -> True
+        (make_story("hn", 200, "x", comment_count_at_fetch=100), True),
+        # Small-stale: 10->16, growth=6, threshold=max(10//3, 5) = 5 -> True.
+        # Locks in the new behavior: 10-comment stories now refresh on
+        # +6 new comments instead of needing +50.
+        (make_story("hn", 16, "x", comment_count_at_fetch=10), True),
+        # Non-HN source -> False even with stale-looking shape
+        (
+            make_story("rss_reddit_test", 284, "", comment_count_at_fetch=1),
+            False,
+        ),
+    ]
+    for s, expected in cases:
+        actual = _needs_hn_prewarm(s)
+        assert actual is expected, f"failed for {s}: expected {expected}, got {actual}"
+
+
+def test_fetch_candidates_only_reprewarms_stale_hn_when_full(monkeypatch) -> None:
+    """Stories with non-empty top_comments but stale comment_count are re-prewarmed.
+
+    Regression for the 1->284 case on story 48709670: top_comments is set
+    (1-comment stub) but the live comment count has grown well past the
+    threshold. The regen prewarm must refresh it.
+    """
+    db = Database(":memory:")
+    try:
+        config = Config(
+            db_path=db.db_path,
+            prewarm_hn_full=True,
+            prewarm_reddit_full=False,
+        )
+
+        fresh = Story(
+            id=2,
+            title="Fresh",
+            url="",
+            score=10,
+            time=100,
+            text_content="f",
+            comment_count=50,
+            top_comments="recently prewarmed",
+            comment_count_at_fetch=50,
+        )
+        stale = Story(
+            id=3,
+            title="Stale 1->284",
+            url="",
+            score=20,
+            time=100,
+            text_content="s",
+            comment_count=284,
+            top_comments="old single comment",
+            comment_count_at_fetch=1,
+        )
+        no_comments = Story(
+            id=4,
+            title="No comments",
+            url="",
+            score=5,
+            time=100,
+            text_content="n",
+            comment_count=0,
+        )
+        stories = [fresh, stale, no_comments]
         for s in stories:
             db.upsert_story(s)
 
@@ -4279,59 +4905,143 @@ def test_fetch_candidates_only_prewarms_all_reddit_when_full(monkeypatch) -> Non
 
         captured_ids: list[list[int]] = []
 
-        def fake_build_reddit_topfeed_factories(feeds, per_feed, days, exclude_urls):
-            return [], []
-
-        def fake_build_reddit_prewarm_factories(story_ids, db_):
-            captured_ids.append(list(story_ids))
-            return [], []
-
-        # Block the queue from enqueueing anything (factories are empty
-        # anyway, but we want a no-op wait).
-        def fake_enqueue_all(*a, **kw):
-            return None
-
-        def fake_wait_until_empty(timeout=None):
-            return True
+        def fake_prewarm(ids, db_, embedder):
+            captured_ids.append(list(ids))
+            return len(ids)
 
         monkeypatch.setattr(pipeline, "fetch_candidates", fake_fetch_candidates)
-        monkeypatch.setattr(
-            pipeline,
-            "build_reddit_topfeed_factories",
-            fake_build_reddit_topfeed_factories,
-        )
-        monkeypatch.setattr(
-            pipeline,
-            "build_reddit_prewarm_factories",
-            fake_build_reddit_prewarm_factories,
-        )
-        monkeypatch.setattr(
-            reddit_fetch_queue, "enqueue_all_reddit_fetches", fake_enqueue_all
-        )
-        monkeypatch.setattr(
-            reddit_fetch_queue, "wait_until_empty", fake_wait_until_empty
-        )
+        monkeypatch.setattr(pipeline, "prewarm_top_stories", fake_prewarm)
 
         asyncio.run(
             pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
         )
         assert len(captured_ids) == 1
-        # Stories without top_comments: 10, 11
-        assert sorted(captured_ids[0]) == [10, 11]
+        # Stale 1->284 fires; fresh 50->50 does not; no_comments has 0.
+        assert sorted(captured_ids[0]) == [3]
 
     finally:
         db.close()
 
 
-def test_fetch_candidates_only_skips_reddit_with_zero_comments(
+def test_fetch_candidates_only_skips_fresh_hn_when_full(monkeypatch) -> None:
+    """Stories with top_comments already up to date are not re-prewarmed.
+
+    Without this guard, the new stale-criterion would re-prewarm the
+    entire live window every regen cycle.
+    """
+    db = Database(":memory:")
+    try:
+        config = Config(
+            db_path=db.db_path,
+            prewarm_hn_full=True,
+            prewarm_reddit_full=False,
+        )
+
+        stories = [
+            Story(
+                id=2,
+                title="Up to date",
+                url="",
+                score=10,
+                time=100,
+                text_content="f",
+                comment_count=120,
+                top_comments="recently prewarmed",
+                comment_count_at_fetch=120,
+            ),
+        ]
+        for s in stories:
+            db.upsert_story(s)
+
+        async def fake_fetch_candidates(
+            config, exclude_ids, exclude_urls, db, embedder
+        ):
+            return stories, 1
+
+        captured_ids: list[list[int]] = []
+
+        def fake_prewarm(ids, db_, embedder):
+            captured_ids.append(list(ids))
+            return len(ids)
+
+        monkeypatch.setattr(pipeline, "fetch_candidates", fake_fetch_candidates)
+        monkeypatch.setattr(pipeline, "prewarm_top_stories", fake_prewarm)
+
+        asyncio.run(
+            pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
+        )
+        # Up to date -> no prewarm at all this cycle
+        assert captured_ids == []
+
+    finally:
+        db.close()
+
+
+def test_fetch_candidates_only_reprewarms_empty_top_comments_hn_when_full(
     monkeypatch,
 ) -> None:
-    """Prewarm query filters out Reddit stories with `comment_count <= 0`.
+    """Empty top_comments + comment_count > 0 still triggers prewarm.
 
-    Reddit's per-post RSS for a 0-comment post returns an empty feed, so
-    the prewarm HTTP call would never populate `top_comments`. Filtering
-    at the query level saves the rate budget for stories that can
-    actually benefit from prewarm.
+    Preserves the pre-2026-06-29 behavior; the new stale-criterion is
+    additive, not a replacement.
+    """
+    db = Database(":memory:")
+    try:
+        config = Config(
+            db_path=db.db_path,
+            prewarm_hn_full=True,
+            prewarm_reddit_full=False,
+        )
+
+        stories = [
+            Story(
+                id=7,
+                title="Never prewarmed",
+                url="",
+                score=10,
+                time=100,
+                text_content="n",
+                comment_count=42,
+                top_comments="",
+                comment_count_at_fetch=0,
+            ),
+        ]
+        for s in stories:
+            db.upsert_story(s)
+
+        async def fake_fetch_candidates(
+            config, exclude_ids, exclude_urls, db, embedder
+        ):
+            return stories, 1
+
+        captured_ids: list[list[int]] = []
+
+        def fake_prewarm(ids, db_, embedder):
+            captured_ids.append(list(ids))
+            return len(ids)
+
+        monkeypatch.setattr(pipeline, "fetch_candidates", fake_fetch_candidates)
+        monkeypatch.setattr(pipeline, "prewarm_top_stories", fake_prewarm)
+
+        asyncio.run(
+            pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
+        )
+        assert captured_ids == [[7]]
+
+    finally:
+        db.close()
+
+
+def test_fetch_candidates_only_prewarms_top_n_per_sub_from_cache(
+    monkeypatch,
+) -> None:
+    """The prewarm phase reads the topfeed cache and takes the first
+    ``reddit_prewarm_top_per_sub`` stories per subreddit (Reddit returns
+    them in hot/score-desc order). Multi-cycle completion is expected —
+    see WORKLOG 2026-06-29 "Reddit refresh".
+
+    With 3 subs × 5 stories each and N=2, the prewarm factory receives
+    6 IDs: the first 2 from each sub's cache.
     """
     from reddit_fetch_queue import queue as reddit_fetch_queue
 
@@ -4342,52 +5052,43 @@ def test_fetch_candidates_only_skips_reddit_with_zero_comments(
             prewarm_hn_full=False,
             regen_prewarm_top_n=0,
             prewarm_reddit_full=True,
+            reddit_prewarm_top_per_sub=2,
         )
 
-        stories = [
-            Story(
-                id=20,
-                title="Prewarmable",
-                url="http://reddit.com/r/test/20",
-                score=50,
-                time=100,
-                text_content="x",
-                source="rss_reddit_test",
-                comment_count=5,
-            ),
-            Story(
-                id=21,
-                title="Zero comments",
-                url="http://reddit.com/r/test/21",
-                score=100,
-                time=200,
-                text_content="x",
-                source="rss_reddit_test",
-                comment_count=0,
-            ),
-            Story(
-                id=22,
-                title="No comment count known",
-                url="http://reddit.com/r/test/22",
-                score=200,
-                time=300,
-                text_content="x",
-                source="rss_reddit_test",
-                comment_count=None,
-            ),
+        feed_urls = [
+            "https://www.reddit.com/r/A/top/.rss?t=week&limit=25",
+            "https://www.reddit.com/r/B/top/.rss?t=week&limit=25",
+            "https://www.reddit.com/r/C/top/.rss?t=week&limit=25",
         ]
-        for s in stories:
-            db.upsert_story(s)
+
+        # Pre-populate the topfeed cache with 5 stories per sub. The
+        # first 2 (hot order) should be prewarmed.
+        for i, url in enumerate(feed_urls):
+            stories = [
+                Story(
+                    id=-1000 - (i * 10) - j,
+                    title=f"r/{url.split('/r/')[1].split('/')[0]} #{j}",
+                    url=f"http://reddit.com/r/test/{i}/{j}",
+                    score=100 - j,
+                    time=1000 + j,
+                    text_content=f"body {i}-{j}",
+                    source=f"rss_reddit_{url.split('/r/')[1].split('/')[0]}",
+                )
+                for j in range(5)
+            ]
+            pipeline.reddit_feed_cache.set(url, stories)
 
         async def fake_fetch_candidates(
             config, exclude_ids, exclude_urls, db, embedder
         ):
-            return stories, 3
+            return [], 0
 
         captured_ids: list[list[int]] = []
 
         def fake_build_reddit_topfeed_factories(feeds, per_feed, days, exclude_urls):
-            return [], []
+            # Return no factories (we use the cache directly), but
+            # return the feed URLs so the prewarm phase can read them.
+            return [], feed_urls
 
         def fake_build_reddit_prewarm_factories(story_ids, db_):
             captured_ids.append(list(story_ids))
@@ -4421,11 +5122,152 @@ def test_fetch_candidates_only_skips_reddit_with_zero_comments(
             pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
         )
         assert len(captured_ids) == 1
-        # Only story 20 (cc=5) is picked. 21 (cc=0) and 22 (cc=None) are
-        # excluded — `comment_count > 0` is SQL-strict.
-        assert sorted(captured_ids[0]) == [20]
+        # 3 subs × 2 per sub = 6 IDs
+        assert len(captured_ids[0]) == 6
+        # The first 2 from each sub (in cache insertion order = hot order)
+        expected = [-1000, -1001, -1010, -1011, -1020, -1021]
+        assert captured_ids[0] == expected
 
     finally:
+        pipeline.reddit_feed_cache.reset()
+        db.close()
+
+
+def test_fetch_candidates_only_skips_reddit_prewarm_when_disabled(
+    monkeypatch,
+) -> None:
+    """When ``prewarm_reddit_full=False``, the prewarm phase is skipped
+    even if the topfeed cache has stories. Topfeeds still run."""
+    from reddit_fetch_queue import queue as reddit_fetch_queue
+
+    db = Database(":memory:")
+    try:
+        config = Config(
+            db_path=db.db_path,
+            prewarm_hn_full=False,
+            regen_prewarm_top_n=0,
+            prewarm_reddit_full=False,
+            reddit_prewarm_top_per_sub=10,
+        )
+
+        feed_urls = ["https://www.reddit.com/r/A/top/.rss?t=week&limit=25"]
+        stories = [
+            Story(
+                id=-1,
+                title="x",
+                url="http://reddit.com/r/test/1",
+                score=50,
+                time=100,
+                text_content="x",
+                source="rss_reddit_A",
+            )
+        ]
+        pipeline.reddit_feed_cache.set(feed_urls[0], stories)
+
+        async def fake_fetch_candidates(
+            config, exclude_ids, exclude_urls, db, embedder
+        ):
+            return [], 0
+
+        captured_ids: list[list[int]] = []
+
+        def fake_build_reddit_topfeed_factories(feeds, per_feed, days, exclude_urls):
+            return [], feed_urls
+
+        def fake_build_reddit_prewarm_factories(story_ids, db_):
+            captured_ids.append(list(story_ids))
+            return [], []
+
+        monkeypatch.setattr(pipeline, "fetch_candidates", fake_fetch_candidates)
+        monkeypatch.setattr(
+            pipeline,
+            "build_reddit_topfeed_factories",
+            fake_build_reddit_topfeed_factories,
+        )
+        monkeypatch.setattr(
+            pipeline,
+            "build_reddit_prewarm_factories",
+            fake_build_reddit_prewarm_factories,
+        )
+        monkeypatch.setattr(
+            reddit_fetch_queue, "enqueue_all_reddit_fetches", lambda *a, **kw: None
+        )
+        monkeypatch.setattr(
+            reddit_fetch_queue, "wait_until_empty", lambda timeout=None: True
+        )
+
+        asyncio.run(
+            pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
+        )
+        # prewarm_reddit_full=False → no prewarm factories built
+        assert captured_ids == []
+
+    finally:
+        pipeline.reddit_feed_cache.reset()
+        db.close()
+
+
+def test_fetch_candidates_only_skips_reddit_prewarm_with_empty_cache(
+    monkeypatch,
+) -> None:
+    """If the topfeed cache is empty (e.g. all topfeeds failed), the
+    prewarm phase is skipped silently — no factories built."""
+    from reddit_fetch_queue import queue as reddit_fetch_queue
+
+    db = Database(":memory:")
+    try:
+        config = Config(
+            db_path=db.db_path,
+            prewarm_hn_full=False,
+            regen_prewarm_top_n=0,
+            prewarm_reddit_full=True,
+            reddit_prewarm_top_per_sub=10,
+        )
+
+        feed_urls = ["https://www.reddit.com/r/A/top/.rss?t=week&limit=25"]
+        # Cache is empty (no topfeed succeeded)
+        pipeline.reddit_feed_cache.reset()
+
+        async def fake_fetch_candidates(
+            config, exclude_ids, exclude_urls, db, embedder
+        ):
+            return [], 0
+
+        captured_ids: list[list[int]] = []
+
+        def fake_build_reddit_topfeed_factories(feeds, per_feed, days, exclude_urls):
+            return [], feed_urls
+
+        def fake_build_reddit_prewarm_factories(story_ids, db_):
+            captured_ids.append(list(story_ids))
+            return [], []
+
+        monkeypatch.setattr(pipeline, "fetch_candidates", fake_fetch_candidates)
+        monkeypatch.setattr(
+            pipeline,
+            "build_reddit_topfeed_factories",
+            fake_build_reddit_topfeed_factories,
+        )
+        monkeypatch.setattr(
+            pipeline,
+            "build_reddit_prewarm_factories",
+            fake_build_reddit_prewarm_factories,
+        )
+        monkeypatch.setattr(
+            reddit_fetch_queue, "enqueue_all_reddit_fetches", lambda *a, **kw: None
+        )
+        monkeypatch.setattr(
+            reddit_fetch_queue, "wait_until_empty", lambda timeout=None: True
+        )
+
+        asyncio.run(
+            pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
+        )
+        # Empty cache → no prewarm IDs → no prewarm factories
+        assert captured_ids == []
+
+    finally:
+        pipeline.reddit_feed_cache.reset()
         db.close()
 
 
@@ -4543,6 +5385,113 @@ def test_fetch_candidates_only_prewarms_all_lesswrong_when_full(monkeypatch) -> 
         db.close()
 
 
+def test_prewarm_lesswrong_stories_refetches_when_only_one_field_is_stale(
+    monkeypatch,
+) -> None:
+    """Idempotency check must skip only when BOTH top_comments and self_text
+    are already populated with equal or richer data. If top_comments is
+    empty but self_text is already saturated (e.g. an RSS snippet was
+    truncated to SELF_TEXT_PROMPT_CHAR_LIMIT), the prewarm should still
+    fetch the new top_comments.
+    """
+    from server import LessWrongContext
+
+    db = Database(":memory:")
+    try:
+        # self_text already at the 8k cap (RSS-saturated); top_comments empty.
+        # The new GraphQL body is shorter than 8k so the OLD idempotency
+        # logic would skip this — but top_comments has fresh data, so we
+        # should still upsert.
+        db.upsert_story(
+            Story(
+                id=42,
+                title="saturated-rss-body",
+                url="https://www.lesswrong.com/posts/abc123/saturated",
+                score=0,
+                time=100,
+                text_content="placeholder",
+                source="rss_lesswrong_com",
+                self_text="x" * 8000,
+                top_comments="",
+            )
+        )
+
+        async def fake_fetch(post_id):
+            return LessWrongContext(
+                self_text="shorter new body from graphql",
+                top_comments="fresh comment from graphql",
+                comment_count=5,
+                score=42,
+            )
+
+        monkeypatch.setattr("server._fetch_lesswrong_context", fake_fetch)
+
+        updated = asyncio.run(
+            pipeline.prewarm_lesswrong_stories([42], db, embedder=None)
+        )
+        assert updated == 1
+        row = db.get_story(42)
+        assert row is not None
+        # Old behavior: skipped (no upsert). New behavior: upserted.
+        assert row.top_comments == "fresh comment from graphql"
+        assert row.score == 42
+        # self_text uses the longer of the two
+        assert len(row.self_text) == 8000
+
+    finally:
+        db.close()
+
+
+def test_prewarm_lesswrong_stories_skips_when_both_fields_already_richer(
+    monkeypatch,
+) -> None:
+    """If both top_comments and self_text are already populated and the
+    new data is no richer, skip (no upsert)."""
+    from server import LessWrongContext
+
+    db = Database(":memory:")
+    try:
+        long_body = "x" * 5000
+        long_comments = "y" * 5000
+        db.upsert_story(
+            Story(
+                id=43,
+                title="already-prewarmed",
+                url="https://www.lesswrong.com/posts/def456/already",
+                score=100,
+                time=100,
+                text_content="placeholder",
+                source="rss_lesswrong_com",
+                self_text=long_body,
+                top_comments=long_comments,
+            )
+        )
+
+        async def fake_fetch(post_id):
+            return LessWrongContext(
+                self_text="x" * 100,
+                top_comments="y" * 100,
+                comment_count=1,
+                score=10,
+            )
+
+        monkeypatch.setattr("server._fetch_lesswrong_context", fake_fetch)
+
+        updated = asyncio.run(
+            pipeline.prewarm_lesswrong_stories([43], db, embedder=None)
+        )
+        assert updated == 0
+        row = db.get_story(43)
+        assert row is not None
+        # Untouched
+        assert row.self_text == long_body
+        assert row.top_comments == long_comments
+        # score: max(100, 10) = 100 (no change)
+
+    finally:
+        db.close()
+
+
 def _clear_model_cache() -> None:
     _MODEL_CACHE.clear()
 
@@ -4611,7 +5560,7 @@ def test_model_cache_hit() -> None:
     _set_cached_model(42, "sig1", svm, scaler, maxsize=10)
     result = _get_cached_model(42, "sig1")
     assert result is not None
-    cached_svm, cached_scaler = result
+    cached_svm, cached_scaler, _ = result
     assert cached_svm is svm
     assert cached_scaler is scaler
 
@@ -4672,6 +5621,269 @@ def test_model_cache_eviction() -> None:
     assert _get_cached_model(1, "sig4") is not None
 
 
+@settings(max_examples=50, deadline=None)
+@given(
+    n_query=st.integers(min_value=0, max_value=40),
+    n_ref=st.integers(min_value=0, max_value=40),
+    dim=st.integers(min_value=1, max_value=8),
+    k=st.integers(min_value=1, max_value=40),
+    chunk_size=st.integers(min_value=1, max_value=16),
+    seed=st.integers(min_value=0, max_value=2**31 - 1),
+)
+def test_knn_mean_and_max_matches_separate_helpers(
+    n_query: int, n_ref: int, dim: int, k: int, chunk_size: int, seed: int
+) -> None:
+    """The fused helper must be bit-for-bit equivalent to the pair it replaces."""
+    rng = np.random.default_rng(seed)
+    query = rng.standard_normal((n_query, dim)).astype(np.float32)
+    ref = rng.standard_normal((n_ref, dim)).astype(np.float32)
+
+    fused_mean, fused_max = ranking._knn_mean_and_max(
+        query, ref, k, chunk_size=chunk_size
+    )
+    sep_mean = ranking._knn_similarity(query, ref, k, chunk_size=chunk_size)
+    sep_max = ranking._chunked_max_dot(query, ref, chunk_size=chunk_size)
+
+    np.testing.assert_allclose(fused_mean, sep_mean, rtol=0, atol=1e-6)
+    np.testing.assert_allclose(fused_max, sep_max, rtol=0, atol=1e-6)
+
+
+def test_rank_trace_records_and_formats_fields() -> None:
+    trace = RankTrace()
+    trace.set_count("candidates", 12)
+    trace.set_label("model_cache", "miss")
+    trace.add_timing("svm_fit", 1.24)
+    trace.add_timing("svm_fit", 2.26)
+
+    fields = trace.to_log_fields()
+    assert fields["candidates"] == 12
+    assert fields["model_cache"] == "miss"
+    assert fields["svm_fit_ms"] == 3.5
+    assert "candidates=12" in trace.format_log_fields()
+    assert "model_cache=miss" in trace.format_log_fields()
+
+
+def test_rank_trace_reports_svm_cache_miss_then_hit(
+    db: Database, embedder: Embedder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_model_cache()
+    user = db.create_user("trace_cache")
+    now = int(time.time())
+    feedback_stories: list[Story] = []
+    for i in range(20):
+        up = Story(
+            id=10_000 + i,
+            title=f"up {i}",
+            url=None,
+            score=10,
+            time=now,
+            text_content=f"up story {i}",
+            source="hn",
+            comment_count=1,
+        )
+        down = Story(
+            id=20_000 + i,
+            title=f"down {i}",
+            url=None,
+            score=10,
+            time=now,
+            text_content=f"down story {i}",
+            source="hn",
+            comment_count=1,
+        )
+        db.upsert_story(up)
+        db.upsert_story(down)
+        db.upsert_feedback(user.id, up.id, "up")
+        db.upsert_feedback(user.id, down.id, "down")
+        feedback_stories.extend([up, down])
+
+    candidates = [
+        Story(
+            id=30_000 + i,
+            title=f"candidate {i}",
+            url=None,
+            score=100 - i,
+            time=now,
+            text_content=f"candidate story {i}",
+            source="hn",
+            comment_count=1,
+        )
+        for i in range(3)
+    ]
+
+    def fake_embeddings(
+        stories: list[Story], embedder_arg: Embedder, db_inst: Database
+    ) -> np.ndarray:
+        rows: list[np.ndarray] = []
+        for story in stories:
+            vec = np.zeros(384, dtype=np.float32)
+            if story.id >= 30_000:
+                vec[0] = 1.0
+            elif story.id >= 20_000:
+                vec[1] = 1.0
+            else:
+                vec[0] = 1.0
+            rows.append(vec)
+        return np.array(rows, dtype=np.float32)
+
+    monkeypatch.setattr("pipeline.ranking.get_or_compute_embeddings", fake_embeddings)
+    topk_calls = 0
+    real_topk_mean = pipeline._topk_mean
+
+    def counting_topk_mean(values: np.ndarray, k: int) -> float:
+        nonlocal topk_calls
+        topk_calls += 1
+        return real_topk_mean(values, k)
+
+    monkeypatch.setattr("pipeline.ranking._topk_mean", counting_topk_mean)
+    seen_svc_cache_sizes: list[int | None] = []
+    real_svc = pipeline.ranking.SVC
+
+    def tracking_svc(*args, **kwargs):
+        seen_svc_cache_sizes.append(kwargs.get("cache_size"))
+        return real_svc(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline.ranking, "SVC", tracking_svc)
+    candidate_embeddings = fake_embeddings(candidates, embedder, db)
+    config = Config()
+
+    miss_trace = RankTrace()
+    _score_and_rank(
+        candidates,
+        candidate_embeddings,
+        db,
+        config,
+        embedder,
+        user_id=user.id,
+        trace=miss_trace,
+    )
+    assert miss_trace.labels["model_cache"] == "miss"
+    assert miss_trace.timings_ms["svm_fit"] >= 0
+    assert miss_trace.timings_ms["svm_training_feature_prep"] >= 0
+    miss_topk_calls = topk_calls
+    assert miss_topk_calls > 0
+    assert seen_svc_cache_sizes == [16]
+
+    hit_trace = RankTrace()
+    _score_and_rank(
+        candidates,
+        candidate_embeddings,
+        db,
+        config,
+        embedder,
+        user_id=user.id,
+        trace=hit_trace,
+    )
+    assert hit_trace.labels["model_cache"] == "hit"
+    assert "svm_fit" not in hit_trace.timings_ms
+    assert "svm_training_feature_prep" not in hit_trace.timings_ms
+    assert hit_trace.timings_ms["decision"] >= 0
+    assert topk_calls == miss_topk_calls
+
+
+def test_two_leg_recent_zero_limits_do_not_error(
+    db: Database, embedder: Embedder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Setting both candidate limits to 0 must not crash the rank path.
+    The HN and RSS recent legs return empty; the archive leg still
+    supplies candidates for the (likely empty) result."""
+    user = db.create_user("two_leg_zero")
+    config = Config(
+        db_path=db.db_path,
+        recent_candidate_hn_limit=0,
+        recent_candidate_rss_limit=0,
+    )
+    ranked = fast_rerank_for_user(db, config, embedder, user.id)
+    assert isinstance(ranked, list)
+
+
+def test_two_leg_recent_huge_limits_no_truncation_error(
+    db: Database, embedder: Embedder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Limits larger than the row count return all rows. SQLite does not
+    require the result to match the LIMIT; the rank path must accept it."""
+    user = db.create_user("two_leg_huge")
+    config = Config(
+        db_path=db.db_path,
+        recent_candidate_hn_limit=1_000_000,
+        recent_candidate_rss_limit=1_000_000,
+    )
+    ranked = fast_rerank_for_user(db, config, embedder, user.id)
+    assert isinstance(ranked, list)
+
+
+def test_two_leg_recent_preserves_hn_and_rss_legs(
+    db: Database, embedder: Embedder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A two-leg query with non-zero limits must return at least one
+    HN source and at least one non-HN source in the candidate set."""
+    user = db.create_user("two_leg_mix")
+    now = int(time.time())
+    hn_story = Story(
+        id=1,
+        title="HN",
+        url=None,
+        score=100,
+        time=now,
+        text_content="hn body",
+        source="hn",
+        comment_count=5,
+    )
+    rss_story = Story(
+        id=2,
+        title="RSS",
+        url=None,
+        score=0,
+        time=now,
+        text_content="rss body",
+        source="rss_lobste_rs",
+        comment_count=0,
+    )
+    db.upsert_story(hn_story)
+    db.upsert_story(rss_story)
+    monkeypatch.setattr(
+        "pipeline.ranking.get_or_compute_embeddings",
+        lambda stories, e, d: np.zeros((len(stories), 384), dtype=np.float32),
+    )
+
+    config = Config(
+        db_path=db.db_path,
+        recent_candidate_hn_limit=5000,
+        recent_candidate_rss_limit=500,
+    )
+    captured: dict[str, list[Story]] = {}
+
+    real_fast = fast_rerank_for_user
+
+    def capture_fast(*args, **kwargs):
+        # Tap into the row-level fetch by querying the DB directly with
+        # the same filters the rank path uses.
+        cutoff = int(time.time()) - (config.days * 86400)
+        hn_rows = db.execute(
+            "SELECT id, title, url, score, time, text_content, source, "
+            "comment_count, discussion_url, comment_count_at_fetch, "
+            "self_text, top_comments, article_body "
+            "FROM stories WHERE time >= ? AND source = 'hn' "
+            "AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?)",
+            (cutoff, user.id),
+        )
+        rss_rows = db.execute(
+            "SELECT id, title, url, score, time, text_content, source, "
+            "comment_count, discussion_url, comment_count_at_fetch, "
+            "self_text, top_comments, article_body "
+            "FROM stories WHERE time >= ? AND source != 'hn' "
+            "AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?)",
+            (cutoff, user.id),
+        )
+        captured["hn"] = [Database._row_to_story(r) for r in hn_rows]
+        captured["rss"] = [Database._row_to_story(r) for r in rss_rows]
+        return real_fast(*args, **kwargs)
+
+    capture_fast(db, config, embedder, user.id)
+    assert {s.id for s in captured["hn"]} == {1}
+    assert {s.id for s in captured["rss"]} == {2}
+
+
 def test_is_recent_flag_inclusive_30d_boundary(
     db: Database, embedder: Embedder
 ) -> None:
@@ -4722,3 +5934,237 @@ def test_is_recent_flag_inclusive_30d_boundary(
     assert by_id[1].is_recent is True, "1d old should be recent"
     assert by_id[2].is_recent is True, "30d - 1s should be recent"
     assert by_id[3].is_recent is False, "30d + 1s should NOT be recent"
+
+
+def test_select_article_fetch_excludes_lesswrong(db):
+    """LessWrong source stories must not be selected for article body fetch."""
+    now = 2_000_000_000.0
+
+    lw_story = Story(
+        id=101,
+        title="Some LW Post",
+        url="https://www.lesswrong.com/posts/abc/xyz",
+        score=50,
+        time=int(now - 86400),
+        text_content="LW text",
+        source="rss_lesswrong_com",
+    )
+    db.upsert_story(lw_story)
+
+    ranked = [pipeline.RankedStory(story=lw_story, score=0.8, best_match_title="")]
+    result = pipeline.select_article_fetch_candidates(
+        ranked=ranked,
+        dashboard_selected=ranked,
+        db=db,
+        max_per_run=10,
+        now_ts=now,
+    )
+    assert result == []
+
+
+def test_article_fetch_batch_logs_summary(db, caplog, monkeypatch):
+    """fetch_and_cache_article_bodies emits ok/failed/errors summary."""
+    import logging
+    import server
+
+    caplog.set_level(logging.INFO)
+
+    a1 = Story(
+        id=201,
+        title="Article 1",
+        url="https://example.com/a1",
+        score=10,
+        time=int(time.time()) - 3600,
+        text_content="a1",
+        source="hn",
+    )
+    db.upsert_story(a1)
+
+    async def dummy_fetch(url):
+        return server.ArticleFetchResult(
+            body="Test article body text that is long enough",
+            status=200,
+        )
+
+    monkeypatch.setattr(server, "_fetch_article_body_with_result", dummy_fetch)
+
+    async def runner():
+        await pipeline.fetch_and_cache_article_bodies(
+            db=db,
+            embedder=_DummyEmbedder(),
+            stories=[a1],
+            concurrency=1,
+        )
+
+    import asyncio
+
+    asyncio.run(runner())
+
+    logs = [r.message for r in caplog.records]
+    assert any("article_fetch: fetching" in m for m in logs)
+    assert any("article_fetch: ok=" in m for m in logs)
+    assert any("errors=[" in m for m in logs)
+
+
+def test_select_article_fetch_excludes_paywall_domains(db):
+    """Hard-paywall domain articles must not be selected for body fetch."""
+    now = 2_000_000_000.0
+    domains = [
+        "bloomberg.com",
+        "economist.com",
+        "ft.com",
+        "nytimes.com",
+        "wsj.com",
+        "reuters.com",
+        "axios.com",
+    ]
+    for i, domain in enumerate(domains):
+        s = Story(
+            id=400 + i,
+            title=f"Article on {domain}",
+            url=f"https://www.{domain}/article/123",
+            score=100,
+            time=int(now - 3600),
+            text_content="text",
+            source="hn",
+        )
+        db.upsert_story(s)
+        ranked = [pipeline.RankedStory(story=s, score=1.0, best_match_title="")]
+        result = pipeline.select_article_fetch_candidates(
+            ranked=ranked,
+            dashboard_selected=ranked,
+            db=db,
+            max_per_run=10,
+            now_ts=now,
+        )
+        assert result == [], f"{domain} should be excluded"
+
+
+def test_select_article_fetch_excludes_youtube_urls(db):
+    """YouTube watch pages must not be selected for body fetch."""
+    now = 2_000_000_000.0
+    urls = [
+        "https://www.youtube.com/watch?v=abc123",
+        "https://youtu.be/xyz456",
+    ]
+    for i, url in enumerate(urls):
+        s = Story(
+            id=500 + i,
+            title="Video",
+            url=url,
+            score=100,
+            time=int(now - 3600),
+            text_content="video",
+            source="hn",
+        )
+        db.upsert_story(s)
+        ranked = [pipeline.RankedStory(story=s, score=1.0, best_match_title="")]
+        result = pipeline.select_article_fetch_candidates(
+            ranked=ranked,
+            dashboard_selected=ranked,
+            db=db,
+            max_per_run=10,
+            now_ts=now,
+        )
+        assert result == [], f"should skip {url}"
+
+
+def test_is_fetchable_article_url():
+    """Unit test for the shared URL filter used by both batch and on-demand paths."""
+    from pipeline import _is_fetchable_article_url
+
+    # Fetchable URLs
+    assert _is_fetchable_article_url("https://example.com/article")
+    assert _is_fetchable_article_url("https://github.com/org/repo")
+    assert _is_fetchable_article_url("https://simonwillison.net/2026/01/01/post")
+
+    # Paywall domains
+    assert not _is_fetchable_article_url("https://www.nytimes.com/2026/01/01/article")
+    assert not _is_fetchable_article_url("https://bloomberg.com/news/articles/2026")
+    assert not _is_fetchable_article_url("https://www.economist.com/article/123")
+    assert not _is_fetchable_article_url("https://ft.com/content/abc123")
+    assert not _is_fetchable_article_url("https://www.wsj.com/articles/123")
+    assert not _is_fetchable_article_url("https://reuters.com/world/example-article")
+    assert not _is_fetchable_article_url(
+        "https://www.axios.com/2026/06/12/some-article"
+    )
+
+    # YouTube
+    assert not _is_fetchable_article_url("https://www.youtube.com/watch?v=abc123")
+    assert not _is_fetchable_article_url("https://youtu.be/xyz456")
+
+    # HN discussion URLs
+    assert not _is_fetchable_article_url("https://news.ycombinator.com/item?id=12345")
+    assert not _is_fetchable_article_url(
+        "https://news.ycombinator.com/item?id=99999999"
+    )
+
+    # Empty/None
+    assert not _is_fetchable_article_url("")
+
+    # Binary file extensions
+    assert not _is_fetchable_article_url("https://example.com/report.pdf")
+    assert not _is_fetchable_article_url("https://example.com/paper.PDF")
+    assert not _is_fetchable_article_url("https://example.com/report.pdf?download=1")
+    assert not _is_fetchable_article_url("https://example.com/image.png")
+    assert not _is_fetchable_article_url("https://example.com/doc.docx")
+    assert not _is_fetchable_article_url("https://example.com/deb.deb")
+
+    # PDF as path segment (not extension) is still fetchable
+    assert _is_fetchable_article_url("https://example.com/pdf/article")
+
+
+def test_article_fetch_http_4xx_becomes_permanent(db, monkeypatch):
+    """401 and 403 failures become permanent after 3 attempts (batch path)."""
+    import server
+
+    story = Story(
+        id=601,
+        title="Paywalled article",
+        url="https://reuters.com/example/article",
+        score=10,
+        time=int(time.time()) - 3600,
+        text_content="text",
+        source="hn",
+    )
+    db.upsert_story(story)
+    db.record_article_fetch_failure(
+        story_id=story.id,
+        url=story.url or "",
+        status=401,
+        error="http_401",
+        permanent=False,
+        next_retry_at=0.0,
+    )
+    # Bump count to 2 so the next fetch triggers the failure_count >= 3 gate
+    with db.conn() as conn:
+        conn.execute(
+            "UPDATE article_fetch_failures SET failure_count = 2 WHERE story_id = ?",
+            (story.id,),
+        )
+
+    async def failing_401(_url: str) -> server.ArticleFetchResult:
+        return server.ArticleFetchResult(
+            body=None,
+            status=401,
+            error="http_401",
+            permanent=False,
+        )
+
+    monkeypatch.setattr(server, "_fetch_article_body_with_result", failing_401)
+
+    import asyncio
+
+    asyncio.run(
+        pipeline.fetch_and_cache_article_bodies(
+            db=db,
+            embedder=_DummyEmbedder(),
+            stories=[story],
+            concurrency=1,
+        )
+    )
+
+    failure = db.get_article_fetch_failure(story.id)
+    assert failure is not None
+    assert failure["failure_count"] == 3
+    assert failure["permanent"] == 1

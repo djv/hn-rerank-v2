@@ -15,7 +15,10 @@ consuming rate-limit budget (per Reddit's published policy).
 from __future__ import annotations
 
 import logging
+import threading
 import time
+
+from cachetools import TTLCache
 
 from database import Story
 
@@ -30,49 +33,44 @@ class RedditFeedCache:
     def __init__(self) -> None:
         self.TTL_SECONDS: float = 14400.0
         self.MAX_ENTRIES: int = 100
+        self._lock = threading.Lock()
         self.reset()
 
     def reset(self) -> None:
-        self._cache: dict[str, tuple[float, list[Story]]] = {}
-        self._hits: int = 0
-        self._misses: int = 0
+        with self._lock:
+            self._cache: TTLCache[str, list[Story]] = TTLCache(
+                maxsize=self.MAX_ENTRIES,
+                ttl=self.TTL_SECONDS,
+                timer=lambda: time.time(),
+            )
+            self._hits: int = 0
+            self._misses: int = 0
 
     def get(self, feed_url: str) -> list[Story] | None:
-        now = time.time()
-        entry = self._cache.get(feed_url)
-        if entry is None:
-            self._misses += 1
-            logger.debug("reddit_feed_cache miss feed=%s", feed_url)
-            return None
-        cached_at, stories = entry
-        if now - cached_at > self.TTL_SECONDS:
-            del self._cache[feed_url]
-            self._misses += 1
-            logger.debug(
-                "reddit_feed_cache expired feed=%s age=%.0fs", feed_url, now - cached_at
-            )
-            return None
-        self._hits += 1
-        logger.debug(
-            "reddit_feed_cache hit feed=%s age=%.0fs", feed_url, now - cached_at
-        )
-        return list(stories)
+        with self._lock:
+            stories = self._cache.get(feed_url)
+            if stories is None:
+                self._misses += 1
+                logger.debug("reddit_feed_cache miss feed=%s", feed_url)
+                return None
+            self._hits += 1
+            logger.debug("reddit_feed_cache hit feed=%s", feed_url)
+            return list(stories)
 
     def set(self, feed_url: str, stories: list[Story]) -> None:
-        self._cache[feed_url] = (time.time(), list(stories))
-        if len(self._cache) > self.MAX_ENTRIES:
-            oldest_key = min(self._cache, key=lambda k: self._cache[k][0])
-            del self._cache[oldest_key]
-            logger.debug("reddit_feed_cache evicted feed=%s", oldest_key)
+        with self._lock:
+            self._cache[feed_url] = list(stories)
 
     def stats(self) -> CacheStats:
-        return {
-            "size": len(self._cache),
-            "hits": self._hits,
-            "misses": self._misses,
-            "max_entries": self.MAX_ENTRIES,
-            "ttl_seconds": self.TTL_SECONDS,
-        }
+        with self._lock:
+            self._cache.expire()
+            return {
+                "size": len(self._cache),
+                "hits": self._hits,
+                "misses": self._misses,
+                "max_entries": self.MAX_ENTRIES,
+                "ttl_seconds": self.TTL_SECONDS,
+            }
 
 
 cache: RedditFeedCache = RedditFeedCache()

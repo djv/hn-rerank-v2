@@ -20,7 +20,7 @@ class DummyEmbedder(Embedder):
     def __init__(self) -> None:
         pass
 
-    def encode(self, texts: list[str], batch_size: int = 32):
+    def encode(self, texts: list[str], batch_size: int | None = None):
         arr = np.zeros((len(texts), 384), dtype=np.float32)
         if len(texts):
             arr[:, 0] = 1.0

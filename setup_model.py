@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Download all-MiniLM-L6-v2 ONNX model, tokenizer files, and Pico CSS."""
 
+from __future__ import annotations
+
 import sys
 from pathlib import Path
 import httpx

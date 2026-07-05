@@ -33,7 +33,7 @@ from database import Database  # noqa: E402
 from pipeline import Config  # noqa: E402
 from scripts.eval_ranker_variants import (  # noqa: E402
     FoldData,
-    _load_recent_candidates,
+    _load_production_candidates,
     _make_fold,
     _scores_margin_3class,
     _metrics,
@@ -58,8 +58,8 @@ def main() -> None:
         raise RuntimeError("Missing default user token")
 
     window_days = args.window_days
-    cutoff_ts = int(time.time()) - window_days * 86400
-    candidates, cand_emb = _load_recent_candidates(db, cutoff_ts)
+    eval_config = replace(config, days=window_days)
+    candidates, cand_emb = _load_production_candidates(db, eval_config, user.id)
     cand_id_to_idx = {s.id: i for i, s in enumerate(candidates)}
     fb_stories, fb_labels, fb_vote_times = db.get_feedback_for_training(user_id=user.id)
     all_y = np.array(fb_labels, dtype=int)

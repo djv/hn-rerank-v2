@@ -16,3 +16,7 @@ Story title: {title}
 
 Comments:
 {comments_section}
+
+IMPORTANT: Summarize what commenters are saying, NOT what the article claims.
+If commenters reference article claims to disagree, describe their disagreement —
+do not re-summarize the article's claims as if they were discussion points.

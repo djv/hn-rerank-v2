@@ -13,6 +13,12 @@
       --pico-primary: #ff6600;
       --pico-primary-background: #ff6600;
       --pico-primary-hover: #e05a00;
+      --page-gutter: 1rem;
+      --vote-bar-height: 3.2rem;
+      --card-bottom-gap: 0.5rem;
+      --active-card-viewport-reserve: calc(var(--vote-bar-height) + var(--card-bottom-gap));
+      --fullscreen-gutter: 1rem;
+      --mobile-vote-bar-clearance: calc(3.75rem + env(safe-area-inset-bottom, 0px));
     }
     
     html {
@@ -20,10 +26,16 @@
     }
 
     body {
-      padding-top: 0.5rem;
-      padding-bottom: 1rem;
+      padding-top: 0;
+      padding-bottom: var(--page-gutter);
       overflow: hidden;
     }
+
+    body.fullscreen {
+      padding-block: var(--fullscreen-gutter);
+    }
+
+    main { padding-block: 0; }
 
     header {
       border-bottom: 1px solid var(--pico-muted-border-color);
@@ -48,9 +60,16 @@
     }
 
     .share-link {
-      margin-left: 0.5rem;
+      display: block;
+      margin: 0.2rem 0 0.65rem;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: var(--pico-primary);
       font-size: 0.75rem;
+      text-align: left;
       opacity: 0.6;
+      cursor: pointer;
     }
     .share-link:hover {
       opacity: 1;
@@ -96,57 +115,62 @@
     .queue-pill {
       display: block;
       margin-bottom: 0.65rem;
-      padding: 0.35rem 0.45rem;
+      padding: 0.45rem;
       border: 1px solid var(--pico-muted-border-color);
       border-radius: 4px;
       background: var(--pico-card-background-color);
       line-height: 1.25;
     }
     .queue-pill--bar {
-      padding: 0.4rem 0.45rem;
-    }
-    .refresh-progress {
-      display: flex;
-      gap: 3px;
-      height: 8px;
-    }
-    .refresh-segment {
-      flex: 1;
-      border-radius: 2px;
-      background: rgba(0, 0, 0, 0.12);
-      border: 1px solid rgba(0, 0, 0, 0.08);
-      transition: background-color 200ms ease;
-    }
-    .refresh-segment.filled {
-      background: var(--pico-primary);
-      border-color: var(--pico-primary);
-    }
-    .refresh-segment.next-refresh {
-      animation: pulse-segment 600ms ease-in-out 2;
-    }
-    @keyframes pulse-segment {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.45; }
+      padding: 0.45rem;
     }
 
-    .sort-tabs {
+    .toast {
+      position: fixed;
+      top: 0.75rem;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 1000;
+      max-width: min(90vw, 360px);
+      padding: 0.5rem 0.85rem;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.97);
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
+      color: #212529;
+      font-size: 0.85rem;
+      border: 1px solid rgba(0, 0, 0, 0.12);
+      text-align: center;
+    }
+    .toast[hidden] { display: none; }
+    .toast--error {
+      border-color: #dc3545;
+      color: #842029;
+    }
+    .toast--info {
+      border-color: rgba(0, 0, 0, 0.12);
+    }
+
+    .tab-bar {
+      display: flex;
+      gap: 0;
+      margin-bottom: 0.6rem;
+    }
+
+    .tab-bar--sort {
       display: grid;
       grid-template-columns: 1fr;
       gap: 0.35rem;
       margin-bottom: 0.3rem;
     }
 
-    .age-tabs {
-      display: grid;
-      grid-template-columns: 1fr;
-      gap: 0.35rem;
-      margin-bottom: 0.6rem;
+    .tab-bar--grid-4 {
+      grid-template-columns: repeat(4, 1fr);
     }
 
-    .sort-tab, .age-tab {
+    .tab-btn {
       width: 100%;
       margin: 0;
-      padding: 0.4rem 0.6rem;
+      padding: 0.6rem;
       border-radius: 6px;
       font-size: 0.85rem;
       font-weight: 500;
@@ -159,56 +183,42 @@
       transition: all 0.15s;
     }
 
-    .sort-tab:hover, .age-tab:hover {
+    .tab-btn:hover {
       background: color-mix(in srgb, var(--pico-primary) 8%, var(--pico-card-background-color));
       border-color: var(--pico-primary);
       color: var(--pico-color);
     }
 
-    .sort-tab.active, .age-tab.active {
+    .tab-btn.active {
       background: var(--pico-primary);
       color: white;
       border-color: var(--pico-primary);
       font-weight: 600;
     }
 
-    .source-tabs {
-      display: flex;
-      gap: 0;
-      margin-bottom: 0.6rem;
-    }
-    .source-tab {
+    .tab-btn--segmented {
       flex: 1;
-      margin: 0;
-      padding: 0.35rem 0.3rem;
+      padding: 0.3rem;
       border-radius: 0;
       font-size: 0.75rem;
-      font-weight: 500;
-      line-height: 1.2;
-      text-align: center;
       white-space: nowrap;
-      background: var(--pico-card-background-color);
-      border: 1px solid var(--pico-muted-border-color);
       border-right: none;
-      color: var(--pico-muted-color);
-      cursor: pointer;
-      transition: all 0.15s;
     }
-    .source-tab:first-child {
+    .tab-btn--segmented:first-child {
       border-top-left-radius: 6px;
       border-bottom-left-radius: 6px;
     }
-    .source-tab:last-child {
+    .tab-btn--segmented:last-child {
       border-top-right-radius: 6px;
       border-bottom-right-radius: 6px;
       border-right: 1px solid var(--pico-muted-border-color);
     }
-    .source-tab:hover {
+    .tab-btn--segmented:hover {
       background: color-mix(in srgb, #6c757d 12%, var(--pico-card-background-color));
       border-color: #6c757d;
       color: var(--pico-color);
     }
-    .source-tab.active {
+    .tab-btn--segmented.active {
       background: #6c757d;
       color: white;
       border-color: #6c757d;
@@ -319,7 +329,7 @@
       width: fit-content;
       min-width: min(60ch, 100%);
       max-width: 902px;
-      padding: 0.55rem 0.7rem 0.65rem 0.7rem;
+      padding: 0.5rem;
       border-radius: 6px;
       border: 1px solid var(--pico-card-border-color);
       border-left: 7px solid transparent;
@@ -333,11 +343,10 @@
     .story-card.active {
       display: block;
       cursor: default;
-      max-height: calc(100vh - 5rem);     /* fallback for older browsers */
-      max-height: calc(100dvh - 5rem);    /* preferred */
+      max-height: calc(100vh - var(--active-card-viewport-reserve));     /* fallback for older browsers; clears fixed vote bar */
+      max-height: calc(100dvh - var(--active-card-viewport-reserve));    /* preferred */
       min-height: 18rem;
       overflow: auto;
-      padding-bottom: 4rem;
     }
 
     .story-card.fade-out {
@@ -370,76 +379,49 @@
       color: #f8f9fa;
     }
 
-    .uncertain-badge {
+    .badge {
       display: inline-block;
       padding: 0.05rem 0.35rem;
       border-radius: 3px;
       font-weight: 600;
       font-size: 0.7rem;
-      background: hsl(280, 50%, 25%); /* Deep plum/purple for uncertainty */
+      line-height: 1.2;
+    }
+
+    .badge--uncertain {
+      background: hsl(280, 50%, 25%);
       color: hsl(280, 80%, 90%);
       border: 1px solid hsl(280, 50%, 35%);
-      line-height: 1.2;
     }
 
-    .novel-badge {
-      display: inline-block;
-      padding: 0.05rem 0.35rem;
-      border-radius: 3px;
-      font-weight: 600;
-      font-size: 0.7rem;
-      background: hsl(170, 50%, 25%); /* Deep teal for novelty */
+    .badge--novel {
+      background: hsl(170, 50%, 25%);
       color: hsl(170, 80%, 90%);
       border: 1px solid hsl(170, 50%, 35%);
-      line-height: 1.2;
     }
 
-    .discussion-rich-badge {
-      display: inline-block;
-      padding: 0.05rem 0.35rem;
-      border-radius: 3px;
-      font-weight: 600;
-      font-size: 0.7rem;
+    .badge--talk {
       background: hsl(35, 60%, 25%);
       color: hsl(35, 80%, 90%);
       border: 1px solid hsl(35, 60%, 35%);
-      line-height: 1.2;
     }
 
-    .high-engagement-badge {
-      display: inline-block;
-      padding: 0.05rem 0.35rem;
-      border-radius: 3px;
-      font-weight: 600;
-      font-size: 0.7rem;
+    .badge--top {
       background: hsl(45, 60%, 25%);
       color: hsl(45, 80%, 90%);
       border: 1px solid hsl(45, 60%, 35%);
-      line-height: 1.2;
     }
 
-    .hot-badge {
-      display: inline-block;
-      padding: 0.05rem 0.35rem;
-      border-radius: 3px;
-      font-weight: 600;
-      font-size: 0.7rem;
+    .badge--hot {
       background: hsl(15, 60%, 25%);
       color: hsl(15, 80%, 90%);
       border: 1px solid hsl(15, 60%, 35%);
-      line-height: 1.2;
     }
 
-    .similar-badge {
-      display: inline-block;
-      padding: 0.05rem 0.35rem;
-      border-radius: 3px;
-      font-weight: 600;
-      font-size: 0.7rem;
-      background: hsl(210, 50%, 25%); /* Steel/Slate Blue for similar stories */
+    .badge--similar {
+      background: hsl(210, 50%, 25%);
       color: hsl(210, 80%, 90%);
       border: 1px solid hsl(210, 50%, 35%);
-      line-height: 1.2;
     }
 
     .story-card.enriched {
@@ -471,6 +453,10 @@
 
     .tldr-detail-content {
       cursor: default;
+      margin-top: 0.4rem;
+      padding-top: 0.4rem;
+      border-top: 1px dashed var(--pico-muted-border-color);
+      font-size: 0.85rem;
       overflow-wrap: anywhere;
     }
 
@@ -510,25 +496,44 @@
       padding-bottom: calc(0.5rem + env(safe-area-inset-bottom, 0));
       display: flex;
       align-items: center;
-      justify-content: space-between;
+      justify-content: flex-end;
       gap: 0.6rem;
       max-width: 1280px;
       margin: 0 auto;
     }
     .vote-bar[hidden] { display: none; }
 
-    .vote-bar .refresh-wrapper {
-      display: flex;
-      flex-direction: column;
-      gap: 0.3rem;
-      align-items: flex-start;
+    .filter-toggle-btn {
+      display: none;
+      margin-right: auto;
     }
 
-    .vote-bar .refresh-label {
-      font-size: 0.75rem;
-      color: var(--pico-muted-color);
-      white-space: nowrap;
-      font-weight: 500;
+    .fullscreen .swipe-side { display: none; }
+    .fullscreen .vote-bar { display: none; }
+    .fullscreen .swipe-shell {
+      height: calc(100vh - var(--fullscreen-gutter) - var(--fullscreen-gutter));
+      height: calc(100dvh - var(--fullscreen-gutter) - var(--fullscreen-gutter));
+      padding-block: 0;
+      display: flex;
+      flex-direction: column;
+    }
+    .fullscreen .swipe-layout,
+    .fullscreen #stories {
+      flex: 1;
+      min-height: 0;
+    }
+    .fullscreen .swipe-layout {
+      align-items: stretch;
+    }
+    .fullscreen #stories {
+      display: flex;
+      flex-direction: column;
+    }
+    .fullscreen .story-card.active {
+      height: 100%;
+      max-height: 100%;
+      margin-bottom: 0;
+      overflow: auto;
     }
 
     .vote-counts {
@@ -538,7 +543,6 @@
       font-weight: 500;
       color: var(--pico-muted-color);
       align-items: center;
-      margin-left: auto;
     }
     .vote-count {
       display: inline-flex;
@@ -553,14 +557,8 @@
     .vote-count--neutral { color: #ffc107; }
     .vote-count--down { color: #dc3545; }
 
-    .vote-bar .refresh-progress {
-      display: flex;
-      gap: 3px;
-      width: 120px;
-      height: 6px;
-    }
-
-    .feedback-btn {
+    .feedback-btn,
+    .filter-toggle-btn {
       padding: 0.5rem 0.9rem;
       font-size: 0.95rem;
       font-weight: 500;
@@ -587,24 +585,6 @@
     .feedback-btn:active {
       transform: translateY(0);
       box-shadow: 0 1px 1px rgba(0, 0, 0, 0.1);
-    }
-
-    .tldr-detail-btn {
-      padding: 0.1rem 0.45rem;
-      font-size: 0.8rem;
-      border-radius: 4px;
-      background: transparent;
-      border: 1px solid var(--pico-muted-border-color);
-      color: var(--pico-muted-color);
-      cursor: pointer;
-      line-height: 1.2;
-      transition: all 0.2s;
-      margin-bottom: 0;
-    }
-
-    .tldr-detail-btn:hover {
-      background: #2b3035;
-      color: white;
     }
 
     .tldr-detail-content h1,
@@ -767,40 +747,59 @@
       }
 
       .swipe-side {
-        position: static;
-        order: -1;
-        flex: 0 0 auto;
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        z-index: 99;
+        transform: translateY(-100%);
+        transition: transform 0.2s ease;
         width: 100%;
         max-width: 100%;
         max-height: none;
         display: flex;
         flex-direction: column;
         gap: 0.5rem;
-        padding-bottom: 0.4rem;
+        padding: 0.6rem 0.8rem 0.6rem 0.8rem;
+        background: var(--pico-card-background-color);
         border-bottom: 1px solid var(--pico-muted-border-color);
-        margin-bottom: 0.4rem;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+        overflow-y: auto;
       }
 
-      .sort-tabs {
+      .swipe-side.visible {
+        transform: translateY(0);
+      }
+
+      .tab-bar--sort {
         display: grid;
         grid-template-columns: repeat(4, 1fr);
         gap: 0.3rem;
         margin-bottom: 0;
       }
 
-      .age-tabs {
+      .tab-bar--segmented {
         display: grid;
-        grid-template-columns: repeat(2, 1fr);
         gap: 0.3rem;
         margin-bottom: 0;
       }
 
-      .source-tabs {
+      .tab-bar[data-filter="age"] {
+        grid-template-columns: repeat(2, 1fr);
+      }
+
+      .tab-bar[data-filter="source"] {
         grid-template-columns: repeat(3, 1fr);
-        margin-bottom: 0;
+      }
+
+      .tab-btn--segmented {
+        border-right: 1px solid var(--pico-muted-border-color);
+        border-radius: 6px;
       }
 
       .swipe-keys { display: none; }
+
+      .filter-toggle-btn { display: inline-flex; }
 
       .feedback-btn {
         padding: 0.6rem 0.9rem;
@@ -813,8 +812,8 @@
       }
 
       .swipe-shell {
-        height: calc(100vh - 1.5rem);    /* fallback for older browsers */
-        height: calc(100dvh - 1.5rem);   /* preferred: accounts for mobile URL bar */
+        height: calc(100vh - 1.5rem - var(--mobile-vote-bar-clearance));    /* fallback for older browsers */
+        height: calc(100dvh - 1.5rem - var(--mobile-vote-bar-clearance));   /* preferred: accounts for mobile URL bar */
         display: flex;
         flex-direction: column;
       }
@@ -838,147 +837,27 @@
   </style>
 </head>
 <body>
-  <div id="refresh-banner" class="refresh-banner" hidden>
-    <span id="refresh-banner-text">Ranking updated</span>
-    <button type="button" id="refresh-now-btn">Refresh</button>
-  </div>
+  <div id="toast" class="toast" hidden role="status" aria-live="polite"></div>
 
   <main class="container swipe-shell">
     <div class="swipe-layout">
-      <div id="stories">
-      {% for item in stories %}
-      <article class="story-card{% if item.story.text_content | length >= 1000 %} enriched{% endif %}"
-               data-story-id="{{ item.story.id }}"
-               data-score="{{ item.score }}"
-               data-time="{{ item.story.time }}"
-               data-source="{{ item.story.source }}"
-               data-is-hn="{{ '0' if item.is_non_hn else '1' }}"
-                data-sort-popular="{{ '1' if item.is_hot or item.is_high_engagement or item.is_discussion_rich else '0' }}"
-                data-sort-explore="{{ '1' if item.is_uncertain or item.is_similar or item.is_novel else '0' }}"
-                data-is-recent="{{ '1' if item.is_recent else '0' }}"
-               data-article-url="{{ item.story.url or '' }}"
-               data-comments-url="{{ item.story.discussion_url or '' }}">
-        <div class="story-header">
-          {% if item.is_uncertain %}
-          <span class="uncertain-badge" title="Model is highly uncertain about this story (high entropy distribution)">🤔 Unsure</span>
-          {% endif %}
-          {% if item.is_novel %}
-          <span class="novel-badge" title="Semantically distant from anything you've voted on">✨ Novel</span>
-          {% endif %}
-          {% if item.is_discussion_rich %}
-          <span class="discussion-rich-badge" title="High HN comment count for its age cohort">💬 Talk-worthy</span>
-          {% endif %}
-          {% if item.is_high_engagement %}
-          <span class="high-engagement-badge" title="High HN score for its age cohort">🏆 Top</span>
-          {% endif %}
-          {% if item.is_hot %}
-          <span class="hot-badge" title="Top {{ hot_badge_percentile }}% by engagement velocity (points/hour) and score ≥ 20">🔥 Hot</span>
-          {% endif %}
-          {% if item.is_similar %}
-          <span class="similar-badge" title="Most similar to your upvoted stories for its age cohort">🎯 Similar</span>
-          {% endif %}
-          
-          {% if item.story.source != "hn" %}
-          <span class="source-badge" title="{{ item.story.source }}">{{ item.story.source | source_label }}</span>
-          {% endif %}
-          
-          {% if item.story.score > 0 %}
-          <span>{{ item.story.score }} pts</span>
-          {% endif %}
-          
-          <span>{{ item.story.time | time_ago }}</span>
-          
-          {% if item.story.discussion_url %}
-          <a href="{{ item.story.discussion_url }}" target="_blank" rel="noopener">
-            💬{% if item.story.comment_count is not none %} {{ item.story.comment_count }}{% endif %} comments
-          </a>
-          {% endif %}
-
-        </div>
-
-        <h2 class="story-title">
-          <a href="{{ item.story.url or item.story.discussion_url }}" target="_blank" rel="noopener">
-            {{ item.story.title }}
-          </a>
-        </h2>
-
-        <div class="story-footer">
-          <button type="button" class="tldr-detail-btn" data-tldr-detail>TLDR</button>
-        </div>
-
-        {% if item.best_match_title %}
-        <p class="match-reason">Similar to: {{ item.best_match_title }}</p>
-        {% endif %}
-      </article>
+      <div id="stories"
+           data-user-id="{{ user_id or 0 }}"
+           data-user-token="{{ user_token or '' }}"
+           data-dashboard-version="{{ dashboard_version }}"
+           data-current-version="{{ dashboard_latest_version }}">
+      {% for card in cards %}
+      {% include "components/story_card.html" %}
       {% endfor %}
       </div>
 
-      <aside class="swipe-side" aria-label="Queue and keyboard controls">
-        <div class="sort-tabs" aria-label="Sort order">
-          <button type="button" class="sort-tab active" data-sort="recommended">Recommended</button>
-          <button type="button" class="sort-tab" data-sort="popular">Popular</button>
-          <button type="button" class="sort-tab" data-sort="explore">Explore</button>
-          <button type="button" class="sort-tab" data-sort="date">Date</button>
-        </div>
-        <div class="age-tabs" aria-label="Age filter">
-          <button type="button" class="age-tab active" data-age="recent">Recent</button>
-          <button type="button" class="age-tab" data-age="archive">Archive</button>
-        </div>
-        <div class="source-tabs" aria-label="Source filter">
-          <button type="button" class="source-tab active" data-source="mixed">Mixed</button>
-          <button type="button" class="source-tab" data-source="hn">HN</button>
-          <button type="button" class="source-tab" data-source="non-hn">Non-HN</button>
-        </div>
-        <div class="swipe-keys">
-          <span class="key-row" tabindex="0" data-key-action="up"><span class="key-hint">k</span> upvote</span>
-          <span class="key-row" tabindex="0" data-key-action="neutral"><span class="key-hint">l</span> skip (neutral)</span>
-          <span class="key-row" tabindex="0" data-key-action="down"><span class="key-hint">j</span> downvote</span>
-          <span class="key-row" tabindex="0" data-key-action="open-article"><span class="key-hint">o</span> open article</span>
-          <span class="key-row" tabindex="0" data-key-action="open-comments"><span class="key-hint">c</span> open comments</span>
-        </div>
-      </aside>
+      {% include "components/side_rail.html" %}
     </div>
 
   </main>
 
-  <div class="vote-bar" hidden>
-    <div class="refresh-wrapper">
-      <span class="refresh-label">Votes until refresh</span>
-      <div class="refresh-progress" aria-label="Ranking refresh progress" role="progressbar" aria-valuemin="0" aria-valuemax="5" aria-valuenow="0">
-        <span class="refresh-segment" data-segment="1"></span>
-        <span class="refresh-segment" data-segment="2"></span>
-        <span class="refresh-segment" data-segment="3"></span>
-        <span class="refresh-segment" data-segment="4"></span>
-        <span class="refresh-segment" data-segment="5"></span>
-      </div>
-    </div>
-    <div class="vote-counts" aria-label="Your all-time vote counts">
-      <span class="vote-count vote-count--up">
-        <span class="vote-count-glyph" aria-hidden="true">▲</span>
-        <span class="vote-count-num" data-vote-count="up">{{ vote_count_up or 0 }}</span>
-      </span>
-      <span class="vote-count vote-count--neutral">
-        <span class="vote-count-glyph" aria-hidden="true">●</span>
-        <span class="vote-count-num" data-vote-count="neutral">{{ vote_count_neutral or 0 }}</span>
-      </span>
-      <span class="vote-count vote-count--down">
-        <span class="vote-count-glyph" aria-hidden="true">▼</span>
-        <span class="vote-count-num" data-vote-count="down">{{ vote_count_down or 0 }}</span>
-      </span>
-    </div>
-    <div class="feedback-group">
-      <button class="feedback-btn" data-fb="up" title="Upvote">▲</button>
-      <button class="feedback-btn" data-fb="neutral" title="Skip (neutral)">✓</button>
-      <button class="feedback-btn" data-fb="down" title="Downvote">▼</button>
-    </div>
-  </div>
-
-    <div id="first-time-tip" class="first-time-tip-overlay" hidden aria-label="Keyboard shortcuts">
-      <div class="first-time-tip-inner">
-        <p><strong>Tip:</strong> arrows scroll inside the card. Press <kbd>k</kbd> to upvote, <kbd>j</kbd> to downvote, <kbd>l</kbd> to skip (neutral), <kbd>u</kbd> to undo. Press <kbd>o</kbd> to open the article, <kbd>c</kbd> to open the comments.</p>
-        <button type="button" class="first-time-tip-dismiss" data-dismiss-tip>Got it</button>
-      </div>
-    </div>
+  {% include "components/vote_bar.html" %}
+  {% include "components/first_time_tip.html" %}
 
   <script>
     const presentStoryIds = new Set();
@@ -989,58 +868,52 @@
 
     // Swipe deck state
     const storiesContainer = document.getElementById('stories');
-    const refreshBanner = document.getElementById('refresh-banner');
-    const refreshBannerText = document.getElementById('refresh-banner-text');
-    const refreshNowBtn = document.getElementById('refresh-now-btn');
+    const toastEl = document.getElementById('toast');
     const sortTabs = Array.from(document.querySelectorAll('[data-sort]'));
     const ageTabs = Array.from(document.querySelectorAll('[data-age]'));
-    const sourceTabs = Array.from(document.querySelectorAll('[data-source]'));
+    const sourceTabs = Array.from(document.querySelectorAll('.tab-btn[data-source]'));
     const voteBar = document.querySelector('.vote-bar');
-    let pendingFeedbackRequests = 0;
-    let refillQueued = false;
-    let isRefilling = false;
+    const sidePanel = document.querySelector('.swipe-side');
+    const filterToggleBtn = document.querySelector('.filter-toggle-btn');
     let activeCard = null;
     let lastVote = null;
+    let nextVoteId = 1;
     let currentSort = 'recommended';
     let currentAge = 'recent';
     let currentSource = 'mixed';
-    let votesSinceRankingRefresh = 0;
-    let preloadedRefillDoc = null;
-    let isPreloadingRefill = false;
-    let preloadRefillPromise = null;
     const votedStoryIds = new Set();
+    const feedbackChains = new Map();
     const MAX_QUEUE = 12;
-    const LOW_WATERMARK = 4;
-    const PREFETCH_COUNT = 3;
-    const IDLE_INACTIVE_PREFETCH_COUNT = 3;
-    const VOTES_PER_RANKING_REFRESH = 5;
+    const PREFETCH_COUNT = 2;
+    const IDLE_INACTIVE_PREFETCH_COUNT = 2;
+    const tldrCache = new Map(); // storyId (number) → raw TLDR markdown (string)
     let idleAgePrefetchHandle = null;
+    let toastTimer = null;
+    let refillInFlight = false;
+    let queuedRefillAdvance = null;
+    let warmPollInFlight = false;
+    let warmMinVersion = null;
+    let latestWarmTargetVersion = null;
+    let lastScheduledWarmVersion = null;
+    const VOTED_STORAGE_LIMIT = 1000;
 
     function cards() {
       return Array.from(storiesContainer.querySelectorAll('.story-card'));
     }
 
-    function matchesCurrentSource(card) {
-      if (currentSource === 'hn') {
-        return card.dataset.isHn === '1';
-      }
-      if (currentSource === 'non-hn') {
-        return card.dataset.isHn === '0';
-      }
-      return true;
+    function matchesCurrentCombo(card) {
+      const target = currentAge + '_' + currentSource;
+      return (card.dataset.combo || '').split(' ').includes(target);
     }
 
     function matchesCurrentAxes(card) {
-      if (!matchesCurrentSource(card)) return false;
-      if (currentAge === 'archive' && card.dataset.isRecent !== '0') return false;
-      if (currentAge === 'recent' && card.dataset.isRecent !== '1') return false;
       if (currentSort === 'popular' && card.dataset.sortPopular !== '1') return false;
       if (currentSort === 'explore' && card.dataset.sortExplore !== '1') return false;
       return true;
     }
 
     function queuedCards() {
-      return cards().filter(card => !card.dataset.voted && matchesCurrentAxes(card));
+      return cards().filter(card => !card.dataset.voted && matchesCurrentCombo(card) && matchesCurrentAxes(card));
     }
 
     // Map a story's rank position (sorted by data-score desc) to a hue.
@@ -1062,47 +935,26 @@
       });
     }
 
-    function orderByRank() {
+    function orderCards(comparator) {
       const cards = Array.from(document.querySelectorAll('.story-card'));
-      cards.sort((a, b) => parseFloat(b.dataset.score) - parseFloat(a.dataset.score));
-      cards.forEach(card => storiesContainer.appendChild(card));
-    }
-
-    function orderByDate() {
-      const cards = Array.from(document.querySelectorAll('.story-card'));
-      cards.sort((a, b) => Number(b.dataset.time || 0) - Number(a.dataset.time || 0));
-      cards.forEach(card => storiesContainer.appendChild(card));
-    }
-
-    function shuffleStories() {
-      const cards = Array.from(document.querySelectorAll('.story-card'));
-      for (let i = cards.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [cards[i], cards[j]] = [cards[j], cards[i]];
-      }
+      cards.sort(comparator);
       cards.forEach(card => storiesContainer.appendChild(card));
     }
 
     function orderForCurrentSort() {
-      if (currentSort === 'date') orderByDate();
-      else if (currentSort === 'recommended') orderByRank();
-      else shuffleStories();
+      if (currentSort === 'date') {
+        orderCards((a, b) => Number(b.dataset.time || 0) - Number(a.dataset.time || 0));
+      } else {
+        orderCards((a, b) => parseFloat(b.dataset.score) - parseFloat(a.dataset.score));
+      }
     }
 
-    function updateRefreshProgress() {
-      const filledCount = votesSinceRankingRefresh;
-      const segments = document.querySelectorAll('.vote-bar .refresh-segment');
-      segments.forEach((seg, idx) => {
-        const isFilled = idx < filledCount;
-        seg.classList.toggle('filled', isFilled);
-        seg.classList.toggle('next-refresh', filledCount === VOTES_PER_RANKING_REFRESH && isFilled);
-      });
-      const progressBar = document.querySelector('.vote-bar .refresh-progress');
-      progressBar?.setAttribute('aria-valuenow', String(Math.min(filledCount, VOTES_PER_RANKING_REFRESH)));
-    }
-
-    function updateQueueStatus() {
-      updateRefreshProgress();
+    function advanceToNextCard() {
+      const q = queuedCards();
+      if (q.length === 0) return;
+      const idx = activeCard ? q.indexOf(activeCard) : -1;
+      const next = q[(idx + 1) % q.length];
+      setActiveCard(next);
     }
 
     function setActiveCard(card) {
@@ -1118,8 +970,6 @@
       }
       prefetchUpcomingTldrs();
       scheduleIdleAgePrefetch();
-      updateQueueStatus();
-      maybeRefillQueue();
     }
 
     function updateVoteBar() {
@@ -1128,51 +978,93 @@
       });
     }
 
-    function showNextCard() {
-      setActiveCard(queuedCards()[0] || null);
+    function showNextCard({ allowRefresh = true } = {}) {
+      const next = queuedCards()[0];
+      if (next) {
+        setActiveCard(next);
+        return;
+      }
+      setActiveCard(null);
+      if (allowRefresh) {
+        scheduleDeckRefresh({ advance: true });
+      }
     }
 
-    function setSort(sort) {
-      currentSort = sort;
-      sortTabs.forEach(tab => {
-        tab.classList.toggle('active', tab.dataset.sort === currentSort);
+    const FILTERS = {
+      sort: { tabs: sortTabs, attr: 'data-sort' },
+      age: { tabs: ageTabs, attr: 'data-age' },
+      source: { tabs: sourceTabs, attr: 'data-source' },
+    };
+
+    function updateFilterTabs(filterName, value) {
+      const filter = FILTERS[filterName];
+      filter.tabs.forEach(tab => {
+        tab.classList.toggle('active', tab.getAttribute(filter.attr) === value);
       });
-      if (activeCard && !matchesCurrentAxes(activeCard)) {
-        activeCard.classList.remove('active');
+    }
+
+    function setFilter(filterName, value) {
+      if (filterName === 'sort' && value === 'popular' && currentSource === 'non-hn') {
+        return;
       }
-      if (refillQueued) {
-        refillWhenReady();
+      sidePanel.classList.remove('visible');
+
+      if (filterName === 'sort') {
+        if (value === currentSort) {
+          advanceToNextCard();
+          return;
+        }
+        currentSort = value;
+        updateFilterTabs('sort', currentSort);
+        sourceTabs.forEach(tab => {
+          tab.disabled = (value === 'popular' && tab.dataset.source !== 'hn');
+        });
+        if (value === 'popular' && currentSource !== 'hn') {
+          currentSource = 'hn';
+          updateFilterTabs('source', currentSource);
+        }
+        if (activeCard && !matchesCurrentAxes(activeCard)) {
+          activeCard.classList.remove('active');
+        }
+        orderForCurrentSort();
+        showNextCard({ allowRefresh: false });
+        scheduleDeckRefresh({ advance: true });
+        scheduleIdleAgePrefetch();
+        return;
+      }
+
+      if (filterName === 'age') {
+        if (value === currentAge) return;
+        currentAge = value;
+        updateFilterTabs('age', currentAge);
+        if (activeCard && (!matchesCurrentCombo(activeCard) || !matchesCurrentAxes(activeCard))) {
+          activeCard.classList.remove('active');
+        }
+        orderForCurrentSort();
+        showNextCard({ allowRefresh: false });
+        scheduleDeckRefresh({ advance: true });
+        scheduleIdleAgePrefetch();
+        return;
+      }
+
+      if (filterName !== 'source') {
+        return;
+      }
+
+      currentSource = value;
+      updateFilterTabs('source', currentSource);
+      const popularTab = sortTabs.find(t => t.dataset.sort === 'popular');
+      if (popularTab) popularTab.disabled = (value === 'non-hn');
+      if (currentSort === 'popular' && value === 'non-hn') {
+        currentSort = 'recommended';
+        updateFilterTabs('sort', currentSort);
+      }
+      if (activeCard && (!matchesCurrentCombo(activeCard) || !matchesCurrentAxes(activeCard))) {
+        activeCard.classList.remove('active');
       }
       orderForCurrentSort();
-      showNextCard();
-      scheduleIdleAgePrefetch();
-    }
-
-    function setAge(age) {
-      currentAge = age;
-      ageTabs.forEach(tab => {
-        tab.classList.toggle('active', tab.dataset.age === currentAge);
-      });
-      if (activeCard && !matchesCurrentAxes(activeCard)) {
-        activeCard.classList.remove('active');
-      }
-      if (refillQueued) {
-        refillWhenReady();
-      }
-      showNextCard();
-      scheduleIdleAgePrefetch();
-    }
-
-    function setSource(source) {
-      currentSource = source;
-      sourceTabs.forEach(tab => {
-        tab.classList.toggle('active', tab.dataset.source === currentSource);
-      });
-      if (activeCard && !matchesCurrentAxes(activeCard)) {
-        activeCard.classList.remove('active');
-      }
-      showNextCard();
-      updateQueueStatus();
+      showNextCard({ allowRefresh: false });
+      scheduleDeckRefresh({ advance: true });
     }
 
     applyGradient();
@@ -1223,76 +1115,260 @@
       });
     }
 
-    function updateRefreshBanner() {
-      const hasPending = pendingFeedbackRequests > 0;
-      const isReady =
-        refillQueued &&
-        preloadedRefillDoc !== null &&
-        !isRefilling &&
-        !hasPending;
-      const isPreparing =
-        refillQueued &&
-        !isReady &&
-        !isRefilling &&
-        !hasPending;
-      const shouldShow = hasPending || isRefilling || isPreparing || isReady;
-
-      refreshBanner.hidden = !shouldShow;
-      refreshNowBtn.hidden = !isReady;
-
-      if (!shouldShow) return;
-      if (isRefilling) {
-        refreshBannerText.textContent = 'Refilling queue...';
-      } else if (hasPending) {
-        const label = pendingFeedbackRequests === 1 ? '1 vote saving' : `${pendingFeedbackRequests} votes saving`;
-        refreshBannerText.textContent = `${label} syncing`;
-      } else if (isPreparing) {
-        refreshBannerText.textContent = 'Preparing refresh...';
-      } else if (isReady) {
-        refreshBannerText.textContent = 'New ranking ready';
+    function showToast(message, variant) {
+      const kind = variant || 'info';
+      toastEl.textContent = message;
+      toastEl.className = `toast toast--${kind}`;
+      toastEl.hidden = false;
+      if (toastTimer) {
+        clearTimeout(toastTimer);
       }
+      toastTimer = window.setTimeout(() => {
+        toastEl.hidden = true;
+        toastTimer = null;
+      }, 3000);
     }
 
-    function markVoteSaving() {
-      updateRefreshBanner();
+    const copyProfileLinkButton = document.getElementById('copyProfileLink');
+    if (copyProfileLinkButton) {
+      copyProfileLinkButton.addEventListener('click', async () => {
+        const link = profileLink();
+        if (!link) return;
+        try {
+          await navigator.clipboard.writeText(link);
+          showToast('Profile link copied', 'success');
+        } catch {
+          showToast(link, 'info');
+        }
+      });
     }
 
-    async function refillWhenReady() {
-      if (isRefilling) return;
-      refillQueued = true;
-      updateRefreshBanner();
-      if (pendingFeedbackRequests > 0) return;
+    function routePrefix() {
+      if (window.location.pathname.startsWith('/hn')) return '/hn';
+      return '';
+    }
 
-      isRefilling = true;
-      updateRefreshBanner();
-      updateQueueStatus();
+    function apiPath(path) {
+      return `${routePrefix()}${path}`;
+    }
+
+    function feedbackPath() {
+      return apiPath('/api/feedback');
+    }
+
+    function profileLink() {
+      const token = storiesContainer?.dataset.userToken || '';
+      if (!token) return '';
+      return `${window.location.origin}${routePrefix()}/u/${encodeURIComponent(token)}`;
+    }
+
+    function rankingReadyPath(minVersion, targetVersion) {
+      return `${apiPath('/api/ranking-ready')}?min_version=${encodeURIComponent(minVersion)}&target_version=${encodeURIComponent(targetVersion)}`;
+    }
+
+    function votedStorageKey() {
+      const userId = storiesContainer?.dataset.userId || '0';
+      return `hnRewrite:votedStoryIds:${userId}`;
+    }
+
+    function readStoredVotedStoryIds() {
       try {
-        await refillQueue();
+        const raw = window.localStorage.getItem(votedStorageKey());
+        if (!raw) return [];
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) return [];
+        return parsed
+          .map(value => Number(value))
+          .filter(value => Number.isSafeInteger(value));
       } catch (err) {
-        console.error('Failed to refill queue', err);
-      } finally {
-        isRefilling = false;
-        refillQueued = false;
-        updateQueueStatus();
-        updateRefreshBanner();
+        console.debug('Unable to read persisted voted story ids', err);
+        return [];
       }
     }
 
-    refreshNowBtn.addEventListener('click', refillWhenReady);
+    function writeStoredVotedStoryIds() {
+      try {
+        const ids = Array.from(votedStoryIds)
+          .filter(value => Number.isSafeInteger(value))
+          .slice(-VOTED_STORAGE_LIMIT);
+        window.localStorage.setItem(votedStorageKey(), JSON.stringify(ids));
+      } catch (err) {
+        console.debug('Unable to persist voted story ids', err);
+      }
+    }
+
+    function rememberVotedStoryId(storyId) {
+      votedStoryIds.add(storyId);
+      writeStoredVotedStoryIds();
+    }
+
+    function forgetVotedStoryId(storyId) {
+      votedStoryIds.delete(storyId);
+      writeStoredVotedStoryIds();
+    }
+
+    function seedVotedStoryIdsFromStorage() {
+      readStoredVotedStoryIds().forEach(storyId => votedStoryIds.add(storyId));
+      let removedStoredVotes = 0;
+      cards().forEach(card => {
+        const storyId = Number(card.dataset.storyId);
+        if (votedStoryIds.has(storyId)) {
+          card.dataset.voted = 'stored';
+          card.remove();
+          removedStoredVotes += 1;
+        }
+      });
+      if (removedStoredVotes > 0) {
+        console.debug(
+          `removed ${removedStoredVotes} persisted voted card(s) from stale page cache`
+        );
+      }
+    }
+
+    function waitForVoteRemoval() {
+      if (!activeCard?.dataset.voted) {
+        return Promise.resolve();
+      }
+      return new Promise(resolve => {
+        window.requestAnimationFrame(() => {
+          if (!activeCard?.dataset.voted) {
+            resolve();
+            return;
+          }
+          window.setTimeout(resolve, 180);
+        });
+      });
+    }
+
+    function scheduleDeckRefresh({ advance = true, waitForWarm = false, targetVersion = null } = {}) {
+      if (waitForWarm) {
+        if (typeof targetVersion !== 'number' || !Number.isFinite(targetVersion) || targetVersion < 0) {
+          return;
+        }
+        if (lastScheduledWarmVersion !== null && targetVersion <= lastScheduledWarmVersion) {
+          return;
+        }
+        lastScheduledWarmVersion = targetVersion;
+        latestWarmTargetVersion = Math.max(latestWarmTargetVersion || 0, targetVersion);
+        if (warmMinVersion === null) {
+          warmMinVersion = targetVersion;
+        }
+        runWarmPollLoop();
+        return;
+      }
+
+      queueRefill(advance);
+    }
+
+    function queueRefill(advance) {
+      queuedRefillAdvance = queuedRefillAdvance === null ? advance : queuedRefillAdvance || advance;
+      runRefillLoop();
+    }
+
+    async function runRefillLoop() {
+      if (refillInFlight) {
+        return;
+      }
+      refillInFlight = true;
+      try {
+        while (queuedRefillAdvance !== null) {
+          const advance = queuedRefillAdvance;
+          queuedRefillAdvance = null;
+          try {
+            await refillQueue({ advance });
+          } catch (err) {
+            console.error('Failed to refresh deck', err);
+          }
+        }
+      } finally {
+        refillInFlight = false;
+      }
+    }
+
+    async function runWarmPollLoop() {
+      if (warmPollInFlight) {
+        return;
+      }
+      warmPollInFlight = true;
+      try {
+        while (warmMinVersion !== null && latestWarmTargetVersion !== null) {
+          const minVersion = warmMinVersion;
+          const targetVersion = latestWarmTargetVersion;
+          const readyVersion = await waitForRankingReady(minVersion, targetVersion);
+          if (readyVersion !== null) {
+            await waitForVoteRemoval();
+            queueRefill(false);
+            if (readyVersion >= latestWarmTargetVersion) {
+              warmMinVersion = null;
+              latestWarmTargetVersion = null;
+            } else {
+              warmMinVersion = readyVersion + 1;
+            }
+          } else if (targetVersion === latestWarmTargetVersion) {
+            warmMinVersion = null;
+            latestWarmTargetVersion = null;
+          }
+        }
+      } finally {
+        warmPollInFlight = false;
+        if (warmMinVersion !== null && latestWarmTargetVersion !== null) {
+          runWarmPollLoop();
+        }
+      }
+    }
+
+    async function waitForRankingReady(minVersion, targetVersion) {
+      const startedAt = Date.now();
+      let delayMs = 400;
+      while (Date.now() - startedAt <= 30000) {
+        await new Promise(resolve => window.setTimeout(resolve, delayMs));
+        try {
+          const resp = await fetch(rankingReadyPath(minVersion, targetVersion), { cache: 'no-store' });
+          if (!resp.ok) {
+            throw new Error(`Ranking readiness failed: ${resp.status}`);
+          }
+          const data = await resp.json();
+          if (data.ready && typeof data.ready_version === 'number') {
+            return data.ready_version;
+          }
+        } catch (err) {
+          console.error('Failed checking ranking readiness', err);
+        }
+        delayMs = Math.min(delayMs * 2, 2500);
+      }
+      return null;
+    }
+
     sortTabs.forEach(tab => {
-      tab.addEventListener('click', () => setSort(tab.dataset.sort));
+      tab.addEventListener('click', () => setFilter('sort', tab.dataset.sort));
     });
     ageTabs.forEach(tab => {
-      tab.addEventListener('click', () => setAge(tab.dataset.age));
+      tab.addEventListener('click', () => setFilter('age', tab.dataset.age));
     });
     sourceTabs.forEach(tab => {
-      tab.addEventListener('click', () => setSource(tab.dataset.source));
+      tab.addEventListener('click', () => setFilter('source', tab.dataset.source));
     });
+
+    filterToggleBtn.addEventListener('click', () => {
+      sidePanel.classList.toggle('visible');
+    });
+
+    document.addEventListener('click', (e) => {
+      if (sidePanel.classList.contains('visible') &&
+          !sidePanel.contains(e.target) &&
+          e.target !== filterToggleBtn) {
+        sidePanel.classList.remove('visible');
+      }
+    });
+
     document.querySelectorAll('[data-key-action]').forEach(btn => {
       const runKeyAction = () => {
         const action = btn.dataset.keyAction;
         if (action === 'undo') {
           undoLastVote();
+        } else if (action === 'toggle-panel') {
+          sidePanel.classList.toggle('visible');
+          document.body.classList.toggle('fullscreen');
         } else {
           submitVote(action);
         }
@@ -1316,37 +1392,8 @@
       return parser.parseFromString(htmlText, 'text/html');
     }
 
-    function scheduleRefillPreload() {
-      if (preloadRefillPromise || preloadedRefillDoc) {
-        return;
-      }
-      isPreloadingRefill = true;
-      preloadRefillPromise = new Promise(resolve => {
-        window.setTimeout(resolve, 2500);
-      }).then(async () => {
-        preloadedRefillDoc = await fetchRefillDoc();
-        return preloadedRefillDoc;
-      }).catch(err => {
-        console.error('Failed to preload refreshed queue', err);
-        return null;
-      }).finally(() => {
-        preloadRefillPromise = null;
-        isPreloadingRefill = false;
-        updateRefreshBanner();
-      });
-    }
-
-    async function refillQueue({ forceFetch = false } = {}) {
-      let newDoc = preloadedRefillDoc;
-      if (forceFetch || !newDoc) {
-        if (!forceFetch && preloadRefillPromise) {
-          newDoc = await preloadRefillPromise;
-        }
-        if (!newDoc) {
-          newDoc = await fetchRefillDoc();
-        }
-      }
-      preloadedRefillDoc = null;
+    async function refillQueue({ advance = true } = {}) {
+      const newDoc = await fetchRefillDoc();
       const newStories = newDoc.getElementById('stories');
       if (!newStories) {
         throw new Error('Refill failed: stories container missing');
@@ -1379,52 +1426,31 @@
       }
 
       applyGradient();
-      bindEvents();
-      if (!activeCard || activeCard.dataset.voted) {
-        showNextCard();
+      orderForCurrentSort();
+      if (advance) {
+        showNextCard({ allowRefresh: false });
       }
     }
 
-    // Function to bind click event listeners to current cards
-    function bindEvents() {
-      // 1. Feedback buttons
-      document.querySelectorAll('[data-fb]').forEach(btn => {
-        btn.onclick = () => {
-          submitVote(btn.dataset.fb);
-        };
+    document.querySelectorAll('[data-fb]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        submitVote(btn.dataset.fb);
       });
+    });
 
-      // 2. TLDR detail buttons and empty card space
-      document.querySelectorAll('.story-card').forEach(card => {
-        card.onclick = async (e) => {
-          if (
-            e.target.closest('a, button, input, textarea, select, summary, [role="button"], .tldr-detail-content') ||
-            window.getSelection()?.toString()
-          ) {
-            return;
-          }
-          await openTldrDetail(card);
-        };
-      });
-
-      document.querySelectorAll('[data-tldr-detail]').forEach(btn => {
-        btn.onclick = async (e) => {
-          e.stopPropagation();
-          await openTldrDetail(btn.closest('.story-card'));
-        };
-      });
-    }
-
-
-
-    function maybeRefillQueue() {
-      if (queuedCards().length > LOW_WATERMARK || isRefilling || refillQueued) {
+    storiesContainer.addEventListener('click', async (e) => {
+      const card = e.target.closest('.story-card');
+      if (!card) {
         return;
       }
-      if (!activeCard) {
-        refillWhenReady();
+      if (
+        e.target.closest('a, button, input, textarea, select, summary, [role="button"], .tldr-detail-content') ||
+        window.getSelection()?.toString()
+      ) {
+        return;
       }
-    }
+      await openTldrDetail(card);
+    });
 
     function prefetchUpcomingTldrs() {
       queuedCards().slice(0, PREFETCH_COUNT).forEach(card => {
@@ -1464,16 +1490,14 @@
       }
     }
 
-    function sendFeedback(storyId, action, queueRemaining, refreshRanking = false) {
-      const apiPath = window.location.pathname.startsWith('/rewrite') ? '/rewrite/api/feedback' : '/api/feedback';
-      return fetch(apiPath, {
+    function sendFeedback(storyId, action) {
+      return fetch(feedbackPath(), {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
           story_id: storyId,
           action,
-          queue_remaining: queueRemaining,
-          refresh_ranking: refreshRanking
+          queue_remaining: queuedCards().length,
         })
       }).then(resp => {
         if (!resp.ok) {
@@ -1483,29 +1507,65 @@
       });
     }
 
+    function enqueueFeedback(storyId, action) {
+      const previous = feedbackChains.get(storyId) || Promise.resolve();
+      const next = previous
+        .catch(() => {})
+        .then(() => sendFeedback(storyId, action));
+      const tracked = next.finally(() => {
+        if (feedbackChains.get(storyId) === tracked) {
+          feedbackChains.delete(storyId);
+        }
+      });
+      feedbackChains.set(storyId, tracked);
+      return next;
+    }
+
+    function adjustVoteCount(action, delta) {
+      const countEl = document.querySelector(`[data-vote-count="${action}"]`);
+      if (!countEl) {
+        return;
+      }
+      const nextCount = Math.max(0, Number(countEl.textContent || '0') + delta);
+      countEl.textContent = String(nextCount);
+    }
+
+    function incrementVoteCount(vote) {
+      if (vote.countApplied) {
+        return;
+      }
+      adjustVoteCount(vote.action, 1);
+      vote.countApplied = true;
+    }
+
+    function decrementVoteCount(vote) {
+      if (!vote.countApplied) {
+        return;
+      }
+      adjustVoteCount(vote.action, -1);
+      vote.countApplied = false;
+    }
+
     function submitVote(action, card = activeCard) {
       if (!card || card.dataset.voted) {
         return;
       }
 
       const storyId = Number(card.dataset.storyId);
-      votedStoryIds.add(storyId);
-      const applyExistingRefillAfterVote = refillQueued && pendingFeedbackRequests === 0;
-      votesSinceRankingRefresh += 1;
-      updateRefreshProgress();
-      const shouldRefreshRanking = votesSinceRankingRefresh >= VOTES_PER_RANKING_REFRESH;
-      if (shouldRefreshRanking) {
-        votesSinceRankingRefresh = 0;
-        updateRefreshProgress();
-      }
+      const vote = {
+        id: nextVoteId++,
+        storyId,
+        action,
+        card,
+        countApplied: false,
+        undone: false,
+      };
+      rememberVotedStoryId(storyId);
       card.dataset.voted = action;
       document.querySelectorAll('[data-fb]').forEach(btn => {
         btn.classList.toggle('active', btn.dataset.fb === action);
       });
-      const countEl = document.querySelector(`[data-vote-count="${action}"]`);
-      if (countEl) {
-        countEl.textContent = String(Number(countEl.textContent || '0') + 1);
-      }
+      incrementVoteCount(vote);
 
       if (action === 'up') {
         card.style.setProperty('--swipe-exit-x', '42px');
@@ -1526,39 +1586,30 @@
         }
       }, 150);
 
-      const queueRemaining = queuedCards().length;
-      pendingFeedbackRequests += 1;
-      markVoteSaving();
+      const savePromise = enqueueFeedback(storyId, action)
+        .then(data => {
+          scheduleDeckRefresh({
+            waitForWarm: true,
+            targetVersion: data.target_version,
+            advance: false,
+          });
+          return data;
+        })
+        .catch(err => {
+          console.error('Network error submitting feedback', err);
+          if (!vote.undone) {
+            decrementVoteCount(vote);
+          }
+          if (lastVote?.id === vote.id) {
+            lastVote = null;
+            forgetVotedStoryId(storyId);
+            delete card.dataset.voted;
+          }
+          showToast('Vote failed to save', 'error');
+        });
 
-      const savePromise = sendFeedback(
-        storyId,
-        action,
-        queueRemaining,
-        shouldRefreshRanking
-      ).then(data => {
-        if (data.ranking_refresh_queued) {
-          refillQueued = true;
-          scheduleRefillPreload();
-        }
-        return data;
-      }).catch(err => {
-        console.error('Network error submitting feedback', err);
-        votedStoryIds.delete(storyId);
-        delete card.dataset.voted;
-        refreshBannerText.textContent = 'Vote failed to save';
-        refreshBanner.hidden = false;
-        refreshNowBtn.hidden = true;
-      }).finally(() => {
-        pendingFeedbackRequests = Math.max(0, pendingFeedbackRequests - 1);
-        if (applyExistingRefillAfterVote && pendingFeedbackRequests === 0) {
-          window.setTimeout(refillWhenReady, 250);
-        } else {
-          updateRefreshBanner();
-          maybeRefillQueue();
-        }
-      });
-
-      lastVote = { storyId, action, card, savePromise };
+      vote.savePromise = savePromise;
+      lastVote = vote;
     }
 
     function undoLastVote() {
@@ -1568,9 +1619,11 @@
       }
       lastVote = null;
 
-      const { storyId, action, card, savePromise } = vote;
-      votedStoryIds.delete(storyId);
+      const { storyId, card } = vote;
+      vote.undone = true;
+      forgetVotedStoryId(storyId);
       delete card.dataset.voted;
+      decrementVoteCount(vote);
       card.classList.remove('fade-out');
       document.querySelectorAll('[data-fb]').forEach(btn => {
         btn.classList.remove('active');
@@ -1578,27 +1631,18 @@
       if (!card.isConnected) {
         storiesContainer.insertBefore(card, storiesContainer.firstChild);
       }
-      bindEvents();
       setActiveCard(card);
 
-      pendingFeedbackRequests += 1;
-      markVoteSaving();
-      Promise.resolve(savePromise).finally(() => {
-        return sendFeedback(storyId, 'clear', queuedCards().length, true);
-      }).then(data => {
-        if (data.ranking_refresh_queued) {
-          refillQueued = true;
-          preloadedRefillDoc = null;
-          scheduleRefillPreload();
-        }
+      enqueueFeedback(storyId, 'clear').then(data => {
+        scheduleDeckRefresh({
+          waitForWarm: true,
+          targetVersion: data.target_version,
+          advance: false,
+        });
+        return data;
       }).catch(err => {
         console.error('Network error undoing feedback', err);
-        refreshBannerText.textContent = 'Undo failed to save';
-        refreshBanner.hidden = false;
-        refreshNowBtn.hidden = true;
-      }).finally(() => {
-        pendingFeedbackRequests = Math.max(0, pendingFeedbackRequests - 1);
-        updateRefreshBanner();
+        showToast('Undo failed to save', 'error');
       });
     }
 
@@ -1617,7 +1661,6 @@
         return;
       }
 
-      const btn = card.querySelector('[data-tldr-detail]');
       const storyId = Number(card.dataset.storyId);
       const storyTitle = card.querySelector('.story-title a')?.textContent || '';
 
@@ -1625,59 +1668,92 @@
       if (contentDiv?.dataset.loading === 'true') {
         return;
       }
-      if (contentDiv && contentDiv.style.display !== 'none') {
+      if (contentDiv && contentDiv.style.display !== 'none' && !contentDiv.dataset.error) {
         return;
       }
       if (!contentDiv) {
         contentDiv = document.createElement('div');
         contentDiv.className = 'tldr-detail-content';
-        contentDiv.style.marginTop = '0.4rem';
-        contentDiv.style.fontSize = '0.85rem';
-        contentDiv.style.borderTop = '1px dashed var(--pico-muted-border-color)';
-        contentDiv.style.paddingTop = '0.4rem';
         contentDiv.style.display = 'none';
         card.appendChild(contentDiv);
       }
-      contentDiv.dataset.loading = 'true';
-
-      if (btn) {
-        btn.disabled = true;
-        btn.textContent = 'Analyzing...';
+      const cached = tldrCache.get(storyId);
+      if (cached !== undefined) {
+        delete contentDiv.dataset.error;
+        contentDiv.innerHTML = parseSimpleMarkdown(cached);
+        styleTldrLabels(contentDiv);
+        contentDiv.style.display = 'block';
+        return;
       }
 
-      const apiPath = window.location.pathname.startsWith('/rewrite') ? '/rewrite/api/tldr-detail' : '/api/tldr-detail';
+      contentDiv.textContent = 'Loading TLDR...';
+      contentDiv.style.display = 'block';
+      contentDiv.dataset.loading = 'true';
+
+      const detailApiPath = apiPath('/api/tldr-detail');
       try {
-        const resp = await fetch(apiPath, {
+        const resp = await fetch(detailApiPath, {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({ story_id: storyId, story_title: storyTitle })
         });
         if (resp.ok) {
           const data = await resp.json();
+          tldrCache.set(storyId, data.tldr);
+          delete contentDiv.dataset.error;
           contentDiv.innerHTML = parseSimpleMarkdown(data.tldr);
           styleTldrLabels(contentDiv);
           contentDiv.style.display = 'block';
-          if (btn) {
-            btn.style.display = 'none';
-          }
         } else {
           const errData = await resp.json().catch(() => ({}));
-          if (btn) {
-            btn.textContent = 'Failed';
-            btn.title = errData.error || 'Failed to generate TLDR';
-            btn.disabled = false;
-          }
+          const errorMsg = errData.error || `HTTP ${resp.status}`;
+          contentDiv.textContent = 'TLDR: ' + errorMsg;
+          contentDiv.dataset.error = 'true';
+          contentDiv.style.display = 'block';
+          console.warn('openTldrDetail failed:', errorMsg);
         }
       } catch (err) {
+        contentDiv.textContent = 'TLDR: ' + (err.message || 'Network error');
+        contentDiv.dataset.error = 'true';
+        contentDiv.style.display = 'block';
         console.error(err);
-        if (btn) {
-          btn.textContent = 'Error';
-          btn.disabled = false;
-        }
       } finally {
-        contentDiv.dataset.loading = 'false';
+        delete contentDiv.dataset.loading;
       }
     }
+
+    function scrollActiveCard(direction) {
+      const card = document.querySelector('.story-card.active');
+      if (!card) {
+        return;
+      }
+      card.scrollBy({ top: card.clientHeight * 0.8 * direction });
+    }
+
+    const KEY_ACTIONS = {
+      arrowup: () => scrollActiveCard(-1),
+      arrowdown: () => scrollActiveCard(1),
+      k: () => submitVote('up'),
+      j: () => submitVote('down'),
+      l: () => submitVote('neutral'),
+      o: () => openStoryUrl('article'),
+      c: () => openStoryUrl('comments'),
+      u: () => undoLastVote(),
+      r: () => setFilter('sort', 'recommended'),
+      p: () => setFilter('sort', 'popular'),
+      x: () => setFilter('sort', 'explore'),
+      d: () => setFilter('sort', 'date'),
+      e: () => setFilter('age', 'recent'),
+      a: () => setFilter('age', 'archive'),
+      m: () => setFilter('source', 'mixed'),
+      h: () => setFilter('source', 'hn'),
+      n: () => setFilter('source', 'non-hn'),
+      f: () => {
+        const panel = document.querySelector('.swipe-side');
+        panel.classList.toggle('visible');
+        document.body.classList.toggle('fullscreen');
+      },
+    };
 
     document.addEventListener('keydown', (e) => {
       if (
@@ -1688,31 +1764,10 @@
         return;
       }
       const key = e.key.toLowerCase();
-      if (key === 'arrowup' || key === 'arrowdown') {
+      const action = KEY_ACTIONS[key];
+      if (action) {
         e.preventDefault();
-        const card = document.querySelector('.story-card.active');
-        if (card) {
-          const scrollAmount = card.clientHeight * 0.8;
-          card.scrollBy({ top: key === 'arrowdown' ? scrollAmount : -scrollAmount });
-        }
-      } else if (key === 'k') {
-        e.preventDefault();
-        submitVote('up');
-      } else if (key === 'j') {
-        e.preventDefault();
-        submitVote('down');
-      } else if (key === 'l') {
-        e.preventDefault();
-        submitVote('neutral');
-      } else if (key === 'o') {
-        e.preventDefault();
-        openStoryUrl('article');
-      } else if (key === 'c') {
-        e.preventDefault();
-        openStoryUrl('comments');
-      } else if (key === 'u') {
-        e.preventDefault();
-        undoLastVote();
+        action();
       }
     });
 
@@ -1733,10 +1788,19 @@
       }
     })();
 
-    // Run initial event binding
-    bindEvents();
-    setSort('recommended');
-    setAge('recent');
+    seedVotedStoryIdsFromStorage();
+    setFilter('sort', 'recommended');
+    setFilter('age', 'recent');
+
+    // If the page was served from a stale cache, schedule a warm-polled
+    // refill so voted stories and outdated rankings are replaced as soon
+    // as the server finishes warming.
+    const storiesEl = document.getElementById('stories');
+    const pageVer = storiesEl ? parseInt(storiesEl.dataset.dashboardVersion) : NaN;
+    const currVer = storiesEl ? parseInt(storiesEl.dataset.currentVersion) : NaN;
+    if (Number.isFinite(pageVer) && Number.isFinite(currVer) && pageVer < currVer) {
+      scheduleDeckRefresh({ waitForWarm: true, targetVersion: currVer, advance: true });
+    }
   </script>
 </body>
 </html>

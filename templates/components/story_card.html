@@ -1,0 +1,46 @@
+<article class="story-card{% if card.is_enriched %} enriched{% endif %}"
+         data-combo="{{ card.combo_keys }}"
+         data-story-id="{{ card.story.id }}"
+         data-score="{{ card.score }}"
+         data-time="{{ card.story.time }}"
+         data-story-source="{{ card.story.source }}"
+         data-is-hn="{{ card.is_hn_attr }}"
+         data-sort-popular="{{ card.sort_popular_attr }}"
+         data-sort-explore="{{ card.sort_explore_attr }}"
+         data-is-recent="{{ card.is_recent_attr }}"
+         data-article-url="{{ card.article_url }}"
+         data-comments-url="{{ card.comments_url }}">
+  <div class="story-header">
+    {% for badge in card.badges %}
+    {% include "components/badge.html" %}
+    {% endfor %}
+
+    {% if card.show_source_badge %}
+    <span class="source-badge" title="{{ card.story.source }}">{{ card.source_label }}</span>
+    {% endif %}
+
+    {% if card.show_score %}
+    <span>{{ card.story.score }} pts</span>
+    {% endif %}
+
+    <span>{{ card.time_ago }}</span>
+
+    {% if card.comments_url %}
+    <a href="{{ card.comments_url }}" target="_blank" rel="noopener">
+      💬{% if card.story.comment_count is not none %} {{ card.story.comment_count }}{% endif %} comments
+    </a>
+    {% endif %}
+  </div>
+
+  <h2 class="story-title">
+    <a href="{{ card.article_url or card.comments_url }}" target="_blank" rel="noopener">
+      {{ card.story.title }}
+    </a>
+  </h2>
+
+  <div class="story-footer"></div>
+
+  {% if card.best_match_title %}
+  <p class="match-reason">Similar to: {{ card.best_match_title }}</p>
+  {% endif %}
+</article>
