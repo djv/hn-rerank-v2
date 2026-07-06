@@ -234,6 +234,33 @@ def test_env(tmp_path, mock_embedder):
     db.close()
 
 
+def test_discussion_budget_scales_with_comment_volume() -> None:
+    """The discussion-only TLDR budget must grow with comment volume rather
+    than staying fixed at 3-5 bullets regardless of thread size."""
+    import server
+
+    assert server._discussion_budget(0) == "3-5 bullets, max 150 words"
+    assert server._discussion_budget(1_499) == "3-5 bullets, max 150 words"
+    assert server._discussion_budget(1_500) == "6-8 bullets, max 250 words"
+    assert server._discussion_budget(4_999) == "6-8 bullets, max 250 words"
+    assert server._discussion_budget(5_000) == "9-12 bullets, max 400 words"
+    assert server._discussion_budget(12_000) == "9-12 bullets, max 400 words"
+
+
+def test_discussion_only_prompt_renders_budget_placeholder() -> None:
+    """Pins the {budget} placeholder contract in discussion_only_v4.txt -- if
+    a future prompt edit drops it, .format() must fail loudly here rather
+    than silently ignoring the scaled budget."""
+    import server
+
+    prompt = server._load_prompt("discussion_only_v4.txt").format(
+        title="Some story",
+        comments_section="a comment",
+        budget=server._discussion_budget(5_000),
+    )
+    assert "9-12 bullets, max 400 words" in prompt
+
+
 def test_token_redirect(app_env):
     port, _, _, _, user = app_env
     resp = httpx.get(f"http://127.0.0.1:{port}/u/{user.token}", follow_redirects=False)

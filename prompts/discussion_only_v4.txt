@@ -4,7 +4,7 @@ Use ONLY information from the comments below.
 Output ONE section only:
 
 ### Discussion
-3-5 bullets, max 150 words, summarizing the comments.
+{budget}, summarizing the comments.
 
 Markdown formatting:
 - FLAT structure only — no nested list levels.

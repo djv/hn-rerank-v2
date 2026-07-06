@@ -42,7 +42,7 @@ SELF_TEXT_PROMPT_MIN_CHARS = 300
 REDDIT_COMMENTS_CACHE_CHAR_LIMIT = 10_000
 REDDIT_COMMENT_LIMIT = 40
 REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dashboard"
-TLDR_PROMPT_VERSION = "detail-v4"
+TLDR_PROMPT_VERSION = "detail-v5"
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
 _PROMPT_CACHE: dict[str, str] = {}
 
@@ -637,6 +637,18 @@ def _tldr_cache_key(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _discussion_budget(comment_chars: int) -> str:
+    """Bullet/word budget for the discussion-only summary, scaled by comment
+    volume so a large thread doesn't collapse into the same terse output as a
+    thin one. comment_chars is the length of the already char-capped
+    comments_section (see COMMENT_PROMPT_CHAR_LIMIT)."""
+    if comment_chars < 1_500:
+        return "3-5 bullets, max 150 words"
+    if comment_chars < 5_000:
+        return "6-8 bullets, max 250 words"
+    return "9-12 bullets, max 400 words"
+
+
 async def generate_detailed_tldr(
     title: str,
     self_text: str = "",
@@ -739,7 +751,9 @@ async def generate_detailed_tldr(
         )
     else:
         prompt = _load_prompt("discussion_only_v4.txt").format(
-            title=title, comments_section=comments_section
+            title=title,
+            comments_section=comments_section,
+            budget=_discussion_budget(len(comments_section)),
         )
 
     result = await _call_llm_chat(
