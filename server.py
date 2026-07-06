@@ -1578,6 +1578,13 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
                 {"ok": True, "tldr": stale_tldr, "cached": True, "stale": True}
             )
 
+        # Recent, high-velocity HN threads bypass the cache hit below and the
+        # dedicated "already cached" fast path, since CH prewarm data can be
+        # 1-24h stale for brand-new comments — see _hn_thread_looks_active.
+        needs_active_refresh = bool(story.top_comments) and _hn_thread_looks_active(
+            story, runtime.config, time.time()
+        )
+
         article_body = story.article_body or None
         cache_key = _tldr_cache_key(
             title=story.title,
@@ -1586,7 +1593,7 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             article_body=article_body or "",
         )
         cached_tldr = runtime.db.get_tldr_cache(story.id, cache_key)
-        if cached_tldr:
+        if cached_tldr and not needs_active_refresh:
             logging.info(
                 "tldr_detail story_id=%s result=cache_hit cache_key=%s",
                 story.id,
@@ -1607,16 +1614,11 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             )
 
         # If an HN story has comments but no cached comment text, fetch them
-        # lazily. Also force a real-time refresh for recent, high-velocity
-        # threads even when top_comments is already populated from prewarm,
-        # since CH prewarm data can be 1-24h stale for brand-new comments.
+        # lazily.
         needs_empty_fetch = (
             is_hn_source(story.source)
             and not story.top_comments
             and (story.comment_count or 0) > 0
-        )
-        needs_active_refresh = bool(story.top_comments) and _hn_thread_looks_active(
-            story, runtime.config, time.time()
         )
         if needs_empty_fetch or needs_active_refresh:
             try:

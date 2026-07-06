@@ -2102,6 +2102,126 @@ def test_flask_test_client_tldr_forces_refresh_for_active_thread(
     assert calls == [{"sid": active_story.id, "force": True}]
 
 
+def test_flask_test_client_tldr_forces_refresh_for_active_thread_even_when_cached(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An active thread must bypass a pre-existing cached TLDR too -- the
+    force-refresh must not be short-circuited by the early cache-hit check,
+    since serving a cached summary forever was the original bug."""
+    import server
+
+    _, db, _, handler, user = test_env
+    now = time.time()
+    active_story = Story(
+        id=1730,
+        title="Active thread story with stale cache",
+        url="https://example.com/active-thread-cached",
+        score=200,
+        time=int(now - 2 * 3600),  # 2h old
+        text_content="Active thread story with stale cache. Body.",
+        source="hn",
+        comment_count=200,  # 100 comments/hour
+        comment_count_at_fetch=200,
+        self_text="",
+        top_comments="Existing prewarmed comments.",
+        article_body="Body.",
+    )
+    db.upsert_story(active_story)
+    cached_key = server._tldr_cache_key(
+        title=active_story.title,
+        self_text=active_story.self_text or "",
+        top_comments=active_story.top_comments or "",
+        article_body=active_story.article_body or "",
+    )
+    db.upsert_tldr_cache(active_story.id, cached_key, "Stale cached TLDR")
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+
+    calls: list[dict[str, Any]] = []
+
+    async def mock_fetch_story(client_, sid, db_, *, force=False):
+        calls.append({"sid": sid, "force": force})
+        return None
+
+    monkeypatch.setattr("pipeline.fetch_story", mock_fetch_story)
+
+    async def mock_generate_detailed_tldr(
+        title: str, self_text: str, top_comments: str, article_body: str
+    ) -> "server.TldrResult":
+        return server.TldrResult(kind="ok", tldr=f"TLDR: {title}")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    resp = client.post("/api/tldr-detail", json={"story_id": active_story.id})
+
+    assert resp.status_code == 200
+    assert calls == [{"sid": active_story.id, "force": True}]
+    # The stale cached summary must not be the one returned -- fetch_story
+    # is mocked to a no-op, so the post-refresh cache_key is unchanged and
+    # the (still-stale) cached summary is what's served back, but the
+    # important assertion is that the refresh path fired at all.
+    assert resp.get_json()["tldr"] == "Stale cached TLDR"
+
+
+def test_flask_test_client_tldr_skips_refresh_for_cached_quiet_recent_thread(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cached, quiet/recent HN thread (fails the velocity gate) must
+    still take the early cache-hit path and must NOT trigger fetch_story --
+    regression guard for the cache-bypass added alongside the active-thread
+    force-refresh."""
+    import server
+
+    _, db, _, handler, user = test_env
+    now = time.time()
+    quiet_story = Story(
+        id=1731,
+        title="Quiet recent story with cache",
+        url="https://example.com/quiet-recent-cached",
+        score=10,
+        time=int(now - 2 * 3600),  # 2h old
+        text_content="Quiet recent story with cache. Body.",
+        source="hn",
+        comment_count=5,  # 2.5 comments/hour, below default floor + velocity
+        comment_count_at_fetch=5,
+        self_text="",
+        top_comments="Existing prewarmed comments.",
+        article_body="Body.",
+    )
+    db.upsert_story(quiet_story)
+    cached_key = server._tldr_cache_key(
+        title=quiet_story.title,
+        self_text=quiet_story.self_text or "",
+        top_comments=quiet_story.top_comments or "",
+        article_body=quiet_story.article_body or "",
+    )
+    db.upsert_tldr_cache(quiet_story.id, cached_key, "Cached TLDR")
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+
+    calls: list[dict[str, Any]] = []
+
+    async def mock_fetch_story(client_, sid, db_, *, force=False):
+        calls.append({"sid": sid, "force": force})
+        return None
+
+    monkeypatch.setattr("pipeline.fetch_story", mock_fetch_story)
+
+    async def mock_generate_detailed_tldr(
+        title: str, self_text: str, top_comments: str, article_body: str
+    ) -> "server.TldrResult":
+        return server.TldrResult(kind="ok", tldr=f"TLDR: {title}")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    resp = client.post("/api/tldr-detail", json={"story_id": quiet_story.id})
+
+    assert resp.status_code == 200
+    assert calls == []
+    assert resp.get_json()["tldr"] == "Cached TLDR"
+    assert resp.get_json()["cached"] is True
+
+
 def test_flask_test_client_tldr_skips_refresh_for_quiet_recent_thread(
     test_env: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
