@@ -1282,6 +1282,25 @@ class Handler:
             asyncio.run(_prefetch_tldrs_for_ranked(final, db, per_combo, stale_per_run))
 
 
+_CARDS_START = b"<!--cards:start-->"
+_CARDS_END = b"<!--cards:end-->"
+
+
+def _extract_cards_fragment(html: bytes) -> bytes:
+    """Slice the rendered card markup out of a full dashboard render.
+
+    Byte-level find/slice (no HTML parsing) so the fragment is guaranteed
+    to be exactly the markup between the sentinel comments in index.html.
+    Returns an empty fragment for skeleton/cold-deck-less renders, which
+    carry no sentinels and no cards either way.
+    """
+    start = html.find(_CARDS_START)
+    end = html.find(_CARDS_END)
+    if start == -1 or end == -1:
+        return b""
+    return html[start + len(_CARDS_START) : end]
+
+
 def _no_cache_dashboard_response(
     html: bytes, *, user: User | None = None, set_session_cookie: bool = False
 ) -> Response:
@@ -1933,6 +1952,23 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
     @app.get("/api/ranking-ready")
     def ranking_ready() -> ResponseReturnValue:
         return _handle_flask_ranking_ready(runtime)
+
+    @app.get("/api/deck-cards")
+    def deck_cards() -> ResponseReturnValue:
+        user = _flask_user(runtime)
+        if not user:
+            return _flask_json_response(
+                {"error": "No session"}, status=HTTPStatus.UNAUTHORIZED
+            )
+        html = runtime._render_dashboard_for_user(user)
+        fragment = _extract_cards_fragment(html)
+        response = Response(
+            fragment, status=HTTPStatus.OK, content_type="text/html; charset=utf-8"
+        )
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
 
     @app.get("/")
     @app.get("/index.html")

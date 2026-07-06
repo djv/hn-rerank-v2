@@ -3916,6 +3916,57 @@ def test_data_is_recent_attribute_emitted(test_env):
     assert 'data-is-recent="0"' in old_card
 
 
+def test_deck_cards_requires_session(app_env: Any) -> None:
+    port, _, _, _, _ = app_env
+
+    resp = httpx.get(f"http://127.0.0.1:{port}/api/deck-cards")
+
+    assert resp.status_code == 401
+    assert resp.json() == {"error": "No session"}
+
+
+def test_deck_cards_returns_only_card_fragment(test_env) -> None:
+    """The fragment must carry the same cards as the full page but none of
+    the static shell (Pico CSS, custom CSS, inline JS) - that's the whole
+    point of the slim refill endpoint."""
+    port, db, regen_event, handler, user = test_env
+    now = int(time.time())
+    story_id = 6001
+    db.upsert_story(
+        Story(
+            id=story_id,
+            title="Deck cards fragment story",
+            url=None,
+            score=250,
+            time=now - 3600,
+            text_content="A story with content.",
+            source="hn",
+            comment_count=4,
+        )
+    )
+    handler._render_dashboard_for_user(user)
+    _wait_for_cache(handler, user, 0, timeout=3.0)
+
+    full = httpx.get(
+        f"http://127.0.0.1:{port}/",
+        cookies={"hn_token": user.token},
+        follow_redirects=True,
+    )
+    fragment_resp = httpx.get(
+        f"http://127.0.0.1:{port}/api/deck-cards",
+        cookies={"hn_token": user.token},
+    )
+
+    assert fragment_resp.status_code == 200
+    assert fragment_resp.headers["content-type"].startswith("text/html")
+    assert fragment_resp.headers["Cache-Control"] == "no-cache, no-store, must-revalidate"
+    fragment = fragment_resp.text
+    assert f'data-story-id="{story_id}"' in fragment
+    assert "<style" not in fragment
+    assert "<script" not in fragment
+    assert len(fragment) < len(full.text) * 0.5
+
+
 def test_inline_script_has_voted_story_ids_filter():
     """The client-side ``votedStoryIds`` Set and the refillQueue filter are
     the defense-in-depth for the 2026-06-28 stale-fetch bug: even if a SWR

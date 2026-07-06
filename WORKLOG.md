@@ -2,6 +2,40 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-06 — perf: slim deck-refill endpoint (`/api/deck-cards`)
+
+Prompted by reviewing Linear's engineering write-up on their client
+performance techniques (performance.dev). Most of it doesn't transfer here
+(server-rendered shell, no client store, system fonts, optimistic voting
+already in place) but one idea did: deck refills were re-fetching the
+*entire* dashboard document (Pico CSS + custom CSS + inline JS + full card
+pool, ~140 KB) just to pull a handful of new `.story-card` elements
+(`fetchRefillDoc`/`refillQueue` in `templates/index.html`, previously
+`fetch(window.location.href)` + full-document `DOMParser`).
+
+Added `GET /api/deck-cards` (`server.py`): reuses the existing SWR-cached
+`_render_dashboard_for_user` bytes and slices out just the card markup via
+new `_extract_cards_fragment`, using byte-level `find`/slice between two
+HTML-comment sentinels (`<!--cards:start-->` / `<!--cards:end-->`) added
+around the card loop in `templates/index.html`. No new render path, no
+ranked-list re-plumb - the fragment is guaranteed byte-for-byte identical
+to the cards region of the full page. Requires an existing session
+(401 otherwise); same no-store headers as the full page.
+
+Client (`templates/index.html`): `fetchRefillDoc` now fetches
+`/api/deck-cards` instead of the full page; `refillQueue` reads
+`.story-card` nodes directly off the fragment instead of drilling into a
+parsed `#stories` container. Dedup, voted-story suppression, gradient, and
+sort-order logic unchanged.
+
+Verified: full suite (498 passed, 1 skipped), `ruff check .` and
+`ty check` clean. Live smoke test against an isolated worktree DB copy
+(100 seeded stories): full page 242,673 bytes vs. fragment 101,046 bytes,
+identical 100/100 `data-story-id` cards in both, fragment contains zero
+`<style>`/`<script>`/Pico markup, unauthenticated request returns 401. New
+tests `test_deck_cards_requires_session` and
+`test_deck_cards_returns_only_card_fragment` in `tests/test_server.py`.
+
 ## 2026-07-05 — fix: ClearVote no-op when no existing vote (weed finding)
 
 `/allium:weed` against `specs/ranking-feedback.allium` re-confirmed the
