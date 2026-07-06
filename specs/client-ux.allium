@@ -1,0 +1,212 @@
+-- allium: 3
+-- client-ux.allium
+
+-- Scope: the browser-facing interaction flow around the story deck -
+-- everything a viewer can do to navigate, filter, and consume the
+-- dashboard, independent of how stories are ranked or summarized.
+-- Includes:
+--   - First-visit account creation and profile-link device linking
+--   - Navigation filters (sort / age / source) and how they compose
+--   - The single-card "deck" consumption model: one active card at a
+--     time, voted cards never resurface, running out of cards
+--     triggers a background refill
+--   - The observable TLDR request contract: outcomes the viewer can
+--     see (summarized / nothing to summarize / failed) and which of
+--     those are cached vs. retryable - not how summaries are generated
+--   - The first-time onboarding tip and its per-browser (not
+--     per-account) dismissal
+-- Excludes:
+--   - Ranking and voting domain rules (CastVote, ClearVote, discovery
+--     badges, personalization ramp-in) - see ranking-feedback.allium,
+--     reused here by reference
+--   - TLDR/summary generation, caching thresholds, hot-thread
+--     detection - a separate (not yet written) summarization spec;
+--     this spec only covers the contract the viewer observes
+--   - Story ingestion/sourcing from HN, Reddit, LessWrong, RSS
+--   - Token/cookie security mechanics - "profile link" and "browser"
+--     are opaque identifiers here, not implementation of either
+
+use "./ranking-feedback.allium" as ranking
+
+external entity Browser {}
+
+enum SortMode { recommended | popular | explore | date }
+enum TldrOutcome { summarized | nothing_to_summarize | failed }
+
+entity BrowserSession {
+    browser: Browser
+    account: ranking/User
+}
+
+entity NavigationFilter {
+    viewer: ranking/User
+    sort: SortMode
+    age: ranking/SegmentAge
+    source: ranking/SegmentSource
+}
+
+entity OnboardingTip {
+    browser: Browser
+    dismissed: Boolean
+}
+
+external entity TldrView {
+    story: ranking/Story
+    outcome: TldrOutcome
+    text: String?
+}
+
+-- A first-ever visit creates a new account for that browser. This is
+-- the only place ranking/User accounts come into existence - the
+-- ranking spec treats User as pre-existing because it excludes auth.
+rule StartSession {
+    when: FirstVisit(browser)
+    requires: not exists BrowserSession{browser}
+
+    ensures: BrowserSession.created(browser: browser, account: ranking/User.created())
+}
+
+-- Opening a copied profile link on a browser (new, or previously tied
+-- to a different account) re-points that browser at the target
+-- account instead of creating a new one. This is the sole
+-- device-linking mechanism; there is no in-app "paste a link" field.
+rule RedeemProfileLink {
+    when: RedeemProfileLink(browser, account)
+
+    ensures:
+        if exists BrowserSession{browser}:
+            BrowserSession{browser}.account = account
+        else:
+            BrowserSession.created(browser: browser, account: account)
+}
+
+rule SelectSort {
+    when: SelectSort(viewer, sort)
+
+    ensures:
+        NavigationFilter{viewer}.sort = sort
+        if sort = popular:
+            NavigationFilter{viewer}.source = hn
+
+    @guidance
+        -- The popular sort only has meaning within HN's own score
+        -- signal, so choosing it forces the source filter to hn.
+}
+
+rule SelectSource {
+    when: SelectSource(viewer, source)
+
+    ensures:
+        NavigationFilter{viewer}.source = source
+        if source = non_hn and NavigationFilter{viewer}.sort = popular:
+            NavigationFilter{viewer}.sort = recommended
+}
+
+rule SelectAge {
+    when: SelectAge(viewer, age)
+    ensures: NavigationFilter{viewer}.age = age
+}
+
+invariant PopularSortRequiresHnSource {
+    for f in NavigationFilters:
+        f.sort = popular implies f.source = hn
+}
+
+surface StoryDeck {
+    facing viewer: ranking/User
+
+    context card: ranking/RankedCard where for_user = viewer
+    let filter = NavigationFilter{viewer}
+    let tldr = TldrView{story: card.story}
+
+    exposes:
+        filter.sort
+        filter.age
+        filter.source
+        card.segment
+        card.badges
+        tldr.outcome
+        tldr.text when tldr.outcome = summarized
+
+    provides:
+        SelectSort(viewer, sort)
+        SelectAge(viewer, age)
+        SelectSource(viewer, source)
+        ranking/CastVote(viewer, card.story, reaction)
+        ranking/ClearVote(viewer, card.story)
+            when exists ranking/Vote{user: viewer, story: card.story}
+        ViewTldr(viewer, card.story)
+
+    @guarantee OneCardAtATime
+        -- Exactly one card is "active" for a viewer at any moment.
+        -- Advancing (voting, skipping, or undoing) always leaves
+        -- either a new active card matching the current filter, or
+        -- none - never two, never a stale one.
+
+    @guarantee VotedCardsNeverResurface
+        -- Once a viewer has cast any reaction (including neutral/skip)
+        -- on a story, that story is never shown to them again as an
+        -- active card, even across a background refill, until the
+        -- vote is undone or cleared.
+
+    @guarantee DeckRefillsWhenExhausted
+        -- If no card matches the viewer's current filter, the system
+        -- automatically fetches more candidates in the background
+        -- rather than leaving the deck permanently empty. The viewer
+        -- never has to take an explicit "load more" action.
+
+    @guarantee VoteFeelsInstant
+        -- Casting a vote (including via undo) is reflected to the
+        -- viewer immediately, before the vote is durably recorded.
+        -- If recording later fails, the reflected state is reverted
+        -- and the viewer is told the vote did not save.
+
+    @guarantee TldrCachingContract
+        -- A TldrView with outcome summarized or nothing_to_summarize
+        -- is stable for the viewer's session: re-opening the same
+        -- card returns the cached view without a new request. A
+        -- TldrView with outcome failed is never cached - re-opening
+        -- the card retries.
+
+    @guidance
+        -- Filtering (sort/age/source) narrows which already-fetched
+        -- cards are eligible to become active; it is not a new query
+        -- for different stories.
+}
+
+rule DismissOnboardingTip {
+    when: DismissOnboardingTip(tip)
+    ensures: tip.dismissed = true
+}
+
+-- Scoped to the browser rather than the account: onboarding state
+-- travels with the device, not the identity. A returning account
+-- visiting from a browser that has never dismissed the tip (e.g.
+-- right after redeeming a profile link on a new device) sees it
+-- again, even though voting/ranking state for that account is fully
+-- restored.
+surface OnboardingTipSurface {
+    facing browser: Browser
+
+    let tip = OnboardingTip{browser: browser}
+
+    exposes:
+        tip.dismissed when not tip.dismissed
+
+    provides:
+        DismissOnboardingTip(tip)
+}
+
+surface AccountEntry {
+    facing browser: Browser
+
+    provides:
+        FirstVisit(browser)
+        RedeemProfileLink(browser, account)
+
+    @guidance
+        -- `account` stands in for the profile link's token resolution,
+        -- which is elided here (see scope note) - the browser does not
+        -- literally choose an account, it presents an opaque link that
+        -- resolves to one.
+}
