@@ -97,6 +97,13 @@ class Config:
     # current story content (e.g. article_body was enriched after the TLDR
     # was generated). 0 disables. See server.py::_prefetch_tldrs_for_ranked.
     tldr_prefetch_stale_per_run: int = 3
+    # On-demand HN comment refresh (tldr-detail): forces a real-time Algolia
+    # re-fetch for recent, high-velocity threads even when top_comments is
+    # already populated from prewarm, since CH prewarm has 1-24h latency on
+    # brand-new comments. Any knob set to 0 disables the corresponding gate.
+    tldr_refresh_recent_hours: float = 72.0
+    tldr_refresh_min_comments: int = 30
+    tldr_refresh_min_comments_per_hour: float = 8.0
     # Public demo abuse limits. Cached TLDR hits bypass the uncached TLDR
     # quota; these limits protect only new enrichment/LLM work and vote writes.
     tldr_uncached_per_user_limit: int = 12

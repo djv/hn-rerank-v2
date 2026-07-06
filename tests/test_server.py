@@ -2053,6 +2053,153 @@ def test_flask_test_client_tldr_uncached_limit_sets_retry_after(
     assert calls == ["Flask per-user TLDR story 1716"]
 
 
+def test_flask_test_client_tldr_forces_refresh_for_active_thread(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recent, high-velocity HN thread should trigger a force=True
+    fetch_story call even though top_comments is already populated from
+    prewarm -- CH prewarm data can be 1-24h stale for brand-new comments."""
+    import server
+
+    _, db, _, handler, user = test_env
+    now = time.time()
+    active_story = Story(
+        id=1720,
+        title="Active thread story",
+        url="https://example.com/active-thread",
+        score=200,
+        time=int(now - 2 * 3600),  # 2h old
+        text_content="Active thread story. Body.",
+        source="hn",
+        comment_count=200,  # 100 comments/hour
+        comment_count_at_fetch=200,
+        self_text="",
+        top_comments="Existing prewarmed comments.",
+        article_body="Body.",
+    )
+    db.upsert_story(active_story)
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+
+    calls: list[dict[str, Any]] = []
+
+    async def mock_fetch_story(client_, sid, db_, *, force=False):
+        calls.append({"sid": sid, "force": force})
+        return None
+
+    monkeypatch.setattr("pipeline.fetch_story", mock_fetch_story)
+
+    async def mock_generate_detailed_tldr(
+        title: str, self_text: str, top_comments: str, article_body: str
+    ) -> "server.TldrResult":
+        return server.TldrResult(kind="ok", tldr=f"TLDR: {title}")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    resp = client.post("/api/tldr-detail", json={"story_id": active_story.id})
+
+    assert resp.status_code == 200
+    assert calls == [{"sid": active_story.id, "force": True}]
+
+
+def test_flask_test_client_tldr_skips_refresh_for_quiet_recent_thread(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recent but low-velocity HN thread should NOT trigger a forced
+    refresh -- only threads that look actively busy are worth the extra
+    Algolia call."""
+    import server
+
+    _, db, _, handler, user = test_env
+    now = time.time()
+    quiet_story = Story(
+        id=1721,
+        title="Quiet recent story",
+        url="https://example.com/quiet-recent",
+        score=10,
+        time=int(now - 2 * 3600),  # 2h old
+        text_content="Quiet recent story. Body.",
+        source="hn",
+        comment_count=5,  # 2.5 comments/hour, below default floor + velocity
+        comment_count_at_fetch=5,
+        self_text="",
+        top_comments="Existing prewarmed comments.",
+        article_body="Body.",
+    )
+    db.upsert_story(quiet_story)
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+
+    calls: list[dict[str, Any]] = []
+
+    async def mock_fetch_story(client_, sid, db_, *, force=False):
+        calls.append({"sid": sid, "force": force})
+        return None
+
+    monkeypatch.setattr("pipeline.fetch_story", mock_fetch_story)
+
+    async def mock_generate_detailed_tldr(
+        title: str, self_text: str, top_comments: str, article_body: str
+    ) -> "server.TldrResult":
+        return server.TldrResult(kind="ok", tldr=f"TLDR: {title}")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    resp = client.post("/api/tldr-detail", json={"story_id": quiet_story.id})
+
+    assert resp.status_code == 200
+    assert calls == []
+
+
+def test_flask_test_client_tldr_skips_refresh_for_old_active_thread(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A high-velocity-looking thread that is older than
+    tldr_refresh_recent_hours should NOT trigger a forced refresh."""
+    import server
+
+    _, db, _, handler, user = test_env
+    handler.config = replace(handler.config, tldr_refresh_recent_hours=72.0)
+    now = time.time()
+    old_story = Story(
+        id=1722,
+        title="Old busy story",
+        url="https://example.com/old-busy",
+        score=200,
+        time=int(now - 100 * 3600),  # 100h old, past the 72h window
+        text_content="Old busy story. Body.",
+        source="hn",
+        comment_count=500,
+        comment_count_at_fetch=500,
+        self_text="",
+        top_comments="Existing prewarmed comments.",
+        article_body="Body.",
+    )
+    db.upsert_story(old_story)
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+
+    calls: list[dict[str, Any]] = []
+
+    async def mock_fetch_story(client_, sid, db_, *, force=False):
+        calls.append({"sid": sid, "force": force})
+        return None
+
+    monkeypatch.setattr("pipeline.fetch_story", mock_fetch_story)
+
+    async def mock_generate_detailed_tldr(
+        title: str, self_text: str, top_comments: str, article_body: str
+    ) -> "server.TldrResult":
+        return server.TldrResult(kind="ok", tldr=f"TLDR: {title}")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    resp = client.post("/api/tldr-detail", json={"story_id": old_story.id})
+
+    assert resp.status_code == 200
+    assert calls == []
+
+
 def test_flask_test_client_tldr_stale_fallback_on_quota_denied(
     test_env: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2438,7 +2585,7 @@ def test_tldr_detail_dynamic_fetch(test_env, monkeypatch):
     )
 
     # Mock fetch_story and _fetch_article_body
-    async def mock_fetch_story(client, sid, database):
+    async def mock_fetch_story(client, sid, database, *, force=False):
         story = database.get_story(sid)
         from dataclasses import replace
 
@@ -2505,7 +2652,7 @@ def test_tldr_detail_dynamic_fetch_for_bq_seed(test_env, monkeypatch):
         )
     )
 
-    async def mock_fetch_story(client, sid, database):
+    async def mock_fetch_story(client, sid, database, *, force=False):
         story = database.get_story(sid)
         from dataclasses import replace
 
@@ -2563,7 +2710,7 @@ def test_tldr_detail_dynamic_fetch_for_ch_seed(test_env, monkeypatch):
         )
     )
 
-    async def mock_fetch_story(client, sid, database):
+    async def mock_fetch_story(client, sid, database, *, force=False):
         story = database.get_story(sid)
         from dataclasses import replace
 

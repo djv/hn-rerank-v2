@@ -1513,6 +1513,31 @@ def _handle_flask_feedback(runtime: type[Handler]) -> Response:
         )
 
 
+def _hn_thread_looks_active(story: Story, config: Config, now: float) -> bool:
+    """Whether an HN story's comment thread is recent and busy enough to
+    warrant a forced real-time Algolia refresh in tldr-detail.
+
+    Prewarm's comment data comes from ClickHouse, which lags 1-24h behind
+    live HN for brand-new comments. Refreshing every view would be wasteful,
+    so this gates on: post age within a recent window, an absolute comment
+    floor (skip small threads), and comment velocity (comments/hour) above a
+    threshold — a proxy for "this thread is still actively accruing
+    comments right now," since the endpoint has no direct fetch-timestamp
+    signal to compare against.
+    """
+    if not is_hn_source(story.source):
+        return False
+    if story.time <= 0:
+        return False
+    age_hours = (now - story.time) / 3600.0
+    if age_hours <= 0 or age_hours > config.tldr_refresh_recent_hours:
+        return False
+    comment_count = story.comment_count or 0
+    if comment_count < config.tldr_refresh_min_comments:
+        return False
+    return (comment_count / age_hours) >= config.tldr_refresh_min_comments_per_hour
+
+
 def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
     try:
         user = _flask_user(runtime)
@@ -1581,18 +1606,29 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
                 quota.retry_after_seconds,
             )
 
-        # If an HN story has comments but no cached comment text, fetch them lazily.
-        if (
+        # If an HN story has comments but no cached comment text, fetch them
+        # lazily. Also force a real-time refresh for recent, high-velocity
+        # threads even when top_comments is already populated from prewarm,
+        # since CH prewarm data can be 1-24h stale for brand-new comments.
+        needs_empty_fetch = (
             is_hn_source(story.source)
             and not story.top_comments
             and (story.comment_count or 0) > 0
-        ):
+        )
+        needs_active_refresh = bool(story.top_comments) and _hn_thread_looks_active(
+            story, runtime.config, time.time()
+        )
+        if needs_empty_fetch or needs_active_refresh:
             try:
                 from pipeline import fetch_story
 
+                force = needs_active_refresh
+
                 async def do_fetch() -> Story | None:
                     async with httpx.AsyncClient(timeout=15.0) as client:
-                        return await fetch_story(client, story_id, runtime.db)
+                        return await fetch_story(
+                            client, story_id, runtime.db, force=force
+                        )
 
                 updated = asyncio.run(do_fetch())
                 if updated:
