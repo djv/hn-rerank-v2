@@ -33,6 +33,12 @@ external entity Browser {}
 enum SortMode { recommended | popular | explore | date }
 enum TldrOutcome { summarized | nothing_to_summarize | failed }
 
+-- Unlike ranking/SegmentSource (hn | non_hn), the navigation filter has a
+-- third state: mixed, the default view showing the full pool regardless
+-- of source. It is not a ranking-domain segment - it is the absence of a
+-- source restriction in the viewer's navigation choice.
+enum SourceFilter { mixed | hn | non_hn }
+
 entity BrowserSession {
     browser: Browser
     account: ranking/User
@@ -42,7 +48,7 @@ entity NavigationFilter {
     viewer: ranking/User
     sort: SortMode
     age: ranking/SegmentAge
-    source: ranking/SegmentSource
+    source: SourceFilter
 }
 
 entity OnboardingTip {

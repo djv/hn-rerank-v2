@@ -2,6 +2,23 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-06 — spec: fix `NavigationFilter.source` type in `client-ux.allium`
+
+`allium:weed` check-mode pass against `specs/client-ux.allium` found
+`NavigationFilter.source` typed as `ranking/SegmentSource` (`hn | non_hn`),
+but the actual navigation model is 3-way — `mixed | hn | non-hn` — with
+`mixed` (full pool, no source restriction) as the default
+(`pipeline/render.py:279-290`, `templates/index.html:885`). Added a
+client-ux-local `enum SourceFilter { mixed | hn | non_hn }` and repointed
+`NavigationFilter.source` at it; `SelectSort`/`SelectSource`/
+`PopularSortRequiresHnSource` needed no changes since they only ever
+reference the `hn`/`non_hn` values, both still valid members. Verified with
+`allium check specs/client-ux.allium specs/ranking-feedback.allium` — 0
+diagnostics on `client-ux.allium`. A second divergence found in the same
+pass (`SelectSort` doesn't document that reselecting the already-active
+sort tab skips to the next card) was classified as an intentional UX gap,
+not a spec bug — left unmodeled by design.
+
 ## 2026-07-06 — perf: slim deck-refill endpoint (`/api/deck-cards`)
 
 Prompted by reviewing Linear's engineering write-up on their client
