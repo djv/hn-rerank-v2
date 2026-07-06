@@ -846,9 +846,11 @@
            data-user-token="{{ user_token or '' }}"
            data-dashboard-version="{{ dashboard_version }}"
            data-current-version="{{ dashboard_latest_version }}">
+      <!--cards:start-->
       {% for card in cards %}
       {% include "components/story_card.html" %}
       {% endfor %}
+      <!--cards:end-->
       </div>
 
       {% include "components/side_rail.html" %}
@@ -1383,7 +1385,7 @@
     });
 
     async function fetchRefillDoc() {
-      const resp = await fetch(window.location.href, { cache: 'no-store' });
+      const resp = await fetch('/api/deck-cards', { cache: 'no-store' });
       if (!resp.ok) {
         throw new Error(`Refill failed: ${resp.status}`);
       }
@@ -1394,10 +1396,6 @@
 
     async function refillQueue({ advance = true } = {}) {
       const newDoc = await fetchRefillDoc();
-      const newStories = newDoc.getElementById('stories');
-      if (!newStories) {
-        throw new Error('Refill failed: stories container missing');
-      }
 
       cards().forEach(card => {
         if (card !== activeCard) {
@@ -1405,7 +1403,7 @@
         }
       });
       const existing = new Set(cards().map(card => card.dataset.storyId));
-      const incoming = Array.from(newStories.querySelectorAll('.story-card'));
+      const incoming = Array.from(newDoc.querySelectorAll('.story-card'));
       let suppressedVoted = 0;
       for (const card of incoming) {
         const storyId = card.dataset.storyId;
