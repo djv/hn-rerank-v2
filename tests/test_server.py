@@ -261,6 +261,59 @@ def test_discussion_only_prompt_renders_budget_placeholder() -> None:
     assert "9-12 bullets, max 400 words" in prompt
 
 
+def test_article_budget_scales_with_content_volume() -> None:
+    """The article-derived TLDR budget must grow with source material volume
+    rather than staying fixed at 3-5 bullets regardless of article length."""
+    import server
+
+    assert server._article_budget(0) == "3-5 bullets, max 150 words"
+    assert server._article_budget(1_499) == "3-5 bullets, max 150 words"
+    assert server._article_budget(1_500) == "6-8 bullets, max 250 words"
+    assert server._article_budget(4_999) == "6-8 bullets, max 250 words"
+    assert server._article_budget(5_000) == "9-12 bullets, max 400 words"
+    assert server._article_budget(12_000) == "9-12 bullets, max 400 words"
+
+
+def test_article_only_prompt_renders_budget_placeholder() -> None:
+    """Pins the {budget} placeholder contract in article_only_v4.txt -- if a
+    future prompt edit drops it, .format() must fail loudly here rather than
+    silently ignoring the scaled budget."""
+    import server
+
+    prompt = server._load_prompt("article_only_v4.txt").format(
+        title="Some story",
+        article_section="Author's text:\nsome article content",
+        budget=server._article_budget(5_000),
+    )
+    assert "9-12 bullets, max 400 words" in prompt
+
+
+def test_article_v4_prompt_renders_budget_placeholder() -> None:
+    """Pins the {budget} placeholder contract in article_v4.txt (the article
+    half of the combined article+comments path)."""
+    import server
+
+    prompt = server._load_prompt("article_v4.txt").format(
+        title="Some story",
+        article_section="Author's text:\nsome article content",
+        budget=server._article_budget(5_000),
+    )
+    assert "9-12 bullets, max 400 words" in prompt
+
+
+def test_discussion_v4_prompt_renders_budget_placeholder() -> None:
+    """Pins the {budget} placeholder contract in discussion_v4.txt (the
+    discussion half of the combined article+comments path)."""
+    import server
+
+    prompt = server._load_prompt("discussion_v4.txt").format(
+        title="Some story",
+        comments_section="a comment",
+        budget=server._discussion_budget(5_000),
+    )
+    assert "9-12 bullets, max 400 words" in prompt
+
+
 def test_token_redirect(app_env):
     port, _, _, _, user = app_env
     resp = httpx.get(f"http://127.0.0.1:{port}/u/{user.token}", follow_redirects=False)
@@ -3222,6 +3275,38 @@ async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
     assert "- **Article** summary" in result.tldr
     assert "### Discussion" in result.tldr
     assert "- **Discussion** summary" in result.tldr
+
+
+@pytest.mark.asyncio
+async def test_generate_detailed_tldr_scales_combined_path_budgets(monkeypatch):
+    """The combined article+comments path must inject volume-scaled budgets
+    into both halves rather than staying fixed-length regardless of input
+    size (matches article-only/discussion-only scaling)."""
+    import server
+
+    calls = []
+
+    async def mock_call_llm_chat(*, api_key, base_url, model, prompt, max_tokens):
+        calls.append(prompt)
+        return server.LlmChatResult(content="- summary", ok=True)
+
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setattr(server, "_call_llm_chat", mock_call_llm_chat)
+
+    long_article = "x" * 5_000
+    long_comments = "y" * 5_000
+
+    await server.generate_detailed_tldr(
+        "Split summary test",
+        self_text=long_article,
+        top_comments=long_comments,
+        article_body="",
+    )
+
+    assert len(calls) == 2
+    article_prompt, discussion_prompt = calls
+    assert "9-12 bullets, max 400 words" in article_prompt
+    assert "9-12 bullets, max 400 words" in discussion_prompt
 
 
 @pytest.mark.asyncio

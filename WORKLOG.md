@@ -6269,3 +6269,36 @@ tldr=...)`. Direct `_call_llm_chat` mock assertions updated to check
 - Updated test assertions from `result.error == ""` to `result.error is None`.
 
 **Files**: `server.py`, `database.py`, `tests/test_fetch.py`, `WORKLOG.md`.
+
+## 2026-07-06 — RSS content retention + volume-scaled TLDR length
+
+RSS-sourced TLDRs (e.g. Slashdot) were short and sometimes truncated
+mid-word. Root cause was a chain: RSS ingest hard-capped the cleaned
+feed summary at 1000 chars even when the feed carried a full article
+body (`entry.content`), and every article-derived prompt hardcoded a
+fixed short length regardless of how much source material existed.
+
+- `pipeline/enrichment.py`: RSS snippet cap raised from `[:1000]` to
+  `[:RSS_SELF_TEXT_CHAR_LIMIT]` (8000, new constant), matching
+  `server.py`'s `SELF_TEXT_PROMPT_CHAR_LIMIT` — no RSS content that
+  survives ingest is later dropped by the prompt assembler.
+- `server.py`: added `_article_budget(chars)`, mirroring the existing
+  `_discussion_budget` tiers (150/250/400 words at 1500/5000 char
+  breakpoints), so article-derived summaries scale with source volume
+  instead of collapsing a full article into the same terse output as
+  a thin teaser.
+- All three article/discussion prompts that were previously
+  fixed-length now take a `{budget}` placeholder and are scaled at
+  call sites: `article_only_v4.txt` (`_article_budget`), and both
+  halves of the combined path — `article_v4.txt` (`_article_budget`)
+  and `discussion_v4.txt` (`_discussion_budget`). `discussion_only_v4.txt`
+  already had this pattern (added 2026-06-22).
+- Side effect (no code change): the article-fetch guard
+  (`server.py`, `len(self_text) < 500`) now self-adjusts — richer
+  RSS `self_text` clears 500 chars for most feeds with real content,
+  so the secondary HTTP article fetch fires less often, while
+  genuinely thin teasers still fall through and fetch as before.
+
+**Files**: `pipeline/enrichment.py`, `server.py`, `prompts/article_only_v4.txt`,
+`prompts/article_v4.txt`, `prompts/discussion_v4.txt`, `tests/test_pipeline.py`,
+`tests/test_server.py`, `WORKLOG.md`.

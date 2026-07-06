@@ -649,6 +649,19 @@ def _discussion_budget(comment_chars: int) -> str:
     return "9-12 bullets, max 400 words"
 
 
+def _article_budget(self_text_chars: int) -> str:
+    """Bullet/word budget for article-derived summaries, scaled by source
+    material volume so a full RSS/article body doesn't collapse into the
+    same terse output as a thin teaser. self_text_chars is the length of
+    the already char-capped article_section (see SELF_TEXT_PROMPT_CHAR_LIMIT
+    / ARTICLE_BODY_CHAR_LIMIT). Mirrors _discussion_budget's tiers."""
+    if self_text_chars < 1_500:
+        return "3-5 bullets, max 150 words"
+    if self_text_chars < 5_000:
+        return "6-8 bullets, max 250 words"
+    return "9-12 bullets, max 400 words"
+
+
 async def generate_detailed_tldr(
     title: str,
     self_text: str = "",
@@ -685,10 +698,14 @@ async def generate_detailed_tldr(
 
     if article_section and comments_section:
         article_prompt = _load_prompt("article_v4.txt").format(
-            title=title, article_section=article_section
+            title=title,
+            article_section=article_section,
+            budget=_article_budget(len(article_section)),
         )
         discussion_prompt = _load_prompt("discussion_v4.txt").format(
-            title=title, comments_section=comments_section
+            title=title,
+            comments_section=comments_section,
+            budget=_discussion_budget(len(comments_section)),
         )
         article_task = _call_llm_chat(
             api_key=api_key,
@@ -747,7 +764,9 @@ async def generate_detailed_tldr(
 
     if article_section and not comments_section:
         prompt = _load_prompt("article_only_v4.txt").format(
-            title=title, article_section=article_section
+            title=title,
+            article_section=article_section,
+            budget=_article_budget(len(article_section)),
         )
     else:
         prompt = _load_prompt("discussion_only_v4.txt").format(
