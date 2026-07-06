@@ -834,6 +834,59 @@ async def test_rss_feed_no_comments_url(monkeypatch):
     assert stories[0].discussion_url is None
 
 
+@pytest.mark.asyncio
+async def test_rss_feed_retains_full_content_body(monkeypatch):
+    """Feeds that ship a full article body via <content:encoded> must have
+    that body retained in self_text up to RSS_SELF_TEXT_CHAR_LIMIT (8000),
+    not truncated to the old 1000-char teaser cap. Full retention lets the
+    TLDR prompt scale with real content instead of a clipped snippet.
+    """
+    from pipeline import _fetch_and_parse_feed
+    from pipeline.enrichment import RSS_SELF_TEXT_CHAR_LIMIT
+
+    long_body = "word " * 900  # ~4500 chars, well past the old 1000 cap
+
+    class MockResp:
+        status_code = 200
+        text = f"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+<channel><title>Test</title>
+<item>
+  <title>Long Post</title>
+  <link>https://example.com/long-post</link>
+  <pubDate>Tue, 23 Jun 2026 12:00:00 GMT</pubDate>
+  <content:encoded><![CDATA[{long_body}]]></content:encoded>
+</item>
+</channel></rss>"""
+        headers: dict[str, str] = {}
+
+    class MockClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, url, headers=None):
+            return MockResp()
+
+    monkeypatch.setattr("pipeline.enrichment.httpx.AsyncClient", MockClient)
+
+    stories = await _fetch_and_parse_feed(
+        "https://example.com/feed.xml",
+        per_feed=10,
+        cutoff=0,
+        now=1_000_000,
+        exclude_urls=set(),
+    )
+    assert len(stories) == 1
+    assert len(stories[0].self_text) > 1000
+    assert len(stories[0].self_text) <= RSS_SELF_TEXT_CHAR_LIMIT
+
+
 def test_is_summarizable_with_content():
     """Stories with self_text, top_comments, or article_body are summarizable."""
     from pipeline import Story

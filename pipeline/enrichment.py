@@ -32,6 +32,10 @@ from .ranking import (
 RSS_USER_AGENT = "hn-rewrite/1.0 (+https://github.com/local/hn-rewrite)"
 REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dashboard"
 
+# Matches server.py's SELF_TEXT_PROMPT_CHAR_LIMIT: no point retaining RSS
+# content beyond what the TLDR prompt assembler will actually use.
+RSS_SELF_TEXT_CHAR_LIMIT = 8_000
+
 
 def _coerce_int(value, default: int = 0) -> int:
     if value is None:
@@ -638,7 +642,7 @@ async def _fetch_and_parse_feed(
                 summary = entry.summary
 
             clean_summary = clean_text(summary)
-            snippet = clean_summary[:1000]
+            snippet = clean_summary[:RSS_SELF_TEXT_CHAR_LIMIT]
             self_text = snippet
             text_content = compose_story_text(title, self_text)
 
