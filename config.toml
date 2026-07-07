@@ -23,7 +23,6 @@ feeds = [
     "https://www.reddit.com/r/rust/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/linux/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/selfhosted/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/netsec/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/Bogleheads/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/ExpatFIRE/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/urbanplanning/top/.rss?t=week&limit=25",
