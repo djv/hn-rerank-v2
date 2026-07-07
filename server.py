@@ -430,31 +430,44 @@ def _clean_lesswrong_html(raw_html: str | None) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+REDDIT_RSS_ON_DEMAND_MAX_ATTEMPTS = 2
+
+
 async def _fetch_reddit_rss_context(url: str | None) -> RedditRssContext | None:
     rss_url = _reddit_post_rss_url(url)
     if not rss_url:
         return None
 
-    if not await reddit_limiter.acquire():
-        return None
+    resp = None
+    for _attempt in range(REDDIT_RSS_ON_DEMAND_MAX_ATTEMPTS):
+        if not await reddit_limiter.acquire():
+            return None
 
-    try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
-            resp = await client.get(
-                rss_url, headers={"User-Agent": REDDIT_RSS_USER_AGENT}
-            )
-    except Exception:
-        return None
+        try:
+            async with httpx.AsyncClient(
+                follow_redirects=True, timeout=15.0
+            ) as client:
+                resp = await client.get(
+                    rss_url, headers={"User-Agent": REDDIT_RSS_USER_AGENT}
+                )
+        except Exception:
+            return None
 
-    if resp.status_code == 429:
-        retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
-        rl_reset_raw = resp.headers.get("x-ratelimit-reset")
-        rl_reset = float(rl_reset_raw) if rl_reset_raw else None
-        reddit_limiter.on_429(retry_after, rate_limit_reset=rl_reset)
+        if resp.status_code == 429:
+            retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+            rl_reset_raw = resp.headers.get("x-ratelimit-reset")
+            rl_reset = float(rl_reset_raw) if rl_reset_raw else None
+            reddit_limiter.on_429(retry_after, rate_limit_reset=rl_reset)
+            # A single 429 is often transient contention with the topfeed/
+            # prewarm queue on the same shared-IP limiter; the next
+            # acquire() call honors the backoff before we retry once more.
+            continue
+        if resp.status_code != 200:
+            return None
+        reddit_limiter.on_success()
+        break
+    else:
         return None
-    if resp.status_code != 200:
-        return None
-    reddit_limiter.on_success()
 
     parsed = feedparser.parse(resp.text)
     entries = list(parsed.entries)
@@ -1825,6 +1838,10 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
                     "ok": True,
                     "tldr": "No article body or discussion available to summarize for this story.",
                     "cached": False,
+                    # Not persisted to tldr_cache: a later retry (e.g. after
+                    # a transient upstream 429 clears) may find real content,
+                    # so the client must not treat this as a final answer.
+                    "retryable": True,
                 }
             )
         if result.kind == "llm_error":

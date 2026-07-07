@@ -1697,8 +1697,15 @@
         });
         if (resp.ok) {
           const data = await resp.json();
-          tldrCache.set(storyId, data.tldr);
-          delete contentDiv.dataset.error;
+          if (data.retryable) {
+            // No content this attempt (e.g. a transient upstream fetch
+            // failure) - don't cache it as final, so the next card open
+            // retries instead of showing this placeholder forever.
+            contentDiv.dataset.error = 'true';
+          } else {
+            tldrCache.set(storyId, data.tldr);
+            delete contentDiv.dataset.error;
+          }
           contentDiv.innerHTML = parseSimpleMarkdown(data.tldr);
           styleTldrLabels(contentDiv);
           contentDiv.style.display = 'block';
