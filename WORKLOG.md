@@ -2,6 +2,44 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-07 — fix: Reddit on-demand TLDR permanently blanked by a single transient 429
+
+Reported: a Reddit story (`r/Bogleheads` "What's wrong with 100% VOO?",
+story_id `-361278354`) showed 0 comments and no usable TLDR in the app
+despite having 100+ real comments on Reddit. Root-caused via
+`journalctl --user -u hn_rewrite.service` + DB inspection (not
+speculation): the on-demand per-post fetch in
+`_fetch_reddit_rss_context` (`server.py:433`) had already run at
+05:48:44 and gotten a `429 Too Many Requests` from Reddit (shared-IP
+limiter contention with concurrent topfeed/prewarm traffic), then gave
+up with **zero retry**. `story.top_comments` stayed empty in the DB
+permanently — nothing re-triggers this fetch automatically — so
+`generate_detailed_tldr` fell back to the 171-char RSS self_text
+snippet and returned `kind == "no_content"`. The backend correctly
+does not persist that placeholder to `tldr_cache`, so a fresh request
+would have succeeded on retry — but the frontend's `openTldrDetail`
+(`templates/index.html:1657`) cached *any* `resp.ok` payload
+(including the "No article body or discussion available..."
+placeholder) into the in-memory `tldrCache` Map keyed by story_id,
+permanently suppressing any retry for the rest of the browser session.
+
+Fix, two independent parts:
+- `server.py`: `_fetch_reddit_rss_context` now retries once
+  (`REDDIT_RSS_ON_DEMAND_MAX_ATTEMPTS = 2`) on a 429, going back
+  through `reddit_limiter.acquire()` (which honors the limiter's own
+  backoff) before the second attempt.
+- `templates/index.html`: the `no_content` response now carries a
+  `"retryable": true` flag; the frontend skips the `tldrCache.set(...)`
+  call and marks `contentDiv.dataset.error = 'true'` instead, so the
+  existing error-path guard in `openTldrDetail` lets a later card open
+  retry the fetch rather than replaying the stale placeholder forever.
+
+Verified: `uv run pytest tests/ -n 4` (504 passed, 1 skipped),
+`uv run ruff check .`, `uv run ty check` all clean. Also wrote a
+throwaway script mocking `httpx.AsyncClient` to return 429-then-200 and
+confirmed `_fetch_reddit_rss_context` now retries and returns real
+`RedditRssContext` data instead of `None`.
+
 ## 2026-07-06 — spec: fix `NavigationFilter.source` type in `client-ux.allium`
 
 `allium:weed` check-mode pass against `specs/client-ux.allium` found
