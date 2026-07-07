@@ -116,7 +116,9 @@ async def _serve(handler, status=200, body=b"", delay=0.0):
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
     port = server.server_address[1]
-    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t = threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+    )
     t.start()
     url = f"http://127.0.0.1:{port}/{handler}"
     try:

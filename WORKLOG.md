@@ -2,6 +2,29 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-07 — tests: kill the 0.5s server-shutdown tax (again)
+
+`uv run pytest tests/ -n 4` had drifted to ~23.7s, over the <12s target.
+`--durations=15` showed a dozen `0.51s teardown` entries in
+`tests/test_server.py`. Root cause: the three test-server fixtures
+(`app_env`, `test_env` in `tests/test_server.py`, and the `_serve` helper
+in `tests/test_fetch.py`) start `serve_forever()` with werkzeug's/stdlib's
+default `poll_interval` of 0.5s; `_drain_and_shutdown`'s `server.shutdown()`
+blocks until the serving loop's next poll notices the shutdown flag, so
+every teardown paid up to 0.5s of pure idle wait. `test_env` alone backs
+~41 test functions.
+
+Fix: pass `poll_interval=0.01` to all three `serve_forever` calls
+(`tests/test_server.py:198,223`, `tests/test_fetch.py:119`). No production
+code touched. Measured `-n 4`: 23.68s -> 12.56s / 12.81s across repeat runs
+(0.51s teardown band collapsed to ~0.1-0.3s). `ruff check` and `ty check`
+both clean, 504 passed / 1 skipped unchanged.
+
+Note: a prior session's WORKLOG/PR claimed this exact fix had already
+landed (commit `a6269c7f`), but that commit does not exist in this repo's
+history — the live tree still had the unpatched default. Trust the live
+tree over stale session summaries.
+
 ## 2026-07-06 — spec: fix `NavigationFilter.source` type in `client-ux.allium`
 
 `allium:weed` check-mode pass against `specs/client-ux.allium` found

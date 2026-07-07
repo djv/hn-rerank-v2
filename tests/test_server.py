@@ -195,7 +195,9 @@ def app_env(tmp_path_factory, mock_embedder):
     db = Database(str(db_file))
     user = db.create_user("test_token")
     server, port, handler = _start_handler_server(db, mock_embedder)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+    )
     thread.start()
 
     yield port, db, None, handler, user
@@ -220,7 +222,9 @@ def test_env(tmp_path, mock_embedder):
     user = db.create_user("test_token")
 
     server, port, TestHandler = _start_handler_server(db, mock_embedder)
-    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t = threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+    )
     t.start()
 
     regen_event = TestHandler.regen_event
