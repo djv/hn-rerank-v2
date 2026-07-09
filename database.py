@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import time
@@ -48,6 +49,24 @@ class User:
     id: int
     token: str
     created_at: float
+
+
+@dataclass(frozen=True)
+class RankPerfSample:
+    """One warm rerank's perf trace, ready to persist. `fields` is the full
+    RankTrace.to_log_fields() dict (dynamic stage set) stored as JSON; the
+    other columns are the always-queryable dimensions pulled out of it."""
+
+    recorded_at: float
+    user_id: int
+    version: int
+    rank_total_ms: float
+    html_ms: float
+    candidates: int
+    feedback_total: int
+    model_cache: str
+    stories: int
+    fields: dict[str, int | float | str]
 
 
 class Database:
@@ -171,6 +190,26 @@ class Database:
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_article_fetch_failures_url "
                     "ON article_fetch_failures(url)"
+                )
+
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS rank_perf (
+                        id              INTEGER PRIMARY KEY,
+                        recorded_at     REAL NOT NULL,
+                        user_id         INTEGER NOT NULL,
+                        version         INTEGER NOT NULL,
+                        rank_total_ms   REAL NOT NULL,
+                        html_ms         REAL NOT NULL,
+                        candidates      INTEGER NOT NULL,
+                        feedback_total  INTEGER NOT NULL,
+                        model_cache     TEXT NOT NULL,
+                        stories         INTEGER NOT NULL,
+                        fields_json     TEXT NOT NULL
+                    )
+                """)
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_rank_perf_recorded_at "
+                    "ON rank_perf(recorded_at)"
                 )
 
                 # Run migration of article_cache to stories table if article_cache exists
@@ -745,6 +784,32 @@ class Database:
             with conn:
                 cursor = conn.execute(sql, params)
                 return cursor.fetchall()
+
+    # Rank perf telemetry
+    def insert_rank_perf(self, sample: RankPerfSample) -> None:
+        with self.conn() as conn:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO rank_perf (
+                        recorded_at, user_id, version, rank_total_ms, html_ms,
+                        candidates, feedback_total, model_cache, stories, fields_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        sample.recorded_at,
+                        sample.user_id,
+                        sample.version,
+                        sample.rank_total_ms,
+                        sample.html_ms,
+                        sample.candidates,
+                        sample.feedback_total,
+                        sample.model_cache,
+                        sample.stories,
+                        json.dumps(sample.fields),
+                    ),
+                )
 
     # Article fetch failure memory
     def get_article_fetch_failure(self, story_id: int) -> dict | None:

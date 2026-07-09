@@ -2,6 +2,31 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-09 — feature: persist rank_perf traces to SQLite (O2)
+
+Added a `rank_perf` table (additive `CREATE TABLE IF NOT EXISTS`, no migration
+of existing tables) so each warm's `RankTrace` no longer evaporates into
+journalctl. Typed columns cover the always-queryable dimensions
+(`recorded_at`, `user_id`, `version`, `rank_total_ms`, `html_ms`,
+`candidates`, `feedback_total`, `model_cache`, `stories`); a `fields_json`
+column holds the full `trace.to_log_fields()` dict so the dynamic per-stage
+timings (SVM path vs. centroid-only path emit different stages) survive
+without schema churn. Written in `server.py`'s `_run_warm_attempt` right
+after the existing `logging.info("rank_perf ...")` line, wrapped in
+try/except-and-log so a telemetry failure can never break a warm.
+
+New read-only `scripts/perf_report.py` prints p50/p95/max per stage over a
+`--window-days` window, split by `model_cache`, stages sorted by p95
+descending. This is the before/after instrument for the performance work
+queued up next (precomputed-kernel SVM scoring, rerank-cadence changes,
+candidate-matrix caching) — see `fable_plan.md`.
+
+## 2026-07-09 — config: remove low-signal Reddit feeds
+
+Removed the `r/devops`, `r/sre`, and `r/tax` weekly top RSS feeds after
+reviewing local feedback/source statistics. They had fetched substantial story
+counts with no recorded upvotes for user 1.
+
 ## 2026-07-09 — fix: make HN duplicate detection generic
 
 Reworked the selected-card HN duplicate resolver from explicit `[dupe]` comment

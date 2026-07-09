@@ -1454,6 +1454,9 @@ def test_active_warm_commits_when_dashboard_version_advances(
     assert cached[0] == b"fresh content"
     assert cached[2] == 1
 
+    rank_perf_rows = db.execute("SELECT COUNT(*) FROM rank_perf")
+    assert rank_perf_rows[0][0] == 1
+
 
 def test_active_warm_after_lock_wait_still_ranks_and_commits(
     test_env, mock_embedder, monkeypatch

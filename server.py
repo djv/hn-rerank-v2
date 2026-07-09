@@ -29,7 +29,7 @@ from flask import Flask, Response, jsonify, redirect, request
 from flask.typing import ResponseReturnValue
 import httpx
 
-from database import Database, Story, User
+from database import Database, RankPerfSample, Story, User
 from pipeline import Config, Embedder, RankedStory, is_hn_source
 from llm_limiter import limiter as llm_limiter
 from reddit_limiter import limiter as reddit_limiter
@@ -1191,6 +1191,24 @@ class Handler:
                 len(final),
             )
             logging.info("rank_perf %s", trace.format_log_fields())
+
+            fields = trace.to_log_fields()
+            sample = RankPerfSample(
+                recorded_at=time.time(),
+                user_id=user.id,
+                version=requested_version,
+                rank_total_ms=rank_ms,
+                html_ms=html_ms,
+                candidates=int(trace.counts.get("candidates", 0)),
+                feedback_total=int(trace.counts.get("feedback_total", 0)),
+                model_cache=trace.labels.get("model_cache", ""),
+                stories=len(final),
+                fields=fields,
+            )
+            try:
+                cls.db.insert_rank_perf(sample)
+            except Exception:
+                logging.exception("rank_perf persist failed")
 
             per_combo = cls.config.tldr_prefetch_per_combo
             stale_per_run = cls.config.tldr_prefetch_stale_per_run
