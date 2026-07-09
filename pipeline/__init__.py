@@ -99,6 +99,7 @@ from .enrichment import (
     prewarm_top_stories,
     select_article_fetch_candidates,
 )
+from .hn_dupes import canonicalize_hn_dupes
 
 from .render import (
     generate_dashboard_bytes,
@@ -458,7 +459,14 @@ def fast_rerank_for_user(
     trace.set_count("feedback_total", n_feedback)
     if n_feedback == 0:
         trace.set_label("model_cache", "skipped_cold_deck")
-        return build_cold_deck(db)
+        cold_deck = build_cold_deck(db)
+        return canonicalize_hn_dupes(
+            cold_deck,
+            db,
+            selected_limit=config.count,
+            user_id=user_id,
+            feedback_actions=tuple(config.model.dedup_exclude_actions),
+        )
 
     with trace.stage("candidate_sql"):
         candidates = load_production_candidate_stories(
@@ -489,13 +497,22 @@ def fast_rerank_for_user(
         id_to_emb: dict[int, NDArray[np.float32]] = {
             s.id: vec for s, vec in zip(candidates, cand_embeddings)
         }
-        return _apply_dedup_to_ranked(
+        deduped = _apply_dedup_to_ranked(
             ranked,
             db,
             config,
             user_id,
             embeddings=id_to_emb,
             embedder=embedder,
+        )
+    with trace.stage("hn_dupes"):
+        return canonicalize_hn_dupes(
+            deduped,
+            db,
+            candidate_stories=candidates,
+            selected_limit=config.count,
+            user_id=user_id,
+            feedback_actions=tuple(config.model.dedup_exclude_actions),
         )
 
 

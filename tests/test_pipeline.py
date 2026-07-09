@@ -43,6 +43,7 @@ from pipeline import (
     fast_rerank_for_user,
     HOT_MIN_SCORE,
 )
+from pipeline.hn_dupes import HnDupeResolver
 
 
 @pytest.fixture
@@ -2052,6 +2053,352 @@ def test_fast_rerank_for_user_filters_unsummarizable_stories(db, monkeypatch):
     result_ids = {r.story.id for r in ranked}
     assert summarizable_id in result_ids
     assert unsummarizable_id not in result_ids
+
+
+def test_canonicalize_hn_dupes_replaces_selected_story_preserving_metadata(
+    db: Database,
+) -> None:
+    duplicate = Story(
+        id=100,
+        title="Claude Fable extended to July 12",
+        url="https://example.com/dupe",
+        score=10,
+        time=1000,
+        text_content="dupe text",
+        source="hn",
+        comment_count=3,
+    )
+    canonical = Story(
+        id=200,
+        title="We're extending access to Fable 5 on all paid plans through July 12",
+        url="https://example.com/canonical",
+        score=50,
+        time=900,
+        text_content="canonical text",
+        source="hn",
+        comment_count=5,
+        top_comments="canonical comments",
+    )
+    ranked = [
+        RankedStory(
+            story=duplicate,
+            score=0.77,
+            best_match_title="match",
+            is_hot=True,
+            combo_keys="recent_hn recent_mixed",
+        )
+    ]
+    resolver = HnDupeResolver(
+        fetch_item=lambda story_id: {
+            100: {
+                "id": 100,
+                "type": "story",
+                "title": "Claude Fable extended to July 12",
+                "score": 10,
+                "descendants": 3,
+                "kids": [101],
+            },
+            101: {
+                "id": 101,
+                "type": "comment",
+                "text": "Earlier: https://news.ycombinator.com/item?id=200",
+            },
+            200: {
+                "id": 200,
+                "type": "story",
+                "title": "We're extending access to Fable 5 on all paid plans through July 12",
+                "score": 50,
+                "descendants": 5,
+            },
+        }.get(story_id)
+    )
+
+    result = pipeline.canonicalize_hn_dupes(
+        ranked,
+        db,
+        candidate_stories=[duplicate, canonical],
+        resolver=resolver,
+    )
+
+    assert len(result) == 1
+    assert result[0].story == canonical
+    assert result[0].score == 0.77
+    assert result[0].best_match_title == "match"
+    assert result[0].is_hot
+    assert result[0].combo_keys == "recent_hn recent_mixed"
+
+
+def test_canonicalize_hn_dupes_drops_when_target_already_in_output(
+    db: Database,
+) -> None:
+    canonical = _candidate_story(
+        200,
+        source="hn",
+        score=50,
+        time_ts=1000,
+        comment_count=5,
+        article_body="body",
+    )
+    duplicate = _candidate_story(
+        100,
+        source="hn",
+        score=10,
+        time_ts=1000,
+        comment_count=3,
+        article_body="body",
+    )
+    resolver = HnDupeResolver(
+        fetch_item=lambda story_id: {
+            100: {
+                "id": 100,
+                "type": "story",
+                "title": "Candidate 100",
+                "score": 10,
+                "descendants": 3,
+                "kids": [101],
+            },
+            101: {
+                "id": 101,
+                "type": "comment",
+                "text": "Earlier: https://news.ycombinator.com/item?id=200",
+            },
+            200: {
+                "id": 200,
+                "type": "story",
+                "title": "Candidate 200",
+                "score": 50,
+                "descendants": 5,
+            },
+        }.get(story_id)
+    )
+
+    result = pipeline.canonicalize_hn_dupes(
+        [
+            RankedStory(story=canonical, score=1.0, best_match_title=""),
+            RankedStory(story=duplicate, score=0.9, best_match_title=""),
+        ],
+        db,
+        candidate_stories=[canonical, duplicate],
+        resolver=resolver,
+    )
+
+    assert [item.story.id for item in result] == [200]
+
+
+def test_canonicalize_hn_dupes_skips_non_hn_without_calling_resolver(
+    db: Database,
+) -> None:
+    story = _candidate_story(
+        100,
+        source="rss_reddit_python",
+        score=10,
+        time_ts=1000,
+        article_body="body",
+    )
+
+    def fetch_item(_story_id: int) -> dict[str, object] | None:
+        raise AssertionError("non-HN stories must not call the resolver")
+
+    result = pipeline.canonicalize_hn_dupes(
+        [RankedStory(story=story, score=1.0, best_match_title="")],
+        db,
+        resolver=HnDupeResolver(fetch_item=fetch_item),
+    )
+
+    assert [item.story.id for item in result] == [100]
+
+
+def test_canonicalize_hn_dupes_keeps_original_for_unsummarizable_target(
+    db: Database,
+) -> None:
+    duplicate = _candidate_story(
+        100,
+        source="hn",
+        score=10,
+        time_ts=1000,
+        comment_count=3,
+        article_body="body",
+    )
+    resolver = HnDupeResolver(
+        fetch_item=lambda story_id: {
+            100: {
+                "id": 100,
+                "type": "story",
+                "title": "Candidate 100",
+                "score": 10,
+                "descendants": 3,
+                "kids": [101],
+            },
+            101: {
+                "id": 101,
+                "type": "comment",
+                "text": "Earlier: https://news.ycombinator.com/item?id=200",
+            },
+            200: {
+                "id": 200,
+                "type": "story",
+                "title": "Candidate 200",
+                "score": 50,
+                "descendants": 0,
+            },
+        }.get(story_id)
+    )
+
+    result = pipeline.canonicalize_hn_dupes(
+        [RankedStory(story=duplicate, score=1.0, best_match_title="")],
+        db,
+        resolver=resolver,
+    )
+
+    assert [item.story.id for item in result] == [100]
+
+
+def test_canonicalize_hn_dupes_drops_when_linked_target_is_feedback(
+    db: Database,
+) -> None:
+    user = db.create_user("hn_dupe_feedback_target")
+    target = _candidate_story(
+        200,
+        source="hn",
+        score=50,
+        time_ts=1000,
+        comment_count=10,
+        article_body="body",
+    )
+    duplicate = _candidate_story(
+        100,
+        source="hn",
+        score=10,
+        time_ts=1000,
+        comment_count=3,
+        article_body="body",
+    )
+    db.upsert_story(target)
+    db.upsert_feedback(user.id, target.id, "up")
+    resolver = HnDupeResolver(
+        fetch_item=lambda story_id: {
+            100: {
+                "id": 100,
+                "type": "story",
+                "title": "Candidate 100",
+                "score": 10,
+                "descendants": 3,
+                "kids": [101],
+            },
+            101: {
+                "id": 101,
+                "type": "comment",
+                "text": "Earlier: https://news.ycombinator.com/item?id=200",
+            },
+            200: {
+                "id": 200,
+                "type": "story",
+                "title": "Candidate 200",
+                "score": 50,
+                "descendants": 10,
+            },
+        }.get(story_id)
+    )
+
+    result = pipeline.canonicalize_hn_dupes(
+        [RankedStory(story=duplicate, score=1.0, best_match_title="")],
+        db,
+        candidate_stories=[duplicate],
+        user_id=user.id,
+        resolver=resolver,
+    )
+
+    assert result == []
+
+
+def test_canonicalize_hn_dupes_drops_title_match_to_feedback(
+    db: Database,
+) -> None:
+    user = db.create_user("hn_dupe_feedback_title")
+    feedback_story = _candidate_story(
+        200,
+        source="hn",
+        score=50,
+        time_ts=1000,
+        comment_count=10,
+        article_body="body",
+    )
+    selected = _candidate_story(
+        100,
+        source="hn",
+        score=10,
+        time_ts=1000,
+        comment_count=2,
+        article_body="body",
+    )
+    db.upsert_story(feedback_story)
+    db.upsert_feedback(user.id, feedback_story.id, "neutral")
+    resolver = HnDupeResolver(
+        fetch_item=lambda story_id: {
+            100: {
+                "id": 100,
+                "type": "story",
+                "title": "Candidate 100",
+                "score": 10,
+                "descendants": 2,
+                "kids": [],
+            },
+        }.get(story_id)
+    )
+
+    result = pipeline.canonicalize_hn_dupes(
+        [RankedStory(story=selected, score=1.0, best_match_title="")],
+        db,
+        user_id=user.id,
+        resolver=resolver,
+    )
+
+    assert result == []
+
+
+def test_canonicalize_hn_dupes_keeps_downvoted_feedback_match_by_default(
+    db: Database,
+) -> None:
+    user = db.create_user("hn_dupe_feedback_down")
+    feedback_story = _candidate_story(
+        200,
+        source="hn",
+        score=50,
+        time_ts=1000,
+        comment_count=10,
+        article_body="body",
+    )
+    selected = _candidate_story(
+        100,
+        source="hn",
+        score=10,
+        time_ts=1000,
+        comment_count=2,
+        article_body="body",
+    )
+    db.upsert_story(feedback_story)
+    db.upsert_feedback(user.id, feedback_story.id, "down")
+    resolver = HnDupeResolver(
+        fetch_item=lambda story_id: {
+            100: {
+                "id": 100,
+                "type": "story",
+                "title": "Candidate 100",
+                "score": 10,
+                "descendants": 2,
+                "kids": [],
+            },
+        }.get(story_id)
+    )
+
+    result = pipeline.canonicalize_hn_dupes(
+        [RankedStory(story=selected, score=1.0, best_match_title="")],
+        db,
+        user_id=user.id,
+        resolver=resolver,
+    )
+
+    assert [item.story.id for item in result] == [100]
 
 
 def _candidate_story(

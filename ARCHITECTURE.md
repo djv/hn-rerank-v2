@@ -280,6 +280,23 @@ cache is performance-only and is cleared on process restart.
 
 **Candidate filter — `is_summarizable`**: after live + archive + RSS candidates are merged and deduped, `fetch_candidates` filters out stories with no text content (self_text, top_comments, article_body all empty) and no path to content (HN/LessWrong stories with zero comments, or non-HN/non-LessWrong sources). The `is_summarizable(story)` invariant ensures every shown story can produce a meaningful TLDR — either from inline content, from prewarmed/on-demand HN/LessWrong comments, or from already-hydrated top_comments. Stories with `comment_count > 0` (HN or LessWrong) survive the filter even if text fields are empty, because the regen prewarm or the on-demand tldr-detail path will fetch comments.
 
+**HN dupe canonicalization**: after rank selection and render-time dedup,
+`pipeline.hn_dupes.canonicalize_hn_dupes` inspects only selected low-comment HN
+cards. The resolver uses bounded Firebase item JSON reads (first 8 direct
+children, source descendants <= 8) with a small in-process TTL cache and an
+8-worker cap across selected cards. It extracts HN item links from direct child
+comments without looking for wording such as `[dupe]`, validates linked targets
+as live stronger stories, and accepts them only when normalized titles are
+similar (`SequenceMatcher >= 0.50`, or informative-token Jaccard >= 0.20 with
+at least 2 shared tokens). The duplicate card's ranking score and badge/segment
+metadata are preserved when it swaps to the canonical story. If the canonical
+target is already in the final queue or in the user's up/neutral feedback, the
+duplicate card is dropped instead of showing a repeat. Low-comment selected HN
+cards are also suppressed when their URL or title matches up/neutral HN feedback
+stories under the same generic similarity rule. Failures, weak/dissimilar
+targets, dead/deleted targets, and unsummarizable targets leave the original card
+unchanged. This does not delete or rewrite DB rows.
+
 **Archive seeders**: `uv run python scripts/seed_hn_from_clickhouse.py` (ClickHouse, primary) and `uv run python scripts/seed_hn_from_bq.py` (BigQuery, backup) populate `ch_seed` / `bq_seed` rows. Both use the same shared logic in `_seed_common`: skeleton → bulk CH hydration (`ch_client.query_stories_with_comments`, one query for the entire set) → DB upsert → embedding. Comment hydration no longer uses Algolia — it's a single bulk CH SQL query. If CH fails, the skeleton is preserved (the previous per-story parallel Algolia path is archived in `scripts/_archive/algolia/hydrate_comments_algolia.py` as a fallback).
 
 **Comment text refetch**: removed in the 2026-06-26 CH consolidation. The previous per-regen growth check (`comment_count` grew ≥30% and story is <24h old) is now handled by the regen-time prewarm (see below): all HN candidates with `comment_count > 0` and empty `top_comments` get fresh comment text every regen cycle (`prewarm_hn_full=true`, set to false to revert to top-N). Reddit and LessWrong RSS candidates are prewarmed on the same cycle when `prewarm_reddit_full=true` / `prewarm_lesswrong_full=true`.

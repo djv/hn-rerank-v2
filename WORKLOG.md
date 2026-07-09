@@ -2,6 +2,48 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-09 — fix: make HN duplicate detection generic
+
+Reworked the selected-card HN duplicate resolver from explicit `[dupe]` comment
+matching to a structural rule: low-comment HN stories inspect bounded direct
+child comments, extract HN item links without matching specific comment strings,
+and canonicalize only when the linked target is a live stronger HN story with a
+similar normalized title. The first pass uses descendants <= 8, first 8 direct
+kids, title ratio >= 0.50 or informative-token Jaccard >= 0.20 with at least 2
+shared tokens.
+
+The resolver now also uses the existing up/neutral feedback exclusion policy as
+a suppressor. If a selected HN card links to a canonical target already in user
+feedback, or the low-comment selected card title/URL matches an up/neutral HN
+feedback story, the card is dropped rather than replaced with old feedback.
+Downvoted feedback is not a suppressor unless included in the configured
+dedup-exclude actions.
+
+## 2026-07-08 — fix: canonicalize explicit HN duplicate cards
+
+Added a bounded, best-effort HN dupe resolver for the explicit community signal:
+a direct child comment containing `[dupe]` plus a
+`news.ycombinator.com/item?id=<target>` link. The resolver uses Firebase item
+JSON instead of HN HTML, checks only selected final HN cards after ranking and
+render-time dedup, fetches at most the first 20 direct child comments per story,
+validates that the target is a live story, and keeps a small in-process TTL cache
+for item and canonical lookups. Selected HN cards are resolved in parallel with
+an 8-worker cap so a cold resolver cache does not serialize every Firebase item
+read into dashboard ranking latency.
+
+When a selected duplicate resolves, `canonicalize_hn_dupes` swaps the
+`RankedStory.story` to the canonical target while preserving the duplicate slot's
+personalized score, badges, and segment keys. If the target is already present in
+the final queue, the duplicate card is dropped to avoid showing the same story
+twice. Missing signals, network errors, dead/deleted targets, and unsummarizable
+targets keep the original card. No title clustering, page `Sorry.` probing, DB
+deletes, or persistence of Firebase-only canonical stories were added.
+
+Covered by parser/resolver tests in `tests/test_hn_dupes.py` and output-level
+tests in `tests/test_pipeline.py`. Verified before runtime smoke:
+`uv run pytest tests/ -n 4` (517 passed, 1 skipped), `uv run ruff check .`, and
+`uv run ty check`.
+
 ## 2026-07-07 — tests: kill the 0.5s server-shutdown tax (again)
 
 `uv run pytest tests/ -n 4` had drifted to ~23.7s, over the <12s target.
