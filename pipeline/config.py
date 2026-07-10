@@ -26,6 +26,11 @@ class ModelConfig:
     dedup_exclude_actions: tuple[str, ...] = ("up", "neutral")
 
 
+# Shared across all worktrees of this repo (sibling to the `main` checkout)
+# so the 87MB model and secrets never need copying/symlinking per worktree.
+DEFAULT_ONNX_MODEL_DIR = "/home/dev/hn-rewrite/shared/onnx_model"
+DEFAULT_ENV_PATH = "/home/dev/hn-rewrite/shared/.env"
+
 BQ_ARCHIVE_SOURCE = "bq_seed"
 CH_ARCHIVE_SOURCE = "ch_seed"
 
@@ -51,7 +56,7 @@ class Config:
     db_path: str = "hn_rewrite.db"
     days: int = 30
     count: int = 40
-    onnx_model_dir: str = "onnx_model"
+    onnx_model_dir: str = DEFAULT_ONNX_MODEL_DIR
     embedding_batch_size: int = 32
     embedding_ort_variant: Literal[
         "current",
