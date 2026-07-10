@@ -1022,7 +1022,7 @@ class Handler:
         if n_feedback > 0:
             from pipeline import build_cold_deck
 
-            cold_stories = build_cold_deck(cls.db, user_id=user.id)
+            cold_stories = build_cold_deck(cls.db, cls.config, user_id=user.id)
         else:
             cold_stories = cls._cold_stories
         if cold_stories:
@@ -1320,7 +1320,7 @@ class Handler:
     def _rebuild_cold_deck(cls) -> None:
         from pipeline import build_cold_deck
 
-        cold_stories = build_cold_deck(cls.db)
+        cold_stories = build_cold_deck(cls.db, cls.config)
         cls._cold_stories = cold_stories
         logging.info("cold_deck_rebuilt stories=%s", len(cold_stories))
 
