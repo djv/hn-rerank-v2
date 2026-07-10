@@ -2,6 +2,22 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-10 — fix: backfill Explore badge slots past feedback duplicates
+
+`canonicalize_hn_dupes` removes candidates that match a story the user has
+already voted on, but it runs after `rerank_candidates` assigns its badge
+quotas. A duplicate selected as an Unsure, Novel, or Similar card was therefore
+dropped with no replacement, silently leaving the affected Explore badge short.
+
+`fast_rerank_for_user` now builds the existing feedback duplicate context once
+and passes its matcher into `rerank_candidates`. The three personalized Explore
+passes skip matching candidates and continue through their already-sorted pools
+until they fill their quota or exhaust the pool. Primary and Popular selection
+remain unchanged.
+
+`tests/test_pipeline.py` adds synthetic coverage for backfilling all three
+Explore passes and for preserving the no-predicate (cold-deck) behavior.
+
 ## 2026-07-10 — refactor: move onnx_model and .env to a shared cross-worktree directory
 
 `onnx_model/` (87M) and `.env` were only physically present in the `main`

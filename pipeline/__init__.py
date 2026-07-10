@@ -103,7 +103,7 @@ from .enrichment import (
     prewarm_top_stories,
     select_article_fetch_candidates,
 )
-from .hn_dupes import canonicalize_hn_dupes
+from .hn_dupes import _load_feedback_context, _matches_feedback, canonicalize_hn_dupes
 
 from .render import (
     generate_dashboard_bytes,
@@ -473,6 +473,14 @@ def fast_rerank_for_user(
     with trace.stage("candidate_embedding"):
         cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
 
+    # Built once per request and threaded into badge assembly so the
+    # Explore passes (Unsure/Novel/Similar) can skip-and-backfill past
+    # candidates that duplicate a story the user already voted on, instead
+    # of silently losing badge slots to the downstream `canonicalize_hn_dupes`
+    # feedback-match drop (see WORKLOG 2026-07-10).
+    feedback_context = _load_feedback_context(
+        db, user_id=user_id, actions=tuple(config.model.dedup_exclude_actions)
+    )
     ranked = rerank_candidates(
         db=db,
         config=config,
@@ -481,6 +489,7 @@ def fast_rerank_for_user(
         cand_embeddings=cand_embeddings,
         user_id=user_id,
         trace=trace,
+        is_feedback_match=lambda s: _matches_feedback(s, feedback_context),
     )
 
     with trace.stage("dedup"):
