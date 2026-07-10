@@ -574,12 +574,14 @@ async def _call_llm_chat(
     model: str,
     prompt: str,
     max_tokens: int,
+    extra: dict[str, object] | None = None,
 ) -> LlmChatResult:
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3,
         "max_tokens": max_tokens,
+        **(extra or {}),
     }
     try:
         async with httpx.AsyncClient(timeout=45.0) as client:
@@ -624,12 +626,58 @@ async def _call_llm_chat(
         return LlmChatResult(content=str(e), ok=False)
 
 
-def _llm_cache_identity() -> str:
-    provider = os.environ.get("LLM_PROVIDER", "mistral").lower()
-    model = (
-        "mistral-small-latest" if provider == "mistral" else "llama-3.3-70b-versatile"
+@dataclass(frozen=True)
+class LlmProviderConfig:
+    provider: str
+    api_key: str | None
+    base_url: str
+    model: str
+    extra: dict[str, object]
+
+
+def _llm_provider_config() -> LlmProviderConfig:
+    provider = os.environ.get("LLM_PROVIDER", "cerebras").lower()
+    if provider == "mistral":
+        return LlmProviderConfig(
+            provider=provider,
+            api_key=os.environ.get("MISTRAL_API_KEY"),
+            base_url="https://api.mistral.ai/v1/chat/completions",
+            model="mistral-small-latest",
+            extra={},
+        )
+    if provider == "groq":
+        return LlmProviderConfig(
+            provider=provider,
+            api_key=os.environ.get("GROQ_API_KEY"),
+            base_url="https://api.groq.com/openai/v1/chat/completions",
+            model="llama-3.3-70b-versatile",
+            extra={},
+        )
+    # cerebras is the default: fastest of the three and, with the tightened
+    # discussion_v4.txt prompt, matches/beats Mistral on format and budget
+    # adherence (see WORKLOG). gpt-oss-120b is a reasoning model — it burns
+    # max_tokens on hidden reasoning and returns no content if not given
+    # reasoning_effort + enough headroom (see _cerebras_max_tokens below).
+    return LlmProviderConfig(
+        provider="cerebras",
+        api_key=os.environ.get("CEREBRAS_API_KEY"),
+        base_url="https://api.cerebras.ai/v1/chat/completions",
+        model="gpt-oss-120b",
+        extra={"reasoning_effort": "low"},
     )
-    return f"{provider}:{model}:{TLDR_PROMPT_VERSION}"
+
+
+def _cerebras_max_tokens(base: int, extra: dict[str, object]) -> int:
+    # gpt-oss-120b spends some of max_tokens on hidden reasoning before the
+    # visible answer; without headroom it can return an empty completion
+    # with finish_reason="length". A flat buffer is enough at
+    # reasoning_effort="low" (see WORKLOG 2026-07-10 benchmark).
+    return base + 600 if "reasoning_effort" in extra else base
+
+
+def _llm_cache_identity() -> str:
+    cfg = _llm_provider_config()
+    return f"{cfg.provider}:{cfg.model}:{TLDR_PROMPT_VERSION}"
 
 
 def _tldr_cache_key(
@@ -681,15 +729,8 @@ async def generate_detailed_tldr(
     top_comments: str = "",
     article_body: str = "",
 ) -> TldrResult:
-    provider = os.environ.get("LLM_PROVIDER", "mistral").lower()
-    if provider == "mistral":
-        api_key = os.environ.get("MISTRAL_API_KEY")
-        base_url = "https://api.mistral.ai/v1/chat/completions"
-        model = "mistral-small-latest"
-    else:
-        api_key = os.environ.get("GROQ_API_KEY")
-        base_url = "https://api.groq.com/openai/v1/chat/completions"
-        model = "llama-3.3-70b-versatile"
+    cfg = _llm_provider_config()
+    api_key, base_url, model, extra = cfg.api_key, cfg.base_url, cfg.model, cfg.extra
 
     if not api_key:
         return TldrResult(
@@ -725,14 +766,16 @@ async def generate_detailed_tldr(
             base_url=base_url,
             model=model,
             prompt=article_prompt,
-            max_tokens=900,
+            max_tokens=_cerebras_max_tokens(900, extra),
+            extra=extra,
         )
         discussion_task = _call_llm_chat(
             api_key=api_key,
             base_url=base_url,
             model=model,
             prompt=discussion_prompt,
-            max_tokens=900,
+            max_tokens=_cerebras_max_tokens(900, extra),
+            extra=extra,
         )
         article_result, discussion_result = await asyncio.gather(
             article_task,
@@ -793,7 +836,8 @@ async def generate_detailed_tldr(
         base_url=base_url,
         model=model,
         prompt=prompt,
-        max_tokens=2000,
+        max_tokens=_cerebras_max_tokens(2000, extra),
+        extra=extra,
     )
     if result.ok:
         tldr_text = _normalize_tldr_markdown(result.content)

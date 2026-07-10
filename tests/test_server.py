@@ -3255,7 +3255,7 @@ async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
 
     calls = []
 
-    async def mock_call_llm_chat(*, api_key, base_url, model, prompt, max_tokens):
+    async def mock_call_llm_chat(*, api_key, base_url, model, prompt, max_tokens, extra=None):
         calls.append(prompt)
         if "Summarize the article" in prompt:
             return server.LlmChatResult(content="- **Article** summary", ok=True)
@@ -3264,6 +3264,7 @@ async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
         return server.LlmChatResult(content="- **Fallback** summary", ok=True)
 
     monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_PROVIDER", "mistral")
     monkeypatch.setattr(server, "_call_llm_chat", mock_call_llm_chat)
 
     result = await server.generate_detailed_tldr(
@@ -3284,6 +3285,75 @@ async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
     assert "- **Discussion** summary" in result.tldr
 
 
+def test_llm_provider_config_defaults_to_cerebras(monkeypatch) -> None:
+    import server
+
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.setenv("CEREBRAS_API_KEY", "test-key")
+
+    cfg = server._llm_provider_config()
+
+    assert cfg.provider == "cerebras"
+    assert cfg.model == "gpt-oss-120b"
+    assert cfg.api_key == "test-key"
+    assert cfg.extra == {"reasoning_effort": "low"}
+
+
+def test_llm_provider_config_mistral_has_no_extra_params(monkeypatch) -> None:
+    import server
+
+    monkeypatch.setenv("LLM_PROVIDER", "mistral")
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+
+    cfg = server._llm_provider_config()
+
+    assert cfg.provider == "mistral"
+    assert cfg.model == "mistral-small-latest"
+    assert cfg.extra == {}
+
+
+def test_cerebras_max_tokens_adds_buffer_only_with_reasoning_effort() -> None:
+    import server
+
+    assert server._cerebras_max_tokens(900, {"reasoning_effort": "low"}) == 1500
+    assert server._cerebras_max_tokens(900, {}) == 900
+
+
+@pytest.mark.asyncio
+async def test_generate_detailed_tldr_cerebras_passes_reasoning_effort_and_bumped_tokens(
+    monkeypatch,
+) -> None:
+    """Cerebras's gpt-oss-120b is a reasoning model: without reasoning_effort
+    and extra max_tokens headroom it burns the whole budget on hidden
+    reasoning and returns no content (see WORKLOG 2026-07-10)."""
+    import server
+
+    calls = []
+
+    async def mock_call_llm_chat(
+        *, api_key, base_url, model, prompt, max_tokens, extra=None
+    ):
+        calls.append({"max_tokens": max_tokens, "extra": extra, "model": model})
+        return server.LlmChatResult(content="- summary", ok=True)
+
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.setenv("CEREBRAS_API_KEY", "test-key")
+    monkeypatch.setattr(server, "_call_llm_chat", mock_call_llm_chat)
+
+    await server.generate_detailed_tldr(
+        "Cerebras test",
+        self_text="Author text",
+        top_comments="Comment text",
+        article_body="Article body",
+    )
+
+    assert len(calls) == 2
+    for call in calls:
+        assert call["model"] == "gpt-oss-120b"
+        assert call["extra"] == {"reasoning_effort": "low"}
+        assert call["max_tokens"] == 1500
+
+
 @pytest.mark.asyncio
 async def test_generate_detailed_tldr_scales_combined_path_budgets(monkeypatch):
     """The combined article+comments path must inject volume-scaled budgets
@@ -3293,11 +3363,12 @@ async def test_generate_detailed_tldr_scales_combined_path_budgets(monkeypatch):
 
     calls = []
 
-    async def mock_call_llm_chat(*, api_key, base_url, model, prompt, max_tokens):
+    async def mock_call_llm_chat(*, api_key, base_url, model, prompt, max_tokens, extra=None):
         calls.append(prompt)
         return server.LlmChatResult(content="- summary", ok=True)
 
     monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_PROVIDER", "mistral")
     monkeypatch.setattr(server, "_call_llm_chat", mock_call_llm_chat)
 
     long_article = "x" * 5_000
@@ -3384,11 +3455,12 @@ async def test_unified_fallback_omits_article_when_no_article_body(
 
     calls = []
 
-    async def mock_call_llm_chat(*, api_key, base_url, model, prompt, max_tokens):
+    async def mock_call_llm_chat(*, api_key, base_url, model, prompt, max_tokens, extra=None):
         calls.append(prompt)
         return server.LlmChatResult(content="- **Discussion** summary", ok=True)
 
     monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_PROVIDER", "mistral")
     monkeypatch.setattr(server, "_call_llm_chat", mock_call_llm_chat)
 
     result = await server.generate_detailed_tldr(
@@ -3411,11 +3483,12 @@ async def test_generate_detailed_tldr_returns_stub_when_no_content(
 
     calls: list = []
 
-    async def mock_call_llm_chat(*, api_key, base_url, model, prompt, max_tokens):
+    async def mock_call_llm_chat(*, api_key, base_url, model, prompt, max_tokens, extra=None):
         calls.append(prompt)
         return "should not be called"
 
     monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_PROVIDER", "mistral")
     monkeypatch.setattr(server, "_call_llm_chat", mock_call_llm_chat)
 
     result = await server.generate_detailed_tldr(
