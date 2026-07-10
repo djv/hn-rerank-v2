@@ -3685,26 +3685,18 @@ def test_tldr_detail_fetches_lesswrong_comments(test_env, monkeypatch):
     assert updated_story.score == 132
 
 
-def test_dashboard_has_source_filter_toggle():
-    """The side rail must expose a 3-way source filter (Mixed/HN/Non-HN)
-    that narrows the deck by story source. Mixed is the default.
+def test_dashboard_source_filter_toggle_temporarily_disabled():
+    """The 3-way source filter (Mixed/HN/Non-HN) is temporarily disabled
+    while the dashboard is hardcoded to HN-only sources (WORKLOG
+    2026-07-10) — a Non-HN tab would always render an empty deck.
     """
     template, _ = _read_template_and_static()
-    assert 'data-filter="source"' in template
-    # Mixed is the default active tab
-    assert 'TabView("mixed", "<u>M</u>ixed", True)' in (
+    assert 'data-source="mixed"' not in template
+    assert 'data-source="hn"' not in template
+    assert 'data-source="non-hn"' not in template
+    assert "TabView(\"non-hn\"" not in (
         Path(__file__).resolve().parents[1] / "pipeline" / "render.py"
     ).read_text(encoding="utf-8")
-    # Source filter appears before swipe keys in the DOM
-    side_rail = (
-        Path(__file__).resolve().parents[1]
-        / "templates"
-        / "components"
-        / "side_rail.html"
-    ).read_text(encoding="utf-8")
-    assert side_rail.index('include "components/tab_group.html"') < side_rail.index(
-        "swipe-keys"
-    )
 
 
 def test_story_cards_emit_combo_keys_and_is_hn_attribute():

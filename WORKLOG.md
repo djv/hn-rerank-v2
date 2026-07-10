@@ -2,6 +2,24 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-10 — fix: temporarily disable source filter toggle (Mixed/HN/Non-HN)
+
+Follow-on to the HN-only dashboard hardcoding (below): with non-HN
+sources gone from the candidate pool, the Mixed/HN/Non-HN toggle in the
+side rail was dead UI — a Non-HN tab would always render an empty deck.
+
+- `pipeline/render.py::_build_tab_groups` — dropped the `source`
+  `TabGroupView` (comment marks it for re-adding when non-HN sources
+  return).
+- `templates/index.html` — removed the now-dead `m`/`h`/`n` keyboard
+  shortcuts and the orphaned `.tab-bar[data-filter="source"]` CSS rule.
+  `sourceTabs`/`FILTERS.source`/`currentSource` JS state is untouched
+  (querySelectorAll now just returns an empty array; harmless).
+- `tests/test_server.py` — replaced
+  `test_dashboard_has_source_filter_toggle` with
+  `test_dashboard_source_filter_toggle_temporarily_disabled`, asserting
+  the toggle markup is absent.
+
 ## 2026-07-10 — fix: hardcode dashboard to HN sources only (for now)
 
 `build_cold_deck` and `load_production_candidate_stories` (the two

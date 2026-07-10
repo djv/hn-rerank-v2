@@ -788,10 +788,6 @@
         grid-template-columns: repeat(2, 1fr);
       }
 
-      .tab-bar[data-filter="source"] {
-        grid-template-columns: repeat(3, 1fr);
-      }
-
       .tab-btn--segmented {
         border-right: 1px solid var(--pico-muted-border-color);
         border-radius: 6px;
@@ -1750,9 +1746,8 @@
       d: () => setFilter('sort', 'date'),
       e: () => setFilter('age', 'recent'),
       a: () => setFilter('age', 'archive'),
-      m: () => setFilter('source', 'mixed'),
-      h: () => setFilter('source', 'hn'),
-      n: () => setFilter('source', 'non-hn'),
+      // m/h/n (source filter) temporarily disabled alongside the source
+      // toggle UI — see pipeline/render.py::_build_tab_groups.
       f: () => {
         const panel = document.querySelector('.swipe-side');
         panel.classList.toggle('visible');

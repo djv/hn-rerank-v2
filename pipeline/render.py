@@ -251,6 +251,10 @@ def _build_dashboard_cards(
 
 
 def _build_tab_groups() -> tuple[TabGroupView, ...]:
+    # Source filter (Mixed/HN/Non-HN) is temporarily disabled: the dashboard
+    # is hardcoded to HN-only sources for now (see WORKLOG 2026-07-10), so a
+    # Non-HN tab would always render an empty deck. Re-add the TabGroupView
+    # below when non-HN sources return to the candidate pool.
     return (
         TabGroupView(
             key="sort",
@@ -274,18 +278,6 @@ def _build_tab_groups() -> tuple[TabGroupView, ...]:
             tabs=(
                 TabView("recent", "R<u>e</u>cent", True),
                 TabView("archive", "<u>A</u>rchive"),
-            ),
-        ),
-        TabGroupView(
-            key="source",
-            aria_label="Source filter",
-            css_class="tab-bar tab-bar--segmented",
-            data_attr="source",
-            segmented=True,
-            tabs=(
-                TabView("mixed", "<u>M</u>ixed", True),
-                TabView("hn", "<u>H</u>N"),
-                TabView("non-hn", "<u>N</u>on-HN"),
             ),
         ),
     )
