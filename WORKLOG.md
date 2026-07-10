@@ -137,6 +137,41 @@ mechanism currently supplies `MISTRAL_API_KEY` to the systemd user service
 environment) — confirm it's present before/after restarting, or TLDR
 generation will fail with "LLM API key not configured."
 
+## 2026-07-10 — fix: revert LLM_PROVIDER default back to Mistral (Cerebras free-tier RPM too low for prewarm)
+
+Within hours of flipping the default to Cerebras (previous entry), the live
+regen prewarm cycle (`_prefetch_tldrs_for_ranked`, up to 4 concurrent LLM
+calls: outer `Semaphore(2)` stories × inner `asyncio.gather(article,
+discussion)` per story) triggered **3233 `429 Too Many Requests`** from
+Cerebras within an 8-minute window (journalctl, 16:02–16:10). Confirmed via
+Cerebras docs (https://inference-docs.cerebras.ai/support/rate-limits): the
+free tier for `gpt-oss-120b` is capped at **5 requests/minute** (30K TPM) —
+Mistral's free tier is roughly **60 requests/minute** (~1 req/s, ~500K TPM),
+12x the headroom, which is why the same concurrency never tripped it.
+
+No user-visible errors occurred — `stale_fallback` served previously cached
+TLDRs for every failed fresh-generation attempt — but fresh content
+generation was effectively blocked for the affected stories during that
+window. `llm_limiter` (llm_limiter.py) is a reactive-only cooldown (backs off
+after a 429, resets on the next success); it cannot proactively pace calls to
+fit a fixed low RPM ceiling, and Cerebras doesn't send
+`x-ratelimit-remaining-req-minute` (logs show `remaining_req_minute=None`),
+so header-driven pacing isn't an option either. Throttling concurrency alone
+also doesn't fix it: even a single in-flight story still fires 2 calls
+finishing in ~1s each, i.e. ~120 req/min against a 5/min budget.
+
+Reverted `_llm_provider_config()`'s default from `cerebras` back to
+`mistral`; Cerebras remains available and correctly wired as an opt-in
+provider (`LLM_PROVIDER=cerebras`) for lower-concurrency use cases (e.g.
+on-demand single-story `tldr-detail`, not bulk prewarm). `.env`
+(`LLM_PROVIDER=`) updated to `mistral` to match.
+
+If Cerebras is revisited later, it needs proactive request pacing (a
+min-interval gate in `llm_limiter`, not just lower concurrency) or should be
+restricted to the on-demand path only, not the bulk prewarm path.
+
+**Files**: `server.py`, `tests/test_server.py`, `.env` (untracked), `WORKLOG.md`.
+
 ## 2026-07-10 — archive: safely reconcile 12-month ClickHouse seeds
 
 The primary ClickHouse archive seeder now defaults to a 12-month, score≥200

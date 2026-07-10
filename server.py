@@ -636,14 +636,22 @@ class LlmProviderConfig:
 
 
 def _llm_provider_config() -> LlmProviderConfig:
-    provider = os.environ.get("LLM_PROVIDER", "cerebras").lower()
-    if provider == "mistral":
+    # mistral is the default: its free tier (~60 req/min) comfortably absorbs
+    # the prewarm burst (up to 4 concurrent calls); cerebras's free tier for
+    # gpt-oss-120b is capped at 5 req/min and gets buried under 429s during
+    # regen prewarm (see WORKLOG 2026-07-10). Cerebras stays available as an
+    # opt-in provider.
+    provider = os.environ.get("LLM_PROVIDER", "mistral").lower()
+    if provider == "cerebras":
+        # gpt-oss-120b is a reasoning model — it burns max_tokens on hidden
+        # reasoning and returns no content if not given reasoning_effort +
+        # enough headroom (see _cerebras_max_tokens below).
         return LlmProviderConfig(
             provider=provider,
-            api_key=os.environ.get("MISTRAL_API_KEY"),
-            base_url="https://api.mistral.ai/v1/chat/completions",
-            model="mistral-small-latest",
-            extra={},
+            api_key=os.environ.get("CEREBRAS_API_KEY"),
+            base_url="https://api.cerebras.ai/v1/chat/completions",
+            model="gpt-oss-120b",
+            extra={"reasoning_effort": "low"},
         )
     if provider == "groq":
         return LlmProviderConfig(
@@ -653,17 +661,12 @@ def _llm_provider_config() -> LlmProviderConfig:
             model="llama-3.3-70b-versatile",
             extra={},
         )
-    # cerebras is the default: fastest of the three and, with the tightened
-    # discussion_v4.txt prompt, matches/beats Mistral on format and budget
-    # adherence (see WORKLOG). gpt-oss-120b is a reasoning model — it burns
-    # max_tokens on hidden reasoning and returns no content if not given
-    # reasoning_effort + enough headroom (see _cerebras_max_tokens below).
     return LlmProviderConfig(
-        provider="cerebras",
-        api_key=os.environ.get("CEREBRAS_API_KEY"),
-        base_url="https://api.cerebras.ai/v1/chat/completions",
-        model="gpt-oss-120b",
-        extra={"reasoning_effort": "low"},
+        provider="mistral",
+        api_key=os.environ.get("MISTRAL_API_KEY"),
+        base_url="https://api.mistral.ai/v1/chat/completions",
+        model="mistral-small-latest",
+        extra={},
     )
 
 
