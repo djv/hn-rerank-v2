@@ -1250,8 +1250,18 @@ def _assemble_combo_deck(
     idx_for: Callable[[int], int],
     embeddings_map: dict[int, NDArray[np.float32]] | None,
     explore: ExploreContext | None,
+    is_feedback_match: Callable[[Story], bool] | None = None,
 ) -> list[RankedStory]:
     """Bucket ``ranked`` into per-combo primary + badge cards.
+
+    *is_feedback_match*, when provided, marks candidates that duplicate a
+    story the user already voted on (same URL or near-identical HN title —
+    see ``hn_dupes._matches_feedback``). The Explore passes (Unsure/Novel/
+    Similar) skip such candidates and backfill from the rest of the sorted
+    pool, so a badge quota isn't silently short-filled by cards that
+    ``canonicalize_hn_dupes`` would drop downstream anyway. Popular
+    (Hot/Top/Talk) and Primary selection are unaffected — they have larger
+    quotas and are out of scope for this fix (see WORKLOG 2026-07-10).
 
     Non-personalized (Popular: Hot/Top/Talk) badges always run. Personalized
     (Explore: Unsure/Novel/Similar) badges only run when *explore* is
@@ -1275,6 +1285,28 @@ def _assemble_combo_deck(
 
     def _hot_sort_key(r: RankedStory) -> float:
         return float(cand_velocities[idx_for(r.story.id)])
+
+    def _take_unmatched(
+        items: list[RankedStory], n: int
+    ) -> list[RankedStory]:
+        """Take the first *n* items from an already-sorted list, skipping
+        (and backfilling past) any that duplicate voted-on feedback.
+
+        Only walks as far into ``items`` as needed to fill *n* slots, so
+        the (expensive, title-similarity-based) ``is_feedback_match`` check
+        runs on a handful of candidates per badge rather than the whole
+        combo pool.
+        """
+        if is_feedback_match is None:
+            return items[:n]
+        out: list[RankedStory] = []
+        for r in items:
+            if is_feedback_match(r.story):
+                continue
+            out.append(r)
+            if len(out) >= n:
+                break
+        return out
 
     def _entropy_sort_key(r: RankedStory) -> float:
         return float(get_entropy(r))
@@ -1436,29 +1468,38 @@ def _assemble_combo_deck(
                         replace(r, combo_keys=f"{source_key} {mixed_key}", **badge_flags)
                     )
 
-            unsure_items = sorted(
-                [r for r in explore_pool if r.prob_down is not None],
-                key=_entropy_sort_key,
-                reverse=True,
-            )[:DISCOVERY_PER_BADGE]
+            unsure_items = _take_unmatched(
+                sorted(
+                    [r for r in explore_pool if r.prob_down is not None],
+                    key=_entropy_sort_key,
+                    reverse=True,
+                ),
+                DISCOVERY_PER_BADGE,
+            )
             for r in unsure_items:
                 _merge_or_append(r, is_uncertain=True)
                 explore_picked.add(r.story.id)
 
-            novel_items = sorted(
-                [r for r in explore_pool if r.story.id not in explore_picked],
-                key=_novel_sort_key,
-                reverse=True,
-            )[:DISCOVERY_PER_BADGE]
+            novel_items = _take_unmatched(
+                sorted(
+                    [r for r in explore_pool if r.story.id not in explore_picked],
+                    key=_novel_sort_key,
+                    reverse=True,
+                ),
+                DISCOVERY_PER_BADGE,
+            )
             for r in novel_items:
                 _merge_or_append(r, is_novel=True)
                 explore_picked.add(r.story.id)
 
-            similar_items = sorted(
-                [r for r in explore_pool if r.story.id not in explore_picked],
-                key=_similar_sort_key,
-                reverse=True,
-            )[:DISCOVERY_PER_BADGE]
+            similar_items = _take_unmatched(
+                sorted(
+                    [r for r in explore_pool if r.story.id not in explore_picked],
+                    key=_similar_sort_key,
+                    reverse=True,
+                ),
+                DISCOVERY_PER_BADGE,
+            )
             for r in similar_items:
                 _merge_or_append(r, is_similar=True)
                 explore_picked.add(r.story.id)
@@ -1487,12 +1528,18 @@ def rerank_candidates(
     cand_embeddings: NDArray[np.float32] | None = None,
     user_id: int | None = None,
     trace: RankTrace | _NullTrace = NULL_TRACE,
+    is_feedback_match: Callable[[Story], bool] | None = None,
 ) -> list[RankedStory]:
     """Rank candidates and attach discovery badges.
 
     This wraps :func:`_score_and_rank` (which only does tier blend + sort)
     and adds badge attribution + 7 discovery passes (uncertainty, novelty,
     similarity, discussion-rich, high-engagement, hot, non-HN).
+
+    *is_feedback_match*, when provided, is threaded into
+    :func:`_assemble_combo_deck` so the Explore passes can skip-and-backfill
+    past candidates that duplicate already-voted stories (see that
+    function's docstring).
 
     Use this in production; the private ``_score_and_rank`` is intended for
     tier-blend tests that need to assert on ranking without badge side effects.
@@ -1593,4 +1640,5 @@ def rerank_candidates(
         explore=ExploreContext(
             cand_max_sim=cand_max_sim, cand_closest_up=cand_closest_up
         ),
+        is_feedback_match=is_feedback_match,
     )
