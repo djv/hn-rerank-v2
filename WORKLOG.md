@@ -2,6 +2,48 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-10 — feat: add Cerebras as an LLM_PROVIDER option, make it default
+
+Benchmarked TLDR quality across the three candidate providers on real stories
+from the DB (article + discussion prompts, format/budget-adherence checks,
+plus a manual read-through): Mistral (`mistral-small-latest`, the prior
+default) vs Cerebras (`gpt-oss-120b`) vs Groq (`llama-3.3-70b-versatile`,
+never actually wired to prod despite earlier assumptions — `LLM_PROVIDER`
+has always defaulted to `mistral`). Cerebras came out ahead on latency
+(~4x faster), budget-adherence, and content specificity once two prompt
+issues were fixed:
+
+- `gpt-oss-120b` is a reasoning model — called with the same payload shape
+  as Mistral/Groq (no `reasoning_effort`, `max_tokens: 900`) it burns the
+  whole token budget on hidden reasoning and returns no visible content
+  (`finish_reason: "length"`, empty `content`). Fixed by adding
+  `reasoning_effort: "low"` and a flat `+600` max_tokens buffer
+  (`_cerebras_max_tokens` in server.py) whenever that param is set.
+- At n=10 real stories, Cerebras nested sub-bullets under a bold label on
+  dense discussion threads (~2 collapses per 3 retries on the worst-case
+  story) — a direct violation of `discussion_v4.txt`'s explicit "no nested
+  list levels" rule despite the rule naming the exact anti-pattern. A
+  restated "final format check" reminder placed at the end of the prompt
+  (closer to generation) fixed this at 0/10 across a fresh batch. Separately,
+  the fixed `Consensus/Disagreement/Caveat` label set the prompt used to
+  suggest was dropped in favor of freeform per-story `####` headings (see
+  the prior commit) — that change landed for all providers, not just
+  Cerebras.
+
+`server.py` now has `_llm_provider_config()` as the single source of truth
+for provider selection (`mistral` / `groq` / `cerebras`, default `cerebras`),
+replacing duplicated branch logic that previously lived separately in
+`generate_detailed_tldr` and `_llm_cache_identity` (the latter's model-name
+mapping was already subtly wrong for `groq` before this change — anything
+non-mistral was assumed to be Groq's model name for cache-key purposes).
+
+Operational note: this default flip takes effect on `hn_rewrite.service`'s
+next restart. `CEREBRAS_API_KEY` needs to be available in whatever
+mechanism currently supplies `MISTRAL_API_KEY` to the systemd user service
+(not explicitly set in the unit file — inherited from the user session
+environment) — confirm it's present before/after restarting, or TLDR
+generation will fail with "LLM API key not configured."
+
 ## 2026-07-10 — archive: safely reconcile 12-month ClickHouse seeds
 
 The primary ClickHouse archive seeder now defaults to a 12-month, score≥200
