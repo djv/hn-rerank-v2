@@ -1704,10 +1704,12 @@
         });
         if (resp.ok) {
           const data = await resp.json();
-          if (data.retryable) {
-            // No content this attempt (e.g. a transient upstream fetch
-            // failure) - don't cache it as final, so the next card open
-            // retries instead of showing this placeholder forever.
+          if (data.retryable || data.stale) {
+            // Provisional content: a transient no-content attempt
+            // (retryable) or a stale/quota fallback summary (stale) -
+            // don't cache it as final, so the next open (card re-click,
+            // filter switch, next-card cycle) retries instead of showing
+            // this placeholder/stale summary forever.
             contentDiv.dataset.error = 'true';
           } else {
             tldrCache.set(storyId, data.tldr);
