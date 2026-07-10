@@ -28,8 +28,6 @@ feeds = [
     "https://www.reddit.com/r/urbanplanning/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/transit/top/.rss?t=week&limit=25",
 
-    # r/devops
-    "https://www.reddit.com/r/devops/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/dataengineering/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/Maps/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/Ultralight/top/.rss?t=week&limit=25",
@@ -45,11 +43,9 @@ feeds = [
     # Programming languages / CS depth
     "https://www.reddit.com/r/ProgrammingLanguages/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/Compilers/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/sre/top/.rss?t=week&limit=25",
 
     # Finance / tax / nomad money
     "https://www.reddit.com/r/financialindependence/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/tax/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/USExpatTaxes/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/fatFIRE/top/.rss?t=week&limit=25",
 
