@@ -7,17 +7,21 @@ import sys
 from pathlib import Path
 import httpx
 
+from pipeline import DEFAULT_ONNX_MODEL_DIR
+
 MODEL_REPO = "sentence-transformers/all-MiniLM-L6-v2"
 HF_BASE = f"https://huggingface.co/{MODEL_REPO}/resolve/main"
 ONNX_BASE = f"https://huggingface.co/{MODEL_REPO}/resolve/main/onnx"
 
+# Model files land in the shared cross-worktree location (see
+# pipeline/config.py); Pico CSS stays per-checkout under templates/.
 FILES = {
-    f"{ONNX_BASE}/model.onnx": "onnx_model/model.onnx",
-    f"{HF_BASE}/tokenizer.json": "onnx_model/tokenizer.json",
-    f"{HF_BASE}/tokenizer_config.json": "onnx_model/tokenizer_config.json",
-    f"{HF_BASE}/config.json": "onnx_model/config.json",
-    f"{HF_BASE}/special_tokens_map.json": "onnx_model/special_tokens_map.json",
-    f"{HF_BASE}/vocab.txt": "onnx_model/vocab.txt",
+    f"{ONNX_BASE}/model.onnx": f"{DEFAULT_ONNX_MODEL_DIR}/model.onnx",
+    f"{HF_BASE}/tokenizer.json": f"{DEFAULT_ONNX_MODEL_DIR}/tokenizer.json",
+    f"{HF_BASE}/tokenizer_config.json": f"{DEFAULT_ONNX_MODEL_DIR}/tokenizer_config.json",
+    f"{HF_BASE}/config.json": f"{DEFAULT_ONNX_MODEL_DIR}/config.json",
+    f"{HF_BASE}/special_tokens_map.json": f"{DEFAULT_ONNX_MODEL_DIR}/special_tokens_map.json",
+    f"{HF_BASE}/vocab.txt": f"{DEFAULT_ONNX_MODEL_DIR}/vocab.txt",
     "https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css": "templates/pico.min.css",
 }
 

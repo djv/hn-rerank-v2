@@ -30,7 +30,7 @@ from flask.typing import ResponseReturnValue
 import httpx
 
 from database import Database, RankPerfSample, Story, User
-from pipeline import Config, Embedder, RankedStory, is_hn_source
+from pipeline import Config, DEFAULT_ENV_PATH, Embedder, RankedStory, is_hn_source
 from llm_limiter import limiter as llm_limiter
 from reddit_limiter import limiter as reddit_limiter
 from http_fetch import fetch_with_urllib_fallback
@@ -136,10 +136,11 @@ def _looks_like_plain_heading(line: str) -> bool:
 
 
 def load_env() -> None:
-    # Try local .env
+    # Prefer a local .env (per-worktree override); fall back to the shared
+    # location so every worktree finds secrets without copying anything.
     env_path = Path(".env")
     if not env_path.exists():
-        env_path = Path("/home/dev/hn_rerank/.env")
+        env_path = Path(DEFAULT_ENV_PATH)
     if env_path.exists():
         for line in env_path.read_text(encoding="utf-8").splitlines():
             line = line.strip()

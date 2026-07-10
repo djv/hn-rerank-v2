@@ -18,6 +18,8 @@ from .config import (
     CH_ARCHIVE_CANDIDATE_LIMIT,
     CH_ARCHIVE_SOURCE,
     Config,
+    DEFAULT_ENV_PATH,
+    DEFAULT_ONNX_MODEL_DIR,
     LIVE_WINDOW_LIMIT,
     ModelConfig,
     RssConfig,

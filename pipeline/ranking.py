@@ -28,6 +28,7 @@ from .config import (
     BQ_ARCHIVE_SOURCE,
     CH_ARCHIVE_SOURCE,
     Config,
+    DEFAULT_ONNX_MODEL_DIR,
     is_hn_source,
 )
 
@@ -457,7 +458,7 @@ def _embedding_session_options(ort_variant: EmbeddingOrtVariant) -> ort.SessionO
 class Embedder:
     def __init__(
         self,
-        model_dir: str = "onnx_model",
+        model_dir: str = DEFAULT_ONNX_MODEL_DIR,
         *,
         batch_size: int = 32,
         ort_variant: EmbeddingOrtVariant = "current",

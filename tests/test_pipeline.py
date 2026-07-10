@@ -315,8 +315,8 @@ def test_build_cold_deck_computes_popular_badges_but_not_explore(
 
 @pytest.fixture(scope="module")
 def embedder():
-    # Uses the real downloaded ONNX model
-    return Embedder("onnx_model")
+    # Uses the real downloaded ONNX model (shared across worktrees)
+    return Embedder()
 
 
 def test_embedder_uses_configured_batch_and_ort_variant(monkeypatch):
