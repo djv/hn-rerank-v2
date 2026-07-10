@@ -2,6 +2,23 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-10 — archive: safely reconcile 12-month ClickHouse seeds
+
+The primary ClickHouse archive seeder now defaults to a 12-month, score≥200
+window and has an explicit `--reconcile` mode for the daily archive job. It
+remains pure backfill by default. Reconciliation is deliberately narrow:
+feedback rows and `bq_seed` provenance are never touched; recent `hn` rows
+keep their live-source label and gravity-ranked candidate lane; only aged
+qualifying HN rows are promoted to `ch_seed`.
+
+Comment hydration is bounded to 200 IDs per ClickHouse request and runs only
+for new or comment-empty rows. Existing rich text stays intact through the
+normal upsert safeguards, and embeddings are hash-checked from the stored
+post-upsert story rather than the seed skeleton. This prevents a metadata
+refresh from degrading an existing text embedding. The external daily user
+timer is configured to run the explicit reconciliation mode at low priority
+after backups.
+
 ## 2026-07-10 — perf: move HN duplicate canonicalization off warm ranking (PERF-1)
 
 Added the additive `hn_dupe_resolutions` SQLite cache with typed canonical,

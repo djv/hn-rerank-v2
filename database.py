@@ -35,6 +35,15 @@ class Story:
 
 
 @dataclass(frozen=True)
+class SeedStoryState:
+    """Small story projection used to classify archive reconciliation rows."""
+
+    id: int
+    source: str
+    has_top_comments: bool
+
+
+@dataclass(frozen=True)
 class FeedbackRecord:
     story_id: int
     action: Action
@@ -509,6 +518,24 @@ class Database:
         with self.conn() as conn:
             cursor = conn.execute(query, ids)
             return [self._row_to_story(row) for row in cursor.fetchall()]
+
+    def get_seed_story_states(self, ids: list[int]) -> dict[int, SeedStoryState]:
+        """Return only the fields archive reconciliation needs for ``ids``."""
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        with self.conn() as conn:
+            rows = conn.execute(
+                f"SELECT id, source, top_comments != '' FROM stories "
+                f"WHERE id IN ({placeholders})",
+                ids,
+            ).fetchall()
+        return {
+            int(row[0]): SeedStoryState(
+                id=int(row[0]), source=str(row[1]), has_top_comments=bool(row[2])
+            )
+            for row in rows
+        }
 
     # HN explicit duplicate canonicalization cache
     @staticmethod

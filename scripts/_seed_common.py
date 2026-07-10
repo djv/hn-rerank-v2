@@ -4,13 +4,17 @@ import json
 import logging
 import sys
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from collections.abc import Iterator
+from typing import Any, TypeVar
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from ch_client import query_stories_with_comments as _ch_query_stories_with_comments
+from ch_client import (
+    clear_cache as _clear_ch_cache,
+    query_stories_with_comments as _ch_query_stories_with_comments,
+)
 from database import Database, Story
 from pipeline import (
     BQ_ARCHIVE_SOURCE,
@@ -21,6 +25,25 @@ from pipeline import (
     _extract_comments_recursive,
     _select_top_comments,
 )
+
+
+@dataclass(frozen=True)
+class SeedResult:
+    """Outcome counters for one archive seed or reconciliation run."""
+
+    inserted: int = 0
+    refreshed: int = 0
+    promoted: int = 0
+    skipped_feedback: int = 0
+    skipped_existing: int = 0
+    hydrated_comments: int = 0
+
+    def __iter__(self) -> Iterator[int]:
+        """Preserve the legacy four-counter unpacking contract for BQ callers."""
+        yield self.inserted
+        yield self.skipped_feedback
+        yield self.skipped_existing
+        yield self.hydrated_comments
 
 
 def _write_dryrun(
@@ -121,9 +144,11 @@ def feedback_story_ids(db: Database) -> set[int]:
     return {int(row[0]) for row in rows}
 
 
-def existing_story_ids(db: Database) -> set[int]:
-    rows = db.execute("SELECT id FROM stories")
-    return {int(row[0]) for row in rows}
+T = TypeVar("T")
+
+
+def _chunked(items: list[T], size: int) -> list[list[T]]:
+    return [items[start : start + size] for start in range(0, len(items), size)]
 
 
 async def seed_rows(
@@ -133,58 +158,116 @@ async def seed_rows(
     db: Database,
     embedder: Embedder,
     concurrency: int = 10,
-) -> tuple[int, int, int, int]:
-    """Skeleton -> bulk-CH-hydrate -> upsert.
+    reconcile: bool = False,
+    live_window_days: int = 30,
+    now_ts: int | None = None,
+    hydration_batch_size: int = 200,
+) -> SeedResult:
+    """Seed archive stories, optionally reconciling safe existing HN rows.
 
-    Replaces the previous per-story parallel Algolia hydration. The CH bulk
-    path is one query for the entire skeleton set (vs N parallel Algolia
-    calls), and the comment-selection logic is identical to the previous
-    implementation (re-uses _extract_comments_recursive / _select_top_comments).
+    The default is pure backfill: feedback and existing IDs are untouched.
+    Reconciliation refreshes only rows owned by this archive source or HN
+    rows. Recent HN rows retain ``source='hn'`` so they remain in the live
+    gravity-ranked candidate leg; aged qualifying HN rows are promoted to the
+    archive source. Other source labels (notably ``bq_seed``) are never
+    changed.
     """
-    del concurrency  # bulk path is single-query; concurrency no longer used
+    del concurrency  # bulk path is explicitly batched; concurrency is legacy CLI API
+    if live_window_days <= 0:
+        raise ValueError("live_window_days must be positive")
+    if hydration_batch_size <= 0:
+        raise ValueError("hydration_batch_size must be positive")
+
     protected_ids = feedback_story_ids(db)
-    existing_ids = existing_story_ids(db)
-    skeletons: list[Story] = []
-    skipped_feedback = 0
-    skipped_existing = 0
-    for row in rows:
-        story = story_from_bq_row(row, source=source)
-        if story is None:
-            continue
+    row_stories = [
+        story
+        for row in rows
+        if (story := story_from_bq_row(row, source=source)) is not None
+    ]
+    existing_by_id = db.get_seed_story_states([story.id for story in row_stories])
+    live_cutoff = int(now_ts if now_ts is not None else time.time()) - (
+        live_window_days * 86400
+    )
+    to_upsert: list[Story] = []
+    needs_hydration: list[Story] = []
+    result = SeedResult()
+
+    for story in row_stories:
         if story.id in protected_ids:
-            skipped_feedback += 1
+            result = replace(result, skipped_feedback=result.skipped_feedback + 1)
             continue
-        if story.id in existing_ids:
-            skipped_existing += 1
+        existing = existing_by_id.get(story.id)
+        if existing is None:
+            target_source = (
+                "hn" if reconcile and story.time >= live_cutoff else source
+            )
+            new_story = replace(story, source=target_source)
+            to_upsert.append(new_story)
+            needs_hydration.append(new_story)
             continue
-        skeletons.append(story)
+        if not reconcile or existing.source not in {"hn", source}:
+            result = replace(result, skipped_existing=result.skipped_existing + 1)
+            continue
 
-    if not skeletons:
-        return 0, skipped_feedback, skipped_existing, 0
-
-    skeleton_ids = [s.id for s in skeletons]
-    try:
-        ch_items = _ch_query_stories_with_comments(skeleton_ids, max_levels=5)
-    except Exception as exc:
-        logging.warning(
-            "bulk CH hydration failed (%r); falling back to skeleton-only", exc
+        target_source = (
+            "hn" if existing.source == "hn" and story.time >= live_cutoff else source
         )
-        ch_items = {}
+        reconciled = replace(story, source=target_source)
+        to_upsert.append(reconciled)
+        if target_source == source and existing.source == "hn":
+            result = replace(result, promoted=result.promoted + 1)
+        else:
+            result = replace(result, refreshed=result.refreshed + 1)
+        if not existing.has_top_comments:
+            needs_hydration.append(reconciled)
 
-    hydrated: list[Story] = []
+    if not to_upsert:
+        return result
+
     hydrated_count = 0
-    for skeleton in skeletons:
-        item = ch_items.get(skeleton.id)
-        if item is None:
-            hydrated.append(skeleton)
-            continue
-        story = _apply_ch_comments_to_story(skeleton, item)
-        hydrated.append(story)
-        if story.top_comments:
-            hydrated_count += 1
+    hydration_by_id = {story.id: story for story in needs_hydration}
+    for story_batch in _chunked(to_upsert, hydration_batch_size):
+        hydrated_by_id: dict[int, Story] = {}
+        batch_hydration_ids = [
+            story.id for story in story_batch if story.id in hydration_by_id
+        ]
+        if batch_hydration_ids:
+            try:
+                ch_items = _ch_query_stories_with_comments(
+                    batch_hydration_ids, max_levels=5
+                )
+                for story_id in batch_hydration_ids:
+                    item = ch_items.get(story_id)
+                    if item is None:
+                        continue
+                    hydrated = _apply_ch_comments_to_story(
+                        hydration_by_id[story_id], item
+                    )
+                    hydrated_by_id[story_id] = hydrated
+                    if hydrated.top_comments:
+                        hydrated_count += 1
+            except Exception as exc:
+                logging.warning(
+                    "bulk CH hydration failed for %d stories (%r); using skeletons",
+                    len(batch_hydration_ids),
+                    exc,
+                )
+            finally:
+                _clear_ch_cache()
 
-    for story in hydrated:
-        db.upsert_story(story)
+        final_stories = [
+            hydrated_by_id.get(story.id, story) for story in story_batch
+        ]
+        for story in final_stories:
+            db.upsert_story(story)
 
-    get_or_compute_embeddings(hydrated, embedder, db)
-    return len(hydrated), skipped_feedback, skipped_existing, hydrated_count
+        # ``upsert_story`` preserves longer cached fields. Re-read only this
+        # bounded batch before hashing, preventing a seed run from retaining
+        # thousands of full comment bodies and embeddings at once.
+        stored_stories = db.get_stories([story.id for story in final_stories])
+        get_or_compute_embeddings(stored_stories, embedder, db)
+    return replace(
+        result,
+        inserted=sum(1 for story in to_upsert if story.id not in existing_by_id),
+        hydrated_comments=hydrated_count,
+    )
