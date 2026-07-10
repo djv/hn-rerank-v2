@@ -2,6 +2,29 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-10 — fix: hardcode dashboard to HN sources only (for now)
+
+`build_cold_deck` and `load_production_candidate_stories` (the two
+functions that actually assemble what a user sees on the dashboard —
+`build_cold_deck` for 0-feedback users, `load_production_candidate_stories`
+for everyone else) now only return `hn`, `bq_seed`, and `ch_seed` sourced
+stories. Non-HN legs (RSS feeds, Reddit, LessWrong) are no longer read
+into the dashboard candidate pool; ingestion (`fetch_candidates_only`,
+`fetch_candidates`) is untouched, so those sources keep getting fetched
+into the DB, they're just filtered out at read time.
+
+This is a hardcoded, non-configurable change (`AND source IN ('hn',
+'bq_seed', 'ch_seed')` in `build_cold_deck`'s SQL; the `rss_rows` /
+`archive_rss_rows` legs deleted outright from
+`load_production_candidate_stories`) — a config toggle was considered
+and explicitly declined in favor of a minimal 2-function edit. To
+restore non-HN sources, revert this commit.
+
+Updated `test_build_cold_deck_combo_keys_and_flags` and
+`test_load_production_candidate_stories_preserves_leg_order_and_limits`
+in `tests/test_pipeline.py` to match (non-HN story ids no longer appear
+in results).
+
 ## 2026-07-10 — feat: add Cerebras as an LLM_PROVIDER option, make it default
 
 Benchmarked TLDR quality across the three candidate providers on real stories
