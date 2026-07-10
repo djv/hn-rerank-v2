@@ -279,15 +279,15 @@ def test_build_cold_deck_combo_keys_and_flags(
     cold = pipeline.build_cold_deck(db)
     by_id = {item.story.id: item for item in cold}
 
+    # Dashboard is hardcoded to HN sources only for now — non-HN story 3
+    # is filtered out at the SQL level.
+    assert 3 not in by_id
     assert by_id[1].combo_keys == "recent_hn recent_mixed"
     assert by_id[1].is_recent is True
     assert by_id[1].is_non_hn is False
     assert by_id[2].combo_keys == "archive_hn archive_mixed"
     assert by_id[2].is_recent is False
     assert by_id[2].is_non_hn is False
-    assert by_id[3].combo_keys == "recent_non-hn recent_mixed"
-    assert by_id[3].is_recent is True
-    assert by_id[3].is_non_hn is True
 
 
 def test_build_cold_deck_uses_badge_defaults(db: Database) -> None:
@@ -2416,7 +2416,9 @@ def test_load_production_candidate_stories_preserves_leg_order_and_limits(
         db, config, user_id=user.id, exclude_feedback=True, now_ts=now
     )
 
-    assert [story.id for story in candidates] == [1, 2, 10, 11, 21, 20, 30, 31]
+    # Dashboard is hardcoded to HN sources only for now — non-HN legs
+    # (ids 10, 11, 12, 30, 31, 32) are dropped.
+    assert [story.id for story in candidates] == [1, 2, 21, 20]
 
 
 def test_load_production_candidate_stories_feedback_switch_and_summarizable_filter(

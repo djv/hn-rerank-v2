@@ -137,6 +137,7 @@ def build_cold_deck(db: Database, user_id: int | None = None) -> list[RankedStor
             "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
             "FROM stories "
             "WHERE id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?) "
+            "  AND source IN ('hn', 'bq_seed', 'ch_seed') "
             "ORDER BY CAST(score AS REAL) / POW((? - time) / 3600.0 + 2.0, 1.8) DESC, "
             "         time DESC "
             "LIMIT ?",
@@ -147,6 +148,7 @@ def build_cold_deck(db: Database, user_id: int | None = None) -> list[RankedStor
             "SELECT id, title, url, score, time, text_content, source, comment_count, "
             "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
             "FROM stories "
+            "WHERE source IN ('hn', 'bq_seed', 'ch_seed') "
             "ORDER BY CAST(score AS REAL) / POW((? - time) / 3600.0 + 2.0, 1.8) DESC, "
             "         time DESC "
             "LIMIT ?",
@@ -181,10 +183,13 @@ def load_production_candidate_stories(
     exclude_feedback: bool,
     now_ts: int | None = None,
 ) -> list[Story]:
-    """Load the same four candidate legs used by the personalized dashboard.
+    """Load the same candidate legs used by the personalized dashboard.
 
     ``exclude_feedback=False`` is for offline evaluation: the initial pool
     needs feedback stories present so held-out folds can be measured.
+
+    Hardcoded to HN sources only (``hn``, ``bq_seed``, ``ch_seed``) for
+    now — non-HN legs (RSS/Reddit/LessWrong) are disabled.
     """
     if exclude_feedback and user_id is None:
         raise ValueError("user_id is required when exclude_feedback=True")
@@ -200,8 +205,8 @@ def load_production_candidate_stories(
         (user_id,) if exclude_feedback and user_id else ()
     )
 
-    # Four production legs: recent HN by gravity, recent non-HN by recency,
-    # archive HN seeds by score, and archive non-HN by recency.
+    # HN-only production legs: recent HN by gravity, archive HN seeds by
+    # score. Non-HN legs (RSS/Reddit/LessWrong) are disabled for now.
     hn_rows = db.execute(
         "SELECT id, title, url, score, time, text_content, source, comment_count, "
         "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
@@ -218,22 +223,6 @@ def load_production_candidate_stories(
             config.recent_candidate_hn_limit,
         ),
     )
-    rss_rows = db.execute(
-        "SELECT id, title, url, score, time, text_content, source, comment_count, "
-        "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
-        "FROM stories "
-        "WHERE time >= ? AND source != 'hn' AND source NOT IN (?, ?) "
-        f"{feedback_filter}"
-        "ORDER BY time DESC "
-        "LIMIT ?",
-        (
-            cutoff_ts,
-            BQ_ARCHIVE_SOURCE,
-            CH_ARCHIVE_SOURCE,
-            *feedback_params,
-            config.recent_candidate_rss_limit,
-        ),
-    )
     archive_rows = db.execute(
         "SELECT id, title, url, score, time, text_content, source, comment_count, "
         "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
@@ -247,22 +236,7 @@ def load_production_candidate_stories(
             BQ_ARCHIVE_CANDIDATE_LIMIT + CH_ARCHIVE_CANDIDATE_LIMIT,
         ),
     )
-    archive_rss_rows = db.execute(
-        "SELECT id, title, url, score, time, text_content, source, comment_count, "
-        "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
-        "FROM stories "
-        "WHERE source != 'hn' AND source NOT IN (?, ?) AND time < ? "
-        f"{feedback_filter}"
-        "ORDER BY time DESC LIMIT ?",
-        (
-            BQ_ARCHIVE_SOURCE,
-            CH_ARCHIVE_SOURCE,
-            cutoff_ts,
-            *feedback_params,
-            config.recent_candidate_rss_limit,
-        ),
-    )
-    rows = hn_rows + rss_rows + archive_rows + archive_rss_rows
+    rows = hn_rows + archive_rows
     return [
         story
         for story in (Database._row_to_story(row) for row in rows)
