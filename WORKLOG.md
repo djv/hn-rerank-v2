@@ -2,6 +2,30 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-10 — refactor: move onnx_model and .env to a shared cross-worktree directory
+
+`onnx_model/` (87M) and `.env` were only physically present in the `main`
+checkout; every new git worktree needed a manual symlink/copy of the model
+plus a Claude Code permission prompt to create it. Moved both to
+`/home/dev/hn-rewrite/shared/` (sibling of `main`) and added
+`DEFAULT_ONNX_MODEL_DIR` / `DEFAULT_ENV_PATH` constants in
+`pipeline/config.py`, used as the default `onnx_model_dir` (`Config`,
+`Embedder`) and as `server.py`'s `.env` fallback path. Also fixed the `.env`
+fallback, which pointed at the retired `hn_rerank` project's directory
+instead of anywhere real. See PR #12 (commit `a872771`).
+
+**Caused a brief outage**: moving the files broke the then-deployed `main`
+code (still on relative `"onnx_model"`/`.env` paths) before the fix was
+merged — `hn_rewrite.service` crash-looped for ~1.5 minutes between the move
+and the merge+restart. No user-visible data loss; verified recovery via
+`journalctl` (clean `cold_deck_rebuilt`, successful `/api/tldr-detail` call
+hitting `api.mistral.ai`, confirming both the shared model and shared `.env`
+resolve correctly) after restart.
+
+`scripts/bakeoff_embedding_models.py` (untracked WIP in `main`) still
+hardcodes the old relative `"onnx_model"` path and needs a manual fixup —
+left untouched since it predates this change and isn't committed.
+
 ## 2026-07-10 — fix: cold-deck fallback now computes Popular badges and includes Archive
 
 Root cause of "Popular/Explore/Archive show empty queue": the cold-deck
