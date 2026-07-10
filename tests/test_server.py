@@ -3285,17 +3285,30 @@ async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
     assert "- **Discussion** summary" in result.tldr
 
 
-def test_llm_provider_config_defaults_to_cerebras(monkeypatch) -> None:
+def test_llm_provider_config_defaults_to_mistral(monkeypatch) -> None:
     import server
 
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+
+    cfg = server._llm_provider_config()
+
+    assert cfg.provider == "mistral"
+    assert cfg.model == "mistral-small-latest"
+    assert cfg.api_key == "test-key"
+    assert cfg.extra == {}
+
+
+def test_llm_provider_config_cerebras_has_reasoning_effort(monkeypatch) -> None:
+    import server
+
+    monkeypatch.setenv("LLM_PROVIDER", "cerebras")
     monkeypatch.setenv("CEREBRAS_API_KEY", "test-key")
 
     cfg = server._llm_provider_config()
 
     assert cfg.provider == "cerebras"
     assert cfg.model == "gpt-oss-120b"
-    assert cfg.api_key == "test-key"
     assert cfg.extra == {"reasoning_effort": "low"}
 
 
@@ -3336,7 +3349,7 @@ async def test_generate_detailed_tldr_cerebras_passes_reasoning_effort_and_bumpe
         calls.append({"max_tokens": max_tokens, "extra": extra, "model": model})
         return server.LlmChatResult(content="- summary", ok=True)
 
-    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.setenv("LLM_PROVIDER", "cerebras")
     monkeypatch.setenv("CEREBRAS_API_KEY", "test-key")
     monkeypatch.setattr(server, "_call_llm_chat", mock_call_llm_chat)
 
