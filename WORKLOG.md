@@ -77,6 +77,17 @@ deck's structure; only Explore remains empty until real feedback exists.
   `test_build_cold_deck_uses_badge_defaults` renamed to
   `test_build_cold_deck_computes_popular_badges_but_not_explore` and its
   assertions updated to reflect Popular badges now being computed.
+## 2026-07-10 — embedding: add offline ONNX model bakeoff path
+
+Added `scripts/bakeoff_embedding_models.py`, which creates separately cached,
+validated 384-dimensional embedding snapshots for the current MiniLM encoder,
+Mixedbread xsmall, Snowflake Arctic XS, and BGE-small. It reads the production
+candidate set but never writes to `hn_rewrite.db`; each snapshot carries exact
+story IDs, input hashes, frozen story rows, feedback labels, and vote times.
+`scripts/eval_ranker_variants.py` now accepts such a snapshot through
+`--embeddings-file` and rejects stale or mismatched rows. This permits a fully
+reproducible temporal SVM comparison without mixing embedding spaces in the
+live cache or changing the running service.
 
 ## 2026-07-10 — fix: temporarily disable source filter toggle (Mixed/HN/Non-HN)
 
