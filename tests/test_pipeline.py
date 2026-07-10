@@ -223,7 +223,7 @@ def _cold_story(
 
 
 def test_build_cold_deck_empty_db(db: Database) -> None:
-    assert pipeline.build_cold_deck(db) == []
+    assert pipeline.build_cold_deck(db, Config()) == []
 
 
 def test_build_cold_deck_score_order_and_summarizable_filter(
@@ -243,7 +243,7 @@ def test_build_cold_deck_score_order_and_summarizable_filter(
     for story in (unsummarizable, low, high):
         db.upsert_story(story)
 
-    cold = pipeline.build_cold_deck(db)
+    cold = pipeline.build_cold_deck(db, Config())
 
     assert [item.story.id for item in cold] == [3, 2]
     gravity_div = 3.0**1.8
@@ -276,7 +276,7 @@ def test_build_cold_deck_combo_keys_and_flags(
     for story in (recent_hn, archive_hn, recent_non_hn):
         db.upsert_story(story)
 
-    cold = pipeline.build_cold_deck(db)
+    cold = pipeline.build_cold_deck(db, Config())
     by_id = {item.story.id: item for item in cold}
 
     # Dashboard is hardcoded to HN sources only for now — non-HN story 3
@@ -290,21 +290,27 @@ def test_build_cold_deck_combo_keys_and_flags(
     assert by_id[2].is_non_hn is False
 
 
-def test_build_cold_deck_uses_badge_defaults(db: Database) -> None:
+def test_build_cold_deck_computes_popular_badges_but_not_explore(
+    db: Database,
+) -> None:
+    """Popular (Hot/Top/Talk) is non-personalized and computed on the cold
+    deck; Explore (Unsure/Novel/Similar) is personalized and always absent
+    (no feedback to compute it against) — see build_cold_deck docstring."""
     db.upsert_story(_cold_story(1, score=100, time_ts=int(time.time()) - 3600))
 
-    item = pipeline.build_cold_deck(db)[0]
+    item = pipeline.build_cold_deck(db, Config())[0]
 
     assert item.best_match_title == ""
     assert item.prob_down is None
     assert item.prob_neutral is None
     assert item.prob_up is None
+    # Explore badges require feedback to personalize against; always absent.
     assert item.is_uncertain is False
     assert item.is_novel is False
-    assert item.is_discussion_rich is False
-    assert item.is_high_engagement is False
-    assert item.is_hot is False
     assert item.is_similar is False
+    # Popular badges are non-personalized; the sole HN candidate is both
+    # highest-scoring and highest-velocity, so it earns Hot.
+    assert item.is_hot is True
 
 
 @pytest.fixture(scope="module")

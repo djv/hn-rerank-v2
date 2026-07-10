@@ -51,6 +51,7 @@ from .ranking import (
     _MODEL_SCHEMA_VERSION,
     _NullTrace,
     _SIM_CHUNK_SIZE,
+    _assemble_combo_deck,
     _chunked_max_dot,
     _comment_rank_key,
     _extract_comments_recursive,
@@ -111,7 +112,6 @@ from reddit_limiter import limiter as reddit_limiter
 
 
 COLD_DECK_LIMIT = 100
-COLD_DECK_QUERY_LIMIT = 400
 
 
 def _combo_keys_for_story(story: Story, recent_cutoff: int) -> str:
@@ -120,59 +120,71 @@ def _combo_keys_for_story(story: Story, recent_cutoff: int) -> str:
     return f"{age}_{source} {age}_mixed"
 
 
-def build_cold_deck(db: Database, user_id: int | None = None) -> list[RankedStory]:
-    """Build a gravity-sorted fallback deck from existing SQLite rows.
+def build_cold_deck(
+    db: Database, config: Config, user_id: int | None = None
+) -> list[RankedStory]:
+    """Build a gravity-sorted, badge-annotated fallback deck — no embeddings,
+    no personalization.
 
     Uses the same tier-1 gravity formula as ``_score_and_rank`` so a
     zero-vote user sees the same ranking as the cold deck.  See
     ``fast_rerank_for_user`` for the 0-vote short-circuit.
 
-    When *user_id* is provided, the SQL filters out stories the user
-    has already voted on.
+    Reuses the same HN-only candidate legs (recent + archive) as the
+    personalized dashboard via ``load_production_candidate_stories``, and
+    the same non-personalized Popular badge assembly (Hot/Top/Talk) as
+    ``rerank_candidates`` via ``_assemble_combo_deck``, so cold-start decks
+    have Popular and Archive combos populated instead of being flat
+    recent-only cards. Explore (Unsure/Novel/Similar) is intentionally
+    skipped — it's personalized and requires feedback to compute against.
+
+    When *user_id* is provided, already-voted stories are excluded.
     """
     now_ts = int(time.time())
-    if user_id is not None:
-        rows = db.execute(
-            "SELECT id, title, url, score, time, text_content, source, comment_count, "
-            "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
-            "FROM stories "
-            "WHERE id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?) "
-            "  AND source IN ('hn', 'bq_seed', 'ch_seed') "
-            "ORDER BY CAST(score AS REAL) / POW((? - time) / 3600.0 + 2.0, 1.8) DESC, "
-            "         time DESC "
-            "LIMIT ?",
-            (user_id, now_ts, COLD_DECK_QUERY_LIMIT),
-        )
-    else:
-        rows = db.execute(
-            "SELECT id, title, url, score, time, text_content, source, comment_count, "
-            "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
-            "FROM stories "
-            "WHERE source IN ('hn', 'bq_seed', 'ch_seed') "
-            "ORDER BY CAST(score AS REAL) / POW((? - time) / 3600.0 + 2.0, 1.8) DESC, "
-            "         time DESC "
-            "LIMIT ?",
-            (now_ts, COLD_DECK_QUERY_LIMIT),
-        )
-    stories = [Database._row_to_story(row) for row in rows]
+    candidates = load_production_candidate_stories(
+        db,
+        config,
+        user_id=user_id,
+        exclude_feedback=user_id is not None,
+        now_ts=now_ts,
+    )
+    candidates = [story for story in candidates if is_summarizable(story)]
+    if not candidates:
+        return []
+
     recent_cutoff = now_ts - (30 * 86400)
-    cold: list[RankedStory] = []
-    for story in stories:
-        if not is_summarizable(story):
-            continue
-        cold.append(
-            RankedStory(
-                story=story,
-                score=story.score / ((now_ts - story.time) / 3600.0 + 2.0) ** 1.8,
-                best_match_title="",
-                is_non_hn=(not is_hn_source(story.source)),
-                is_recent=(story.time >= recent_cutoff),
-                combo_keys=_combo_keys_for_story(story, recent_cutoff),
-            )
+    ranked = [
+        RankedStory(
+            story=story,
+            score=story.score / ((now_ts - story.time) / 3600.0 + 2.0) ** 1.8,
+            best_match_title="",
+            is_non_hn=(not is_hn_source(story.source)),
+            is_recent=(story.time >= recent_cutoff),
+            combo_keys=_combo_keys_for_story(story, recent_cutoff),
         )
-        if len(cold) >= COLD_DECK_LIMIT:
-            break
-    return cold
+        for story in candidates
+    ]
+
+    cand_scores = np.array([story.score for story in candidates])
+    cand_velocities = np.array(
+        [
+            story.score / max((now_ts - story.time) / 3600.0, 0.1)
+            for story in candidates
+        ]
+    )
+    story_id_to_idx = {story.id: idx for idx, story in enumerate(candidates)}
+
+    cold = _assemble_combo_deck(
+        ranked,
+        config=config,
+        recent_cutoff=recent_cutoff,
+        cand_scores=cand_scores,
+        cand_velocities=cand_velocities,
+        idx_for=story_id_to_idx.__getitem__,
+        embeddings_map=None,
+        explore=None,
+    )
+    return cold[:COLD_DECK_LIMIT]
 
 
 def load_production_candidate_stories(
@@ -434,7 +446,7 @@ def fast_rerank_for_user(
     trace.set_count("feedback_total", n_feedback)
     if n_feedback == 0:
         trace.set_label("model_cache", "skipped_cold_deck")
-        cold_deck = build_cold_deck(db)
+        cold_deck = build_cold_deck(db, config)
         return canonicalize_hn_dupes(
             cold_deck,
             db,

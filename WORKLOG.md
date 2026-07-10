@@ -2,6 +2,58 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-10 — fix: cold-deck fallback now computes Popular badges and includes Archive
+
+Root cause of "Popular/Explore/Archive show empty queue": the cold-deck
+fallback (`build_cold_deck`) is served on any dashboard-cache miss —
+every user right after a `hn_rewrite.service` restart, and *every*
+render for zero-feedback users (who never trigger a background warm,
+since `server.py::_render_dashboard_for_user` gates `_trigger_warm` on
+`n_feedback > 0`). The old `build_cold_deck` was a single gravity-sorted
+SQL query with no velocity/badge computation and no archive leg, so on
+the cold path: Popular badges (Hot/Top/Talk) were never set (always
+`sort_popular_attr="0"`), and archive-age rows never survived the
+gravity ordering (`score / age_hours^1.8` decays anything past a few
+days to ~0), so Archive was always empty too. Explore (Unsure/Novel/
+Similar) is correctly empty on cold start — it's personalized and
+requires feedback to compute against.
+
+Two commits:
+
+1. **Refactor (behavior-preserving)** — extracted the per-combo bucket/
+   badge assembly loop out of `rerank_candidates` into a shared
+   `pipeline.ranking._assemble_combo_deck(..., explore: ExploreContext |
+   None)`. Popular (Hot/Top/Talk) always runs; Explore only runs when an
+   `ExploreContext` is supplied. Full test suite passes with zero test
+   changes, confirming no behavior drift in the warm path.
+2. **Fix** — rewrote `build_cold_deck` to reuse
+   `load_production_candidate_stories` (same HN-only recent + archive
+   legs as the personalized dashboard) and `_assemble_combo_deck` with
+   `embeddings_map=None, explore=None` — no ONNX/embedding computation,
+   so the cold path stays a fast, model-free fallback. `build_cold_deck`
+   now takes a required `config: Config` param (needed for
+   `hot_badge_percentile` and the candidate-leg limits); all three call
+   sites (`fast_rerank_for_user`, `server.py::_render_dashboard_for_user`,
+   `server.py::_rebuild_cold_deck`) already had `config`/`cls.config` in
+   scope. `COLD_DECK_QUERY_LIMIT` dropped (unused — candidate volume is
+   now governed by `Config.recent_candidate_hn_limit` /
+   `BQ_ARCHIVE_CANDIDATE_LIMIT` / `CH_ARCHIVE_CANDIDATE_LIMIT`).
+
+Net effect: cold-start decks (post-restart, or zero-feedback users) now
+have Popular badges and an archive bucket populated, matching the warm
+deck's structure; only Explore remains empty until real feedback exists.
+
+- `pipeline/ranking.py` — added `ExploreContext`, module-level
+  `get_entropy`, `_assemble_combo_deck`; `rerank_candidates` now calls it.
+- `pipeline/__init__.py` — `build_cold_deck` rewritten; signature is now
+  `build_cold_deck(db, config, user_id=None)`.
+- `server.py` — updated the two `build_cold_deck` call sites to pass
+  `cls.config`.
+- `tests/test_pipeline.py` — cold-deck tests updated to pass `Config()`;
+  `test_build_cold_deck_uses_badge_defaults` renamed to
+  `test_build_cold_deck_computes_popular_badges_but_not_explore` and its
+  assertions updated to reflect Popular badges now being computed.
+
 ## 2026-07-10 — fix: temporarily disable source filter toggle (Mixed/HN/Non-HN)
 
 Follow-on to the HN-only dashboard hardcoding (below): with non-HN
