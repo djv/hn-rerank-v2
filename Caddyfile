@@ -8,10 +8,6 @@ http://:8000 {
 		reverse_proxy 127.0.0.1:8766
 	}
 
-	handle /static/* {
-		reverse_proxy 127.0.0.1:8766
-	}
-
 	redir /hn /hn/
 
 	handle_path /hn/* {
