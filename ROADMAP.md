@@ -50,6 +50,12 @@ cache hits — leave KNN/FAISS alone, it's already cheap.
 
 ### PERF-1. Resolve HN duplicate canonicalization off the warm path (M, 1-2 days)
 
+**Completed 2026-07-10.** Canonicalization is now a SQLite-only warm-path
+lookup. A coalescing daemon submitted directly after HN candidate fetches
+persists bounded Firebase resolutions (including retry/negative TTLs), so an
+unknown or failed lookup leaves the original card visible without delaying a
+deck.
+
 **First actual warm-path fix.** `canonicalize_hn_dupes` (pipeline/__init__.py,
 called under `trace.stage("hn_dupes")`) does Firebase HTTP lookups
 synchronously after ranking — bounded (8 workers, 1.5s timeout, TTL cache) but

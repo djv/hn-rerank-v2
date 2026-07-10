@@ -2,6 +2,16 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-10 — perf: move HN duplicate canonicalization off warm ranking (PERF-1)
+
+Added the additive `hn_dupe_resolutions` SQLite cache with typed canonical,
+negative, and retry states. Regeneration now submits its just-fetched HN
+snapshot to one coalescing daemon worker; it resolves only bounded low-comment
+candidates and persists a fetched canonical target before the mapping. Warm
+reranking reads unexpired mappings in bulk and never calls Firebase: unknown,
+retry, no-match, or unavailable targets retain the original card. Rank traces
+now include duplicate-cache counters alongside the existing `hn_dupes` stage.
+
 ## 2026-07-10 — docs: unify fable_plan.md + codex_ultra_plan.md into ROADMAP.md
 
 The two advisory roadmaps had drifted: `fable_plan.md` (tracked) and

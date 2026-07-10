@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 
 import numpy as np
@@ -466,6 +467,7 @@ def fast_rerank_for_user(
             selected_limit=config.count,
             user_id=user_id,
             feedback_actions=tuple(config.model.dedup_exclude_actions),
+            trace=trace,
         )
 
     with trace.stage("candidate_sql"):
@@ -513,6 +515,7 @@ def fast_rerank_for_user(
             selected_limit=config.count,
             user_id=user_id,
             feedback_actions=tuple(config.model.dedup_exclude_actions),
+            trace=trace,
         )
 
 
@@ -575,6 +578,7 @@ async def fetch_candidates_only(
     db: Database,
     embedder: Embedder | None = None,
     prewarm_top_n: int | None = None,
+    on_hn_candidates: Callable[[Sequence[Story]], None] | None = None,
 ) -> None:
     """Fetch new candidates into shared DB; prewarm top-N hot per sub.
 
@@ -615,6 +619,11 @@ async def fetch_candidates_only(
         config, feedback_ids, feedback_urls, db, None
     )
     logging.info("Regen: fetched %d candidates", n_fetched)
+    if on_hn_candidates is not None:
+        try:
+            on_hn_candidates([story for story in candidates if story.source == "hn"])
+        except Exception:
+            logging.exception("fetch_candidates_only: HN dupe callback failed")
 
     # HN prewarm
     if config.prewarm_hn_full and embedder is not None:

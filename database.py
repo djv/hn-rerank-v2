@@ -14,6 +14,7 @@ from numpy.typing import NDArray
 
 
 Action: TypeAlias = Literal["up", "neutral", "down"]
+HnDupeStatus: TypeAlias = Literal["canonical", "no_match", "retry"]
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,17 @@ class RankPerfSample:
     model_cache: str
     stories: int
     fields: dict[str, int | float | str]
+
+
+@dataclass(frozen=True)
+class HnDupeResolution:
+    source_story_id: int
+    canonical_story_id: int | None
+    status: HnDupeStatus
+    checked_at: float
+    next_check_at: float
+    failure_count: int
+    last_error: str
 
 
 class Database:
@@ -210,6 +222,24 @@ class Database:
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_rank_perf_recorded_at "
                     "ON rank_perf(recorded_at)"
+                )
+
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS hn_dupe_resolutions (
+                        source_story_id INTEGER PRIMARY KEY,
+                        canonical_story_id INTEGER,
+                        status TEXT NOT NULL CHECK(status IN ('canonical', 'no_match', 'retry')),
+                        checked_at REAL NOT NULL,
+                        next_check_at REAL NOT NULL,
+                        failure_count INTEGER NOT NULL DEFAULT 0,
+                        last_error TEXT NOT NULL DEFAULT '',
+                        FOREIGN KEY (source_story_id) REFERENCES stories(id) ON DELETE CASCADE,
+                        FOREIGN KEY (canonical_story_id) REFERENCES stories(id) ON DELETE SET NULL
+                    )
+                """)
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_hn_dupe_resolutions_due "
+                    "ON hn_dupe_resolutions(next_check_at)"
                 )
 
                 # Run migration of article_cache to stories table if article_cache exists
@@ -479,6 +509,67 @@ class Database:
         with self.conn() as conn:
             cursor = conn.execute(query, ids)
             return [self._row_to_story(row) for row in cursor.fetchall()]
+
+    # HN explicit duplicate canonicalization cache
+    @staticmethod
+    def _row_to_hn_dupe_resolution(row: tuple) -> HnDupeResolution:
+        return HnDupeResolution(
+            source_story_id=int(row[0]), canonical_story_id=row[1], status=row[2],
+            checked_at=float(row[3]), next_check_at=float(row[4]),
+            failure_count=int(row[5]), last_error=str(row[6] or ""),
+        )
+
+    def get_hn_dupe_resolutions(
+        self, source_story_ids: list[int], *, now: float | None = None
+    ) -> dict[int, HnDupeResolution]:
+        if not source_story_ids:
+            return {}
+        now = time.time() if now is None else now
+        placeholders = ",".join("?" for _ in source_story_ids)
+        with self.conn() as conn:
+            rows = conn.execute(
+                f"SELECT source_story_id, canonical_story_id, status, checked_at, "
+                f"next_check_at, failure_count, last_error FROM hn_dupe_resolutions "
+                f"WHERE source_story_id IN ({placeholders}) AND next_check_at > ?",
+                [*source_story_ids, now],
+            ).fetchall()
+        return {row[0]: self._row_to_hn_dupe_resolution(row) for row in rows}
+
+    def get_due_hn_dupe_candidate_ids(
+        self, candidate_ids: list[int], *, limit: int = 250, now: float | None = None
+    ) -> list[int]:
+        """Select current low-comment HN candidates fairly: unseen, then oldest due."""
+        if not candidate_ids or limit <= 0:
+            return []
+        now = time.time() if now is None else now
+        placeholders = ",".join("?" for _ in candidate_ids)
+        with self.conn() as conn:
+            rows = conn.execute(
+                f"SELECT s.id FROM stories s LEFT JOIN hn_dupe_resolutions r "
+                f"ON r.source_story_id = s.id WHERE s.id IN ({placeholders}) "
+                "AND s.source = 'hn' AND COALESCE(s.comment_count, s.comment_count_at_fetch, 0) <= 8 "
+                "AND (r.source_story_id IS NULL OR r.next_check_at <= ?) "
+                "ORDER BY CASE WHEN r.source_story_id IS NULL THEN 0 ELSE 1 END, "
+                "COALESCE(r.next_check_at, 0), s.id LIMIT ?",
+                [*candidate_ids, now, limit],
+            ).fetchall()
+        return [int(row[0]) for row in rows]
+
+    def upsert_hn_dupe_resolution(
+        self, resolution: HnDupeResolution
+    ) -> None:
+        with self.conn() as conn:
+            with conn:
+                conn.execute(
+                    "INSERT INTO hn_dupe_resolutions (source_story_id, canonical_story_id, status, "
+                    "checked_at, next_check_at, failure_count, last_error) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(source_story_id) DO UPDATE SET canonical_story_id=excluded.canonical_story_id, "
+                    "status=excluded.status, checked_at=excluded.checked_at, next_check_at=excluded.next_check_at, "
+                    "failure_count=excluded.failure_count, last_error=excluded.last_error",
+                    (resolution.source_story_id, resolution.canonical_story_id, resolution.status,
+                     resolution.checked_at, resolution.next_check_at, resolution.failure_count,
+                     resolution.last_error[:500]),
+                )
 
     def prune_stories(self, max_age_days: int = 60) -> int:
         cutoff = time.time() - (max_age_days * 86400)

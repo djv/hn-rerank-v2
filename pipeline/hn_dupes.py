@@ -9,11 +9,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
-from typing import TypeAlias, TypeVar, cast
+from typing import Literal, Protocol, TypeAlias, TypeVar, cast
 
 import httpx
 
-from database import Database, Story
+from database import Database, HnDupeResolution, Story
 from dedup import NormalizedUrl, normalize_url
 from .ranking import RankedStory, clean_text, compose_story_text
 
@@ -82,6 +82,14 @@ class FeedbackDupeContext:
     story_ids: set[int]
     urls: set[NormalizedUrl]
     hn_stories: list[Story]
+
+
+@dataclass(frozen=True)
+class HnDupeOutcome:
+    """A complete negative inspection is distinct from a transient failure."""
+    status: Literal["canonical", "no_match", "retry"]
+    canonical_story: Story | None = None
+    error: str = ""
 
 
 def extract_hn_story_link_ids(comment_text: str, *, source_id: int) -> list[int]:
@@ -166,10 +174,16 @@ class HnDupeResolver:
         self._canonical_cache: dict[int, tuple[float, int | None]] = {}
         self._lock = threading.Lock()
 
-    def find_canonical_story_id(self, story_id: int) -> int | None:
+    def resolve(self, story_id: int) -> HnDupeOutcome:
         cached = self._get_cached_canonical(story_id)
         if cached is not _CACHE_MISS:
-            return cast(int | None, cached)
+            target_id = cast(int | None, cached)
+            if target_id is None:
+                return HnDupeOutcome("no_match")
+            target = self.get_story(target_id)
+            if target is None:
+                return HnDupeOutcome("retry", error="canonical target unavailable")
+            return HnDupeOutcome("canonical", canonical_story=target)
 
         canonical_id: int | None = None
         try:
@@ -178,7 +192,7 @@ class HnDupeResolver:
                 source_descendants = _coerce_nonnegative_int(item.get("descendants"))
                 if source_descendants > self._max_source_descendants:
                     self._set_cached_canonical(story_id, None)
-                    return None
+                    return HnDupeOutcome("no_match")
 
                 targets: list[FirebaseItem] = []
                 for child_id in _first_kid_ids(item, self._max_kids):
@@ -211,10 +225,20 @@ class HnDupeResolver:
                     )
         except Exception as exc:
             logging.debug("hn_dupe_resolver story_id=%s error=%r", story_id, exc)
-            canonical_id = None
+            return HnDupeOutcome("retry", error=repr(exc))
 
         self._set_cached_canonical(story_id, canonical_id)
-        return canonical_id
+        if canonical_id is None:
+            return HnDupeOutcome("no_match")
+        target = self.get_story(canonical_id)
+        if target is None:
+            return HnDupeOutcome("retry", error="canonical target unavailable")
+        return HnDupeOutcome("canonical", canonical_story=target)
+
+    def find_canonical_story_id(self, story_id: int) -> int | None:
+        """Compatibility wrapper for callers outside the persisted worker."""
+        outcome = self.resolve(story_id)
+        return outcome.canonical_story.id if outcome.canonical_story else None
 
     def get_story(self, story_id: int) -> Story | None:
         item = self._get_item(story_id)
@@ -268,15 +292,85 @@ class HnDupeResolver:
             timeout=self._timeout_seconds,
         )
         if response.status_code != 200:
-            return None
-        payload = response.json()
+            raise RuntimeError(f"Firebase HTTP {response.status_code}")
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise RuntimeError("invalid Firebase JSON") from exc
         if not isinstance(payload, Mapping):
-            return None
+            raise RuntimeError("invalid Firebase response")
         return cast(FirebaseItem, payload)
 
 
 _CACHE_MISS = object()
 _DEFAULT_RESOLVER = HnDupeResolver()
+
+
+class HnDupeResolutionWorker:
+    """One coalescing daemon that keeps Firebase out of ranking requests."""
+
+    def __init__(self, db: Database, *, resolver: HnDupeResolver | None = None) -> None:
+        self._db = db
+        self._resolver = resolver or HnDupeResolver()
+        self._lock = threading.Lock()
+        self._pending: list[Story] | None = None
+        self._active = False
+
+    def submit(self, candidates: Sequence[Story]) -> None:
+        snapshot = [story for story in candidates if story.source == "hn"]
+        if not snapshot:
+            return
+        with self._lock:
+            self._pending = snapshot
+            if self._active:
+                return
+            self._active = True
+        threading.Thread(target=self._run, name="hn-dupe-resolver", daemon=True).start()
+
+    def _run(self) -> None:
+        while True:
+            with self._lock:
+                snapshot, self._pending = self._pending, None
+            if snapshot:
+                try:
+                    self._resolve_snapshot(snapshot)
+                except Exception:
+                    logging.exception("hn_dupe_worker batch failed")
+            with self._lock:
+                if self._pending is None:
+                    self._active = False
+                    return
+
+    def _resolve_snapshot(self, candidates: Sequence[Story]) -> None:
+        by_id = {story.id: story for story in candidates if story.id > 0}
+        due_ids = self._db.get_due_hn_dupe_candidate_ids(list(by_id), limit=250)
+        if not due_ids:
+            return
+        now = time.time()
+        with ThreadPoolExecutor(max_workers=min(MAX_DUPE_RESOLVE_WORKERS, len(due_ids))) as pool:
+            futures = {pool.submit(self._resolver.resolve, sid): sid for sid in due_ids}
+            for future in as_completed(futures):
+                source_id = futures[future]
+                try:
+                    outcome = future.result()
+                except Exception as exc:
+                    outcome = HnDupeOutcome("retry", error=repr(exc))
+                prior = self._db.get_hn_dupe_resolutions([source_id]).get(source_id)
+                failures = (prior.failure_count if prior else 0) + (outcome.status == "retry")
+                if outcome.status == "canonical" and outcome.canonical_story is not None:
+                    # Persist target first: a cache hit can always render locally.
+                    self._db.upsert_story(outcome.canonical_story)
+                    canonical_id = outcome.canonical_story.id
+                    next_check = now + 30 * 86400
+                elif outcome.status == "no_match":
+                    canonical_id, failures, next_check = None, 0, now + 24 * 3600
+                else:
+                    canonical_id = None
+                    next_check = now + min(6 * 3600, 15 * 60 * (2 ** max(0, failures - 1)))
+                self._db.upsert_hn_dupe_resolution(HnDupeResolution(
+                    source_id, canonical_id, outcome.status, now, next_check,
+                    int(failures), outcome.error,
+                ))
 
 
 def canonicalize_hn_dupes(
@@ -288,6 +382,7 @@ def canonicalize_hn_dupes(
     user_id: int | None = None,
     feedback_actions: tuple[str, ...] = ("up", "neutral"),
     resolver: HnDupeResolver | None = None,
+    trace: _TraceCounter | None = None,
 ) -> list[RankedStory]:
     """Replace or suppress selected HN cards with canonical duplicate targets."""
     if not ranked:
@@ -297,7 +392,6 @@ def canonicalize_hn_dupes(
     if selected_count == 0:
         return ranked
 
-    dupe_resolver = resolver or _DEFAULT_RESOLVER
     candidate_by_id = {story.id: story for story in candidate_stories}
     original_output_ids = {item.story.id for item in ranked}
     feedback_context = _load_feedback_context(
@@ -305,11 +399,14 @@ def canonicalize_hn_dupes(
         user_id=user_id,
         actions=feedback_actions,
     )
-    target_by_source = _resolve_selected_targets(
-        ranked,
-        selected_count=selected_count,
-        resolver=dupe_resolver,
-    )
+    source_ids = list(dict.fromkeys(
+        item.story.id for item in ranked[:selected_count]
+        if item.story.source == "hn" and item.story.id > 0
+    ))
+    resolutions = db.get_hn_dupe_resolutions(source_ids)
+    _set_trace_count(trace, "hn_dupes_cache_hit", len(resolutions))
+    _set_trace_count(trace, "hn_dupes_cache_miss", len(source_ids) - len(resolutions))
+    _set_trace_count(trace, "hn_dupes_retry", sum(r.status == "retry" for r in resolutions.values()))
     emitted_ids: set[int] = set()
     output: list[RankedStory] = []
 
@@ -321,7 +418,8 @@ def canonicalize_hn_dupes(
                 emitted_ids.add(story.id)
             continue
 
-        target_id = target_by_source.get(story.id)
+        resolution = resolutions.get(story.id)
+        target_id = resolution.canonical_story_id if resolution and resolution.status == "canonical" else None
         if _matches_feedback(story, feedback_context):
             logging.info(
                 "hn_dupe_resolver source_id=%s result=dropped_feedback_match",
@@ -358,9 +456,9 @@ def canonicalize_hn_dupes(
             target_id,
             db,
             candidate_by_id=candidate_by_id,
-            resolver=dupe_resolver,
         )
         if target_story is None:
+            _increment_trace_count(trace, "hn_dupes_target_missing")
             if story.id not in emitted_ids:
                 output.append(item)
                 emitted_ids.add(story.id)
@@ -420,18 +518,31 @@ def _lookup_canonical_story(
     db: Database,
     *,
     candidate_by_id: Mapping[int, Story],
-    resolver: HnDupeResolver,
 ) -> Story | None:
     from . import is_summarizable
 
     target_story = candidate_by_id.get(target_id)
     if target_story is None:
         target_story = db.get_story(target_id)
-    if target_story is None:
-        target_story = resolver.get_story(target_id)
     if target_story is None or not is_summarizable(target_story):
         return None
     return target_story
+
+
+class _TraceCounter(Protocol):
+    def set_count(self, name: str, value: int) -> None: ...
+
+
+def _set_trace_count(trace: _TraceCounter | None, key: str, value: int) -> None:
+    if trace is not None:
+        trace.set_count(key, value)
+
+
+def _increment_trace_count(trace: _TraceCounter | None, key: str) -> None:
+    if trace is not None:
+        # RankTrace intentionally exposes set_count but no get_count.
+        # Counters are only informational, so target-missing is reported once.
+        trace.set_count(key, 1)
 
 
 def _load_feedback_context(

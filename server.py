@@ -2074,6 +2074,9 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
 
 def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
     logging.info("Starting background regeneration loop...")
+    from pipeline.hn_dupes import HnDupeResolutionWorker
+
+    hn_dupe_worker = HnDupeResolutionWorker(db)
     embedder = Handler.embedder
     if config.regen_initial_delay_seconds > 0:
         logging.info(
@@ -2094,7 +2097,14 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
         try:
             from pipeline import fetch_candidates_only
 
-            asyncio.run(fetch_candidates_only(config, db, embedder=embedder))
+            asyncio.run(
+                fetch_candidates_only(
+                    config,
+                    db,
+                    embedder=embedder,
+                    on_hn_candidates=hn_dupe_worker.submit,
+                )
+            )
             Handler._rebuild_cold_deck()
             Handler._bump_all_cached_versions()
 

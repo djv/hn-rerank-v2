@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 from hypothesis import given, strategies as st, settings, HealthCheck
-from database import Database, Story
+from database import Database, HnDupeResolution, Story
 from dataclasses import replace
 import pipeline
 import pipeline.ranking as ranking
@@ -2088,36 +2088,17 @@ def test_canonicalize_hn_dupes_replaces_selected_story_preserving_metadata(
             combo_keys="recent_hn recent_mixed",
         )
     ]
-    resolver = HnDupeResolver(
-        fetch_item=lambda story_id: {
-            100: {
-                "id": 100,
-                "type": "story",
-                "title": "Claude Fable extended to July 12",
-                "score": 10,
-                "descendants": 3,
-                "kids": [101],
-            },
-            101: {
-                "id": 101,
-                "type": "comment",
-                "text": "Earlier: https://news.ycombinator.com/item?id=200",
-            },
-            200: {
-                "id": 200,
-                "type": "story",
-                "title": "We're extending access to Fable 5 on all paid plans through July 12",
-                "score": 50,
-                "descendants": 5,
-            },
-        }.get(story_id)
+    db.upsert_story(duplicate)
+    db.upsert_story(canonical)
+    now = time.time()
+    db.upsert_hn_dupe_resolution(
+        HnDupeResolution(100, 200, "canonical", now, now + 86400, 0, "")
     )
 
     result = pipeline.canonicalize_hn_dupes(
         ranked,
         db,
         candidate_stories=[duplicate, canonical],
-        resolver=resolver,
     )
 
     assert len(result) == 1
@@ -2147,29 +2128,11 @@ def test_canonicalize_hn_dupes_drops_when_target_already_in_output(
         comment_count=3,
         article_body="body",
     )
-    resolver = HnDupeResolver(
-        fetch_item=lambda story_id: {
-            100: {
-                "id": 100,
-                "type": "story",
-                "title": "Candidate 100",
-                "score": 10,
-                "descendants": 3,
-                "kids": [101],
-            },
-            101: {
-                "id": 101,
-                "type": "comment",
-                "text": "Earlier: https://news.ycombinator.com/item?id=200",
-            },
-            200: {
-                "id": 200,
-                "type": "story",
-                "title": "Candidate 200",
-                "score": 50,
-                "descendants": 5,
-            },
-        }.get(story_id)
+    db.upsert_story(duplicate)
+    db.upsert_story(canonical)
+    now = time.time()
+    db.upsert_hn_dupe_resolution(
+        HnDupeResolution(100, 200, "canonical", now, now + 86400, 0, "")
     )
 
     result = pipeline.canonicalize_hn_dupes(
@@ -2179,7 +2142,6 @@ def test_canonicalize_hn_dupes_drops_when_target_already_in_output(
         ],
         db,
         candidate_stories=[canonical, duplicate],
-        resolver=resolver,
     )
 
     assert [item.story.id for item in result] == [200]
