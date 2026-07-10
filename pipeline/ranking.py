@@ -7,7 +7,7 @@ import re
 import threading
 import time
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -1216,121 +1216,55 @@ def mmr_filter(
     return selected
 
 
-def rerank_candidates(
-    db: Database,
-    config: Config,
-    embedder: Embedder,
-    candidates: list[Story],
-    cand_embeddings: NDArray[np.float32] | None = None,
-    user_id: int | None = None,
-    trace: RankTrace | _NullTrace = NULL_TRACE,
-) -> list[RankedStory]:
-    """Rank candidates and attach discovery badges.
+def get_entropy(r: RankedStory) -> float:
+    """Shannon entropy (bits) of a story's prob_down/neutral/up distribution.
 
-    This wraps :func:`_score_and_rank` (which only does tier blend + sort)
-    and adds badge attribution + 7 discovery passes (uncertainty, novelty,
-    similarity, discussion-rich, high-engagement, hot, non-HN).
-
-    Use this in production; the private ``_score_and_rank`` is intended for
-    tier-blend tests that need to assert on ranking without badge side effects.
+    ``None`` probabilities (no trained model / cold path) contribute nothing,
+    so a story with no probabilities at all has entropy 0.
     """
-    if not candidates:
-        return []
-    if trace is not None:
-        trace.set_count("candidates", len(candidates))
+    ent = 0.0
+    for p in (r.prob_down, r.prob_neutral, r.prob_up):
+        if p is not None and p > 1e-9:
+            ent -= p * np.log2(p)
+    return ent
 
-    if cand_embeddings is None:
-        if trace is not None:
-            with trace.stage("candidate_embedding"):
-                cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
-        else:
-            cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
 
-    score_context = RankScoreContext()
-    ranked = _score_and_rank(
-        candidates,
-        cand_embeddings,
-        db,
-        config,
-        embedder,
-        user_id=user_id,
-        trace=trace,
-        score_context=score_context,
-    )
+@dataclass(frozen=True)
+class ExploreContext:
+    """Per-candidate arrays needed for the personalized Explore badges
+    (Unsure/Novel/Similar). Absent (``None``) on the cold-deck path, which
+    has no feedback to personalize against."""
 
-    # Build MMR embeddings map once (used per combo)
-    embeddings_map: dict[int, NDArray[np.float32]] = {}
-    if config.model.enable_mmr:
-        embeddings_map = {s.id: vec for s, vec in zip(candidates, cand_embeddings)}
+    cand_max_sim: NDArray[np.float32]
+    cand_closest_up: NDArray[np.float32]
 
-    with trace.stage("badge_similarity"):
-        # Reuse vectors from _score_and_rank when SVM was trained;
-        # otherwise compute them (chunked) on demand.
-        if score_context.cand_closest_up is not None:
-            cand_closest_up = score_context.cand_closest_up
-            cand_closest_down = score_context.cand_closest_down
-            cand_closest_neutral = score_context.cand_closest_neutral
-        else:
-            feedback_stories, feedback_labels, _ = db.get_feedback_for_training(
-                user_id=user_id
-            )
-            fb_labels_arr = np.array(feedback_labels)
-            up_mask = fb_labels_arr == 2
-            down_mask = fb_labels_arr == 0
-            neutral_mask = fb_labels_arr == 1
-            fb_embs = get_or_compute_embeddings(feedback_stories, embedder, db)
-            cand_closest_up = (
-                _chunked_max_dot(cand_embeddings, fb_embs[up_mask])
-                if up_mask.any()
-                else np.zeros(len(candidates), dtype=np.float32)
-            )
-            cand_closest_down = (
-                _chunked_max_dot(cand_embeddings, fb_embs[down_mask])
-                if down_mask.any()
-                else np.zeros(len(candidates), dtype=np.float32)
-            )
-            cand_closest_neutral = (
-                _chunked_max_dot(cand_embeddings, fb_embs[neutral_mask])
-                if neutral_mask.any()
-                else np.zeros(len(candidates), dtype=np.float32)
-            )
 
-        assert cand_closest_down is not None and cand_closest_neutral is not None
-        cand_max_sim = np.maximum.reduce(
-            [cand_closest_up, cand_closest_down, cand_closest_neutral]
-        )
+def _assemble_combo_deck(
+    ranked: list[RankedStory],
+    *,
+    config: Config,
+    recent_cutoff: int,
+    cand_scores: NDArray[np.float32],
+    cand_velocities: NDArray[np.float32],
+    idx_for: Callable[[int], int],
+    embeddings_map: dict[int, NDArray[np.float32]] | None,
+    explore: ExploreContext | None,
+) -> list[RankedStory]:
+    """Bucket ``ranked`` into per-combo primary + badge cards.
 
-    # Hoist now_ts and compute per-age-bucket metadata early so all
-    # threshold computations below can produce per-candidate arrays.
-    # Per-bucket thresholds are required because archive candidates have
-    # structurally higher absolute scores/comment counts (months/years of
-    # accumulation) than recent candidates; a single global threshold
-    # would be archive-dominated and make it nearly impossible for
-    # recent stories to earn Top/Talk-worthy badges. Similar logic
-    # applies to Novel/Similar/Unsure so badges remain meaningful
-    # within each age cohort.
-    cand_scores = np.array([s.score for s in candidates])
-    now_ts = time.time()
-    recent_cutoff = int(now_ts) - 30 * 86400
-    cand_velocities = np.array(
-        [s.score / max((now_ts - s.time) / 3600.0, 0.1) for s in candidates]
-    )
-
-    story_id_to_idx = {s.id: idx for idx, s in enumerate(candidates)}
-    idx_for = story_id_to_idx.__getitem__
-
-    def get_entropy(r: RankedStory) -> float:
-        ent = 0.0
-        for p in (r.prob_down, r.prob_neutral, r.prob_up):
-            if p is not None and p > 1e-9:
-                ent -= p * np.log2(p)
-        return ent
+    Non-personalized (Popular: Hot/Top/Talk) badges always run. Personalized
+    (Explore: Unsure/Novel/Similar) badges only run when *explore* is
+    provided — the cold-deck path passes ``None`` since it has no feedback
+    to personalize against.
+    """
 
     def _novel_sort_key(r: RankedStory) -> float:
-        return float(1.0 - cand_max_sim[idx_for(r.story.id)])
+        assert explore is not None
+        return float(1.0 - explore.cand_max_sim[idx_for(r.story.id)])
 
     def _similar_sort_key(r: RankedStory) -> float:
-        return float(cand_closest_up[idx_for(r.story.id)])
+        assert explore is not None
+        return float(explore.cand_closest_up[idx_for(r.story.id)])
 
     def _discussion_sort_key(r: RankedStory) -> float:
         return float(r.story.comment_count or 0)
@@ -1477,55 +1411,56 @@ def rerank_candidates(
         # stack badges on stories already picked by Popular, matching the
         # old parallel-pass design. Within Explore, Unsure/Novel/Similar
         # are serial (mutually exclusive) to keep the badge mix varied.
-        explore_pool = [r for r in combo_pool if r.story.id not in primary_ids]
-        explore_picked = set[int]()  # only track Explore picks, not Popular
+        if explore is not None:
+            explore_pool = [r for r in combo_pool if r.story.id not in primary_ids]
+            explore_picked = set[int]()  # only track Explore picks, not Popular
 
-        def _merge_or_append(r: RankedStory, **badge_flags: bool) -> None:
-            # A story already present in `final` (e.g. badged by Hot/Top/Talk,
-            # or by an earlier Explore pass) gets the new badge OR'd onto its
-            # existing card instead of appending a duplicate — one card per
-            # story per segment (see specs/ranking-feedback.allium invariant
-            # OneCardPerStoryPerSegment).
-            existing = next(
-                (i for i, f in enumerate(final) if f.story.id == r.story.id), None
-            )
-            if existing is not None:
-                final[existing] = replace(
-                    final[existing],
-                    combo_keys=f"{source_key} {mixed_key}",
-                    **badge_flags,
+            def _merge_or_append(r: RankedStory, **badge_flags: bool) -> None:
+                # A story already present in `final` (e.g. badged by Hot/Top/Talk,
+                # or by an earlier Explore pass) gets the new badge OR'd onto its
+                # existing card instead of appending a duplicate — one card per
+                # story per segment (see specs/ranking-feedback.allium invariant
+                # OneCardPerStoryPerSegment).
+                existing = next(
+                    (i for i, f in enumerate(final) if f.story.id == r.story.id), None
                 )
-            else:
-                final.append(
-                    replace(r, combo_keys=f"{source_key} {mixed_key}", **badge_flags)
-                )
+                if existing is not None:
+                    final[existing] = replace(
+                        final[existing],
+                        combo_keys=f"{source_key} {mixed_key}",
+                        **badge_flags,
+                    )
+                else:
+                    final.append(
+                        replace(r, combo_keys=f"{source_key} {mixed_key}", **badge_flags)
+                    )
 
-        unsure_items = sorted(
-            [r for r in explore_pool if r.prob_down is not None],
-            key=_entropy_sort_key,
-            reverse=True,
-        )[:DISCOVERY_PER_BADGE]
-        for r in unsure_items:
-            _merge_or_append(r, is_uncertain=True)
-            explore_picked.add(r.story.id)
+            unsure_items = sorted(
+                [r for r in explore_pool if r.prob_down is not None],
+                key=_entropy_sort_key,
+                reverse=True,
+            )[:DISCOVERY_PER_BADGE]
+            for r in unsure_items:
+                _merge_or_append(r, is_uncertain=True)
+                explore_picked.add(r.story.id)
 
-        novel_items = sorted(
-            [r for r in explore_pool if r.story.id not in explore_picked],
-            key=_novel_sort_key,
-            reverse=True,
-        )[:DISCOVERY_PER_BADGE]
-        for r in novel_items:
-            _merge_or_append(r, is_novel=True)
-            explore_picked.add(r.story.id)
+            novel_items = sorted(
+                [r for r in explore_pool if r.story.id not in explore_picked],
+                key=_novel_sort_key,
+                reverse=True,
+            )[:DISCOVERY_PER_BADGE]
+            for r in novel_items:
+                _merge_or_append(r, is_novel=True)
+                explore_picked.add(r.story.id)
 
-        similar_items = sorted(
-            [r for r in explore_pool if r.story.id not in explore_picked],
-            key=_similar_sort_key,
-            reverse=True,
-        )[:DISCOVERY_PER_BADGE]
-        for r in similar_items:
-            _merge_or_append(r, is_similar=True)
-            explore_picked.add(r.story.id)
+            similar_items = sorted(
+                [r for r in explore_pool if r.story.id not in explore_picked],
+                key=_similar_sort_key,
+                reverse=True,
+            )[:DISCOVERY_PER_BADGE]
+            for r in similar_items:
+                _merge_or_append(r, is_similar=True)
+                explore_picked.add(r.story.id)
 
     # Set is_recent and is_non_hn on every story in `final` (these flags are
     # source/time based, not rank-based, so they always reflect the current
@@ -1541,3 +1476,120 @@ def rerank_candidates(
 
     final.sort(key=lambda r: r.score, reverse=True)
     return final
+
+
+def rerank_candidates(
+    db: Database,
+    config: Config,
+    embedder: Embedder,
+    candidates: list[Story],
+    cand_embeddings: NDArray[np.float32] | None = None,
+    user_id: int | None = None,
+    trace: RankTrace | _NullTrace = NULL_TRACE,
+) -> list[RankedStory]:
+    """Rank candidates and attach discovery badges.
+
+    This wraps :func:`_score_and_rank` (which only does tier blend + sort)
+    and adds badge attribution + 7 discovery passes (uncertainty, novelty,
+    similarity, discussion-rich, high-engagement, hot, non-HN).
+
+    Use this in production; the private ``_score_and_rank`` is intended for
+    tier-blend tests that need to assert on ranking without badge side effects.
+    """
+    if not candidates:
+        return []
+    if trace is not None:
+        trace.set_count("candidates", len(candidates))
+
+    if cand_embeddings is None:
+        if trace is not None:
+            with trace.stage("candidate_embedding"):
+                cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
+        else:
+            cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
+
+    score_context = RankScoreContext()
+    ranked = _score_and_rank(
+        candidates,
+        cand_embeddings,
+        db,
+        config,
+        embedder,
+        user_id=user_id,
+        trace=trace,
+        score_context=score_context,
+    )
+
+    # Build MMR embeddings map once (used per combo)
+    embeddings_map: dict[int, NDArray[np.float32]] = {}
+    if config.model.enable_mmr:
+        embeddings_map = {s.id: vec for s, vec in zip(candidates, cand_embeddings)}
+
+    with trace.stage("badge_similarity"):
+        # Reuse vectors from _score_and_rank when SVM was trained;
+        # otherwise compute them (chunked) on demand.
+        if score_context.cand_closest_up is not None:
+            cand_closest_up = score_context.cand_closest_up
+            cand_closest_down = score_context.cand_closest_down
+            cand_closest_neutral = score_context.cand_closest_neutral
+        else:
+            feedback_stories, feedback_labels, _ = db.get_feedback_for_training(
+                user_id=user_id
+            )
+            fb_labels_arr = np.array(feedback_labels)
+            up_mask = fb_labels_arr == 2
+            down_mask = fb_labels_arr == 0
+            neutral_mask = fb_labels_arr == 1
+            fb_embs = get_or_compute_embeddings(feedback_stories, embedder, db)
+            cand_closest_up = (
+                _chunked_max_dot(cand_embeddings, fb_embs[up_mask])
+                if up_mask.any()
+                else np.zeros(len(candidates), dtype=np.float32)
+            )
+            cand_closest_down = (
+                _chunked_max_dot(cand_embeddings, fb_embs[down_mask])
+                if down_mask.any()
+                else np.zeros(len(candidates), dtype=np.float32)
+            )
+            cand_closest_neutral = (
+                _chunked_max_dot(cand_embeddings, fb_embs[neutral_mask])
+                if neutral_mask.any()
+                else np.zeros(len(candidates), dtype=np.float32)
+            )
+
+        assert cand_closest_down is not None and cand_closest_neutral is not None
+        cand_max_sim = np.maximum.reduce(
+            [cand_closest_up, cand_closest_down, cand_closest_neutral]
+        )
+
+    # Hoist now_ts and compute per-age-bucket metadata early so all
+    # threshold computations below can produce per-candidate arrays.
+    # Per-bucket thresholds are required because archive candidates have
+    # structurally higher absolute scores/comment counts (months/years of
+    # accumulation) than recent candidates; a single global threshold
+    # would be archive-dominated and make it nearly impossible for
+    # recent stories to earn Top/Talk-worthy badges. Similar logic
+    # applies to Novel/Similar/Unsure so badges remain meaningful
+    # within each age cohort.
+    cand_scores = np.array([s.score for s in candidates])
+    now_ts = time.time()
+    recent_cutoff = int(now_ts) - 30 * 86400
+    cand_velocities = np.array(
+        [s.score / max((now_ts - s.time) / 3600.0, 0.1) for s in candidates]
+    )
+
+    story_id_to_idx = {s.id: idx for idx, s in enumerate(candidates)}
+    idx_for = story_id_to_idx.__getitem__
+
+    return _assemble_combo_deck(
+        ranked,
+        config=config,
+        recent_cutoff=recent_cutoff,
+        cand_scores=cand_scores,
+        cand_velocities=cand_velocities,
+        idx_for=idx_for,
+        embeddings_map=embeddings_map,
+        explore=ExploreContext(
+            cand_max_sim=cand_max_sim, cand_closest_up=cand_closest_up
+        ),
+    )
