@@ -2,6 +2,61 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-10 — docs: unify fable_plan.md + codex_ultra_plan.md into ROADMAP.md
+
+The two advisory roadmaps had drifted: `fable_plan.md` (tracked) and
+`codex_ultra_plan.md` (untracked, a later reconciliation against the live
+tree) used conflicting numbering for the same work (fable's O1/O2/O3 =
+healthz/metrics/backups; codex's O1/O2/O3 = backups/Reddit/health), and three
+items have since resolved (backups, metrics, healthz — see the two entries
+below). Merged both into a single canonical `ROADMAP.md`: one stable ID per
+item (`PERF-*`, `REF-*`, `F*`, `OPS-*`, `B*`), a status ledger at the top for
+resolved items, fable's concrete technical detail kept where richer, codex's
+corrected priority order and Reddit-isolation/hn_dupes items folded in.
+Deleted both source files (`git rm fable_plan.md`, `rm codex_ultra_plan.md`)
+and repointed the two live references to the old filenames
+(`scripts/perf_report.py`'s docstring, this file's O2 entry below) at
+`ROADMAP.md`.
+
+## 2026-07-10 — ops: close O3 (health/perf control plane), no code
+
+`codex_ultra_plan.md`'s O3 asked for `/healthz`, `rank_perf` retention, and an
+optional browser smoke test. Reviewed with the user and closed without
+further code:
+
+- The metrics half already shipped as O2 (`470f787`, 2026-07-09): `rank_perf`
+  table + `scripts/perf_report.py`.
+- `/healthz` was dropped as redundant for this deployment shape: single-user,
+  localhost-bound, SWR-cached. DB reachability, last regen, warm failures, and
+  the Reddit circuit state are all already in journalctl or directly
+  queryable in the DB; a live status endpoint only pays off with an external
+  poller, and none exists here.
+- `rank_perf` retention was deferred as premature: ~200 warms/day at a few
+  hundred bytes each is ~73k rows/year, negligible. `prune_rank_perf` can be
+  added later (mirroring `prune_stories`, `database.py:483`) if growth ever
+  becomes a real concern.
+- Browser smoke test / systemd memory caps remain deferred per the original
+  doc (heavy Playwright dep; caps need a memory baseline first).
+
+## 2026-07-10 — ops: repair backup service unit paths (O1)
+
+`hn-rewrite-backup.service` had been failing silently (`203/EXEC`) since at
+least 2026-07-09T00:13:52Z: both `WorkingDirectory` and `ExecStart` in
+`~/.config/systemd/user/hn-rewrite-backup.service` pointed at the old
+checkout (`/home/dev/hn-rewrite`), which no longer has `scripts/` or the live
+DB — both live at `/home/dev/hn-rewrite/main` now. The daily timer kept
+firing and kept failing; no backup had succeeded since the checkout moved.
+
+Fixed both paths, `daemon-reload` + `reset-failed`, then ran the corrected
+unit manually (exit 0, checksum verified on upload) and did a non-destructive
+restore drill into a scratch dir: downloaded the fresh snapshot, verified its
+sha256, ran `PRAGMA integrity_check` (`ok`), and compared row counts against
+the live DB — feedback (5257) and users (423) matched exactly; stories
+differed by 111 (36055 vs 36166), consistent with regen churn during the
+drill, not data loss. Drill artifacts were scratch-only and removed after.
+
+No repo files changed (systemd user units live under `~/.config`, untracked).
+
 ## 2026-07-09 — feature: persist rank_perf traces to SQLite (O2)
 
 Added a `rank_perf` table (additive `CREATE TABLE IF NOT EXISTS`, no migration
@@ -19,7 +74,7 @@ New read-only `scripts/perf_report.py` prints p50/p95/max per stage over a
 `--window-days` window, split by `model_cache`, stages sorted by p95
 descending. This is the before/after instrument for the performance work
 queued up next (precomputed-kernel SVM scoring, rerank-cadence changes,
-candidate-matrix caching) — see `fable_plan.md`.
+candidate-matrix caching) — see `ROADMAP.md`.
 
 ## 2026-07-09 — config: remove low-signal Reddit feeds
 

@@ -3,8 +3,8 @@
 
 Reads the rank_perf table O2 writes on every warm (server.py's
 _run_warm_attempt) and prints a compact stage-timing breakdown. This is
-the before/after instrument for the P1/P2/P3 performance work in
-fable_plan.md — run before and after each change and diff the numbers.
+the before/after instrument for the PERF-1/PERF-2/PERF-3 performance work in
+ROADMAP.md — run before and after each change and diff the numbers.
 
 Usage:
     uv run python scripts/perf_report.py --window-days 7
