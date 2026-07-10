@@ -331,7 +331,7 @@ def test_embedding_cosine_no_embedding_for_story() -> None:
 
 @pytest.fixture
 def embedder() -> Embedder:
-    return Embedder("onnx_model")
+    return Embedder()
 
 
 def test_fast_rerank_for_user_dedups_duplicate_urls(db, monkeypatch) -> None:

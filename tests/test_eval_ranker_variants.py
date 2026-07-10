@@ -56,6 +56,108 @@ def _eval_story(sid: int) -> Story:
     )
 
 
+def test_external_embedding_snapshot_validates_candidate_identity(tmp_path: Path) -> None:
+    from scripts.eval_ranker_variants import (
+        _embedding_text_hashes,
+        _load_external_embeddings,
+    )
+
+    stories = [_eval_story(1), _eval_story(2)]
+    path = tmp_path / "embeddings.npz"
+    expected = np.eye(2, 384, dtype=np.float32)
+    np.savez(
+        path,
+        story_ids=np.array([1, 2], dtype=np.int64),
+        text_hashes=_embedding_text_hashes(stories),
+        embeddings=expected,
+    )
+
+    actual = _load_external_embeddings(path, stories)
+
+    assert np.array_equal(actual, expected)
+
+
+def test_external_embedding_snapshot_rejects_stale_text(tmp_path: Path) -> None:
+    from scripts.eval_ranker_variants import _load_external_embeddings
+
+    stories = [_eval_story(1)]
+    path = tmp_path / "embeddings.npz"
+    np.savez(
+        path,
+        story_ids=np.array([1], dtype=np.int64),
+        text_hashes=np.array(["0" * 64], dtype="<U64"),
+        embeddings=np.ones((1, 384), dtype=np.float32),
+    )
+
+    with pytest.raises(ValueError, match="text hashes"):
+        _load_external_embeddings(path, stories)
+
+
+def test_external_embedding_snapshot_freezes_candidate_membership(tmp_path: Path) -> None:
+    import json
+    from dataclasses import asdict
+
+    from scripts.eval_ranker_variants import (
+        _embedding_text_hashes,
+        _snapshot_candidate_stories,
+    )
+
+    stories = [_eval_story(2), _eval_story(1)]
+    path = tmp_path / "embeddings.npz"
+    np.savez(
+        path,
+        story_ids=np.array([2, 1], dtype=np.int64),
+        text_hashes=_embedding_text_hashes(stories),
+        embeddings=np.eye(2, 384, dtype=np.float32),
+        stories_json=np.array(json.dumps([asdict(story) for story in stories])),
+    )
+
+    loaded = _snapshot_candidate_stories(path)
+
+    assert [story.id for story in loaded] == [2, 1]
+
+
+def test_external_embedding_snapshot_freezes_feedback_labels_and_times(
+    tmp_path: Path,
+) -> None:
+    import json
+    from dataclasses import asdict
+
+    from scripts.eval_ranker_variants import _snapshot_feedback
+
+    stories = [_eval_story(2), _eval_story(1)]
+    path = tmp_path / "embeddings.npz"
+    np.savez(
+        path,
+        feedback_story_ids=np.array([2, 1], dtype=np.int64),
+        feedback_stories_json=np.array(json.dumps([asdict(story) for story in stories])),
+        feedback_labels=np.array([2, 0], dtype=np.int8),
+        feedback_vote_times=np.array([10.0, 20.0], dtype=np.float64),
+    )
+
+    loaded_stories, labels, vote_times = _snapshot_feedback(path)
+
+    assert [story.id for story in loaded_stories] == [2, 1]
+    assert labels.tolist() == [2, 0]
+    assert vote_times.tolist() == [10.0, 20.0]
+
+
+def test_candidate_cap_retains_feedback_story_ids() -> None:
+    from scripts.eval_ranker_variants import _candidate_indices_with_feedback
+
+    candidates = [_eval_story(sid) for sid in range(1, 11)]
+
+    indices = _candidate_indices_with_feedback(
+        candidates,
+        max_candidates=4,
+        required_story_ids={2, 8},
+    )
+
+    selected_ids = {candidates[index].id for index in indices}
+    assert len(indices) == 4
+    assert {2, 8} <= selected_ids
+
+
 def test_make_fold_removes_training_feedback_but_keeps_held_out() -> None:
     from scripts.eval_ranker_variants import _make_fold
 

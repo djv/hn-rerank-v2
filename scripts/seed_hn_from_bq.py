@@ -130,12 +130,7 @@ async def async_main() -> None:
             batch_size=config.embedding_batch_size,
             ort_variant=config.embedding_ort_variant,
         )
-        (
-            inserted,
-            skipped_feedback,
-            skipped_existing,
-            hydrated_comments,
-        ) = await seed_rows(
+        result = await seed_rows(
             rows,
             source="bq_seed",
             db=db,
@@ -143,11 +138,11 @@ async def async_main() -> None:
             concurrency=args.concurrency,
         )
         logging.info(
-            "seeded=%s skipped_feedback=%s skipped_existing=%s hydrated_comments=%s",
-            inserted,
-            skipped_feedback,
-            skipped_existing,
-            hydrated_comments,
+            "inserted=%s skipped_feedback=%s skipped_existing=%s hydrated_comments=%s",
+            result.inserted,
+            result.skipped_feedback,
+            result.skipped_existing,
+            result.hydrated_comments,
         )
     finally:
         db.close()

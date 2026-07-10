@@ -1,6 +1,7 @@
 import hashlib
 import json
 import sys
+import time
 from pathlib import Path
 
 import httpx
@@ -110,6 +111,7 @@ async def test_seed_skips_feedback_story_without_update(monkeypatch):
             source="ch_seed",
             db=db,
             embedder=DummyEmbedder(),
+            reconcile=True,
         )
 
         assert inserted == 0
@@ -282,6 +284,168 @@ async def test_comment_hydration_failure_preserves_ch_skeleton(monkeypatch):
         db.close()
 
 
+@pytest.mark.asyncio
+async def test_reconcile_preserves_recent_hn_and_promotes_aged_hn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = Database(":memory:")
+    now = int(time.time())
+    try:
+        recent = Story(
+            id=801,
+            title="Recent existing",
+            url="https://example.com/recent",
+            score=250,
+            time=now - 3600,
+            text_content="Recent existing Rich cached comments.",
+            source="hn",
+            top_comments="Rich cached comments.",
+        )
+        aged = Story(
+            id=802,
+            title="Aged existing",
+            url="https://example.com/aged",
+            score=250,
+            time=now - 31 * 86400,
+            text_content="Aged existing Rich cached comments.",
+            source="hn",
+            top_comments="Rich cached comments.",
+        )
+        bq_story = Story(
+            id=803,
+            title="BQ existing",
+            url="https://example.com/bq",
+            score=250,
+            time=now - 31 * 86400,
+            text_content="BQ existing",
+            source="bq_seed",
+        )
+        for story in (recent, aged, bq_story):
+            db.upsert_story(story)
+
+        def fail_bulk(*args: object, **kwargs: object) -> None:
+            raise AssertionError("stored comments should not be rehydrated")
+
+        monkeypatch.setattr(
+            "scripts._seed_common._ch_query_stories_with_comments", fail_bulk
+        )
+        result = await seed_rows(
+            [
+                {
+                    "id": 801,
+                    "title": "Recent refreshed",
+                    "url": "https://example.com/recent",
+                    "text": "Recent text",
+                    "score": 501,
+                    "descendants": 10,
+                    "created_at_i": now - 3600,
+                },
+                {
+                    "id": 802,
+                    "title": "Aged refreshed",
+                    "url": "https://example.com/aged",
+                    "text": "Aged text",
+                    "score": 502,
+                    "descendants": 11,
+                    "created_at_i": now - 31 * 86400,
+                },
+                {
+                    "id": 803,
+                    "title": "BQ must not change",
+                    "url": "https://example.com/bq",
+                    "text": "BQ text",
+                    "score": 503,
+                    "descendants": 12,
+                    "created_at_i": now - 31 * 86400,
+                },
+            ],
+            source="ch_seed",
+            db=db,
+            embedder=DummyEmbedder(),
+            reconcile=True,
+            now_ts=now,
+        )
+
+        assert result.inserted == 0
+        assert result.refreshed == 1
+        assert result.promoted == 1
+        assert result.skipped_existing == 1
+        recent_after = db.get_story(801)
+        assert recent_after is not None
+        assert recent_after.source == "hn"
+        promoted = db.get_story(802)
+        assert promoted is not None
+        assert promoted.source == "ch_seed"
+        assert "Rich cached comments" in promoted.top_comments
+        model_version = "all-MiniLM-L6-v2|mean|norm|256"
+        stored_hash = hashlib.sha256(
+            story_embedding_text(promoted).encode("utf-8")
+        ).hexdigest()
+        assert db.get_embedding(promoted.id, model_version, stored_hash) is not None
+        assert db.get_story(803) == bq_story
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_batches_only_rows_without_cached_comments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = Database(":memory:")
+    calls: list[list[int]] = []
+    now = int(time.time())
+    try:
+        def empty_bulk(
+            story_ids: list[int], max_levels: int = 5
+        ) -> dict[int, dict[str, object]]:
+            assert max_levels == 5
+            calls.append(story_ids)
+            return {}
+
+        monkeypatch.setattr(
+            "scripts._seed_common._ch_query_stories_with_comments", empty_bulk
+        )
+        result = await seed_rows(
+            [
+                {
+                    "id": 901,
+                    "title": "First",
+                    "score": 200,
+                    "descendants": 0,
+                    "created_at_i": 1,
+                },
+                {
+                    "id": 902,
+                    "title": "Second",
+                    "score": 200,
+                    "descendants": 0,
+                    "created_at_i": 1,
+                },
+                {
+                    "id": 903,
+                    "title": "Current live story",
+                    "score": 200,
+                    "descendants": 0,
+                    "created_at_i": now - 60,
+                },
+            ],
+            source="ch_seed",
+            db=db,
+            embedder=DummyEmbedder(),
+            reconcile=True,
+            hydration_batch_size=1,
+        )
+
+        assert result.inserted == 3
+        assert result.hydrated_comments == 0
+        assert calls == [[901], [902], [903]]
+        current = db.get_story(903)
+        assert current is not None
+        assert current.source == "hn"
+    finally:
+        db.close()
+
+
 def test_run_ch_query_uses_correct_endpoint(monkeypatch):
     captured = {}
 
@@ -302,12 +466,12 @@ def test_run_ch_query_uses_correct_endpoint(monkeypatch):
         return MockResponse(200, {"data": []})
 
     monkeypatch.setattr(httpx, "post", fake_post)
-    seed_hn_from_clickhouse.run_ch_query(limit=500, months=6, min_score=200)
+    seed_hn_from_clickhouse.run_ch_query(limit=500, months=12, min_score=200)
     assert (
         captured["url"] == "https://play.clickhouse.com/?user=play&default_format=JSON"
     )
     assert "LIMIT 500" in captured["query"]
-    assert "INTERVAL 6 MONTH" in captured["query"]
+    assert "INTERVAL 12 MONTH" in captured["query"]
     assert "AND score >= 200" in captured["query"]
 
 

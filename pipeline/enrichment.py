@@ -32,6 +32,10 @@ from .ranking import (
 RSS_USER_AGENT = "hn-rewrite/1.0 (+https://github.com/local/hn-rewrite)"
 REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dashboard"
 
+# Matches server.py's SELF_TEXT_PROMPT_CHAR_LIMIT: no point retaining RSS
+# content beyond what the TLDR prompt assembler will actually use.
+RSS_SELF_TEXT_CHAR_LIMIT = 8_000
+
 
 def _coerce_int(value, default: int = 0) -> int:
     if value is None:
@@ -82,8 +86,17 @@ def _empty_story(sid: int) -> Story:
 
 
 async def fetch_story(
-    client: httpx.AsyncClient, sid: int, db: Database
+    client: httpx.AsyncClient, sid: int, db: Database, *, force: bool = False
 ) -> Story | None:
+    """Fetch a single story from Algolia, refreshing the DB row.
+
+    ``force=True`` bypasses the cached-row short-circuits below and always
+    queries Algolia for the current comment tree — used by the tldr-detail
+    on-demand refresh for recent, high-velocity HN threads where prewarm's
+    CH data may already be 1-24h stale. ``force=False`` (default) keeps the
+    original cheap staleness check so routine callers (e.g. the empty-
+    top_comments lazy fetch) don't cause extra Algolia traffic.
+    """
     story = db.get_story(sid)
     if story is not None:
         if story.text_content == "":
@@ -91,13 +104,14 @@ async def fetch_story(
                 pass  # corrupted _empty_story, fall through to API re-fetch
             else:
                 return None
-        comments_stale = story.top_comments == "" or (story.comment_count or 0) > (
-            story.comment_count_at_fetch or 0
-        )
-        if not comments_stale:
-            return story
-        if story.top_comments != "" and (story.comment_count_at_fetch or 0) > 50:
-            return story
+        if not force:
+            comments_stale = story.top_comments == "" or (
+                story.comment_count or 0
+            ) > (story.comment_count_at_fetch or 0)
+            if not comments_stale:
+                return story
+            if story.top_comments != "" and (story.comment_count_at_fetch or 0) > 50:
+                return story
 
     url = f"https://hn.algolia.com/api/v1/items/{sid}"
     try:
@@ -628,7 +642,7 @@ async def _fetch_and_parse_feed(
                 summary = entry.summary
 
             clean_summary = clean_text(summary)
-            snippet = clean_summary[:1000]
+            snippet = clean_summary[:RSS_SELF_TEXT_CHAR_LIMIT]
             self_text = snippet
             text_content = compose_story_text(title, self_text)
 

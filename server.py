@@ -29,8 +29,8 @@ from flask import Flask, Response, jsonify, redirect, request
 from flask.typing import ResponseReturnValue
 import httpx
 
-from database import Database, Story, User
-from pipeline import Config, Embedder, RankedStory, is_hn_source
+from database import Database, RankPerfSample, Story, User
+from pipeline import Config, DEFAULT_ENV_PATH, Embedder, RankedStory, is_hn_source
 from llm_limiter import limiter as llm_limiter
 from reddit_limiter import limiter as reddit_limiter
 from http_fetch import fetch_with_urllib_fallback
@@ -42,7 +42,7 @@ SELF_TEXT_PROMPT_MIN_CHARS = 300
 REDDIT_COMMENTS_CACHE_CHAR_LIMIT = 10_000
 REDDIT_COMMENT_LIMIT = 40
 REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dashboard"
-TLDR_PROMPT_VERSION = "detail-v4"
+TLDR_PROMPT_VERSION = "detail-v5"
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
 _PROMPT_CACHE: dict[str, str] = {}
 
@@ -136,10 +136,11 @@ def _looks_like_plain_heading(line: str) -> bool:
 
 
 def load_env() -> None:
-    # Try local .env
+    # Prefer a local .env (per-worktree override); fall back to the shared
+    # location so every worktree finds secrets without copying anything.
     env_path = Path(".env")
     if not env_path.exists():
-        env_path = Path("~/hn_rerank/.env")
+        env_path = Path(DEFAULT_ENV_PATH)
     if env_path.exists():
         for line in env_path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
@@ -430,31 +431,44 @@ def _clean_lesswrong_html(raw_html: str | None) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+REDDIT_RSS_ON_DEMAND_MAX_ATTEMPTS = 2
+
+
 async def _fetch_reddit_rss_context(url: str | None) -> RedditRssContext | None:
     rss_url = _reddit_post_rss_url(url)
     if not rss_url:
         return None
 
-    if not await reddit_limiter.acquire():
-        return None
+    resp = None
+    for _attempt in range(REDDIT_RSS_ON_DEMAND_MAX_ATTEMPTS):
+        if not await reddit_limiter.acquire():
+            return None
 
-    try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
-            resp = await client.get(
-                rss_url, headers={"User-Agent": REDDIT_RSS_USER_AGENT}
-            )
-    except Exception:
-        return None
+        try:
+            async with httpx.AsyncClient(
+                follow_redirects=True, timeout=15.0
+            ) as client:
+                resp = await client.get(
+                    rss_url, headers={"User-Agent": REDDIT_RSS_USER_AGENT}
+                )
+        except Exception:
+            return None
 
-    if resp.status_code == 429:
-        retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
-        rl_reset_raw = resp.headers.get("x-ratelimit-reset")
-        rl_reset = float(rl_reset_raw) if rl_reset_raw else None
-        reddit_limiter.on_429(retry_after, rate_limit_reset=rl_reset)
+        if resp.status_code == 429:
+            retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+            rl_reset_raw = resp.headers.get("x-ratelimit-reset")
+            rl_reset = float(rl_reset_raw) if rl_reset_raw else None
+            reddit_limiter.on_429(retry_after, rate_limit_reset=rl_reset)
+            # A single 429 is often transient contention with the topfeed/
+            # prewarm queue on the same shared-IP limiter; the next
+            # acquire() call honors the backoff before we retry once more.
+            continue
+        if resp.status_code != 200:
+            return None
+        reddit_limiter.on_success()
+        break
+    else:
         return None
-    if resp.status_code != 200:
-        return None
-    reddit_limiter.on_success()
 
     parsed = feedparser.parse(resp.text)
     entries = list(parsed.entries)
@@ -561,12 +575,14 @@ async def _call_llm_chat(
     model: str,
     prompt: str,
     max_tokens: int,
+    extra: dict[str, object] | None = None,
 ) -> LlmChatResult:
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3,
         "max_tokens": max_tokens,
+        **(extra or {}),
     }
     try:
         async with httpx.AsyncClient(timeout=45.0) as client:
@@ -611,12 +627,61 @@ async def _call_llm_chat(
         return LlmChatResult(content=str(e), ok=False)
 
 
-def _llm_cache_identity() -> str:
+@dataclass(frozen=True)
+class LlmProviderConfig:
+    provider: str
+    api_key: str | None
+    base_url: str
+    model: str
+    extra: dict[str, object]
+
+
+def _llm_provider_config() -> LlmProviderConfig:
+    # mistral is the default: its free tier (~60 req/min) comfortably absorbs
+    # the prewarm burst (up to 4 concurrent calls); cerebras's free tier for
+    # gpt-oss-120b is capped at 5 req/min and gets buried under 429s during
+    # regen prewarm (see WORKLOG 2026-07-10). Cerebras stays available as an
+    # opt-in provider.
     provider = os.environ.get("LLM_PROVIDER", "mistral").lower()
-    model = (
-        "mistral-small-latest" if provider == "mistral" else "llama-3.3-70b-versatile"
+    if provider == "cerebras":
+        # gpt-oss-120b is a reasoning model — it burns max_tokens on hidden
+        # reasoning and returns no content if not given reasoning_effort +
+        # enough headroom (see _cerebras_max_tokens below).
+        return LlmProviderConfig(
+            provider=provider,
+            api_key=os.environ.get("CEREBRAS_API_KEY"),
+            base_url="https://api.cerebras.ai/v1/chat/completions",
+            model="gpt-oss-120b",
+            extra={"reasoning_effort": "low"},
+        )
+    if provider == "groq":
+        return LlmProviderConfig(
+            provider=provider,
+            api_key=os.environ.get("GROQ_API_KEY"),
+            base_url="https://api.groq.com/openai/v1/chat/completions",
+            model="llama-3.3-70b-versatile",
+            extra={},
+        )
+    return LlmProviderConfig(
+        provider="mistral",
+        api_key=os.environ.get("MISTRAL_API_KEY"),
+        base_url="https://api.mistral.ai/v1/chat/completions",
+        model="mistral-small-latest",
+        extra={},
     )
-    return f"{provider}:{model}:{TLDR_PROMPT_VERSION}"
+
+
+def _cerebras_max_tokens(base: int, extra: dict[str, object]) -> int:
+    # gpt-oss-120b spends some of max_tokens on hidden reasoning before the
+    # visible answer; without headroom it can return an empty completion
+    # with finish_reason="length". A flat buffer is enough at
+    # reasoning_effort="low" (see WORKLOG 2026-07-10 benchmark).
+    return base + 600 if "reasoning_effort" in extra else base
+
+
+def _llm_cache_identity() -> str:
+    cfg = _llm_provider_config()
+    return f"{cfg.provider}:{cfg.model}:{TLDR_PROMPT_VERSION}"
 
 
 def _tldr_cache_key(
@@ -637,21 +702,39 @@ def _tldr_cache_key(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _discussion_budget(comment_chars: int) -> str:
+    """Bullet/word budget for the discussion-only summary, scaled by comment
+    volume so a large thread doesn't collapse into the same terse output as a
+    thin one. comment_chars is the length of the already char-capped
+    comments_section (see COMMENT_PROMPT_CHAR_LIMIT)."""
+    if comment_chars < 1_500:
+        return "3-5 bullets, max 150 words"
+    if comment_chars < 5_000:
+        return "6-8 bullets, max 250 words"
+    return "9-12 bullets, max 400 words"
+
+
+def _article_budget(self_text_chars: int) -> str:
+    """Bullet/word budget for article-derived summaries, scaled by source
+    material volume so a full RSS/article body doesn't collapse into the
+    same terse output as a thin teaser. self_text_chars is the length of
+    the already char-capped article_section (see SELF_TEXT_PROMPT_CHAR_LIMIT
+    / ARTICLE_BODY_CHAR_LIMIT). Mirrors _discussion_budget's tiers."""
+    if self_text_chars < 1_500:
+        return "3-5 bullets, max 150 words"
+    if self_text_chars < 5_000:
+        return "6-8 bullets, max 250 words"
+    return "9-12 bullets, max 400 words"
+
+
 async def generate_detailed_tldr(
     title: str,
     self_text: str = "",
     top_comments: str = "",
     article_body: str = "",
 ) -> TldrResult:
-    provider = os.environ.get("LLM_PROVIDER", "mistral").lower()
-    if provider == "mistral":
-        api_key = os.environ.get("MISTRAL_API_KEY")
-        base_url = "https://api.mistral.ai/v1/chat/completions"
-        model = "mistral-small-latest"
-    else:
-        api_key = os.environ.get("GROQ_API_KEY")
-        base_url = "https://api.groq.com/openai/v1/chat/completions"
-        model = "llama-3.3-70b-versatile"
+    cfg = _llm_provider_config()
+    api_key, base_url, model, extra = cfg.api_key, cfg.base_url, cfg.model, cfg.extra
 
     if not api_key:
         return TldrResult(
@@ -673,24 +756,30 @@ async def generate_detailed_tldr(
 
     if article_section and comments_section:
         article_prompt = _load_prompt("article_v4.txt").format(
-            title=title, article_section=article_section
+            title=title,
+            article_section=article_section,
+            budget=_article_budget(len(article_section)),
         )
         discussion_prompt = _load_prompt("discussion_v4.txt").format(
-            title=title, comments_section=comments_section
+            title=title,
+            comments_section=comments_section,
+            budget=_discussion_budget(len(comments_section)),
         )
         article_task = _call_llm_chat(
             api_key=api_key,
             base_url=base_url,
             model=model,
             prompt=article_prompt,
-            max_tokens=900,
+            max_tokens=_cerebras_max_tokens(900, extra),
+            extra=extra,
         )
         discussion_task = _call_llm_chat(
             api_key=api_key,
             base_url=base_url,
             model=model,
             prompt=discussion_prompt,
-            max_tokens=900,
+            max_tokens=_cerebras_max_tokens(900, extra),
+            extra=extra,
         )
         article_result, discussion_result = await asyncio.gather(
             article_task,
@@ -735,11 +824,15 @@ async def generate_detailed_tldr(
 
     if article_section and not comments_section:
         prompt = _load_prompt("article_only_v4.txt").format(
-            title=title, article_section=article_section
+            title=title,
+            article_section=article_section,
+            budget=_article_budget(len(article_section)),
         )
     else:
         prompt = _load_prompt("discussion_only_v4.txt").format(
-            title=title, comments_section=comments_section
+            title=title,
+            comments_section=comments_section,
+            budget=_discussion_budget(len(comments_section)),
         )
 
     result = await _call_llm_chat(
@@ -747,7 +840,8 @@ async def generate_detailed_tldr(
         base_url=base_url,
         model=model,
         prompt=prompt,
-        max_tokens=2000,
+        max_tokens=_cerebras_max_tokens(2000, extra),
+        extra=extra,
     )
     if result.ok:
         tldr_text = _normalize_tldr_markdown(result.content)
@@ -932,7 +1026,7 @@ class Handler:
         if n_feedback > 0:
             from pipeline import build_cold_deck
 
-            cold_stories = build_cold_deck(cls.db, user_id=user.id)
+            cold_stories = build_cold_deck(cls.db, cls.config, user_id=user.id)
         else:
             cold_stories = cls._cold_stories
         if cold_stories:
@@ -1146,6 +1240,24 @@ class Handler:
             )
             logging.info("rank_perf %s", trace.format_log_fields())
 
+            fields = trace.to_log_fields()
+            sample = RankPerfSample(
+                recorded_at=time.time(),
+                user_id=user.id,
+                version=requested_version,
+                rank_total_ms=rank_ms,
+                html_ms=html_ms,
+                candidates=int(trace.counts.get("candidates", 0)),
+                feedback_total=int(trace.counts.get("feedback_total", 0)),
+                model_cache=trace.labels.get("model_cache", ""),
+                stories=len(final),
+                fields=fields,
+            )
+            try:
+                cls.db.insert_rank_perf(sample)
+            except Exception:
+                logging.exception("rank_perf persist failed")
+
             per_combo = cls.config.tldr_prefetch_per_combo
             stale_per_run = cls.config.tldr_prefetch_stale_per_run
             if cls.config.article_fetch_max_per_run > 0 or (
@@ -1212,7 +1324,7 @@ class Handler:
     def _rebuild_cold_deck(cls) -> None:
         from pipeline import build_cold_deck
 
-        cold_stories = build_cold_deck(cls.db)
+        cold_stories = build_cold_deck(cls.db, cls.config)
         cls._cold_stories = cold_stories
         logging.info("cold_deck_rebuilt stories=%s", len(cold_stories))
 
@@ -1266,6 +1378,25 @@ class Handler:
         stale_per_run = config.tldr_prefetch_stale_per_run
         if (per_combo > 0 or stale_per_run > 0) and final:
             asyncio.run(_prefetch_tldrs_for_ranked(final, db, per_combo, stale_per_run))
+
+
+_CARDS_START = b"<!--cards:start-->"
+_CARDS_END = b"<!--cards:end-->"
+
+
+def _extract_cards_fragment(html: bytes) -> bytes:
+    """Slice the rendered card markup out of a full dashboard render.
+
+    Byte-level find/slice (no HTML parsing) so the fragment is guaranteed
+    to be exactly the markup between the sentinel comments in index.html.
+    Returns an empty fragment for skeleton/cold-deck-less renders, which
+    carry no sentinels and no cards either way.
+    """
+    start = html.find(_CARDS_START)
+    end = html.find(_CARDS_END)
+    if start == -1 or end == -1:
+        return b""
+    return html[start + len(_CARDS_START) : end]
 
 
 def _no_cache_dashboard_response(
@@ -1513,6 +1644,31 @@ def _handle_flask_feedback(runtime: type[Handler]) -> Response:
         )
 
 
+def _hn_thread_looks_active(story: Story, config: Config, now: float) -> bool:
+    """Whether an HN story's comment thread is recent and busy enough to
+    warrant a forced real-time Algolia refresh in tldr-detail.
+
+    Prewarm's comment data comes from ClickHouse, which lags 1-24h behind
+    live HN for brand-new comments. Refreshing every view would be wasteful,
+    so this gates on: post age within a recent window, an absolute comment
+    floor (skip small threads), and comment velocity (comments/hour) above a
+    threshold — a proxy for "this thread is still actively accruing
+    comments right now," since the endpoint has no direct fetch-timestamp
+    signal to compare against.
+    """
+    if not is_hn_source(story.source):
+        return False
+    if story.time <= 0:
+        return False
+    age_hours = (now - story.time) / 3600.0
+    if age_hours <= 0 or age_hours > config.tldr_refresh_recent_hours:
+        return False
+    comment_count = story.comment_count or 0
+    if comment_count < config.tldr_refresh_min_comments:
+        return False
+    return (comment_count / age_hours) >= config.tldr_refresh_min_comments_per_hour
+
+
 def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
     try:
         user = _flask_user(runtime)
@@ -1553,6 +1709,13 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
                 {"ok": True, "tldr": stale_tldr, "cached": True, "stale": True}
             )
 
+        # Recent, high-velocity HN threads bypass the cache hit below and the
+        # dedicated "already cached" fast path, since CH prewarm data can be
+        # 1-24h stale for brand-new comments — see _hn_thread_looks_active.
+        needs_active_refresh = bool(story.top_comments) and _hn_thread_looks_active(
+            story, runtime.config, time.time()
+        )
+
         article_body = story.article_body or None
         cache_key = _tldr_cache_key(
             title=story.title,
@@ -1561,7 +1724,7 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             article_body=article_body or "",
         )
         cached_tldr = runtime.db.get_tldr_cache(story.id, cache_key)
-        if cached_tldr:
+        if cached_tldr and not needs_active_refresh:
             logging.info(
                 "tldr_detail story_id=%s result=cache_hit cache_key=%s",
                 story.id,
@@ -1581,18 +1744,24 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
                 quota.retry_after_seconds,
             )
 
-        # If an HN story has comments but no cached comment text, fetch them lazily.
-        if (
+        # If an HN story has comments but no cached comment text, fetch them
+        # lazily.
+        needs_empty_fetch = (
             is_hn_source(story.source)
             and not story.top_comments
             and (story.comment_count or 0) > 0
-        ):
+        )
+        if needs_empty_fetch or needs_active_refresh:
             try:
                 from pipeline import fetch_story
 
+                force = needs_active_refresh
+
                 async def do_fetch() -> Story | None:
                     async with httpx.AsyncClient(timeout=15.0) as client:
-                        return await fetch_story(client, story_id, runtime.db)
+                        return await fetch_story(
+                            client, story_id, runtime.db, force=force
+                        )
 
                 updated = asyncio.run(do_fetch())
                 if updated:
@@ -1735,6 +1904,10 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
                     "ok": True,
                     "tldr": "No article body or discussion available to summarize for this story.",
                     "cached": False,
+                    # Not persisted to tldr_cache: a later retry (e.g. after
+                    # a transient upstream 429 clears) may find real content,
+                    # so the client must not treat this as a final answer.
+                    "retryable": True,
                 }
             )
         if result.kind == "llm_error":
@@ -1882,6 +2055,23 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
     def ranking_ready() -> ResponseReturnValue:
         return _handle_flask_ranking_ready(runtime)
 
+    @app.get("/api/deck-cards")
+    def deck_cards() -> ResponseReturnValue:
+        user = _flask_user(runtime)
+        if not user:
+            return _flask_json_response(
+                {"error": "No session"}, status=HTTPStatus.UNAUTHORIZED
+            )
+        html = runtime._render_dashboard_for_user(user)
+        fragment = _extract_cards_fragment(html)
+        response = Response(
+            fragment, status=HTTPStatus.OK, content_type="text/html; charset=utf-8"
+        )
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
+
     @app.get("/")
     @app.get("/index.html")
     def dashboard() -> ResponseReturnValue:
@@ -1932,6 +2122,9 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
 
 def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
     logging.info("Starting background regeneration loop...")
+    from pipeline.hn_dupes import HnDupeResolutionWorker
+
+    hn_dupe_worker = HnDupeResolutionWorker(db)
     embedder = Handler.embedder
     if config.regen_initial_delay_seconds > 0:
         logging.info(
@@ -1952,7 +2145,14 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
         try:
             from pipeline import fetch_candidates_only
 
-            asyncio.run(fetch_candidates_only(config, db, embedder=embedder))
+            asyncio.run(
+                fetch_candidates_only(
+                    config,
+                    db,
+                    embedder=embedder,
+                    on_hn_candidates=hn_dupe_worker.submit,
+                )
+            )
             Handler._rebuild_cold_deck()
             Handler._bump_all_cached_versions()
 

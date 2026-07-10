@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import time
@@ -13,6 +14,7 @@ from numpy.typing import NDArray
 
 
 Action: TypeAlias = Literal["up", "neutral", "down"]
+HnDupeStatus: TypeAlias = Literal["canonical", "no_match", "retry"]
 
 
 @dataclass(frozen=True)
@@ -33,6 +35,15 @@ class Story:
 
 
 @dataclass(frozen=True)
+class SeedStoryState:
+    """Small story projection used to classify archive reconciliation rows."""
+
+    id: int
+    source: str
+    has_top_comments: bool
+
+
+@dataclass(frozen=True)
 class FeedbackRecord:
     story_id: int
     action: Action
@@ -48,6 +59,35 @@ class User:
     id: int
     token: str
     created_at: float
+
+
+@dataclass(frozen=True)
+class RankPerfSample:
+    """One warm rerank's perf trace, ready to persist. `fields` is the full
+    RankTrace.to_log_fields() dict (dynamic stage set) stored as JSON; the
+    other columns are the always-queryable dimensions pulled out of it."""
+
+    recorded_at: float
+    user_id: int
+    version: int
+    rank_total_ms: float
+    html_ms: float
+    candidates: int
+    feedback_total: int
+    model_cache: str
+    stories: int
+    fields: dict[str, int | float | str]
+
+
+@dataclass(frozen=True)
+class HnDupeResolution:
+    source_story_id: int
+    canonical_story_id: int | None
+    status: HnDupeStatus
+    checked_at: float
+    next_check_at: float
+    failure_count: int
+    last_error: str
 
 
 class Database:
@@ -171,6 +211,44 @@ class Database:
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_article_fetch_failures_url "
                     "ON article_fetch_failures(url)"
+                )
+
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS rank_perf (
+                        id              INTEGER PRIMARY KEY,
+                        recorded_at     REAL NOT NULL,
+                        user_id         INTEGER NOT NULL,
+                        version         INTEGER NOT NULL,
+                        rank_total_ms   REAL NOT NULL,
+                        html_ms         REAL NOT NULL,
+                        candidates      INTEGER NOT NULL,
+                        feedback_total  INTEGER NOT NULL,
+                        model_cache     TEXT NOT NULL,
+                        stories         INTEGER NOT NULL,
+                        fields_json     TEXT NOT NULL
+                    )
+                """)
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_rank_perf_recorded_at "
+                    "ON rank_perf(recorded_at)"
+                )
+
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS hn_dupe_resolutions (
+                        source_story_id INTEGER PRIMARY KEY,
+                        canonical_story_id INTEGER,
+                        status TEXT NOT NULL CHECK(status IN ('canonical', 'no_match', 'retry')),
+                        checked_at REAL NOT NULL,
+                        next_check_at REAL NOT NULL,
+                        failure_count INTEGER NOT NULL DEFAULT 0,
+                        last_error TEXT NOT NULL DEFAULT '',
+                        FOREIGN KEY (source_story_id) REFERENCES stories(id) ON DELETE CASCADE,
+                        FOREIGN KEY (canonical_story_id) REFERENCES stories(id) ON DELETE SET NULL
+                    )
+                """)
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_hn_dupe_resolutions_due "
+                    "ON hn_dupe_resolutions(next_check_at)"
                 )
 
                 # Run migration of article_cache to stories table if article_cache exists
@@ -440,6 +518,85 @@ class Database:
         with self.conn() as conn:
             cursor = conn.execute(query, ids)
             return [self._row_to_story(row) for row in cursor.fetchall()]
+
+    def get_seed_story_states(self, ids: list[int]) -> dict[int, SeedStoryState]:
+        """Return only the fields archive reconciliation needs for ``ids``."""
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        with self.conn() as conn:
+            rows = conn.execute(
+                f"SELECT id, source, top_comments != '' FROM stories "
+                f"WHERE id IN ({placeholders})",
+                ids,
+            ).fetchall()
+        return {
+            int(row[0]): SeedStoryState(
+                id=int(row[0]), source=str(row[1]), has_top_comments=bool(row[2])
+            )
+            for row in rows
+        }
+
+    # HN explicit duplicate canonicalization cache
+    @staticmethod
+    def _row_to_hn_dupe_resolution(row: tuple) -> HnDupeResolution:
+        return HnDupeResolution(
+            source_story_id=int(row[0]), canonical_story_id=row[1], status=row[2],
+            checked_at=float(row[3]), next_check_at=float(row[4]),
+            failure_count=int(row[5]), last_error=str(row[6] or ""),
+        )
+
+    def get_hn_dupe_resolutions(
+        self, source_story_ids: list[int], *, now: float | None = None
+    ) -> dict[int, HnDupeResolution]:
+        if not source_story_ids:
+            return {}
+        now = time.time() if now is None else now
+        placeholders = ",".join("?" for _ in source_story_ids)
+        with self.conn() as conn:
+            rows = conn.execute(
+                f"SELECT source_story_id, canonical_story_id, status, checked_at, "
+                f"next_check_at, failure_count, last_error FROM hn_dupe_resolutions "
+                f"WHERE source_story_id IN ({placeholders}) AND next_check_at > ?",
+                [*source_story_ids, now],
+            ).fetchall()
+        return {row[0]: self._row_to_hn_dupe_resolution(row) for row in rows}
+
+    def get_due_hn_dupe_candidate_ids(
+        self, candidate_ids: list[int], *, limit: int = 250, now: float | None = None
+    ) -> list[int]:
+        """Select current low-comment HN candidates fairly: unseen, then oldest due."""
+        if not candidate_ids or limit <= 0:
+            return []
+        now = time.time() if now is None else now
+        placeholders = ",".join("?" for _ in candidate_ids)
+        with self.conn() as conn:
+            rows = conn.execute(
+                f"SELECT s.id FROM stories s LEFT JOIN hn_dupe_resolutions r "
+                f"ON r.source_story_id = s.id WHERE s.id IN ({placeholders}) "
+                "AND s.source = 'hn' AND COALESCE(s.comment_count, s.comment_count_at_fetch, 0) <= 8 "
+                "AND (r.source_story_id IS NULL OR r.next_check_at <= ?) "
+                "ORDER BY CASE WHEN r.source_story_id IS NULL THEN 0 ELSE 1 END, "
+                "COALESCE(r.next_check_at, 0), s.id LIMIT ?",
+                [*candidate_ids, now, limit],
+            ).fetchall()
+        return [int(row[0]) for row in rows]
+
+    def upsert_hn_dupe_resolution(
+        self, resolution: HnDupeResolution
+    ) -> None:
+        with self.conn() as conn:
+            with conn:
+                conn.execute(
+                    "INSERT INTO hn_dupe_resolutions (source_story_id, canonical_story_id, status, "
+                    "checked_at, next_check_at, failure_count, last_error) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(source_story_id) DO UPDATE SET canonical_story_id=excluded.canonical_story_id, "
+                    "status=excluded.status, checked_at=excluded.checked_at, next_check_at=excluded.next_check_at, "
+                    "failure_count=excluded.failure_count, last_error=excluded.last_error",
+                    (resolution.source_story_id, resolution.canonical_story_id, resolution.status,
+                     resolution.checked_at, resolution.next_check_at, resolution.failure_count,
+                     resolution.last_error[:500]),
+                )
 
     def prune_stories(self, max_age_days: int = 60) -> int:
         cutoff = time.time() - (max_age_days * 86400)
@@ -745,6 +902,32 @@ class Database:
             with conn:
                 cursor = conn.execute(sql, params)
                 return cursor.fetchall()
+
+    # Rank perf telemetry
+    def insert_rank_perf(self, sample: RankPerfSample) -> None:
+        with self.conn() as conn:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO rank_perf (
+                        recorded_at, user_id, version, rank_total_ms, html_ms,
+                        candidates, feedback_total, model_cache, stories, fields_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        sample.recorded_at,
+                        sample.user_id,
+                        sample.version,
+                        sample.rank_total_ms,
+                        sample.html_ms,
+                        sample.candidates,
+                        sample.feedback_total,
+                        sample.model_cache,
+                        sample.stories,
+                        json.dumps(sample.fields),
+                    ),
+                )
 
     # Article fetch failure memory
     def get_article_fetch_failure(self, story_id: int) -> dict | None:

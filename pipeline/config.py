@@ -26,6 +26,11 @@ class ModelConfig:
     dedup_exclude_actions: tuple[str, ...] = ("up", "neutral")
 
 
+# Shared across all worktrees of this repo (sibling to the `main` checkout)
+# so the 87MB model and secrets never need copying/symlinking per worktree.
+DEFAULT_ONNX_MODEL_DIR = "~/hn-rewrite/shared/onnx_model"
+DEFAULT_ENV_PATH = "~/hn-rewrite/shared/.env"
+
 BQ_ARCHIVE_SOURCE = "bq_seed"
 CH_ARCHIVE_SOURCE = "ch_seed"
 
@@ -51,7 +56,7 @@ class Config:
     db_path: str = "hn_rewrite.db"
     days: int = 30
     count: int = 40
-    onnx_model_dir: str = "onnx_model"
+    onnx_model_dir: str = DEFAULT_ONNX_MODEL_DIR
     embedding_batch_size: int = 32
     embedding_ort_variant: Literal[
         "current",
@@ -97,6 +102,13 @@ class Config:
     # current story content (e.g. article_body was enriched after the TLDR
     # was generated). 0 disables. See server.py::_prefetch_tldrs_for_ranked.
     tldr_prefetch_stale_per_run: int = 3
+    # On-demand HN comment refresh (tldr-detail): forces a real-time Algolia
+    # re-fetch for recent, high-velocity threads even when top_comments is
+    # already populated from prewarm, since CH prewarm has 1-24h latency on
+    # brand-new comments. Any knob set to 0 disables the corresponding gate.
+    tldr_refresh_recent_hours: float = 72.0
+    tldr_refresh_min_comments: int = 30
+    tldr_refresh_min_comments_per_hour: float = 8.0
     # Public demo abuse limits. Cached TLDR hits bypass the uncached TLDR
     # quota; these limits protect only new enrichment/LLM work and vote writes.
     tldr_uncached_per_user_limit: int = 12

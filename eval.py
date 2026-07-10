@@ -551,7 +551,7 @@ def main() -> None:
         raise RuntimeError("Missing default user token")
 
     try:
-        embedder: Embedder | None = Embedder("onnx_model")
+        embedder: Embedder | None = Embedder()
     except Exception as exc:
         print(f"Warning: Embedder not available ({exc}); skipping final_queue metrics.")
         embedder = None

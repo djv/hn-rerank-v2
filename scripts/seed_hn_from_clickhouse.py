@@ -39,8 +39,8 @@ ORDER BY score DESC, time DESC
 
 
 def build_ch_query(
-    months: int = 3,
-    min_score: int = 100,
+    months: int = 12,
+    min_score: int = 200,
     limit: int | None = None,
 ) -> str:
     if months <= 0:
@@ -55,8 +55,8 @@ def build_ch_query(
 
 def run_ch_query(
     limit: int | None = None,
-    months: int = 3,
-    min_score: int = 100,
+    months: int = 12,
+    min_score: int = 200,
 ) -> list[dict[str, Any]]:
     query = build_ch_query(months=months, min_score=min_score, limit=limit)
     resp = httpx.post(
@@ -81,9 +81,20 @@ async def async_main() -> None:
     )
     parser.add_argument("--config", default="config.toml")
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--months", type=int, default=6)
+    parser.add_argument("--months", type=int, default=12)
     parser.add_argument("--min-score", type=int, default=200)
     parser.add_argument("--concurrency", type=int, default=10)
+    parser.add_argument(
+        "--reconcile",
+        action="store_true",
+        help="Refresh safe existing HN/archive rows and promote aged HN stories.",
+    )
+    parser.add_argument(
+        "--hydration-batch-size",
+        type=int,
+        default=200,
+        help="Maximum story IDs in each bulk ClickHouse comment request.",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -124,24 +135,25 @@ async def async_main() -> None:
             batch_size=config.embedding_batch_size,
             ort_variant=config.embedding_ort_variant,
         )
-        (
-            inserted,
-            skipped_feedback,
-            skipped_existing,
-            hydrated_comments,
-        ) = await seed_rows(
+        result = await seed_rows(
             rows,
             source=CH_ARCHIVE_SOURCE,
             db=db,
             embedder=embedder,
             concurrency=args.concurrency,
+            reconcile=args.reconcile,
+            live_window_days=config.days,
+            hydration_batch_size=args.hydration_batch_size,
         )
         logging.info(
-            "seeded=%s skipped_feedback=%s skipped_existing=%s hydrated_comments=%s",
-            inserted,
-            skipped_feedback,
-            skipped_existing,
-            hydrated_comments,
+            "inserted=%s refreshed=%s promoted=%s skipped_feedback=%s "
+            "skipped_existing=%s hydrated_comments=%s",
+            result.inserted,
+            result.refreshed,
+            result.promoted,
+            result.skipped_feedback,
+            result.skipped_existing,
+            result.hydrated_comments,
         )
     finally:
         db.close()

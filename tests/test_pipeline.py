@@ -3,10 +3,12 @@ import asyncio
 import numpy as np
 import pytest
 import time
+from collections.abc import Callable
+from numpy.typing import NDArray
 from pathlib import Path
 from types import SimpleNamespace
 from hypothesis import given, strategies as st, settings, HealthCheck
-from database import Database, Story
+from database import Database, HnDupeResolution, Story
 from dataclasses import replace
 import pipeline
 import pipeline.ranking as ranking
@@ -43,6 +45,7 @@ from pipeline import (
     fast_rerank_for_user,
     HOT_MIN_SCORE,
 )
+from pipeline.hn_dupes import HnDupeResolver
 
 
 @pytest.fixture
@@ -222,7 +225,7 @@ def _cold_story(
 
 
 def test_build_cold_deck_empty_db(db: Database) -> None:
-    assert pipeline.build_cold_deck(db) == []
+    assert pipeline.build_cold_deck(db, Config()) == []
 
 
 def test_build_cold_deck_score_order_and_summarizable_filter(
@@ -242,7 +245,7 @@ def test_build_cold_deck_score_order_and_summarizable_filter(
     for story in (unsummarizable, low, high):
         db.upsert_story(story)
 
-    cold = pipeline.build_cold_deck(db)
+    cold = pipeline.build_cold_deck(db, Config())
 
     assert [item.story.id for item in cold] == [3, 2]
     gravity_div = 3.0**1.8
@@ -275,41 +278,47 @@ def test_build_cold_deck_combo_keys_and_flags(
     for story in (recent_hn, archive_hn, recent_non_hn):
         db.upsert_story(story)
 
-    cold = pipeline.build_cold_deck(db)
+    cold = pipeline.build_cold_deck(db, Config())
     by_id = {item.story.id: item for item in cold}
 
+    # Dashboard is hardcoded to HN sources only for now — non-HN story 3
+    # is filtered out at the SQL level.
+    assert 3 not in by_id
     assert by_id[1].combo_keys == "recent_hn recent_mixed"
     assert by_id[1].is_recent is True
     assert by_id[1].is_non_hn is False
     assert by_id[2].combo_keys == "archive_hn archive_mixed"
     assert by_id[2].is_recent is False
     assert by_id[2].is_non_hn is False
-    assert by_id[3].combo_keys == "recent_non-hn recent_mixed"
-    assert by_id[3].is_recent is True
-    assert by_id[3].is_non_hn is True
 
 
-def test_build_cold_deck_uses_badge_defaults(db: Database) -> None:
+def test_build_cold_deck_computes_popular_badges_but_not_explore(
+    db: Database,
+) -> None:
+    """Popular (Hot/Top/Talk) is non-personalized and computed on the cold
+    deck; Explore (Unsure/Novel/Similar) is personalized and always absent
+    (no feedback to compute it against) — see build_cold_deck docstring."""
     db.upsert_story(_cold_story(1, score=100, time_ts=int(time.time()) - 3600))
 
-    item = pipeline.build_cold_deck(db)[0]
+    item = pipeline.build_cold_deck(db, Config())[0]
 
     assert item.best_match_title == ""
     assert item.prob_down is None
     assert item.prob_neutral is None
     assert item.prob_up is None
+    # Explore badges require feedback to personalize against; always absent.
     assert item.is_uncertain is False
     assert item.is_novel is False
-    assert item.is_discussion_rich is False
-    assert item.is_high_engagement is False
-    assert item.is_hot is False
     assert item.is_similar is False
+    # Popular badges are non-personalized; the sole HN candidate is both
+    # highest-scoring and highest-velocity, so it earns Hot.
+    assert item.is_hot is True
 
 
 @pytest.fixture(scope="module")
 def embedder():
-    # Uses the real downloaded ONNX model
-    return Embedder("onnx_model")
+    # Uses the real downloaded ONNX model (shared across worktrees)
+    return Embedder()
 
 
 def test_embedder_uses_configured_batch_and_ort_variant(monkeypatch):
@@ -832,6 +841,59 @@ async def test_rss_feed_no_comments_url(monkeypatch):
     assert len(stories) == 1
     assert stories[0].url == "https://example.com/blog"
     assert stories[0].discussion_url is None
+
+
+@pytest.mark.asyncio
+async def test_rss_feed_retains_full_content_body(monkeypatch):
+    """Feeds that ship a full article body via <content:encoded> must have
+    that body retained in self_text up to RSS_SELF_TEXT_CHAR_LIMIT (8000),
+    not truncated to the old 1000-char teaser cap. Full retention lets the
+    TLDR prompt scale with real content instead of a clipped snippet.
+    """
+    from pipeline import _fetch_and_parse_feed
+    from pipeline.enrichment import RSS_SELF_TEXT_CHAR_LIMIT
+
+    long_body = "word " * 900  # ~4500 chars, well past the old 1000 cap
+
+    class MockResp:
+        status_code = 200
+        text = f"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+<channel><title>Test</title>
+<item>
+  <title>Long Post</title>
+  <link>https://example.com/long-post</link>
+  <pubDate>Tue, 23 Jun 2026 12:00:00 GMT</pubDate>
+  <content:encoded><![CDATA[{long_body}]]></content:encoded>
+</item>
+</channel></rss>"""
+        headers: dict[str, str] = {}
+
+    class MockClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, url, headers=None):
+            return MockResp()
+
+    monkeypatch.setattr("pipeline.enrichment.httpx.AsyncClient", MockClient)
+
+    stories = await _fetch_and_parse_feed(
+        "https://example.com/feed.xml",
+        per_feed=10,
+        cutoff=0,
+        now=1_000_000,
+        exclude_urls=set(),
+    )
+    assert len(stories) == 1
+    assert len(stories[0].self_text) > 1000
+    assert len(stories[0].self_text) <= RSS_SELF_TEXT_CHAR_LIMIT
 
 
 def test_is_summarizable_with_content():
@@ -2001,6 +2063,314 @@ def test_fast_rerank_for_user_filters_unsummarizable_stories(db, monkeypatch):
     assert unsummarizable_id not in result_ids
 
 
+def test_canonicalize_hn_dupes_replaces_selected_story_preserving_metadata(
+    db: Database,
+) -> None:
+    duplicate = Story(
+        id=100,
+        title="Claude Fable extended to July 12",
+        url="https://example.com/dupe",
+        score=10,
+        time=1000,
+        text_content="dupe text",
+        source="hn",
+        comment_count=3,
+    )
+    canonical = Story(
+        id=200,
+        title="We're extending access to Fable 5 on all paid plans through July 12",
+        url="https://example.com/canonical",
+        score=50,
+        time=900,
+        text_content="canonical text",
+        source="hn",
+        comment_count=5,
+        top_comments="canonical comments",
+    )
+    ranked = [
+        RankedStory(
+            story=duplicate,
+            score=0.77,
+            best_match_title="match",
+            is_hot=True,
+            combo_keys="recent_hn recent_mixed",
+        )
+    ]
+    db.upsert_story(duplicate)
+    db.upsert_story(canonical)
+    now = time.time()
+    db.upsert_hn_dupe_resolution(
+        HnDupeResolution(100, 200, "canonical", now, now + 86400, 0, "")
+    )
+
+    result = pipeline.canonicalize_hn_dupes(
+        ranked,
+        db,
+        candidate_stories=[duplicate, canonical],
+    )
+
+    assert len(result) == 1
+    assert result[0].story == canonical
+    assert result[0].score == 0.77
+    assert result[0].best_match_title == "match"
+    assert result[0].is_hot
+    assert result[0].combo_keys == "recent_hn recent_mixed"
+
+
+def test_canonicalize_hn_dupes_drops_when_target_already_in_output(
+    db: Database,
+) -> None:
+    canonical = _candidate_story(
+        200,
+        source="hn",
+        score=50,
+        time_ts=1000,
+        comment_count=5,
+        article_body="body",
+    )
+    duplicate = _candidate_story(
+        100,
+        source="hn",
+        score=10,
+        time_ts=1000,
+        comment_count=3,
+        article_body="body",
+    )
+    db.upsert_story(duplicate)
+    db.upsert_story(canonical)
+    now = time.time()
+    db.upsert_hn_dupe_resolution(
+        HnDupeResolution(100, 200, "canonical", now, now + 86400, 0, "")
+    )
+
+    result = pipeline.canonicalize_hn_dupes(
+        [
+            RankedStory(story=canonical, score=1.0, best_match_title=""),
+            RankedStory(story=duplicate, score=0.9, best_match_title=""),
+        ],
+        db,
+        candidate_stories=[canonical, duplicate],
+    )
+
+    assert [item.story.id for item in result] == [200]
+
+
+def test_canonicalize_hn_dupes_skips_non_hn_without_calling_resolver(
+    db: Database,
+) -> None:
+    story = _candidate_story(
+        100,
+        source="rss_reddit_python",
+        score=10,
+        time_ts=1000,
+        article_body="body",
+    )
+
+    def fetch_item(_story_id: int) -> dict[str, object] | None:
+        raise AssertionError("non-HN stories must not call the resolver")
+
+    result = pipeline.canonicalize_hn_dupes(
+        [RankedStory(story=story, score=1.0, best_match_title="")],
+        db,
+        resolver=HnDupeResolver(fetch_item=fetch_item),
+    )
+
+    assert [item.story.id for item in result] == [100]
+
+
+def test_canonicalize_hn_dupes_keeps_original_for_unsummarizable_target(
+    db: Database,
+) -> None:
+    duplicate = _candidate_story(
+        100,
+        source="hn",
+        score=10,
+        time_ts=1000,
+        comment_count=3,
+        article_body="body",
+    )
+    resolver = HnDupeResolver(
+        fetch_item=lambda story_id: {
+            100: {
+                "id": 100,
+                "type": "story",
+                "title": "Candidate 100",
+                "score": 10,
+                "descendants": 3,
+                "kids": [101],
+            },
+            101: {
+                "id": 101,
+                "type": "comment",
+                "text": "Earlier: https://news.ycombinator.com/item?id=200",
+            },
+            200: {
+                "id": 200,
+                "type": "story",
+                "title": "Candidate 200",
+                "score": 50,
+                "descendants": 0,
+            },
+        }.get(story_id)
+    )
+
+    result = pipeline.canonicalize_hn_dupes(
+        [RankedStory(story=duplicate, score=1.0, best_match_title="")],
+        db,
+        resolver=resolver,
+    )
+
+    assert [item.story.id for item in result] == [100]
+
+
+def test_canonicalize_hn_dupes_drops_when_linked_target_is_feedback(
+    db: Database,
+) -> None:
+    user = db.create_user("hn_dupe_feedback_target")
+    target = _candidate_story(
+        200,
+        source="hn",
+        score=50,
+        time_ts=1000,
+        comment_count=10,
+        article_body="body",
+    )
+    duplicate = _candidate_story(
+        100,
+        source="hn",
+        score=10,
+        time_ts=1000,
+        comment_count=3,
+        article_body="body",
+    )
+    db.upsert_story(target)
+    db.upsert_feedback(user.id, target.id, "up")
+    resolver = HnDupeResolver(
+        fetch_item=lambda story_id: {
+            100: {
+                "id": 100,
+                "type": "story",
+                "title": "Candidate 100",
+                "score": 10,
+                "descendants": 3,
+                "kids": [101],
+            },
+            101: {
+                "id": 101,
+                "type": "comment",
+                "text": "Earlier: https://news.ycombinator.com/item?id=200",
+            },
+            200: {
+                "id": 200,
+                "type": "story",
+                "title": "Candidate 200",
+                "score": 50,
+                "descendants": 10,
+            },
+        }.get(story_id)
+    )
+
+    result = pipeline.canonicalize_hn_dupes(
+        [RankedStory(story=duplicate, score=1.0, best_match_title="")],
+        db,
+        candidate_stories=[duplicate],
+        user_id=user.id,
+        resolver=resolver,
+    )
+
+    assert result == []
+
+
+def test_canonicalize_hn_dupes_drops_title_match_to_feedback(
+    db: Database,
+) -> None:
+    user = db.create_user("hn_dupe_feedback_title")
+    feedback_story = _candidate_story(
+        200,
+        source="hn",
+        score=50,
+        time_ts=1000,
+        comment_count=10,
+        article_body="body",
+    )
+    selected = _candidate_story(
+        100,
+        source="hn",
+        score=10,
+        time_ts=1000,
+        comment_count=2,
+        article_body="body",
+    )
+    db.upsert_story(feedback_story)
+    db.upsert_feedback(user.id, feedback_story.id, "neutral")
+    resolver = HnDupeResolver(
+        fetch_item=lambda story_id: {
+            100: {
+                "id": 100,
+                "type": "story",
+                "title": "Candidate 100",
+                "score": 10,
+                "descendants": 2,
+                "kids": [],
+            },
+        }.get(story_id)
+    )
+
+    result = pipeline.canonicalize_hn_dupes(
+        [RankedStory(story=selected, score=1.0, best_match_title="")],
+        db,
+        user_id=user.id,
+        resolver=resolver,
+    )
+
+    assert result == []
+
+
+def test_canonicalize_hn_dupes_keeps_downvoted_feedback_match_by_default(
+    db: Database,
+) -> None:
+    user = db.create_user("hn_dupe_feedback_down")
+    feedback_story = _candidate_story(
+        200,
+        source="hn",
+        score=50,
+        time_ts=1000,
+        comment_count=10,
+        article_body="body",
+    )
+    selected = _candidate_story(
+        100,
+        source="hn",
+        score=10,
+        time_ts=1000,
+        comment_count=2,
+        article_body="body",
+    )
+    db.upsert_story(feedback_story)
+    db.upsert_feedback(user.id, feedback_story.id, "down")
+    resolver = HnDupeResolver(
+        fetch_item=lambda story_id: {
+            100: {
+                "id": 100,
+                "type": "story",
+                "title": "Candidate 100",
+                "score": 10,
+                "descendants": 2,
+                "kids": [],
+            },
+        }.get(story_id)
+    )
+
+    result = pipeline.canonicalize_hn_dupes(
+        [RankedStory(story=selected, score=1.0, best_match_title="")],
+        db,
+        user_id=user.id,
+        resolver=resolver,
+    )
+
+    assert [item.story.id for item in result] == [100]
+
+
 def _candidate_story(
     sid: int,
     *,
@@ -2054,7 +2424,9 @@ def test_load_production_candidate_stories_preserves_leg_order_and_limits(
         db, config, user_id=user.id, exclude_feedback=True, now_ts=now
     )
 
-    assert [story.id for story in candidates] == [1, 2, 10, 11, 21, 20, 30, 31]
+    # Dashboard is hardcoded to HN sources only for now — non-HN legs
+    # (ids 10, 11, 12, 30, 31, 32) are dropped.
+    assert [story.id for story in candidates] == [1, 2, 21, 20]
 
 
 def test_load_production_candidate_stories_feedback_switch_and_summarizable_filter(
@@ -3020,6 +3392,189 @@ def test_each_badge_floored_at_five_per_cohort(
         assert n_archive >= DISCOVERY_PER_BADGE, (
             f"{attr} must appear >= {DISCOVERY_PER_BADGE} in archive (got {n_archive})"
         )
+
+
+def _make_combo_deck_inputs() -> tuple[
+    list[RankedStory],
+    int,
+    NDArray[np.float32],
+    NDArray[np.float32],
+    Callable[[int], int],
+    ranking.ExploreContext,
+]:
+    """Build synthetic inputs for a direct ``_assemble_combo_deck`` call.
+
+    24 recent HN candidates: ids 0-11 score high enough to fill
+    ``PRIMARY_PER_COMBO`` (12) and land in Primary; ids 12-23 score low
+    (never Hot/Top/Talk-eligible) and form the Explore-only pool, split
+    into three disjoint groups of 4 for Unsure/Novel/Similar respectively:
+      - Unsure pool: ids 12-15, each with a distinct prob_down (entropy
+        peaks at prob_down=1/3 and falls off monotonically toward 1, so
+        prob_down=0.34/0.5/0.7/0.9 gives strictly *decreasing* entropy
+        12 > 13 > 14 > 15).
+      - Novel pool: ids 16-19, cand_max_sim strictly increasing 16 < 17 <
+        18 < 19 (novel sort key = 1 - max_sim, so 16 is most novel). All
+        other ids default to max_sim=0.99 (i.e. "not novel") so they can't
+        outrank the intended novel pool.
+      - Similar pool: ids 20-23, cand_closest_up strictly decreasing
+        20 > 21 > 22 > 23 (20 is most similar). All other ids default to
+        closest_up=0.0, below every value in the similar pool.
+    """
+    now = int(time.time())
+    candidates: list[Story] = []
+    for i in range(12):
+        candidates.append(
+            Story(
+                id=i,
+                title=f"Primary {i}",
+                url=None,
+                score=1000 - i,
+                time=now,
+                text_content=f"primary story {i}",
+                source="hn",
+                comment_count=0,
+            )
+        )
+    for i in range(12, 24):
+        candidates.append(
+            Story(
+                id=i,
+                title=f"Explore {i}",
+                url=None,
+                score=5,
+                time=now,
+                text_content=f"explore story {i}",
+                source="hn",
+                comment_count=0,
+            )
+        )
+
+    ranked = [
+        RankedStory(
+            story=s,
+            score=float(s.score),
+            best_match_title="",
+        )
+        for s in candidates
+    ]
+    unsure_probs = {12: 0.34, 13: 0.5, 14: 0.7, 15: 0.9}
+    ranked = [
+        replace(
+            r,
+            prob_down=unsure_probs[r.story.id],
+            prob_neutral=(1 - unsure_probs[r.story.id]) / 2,
+            prob_up=(1 - unsure_probs[r.story.id]) / 2,
+        )
+        if r.story.id in unsure_probs
+        else r
+        for r in ranked
+    ]
+
+    story_id_to_idx = {s.id: idx for idx, s in enumerate(candidates)}
+    idx_for = story_id_to_idx.__getitem__
+
+    cand_scores = np.array([s.score for s in candidates], dtype=np.float32)
+    cand_velocities = np.array([0.0 for _ in candidates], dtype=np.float32)
+
+    cand_max_sim = np.full(len(candidates), 0.99, dtype=np.float32)
+    novel_sims = {16: 0.1, 17: 0.4, 18: 0.6, 19: 0.9}
+    for sid, sim in novel_sims.items():
+        cand_max_sim[story_id_to_idx[sid]] = sim
+
+    cand_closest_up = np.zeros(len(candidates), dtype=np.float32)
+    similar_sims = {20: 0.9, 21: 0.6, 22: 0.4, 23: 0.1}
+    for sid, sim in similar_sims.items():
+        cand_closest_up[story_id_to_idx[sid]] = sim
+
+    recent_cutoff = now - 30 * 86400
+    explore = ranking.ExploreContext(
+        cand_max_sim=cand_max_sim, cand_closest_up=cand_closest_up
+    )
+    return ranked, recent_cutoff, cand_scores, cand_velocities, idx_for, explore
+
+
+def test_explore_badges_backfill_past_feedback_matches() -> None:
+    """Explore passes (Unsure/Novel/Similar) skip candidates that duplicate
+    already-voted feedback and backfill from the rest of the sorted pool,
+    instead of silently losing badge slots.
+
+    Reproduces the bug found for a heavy voter (user=1): without
+    ``is_feedback_match``, the naive top-``DISCOVERY_PER_BADGE`` slice picks
+    the best-ranked candidate per badge even when it duplicates a story the
+    user already voted on — a duplicate that ``canonicalize_hn_dupes`` would
+    drop downstream with no replacement, silently shrinking the deck.
+    """
+    config = Config(count=40)
+    ranked, recent_cutoff, cand_scores, cand_velocities, idx_for, explore = (
+        _make_combo_deck_inputs()
+    )
+
+    # The best-ranked candidate in each badge's pool duplicates feedback:
+    # id 12 (highest entropy), id 16 (most novel), id 20 (most similar).
+    feedback_matched_ids = {12, 16, 20}
+
+    def is_feedback_match(story: Story) -> bool:
+        return story.id in feedback_matched_ids
+
+    final = ranking._assemble_combo_deck(
+        ranked,
+        config=config,
+        recent_cutoff=recent_cutoff,
+        cand_scores=cand_scores,
+        cand_velocities=cand_velocities,
+        idx_for=idx_for,
+        embeddings_map=None,
+        explore=explore,
+        is_feedback_match=is_feedback_match,
+    )
+
+    from pipeline import DISCOVERY_PER_BADGE
+
+    unsure_ids = {r.story.id for r in final if r.is_uncertain}
+    novel_ids = {r.story.id for r in final if r.is_novel}
+    similar_ids = {r.story.id for r in final if r.is_similar}
+
+    assert len(unsure_ids) == DISCOVERY_PER_BADGE, unsure_ids
+    assert len(novel_ids) == DISCOVERY_PER_BADGE, novel_ids
+    assert len(similar_ids) == DISCOVERY_PER_BADGE, similar_ids
+
+    # The feedback-matched top pick in each pool must be excluded ...
+    assert 12 not in unsure_ids
+    assert 16 not in novel_ids
+    assert 20 not in similar_ids
+    # ... and backfilled with the next-best candidate in that pool.
+    assert unsure_ids == {13, 14}
+    assert novel_ids == {17, 18}
+    assert similar_ids == {21, 22}
+
+
+def test_explore_badges_no_feedback_match_predicate_is_unaffected() -> None:
+    """``is_feedback_match=None`` (cold-deck / no-feedback path) preserves
+    the pre-existing top-N-by-rank behavior exactly."""
+    config = Config(count=40)
+    ranked, recent_cutoff, cand_scores, cand_velocities, idx_for, explore = (
+        _make_combo_deck_inputs()
+    )
+
+    final = ranking._assemble_combo_deck(
+        ranked,
+        config=config,
+        recent_cutoff=recent_cutoff,
+        cand_scores=cand_scores,
+        cand_velocities=cand_velocities,
+        idx_for=idx_for,
+        embeddings_map=None,
+        explore=explore,
+        is_feedback_match=None,
+    )
+
+    unsure_ids = {r.story.id for r in final if r.is_uncertain}
+    novel_ids = {r.story.id for r in final if r.is_novel}
+    similar_ids = {r.story.id for r in final if r.is_similar}
+
+    assert unsure_ids == {12, 13}
+    assert novel_ids == {16, 17}
+    assert similar_ids == {20, 21}
 
 
 def test_cascade_badges_mutually_exclusive(db: Database, embedder: Embedder) -> None:

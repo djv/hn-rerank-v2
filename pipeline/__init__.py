@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 
 import numpy as np
@@ -17,6 +18,8 @@ from .config import (
     CH_ARCHIVE_CANDIDATE_LIMIT,
     CH_ARCHIVE_SOURCE,
     Config,
+    DEFAULT_ENV_PATH,
+    DEFAULT_ONNX_MODEL_DIR,
     LIVE_WINDOW_LIMIT,
     ModelConfig,
     RssConfig,
@@ -50,6 +53,7 @@ from .ranking import (
     _MODEL_SCHEMA_VERSION,
     _NullTrace,
     _SIM_CHUNK_SIZE,
+    _assemble_combo_deck,
     _chunked_max_dot,
     _comment_rank_key,
     _extract_comments_recursive,
@@ -99,6 +103,7 @@ from .enrichment import (
     prewarm_top_stories,
     select_article_fetch_candidates,
 )
+from .hn_dupes import _load_feedback_context, _matches_feedback, canonicalize_hn_dupes
 
 from .render import (
     generate_dashboard_bytes,
@@ -109,7 +114,6 @@ from reddit_limiter import limiter as reddit_limiter
 
 
 COLD_DECK_LIMIT = 100
-COLD_DECK_QUERY_LIMIT = 400
 
 
 def _combo_keys_for_story(story: Story, recent_cutoff: int) -> str:
@@ -118,57 +122,71 @@ def _combo_keys_for_story(story: Story, recent_cutoff: int) -> str:
     return f"{age}_{source} {age}_mixed"
 
 
-def build_cold_deck(db: Database, user_id: int | None = None) -> list[RankedStory]:
-    """Build a gravity-sorted fallback deck from existing SQLite rows.
+def build_cold_deck(
+    db: Database, config: Config, user_id: int | None = None
+) -> list[RankedStory]:
+    """Build a gravity-sorted, badge-annotated fallback deck — no embeddings,
+    no personalization.
 
     Uses the same tier-1 gravity formula as ``_score_and_rank`` so a
     zero-vote user sees the same ranking as the cold deck.  See
     ``fast_rerank_for_user`` for the 0-vote short-circuit.
 
-    When *user_id* is provided, the SQL filters out stories the user
-    has already voted on.
+    Reuses the same HN-only candidate legs (recent + archive) as the
+    personalized dashboard via ``load_production_candidate_stories``, and
+    the same non-personalized Popular badge assembly (Hot/Top/Talk) as
+    ``rerank_candidates`` via ``_assemble_combo_deck``, so cold-start decks
+    have Popular and Archive combos populated instead of being flat
+    recent-only cards. Explore (Unsure/Novel/Similar) is intentionally
+    skipped — it's personalized and requires feedback to compute against.
+
+    When *user_id* is provided, already-voted stories are excluded.
     """
     now_ts = int(time.time())
-    if user_id is not None:
-        rows = db.execute(
-            "SELECT id, title, url, score, time, text_content, source, comment_count, "
-            "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
-            "FROM stories "
-            "WHERE id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?) "
-            "ORDER BY CAST(score AS REAL) / POW((? - time) / 3600.0 + 2.0, 1.8) DESC, "
-            "         time DESC "
-            "LIMIT ?",
-            (user_id, now_ts, COLD_DECK_QUERY_LIMIT),
-        )
-    else:
-        rows = db.execute(
-            "SELECT id, title, url, score, time, text_content, source, comment_count, "
-            "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
-            "FROM stories "
-            "ORDER BY CAST(score AS REAL) / POW((? - time) / 3600.0 + 2.0, 1.8) DESC, "
-            "         time DESC "
-            "LIMIT ?",
-            (now_ts, COLD_DECK_QUERY_LIMIT),
-        )
-    stories = [Database._row_to_story(row) for row in rows]
+    candidates = load_production_candidate_stories(
+        db,
+        config,
+        user_id=user_id,
+        exclude_feedback=user_id is not None,
+        now_ts=now_ts,
+    )
+    candidates = [story for story in candidates if is_summarizable(story)]
+    if not candidates:
+        return []
+
     recent_cutoff = now_ts - (30 * 86400)
-    cold: list[RankedStory] = []
-    for story in stories:
-        if not is_summarizable(story):
-            continue
-        cold.append(
-            RankedStory(
-                story=story,
-                score=story.score / ((now_ts - story.time) / 3600.0 + 2.0) ** 1.8,
-                best_match_title="",
-                is_non_hn=(not is_hn_source(story.source)),
-                is_recent=(story.time >= recent_cutoff),
-                combo_keys=_combo_keys_for_story(story, recent_cutoff),
-            )
+    ranked = [
+        RankedStory(
+            story=story,
+            score=story.score / ((now_ts - story.time) / 3600.0 + 2.0) ** 1.8,
+            best_match_title="",
+            is_non_hn=(not is_hn_source(story.source)),
+            is_recent=(story.time >= recent_cutoff),
+            combo_keys=_combo_keys_for_story(story, recent_cutoff),
         )
-        if len(cold) >= COLD_DECK_LIMIT:
-            break
-    return cold
+        for story in candidates
+    ]
+
+    cand_scores = np.array([story.score for story in candidates])
+    cand_velocities = np.array(
+        [
+            story.score / max((now_ts - story.time) / 3600.0, 0.1)
+            for story in candidates
+        ]
+    )
+    story_id_to_idx = {story.id: idx for idx, story in enumerate(candidates)}
+
+    cold = _assemble_combo_deck(
+        ranked,
+        config=config,
+        recent_cutoff=recent_cutoff,
+        cand_scores=cand_scores,
+        cand_velocities=cand_velocities,
+        idx_for=story_id_to_idx.__getitem__,
+        embeddings_map=None,
+        explore=None,
+    )
+    return cold[:COLD_DECK_LIMIT]
 
 
 def load_production_candidate_stories(
@@ -179,10 +197,13 @@ def load_production_candidate_stories(
     exclude_feedback: bool,
     now_ts: int | None = None,
 ) -> list[Story]:
-    """Load the same four candidate legs used by the personalized dashboard.
+    """Load the same candidate legs used by the personalized dashboard.
 
     ``exclude_feedback=False`` is for offline evaluation: the initial pool
     needs feedback stories present so held-out folds can be measured.
+
+    Hardcoded to HN sources only (``hn``, ``bq_seed``, ``ch_seed``) for
+    now — non-HN legs (RSS/Reddit/LessWrong) are disabled.
     """
     if exclude_feedback and user_id is None:
         raise ValueError("user_id is required when exclude_feedback=True")
@@ -198,8 +219,8 @@ def load_production_candidate_stories(
         (user_id,) if exclude_feedback and user_id else ()
     )
 
-    # Four production legs: recent HN by gravity, recent non-HN by recency,
-    # archive HN seeds by score, and archive non-HN by recency.
+    # HN-only production legs: recent HN by gravity, archive HN seeds by
+    # score. Non-HN legs (RSS/Reddit/LessWrong) are disabled for now.
     hn_rows = db.execute(
         "SELECT id, title, url, score, time, text_content, source, comment_count, "
         "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
@@ -216,22 +237,6 @@ def load_production_candidate_stories(
             config.recent_candidate_hn_limit,
         ),
     )
-    rss_rows = db.execute(
-        "SELECT id, title, url, score, time, text_content, source, comment_count, "
-        "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
-        "FROM stories "
-        "WHERE time >= ? AND source != 'hn' AND source NOT IN (?, ?) "
-        f"{feedback_filter}"
-        "ORDER BY time DESC "
-        "LIMIT ?",
-        (
-            cutoff_ts,
-            BQ_ARCHIVE_SOURCE,
-            CH_ARCHIVE_SOURCE,
-            *feedback_params,
-            config.recent_candidate_rss_limit,
-        ),
-    )
     archive_rows = db.execute(
         "SELECT id, title, url, score, time, text_content, source, comment_count, "
         "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
@@ -245,22 +250,7 @@ def load_production_candidate_stories(
             BQ_ARCHIVE_CANDIDATE_LIMIT + CH_ARCHIVE_CANDIDATE_LIMIT,
         ),
     )
-    archive_rss_rows = db.execute(
-        "SELECT id, title, url, score, time, text_content, source, comment_count, "
-        "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
-        "FROM stories "
-        "WHERE source != 'hn' AND source NOT IN (?, ?) AND time < ? "
-        f"{feedback_filter}"
-        "ORDER BY time DESC LIMIT ?",
-        (
-            BQ_ARCHIVE_SOURCE,
-            CH_ARCHIVE_SOURCE,
-            cutoff_ts,
-            *feedback_params,
-            config.recent_candidate_rss_limit,
-        ),
-    )
-    rows = hn_rows + rss_rows + archive_rows + archive_rss_rows
+    rows = hn_rows + archive_rows
     return [
         story
         for story in (Database._row_to_story(row) for row in rows)
@@ -458,7 +448,15 @@ def fast_rerank_for_user(
     trace.set_count("feedback_total", n_feedback)
     if n_feedback == 0:
         trace.set_label("model_cache", "skipped_cold_deck")
-        return build_cold_deck(db)
+        cold_deck = build_cold_deck(db, config)
+        return canonicalize_hn_dupes(
+            cold_deck,
+            db,
+            selected_limit=config.count,
+            user_id=user_id,
+            feedback_actions=tuple(config.model.dedup_exclude_actions),
+            trace=trace,
+        )
 
     with trace.stage("candidate_sql"):
         candidates = load_production_candidate_stories(
@@ -475,6 +473,14 @@ def fast_rerank_for_user(
     with trace.stage("candidate_embedding"):
         cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
 
+    # Built once per request and threaded into badge assembly so the
+    # Explore passes (Unsure/Novel/Similar) can skip-and-backfill past
+    # candidates that duplicate a story the user already voted on, instead
+    # of silently losing badge slots to the downstream `canonicalize_hn_dupes`
+    # feedback-match drop (see WORKLOG 2026-07-10).
+    feedback_context = _load_feedback_context(
+        db, user_id=user_id, actions=tuple(config.model.dedup_exclude_actions)
+    )
     ranked = rerank_candidates(
         db=db,
         config=config,
@@ -483,19 +489,30 @@ def fast_rerank_for_user(
         cand_embeddings=cand_embeddings,
         user_id=user_id,
         trace=trace,
+        is_feedback_match=lambda s: _matches_feedback(s, feedback_context),
     )
 
     with trace.stage("dedup"):
         id_to_emb: dict[int, NDArray[np.float32]] = {
             s.id: vec for s, vec in zip(candidates, cand_embeddings)
         }
-        return _apply_dedup_to_ranked(
+        deduped = _apply_dedup_to_ranked(
             ranked,
             db,
             config,
             user_id,
             embeddings=id_to_emb,
             embedder=embedder,
+        )
+    with trace.stage("hn_dupes"):
+        return canonicalize_hn_dupes(
+            deduped,
+            db,
+            candidate_stories=candidates,
+            selected_limit=config.count,
+            user_id=user_id,
+            feedback_actions=tuple(config.model.dedup_exclude_actions),
+            trace=trace,
         )
 
 
@@ -558,6 +575,7 @@ async def fetch_candidates_only(
     db: Database,
     embedder: Embedder | None = None,
     prewarm_top_n: int | None = None,
+    on_hn_candidates: Callable[[Sequence[Story]], None] | None = None,
 ) -> None:
     """Fetch new candidates into shared DB; prewarm top-N hot per sub.
 
@@ -598,6 +616,11 @@ async def fetch_candidates_only(
         config, feedback_ids, feedback_urls, db, None
     )
     logging.info("Regen: fetched %d candidates", n_fetched)
+    if on_hn_candidates is not None:
+        try:
+            on_hn_candidates([story for story in candidates if story.source == "hn"])
+        except Exception:
+            logging.exception("fetch_candidates_only: HN dupe callback failed")
 
     # HN prewarm
     if config.prewarm_hn_full and embedder is not None:

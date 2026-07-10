@@ -4,7 +4,7 @@ Use ONLY information from the article below.
 Output ONE section only:
 
 ### Article
-3-5 bullets, max 120 words.
+{budget}, summarizing the article.
 
 Markdown formatting:
 - FLAT structure only — no nested list levels.

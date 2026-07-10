@@ -54,6 +54,7 @@ from pipeline import (
     clean_text,
     load_production_candidate_stories,
     mmr_filter,
+    story_embedding_text,
 )
 
 MODEL_VERSION = "all-MiniLM-L6-v2|mean|norm|256"
@@ -95,9 +96,119 @@ def _db_sha256(db_path: str) -> str:
     return hashlib.sha256(Path(db_path).read_bytes()).hexdigest()[:16]
 
 
+def _embedding_text_hashes(stories: list[Story]) -> np.ndarray:
+    return np.array(
+        [
+            hashlib.sha256(story_embedding_text(story).encode("utf-8")).hexdigest()
+            for story in stories
+        ],
+        dtype="<U64",
+    )
+
+
+def _load_external_embeddings(
+    path: str | Path, stories: list[Story]
+) -> np.ndarray:
+    """Load a model-bakeoff embedding snapshot after validating its story rows."""
+    with np.load(path, allow_pickle=False) as data:
+        required = {"story_ids", "text_hashes", "embeddings"}
+        missing = required - set(data.files)
+        if missing:
+            raise ValueError(
+                f"Embedding snapshot missing required array(s): {', '.join(sorted(missing))}"
+            )
+        story_ids = np.asarray(data["story_ids"], dtype=np.int64)
+        text_hashes = np.asarray(data["text_hashes"], dtype="<U64")
+        embeddings = np.asarray(data["embeddings"], dtype=np.float32)
+
+    expected_hashes = _embedding_text_hashes(stories)
+    if embeddings.ndim != 2 or embeddings.shape[0] != len(stories):
+        raise ValueError(
+            "Embedding snapshot shape does not match production candidates: "
+            f"{embeddings.shape} for {len(stories)} stories"
+        )
+    if not np.isfinite(embeddings).all():
+        raise ValueError("Embedding snapshot contains non-finite values")
+    snapshot_keys = list(zip(story_ids.tolist(), text_hashes.tolist(), strict=True))
+    expected_keys = list(
+        zip([story.id for story in stories], expected_hashes.tolist(), strict=True)
+    )
+    if len(set(snapshot_keys)) != len(snapshot_keys):
+        raise ValueError("Embedding snapshot contains duplicate story IDs or text hashes")
+    if set(snapshot_keys) != set(expected_keys):
+        raise ValueError("Embedding snapshot story IDs or text hashes do not match production candidates")
+    vectors_by_key = dict(zip(snapshot_keys, embeddings, strict=True))
+    return np.array([vectors_by_key[key] for key in expected_keys], dtype=np.float32)
+
+
+def _snapshot_candidate_stories(path: str | Path) -> list[Story]:
+    """Load the frozen candidate rows stored alongside an embedding snapshot."""
+    with np.load(path, allow_pickle=False) as data:
+        if "stories_json" not in data.files:
+            raise ValueError("Embedding snapshot missing required array: stories_json")
+        raw_json = str(data["stories_json"].item())
+    try:
+        raw_stories = json.loads(raw_json)
+        if not isinstance(raw_stories, list):
+            raise ValueError("stories_json must contain a list")
+        return [Story(**raw_story) for raw_story in raw_stories]
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("Embedding snapshot has invalid frozen story rows") from exc
+
+
+def _snapshot_feedback(
+    path: str | Path,
+) -> tuple[list[Story], np.ndarray, np.ndarray]:
+    """Load the feedback labels and times captured with an embedding snapshot."""
+    with np.load(path, allow_pickle=False) as data:
+        required = {
+            "feedback_story_ids",
+            "feedback_stories_json",
+            "feedback_labels",
+            "feedback_vote_times",
+        }
+        missing = required - set(data.files)
+        if missing:
+            raise ValueError(
+                "Embedding snapshot missing frozen feedback array(s): "
+                + ", ".join(sorted(missing))
+            )
+        story_ids = np.asarray(data["feedback_story_ids"], dtype=np.int64)
+        labels = np.asarray(data["feedback_labels"], dtype=int)
+        vote_times = np.asarray(data["feedback_vote_times"], dtype=np.float64)
+        raw_json = str(data["feedback_stories_json"].item())
+    try:
+        raw_stories = json.loads(raw_json)
+        if not isinstance(raw_stories, list):
+            raise ValueError("feedback_stories_json must contain a list")
+        stories = [Story(**raw_story) for raw_story in raw_stories]
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("Embedding snapshot has invalid frozen feedback rows") from exc
+    if not (
+        len(story_ids) == len(stories) == len(labels) == len(vote_times)
+    ):
+        raise ValueError("Embedding snapshot frozen feedback arrays have different lengths")
+    if not np.array_equal(story_ids, np.array([story.id for story in stories])):
+        raise ValueError("Embedding snapshot frozen feedback story IDs do not match rows")
+    if len(set(story_ids.tolist())) != len(story_ids):
+        raise ValueError("Embedding snapshot frozen feedback contains duplicate story IDs")
+    if not set(labels.tolist()) <= {0, 1, 2}:
+        raise ValueError("Embedding snapshot frozen feedback labels must be 0, 1, or 2")
+    if not np.isfinite(vote_times).all():
+        raise ValueError("Embedding snapshot frozen feedback times are non-finite")
+    return stories, labels, vote_times
+
+
 def _load_production_candidates(
-    db: Database, config: Config, user_id: int
+    db: Database,
+    config: Config,
+    user_id: int,
+    embeddings_file: str | Path | None = None,
 ) -> tuple[list[Story], np.ndarray]:
+    if embeddings_file is not None:
+        stories = _snapshot_candidate_stories(embeddings_file)
+        return stories, _load_external_embeddings(embeddings_file, stories)
+
     stories = load_production_candidate_stories(
         db,
         config,
@@ -105,8 +216,8 @@ def _load_production_candidates(
         exclude_feedback=False,
     )
     hashes = {
-        s.id: hashlib.sha256(s.text_content.encode("utf-8")).hexdigest()
-        for s in stories
+        s.id: text_hash
+        for s, text_hash in zip(stories, _embedding_text_hashes(stories), strict=True)
     }
     cached = db.get_embeddings_batch([s.id for s in stories], MODEL_VERSION, hashes)
     embeddings = np.array(
@@ -114,6 +225,40 @@ def _load_production_candidates(
         dtype=np.float32,
     )
     return stories, embeddings
+
+
+def _candidate_indices_with_feedback(
+    candidates: list[Story],
+    *,
+    max_candidates: int | None,
+    required_story_ids: set[int],
+) -> np.ndarray:
+    """Choose a deterministic capped pool while retaining evaluable feedback."""
+    if max_candidates is None or len(candidates) <= max_candidates:
+        return np.arange(len(candidates), dtype=int)
+
+    required_indices = {
+        index for index, story in enumerate(candidates) if story.id in required_story_ids
+    }
+    if len(required_indices) > max_candidates:
+        raise RuntimeError(
+            "--max-candidates is smaller than the valid feedback candidate set"
+        )
+    optional_indices = np.array(
+        sorted(
+            (index for index in range(len(candidates)) if index not in required_indices),
+            key=lambda index: candidates[index].id,
+        ),
+        dtype=int,
+    )
+    remaining_slots = max_candidates - len(required_indices)
+    if remaining_slots < len(optional_indices):
+        optional_indices = np.random.default_rng(1).choice(
+            optional_indices, size=remaining_slots, replace=False
+        )
+    return np.array(
+        sorted(required_indices | {int(index) for index in optional_indices}), dtype=int
+    )
 
 
 def _field_embeddings_by_field(
@@ -1829,6 +1974,17 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.toml")
     parser.add_argument("--output", default="eval_ranker_variants.json")
+    parser.add_argument(
+        "--embeddings-file",
+        help=(
+            "Optional .npz snapshot with story_ids, text_hashes, and embeddings. "
+            "Used by the embedding-model bakeoff without writing to the live DB."
+        ),
+    )
+    parser.add_argument(
+        "--embedding-label",
+        help="Human-readable embedding specification recorded in the JSON report.",
+    )
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument(
         "--split",
@@ -1908,10 +2064,23 @@ def main() -> None:
 
     window_days = args.window_days if args.window_days is not None else config.days
     eval_config = replace(config, days=window_days)
-    candidates, cand_emb = _load_production_candidates(db, eval_config, user.id)
+    if args.embeddings_file:
+        fb_stories, all_y, fb_vote_times = _snapshot_feedback(args.embeddings_file)
+    else:
+        fb_stories, fb_labels, fb_vote_times = db.get_feedback_for_training(
+            user_id=user.id
+        )
+        all_y = np.array(fb_labels, dtype=int)
+    candidates, cand_emb = _load_production_candidates(
+        db,
+        eval_config,
+        user.id,
+        embeddings_file=args.embeddings_file,
+    )
     cand_id_to_idx = {s.id: i for i, s in enumerate(candidates)}
-    fb_stories, fb_labels, fb_vote_times = db.get_feedback_for_training(user_id=user.id)
-    all_y = np.array(fb_labels, dtype=int)
+    if args.embeddings_file:
+        candidate_by_id = {story.id: story for story in candidates}
+        fb_stories = [candidate_by_id.get(story.id, story) for story in fb_stories]
     fb_vote_times = np.array(fb_vote_times, dtype=np.float64)
     fb_to_cand = np.array([cand_id_to_idx.get(s.id, -1) for s in fb_stories])
     valid_mask = fb_to_cand >= 0
@@ -1933,26 +2102,16 @@ def main() -> None:
         fb_to_cand = fb_to_cand[keep_feedback_positions]
         valid_mask = fb_to_cand >= 0
 
-    if args.max_candidates is not None and len(candidates) > args.max_candidates:
-        rng = np.random.default_rng(1)
+    if (
+        args.embeddings_file is None
+        and args.max_candidates is not None
+        and len(candidates) > args.max_candidates
+    ):
         required_ids = {s.id for s in fb_stories if s.id in cand_id_to_idx}
-        required_indices = {cand_id_to_idx[sid] for sid in required_ids}
-        if len(required_indices) > args.max_candidates:
-            raise RuntimeError(
-                "--max-candidates is smaller than the sampled valid feedback set"
-            )
-        remaining_slots = args.max_candidates - len(required_indices)
-        optional_indices = np.array(
-            [i for i in range(len(candidates)) if i not in required_indices],
-            dtype=int,
-        )
-        if remaining_slots < len(optional_indices):
-            optional_indices = rng.choice(
-                optional_indices, size=remaining_slots, replace=False
-            )
-        keep_candidate_indices = np.array(
-            sorted(set(required_indices) | {int(i) for i in optional_indices}),
-            dtype=int,
+        keep_candidate_indices = _candidate_indices_with_feedback(
+            candidates,
+            max_candidates=args.max_candidates,
+            required_story_ids=required_ids,
         )
         candidates = [candidates[i] for i in keep_candidate_indices]
         cand_emb = cand_emb[keep_candidate_indices]
@@ -2469,6 +2628,8 @@ def main() -> None:
             "mmr_threshold": config.model.diversity_threshold,
             "mmr_limit": config.count,
             "db_sha256": _db_sha256(config.db_path),
+            "embedding_label": args.embedding_label,
+            "embeddings_file": args.embeddings_file,
         },
         "variants": {},
         "baselines": {},

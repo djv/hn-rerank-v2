@@ -13,7 +13,8 @@
 --   - Segmentation of the dashboard by recency and source
 -- Excludes:
 --   - Story ingestion/sourcing from HN, Reddit, LessWrong, RSS (separate
---     ingestion spec; Story is modelled here as external)
+--     ingestion spec; this spec owns only the minimal Story shape needed
+--     for ranking feedback)
 --   - The specific ML technique used to learn preference (SVM, k-NN,
 --     clustering, embedding model) - these are implementation, not
 --     domain-level decisions, and are free to change without affecting
@@ -21,7 +22,7 @@
 --   - TLDR/summary generation
 --   - Authentication / device linking (`/u/<token>`)
 
-external entity Story {
+entity Story {
     title: String
     url: String?
 }
@@ -152,6 +153,14 @@ surface Dashboard {
         -- first vote, and SVM preference scoring that ramps in once
         -- `viewer.is_svm_personalization_ready`. There is no hard
         -- cutover at any stage.
+}
+
+invariant SvmReadinessDefinition {
+    for user in Users:
+        user.votes.count >= user.up_votes.count + user.down_votes.count
+        and user.is_svm_personalization_ready =
+            user.up_votes.count >= config.min_up_votes_for_personalization
+            and user.down_votes.count >= config.min_down_votes_for_personalization
 }
 
 invariant OneCardPerStoryPerSegment {
