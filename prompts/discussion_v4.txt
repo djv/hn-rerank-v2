@@ -7,7 +7,9 @@ Use a FLAT structure — no nested list levels. If a sub-topic has multiple bull
 - **Precedent exists** in...
 (NOT `- **Criticism of US control**:` followed by siblings.)
 Every non-empty output line must start with "- ".
-Use labels like **Consensus:**, **Disagreement:**, and **Caveat:** when present.
+Group bullets under freeform `####` headings that describe what this specific
+thread is actually about — pick heading names that fit this discussion, not
+a fixed set reused across every story.
 Do not put multiple bullets on one line.
 If the comments are thin or low-signal, say so explicitly.
 
