@@ -349,6 +349,10 @@
       overflow: auto;
     }
 
+    .story-card:focus-visible {
+      outline: none;
+    }
+
     .story-card.fade-out {
       opacity: 0;
       transform: translateX(var(--swipe-exit-x, 0)) translateY(10px) rotate(var(--swipe-exit-rotate, 0deg));
@@ -962,6 +966,13 @@
         openTldrDetail(activeCard);
         voteBar.hidden = false;
         updateVoteBar();
+        // Focus the card so native scroll keys (space, PgUp/PgDn, Home/End,
+        // arrows) target its scrollable content instead of the page body.
+        // Skip while the first-time tip owns focus so we don't steal it.
+        const tip = document.getElementById('first-time-tip');
+        if (!tip || tip.hidden || !tip.contains(document.activeElement)) {
+          activeCard.focus({ preventScroll: true });
+        }
       } else {
         document.querySelectorAll('[data-fb]').forEach(btn => btn.classList.remove('active'));
         voteBar.hidden = true;
@@ -1723,17 +1734,7 @@
       }
     }
 
-    function scrollActiveCard(direction) {
-      const card = document.querySelector('.story-card.active');
-      if (!card) {
-        return;
-      }
-      card.scrollBy({ top: 40 * direction });
-    }
-
     const KEY_ACTIONS = {
-      arrowup: () => scrollActiveCard(-1),
-      arrowdown: () => scrollActiveCard(1),
       k: () => submitVote('up'),
       j: () => submitVote('down'),
       l: () => submitVote('neutral'),
