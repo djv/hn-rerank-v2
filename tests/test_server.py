@@ -503,6 +503,8 @@ def test_static_serving(test_env):
     assert 'data-age="recent"' in resp.text
     assert 'data-age="archive"' in resp.text
     assert 'id="toast"' in resp.text
+    assert 'id="queue-loading"' in resp.text
+    assert "Loading more stories…" in resp.text
     assert 'class="refresh-progress"' not in resp.text
     assert 'id="sort-toggle"' not in resp.text
     assert 'id="queue-status"' not in resp.text

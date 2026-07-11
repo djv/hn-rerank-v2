@@ -322,6 +322,12 @@
       flex: 1 1 902px;
     }
 
+    .queue-loading {
+      margin: 2rem 0;
+      color: var(--pico-muted-color);
+      text-align: center;
+    }
+
     .story-card {
       display: none;
       margin-right: auto;
@@ -848,6 +854,9 @@
       {% include "components/story_card.html" %}
       {% endfor %}
       <!--cards:end-->
+      <p id="queue-loading" class="queue-loading" hidden role="status" aria-live="polite">
+        Loading more stories…
+      </p>
       </div>
 
       {% include "components/side_rail.html" %}
@@ -868,6 +877,7 @@
     // Swipe deck state
     const storiesContainer = document.getElementById('stories');
     const toastEl = document.getElementById('toast');
+    const queueLoadingEl = document.getElementById('queue-loading');
     const sortTabs = Array.from(document.querySelectorAll('[data-sort]'));
     const ageTabs = Array.from(document.querySelectorAll('[data-age]'));
     const sourceTabs = Array.from(document.querySelectorAll('.tab-btn[data-source]'));
@@ -988,8 +998,13 @@
         document.querySelectorAll('[data-fb]').forEach(btn => btn.classList.remove('active'));
         voteBar.hidden = true;
       }
+      updateQueueLoading();
       prefetchUpcomingTldrs();
       scheduleIdleAgePrefetch();
+    }
+
+    function updateQueueLoading() {
+      queueLoadingEl.hidden = !(refillInFlight && activeCard === null);
     }
 
     function updateVoteBar() {
@@ -1316,6 +1331,7 @@
         return;
       }
       refillInFlight = true;
+      updateQueueLoading();
       try {
         while (queuedRefillAdvance !== null) {
           const advance = queuedRefillAdvance;
@@ -1328,6 +1344,7 @@
         }
       } finally {
         refillInFlight = false;
+        updateQueueLoading();
       }
     }
 
