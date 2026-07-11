@@ -57,7 +57,6 @@ from pipeline import (
     story_embedding_text,
 )
 
-MODEL_VERSION = "all-MiniLM-L6-v2|mean|norm|256"
 SELF_FIELD_CHAR_LIMIT = 6000
 ARTICLE_FIELD_CHAR_LIMIT = 4000
 COMMENT_FIELD_CHAR_LIMIT = 6000
@@ -219,7 +218,9 @@ def _load_production_candidates(
         s.id: text_hash
         for s, text_hash in zip(stories, _embedding_text_hashes(stories), strict=True)
     }
-    cached = db.get_embeddings_batch([s.id for s in stories], MODEL_VERSION, hashes)
+    cached = db.get_embeddings_batch(
+        [s.id for s in stories], config.embedding_model_version, hashes
+    )
     embeddings = np.array(
         [cached.get(s.id, np.zeros(384, dtype=np.float32)) for s in stories],
         dtype=np.float32,
@@ -2055,6 +2056,8 @@ def main() -> None:
     embedder = (
         Embedder(
             config.onnx_model_dir,
+            model_version=config.embedding_model_version,
+            max_tokens=config.embedding_max_tokens,
             batch_size=config.embedding_batch_size,
             ort_variant=config.embedding_ort_variant,
         )

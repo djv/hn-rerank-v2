@@ -37,6 +37,8 @@ from pipeline import (  # noqa: E402
 from scripts.eval_ranker_variants import (  # noqa: E402
     _candidate_indices_with_feedback,
     _embedding_text_hashes,
+    _snapshot_candidate_stories,
+    _snapshot_feedback,
 )
 
 
@@ -224,11 +226,24 @@ def main() -> None:
     parser.add_argument("--config", default="config.toml")
     parser.add_argument("--user-id", type=int)
     parser.add_argument(
+        "--reference-snapshot",
+        type=Path,
+        help=(
+            "Use the frozen candidates and feedback in this .npz snapshot instead "
+            "of reading the live database. Required for a fair sequential bakeoff."
+        ),
+    )
+    parser.add_argument(
         "--models",
         type=_parse_models,
         default=["minilm", "mxbai_xsmall", "arctic_xs", "bge_small"],
     )
-    parser.add_argument("--max-tokens", type=int, choices=(256, 512), default=256)
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        choices=(256, 512, 1024, 2048, 4096),
+        default=256,
+    )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument(
         "--max-candidates",
@@ -240,21 +255,31 @@ def main() -> None:
     args = parser.parse_args()
     if args.batch_size <= 0:
         raise SystemExit("--batch-size must be positive")
+    if args.reference_snapshot is not None and args.max_candidates is not None:
+        raise SystemExit("--reference-snapshot cannot be combined with --max-candidates")
 
     config = Config.load(args.config)
-    db = Database(config.db_path, read_only=True)
-    try:
-        user_id = args.user_id
-        if user_id is None:
-            user = db.get_user_by_token("default")
-            if user is None:
-                raise SystemExit("Missing default user token; pass --user-id")
-            user_id = user.id
-        stories, feedback_stories, feedback_labels, feedback_vote_times = (
-            _candidate_stories(db, config, user_id, args.max_candidates)
+    user_id: int | None = args.user_id
+    if args.reference_snapshot is not None:
+        stories = _snapshot_candidate_stories(args.reference_snapshot)
+        feedback_stories, feedback_labels_array, feedback_vote_times_array = (
+            _snapshot_feedback(args.reference_snapshot)
         )
-    finally:
-        db.close()
+        feedback_labels = [int(label) for label in feedback_labels_array]
+        feedback_vote_times = [float(vote_time) for vote_time in feedback_vote_times_array]
+    else:
+        db = Database(config.db_path, read_only=True)
+        try:
+            if user_id is None:
+                user = db.get_user_by_token("default")
+                if user is None:
+                    raise SystemExit("Missing default user token; pass --user-id")
+                user_id = user.id
+            stories, feedback_stories, feedback_labels, feedback_vote_times = (
+                _candidate_stories(db, config, user_id, args.max_candidates)
+            )
+        finally:
+            db.close()
     if not stories:
         raise SystemExit("No production candidate stories found")
 
@@ -272,6 +297,9 @@ def main() -> None:
         "max_tokens": args.max_tokens,
         "batch_size": args.batch_size,
         "max_candidates": args.max_candidates,
+        "reference_snapshot": (
+            str(args.reference_snapshot) if args.reference_snapshot is not None else None
+        ),
         "models": model_results,
     }
 

@@ -8,6 +8,26 @@ Append-only log of notable changes, fixes, and operational events.
   the available `#stories` column before and after enrichment. The dashboard
   shell's existing width cap and filter rail are unchanged.
 
+## 2026-07-11 — mxbai context-length bakeoff
+
+- Extended the offline embedding bakeoff to accept 1024- and 2048-token
+  contexts, then evaluated mxbai at 512, 1024, and 2048 tokens against the
+  frozen 8,311-candidate, 1,139-feedback snapshot used by the existing 256-
+  and 4096-token runs.
+- Leakage-safe five-fold temporal results for mxbai 512/1024/2048 were raw
+  NDCG@12 `0.237`/`0.264`/`0.308`, NDCG@40 `0.210`/`0.227`/`0.220`, and MAP
+  `0.113`/`0.111`/`0.115`. Shuffled-label NDCG@40 remained near zero
+  (`0.010`/`0.000`/`0.009`).
+- The predeclared promotion gate selects mxbai 2048: versus MiniLM 256 it adds
+  `+0.085` NDCG@12 and `+0.027` NDCG@40, improves MAP by `+0.027`, and wins
+  NDCG@40 in 3/5 folds. It remains within `0.016` NDCG@12 and `0.001`
+  NDCG@40 of mxbai 4096.
+- Full-snapshot throughput was 13.976, 6.183, and 3.333 stories/s at
+  512/1024/2048 tokens. The 2048 run is only about 4% faster than the measured
+  4096 run (3.203 stories/s), so switching production models remains a
+  separate, reversible change; this bakeoff did not alter production config
+  or the live embedding cache.
+
 ## 2026-07-10 — fix: backfill Explore badge slots past feedback duplicates
 
 `canonicalize_hn_dupes` removes candidates that match a story the user has

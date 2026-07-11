@@ -30,9 +30,6 @@ from pipeline import (  # noqa: E402
     story_embedding_text,
 )
 
-EMBEDDING_MODEL_VERSION = "all-MiniLM-L6-v2|mean|norm|256"
-
-
 def _clear_model_cache() -> None:
     with _MODEL_CACHE_LOCK:
         _MODEL_CACHE.clear()
@@ -86,7 +83,9 @@ def _candidate_stories(db: Database, config: Config, user_id: int) -> list[Story
     return [s for s in stories if is_summarizable(s)]
 
 
-def _missing_embedding_count(db: Database, stories: list[Story]) -> int:
+def _missing_embedding_count(
+    db: Database, stories: list[Story], model_version: str
+) -> int:
     hashes = {
         story.id: hashlib.sha256(
             story_embedding_text(story).encode("utf-8")
@@ -94,7 +93,7 @@ def _missing_embedding_count(db: Database, stories: list[Story]) -> int:
         for story in stories
     }
     cached = db.get_embeddings_batch(
-        [story.id for story in stories], EMBEDDING_MODEL_VERSION, hashes
+        [story.id for story in stories], model_version, hashes
     )
     return len(stories) - len(cached)
 
@@ -104,8 +103,12 @@ def _preflight_read_only_embeddings(
 ) -> dict[str, int]:
     candidates = _candidate_stories(db, config, user_id)
     feedback_stories, _labels, _vote_times = db.get_feedback_for_training(user_id)
-    candidate_missing = _missing_embedding_count(db, candidates)
-    feedback_missing = _missing_embedding_count(db, feedback_stories)
+    candidate_missing = _missing_embedding_count(
+        db, candidates, config.embedding_model_version
+    )
+    feedback_missing = _missing_embedding_count(
+        db, feedback_stories, config.embedding_model_version
+    )
     return {
         "candidates": len(candidates),
         "feedback": len(feedback_stories),
@@ -247,6 +250,8 @@ def main() -> None:
 
         embedder = Embedder(
             config.onnx_model_dir,
+            model_version=config.embedding_model_version,
+            max_tokens=config.embedding_max_tokens,
             batch_size=config.embedding_batch_size,
             ort_variant=config.embedding_ort_variant,
         )

@@ -959,7 +959,7 @@ async def fetch_and_cache_article_bodies(
     from server import ARTICLE_BODY_CHAR_LIMIT, _fetch_article_body_with_result
 
     sem = asyncio.Semaphore(max(1, concurrency))
-    model_version = "all-MiniLM-L6-v2|mean|norm|256"
+    model_version = embedder.model_version
 
     success = [0]
     error_counts: dict[str, int] = {}

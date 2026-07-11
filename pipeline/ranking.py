@@ -28,6 +28,8 @@ from .config import (
     BQ_ARCHIVE_SOURCE,
     CH_ARCHIVE_SOURCE,
     Config,
+    DEFAULT_EMBEDDING_MAX_TOKENS,
+    DEFAULT_EMBEDDING_MODEL_VERSION,
     DEFAULT_ONNX_MODEL_DIR,
     is_hn_source,
 )
@@ -456,15 +458,26 @@ def _embedding_session_options(ort_variant: EmbeddingOrtVariant) -> ort.SessionO
 
 # Algolia Fetching
 class Embedder:
+    model_version = DEFAULT_EMBEDDING_MODEL_VERSION
+    max_tokens = DEFAULT_EMBEDDING_MAX_TOKENS
+
     def __init__(
         self,
         model_dir: str = DEFAULT_ONNX_MODEL_DIR,
         *,
+        model_version: str = DEFAULT_EMBEDDING_MODEL_VERSION,
+        max_tokens: int = DEFAULT_EMBEDDING_MAX_TOKENS,
         batch_size: int = 32,
         ort_variant: EmbeddingOrtVariant = "current",
     ) -> None:
+        if not model_version.strip():
+            raise ValueError("model_version must not be empty")
+        if max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
+        self.model_version = model_version
+        self.max_tokens = max_tokens
         self.batch_size = batch_size
         self.tokenizer: Any = AutoTokenizer.from_pretrained(model_dir)
         session_options = _embedding_session_options(ort_variant)
@@ -473,7 +486,6 @@ class Embedder:
             sess_options=session_options,
             providers=["CPUExecutionProvider"],
         )
-        self.max_tokens = 512
 
     def encode(
         self, texts: list[str], batch_size: int | None = None
@@ -541,7 +553,7 @@ def get_or_compute_embeddings(
     }
 
     ids = [s.id for s in stories]
-    model_version = "all-MiniLM-L6-v2|mean|norm|256"
+    model_version = embedder.model_version
 
     cached = db.get_embeddings_batch(ids, model_version, story_hashes)
     missing_stories = [s for s in stories if s.id not in cached]

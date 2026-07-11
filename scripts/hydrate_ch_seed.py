@@ -72,6 +72,8 @@ async def main() -> None:
     db = Database(config.db_path)
     embedder = Embedder(
         config.onnx_model_dir,
+        model_version=config.embedding_model_version,
+        max_tokens=config.embedding_max_tokens,
         batch_size=config.embedding_batch_size,
         ort_variant=config.embedding_ort_variant,
     )

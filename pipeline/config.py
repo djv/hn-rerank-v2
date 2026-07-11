@@ -29,6 +29,8 @@ class ModelConfig:
 # Shared across all worktrees of this repo (sibling to the `main` checkout)
 # so the 87MB model and secrets never need copying/symlinking per worktree.
 DEFAULT_ONNX_MODEL_DIR = "/home/dev/hn-rewrite/shared/onnx_model"
+DEFAULT_EMBEDDING_MODEL_VERSION = "all-MiniLM-L6-v2|mean|norm|512"
+DEFAULT_EMBEDDING_MAX_TOKENS = 512
 DEFAULT_ENV_PATH = "/home/dev/hn-rewrite/shared/.env"
 
 BQ_ARCHIVE_SOURCE = "bq_seed"
@@ -57,6 +59,8 @@ class Config:
     days: int = 30
     count: int = 40
     onnx_model_dir: str = DEFAULT_ONNX_MODEL_DIR
+    embedding_model_version: str = DEFAULT_EMBEDDING_MODEL_VERSION
+    embedding_max_tokens: int = DEFAULT_EMBEDDING_MAX_TOKENS
     embedding_batch_size: int = 32
     embedding_ort_variant: Literal[
         "current",
@@ -129,6 +133,10 @@ class Config:
     def __post_init__(self) -> None:
         if self.embedding_batch_size <= 0:
             raise ValueError("embedding_batch_size must be positive")
+        if not self.embedding_model_version.strip():
+            raise ValueError("embedding_model_version must not be empty")
+        if self.embedding_max_tokens <= 0:
+            raise ValueError("embedding_max_tokens must be positive")
         if self.embedding_ort_variant not in {
             "current",
             "spin_off",

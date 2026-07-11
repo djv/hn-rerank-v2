@@ -1837,7 +1837,7 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
 
                     embedder = runtime.embedder
                     if embedder is not None:
-                        model_version = "all-MiniLM-L6-v2|mean|norm|256"
+                        model_version = embedder.model_version
                         new_vec = embedder.encode([new_text])[0]
                         new_hash = hashlib.sha256(new_text.encode("utf-8")).hexdigest()
                         runtime.db.upsert_embedding(
@@ -2188,6 +2188,8 @@ def main() -> None:
 
     embedder = Embedder(
         config.onnx_model_dir,
+        model_version=config.embedding_model_version,
+        max_tokens=config.embedding_max_tokens,
         batch_size=config.embedding_batch_size,
         ort_variant=config.embedding_ort_variant,
     )
