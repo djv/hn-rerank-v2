@@ -123,6 +123,8 @@ class Config:
     feedback_per_user_window_seconds: int = 600
     feedback_global_limit: int = 2000
     feedback_global_window_seconds: int = 3600
+    dashboard_warm_vote_threshold: int = 10
+    dashboard_warm_idle_seconds: float = 3.0
     session_create_per_ip_limit: int = 60
     session_create_per_ip_window_seconds: int = 3600
     profile_link_per_ip_limit: int = 120
@@ -137,6 +139,10 @@ class Config:
             raise ValueError("embedding_model_version must not be empty")
         if self.embedding_max_tokens <= 0:
             raise ValueError("embedding_max_tokens must be positive")
+        if self.dashboard_warm_vote_threshold <= 0:
+            raise ValueError("dashboard_warm_vote_threshold must be positive")
+        if self.dashboard_warm_idle_seconds <= 0:
+            raise ValueError("dashboard_warm_idle_seconds must be positive")
         if self.embedding_ort_variant not in {
             "current",
             "spin_off",

@@ -978,7 +978,11 @@ class Handler:
     _warmup_timers: dict[int, threading.Timer] = {}
     _warmup_running_users: set[int] = set()
     _warmup_in_flight_guard = threading.Lock()
-    _WARM_DEBOUNCE_S: float = 1.0
+    _WARM_DEBOUNCE_S: float = 0.0
+    _feedback_warm_counts: dict[int, int] = {}
+    _feedback_warm_versions: dict[int, int] = {}
+    _feedback_warm_timers: dict[int, threading.Timer] = {}
+    _feedback_warm_guard = threading.Lock()
     _public_demo_limiter = FixedWindowLimiter()
 
     @classmethod
@@ -1085,6 +1089,50 @@ class Handler:
                 "dashboard_cache_invalidated user_id=%s version=%s", user_id, version
             )
             return version
+
+    @classmethod
+    def _schedule_feedback_warm(cls, user: User, version: int) -> bool:
+        """Schedule a warm at the vote threshold or after an idle pause."""
+        with cls._feedback_warm_guard:
+            user_id = user.id
+            count = cls._feedback_warm_counts.get(user_id, 0) + 1
+            cls._feedback_warm_counts[user_id] = count
+            cls._feedback_warm_versions[user_id] = version
+            previous = cls._feedback_warm_timers.pop(user_id, None)
+            if previous is not None:
+                previous.cancel()
+
+            if count >= cls.config.dashboard_warm_vote_threshold:
+                cls._feedback_warm_counts[user_id] = 0
+                cls._feedback_warm_versions.pop(user_id, None)
+                threshold_reached = True
+            else:
+                timer = threading.Timer(
+                    cls.config.dashboard_warm_idle_seconds,
+                    cls._feedback_warm_idle_fired,
+                    args=(user,),
+                )
+                timer.daemon = True
+                cls._feedback_warm_timers[user_id] = timer
+                timer.start()
+                threshold_reached = False
+
+        if threshold_reached:
+            cls._trigger_warm(user, version)
+        return threshold_reached
+
+    @classmethod
+    def _feedback_warm_idle_fired(cls, user: User) -> None:
+        with cls._feedback_warm_guard:
+            user_id = user.id
+            timer = cls._feedback_warm_timers.get(user_id)
+            if timer is not threading.current_thread():
+                return
+            cls._feedback_warm_timers.pop(user_id, None)
+            version = cls._feedback_warm_versions.pop(user_id, None)
+            cls._feedback_warm_counts[user_id] = 0
+        if version is not None:
+            cls._trigger_warm(user, version)
 
     @classmethod
     def _trigger_warm(cls, user: User, version: int) -> None:
@@ -1624,17 +1672,18 @@ def _handle_flask_feedback(runtime: type[Handler]) -> Response:
         else:
             runtime.db.upsert_feedback(user.id, story_id, action)
 
-        # Every vote invalidates and warms the next dashboard version so refillQueue
-        # cannot reintroduce a story the user has just acted on.
+        # Every vote invalidates immediately. Ranking is cadence-gated; stale
+        # cached refills remain safe because the client filters voted story IDs.
         version = runtime._invalidate_dashboard_cache(user.id)
-        runtime._trigger_warm(user, version)
+        warm_queued = runtime._schedule_feedback_warm(user, version)
         runtime.regen_event.set()
 
         return _flask_json_response(
             {
                 "ok": True,
-                "ranking_refresh_queued": True,
+                "ranking_refresh_queued": warm_queued,
                 "target_version": version,
+                "ranking_idle_seconds": runtime.config.dashboard_warm_idle_seconds,
             }
         )
     except Exception:
@@ -2062,7 +2111,8 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
             return _flask_json_response(
                 {"error": "No session"}, status=HTTPStatus.UNAUTHORIZED
             )
-        html = runtime._render_dashboard_for_user(user)
+        cached = runtime._dashboard_cache.get(f"dashboard_{user.id}")
+        html = cached[0] if cached is not None else runtime._render_dashboard_for_user(user)
         fragment = _extract_cards_fragment(html)
         response = Response(
             fragment, status=HTTPStatus.OK, content_type="text/html; charset=utf-8"

@@ -70,12 +70,20 @@ def mock_embedder() -> MockEmbedder:
 
 
 def _reset_warm_state(handler: type[Handler], debounce_s: float = 0.01) -> None:
+    for timer in getattr(handler, "_warmup_timers", {}).values():
+        timer.cancel()
+    for timer in getattr(handler, "_feedback_warm_timers", {}).values():
+        timer.cancel()
     handler._warmup_requested_versions = {}
     handler._warmup_last_request_at = {}
     handler._warmup_timers = {}
     handler._warmup_running_users = set()
     handler._warmup_in_flight_guard = threading.Lock()
     handler._WARM_DEBOUNCE_S = debounce_s
+    handler._feedback_warm_counts = {}
+    handler._feedback_warm_versions = {}
+    handler._feedback_warm_timers = {}
+    handler._feedback_warm_guard = threading.Lock()
 
 
 def _has_pending_warm(handler: type[Handler]) -> bool:
@@ -171,6 +179,12 @@ def _start_handler_server(
 
 
 def _drain_and_shutdown(server: Any, handler: type[Handler]) -> None:
+    with handler._feedback_warm_guard:
+        for timer in handler._feedback_warm_timers.values():
+            timer.cancel()
+        handler._feedback_warm_timers.clear()
+        handler._feedback_warm_counts.clear()
+        handler._feedback_warm_versions.clear()
     _drain_warms(handler)
     server.shutdown()
 
@@ -521,8 +535,9 @@ def test_feedback_post(test_env):
     assert resp.status_code == 200
     assert resp.json() == {
         "ok": True,
-        "ranking_refresh_queued": True,
+        "ranking_refresh_queued": False,
         "target_version": 1,
+        "ranking_idle_seconds": 3.0,
     }
 
     records = db.get_all_feedback(user.id)
@@ -578,15 +593,8 @@ def test_feedback_post_rejects_malformed_story_id(test_env: Any) -> None:
     assert not regen_event.is_set()
 
 
-def test_feedback_post_invalidates_cache_on_every_vote(test_env):
-    """Every vote bumps the dashboard version and triggers a warm, regardless
-    of client-supplied ``queue_remaining`` or ``refresh_ranking`` hints.
-
-    Regression: the previous "defer until queue low / every 5 votes" gating
-    left the cached HTML stale for up to ~9s per burst; the SWR stale-hit
-    path then re-injected already-voted stories via ``refillQueue`` (the bug
-    observed on 2026-06-28).
-    """
+def test_feedback_post_invalidates_cache_and_defers_warm_until_idle(test_env):
+    """A vote persists immediately while ranking waits for the idle cadence."""
     port, db, regen_event, handler, user = test_env
     db.upsert_story(
         Story(
@@ -613,12 +621,80 @@ def test_feedback_post_invalidates_cache_on_every_vote(test_env):
     assert resp.status_code == 200
     assert resp.json() == {
         "ok": True,
-        "ranking_refresh_queued": True,
+        "ranking_refresh_queued": False,
         "target_version": starting_version + 1,
+        "ranking_idle_seconds": handler.config.dashboard_warm_idle_seconds,
     }
     assert len(db.get_all_feedback(user.id)) == 1
     assert handler._dashboard_version(user.id) == starting_version + 1
     assert regen_event.is_set()
+
+
+def test_feedback_vote_threshold_queues_one_latest_warm(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    port, db, _, handler, user = test_env
+    handler.config = replace(
+        handler.config,
+        dashboard_warm_vote_threshold=10,
+        dashboard_warm_idle_seconds=60.0,
+    )
+    calls: list[tuple[int, int]] = []
+
+    def fake_trigger_warm(cls: type[Handler], warm_user: Any, version: int) -> None:
+        calls.append((warm_user.id, version))
+
+    monkeypatch.setattr(handler, "_trigger_warm", classmethod(fake_trigger_warm))
+    for story_id in range(1200, 1210):
+        db.upsert_story(
+            Story(
+                id=story_id,
+                title=f"Threshold story {story_id}",
+                url=f"https://example.com/{story_id}",
+                score=100,
+                time=1600000000,
+                text_content="Feedback body text",
+                source="hn",
+            )
+        )
+
+    responses = [
+        httpx.post(
+            f"http://127.0.0.1:{port}/api/feedback",
+            json={"story_id": story_id, "action": "neutral"},
+            cookies={"hn_token": user.token},
+        ).json()
+        for story_id in range(1200, 1210)
+    ]
+
+    assert [response["ranking_refresh_queued"] for response in responses] == [
+        False
+    ] * 9 + [True]
+    assert calls == [(user.id, 10)]
+
+
+def test_feedback_idle_threshold_queues_latest_warm(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, _, handler, user = test_env
+    handler.config = replace(
+        handler.config,
+        dashboard_warm_vote_threshold=10,
+        dashboard_warm_idle_seconds=0.02,
+    )
+    calls: list[int] = []
+    monkeypatch.setattr(
+        handler,
+        "_trigger_warm",
+        classmethod(lambda cls, warm_user, version: calls.append(version)),
+    )
+    handler._schedule_feedback_warm(user, 1)
+    time.sleep(0.01)
+    handler._schedule_feedback_warm(user, 2)
+    deadline = time.time() + 0.2
+    while not calls and time.time() < deadline:
+        time.sleep(0.005)
+    assert calls == [2]
 
 
 def test_feedback_post_limit_returns_429_without_write(test_env) -> None:
@@ -756,15 +832,16 @@ def test_feedback_post_invalidates_cache_with_low_queue(test_env):
     assert resp.status_code == 200
     assert resp.json() == {
         "ok": True,
-        "ranking_refresh_queued": True,
+        "ranking_refresh_queued": False,
         "target_version": starting_version + 1,
+        "ranking_idle_seconds": handler.config.dashboard_warm_idle_seconds,
     }
     assert handler._dashboard_version(user.id) == starting_version + 1
     assert regen_event.is_set()
 
 
 def test_feedback_post_refreshes_when_client_requests_ranking(test_env):
-    port, db, regen_event, _, user = test_env
+    port, db, regen_event, handler, user = test_env
     db.upsert_story(
         Story(
             id=1002,
@@ -792,8 +869,9 @@ def test_feedback_post_refreshes_when_client_requests_ranking(test_env):
     assert resp.status_code == 200
     assert resp.json() == {
         "ok": True,
-        "ranking_refresh_queued": True,
+        "ranking_refresh_queued": False,
         "target_version": 1,
+        "ranking_idle_seconds": handler.config.dashboard_warm_idle_seconds,
     }
     assert len(db.get_all_feedback(user.id)) == 1
     assert regen_event.is_set()
@@ -808,6 +886,7 @@ def test_feedback_post_bumps_cache_version_for_warm_rerender(test_env, monkeypat
     just-voted story into the refill queue.
     """
     port, db, _, handler, user = test_env
+    handler.config = replace(handler.config, dashboard_warm_vote_threshold=1)
 
     voted_story = Story(
         id=4242,
@@ -852,6 +931,7 @@ def test_feedback_post_bumps_cache_version_for_warm_rerender(test_env, monkeypat
         "ok": True,
         "ranking_refresh_queued": True,
         "target_version": pre_version + 1,
+        "ranking_idle_seconds": handler.config.dashboard_warm_idle_seconds,
     }
 
     post_version = handler._dashboard_version(user.id)
@@ -865,7 +945,7 @@ def test_feedback_post_bumps_cache_version_for_warm_rerender(test_env, monkeypat
 
 
 def test_feedback_clear(test_env):
-    port, db, regen_event, _, user = test_env
+    port, db, regen_event, handler, user = test_env
     db.upsert_story(
         Story(
             id=999,
@@ -894,8 +974,9 @@ def test_feedback_clear(test_env):
     assert resp.status_code == 200
     assert resp.json() == {
         "ok": True,
-        "ranking_refresh_queued": True,
+        "ranking_refresh_queued": False,
         "target_version": 1,
+        "ranking_idle_seconds": handler.config.dashboard_warm_idle_seconds,
     }
 
     assert len(db.get_all_feedback(user.id)) == 0
@@ -1929,8 +2010,9 @@ def test_flask_test_client_feedback_writes_and_queues_refresh(test_env: Any) -> 
     assert resp.status_code == 200
     assert resp.get_json() == {
         "ok": True,
-        "ranking_refresh_queued": True,
+        "ranking_refresh_queued": False,
         "target_version": 1,
+        "ranking_idle_seconds": handler.config.dashboard_warm_idle_seconds,
     }
     records = db.get_all_feedback(user.id)
     assert [(record.story_id, record.action) for record in records] == [(1710, "up")]
@@ -4014,6 +4096,7 @@ def test_setFilter_preserves_sort_age_source_refresh_behavior() -> None:
     assert "scheduleDeckRefresh({ advance: true })" in body
     assert "orderForCurrentSort()" in body
     assert "showNextCard({ allowRefresh: false })" in body
+    assert body.count("focusActiveCard()") >= 3
     assert "matchesCurrentCombo(activeCard)" in body
     assert "filterName === 'sort' && value === 'popular'" in body
     assert "currentSource === 'non-hn'" in body
@@ -4024,6 +4107,51 @@ def test_setFilter_preserves_sort_age_source_refresh_behavior() -> None:
     assert "FILTERS" in static
     assert "refillQueued" not in body
     assert "refillWhenReady" not in body
+
+
+def test_deck_actions_restore_native_focus_to_active_card() -> None:
+    """Deck-changing actions share deferred, non-scrolling card focus."""
+    template, inline_script = _read_template_and_static()
+    focus_block = inline_script.split("function focusActiveCard()", 1)[1].split(
+        "function setActiveCard", 1
+    )[0]
+    assert "activeCard?.isConnected" in focus_block
+    assert "activeCard.focus({ preventScroll: true })" in focus_block
+    assert "first-time-tip" in focus_block
+
+    set_active_block = inline_script.split("function setActiveCard", 1)[1].split(
+        "function updateVoteBar", 1
+    )[0]
+    assert "focusActiveCard()" in set_active_block
+
+    submit_block = inline_script.split("function submitVote(", 1)[1].split(
+        "function ", 1
+    )[0]
+    assert "scheduleVoteRefresh(data);\n          focusActiveCard();" in submit_block
+    assert "card.remove();\n          showNextCard();\n          focusActiveCard();" in submit_block
+    undo_block = inline_script.split("function undoLastVote()", 1)[1].split(
+        "function ", 1
+    )[0]
+    assert "scheduleVoteRefresh(data);\n        focusActiveCard();" in undo_block
+
+    key_actions = inline_script.split("const KEY_ACTIONS =", 1)[1].split(
+        "document.addEventListener('keydown'", 1
+    )[0]
+    assert "document.body.classList.toggle('fullscreen');\n        focusActiveCard();" in key_actions
+    key_action_buttons = inline_script.split(
+        "document.querySelectorAll('[data-key-action]').forEach", 1
+    )[1].split("async function fetchRefillDoc", 1)[0]
+    assert "document.body.classList.toggle('fullscreen');\n          focusActiveCard();" in key_action_buttons
+    assert "max-height: calc(100dvh - var(--vote-bar-height) - var(--page-gutter));" in template
+
+    refill_block = inline_script.split("async function refillQueue", 1)[1].split(
+        "document.querySelectorAll('[data-fb]')", 1
+    )[0]
+    assert "document.activeElement === activeCard" in refill_block
+    assert "activeCard.focus({ preventScroll: true })" in refill_block
+    assert refill_block.index("orderForCurrentSort()") < refill_block.index(
+        "activeCard.focus({ preventScroll: true })"
+    )
 
 
 def test_orderForCurrentSort_uses_shared_order_helper_for_deterministic_modes():
@@ -4153,6 +4281,30 @@ def test_deck_cards_returns_only_card_fragment(test_env) -> None:
     assert len(fragment) < len(full.text) * 0.5
 
 
+def test_deck_cards_serves_stale_cache_without_triggering_warm(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    port, _, _, handler, user = test_env
+    cached_html = b'<!--cards:start--><div data-story-id="7001"></div><!--cards:end-->'
+    handler._dashboard_cache[f"dashboard_{user.id}"] = (cached_html, time.time(), 1)
+    handler._dashboard_versions[user.id] = 2
+    calls: list[int] = []
+    monkeypatch.setattr(
+        handler,
+        "_trigger_warm",
+        classmethod(lambda cls, warm_user, version: calls.append(version)),
+    )
+
+    response = httpx.get(
+        f"http://127.0.0.1:{port}/api/deck-cards",
+        cookies={"hn_token": user.token},
+    )
+
+    assert response.status_code == 200
+    assert 'data-story-id="7001"' in response.text
+    assert calls == []
+
+
 def test_inline_script_has_voted_story_ids_filter():
     """The client-side ``votedStoryIds`` Set and the refillQueue filter are
     the defense-in-depth for the 2026-06-28 stale-fetch bug: even if a SWR
@@ -4195,17 +4347,21 @@ def test_inline_script_has_voted_story_ids_filter():
     assert "delete card.dataset.voted" in submit_catch
 
 
-def test_submitVote_schedules_ready_gated_refill_on_success() -> None:
-    """A successful vote save waits for warmed ranking HTML before refill."""
+def test_submitVote_schedules_stale_then_ready_gated_refill_on_success() -> None:
+    """A saved vote refills stale immediately and fresh after cadence warm."""
     _, inline_script = _read_template_and_static()
     submit_vote_block = inline_script.split("function submitVote(", 1)[1].split(
         "function ", 1
     )[0]
     assert "silentRefill()" not in submit_vote_block
-    assert "scheduleDeckRefresh({" in submit_vote_block
-    assert "waitForWarm: true" in submit_vote_block
-    assert "targetVersion: data.target_version" in submit_vote_block
-    assert "advance: false" in submit_vote_block
+    assert "scheduleVoteRefresh(data)" in submit_vote_block
+    refresh_block = inline_script.split("function scheduleVoteRefresh(", 1)[1].split(
+        "function ", 1
+    )[0]
+    assert "queueRefill(false)" in refresh_block
+    assert "data.ranking_refresh_queued" in refresh_block
+    assert "waitForWarm: true" in refresh_block
+    assert "data.ranking_idle_seconds" in refresh_block
     # On a failed save, the catch handler must surface a toast (not the old
     # refresh banner, which is gone).
     submit_catch = submit_vote_block.split("Network error submitting feedback", 1)[1]
@@ -4214,17 +4370,14 @@ def test_submitVote_schedules_ready_gated_refill_on_success() -> None:
     assert "refreshBanner.hidden" not in submit_catch
 
 
-def test_undoLastVote_schedules_ready_gated_refill_on_success() -> None:
-    """A successful undo waits for warmed ranking HTML before refill."""
+def test_undoLastVote_uses_vote_refresh_cadence_on_success() -> None:
+    """A successful undo uses the same stale/fresh refill cadence."""
     _, inline_script = _read_template_and_static()
     undo_block = inline_script.split("function undoLastVote()", 1)[1].split(
         "function ", 1
     )[0]
     assert "silentRefill()" not in undo_block
-    assert "scheduleDeckRefresh({" in undo_block
-    assert "waitForWarm: true" in undo_block
-    assert "targetVersion: data.target_version" in undo_block
-    assert "advance: false" in undo_block
+    assert "scheduleVoteRefresh(data)" in undo_block
     undo_catch = undo_block.split("Network error undoing feedback", 1)[1]
     assert "showToast(" in undo_catch
     assert "refreshBannerText" not in undo_catch
@@ -4613,7 +4766,7 @@ def test_on_demand_tldr_clears_failure_on_success(test_env, monkeypatch):
     updated = db.get_story(sid)
     assert updated is not None
     assert updated.article_body == "Recovered article body content here"
-    model_version = "all-MiniLM-L6-v2|mean|norm|256"
+    model_version = MockEmbedder.model_version
     text_hash = hashlib.sha256(updated.text_content.encode("utf-8")).hexdigest()
     assert db.get_embedding(sid, model_version, text_hash) is not None
 

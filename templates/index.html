@@ -106,7 +106,8 @@
       flex: 0 0 170px;
       color: var(--pico-muted-color);
       font-size: 0.8rem;
-      max-height: calc(100vh - 1.5rem);
+      max-height: calc(100vh - var(--vote-bar-height) - var(--page-gutter));
+      max-height: calc(100dvh - var(--vote-bar-height) - var(--page-gutter));
       overflow-y: auto;
       overflow-x: hidden;
       padding-right: 0.5rem;
@@ -893,6 +894,8 @@
     let warmMinVersion = null;
     let latestWarmTargetVersion = null;
     let lastScheduledWarmVersion = null;
+    let voteWarmIdleTimer = null;
+    let latestVoteTargetVersion = null;
     const VOTED_STORAGE_LIMIT = 1000;
 
     function cards() {
@@ -934,7 +937,14 @@
     }
 
     function orderCards(comparator) {
-      const cards = Array.from(document.querySelectorAll('.story-card'));
+      // Exclude the active card: it's the only visible card (the rest are
+      // display:none), so reordering it is a no-op visually but the
+      // appendChild move resets its internal scroll position (it's the
+      // element the user is actively reading/scrolling). Leaving it in
+      // place avoids that disruption; its stale DOM position only affects
+      // queuedCards() ordering, and it's removed from the queue on vote
+      // anyway.
+      const cards = Array.from(document.querySelectorAll('.story-card')).filter(card => card !== activeCard);
       cards.sort(comparator);
       cards.forEach(card => storiesContainer.appendChild(card));
     }
@@ -955,6 +965,17 @@
       setActiveCard(next);
     }
 
+    function focusActiveCard() {
+      // Let the first-time tip retain its initial focus until dismissed.
+      const tip = document.getElementById('first-time-tip');
+      if (
+        activeCard?.isConnected &&
+        (!tip || tip.hidden || !tip.contains(document.activeElement))
+      ) {
+        activeCard.focus({ preventScroll: true });
+      }
+    }
+
     function setActiveCard(card) {
       cards().forEach(c => c.classList.toggle('active', c === card));
       activeCard = card || null;
@@ -962,13 +983,7 @@
         openTldrDetail(activeCard);
         voteBar.hidden = false;
         updateVoteBar();
-        // Focus the card so native scroll keys (space, PgUp/PgDn, Home/End,
-        // arrows) target its scrollable content instead of the page body.
-        // Skip while the first-time tip owns focus so we don't steal it.
-        const tip = document.getElementById('first-time-tip');
-        if (!tip || tip.hidden || !tip.contains(document.activeElement)) {
-          activeCard.focus({ preventScroll: true });
-        }
+        focusActiveCard();
       } else {
         document.querySelectorAll('[data-fb]').forEach(btn => btn.classList.remove('active'));
         voteBar.hidden = true;
@@ -1033,6 +1048,7 @@
         }
         orderForCurrentSort();
         showNextCard({ allowRefresh: false });
+        focusActiveCard();
         scheduleDeckRefresh({ advance: true });
         scheduleIdleAgePrefetch();
         return;
@@ -1047,6 +1063,7 @@
         }
         orderForCurrentSort();
         showNextCard({ allowRefresh: false });
+        focusActiveCard();
         scheduleDeckRefresh({ advance: true });
         scheduleIdleAgePrefetch();
         return;
@@ -1069,6 +1086,7 @@
       }
       orderForCurrentSort();
       showNextCard({ allowRefresh: false });
+      focusActiveCard();
       scheduleDeckRefresh({ advance: true });
     }
 
@@ -1265,6 +1283,27 @@
       queueRefill(advance);
     }
 
+    function scheduleVoteRefresh(data) {
+      latestVoteTargetVersion = data.target_version;
+      queueRefill(false);
+      if (voteWarmIdleTimer !== null) {
+        window.clearTimeout(voteWarmIdleTimer);
+        voteWarmIdleTimer = null;
+      }
+      if (data.ranking_refresh_queued) {
+        scheduleDeckRefresh({ waitForWarm: true, targetVersion: data.target_version, advance: false });
+        return;
+      }
+      const idleMs = Number(data.ranking_idle_seconds) * 1000;
+      if (!Number.isFinite(idleMs) || idleMs <= 0) return;
+      voteWarmIdleTimer = window.setTimeout(() => {
+        voteWarmIdleTimer = null;
+        if (latestVoteTargetVersion !== null) {
+          scheduleDeckRefresh({ waitForWarm: true, targetVersion: latestVoteTargetVersion, advance: false });
+        }
+      }, idleMs);
+    }
+
     function queueRefill(advance) {
       queuedRefillAdvance = queuedRefillAdvance === null ? advance : queuedRefillAdvance || advance;
       runRefillLoop();
@@ -1374,6 +1413,7 @@
         } else if (action === 'toggle-panel') {
           sidePanel.classList.toggle('visible');
           document.body.classList.toggle('fullscreen');
+          focusActiveCard();
         } else {
           submitVote(action);
         }
@@ -1398,6 +1438,9 @@
     }
 
     async function refillQueue({ advance = true } = {}) {
+      // Reordering re-appends the active card. Preserve its native scrolling
+      // focus across that DOM move, without taking focus from a link/control.
+      const restoreActiveCardFocus = document.activeElement === activeCard;
       const newDoc = await fetchRefillDoc();
 
       cards().forEach(card => {
@@ -1428,6 +1471,9 @@
 
       applyGradient();
       orderForCurrentSort();
+      if (restoreActiveCardFocus && activeCard?.isConnected) {
+        activeCard.focus({ preventScroll: true });
+      }
       if (advance) {
         showNextCard({ allowRefresh: false });
       }
@@ -1584,16 +1630,14 @@
         if (card.dataset.voted === action) {
           card.remove();
           showNextCard();
+          focusActiveCard();
         }
       }, 150);
 
       const savePromise = enqueueFeedback(storyId, action)
         .then(data => {
-          scheduleDeckRefresh({
-            waitForWarm: true,
-            targetVersion: data.target_version,
-            advance: false,
-          });
+          scheduleVoteRefresh(data);
+          focusActiveCard();
           return data;
         })
         .catch(err => {
@@ -1635,11 +1679,8 @@
       setActiveCard(card);
 
       enqueueFeedback(storyId, 'clear').then(data => {
-        scheduleDeckRefresh({
-          waitForWarm: true,
-          targetVersion: data.target_version,
-          advance: false,
-        });
+        scheduleVoteRefresh(data);
+        focusActiveCard();
         return data;
       }).catch(err => {
         console.error('Network error undoing feedback', err);
@@ -1751,6 +1792,7 @@
         const panel = document.querySelector('.swipe-side');
         panel.classList.toggle('visible');
         document.body.classList.toggle('fullscreen');
+        focusActiveCard();
       },
     };
 
