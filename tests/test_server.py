@@ -3723,6 +3723,22 @@ def test_story_cards_emit_combo_keys_and_is_hn_attribute():
     assert "s === 'hn' || s === 'bq_seed'" not in static
 
 
+def test_story_cards_always_fill_the_story_column() -> None:
+    """All cards use the available story-column width, before enrichment."""
+    template, _ = _read_template_and_static()
+    card_css = template.split("    .story-card {", 1)[1].split("    }", 1)[0]
+    enriched_css = template.split("    .story-card.enriched {", 1)[1].split(
+        "    }", 1
+    )[0]
+
+    assert "width: 100%;" in card_css
+    assert "width: fit-content;" not in card_css
+    assert "min-width:" not in card_css
+    assert "max-width:" not in card_css
+    assert "width:" not in enriched_css
+    assert "max-width:" not in enriched_css
+
+
 def test_static_dashboard_js_has_no_jinja():
     """The inline <script> in the template is served as-is by Jinja2, so it
     must not contain Jinja2 directives."""

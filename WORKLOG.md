@@ -2,6 +2,12 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-11 — Story cards fill the story column
+
+- Replaced shrink-to-fit card sizing with `width: 100%`, so every card fills
+  the available `#stories` column before and after enrichment. The dashboard
+  shell's existing width cap and filter rail are unchanged.
+
 ## 2026-07-10 — fix: backfill Explore badge slots past feedback duplicates
 
 `canonicalize_hn_dupes` removes candidates that match a story the user has

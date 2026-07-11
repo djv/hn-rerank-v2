@@ -486,6 +486,8 @@ Vote buttons (▲ / ✓ / ▼) gain larger touch targets on mobile
 and stay inside the `.story-header`. The card area is a flex child of the
 viewport so it fills remaining vertical space and scrolls internally via
 `.story-card.active { overflow: auto; max-height: 100%; }`.
+Every `.story-card` fills the available `#stories` column width; the overall
+dashboard shell retains its 1280px cap and optional filter rail.
 
 ### 4.3 Client-side Rendering
 
