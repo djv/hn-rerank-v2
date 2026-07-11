@@ -2,6 +2,21 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-11 — fix: empty Popular/Archive deck after voting
+
+Post-vote refreshes remain non-advancing when a filtered card is visible, but
+now activate the first matching replacement when the last Popular/Archive card
+has been voted away. This removes the need to switch filters to recover an
+otherwise valid freshly ranked deck.
+
+## 2026-07-11 — fix: sort tabs advance on the first click
+
+Switching between Recommended and Date could leave the current card visible
+after the first click because both modes accepted it and the selector chose it
+again. Sort transitions now explicitly exclude the active card when selecting
+the next card, while a repeated click on the selected sort continues to cycle
+normally. Popular and Explore filtering and ordering are unchanged.
+
 ## 2026-07-11 — Story cards fill the story column
 
 - Replaced shrink-to-fit card sizing with `width: 100%`, so every card fills

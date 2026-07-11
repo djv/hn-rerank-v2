@@ -4095,7 +4095,9 @@ def test_setFilter_preserves_sort_age_source_refresh_behavior() -> None:
     body = static[idx:end]
     assert "scheduleDeckRefresh({ advance: true })" in body
     assert "orderForCurrentSort()" in body
-    assert "showNextCard({ allowRefresh: false })" in body
+    assert "showNextCard({ allowRefresh: false, excludeActive: true })" in body
+    assert "excludeActive = false" in static
+    assert "!excludeActive || card !== activeCard" in static
     assert body.count("focusActiveCard()") >= 3
     assert "matchesCurrentCombo(activeCard)" in body
     assert "filterName === 'sort' && value === 'popular'" in body
@@ -4570,13 +4572,16 @@ def test_refillQueue_reorders_deterministic_modes_only() -> None:
     )
 
 
-def test_refillQueue_advance_false_path_does_not_show_next_card() -> None:
+def test_refillQueue_activates_a_replacement_only_when_the_deck_is_empty() -> None:
+    """A non-advancing vote refill preserves an active card but recovers an
+    empty filtered deck once fresh matching cards arrive."""
     _, inline_script = _read_template_and_static()
     block = inline_script.split("async function refillQueue(", 1)[1].split(
         "function ", 1
     )[0]
     assert "advance = true" in block
-    assert "if (advance) {\n        showNextCard({ allowRefresh: false });" in block
+    assert "const needsActiveCard = activeCard === null;" in block
+    assert "if (advance || needsActiveCard) {\n        showNextCard({ allowRefresh: false });" in block
 
 
 def test_showToast_dismisses_after_3s() -> None:

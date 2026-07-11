@@ -998,8 +998,8 @@
       });
     }
 
-    function showNextCard({ allowRefresh = true } = {}) {
-      const next = queuedCards()[0];
+    function showNextCard({ allowRefresh = true, excludeActive = false } = {}) {
+      const next = queuedCards().find(card => !excludeActive || card !== activeCard);
       if (next) {
         setActiveCard(next);
         return;
@@ -1047,7 +1047,9 @@
           activeCard.classList.remove('active');
         }
         orderForCurrentSort();
-        showNextCard({ allowRefresh: false });
+        // Recommended and Date can both include the visible card. A sort
+        // change must still move to the newly ordered deck immediately.
+        showNextCard({ allowRefresh: false, excludeActive: true });
         focusActiveCard();
         scheduleDeckRefresh({ advance: true });
         scheduleIdleAgePrefetch();
@@ -1474,7 +1476,12 @@
       if (restoreActiveCardFocus && activeCard?.isConnected) {
         activeCard.focus({ preventScroll: true });
       }
-      if (advance) {
+      // Vote refreshes normally leave the visible card alone. If the last
+      // card for the active filters was voted away, though, a non-advancing
+      // fresh refill must activate the first replacement instead of leaving
+      // the deck empty until the user changes filters.
+      const needsActiveCard = activeCard === null;
+      if (advance || needsActiveCard) {
         showNextCard({ allowRefresh: false });
       }
     }
