@@ -71,14 +71,22 @@ replacement/suppression behavior, and p50/p95 `hn_dupes_ms` before/after via
 
 ### PERF-2. Stop paying a full warm per vote (S-M)
 
-**Biggest felt win, smallest diff.** A 30-swipe session currently triggers
-~30 full reranks (1s debounce, server.py `_WARM_DEBOUNCE_S`). One vote among
-thousands of feedback rows barely moves the ranking, and the client already
-suppresses `votedStoryIds` locally. Policy change in `_handle_flask_feedback`
-/ `_trigger_warm`: serve refills immediately from the *stale* ranking minus
-voted cards, and only ready-gate a real rerank every Nth vote (e.g. N=10) or
-after T seconds idle. Effect: vote→refill goes from several seconds to
-~instant for most votes, with zero model work.
+**Completed 2026-07-11 (`748d3c8`).** Feedback now invalidates the dashboard
+immediately and refills from the stale cached deck while the client suppresses
+voted story IDs. Per-user warm work is coalesced until either the configurable
+vote threshold is reached (default 10) or the configurable idle timer fires
+(default 3 seconds). The implementation preserves version/ready-gating
+semantics and is covered by threshold, idle, stale-refill, and warm-coalescing
+tests.
+
+**Biggest felt win, smallest diff.** Before this change, a 30-swipe session
+triggered ~30 full reranks (1s debounce, server.py `_WARM_DEBOUNCE_S`). One
+vote among thousands of feedback rows barely moves the ranking, and the client
+already suppresses `votedStoryIds` locally. Policy change in
+`_handle_flask_feedback` / `_trigger_warm`: serve refills immediately from the
+*stale* ranking minus voted cards, and only ready-gate a real rerank every Nth
+vote (e.g. N=10) or after T seconds idle. Effect: vote→refill goes from several
+seconds to ~instant for most votes, with zero model work.
 
 Keep it configurable (a knob, not a hard-coded "every ten votes") and test
 freshness/version semantics rather than assuming a fixed cadence. Extend the
@@ -319,8 +327,9 @@ Test event idempotency and session/card association.
 
 1. ~~O2 (metrics table)~~ — done, baseline available via `perf_report.py`.
 2. ~~O1 (backup repair + drill)~~ — done.
-3. **PERF-1** — make HN duplicate resolution local-only during warm ranking.
-4. **PERF-2** — rerank cadence / stale-deck refill policy (biggest felt win).
+3. ~~**PERF-1** — make HN duplicate resolution local-only during warm
+   ranking~~ — done.
+4. ~~**PERF-2** — rerank cadence / stale-deck refill policy~~ — done.
 5. **PERF-3** (+ **PERF-4** if substage tracing shows it matters) — precomputed
    kernel SVM, with parity and memory gates.
 6. **OPS-1** — isolate Reddit from core regeneration.

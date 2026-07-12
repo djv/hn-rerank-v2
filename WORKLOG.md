@@ -2,6 +2,13 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-12 — docs: mark PERF-2 complete in the canonical roadmap
+
+Reconciled `ROADMAP.md` with the live tree: commit `748d3c8` already shipped
+stale-deck immediate refills and configurable per-user reranking after 10 votes
+or 3 seconds idle, with version, cadence, refill, and coalescing coverage. The
+next roadmap implementation item is PERF-3.
+
 ## 2026-07-12 — db: migrate all application tables to SQLite STRICT
 
 Canonical table definitions now use SQLite `STRICT` mode and schema version 1.
