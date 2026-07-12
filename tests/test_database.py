@@ -4,7 +4,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 from hypothesis import given, strategies as st, settings, HealthCheck
-from database import Database, Story
+from database import Database, InteractionEvent, Story
+from scripts.migrate_interaction_events import migrate_database as migrate_interaction_events
 from scripts.migrate_db_to_strict import migrate_database
 
 
@@ -115,7 +116,7 @@ def test_fresh_database_uses_strict_tables_and_schema_version(tmp_path) -> None:
         ).fetchall()
         assert application_tables
         assert all(strict == 1 for _, strict in application_tables)
-        assert conn.execute("PRAGMA user_version").fetchone() == (1,)
+        assert conn.execute("PRAGMA user_version").fetchone() == (2,)
 
         with pytest.raises(sqlite3.IntegrityError, match="datatype mismatch"):
             conn.execute(
@@ -137,6 +138,82 @@ def test_database_rejects_unmigrated_flexible_schema(tmp_path: Path) -> None:
         assert conn.execute(
             "SELECT strict FROM pragma_table_list WHERE name='stories'"
         ).fetchone() == (0,)
+
+
+def test_interaction_migration_backs_up_and_is_additive(tmp_path: Path) -> None:
+    source = tmp_path / "legacy-strict.db"
+    with sqlite3.connect(source) as conn:
+        conn.execute("CREATE TABLE stories (id INTEGER PRIMARY KEY) STRICT")
+        conn.execute("INSERT INTO stories VALUES (1)")
+        conn.execute("PRAGMA user_version=1")
+
+    backup = migrate_interaction_events(source)
+
+    assert backup.exists()
+    with sqlite3.connect(source) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone() == (2,)
+        assert conn.execute(
+            "SELECT strict FROM pragma_table_list WHERE name='interaction_events'"
+        ).fetchone() == (1,)
+        assert conn.execute("SELECT COUNT(*) FROM stories").fetchone() == (1,)
+        assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+    with sqlite3.connect(backup) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone() == (1,)
+        assert conn.execute("SELECT COUNT(*) FROM stories").fetchone() == (1,)
+
+
+def test_interaction_events_are_strict_idempotent_and_isolated(db: Database) -> None:
+    db.upsert_story(
+        Story(id=501, title="Ledger story", url=None, score=1, time=1, text_content="x")
+    )
+    event = InteractionEvent(
+        event_id="11111111-1111-4111-8111-111111111111",
+        client_session_id="22222222-2222-4222-8222-222222222222",
+        user_id=7,
+        story_id=501,
+        event_type="impression",
+        dashboard_version=0,
+        position=3,
+        sort_mode="recommended",
+        age_filter="recent",
+        source_filter="mixed",
+        ranker_arm="baseline",
+        occurred_at=1_700_000_000.0,
+    )
+    assert db.insert_interaction_events([event, event]) == (1, 1)
+    assert db.insert_interaction_events([event]) == (0, 1)
+    with db.conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM interaction_events").fetchone() == (1,)
+        assert conn.execute(
+            "SELECT strict FROM pragma_table_list WHERE name='interaction_events'"
+        ).fetchone() == (1,)
+        indexes = {
+            row[1]
+            for row in conn.execute("PRAGMA index_list(interaction_events)")
+        }
+        assert "idx_interaction_events_user_time" in indexes
+        assert "idx_interaction_events_story_time" in indexes
+
+
+def test_interaction_events_reject_unknown_story_atomically(db: Database) -> None:
+    event = InteractionEvent(
+        event_id="33333333-3333-4333-8333-333333333333",
+        client_session_id="44444444-4444-4444-8444-444444444444",
+        user_id=1,
+        story_id=999999,
+        event_type="article_open",
+        dashboard_version=1,
+        position=0,
+        sort_mode="recommended",
+        age_filter="recent",
+        source_filter="mixed",
+        ranker_arm="baseline",
+        occurred_at=1_700_000_000.0,
+    )
+    with pytest.raises(ValueError, match="Unknown story IDs"):
+        db.insert_interaction_events([event])
+    with db.conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM interaction_events").fetchone() == (0,)
 
 
 def test_strict_migration_preserves_schema_and_removes_orphan_caches(

@@ -907,6 +907,23 @@
     let voteWarmIdleTimer = null;
     let latestVoteTargetVersion = null;
     const VOTED_STORAGE_LIMIT = 1000;
+    const INTERACTION_QUEUE_LIMIT = 256;
+    const INTERACTION_BATCH_SIZE = 64;
+    const clientSessionId = (() => {
+      try {
+        const key = 'hnRewrite:interactionSessionId';
+        const existing = window.sessionStorage.getItem(key);
+        if (existing) return existing;
+        const created = crypto.randomUUID();
+        window.sessionStorage.setItem(key, created);
+        return created;
+      } catch {
+        return crypto.randomUUID();
+      }
+    })();
+    const interactionEvents = [];
+    let interactionFlushInFlight = false;
+    let activeInteraction = null;
 
     function cards() {
       return Array.from(storiesContainer.querySelectorAll('.story-card'));
@@ -925,6 +942,83 @@
 
     function queuedCards() {
       return cards().filter(card => !card.dataset.voted && matchesCurrentCombo(card) && matchesCurrentAxes(card));
+    }
+
+    function newInteractionEventId() {
+      return crypto.randomUUID();
+    }
+
+    function queueInteraction(eventType, card, durationMs = null) {
+      if (!card) return;
+      const visiblePosition = queuedCards().indexOf(card);
+      const position = visiblePosition >= 0
+        ? visiblePosition
+        : Number(card.dataset.position || 0);
+      if (visiblePosition >= 0) card.dataset.position = String(visiblePosition);
+      interactionEvents.push({
+        event_id: newInteractionEventId(),
+        client_session_id: clientSessionId,
+        story_id: Number(card.dataset.storyId),
+        event_type: eventType,
+        dashboard_version: Number(card.dataset.dashboardVersion || storiesContainer?.dataset.dashboardVersion || 0),
+        position: Math.max(0, position),
+        sort_mode: currentSort,
+        age_filter: currentAge,
+        source_filter: currentSource,
+        ranker_arm: card.dataset.rankerArm || 'baseline',
+        occurred_at: Date.now() / 1000,
+        ...(durationMs === null ? {} : {duration_ms: Math.round(durationMs)})
+      });
+      while (interactionEvents.length > INTERACTION_QUEUE_LIMIT) {
+        interactionEvents.shift();
+      }
+      scheduleInteractionFlush();
+    }
+
+    function flushInteractionEvents() {
+      if (interactionFlushInFlight || interactionEvents.length === 0) return;
+      const batch = interactionEvents.slice(0, INTERACTION_BATCH_SIZE);
+      const payload = JSON.stringify({events: batch});
+      const body = new Blob([payload], {type: 'application/json'});
+      // Some privacy extensions block URL paths containing "events". Keep
+      // the ingestion contract identical, but use a neutral client path.
+      const path = apiPath('/api/interaction');
+      if (navigator.sendBeacon && navigator.sendBeacon(path, body)) {
+        interactionEvents.splice(0, batch.length);
+        if (interactionEvents.length > 0) scheduleInteractionFlush();
+        return;
+      }
+      interactionFlushInFlight = true;
+      fetch(path, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: payload,
+        keepalive: true
+      }).then(resp => {
+        if (resp.ok) interactionEvents.splice(0, batch.length);
+      }).catch(() => {
+        // Keep the bounded queue for the next activation or page lifecycle event.
+      }).finally(() => {
+        interactionFlushInFlight = false;
+        if (interactionEvents.length > 0) scheduleInteractionFlush();
+      });
+    }
+
+    function scheduleInteractionFlush() {
+      window.setTimeout(flushInteractionEvents, 0);
+    }
+
+    function beginInteraction(card, emitImpression = true) {
+      if (!card) return;
+      activeInteraction = {card, startedAt: performance.now()};
+      if (emitImpression) queueInteraction('impression', card);
+    }
+
+    function endInteraction() {
+      if (!activeInteraction) return;
+      const elapsed = Math.max(0, performance.now() - activeInteraction.startedAt);
+      queueInteraction('dwell', activeInteraction.card, elapsed);
+      activeInteraction = null;
     }
 
     // Map a story's rank position (sorted by data-score desc) to a hue.
@@ -987,9 +1081,18 @@
     }
 
     function setActiveCard(card) {
+      const changed = activeCard !== card;
+      if (changed) {
+        endInteraction();
+      }
       cards().forEach(c => c.classList.toggle('active', c === card));
       activeCard = card || null;
       if (activeCard) {
+        if (changed) {
+          beginInteraction(activeCard, true);
+        } else if (activeInteraction === null) {
+          beginInteraction(activeCard, false);
+        }
         openTldrDetail(activeCard);
         voteBar.hidden = false;
         updateVoteBar();
@@ -1002,6 +1105,19 @@
       prefetchUpcomingTldrs();
       scheduleIdleAgePrefetch();
     }
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') {
+        endInteraction();
+        flushInteractionEvents();
+      } else if (activeCard && activeInteraction === null) {
+        beginInteraction(activeCard, false);
+      }
+    });
+    window.addEventListener('pagehide', () => {
+      endInteraction();
+      flushInteractionEvents();
+    });
 
     function updateQueueLoading() {
       const refreshPending = (
@@ -1517,6 +1633,15 @@
       });
     });
 
+    storiesContainer.addEventListener('click', (e) => {
+      const link = e.target.closest('a[data-event-kind]');
+      if (link) {
+        const card = link.closest('.story-card');
+        queueInteraction(link.dataset.eventKind, card);
+        flushInteractionEvents();
+      }
+    });
+
     storiesContainer.addEventListener('click', async (e) => {
       const card = e.target.closest('.story-card');
       if (!card) {
@@ -1727,6 +1852,8 @@
       const attr = kind === 'article' ? 'articleUrl' : 'commentsUrl';
       const url = card.dataset[attr];
       if (!url) return;
+      queueInteraction(kind === 'article' ? 'article_open' : 'comments_open', card);
+      flushInteractionEvents();
       window.open(url, '_blank', 'noopener,noreferrer');
     }
 

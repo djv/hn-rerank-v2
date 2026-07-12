@@ -2037,6 +2037,90 @@ def test_flask_test_client_feedback_rejects_invalid_payload(test_env: Any) -> No
     assert not regen_event.is_set()
 
 
+def test_flask_test_client_events_require_same_origin_and_session(app_env: Any) -> None:
+    _, _, _, handler, _ = app_env
+    client = create_app(handler).test_client()
+
+    cross_site = client.post(
+        "/api/interaction",
+        json={"events": []},
+        headers={"Origin": "https://evil.example", "Host": "localhost"},
+    )
+    assert cross_site.status_code == 403
+
+    no_session = client.post("/api/interaction", json={"events": []})
+    assert no_session.status_code == 401
+    assert no_session.get_json() == {"error": "No session"}
+
+
+def test_flask_test_client_events_batch_and_replay_are_idempotent(
+    test_env: Any,
+) -> None:
+    _, db, _, handler, user = test_env
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+    db.upsert_story(
+        Story(
+            id=2710,
+            title="Ledger API story",
+            url="https://example.com/ledger-api",
+            score=10,
+            time=1600000000,
+            text_content="Ledger body",
+            source="hn",
+        )
+    )
+    event = {
+        "event_id": "55555555-5555-4555-8555-555555555555",
+        "client_session_id": "66666666-6666-4666-8666-666666666666",
+        "story_id": 2710,
+        "event_type": "impression",
+        "dashboard_version": 0,
+        "position": 0,
+        "sort_mode": "recommended",
+        "age_filter": "recent",
+        "source_filter": "mixed",
+        "ranker_arm": "baseline",
+        "occurred_at": 1_700_000_000.0,
+    }
+
+    first = client.post("/api/interaction", json={"events": [event, event]})
+    replay = client.post("/api/interaction", json={"events": [event]})
+
+    assert first.status_code == 200
+    assert first.get_json() == {"ok": True, "inserted": 1, "duplicates": 1}
+    assert replay.status_code == 200
+    assert replay.get_json() == {"ok": True, "inserted": 0, "duplicates": 1}
+    with db.conn() as conn:
+        assert conn.execute(
+            "SELECT user_id, story_id, event_type FROM interaction_events"
+        ).fetchall() == [(user.id, 2710, "impression")]
+
+
+def test_flask_test_client_events_reject_invalid_batch_atomically(test_env: Any) -> None:
+    _, db, _, handler, user = test_env
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+    invalid = {
+        "event_id": "77777777-7777-4777-8777-777777777777",
+        "client_session_id": "88888888-8888-4888-8888-888888888888",
+        "story_id": 999999,
+        "event_type": "impression",
+        "dashboard_version": 0,
+        "position": 0,
+        "sort_mode": "recommended",
+        "age_filter": "recent",
+        "source_filter": "mixed",
+        "ranker_arm": "baseline",
+        "occurred_at": 1_700_000_000.0,
+    }
+    response = client.post("/api/interaction", json={"events": [invalid]})
+    assert response.status_code == 400
+    assert "Unknown story IDs" in response.get_json()["error"]
+    with db.conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM interaction_events").fetchone() == (0,)
+
+
 def test_flask_test_client_feedback_limit_sets_retry_after(test_env: Any) -> None:
     _, db, regen_event, handler, user = test_env
     handler.config = replace(
@@ -3805,6 +3889,21 @@ def test_story_cards_emit_combo_keys_and_is_hn_attribute():
     assert "card.dataset.combo" in static
     assert "s.startsWith('rss_')" not in static
     assert "s === 'hn' || s === 'bq_seed'" not in static
+
+
+def test_story_cards_emit_interaction_dimensions_and_explicit_event_hooks() -> None:
+    template, static = _read_template_and_static()
+    assert 'data-position="{{ card.position }}"' in template
+    assert 'data-dashboard-version="{{ dashboard_version or 0 }}"' in template
+    assert 'data-ranker-arm="baseline"' in template
+    assert 'data-event-kind="comments_open"' in template
+    assert "queueInteraction('impression'" in static
+    assert "queueInteraction('dwell'" in static
+    assert "navigator.sendBeacon" in static
+    assert "apiPath('/api/interaction')" in static
+    assert "data-event-kind" in static
+    assert "openTldrDetail" in static
+    assert "queueInteraction('tldr" not in static
 
 
 def test_story_cards_always_fill_the_story_column() -> None:

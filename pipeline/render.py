@@ -56,6 +56,7 @@ class VoteCountsView:
 class DashboardCardView:
     story: Story
     score: float
+    position: int
     best_match_title: str
     badges: tuple[BadgeView, ...]
     combo_keys: str
@@ -217,12 +218,13 @@ def _build_dashboard_cards(
     ranked: list[RankedStory], *, hot_badge_percentile: int
 ) -> list[DashboardCardView]:
     cards: list[DashboardCardView] = []
-    for item in ranked:
+    for position, item in enumerate(ranked):
         story = item.story
         cards.append(
             DashboardCardView(
                 story=story,
                 score=item.score,
+                position=position,
                 best_match_title=item.best_match_title,
                 badges=_build_badges(item, hot_badge_percentile=hot_badge_percentile),
                 combo_keys=item.combo_keys,

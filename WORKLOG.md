@@ -6848,6 +6848,28 @@ fixed short length regardless of how much source material existed.
   metadata, and restart-safe limiter circuit cooldowns. No story, feedback, or
   cache data was deleted.
 
+## 2026-07-12 — Explicit interaction measurement ledger
+
+- Added schema version 2's additive STRICT `interaction_events` table and
+  `Database.insert_interaction_events()` with UUID idempotency and story-ID
+  validation. Events intentionally do not foreign-key stories so retention
+  pruning cannot delete or block historical telemetry.
+- Added authenticated, same-origin `POST /api/events` with all-or-nothing
+  validation, a 64-event batch cap, and public-demo request limiting.
+- Instrumented the deck for impression/dwell intervals and explicit article or
+  comments opens. TLDR prefetch and automatic enrichment remain untracked.
+- Added `scripts/migrate_interaction_events.py`, which refuses a running
+  service, creates a consistent integrity-checked backup, and verifies the
+  migrated database. Live activation is a separate operational step.
+
+## 2026-07-12 — Use a blocker-resistant interaction endpoint
+
+- Changed the browser beacon endpoint from `/api/events` to
+  `/api/interaction` after the live public demo's privacy blocker rejected
+  requests containing `events` with `ERR_BLOCKED_BY_CLIENT`.
+- Removed the old `/api/events` route rather than retaining a compatibility
+  alias, so all client, server, test, and documentation paths use the neutral
+  endpoint consistently.
 ## 2026-07-12 — add bounded embedding memory instrumentation
 
 `Embedder.encode()` now emits one `embedding_perf` summary per non-empty call

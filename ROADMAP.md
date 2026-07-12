@@ -36,6 +36,13 @@ fable lacked) — into one canonical roadmap, deduped and re-numbered. Merged
   Reddit circuit are all already in journalctl or directly queryable in the
   DB; a live status endpoint only pays off with an external poller, and none
   exists here. See WORKLOG.md 2026-07-10.
+- ✅ **Interaction measurement ledger** — 2026-07-12. Added additive STRICT
+  schema v2, idempotent `POST /api/interaction`, bounded client batching,
+  explicit impression/dwell/link telemetry, and backup-verified migration
+  tooling. The neutral client path avoids privacy extensions that block URLs
+  containing "events". The ledger is observation-only: ranking, regeneration,
+  TLDR behavior, and source selection are unchanged. Analysis and experiment
+  assignment remain follow-up work.
 
 ---
 

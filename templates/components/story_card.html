@@ -2,6 +2,9 @@
          tabindex="-1"
          data-combo="{{ card.combo_keys }}"
          data-story-id="{{ card.story.id }}"
+         data-position="{{ card.position }}"
+         data-dashboard-version="{{ dashboard_version or 0 }}"
+         data-ranker-arm="baseline"
          data-score="{{ card.score }}"
          data-time="{{ card.story.time }}"
          data-story-source="{{ card.story.source }}"
@@ -27,14 +30,16 @@
     <span>{{ card.time_ago }}</span>
 
     {% if card.comments_url %}
-    <a href="{{ card.comments_url }}" target="_blank" rel="noopener">
+    <a href="{{ card.comments_url }}" data-event-kind="comments_open" target="_blank" rel="noopener">
       💬{% if card.story.comment_count is not none %} {{ card.story.comment_count }}{% endif %} comments
     </a>
     {% endif %}
   </div>
 
   <h2 class="story-title">
-    <a href="{{ card.article_url or card.comments_url }}" target="_blank" rel="noopener">
+    <a href="{{ card.article_url or card.comments_url }}"
+       data-event-kind="{{ 'article_open' if card.article_url else 'comments_open' }}"
+       target="_blank" rel="noopener">
       {{ card.story.title }}
     </a>
   </h2>

@@ -515,6 +515,24 @@ dashboard shell retains its 1280px cap and optional filter rail.
 ### 4.3 Client-side Rendering
 
 The raw Markdown response is formatted on the fly using a robust, line-by-line parser (`parseSimpleMarkdown`) to render headers, bold text, and lists safely.
+
+### 4.4 Interaction ledger
+
+The browser records only explicit deck interactions: card impressions, dwell
+intervals, article opens, and comments opens. Events are batched in memory and
+sent to same-origin `POST /api/interaction` with `navigator.sendBeacon` (falling
+back to a keepalive fetch). The neutral path avoids privacy extensions that
+block URLs containing "events". Each event carries a browser-session UUID, user
+identity from the HTTP-only cookie, story ID, visible position, dashboard
+version, current sort/age/source filters, and the active ranker arm. TLDR
+prefetches and automatic card enrichment do not generate interaction events.
+
+SQLite stores events indefinitely in the additive STRICT `interaction_events`
+table (schema version 2). Event UUIDs make retries idempotent; story IDs are
+validated at ingestion but are not foreign keys, so later story pruning cannot
+erase historical exposure data or block retention maintenance. The migration
+script creates a consistent backup and verifies integrity before and after the
+schema change.
 ## Asynchronous Reddit refresh
 
 Core regeneration publishes ClickHouse/HN and ordinary RSS candidates without

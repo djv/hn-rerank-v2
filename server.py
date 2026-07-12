@@ -13,12 +13,14 @@ import secrets
 import sys
 import threading
 import time
+import math
+import uuid
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from http import HTTPStatus
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 from urllib.parse import urlparse, urlunparse
 
 import feedparser
@@ -29,7 +31,14 @@ from flask import Flask, Response, jsonify, redirect, request
 from flask.typing import ResponseReturnValue
 import httpx
 
-from database import Database, RankPerfSample, Story, User
+from database import (
+    Database,
+    InteractionEvent,
+    InteractionEventType,
+    RankPerfSample,
+    Story,
+    User,
+)
 from pipeline import Config, DEFAULT_ENV_PATH, Embedder, RankedStory, is_hn_source
 from llm_limiter import limiter as llm_limiter
 from reddit_limiter import limiter as reddit_limiter
@@ -412,6 +421,9 @@ def _is_low_signal_reddit_comment(author: str, text: str) -> bool:
 
 LESSWRONG_COMMENT_LIMIT = 20
 MAX_CONTENT_LENGTH = 10**6  # 1MB cap on POST bodies
+MAX_INTERACTION_EVENTS = 64
+INTERACTION_EVENT_REQUESTS_PER_MINUTE = 120
+INTERACTION_EVENT_GLOBAL_REQUESTS_PER_MINUTE = 10_000
 
 
 def _extract_lesswrong_post_id(url: str | None) -> str | None:
@@ -1595,6 +1607,25 @@ def _acquire_feedback_quota(runtime: type[Handler], user: User) -> RateLimitResu
     )
 
 
+def _acquire_interaction_event_quota(
+    runtime: type[Handler], user: User
+) -> RateLimitResult:
+    return runtime._public_demo_limiter.try_acquire(
+        (
+            (
+                f"events:user:{user.id}",
+                INTERACTION_EVENT_REQUESTS_PER_MINUTE,
+                60,
+            ),
+            (
+                "events:global",
+                INTERACTION_EVENT_GLOBAL_REQUESTS_PER_MINUTE,
+                60,
+            ),
+        )
+    )
+
+
 def _flask_session_limit_key(user: User | None) -> str:
     if user is not None:
         return f"user:{user.id}"
@@ -1688,6 +1719,167 @@ def _handle_flask_feedback(runtime: type[Handler]) -> Response:
         )
     except Exception:
         logging.exception("Error handling feedback")
+        return _flask_json_response(
+            {"error": "Internal error"}, status=HTTPStatus.INTERNAL_SERVER_ERROR
+        )
+
+
+def _handle_flask_interaction_events(runtime: type[Handler]) -> Response:
+    user = _flask_user(runtime)
+    if not user:
+        return _flask_json_response(
+            {"error": "No session"}, status=HTTPStatus.UNAUTHORIZED
+        )
+
+    try:
+        body = request.get_data(cache=True)
+        if len(body) > MAX_CONTENT_LENGTH:
+            return _flask_text_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            return _flask_json_response(
+                {"error": "Invalid JSON body"}, status=HTTPStatus.BAD_REQUEST
+            )
+        if not isinstance(data, dict) or set(data) != {"events"}:
+            return _flask_json_response(
+                {"error": "Expected an events envelope"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+        raw_events = data["events"]
+        if (
+            not isinstance(raw_events, list)
+            or not raw_events
+            or len(raw_events) > MAX_INTERACTION_EVENTS
+        ):
+            return _flask_json_response(
+                {"error": f"events must contain 1-{MAX_INTERACTION_EVENTS} items"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+
+        event_types = {"impression", "article_open", "comments_open", "dwell"}
+        events: list[InteractionEvent] = []
+        for raw_event in raw_events:
+            if not isinstance(raw_event, dict):
+                raise ValueError("each event must be an object")
+            required = {
+                "event_id",
+                "client_session_id",
+                "story_id",
+                "event_type",
+                "dashboard_version",
+                "position",
+                "sort_mode",
+                "age_filter",
+                "source_filter",
+                "ranker_arm",
+                "occurred_at",
+            }
+            if not required.issubset(raw_event) or bool(
+                set(raw_event) - (required | {"duration_ms"})
+            ):
+                raise ValueError("event has unexpected or missing fields")
+
+            event_id = raw_event["event_id"]
+            client_session_id = raw_event["client_session_id"]
+            if not isinstance(event_id, str) or len(event_id) > 64:
+                raise ValueError("event_id must be a short string")
+            if not isinstance(client_session_id, str) or len(client_session_id) > 128:
+                raise ValueError("client_session_id must be a short string")
+            try:
+                uuid.UUID(event_id)
+                uuid.UUID(client_session_id)
+            except (ValueError, AttributeError, TypeError) as exc:
+                raise ValueError("event IDs must be UUIDs") from exc
+
+            story_id = raw_event["story_id"]
+            dashboard_version = raw_event["dashboard_version"]
+            position = raw_event["position"]
+            if (
+                not isinstance(story_id, int)
+                or isinstance(story_id, bool)
+                or story_id <= 0
+                or not isinstance(dashboard_version, int)
+                or isinstance(dashboard_version, bool)
+                or dashboard_version < 0
+                or not isinstance(position, int)
+                or isinstance(position, bool)
+                or position < 0
+            ):
+                raise ValueError("story_id, dashboard_version, and position are invalid")
+
+            event_type = raw_event["event_type"]
+            if not isinstance(event_type, str) or event_type not in event_types:
+                raise ValueError("unknown event_type")
+            occurred_at = raw_event["occurred_at"]
+            if (
+                not isinstance(occurred_at, (int, float))
+                or isinstance(occurred_at, bool)
+                or not math.isfinite(float(occurred_at))
+                or float(occurred_at) <= 0
+            ):
+                raise ValueError("occurred_at must be a finite timestamp")
+
+            dimensions = tuple(
+                raw_event[name]
+                for name in ("sort_mode", "age_filter", "source_filter", "ranker_arm")
+            )
+            if any(
+                not isinstance(value, str) or not value or len(value) > 64
+                for value in dimensions
+            ):
+                raise ValueError("event dimensions must be short strings")
+            sort_mode, age_filter, source_filter, ranker_arm = cast(
+                tuple[str, str, str, str], dimensions
+            )
+
+            duration_ms = raw_event.get("duration_ms")
+            if duration_ms is not None and (
+                not isinstance(duration_ms, int)
+                or isinstance(duration_ms, bool)
+                or duration_ms < 0
+                or duration_ms > 86_400_000
+            ):
+                raise ValueError("duration_ms is invalid")
+            if event_type == "dwell" and duration_ms is None:
+                raise ValueError("dwell events require duration_ms")
+            if event_type != "dwell" and duration_ms is not None:
+                raise ValueError("only dwell events may include duration_ms")
+
+            events.append(
+                InteractionEvent(
+                    event_id=event_id,
+                    client_session_id=client_session_id,
+                    user_id=user.id,
+                    story_id=story_id,
+                    event_type=cast(InteractionEventType, event_type),
+                    dashboard_version=dashboard_version,
+                    position=position,
+                    sort_mode=sort_mode,
+                    age_filter=age_filter,
+                    source_filter=source_filter,
+                    ranker_arm=ranker_arm,
+                    occurred_at=float(occurred_at),
+                    duration_ms=duration_ms,
+                )
+            )
+
+        quota = _acquire_interaction_event_quota(runtime, user)
+        if not quota.allowed:
+            return _flask_rate_limit_response(
+                "Too many interaction events. Please try again later.",
+                quota.retry_after_seconds,
+            )
+        inserted, duplicates = runtime.db.insert_interaction_events(events)
+        return _flask_json_response(
+            {"ok": True, "inserted": inserted, "duplicates": duplicates}
+        )
+    except ValueError as exc:
+        return _flask_json_response(
+            {"error": str(exc)}, status=HTTPStatus.BAD_REQUEST
+        )
+    except Exception:
+        logging.exception("Error handling interaction events")
         return _flask_json_response(
             {"error": "Internal error"}, status=HTTPStatus.INTERNAL_SERVER_ERROR
         )
@@ -2151,6 +2343,13 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
             return cross_site_response
         return _handle_flask_feedback(runtime)
 
+    @app.route("/api/interaction", methods=["POST"], provide_automatic_options=False)
+    def interaction_events() -> ResponseReturnValue:
+        cross_site_response = _flask_cross_site_post_response()
+        if cross_site_response is not None:
+            return cross_site_response
+        return _handle_flask_interaction_events(runtime)
+
     @app.route("/api/tldr-detail", methods=["POST"], provide_automatic_options=False)
     def tldr_detail() -> ResponseReturnValue:
         cross_site_response = _flask_cross_site_post_response()
@@ -2159,6 +2358,7 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
         return _handle_flask_tldr_detail(runtime)
 
     @app.route("/api/feedback", methods=["OPTIONS"])
+    @app.route("/api/interaction", methods=["OPTIONS"])
     @app.route("/api/tldr-detail", methods=["OPTIONS"])
     def api_options() -> Response:
         response = Response(status=HTTPStatus.NO_CONTENT)

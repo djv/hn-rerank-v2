@@ -15,7 +15,10 @@ from numpy.typing import NDArray
 
 Action: TypeAlias = Literal["up", "neutral", "down"]
 HnDupeStatus: TypeAlias = Literal["canonical", "no_match", "retry"]
-STRICT_SCHEMA_VERSION = 1
+InteractionEventType: TypeAlias = Literal[
+    "impression", "article_open", "comments_open", "dwell"
+]
+STRICT_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -78,6 +81,25 @@ class RankPerfSample:
     model_cache: str
     stories: int
     fields: dict[str, int | float | str]
+
+
+@dataclass(frozen=True)
+class InteractionEvent:
+    """One explicit client interaction, normalized at the HTTP boundary."""
+
+    event_id: str
+    client_session_id: str
+    user_id: int
+    story_id: int
+    event_type: InteractionEventType
+    dashboard_version: int
+    position: int
+    sort_mode: str
+    age_filter: str
+    source_filter: str
+    ranker_arm: str
+    occurred_at: float
+    duration_ms: int | None = None
 
 
 @dataclass(frozen=True)
@@ -266,6 +288,38 @@ class Database:
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_rank_perf_recorded_at "
                     "ON rank_perf(recorded_at)"
+                )
+
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS interaction_events (
+                        event_id           TEXT PRIMARY KEY,
+                        client_session_id  TEXT NOT NULL,
+                        user_id             INTEGER NOT NULL,
+                        story_id            INTEGER NOT NULL,
+                        event_type         TEXT NOT NULL CHECK(
+                            event_type IN ('impression', 'article_open',
+                                           'comments_open', 'dwell')
+                        ),
+                        dashboard_version  INTEGER NOT NULL CHECK(dashboard_version >= 0),
+                        position            INTEGER NOT NULL CHECK(position >= 0),
+                        sort_mode           TEXT NOT NULL,
+                        age_filter          TEXT NOT NULL,
+                        source_filter       TEXT NOT NULL,
+                        ranker_arm          TEXT NOT NULL,
+                        occurred_at         REAL NOT NULL,
+                        duration_ms         INTEGER CHECK(
+                            duration_ms IS NULL OR duration_ms >= 0
+                        ),
+                        received_at         REAL NOT NULL
+                    ) STRICT
+                """)
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_interaction_events_user_time "
+                    "ON interaction_events(user_id, occurred_at)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_interaction_events_story_time "
+                    "ON interaction_events(story_id, occurred_at)"
                 )
 
                 conn.execute("""
@@ -1069,6 +1123,77 @@ class Database:
                         json.dumps(sample.fields),
                     ),
                 )
+
+    def insert_interaction_events(
+        self, events: list[InteractionEvent]
+    ) -> tuple[int, int]:
+        """Insert a batch of events and return ``(inserted, duplicates)``.
+
+        Event IDs are the idempotency key.  Story IDs are checked only for
+        new events; replaying an event remains a no-op even if its story has
+        since been pruned from the story corpus.
+        """
+        if not events:
+            return 0, 0
+        with self.conn() as conn:
+            with conn:
+                event_ids = [event.event_id for event in events]
+                placeholders = ",".join("?" for _ in event_ids)
+                existing_rows = conn.execute(
+                    "SELECT event_id FROM interaction_events "
+                    f"WHERE event_id IN ({placeholders})",
+                    event_ids,
+                ).fetchall()
+                existing_ids = {str(row[0]) for row in existing_rows}
+                new_story_ids = {
+                    event.story_id
+                    for event in events
+                    if event.event_id not in existing_ids
+                }
+                if new_story_ids:
+                    story_placeholders = ",".join("?" for _ in new_story_ids)
+                    story_rows = conn.execute(
+                        "SELECT id FROM stories "
+                        f"WHERE id IN ({story_placeholders})",
+                        tuple(new_story_ids),
+                    ).fetchall()
+                    known_story_ids = {int(row[0]) for row in story_rows}
+                    missing = sorted(new_story_ids - known_story_ids)
+                    if missing:
+                        raise ValueError(f"Unknown story IDs: {missing[:10]}")
+
+                received_at = time.time()
+                inserted = 0
+                for event in events:
+                    cursor = conn.execute(
+                        """
+                        INSERT INTO interaction_events (
+                            event_id, client_session_id, user_id, story_id,
+                            event_type, dashboard_version, position, sort_mode,
+                            age_filter, source_filter, ranker_arm, occurred_at,
+                            duration_ms, received_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(event_id) DO NOTHING
+                        """,
+                        (
+                            event.event_id,
+                            event.client_session_id,
+                            event.user_id,
+                            event.story_id,
+                            event.event_type,
+                            event.dashboard_version,
+                            event.position,
+                            event.sort_mode,
+                            event.age_filter,
+                            event.source_filter,
+                            event.ranker_arm,
+                            event.occurred_at,
+                            event.duration_ms,
+                            received_at,
+                        ),
+                    )
+                    inserted += cursor.rowcount
+                return inserted, len(events) - inserted
 
     # Article fetch failure memory
     def get_article_fetch_failure(self, story_id: int) -> dict | None:
