@@ -15,6 +15,7 @@ from numpy.typing import NDArray
 
 Action: TypeAlias = Literal["up", "neutral", "down"]
 HnDupeStatus: TypeAlias = Literal["canonical", "no_match", "retry"]
+STRICT_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -110,7 +111,12 @@ class Database:
             conn.execute("PRAGMA busy_timeout=5000")
             self._pool.put(conn)
         if not read_only:
-            self._create_tables()
+            try:
+                self._assert_schema_compatible()
+                self._create_tables()
+            except Exception:
+                self.close()
+                raise
 
     @contextmanager
     def conn(self) -> Generator[sqlite3.Connection, None, None]:
@@ -119,6 +125,24 @@ class Database:
             yield conn
         finally:
             self._pool.put(conn)
+
+    def _assert_schema_compatible(self) -> None:
+        with self.conn() as conn:
+            tables = conn.execute(
+                "SELECT name, strict FROM pragma_table_list "
+                "WHERE schema='main' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+            if not tables:
+                return
+            non_strict = [str(name) for name, strict in tables if strict != 1]
+            version_row = conn.execute("PRAGMA user_version").fetchone()
+            version = int(version_row[0]) if version_row else 0
+            if non_strict or version != STRICT_SCHEMA_VERSION:
+                raise RuntimeError(
+                    "Database schema requires explicit STRICT migration; run "
+                    "`uv run python scripts/migrate_db_to_strict.py` while the "
+                    f"service is stopped (version={version}, non_strict={non_strict})"
+                )
 
     def _create_tables(self) -> None:
         with self.conn() as conn:
@@ -139,7 +163,7 @@ class Database:
                         self_text      TEXT NOT NULL DEFAULT '',
                         top_comments   TEXT NOT NULL DEFAULT '',
                         article_body   TEXT NOT NULL DEFAULT ''
-                    )
+                    ) STRICT
                 """)
                 cursor = conn.execute("PRAGMA table_info(stories)")
                 columns = {row[1] for row in cursor.fetchall()}
@@ -172,7 +196,7 @@ class Database:
                         text_hash     TEXT NOT NULL DEFAULT '',
                         embedding     BLOB NOT NULL,
                         FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE
-                    )
+                    ) STRICT
                 """)
                 cursor = conn.execute("PRAGMA table_info(embeddings)")
                 emb_columns = {row[1] for row in cursor.fetchall()}
@@ -189,7 +213,7 @@ class Database:
                         created_at  REAL NOT NULL,
                         PRIMARY KEY (story_id, cache_key),
                         FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE
-                    )
+                    ) STRICT
                 """)
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_tldr_cache_story ON tldr_cache(story_id)"
@@ -206,7 +230,7 @@ class Database:
                         next_retry_at  REAL NOT NULL DEFAULT 0,
                         updated_at     REAL NOT NULL,
                         FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE
-                    )
+                    ) STRICT
                 """)
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_article_fetch_failures_url "
@@ -226,7 +250,7 @@ class Database:
                         model_cache     TEXT NOT NULL,
                         stories         INTEGER NOT NULL,
                         fields_json     TEXT NOT NULL
-                    )
+                    ) STRICT
                 """)
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_rank_perf_recorded_at "
@@ -244,7 +268,7 @@ class Database:
                         last_error TEXT NOT NULL DEFAULT '',
                         FOREIGN KEY (source_story_id) REFERENCES stories(id) ON DELETE CASCADE,
                         FOREIGN KEY (canonical_story_id) REFERENCES stories(id) ON DELETE SET NULL
-                    )
+                    ) STRICT
                 """)
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_hn_dupe_resolutions_due "
@@ -273,7 +297,7 @@ class Database:
                         id          INTEGER PRIMARY KEY,
                         token       TEXT UNIQUE NOT NULL,
                         created_at  REAL NOT NULL
-                    )
+                    ) STRICT
                 """)
 
                 # Multi-user feedback migration
@@ -293,7 +317,7 @@ class Database:
                                 updated_at  REAL NOT NULL,
                                 PRIMARY KEY (user_id, story_id),
                                 FOREIGN KEY (story_id) REFERENCES stories(id)
-                            )
+                            ) STRICT
                         """)
                         conn.execute(
                             "INSERT OR IGNORE INTO users (id, token, created_at) VALUES (1, 'default', ?)",
@@ -318,7 +342,7 @@ class Database:
                                 updated_at  REAL NOT NULL,
                                 PRIMARY KEY (user_id, story_id),
                                 FOREIGN KEY (story_id) REFERENCES stories(id)
-                            )
+                            ) STRICT
                         """)
                         conn.execute(
                             "INSERT OR IGNORE INTO users (id, token, created_at) VALUES (1, 'default', ?)",
@@ -343,8 +367,10 @@ class Database:
                             updated_at  REAL NOT NULL,
                             PRIMARY KEY (user_id, story_id),
                             FOREIGN KEY (story_id) REFERENCES stories(id)
-                        )
+                        ) STRICT
                     """)
+
+                conn.execute(f"PRAGMA user_version={STRICT_SCHEMA_VERSION}")
 
     def close(self) -> None:
         while not self._pool.empty():

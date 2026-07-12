@@ -2,6 +2,15 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-12 — db: migrate all application tables to SQLite STRICT
+
+Canonical table definitions now use SQLite `STRICT` mode and schema version 1.
+The explicit `scripts/migrate_db_to_strict.py` workflow copies into a validated
+sibling database, preserves the original for rollback, and removes orphaned
+embedding/TLDR cache rows only with an explicit flag. The production conversion
+removed 444 orphaned embeddings and 10 orphaned TLDR rows discovered by the
+preflight foreign-key audit; no source stories or feedback rows were removed.
+
 ## 2026-07-11 — ux: show refill state for an empty filtered queue
 
 The dashboard now displays “Loading more stories…” while no card matches the

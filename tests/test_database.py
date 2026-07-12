@@ -1,9 +1,11 @@
 import time
 import sqlite3
+from pathlib import Path
 import numpy as np
 import pytest
 from hypothesis import given, strategies as st, settings, HealthCheck
 from database import Database, Story
+from scripts.migrate_db_to_strict import migrate_database
 
 
 @pytest.fixture
@@ -99,6 +101,115 @@ def test_read_only_database_opens_existing_db_without_writes(tmp_path) -> None:
             )
     finally:
         readonly.close()
+
+
+def test_fresh_database_uses_strict_tables_and_schema_version(tmp_path) -> None:
+    db_path = tmp_path / "strict.db"
+    database = Database(str(db_path))
+    database.close()
+
+    with sqlite3.connect(db_path) as conn:
+        application_tables = conn.execute(
+            "SELECT name, strict FROM pragma_table_list "
+            "WHERE schema='main' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        assert application_tables
+        assert all(strict == 1 for _, strict in application_tables)
+        assert conn.execute("PRAGMA user_version").fetchone() == (1,)
+
+        with pytest.raises(sqlite3.IntegrityError, match="datatype mismatch"):
+            conn.execute(
+                "INSERT INTO stories "
+                "(id, title, score, time, text_content, source, fetched_at) "
+                "VALUES ('not-an-id', 'Title', 1, 1, 'Text', 'hn', 1.0)"
+            )
+
+
+def test_database_rejects_unmigrated_flexible_schema(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE stories (id INTEGER PRIMARY KEY)")
+
+    with pytest.raises(RuntimeError, match="explicit STRICT migration"):
+        Database(str(db_path))
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone() == (0,)
+        assert conn.execute(
+            "SELECT strict FROM pragma_table_list WHERE name='stories'"
+        ).fetchone() == (0,)
+
+
+def test_strict_migration_preserves_schema_and_removes_orphan_caches(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "legacy.db"
+    destination = tmp_path / "strict.db"
+    with sqlite3.connect(source) as conn:
+        conn.executescript(
+            """
+            PRAGMA foreign_keys=OFF;
+            CREATE TABLE stories (id INTEGER PRIMARY KEY, title TEXT NOT NULL);
+            CREATE TABLE embeddings (
+                story_id INTEGER PRIMARY KEY,
+                embedding BLOB NOT NULL,
+                FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE
+            );
+            CREATE TABLE tldr_cache (
+                story_id INTEGER NOT NULL,
+                cache_key TEXT NOT NULL,
+                PRIMARY KEY (story_id, cache_key),
+                FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE
+            );
+            CREATE INDEX idx_story_title ON stories(title);
+            INSERT INTO stories VALUES (1, 'kept');
+            INSERT INTO embeddings VALUES (1, X'0102');
+            INSERT INTO embeddings VALUES (2, X'0304');
+            INSERT INTO tldr_cache VALUES (1, 'kept');
+            INSERT INTO tldr_cache VALUES (3, 'orphan');
+            """
+        )
+
+    result = migrate_database(source, destination, remove_orphan_caches=True)
+
+    assert result.removed_orphans == {"embeddings": 1, "tldr_cache": 1}
+    with sqlite3.connect(source) as conn:
+        assert conn.execute("SELECT count(*) FROM embeddings").fetchone() == (2,)
+        assert conn.execute("SELECT count(*) FROM tldr_cache").fetchone() == (2,)
+    with sqlite3.connect(destination) as conn:
+        assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert conn.execute("SELECT count(*) FROM embeddings").fetchone() == (1,)
+        assert conn.execute("SELECT count(*) FROM tldr_cache").fetchone() == (1,)
+        assert conn.execute(
+            "SELECT strict FROM pragma_table_list WHERE name='stories'"
+        ).fetchone() == (1,)
+        assert conn.execute(
+            "SELECT count(*) FROM sqlite_schema WHERE name='idx_story_title'"
+        ).fetchone() == (1,)
+
+
+def test_strict_migration_refuses_orphans_without_explicit_permission(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "legacy.db"
+    destination = tmp_path / "strict.db"
+    with sqlite3.connect(source) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE stories (id INTEGER PRIMARY KEY);
+            CREATE TABLE embeddings (
+                story_id INTEGER PRIMARY KEY,
+                FOREIGN KEY (story_id) REFERENCES stories(id)
+            );
+            PRAGMA foreign_keys=OFF;
+            INSERT INTO embeddings VALUES (99);
+            """
+        )
+
+    with pytest.raises(RuntimeError, match="--remove-orphan-caches"):
+        migrate_database(source, destination, remove_orphan_caches=False)
+    assert source.exists()
+    assert not destination.exists()
 
 
 def test_archive_score_time_index_created(db: Database) -> None:

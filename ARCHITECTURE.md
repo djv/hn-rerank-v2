@@ -349,6 +349,14 @@ To reduce SQLite connection establishment overhead and eliminate lock contention
 * **Auto Commit/Rollback**: All database write operations wrap queries in a transaction context (`with conn:`) to ensure automatic rollback on failure and commit on success.
 * **PRAGMA Settings**: Each pooled connection is initialized with `PRAGMA journal_mode=WAL` (Write-Ahead Logging), `PRAGMA foreign_keys=ON` (constraint enforcement), and `PRAGMA busy_timeout=5000` (blocking writers retry for up to 5 seconds before failing).
 * **Server-Level Reuse**: The Flask app reuses a single global `Database` instance through the `Handler` runtime state across threaded requests, resolving lock issues and significantly increasing throughput.
+
+All canonical application tables use SQLite `STRICT` mode and schema version 1.
+Strictness applies automatically to fresh databases. Existing flexible databases
+must be converted explicitly with `uv run python scripts/migrate_db_to_strict.py`;
+the tool builds and validates a sibling database without modifying the source,
+requires the service to be stopped, and can retain the original during atomic
+activation. It only removes orphaned rows from the derived `embeddings` and
+`tldr_cache` caches when `--remove-orphan-caches` is explicitly supplied.
 * **Longest Text Merge**: `upsert_story()` preserves the longest known `self_text`, `top_comments`, and `article_body` values for an existing story, then recomposes `text_content` from those merged raw fields. This protects dynamically fetched comments and article bodies from being overwritten by later lightweight candidate refreshes.
 
 ### 3.11 Runtime Memory Controls
