@@ -4,6 +4,7 @@ import hashlib
 import html
 import logging
 import re
+import resource
 import threading
 import time
 from collections import Counter
@@ -42,6 +43,18 @@ EmbeddingOrtVariant: TypeAlias = Literal[
     "spin_off_graph_all",
     "spin_off_auto_threads",
 ]
+
+
+def _process_rss_kb() -> int | None:
+    """Return current process RSS on Linux, or None when unavailable."""
+    try:
+        with Path("/proc/self/status").open(encoding="utf-8") as status:
+            for line in status:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
 
 
 # SVM model cache: keyed on (user_id, feedback_signature, schema_version)
@@ -551,6 +564,10 @@ class Embedder:
         if effective_batch_size <= 0:
             raise ValueError("batch_size must be positive")
 
+        started = time.perf_counter()
+        rss_before_kb = _process_rss_kb()
+        batch_count = 0
+        longest_tokens = 0
         embeddings = []
         for i in range(0, len(texts), effective_batch_size):
             batch_texts = texts[i : i + effective_batch_size]
@@ -561,6 +578,8 @@ class Embedder:
                 max_length=self.max_tokens,
                 return_tensors="np",
             )
+            batch_count += 1
+            longest_tokens = max(longest_tokens, int(inputs["input_ids"].shape[1]))
 
             onnx_inputs = {}
             for input_meta in self.session.get_inputs():
@@ -587,7 +606,29 @@ class Embedder:
 
             embeddings.append(normalized_embeddings)
 
-        return np.concatenate(embeddings, axis=0)
+        result = np.concatenate(embeddings, axis=0)
+        rss_after_kb = _process_rss_kb()
+        rss_delta_kb = (
+            rss_after_kb - rss_before_kb
+            if rss_before_kb is not None and rss_after_kb is not None
+            else None
+        )
+        logging.info(
+            "embedding_perf texts=%d batches=%d batch_size=%d max_tokens=%d "
+            "longest_tokens=%d duration_ms=%.1f rss_before_kb=%s "
+            "rss_after_kb=%s rss_delta_kb=%s peak_rss_kb=%d",
+            len(texts),
+            batch_count,
+            effective_batch_size,
+            self.max_tokens,
+            longest_tokens,
+            (time.perf_counter() - started) * 1000,
+            rss_before_kb,
+            rss_after_kb,
+            rss_delta_kb,
+            resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        )
+        return result
 
 
 def get_or_compute_embeddings(

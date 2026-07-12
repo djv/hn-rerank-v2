@@ -6847,3 +6847,11 @@ fixed short length regardless of how much source material existed.
 - Added STRICT SQLite state for ordered Reddit feed snapshots, per-feed retry
   metadata, and restart-safe limiter circuit cooldowns. No story, feedback, or
   cache data was deleted.
+
+## 2026-07-12 — add bounded embedding memory instrumentation
+
+`Embedder.encode()` now emits one `embedding_perf` summary per non-empty call
+with text and batch counts, longest tokenized batch length, duration, current
+RSS before/after, RSS delta, and process peak RSS. This is instrumentation only:
+the 4096-token context, batch sizing, ONNX settings, and embedding output are
+unchanged.
