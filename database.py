@@ -91,6 +91,17 @@ class HnDupeResolution:
     last_error: str
 
 
+@dataclass(frozen=True)
+class RedditFeedState:
+    feed_url: str
+    last_attempt_at: float
+    last_success_at: float
+    failure_count: int
+    next_retry_at: float
+    last_error: str
+    item_count: int
+
+
 class Database:
     def __init__(self, path: str = "hn_rewrite.db", *, read_only: bool = False) -> None:
         self.read_only = read_only
@@ -274,6 +285,38 @@ class Database:
                     "CREATE INDEX IF NOT EXISTS idx_hn_dupe_resolutions_due "
                     "ON hn_dupe_resolutions(next_check_at)"
                 )
+
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS reddit_feed_state (
+                        feed_url TEXT PRIMARY KEY,
+                        last_attempt_at REAL NOT NULL,
+                        last_success_at REAL NOT NULL DEFAULT 0,
+                        failure_count INTEGER NOT NULL DEFAULT 0,
+                        next_retry_at REAL NOT NULL DEFAULT 0,
+                        last_error TEXT NOT NULL DEFAULT '',
+                        item_count INTEGER NOT NULL DEFAULT 0
+                    ) STRICT
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS reddit_feed_items (
+                        feed_url TEXT NOT NULL,
+                        story_id INTEGER NOT NULL,
+                        position INTEGER NOT NULL,
+                        observed_at REAL NOT NULL,
+                        PRIMARY KEY (feed_url, story_id),
+                        FOREIGN KEY (feed_url) REFERENCES reddit_feed_state(feed_url)
+                            ON DELETE CASCADE,
+                        FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE
+                    ) STRICT
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS reddit_circuit_state (
+                        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                        consecutive_429 INTEGER NOT NULL,
+                        retry_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    ) STRICT
+                """)
 
                 # Run migration of article_cache to stories table if article_cache exists
                 tbl_cursor = conn.execute(
@@ -928,6 +971,78 @@ class Database:
             with conn:
                 cursor = conn.execute(sql, params)
                 return cursor.fetchall()
+
+    def record_reddit_feed_success(
+        self, feed_url: str, story_ids: list[int], now_ts: float
+    ) -> None:
+        """Atomically replace one feed's ordered successful snapshot."""
+        with self.conn() as conn:
+            with conn:
+                conn.execute(
+                    "INSERT INTO reddit_feed_state "
+                    "(feed_url, last_attempt_at, last_success_at, failure_count, "
+                    "next_retry_at, last_error, item_count) VALUES (?, ?, ?, 0, 0, '', ?) "
+                    "ON CONFLICT(feed_url) DO UPDATE SET last_attempt_at=excluded.last_attempt_at, "
+                    "last_success_at=excluded.last_success_at, failure_count=0, "
+                    "next_retry_at=0, last_error='', item_count=excluded.item_count",
+                    (feed_url, now_ts, now_ts, len(story_ids)),
+                )
+                conn.execute(
+                    "DELETE FROM reddit_feed_items WHERE feed_url = ?", (feed_url,)
+                )
+                conn.executemany(
+                    "INSERT INTO reddit_feed_items "
+                    "(feed_url, story_id, position, observed_at) VALUES (?, ?, ?, ?)",
+                    [
+                        (feed_url, story_id, position, now_ts)
+                        for position, story_id in enumerate(story_ids)
+                    ],
+                )
+
+    def record_reddit_feed_failure(
+        self, feed_url: str, error: str, now_ts: float
+    ) -> None:
+        with self.conn() as conn:
+            with conn:
+                row = conn.execute(
+                    "SELECT failure_count FROM reddit_feed_state WHERE feed_url = ?",
+                    (feed_url,),
+                ).fetchone()
+                failures = (int(row[0]) if row else 0) + 1
+                retry = now_ts + min(300.0 * (2 ** (failures - 1)), 14400.0)
+                conn.execute(
+                    "INSERT INTO reddit_feed_state "
+                    "(feed_url, last_attempt_at, failure_count, next_retry_at, last_error) "
+                    "VALUES (?, ?, ?, ?, ?) ON CONFLICT(feed_url) DO UPDATE SET "
+                    "last_attempt_at=excluded.last_attempt_at, failure_count=excluded.failure_count, "
+                    "next_retry_at=excluded.next_retry_at, last_error=excluded.last_error",
+                    (feed_url, now_ts, failures, retry, error[:500]),
+                )
+
+    def get_reddit_feed_state(self, feed_url: str) -> RedditFeedState | None:
+        rows = self.execute(
+            "SELECT feed_url, last_attempt_at, last_success_at, failure_count, "
+            "next_retry_at, last_error, item_count FROM reddit_feed_state WHERE feed_url = ?",
+            (feed_url,),
+        )
+        return RedditFeedState(*rows[0]) if rows else None
+
+    def save_reddit_circuit_state(
+        self, consecutive_429: int, retry_at: float, now_ts: float
+    ) -> None:
+        self.execute(
+            "INSERT INTO reddit_circuit_state "
+            "(singleton, consecutive_429, retry_at, updated_at) VALUES (1, ?, ?, ?) "
+            "ON CONFLICT(singleton) DO UPDATE SET consecutive_429=excluded.consecutive_429, "
+            "retry_at=excluded.retry_at, updated_at=excluded.updated_at",
+            (consecutive_429, retry_at, now_ts),
+        )
+
+    def get_reddit_circuit_state(self) -> tuple[int, float] | None:
+        rows = self.execute(
+            "SELECT consecutive_429, retry_at FROM reddit_circuit_state WHERE singleton = 1"
+        )
+        return (int(rows[0][0]), float(rows[0][1])) if rows else None
 
     # Rank perf telemetry
     def insert_rank_perf(self, sample: RankPerfSample) -> None:

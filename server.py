@@ -2176,6 +2176,16 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
 
     hn_dupe_worker = HnDupeResolutionWorker(db)
     embedder = Handler.embedder
+
+    def publish_reddit_changes() -> None:
+        Handler._rebuild_cold_deck()
+        Handler._bump_all_cached_versions()
+
+    from reddit_refresh import RedditRefreshWorker
+
+    reddit_worker = RedditRefreshWorker(
+        config, db, embedder, on_changed=publish_reddit_changes
+    )
     if config.regen_initial_delay_seconds > 0:
         logging.info(
             "Deferring first regen for %ds (avoid contention with first warm)",
@@ -2205,6 +2215,7 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
             )
             Handler._rebuild_cold_deck()
             Handler._bump_all_cached_versions()
+            reddit_worker.submit()
 
             if Handler._cold_stories:
                 t = threading.Thread(

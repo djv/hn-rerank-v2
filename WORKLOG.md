@@ -6836,3 +6836,14 @@ fixed short length regardless of how much source material existed.
 **Files**: `pipeline/enrichment.py`, `server.py`, `prompts/article_only_v4.txt`,
 `prompts/article_v4.txt`, `prompts/discussion_v4.txt`, `tests/test_pipeline.py`,
 `tests/test_server.py`, `WORKLOG.md`.
+## 2026-07-12 — Non-HN restoration and asynchronous Reddit regeneration
+
+- Restored recent candidates from all configured non-HN feeds to the mixed
+  cold and personalized decks behind `non_hn_candidates_enabled`; obsolete
+  and archive non-HN rows remain excluded.
+- Removed both Reddit queue drains from core regeneration. A coalescing daemon
+  now performs Reddit topfeed and bounded comment hydration independently and
+  invalidates dashboard versions only when a batch changes persisted content.
+- Added STRICT SQLite state for ordered Reddit feed snapshots, per-feed retry
+  metadata, and restart-safe limiter circuit cooldowns. No story, feedback, or
+  cache data was deleted.

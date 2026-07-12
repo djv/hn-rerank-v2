@@ -3,13 +3,12 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import numpy as np
 from numpy.typing import NDArray
 
 from database import Database, Story
-from reddit_fetch_queue import CoroFactory
 
 # ruff: noqa: F401 — re-exports for the public pipeline namespace.
 from .config import (
@@ -116,6 +115,18 @@ from reddit_limiter import limiter as reddit_limiter
 COLD_DECK_LIMIT = 100
 
 
+@dataclass(frozen=True)
+class RedditRefreshResult:
+    feeds: int
+    changed_stories: int
+    hydrated_stories: int
+    prewarm_candidates: int
+
+    @property
+    def changed(self) -> bool:
+        return self.changed_stories > 0 or self.hydrated_stories > 0
+
+
 def _combo_keys_for_story(story: Story, recent_cutoff: int) -> str:
     age = "recent" if story.time >= recent_cutoff else "archive"
     source = "hn" if is_hn_source(story.source) else "non-hn"
@@ -132,7 +143,7 @@ def build_cold_deck(
     zero-vote user sees the same ranking as the cold deck.  See
     ``fast_rerank_for_user`` for the 0-vote short-circuit.
 
-    Reuses the same HN-only candidate legs (recent + archive) as the
+    Reuses the same production candidate legs as the
     personalized dashboard via ``load_production_candidate_stories``, and
     the same non-personalized Popular badge assembly (Hot/Top/Talk) as
     ``rerank_candidates`` via ``_assemble_combo_deck``, so cold-start decks
@@ -219,8 +230,8 @@ def load_production_candidate_stories(
         (user_id,) if exclude_feedback and user_id else ()
     )
 
-    # HN-only production legs: recent HN by gravity, archive HN seeds by
-    # score. Non-HN legs (RSS/Reddit/LessWrong) are disabled for now.
+    # Production legs: recent HN by gravity, archive HN seeds by score,
+    # and (when enabled) recent rows from currently configured feeds.
     hn_rows = db.execute(
         "SELECT id, title, url, score, time, text_content, source, comment_count, "
         "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
@@ -250,7 +261,28 @@ def load_production_candidate_stories(
             BQ_ARCHIVE_CANDIDATE_LIMIT + CH_ARCHIVE_CANDIDATE_LIMIT,
         ),
     )
-    rows = hn_rows + archive_rows
+    rss_rows: list[tuple] = []
+    if config.non_hn_candidates_enabled and config.rss.enabled:
+        configured_sources = tuple(
+            dict.fromkeys(_rss_source_name(feed) for feed in config.rss.feeds)
+        )
+        if configured_sources:
+            placeholders = ",".join("?" for _ in configured_sources)
+            rss_rows = db.execute(
+                "SELECT id, title, url, score, time, text_content, source, comment_count, "
+                "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
+                "FROM stories "
+                f"WHERE time >= ? AND source IN ({placeholders}) "
+                f"{feedback_filter}"
+                "ORDER BY time DESC LIMIT ?",
+                (
+                    cutoff_ts,
+                    *configured_sources,
+                    *feedback_params,
+                    config.recent_candidate_rss_limit,
+                ),
+            )
+    rows = hn_rows + rss_rows + archive_rows
     return [
         story
         for story in (Database._row_to_story(row) for row in rows)
@@ -577,36 +609,7 @@ async def fetch_candidates_only(
     prewarm_top_n: int | None = None,
     on_hn_candidates: Callable[[Sequence[Story]], None] | None = None,
 ) -> None:
-    """Fetch new candidates into shared DB; prewarm top-N hot per sub.
-
-    The Reddit fetch pipeline runs in two phases via the shared
-    :class:`reddit_fetch_queue.RedditFetchQueue`:
-
-    1. **Topfeed phase.** All 41 subreddit topfeeds are enqueued at a
-       fixed 50s stride. Reddit returns entries in hot/score-desc order
-       and the factory stores them in ``reddit_feed_cache`` in that
-       order. The phase blocks until the queue drains (with a generous
-       90-min timeout for slow networks / rate-limit backoffs).
-    2. **Prewarm phase.** After the topfeed phase completes, the first
-       ``config.reddit_prewarm_top_per_sub`` (default 10) stories per
-       subreddit are read from the cache. These are the hottest
-       ``N * 41`` stories across all subs. Per-post RSS fetches for
-       their comments are enqueued at ``config.reddit_min_fetch_spacing_seconds``
-       (default 30s) stride. Multi-cycle completion is expected: the
-       90-min drain timeout covers ~180 of 410 prewarm tasks; the rest
-       finish in subsequent cycles.
-
-    The two-phase flow is needed because the prewarm IDs come from the
-    topfeed cache, which is populated by the topfeed phase. A single
-    interleaved enqueue can't do that — the prewarm factories would have
-    no IDs to enqueue.
-
-    New Reddit stories discovered by this cycle's topfeed are ranked in
-    this cycle (their stories are upserted post-drain) but their
-    per-post comment fetch is best-effort. Stories already in the cache
-    from a previous cycle's topfeed are prewarmed in this cycle.
-    """
-    from reddit_fetch_queue import queue as reddit_fetch_queue
+    """Fetch and publish core candidates without waiting for Reddit."""
 
     feedback_records = db.get_all_feedback()
     feedback_ids = {f.story_id for f in feedback_records}
@@ -650,127 +653,6 @@ async def fetch_candidates_only(
                     len(top_ids),
                 )
 
-    # Reddit topfeed + prewarm via the shared queue. Both are enqueued
-    # together via `enqueue_all_reddit_fetches` so they interleave on a
-    # single `min_stride_seconds` window. The single drain at the end of
-    # the regen flow handles the case where the queue never fully drains
-    # (we log a warning but continue — prewarm counts reflect only what
-    # ran).
-    topfeed_factories, reddit_feed_urls = build_reddit_topfeed_factories(
-        list(config.rss.feeds),
-        config.rss.per_feed_limit,
-        config.days,
-        feedback_urls,
-    )
-
-    prewarm_ids: list[int] = []
-    prewarm_factories: list[CoroFactory] = []
-    prewarm_updated_ids: list[int] = []
-
-    if topfeed_factories:
-        # Phase 1: topfeed. Enqueue all 41 subs at a fixed 50s stride.
-        # The factory writes parsed Stories to ``reddit_feed_cache`` in
-        # the order Reddit returned them (hot/score-desc). We don't need
-        # any prewarm IDs before this phase completes — the prewarm phase
-        # reads the cache to determine the top-N per sub.
-        reddit_fetch_queue.enqueue_all_reddit_fetches(
-            topfeed_factories,
-            [],
-            min_stride_seconds=50.0,
-        )
-        # 41 subs × 50s = 2050s nominal; 90-min drain gives ample slack
-        # for 429 backoffs and slow networks.
-        topfeed_drained = reddit_fetch_queue.wait_until_empty(timeout=5400.0)
-        if not topfeed_drained:
-            logging.warning(
-                "fetch_candidates_only: reddit topfeed queue did not drain "
-                "in 5400s, continuing with partial cache"
-            )
-
-    # Phase 1.5: persist cached topfeed stories into SQLite. The prewarm
-    # factories load each story row from the DB with `db.get_story`, so
-    # the rows must exist before prewarm is enqueued. Without this step
-    # brand-new topfeed discoveries would no-op through the prewarm
-    # factory's missing-row short-circuit.
-    if topfeed_factories and reddit_feed_urls:
-        for feed_url in reddit_feed_urls:
-            cached = reddit_feed_cache.get(feed_url)
-            if cached:
-                for story in cached:
-                    if db.get_story(story.id) is not None:
-                        continue
-                    db.upsert_story(story)
-
-    if config.prewarm_reddit_full and reddit_feed_urls:
-        # Phase 2: prewarm. After the topfeed phase, read the cache and
-        # take the first ``reddit_prewarm_top_per_sub`` stories per
-        # subreddit. These are the hottest N per sub across all 41 subs.
-        # Skip rows whose DB copy already has `top_comments` (already
-        # hydrated by a previous cycle), and stop at
-        # ``reddit_prewarm_max_per_cycle`` to keep the per-cycle work
-        # bounded under current rate limits.
-        n_per_sub = config.reddit_prewarm_top_per_sub
-        max_per_cycle = config.reddit_prewarm_max_per_cycle
-        for feed_url in reddit_feed_urls:
-            if max_per_cycle <= 0 or len(prewarm_ids) >= max_per_cycle:
-                break
-            cached = reddit_feed_cache.get(feed_url)
-            if not cached:
-                continue
-            for story in cached[:n_per_sub]:
-                if len(prewarm_ids) >= max_per_cycle:
-                    break
-                existing = db.get_story(story.id)
-                if existing and existing.top_comments:
-                    continue
-                prewarm_ids.append(story.id)
-
-        if prewarm_ids:
-            prewarm_factories, prewarm_updated_ids = build_reddit_prewarm_factories(
-                prewarm_ids, db
-            )
-
-        if prewarm_factories:
-            reddit_fetch_queue.enqueue_all_reddit_fetches(
-                [],
-                prewarm_factories,
-                min_stride_seconds=config.reddit_min_fetch_spacing_seconds,
-            )
-            # 90-min drain covers ~180 of 410 at 30s stride. The rest
-            # continue in the background and finish over the next 2-3
-            # regen cycles. Multi-cycle completion is by design.
-            prewarm_drained = reddit_fetch_queue.wait_until_empty(timeout=5400.0)
-            if not prewarm_drained:
-                logging.warning(
-                    "fetch_candidates_only: reddit prewarm queue did not "
-                    "drain in 5400s, continuing with partial comments"
-                )
-
-    if topfeed_factories or prewarm_factories:
-        # Post-drain: collect Reddit topfeed stories from cache and
-        # extend the candidates list. Persistence was handled by the
-        # Phase 1.5 upsert loop above; re-upsert here is redundant.
-        for feed_url in reddit_feed_urls:
-            cached = reddit_feed_cache.get(feed_url)
-            if cached:
-                candidates.extend(cached)
-
-        # Post-drain: recompute embeddings for stories whose
-        # `top_comments`/`self_text` changed during prewarm.
-        if prewarm_updated_ids and embedder is not None:
-            updated_stories = [db.get_story(sid) for sid in prewarm_updated_ids]
-            updated_stories = [s for s in updated_stories if s is not None]
-            if updated_stories:
-                get_or_compute_embeddings(updated_stories, embedder, db)
-
-        logging.info(
-            "Regen: reddit topfeed=%d prewarm=%d (top_per_sub=%d, prewarm_ids=%d)",
-            len(reddit_feed_urls),
-            len(prewarm_updated_ids),
-            config.reddit_prewarm_top_per_sub,
-            len(prewarm_ids),
-        )
-
     # LessWrong prewarm
     if config.prewarm_lesswrong_full:
         needs_prewarm_lw = [
@@ -785,3 +667,97 @@ async def fetch_candidates_only(
                 prewarmed,
                 len(needs_prewarm_lw),
             )
+
+
+def refresh_reddit_candidates(
+    config: Config,
+    db: Database,
+    embedder: Embedder | None,
+) -> RedditRefreshResult:
+    """Run the slow Reddit refresh phases outside core regeneration."""
+    from reddit_fetch_queue import queue as reddit_fetch_queue
+
+    now_ts = time.time()
+    feedback_urls = {f.url for f in db.get_all_feedback() if f.url}
+    eligible_feeds = [
+        feed
+        for feed in config.rss.feeds
+        if (state := db.get_reddit_feed_state(feed)) is None
+        or state.next_retry_at <= now_ts
+    ]
+    factories, feed_urls = build_reddit_topfeed_factories(
+        eligible_feeds,
+        config.rss.per_feed_limit,
+        config.days,
+        feedback_urls,
+    )
+    if factories:
+        reddit_fetch_queue.enqueue_all_reddit_fetches(
+            factories, [], min_stride_seconds=50.0
+        )
+        if not reddit_fetch_queue.wait_until_empty(timeout=5400.0):
+            logging.warning("reddit_refresh: topfeed queue timed out")
+
+    changed_ids: set[int] = set()
+    for feed_url in feed_urls:
+        cached = reddit_feed_cache.get(feed_url)
+        if cached is None:
+            db.record_reddit_feed_failure(feed_url, "fetch returned no snapshot", now_ts)
+            continue
+        for story in cached:
+            existing = db.get_story(story.id)
+            if existing is None or (
+                existing.title,
+                existing.url,
+                existing.time,
+                existing.self_text,
+            ) != (story.title, story.url, story.time, story.self_text):
+                changed_ids.add(story.id)
+            db.upsert_story(story)
+        db.record_reddit_feed_success(
+            feed_url, [story.id for story in cached], now_ts
+        )
+
+    prewarm_ids: list[int] = []
+    if config.prewarm_reddit_full:
+        for feed_url in feed_urls:
+            if len(prewarm_ids) >= config.reddit_prewarm_max_per_cycle:
+                break
+            for story in (reddit_feed_cache.get(feed_url) or [])[
+                : config.reddit_prewarm_top_per_sub
+            ]:
+                if len(prewarm_ids) >= config.reddit_prewarm_max_per_cycle:
+                    break
+                existing = db.get_story(story.id)
+                if existing is None or not existing.top_comments:
+                    prewarm_ids.append(story.id)
+
+    prewarm_factories, updated_ids = build_reddit_prewarm_factories(prewarm_ids, db)
+    if prewarm_factories:
+        reddit_fetch_queue.enqueue_all_reddit_fetches(
+            [],
+            prewarm_factories,
+            min_stride_seconds=config.reddit_min_fetch_spacing_seconds,
+        )
+        if not reddit_fetch_queue.wait_until_empty(timeout=5400.0):
+            logging.warning("reddit_refresh: prewarm queue timed out")
+
+    if updated_ids and embedder is not None:
+        updated = [story for sid in updated_ids if (story := db.get_story(sid))]
+        if updated:
+            get_or_compute_embeddings(updated, embedder, db)
+
+    result = RedditRefreshResult(
+        feeds=len(feed_urls),
+        changed_stories=len(changed_ids),
+        hydrated_stories=len(set(updated_ids)),
+        prewarm_candidates=len(prewarm_ids),
+    )
+    logging.info(
+        "reddit_refresh_complete feeds=%d changed=%d hydrated=%d candidates=%d",
+        result.feeds,
+        result.changed_stories,
+        result.hydrated_stories,
+        result.prewarm_candidates,
+    )
+    return result

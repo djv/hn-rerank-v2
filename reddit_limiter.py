@@ -24,8 +24,15 @@ import logging
 import random
 import threading
 import time
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RedditCircuitSnapshot:
+    consecutive_429: int
+    retry_at: float
 
 
 class RedditRateLimiter:
@@ -154,6 +161,28 @@ class RedditRateLimiter:
             self._probing = False
         if was_open:
             logger.info("reddit_limiter circuit closed after successful probe")
+
+    def snapshot(self, *, wall_time: float | None = None) -> RedditCircuitSnapshot:
+        """Return restart-safe circuit state using a wall-clock retry time."""
+        wall = time.time() if wall_time is None else wall_time
+        with self._lock:
+            remaining = max(
+                0.0,
+                self.CIRCUIT_COOLDOWN - (time.monotonic() - self._circuit_opened_at),
+            ) if self._consecutive_429 >= self.MAX_CONSECUTIVE_429 else 0.0
+            return RedditCircuitSnapshot(self._consecutive_429, wall + remaining)
+
+    def restore(self, snapshot: RedditCircuitSnapshot) -> None:
+        """Restore only a still-active cooldown; monotonic values are rebuilt."""
+        remaining = max(0.0, snapshot.retry_at - time.time())
+        with self._lock:
+            self._consecutive_429 = snapshot.consecutive_429
+            self._probing = False
+            self._circuit_opened_at = (
+                time.monotonic() - (self.CIRCUIT_COOLDOWN - remaining)
+                if remaining > 0
+                else 0.0
+            )
 
 
 limiter: RedditRateLimiter = RedditRateLimiter()

@@ -280,11 +280,12 @@ profile persistence through `/u/<token>`.
 
 ### OPS-1. Decouple Reddit from core regeneration (M, 1-2 days)
 
-**High priority.** Persist per-feed freshness, retry, and circuit-breaker
-state in SQLite. Core ClickHouse/HN regeneration should use the last
-successful Reddit cache and publish independently while Reddit continues
-best-effort hydration; a later successful Reddit batch can trigger a
-lightweight invalidation.
+**Completed 2026-07-12.** Core ClickHouse/HN and ordinary RSS regeneration
+now publishes without waiting for Reddit. A coalescing Reddit worker refreshes
+topfeeds and comments asynchronously, persists per-feed snapshots/retry state
+and the global circuit cooldown in SQLite, and invalidates the deck once per
+changed batch. Recent rows from all currently configured non-HN feeds are
+again eligible for the mixed deck; removed and historical feed rows are not.
 
 Test with a fake queue/clock: HN regeneration succeeds on schedule when
 Reddit is circuit-open, stale Reddit data remains visible with a clear
@@ -349,7 +350,7 @@ Test event idempotency and session/card association.
 4. ~~**PERF-2** — rerank cadence / stale-deck refill policy~~ — done.
 5. ~~**PERF-3** — precomputed kernel SVM~~ — done. **PERF-4** remains
    conditional on finer candidate-embedding tracing.
-6. **OPS-1** — isolate Reddit from core regeneration.
+6. ~~**OPS-1** — isolate Reddit from core regeneration~~ — done.
 7. **REF-1 → REF-2 → REF-3**, then **F1-F3** and **B1-B3** by appetite.
 
 ## Verification (applies to whichever items proceed)

@@ -5126,9 +5126,7 @@ def test_fetch_candidates_only_persists_topfeed_before_prewarm(
         )
         monkeypatch.setattr("reddit_fetch_queue.queue", _NoopQueue())
 
-        asyncio.run(
-            pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
-        )
+        pipeline.refresh_reddit_candidates(config, db, _DummyEmbedder())
         # Story was persisted in phase 1.5 before prewarm was built.
         assert db.get_story(42) is not None
         # And the prewarm factory was given the story's id.
@@ -5234,9 +5232,7 @@ def test_fetch_candidates_only_caps_reddit_prewarm(monkeypatch) -> None:
         )
         monkeypatch.setattr("reddit_fetch_queue.queue", _NoopQueue())
 
-        asyncio.run(
-            pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
-        )
+        pipeline.refresh_reddit_candidates(config, db, _DummyEmbedder())
         assert captured_factory_ids
         assert len(captured_factory_ids[0]) == 4
     finally:
@@ -5331,9 +5327,7 @@ def test_fetch_candidates_only_skips_already_hydrated_reddit(monkeypatch) -> Non
         )
         monkeypatch.setattr("reddit_fetch_queue.queue", _NoopQueue())
 
-        asyncio.run(
-            pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
-        )
+        pipeline.refresh_reddit_candidates(config, db, _DummyEmbedder())
         assert captured_factory_ids
         assert 10 not in captured_factory_ids[0]
         assert 20 in captured_factory_ids[0]
@@ -5674,9 +5668,7 @@ def test_fetch_candidates_only_prewarms_top_n_per_sub_from_cache(
             reddit_fetch_queue, "wait_until_empty", fake_wait_until_empty
         )
 
-        asyncio.run(
-            pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
-        )
+        pipeline.refresh_reddit_candidates(config, db, _DummyEmbedder())
         assert len(captured_ids) == 1
         # 3 subs × 2 per sub = 6 IDs
         assert len(captured_ids[0]) == 6

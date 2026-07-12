@@ -102,6 +102,7 @@ class Config:
     # signal is orthogonal to the SQL ordering.
     recent_candidate_hn_limit: int = 5000
     recent_candidate_rss_limit: int = 500
+    non_hn_candidates_enabled: bool = True
     tldr_prefetch_per_combo: int = 5
     # After the top-per-combo pass, regenerate up to this many additional
     # cold-deck stories whose cached TLDR's cache_key no longer matches

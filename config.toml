@@ -6,6 +6,7 @@ embedding_max_tokens = 4096
 embedding_batch_size = 2
 dashboard_warm_vote_threshold = 10
 dashboard_warm_idle_seconds = 3.0
+non_hn_candidates_enabled = true
 
 [hn_rewrite.model]
 svm_c = 0.1

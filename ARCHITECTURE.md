@@ -515,3 +515,12 @@ dashboard shell retains its 1280px cap and optional filter rail.
 ### 4.3 Client-side Rendering
 
 The raw Markdown response is formatted on the fly using a robust, line-by-line parser (`parseSimpleMarkdown`) to render headers, bold text, and lists safely.
+## Asynchronous Reddit refresh
+
+Core regeneration publishes ClickHouse/HN and ordinary RSS candidates without
+waiting for Reddit's deliberately slow request queue. `RedditRefreshWorker`
+coalesces refresh requests, runs topfeed discovery followed by bounded comment
+hydration, and rebuilds cached decks once when a batch changes story content.
+SQLite retains per-feed success/retry metadata, ordered snapshot membership,
+and restart-safe global circuit cooldown state. Production ranking admits only
+recent rows whose source is derived from the currently configured feed list.
