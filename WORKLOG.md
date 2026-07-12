@@ -4,9 +4,9 @@ Append-only log of notable changes, fixes, and operational events.
 
 ## 2026-07-11 — ux: show refill state for an empty filtered queue
 
-The dashboard now displays “Loading more stories…” while its serialized refill
-request is in flight and no card matches the active filters. It hides as soon
-as a replacement activates or the request finishes.
+The dashboard now displays “Loading more stories…” while no card matches the
+active filters and a refill, cadence delay, or ranking-ready poll is pending.
+It hides as soon as a replacement activates or the pending refresh finishes.
 
 ## 2026-07-11 — fix: empty Popular/Archive deck after voting
 

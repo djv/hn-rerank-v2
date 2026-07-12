@@ -1004,7 +1004,10 @@
     }
 
     function updateQueueLoading() {
-      queueLoadingEl.hidden = !(refillInFlight && activeCard === null);
+      const refreshPending = (
+        refillInFlight || warmPollInFlight || voteWarmIdleTimer !== null
+      );
+      queueLoadingEl.hidden = !(refreshPending && activeCard === null);
     }
 
     function updateVoteBar() {
@@ -1318,7 +1321,9 @@
         if (latestVoteTargetVersion !== null) {
           scheduleDeckRefresh({ waitForWarm: true, targetVersion: latestVoteTargetVersion, advance: false });
         }
+        updateQueueLoading();
       }, idleMs);
+      updateQueueLoading();
     }
 
     function queueRefill(advance) {
@@ -1353,6 +1358,7 @@
         return;
       }
       warmPollInFlight = true;
+      updateQueueLoading();
       try {
         while (warmMinVersion !== null && latestWarmTargetVersion !== null) {
           const minVersion = warmMinVersion;
@@ -1376,6 +1382,8 @@
         warmPollInFlight = false;
         if (warmMinVersion !== null && latestWarmTargetVersion !== null) {
           runWarmPollLoop();
+        } else {
+          updateQueueLoading();
         }
       }
     }
