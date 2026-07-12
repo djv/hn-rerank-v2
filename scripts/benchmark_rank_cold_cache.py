@@ -5,7 +5,6 @@ import hashlib
 import json
 import statistics
 import sys
-import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
@@ -16,17 +15,13 @@ if str(ROOT) not in sys.path:
 
 from database import Database, Story  # noqa: E402
 from pipeline import (  # noqa: E402
-    BQ_ARCHIVE_CANDIDATE_LIMIT,
-    BQ_ARCHIVE_SOURCE,
-    CH_ARCHIVE_CANDIDATE_LIMIT,
-    CH_ARCHIVE_SOURCE,
     Config,
     Embedder,
     RankTrace,
     _MODEL_CACHE,
     _MODEL_CACHE_LOCK,
     fast_rerank_for_user,
-    is_summarizable,
+    load_production_candidate_stories,
     story_embedding_text,
 )
 
@@ -51,36 +46,12 @@ def _heaviest_user_id(db: Database) -> int:
 
 
 def _candidate_stories(db: Database, config: Config, user_id: int) -> list[Story]:
-    now_ts = int(time.time())
-    cutoff_ts = now_ts - (config.days * 86400)
-    recent_rows = db.execute(
-        "SELECT id, title, url, score, time, text_content, source, comment_count, "
-        "       discussion_url, comment_count_at_fetch, "
-        "       CASE WHEN self_text != '' OR top_comments != '' OR article_body != '' "
-        "            THEN '1' ELSE '' END AS self_text, "
-        "       '' AS top_comments, '' AS article_body "
-        "FROM stories WHERE time >= ? AND source NOT IN (?, ?) "
-        "AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?)",
-        (cutoff_ts, BQ_ARCHIVE_SOURCE, CH_ARCHIVE_SOURCE, user_id),
+    return load_production_candidate_stories(
+        db,
+        config,
+        user_id=user_id,
+        exclude_feedback=True,
     )
-    archive_rows = db.execute(
-        "SELECT id, title, url, score, time, text_content, source, comment_count, "
-        "       discussion_url, comment_count_at_fetch, "
-        "       CASE WHEN self_text != '' OR top_comments != '' OR article_body != '' "
-        "            THEN '1' ELSE '' END AS self_text, "
-        "       '' AS top_comments, '' AS article_body "
-        "FROM stories INDEXED BY idx_stories_archive_score_time "
-        f"WHERE source IN ('{BQ_ARCHIVE_SOURCE}', '{CH_ARCHIVE_SOURCE}') "
-        "AND text_content != '' "
-        "AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?) "
-        "ORDER BY score DESC, time DESC LIMIT ?",
-        (
-            user_id,
-            BQ_ARCHIVE_CANDIDATE_LIMIT + CH_ARCHIVE_CANDIDATE_LIMIT,
-        ),
-    )
-    stories = [Database._row_to_story(row) for row in recent_rows + archive_rows]
-    return [s for s in stories if is_summarizable(s)]
 
 
 def _missing_embedding_count(

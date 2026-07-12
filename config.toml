@@ -9,6 +9,8 @@ dashboard_warm_idle_seconds = 3.0
 
 [hn_rewrite.model]
 svm_c = 0.1
+svm_precomputed_enabled = true
+svm_precomputed_chunk_size = 512
 
 [hn_rewrite.rss]
 feeds = [

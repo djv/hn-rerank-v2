@@ -10,6 +10,8 @@ class ModelConfig:
     svm_c: float = 0.2
     svm_gamma: float | str = 0.03
     svm_kernel: str = "rbf"
+    svm_precomputed_enabled: bool = False
+    svm_precomputed_chunk_size: int = 512
     neutral_weight: float = 0.0
     enable_mmr: bool = False
     diversity_threshold: float = 0.75
@@ -143,6 +145,8 @@ class Config:
             raise ValueError("dashboard_warm_vote_threshold must be positive")
         if self.dashboard_warm_idle_seconds <= 0:
             raise ValueError("dashboard_warm_idle_seconds must be positive")
+        if self.model.svm_precomputed_chunk_size <= 0:
+            raise ValueError("svm_precomputed_chunk_size must be positive")
         if self.embedding_ort_variant not in {
             "current",
             "spin_off",

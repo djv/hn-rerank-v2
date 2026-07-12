@@ -45,6 +45,7 @@ from pipeline import (
     fast_rerank_for_user,
     HOT_MIN_SCORE,
 )
+from pipeline.ranking import PrecomputedRbfSVC
 from pipeline.hn_dupes import HnDupeResolver
 
 
@@ -6049,6 +6050,34 @@ def test_prewarm_lesswrong_stories_skips_when_both_fields_already_richer(
 
 def _clear_model_cache() -> None:
     _MODEL_CACHE.clear()
+
+
+def test_precomputed_rbf_svc_matches_regular_svc() -> None:
+    from sklearn.svm import SVC
+
+    rng = np.random.default_rng(42)
+    training = rng.normal(size=(90, 12))
+    candidates = rng.normal(size=(47, 12))
+    labels = [index % 3 for index in range(len(training))]
+    weights = np.ones(len(training), dtype=np.float64)
+
+    regular = SVC(C=0.1, kernel="rbf", gamma=0.03, decision_function_shape="ovr")
+    regular.fit(training, labels, sample_weight=weights)
+    precomputed = PrecomputedRbfSVC(c=0.1, gamma=0.03, chunk_size=7)
+    precomputed.fit(training, labels, sample_weight=weights)
+
+    expected = regular.decision_function(candidates)
+    actual = precomputed.decision_function(candidates)
+    assert np.allclose(actual, expected, rtol=1e-7, atol=1e-9)
+    assert np.array_equal(
+        np.argsort(-actual[:, 2], kind="stable")[:40],
+        np.argsort(-expected[:, 2], kind="stable")[:40],
+    )
+
+
+def test_precomputed_rbf_svc_validates_chunk_size() -> None:
+    with pytest.raises(ValueError, match="chunk_size must be positive"):
+        PrecomputedRbfSVC(c=0.1, gamma=0.03, chunk_size=0)
 
 
 def _make_story(db: Database, sid: int) -> None:

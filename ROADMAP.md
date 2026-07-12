@@ -96,6 +96,14 @@ existing `test_ready_gated_refill_*` / warm-coalescing tests
 
 ### PERF-3. Precomputed-kernel SVM inference (M-L, 2-4 days)
 
+**Completed 2026-07-12.** Production now uses the exact precomputed RBF model
+with candidate inference chunked at 512 rows and the original libsvm path
+retained behind a config fallback. The live production-shaped cold benchmark
+reduced decision inference from 5.83s to 0.58s and total ranking from 12.86s to
+6.58s; warm runs measured 0.56-0.58s decision and about 5.1s total. Peak RSS
+rose from 730MiB to 834MiB on a host with 2.6GiB available. Exact top-40 parity
+means temporal ranking metrics are unchanged by construction.
+
 **Read-only benchmark completed 2026-07-12.** On the live user-1 shape (7,910
 candidates, 3,347 training rows), current libsvm inference took 5.78s versus
 445ms to construct the candidate kernel plus 301ms for precomputed inference.
@@ -339,8 +347,8 @@ Test event idempotency and session/card association.
 3. ~~**PERF-1** — make HN duplicate resolution local-only during warm
    ranking~~ — done.
 4. ~~**PERF-2** — rerank cadence / stale-deck refill policy~~ — done.
-5. **PERF-3** (+ **PERF-4** if substage tracing shows it matters) — precomputed
-   kernel SVM, with parity and memory gates.
+5. ~~**PERF-3** — precomputed kernel SVM~~ — done. **PERF-4** remains
+   conditional on finer candidate-embedding tracing.
 6. **OPS-1** — isolate Reddit from core regeneration.
 7. **REF-1 → REF-2 → REF-3**, then **F1-F3** and **B1-B3** by appetite.
 

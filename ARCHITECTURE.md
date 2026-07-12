@@ -100,9 +100,21 @@ This avoids scikit-learn's deprecated and slower `SVC(probability=True)` calibra
 
 **Current hyperparameters** (30-day default-user eval, 2026-06-28): `C=0.5`, `gamma=0.03`, `kernel=rbf`, `neutral_weight=0.0`, `positive_cluster_k=4`. Re-tuned on the 4-binary source feature set; the previous 2026-06-23 setting (`C=0.2, gamma=0.03, kernel=rbf`) was measured on the pre-4-binary-source feature set and is no longer optimal. A wide RBF sweep (49 (C, γ) combos) confirmed `C=0.5, gamma=0.03` sits in a broad plateau spanning `C∈{0.3-1.0}` × `γ∈{0.01-0.03}`, all within 1σ of each other. The plateau is also robust to a linear kernel fallback at the same hyperparams — linear at `C=0.1` gives 0.45 NDCG@40, RBF at the plateau gives 0.49-0.50, a +0.05 lift on the production 394-d feature set. The final-queue (post-13-discovery-passes) lift is even larger: linear 0.493 → RBF 0.596 = +0.10.
 
+#### Exact Precomputed RBF Inference
+
+Production uses an exact `SVC(kernel="precomputed")` path behind
+`model.svm_precomputed_enabled`. Training materializes the feedback-by-feedback
+RBF kernel, while inference constructs candidate kernels in configurable
+512-row chunks (`model.svm_precomputed_chunk_size`) so the full
+candidate-by-feedback matrix is never resident. The fallback remains the
+original libsvm RBF path. On the 2026-07-12 live shape (7,910 candidates and
+3,347 feedback rows), chunked inference reduced the decision stage from 5.83s
+to 0.58s with exact top-40 ordering and `3.12e-7` maximum decision drift. Peak
+process RSS increased from 730MiB to 834MiB; the host had 2.6GiB available.
+
 #### Per-User SVM Model Cache (Schema-Versioned)
 
-The trained `(SVC, StandardScaler)` tuple is cached in-process in `_MODEL_CACHE` (a lock-guarded `cachetools.LRUCache`, max 20 active entries by default) keyed on `(user_id, feedback_signature, _MODEL_SCHEMA_VERSION)`. The signature is a SHA-256 of the user's feedback story IDs + actions + update timestamps; the schema version is bumped whenever the feature schema changes. Bumping `_MODEL_SCHEMA_VERSION = 2` (2026-06-28, 4-binary source categories) invalidates every active user's cached model on next request — the correct behavior, since a stale scaler fit on 6 meta columns would be applied to a 10-column input and produce NaN scores. Schema version is the only viable invalidation key: the cache is in-memory only, so a runtime dim check would mask future schema bugs.
+The trained classifier/scaler tuple is cached in-process in `_MODEL_CACHE` (a lock-guarded `cachetools.LRUCache`, max 20 active entries by default) keyed on `(user_id, feedback_signature, _MODEL_SCHEMA_VERSION)`. The signature is a SHA-256 of the user's feedback story IDs + actions + update timestamps; the schema version is bumped whenever the feature or classifier representation changes. `_MODEL_SCHEMA_VERSION = 3` selects the config-gated precomputed classifier safely. Schema version is the only viable invalidation key: the cache is in-memory only, so a runtime dimension check would mask future schema bugs.
 
 #### Dual-Gate SVM Activation
 

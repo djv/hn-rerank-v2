@@ -19,6 +19,7 @@ from bs4 import BeautifulSoup
 from cachetools import LRUCache
 from numpy.typing import NDArray
 from sklearn.cluster import KMeans
+from sklearn.metrics.pairwise import rbf_kernel
 from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
 from transformers import AutoTokenizer
@@ -53,12 +54,65 @@ _MODEL_CACHE_STORAGE_MAXSIZE = 10_000
 # so they are cached alongside it to skip the per-regen KMeans on cache hits.
 # ``centers`` may be None for entries written before this field existed (or by
 # tests); callers must fall back to recomputing when it is None.
-_CachedModel = tuple[SVC, StandardScaler, "NDArray[np.float32] | None"]
+class PrecomputedRbfSVC:
+    """Exact RBF SVC with bounded candidate-kernel inference memory."""
+
+    def __init__(self, *, c: float, gamma: float, chunk_size: int) -> None:
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        self.gamma = gamma
+        self.chunk_size = chunk_size
+        self._svc = SVC(
+            C=c,
+            kernel="precomputed",
+            cache_size=16,
+            random_state=0,
+            decision_function_shape="ovr",
+        )
+        self._training_features: NDArray[np.float64] | None = None
+
+    @property
+    def classes_(self) -> NDArray[np.int64]:
+        return self._svc.classes_
+
+    def fit(
+        self,
+        features: NDArray[np.float64],
+        labels: list[int],
+        *,
+        sample_weight: NDArray[np.float64],
+    ) -> PrecomputedRbfSVC:
+        self._training_features = np.asarray(features)
+        kernel = rbf_kernel(features, features, gamma=self.gamma)
+        self._svc.fit(kernel, labels, sample_weight=sample_weight)
+        return self
+
+    def decision_function(
+        self, features: NDArray[np.float64]
+    ) -> NDArray[np.float64]:
+        if self._training_features is None:
+            raise RuntimeError("fit must run before decision_function")
+        chunks = []
+        for start in range(0, len(features), self.chunk_size):
+            kernel = rbf_kernel(
+                features[start : start + self.chunk_size],
+                self._training_features,
+                gamma=self.gamma,
+            )
+            chunks.append(self._svc.decision_function(kernel))
+        if not chunks:
+            width = len(self.classes_) if len(self.classes_) > 2 else 1
+            return np.empty((0, width), dtype=np.float64)
+        return np.concatenate(chunks, axis=0)
+
+
+_CachedClassifier: TypeAlias = SVC | PrecomputedRbfSVC
+_CachedModel = tuple[_CachedClassifier, StandardScaler, "NDArray[np.float32] | None"]
 _MODEL_CACHE: LRUCache[tuple[int, str, int], _CachedModel] = LRUCache(
     maxsize=_MODEL_CACHE_STORAGE_MAXSIZE
 )
 _MODEL_CACHE_LOCK = threading.Lock()
-_MODEL_SCHEMA_VERSION = 2  # +1 whenever meta-column schema changes (see ARCHITECTURE)
+_MODEL_SCHEMA_VERSION = 3  # +1 whenever model/feature schema changes (see ARCHITECTURE)
 
 
 @dataclass
@@ -153,7 +207,7 @@ def _get_cached_model(
 def _set_cached_model(
     user_id: int | None,
     signature: str,
-    svm: SVC,
+    svm: _CachedClassifier,
     scaler: StandardScaler,
     maxsize: int = 20,
     *,
@@ -1022,14 +1076,27 @@ def _score_and_rank(
                 fb_features_scaled = np.hstack(
                     [fb_features[:, :emb_dim], fb_features_meta_scaled]
                 )
-                svm = SVC(
-                    C=config.model.svm_c,
-                    kernel=config.model.svm_kernel,
-                    gamma=config.model.svm_gamma,
-                    cache_size=16,
-                    random_state=0,
-                    decision_function_shape="ovr",
-                )
+                if config.model.svm_precomputed_enabled:
+                    if config.model.svm_kernel != "rbf" or not isinstance(
+                        config.model.svm_gamma, float
+                    ):
+                        raise ValueError(
+                            "precomputed SVM requires a numeric RBF gamma"
+                        )
+                    svm: _CachedClassifier = PrecomputedRbfSVC(
+                        c=config.model.svm_c,
+                        gamma=config.model.svm_gamma,
+                        chunk_size=config.model.svm_precomputed_chunk_size,
+                    )
+                else:
+                    svm = SVC(
+                        C=config.model.svm_c,
+                        kernel=config.model.svm_kernel,
+                        gamma=config.model.svm_gamma,
+                        cache_size=16,
+                        random_state=0,
+                        decision_function_shape="ovr",
+                    )
                 if trace is not None:
                     with trace.stage("svm_fit"):
                         svm.fit(

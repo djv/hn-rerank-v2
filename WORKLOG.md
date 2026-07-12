@@ -2,6 +2,18 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-12 — perf: ship chunked exact precomputed-kernel SVM
+
+Added a config-gated exact precomputed RBF classifier and enabled it with
+512-candidate inference chunks. The original libsvm path remains available by
+setting `model.svm_precomputed_enabled = false`; model cache schema version 3
+prevents reuse across classifier representations. Production-shaped read-only
+benchmarks reduced decision inference from 5.83s to 0.58s, cold total ranking
+from 12.86s to 6.58s, and warm total ranking to about 5.1s. Top-40 ordering was
+identical with `3.12e-7` maximum decision drift. Peak RSS rose from 730MiB to
+834MiB (2.6GiB host memory available). Also corrected the cold-cache benchmark
+preflight to use the actual capped production candidate loader.
+
 ## 2026-07-12 — perf: benchmark exact precomputed-kernel SVM inference
 
 Added a read-only production-shaped PERF-3 benchmark that intercepts only SVC
