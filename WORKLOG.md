@@ -2,6 +2,17 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-12 — perf: benchmark exact precomputed-kernel SVM inference
+
+Added a read-only production-shaped PERF-3 benchmark that intercepts only SVC
+construction while retaining the live candidate, embedding, feature, scaling,
+label, and sample-weight paths. For user 1 (7,910 candidates, 3,347 feedback
+rows), regular decision inference took 5.78s; candidate-kernel construction plus
+precomputed inference took 0.75s. Top-40 ordering matched exactly and maximum
+absolute decision drift was `3.12e-7`. The candidate and training kernels used
+about 101MiB and 43MiB respectively, making bounded peak memory the main gate
+for production integration. The benchmark refuses to write missing embeddings.
+
 ## 2026-07-12 — docs: mark PERF-2 complete in the canonical roadmap
 
 Reconciled `ROADMAP.md` with the live tree: commit `748d3c8` already shipped

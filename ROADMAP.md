@@ -96,6 +96,15 @@ existing `test_ready_gated_refill_*` / warm-coalescing tests
 
 ### PERF-3. Precomputed-kernel SVM inference (M-L, 2-4 days)
 
+**Read-only benchmark completed 2026-07-12.** On the live user-1 shape (7,910
+candidates, 3,347 training rows), current libsvm inference took 5.78s versus
+445ms to construct the candidate kernel plus 301ms for precomputed inference.
+The top-40 ordering was identical and maximum absolute decision drift was
+`3.12e-7`. Explicit kernel arrays occupied about 101MiB (candidate) and 43MiB
+(training), so the production design must bound peak memory. Reproduce with
+`scripts/benchmark_precomputed_svm.py`; it opens SQLite read-only and refuses
+to run if required embeddings are absent.
+
 **Stable bottleneck, but the highest-effort/least-certain item — do after
 PERF-1/PERF-2, not before.** `SVC.decision_function` is consistently ~5s:
 libsvm's single-threaded per-SV loop, likely >1500 SVs at C=0.1 on ~2500
