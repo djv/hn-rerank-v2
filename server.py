@@ -995,6 +995,8 @@ class Handler:
     _feedback_warm_versions: dict[int, int] = {}
     _feedback_warm_timers: dict[int, threading.Timer] = {}
     _feedback_warm_guard = threading.Lock()
+    _feedback_regen_timer: threading.Timer | None = None
+    _feedback_regen_guard = threading.Lock()
     _public_demo_limiter = FixedWindowLimiter()
 
     @classmethod
@@ -1145,6 +1147,45 @@ class Handler:
             cls._feedback_warm_counts[user_id] = 0
         if version is not None:
             cls._trigger_warm(user, version)
+
+    @classmethod
+    def _schedule_feedback_regen(cls) -> None:
+        """Restart the process-wide trailing regeneration timer."""
+        with cls._feedback_regen_guard:
+            previous = cls._feedback_regen_timer
+            if previous is not None:
+                previous.cancel()
+            timer = threading.Timer(
+                cls.config.feedback_regen_idle_seconds,
+                cls._feedback_regen_idle_fired,
+            )
+            timer.daemon = True
+            cls._feedback_regen_timer = timer
+            timer.start()
+        logging.info(
+            "feedback_regen_scheduled idle_seconds=%.1f",
+            cls.config.feedback_regen_idle_seconds,
+        )
+
+    @classmethod
+    def _feedback_regen_idle_fired(cls) -> None:
+        with cls._feedback_regen_guard:
+            if cls._feedback_regen_timer is not threading.current_thread():
+                return
+            cls._feedback_regen_timer = None
+        logging.info("feedback_regen_idle_elapsed")
+        cls.regen_event.set()
+
+    @classmethod
+    def _cancel_feedback_regen(cls) -> None:
+        """Retire feedback-delayed work satisfied by a regeneration."""
+        with cls._feedback_regen_guard:
+            timer = cls._feedback_regen_timer
+            cls._feedback_regen_timer = None
+            if timer is not None:
+                timer.cancel()
+        if timer is not None:
+            logging.info("feedback_regen_pending_satisfied")
 
     @classmethod
     def _trigger_warm(cls, user: User, version: int) -> None:
@@ -1703,11 +1744,12 @@ def _handle_flask_feedback(runtime: type[Handler]) -> Response:
         else:
             runtime.db.upsert_feedback(user.id, story_id, action)
 
-        # Every vote invalidates immediately. Ranking is cadence-gated; stale
-        # cached refills remain safe because the client filters voted story IDs.
+        # Every vote invalidates immediately. Personalized ranking is
+        # cadence-gated; global candidate regeneration waits for a quiet period.
+        # Stale cached refills remain safe because the client filters voted IDs.
         version = runtime._invalidate_dashboard_cache(user.id)
         warm_queued = runtime._schedule_feedback_warm(user, version)
-        runtime.regen_event.set()
+        runtime._schedule_feedback_regen()
 
         return _flask_json_response(
             {
@@ -2398,8 +2440,12 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
         triggered = event.wait(timeout=config.regen_interval_seconds)
         if triggered:
             event.clear()
-            # Debounce click storms
-            time.sleep(2)
+
+        # A periodic or explicitly triggered regeneration satisfies any
+        # feedback-delayed request that was still pending. Clear the event
+        # again to close the race with a timer firing as the timeout elapsed.
+        Handler._cancel_feedback_regen()
+        event.clear()
 
         logging.info("Regeneration triggered. Fetching candidates...")
         try:
@@ -2478,6 +2524,7 @@ def main() -> None:
     except KeyboardInterrupt:
         logging.info("Shutting down...")
     finally:
+        Handler._cancel_feedback_regen()
         db.close()
 
 

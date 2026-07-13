@@ -102,6 +102,13 @@ def test_config_rejects_invalid_embedding_batch_size():
         Config(embedding_batch_size=0)
 
 
+def test_config_rejects_nonpositive_feedback_regen_idle_seconds() -> None:
+    with pytest.raises(
+        ValueError, match="feedback_regen_idle_seconds must be positive"
+    ):
+        Config(feedback_regen_idle_seconds=0)
+
+
 def test_config_rejects_invalid_embedding_ort_variant():
     with pytest.raises(ValueError, match="embedding_ort_variant must be one of"):
         Config(embedding_ort_variant=cast(Any, "approximate_gelu"))
@@ -113,6 +120,7 @@ def test_config_load_checked_in_config_contains_only_runtime_overrides():
     config = Config.load(str(config_path))
 
     assert config.server_port == 8766
+    assert config.feedback_regen_idle_seconds == 300.0
     assert config.article_fetch_max_per_run == 50
     assert config.model.svm_c == 0.1
     assert config.model.svm_gamma == 0.03

@@ -128,6 +128,7 @@ class Config:
     feedback_global_window_seconds: int = 3600
     dashboard_warm_vote_threshold: int = 10
     dashboard_warm_idle_seconds: float = 3.0
+    feedback_regen_idle_seconds: float = 300.0
     session_create_per_ip_limit: int = 60
     session_create_per_ip_window_seconds: int = 3600
     profile_link_per_ip_limit: int = 120
@@ -146,6 +147,8 @@ class Config:
             raise ValueError("dashboard_warm_vote_threshold must be positive")
         if self.dashboard_warm_idle_seconds <= 0:
             raise ValueError("dashboard_warm_idle_seconds must be positive")
+        if self.feedback_regen_idle_seconds <= 0:
+            raise ValueError("feedback_regen_idle_seconds must be positive")
         if self.model.svm_precomputed_chunk_size <= 0:
             raise ValueError("svm_precomputed_chunk_size must be positive")
         if self.embedding_ort_variant not in {

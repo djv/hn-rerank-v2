@@ -6877,3 +6877,28 @@ with text and batch counts, longest tokenized batch length, duration, current
 RSS before/after, RSS delta, and process peak RSS. This is instrumentation only:
 the 4096-token context, batch sizing, ONNX settings, and embedding output are
 unchanged.
+
+## 2026-07-13 — separate personalized warming from global regeneration
+
+- Successful votes and clears still invalidate the user's dashboard and use
+  the existing 10-vote/3-second personalized warm cadence.
+- Replaced the immediate global `regen_event` signal with one process-wide
+  trailing timer. `feedback_regen_idle_seconds` defaults to 300 seconds, and
+  every feedback change from any user restarts it.
+- A normal periodic regeneration cancels a pending feedback timer, preventing
+  a redundant delayed run. Rejected feedback and no-op clears schedule no work.
+- Added timer reset, cross-user coalescing, single-signal, cancellation,
+  cleanup, and positive-config-validation coverage.
+- Verification: `565 passed, 1 skipped`, repository-wide Ruff and `ty` clean.
+  After restart and the initial regeneration, a user-1 neutral vote followed
+  by clear restored the original absent feedback row. The final clear at
+  05:29:03.648 UTC triggered no immediate regeneration; the trailing timer
+  elapsed at 05:34:03.648 and regeneration began at 05:34:03.649 exactly one
+  five-minute idle interval later.
+- The two uncontended personalized ranks took 6.35s and 6.32s (about 9.35s
+  end-to-end including the 3s cadence), narrowly missing the six-second rank
+  target for user 1's 3,364-row profile. The overlap-sensitive stages returned
+  to the idle range: `candidate_sql_ms=1442.9/1443.7` and
+  `candidate_embedding_ms=123.7/123.3`, versus the observed contention tail of
+  roughly 11-23s and 6-12s respectively. Candidate-matrix caching remains a
+  measured follow-up rather than part of this behavior-only change.
