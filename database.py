@@ -6,7 +6,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal, Generator, TypeAlias
+from typing import Literal, Generator, NamedTuple, TypeAlias
 from contextlib import contextmanager
 import queue
 import numpy as np
@@ -100,6 +100,14 @@ class InteractionEvent:
     ranker_arm: str
     occurred_at: float
     duration_ms: int | None = None
+
+
+class InteractionInsertResult(NamedTuple):
+    """Outcome of an interaction-event batch insert."""
+
+    inserted: int
+    duplicates: int
+    unknown: int
 
 
 @dataclass(frozen=True)
@@ -1126,15 +1134,17 @@ class Database:
 
     def insert_interaction_events(
         self, events: list[InteractionEvent]
-    ) -> tuple[int, int]:
-        """Insert a batch of events and return ``(inserted, duplicates)``.
+    ) -> InteractionInsertResult:
+        """Insert a batch of events and return ``(inserted, duplicates, unknown)``.
 
         Event IDs are the idempotency key.  Story IDs are checked only for
         new events; replaying an event remains a no-op even if its story has
-        since been pruned from the story corpus.
+        since been pruned from the story corpus.  New events referencing a
+        story ID absent from ``stories`` are skipped and counted as
+        ``unknown`` — they never fail the rest of the batch.
         """
         if not events:
-            return 0, 0
+            return InteractionInsertResult(0, 0, 0)
         with self.conn() as conn:
             with conn:
                 event_ids = [event.event_id for event in events]
@@ -1150,6 +1160,7 @@ class Database:
                     for event in events
                     if event.event_id not in existing_ids
                 }
+                unknown_story_ids: set[int] = set()
                 if new_story_ids:
                     story_placeholders = ",".join("?" for _ in new_story_ids)
                     story_rows = conn.execute(
@@ -1158,13 +1169,18 @@ class Database:
                         tuple(new_story_ids),
                     ).fetchall()
                     known_story_ids = {int(row[0]) for row in story_rows}
-                    missing = sorted(new_story_ids - known_story_ids)
-                    if missing:
-                        raise ValueError(f"Unknown story IDs: {missing[:10]}")
+                    unknown_story_ids = new_story_ids - known_story_ids
 
                 received_at = time.time()
                 inserted = 0
+                unknown = 0
                 for event in events:
+                    if (
+                        event.event_id not in existing_ids
+                        and event.story_id in unknown_story_ids
+                    ):
+                        unknown += 1
+                        continue
                     cursor = conn.execute(
                         """
                         INSERT INTO interaction_events (
@@ -1193,7 +1209,9 @@ class Database:
                         ),
                     )
                     inserted += cursor.rowcount
-                return inserted, len(events) - inserted
+                return InteractionInsertResult(
+                    inserted, len(events) - inserted - unknown, unknown
+                )
 
     # Article fetch failure memory
     def get_article_fetch_failure(self, story_id: int) -> dict | None:

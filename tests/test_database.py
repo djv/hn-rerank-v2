@@ -180,8 +180,8 @@ def test_interaction_events_are_strict_idempotent_and_isolated(db: Database) -> 
         ranker_arm="baseline",
         occurred_at=1_700_000_000.0,
     )
-    assert db.insert_interaction_events([event, event]) == (1, 1)
-    assert db.insert_interaction_events([event]) == (0, 1)
+    assert db.insert_interaction_events([event, event]) == (1, 1, 0)
+    assert db.insert_interaction_events([event]) == (0, 1, 0)
     with db.conn() as conn:
         assert conn.execute("SELECT COUNT(*) FROM interaction_events").fetchone() == (1,)
         assert conn.execute(
@@ -195,8 +195,11 @@ def test_interaction_events_are_strict_idempotent_and_isolated(db: Database) -> 
         assert "idx_interaction_events_story_time" in indexes
 
 
-def test_interaction_events_reject_unknown_story_atomically(db: Database) -> None:
-    event = InteractionEvent(
+def test_interaction_events_skip_unknown_story_per_event(db: Database) -> None:
+    db.upsert_story(
+        Story(id=502, title="Known story", url=None, score=1, time=1, text_content="x")
+    )
+    unknown = InteractionEvent(
         event_id="33333333-3333-4333-8333-333333333333",
         client_session_id="44444444-4444-4444-8444-444444444444",
         user_id=1,
@@ -210,10 +213,25 @@ def test_interaction_events_reject_unknown_story_atomically(db: Database) -> Non
         ranker_arm="baseline",
         occurred_at=1_700_000_000.0,
     )
-    with pytest.raises(ValueError, match="Unknown story IDs"):
-        db.insert_interaction_events([event])
+    known = InteractionEvent(
+        event_id="55555555-5555-4555-8555-555555555556",
+        client_session_id="44444444-4444-4444-8444-444444444444",
+        user_id=1,
+        story_id=502,
+        event_type="impression",
+        dashboard_version=1,
+        position=1,
+        sort_mode="recommended",
+        age_filter="recent",
+        source_filter="mixed",
+        ranker_arm="baseline",
+        occurred_at=1_700_000_000.0,
+    )
+    assert db.insert_interaction_events([unknown, known]) == (1, 0, 1)
     with db.conn() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM interaction_events").fetchone() == (0,)
+        assert conn.execute(
+            "SELECT story_id FROM interaction_events"
+        ).fetchall() == [(502,)]
 
 
 def test_strict_migration_preserves_schema_and_removes_orphan_caches(

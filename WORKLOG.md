@@ -2,6 +2,36 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-15 — fix: interaction ledger silently dropped whole batches (all non-HN events lost)
+
+`POST /api/interaction` rejected `story_id <= 0`, but every non-HN story uses a
+negative synthetic ID (`pipeline/enrichment.py`, `-(val % 2**31)`), and a single
+bad event 400'd the entire batch (a second batch-atomic layer also rejected
+unknown story IDs in `insert_interaction_events`). The client's `sendBeacon`
+path treats browser acceptance as delivery, so poisoned batches vanished
+silently; the keepalive-fetch fallback retried rejected batches forever at
+`setTimeout(0)`. Evidence: 458 events recorded under `source_filter='mixed'`
+but zero ledger events from any non-HN story — an unknown number of valid HN
+events in mixed batches were lost alongside. No backfill is possible.
+
+Fix: per-event accept/reject at ingestion (`_parse_interaction_event` in
+server.py), any nonzero story ID valid, unknown-story events skipped and
+counted (`InteractionInsertResult` in database.py) instead of failing the
+batch, response gains a `rejected` field, rejections logged at WARNING.
+Client drops payloads on non-429 4xx and retries transient failures after 5s.
+
+**Data-quality note:** ledger data before 2026-07-15 is HN-survivor-biased —
+mixed-deck batches containing any non-HN event were dropped wholesale. Do not
+compare exposure or position metrics naively across this date.
+
+Verified: 565 tests pass, ruff/ty clean; live smoke posted a 3-event batch
+(negative-ID tildes story −350334544, HN story 48925271, unknown 999999999) →
+`{"ok":true,"inserted":2,"duplicates":0,"rejected":1}`, both rows present,
+WARNING logged. The two smoke impressions remain in the ledger deliberately
+(event_ids `96920069-7b65-4936-95dc-4974c0cc9351`,
+`79933d6f-d722-4561-9694-da8ebe2add76`, session
+`97e7842c-b827-4c78-8bbd-b691d32b4b10`) — DB rule forbids deletes.
+
 ## 2026-07-13 — ops: add standard-port Tailscale Funnel routes
 
 Added persistent HTTPS port 443 Funnel routes matching the existing port 8443

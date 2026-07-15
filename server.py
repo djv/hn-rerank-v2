@@ -20,7 +20,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from http import HTTPStatus
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
 from urllib.parse import urlparse, urlunparse
 
 import feedparser
@@ -1766,6 +1766,113 @@ def _handle_flask_feedback(runtime: type[Handler]) -> Response:
         )
 
 
+def _parse_interaction_event(raw_event: Any, user_id: int) -> InteractionEvent:
+    """Validate one raw ledger event; raises ValueError on any bad field."""
+    event_types = {"impression", "article_open", "comments_open", "dwell"}
+    if not isinstance(raw_event, dict):
+        raise ValueError("each event must be an object")
+    required = {
+        "event_id",
+        "client_session_id",
+        "story_id",
+        "event_type",
+        "dashboard_version",
+        "position",
+        "sort_mode",
+        "age_filter",
+        "source_filter",
+        "ranker_arm",
+        "occurred_at",
+    }
+    if not required.issubset(raw_event) or bool(
+        set(raw_event) - (required | {"duration_ms"})
+    ):
+        raise ValueError("event has unexpected or missing fields")
+
+    event_id = raw_event["event_id"]
+    client_session_id = raw_event["client_session_id"]
+    if not isinstance(event_id, str) or len(event_id) > 64:
+        raise ValueError("event_id must be a short string")
+    if not isinstance(client_session_id, str) or len(client_session_id) > 128:
+        raise ValueError("client_session_id must be a short string")
+    try:
+        uuid.UUID(event_id)
+        uuid.UUID(client_session_id)
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise ValueError("event IDs must be UUIDs") from exc
+
+    story_id = raw_event["story_id"]
+    dashboard_version = raw_event["dashboard_version"]
+    position = raw_event["position"]
+    if (
+        not isinstance(story_id, int)
+        or isinstance(story_id, bool)
+        # Negative IDs are valid: non-HN stories use synthetic negative IDs.
+        or story_id == 0
+        or not isinstance(dashboard_version, int)
+        or isinstance(dashboard_version, bool)
+        or dashboard_version < 0
+        or not isinstance(position, int)
+        or isinstance(position, bool)
+        or position < 0
+    ):
+        raise ValueError("story_id, dashboard_version, and position are invalid")
+
+    event_type = raw_event["event_type"]
+    if not isinstance(event_type, str) or event_type not in event_types:
+        raise ValueError("unknown event_type")
+    occurred_at = raw_event["occurred_at"]
+    if (
+        not isinstance(occurred_at, (int, float))
+        or isinstance(occurred_at, bool)
+        or not math.isfinite(float(occurred_at))
+        or float(occurred_at) <= 0
+    ):
+        raise ValueError("occurred_at must be a finite timestamp")
+
+    dimensions = tuple(
+        raw_event[name]
+        for name in ("sort_mode", "age_filter", "source_filter", "ranker_arm")
+    )
+    if any(
+        not isinstance(value, str) or not value or len(value) > 64
+        for value in dimensions
+    ):
+        raise ValueError("event dimensions must be short strings")
+    sort_mode, age_filter, source_filter, ranker_arm = cast(
+        tuple[str, str, str, str], dimensions
+    )
+
+    duration_ms = raw_event.get("duration_ms")
+    if duration_ms is not None and (
+        not isinstance(duration_ms, int)
+        or isinstance(duration_ms, bool)
+        or duration_ms < 0
+        or duration_ms > 86_400_000
+    ):
+        raise ValueError("duration_ms is invalid")
+    if event_type == "dwell" and duration_ms is None:
+        raise ValueError("dwell events require duration_ms")
+    if event_type != "dwell" and duration_ms is not None:
+        raise ValueError("only dwell events may include duration_ms")
+
+    return InteractionEvent(
+        event_id=event_id,
+        client_session_id=client_session_id,
+        user_id=user_id,
+        story_id=story_id,
+        event_type=cast(InteractionEventType, event_type),
+        dashboard_version=dashboard_version,
+        position=position,
+        sort_mode=sort_mode,
+        age_filter=age_filter,
+        source_filter=source_filter,
+        ranker_arm=ranker_arm,
+        occurred_at=float(occurred_at),
+        duration_ms=duration_ms,
+    )
+
+
 def _handle_flask_interaction_events(runtime: type[Handler]) -> Response:
     user = _flask_user(runtime)
     if not user:
@@ -1799,112 +1906,15 @@ def _handle_flask_interaction_events(runtime: type[Handler]) -> Response:
                 status=HTTPStatus.BAD_REQUEST,
             )
 
-        event_types = {"impression", "article_open", "comments_open", "dwell"}
+        # Per-event accept/reject: one malformed or unknown-story event must
+        # never discard its batch neighbors (the beacon path can't retry).
         events: list[InteractionEvent] = []
+        invalid_reasons: list[str] = []
         for raw_event in raw_events:
-            if not isinstance(raw_event, dict):
-                raise ValueError("each event must be an object")
-            required = {
-                "event_id",
-                "client_session_id",
-                "story_id",
-                "event_type",
-                "dashboard_version",
-                "position",
-                "sort_mode",
-                "age_filter",
-                "source_filter",
-                "ranker_arm",
-                "occurred_at",
-            }
-            if not required.issubset(raw_event) or bool(
-                set(raw_event) - (required | {"duration_ms"})
-            ):
-                raise ValueError("event has unexpected or missing fields")
-
-            event_id = raw_event["event_id"]
-            client_session_id = raw_event["client_session_id"]
-            if not isinstance(event_id, str) or len(event_id) > 64:
-                raise ValueError("event_id must be a short string")
-            if not isinstance(client_session_id, str) or len(client_session_id) > 128:
-                raise ValueError("client_session_id must be a short string")
             try:
-                uuid.UUID(event_id)
-                uuid.UUID(client_session_id)
-            except (ValueError, AttributeError, TypeError) as exc:
-                raise ValueError("event IDs must be UUIDs") from exc
-
-            story_id = raw_event["story_id"]
-            dashboard_version = raw_event["dashboard_version"]
-            position = raw_event["position"]
-            if (
-                not isinstance(story_id, int)
-                or isinstance(story_id, bool)
-                or story_id <= 0
-                or not isinstance(dashboard_version, int)
-                or isinstance(dashboard_version, bool)
-                or dashboard_version < 0
-                or not isinstance(position, int)
-                or isinstance(position, bool)
-                or position < 0
-            ):
-                raise ValueError("story_id, dashboard_version, and position are invalid")
-
-            event_type = raw_event["event_type"]
-            if not isinstance(event_type, str) or event_type not in event_types:
-                raise ValueError("unknown event_type")
-            occurred_at = raw_event["occurred_at"]
-            if (
-                not isinstance(occurred_at, (int, float))
-                or isinstance(occurred_at, bool)
-                or not math.isfinite(float(occurred_at))
-                or float(occurred_at) <= 0
-            ):
-                raise ValueError("occurred_at must be a finite timestamp")
-
-            dimensions = tuple(
-                raw_event[name]
-                for name in ("sort_mode", "age_filter", "source_filter", "ranker_arm")
-            )
-            if any(
-                not isinstance(value, str) or not value or len(value) > 64
-                for value in dimensions
-            ):
-                raise ValueError("event dimensions must be short strings")
-            sort_mode, age_filter, source_filter, ranker_arm = cast(
-                tuple[str, str, str, str], dimensions
-            )
-
-            duration_ms = raw_event.get("duration_ms")
-            if duration_ms is not None and (
-                not isinstance(duration_ms, int)
-                or isinstance(duration_ms, bool)
-                or duration_ms < 0
-                or duration_ms > 86_400_000
-            ):
-                raise ValueError("duration_ms is invalid")
-            if event_type == "dwell" and duration_ms is None:
-                raise ValueError("dwell events require duration_ms")
-            if event_type != "dwell" and duration_ms is not None:
-                raise ValueError("only dwell events may include duration_ms")
-
-            events.append(
-                InteractionEvent(
-                    event_id=event_id,
-                    client_session_id=client_session_id,
-                    user_id=user.id,
-                    story_id=story_id,
-                    event_type=cast(InteractionEventType, event_type),
-                    dashboard_version=dashboard_version,
-                    position=position,
-                    sort_mode=sort_mode,
-                    age_filter=age_filter,
-                    source_filter=source_filter,
-                    ranker_arm=ranker_arm,
-                    occurred_at=float(occurred_at),
-                    duration_ms=duration_ms,
-                )
-            )
+                events.append(_parse_interaction_event(raw_event, user.id))
+            except ValueError as exc:
+                invalid_reasons.append(str(exc))
 
         quota = _acquire_interaction_event_quota(runtime, user)
         if not quota.allowed:
@@ -1912,9 +1922,25 @@ def _handle_flask_interaction_events(runtime: type[Handler]) -> Response:
                 "Too many interaction events. Please try again later.",
                 quota.retry_after_seconds,
             )
-        inserted, duplicates = runtime.db.insert_interaction_events(events)
+        result = runtime.db.insert_interaction_events(events)
+        rejected = len(invalid_reasons) + result.unknown
+        if rejected:
+            logging.warning(
+                "interaction events: rejected %d of %d "
+                "(%d invalid, %d unknown story); reasons: %s",
+                rejected,
+                len(raw_events),
+                len(invalid_reasons),
+                result.unknown,
+                invalid_reasons[:3],
+            )
         return _flask_json_response(
-            {"ok": True, "inserted": inserted, "duplicates": duplicates}
+            {
+                "ok": True,
+                "inserted": result.inserted,
+                "duplicates": result.duplicates,
+                "rejected": rejected,
+            }
         )
     except ValueError as exc:
         return _flask_json_response(

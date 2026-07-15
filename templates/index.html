@@ -909,6 +909,7 @@
     const VOTED_STORAGE_LIMIT = 1000;
     const INTERACTION_QUEUE_LIMIT = 256;
     const INTERACTION_BATCH_SIZE = 64;
+    const INTERACTION_RETRY_DELAY_MS = 5000;
     const clientSessionId = (() => {
       try {
         const key = 'hnRewrite:interactionSessionId';
@@ -989,23 +990,32 @@
         return;
       }
       interactionFlushInFlight = true;
+      let retryDelayMs = 0;
       fetch(path, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: payload,
         keepalive: true
       }).then(resp => {
-        if (resp.ok) interactionEvents.splice(0, batch.length);
+        // A non-429 4xx is the server's permanent verdict on this payload;
+        // keeping it queued would poison every subsequent flush.
+        const permanentlyRejected = resp.status >= 400 && resp.status < 500 && resp.status !== 429;
+        if (resp.ok || permanentlyRejected) {
+          interactionEvents.splice(0, batch.length);
+        } else {
+          retryDelayMs = INTERACTION_RETRY_DELAY_MS;
+        }
       }).catch(() => {
         // Keep the bounded queue for the next activation or page lifecycle event.
+        retryDelayMs = INTERACTION_RETRY_DELAY_MS;
       }).finally(() => {
         interactionFlushInFlight = false;
-        if (interactionEvents.length > 0) scheduleInteractionFlush();
+        if (interactionEvents.length > 0) scheduleInteractionFlush(retryDelayMs);
       });
     }
 
-    function scheduleInteractionFlush() {
-      window.setTimeout(flushInteractionEvents, 0);
+    function scheduleInteractionFlush(delayMs = 0) {
+      window.setTimeout(flushInteractionEvents, delayMs);
     }
 
     function beginInteraction(card, emitImpression = true) {

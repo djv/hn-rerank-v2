@@ -535,6 +535,15 @@ validated at ingestion but are not foreign keys, so later story pruning cannot
 erase historical exposure data or block retention maintenance. The migration
 script creates a consistent backup and verifies integrity before and after the
 schema change.
+
+Ingestion is per-event (since 2026-07-15): any nonzero integer story ID is
+valid — non-HN stories use negative synthetic IDs — and a malformed event or
+one referencing an unknown story is rejected or skipped individually, counted
+in the response's `rejected` field, and logged at WARNING; it never discards
+its batch neighbors. Only envelope-level problems (bad JSON, wrong shape,
+oversized batch) return 400. The client drops payloads the server permanently
+rejects (non-429 4xx) and retries transient failures (network, 429, 5xx) after
+a 5s delay, so a bad event can no longer poison the flush queue.
 ## Asynchronous Reddit refresh
 
 Core regeneration publishes ClickHouse/HN and ordinary RSS candidates without

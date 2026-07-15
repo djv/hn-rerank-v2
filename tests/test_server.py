@@ -2194,23 +2194,20 @@ def test_flask_test_client_events_batch_and_replay_are_idempotent(
     replay = client.post("/api/interaction", json={"events": [event]})
 
     assert first.status_code == 200
-    assert first.get_json() == {"ok": True, "inserted": 1, "duplicates": 1}
+    assert first.get_json() == {"ok": True, "inserted": 1, "duplicates": 1, "rejected": 0}
     assert replay.status_code == 200
-    assert replay.get_json() == {"ok": True, "inserted": 0, "duplicates": 1}
+    assert replay.get_json() == {"ok": True, "inserted": 0, "duplicates": 1, "rejected": 0}
     with db.conn() as conn:
         assert conn.execute(
             "SELECT user_id, story_id, event_type FROM interaction_events"
         ).fetchall() == [(user.id, 2710, "impression")]
 
 
-def test_flask_test_client_events_reject_invalid_batch_atomically(test_env: Any) -> None:
-    _, db, _, handler, user = test_env
-    client = create_app(handler).test_client()
-    client.set_cookie("hn_token", user.token)
-    invalid = {
-        "event_id": "77777777-7777-4777-8777-777777777777",
+def _ledger_event(event_id: str, story_id: int) -> dict[str, Any]:
+    return {
+        "event_id": event_id,
         "client_session_id": "88888888-8888-4888-8888-888888888888",
-        "story_id": 999999,
+        "story_id": story_id,
         "event_type": "impression",
         "dashboard_version": 0,
         "position": 0,
@@ -2220,11 +2217,63 @@ def test_flask_test_client_events_reject_invalid_batch_atomically(test_env: Any)
         "ranker_arm": "baseline",
         "occurred_at": 1_700_000_000.0,
     }
-    response = client.post("/api/interaction", json={"events": [invalid]})
-    assert response.status_code == 400
-    assert "Unknown story IDs" in response.get_json()["error"]
+
+
+def test_flask_test_client_events_accept_negative_story_ids(test_env: Any) -> None:
+    _, db, _, handler, user = test_env
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+    db.upsert_story(
+        Story(
+            id=-42,
+            title="Synthetic RSS story",
+            url="https://example.com/rss-item",
+            score=0,
+            time=1600000000,
+            text_content="Feed body",
+            source="rss_example_com",
+        )
+    )
+    event = _ledger_event("77777777-7777-4777-8777-777777777777", -42)
+    response = client.post("/api/interaction", json={"events": [event]})
+    assert response.status_code == 200
+    assert response.get_json() == {"ok": True, "inserted": 1, "duplicates": 0, "rejected": 0}
     with db.conn() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM interaction_events").fetchone() == (0,)
+        assert conn.execute(
+            "SELECT story_id FROM interaction_events"
+        ).fetchall() == [(-42,)]
+
+
+def test_flask_test_client_events_skip_invalid_and_unknown_per_event(
+    test_env: Any,
+) -> None:
+    _, db, _, handler, user = test_env
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+    db.upsert_story(
+        Story(
+            id=2711,
+            title="Ledger valid story",
+            url="https://example.com/ledger-valid",
+            score=10,
+            time=1600000000,
+            text_content="Ledger body",
+            source="hn",
+        )
+    )
+    unknown = _ledger_event("99999999-9999-4999-8999-999999999999", 999999)
+    malformed = _ledger_event("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", 2711)
+    malformed["event_type"] = "hover"
+    valid = _ledger_event("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", 2711)
+    response = client.post(
+        "/api/interaction", json={"events": [unknown, malformed, valid]}
+    )
+    assert response.status_code == 200
+    assert response.get_json() == {"ok": True, "inserted": 1, "duplicates": 0, "rejected": 2}
+    with db.conn() as conn:
+        assert conn.execute(
+            "SELECT story_id FROM interaction_events"
+        ).fetchall() == [(2711,)]
 
 
 def test_flask_test_client_feedback_limit_sets_retry_after(test_env: Any) -> None:
