@@ -1056,6 +1056,8 @@
     function orderForCurrentSort() {
       if (currentSort === 'date') {
         orderCards((a, b) => Number(b.dataset.time || 0) - Number(a.dataset.time || 0));
+      } else if (currentSort === 'explore') {
+        orderCards(() => Math.random() - 0.5);
       } else {
         orderCards((a, b) => parseFloat(b.dataset.score) - parseFloat(a.dataset.score));
       }

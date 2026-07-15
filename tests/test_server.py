@@ -4363,20 +4363,6 @@ def test_deck_actions_restore_native_focus_to_active_card() -> None:
     )
 
 
-def test_orderForCurrentSort_uses_shared_order_helper_for_deterministic_modes():
-    """All sort modes use deterministic ordering; no shuffling."""
-    _, static = _read_template_and_static()
-    idx = static.index("function orderForCurrentSort(")
-    end = static.index("\n\n    function advanceToNextCard(", idx)
-    body = static[idx:end]
-    assert "currentSort === 'date'" in body
-    assert "orderCards((a, b) => parseFloat(b.dataset.score)" in body
-    assert "orderCards((a, b) => Number(b.dataset.time || 0)" in body
-    assert "shuffleCards()" not in body
-    assert "Math.floor(Math.random() * (i + 1))" not in static
-    assert "advanceToNextCard()" in static
-
-
 def test_data_is_recent_attribute_emitted(test_env):
     """Per-card data-is-recent attribute is set correctly based on story age."""
     import re

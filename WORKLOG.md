@@ -2,6 +2,18 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-13 — ops: add standard-port Tailscale Funnel routes
+
+Added persistent HTTPS port 443 Funnel routes matching the existing port 8443
+topology: `/` proxies to localhost Caddy on `127.0.0.1:8000`, while `/v1` and
+`/transit` proxy to the transit service on `127.0.0.1:8787/v1`. Port 8443
+remains active for a 24-hour compatibility window while known transit clients
+move to the portless URL. Fresh cookie-preserving requests to `/hn/` and
+`/hn/api/user` returned `200` on both ports; both port-443 transit aliases
+returned `200`; and TLS 1.3 certificate verification on port 443 succeeded.
+The new public dashboard URL is
+`https://ubuntu-8gb-nbg1-1.tailca4726.ts.net/hn/`.
+
 ## 2026-07-12 — perf: ship chunked exact precomputed-kernel SVM
 
 Added a config-gated exact precomputed RBF classifier and enabled it with
@@ -6902,3 +6914,11 @@ unchanged.
   `candidate_embedding_ms=123.7/123.3`, versus the observed contention tail of
   roughly 11-23s and 6-12s respectively. Candidate-matrix caching remains a
   measured follow-up rather than part of this behavior-only change.
+
+## 2026-07-14 — shuffle Explore ordering
+
+- Explore now shuffles its eligible cards in the browser instead of ordering
+  them by SVM score, so slow voting can reach Unsure and Novel stories rather
+  than repeatedly consuming Similar cards first.
+- Recommended and Popular retain score ordering; Date retains newest-first
+  ordering.

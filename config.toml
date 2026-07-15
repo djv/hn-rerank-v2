@@ -68,9 +68,6 @@ feeds = [
     "https://www.reddit.com/r/onebag/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/digitalnomad/top/.rss?t=week&limit=25",
 
-    # Evidence-ish health
-    "https://www.reddit.com/r/medicine/top/.rss?t=week&limit=25",
-
     "https://simonwillison.net/atom/everything/",
     "https://www.interconnects.ai/feed",
     "https://jack-clark.net/feed/",
@@ -95,7 +92,6 @@ feeds = [
     "https://www.tweag.io/rss.xml",
     "https://well-typed.com/blog/rss2.xml",
     "https://ocaml.org/feed.xml",
-    "https://bartoszmilewski.com/feed/",
     "https://aphyr.com/posts.atom",
     "https://googleprojectzero.blogspot.com/feeds/posts/default",
     "https://blog.trailofbits.com/feed/",
