@@ -6952,3 +6952,32 @@ unchanged.
   than repeatedly consuming Similar cards first.
 - Recommended and Popular retain score ordering; Date retains newest-first
   ordering.
+
+## 2026-07-16 — Qwen3-Embedding-0.6B CPU speed bakeoff (disqualified)
+
+Prompted by a Reddit (r/AI_Agents) claim that Qwen3 embeddings "run in
+milliseconds on CPU." Added `scripts/bench_qwen_embed_speed.py`, a read-only
+speed-only benchmark (no DB writes, no quality/NDCG eval) comparing the
+production encoder against Qwen3-Embedding-0.6B on identical real candidate
+texts, both under onnxruntime `CPUExecutionProvider`.
+
+- Production: `mxbai-embed-xsmall-v1`, 6-layer BERT, 384-d, mean-pool + L2.
+- Candidate: `onnx-community/Qwen3-Embedding-0.6B-ONNX` (int8/quantized
+  export — the realistic CPU deployment weight, not the 2.4GB fp32 export),
+  28-layer causal decoder, 1024-d, last-token pool + L2. The export is a
+  decoder-with-past graph, so the script also synthesizes `position_ids` and
+  28 zero-length `past_key_values.{i}.{key,value}` inputs for the single
+  forward pass, and requests only `last_hidden_state` (not the unused
+  `present.*` KV outputs) to avoid penalizing it with copy-out work no real
+  single-pass embedding usage would pay.
+- Result, on this host: at production's 4096-token budget, mxbai averaged
+  ~1.3s/text (n=10) vs Qwen3 int8 at ~19.6s/text (n=10) — **~15x slower**. At
+  a capped 512 tokens (n=5) the gap was smaller (~5x), so the penalty grows
+  faster than linearly with context length, consistent with 28 layers vs 6
+  plus quadratic attention cost.
+- Decision: disqualified for regen-time use without even running a quality
+  eval — regen prewarms up to ~5000 candidates per cycle, and a >10x per-text
+  cost is well past the threshold set before running this. No `.npz`
+  bakeoff/quality eval (`scripts/bakeoff_embedding_models.py` +
+  `scripts/eval_ranker_variants.py`) was run; not worth it until CPU speed
+  clears the bar, or unless GPU inference becomes available.
