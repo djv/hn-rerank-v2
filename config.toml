@@ -8,6 +8,8 @@ dashboard_warm_vote_threshold = 10
 dashboard_warm_idle_seconds = 3.0
 feedback_regen_idle_seconds = 300.0
 non_hn_candidates_enabled = true
+tldr_uncached_per_user_limit = 24
+tldr_uncached_global_limit = 120
 
 [hn_rewrite.model]
 svm_c = 0.1
