@@ -66,14 +66,14 @@ We evaluated multiple embedding models for topic-level matching:
 
 **Key finding**: MiniLM has the best discrimination (0.091 mean similarity for unrelated texts). Longer context (512+ tokens) actually hurts discrimination by adding noise. The 256-token limit is optimal — it captures title + first paragraph without noise.
 
-**Production embedding input**: The current production embedding is a single composed text string, centralized in `story_embedding_text()`. For normal rows this preserves the stored `text_content` exactly, keeping existing cache hashes stable; if `text_content` is empty, it recomposes from `title`, `self_text`, `article_body`, and `top_comments` as a recovery fallback.
+**Production embedding input**: The current production encoder is configured in `config.toml` as `mxbai-embed-xsmall-v1|mean|norm|4096` (384 dimensions, 4096-token budget). It embeds a single composed text string, centralized in `story_embedding_text()`. For normal rows this preserves the stored `text_content` exactly, keeping existing cache hashes stable; if `text_content` is empty, it recomposes from `title`, `self_text`, `article_body`, and `top_comments` as a recovery fallback. The MiniLM results in the table above are a historical benchmark, not the live encoder.
 
 **Field-level embedding candidate**: The eval script can test a slower field-level mode that embeds `title`, `self_text`, `article_body`, and `top_comments` separately, then averages the non-empty field vectors. This should not replace production without a new embedding `model_version`, because switching it would intentionally invalidate the existing embedding cache and change feedback-story vectors.
 
-#### 390-Dimensional Production SVM Feature Vector
+#### 394-Dimensional Production SVM Feature Vector
 
 The production SVM trains on a **394-dimensional feature vector**:
-* **`[0-383]` (384-d)**: MiniLM sentence embedding from the production composed text.
+* **`[0-383]` (384-d)**: The configured 384-d sentence embedding from the production composed text.
 * **`[384]` (1-d)**: Normalized log text length: `min(log1p(len), 12.0) / 12.0`.
 * **`[385-388]` (4-d)**: Similarity metrics to historical feedback:
   * Mean cosine similarity to the top-k upvoted story embeddings (`knn_k=10`, LOOCV for training).
@@ -81,7 +81,7 @@ The production SVM trains on a **394-dimensional feature vector**:
   * Maximum cosine similarity to any upvoted story embedding.
   * Maximum cosine similarity to any downvoted story embedding.
 * **`[389]` (1-d)**: Maximum cosine similarity to a 4-cluster k-means summary of the user's upvoted feedback. The runtime fits those positive-cluster centers once per render and reuses them for both feedback rows and candidate rows.
-* **`[390-393]` (4-d)**: 4-binary source category one-hot: `is_hn_live`, `is_archive`, `is_reddit`, `is_rss` (from `source_category_onehot()` in `pipeline.py:127`). "Other" sources (Slashdot without the `rss_` prefix, Tildes, etc.) get the all-zero vector and inherit the implicit "other" prior from absence of all four bits. Bumped from a single `is_hn` flag in 2026-06-28 so the model can learn distinct per-source priors — archive candidates (`bq_seed`/`ch_seed`) used to share a feature bit with live HN, so the SVM had no way to demote the ~70%-of-pool archive contamination.
+* **`[390-393]` (4-d)**: 4-binary source category one-hot: `is_hn_live`, `is_archive`, `is_reddit`, `is_rss` (from `source_category_onehot()` in `pipeline/ranking.py`). "Other" sources (Slashdot without the `rss_` prefix, Tildes, etc.) get the all-zero vector and inherit the implicit "other" prior from absence of all four bits. Bumped from a single `is_hn` flag in 2026-06-28 so the model can learn distinct per-source priors — archive candidates (`bq_seed`/`ch_seed`) used to share a feature bit with live HN, so the SVM had no way to demote the ~70%-of-pool archive contamination.
 
 The SVM deliberately excludes engagement metadata: score, comment count, HN quality, comment-to-score ratio, score velocity, comment velocity. These features produced inflated archive-wide offline metrics and worse 30-day held-out ranking than the semantic/text/similarity feature set. The 4-binary source features are kept because the model needs the per-source prior to handle the heterogeneous candidate pool, and the `strip_hn` formula in the eval (zeroing these features at inference) gives a clean ablation: ~0.38 NDCG@100 lift comes from the source features, ~0.22 NDCG@100 comes from the rest.
 
@@ -89,7 +89,7 @@ To prevent train-test covariate shift / feature leakage, when computing the simi
 
 To avoid outlier features (like fresh stories having extremely large negative z-scores like `-4.8` for points/comments, or similarity features having blown-up z-scores due to low training variance) from completely dominating the SVM ranking decision, the standard-scaled metadata features are clipped to the range `[-2.5, 2.5]`. This z-score clipping significantly improves raw ranking metrics (Raw NDCG@100 from `0.720` to `0.738`, Raw NDCG@200 from `0.691` to `0.706`) and prevents model overfitting.
 
-**Raw embeddings must not be standard-scaled.** The 384-d MiniLM vectors are L2-normalized — each dimension is on the same unit scale by construction. StandardScaler is applied only to metadata columns (from `emb_dim:` onward in the feature vector). Scaling raw embedding dimensions independently breaks their cosine similarity structure and collapses ranking performance, because a dimension with small-magnitude signal across the training set gets inflated to the same variance as a dimension with genuine semantic signal.
+**Raw embeddings must not be standard-scaled.** The configured 384-d vectors are L2-normalized — each dimension is on the same unit scale by construction. StandardScaler is applied only to metadata columns (from `emb_dim:` onward in the feature vector). Scaling raw embedding dimensions independently breaks their cosine similarity structure and collapses ranking performance, because a dimension with small-magnitude signal across the training set gets inflated to the same variance as a dimension with genuine semantic signal.
 
 ### 3.3 SVM Personalization
 When both upvote and downvote feedback pass the dual gate, the runtime trains a per-user `SVC` with `probability=False` and ranks candidates by the normalized one-vs-rest up-class margin:
@@ -99,6 +99,8 @@ $$\text{score} = \text{minmax01}(f_{\text{up}}(x))$$
 This avoids scikit-learn's deprecated and slower `SVC(probability=True)` calibration path. The dashboard still computes approximate probability-like fields by applying a softmax over the multi-class decision margins, but ranking itself is driven by the raw up-margin ordering. Because these softmax values are not calibrated probabilities, the UI does not show exact percentages; it uses them only for uncertainty entropy to select `🤔 Unsure` candidates. Card-left color is a smooth blue→red gradient driven by the card's rank position in the current render's sorted-by-score order (rank 1 = blue, rank N = red, evenly distributed), computed client-side from `data-score` values and applied to the border-left plus a 4% tinted background. Rank-percentile mapping (rather than linear-in-score) ensures visually distinguishable colors even when the score distribution clusters — the gradient travels with each card when the user sorts by date.
 
 **Current hyperparameters** (30-day default-user eval, 2026-06-28): `C=0.5`, `gamma=0.03`, `kernel=rbf`, `neutral_weight=0.0`, `positive_cluster_k=4`. Re-tuned on the 4-binary source feature set; the previous 2026-06-23 setting (`C=0.2, gamma=0.03, kernel=rbf`) was measured on the pre-4-binary-source feature set and is no longer optimal. A wide RBF sweep (49 (C, γ) combos) confirmed `C=0.5, gamma=0.03` sits in a broad plateau spanning `C∈{0.3-1.0}` × `γ∈{0.01-0.03}`, all within 1σ of each other. The plateau is also robust to a linear kernel fallback at the same hyperparams — linear at `C=0.1` gives 0.45 NDCG@40, RBF at the plateau gives 0.49-0.50, a +0.05 lift on the production 394-d feature set. The final-queue (post-13-discovery-passes) lift is even larger: linear 0.493 → RBF 0.596 = +0.10.
+
+The values above are the evaluated benchmark setting. The checked-in `config.toml` currently overrides `C` to `0.1` while retaining `gamma=0.03`; do not read the benchmark row as a statement of the live override.
 
 #### Exact Precomputed RBF Inference
 
@@ -326,9 +328,13 @@ The configured RSS candidate pool mixes community aggregators with curated exper
 Dashboard source badges use display labels derived from stored source IDs. Historical feed-host artifacts such as `rss_rss_slashdot_org` are rendered as readable labels like `Slashdot`, while new feeds hosted at `rss.*`, `feeds.*`, or `feed.*` strip that host prefix before storing the source ID.
 
 ### 3.7 Comment Text Refetch on Growth
-By default, a story's `text_content` (the title + self-post + selected comments baked into a single text blob) is fetched once and frozen along with its 384-dim embedding. The comment subset recursively scans the full comment tree (from CH bulk or Algolia items), drops very short/low-signal text, and selects up to 40 comments / 10K chars for both embeddings and TLDR context. HN comment points are not exposed by the APIs used here, and tree order does not match rendered HN order, so selection uses local structural signals instead of pretending score order is available: up to four top-level threads with the most descendants are treated as discussion cores, each can contribute its root plus several replies, and remaining slots are filled with broad top-level coverage while capping each thread at six comments. During regen, only the integer fields (`score`, `comment_count`) are refreshed.
+The default regeneration interval is 4 hours (`regen_interval_seconds=14400` in `config.toml`); older references to a 3-hour cycle describe superseded configuration.
+
+By default, a story's `text_content` (the title + self-post + selected comments baked into a single text blob) is fetched once and frozen along with its 384-dim embedding. The comment subset recursively scans the full comment tree (from CH bulk or Algolia items), drops very short/low-signal text, and selects up to 40 comments / 10K chars for both embeddings and TLDR context. HN comment points are not exposed by the APIs used here, and tree order does not match rendered HN order, so selection uses local structural signals instead of pretending score order is available: up to four top-level threads with the most descendants are treated as discussion cores, each can contribute its root plus several replies, and remaining slots are filled with broad top-level coverage while capping each thread at six comments. Outside the regen prewarm path, only the integer fields (`score`, `comment_count`) are refreshed.
 
 **Re-embedding on regen**: `pipeline.prewarm_top_stories` is called once per regen cycle (inside `fetch_candidates_only`) for all HN candidates needing fresh comments (or top-N by score, depending on `prewarm_hn_full`). If `text_content` changed (because new top comments were fetched), the story gets re-embedded. Stories that grow fast but stay outside the prewarm scope will have a slightly stale embedding for up to one regen cycle (3h). Stories in `feedback` (voted by the user) are protected from any re-embedding by the `text_hash` check in `get_or_compute_embeddings`, which forces a fresh computation only when the text content changes — not when the score or comment count changes.
+
+The default cycle is 4 hours, so the stale-embedding bound in the preceding historical note is 4 hours under the current configuration.
 
 ### 3.8 Stale Comment Backfill & Data Integrity
 

@@ -13,7 +13,7 @@
 - Make minimal, behavior-preserving changes unless the user asks for a broader refactor.
 - Keep the runtime path local-first; do not add new external dependencies unless needed.
 - **Be very skeptical of unusually high metrics** (e.g. NDCG > 0.40). We are unlikely to beat the Hacker News baseline by a large margin; high metrics often indicate feature leakage, train-test contamination, or metric saturation artifacts.
-- **Do NOT standard-scale raw embeddings** (384-d MiniLM vectors are L2-normalized; StandardScaler must only touch metadata columns from `emb_dim:` onward).
+- **Do NOT standard-scale raw embeddings** (the production 384-d embeddings are L2-normalized; the current configured encoder is mxbai-embed-xsmall-v1). StandardScaler must only touch metadata columns from `emb_dim:` onward.
 - **Never delete or destructively modify the local database** (`hn_rewrite.db`, `hn.db`, or any `*.db` file in the working tree). The DB holds the user's accumulated feedback and is the single source of truth for personalization. No `rm`, no `DELETE FROM` without a `WHERE` clause that excludes all rows, no schema migrations that drop tables or columns with data. The pipeline's own `prune_stories` and `prune_*` operations are fine — they have explicit retention rules and `id NOT IN (SELECT story_id FROM feedback)` guards. When in doubt, ask before running any command that touches the DB file.
   - **Exception (2026-06-22):** 756 test/empty stories (time=0) were deleted with explicit user permission. This included 2 test stories (id=999 "Test", id=99999998 "Test regen live") that received 2 upvotes from user 1. Backup retained at `hn_rewrite.db.pre_test_removal_20260622T163344Z`.
 - Keep test execution times optimized (target under 12 seconds total at `-n 4`). Run the full suite with `uv run pytest tests/ -n 4` (4 cores; `pytest-xdist` is in `dev`). Single-process takes ~32s; `-n 4` brings it to ~22s on this host. Per-test ONNX model loads are avoided entirely by `MockEmbedder(Embedder)` in `tests/test_server.py:18` (overrides `__init__` to skip the `AutoTokenizer.from_pretrained` + `ort.InferenceSession` path) and `DummyEmbedder(Embedder)` in the two seed test files — they share a module-scoped `mock_embedder` fixture in `test_server.py`. The remaining ~22s is dominated by `test_leak_check_smoke` (10s) and `test_leak_check_flag_in_help` (3s) in `test_eval_ranker_variants.py` (subprocesses that run real sklearn). Do not regress this: any new "mock" embedder that subclasses `pipeline.Embedder` MUST override `__init__` or it will silently reload ONNX per test.
@@ -166,7 +166,7 @@ runtime dep (e.g. jax, tensorflow), give it its own
 
 - Migrate feedback from legacy JSON: `uv run python migrate_feedback.py`
 - **Primary archive seeder** — ClickHouse (no GCP auth, 10-30x faster, real-time scores):
-  `uv run python scripts/seed_hn_from_clickhouse.py` (default: 6 months, score ≥ 200)
+  `uv run python scripts/seed_hn_from_clickhouse.py` (default: 12 months, score ≥ 200)
 - **Backup archive seeder** — BigQuery (requires `gcloud`/`bq` auth, stale snapshot):
   `uv run python scripts/seed_hn_from_bq.py --months N --min-score N`
 - Dry-run archive seeders (fetch rows to JSONL, skip DB/Algolia):
@@ -211,11 +211,11 @@ sole source for the live 30-day window and bulk operations.
 
 | Source | Used for | Why |
 |---|---|---|
-| **ClickHouse** (`hackernews_history`) | Live 30-day window (`query_live_window`), bulk comment hydration (archive seed), bulk prewarm (top-50 ranked) | Single SQL query for N stories; 10-100× faster than per-story Algolia |
+| **ClickHouse** (`hackernews_history`) | Live 30-day window (`query_live_window`), bulk comment hydration (archive seed), regen-time bulk prewarm (all eligible HN rows by default) | Single SQL query for N stories; 10-100× faster than per-story Algolia |
 | **Algolia** (`hn.algolia.com`) | Single-story items fallback (lazy TLDR detail for stories outside prewarm) | Real-time, no CH equivalent for one-off fetches; used only as fallback |
 | **BigQuery** (`bigquery-public-data.hacker_news.full`) | Backup archive seeder (manual) | Same data as CH; slower; requires `gcloud`/`bq` auth |
 
-The live `hn` source pipeline (`fetch_candidates` in `pipeline.py`) now
+The live `hn` source pipeline (`fetch_candidates` in `pipeline/__init__.py`) now
 issues **1 CH call per regen**:
 
 1. `ch_client.query_live_window(days=30, min_score=5, limit=5000)` — every
@@ -225,7 +225,7 @@ issues **1 CH call per regen**:
 The prewarm (comment text for all HN candidates with `comment_count > 0` and
 empty `top_comments`) is a second CH call inside `fetch_candidates_only`,
 at regen time — not on the render path. Every user's first dashboard render
-finds the candidate rows already populated. The first 4 cards any user sees
+finds the candidate rows already populated. The first cards any user sees
 have `top_comments` already populated — no Algolia wait and no render-time
 prewarm latency.
 
@@ -238,7 +238,7 @@ prewarm is now driven by `reddit_prewarm_top_per_sub=10` — top 10 hot per sub
 from the topfeed cache, not by score from a DB query).
 
 CH has 1-24h latency for brand-new content (vs Algolia's real-time).
-With a 3h regen cycle, worst case is 4h lag for stories posted in the
+With the default 4h regen cycle, worst case is 5h lag for stories posted in the
 last hour. Acceptable for "best of HN" view; the swipe deck mostly
 shows older stories anyway.
 
