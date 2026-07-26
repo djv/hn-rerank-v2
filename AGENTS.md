@@ -248,6 +248,18 @@ before 2026-06-26) is preserved in
 `scripts/_archive/algolia/` as a fallback if CH
 becomes unavailable.
 
+**Comment tree fetches walk `kids` arrays, never join the comments table.**
+`ch_client.query_comments_bulk` fetches a story's comment tree with one
+`id IN (...)` lookup per level (via each row's `kids` array), N+1 cheap
+queries instead of a single join. An earlier version joined against
+`(SELECT * FROM hackernews_history FINAL WHERE type = 'comment' ...)` once
+per level and reliably exceeded play.clickhouse.com's query memory limit
+(`Code: 241 MEMORY_LIMIT_EXCEEDED`) regardless of batch size — this killed
+HN discussion TLDR generation site-wide from 2026-07-23 to 2026-07-26 (see
+WORKLOG.md). Do not reintroduce a full-table join or `FINAL` scan in a
+comment query; `tests/test_ch_client.py::test_comment_queries_do_not_join_or_scan_full_table`
+guards against it.
+
 ## See also
 - [WORKLOG.md](WORKLOG.md) — recent changes and operational events
 

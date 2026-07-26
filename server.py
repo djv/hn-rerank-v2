@@ -2025,6 +2025,17 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             story, runtime.config, time.time()
         )
 
+        # An HN story with comments on HN but nothing in top_comments (missed
+        # prewarm, or prewarm failed) must also bypass the cache hit below —
+        # otherwise it is served whatever article-only blob was cached the
+        # first time and can never recover, since the refresh check above
+        # requires top_comments to already be non-empty.
+        needs_empty_fetch = (
+            is_hn_source(story.source)
+            and not story.top_comments
+            and (story.comment_count or 0) > 0
+        )
+
         article_body = story.article_body or None
         cache_key = _tldr_cache_key(
             title=story.title,
@@ -2033,7 +2044,7 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             article_body=article_body or "",
         )
         cached_tldr = runtime.db.get_tldr_cache(story.id, cache_key)
-        if cached_tldr and not needs_active_refresh:
+        if cached_tldr and not needs_active_refresh and not needs_empty_fetch:
             logging.info(
                 "tldr_detail story_id=%s result=cache_hit cache_key=%s",
                 story.id,
@@ -2053,13 +2064,6 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
                 quota.retry_after_seconds,
             )
 
-        # If an HN story has comments but no cached comment text, fetch them
-        # lazily.
-        needs_empty_fetch = (
-            is_hn_source(story.source)
-            and not story.top_comments
-            and (story.comment_count or 0) > 0
-        )
         if needs_empty_fetch or needs_active_refresh:
             try:
                 from pipeline import fetch_story

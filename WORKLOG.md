@@ -2,6 +2,61 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-26 — fix: HN discussion TLDR generation dead site-wide since 2026-07-23 (CH bulk comment query OOM)
+
+Discussion TLDRs (the `### Discussion` section of `/api/tldr-detail`) stopped
+generating for HN stories on 2026-07-23 05:45 UTC and stayed dead through
+2026-07-26. Daily `top_comments` fill rate for HN stories with comments:
+07-22 133/174, 07-23 5/164, 07-24 2/160, 07-25 1/131, 07-26 0/34.
+
+Two compounding defects:
+
+1. `ch_client._build_comments_bulk_query` joined
+   `(SELECT * FROM hackernews_history FINAL WHERE type = 'comment' ...)`
+   once per tree level (×5). Against the shared `play.clickhouse.com`
+   instance this reliably exceeded the query memory limit
+   (`Code: 241. DB::Exception: Query memory limit exceeded: would use
+   18.64 GiB, maximum: 18.63 GiB (MEMORY_LIMIT_EXCEEDED)`) — reproduced
+   at batch sizes 1 through 200, so batch size was never the variable.
+   Every regen logged `prewarm_top_stories: CH bulk query failed (500)` →
+   `prewarmed 0/N HN candidates`; `_post_ch`'s `resp.raise_for_status()`
+   discarded the response body, so five days of logs said only "500
+   Internal Server Error" and never showed the real CH error. No code
+   change caused this — `git log` shows nothing between 07-20 and the
+   incident — the trigger was contention on the shared instance pushing
+   an always-marginal query shape over the edge.
+2. Once a story's `top_comments` went empty, it could never recover:
+   `/api/tldr-detail`'s refresh gate (`needs_active_refresh` in
+   `server.py`) required `bool(story.top_comments)` to be true before
+   even considering a refetch, so the cache-hit path returned the
+   article-only blob forever. The lazy per-story comment fetch that
+   exists for exactly this case (`needs_empty_fetch`) was unreachable
+   because it was checked *after* the cache short-circuit.
+
+Fix:
+- `ch_client.py`: replaced the chained-CTE/join query with a BFS walk over
+  each story's `kids` array — one `id IN (...)` lookup per tree level
+  instead of a join against the full comments table. Verified live:
+  story 49038433 (1148 comments) now returns 1061 comments in 0.6s versus
+  reliably OOMing before.
+- `ch_client._post_ch` now includes the CH response body in raised errors.
+- `pipeline/enrichment.prewarm_top_stories` chunks its CH fetch (100
+  stories/chunk) so one failed chunk costs that chunk, not the whole run.
+- `server.py`: `needs_empty_fetch` is now computed and checked before the
+  cache short-circuit, so a comment-less HN story can reach the lazy
+  fetch instead of being served a permanently stale article-only blob.
+- `scripts/backfill_hn_comments.py` (new): reuses `prewarm_top_stories`
+  to backfill stories stuck with `comment_count > 0` and empty
+  `top_comments`. Backed up the DB (`./scripts/backup_hn_db.sh`,
+  snapshot `20260726T161824Z`) before running; found 2294 stuck HN
+  stories, backfilled in chunks of 100.
+
+Verified: `uv run pytest tests/ -n 4` (564 passed, 3 pre-existing
+unrelated Reddit-topfeed failures reproduced on unmodified `main`, 1
+skipped), `ruff check .` clean, `ty check` clean. Added a query-shape
+regression test (`test_comment_queries_do_not_join_or_scan_full_table`)
+asserting no `INNER JOIN`/`FINAL` in the comment queries.
+
 ## 2026-07-15 — fix: interaction ledger silently dropped whole batches (all non-HN events lost)
 
 `POST /api/interaction` rejected `story_id <= 0`, but every non-HN story uses a
