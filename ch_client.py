@@ -1,9 +1,17 @@
 """ClickHouse client for HN bulk data queries.
 
-Replaces per-story parallel Algolia calls with one SQL query for N stories
+Replaces per-story parallel Algolia calls with SQL queries for N stories
 plus their comment trees. CH Playground is free, no auth, no rate limit
 worth mentioning for our usage (~0.3s per 100-story bulk query, ~1s for
 2,000 stories).
+
+Comment trees are fetched by walking each story's `kids` array level by
+level (`query_comments_bulk`), one `id IN (...)` query per level, rather
+than joining against the full comments table. A single-query join
+(`INNER JOIN (SELECT * FROM hackernews_history FINAL WHERE type =
+'comment' ...)`, repeated once per level) reliably exceeds the shared
+play.clickhouse.com instance's query memory limit regardless of batch
+size — see incident notes in WORKLOG.md.
 
 Public API:
 - query_live_window(days, min_score, limit) -> list of story metadata dicts
@@ -95,7 +103,21 @@ def _post_ch(query: str) -> list[dict[str, Any]]:
         content=query,
         timeout=CH_TIMEOUT_SECONDS,
     )
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        # raise_for_status() alone discards the response body, which is
+        # where CH puts the actual error (e.g. "Code: 241 ...
+        # MEMORY_LIMIT_EXCEEDED"). Without this, failures all look like a
+        # bare "500 Internal Server Error" in the logs.
+        try:
+            body = resp.text[:500]
+        except Exception:
+            body = "<unreadable response body>"
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise httpx.HTTPStatusError(
+                f"{exc}: {body}", request=exc.request, response=exc.response
+            ) from exc
     payload: Any = resp.json()
     if isinstance(payload, dict) and "data" in payload:
         return payload["data"]
@@ -210,60 +232,56 @@ def query_stories_bulk(story_ids: list[int]) -> dict[int, dict[str, Any]]:
     return out
 
 
-def _build_comments_bulk_query(story_ids: list[int], max_levels: int) -> str:
-    """Build a chained-CTE query that returns comments for N stories.
+# Comment fetching walks the `kids` arrays level by level instead of joining
+# against the full `hackernews_history` comments table. The previous
+# chained-CTE approach (`INNER JOIN (SELECT * FROM hackernews_history FINAL
+# WHERE type = 'comment' ...)`, repeated once per level) forced CH to
+# materialise every HN comment ever posted, once per level; against the
+# shared play.clickhouse.com instance this reliably blew the query memory
+# limit (Code: 241, MEMORY_LIMIT_EXCEEDED) regardless of batch size. An
+# `id IN (...)` lookup against the exact IDs named by `kids` touches only
+# the rows we need and is effectively free.
+_ID_CHUNK_SIZE = 5000
+# Cap the number of comment IDs fetched at any one level so a single
+# pathological megathread can't blow the query back up; this is well above
+# any real HN thread's per-level fanout.
+_MAX_LEVEL_FRONTIER = 20_000
 
-    Returns rows with columns: id, type, by, parent, story_id, text, kids.
-    For level0, story_id == parent (the comment's parent is the story).
-    For deeper levels, story_id is inherited from the level0 comment that
-    initiated the chain.
 
-    Uses argMax(kids, update_time) on the story row to ensure we get the
-    latest version of each story's kids array. CH Playground's FINAL
-    keyword can collapse to a version with empty kids in some cases;
-    argMax is explicit and reliable.
+def _chunked(ids: list[int], size: int = _ID_CHUNK_SIZE) -> list[list[int]]:
+    return [ids[i : i + size] for i in range(0, len(ids), size)]
+
+
+def _build_story_kids_query(story_ids: list[int]) -> str:
+    """Return each story's `kids` array (level-0 comment IDs).
+
+    Uses argMax(kids, update_time) rather than FINAL to pick the latest
+    version of each story row; CH Playground's FINAL can collapse to a
+    version with an empty kids array in some cases, argMax is explicit.
     """
-    if not story_ids:
-        return "SELECT 1 WHERE 0"
     ids_csv = ",".join(str(int(i)) for i in story_ids)
-    ctes = [
-        f"""
-story_kids AS (
-    SELECT id, argMax(kids, update_time) AS kids
-    FROM hackernews_history
-    WHERE id IN ({ids_csv}) AND type = 'story' AND deleted = 0 AND dead = 0
-    GROUP BY id
-)""",
-        """
-expanded_kids AS (
-    SELECT arrayJoin(sk.kids) AS id, sk.id AS story_id
-    FROM story_kids sk
-    WHERE length(sk.kids) > 0
-)""",
-        """
-level0 AS (
-    SELECT h.id, h.type, h.by, h.parent, ek.story_id, h.text, h.kids
-    FROM (SELECT * FROM hackernews_history FINAL WHERE type = 'comment' AND deleted = 0 AND dead = 0) AS h
-    INNER JOIN expanded_kids ek ON h.id = ek.id
-)""",
-    ]
-    prev = "level0"
-    for lvl in range(1, max_levels):
-        cur = f"level{lvl}"
-        ctes.append(
-            f"""
-{cur} AS (
-    SELECT h.id, h.type, h.by, h.parent, p.story_id, h.text, h.kids
-    FROM (SELECT * FROM hackernews_history FINAL WHERE type = 'comment' AND deleted = 0 AND dead = 0) AS h
-    INNER JOIN {prev} p ON h.parent = p.id
-)"""
-        )
-        prev = cur
-    union_parts = [
-        f"SELECT id, type, by, parent, story_id, text, kids FROM {p}"
-        for p in ["level0"] + [f"level{i}" for i in range(1, max_levels)]
-    ]
-    return "WITH " + ",\n".join(ctes) + "\n" + "\nUNION ALL\n".join(union_parts)
+    return f"""
+SELECT id, argMax(kids, update_time) AS kids
+FROM hackernews_history
+WHERE id IN ({ids_csv}) AND type = 'story' AND deleted = 0 AND dead = 0
+GROUP BY id
+"""
+
+
+def _build_comment_level_query(comment_ids: list[int]) -> str:
+    """Return comment rows (with their own `kids`) for an exact ID list."""
+    ids_csv = ",".join(str(int(i)) for i in comment_ids)
+    return f"""
+SELECT
+    id,
+    any(by) AS by,
+    any(parent) AS parent,
+    argMax(text, update_time) AS text,
+    argMax(kids, update_time) AS kids
+FROM hackernews_history
+WHERE id IN ({ids_csv}) AND type = 'comment' AND deleted = 0 AND dead = 0
+GROUP BY id
+"""
 
 
 def query_comments_bulk(
@@ -272,20 +290,45 @@ def query_comments_bulk(
 ) -> dict[int, list[dict[str, Any]]]:
     """Return {story_id: [comment_dict, ...]} for the given stories.
 
-    Each comment dict has the Algolia items shape (id, type, text, kids).
-    Children are not recursively nested in the result; the caller is expected
-    to use parent IDs to reconstruct the tree if needed.
+    Walks the `kids` arrays breadth-first, one cheap `id IN (...)` query per
+    level, instead of joining against the full comments table. Each comment
+    dict has the Algolia items shape (id, type, text, kids). Children are
+    not recursively nested in the result; the caller is expected to use
+    parent IDs to reconstruct the tree if needed.
     """
     if not story_ids:
         return {}
     if max_levels < 1:
         raise ValueError("max_levels must be >= 1")
-    rows = _post_ch(_build_comments_bulk_query(story_ids, max_levels))
+
     by_story: dict[int, list[dict[str, Any]]] = {sid: [] for sid in story_ids}
-    for row in rows:
-        sid = _to_int(row.get("story_id"))
-        if sid in by_story:
-            by_story[sid].append(_build_comment_dict(row))
+
+    # frontier maps comment_id -> owning root story_id, for the level about
+    # to be fetched.
+    frontier: dict[int, int] = {}
+    for chunk in _chunked(list(story_ids)):
+        for row in _post_ch(_build_story_kids_query(chunk)):
+            sid = _to_int(row.get("id"))
+            for kid in row.get("kids") or []:
+                frontier[_to_int(kid)] = sid
+
+    level = 0
+    while frontier and level < max_levels:
+        ids = list(frontier.keys())[:_MAX_LEVEL_FRONTIER]
+        next_frontier: dict[int, int] = {}
+        for chunk in _chunked(ids):
+            for row in _post_ch(_build_comment_level_query(chunk)):
+                cid = _to_int(row.get("id"))
+                sid = frontier.get(cid)
+                if sid is None:
+                    continue
+                if sid in by_story:
+                    by_story[sid].append(_build_comment_dict(row))
+                for kid in row.get("kids") or []:
+                    next_frontier[_to_int(kid)] = sid
+        frontier = next_frontier
+        level += 1
+
     return by_story
 
 
@@ -297,10 +340,6 @@ SELECT
 FROM hackernews_history FINAL
 WHERE id = {int(story_id)}
 """
-
-
-def _build_single_story_comments_query(story_id: int, max_levels: int) -> str:
-    return _build_comments_bulk_query([story_id], max_levels)
 
 
 def query_stories_with_comments(
@@ -348,7 +387,7 @@ def query_single_story(story_id: int, max_levels: int = 5) -> dict[str, Any] | N
     if not story_rows:
         return None
     story_dict = _build_story_dict(story_rows[0])
-    comment_rows = _post_ch(_build_single_story_comments_query(story_id, max_levels))
-    story_dict["children"] = [_build_comment_dict(r) for r in comment_rows]
+    comments_by_story = query_comments_bulk([story_id], max_levels)
+    story_dict["children"] = comments_by_story.get(story_id, [])
     _cache_put(key, story_dict)
     return story_dict

@@ -8,7 +8,7 @@ import re
 import threading
 import time
 from dataclasses import replace
-from typing import Protocol
+from typing import Any, Protocol
 from urllib.parse import urlparse
 
 import feedparser
@@ -189,6 +189,11 @@ async def fetch_story(
         return story if story else None
 
 
+# Stories per CH fetch chunk in prewarm_top_stories. Keeps a single failed
+# chunk (network blip, CH overload) from zeroing out an entire prewarm run.
+_PREWARM_CHUNK_SIZE = 100
+
+
 def prewarm_top_stories(
     story_ids: list[int],
     db: Database,
@@ -224,11 +229,20 @@ def prewarm_top_stories(
     if not target_ids:
         return 0
 
-    try:
-        ch_items = query_stories_with_comments(target_ids, max_levels=max_levels)
-    except Exception as exc:
-        logging.warning("prewarm_top_stories: CH bulk query failed (%r)", exc)
-        return 0
+    # Chunk the CH fetch: one chunk failing (network blip, CH overload)
+    # should cost that chunk, not the entire prewarm run.
+    ch_items: dict[int, dict[str, Any]] = {}
+    for i in range(0, len(target_ids), _PREWARM_CHUNK_SIZE):
+        chunk = target_ids[i : i + _PREWARM_CHUNK_SIZE]
+        try:
+            ch_items.update(query_stories_with_comments(chunk, max_levels=max_levels))
+        except Exception as exc:
+            logging.warning(
+                "prewarm_top_stories: CH bulk query failed for chunk of %d (%r)",
+                len(chunk),
+                exc,
+            )
+            continue
 
     if not ch_items:
         return 0
