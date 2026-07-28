@@ -2,6 +2,56 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-28 — fix: hn_rewrite.service memory footprint (glibc arena retention, not a Python leak)
+
+`hn_rewrite.service` was sitting at ~4.9 GB RSS with a 13h peak of 7.0 GB on
+an 8 GB host (1.1 GB free, 4.0/8 GB swap used), one long-article encode away
+from an OOM kill.
+
+Audited every in-memory cache in `server.py`/`pipeline/` — all bounded
+(`_MODEL_CACHE` capped at 20 entries ~250 MB, `_dashboard_cache` capped at
+100 entries, embedder session+weights ~160 MB fixed) — total accounted-for
+memory only ~400-600 MB. The gap is allocator retention, confirmed by
+inspecting the live process (`/proc/<pid>/smaps`, `/proc/<pid>/maps`): 18
+threads, 4.07 GB RSS but **10 GB of mappings** across 107 large anon regions
+totalling 6.8 GB reserved; eleven regions exactly 64 MB, the glibc
+per-thread-arena signature. ORT's own arena is disabled
+(`enable_cpu_mem_arena = False`, `pipeline/ranking.py`), so large tensors go
+straight to glibc malloc, which never hands the pages back — glibc's dynamic
+mmap threshold also ratchets up to 32 MB after large frees, so subsequent big
+allocations land in retained heap instead of being `munmap`'d.
+
+Root driver of the large-tensor side: `embedding_max_tokens = 4096` against
+mxbai-embed-xsmall-v1 (12 heads); BERT attention scores are
+`batch × heads × seq² × 4 B` — quadratic in sequence length. A week of
+`embedding_perf` logs showed 606/783 encodes were single-text (batch size
+irrelevant to them) and only 177 were multi-text (max 426 texts/regen batch);
+`padding=True` means those multi-text batches pay seq² cost on the *longest*
+text in the batch, wasting cycles on texts that didn't need it.
+
+Fix (config/unit-file only — no re-embed, no ranking change):
+- `~/.config/systemd/user/hn_rewrite.service`: added
+  `MALLOC_ARENA_MAX=2`, `MALLOC_MMAP_THRESHOLD_=131072`,
+  `MALLOC_TRIM_THRESHOLD_=131072`. Caps per-thread arena hoarding and disables
+  glibc's dynamic mmap-threshold ratcheting so large tensors are `mmap`'d and
+  fully returned to the OS on free.
+- `config.toml`: `embedding_batch_size` 2 → 1, halving the transient
+  attention-tensor peak. Does **not** invalidate cached embeddings —
+  `embedding_model_version` (`mxbai-embed-xsmall-v1|mean|norm|4096`) does not
+  encode batch size, and mean-pooling over the attention mask makes padding
+  semantically inert either way.
+
+Deliberately did *not* touch `embedding_max_tokens` — that changes truncation
+and would invalidate all ~46k stored embeddings, requiring a model-version
+bump and full re-embed. Revisit only if the above proves insufficient after
+measurement (see verification in the session's plan file).
+
+Not yet applied: `MemoryHigh`/`MemoryMax` guardrail (deferred until the
+post-fix peak is measured — setting it before that risks OOM-killing a
+legitimate long-article encode) and an explicit `malloc_trim(0)` call after
+`Embedder.encode` (only needed if the env vars alone don't bring steady-state
+RSS under ~2.5 GB).
+
 ## 2026-07-26 — fix: HN discussion TLDR generation dead site-wide since 2026-07-23 (CH bulk comment query OOM)
 
 Discussion TLDRs (the `### Discussion` section of `/api/tldr-detail`) stopped
