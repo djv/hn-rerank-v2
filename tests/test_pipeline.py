@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 import time
 from collections.abc import Callable
+from email.utils import formatdate
 from numpy.typing import NDArray
 from pathlib import Path
 from types import SimpleNamespace
@@ -54,6 +55,17 @@ def db():
     db_instance = Database(":memory:")
     yield db_instance
     db_instance.close()
+
+
+def _recent_pubdate(days_ago: float = 1.0) -> str:
+    """RFC-822 pubDate `days_ago` days in the past.
+
+    Reddit topfeed factories filter entries against a
+    `now - days * 86400` cutoff (see `build_reddit_topfeed_factories`
+    in pipeline/enrichment.py), so a hardcoded date silently ages out
+    of the window and yields an empty feed. Always generate relative.
+    """
+    return formatdate(time.time() - days_ago * 86400, usegmt=True)
 
 
 def test_config_load_missing_file_returns_dataclass_defaults(tmp_path):
@@ -1050,7 +1062,7 @@ async def test_build_reddit_topfeed_serializes_and_sets_user_agent(
     def rss_doc(title: str, link: str) -> str:
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0"><channel><title>Test</title>
-<item><title>{title}</title><link>{link}</link><pubDate>Tue, 23 Jun 2026 12:00:00 GMT</pubDate><description>Substantial test summary text for ranking.</description></item>
+<item><title>{title}</title><link>{link}</link><pubDate>{_recent_pubdate()}</pubDate><description>Substantial test summary text for ranking.</description></item>
 </channel></rss>"""
 
     class MockClient:
@@ -1141,7 +1153,7 @@ async def test_build_reddit_topfeed_populates_self_text(tmp_path, monkeypatch):
         return f"""<?xml version="1.0"?>
 <rss><channel>
 <item><title>{title}</title><link>{link}</link>
-<pubDate>Tue, 23 Jun 2026 12:00:00 GMT</pubDate>
+<pubDate>{_recent_pubdate()}</pubDate>
 <description>{body}</description>
 </item></channel></rss>"""
 
@@ -1251,7 +1263,7 @@ async def test_build_reddit_topfeed_cache_miss_fetches_and_caches(
     def rss_doc(title: str, link: str) -> str:
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0"><channel><title>Test</title>
-<item><title>{title}</title><link>{link}</link><pubDate>Tue, 23 Jun 2026 12:00:00 GMT</pubDate><description>test body</description></item>
+<item><title>{title}</title><link>{link}</link><pubDate>{_recent_pubdate()}</pubDate><description>test body</description></item>
 </channel></rss>"""
 
     class MockResp:
