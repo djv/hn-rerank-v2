@@ -254,14 +254,28 @@ The server logs dashboard timing with stable prefixes: `dashboard_cache_invalida
 
 For offline timing, run `uv run python scripts/benchmark_rank_cold_cache.py`. By default it opens `hn_rewrite.db` read-only, selects the user with the most feedback, clears the in-process SVM model cache before cold runs, and then repeats warm runs against the same process cache. If read-only ranking would need to compute missing embeddings, the script exits with a preflight summary instead of writing to the live DB; run `uv run python scripts/embed_remaining.py` first or pass `--allow-writes` explicitly.
 
-**Heavy-vote reload finding (2026-06-29).** The current bottleneck is not
-warm-cache `SVC.fit`; it is scoring the full candidate pool with the RBF
-SVM. A live benchmark for user 1 with 2,517 feedback rows and 8,915
-candidates measured warm-cache reloads at ~6.5s, with
+**Heavy-vote reload finding (2026-06-29, reconfirmed 2026-07-28).** The
+current bottleneck is not warm-cache `SVC.fit`; it is scoring the full
+candidate pool with the RBF SVM. A live benchmark for user 1 with 2,517
+feedback rows and 8,915 candidates measured warm-cache reloads at ~6.5s, with
 `decision_function` alone at ~4.3s and candidate SVM feature prep at
 ~1.5s. Exact-path cleanup brought `candidate_sql` down to ~100ms and
 badge similarity to ~30ms, but cannot make reloads sub-3s while every
 candidate is sent through the RBF SVM.
+
+Reconfirmed after the 3.3.1 candidate-pool cache shipped: live votes from
+user 1 (now 3,810 feedback rows, ~8,040 candidates) still show `rank_total_ms`
+of 7,060-7,964ms, with `candidate_sql_ms`/`candidate_embedding_ms` down to
+5.5-16.5ms (`pool_cache=hit` — 3.3.1 working as intended) but
+`svm_candidate_feature_prep_ms` (~1.5-1.8s) and `decision_ms` (~0.9-1.0s)
+essentially unchanged, plus `hn_dupes_ms`/`dedup_ms` (~0.4-0.7s each) that
+also scale with candidate count. All four are `O(candidates × feedback_total)`
+work (k-NN/kernel evaluations against the full up/down feedback set) that
+must recompute on every vote, since the model cache key is the feedback
+signature itself — a new vote is a new signature by construction, so no
+caching layer can shortcut it without changing what gets computed. This is
+orthogonal to 3.3.1 (which only removed the shared-pool *reload* cost) and
+remains open; see the follow-up options below.
 
 The saved follow-up options are:
 
