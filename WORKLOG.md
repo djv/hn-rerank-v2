@@ -2,6 +2,27 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-07-28 — fix: `test_build_reddit_topfeed_*` time-bomb failures
+
+Three tests (`test_build_reddit_topfeed_serializes_and_sets_user_agent`,
+`test_build_reddit_topfeed_populates_self_text`,
+`test_build_reddit_topfeed_cache_miss_fetches_and_caches`) were failing on
+main HEAD with `reddit_feed_cache.get(...)` returning empty/`None`. Not a
+regression: each built a mock RSS document with a hardcoded
+`<pubDate>Tue, 23 Jun 2026 12:00:00 GMT</pubDate>`, then drove
+`build_reddit_topfeed_factories(..., days=30)`. That helper filters entries
+older than `now - days*86400` (`pipeline/enrichment.py`), so once wall-clock
+time passed 30 days past the hardcoded date, every mock entry was silently
+dropped, `stories` came back empty, and `reddit_feed_cache.set(...)` was
+never called.
+
+Fix: `tests/test_pipeline.py` gained a `_recent_pubdate(days_ago=1.0)` helper
+(via `email.utils.formatdate`) and the three affected mock RSS docs now
+generate a relative pubDate instead of a fixed one. Three sibling tests
+(`test_rss_feed_captures_comments_url` etc.) keep the hardcoded date — they
+call `_fetch_and_parse_feed` directly with `cutoff=0` and are immune by
+construction. No production code changed.
+
 ## 2026-07-28 — fix: hn_rewrite.service memory footprint (glibc arena retention, not a Python leak)
 
 `hn_rewrite.service` was sitting at ~4.9 GB RSS with a 13h peak of 7.0 GB on
