@@ -23,6 +23,51 @@ generate a relative pubDate instead of a fixed one. Three sibling tests
 call `_fetch_and_parse_feed` directly with `cutoff=0` and are immune by
 construction. No production code changed.
 
+## 2026-07-28 — perf: shared candidate pool cache (friend-session investigation)
+
+A friend tested the dashboard for ~4h on 2026-07-13 (`user_id=44`, 65 feedback
+versions, 220 recorded ranks). Nothing errored — every interaction was a 200 —
+but the dashboard never visibly personalized: **zero** full-page renders came
+back `result=cache_hit`/`stale_hit` with real personalization; every `GET /`
+logged `result=cold_deck`, with `elapsed_ms` up to 12,286.9. Per-warm SVM rank
+time: median 4,440ms, p90 15,380ms, max 32,900ms (`rank_perf` for user 44,
+n=220).
+
+Profiling `rank_perf`'s per-stage breakdown showed the SVM fit itself
+(`svm_fit_ms`) was a non-issue at 5.6ms median — the cost was reloading the
+~8,900-row candidate pool from SQLite and re-materializing its embedding
+matrix on *every* warm, for *every* user: `candidate_sql_ms` med 2,070ms (p90
+8,544ms), `candidate_embedding_ms` med 620ms (p90 7,471ms). That's ~60-70% of
+`rank_total_ms`, and it's fully shareable work — the pool only differs per
+user by which stories are excluded for already-voted feedback, and it only
+changes at regen.
+
+Fix: `pipeline/candidate_cache.py` — a process-wide, lock-guarded
+`CandidatePool` (stories + `(N, 384)` embedding matrix + id→index map),
+built once via the existing `load_production_candidate_stories(...,
+exclude_feedback=False)` + `get_or_compute_embeddings`, with per-user feedback
+exclusion applied as an in-memory boolean-mask (`CandidatePool.without_feedback`)
+instead of a SQL filter. Wired into `fast_rerank_for_user` and
+`build_cold_deck` (both now take an optional `embedder` — cache-backed when
+present); `Handler._rebuild_cold_deck` (`server.py`) calls
+`invalidate_candidate_pool()` before rebuilding, so regen's fresh rows land in
+the next pool build off the request thread. The candidate pool is scoped to
+the passed-in `Database` instance by identity, so tests using ephemeral
+`:memory:` databases never see a stale cross-test pool.
+
+`fast_rerank_for_user`'s zero-feedback branch deliberately keeps the old
+uncached, no-embedder path — a 0-vote cold deck is pure gravity/time ranking
+and never touched embeddings before; forcing it through the pool cache would
+have made a no-op path pay an embedding cost for no benefit.
+
+Live verification after restart (fresh test user, 12-vote swipe burst via
+`POST /api/feedback`): `rank_total_ms` 253.3 and 281.6 (`pool_cache=hit`,
+`candidate_sql_ms` 8.5/0.1, `candidate_embedding_ms` 12.7/6.3), followed by a
+`GET /` logging `result=cache_hit elapsed_ms=0.0` — the fast path this fix was
+meant to unlock. No new errors in the post-restart journal; RSS unchanged at
+~1.1G (the shared pool's embedding matrix is ~14MB for ~8,900 candidates,
+noise against existing model/ORT overhead).
+
 ## 2026-07-28 — fix: hn_rewrite.service memory footprint (glibc arena retention, not a Python leak)
 
 `hn_rewrite.service` was sitting at ~4.9 GB RSS with a 13h peak of 7.0 GB on

@@ -103,6 +103,11 @@ from .enrichment import (
     select_article_fetch_candidates,
 )
 from .hn_dupes import _load_feedback_context, _matches_feedback, canonicalize_hn_dupes
+from .candidate_cache import (
+    CandidatePool,
+    get_candidate_pool,
+    invalidate_candidate_pool,
+)
 
 from .render import (
     generate_dashboard_bytes,
@@ -134,7 +139,10 @@ def _combo_keys_for_story(story: Story, recent_cutoff: int) -> str:
 
 
 def build_cold_deck(
-    db: Database, config: Config, user_id: int | None = None
+    db: Database,
+    config: Config,
+    user_id: int | None = None,
+    embedder: Embedder | None = None,
 ) -> list[RankedStory]:
     """Build a gravity-sorted, badge-annotated fallback deck — no embeddings,
     no personalization.
@@ -152,16 +160,31 @@ def build_cold_deck(
     skipped — it's personalized and requires feedback to compute against.
 
     When *user_id* is provided, already-voted stories are excluded.
+
+    When *embedder* is provided, the candidate pool is served from the
+    process-wide cache (``pipeline.candidate_cache``) instead of a fresh
+    SQL load — this is the production path (server.py passes the runtime
+    embedder), and avoids re-paying the ~2-8s candidate SQL/embedding cost
+    on every cold-deck build. Without an embedder (e.g. offline tests),
+    falls back to a direct, uncached load; cold-deck ranking never uses
+    embeddings so behavior is identical either way.
     """
     now_ts = int(time.time())
-    candidates = load_production_candidate_stories(
-        db,
-        config,
-        user_id=user_id,
-        exclude_feedback=user_id is not None,
-        now_ts=now_ts,
-    )
-    candidates = [story for story in candidates if is_summarizable(story)]
+    if embedder is not None:
+        pool = get_candidate_pool(db, config, embedder)
+        if user_id is not None:
+            voted_ids = frozenset(_voted_story_ids(db, user_id))
+            candidates, _ = pool.without_feedback(voted_ids)
+        else:
+            candidates = list(pool.stories)
+    else:
+        candidates = load_production_candidate_stories(
+            db,
+            config,
+            user_id=user_id,
+            exclude_feedback=user_id is not None,
+            now_ts=now_ts,
+        )
     if not candidates:
         return []
 
@@ -288,6 +311,20 @@ def load_production_candidate_stories(
         for story in (Database._row_to_story(row) for row in rows)
         if is_summarizable(story)
     ]
+
+
+def _voted_story_ids(db: Database, user_id: int) -> set[int]:
+    """All story IDs a user has left feedback on, any action.
+
+    Mirrors the ``id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?)``
+    exclusion in ``load_production_candidate_stories`` — used to apply the
+    same exclusion as an in-memory mask over the cached candidate pool
+    instead of a SQL filter.
+    """
+    rows = db.execute(
+        "SELECT story_id FROM feedback WHERE user_id = ?", (user_id,)
+    )
+    return {row[0] for row in rows}
 
 
 def _needs_hn_prewarm(s: Story) -> bool:
@@ -480,6 +517,9 @@ def fast_rerank_for_user(
     trace.set_count("feedback_total", n_feedback)
     if n_feedback == 0:
         trace.set_label("model_cache", "skipped_cold_deck")
+        # Zero-feedback cold deck is a pure gravity/time ranking — no
+        # embeddings needed, so don't force the (embedder-requiring)
+        # candidate pool cache here; keep the direct, uncached load.
         cold_deck = build_cold_deck(db, config)
         return canonicalize_hn_dupes(
             cold_deck,
@@ -491,19 +531,17 @@ def fast_rerank_for_user(
         )
 
     with trace.stage("candidate_sql"):
-        candidates = load_production_candidate_stories(
-            db,
-            config,
-            user_id=user_id,
-            exclude_feedback=True,
-        )
+        pool = get_candidate_pool(db, config, embedder, trace=trace)
+        voted_ids = frozenset(_voted_story_ids(db, user_id))
+    if not pool.stories:
+        return []
+
+    with trace.stage("candidate_embedding"):
+        candidates, cand_embeddings = pool.without_feedback(voted_ids)
     if trace is not None:
         trace.set_count("candidates", len(candidates))
     if not candidates:
         return []
-
-    with trace.stage("candidate_embedding"):
-        cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
 
     # Built once per request and threaded into badge assembly so the
     # Explore passes (Unsure/Novel/Similar) can skip-and-backfill past

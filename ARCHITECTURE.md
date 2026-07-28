@@ -31,6 +31,7 @@ The codebase consists of six primary modules plus the `pipeline/` package:
 1. **[database.py](database.py)**: Encapsulates all SQLite interactions. Manages schemas (`stories`, `embeddings`, `feedback`), cascade-deletes, pruned retention rules, and automatic schema migrations. Staging raw inputs directly inside `stories` (`self_text`, `top_comments`, `article_body`) permits on-the-fly text composition and sync-detection. The legacy `article_cache` table is dropped and migrated directly.
 2. **[pipeline/](pipeline/)** — package split from the original `pipeline.py`:
    - **[pipeline/__init__.py](pipeline/__init__.py)** — Conductor: candidate orchestration (`fetch_candidates`, `fetch_candidates_only`), cold-deck assembly (`build_cold_deck`), per-user dashboard entry point (`fast_rerank_for_user`), dedup filter (`_apply_dedup_to_ranked`). Re-exports the full flat namespace so all `from pipeline import X` callers remain unchanged.
+   - **[pipeline/candidate_cache.py](pipeline/candidate_cache.py)** — Process-wide `CandidatePool` cache (stories + embedding matrix, masked per user for feedback exclusion) shared across `build_cold_deck`/`fast_rerank_for_user`; see §3.3.1.
    - **[pipeline/config.py](pipeline/config.py)** — Configuration dataclasses (`Config`, `ModelConfig`, `RssConfig`), TOML loader (`Config.load`), config overlay helper, archive/CH source constants, `is_hn_source`.
    - **[pipeline/ranking.py](pipeline/ranking.py)** — Text utilities (`clean_text`, `compose_story_text`, `story_embedding_text`), comment extraction/selection, ONNX `Embedder`, embedding cache (`get_or_compute_embeddings`), SVM model cache, similarity kernels, feature assembly, `_score_and_rank`, MMR diversity filter, `rerank_candidates` (badge passes + combo assembly), `RankedStory`/`RankTrace` dataclasses.
    - **[pipeline/enrichment.py](pipeline/enrichment.py)** — RSS feed parsing, Algolia fallback fetch (`fetch_story`), HN/Reddit/LessWrong comment prewarm, Reddit topfeed builders, article-body fetch pipeline. Holds the 3 late `from server import ...` sites that dissolve the pipeline↔server import cycle.
@@ -249,7 +250,7 @@ When a user votes, the visible card exits immediately and the next queued card b
 
 Personalized warming and global candidate regeneration are independent feedback paths. Every successful vote or clear participates in the fast per-user cadence above, while also restarting one process-wide trailing timer controlled by `feedback_regen_idle_seconds` (default 300 seconds). Only when the app has received no feedback changes for that interval does the timer signal the normal regeneration loop. Votes from all users coalesce into the same timer, and any periodic regeneration that begins while the timer is pending satisfies and cancels that delayed request. Rejected feedback and clears that delete no row schedule neither path. The normal four-hour regeneration interval is unchanged.
 
-The server logs dashboard timing with stable prefixes: `dashboard_cache_invalidated`, `dashboard_warm`, `dashboard_render`, and `rank_perf`. Render logs include cache-hit/stale/skeleton results, cache age, ranking time, HTML generation time, and story count. `rank_perf` is emitted once per completed warm render and carries the stage breakdown for personalized ranking: candidate SQL, candidate embedding lookup/compute, feedback embedding lookup/compute, SVM feature preparation, `SVC.fit` when the model cache misses, `decision_function`, tier-2 centroid scoring, badge similarity work, dedup, total rank time, feedback counts by class, candidate counts, and `model_cache=hit|miss|skipped`. These logs are intended to diagnose cases where a silent refill is taking longer than the typical warm-cache path. Each completed warm also persists a `rank_perf` row to SQLite (`database.py`'s `insert_rank_perf`, wrapped in try/except so a telemetry failure never breaks a warm): typed columns for the always-queryable dimensions (`recorded_at`, `user_id`, `version`, `rank_total_ms`, `html_ms`, `candidates`, `feedback_total`, `model_cache`, `stories`) plus a `fields_json` column holding the full `trace.to_log_fields()` dict, so the dynamic per-stage timings survive without schema churn. `uv run python scripts/perf_report.py --window-days N` reports p50/p95/max per stage, split by `model_cache`, stages sorted by p95 descending — the before/after instrument for ranking-performance changes.
+The server logs dashboard timing with stable prefixes: `dashboard_cache_invalidated`, `dashboard_warm`, `dashboard_render`, and `rank_perf`. Render logs include cache-hit/stale/skeleton results, cache age, ranking time, HTML generation time, and story count. `rank_perf` is emitted once per completed warm render and carries the stage breakdown for personalized ranking: candidate SQL, candidate embedding lookup/compute, feedback embedding lookup/compute, SVM feature preparation, `SVC.fit` when the model cache misses, `decision_function`, tier-2 centroid scoring, badge similarity work, dedup, total rank time, feedback counts by class, candidate counts, `model_cache=hit|miss|skipped`, and (since 2026-07-28) `pool_cache=hit|miss` — see 3.3.1 below. These logs are intended to diagnose cases where a silent refill is taking longer than the typical warm-cache path. Each completed warm also persists a `rank_perf` row to SQLite (`database.py`'s `insert_rank_perf`, wrapped in try/except so a telemetry failure never breaks a warm): typed columns for the always-queryable dimensions (`recorded_at`, `user_id`, `version`, `rank_total_ms`, `html_ms`, `candidates`, `feedback_total`, `model_cache`, `stories`) plus a `fields_json` column holding the full `trace.to_log_fields()` dict, so the dynamic per-stage timings survive without schema churn. `uv run python scripts/perf_report.py --window-days N` reports p50/p95/max per stage, split by `model_cache`, stages sorted by p95 descending — the before/after instrument for ranking-performance changes.
 
 For offline timing, run `uv run python scripts/benchmark_rank_cold_cache.py`. By default it opens `hn_rewrite.db` read-only, selects the user with the most feedback, clears the in-process SVM model cache before cold runs, and then repeats warm runs against the same process cache. If read-only ranking would need to compute missing embeddings, the script exits with a preflight summary instead of writing to the live DB; run `uv run python scripts/embed_remaining.py` first or pass `--allow-writes` explicitly.
 
@@ -276,13 +277,54 @@ The saved follow-up options are:
 * **Candidate policy reduction**: shrink the 30-day render window, lower
   archive caps, or add source quotas. Simple, but it directly changes what
   can surface.
-* **Richer per-user cache**: cache candidate feature matrices or
+* ~~**Richer per-user cache**: cache candidate feature matrices or
   candidate-feedback dot products keyed by the feedback signature and
-  candidate-pool signature. Useful for reloads without fresh feedback,
-  less useful for one-rerank-per-vote behavior.
+  candidate-pool signature.~~ **Done 2026-07-28** — see 3.3.1: the shared
+  candidate pool (stories + embedding matrix) is cached process-wide and
+  masked per user, rather than caching feature matrices per user.
 * **Approximate/capped model**: evaluate Random Fourier Features or
   class-balanced training/support-vector caps. Simpler linear/logistic
   replacements have already measured worse, so this needs quality eval.
+
+#### 3.3.1 Shared candidate pool cache (2026-07-28)
+
+A friend-session investigation (WORKLOG 2026-07-28) found `candidate_sql` and
+`candidate_embedding` — not the SVM fit — dominating rank time in production:
+median 2,070ms / 620ms respectively across ~8,900 candidates, versus 5.6ms
+for `svm_fit`. That cost was being paid on *every* warm for *every* user, even
+though the candidate pool (all production candidates, unfiltered by feedback)
+is identical across users and only changes at regen.
+
+`pipeline/candidate_cache.py` now holds one process-wide `CandidatePool`
+(stories tuple + `(N, 384)` embedding matrix + id→index map), built via the
+existing `load_production_candidate_stories(..., exclude_feedback=False)` +
+`get_or_compute_embeddings`. Per-user personalization excludes already-voted
+stories via `CandidatePool.without_feedback(voted_ids)` — a boolean mask over
+the shared arrays, no SQL. `fast_rerank_for_user` and `build_cold_deck` both
+take an optional `embedder` param; when present, they read from
+`get_candidate_pool(db, config, embedder, trace=trace)` instead of doing a
+fresh load, and the `pool_cache: hit|miss` trace label surfaces in
+`rank_perf`. `Handler._rebuild_cold_deck` (`server.py`) calls
+`invalidate_candidate_pool()` before rebuilding at regen time, so the pool
+refreshes off the request thread and the next warm/cold-deck build after
+regen finds fresh stories.
+
+The pool is scoped to the passed-in `Database` instance by identity (not just
+a bare global), so tests using ephemeral `:memory:` databases each get their
+own build instead of leaking a stale pool across test cases; production runs
+one long-lived `Database` for the process lifetime, so this scoping is a
+no-op there.
+
+`fast_rerank_for_user`'s zero-feedback branch intentionally keeps calling
+`build_cold_deck` *without* an embedder — a 0-vote cold deck is pure
+gravity/time ranking and has never touched embeddings, so routing it through
+the cache would add an embedding cost with no ranking benefit.
+
+Live-verified post-fix: a 12-vote swipe burst against a fresh user brought
+`rank_total_ms` to 253.3/281.6 (`pool_cache=hit`, `candidate_sql_ms` 8.5/0.1,
+`candidate_embedding_ms` 12.7/6.3), and the next full `GET /` returned
+`result=cache_hit elapsed_ms=0.0` — the first personalized full-page render
+path this fix was meant to unlock.
 
 ### 3.6 ClickHouse Candidate Fetch Window
 The live-window fetch (`pipeline.fetch_candidates`) uses `ch_client.query_live_window(days=30, min_score=5, limit=5000)` to pull all live HN stories from the past 30 days. This single SQL query returns every story with title, url, score, descendants, time, and self-text — no pagination, no per-story items call needed. Stories with `score < 5` are filtered at the query level. Result count is typically 2000-5000 rows; query time <2s on CH Playground. The 30-day window (widened from 7d on 2026-06-29) gives 7-30d HN stories a "second chance" to be re-discovered, re-scored, and re-ranked on every regen; without it, stories that fell out of the live window would stay frozen in the DB with stale scores and never re-enter the candidate pool.

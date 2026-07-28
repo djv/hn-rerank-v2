@@ -1044,7 +1044,9 @@ class Handler:
         if n_feedback > 0:
             from pipeline import build_cold_deck
 
-            cold_stories = build_cold_deck(cls.db, cls.config, user_id=user.id)
+            cold_stories = build_cold_deck(
+                cls.db, cls.config, user_id=user.id, embedder=cls.embedder
+            )
         else:
             cold_stories = cls._cold_stories
         if cold_stories:
@@ -1424,8 +1426,13 @@ class Handler:
     @classmethod
     def _rebuild_cold_deck(cls) -> None:
         from pipeline import build_cold_deck
+        from pipeline.candidate_cache import invalidate_candidate_pool
 
-        cold_stories = build_cold_deck(cls.db, cls.config)
+        # Regen just wrote fresh stories — drop the shared candidate pool
+        # so this rebuild (and every warm/cold-deck build until the next
+        # regen) picks up the new rows instead of a stale snapshot.
+        invalidate_candidate_pool()
+        cold_stories = build_cold_deck(cls.db, cls.config, embedder=cls.embedder)
         cls._cold_stories = cold_stories
         logging.info("cold_deck_rebuilt stories=%s", len(cold_stories))
 
