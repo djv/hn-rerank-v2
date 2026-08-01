@@ -2,6 +2,49 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-08-01 — fix: 429-cascade in `reddit_fetch_queue.py`
+
+24h of `journalctl --user -u hn_rewrite.service` logs showed a 44% Reddit
+429 rate (227 of 515 requests) and 72.5 min/day spent asleep in backoff —
+each `reddit_refresh_complete` for 33 feeds took ~35-45 min instead of the
+intended ~3-4 min at `RedditFetchQueue.MIN_FETCH_SPACING = 50.0s`.
+
+Root cause: `_pop_ready` (`reddit_fetch_queue.py`) only checked a task's
+pre-computed `target_at`, which assumes zero task duration. When a task's
+factory (`_fetch_reddit_rss_context`, `server.py`) hit a 429 and retried
+internally, the retry's backoff wait (commonly ~57s, driven by Reddit's own
+`Retry-After`/`x-ratelimit-reset`) exceeded the 50s stride budgeted for it.
+By the time the task returned, the next task's `target_at` had long since
+elapsed, so it fired immediately — spacing collapsed to
+`reddit_limiter`'s bare `INTER_REQUEST_DELAY` floor (2s+jitter), well under
+Reddit's real tolerance, which produced another 429 and repeated the cycle.
+Live evidence: `05:43:01,441 200 OK` (a retry succeeding) followed by
+`05:43:02,916 429` for a *different*, unrelated story 1.5s later.
+
+Fix: added `_last_dispatch_at`/`_current_min_gap` tracking to
+`RedditFetchQueue`, mirroring the reservation pattern already used by
+`RedditRateLimiter._next_allowed_at` (`reddit_limiter.py`). `_pop_ready` now
+gates on `max(target_at, _last_dispatch_at + _current_min_gap)`, and the
+worker records `_last_dispatch_at` after each task actually finishes
+(success or failure), so an overrunning task's retry wait pushes back every
+task still in the queue — not just the one that overran.
+
+Regression test: `test_task_overrun_delays_next_task_by_full_gap`
+(`tests/test_reddit_fetch_queue.py`) simulates the overrun directly (a task
+that sleeps far past its stride) and asserts the next task waits the full
+gap from actual completion, not from its stale schedule slot; it failed
+with a ~2ms observed gap before the fix and passes after. Full suite (573
+passed, 1 skipped), `ruff check .`, and `ty check` all clean.
+
+Does not touch the on-demand Reddit fetch path (`server.py:2099`, used by
+live TLDR-detail requests) — it still goes through `reddit_limiter.acquire()`
+directly with its short 2s floor, so interactive requests aren't penalized
+by queue-scale spacing.
+
+Live effect not yet re-measured post-deploy; re-check with
+`journalctl --user -u hn_rewrite.service --since "5 hours ago" -q | grep -c
+"429 Too Many Requests"` after the next regen cycle and one restart.
+
 ## 2026-07-28 — fix: `test_build_reddit_topfeed_*` time-bomb failures
 
 Three tests (`test_build_reddit_topfeed_serializes_and_sets_user_agent`,
