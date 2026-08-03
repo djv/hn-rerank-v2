@@ -50,7 +50,6 @@ feeds = [
     # AI / coding agents
     "https://www.reddit.com/r/AI_Agents/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/ChatGPTCoding/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/LanguageTechnology/top/.rss?t=week&limit=25",
 
     # Programming languages / CS depth
     "https://www.reddit.com/r/ProgrammingLanguages/top/.rss?t=week&limit=25",
@@ -63,7 +62,6 @@ feeds = [
 
     # Urbanism / cities
     "https://www.reddit.com/r/Urbanism/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/urbandesign/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/WalkableStreets/top/.rss?t=week&limit=25",
 
     # Travel / gear / nomad logistics
@@ -73,7 +71,6 @@ feeds = [
     "https://simonwillison.net/atom/everything/",
     "https://www.interconnects.ai/feed",
     "https://jack-clark.net/feed/",
-    "https://openai.com/news/rss.xml",
     "https://research.google/blog/rss/",
     "https://deepmind.google/blog/rss.xml",
     "https://huggingface.co/blog/feed.xml",
@@ -85,7 +82,6 @@ feeds = [
     "https://www.kitces.com/feed/",
     "https://pedestrianobservations.com/feed/",
     "https://humantransit.org/feed",
-    "https://www.londonreconnections.com/feed/",
     "https://eugeneyan.com/rss/",
     "https://huyenchip.com/feed.xml",
     "https://www.latent.space/feed",
