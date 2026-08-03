@@ -2,6 +2,30 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-08-01 — ops: retired dead unit, pruned pre-migration DB snapshots
+
+Two small ops cleanups from a general project health pass:
+
+- `hn_rerank_feedback.service` had been `failed` since 2026-06-18 (1.5
+  months) and permanently reddened `systemctl --user list-units`. It
+  pointed at `/home/dev/hn_rerank` — the predecessor project this repo
+  replaced, not this codebase — and was already `disabled`. Ran
+  `systemctl --user reset-failed`, removed the unit file, `daemon-reload`.
+
+- Disk was at 78% (17G free) with 7 `hn_rewrite.db.pre_*`/`.backup.*`
+  snapshot files (~3.4G total) from one-off pre-migration safety copies
+  going back to 2026-06-20. All associated migrations (STRICT schema,
+  interaction ledger, GIS/stats/test-row removal, user cleanup, Reddit
+  backlog cleanup) have been stable for 3+ weeks with no rollback. Kept
+  the 2 newest (`pre_strict_20260712T081713Z`,
+  `pre_interaction_events_20260712T160518Z`) and deleted the other 5
+  (~2.1G freed) with explicit per-file user sign-off, per the DB-safety
+  rule in AGENTS.md. Daily Drive backups (30-day retention,
+  `hn-rewrite-backup.timer`) cover the *current* DB but not these
+  specific pre-migration states, so this was a one-way loss of rollback
+  insurance for already-stable migrations, not a data-loss risk for live
+  data.
+
 ## 2026-08-01 — fix: 429-cascade in `reddit_fetch_queue.py`
 
 24h of `journalctl --user -u hn_rewrite.service` logs showed a 44% Reddit
