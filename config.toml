@@ -27,7 +27,6 @@ feeds = [
     "https://mshibanami.github.io/GitHubTrendingRSS/weekly/haskell.xml",
     "https://www.reddit.com/r/MachineLearning/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/programming/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/compsci/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/LocalLLaMA/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/ExperiencedDevs/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/haskell/top/.rss?t=week&limit=25",
