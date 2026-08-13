@@ -61,6 +61,10 @@ disappear during cold start when they're arguably most useful.
 
 ### `pipeline.py`
 
+**Superseded:** line references in this section predate the `pipeline/`
+package split (see ARCHITECTURE.md) and no longer resolve. Historical record
+only.
+
 **1. `RankedStory` dataclass (line 93)**
 - Add `is_discussion_rich: bool = False`
 - Add `is_high_engagement: bool = False`
