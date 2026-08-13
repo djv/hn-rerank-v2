@@ -398,6 +398,10 @@ dev = [
 dl-experiment = [
     { name = "torch" },
 ]
+embedding-experiment = [
+    { name = "huggingface-hub" },
+    { name = "scipy" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -425,6 +429,10 @@ dev = [
     { name = "ty", specifier = ">=0.0.10" },
 ]
 dl-experiment = [{ name = "torch", specifier = ">=2.12" }]
+embedding-experiment = [
+    { name = "huggingface-hub", specifier = ">=0.25" },
+    { name = "scipy", specifier = ">=1.14" },
+]
 
 [[package]]
 name = "htmldate"
