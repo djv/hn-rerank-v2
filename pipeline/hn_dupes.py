@@ -475,44 +475,6 @@ def canonicalize_hn_dupes(
     return output
 
 
-def _resolve_selected_targets(
-    ranked: Sequence[RankedStory],
-    *,
-    selected_count: int,
-    resolver: HnDupeResolver,
-) -> dict[int, int | None]:
-    source_ids = list(
-        dict.fromkeys(
-            item.story.id
-            for item in ranked[:selected_count]
-            if item.story.source == "hn" and item.story.id > 0
-        )
-    )
-    if not source_ids:
-        return {}
-    if len(source_ids) == 1:
-        story_id = source_ids[0]
-        return {story_id: resolver.find_canonical_story_id(story_id)}
-
-    target_by_source: dict[int, int | None] = {}
-    worker_count = min(MAX_DUPE_RESOLVE_WORKERS, len(source_ids))
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        futures = {
-            executor.submit(resolver.find_canonical_story_id, story_id): story_id
-            for story_id in source_ids
-        }
-        for future in as_completed(futures):
-            story_id = futures[future]
-            try:
-                target_by_source[story_id] = future.result()
-            except Exception as exc:
-                logging.debug(
-                    "hn_dupe_resolver story_id=%s parallel_error=%r", story_id, exc
-                )
-                target_by_source[story_id] = None
-    return target_by_source
-
-
 def _lookup_canonical_story(
     target_id: int,
     db: Database,
