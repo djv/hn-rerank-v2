@@ -2,6 +2,64 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-08-13 — chore: general project health pass
+
+Disk was at 77% (17G free). Reclaimed ~3.5G (77%→74%) and packed a
+never-gc'd git object store, none of it touching the live DB or running
+service.
+
+- **Verified Drive backups before touching any `*.db` file.**
+  `hn-rewrite-backup.timer` is firing daily and `scripts/backup_hn_db.sh`
+  checksum-verifies each upload against the remote; the Drive folder holds
+  30 dated snapshots, oldest `20260716T001030Z`. That 30-day window
+  determined which local pre-migration snapshots were safe to drop.
+- **DB snapshot cleanup (~1.6G), per-file sign-off per AGENTS.md:** deleted
+  `hn_rewrite.db.pre_feed_prune_20260813T135400Z` (818M) and
+  `hn_rewrite.db.pre_experienceddevs_removal_20260806T121136Z` (789M) — both
+  guard row-deletion prunes with a same-morning Drive backup predating them.
+  Kept `hn_rewrite.db.pre_strict_20260712T081713Z` and
+  `hn_rewrite.db.pre_interaction_events_20260712T160518Z`: they predate the
+  Drive window by 4 days and are the only surviving copies of the
+  pre-STRICT-schema and pre-interaction-ledger states (the July snapshots
+  the 2026-08-01 pass deliberately kept). Also deleted a 0-byte stray
+  `hn_rewrite.db` outside the worktree (Jul 3, wrong-cwd artifact, no
+  tables). `feedback` row count (4389) and `PRAGMA integrity_check` (`ok`)
+  on the live DB were unchanged before/after.
+- **`main/onnx_model_v2/` (417M)** — orphaned ONNX bakeoff model from the
+  2026-07-10/11 embedding bakeoff; zero references anywhere in the repo.
+  Production models (`shared/mxbai-embed-xsmall-v1`,
+  `shared/onnx_model`) are untouched.
+- **`main/.mimocode/` (58M)**, four orphaned `.pyc` files whose sources no
+  longer exist, an old `.ruff_cache/0.14.10/` tree, and four empty
+  `.agents`/`.codex` dirs.
+- **`git gc --prune=now`** — the repo had never been packed: 2,628 loose
+  objects / 62.45 MiB with zero packs. Now 1 pack, 1.63 MiB.
+- **Deleted four fully-merged remote branches** (`tinder-queue-ui`,
+  `worktree-explore-badge-backfill`, `worktree-fix-ch-comment-oom`,
+  `worktree-mistral-default-revert`) plus the matching local branch, then
+  `git remote prune origin`. Six unmerged branches were left alone.
+- **Untracked 23 `eval_ranker_*.json` sweep outputs** (`38f387f`) — tracked
+  in `f9ac731` as "reproducible benchmarks," then gitignored two days later
+  by `0ca2348`, which never applies to already-tracked files. Files remain
+  on disk; nothing in the repo referenced them by name.
+- **Removed dead code** (`93e7f5e`): `pipeline/hn_dupes.py`'s
+  `_resolve_selected_targets`, unreferenced anywhere including tests,
+  superseded by the batch resolve path at `hn_dupes.py:350`.
+- **Fixed stale `pipeline.py` doc references** (`65da887`): `ARCHITECTURE.md`
+  cited a line number in the pre-split `pipeline.py`; two `plans/` docs got
+  a "superseded" note instead of a line-by-line rewrite.
+- **Declared `huggingface_hub` and `scipy`** (`48185b7`) as an
+  `embedding-experiment` dependency group — both were imported by embedding
+  bakeoff scripts but only worked by arriving transitively via
+  `transformers`/`scikit-learn`.
+
+Left alone: `main/hn.db` (protected by the AGENTS.md do-not-delete rule),
+`shared/onnx_model` (still the code default), `.venv`/`.hypothesis`/
+`.pytest_cache` (regenerable, actively used), four scripts with no code
+references but plausible ongoing use, and the ruff default rule set.
+`ruff check .`, `ty check`, and `pytest -n 4` (573 passed, 1 skipped) all
+green before and after; `hn_rewrite.service` stayed active throughout.
+
 ## 2026-08-13 — chore: prune five rejected Reddit feeds
 
 Removed r/Maps, r/linux, r/USExpatTaxes, r/ManyBaggers, and
