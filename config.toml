@@ -28,11 +28,9 @@ feeds = [
     "https://www.reddit.com/r/MachineLearning/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/programming/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/LocalLLaMA/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/ExperiencedDevs/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/haskell/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/ocaml/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/rust/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/linux/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/selfhosted/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/Bogleheads/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/ExpatFIRE/top/.rss?t=week&limit=25",
@@ -40,9 +38,7 @@ feeds = [
     "https://www.reddit.com/r/transit/top/.rss?t=week&limit=25",
 
     "https://www.reddit.com/r/dataengineering/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/Maps/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/Ultralight/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/ManyBaggers/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/awardtravel/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/CreditCards/top/.rss?t=week&limit=25",
 
@@ -56,12 +52,10 @@ feeds = [
 
     # Finance / tax / nomad money
     "https://www.reddit.com/r/financialindependence/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/USExpatTaxes/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/fatFIRE/top/.rss?t=week&limit=25",
 
     # Urbanism / cities
     "https://www.reddit.com/r/Urbanism/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/WalkableStreets/top/.rss?t=week&limit=25",
 
     # Travel / gear / nomad logistics
     "https://www.reddit.com/r/onebag/top/.rss?t=week&limit=25",

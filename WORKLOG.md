@@ -2,6 +2,25 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-08-13 — chore: prune five rejected Reddit feeds
+
+Removed r/Maps, r/linux, r/USExpatTaxes, r/ManyBaggers, and
+r/WalkableStreets from `config.toml` after they accumulated 20 downvotes and
+no upvotes. Purged their exact source-owned data: 1,127 stories, 32 feedback
+rows, 50 interaction events, 1,085 embeddings, 69 TLDR cache rows, 108 Reddit
+feed-cache items, and 5 feed-state rows. A consistent SQLite backup was taken
+first at `hn_rewrite.db.pre_feed_prune_20260813T135400Z`; the post-purge
+`PRAGMA integrity_check` returned `ok`.
+
+## 2026-08-06 — chore: drop r/ExperiencedDevs feed
+
+Removed `https://www.reddit.com/r/ExperiencedDevs/top/.rss?t=week&limit=25`
+from `config.toml`. Also cleaned existing rows from the DB: 218
+`rss_reddit_experienceddevs` stories and 5 attached `feedback` rows
+(all `neutral`/`down`, no upvotes) deleted after user confirmation.
+Backup taken first: `hn_rewrite.db.pre_experienceddevs_removal_20260806T121136Z`.
+`PRAGMA integrity_check` passed post-delete.
+
 ## 2026-08-01 — ops: retired dead unit, pruned pre-migration DB snapshots
 
 Two small ops cleanups from a general project health pass:
