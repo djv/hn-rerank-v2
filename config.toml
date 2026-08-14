@@ -34,11 +34,9 @@ feeds = [
     "https://www.reddit.com/r/selfhosted/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/Bogleheads/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/ExpatFIRE/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/urbanplanning/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/transit/top/.rss?t=week&limit=25",
 
     "https://www.reddit.com/r/dataengineering/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/Ultralight/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/awardtravel/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/CreditCards/top/.rss?t=week&limit=25",
 

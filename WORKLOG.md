@@ -2,6 +2,17 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-08-14 — chore: remove rejected UrbanPlanning and Ultralight feeds
+
+- Removed `r/urbanplanning` and `r/Ultralight` from the configured RSS feeds
+  after their live feedback records showed 0 up / 1 neutral / 3 down and
+  2 up / 9 neutral / 3 down, respectively.
+- Purged only data owned by `rss_reddit_urbanplanning` and
+  `rss_reddit_ultralight`, including dependent feedback, interaction,
+  embedding, TLDR, fetch-failure, reading-event, user-signal, Reddit item,
+  and Reddit feed-state rows.
+- Created an integrity-checked pre-purge database snapshot before deletion.
+
 ## 2026-08-14 — analysis: read the interaction ledger; recommend B3 over B1/B2
 
 Added `scripts/ledger_report.py`, a read-only diagnostic over the
