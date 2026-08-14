@@ -2,6 +2,53 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-08-14 — analysis: read the interaction ledger; recommend B3 over B1/B2
+
+Added `scripts/ledger_report.py`, a read-only diagnostic over the
+`interaction_events` ledger (live a month, previously unconsumed except by
+`scripts/narrowing_report.py`'s topical-coverage view). It reports position
+bias, source mix, dwell↔vote agreement, and preference drift, then prints an
+explicit next-step recommendation. Lifted `_heaviest_user_id`,
+`_pool_embeddings`, `_iso_week`, `_cosine_distance` out of
+`narrowing_report.py` into `scripts/_ledger_common.py` (both scripts now
+import them; `narrowing_report.py`'s output is unchanged — verified against
+the live DB before/after).
+
+**Result on user 1, `--since 2026-07-15` (post ledger-fix window):**
+
+- **Dwell↔vote agreement (the B3 gate): rank-AUC 0.771** (up vs. down,
+  dwell capped at 120s, 159 up / 171 down story-sums). Comfortably above the
+  0.65 usability bar — capped dwell is a real predictor of eventual vote
+  direction, not noise.
+- **Preference drift (the B1 gate): not measurable.** All 1,386 of user 1's
+  upvote rows have `updated_at` inside the last 60 days — a mutation-time
+  artifact (STRICT-schema migration and other bulk touches rewrite
+  `updated_at`), not evidence that every upvote is recent. B1 needs true
+  vote-creation timestamps before it can be evaluated at all.
+- **Position bias:** vote rate holds up through position ~15-20 on `date`
+  and `recommended` sort (0.16-0.25), doesn't collapse to zero until the
+  tail (30+, n<10). No cheap deck-depth fix is indicated.
+- **Source mix:** non-HN restoration (2026-07-12) is reaching the deck —
+  impressions span 40+ non-`hn` sources — but is thin relative to pool share
+  for several RSS/Reddit feeds (e.g. `rss_reddit_compilers`: 1 impression /
+  16 in pool). Not actioned here, just surfaced.
+- `ranker_arm` is `'baseline'` on every one of ~8,000 logged events — B2
+  (interleaving) has zero retroactive signal; it can only be measured by
+  first turning it on.
+
+**Recommendation, per the plan's decision rule: build the B3 consumer next**
+(dwell as a `sample_weight` modifier / eval label), not B1 or B2. Skipped: no
+production ranking or client behavior changed by this pass. Read-only
+against the live DB throughout (`PRAGMA integrity_check` and file size
+identical before/after); `hn_rewrite.service` untouched.
+
+**Files**: `scripts/ledger_report.py`, `scripts/_ledger_common.py` (new),
+`scripts/narrowing_report.py` (import-only change), `tests/test_ledger_report.py`
+(new — pure-function unit + Hypothesis coverage for rank-AUC, bucketing,
+capping, percentile, centroid, cosine distance), `ROADMAP.md`, `WORKLOG.md`.
+Verification: `uv run pytest tests/ -n 4` (600 passed, 1 skipped), `ruff
+check .` clean, `ty check` clean.
+
 ## 2026-08-13 — chore: general project health pass
 
 Disk was at 77% (17G free). Reclaimed ~3.5G (77%→74%) and packed a

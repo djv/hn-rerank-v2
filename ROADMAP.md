@@ -310,6 +310,15 @@ sign-off per the DB-safety rule.)
 
 ### B1. Test preference drift explicitly
 
+**Blocked, not just low-priority — read 2026-08-14, see WORKLOG.md.**
+`scripts/ledger_report.py`'s drift gate found `feedback.updated_at` is
+mutation time, not vote-creation time: all 1,386 of user 1's upvote rows
+show `updated_at` inside the last 60 days (a STRICT-schema-migration and
+other bulk-touch artifact), so recent-vs-older centroid drift isn't
+measurable from the current column. Needs a true vote-creation timestamp
+(or first-seen `interaction_events` fallback) before this item can even be
+evaluated, let alone built.
+
 The ranker receives feedback timestamps but doesn't use them — a 2024-vintage
 upvote counts the same as yesterday's. Add a configuration-gated exponential
 time-decay factor to existing sample weights (half-life ~6 months, one
@@ -322,6 +331,12 @@ Test class gates, cache invalidation, source-level time-split metrics.
 
 ### B2. Add online comparison before adopting model changes
 
+**Confirmed unmeasurable retroactively, 2026-08-14.** `ranker_arm` is
+`'baseline'` on all ~8,000 logged `interaction_events` rows — there is no
+historical data to mine here; it can only be measured by first turning
+interleaving on. Gated on REF-2 (per B3 note below) rather than
+independently actionable today.
+
 NDCG on historical splits ≠ what you actually upvote. Use deterministic
 team-draft interleaving for a baseline vs. experimental deck (built for n=1):
 interleave decks from ranker A and B, record which variant's cards win votes,
@@ -332,6 +347,16 @@ ranking tweak (PERF-3 parity check, B1 decay, F3 dial) into a measured
 decision instead of vibes.
 
 ### B3. Build an impression ledger; don't discard implicit signals
+
+**Ledger exists (2026-07-12) and its consumer is now the recommended next
+step — read 2026-08-14, see WORKLOG.md.** `scripts/ledger_report.py` found
+capped dwell time predicts eventual vote direction with rank-AUC 0.771 (up
+vs. down, 159/171 story-sums, `--since 2026-07-15`) — well above noise. This
+clears the gate the roadmap set for treating dwell as a real signal. Next
+step is the *consumer*: fold capped per-story dwell into `_score_and_rank`
+as a `sample_weight` modifier (or an `eval_ranker_variants.py` label),
+gated the same way B1 would be — one flag, promote only on time-split NDCG
+improvement, never let it silently become a labeling ground truth.
 
 Dwell time per card, TLDR expansions, discussion-link clicks, saves all
 happen client-side and vanish today. Record deck version, rank, source,
@@ -358,7 +383,13 @@ Test event idempotency and session/card association.
 5. ~~**PERF-3** — precomputed kernel SVM~~ — done. **PERF-4** remains
    conditional on finer candidate-embedding tracing.
 6. ~~**OPS-1** — isolate Reddit from core regeneration~~ — done.
-7. **REF-1 → REF-2 → REF-3**, then **F1-F3** and **B1-B3** by appetite.
+7. ~~read the interaction ledger (`scripts/ledger_report.py`)~~ — done,
+   2026-08-14. Result: B1 blocked (no true vote-creation timestamp), B2
+   unmeasurable retroactively (constant `ranker_arm`), **B3 cleared**
+   (dwell rank-AUC 0.771). See WORKLOG.md.
+8. **B3's consumer** (dwell as a `sample_weight` modifier), then
+   **REF-1 → REF-2 → REF-3**, then **F1-F3** by appetite. B1/B2 stay
+   blocked/deferred until their prerequisites above are addressed.
 
 ## Verification (applies to whichever items proceed)
 
