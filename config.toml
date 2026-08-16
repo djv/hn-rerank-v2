@@ -30,7 +30,6 @@ feeds = [
     "https://www.reddit.com/r/LocalLLaMA/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/haskell/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/ocaml/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/rust/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/selfhosted/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/Bogleheads/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/ExpatFIRE/top/.rss?t=week&limit=25",

@@ -7354,3 +7354,8 @@ texts, both under onnxruntime `CPUExecutionProvider`.
   bakeoff/quality eval (`scripts/bakeoff_embedding_models.py` +
   `scripts/eval_ranker_variants.py`) was run; not worth it until CPU speed
   clears the bar, or unless GPU inference becomes available.
+## 2026-08-16 — remove r/rust feed
+
+- Removed the `r/rust` RSS feed from `config.toml`.
+- Purged its exact `rss_reddit_rust` stories and dependent stored rows from
+  the local database after creating a recoverable backup.
