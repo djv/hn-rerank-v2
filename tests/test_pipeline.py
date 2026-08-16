@@ -1585,18 +1585,38 @@ _CLEAN_TEXT_NOISE = st.sampled_from(
 )
 
 
+@st.composite
+def _clean_text_payload_and_noise(draw: st.DrawFn) -> tuple[str, str]:
+    """Noise plus a payload long enough to clear clean_text's 0.5 density floor.
+
+    clean_text only ever removes characters and never removes alphanumerics, so
+    with k payload words (5 alnum + 1 space each) and N noise characters the
+    cleaned density is at least 5k / (6k - 1 + N); requiring 4k >= N - 1 keeps
+    that at or above 0.5 for every draw.
+    """
+    fragments = draw(st.lists(st.one_of(st.text(max_size=20), _CLEAN_TEXT_NOISE), max_size=15))
+    noise = "".join(fragments)
+    words = max(4, (len(noise) + 3) // 4)
+    payload = " ".join(
+        draw(
+            st.lists(
+                st.sampled_from(["alpha", "beta", "gamma", "delta"]),
+                min_size=words,
+                max_size=words,
+            )
+        )
+    )
+    return payload, noise
+
+
 @given(
-    fragments=st.lists(st.one_of(st.text(max_size=20), _CLEAN_TEXT_NOISE), max_size=15),
-    payload=st.lists(
-        st.sampled_from(["alpha", "beta", "gamma", "delta"]),
-        min_size=4,
-        max_size=10,
-    ).map(" ".join),
+    pair=_clean_text_payload_and_noise(),
     min_len=st.integers(min_value=0, max_value=10),
 )
 @settings(max_examples=100)
-def test_clean_text_properties(fragments: list[str], payload: str, min_len: int) -> None:
-    text = payload + "".join(fragments)
+def test_clean_text_properties(pair: tuple[str, str], min_len: int) -> None:
+    payload, noise = pair
+    text = payload + noise
     cleaned = clean_text(text, min_len=min_len)
 
     # The meaningful prefix is long enough to survive min_len and provides
