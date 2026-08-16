@@ -312,6 +312,10 @@ def clean_text(raw_text: str, min_len: int = 0) -> str:
         except Exception:
             txt = re.sub(r"<[^>]*>", " ", raw_text)
         txt = html.unescape(txt)
+        # Unescaping can recreate tag-looking fragments (for example
+        # ``&lt;0>`` becomes ``<0>``) after BeautifulSoup has parsed the input.
+        # Strip those residual tags before applying the text-only invariants.
+        txt = re.sub(r"<[^>]*>", " ", txt)
 
     txt = re.sub(r"[\u2800-\u28FF\u2500-\u27BF]+", "", txt)
     txt = re.sub(r"[#*^\\/|\\-_+]{3,}", "", txt)

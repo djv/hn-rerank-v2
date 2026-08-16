@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from hypothesis import given, strategies as st
+from hypothesis import assume, given, strategies as st
 
 from scripts.ledger_report import (
     bucket_position,
@@ -116,8 +116,7 @@ class TestRankAuc:
     ) -> None:
         scores = [s for s, _ in pairs]
         labels = [lbl for _, lbl in pairs]
-        if not any(labels) or all(labels):
-            return  # need both classes present
+        assume(any(labels) and not all(labels))  # need both classes present
         base = rank_auc(scores, labels)
         # Rank-transform: strictly order-preserving regardless of the
         # original floats' spacing (an affine map can collapse distinct
@@ -138,8 +137,7 @@ class TestRankAuc:
     ) -> None:
         scores = [s for s, _ in pairs]
         labels = [lbl for _, lbl in pairs]
-        if not any(labels) or all(labels):
-            return
+        assume(any(labels) and not all(labels))
         base = rank_auc(scores, labels)
         flipped = [not lbl for lbl in labels]
         assert rank_auc(scores, flipped) == pytest.approx(1.0 - base)

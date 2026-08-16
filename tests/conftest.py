@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 
 import pytest
+from hypothesis import settings
 
 from reddit_feed_cache import cache as reddit_feed_cache
 from reddit_fetch_queue import queue as reddit_fetch_queue
 from reddit_limiter import limiter as reddit_limiter
 from llm_limiter import limiter as llm_limiter
+
+# `dev` (fast local iteration) vs `ci` (wider search, no per-example deadline
+# since CI hosts are noisier). Profiles are opt-in so ordinary pytest runs
+# retain Hypothesis' normal example count.
+settings.register_profile("dev", max_examples=50)
+settings.register_profile("ci", max_examples=300, deadline=None, print_blob=True)
+if profile_name := os.environ.get("HYPOTHESIS_PROFILE"):
+    settings.load_profile(profile_name)
 
 
 @pytest.fixture(autouse=True)

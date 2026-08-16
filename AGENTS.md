@@ -17,6 +17,19 @@
 - **Never delete or destructively modify the local database** (`hn_rewrite.db`, `hn.db`, or any `*.db` file in the working tree). The DB holds the user's accumulated feedback and is the single source of truth for personalization. No `rm`, no `DELETE FROM` without a `WHERE` clause that excludes all rows, no schema migrations that drop tables or columns with data. The pipeline's own `prune_stories` and `prune_*` operations are fine — they have explicit retention rules and `id NOT IN (SELECT story_id FROM feedback)` guards. When in doubt, ask before running any command that touches the DB file.
   - **Exception (2026-06-22):** 756 test/empty stories (time=0) were deleted with explicit user permission. This included 2 test stories (id=999 "Test", id=99999998 "Test regen live") that received 2 upvotes from user 1. Backup retained at `hn_rewrite.db.pre_test_removal_20260622T163344Z`.
 - Keep test execution times optimized (target under 12 seconds total at `-n 4`). Run the full suite with `uv run pytest tests/ -n 4` (4 cores; `pytest-xdist` is in `dev`). Single-process takes ~32s; `-n 4` brings it to ~22s on this host. Per-test ONNX model loads are avoided entirely by `MockEmbedder(Embedder)` in `tests/test_server.py:18` (overrides `__init__` to skip the `AutoTokenizer.from_pretrained` + `ort.InferenceSession` path) and `DummyEmbedder(Embedder)` in the two seed test files — they share a module-scoped `mock_embedder` fixture in `test_server.py`. The remaining ~22s is dominated by `test_leak_check_smoke` (10s) and `test_leak_check_flag_in_help` (3s) in `test_eval_ranker_variants.py` (subprocesses that run real sklearn). Do not regress this: any new "mock" embedder that subclasses `pipeline.Embedder` MUST override `__init__` or it will silently reload ONNX per test.
+- **Hypothesis profiles**: `tests/conftest.py` registers opt-in `dev` (50
+  examples) and `ci` (300 examples, `deadline=None`, `print_blob=True`).
+  Select with `HYPOTHESIS_PROFILE=ci uv run pytest tests/`; ordinary pytest
+  runs retain Hypothesis' default settings. A test's own
+  `@settings(...)` still overrides the profile's `max_examples`/`deadline`
+  for that test specifically. When adding a `@given` property test, prefer
+  a strategy that actually reaches the branch under test (avoid
+  `st.sampled_from` over a handful of literals — that's `parametrize` in
+  disguise — and avoid feeding raw `st.text()`/`st.floats()` where the
+  interesting inputs are structured, e.g. HTML fragments or clustered
+  embeddings) and draw any randomness used inside the test body (e.g.
+  `np.random.default_rng(seed)` from a drawn `seed`) rather than calling
+  global `np.random.*`, or hypothesis can't shrink or replay a failure.
 - **Never silently lose uncommitted work.** The working tree can hold
   modifications from a prior session (Codex, codex, opencode, human
   hand-edits). Treat any pre-existing uncommitted change as load-bearing

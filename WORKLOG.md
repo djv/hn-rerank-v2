@@ -2,6 +2,76 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-08-15 — test: close remaining Hypothesis property gaps
+
+Follow-up validation of the 2026-08-14 property-test work:
+
+- The SVM property now guarantees both feedback classes reach the fitting
+  branch and asserts all three output probabilities are populated.
+- The MMR property uses an exact cluster-survivor oracle and varies the limit,
+  so empty output and ignored-limit mutations fail.
+- The clean-text property preserves generated semantic payload while checking
+  safety invariants. It also exposed and fixed residual tag-looking fragments
+  recreated by HTML unescaping (for example `&lt;0>` becoming `<0>`).
+- URL normalization now removes HTTP `:80` and HTTPS `:443` while preserving
+  non-default ports, matching its documented contract.
+- Dashboard-cache sequences now assert stale response bytes and eventual
+  current-version warming after current renders.
+- Hypothesis profiles remain available as opt-in `dev`/`ci` profiles; ordinary
+  pytest runs retain the library default example count.
+
+Focused tests: 356 passed. CI-profile spot check: 5 passed. Full suite:
+600 passed, 1 skipped in 14.15s with four workers. Ruff and Ty are clean.
+
+## 2026-08-14 — test: strengthen the hypothesis property tests
+
+Reviewed all 8 `@given` property tests in `tests/`; 3 were effectively
+vacuous and one was non-deterministic. Fixed, test-only, no production
+code changes:
+
+- `test_svm_fitting_robustness` (`test_pipeline.py`) used global
+  `np.random.*` inside the test body, so a failure couldn't be shrunk or
+  replayed. Now draws a `seed` and uses a local `np.random.default_rng`.
+- `test_mmr_output_is_subset` (`test_pipeline.py`) built one-hot,
+  mutually-orthogonal embeddings, so `mmr_filter`'s `sim > threshold`
+  discard branch (`pipeline/ranking.py`) was never exercised — only
+  trivial subset/order properties were checked. Rewrote to draw a cluster
+  id per story with identical-within-cluster / orthogonal-across-cluster
+  embeddings, and assert the real contract: at most one survivor per
+  cluster, and it's the highest-scored member. Verified against a
+  deliberately broken `mmr_filter` (discard branch disabled) — the new
+  test fails, the old one didn't.
+- `test_normalize_url_property_idempotent_on_variants` (`test_dedup.py`)
+  drew from `st.sampled_from([...4 literals...])` — a `parametrize` in
+  property clothing (hypothesis statistics: "4 passing examples, stopped
+  because nothing left to do"). Replaced with a composite strategy that
+  builds noisy/clean URL pairs across every dimension `normalize_url`
+  claims to strip (scheme, `www.`, case, trailing slash, trackers,
+  fragment) and asserts they normalize equal, not just idempotent.
+- `test_clean_text_properties` (`test_pipeline.py`) drew raw `st.text()`,
+  which almost never contains HTML tags, entities, or braille, so 3 of 4
+  assertions rarely fired. Now interleaves text with sampled HTML/entity/
+  braille fragments.
+- `rank_auc` properties (`test_ledger_report.py`) skipped degenerate label
+  sets with a bare `return`, which hypothesis counted as a pass and
+  couldn't steer away from. Switched to `hypothesis.assume()`.
+- `test_story_pruning_integrity_invariants` (`test_database.py`) drew
+  `feedback_indices` over a fixed `0..49` range independent of the
+  generated story count, so most indices were dead whenever fewer than 50
+  stories were generated. Now draws indices via `st.data()` against the
+  actual list length.
+- Added `HYPOTHESIS_PROFILE` support in `tests/conftest.py`
+  (`dev`=50 examples default, `ci`=300 examples/`deadline=None`).
+  Documented in `AGENTS.md` along with guidance for future `@given` tests
+  (avoid `sampled_from` over a handful of literals, draw local RNGs
+  instead of calling global `np.random`).
+
+Full suite (`uv run pytest tests/ -n 4`): 600 passed, 1 skipped.
+`ruff check` and `ty check` clean. Not done in this pass (left as a
+follow-up): `reddit_limiter`/`llm_limiter`/`candidate_cache` have no
+property coverage despite invariant-heavy behavior (token-bucket spacing,
+backoff monotonicity, LRU bounds).
+
 ## 2026-08-14 — chore: remove rejected UrbanPlanning and Ultralight feeds
 
 - Removed `r/urbanplanning` and `r/Ultralight` from the configured RSS feeds

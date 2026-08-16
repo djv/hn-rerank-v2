@@ -1,7 +1,8 @@
-from typing import Any, cast
+from typing import Any, Literal, cast
 import asyncio
 import numpy as np
 import pytest
+import re
 import time
 from collections.abc import Callable
 from email.utils import formatdate
@@ -1382,24 +1383,58 @@ async def test_prewarm_reddit_top_stories_skips_if_already_populated(
     assert updated.comment_count is None  # unchanged
 
 
-@given(st.lists(st.floats(0.0, 1.0, allow_nan=False), min_size=2, max_size=50))
-def test_mmr_output_is_subset(scores):
+@given(
+    cluster_ids=st.lists(st.integers(min_value=0, max_value=19), min_size=2, max_size=50),
+    scores=st.lists(st.floats(0.0, 1.0, allow_nan=False), min_size=2, max_size=50),
+    limit=st.integers(min_value=1, max_value=10),
+)
+def test_mmr_output_matches_cluster_survivor_oracle(
+    cluster_ids: list[int], scores: list[float], limit: int
+) -> None:
+    # Pair up cluster_ids/scores to a common length so every story has both.
+    n = min(len(cluster_ids), len(scores))
+    cluster_ids = cluster_ids[:n]
+    scores = scores[:n]
+
+    # Twenty orthonormal basis vectors: identical embeddings within a cluster
+    # (dot == 1.0, always merged) and orthogonal across clusters (dot ==
+    # 0.0, never merged) -- this makes the sim > threshold discard branch
+    # in mmr_filter deterministic instead of accidental.
+    basis = np.eye(20, 384, dtype=np.float32)
+
+    story_ids = list(range(n))
     ranked = []
     embeddings_map = {}
-    for i, s in enumerate(scores):
+    for i, (cid, s) in enumerate(zip(cluster_ids, scores)):
         story = Story(id=i, title=f"S{i}", url=None, score=0, time=0, text_content="")
         ranked.append(RankedStory(story=story, score=s, best_match_title=""))
-        v = np.zeros(384, dtype=np.float32)
-        v[i % 384] = 1.0
-        embeddings_map[i] = v
+        embeddings_map[i] = basis[cid]
 
-    filtered = mmr_filter(ranked, embeddings_map, threshold=0.85, limit=10)
+    # Production callers feed mmr_filter stories already sorted by score.
+    ranked.sort(key=lambda item: item.score, reverse=True)
+
+    filtered = mmr_filter(ranked, embeddings_map, threshold=0.85, limit=limit)
 
     filtered_ids = [item.story.id for item in filtered]
     input_ids = [item.story.id for item in ranked]
-    for fid in filtered_ids:
-        assert fid in input_ids
-    assert filtered_ids == sorted(filtered_ids, key=lambda x: input_ids.index(x))
+
+    # The reference model is exactly the contract implemented by mmr_filter:
+    # retain the first (highest-scored) story from each embedding cluster,
+    # preserving ranked order, then stop at the requested limit.
+    cluster_of = {i: cluster_ids[i] for i in story_ids}
+    expected_ids = []
+    seen_clusters = set()
+    for item in ranked:
+        c = cluster_of[item.story.id]
+        if c not in seen_clusters:
+            seen_clusters.add(c)
+            expected_ids.append(item.story.id)
+            if len(expected_ids) == limit:
+                break
+
+    assert filtered_ids == expected_ids
+    assert len(filtered_ids) == min(limit, len(seen_clusters))
+    assert all(fid in input_ids for fid in filtered_ids)
 
 
 def test_rerank_candidates_mmr_config_switch(db, embedder, monkeypatch):
@@ -1535,23 +1570,46 @@ def test_rank_no_feedback_frontpage_sort(db, embedder):
     assert ranked[0].story.id == 2
 
 
-@given(text=st.text(), min_len=st.integers(min_value=0, max_value=100))
-@settings(max_examples=25)
-def test_clean_text_properties(text, min_len):
-    import re
+_CLEAN_TEXT_NOISE = st.sampled_from(
+    [
+        "<b>",
+        "</b>",
+        "<div class='x'>",
+        "<script>alert(1)</script>",
+        "&amp;",
+        "&#x27;",
+        "&lt;",
+        "⠀⠁⠒",  # braille
+        "─━",  # box-drawing, also in the stripped range
+    ]
+)
 
+
+@given(
+    fragments=st.lists(st.one_of(st.text(max_size=20), _CLEAN_TEXT_NOISE), max_size=15),
+    payload=st.lists(
+        st.sampled_from(["alpha", "beta", "gamma", "delta"]),
+        min_size=4,
+        max_size=10,
+    ).map(" ".join),
+    min_len=st.integers(min_value=0, max_value=10),
+)
+@settings(max_examples=100)
+def test_clean_text_properties(fragments: list[str], payload: str, min_len: int) -> None:
+    text = payload + "".join(fragments)
     cleaned = clean_text(text, min_len=min_len)
 
-    if cleaned != "":
-        # Length constraint
-        assert len(cleaned) > min_len
-        # Alphanumeric density
-        alnum = sum(c.isalnum() for c in cleaned)
-        assert alnum / len(cleaned) >= 0.5
-        # No Braille
-        assert not re.search(r"[\u2800-\u28FF]", cleaned)
-        # No unescaped tags
-        assert not re.search(r"<[^>]+>", cleaned)
+    # The meaningful prefix is long enough to survive min_len and provides
+    # an oracle stronger than "empty output is acceptable".
+    assert cleaned != ""
+    assert len(cleaned) > min_len
+    assert all(word in cleaned for word in payload.split())
+
+    # Safety and normalization invariants apply to every non-empty result.
+    alnum = sum(c.isalnum() for c in cleaned)
+    assert alnum / len(cleaned) >= 0.5
+    assert not re.search(r"[\u2800-\u28FF]", cleaned)
+    assert not re.search(r"<[^>]+>", cleaned)
 
 
 def test_svm_personalization_features_exclude_engagement_source_metadata():
@@ -1587,17 +1645,30 @@ def test_svm_personalization_features_exclude_engagement_source_metadata():
 
 
 @given(
-    feedback_actions=st.lists(
-        st.sampled_from(["up", "neutral", "down"]), min_size=0, max_size=20
-    ),
+    up_count=st.integers(min_value=2, max_value=5),
+    down_count=st.integers(min_value=2, max_value=5),
+    neutral_count=st.integers(min_value=0, max_value=3),
     cand_count=st.integers(min_value=1, max_value=10),
+    seed=st.integers(min_value=0, max_value=2**31 - 1),
 )
 @settings(
     max_examples=25,
     suppress_health_check=[HealthCheck.function_scoped_fixture],
     deadline=1000,
 )
-def test_svm_fitting_robustness(embedder, feedback_actions, cand_count):
+def test_svm_fitting_robustness(
+    embedder: Embedder,
+    up_count: int,
+    down_count: int,
+    neutral_count: int,
+    cand_count: int,
+    seed: int,
+) -> None:
+    rng = np.random.default_rng(seed)
+    feedback_actions: list[Literal["up", "down", "neutral"]] = (
+        ["up"] * up_count + ["down"] * down_count + ["neutral"] * neutral_count
+    )
+    rng.shuffle(feedback_actions)
     db = Database(":memory:")
     try:
         user = db.create_user("test_token_robustness")
@@ -1607,7 +1678,7 @@ def test_svm_fitting_robustness(embedder, feedback_actions, cand_count):
                 id=1000 + i,
                 title=f"Feedback Story {i}",
                 url=None,
-                score=np.random.randint(0, 1000),
+                score=int(rng.integers(0, 1000)),
                 time=int(1600000000 + i * 100),
                 text_content=f"Sample semantic content for history {i}",
             )
@@ -1616,7 +1687,7 @@ def test_svm_fitting_robustness(embedder, feedback_actions, cand_count):
             shash = hashlib.sha256(story.text_content.encode("utf-8")).hexdigest()
             db.upsert_story(story)
             db.upsert_embedding(
-                story.id, model_version, shash, np.random.randn(384).astype(np.float32)
+                story.id, model_version, shash, rng.standard_normal(384).astype(np.float32)
             )
             db.upsert_feedback(user.id, story.id, action)
 
@@ -1627,21 +1698,24 @@ def test_svm_fitting_robustness(embedder, feedback_actions, cand_count):
                     id=i,
                     title=f"Candidate Story {i}",
                     url=None,
-                    score=np.random.randint(0, 500),
+                    score=int(rng.integers(0, 500)),
                     time=int(1600000000),
                     text_content=f"Sample candidate content {i}",
                 )
             )
 
-        cand_embs = np.random.randn(cand_count, 384).astype(np.float32)
-        config = Config()
+        cand_embs = rng.standard_normal((cand_count, 384)).astype(np.float32)
+        config = Config(
+            model=ModelConfig(min_up_for_svm=2, min_down_for_svm=2)
+        )
         ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
 
         assert len(ranked) == cand_count
         for item in ranked:
             assert 0.0 <= item.score <= 1.0
-            if not feedback_actions:
-                assert 0.0 <= item.score <= 1.0
+            assert item.prob_down is not None
+            assert item.prob_neutral is not None
+            assert item.prob_up is not None
     finally:
         db.close()
 

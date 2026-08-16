@@ -818,11 +818,16 @@ def test_feedback_training_data(db):
         min_size=5,
         max_size=50,
     ),
-    # Indices of stories to attach feedback to
-    feedback_indices=st.sets(st.integers(min_value=0, max_value=49)),
+    data=st.data(),
 )
 @settings(max_examples=25, suppress_health_check=[HealthCheck.function_scoped_fixture])
-def test_story_pruning_integrity_invariants(fetched_offsets, feedback_indices):
+def test_story_pruning_integrity_invariants(fetched_offsets, data):
+    # Indices of stories to attach feedback to -- drawn against the
+    # actual story count so every index is live (a fixed 0..49 range
+    # went dead whenever fewer than 50 stories were generated).
+    feedback_indices = data.draw(
+        st.sets(st.integers(min_value=0, max_value=len(fetched_offsets) - 1))
+    )
     db = Database(":memory:")
     try:
         user = db.create_user("test_token_hypothesis")
@@ -851,7 +856,7 @@ def test_story_pruning_integrity_invariants(fetched_offsets, feedback_indices):
             )
 
             # Apply feedback if indexed
-            has_feedback = i in feedback_indices and i < len(fetched_offsets)
+            has_feedback = i in feedback_indices
             if has_feedback:
                 db.upsert_feedback(user.id, i, "up")
 

@@ -92,14 +92,25 @@ def normalize_url(raw: str | None) -> NormalizedUrl | None:
     parsed = urlparse(parse_target)
     if not parsed.netloc:
         return None
-    if "." not in parsed.netloc:
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    hostname = parsed.hostname
+    if not hostname or "." not in hostname:
         return None
 
-    host = parsed.netloc.lower()
+    host = hostname.lower()
     if host.startswith("www."):
         host = host[4:]
     if not host:
         return None
+    scheme = parsed.scheme.lower()
+    is_default_port = (scheme == "http" and port == 80) or (
+        scheme == "https" and port == 443
+    )
+    if port is not None and not is_default_port:
+        host = f"{host}:{port}"
 
     path = parsed.path or "/"
     if len(path) > 1 and path.endswith("/"):

@@ -1825,8 +1825,11 @@ def prop_db():
     suppress_health_check=[HealthCheck.function_scoped_fixture],
 )
 def test_dashboard_cache_version_invariant_property(
-    operations, prop_db, mock_embedder, monkeypatch
-):
+    operations: list[str],
+    prop_db: Database,
+    mock_embedder: MockEmbedder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     with prop_db.conn() as conn:
         with conn:
             conn.execute("DELETE FROM users")
@@ -1867,15 +1870,31 @@ def test_dashboard_cache_version_invariant_property(
     cache_key = f"dashboard_{user.id}"
     for operation in operations:
         current_version = TestHandler._dashboard_version(user.id)
+        cached_before = TestHandler._dashboard_cache.get(cache_key)
         if operation == "invalidate":
             TestHandler._invalidate_dashboard_cache(user.id)
         elif operation == "render_current":
-            TestHandler._render_dashboard_for_user(user)
+            rendered = TestHandler._render_dashboard_for_user(user)
+            allowed = {SKELETON_HTML, f"v={current_version}".encode()}
+            if cached_before is not None:
+                allowed.add(cached_before[0])
+            assert rendered in allowed
         else:
             stale_version = max(0, current_version - 1)
-            TestHandler._render_dashboard_for_user(user, expected_version=stale_version)
-            # stale hit MUST return content that was in cache before
-            # (cache version must be ≥ stale_version)
+            rendered = TestHandler._render_dashboard_for_user(
+                user, expected_version=stale_version
+            )
+            if cached_before is not None:
+                # A stale hit must return content that was in cache before;
+                # the warm may replace it only after the response is formed.
+                assert rendered == cached_before[0]
+
+        if operation == "render_current":
+            # Rendering must eventually warm the requested current version,
+            # not merely leave the cache absent while the weak version-order
+            # invariant continues to pass.
+            warmed = _wait_for_cache(TestHandler, user, current_version)
+            assert warmed == f"v={current_version}".encode()
 
         # Wait for any in-flight warm to settle before checking invariant.
         # SWR allows stale cache entries (cache version < current version)
