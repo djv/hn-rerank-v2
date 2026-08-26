@@ -2,6 +2,15 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-08-26 — chore: drop three dead tables
+
+`reading_events`, `user_signals`, `muted_channels` had zero rows and zero
+code references anywhere in `*.py` (not even `database.py::_create_tables`)
+— residue from a superseded schema. Backed up (`scripts/backup_hn_db.sh`,
+Drive snapshot `20260826T080532Z`) then dropped via new
+`scripts/drop_dead_tables.py --apply`, which refuses to run if any target
+table is non-empty. `PRAGMA integrity_check` returned `ok` after.
+
 ## 2026-08-15 — test: close remaining Hypothesis property gaps
 
 Follow-up validation of the 2026-08-14 property-test work:
