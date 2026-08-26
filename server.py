@@ -16,7 +16,7 @@ import time
 import math
 import uuid
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from http import HTTPStatus
 from pathlib import Path
@@ -54,6 +54,10 @@ REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dash
 TLDR_PROMPT_VERSION = "detail-v5"
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
 _PROMPT_CACHE: dict[str, str] = {}
+# Seam for tests: swap in a controllable timer to make debounce/regen tests
+# deterministic instead of racing the real clock. Production always uses the
+# real threading.Timer.
+_TIMER_FACTORY: Callable[..., threading.Timer] = threading.Timer
 
 
 @dataclass(frozen=True)
@@ -1157,7 +1161,7 @@ class Handler:
             previous = cls._feedback_regen_timer
             if previous is not None:
                 previous.cancel()
-            timer = threading.Timer(
+            timer = _TIMER_FACTORY(
                 cls.config.feedback_regen_idle_seconds,
                 cls._feedback_regen_idle_fired,
             )

@@ -8,6 +8,7 @@ import pytest
 from hypothesis import HealthCheck, given, settings, strategies as st
 from werkzeug.serving import make_server
 
+from collections.abc import Callable
 from typing import Any, cast
 
 from server import Handler, SKELETON_HTML, create_app
@@ -103,6 +104,43 @@ def _has_pending_warm(handler: type[Handler]) -> bool:
 def _has_pending_feedback_regen(handler: type[Handler]) -> bool:
     with handler._feedback_regen_guard:
         return handler._feedback_regen_timer is not None
+
+
+class _ControllableTimer(threading.Timer):
+    """`threading.Timer` stand-in for deterministic timer tests.
+
+    `start()` does not arm a real background wait; the callback only runs
+    when `.fire()` is called explicitly. `.fire()` still executes on the
+    timer's own thread (via the real `Thread.start`/`join`), so
+    `threading.current_thread()` inside the callback is the timer object
+    itself -- production code (`Handler._feedback_regen_idle_fired`) guards
+    on that identity, and a stub that ran the callback inline would make
+    that guard untestable. `cancel()` is inherited unmodified, so debounced
+    timers behave exactly as in production: a `fire()` after `cancel()` is
+    correctly a no-op.
+    """
+
+    def start(self) -> None:  # do not arm a real wait
+        pass
+
+    def fire(self) -> None:
+        self.interval = 0
+        threading.Thread.start(self)
+        self.join(timeout=1.0)
+
+
+def _controllable_timer_factory(
+    created: list[_ControllableTimer],
+) -> Callable[..., _ControllableTimer]:
+    """Build a `server._TIMER_FACTORY` replacement that records every timer
+    it creates into `created`, in creation order."""
+
+    def factory(*args: Any, **kwargs: Any) -> _ControllableTimer:
+        timer = _ControllableTimer(*args, **kwargs)
+        created.append(timer)
+        return timer
+
+    return factory
 
 
 def _drain_warms(handler: type[Handler], timeout_s: float = 3.0) -> None:
@@ -716,10 +754,22 @@ def test_feedback_idle_threshold_queues_latest_warm(
 def test_feedback_regen_timer_resets_across_users_and_signals_once(
     test_env: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """All users share one trailing regeneration request."""
+    """All users share one trailing regeneration request.
+
+    Uses a controllable timer (see `_controllable_timer_factory`) instead of
+    a short real `feedback_regen_idle_seconds` + `time.sleep` budget: the
+    prior version raced the wall clock and failed intermittently under
+    parallel test workers (each of the three HTTP round-trips plus two 30ms
+    sleeps had to fit inside a 150ms window). The invariant under test --
+    each vote replaces the pending timer, and a burst produces exactly one
+    regen signal -- does not need real time to verify.
+    """
+    import server
+
     port, db, regen_event, handler, user = test_env
     other_user = db.create_user("other_feedback_regen_user")
-    handler.config = replace(handler.config, feedback_regen_idle_seconds=0.15)
+    timers: list[_ControllableTimer] = []
+    monkeypatch.setattr(server, "_TIMER_FACTORY", _controllable_timer_factory(timers))
     set_calls: list[float] = []
     original_set = regen_event.set
 
@@ -748,32 +798,29 @@ def test_feedback_regen_timer_resets_across_users_and_signals_once(
         cookies={"hn_token": user.token},
     )
     assert first.status_code == 200
-    first_timer = handler._feedback_regen_timer
-    time.sleep(0.03)
     second = httpx.post(
         f"http://127.0.0.1:{port}/api/feedback",
         json={"story_id": 1301, "action": "down"},
         cookies={"hn_token": other_user.token},
     )
     assert second.status_code == 200
-    second_timer = handler._feedback_regen_timer
-    assert first_timer is not second_timer
-
-    time.sleep(0.03)
     third = httpx.post(
         f"http://127.0.0.1:{port}/api/feedback",
         json={"story_id": 1302, "action": "neutral"},
         cookies={"hn_token": user.token},
     )
     assert third.status_code == 200
-    third_timer = handler._feedback_regen_timer
-    assert second_timer is not third_timer
+    assert user.id != other_user.id
+
+    # Each vote cancelled the previous timer and armed a new one: three
+    # distinct timer objects were created, and only the last is still live.
+    assert len(timers) == 3
+    assert timers[0].finished.is_set()
+    assert timers[1].finished.is_set()
+    assert not timers[2].finished.is_set()
     assert not regen_event.is_set()
 
-    assert user.id != other_user.id
-    deadline = time.time() + 0.5
-    while not regen_event.is_set() and time.time() < deadline:
-        time.sleep(0.005)
+    timers[2].fire()
 
     assert regen_event.is_set()
     assert len(set_calls) == 1
@@ -784,15 +831,20 @@ def test_regeneration_start_cancels_pending_feedback_timer(
     test_env: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A periodic regeneration satisfies the pending delayed request."""
+    import server
+
     _, _, regen_event, handler, _ = test_env
-    handler.config = replace(handler.config, feedback_regen_idle_seconds=0.03)
+    timers: list[_ControllableTimer] = []
+    monkeypatch.setattr(server, "_TIMER_FACTORY", _controllable_timer_factory(timers))
     set_calls: list[None] = []
     monkeypatch.setattr(regen_event, "set", lambda: set_calls.append(None))
 
     handler._schedule_feedback_regen()
     assert _has_pending_feedback_regen(handler)
     handler._cancel_feedback_regen()
-    time.sleep(0.06)
+
+    assert timers[0].finished.is_set()
+    timers[0].fire()
 
     assert set_calls == []
     assert not _has_pending_feedback_regen(handler)

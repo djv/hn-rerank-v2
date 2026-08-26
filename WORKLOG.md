@@ -2,14 +2,31 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
-## 2026-08-26 — chore: drop three dead tables
+## 2026-08-26 — test: make the feedback-regen-timer test deterministic
 
-`reading_events`, `user_signals`, `muted_channels` had zero rows and zero
-code references anywhere in `*.py` (not even `database.py::_create_tables`)
-— residue from a superseded schema. Backed up (`scripts/backup_hn_db.sh`,
-Drive snapshot `20260826T080532Z`) then dropped via new
-`scripts/drop_dead_tables.py --apply`, which refuses to run if any target
-table is non-empty. `PRAGMA integrity_check` returned `ok` after.
+`tests/test_server.py::test_feedback_regen_timer_resets_across_users_and_signals_once`
+was intermittently flaky under `-n 4`: it set
+`feedback_regen_idle_seconds=0.15` and needed 3 HTTP round-trips + 60ms of
+`time.sleep` to finish inside that window, which parallel test workers
+sometimes blew. Reproduced by artificially shrinking the idle window; did
+not reproduce in isolation or under `-n 8` (confirming the wall-clock-race
+diagnosis rather than order-dependence).
+
+Fixed by removing the wall clock instead of the coverage. Added a
+`server._TIMER_FACTORY` seam (`threading.Timer` by default) that
+`Handler._schedule_feedback_regen` now calls through. The test swaps in a
+`_ControllableTimer` (`tests/test_server.py`) that records itself instead of
+arming a real wait and only runs its callback on an explicit `.fire()` —
+still on the timer's own real thread, so `threading.current_thread()`
+identity inside `_feedback_regen_idle_fired`'s debounce guard is preserved.
+Verified the rewritten test both passes deterministically and catches a
+real regression: temporarily removed the `_schedule_feedback_regen` cancel
+call (breaking debounce) and confirmed the test fails; restored and
+confirmed it passes again. 5x `pytest tests/ -n 8` clean, no flake.
+
+Also moved `test_regeneration_start_cancels_pending_feedback_timer` off its
+`time.sleep(0.06)` to the same controllable-timer helper while touching this
+area.
 
 ## 2026-08-15 — test: close remaining Hypothesis property gaps
 
