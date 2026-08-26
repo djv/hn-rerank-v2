@@ -2,31 +2,55 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
-## 2026-08-26 — test: make the feedback-regen-timer test deterministic
+## 2026-08-26 — fix: eval.py NameError + candidate-cap subsampling artifact
 
-`tests/test_server.py::test_feedback_regen_timer_resets_across_users_and_signals_once`
-was intermittently flaky under `-n 4`: it set
-`feedback_regen_idle_seconds=0.15` and needed 3 HTTP round-trips + 60ms of
-`time.sleep` to finish inside that window, which parallel test workers
-sometimes blew. Reproduced by artificially shrinking the idle window; did
-not reproduce in isolation or under `-n 8` (confirming the wall-clock-race
-diagnosis rather than order-dependence).
+A general health pass found `eval_report.json` (committed, `db_sha256`
+`44b8701628437da1`) stale since 2026-07-04 at `n_feedback: 2466` vs the live
+4291. Regenerating it surfaced two real bugs, both fixed:
 
-Fixed by removing the wall clock instead of the coverage. Added a
-`server._TIMER_FACTORY` seam (`threading.Timer` by default) that
-`Handler._schedule_feedback_regen` now calls through. The test swaps in a
-`_ControllableTimer` (`tests/test_server.py`) that records itself instead of
-arming a real wait and only runs its callback on an explicit `.fire()` —
-still on the timer's own real thread, so `threading.current_thread()`
-identity inside `_feedback_regen_idle_fired`'s debounce guard is preserved.
-Verified the rewritten test both passes deterministically and catches a
-real regression: temporarily removed the `_schedule_feedback_regen` cancel
-call (breaking debounce) and confirmed the test fails; restored and
-confirmed it passes again. 5x `pytest tests/ -n 8` clean, no flake.
+1. **`eval.py` crashed on every real run.** `RankedStory`, `mmr_filter`,
+   `rerank_candidates`, `story_embedding_text`, and `Database` were used at
+   runtime in `_evaluate_fold`/`_compute_final_queue_metrics` but imported
+   only under `TYPE_CHECKING` (added by the 2026-06-28 lazy-import perf
+   work). `tests/test_eval.py` only asserts against the static report file
+   and never exercises `main()`, so this went undetected for ~2 months.
+   Fixed with function-local runtime imports, matching the file's existing
+   lazy-import pattern (`--help` stays at 0.17s). Removed the now-dead
+   `TYPE_CHECKING` imports of those four names.
 
-Also moved `test_regeneration_start_cancels_pending_feedback_timer` off its
-`time.sleep(0.06)` to the same controllable-timer helper while touching this
-area.
+2. **`--candidate-cap` silently dropped most of the feedback set.** The
+   subsample was a plain uniform random draw over the full candidate pool
+   with no guarantee that voted-on stories survived it. As the archive has
+   grown (55,054 candidates now vs whatever smaller pool existed in July),
+   an increasing share of feedback rows are excluded by chance — this run,
+   before the fix, excluded 3,510 of 4,287 rows (82%), crashing
+   `ndcg_at_40` to ~0.024 for reasons unrelated to ranking quality. Fixed by
+   reusing `_candidate_indices_with_feedback`
+   (`scripts/eval_ranker_variants.py`, already tested by
+   `test_candidate_cap_retains_feedback_story_ids`) so the cap only trims
+   non-feedback filler; every feedback-linked candidate is always retained.
+   Note: that helper's fill order is deterministic and ignores
+   `--candidate-cap-seed` — the flag is kept (a test pins it in `--help`)
+   but documented as a no-op.
+
+Regenerated with `uv run python eval.py --candidate-cap 10000` (matching the
+stale report's config). Headline: `ndcg_at_40` (current formula, mmr) =
+**0.197 ± 0.067**, down from the stale 0.332. Not treated as alarming per
+AGENTS.md's leakage-skepticism guidance — a decline, not an implausible
+jump — and expected: `n_feedback` grew 74% (2466 → 4291) with more
+topic/time drift, and this run is the first methodologically sound number
+since the subsampling bug started degrading with archive growth. New
+`db_sha256`: `f59ffa04ef31e8c2`.
+
+Full suite (`uv run pytest tests/ -n 4`): 600 passed, 1 skipped. Ruff and Ty
+clean.
+
+**Observation, not investigated:** `current`/`up_only`'s `mmr` and `raw`
+NDCG values are bit-identical in this run (as they were pre-fix too), where
+the stale July report had them differ (0.3316 vs 0.3421). Worth checking
+whether `mmr_filter` is a no-op on the current candidate/threshold shape,
+or whether something else changed between July and now — flagged for
+follow-up, out of scope here.
 
 ## 2026-08-15 — test: close remaining Hypothesis property gaps
 

@@ -30,14 +30,7 @@ import numpy as np
 
 if TYPE_CHECKING:
     from database import Database, Story
-    from pipeline import (
-        Config,
-        Embedder,
-        RankedStory,
-        mmr_filter,
-        rerank_candidates,
-        story_embedding_text,
-    )
+    from pipeline import Config, Embedder
 
 MODEL_VERSION = "all-MiniLM-L6-v2|mean|norm|256"
 REPORT_PATH = Path(__file__).parent / "eval_report.json"
@@ -154,6 +147,8 @@ def _evaluate_fold(
     cand_closest_down: np.ndarray | None = None,
     k_values: tuple[int, ...] = (40,),
 ) -> dict:
+    from pipeline import RankedStory, mmr_filter
+
     if formula == "current":
         if neutral_weight != 0.0:
             class_order = list(range(decision.shape[1]))
@@ -361,6 +356,9 @@ def _compute_final_queue_metrics(
     Returns {"mmr": metrics, "per_source": {source: ...}}.
     Returns empty dict on failure.
     """
+    from database import Database
+    from pipeline import rerank_candidates, story_embedding_text
+
     db = Database(":memory:")
     uid = 1000 + fold_idx
 
@@ -503,13 +501,17 @@ def main() -> None:
         "--candidate-cap",
         type=int,
         default=None,
-        help="Subsample candidates to this many stories (random, fixed seed).",
+        help="Subsample candidates to this many stories. All feedback-linked "
+        "candidates are always retained; the cap only trims the rest, with "
+        "a deterministic fill order.",
     )
     parser.add_argument(
         "--candidate-cap-seed",
         type=int,
         default=0,
-        help="Random seed for --candidate-cap subsampling (default 0).",
+        help="No-op: retained for CLI/report compatibility. The candidate "
+        "subsample's non-feedback fill order is deterministic (see "
+        "_candidate_indices_with_feedback), not seeded by this flag.",
     )
     parser.add_argument(
         "--exclude-sources",
@@ -573,15 +575,29 @@ def main() -> None:
         cand_emb = cand_emb[keep_idx]
         print(f"  Excluded sources {sorted(excluded)}: {before} -> {len(candidates)}")
     if args.candidate_cap is not None and len(candidates) > args.candidate_cap:
-        rng = np.random.default_rng(args.candidate_cap_seed)
-        keep_idx = np.sort(
-            rng.choice(len(candidates), size=args.candidate_cap, replace=False)
+        # A plain uniform random subsample drops a growing share of
+        # feedback-linked stories as the archive grows relative to the fixed
+        # cap (82% excluded once the pool passed ~55k rows), silently
+        # gutting the eval's test set and crashing NDCG for reasons
+        # unrelated to ranking quality. `_candidate_indices_with_feedback`
+        # (already used and tested by scripts/eval_ranker_variants.py) keeps
+        # every feedback-linked candidate and fills the remaining slots
+        # randomly, so the cap only trims non-feedback filler.
+        from scripts.eval_ranker_variants import _candidate_indices_with_feedback
+
+        before = len(candidates)
+        fb_ids = {s.id for s in fb_stories}
+        keep_idx = _candidate_indices_with_feedback(
+            candidates, max_candidates=args.candidate_cap, required_story_ids=fb_ids
         )
         candidates = [candidates[i] for i in keep_idx]
         cand_emb = cand_emb[keep_idx]
         print(
-            f"  Subsampled to {len(candidates)} candidates "
-            f"(seed={args.candidate_cap_seed}) for apples-to-apples comparison"
+            f"  Subsampled to {len(candidates)} candidates for "
+            f"apples-to-apples comparison [{before - len(candidates)} "
+            "non-feedback rows dropped; all feedback-linked candidates "
+            "retained -- fill order is deterministic, --candidate-cap-seed "
+            "does not apply]"
         )
 
     # Map feedback stories → candidate indices
