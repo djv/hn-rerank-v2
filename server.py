@@ -2521,12 +2521,28 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
             logging.exception("Background regeneration failed: %r", e)
 
 
+def _quiet_third_party_loggers() -> None:
+    """Silence third-party INFO/WARNING noise that isn't actionable.
+
+    httpx logs an INFO line for every outbound request (CH, Algolia, RSS,
+    article fetches); at regen scale this is ~88% of journal volume and
+    drowns out anything worth reading during a live incident. trafilatura
+    emits a benign "discarding data: None" WARNING whenever we call
+    extract() without a source URL, which we always do. Neither is a
+    signal we act on; downstream errors still surface via our own
+    exception/warning logging.
+    """
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("trafilatura").setLevel(logging.ERROR)
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[logging.StreamHandler(sys.stderr)],
     )
+    _quiet_third_party_loggers()
     load_env()
     config = Config.load()
     db = Database(config.db_path)

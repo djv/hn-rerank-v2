@@ -5244,3 +5244,27 @@ def test_warm_background_article_fetch_failure_still_prefetches_tldrs(
 
     assert prefetch_calls == [[3010]]
     assert srv.Handler._article_fetch_in_flight == set()
+
+
+def test_quiet_third_party_loggers_silences_httpx_and_trafilatura() -> None:
+    """httpx INFO and trafilatura's benign "discarding data" WARNING made up
+    ~88% of a week of journal volume in production, drowning out anything
+    actionable during an incident (see WORKLOG 2026-08-27)."""
+    import logging
+    import server as srv
+
+    httpx_logger = logging.getLogger("httpx")
+    trafilatura_logger = logging.getLogger("trafilatura")
+    orig_httpx_level = httpx_logger.level
+    orig_trafilatura_level = trafilatura_logger.level
+    try:
+        httpx_logger.setLevel(logging.NOTSET)
+        trafilatura_logger.setLevel(logging.NOTSET)
+
+        srv._quiet_third_party_loggers()
+
+        assert httpx_logger.level == logging.WARNING
+        assert trafilatura_logger.level == logging.ERROR
+    finally:
+        httpx_logger.setLevel(orig_httpx_level)
+        trafilatura_logger.setLevel(orig_trafilatura_level)
