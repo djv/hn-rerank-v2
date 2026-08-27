@@ -14,9 +14,9 @@
 - Keep the runtime path local-first; do not add new external dependencies unless needed.
 - **Be very skeptical of unusually high metrics** (e.g. NDCG > 0.40). We are unlikely to beat the Hacker News baseline by a large margin; high metrics often indicate feature leakage, train-test contamination, or metric saturation artifacts.
 - **Do NOT standard-scale raw embeddings** (the production 384-d embeddings are L2-normalized; the current configured encoder is mxbai-embed-xsmall-v1). StandardScaler must only touch metadata columns from `emb_dim:` onward.
-- **Never delete or destructively modify the local database** (`hn_rewrite.db`, `hn.db`, or any `*.db` file in the working tree). The DB holds the user's accumulated feedback and is the single source of truth for personalization. No `rm`, no `DELETE FROM` without a `WHERE` clause that excludes all rows, no schema migrations that drop tables or columns with data. The pipeline's own `prune_stories` and `prune_*` operations are fine — they have explicit retention rules and `id NOT IN (SELECT story_id FROM feedback)` guards. When in doubt, ask before running any command that touches the DB file.
+- **Never delete or destructively modify the local database** (`hn_rewrite.db`, `hn.db`, or any `*.db` file in the working tree). The DB holds the user's accumulated feedback and is the single source of truth for personalization. No `rm`, no `DELETE FROM` without a `WHERE` clause that excludes all rows, no schema migrations that drop tables or columns with data. `database.py`'s `prune_stories` has an explicit retention rule and an `id NOT IN (SELECT story_id FROM feedback)` guard, so it would be fine to run — but it is currently **dormant**: nothing in the live pipeline calls it (only tests do). Wiring it up would start deleting story rows from an 860MB+ DB; treat that as a decision requiring explicit user sign-off, not routine maintenance. When in doubt, ask before running any command that touches the DB file.
   - **Exception (2026-06-22):** 756 test/empty stories (time=0) were deleted with explicit user permission. This included 2 test stories (id=999 "Test", id=99999998 "Test regen live") that received 2 upvotes from user 1. Backup retained at `hn_rewrite.db.pre_test_removal_20260622T163344Z`.
-- Keep test execution times optimized (target under 12 seconds total at `-n 4`). Run the full suite with `uv run pytest tests/ -n 4` (4 cores; `pytest-xdist` is in `dev`). Single-process takes ~32s; `-n 4` brings it to ~22s on this host. Per-test ONNX model loads are avoided entirely by `MockEmbedder(Embedder)` in `tests/test_server.py:18` (overrides `__init__` to skip the `AutoTokenizer.from_pretrained` + `ort.InferenceSession` path) and `DummyEmbedder(Embedder)` in the two seed test files — they share a module-scoped `mock_embedder` fixture in `test_server.py`. The remaining ~22s is dominated by `test_leak_check_smoke` (10s) and `test_leak_check_flag_in_help` (3s) in `test_eval_ranker_variants.py` (subprocesses that run real sklearn). Do not regress this: any new "mock" embedder that subclasses `pipeline.Embedder` MUST override `__init__` or it will silently reload ONNX per test.
+- Keep test execution times optimized (target under 12 seconds total at `-n 4`). Run the full suite with `uv run pytest tests/ -n 4` (4 cores; `pytest-xdist` is in `dev`). Single-process takes ~32s; `-n 4` brings it to ~13s on this host (still a hair over the 12s target — no single dominant test, the slowest is a ~3s Hypothesis property test in `test_server.py`). Per-test ONNX model loads are avoided entirely by `MockEmbedder(Embedder)` in `tests/test_server.py:21` (overrides `__init__` to skip the `AutoTokenizer.from_pretrained` + `ort.InferenceSession` path) and `DummyEmbedder(Embedder)` in the two seed test files — they share a module-scoped `mock_embedder` fixture in `test_server.py`. Do not regress this: any new "mock" embedder that subclasses `pipeline.Embedder` MUST override `__init__` or it will silently reload ONNX per test.
 - **Hypothesis profiles**: `tests/conftest.py` registers opt-in `dev` (50
   examples) and `ci` (300 examples, `deadline=None`, `print_blob=True`).
   Select with `HYPOTHESIS_PROFILE=ci uv run pytest tests/`; ordinary pytest
@@ -151,11 +151,11 @@ Before reporting completion of any code or template change:
 
 ## Dependency groups
 
-`pyproject.toml` ships two groups beyond the runtime deps. Default
-`uv sync` installs only `dev` (linters, pytest, type checker). The
-`dl-experiment` group is opt-in.
+`pyproject.toml` ships three groups beyond the runtime deps. Default
+`uv sync` installs only `dev` (linters, pytest, type checker). `dl-experiment`
+and `embedding-experiment` are both opt-in.
 
-- `dev` — pytest, pytest-asyncio, hypothesis, ruff, ty. Always
+- `dev` — pytest, pytest-asyncio, hypothesis, pytest-xdist, ruff, ty. Always
   installed by `uv sync`.
 - `dl-experiment` — `torch>=2.12`. Pulls in the ~700MB torch +
   triton + nvidia-cu* wheels. **Required only by** `pipeline_dl.py`,
@@ -166,11 +166,17 @@ Before reporting completion of any code or template change:
   - Install on demand: `uv sync --group dl-experiment`
   - Run the experiment tests: `uv run --group dl-experiment pytest tests/test_pipeline_dl.py`
   - Run the offline eval: `uv run --group dl-experiment python scripts/eval_ranker_variants.py ...`
-  - Without the group, `scripts/eval_ranker_variants.py` exits 1 with
-    a friendly error pointing at this command.
-  - The 21 `test_pipeline_dl.py` tests are skipped (not failed) by
-    `pytest.importorskip("torch")` at the top of the file when the
-    group is not active.
+  - Without the group, `scripts/eval_ranker_variants.py --help` still
+    exits 0; the friendly error only fires when a DL variant is
+    actually requested.
+  - `tests/test_pipeline_dl.py` is a single `pytest.importorskip("torch")`
+    at module scope, so pytest reports it as **1** skip (not one per
+    test function) when the group is not active.
+- `embedding-experiment` (`48185b7`) — `huggingface-hub`, `scipy`. Required
+  only by `scripts/bakeoff_embedding_models.py` and
+  `scripts/bench_qwen_embed_speed.py` (embedding-model comparison tooling,
+  not the live ranking path).
+  - Install on demand: `uv sync --group embedding-experiment`
 
 If a future experiment is added that needs a different heavy
 runtime dep (e.g. jax, tensorflow), give it its own
@@ -229,14 +235,13 @@ sole source for the live 30-day window and bulk operations.
 | **BigQuery** (`bigquery-public-data.hacker_news.full`) | Backup archive seeder (manual) | Same data as CH; slower; requires `gcloud`/`bq` auth |
 
 The live `hn` source pipeline (`fetch_candidates` in `pipeline/__init__.py`) now
-issues **1 CH call per regen**:
+issues **2 CH calls per regen**:
 
 1. `ch_client.query_live_window(days=30, min_score=5, limit=5000)` — every
    live HN story from the past 30 days with all fields (title, url,
    score, descendants, time, text).
-
-The prewarm (comment text for all HN candidates with `comment_count > 0` and
-empty `top_comments`) is a second CH call inside `fetch_candidates_only`,
+2. The prewarm (comment text for all HN candidates with `comment_count > 0` and
+   empty `top_comments`), inside `fetch_candidates_only`,
 at regen time — not on the render path. Every user's first dashboard render
 finds the candidate rows already populated. The first cards any user sees
 have `top_comments` already populated — no Algolia wait and no render-time
@@ -255,11 +260,12 @@ With the default 4h regen cycle, worst case is 5h lag for stories posted in the
 last hour. Acceptable for "best of HN" view; the swipe deck mostly
 shows older stories anyway.
 
-The CH bulk client lives in `ch_client.py`. The
-previous per-story parallel Algolia hydration (used for archive seeding
-before 2026-06-26) is preserved in
-`scripts/_archive/algolia/` as a fallback if CH
-becomes unavailable.
+The CH bulk client lives in `ch_client.py`. The previous per-story parallel
+Algolia hydration (used for archive seeding before 2026-06-26) was removed
+in `f4b2000` ("Collapse eval scripts, remove legacy_features and archived
+Algolia") — `scripts/_archive/algolia/` no longer exists. If CH becomes
+unavailable, recover it from git history (`git show f4b2000^:main/scripts/_archive/algolia/...`)
+rather than expecting it on disk.
 
 **Comment tree fetches walk `kids` arrays, never join the comments table.**
 `ch_client.query_comments_bulk` fetches a story's comment tree with one
@@ -301,6 +307,8 @@ HN_KEEP_N=7 ./scripts/backup_hn_db.sh             # keep 7
 LATEST=$(rclone lsf --dirs-only drive:hn-rewrite/backups/ | sort -r | head -1)
 rclone copy drive:hn-rewrite/backups/$LATEST/hn_rewrite.db ./hn_rewrite.db
 sqlite3 hn_rewrite.db "PRAGMA integrity_check;"
+```
+
 ## Testing notes
 
 - **Curl sessions**: first-visit `GET /` creates one user, sets `hn_token`, and serves the dashboard directly. `/u/<token>` only imports an existing profile onto a new device. Always use `-c cookie.txt -b cookie.txt` when testing live API flows with curl so subsequent requests keep the same profile.

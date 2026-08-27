@@ -1,5 +1,10 @@
 # Add `Discussion-rich` and `High-engagement` surfaces
 
+**Completed.** Both surfaces shipped as `is_discussion_rich` /
+`is_high_engagement` on `RankedStory` (`pipeline/ranking.py`), rendered as
+the "Talk-worthy" and "Top" badges (`pipeline/render.py`). Kept here as the
+design record.
+
 ## Goal
 Add two new post-MMR surfaces that mirror the existing `is_uncertain` and `is_novel`
 pattern: a boolean flag on `RankedStory`, a post-rank surfacing pass that pulls

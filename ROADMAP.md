@@ -3,7 +3,7 @@
 ## Context
 
 This is a personal, single-user, local-first Hacker News reranking dashboard.
-`GET /` is SWR-cached (`Handler._dashboard_cache`, server.py:920) — the
+`GET /` is SWR-cached (`Handler._dashboard_cache`, server.py:984) — the
 user-facing latency that matters is **vote → warm completion → ready-gated
 refill**, not page-render time. Deployment shape is SQLite + one systemd
 service; do not reach for Postgres, Redis, a message broker, FAISS, or a deep
@@ -149,19 +149,12 @@ ordering/tie behavior, temporal-evaluation parity, full-suite verification,
 peak-memory sampling. Do not materialize a full candidate-by-training kernel
 while the service is memory constrained.
 
-### PERF-4. Cache the candidate matrix per regen cycle (S, demoted)
+### PERF-4. Cache the candidate matrix per regen cycle — **Done 2026-07-28**
 
-**Demote until instrumented** — a production-shaped read found only two
-embedding misses, so the occasional 15s `candidate_embedding` tail is likely
-concurrency/content-change related, not "recompute from scratch every warm."
-Add finer substage tracing first (cache hit/miss count, SQLite read, hashing,
-ONNX compute, competing regen/background work) before retaining full
-candidate matrices in memory. Every warm currently re-runs
-`load_production_candidate_stories` and `get_or_compute_embeddings` against
-the DB; candidates only change 4-hourly, so holding `(stories,
-embedding_matrix)` in-process keyed by regen generation is plausible
-(~8000×384 float32 ≈ 12MB, not a memory concern), but confirm the tail is
-actually recompute-bound before adding the cache.
+Shipped as `pipeline/candidate_cache.py`: a process-wide `CandidatePool`
+holding `(stories, embedding_matrix)` keyed by regen generation, with
+`pool_cache=hit|miss` visible in `rank_perf` logging. See
+`ARCHITECTURE.md` §"Shared candidate pool cache (2026-07-28)" for the design.
 
 ---
 
@@ -196,7 +189,7 @@ changed story.
 ### REF-2. Replace class-global `Handler` state with an injected runtime (M, 2-3 days)
 
 **Highest correctness/testability payoff.** All `Handler` state is
-class-level (server.py:915-934), shared process-wide — why conftest needs
+class-level (server.py:~980-1010), shared process-wide — why conftest needs
 autouse singleton-reset fixtures and why parallel test isolation is fragile.
 Introduce an `AppRuntime`/instance (`config`, `db`, `embedder`, regen event,
 public-demo limiter) and a `DashboardService` owning versions, render locks,
@@ -222,8 +215,8 @@ mapping — move cache-key construction, source hydration, LLM generation,
 fallback behavior, and persistence behind the service. Don't start with
 Blueprints; they'd just relocate the same tangled handler.
 
-Then, as a fourth refactor once that boundary exists: extract the ~945-line
-inline `<script>` in `index.html` (52% of the only template) to
+Then, as a fourth refactor once that boundary exists: extract the 1000+-line
+inline `<script>` in `index.html` (over half of the only template) to
 `static/deck.js`. Cuts every dashboard render's payload, ends the
 template-string-test brittleness for JS internals, opens the door to real
 JS/browser unit tests, and gives `tests/test_server.py`'s template assertions
@@ -380,8 +373,9 @@ Test event idempotency and session/card association.
 3. ~~**PERF-1** — make HN duplicate resolution local-only during warm
    ranking~~ — done.
 4. ~~**PERF-2** — rerank cadence / stale-deck refill policy~~ — done.
-5. ~~**PERF-3** — precomputed kernel SVM~~ — done. **PERF-4** remains
-   conditional on finer candidate-embedding tracing.
+5. ~~**PERF-3** — precomputed kernel SVM~~ — done.
+5b. ~~**PERF-4** — cache the candidate matrix per regen cycle~~ — done
+   (`pipeline/candidate_cache.py`, 2026-07-28).
 6. ~~**OPS-1** — isolate Reddit from core regeneration~~ — done.
 7. ~~read the interaction ledger (`scripts/ledger_report.py`)~~ — done,
    2026-08-14. Result: B1 blocked (no true vote-creation timestamp), B2
