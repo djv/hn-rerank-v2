@@ -116,7 +116,7 @@ def _main():
     fb_vote_times = np.array(fb_vote_times, dtype=np.float64)
     print(f"Feedback: {len(fb_stories)} rows ({Counter(fb_labels)})")
 
-    candidates, cand_emb = _load_candidates(db)
+    candidates, cand_emb = _load_candidates(db, config.embedding_model_version)
     print(f"Candidates: {len(candidates)}")
     if args.max_candidates is not None and len(candidates) > args.max_candidates:
         rng = np.random.default_rng(0)

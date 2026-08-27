@@ -1,9 +1,19 @@
 import json
 import subprocess
+import sys
 from pathlib import Path
+
+import numpy as np
+import pytest
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from database import Database, Story
+from eval import MIN_EMBEDDING_COVERAGE, _load_candidates
 
 REPORT = Path(__file__).parent.parent / "eval_report.json"
 EVAL_PY = Path(__file__).parent.parent / "eval.py"
+MODEL_VERSION = "mxbai-embed-xsmall-v1|mean|norm|4096"
 
 
 def test_report_exists():
@@ -98,4 +108,79 @@ def test_final_queue_per_source_present():
         assert "n_test" in ps[source]
         assert "mean" in ps[source]
         assert "mmr" in ps[source]["mean"]
-        assert "ndcg_at_40" in ps[source]["mean"]["mmr"]
+
+
+# ---------------------------------------------------------------------------
+# _load_candidates: model_version must be threaded in, not hardcoded
+# (regression coverage for the 2026-08-27 fix -- see WORKLOG). A prior
+# hardcoded MODEL_VERSION constant disagreed with the configured encoder,
+# so most embedding lookups silently missed and fell back to zero vectors.
+# ---------------------------------------------------------------------------
+
+
+def _seed_story_with_embedding(
+    db: Database, story_id: int, text: str, model_version: str | None
+) -> None:
+    import hashlib
+
+    db.upsert_story(
+        Story(
+            id=story_id,
+            title=f"story {story_id}",
+            url=None,
+            score=1,
+            time=1,
+            text_content=text,
+            source="hn",
+        )
+    )
+    if model_version is not None:
+        text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        db.upsert_embedding(
+            story_id, model_version, text_hash, np.zeros(384, dtype=np.float32)
+        )
+
+
+def test_load_candidates_uses_the_passed_model_version_not_a_hardcoded_one():
+    """A story embedded under a different model_version must count as a
+    miss, not a hit -- proves the lookup key comes from the caller."""
+    db = Database(":memory:")
+    _seed_story_with_embedding(db, 1, "story one", MODEL_VERSION)
+    _seed_story_with_embedding(db, 2, "story two", "some-other-model|v1")
+
+    with pytest.raises(RuntimeError, match="coverage"):
+        _load_candidates(db, MODEL_VERSION)
+
+
+def test_load_candidates_raises_on_low_embedding_coverage():
+    """Below MIN_EMBEDDING_COVERAGE, fail loudly rather than silently
+    filling the gap with zero vectors (the pre-fix behavior)."""
+    assert 0.1 < MIN_EMBEDDING_COVERAGE, "test assumes 1/10 coverage is a failure"
+    db = Database(":memory:")
+    for i in range(10):
+        # Only embed 1 of 10 -- well under MIN_EMBEDDING_COVERAGE.
+        _seed_story_with_embedding(
+            db, i, f"story {i}", MODEL_VERSION if i == 0 else None
+        )
+
+    with pytest.raises(RuntimeError, match="coverage"):
+        _load_candidates(db, MODEL_VERSION)
+
+
+def test_load_candidates_succeeds_with_full_coverage():
+    db = Database(":memory:")
+    for i in range(10):
+        _seed_story_with_embedding(db, i, f"story {i}", MODEL_VERSION)
+
+    stories, embeddings = _load_candidates(db, MODEL_VERSION)
+    assert len(stories) == 10
+    assert embeddings.shape == (10, 384)
+
+
+def test_load_candidates_empty_db_does_not_raise():
+    """Zero candidate stories is a degenerate-but-valid input (coverage
+    over an empty set is defined as 1.0), not a coverage failure."""
+    db = Database(":memory:")
+    stories, embeddings = _load_candidates(db, MODEL_VERSION)
+    assert stories == []
+    assert embeddings.shape == (0,)

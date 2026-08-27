@@ -32,16 +32,31 @@ if TYPE_CHECKING:
     from database import Database, Story
     from pipeline import Config, Embedder
 
-MODEL_VERSION = "all-MiniLM-L6-v2|mean|norm|256"
 REPORT_PATH = Path(__file__).parent / "eval_report.json"
+
+# Minimum fraction of text-bearing stories that must resolve a cached
+# embedding at the configured model_version. Below this, the candidate
+# matrix is mostly zero-vectors (see _load_candidates) and every metric
+# downstream is meaningless -- fail loudly rather than silently degrading.
+MIN_EMBEDDING_COVERAGE = 0.9
 
 
 def _db_sha256(db_path: str) -> str:
     return hashlib.sha256(Path(db_path).read_bytes()).hexdigest()[:16]
 
 
-def _load_candidates(db: Database) -> tuple[list[Story], np.ndarray]:
-    """Read all non-negative-cached stories + their embeddings."""
+def _load_candidates(
+    db: Database, model_version: str
+) -> tuple[list[Story], np.ndarray]:
+    """Read all non-negative-cached stories + their embeddings.
+
+    ``model_version`` must match the encoder that actually produced the
+    embeddings (i.e. ``embedder.model_version``, not a hardcoded string) --
+    a mismatch silently degrades every story without a cache hit to a zero
+    vector (see the coverage check below), which previously went unnoticed
+    when this used a stale module-level constant instead of the live
+    config (WORKLOG 2026-08-27).
+    """
     from database import Database as _Database
 
     rows = db.execute(
@@ -58,8 +73,19 @@ def _load_candidates(db: Database) -> tuple[list[Story], np.ndarray]:
         for s in stories
     }
     cached = db.get_embeddings_batch(
-        [s.id for s in stories], MODEL_VERSION, story_hashes
+        [s.id for s in stories], model_version, story_hashes
     )
+    coverage = len(cached) / len(stories) if stories else 1.0
+    if coverage < MIN_EMBEDDING_COVERAGE:
+        raise RuntimeError(
+            f"Embedding coverage for model_version={model_version!r} is "
+            f"{coverage:.1%} ({len(cached)}/{len(stories)} stories) -- below "
+            f"the {MIN_EMBEDDING_COVERAGE:.0%} minimum. The remaining "
+            "stories would silently fall back to zero vectors, making every "
+            "downstream metric meaningless. Re-embed the candidate pool "
+            "under this model_version (e.g. run a regen cycle) before "
+            "evaluating, or pass the model_version actually cached."
+        )
     embeddings = np.array(
         [cached.get(s.id, np.zeros(384, dtype=np.float32)) for s in stories],
         dtype=np.float32,
@@ -381,7 +407,7 @@ def _compute_final_queue_metrics(
         s = all_stories[sid]
         text = story_embedding_text(s)
         text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        db.upsert_embedding(sid, MODEL_VERSION, text_hash, emb)
+        db.upsert_embedding(sid, embedder.model_version, text_hash, emb)
 
     for s, a in zip(fb_train_stories, y_train):
         action = "down" if int(a) == 0 else "neutral" if int(a) == 1 else "up"
@@ -553,7 +579,16 @@ def main() -> None:
         raise RuntimeError("Missing default user token")
 
     try:
-        embedder: Embedder | None = Embedder()
+        # Mirror the server's own construction (server.py) so eval measures
+        # the encoder actually configured for production, not a hardcoded
+        # default.
+        embedder: Embedder | None = Embedder(
+            config.onnx_model_dir,
+            model_version=config.embedding_model_version,
+            max_tokens=config.embedding_max_tokens,
+            batch_size=config.embedding_batch_size,
+            ort_variant=config.embedding_ort_variant,
+        )
     except Exception as exc:
         print(f"Warning: Embedder not available ({exc}); skipping final_queue metrics.")
         embedder = None
@@ -565,7 +600,7 @@ def main() -> None:
     print(f"Feedback: {len(fb_stories)} rows ({Counter(fb_labels)})")
 
     # Candidates
-    candidates, cand_emb = _load_candidates(db)
+    candidates, cand_emb = _load_candidates(db, config.embedding_model_version)
     print(f"Candidates: {len(candidates)}")
     if args.exclude_sources:
         excluded = set(args.exclude_sources)
