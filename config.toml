@@ -107,5 +107,4 @@ feeds = [
     # Health / medicine
     "https://erictopol.substack.com/feed",
     "https://theskepticalcardiologist.substack.com/feed",
-    "https://sciencebasedmedicine.org/feed/",
 ]
