@@ -527,7 +527,6 @@ def _embedding_session_options(ort_variant: EmbeddingOrtVariant) -> ort.SessionO
     raise ValueError(f"Unknown embedding ORT variant: {ort_variant}")
 
 
-# Algolia Fetching
 class Embedder:
     model_version = DEFAULT_EMBEDDING_MODEL_VERSION
     max_tokens = DEFAULT_EMBEDDING_MAX_TOKENS

@@ -303,7 +303,6 @@ class HnDupeResolver:
 
 
 _CACHE_MISS = object()
-_DEFAULT_RESOLVER = HnDupeResolver()
 
 
 class HnDupeResolutionWorker:
