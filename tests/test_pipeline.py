@@ -361,7 +361,7 @@ def test_embedder_uses_configured_batch_and_ort_variant(monkeypatch):
         ):
             assert padding is True
             assert truncation is True
-            assert max_length == 512
+            assert max_length == 4096
             assert return_tensors == "np"
             width = max(1, max(len(text) for text in texts))
             input_ids = np.ones((len(texts), width), dtype=np.int64)

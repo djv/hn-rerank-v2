@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Download all-MiniLM-L6-v2 ONNX model, tokenizer files, and Pico CSS."""
+"""Download the production ONNX embedding model, tokenizer files, and Pico CSS.
+
+Provisions DEFAULT_ONNX_MODEL_DIR with whatever model config.toml's
+embedding_model_version currently names (mxbai-embed-xsmall-v1 as of
+2026-08-27; see WORKLOG for the switch history). If a future model swap
+changes MODEL_REPO here, also update DEFAULT_ONNX_MODEL_DIR/
+DEFAULT_EMBEDDING_MODEL_VERSION/DEFAULT_EMBEDDING_MAX_TOKENS in
+pipeline/config.py so the two stay in lockstep.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +17,7 @@ import httpx
 
 from pipeline import DEFAULT_ONNX_MODEL_DIR
 
-MODEL_REPO = "sentence-transformers/all-MiniLM-L6-v2"
+MODEL_REPO = "mixedbread-ai/mxbai-embed-xsmall-v1"
 HF_BASE = f"https://huggingface.co/{MODEL_REPO}/resolve/main"
 ONNX_BASE = f"https://huggingface.co/{MODEL_REPO}/resolve/main/onnx"
 

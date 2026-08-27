@@ -29,10 +29,13 @@ class ModelConfig:
 
 
 # Shared across all worktrees of this repo (sibling to the `main` checkout)
-# so the 87MB model and secrets never need copying/symlinking per worktree.
-DEFAULT_ONNX_MODEL_DIR = "/home/dev/hn-rewrite/shared/onnx_model"
-DEFAULT_EMBEDDING_MODEL_VERSION = "all-MiniLM-L6-v2|mean|norm|512"
-DEFAULT_EMBEDDING_MAX_TOKENS = 512
+# so the ~90MB model and secrets never need copying/symlinking per worktree.
+# Kept in sync with config.toml's [hn_rewrite] onnx_model_dir/
+# embedding_model_version/embedding_max_tokens -- these are the fallback
+# used only when config.toml doesn't override them (it currently does not).
+DEFAULT_ONNX_MODEL_DIR = "/home/dev/hn-rewrite/shared/mxbai-embed-xsmall-v1"
+DEFAULT_EMBEDDING_MODEL_VERSION = "mxbai-embed-xsmall-v1|mean|norm|4096"
+DEFAULT_EMBEDDING_MAX_TOKENS = 4096
 DEFAULT_ENV_PATH = "/home/dev/hn-rewrite/shared/.env"
 
 BQ_ARCHIVE_SOURCE = "bq_seed"

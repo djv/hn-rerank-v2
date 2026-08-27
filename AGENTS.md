@@ -129,6 +129,9 @@
 ## Common commands
 
 - Install or refresh the environment: `uv sync`
+- Bootstrap the embedding model on a fresh checkout: `uv run python setup_model.py`
+  (downloads the production ONNX model into `DEFAULT_ONNX_MODEL_DIR`,
+  `pipeline/config.py`; no-ops if the files already exist)
 - Run tests: `uv run pytest tests/`
 - Run linting: `uv run ruff check .`
 - Run type checking: `uv run ty check` (Astral's `ty`; pre-existing

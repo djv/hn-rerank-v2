@@ -52,13 +52,24 @@ def main() -> None:
         ort_variant=config.embedding_ort_variant,
     )
 
+    # NOT EXISTS on model_version (not a LEFT JOIN ... IS NULL on story_id)
+    # so this also catches stories whose only embeddings row is stale --
+    # e.g. left over from a prior encoder before an embedding_model_version
+    # switch in config.toml. `embeddings` is one row per story_id
+    # (upsert_embedding does ON CONFLICT(story_id) DO UPDATE), so a story
+    # last embedded under an old model never resurfaces via a plain
+    # "any embedding exists" check.
     rows = db.execute(
-        "SELECT s.id FROM stories s "
-        "LEFT JOIN embeddings e ON e.story_id = s.id "
-        "WHERE e.story_id IS NULL"
+        "SELECT s.id FROM stories s WHERE NOT EXISTS "
+        "(SELECT 1 FROM embeddings e WHERE e.story_id = s.id AND e.model_version = ?)",
+        (embedder.model_version,),
     )
     unembedded_ids = [int(r[0]) for r in rows]
-    logging.info("stories missing embeddings: %s", len(unembedded_ids))
+    logging.info(
+        "stories missing/stale embeddings for model_version=%s: %s",
+        embedder.model_version,
+        len(unembedded_ids),
+    )
 
     computed = 0
     for i in range(0, len(unembedded_ids), 500):
