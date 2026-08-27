@@ -9,6 +9,7 @@ import threading
 import time
 from dataclasses import replace
 from typing import Any, Protocol
+from urllib.error import URLError
 from urllib.parse import urlparse
 
 import feedparser
@@ -698,8 +699,18 @@ async def _fetch_and_parse_feed(
             stories.append(story)
 
         return stories
-    except Exception as e:
-        logging.error("Failed to fetch RSS feed %s: %r", feed_url, e)
+    except (URLError, httpx.HTTPError) as e:
+        # Both httpx and the urllib fallback (fetch_with_urllib_fallback)
+        # were exhausted -- a genuine network-down/DNS/timeout condition,
+        # or a status code neither side treats as retryable. Expected and
+        # transient; not worth a full traceback.
+        logging.warning("Failed to fetch RSS feed %s: %r", feed_url, e)
+        return []
+    except Exception:
+        # Anything else (malformed feed content, a parsing bug, ...) is
+        # unexpected -- keep the full traceback per the project's
+        # no-silent-failures rule.
+        logging.exception("Unexpected error fetching RSS feed %s", feed_url)
         return []
 
 

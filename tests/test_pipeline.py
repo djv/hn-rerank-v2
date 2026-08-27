@@ -918,6 +918,91 @@ async def test_rss_feed_retains_full_content_body(monkeypatch):
     assert len(stories[0].self_text) <= RSS_SELF_TEXT_CHAR_LIMIT
 
 
+@pytest.mark.asyncio
+async def test_fetch_and_parse_feed_transport_error_logs_warning_not_error(
+    monkeypatch, caplog
+):
+    """A transport error that survives the urllib fallback too (genuine
+    network-down) is expected/transient -- logged at WARNING with no
+    traceback, not ERROR. Regression for the 2026-08-27 fix: previously
+    any exception here (transport errors included) hit a bare
+    `except Exception: logging.error(...)`, indistinguishable from a
+    real bug."""
+    import logging
+    from urllib.error import URLError
+
+    import httpx
+
+    from pipeline import _fetch_and_parse_feed
+
+    logging.getLogger().setLevel(logging.NOTSET)
+    caplog.set_level(logging.INFO)
+
+    class MockClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, url, headers=None):
+            raise httpx.RemoteProtocolError("peer closed connection")
+
+    monkeypatch.setattr("pipeline.enrichment.httpx.AsyncClient", MockClient)
+    monkeypatch.setattr(
+        "http_fetch.urlopen", lambda *a, **k: (_ for _ in ()).throw(URLError("down"))
+    )
+
+    stories = await _fetch_and_parse_feed(
+        "https://example.com/feed.xml",
+        per_feed=10,
+        cutoff=0,
+        now=1_000_000,
+        exclude_urls=set(),
+    )
+    assert stories == []
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("Failed to fetch RSS feed" in r.message for r in warnings)
+    assert errors == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_and_parse_feed_unexpected_error_logs_exception_with_traceback(
+    monkeypatch, caplog
+):
+    """A non-network exception (e.g. a real bug) must be logged with a
+    full traceback (logging.exception), per the no-silent-failures rule
+    -- not merged into the same quiet path as an expected transport
+    failure."""
+    import logging
+
+    from pipeline import _fetch_and_parse_feed
+
+    caplog.set_level(logging.INFO)
+
+    def boom(feed_url):
+        raise RuntimeError("unexpected parsing bug")
+
+    monkeypatch.setattr("pipeline.enrichment._rss_source_name", boom)
+
+    stories = await _fetch_and_parse_feed(
+        "https://example.com/feed.xml",
+        per_feed=10,
+        cutoff=0,
+        now=1_000_000,
+        exclude_urls=set(),
+    )
+    assert stories == []
+    error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(error_records) == 1
+    assert "Unexpected error fetching RSS feed" in error_records[0].message
+    assert error_records[0].exc_info is not None
+
+
 def test_is_summarizable_with_content():
     """Stories with self_text, top_comments, or article_body are summarizable."""
     from pipeline import Story
