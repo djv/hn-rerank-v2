@@ -941,8 +941,19 @@
       return true;
     }
 
+    function isQueued(card) {
+      return !card.dataset.voted && matchesCurrentCombo(card) && matchesCurrentAxes(card);
+    }
+
     function queuedCards() {
-      return cards().filter(card => !card.dataset.voted && matchesCurrentCombo(card) && matchesCurrentAxes(card));
+      return cards().filter(isQueued);
+    }
+
+    function nextQueuedSibling(card) {
+      for (let el = card.nextElementSibling; el; el = el.nextElementSibling) {
+        if (el.classList.contains('story-card') && isQueued(el)) return el;
+      }
+      return null;
     }
 
     function newInteractionEventId() {
@@ -1144,8 +1155,14 @@
       });
     }
 
-    function showNextCard({ allowRefresh = true, excludeActive = false } = {}) {
-      const next = queuedCards().find(card => !excludeActive || card !== activeCard);
+    function showNextCard({ allowRefresh = true, excludeActive = false, preferred = null } = {}) {
+      const queue = queuedCards();
+      const usePreferred =
+        preferred && preferred.isConnected && queue.includes(preferred) &&
+        (!excludeActive || preferred !== activeCard);
+      const next = usePreferred
+        ? preferred
+        : queue.find(card => !excludeActive || card !== activeCard);
       if (next) {
         setActiveCard(next);
         return;
@@ -1797,8 +1814,9 @@
 
       window.setTimeout(() => {
         if (card.dataset.voted === action) {
+          const preferred = nextQueuedSibling(card);
           card.remove();
-          showNextCard();
+          showNextCard({ preferred });
           focusActiveCard();
         }
       }, 150);

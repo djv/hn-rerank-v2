@@ -2,6 +2,33 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-08-27 — fix: voting reset the deck back to the top of the stack
+
+`submitVote()` called bare `showNextCard()` after removing the voted card.
+`showNextCard()` is positionless — it always picks the head of
+`queuedCards()` — while `orderCards()`/`orderForCurrentSort()` leave the
+active card at DOM index 0 and re-append every other card after it. Any
+forward movement that wasn't a vote (e.g. re-tapping the active sort tab,
+which uses index-based `advanceToNextCard()`) left the viewer deeper in the
+stack while position 0 held a card already passed; voting then snapped back
+to it.
+
+Fix: added `isQueued()`/`nextQueuedSibling(card)` (`templates/index.html`)
+and a `preferred` option on `showNextCard()`. `submitVote()` now resolves
+the voted card's next queued sibling before removing it and passes that as
+`preferred`, so the vote advances to the card that followed it in the
+current deck order, wrapping to the head only when the voted card was last.
+`preferred` is revalidated (`isConnected` + still in the current
+`queuedCards()`) before use, since it's resolved ~150ms before use and a
+refill/filter change could race it — falling back to the prior head-of-deck
+pick in that case. `undoLastVote()`'s reinsertion-at-head behavior is
+unchanged (out of scope; it re-activates the restored card explicitly, so
+the viewer isn't displaced by it).
+
+Updated `ARCHITECTURE.md` (personalized-ranking section) and the
+`test_deck_actions_restore_native_focus_to_active_card` string-pin in
+`tests/test_server.py`.
+
 ## 2026-08-26 — fix: eval.py NameError + candidate-cap subsampling artifact
 
 A general health pass found `eval_report.json` (committed, `db_sha256`

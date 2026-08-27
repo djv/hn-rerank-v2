@@ -4457,7 +4457,12 @@ def test_deck_actions_restore_native_focus_to_active_card() -> None:
         "function ", 1
     )[0]
     assert "scheduleVoteRefresh(data);\n          focusActiveCard();" in submit_block
-    assert "card.remove();\n          showNextCard();\n          focusActiveCard();" in submit_block
+    assert (
+        "const preferred = nextQueuedSibling(card);\n"
+        "          card.remove();\n"
+        "          showNextCard({ preferred });\n"
+        "          focusActiveCard();"
+    ) in submit_block
     undo_block = inline_script.split("function undoLastVote()", 1)[1].split(
         "function ", 1
     )[0]
@@ -4481,6 +4486,39 @@ def test_deck_actions_restore_native_focus_to_active_card() -> None:
     assert refill_block.index("orderForCurrentSort()") < refill_block.index(
         "activeCard.focus({ preventScroll: true })"
     )
+
+
+def test_submitVote_advances_to_the_voted_cards_successor_not_the_deck_head() -> None:
+    """Voting must not reset the viewer to the top of the stack: the
+    successor is resolved from the voted card's DOM position before removal,
+    and showNextCard only trusts it if it's still connected and still
+    eligible (guards against a race with a concurrent refill/filter change).
+    """
+    _, inline_script = _read_template_and_static()
+
+    submit_block = inline_script.split("function submitVote(", 1)[1].split(
+        "function ", 1
+    )[0]
+    # Successor must be captured from `card` (the voted card) before it is
+    # removed from the DOM, not from queuedCards() head-of-deck afterward.
+    assert (
+        "const preferred = nextQueuedSibling(card);\n          card.remove();"
+    ) in submit_block
+
+    show_next_block = inline_script.split("function showNextCard(", 1)[1].split(
+        "function ", 1
+    )[0]
+    assert "preferred = null" in show_next_block
+    assert "preferred.isConnected" in show_next_block
+    assert "queue.includes(preferred)" in show_next_block
+    # Falls back to the original head-of-deck pick when preferred is stale.
+    assert "queue.find(card => !excludeActive || card !== activeCard)" in show_next_block
+
+    next_sibling_block = inline_script.split("function nextQueuedSibling(", 1)[
+        1
+    ].split("function ", 1)[0]
+    assert "nextElementSibling" in next_sibling_block
+    assert "isQueued(el)" in next_sibling_block
 
 
 def test_data_is_recent_attribute_emitted(test_env):
