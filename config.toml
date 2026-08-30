@@ -93,7 +93,6 @@ feeds = [
     "https://discourse.haskell.org/latest.rss",
 
     # Software / systems / AI coding
-    "https://martinfowler.com/feed.atom",
     "https://danluu.com/atom.xml",
     "https://jvns.ca/atom.xml",
     "https://pluralistic.net/feed/",
