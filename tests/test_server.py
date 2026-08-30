@@ -4319,6 +4319,40 @@ def test_dashboard_stale_hit_returns_when_version_mismatch(swr_handler):
     assert result == stale_html
 
 
+def test_patch_current_version_replaces_attribute_value():
+    from server import _patch_current_version
+
+    html = b'<div data-dashboard-version="3" data-current-version="3">x</div>'
+    patched = _patch_current_version(html, 7)
+    assert patched == b'<div data-dashboard-version="3" data-current-version="7">x</div>'
+
+
+def test_patch_current_version_is_noop_without_attribute():
+    from server import _patch_current_version
+
+    html = b"no version attribute here"
+    assert _patch_current_version(html, 7) == html
+
+
+def test_dashboard_stale_hit_patches_current_version_to_live_version(swr_handler):
+    # A stale_hit response must self-report as stale via `data-current-version`
+    # so the client's `pageVer < currVer` staleness check (index.html) fires
+    # and schedules a warm-poll refill — otherwise a page carrying identical
+    # dashboard/current versions looks current even though it's the old,
+    # HN-only render from before the live version advanced.
+    user, h = swr_handler
+    stale_html = (
+        b'<div id="stories" data-dashboard-version="0" data-current-version="0">'
+        b"</div>"
+    )
+    h._dashboard_cache[f"dashboard_{user.id}"] = (stale_html, time.time(), 0)
+    h._dashboard_versions[user.id] = 3
+
+    result = h._render_dashboard_for_user(user)
+    assert b'data-dashboard-version="0"' in result
+    assert b'data-current-version="3"' in result
+
+
 def test_dashboard_cache_hit_returns_when_version_matches(swr_handler):
     user, h = swr_handler
     fresh_html = b"fresh content"
@@ -4412,6 +4446,63 @@ def test_bump_all_cached_versions(swr_handler):
     assert h._dashboard_versions[1] == 6
     assert h._dashboard_versions[2] == 11
     assert h._dashboard_versions[3] == 1
+
+
+def test_bump_all_cached_versions_covers_users_with_no_prior_version(swr_handler):
+    # A user who has never voted has no entry in _dashboard_versions (it
+    # implicitly reads as 0), but can still hold a live _dashboard_cache
+    # entry from their first cold-deck render. Without covering this case,
+    # _bump_all_cached_versions never advances their version past 0, so
+    # every future GET / is a permanent cache_hit on stale bytes — not even
+    # a reload fixes it (see WORKLOG 2026-08-28).
+    user, h = swr_handler
+    h._dashboard_versions = {}
+    h._dashboard_cache = {
+        f"dashboard_{user.id}": (b"cached", time.time(), 0),
+    }
+
+    h._bump_all_cached_versions()
+
+    assert h._dashboard_versions[user.id] == 1
+
+
+def test_warm_stale_cached_users_warms_every_cached_user(swr_handler):
+    # After a regen/RSS-refresh bump, no per-user render is ever scheduled
+    # on its own (see WORKLOG 2026-08-28) — a cached user's stale bytes just
+    # sit there until their own next request. _warm_stale_cached_users must
+    # proactively trigger a warm for every user with a live cache entry.
+    user, h = swr_handler
+    other_user = h.db.create_user("other_user_tok")
+    h._dashboard_cache = {
+        f"dashboard_{user.id}": (b"cached", time.time(), 0),
+        f"dashboard_{other_user.id}": (b"cached", time.time(), 0),
+    }
+    h._dashboard_versions = {user.id: 1, other_user.id: 1}
+    calls: list[int] = []
+    h._trigger_warm = classmethod(  # type: ignore[method-assign]
+        lambda cls, warm_user, version: calls.append(warm_user.id)
+    )
+
+    h._warm_stale_cached_users()
+
+    assert sorted(calls) == sorted([user.id, other_user.id])
+
+
+def test_warm_stale_cached_users_skips_unknown_user_id(swr_handler):
+    # A cache entry for a user_id no longer in the users table (e.g. a
+    # pruned/never-created row) must not crash the warm sweep.
+    user, h = swr_handler
+    h._dashboard_cache = {
+        "dashboard_999999999": (b"cached", time.time(), 0),
+    }
+    calls: list[int] = []
+    h._trigger_warm = classmethod(  # type: ignore[method-assign]
+        lambda cls, warm_user, version: calls.append(warm_user.id)
+    )
+
+    h._warm_stale_cached_users()
+
+    assert calls == []
 
 
 def test_setFilter_preserves_sort_age_source_refresh_behavior() -> None:
@@ -4634,9 +4725,15 @@ def test_deck_cards_returns_only_card_fragment(test_env) -> None:
     assert len(fragment) < len(full.text) * 0.5
 
 
-def test_deck_cards_serves_stale_cache_without_triggering_warm(
+def test_deck_cards_triggers_warm_on_stale_cache(
     test_env: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # /api/deck-cards is the endpoint every in-tab refill (vote, filter tab
+    # click) calls. Unlike GET / it used to never compare its cached
+    # version to the live one, so an open tab could poll this endpoint
+    # forever and always get the same stale deck (see WORKLOG 2026-08-28).
+    # It must now self-heal the same way GET /'s stale_hit branch does:
+    # serve the stale fragment immediately (SWR), but kick off a warm.
     port, _, _, handler, user = test_env
     cached_html = b'<!--cards:start--><div data-story-id="7001"></div><!--cards:end-->'
     handler._dashboard_cache[f"dashboard_{user.id}"] = (cached_html, time.time(), 1)
@@ -4655,6 +4752,29 @@ def test_deck_cards_serves_stale_cache_without_triggering_warm(
 
     assert response.status_code == 200
     assert 'data-story-id="7001"' in response.text
+    assert calls == [2]
+
+
+def test_deck_cards_does_not_warm_when_cache_is_current(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    port, _, _, handler, user = test_env
+    cached_html = b'<!--cards:start--><div data-story-id="7001"></div><!--cards:end-->'
+    handler._dashboard_cache[f"dashboard_{user.id}"] = (cached_html, time.time(), 2)
+    handler._dashboard_versions[user.id] = 2
+    calls: list[int] = []
+    monkeypatch.setattr(
+        handler,
+        "_trigger_warm",
+        classmethod(lambda cls, warm_user, version: calls.append(version)),
+    )
+
+    response = httpx.get(
+        f"http://127.0.0.1:{port}/api/deck-cards",
+        cookies={"hn_token": user.token},
+    )
+
+    assert response.status_code == 200
     assert calls == []
 
 

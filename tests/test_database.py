@@ -902,6 +902,13 @@ def test_user_management(db):
     existing = db.get_or_create_user("tok123")
     assert existing.id == user.id
 
+    # Test get_user_by_id
+    by_id = db.get_user_by_id(user.id)
+    assert by_id is not None
+    assert by_id.token == "tok123"
+
+    assert db.get_user_by_id(-999999) is None
+
     new_user = db.get_or_create_user("new_tok")
     assert new_user.token == "new_tok"
 

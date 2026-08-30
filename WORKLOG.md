@@ -2,6 +2,84 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-08-28 — fix: dashboard cache needed 2 refreshes to show non-HN cards
+
+Follow-up to the same-day deck-composition instrumentation below: a fresh
+rank already produces ~17 non-HN cards out of 49, but a user had to hard
+refresh before non-HN cards appeared. Traced the full cache path
+(`_dashboard_cache`, `server.py:984`, an in-memory
+`dict[str, tuple[html_bytes, written_at, version]]` keyed
+`f"dashboard_{user.id}"`) and found four compounding staleness bugs:
+
+1. **`GET /api/deck-cards` never validated its cache.** `server.py:2382-2400`
+   (pre-fix) read `_dashboard_cache` and served it unconditionally — no
+   version comparison, no `_trigger_warm`. Every in-tab refill
+   (`refillQueue`, `templates/index.html:1612-1656`, called on vote and on
+   sort/age tab clicks) hit this endpoint, so an open tab could poll it
+   forever and always get the same stale deck. This was already pinned as
+   current behavior by
+   `tests/test_server.py::test_deck_cards_serves_stale_cache_without_triggering_warm`
+   (asserted `calls == []`).
+2. **Regen/RSS-refresh bumped versions but never warmed anyone.**
+   `publish_reddit_changes()` (`server.py:2547-2549`) and the main regen loop
+   (`server.py:2587-2588`) both called `_rebuild_cold_deck()` +
+   `_bump_all_cached_versions()` and stopped — the per-user version counter
+   advanced, but nothing re-rendered any user's cached HTML. A cached deck
+   only refreshed if and when that user's *own* subsequent request happened
+   to trigger a warm.
+3. **A stale response lied about being current.** `data-dashboard-version`
+   and `data-current-version` (`templates/index.html:850-851`) are both baked
+   in at render time from the *same* version, so `GET /`'s `stale_hit` branch
+   (`server.py:1033-1043`, pre-fix) returned old bytes whose two attributes
+   were equal — defeating the client's own `pageVer < currVer` staleness
+   check (`templates/index.html:2029-2033`) and skipping the warm-poll
+   refill. This is why *one* refresh wasn't enough: refresh #1 served stale
+   bytes (but did kick off a background warm via `_trigger_warm`); only
+   refresh #2, landing on the now-updated cache entry as a plain `cache_hit`,
+   showed the fresh deck.
+4. **`_bump_all_cached_versions` skipped never-voted users.**
+   `server.py:1421-1428` (pre-fix) only bumped `uid`s already present in
+   `_dashboard_versions`. A user with no feedback has no entry there (reads
+   implicitly as version 0), so their version never advanced past 0 even
+   after a regen — every future `GET /` was a permanent `cache_hit` on stale
+   bytes; not even a reload helped that specific user.
+
+Two hypotheses were checked and ruled out: client-side filtering isn't the
+cause (non-HN cards carry `recent_mixed` in `combo_keys`, and the default
+source filter is `'mixed'`); browser HTTP caching isn't the cause (every
+response in this path sets `Cache-Control: no-cache, no-store,
+must-revalidate`, and the client also fetches with `{cache: 'no-store'}`).
+
+**Fix** (test-first; new/updated tests in `tests/test_database.py` and
+`tests/test_server.py`, see below):
+
+- `server.py`: `/api/deck-cards` now compares `cached[2]` against the live
+  `_dashboard_version(user.id)` and calls `_trigger_warm` on a mismatch,
+  mirroring `_render_dashboard_for_user`'s existing `stale_hit` self-heal —
+  still serves the (possibly stale) fragment immediately (SWR), just stops
+  being the one path that could never repair itself.
+- New `_patch_current_version(html, version)` (byte-level find/replace, same
+  idiom as `_extract_cards_fragment`) rewrites `data-current-version` to the
+  live version before returning a `stale_hit` response, so a stale page now
+  honestly reports itself as stale and the client's own staleness check
+  fires.
+- New `Handler._warm_stale_cached_users()`: after a version bump, walks
+  `_dashboard_cache`'s keys, resolves each to a `User` via the new
+  `Database.get_user_by_id` (mirrors `get_user_by_token`,
+  `database.py:1305-1312`), and calls `_trigger_warm` for each — bounded by
+  the existing 100-entry cache cap (`_enforce_cache_cap`), so it can't
+  warm-storm the full `users` table. Called from both
+  `publish_reddit_changes()` and the main regen loop, right after
+  `_bump_all_cached_versions()`.
+- `_bump_all_cached_versions` now bumps the union of `_dashboard_versions`'
+  existing keys and every `user_id` parsed out of `_dashboard_cache`'s keys
+  (defaulting a missing entry to 0), closing the never-voted-user gap.
+
+Not changed: the structural HN-skew causes from the composition-instrument
+entry below (`archive_nonhn` always empty, Popular badges HN-gated, the RSS
+leg's ~4-day effective window, the removed source-filter UI) — those are
+separate and still open.
+
 ## 2026-08-28 — debug: deck too short, reads HN-only
 
 Investigated a report that the live deck "seems too short and contains only

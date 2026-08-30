@@ -1311,6 +1311,15 @@ class Database:
                 return User(id=row[0], token=row[1], created_at=row[2])
             return None
 
+    def get_user_by_id(self, user_id: int) -> User | None:
+        with self.conn() as conn:
+            row = conn.execute(
+                "SELECT id, token, created_at FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+            if row:
+                return User(id=row[0], token=row[1], created_at=row[2])
+            return None
+
     def get_or_create_user(self, token: str) -> User:
         user = self.get_user_by_token(token)
         if user:

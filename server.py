@@ -1040,7 +1040,7 @@ class Handler:
                 (time.perf_counter() - request_start) * 1000,
             )
             cls._trigger_warm(user, expected_version)
-            return cached[0]
+            return _patch_current_version(cached[0], expected_version)
 
         # No per-user cache → render the cold deck, then warm the
         # personalized version in the background.
@@ -1419,13 +1419,50 @@ class Handler:
 
     @classmethod
     def _bump_all_cached_versions(cls) -> None:
+        # Union with cache-derived user_ids, not just _dashboard_versions'
+        # existing keys: a user who has never voted has no entry there (it
+        # implicitly reads as version 0 via `_dashboard_version`), but can
+        # still hold a live `_dashboard_cache` entry from their first
+        # cold-deck render. Without this, such a user's version never
+        # advances past 0, so every future GET / is a permanent cache_hit on
+        # stale bytes — not even a reload fixes it (see WORKLOG 2026-08-28).
+        cache_user_ids = {
+            uid
+            for uid in (
+                _cache_key_user_id(key) for key in cls._dashboard_cache
+            )
+            if uid is not None
+        }
         with cls._dashboard_versions_guard:
-            for uid in list(cls._dashboard_versions.keys()):
-                cls._dashboard_versions[uid] += 1
+            all_uids = set(cls._dashboard_versions) | cache_user_ids
+            for uid in all_uids:
+                cls._dashboard_versions[uid] = cls._dashboard_versions.get(uid, 0) + 1
         logging.info(
             "bump_all_cached_versions count=%s",
             len(cls._dashboard_versions),
         )
+
+    @classmethod
+    def _warm_stale_cached_users(cls) -> None:
+        """Proactively warm every user with a live dashboard cache entry.
+
+        Regen and RSS-refresh both bump every tracked user's dashboard
+        version (`_bump_all_cached_versions`) but never re-render anyone's
+        cache — nothing else schedules a warm, so a cached user's bytes just
+        sit stale until their own next request happens to trigger one (see
+        WORKLOG 2026-08-28). Call this right after a version bump so cached
+        decks actually refresh in the background instead of waiting on user
+        activity. Bounded by the existing ~100-entry `_dashboard_cache` cap
+        (`_enforce_cache_cap`), so this can't warm-storm the full user table.
+        """
+        for key in list(cls._dashboard_cache.keys()):
+            uid = _cache_key_user_id(key)
+            if uid is None:
+                continue
+            user = cls.db.get_user_by_id(uid)
+            if user is None:
+                continue
+            cls._trigger_warm(user, cls._dashboard_version(uid))
 
     @classmethod
     def _rebuild_cold_deck(cls) -> None:
@@ -1492,8 +1529,44 @@ class Handler:
             asyncio.run(_prefetch_tldrs_for_ranked(final, db, per_combo, stale_per_run))
 
 
+_DASHBOARD_CACHE_KEY_PREFIX = "dashboard_"
+
+
+def _cache_key_user_id(cache_key: str) -> int | None:
+    """Parse the user id out of a ``_dashboard_cache`` key, or ``None``."""
+    if not cache_key.startswith(_DASHBOARD_CACHE_KEY_PREFIX):
+        return None
+    suffix = cache_key[len(_DASHBOARD_CACHE_KEY_PREFIX) :]
+    return int(suffix) if suffix.isdigit() else None
+
+
 _CARDS_START = b"<!--cards:start-->"
 _CARDS_END = b"<!--cards:end-->"
+_CURRENT_VERSION_ATTR = b'data-current-version="'
+
+
+def _patch_current_version(html: bytes, version: int) -> bytes:
+    """Rewrite the ``data-current-version`` attribute to *version*.
+
+    ``data-current-version`` is baked into cached HTML at render time
+    (``dashboard_latest_version`` at the time of that render). A stale-cache
+    response reuses old bytes whose ``data-dashboard-version`` and
+    ``data-current-version`` were equal at render time, so without this patch
+    a stale response silently claims to be current — defeating the client's
+    own ``pageVer < currVer`` staleness check (``templates/index.html``) and
+    leaving it without a warm-poll refill (see WORKLOG 2026-08-28). Byte-level
+    find/replace, no HTML parsing, mirroring ``_extract_cards_fragment``. A
+    no-op (returns *html* unchanged) if the attribute isn't present, e.g. in
+    tests that stub out rendering with plain bytes.
+    """
+    start = html.find(_CURRENT_VERSION_ATTR)
+    if start == -1:
+        return html
+    value_start = start + len(_CURRENT_VERSION_ATTR)
+    end = html.find(b'"', value_start)
+    if end == -1:
+        return html
+    return html[:value_start] + str(version).encode() + html[end:]
 
 
 def _extract_cards_fragment(html: bytes) -> bytes:
@@ -2388,6 +2461,17 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
             )
         cached = runtime._dashboard_cache.get(f"dashboard_{user.id}")
         html = cached[0] if cached is not None else runtime._render_dashboard_for_user(user)
+        # Unlike GET /, this endpoint used to serve `cached` unconditionally
+        # with no version check — an open tab's in-DOM refills (vote, filter
+        # tab click) could poll it forever and always get the same stale
+        # deck, since regen/RSS-refresh bumps the live version but never
+        # re-renders any user's cache (see WORKLOG 2026-08-28). Mirror
+        # `_render_dashboard_for_user`'s stale_hit self-heal: still serve the
+        # (possibly stale) fragment immediately, but kick off a warm.
+        if cached is not None:
+            current_version = runtime._dashboard_version(user.id)
+            if cached[2] < current_version:
+                runtime._trigger_warm(user, current_version)
         fragment = _extract_cards_fragment(html)
         response = Response(
             fragment, status=HTTPStatus.OK, content_type="text/html; charset=utf-8"
@@ -2463,6 +2547,7 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
     def publish_reddit_changes() -> None:
         Handler._rebuild_cold_deck()
         Handler._bump_all_cached_versions()
+        Handler._warm_stale_cached_users()
 
     from reddit_refresh import RedditRefreshWorker
 
@@ -2502,6 +2587,7 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
             )
             Handler._rebuild_cold_deck()
             Handler._bump_all_cached_versions()
+            Handler._warm_stale_cached_users()
             reddit_worker.submit()
 
             if Handler._cold_stories:
