@@ -119,7 +119,7 @@ def get_candidate_pool(
         from . import get_or_compute_embeddings, load_production_candidate_stories
 
         stories = load_production_candidate_stories(
-            db, config, user_id=None, exclude_feedback=False
+            db, config, user_id=None, exclude_feedback=False, trace=trace
         )
         embeddings = get_or_compute_embeddings(stories, embedder, db)
         index_by_id = {story.id: idx for idx, story in enumerate(stories)}

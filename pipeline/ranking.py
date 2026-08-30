@@ -1374,6 +1374,7 @@ def _assemble_combo_deck(
     embeddings_map: dict[int, NDArray[np.float32]] | None,
     explore: ExploreContext | None,
     is_feedback_match: Callable[[Story], bool] | None = None,
+    trace: RankTrace | _NullTrace = NULL_TRACE,
 ) -> list[RankedStory]:
     """Bucket ``ranked`` into per-combo primary + badge cards.
 
@@ -1462,7 +1463,12 @@ def _assemble_combo_deck(
         else:
             combo_pool = [r for r in age_pool if not is_hn_source(r.story.source)]
 
+        combo_id = f"{age}_{source}"
+        trace.set_count(f"combo_pool_{combo_id}", len(combo_pool))
+
         if not combo_pool:
+            trace.set_count(f"combo_primary_{combo_id}", 0)
+            trace.set_count(f"combo_badges_{combo_id}", 0)
             continue
 
         source_key = age + ("_hn" if source == "hn" else "_non-hn")
@@ -1487,6 +1493,8 @@ def _assemble_combo_deck(
         else:
             primary = []
 
+        trace.set_count(f"combo_primary_{combo_id}", len(primary))
+        badge_baseline = len(final)
         primary_ids = {r.story.id for r in primary}
 
         # --- Popular (HN only): Hot + Top + Talk ---
@@ -1627,6 +1635,8 @@ def _assemble_combo_deck(
                 _merge_or_append(r, is_similar=True)
                 explore_picked.add(r.story.id)
 
+        trace.set_count(f"combo_badges_{combo_id}", len(final) - badge_baseline)
+
     # Set is_recent and is_non_hn on every story in `final` (these flags are
     # source/time based, not rank-based, so they always reflect the current
     # candidate's metadata regardless of how it was selected).
@@ -1764,4 +1774,5 @@ def rerank_candidates(
             cand_max_sim=cand_max_sim, cand_closest_up=cand_closest_up
         ),
         is_feedback_match=is_feedback_match,
+        trace=trace,
     )

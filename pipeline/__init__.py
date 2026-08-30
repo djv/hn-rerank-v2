@@ -143,6 +143,7 @@ def build_cold_deck(
     config: Config,
     user_id: int | None = None,
     embedder: Embedder | None = None,
+    trace: RankTrace | _NullTrace = NULL_TRACE,
 ) -> list[RankedStory]:
     """Build a gravity-sorted, badge-annotated fallback deck — no embeddings,
     no personalization.
@@ -171,7 +172,7 @@ def build_cold_deck(
     """
     now_ts = int(time.time())
     if embedder is not None:
-        pool = get_candidate_pool(db, config, embedder)
+        pool = get_candidate_pool(db, config, embedder, trace=trace)
         if user_id is not None:
             voted_ids = frozenset(_voted_story_ids(db, user_id))
             candidates, _ = pool.without_feedback(voted_ids)
@@ -184,6 +185,7 @@ def build_cold_deck(
             user_id=user_id,
             exclude_feedback=user_id is not None,
             now_ts=now_ts,
+            trace=trace,
         )
     if not candidates:
         return []
@@ -219,6 +221,7 @@ def build_cold_deck(
         idx_for=story_id_to_idx.__getitem__,
         embeddings_map=None,
         explore=None,
+        trace=trace,
     )
     return cold[:COLD_DECK_LIMIT]
 
@@ -230,14 +233,22 @@ def load_production_candidate_stories(
     user_id: int | None,
     exclude_feedback: bool,
     now_ts: int | None = None,
+    trace: RankTrace | _NullTrace = NULL_TRACE,
 ) -> list[Story]:
     """Load the same candidate legs used by the personalized dashboard.
 
     ``exclude_feedback=False`` is for offline evaluation: the initial pool
     needs feedback stories present so held-out folds can be measured.
 
-    Hardcoded to HN sources only (``hn``, ``bq_seed``, ``ch_seed``) for
-    now — non-HN legs (RSS/Reddit/LessWrong) are disabled.
+    Runs three legs: recent HN by gravity, archive HN seeds (``bq_seed``/
+    ``ch_seed``) by score, and — when ``config.non_hn_candidates_enabled``
+    and ``config.rss.enabled`` — recent rows from the currently configured
+    RSS/Reddit/LessWrong feeds. Sets ``pool_hn``, ``pool_archive``,
+    ``pool_rss`` (post-``is_summarizable`` counts) and, when the RSS leg
+    runs, ``pool_rss_oldest_age_h`` (age in hours of the oldest RSS row
+    returned, exposing how much of the configured ``days`` window that
+    leg's ``LIMIT`` actually reaches) on *trace* for diagnosing candidate
+    pool composition.
     """
     if exclude_feedback and user_id is None:
         raise ValueError("user_id is required when exclude_feedback=True")
@@ -305,12 +316,26 @@ def load_production_candidate_stories(
                     config.recent_candidate_rss_limit,
                 ),
             )
-    rows = hn_rows + rss_rows + archive_rows
-    return [
-        story
-        for story in (Database._row_to_story(row) for row in rows)
-        if is_summarizable(story)
+    hn_stories = [
+        s for s in (Database._row_to_story(row) for row in hn_rows) if is_summarizable(s)
     ]
+    archive_stories = [
+        s
+        for s in (Database._row_to_story(row) for row in archive_rows)
+        if is_summarizable(s)
+    ]
+    rss_stories = [
+        s for s in (Database._row_to_story(row) for row in rss_rows) if is_summarizable(s)
+    ]
+    trace.set_count("pool_hn", len(hn_stories))
+    trace.set_count("pool_archive", len(archive_stories))
+    trace.set_count("pool_rss", len(rss_stories))
+    if rss_stories:
+        oldest_rss_time = min(s.time for s in rss_stories)
+        trace.set_count(
+            "pool_rss_oldest_age_h", int((now - oldest_rss_time) / 3600)
+        )
+    return hn_stories + rss_stories + archive_stories
 
 
 def _voted_story_ids(db: Database, user_id: int) -> set[int]:
@@ -520,8 +545,8 @@ def fast_rerank_for_user(
         # Zero-feedback cold deck is a pure gravity/time ranking — no
         # embeddings needed, so don't force the (embedder-requiring)
         # candidate pool cache here; keep the direct, uncached load.
-        cold_deck = build_cold_deck(db, config)
-        return canonicalize_hn_dupes(
+        cold_deck = build_cold_deck(db, config, trace=trace)
+        cold_final = canonicalize_hn_dupes(
             cold_deck,
             db,
             selected_limit=config.count,
@@ -529,6 +554,11 @@ def fast_rerank_for_user(
             feedback_actions=tuple(config.model.dedup_exclude_actions),
             trace=trace,
         )
+        trace.set_count(
+            "deck_nonhn_final",
+            sum(1 for r in cold_final if not is_hn_source(r.story.source)),
+        )
+        return cold_final
 
     with trace.stage("candidate_sql"):
         pool = get_candidate_pool(db, config, embedder, trace=trace)
@@ -561,6 +591,10 @@ def fast_rerank_for_user(
         trace=trace,
         is_feedback_match=lambda s: _matches_feedback(s, feedback_context),
     )
+    trace.set_count(
+        "deck_nonhn_pre_dedup",
+        sum(1 for r in ranked if not is_hn_source(r.story.source)),
+    )
 
     with trace.stage("dedup"):
         id_to_emb: dict[int, NDArray[np.float32]] = {
@@ -574,8 +608,12 @@ def fast_rerank_for_user(
             embeddings=id_to_emb,
             embedder=embedder,
         )
+    trace.set_count(
+        "deck_nonhn_post_dedup",
+        sum(1 for r in deduped if not is_hn_source(r.story.source)),
+    )
     with trace.stage("hn_dupes"):
-        return canonicalize_hn_dupes(
+        final = canonicalize_hn_dupes(
             deduped,
             db,
             candidate_stories=candidates,
@@ -584,6 +622,11 @@ def fast_rerank_for_user(
             feedback_actions=tuple(config.model.dedup_exclude_actions),
             trace=trace,
         )
+    trace.set_count(
+        "deck_nonhn_final",
+        sum(1 for r in final if not is_hn_source(r.story.source)),
+    )
+    return final
 
 
 def _apply_dedup_to_ranked(

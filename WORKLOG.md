@@ -2,6 +2,100 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-08-28 — debug: deck too short, reads HN-only
+
+Investigated a report that the live deck "seems too short and contains only
+HN stories." No behavior change in this pass — instrumentation + report
+only, per user decision. The DB is not starved of non-HN content: 4692
+non-HN rows in the 30-day window vs 5065 HN, 4655 of them embedded with the
+production model. Rendered deck for user 1 measured at **49 cards**
+(`rank_perf` versions 76-78, candidate pool 8417-8419); cold deck 44.
+
+Four structural causes, confirmed from code + a fresh instrumented rerank on
+a scratch DB copy (`scripts/deck_composition_report.py --user-id 1`):
+
+1. **`archive_nonhn` is structurally always empty** — confirmed at
+   `combo_pool_archive_nonhn = 0`. The RSS candidate leg only ever selects
+   `time >= now-30d` (`pipeline/__init__.py:298`, unchanged by this pass),
+   while the archive combo selects `time < recent_cutoff`
+   (`pipeline/ranking.py:1455-1459`); no row can satisfy both. One of the
+   four `COMBO_DEFS` combos (`ranking.py:1444-1448`) is dead, so the Archive
+   tab is 100% HN and 12 of ~48 primary slots are unused.
+2. **Popular badges (Hot/Top/Talk) are HN-gated** — `if source == "hn":` at
+   `ranking.py:1497` guards the entire block, and `sort_popular_attr`
+   (`pipeline/render.py:236-240`) is exactly what the client's Popular tab
+   filters on. Popular is 100% HN by construction.
+3. **The Mixed/HN/Non-HN source filter is gone from the UI.**
+   `_build_tab_groups` (`pipeline/render.py:252-256`) drops the source
+   `TabGroupView` behind a comment claiming the dashboard is "hardcoded to
+   HN-only sources for now" — stale: `non_hn_candidates_enabled = true`
+   (`config.toml:10`) and the RSS leg does run. `load_production_candidate_stories`'s
+   docstring (`pipeline/__init__.py:239-241`, pre-this-pass) made the same
+   stale claim. Client plumbing (`FILTERS.source`, combo keys
+   `recent_non-hn`) is still present but unreachable — there is no way to
+   ask for a non-HN-only deck.
+4. **The RSS leg samples ~4 days of the 30-day window, not 30.**
+   `recent_candidate_rss_limit=500` (`pipeline/config.py:107`, unset in
+   `config.toml`) ordered by `time DESC` (`__init__.py:300`) over 4692
+   eligible rows returns rows spanning only ~3.9 days (confirmed via the new
+   `pool_rss_oldest_age_h` counter: 93h ≈ 3.9d), picked by recency rather
+   than quality. The HN leg, by contrast, takes 5000 of 5065 eligible rows
+   by gravity — near-total 30-day coverage.
+
+Two plausible causes were **ruled out** with measurements:
+
+* *Tier-1 gravity burying non-HN cards*: at 4407 votes, `alpha_2 =
+  min(n_feedback/50, 1) = 1.0` (`ranking.py:1239`), so `t1_weight = 0` — pure
+  gravity contributes nothing to this user's score once past the 50-vote
+  cold-start window.
+* *Cosine dedup eating non-HN candidates*: at threshold 0.87
+  (`pipeline/config.py:27`), only 35 of 499 recent non-HN candidates reach
+  0.87 cosine similarity against any up/neutral feedback vector (median
+  max-sim 0.61, p90 0.83). Live `dedup` log lines agree
+  (`embedding_dups=152` of `suppressed=2876`; the bulk is `fb_url=2695`,
+  dominated by feedback stories `_apply_dedup_to_ranked` appends to its own
+  input and which then match their own URLs).
+
+**Composition measured with the new counters** (fresh rerank, user 1, scratch
+DB copy): pool = 4484 HN / 3751 archive HN+non-HN mixed / 494 RSS (post
+`is_summarizable`). Per combo (pool → primary → badges):
+`recent_hn` 4204→12→12, `recent_nonhn` 461→12→6, `archive_hn` 3751→12→10,
+`archive_nonhn` 0→0→0. Non-HN survivors: 18 pre-dedup → 17 post-dedup → 17
+final, out of 49 total — so roughly a third of the deck *is* non-HN in a
+fresh rank, concentrated entirely in `recent_nonhn`. This means the "only HN
+stories" perception is likely compounded by the client: `/api/deck-cards`
+(`server.py:2382`) replays the cached rendered HTML rather than re-ranking
+(`server.py:2389-2391`), so the usable non-HN slice shrinks toward zero
+between warms as votes remove cards from the cached deck with no
+replenishment until the next regen — on top of causes 1-3 above making
+Popular and Archive tabs pure-HN regardless of warm freshness.
+
+Added, no behavior change:
+
+* `RankTrace` counters: `pool_hn`/`pool_archive`/`pool_rss`/
+  `pool_rss_oldest_age_h` (`pipeline/__init__.py`,
+  `load_production_candidate_stories`), `combo_pool_<id>`/
+  `combo_primary_<id>`/`combo_badges_<id>` for each of the four combos
+  (`pipeline/ranking.py`, `_assemble_combo_deck`), and
+  `deck_nonhn_pre_dedup`/`deck_nonhn_post_dedup`/`deck_nonhn_final`
+  (`pipeline/__init__.py`, `fast_rerank_for_user`). All flow into
+  `rank_perf.fields_json` automatically via `RankTrace.to_log_fields()`
+  (`server.py:1350`) — no new table, no new log stream.
+* `scripts/deck_composition_report.py` — prints the above per-stage table
+  either from a fresh rerank (against a temp-directory copy of the DB, never
+  the live file — the embedding-cache write path needs read-write) or from
+  the newest `rank_perf` row(s) (`--from-rank-perf`, read-only against the
+  live DB, no re-rank cost).
+
+Not fixed in this pass (documentation debt only): the stale "HN-only" claims
+at `pipeline/render.py:252-256` and `pipeline/__init__.py:239-241` describe
+behavior that hasn't been true since the RSS leg was enabled; both still say
+so in comments/docstrings. Candidate fixes discussed but deferred pending a
+follow-up: raise `PRIMARY_PER_COMBO`/retire the dead `archive_nonhn` combo,
+un-gate Popular for non-HN sources, re-enable the source `TabGroupView`,
+widen/re-order the RSS leg, and make `/api/deck-cards` trigger a warm instead
+of replaying an exhausted cached deck.
+
 ## 2026-08-27 — fix: voting reset the deck back to the top of the stack
 
 `submitVote()` called bare `showNextCard()` after removing the voted card.
