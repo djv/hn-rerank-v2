@@ -300,18 +300,21 @@ def test_build_cold_deck_combo_keys_and_flags(
     for story in (recent_hn, archive_hn, recent_non_hn):
         db.upsert_story(story)
 
-    cold = pipeline.build_cold_deck(db, Config())
+    # "https://rss.blog" -> _rss_source_name -> "rss_blog", matching
+    # recent_non_hn's source, so the RSS leg actually picks it up.
+    config = Config(rss=RssConfig(feeds=("https://rss.blog",)))
+    cold = pipeline.build_cold_deck(db, config)
     by_id = {item.story.id: item for item in cold}
 
-    # Dashboard is hardcoded to HN sources only for now — non-HN story 3
-    # is filtered out at the SQL level.
-    assert 3 not in by_id
     assert by_id[1].combo_keys == "recent_hn recent_mixed"
     assert by_id[1].is_recent is True
     assert by_id[1].is_non_hn is False
     assert by_id[2].combo_keys == "archive_hn archive_mixed"
     assert by_id[2].is_recent is False
     assert by_id[2].is_non_hn is False
+    assert by_id[3].combo_keys == "recent_non-hn recent_mixed"
+    assert by_id[3].is_recent is True
+    assert by_id[3].is_non_hn is True
 
 
 def test_build_cold_deck_computes_popular_badges_but_not_explore(
@@ -2664,6 +2667,48 @@ def test_load_production_candidate_stories_feedback_switch_and_summarizable_filt
     assert [story.id for story in included] == [1]
 
 
+def test_load_production_candidate_stories_rss_leg_reaches_full_window(
+    db: Database,
+) -> None:
+    """A limit above the in-window row count must not truncate the RSS leg
+    to a slice of the configured `days` window.
+
+    Regression guard for the ~4-day effective RSS window found in
+    production (recent_candidate_rss_limit=500 against ~4,200 in-window
+    rows, ORDER BY time DESC — see WORKLOG 2026-08-28/2026-08-30):
+    with a limit that clears the row count, every in-window row must come
+    back, including the oldest ones near the `days` cutoff.
+    """
+    user = db.create_user("rss_full_window")
+    now = 2_000_000_000
+    config = Config(
+        days=30,
+        recent_candidate_hn_limit=0,
+        recent_candidate_rss_limit=10,
+        rss=RssConfig(feeds=("https://rss.a",)),
+    )
+    in_window_ages_days = [0.1, 5, 15, 25, 29.9]
+    for i, age_days in enumerate(in_window_ages_days):
+        db.upsert_story(
+            _candidate_story(
+                100 + i,
+                source="rss_a",
+                score=0,
+                time_ts=now - int(age_days * 86400),
+            )
+        )
+    # Just outside the 30-day window — must not appear.
+    db.upsert_story(
+        _candidate_story(200, source="rss_a", score=0, time_ts=now - 31 * 86400)
+    )
+
+    candidates = load_production_candidate_stories(
+        db, config, user_id=user.id, exclude_feedback=True, now_ts=now
+    )
+
+    assert {story.id for story in candidates} == {100, 101, 102, 103, 104}
+
+
 def test_fast_rerank_for_user_zero_vote_returns_cold_deck(
     db: Database, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3332,8 +3377,10 @@ def test_novel_archive_pass_surfaces_archive_novel(
 
     This test constructs archive candidates with low max_sim (novel-
     qualifying) and asserts they appear in `final` with is_novel=True.
-    The top 2 by distance (sim 0.05, 0.10) are picked by the
-    novel-archive pass (slot_limit=5).
+    The archive fillers outnumber PRIMARY_ARCHIVE_HN so Primary is fully
+    saturated by fillers (higher score), leaving the low-score novel
+    targets in the Explore pool; the novel pass then sorts by distance
+    (= 1 - sim) desc and takes the top DISCOVERY_PER_BADGE.
     """
     config = Config(count=40)
     user = db.create_user("test_novel_archive")
@@ -3352,20 +3399,22 @@ def test_novel_archive_pass_surfaces_archive_novel(
     db.upsert_feedback(user.id, 100, "up")
 
     now = int(time.time())
+    from pipeline.ranking import PRIMARY_ARCHIVE_HN
+
+    n_archive_filler = PRIMARY_ARCHIVE_HN + 4
+
     # Setup:
     #   12 recent primary (high score, sim 0.5) fill the primary ranked set.
-    #   12 archive fillers (high score, sim 0.5) — they have sim 0.5 too,
-    #     so they don't qualify as novel and are not picked by novel-archive
-    #     (which sorts by distance desc).
+    #   n_archive_filler archive fillers (high score, sim 0.5) — they have
+    #     sim 0.5 too, so they don't qualify as novel, and there are more of
+    #     them than PRIMARY_ARCHIVE_HN so Primary is saturated by fillers
+    #     alone, none of the novel targets below leak into Primary.
     #   4 archive novel targets (low score, sim 0.05..0.20) — the test target.
-    # Archive novel sims: [0.05, 0.10, 0.15, 0.20]. The novel-archive pass
-    # sorts by distance (= 1 - sim) desc and takes the top 5. All 4 novel
-    # targets have higher distance than the archive fillers (sim 0.5 →
-    # dist 0.5), so the top of the novel-archive pool is the 4 novel
-    # targets; the pass picks 4 of them and (with slot_limit=5) leaves room
-    # for an additional 1 archive filler (the 4th filler is the 5th by
-    # distance, with sim 0.5 → dist 0.5, tied with the others — last pick
-    # depends on stable sort order).
+    # Archive novel sims: [0.05, 0.10, 0.15, 0.20]. Fillers outscore novel
+    # targets (200+ vs 5), so Primary picks the top PRIMARY_ARCHIVE_HN
+    # fillers, leaving all 4 novel targets (plus the filler overflow) in the
+    # Explore pool; the novel pass there sorts by distance (= 1 - sim) desc
+    # and takes the top DISCOVERY_PER_BADGE, both of which are novel targets.
     candidates = []
     for i in range(12):
         candidates.append(
@@ -3380,7 +3429,7 @@ def test_novel_archive_pass_surfaces_archive_novel(
                 comment_count=0,
             )
         )
-    for i in range(12):
+    for i in range(n_archive_filler):
         candidates.append(
             Story(
                 id=12 + i,
@@ -3393,10 +3442,11 @@ def test_novel_archive_pass_surfaces_archive_novel(
                 comment_count=0,
             )
         )
+    novel_id_base = 12 + n_archive_filler
     for i, sim in enumerate([0.05, 0.10, 0.15, 0.20]):
         candidates.append(
             Story(
-                id=24 + i,
+                id=novel_id_base + i,
                 title=f"ANovel {i}",
                 url=None,
                 score=5,
@@ -3407,39 +3457,38 @@ def test_novel_archive_pass_surfaces_archive_novel(
             )
         )
 
-    cand_embs = np.zeros((28, 384), dtype=np.float32)
+    n_candidates = len(candidates)
+    cand_embs = np.zeros((n_candidates, 384), dtype=np.float32)
     for i in range(12):
         cand_embs[i, 0] = 0.5
         cand_embs[i, 50 + i] = np.sqrt(0.75)
-    for i in range(12):
+    for i in range(n_archive_filler):
         cand_embs[12 + i, 0] = 0.5
         cand_embs[12 + i, 150 + i] = np.sqrt(0.75)
     for i, s in enumerate([0.05, 0.10, 0.15, 0.20]):
-        cand_embs[24 + i, 0] = s
-        cand_embs[24 + i, 300 + i] = np.sqrt(max(1.0 - s * s, 0.0))
+        cand_embs[novel_id_base + i, 0] = s
+        cand_embs[novel_id_base + i, 300 + i] = np.sqrt(max(1.0 - s * s, 0.0))
 
     ranked = rerank_candidates(
         db, config, embedder, candidates, cand_embs, user_id=user.id
     )
 
     by_id = {r.story.id: r for r in ranked}
+    novel_ids_all = [novel_id_base + i for i in range(4)]
     # With per-combo DISCOVERY_PER_BADGE=2, only the top 2 by distance
-    # (ids 24 and 25, sim=0.05, 0.10) get is_novel. The other two
-    # (ids 26, 27) may appear via other passes (Popular, Similar, etc.)
-    # but should not have is_novel.
+    # (sim=0.05, 0.10) get is_novel. The other two may appear via other
+    # passes (Popular, Similar, etc.) but should not have is_novel.
     from pipeline import DISCOVERY_PER_BADGE
 
-    novel_ids = [
-        aid for aid in (24, 25, 26, 27) if aid in by_id and by_id[aid].is_novel
-    ]
+    novel_ids = [aid for aid in novel_ids_all if aid in by_id and by_id[aid].is_novel]
     assert len(novel_ids) >= DISCOVERY_PER_BADGE, (
         f"Expected at least {DISCOVERY_PER_BADGE} novel picks, got {novel_ids}"
     )
     # The top by distance (sim 0.05, 0.10) must be among the novel picks.
-    for aid in (24, 25):
+    for aid, sim_label in zip(novel_ids_all[:2], ("0.05", "0.10")):
         assert aid in by_id, f"Archive novel id={aid} should be in final"
         assert by_id[aid].is_novel, (
-            f"Archive novel id={aid} (sim={'0.05' if aid == 24 else '0.10'}) should have is_novel=True"
+            f"Archive novel id={aid} (sim={sim_label}) should have is_novel=True"
         )
         assert not by_id[aid].is_recent, (
             f"Archive novel id={aid} should be is_recent=False"
@@ -3775,6 +3824,174 @@ def test_explore_badges_no_feedback_match_predicate_is_unaffected() -> None:
     assert unsure_ids == {12, 13}
     assert novel_ids == {16, 17}
     assert similar_ids == {20, 21}
+
+
+def _make_mixed_combo_deck_inputs(
+    n_recent_hn: int,
+    n_recent_nonhn: int,
+    n_archive_hn: int,
+    n_archive_nonhn: int,
+) -> tuple[
+    list[RankedStory],
+    int,
+    NDArray[np.float32],
+    NDArray[np.float32],
+    Callable[[int], int],
+]:
+    """Build a ``ranked`` list spanning all four age/source cells, for
+    testing ``_assemble_combo_deck``'s combo assignment directly.
+
+    Ids are assigned by cell so callers can identify which cell a result
+    came from: recent_hn -> 0.., recent_nonhn -> 1000.., archive_hn ->
+    2000.., archive_nonhn -> 3000... Every candidate gets a distinct score
+    (higher id = lower score within a cell) so top-N selection is
+    deterministic.
+    """
+    now = int(time.time())
+    recent_cutoff = now - 30 * 86400
+    candidates: list[Story] = []
+
+    def _add(n: int, id_base: int, source: str, recent: bool) -> None:
+        story_time = now - 3600 if recent else recent_cutoff - 3600
+        for i in range(n):
+            candidates.append(
+                Story(
+                    id=id_base + i,
+                    title=f"{source} {i}",
+                    url=None,
+                    score=1000 - i,
+                    time=story_time,
+                    text_content=f"{source} story {i}",
+                    source=source,
+                    comment_count=0,
+                )
+            )
+
+    _add(n_recent_hn, 0, "hn", recent=True)
+    _add(n_recent_nonhn, 1000, "rss_a", recent=True)
+    _add(n_archive_hn, 2000, CH_ARCHIVE_SOURCE, recent=False)
+    _add(n_archive_nonhn, 3000, "rss_a", recent=False)
+
+    ranked = [
+        RankedStory(story=s, score=float(s.score), best_match_title="")
+        for s in candidates
+    ]
+    idx_for = {s.id: idx for idx, s in enumerate(candidates)}.__getitem__
+    cand_scores = np.array([s.score for s in candidates], dtype=np.float32)
+    cand_velocities = np.zeros(len(candidates), dtype=np.float32)
+    return ranked, recent_cutoff, cand_scores, cand_velocities, idx_for
+
+
+def test_assemble_combo_deck_never_emits_archive_nonhn() -> None:
+    """archive_nonhn (time < recent_cutoff AND non-HN source) is
+    structurally unreachable in production (see PRIMARY_RECENT_NONHN /
+    PRIMARY_ARCHIVE_HN comment in pipeline/ranking.py) and was retired
+    from COMBO_DEFS. Even when the input `ranked` list does contain rows
+    that would fall in that cell (e.g. if a future config change widened
+    the RSS leg's window past 30 days), no emitted combo_keys may
+    reference it — regression guard against the dead combo silently
+    reappearing.
+    """
+    config = Config(count=40)
+    ranked, recent_cutoff, cand_scores, cand_velocities, idx_for = (
+        _make_mixed_combo_deck_inputs(
+            n_recent_hn=4, n_recent_nonhn=4, n_archive_hn=4, n_archive_nonhn=4
+        )
+    )
+
+    final = ranking._assemble_combo_deck(
+        ranked,
+        config=config,
+        recent_cutoff=recent_cutoff,
+        cand_scores=cand_scores,
+        cand_velocities=cand_velocities,
+        idx_for=idx_for,
+        embeddings_map=None,
+        explore=None,
+    )
+
+    assert 3000 not in {r.story.id for r in final}, (
+        "archive_nonhn candidates must never be selected"
+    )
+    for r in final:
+        assert "archive_non-hn" not in r.combo_keys, r.combo_keys
+
+
+def test_assemble_combo_deck_honours_asymmetric_primary_limits() -> None:
+    """Per-combo primary quotas after retiring archive_nonhn: recent_hn
+    keeps PRIMARY_PER_COMBO, recent_nonhn and archive_hn absorb its freed
+    slots (see WORKLOG 2026-08-30).
+
+    Checked via the combo_primary_<id> trace counter rather than by
+    re-deriving primary membership from combo_keys — Popular badges (Hot/
+    Top/Talk, HN only) can append additional cards beyond primary_limit
+    when the combo pool is large, so combo_keys membership alone
+    overcounts primary for recent_hn/archive_hn.
+    """
+    from pipeline.ranking import (
+        PRIMARY_ARCHIVE_HN,
+        PRIMARY_PER_COMBO,
+        PRIMARY_RECENT_NONHN,
+    )
+
+    config = Config(count=200)
+    # Oversupply every cell so the primary_limit, not pool size, binds.
+    n = max(PRIMARY_PER_COMBO, PRIMARY_RECENT_NONHN, PRIMARY_ARCHIVE_HN) + 10
+    ranked, recent_cutoff, cand_scores, cand_velocities, idx_for = (
+        _make_mixed_combo_deck_inputs(
+            n_recent_hn=n, n_recent_nonhn=n, n_archive_hn=n, n_archive_nonhn=0
+        )
+    )
+    trace = RankTrace()
+
+    ranking._assemble_combo_deck(
+        ranked,
+        config=config,
+        recent_cutoff=recent_cutoff,
+        cand_scores=cand_scores,
+        cand_velocities=cand_velocities,
+        idx_for=idx_for,
+        embeddings_map=None,
+        explore=None,
+        trace=trace,
+    )
+
+    assert trace.counts["combo_primary_recent_hn"] == PRIMARY_PER_COMBO
+    assert trace.counts["combo_primary_recent_nonhn"] == PRIMARY_RECENT_NONHN
+    assert trace.counts["combo_primary_archive_hn"] == PRIMARY_ARCHIVE_HN
+
+
+def test_assemble_combo_deck_sets_trace_counters_for_three_combos() -> None:
+    """Trace counters are emitted for exactly the three surviving combos —
+    no archive_nonhn counters, since that combo no longer exists."""
+    config = Config(count=40)
+    ranked, recent_cutoff, cand_scores, cand_velocities, idx_for = (
+        _make_mixed_combo_deck_inputs(
+            n_recent_hn=2, n_recent_nonhn=2, n_archive_hn=2, n_archive_nonhn=2
+        )
+    )
+    trace = RankTrace()
+
+    ranking._assemble_combo_deck(
+        ranked,
+        config=config,
+        recent_cutoff=recent_cutoff,
+        cand_scores=cand_scores,
+        cand_velocities=cand_velocities,
+        idx_for=idx_for,
+        embeddings_map=None,
+        explore=None,
+        trace=trace,
+    )
+
+    for combo_id in ("recent_hn", "recent_nonhn", "archive_hn"):
+        assert f"combo_pool_{combo_id}" in trace.counts
+        assert f"combo_primary_{combo_id}" in trace.counts
+        assert f"combo_badges_{combo_id}" in trace.counts
+    assert "combo_pool_archive_nonhn" not in trace.counts
+    # The archive_nonhn rows in the input are simply invisible to every
+    # combo — not merged into archive_hn or any other cell.
+    assert trace.counts["combo_pool_archive_hn"] == 2
 
 
 def test_cascade_badges_mutually_exclusive(db: Database, embedder: Embedder) -> None:

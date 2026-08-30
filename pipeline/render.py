@@ -253,10 +253,17 @@ def _build_dashboard_cards(
 
 
 def _build_tab_groups() -> tuple[TabGroupView, ...]:
-    # Source filter (Mixed/HN/Non-HN) is temporarily disabled: the dashboard
-    # is hardcoded to HN-only sources for now (see WORKLOG 2026-07-10), so a
-    # Non-HN tab would always render an empty deck. Re-add the TabGroupView
-    # below when non-HN sources return to the candidate pool.
+    # Source filter (Mixed/HN/Non-HN) is temporarily disabled. The claim
+    # that non-HN sources are absent from the candidate pool is stale —
+    # the RSS/Reddit/LessWrong leg has been enabled since well before this
+    # comment was last touched (config.non_hn_candidates_enabled=true;
+    # see WORKLOG 2026-08-28/2026-08-30) — but re-enabling this UI still
+    # needs client-side work: an Archive+Non-HN selection currently has no
+    # matching combo (archive_nonhn is structurally always empty, see
+    # PRIMARY_RECENT_NONHN/PRIMARY_ARCHIVE_HN in pipeline/ranking.py) and
+    # would need the same kind of guard the client already has for
+    # Popular+Non-HN. Deferred (2026-08-30 user decision); re-add the
+    # TabGroupView below alongside that client-side guard.
     return (
         TabGroupView(
             key="sort",

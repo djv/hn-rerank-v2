@@ -247,6 +247,15 @@ TOP_COMMENT_TOP_LEVEL_BUDGET = TOP_COMMENT_LIMIT // 3
 HOT_MIN_SCORE = 20
 DASHBOARD_QUEUE_SIZE = 12
 PRIMARY_PER_COMBO = 12
+# archive_nonhn (time < recent_cutoff AND non-HN source) is structurally
+# always empty: the RSS leg is the only source of non-HN candidates, and
+# it's windowed to time >= recent_cutoff (see load_production_candidate_
+# stories), so no row can ever satisfy both. That combo was retired from
+# COMBO_DEFS below (see WORKLOG 2026-08-30) and its 12 primary + 6 explore
+# slots redistributed to the two combos most starved of non-HN/archive
+# coverage, rather than left unspent.
+PRIMARY_RECENT_NONHN = 20
+PRIMARY_ARCHIVE_HN = 16
 DISCOVERY_PER_BADGE = 2
 SOURCE_CATEGORIES: tuple[str, ...] = ("hn_live", "archive", "reddit", "rss")
 
@@ -1436,7 +1445,9 @@ def _assemble_combo_deck(
         return float(get_entropy(r))
 
     # Per-combo deck construction. Three combos: recent_hn, recent_nonhn,
-    # archive_hn. Each combo gets PRIMARY_PER_COMBO primary cards (MMR if
+    # archive_hn (a fourth, archive_nonhn, is structurally always empty —
+    # see the PRIMARY_RECENT_NONHN/PRIMARY_ARCHIVE_HN comment above — and
+    # has been retired). Each combo gets its own primary quota (MMR if
     # enabled, otherwise top-score), plus DISCOVERY_PER_BADGE cards for each
     # of Hot/Top/Talk (Popular, HN only) and Unsure/Novel/Similar (Explore).
     #
@@ -1444,9 +1455,8 @@ def _assemble_combo_deck(
     # age+source without computing offsets (e.g. "recent_hn recent_mixed").
     COMBO_DEFS: list[tuple[str, str, int]] = [
         ("recent", "hn", PRIMARY_PER_COMBO),
-        ("recent", "nonhn", PRIMARY_PER_COMBO),
-        ("archive", "hn", PRIMARY_PER_COMBO),
-        ("archive", "nonhn", PRIMARY_PER_COMBO),
+        ("recent", "nonhn", PRIMARY_RECENT_NONHN),
+        ("archive", "hn", PRIMARY_ARCHIVE_HN),
     ]
 
     final: list[RankedStory] = []

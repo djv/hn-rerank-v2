@@ -103,8 +103,17 @@ class Config:
     # embedding, SVM feature prep, and decision_function. The
     # is_uncertain discovery pass is allowed to shift because that
     # signal is orthogonal to the SQL ordering.
+    #
+    # rss_limit matches hn_limit (was 500, ~4,200 in-window rows) so the
+    # `ORDER BY time DESC` leg actually reaches the full `days` window
+    # instead of truncating to the newest ~4 days of it (see WORKLOG
+    # 2026-08-30: pool_rss_oldest_age_h measured ~93h against a 30-day
+    # window). There's no non-HN engagement signal to sort by instead —
+    # score is 0 for nearly all non-HN rows — so once the limit clears
+    # the in-window row count, the ordering stops mattering and the
+    # ranker's own scoring picks the winners from the full window.
     recent_candidate_hn_limit: int = 5000
-    recent_candidate_rss_limit: int = 500
+    recent_candidate_rss_limit: int = 5000
     non_hn_candidates_enabled: bool = True
     tldr_prefetch_per_combo: int = 5
     # After the top-per-combo pass, regenerate up to this many additional

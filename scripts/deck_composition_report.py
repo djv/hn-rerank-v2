@@ -43,7 +43,9 @@ from database import Database  # noqa: E402
 from pipeline import Config, Embedder, RankTrace, fast_rerank_for_user  # noqa: E402
 
 # Combo ids as produced by pipeline.ranking._assemble_combo_deck's COMBO_DEFS.
-_COMBO_IDS = ("recent_hn", "recent_nonhn", "archive_hn", "archive_nonhn")
+# archive_nonhn was retired (see WORKLOG 2026-08-30) — it was structurally
+# always empty, so it no longer appears here.
+_COMBO_IDS = ("recent_hn", "recent_nonhn", "archive_hn")
 
 
 def _print_fields(fields: Mapping[str, object]) -> None:

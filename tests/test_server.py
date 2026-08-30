@@ -4093,9 +4093,16 @@ def test_tldr_detail_fetches_lesswrong_comments(test_env, monkeypatch):
 
 
 def test_dashboard_source_filter_toggle_temporarily_disabled():
-    """The 3-way source filter (Mixed/HN/Non-HN) is temporarily disabled
-    while the dashboard is hardcoded to HN-only sources (WORKLOG
-    2026-07-10) — a Non-HN tab would always render an empty deck.
+    """The 3-way source filter (Mixed/HN/Non-HN) is temporarily disabled.
+
+    Non-HN sources are present in the pool (RSS/Reddit/LessWrong have been
+    enabled since well before this test was last touched), but an
+    Archive+Non-HN selection would render an empty deck: archive_nonhn is
+    structurally always empty and was retired from COMBO_DEFS (see
+    PRIMARY_RECENT_NONHN/PRIMARY_ARCHIVE_HN in pipeline/ranking.py).
+    Re-enabling this UI needs the same client-side guard Popular+Non-HN
+    already has (see setFilter in templates/index.html) — deferred, see
+    WORKLOG 2026-08-30.
     """
     template, _ = _read_template_and_static()
     assert 'data-source="mixed"' not in template

@@ -889,7 +889,7 @@ async def _prefetch_tldrs_for_ranked(
 
     seen: set[int] = set()
     story_ids: list[int] = []
-    for combo_key in ["recent_hn", "recent_non-hn", "archive_hn", "archive_non-hn"]:
+    for combo_key in ["recent_hn", "recent_non-hn", "archive_hn"]:
         for sid in combo_groups.get(combo_key, []):
             if sid not in seen:
                 seen.add(sid)

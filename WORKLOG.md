@@ -2,6 +2,86 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-08-30 — fix: retire the dead archive_nonhn combo; widen the RSS window
+
+Follow-up to the two 2026-08-28 entries below, closing two of the four
+deferred structural HN-skew causes (Popular badge gating and the source
+filter UI remain open — see those entries).
+
+1. **The `archive_nonhn` combo was structurally always empty.**
+   `COMBO_DEFS` (`pipeline/ranking.py`) declared four age/source combos, but
+   `archive_nonhn` requires `story.time < recent_cutoff` (hardcoded now−30d)
+   *and* a non-HN source, while the only leg producing non-HN rows (RSS) is
+   windowed to `time >= now − config.days*86400` with `days=30` — the two
+   predicates are disjoint by construction. The combo always hit the
+   `if not combo_pool: continue` early-out, forfeiting its 12 primary + 6
+   explore slots with no redistribution. Retired the tuple from `COMBO_DEFS`
+   and gave the two surviving non-`recent_hn` combos named, larger limits:
+   `PRIMARY_RECENT_NONHN = 20` (was 12) and `PRIMARY_ARCHIVE_HN = 16` (was
+   12); `recent_hn` stays at `PRIMARY_PER_COMBO = 12`. Updated the two
+   callers that enumerated all four combo ids (`server.py`'s TLDR prefetch
+   order, `scripts/deck_composition_report.py`'s `_COMBO_IDS`).
+2. **The RSS candidate leg reached only ~4 of its 30-day window.**
+   `recent_candidate_rss_limit` defaulted to 500 (`pipeline/config.py`)
+   against ~4,200 in-window non-HN rows, `ORDER BY time DESC` — so it
+   returned only the newest ~12% of the window (measured:
+   `pool_rss_oldest_age_h = 93`, ≈3.9 days). Raised the default to 5000,
+   matching `recent_candidate_hn_limit`. No new ordering/quality key was
+   introduced — non-HN `score` is 0 for 11,689 of 11,810 rows, so there's
+   nothing to sort by — but once the limit clears the in-window row count
+   the SQL ordering stops mattering; the ranker's own scoring picks winners
+   from the full window.
+
+Measured before/after on a fresh rerank for user 1 (`scripts/
+deck_composition_report.py --user-id 1`, scratch DB copy):
+`pool_rss_oldest_age_h` 93h → 719h (≈30 days); `archive_nonhn` row gone from
+the composition table entirely; `combo_primary_recent_nonhn`/`archive_hn`
+now 20/16 (was 12/12); `deck_nonhn_final` 17 → 24 out of 61 total cards (was
+49). Cost measured via `scripts/benchmark_rank_cold_cache.py
+--rss-candidate-limit {500,5000} --allow-writes` on the live DB (embedding
+cache pre-warmed for a fair comparison): candidate pool grows 8,371 → 11,962
+(+43%); warm (cache-hit, the per-request path) `rank_total_ms` p50 rises
+4,260ms → 4,791ms (+12%, driven by SVM feature prep and MMR/decision scoring
+scaling with pool size); cold (pool-cache-miss, once per regen) rises only
+8,634ms → 9,178ms (+6%). Accepted as a reasonable trade for a local-first,
+single-user app (user decision).
+
+- `pipeline/ranking.py`: retired `archive_nonhn` from `COMBO_DEFS`; added
+  `PRIMARY_RECENT_NONHN`/`PRIMARY_ARCHIVE_HN` beside `PRIMARY_PER_COMBO`.
+- `pipeline/config.py`: `recent_candidate_rss_limit` 500 → 5000.
+- `server.py`, `scripts/deck_composition_report.py`: dropped
+  `archive_non-hn`/`archive_nonhn` from combo-id enumerations.
+- `pipeline/render.py`, `tests/test_server.py`: corrected the stale
+  "hardcoded to HN-only sources" comment/docstring on the disabled source
+  filter — non-HN sources have been in the pool for a while; the real
+  blocker for re-enabling it is that Archive+Non-HN now has no combo to
+  populate it (would need the same client-side guard Popular+Non-HN
+  already has). Re-enabling the filter itself stays deferred.
+- Tests (`tests/test_pipeline.py`): new `_make_mixed_combo_deck_inputs`
+  fixture spanning all four age/source cells plus
+  `test_assemble_combo_deck_never_emits_archive_nonhn`,
+  `test_assemble_combo_deck_honours_asymmetric_primary_limits`,
+  `test_assemble_combo_deck_sets_trace_counters_for_three_combos`,
+  `test_load_production_candidate_stories_rss_leg_reaches_full_window`;
+  updated `test_build_cold_deck_combo_keys_and_flags` to configure an RSS
+  feed so its non-HN row actually flows through instead of asserting it's
+  dropped; updated `test_novel_archive_pass_surfaces_archive_novel`'s
+  fixture (its 12 archive fillers exactly matched the new
+  `PRIMARY_ARCHIVE_HN=16`, so all archive candidates — including the novel
+  targets — were landing in Primary; widened to `PRIMARY_ARCHIVE_HN + 4`
+  fillers so Primary is saturated by fillers alone again).
+
+Full suite: 624 passed, 1 skipped, 1 deselected. Ruff and ty clean.
+
+Not changed (still open, see the 2026-08-28 debug entry): Popular badges
+(Hot/Top/Talk) remain HN-gated — un-gating was considered and declined this
+pass, since non-HN `score` is 0 for nearly all rows (Hot/Top would be
+meaningless; only Talk, gated on `comment_count > 0`, would produce
+meaningful non-HN badges, concentrated in Reddit feeds) — and the Mixed/
+HN/Non-HN source filter UI stays disabled (user decision, deferred pending
+client-side work to disable an Archive+Non-HN combination the way
+Popular+Non-HN is already disabled).
+
 ## 2026-08-28 — fix: dashboard cache needed 2 refreshes to show non-HN cards
 
 Follow-up to the same-day deck-composition instrumentation below: a fresh
