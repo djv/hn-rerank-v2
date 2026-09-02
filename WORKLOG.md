@@ -2,6 +2,37 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-08-30 — fix: widen DISCOVERY_PER_BADGE so Popular isn't stuck at 6
+
+User-reported: the Popular tab showed exactly six stories, two per badge.
+Traced to `DISCOVERY_PER_BADGE = 2` (`pipeline/ranking.py`), the shared
+per-badge slot cap used by all six discovery passes (Hot/Top/Talk for
+Popular, Unsure/Novel/Similar for Explore). Popular filters to
+`is_hot OR is_high_engagement OR is_discussion_rich`
+(`pipeline/render.py`'s `sort_popular_attr`), so 3 badges × 2 slots = 6 per
+combo, and selecting Popular forces the source filter to HN
+(`templates/index.html`), landing on exactly one combo (`recent_hn`, or
+`archive_hn` after switching Age) — hence "six, two per badge." This closes
+the "Popular badge gating" item deferred in the 2026-08-28 entries above.
+
+Raised `DISCOVERY_PER_BADGE` to 5. This also happened to be the value
+`test_each_badge_floored_at_five_per_cohort` (`tests/test_pipeline.py`) was
+already written against — its docstring documents "the user's explicit
+(5,5) expectation" using the constant symbolically, so the bump aligns with
+a target that was already anticipated in the test suite.
+
+Fixed several other tests whose fixtures hardcoded exact IDs/counts around
+the old cap of 2 (backfill/no-backfill Explore badge tests, the novel-pass
+distance-vs-score test, the archive-novel-pass test, the hot-badge-percentile
+test, and the per-cohort floor test's candidate pool sizing) to size
+dynamically off `DISCOVERY_PER_BADGE` instead.
+
+Measured via `scripts/deck_composition_report.py --user-id 1` (scratch DB
+copy, fresh rerank): `combo_badges_recent_hn` 12 → 30, `combo_badges_archive_hn`
+10 → 25, `combo_badges_recent_nonhn` 6 → 15. Popular specifically (Hot+Top+Talk
+only, excluding Explore): recent_hn 6 → 15, archive_hn (no Hot by design) 4 → 10.
+Restarted `hn_rewrite.service`; journal clean, no TLDR rate-limit rejections.
+
 ## 2026-08-30 — fix: retire the dead archive_nonhn combo; widen the RSS window
 
 Follow-up to the two 2026-08-28 entries below, closing two of the four

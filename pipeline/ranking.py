@@ -256,7 +256,7 @@ PRIMARY_PER_COMBO = 12
 # coverage, rather than left unspent.
 PRIMARY_RECENT_NONHN = 20
 PRIMARY_ARCHIVE_HN = 16
-DISCOVERY_PER_BADGE = 2
+DISCOVERY_PER_BADGE = 5
 SOURCE_CATEGORIES: tuple[str, ...] = ("hn_live", "archive", "reddit", "rss")
 
 
