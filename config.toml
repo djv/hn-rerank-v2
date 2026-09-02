@@ -86,7 +86,6 @@ feeds = [
     "https://pudding.cool/feed.xml",
     "https://scottaaronson.blog/?feed=rss2",
     "https://erikbern.com/feed",
-    "https://blogs.bmj.com/bjsm/feed/",
     "https://evidence.nihr.ac.uk/feed/",
     "https://www.quantamagazine.org/feed/",
     "https://aeon.co/feed.rss",
