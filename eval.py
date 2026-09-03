@@ -568,6 +568,8 @@ def main() -> None:
         Config,
         Embedder,
         _knn_similarity,
+        _positive_cluster_centers,
+        _similarity_to_positive_cluster_centers,
         _softmax_rows,
         _svm_personalization_features,
     )
@@ -698,6 +700,21 @@ def main() -> None:
         n_up = up_mask.sum()
         n_down = down_mask.sum()
 
+        # Positive-cluster similarity mirrors production
+        # (pipeline/ranking.py `_score_and_rank`): fit KMeans on the fold's
+        # up-voted embeddings once, reuse the centers for both train and
+        # candidate rows. No LOOCV self-exclusion here — production doesn't
+        # exclude either. Empty up class yields zeros via the helper.
+        _cluster_centers = _positive_cluster_centers(
+            fb_up_train, config.model.positive_cluster_k
+        )
+        fb_cluster_sim = _similarity_to_positive_cluster_centers(
+            fb_train_emb, _cluster_centers
+        )
+        cand_cluster_sim = _similarity_to_positive_cluster_centers(
+            fold_cand_emb, _cluster_centers
+        )
+
         # k-NN similarity (replaces global mean)
         k = config.model.knn_k
 
@@ -769,7 +786,8 @@ def main() -> None:
         fold_cand_source = source_category_stack([s.source for s in fold_candidates])
 
         # Build features for this fold (production 394-d feature set;
-        # matches pipeline._svm_personalization_features used at runtime)
+        # matches pipeline._svm_personalization_features used at runtime,
+        # including the positive-cluster column fitted above)
         X_train = _svm_personalization_features(
             fb_train_emb,
             text_lengths=fb_train_textlens,
@@ -777,7 +795,7 @@ def main() -> None:
             sim_to_downvoted=fb_sim_down,
             closest_upvoted=fb_closest_up,
             closest_downvoted=fb_closest_down,
-            positive_cluster_similarity=None,
+            positive_cluster_similarity=fb_cluster_sim,
             is_hn_live=fb_train_source[:, 0],
             is_archive=fb_train_source[:, 1],
             is_reddit=fb_train_source[:, 2],
@@ -790,11 +808,18 @@ def main() -> None:
             sim_to_downvoted=cand_sim_down,
             closest_upvoted=cand_closest_up,
             closest_downvoted=cand_closest_down,
-            positive_cluster_similarity=None,
+            positive_cluster_similarity=cand_cluster_sim,
             is_hn_live=fold_cand_source[:, 0],
             is_archive=fold_cand_source[:, 1],
             is_reddit=fold_cand_source[:, 2],
             is_rss=fold_cand_source[:, 3],
+        )
+        # Train-serve parity: eval must measure the 394-d production feature
+        # set, not a 393-d proxy with a nulled cluster column. Bump
+        # _MODEL_SCHEMA_VERSION only if the production schema itself changes;
+        # this assert guards the eval side of the contract.
+        assert X_train.shape[1] == 394 == X_cand.shape[1], (
+            f"eval/prod feature dim mismatch: {X_train.shape[1]} vs {X_cand.shape[1]}"
         )
 
         counts = Counter(y_train)
@@ -1140,7 +1165,9 @@ def main() -> None:
 
     if "final_queue" in report:
         fq: Any = report["final_queue"]
-        print("\n=== Final queue (production pipeline, top 40) ===")
+        print("\n=== Final queue (production pipeline, top 40) [GATING] ===")
+        print("  This measures the served deck; gate serving changes on it,")
+        print("  not on the raw-margin formulas above.")
         for metric in metric_keys:
             m = fq["mean"]["mmr"][metric]
             s = fq["std"]["mmr"][metric]

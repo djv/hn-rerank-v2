@@ -184,3 +184,90 @@ def test_load_candidates_empty_db_does_not_raise():
     stories, embeddings = _load_candidates(db, MODEL_VERSION)
     assert stories == []
     assert embeddings.shape == (0,)
+
+
+# ---------------------------------------------------------------------------
+# Eval/prod feature parity: eval must measure the 394-d production feature
+# set, including the positive-cluster column (regression coverage for the
+# 2026-09 fix -- eval previously passed positive_cluster_similarity=None,
+# ranking a 393-d proxy of the 394-d served model).
+# ---------------------------------------------------------------------------
+
+
+def _clustered_embeddings(
+    seed: int, n_up: int = 20, n_down: int = 10
+) -> tuple[np.ndarray, np.ndarray]:
+    """Two well-separated 384-d blobs: ups around e0, downs around e1."""
+    rng = np.random.default_rng(seed)
+    up = np.zeros((n_up, 384), dtype=np.float32)
+    up[:, 0] = 1.0
+    up += rng.normal(0, 0.05, size=up.shape).astype(np.float32)
+    down = np.zeros((n_down, 384), dtype=np.float32)
+    down[:, 1] = 1.0
+    down += rng.normal(0, 0.05, size=down.shape).astype(np.float32)
+    for row in list(up) + list(down):
+        row /= max(np.linalg.norm(row), 1e-12)
+    fb_train = np.concatenate([up, down], axis=0).astype(np.float32)
+    return fb_train, up.astype(np.float32)
+
+
+def test_eval_cluster_feature_matches_production_schema() -> None:
+    """Cluster column is populated (not nulled), 394-d, and discriminative."""
+    from pipeline import (
+        _positive_cluster_centers,
+        _similarity_to_positive_cluster_centers,
+        _svm_personalization_features,
+    )
+
+    fb_train, fb_up = _clustered_embeddings(seed=0)
+    centers = _positive_cluster_centers(fb_up, 4)
+    sims = _similarity_to_positive_cluster_centers(fb_train, centers)
+
+    n = len(fb_train)
+    zeros = np.zeros(n, dtype=np.float32)
+    X = _svm_personalization_features(
+        fb_train,
+        text_lengths=np.full(n, 100),
+        sim_to_upvoted=zeros,
+        sim_to_downvoted=zeros,
+        closest_upvoted=zeros,
+        closest_downvoted=zeros,
+        positive_cluster_similarity=sims,
+        is_hn_live=zeros,
+        is_archive=zeros,
+        is_reddit=zeros,
+        is_rss=zeros,
+    )
+    assert X.shape == (n, 394)
+    cluster_col = X[:, 384 + 5]
+    assert bool((cluster_col > 0).any()), "cluster column must not be all-zero"
+    assert float(cluster_col.min()) >= 0.0 and float(cluster_col.max()) <= 1.0
+    # Ups (around e0, where centers were fit) outrank downs on this column.
+    assert float(cluster_col[: len(fb_up)].mean()) > float(
+        cluster_col[len(fb_up) :].mean()
+    )
+
+
+def test_eval_cluster_feature_empty_up_class_yields_zeros() -> None:
+    """No up-voted feedback degrades to a zero column, matching production
+    (`_similarity_to_positive_cluster_centers` with empty centers)."""
+    from pipeline import (
+        _positive_cluster_centers,
+        _similarity_to_positive_cluster_centers,
+    )
+
+    fb_train, _ = _clustered_embeddings(seed=1)
+    centers = _positive_cluster_centers(np.zeros((0, 384), dtype=np.float32), 4)
+    assert centers.shape == (0, 384)
+    sims = _similarity_to_positive_cluster_centers(fb_train, centers)
+    assert sims.shape == (len(fb_train),)
+    assert bool((sims == 0).all())
+
+
+def test_eval_py_does_not_null_the_cluster_column() -> None:
+    """Locks the fix in place: eval.py must thread real cluster similarities
+    into both `_svm_personalization_features` calls (train + candidates)."""
+    src = EVAL_PY.read_text()
+    assert "positive_cluster_similarity=None" not in src
+    assert src.count("positive_cluster_similarity=fb_cluster_sim") == 1
+    assert src.count("positive_cluster_similarity=cand_cluster_sim") == 1
