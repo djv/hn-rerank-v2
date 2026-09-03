@@ -128,6 +128,51 @@ class Config:
     tldr_refresh_recent_hours: float = 72.0
     tldr_refresh_min_comments: int = 30
     tldr_refresh_min_comments_per_hour: float = 8.0
+    # Minimum spacing between outbound LLM requests through the shared
+    # llm_limiter (server.py::llm_limiter). generate_detailed_tldr fires the
+    # article and discussion prompts concurrently via asyncio.gather, and
+    # prefetch runs up to 2 stories concurrently on top of that — without
+    # spacing, those calls land on the provider in the same instant and
+    # self-inflict 429s that then truncate one half of the TLDR (see
+    # WORKLOG 2026-09-03). 0 disables spacing (cooldown-only, prior behavior).
+    llm_min_request_spacing_seconds: float = 1.0
+    # Sustained request budget for the shared llm_limiter (see
+    # llm_limiter.LlmRateLimiter). Set below Mistral's free-tier ~60 req/min
+    # so our own accounting stays ahead of the provider's, rather than
+    # discovering the ceiling via repeated 429s (see WORKLOG 2026-09-03
+    # follow-up: "self-inflicted 429s"). 0 disables budget pacing
+    # (spacing/cooldown-only, prior behavior).
+    llm_requests_per_minute: float = 50.0
+    # Process-wide cap on in-flight LLM calls, enforced by llm_limiter
+    # itself rather than a per-event-loop asyncio.Semaphore -- see
+    # llm_limiter.LlmRateLimiter docstring for why the per-loop semaphore in
+    # _prefetch_tldrs_for_ranked couldn't actually bound concurrency once
+    # multiple warm cycles overlapped. 0 disables the cap.
+    llm_max_concurrency: int = 4
+    # Fraction of llm_requests_per_minute that BACKGROUND (prefetch) calls
+    # must leave available for FOREGROUND (on-demand tldr-detail) calls.
+    # Background prefetch yields once the bucket drops into this reserve;
+    # a live user's TLDR open should never queue behind warm-cycle prefetch.
+    llm_background_reserve_fraction: float = 0.25
+    # Wall-clock budget for a single llm_limiter.acquire() to be granted
+    # (spacing/token wait + concurrency wait combined). Past this, acquire()
+    # returns False and the caller fails fast instead of parking a Flask
+    # worker thread for minutes behind a 429 storm (see WORKLOG 2026-09-03
+    # follow-up).
+    llm_acquire_deadline_seconds: float = 25.0
+    # Minimum interval between forced real-time refreshes of one HN story's
+    # comments in tldr-detail (_hn_thread_looks_active). Without this, a
+    # thread that stays "active" (recent + high comment velocity) forces a
+    # fresh Algolia fetch and LLM regeneration on every single view forever
+    # -- the busiest stories were structurally the slowest (see WORKLOG
+    # 2026-09-03 follow-up). 0 disables throttling (refresh every view).
+    tldr_refresh_min_interval_seconds: float = 900.0
+    # Minimum interval between background TLDR prefetch runs
+    # (_prefetch_tldrs_for_ranked), regardless of how often dashboard warms
+    # or regen cycles trigger _warm_background_tasks. Multiple warms in a
+    # short burst (e.g. from rapid voting) previously each queued their own
+    # prefetch pass concurrently. 0 disables debouncing (run every warm).
+    tldr_prefetch_min_interval_seconds: float = 120.0
     # Public demo abuse limits. Cached TLDR hits bypass the uncached TLDR
     # quota; these limits protect only new enrichment/LLM work and vote writes.
     tldr_uncached_per_user_limit: int = 12

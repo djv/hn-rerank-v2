@@ -2,6 +2,232 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-09-03 — fix: super-slow TLDR generation (self-inflicted 429 starvation, follow-up)
+
+User-reported: super slow TLDR on
+https://news.ycombinator.com/item?id=49550174 (181 comments, 10K chars
+`top_comments`, 5591-char article body). `journalctl` for 20:19-20:22
+showed exactly the same failure class as the earlier same-day 429/partial
+fix below, deployed but not yet running (the service had started at
+2026-09-02 20:43, before that fix landed):
+
+- Ten `llm_limiter 429` warnings inside 20ms at 20:20:24, sixteen more at
+  20:20:54 — Mistral's free-tier budget was genuinely exhausted
+  (`remaining_req_minute=0`), not just burst-colliding.
+- Story 49550174 generated three times in 60s under the *same* cache_key
+  (20:20:29 full, 20:20:40 salvaged article-only overwriting the good row,
+  20:21:29 full again) — no in-flight coalescing existed, so every
+  concurrent request for one story paid for its own LLM calls.
+- 20:21:45: a request got a bare 429 all the way through to the browser
+  (HTTP 503).
+
+Root causes, all fixed:
+
+1. **No process-wide concurrency cap.** `asyncio.Semaphore(2)` in
+   `_prefetch_tldrs_for_ranked` is scoped to one event loop, but
+   `_warm_background_tasks` runs in a fresh thread (fresh loop) per
+   dashboard warm, and warms fired 4x in 60s during rapid voting —
+   overlapping loops each got their own semaphore, so real concurrency was
+   unbounded.
+2. **Client fan-out.** `setActiveCard` fired the active-card open +
+   `PREFETCH_COUNT=2` upcoming + `IDLE_INACTIVE_PREFETCH_COUNT=2` idle
+   other-age prefetches — up to 5 concurrent `/api/tldr-detail` requests
+   per vote, ×2 LLM calls each = 10, matching the observed 10-way burst.
+3. **No in-flight coalescing.** Concurrent opens of the same story each
+   missed cache and generated independently.
+4. **Reactive-only pacing.** `llm_limiter` only backed off *after* a 429;
+   ten simultaneous 429s each incremented `_consecutive_429`, jumping
+   straight to the 30s ceiling with every waiter waking in lockstep.
+5. **`_hn_thread_looks_active` forced a refresh on every single view** of
+   a busy thread forever — the hottest stories were structurally the
+   slowest.
+
+Fixes:
+
+- **`llm_limiter.py`**: rewritten into a real admission controller.
+  Existing 429 cooldown (`_next_allowed_at`) and inter-request spacing
+  (`_next_slot_at`/`min_spacing_seconds`) kept; added a continuous-refill
+  token bucket (`requests_per_minute`, default 50 — paced under Mistral's
+  free-tier ~60/min), a process-wide concurrency cap (`max_concurrency`,
+  default 4) enforced by a plain counter behind the limiter's own
+  `threading.Lock` rather than `asyncio.Semaphore` (the semaphore's whole
+  failure mode was being per-loop), a `Priority.FOREGROUND`/`BACKGROUND`
+  split (`background_reserve_fraction`, default 0.25) so prefetch yields
+  its share of budget before a live request would, and an
+  `acquire(deadline=...)` that returns `False` instead of waiting forever
+  (`default_deadline_seconds`, default 25s). Also fixed 429 double-counting:
+  a 429 arriving while a cooldown is already active (the concurrent-burst
+  case) no longer re-escalates the backoff — only a 429 after the prior
+  cooldown expired counts as a new incident — and added jitter to the
+  backoff delay so waiters don't wake in lockstep. All new mechanisms are
+  no-ops at their defaults (unconfigured limiter matches prior behavior);
+  new config in `pipeline/config.py`: `llm_requests_per_minute`,
+  `llm_max_concurrency`, `llm_background_reserve_fraction`,
+  `llm_acquire_deadline_seconds`.
+- **`server.py`**: priority travels via a `contextvars.ContextVar`
+  (`_llm_priority_ctx`) set around the outermost call in each caller
+  (`_handle_flask_tldr_detail` = FOREGROUND default, `_prefetch_one` =
+  BACKGROUND) rather than threaded as a parameter through
+  `generate_detailed_tldr`/`_call_llm_chat` — keeps the many existing
+  tests that monkeypatch those functions with a fixed signature working
+  unchanged. `_call_llm_chat` now computes one deadline for the whole call
+  (not per attempt) and drops the 429 retry count from 4 to 2 attempts
+  (under a real budget, a 429 means our accounting disagrees with the
+  provider's — burning more attempts just makes it worse); `release()` is
+  called in a `finally` around each HTTP call. New
+  `_claim_tldr_generation`/`_release_tldr_generation` (a
+  `threading.Event`-keyed claim on `(story_id, cache_key)`) coalesce
+  concurrent generation requests in both `_handle_flask_tldr_detail` and
+  `_prefetch_one` — waiters loop (bounded by one overall deadline) rather
+  than waiting once, since the owner's Event wakes every waiter at once
+  and only one wins the re-claim; the release happens only after the
+  terminal cache write, not right after generation, or a waiter can wake
+  in the gap and generate a duplicate anyway. `_hn_thread_looks_active`'s
+  forced refresh is now throttled to at most once per
+  `tldr_refresh_min_interval_seconds` (default 900s) per story via the new
+  `database.get_tldr_cache_created_at`. Background prefetch runs are
+  debounced to at most once per `tldr_prefetch_min_interval_seconds`
+  (default 120s) via a class-level `Handler._last_tldr_prefetch_at`. Added
+  `generation_ms`/`coalesced` to the `tldr_detail` outcome logs — there was
+  previously no timing instrumentation on this path at all.
+- **`templates/index.html`**: `prefetchUpcomingTldrs` and
+  `scheduleIdleAgePrefetch` now enqueue into one shared sequential queue
+  (`tldrPrefetchQueue`/`runTldrPrefetchQueue`) instead of firing
+  `openTldrDetail` directly per card; the queue pauses entirely while the
+  foreground (active-card) request is in flight. A `tldrInFlight` set
+  keyed by story id stops any card being requested twice concurrently
+  (the previous guard only checked a DOM `dataset.loading` flag on an
+  element that might not exist yet). `IDLE_INACTIVE_PREFETCH_COUNT` cut
+  from 2 to 1, and idle other-age prefetch skips entirely while the
+  upcoming-cards queue still has pending work.
+- `database.py`: new `get_tldr_cache_created_at`.
+
+**Verification**: `uv run pytest tests/ -n 4` (657 passed, 1 skipped),
+`uv run ruff check .`, `uv run ty check` — all clean. New tests cover the
+token bucket, concurrency cap, priority reserve, deadline, and the 429
+burst-accounting fix (`tests/test_llm_limiter.py`); request coalescing
+under real concurrent HTTP requests, the active-refresh throttle, and the
+prefetch debounce (`tests/test_server.py`). Not yet done: restart
+`hn_rewrite.service` to deploy this alongside the pending 429/partial fix
+below, and a live re-check of story 49550174 plus a `journalctl` scan for
+429 volume under normal voting load.
+
+**Files**: `llm_limiter.py`, `server.py`, `pipeline/config.py`,
+`database.py`, `templates/index.html`, `ARCHITECTURE.md`,
+`tests/test_llm_limiter.py`, `tests/test_server.py`, `WORKLOG.md`.
+
+## 2026-09-03 — eval/prod cluster-feature parity (fix train-serve skew)
+
+`eval.py` passed `positive_cluster_similarity=None` (zero column) while
+production fits per-render KMeans centers (`pipeline/ranking.py`), so every
+sweep ranked a 393-d proxy of the 394-d served model. Eval now fits
+`_positive_cluster_centers` per fold and threads real similarities into both
+`_svm_personalization_features` calls (mirroring prod, no LOOCV on this
+column), plus a 394-d parity assert and a source-level regression test
+(`tests/test_eval.py`). Report printout labels `final_queue` as the gating
+metric for serving changes.
+
+Same-DB control (`--candidate-cap 10000`, n=4525, db `0be5620a`): current raw
+NDCG@40 0.536 -> **0.589** (+0.053), MAP 0.216 -> 0.234, hn per-source 0.246
+-> 0.309; `hn_baseline`/`knn_diff` unchanged (don't use SVM features);
+`final_queue` identical at 0.545 (production path untouched, as intended).
+Brier 0.220 -> 0.226 (slightly worse; calibration remains open).
+The committed `eval_report.json` (0.197/0.007 era, n=4291) is stale against
+pool drift and was deliberately left unregenerated — re-baseline it
+separately. Existing unrelated WIP was left untouched.
+
+## 2026-09-03 — fix: ranked dedup ties keep the earlier story
+
+Fixed `_story_sort_key` in `dedup.py`: equal-source, equal-score duplicate
+buckets now use the earlier ranked position as the final tiebreak. The same
+key is used by URL dedup and embedding-cosine dedup, so both paths now retain
+the story the ranker placed first. Added regressions for both paths and
+reconciled the policy wording in `ARCHITECTURE.md`. Existing unrelated WIP was
+left untouched.
+
+## 2026-09-03 — fix: self-inflicted 429s truncated TLDRs (article/discussion salvage cached as final)
+
+User-reported: https://news.ycombinator.com/item?id=49541519 ("I wanna live
+an NPC life") showed only an **Article** section, no **Discussion**, despite
+the story having 10K chars of `top_comments` (170 comments). `journalctl`
+traced it to `generate_detailed_tldr` (server.py) firing the article and
+discussion LLM prompts concurrently via `asyncio.gather`; `llm_limiter`
+(llm_limiter.py) only reacted to a 429 after the fact (a cooldown), it never
+paced requests, so both calls hit Mistral in the same instant and one got a
+429. That salvage path already existed (falls back to the surviving half)
+but returned `TldrResult(kind="ok", ...)` — indistinguishable from a
+complete result — so the salvaged half got `upsert_tldr_cache`d as final.
+Since `upsert_tldr_cache` deletes the prior row unconditionally, a later
+salvage on an already-complete story destroys the complete summary. Over
+2026-09-02→03: 12 salvages out of 61 generations (~20%). Same class of bug
+as the 2026-08-01 Reddit "429-cascade" entry below.
+
+Fixes (`llm_limiter.py`, `server.py`, `pipeline/config.py`):
+
+- `LlmRateLimiter` gained a `min_spacing_seconds` reserved-slot queue
+  (`_next_slot_at`) alongside the existing 429 cooldown
+  (`_next_allowed_at`) — every `acquire()` now waits for its own spaced
+  slot, so concurrent callers no longer land on the provider in the same
+  instant. New config `llm_min_request_spacing_seconds` (default 1.0s),
+  wired in `main()`. Default constructor value stays `0.0`, so no test
+  behavior changed.
+- `TldrResult` gained `partial: bool = False`, set `True` by both salvage
+  branches. `_prefetch_one` now treats a partial as a non-success (no
+  cache write, retried next prefetch pass). `_handle_flask_tldr_detail`
+  skips `upsert_tldr_cache` on a partial and returns
+  `{"partial": True}`; the client (`templates/index.html`) treats that the
+  same as the existing `retryable`/`stale` provisional-content branch —
+  not cached client-side either, so the next open retries.
+- Separate latent bug found while tracing: the *second* (post-enrichment)
+  cache lookup in `_handle_flask_tldr_detail` had no guard against
+  `needs_active_refresh`/`needs_empty_fetch`, unlike the first lookup. When
+  the enrichment fetch was a no-op (e.g. `fetch_story` mocked or genuinely
+  returned nothing new), the recomputed cache_key came back identical to
+  the pre-enrich key and the forced-refresh bypass was silently undone,
+  serving the same stale cached TLDR the refresh was supposed to replace.
+  Fixed by only trusting the post-enrich hit when the key actually changed
+  or no forced refresh was pending. `test_flask_test_client_tldr_forces_refresh_for_active_thread_even_when_cached`
+  (tests/test_server.py) previously asserted the buggy behavior in its own
+  docstring/comment — updated to assert the fix instead.
+
+`scripts/purge_partial_tldrs.py` (new): finds tldr_cache rows whose stored
+`cache_key` is *currently live* (matches what `_tldr_cache_key` computes
+from the story's current fields today) and covers only one of
+`### Article`/`### Discussion` despite `generate_detailed_tldr` would take
+the dual-prompt branch for that content today. Deliberately excludes stale
+rows (cache_key mismatch — those already regenerate on next view and may
+still be a useful stale fallback) and comments-only/article-only stories
+whose self_text is below `SELF_TEXT_PROMPT_MIN_CHARS` (legitimately
+single-section, not a salvage — e.g. most Ask HN posts). A naive first cut
+of this query (current-content-only, no cache_key or min-chars check)
+matched 240 then 201 rows; the precise query matched **8**, consistent with
+the observed salvage rate. Ran with user sign-off: `--apply --yes` deleted
+those 8 rows (including 49541519); confirmed via sqlite that the story row
+itself and every other tldr_cache row were untouched.
+
+Provider swap considered and rejected for now (Daniel asked whether any of
+the other configured keys — Groq, Cerebras, OpenRouter — would do better).
+Cerebras `gpt-oss-120b` was already bake-off'd ahead on quality (2026-07-10
+entries below) but its free tier is 5 RPM — unusable for prewarm, unchanged
+per 2026-09-03 docs re-check. Groq's `openai/gpt-oss-120b` free tier is 30
+RPM but only 8K TPM, and one story's article+discussion prompts alone need
+~10.5K tokens — TPM is the binding constraint, not RPM. OpenRouter's
+`:free` variants cap at 50-1000 requests/day. Mistral's ~60 RPM / ~500K TPM
+free tier was never actually the bottleneck — the 429s were self-inflicted
+burst/concurrency, which the spacing fix above addresses directly; swapping
+providers without it would only relocate the same failure mode. Two
+independent follow-ups noted for later (not done here): the `LLM_PROVIDER=groq`
+branch is still pointed at `llama-3.3-70b-versatile` rather than
+`openai/gpt-oss-120b` (and needs the `reasoning_effort` extra to get
+`_cerebras_max_tokens`'s headroom, despite the misleading name), and
+`llm_limiter.record_response` only parses Mistral's rate-limit header
+shape — Groq/Cerebras send different headers and would need their own
+mapping before a real switch.
+
+**Files**: `llm_limiter.py`, `server.py`, `pipeline/config.py`,
+`templates/index.html`, `tests/test_llm_limiter.py`, `tests/test_server.py`,
+`scripts/purge_partial_tldrs.py` (new), `WORKLOG.md`.
+
 ## 2026-08-30 — fix: widen DISCOVERY_PER_BADGE so Popular isn't stuck at 6
 
 User-reported: the Popular tab showed exactly six stories, two per badge.

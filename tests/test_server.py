@@ -1,3 +1,4 @@
+import asyncio
 import threading
 import time
 from dataclasses import replace
@@ -2483,6 +2484,70 @@ def test_flask_test_client_tldr_cached_bypasses_uncached_quota(
     assert calls == 1
 
 
+def test_flask_tldr_detail_coalesces_concurrent_requests_for_same_story(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """N concurrent /api/tldr-detail requests for one story+content must
+    trigger exactly one generate_detailed_tldr call -- otherwise each
+    concurrent opener (active-card + prefetch + idle-prefetch fan-out) pays
+    for its own LLM calls and can even overwrite a good cached result with
+    a later 429 salvage. See WORKLOG 2026-09-03 follow-up ("story
+    regenerated 3x in 60s")."""
+    import server
+
+    port, db, _, handler, user = test_env
+    story = Story(
+        id=1750,
+        title="Coalescing story",
+        url="https://example.com/coalescing",
+        score=10,
+        time=1600000000,
+        text_content="Coalescing story. Body.",
+        source="hn",
+        comment_count=0,
+        self_text="",
+        top_comments="",
+        article_body="Body.",
+    )
+    db.upsert_story(story)
+
+    calls = 0
+
+    async def slow_generate_detailed_tldr(title, self_text, top_comments, article_body):
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.2)
+        return server.TldrResult(kind="ok", tldr=f"TLDR: {title}")
+
+    monkeypatch.setattr(
+        server, "generate_detailed_tldr", slow_generate_detailed_tldr
+    )
+
+    results: list[httpx.Response] = []
+    results_lock = threading.Lock()
+
+    def fire() -> None:
+        resp = httpx.post(
+            f"http://127.0.0.1:{port}/api/tldr-detail",
+            json={"story_id": story.id},
+            cookies={"hn_token": user.token},
+        )
+        with results_lock:
+            results.append(resp)
+
+    threads = [threading.Thread(target=fire) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5.0)
+
+    assert calls == 1
+    assert len(results) == 3
+    for resp in results:
+        assert resp.status_code == 200
+        assert resp.json()["tldr"] == "TLDR: Coalescing story"
+
+
 def test_flask_test_client_tldr_uncached_limit_sets_retry_after(
     test_env: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2587,8 +2652,11 @@ def test_flask_test_client_tldr_forces_refresh_for_active_thread_even_when_cache
     test_env: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An active thread must bypass a pre-existing cached TLDR too -- the
-    force-refresh must not be short-circuited by the early cache-hit check,
-    since serving a cached summary forever was the original bug."""
+    force-refresh must not be short-circuited by the early cache-hit check
+    (the original bug), nor by the post-enrich cache lookup silently
+    re-trusting the same stale row when the mocked fetch_story is a no-op
+    and the recomputed cache_key comes back unchanged (see WORKLOG
+    2026-09-03: 'post-enrich cache guard')."""
     import server
 
     _, db, _, handler, user = test_env
@@ -2615,6 +2683,19 @@ def test_flask_test_client_tldr_forces_refresh_for_active_thread_even_when_cache
         article_body=active_story.article_body or "",
     )
     db.upsert_tldr_cache(active_story.id, cached_key, "Stale cached TLDR")
+    # Backdate created_at past tldr_refresh_min_interval_seconds so this
+    # test still exercises "a cache hit doesn't short-circuit force-refresh"
+    # rather than the separate min-interval throttle (see
+    # test_tldr_active_refresh_throttled_within_min_interval).
+    with db.conn() as conn:
+        with conn:
+            conn.execute(
+                "UPDATE tldr_cache SET created_at = ? WHERE story_id = ?",
+                (
+                    time.time() - handler.config.tldr_refresh_min_interval_seconds - 1,
+                    active_story.id,
+                ),
+            )
     client = create_app(handler).test_client()
     client.set_cookie("hn_token", user.token)
 
@@ -2637,11 +2718,195 @@ def test_flask_test_client_tldr_forces_refresh_for_active_thread_even_when_cache
 
     assert resp.status_code == 200
     assert calls == [{"sid": active_story.id, "force": True}]
-    # The stale cached summary must not be the one returned -- fetch_story
-    # is mocked to a no-op, so the post-refresh cache_key is unchanged and
-    # the (still-stale) cached summary is what's served back, but the
-    # important assertion is that the refresh path fired at all.
-    assert resp.get_json()["tldr"] == "Stale cached TLDR"
+    # fetch_story is mocked to a no-op, so the post-refresh cache_key comes
+    # back identical to the pre-refresh key. The post-enrich guard must
+    # still refuse to trust that hit (needs_active_refresh was true), so
+    # the response must be the freshly generated summary, not the stale
+    # cached one -- and the stale row in tldr_cache must be overwritten.
+    assert resp.get_json()["tldr"] == "TLDR: Active thread story with stale cache"
+    assert db.get_tldr_cache(active_story.id, cached_key) == (
+        "TLDR: Active thread story with stale cache"
+    )
+
+
+def test_tldr_active_refresh_throttled_within_min_interval(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recent, high-velocity thread stays 'active' by
+    _hn_thread_looks_active for its entire recent-hours window -- without a
+    per-story cooldown, every single view forces a real-time Algolia
+    refetch + LLM regeneration forever. If the story's TLDR was already
+    regenerated within tldr_refresh_min_interval_seconds, the forced
+    refresh must be skipped and the ordinary (pre-enrich) cache hit served
+    instead. See WORKLOG 2026-09-03 follow-up."""
+    import server
+
+    _, db, _, handler, user = test_env
+    now = time.time()
+    active_story = Story(
+        id=1740,
+        title="Active thread story refreshed recently",
+        url="https://example.com/active-thread-throttled",
+        score=200,
+        time=int(now - 2 * 3600),  # 2h old
+        text_content="Active thread story refreshed recently. Body.",
+        source="hn",
+        comment_count=200,  # 100 comments/hour -- looks_active would be True
+        comment_count_at_fetch=200,
+        self_text="",
+        top_comments="Existing prewarmed comments.",
+        article_body="Body.",
+    )
+    db.upsert_story(active_story)
+    cached_key = server._tldr_cache_key(
+        title=active_story.title,
+        self_text=active_story.self_text or "",
+        top_comments=active_story.top_comments or "",
+        article_body=active_story.article_body or "",
+    )
+    db.upsert_tldr_cache(active_story.id, cached_key, "Recently generated TLDR")
+    # created_at defaults to "now" from upsert_tldr_cache -- well within the
+    # default 900s throttle window.
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+
+    fetch_calls: list[int] = []
+
+    async def mock_fetch_story(client_, sid, db_, *, force=False):
+        fetch_calls.append(sid)
+        return None
+
+    monkeypatch.setattr("pipeline.fetch_story", mock_fetch_story)
+
+    resp = client.post("/api/tldr-detail", json={"story_id": active_story.id})
+
+    assert resp.status_code == 200
+    assert fetch_calls == []  # no forced refetch -- throttled
+    assert resp.get_json() == {
+        "ok": True,
+        "tldr": "Recently generated TLDR",
+        "cached": True,
+    }
+
+
+def test_flask_test_client_tldr_partial_result_not_cached(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A salvaged half (article-only or discussion-only, from a 429 on the
+    other half) must be returned for this request but never written to
+    tldr_cache -- upsert_tldr_cache deletes the prior row unconditionally,
+    so caching a partial would either poison a fresh story forever or
+    destroy a previously complete TLDR. See WORKLOG 2026-09-03."""
+    import server
+
+    _, db, _, handler, user = test_env
+    story = Story(
+        id=1740,
+        title="Partial salvage story",
+        url="https://example.com/partial-salvage",
+        score=10,
+        time=1600000000,
+        text_content="Partial salvage story. Body.",
+        source="hn",
+        comment_count=50,
+        self_text="",
+        top_comments="Some comments.",
+        article_body="Body.",
+    )
+    db.upsert_story(story)
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+
+    async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
+        return server.TldrResult(
+            kind="ok", tldr=f"### Discussion\n- salvaged for {title}", partial=True
+        )
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    resp = client.post("/api/tldr-detail", json={"story_id": story.id})
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["ok"] is True
+    assert data["cached"] is False
+    assert data["partial"] is True
+    assert "salvaged" in data["tldr"]
+    # The invariant: nothing was written to tldr_cache for this story.
+    cache_key = server._tldr_cache_key(
+        title=story.title,
+        self_text="",
+        top_comments="Some comments.",
+        article_body="Body.",
+    )
+    assert db.get_tldr_cache(story.id, cache_key) is None
+    assert db.get_any_tldr_for_story(story.id) is None
+
+
+def test_flask_test_client_tldr_partial_result_does_not_overwrite_complete_cache(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If a story already has a complete cached TLDR and a later request
+    (e.g. an active-thread forced refresh) salvages only one half, the
+    pre-existing complete summary must survive -- the request only serves
+    the partial for this response, it does not touch the cache."""
+    import server
+
+    _, db, _, handler, user = test_env
+    now = time.time()
+    story = Story(
+        id=1741,
+        title="Partial vs complete cache story",
+        url="https://example.com/partial-vs-complete",
+        score=200,
+        time=int(now - 2 * 3600),  # 2h old -> active-thread velocity gate
+        text_content="Partial vs complete cache story. Body.",
+        source="hn",
+        comment_count=200,
+        comment_count_at_fetch=200,
+        self_text="",
+        top_comments="Existing prewarmed comments.",
+        article_body="Body.",
+    )
+    db.upsert_story(story)
+    cache_key = server._tldr_cache_key(
+        title=story.title,
+        self_text="",
+        top_comments="Existing prewarmed comments.",
+        article_body="Body.",
+    )
+    db.upsert_tldr_cache(story.id, cache_key, "### Article\n...\n\n### Discussion\n...")
+    # Backdate past tldr_refresh_min_interval_seconds so this test exercises
+    # "active thread forces refresh despite a cache hit" rather than the
+    # separate min-interval throttle.
+    with db.conn() as conn:
+        with conn:
+            conn.execute(
+                "UPDATE tldr_cache SET created_at = ? WHERE story_id = ?",
+                (now - handler.config.tldr_refresh_min_interval_seconds - 1, story.id),
+            )
+
+    async def mock_fetch_story(client_, sid, db_, *, force=False):
+        return None
+
+    monkeypatch.setattr("pipeline.fetch_story", mock_fetch_story)
+
+    async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
+        return server.TldrResult(
+            kind="ok", tldr="### Article\nsalvaged article only", partial=True
+        )
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+    resp = client.post("/api/tldr-detail", json={"story_id": story.id})
+
+    assert resp.status_code == 200
+    assert resp.get_json()["partial"] is True
+    assert db.get_tldr_cache(story.id, cache_key) == (
+        "### Article\n...\n\n### Discussion\n..."
+    )
 
 
 def test_flask_test_client_tldr_skips_refresh_for_cached_quiet_recent_thread(
@@ -2934,6 +3199,49 @@ async def test_prefetch_tldrs_for_ranked_regenerates_stale_beyond_top_combo(
     assert generated == 2
     assert sorted(calls) == sorted([stories[0].title, stories[1].title])
     assert db.get_any_tldr_for_story(stories[2].id) == "Fresh TLDR"
+
+
+async def test_prefetch_tldrs_for_ranked_does_not_cache_partial_results(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prefetch candidate whose generation salvages only one half must
+    not be counted as generated and must not be written to tldr_cache --
+    the next prefetch pass should retry it from scratch rather than
+    treating the salvaged half as done. See WORKLOG 2026-09-03."""
+    import server as srv
+    from pipeline import RankedStory
+
+    _, db, _, _, _ = test_env
+
+    story = Story(
+        id=3200,
+        title="Prefetch partial story",
+        url="https://example.com/prefetch-partial",
+        score=10,
+        time=1600000000,
+        text_content="body",
+        source="hn",
+        comment_count=10,
+        self_text="",
+        top_comments="Some comments.",
+        article_body="Some body.",
+    )
+    db.upsert_story(story)
+    ranked = [
+        RankedStory(story=story, score=1.0, best_match_title="", combo_keys="recent_hn")
+    ]
+
+    async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
+        return srv.TldrResult(
+            kind="ok", tldr="### Discussion\nsalvaged", partial=True
+        )
+
+    monkeypatch.setattr(srv, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    generated = await srv._prefetch_tldrs_for_ranked(ranked, db, per_combo=1)
+
+    assert generated == 0
+    assert db.get_any_tldr_for_story(story.id) is None
 
 
 def test_normalize_tldr_markdown_repairs_inline_bullets():
@@ -3677,6 +3985,87 @@ async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
     assert "- **Article** summary" in result.tldr
     assert "### Discussion" in result.tldr
     assert "- **Discussion** summary" in result.tldr
+    assert result.partial is False
+
+
+@pytest.mark.asyncio
+async def test_generate_detailed_tldr_marks_partial_on_article_failure(monkeypatch):
+    """A 429 (or any failure) on the article half must salvage the
+    discussion half but flag the result partial so callers don't cache it
+    as a complete TLDR. See WORKLOG 2026-09-03."""
+    import server
+
+    async def mock_call_llm_chat(*, api_key, base_url, model, prompt, max_tokens, extra=None):
+        if "Summarize the article" in prompt:
+            return server.LlmChatResult(content="rate limited", ok=False, status=429)
+        return server.LlmChatResult(content="- **Discussion** summary", ok=True)
+
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_PROVIDER", "mistral")
+    monkeypatch.setattr(server, "_call_llm_chat", mock_call_llm_chat)
+
+    result = await server.generate_detailed_tldr(
+        "Partial test",
+        self_text="Author text",
+        top_comments="Comment text",
+        article_body="Article body",
+    )
+
+    assert result.kind == "ok"
+    assert result.partial is True
+    assert "### Discussion" in result.tldr
+    assert "### Article" not in result.tldr
+
+
+@pytest.mark.asyncio
+async def test_generate_detailed_tldr_marks_partial_on_discussion_failure(monkeypatch):
+    import server
+
+    async def mock_call_llm_chat(*, api_key, base_url, model, prompt, max_tokens, extra=None):
+        if "Summarize the discussion" in prompt:
+            return server.LlmChatResult(content="rate limited", ok=False, status=429)
+        return server.LlmChatResult(content="- **Article** summary", ok=True)
+
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_PROVIDER", "mistral")
+    monkeypatch.setattr(server, "_call_llm_chat", mock_call_llm_chat)
+
+    result = await server.generate_detailed_tldr(
+        "Partial test",
+        self_text="Author text",
+        top_comments="Comment text",
+        article_body="Article body",
+    )
+
+    assert result.kind == "ok"
+    assert result.partial is True
+    assert "### Article" in result.tldr
+    assert "### Discussion" not in result.tldr
+
+
+@pytest.mark.asyncio
+async def test_generate_detailed_tldr_single_source_path_is_not_partial(monkeypatch):
+    """A story with only comments (no article/self_text) takes the
+    discussion-only prompt path -- that is a complete result on its own
+    terms, not a salvaged half, so partial must stay False."""
+    import server
+
+    async def mock_call_llm_chat(*, api_key, base_url, model, prompt, max_tokens, extra=None):
+        return server.LlmChatResult(content="- **Discussion** summary", ok=True)
+
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_PROVIDER", "mistral")
+    monkeypatch.setattr(server, "_call_llm_chat", mock_call_llm_chat)
+
+    result = await server.generate_detailed_tldr(
+        "Comments-only test",
+        self_text="",
+        top_comments="Comment text",
+        article_body="",
+    )
+
+    assert result.kind == "ok"
+    assert result.partial is False
 
 
 def test_llm_provider_config_defaults_to_mistral(monkeypatch) -> None:
@@ -3801,9 +4190,14 @@ async def test_call_llm_chat_uses_limiter(monkeypatch):
     calls = []
 
     class FakeLimiter:
-        async def acquire(self):
-            calls.append(("acquire", None))
+        default_deadline_seconds = None
+
+        async def acquire(self, priority=None, deadline=None):
+            calls.append(("acquire", priority))
             return True
+
+        def release(self):
+            calls.append(("release", None))
 
         def record_response(self, *, status, headers):
             calls.append(("record_response", status, dict(headers)))
@@ -3844,8 +4238,9 @@ async def test_call_llm_chat_uses_limiter(monkeypatch):
     assert result.content == "summary"
     assert result.ok is True
     assert calls == [
-        ("acquire", None),
+        ("acquire", server.Priority.FOREGROUND),
         ("post", "https://example.test/chat"),
+        ("release", None),
         (
             "record_response",
             200,
@@ -5300,6 +5695,11 @@ def test_warm_background_task_dedupes_in_flight_ids(test_env, monkeypatch):
 
     # Mark s1 and s2 as in-flight, leave s3 free
     srv.Handler._article_fetch_in_flight = {3001, 3002}
+    # _warm_background_tasks is invoked directly on the shared Handler
+    # class here (not a per-test TestHandler), so the prefetch debounce
+    # timestamp must be reset too, or an earlier test's run leaks into this
+    # one's due/skipped decision (see WORKLOG 2026-09-03 follow-up).
+    srv.Handler._last_tldr_prefetch_at = 0.0
 
     fetched_ids: list[int] = []
 
@@ -5348,13 +5748,16 @@ def test_warm_background_article_fetch_failure_still_prefetches_tldrs(
     db.upsert_story(story)
     ranked = [RankedStory(story=story, score=1.0, best_match_title="")]
     srv.Handler._article_fetch_in_flight = set()
+    srv.Handler._last_tldr_prefetch_at = 0.0
 
     async def failing_fetch(*args, **kwargs):
         raise RuntimeError("boom")
 
     prefetch_calls: list[list[int]] = []
 
-    async def capture_prefetch(ranked_stories, database, per_combo, stale_per_run=0):
+    async def capture_prefetch(
+        ranked_stories, database, per_combo, stale_per_run=0, config=None
+    ):
         prefetch_calls.append([rs.story.id for rs in ranked_stories])
         return 1
 
@@ -5371,6 +5774,53 @@ def test_warm_background_article_fetch_failure_still_prefetches_tldrs(
 
     assert prefetch_calls == [[3010]]
     assert srv.Handler._article_fetch_in_flight == set()
+
+
+def test_warm_background_tasks_debounces_tldr_prefetch(
+    test_env: Any, monkeypatch
+) -> None:
+    """A burst of dashboard warms (e.g. rapid voting) must not each queue
+    their own overlapping prefetch pass -- only one run per
+    tldr_prefetch_min_interval_seconds. See WORKLOG 2026-09-03 follow-up."""
+    import server as srv
+    from pipeline import Config, RankedStory
+
+    _, db, _, _, _ = test_env
+    story = Story(
+        id=3020,
+        title="Debounce story",
+        url="https://example.com/debounce",
+        score=10,
+        time=int(time.time()) - 3600,
+        text_content="debounce story",
+        source="hn",
+    )
+    ranked = [RankedStory(story=story, score=1.0, best_match_title="")]
+    cfg = Config(
+        article_fetch_max_per_run=0,
+        tldr_prefetch_min_interval_seconds=120.0,
+    )
+    srv.Handler._last_tldr_prefetch_at = 0.0
+
+    prefetch_calls = 0
+
+    async def counting_prefetch(*args, **kwargs):
+        nonlocal prefetch_calls
+        prefetch_calls += 1
+        return 0
+
+    monkeypatch.setattr(srv, "_prefetch_tldrs_for_ranked", counting_prefetch)
+
+    srv.Handler._warm_background_tasks(ranked, db, MockEmbedder(), cfg, per_combo=1)
+    srv.Handler._warm_background_tasks(ranked, db, MockEmbedder(), cfg, per_combo=1)
+
+    assert prefetch_calls == 1
+
+    # Once the interval has elapsed, the next warm must run again.
+    srv.Handler._last_tldr_prefetch_at = time.time() - 121.0
+    srv.Handler._warm_background_tasks(ranked, db, MockEmbedder(), cfg, per_combo=1)
+
+    assert prefetch_calls == 2
 
 
 def test_quiet_third_party_loggers_silences_httpx_and_trafilatura() -> None:
