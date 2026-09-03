@@ -206,6 +206,19 @@ def test_dedup_ranked_prefers_higher_score_within_same_source() -> None:
     assert [s.id for s in out] == [2]
 
 
+def test_dedup_ranked_same_score_keeps_first_occurrence() -> None:
+    """Same source + same score: the earlier-ranked story wins, not the later.
+
+    Regression: `_story_sort_key` used `-position` as its tiebreak, so a
+    same-source/same-score duplicate bucket kept the *later* input instead
+    of the earlier one (the ranker had already ordered them).
+    """
+    a = _story(1, url="https://example.com/a", source="hn", score=100)
+    b = _story(2, url="https://example.com/a", source="hn", score=100)
+    assert [s.id for s in dedup_ranked([a, b], [], DedupConfig())] == [1]
+    assert [s.id for s in dedup_ranked([b, a], [], DedupConfig())] == [2]
+
+
 def test_dedup_ranked_keeps_null_url_stories_through() -> None:
     """Self-posts (url=None) are not deduped by URL."""
     a = _story(1, url=None, source="hn")
@@ -357,6 +370,18 @@ def test_embedding_cosine_source_preference_tiebreak() -> None:
     out = dedup_ranked([a, b], [], DedupConfig(), embeddings=embeddings)
     assert len(out) == 1
     assert out[0].id == 2  # HN wins even though slashdot was first
+
+
+def test_embedding_cosine_same_score_keeps_first_occurrence() -> None:
+    """Same source + same score: embedding dedup keeps earlier-ranked story."""
+    a = _story(1, url="https://a.com/x", source="hn", score=100)
+    b = _story(2, url="https://b.com/x", source="hn", score=100)
+    v = _unit_vec(1)
+    embeddings = {1: v, 2: v}
+    out = dedup_ranked([a, b], [], DedupConfig(), embeddings=embeddings)
+    assert [s.id for s in out] == [1]
+    out = dedup_ranked([b, a], [], DedupConfig(), embeddings=embeddings)
+    assert [s.id for s in out] == [2]
 
 
 def test_embedding_cosine_no_embedding_for_story() -> None:

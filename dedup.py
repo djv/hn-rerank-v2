@@ -173,11 +173,11 @@ def _story_sort_key(
     """Stable order key for ``Story`` used inside a duplicate bucket.
 
     Lower wins.  Components: source preference, negative score (higher
-    score first), position (preserve caller-provided order as final
-    tiebreak), id (deterministic).
+    score first), and position (earlier caller-provided order wins as the
+    final tiebreak).
     """
     pref_rank = _source_preference_rank(story.source, cfg)
-    return (pref_rank[0], pref_rank[1], pref_rank[2], -story.score, -position)
+    return (pref_rank[0], pref_rank[1], pref_rank[2], -story.score, position)
 
 
 def dedup_ranked(
