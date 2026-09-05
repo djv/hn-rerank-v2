@@ -70,17 +70,10 @@ class RedditRateLimiter:
         """Reserve a rate-limit slot for the next Reddit request.
 
         Inside the lock, atomically computes this caller's slot time
-        (``max(now, _next_allowed_at)``) and reserves the FOLLOWING slot
-        by bumping ``_next_allowed_at = slot + delay``. The next caller
-        to enter the lock will see the bumped value and stagger itself
-        correctly, even if it's in a different OS thread (queue worker
-        vs HTTP handler).
-
-        Previously ``_next_allowed_at`` was advanced only in
-        ``on_success``/``on_429`` (after the HTTP response), so two
-        concurrent ``acquire()`` callers both saw the same stale value
-        and fired HTTP simultaneously. See WORKLOG 2026-06-28
-        "Limiter concurrency race fix" for the full analysis.
+        (``max(now, _next_allowed_at)``) and reserves the FOLLOWING slot,
+        so concurrent callers across threads stagger correctly even
+        before any HTTP response is known (see WORKLOG 2026-06-28).
+        The lock is released during asyncio.sleep so threads proceed.
         """
         with self._lock:
             if self._consecutive_429 >= self.MAX_CONSECUTIVE_429:
@@ -125,12 +118,8 @@ class RedditRateLimiter:
             else:
                 idx = min(self._consecutive_429 - 1, len(self.BACKOFF) - 1)
                 delay = self.BACKOFF[idx]
-            # ``max(_next_allowed_at, now + delay)`` — never earlier than
-            # what ``acquire()`` already reserved. A successful prior
-            # acquire may have set the next slot to a time < now + delay;
-            # the 429 backoff can only push it further out, never pull it
-            # back. This protects callers who are mid-``asyncio.sleep``
-            # against invalidation.
+            # Never pull the reserved slot earlier: a prior acquire() may
+            # already have callers mid-sleep on the current value.
             now = time.monotonic()
             self._next_allowed_at = max(self._next_allowed_at, now + delay)
             if prev < self.MAX_CONSECUTIVE_429 <= self._consecutive_429:

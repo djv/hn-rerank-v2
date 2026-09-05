@@ -301,82 +301,41 @@ def test_env(tmp_path, mock_embedder):
     db.close()
 
 
-def test_discussion_budget_scales_with_comment_volume() -> None:
-    """The discussion-only TLDR budget must grow with comment volume rather
-    than staying fixed at 3-5 bullets regardless of thread size."""
+def test_section_budget_scales_with_source_volume() -> None:
+    """The TLDR bullet budget must grow with source material volume rather
+    than staying fixed at 3-5 bullets regardless of thread/article size."""
     import server
 
-    assert server._discussion_budget(0) == "3-5 bullets, max 150 words"
-    assert server._discussion_budget(1_499) == "3-5 bullets, max 150 words"
-    assert server._discussion_budget(1_500) == "6-8 bullets, max 250 words"
-    assert server._discussion_budget(4_999) == "6-8 bullets, max 250 words"
-    assert server._discussion_budget(5_000) == "9-12 bullets, max 400 words"
-    assert server._discussion_budget(12_000) == "9-12 bullets, max 400 words"
+    assert server._section_budget(0) == "3-5 bullets, max 150 words"
+    assert server._section_budget(1_499) == "3-5 bullets, max 150 words"
+    assert server._section_budget(1_500) == "6-8 bullets, max 250 words"
+    assert server._section_budget(4_999) == "6-8 bullets, max 250 words"
+    assert server._section_budget(5_000) == "9-12 bullets, max 400 words"
+    assert server._section_budget(12_000) == "9-12 bullets, max 400 words"
 
 
-def test_discussion_only_prompt_renders_budget_placeholder() -> None:
-    """Pins the {budget} placeholder contract in discussion_only_v4.txt -- if
-    a future prompt edit drops it, .format() must fail loudly here rather
+@pytest.mark.parametrize(
+    ("template", "fields"),
+    [
+        ("discussion_only_v4.txt", {"comments_section": "a comment"}),
+        (
+            "article_only_v4.txt",
+            {"article_section": "Author's text:\nsome article content"},
+        ),
+        ("article_v4.txt", {"article_section": "Author's text:\nsome article content"}),
+        ("discussion_v4.txt", {"comments_section": "a comment"}),
+    ],
+)
+def test_prompts_render_budget_placeholder(template: str, fields: dict) -> None:
+    """Pins the {budget} placeholder contract in every TLDR prompt -- if a
+    future prompt edit drops it, .format() must fail loudly here rather
     than silently ignoring the scaled budget."""
     import server
 
-    prompt = server._load_prompt("discussion_only_v4.txt").format(
+    prompt = server._load_prompt(template).format(
         title="Some story",
-        comments_section="a comment",
-        budget=server._discussion_budget(5_000),
-    )
-    assert "9-12 bullets, max 400 words" in prompt
-
-
-def test_article_budget_scales_with_content_volume() -> None:
-    """The article-derived TLDR budget must grow with source material volume
-    rather than staying fixed at 3-5 bullets regardless of article length."""
-    import server
-
-    assert server._article_budget(0) == "3-5 bullets, max 150 words"
-    assert server._article_budget(1_499) == "3-5 bullets, max 150 words"
-    assert server._article_budget(1_500) == "6-8 bullets, max 250 words"
-    assert server._article_budget(4_999) == "6-8 bullets, max 250 words"
-    assert server._article_budget(5_000) == "9-12 bullets, max 400 words"
-    assert server._article_budget(12_000) == "9-12 bullets, max 400 words"
-
-
-def test_article_only_prompt_renders_budget_placeholder() -> None:
-    """Pins the {budget} placeholder contract in article_only_v4.txt -- if a
-    future prompt edit drops it, .format() must fail loudly here rather than
-    silently ignoring the scaled budget."""
-    import server
-
-    prompt = server._load_prompt("article_only_v4.txt").format(
-        title="Some story",
-        article_section="Author's text:\nsome article content",
-        budget=server._article_budget(5_000),
-    )
-    assert "9-12 bullets, max 400 words" in prompt
-
-
-def test_article_v4_prompt_renders_budget_placeholder() -> None:
-    """Pins the {budget} placeholder contract in article_v4.txt (the article
-    half of the combined article+comments path)."""
-    import server
-
-    prompt = server._load_prompt("article_v4.txt").format(
-        title="Some story",
-        article_section="Author's text:\nsome article content",
-        budget=server._article_budget(5_000),
-    )
-    assert "9-12 bullets, max 400 words" in prompt
-
-
-def test_discussion_v4_prompt_renders_budget_placeholder() -> None:
-    """Pins the {budget} placeholder contract in discussion_v4.txt (the
-    discussion half of the combined article+comments path)."""
-    import server
-
-    prompt = server._load_prompt("discussion_v4.txt").format(
-        title="Some story",
-        comments_section="a comment",
-        budget=server._discussion_budget(5_000),
+        budget=server._section_budget(5_000),
+        **fields,
     )
     assert "9-12 bullets, max 400 words" in prompt
 
@@ -2863,8 +2822,9 @@ def test_flask_test_client_tldr_stale_fallback_on_quota_denied(
     }
 
 
+@pytest.mark.parametrize("cacheable", [True, False])
 async def test_prefetch_tldrs_for_ranked_regenerates_stale_beyond_top_combo(
-    test_env: Any, monkeypatch: pytest.MonkeyPatch
+    test_env: Any, monkeypatch: pytest.MonkeyPatch, cacheable: bool
 ) -> None:
     """Side B: the top-per-combo prefetch alone never reaches a story ranked
     below the cutoff, so a stale-key story there is stuck until it re-enters
@@ -2923,7 +2883,7 @@ async def test_prefetch_tldrs_for_ranked_regenerates_stale_beyond_top_combo(
 
     async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
         calls.append(title)
-        return srv.TldrResult(kind="ok", tldr=f"TLDR: {title}")
+        return srv.TldrResult(kind="ok", tldr=f"TLDR: {title}", cacheable=cacheable)
 
     monkeypatch.setattr(srv, "generate_detailed_tldr", mock_generate_detailed_tldr)
 
@@ -2931,8 +2891,11 @@ async def test_prefetch_tldrs_for_ranked_regenerates_stale_beyond_top_combo(
         ranked, db, per_combo=1, stale_per_run=2
     )
 
-    assert generated == 2
+    assert generated == (2 if cacheable else 0)
     assert sorted(calls) == sorted([stories[0].title, stories[1].title])
+    if not cacheable:
+        assert db.get_any_tldr_for_story(stories[0].id) is None
+        assert db.get_any_tldr_for_story(stories[1].id) == "Stale TLDR"
     assert db.get_any_tldr_for_story(stories[2].id) == "Fresh TLDR"
 
 
@@ -3643,13 +3606,148 @@ def test_tldr_detail_does_not_cache_placeholder(test_env, monkeypatch):
     assert db.get_tldr_cache(779, "") is None  # no cache entry written
 
 
+def test_tldr_partial_response_remains_retryable(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import server
+
+    port, db, _, _, user = test_env
+    db.upsert_story(Story(
+        id=780, title="Partial story", url=None, score=5, time=1600000000,
+        text_content="Body", article_body="Body",
+    ))
+
+    async def generate(*args: object, **kwargs: object) -> server.TldrResult:
+        return server.TldrResult(kind="ok", tldr="### Article\n- Partial", cacheable=False)
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", generate)
+    response = httpx.post(
+        f"http://127.0.0.1:{port}/api/tldr-detail",
+        json={"story_id": 780}, cookies={"hn_token": user.token},
+    )
+    assert response.status_code == 200
+    assert response.json()["retryable"] is True
+    assert db.get_any_tldr_for_story(780) is None
+
+
+def test_prefetch_follows_navigation_order() -> None:
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node is required to execute browser queue logic")
+    _, script = _read_template_and_static()
+    start = script.index("    function prefetchUpcomingTldrs()")
+    end = script.index("    function cardsForAge", start)
+    # Execute the production function against queue states, including a
+    # retained active card in the middle after a refill and wraparound.
+    harness = """
+      const assert = require('node:assert/strict');
+      const PREFETCH_COUNT = 2;
+      let queue, activeCard, requested;
+      const queuedCards = () => queue;
+      const prefetchCards = cards => { requested = cards; };
+    """ + script[start:end] + """
+      for (const [cards, active, expected] of [
+        [[1,2,3,4], 1, [2,3]],
+        [[1,2,3,4], 3, [4,1]],
+        [[1,2,3,4], 4, [1,2]],
+        [[1], 1, []], [[], null, []], [[1,2], null, [1,2]],
+      ]) {
+        queue = cards; activeCard = active;
+        prefetchUpcomingTldrs();
+        assert.deepEqual(requested, expected);
+      }
+    """
+    subprocess.run([node, "-e", harness], check=True, capture_output=True, text=True)
+    refill = script[script.index("    async function refillQueue("):script.index("    document.querySelectorAll('[data-fb]').forEach", script.index("    async function refillQueue("))]
+    assert "else {\n        prefetchUpcomingTldrs();" in refill
+
+
+def test_maybe_cache_tldr_skips_salvaged_half(tmp_path: Path) -> None:
+    """_maybe_cache_tldr persists complete TLDRs but never a salvaged half
+    (single-row table: caching it would evict a previously complete TLDR)."""
+    from database import Database
+
+    import server
+
+    db = Database(str(tmp_path / "cache_gate.db"))
+    try:
+        db.upsert_story(
+            Story(
+                id=781,
+                title="Cache gate story",
+                url=None,
+                score=5,
+                time=1600000000,
+                text_content="x",
+            )
+        )
+        assert (
+            server._maybe_cache_tldr(
+                db, 781, "key1", server.TldrResult(kind="ok", tldr="full")
+            )
+            is True
+        )
+        assert db.get_tldr_cache(781, "key1") == "full"
+
+        assert (
+            server._maybe_cache_tldr(
+                db,
+                781,
+                "key2",
+                server.TldrResult(
+                    kind="ok", tldr="### Article\n- half", cacheable=False
+                ),
+            )
+            is False
+        )
+        assert db.get_tldr_cache(781, "key2") is None
+        assert db.get_any_tldr_for_story(781) == "full"  # complete row intact
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_generate_marks_single_half_salvage_uncacheable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One failed side → ok + cacheable=False; both failed → llm_error."""
+    import server
+
+    async def mock_call_llm_chat(
+        *, api_key, base_url, model, prompt, max_tokens, extra=None
+    ):
+        if "Summarize the discussion" in prompt:
+            return server.LlmChatResult(content="boom", ok=False, status=429)
+        return server.LlmChatResult(content="- **Article** summary", ok=True)
+
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_PROVIDER", "mistral")
+    monkeypatch.setattr(server, "_call_llm_chat", mock_call_llm_chat)
+
+    result = await server.generate_detailed_tldr(
+        "Salvage test",
+        self_text="Author text",
+        top_comments="Comment text",
+        article_body="Body text",
+    )
+
+    assert result.kind == "ok"
+    assert result.cacheable is False
+    assert result.tldr.startswith("### Article")
+
+
 @pytest.mark.asyncio
 async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
     import server
 
     calls = []
 
-    async def mock_call_llm_chat(*, api_key, base_url, model, prompt, max_tokens, extra=None):
+    async def mock_call_llm_chat(
+        *, api_key, base_url, model, prompt, max_tokens, extra=None
+    ):
         calls.append(prompt)
         if "Summarize the article" in prompt:
             return server.LlmChatResult(content="- **Article** summary", ok=True)
@@ -3679,44 +3777,74 @@ async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
     assert "- **Discussion** summary" in result.tldr
 
 
-def test_llm_provider_config_defaults_to_mistral(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("provider", "key_env", "model", "extra", "base_host"),
+    [
+        ("mistral", "MISTRAL_API_KEY", "mistral-small-latest", {}, "api.mistral.ai"),
+        (
+            "cerebras",
+            "CEREBRAS_API_KEY",
+            "gpt-oss-120b",
+            {"reasoning_effort": "low"},
+            "api.cerebras.ai",
+        ),
+        (
+            "groq",
+            "GROQ_API_KEY",
+            "llama-3.3-70b-versatile",
+            {},
+            "api.groq.com",
+        ),
+        (
+            "openrouter",
+            "OPENROUTER_API_KEY",
+            "meta-llama/llama-3.3-70b-instruct",
+            {},
+            "openrouter.ai",
+        ),
+    ],
+)
+def test_llm_provider_config_table(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    key_env: str,
+    model: str,
+    extra: dict,
+    base_host: str,
+) -> None:
+    """Every provider row maps env key + endpoint + default model + extras;
+    LLM_MODEL overrides the default model for any provider."""
+    import server
+
+    monkeypatch.setenv("LLM_PROVIDER", provider)
+    monkeypatch.setenv(key_env, "test-key")
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+
+    cfg = server._llm_provider_config()
+
+    assert cfg.provider == provider
+    assert cfg.api_key == "test-key"
+    assert cfg.model == model
+    assert cfg.extra == extra
+    assert base_host in cfg.base_url
+
+    monkeypatch.setenv("LLM_MODEL", "custom-model")
+    assert server._llm_provider_config().model == "custom-model"
+
+
+def test_llm_provider_config_unknown_falls_back_to_mistral(monkeypatch) -> None:
     import server
 
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
     monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    assert server._llm_provider_config().provider == "mistral"
+
+    monkeypatch.setenv("LLM_PROVIDER", "not-a-provider")
 
     cfg = server._llm_provider_config()
 
     assert cfg.provider == "mistral"
     assert cfg.model == "mistral-small-latest"
-    assert cfg.api_key == "test-key"
-    assert cfg.extra == {}
-
-
-def test_llm_provider_config_cerebras_has_reasoning_effort(monkeypatch) -> None:
-    import server
-
-    monkeypatch.setenv("LLM_PROVIDER", "cerebras")
-    monkeypatch.setenv("CEREBRAS_API_KEY", "test-key")
-
-    cfg = server._llm_provider_config()
-
-    assert cfg.provider == "cerebras"
-    assert cfg.model == "gpt-oss-120b"
-    assert cfg.extra == {"reasoning_effort": "low"}
-
-
-def test_llm_provider_config_mistral_has_no_extra_params(monkeypatch) -> None:
-    import server
-
-    monkeypatch.setenv("LLM_PROVIDER", "mistral")
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
-
-    cfg = server._llm_provider_config()
-
-    assert cfg.provider == "mistral"
-    assert cfg.model == "mistral-small-latest"
-    assert cfg.extra == {}
 
 
 def test_cerebras_max_tokens_adds_buffer_only_with_reasoning_effort() -> None:

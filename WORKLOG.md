@@ -2,6 +2,62 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-09-05 — finish TLDR queue prefetch and cache hardening
+
+- Browser lookahead now requests the next two cards after the active card,
+  wrapping in navigation order. Previously the active card consumed a slot.
+  Retaining the active card during deck refill now also warms its new queue.
+- Background and on-demand generation share the cache gate: failed, empty,
+  and partial results cannot overwrite a complete stored summary. Partial
+  HTTP results are retryable so the browser does not retain them as final.
+- Kept the existing simplification of providers, prompt budgets, enrichment,
+  and response helpers; removed the redundant background result check.
+- Validation: 635 passed, 1 skipped; Ruff and ty clean. Node executed the
+  production lookahead against empty, single-card, middle, and wraparound
+  queues. Service restarted; dashboard HTTP 200. A previously uncached
+  article returned a complete TLDR in 11.89s. Prefetch improves readiness,
+  but this does not establish a reduction in underlying generation latency.
+
+## 2026-09-05 — simplify TLDR path (net-negative source, salvage-never-cache, OpenRouter)
+
+Reverted 6cc2929 earlier today (fail-fast limiter made every TLDR hang
+then 503 under Mistral exhaustion); then simplified the restored TLDR
+path instead of re-adding machinery. Non-test source is net negative;
+tests grow only where coverage was missing.
+
+- `TldrResult.cacheable` (default True): half-salvage serves with
+  `cacheable=False`; `_maybe_cache_tldr` persists only cacheable rows.
+  Fixes the Sep-3 corruption class (salvaged half evicting a complete
+  TLDR from the single-row table) with a 14-line gate instead of a
+  limiter rewrite. Covered: `test_maybe_cache_tldr_skips_salvaged_half`,
+  `test_generate_marks_single_half_salvage_uncacheable`.
+- `generate_detailed_tldr`: uniform half-assembly via `_normalize` +
+  walrus (drops the 4-way branch + redundant `.strip()`s); single-path
+  prompt selection collapsed; `_article/_discussion_budget` merged into
+  `_section_budget` (tiers were byte-identical; tests merged too).
+- Handler: `_serve_cached_tldr` (both hit sites),
+  `_stale_tldr_fallback_response` (hoisted closure), one unified
+  reddit/LessWrong enrich block.
+- Providers table-driven (`_LLM_PROVIDERS`) + `openrouter`
+  (`OPENROUTER_API_KEY`, default `meta-llama/llama-3.3-70b-instruct`) +
+  `LLM_MODEL` override for any provider. Pinned by a parametrized
+  table test (all 4 providers) + unknown-falls-back-to-mistral.
+- Client: `prefetchCards` (upcoming-2 + idle-2 share it); inline-bullet
+  regex unified with the server (`[.!;?:]`).
+- reddit_limiter: trimmed duplicate backoff commentary (snapshot/restore
+  kept — load-bearing for restart persistence).
+
+Process note: the file editor auto-runs `ruff format` on save while this
+repo is only `ruff check`-clean, so each Python edit reflowed unrelated
+regions. De-reflowed via hunk-filtered patch (`/tmp/filter_patch.py`
+pattern: diff, keep logical hunks, checkout, re-apply) — final diff
+contains zero formatter churn. If a future diff shows whole-file reflows,
+suspect the editor, not the author.
+
+**Files**: `server.py`, `reddit_limiter.py`, `templates/index.html`,
+`tests/test_server.py`, `WORKLOG.md`.
+**Verification**: 632 passed, 1 skipped (`pytest -n 4`); `ruff`, `ty` clean.
+
 ## 2026-08-30 — fix: widen DISCOVERY_PER_BADGE so Popular isn't stuck at 6
 
 User-reported: the Popular tab showed exactly six stories, two per badge.

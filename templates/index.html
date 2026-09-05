@@ -1286,7 +1286,10 @@
           return line;
         })
         .join('\n')
-        .replace(/(\S)\s+-\s+(?=\S)/g, '$1\n- ');
+        // Inline-bullet rule mirrors server._normalize_tldr_markdown — keep
+        // the character class identical ([.!;?:]) or cached/stale rows will
+        // render differently from fresh ones.
+        .replace(/([.!;?:])\s+-\s+(?=\S)/g, '$1\n- ');
     }
 
     function parseSimpleMarkdown(text) {
@@ -1653,6 +1656,9 @@
       const needsActiveCard = activeCard === null;
       if (advance || needsActiveCard) {
         showNextCard({ allowRefresh: false });
+      } else {
+        prefetchUpcomingTldrs();
+        scheduleIdleAgePrefetch();
       }
     }
 
@@ -1685,12 +1691,20 @@
       await openTldrDetail(card);
     });
 
-    function prefetchUpcomingTldrs() {
-      queuedCards().slice(0, PREFETCH_COUNT).forEach(card => {
+    function prefetchCards(cards) {
+      cards.forEach(card => {
         if (!card.querySelector('.tldr-detail-content')) {
           openTldrDetail(card);
         }
       });
+    }
+
+    function prefetchUpcomingTldrs() {
+      const queue = queuedCards();
+      const index = queue.indexOf(activeCard);
+      // Follow navigation order, including wraparound after the last card.
+      const upcoming = index < 0 ? queue : queue.slice(index + 1).concat(queue.slice(0, index));
+      prefetchCards(upcoming.slice(0, PREFETCH_COUNT));
     }
 
     function cardsForAge(age) {
@@ -1708,13 +1722,7 @@
       const otherAge = currentAge === 'recent' ? 'archive' : 'recent';
       const run = () => {
         idleAgePrefetchHandle = null;
-        cardsForAge(otherAge)
-          .slice(0, IDLE_INACTIVE_PREFETCH_COUNT)
-          .forEach(card => {
-            if (!card.querySelector('.tldr-detail-content')) {
-              openTldrDetail(card);
-            }
-          });
+        prefetchCards(cardsForAge(otherAge).slice(0, IDLE_INACTIVE_PREFETCH_COUNT));
       };
       if ('requestIdleCallback' in window) {
         idleAgePrefetchHandle = window.requestIdleCallback(run, { timeout: 2500 });

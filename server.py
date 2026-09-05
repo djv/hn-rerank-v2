@@ -198,6 +198,9 @@ class TldrResult:
     tldr: str = ""
     error_status: int | None = None
     error_text: str = ""
+    # False for a salvaged half: serve this request only, never tldr_cache
+    # (one row per story — caching it would evict a complete TLDR).
+    cacheable: bool = True
 
 
 def _llm_error_from(r: LlmChatResult) -> TldrResult:
@@ -652,38 +655,48 @@ class LlmProviderConfig:
     extra: dict[str, object]
 
 
+# Provider table: name → (key env var, chat-completions endpoint, default
+# model, extra payload). mistral is the default; cerebras's free tier
+# 429s under prewarm (WORKLOG 2026-07-10). gpt-oss-120b burns max_tokens on
+# hidden reasoning, hence reasoning_effort + _cerebras_max_tokens headroom.
+_LLM_PROVIDERS: dict[str, tuple[str, str, str, dict[str, object]]] = {
+    "mistral": (
+        "MISTRAL_API_KEY",
+        "https://api.mistral.ai/v1/chat/completions",
+        "mistral-small-latest",
+        {},
+    ),
+    "cerebras": (
+        "CEREBRAS_API_KEY",
+        "https://api.cerebras.ai/v1/chat/completions",
+        "gpt-oss-120b",
+        {"reasoning_effort": "low"},
+    ),
+    "groq": (
+        "GROQ_API_KEY",
+        "https://api.groq.com/openai/v1/chat/completions",
+        "llama-3.3-70b-versatile",
+        {},
+    ),
+    "openrouter": (
+        "OPENROUTER_API_KEY",
+        "https://openrouter.ai/api/v1/chat/completions",
+        "meta-llama/llama-3.3-70b-instruct",
+        {},
+    ),
+}
+
+
 def _llm_provider_config() -> LlmProviderConfig:
-    # mistral is the default: its free tier (~60 req/min) comfortably absorbs
-    # the prewarm burst (up to 4 concurrent calls); cerebras's free tier for
-    # gpt-oss-120b is capped at 5 req/min and gets buried under 429s during
-    # regen prewarm (see WORKLOG 2026-07-10). Cerebras stays available as an
-    # opt-in provider.
     provider = os.environ.get("LLM_PROVIDER", "mistral").lower()
-    if provider == "cerebras":
-        # gpt-oss-120b is a reasoning model — it burns max_tokens on hidden
-        # reasoning and returns no content if not given reasoning_effort +
-        # enough headroom (see _cerebras_max_tokens below).
-        return LlmProviderConfig(
-            provider=provider,
-            api_key=os.environ.get("CEREBRAS_API_KEY"),
-            base_url="https://api.cerebras.ai/v1/chat/completions",
-            model="gpt-oss-120b",
-            extra={"reasoning_effort": "low"},
-        )
-    if provider == "groq":
-        return LlmProviderConfig(
-            provider=provider,
-            api_key=os.environ.get("GROQ_API_KEY"),
-            base_url="https://api.groq.com/openai/v1/chat/completions",
-            model="llama-3.3-70b-versatile",
-            extra={},
-        )
+    name = provider if provider in _LLM_PROVIDERS else "mistral"
+    key_env, base_url, model, extra = _LLM_PROVIDERS[name]
     return LlmProviderConfig(
-        provider="mistral",
-        api_key=os.environ.get("MISTRAL_API_KEY"),
-        base_url="https://api.mistral.ai/v1/chat/completions",
-        model="mistral-small-latest",
-        extra={},
+        provider=name,
+        api_key=os.environ.get(key_env),
+        base_url=base_url,
+        model=os.environ.get("LLM_MODEL", model),
+        extra=dict(extra),
     )
 
 
@@ -718,27 +731,11 @@ def _tldr_cache_key(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _discussion_budget(comment_chars: int) -> str:
-    """Bullet/word budget for the discussion-only summary, scaled by comment
-    volume so a large thread doesn't collapse into the same terse output as a
-    thin one. comment_chars is the length of the already char-capped
-    comments_section (see COMMENT_PROMPT_CHAR_LIMIT)."""
-    if comment_chars < 1_500:
+def _section_budget(source_chars: int) -> str:
+    """Bullet/word budget scaled by capped source length (thin input → terse)."""
+    if source_chars < 1_500:
         return "3-5 bullets, max 150 words"
-    if comment_chars < 5_000:
-        return "6-8 bullets, max 250 words"
-    return "9-12 bullets, max 400 words"
-
-
-def _article_budget(self_text_chars: int) -> str:
-    """Bullet/word budget for article-derived summaries, scaled by source
-    material volume so a full RSS/article body doesn't collapse into the
-    same terse output as a thin teaser. self_text_chars is the length of
-    the already char-capped article_section (see SELF_TEXT_PROMPT_CHAR_LIMIT
-    / ARTICLE_BODY_CHAR_LIMIT). Mirrors _discussion_budget's tiers."""
-    if self_text_chars < 1_500:
-        return "3-5 bullets, max 150 words"
-    if self_text_chars < 5_000:
+    if source_chars < 5_000:
         return "6-8 bullets, max 250 words"
     return "9-12 bullets, max 400 words"
 
@@ -774,81 +771,70 @@ async def generate_detailed_tldr(
         article_prompt = _load_prompt("article_v4.txt").format(
             title=title,
             article_section=article_section,
-            budget=_article_budget(len(article_section)),
+            budget=_section_budget(len(article_section)),
         )
         discussion_prompt = _load_prompt("discussion_v4.txt").format(
             title=title,
             comments_section=comments_section,
-            budget=_discussion_budget(len(comments_section)),
-        )
-        article_task = _call_llm_chat(
-            api_key=api_key,
-            base_url=base_url,
-            model=model,
-            prompt=article_prompt,
-            max_tokens=_cerebras_max_tokens(900, extra),
-            extra=extra,
-        )
-        discussion_task = _call_llm_chat(
-            api_key=api_key,
-            base_url=base_url,
-            model=model,
-            prompt=discussion_prompt,
-            max_tokens=_cerebras_max_tokens(900, extra),
-            extra=extra,
+            budget=_section_budget(len(comments_section)),
         )
         article_result, discussion_result = await asyncio.gather(
-            article_task,
-            discussion_task,
+            _call_llm_chat(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                prompt=article_prompt,
+                max_tokens=_cerebras_max_tokens(900, extra),
+                extra=extra,
+            ),
+            _call_llm_chat(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                prompt=discussion_prompt,
+                max_tokens=_cerebras_max_tokens(900, extra),
+                extra=extra,
+            ),
         )
-
-        if article_result.ok and discussion_result.ok:
-            article_text = _normalize_tldr_markdown(article_result.content)
-            discussion_text = _normalize_tldr_markdown(discussion_result.content)
-            if not article_text.strip() and not discussion_text.strip():
-                return TldrResult(kind="llm_error", error_text="empty LLM response")
+        good: list[tuple[str, str]] = []
+        for label, result in (
+            ("Article", article_result),
+            ("Discussion", discussion_result),
+        ):
+            if result.ok and (text := _normalize_tldr_markdown(result.content)):
+                good.append((label, text))
+        if len(good) == 2:
             return TldrResult(
                 kind="ok",
-                tldr=f"### Article\n{article_text}\n\n### Discussion\n{discussion_text}",
+                tldr="\n\n".join(f"### {label}\n{text}" for label, text in good),
             )
-
-        if article_result.ok and not discussion_result.ok:
+        if len(good) == 1:
+            label, text = good[0]
+            failed = discussion_result if label == "Article" else article_result
             logging.warning(
-                "tldr: discussion call failed (status=%s), salvaging article-only",
-                discussion_result.status,
+                "tldr: %s call failed (status=%s), salvaging %s-only",
+                "discussion" if label == "Article" else "article",
+                failed.status,
+                label.lower(),
             )
-            article_text = _normalize_tldr_markdown(article_result.content)
-            if not article_text.strip():
-                return TldrResult(kind="llm_error", error_text="empty LLM response")
-            return TldrResult(kind="ok", tldr=f"### Article\n{article_text}")
-
-        if not article_result.ok and discussion_result.ok:
-            logging.warning(
-                "tldr: article call failed (status=%s), salvaging discussion-only",
-                article_result.status,
+            return TldrResult(kind="ok", tldr=f"### {label}\n{text}", cacheable=False)
+        if not article_result.ok and not discussion_result.ok:
+            return TldrResult(
+                kind="llm_error",
+                error_status=article_result.status or discussion_result.status,
+                error_text=f"Article: {article_result.content}; Discussion: {discussion_result.content}",
             )
-            discussion_text = _normalize_tldr_markdown(discussion_result.content)
-            if not discussion_text.strip():
-                return TldrResult(kind="llm_error", error_text="empty LLM response")
-            return TldrResult(kind="ok", tldr=f"### Discussion\n{discussion_text}")
+        return TldrResult(kind="llm_error", error_text="empty LLM response")
 
-        return TldrResult(
-            kind="llm_error",
-            error_status=article_result.status or discussion_result.status,
-            error_text=f"Article: {article_result.content}; Discussion: {discussion_result.content}",
-        )
-
-    if article_section and not comments_section:
-        prompt = _load_prompt("article_only_v4.txt").format(
-            title=title,
-            article_section=article_section,
-            budget=_article_budget(len(article_section)),
+    if article_section:
+        name, section = "article_only_v4.txt", article_section
+        prompt = _load_prompt(name).format(
+            title=title, article_section=section, budget=_section_budget(len(section))
         )
     else:
-        prompt = _load_prompt("discussion_only_v4.txt").format(
-            title=title,
-            comments_section=comments_section,
-            budget=_discussion_budget(len(comments_section)),
+        name, section = "discussion_only_v4.txt", comments_section
+        prompt = _load_prompt(name).format(
+            title=title, comments_section=section, budget=_section_budget(len(section))
         )
 
     result = await _call_llm_chat(
@@ -860,10 +846,9 @@ async def generate_detailed_tldr(
         extra=extra,
     )
     if result.ok:
-        tldr_text = _normalize_tldr_markdown(result.content)
-        if not tldr_text.strip():
-            return TldrResult(kind="llm_error", error_text="empty LLM response")
-        return TldrResult(kind="ok", tldr=tldr_text)
+        if text := _normalize_tldr_markdown(result.content):
+            return TldrResult(kind="ok", tldr=text)
+        return TldrResult(kind="llm_error", error_text="empty LLM response")
     return _llm_error_from(result)
 
 
@@ -950,10 +935,7 @@ async def _prefetch_tldrs_for_ranked(
                 top_comments=top_comments,
                 article_body=article_body,
             )
-        if result.kind != "ok":
-            return False
-        db.upsert_tldr_cache(story_id, cache_key, result.tldr)
-        return True
+        return _maybe_cache_tldr(db, story_id, cache_key, result)
 
     results = await asyncio.gather(
         *(_prefetch_one(sid) for sid in story_ids), return_exceptions=True
@@ -2062,6 +2044,51 @@ def _hn_thread_looks_active(story: Story, config: Config, now: float) -> bool:
     return (comment_count / age_hours) >= config.tldr_refresh_min_comments_per_hour
 
 
+def _serve_cached_tldr(
+    cached_tldr: str, story_id: int, cache_key: str, event: str
+) -> Response:
+    """Log + serve an exact-key cache hit (early or post-enrich)."""
+    logging.info(
+        "tldr_detail story_id=%s result=%s cache_key=%s",
+        story_id,
+        event,
+        cache_key[:12],
+    )
+    return _flask_json_response({"ok": True, "tldr": cached_tldr, "cached": True})
+
+
+def _stale_tldr_fallback_response(
+    db: Database, story_id: int, reason: str
+) -> Response | None:
+    stale_tldr = db.get_any_tldr_for_story(story_id)
+    if not stale_tldr:
+        return None
+    logging.info(
+        "tldr_detail story_id=%s result=stale_fallback reason=%s",
+        story_id,
+        reason,
+    )
+    return _flask_json_response(
+        {"ok": True, "tldr": stale_tldr, "cached": True, "stale": True}
+    )
+
+
+def _maybe_cache_tldr(
+    db: Database, story_id: int, cache_key: str, result: TldrResult
+) -> bool:
+    """Persist a generated TLDR unless it's a salvaged half (True=written);
+    caching a half would evict the story's complete TLDR (one row/story)."""
+    if result.kind != "ok" or not result.tldr.strip() or not result.cacheable:
+        logging.warning(
+            "tldr_detail story_id=%s result=partial_not_cached cache_key=%s",
+            story_id,
+            cache_key[:12],
+        )
+        return False
+    db.upsert_tldr_cache(story_id, cache_key, result.tldr)
+    return True
+
+
 def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
     try:
         user = _flask_user(runtime)
@@ -2087,19 +2114,6 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
         if not story:
             return _flask_json_response(
                 {"error": "Story not found in database"}, status=HTTPStatus.NOT_FOUND
-            )
-
-        def _stale_tldr_fallback(reason: str) -> Response | None:
-            stale_tldr = runtime.db.get_any_tldr_for_story(story.id)
-            if not stale_tldr:
-                return None
-            logging.info(
-                "tldr_detail story_id=%s result=stale_fallback reason=%s",
-                story.id,
-                reason,
-            )
-            return _flask_json_response(
-                {"ok": True, "tldr": stale_tldr, "cached": True, "stale": True}
             )
 
         # Recent, high-velocity HN threads bypass the cache hit below and the
@@ -2129,18 +2143,13 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
         )
         cached_tldr = runtime.db.get_tldr_cache(story.id, cache_key)
         if cached_tldr and not needs_active_refresh and not needs_empty_fetch:
-            logging.info(
-                "tldr_detail story_id=%s result=cache_hit cache_key=%s",
-                story.id,
-                cache_key[:12],
-            )
-            return _flask_json_response(
-                {"ok": True, "tldr": cached_tldr, "cached": True}
-            )
+            return _serve_cached_tldr(cached_tldr, story.id, cache_key, "cache_hit")
 
         quota = _acquire_tldr_uncached_quota(runtime, user)
         if not quota.allowed:
-            fallback = _stale_tldr_fallback("quota_denied")
+            fallback = _stale_tldr_fallback_response(
+                runtime.db, story.id, "quota_denied"
+            )
             if fallback:
                 return fallback
             return _flask_rate_limit_response(
@@ -2168,37 +2177,33 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
 
         article_body = story.article_body or article_body
 
+        # reddit/LessWrong-sourced stories missing a half get one remote
+        # enrichment attempt (RSS comments / LW post); anything already
+        # complete, URL-less, or from another source passes through.
         if (
-            story.source.startswith("rss_reddit_")
-            and story.url
+            story.url
             and (not story.self_text or not story.top_comments)
+            and (
+                story.source.startswith("rss_reddit_")
+                or story.source == "rss_lesswrong_com"
+            )
         ):
-            reddit_context = asyncio.run(_fetch_reddit_rss_context(story.url))
-            if reddit_context and (
-                reddit_context.self_text or reddit_context.top_comments
+            if story.source.startswith("rss_reddit_"):
+                remote_context = asyncio.run(_fetch_reddit_rss_context(story.url))
+            else:
+                post_id = _extract_lesswrong_post_id(story.url)
+                remote_context = (
+                    asyncio.run(_fetch_lesswrong_context(post_id)) if post_id else None
+                )
+            if remote_context and (
+                remote_context.self_text or remote_context.top_comments
             ):
                 from pipeline import _merge_source_context
 
                 story = _merge_source_context(
-                    story, reddit_context, article_body, prefer_longer_comments=True
+                    story, remote_context, article_body, prefer_longer_comments=True
                 )
                 runtime.db.upsert_story(story)
-
-        if (
-            story.source == "rss_lesswrong_com"
-            and story.url
-            and (not story.self_text or not story.top_comments)
-        ):
-            post_id = _extract_lesswrong_post_id(story.url)
-            if post_id:
-                lw_context = asyncio.run(_fetch_lesswrong_context(post_id))
-                if lw_context and (lw_context.self_text or lw_context.top_comments):
-                    from pipeline import _merge_source_context
-
-                    story = _merge_source_context(
-                        story, lw_context, article_body, prefer_longer_comments=True
-                    )
-                    runtime.db.upsert_story(story)
 
         if (
             article_body is None
@@ -2278,13 +2283,8 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
         )
         cached_tldr = runtime.db.get_tldr_cache(story.id, cache_key)
         if cached_tldr:
-            logging.info(
-                "tldr_detail story_id=%s result=post_enrich_cache_hit cache_key=%s",
-                story.id,
-                cache_key[:12],
-            )
-            return _flask_json_response(
-                {"ok": True, "tldr": cached_tldr, "cached": True}
+            return _serve_cached_tldr(
+                cached_tldr, story.id, cache_key, "post_enrich_cache_hit"
             )
 
         result = asyncio.run(
@@ -2315,7 +2315,7 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
                 result.error_status,
                 result.error_text,
             )
-            fallback = _stale_tldr_fallback("llm_error")
+            fallback = _stale_tldr_fallback_response(runtime.db, story.id, "llm_error")
             if fallback:
                 return fallback
             if result.error_status == 429:
@@ -2325,13 +2325,16 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             return _flask_json_response(
                 {"error": error}, status=HTTPStatus.SERVICE_UNAVAILABLE
             )
-        runtime.db.upsert_tldr_cache(story.id, cache_key, result.tldr)
+        _maybe_cache_tldr(runtime.db, story.id, cache_key, result)
         logging.info(
             "tldr_detail story_id=%s result=generated cache_key=%s",
             story.id,
             cache_key[:12],
         )
-        return _flask_json_response({"ok": True, "tldr": result.tldr, "cached": False})
+        payload = {"ok": True, "tldr": result.tldr, "cached": False}
+        if not result.cacheable:
+            payload["retryable"] = True
+        return _flask_json_response(payload)
     except Exception:
         logging.exception("Error handling tldr-detail")
         return _flask_json_response(
