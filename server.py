@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import gc
 import hashlib
 import html
@@ -41,19 +40,9 @@ from database import (
     User,
 )
 from pipeline import Config, DEFAULT_ENV_PATH, Embedder, RankedStory, is_hn_source
-from llm_limiter import Priority, limiter as llm_limiter
+from llm_limiter import limiter as llm_limiter
 from reddit_limiter import limiter as reddit_limiter
 from http_fetch import fetch_with_urllib_fallback
-
-# Which llm_limiter lane the *current* async context's LLM calls should use.
-# Set around the outermost call in each caller (_handle_flask_tldr_detail =
-# FOREGROUND [the default], _prefetch_one = BACKGROUND) rather than threaded
-# as a parameter through generate_detailed_tldr/_call_llm_chat, so the many
-# existing tests that monkeypatch those functions with a fixed signature
-# don't need updating for a param they have no reason to know about.
-_llm_priority_ctx: contextvars.ContextVar[Priority] = contextvars.ContextVar(
-    "_llm_priority_ctx", default=Priority.FOREGROUND
-)
 
 ARTICLE_BODY_CHAR_LIMIT = 15_000
 SELF_TEXT_PROMPT_CHAR_LIMIT = 8_000
@@ -209,11 +198,6 @@ class TldrResult:
     tldr: str = ""
     error_status: int | None = None
     error_text: str = ""
-    # True when `tldr` covers only one of the article/discussion halves
-    # because the other half's LLM call failed (see the salvage branches in
-    # generate_detailed_tldr). Callers must not persist a partial result to
-    # tldr_cache — see WORKLOG 2026-09-03.
-    partial: bool = False
 
 
 def _llm_error_from(r: LlmChatResult) -> TldrResult:
@@ -616,44 +600,18 @@ async def _call_llm_chat(
         "max_tokens": max_tokens,
         **(extra or {}),
     }
-    # Priority travels via contextvar rather than a parameter here so the
-    # many existing tests that monkeypatch `_call_llm_chat`/
-    # `generate_detailed_tldr` with a fixed signature don't need updating --
-    # see `_llm_priority_ctx` and its callers (_handle_flask_tldr_detail
-    # sets FOREGROUND, _prefetch_one sets BACKGROUND).
-    priority = _llm_priority_ctx.get()
-    # One deadline for the whole call (all attempts), not per attempt --
-    # otherwise a 429 storm can still occupy a Flask worker for
-    # attempts * default_deadline_seconds (see WORKLOG 2026-09-03 follow-up).
-    deadline = (
-        time.monotonic() + llm_limiter.default_deadline_seconds
-        if llm_limiter.default_deadline_seconds is not None
-        else None
-    )
     try:
         async with httpx.AsyncClient(timeout=45.0) as client:
-            # 2 attempts, down from 4: under a real request budget
-            # (llm_limiter.requests_per_minute) a 429 means our own
-            # accounting disagrees with the provider's, and burning more
-            # attempts just makes that worse.
-            for attempt in range(2):
-                if not await llm_limiter.acquire(priority=priority, deadline=deadline):
-                    return LlmChatResult(
-                        content="LLM request budget exhausted (acquire deadline exceeded)",
-                        ok=False,
-                        status=429,
-                    )
-                try:
-                    resp = await client.post(
-                        base_url,
-                        headers={
-                            "Authorization": f"Bearer {api_key}",
-                            "Content-Type": "application/json",
-                        },
-                        json=payload,
-                    )
-                finally:
-                    llm_limiter.release()
+            for attempt in range(4):
+                await llm_limiter.acquire()
+                resp = await client.post(
+                    base_url,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
                 llm_limiter.record_response(
                     status=resp.status_code,
                     headers=resp.headers,
@@ -664,9 +622,9 @@ async def _call_llm_chat(
                         content=data["choices"][0]["message"]["content"],
                         ok=True,
                     )
-                if resp.status_code == 429 and attempt < 1:
+                if resp.status_code == 429 and attempt < 3:
                     continue
-                if resp.status_code == 503 and attempt < 1:
+                if resp.status_code == 503 and attempt < 3:
                     base = 2 ** (attempt + 1)
                     jitter = random.uniform(0, base * 0.5)
                     delay = _parse_retry_after(
@@ -862,9 +820,7 @@ async def generate_detailed_tldr(
             article_text = _normalize_tldr_markdown(article_result.content)
             if not article_text.strip():
                 return TldrResult(kind="llm_error", error_text="empty LLM response")
-            return TldrResult(
-                kind="ok", tldr=f"### Article\n{article_text}", partial=True
-            )
+            return TldrResult(kind="ok", tldr=f"### Article\n{article_text}")
 
         if not article_result.ok and discussion_result.ok:
             logging.warning(
@@ -874,9 +830,7 @@ async def generate_detailed_tldr(
             discussion_text = _normalize_tldr_markdown(discussion_result.content)
             if not discussion_text.strip():
                 return TldrResult(kind="llm_error", error_text="empty LLM response")
-            return TldrResult(
-                kind="ok", tldr=f"### Discussion\n{discussion_text}", partial=True
-            )
+            return TldrResult(kind="ok", tldr=f"### Discussion\n{discussion_text}")
 
         return TldrResult(
             kind="llm_error",
@@ -913,51 +867,14 @@ async def generate_detailed_tldr(
     return _llm_error_from(result)
 
 
-_tldr_inflight_lock = threading.Lock()
-_tldr_inflight: dict[tuple[int, str], threading.Event] = {}
-
-
-def _claim_tldr_generation(story_id: int, cache_key: str) -> threading.Event | None:
-    """Claim the right to generate a TLDR for (story_id, cache_key).
-
-    Returns None if the caller now owns generation for this exact key (and
-    must call `_release_tldr_generation` in a `finally`). Returns an Event
-    to wait on if another caller already claimed it -- this is what stops
-    concurrent duplicate generations for one story under one cache_key
-    (e.g. the client's active-card open racing its own prefetch and idle
-    other-age prefetch), which is what caused story 49550174 to regenerate
-    3x in 60s and have a good summary overwritten by a 429 salvage. See
-    WORKLOG 2026-09-03 follow-up.
-    """
-    key = (story_id, cache_key)
-    with _tldr_inflight_lock:
-        existing = _tldr_inflight.get(key)
-        if existing is not None:
-            return existing
-        _tldr_inflight[key] = threading.Event()
-        return None
-
-
-def _release_tldr_generation(story_id: int, cache_key: str) -> None:
-    key = (story_id, cache_key)
-    with _tldr_inflight_lock:
-        event = _tldr_inflight.pop(key, None)
-    if event is not None:
-        event.set()
-
-
 async def _prefetch_tldrs_for_ranked(
     ranked_stories: list[RankedStory],
     db: Database,
     per_combo: int,
     stale_per_run: int = 0,
-    config: Config | None = None,
 ) -> int:
     if (per_combo <= 0 and stale_per_run <= 0) or not ranked_stories:
         return 0
-    # Optional so existing callers/tests that predate the coalescing wait
-    # deadline below don't need updating; falls back to Config()'s defaults.
-    config = config or Config()
 
     combo_groups: dict[str, list[int]] = {}
     if per_combo > 0:
@@ -1026,30 +943,14 @@ async def _prefetch_tldrs_for_ranked(
         if db.get_tldr_cache(story_id, cache_key):
             return False
 
-        existing = _claim_tldr_generation(story_id, cache_key)
-        if existing is not None:
-            # A foreground tldr-detail request (or another prefetch pass)
-            # already owns generation for this exact key -- don't duplicate
-            # the LLM calls, just wait for it and skip (it will have
-            # already cached the result if it succeeded).
-            await asyncio.to_thread(
-                existing.wait, config.llm_acquire_deadline_seconds
+        async with sem:
+            result = await generate_detailed_tldr(
+                title,
+                self_text=self_text,
+                top_comments=top_comments,
+                article_body=article_body,
             )
-            return False
-
-        token = _llm_priority_ctx.set(Priority.BACKGROUND)
-        try:
-            async with sem:
-                result = await generate_detailed_tldr(
-                    title,
-                    self_text=self_text,
-                    top_comments=top_comments,
-                    article_body=article_body,
-                )
-        finally:
-            _llm_priority_ctx.reset(token)
-            _release_tldr_generation(story_id, cache_key)
-        if result.kind != "ok" or result.partial:
+        if result.kind != "ok":
             return False
         db.upsert_tldr_cache(story_id, cache_key, result.tldr)
         return True
@@ -1086,12 +987,6 @@ class Handler:
     _cold_stories: list[RankedStory] = []
     _article_fetch_in_flight: set[int] = set()
     _warm_bg_lock = threading.Lock()
-    # Last time _prefetch_tldrs_for_ranked actually ran, guarded by
-    # _warm_bg_lock. _warm_background_tasks is spawned once per dashboard
-    # warm and once per regen, so a burst of warms (e.g. rapid voting)
-    # previously queued one overlapping prefetch pass per warm -- see
-    # WORKLOG 2026-09-03 follow-up.
-    _last_tldr_prefetch_at: float = 0.0
     _render_locks: dict[int, threading.Lock] = {}
     _render_locks_guard = threading.Lock()
     _warmup_requested_versions: dict[int, int] = {}
@@ -1631,24 +1526,7 @@ class Handler:
 
         stale_per_run = config.tldr_prefetch_stale_per_run
         if (per_combo > 0 or stale_per_run > 0) and final:
-            min_interval = config.tldr_prefetch_min_interval_seconds
-            now = time.time()
-            with cls._warm_bg_lock:
-                due = now - cls._last_tldr_prefetch_at >= min_interval
-                if due:
-                    cls._last_tldr_prefetch_at = now
-            if due:
-                asyncio.run(
-                    _prefetch_tldrs_for_ranked(
-                        final, db, per_combo, stale_per_run, config=config
-                    )
-                )
-            else:
-                logging.info(
-                    "tldr_prefetch skipped=debounced last_run_age_s=%.1f min_interval_s=%.1f",
-                    now - cls._last_tldr_prefetch_at,
-                    min_interval,
-                )
+            asyncio.run(_prefetch_tldrs_for_ranked(final, db, per_combo, stale_per_run))
 
 
 _DASHBOARD_CACHE_KEY_PREFIX = "dashboard_"
@@ -2230,20 +2108,6 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
         needs_active_refresh = bool(story.top_comments) and _hn_thread_looks_active(
             story, runtime.config, time.time()
         )
-        min_refresh_interval = runtime.config.tldr_refresh_min_interval_seconds
-        if needs_active_refresh and min_refresh_interval > 0:
-            # A thread stays "active" by this heuristic for its entire
-            # tldr_refresh_recent_hours window, so without a cooldown this
-            # forces a fresh Algolia fetch + LLM regeneration on *every*
-            # view forever -- the busiest stories were structurally the
-            # slowest (see WORKLOG 2026-09-03 follow-up). Skip the forced
-            # refresh if we already regenerated within the last interval.
-            last_generated_at = runtime.db.get_tldr_cache_created_at(story.id)
-            if (
-                last_generated_at is not None
-                and time.time() - last_generated_at < min_refresh_interval
-            ):
-                needs_active_refresh = False
 
         # An HN story with comments on HN but nothing in top_comments (missed
         # prewarm, or prewarm failed) must also bypass the cache hit below —
@@ -2257,13 +2121,12 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
         )
 
         article_body = story.article_body or None
-        pre_enrich_cache_key = _tldr_cache_key(
+        cache_key = _tldr_cache_key(
             title=story.title,
             self_text=story.self_text or "",
             top_comments=story.top_comments or "",
             article_body=article_body or "",
         )
-        cache_key = pre_enrich_cache_key
         cached_tldr = runtime.db.get_tldr_cache(story.id, cache_key)
         if cached_tldr and not needs_active_refresh and not needs_empty_fetch:
             logging.info(
@@ -2413,20 +2276,8 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             top_comments=story.top_comments or "",
             article_body=article_body or "",
         )
-        # A forced refresh (needs_active_refresh / needs_empty_fetch) means
-        # the pre-enrich cache hit above was deliberately bypassed because
-        # the cached content might be stale. If the enrichment steps above
-        # didn't actually change the inputs (fetch failed, or returned the
-        # same content), cache_key comes back identical to
-        # pre_enrich_cache_key — trusting a hit here would silently undo
-        # that bypass and serve the same stale TLDR anyway. Only trust this
-        # lookup when either no forced refresh was needed, or the inputs
-        # actually changed. See WORKLOG 2026-09-03.
         cached_tldr = runtime.db.get_tldr_cache(story.id, cache_key)
-        if cached_tldr and (
-            cache_key != pre_enrich_cache_key
-            or not (needs_active_refresh or needs_empty_fetch)
-        ):
+        if cached_tldr:
             logging.info(
                 "tldr_detail story_id=%s result=post_enrich_cache_hit cache_key=%s",
                 story.id,
@@ -2436,122 +2287,51 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
                 {"ok": True, "tldr": cached_tldr, "cached": True}
             )
 
-        # A concurrent request for this exact story+content may already be
-        # generating (e.g. active-card open racing its own prefetch or idle
-        # other-age prefetch) -- wait for it instead of duplicating the LLM
-        # calls, which is what let one story regenerate 3x in 60s. Loop
-        # (bounded by one overall deadline) rather than waiting once: the
-        # owner's Event wakes every waiter at once, and only one of them
-        # wins the re-claim, so the rest must go back to waiting on the new
-        # owner instead of falling through and generating independently.
-        # See WORKLOG 2026-09-03 follow-up.
-        coalesce_deadline = time.monotonic() + runtime.config.llm_acquire_deadline_seconds
-        existing_generation = _claim_tldr_generation(story.id, cache_key)
-        coalesced = existing_generation is not None
-        while existing_generation is not None:
-            remaining = coalesce_deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            existing_generation.wait(remaining)
-            cached_tldr = runtime.db.get_tldr_cache(story.id, cache_key)
-            if cached_tldr:
-                logging.info(
-                    "tldr_detail story_id=%s result=coalesced_cache_hit cache_key=%s",
-                    story.id,
-                    cache_key[:12],
-                )
-                return _flask_json_response(
-                    {"ok": True, "tldr": cached_tldr, "cached": True}
-                )
-            # The previous owner's generation failed or produced an
-            # un-cacheable partial -- try to claim it ourselves; if someone
-            # else wins the race instead, loop back and wait on them.
-            existing_generation = _claim_tldr_generation(story.id, cache_key)
-
-        owns_generation = existing_generation is None
-        wait_started_at = time.monotonic()
-        try:
-            # Everything through the cache write below stays inside this
-            # try/finally: releasing the claim any earlier (e.g. right
-            # after generation, before upsert_tldr_cache) reopens the exact
-            # race being closed here -- a waiter can wake, find nothing
-            # cached yet, and generate a duplicate of its own.
-            result = asyncio.run(
-                generate_detailed_tldr(
-                    story.title,
-                    self_text=story.self_text or "",
-                    top_comments=story.top_comments or "",
-                    article_body=article_body or "",
-                )
+        result = asyncio.run(
+            generate_detailed_tldr(
+                story.title,
+                self_text=story.self_text or "",
+                top_comments=story.top_comments or "",
+                article_body=article_body or "",
             )
-            generation_ms = (time.monotonic() - wait_started_at) * 1000
-            if result.kind == "no_content":
-                return _flask_json_response(
-                    {
-                        "ok": True,
-                        "tldr": "No article body or discussion available to summarize for this story.",
-                        "cached": False,
-                        # Not persisted to tldr_cache: a later retry (e.g.
-                        # after a transient upstream 429 clears) may find
-                        # real content, so the client must not treat this
-                        # as a final answer.
-                        "retryable": True,
-                    }
-                )
-            if result.kind == "llm_error":
-                logging.warning(
-                    "tldr_detail story_id=%s result=llm_error cache_key=%s status=%s "
-                    "error=%s generation_ms=%.0f coalesced=%s",
-                    story.id,
-                    cache_key[:12],
-                    result.error_status,
-                    result.error_text,
-                    generation_ms,
-                    coalesced,
-                )
-                fallback = _stale_tldr_fallback("llm_error")
-                if fallback:
-                    return fallback
-                if result.error_status == 429:
-                    error = "Rate limit exceeded. Please try again in a moment."
-                else:
-                    error = "Failed to generate TLDR. Please try again later."
-                return _flask_json_response(
-                    {"error": error}, status=HTTPStatus.SERVICE_UNAVAILABLE
-                )
-            if result.partial:
-                # A salvaged half (one of the two concurrent LLM calls hit
-                # a 429) must never overwrite tldr_cache — upsert_tldr_cache
-                # deletes the prior row unconditionally, so caching this
-                # would destroy a previously complete TLDR and then serve
-                # the partial forever. Return it for this request only; the
-                # next request retries from scratch. See WORKLOG 2026-09-03.
-                logging.warning(
-                    "tldr_detail story_id=%s result=partial_not_cached cache_key=%s "
-                    "generation_ms=%.0f coalesced=%s",
-                    story.id,
-                    cache_key[:12],
-                    generation_ms,
-                    coalesced,
-                )
-                return _flask_json_response(
-                    {"ok": True, "tldr": result.tldr, "cached": False, "partial": True}
-                )
-            runtime.db.upsert_tldr_cache(story.id, cache_key, result.tldr)
-            logging.info(
-                "tldr_detail story_id=%s result=generated cache_key=%s "
-                "generation_ms=%.0f coalesced=%s",
+        )
+        if result.kind == "no_content":
+            return _flask_json_response(
+                {
+                    "ok": True,
+                    "tldr": "No article body or discussion available to summarize for this story.",
+                    "cached": False,
+                    # Not persisted to tldr_cache: a later retry (e.g. after
+                    # a transient upstream 429 clears) may find real content,
+                    # so the client must not treat this as a final answer.
+                    "retryable": True,
+                }
+            )
+        if result.kind == "llm_error":
+            logging.warning(
+                "tldr_detail story_id=%s result=llm_error cache_key=%s status=%s error=%s",
                 story.id,
                 cache_key[:12],
-                generation_ms,
-                coalesced,
+                result.error_status,
+                result.error_text,
             )
+            fallback = _stale_tldr_fallback("llm_error")
+            if fallback:
+                return fallback
+            if result.error_status == 429:
+                error = "Rate limit exceeded. Please try again in a moment."
+            else:
+                error = "Failed to generate TLDR. Please try again later."
             return _flask_json_response(
-                {"ok": True, "tldr": result.tldr, "cached": False}
+                {"error": error}, status=HTTPStatus.SERVICE_UNAVAILABLE
             )
-        finally:
-            if owns_generation:
-                _release_tldr_generation(story.id, cache_key)
+        runtime.db.upsert_tldr_cache(story.id, cache_key, result.tldr)
+        logging.info(
+            "tldr_detail story_id=%s result=generated cache_key=%s",
+            story.id,
+            cache_key[:12],
+        )
+        return _flask_json_response({"ok": True, "tldr": result.tldr, "cached": False})
     except Exception:
         logging.exception("Error handling tldr-detail")
         return _flask_json_response(
@@ -2851,17 +2631,6 @@ def main() -> None:
     _quiet_third_party_loggers()
     load_env()
     config = Config.load()
-    llm_limiter.min_spacing_seconds = config.llm_min_request_spacing_seconds
-    llm_limiter.requests_per_minute = config.llm_requests_per_minute or None
-    llm_limiter.max_concurrency = config.llm_max_concurrency or None
-    llm_limiter.background_reserve_fraction = config.llm_background_reserve_fraction
-    llm_limiter.default_deadline_seconds = config.llm_acquire_deadline_seconds or None
-    # reset() re-derives the token bucket's starting capacity from
-    # requests_per_minute -- without this the bucket stays at its
-    # construction-time value (0 tokens, since the module-level `limiter`
-    # is built with no budget configured) and the first minute of calls
-    # would wait to "refill" from empty instead of starting at full budget.
-    llm_limiter.reset()
     db = Database(config.db_path)
 
     regen_event = threading.Event()

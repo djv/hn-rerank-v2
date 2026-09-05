@@ -894,7 +894,7 @@
     const feedbackChains = new Map();
     const MAX_QUEUE = 12;
     const PREFETCH_COUNT = 2;
-    const IDLE_INACTIVE_PREFETCH_COUNT = 1;
+    const IDLE_INACTIVE_PREFETCH_COUNT = 2;
     const tldrCache = new Map(); // storyId (number) → raw TLDR markdown (string)
     let idleAgePrefetchHandle = null;
     let toastTimer = null;
@@ -1686,7 +1686,11 @@
     });
 
     function prefetchUpcomingTldrs() {
-      queuedCards().slice(0, PREFETCH_COUNT).forEach(enqueueTldrPrefetch);
+      queuedCards().slice(0, PREFETCH_COUNT).forEach(card => {
+        if (!card.querySelector('.tldr-detail-content')) {
+          openTldrDetail(card);
+        }
+      });
     }
 
     function cardsForAge(age) {
@@ -1704,15 +1708,13 @@
       const otherAge = currentAge === 'recent' ? 'archive' : 'recent';
       const run = () => {
         idleAgePrefetchHandle = null;
-        // Only top up the other-age deck once the upcoming-cards prefetch
-        // has drained -- this is the lowest-priority fetch, not one that
-        // should compete with it for the same request budget.
-        if (tldrPrefetchQueue.length > 0) {
-          return;
-        }
         cardsForAge(otherAge)
           .slice(0, IDLE_INACTIVE_PREFETCH_COUNT)
-          .forEach(enqueueTldrPrefetch);
+          .forEach(card => {
+            if (!card.querySelector('.tldr-detail-content')) {
+              openTldrDetail(card);
+            }
+          });
       };
       if ('requestIdleCallback' in window) {
         idleAgePrefetchHandle = window.requestIdleCallback(run, { timeout: 2500 });
@@ -1885,15 +1887,7 @@
       window.open(url, '_blank', 'noopener,noreferrer');
     }
 
-    // Story ids with an in-flight /api/tldr-detail request, regardless of
-    // whether it's the foreground open or a background prefetch -- without
-    // this, the active-card open, its upcoming-cards prefetch, and the idle
-    // other-age prefetch could all request the *same* card at once (see
-    // openTldrDetailQueue below for the broader fan-out fix).
-    const tldrInFlight = new Set();
-    let foregroundTldrInFlight = false;
-
-    async function openTldrDetail(card, { background = false } = {}) {
+    async function openTldrDetail(card) {
       if (!card) {
         return;
       }
@@ -1906,9 +1900,6 @@
         return;
       }
       if (contentDiv && contentDiv.style.display !== 'none' && !contentDiv.dataset.error) {
-        return;
-      }
-      if (tldrInFlight.has(storyId)) {
         return;
       }
       if (!contentDiv) {
@@ -1929,10 +1920,6 @@
       contentDiv.textContent = 'Loading TLDR...';
       contentDiv.style.display = 'block';
       contentDiv.dataset.loading = 'true';
-      tldrInFlight.add(storyId);
-      if (!background) {
-        foregroundTldrInFlight = true;
-      }
 
       const detailApiPath = apiPath('/api/tldr-detail');
       try {
@@ -1943,13 +1930,12 @@
         });
         if (resp.ok) {
           const data = await resp.json();
-          if (data.retryable || data.stale || data.partial) {
+          if (data.retryable || data.stale) {
             // Provisional content: a transient no-content attempt
-            // (retryable), a stale/quota fallback summary (stale), or a
-            // salvaged article-only/discussion-only half (partial, from a
-            // 429 on the other half) - don't cache it as final, so the next
-            // open (card re-click, filter switch, next-card cycle) retries
-            // instead of showing this placeholder/partial summary forever.
+            // (retryable) or a stale/quota fallback summary (stale) -
+            // don't cache it as final, so the next open (card re-click,
+            // filter switch, next-card cycle) retries instead of showing
+            // this placeholder/stale summary forever.
             contentDiv.dataset.error = 'true';
           } else {
             tldrCache.set(storyId, data.tldr);
@@ -1973,48 +1959,6 @@
         console.error(err);
       } finally {
         delete contentDiv.dataset.loading;
-        tldrInFlight.delete(storyId);
-        if (!background) {
-          foregroundTldrInFlight = false;
-          runTldrPrefetchQueue();
-        }
-      }
-    }
-
-    // A single sequential queue for prefetch requests (upcoming cards +
-    // idle other-age cards), run one at a time and paused entirely while a
-    // foreground open is in flight. Before this, one vote could fire up to
-    // 5 concurrent /api/tldr-detail requests (active card + PREFETCH_COUNT
-    // upcoming + IDLE_INACTIVE_PREFETCH_COUNT idle), each 2 LLM calls --
-    // exactly the burst that caused self-inflicted 429s server-side. See
-    // WORKLOG 2026-09-03 follow-up.
-    const tldrPrefetchQueue = [];
-    let tldrPrefetchQueueRunning = false;
-
-    function enqueueTldrPrefetch(card) {
-      if (!card) return;
-      const storyId = Number(card.dataset.storyId);
-      if (tldrInFlight.has(storyId) || card.querySelector('.tldr-detail-content')) {
-        return;
-      }
-      if (tldrPrefetchQueue.includes(card)) return;
-      tldrPrefetchQueue.push(card);
-      runTldrPrefetchQueue();
-    }
-
-    async function runTldrPrefetchQueue() {
-      if (tldrPrefetchQueueRunning || foregroundTldrInFlight) return;
-      tldrPrefetchQueueRunning = true;
-      try {
-        while (tldrPrefetchQueue.length && !foregroundTldrInFlight) {
-          const card = tldrPrefetchQueue.shift();
-          if (!card.isConnected || card.querySelector('.tldr-detail-content')) {
-            continue;
-          }
-          await openTldrDetail(card, { background: true });
-        }
-      } finally {
-        tldrPrefetchQueueRunning = false;
       }
     }
 

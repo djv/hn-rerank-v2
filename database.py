@@ -832,18 +832,6 @@ class Database:
             ).fetchall()
             return {row[0]: row[1] for row in rows}
 
-    def get_tldr_cache_created_at(self, story_id: int) -> float | None:
-        """When the story's current tldr_cache row (if any) was written,
-        regardless of cache_key -- used to throttle forced active-thread
-        refreshes (see server.py::_hn_thread_looks_active) so a hot story
-        doesn't force a fresh LLM generation on every single view."""
-        with self.conn() as conn:
-            row = conn.execute(
-                "SELECT created_at FROM tldr_cache WHERE story_id = ?",
-                (story_id,),
-            ).fetchone()
-            return row[0] if row else None
-
     def upsert_tldr_cache(self, story_id: int, cache_key: str, tldr: str) -> None:
         with self.conn() as conn:
             with conn:
