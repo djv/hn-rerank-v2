@@ -661,8 +661,8 @@ class LlmProviderConfig:
 
 
 # Provider table: name → (key env var, chat-completions endpoint, default
-# model, extra payload). Mistral remains the paid default; Zen is selected
-# explicitly for the tested free TLDR deployment.
+# model, extra payload). Zen is the free default; other providers are explicit
+# opt-ins for targeted testing or deployments.
 _LLM_PROVIDERS: dict[str, tuple[str, str, str, dict[str, object]]] = {
     "mistral": (
         "MISTRAL_API_KEY",
@@ -698,7 +698,7 @@ _LLM_PROVIDERS: dict[str, tuple[str, str, str, dict[str, object]]] = {
 
 
 def _llm_provider_config() -> LlmProviderConfig:
-    provider = os.environ.get("LLM_PROVIDER", "mistral").lower()
+    provider = os.environ.get("LLM_PROVIDER", "zen").lower()
     if provider not in _LLM_PROVIDERS:
         raise ValueError(f"Unsupported LLM_PROVIDER: {provider}")
     key_env, base_url, model, extra = _LLM_PROVIDERS[provider]

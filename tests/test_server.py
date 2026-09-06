@@ -3844,7 +3844,7 @@ def test_llm_provider_config_unknown_is_rejected(monkeypatch) -> None:
 
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
     monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
-    assert server._llm_provider_config().provider == "mistral"
+    assert server._llm_provider_config().provider == "zen"
 
     monkeypatch.setenv("LLM_PROVIDER", "not-a-provider")
     with pytest.raises(ValueError, match="Unsupported LLM_PROVIDER"):

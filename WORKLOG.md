@@ -16,7 +16,8 @@ Append-only log of notable changes, fixes, and operational events.
 - Added explicit `zen` provider configuration for the tested free
   `ling-3.0-flash-fin-free` model and its larger reasoning budget. Unknown
   provider names now fail at configuration instead of silently switching
-  models.
+  models. Zen is also the code default, so an omitted provider cannot select a
+  paid model accidentally.
 - Validation from the 15-story real-data benchmark: Zen Ling completed
   15/15 article-plus-comment stories in 109 seconds with one transient 503
   retry. Groq GPT-OSS 20B also completed 15/15 but required 14.5 minutes at
