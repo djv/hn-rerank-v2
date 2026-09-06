@@ -2,6 +2,29 @@
 
 Append-only log of notable changes, fixes, and operational events.
 
+## 2026-09-06 — TLDR cleanup and free Zen provider
+
+- Removed inactive-age-tab TLDR prefetch. It consumed shared LLM capacity
+  without helping the next card, so only the active queue lookahead and
+  ranked background prefetch remain.
+- Removed contradictory prompt wording that required topic headings while
+  also requiring every output line to begin with a bullet.
+- LLM responses now carry `finish_reason` and are accepted only when they
+  are non-empty, non-truncated, and contain bullet content. Invalid 200
+  responses cannot enter the cache; partial article/comment salvage remains
+  retryable and uncached.
+- Added explicit `zen` provider configuration for the tested free
+  `ling-3.0-flash-fin-free` model and its larger reasoning budget. Unknown
+  provider names now fail at configuration instead of silently switching
+  models.
+- Validation from the 15-story real-data benchmark: Zen Ling completed
+  15/15 article-plus-comment stories in 109 seconds with one transient 503
+  retry. Groq GPT-OSS 20B also completed 15/15 but required 14.5 minutes at
+  safe free-tier pacing. A later strict-validation rerun hit transient 503
+  saturation on one story; its direct retry succeeded. These results support
+  Zen as the free deployment default; they do not imply every free endpoint is
+  reliable.
+
 ## 2026-09-05 — finish TLDR queue prefetch and cache hardening
 
 - Browser lookahead now requests the next two cards after the active card,

@@ -894,9 +894,7 @@
     const feedbackChains = new Map();
     const MAX_QUEUE = 12;
     const PREFETCH_COUNT = 2;
-    const IDLE_INACTIVE_PREFETCH_COUNT = 2;
     const tldrCache = new Map(); // storyId (number) → raw TLDR markdown (string)
-    let idleAgePrefetchHandle = null;
     let toastTimer = null;
     let refillInFlight = false;
     let queuedRefillAdvance = null;
@@ -1126,7 +1124,6 @@
       }
       updateQueueLoading();
       prefetchUpcomingTldrs();
-      scheduleIdleAgePrefetch();
     }
 
     document.addEventListener('visibilitychange', () => {
@@ -1215,7 +1212,6 @@
         showNextCard({ allowRefresh: false, excludeActive: true });
         focusActiveCard();
         scheduleDeckRefresh({ advance: true });
-        scheduleIdleAgePrefetch();
         return;
       }
 
@@ -1230,7 +1226,6 @@
         showNextCard({ allowRefresh: false });
         focusActiveCard();
         scheduleDeckRefresh({ advance: true });
-        scheduleIdleAgePrefetch();
         return;
       }
 
@@ -1658,7 +1653,6 @@
         showNextCard({ allowRefresh: false });
       } else {
         prefetchUpcomingTldrs();
-        scheduleIdleAgePrefetch();
       }
     }
 
@@ -1713,22 +1707,6 @@
         if (age === 'archive') return card.dataset.isRecent === '0';
         return card.dataset.isRecent === '1';
       });
-    }
-
-    function scheduleIdleAgePrefetch() {
-      if (idleAgePrefetchHandle) {
-        return;
-      }
-      const otherAge = currentAge === 'recent' ? 'archive' : 'recent';
-      const run = () => {
-        idleAgePrefetchHandle = null;
-        prefetchCards(cardsForAge(otherAge).slice(0, IDLE_INACTIVE_PREFETCH_COUNT));
-      };
-      if ('requestIdleCallback' in window) {
-        idleAgePrefetchHandle = window.requestIdleCallback(run, { timeout: 2500 });
-      } else {
-        idleAgePrefetchHandle = window.setTimeout(run, 1500);
-      }
     }
 
     function sendFeedback(storyId, action) {

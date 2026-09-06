@@ -6,7 +6,6 @@ Use a FLAT structure — no nested list levels. If a sub-topic has multiple bull
 - Users compare this to...
 - **Precedent exists** in...
 (NOT `- **Criticism of US control**:` followed by siblings.)
-Every non-empty output line must start with "- ".
 Use **bold** key terms.
 Keep each bullet to one short sentence.
 

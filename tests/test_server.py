@@ -3802,6 +3802,13 @@ async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
             {},
             "openrouter.ai",
         ),
+        (
+            "zen",
+            "OPENCODE_ZEN_API_KEY",
+            "ling-3.0-flash-fin-free",
+            {},
+            "opencode.ai",
+        ),
     ],
 )
 def test_llm_provider_config_table(
@@ -3832,7 +3839,7 @@ def test_llm_provider_config_table(
     assert server._llm_provider_config().model == "custom-model"
 
 
-def test_llm_provider_config_unknown_falls_back_to_mistral(monkeypatch) -> None:
+def test_llm_provider_config_unknown_is_rejected(monkeypatch) -> None:
     import server
 
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
@@ -3840,18 +3847,43 @@ def test_llm_provider_config_unknown_falls_back_to_mistral(monkeypatch) -> None:
     assert server._llm_provider_config().provider == "mistral"
 
     monkeypatch.setenv("LLM_PROVIDER", "not-a-provider")
-
-    cfg = server._llm_provider_config()
-
-    assert cfg.provider == "mistral"
-    assert cfg.model == "mistral-small-latest"
+    with pytest.raises(ValueError, match="Unsupported LLM_PROVIDER"):
+        server._llm_provider_config()
 
 
-def test_cerebras_max_tokens_adds_buffer_only_with_reasoning_effort() -> None:
+def test_provider_max_tokens_reserves_reasoning_headroom() -> None:
     import server
 
-    assert server._cerebras_max_tokens(900, {"reasoning_effort": "low"}) == 1500
-    assert server._cerebras_max_tokens(900, {}) == 900
+    cerebras = server.LlmProviderConfig(
+        "cerebras", "key", "https://example.test", "model", {"reasoning_effort": "low"}
+    )
+    mistral = server.LlmProviderConfig(
+        "mistral", "key", "https://example.test", "model", {}
+    )
+    zen = server.LlmProviderConfig(
+        "zen", "key", "https://example.test", "model", {}
+    )
+    assert server._max_tokens_for_provider(cerebras, 900) == 1500
+    assert server._max_tokens_for_provider(mistral, 900) == 900
+    assert server._max_tokens_for_provider(zen, 900) == 8192
+
+
+@pytest.mark.parametrize(
+    ("content", "finish_reason", "valid"),
+    [
+        ("- one bullet", "stop", True),
+        ("- one bullet", None, True),
+        ("#### Heading only", "stop", False),
+        ("- partial", "length", False),
+        ("", "stop", False),
+    ],
+)
+def test_llm_completion_validation(
+    content: str, finish_reason: str | None, valid: bool
+) -> None:
+    import server
+
+    assert server._valid_llm_completion(content, finish_reason) is valid
 
 
 @pytest.mark.asyncio
@@ -3942,7 +3974,7 @@ async def test_call_llm_chat_uses_limiter(monkeypatch):
         text = '{"ok": true}'
 
         def json(self):
-            return {"choices": [{"message": {"content": "summary"}}]}
+            return {"choices": [{"message": {"content": "- summary"}, "finish_reason": "stop"}]}
 
     class FakeClient:
         def __init__(self, *, timeout):
@@ -3969,7 +4001,7 @@ async def test_call_llm_chat_uses_limiter(monkeypatch):
         max_tokens=10,
     )
 
-    assert result.content == "summary"
+    assert result.content == "- summary"
     assert result.ok is True
     assert calls == [
         ("acquire", None),
@@ -4658,7 +4690,8 @@ def test_setFilter_preserves_sort_age_source_refresh_behavior() -> None:
     assert "popularTab.disabled = (value === 'non-hn')" in body
     assert "currentSort = 'recommended'" in body
     assert "updateFilterTabs('sort', currentSort)" in body
-    assert "scheduleIdleAgePrefetch()" in body
+    assert "scheduleIdleAgePrefetch()" not in body
+    assert "scheduleIdleAgePrefetch" not in static
     assert "FILTERS" in static
     assert "refillQueued" not in body
     assert "refillWhenReady" not in body

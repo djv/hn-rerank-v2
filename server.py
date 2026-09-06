@@ -190,6 +190,7 @@ class LlmChatResult:
     content: str
     ok: bool
     status: int | None = None
+    finish_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -621,9 +622,13 @@ async def _call_llm_chat(
                 )
                 if resp.status_code == 200:
                     data = resp.json()
+                    choice = data["choices"][0]
+                    content = choice["message"].get("content") or ""
+                    finish_reason = choice.get("finish_reason")
                     return LlmChatResult(
-                        content=data["choices"][0]["message"]["content"],
-                        ok=True,
+                        content=content,
+                        ok=_valid_llm_completion(content, finish_reason),
+                        finish_reason=finish_reason,
                     )
                 if resp.status_code == 429 and attempt < 3:
                     continue
@@ -656,9 +661,8 @@ class LlmProviderConfig:
 
 
 # Provider table: name → (key env var, chat-completions endpoint, default
-# model, extra payload). mistral is the default; cerebras's free tier
-# 429s under prewarm (WORKLOG 2026-07-10). gpt-oss-120b burns max_tokens on
-# hidden reasoning, hence reasoning_effort + _cerebras_max_tokens headroom.
+# model, extra payload). Mistral remains the paid default; Zen is selected
+# explicitly for the tested free TLDR deployment.
 _LLM_PROVIDERS: dict[str, tuple[str, str, str, dict[str, object]]] = {
     "mistral": (
         "MISTRAL_API_KEY",
@@ -684,15 +688,22 @@ _LLM_PROVIDERS: dict[str, tuple[str, str, str, dict[str, object]]] = {
         "meta-llama/llama-3.3-70b-instruct",
         {},
     ),
+    "zen": (
+        "OPENCODE_ZEN_API_KEY",
+        "https://opencode.ai/zen/v1/chat/completions",
+        "ling-3.0-flash-fin-free",
+        {},
+    ),
 }
 
 
 def _llm_provider_config() -> LlmProviderConfig:
     provider = os.environ.get("LLM_PROVIDER", "mistral").lower()
-    name = provider if provider in _LLM_PROVIDERS else "mistral"
-    key_env, base_url, model, extra = _LLM_PROVIDERS[name]
+    if provider not in _LLM_PROVIDERS:
+        raise ValueError(f"Unsupported LLM_PROVIDER: {provider}")
+    key_env, base_url, model, extra = _LLM_PROVIDERS[provider]
     return LlmProviderConfig(
-        provider=name,
+        provider=provider,
         api_key=os.environ.get(key_env),
         base_url=base_url,
         model=os.environ.get("LLM_MODEL", model),
@@ -700,12 +711,20 @@ def _llm_provider_config() -> LlmProviderConfig:
     )
 
 
-def _cerebras_max_tokens(base: int, extra: dict[str, object]) -> int:
-    # gpt-oss-120b spends some of max_tokens on hidden reasoning before the
-    # visible answer; without headroom it can return an empty completion
-    # with finish_reason="length". A flat buffer is enough at
-    # reasoning_effort="low" (see WORKLOG 2026-07-10 benchmark).
-    return base + 600 if "reasoning_effort" in extra else base
+def _max_tokens_for_provider(cfg: LlmProviderConfig, base: int) -> int:
+    if cfg.provider == "zen":
+        # Ling's free endpoint spends a large, variable amount on reasoning.
+        return 8_192
+    if cfg.provider == "cerebras" and "reasoning_effort" in cfg.extra:
+        return base + 600
+    return base
+
+
+def _valid_llm_completion(content: str, finish_reason: str | None) -> bool:
+    """Accept only complete, substantive bullet output from real providers."""
+    if finish_reason == "length" or not content.strip():
+        return False
+    return bool(re.search(r"^\s*[-*]\s+\S", content, re.MULTILINE))
 
 
 def _llm_cache_identity() -> str:
@@ -784,7 +803,7 @@ async def generate_detailed_tldr(
                 base_url=base_url,
                 model=model,
                 prompt=article_prompt,
-                max_tokens=_cerebras_max_tokens(900, extra),
+                max_tokens=_max_tokens_for_provider(cfg, 900),
                 extra=extra,
             ),
             _call_llm_chat(
@@ -792,7 +811,7 @@ async def generate_detailed_tldr(
                 base_url=base_url,
                 model=model,
                 prompt=discussion_prompt,
-                max_tokens=_cerebras_max_tokens(900, extra),
+                max_tokens=_max_tokens_for_provider(cfg, 900),
                 extra=extra,
             ),
         )
@@ -842,7 +861,7 @@ async def generate_detailed_tldr(
         base_url=base_url,
         model=model,
         prompt=prompt,
-        max_tokens=_cerebras_max_tokens(2000, extra),
+        max_tokens=_max_tokens_for_provider(cfg, 2000),
         extra=extra,
     )
     if result.ok:
