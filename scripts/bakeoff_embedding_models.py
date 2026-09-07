@@ -12,6 +12,8 @@ import argparse
 import hashlib
 import json
 import sys
+import shutil
+from unittest.mock import patch
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -39,6 +41,10 @@ from scripts.eval_ranker_variants import (  # noqa: E402
     _embedding_text_hashes,
     _snapshot_candidate_stories,
     _snapshot_feedback,
+    _snapshot_context,
+    _db_sha256,
+    _validated_embeddings,
+    frozen_database,
 )
 
 
@@ -188,7 +194,15 @@ def _snapshot_path(output_dir: Path, name: str, max_tokens: int) -> Path:
     return output_dir / f"{name}-tokens{max_tokens}.npz"
 
 
-def _snapshot_matches(path: Path, stories: list[Story]) -> bool:
+def _snapshot_matches(
+    path: Path,
+    stories: list[Story],
+    feedback_stories: list[Story],
+    labels: list[int],
+    vote_times: list[float],
+    database_sha256: str,
+    evaluation_time: float,
+) -> bool:
     if not path.exists():
         return False
     try:
@@ -201,9 +215,29 @@ def _snapshot_matches(path: Path, stories: list[Story]) -> bool:
                 "feedback_stories_json",
                 "feedback_labels",
                 "feedback_vote_times",
+                "feedback_embeddings",
+                "database_sha256",
+                "evaluation_time",
+                "database_snapshot",
+                "config_json",
+                "user_id",
             }
             if not required <= set(data.files):
                 return False
+            _validated_embeddings(
+                stories,
+                dict(zip([s.id for s in stories], data["embeddings"], strict=True)),
+            )
+            _validated_embeddings(
+                feedback_stories,
+                dict(
+                    zip(
+                        [s.id for s in feedback_stories],
+                        data["feedback_embeddings"],
+                        strict=True,
+                    )
+                ),
+            )
             return (
                 np.array_equal(
                     np.asarray(data["story_ids"], dtype=np.int64),
@@ -214,6 +248,16 @@ def _snapshot_matches(path: Path, stories: list[Story]) -> bool:
                     _embedding_text_hashes(stories),
                 )
                 and np.asarray(data["embeddings"]).shape == (len(stories), 384)
+                and np.asarray(data["feedback_embeddings"]).shape
+                == (len(feedback_stories), 384)
+                and np.array_equal(data["feedback_labels"], labels)
+                and np.array_equal(data["feedback_vote_times"], vote_times)
+                and str(data["feedback_stories_json"].item())
+                == json.dumps(
+                    [asdict(s) for s in feedback_stories], separators=(",", ":")
+                )
+                and str(data["database_sha256"].item()) == database_sha256
+                and float(data["evaluation_time"].item()) == evaluation_time
             )
     except (KeyError, OSError, ValueError):
         return False
@@ -223,7 +267,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Create 384-dimensional ONNX embedding snapshots for model bakeoff."
     )
-    parser.add_argument("--config", default="config.toml")
+    parser.add_argument("--config", help="Configuration file; defaults to config.toml")
     parser.add_argument("--user-id", type=int)
     parser.add_argument(
         "--reference-snapshot",
@@ -250,41 +294,71 @@ def main() -> None:
         type=int,
         help="Deterministic candidate cap matching eval_ranker_variants.py.",
     )
-    parser.add_argument("--output-dir", type=Path, default=Path("/tmp/hn-rewrite-embedding-bakeoff"))
+    parser.add_argument(
+        "--output-dir", type=Path, default=Path("/tmp/hn-rewrite-embedding-bakeoff")
+    )
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
+    if args.max_candidates is not None and args.max_candidates <= 0:
+        raise SystemExit("--max-candidates must be positive")
     if args.batch_size <= 0:
         raise SystemExit("--batch-size must be positive")
+    if args.reference_snapshot is not None and args.config is not None:
+        raise SystemExit(
+            "--config cannot override a reference snapshot's frozen configuration"
+        )
     if args.reference_snapshot is not None and args.max_candidates is not None:
-        raise SystemExit("--reference-snapshot cannot be combined with --max-candidates")
+        raise SystemExit(
+            "--reference-snapshot cannot be combined with --max-candidates"
+        )
 
-    config = Config.load(args.config)
+    config = Config.load(args.config or "config.toml")
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    evaluation_time = time.time()
     user_id: int | None = args.user_id
     if args.reference_snapshot is not None:
+        config, evaluation_time, database_snapshot = _snapshot_context(
+            args.reference_snapshot
+        )
+        with np.load(args.reference_snapshot, allow_pickle=False) as data:
+            snapshot_user_id = int(data["user_id"].item())
+        if user_id is not None and user_id != snapshot_user_id:
+            raise ValueError("--user-id does not match the reference snapshot")
+        user_id = snapshot_user_id
         stories = _snapshot_candidate_stories(args.reference_snapshot)
         feedback_stories, feedback_labels_array, feedback_vote_times_array = (
             _snapshot_feedback(args.reference_snapshot)
         )
         feedback_labels = [int(label) for label in feedback_labels_array]
-        feedback_vote_times = [float(vote_time) for vote_time in feedback_vote_times_array]
+        feedback_vote_times = [
+            float(vote_time) for vote_time in feedback_vote_times_array
+        ]
+        database_sha256 = _db_sha256(database_snapshot)
     else:
-        db = Database(config.db_path, read_only=True)
-        try:
+        with frozen_database(config.db_path) as (db, database_sha256):
             if user_id is None:
                 user = db.get_user_by_token("default")
                 if user is None:
                     raise SystemExit("Missing default user token; pass --user-id")
                 user_id = user.id
-            stories, feedback_stories, feedback_labels, feedback_vote_times = (
-                _candidate_stories(db, config, user_id, args.max_candidates)
+            with patch("time.time", return_value=evaluation_time):
+                stories, feedback_stories, feedback_labels, feedback_vote_times = (
+                    _candidate_stories(db, config, user_id, args.max_candidates)
+                )
+            database_snapshot = str(
+                (args.output_dir / f"inputs-{database_sha256}.sqlite").resolve()
             )
-        finally:
-            db.close()
+            if not Path(database_snapshot).exists():
+                shutil.copyfile(db.db_path, database_snapshot)
+            elif _db_sha256(database_snapshot) != database_sha256:
+                raise ValueError("Existing input snapshot hash mismatch")
     if not stories:
         raise SystemExit("No production candidate stories found")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    texts = [story_embedding_text(story) for story in stories]
+    all_stories = list({s.id: s for s in stories + feedback_stories}.values())
+    texts = [story_embedding_text(story) for story in all_stories]
+    all_index = {s.id: i for i, s in enumerate(all_stories)}
     story_ids = np.array([story.id for story in stories], dtype=np.int64)
     text_hashes = _embedding_text_hashes(stories)
     feedback_story_ids = np.array(
@@ -298,7 +372,9 @@ def main() -> None:
         "batch_size": args.batch_size,
         "max_candidates": args.max_candidates,
         "reference_snapshot": (
-            str(args.reference_snapshot) if args.reference_snapshot is not None else None
+            str(args.reference_snapshot)
+            if args.reference_snapshot is not None
+            else None
         ),
         "models": model_results,
     }
@@ -306,7 +382,15 @@ def main() -> None:
     for name in args.models:
         spec = MODELS[name]
         path = _snapshot_path(args.output_dir, name, args.max_tokens)
-        if not args.force and _snapshot_matches(path, stories):
+        if not args.force and _snapshot_matches(
+            path,
+            stories,
+            feedback_stories,
+            feedback_labels,
+            feedback_vote_times,
+            database_sha256,
+            evaluation_time,
+        ):
             print(f"{name}: reusing {path}")
             model_results.append({"name": name, "snapshot": str(path), "reused": True})
             continue
@@ -320,7 +404,7 @@ def main() -> None:
             max_tokens=args.max_tokens,
             batch_size=args.batch_size,
         )
-        if embeddings.shape != (len(stories), 384):
+        if embeddings.shape != (len(all_stories), 384):
             raise RuntimeError(
                 f"{name} emitted {embeddings.shape}; this bakeoff only supports 384 dimensions"
             )
@@ -328,7 +412,13 @@ def main() -> None:
             path,
             story_ids=story_ids,
             text_hashes=text_hashes,
-            embeddings=embeddings,
+            embeddings=embeddings[[all_index[s.id] for s in stories]],
+            feedback_embeddings=embeddings[[all_index[s.id] for s in feedback_stories]],
+            config_json=np.array(json.dumps(asdict(config), sort_keys=True)),
+            evaluation_time=np.array(evaluation_time),
+            user_id=np.array(user_id),
+            database_snapshot=np.array(database_snapshot),
+            database_sha256=np.array(database_sha256),
             stories_json=np.array(
                 json.dumps([asdict(story) for story in stories], separators=(",", ":"))
             ),

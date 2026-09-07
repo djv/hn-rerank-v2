@@ -62,6 +62,8 @@ def _process_rss_kb() -> int | None:
 # (number / semantics of meta columns appended to the embedding) changes;
 # the cache key then changes for every user, forcing a clean re-fit.
 _MODEL_CACHE_STORAGE_MAXSIZE = 10_000
+
+
 # Cached value: (svm, scaler, positive_cluster_centers). The centers depend
 # only on the up-voted feedback embeddings — same invalidation as the SVM —
 # so they are cached alongside it to skip the per-regen KMeans on cache hits.
@@ -100,9 +102,7 @@ class PrecomputedRbfSVC:
         self._svc.fit(kernel, labels, sample_weight=sample_weight)
         return self
 
-    def decision_function(
-        self, features: NDArray[np.float64]
-    ) -> NDArray[np.float64]:
+    def decision_function(self, features: NDArray[np.float64]) -> NDArray[np.float64]:
         if self._training_features is None:
             raise RuntimeError("fit must run before decision_function")
         chunks = []
@@ -125,7 +125,7 @@ _MODEL_CACHE: LRUCache[tuple[int, str, int], _CachedModel] = LRUCache(
     maxsize=_MODEL_CACHE_STORAGE_MAXSIZE
 )
 _MODEL_CACHE_LOCK = threading.Lock()
-_MODEL_SCHEMA_VERSION = 3  # +1 whenever model/feature schema changes (see ARCHITECTURE)
+_MODEL_SCHEMA_VERSION = 4  # +1 whenever model/feature schema changes (see ARCHITECTURE)
 
 
 @dataclass
@@ -204,9 +204,7 @@ def _feedback_signature(db: Database, user_id: int) -> str:
     return hasher.hexdigest()
 
 
-def _get_cached_model(
-    user_id: int | None, signature: str
-) -> _CachedModel | None:
+def _get_cached_model(user_id: int | None, signature: str) -> _CachedModel | None:
     if user_id is None:
         return None
     with _MODEL_CACHE_LOCK:
@@ -524,12 +522,16 @@ def _embedding_session_options(ort_variant: EmbeddingOrtVariant) -> ort.SessionO
     if ort_variant == "spin_off_graph_all":
         session_options.add_session_config_entry("session.intra_op.allow_spinning", "0")
         session_options.add_session_config_entry("session.inter_op.allow_spinning", "0")
-        session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        session_options.graph_optimization_level = (
+            ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        )
         return session_options
     if ort_variant == "spin_off_auto_threads":
         session_options.add_session_config_entry("session.intra_op.allow_spinning", "0")
         session_options.add_session_config_entry("session.inter_op.allow_spinning", "0")
-        session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        session_options.graph_optimization_level = (
+            ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        )
         session_options.intra_op_num_threads = 0
         session_options.inter_op_num_threads = 1
         return session_options
@@ -887,25 +889,17 @@ def _loocv_knn_features(
     class_indices: np.ndarray,
     k: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    n = len(class_embs)
-    sim_mat = fb_embeddings @ class_embs.T
-    if n > 1:
-        for idx, tp in enumerate(class_indices):
-            sim_mat[tp, idx] = -2.0
-    sim_to = np.zeros(len(fb_embeddings), dtype=np.float32)
-    k_eff = min(k, n)
-    for i in range(len(fb_embeddings)):
-        sims = sim_mat[i]
-        exclude = 1 if i in class_indices else 0
-        n_available = max(1, n - exclude)
-        k_use = min(k_eff, n_available)
-        sim_to[i] = _topk_mean(sims, k_use)
-    sim_mat_clean = fb_embeddings @ class_embs.T
-    if n > 1:
-        for idx, tp in enumerate(class_indices):
-            sim_mat_clean[tp, idx] = -1.0
-    closest = np.max(sim_mat_clean, axis=1)
-    return sim_to, closest
+    means = np.zeros(len(fb_embeddings), dtype=np.float32)
+    closest = np.zeros(len(fb_embeddings), dtype=np.float32)
+    similarities = fb_embeddings @ class_embs.T
+    own_columns = {int(row): column for column, row in enumerate(class_indices)}
+    for row, values in enumerate(similarities):
+        if row in own_columns:
+            values = np.delete(values, own_columns[row])
+        if len(values):
+            means[row] = _topk_mean(values, min(k, len(values)))
+            closest[row] = values.max()
+    return means, closest
 
 
 def _score_and_rank(
@@ -1045,97 +1039,102 @@ def _score_and_rank(
             else:
                 if trace is not None:
                     trace.set_label("model_cache", "miss")
-                with trace.stage("svm_training_feature_prep"):
-                    # LOOCV k-NN for training: exclude self from reference set
-                    fb_sim_to_up = np.zeros(len(fb_embeddings), dtype=np.float32)
-                    fb_sim_to_down = np.zeros(len(fb_embeddings), dtype=np.float32)
-                    if n_up > 0:
-                        up_indices = np.where(up_mask)[0]
-                        fb_sim_to_up, fb_closest_up = _loocv_knn_features(
-                            fb_embeddings, fb_up_embs, up_indices, k
+                    with trace.stage("svm_training_feature_prep"):
+                        # LOOCV k-NN for training: exclude self from reference set
+                        fb_sim_to_up = np.zeros(len(fb_embeddings), dtype=np.float32)
+                        fb_sim_to_down = np.zeros(len(fb_embeddings), dtype=np.float32)
+                        if n_up > 0:
+                            up_indices = np.where(up_mask)[0]
+                            fb_sim_to_up, fb_closest_up = _loocv_knn_features(
+                                fb_embeddings, fb_up_embs, up_indices, k
+                            )
+                        else:
+                            fb_closest_up = np.zeros(
+                                len(fb_embeddings), dtype=np.float32
+                            )
+
+                        if n_down > 0:
+                            down_indices = np.where(down_mask)[0]
+                            fb_sim_to_down, fb_closest_down = _loocv_knn_features(
+                                fb_embeddings, fb_down_embs, down_indices, k
+                            )
+                        else:
+                            fb_closest_down = np.zeros(
+                                len(fb_embeddings), dtype=np.float32
+                            )
+
+                        fb_positive_cluster_sim = (
+                            _similarity_to_positive_cluster_centers(
+                                fb_embeddings, positive_cluster_centers
+                            )
                         )
-                    else:
-                        fb_closest_up = np.zeros(len(fb_embeddings), dtype=np.float32)
 
-                    if n_down > 0:
-                        down_indices = np.where(down_mask)[0]
-                        fb_sim_to_down, fb_closest_down = _loocv_knn_features(
-                            fb_embeddings, fb_down_embs, down_indices, k
+                        fb_text_lengths = np.array(
+                            [len(s.text_content) for s in feedback_stories]
                         )
+
+                        # 4-binary source category one-hot per feedback story.
+                        fb_source_onehot = source_category_stack(
+                            [s.source for s in feedback_stories]
+                        )
+                        fb_is_hn_live = fb_source_onehot[:, 0]
+                        fb_is_archive = fb_source_onehot[:, 1]
+                        fb_is_reddit = fb_source_onehot[:, 2]
+                        fb_is_rss = fb_source_onehot[:, 3]
+
+                        fb_features = _svm_personalization_features(
+                            fb_embeddings,
+                            text_lengths=fb_text_lengths,
+                            sim_to_upvoted=fb_sim_to_up,
+                            sim_to_downvoted=fb_sim_to_down,
+                            closest_upvoted=fb_closest_up,
+                            closest_downvoted=fb_closest_down,
+                            positive_cluster_similarity=fb_positive_cluster_sim,
+                            is_hn_live=fb_is_hn_live,
+                            is_archive=fb_is_archive,
+                            is_reddit=fb_is_reddit,
+                            is_rss=fb_is_rss,
+                        )
+
+                    # Ensure all three classes (0, 1, 2) are present
+                    missing = {0, 1, 2} - set(feedback_labels)
+                    if missing:
+                        fb_features = np.concatenate(
+                            [
+                                fb_features,
+                                np.zeros(
+                                    (len(missing), fb_features.shape[1]),
+                                    dtype=np.float32,
+                                ),
+                            ],
+                            axis=0,
+                        )
+                        labels = list(feedback_labels) + list(missing)
                     else:
-                        fb_closest_down = np.zeros(len(fb_embeddings), dtype=np.float32)
+                        labels = list(feedback_labels)
 
-                    fb_positive_cluster_sim = _similarity_to_positive_cluster_centers(
-                        fb_embeddings, positive_cluster_centers
+                    # Compute balanced weights for real feedback; 1e-6 for dummies
+                    counts = Counter(feedback_labels)
+                    n_classes = len(counts)
+                    n_real = len(feedback_labels)
+                    weights = [
+                        n_real / (n_classes * counts[lbl]) for lbl in feedback_labels
+                    ]
+                    weights.extend([1e-6] * len(missing))
+                    sample_weights = np.array(weights, dtype=np.float64)
+
+                    scaler = StandardScaler()
+                    fb_features_meta_scaled = np.clip(
+                        scaler.fit_transform(fb_features[:, emb_dim:]), -2.5, 2.5
                     )
-
-                    fb_text_lengths = np.array(
-                        [len(s.text_content) for s in feedback_stories]
+                    fb_features_scaled = np.hstack(
+                        [fb_features[:, :emb_dim], fb_features_meta_scaled]
                     )
-
-                    # 4-binary source category one-hot per feedback story.
-                    fb_source_onehot = source_category_stack(
-                        [s.source for s in feedback_stories]
-                    )
-                    fb_is_hn_live = fb_source_onehot[:, 0]
-                    fb_is_archive = fb_source_onehot[:, 1]
-                    fb_is_reddit = fb_source_onehot[:, 2]
-                    fb_is_rss = fb_source_onehot[:, 3]
-
-                    fb_features = _svm_personalization_features(
-                        fb_embeddings,
-                        text_lengths=fb_text_lengths,
-                        sim_to_upvoted=fb_sim_to_up,
-                        sim_to_downvoted=fb_sim_to_down,
-                        closest_upvoted=fb_closest_up,
-                        closest_downvoted=fb_closest_down,
-                        positive_cluster_similarity=fb_positive_cluster_sim,
-                        is_hn_live=fb_is_hn_live,
-                        is_archive=fb_is_archive,
-                        is_reddit=fb_is_reddit,
-                        is_rss=fb_is_rss,
-                    )
-
-                # Ensure all three classes (0, 1, 2) are present
-                missing = {0, 1, 2} - set(feedback_labels)
-                if missing:
-                    fb_features = np.concatenate(
-                        [
-                            fb_features,
-                            np.zeros(
-                                (len(missing), fb_features.shape[1]), dtype=np.float32
-                            ),
-                        ],
-                        axis=0,
-                    )
-                    labels = list(feedback_labels) + list(missing)
-                else:
-                    labels = list(feedback_labels)
-
-                # Compute balanced weights for real feedback; 1e-6 for dummies
-                counts = Counter(feedback_labels)
-                n_classes = len(counts)
-                n_real = len(feedback_labels)
-                weights = [
-                    n_real / (n_classes * counts[lbl]) for lbl in feedback_labels
-                ]
-                weights.extend([1e-6] * len(missing))
-                sample_weights = np.array(weights, dtype=np.float64)
-
-                scaler = StandardScaler()
-                fb_features_meta_scaled = np.clip(
-                    scaler.fit_transform(fb_features[:, emb_dim:]), -2.5, 2.5
-                )
-                fb_features_scaled = np.hstack(
-                    [fb_features[:, :emb_dim], fb_features_meta_scaled]
-                )
                 if config.model.svm_precomputed_enabled:
                     if config.model.svm_kernel != "rbf" or not isinstance(
                         config.model.svm_gamma, float
                     ):
-                        raise ValueError(
-                            "precomputed SVM requires a numeric RBF gamma"
-                        )
+                        raise ValueError("precomputed SVM requires a numeric RBF gamma")
                     svm: _CachedClassifier = PrecomputedRbfSVC(
                         c=config.model.svm_c,
                         gamma=config.model.svm_gamma,
@@ -1192,6 +1191,7 @@ def _score_and_rank(
                 probs = _softmax_rows(decision)
             scores = _minmax01(raw_scores)
         except Exception as e:
+            trace.set_label("svm_fit", "error")
             logging.error("Failed to fit feedback SVM: %r", e)
     elif trace is not None:
         trace.set_label("model_cache", "skipped")
@@ -1235,7 +1235,9 @@ def _score_and_rank(
     # SVM already has the prior signal directly and the boost double-counted.
     tier1_scores = np.array(
         [
-            s.score / max(((now - s.time) / 3600.0 + 2.0) ** 1.8, 0.1)
+            # Clamp age at zero: a story newer than `now` (clock skew) would
+            # otherwise raise a negative base to a fractional power (complex).
+            s.score / max((max((now - s.time) / 3600.0, 0.0) + 2.0) ** 1.8, 0.1)
             for s in candidates
         ],
         dtype=np.float32,
@@ -1295,6 +1297,7 @@ def _score_and_rank(
                     )
                 )
         except (ValueError, IndexError, NameError) as e:
+            trace.set_label("svm_probs", "error")
             logging.error("Error mapping probability class indices: %r", e)
             ranked = []
 
@@ -1419,9 +1422,7 @@ def _assemble_combo_deck(
     def _hot_sort_key(r: RankedStory) -> float:
         return float(cand_velocities[idx_for(r.story.id)])
 
-    def _take_unmatched(
-        items: list[RankedStory], n: int
-    ) -> list[RankedStory]:
+    def _take_unmatched(items: list[RankedStory], n: int) -> list[RankedStory]:
         """Take the first *n* items from an already-sorted list, skipping
         (and backfilling past) any that duplicate voted-on feedback.
 
@@ -1606,7 +1607,9 @@ def _assemble_combo_deck(
                     )
                 else:
                     final.append(
-                        replace(r, combo_keys=f"{source_key} {mixed_key}", **badge_flags)
+                        replace(
+                            r, combo_keys=f"{source_key} {mixed_key}", **badge_flags
+                        )
                     )
 
             unsure_items = _take_unmatched(
@@ -1710,6 +1713,39 @@ def rerank_candidates(
         trace=trace,
         score_context=score_context,
     )
+
+    return assemble_ranked_deck(
+        ranked,
+        candidates,
+        cand_embeddings,
+        db,
+        config,
+        embedder,
+        user_id=user_id,
+        score_context=score_context,
+        trace=trace,
+        is_feedback_match=is_feedback_match,
+    )
+
+
+def assemble_ranked_deck(
+    ranked: list[RankedStory],
+    candidates: list[Story],
+    cand_embeddings: NDArray[np.float32],
+    db: Database,
+    config: Config,
+    embedder: Embedder,
+    *,
+    user_id: int | None = None,
+    score_context: RankScoreContext | None = None,
+    trace: RankTrace | _NullTrace = NULL_TRACE,
+    is_feedback_match: Callable[[Story], bool] | None = None,
+) -> list[RankedStory]:
+    """Attach production combo membership and discovery to an existing ranking."""
+    if not candidates:
+        return []
+    if score_context is None:
+        score_context = RankScoreContext()
 
     # Build MMR embeddings map once (used per combo)
     embeddings_map: dict[int, NDArray[np.float32]] = {}

@@ -154,27 +154,12 @@ Before reporting completion of any code or template change:
 
 ## Dependency groups
 
-`pyproject.toml` ships three groups beyond the runtime deps. Default
-`uv sync` installs only `dev` (linters, pytest, type checker). `dl-experiment`
-and `embedding-experiment` are both opt-in.
+`pyproject.toml` ships two groups beyond the runtime deps. Default
+`uv sync` installs only `dev` (linters, pytest, type checker). The
+`embedding-experiment` group is opt-in.
 
 - `dev` — pytest, pytest-asyncio, hypothesis, pytest-xdist, ruff, ty. Always
   installed by `uv sync`.
-- `dl-experiment` — `torch>=2.12`. Pulls in the ~700MB torch +
-  triton + nvidia-cu* wheels. **Required only by** `pipeline_dl.py`,
-  `pipeline_dl_t0.py`, `tests/test_pipeline_dl.py`, and
-  `scripts/eval_ranker_variants.py` — the unshipped attention-MLP
-  ranker experiment (loses to SVM on every metric; see WORKLOG
-  2026-06-25).
-  - Install on demand: `uv sync --group dl-experiment`
-  - Run the experiment tests: `uv run --group dl-experiment pytest tests/test_pipeline_dl.py`
-  - Run the offline eval: `uv run --group dl-experiment python scripts/eval_ranker_variants.py ...`
-  - Without the group, `scripts/eval_ranker_variants.py --help` still
-    exits 0; the friendly error only fires when a DL variant is
-    actually requested.
-  - `tests/test_pipeline_dl.py` is a single `pytest.importorskip("torch")`
-    at module scope, so pytest reports it as **1** skip (not one per
-    test function) when the group is not active.
 - `embedding-experiment` (`48185b7`) — `huggingface-hub`, `scipy`. Required
   only by `scripts/bakeoff_embedding_models.py` and
   `scripts/bench_qwen_embed_speed.py` (embedding-model comparison tooling,

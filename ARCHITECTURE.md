@@ -117,7 +117,7 @@ process RSS increased from 730MiB to 834MiB; the host had 2.6GiB available.
 
 #### Per-User SVM Model Cache (Schema-Versioned)
 
-The trained classifier/scaler tuple is cached in-process in `_MODEL_CACHE` (a lock-guarded `cachetools.LRUCache`, max 20 active entries by default) keyed on `(user_id, feedback_signature, _MODEL_SCHEMA_VERSION)`. The signature is a SHA-256 of the user's feedback story IDs + actions + update timestamps; the schema version is bumped whenever the feature or classifier representation changes. `_MODEL_SCHEMA_VERSION = 3` selects the config-gated precomputed classifier safely. Schema version is the only viable invalidation key: the cache is in-memory only, so a runtime dimension check would mask future schema bugs.
+The trained classifier/scaler tuple is cached in-process in `_MODEL_CACHE` (a lock-guarded `cachetools.LRUCache`, max 20 active entries by default) keyed on `(user_id, feedback_signature, _MODEL_SCHEMA_VERSION)`. The signature is a SHA-256 of the user's feedback story IDs + actions + update timestamps; the schema version is bumped whenever the feature or classifier representation changes. `_MODEL_SCHEMA_VERSION = 4` also invalidates models built before singleton feedback self-exclusion was corrected. Schema version is the only viable invalidation key: the cache is in-memory only, so a runtime dimension check would mask future schema bugs.
 
 #### Dual-Gate SVM Activation
 
@@ -463,7 +463,41 @@ The system supports multiple users with independent feedback histories and perso
 ### 3.13 Evaluation Scripts
 Offline eval scripts resolve the `default` token through the `users` table and pass that `user_id` explicitly to `get_feedback_for_training()`. This keeps personalized metrics scoped to the default user's labels instead of pooling all users' feedback.
 
-The leakage-safe variant evaluator is `scripts/eval_ranker_variants.py`. By default it uses the configured live window (`days = 30`), removes training-feedback stories from each fold's candidate pool, leaves held-out feedback stories in the pool as unknown candidates, and computes all feedback-similarity features from the training fold only. Use `--window-days N` to widen the candidate story-age window for offline evaluation without changing production dashboard behavior.
+The canonical retrospective evaluator is `scripts/eval_ranker_variants.py`
+(`uv run python scripts/eval_ranker_variants.py --folds 5 --output /tmp/evaluation.json`).
+The default `production` scorer calls the serving ranker directly
+(`_score_and_rank` + `rerank_candidates` deck assembly, including feature schema,
+scaling, fitting thresholds, dummy classes, source/cluster features and the
+cold-start blend), so eval tracks serving by construction. Named experiments are
+`margin3_up` (plain 3-class up-margin), `linear_svc_up` / `logreg_up` (cheap linear
+checks), `margin3_up_recency30d` (time-decay ablation), `margin3_plus_cluster` /
+`margin3_plus_source` / `margin3_plus_tierblend` / `margin3_plus_all` (additive
+ablations attributing production's extras — see WORKLOG 2026-09-06; cluster and
+source features cost ~−0.014/−0.007 NDCG@40, tier blend is neutral), and
+`tier2_centroid` plus the `gravity` / `candidate_order` baselines. `--svm-c` / `--svm-gamma` add an
+`svm_override` entry; `--sweep-svm` runs the C/γ grid through the same engine
+(replacing the deleted `scripts/svm_hparam_sweep.py` wrapper).
+
+Each run opens the source DB read-only via a consistent temporary SQLite backup
+(including committed WAL pages) and freezes configuration and evaluation time.
+Schema-v2 reports record snapshot hash, code revision, input counts, sampling
+seeds/caps, per-fold story IDs and cutoffs, and effective configuration.
+`--now UNIX_TIME` supports repeatable comparisons. Input vectors must be finite,
+unit-normalized 384-d embeddings with matching text hashes; violations abort with
+coverage and example IDs. Training feedback loads independently of candidate
+membership. Folds expand chronologically without splitting equal timestamps; the
+latest 20% of timestamp groups are reserved for `--confirmation`. Metadata scaling
+fits on training rows only; singleton class members get zero similarity features.
+Failed scorers abort the run (serving failures surface as `svm_fit` / `svm_probs`
+trace labels, which the evaluator promotes to errors) instead of silently scoring
+a fallback.
+
+Relevance is up=1, neutral=0, down=0: metrics describe **recovery of known held-out
+feedback**, with judged coverage, eligible/excluded positives, and nulls for
+undefined quantities. `std` is fold variation. Results are current-snapshot
+diagnostics, not causal reading-quality estimates: `updated_at` only approximates
+vote chronology and historical snapshots do not exist.
+
 
 A 365-day smoke eval on 2026-06-23 (`--window-days 365 --folds 3 --variants margin3_up`) had 4,417 candidates and 1,744 valid feedback labels. Candidate recall rose to 93.3% for upvotes, 100.0% for downvotes, and 100.0% for neutrals, confirming that the 30-day eval's low upvote recall is mostly an intentional recency-window effect rather than missing stories or empty text.
 
@@ -480,20 +514,21 @@ The promoted change is the positive-cluster SVM. It keeps the leakage-safe seman
 
 The evaluator now also reports `NDCG@40` alongside `NDCG@100`, `NDCG@200`, `P@40`, and `Down@40` so the scoreboard matches the fixed dashboard window more closely.
 
-Simple-model eval variants are available as `linear_svc_up`, `logreg_up`, and `sgd_log_up`. A 5-fold 30-day default-user run on 2026-06-23 compared them against the current RBF margin baseline on the same rolling candidate window:
+Simple-model eval variants are available as `linear_svc_up` and `logreg_up`. A 5-fold 30-day default-user run on 2026-06-23 compared them against the current RBF margin baseline on the same rolling candidate window:
 
 | Variant | Raw NDCG@40 | Raw NDCG@100 | Raw MAP | P@40 | Down@40 | Median upvote rank |
 |---------|-------------|--------------|---------|------|---------|--------------------|
 | `margin3_up` (RBF SVC) | 0.416 | 0.419 | 0.253 | 0.355 | 0.020 | 159.4 |
 | `linear_svc_up` | 0.352 | 0.366 | 0.198 | 0.325 | 0.010 | 196.1 |
 | `logreg_up` | 0.380 | 0.392 | 0.225 | 0.330 | 0.010 | 166.1 |
-| `sgd_log_up` | 0.178 | 0.203 | 0.110 | 0.165 | 0.000 | 356.8 |
 
 Conclusion: logistic regression is the least-bad faster candidate, but it still gives up meaningful `NDCG@40`, MAP, and P@40 versus the RBF SVC. Do not promote a simpler classifier without either a substantial latency requirement or another feature/scoring change that recovers the quality gap.
 
 A follow-up logistic-regression `C` sweep on the same 5-fold 30-day setup tested `C={0.01,0.03,0.05,0.1,0.2,0.4,0.8,1.5,3.0,10.0}`. Best `NDCG@40` was `C=0.1` (`NDCG@40=0.385`, `P@40=0.335`, `Down@40=0.015`, MAP `0.223`, median `167.3`). Best MAP/NDCG@100/median was `C=0.2` (`NDCG@40=0.380`, `NDCG@100=0.392`, MAP `0.225`, `P@40=0.330`, `Down@40=0.010`, median `166.1`). Larger `C` values degraded sharply. The sweep does not change the conclusion: tuned logistic regression remains below the RBF SVC baseline (`NDCG@40=0.416`, MAP `0.253`, `P@40=0.355`, median `159.4`).
 
-MLP classifier variants are available only in eval as `mlp_32_a1e-3`, `mlp_64_a1e-3`, and `mlp_64_16_a1e-3`. A 5-fold 30-day run on 2026-06-23 reused the standard leakage-safe feature matrix, kept raw embedding dimensions unscaled, scaled/clipped only metadata columns, and applied the same balanced sample weights as the simpler classifiers:
+MLP classifier variants were evaluated on 2026-06-23 and retired on 2026-09-06
+(see WORKLOG); results retained as provenance. That run reused the standard
+leakage-safe feature matrix, kept raw embedding dimensions unscaled, scaled/clipped only metadata columns, and applied the same balanced sample weights as the simpler classifiers:
 
 | Variant | Raw NDCG@40 | Raw NDCG@100 | Raw MAP | P@40 | Down@40 | Median upvote rank |
 |---------|-------------|--------------|---------|------|---------|--------------------|
@@ -502,15 +537,15 @@ MLP classifier variants are available only in eval as `mlp_32_a1e-3`, `mlp_64_a1
 | `mlp_64_a1e-3` | 0.306 | 0.331 | 0.177 | 0.265 | 0.025 | 237.1 |
 | `mlp_64_16_a1e-3` | 0.215 | 0.235 | 0.109 | 0.160 | 0.010 | 426.4 |
 
-Conclusion: the tested MLPs substantially underperform the RBF SVC on the main eyeball metric (`NDCG@40`), P@40, MAP, and median rank. The best MLP (`64` hidden units) is also below tuned logistic regression, so neural classifiers are not a promising replacement without a materially different architecture or much more feedback data.
+Conclusion: the tested MLPs substantially underperform the RBF SVC on the main eyeball metric (`NDCG@40`), P@40, MAP, and median rank. The best MLP (`64` hidden units) is also below tuned logistic regression, so neural classifiers are not a promising replacement without a materially different architecture or much more feedback data. (Separately, the retired unshipped attention-MLP experiment had mixed historical results — see WORKLOG 2026-09-06 — so this is not a blanket claim about all neural approaches.)
 
-For expensive field-level embedding experiments, use `--max-feedback-per-class N` and `--max-candidates N` first. The evaluator keeps sampled valid feedback stories in the candidate pool and fills the rest with deterministic random background candidates, which makes small field-level smoke tests practical before attempting a full uncached field embedding run. Field-level eval embeddings use cleaned, production-budgeted field text (`title`, `self_text[:6000]`, `article_body[:4000]`, `top_comments[:6000]`) and reuse candidate field vectors for feedback stories already present in the candidate pool.
+Field-level embedding experiments were retired on 2026-09-06; the results below are
 
 Field-level embedding smoke tests on 2026-06-23 were mixed but worth further measurement: a tiny 45-label / 120-candidate sample lost to composed embeddings, while a 90-label / 300-candidate sample improved raw `NDCG@40` from `0.211` to `0.298`, `P@40` from `0.050` to `0.083`, and `Down@40` from `0.042` to `0.025`. This is not enough to promote production, but it justifies a cached full eval.
 
 Full 5-fold 30-day eval on 2026-06-23 did not support averaged field embeddings. Against `margin3_up`, `field_margin3_up` dropped raw `NDCG@40` from `0.418` to `0.301`, raw `NDCG@100` from `0.422` to `0.305`, MAP from `0.243` to `0.155`, `P@40` from `0.345` to `0.235`, and median upvote rank from `155.0` to `391.7`. It did reduce `Down@40` from `0.025` to `0.005`, but the relevance loss is too large to promote.
 
-Per-field similarity features are available in eval as `field_sims_margin3_up`. This keeps the normal composed embedding as the base vector and appends 16 metadata features: for each of `title`, `self_text`, `article_body`, and `top_comments`, top-k up similarity, top-k down similarity, closest-up similarity, and closest-down similarity. Small samples were mixed: the 45-label / 120-candidate sample improved `NDCG@100` and MAP but worsened `NDCG@40`, `P@40`, and `Down@40`; the 90-label / 300-candidate sample improved over baseline but underperformed averaged field embeddings on `NDCG@40`, MAP, median rank, and `Down@40`.
+Per-field similarity features were evaluated as `field_sims_margin3_up` (since retired). This kept the normal composed embedding as the base vector and appends 16 metadata features: for each of `title`, `self_text`, `article_body`, and `top_comments`, top-k up similarity, top-k down similarity, closest-up similarity, and closest-down similarity. Small samples were mixed: the 45-label / 120-candidate sample improved `NDCG@100` and MAP but worsened `NDCG@40`, `P@40`, and `Down@40`; the 90-label / 300-candidate sample improved over baseline but underperformed averaged field embeddings on `NDCG@40`, MAP, median rank, and `Down@40`.
 
 A focused full 5-fold eval on 2026-06-23 tested source/domain preference features, pairwise ranking, SVM/tier2 rank blending, and action-weight tweaks. None beat the baseline `margin3_up` on the main raw metrics. The least bad variant was `source_domain_margin3_up` (`NDCG@40=0.408`, `P@40=0.325`, `Down@40=0.015`, MAP `0.220`, median upvote rank `205.5`) versus baseline (`NDCG@40=0.418`, `P@40=0.345`, `Down@40=0.025`, MAP `0.243`, median `155.0`). The source/domain and tier2-blend variants reduced `Down@40`, but at the cost of relevance and rank quality. Pairwise variants were much worse and should not be pursued in their current form.
 
@@ -542,7 +577,11 @@ LessWrong RSS stories (`rss_lesswrong_com`) follow the same lazy-enrichment patt
 
 ### 4.2 Prompt Construction
 
-The detailed summary endpoint `/api/tldr-detail` proxies requests to Mistral or Groq. It uses four different prompt paths depending on what content is available:
+The detailed summary endpoint `/api/tldr-detail` defaults to Groq `openai/gpt-oss-20b` using `GROQ_API_KEY`. GPT-OSS uses low reasoning effort and 600 extra completion tokens to leave room for visible summary text. Explicit `LLM_PROVIDER` / `LLM_MODEL` overrides remain supported; there is no automatic provider fallback.
+
+The shared LLM limiter learns Groq’s minute token allowance from response headers and atomically reserves conservative prompt/output estimates before subsequent requests. It honors numeric `Retry-After` on 429 responses, rechecks cooldowns after waking, and defers requests requiring more than 30 seconds of waiting so long quota exhaustion does not strand HTTP handlers. This replaces blind short retries; it does not increase the provider’s quota. Failed, truncated, empty and partial summaries remain uncached, with existing cached summaries available as stale fallbacks.
+
+It uses four different prompt paths depending on what content is available:
 
 | Input | Path | Output format |
 |---|---|---|

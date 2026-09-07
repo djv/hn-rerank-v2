@@ -27,9 +27,6 @@ dev = [
     "ruff>=0.14",
     "ty>=0.0.10",
 ]
-dl-experiment = [
-    "torch>=2.12",
-]
 embedding-experiment = [
     "huggingface-hub>=0.25",
     "scipy>=1.14",

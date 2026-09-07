@@ -138,12 +138,30 @@ def _combo_keys_for_story(story: Story, recent_cutoff: int) -> str:
     return f"{age}_{source} {age}_mixed"
 
 
+def cold_ranked_candidates(candidates: list[Story], now_ts: int) -> list[RankedStory]:
+    """Production zero-feedback scores and browser eligibility before selection."""
+    recent_cutoff = now_ts - 30 * 86400
+    return [
+        RankedStory(
+            story=story,
+            score=story.score / ((now_ts - story.time) / 3600.0 + 2.0) ** 1.8,
+            best_match_title="",
+            is_non_hn=(not is_hn_source(story.source)),
+            is_recent=(story.time >= recent_cutoff),
+            combo_keys=_combo_keys_for_story(story, recent_cutoff),
+        )
+        for story in candidates
+    ]
+
+
 def build_cold_deck(
     db: Database,
     config: Config,
     user_id: int | None = None,
     embedder: Embedder | None = None,
     trace: RankTrace | _NullTrace = NULL_TRACE,
+    *,
+    candidates: list[Story] | None = None,
 ) -> list[RankedStory]:
     """Build a gravity-sorted, badge-annotated fallback deck — no embeddings,
     no personalization.
@@ -171,37 +189,28 @@ def build_cold_deck(
     embeddings so behavior is identical either way.
     """
     now_ts = int(time.time())
-    if embedder is not None:
-        pool = get_candidate_pool(db, config, embedder, trace=trace)
-        if user_id is not None:
-            voted_ids = frozenset(_voted_story_ids(db, user_id))
-            candidates, _ = pool.without_feedback(voted_ids)
+    if candidates is None:
+        if embedder is not None:
+            pool = get_candidate_pool(db, config, embedder, trace=trace)
+            if user_id is not None:
+                voted_ids = frozenset(_voted_story_ids(db, user_id))
+                candidates, _ = pool.without_feedback(voted_ids)
+            else:
+                candidates = list(pool.stories)
         else:
-            candidates = list(pool.stories)
-    else:
-        candidates = load_production_candidate_stories(
-            db,
-            config,
-            user_id=user_id,
-            exclude_feedback=user_id is not None,
-            now_ts=now_ts,
-            trace=trace,
-        )
+            candidates = load_production_candidate_stories(
+                db,
+                config,
+                user_id=user_id,
+                exclude_feedback=user_id is not None,
+                now_ts=now_ts,
+                trace=trace,
+            )
     if not candidates:
         return []
 
     recent_cutoff = now_ts - (30 * 86400)
-    ranked = [
-        RankedStory(
-            story=story,
-            score=story.score / ((now_ts - story.time) / 3600.0 + 2.0) ** 1.8,
-            best_match_title="",
-            is_non_hn=(not is_hn_source(story.source)),
-            is_recent=(story.time >= recent_cutoff),
-            combo_keys=_combo_keys_for_story(story, recent_cutoff),
-        )
-        for story in candidates
-    ]
+    ranked = cold_ranked_candidates(candidates, now_ts)
 
     cand_scores = np.array([story.score for story in candidates])
     cand_velocities = np.array(
@@ -596,6 +605,23 @@ def fast_rerank_for_user(
         sum(1 for r in ranked if not is_hn_source(r.story.source)),
     )
 
+    return finalize_ranked_deck(
+        ranked, candidates, cand_embeddings, db, config, embedder, user_id, trace=trace
+    )
+
+
+def finalize_ranked_deck(
+    ranked: list[RankedStory],
+    candidates: list[Story],
+    cand_embeddings: NDArray[np.float32],
+    db: Database,
+    config: Config,
+    embedder: Embedder,
+    user_id: int,
+    *,
+    trace: RankTrace | _NullTrace = NULL_TRACE,
+) -> list[RankedStory]:
+    """Shared serving/evaluation deduplication and canonicalization boundary."""
     with trace.stage("dedup"):
         id_to_emb: dict[int, NDArray[np.float32]] = {
             s.id: vec for s, vec in zip(candidates, cand_embeddings)

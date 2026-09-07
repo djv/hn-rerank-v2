@@ -78,17 +78,13 @@ on live traffic instead of NDCG over biased historical labels. Risk: at
 per comparison; a couple of genuinely random cards per session is the
 visible UX price.
 
-**1.5 — The WORKLOG's SVM-vs-DL verdict is stale on four axes.** Every DL
-number (attention MLP, blend_score_75 at +0.055 NDCG@40 over SVM)
-predates the temporal split (2026-07-01, which cut headline NDCG@40
-roughly in half), the production-legs candidate pool, the 4-binary source
-features, and the mxbai embedding switch — and the blend was rejected
-partly on a 3s cold-render cost that the PERF-2/3 cadence work has since
-made irrelevant. One `--group dl-experiment` re-run under the current
-harness would either retire the question properly or resurrect a shelved
-+0.05. Risk: torch group is a 700MB install and the answer may still be
-"no," but right now the conclusion in the docs isn't supported by the
-current methodology.
+**1.5 — Retired: revisit the SVM-vs-DL question.** The old attention-MLP
+numbers used a different temporal split, candidate pool, source features,
+and embedding model. The experiment was never on the serving path and was
+deleted on 2026-09-06 as unshipped research. Some historical neural/blend
+runs beat their contemporary SVM comparator, so retirement is not a blanket
+loss claim. A future model experiment should start as a new, measured branch with
+the current evaluator rather than preserving this abandoned implementation.
 
 **1.6 — Disambiguate the neutral class.** 1,179 skips (31% of labels!)
 train as a full third class with balanced weight, but the label conflates

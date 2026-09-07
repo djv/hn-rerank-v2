@@ -1,6 +1,168 @@
 # Worklog: hn-rewrite
 
+## 2026-09-07 — Groq as the production TLDR provider
+
+- Selected Groq GPT-OSS 20B over OpenRouter’s free router after same-story
+  comparisons. The latest four-story run completed 3/4 on both providers;
+  Groq’s successful calls took 0.9–15.1s versus 8.0–18.1s. OpenRouter’s earlier
+  run completed only 1/4 (146.6s). These are small operational samples, not a
+  comprehensive quality benchmark. Groq’s earlier bulk run cached 28, rejected
+  22 partial/failed results, and stopped on quota with 19 unattempted.
+- Default to Groq GPT-OSS 20B with low reasoning effort and 600 tokens of
+  completion headroom. Preserve explicit provider/model overrides and the
+  complete-summary cache gate; no automatic paid fallback.
+- Learn the provider’s token allowance from headers and reserve estimates
+  under the shared lock. Honor Retry-After, recheck cooldowns after waiting,
+  and fail fast when a quota wait exceeds 30 seconds. No fixed per-story pause.
+- Validation: 661 tests passed with four workers; Ruff, Ty and diff checks
+  clean. Updated the shared runtime environment to Groq and restarted the
+  service. Dashboard and cached TLDR returned HTTP 200; the uncached dual
+  summary encountered provider 429s and correctly served a stale cached
+  fallback. Two direct summaries with the new settings completed in 1.1s
+  and 8.5s before quota deferred the next request. Free-tier capacity remains
+  a constraint. No commit or push.
+
+
 Append-only log of notable changes, fixes, and operational events.
+
+## 2026-09-06 — simplify the canonical evaluator; decouple it from serving
+
+First-principles pass over the uncommitted eval work: the 2,737-line evaluator
+with 66 variants outweighed the diagnostic it serves, and its reuse machinery
+branched the serving hot path. Prefer deleting over simplifying.
+
+- Deleted `eval.py` (13-line shim; canonical is now
+  `scripts/eval_ranker_variants.py`), `scripts/feature_ablation.py` and
+  `scripts/svm_hparam_sweep.py` (thin stubs; sweep lives on as `--sweep-svm`),
+  and the untracked `scripts/benchmark_eval_reuse.py` (one-off 2.09x number,
+  kept here instead of as a kept script).
+- Trimmed the variant registry 66 → 6 (`production`, `margin3_up`,
+  `linear_svc_up`, `logreg_up`, `margin3_up_recency30d`, `tier2_centroid`) plus
+  sweep/`svm_override` and the three trivial baselines. Deleted the
+  field/textsplit/cluster/source-domain/pairwise/binary/calibration/SGD/MLP
+  scorers and their `FoldData`/`_make_fold` plumbing (~1,150 lines).
+  `scripts/eval_ranker_variants.py` is now ~1,580 lines.
+- Decoupled production: removed `SvmPreparedInputs` / `strict` /
+  `prepared_inputs` from `_score_and_rank`. Serving is straight-line again;
+  eval observes it through the existing `RankScoreContext` (badge similarities)
+  and two new trace labels (`svm_fit` / `svm_probs` = `error`), which the
+  evaluator promotes to fold-aborting errors to preserve fail-loud semantics.
+  The reuse benchmark's speedup is surrendered; eval pays a `_chunked_max_dot`
+  fallback only when similarities are missing.
+- Kept deliberately: `assemble_ranked_deck` / `finalize_ranked_deck` /
+  `cold_ranked_candidates` (genuine serving decompositions shared with eval —
+  deleting them would duplicate code), both test files (different layers, not
+  duplicates), and the bakeoff snapshot strictness (load-bearing provenance,
+  not ceremony).
+- Docs: trimmed the ARCHITECTURE eval section ~70 → ~25 lines, fixed stale
+  "available variant" claims (sgd/mlp/field/source-domain/pairwise) to
+  past-tense provenance with the 2026-09-06 retirement pointer.
+- Fixed a WIP bug the simplification exposed: `--confirmation`'s help string
+  ("20% of") crashed `--help` via argparse `%`-formatting (`% o` parses as
+  octal). Now "20 percent".
+- Verification: 651 passed (`pytest -n 4`); `ruff`/`ty` clean; bounded
+  live-DB smoke (2 folds, 300 candidates, 8/class) completes read-only.
+
+## 2026-09-06 — first metrics from the trimmed evaluator
+
+5-fold temporal eval, 2,000-candidate pool (3,718 valid feedback rows retained),
+production config C=0.1 γ=0.03. Full 12,683 pool aborted on one stale-hash
+embedding (non-feedback story 49585627, text grown since embedding); re-embedded
+via the standard path with approval, then hit two brand-new Reddit stories with
+no rows at all — fixed durably with the sanctioned `embed_remaining.py`
+(290 rows). Live-pool eval stays racy by design (pool shifts between runs);
+paired within-run diffs are the only comparable numbers.
+
+- production raw NDCG@40 0.054±0.082, MAP 0.049; archive-section NDCG@40 0.216
+  (all eligible held-out positives are archive; recent sections have none).
+- margin3_up (same C/γ, no cluster/source extras, no tier blend) beats
+  production twice: 0.090 vs 0.054 (paired +0.035) and 0.068 vs 0.055.
+  centroid 0.087/0.085 (paired +0.032). Linear/logreg tie production ~0.054;
+  gravity and pool-order score exactly 0.000. Suggestive, not conclusive
+  (n=4 defined folds, std ~0.08) — points at production's extra features,
+  not at C/γ.
+- Targeted override C=0.2 (γ=0.03): NDCG@40 0.025, MAP 0.044 — worse than
+  C=0.1. Upward-C retune direction closed; full 30-combo sweep not run
+  (~30x the comparison run, exceeds command timeouts).
+- Reports at /tmp/eval_compare.json, /tmp/eval_sweep1.json (not committed).
+
+## 2026-09-06 — ablation: cluster/source features cost the +0.03 gap
+
+Additive ablation on margin3_up (same C/γ), paired within-run, 5 folds ×
+2,000-candidate pool. New eval-only scorers mirror serving exactly
+(`_positive_cluster_similarity`, `source_category_stack`, production alpha
+schedule; tier1 uses the fold cutoff as `now`, tier2 is the fold centroid —
+order-preserving approximations, documented inline):
+
+- margin3_up 0.090±0.067 | +cluster 0.040±0.025 (paired −0.014)
+  | +source 0.047±0.059 (paired −0.007) | +tierblend 0.090 (paired +0.000)
+- margin3_plus_all 0.054±0.081, paired +0.0000 vs production 0.054 —
+  decomposition reproduces serving exactly, attribution closed.
+- Tier blend is neutral; the cluster similarity feature is the single biggest
+  cost (and the most consistent: tightest std), source onehots second.
+
+This contradicts the old-harness promotion note (ARCHITECTURE: positive-cluster
+SVM 30d NDCG 0.456 vs 0.431 baseline) that shipped cluster features to
+production. The new harness is leakage-safer (LOOCV, singleton exclusion,
+independent feedback embeddings, training-feedback-free pools); the old tables
+are retained as provenance but should no longer gate ranker decisions.
+Recommendation: drop the cluster-similarity and source-category features from
+the production SVM (serving gets simpler AND ~+0.02–0.03). Awaiting sign-off —
+production behavior change, not made here.
+
+Drive-bys: fixed a latent serving crash — future-dated story times made tier1
+gravity raise a negative base to a fractional power (complex → TypeError).
+Age is now clamped at zero (identical output for all real inputs). Same clamp
+in the eval tier-blend mirror.
+- Verification: 661 passed (`pytest -n 4`, includes other workstreams' WIP
+  tests); `ruff`/`ty` clean. Report at /tmp/eval_ablate.json (not committed).
+
+## 2026-09-06 — canonical retrospective evaluation
+
+- Replaced the duplicated `eval.py` implementation with the canonical evaluator
+  adapter; updated the SVM grid and embedding bakeoff consumers, and retired the
+  incompatible shuffled feature-ablation harness with a clear error.
+- Added the actual production scorer, shared serving/deck finalization helpers,
+  independent feedback embeddings, strict coverage, read-only consistent SQLite
+  snapshots, frozen clock/configuration/provenance, timestamp-group expanding folds,
+  cutoff decay, and an explicit 20% confirmation period reserved before sampling.
+- Corrected singleton self-exclusion in the shared LOOCV helper and bumped the model
+  cache schema to 4. Production ranking policy and configuration remain unchanged.
+- Reports now distinguish raw order, optional MMR and each Recommended age/source
+  combination. Relevance is binary known-upvote recovery; unjudged cards remain
+  unknown, missing metrics are null, summaries count defined folds, and comparisons
+  are paired against production. Failed folds abort. No telemetry or DB migration.
+- Preserved the pending PyTorch retirement. Corrected its blanket loss claim:
+  the 2026-06-25 archive records attention 0.471 and score-blend 0.492 NDCG@40
+  versus SVM 0.437. Those older diagnostics are not causal evidence or comparable
+  to the new report schema.
+- Reused per-fold preprocessing and scratch inputs across variants/baselines.
+  `scripts/benchmark_eval_reuse.py` (600 candidates, 120 feedback, 3 folds, 7
+  scorers, 3 repeats) produced identical metrics: median 3.102s unshared versus
+  1.482s reused, 2.09x faster. This compares equivalent current calculations,
+  not different historical metric definitions.
+- Bounded live-input smoke: 300 candidates, 45 sampled feedback / 38 development
+  rows, 2 folds. Completed successfully; held-out positives were outside the
+  current candidate pool, so recall is null and exclusions are explicit.
+- Both evaluator CLI entrypoints and the full 30-point SVM sweep completed on a
+  frozen fixture. Bakeoff tests use fake encoders, exercise independent feedback
+  coverage, reference snapshots and reproduction after the source changes.
+- Verification at implementation completion: 651 tests passed with four workers;
+  Ruff, Ty, and `git diff --check` passed. Restarted the service successfully;
+  dashboard and cached TLDR requests returned HTTP 200. The uncached TLDR smoke
+  timed out while the upstream provider was returning 429s. Later quota checks
+  confirmed `FreeUsageLimitError`, so the requested quota-conditional bulk TLDR
+  prefetch was not started. The later simplification entry above supersedes the
+  implementation and benchmark details here. No commit or push.
+
+## 2026-09-06 — retire the unshipped PyTorch ranker experiment
+
+- Removed the attention-MLP models, their tests, offline evaluator variants,
+  and optional `torch` dependency group. It was never on the serving path.
+  Some archived neural/blend runs beat their contemporary SVM comparator;
+  retirement is not evidence that every historical experiment lost.
+- Kept the historical evaluation results below as provenance; Git history can
+  recover the deleted research if a future experiment needs it.
 
 ## 2026-09-06 — TLDR cleanup and free Zen provider
 

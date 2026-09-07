@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Leakage-safe 30-day evaluator for personalized ranker variants."""
+"""Canonical current-snapshot retrospective ranking diagnostics."""
 
 from __future__ import annotations
 
@@ -8,40 +8,24 @@ import hashlib
 import json
 import math
 import sys
+import sqlite3
+import subprocess
+import tempfile
+from contextlib import ExitStack, contextmanager
+from unittest.mock import patch
 import time
 from collections import Counter
 from typing import Any
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from urllib.parse import urlparse
 
 import numpy as np
-from sklearn.cluster import KMeans
-from sklearn.linear_model import LogisticRegression, SGDClassifier
-from sklearn.model_selection import StratifiedKFold
-from sklearn.neural_network import MLPClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import LinearSVC, SVC
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-try:
-    import torch  # noqa: F401  # type: ignore
-
-    _TORCH_AVAILABLE = True
-except ImportError:
-    _TORCH_AVAILABLE = False
-    torch = None  # type: ignore[assignment]
-
-# DL imports are deferred; only loaded if a DL variant is requested.
-# This lets the harness run all sklearn / SVM / cluster variants without
-# pulling in the ~700MB torch dependency.
-if _TORCH_AVAILABLE:
-    from pipeline_dl import fit_attention_mlp, predict_attention_mlp
-    from pipeline_dl_t0 import (
-        fit_attention_mlp_t0,
-        predict_attention_mlp_t0,
-    )
 
 from database import Database, Story
 from pipeline import (
@@ -50,38 +34,27 @@ from pipeline import (
     ModelConfig,
     RankedStory,
     _knn_similarity,
-    _positive_cluster_centers,
-    clean_text,
     load_production_candidate_stories,
     mmr_filter,
     story_embedding_text,
 )
-
-SELF_FIELD_CHAR_LIMIT = 6000
-ARTICLE_FIELD_CHAR_LIMIT = 4000
-COMMENT_FIELD_CHAR_LIMIT = 6000
 
 
 @dataclass(frozen=True)
 class FoldData:
     candidates: list[Story]
     cand_emb: np.ndarray
-    cand_field_emb: np.ndarray
-    cand_field_parts: np.ndarray
     train_stories: list[Story]
     test_stories: list[Story]
     test_actions: np.ndarray
     train_vote_times: np.ndarray
     x_train_base: np.ndarray
     x_cand_base: np.ndarray
-    x_train_field: np.ndarray
-    x_cand_field: np.ndarray
-    x_train_field_sims: np.ndarray
-    x_cand_field_sims: np.ndarray
-    x_train_textsplit: np.ndarray
-    x_cand_textsplit: np.ndarray
     y_train: np.ndarray
     tier2_scores: np.ndarray
+    train_emb: np.ndarray | None = None
+    runtime_db: Database | None = None
+    similarities: dict[int, np.ndarray] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -92,7 +65,312 @@ class FoldSplit:
 
 
 def _db_sha256(db_path: str) -> str:
-    return hashlib.sha256(Path(db_path).read_bytes()).hexdigest()[:16]
+    with Path(db_path).open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+@contextmanager
+def frozen_database(path: str):
+    """SQLite backup includes committed WAL pages; both reader handles are read-only."""
+    with tempfile.TemporaryDirectory(prefix="rank-eval-") as directory:
+        target = Path(directory) / "snapshot.db"
+        source = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+        destination = sqlite3.connect(target)
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+            source.close()
+        digest = _db_sha256(str(target))
+        db = Database(str(target), read_only=True)
+        try:
+            yield db, digest
+        finally:
+            db.close()
+
+
+def _snapshot_context(path: str | Path) -> tuple[Config, float, str]:
+    from pipeline.config import RssConfig
+
+    with np.load(path, allow_pickle=False) as data:
+        required = {
+            "config_json",
+            "evaluation_time",
+            "database_snapshot",
+            "database_sha256",
+            "user_id",
+        }
+        if not required <= set(data.files):
+            raise ValueError(
+                "Snapshot lacks frozen configuration/time/database; regenerate bakeoff"
+            )
+        raw = json.loads(str(data["config_json"].item()))
+        model = raw.pop("model")
+        model["dedup_exclude_actions"] = tuple(model["dedup_exclude_actions"])
+        rss = raw.pop("rss")
+        rss["feeds"] = tuple(rss["feeds"])
+        config = Config(**raw, model=ModelConfig(**model), rss=RssConfig(**rss))
+        now = float(data["evaluation_time"].item())
+        database_path = str(data["database_snapshot"].item())
+        digest = str(data["database_sha256"].item())
+    if not math.isfinite(now) or _db_sha256(database_path) != digest:
+        raise ValueError("Frozen snapshot timestamp or database hash is invalid")
+    return config, now, database_path
+
+
+def _validated_embeddings(
+    stories: list[Story], cached: dict[int, np.ndarray]
+) -> np.ndarray:
+    invalid = [
+        s.id
+        for s in stories
+        if s.id not in cached
+        or cached[s.id].shape != (384,)
+        or not np.isfinite(cached[s.id]).all()
+        or not np.isclose(np.linalg.norm(cached[s.id]), 1.0, atol=1e-3)
+    ]
+    if invalid:
+        raise ValueError(
+            f"Embedding coverage: {len(stories) - len(invalid)}/{len(stories)} valid; "
+            f"missing/invalid IDs (first 20): {invalid[:20]}"
+        )
+    return np.asarray([cached[s.id] for s in stories], dtype=np.float32).reshape(
+        -1, 384
+    )
+
+
+class _FrozenEmbedder(Embedder):
+    def __init__(self, model_version: str) -> None:
+        self.model_version = model_version
+
+    def encode(self, texts: list[str], batch_size: int | None = None) -> np.ndarray:
+        raise RuntimeError("Evaluation attempted to compute an uncaptured embedding")
+
+
+@contextmanager
+def _fold_database(fold: FoldData, config: Config, source_db: Database | None):
+    if fold.runtime_db is not None:
+        yield fold.runtime_db
+        return
+    db = Database(":memory:")
+    try:
+        stories = {s.id: s for s in fold.candidates + fold.train_stories}
+        vectors = dict(zip([s.id for s in fold.candidates], fold.cand_emb, strict=True))
+        train_emb = fold.train_emb
+        if train_emb is None:
+            train_emb = fold.x_train_base[:, : fold.cand_emb.shape[1]]
+        vectors.update(zip([s.id for s in fold.train_stories], train_emb, strict=True))
+        for story in stories.values():
+            db.upsert_story(story)
+            db.upsert_embedding(
+                story.id,
+                config.embedding_model_version,
+                str(_embedding_text_hashes([story])[0]),
+                vectors[story.id],
+            )
+        for story, label in zip(fold.train_stories, fold.y_train, strict=True):
+            db.upsert_feedback(1, story.id, ("down", "neutral", "up")[int(label)])
+        with db.conn() as conn:
+            conn.executemany(
+                "UPDATE feedback SET updated_at=? WHERE user_id=1 AND story_id=?",
+                [
+                    (float(t), s.id)
+                    for s, t in zip(
+                        fold.train_stories, fold.train_vote_times, strict=True
+                    )
+                ],
+            )
+            conn.commit()
+        # Canonical resolution and target metadata come from the same read-only snapshot.
+        with ExitStack() as stack:
+            if source_db is not None:
+                stack.enter_context(
+                    patch.object(
+                        db, "get_hn_dupe_resolutions", source_db.get_hn_dupe_resolutions
+                    )
+                )
+                local_get_story = db.get_story
+                stack.enter_context(
+                    patch.object(
+                        db,
+                        "get_story",
+                        lambda sid: local_get_story(sid) or source_db.get_story(sid),
+                    )
+                )
+            yield db
+    finally:
+        db.close()
+
+
+@contextmanager
+def _reuse_preprocessing():
+    """Retain only this fold's compatible scaling results and their input arrays."""
+    prepared: dict[tuple[int, int, int], tuple] = {}
+    fit_scale = _fit_scale
+
+    def reuse_scale(train: np.ndarray, cand: np.ndarray, emb_dim: int) -> tuple:
+        key = (id(train), id(cand), emb_dim)
+        if key not in prepared:
+            prepared[key] = (train, cand, fit_scale(train, cand, emb_dim))
+        return prepared[key][2]
+
+    with patch(__name__ + "._fit_scale", side_effect=reuse_scale):
+        yield
+
+
+def _production_scores(
+    fold: FoldData, config: Config, source_db: Database | None = None
+) -> tuple[np.ndarray, np.ndarray | None]:
+    from pipeline.ranking import RankScoreContext, RankTrace, _score_and_rank
+
+    if not fold.train_stories:
+        from pipeline import cold_ranked_candidates
+
+        ranked = cold_ranked_candidates(fold.candidates, int(time.time()))
+        return np.array([r.score for r in ranked]), None
+
+    trace = RankTrace()
+    score_context = RankScoreContext()
+    with _fold_database(fold, config, source_db) as db:
+        ranked = _score_and_rank(
+            fold.candidates,
+            fold.cand_emb,
+            db,
+            config,
+            _FrozenEmbedder(config.embedding_model_version),
+            trace=trace,
+            score_context=score_context,
+        )
+    if trace.labels.get("svm_fit") == "error":
+        raise RuntimeError(
+            "Production fit failed; aborting fold instead of scoring fallback"
+        )
+    if trace.labels.get("svm_probs") == "error":
+        raise RuntimeError("Production probability mapping failed; aborting fold")
+    if (
+        score_context.cand_closest_up is not None
+        and score_context.cand_closest_down is not None
+        and score_context.cand_closest_neutral is not None
+    ):
+        fold.similarities.update(
+            {
+                2: score_context.cand_closest_up,
+                0: score_context.cand_closest_down,
+                1: score_context.cand_closest_neutral,
+            }
+        )
+    by_id = {r.story.id: r for r in ranked}
+    probabilities = (
+        np.array(
+            [
+                [by_id[s.id].prob_down, by_id[s.id].prob_neutral, by_id[s.id].prob_up]
+                for s in fold.candidates
+            ],
+            dtype=np.float32,
+        )
+        if ranked and ranked[0].prob_up is not None
+        else None
+    )
+    return np.array([by_id[s.id].score for s in fold.candidates]), probabilities
+
+
+def _recommended(
+    scores: np.ndarray,
+    fold: FoldData,
+    config: Config,
+    probs: np.ndarray | None,
+    source_db: Database | None,
+) -> list[RankedStory]:
+    from pipeline import finalize_ranked_deck
+    from pipeline.ranking import assemble_ranked_deck
+    from pipeline.hn_dupes import (
+        _load_feedback_context,
+        _matches_feedback,
+        canonicalize_hn_dupes,
+    )
+
+    ranked = [
+        RankedStory(
+            story=fold.candidates[i],
+            score=float(scores[i]),
+            best_match_title="",
+            prob_down=float(probs[i, 0]) if probs is not None else None,
+            prob_neutral=float(probs[i, 1]) if probs is not None else None,
+            prob_up=float(probs[i, 2]) if probs is not None else None,
+        )
+        for i in np.argsort(-scores, kind="stable")
+    ]
+    embedder = _FrozenEmbedder(config.embedding_model_version)
+    with _fold_database(fold, config, source_db) as db:
+        context = _load_feedback_context(
+            db, user_id=1, actions=tuple(config.model.dedup_exclude_actions)
+        )
+        if not fold.train_stories:
+            from pipeline import build_cold_deck
+
+            deck = build_cold_deck(db, config, candidates=fold.candidates)
+            return canonicalize_hn_dupes(
+                deck,
+                db,
+                selected_limit=config.count,
+                user_id=1,
+                feedback_actions=tuple(config.model.dedup_exclude_actions),
+            )
+        from pipeline.ranking import RankScoreContext, _chunked_max_dot
+
+        if not fold.similarities:
+            train_emb = (
+                fold.train_emb
+                if fold.train_emb is not None
+                else fold.x_train_base[:, :384]
+            )
+            for label in (0, 1, 2):
+                fold.similarities[label] = _chunked_max_dot(
+                    fold.cand_emb, train_emb[fold.y_train == label]
+                )
+
+        score_context = RankScoreContext(
+            cand_closest_up=fold.similarities[2],
+            cand_closest_down=fold.similarities[0],
+            cand_closest_neutral=fold.similarities[1],
+        )
+        deck = assemble_ranked_deck(
+            ranked,
+            fold.candidates,
+            fold.cand_emb,
+            db,
+            config,
+            embedder,
+            user_id=1,
+            score_context=score_context,
+            is_feedback_match=lambda s: _matches_feedback(s, context),
+        )
+        return finalize_ranked_deck(
+            deck, fold.candidates, fold.cand_emb, db, config, embedder, 1
+        )
+
+
+def _paired_differences(results: dict[str, list[dict]]) -> dict:
+    reference = results["production"]
+    differences = {}
+    for name, rows in results.items():
+        if name == "production":
+            continue
+        if len(rows) != len(reference):
+            raise ValueError("Cannot pair incomplete folds")
+        differences[name] = [
+            {
+                side: {
+                    key: row[side][key] - baseline[side][key]
+                    if row[side][key] is not None and baseline[side][key] is not None
+                    else None
+                    for key in row[side]
+                }
+                for side in row
+            }
+            for row, baseline in zip(rows, reference, strict=True)
+        ]
+    return _aggregate_results(differences)
 
 
 def _embedding_text_hashes(stories: list[Story]) -> np.ndarray:
@@ -105,9 +383,7 @@ def _embedding_text_hashes(stories: list[Story]) -> np.ndarray:
     )
 
 
-def _load_external_embeddings(
-    path: str | Path, stories: list[Story]
-) -> np.ndarray:
+def _load_external_embeddings(path: str | Path, stories: list[Story]) -> np.ndarray:
     """Load a model-bakeoff embedding snapshot after validating its story rows."""
     with np.load(path, allow_pickle=False) as data:
         required = {"story_ids", "text_hashes", "embeddings"}
@@ -133,11 +409,18 @@ def _load_external_embeddings(
         zip([story.id for story in stories], expected_hashes.tolist(), strict=True)
     )
     if len(set(snapshot_keys)) != len(snapshot_keys):
-        raise ValueError("Embedding snapshot contains duplicate story IDs or text hashes")
+        raise ValueError(
+            "Embedding snapshot contains duplicate story IDs or text hashes"
+        )
     if set(snapshot_keys) != set(expected_keys):
-        raise ValueError("Embedding snapshot story IDs or text hashes do not match production candidates")
+        raise ValueError(
+            "Embedding snapshot story IDs or text hashes do not match production candidates"
+        )
     vectors_by_key = dict(zip(snapshot_keys, embeddings, strict=True))
-    return np.array([vectors_by_key[key] for key in expected_keys], dtype=np.float32)
+    ordered = np.array([vectors_by_key[key] for key in expected_keys], dtype=np.float32)
+    return _validated_embeddings(
+        stories, dict(zip([s.id for s in stories], ordered, strict=True))
+    )
 
 
 def _snapshot_candidate_stories(path: str | Path) -> list[Story]:
@@ -173,7 +456,12 @@ def _snapshot_feedback(
                 + ", ".join(sorted(missing))
             )
         story_ids = np.asarray(data["feedback_story_ids"], dtype=np.int64)
-        labels = np.asarray(data["feedback_labels"], dtype=int)
+        raw_labels = np.asarray(data["feedback_labels"])
+        if raw_labels.ndim != 1 or not np.isin(raw_labels, [0, 1, 2]).all():
+            raise ValueError(
+                "Embedding snapshot frozen feedback labels must be 0, 1, or 2"
+            )
+        labels = raw_labels.astype(int)
         vote_times = np.asarray(data["feedback_vote_times"], dtype=np.float64)
         raw_json = str(data["feedback_stories_json"].item())
     try:
@@ -183,14 +471,18 @@ def _snapshot_feedback(
         stories = [Story(**raw_story) for raw_story in raw_stories]
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError("Embedding snapshot has invalid frozen feedback rows") from exc
-    if not (
-        len(story_ids) == len(stories) == len(labels) == len(vote_times)
-    ):
-        raise ValueError("Embedding snapshot frozen feedback arrays have different lengths")
+    if not (len(story_ids) == len(stories) == len(labels) == len(vote_times)):
+        raise ValueError(
+            "Embedding snapshot frozen feedback arrays have different lengths"
+        )
     if not np.array_equal(story_ids, np.array([story.id for story in stories])):
-        raise ValueError("Embedding snapshot frozen feedback story IDs do not match rows")
+        raise ValueError(
+            "Embedding snapshot frozen feedback story IDs do not match rows"
+        )
     if len(set(story_ids.tolist())) != len(story_ids):
-        raise ValueError("Embedding snapshot frozen feedback contains duplicate story IDs")
+        raise ValueError(
+            "Embedding snapshot frozen feedback contains duplicate story IDs"
+        )
     if not set(labels.tolist()) <= {0, 1, 2}:
         raise ValueError("Embedding snapshot frozen feedback labels must be 0, 1, or 2")
     if not np.isfinite(vote_times).all():
@@ -203,6 +495,9 @@ def _load_production_candidates(
     config: Config,
     user_id: int,
     embeddings_file: str | Path | None = None,
+    *,
+    max_candidates: int | None = None,
+    required_story_ids: set[int] | None = None,
 ) -> tuple[list[Story], np.ndarray]:
     if embeddings_file is not None:
         stories = _snapshot_candidate_stories(embeddings_file)
@@ -214,6 +509,12 @@ def _load_production_candidates(
         user_id=user_id,
         exclude_feedback=False,
     )
+    indices = _candidate_indices_with_feedback(
+        stories,
+        max_candidates=max_candidates,
+        required_story_ids=required_story_ids or set(),
+    )
+    stories = [stories[i] for i in indices]
     hashes = {
         s.id: text_hash
         for s, text_hash in zip(stories, _embedding_text_hashes(stories), strict=True)
@@ -221,10 +522,7 @@ def _load_production_candidates(
     cached = db.get_embeddings_batch(
         [s.id for s in stories], config.embedding_model_version, hashes
     )
-    embeddings = np.array(
-        [cached.get(s.id, np.zeros(384, dtype=np.float32)) for s in stories],
-        dtype=np.float32,
-    )
+    embeddings = _validated_embeddings(stories, cached)
     return stories, embeddings
 
 
@@ -239,7 +537,9 @@ def _candidate_indices_with_feedback(
         return np.arange(len(candidates), dtype=int)
 
     required_indices = {
-        index for index, story in enumerate(candidates) if story.id in required_story_ids
+        index
+        for index, story in enumerate(candidates)
+        if story.id in required_story_ids
     }
     if len(required_indices) > max_candidates:
         raise RuntimeError(
@@ -247,7 +547,11 @@ def _candidate_indices_with_feedback(
         )
     optional_indices = np.array(
         sorted(
-            (index for index in range(len(candidates)) if index not in required_indices),
+            (
+                index
+                for index in range(len(candidates))
+                if index not in required_indices
+            ),
             key=lambda index: candidates[index].id,
         ),
         dtype=int,
@@ -260,117 +564,6 @@ def _candidate_indices_with_feedback(
     return np.array(
         sorted(required_indices | {int(index) for index in optional_indices}), dtype=int
     )
-
-
-def _field_embeddings_by_field(
-    stories: list[Story], embedder: Embedder, batch_size: int = 64
-) -> np.ndarray:
-    if not stories:
-        return np.empty((0, 4, 384), dtype=np.float32)
-
-    field_texts = [
-        [
-            clean_text(s.title or ""),
-            clean_text(s.self_text or "")[:SELF_FIELD_CHAR_LIMIT],
-            clean_text(s.article_body or "")[:ARTICLE_FIELD_CHAR_LIMIT],
-            clean_text(s.top_comments or "")[:COMMENT_FIELD_CHAR_LIMIT],
-        ]
-        for s in stories
-    ]
-    parts = np.zeros((len(stories), 4, 384), dtype=np.float32)
-    for field_idx in range(4):
-        texts = [fields[field_idx] for fields in field_texts]
-        non_empty = [i for i, text in enumerate(texts) if text.strip()]
-        if not non_empty:
-            continue
-        non_empty_texts = [texts[i] for i in non_empty]
-        embs = []
-        for i in range(0, len(non_empty_texts), batch_size):
-            embs.append(embedder.encode(non_empty_texts[i : i + batch_size]))
-        parts[np.array(non_empty, dtype=int), field_idx, :] = np.concatenate(
-            embs, axis=0
-        ).astype(np.float32)
-    return parts
-
-
-def _average_field_embeddings(field_parts: np.ndarray) -> np.ndarray:
-    if len(field_parts) == 0:
-        return np.empty((0, 384), dtype=np.float32)
-    present = (np.linalg.norm(field_parts, axis=2) > 0).astype(np.float32)
-    total = field_parts.sum(axis=1)
-    counts = present.sum(axis=1, keepdims=True)
-    averaged = total / np.maximum(counts, 1.0)
-    norms = np.linalg.norm(averaged, axis=1, keepdims=True)
-    norms = np.clip(norms, a_min=1e-12, a_max=None)
-    return (averaged / norms).astype(np.float32)
-
-
-def _field_level_embeddings(
-    stories: list[Story], embedder: Embedder, batch_size: int = 64
-) -> np.ndarray:
-    return _average_field_embeddings(
-        _field_embeddings_by_field(stories, embedder, batch_size)
-    )
-
-
-def _field_similarity_feature_matrix(
-    query_parts: np.ndarray,
-    train_parts: np.ndarray,
-    y_train: np.ndarray,
-    *,
-    k: int,
-    loocv: bool,
-) -> np.ndarray:
-    if len(query_parts) == 0:
-        return np.empty((0, 16), dtype=np.float32)
-
-    features = np.zeros((len(query_parts), 16), dtype=np.float32)
-    query_present = np.linalg.norm(query_parts, axis=2) > 0
-    train_present = np.linalg.norm(train_parts, axis=2) > 0
-
-    for field_idx in range(4):
-        query_emb = query_parts[:, field_idx, :]
-        train_emb = train_parts[:, field_idx, :]
-        present_query = query_present[:, field_idx]
-
-        sim_up = np.zeros(len(query_parts), dtype=np.float32)
-        sim_down = np.zeros(len(query_parts), dtype=np.float32)
-        closest_up = np.zeros(len(query_parts), dtype=np.float32)
-        closest_down = np.zeros(len(query_parts), dtype=np.float32)
-
-        for label, sim_out, closest_out in (
-            (2, sim_up, closest_up),
-            (0, sim_down, closest_down),
-        ):
-            ref_mask = (y_train == label) & train_present[:, field_idx]
-            ref_emb = train_emb[ref_mask]
-            if len(ref_emb) == 0:
-                continue
-
-            ref_indices = np.where(ref_mask)[0]
-            mat = query_emb @ ref_emb.T
-            closest_mat = mat.copy()
-            if loocv and len(query_parts) == len(train_parts):
-                for col, row in enumerate(ref_indices):
-                    if row < len(query_parts):
-                        mat[row, col] = -2.0
-                        closest_mat[row, col] = -1.0
-
-            for row in np.where(present_query)[0]:
-                exclude = 1 if loocv and row in ref_indices else 0
-                n_available = len(ref_emb) - exclude
-                if n_available <= 0:
-                    continue
-                k_use = min(k, n_available)
-                sim_out[row] = float(np.sort(mat[row])[-k_use:].mean())
-                closest_out[row] = float(np.max(closest_mat[row]))
-
-        col = field_idx * 4
-        for offset, raw in enumerate((sim_up, sim_down, closest_up, closest_down)):
-            values = _normalize_sims(raw)
-            values[~present_query] = 0.0
-            features[:, col + offset] = values
-    return features.astype(np.float32)
 
 
 def _normalize_log_lengths(lengths: np.ndarray) -> np.ndarray:
@@ -388,26 +581,10 @@ def _feature_matrix(
     sim_down: np.ndarray,
     closest_up: np.ndarray,
     closest_down: np.ndarray,
-    *,
-    textsplit: bool,
 ) -> np.ndarray:
-    if textsplit:
-        text_meta = np.column_stack(
-            [
-                _normalize_log_lengths(np.array([len(s.title) for s in stories])),
-                _normalize_log_lengths(np.array([len(s.self_text) for s in stories])),
-                _normalize_log_lengths(
-                    np.array([len(s.article_body) for s in stories])
-                ),
-                _normalize_log_lengths(
-                    np.array([len(s.top_comments) for s in stories])
-                ),
-            ]
-        )
-    else:
-        text_meta = _normalize_log_lengths(
-            np.array([len(s.text_content) for s in stories])
-        )[:, None]
+    text_meta = _normalize_log_lengths(
+        np.array([len(s.text_content) for s in stories])
+    )[:, None]
 
     sim_meta = np.column_stack(
         [
@@ -435,50 +612,13 @@ def _fit_scale(
 def _loocv_similarity_features(
     train_emb: np.ndarray, y_train: np.ndarray, k: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    up_mask = y_train == 2
-    down_mask = y_train == 0
-    up_emb = train_emb[up_mask]
-    down_emb = train_emb[down_mask]
-    sim_up = np.zeros(len(train_emb), dtype=np.float32)
-    sim_down = np.zeros(len(train_emb), dtype=np.float32)
+    from pipeline.ranking import _loocv_knn_features
 
-    if len(up_emb):
-        up_indices = np.where(up_mask)[0]
-        mat = train_emb @ up_emb.T
-        if len(up_emb) > 1:
-            for col, row in enumerate(up_indices):
-                mat[row, col] = -2.0
-        for row in range(len(train_emb)):
-            exclude = 1 if row in up_indices else 0
-            k_use = min(k, max(1, len(up_emb) - exclude))
-            sim_up[row] = np.sort(mat[row])[-k_use:].mean()
-        clean = train_emb @ up_emb.T
-        if len(up_emb) > 1:
-            for col, row in enumerate(up_indices):
-                clean[row, col] = -1.0
-        closest_up = np.max(clean, axis=1)
-    else:
-        closest_up = np.zeros(len(train_emb), dtype=np.float32)
-
-    if len(down_emb):
-        down_indices = np.where(down_mask)[0]
-        mat = train_emb @ down_emb.T
-        if len(down_emb) > 1:
-            for col, row in enumerate(down_indices):
-                mat[row, col] = -2.0
-        for row in range(len(train_emb)):
-            exclude = 1 if row in down_indices else 0
-            k_use = min(k, max(1, len(down_emb) - exclude))
-            sim_down[row] = np.sort(mat[row])[-k_use:].mean()
-        clean = train_emb @ down_emb.T
-        if len(down_emb) > 1:
-            for col, row in enumerate(down_indices):
-                clean[row, col] = -1.0
-        closest_down = np.max(clean, axis=1)
-    else:
-        closest_down = np.zeros(len(train_emb), dtype=np.float32)
-
-    return sim_up, sim_down, closest_up, closest_down
+    features = []
+    for label in (2, 0):
+        indices = np.flatnonzero(y_train == label)
+        features.append(_loocv_knn_features(train_emb, train_emb[indices], indices, k))
+    return features[0][0], features[1][0], features[0][1], features[1][1]
 
 
 def _candidate_similarity_features(
@@ -504,6 +644,8 @@ def _candidate_similarity_features(
 def _tier2_scores(
     cand_emb: np.ndarray, train_emb: np.ndarray, y_train: np.ndarray
 ) -> np.ndarray:
+    if not len(cand_emb):
+        return np.empty(0, dtype=np.float32)
     up_emb = train_emb[y_train == 2]
     down_emb = train_emb[y_train == 0]
     up_centroid = (
@@ -569,161 +711,16 @@ def _percentile_scores(scores: np.ndarray) -> np.ndarray:
     return ranks
 
 
-def _minmax_scores(scores: np.ndarray) -> np.ndarray:
-    lo = float(np.min(scores))
-    hi = float(np.max(scores))
-    return ((scores - lo) / (hi - lo + 1e-8)).astype(np.float32)
-
-
-def _story_domain(story: Story) -> str:
-    if not story.url:
-        return ""
-    host = urlparse(story.url).netloc.lower()
-    if host.startswith("www."):
-        host = host[4:]
-    return host
-
-
-def _story_source(story: Story) -> str:
-    return (story.source or "").lower()
-
-
-def _source_domain_feature_matrix(
-    query_stories: list[Story],
-    train_stories: list[Story],
-    y_train: np.ndarray,
-    *,
-    loocv: bool,
-) -> np.ndarray:
-    source_counts: Counter[str] = Counter()
-    source_up: Counter[str] = Counter()
-    source_down: Counter[str] = Counter()
-    domain_counts: Counter[str] = Counter()
-    domain_up: Counter[str] = Counter()
-    domain_down: Counter[str] = Counter()
-
-    for story, label in zip(train_stories, y_train, strict=True):
-        source = _story_source(story)
-        domain = _story_domain(story)
-        source_counts[source] += 1
-        domain_counts[domain] += 1
-        if label == 2:
-            source_up[source] += 1
-            domain_up[domain] += 1
-        elif label == 0:
-            source_down[source] += 1
-            domain_down[domain] += 1
-
-    features = np.zeros((len(query_stories), 6), dtype=np.float32)
-    for row, story in enumerate(query_stories):
-        source = _story_source(story)
-        domain = _story_domain(story)
-        source_total = source_counts[source]
-        source_pos = source_up[source]
-        source_neg = source_down[source]
-        domain_total = domain_counts[domain]
-        domain_pos = domain_up[domain]
-        domain_neg = domain_down[domain]
-
-        if loocv and row < len(train_stories):
-            label = int(y_train[row])
-            if _story_source(train_stories[row]) == source:
-                source_total -= 1
-                if label == 2:
-                    source_pos -= 1
-                elif label == 0:
-                    source_neg -= 1
-            if _story_domain(train_stories[row]) == domain:
-                domain_total -= 1
-                if label == 2:
-                    domain_pos -= 1
-                elif label == 0:
-                    domain_neg -= 1
-
-        features[row] = [
-            (source_pos + 0.5) / (source_total + 1.5),
-            (source_neg + 0.5) / (source_total + 1.5),
-            min(math.log1p(max(source_total, 0)) / 6.0, 1.0),
-            (domain_pos + 0.5) / (domain_total + 1.5),
-            (domain_neg + 0.5) / (domain_total + 1.5),
-            min(math.log1p(max(domain_total, 0)) / 6.0, 1.0),
-        ]
-    return features
-
-
-def _select_matrices(
-    fold: FoldData, *, feature_source: str, textsplit: bool
-) -> tuple[np.ndarray, np.ndarray]:
-    if feature_source == "field":
-        return fold.x_train_field, fold.x_cand_field
-    if textsplit:
-        return fold.x_train_textsplit, fold.x_cand_textsplit
-    return fold.x_train_base, fold.x_cand_base
-
-
-def _scores_prob_3class(
-    fold: FoldData, config: Config, *, textsplit: bool
-) -> tuple[np.ndarray, np.ndarray | None]:
-    train_x, cand_x = _select_matrices(fold, feature_source="base", textsplit=textsplit)
-    x_train, x_cand = _fit_scale(train_x, cand_x, fold.cand_emb.shape[1])
-    missing = sorted({0, 1, 2} - set(fold.y_train))
-    y = fold.y_train
-    weights = _balanced_weights(y)
-    if missing:
-        x_train = np.vstack([x_train, np.zeros((len(missing), x_train.shape[1]))])
-        y = np.concatenate([y, np.array(missing)])
-        weights = np.concatenate([weights, np.full(len(missing), 1e-6)])
-    svm = SVC(
-        C=config.model.svm_c,
-        kernel=config.model.svm_kernel,
-        gamma=config.model.svm_gamma,
-        random_state=0,
-        decision_function_shape="ovr",
-        probability=True,
-    )
-    svm.fit(x_train, y, sample_weight=weights)
-    probs = svm.predict_proba(x_cand)
-    classes = list(svm.classes_)
-    scores = (
-        probs[:, classes.index(2)]
-        + config.model.neutral_weight * probs[:, classes.index(1)]
-    )
-    return scores.astype(np.float32), probs
-
-
-def _scores_margin_3class(
-    fold: FoldData,
+def _fit_svc_up_margin(
+    train_raw: np.ndarray,
+    cand_raw: np.ndarray,
+    y: np.ndarray,
+    weights: np.ndarray,
     config: Config,
-    *,
-    textsplit: bool,
-    mode: str,
-    half_life_days: float | None = None,
-    hard_negative_multiplier: float | None = None,
-    label_weight_multipliers: dict[int, float] | None = None,
-) -> tuple[np.ndarray, None]:
-    train_x, cand_x = _select_matrices(fold, feature_source="base", textsplit=textsplit)
-    x_train, x_cand = _fit_scale(train_x, cand_x, fold.cand_emb.shape[1])
-    y = fold.y_train
-    weights = _balanced_weights(y)
-    if label_weight_multipliers is not None:
-        weights = weights * np.array(
-            [label_weight_multipliers.get(int(label), 1.0) for label in y],
-            dtype=np.float64,
-        )
-    if half_life_days is not None:
-        weights = weights * _recency_decay(
-            time.time(), fold.train_vote_times, half_life_days
-        )
-    if hard_negative_multiplier is not None:
-        down_mask = y == 0
-        up_emb = fold.cand_emb[:0]
-        train_emb = train_x[:, : fold.cand_emb.shape[1]]
-        if np.any(y == 2):
-            up_emb = train_emb[y == 2]
-        if np.any(down_mask) and len(up_emb):
-            hard = np.max(train_emb[down_mask] @ up_emb.T, axis=1)
-            hard = _normalize_sims(hard)
-            weights[down_mask] *= 1.0 + hard_negative_multiplier * hard
+    emb_dim: int,
+) -> np.ndarray:
+    """Shared RBF-margin fit for margin3_up and its additive ablations."""
+    x_train, x_cand = _fit_scale(train_raw, cand_raw, emb_dim)
     svm = SVC(
         C=config.model.svm_c,
         kernel=config.model.svm_kernel,
@@ -737,25 +734,142 @@ def _scores_margin_3class(
     if decision.ndim == 1:
         up_sign = 1.0 if classes[-1] == 2 else -1.0
         scores = up_sign * decision
-    elif mode == "up":
-        scores = decision[:, classes.index(2)]
-    elif mode == "up_neutral":
-        scores = (
-            decision[:, classes.index(2)]
-            + config.model.neutral_weight * decision[:, classes.index(1)]
-        )
-    elif mode == "up_minus_down":
-        scores = decision[:, classes.index(2)] - decision[:, classes.index(0)]
     else:
-        raise ValueError(f"Unknown margin mode: {mode}")
-    return scores.astype(np.float32), None
+        scores = decision[:, classes.index(2)]
+    return scores.astype(np.float32)
+
+
+def _scores_margin_3class(
+    fold: FoldData,
+    config: Config,
+    *,
+    half_life_days: float | None = None,
+) -> tuple[np.ndarray, None]:
+    y = fold.y_train
+    weights = _balanced_weights(y)
+    if half_life_days is not None:
+        weights = weights * _recency_decay(
+            float(fold.train_vote_times.max()), fold.train_vote_times, half_life_days
+        )
+    scores = _fit_svc_up_margin(
+        fold.x_train_base, fold.x_cand_base, y, weights, config, fold.cand_emb.shape[1]
+    )
+    return scores, None
+
+
+def _ablation_extra_columns(
+    fold: FoldData, config: Config, *, cluster: bool, source: bool
+) -> tuple[np.ndarray, np.ndarray]:
+    """Production-extra feature columns appended to the base margin3 matrix.
+
+    Mirrors serving: positive-cluster max-similarity over up-vote embeddings
+    and the 4-binary source category stack. Scaling is left to _fit_scale,
+    which standardizes metadata columns exactly like serving.
+    """
+    train_extras: list[np.ndarray] = []
+    cand_extras: list[np.ndarray] = []
+    emb_dim = fold.cand_emb.shape[1]
+    train_emb = fold.x_train_base[:, :emb_dim]
+    if cluster:
+        from pipeline.ranking import _positive_cluster_similarity
+
+        up_emb = train_emb[fold.y_train == 2]
+        k = config.model.positive_cluster_k
+        train_extras.append(_positive_cluster_similarity(train_emb, up_emb, k)[:, None])
+        cand_extras.append(
+            _positive_cluster_similarity(fold.cand_emb, up_emb, k)[:, None]
+        )
+    if source:
+        from pipeline.ranking import source_category_stack
+
+        train_extras.append(
+            source_category_stack([s.source for s in fold.train_stories])
+        )
+        cand_extras.append(source_category_stack([s.source for s in fold.candidates]))
+    zeros_train = np.empty((len(train_emb), 0), dtype=np.float32)
+    zeros_cand = np.empty((len(fold.cand_emb), 0), dtype=np.float32)
+    train_extra = (
+        np.hstack(train_extras).astype(np.float32) if train_extras else zeros_train
+    )
+    cand_extra = (
+        np.hstack(cand_extras).astype(np.float32) if cand_extras else zeros_cand
+    )
+    return (
+        np.hstack([fold.x_train_base, train_extra]),
+        np.hstack([fold.x_cand_base, cand_extra]),
+    )
+
+
+def _production_tier_blend(
+    margin: np.ndarray, fold: FoldData, config: Config
+) -> np.ndarray:
+    """Blend a margin scorer with tier1/tier2 using serving's alpha schedule.
+
+    Approximation note: tier1 uses the fold training cutoff as `now` (serving
+    uses wall time) and tier2 is the evaluator's centroid score, which matches
+    serving's formula on fold embeddings rather than independent feedback
+    vectors. Order effects — all NDCG cares about — are preserved.
+    """
+    from pipeline.ranking import _minmax01
+
+    cutoff = (
+        float(fold.train_vote_times.max())
+        if len(fold.train_vote_times)
+        else float(time.time())
+    )
+    tier1 = np.array(
+        [
+            s.score / max((max((cutoff - s.time) / 3600.0, 0.0) + 2.0) ** 1.8, 0.1)
+            for s in fold.candidates
+        ],
+        dtype=np.float32,
+    )
+    if tier1.max() > 0:
+        tier1 = tier1 / tier1.max()
+    y = fold.y_train
+    n_up, n_down = int((y == 2).sum()), int((y == 0).sum())
+    model = config.model
+    alpha_2 = float(np.clip(len(y) / model.tier2_blend_window, 0.0, 1.0))
+    blend_start = min(model.min_up_for_svm, model.min_down_for_svm)
+    alpha_3 = float(
+        np.clip((min(n_up, n_down) - blend_start) / model.tier3_blend_window, 0.0, 1.0)
+    )
+    t1_weight = 1.0 - alpha_2
+    t2_weight = alpha_2 * (1.0 - alpha_3)
+    t3_weight = alpha_2 * alpha_3
+    return np.asarray(
+        t1_weight * tier1
+        + t2_weight * fold.tier2_scores
+        + t3_weight * _minmax01(margin),
+        dtype=np.float32,
+    )
+
+
+def _scores_margin3_plus(
+    fold: FoldData, config: Config, *, cluster: bool, source: bool, tierblend: bool
+) -> tuple[np.ndarray, None]:
+    train_raw, cand_raw = _ablation_extra_columns(
+        fold, config, cluster=cluster, source=source
+    )
+    margin = _fit_svc_up_margin(
+        train_raw,
+        cand_raw,
+        fold.y_train,
+        _balanced_weights(fold.y_train),
+        config,
+        fold.cand_emb.shape[1],
+    )
+    if tierblend:
+        return _production_tier_blend(margin, fold, config), None
+    return margin, None
 
 
 def _prepare_linear_model_inputs(
     fold: FoldData, config: Config
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    train_x, cand_x = _select_matrices(fold, feature_source="base", textsplit=False)
-    x_train, x_cand = _fit_scale(train_x, cand_x, fold.cand_emb.shape[1])
+    x_train, x_cand = _fit_scale(
+        fold.x_train_base, fold.x_cand_base, fold.cand_emb.shape[1]
+    )
     y = fold.y_train
     weights = _balanced_weights(y)
     return x_train, x_cand, y, weights
@@ -797,888 +911,125 @@ def _scores_logreg_up(
     return scores.astype(np.float32), probs
 
 
-def _scores_sgd_log_up(
-    fold: FoldData, config: Config
-) -> tuple[np.ndarray, np.ndarray | None]:
-    x_train, x_cand, y, weights = _prepare_linear_model_inputs(fold, config)
-    clf = SGDClassifier(
-        loss="log_loss",
-        alpha=0.0001,
-        max_iter=2000,
-        tol=1e-3,
-        random_state=0,
-    )
-    clf.fit(x_train, y, sample_weight=weights)
-    probs = clf.predict_proba(x_cand)
-    classes = list(clf.classes_)  # type: ignore  # sklearn SGDClassifier.classes_ not recognized by ty after fit
-    scores = probs[:, classes.index(2)]
-    return scores.astype(np.float32), probs
-
-
-def _scores_mlp_up(
-    fold: FoldData,
-    config: Config,
-    hidden_layer_sizes: tuple[int, ...],
-    alpha: float,
-) -> tuple[np.ndarray, np.ndarray | None]:
-    x_train, x_cand, y, weights = _prepare_linear_model_inputs(fold, config)
-    clf = MLPClassifier(
-        hidden_layer_sizes=hidden_layer_sizes,
-        activation="relu",
-        solver="adam",
-        alpha=alpha,
-        batch_size=min(64, len(y)),
-        learning_rate_init=0.001,
-        max_iter=500,
-        early_stopping=True,
-        validation_fraction=0.2,
-        n_iter_no_change=20,
-        random_state=0,
-    )
-    clf.fit(x_train, y, sample_weight=weights)
-    probs = clf.predict_proba(x_cand)
-    classes = list(clf.classes_)
-    scores = probs[:, classes.index(2)]
-    return scores.astype(np.float32), probs
-
-
-def _scores_attention_mlp_up(
-    fold: FoldData, config: Config
-) -> tuple[np.ndarray, np.ndarray | None]:
-    """T1: multi-head, wide MLP, cosine sims (full Tier 1)."""
-    return _scores_attention_mlp_v1(fold, config, extra_dim=5, hidden_dim=256)
-
-
-def _scores_attention_mlp_v1_nocos_up(
-    fold: FoldData, config: Config
-) -> tuple[np.ndarray, np.ndarray | None]:
-    """T1 without cosine-sim features."""
-    return _scores_attention_mlp_v1(fold, config, extra_dim=0, hidden_dim=256)
-
-
-def _scores_attention_mlp_v1_h64_up(
-    fold: FoldData, config: Config
-) -> tuple[np.ndarray, np.ndarray | None]:
-    """T1 with hidden_dim=64 (same as T0)."""
-    return _scores_attention_mlp_v1(fold, config, extra_dim=5, hidden_dim=64)
-
-
-def _scores_attention_mlp_v1(
-    fold: FoldData, config: Config, *, extra_dim: int, hidden_dim: int
-) -> tuple[np.ndarray, np.ndarray | None]:
-    """Configurable T1 scorer.
-
-    Args:
-        extra_dim: number of cosine-sim features (0 to disable)
-        hidden_dim: MLP hidden layer width
-    """
-    return _scores_attention_mlp_v2(
-        fold,
-        config,
-        extra_dim=extra_dim,
-        hidden_dim=hidden_dim,
-        use_meta_per_class=False,
-        use_ranking=False,
-        use_mixup=False,
-    )
-
-
-# Tier 2 wrappers
-def _scores_attention_mlp_v2_rank_up(
-    fold: FoldData, config: Config
-) -> tuple[np.ndarray, np.ndarray | None]:
-    """T1 + ranking loss only."""
-    return _scores_attention_mlp_v2(
-        fold,
-        config,
-        extra_dim=0,
-        hidden_dim=256,
-        use_meta_per_class=False,
-        use_ranking=True,
-        use_mixup=False,
-    )
-
-
-def _scores_attention_mlp_v2_meta_up(
-    fold: FoldData, config: Config
-) -> tuple[np.ndarray, np.ndarray | None]:
-    """T1 + per-class meta only."""
-    return _scores_attention_mlp_v2(
-        fold,
-        config,
-        extra_dim=0,
-        hidden_dim=256,
-        use_meta_per_class=True,
-        use_ranking=False,
-        use_mixup=False,
-    )
-
-
-def _scores_attention_mlp_v2_mixup_up(
-    fold: FoldData, config: Config
-) -> tuple[np.ndarray, np.ndarray | None]:
-    """T1 + mixup only."""
-    return _scores_attention_mlp_v2(
-        fold,
-        config,
-        extra_dim=0,
-        hidden_dim=256,
-        use_meta_per_class=False,
-        use_ranking=False,
-        use_mixup=True,
-    )
-
-
-def _scores_attention_mlp_v2_all_up(
-    fold: FoldData, config: Config
-) -> tuple[np.ndarray, np.ndarray | None]:
-    """T1 + all Tier 2 features (ranking + meta + mixup)."""
-    return _scores_attention_mlp_v2(
-        fold,
-        config,
-        extra_dim=0,
-        hidden_dim=256,
-        use_meta_per_class=True,
-        use_ranking=True,
-        use_mixup=True,
-    )
-
-
-def _scores_attention_mlp_v2(
-    fold: FoldData,
-    config: Config,
-    *,
-    extra_dim: int,
-    hidden_dim: int,
-    use_meta_per_class: bool,
-    use_ranking: bool,
-    use_mixup: bool,
-) -> tuple[np.ndarray, np.ndarray | None]:
-    """Configurable T2 scorer.
-
-    Args:
-        extra_dim: number of cosine-sim features (0 to disable)
-        hidden_dim: MLP hidden layer width
-        use_meta_per_class: concatenate per-class mean meta
-        use_ranking: enable pairwise ranking loss
-        use_mixup: enable mixup augmentation
-    """
-    emb_dim = fold.cand_emb.shape[1]
-
-    train_x, cand_x = _select_matrices(fold, feature_source="base", textsplit=False)
-
-    try:
-        scaler = StandardScaler()
-        train_meta = np.clip(scaler.fit_transform(train_x[:, emb_dim:]), -2.5, 2.5)
-        cand_meta = np.clip(scaler.transform(cand_x[:, emb_dim:]), -2.5, 2.5)
-    except Exception:
-        train_meta = train_x[:, emb_dim:].copy()
-        cand_meta = cand_x[:, emb_dim:].copy()
-
-    train_emb = train_x[:, :emb_dim].astype(np.float32)
-    cand_emb = cand_x[:, :emb_dim].astype(np.float32)
-    train_labels = fold.y_train
-
-    train_extra = None
-    cand_extra = None
-    if extra_dim > 0:
-        k = config.model.knn_k
-        n_clusters = config.model.positive_cluster_k
-        up_emb = train_emb[train_labels == 2]
-        down_emb = train_emb[train_labels == 0]
-
-        def _cosine_sims(query: np.ndarray) -> np.ndarray:
-            N = len(query)
-            out = np.zeros((N, 5), dtype=np.float32)
-            if len(up_emb):
-                out[:, 0] = _knn_similarity(query, up_emb, k=min(k, len(up_emb)))
-                out[:, 1] = np.max(query @ up_emb.T, axis=1)
-            if len(down_emb):
-                out[:, 2] = _knn_similarity(query, down_emb, k=min(k, len(down_emb)))
-                out[:, 3] = np.max(query @ down_emb.T, axis=1)
-            if len(up_emb) >= n_clusters:
-                centers = _positive_cluster_centers(up_emb, n_clusters)
-                out[:, 4] = np.max(query @ centers.T, axis=1)
-            return np.clip(out, -1.0, 1.0)
-
-        train_extra = _cosine_sims(train_emb).astype(np.float32)
-        cand_extra = _cosine_sims(cand_emb).astype(np.float32)
-
-    train_meta_per_class = None
-    cand_meta_per_class = None
-    if use_meta_per_class:
-        up_meta = train_meta[train_labels == 2].mean(axis=0, keepdims=True)
-        down_meta = train_meta[train_labels == 0].mean(axis=0, keepdims=True)
-        meta_pc = np.concatenate([up_meta, down_meta], axis=1).astype(np.float32)
-        train_meta_per_class = np.tile(meta_pc, (len(train_emb), 1))
-        cand_meta_per_class = np.tile(meta_pc, (len(cand_emb), 1))
-
-    kw: dict = dict(
-        train_extra=train_extra,
-        hidden_dim=hidden_dim,
-        n_epochs=100,
-        lr=1e-3,
-        patience=15,
-        val_frac=0.2,
-        seed=0,
-    )
-    if use_ranking:
-        kw["ranking_lambda"] = 0.5
-        kw["ranking_margin"] = 0.5
-        kw["ranking_pairs"] = 256
-    if use_mixup:
-        kw["mixup_alpha"] = 0.4
-
-    model = fit_attention_mlp(
-        train_emb,
-        train_labels,
-        train_meta.astype(np.float32),
-        train_meta_per_class=train_meta_per_class,
-        **kw,
-    )
-
-    if model is None:
-        return np.full(len(cand_emb), 0.5, dtype=np.float32), None
-
-    scores, probs = predict_attention_mlp(
-        model,
-        cand_emb,
-        cand_meta.astype(np.float32),
-        train_emb,
-        train_labels,
-        cand_extra=cand_extra,
-        cand_meta_per_class=cand_meta_per_class,
-        batch_size=128,
-    )
-    return scores.astype(np.float32), probs.astype(np.float32)
-
-
-def _rank_ascending(scores: np.ndarray) -> np.ndarray:
-    """Rank items ascending (1=worst, N=best)."""
-    from scipy.stats import rankdata
-
-    return rankdata(scores, method="average").astype(np.float32)
-
-
-def _scores_blend_up(
-    fold: FoldData, config: Config, alpha: float, *, kind: str
-) -> tuple[np.ndarray, None]:
-    """Blend SVM + MLP scores.
-
-    Args:
-        alpha: weight for SVM score (0 = pure MLP, 1 = pure SVM)
-        kind: 'score' for raw-score blend, 'rank' for rank blend
-    """
-    svm_scores, _ = _scores_margin_3class(fold, config, textsplit=False, mode="up")
-    mlp_scores, _ = _scores_attention_mlp_v2_meta_up(fold, config)
-    svm_scores = svm_scores.astype(np.float32)
-    mlp_scores = mlp_scores.astype(np.float32)
-
-    if kind == "rank":
-        svm_ranks = _rank_ascending(svm_scores)
-        mlp_ranks = _rank_ascending(mlp_scores)
-        blended = alpha * svm_ranks + (1 - alpha) * mlp_ranks
-    else:  # score blend (default)
-        blended = alpha * svm_scores + (1 - alpha) * mlp_scores
-
-    return blended.astype(np.float32), None
-
-
-def _scores_attention_mlp_t0_up(
-    fold: FoldData, config: Config
-) -> tuple[np.ndarray, np.ndarray | None]:
-    """T0 baseline: single-head, narrow MLP, no cosine sims."""
-    emb_dim = fold.cand_emb.shape[1]
-
-    train_x, cand_x = _select_matrices(fold, feature_source="base", textsplit=False)
-
-    try:
-        scaler = StandardScaler()
-        train_meta = np.clip(scaler.fit_transform(train_x[:, emb_dim:]), -2.5, 2.5)
-        cand_meta = np.clip(scaler.transform(cand_x[:, emb_dim:]), -2.5, 2.5)
-    except Exception:
-        train_meta = train_x[:, emb_dim:].copy()
-        cand_meta = cand_x[:, emb_dim:].copy()
-
-    train_emb = train_x[:, :emb_dim].astype(np.float32)
-    cand_emb = cand_x[:, :emb_dim].astype(np.float32)
-    train_labels = fold.y_train
-
-    model = fit_attention_mlp_t0(
-        train_emb,
-        train_labels,
-        train_meta.astype(np.float32),
-        n_epochs=100,
-        lr=1e-3,
-        patience=15,
-        val_frac=0.2,
-        seed=0,
-    )
-
-    if model is None:
-        return np.full(len(cand_emb), 0.5, dtype=np.float32), None
-
-    scores, probs = predict_attention_mlp_t0(
-        model,
-        cand_emb,
-        cand_meta.astype(np.float32),
-        train_emb,
-        train_labels,
-        batch_size=128,
-    )
-    return scores.astype(np.float32), probs.astype(np.float32)
-
-
-def _scores_attention_mlp_t0_cos_up(
-    fold: FoldData, config: Config
-) -> tuple[np.ndarray, np.ndarray | None]:
-    """T0 baseline + cosine sim features."""
-    emb_dim = fold.cand_emb.shape[1]
-
-    train_x, cand_x = _select_matrices(fold, feature_source="base", textsplit=False)
-
-    try:
-        scaler = StandardScaler()
-        train_meta = np.clip(scaler.fit_transform(train_x[:, emb_dim:]), -2.5, 2.5)
-        cand_meta = np.clip(scaler.transform(cand_x[:, emb_dim:]), -2.5, 2.5)
-    except Exception:
-        train_meta = train_x[:, emb_dim:].copy()
-        cand_meta = cand_x[:, emb_dim:].copy()
-
-    train_emb = train_x[:, :emb_dim].astype(np.float32)
-    cand_emb = cand_x[:, :emb_dim].astype(np.float32)
-    train_labels = fold.y_train
-
-    k = config.model.knn_k
-    n_clusters = config.model.positive_cluster_k
-    up_emb = train_emb[train_labels == 2]
-    down_emb = train_emb[train_labels == 0]
-
-    def _cosine_sims(query: np.ndarray) -> np.ndarray:
-        N = len(query)
-        out = np.zeros((N, 5), dtype=np.float32)
-        if len(up_emb):
-            out[:, 0] = _knn_similarity(query, up_emb, k=min(k, len(up_emb)))
-            out[:, 1] = np.max(query @ up_emb.T, axis=1)
-        if len(down_emb):
-            out[:, 2] = _knn_similarity(query, down_emb, k=min(k, len(down_emb)))
-            out[:, 3] = np.max(query @ down_emb.T, axis=1)
-        if len(up_emb) >= n_clusters:
-            centers = _positive_cluster_centers(up_emb, n_clusters)
-            out[:, 4] = np.max(query @ centers.T, axis=1)
-        return np.clip(out, -1.0, 1.0)
-
-    train_extra = _cosine_sims(train_emb).astype(np.float32)
-    cand_extra = _cosine_sims(cand_emb).astype(np.float32)
-
-    model = fit_attention_mlp_t0(
-        train_emb,
-        train_labels,
-        train_meta.astype(np.float32),
-        train_extra=train_extra,
-        n_epochs=100,
-        lr=1e-3,
-        patience=15,
-        val_frac=0.2,
-        seed=0,
-    )
-
-    if model is None:
-        return np.full(len(cand_emb), 0.5, dtype=np.float32), None
-
-    scores, probs = predict_attention_mlp_t0(
-        model,
-        cand_emb,
-        cand_meta.astype(np.float32),
-        train_emb,
-        train_labels,
-        cand_extra=cand_extra,
-        batch_size=128,
-    )
-    return scores.astype(np.float32), probs.astype(np.float32)
-
-
-def _scores_margin_source_domain(
-    fold: FoldData, config: Config
-) -> tuple[np.ndarray, None]:
-    train_extra = _source_domain_feature_matrix(
-        fold.train_stories, fold.train_stories, fold.y_train, loocv=True
-    )
-    cand_extra = _source_domain_feature_matrix(
-        fold.candidates, fold.train_stories, fold.y_train, loocv=False
-    )
-    train_x = np.hstack([fold.x_train_base, train_extra]).astype(np.float32)
-    cand_x = np.hstack([fold.x_cand_base, cand_extra]).astype(np.float32)
-    x_train, x_cand = _fit_scale(train_x, cand_x, fold.cand_emb.shape[1])
-    weights = _balanced_weights(fold.y_train)
-    svm = SVC(
-        C=config.model.svm_c,
-        kernel=config.model.svm_kernel,
-        gamma=config.model.svm_gamma,
-        random_state=0,
-        decision_function_shape="ovr",
-    )
-    svm.fit(x_train, fold.y_train, sample_weight=weights)
-    decision = svm.decision_function(x_cand)
-    classes = list(svm.classes_)
-    if decision.ndim == 1:
-        up_sign = 1.0 if classes[-1] == 2 else -1.0
-        scores = up_sign * decision
-    else:
-        scores = decision[:, classes.index(2)]
-    return scores.astype(np.float32), None
-
-
-def _scores_margin_rank_calibrated(
-    fold: FoldData, config: Config, *, tier2_weight: float
-) -> tuple[np.ndarray, None]:
-    margin, _ = _scores_margin_3class(fold, config, textsplit=False, mode="up")
-    calibrated = _percentile_scores(margin)
-    tier2 = _percentile_scores(fold.tier2_scores)
-    return ((1.0 - tier2_weight) * calibrated + tier2_weight * tier2).astype(
-        np.float32
-    ), None
-
-
-def _scores_positive_clusters(
-    fold: FoldData, *, n_clusters: int
-) -> tuple[np.ndarray, None]:
-    up_emb = fold.x_train_base[fold.y_train == 2, : fold.cand_emb.shape[1]]
-    down_emb = fold.x_train_base[fold.y_train == 0, : fold.cand_emb.shape[1]]
-    if len(up_emb) == 0:
-        return fold.tier2_scores.copy(), None
-    if len(up_emb) <= n_clusters:
-        centers = up_emb
-    else:
-        # Deterministic farthest-first centers avoids adding another tuning surface.
-        centers = [up_emb[0]]
-        sims_to_centers = up_emb @ centers[0]
-        while len(centers) < n_clusters:
-            next_idx = int(np.argmin(sims_to_centers))
-            centers.append(up_emb[next_idx])
-            sims_to_centers = np.maximum(sims_to_centers, up_emb @ centers[-1])
-        centers = np.vstack(centers)
-    pos_score = np.max(fold.cand_emb @ centers.T, axis=1)
-    if len(down_emb):
-        down_score = np.max(fold.cand_emb @ down_emb.T, axis=1)
-    else:
-        down_score = np.zeros(len(fold.cand_emb), dtype=np.float32)
-    return _minmax_scores(pos_score - down_score), None
-
-
-def _farthest_first_centroids(embeddings: np.ndarray, n_clusters: int) -> np.ndarray:
-    if len(embeddings) <= n_clusters:
-        return embeddings.copy()
-    centers = [embeddings[0]]
-    sims_to_centers = embeddings @ centers[0]
-    while len(centers) < n_clusters:
-        next_idx = int(np.argmin(sims_to_centers))
-        centers.append(embeddings[next_idx])
-        sims_to_centers = np.maximum(sims_to_centers, embeddings @ centers[-1])
-    return np.vstack(centers).astype(np.float32)
-
-
-def _kmeans_centroids(embeddings: np.ndarray, n_clusters: int) -> np.ndarray:
-    if len(embeddings) <= n_clusters:
-        return embeddings.copy()
-    km = KMeans(n_clusters=n_clusters, n_init=10, random_state=0)
-    km.fit(embeddings)
-    centers = km.cluster_centers_.astype(np.float32)
-    norms = np.linalg.norm(centers, axis=1, keepdims=True)
-    return centers / np.clip(norms, a_min=1e-12, a_max=None)
-
-
-def _positive_cluster_centroids(
-    embeddings: np.ndarray, *, n_clusters: int, method: str
-) -> np.ndarray:
-    if method == "ff":
-        return _farthest_first_centroids(embeddings, n_clusters)
-    if method == "kmeans":
-        return _kmeans_centroids(embeddings, n_clusters)
-    raise ValueError(f"Unknown cluster method: {method}")
-
-
-def _closest_positive_cluster_feature(
-    query_emb: np.ndarray,
-    up_emb: np.ndarray,
-    *,
-    n_clusters: int,
-    method: str,
-) -> np.ndarray:
-    if len(up_emb) == 0:
-        return np.zeros(len(query_emb), dtype=np.float32)
-    centers = _positive_cluster_centroids(
-        up_emb, n_clusters=min(n_clusters, len(up_emb)), method=method
-    )
-    return _normalize_sims(np.max(query_emb @ centers.T, axis=1)).astype(np.float32)
-
-
-def _cluster_similarity_features(
-    query_emb: np.ndarray,
-    train_emb: np.ndarray,
-    y_train: np.ndarray,
-    *,
-    n_clusters: int,
-    method: str,
-) -> dict[str, np.ndarray]:
-    up_emb = train_emb[y_train == 2]
-    down_emb = train_emb[y_train == 0]
-    features: dict[str, np.ndarray] = {
-        "pos_cluster": np.zeros(len(query_emb), dtype=np.float32),
-        "neg_cluster": np.zeros(len(query_emb), dtype=np.float32),
-        "cluster_margin": np.zeros(len(query_emb), dtype=np.float32),
-        "pos_cluster_entropy": np.zeros(len(query_emb), dtype=np.float32),
-        "centroid_residual": np.zeros(len(query_emb), dtype=np.float32),
-        "down_up_interaction": np.zeros(len(query_emb), dtype=np.float32),
-    }
-
-    if len(up_emb):
-        pos_centers = _positive_cluster_centroids(
-            up_emb, n_clusters=min(n_clusters, len(up_emb)), method=method
-        )
-        pos_sims = query_emb @ pos_centers.T
-        pos_cluster = _normalize_sims(np.max(pos_sims, axis=1))
-        features["pos_cluster"] = pos_cluster.astype(np.float32)
-        logits = pos_sims * 10.0
-        logits = logits - np.max(logits, axis=1, keepdims=True)
-        probs = np.exp(logits)
-        probs = probs / np.clip(np.sum(probs, axis=1, keepdims=True), 1e-12, None)
-        entropy = -np.sum(probs * np.log2(np.clip(probs, 1e-12, None)), axis=1)
-        denom = math.log2(pos_sims.shape[1]) if pos_sims.shape[1] > 1 else 1.0
-        features["pos_cluster_entropy"] = (entropy / denom).astype(np.float32)
-        up_centroid = up_emb.mean(axis=0)
-        up_centroid = up_centroid / max(float(np.linalg.norm(up_centroid)), 1e-12)
-        centroid_sim = _normalize_sims(query_emb @ up_centroid)
-        features["centroid_residual"] = (pos_cluster - centroid_sim).astype(np.float32)
-
-    if len(down_emb):
-        neg_centers = _positive_cluster_centroids(
-            down_emb, n_clusters=min(n_clusters, len(down_emb)), method=method
-        )
-        neg_cluster = _normalize_sims(np.max(query_emb @ neg_centers.T, axis=1))
-        features["neg_cluster"] = neg_cluster.astype(np.float32)
-
-    features["cluster_margin"] = (
-        features["pos_cluster"] - features["neg_cluster"]
-    ).astype(np.float32)
-    features["down_up_interaction"] = (
-        features["pos_cluster"] * features["neg_cluster"]
-    ).astype(np.float32)
-    return features
-
-
-def _scores_margin_with_cluster_features(
-    fold: FoldData,
-    config: Config,
-    *,
-    n_clusters: int,
-    method: str,
-    feature_names: tuple[str, ...],
-) -> tuple[np.ndarray, None]:
-    train_emb = fold.x_train_base[:, : fold.cand_emb.shape[1]]
-    train_features = _cluster_similarity_features(
-        train_emb,
-        train_emb,
-        fold.y_train,
-        n_clusters=n_clusters,
-        method=method,
-    )
-    cand_features = _cluster_similarity_features(
-        fold.cand_emb,
-        train_emb,
-        fold.y_train,
-        n_clusters=n_clusters,
-        method=method,
-    )
-    train_extra = np.column_stack([train_features[name] for name in feature_names])
-    cand_extra = np.column_stack([cand_features[name] for name in feature_names])
-    train_x = np.hstack([fold.x_train_base, train_extra]).astype(np.float32)
-    cand_x = np.hstack([fold.x_cand_base, cand_extra]).astype(np.float32)
-    x_train, x_cand = _fit_scale(train_x, cand_x, fold.cand_emb.shape[1])
-    weights = _balanced_weights(fold.y_train)
-    svm = SVC(
-        C=config.model.svm_c,
-        kernel=config.model.svm_kernel,
-        gamma=config.model.svm_gamma,
-        random_state=0,
-        decision_function_shape="ovr",
-    )
-    svm.fit(x_train, fold.y_train, sample_weight=weights)
-    decision = svm.decision_function(x_cand)
-    classes = list(svm.classes_)
-    if decision.ndim == 1:
-        up_sign = 1.0 if classes[-1] == 2 else -1.0
-        scores = up_sign * decision
-    else:
-        scores = decision[:, classes.index(2)]
-    return scores.astype(np.float32), None
-
-
-def _scores_margin_3class_field(
-    fold: FoldData, config: Config, *, half_life_days: float | None = None
-) -> tuple[np.ndarray, None]:
-    x_train, x_cand = _select_matrices(fold, feature_source="field", textsplit=False)
-    x_train, x_cand = _fit_scale(x_train, x_cand, fold.cand_field_emb.shape[1])
-    y = fold.y_train
-    weights = _balanced_weights(y)
-    if half_life_days is not None:
-        weights = weights * _recency_decay(
-            time.time(), fold.train_vote_times, half_life_days
-        )
-    svm = SVC(
-        C=config.model.svm_c,
-        kernel=config.model.svm_kernel,
-        gamma=config.model.svm_gamma,
-        random_state=0,
-        decision_function_shape="ovr",
-    )
-    svm.fit(x_train, y, sample_weight=weights)
-    decision = svm.decision_function(x_cand)
-    classes = list(svm.classes_)
-    if decision.ndim == 1:
-        up_sign = 1.0 if classes[-1] == 2 else -1.0
-        scores = up_sign * decision
-    else:
-        scores = decision[:, classes.index(2)]
-    return scores.astype(np.float32), None
-
-
-def _scores_margin_3class_field_sims(
-    fold: FoldData, config: Config
-) -> tuple[np.ndarray, None]:
-    x_train, x_cand = _fit_scale(
-        fold.x_train_field_sims, fold.x_cand_field_sims, fold.cand_emb.shape[1]
-    )
-    weights = _balanced_weights(fold.y_train)
-    svm = SVC(
-        C=config.model.svm_c,
-        kernel=config.model.svm_kernel,
-        gamma=config.model.svm_gamma,
-        random_state=0,
-        decision_function_shape="ovr",
-    )
-    svm.fit(x_train, fold.y_train, sample_weight=weights)
-    decision = svm.decision_function(x_cand)
-    classes = list(svm.classes_)
-    if decision.ndim == 1:
-        up_sign = 1.0 if classes[-1] == 2 else -1.0
-        scores = up_sign * decision
-    else:
-        scores = decision[:, classes.index(2)]
-    return scores.astype(np.float32), None
-
-
-def _scores_binary_margin(
-    fold: FoldData,
-    config: Config,
-    *,
-    textsplit: bool,
-    probability: bool,
-    half_life_days: float | None = None,
-) -> tuple[np.ndarray, None]:
-    keep = fold.y_train != 1
-    train_x, cand_x = _select_matrices(fold, feature_source="base", textsplit=textsplit)
-    x_train, x_cand = _fit_scale(train_x[keep], cand_x, fold.cand_emb.shape[1])
-    y = fold.y_train[keep]
-    weights = _balanced_weights(y)
-    if half_life_days is not None:
-        weights = weights * _recency_decay(
-            time.time(), fold.train_vote_times[keep], half_life_days
-        )
-    svm_kwargs = {
-        "C": config.model.svm_c,
-        "kernel": config.model.svm_kernel,
-        "gamma": config.model.svm_gamma,
-        "random_state": 0,
-    }
-    if probability:
-        svm_kwargs["probability"] = True
-    svm = SVC(**svm_kwargs)
-    svm.fit(x_train, y, sample_weight=weights)
-    classes = list(svm.classes_)
-    if probability:
-        probs = svm.predict_proba(x_cand)
-        return probs[:, classes.index(2)].astype(np.float32), None
-    decision = svm.decision_function(x_cand)
-    up_sign = 1.0 if classes[-1] == 2 else -1.0
-    return (up_sign * decision).astype(np.float32), None
-
-
-def _scores_pairwise(
-    fold: FoldData, *, textsplit: bool, strict_up_only: bool = False
-) -> tuple[np.ndarray, None]:
-    rel = np.array([{0: 0.0, 1: 0.2, 2: 1.0}[int(y)] for y in fold.y_train])
-    train_raw, cand_raw = _select_matrices(
-        fold, feature_source="base", textsplit=textsplit
-    )
-    train_x, cand_x = _fit_scale(train_raw, cand_raw, fold.cand_emb.shape[1])
-    rng = np.random.default_rng(0)
-    pairs: list[np.ndarray] = []
-    labels: list[int] = []
-    max_pairs_per_order = 60000
-    pair_orders = (
-        ((1.0, 0.2), (1.0, 0.0))
-        if strict_up_only
-        else ((1.0, 0.2), (1.0, 0.0), (0.2, 0.0))
-    )
-    for hi_rel, lo_rel in pair_orders:
-        hi = np.where(rel == hi_rel)[0]
-        lo = np.where(rel == lo_rel)[0]
-        if not len(hi) or not len(lo):
-            continue
-        pair_idx = np.array(np.meshgrid(hi, lo)).T.reshape(-1, 2)
-        if len(pair_idx) > max_pairs_per_order:
-            pair_idx = pair_idx[
-                rng.choice(len(pair_idx), max_pairs_per_order, replace=False)
-            ]
-        diffs = train_x[pair_idx[:, 0]] - train_x[pair_idx[:, 1]]
-        pairs.append(diffs)
-        labels.extend([1] * len(diffs))
-        pairs.append(-diffs)
-        labels.extend([0] * len(diffs))
-
-    if not pairs:
-        return fold.tier2_scores.copy(), None
-
-    x_pairs = np.vstack(pairs)
-    y_pairs = np.array(labels)
-    order = rng.permutation(len(y_pairs))
-    clf = SGDClassifier(
-        loss="log_loss",
-        alpha=1e-5,
-        penalty="l2",
-        max_iter=2000,
-        tol=1e-4,
-        random_state=0,
-        class_weight="balanced",
-    )
-    clf.fit(x_pairs[order], y_pairs[order])
-    return clf.decision_function(cand_x).astype(np.float32), None
-
-
 def _metrics(
     scores: np.ndarray,
     fold: FoldData,
     config: Config,
     probs: np.ndarray | None = None,
+    *,
+    source_db: Database | None = None,
+    calibration_available: bool = False,
 ) -> dict:
-    order = np.argsort(-scores)
-    ranked = [
-        RankedStory(
-            story=fold.candidates[i], score=float(scores[i]), best_match_title=""
-        )
-        for i in order
-    ]
-    emb_map = {s.id: fold.cand_emb[i] for i, s in enumerate(fold.candidates)}
-    rel_map = {0: 0.0, 1: 0.2, 2: 1.0}
-    test_rel = np.array([rel_map[int(action)] for action in fold.test_actions])
-    ideal = test_rel.tolist()
+    """Recovery of known feedback; unjudged cards have unknown relevance."""
+    if scores.shape != (len(fold.candidates),) or not np.isfinite(scores).all():
+        raise ValueError("Scorer returned invalid scores")
+    order = np.argsort(-scores, kind="stable")
+    judged = {
+        s.id: int(a) for s, a in zip(fold.test_stories, fold.test_actions, strict=True)
+    }
+    candidate_ids = {s.id for s in fold.candidates}
 
-    def compute(rank_map: dict[int, int]) -> dict:
-        rel_by_pos = {
-            rank_map[s.id]: test_rel[i]
-            for i, s in enumerate(fold.test_stories)
-            if s.id in rank_map
+    def compute(ids: list[int], eligible: set[int]) -> dict:
+        positives = {
+            sid for sid, label in judged.items() if label == 2 and sid in eligible
         }
-
-        def ndcg(k: int) -> float:
-            dcg = sum(r / math.log2(p + 2) for p, r in rel_by_pos.items() if p < k)
-            idcg = sum(
-                r / math.log2(i + 2)
-                for i, r in enumerate(sorted(ideal, reverse=True)[:k])
+        ranks = [i for i, sid in enumerate(ids) if sid in positives]
+        n_up = len(positives)
+        result: dict[str, float | int | None] = {
+            "returned_cards": len(ids),
+            "eligible_positives": n_up,
+            "not_returned_eligible_positives": n_up - len(ranks),
+            "excluded_positives": sum(a == 2 for a in judged.values()) - n_up,
+            "judged_cards": sum(sid in judged for sid in ids),
+            "judged_coverage": sum(sid in judged for sid in ids) / len(ids)
+            if ids
+            else None,
+            "known_neutral_cards": sum(judged.get(sid) == 1 for sid in ids),
+            "known_downvote_cards": sum(judged.get(sid) == 0 for sid in ids),
+            "map": sum((i + 1) / (p + 1) for i, p in enumerate(ranks)) / n_up
+            if n_up
+            else None,
+            "median_rank": float(np.median(ranks)) if ranks else None,
+            "p25_rank": float(np.percentile(ranks, 25)) if ranks else None,
+            "p75_rank": float(np.percentile(ranks, 75)) if ranks else None,
+            "brier_up": None,
+        }
+        for k in (12, 40, 100, 200):
+            ideal = sum(1 / math.log2(i + 2) for i in range(min(n_up, k)))
+            result[f"ndcg_at_{k}"] = (
+                sum(1 / math.log2(p + 2) for p in ranks if p < k) / ideal
+                if ideal
+                else None
             )
-            return dcg / idcg if idcg > 0 else 0.0
+            result[f"up_recall_at_{k}"] = (
+                sum(p < k for p in ranks) / n_up if n_up else None
+            )
+            result[f"hit_at_{k}"] = (
+                sum(sid in judged for sid in ids[:k]) / len(judged) if judged else None
+            )
+        returned40 = len(ids[:40])
+        result["known_upvote_fraction_at_40"] = (
+            sum(p < 40 for p in ranks) / returned40 if returned40 else None
+        )
+        result["known_downvote_fraction_at_40"] = (
+            sum(judged.get(sid) == 0 for sid in ids[:40]) / returned40
+            if returned40
+            else None
+        )
+        if calibration_available and probs is not None:
+            index = {s.id: i for i, s in enumerate(fold.candidates)}
+            errors = [
+                (float(probs[index[sid], 2]) - float(judged[sid] == 2)) ** 2
+                for sid in ids
+                if sid in judged and sid in index
+            ]
+            result["brier_up"] = float(np.mean(errors)) if errors else None
+        return result
 
-        up_positions = sorted(
-            rank_map[s.id]
-            for i, s in enumerate(fold.test_stories)
-            if fold.test_actions[i] == 2 and s.id in rank_map
-        )
-        n_up = int((fold.test_actions == 2).sum())
-        ap = (
-            sum((idx + 1) / (pos + 1) for idx, pos in enumerate(up_positions)) / n_up
-            if n_up and up_positions
-            else 0.0
-        )
-        up_by_pos = set(up_positions)
-        down_positions = {
-            rank_map[s.id]
-            for i, s in enumerate(fold.test_stories)
-            if fold.test_actions[i] == 0 and s.id in rank_map
-        }
-        surfaced_positions = [
-            rank_map[s.id] for s in fold.test_stories if s.id in rank_map
+    if probs is not None and (
+        probs.shape != (len(fold.candidates), 3) or not np.isfinite(probs).all()
+    ):
+        raise ValueError("Invalid scorer probability matrix")
+    raw_ids = [fold.candidates[i].id for i in order]
+    output = {"raw": compute(raw_ids, candidate_ids)}
+    if config.model.enable_mmr:
+        ranked = [
+            RankedStory(
+                story=fold.candidates[i], score=float(scores[i]), best_match_title=""
+            )
+            for i in order
         ]
+        top = mmr_filter(
+            ranked,
+            dict(zip([s.id for s in fold.candidates], fold.cand_emb, strict=True)),
+            threshold=config.model.diversity_threshold,
+            limit=config.count,
+        )
+        output["mmr"] = compute([r.story.id for r in top], candidate_ids)
+    deck = _recommended(scores, fold, config, probs, source_db)
+    from pipeline.config import is_hn_source
 
-        def up_recall(k: int) -> float:
-            return (
-                sum(1 for p in up_by_pos if p < k) / n_up
-                if n_up
-                else 0.0
+    cutoff = int(time.time()) - 30 * 86400
+    for age in ("recent", "archive"):
+        for source in ("mixed", "hn", "non-hn"):
+            key = f"{age}_{source}"
+            eligible = {
+                s.id
+                for s in fold.candidates + [r.story for r in deck]
+                if (s.time >= cutoff) == (age == "recent")
+                and (source == "mixed" or is_hn_source(s.source) == (source == "hn"))
+            }
+            output[f"recommended_{key}"] = compute(
+                [r.story.id for r in deck if key in r.combo_keys.split()], eligible
             )
-
-        return {
-            "ndcg_at_12": ndcg(12),
-            "ndcg_at_100": ndcg(100),
-            "ndcg_at_40": ndcg(40),
-            "ndcg_at_200": ndcg(200),
-            "map": ap,
-            "precision_at_40": sum(1 for p in up_by_pos if p < 40) / 40.0,
-            "up_recall_at_12": up_recall(12),
-            "up_recall_at_40": up_recall(40),
-            "downvote_rate_at_40": sum(1 for p in down_positions if p < 40) / 40.0,
-            "hit_at_40": sum(1 for p in surfaced_positions if p < 40)
-            / max(len(fold.test_stories), 1),
-            "hit_at_100": sum(1 for p in rel_by_pos if p < 100)
-            / max(len(fold.test_stories), 1),
-        }
-
-    raw_rank_map = {fold.candidates[idx].id: pos for pos, idx in enumerate(order)}
-    top = mmr_filter(
-        ranked,
-        emb_map,
-        threshold=config.model.diversity_threshold,
-        limit=config.count,
-    )
-    mmr_rank_map = {item.story.id: pos for pos, item in enumerate(top)}
-    up_ids = {
-        s.id for i, s in enumerate(fold.test_stories) if fold.test_actions[i] == 2
-    }
-    up_ranks = [
-        pos for pos, idx in enumerate(order) if fold.candidates[idx].id in up_ids
-    ]
-    ranks = {
-        "median_rank": float(np.median(up_ranks)) if up_ranks else 0.0,
-        "p25_rank": float(np.percentile(up_ranks, 25)) if up_ranks else 0.0,
-        "p75_rank": float(np.percentile(up_ranks, 75)) if up_ranks else 0.0,
-    }
-    raw = compute(raw_rank_map) | ranks
-    mmr = compute(mmr_rank_map) | ranks
-    if probs is not None:
-        id_to_idx = {s.id: i for i, s in enumerate(fold.candidates)}
-        p_up = []
-        y_up = []
-        for i, story in enumerate(fold.test_stories):
-            if story.id in id_to_idx:
-                p_up.append(probs[id_to_idx[story.id], 2])
-                y_up.append(1.0 if fold.test_actions[i] == 2 else 0.0)
-        raw["brier_up"] = float(np.mean((np.array(p_up) - np.array(y_up)) ** 2))
-        mmr["brier_up"] = raw["brier_up"]
-    else:
-        raw["brier_up"] = 0.0
-        mmr["brier_up"] = 0.0
-    return {"raw": raw, "mmr": mmr}
+    return output
 
 
 def _make_fold(
     candidates: list[Story],
     cand_emb: np.ndarray,
-    cand_field_emb: np.ndarray,
-    cand_field_parts: np.ndarray,
     fb_stories: list[Story],
     fb_to_cand: np.ndarray,
-    fb_field_emb: np.ndarray,
-    fb_field_parts: np.ndarray,
     fb_vote_times: np.ndarray,
     y: np.ndarray,
     valid_positions: np.ndarray,
@@ -1686,29 +1037,42 @@ def _make_fold(
     test_pos: np.ndarray,
     config: Config,
     *,
-    needs_field: bool,
+    feedback_embeddings: np.ndarray | None = None,
+    needs_experimental: bool = True,
 ) -> FoldData:
     train_story_indices = valid_positions[train_pos]
     test_story_indices = valid_positions[test_pos]
     train_ids = {fb_stories[idx].id for idx in train_story_indices}
-    cand_mask = np.array([s.id not in train_ids for s in candidates])
+    cand_mask = np.array([s.id not in train_ids for s in candidates], dtype=bool)
     fold_candidates = [s for i, s in enumerate(candidates) if cand_mask[i]]
     fold_cand_emb = cand_emb[cand_mask]
-    fold_cand_field_emb = cand_field_emb[cand_mask]
-    fold_cand_field_parts = cand_field_parts[cand_mask]
 
-    train_emb = cand_emb[fb_to_cand[train_story_indices]]
-    train_field_emb = fb_field_emb[train_story_indices] if needs_field else train_emb
-    train_field_parts = (
-        fb_field_parts[train_story_indices]
-        if needs_field
-        else np.empty((0, 4, 384), dtype=np.float32)
+    train_emb = (
+        feedback_embeddings[train_story_indices]
+        if feedback_embeddings is not None
+        else cand_emb[fb_to_cand[train_story_indices]]
     )
     y_train = y[train_pos]
     train_stories = [fb_stories[idx] for idx in train_story_indices]
     test_stories = [fb_stories[idx] for idx in test_story_indices]
     test_actions = y[test_pos]
     train_vote_times = fb_vote_times[train_pos]
+
+    if not needs_experimental:
+        empty = np.empty((0, 0), dtype=np.float32)
+        return FoldData(
+            candidates=fold_candidates,
+            cand_emb=fold_cand_emb,
+            train_stories=train_stories,
+            test_stories=test_stories,
+            test_actions=test_actions,
+            train_vote_times=train_vote_times,
+            x_train_base=empty,
+            x_cand_base=empty,
+            y_train=y_train,
+            train_emb=train_emb,
+            tier2_scores=_tier2_scores(fold_cand_emb, train_emb, y_train),
+        )
 
     train_sim_up, train_sim_down, train_closest_up, train_closest_down = (
         _loocv_similarity_features(train_emb, y_train, config.model.knn_k)
@@ -1718,87 +1082,10 @@ def _make_fold(
             fold_cand_emb, train_emb, y_train, config.model.knn_k
         )
     )
-    if needs_field:
-        (
-            train_field_sim_up,
-            train_field_sim_down,
-            train_field_closest_up,
-            train_field_closest_down,
-        ) = _loocv_similarity_features(train_field_emb, y_train, config.model.knn_k)
-        (
-            cand_field_sim_up,
-            cand_field_sim_down,
-            cand_field_closest_up,
-            cand_field_closest_down,
-        ) = _candidate_similarity_features(
-            fold_cand_field_emb, train_field_emb, y_train, config.model.knn_k
-        )
-        x_train_field = _feature_matrix(
-            train_field_emb,
-            train_stories,
-            train_field_sim_up,
-            train_field_sim_down,
-            train_field_closest_up,
-            train_field_closest_down,
-            textsplit=False,
-        )
-        x_cand_field = _feature_matrix(
-            fold_cand_field_emb,
-            fold_candidates,
-            cand_field_sim_up,
-            cand_field_sim_down,
-            cand_field_closest_up,
-            cand_field_closest_down,
-            textsplit=False,
-        )
-        train_field_sim_features = _field_similarity_feature_matrix(
-            train_field_parts,
-            train_field_parts,
-            y_train,
-            k=config.model.knn_k,
-            loocv=True,
-        )
-        cand_field_sim_features = _field_similarity_feature_matrix(
-            fold_cand_field_parts,
-            train_field_parts,
-            y_train,
-            k=config.model.knn_k,
-            loocv=False,
-        )
-        train_base_meta = _feature_matrix(
-            train_emb,
-            train_stories,
-            train_sim_up,
-            train_sim_down,
-            train_closest_up,
-            train_closest_down,
-            textsplit=True,
-        )[:, train_emb.shape[1] :]
-        cand_base_meta = _feature_matrix(
-            fold_cand_emb,
-            fold_candidates,
-            cand_sim_up,
-            cand_sim_down,
-            cand_closest_up,
-            cand_closest_down,
-            textsplit=True,
-        )[:, fold_cand_emb.shape[1] :]
-        x_train_field_sims = np.hstack(
-            [train_emb, train_base_meta, train_field_sim_features]
-        ).astype(np.float32)
-        x_cand_field_sims = np.hstack(
-            [fold_cand_emb, cand_base_meta, cand_field_sim_features]
-        ).astype(np.float32)
-    else:
-        x_train_field = np.empty((0, 0), dtype=np.float32)
-        x_cand_field = np.empty((0, 0), dtype=np.float32)
-        x_train_field_sims = np.empty((0, 0), dtype=np.float32)
-        x_cand_field_sims = np.empty((0, 0), dtype=np.float32)
     return FoldData(
+        train_emb=train_emb,
         candidates=fold_candidates,
         cand_emb=fold_cand_emb,
-        cand_field_emb=fold_cand_field_emb,
-        cand_field_parts=fold_cand_field_parts,
         train_stories=train_stories,
         test_stories=test_stories,
         test_actions=test_actions,
@@ -1810,7 +1097,6 @@ def _make_fold(
             train_sim_down,
             train_closest_up,
             train_closest_down,
-            textsplit=False,
         ),
         x_cand_base=_feature_matrix(
             fold_cand_emb,
@@ -1819,29 +1105,6 @@ def _make_fold(
             cand_sim_down,
             cand_closest_up,
             cand_closest_down,
-            textsplit=False,
-        ),
-        x_train_field=x_train_field,
-        x_cand_field=x_cand_field,
-        x_train_field_sims=x_train_field_sims,
-        x_cand_field_sims=x_cand_field_sims,
-        x_train_textsplit=_feature_matrix(
-            train_emb,
-            train_stories,
-            train_sim_up,
-            train_sim_down,
-            train_closest_up,
-            train_closest_down,
-            textsplit=True,
-        ),
-        x_cand_textsplit=_feature_matrix(
-            fold_cand_emb,
-            fold_candidates,
-            cand_sim_up,
-            cand_sim_down,
-            cand_closest_up,
-            cand_closest_down,
-            textsplit=True,
         ),
         y_train=y_train,
         tier2_scores=_tier2_scores(fold_cand_emb, train_emb, y_train),
@@ -1857,68 +1120,43 @@ def _temporal_splits(
 ) -> list[FoldSplit]:
     if folds < 1:
         raise ValueError("--folds must be at least 1")
+    if y.ndim != 1 or vote_times.shape != y.shape:
+        raise ValueError("Labels and timestamps must be aligned vectors")
     if len(y) < 2:
-        raise RuntimeError("Need at least 2 valid feedback rows for temporal evaluation")
-    order = np.argsort(vote_times, kind="mergesort")
-    initial_train_size = int(math.floor(len(order) * initial_train_frac))
-    initial_train_size = min(max(initial_train_size, 1), len(order) - 1)
-    test_blocks = [
-        block.astype(int)
-        for block in np.array_split(order[initial_train_size:], folds)
-        if len(block)
-    ]
-    splits = []
-    train_end = initial_train_size
-    for fold_no, block in enumerate(test_blocks, start=1):
-        splits.append(
-            FoldSplit(
-                fold_no=fold_no,
-                train_pos=order[:train_end],
-                test_pos=block,
-            )
+        raise RuntimeError(
+            "Need at least 2 valid feedback rows for temporal evaluation"
         )
-        train_end += len(block)
+    if not np.isfinite(vote_times).all() or not 0 < initial_train_frac < 1:
+        raise ValueError("Finite timestamps and 0 < initial_train_frac < 1 required")
+    groups = np.unique(vote_times)
+    if len(groups) < folds + 1:
+        raise ValueError("Need at least folds + 1 distinct timestamp groups")
+    initial = max(1, min(int(len(groups) * initial_train_frac), len(groups) - folds))
+    blocks = np.array_split(groups[initial:], folds)
+    splits = [
+        FoldSplit(
+            i,
+            np.flatnonzero(vote_times < block[0]),
+            np.flatnonzero(np.isin(vote_times, block)),
+        )
+        for i, block in enumerate(blocks, 1)
+    ]
     return splits
 
 
-def _stratified_splits(y: np.ndarray, *, folds: int) -> list[FoldSplit]:
-    splits = StratifiedKFold(n_splits=folds, shuffle=True, random_state=0).split(
-        np.zeros((len(y), 1)), y
-    )
-    return [
-        FoldSplit(fold_no=fold_no, train_pos=train_pos, test_pos=test_pos)
-        for fold_no, (train_pos, test_pos) in enumerate(splits, start=1)
-    ]
-
-
 def _variant_requires_all_labels(name: str) -> bool:
-    all_label_prefixes = (
-        "legacy_prob_3class",
-        "prob_3class",
-        "margin3",
-        "linear_svc",
-        "logreg",
-        "sgd_log",
-        "mlp_",
-        "source_domain",
-        "rank_calibrated",
-        "field_",
-        "pos_cluster_feat",
-        "neg_cluster_feat",
-        "cluster_margin",
-        "pos_cluster_entropy",
-        "centroid_residual",
-        "down_up_interaction",
-        "cluster_combo",
-        "attention_mlp",
-        "attn_mlp",
-        "blend_",
-    )
+    all_label_prefixes = ("margin3", "linear_svc", "logreg")
     return name.startswith(all_label_prefixes)
 
 
 def _required_labels_for_variants(variant_names: list[str]) -> set[int]:
-    labels = {0, 2}
+    labels = (
+        set()
+        if all(
+            name == "production" or name.startswith("svm_") for name in variant_names
+        )
+        else {0, 2}
+    )
     if any(_variant_requires_all_labels(name) for name in variant_names):
         labels.add(1)
     return labels
@@ -1947,33 +1185,38 @@ def _validate_splits(
 
 def _aggregate_results(
     rows_by_name: dict[str, list[dict]],
-    metric_keys: list[str],
 ) -> dict[str, dict[str, Any]]:
-    return {
-        name: {
-            "mean": {
-                side: {
-                    key: float(np.mean([row[side][key] for row in rows]))
-                    for key in metric_keys
-                }
-                for side in ("raw", "mmr")
-            },
-            "std": {
-                side: {
-                    key: float(np.std([row[side][key] for row in rows]))
-                    for key in metric_keys
-                }
-                for side in ("raw", "mmr")
-            },
+    aggregated = {}
+    for name, rows in rows_by_name.items():
+        if not rows:
+            raise ValueError(f"No completed folds for {name}")
+        result: dict[str, Any] = {
+            "mean": {},
+            "std": {},
+            "defined_folds": {},
             "per_fold": rows,
         }
-        for name, rows in rows_by_name.items()
-    }
+        for side in rows[0]:
+            result["mean"][side] = {}
+            result["std"][side] = {}
+            result["defined_folds"][side] = {}
+            for key in rows[0][side]:
+                values = [row[side][key] for row in rows if row[side][key] is not None]
+                result["mean"][side][key] = float(np.mean(values)) if values else None
+                result["std"][side][key] = float(np.std(values)) if values else None
+                result["defined_folds"][side][key] = len(values)
+        aggregated[name] = result
+    return aggregated
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    with ExitStack() as stack:
+        _main(argv, stack)
+
+
+def _main(argv: list[str] | None, stack: ExitStack) -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="config.toml")
+    parser.add_argument("--config", help="Configuration file; defaults to config.toml")
     parser.add_argument("--output", default="eval_ranker_variants.json")
     parser.add_argument(
         "--embeddings-file",
@@ -1986,6 +1229,7 @@ def main() -> None:
         "--embedding-label",
         help="Human-readable embedding specification recorded in the JSON report.",
     )
+    parser.add_argument("--user-id", type=int)
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument(
         "--split",
@@ -1993,7 +1237,7 @@ def main() -> None:
         default="temporal",
         help=(
             "Evaluation split. temporal uses expanding-window chronological folds; "
-            "stratified preserves the previous shuffled class-balanced split."
+            "stratified is rejected because its historical meaning cannot be preserved."
         ),
     )
     parser.add_argument(
@@ -2005,10 +1249,11 @@ def main() -> None:
     parser.add_argument("--svm-gamma", type=float)
     parser.add_argument(
         "--variants",
-        help="Comma-separated variant names to run. Defaults to all variants.",
+        help="Comma-separated variant names to run. Defaults to production; production is always included.",
     )
     parser.add_argument(
         "--max-candidates",
+        "--candidate-cap",
         type=int,
         help="Sample at most this many candidate stories after loading the eval window.",
     )
@@ -2028,9 +1273,60 @@ def main() -> None:
             "leakage in the offline harness."
         ),
     )
-    args = parser.parse_args()
-
-    config = Config.load(args.config)
+    parser.add_argument(
+        "--sweep-svm",
+        action="store_true",
+        help="Compare the named C/gamma grid against production",
+    )
+    parser.add_argument(
+        "--confirmation",
+        action="store_true",
+        help="Evaluate the reserved latest 20 percent of timestamp groups",
+    )
+    parser.add_argument("--now", type=float, help="Frozen evaluation Unix timestamp")
+    parser.add_argument(
+        "--candidate-cap-seed",
+        type=int,
+        default=0,
+        help="Legacy no-op; only zero is accepted",
+    )
+    args = parser.parse_args(argv)
+    if args.candidate_cap_seed != 0:
+        parser.error("--candidate-cap-seed was a no-op; only 0 is supported")
+    for option in ("svm_c", "svm_gamma"):
+        value = getattr(args, option)
+        if value is not None and (not math.isfinite(value) or value <= 0):
+            parser.error(f"--{option.replace('_', '-')} must be finite and positive")
+    for option in ("folds", "max_candidates", "max_feedback_per_class", "window_days"):
+        value = getattr(args, option)
+        if value is not None and value <= 0:
+            parser.error(f"--{option.replace('_', '-')} must be positive")
+    if args.split != "temporal":
+        parser.error(
+            "--split stratified is retired: chronological evaluation is required"
+        )
+    config = Config.load(args.config or "config.toml")
+    if args.embeddings_file and (
+        args.config is not None or args.window_days is not None
+    ):
+        parser.error(
+            "Frozen embedding snapshots cannot be combined with --config or --window-days"
+        )
+    database_path = config.db_path
+    frozen_now = None
+    if args.embeddings_file:
+        config, frozen_now, database_path = _snapshot_context(args.embeddings_file)
+    now = (
+        args.now
+        if args.now is not None
+        else frozen_now
+        if frozen_now is not None
+        else time.time()
+    )
+    if not math.isfinite(now):
+        parser.error("--now must be finite")
+    stack.enter_context(patch("time.time", return_value=now))
+    production_config = config
     if args.svm_c is not None or args.svm_gamma is not None:
         model = replace(
             config.model,
@@ -2040,30 +1336,29 @@ def main() -> None:
             ),
         )
         config = replace(config, model=ModelConfig(**model.__dict__))
-    db = Database(config.db_path)
-    user = db.get_user_by_token("default")
+    db, snapshot_hash = stack.enter_context(frozen_database(database_path))
+    user_id = args.user_id
+    if args.embeddings_file:
+        with np.load(args.embeddings_file, allow_pickle=False) as data:
+            snapshot_user_id = int(data["user_id"].item())
+        if user_id is not None and user_id != snapshot_user_id:
+            parser.error("--user-id does not match the frozen feedback owner")
+        user_id = snapshot_user_id
+    user = (
+        db.get_user_by_id(user_id)
+        if user_id is not None
+        else db.get_user_by_token("default")
+    )
     if user is None:
-        raise RuntimeError("Missing default user token")
+        raise RuntimeError("Missing evaluation user")
 
     requested = (
         [name.strip() for name in args.variants.split(",") if name.strip()]
         if args.variants
-        else []
+        else ["production"]
     )
-    needs_field = (not requested) or any(
-        name.startswith("field_") for name in requested
-    )
-    embedder = (
-        Embedder(
-            config.onnx_model_dir,
-            model_version=config.embedding_model_version,
-            max_tokens=config.embedding_max_tokens,
-            batch_size=config.embedding_batch_size,
-            ort_variant=config.embedding_ort_variant,
-        )
-        if needs_field
-        else None
-    )
+    if "production" not in requested:
+        requested.insert(0, "production")
 
     window_days = args.window_days if args.window_days is not None else config.days
     eval_config = replace(config, days=window_days)
@@ -2074,19 +1369,17 @@ def main() -> None:
             user_id=user.id
         )
         all_y = np.array(fb_labels, dtype=int)
-    candidates, cand_emb = _load_production_candidates(
-        db,
-        eval_config,
-        user.id,
-        embeddings_file=args.embeddings_file,
-    )
-    cand_id_to_idx = {s.id: i for i, s in enumerate(candidates)}
-    if args.embeddings_file:
-        candidate_by_id = {story.id: story for story in candidates}
-        fb_stories = [candidate_by_id.get(story.id, story) for story in fb_stories]
     fb_vote_times = np.array(fb_vote_times, dtype=np.float64)
-    fb_to_cand = np.array([cand_id_to_idx.get(s.id, -1) for s in fb_stories])
-    valid_mask = fb_to_cand >= 0
+    valid_mask = np.ones(len(fb_stories), dtype=bool)
+
+    groups = np.unique(fb_vote_times)
+    if len(groups) < 3:
+        raise ValueError(
+            "Need at least three timestamp groups before reserving confirmation"
+        )
+    confirmation_start = groups[max(1, int(math.floor(len(groups) * 0.8)))]
+    if not np.isfinite(fb_vote_times).all() or not set(all_y.tolist()) <= {0, 1, 2}:
+        raise ValueError("Invalid feedback labels or timestamps")
 
     if args.max_feedback_per_class is not None:
         rng = np.random.default_rng(0)
@@ -2102,44 +1395,55 @@ def main() -> None:
         fb_stories = [fb_stories[i] for i in keep_feedback_positions]
         all_y = all_y[keep_feedback_positions]
         fb_vote_times = fb_vote_times[keep_feedback_positions]
-        fb_to_cand = fb_to_cand[keep_feedback_positions]
-        valid_mask = fb_to_cand >= 0
+        valid_mask = np.ones(len(fb_stories), dtype=bool)
 
-    if (
-        args.embeddings_file is None
-        and args.max_candidates is not None
-        and len(candidates) > args.max_candidates
-    ):
-        required_ids = {s.id for s in fb_stories if s.id in cand_id_to_idx}
-        keep_candidate_indices = _candidate_indices_with_feedback(
-            candidates,
-            max_candidates=args.max_candidates,
-            required_story_ids=required_ids,
+    if args.embeddings_file and args.max_candidates is not None:
+        parser.error(
+            "--max-candidates cannot change a frozen embedding snapshot; cap it at bakeoff creation"
         )
-        candidates = [candidates[i] for i in keep_candidate_indices]
-        cand_emb = cand_emb[keep_candidate_indices]
-        cand_id_to_idx = {s.id: i for i, s in enumerate(candidates)}
-        fb_to_cand = np.array([cand_id_to_idx.get(s.id, -1) for s in fb_stories])
-        valid_mask = fb_to_cand >= 0
-
-    cand_field_parts = (
-        _field_embeddings_by_field(candidates, embedder)
-        if needs_field and embedder is not None
-        else np.empty((len(candidates), 4, cand_emb.shape[1]), dtype=np.float32)
+    candidates, cand_emb = _load_production_candidates(
+        db,
+        eval_config,
+        user.id,
+        embeddings_file=args.embeddings_file,
+        max_candidates=args.max_candidates,
+        required_story_ids={s.id for s in fb_stories},
     )
-    fb_field_parts = np.empty((len(fb_stories), 4, cand_emb.shape[1]), dtype=np.float32)
-    if needs_field and embedder is not None:
-        fb_field_parts.fill(0.0)
-        valid_fb_positions = np.where(valid_mask)[0]
-        fb_field_parts[valid_fb_positions] = cand_field_parts[
-            fb_to_cand[valid_fb_positions]
-        ]
+    cand_id_to_idx = {s.id: i for i, s in enumerate(candidates)}
+    fb_to_cand = np.array([cand_id_to_idx.get(s.id, -1) for s in fb_stories])
+
+    if args.embeddings_file:
+        with np.load(args.embeddings_file, allow_pickle=False) as data:
+            if "feedback_embeddings" not in data.files:
+                raise ValueError(
+                    "Snapshot requires independent feedback_embeddings; regenerate bakeoff"
+                )
+            original_stories, _, _ = _snapshot_feedback(args.embeddings_file)
+            vectors = dict(
+                zip(
+                    [s.id for s in original_stories],
+                    data["feedback_embeddings"],
+                    strict=True,
+                )
+            )
+            feedback_embeddings = _validated_embeddings(fb_stories, vectors)
     else:
-        fb_field_parts = np.empty(
-            (len(fb_stories), 4, cand_emb.shape[1]), dtype=np.float32
+        hashes = dict(
+            zip(
+                [s.id for s in fb_stories],
+                _embedding_text_hashes(fb_stories),
+                strict=True,
+            )
         )
-    cand_field_emb = _average_field_embeddings(cand_field_parts)
-    fb_field_emb = _average_field_embeddings(fb_field_parts)
+        feedback_embeddings = _validated_embeddings(
+            fb_stories,
+            db.get_embeddings_batch(
+                [s.id for s in fb_stories], config.embedding_model_version, hashes
+            ),
+        )
+    if not args.confirmation:
+        valid_mask &= fb_vote_times < confirmation_start
+
     valid_positions = np.where(valid_mask)[0]
     y = all_y[valid_mask]
     fb_vote_times = fb_vote_times[valid_mask]
@@ -2147,7 +1451,7 @@ def main() -> None:
     candidate_recall = {}
     for label in (0, 1, 2):
         total = int((all_y == label).sum())
-        present = int(((all_y == label) & valid_mask).sum())
+        present = int(((all_y == label) & (fb_to_cand >= 0)).sum())
         candidate_recall[label_names[label]] = {
             "present": present,
             "total": total,
@@ -2161,365 +1465,45 @@ def main() -> None:
     print(f"candidate_recall={candidate_recall}")
 
     variants = {
-        "legacy_prob_3class": lambda fold: _scores_prob_3class(
-            fold, config, textsplit=False
-        ),
-        "prob_3class_textsplit": lambda fold: _scores_prob_3class(
-            fold, config, textsplit=True
-        ),
-        "margin3_up": lambda fold: _scores_margin_3class(
-            fold, config, textsplit=False, mode="up"
-        ),
+        "production": lambda fold: _production_scores(fold, production_config, db),
+        "margin3_up": lambda fold: _scores_margin_3class(fold, config),
         "linear_svc_up": lambda fold: _scores_linear_svc_up(fold, config),
         "logreg_up": lambda fold: _scores_logreg_up(fold, config),
-        "sgd_log_up": lambda fold: _scores_sgd_log_up(fold, config),
-        "mlp_32_a1e-3": lambda fold: _scores_mlp_up(fold, config, (32,), 1e-3),
-        "mlp_64_a1e-3": lambda fold: _scores_mlp_up(fold, config, (64,), 1e-3),
-        "mlp_64_16_a1e-3": lambda fold: _scores_mlp_up(fold, config, (64, 16), 1e-3),
-        "source_domain_margin3_up": lambda fold: _scores_margin_source_domain(
-            fold, config
-        ),
-        "rank_calibrated_tier2_10": lambda fold: _scores_margin_rank_calibrated(
-            fold, config, tier2_weight=0.10
-        ),
-        "rank_calibrated_tier2_20": lambda fold: _scores_margin_rank_calibrated(
-            fold, config, tier2_weight=0.20
-        ),
-        "rank_calibrated_tier2_30": lambda fold: _scores_margin_rank_calibrated(
-            fold, config, tier2_weight=0.30
-        ),
-        "field_margin3_up": lambda fold: _scores_margin_3class_field(fold, config),
-        "field_sims_margin3_up": lambda fold: _scores_margin_3class_field_sims(
-            fold, config
-        ),
         "margin3_up_recency30d": lambda fold: _scores_margin_3class(
-            fold, config, textsplit=False, mode="up", half_life_days=30.0
-        ),
-        "field_margin3_up_recency30d": lambda fold: _scores_margin_3class_field(
             fold, config, half_life_days=30.0
         ),
-        "margin3_up_recency90d": lambda fold: _scores_margin_3class(
-            fold, config, textsplit=False, mode="up", half_life_days=90.0
+        "margin3_plus_cluster": lambda fold: _scores_margin3_plus(
+            fold, config, cluster=True, source=False, tierblend=False
         ),
-        "margin3_up_minus_down": lambda fold: _scores_margin_3class(
-            fold, config, textsplit=False, mode="up_minus_down"
+        "margin3_plus_source": lambda fold: _scores_margin3_plus(
+            fold, config, cluster=False, source=True, tierblend=False
         ),
-        "positive_clusters_4": lambda fold: _scores_positive_clusters(
-            fold, n_clusters=4
+        "margin3_plus_tierblend": lambda fold: _scores_margin3_plus(
+            fold, config, cluster=False, source=False, tierblend=True
         ),
-        "positive_clusters_8": lambda fold: _scores_positive_clusters(
-            fold, n_clusters=8
+        "margin3_plus_all": lambda fold: _scores_margin3_plus(
+            fold, config, cluster=True, source=True, tierblend=True
         ),
-        "pos_cluster_feat_ff4": lambda fold: _scores_margin_with_cluster_features(
-            fold, config, n_clusters=4, method="ff", feature_names=("pos_cluster",)
-        ),
-        "pos_cluster_feat_ff8": lambda fold: _scores_margin_with_cluster_features(
-            fold, config, n_clusters=8, method="ff", feature_names=("pos_cluster",)
-        ),
-        "pos_cluster_feat_ff12": lambda fold: _scores_margin_with_cluster_features(
-            fold, config, n_clusters=12, method="ff", feature_names=("pos_cluster",)
-        ),
-        "pos_cluster_feat_kmeans4": lambda fold: _scores_margin_with_cluster_features(
-            fold, config, n_clusters=4, method="kmeans", feature_names=("pos_cluster",)
-        ),
-        "pos_cluster_feat_kmeans2": lambda fold: _scores_margin_with_cluster_features(
-            fold, config, n_clusters=2, method="kmeans", feature_names=("pos_cluster",)
-        ),
-        "pos_cluster_feat_kmeans3": lambda fold: _scores_margin_with_cluster_features(
-            fold, config, n_clusters=3, method="kmeans", feature_names=("pos_cluster",)
-        ),
-        "pos_cluster_feat_kmeans5": lambda fold: _scores_margin_with_cluster_features(
-            fold, config, n_clusters=5, method="kmeans", feature_names=("pos_cluster",)
-        ),
-        "pos_cluster_feat_kmeans6": lambda fold: _scores_margin_with_cluster_features(
-            fold, config, n_clusters=6, method="kmeans", feature_names=("pos_cluster",)
-        ),
-        "pos_cluster_feat_kmeans8": lambda fold: _scores_margin_with_cluster_features(
-            fold, config, n_clusters=8, method="kmeans", feature_names=("pos_cluster",)
-        ),
-        "pos_cluster_feat_kmeans12": lambda fold: _scores_margin_with_cluster_features(
-            fold, config, n_clusters=12, method="kmeans", feature_names=("pos_cluster",)
-        ),
-        "pos_cluster_feat_kmeans16": lambda fold: _scores_margin_with_cluster_features(
-            fold, config, n_clusters=16, method="kmeans", feature_names=("pos_cluster",)
-        ),
-        "pos_cluster_feat_kmeans24": lambda fold: _scores_margin_with_cluster_features(
-            fold, config, n_clusters=24, method="kmeans", feature_names=("pos_cluster",)
-        ),
-        "neg_cluster_feat_kmeans4": lambda fold: _scores_margin_with_cluster_features(
-            fold, config, n_clusters=4, method="kmeans", feature_names=("neg_cluster",)
-        ),
-        "cluster_margin_feat_kmeans4": lambda fold: _scores_margin_with_cluster_features(
-            fold,
-            config,
-            n_clusters=4,
-            method="kmeans",
-            feature_names=("cluster_margin",),
-        ),
-        "pos_cluster_entropy_kmeans4": lambda fold: _scores_margin_with_cluster_features(
-            fold,
-            config,
-            n_clusters=4,
-            method="kmeans",
-            feature_names=("pos_cluster_entropy",),
-        ),
-        "centroid_residual_kmeans4": lambda fold: _scores_margin_with_cluster_features(
-            fold,
-            config,
-            n_clusters=4,
-            method="kmeans",
-            feature_names=("centroid_residual",),
-        ),
-        "down_up_interaction_kmeans4": lambda fold: _scores_margin_with_cluster_features(
-            fold,
-            config,
-            n_clusters=4,
-            method="kmeans",
-            feature_names=("down_up_interaction",),
-        ),
-        "down_up_interaction_kmeans2": lambda fold: _scores_margin_with_cluster_features(
-            fold,
-            config,
-            n_clusters=2,
-            method="kmeans",
-            feature_names=("down_up_interaction",),
-        ),
-        "down_up_interaction_kmeans3": lambda fold: _scores_margin_with_cluster_features(
-            fold,
-            config,
-            n_clusters=3,
-            method="kmeans",
-            feature_names=("down_up_interaction",),
-        ),
-        "down_up_interaction_kmeans5": lambda fold: _scores_margin_with_cluster_features(
-            fold,
-            config,
-            n_clusters=5,
-            method="kmeans",
-            feature_names=("down_up_interaction",),
-        ),
-        "down_up_interaction_kmeans6": lambda fold: _scores_margin_with_cluster_features(
-            fold,
-            config,
-            n_clusters=6,
-            method="kmeans",
-            feature_names=("down_up_interaction",),
-        ),
-        "down_up_interaction_kmeans8": lambda fold: _scores_margin_with_cluster_features(
-            fold,
-            config,
-            n_clusters=8,
-            method="kmeans",
-            feature_names=("down_up_interaction",),
-        ),
-        "down_up_interaction_kmeans12": lambda fold: _scores_margin_with_cluster_features(
-            fold,
-            config,
-            n_clusters=12,
-            method="kmeans",
-            feature_names=("down_up_interaction",),
-        ),
-        "down_up_interaction_kmeans16": lambda fold: _scores_margin_with_cluster_features(
-            fold,
-            config,
-            n_clusters=16,
-            method="kmeans",
-            feature_names=("down_up_interaction",),
-        ),
-        "down_up_interaction_kmeans24": lambda fold: _scores_margin_with_cluster_features(
-            fold,
-            config,
-            n_clusters=24,
-            method="kmeans",
-            feature_names=("down_up_interaction",),
-        ),
-        "cluster_combo_kmeans4": lambda fold: _scores_margin_with_cluster_features(
-            fold,
-            config,
-            n_clusters=4,
-            method="kmeans",
-            feature_names=(
-                "pos_cluster",
-                "neg_cluster",
-                "cluster_margin",
-                "pos_cluster_entropy",
-                "centroid_residual",
-                "down_up_interaction",
-            ),
-        ),
-        "cluster_combo_kmeans2": lambda fold: _scores_margin_with_cluster_features(
-            fold,
-            config,
-            n_clusters=2,
-            method="kmeans",
-            feature_names=(
-                "pos_cluster",
-                "neg_cluster",
-                "cluster_margin",
-                "pos_cluster_entropy",
-                "centroid_residual",
-                "down_up_interaction",
-            ),
-        ),
-        "cluster_combo_kmeans8": lambda fold: _scores_margin_with_cluster_features(
-            fold,
-            config,
-            n_clusters=8,
-            method="kmeans",
-            feature_names=(
-                "pos_cluster",
-                "neg_cluster",
-                "cluster_margin",
-                "pos_cluster_entropy",
-                "centroid_residual",
-                "down_up_interaction",
-            ),
-        ),
-        "cluster_combo_kmeans12": lambda fold: _scores_margin_with_cluster_features(
-            fold,
-            config,
-            n_clusters=12,
-            method="kmeans",
-            feature_names=(
-                "pos_cluster",
-                "neg_cluster",
-                "cluster_margin",
-                "pos_cluster_entropy",
-                "centroid_residual",
-                "down_up_interaction",
-            ),
-        ),
-        "margin3_up_hardneg_2": lambda fold: _scores_margin_3class(
-            fold,
-            config,
-            textsplit=False,
-            mode="up",
-            hard_negative_multiplier=2.0,
-        ),
-        "margin3_up_hardneg_4": lambda fold: _scores_margin_3class(
-            fold,
-            config,
-            textsplit=False,
-            mode="up",
-            hard_negative_multiplier=4.0,
-        ),
-        "margin3_weight_neutral05": lambda fold: _scores_margin_3class(
-            fold,
-            config,
-            textsplit=False,
-            mode="up",
-            label_weight_multipliers={1: 0.5},
-        ),
-        "margin3_weight_neutral025": lambda fold: _scores_margin_3class(
-            fold,
-            config,
-            textsplit=False,
-            mode="up",
-            label_weight_multipliers={1: 0.25},
-        ),
-        "margin3_weight_down15_neutral05": lambda fold: _scores_margin_3class(
-            fold,
-            config,
-            textsplit=False,
-            mode="up",
-            label_weight_multipliers={0: 1.5, 1: 0.5},
-        ),
-        "margin3_textsplit_up": lambda fold: _scores_margin_3class(
-            fold, config, textsplit=True, mode="up"
-        ),
-        "binary_margin_no_neutral": lambda fold: _scores_binary_margin(
-            fold, config, textsplit=False, probability=False
-        ),
-        "binary_margin_no_neutral_recency30d": lambda fold: _scores_binary_margin(
-            fold, config, textsplit=False, probability=False, half_life_days=30.0
-        ),
-        "binary_prob_no_neutral": lambda fold: _scores_binary_margin(
-            fold, config, textsplit=False, probability=True
-        ),
-        "binary_margin_textsplit": lambda fold: _scores_binary_margin(
-            fold, config, textsplit=True, probability=False
-        ),
-        "binary_prob_textsplit": lambda fold: _scores_binary_margin(
-            fold, config, textsplit=True, probability=True
-        ),
-        "pairwise_base": lambda fold: _scores_pairwise(fold, textsplit=False),
-        "pairwise_up_only": lambda fold: _scores_pairwise(
-            fold, textsplit=False, strict_up_only=True
-        ),
-        "pairwise_textsplit": lambda fold: _scores_pairwise(fold, textsplit=True),
         "tier2_centroid": lambda fold: (fold.tier2_scores.copy(), None),
     }
-    # Register DL variants only if torch is available. This lets the
-    # harness run all 65 non-DL variants on a stock install; DL/blend
-    # variants are opt-in via `uv sync --group dl-experiment`.
-    if _TORCH_AVAILABLE:
-        variants.update(
-            {
-                "attention_mlp": lambda fold: _scores_attention_mlp_up(fold, config),
-                "attn_mlp_t0": lambda fold: _scores_attention_mlp_t0_up(fold, config),
-                "attn_mlp_t0_cos": lambda fold: _scores_attention_mlp_t0_cos_up(
-                    fold, config
-                ),
-                "attn_mlp_v1_nocos": lambda fold: _scores_attention_mlp_v1_nocos_up(
-                    fold, config
-                ),
-                "attn_mlp_v1_h64": lambda fold: _scores_attention_mlp_v1_h64_up(
-                    fold, config
-                ),
-                "attn_mlp_v2_rank": lambda fold: _scores_attention_mlp_v2_rank_up(
-                    fold, config
-                ),
-                "attn_mlp_v2_meta": lambda fold: _scores_attention_mlp_v2_meta_up(
-                    fold, config
-                ),
-                "attn_mlp_v2_mixup": lambda fold: _scores_attention_mlp_v2_mixup_up(
-                    fold, config
-                ),
-                "attn_mlp_v2_all": lambda fold: _scores_attention_mlp_v2_all_up(
-                    fold, config
-                ),
-                "blend_score_10": lambda fold: _scores_blend_up(
-                    fold, config, 0.10, kind="score"
-                ),
-                "blend_score_25": lambda fold: _scores_blend_up(
-                    fold, config, 0.25, kind="score"
-                ),
-                "blend_score_50": lambda fold: _scores_blend_up(
-                    fold, config, 0.50, kind="score"
-                ),
-                "blend_score_75": lambda fold: _scores_blend_up(
-                    fold, config, 0.75, kind="score"
-                ),
-                "blend_score_90": lambda fold: _scores_blend_up(
-                    fold, config, 0.90, kind="score"
-                ),
-                "blend_rank_10": lambda fold: _scores_blend_up(
-                    fold, config, 0.10, kind="rank"
-                ),
-                "blend_rank_25": lambda fold: _scores_blend_up(
-                    fold, config, 0.25, kind="rank"
-                ),
-                "blend_rank_50": lambda fold: _scores_blend_up(
-                    fold, config, 0.50, kind="rank"
-                ),
-                "blend_rank_75": lambda fold: _scores_blend_up(
-                    fold, config, 0.75, kind="rank"
-                ),
-                "blend_rank_90": lambda fold: _scores_blend_up(
-                    fold, config, 0.90, kind="rank"
-                ),
-            }
-        )
+    if args.svm_c is not None or args.svm_gamma is not None:
+        variants["svm_override"] = lambda fold: _production_scores(fold, config, db)
+        requested.append("svm_override")
+    if args.sweep_svm:
+        for c in (0.05, 0.1, 0.2, 0.5, 1.0, 2.0):
+            for gamma in (0.01, 0.02, 0.03, 0.05, 0.1):
+                name = f"svm_c{c}_gamma{gamma}"
+                tuned = replace(
+                    production_config,
+                    model=replace(production_config.model, svm_c=c, svm_gamma=gamma),
+                )
+                variants[name] = lambda fold, tuned=tuned: _production_scores(
+                    fold, tuned, db
+                )
+                requested.append(name)
     if requested:
         missing = sorted(set(requested) - set(variants))
         if missing:
-            if any(
-                m.startswith(("attention_mlp", "attn_mlp", "blend_")) for m in missing
-            ):
-                raise RuntimeError(
-                    f"Requested DL/blend variants not available: {', '.join(missing)}. "
-                    "Install torch with `uv sync --group dl-experiment`."
-                )
             raise ValueError(f"Unknown variants: {', '.join(missing)}")
         variants = {name: variants[name] for name in requested}
 
@@ -2533,16 +1517,22 @@ def main() -> None:
             f"valid feedback is missing {missing_global_labels}"
         )
 
-    split_label = (
-        "temporal-expanding"
-        if args.split == "temporal"
-        else f"{args.folds}-fold-stratified"
-    )
-    splits = (
-        _temporal_splits(y, fb_vote_times, folds=args.folds)
-        if args.split == "temporal"
-        else _stratified_splits(y, folds=args.folds)
-    )
+    split_label = "temporal-expanding"
+    splits = _temporal_splits(y, fb_vote_times, folds=args.folds)
+    if args.confirmation:
+        reserved = np.unique(fb_vote_times[fb_vote_times >= confirmation_start])
+        if len(reserved) < args.folds:
+            raise ValueError(
+                "Confirmation has fewer timestamp groups than requested folds"
+            )
+        splits = [
+            FoldSplit(
+                i,
+                np.flatnonzero(fb_vote_times < block[0]),
+                np.flatnonzero(np.isin(fb_vote_times, block)),
+            )
+            for i, block in enumerate(np.array_split(reserved, args.folds), 1)
+        ]
     _validate_splits(
         splits,
         y,
@@ -2571,47 +1561,50 @@ def main() -> None:
             fold = _make_fold(
                 candidates,
                 cand_emb,
-                cand_field_emb,
-                cand_field_parts,
                 fb_stories,
                 fb_to_cand,
-                fb_field_emb,
-                fb_field_parts,
                 fb_vote_times,
                 y_label,
                 valid_positions,
                 split.train_pos,
                 split.test_pos,
                 config,
-                needs_field=needs_field,
+                feedback_embeddings=feedback_embeddings,
+                needs_experimental=any(
+                    name != "production" and not name.startswith("svm_")
+                    for name in variants
+                ),
             )
-            for name, scorer in scorers.items():
-                scores, probs = scorer(fold)
-                results[name].append(_metrics(scores, fold, config, probs))
+            with _fold_database(fold, config, db) as fold_db:
+                fold = replace(fold, runtime_db=fold_db)
+                with _reuse_preprocessing():
+                    for name, scorer in scorers.items():
+                        scores, probs = (
+                            scorer(fold) if fold.candidates else (np.empty(0), None)
+                        )
+                        results[name].append(
+                            _metrics(
+                                scores,
+                                fold,
+                                config,
+                                probs,
+                                source_db=db,
+                                calibration_available=name != "production"
+                                and not name.startswith("svm_"),
+                            )
+                        )
             print(f"{label}fold {split.fold_no}/{len(splits)} done")
         return results
 
-    results = _run_scorers(variants, y)
-    baseline_results = _run_scorers(baselines, y, label="[baseline] ")
+    combined = _run_scorers(variants | baselines, y)
+    results = {name: combined[name] for name in variants}
+    baseline_results = {name: combined[name] for name in baselines}
 
-    metric_keys = [
-        "ndcg_at_12",
-        "ndcg_at_100",
-        "ndcg_at_40",
-        "ndcg_at_200",
-        "map",
-        "precision_at_40",
-        "up_recall_at_12",
-        "up_recall_at_40",
-        "downvote_rate_at_40",
-        "hit_at_40",
-        "hit_at_100",
-        "median_rank",
-        "p25_rank",
-        "p75_rank",
-        "brier_up",
-    ]
     report: dict[str, Any] = {
+        "schema_version": 2,
+        "interpretation": "Recovery of known held-out feedback on a current snapshot; unknown relevance is unjudged. Feedback updated_at approximates chronology with rare corrections. No historical content or candidate snapshots; not causal reading-quality estimates. Confirmation is reusable historical evidence.",
+        "relevance": {"up": 1, "neutral": 0, "down": 0},
+        "variation": "std is fold variation, not uncertainty of a causal estimate",
         "config": {
             "split": split_label,
             "split_mode": args.split,
@@ -2630,7 +1623,47 @@ def main() -> None:
             "positive_cluster_k": config.model.positive_cluster_k,
             "mmr_threshold": config.model.diversity_threshold,
             "mmr_limit": config.count,
-            "db_sha256": _db_sha256(config.db_path),
+            "db_sha256": snapshot_hash,
+            "now": now,
+            "embedding_snapshot_sha256": _db_sha256(args.embeddings_file)
+            if args.embeddings_file
+            else None,
+            "n_feedback_input": len(fb_stories),
+            "folds": [
+                {
+                    "fold": split.fold_no,
+                    "training_rows": len(split.train_pos),
+                    "test_rows": len(split.test_pos),
+                    "training_cutoff": float(fb_vote_times[split.train_pos].max()),
+                    "test_start": float(fb_vote_times[split.test_pos].min()),
+                    "test_end": float(fb_vote_times[split.test_pos].max()),
+                    "training_story_ids": [
+                        fb_stories[valid_positions[i]].id for i in split.train_pos
+                    ],
+                    "test_story_ids": [
+                        fb_stories[valid_positions[i]].id for i in split.test_pos
+                    ],
+                }
+                for split in splits
+            ],
+            "frozen_config": asdict(config),
+            "confirmation": args.confirmation,
+            "confirmation_start": float(confirmation_start),
+            "sampling": {
+                "max_candidates": args.max_candidates,
+                "max_feedback_per_class": args.max_feedback_per_class,
+                "candidate_seed": 1,
+                "feedback_seed": 0,
+            },
+            "code_revision": subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], text=True
+            ).strip(),
+            "dirty_state": subprocess.check_output(
+                ["git", "status", "--porcelain"], text=True
+            ),
+            "dirty_diff_sha256": hashlib.sha256(
+                subprocess.check_output(["git", "diff", "HEAD"])
+            ).hexdigest(),
             "embedding_label": args.embedding_label,
             "embeddings_file": args.embeddings_file,
         },
@@ -2639,8 +1672,8 @@ def main() -> None:
     }
     if args.split == "stratified":
         del report["config"]["temporal_initial_train_frac"]
-    report["variants"] = _aggregate_results(results, metric_keys)
-    report["baselines"] = _aggregate_results(baseline_results, metric_keys)
+    report["variants"] = _aggregate_results(results)
+    report["baselines"] = _aggregate_results(baseline_results)
 
     if args.leak_check:
         print(f"\n=== Leak check: shuffling y (n={len(y)}, seed=0) ===")
@@ -2651,10 +1684,11 @@ def main() -> None:
             split_mode=f"{split_label} leak-check",
             required_train_labels=required_train_labels,
         )
-        leak_results = _run_scorers(variants, y_shuffled, label="[leak-check] ")
-        leak_baseline_results = _run_scorers(
-            baselines, y_shuffled, label="[leak-check baseline] "
+        leak_combined = _run_scorers(
+            variants | baselines, y_shuffled, label="[leak-check] "
         )
+        leak_results = {name: leak_combined[name] for name in variants}
+        leak_baseline_results = {name: leak_combined[name] for name in baselines}
         report["leak_check"] = {
             "config": {
                 "y_seed": 0,
@@ -2664,47 +1698,14 @@ def main() -> None:
             "variants": {},
             "baselines": {},
         }
-        report["leak_check"]["variants"] = _aggregate_results(
-            leak_results, metric_keys
-        )
-        report["leak_check"]["baselines"] = _aggregate_results(
-            leak_baseline_results, metric_keys
-        )
+        report["leak_check"]["variants"] = _aggregate_results(leak_results)
+        report["leak_check"]["baselines"] = _aggregate_results(leak_baseline_results)
 
-    Path(args.output).write_text(json.dumps(report, indent=2))
+    report["paired_differences_against_production"] = _paired_differences(combined)
+    Path(args.output).write_text(json.dumps(report, indent=2, allow_nan=False))
     print(f"wrote {args.output}")
     for name, data in report["variants"].items():
-        raw = data["mean"]["raw"]
-        print(
-            f"{name:26s} raw_ndcg12={raw['ndcg_at_12']:.3f} "
-            f"raw_ndcg40={raw['ndcg_at_40']:.3f} "
-            f"up_recall40={raw['up_recall_at_40']:.3f} "
-            f"down40={raw['downvote_rate_at_40']:.3f} "
-            f"median={raw['median_rank']:.1f}"
-        )
-
-    if args.leak_check and "leak_check" in report:
-        print(f"\n{'=' * 80}")
-        print(
-            f"{'Variant':26s} {'normal raw40':>14s} {'shuffled raw40':>16s} {'ratio':>8s}"
-        )
-        print("-" * 80)
-        for name in report["variants"]:
-            if name not in report["leak_check"]["variants"]:
-                continue
-            normal_n = report["variants"][name]["mean"]["raw"]["ndcg_at_40"]
-            # ty loses dict nesting through the long subscript chain; Any cast
-            # at the variants level lets it find the ndcg_at_40 leaf.
-            leak_variants: Any = report["leak_check"]["variants"]
-            shuffled_n = leak_variants[name]["mean"]["raw"]["ndcg_at_40"]
-            ratio = shuffled_n / normal_n if normal_n > 1e-9 else float("inf")
-            print(f"{name:26s} {normal_n:14.4f} {shuffled_n:16.4f} {ratio:8.2f}")
-            if ratio > 0.5:
-                print(
-                    f"{'':26s} WARNING: shuffled/raw ratio > 0.5, "
-                    f"possible data leakage in harness"
-                )
-        print("=" * 80)
+        print(name, json.dumps(data["mean"]["raw"]))
 
 
 if __name__ == "__main__":
