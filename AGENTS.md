@@ -143,14 +143,23 @@
 
 Before reporting completion of any code or template change:
 
-1. `uv run pytest tests/ -n 4` — full suite must pass
+1. `uv run pytest tests/ -n 4` — full suite must pass. After each
+   logical edit, run the affected test files first; the full suite is
+   the gate, not the first signal.
 2. `uv run ruff check .` — lint must be clean
-3. `uv run ty check` — zero new type diagnostics
-4. If the change affects runtime behavior: restart the service, then
+3. `uv run ruff format --check` on every touched Python file — the repo
+   has no global format pass; keep your own diff format-clean so the
+   changed-files CI gate stays green.
+4. `uv run ty check` — zero new type diagnostics
+5. If the change affects runtime behavior: restart the service, then
    live smoke test with endpoint requests plus a bounded
    `journalctl --user -u hn_rewrite.service --since '1 min ago'` scan
-5. If UI templates changed: update corresponding assertions in
+6. If UI templates changed: update corresponding assertions in
    `tests/test_server.py`
+
+CI (`.github/workflows/ci.yml`) runs steps 1–4 on push and PR, plus
+`tests/test_cli_boot.py` boot smoke tests for every argparse script.
+Markdown protocol does not bind agents; CI does — keep it green.
 
 ## Dependency groups
 

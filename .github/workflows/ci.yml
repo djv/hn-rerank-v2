@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dev dependencies
+        run: uv sync --group dev
+      - name: Lint
+        run: uv run ruff check .
+      - name: Changed Python files
+        id: changed
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="origin/${{ github.base_ref }}"
+            files=$(git diff --name-only "$base"...HEAD -- '*.py' | tr '\n' ' ')
+          else
+            files=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} -- '*.py' | tr '\n' ' ')
+          fi
+          echo "files=$files" >> "$GITHUB_OUTPUT"
+      - name: Format check (changed files)
+        if: steps.changed.outputs.files != ''
+        run: uv run ruff format --check ${{ steps.changed.outputs.files }}
+      - name: Type check
+        run: uv run ty check
+      - name: Tests
+        run: uv run pytest tests/ -n 4 -q
