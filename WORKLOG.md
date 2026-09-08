@@ -1,5 +1,20 @@
 # Worklog: hn-rewrite
 
+## 2026-09-08 — TLDR reshape: 402 cooldown, halved outputs, doubled inputs
+
+- 402 (billing refusal, e.g. capped Mistral key) now enters the cooldown
+  path: seeds `llm_limiter.on_429()` explicitly (no Retry-After semantics
+  on 402), serves the cooling-down countdown, prefetch skips while capped.
+  Test pins 429 + 402 shapes and asserts `retry_after_seconds > 0` on 402.
+- Outputs halved: `_section_budget` 75/125/200 words (2-3/3-4/4-6
+  bullets); dual-path cap 900 -> 450, single-path 2000 -> 1000.
+- Inputs doubled: article 15k -> 30k, self-text 8k -> 16k, comments
+  12k -> 24k chars. `SELF_TEXT_PROMPT_MIN_CHARS` stays 300.
+- `TLDR_PROMPT_VERSION` detail-v5 -> detail-v6 (old long cache regenerates).
+- Verified: 704 passed, ruff + format + ty clean, restart live (dash 200,
+  fresh v6 article-only 109 words + discussion-only 120 words, no errors;
+  one discussion-half salvage via the pre-existing path).
+
 ## 2026-09-08 — CI green on runners (model provisioning)
 
 - Push gate failed 3x: `tests/test_pipeline.py` module `embedder` fixture

@@ -44,14 +44,14 @@ from llm_limiter import limiter as llm_limiter
 from reddit_limiter import limiter as reddit_limiter
 from http_fetch import fetch_with_urllib_fallback
 
-ARTICLE_BODY_CHAR_LIMIT = 15_000
-SELF_TEXT_PROMPT_CHAR_LIMIT = 8_000
-COMMENT_PROMPT_CHAR_LIMIT = 12_000
+ARTICLE_BODY_CHAR_LIMIT = 30_000
+SELF_TEXT_PROMPT_CHAR_LIMIT = 16_000
+COMMENT_PROMPT_CHAR_LIMIT = 24_000
 SELF_TEXT_PROMPT_MIN_CHARS = 300
 REDDIT_COMMENTS_CACHE_CHAR_LIMIT = 10_000
 REDDIT_COMMENT_LIMIT = 40
 REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dashboard"
-TLDR_PROMPT_VERSION = "detail-v5"
+TLDR_PROMPT_VERSION = "detail-v6"
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
 _PROMPT_CACHE: dict[str, str] = {}
 # Seam for tests: swap in a controllable timer to make debounce/regen tests
@@ -774,10 +774,10 @@ def _tldr_cache_key(
 def _section_budget(source_chars: int) -> str:
     """Bullet/word budget scaled by capped source length (thin input → terse)."""
     if source_chars < 1_500:
-        return "3-5 bullets, max 150 words"
+        return "2-3 bullets, max 75 words"
     if source_chars < 5_000:
-        return "6-8 bullets, max 250 words"
-    return "9-12 bullets, max 400 words"
+        return "3-4 bullets, max 125 words"
+    return "4-6 bullets, max 200 words"
 
 
 async def generate_detailed_tldr(
@@ -824,7 +824,7 @@ async def generate_detailed_tldr(
                 base_url=base_url,
                 model=model,
                 prompt=article_prompt,
-                max_tokens=_max_tokens_for_provider(cfg, 900),
+                max_tokens=_max_tokens_for_provider(cfg, 450),
                 extra=extra,
             ),
             _call_llm_chat(
@@ -832,7 +832,7 @@ async def generate_detailed_tldr(
                 base_url=base_url,
                 model=model,
                 prompt=discussion_prompt,
-                max_tokens=_max_tokens_for_provider(cfg, 900),
+                max_tokens=_max_tokens_for_provider(cfg, 450),
                 extra=extra,
             ),
         )
@@ -882,7 +882,7 @@ async def generate_detailed_tldr(
         base_url=base_url,
         model=model,
         prompt=prompt,
-        max_tokens=_max_tokens_for_provider(cfg, 2000),
+        max_tokens=_max_tokens_for_provider(cfg, 1000),
         extra=extra,
     )
     if result.ok:
@@ -2503,7 +2503,13 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             fallback = _stale_tldr_fallback_response(runtime.db, story.id, "llm_error")
             if fallback:
                 return fallback
-            if result.error_status == 429:
+            if result.error_status in (429, 402):
+                if result.error_status == 402:
+                    # Billing refusal (e.g. spend cap): no Retry-After
+                    # semantics, so seed the cooldown explicitly. Escalates
+                    # with consecutive 402s via the limiter backoff and
+                    # self-clears, like a 429.
+                    llm_limiter.on_429()
                 return _flask_rate_limit_response(
                     "Summary provider is cooling down. Please try again later.",
                     max(1, llm_limiter.retry_after_seconds),

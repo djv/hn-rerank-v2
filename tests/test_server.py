@@ -303,15 +303,15 @@ def test_env(tmp_path, mock_embedder):
 
 def test_section_budget_scales_with_source_volume() -> None:
     """The TLDR bullet budget must grow with source material volume rather
-    than staying fixed at 3-5 bullets regardless of thread/article size."""
+    than staying fixed at 2-3 bullets regardless of thread/article size."""
     import server
 
-    assert server._section_budget(0) == "3-5 bullets, max 150 words"
-    assert server._section_budget(1_499) == "3-5 bullets, max 150 words"
-    assert server._section_budget(1_500) == "6-8 bullets, max 250 words"
-    assert server._section_budget(4_999) == "6-8 bullets, max 250 words"
-    assert server._section_budget(5_000) == "9-12 bullets, max 400 words"
-    assert server._section_budget(12_000) == "9-12 bullets, max 400 words"
+    assert server._section_budget(0) == "2-3 bullets, max 75 words"
+    assert server._section_budget(1_499) == "2-3 bullets, max 75 words"
+    assert server._section_budget(1_500) == "3-4 bullets, max 125 words"
+    assert server._section_budget(4_999) == "3-4 bullets, max 125 words"
+    assert server._section_budget(5_000) == "4-6 bullets, max 200 words"
+    assert server._section_budget(12_000) == "4-6 bullets, max 200 words"
 
 
 @pytest.mark.parametrize(
@@ -337,7 +337,7 @@ def test_prompts_render_budget_placeholder(template: str, fields: dict) -> None:
         budget=server._section_budget(5_000),
         **fields,
     )
-    assert "9-12 bullets, max 400 words" in prompt
+    assert "4-6 bullets, max 200 words" in prompt
 
 
 def test_token_redirect(app_env):
@@ -2848,10 +2848,9 @@ def test_flask_test_client_tldr_provider_error_degrades_gracefully(
 ) -> None:
     """Pin the tap path when the LLM provider refuses (rate limit or billing
     cap, e.g. a capped Mistral key returning 429 or 402): a stale-cached TLDR
-    must be served either way; with nothing cached, 429 degrades to the
-    cooldown countdown while a non-429 billing refusal surfaces as a generic
-    503. Characterization only -- if the live cap produces a different status
-    shape, this test names the gap instead of silently passing."""
+    must be served either way; with nothing cached, both degrade to the
+    cooldown countdown (402 seeds the limiter explicitly since a billing
+    refusal carries no Retry-After semantics)."""
     import server
 
     _, db, _, handler, user = test_env
@@ -2915,12 +2914,11 @@ def test_flask_test_client_tldr_provider_error_degrades_gracefully(
         "cached": True,
         "stale": True,
     }
-    if error_status == 429:
-        assert fresh.status_code == 429
-        assert "cooling down" in fresh.get_json()["error"]
-    else:
-        assert fresh.status_code == 503
-        assert "error" in fresh.get_json()
+    assert fresh.status_code == 429
+    assert "cooling down" in fresh.get_json()["error"]
+    if error_status == 402:
+        # Billing refusal seeds the limiter: prefetch skips while capped.
+        assert server.llm_limiter.retry_after_seconds > 0
 
 
 @pytest.mark.parametrize("cacheable", [True, False])
@@ -4324,7 +4322,7 @@ async def test_generate_detailed_tldr_cerebras_passes_reasoning_effort_and_bumpe
     for call in calls:
         assert call["model"] == "gpt-oss-120b"
         assert call["extra"] == {"reasoning_effort": "low"}
-        assert call["max_tokens"] == 1500
+        assert call["max_tokens"] == 1050
 
 
 @pytest.mark.asyncio
@@ -4358,8 +4356,8 @@ async def test_generate_detailed_tldr_scales_combined_path_budgets(monkeypatch):
 
     assert len(calls) == 2
     article_prompt, discussion_prompt = calls
-    assert "9-12 bullets, max 400 words" in article_prompt
-    assert "9-12 bullets, max 400 words" in discussion_prompt
+    assert "4-6 bullets, max 200 words" in article_prompt
+    assert "4-6 bullets, max 200 words" in discussion_prompt
 
 
 @pytest.mark.asyncio
