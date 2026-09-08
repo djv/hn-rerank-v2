@@ -1,5 +1,22 @@
 # Worklog: hn-rewrite
 
+## 2026-09-08 — gospark cap raised: truncation fixed, still parked
+
+- `GET /zen/go/v1/usage` works with the Go key (rolling/weekly/monthly
+  percent + resetsAt); bakeoff gained a pre-flight gate
+  (`--max-usage-percent 80`, `--skip-usage-check`) that prints meters and
+  aborts past the threshold. Gate verified live (2%/2%/1% -> proceed).
+- Prod + benchmark cap: gospark rule is now base+1200 (dual 1650, single
+  2200) — responses deducts ~900-1050 reasoning tokens from the same
+  bucket even at effort=low, so +600 could never fit reasoning + output.
+- Validation run (8 stories, 30s pacing, texts in
+  `eval_gospark_bakeoff_v2_2026-09-08.json`): 8/8 ok, zero 429s, 7/8 full
+  dual-section at 259-314 words (on-budget), 1 article-only salvage.
+  Truncation fixed; remaining profile 14-35s/story.
+- Still parked for interactive taps on latency; un-park decision needs a
+  latency story (serialized halves would be worse, not better).
+- Verified: 708 passed, ruff + format + ty clean.
+
 ## 2026-09-08 — ranker re-eval: C=0.1 stands, old C=0.5 plateau gone
 
 - 30-point sweep (C 0.05-2.0 x gamma 0.01-0.1, 5 temporal folds;

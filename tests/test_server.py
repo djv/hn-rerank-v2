@@ -4277,9 +4277,10 @@ def test_provider_max_tokens_reserves_reasoning_headroom() -> None:
         "muse-spark-1.3-contributor",
         {"reasoning_effort": "low"},
     )
-    # max_output_tokens covers reasoning + output, so gospark gets the same
-    # headroom as the other reasoning providers.
-    assert server._max_tokens_for_provider(gospark, 450) == 1050
+    # max_output_tokens covers reasoning + output, so gospark gets a larger
+    # headroom than the chat-completions reasoning providers (~1000 measured
+    # reasoning tokens per call even at effort=low).
+    assert server._max_tokens_for_provider(gospark, 450) == 1650
 
 
 @pytest.mark.parametrize(

@@ -44,6 +44,50 @@ def pick_stories(db_path: str, n: int) -> list[dict[str, str]]:
     ]
 
 
+def go_usage() -> dict[str, dict[str, object]] | None:
+    """Live Go allowance meters, or None when the key is absent/unreachable."""
+    import json
+    import urllib.request
+
+    api_key = os.environ.get("OPENCODE_GO_API_KEY")
+    if not api_key:
+        return None
+    req = urllib.request.Request(
+        "https://opencode.ai/zen/go/v1/usage",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "hn-rewrite-bakeoff/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            payload = json.load(resp)
+    except Exception as e:  # noqa: BLE001 - pre-flight must degrade, not crash
+        print(f"go usage unavailable ({type(e).__name__}), skipping gate")
+        return None
+    usage = payload.get("usage") if isinstance(payload, dict) else None
+    return usage if isinstance(usage, dict) else None
+
+
+def check_go_usage(max_percent: float) -> int:
+    """Pre-flight gate: print Go meters, abort (exit 2) past the threshold."""
+    usage = go_usage()
+    if usage is None:
+        return 0
+    worst = 0.0
+    for window in ("rolling", "weekly", "monthly"):
+        entry = usage.get(window)
+        pct = entry.get("percent") if isinstance(entry, dict) else None
+        resets = entry.get("resetsAt") if isinstance(entry, dict) else None
+        print(f"go usage {window}: {pct}% (resets {resets})")
+        if isinstance(pct, (int, float)):
+            worst = max(worst, float(pct))
+    if worst >= max_percent:
+        print(f"go usage {worst:.0f}% >= cap {max_percent:.0f}%, aborting")
+        return 2
+    return 0
+
+
 async def run_provider(
     provider: str, stories: list[dict[str, str]], *, sleep_s: float, dump: dict | None
 ) -> list[dict[str, object]]:
@@ -111,14 +155,30 @@ def main() -> int:
         "--dump-json",
         help="Write per-provider/story rows including full TLDR texts to this JSON file.",
     )
+    ap.add_argument(
+        "--max-usage-percent",
+        type=float,
+        default=80.0,
+        help="Abort before running when any Go allowance meter reaches this percent.",
+    )
+    ap.add_argument(
+        "--skip-usage-check",
+        action="store_true",
+        help="Skip the Go usage pre-flight gate.",
+    )
     args = ap.parse_args()
     server.load_env()
+    providers = [p.strip() for p in args.providers.split(",")]
+    if "gospark" in providers and not args.skip_usage_check:
+        gate = check_go_usage(args.max_usage_percent)
+        if gate:
+            return gate
     stories = pick_stories("hn_rewrite.db", args.stories)
     print(f"baking off {len(stories)} stories")
     dumped: dict[str, list[dict[str, object]]] = {}
-    for provider in args.providers.split(","):
-        dumped[provider.strip()] = asyncio.run(
-            run_provider(provider.strip(), stories, sleep_s=args.sleep_seconds, dump={})
+    for provider in providers:
+        dumped[provider] = asyncio.run(
+            run_provider(provider, stories, sleep_s=args.sleep_seconds, dump={})
         )
     if args.dump_json:
         import json

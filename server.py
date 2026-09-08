@@ -923,10 +923,12 @@ def _max_tokens_for_provider(cfg: LlmProviderConfig, base: int) -> int:
     if cfg.provider == "zen":
         # Ling's free endpoint spends a large, variable amount on reasoning.
         return 8_192
-    if (
-        cfg.provider in {"cerebras", "groq", "gospark"}
-        and "reasoning_effort" in cfg.extra
-    ):
+    if cfg.provider == "gospark" and "reasoning_effort" in cfg.extra:
+        # Responses API deducts reasoning from the same max_output_tokens
+        # bucket; measured ~900-1050 reasoning tokens per TLDR call even at
+        # effort=low, so the headroom must cover reasoning + full output.
+        return base + 1200
+    if cfg.provider in {"cerebras", "groq"} and "reasoning_effort" in cfg.extra:
         return base + 600
     return base
 
