@@ -1,5 +1,26 @@
 # Worklog: hn-rewrite
 
+## 2026-09-08 — Go Spark bakeoff: quality yes, operations no (parked)
+
+- Zen `contributor-free` id is hard-gated to OpenCode client sessions
+  (`MissingSessionID`); Go key works on `/zen/go/v1/responses` with
+  `x-opencode-session` + custom UA (chat/completions 500s on Muse ids).
+- `reasoning.effort=none` rejected upstream; `low` accepted but still
+  burns ~900-1050 reasoning tokens on full TLDR prompts — ~99% of a 1050
+  budget, truncating output (`incomplete` -> salvaged halves, 1 total
+  failure in 8). `max_output_tokens` covers reasoning + output.
+- 8-story paced bakoff (mistral vs gospark-low, same stories, texts in
+  `/tmp/bakeoff_2026-09-08.json`): mistral 1.4-4.4s, 159-440 words, 8/8
+  clean; spark 14-87s, 68-273 words, 429s even at 30s spacing with dual
+  concurrent halves (minute bucket is tight for our 2-call pattern).
+- Quality eyeball: spark summaries are dense and specific (often better
+  detail retrieval), fully style-compliant. Latency + limits kill it for
+  interactive taps; would need 2-4k caps + serialized halves (30-60s/tap).
+- Decision: PARKED. Integration stays (responses client, gospark row,
+  tests) — one `LLM_PROVIDER` switch away if limits/effort improve.
+  Live remains mistral-small. Key in `shared/.env` as OPENCODE_GO_API_KEY.
+- Verified: 708 passed, ruff + format + ty clean, boot tests green.
+
 ## 2026-09-08 — TLDR reshape: 402 cooldown, halved outputs, doubled inputs
 
 - 402 (billing refusal, e.g. capped Mistral key) now enters the cooldown

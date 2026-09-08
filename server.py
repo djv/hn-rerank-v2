@@ -662,6 +662,184 @@ async def _call_llm_chat(
         return LlmChatResult(content=str(e), ok=False)
 
 
+# Go gateway client identity: non-generic UA + stable per-day session id
+# (prompt-cache affinity; Go asks for a stable conversation session).
+_GO_USER_AGENT = "hn-rewrite-tldr/1.0"
+
+
+def _go_session_id() -> str:
+    return f"hn-rewrite-tldr-{time.strftime('%Y%m%d')}"
+
+
+def _responses_text(data: dict) -> str:
+    """Extract concatenated output_text from a Responses API payload."""
+    parts: list[str] = []
+    output = data.get("output")
+    if not isinstance(output, list):
+        return ""
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue  # reasoning items, tool calls, etc.
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "output_text":
+                text = part.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+    return "".join(parts)
+
+
+def _responses_error(data: object, status_code: int, raw_text: str) -> str:
+    if isinstance(data, dict):
+        payload: dict[Any, Any] = data
+        err = payload.get("error")
+        if isinstance(err, dict) and err.get("message"):
+            return str(err["message"])
+    return f"Error from LLM Provider: HTTP {status_code} - {raw_text}"
+
+
+async def _call_llm_responses(
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    prompt: str,
+    max_tokens: int,
+    extra: dict[str, object] | None = None,
+) -> LlmChatResult:
+    """OpenAI Responses-API caller for the Go gateway (Muse Spark).
+
+    Same contract as _call_llm_chat. max_output_tokens covers reasoning +
+    output tokens, so reasoning effort is pinned low (upstream rejects
+    "none"). No temperature: the provider forces its default.
+    """
+    payload = {
+        "model": model,
+        "input": prompt,
+        "max_output_tokens": max_tokens,
+        "reasoning": {"effort": (extra or {}).get("reasoning_effort", "low")},
+    }
+    estimated_tokens = len(prompt) // 3 + max_tokens
+    try:
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            for attempt in range(4):
+                if not await llm_limiter.acquire(estimated_tokens=estimated_tokens):
+                    return LlmChatResult(
+                        content="LLM quota cooldown; retry later.", ok=False, status=429
+                    )
+                t0 = time.perf_counter()
+                resp = await client.post(
+                    base_url,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                        "User-Agent": _GO_USER_AGENT,
+                        "x-opencode-session": _go_session_id(),
+                    },
+                    json=payload,
+                )
+                ms = (time.perf_counter() - t0) * 1000.0
+                try:
+                    data = resp.json()
+                except ValueError:
+                    data = {}
+                usage = data.get("usage") if isinstance(data, dict) else {}
+                used_tokens = (
+                    usage.get("total_tokens") if isinstance(usage, dict) else None
+                )
+                llm_limiter.record_response(
+                    status=resp.status_code,
+                    headers=resp.headers,
+                    reserved_tokens=estimated_tokens,
+                    used_tokens=used_tokens
+                    if isinstance(used_tokens, int) and used_tokens >= 0
+                    else None,
+                )
+                if resp.status_code == 200 and isinstance(data, dict):
+                    content = _responses_text(data)
+                    details = (
+                        usage.get("output_tokens_details") or {}
+                        if isinstance(usage, dict)
+                        else {}
+                    )
+                    logging.info(
+                        "llm_responses model=%s ms=%.0f in=%s out=%s reasoning=%s status_field=%s",
+                        model,
+                        ms,
+                        (
+                            usage.get("input_tokens")
+                            if isinstance(usage, dict)
+                            else None
+                        ),
+                        (
+                            usage.get("output_tokens")
+                            if isinstance(usage, dict)
+                            else None
+                        ),
+                        (
+                            details.get("reasoning_tokens")
+                            if isinstance(details, dict)
+                            else None
+                        ),
+                        data.get("status"),
+                    )
+                    finish = None if data.get("status") == "completed" else "length"
+                    return LlmChatResult(
+                        content=content,
+                        ok=_valid_llm_completion(content, finish),
+                        finish_reason=finish,
+                    )
+                if resp.status_code == 429 and attempt < 3:
+                    continue
+                if resp.status_code == 503 and attempt < 3:
+                    base = 2 ** (attempt + 1)
+                    jitter = random.uniform(0, base * 0.5)
+                    delay = _parse_retry_after(
+                        resp.headers.get("Retry-After"), default=base + jitter
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                break
+            err_data: object = data if isinstance(data, dict) else {}
+            return LlmChatResult(
+                content=_responses_error(err_data, resp.status_code, resp.text),
+                ok=False,
+                status=resp.status_code,
+            )
+    except Exception as e:
+        logging.exception("_call_llm_responses: unexpected exception")
+        return LlmChatResult(content=str(e), ok=False)
+
+
+async def _call_llm_for_config(
+    cfg: LlmProviderConfig,
+    *,
+    prompt: str,
+    max_tokens: int,
+) -> LlmChatResult:
+    """Dispatch to the chat or responses caller based on endpoint shape."""
+    api_key, base_url, model, extra = cfg.api_key, cfg.base_url, cfg.model, cfg.extra
+    if base_url.rstrip("/").endswith("/responses"):
+        return await _call_llm_responses(
+            api_key=api_key or "",
+            base_url=base_url,
+            model=model,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            extra=extra,
+        )
+    return await _call_llm_chat(
+        api_key=api_key or "",
+        base_url=base_url,
+        model=model,
+        prompt=prompt,
+        max_tokens=max_tokens,
+        extra=extra,
+    )
+
+
 @dataclass(frozen=True)
 class LlmProviderConfig:
     provider: str
@@ -705,6 +883,15 @@ _LLM_PROVIDERS: dict[str, tuple[str, str, str, dict[str, object]]] = {
         "ling-3.0-flash-fin-free",
         {},
     ),
+    # OpenCode Go gateway: Muse Spark lives on the Responses API
+    # (/responses), not chat/completions — _call_llm_for_config dispatches
+    # on the URL suffix. Requires x-opencode-session + non-generic UA.
+    "gospark": (
+        "OPENCODE_GO_API_KEY",
+        "https://opencode.ai/zen/go/v1/responses",
+        "muse-spark-1.3-contributor",
+        {"reasoning_effort": "low"},
+    ),
     "gemini": (
         "GEMINI_API_KEY",
         "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
@@ -736,7 +923,10 @@ def _max_tokens_for_provider(cfg: LlmProviderConfig, base: int) -> int:
     if cfg.provider == "zen":
         # Ling's free endpoint spends a large, variable amount on reasoning.
         return 8_192
-    if cfg.provider in {"cerebras", "groq"} and "reasoning_effort" in cfg.extra:
+    if (
+        cfg.provider in {"cerebras", "groq", "gospark"}
+        and "reasoning_effort" in cfg.extra
+    ):
         return base + 600
     return base
 
@@ -787,7 +977,7 @@ async def generate_detailed_tldr(
     article_body: str = "",
 ) -> TldrResult:
     cfg = _llm_provider_config()
-    api_key, base_url, model, extra = cfg.api_key, cfg.base_url, cfg.model, cfg.extra
+    api_key = cfg.api_key
 
     if not api_key:
         return TldrResult(
@@ -819,21 +1009,15 @@ async def generate_detailed_tldr(
             budget=_section_budget(len(comments_section)),
         )
         article_result, discussion_result = await asyncio.gather(
-            _call_llm_chat(
-                api_key=api_key,
-                base_url=base_url,
-                model=model,
+            _call_llm_for_config(
+                cfg,
                 prompt=article_prompt,
                 max_tokens=_max_tokens_for_provider(cfg, 450),
-                extra=extra,
             ),
-            _call_llm_chat(
-                api_key=api_key,
-                base_url=base_url,
-                model=model,
+            _call_llm_for_config(
+                cfg,
                 prompt=discussion_prompt,
                 max_tokens=_max_tokens_for_provider(cfg, 450),
-                extra=extra,
             ),
         )
         good: list[tuple[str, str]] = []
@@ -877,13 +1061,10 @@ async def generate_detailed_tldr(
             title=title, comments_section=section, budget=_section_budget(len(section))
         )
 
-    result = await _call_llm_chat(
-        api_key=api_key,
-        base_url=base_url,
-        model=model,
+    result = await _call_llm_for_config(
+        cfg,
         prompt=prompt,
         max_tokens=_max_tokens_for_provider(cfg, 1000),
-        extra=extra,
     )
     if result.ok:
         if text := _normalize_tldr_markdown(result.content):

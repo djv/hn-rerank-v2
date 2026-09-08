@@ -4270,6 +4270,16 @@ def test_provider_max_tokens_reserves_reasoning_headroom() -> None:
         {"reasoning_effort": "low"},
     )
     assert server._max_tokens_for_provider(groq, 900) == 1500
+    gospark = server.LlmProviderConfig(
+        "gospark",
+        "key",
+        "https://opencode.ai/zen/go/v1/responses",
+        "muse-spark-1.3-contributor",
+        {"reasoning_effort": "low"},
+    )
+    # max_output_tokens covers reasoning + output, so gospark gets the same
+    # headroom as the other reasoning providers.
+    assert server._max_tokens_for_provider(gospark, 450) == 1050
 
 
 @pytest.mark.parametrize(
@@ -4323,6 +4333,182 @@ async def test_generate_detailed_tldr_cerebras_passes_reasoning_effort_and_bumpe
         assert call["model"] == "gpt-oss-120b"
         assert call["extra"] == {"reasoning_effort": "low"}
         assert call["max_tokens"] == 1050
+
+
+def test_responses_text_extraction() -> None:
+    """Responses payloads mix reasoning items with message items; only
+    output_text parts must surface, concatenated in order."""
+    import server
+
+    assert server._responses_text({}) == ""
+    assert server._responses_text({"output": "x"}) == ""
+    payload = {
+        "output": [
+            {"type": "reasoning", "summary": []},
+            {
+                "type": "message",
+                "content": [
+                    {"type": "output_text", "text": "- first"},
+                    {"type": "refusal", "refusal": "no"},
+                    {"type": "output_text", "text": "\n- second"},
+                ],
+            },
+        ]
+    }
+    assert server._responses_text(payload) == "- first\n- second"
+
+
+def test_responses_error_prefers_provider_message() -> None:
+    import server
+
+    assert (
+        server._responses_error({"error": {"message": "Upstream broke"}}, 500, "raw")
+        == "Upstream broke"
+    )
+    assert "HTTP 400" in server._responses_error({}, 400, "raw")
+
+
+@pytest.mark.asyncio
+async def test_call_llm_for_config_dispatches_on_endpoint(monkeypatch) -> None:
+    """chat/completions URLs go to _call_llm_chat; /responses URLs go to
+    _call_llm_responses. The gospark row must take the responses path."""
+    import server
+
+    calls: list[str] = []
+
+    async def fake_chat(**kwargs):
+        calls.append("chat")
+        return server.LlmChatResult(content="- c", ok=True)
+
+    async def fake_responses(**kwargs):
+        calls.append("responses")
+        assert kwargs["extra"] == {"reasoning_effort": "low"}
+        return server.LlmChatResult(content="- r", ok=True)
+
+    monkeypatch.setattr(server, "_call_llm_chat", fake_chat)
+    monkeypatch.setattr(server, "_call_llm_responses", fake_responses)
+
+    chat_cfg = server.LlmProviderConfig(
+        "mistral", "k", "https://api.mistral.ai/v1/chat/completions", "m", {}
+    )
+    go_cfg = server.LlmProviderConfig(
+        "gospark",
+        "k",
+        "https://opencode.ai/zen/go/v1/responses",
+        "muse-spark-1.3-contributor",
+        {"reasoning_effort": "low"},
+    )
+    assert (
+        await server._call_llm_for_config(chat_cfg, prompt="p", max_tokens=10)
+    ).content == "- c"
+    assert (
+        await server._call_llm_for_config(go_cfg, prompt="p", max_tokens=10)
+    ).content == "- r"
+    assert calls == ["chat", "responses"]
+
+
+@pytest.mark.asyncio
+async def test_call_llm_responses_success_and_429(monkeypatch) -> None:
+    """Responses caller: completed payload validates like chat output;
+    incomplete (truncation) is rejected; a 429 surfaces status 429 for the
+    cooldown path. Headers must carry the Go session identity + custom UA."""
+    import server
+
+    seen: dict[str, Any] = {}
+
+    class FakeResponse:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+            self.headers = {}
+            self.text = "raw"
+
+        def json(self):
+            return self._payload
+
+    def ok_payload():
+        return {
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "- summary"}],
+                }
+            ],
+            "usage": {"total_tokens": 100},
+        }
+
+    responses = [FakeResponse(200, ok_payload())]
+
+    class FakeClient:
+        def __init__(self, *, timeout):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, base_url, *, headers, json):
+            seen["headers"] = dict(headers)
+            seen["payload"] = dict(json)
+            return responses.pop(0)
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", FakeClient)
+
+    async def allow_acquire(*, estimated_tokens=0):
+        return True
+
+    async def noop_record(**kwargs):
+        return None
+
+    monkeypatch.setattr(server.llm_limiter, "acquire", allow_acquire)
+    monkeypatch.setattr(server.llm_limiter, "record_response", noop_record)
+
+    res = await server._call_llm_responses(
+        api_key="k",
+        base_url="https://opencode.ai/zen/go/v1/responses",
+        model="muse-spark-1.3-contributor",
+        prompt="Summarize.",
+        max_tokens=450,
+        extra={"reasoning_effort": "low"},
+    )
+    assert res.ok and res.content == "- summary"
+    assert seen["headers"]["x-opencode-session"].startswith("hn-rewrite-tldr-")
+    assert seen["headers"]["User-Agent"] == "hn-rewrite-tldr/1.0"
+    assert seen["payload"]["reasoning"] == {"effort": "low"}
+    assert "temperature" not in seen["payload"]
+
+    # Truncated (incomplete status) must not validate.
+    responses.append(FakeResponse(200, {**ok_payload(), "status": "incomplete"}))
+    res = await server._call_llm_responses(
+        api_key="k",
+        base_url="https://example.test",
+        model="m",
+        prompt="p",
+        max_tokens=10,
+    )
+    assert not res.ok
+
+    # Provider 429 retried then surfaced with status for the cooldown path.
+    responses.extend(
+        [
+            FakeResponse(429, {"error": {"message": "slow down"}}),
+            FakeResponse(429, {"error": {"message": "slow down"}}),
+            FakeResponse(429, {"error": {"message": "slow down"}}),
+            FakeResponse(429, {"error": {"message": "slow down"}}),
+        ]
+    )
+    res = await server._call_llm_responses(
+        api_key="k",
+        base_url="https://example.test",
+        model="m",
+        prompt="p",
+        max_tokens=10,
+    )
+    assert not res.ok and res.status == 429
+    assert "slow down" in res.content
 
 
 @pytest.mark.asyncio

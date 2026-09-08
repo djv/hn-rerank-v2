@@ -45,7 +45,7 @@ def pick_stories(db_path: str, n: int) -> list[dict[str, str]]:
 
 
 async def run_provider(
-    provider: str, stories: list[dict[str, str]]
+    provider: str, stories: list[dict[str, str]], *, sleep_s: float, dump: dict | None
 ) -> list[dict[str, object]]:
     os.environ["LLM_PROVIDER"] = provider
     # BAKEOFF_MODEL pins one model across providers; otherwise each
@@ -78,6 +78,9 @@ async def run_provider(
                 "chars": len(res.tldr),
                 "status": res.error_status,
             }
+            if dump is not None:
+                row["tldr"] = res.tldr
+                row["title"] = s["title"]
             print(
                 f"  story {i}: kind={res.kind} ms={ms:.0f} chars={len(res.tldr)} "
                 f"status={res.error_status} err={str(res.error_text)[:160]!r}",
@@ -90,7 +93,7 @@ async def run_provider(
             out.append(
                 {"story": i, "kind": "exception", "ms": round(ms), "error": str(e)}
             )
-        await asyncio.sleep(6)  # stay under free-tier RPM on both providers
+        await asyncio.sleep(sleep_s)  # stay under free-tier RPM on both providers
     return out
 
 
@@ -98,12 +101,31 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--stories", type=int, default=4)
     ap.add_argument("--providers", default="groq,gemini")
+    ap.add_argument(
+        "--sleep-seconds",
+        type=float,
+        default=6.0,
+        help="Delay between stories (raise for tight minute-bucket providers).",
+    )
+    ap.add_argument(
+        "--dump-json",
+        help="Write per-provider/story rows including full TLDR texts to this JSON file.",
+    )
     args = ap.parse_args()
     server.load_env()
     stories = pick_stories("hn_rewrite.db", args.stories)
     print(f"baking off {len(stories)} stories")
+    dumped: dict[str, list[dict[str, object]]] = {}
     for provider in args.providers.split(","):
-        asyncio.run(run_provider(provider.strip(), stories))
+        dumped[provider.strip()] = asyncio.run(
+            run_provider(provider.strip(), stories, sleep_s=args.sleep_seconds, dump={})
+        )
+    if args.dump_json:
+        import json
+
+        with open(args.dump_json, "w", encoding="utf-8") as fh:
+            json.dump(dumped, fh, ensure_ascii=False, indent=1)
+        print(f"wrote {args.dump_json}")
     return 0
 
 
