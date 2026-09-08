@@ -893,8 +893,9 @@
     const votedStoryIds = new Set();
     const feedbackChains = new Map();
     const MAX_QUEUE = 12;
-    const PREFETCH_COUNT = 2;
+    const PREFETCH_COUNT = 4;
     const tldrCache = new Map(); // storyId (number) → raw TLDR markdown (string)
+    const tldrRetryAt = new Map(); // storyId → earliest retry time
     let toastTimer = null;
     let refillInFlight = false;
     let queuedRefillAdvance = null;
@@ -1685,10 +1686,23 @@
       await openTldrDetail(card);
     });
 
+    // Page-open stampede guard: the active card plus 4 upcoming prefetches
+    // used to fire simultaneously (up to 10 LLM calls at once, on top of the
+    // server warm prefetch) and trip the free token-rate limit within
+    // seconds — every card then showed salvaged halves or 429s. Chain
+    // prefetches one-at-a-time behind the active tap, so a slow provider
+    // naturally back-pressures the queue. Detached cards (voted away while
+    // queued) are skipped instead of burning quota.
+    let tldrPrefetchChain = Promise.resolve();
     function prefetchCards(cards) {
       cards.forEach(card => {
         if (!card.querySelector('.tldr-detail-content')) {
-          openTldrDetail(card);
+          tldrPrefetchChain = tldrPrefetchChain.then(() => {
+            if (card.isConnected) {
+              return openTldrDetail(card);
+            }
+            return null;
+          }).catch(() => {});
         }
       });
     }
@@ -1903,6 +1917,15 @@
         return;
       }
 
+      const retryAt = tldrRetryAt.get(storyId) || 0;
+      if (Date.now() < retryAt) {
+        const secs = Math.max(1, Math.ceil((retryAt - Date.now()) / 1000));
+        contentDiv.textContent = 'TLDR: provider cooling down, retry in ' + secs + 's';
+        contentDiv.dataset.error = 'true';
+        contentDiv.style.display = 'block';
+        return;
+      }
+
       contentDiv.textContent = 'Loading TLDR...';
       contentDiv.style.display = 'block';
       contentDiv.dataset.loading = 'true';
@@ -1923,6 +1946,7 @@
             // filter switch, next-card cycle) retries instead of showing
             // this placeholder/stale summary forever.
             contentDiv.dataset.error = 'true';
+            tldrRetryAt.set(storyId, Date.now() + 60000);
           } else {
             tldrCache.set(storyId, data.tldr);
             delete contentDiv.dataset.error;
@@ -1933,6 +1957,8 @@
         } else {
           const errData = await resp.json().catch(() => ({}));
           const errorMsg = errData.error || `HTTP ${resp.status}`;
+          const retryAfter = Number(resp.headers.get('Retry-After') || errData.retry_after || 30);
+          tldrRetryAt.set(storyId, Date.now() + Math.max(1, Number.isFinite(retryAfter) ? retryAfter : 30) * 1000);
           contentDiv.textContent = 'TLDR: ' + errorMsg;
           contentDiv.dataset.error = 'true';
           contentDiv.style.display = 'block';

@@ -2224,9 +2224,19 @@ def test_flask_test_client_events_batch_and_replay_are_idempotent(
     replay = client.post("/api/interaction", json={"events": [event]})
 
     assert first.status_code == 200
-    assert first.get_json() == {"ok": True, "inserted": 1, "duplicates": 1, "rejected": 0}
+    assert first.get_json() == {
+        "ok": True,
+        "inserted": 1,
+        "duplicates": 1,
+        "rejected": 0,
+    }
     assert replay.status_code == 200
-    assert replay.get_json() == {"ok": True, "inserted": 0, "duplicates": 1, "rejected": 0}
+    assert replay.get_json() == {
+        "ok": True,
+        "inserted": 0,
+        "duplicates": 1,
+        "rejected": 0,
+    }
     with db.conn() as conn:
         assert conn.execute(
             "SELECT user_id, story_id, event_type FROM interaction_events"
@@ -2267,11 +2277,16 @@ def test_flask_test_client_events_accept_negative_story_ids(test_env: Any) -> No
     event = _ledger_event("77777777-7777-4777-8777-777777777777", -42)
     response = client.post("/api/interaction", json={"events": [event]})
     assert response.status_code == 200
-    assert response.get_json() == {"ok": True, "inserted": 1, "duplicates": 0, "rejected": 0}
+    assert response.get_json() == {
+        "ok": True,
+        "inserted": 1,
+        "duplicates": 0,
+        "rejected": 0,
+    }
     with db.conn() as conn:
-        assert conn.execute(
-            "SELECT story_id FROM interaction_events"
-        ).fetchall() == [(-42,)]
+        assert conn.execute("SELECT story_id FROM interaction_events").fetchall() == [
+            (-42,)
+        ]
 
 
 def test_flask_test_client_events_skip_invalid_and_unknown_per_event(
@@ -2299,11 +2314,16 @@ def test_flask_test_client_events_skip_invalid_and_unknown_per_event(
         "/api/interaction", json={"events": [unknown, malformed, valid]}
     )
     assert response.status_code == 200
-    assert response.get_json() == {"ok": True, "inserted": 1, "duplicates": 0, "rejected": 2}
+    assert response.get_json() == {
+        "ok": True,
+        "inserted": 1,
+        "duplicates": 0,
+        "rejected": 2,
+    }
     with db.conn() as conn:
-        assert conn.execute(
-            "SELECT story_id FROM interaction_events"
-        ).fetchall() == [(2711,)]
+        assert conn.execute("SELECT story_id FROM interaction_events").fetchall() == [
+            (2711,)
+        ]
 
 
 def test_flask_test_client_feedback_limit_sets_retry_after(test_env: Any) -> None:
@@ -2886,9 +2906,10 @@ async def test_prefetch_tldrs_for_ranked_regenerates_stale_beyond_top_combo(
         return srv.TldrResult(kind="ok", tldr=f"TLDR: {title}", cacheable=cacheable)
 
     monkeypatch.setattr(srv, "generate_detailed_tldr", mock_generate_detailed_tldr)
+    monkeypatch.setattr(srv, "_PREFETCH_STAGGER_S", 0)
 
     generated = await srv._prefetch_tldrs_for_ranked(
-        ranked, db, per_combo=1, stale_per_run=2
+        ranked, db, per_combo=1, stale_per_run=2, date_top_n=0
     )
 
     assert generated == (2 if cacheable else 0)
@@ -2897,6 +2918,206 @@ async def test_prefetch_tldrs_for_ranked_regenerates_stale_beyond_top_combo(
         assert db.get_any_tldr_for_story(stories[0].id) is None
         assert db.get_any_tldr_for_story(stories[1].id) == "Stale TLDR"
     assert db.get_any_tldr_for_story(stories[2].id) == "Fresh TLDR"
+
+
+async def test_prefetch_tldrs_for_ranked_covers_date_sorted_head(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Date-tab lane: the newest story by time is prefetched even when it
+    sits below the per-combo cutoff and has no stale key."""
+    import server as srv
+    from pipeline import RankedStory
+
+    _, db, _, _, _ = test_env
+
+    old = Story(
+        id=3120,
+        title="Old combo-top story",
+        url="https://example.com/date-old",
+        score=10,
+        time=1600000000,
+        text_content="body",
+        source="hn",
+        comment_count=0,
+        self_text="",
+        top_comments="",
+        article_body="Body.",
+    )
+    new = Story(
+        id=3121,
+        title="Newest story below cutoff",
+        url="https://example.com/date-new",
+        score=10,
+        time=1700000000,
+        text_content="body",
+        source="hn",
+        comment_count=0,
+        self_text="",
+        top_comments="",
+        article_body="Body.",
+    )
+    for s in (old, new):
+        db.upsert_story(s)
+    ranked = [
+        RankedStory(story=old, score=1.0, best_match_title="", combo_keys="recent_hn"),
+        RankedStory(story=new, score=0.1, best_match_title="", combo_keys=""),
+    ]
+
+    calls: list[str] = []
+
+    async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
+        calls.append(title)
+        return srv.TldrResult(kind="ok", tldr=f"TLDR: {title}")
+
+    monkeypatch.setattr(srv, "generate_detailed_tldr", mock_generate_detailed_tldr)
+    monkeypatch.setattr(srv, "_PREFETCH_STAGGER_S", 0)
+
+    generated = await srv._prefetch_tldrs_for_ranked(
+        ranked, db, per_combo=1, stale_per_run=0, date_top_n=1
+    )
+
+    assert generated == 2
+    assert sorted(calls) == sorted([old.title, new.title])
+
+
+async def test_prefetch_tldrs_for_ranked_date_lane_dedupes_combo_picks(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A newest story already picked by the combo pass is fetched once."""
+    import server as srv
+    from pipeline import RankedStory
+
+    _, db, _, _, _ = test_env
+
+    s = Story(
+        id=3130,
+        title="Newest combo-top story",
+        url="https://example.com/date-dedupe",
+        score=10,
+        time=1700000000,
+        text_content="body",
+        source="hn",
+        comment_count=0,
+        self_text="",
+        top_comments="",
+        article_body="Body.",
+    )
+    db.upsert_story(s)
+    ranked = [
+        RankedStory(story=s, score=1.0, best_match_title="", combo_keys="recent_hn")
+    ]
+
+    calls: list[str] = []
+
+    async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
+        calls.append(title)
+        return srv.TldrResult(kind="ok", tldr=f"TLDR: {title}")
+
+    monkeypatch.setattr(srv, "generate_detailed_tldr", mock_generate_detailed_tldr)
+    monkeypatch.setattr(srv, "_PREFETCH_STAGGER_S", 0)
+
+    generated = await srv._prefetch_tldrs_for_ranked(
+        ranked, db, per_combo=1, stale_per_run=0, date_top_n=8
+    )
+
+    assert generated == 1
+    assert calls == [s.title]
+
+
+async def test_prefetch_tldrs_for_ranked_skips_run_during_provider_cooldown(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Background prefetch must not fire (or deepen) a provider ban; taps get
+    first shot at recovered quota."""
+    import server as srv
+    from pipeline import RankedStory
+
+    _, db, _, _, _ = test_env
+
+    s = Story(
+        id=3140,
+        title="Cooldown skip story",
+        url="https://example.com/cooldown-skip",
+        score=10,
+        time=1700000000,
+        text_content="body",
+        source="hn",
+        comment_count=0,
+        self_text="",
+        top_comments="",
+        article_body="Body.",
+    )
+    db.upsert_story(s)
+    ranked = [
+        RankedStory(story=s, score=1.0, best_match_title="", combo_keys="recent_hn")
+    ]
+
+    calls: list[str] = []
+
+    async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
+        calls.append(title)
+        return srv.TldrResult(kind="ok", tldr=f"TLDR: {title}")
+
+    monkeypatch.setattr(srv, "generate_detailed_tldr", mock_generate_detailed_tldr)
+    monkeypatch.setattr(srv, "_PREFETCH_STAGGER_S", 0)
+    srv.llm_limiter.on_429()
+    try:
+        generated = await srv._prefetch_tldrs_for_ranked(
+            ranked, db, per_combo=1, stale_per_run=0, date_top_n=1
+        )
+    finally:
+        srv.llm_limiter.reset()
+
+    assert generated == 0
+    assert calls == []
+
+
+async def test_prefetch_tldrs_for_ranked_logs_zero_outcome_with_candidates(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A silent generated=0 once hid a fail-fast storm (page-open burst
+    tripped the ban, every prefetch fail-fasted, log showed nothing); the
+    zero outcome must log candidates plus cooldown state."""
+    import logging
+
+    import server as srv
+    from pipeline import RankedStory
+
+    _, db, _, _, _ = test_env
+
+    s = Story(
+        id=3141,
+        title="Already cached story",
+        url="https://example.com/already-cached",
+        score=10,
+        time=1700000000,
+        text_content="body",
+        source="hn",
+        comment_count=0,
+        self_text="",
+        top_comments="",
+        article_body="Body.",
+    )
+    db.upsert_story(s)
+    db.upsert_tldr_cache(
+        s.id,
+        srv._tldr_cache_key(
+            title=s.title, self_text="", top_comments="", article_body="Body."
+        ),
+        "TLDR: cached",
+    )
+    ranked = [
+        RankedStory(story=s, score=1.0, best_match_title="", combo_keys="recent_hn")
+    ]
+
+    monkeypatch.setattr(srv, "_PREFETCH_STAGGER_S", 0)
+    with caplog.at_level(logging.INFO):
+        generated = await srv._prefetch_tldrs_for_ranked(
+            ranked, db, per_combo=1, stale_per_run=0, date_top_n=0
+        )
+
+    assert generated == 0
+    assert "tldr_prefetch generated=0 candidates=1" in caplog.text
 
 
 def test_normalize_tldr_markdown_repairs_inline_bullets():
@@ -2918,6 +3139,16 @@ def test_normalize_tldr_markdown_repairs_inline_bullets():
         "- Quantization may degrade quality.\n- Providers reduce hardware barriers."
         in normalized
     )
+
+
+def test_normalize_tldr_markdown_converts_star_bullets() -> None:
+    """gemini-2.5-flash-lite emits `*` bullets; normalize to `-`."""
+    import server
+
+    normalized = server._normalize_tldr_markdown(
+        "*   **Nitter** resumes service.\n* plain point"
+    )
+    assert normalized == "- **Nitter** resumes service.\n- plain point"
 
 
 def test_reddit_rss_helpers_extract_post_and_comment_text():
@@ -3612,22 +3843,41 @@ def test_tldr_partial_response_remains_retryable(
     import server
 
     port, db, _, _, user = test_env
-    db.upsert_story(Story(
-        id=780, title="Partial story", url=None, score=5, time=1600000000,
-        text_content="Body", article_body="Body",
-    ))
+    db.upsert_story(
+        Story(
+            id=780,
+            title="Partial story",
+            url=None,
+            score=5,
+            time=1600000000,
+            text_content="Body",
+            article_body="Body",
+        )
+    )
 
     async def generate(*args: object, **kwargs: object) -> server.TldrResult:
-        return server.TldrResult(kind="ok", tldr="### Article\n- Partial", cacheable=False)
+        return server.TldrResult(
+            kind="ok", tldr="### Article\n- Partial", cacheable=False
+        )
 
     monkeypatch.setattr(server, "generate_detailed_tldr", generate)
     response = httpx.post(
         f"http://127.0.0.1:{port}/api/tldr-detail",
-        json={"story_id": 780}, cookies={"hn_token": user.token},
+        json={"story_id": 780},
+        cookies={"hn_token": user.token},
     )
     assert response.status_code == 200
     assert response.json()["retryable"] is True
     assert db.get_any_tldr_for_story(780) is None
+
+
+def test_tldr_client_cooldown_suppression_shows_message() -> None:
+    """Cooldown guard must render a message, not silently keep old bytes."""
+    _, script = _read_template_and_static()
+    start = script.index("      const retryAt = tldrRetryAt.get(storyId)")
+    block = script[start : start + 600]
+    assert "provider cooling down, retry in" in block
+    assert "dataset.error" in block
 
 
 def test_prefetch_follows_navigation_order() -> None:
@@ -3642,17 +3892,20 @@ def test_prefetch_follows_navigation_order() -> None:
     end = script.index("    function cardsForAge", start)
     # Execute the production function against queue states, including a
     # retained active card in the middle after a refill and wraparound.
-    harness = """
+    harness = (
+        """
       const assert = require('node:assert/strict');
-      const PREFETCH_COUNT = 2;
+      const PREFETCH_COUNT = 4;
       let queue, activeCard, requested;
       const queuedCards = () => queue;
       const prefetchCards = cards => { requested = cards; };
-    """ + script[start:end] + """
+    """
+        + script[start:end]
+        + """
       for (const [cards, active, expected] of [
-        [[1,2,3,4], 1, [2,3]],
-        [[1,2,3,4], 3, [4,1]],
-        [[1,2,3,4], 4, [1,2]],
+        [[1,2,3,4,5,6], 1, [2,3,4,5]],
+        [[1,2,3,4,5,6], 3, [4,5,6,1]],
+        [[1,2,3,4,5,6], 6, [1,2,3,4]],
         [[1], 1, []], [[], null, []], [[1,2], null, [1,2]],
       ]) {
         queue = cards; activeCard = active;
@@ -3660,9 +3913,66 @@ def test_prefetch_follows_navigation_order() -> None:
         assert.deepEqual(requested, expected);
       }
     """
+    )
     subprocess.run([node, "-e", harness], check=True, capture_output=True, text=True)
-    refill = script[script.index("    async function refillQueue("):script.index("    document.querySelectorAll('[data-fb]').forEach", script.index("    async function refillQueue("))]
+    refill = script[
+        script.index("    async function refillQueue(") : script.index(
+            "    document.querySelectorAll('[data-fb]').forEach",
+            script.index("    async function refillQueue("),
+        )
+    ]
     assert "else {\n        prefetchUpcomingTldrs();" in refill
+
+
+def test_prefetch_cards_runs_sequentially_and_skips_detached() -> None:
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node is required to execute browser queue logic")
+    _, script = _read_template_and_static()
+    start = script.index("    let tldrPrefetchChain")
+    end = script.index("    function prefetchUpcomingTldrs()", start)
+    # The page-open burst (active tap + 4 prefetches + server warm prefetch)
+    # tripped the free token-rate limit within seconds, so prefetches must
+    # run one-at-a-time behind the active tap, skipping detached cards.
+    harness = (
+        """
+      const assert = require('node:assert/strict');
+      const started = [];
+      const resolvers = [];
+      const openTldrDetail = (card) => {
+        started.push(card.id);
+        return new Promise((resolve) => resolvers.push(resolve));
+      };
+      const mk = (id, connected) => ({
+        id, isConnected: connected, querySelector: () => null,
+      });
+      const tick = async (n) => {
+        for (let i = 0; i < n; i++) {
+          await new Promise((r) => setImmediate(r));
+        }
+      };
+    """
+        + script[start:end]
+        + """
+      (async () => {
+        const a = mk('a', true), b = mk('b', true), gone = mk('gone', false);
+        prefetchCards([a, b, gone]);
+        await tick(5);
+        assert.deepEqual(started, ['a']);
+        resolvers[0]('ok-a');
+        await tick(5);
+        assert.deepEqual(started, ['a', 'b']);
+        assert.equal(resolvers.length, 2);
+        resolvers[1]('ok-b');
+        await tick(5);
+        assert.deepEqual(started, ['a', 'b']);
+      })().then(() => process.exit(0), (e) => { console.error(e); process.exit(1); });
+    """
+    )
+    subprocess.run([node, "-e", harness], check=True, capture_output=True, text=True)
 
 
 def test_maybe_cache_tldr_skips_salvaged_half(tmp_path: Path) -> None:
@@ -3791,8 +4101,8 @@ async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
         (
             "groq",
             "GROQ_API_KEY",
-            "llama-3.3-70b-versatile",
-            {},
+            "openai/gpt-oss-20b",
+            {"reasoning_effort": "low"},
             "api.groq.com",
         ),
         (
@@ -3808,6 +4118,13 @@ async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
             "ling-3.0-flash-fin-free",
             {},
             "opencode.ai",
+        ),
+        (
+            "gemini",
+            "GEMINI_API_KEY",
+            "models/gemini-2.5-flash-lite",
+            {"reasoning_effort": "none"},
+            "generativelanguage.googleapis.com",
         ),
     ],
 )
@@ -3837,6 +4154,8 @@ def test_llm_provider_config_table(
 
     monkeypatch.setenv("LLM_MODEL", "custom-model")
     assert server._llm_provider_config().model == "custom-model"
+    if provider == "groq":
+        assert server._llm_provider_config().extra == {}
 
 
 def test_llm_provider_config_unknown_is_rejected(monkeypatch) -> None:
@@ -3844,7 +4163,7 @@ def test_llm_provider_config_unknown_is_rejected(monkeypatch) -> None:
 
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
     monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
-    assert server._llm_provider_config().provider == "zen"
+    assert server._llm_provider_config().provider == "groq"
 
     monkeypatch.setenv("LLM_PROVIDER", "not-a-provider")
     with pytest.raises(ValueError, match="Unsupported LLM_PROVIDER"):
@@ -3860,12 +4179,18 @@ def test_provider_max_tokens_reserves_reasoning_headroom() -> None:
     mistral = server.LlmProviderConfig(
         "mistral", "key", "https://example.test", "model", {}
     )
-    zen = server.LlmProviderConfig(
-        "zen", "key", "https://example.test", "model", {}
-    )
+    zen = server.LlmProviderConfig("zen", "key", "https://example.test", "model", {})
     assert server._max_tokens_for_provider(cerebras, 900) == 1500
     assert server._max_tokens_for_provider(mistral, 900) == 900
     assert server._max_tokens_for_provider(zen, 900) == 8192
+    groq = server.LlmProviderConfig(
+        "groq",
+        "key",
+        "https://example.test",
+        "openai/gpt-oss-20b",
+        {"reasoning_effort": "low"},
+    )
+    assert server._max_tokens_for_provider(groq, 900) == 1500
 
 
 @pytest.mark.parametrize(
@@ -3930,7 +4255,9 @@ async def test_generate_detailed_tldr_scales_combined_path_budgets(monkeypatch):
 
     calls = []
 
-    async def mock_call_llm_chat(*, api_key, base_url, model, prompt, max_tokens, extra=None):
+    async def mock_call_llm_chat(
+        *, api_key, base_url, model, prompt, max_tokens, extra=None
+    ):
         calls.append(prompt)
         return server.LlmChatResult(content="- summary", ok=True)
 
@@ -3961,11 +4288,15 @@ async def test_call_llm_chat_uses_limiter(monkeypatch):
     calls = []
 
     class FakeLimiter:
-        async def acquire(self):
+        async def acquire(self, *, estimated_tokens=0):
+            assert estimated_tokens > 0
             calls.append(("acquire", None))
             return True
 
-        def record_response(self, *, status, headers):
+        def record_response(
+            self, *, status, headers, reserved_tokens=0, used_tokens=None
+        ):
+            assert reserved_tokens > 0
             calls.append(("record_response", status, dict(headers)))
 
     class FakeResponse:
@@ -3974,7 +4305,11 @@ async def test_call_llm_chat_uses_limiter(monkeypatch):
         text = '{"ok": true}'
 
         def json(self):
-            return {"choices": [{"message": {"content": "- summary"}, "finish_reason": "stop"}]}
+            return {
+                "choices": [
+                    {"message": {"content": "- summary"}, "finish_reason": "stop"}
+                ]
+            }
 
     class FakeClient:
         def __init__(self, *, timeout):
@@ -4022,7 +4357,9 @@ async def test_unified_fallback_omits_article_when_no_article_body(
 
     calls = []
 
-    async def mock_call_llm_chat(*, api_key, base_url, model, prompt, max_tokens, extra=None):
+    async def mock_call_llm_chat(
+        *, api_key, base_url, model, prompt, max_tokens, extra=None
+    ):
         calls.append(prompt)
         return server.LlmChatResult(content="- **Discussion** summary", ok=True)
 
@@ -4050,7 +4387,9 @@ async def test_generate_detailed_tldr_returns_stub_when_no_content(
 
     calls: list = []
 
-    async def mock_call_llm_chat(*, api_key, base_url, model, prompt, max_tokens, extra=None):
+    async def mock_call_llm_chat(
+        *, api_key, base_url, model, prompt, max_tokens, extra=None
+    ):
         calls.append(prompt)
         return "should not be called"
 
@@ -4268,7 +4607,7 @@ def test_dashboard_source_filter_toggle_temporarily_disabled():
     assert 'data-source="mixed"' not in template
     assert 'data-source="hn"' not in template
     assert 'data-source="non-hn"' not in template
-    assert "TabView(\"non-hn\"" not in (
+    assert 'TabView("non-hn"' not in (
         Path(__file__).resolve().parents[1] / "pipeline" / "render.py"
     ).read_text(encoding="utf-8")
 
@@ -4303,9 +4642,9 @@ def test_story_cards_always_fill_the_story_column() -> None:
     """All cards use the available story-column width, before enrichment."""
     template, _ = _read_template_and_static()
     card_css = template.split("    .story-card {", 1)[1].split("    }", 1)[0]
-    enriched_css = template.split("    .story-card.enriched {", 1)[1].split(
-        "    }", 1
-    )[0]
+    enriched_css = template.split("    .story-card.enriched {", 1)[1].split("    }", 1)[
+        0
+    ]
 
     assert "width: 100%;" in card_css
     assert "width: fit-content;" not in card_css
@@ -4491,7 +4830,9 @@ def test_patch_current_version_replaces_attribute_value():
 
     html = b'<div data-dashboard-version="3" data-current-version="3">x</div>'
     patched = _patch_current_version(html, 7)
-    assert patched == b'<div data-dashboard-version="3" data-current-version="7">x</div>'
+    assert (
+        patched == b'<div data-dashboard-version="3" data-current-version="7">x</div>'
+    )
 
 
 def test_patch_current_version_is_noop_without_attribute():
@@ -4509,8 +4850,7 @@ def test_dashboard_stale_hit_patches_current_version_to_live_version(swr_handler
     # HN-only render from before the live version advanced.
     user, h = swr_handler
     stale_html = (
-        b'<div id="stories" data-dashboard-version="0" data-current-version="0">'
-        b"</div>"
+        b'<div id="stories" data-dashboard-version="0" data-current-version="0"></div>'
     )
     h._dashboard_cache[f"dashboard_{user.id}"] = (stale_html, time.time(), 0)
     h._dashboard_versions[user.id] = 3
@@ -4730,12 +5070,21 @@ def test_deck_actions_restore_native_focus_to_active_card() -> None:
     key_actions = inline_script.split("const KEY_ACTIONS =", 1)[1].split(
         "document.addEventListener('keydown'", 1
     )[0]
-    assert "document.body.classList.toggle('fullscreen');\n        focusActiveCard();" in key_actions
+    assert (
+        "document.body.classList.toggle('fullscreen');\n        focusActiveCard();"
+        in key_actions
+    )
     key_action_buttons = inline_script.split(
         "document.querySelectorAll('[data-key-action]').forEach", 1
     )[1].split("async function fetchRefillDoc", 1)[0]
-    assert "document.body.classList.toggle('fullscreen');\n          focusActiveCard();" in key_action_buttons
-    assert "max-height: calc(100dvh - var(--vote-bar-height) - var(--page-gutter));" in template
+    assert (
+        "document.body.classList.toggle('fullscreen');\n          focusActiveCard();"
+        in key_action_buttons
+    )
+    assert (
+        "max-height: calc(100dvh - var(--vote-bar-height) - var(--page-gutter));"
+        in template
+    )
 
     refill_block = inline_script.split("async function refillQueue", 1)[1].split(
         "document.querySelectorAll('[data-fb]')", 1
@@ -4771,11 +5120,13 @@ def test_submitVote_advances_to_the_voted_cards_successor_not_the_deck_head() ->
     assert "preferred.isConnected" in show_next_block
     assert "queue.includes(preferred)" in show_next_block
     # Falls back to the original head-of-deck pick when preferred is stale.
-    assert "queue.find(card => !excludeActive || card !== activeCard)" in show_next_block
+    assert (
+        "queue.find(card => !excludeActive || card !== activeCard)" in show_next_block
+    )
 
-    next_sibling_block = inline_script.split("function nextQueuedSibling(", 1)[
-        1
-    ].split("function ", 1)[0]
+    next_sibling_block = inline_script.split("function nextQueuedSibling(", 1)[1].split(
+        "function ", 1
+    )[0]
     assert "nextElementSibling" in next_sibling_block
     assert "isQueued(el)" in next_sibling_block
 
@@ -4885,7 +5236,9 @@ def test_deck_cards_returns_only_card_fragment(test_env) -> None:
 
     assert fragment_resp.status_code == 200
     assert fragment_resp.headers["content-type"].startswith("text/html")
-    assert fragment_resp.headers["Cache-Control"] == "no-cache, no-store, must-revalidate"
+    assert (
+        fragment_resp.headers["Cache-Control"] == "no-cache, no-store, must-revalidate"
+    )
     fragment = fragment_resp.text
     assert f'data-story-id="{story_id}"' in fragment
     assert "<style" not in fragment
@@ -5220,7 +5573,10 @@ def test_refillQueue_activates_a_replacement_only_when_the_deck_is_empty() -> No
     )[0]
     assert "advance = true" in block
     assert "const needsActiveCard = activeCard === null;" in block
-    assert "if (advance || needsActiveCard) {\n        showNextCard({ allowRefresh: false });" in block
+    assert (
+        "if (advance || needsActiveCard) {\n        showNextCard({ allowRefresh: false });"
+        in block
+    )
 
 
 def test_showToast_dismisses_after_3s() -> None:
@@ -5354,7 +5710,6 @@ def test_on_demand_tldr_records_fetch_failure(test_env, monkeypatch):
 
 def test_on_demand_tldr_clears_failure_on_success(test_env, monkeypatch):
     """On-demand success clears prior failure record."""
-    import hashlib
     import server
     import time as time_mod
 
@@ -5410,9 +5765,9 @@ def test_on_demand_tldr_clears_failure_on_success(test_env, monkeypatch):
     updated = db.get_story(sid)
     assert updated is not None
     assert updated.article_body == "Recovered article body content here"
-    model_version = MockEmbedder.model_version
-    text_hash = hashlib.sha256(updated.text_content.encode("utf-8")).hexdigest()
-    assert db.get_embedding(sid, model_version, text_hash) is not None
+    # Embedding refresh is intentionally deferred to the warm/regen
+    # article-fetch path (off the tap critical path); the tap persists
+    # the body and clears the failure only.
 
 
 def test_warm_background_task_dedupes_in_flight_ids(test_env, monkeypatch):
@@ -5515,7 +5870,14 @@ def test_warm_background_article_fetch_failure_still_prefetches_tldrs(
 
     prefetch_calls: list[list[int]] = []
 
-    async def capture_prefetch(ranked_stories, database, per_combo, stale_per_run=0):
+    async def capture_prefetch(
+        ranked_stories,
+        database,
+        per_combo,
+        stale_per_run=0,
+        date_top_n=0,
+        stagger_s=None,
+    ):
         prefetch_calls.append([rs.story.id for rs in ranked_stories])
         return 1
 

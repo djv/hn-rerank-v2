@@ -123,6 +123,10 @@ def _normalize_tldr_markdown(text: str) -> str:
     lines = []
     for raw_line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         line = raw_line.rstrip()
+        # Some models (gemini-2.5-flash-lite) emit `*` bullets despite the
+        # prompt's flat `-` convention; normalize so cached summaries and
+        # the renderer see one marker style.
+        line = re.sub(r"^(\s*)\*\s+", r"\1- ", line)
         stripped = line.strip()
         if _looks_like_plain_heading(stripped):
             lines.append(f"### {stripped}")
@@ -465,9 +469,7 @@ async def _fetch_reddit_rss_context(url: str | None) -> RedditRssContext | None:
             return None
 
         try:
-            async with httpx.AsyncClient(
-                follow_redirects=True, timeout=15.0
-            ) as client:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
                 resp = await client.get(
                     rss_url, headers={"User-Agent": REDDIT_RSS_USER_AGENT}
                 )
@@ -604,10 +606,14 @@ async def _call_llm_chat(
         "max_tokens": max_tokens,
         **(extra or {}),
     }
+    estimated_tokens = len(prompt) // 3 + max_tokens
     try:
         async with httpx.AsyncClient(timeout=45.0) as client:
             for attempt in range(4):
-                await llm_limiter.acquire()
+                if not await llm_limiter.acquire(estimated_tokens=estimated_tokens):
+                    return LlmChatResult(
+                        content="LLM quota cooldown; retry later.", ok=False, status=429
+                    )
                 resp = await client.post(
                     base_url,
                     headers={
@@ -616,12 +622,17 @@ async def _call_llm_chat(
                     },
                     json=payload,
                 )
+                data = resp.json() if resp.status_code == 200 else {}
+                used_tokens = data.get("usage", {}).get("total_tokens")
                 llm_limiter.record_response(
                     status=resp.status_code,
                     headers=resp.headers,
+                    reserved_tokens=estimated_tokens,
+                    used_tokens=used_tokens
+                    if isinstance(used_tokens, int) and used_tokens >= 0
+                    else None,
                 )
                 if resp.status_code == 200:
-                    data = resp.json()
                     choice = data["choices"][0]
                     content = choice["message"].get("content") or ""
                     finish_reason = choice.get("finish_reason")
@@ -661,7 +672,7 @@ class LlmProviderConfig:
 
 
 # Provider table: name → (key env var, chat-completions endpoint, default
-# model, extra payload). Zen is the free default; other providers are explicit
+# model, extra payload). Groq is the free default; other providers are explicit
 # opt-ins for targeted testing or deployments.
 _LLM_PROVIDERS: dict[str, tuple[str, str, str, dict[str, object]]] = {
     "mistral": (
@@ -679,8 +690,8 @@ _LLM_PROVIDERS: dict[str, tuple[str, str, str, dict[str, object]]] = {
     "groq": (
         "GROQ_API_KEY",
         "https://api.groq.com/openai/v1/chat/completions",
-        "llama-3.3-70b-versatile",
-        {},
+        "openai/gpt-oss-20b",
+        {"reasoning_effort": "low"},
     ),
     "openrouter": (
         "OPENROUTER_API_KEY",
@@ -694,20 +705,30 @@ _LLM_PROVIDERS: dict[str, tuple[str, str, str, dict[str, object]]] = {
         "ling-3.0-flash-fin-free",
         {},
     ),
+    "gemini": (
+        "GEMINI_API_KEY",
+        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "models/gemini-2.5-flash-lite",
+        {"reasoning_effort": "none"},
+    ),
 }
 
 
 def _llm_provider_config() -> LlmProviderConfig:
-    provider = os.environ.get("LLM_PROVIDER", "zen").lower()
+    provider = os.environ.get("LLM_PROVIDER", "groq").lower()
     if provider not in _LLM_PROVIDERS:
         raise ValueError(f"Unsupported LLM_PROVIDER: {provider}")
     key_env, base_url, model, extra = _LLM_PROVIDERS[provider]
+    model = os.environ.get("LLM_MODEL", model)
+    extra = dict(extra)
+    if provider == "groq" and not model.startswith("openai/gpt-oss-"):
+        extra.pop("reasoning_effort", None)
     return LlmProviderConfig(
         provider=provider,
         api_key=os.environ.get(key_env),
         base_url=base_url,
-        model=os.environ.get("LLM_MODEL", model),
-        extra=dict(extra),
+        model=model,
+        extra=extra,
     )
 
 
@@ -715,7 +736,7 @@ def _max_tokens_for_provider(cfg: LlmProviderConfig, base: int) -> int:
     if cfg.provider == "zen":
         # Ling's free endpoint spends a large, variable amount on reasoning.
         return 8_192
-    if cfg.provider == "cerebras" and "reasoning_effort" in cfg.extra:
+    if cfg.provider in {"cerebras", "groq"} and "reasoning_effort" in cfg.extra:
         return base + 600
     return base
 
@@ -871,13 +892,32 @@ async def generate_detailed_tldr(
     return _llm_error_from(result)
 
 
+# Stagger between background TLDR prefetch LLM starts (seconds, capped at
+# 15s total offset). Seam for tests: patched to 0 to avoid real sleeps.
+_PREFETCH_STAGGER_S = 1.0
+
+
 async def _prefetch_tldrs_for_ranked(
     ranked_stories: list[RankedStory],
     db: Database,
     per_combo: int,
     stale_per_run: int = 0,
+    date_top_n: int = 8,
+    stagger_s: float | None = None,
 ) -> int:
-    if (per_combo <= 0 and stale_per_run <= 0) or not ranked_stories:
+    if (
+        per_combo <= 0 and stale_per_run <= 0 and date_top_n <= 0
+    ) or not ranked_stories:
+        return 0
+
+    # Background work must not deepen a provider ban: fail-fast per call
+    # already avoids spending quota, but a warm/regen burst firing dozens of
+    # attempts the moment a cooldown lifts re-trips free-tier rate limits
+    # (Groq answered a post-restart burst with a 660s retry-after). Skip the
+    # whole run while cooling down; on-demand taps get first shot at quota.
+    cooldown = llm_limiter.retry_after_seconds
+    if cooldown > 0:
+        logging.info("tldr_prefetch skipped: provider cooldown %ss remaining", cooldown)
         return 0
 
     combo_groups: dict[str, list[int]] = {}
@@ -898,6 +938,20 @@ async def _prefetch_tldrs_for_ranked(
             if sid not in seen:
                 seen.add(sid)
                 story_ids.append(sid)
+
+    # Date-tab lane: newest-first head of the deck, matching the client's
+    # date sort (story.time desc). Prefetch only covered combo tops before,
+    # so the Date tab's first cards always paid the full cold path.
+    date_added = 0
+    if date_top_n > 0:
+        by_time = sorted(ranked_stories, key=lambda rs: rs.story.time, reverse=True)
+        for rs in by_time:
+            if date_added >= date_top_n:
+                break
+            if rs.story.id not in seen:
+                seen.add(rs.story.id)
+                story_ids.append(rs.story.id)
+                date_added += 1
 
     stale_added = 0
     if stale_per_run > 0:
@@ -925,7 +979,7 @@ async def _prefetch_tldrs_for_ranked(
 
     sem = asyncio.Semaphore(2)
 
-    async def _prefetch_one(story_id: int) -> bool:
+    async def _prefetch_one(index: int, story_id: int) -> bool:
         story = db.get_story(story_id)
         if not story:
             return False
@@ -947,6 +1001,13 @@ async def _prefetch_tldrs_for_ranked(
         if db.get_tldr_cache(story_id, cache_key):
             return False
 
+        # Stagger LLM starts so the burst doesn't hit free-tier
+        # request-rate limits all at once (each item costs up to 2 calls).
+        # Seam for tests: stagger_s=None falls back to _PREFETCH_STAGGER_S,
+        # which tests patch to 0.
+        stagger = _PREFETCH_STAGGER_S if stagger_s is None else stagger_s
+        if index > 0 and stagger > 0:
+            await asyncio.sleep(min(index * stagger, 15.0))
         async with sem:
             result = await generate_detailed_tldr(
                 title,
@@ -957,17 +1018,32 @@ async def _prefetch_tldrs_for_ranked(
         return _maybe_cache_tldr(db, story_id, cache_key, result)
 
     results = await asyncio.gather(
-        *(_prefetch_one(sid) for sid in story_ids), return_exceptions=True
+        *(_prefetch_one(i, sid) for i, sid in enumerate(story_ids)),
+        return_exceptions=True,
     )
     generated = sum(1 for r in results if r is True)
 
     if generated:
         logging.info(
-            "tldr_prefetch generated=%s candidates=%s per_combo=%s stale_added=%s",
+            "tldr_prefetch generated=%s candidates=%s per_combo=%s stale_added=%s date_added=%s",
             generated,
             len(story_ids),
             per_combo,
             stale_added,
+            date_added,
+        )
+    else:
+        # Always log the zero outcome: a silent miss here once hid a real
+        # failure mode (page-open burst tripped the provider ban, every
+        # prefetch fail-fasted, and the run returned 0 indistinguishable
+        # from "everything already cached").
+        logging.info(
+            "tldr_prefetch generated=0 candidates=%s per_combo=%s stale_added=%s date_added=%s cooldown_s=%.0f",
+            len(story_ids),
+            per_combo,
+            stale_added,
+            date_added,
+            llm_limiter.retry_after_seconds,
         )
     return generated
 
@@ -1429,9 +1505,7 @@ class Handler:
         # stale bytes — not even a reload fixes it (see WORKLOG 2026-08-28).
         cache_user_ids = {
             uid
-            for uid in (
-                _cache_key_user_id(key) for key in cls._dashboard_cache
-            )
+            for uid in (_cache_key_user_id(key) for key in cls._dashboard_cache)
             if uid is not None
         }
         with cls._dashboard_versions_guard:
@@ -1526,8 +1600,18 @@ class Handler:
                     )
 
         stale_per_run = config.tldr_prefetch_stale_per_run
-        if (per_combo > 0 or stale_per_run > 0) and final:
-            asyncio.run(_prefetch_tldrs_for_ranked(final, db, per_combo, stale_per_run))
+        date_top_n = config.tldr_prefetch_date_top_n
+        if (per_combo > 0 or stale_per_run > 0 or date_top_n > 0) and final:
+            asyncio.run(
+                _prefetch_tldrs_for_ranked(
+                    final,
+                    db,
+                    per_combo,
+                    stale_per_run,
+                    date_top_n,
+                    stagger_s=config.tldr_prefetch_stagger_seconds,
+                )
+            )
 
 
 _DASHBOARD_CACHE_KEY_PREFIX = "dashboard_"
@@ -2028,9 +2112,7 @@ def _handle_flask_interaction_events(runtime: type[Handler]) -> Response:
             }
         )
     except ValueError as exc:
-        return _flask_json_response(
-            {"error": str(exc)}, status=HTTPStatus.BAD_REQUEST
-        )
+        return _flask_json_response({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
     except Exception:
         logging.exception("Error handling interaction events")
         return _flask_json_response(
@@ -2164,6 +2246,19 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
         if cached_tldr and not needs_active_refresh and not needs_empty_fetch:
             return _serve_cached_tldr(cached_tldr, story.id, cache_key, "cache_hit")
 
+        retry_after = llm_limiter.retry_after_seconds
+        if retry_after:
+            if cached_tldr:
+                return _serve_cached_tldr(cached_tldr, story.id, cache_key, "cache_hit")
+            fallback = _stale_tldr_fallback_response(
+                runtime.db, story.id, "provider_cooldown"
+            )
+            if fallback:
+                return fallback
+            return _flask_rate_limit_response(
+                "Summary provider is cooling down. Please try again later.", retry_after
+            )
+
         quota = _acquire_tldr_uncached_quota(runtime, user)
         if not quota.allowed:
             fallback = _stale_tldr_fallback_response(
@@ -2176,44 +2271,117 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
                 quota.retry_after_seconds,
             )
 
-        if needs_empty_fetch or needs_active_refresh:
+        t_tap = time.perf_counter()
+        hydrate_ms = 0.0
+        hydrate_hn_ms = 0.0
+        hydrate_src_ms = 0.0
+        hydrate_article_ms = 0.0
+
+        # Hydration lanes (HN thread refresh, Reddit/LW context, article
+        # body) are independent by source — the article lane excludes
+        # reddit/LW sources and the source lane only runs for them — so run
+        # all eligible lanes concurrently instead of back-to-back. Merges
+        # below apply in the original order to preserve semantics.
+        hn_needed = needs_empty_fetch or needs_active_refresh
+        src_kind: str | None = None
+        if story.url and (not story.self_text or not story.top_comments):
+            if story.source.startswith("rss_reddit_"):
+                src_kind = "reddit"
+            elif story.source == "rss_lesswrong_com":
+                src_kind = "lesswrong"
+        from pipeline import _is_fetchable_article_url
+
+        article_eligible = (
+            article_body is None
+            and story.url
+            and src_kind is None
+            and len(story.self_text) < 500
+            and _is_fetchable_article_url(story.url)
+        )
+        _lw_post_id: str | None = None
+        if src_kind == "lesswrong" and story.url:
+            _lw_post_id = _extract_lesswrong_post_id(story.url)
+            if not _lw_post_id:
+                src_kind = None
+
+        async def _hn_lane() -> Story | None:
+            from pipeline import fetch_story
+
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                return await fetch_story(
+                    client, story_id, runtime.db, force=needs_active_refresh
+                )
+
+        async def _src_lane() -> Any | None:
+            if src_kind == "reddit":
+                assert story.url is not None
+                return await _fetch_reddit_rss_context(story.url)
+            if src_kind == "lesswrong":
+                assert _lw_post_id is not None
+                return await _fetch_lesswrong_context(_lw_post_id)
+            return None
+
+        async def _article_lane() -> ArticleFetchResult | None:
+            assert story.url is not None
+            return await _fetch_article_body_with_result(story.url)
+
+        async def _gather_hydration() -> tuple[Any, Any, Any, dict[str, float]]:
+            tasks: dict[str, Any] = {}
+            if hn_needed:
+                tasks["hn"] = _hn_lane()
+            if src_kind is not None:
+                tasks["src"] = _src_lane()
+            if article_eligible:
+                tasks["article"] = _article_lane()
+            if not tasks:
+                return None, None, None, {}
+
+            async def _timed(name: str, coro: Any) -> tuple[str, Any, float]:
+                t0 = time.perf_counter()
+                try:
+                    return name, await coro, (time.perf_counter() - t0) * 1000.0
+                except Exception as e:
+                    logging.error("TLDR hydration lane %s failed: %r", name, e)
+                    return name, e, (time.perf_counter() - t0) * 1000.0
+
+            gathered = await asyncio.gather(
+                *(_timed(name, coro) for name, coro in tasks.items())
+            )
+            out: dict[str, Any] = {}
+            timings: dict[str, float] = {}
+            for name, value, ms in gathered:
+                out[name] = value
+                timings[name] = ms
+            return out.get("hn"), out.get("src"), out.get("article"), timings
+
+        t_hydrate = time.perf_counter()
+        hn_updated: Story | None = None
+        remote_context: Any | None = None
+        article_result: ArticleFetchResult | None = None
+        if hn_needed or src_kind is not None or article_eligible:
             try:
-                from pipeline import fetch_story
-
-                force = needs_active_refresh
-
-                async def do_fetch() -> Story | None:
-                    async with httpx.AsyncClient(timeout=15.0) as client:
-                        return await fetch_story(
-                            client, story_id, runtime.db, force=force
-                        )
-
-                updated = asyncio.run(do_fetch())
-                if updated:
-                    story = updated
+                hn_updated, remote_context, article_result, _timings = asyncio.run(
+                    _gather_hydration()
+                )
+                hydrate_hn_ms = _timings.get("hn", 0.0)
+                hydrate_src_ms = _timings.get("src", 0.0)
+                hydrate_article_ms = _timings.get("article", 0.0)
             except Exception as e:
-                logging.error("Failed to dynamically fetch comments for TLDR: %r", e)
+                logging.error("Failed to hydrate story for TLDR: %r", e)
+        hydrate_ms = (time.perf_counter() - t_hydrate) * 1000.0
+
+        if isinstance(hn_updated, Story):
+            story = hn_updated
+        elif isinstance(hn_updated, Exception):
+            logging.error(
+                "Failed to dynamically fetch comments for TLDR: %r", hn_updated
+            )
 
         article_body = story.article_body or article_body
 
-        # reddit/LessWrong-sourced stories missing a half get one remote
-        # enrichment attempt (RSS comments / LW post); anything already
-        # complete, URL-less, or from another source passes through.
-        if (
-            story.url
-            and (not story.self_text or not story.top_comments)
-            and (
-                story.source.startswith("rss_reddit_")
-                or story.source == "rss_lesswrong_com"
-            )
-        ):
-            if story.source.startswith("rss_reddit_"):
-                remote_context = asyncio.run(_fetch_reddit_rss_context(story.url))
-            else:
-                post_id = _extract_lesswrong_post_id(story.url)
-                remote_context = (
-                    asyncio.run(_fetch_lesswrong_context(post_id)) if post_id else None
-                )
+        # Merge the concurrently fetched source context (same semantics as
+        # the old sequential block; eligibility was snapshotted above).
+        if not isinstance(remote_context, Exception):
             if remote_context and (
                 remote_context.self_text or remote_context.top_comments
             ):
@@ -2223,76 +2391,64 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
                     story, remote_context, article_body, prefer_longer_comments=True
                 )
                 runtime.db.upsert_story(story)
+        else:
+            logging.error("TLDR source-context lane failed: %r", remote_context)
 
-        if (
-            article_body is None
-            and story.url
-            and not story.source.startswith("rss_reddit_")
-            and story.source != "rss_lesswrong_com"
-            and len(story.self_text) < 500
-        ):
-            from pipeline import _is_fetchable_article_url
+        if article_result is not None and not isinstance(article_result, Exception):
+            from pipeline import (
+                _article_failure_retry_time,
+                compose_story_text,
+            )
 
-            if _is_fetchable_article_url(story.url):
-                from pipeline import (
-                    _article_failure_retry_time,
-                    compose_story_text,
+            result = article_result
+            if result.body:
+                article_body = result.body[:ARTICLE_BODY_CHAR_LIMIT]
+                new_text = compose_story_text(
+                    story.title,
+                    story.self_text,
+                    story.top_comments,
+                    article_body,
                 )
-
-                result = asyncio.run(_fetch_article_body_with_result(story.url))
-                if result.body:
-                    article_body = result.body[:ARTICLE_BODY_CHAR_LIMIT]
-                    new_text = compose_story_text(
-                        story.title,
-                        story.self_text,
-                        story.top_comments,
-                        article_body,
+                updated_story = replace(
+                    story,
+                    article_body=article_body,
+                    text_content=new_text,
+                )
+                runtime.db.upsert_story(updated_story)
+                runtime.db.clear_article_fetch_failure(story.id)
+                # Embedding refresh intentionally left to the warm/regen
+                # article-fetch path (pipeline/enrichment.py re-embeds
+                # there); running ONNX encode here would block the tap.
+                story = updated_story
+            else:
+                now_ts = time.time()
+                previous = runtime.db.get_article_fetch_failure(story.id)
+                previous_count = int(previous["failure_count"]) if previous else 0
+                failure_count = previous_count + 1
+                permanent = (
+                    result.permanent
+                    or (result.error == "empty_extraction" and failure_count >= 3)
+                    or (
+                        result.error is not None
+                        and result.error in ("http_401", "http_403")
+                        and failure_count >= 3
                     )
-                    updated_story = replace(
-                        story,
-                        article_body=article_body,
-                        text_content=new_text,
-                    )
-                    runtime.db.upsert_story(updated_story)
-                    runtime.db.clear_article_fetch_failure(story.id)
-
-                    embedder = runtime.embedder
-                    if embedder is not None:
-                        model_version = embedder.model_version
-                        new_vec = embedder.encode([new_text])[0]
-                        new_hash = hashlib.sha256(new_text.encode("utf-8")).hexdigest()
-                        runtime.db.upsert_embedding(
-                            story.id, model_version, new_hash, new_vec
-                        )
-
-                    story = updated_story
-                else:
-                    now_ts = time.time()
-                    previous = runtime.db.get_article_fetch_failure(story.id)
-                    previous_count = int(previous["failure_count"]) if previous else 0
-                    failure_count = previous_count + 1
-                    permanent = (
-                        result.permanent
-                        or (result.error == "empty_extraction" and failure_count >= 3)
-                        or (
-                            result.error is not None
-                            and result.error in ("http_401", "http_403")
-                            and failure_count >= 3
-                        )
-                    )
-                    next_retry_at = (
-                        now_ts + 3650 * 86400
-                        if permanent
-                        else _article_failure_retry_time(failure_count, now_ts)
-                    )
-                    runtime.db.record_article_fetch_failure(
-                        story.id,
-                        story.url or "",
-                        status=result.status,
-                        error=result.error,
-                        permanent=permanent,
-                        next_retry_at=next_retry_at,
-                    )
+                )
+                next_retry_at = (
+                    now_ts + 3650 * 86400
+                    if permanent
+                    else _article_failure_retry_time(failure_count, now_ts)
+                )
+                runtime.db.record_article_fetch_failure(
+                    story.id,
+                    story.url or "",
+                    status=result.status,
+                    error=result.error,
+                    permanent=permanent,
+                    next_retry_at=next_retry_at,
+                )
+        elif isinstance(article_result, Exception):
+            logging.error("TLDR article lane failed: %r", article_result)
 
         cache_key = _tldr_cache_key(
             title=story.title,
@@ -2306,6 +2462,7 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
                 cached_tldr, story.id, cache_key, "post_enrich_cache_hit"
             )
 
+        t_llm = time.perf_counter()
         result = asyncio.run(
             generate_detailed_tldr(
                 story.title,
@@ -2314,6 +2471,8 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
                 article_body=article_body or "",
             )
         )
+        llm_ms = (time.perf_counter() - t_llm) * 1000.0
+        tldr_total_ms = (time.perf_counter() - t_tap) * 1000.0
         if result.kind == "no_content":
             return _flask_json_response(
                 {
@@ -2328,17 +2487,27 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             )
         if result.kind == "llm_error":
             logging.warning(
-                "tldr_detail story_id=%s result=llm_error cache_key=%s status=%s error=%s",
+                "tldr_detail story_id=%s result=llm_error cache_key=%s status=%s error=%s "
+                "tldr_total_ms=%.0f hydrate_ms=%.0f(hnsrc=%.0f/%.0f/art=%.0f) llm_ms=%.0f",
                 story.id,
                 cache_key[:12],
                 result.error_status,
                 result.error_text,
+                tldr_total_ms,
+                hydrate_ms,
+                hydrate_hn_ms,
+                hydrate_src_ms,
+                hydrate_article_ms,
+                llm_ms,
             )
             fallback = _stale_tldr_fallback_response(runtime.db, story.id, "llm_error")
             if fallback:
                 return fallback
             if result.error_status == 429:
-                error = "Rate limit exceeded. Please try again in a moment."
+                return _flask_rate_limit_response(
+                    "Summary provider is cooling down. Please try again later.",
+                    max(1, llm_limiter.retry_after_seconds),
+                )
             else:
                 error = "Failed to generate TLDR. Please try again later."
             return _flask_json_response(
@@ -2346,9 +2515,16 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             )
         _maybe_cache_tldr(runtime.db, story.id, cache_key, result)
         logging.info(
-            "tldr_detail story_id=%s result=generated cache_key=%s",
+            "tldr_detail story_id=%s result=generated cache_key=%s "
+            "tldr_total_ms=%.0f hydrate_ms=%.0f(hnsrc=%.0f/%.0f/art=%.0f) llm_ms=%.0f",
             story.id,
             cache_key[:12],
+            tldr_total_ms,
+            hydrate_ms,
+            hydrate_hn_ms,
+            hydrate_src_ms,
+            hydrate_article_ms,
+            llm_ms,
         )
         payload = {"ok": True, "tldr": result.tldr, "cached": False}
         if not result.cacheable:
@@ -2482,7 +2658,11 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
                 {"error": "No session"}, status=HTTPStatus.UNAUTHORIZED
             )
         cached = runtime._dashboard_cache.get(f"dashboard_{user.id}")
-        html = cached[0] if cached is not None else runtime._render_dashboard_for_user(user)
+        html = (
+            cached[0]
+            if cached is not None
+            else runtime._render_dashboard_for_user(user)
+        )
         # Unlike GET /, this endpoint used to serve `cached` unconditionally
         # with no version check — an open tab's in-DOM refills (vote, filter
         # tab click) could poll it forever and always get the same stale

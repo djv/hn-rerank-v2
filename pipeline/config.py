@@ -115,12 +115,21 @@ class Config:
     recent_candidate_hn_limit: int = 5000
     recent_candidate_rss_limit: int = 5000
     non_hn_candidates_enabled: bool = True
-    tldr_prefetch_per_combo: int = 5
+    tldr_prefetch_per_combo: int = 2
     # After the top-per-combo pass, regenerate up to this many additional
     # cold-deck stories whose cached TLDR's cache_key no longer matches
     # current story content (e.g. article_body was enriched after the TLDR
     # was generated). 0 disables. See server.py::_prefetch_tldrs_for_ranked.
-    tldr_prefetch_stale_per_run: int = 3
+    # Kept small: bulk prefetch trips Groq free-tier bans (875s retry-after
+    # observed 2026-09-07), so the steady-state budget is ~10 stories/run.
+    tldr_prefetch_stale_per_run: int = 1
+    # Date-tab coverage: newest-first head of the cold deck, matching the
+    # client's date sort (story.time desc). Deduped against combo picks.
+    tldr_prefetch_date_top_n: int = 3
+    # Seconds between background TLDR prefetch LLM starts (capped at 15s
+    # total offset). Gemini free allows ~10-15 RPM, so a Gemini deployment
+    # wants ~5.0; Groq free tolerates 1.0.
+    tldr_prefetch_stagger_seconds: float = 1.0
     # On-demand HN comment refresh (tldr-detail): forces a real-time Algolia
     # re-fetch for recent, high-velocity threads even when top_comments is
     # already populated from prewarm, since CH prewarm has 1-24h latency on

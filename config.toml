@@ -8,8 +8,12 @@ dashboard_warm_vote_threshold = 10
 dashboard_warm_idle_seconds = 3.0
 feedback_regen_idle_seconds = 300.0
 non_hn_candidates_enabled = true
-tldr_uncached_per_user_limit = 24
+tldr_uncached_per_user_limit = 120
 tldr_uncached_global_limit = 120
+# Mistral Tier 1 is TPM-bound (100K/min; a cold tap costs ~13K tokens over
+# 2 calls), so spread background prefetch starts: 10 candidates x 2 calls
+# over ~30s stays inside the rolling token window when most are cached.
+tldr_prefetch_stagger_seconds = 3.0
 
 [hn_rewrite.model]
 svm_c = 0.1
