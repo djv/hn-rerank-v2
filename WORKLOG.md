@@ -1,5 +1,16 @@
 # Worklog: hn-rewrite
 
+## 2026-09-08 — CI green on runners (model provisioning)
+
+- Push gate failed 3x: `tests/test_pipeline.py` module `embedder` fixture
+  loads the real ONNX model from the hardcoded host path, absent on GitHub
+  runners (657 passed, 47 OSError).
+- Fix: `DEFAULT_ONNX_MODEL_DIR` honors `HN_ONNX_MODEL_DIR` (default
+  unchanged); CI caches + provisions via `setup_model.py` into
+  `$RUNNER_TEMP/onnx-model` before pytest. Verified locally with a copied
+  model dir (real-embedder tests pass under override).
+- Verified: 704 passed (`pytest -n 4`), ruff + format + ty clean.
+
 ## 2026-09-07 — embedding model contract (no re-embed)
 
 - `setup_model.py` pins `MODEL_REVISION` and writes/verifies a

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tomllib
 from dataclasses import dataclass, field, fields, replace
 from typing import Any, Literal
@@ -33,7 +34,9 @@ class ModelConfig:
 # Kept in sync with config.toml's [hn_rewrite] onnx_model_dir/
 # embedding_model_version/embedding_max_tokens -- these are the fallback
 # used only when config.toml doesn't override them (it currently does not).
-DEFAULT_ONNX_MODEL_DIR = "/home/dev/hn-rewrite/shared/mxbai-embed-xsmall-v1"
+DEFAULT_ONNX_MODEL_DIR = os.environ.get(
+    "HN_ONNX_MODEL_DIR", "/home/dev/hn-rewrite/shared/mxbai-embed-xsmall-v1"
+)
 DEFAULT_EMBEDDING_MODEL_VERSION = "mxbai-embed-xsmall-v1|mean|norm|4096"
 DEFAULT_EMBEDDING_MAX_TOKENS = 4096
 DEFAULT_ENV_PATH = "/home/dev/hn-rewrite/shared/.env"

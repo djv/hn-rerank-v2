@@ -18,6 +18,15 @@ jobs:
           python-version: "3.12"
       - name: Install dev dependencies
         run: uv sync --group dev
+      - name: Cache ONNX model
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/onnx-model
+          key: onnx-model-${{ hashFiles('setup_model.py') }}
+      - name: Provision embedding model
+        env:
+          HN_ONNX_MODEL_DIR: ${{ runner.temp }}/onnx-model
+        run: uv run python setup_model.py
       - name: Lint
         run: uv run ruff check .
       - name: Changed Python files
@@ -36,4 +45,6 @@ jobs:
       - name: Type check
         run: uv run ty check
       - name: Tests
+        env:
+          HN_ONNX_MODEL_DIR: ${{ runner.temp }}/onnx-model
         run: uv run pytest tests/ -n 4 -q
