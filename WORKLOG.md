@@ -1,5 +1,17 @@
 # Worklog: hn-rewrite
 
+## 2026-09-08 — F2 attribution: "Because you upvoted …" live
+
+- `_knn_mean_and_max` also returns argmax indices (one extra reduction
+  over the existing chunk matrix, no new matmul); threaded through
+  `RankScoreContext` with aligned up-story titles; `best_match_title`
+  filled in assembly with a 0.35 similarity floor (weak matches silent),
+  empty when cold/missing. Template `Similar to:` ->
+  `Because you upvoted:` (same class, autoescaped).
+- Live user-1 deck: 86/96 cards attributed, titles sane.
+- Tests: argmax parity vs naive (extended fuzz), fill happy/cold/floor/
+  missing/unknown paths, render-escaping of a quoted title.
+
 ## 2026-09-08 — regen contention telemetry (pool-wait + phase markers)
 
 - Pool contention was invisible: `Database.conn()` blocked on an empty

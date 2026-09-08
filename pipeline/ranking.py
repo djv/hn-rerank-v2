@@ -196,6 +196,10 @@ class RankScoreContext:
     cand_closest_up: NDArray[np.float32] | None = None
     cand_closest_down: NDArray[np.float32] | None = None
     cand_closest_neutral: NDArray[np.float32] | None = None
+    # F2 attribution: argmax row (into fb_up_titles) of the closest upvoted
+    # feedback story per candidate, plus the aligned up-story titles.
+    cand_closest_up_idx: NDArray[np.int64] | None = None
+    fb_up_titles: list[str] = field(default_factory=list)
 
 
 def _feedback_signature(db: Database, user_id: int) -> str:
@@ -803,26 +807,30 @@ def _knn_mean_and_max(
     ref_emb: NDArray[np.float32],
     k: int,
     chunk_size: int = _SIM_CHUNK_SIZE,
-) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
-    """Fused (top-k mean, max) cosine similarity in a single dot pass.
+) -> tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.int64]]:
+    """Fused (top-k mean, max, argmax) cosine similarity in a single dot pass.
 
     Exactly equivalent to the pair
     ``(_knn_similarity(query, ref, k), _chunked_max_dot(query, ref))`` but
     computes the ``query @ ref.T`` matrix once instead of twice — the max is
     just the top-1 of the same similarity rows the k-NN mean already reduces.
+    The argmax row index (into ref) is one extra reduction over the same
+    chunk; callers needing attribution (F2) get it with no new matmul.
     """
     n = query_emb.shape[0]
     if ref_emb.shape[0] == 0:
         zeros = np.zeros(n, dtype=np.float32)
-        return zeros, zeros.copy()
+        return zeros, zeros.copy(), np.full(n, -1, dtype=np.int64)
     n_ref = ref_emb.shape[0]
     k_actual = min(k, n_ref)
     mean_out = np.zeros(n, dtype=np.float32)
     max_out = np.zeros(n, dtype=np.float32)
+    argmax_out = np.full(n, -1, dtype=np.int64)
     for start in range(0, n, chunk_size):
         end = min(start + chunk_size, n)
         sim_chunk = query_emb[start:end] @ ref_emb.T
         max_out[start:end] = np.max(sim_chunk, axis=1)
+        argmax_out[start:end] = np.argmax(sim_chunk, axis=1)
         if k_actual <= 0:
             continue
         if k_actual == n_ref:
@@ -830,7 +838,11 @@ def _knn_mean_and_max(
         else:
             topk = np.partition(sim_chunk, n_ref - k_actual, axis=1)[:, -k_actual:]
         mean_out[start:end] = topk.mean(axis=1)
-    return mean_out.astype(np.float32), max_out.astype(np.float32)
+    return (
+        mean_out.astype(np.float32),
+        max_out.astype(np.float32),
+        argmax_out,
+    )
 
 
 def _chunked_max_dot(
@@ -1069,10 +1081,10 @@ def _score_and_rank(
                 # Fused (top-k mean, max) per class — one dot pass each instead
                 # of the two _knn_similarity/_chunked_max_dot recomputed the
                 # same candidate @ feedback matrix twice.
-                cand_sim_to_up, cand_closest_up = _knn_mean_and_max(
-                    candidate_embeddings, fb_up_embs, k
+                cand_sim_to_up, cand_closest_up, cand_closest_up_idx = (
+                    _knn_mean_and_max(candidate_embeddings, fb_up_embs, k)
                 )
-                cand_sim_to_down, cand_closest_down = _knn_mean_and_max(
+                cand_sim_to_down, cand_closest_down, _ = _knn_mean_and_max(
                     candidate_embeddings, fb_down_embs, k
                 )
                 cand_closest_neutral = _chunked_max_dot(
@@ -1113,6 +1125,10 @@ def _score_and_rank(
                 )
             if score_context is not None:
                 score_context.cand_closest_up = cand_closest_up.astype(np.float32)
+                score_context.cand_closest_up_idx = cand_closest_up_idx
+                score_context.fb_up_titles = [
+                    feedback_stories[i].title for i in np.flatnonzero(up_mask)
+                ]
                 score_context.cand_closest_down = cand_closest_down.astype(np.float32)
                 score_context.cand_closest_neutral = cand_closest_neutral.astype(
                     np.float32
@@ -1815,6 +1831,47 @@ def rerank_candidates(
     )
 
 
+# Minimum closest-up similarity for showing an attribution. A bogus
+# "because you upvoted X" on a weak match is worse than none.
+ATTRIBUTION_MIN_SIM = 0.35
+
+
+def _fill_best_match_titles(
+    final: list[RankedStory],
+    candidates: list[Story],
+    score_context: RankScoreContext | None,
+) -> list[RankedStory]:
+    """F2 attribution: name the closest upvoted story per deck card.
+
+    Uses the argmax indices already computed for features (no new matmul).
+    Empty when cold (no feedback), when the argmax is invalid, when the
+    feedback title is gone, or below ATTRIBUTION_MIN_SIM.
+    """
+    if (
+        score_context is None
+        or score_context.cand_closest_up_idx is None
+        or score_context.cand_closest_up is None
+        or not score_context.fb_up_titles
+    ):
+        return final
+    row_of = {s.id: i for i, s in enumerate(candidates)}
+    titles = score_context.fb_up_titles
+    filled: list[RankedStory] = []
+    for r in final:
+        row = row_of.get(r.story.id)
+        title = ""
+        if row is not None:
+            fb_row = int(score_context.cand_closest_up_idx[row])
+            if (
+                0 <= fb_row < len(titles)
+                and float(score_context.cand_closest_up[row]) >= ATTRIBUTION_MIN_SIM
+                and titles[fb_row]
+            ):
+                title = titles[fb_row]
+        filled.append(replace(r, best_match_title=title) if title else r)
+    return filled
+
+
 def assemble_ranked_deck(
     ranked: list[RankedStory],
     candidates: list[Story],
@@ -1896,7 +1953,7 @@ def assemble_ranked_deck(
     idx_for = story_id_to_idx.__getitem__
 
     with trace.stage("combo_assembly"):
-        return _assemble_combo_deck(
+        final = _assemble_combo_deck(
             ranked,
             config=config,
             recent_cutoff=recent_cutoff,
@@ -1910,3 +1967,4 @@ def assemble_ranked_deck(
             is_feedback_match=is_feedback_match,
             trace=trace,
         )
+    return _fill_best_match_titles(final, candidates, score_context)

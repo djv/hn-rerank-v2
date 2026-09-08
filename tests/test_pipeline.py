@@ -6790,7 +6790,7 @@ def test_knn_mean_and_max_matches_separate_helpers(
     query = rng.standard_normal((n_query, dim)).astype(np.float32)
     ref = rng.standard_normal((n_ref, dim)).astype(np.float32)
 
-    fused_mean, fused_max = ranking._knn_mean_and_max(
+    fused_mean, fused_max, fused_argmax = ranking._knn_mean_and_max(
         query, ref, k, chunk_size=chunk_size
     )
     sep_mean = ranking._knn_similarity(query, ref, k, chunk_size=chunk_size)
@@ -6798,6 +6798,12 @@ def test_knn_mean_and_max_matches_separate_helpers(
 
     np.testing.assert_allclose(fused_mean, sep_mean, rtol=0, atol=1e-6)
     np.testing.assert_allclose(fused_max, sep_max, rtol=0, atol=1e-6)
+    if n_ref > 0:
+        np.testing.assert_array_equal(
+            fused_argmax, np.argmax(query @ ref.T, axis=1).astype(np.int64)
+        )
+    else:
+        np.testing.assert_array_equal(fused_argmax, np.full(n_query, -1))
 
 
 def test_rank_trace_records_and_formats_fields() -> None:
@@ -7320,3 +7326,81 @@ def test_article_fetch_http_4xx_becomes_permanent(db, monkeypatch):
     assert failure is not None
     assert failure["failure_count"] == 3
     assert failure["permanent"] == 1
+
+
+def _f2_story(sid: int, title: str = "t") -> Story:
+    return Story(
+        id=sid,
+        title=title,
+        url=None,
+        score=0,
+        time=0,
+        text_content="",
+        source="hn",
+    )
+
+
+def _f2_ranked(sids: list[int]) -> list:
+    return [
+        ranking.RankedStory(story=_f2_story(i), score=1.0, best_match_title="")
+        for i in sids
+    ]
+
+
+def _f2_context(n_cands: int, idx: list[int], sims: list[float], titles: list[str]):
+    return ranking.RankScoreContext(
+        cand_closest_up=np.array(sims, dtype=np.float32),
+        cand_closest_up_idx=np.array(idx, dtype=np.int64),
+        fb_up_titles=titles,
+    )
+
+
+def test_fill_best_match_titles_happy_path() -> None:
+    ctx = _f2_context(3, [0, 1, 0], [0.9, 0.8, 0.9], ["Up A", "Up B"])
+    out = ranking._fill_best_match_titles(
+        _f2_ranked([10, 11, 12]),
+        [_f2_story(10), _f2_story(11), _f2_story(12)],
+        ctx,
+    )
+    assert [r.best_match_title for r in out] == ["Up A", "Up B", "Up A"]
+
+
+def test_fill_best_match_titles_cold_and_floor() -> None:
+    ranked = _f2_ranked([10])
+    cands = [_f2_story(10)]
+    # No context (cold user): untouched, same objects.
+    assert ranking._fill_best_match_titles(ranked, cands, None) == ranked
+    assert (
+        ranking._fill_best_match_titles(ranked, cands, ranking.RankScoreContext())
+        == ranked
+    )
+    # Below the similarity floor: silent.
+    ctx = _f2_context(1, [0], [0.10], ["Up A"])
+    assert ranking._fill_best_match_titles(ranked, cands, ctx)[0].best_match_title == ""
+    # Invalid argmax row and missing title: silent.
+    ctx = _f2_context(1, [-1], [0.95], ["Up A"])
+    assert ranking._fill_best_match_titles(ranked, cands, ctx)[0].best_match_title == ""
+    ctx = _f2_context(1, [5], [0.95], ["Up A"])
+    assert ranking._fill_best_match_titles(ranked, cands, ctx)[0].best_match_title == ""
+    ctx = _f2_context(1, [0], [0.95], [""])
+    assert ranking._fill_best_match_titles(ranked, cands, ctx)[0].best_match_title == ""
+    # Unknown story id: untouched.
+    ctx = _f2_context(1, [0], [0.95], ["Up A"])
+    out = ranking._fill_best_match_titles(_f2_ranked([99]), cands, ctx)
+    assert out[0].best_match_title == ""
+
+
+def test_fill_best_match_titles_render_escapes() -> None:
+    """A quoted/malicious upvoted title must render escaped, never raw."""
+    from pipeline import render
+
+    story = _f2_story(10, "C <b>ard</b>")
+    ranked = [
+        ranking.RankedStory(story=story, score=1.0, best_match_title='Up "quoted" <x>')
+    ]
+    html = render.generate_dashboard_bytes(
+        ranked, Config(), Database(":memory:")
+    ).decode("utf-8")
+    assert "Because you upvoted:" in html
+    assert "Up &#34;quoted&#34;" in html or "Up &quot;quoted&quot;" in html
+    assert 'Up "quoted" <x>' not in html
