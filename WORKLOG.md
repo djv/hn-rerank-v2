@@ -8366,3 +8366,24 @@ texts, both under onnxruntime `CPUExecutionProvider`.
 - Removed the `r/rust` RSS feed from `config.toml`.
 - Purged its exact `rss_reddit_rust` stories and dependent stored rows from
   the local database after creating a recoverable backup.
+
+## 2026-09-08 — monster-encode WARN + LLM spend visibility
+
+- `pipeline/ranking.py`: `Embedder.encode` now emits `embedding_slow` WARN
+  when a single call exceeds `_EMBEDDING_SLOW_WARN_SECONDS` (10s), with
+  texts/batches/longest_tokens/duration — joins the stall-monster signal
+  next to `dashboard_warm_starved`. Existing `embedding_perf` info line kept.
+- `database.py`: new additive `llm_usage_daily(day, provider, calls,
+  input_tokens, output_tokens, reasoning_tokens)` STRICT table +
+  `record_llm_usage` (UPSERT accumulate, None usage counts as 0) +
+  `get_llm_usage_day`.
+- `server.py`: `LlmChatResult` carries input/output/reasoning tokens, parsed
+  defensively (`_usage_int`) in both chat and responses callers; recording
+  flows through a process-wide recorder bound once in `main()` to
+  `db.record_llm_usage`, swallowed with a log line on failure (never breaks
+  TLDR). Regen logs one `llm_spend_today` line per provider per cycle, with
+  a nominal mistral-small $ estimate (informational; the $10 cap is enforced
+  in the Mistral console, not here).
+- Design note: first cut threaded `db` explicitly through
+  `generate_detailed_tldr`, which broke 24 existing mocks; reverted to the
+  global recorder (set/restore in tests) for zero call-site churn.

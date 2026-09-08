@@ -1054,3 +1054,24 @@ def test_pool_wait_over_threshold_is_counted_and_logged(tmp_path, caplog) -> Non
         assert any("db_pool_wait_ms=" in r.message for r in caplog.records)
     finally:
         db.close()
+
+
+def test_llm_usage_daily_accumulates_per_provider(db: Database) -> None:
+    """Spend visibility must be additive: repeated calls accumulate into one
+    (day, provider) row, and None usage (provider omitted it) counts as 0."""
+    db.record_llm_usage("mistral", 1000, 200, None)
+    db.record_llm_usage("mistral", 500, 100, None)
+    db.record_llm_usage("gospark", 2000, 300, 900)
+
+    rows = db.get_llm_usage_day(time.strftime("%Y-%m-%d"))
+    by_provider = {r["provider"]: r for r in rows}
+    assert by_provider["mistral"] == {
+        "provider": "mistral",
+        "calls": 2,
+        "input_tokens": 1500,
+        "output_tokens": 300,
+        "reasoning_tokens": 0,
+    }
+    assert by_provider["gospark"]["calls"] == 1
+    assert by_provider["gospark"]["reasoning_tokens"] == 900
+    assert db.get_llm_usage_day("1999-01-01") == []

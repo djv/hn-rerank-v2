@@ -7404,3 +7404,51 @@ def test_fill_best_match_titles_render_escapes() -> None:
     assert "Because you upvoted:" in html
     assert "Up &#34;quoted&#34;" in html or "Up &quot;quoted&quot;" in html
     assert 'Up "quoted" <x>' not in html
+
+
+def _embedder_with_fake_session() -> Embedder:
+    """Real Embedder.encode without ONNX: fake tokenizer + session."""
+    emb = Embedder.__new__(Embedder)
+    emb.batch_size = 32
+    emb.max_tokens = 4096
+
+    def fake_tokenizer(batch_texts: list[str], **kwargs: object) -> dict[str, object]:
+        n = len(batch_texts)
+        return {
+            "input_ids": SimpleNamespace(shape=(n, 8)),
+            "attention_mask": np.ones((n, 8), dtype=np.int64),
+        }
+
+    emb.tokenizer = fake_tokenizer
+    emb.session = cast(
+        Any,
+        SimpleNamespace(
+            get_inputs=lambda: [
+                SimpleNamespace(name="input_ids"),
+                SimpleNamespace(name="attention_mask"),
+            ],
+            run=lambda _o, _i: [np.ones((1, 8, 4), dtype=np.float32)],
+        ),
+    )
+    return emb
+
+
+def test_encode_slow_warn_fires_only_over_threshold(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Stall monsters must be loud: encode() over the slow threshold emits
+    embedding_slow; fast encodes stay at embedding_perf info only."""
+    import logging
+
+    emb = _embedder_with_fake_session()
+    monkeypatch.setattr(ranking, "_EMBEDDING_SLOW_WARN_SECONDS", 0.0)
+    with caplog.at_level(logging.DEBUG):
+        emb.encode(["hello world"])
+    assert any("embedding_slow" in r.message for r in caplog.records)
+
+    caplog.clear()
+    monkeypatch.setattr(ranking, "_EMBEDDING_SLOW_WARN_SECONDS", 1e9)
+    with caplog.at_level(logging.DEBUG):
+        result = emb.encode(["hello world"])
+    assert result.shape == (1, 4)
+    assert not any("embedding_slow" in r.message for r in caplog.records)

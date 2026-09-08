@@ -6245,3 +6245,242 @@ def test_warm_is_starved_predicate(
     import server
 
     assert server._warm_is_starved(rank_ms, stage_sum_ms) is expected
+
+
+def test_usage_int_parses_defensively() -> None:
+    import server
+
+    assert server._usage_int({"prompt_tokens": 10}, "prompt_tokens") == 10
+    assert server._usage_int({"prompt_tokens": -1}, "prompt_tokens") is None
+    assert server._usage_int({"prompt_tokens": "10"}, "prompt_tokens") is None
+    assert server._usage_int({"other": 1}, "prompt_tokens") is None
+    assert server._usage_int(None, "prompt_tokens") is None
+    assert server._usage_int("usage", "prompt_tokens") is None
+
+
+def test_note_llm_usage_swallows_recorder_errors() -> None:
+    """Usage recording must never break TLDR serving: a failing recorder
+    is a log line, not an exception."""
+    import server
+
+    def bad_recorder(provider, in_tok, out_tok, reasoning_tok):
+        raise RuntimeError("db is down")
+
+    result = server.LlmChatResult(content="- hi", ok=True)
+    server._note_llm_usage(None, "mistral", result)
+    server._note_llm_usage(bad_recorder, "mistral", result)
+
+
+async def test_call_llm_for_config_records_chat_usage(monkeypatch) -> None:
+    import server
+
+    recorded = []
+
+    class FakeLimiter:
+        async def acquire(self, *, estimated_tokens=0):
+            return True
+
+        def record_response(self, **kwargs):
+            pass
+
+    class FakeResponse:
+        status_code = 200
+        headers = {}
+        text = "{}"
+
+        def json(self):
+            return {
+                "choices": [
+                    {"message": {"content": "- summary"}, "finish_reason": "stop"}
+                ],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 20,
+                    "total_tokens": 30,
+                },
+            }
+
+    class FakeClient:
+        def __init__(self, *, timeout):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, base_url, *, headers, json):
+            return FakeResponse()
+
+    monkeypatch.setattr(server, "llm_limiter", FakeLimiter())
+    monkeypatch.setattr(server.httpx, "AsyncClient", FakeClient)
+
+    cfg = server.LlmProviderConfig(
+        provider="mistral",
+        api_key="test-key",
+        base_url="https://api.mistral.ai/v1/chat/completions",
+        model="mistral-small-latest",
+        extra={},
+    )
+    result = await server._call_llm_for_config(
+        cfg, prompt="hello", max_tokens=10, on_usage=lambda *a: recorded.append(a)
+    )
+
+    assert result.ok is True
+    assert (result.input_tokens, result.output_tokens, result.reasoning_tokens) == (
+        10,
+        20,
+        None,
+    )
+    assert recorded == [("mistral", 10, 20, None)]
+
+
+async def test_call_llm_responses_records_reasoning_usage(monkeypatch) -> None:
+    import server
+
+    recorded = []
+
+    class FakeLimiter:
+        async def acquire(self, *, estimated_tokens=0):
+            return True
+
+        def record_response(self, **kwargs):
+            pass
+
+    class FakeResponse:
+        status_code = 200
+        headers = {}
+        text = "{}"
+
+        def json(self):
+            return {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "- summary"}],
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "output_tokens_details": {"reasoning_tokens": 12},
+                },
+                "status": "completed",
+            }
+
+    class FakeClient:
+        def __init__(self, *, timeout):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, base_url, *, headers, json):
+            return FakeResponse()
+
+    monkeypatch.setattr(server, "llm_limiter", FakeLimiter())
+    monkeypatch.setattr(server.httpx, "AsyncClient", FakeClient)
+
+    cfg = server.LlmProviderConfig(
+        provider="gospark",
+        api_key="test-key",
+        base_url="https://opencode.ai/zen/go/v1/responses",
+        model="muse-spark",
+        extra={},
+    )
+    result = await server._call_llm_for_config(
+        cfg, prompt="hello", max_tokens=100, on_usage=lambda *a: recorded.append(a)
+    )
+
+    assert result.ok is True
+    assert (result.input_tokens, result.output_tokens, result.reasoning_tokens) == (
+        100,
+        50,
+        12,
+    )
+    assert recorded == [("gospark", 100, 50, 12)]
+
+
+def test_log_llm_spend_today_logs_estimate(caplog) -> None:
+    """One regen = one spend line per provider, with a $ estimate for mistral."""
+    import logging
+
+    import server
+    from database import Database
+
+    db = Database(":memory:")
+    try:
+        db.record_llm_usage("mistral", 1000, 2000, None)
+        with caplog.at_level(logging.INFO):
+            server._log_llm_spend_today(db)
+        assert any(
+            "llm_spend_today" in r.message
+            and "provider=mistral" in r.message
+            and "est_usd=0.0007" in r.message
+            for r in caplog.records
+        )
+        # Empty day: no lines, no crash.
+        caplog.clear()
+        empty_db = Database(":memory:")
+        try:
+            with caplog.at_level(logging.INFO):
+                server._log_llm_spend_today(empty_db)
+            assert not any("llm_spend_today" in r.message for r in caplog.records)
+        finally:
+            empty_db.close()
+    finally:
+        db.close()
+
+
+async def test_generate_detailed_tldr_records_usage_via_global_recorder(
+    monkeypatch,
+) -> None:
+    """generate_detailed_tldr must record token usage through the global
+    recorder bound in main() (no signature change, existing mocks intact)."""
+    import server
+    from database import Database
+
+    async def fake_call_llm_for_config(cfg, *, prompt, max_tokens, on_usage=None):
+        result = server.LlmChatResult(
+            content="- **Discussion** summary",
+            ok=True,
+            input_tokens=5,
+            output_tokens=7,
+        )
+        server._note_llm_usage(on_usage, cfg.provider, result)
+        return result
+
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_PROVIDER", "mistral")
+    monkeypatch.setattr(server, "_call_llm_for_config", fake_call_llm_for_config)
+
+    db = Database(":memory:")
+    old = server._llm_usage_recorder
+    server.set_llm_usage_recorder(db.record_llm_usage)
+    try:
+        result = await server.generate_detailed_tldr(
+            "Story links to OpenAI",
+            self_text="",
+            top_comments="comment 1\ncomment 2",
+            article_body="",
+        )
+        assert result.kind == "ok"
+        import time as time_mod
+
+        rows = db.get_llm_usage_day(time_mod.strftime("%Y-%m-%d"))
+        assert rows == [
+            {
+                "provider": "mistral",
+                "calls": 1,
+                "input_tokens": 5,
+                "output_tokens": 7,
+                "reasoning_tokens": 0,
+            }
+        ]
+    finally:
+        server.set_llm_usage_recorder(old)
+        db.close()

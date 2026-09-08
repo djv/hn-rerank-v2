@@ -195,6 +195,10 @@ class LlmChatResult:
     ok: bool
     status: int | None = None
     finish_reason: str | None = None
+    # Token usage for spend visibility (None when the provider omits usage).
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    reasoning_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -590,6 +594,16 @@ async def _fetch_lesswrong_context(post_id: str) -> LessWrongContext | None:
     )
 
 
+def _usage_int(usage: Any, key: str) -> int | None:
+    """Defensive usage-field reader: non-negative ints only, else None."""
+    if not isinstance(usage, dict):
+        return None
+    value = usage.get(key)
+    if isinstance(value, int) and value >= 0:
+        return value
+    return None
+
+
 async def _call_llm_chat(
     *,
     api_key: str,
@@ -636,10 +650,13 @@ async def _call_llm_chat(
                     choice = data["choices"][0]
                     content = choice["message"].get("content") or ""
                     finish_reason = choice.get("finish_reason")
+                    usage = data.get("usage", {})
                     return LlmChatResult(
                         content=content,
                         ok=_valid_llm_completion(content, finish_reason),
                         finish_reason=finish_reason,
+                        input_tokens=_usage_int(usage, "prompt_tokens"),
+                        output_tokens=_usage_int(usage, "completion_tokens"),
                     )
                 if resp.status_code == 429 and attempt < 3:
                     continue
@@ -786,10 +803,14 @@ async def _call_llm_responses(
                         data.get("status"),
                     )
                     finish = None if data.get("status") == "completed" else "length"
+                    details = details if isinstance(details, dict) else {}
                     return LlmChatResult(
                         content=content,
                         ok=_valid_llm_completion(content, finish),
                         finish_reason=finish,
+                        input_tokens=_usage_int(usage, "input_tokens"),
+                        output_tokens=_usage_int(usage, "output_tokens"),
+                        reasoning_tokens=_usage_int(details, "reasoning_tokens"),
                     )
                 if resp.status_code == 429 and attempt < 3:
                     continue
@@ -813,16 +834,48 @@ async def _call_llm_responses(
         return LlmChatResult(content=str(e), ok=False)
 
 
+# Spend-visibility recorder: Database.record_llm_usage bound by callers that
+# own a db handle. Recording must never break TLDR serving, so every failure
+# is swallowed with a log line.
+LlmUsageRecorder = Callable[[str, int | None, int | None, int | None], None]
+
+
+def _note_llm_usage(
+    on_usage: LlmUsageRecorder | None, provider: str, result: LlmChatResult
+) -> None:
+    if on_usage is None:
+        return
+    try:
+        on_usage(
+            provider, result.input_tokens, result.output_tokens, result.reasoning_tokens
+        )
+    except Exception:
+        logging.exception("llm_usage record failed (non-fatal)")
+
+
+# Process-wide spend recorder, bound once in main() to db.record_llm_usage.
+# generate_detailed_tldr reads it so no caller signature changes (keeps the
+# many generate_detailed_tldr mocks in tests/test_server.py intact). Tests
+# that need recording set/restore it directly.
+_llm_usage_recorder: LlmUsageRecorder | None = None
+
+
+def set_llm_usage_recorder(recorder: LlmUsageRecorder | None) -> None:
+    global _llm_usage_recorder
+    _llm_usage_recorder = recorder
+
+
 async def _call_llm_for_config(
     cfg: LlmProviderConfig,
     *,
     prompt: str,
     max_tokens: int,
+    on_usage: LlmUsageRecorder | None = None,
 ) -> LlmChatResult:
     """Dispatch to the chat or responses caller based on endpoint shape."""
     api_key, base_url, model, extra = cfg.api_key, cfg.base_url, cfg.model, cfg.extra
     if base_url.rstrip("/").endswith("/responses"):
-        return await _call_llm_responses(
+        result = await _call_llm_responses(
             api_key=api_key or "",
             base_url=base_url,
             model=model,
@@ -830,7 +883,9 @@ async def _call_llm_for_config(
             max_tokens=max_tokens,
             extra=extra,
         )
-    return await _call_llm_chat(
+        _note_llm_usage(on_usage, cfg.provider, result)
+        return result
+    result = await _call_llm_chat(
         api_key=api_key or "",
         base_url=base_url,
         model=model,
@@ -838,6 +893,8 @@ async def _call_llm_for_config(
         max_tokens=max_tokens,
         extra=extra,
     )
+    _note_llm_usage(on_usage, cfg.provider, result)
+    return result
 
 
 @dataclass(frozen=True)
@@ -980,6 +1037,7 @@ async def generate_detailed_tldr(
 ) -> TldrResult:
     cfg = _llm_provider_config()
     api_key = cfg.api_key
+    on_usage = _llm_usage_recorder
 
     if not api_key:
         return TldrResult(
@@ -1015,11 +1073,13 @@ async def generate_detailed_tldr(
                 cfg,
                 prompt=article_prompt,
                 max_tokens=_max_tokens_for_provider(cfg, 450),
+                on_usage=on_usage,
             ),
             _call_llm_for_config(
                 cfg,
                 prompt=discussion_prompt,
                 max_tokens=_max_tokens_for_provider(cfg, 450),
+                on_usage=on_usage,
             ),
         )
         good: list[tuple[str, str]] = []
@@ -1067,6 +1127,7 @@ async def generate_detailed_tldr(
         cfg,
         prompt=prompt,
         max_tokens=_max_tokens_for_provider(cfg, 1000),
+        on_usage=on_usage,
     )
     if result.ok:
         if text := _normalize_tldr_markdown(result.content):
@@ -2959,6 +3020,38 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
     return app
 
 
+# Nominal mistral-small per-1M-token rates for the spend estimate below.
+# informational only — the $10 cap lives in the Mistral console.
+_MISTRAL_SMALL_USD_PER_1M_IN = 0.10
+_MISTRAL_SMALL_USD_PER_1M_OUT = 0.30
+
+
+def _log_llm_spend_today(db: Database) -> None:
+    """One log line per regen with today's per-provider token totals."""
+    try:
+        rows = db.get_llm_usage_day(time.strftime("%Y-%m-%d"))
+    except Exception:
+        logging.exception("_log_llm_spend_today: usage read failed (non-fatal)")
+        return
+    for row in rows:
+        provider = str(row["provider"])
+        est_usd: float | None = None
+        if provider == "mistral":
+            est_usd = (
+                int(row["input_tokens"]) / 1_000_000 * _MISTRAL_SMALL_USD_PER_1M_IN
+                + int(row["output_tokens"]) / 1_000_000 * _MISTRAL_SMALL_USD_PER_1M_OUT
+            )
+        logging.info(
+            "llm_spend_today provider=%s calls=%s in=%s out=%s reasoning=%s est_usd=%s",
+            provider,
+            row["calls"],
+            row["input_tokens"],
+            row["output_tokens"],
+            row["reasoning_tokens"],
+            f"{est_usd:.4f}" if est_usd is not None else "n/a",
+        )
+
+
 def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
     logging.info("Starting background regeneration loop...")
     from pipeline.hn_dupes import HnDupeResolutionWorker
@@ -3013,6 +3106,7 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
             Handler._bump_all_cached_versions()
             Handler._warm_stale_cached_users()
             logging.info("regen_rebuild_done")
+            _log_llm_spend_today(db)
             reddit_worker.submit()
 
             if Handler._cold_stories:
@@ -3072,6 +3166,7 @@ def main() -> None:
     Handler.db = db
     Handler.embedder = embedder
     Handler.regen_event = regen_event
+    set_llm_usage_recorder(db.record_llm_usage)
     Handler._rebuild_cold_deck()
 
     # Start regen thread

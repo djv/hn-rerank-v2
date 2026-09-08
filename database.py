@@ -299,6 +299,18 @@ class Database:
                 )
 
                 conn.execute("""
+                    CREATE TABLE IF NOT EXISTS llm_usage_daily (
+                        day              TEXT NOT NULL,
+                        provider         TEXT NOT NULL,
+                        calls            INTEGER NOT NULL DEFAULT 0,
+                        input_tokens     INTEGER NOT NULL DEFAULT 0,
+                        output_tokens    INTEGER NOT NULL DEFAULT 0,
+                        reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (day, provider)
+                    ) STRICT
+                """)
+
+                conn.execute("""
                     CREATE TABLE IF NOT EXISTS rank_perf (
                         id              INTEGER PRIMARY KEY,
                         recorded_at     REAL NOT NULL,
@@ -914,6 +926,55 @@ class Database:
                     """,
                     (story_id, cache_key, tldr, time.time()),
                 )
+
+    # LLM usage (spend visibility; additive, never blocks serving)
+    def record_llm_usage(
+        self,
+        provider: str,
+        input_tokens: int | None,
+        output_tokens: int | None,
+        reasoning_tokens: int | None,
+    ) -> None:
+        day = time.strftime("%Y-%m-%d")
+        with self.conn() as conn:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO llm_usage_daily
+                        (day, provider, calls, input_tokens, output_tokens, reasoning_tokens)
+                    VALUES (?, ?, 1, ?, ?, ?)
+                    ON CONFLICT(day, provider) DO UPDATE SET
+                        calls = calls + 1,
+                        input_tokens = input_tokens + excluded.input_tokens,
+                        output_tokens = output_tokens + excluded.output_tokens,
+                        reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens
+                    """,
+                    (
+                        day,
+                        provider,
+                        input_tokens or 0,
+                        output_tokens or 0,
+                        reasoning_tokens or 0,
+                    ),
+                )
+
+    def get_llm_usage_day(self, day: str) -> list[dict[str, int | str]]:
+        with self.conn() as conn:
+            rows = conn.execute(
+                "SELECT provider, calls, input_tokens, output_tokens, reasoning_tokens"
+                " FROM llm_usage_daily WHERE day = ? ORDER BY provider",
+                (day,),
+            ).fetchall()
+            return [
+                {
+                    "provider": row[0],
+                    "calls": row[1],
+                    "input_tokens": row[2],
+                    "output_tokens": row[3],
+                    "reasoning_tokens": row[4],
+                }
+                for row in rows
+            ]
 
     # Feedback
     def upsert_feedback(

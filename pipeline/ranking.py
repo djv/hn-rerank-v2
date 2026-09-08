@@ -544,6 +544,12 @@ def _embedding_session_options(ort_variant: EmbeddingOrtVariant) -> ort.SessionO
     raise ValueError(f"Unknown embedding ORT variant: {ort_variant}")
 
 
+# Single encode() calls slower than this get a loud WARN (stall monsters:
+# one giant batch hogging CPU next to a warm, see WORKLOG 2026-09-08).
+# Seam for tests: patched to 0 to force the WARN without a real 10s stall.
+_EMBEDDING_SLOW_WARN_SECONDS = 10.0
+
+
 class Embedder:
     model_version = DEFAULT_EMBEDDING_MODEL_VERSION
     max_tokens = DEFAULT_EMBEDDING_MAX_TOKENS
@@ -708,6 +714,7 @@ class Embedder:
             if rss_before_kb is not None and rss_after_kb is not None
             else None
         )
+        duration_s = time.perf_counter() - started
         logging.info(
             "embedding_perf texts=%d batches=%d batch_size=%d max_tokens=%d "
             "longest_tokens=%d duration_ms=%.1f rss_before_kb=%s "
@@ -717,12 +724,22 @@ class Embedder:
             effective_batch_size,
             self.max_tokens,
             longest_tokens,
-            (time.perf_counter() - started) * 1000,
+            duration_s * 1000,
             rss_before_kb,
             rss_after_kb,
             rss_delta_kb,
             resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
         )
+        if duration_s >= _EMBEDDING_SLOW_WARN_SECONDS:
+            logging.warning(
+                "embedding_slow texts=%d batches=%d longest_tokens=%d "
+                "duration_s=%.1f (threshold_s=%.1f)",
+                len(texts),
+                batch_count,
+                longest_tokens,
+                duration_s,
+                _EMBEDDING_SLOW_WARN_SECONDS,
+            )
         return result
 
 
