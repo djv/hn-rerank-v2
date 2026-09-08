@@ -245,6 +245,17 @@ class Database:
                     conn.execute(
                         "ALTER TABLE embeddings ADD COLUMN text_hash TEXT NOT NULL DEFAULT ''"
                     )
+                # Provenance for the embedding contract (WORKLOG 2026-09-07):
+                # model_sha/dim are recorded on new rows only and never enter
+                # the match predicate, so legacy rows keep hitting as-is.
+                if "model_sha" not in emb_columns:
+                    conn.execute(
+                        "ALTER TABLE embeddings ADD COLUMN model_sha TEXT NOT NULL DEFAULT ''"
+                    )
+                if "dim" not in emb_columns:
+                    conn.execute(
+                        "ALTER TABLE embeddings ADD COLUMN dim INTEGER NOT NULL DEFAULT 0"
+                    )
 
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS tldr_cache (
@@ -672,9 +683,13 @@ class Database:
     @staticmethod
     def _row_to_hn_dupe_resolution(row: tuple) -> HnDupeResolution:
         return HnDupeResolution(
-            source_story_id=int(row[0]), canonical_story_id=row[1], status=row[2],
-            checked_at=float(row[3]), next_check_at=float(row[4]),
-            failure_count=int(row[5]), last_error=str(row[6] or ""),
+            source_story_id=int(row[0]),
+            canonical_story_id=row[1],
+            status=row[2],
+            checked_at=float(row[3]),
+            next_check_at=float(row[4]),
+            failure_count=int(row[5]),
+            last_error=str(row[6] or ""),
         )
 
     def get_hn_dupe_resolutions(
@@ -713,9 +728,7 @@ class Database:
             ).fetchall()
         return [int(row[0]) for row in rows]
 
-    def upsert_hn_dupe_resolution(
-        self, resolution: HnDupeResolution
-    ) -> None:
+    def upsert_hn_dupe_resolution(self, resolution: HnDupeResolution) -> None:
         with self.conn() as conn:
             with conn:
                 conn.execute(
@@ -724,9 +737,15 @@ class Database:
                     "ON CONFLICT(source_story_id) DO UPDATE SET canonical_story_id=excluded.canonical_story_id, "
                     "status=excluded.status, checked_at=excluded.checked_at, next_check_at=excluded.next_check_at, "
                     "failure_count=excluded.failure_count, last_error=excluded.last_error",
-                    (resolution.source_story_id, resolution.canonical_story_id, resolution.status,
-                     resolution.checked_at, resolution.next_check_at, resolution.failure_count,
-                     resolution.last_error[:500]),
+                    (
+                        resolution.source_story_id,
+                        resolution.canonical_story_id,
+                        resolution.status,
+                        resolution.checked_at,
+                        resolution.next_check_at,
+                        resolution.failure_count,
+                        resolution.last_error[:500],
+                    ),
                 )
 
     def prune_stories(self, max_age_days: int = 60) -> int:
@@ -747,24 +766,48 @@ class Database:
         model_version: str,
         text_hash: str,
         vec: NDArray[np.float32],
+        model_sha: str = "",
+        dim: int = 0,
     ) -> None:
         blob = vec.astype(np.float32).tobytes()
+        if dim <= 0:
+            dim = int(vec.shape[0]) if vec.ndim == 1 else 0
         with self.conn() as conn:
             with conn:
                 conn.execute(
                     """
-                    INSERT INTO embeddings (story_id, model_version, text_hash, embedding)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO embeddings (story_id, model_version, text_hash, embedding, model_sha, dim)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     ON CONFLICT(story_id) DO UPDATE SET
                         model_version=excluded.model_version,
                         text_hash=excluded.text_hash,
-                        embedding=excluded.embedding
+                        embedding=excluded.embedding,
+                        model_sha=excluded.model_sha,
+                        dim=excluded.dim
                     """,
-                    (story_id, model_version, text_hash, blob),
+                    (story_id, model_version, text_hash, blob, model_sha, dim),
                 )
 
+    @staticmethod
+    def _decode_embedding_blob(
+        blob: bytes, *, expected_dim: int, story_id: int
+    ) -> NDArray[np.float32] | None:
+        # Length guard: a row whose bytes don't match the live dim is a
+        # corrupt or foreign-dim vector. Skipping it as a miss (re-encoded
+        # on demand) beats the old inhomogeneous-shape ValueError that
+        # broke every rerank. expected_dim=0 preserves legacy behavior.
+        if expected_dim > 0 and len(blob) != expected_dim * 4:
+            logging.warning(
+                "embedding_dim_mismatch story_id=%s blob_bytes=%s expected_dim=%s; treating as miss",
+                story_id,
+                len(blob),
+                expected_dim,
+            )
+            return None
+        return np.frombuffer(blob, dtype=np.float32)
+
     def get_embedding(
-        self, story_id: int, model_version: str, text_hash: str
+        self, story_id: int, model_version: str, text_hash: str, expected_dim: int = 0
     ) -> NDArray[np.float32] | None:
         with self.conn() as conn:
             cursor = conn.execute(
@@ -774,10 +817,16 @@ class Database:
             row = cursor.fetchone()
             if not row:
                 return None
-            return np.frombuffer(row[0], dtype=np.float32)
+            return self._decode_embedding_blob(
+                row[0], expected_dim=expected_dim, story_id=story_id
+            )
 
     def get_embeddings_batch(
-        self, ids: list[int], model_version: str, hashes: dict[int, str]
+        self,
+        ids: list[int],
+        model_version: str,
+        hashes: dict[int, str],
+        expected_dim: int = 0,
     ) -> dict[int, NDArray[np.float32]]:
         if not ids:
             return {}
@@ -790,10 +839,23 @@ class Database:
         with self.conn() as conn:
             cursor = conn.execute(query, params)
             res = {}
+            skipped = 0
             for row in cursor.fetchall():
                 sid, h, blob = row[0], row[1], row[2]
                 if hashes.get(sid) == h:
-                    res[sid] = np.frombuffer(blob, dtype=np.float32)
+                    vec = self._decode_embedding_blob(
+                        blob, expected_dim=expected_dim, story_id=sid
+                    )
+                    if vec is None:
+                        skipped += 1
+                        continue
+                    res[sid] = vec
+            if skipped:
+                logging.warning(
+                    "embeddings_batch_skipped_dim_mismatch skipped=%s ids=%s",
+                    skipped,
+                    len(ids),
+                )
             return res
 
     # TLDR cache
@@ -1164,8 +1226,7 @@ class Database:
                 if new_story_ids:
                     story_placeholders = ",".join("?" for _ in new_story_ids)
                     story_rows = conn.execute(
-                        "SELECT id FROM stories "
-                        f"WHERE id IN ({story_placeholders})",
+                        f"SELECT id FROM stories WHERE id IN ({story_placeholders})",
                         tuple(new_story_ids),
                     ).fetchall()
                     known_story_ids = {int(row[0]) for row in story_rows}

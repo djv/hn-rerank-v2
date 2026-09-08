@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import html
+import json
 import logging
 import re
 import resource
@@ -35,6 +36,7 @@ from .config import (
     DEFAULT_ONNX_MODEL_DIR,
     is_hn_source,
 )
+from .model_manifest import ModelManifest, verify_model_dir
 
 
 EmbeddingOrtVariant: TypeAlias = Literal[
@@ -541,6 +543,11 @@ def _embedding_session_options(ort_variant: EmbeddingOrtVariant) -> ort.SessionO
 class Embedder:
     model_version = DEFAULT_EMBEDDING_MODEL_VERSION
     max_tokens = DEFAULT_EMBEDDING_MAX_TOKENS
+    # Provenance for new embedding rows (class attrs so test doubles that
+    # skip __init__ still expose them; real inits overwrite below).
+    model_onnx_sha: str = ""
+    embedding_dim: int = 384
+    model_manifest: ModelManifest | None = None
 
     def __init__(
         self,
@@ -567,6 +574,76 @@ class Embedder:
             sess_options=session_options,
             providers=["CPUExecutionProvider"],
         )
+        self.model_manifest, mismatches = self._check_manifest(model_dir)
+        self.model_onnx_sha = (self.model_manifest.files or {}).get("model.onnx", "")
+        self.embedding_dim = self._resolve_embedding_dim(model_dir)
+        if mismatches:
+            # Warn-and-serve: the bytes changed under the recorded baseline,
+            # but stored vectors keep matching (version string untouched).
+            # Loud log, no refusal — uptime beats strictness here.
+            logging.error(
+                "embedding_model_changed dir=%s serving_recorded_vectors "
+                "mismatches=%s (re-baseline deliberately via setup_model.py)",
+                model_dir,
+                "; ".join(mismatches),
+            )
+
+    @staticmethod
+    def _manifest_repo() -> str:
+        return "mixedbread-ai/mxbai-embed-xsmall-v1"
+
+    def _check_manifest(self, model_dir: str) -> tuple[ModelManifest, list[str]]:
+        # Manifest IO must never break init (read-only mounts, fake dirs in
+        # tests) and must never write: baselines belong to setup_model.py,
+        # so request paths and test doubles can't alter prod state.
+        # Verification is best-effort; serving is not gated on it.
+        try:
+            stored, mismatches = verify_model_dir(
+                model_dir, self._manifest_repo(), self._manifest_revision()
+            )
+        except OSError as exc:
+            logging.warning(
+                "embedding_manifest_check_skipped dir=%s error=%r", model_dir, exc
+            )
+            return (
+                ModelManifest(repo="", revision="", files={}, created_at=0.0),
+                [],
+            )
+        if stored is None:
+            logging.warning(
+                "embedding_manifest_missing dir=%s; run setup_model.py to baseline",
+                model_dir,
+            )
+            return ModelManifest(repo="", revision="", files={}, created_at=0.0), []
+        return stored, mismatches
+
+    @staticmethod
+    def _manifest_revision() -> str:
+        try:
+            from setup_model import MODEL_REPO, MODEL_REVISION
+
+            if MODEL_REPO == Embedder._manifest_repo():
+                return MODEL_REVISION
+        except ImportError:
+            pass
+        return "main"
+
+    @staticmethod
+    def _resolve_embedding_dim(model_dir: str) -> int:
+        try:
+            hidden = json.loads((Path(model_dir) / "config.json").read_text())[
+                "hidden_size"
+            ]
+            dim = int(hidden)
+            if dim > 0:
+                return dim
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        logging.warning(
+            "embedding_dim unreadable from %s/config.json; falling back to 384",
+            model_dir,
+        )
+        return 384
 
     def encode(
         self, texts: list[str], batch_size: int | None = None
@@ -664,14 +741,23 @@ def get_or_compute_embeddings(
     ids = [s.id for s in stories]
     model_version = embedder.model_version
 
-    cached = db.get_embeddings_batch(ids, model_version, story_hashes)
+    cached = db.get_embeddings_batch(
+        ids, model_version, story_hashes, expected_dim=embedder.embedding_dim
+    )
     missing_stories = [s for s in stories if s.id not in cached]
 
     if missing_stories:
         texts = [embedding_texts[s.id] for s in missing_stories]
         computed = embedder.encode(texts)
         for s, vec in zip(missing_stories, computed):
-            db.upsert_embedding(s.id, model_version, story_hashes[s.id], vec)
+            db.upsert_embedding(
+                s.id,
+                model_version,
+                story_hashes[s.id],
+                vec,
+                model_sha=embedder.model_onnx_sha,
+                dim=embedder.embedding_dim,
+            )
             cached[s.id] = vec
 
     return np.array([cached[story_id] for story_id in ids], dtype=np.float32)

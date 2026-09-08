@@ -1,5 +1,143 @@
 # Worklog: hn-rewrite
 
+## 2026-09-07 — embedding model contract (no re-embed)
+
+- `setup_model.py` pins `MODEL_REVISION` and writes/verifies a
+  `model_manifest.json` baseline (sha256 of the six model files); first run
+  grandfathers current bytes, later mismatches exit loud (explicit
+  re-baseline only). `Embedder` init re-verifies and warn-and-serves
+  (`embedding_model_changed`, stored vectors keep matching).
+- `embeddings` gains additive `model_sha`/`dim` (match predicate
+  untouched); wrong-length blobs become misses, fixing the
+  inhomogeneous-shape crash class. Provenance recorded on both write
+  paths (`get_or_compute_embeddings`, article-fetch).
+- Load-bearing test: legacy rows (no sha/dim) all hit, zero encodes.
+- Verified: 702 passed (`pytest -n 4`), ruff + format + ty clean,
+  `setup_model.py` verifies baseline, restart live (dash 200, Mistral taps
+  serving, no changed-model warnings, 59,493 embedding rows intact).
+  Rotation policy: version bump + background backfill while old rows
+  serve — never a flag day, never a dead dashboard. No commit.
+
+## 2026-09-07 — Mistral live on pay-as-you-go (mistral-small)
+
+- Root cause of the zero-quota wall: keys were on Free mode with no API
+  allocation (`limit-req-minute=0` on both keys, all models). Enabling
+  pay-as-you-go unlocked Tier 1; probe 200'd.
+- Measured Tier 1 per-model limits: small 100 RPM/100K TPM, 14b 120/1.5M,
+  8b 750/1M, 3b 3000/2M. No model is $0 with pay-go on (free-ness is
+  account-level Experiment tier, not per-model). Daniel chose small.
+- Live: `MISTRAL_API_KEY` rotated, `LLM_PROVIDER=mistral`, stagger 3.0s
+  (small is TPM-bound: ~13K tokens/tap over 2 calls), uncached tap
+  generated full dual summary in 3.4s. No commit.
+
+- Symptom: fresh page open showed salvaged halves then 429s. Chain: client
+  fired active tap + 4 prefetches at once (~10 LLM calls) on top of the
+  server warm prefetch (~10 candidates x2, stagger 1s) — Groq free
+  token-rate tripped within seconds; halves are uncacheable, so nothing
+  stuck; server prefetch fail-fasted to a silent generated=0 (no log).
+- Fix: `prefetchCards` chains one-at-a-time behind the active tap
+  (`tldrPrefetchChain`), skipping detached cards; slow quota now
+  back-pressures the queue instead of bursting. Server logs the zero
+  outcome with candidates + cooldown (`tldr_prefetch generated=0 ...`).
+- Tests: node harness for sequential/detached-skip, caplog test for the
+  zero-outcome log. Full suite 693 passed, ruff/format/ty clean. No commit.
+
+- Mistral revert failed: single-tiny-probe 429 with
+  `x-ratelimit-limit-req-minute = 0` — the key has zero allocation, so no
+  pacing fix helps; "working ok" was the pre-exhaustion era. Reverts to a
+  zero-limit provider are unverifiable; probe first from now on.
+- Same probes: Groq 200 (daily 200K TPD reset at 00:00 UTC), Gemini-lite
+  429 daily/plan quota exhausted (~1h of bakeoff + prefetch + taps burned
+  the free tier). Free tiers rotate: whoever was quiet longest serves.
+- Back on Groq (`LLM_PROVIDER=groq`); live uncached tap generated a full
+  dual summary in ~1s. Stagger stays 1.0s; prefetch budget ~10/run with
+  cooldown-skip retained. Durable fix remains Groq Developer (~$4/mo) —
+  free-tier whack-a-mole will recur daily. No commit.
+
+## 2026-09-07 — verification tightening: CI, format gate, CLI boot tests
+
+- `.github/workflows/ci.yml` runs pytest `-n 4`, `ruff check`,
+  `ruff format --check` (changed Python files only — no global format
+  pass, so other lanes' diffs stay clean), and `ty check` on push/PR.
+- `tests/test_cli_boot.py`: 23 argparse entry points must exit 0 on
+  `--help` (caught a real `%`-formatting crash class). Scoped to scripts
+  calling `parse_args` — the 7 flag-less mains are excluded because
+  invoking them would *run* the script (one binds a port). All listed
+  mains were audited to parse before any side effect. Runs in ~3.5s.
+- Protocol: per-edit test runs, per-file format check, CI as the binding
+  gate. Incident log: an early draft invoked the flag-less mains and may
+  have triggered idempotent backfill writes on the live DB; `quick_check`
+  is ok. Lesson captured in the test module docstring.
+- Verification: full suite; `ruff`/`ty` clean.
+
+## 2026-09-07 — Gemini 2.5 Flash-Lite is the production TLDR provider
+
+- Research: our cold tap (~13k tokens, 2 req) blows Groq free's 8K TPM
+  alone; a 10-story prefetch eats most of 200K TPD. Cerebras free
+  disqualified (5 RPM + 8K context cap < our ~11k-token prompts).
+  Gemini 2.0/2.5 Flash free kept 429ing at 10 RPM; Flash-Lite went 4/4
+  in 1-7s with zero 429s. Daniel chose Gemini free.
+- Integration gotchas (all found empirically): `gemini-2.0-flash` is
+  retired (404); the OpenAI-compat endpoint needs the `models/` prefix;
+  2.5-flash's default thinking budget (~2.4k hidden tokens) eats
+  `max_tokens` and truncates at 900 → send `reasoning_effort: "none"`
+  (usage-verified zero thinking tokens); Lite emits `*` bullets →
+  `_normalize_tldr_markdown` now folds them to `-`.
+- Quality eyeball (Nitter story): Lite covers the same facts as the
+  Groq-era cached summary, slightly less structured (fewer `####`
+  groupings). Accepted for a personal dashboard at 4/4 availability.
+- Switched: `LLM_PROVIDER=gemini` + `GEMINI_API_KEY` in shared env
+  (600 perms, outside git); removed stale `LLM_MODEL=gpt-oss-20b`
+  override that 404'd the first switched tap. `models/gemini-2.5-flash-lite`
+  default; `tldr_prefetch_stagger_seconds=5.0` in config.toml for the
+  10-15 RPM wall. New `scripts/bakeoff_tldr_providers.py` (also added to
+  `tests/test_cli_boot.py` mains by the parallel session).
+- Validation: 691 passed (`pytest -n 4`); Ruff, Ty, diff clean. Restarted;
+  dashboard 200; live uncached tap generated in 840ms. The 7
+  `test_cli_boot` failures seen mid-session were live-DB lock contention
+  with the bakeoff/server, not code (green on rerun). No commit.
+
+## 2026-09-07 — cap provider cooldowns, stop prefetch deepening bans
+
+- A 660s browser cooldown was Groq's own `retry-after` after bulk prefetch
+  tripped the free tier; we honored it verbatim and the widened prefetch
+  re-fired the burst on every restart. `LlmRateLimiter` now caps adopted
+  provider `retry-after` at 120s (logged when capped); the consecutive-429
+  backoff re-extends if rejections continue.
+- `_prefetch_tldrs_for_ranked` skips the whole run while `retry_after_seconds
+  > 0` so taps get first shot at recovered quota; concurrency back to 2
+  with staggered LLM starts (`_PREFETCH_STAGGER_S=1.0`, 0 in tests).
+  Date lane and wider candidate coverage kept.
+- Validation: 666 passed (`pytest -n 4`); Ruff, Ty, diff checks clean.
+
+## 2026-09-07 — limit prefetch against free-tier bans
+
+- Steady-state prefetch budget ~26 → ~10 stories/run: `per_combo` 5→2,
+  `stale_per_run` 3→1, `date_top_n` 8→3. Cooldown skip, sem 2, and stagger
+  retained. Browser lookahead untouched (user-paced, not bulk).
+
+## 2026-09-07 — faster cold TLDR taps, wider prefetch, visible cooldown
+
+- Cold tap now hydrates HN-thread, Reddit/LW, and article lanes concurrently
+  (single `asyncio.gather`; merges apply in the original order) instead of
+  three sequential `asyncio.run` blocks. Tap-path ONNX re-embed removed —
+  the warm/regen article-fetch path already re-embeds — so the tap persists
+  the body and clears the fetch failure without blocking on inference.
+- Tap spans logged on `generated`/`llm_error`: `tldr_total_ms`,
+  `hydrate_ms` (hn/src/article split), `llm_ms`. No prompt or model change;
+  summary quality untouched.
+- Prefetch widened (quota spend approved): server `Semaphore(2→4)`, new
+  `tldr_prefetch_date_top_n=8` date lane (newest-by-`story.time`, deduped
+  against combo picks, covers the Date tab's first cards), browser
+  `PREFETCH_COUNT 2→4`. On-demand keeps fail-fast priority over prefetch
+  via the shared limiter cooldown gate.
+- Cooldown UX: browser no longer silently skips retries — it renders
+  "provider cooling down, retry in Ns" with an error flag.
+- Validation: 664 passed (`pytest -n 4`); Ruff, Ty, diff checks clean.
+  Service restarted; dashboard 200. Uncached smoke tap served a salvaged
+  partial (retryable, uncached per strict validation) in ~1.2s
+  (hydrate ~525ms, LLM ~678ms) under an active 429 cooldown. No commit.
+
 ## 2026-09-07 — Groq as the production TLDR provider
 
 - Selected Groq GPT-OSS 20B over OpenRouter’s free router after same-story

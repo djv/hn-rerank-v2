@@ -5,7 +5,9 @@ import numpy as np
 import pytest
 from hypothesis import given, strategies as st, settings, HealthCheck
 from database import Database, InteractionEvent, Story
-from scripts.migrate_interaction_events import migrate_database as migrate_interaction_events
+from scripts.migrate_interaction_events import (
+    migrate_database as migrate_interaction_events,
+)
 from scripts.migrate_db_to_strict import migrate_database
 
 
@@ -183,13 +185,14 @@ def test_interaction_events_are_strict_idempotent_and_isolated(db: Database) -> 
     assert db.insert_interaction_events([event, event]) == (1, 1, 0)
     assert db.insert_interaction_events([event]) == (0, 1, 0)
     with db.conn() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM interaction_events").fetchone() == (1,)
+        assert conn.execute("SELECT COUNT(*) FROM interaction_events").fetchone() == (
+            1,
+        )
         assert conn.execute(
             "SELECT strict FROM pragma_table_list WHERE name='interaction_events'"
         ).fetchone() == (1,)
         indexes = {
-            row[1]
-            for row in conn.execute("PRAGMA index_list(interaction_events)")
+            row[1] for row in conn.execute("PRAGMA index_list(interaction_events)")
         }
         assert "idx_interaction_events_user_time" in indexes
         assert "idx_interaction_events_story_time" in indexes
@@ -229,9 +232,9 @@ def test_interaction_events_skip_unknown_story_per_event(db: Database) -> None:
     )
     assert db.insert_interaction_events([unknown, known]) == (1, 0, 1)
     with db.conn() as conn:
-        assert conn.execute(
-            "SELECT story_id FROM interaction_events"
-        ).fetchall() == [(502,)]
+        assert conn.execute("SELECT story_id FROM interaction_events").fetchall() == [
+            (502,)
+        ]
 
 
 def test_strict_migration_preserves_schema_and_removes_orphan_caches(
@@ -427,6 +430,48 @@ def test_get_embeddings_batch(db):
     batch2 = db.get_embeddings_batch([1, 2], "v1", bad_hashes)
     assert len(batch2) == 1
     assert 2 not in batch2
+
+
+def test_upsert_embedding_records_provenance(db):
+    from database import Story
+
+    db.upsert_story(Story(id=7, title="S", url=None, score=1, time=1, text_content="T"))
+    vec = np.ones(384, dtype=np.float32)
+    db.upsert_embedding(7, "v1", "h", vec, model_sha="abc123", dim=384)
+
+    with db.conn() as conn:
+        row = conn.execute(
+            "SELECT model_sha, dim, length(embedding) FROM embeddings WHERE story_id = 7"
+        ).fetchone()
+    assert row is not None
+    assert row[0] == "abc123"
+    assert row[1] == 384
+    assert row[2] == 384 * 4
+
+    # Provenance columns never gate the match: legacy callers omit them.
+    assert db.get_embedding(7, "v1", "h") is not None
+
+
+def test_get_embeddings_batch_skips_wrong_dim_row(db, caplog):
+    import logging
+
+    from database import Story
+
+    db.upsert_story(Story(id=8, title="S", url=None, score=1, time=1, text_content="T"))
+    db.upsert_story(Story(id=9, title="S", url=None, score=1, time=1, text_content="T"))
+    db.upsert_embedding(8, "v1", "h8", np.ones(384, dtype=np.float32))
+    db.upsert_embedding(9, "v1", "h9", np.ones(8, dtype=np.float32))
+
+    with caplog.at_level(logging.WARNING):
+        batch = db.get_embeddings_batch(
+            [8, 9], "v1", {8: "h8", 9: "h9"}, expected_dim=384
+        )
+    assert list(batch) == [8]
+    assert "embedding_dim_mismatch" in caplog.text
+
+    # expected_dim=0 preserves legacy behavior (no length check).
+    legacy = db.get_embeddings_batch([9], "v1", {9: "h9"})
+    assert list(legacy) == [9]
 
 
 def test_tldr_cache_roundtrip_replaces_stale_entries(db):

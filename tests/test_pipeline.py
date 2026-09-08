@@ -1472,7 +1472,9 @@ async def test_prewarm_reddit_top_stories_skips_if_already_populated(
 
 
 @given(
-    cluster_ids=st.lists(st.integers(min_value=0, max_value=19), min_size=2, max_size=50),
+    cluster_ids=st.lists(
+        st.integers(min_value=0, max_value=19), min_size=2, max_size=50
+    ),
     scores=st.lists(st.floats(0.0, 1.0, allow_nan=False), min_size=2, max_size=50),
     limit=st.integers(min_value=1, max_value=10),
 )
@@ -1682,7 +1684,9 @@ def _clean_text_payload_and_noise(draw: st.DrawFn) -> tuple[str, str]:
     cleaned density is at least 5k / (6k - 1 + N); requiring 4k >= N - 1 keeps
     that at or above 0.5 for every draw.
     """
-    fragments = draw(st.lists(st.one_of(st.text(max_size=20), _CLEAN_TEXT_NOISE), max_size=15))
+    fragments = draw(
+        st.lists(st.one_of(st.text(max_size=20), _CLEAN_TEXT_NOISE), max_size=15)
+    )
     noise = "".join(fragments)
     words = max(4, (len(noise) + 3) // 4)
     payload = " ".join(
@@ -1795,7 +1799,10 @@ def test_svm_fitting_robustness(
             shash = hashlib.sha256(story.text_content.encode("utf-8")).hexdigest()
             db.upsert_story(story)
             db.upsert_embedding(
-                story.id, model_version, shash, rng.standard_normal(384).astype(np.float32)
+                story.id,
+                model_version,
+                shash,
+                rng.standard_normal(384).astype(np.float32),
             )
             db.upsert_feedback(user.id, story.id, action)
 
@@ -1813,9 +1820,7 @@ def test_svm_fitting_robustness(
             )
 
         cand_embs = rng.standard_normal((cand_count, 384)).astype(np.float32)
-        config = Config(
-            model=ModelConfig(min_up_for_svm=2, min_down_for_svm=2)
-        )
+        config = Config(model=ModelConfig(min_up_for_svm=2, min_down_for_svm=2))
         ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
 
         assert len(ranked) == cand_count
@@ -3831,7 +3836,9 @@ def test_explore_badges_backfill_past_feedback_matches() -> None:
     assert similar_base not in similar_ids
     # ... and backfilled with the next-best candidates in that pool, with
     # the single worst candidate (last index) dropped for lack of room.
-    assert unsure_ids == set(range(unsure_base + 1, unsure_base + 1 + DISCOVERY_PER_BADGE))
+    assert unsure_ids == set(
+        range(unsure_base + 1, unsure_base + 1 + DISCOVERY_PER_BADGE)
+    )
     assert novel_ids == set(range(novel_base + 1, novel_base + 1 + DISCOVERY_PER_BADGE))
     assert similar_ids == set(
         range(similar_base + 1, similar_base + 1 + DISCOVERY_PER_BADGE)
@@ -4861,6 +4868,58 @@ class _DummyEmbedder(Embedder):
         if len(texts):
             arr[:, 0] = 1.0
         return arr
+
+
+class _CountingDummyEmbedder(_DummyEmbedder):
+    def __init__(self) -> None:
+        super().__init__()
+        self.encode_calls = 0
+
+    def encode(
+        self, texts: list[str], batch_size: int | None = None
+    ) -> NDArray[np.float32]:
+        self.encode_calls += 1
+        return super().encode(texts, batch_size)
+
+
+def test_get_or_compute_embeddings_legacy_rows_all_hit_no_reencode() -> None:
+    """Contract rollout must not invalidate one stored row: legacy rows
+    (no sha/dim provenance) match by version+hash and encode never runs."""
+    import hashlib
+
+    db = Database(":memory:")
+    try:
+        stories = [
+            Story(
+                id=901 + i,
+                title=f"Legacy {i}",
+                url=None,
+                score=i,
+                time=1700000000,
+                text_content=f"legacy body {i}",
+            )
+            for i in range(3)
+        ]
+        for s in stories:
+            db.upsert_story(s)
+        embedder = _CountingDummyEmbedder()
+        for s in stories:
+            text_hash = hashlib.sha256(
+                story_embedding_text(s).encode("utf-8")
+            ).hexdigest()
+            db.upsert_embedding(
+                s.id,
+                embedder.model_version,
+                text_hash,
+                np.zeros(384, dtype=np.float32),
+            )
+
+        result = get_or_compute_embeddings(stories, embedder, db)
+
+        assert result.shape == (3, 384)
+        assert embedder.encode_calls == 0
+    finally:
+        db.close()
 
 
 def test_prewarm_top_stories_empty_list_returns_zero() -> None:

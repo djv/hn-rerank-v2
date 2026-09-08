@@ -106,9 +106,9 @@ async def fetch_story(
             else:
                 return None
         if not force:
-            comments_stale = story.top_comments == "" or (
-                story.comment_count or 0
-            ) > (story.comment_count_at_fetch or 0)
+            comments_stale = story.top_comments == "" or (story.comment_count or 0) > (
+                story.comment_count_at_fetch or 0
+            )
             if not comments_stale:
                 return story
             if story.top_comments != "" and (story.comment_count_at_fetch or 0) > 50:
@@ -382,7 +382,9 @@ def _merge_source_context(
         )
     else:
         top_comments = ctx.top_comments
-    new_text = compose_story_text(story.title, self_text, top_comments, article_body or "")
+    new_text = compose_story_text(
+        story.title, self_text, top_comments, article_body or ""
+    )
     return replace(
         story,
         self_text=self_text,
@@ -1005,7 +1007,14 @@ async def fetch_and_cache_article_bodies(
                     db.upsert_story(updated)
                     new_vec = embedder.encode([new_text])[0]
                     new_hash = hashlib.sha256(new_text.encode("utf-8")).hexdigest()
-                    db.upsert_embedding(story.id, model_version, new_hash, new_vec)
+                    db.upsert_embedding(
+                        story.id,
+                        model_version,
+                        new_hash,
+                        new_vec,
+                        model_sha=embedder.model_onnx_sha,
+                        dim=embedder.embedding_dim,
+                    )
                     db.clear_article_fetch_failure(story.id)
                     success[0] += 1
                     return story.id, updated
