@@ -1,5 +1,17 @@
 # Worklog: hn-rewrite
 
+## 2026-09-08 — bucketed batching killed by measurement (negative result)
+
+- Built length-bucketed batching (bounds 128/1024, widths capped by the
+  proven-safe 4096^2 transient peak, parity-tested vs single) to shrink
+  the prewarm CPU contention window. Real-mix benchmark (200 recent
+  story texts): batch 1 = 61.9s, batch 8 = 59.0s — 5%. Padding waste on
+  medium/long texts (quadratic attention) cancels call-overhead savings
+  except for shorts (2.6x on titles). +180MB transient RSS for the 5%.
+- Verdict: NOT shipped — fully reverted, nothing of it in tree. Matches
+  the 2026-07-28 finding (most encodes are single-text anyway). The
+  contention lever is fewer encodes, not wider batches; config stays 1.
+
 ## 2026-09-08 — terminal theme (green phosphor dark mode)
 
 - `data-theme` dark; Pico dark base + phosphor vars (`--term-green`
