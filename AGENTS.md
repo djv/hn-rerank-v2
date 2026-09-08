@@ -287,6 +287,9 @@ The HN database is backed up daily to Google Drive via a systemd user timer.
 - Service: `~/.config/systemd/user/hn-rewrite-backup.service`
 - Timer: `~/.config/systemd/user/hn-rewrite-backup.timer` (active)
 - Target: `drive:hn-rewrite/backups/<YYYYMMDDTHHMMSSZ>/hn_rewrite.db`
+- Secrets: `../shared/.env` (API keys, 600, outside git) is copied as
+  `dotenv` into the same snapshot folder (env: `HN_ENV_FILE`). Skipped
+  silently when absent. Never commit key values to the repo.
 - Retention: 30 most recent snapshots (env: `HN_KEEP_N=30`)
 - Logs: `journalctl --user -u hn-rewrite-backup.service`
 
@@ -304,7 +307,22 @@ HN_KEEP_N=7 ./scripts/backup_hn_db.sh             # keep 7
 LATEST=$(rclone lsf --dirs-only drive:hn-rewrite/backups/ | sort -r | head -1)
 rclone copy drive:hn-rewrite/backups/$LATEST/hn_rewrite.db ./hn_rewrite.db
 sqlite3 hn_rewrite.db "PRAGMA integrity_check;"
+rclone copy drive:hn-rewrite/backups/$LATEST/dotenv ../shared/.env
+chmod 600 ../shared/.env
 ```
+
+### Re-issuing API keys (values live only in `../shared/.env`)
+
+- `MISTRAL_API_KEY` — Mistral console → API keys. Note the $10 spend cap;
+  a capped key returns quota 429s and the dashboard degrades to cooldown +
+  stale-cache fallback until the cap is raised.
+- `GROQ_API_KEY` — Groq console → API keys. Free tier is rate-limited;
+  kept as the manual fallback provider (`LLM_PROVIDER=groq`).
+- `GEMINI_API_KEY` — Google AI Studio → API keys. Manual fallback
+  (`LLM_PROVIDER=gemini`).
+- After changing keys or `LLM_PROVIDER`: `systemctl --user restart
+  hn_rewrite.service`, then live smoke test (dashboard + cached/uncached
+  `POST /api/tldr-detail`).
 
 ## Testing notes
 

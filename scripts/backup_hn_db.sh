@@ -30,6 +30,14 @@ fi
 
 echo "Backed up $DB_PATH to $RCLONE_REMOTE/$TIMESTAMP/"
 
+# 5. Secrets backup: the dotenv file (API keys) is NOT in the DB, so copy it
+# next to the snapshot. Skipped silently when the file is absent.
+ENV_FILE="${HN_ENV_FILE:-../shared/.env}"
+if [[ -f "$ENV_FILE" ]]; then
+    rclone copyto "$ENV_FILE" "$RCLONE_REMOTE/$TIMESTAMP/dotenv"
+    echo "Backed up $ENV_FILE to $RCLONE_REMOTE/$TIMESTAMP/"
+fi
+
 # 5. Retention: keep newest N dated subfolders
 if [[ "$KEEP_N" =~ ^[0-9]+$ ]] && (( KEEP_N > 0 )); then
     rclone lsf --dirs-only "$RCLONE_REMOTE" \
