@@ -1,5 +1,17 @@
 # Worklog: hn-rewrite
 
+## 2026-09-08 — ranker re-eval: C=0.1 stands, old C=0.5 plateau gone
+
+- 30-point sweep (C 0.05-2.0 x gamma 0.01-0.1, 5 temporal folds;
+  raw JSON `eval_ranker_sweep_2026-09-08.json` left uncommitted, 6.3MB)
+  vs production.
+- `svm_c0.1_gamma0.03` deltas exactly +0.0000: production IS C=0.1/g0.03.
+  No grid point wins: best d40 +0.037 (c0.1/g0.01) loses at d100; C=0.5
+  all-negative (-0.01..-0.04). Old plateau does not reproduce — KEEP.
+- Gamma 0.1 degenerate (matches no-op baselines). Absolute NDCG low
+  (0.046/0.106, sparse judgments); leak check separates only at depth
+  >= 100 (shuffled 0.036 vs 0.106), so trust d100 over d40. No change.
+
 ## 2026-09-08 — Go Spark bakeoff: quality yes, operations no (parked)
 
 - Zen `contributor-free` id is hard-gated to OpenCode client sessions
