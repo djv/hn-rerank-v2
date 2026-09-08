@@ -6200,3 +6200,22 @@ def test_quiet_third_party_loggers_silences_httpx_and_trafilatura() -> None:
     finally:
         httpx_logger.setLevel(orig_httpx_level)
         trafilatura_logger.setLevel(orig_trafilatura_level)
+
+
+@pytest.mark.parametrize(
+    ("rank_ms", "stage_sum_ms", "expected"),
+    [
+        (54_000.0, 12_000.0, True),  # monster warm, stages explain little
+        (6_230_000.0, 900.0, True),  # 103-min stall, near-zero stages
+        (9_000.0, 3_500.0, False),  # ordinary slow warm, below 20s floor
+        (25_000.0, 20_000.0, False),  # expensive but accounted compute
+        (25_000.0, 8_000.0, True),  # just over the 3x boundary
+        (21_000.0, 7_000.0, False),  # exactly 3x is not starvation
+    ],
+)
+def test_warm_is_starved_predicate(
+    rank_ms: float, stage_sum_ms: float, expected: bool
+) -> None:
+    import server
+
+    assert server._warm_is_starved(rank_ms, stage_sum_ms) is expected

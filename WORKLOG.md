@@ -1,5 +1,25 @@
 # Worklog: hn-rewrite
 
+## 2026-09-08 — dedup tail: algorithm innocent, contention convicted
+
+- `dedup_ms` p50 0.66s / p95 2.6s / max 12.5s. Tried a blocked-BLAS
+  rewrite of the embedding-cosine greedy loop; it REGRESSED typical
+  (0.75s -> 2.2s — the intra-block Python scan dominates) and was fully
+  reverted (stash dropped, nothing of it remains in tree).
+- Correlation over 14d/671 warms: warms within 0-15min of a regen start
+  run p50 ~10.5s vs ~7.3s far from regen (+3s contention tax, confirmed
+  live today 13:45 when regen overlapped active use -> 35-54s warms).
+  Monsters (103-min wall, 0.9s stages) occur in ALL bins — thread
+  stall/suspension, not compute; mechanism still unknown.
+- Shipped: `dashboard_warm_starved` WARN (rank_ms > 20s and stages explain
+  <1/3) + `_warm_is_starved` predicate with boundary tests, so the next
+  monster arrives with a label instead of a mystery. New trace stages
+  (`combo_mmr`, `combo_assembly`) stay — they proved MMR innocent.
+- Not pursued: regen-write chunking / pool growth (the +3s tax fix —
+  scoped as its own cut if the tax matters more than the ~4s floor).
+- Verified: 720 passed, ruff + format + ty clean, restart live (dash 200,
+  no errors).
+
 ## 2026-09-08 — warm latency: title-dupe difflib was ~8s, cached away
 
 - New `combo_mmr`/`combo_assembly` trace stages showed MMR innocent

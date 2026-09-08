@@ -1608,6 +1608,26 @@ class Handler:
             logging.info("rank_perf %s", trace.format_log_fields())
 
             fields = trace.to_log_fields()
+            stage_sum_ms = sum(
+                value
+                for key, value in fields.items()
+                if key.endswith("_ms")
+                and key != "rank_total_ms"
+                and isinstance(value, (int, float))
+            )
+            if _warm_is_starved(rank_ms, stage_sum_ms):
+                # Starvation signature: the thread was stalled, not computing.
+                # Stages explain <1/3 of wall time (regen contention, pool
+                # exhaustion, or host-level stalls — see WORKLOG 2026-09-08).
+                logging.warning(
+                    "dashboard_warm_starved user_id=%s version=%s rank_ms=%.1f"
+                    " stage_sum_ms=%.1f model_cache=%s",
+                    user.id,
+                    requested_version,
+                    rank_ms,
+                    stage_sum_ms,
+                    trace.labels.get("model_cache", ""),
+                )
             sample = RankPerfSample(
                 recorded_at=time.time(),
                 user_id=user.id,
@@ -1972,6 +1992,17 @@ def _flask_cross_site_post_response() -> Response | None:
     return _flask_json_response(
         {"error": "Cross-site POSTs are not allowed"}, status=HTTPStatus.FORBIDDEN
     )
+
+
+def _warm_is_starved(rank_ms: float, stage_sum_ms: float) -> bool:
+    """Starvation signature: wall time far exceeds accounted stage time.
+
+    A slow warm whose stages explain the wall is just expensive compute;
+    a 50s warm with 5s of stages means the thread was stalled (regen
+    contention, pool exhaustion, host-level). Thresholds: only warms over
+    20s qualify, and stages must explain less than a third.
+    """
+    return rank_ms > 20_000 and rank_ms > 3 * max(stage_sum_ms, 1.0)
 
 
 def _flask_rate_limit_response(message: str, retry_after_seconds: int) -> Response:
