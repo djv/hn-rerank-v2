@@ -1023,3 +1023,34 @@ def test_count_feedback_by_action(db):
 
     db.upsert_feedback(user.id, 1, "down")  # change vote
     assert db.count_feedback_by_action(user.id) == {"up": 0, "neutral": 1, "down": 2}
+
+
+def test_pool_wait_over_threshold_is_counted_and_logged(tmp_path, caplog) -> None:
+    """Pool exhaustion must be visible: when all 5 connections are checked
+    out, the next checkout waits, and waits over 100ms increment
+    pool_slow_waits plus emit db_pool_wait_ms (the regen-contention signal
+    slow warms are joined against)."""
+    import threading
+    import time
+
+    db = Database(str(tmp_path / "pool.db"))
+    try:
+        assert db.pool_slow_waits == 0
+        held = [db._pool.get() for _ in range(5)]
+        done: dict[str, bool] = {}
+
+        def worker() -> None:
+            with db.conn():
+                done["ok"] = True
+
+        t = threading.Thread(target=worker)
+        t.start()
+        time.sleep(0.15)
+        for c in held:
+            db._pool.put(c)
+        t.join(timeout=5)
+        assert done.get("ok") is True
+        assert db.pool_slow_waits >= 1
+        assert any("db_pool_wait_ms=" in r.message for r in caplog.records)
+    finally:
+        db.close()

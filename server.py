@@ -2999,6 +2999,7 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
         try:
             from pipeline import fetch_candidates_only
 
+            logging.info("regen_fetch_start")
             asyncio.run(
                 fetch_candidates_only(
                     config,
@@ -3007,9 +3008,11 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
                     on_hn_candidates=hn_dupe_worker.submit,
                 )
             )
+            logging.info("regen_fetch_done")
             Handler._rebuild_cold_deck()
             Handler._bump_all_cached_versions()
             Handler._warm_stale_cached_users()
+            logging.info("regen_rebuild_done")
             reddit_worker.submit()
 
             if Handler._cold_stories:

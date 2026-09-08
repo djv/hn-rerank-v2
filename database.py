@@ -151,6 +151,7 @@ class Database:
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("PRAGMA busy_timeout=5000")
             self._pool.put(conn)
+        self.pool_slow_waits = 0
         if not read_only:
             try:
                 self._assert_schema_compatible()
@@ -161,7 +162,15 @@ class Database:
 
     @contextmanager
     def conn(self) -> Generator[sqlite3.Connection, None, None]:
+        start = time.perf_counter()
         conn = self._pool.get()
+        waited_ms = (time.perf_counter() - start) * 1000.0
+        if waited_ms > 100.0:
+            # Contention signal: all pool connections were checked out
+            # (regen bulk writes vs vote-warms). Counted for tests, logged
+            # for joining slow warms against pool pressure.
+            self.pool_slow_waits += 1
+            logging.warning("db_pool_wait_ms=%.1f", waited_ms)
         try:
             yield conn
         finally:

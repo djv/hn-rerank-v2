@@ -1,5 +1,16 @@
 # Worklog: hn-rewrite
 
+## 2026-09-08 — regen contention telemetry (pool-wait + phase markers)
+
+- Pool contention was invisible: `Database.conn()` blocked on an empty
+  pool with no timeout and no metric. Now waits >100ms increment
+  `pool_slow_waits` and log `db_pool_wait_ms` (test: 5-conn exhaustion
+  in threads). Regen logs phase markers (`regen_fetch_start/done`,
+  `regen_rebuild_done`) so slow warms join against regen phase, not just
+  regen start. Behavior-neutral; the cut (chunked prewarm / pool growth)
+  waits for one measured cycle.
+- Verified: 721 passed, ruff + format + ty clean, restart live.
+
 ## 2026-09-08 — dedup tail: algorithm innocent, contention convicted
 
 - `dedup_ms` p50 0.66s / p95 2.6s / max 12.5s. Tried a blocked-BLAS
