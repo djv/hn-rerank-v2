@@ -1,5 +1,18 @@
 # Worklog: hn-rewrite
 
+## 2026-09-08 — terminal theme (green phosphor dark mode)
+
+- `data-theme` dark; Pico dark base + phosphor vars (`--term-green`
+  #33dd66, amber #ffb000), system mono stack (no webfonts), square
+  2px cards/panels, uppercase micro-labels, `$ hn-rewrite --deck`
+  prompt header, CSS-only blinking warming dot on `#queue-loading`.
+  Rank gradient floor raised (45->68%) so pale ranks stay visible on
+  near-black. No scanlines. Class names/IDs untouched.
+- Verified: 725 passed (incl. new terminal contract test), restart live
+  (dash 200 with all chrome strings, tap 200, no errors). Attribution
+  line absent for cold users by design (verified for user 1 in-process:
+  86/96 attributed).
+
 ## 2026-09-08 — F2 attribution: "Because you upvoted …" live
 
 - `_knn_mean_and_max` also returns argmax indices (one extra reduction

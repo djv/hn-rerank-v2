@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="light">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -13,6 +13,16 @@
       --pico-primary: #ff6600;
       --pico-primary-background: #ff6600;
       --pico-primary-hover: #e05a00;
+      /* Terminal theme (green phosphor): dark Pico base + mono + phosphor
+         accents. System mono stack only — no webfonts (local-first). */
+      --term-green: #33dd66;
+      --term-green-dim: #1d7a3c;
+      --term-amber: #ffb000;
+      --term-bg: #0a0e0a;
+      --term-panel: #0e140e;
+      --pico-border-radius: 2px;
+      --pico-font-family: ui-monospace, SFMono-Regular, Menlo, Consolas,
+        "Liberation Mono", monospace;
       --page-gutter: 1rem;
       --vote-bar-height: 3.2rem;
       --card-bottom-gap: 0.5rem;
@@ -29,6 +39,78 @@
       padding-top: 0;
       padding-bottom: var(--page-gutter);
       overflow: hidden;
+      background: var(--term-bg);
+    }
+
+    main, .deck-wrap, .swipe-side {
+      background: transparent;
+    }
+
+    /* Terminal chrome: prompt header, blocky panels, micro-labels. */
+    .term-prompt {
+      font-size: 0.8rem;
+      color: var(--term-green);
+      margin-bottom: 0.6rem;
+      overflow-wrap: anywhere;
+    }
+    .term-prompt .term-cursor {
+      display: inline-block;
+      width: 0.55em;
+      height: 1em;
+      background: var(--term-green);
+      vertical-align: text-bottom;
+      margin-left: 0.15em;
+    }
+
+    .tab-label, .swipe-keys, .badge-legend, .rank-legend, .queue-status,
+    .card-actions, .refresh-banner {
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      font-size: 0.72rem;
+    }
+
+    .key-hint {
+      border: 1px solid var(--term-green-dim);
+      color: var(--term-green);
+      border-radius: 2px;
+    }
+
+    .vote-btn {
+      border-radius: 2px;
+    }
+    .vote-btn.active {
+      border-color: var(--term-green);
+      color: var(--term-green);
+    }
+
+    /* Warming activity dot: blinking block cursor, CSS only. */
+    @keyframes term-blink {
+      0%, 49% { opacity: 1; }
+      50%, 100% { opacity: 0; }
+    }
+    #queue-loading:not([hidden])::after {
+      content: "▮";
+      color: var(--term-green);
+      margin-left: 0.4em;
+      animation: term-blink 1s steps(1) infinite;
+    }
+
+    .tldr-toggle {
+      color: var(--term-green);
+    }
+    .tldr-detail {
+      border-left: 2px solid var(--term-green-dim);
+    }
+    .tldr-detail-content h3 {
+      color: var(--term-green);
+    }
+    .tldr-error, .tldr-stale {
+      color: var(--term-amber);
+    }
+    .domain-chip {
+      border: 1px solid var(--term-green-dim);
+      border-radius: 2px;
+      padding: 0 0.3em;
     }
 
     body.fullscreen {
@@ -335,10 +417,10 @@
       margin-bottom: 0.4rem;
       width: 100%;
       padding: 0.5rem;
-      border-radius: 6px;
-      border: 1px solid var(--pico-card-border-color);
+      border-radius: 2px;
+      border: 1px solid var(--term-green-dim);
       border-left: 7px solid transparent;
-      background: var(--pico-card-background-color);
+      background: var(--term-panel);
       transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1), transform 0.2s, box-shadow 0.2s;
       opacity: 1;
       overflow: hidden;
@@ -752,7 +834,7 @@
       width: 1.6rem;
       height: 0.55rem;
       border-radius: 3px;
-      background: linear-gradient(to right, hsl(24, 100%, 42%), hsl(24, 70%, 82%));
+      background: linear-gradient(to right, hsl(24, 100%, 45%), hsl(24, 80%, 68%));
     }
 
     .queue-status {
@@ -1121,10 +1203,11 @@
         .map(card => ({ card, score: parseFloat(card.dataset.score) || 0 }))
         .sort((a, b) => b.score - a.score);
       ranked.forEach((entry, i) => {
-        // t=0 -> top rank -> saturated (42%); t=1 -> bottom -> pale (82%)
+        // t=0 -> top rank -> saturated (45%); t=1 -> bottom -> still
+        // visible on the dark terminal bg (68%, floor raised vs light).
         const t = N === 1 ? 0 : i / (N - 1);
-        const light = (42 + 40 * t).toFixed(1);
-        const sat = Math.round(100 - 30 * t);
+        const light = (45 + 23 * t).toFixed(1);
+        const sat = Math.round(100 - 20 * t);
         entry.card.style.borderLeftColor = `hsl(24, ${sat}%, ${light}%)`;
         entry.card.style.backgroundColor = `color-mix(in srgb, var(--pico-card-background-color) 96%, hsl(24, ${sat}%, ${light}%) 4%)`;
       });

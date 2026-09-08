@@ -3975,6 +3975,32 @@ def test_tldr_enhance_and_queue_status_contract() -> None:
     assert "220 * (N - 1 - i)" not in script
 
 
+def test_terminal_theme_contract() -> None:
+    """Terminal theme: dark Pico base, phosphor vars, mono stack, prompt
+    chrome, dark-tuned rank gradient. Class names and element IDs must be
+    unchanged (JS/template contracts depend on them)."""
+    template, script = _read_template_and_static()
+    assert 'data-theme="dark"' in template
+    assert "--term-green: #33dd66" in template
+    assert "ui-monospace" in template
+    assert "term-prompt" in template
+    assert "$ hn-rewrite --deck" in template
+    assert "term-blink" in template
+    assert "#queue-loading:not([hidden])::after" in template
+    # Rank gradient floor raised for dark bg (pale end still visible).
+    assert "45 + 23 * t" in script
+    assert "42 + 40 * t" not in script
+    # Unchanged contracts the JS depends on.
+    for token in (
+        'id="queueStatus"',
+        'id="queue-loading"',
+        'class="story-card',
+        'data-key-action="undo"',
+        "badge-legend",
+    ):
+        assert token in template
+
+
 def test_prefetch_follows_navigation_order() -> None:
     import shutil
     import subprocess
