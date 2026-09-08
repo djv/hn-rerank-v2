@@ -1,5 +1,26 @@
 # Worklog: hn-rewrite
 
+## 2026-09-08 — warm latency: title-dupe difflib was ~8s, cached away
+
+- New `combo_mmr`/`combo_assembly` trace stages showed MMR innocent
+  (disabled in prod) and `combo_assembly` at ~2.8-3.2s. cProfile traced it
+  to `_matches_feedback` -> `_story_titles_are_similar`: 22k difflib pairs
+  per warm (~8s), each re-normalizing the same ~390 feedback titles.
+- Fix (exact verdicts, no eval needed): feedback titles normalized once
+  per warm (`FeedbackDupeContext.hn_title_keys`); integer length bound
+  skips provably-unmatchable difflib pairs; quick-ratio cascade; pair
+  verdicts in a bounded (64k) lru_cache — text-pair verdicts never go
+  stale, only new titles miss. Rejected: token-prefilter gating (63% of
+  ratio matches share <2 tokens — paraphrase catches that must survive).
+- Measured user-1 warm: 11.8s -> 3.9s on repeat warms (combo_assembly
+  2866ms -> 132ms, 19.8k cache hits, 0 new misses). Live long-lived
+  service gets this on every warm after the first; first warm per restart
+  still pays full price.
+- Tests: hypothesis fuzz parity vs naive reference (60 ex), length-bound
+  boundaries, context parallelism, cache-reuse contract.
+- Verified: 714 passed, ruff + format + ty clean, restart live (dash 200,
+  no errors).
+
 ## 2026-09-08 — UI polish pass: legend, gradient, domain, TLDR chrome
 
 - Side rail: badge legend (icon+label, single-sourced from

@@ -9,6 +9,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
+from fractions import Fraction
+from functools import lru_cache
 from typing import Literal, Protocol, TypeAlias, TypeVar, cast
 
 import httpx
@@ -82,11 +84,16 @@ class FeedbackDupeContext:
     story_ids: set[int]
     urls: set[NormalizedUrl]
     hn_stories: list[Story]
+    # Parallel to hn_stories: (normalized title, informative token set) per
+    # story, precomputed once per warm so the hot match loop never
+    # re-normalizes the same feedback titles (~400x redundancy before).
+    hn_title_keys: tuple[tuple[str, frozenset[str]], ...] = ()
 
 
 @dataclass(frozen=True)
 class HnDupeOutcome:
     """A complete negative inspection is distinct from a transient failure."""
+
     status: Literal["canonical", "no_match", "retry"]
     canonical_story: Story | None = None
     error: str = ""
@@ -275,9 +282,7 @@ class HnDupeResolver:
             self._canonical_cache[story_id] = (time.monotonic(), target_id)
             self._trim_cache_locked(self._canonical_cache)
 
-    def _trim_cache_locked(
-        self, cache: dict[int, tuple[float, CacheValue]]
-    ) -> None:
+    def _trim_cache_locked(self, cache: dict[int, tuple[float, CacheValue]]) -> None:
         overflow = len(cache) - self._max_cache_entries
         if overflow <= 0:
             return
@@ -346,7 +351,9 @@ class HnDupeResolutionWorker:
         if not due_ids:
             return
         now = time.time()
-        with ThreadPoolExecutor(max_workers=min(MAX_DUPE_RESOLVE_WORKERS, len(due_ids))) as pool:
+        with ThreadPoolExecutor(
+            max_workers=min(MAX_DUPE_RESOLVE_WORKERS, len(due_ids))
+        ) as pool:
             futures = {pool.submit(self._resolver.resolve, sid): sid for sid in due_ids}
             for future in as_completed(futures):
                 source_id = futures[future]
@@ -355,8 +362,13 @@ class HnDupeResolutionWorker:
                 except Exception as exc:
                     outcome = HnDupeOutcome("retry", error=repr(exc))
                 prior = self._db.get_hn_dupe_resolutions([source_id]).get(source_id)
-                failures = (prior.failure_count if prior else 0) + (outcome.status == "retry")
-                if outcome.status == "canonical" and outcome.canonical_story is not None:
+                failures = (prior.failure_count if prior else 0) + (
+                    outcome.status == "retry"
+                )
+                if (
+                    outcome.status == "canonical"
+                    and outcome.canonical_story is not None
+                ):
                     # Persist target first: a cache hit can always render locally.
                     self._db.upsert_story(outcome.canonical_story)
                     canonical_id = outcome.canonical_story.id
@@ -365,11 +377,20 @@ class HnDupeResolutionWorker:
                     canonical_id, failures, next_check = None, 0, now + 24 * 3600
                 else:
                     canonical_id = None
-                    next_check = now + min(6 * 3600, 15 * 60 * (2 ** max(0, failures - 1)))
-                self._db.upsert_hn_dupe_resolution(HnDupeResolution(
-                    source_id, canonical_id, outcome.status, now, next_check,
-                    int(failures), outcome.error,
-                ))
+                    next_check = now + min(
+                        6 * 3600, 15 * 60 * (2 ** max(0, failures - 1))
+                    )
+                self._db.upsert_hn_dupe_resolution(
+                    HnDupeResolution(
+                        source_id,
+                        canonical_id,
+                        outcome.status,
+                        now,
+                        next_check,
+                        int(failures),
+                        outcome.error,
+                    )
+                )
 
 
 def canonicalize_hn_dupes(
@@ -398,14 +419,19 @@ def canonicalize_hn_dupes(
         user_id=user_id,
         actions=feedback_actions,
     )
-    source_ids = list(dict.fromkeys(
-        item.story.id for item in ranked[:selected_count]
-        if item.story.source == "hn" and item.story.id > 0
-    ))
+    source_ids = list(
+        dict.fromkeys(
+            item.story.id
+            for item in ranked[:selected_count]
+            if item.story.source == "hn" and item.story.id > 0
+        )
+    )
     resolutions = db.get_hn_dupe_resolutions(source_ids)
     _set_trace_count(trace, "hn_dupes_cache_hit", len(resolutions))
     _set_trace_count(trace, "hn_dupes_cache_miss", len(source_ids) - len(resolutions))
-    _set_trace_count(trace, "hn_dupes_retry", sum(r.status == "retry" for r in resolutions.values()))
+    _set_trace_count(
+        trace, "hn_dupes_retry", sum(r.status == "retry" for r in resolutions.values())
+    )
     emitted_ids: set[int] = set()
     output: list[RankedStory] = []
 
@@ -418,7 +444,11 @@ def canonicalize_hn_dupes(
             continue
 
         resolution = resolutions.get(story.id)
-        target_id = resolution.canonical_story_id if resolution and resolution.status == "canonical" else None
+        target_id = (
+            resolution.canonical_story_id
+            if resolution and resolution.status == "canonical"
+            else None
+        )
         if _matches_feedback(story, feedback_context):
             logging.info(
                 "hn_dupe_resolver source_id=%s result=dropped_feedback_match",
@@ -519,6 +549,7 @@ def _load_feedback_context(
     story_ids: set[int] = set()
     urls: set[NormalizedUrl] = set()
     hn_stories: list[Story] = []
+    title_keys: list[tuple[str, frozenset[str]]] = []
     for record in db.get_all_feedback(user_id=user_id):
         if record.action not in action_set:
             continue
@@ -538,7 +569,16 @@ def _load_feedback_context(
                     source=record.source,
                 )
             )
-    return FeedbackDupeContext(story_ids=story_ids, urls=urls, hn_stories=hn_stories)
+            norm_title = _normalize_title(record.title)
+            title_keys.append(
+                (norm_title, frozenset(_informative_title_tokens(norm_title)))
+            )
+    return FeedbackDupeContext(
+        story_ids=story_ids,
+        urls=urls,
+        hn_stories=hn_stories,
+        hn_title_keys=tuple(title_keys),
+    )
 
 
 def _matches_feedback(story: Story, feedback: FeedbackDupeContext) -> bool:
@@ -551,7 +591,71 @@ def _matches_feedback(story: Story, feedback: FeedbackDupeContext) -> bool:
         return False
     if _story_comment_count(story) > MAX_SOURCE_DESCENDANTS:
         return False
-    return any(_story_titles_are_similar(story.title, fb.title) for fb in feedback.hn_stories)
+    story_norm = _normalize_title(story.title)
+    if not story_norm:
+        return False
+    story_tokens = frozenset(_informative_title_tokens(story_norm))
+    return any(
+        _titles_are_similar_precomputed(story_norm, story_tokens, fb_norm, fb_tokens)
+        for fb_norm, fb_tokens in feedback.hn_title_keys
+    )
+
+
+# Necessary length bound for SequenceMatcher.ratio() >= TITLE_RATIO_THRESHOLD:
+# ratio = 2M/(a+b) with M <= min(a,b), so reaching the threshold requires
+# 2*min*den >= (a+b)*num. Integer arithmetic — exact, no float edge.
+_RATIO_NUM = Fraction(TITLE_RATIO_THRESHOLD).limit_denominator(1000).numerator
+_RATIO_DEN = Fraction(TITLE_RATIO_THRESHOLD).limit_denominator(1000).denominator
+
+
+def _ratio_length_plausible(a_len: int, b_len: int) -> bool:
+    lo, hi = (a_len, b_len) if a_len <= b_len else (b_len, a_len)
+    return 2 * lo * _RATIO_DEN >= (lo + hi) * _RATIO_NUM
+
+
+@lru_cache(maxsize=65536)
+def _cached_ratio_ge(source_norm: str, target_norm: str) -> bool:
+    """Exact difflib ratio >= threshold, cheap-first cascade.
+
+    real_quick_ratio/quick_ratio are upper bounds: when either is below the
+    threshold the full ratio() cannot reach it, so most dissimilar pairs
+    resolve in O(n) char-counting instead of O(n²) matching. Identical
+    verdicts to a bare ratio() call. The cache is warm-scoped in effect —
+    the same candidate/feedback title pairs recur across combos within a
+    warm and across consecutive warms — and bounded at 64k entries.
+    """
+    matcher = SequenceMatcher(None, source_norm, target_norm)
+    return (
+        matcher.real_quick_ratio() >= TITLE_RATIO_THRESHOLD
+        and matcher.quick_ratio() >= TITLE_RATIO_THRESHOLD
+        and matcher.ratio() >= TITLE_RATIO_THRESHOLD
+    )
+
+
+def _titles_are_similar_precomputed(
+    source_norm: str,
+    source_tokens: frozenset[str],
+    target_norm: str,
+    target_tokens: frozenset[str],
+) -> bool:
+    """Same verdict as _story_titles_are_similar, minus repeated normalization.
+
+    The difflib ratio runs only when the length bound proves it can reach
+    the threshold (the hot loop's 22k-pair cost was ~8s/warm of difflib on
+    pairs that could never match); the token-Jaccard fallback is unchanged.
+    """
+    if not source_norm or not target_norm:
+        return False
+    if _ratio_length_plausible(len(source_norm), len(target_norm)):
+        if _cached_ratio_ge(source_norm, target_norm):
+            return True
+    if not source_tokens or not target_tokens:
+        return False
+    shared = source_tokens & target_tokens
+    if len(shared) < MIN_SHARED_TITLE_TOKENS:
+        return False
+    jaccard = len(shared) / len(source_tokens | target_tokens)
+    return jaccard >= TOKEN_JACCARD_THRESHOLD
 
 
 def _first_kid_ids(item: FirebaseItem, limit: int) -> list[int]:
@@ -575,11 +679,10 @@ def _is_dead_or_deleted(item: FirebaseItem) -> bool:
 
 
 def _target_is_stronger(source: FirebaseItem, target: FirebaseItem) -> bool:
-    return (
-        _coerce_nonnegative_int(target.get("score"))
-        > _coerce_nonnegative_int(source.get("score"))
-        or _coerce_nonnegative_int(target.get("descendants"))
-        > _coerce_nonnegative_int(source.get("descendants"))
+    return _coerce_nonnegative_int(target.get("score")) > _coerce_nonnegative_int(
+        source.get("score")
+    ) or _coerce_nonnegative_int(target.get("descendants")) > _coerce_nonnegative_int(
+        source.get("descendants")
     )
 
 
@@ -593,21 +696,12 @@ def _titles_are_similar(source: FirebaseItem, target: FirebaseItem) -> bool:
 def _story_titles_are_similar(source_title: str, target_title: str) -> bool:
     source_norm = _normalize_title(source_title)
     target_norm = _normalize_title(target_title)
-    if not source_norm or not target_norm:
-        return False
-    ratio = SequenceMatcher(None, source_norm, target_norm).ratio()
-    if ratio >= TITLE_RATIO_THRESHOLD:
-        return True
-
-    source_tokens = _informative_title_tokens(source_norm)
-    target_tokens = _informative_title_tokens(target_norm)
-    if not source_tokens or not target_tokens:
-        return False
-    shared = source_tokens & target_tokens
-    if len(shared) < MIN_SHARED_TITLE_TOKENS:
-        return False
-    jaccard = len(shared) / len(source_tokens | target_tokens)
-    return jaccard >= TOKEN_JACCARD_THRESHOLD
+    return _titles_are_similar_precomputed(
+        source_norm,
+        frozenset(_informative_title_tokens(source_norm)),
+        target_norm,
+        frozenset(_informative_title_tokens(target_norm)),
+    )
 
 
 def _normalize_title(raw: str) -> str:

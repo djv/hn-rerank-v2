@@ -1574,12 +1574,13 @@ def _assemble_combo_deck(
         # --- Primary selection ---
         if primary_limit > 0:
             if config.model.enable_mmr and embeddings_map:
-                primary = mmr_filter(
-                    combo_pool,
-                    embeddings_map,
-                    threshold=config.model.diversity_threshold,
-                    limit=primary_limit,
-                )
+                with trace.stage("combo_mmr"):
+                    primary = mmr_filter(
+                        combo_pool,
+                        embeddings_map,
+                        threshold=config.model.diversity_threshold,
+                        limit=primary_limit,
+                    )
             else:
                 combo_sort = sorted(combo_pool, key=lambda r: r.score, reverse=True)
                 primary = combo_sort[:primary_limit]
@@ -1894,17 +1895,18 @@ def assemble_ranked_deck(
     story_id_to_idx = {s.id: idx for idx, s in enumerate(candidates)}
     idx_for = story_id_to_idx.__getitem__
 
-    return _assemble_combo_deck(
-        ranked,
-        config=config,
-        recent_cutoff=recent_cutoff,
-        cand_scores=cand_scores,
-        cand_velocities=cand_velocities,
-        idx_for=idx_for,
-        embeddings_map=embeddings_map,
-        explore=ExploreContext(
-            cand_max_sim=cand_max_sim, cand_closest_up=cand_closest_up
-        ),
-        is_feedback_match=is_feedback_match,
-        trace=trace,
-    )
+    with trace.stage("combo_assembly"):
+        return _assemble_combo_deck(
+            ranked,
+            config=config,
+            recent_cutoff=recent_cutoff,
+            cand_scores=cand_scores,
+            cand_velocities=cand_velocities,
+            idx_for=idx_for,
+            embeddings_map=embeddings_map,
+            explore=ExploreContext(
+                cand_max_sim=cand_max_sim, cand_closest_up=cand_closest_up
+            ),
+            is_feedback_match=is_feedback_match,
+            trace=trace,
+        )
