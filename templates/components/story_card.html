@@ -23,6 +23,10 @@
     <span class="source-badge" title="{{ card.story.source }}">{{ card.source_label }}</span>
     {% endif %}
 
+    {% if card.domain %}
+    <span class="domain-chip">{{ card.domain }}</span>
+    {% endif %}
+
     {% if card.show_score %}
     <span>{{ card.story.score }} pts</span>
     {% endif %}

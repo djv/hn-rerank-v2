@@ -3959,6 +3959,22 @@ def test_tldr_client_cooldown_suppression_shows_message() -> None:
     assert "dataset.error" in block
 
 
+def test_tldr_enhance_and_queue_status_contract() -> None:
+    """Polish-pass client contracts: the TLDR post-renderer (readtime,
+    stale marker, collapsible sections), the queue status line, and the
+    single-hue rank gradient. Both render sites must route through the
+    enhancer or markers/readtime silently disappear on one path."""
+    _, script = _read_template_and_static()
+    assert "function enhanceTldrContent(contentDiv, opts)" in script
+    assert "tldr-stale" in script
+    assert "Stale summary — refreshing" in script
+    assert "min read" in script
+    assert script.count("enhanceTldrContent(contentDiv, {") == 2
+    assert "Queued ${n}" in script
+    assert "hsl(24," in script
+    assert "220 * (N - 1 - i)" not in script
+
+
 def test_prefetch_follows_navigation_order() -> None:
     import shutil
     import subprocess

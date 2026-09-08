@@ -718,6 +718,72 @@
       border-color: #dc3545 !important;
     }
 
+    .domain-chip {
+      display: inline-block;
+      font-size: 0.72rem;
+      color: var(--pico-muted-color);
+      overflow-wrap: anywhere;
+    }
+
+    .badge-legend {
+      margin-top: 0.65rem;
+      padding-top: 0.5rem;
+      border-top: 1px solid var(--pico-muted-border-color);
+      font-size: 0.72rem;
+      color: var(--pico-muted-color);
+      line-height: 1.7;
+    }
+    .badge-legend-item {
+      display: inline-block;
+      margin-right: 0.45rem;
+      white-space: nowrap;
+    }
+
+    .rank-legend {
+      margin-top: 0.35rem;
+      font-size: 0.72rem;
+      color: var(--pico-muted-color);
+      display: flex;
+      align-items: center;
+      gap: 0.35rem;
+    }
+    .rank-legend-swatch {
+      display: inline-block;
+      width: 1.6rem;
+      height: 0.55rem;
+      border-radius: 3px;
+      background: linear-gradient(to right, hsl(24, 100%, 42%), hsl(24, 70%, 82%));
+    }
+
+    .queue-status {
+      margin-top: 0.65rem;
+      font-size: 0.75rem;
+      color: var(--pico-muted-color);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .tldr-readtime {
+      font-size: 0.72rem;
+      color: var(--pico-muted-color);
+      margin-bottom: 0.25rem;
+    }
+    .tldr-stale {
+      font-size: 0.75rem;
+      font-style: italic;
+      color: var(--pico-muted-color);
+      margin-bottom: 0.25rem;
+    }
+    .tldr-detail-content details {
+      margin-bottom: 0.15rem;
+    }
+    .tldr-detail-content details > summary {
+      cursor: pointer;
+      list-style-position: outside;
+    }
+    .tldr-detail-content details > summary h3 {
+      display: inline;
+    }
+
     .refresh-banner {
       position: fixed;
       top: 0.75rem;
@@ -1041,10 +1107,12 @@
       activeInteraction = null;
     }
 
-    // Map a story's rank position (sorted by data-score desc) to a hue.
-    // Rank 1 (top) = blue, rank N (bottom) = red. Rank-percentile mapping
-    // (rather than linear-in-score) ensures visually distinguishable colors
-    // even when the score distribution clusters near 1.0.
+    // Map a story's rank position (sorted by data-score desc) to an
+    // HN-orange intensity. Rank 1 (top) = saturated orange, rank N =
+    // pale tint. Single-hue (rather than blue->red) so the encoding reads
+    // as "more relevant -> less" instead of "good -> bad", which fought
+    // voting semantics. Rank-percentile mapping keeps colors
+    // distinguishable even when scores cluster near 1.0.
     function applyGradient() {
       const cards = Array.from(document.querySelectorAll('.story-card'));
       const N = cards.length;
@@ -1053,10 +1121,12 @@
         .map(card => ({ card, score: parseFloat(card.dataset.score) || 0 }))
         .sort((a, b) => b.score - a.score);
       ranked.forEach((entry, i) => {
-        // i=0 -> top rank -> blue (220); i=N-1 -> bottom -> red (0)
-        const hue = 220 * (N - 1 - i) / (N - 1);
-        entry.card.style.borderLeftColor = `hsl(${hue.toFixed(1)}, 70%, 40%)`;
-        entry.card.style.backgroundColor = `color-mix(in srgb, var(--pico-card-background-color) 96%, hsl(${hue.toFixed(1)}, 70%, 50%) 4%)`;
+        // t=0 -> top rank -> saturated (42%); t=1 -> bottom -> pale (82%)
+        const t = N === 1 ? 0 : i / (N - 1);
+        const light = (42 + 40 * t).toFixed(1);
+        const sat = Math.round(100 - 30 * t);
+        entry.card.style.borderLeftColor = `hsl(24, ${sat}%, ${light}%)`;
+        entry.card.style.backgroundColor = `color-mix(in srgb, var(--pico-card-background-color) 96%, hsl(24, ${sat}%, ${light}%) 4%)`;
       });
     }
 
@@ -1145,6 +1215,13 @@
         refillInFlight || warmPollInFlight || voteWarmIdleTimer !== null
       );
       queueLoadingEl.hidden = !(refreshPending && activeCard === null);
+      const statusEl = document.getElementById('queueStatus');
+      if (statusEl) {
+        const n = queuedCards().length;
+        statusEl.textContent = refreshPending
+          ? `Queued ${n} · warming…`
+          : `Queued ${n}`;
+      }
     }
 
     function updateVoteBar() {
@@ -1887,6 +1964,51 @@
       window.open(url, '_blank', 'noopener,noreferrer');
     }
 
+    // Post-render TLDR enhancements, idempotent: strips its own markers
+    // first so retries/re-renders never duplicate them. opts.stale adds a
+    // "stale, refreshing" marker for provisional content. Section wrapping
+    // is skipped when the markdown has no ### headers (single-path TLDRs).
+    function enhanceTldrContent(contentDiv, opts) {
+      const stale = !!(opts && opts.stale);
+      contentDiv.querySelectorAll('.tldr-readtime, .tldr-stale').forEach(el => el.remove());
+      const words = contentDiv.textContent.trim().split(/\s+/).filter(Boolean).length;
+      const readtime = document.createElement('div');
+      readtime.className = 'tldr-readtime';
+      readtime.textContent = words <= 1 ? '' : `~${Math.max(1, Math.round(words / 200))} min read · ${words} words`;
+      if (readtime.textContent) {
+        contentDiv.prepend(readtime);
+      }
+      if (stale) {
+        const marker = document.createElement('p');
+        marker.className = 'tldr-stale';
+        marker.textContent = 'Stale summary — refreshing in the background…';
+        const anchor = contentDiv.querySelector('.tldr-readtime');
+        if (anchor) {
+          anchor.after(marker);
+        } else {
+          contentDiv.prepend(marker);
+        }
+      }
+      const headers = Array.from(contentDiv.children).filter(el => el.tagName === 'H3');
+      if (headers.length === 0 || contentDiv.querySelector('details') !== null) {
+        return;
+      }
+      headers.forEach(h3 => {
+        const details = document.createElement('details');
+        details.open = true;
+        const summary = document.createElement('summary');
+        summary.append(...h3.childNodes);
+        details.append(summary);
+        h3.replaceWith(details);
+        let next = details.nextSibling;
+        while (next && !(next.tagName === 'H3')) {
+          const move = next;
+          next = next.nextSibling;
+          details.append(move);
+        }
+      });
+    }
+
     async function openTldrDetail(card) {
       if (!card) {
         return;
@@ -1913,6 +2035,7 @@
         delete contentDiv.dataset.error;
         contentDiv.innerHTML = parseSimpleMarkdown(cached);
         styleTldrLabels(contentDiv);
+        enhanceTldrContent(contentDiv, { stale: false });
         contentDiv.style.display = 'block';
         return;
       }
@@ -1953,6 +2076,7 @@
           }
           contentDiv.innerHTML = parseSimpleMarkdown(data.tldr);
           styleTldrLabels(contentDiv);
+          enhanceTldrContent(contentDiv, { stale: !!(data.retryable || data.stale) });
           contentDiv.style.display = 'block';
         } else {
           const errData = await resp.json().catch(() => ({}));

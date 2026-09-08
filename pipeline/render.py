@@ -4,6 +4,7 @@ from datetime import datetime
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 from jinja2 import Environment, FileSystemLoader
 
@@ -67,6 +68,7 @@ class DashboardCardView:
     is_recent_attr: str
     article_url: str
     comments_url: str
+    domain: str
     source_label: str
     time_ago: str
     show_source_badge: bool
@@ -148,6 +150,38 @@ def _get_pico_css() -> str:
         path = Path("templates/pico.min.css")
         _pico_css_cache = path.read_text(encoding="utf-8") if path.exists() else ""
     return _pico_css_cache
+
+
+def _domain_of(*urls: str) -> str:
+    """First registrable-looking hostname across the given URLs.
+
+    Lowercased, www-stripped, punycode left as-is (honest, no network).
+    Empty when no URL carries a hostname — the template hides the chip.
+    """
+    for url in urls:
+        if not url:
+            continue
+        try:
+            host = urlparse(url).hostname or ""
+        except ValueError:
+            continue
+        host = host.lower().removeprefix("www.")
+        if host:
+            return host
+    return ""
+
+
+# Badge legend for the side rail: icon + short label per kind, in a stable
+# display order. Tooltips stay on the card badges themselves; the legend is
+# a reminder, not documentation.
+BADGE_LEGEND: tuple[tuple[str, str], ...] = (
+    ("🔥", "Hot"),
+    ("🏆", "Top"),
+    ("💬", "Talk"),
+    ("🤔", "Unsure"),
+    ("✨", "Novel"),
+    ("🎯", "Similar"),
+)
 
 
 def _build_badges(
@@ -243,6 +277,7 @@ def _build_dashboard_cards(
                 is_recent_attr="1" if item.is_recent else "0",
                 article_url=story.url or "",
                 comments_url=story.discussion_url or "",
+                domain=_domain_of(story.url or "", story.discussion_url or ""),
                 source_label=source_label_filter(story.source),
                 time_ago=time_ago_filter(story.time),
                 show_source_badge=story.source != "hn",
@@ -325,6 +360,7 @@ def generate_dashboard_bytes(
         timestamp=datetime.now().strftime("%Y-%m-%d %H:%M"),
         cards=_build_dashboard_cards(ranked, hot_badge_percentile=hot_badge_percentile),
         tab_groups=_build_tab_groups(),
+        badge_legend=BADGE_LEGEND,
         server_port=config.server_port,
         pico_css=pico_css,
         user_id=user_id,

@@ -1,5 +1,23 @@
 # Worklog: hn-rewrite
 
+## 2026-09-08 — UI polish pass: legend, gradient, domain, TLDR chrome
+
+- Side rail: badge legend (icon+label, single-sourced from
+  `render.BADGE_LEGEND`), rank-color legend, queue status line
+  (`Queued N [· warming…]`, updated in `updateQueueLoading`), undo key row
+  (JS handler already existed).
+- Rank gradient blue->red replaced with HN-orange single-hue intensity
+  (saturated top -> pale bottom); red read as bad and fought voting.
+- Card header gains a muted www-stripped domain chip (`_domain_of`,
+  server-side, no network); hides when no hostname.
+- TLDR post-render `enhanceTldrContent` (idempotent, both render sites):
+  `~N min read` line, "Stale summary — refreshing…" marker on
+  retryable/stale content, `###` sections wrapped in open `<details>`.
+- ARCHITECTURE dark-theme claim fixed (live is `data-theme="light"`).
+- Verified: 710 passed, gates clean, restart live (dash 200 with all new
+  strings, tap 200, no errors). Explicitly out: list mode, avatars, dark
+  mode (Pico prefers-color-scheme is a ~5-line follow-up).
+
 ## 2026-09-08 — gospark cap raised: truncation fixed, still parked
 
 - `GET /zen/go/v1/usage` works with the Go key (rolling/weekly/monthly

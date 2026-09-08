@@ -58,9 +58,53 @@ def db():
     db_instance.close()
 
 
+def test_dashboard_polish_renders_domain_legend_and_queue_status(
+    db: Database,
+) -> None:
+    """End-to-end render wiring for the polish pass: www-stripped domain
+    chip on cards, badge legend + rank legend + queue status in the rail,
+    and the undo key row. Guards the render.py context (badge_legend) that
+    Jinja would otherwise swallow silently when missing."""
+    from pipeline import render
+
+    assert render._domain_of("https://WWW.Example.COM/a", "") == "example.com"
+    assert render._domain_of("", "https://news.ycombinator.com/item?id=1") == (
+        "news.ycombinator.com"
+    )
+    assert render._domain_of("", "") == ""
+    assert render._domain_of("not a url", "") == ""
+    assert [label for _, label in render.BADGE_LEGEND] == [
+        "Hot",
+        "Top",
+        "Talk",
+        "Unsure",
+        "Novel",
+        "Similar",
+    ]
+
+    story = Story(
+        id=424242,
+        title="Polish render probe",
+        url="https://www.example.com/some-article",
+        score=100,
+        time=1600000000,
+        text_content="",
+    )
+    db.upsert_story(story)
+    html = render.generate_dashboard_bytes(
+        [ranking.RankedStory(story=story, score=1.0, best_match_title="")],
+        Config(),
+        db,
+    ).decode("utf-8")
+    assert '<span class="domain-chip">example.com</span>' in html
+    assert "🔥 Hot" in html
+    assert 'id="queueStatus"' in html
+    assert "top-ranked → bottom" in html
+    assert 'data-key-action="undo"' in html
+
+
 def _recent_pubdate(days_ago: float = 1.0) -> str:
     """RFC-822 pubDate `days_ago` days in the past.
-
     Reddit topfeed factories filter entries against a
     `now - days * 86400` cutoff (see `build_reddit_topfeed_factories`
     in pipeline/enrichment.py), so a hardcoded date silently ages out
