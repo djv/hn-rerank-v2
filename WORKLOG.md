@@ -8367,6 +8367,91 @@ texts, both under onnxruntime `CPUExecutionProvider`.
 - Purged its exact `rss_reddit_rust` stories and dependent stored rows from
   the local database after creating a recoverable backup.
 
+## 2026-09-01/07 — TLDR reliability + embedding contract (`5441ba5`, `2a9a736`)
+
+- TLDR reliability: concurrent hydration, 120s retry-after cap, prefetch
+  pacing/stampede fix; Mistral-small live as `LLM_PROVIDER=mistral`.
+- Embedding contract: `model_manifest.json` baseline
+  (`mixedbread-ai/mxbai-embed-xsmall-v1`), warn-and-serve on mismatch
+  (`embedding_model_changed`), lazy `model_sha`/`dim` provenance on new
+  rows, never in the match predicate. Full re-embed only via version-bump +
+  background backfill — never inline.
+
+## 2026-09-02 — CI gate + tap-error pin (`4b409f7`, `017d2ce`, `7a51186`)
+
+- CI runs pytest/ruff/format/ty on push + PR, plus CLI boot smoke tests.
+- `test_flask_test_client_tldr_provider_error_degrades_gracefully` pins
+  tap behavior on provider refusal (429 → cooldown, 402 → 503).
+- Runners provision the ONNX model via `HN_ONNX_MODEL_DIR` override in
+  `pipeline/config.py` (`setup_model.py`).
+
+## 2026-09-02 — backup includes secrets (`1f05c65`)
+
+- `scripts/backup_hn_db.sh` now copies `../shared/.env` as `dotenv` into
+  the Drive snapshot; AGENTS.md gained a restore/key runbook.
+
+## 2026-09-03 — TLDR v6 reshape (`b8527d8`)
+
+- Provider 402 feeds the cooldown path (`llm_limiter.on_429()`), then
+  stale-serve with countdown.
+- Outputs halved (`_section_budget` 75/125/200 words,
+  `TLDR_PROMPT_VERSION=detail-v6`, dual cap 450 / single 1000); inputs
+  doubled (article 30k / self-text 16k / comments 24k).
+
+## 2026-09-04 — gospark bakeoffs, PARKED (`5779f7d`, `20bc31d`, `7d3a784`)
+
+- Responses-API client + `gospark` provider row (dispatch on `/responses`
+  suffix; `x-opencode-session` + custom UA required).
+- 8-story bakeoffs: mistral 1.4-4.4s, 8/8 good; spark-low 14-87s with
+  truncations and 429s (`reasoning_effort=none` rejected, `low` burns
+  ~900-1050 reasoning tokens/call). After base+1200 cap: 8/8 ok.
+- Verdict PARKED: quality good, latency/limits kill tap use. Usage
+  pre-flight gate (`--max-usage-percent 80`) wired into the bakeoff script.
+- Reports `eval_gospark_bakeoff[_v2]_2026-09-08.json` committed.
+
+## 2026-09-05 — ranker re-eval: C=0.1 stands (`6c683cf`)
+
+- 30-pt sweep (`eval_ranker_sweep_2026-09-08.json`, uncommitted): production
+  `C=0.1/gamma=0.03` wins (+0.0000 delta); C=0.5 all-negative, gamma 0.1
+  degenerate. Old C=0.5 plateau is gone on the current feature set.
+- `config.toml` pins `svm_c = 0.1`.
+
+## 2026-09-06 — deck polish + terminal theme (`df81ea8`, `152dbed`)
+
+- Badge legend, orange gradient, domain chip, TLDR chrome
+  (`enhanceTldrContent`), queue status, undo row.
+- Terminal theme: `data-theme=dark`, green-phosphor/amber palette, mono
+  stack, `$ hn-rewrite --deck` prompt, blinking queue cursor.
+
+## 2026-09-07 — warm latency + contention verdicts (`22a4c76`, `b8669c0`, `c326c45`, `ba3ebfc`, `8cf0605`)
+
+- `combo_mmr`/`combo_assembly` stages proved MMR innocent; cached
+  title-dupe verdicts + precomputed `hn_title_keys` + length bound cut warm
+  11.8s → 3.9s (`combo_assembly` 2866 → 132ms).
+- Blocked-BLAS rewrite regressed (0.75 → 2.2s) and was fully reverted;
+  14-day/671-war correlation shows +3s near regen + stall monsters, shipped
+  as `dashboard_warm_starved` WARN.
+- Pool-wait counter + regen phase markers proved contention is CPU, not
+  pool (16k-upsert repro: 0 waits; ONNX-stream repro: 12.8 → 18.8s).
+- Bucketed prewarm batching measured +5% at +180MB RSS on real mix —
+  killed by measurement, fully reverted.
+
+## 2026-09-07 — F2 attribution (`9a83ffd`)
+
+- `RankedStory.best_match_title` from the KNN argmax (no new matmul),
+  `ATTRIBUTION_MIN_SIM=0.35`; live 86/96 cards attributed.
+- Less-like-this follow-on explored in two designs (separate mute table;
+  downvote-implicates-neighbor edge) and scrapped 2026-09-08 — no second
+  mechanism, downvote semantics unchanged.
+
+## 2026-09-08 — sciencedirect queue investigation (no change)
+
+- A sciencedirect-linked story in the prefetch queue traced to an organic
+  HN submission via the CH live window (`source=hn`, score 30) — no such
+  feed ever existed (`git log -S sciencedirect` empty; RSS items use
+  `rss_*` sources). Domain blocklist proposed and declined; single-row
+  delete rejected as futile (regen re-inserts within ~4h). Left alone.
+
 ## 2026-09-08 — monster-encode WARN + LLM spend visibility
 
 - `pipeline/ranking.py`: `Embedder.encode` now emits `embedding_slow` WARN

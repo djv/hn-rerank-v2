@@ -232,34 +232,24 @@ ordering, active-HN refresh, stale-TLDR fallback, and the rule that
 
 ### F1. Personal archive: true save/read-later + SQLite FTS5 search (M, 1-2 days)
 
-**Highest daily-driver feature.** Right now upvote conflates "good signal"
-with "want to keep." Add a `saved_items` table independent of `feedback`, a
-save button + keyboard shortcut, and a `/library` view backed by SQLite FTS5
-over title, self_text, article_body, and cached TLDRs. A save must **never**
-alter the SVM training label — that's the ranking-isolation invariant to
-test. The killer daily-driver query is "I saw something about X three weeks
-ago"; the corpus already exists, it just isn't searchable. Stdlib, local-first,
-no new deps: one FTS5 virtual table synced by trigger from `stories` +
-`tldr_cache`.
-
-Test: migration, FTS sync after story/TLDR writes, result quality on a
-temporary DB, and ranking isolation.
+**⛔ Rejected 2026-09-08 — the user doesn't want it.** Kept for the record
+so future sessions don't re-propose it. Original pitch: a `saved_items`
+table independent of `feedback`, a save button + keyboard shortcut, and a
+`/library` view backed by SQLite FTS5 over title, self_text, article_body,
+and cached TLDRs.
 
 ### F2. "Because you upvoted …" attribution on cards (S-M, 0.5-1 day)
 
-**High trust/debug value.** The rank pass already computes each candidate's
-nearest upvoted feedback story (`cand_closest_up`, reused via
-`RankScoreContext`). Populate `RankedStory.best_match_title` from that
-existing computation and render a compact, collapsible "Because you upvoted
-…" line plus existing provenance badges. Do **not** present a fabricated
-calibrated probability. Cheap — the data exists at rank time, no new
-full-pool similarity pass. Builds trust and makes bad recommendations
-diagnosable: when the deck goes weird, you'll see exactly which old upvote is
-dragging it. Natural follow-on: a "less like this" action that downweights
-that neighbor.
+**✅ Completed 2026-09-08 (`9a83ffd`).** `RankedStory.best_match_title` is
+populated from the already-computed KNN argmax (`cand_closest_up_idx`,
+no new matmul), gated by `ATTRIBUTION_MIN_SIM=0.35`, rendered as a
+"Because you upvoted …" line on cards.
 
-Test: cold users, deleted feedback stories, HTML escaping, no new similarity
-pass added.
+**Follow-on considered and rejected 2026-09-08:** a "less like this" action
+downweighting the attributed neighbor. Two designs were explored (a separate
+per-user mute table with its own button; then downvote-implicates-neighbor
+via a `feedback.attributed_neighbor_id` edge) and both scrapped — no second
+mechanism, downvote semantics unchanged. See WORKLOG.md.
 
 ### F3. Explore/exploit dial (S, ~1 day)
 
@@ -381,9 +371,14 @@ Test event idempotency and session/card association.
    2026-08-14. Result: B1 blocked (no true vote-creation timestamp), B2
    unmeasurable retroactively (constant `ranker_arm`), **B3 cleared**
    (dwell rank-AUC 0.771). See WORKLOG.md.
-8. **B3's consumer** (dwell as a `sample_weight` modifier), then
+8. ~~**B3's consumer** (dwell as a `sample_weight` modifier), then
    **REF-1 → REF-2 → REF-3**, then **F1-F3** by appetite. B1/B2 stay
-   blocked/deferred until their prerequisites above are addressed.
+   blocked/deferred until their prerequisites above are addressed.~~ —
+   rewritten 2026-09-08: F2 shipped early, F1 rejected outright. New order:
+   **F3 dial → B3 consumer → REF-1 → REF-2 → REF-3** by appetite. B1/B2 stay
+   blocked/deferred. Warm-latency options (bounded RBF shortlist, etc.) live
+   in ARCHITECTURE.md §3.5 as saved options, not roadmap items — warm is
+   ~4s steady-state, so they stay parked unless it regresses.
 
 ## Verification (applies to whichever items proceed)
 

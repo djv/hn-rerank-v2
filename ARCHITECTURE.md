@@ -101,9 +101,13 @@ $$\text{score} = \text{minmax01}(f_{\text{up}}(x))$$
 
 This avoids scikit-learn's deprecated and slower `SVC(probability=True)` calibration path. The dashboard still computes approximate probability-like fields by applying a softmax over the multi-class decision margins, but ranking itself is driven by the raw up-margin ordering. Because these softmax values are not calibrated probabilities, the UI does not show exact percentages; it uses them only for uncertainty entropy to select `🤔 Unsure` candidates. Card-left color is a smooth blue→red gradient driven by the card's rank position in the current render's sorted-by-score order (rank 1 = blue, rank N = red, evenly distributed), computed client-side from `data-score` values and applied to the border-left plus a 4% tinted background. Rank-percentile mapping (rather than linear-in-score) ensures visually distinguishable colors even when the score distribution clusters — the gradient travels with each card when the user sorts by date.
 
-**Current hyperparameters** (30-day default-user eval, 2026-06-28): `C=0.5`, `gamma=0.03`, `kernel=rbf`, `neutral_weight=0.0`, `positive_cluster_k=4`. Re-tuned on the 4-binary source feature set; the previous 2026-06-23 setting (`C=0.2, gamma=0.03, kernel=rbf`) was measured on the pre-4-binary-source feature set and is no longer optimal. A wide RBF sweep (49 (C, γ) combos) confirmed `C=0.5, gamma=0.03` sits in a broad plateau spanning `C∈{0.3-1.0}` × `γ∈{0.01-0.03}`, all within 1σ of each other. The plateau is also robust to a linear kernel fallback at the same hyperparams — linear at `C=0.1` gives 0.45 NDCG@40, RBF at the plateau gives 0.49-0.50, a +0.05 lift on the production 394-d feature set. The final-queue (post-13-discovery-passes) lift is even larger: linear 0.493 → RBF 0.596 = +0.10.
-
-The values above are the evaluated benchmark setting. The checked-in `config.toml` currently overrides `C` to `0.1` while retaining `gamma=0.03`; do not read the benchmark row as a statement of the live override.
+**Current hyperparameters** (30-pt re-eval on the live tree, 2026-09-08,
+`6c683cf`): `C=0.1`, `gamma=0.03`, `kernel=rbf`, `neutral_weight=0.0`,
+`positive_cluster_k=4`. The old `C=0.5` plateau (measured 2026-06-28 on the
+pre-4-binary-source feature set) is gone on current code — `C=0.5` is
+all-negative and `gamma=0.1` degenerate. `config.toml` pins `svm_c = 0.1`
+(the `Config` dataclass default is 0.2; do not read it as production).
+The final-queue (post-discovery-passes) lift is even larger: linear 0.493 → RBF 0.596 = +0.10.
 
 #### Exact Precomputed RBF Inference
 
@@ -217,7 +221,7 @@ is `not s.top_comments`), so a cache would have near-zero hit rate.
 
 The live dashboard path applies a **two-leg recent candidate cap** to bound the work the ranker does on each request. The recent candidate fetch is split:
 - **HN leg** (`source='hn'`): ordered by tier-1 gravity `score / age^1.8` (mirrors the cold-start blend in `_score_and_rank`), capped at `recent_candidate_hn_limit` (default 5000). This keeps the highest-scoring HN candidates in the pool.
-- **RSS leg** (`source != 'hn' AND NOT IN archive`): ordered by `time DESC` only. RSS sources carry no engagement score in the DB, so tier-1 is uninformative there; recency is the most honest SQL-only signal and preserves representation for the `is_non_hn` discovery pass. Capped at `recent_candidate_rss_limit` (default 500).
+- **RSS leg** (`source != 'hn' AND NOT IN archive`): ordered by `time DESC` only. RSS sources carry no engagement score in the DB, so tier-1 is uninformative there; recency is the most honest SQL-only signal and preserves representation for the `is_non_hn` discovery pass. Capped at `recent_candidate_rss_limit` (default 5000, same as the HN leg since 2026-08-30 — the old 500 cap starved the RSS pool and the oldest RSS row was 93h out).
 
 The archive leg (BQ/CH archive sources) is unchanged and capped at 4000. Total recent + archive rows scored per rank ≈ 6000 (down from ~10,400 for the heaviest user). On the heaviest user the warm rank path dropped from ~9.4s p50 to ~6.3s p50 (33% faster), driven mostly by `decision_function` running on 5,000 fewer rows. The `is_uncertain` discovery pass is orthogonal to the SQL ordering and may be slightly affected; impact was small in practice.
 
@@ -239,6 +243,12 @@ Discovery badges (uncertainty, novelty, talk-worthy, top, hot) are applied to an
 * **Uncertainty/Entropy Surfacing (🤔 Unsure)**: Shannon Entropy of the model's predicted probability distribution (Down, Neutral, Up). Per-combo pass (all 3 combos): up to `DISCOVERY_PER_BADGE=5` taken from the top-by-entropy in the post-cascade `explore_pool` (predicate: `r.prob_down is not None`). Requires the SVM to have fit (`n_up >= min_up_for_svm=20` AND `n_down >= min_down_for_svm=20`); with insufficient feedback, `prob_down is None` and the Unsure badge is absent. Can stack with Popular badges (Primary/Top/Talk/Hot) via OR into existing `final` entries.
 * **Novel (✨)**: Per-combo pass (all 3 combos): up to `DISCOVERY_PER_BADGE=5` taken from the top-by-`1 - max_sim` in `explore_pool`, excluding prior Explore picks. No score blend — "novel" means semantically distant from anything voted on, independent of model score. Entries are always appended (no stacking with existing `final` entries).
 * **Similar (🎯, extra-slot only)**: Per-combo pass (all 3 combos): up to `DISCOVERY_PER_BADGE=5` taken from the top-by-`cand_closest_up` in `explore_pool`, excluding prior Explore picks. Pass-only by design (the Similar badge signals "surfaced because of high semantic match"). Entries are always appended. The original "primary-vs-extra-slot" distinction is enforced by only running against `explore_pool` (excludes primary).
+
+**Attribution (F2, `9a83ffd`).** Cards carry a "Because you upvoted …" line
+populated from the already-computed KNN argmax (`cand_closest_up_idx` → the
+nearest upvoted feedback title, no new matmul), shown only when the max
+similarity clears `ATTRIBUTION_MIN_SIM=0.35`. A weak-match attribution is
+worse than none, so cold users and sub-threshold cards show nothing.
 * **Discussion-rich (💬 Talk-worthy)**: HN-only per-combo pass (cascade): up to `DISCOVERY_PER_BADGE=5` taken from the top-by-`comment_count` in `combo_pool`, excluding prior cascade+primary picks, with `comment_count > 0` guard. Mutually exclusive with Hot and Top within the cascade.
 * **High-engagement (🏆 Top)**: HN-only per-combo pass (cascade): up to `DISCOVERY_PER_BADGE=5` taken from the top-by-`story.score` in `combo_pool`, excluding prior cascade+primary picks. Mutually exclusive with Hot and Talk within the cascade.
 * **Hot (🔥)**: HN-only per-combo pass: up to `DISCOVERY_PER_BADGE=5` taken from the top-by engagement velocity (points/hour, p99.5 global), `HOT_MIN_SCORE=20` floor. Runs against the full `combo_pool`; primary-ranked high-velocity stories get the badge via OR into their existing `final` entry. HN-only by definition (velocity requires score history); archive never carries 🔥. Runs on both recent_hn and archive_hn combos.
@@ -579,29 +589,52 @@ LessWrong RSS stories (`rss_lesswrong_com`) follow the same lazy-enrichment patt
 
 ### 4.2 Prompt Construction
 
-The detailed summary endpoint `/api/tldr-detail` defaults to Groq `openai/gpt-oss-20b` using `GROQ_API_KEY`. GPT-OSS uses low reasoning effort and 600 extra completion tokens to leave room for visible summary text. Explicit `LLM_PROVIDER` / `LLM_MODEL` overrides remain supported; there is no automatic provider fallback.
+The detailed summary endpoint `/api/tldr-detail` runs on Mistral
+`mistral-small-latest` pay-as-you-go via `MISTRAL_API_KEY`
+(`LLM_PROVIDER=mistral` in `../shared/.env`). The provider table
+(`server.py:_LLM_PROVIDERS`) also defines groq (free fallback),
+gemini (fallback), cerebras/openrouter/zen (experiments), and gospark
+(Muse Spark via the Responses API — quality-validated in a 2026-09-08
+bakeoff but PARKED: 14-87s latency and reasoning-token burn kill tap
+use; see WORKLOG.md). There is no automatic provider fallback; switching
+is `LLM_PROVIDER=` + service restart. A Mistral 402 (the $10 spend cap)
+feeds the same cooldown path as a 429: limited retries, then stale-cache
+fallback with a countdown (see `test_flask_test_client_tldr_provider_error_degrades_gracefully`).
 
-The shared LLM limiter learns Groq’s minute token allowance from response headers and atomically reserves conservative prompt/output estimates before subsequent requests. It honors numeric `Retry-After` on 429 responses, rechecks cooldowns after waking, and defers requests requiring more than 30 seconds of waiting so long quota exhaustion does not strand HTTP handlers. This replaces blind short retries; it does not increase the provider’s quota. Failed, truncated, empty and partial summaries remain uncached, with existing cached summaries available as stale fallbacks.
+Spend visibility: every LLM call records input/output/reasoning tokens into
+the additive `llm_usage_daily(day, provider, ...)` table
+(`Database.record_llm_usage`, failure-swallowed so telemetry never breaks
+serving); each regen logs one `llm_spend_today` line per provider with a
+nominal mistral-small $ estimate (informational — the cap is enforced in
+the Mistral console, not here).
 
-It uses four different prompt paths depending on what content is available:
+The shared LLM limiter learns the minute token allowance from response headers and atomically reserves conservative prompt/output estimates before subsequent requests. It honors numeric `Retry-After` on 429 responses (capped at 120s per retry), rechecks cooldowns after waking, and defers requests requiring more than 30 seconds of waiting so long quota exhaustion does not strand HTTP handlers. This replaces blind short retries; it does not increase the provider's quota. Failed, truncated, empty and partial summaries remain uncached, with existing cached summaries available as stale fallbacks.
+
+It uses four different prompt paths depending on what content is available
+(`TLDR_PROMPT_VERSION = "detail-v6"`):
 
 | Input | Path | Output format |
 |---|---|---|
-| Article text + comments | **Dual** (two parallel LLM calls) | `### Article` (120w max, 2-3 bullets) + `### Discussion` (150w max, 2-4 bullets) |
-| Only comments | **Discussion-only** (one call) | `### Discussion` (150w max, 3-5 bullets) — no article section |
-| Only article text | **Article-only** (one call) | `### Article` (120w max, 3-5 bullets) — no discussion section |
+| Article text + comments | **Dual** (two parallel LLM calls, 450 tokens each) | `### Article` + `### Discussion`, budgets scaled by source length (see below) |
+| Only comments | **Discussion-only** (one call, 1000 tokens) | `### Discussion` — no article section |
+| Only article text | **Article-only** (one call, 1000 tokens) | `### Article` — no discussion section |
 | Neither | **Stub** (no LLM call) | `"No article body or discussion available to summarize for this story."` |
 
-The dual path sends two focused LLM requests in parallel: one article summary and one discussion summary. The discussion budget was raised from 100w to 150w to give richer comment threads more room. The discussion-only path uses the same discussion prompt as the dual path but omits the article call entirely, preventing fabrication of article content from the title alone.
+Section budgets scale with capped source length (`_section_budget`): <1.5K
+chars → 2-3 bullets max 75 words; <5K → 3-4 bullets max 125 words; else
+4-6 bullets max 200 words. Reasoning providers get headroom on top of the
+base caps (`_max_tokens_for_provider`: +1200 gospark, +600 groq/cerebras).
+Provider responses are dispatched on endpoint shape (`/responses` suffix →
+Responses API).
 
 Detailed TLDR output is cached in SQLite in `tldr_cache` after any dynamic HN comment fetch, Reddit RSS enrichment, or article-body scrape has completed. The cache is keyed by story ID plus a SHA-256 fingerprint of the prompt/model identity and prompt-truncated text inputs (`title`, `self_text`, `top_comments`, and `article_body`). Wall-clock age and engagement metadata are intentionally excluded so cached TLDRs remain reusable as time passes and scores change; refreshed comments, article bodies, or prompt/model versions naturally miss the cache. The request path checks the stored-field cache key before quota/enrichment, then checks the enriched cache key after any successful dynamic context fetch. Only the newest cache entry for a story is retained.
 
 The prompts are built from structured sections of the raw story fields (passed separately, not pre-composed):
 
 - Title
-- Author's text (`self_text`, up to 8K chars)
-- Article body (up to 15K chars)
-- Discussion comments (`top_comments`, up to 12K chars; currently stored up to 10K chars)
+- Author's text (`self_text`, up to 16K chars)
+- Article body (up to 30K chars)
+- Discussion comments (`top_comments`, up to 24K chars; stored up to 10K chars for Reddit)
 
 Each section is only included if non-empty, giving the LLM clearly separated content. Engagement metadata is not included in the prompt, so score/comment-count churn does not force TLDR regeneration. Previously the prompt used a single 30K-char blob of pre-composed `text_content` — this caused the article body to appear twice (once raw, once truncated inside the composed blob). The structured approach avoids duplication and lets the LLM distinguish article content from discussion.
 
