@@ -2842,6 +2842,87 @@ def test_flask_test_client_tldr_stale_fallback_on_quota_denied(
     }
 
 
+@pytest.mark.parametrize("error_status", [429, 402])
+def test_flask_test_client_tldr_provider_error_degrades_gracefully(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch, error_status: int
+) -> None:
+    """Pin the tap path when the LLM provider refuses (rate limit or billing
+    cap, e.g. a capped Mistral key returning 429 or 402): a stale-cached TLDR
+    must be served either way; with nothing cached, 429 degrades to the
+    cooldown countdown while a non-429 billing refusal surfaces as a generic
+    503. Characterization only -- if the live cap produces a different status
+    shape, this test names the gap instead of silently passing."""
+    import server
+
+    _, db, _, handler, user = test_env
+    handler.config = replace(
+        handler.config,
+        tldr_uncached_per_user_limit=100,
+        tldr_uncached_per_user_window_seconds=3600,
+        tldr_uncached_global_limit=100,
+    )
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+    for story_id in (1722, 1723):
+        db.upsert_story(
+            Story(
+                id=story_id,
+                title=f"Provider-error story {story_id}",
+                url=f"https://example.com/provider-error-{story_id}",
+                score=10,
+                time=1600000000,
+                text_content="Story body.",
+                source="hn",
+                comment_count=0,
+                self_text="",
+                top_comments="",
+                article_body="",
+            )
+        )
+    stale_key = server._tldr_cache_key(
+        title="Provider-error story 1723",
+        self_text="",
+        top_comments="",
+        article_body="Body before enrichment.",
+    )
+    db.upsert_tldr_cache(1723, stale_key, "Stale summary survives provider outage")
+    # Current key differs from the stale one so the request misses cache.
+    db.upsert_story(
+        replace(
+            db.get_story(1723),
+            article_body="Body enriched after TLDR was cached.",
+        )
+    )
+
+    async def mock_generate_detailed_tldr(
+        title: str, self_text: str, top_comments: str, article_body: str
+    ) -> "server.TldrResult":
+        return server.TldrResult(
+            kind="llm_error",
+            error_status=error_status,
+            error_text=f"mocked provider HTTP {error_status}",
+        )
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    fresh = client.post("/api/tldr-detail", json={"story_id": 1722})
+    stale = client.post("/api/tldr-detail", json={"story_id": 1723})
+
+    assert stale.status_code == 200
+    assert stale.get_json() == {
+        "ok": True,
+        "tldr": "Stale summary survives provider outage",
+        "cached": True,
+        "stale": True,
+    }
+    if error_status == 429:
+        assert fresh.status_code == 429
+        assert "cooling down" in fresh.get_json()["error"]
+    else:
+        assert fresh.status_code == 503
+        assert "error" in fresh.get_json()
+
+
 @pytest.mark.parametrize("cacheable", [True, False])
 async def test_prefetch_tldrs_for_ranked_regenerates_stale_beyond_top_combo(
     test_env: Any, monkeypatch: pytest.MonkeyPatch, cacheable: bool
