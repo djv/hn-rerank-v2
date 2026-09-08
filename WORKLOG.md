@@ -11,6 +11,20 @@
   waits for one measured cycle.
 - Verified: 721 passed, ruff + format + ty clean, restart live.
 
+## 2026-09-08 — contention verdict: CPU, not pool; prewarm batching eyed
+
+- Synthetic repro (bulk upserts alone): 16k upserts during warms,
+  `pool_slow_waits` stayed 0, stages unmoved — per-op checkouts never
+  exhaust 5 conns, WAL readers don't block. Pool hypothesis dead.
+- With a concurrent ONNX encode stream (faithful prewarm mimic):
+  warm 12.8s -> 18.8s, every compute stage inflated 1.5-4x
+  (feature-prep 2.5s -> 4.9s, dedup 0.7s -> 3.1s), pool waits still 0.
+  4 vCPUs: regen prewarm encodes + warm numpy/SVM simply oversubscribe.
+- Side observation: prewarm encodes at batch_size=1 (17 texts/7.8s in
+  today's regen log) — real batching would shrink the contention window
+  ~5-10x, but peak RSS is already 1.75GB on a 7GB box, so batch width is
+  a memory-risk change, not a free one. Left for an explicit decision.
+
 ## 2026-09-08 — dedup tail: algorithm innocent, contention convicted
 
 - `dedup_ms` p50 0.66s / p95 2.6s / max 12.5s. Tried a blocked-BLAS
