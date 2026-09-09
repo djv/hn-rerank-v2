@@ -12,10 +12,11 @@ from typing import Any, TypeVar
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ch_client import (
+    ChItem,
     clear_cache as _clear_ch_cache,
     query_stories_with_comments as _ch_query_stories_with_comments,
 )
-from database import Database, Story
+from database import Database, Story, coerce_int
 from pipeline import (
     BQ_ARCHIVE_SOURCE,
     Embedder,
@@ -69,19 +70,10 @@ def _write_dryrun(
     logging.info("Dry-run wrote %s rows to %s", len(rows), output_path)
 
 
-def _coerce_int(value: Any, default: int = 0) -> int:
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
 def story_from_bq_row(
     row: dict[str, Any], *, source: str = BQ_ARCHIVE_SOURCE
 ) -> Story | None:
-    sid = _coerce_int(row.get("id"))
+    sid = coerce_int(row.get("id"))
     title = clean_text(str(row.get("title") or ""))
     if sid <= 0 or not title:
         return None
@@ -95,11 +87,11 @@ def story_from_bq_row(
         id=sid,
         title=title,
         url=row.get("url") or None,
-        score=_coerce_int(row.get("score")),
-        time=_coerce_int(row.get("created_at_i")),
+        score=coerce_int(row.get("score")),
+        time=coerce_int(row.get("created_at_i")),
         text_content=text_content,
         source=source,
-        comment_count=_coerce_int(row.get("descendants")),
+        comment_count=coerce_int(row.get("descendants")),
         discussion_url=f"https://news.ycombinator.com/item?id={sid}",
         comment_count_at_fetch=0,
         self_text=self_text,
@@ -108,9 +100,9 @@ def story_from_bq_row(
     )
 
 
-def _apply_ch_comments_to_story(story: Story, item: dict[str, Any]) -> Story:
+def _apply_ch_comments_to_story(story: Story, item: ChItem) -> Story:
     """Apply the comments + score from a CH item dict to a skeleton Story."""
-    comment_count = _coerce_int(item.get("num_comments"), story.comment_count or 0)
+    comment_count = coerce_int(item.get("num_comments"), story.comment_count or 0)
     children = item.get("children") or []
     all_comments = _extract_comments_recursive(children)
     selected = _select_top_comments(all_comments)
@@ -142,6 +134,36 @@ def _apply_ch_comments_to_story(story: Story, item: dict[str, Any]) -> Story:
 def feedback_story_ids(db: Database) -> set[int]:
     rows = db.execute("SELECT DISTINCT story_id FROM feedback")
     return {int(row[0]) for row in rows}
+
+
+STORY_COLS = (
+    "id, title, url, score, time, text_content, source, "
+    "comment_count, discussion_url, comment_count_at_fetch, "
+    "self_text, top_comments, article_body"
+)
+
+
+def rows_to_stories(rows: list[tuple]) -> list[Story]:
+    out: list[Story] = []
+    for r in rows:
+        out.append(
+            Story(
+                id=int(r[0]),
+                title=str(r[1] or ""),
+                url=str(r[2]) if r[2] else None,
+                score=int(r[3] or 0),
+                time=int(r[4] or 0),
+                text_content=str(r[5] or ""),
+                source=str(r[6] or ""),
+                comment_count=int(r[7] or 0),
+                discussion_url=str(r[8] or ""),
+                comment_count_at_fetch=int(r[9] or 0),
+                self_text=str(r[10] or ""),
+                top_comments=str(r[11] or ""),
+                article_body=str(r[12] or ""),
+            )
+        )
+    return out
 
 
 T = TypeVar("T")
@@ -198,9 +220,7 @@ async def seed_rows(
             continue
         existing = existing_by_id.get(story.id)
         if existing is None:
-            target_source = (
-                "hn" if reconcile and story.time >= live_cutoff else source
-            )
+            target_source = "hn" if reconcile and story.time >= live_cutoff else source
             new_story = replace(story, source=target_source)
             to_upsert.append(new_story)
             needs_hydration.append(new_story)
@@ -255,9 +275,7 @@ async def seed_rows(
             finally:
                 _clear_ch_cache()
 
-        final_stories = [
-            hydrated_by_id.get(story.id, story) for story in story_batch
-        ]
+        final_stories = [hydrated_by_id.get(story.id, story) for story in story_batch]
         for story in final_stories:
             db.upsert_story(story)
 

@@ -6,7 +6,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal, Generator, NamedTuple, TypeAlias
+from typing import Any, Literal, Generator, NamedTuple, TypeAlias
 from contextlib import contextmanager
 import queue
 import numpy as np
@@ -19,6 +19,17 @@ InteractionEventType: TypeAlias = Literal[
     "impression", "article_open", "comments_open", "dwell"
 ]
 STRICT_SCHEMA_VERSION = 2
+
+
+def coerce_int(value: Any, default: int = 0) -> int:
+    """Lenient int() for external payloads (CH rows, Algolia items, seed
+    JSONL): None/unparseable collapse to `default` instead of raising."""
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 @dataclass(frozen=True)
@@ -637,7 +648,7 @@ class Database:
                 )
 
     @staticmethod
-    def _row_to_story(row: tuple) -> Story:
+    def _row_to_story(row: tuple[Any, ...]) -> Story:
         return Story(
             id=row[0],
             title=row[1],
@@ -702,7 +713,7 @@ class Database:
 
     # HN explicit duplicate canonicalization cache
     @staticmethod
-    def _row_to_hn_dupe_resolution(row: tuple) -> HnDupeResolution:
+    def _row_to_hn_dupe_resolution(row: tuple[Any, ...]) -> HnDupeResolution:
         return HnDupeResolution(
             source_story_id=int(row[0]),
             canonical_story_id=row[1],
@@ -1160,7 +1171,7 @@ class Database:
                 vote_times.append(updated_at)
             return stories, labels, vote_times
 
-    def execute(self, sql: str, params: tuple = ()) -> list[tuple]:
+    def execute(self, sql: str, params: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
         with self.conn() as conn:
             with conn:
                 cursor = conn.execute(sql, params)
@@ -1345,7 +1356,7 @@ class Database:
                 )
 
     # Article fetch failure memory
-    def get_article_fetch_failure(self, story_id: int) -> dict | None:
+    def get_article_fetch_failure(self, story_id: int) -> dict[str, Any] | None:
         with self.conn() as conn:
             row = conn.execute(
                 """

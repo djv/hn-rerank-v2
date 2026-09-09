@@ -16,38 +16,9 @@ from pipeline import (
     _urllib_fetch,
 )
 from server import _extract_article_body
+from scripts._seed_common import STORY_COLS as _COLS, rows_to_stories
 
 ARTICLE_BODY_CHAR_LIMIT = 15_000
-
-
-def rows_to_stories(rows: list[tuple]) -> list[Story]:
-    out: list[Story] = []
-    for r in rows:
-        out.append(
-            Story(
-                id=int(r[0]),
-                title=str(r[1] or ""),
-                url=str(r[2]) if r[2] else None,
-                score=int(r[3] or 0),
-                time=int(r[4] or 0),
-                text_content=str(r[5] or ""),
-                source=str(r[6] or ""),
-                comment_count=int(r[7] or 0),
-                discussion_url=str(r[8] or ""),
-                comment_count_at_fetch=int(r[9] or 0),
-                self_text=str(r[10] or ""),
-                top_comments=str(r[11] or ""),
-                article_body=str(r[12] or ""),
-            )
-        )
-    return out
-
-
-_COLS = (
-    "id, title, url, score, time, text_content, source, "
-    "comment_count, discussion_url, comment_count_at_fetch, "
-    "self_text, top_comments, article_body"
-)
 
 
 async def main() -> None:

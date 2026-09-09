@@ -46,10 +46,12 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any
+from typing import Any, TypedDict
 
 from cachetools import TLRUCache
 import httpx
+
+from database import coerce_int
 
 
 CH_PLAYGROUND_URL = "https://play.clickhouse.com/?user=play&default_format=JSON"
@@ -72,12 +74,12 @@ _cache: TLRUCache[tuple[Any, ...], Any] = TLRUCache(
 _cache_lock = threading.Lock()
 
 
-def _cache_get(key: tuple) -> Any | None:
+def _cache_get(key: tuple[Any, ...]) -> Any | None:
     with _cache_lock:
         return _cache.get(key)
 
 
-def _cache_put(key: tuple, value: Any) -> None:
+def _cache_put(key: tuple[Any, ...], value: Any) -> None:
     with _cache_lock:
         _cache[key] = value
 
@@ -126,41 +128,53 @@ def _post_ch(query: str) -> list[dict[str, Any]]:
     raise ValueError("ClickHouse returned an unexpected JSON payload shape")
 
 
-def _to_int(value: Any, default: int = 0) -> int:
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
+class ChItem(TypedDict):
+    """Algolia-items-shaped story/comment dict built from a CH row.
+
+    The single typed model for the CH boundary: producers
+    (``_build_story_dict``/``_build_comment_dict``) construct it, consumers
+    (``pipeline/enrichment.py``) read it. Raw ``_post_ch`` rows stay
+    ``dict[str, Any]`` — that's the JSON edge.
+    """
+
+    id: int
+    type: str
+    title: str
+    url: str | None
+    points: int
+    num_comments: int
+    created_at_i: int
+    story_text: str
+    text: str
+    children: list[ChItem]
 
 
-def _build_story_dict(row: dict[str, Any]) -> dict[str, Any]:
+def _build_story_dict(row: dict[str, Any]) -> ChItem:
     """Map a CH story row to the Algolia items shape."""
     return {
-        "id": _to_int(row.get("id")),
+        "id": coerce_int(row.get("id")),
         "type": "story",
         "title": row.get("title") or "",
         "url": row.get("url") or None,
-        "points": _to_int(row.get("score")),
-        "num_comments": _to_int(row.get("descendants")),
-        "created_at_i": _to_int(row.get("ts")),
+        "points": coerce_int(row.get("score")),
+        "num_comments": coerce_int(row.get("descendants")),
+        "created_at_i": coerce_int(row.get("ts")),
         "story_text": row.get("text") or "",
         "text": row.get("text") or "",
         "children": [],  # populated by query_stories_with_comments
     }
 
 
-def _build_comment_dict(row: dict[str, Any]) -> dict[str, Any]:
+def _build_comment_dict(row: dict[str, Any]) -> ChItem:
     """Map a CH comment row to the Algolia items shape (recursive children)."""
     return {
-        "id": _to_int(row.get("id")),
+        "id": coerce_int(row.get("id")),
         "type": "comment",
         "title": "",
         "url": None,
         "points": 0,
         "num_comments": 0,
-        "created_at_i": _to_int(row.get("ts")),
+        "created_at_i": coerce_int(row.get("ts")),
         "story_text": "",
         "text": row.get("text") or "",
         "children": [],  # populated by query_stories_with_comments
@@ -191,7 +205,7 @@ def query_live_window(
     days: int = 30,
     min_score: int = 5,
     limit: int = 5000,
-) -> list[dict[str, Any]]:
+) -> list[ChItem]:
     """Return list of recent high-score story metadata dicts (no comments)."""
     if days <= 0:
         raise ValueError("days must be a positive integer")
@@ -220,15 +234,15 @@ WHERE id IN ({ids_csv})
 """
 
 
-def query_stories_bulk(story_ids: list[int]) -> dict[int, dict[str, Any]]:
+def query_stories_bulk(story_ids: list[int]) -> dict[int, ChItem]:
     """Return {story_id: full story dict} for the given IDs. No comments."""
     if not story_ids:
         return {}
     rows = _post_ch(_build_stories_bulk_query(story_ids))
-    out: dict[int, dict[str, Any]] = {}
+    out: dict[int, ChItem] = {}
     for row in rows:
         if row.get("type") == "story":
-            out[_to_int(row.get("id"))] = _build_story_dict(row)
+            out[coerce_int(row.get("id"))] = _build_story_dict(row)
     return out
 
 
@@ -287,7 +301,7 @@ GROUP BY id
 def query_comments_bulk(
     story_ids: list[int],
     max_levels: int = 5,
-) -> dict[int, list[dict[str, Any]]]:
+) -> dict[int, list[ChItem]]:
     """Return {story_id: [comment_dict, ...]} for the given stories.
 
     Walks the `kids` arrays breadth-first, one cheap `id IN (...)` query per
@@ -301,16 +315,16 @@ def query_comments_bulk(
     if max_levels < 1:
         raise ValueError("max_levels must be >= 1")
 
-    by_story: dict[int, list[dict[str, Any]]] = {sid: [] for sid in story_ids}
+    by_story: dict[int, list[ChItem]] = {sid: [] for sid in story_ids}
 
     # frontier maps comment_id -> owning root story_id, for the level about
     # to be fetched.
     frontier: dict[int, int] = {}
     for chunk in _chunked(list(story_ids)):
         for row in _post_ch(_build_story_kids_query(chunk)):
-            sid = _to_int(row.get("id"))
+            sid = coerce_int(row.get("id"))
             for kid in row.get("kids") or []:
-                frontier[_to_int(kid)] = sid
+                frontier[coerce_int(kid)] = sid
 
     level = 0
     while frontier and level < max_levels:
@@ -318,14 +332,14 @@ def query_comments_bulk(
         next_frontier: dict[int, int] = {}
         for chunk in _chunked(ids):
             for row in _post_ch(_build_comment_level_query(chunk)):
-                cid = _to_int(row.get("id"))
+                cid = coerce_int(row.get("id"))
                 sid = frontier.get(cid)
                 if sid is None:
                     continue
                 if sid in by_story:
                     by_story[sid].append(_build_comment_dict(row))
                 for kid in row.get("kids") or []:
-                    next_frontier[_to_int(kid)] = sid
+                    next_frontier[coerce_int(kid)] = sid
         frontier = next_frontier
         level += 1
 
@@ -345,7 +359,7 @@ WHERE id = {int(story_id)}
 def query_stories_with_comments(
     story_ids: list[int],
     max_levels: int = 5,
-) -> dict[int, dict[str, Any]]:
+) -> dict[int, ChItem]:
     """Return {story_id: item dict with children} for the given stories.
 
     Combines query_stories_bulk + query_comments_bulk. Single network
@@ -371,7 +385,7 @@ def query_stories_with_comments(
     return stories
 
 
-def query_single_story(story_id: int, max_levels: int = 5) -> dict[str, Any] | None:
+def query_single_story(story_id: int, max_levels: int = 5) -> ChItem | None:
     """Return a single story's item dict, or None if not found.
 
     Cache TTL: 15 min (single-story fetches are rare; only used as lazy

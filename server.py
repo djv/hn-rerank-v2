@@ -16,7 +16,7 @@ import time
 import math
 import uuid
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass, replace
 from http import HTTPStatus
 from pathlib import Path
@@ -27,6 +27,7 @@ import feedparser
 import justext
 import trafilatura
 from bs4 import BeautifulSoup
+from bs4.element import Tag
 from flask import Flask, Response, jsonify, redirect, request
 from flask.typing import ResponseReturnValue
 import httpx
@@ -263,7 +264,7 @@ def _extract_with_bs_semantic(html: str) -> str | None:
     for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
         tag.decompose()
 
-    candidates: list = []
+    candidates: list[Tag] = []
 
     # Prefer unclassed <article> (main content on e.g. The Register)
     for art in soup.find_all("article"):
@@ -688,7 +689,7 @@ def _go_session_id() -> str:
     return f"hn-rewrite-tldr-{time.strftime('%Y%m%d')}"
 
 
-def _responses_text(data: dict) -> str:
+def _responses_text(data: dict[str, Any]) -> str:
     """Extract concatenated output_text from a Responses API payload."""
     parts: list[str] = []
     output = data.get("output")
@@ -1991,29 +1992,38 @@ def _flask_client_ip() -> str:
     return request.remote_addr or "127.0.0.1"
 
 
+def _acquire_quota(
+    runtime: type[Handler], buckets: tuple[tuple[str, int, int], ...]
+) -> RateLimitResult:
+    """Single funnel for the per-endpoint quota helpers below."""
+    return runtime._public_demo_limiter.try_acquire(buckets)
+
+
 def _acquire_session_create_quota(runtime: type[Handler]) -> RateLimitResult:
     config = runtime.config
-    return runtime._public_demo_limiter.try_acquire(
+    return _acquire_quota(
+        runtime,
         (
             (
                 f"session-create:ip:{_flask_client_ip()}",
                 config.session_create_per_ip_limit,
                 config.session_create_per_ip_window_seconds,
             ),
-        )
+        ),
     )
 
 
 def _acquire_profile_link_quota(runtime: type[Handler]) -> RateLimitResult:
     config = runtime.config
-    return runtime._public_demo_limiter.try_acquire(
+    return _acquire_quota(
+        runtime,
         (
             (
                 f"profile-link:ip:{_flask_client_ip()}",
                 config.profile_link_per_ip_limit,
                 config.profile_link_per_ip_window_seconds,
             ),
-        )
+        ),
     )
 
 
@@ -2076,7 +2086,8 @@ def _flask_rate_limit_response(message: str, retry_after_seconds: int) -> Respon
 
 def _acquire_feedback_quota(runtime: type[Handler], user: User) -> RateLimitResult:
     config = runtime.config
-    return runtime._public_demo_limiter.try_acquire(
+    return _acquire_quota(
+        runtime,
         (
             (
                 f"feedback:user:{user.id}",
@@ -2088,14 +2099,15 @@ def _acquire_feedback_quota(runtime: type[Handler], user: User) -> RateLimitResu
                 config.feedback_global_limit,
                 config.feedback_global_window_seconds,
             ),
-        )
+        ),
     )
 
 
 def _acquire_interaction_event_quota(
     runtime: type[Handler], user: User
 ) -> RateLimitResult:
-    return runtime._public_demo_limiter.try_acquire(
+    return _acquire_quota(
+        runtime,
         (
             (
                 f"events:user:{user.id}",
@@ -2107,7 +2119,7 @@ def _acquire_interaction_event_quota(
                 INTERACTION_EVENT_GLOBAL_REQUESTS_PER_MINUTE,
                 60,
             ),
-        )
+        ),
     )
 
 
@@ -2122,7 +2134,8 @@ def _acquire_tldr_uncached_quota(
 ) -> RateLimitResult:
     session_key = _flask_session_limit_key(user)
     config = runtime.config
-    return runtime._public_demo_limiter.try_acquire(
+    return _acquire_quota(
+        runtime,
         (
             (
                 f"tldr:user:{session_key}",
@@ -2134,7 +2147,7 @@ def _acquire_tldr_uncached_quota(
                 config.tldr_uncached_global_limit,
                 config.tldr_uncached_global_window_seconds,
             ),
-        )
+        ),
     )
 
 
@@ -2587,7 +2600,7 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
                     client, story_id, runtime.db, force=needs_active_refresh
                 )
 
-        async def _src_lane() -> Any | None:
+        async def _src_lane() -> RedditRssContext | LessWrongContext | None:
             if src_kind == "reddit":
                 assert story.url is not None
                 return await _fetch_reddit_rss_context(story.url)
@@ -2600,8 +2613,25 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             assert story.url is not None
             return await _fetch_article_body_with_result(story.url)
 
-        async def _gather_hydration() -> tuple[Any, Any, Any, dict[str, float]]:
-            tasks: dict[str, Any] = {}
+        # Lane results by name; values are the lane return or the caught
+        # Exception (lanes fail independently — see _timed).
+        HydrationOut = dict[
+            str,
+            Story
+            | RedditRssContext
+            | LessWrongContext
+            | ArticleFetchResult
+            | Exception
+            | None,
+        ]
+
+        async def _gather_hydration() -> tuple[
+            Story | Exception | None,
+            RedditRssContext | LessWrongContext | Exception | None,
+            ArticleFetchResult | Exception | None,
+            dict[str, float],
+        ]:
+            tasks: dict[str, Coroutine[Any, Any, object]] = {}
             if hn_needed:
                 tasks["hn"] = _hn_lane()
             if src_kind is not None:
@@ -2622,17 +2652,27 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             gathered = await asyncio.gather(
                 *(_timed(name, coro) for name, coro in tasks.items())
             )
-            out: dict[str, Any] = {}
+            out: HydrationOut = {}
             timings: dict[str, float] = {}
             for name, value, ms in gathered:
                 out[name] = value
                 timings[name] = ms
-            return out.get("hn"), out.get("src"), out.get("article"), timings
+            # dict.get can't narrow per-key: each lane only ever stores its
+            # own result type (see tasks above), so these casts are safe.
+            return (
+                cast("Story | Exception | None", out.get("hn")),
+                cast(
+                    "RedditRssContext | LessWrongContext | Exception | None",
+                    out.get("src"),
+                ),
+                cast("ArticleFetchResult | Exception | None", out.get("article")),
+                timings,
+            )
 
         t_hydrate = time.perf_counter()
-        hn_updated: Story | None = None
-        remote_context: Any | None = None
-        article_result: ArticleFetchResult | None = None
+        hn_updated: Story | Exception | None = None
+        remote_context: RedditRssContext | LessWrongContext | Exception | None = None
+        article_result: ArticleFetchResult | Exception | None = None
         if hn_needed or src_kind is not None or article_eligible:
             try:
                 hn_updated, remote_context, article_result, _timings = asyncio.run(

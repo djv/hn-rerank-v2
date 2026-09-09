@@ -9,37 +9,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from database import Database, Story
 from pipeline import CH_ARCHIVE_SOURCE, Config, Embedder, get_or_compute_embeddings
-from scripts._seed_common import _apply_ch_comments_to_story
-from ch_client import query_stories_with_comments
-
-STORY_COLS = (
-    "id, title, url, score, time, text_content, source, "
-    "comment_count, discussion_url, comment_count_at_fetch, "
-    "self_text, top_comments, article_body"
+from scripts._seed_common import (
+    STORY_COLS,
+    _apply_ch_comments_to_story,
+    rows_to_stories,
 )
-
-
-def rows_to_stories(rows: list[tuple]) -> list[Story]:
-    out: list[Story] = []
-    for r in rows:
-        out.append(
-            Story(
-                id=int(r[0]),
-                title=str(r[1] or ""),
-                url=str(r[2]) if r[2] else None,
-                score=int(r[3] or 0),
-                time=int(r[4] or 0),
-                text_content=str(r[5] or ""),
-                source=str(r[6] or ""),
-                comment_count=int(r[7] or 0),
-                discussion_url=str(r[8] or ""),
-                comment_count_at_fetch=int(r[9] or 0),
-                self_text=str(r[10] or ""),
-                top_comments=str(r[11] or ""),
-                article_body=str(r[12] or ""),
-            )
-        )
-    return out
+from ch_client import query_stories_with_comments
 
 
 def get_skeleton_stories(db: Database, source: str) -> list[Story]:

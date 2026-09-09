@@ -8,14 +8,17 @@ import re
 import threading
 import time
 from dataclasses import replace
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Protocol
 from urllib.error import URLError
 from urllib.parse import urlparse
 
 import feedparser
 import httpx
 
-from database import Database, Story
+from database import Database, Story, coerce_int
+
+if TYPE_CHECKING:
+    from ch_client import ChItem
 from reddit_fetch_queue import CoroFactory
 from reddit_feed_cache import cache as reddit_feed_cache
 from reddit_limiter import limiter as reddit_limiter
@@ -38,16 +41,7 @@ REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dash
 RSS_SELF_TEXT_CHAR_LIMIT = 8_000
 
 
-def _coerce_int(value, default: int = 0) -> int:
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _ch_story_item_to_story(item: dict) -> Story | None:
+def _ch_story_item_to_story(item: ChItem) -> Story | None:
     """Convert a CH live-window item dict (Algolia shape) to a Story row.
 
     The CH live_window query returns the same fields as Algolia items
@@ -55,7 +49,7 @@ def _ch_story_item_to_story(item: dict) -> Story | None:
     children). For live `hn` source, we insert directly with the CH
     data; comment hydration is handled later by the bulk prewarm path.
     """
-    sid = _coerce_int(item.get("id"))
+    sid = coerce_int(item.get("id"))
     title = clean_text(str(item.get("title") or ""))
     if sid <= 0 or not title:
         return None
@@ -67,13 +61,13 @@ def _ch_story_item_to_story(item: dict) -> Story | None:
         id=sid,
         title=title,
         url=item.get("url") or None,
-        score=_coerce_int(item.get("points")),
-        time=_coerce_int(item.get("created_at_i")),
+        score=coerce_int(item.get("points")),
+        time=coerce_int(item.get("created_at_i")),
         text_content=text_content,
         source="hn",
-        comment_count=_coerce_int(item.get("num_comments")),
+        comment_count=coerce_int(item.get("num_comments")),
         discussion_url=f"https://news.ycombinator.com/item?id={sid}",
-        comment_count_at_fetch=_coerce_int(item.get("num_comments")),
+        comment_count_at_fetch=coerce_int(item.get("num_comments")),
         self_text=self_text,
         top_comments="",
         article_body="",
@@ -236,7 +230,7 @@ def prewarm_top_stories(
 
     # Chunk the CH fetch: one chunk failing (network blip, CH overload)
     # should cost that chunk, not the entire prewarm run.
-    ch_items: dict[int, dict[str, Any]] = {}
+    ch_items: dict[int, ChItem] = {}
     for i in range(0, len(target_ids), _PREWARM_CHUNK_SIZE):
         chunk = target_ids[i : i + _PREWARM_CHUNK_SIZE]
         try:
@@ -264,7 +258,7 @@ def prewarm_top_stories(
         top_comments = " ".join(c["text"] for c in selected)[:10000]
         if not top_comments:
             continue
-        comment_count = _coerce_int(
+        comment_count = coerce_int(
             item.get("num_comments"), existing.comment_count or 0
         )
         new_text_content = compose_story_text(
