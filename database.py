@@ -1171,6 +1171,34 @@ class Database:
                 vote_times.append(updated_at)
             return stories, labels, vote_times
 
+    def get_capped_dwell_by_story(
+        self,
+        user_id: int,
+        cap_ms: int = 120_000,
+        before_ts: float | None = None,
+    ) -> dict[int, float]:
+        """Per-story capped dwell sums for sample_weight experiments (B3).
+
+        Mirrors scripts/ledger_report.py aggregation: each dwell event
+        contributes min(max(duration_ms, 0), cap_ms). before_ts bounds
+        occurred_at for leak-free temporal eval; serving omits it.
+        """
+        query = """
+            SELECT story_id, SUM(MIN(MAX(COALESCE(duration_ms, 0), 0), ?))
+            FROM interaction_events
+            WHERE user_id = ? AND event_type = 'dwell'
+        """
+        params: list[float | int] = [cap_ms, user_id]
+        if before_ts is not None:
+            query += " AND occurred_at <= ?"
+            params.append(before_ts)
+        query += " GROUP BY story_id"
+        with self.conn() as conn:
+            return {
+                int(story_id): float(total)
+                for story_id, total in conn.execute(query, params).fetchall()
+            }
+
     def execute(self, sql: str, params: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
         with self.conn() as conn:
             with conn:

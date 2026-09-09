@@ -376,7 +376,13 @@ Test event idempotency and session/card association.
    blocked/deferred until their prerequisites above are addressed.~~ —
    rewritten 2026-09-08: F2 shipped early, F1 rejected outright. New order:
    **F3 dial → B3 consumer → REF-1 → REF-2 → REF-3** by appetite. B1/B2 stay
-   blocked/deferred. Warm-latency options (bounded RBF shortlist, etc.) live
+   blocked/deferred. — updated 2026-09-09: **B3 consumer KILLED by eval**
+   (`margin3_dwell` vs production on latest-20% window, 5 temporal folds:
+   NDCG@40 −0.005±0.059, MAP +0.003±0.025, median rank +6; strictly worse
+   than plain `margin3_up` on every headline metric; leak check clean so
+   the null is trustworthy). Univariate dwell AUC ≠ ranking lift — dwell
+   tracks exposure, upweighting it flattens the margin. New order:
+   **F3 dial → REF-1 → REF-2 → REF-3** by appetite. Warm-latency options (bounded RBF shortlist, etc.) live
    in ARCHITECTURE.md §3.5 as saved options, not roadmap items — warm is
    ~4s steady-state, so they stay parked unless it regresses.
 

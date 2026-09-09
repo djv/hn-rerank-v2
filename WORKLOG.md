@@ -1,5 +1,24 @@
 # Worklog: hn-rewrite
 
+## 2026-09-09 — B3 consumer KILLED by eval (negative result)
+
+- Built the consumer test exactly as roadmapped: `get_capped_dwell_by_story`
+  (database.py, mirrors ledger_report aggregation, optional occurred_at
+  cutoff) + `margin3_dwell` eval variant (balanced weights ×
+  1+dwell/cap, dwell cut at fold training cutoff — no post-cutoff leakage).
+- `eval_ranker_variants.py --variants production,margin3_up,margin3_dwell
+  --leak-check --confirmation`, 5 temporal folds, latest-20% window
+  (4829 valid feedback: 1518 down / 1697 neutral / 1614 up):
+  dwell vs production NDCG@40 −0.005±0.059, MAP +0.003±0.025, median
+  +6 — all noise; strictly worse than plain margin3_up (NDCG@40 +0.001,
+  MAP +0.017, median −63) on every headline metric.
+- Leak check collapses (shuffled NDCG@40 ≈ 0.01-0.02 vs 0.23), so the
+  null is trustworthy, not a harness artifact.
+- Lesson: univariate dwell AUC 0.771 ≠ ranking lift. Dwell tracks
+  exposure (top cards get stared at); upweighting high-dwell flattens
+  the SVM margin. No prod flag built, no serving change. DAO + variant
+  kept as the executable record.
+
 ## 2026-09-09 — TLDR tone C + thin-article routing (v6->v7)
 
 - A/B on mistral-small (3 stories x A/B/C, frozen inputs, /tmp harness,

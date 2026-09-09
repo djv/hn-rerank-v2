@@ -237,6 +237,71 @@ def test_interaction_events_skip_unknown_story_per_event(db: Database) -> None:
         ]
 
 
+def test_capped_dwell_by_story_sums_caps_and_cuts_at_before_ts(
+    db: Database,
+) -> None:
+    """B3 sample_weight source: per-story dwell sums with per-event cap
+    and an occurred_at cutoff for leak-free temporal eval."""
+    for sid in (601, 602):
+        db.upsert_story(
+            Story(
+                id=sid, title="Dwell story", url=None, score=1, time=1, text_content="x"
+            )
+        )
+
+    def dwell(event_id: str, story_id: int, duration_ms: int, occurred_at: float):
+        return InteractionEvent(
+            event_id=event_id,
+            client_session_id="22222222-2222-4222-8222-222222222222",
+            user_id=7,
+            story_id=story_id,
+            event_type="dwell",
+            dashboard_version=0,
+            position=0,
+            sort_mode="recommended",
+            age_filter="recent",
+            source_filter="mixed",
+            ranker_arm="baseline",
+            occurred_at=occurred_at,
+            duration_ms=duration_ms,
+        )
+
+    impression = InteractionEvent(
+        event_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        client_session_id="22222222-2222-4222-8222-222222222222",
+        user_id=7,
+        story_id=601,
+        event_type="impression",
+        dashboard_version=0,
+        position=0,
+        sort_mode="recommended",
+        age_filter="recent",
+        source_filter="mixed",
+        ranker_arm="baseline",
+        occurred_at=1_700_000_100.0,
+    )
+    events = [
+        impression,  # non-dwell rows never contribute
+        dwell("b0000000-0000-4000-8000-000000000001", 601, 30_000, 1_700_000_100.0),
+        dwell("b0000000-0000-4000-8000-000000000002", 601, 200_000, 1_700_000_200.0),
+        dwell("b0000000-0000-4000-8000-000000000003", 601, 10_000, 1_700_000_900.0),
+        dwell("b0000000-0000-4000-8000-000000000004", 602, 5_000, 1_700_000_100.0),
+    ]
+    assert db.insert_interaction_events(events) == (5, 0, 0)
+
+    # 200s event capped at the 120s default; story 602 untouched by cutoff.
+    assert db.get_capped_dwell_by_story(7) == {601: 160_000.0, 602: 5_000.0}
+    assert db.get_capped_dwell_by_story(7, before_ts=1_700_000_500.0) == {
+        601: 150_000.0,
+        602: 5_000.0,
+    }
+    assert db.get_capped_dwell_by_story(7, cap_ms=10_000) == {
+        601: 30_000.0,
+        602: 5_000.0,
+    }
+    assert db.get_capped_dwell_by_story(8) == {}
+
+
 def test_strict_migration_preserves_schema_and_removes_orphan_caches(
     tmp_path: Path,
 ) -> None:

@@ -757,6 +757,40 @@ def _scores_margin_3class(
     return scores, None
 
 
+def _scores_margin3_dwell(
+    fold: FoldData,
+    config: Config,
+    source_db: Database,
+    user_id: int,
+    *,
+    gain: float = 1.0,
+    cap_ms: int = 120_000,
+) -> tuple[np.ndarray, None]:
+    """margin3_up with dwell-confidence sample weights (B3 experiment).
+
+    Each train row keeps its balanced class weight, multiplied by
+    1 + gain * capped_dwell / cap. Dwell is cut at the fold training
+    cutoff (max train vote time), so no post-cutoff engagement leaks
+    into training; stories without dwell keep factor 1.0.
+    """
+    y = fold.y_train
+    weights = _balanced_weights(y)
+    cutoff = float(fold.train_vote_times.max())
+    dwell = source_db.get_capped_dwell_by_story(user_id, cap_ms, cutoff)
+    if dwell:
+        factors = np.array(
+            [
+                1.0 + gain * min(dwell.get(int(s.id), 0.0), float(cap_ms)) / cap_ms
+                for s in fold.train_stories
+            ]
+        )
+        weights = weights * factors
+    scores = _fit_svc_up_margin(
+        fold.x_train_base, fold.x_cand_base, y, weights, config, fold.cand_emb.shape[1]
+    )
+    return scores, None
+
+
 def _ablation_extra_columns(
     fold: FoldData, config: Config, *, cluster: bool, source: bool
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -1472,6 +1506,7 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
         "margin3_up_recency30d": lambda fold: _scores_margin_3class(
             fold, config, half_life_days=30.0
         ),
+        "margin3_dwell": lambda fold: _scores_margin3_dwell(fold, config, db, user.id),
         "margin3_plus_cluster": lambda fold: _scores_margin3_plus(
             fold, config, cluster=True, source=False, tierblend=False
         ),
