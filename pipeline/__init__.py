@@ -5,12 +5,13 @@ import logging
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
+from typing import Any
 
 import httpx
 import numpy as np
 from numpy.typing import NDArray
 
-from database import Database, Story
+from database import Database, Story, coerce_int
 
 # ruff: noqa: F401 — re-exports for the public pipeline namespace.
 from .config import (
@@ -37,6 +38,7 @@ from .ranking import (
     PRIMARY_PER_COMBO,
     RankScoreContext,
     RankTrace,
+    RankedComment,
     RankedStory,
     SOURCE_CATEGORIES,
     TOP_COMMENT_CORE_THREADS,
@@ -65,7 +67,6 @@ from .ranking import (
     _minmax01,
     _positive_cluster_centers,
     _positive_cluster_similarity,
-    _rank_percentiles,
     _score_and_rank,
     _select_top_comments,
     _set_cached_model,
@@ -87,7 +88,6 @@ from .enrichment import (
     REDDIT_RSS_USER_AGENT,
     _article_failure_retry_time,
     _ch_story_item_to_story,
-    _coerce_int,
     _fetch_and_parse_feed,
     _is_fetchable_article_url,
     _merge_source_context,
@@ -303,7 +303,7 @@ def load_production_candidate_stories(
             BQ_ARCHIVE_CANDIDATE_LIMIT + CH_ARCHIVE_CANDIDATE_LIMIT,
         ),
     )
-    rss_rows: list[tuple] = []
+    rss_rows: list[tuple[Any, ...]] = []
     if config.non_hn_candidates_enabled and config.rss.enabled:
         configured_sources = tuple(
             dict.fromkeys(_rss_source_name(feed) for feed in config.rss.feeds)
@@ -484,13 +484,24 @@ async def _probe_live_counts(
     return counts
 
 
+# Regen-local probe memory: sid -> (probed_at, count_seen). Stops flat
+# threads (live count stuck between DB count and at_fetch) from burning a
+# probe slot every regen. Re-probe when the DB count moves (new CH info)
+# or after _PROBE_MEMORY_TTL_S. Injectable via refresh_grown_threads's
+# `memory` param so tests stay order-independent.
+_PROBE_MEMORY: dict[int, tuple[float, int]] = {}
+_PROBE_MEMORY_TTL_S = 24 * 3600
+_PROBE_MEMORY_MAX = 2000
+
+
 async def refresh_grown_threads(
     config: Config,
     db: Database,
     candidates: Sequence[Story],
     *,
     now: float | None = None,
-) -> int:
+    memory: dict[int, tuple[float, int]] | None = None,
+) -> tuple[int, set[int]]:
     """Probe live counts for young cached threads; hydrate confirmed growth.
 
     Only when we know there's new content: hydration (real-time Algolia
@@ -501,30 +512,49 @@ async def refresh_grown_threads(
     prefetch stale lane then regenerates TLDRs whose inputs actually
     changed — no new LLM path, zero spend when the top selection is stable.
 
-    Returns the number of stories re-hydrated. Per-story failures are log
-    lines, never fatal to regen.
+    Returns (hydrated, touched): re-hydrated count plus every id whose DB
+    row was upserted (count heals included) so the caller can reload
+    exactly those candidates. Per-story failures are log lines, never
+    fatal to regen.
     """
     at = time.time() if now is None else now
     cap = config.tldr_probe_max_threads_per_regen
     if cap <= 0:
-        return 0
-    checked = confirmed = hydrated = 0
+        return (0, set())
+    mem = _PROBE_MEMORY if memory is None else memory
+    checked = confirmed = hydrated = skipped = 0
+    touched: set[int] = set()
     try:
         cached_ids = set(db.get_tldr_cache_keys([s.id for s in candidates if s.id > 0]))
         eligible = _probe_eligible_threads(
             candidates, cached_ids, config.tldr_refresh_recent_hours, at
-        )[:cap]
+        )
+        fresh = [
+            s
+            for s in eligible
+            if (m := mem.get(s.id)) is None
+            or (s.comment_count or 0) != m[1]
+            or at - m[0] >= _PROBE_MEMORY_TTL_S
+        ]
+        skipped = len(eligible) - len(fresh)
+        eligible = fresh[:cap]
         checked = len(eligible)
         if not eligible:
-            return 0
+            return (0, set())
         by_id = {s.id: s for s in eligible}
         live_counts = await _probe_live_counts(
             eligible, config.tldr_probe_timeout_seconds
         )
+        for s in eligible:
+            mem[s.id] = (at, s.comment_count or 0)
+            if len(mem) > _PROBE_MEMORY_MAX:
+                oldest = min(mem, key=lambda k: mem[k][0])
+                del mem[oldest]
         for sid, live in live_counts.items():
             s = by_id[sid]
             if live > (s.comment_count or 0):
                 db.upsert_story(replace(s, comment_count=live))
+                touched.add(sid)
         grown_ids = [
             sid
             for sid, live in live_counts.items()
@@ -545,6 +575,8 @@ async def refresh_grown_threads(
                                 "tldr_probe hydrate story_id=%s failed: %r", sid, exc
                             )
                             return False
+                        if updated is not None:
+                            touched.add(sid)
                         return updated is not None
 
                 hydrated = sum(
@@ -554,13 +586,14 @@ async def refresh_grown_threads(
                     )
                     if ok
                 )
-        return hydrated
+        return (hydrated, touched)
     finally:
         logging.info(
-            "tldr_probe checked=%s confirmed=%s hydrated=%s",
+            "tldr_probe checked=%s confirmed=%s hydrated=%s skipped=%s",
             checked,
             confirmed,
             hydrated,
+            skipped,
         )
 
 
@@ -633,17 +666,17 @@ async def fetch_candidates(
         s.id: s for s in db.get_stories([item["id"] for item in live_window])
     }
     for item in live_window:
-        sid = _coerce_int(item.get("id"))
+        sid = coerce_int(item.get("id"))
         if sid <= 0 or sid in exclude_ids:
             continue
         fresh_metadata[sid] = {
-            "score": _coerce_int(item.get("points")),
-            "comment_count": _coerce_int(item.get("num_comments")),
+            "score": coerce_int(item.get("points")),
+            "comment_count": coerce_int(item.get("num_comments")),
         }
         existing = existing_stories.get(sid)
         if existing is not None:
-            new_score = _coerce_int(item.get("points"), existing.score)
-            new_comments = _coerce_int(
+            new_score = coerce_int(item.get("points"), existing.score)
+            new_comments = coerce_int(
                 item.get("num_comments"), existing.comment_count or 0
             )
             has_changes = new_score != existing.score or new_comments != (
@@ -906,15 +939,16 @@ async def fetch_candidates_only(
 
     # Growth-gated live refresh: probe young cached threads for real
     # comment growth (CH counts lag 1-24h), hydrate confirmed ones before
-    # prewarm/prefetch so the stale TLDR lane sees fresh inputs. Counts
-    # only move upward; failures are per-story log lines inside.
+    # prewarm/prefetch so the stale TLDR lane sees fresh inputs. Reload
+    # every touched row: counts heal upward even without hydration, and the
+    # prewarm gate below must read the healed counts.
     try:
-        grown = await refresh_grown_threads(config, db, candidates)
+        _, touched = await refresh_grown_threads(config, db, candidates)
     except Exception:
         logging.exception("fetch_candidates_only: growth refresh failed")
-        grown = 0
-    if grown:
-        refreshed = {s.id: s for s in db.get_stories([s.id for s in candidates])}
+        touched = set()
+    if touched:
+        refreshed = {s.id: s for s in db.get_stories(sorted(touched))}
         candidates = [refreshed.get(s.id, s) for s in candidates]
 
     # HN prewarm

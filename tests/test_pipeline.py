@@ -1,5 +1,6 @@
 from typing import Any, Literal, cast
 import asyncio
+import hashlib
 import numpy as np
 import pytest
 import re
@@ -20,6 +21,7 @@ from pipeline import (
     Embedder,
     ModelConfig,
     RankTrace,
+    RankedComment,
     RankedStory,
     RssConfig,
     clean_text,
@@ -384,10 +386,47 @@ def test_build_cold_deck_computes_popular_badges_but_not_explore(
     assert item.is_hot is True
 
 
+class _HashEmbedder(Embedder):
+    """Deterministic L2-normalized fake encoder (md5-seeded gaussian/text).
+
+    Differentiation is random-but-stable, so structural assertions (badge
+    floors, tiers, ordering mechanics, SVM plumbing) hold at ~0 cost vs a
+    2.5s ONNX load + per-test encodes. Tests asserting *semantic*
+    similarity use `_real_embedder`. __init__ overridden per the
+    mock-embedder rule in AGENTS.md.
+    """
+
+    def __init__(self) -> None:
+        self.batch_size = 32
+        self.max_tokens = 4096
+
+    def encode(
+        self, texts: list[str], batch_size: int | None = None
+    ) -> NDArray[np.float32]:
+        vecs: list[NDArray[np.float32]] = []
+        for text in texts:
+            seed = int.from_bytes(hashlib.md5(text.encode()).digest()[:8], "little")
+            rng = np.random.default_rng(seed)
+            vec = rng.standard_normal(384).astype(np.float32)
+            vec /= np.linalg.norm(vec)
+            vecs.append(vec)
+        if not vecs:
+            return np.empty((0, 384), dtype=np.float32)
+        return np.stack(vecs).astype(np.float32)
+
+
 @pytest.fixture(scope="module")
-def embedder():
-    # Uses the real downloaded ONNX model (shared across worktrees)
+def _real_embedder() -> Embedder:
+    # Uses the real downloaded ONNX model (shared across worktrees).
+    # Only for tests asserting real-model semantics or output shape.
     return Embedder()
+
+
+@pytest.fixture()
+def embedder() -> Embedder:
+    # Deterministic fake: rank/badge/tier tests exercise logic, not the
+    # encoder. Function-scoped (trivial setup) for order-independence.
+    return _HashEmbedder()
 
 
 def test_embedder_uses_configured_batch_and_ort_variant(monkeypatch):
@@ -476,9 +515,9 @@ def test_embedder_uses_configured_batch_and_ort_variant(monkeypatch):
     assert session.options.inter_op_num_threads == 1
 
 
-def test_embedder_output_shape(embedder):
+def test_embedder_output_shape(_real_embedder):
     texts = ["Hello world", "Hacker News rewrite plan"]
-    embs = embedder.encode(texts)
+    embs = _real_embedder.encode(texts)
     assert embs.shape == (2, 384)
     # Check normalization: norms should be close to 1.0
     norms = np.linalg.norm(embs, axis=1)
@@ -697,7 +736,7 @@ def test_rank_no_feedback_fallback(db, embedder):
     assert ranked[1].score >= 0
 
 
-def test_rank_svm_path(db, embedder):
+def test_rank_svm_path(db, _real_embedder):
     config = Config()
     user = db.create_user("test_token_svm")
     # 20 up + 20 down = both gates pass (n_up >= 20, n_down >= 20)
@@ -743,14 +782,14 @@ def test_rank_svm_path(db, embedder):
             text_content="Delicious chocolate chip cake baking guide.",
         ),
     ]
-    cand_embs = embedder.encode([s.text_content for s in candidates])
+    cand_embs = _real_embedder.encode([s.text_content for s in candidates])
 
     ranked = _score_and_rank(
         candidates=candidates,
         candidate_embeddings=cand_embs,
         db=db,
         config=config,
-        embedder=embedder,
+        embedder=_real_embedder,
     )
 
     assert len(ranked) == 2
@@ -1749,7 +1788,7 @@ def _clean_text_payload_and_noise(draw: st.DrawFn) -> tuple[str, str]:
     pair=_clean_text_payload_and_noise(),
     min_len=st.integers(min_value=0, max_value=10),
 )
-@settings(max_examples=100)
+@settings(max_examples=30)
 def test_clean_text_properties(pair: tuple[str, str], min_len: int) -> None:
     payload, noise = pair
     text = payload + noise
@@ -1808,7 +1847,7 @@ def test_svm_personalization_features_exclude_engagement_source_metadata():
     seed=st.integers(min_value=0, max_value=2**31 - 1),
 )
 @settings(
-    max_examples=25,
+    max_examples=10,
     suppress_health_check=[HealthCheck.function_scoped_fixture],
     deadline=1000,
 )
@@ -2811,7 +2850,7 @@ def test_soft_blend_min_alpha_curve() -> None:
             )
 
 
-def test_no_cliff_at_n_10(db: Database, embedder: Embedder) -> None:
+def test_no_cliff_at_n_10(db: Database, _real_embedder: Embedder) -> None:
     """At n=10, SVM doesn't fire (threshold=20). Ranking is tier-2 centroid-diff."""
     config = Config()
     user = db.create_user("test_token_no_cliff")
@@ -2870,9 +2909,9 @@ def test_no_cliff_at_n_10(db: Database, embedder: Embedder) -> None:
             text_content="How to make perfect sourdough bread at home.",
         ),
     ]
-    cand_embs = embedder.encode([s.text_content for s in candidates])
+    cand_embs = _real_embedder.encode([s.text_content for s in candidates])
 
-    ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
+    ranked = _score_and_rank(candidates, cand_embs, db, config, _real_embedder)
 
     assert len(ranked) == 3
     # Finance candidate is closest to upvotes (centroid formula). Should rank first.
@@ -2950,7 +2989,9 @@ def test_tier1_tier2_blend_with_only_upvotes(db: Database, embedder: Embedder) -
     assert ranked[1].story.id != ranked[2].story.id
 
 
-def test_tier2_pure_at_60_plus_one_class(db: Database, embedder: Embedder) -> None:
+def test_tier2_pure_at_60_plus_one_class(
+    db: Database, _real_embedder: Embedder
+) -> None:
     """60 upvotes (n_feedback=60, α_2=1.0) → pure tier2 centroid, finance first."""
     config = Config()
     user = db.create_user("test_token_pure_tier2")
@@ -2998,8 +3039,8 @@ def test_tier2_pure_at_60_plus_one_class(db: Database, embedder: Embedder) -> No
             source="hn",
         ),
     ]
-    cand_embs = embedder.encode([s.text_content for s in candidates])
-    ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
+    cand_embs = _real_embedder.encode([s.text_content for s in candidates])
+    ranked = _score_and_rank(candidates, cand_embs, db, config, _real_embedder)
 
     assert len(ranked) == 3
     # Pure centroid (sim_up): finance > AI > baking
@@ -3008,7 +3049,7 @@ def test_tier2_pure_at_60_plus_one_class(db: Database, embedder: Embedder) -> No
 
 
 def test_tier1_active_at_tier3_activation_boundary(
-    db: Database, embedder: Embedder
+    db: Database, _real_embedder: Embedder
 ) -> None:
     """19 up/19 down (n_feedback=38) then 20/20 (n_feedback=40).
     At both points tier1 weight is non-zero: 1-38/50=0.24 and 1-40/50=0.20."""
@@ -3069,8 +3110,8 @@ def test_tier1_active_at_tier3_activation_boundary(
             source="hn",
         ),
     ]
-    cand_embs = embedder.encode([s.text_content for s in candidates])
-    ranked_19 = _score_and_rank(candidates, cand_embs, db, config, embedder)
+    cand_embs = _real_embedder.encode([s.text_content for s in candidates])
+    ranked_19 = _score_and_rank(candidates, cand_embs, db, config, _real_embedder)
 
     # Add one more of each class (20 up, 20 down, n_feedback=40, n_min=20)
     db.upsert_story(
@@ -3096,7 +3137,7 @@ def test_tier1_active_at_tier3_activation_boundary(
     )
     db.upsert_feedback(user.id, 219, "down")
 
-    ranked_20 = _score_and_rank(candidates, cand_embs, db, config, embedder)
+    ranked_20 = _score_and_rank(candidates, cand_embs, db, config, _real_embedder)
 
     assert len(ranked_19) == 3
     assert len(ranked_20) == 3
@@ -3115,7 +3156,7 @@ def test_tier1_active_at_tier3_activation_boundary(
     )
 
 
-def test_three_way_blend_at_30_30(db: Database, embedder: Embedder) -> None:
+def test_three_way_blend_at_30_30(db: Database, _real_embedder: Embedder) -> None:
     """30 up/30 down (n_feedback=60, α_2=1.0, α_3≈0.167) → tier2-t3 blend."""
     config = Config()
     user = db.create_user("test_token_three_way")
@@ -3174,8 +3215,8 @@ def test_three_way_blend_at_30_30(db: Database, embedder: Embedder) -> None:
             source="hn",
         ),
     ]
-    cand_embs = embedder.encode([s.text_content for s in candidates])
-    ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
+    cand_embs = _real_embedder.encode([s.text_content for s in candidates])
+    ranked = _score_and_rank(candidates, cand_embs, db, config, _real_embedder)
 
     assert len(ranked) == 3
     # Tier2 + tier3 blend: finance first, baking last
@@ -3198,7 +3239,7 @@ def test_three_way_blend_at_30_30(db: Database, embedder: Embedder) -> None:
     ],
 )
 def test_blend_weights_monotonic(
-    db: Database, embedder: Embedder, n_up: int, n_down: int
+    db: Database, _real_embedder: Embedder, n_up: int, n_down: int
 ) -> None:
     """Verify blend weights change monotonically with feedback count."""
     config = Config()
@@ -3260,8 +3301,8 @@ def test_blend_weights_monotonic(
         ),
     ]
     # All equal score/time so gravity gives equal tier1 scores
-    cand_embs = embedder.encode([s.text_content for s in candidates])
-    ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
+    cand_embs = _real_embedder.encode([s.text_content for s in candidates])
+    ranked = _score_and_rank(candidates, cand_embs, db, config, _real_embedder)
 
     assert len(ranked) == 3
     n_fb = n_up + n_down
@@ -3280,7 +3321,7 @@ def test_blend_weights_monotonic(
         )
 
 
-def test_three_way_weights_sum_to_one(db: Database, embedder: Embedder) -> None:
+def test_three_way_weights_sum_to_one(db: Database, _real_embedder: Embedder) -> None:
     """At 50 up/50 down, α_2=1.0, α_3=0.5, weights: t1=0, t2=0.5, t3=0.5.
     Finance should still rank first, baking last."""
     config = Config()
@@ -3340,15 +3381,15 @@ def test_three_way_weights_sum_to_one(db: Database, embedder: Embedder) -> None:
             source="hn",
         ),
     ]
-    cand_embs = embedder.encode([s.text_content for s in candidates])
-    ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
+    cand_embs = _real_embedder.encode([s.text_content for s in candidates])
+    ranked = _score_and_rank(candidates, cand_embs, db, config, _real_embedder)
 
     assert len(ranked) == 3
     assert ranked[0].story.id == 2
     assert ranked[-1].story.id == 3
 
 
-def test_tier3_pure_at_80_each(db: Database, embedder: Embedder) -> None:
+def test_tier3_pure_at_80_each(db: Database, _real_embedder: Embedder) -> None:
     """80 up/80 down (n_min=80, α_3=1.0) → pure tier3 SVM ranking."""
     config = Config()
     user = db.create_user("test_token_pure_tier3")
@@ -3407,8 +3448,8 @@ def test_tier3_pure_at_80_each(db: Database, embedder: Embedder) -> None:
             source="hn",
         ),
     ]
-    cand_embs = embedder.encode([s.text_content for s in candidates])
-    ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
+    cand_embs = _real_embedder.encode([s.text_content for s in candidates])
+    ranked = _score_and_rank(candidates, cand_embs, db, config, _real_embedder)
 
     assert len(ranked) == 3
     assert ranked[0].story.id == 2
@@ -4525,7 +4566,9 @@ def test_tier1_gravity_at_zero_feedback(db: Database, embedder: Embedder) -> Non
     assert gravity_sorted[0].story.id == 2
 
 
-def test_tier3_svm_at_60_plus_with_gates(db: Database, embedder: Embedder) -> None:
+def test_tier3_svm_at_60_plus_with_gates(
+    db: Database, _real_embedder: Embedder
+) -> None:
     """30 up + 30 down: both gates pass, α=(30-20)/60=0.167, ranking correct."""
     config = Config()
     user = db.create_user("test_token_tier3")
@@ -4573,9 +4616,9 @@ def test_tier3_svm_at_60_plus_with_gates(db: Database, embedder: Embedder) -> No
             text_content="Delicious chocolate chip cake baking guide.",
         ),
     ]
-    cand_embs = embedder.encode([s.text_content for s in candidates])
+    cand_embs = _real_embedder.encode([s.text_content for s in candidates])
 
-    ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
+    ranked = _score_and_rank(candidates, cand_embs, db, config, _real_embedder)
 
     assert len(ranked) == 2
     # AI story should rank first (SVM learned upvote pattern)
@@ -4693,15 +4736,39 @@ def test_min_class_blend_mid(db: Database, embedder: Embedder) -> None:
 # ── Comment selection algorithm tests ──
 
 
+def _ranked_comment(
+    cid: int,
+    text: str,
+    *,
+    depth: int = 0,
+    thread: int = 0,
+    order: tuple[int, ...] = (0,),
+    descendants: int = 0,
+    text_len: int = 80,
+) -> RankedComment:
+    return {
+        "id": cid,
+        "text": text,
+        "score": 0,
+        "depth": depth,
+        "top_thread_index": thread,
+        "sibling_index": cid,
+        "order_path": order,
+        "reply_count": 0,
+        "descendant_count": descendants,
+        "text_len": text_len,
+    }
+
+
 def test_comment_rank_key_no_score_dimension():
     """_comment_rank_key no longer includes the score (depth-penalty) dimension."""
     from pipeline import _comment_rank_key
 
     keys = [
         _comment_rank_key(
-            {"descendant_count": 10, "text_len": 200, "order_path": (0,)}
+            _ranked_comment(1, "c0", order=(0,), descendants=10, text_len=200)
         ),
-        _comment_rank_key({"descendant_count": 0, "text_len": 500, "order_path": (1,)}),
+        _comment_rank_key(_ranked_comment(2, "c1", thread=1, order=(1,), text_len=500)),
     ]
     assert len(keys[0]) == 3  # descendant_count, text_len, order_path
     # Higher descendant_count sorts first
@@ -4712,22 +4779,13 @@ def test_select_top_comments_drops_low_quality_toplevel():
     """Short, low-reply top-level should not be selected as 'good'."""
     from pipeline import _select_top_comments
 
-    good = {
-        "text": "Long substantive comment with a lot of text content that should easily pass the good top-level minimum length requirement and be useful for TLDR summaries.",
-        "depth": 0,
-        "descendant_count": 0,
-        "top_thread_index": 0,
-        "text_len": 200,
-        "order_path": (0,),
-    }
-    bad = {
-        "text": "Nice article!",
-        "depth": 0,
-        "descendant_count": 0,
-        "top_thread_index": 1,
-        "text_len": 14,
-        "order_path": (1,),
-    }
+    good = _ranked_comment(
+        1,
+        "Long substantive comment with a lot of text content that should easily pass the good top-level minimum length requirement and be useful for TLDR summaries.",
+        order=(0,),
+        text_len=200,
+    )
+    bad = _ranked_comment(2, "Nice article!", thread=1, order=(1,), text_len=14)
     selected = _select_top_comments([bad, good], limit=1)
     sel_texts = [c["text"] for c in selected]
     assert any("Long substantive comment" in t for t in sel_texts)
@@ -4738,25 +4796,23 @@ def test_select_top_comments_adaptive_cores_small_story():
     from pipeline import _select_top_comments
 
     roots = [
-        {
-            "text": f"Substantive top-level {i} with enough text to pass the good top-level threshold.",
-            "depth": 0,
-            "descendant_count": 5,
-            "top_thread_index": i,
-            "text_len": 80,
-            "order_path": (i,),
-        }
+        _ranked_comment(
+            100 + i,
+            f"Substantive top-level {i} with enough text to pass the good top-level threshold.",
+            thread=i,
+            order=(i,),
+            descendants=5,
+        )
         for i in range(2)
     ]
     replies = [
-        {
-            "text": f"Substantive reply {i} with enough context to pass the minimum length for comment extraction.",
-            "depth": 1,
-            "descendant_count": 0,
-            "top_thread_index": 0,
-            "text_len": 100,
-            "order_path": (0, i),
-        }
+        _ranked_comment(
+            200 + i,
+            f"Substantive reply {i} with enough context to pass the minimum length for comment extraction.",
+            depth=1,
+            order=(0, i),
+            text_len=100,
+        )
         for i in range(5)
     ]
     selected = _select_top_comments(roots + replies, limit=10)
@@ -4773,27 +4829,28 @@ def test_select_top_comments_top_level_budget_caps():
     from pipeline import _select_top_comments
 
     top_level = [
-        {
-            "text": f"Top {i} with enough text to pass the quality threshold.",
-            "depth": 0,
-            "descendant_count": 10,
-            "top_thread_index": i,
-            "text_len": 100,
-            "order_path": (i,),
-        }
+        _ranked_comment(
+            i,
+            f"Top {i} with enough text to pass the quality threshold.",
+            thread=i,
+            order=(i,),
+            descendants=10,
+            text_len=100,
+        )
         for i in range(30)
     ]
     # Replies in threads 4-7 have higher descendant_count than top-level (12 > 10),
     # so the filler prefers them over additional top-level, keeping count near budget.
     replies = [
-        {
-            "text": f"Reply {t}.{j} substantial text content for TLDR context and discussion summary.",
-            "depth": 1,
-            "descendant_count": 3 if t < 4 else 12,
-            "top_thread_index": t,
-            "text_len": 150,
-            "order_path": (t, j),
-        }
+        _ranked_comment(
+            1000 + t * 10 + j,
+            f"Reply {t}.{j} substantial text content for TLDR context and discussion summary.",
+            depth=1,
+            thread=t,
+            order=(t, j),
+            descendants=3 if t < 4 else 12,
+            text_len=150,
+        )
         for t in range(8)
         for j in range(6)
     ]
@@ -4806,22 +4863,15 @@ def test_select_top_comments_long_reply_beats_short_toplevel():
     """A long, substantive reply should be selected over a short, low-reply top-level."""
     from pipeline import _select_top_comments
 
-    short_top = {
-        "text": "Short top-level.",
-        "depth": 0,
-        "descendant_count": 0,
-        "top_thread_index": 0,
-        "text_len": 18,
-        "order_path": (0,),
-    }
-    long_reply = {
-        "text": "Long substantive reply with enough text to easily pass the minimum extraction length and be useful.",
-        "depth": 2,
-        "descendant_count": 0,
-        "top_thread_index": 1,
-        "text_len": 110,
-        "order_path": (1,),
-    }
+    short_top = _ranked_comment(1, "Short top-level.", order=(0,), text_len=18)
+    long_reply = _ranked_comment(
+        2,
+        "Long substantive reply with enough text to easily pass the minimum extraction length and be useful.",
+        depth=2,
+        thread=1,
+        order=(1,),
+        text_len=110,
+    )
     selected = _select_top_comments([short_top, long_reply], limit=5)
     sel_texts = [c["text"] for c in selected]
     assert any("Long substantive reply" in t for t in sel_texts)
@@ -7598,7 +7648,11 @@ async def test_refresh_grown_threads_only_hydrates_confirmed(monkeypatch) -> Non
         monkeypatch.setattr(pipeline, "fetch_story", fake_fetch_story)
 
         config = Config()
-        assert await refresh_grown_threads(config, db, stories, now=now) == 1
+        memory: dict[int, tuple[float, int]] = {}
+        hydrated_n, touched = await refresh_grown_threads(
+            config, db, stories, now=now, memory=memory
+        )
+        assert (hydrated_n, touched) == (1, {11})
         assert probed == [11, 12]
         assert hydrated == [11]
         row11 = db.get_story(11)
@@ -7607,19 +7661,35 @@ async def test_refresh_grown_threads_only_hydrates_confirmed(monkeypatch) -> Non
         assert row11 is not None and row11.comment_count == 200
         assert row12 is not None and row12.comment_count == 58
         assert row13 is not None and row13.comment_count == 90
+        assert set(memory) == {11, 12}
 
         # Cap + known-growth exclusion: reload like fetch_candidates_only
         # does after a grown cycle — story 11 now shows DB growth 120 >= 26,
-        # so the normal prewarm path owns it and the single probe slot falls
-        # to 12 (live equals stored: nothing to do).
+        # so the normal prewarm path owns it; 12 was probed with no change,
+        # so memory suppresses the re-probe. Nothing fires.
         probed.clear()
         hydrated.clear()
         reloaded = [s for s in (db.get_story(s.id) for s in stories) if s is not None]
         assert len(reloaded) == 3
         capped = dc_replace(config, tldr_probe_max_threads_per_regen=1)
-        assert await refresh_grown_threads(capped, db, reloaded, now=now) == 0
-        assert probed == [12]
+        assert await refresh_grown_threads(
+            capped, db, reloaded, now=now, memory=memory
+        ) == (0, set())
+        assert probed == []
         assert hydrated == []
+
+        # Probe memory: a further immediate repeat still probes nothing.
+        # A CH count move re-arms the probe.
+        assert await refresh_grown_threads(
+            capped, db, reloaded, now=now, memory=memory
+        ) == (0, set())
+        assert probed == []
+        db.upsert_story(replace(reloaded[1], comment_count=59))
+        rearmed = [s for s in (db.get_story(s.id) for s in stories) if s is not None]
+        assert await refresh_grown_threads(
+            capped, db, rearmed, now=now, memory=memory
+        ) == (0, set())
+        assert probed == [12]
     finally:
         db.close()
 

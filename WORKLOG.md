@@ -8491,3 +8491,41 @@ texts, both under onnxruntime `CPUExecutionProvider`.
   `article_body=""` on every force-refresh, degrading the TLDR to
   discussion-only in the DB row. Now preserves the stored body (and the
   tap path benefits too). Covered by `test_fetch_story_preserves_article_body`.
+
+## 2026-09-09 — probe fixes: reload-on-touch + probe memory
+
+- `refresh_grown_threads` now returns `(hydrated, touched)`: the regen
+  hook reloads every touched row (count heals included), fixing a
+  one-cycle miss where a healed count newly cleared the prewarm bar.
+- Regen-local probe memory (`sid -> (probed_at, count_seen)`, 24h TTL,
+  re-arms on DB count moves) stops flat threads burning a probe slot
+  every regen. Injectable `memory` param keeps tests order-independent.
+- Live check: `tldr_probe checked=20 confirmed=0 hydrated=0` (no unknown
+  growth — DB count 96 already matches Firebase live), and
+  `llm_spend_today ... calls=44 ... est_usd=0.0085` confirms spend logging.
+
+## 2026-09-09 — test speed: 18.3s -> ~15.5s wall
+
+- `_HashEmbedder` (md5-seeded, L2-normalized, function-scoped) replaces
+  real ONNX in rank/badge/tier tests; 9 semantic tests + the shape test
+  keep module-scoped `_real_embedder`. `transformers` import is lazy
+  (`ranking.AutoTokenizer` seam, patched by the ort-variant test).
+- Cuts: dashboard property 15->8 examples, reddit spread 1.0s->0.2s,
+  clean_text 100->30, svm_robustness 25->10.
+- Honest accounting: ~2s wall saved; the rest is import floor
+  (~2.3s: sklearn 0.9 + collection) + slowest-worker test time. <12s
+  needs lazy-sklearn surgery — deferred, not worth the blast radius now.
+
+## 2026-09-09 — simplifications + typing must-fix
+
+- Deleted dead `_rank_percentiles` (def + import, zero call sites).
+- Merged three identical int-coercers (`ch_client._to_int`,
+  `enrichment._coerce_int`, `_seed_common._coerce_int`) into
+  `database.coerce_int`; `_seed_common.rows_to_stories` shared (agent).
+- `server.py` quota helpers funnel through `_acquire_quota`.
+- Declined: cap_sweep/cap_loss_check merge (documented complementary
+  tools, different flags/output — agent verified, no files touched).
+- Typing: `ChItem` TypedDict for the CH boundary, `RankedComment` for the
+  comment chain (+ `_ranked_comment` test factory), explicit hydration
+  result union in the tap path, `tuple[Any, ...]`/`dict[str, Any]` for
+  sqlite rows. `ty check` and `ruff check` stay clean.
