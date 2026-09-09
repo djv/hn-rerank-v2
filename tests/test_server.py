@@ -4543,7 +4543,7 @@ async def test_generate_marks_single_half_salvage_uncacheable(
         "Salvage test",
         self_text="Author text",
         top_comments="Comment text",
-        article_body="Body text",
+        article_body="Substantial article body. " * 30,
     )
 
     assert result.kind == "ok"
@@ -4575,7 +4575,7 @@ async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
         "Split summary test",
         self_text="Author text",
         top_comments="Comment text",
-        article_body="Article body",
+        article_body="Substantial article body. " * 30,
     )
 
     assert len(calls) == 2
@@ -4586,6 +4586,42 @@ async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
     assert "### Article" in result.tldr
     assert "- **Article** summary" in result.tldr
     assert "### Discussion" in result.tldr
+    assert "- **Discussion** summary" in result.tldr
+
+
+async def test_generate_detailed_tldr_folds_thin_article_to_discussion_only(
+    monkeypatch,
+) -> None:
+    """A thin article side (< ARTICLE_SECTION_MIN_CHARS) with rich comments
+    must take the single discussion path: one LLM call, no stub Article
+    half, full 1000-token budget for the comments."""
+    import server
+
+    calls = []
+
+    async def mock_call_llm_chat(
+        *, api_key, base_url, model, prompt, max_tokens, extra=None
+    ):
+        calls.append((prompt, max_tokens))
+        return server.LlmChatResult(content="- **Discussion** summary", ok=True)
+
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_PROVIDER", "mistral")
+    monkeypatch.setattr(server, "_call_llm_chat", mock_call_llm_chat)
+
+    result = await server.generate_detailed_tldr(
+        "Thin article test",
+        self_text="",
+        top_comments="Rich comment text. " * 100,
+        article_body="Tiny stub.",
+    )
+
+    assert len(calls) == 1
+    prompt, max_tokens = calls[0]
+    assert "Summarize the discussion" in prompt
+    assert "Tiny stub" not in prompt
+    assert max_tokens >= 1000
+    assert "### Article" not in result.tldr
     assert "- **Discussion** summary" in result.tldr
 
 
@@ -4749,7 +4785,7 @@ async def test_generate_detailed_tldr_cerebras_passes_reasoning_effort_and_bumpe
         "Cerebras test",
         self_text="Author text",
         top_comments="Comment text",
-        article_body="Article body",
+        article_body="Substantial article body. " * 30,
     )
 
     assert len(calls) == 2

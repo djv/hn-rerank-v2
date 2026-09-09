@@ -49,6 +49,10 @@ ARTICLE_BODY_CHAR_LIMIT = 30_000
 SELF_TEXT_PROMPT_CHAR_LIMIT = 16_000
 COMMENT_PROMPT_CHAR_LIMIT = 24_000
 SELF_TEXT_PROMPT_MIN_CHARS = 300
+# Dual-path routing floor: an article side thinner than this folds into the
+# single discussion path instead of spending a second LLM call on a stub
+# Article half and starving the Discussion half (450 vs 1000 tokens).
+ARTICLE_SECTION_MIN_CHARS = 500
 REDDIT_COMMENTS_CACHE_CHAR_LIMIT = 10_000
 REDDIT_COMMENT_LIMIT = 40
 REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dashboard"
@@ -1057,6 +1061,13 @@ async def generate_detailed_tldr(
 
     if not article_section and not top_comments:
         return TldrResult(kind="no_content")
+
+    if (
+        article_section
+        and comments_section
+        and len(article_section) < ARTICLE_SECTION_MIN_CHARS
+    ):
+        article_section = ""
 
     if article_section and comments_section:
         article_prompt = _load_prompt("article_v4.txt").format(
