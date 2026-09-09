@@ -1,5 +1,22 @@
 # Worklog: hn-rewrite
 
+## 2026-09-09 — TLDR tone C + thin-article routing (v6->v7)
+
+- A/B on mistral-small (3 stories x A/B/C, frozen inputs, /tmp harness,
+  ~$0.01): A = Consensus/Disagreement/Caveat soup (prompt-mandated);
+  B freeform but blew the 4-6 bullet budget on rich threads (11 bullets);
+  C dense + attributed-merge won on all 3. Shipped C in
+  discussion_only_v4, bumped detail-v6->v7 (6534 cached rows refresh
+  lazily, quota-gated).
+- Q1 thin-article routing: article side <500ch + comments now folds to
+  single discussion path (was: 2 calls + stub Article half + starved
+  Discussion half at 450 vs 1000 tokens). Saves 1 LLM call per thin
+  story; 3 existing dual-path tests needed substantial fixtures.
+- Q2 normalizer audit (negative result): ran 9 raw A/B outputs through
+  _normalize_tldr_markdown — 0 invented labels/headings; A-labels came
+  from the model per prompt instruction. No code change.
+- Live verified: force-refresh of 49619227 serves C tone, cached:false.
+
 ## 2026-09-09 — tap-time TLDR probe + re-summarize control
 
 - Motivating case: story 49619227 showed many new comments but served a
