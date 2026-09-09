@@ -610,6 +610,8 @@ the Mistral console, not here).
 
 The shared LLM limiter learns the minute token allowance from response headers and atomically reserves conservative prompt/output estimates before subsequent requests. It honors numeric `Retry-After` on 429 responses (capped at 120s per retry), rechecks cooldowns after waking, and defers requests requiring more than 30 seconds of waiting so long quota exhaustion does not strand HTTP handlers. This replaces blind short retries; it does not increase the provider's quota. Failed, truncated, empty and partial summaries remain uncached, with existing cached summaries available as stale fallbacks.
 
+Tap freshness: a tap serves the exact-key cache hit unless the thread looks active (≤72h, ≥30 comments, ≥8/hr velocity → forced Algolia refresh) or has comments but empty `top_comments`. Otherwise young HN threads with cached comments get one tap-time Firebase `descendants` probe (`tldr_tap_probe_timeout_seconds = 3.0s`, ungated by velocity — the user is already looking; miss/failure serves cached, hit heals `comment_count` and force-hydrates). Each rendered TLDR also carries a `↻ re-summarize` control sending `force_refresh: true`, which skips both cache hits and forces HN hydration while staying behind provider cooldown and the shared uncached quota.
+
 It uses four different prompt paths depending on what content is available
 (`TLDR_PROMPT_VERSION = "detail-v6"`):
 

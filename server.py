@@ -2433,6 +2433,55 @@ def _hn_thread_looks_active(story: Story, config: Config, now: float) -> bool:
     return (comment_count / age_hours) >= config.tldr_refresh_min_comments_per_hour
 
 
+def _tldr_tap_should_probe(story: Story, config: Config, now: float) -> bool:
+    """Whether a TLDR tap should confirm the live count before trusting cache.
+
+    Ungated by velocity by design: any young HN thread with cached comments
+    gets one cheap Firebase descendants check (~500B). The user is already
+    looking at this story, so regen's velocity ordering doesn't apply.
+    """
+    if not is_hn_source(story.source):
+        return False
+    if not story.top_comments or story.time <= 0:
+        return False
+    age_hours = (now - story.time) / 3600.0
+    return 0 < age_hours <= config.tldr_refresh_recent_hours
+
+
+def _tldr_tap_probe_growth(
+    db: Database, config: Config, story: Story
+) -> tuple[Story, bool]:
+    """Firebase live-count check for a single tap; heals comment_count on growth.
+
+    Returns (story, grew): grew is True only when live beats the DB count,
+    in which case the healed story is already upserted. Probe failures,
+    unparseable bodies, and backwards counts fall through as (story, False)
+    — the tap serves cached, never blocks.
+    """
+    from pipeline import _probe_live_counts
+
+    if config.tldr_tap_probe_timeout_seconds <= 0:
+        return (story, False)
+    if not _tldr_tap_should_probe(story, config, time.time()):
+        return (story, False)
+    try:
+        live_counts = asyncio.run(
+            _probe_live_counts([story], config.tldr_tap_probe_timeout_seconds)
+        )
+    except Exception:
+        logging.exception("tldr tap probe failed for story_id=%s", story.id)
+        return (story, False)
+    live = live_counts.get(story.id, 0)
+    if live <= (story.comment_count or 0):
+        return (story, False)
+    healed = replace(story, comment_count=live)
+    db.upsert_story(healed)
+    logging.info(
+        "tldr_detail story_id=%s result=tap_probe_growth live=%s", story.id, live
+    )
+    return (healed, True)
+
+
 def _serve_cached_tldr(
     cached_tldr: str, story_id: int, cache_key: str, event: str
 ) -> Response:
@@ -2498,6 +2547,10 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
                 status=HTTPStatus.BAD_REQUEST,
             )
         story_id: int = story_id_raw
+        # Explicit re-summarize from the card control: skip both cache hits
+        # below and force HN hydration. Still gated by provider cooldown and
+        # the shared uncached quota — never 429s when a TLDR row exists.
+        force_refresh = data.get("force_refresh") is True
 
         story = runtime.db.get_story(story_id)
         if not story:
@@ -2531,7 +2584,26 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             article_body=article_body or "",
         )
         cached_tldr = runtime.db.get_tldr_cache(story.id, cache_key)
-        if cached_tldr and not needs_active_refresh and not needs_empty_fetch:
+        # Tap-time probe: a young HN thread that would otherwise serve cached
+        # gets one live-count check first; confirmed growth falls through to
+        # hydration below instead of serving stale. Miss/failure serves cached.
+        tap_probed_growth = False
+        if (
+            cached_tldr
+            and not needs_active_refresh
+            and not needs_empty_fetch
+            and not force_refresh
+        ):
+            story, tap_probed_growth = _tldr_tap_probe_growth(
+                runtime.db, runtime.config, story
+            )
+        if (
+            cached_tldr
+            and not needs_active_refresh
+            and not needs_empty_fetch
+            and not force_refresh
+            and not tap_probed_growth
+        ):
             return _serve_cached_tldr(cached_tldr, story.id, cache_key, "cache_hit")
 
         retry_after = llm_limiter.retry_after_seconds
@@ -2570,7 +2642,16 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
         # reddit/LW sources and the source lane only runs for them — so run
         # all eligible lanes concurrently instead of back-to-back. Merges
         # below apply in the original order to preserve semantics.
-        hn_needed = needs_empty_fetch or needs_active_refresh
+        hn_needed = (
+            needs_empty_fetch
+            or needs_active_refresh
+            or tap_probed_growth
+            or (
+                force_refresh
+                and is_hn_source(story.source)
+                and bool(story.top_comments)
+            )
+        )
         src_kind: str | None = None
         if story.url and (not story.self_text or not story.top_comments):
             if story.source.startswith("rss_reddit_"):
@@ -2597,7 +2678,10 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
 
             async with httpx.AsyncClient(timeout=15.0) as client:
                 return await fetch_story(
-                    client, story_id, runtime.db, force=needs_active_refresh
+                    client,
+                    story_id,
+                    runtime.db,
+                    force=needs_active_refresh or tap_probed_growth or force_refresh,
                 )
 
         async def _src_lane() -> RedditRssContext | LessWrongContext | None:
@@ -2772,7 +2856,7 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             article_body=article_body or "",
         )
         cached_tldr = runtime.db.get_tldr_cache(story.id, cache_key)
-        if cached_tldr:
+        if cached_tldr and not force_refresh:
             return _serve_cached_tldr(
                 cached_tldr, story.id, cache_key, "post_enrich_cache_hit"
             )

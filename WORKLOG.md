@@ -1,5 +1,27 @@
 # Worklog: hn-rewrite
 
+## 2026-09-09 — tap-time TLDR probe + re-summarize control
+
+- Motivating case: story 49619227 showed many new comments but served a
+  stale cached TLDR on open — the tap only force-refreshed above the 8/hr
+  velocity gate, and the regen probe heals within ~4h but the tap never
+  checked itself.
+- B (tap probe): young HN threads with cached comments that would
+  otherwise serve cached get one Firebase `descendants` check first
+  (`server._tldr_tap_probe_growth`, timeout
+  `tldr_tap_probe_timeout_seconds = 3.0s`, ungated by velocity). Hit heals
+  `comment_count` and force-hydrates via Algolia; miss/failure/backwards
+  serves cached, never blocks, never spends quota/LLM. Regen probe,
+  velocity lane, and empty-fetch lane unchanged.
+- C (force): `↻ re-summarize` button on every rendered TLDR
+  (`ensureTldrRefreshButton`, outside prefetch) sends
+  `force_refresh: true`; server skips both cache hits and forces HN
+  hydration, still behind provider cooldown (serves cached) and the
+  shared uncached quota. No new limiter.
+- Verified: 744 passed (7 new: probe hit/miss/failure/old-skip,
+  force regen, force-on-cooldown, predicate gates; quiet-thread test now
+  mocks the probe), ruff + format + ty clean, restart live.
+
 ## 2026-09-08 — bucketed batching killed by measurement (negative result)
 
 - Built length-bucketed batching (bounds 128/1024, widths capped by the

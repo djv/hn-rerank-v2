@@ -2626,10 +2626,10 @@ def test_flask_test_client_tldr_forces_refresh_for_active_thread_even_when_cache
 def test_flask_test_client_tldr_skips_refresh_for_cached_quiet_recent_thread(
     test_env: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A cached, quiet/recent HN thread (fails the velocity gate) must
-    still take the early cache-hit path and must NOT trigger fetch_story --
-    regression guard for the cache-bypass added alongside the active-thread
-    force-refresh."""
+    """A cached, quiet/recent HN thread whose live count hasn't moved (tap
+    probe miss) must still take the early cache-hit path and must NOT
+    trigger fetch_story -- regression guard for the cache-bypass added
+    alongside the active-thread force-refresh."""
     import server
 
     _, db, _, handler, user = test_env
@@ -2667,6 +2667,14 @@ def test_flask_test_client_tldr_skips_refresh_for_cached_quiet_recent_thread(
 
     monkeypatch.setattr("pipeline.fetch_story", mock_fetch_story)
 
+    probe_calls: list[list[int]] = []
+
+    async def mock_probe_live_counts(stories, timeout_s):
+        probe_calls.append([s.id for s in stories])
+        return {}
+
+    monkeypatch.setattr("pipeline._probe_live_counts", mock_probe_live_counts)
+
     async def mock_generate_detailed_tldr(
         title: str, self_text: str, top_comments: str, article_body: str
     ) -> "server.TldrResult":
@@ -2677,9 +2685,369 @@ def test_flask_test_client_tldr_skips_refresh_for_cached_quiet_recent_thread(
     resp = client.post("/api/tldr-detail", json={"story_id": quiet_story.id})
 
     assert resp.status_code == 200
+    assert probe_calls == [[quiet_story.id]]
     assert calls == []
     assert resp.get_json()["tldr"] == "Cached TLDR"
     assert resp.get_json()["cached"] is True
+
+
+def test_flask_test_client_tldr_tap_probe_hydrates_confirmed_growth(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Tap-time probe hit: a live count beating the DB count heals
+    comment_count and force-hydrates, so a grown thread regenerates its
+    TLDR instead of serving the stale cached one."""
+    import server
+
+    _, db, _, handler, user = test_env
+    now = time.time()
+    grown_story = Story(
+        id=1732,
+        title="Grown thread story",
+        url="https://example.com/grown-thread",
+        score=50,
+        time=int(now - 2 * 3600),  # 2h old
+        text_content="Grown thread story. Body.",
+        source="hn",
+        comment_count=20,  # 10/hr but below the 30-comment active floor
+        comment_count_at_fetch=20,  # ... so only the tap probe can notice growth
+        self_text="",
+        top_comments="Old prewarmed comments.",
+        article_body="Body.",
+    )
+    db.upsert_story(grown_story)
+    cached_key = server._tldr_cache_key(
+        title=grown_story.title,
+        self_text=grown_story.self_text or "",
+        top_comments=grown_story.top_comments or "",
+        article_body=grown_story.article_body or "",
+    )
+    db.upsert_tldr_cache(grown_story.id, cached_key, "Stale cached TLDR")
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+
+    probe_timeouts: list[float] = []
+
+    async def mock_probe_live_counts(stories, timeout_s):
+        probe_timeouts.append(timeout_s)
+        return {grown_story.id: 60}
+
+    monkeypatch.setattr("pipeline._probe_live_counts", mock_probe_live_counts)
+
+    calls: list[dict[str, Any]] = []
+
+    async def mock_fetch_story(client_, sid, db_, *, force=False):
+        calls.append({"sid": sid, "force": force})
+        current = db_.get_story(sid)
+        assert current is not None
+        updated = replace(current, top_comments="Freshly hydrated comments.")
+        db_.upsert_story(updated)
+        return updated
+
+    monkeypatch.setattr("pipeline.fetch_story", mock_fetch_story)
+
+    async def mock_generate_detailed_tldr(
+        title: str, self_text: str, top_comments: str, article_body: str
+    ) -> "server.TldrResult":
+        return server.TldrResult(kind="ok", tldr=f"Fresh TLDR: {top_comments}")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    resp = client.post("/api/tldr-detail", json={"story_id": grown_story.id})
+
+    assert resp.status_code == 200
+    assert probe_timeouts == [handler.config.tldr_tap_probe_timeout_seconds]
+    assert calls == [{"sid": grown_story.id, "force": True}]
+    body = resp.get_json()
+    assert body["tldr"] == "Fresh TLDR: Freshly hydrated comments."
+    assert body["cached"] is False
+    healed = db.get_story(grown_story.id)
+    assert healed is not None
+    assert healed.comment_count == 60
+
+
+def test_flask_test_client_tldr_tap_probe_failure_serves_cached(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A throwing tap probe must never block the tap: the cached TLDR is
+    served with no hydration attempt."""
+    import server
+
+    _, db, _, handler, user = test_env
+    now = time.time()
+    quiet_story = Story(
+        id=1733,
+        title="Probe failure story",
+        url="https://example.com/probe-failure",
+        score=10,
+        time=int(now - 2 * 3600),
+        text_content="Probe failure story. Body.",
+        source="hn",
+        comment_count=5,
+        comment_count_at_fetch=5,
+        self_text="",
+        top_comments="Existing prewarmed comments.",
+        article_body="Body.",
+    )
+    db.upsert_story(quiet_story)
+    cached_key = server._tldr_cache_key(
+        title=quiet_story.title,
+        self_text=quiet_story.self_text or "",
+        top_comments=quiet_story.top_comments or "",
+        article_body=quiet_story.article_body or "",
+    )
+    db.upsert_tldr_cache(quiet_story.id, cached_key, "Cached TLDR")
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+
+    async def mock_probe_live_counts(stories, timeout_s):
+        raise ConnectionError("firebase unreachable")
+
+    monkeypatch.setattr("pipeline._probe_live_counts", mock_probe_live_counts)
+
+    calls: list[dict[str, Any]] = []
+
+    async def mock_fetch_story(client_, sid, db_, *, force=False):
+        calls.append({"sid": sid, "force": force})
+        return None
+
+    monkeypatch.setattr("pipeline.fetch_story", mock_fetch_story)
+
+    async def mock_generate_detailed_tldr(
+        title: str, self_text: str, top_comments: str, article_body: str
+    ) -> "server.TldrResult":
+        raise AssertionError("LLM must not run on probe failure")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    resp = client.post("/api/tldr-detail", json={"story_id": quiet_story.id})
+
+    assert resp.status_code == 200
+    assert calls == []
+    assert resp.get_json()["tldr"] == "Cached TLDR"
+    assert resp.get_json()["cached"] is True
+
+
+def test_flask_test_client_tldr_tap_probe_skipped_for_old_thread(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Threads older than the refresh window are never probed on tap,
+    even with a cached TLDR and live-looking counts."""
+    import server
+
+    _, db, _, handler, user = test_env
+    now = time.time()
+    old_story = Story(
+        id=1734,
+        title="Old thread story",
+        url="https://example.com/old-thread",
+        score=500,
+        time=int(now - 100 * 3600),  # 100h old, beyond the 72h window
+        text_content="Old thread story. Body.",
+        source="hn",
+        comment_count=500,
+        comment_count_at_fetch=500,
+        self_text="",
+        top_comments="Existing prewarmed comments.",
+        article_body="Body.",
+    )
+    db.upsert_story(old_story)
+    cached_key = server._tldr_cache_key(
+        title=old_story.title,
+        self_text=old_story.self_text or "",
+        top_comments=old_story.top_comments or "",
+        article_body=old_story.article_body or "",
+    )
+    db.upsert_tldr_cache(old_story.id, cached_key, "Cached TLDR")
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+
+    async def mock_probe_live_counts(stories, timeout_s):
+        raise AssertionError("old threads must not be probed")
+
+    monkeypatch.setattr("pipeline._probe_live_counts", mock_probe_live_counts)
+
+    calls: list[dict[str, Any]] = []
+
+    async def mock_fetch_story(client_, sid, db_, *, force=False):
+        calls.append({"sid": sid, "force": force})
+        return None
+
+    monkeypatch.setattr("pipeline.fetch_story", mock_fetch_story)
+
+    resp = client.post("/api/tldr-detail", json={"story_id": old_story.id})
+
+    assert resp.status_code == 200
+    assert calls == []
+    assert resp.get_json()["tldr"] == "Cached TLDR"
+    assert resp.get_json()["cached"] is True
+
+
+def test_flask_test_client_tldr_force_refresh_regenerates(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """force_refresh bypasses both cache hits (early + post-enrich) and
+    force-hydrates, so even a quiet cached thread gets a fresh summary.
+    The probe is skipped — the user already confirmed intent."""
+    import server
+
+    _, db, _, handler, user = test_env
+    now = time.time()
+    quiet_story = Story(
+        id=1735,
+        title="Forced refresh story",
+        url="https://example.com/forced-refresh",
+        score=10,
+        time=int(now - 2 * 3600),
+        text_content="Forced refresh story. Body.",
+        source="hn",
+        comment_count=5,
+        comment_count_at_fetch=5,
+        self_text="",
+        top_comments="Existing prewarmed comments.",
+        article_body="Body.",
+    )
+    db.upsert_story(quiet_story)
+    cached_key = server._tldr_cache_key(
+        title=quiet_story.title,
+        self_text=quiet_story.self_text or "",
+        top_comments=quiet_story.top_comments or "",
+        article_body=quiet_story.article_body or "",
+    )
+    db.upsert_tldr_cache(quiet_story.id, cached_key, "Cached TLDR")
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+
+    async def mock_probe_live_counts(stories, timeout_s):
+        raise AssertionError("force_refresh must skip the tap probe")
+
+    monkeypatch.setattr("pipeline._probe_live_counts", mock_probe_live_counts)
+
+    calls: list[dict[str, Any]] = []
+
+    async def mock_fetch_story(client_, sid, db_, *, force=False):
+        calls.append({"sid": sid, "force": force})
+        return None  # no new comments; post-enrich key is unchanged
+
+    monkeypatch.setattr("pipeline.fetch_story", mock_fetch_story)
+
+    llm_calls = 0
+
+    async def mock_generate_detailed_tldr(
+        title: str, self_text: str, top_comments: str, article_body: str
+    ) -> "server.TldrResult":
+        nonlocal llm_calls
+        llm_calls += 1
+        return server.TldrResult(kind="ok", tldr="Fresh forced TLDR")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    resp = client.post(
+        "/api/tldr-detail",
+        json={"story_id": quiet_story.id, "force_refresh": True},
+    )
+
+    assert resp.status_code == 200
+    assert calls == [{"sid": quiet_story.id, "force": True}]
+    assert llm_calls == 1  # post-enrich hit skipped despite unchanged key
+    body = resp.get_json()
+    assert body["tldr"] == "Fresh forced TLDR"
+    assert body["cached"] is False
+
+
+def test_flask_test_client_tldr_force_refresh_serves_cached_on_cooldown(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """force_refresh still fail-fasts on provider cooldown: the cached TLDR
+    is served instead of deepening the ban."""
+    import server
+
+    _, db, _, handler, user = test_env
+    now = time.time()
+    quiet_story = Story(
+        id=1736,
+        title="Forced cooldown story",
+        url="https://example.com/forced-cooldown",
+        score=10,
+        time=int(now - 2 * 3600),
+        text_content="Forced cooldown story. Body.",
+        source="hn",
+        comment_count=5,
+        comment_count_at_fetch=5,
+        self_text="",
+        top_comments="Existing prewarmed comments.",
+        article_body="Body.",
+    )
+    db.upsert_story(quiet_story)
+    cached_key = server._tldr_cache_key(
+        title=quiet_story.title,
+        self_text=quiet_story.self_text or "",
+        top_comments=quiet_story.top_comments or "",
+        article_body=quiet_story.article_body or "",
+    )
+    db.upsert_tldr_cache(quiet_story.id, cached_key, "Cached TLDR")
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+
+    async def mock_generate_detailed_tldr(
+        title: str, self_text: str, top_comments: str, article_body: str
+    ) -> "server.TldrResult":
+        raise AssertionError("LLM must not run while cooling down")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    server.llm_limiter.on_429()
+    try:
+        resp = client.post(
+            "/api/tldr-detail",
+            json={"story_id": quiet_story.id, "force_refresh": True},
+        )
+    finally:
+        server.llm_limiter.reset()
+
+    assert resp.status_code == 200
+    assert resp.get_json()["tldr"] == "Cached TLDR"
+    assert resp.get_json()["cached"] is True
+
+
+def test_tldr_tap_should_probe_gates() -> None:
+    """Predicate unit test: young HN threads with comments probe; old,
+    non-HN, comment-less, and timeless stories don't."""
+    import server
+    from pipeline import Config
+
+    config = Config()
+    now = time.time()
+    base = Story(
+        id=1,
+        title="t",
+        url="https://example.com/t",
+        score=1,
+        time=int(now - 3600),
+        text_content="t",
+        source="hn",
+        comment_count=10,
+        self_text="",
+        top_comments="comments",
+        article_body="",
+    )
+
+    assert server._tldr_tap_should_probe(base, config, now) is True
+    assert (
+        server._tldr_tap_should_probe(replace(base, source="rss_x"), config, now)
+        is False
+    )
+    assert (
+        server._tldr_tap_should_probe(replace(base, top_comments=""), config, now)
+        is False
+    )
+    assert server._tldr_tap_should_probe(replace(base, time=0), config, now) is False
+    assert (
+        server._tldr_tap_should_probe(
+            replace(base, time=int(now - 100 * 3600)), config, now
+        )
+        is False
+    )
 
 
 def test_flask_test_client_tldr_skips_refresh_for_quiet_recent_thread(

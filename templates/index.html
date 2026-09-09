@@ -855,6 +855,18 @@
       color: var(--pico-muted-color);
       margin-bottom: 0.25rem;
     }
+    .tldr-refresh-btn {
+      font-size: 0.72rem;
+      font-family: inherit;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--term-green);
+      background: none;
+      border: none;
+      padding: 0;
+      margin-top: 0.25rem;
+      cursor: pointer;
+    }
     .tldr-detail-content details {
       margin-bottom: 0.15rem;
     }
@@ -2092,19 +2104,36 @@
       });
     }
 
-    async function openTldrDetail(card) {
+    // Re-summarize control, idempotent: one button per TLDR block that
+    // force-refreshes this card's summary (new comments) on explicit tap.
+    // Never wired from prefetch — only from successful renders below.
+    function ensureTldrRefreshButton(card, contentDiv) {
+      contentDiv.querySelectorAll('.tldr-refresh-btn').forEach(el => el.remove());
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'tldr-refresh-btn';
+      btn.textContent = '↻ re-summarize';
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        openTldrDetail(card, { force: true });
+      });
+      contentDiv.appendChild(btn);
+    }
+
+    async function openTldrDetail(card, opts) {
       if (!card) {
         return;
       }
+      const force = !!(opts && opts.force);
 
       const storyId = Number(card.dataset.storyId);
       const storyTitle = card.querySelector('.story-title a')?.textContent || '';
 
       let contentDiv = card.querySelector('.tldr-detail-content');
-      if (contentDiv?.dataset.loading === 'true') {
+      if (contentDiv?.dataset.loading === 'true' && !force) {
         return;
       }
-      if (contentDiv && contentDiv.style.display !== 'none' && !contentDiv.dataset.error) {
+      if (contentDiv && contentDiv.style.display !== 'none' && !contentDiv.dataset.error && !force) {
         return;
       }
       if (!contentDiv) {
@@ -2113,18 +2142,19 @@
         contentDiv.style.display = 'none';
         card.appendChild(contentDiv);
       }
-      const cached = tldrCache.get(storyId);
+      const cached = force ? undefined : tldrCache.get(storyId);
       if (cached !== undefined) {
         delete contentDiv.dataset.error;
         contentDiv.innerHTML = parseSimpleMarkdown(cached);
         styleTldrLabels(contentDiv);
         enhanceTldrContent(contentDiv, { stale: false });
+        ensureTldrRefreshButton(card, contentDiv);
         contentDiv.style.display = 'block';
         return;
       }
 
       const retryAt = tldrRetryAt.get(storyId) || 0;
-      if (Date.now() < retryAt) {
+      if (!force && Date.now() < retryAt) {
         const secs = Math.max(1, Math.ceil((retryAt - Date.now()) / 1000));
         contentDiv.textContent = 'TLDR: provider cooling down, retry in ' + secs + 's';
         contentDiv.dataset.error = 'true';
@@ -2141,7 +2171,7 @@
         const resp = await fetch(detailApiPath, {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ story_id: storyId, story_title: storyTitle })
+          body: JSON.stringify({ story_id: storyId, story_title: storyTitle, force_refresh: force })
         });
         if (resp.ok) {
           const data = await resp.json();
@@ -2160,6 +2190,9 @@
           contentDiv.innerHTML = parseSimpleMarkdown(data.tldr);
           styleTldrLabels(contentDiv);
           enhanceTldrContent(contentDiv, { stale: !!(data.retryable || data.stale) });
+          if (!data.retryable && !data.stale) {
+            ensureTldrRefreshButton(card, contentDiv);
+          }
           contentDiv.style.display = 'block';
         } else {
           const errData = await resp.json().catch(() => ({}));

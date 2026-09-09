@@ -18,6 +18,9 @@ tldr_prefetch_stagger_seconds = 3.0
 # cached-TLDR threads with sub-threshold DB growth (see
 # pipeline/config.py). Hydration/LLM still only fire on confirmed growth.
 tldr_probe_max_threads_per_regen = 20
+# Tap-time Firebase probe budget per open (young HN threads only); the regen
+# probe above keeps its own 10s default. Miss/failure serves cached.
+tldr_tap_probe_timeout_seconds = 3.0
 
 [hn_rewrite.model]
 svm_c = 0.1
