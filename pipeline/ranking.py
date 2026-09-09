@@ -9,11 +9,11 @@ import resource
 import threading
 import time
 from collections import Counter
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Literal, TypeAlias
+from typing import Any, Literal, TYPE_CHECKING, TypeAlias, TypedDict
 
 import numpy as np
 import onnxruntime as ort
@@ -24,7 +24,6 @@ from sklearn.cluster import KMeans
 from sklearn.metrics.pairwise import rbf_kernel
 from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
-from transformers import AutoTokenizer
 
 from database import Database, Story
 from .config import (
@@ -37,6 +36,24 @@ from .config import (
     is_hn_source,
 )
 from .model_manifest import ModelManifest, verify_model_dir
+
+if TYPE_CHECKING:
+    from ch_client import ChItem
+
+
+# Lazy seam: `transformers` costs ~0.9s at import and is only needed to
+# construct a real Embedder. Production imports it on first use;
+# tests patch this name directly (see
+# test_embedder_uses_configured_batch_and_ort_variant).
+AutoTokenizer: Any = None
+
+
+def _tokenizer_cls() -> Any:
+    if AutoTokenizer is not None:
+        return AutoTokenizer
+    from transformers import AutoTokenizer as _Cls
+
+    return _Cls
 
 
 EmbeddingOrtVariant: TypeAlias = Literal[
@@ -343,15 +360,34 @@ def clean_text(raw_text: str, min_len: int = 0) -> str:
     return txt
 
 
+class RankedComment(TypedDict):
+    """Normalized comment from ``_extract_comments_recursive``.
+
+    ``id`` stays ``Any`` (opaque JSON passthrough, never arithmeticked);
+    everything the ranker reads is explicitly typed.
+    """
+
+    id: Any
+    text: str
+    score: int
+    depth: int
+    top_thread_index: int | None
+    sibling_index: int
+    order_path: tuple[int, ...]
+    reply_count: int
+    descendant_count: int
+    text_len: int
+
+
 def _extract_comments_recursive(
-    children: list,
+    children: Sequence[ChItem] | Sequence[dict[str, Any]],
     depth: int = 0,
     parent_points: int = 0,
     top_thread_index: int | None = None,
     order_path: tuple[int, ...] = (),
-) -> list[dict]:
+) -> list[RankedComment]:
     MIN_COMMENT_LENGTH = 60
-    results = []
+    results: list[RankedComment] = []
     for sibling_index, child in enumerate(children):
         if not isinstance(child, dict) or child.get("type") != "comment":
             continue
@@ -392,7 +428,7 @@ def _extract_comments_recursive(
     return results
 
 
-def _comment_rank_key(comment: dict) -> tuple:
+def _comment_rank_key(comment: RankedComment) -> tuple[int, int, tuple[int, ...]]:
     return (
         -comment["descendant_count"],
         -min(comment["text_len"], 3000),
@@ -401,9 +437,9 @@ def _comment_rank_key(comment: dict) -> tuple:
 
 
 def _select_top_comments(
-    comments: list[dict],
+    comments: list[RankedComment],
     limit: int = TOP_COMMENT_LIMIT,
-) -> list[dict]:
+) -> list[RankedComment]:
     """Select comment text for embeddings/TLDRs.
 
     Prefer large discussion cores (top engaged threads) and breadth of
@@ -415,15 +451,17 @@ def _select_top_comments(
     if not comments:
         return []
 
-    selected = []
-    selected_indexes = set()
+    selected: list[RankedComment] = []
+    selected_indexes: set[int] = set()
     per_thread: dict[int, int] = {}
 
-    def add(comment: dict) -> None:
+    def add(comment: RankedComment) -> None:
         if len(selected) >= limit:
             return
         index = id(comment)
         thread_index = comment["top_thread_index"]
+        if thread_index is None:
+            return
         if index in selected_indexes:
             return
         if per_thread.get(thread_index, 0) >= TOP_COMMENT_MAX_PER_THREAD:
@@ -443,14 +481,17 @@ def _select_top_comments(
     n_cores = min(TOP_COMMENT_CORE_THREADS, len(good_top_level))
     core_roots = sorted(
         good_top_level,
-        key=lambda c: (-c["descendant_count"], c["top_thread_index"]),
+        key=lambda c: (
+            -c["descendant_count"],
+            c["top_thread_index"] if c["top_thread_index"] is not None else -1,
+        ),
     )[:n_cores]
     core_threads = {c["top_thread_index"] for c in core_roots}
 
     for root in sorted(core_roots, key=_comment_rank_key):
         add(root)
 
-    for thread_index in sorted(core_threads):
+    for thread_index in sorted(t for t in core_threads if t is not None):
         replies = [
             c
             for c in comments
@@ -577,7 +618,7 @@ class Embedder:
         self.model_version = model_version
         self.max_tokens = max_tokens
         self.batch_size = batch_size
-        self.tokenizer: Any = AutoTokenizer.from_pretrained(model_dir)
+        self.tokenizer: Any = _tokenizer_cls().from_pretrained(model_dir)
         session_options = _embedding_session_options(ort_variant)
         self.session = ort.InferenceSession(
             str(Path(model_dir) / "model.onnx"),
@@ -979,16 +1020,6 @@ def _minmax01(values: np.ndarray) -> NDArray[np.float32]:
     if span <= 1e-8:
         return np.full(len(values), 0.5, dtype=np.float32)
     return ((values - values.min()) / span).astype(np.float32)
-
-
-def _rank_percentiles(values: np.ndarray) -> NDArray[np.float32]:
-    values = np.asarray(values, dtype=np.float32)
-    if len(values) <= 1:
-        return np.ones(len(values), dtype=np.float32)
-    order = np.argsort(values, kind="mergesort")
-    ranks = np.empty(len(values), dtype=np.float32)
-    ranks[order] = np.linspace(0.0, 1.0, len(values), dtype=np.float32)
-    return ranks
 
 
 def _softmax_rows(values: np.ndarray) -> NDArray[np.float32]:

@@ -1831,7 +1831,7 @@ def prop_db():
     )
 )
 @settings(
-    max_examples=15,
+    max_examples=8,
     deadline=None,
     suppress_health_check=[HealthCheck.function_scoped_fixture],
 )

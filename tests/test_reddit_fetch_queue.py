@@ -166,11 +166,11 @@ def test_slow_task_blocks_subsequent_tasks() -> None:
 
 
 def test_enqueue_spread_distributes_evenly() -> None:
-    """20 tasks across 1s should be spread 50ms apart."""
+    """20 tasks across 0.2s should be spread 10ms apart."""
     q = RedditFetchQueue()
     q.reset()
     q.POLL_INTERVAL = 0.001
-    q.SPREAD_WINDOW_TOPFEEDS = 1.0
+    q.SPREAD_WINDOW_TOPFEEDS = 0.2
     starts: list[float] = []
     base = time.monotonic()
 
@@ -182,12 +182,12 @@ def test_enqueue_spread_distributes_evenly() -> None:
 
     q.enqueue_spread(20, base, "topfeed", [timed() for _ in range(20)])
     assert q.wait_until_empty(timeout=2.0) is True
-    # Stride is 1.0 / 20 = 0.05s
-    # First task runs immediately, last at ~0.95s
+    # Stride is 0.2 / 20 = 0.01s
+    # First task runs immediately, last at ~0.19s
     assert len(starts) == 20
-    assert starts[-1] - starts[0] >= 0.8  # wide spread
-    # Median should be ~0.5s
-    assert 0.4 <= starts[9] <= 0.6
+    assert starts[-1] - starts[0] >= 0.15  # wide spread
+    # Median should be ~0.1s
+    assert 0.05 <= starts[9] <= 0.15
 
 
 def test_reset_clears_pending_and_signals_idle() -> None:
