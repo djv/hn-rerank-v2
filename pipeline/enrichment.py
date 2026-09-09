@@ -140,11 +140,15 @@ async def fetch_story(
         selected = _select_top_comments(all_comments)
         top_comment_texts = " ".join(c["text"] for c in selected)[:10000]
 
+        # Algolia carries no article body: preserve the stored one, or every
+        # force-refresh (tap active-refresh today, regen growth-refresh next)
+        # would wipe it and silently degrade the TLDR to discussion-only.
+        existing_body = story.article_body if story is not None else ""
         text_content = compose_story_text(
             title=title,
             self_text=story_text,
             comments=top_comment_texts,
-            article_body="",
+            article_body=existing_body,
         )
 
         if not text_content:
@@ -180,7 +184,7 @@ async def fetch_story(
             else len(all_comments),
             self_text=story_text,
             top_comments=top_comment_texts,
-            article_body="",
+            article_body=existing_body,
         )
 
         db.upsert_story(story)

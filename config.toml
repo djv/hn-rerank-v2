@@ -14,6 +14,10 @@ tldr_uncached_global_limit = 120
 # 2 calls), so spread background prefetch starts: 10 candidates x 2 calls
 # over ~30s stays inside the rolling token window when most are cached.
 tldr_prefetch_stagger_seconds = 3.0
+# Live-count probe budget: Firebase descendants checks per regen for young
+# cached-TLDR threads with sub-threshold DB growth (see
+# pipeline/config.py). Hydration/LLM still only fire on confirmed growth.
+tldr_probe_max_threads_per_regen = 20
 
 [hn_rewrite.model]
 svm_c = 0.1

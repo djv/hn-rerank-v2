@@ -7452,3 +7452,242 @@ def test_encode_slow_warn_fires_only_over_threshold(
         result = emb.encode(["hello world"])
     assert result.shape == (1, 4)
     assert not any("embedding_slow" in r.message for r in caplog.records)
+
+
+def _probe_story(
+    sid: int,
+    *,
+    now: float,
+    age_h: float = 6.0,
+    count: int = 83,
+    fetched: int = 80,
+    top: str = "some earlier top comments",
+    source: str = "hn",
+) -> Story:
+    return Story(
+        id=sid,
+        title=f"Probe story {sid}",
+        url=None,
+        score=10,
+        time=int(now - age_h * 3600.0),
+        text_content=f"Probe story {sid} body",
+        source=source,
+        comment_count=count,
+        comment_count_at_fetch=fetched,
+        top_comments=top,
+    )
+
+
+def test_probe_eligible_threads_filters_and_orders() -> None:
+    """Only young cached threads with sub-threshold DB growth are probe
+    candidates; known-growth, history-less, sourceless and old threads stay
+    on their existing paths. Hottest velocity first."""
+    from pipeline import _probe_eligible_threads
+
+    now = time.time()
+    stories = [
+        _probe_story(1, now=now),  # eligible, velocity ~13.8/hr
+        _probe_story(2, now=now, count=200, fetched=100),  # known growth
+        _probe_story(3, now=now, count=40, fetched=0),  # no history
+        _probe_story(4, now=now, count=90, fetched=85, top=""),  # empty top
+        _probe_story(5, now=now, count=90, fetched=85, source="rss_x"),  # non-hn
+        _probe_story(6, now=now, count=90, fetched=85, age_h=100.0),  # old
+        _probe_story(7, now=now, count=60, fetched=55, age_h=1.0),  # vel 60/hr
+        _probe_story(8, now=now),  # same as 1 but uncached
+    ]
+    cached = {1, 2, 3, 4, 5, 6, 7}
+    out = _probe_eligible_threads(stories, cached, 72.0, now)
+    assert [s.id for s in out] == [7, 1]
+
+
+async def test_probe_live_counts_parses_defensively(monkeypatch) -> None:
+    """Firebase probe: only upward, parseable counts survive; every failure
+    mode is a skip, never an exception or a backward move."""
+    import httpx
+    from pipeline import _probe_live_counts
+
+    now = time.time()
+    stories = [_probe_story(i, now=now, count=80) for i in (1, 2, 3, 4, 5)]
+
+    class FakeResponse:
+        def __init__(self, status: int, body: object):
+            self.status_code = status
+            self._body = body
+
+        def json(self) -> object:
+            if isinstance(self._body, Exception):
+                raise self._body
+            return self._body
+
+    payloads = {
+        1: FakeResponse(200, {"descendants": 120}),  # good
+        2: FakeResponse(200, {}),  # missing -> 0, not upward
+        3: FakeResponse(500, {}),  # status
+        4: FakeResponse(200, {"descendants": 50}),  # backwards
+        5: FakeResponse(200, ValueError("nope")),  # unparseable
+    }
+
+    class FakeClient:
+        def __init__(self, *, timeout: float):
+            pass
+
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        async def get(self, url: str) -> FakeResponse:
+            sid = int(url.split("/item/")[1].split(".json")[0])
+            if sid == 5:
+                raise ConnectionError("down")
+            return payloads[sid]
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    assert await _probe_live_counts(stories, 10.0) == {1: 120}
+
+
+async def test_refresh_grown_threads_only_hydrates_confirmed(monkeypatch) -> None:
+    """End of the 'known new content' rule: probes run for eligible cached
+    threads, but the heavy hydration fires only where the probe confirms
+    upward movement. The cap takes hottest first; known-growth threads
+    belong to the normal prewarm path."""
+    from dataclasses import replace as dc_replace
+
+    import pipeline
+    from database import Database
+    from pipeline import Config, refresh_grown_threads
+
+    now = time.time()
+    db = Database(":memory:")
+    try:
+        stories = [
+            _probe_story(11, now=now, count=83, fetched=80),  # live 200: hydrate
+            _probe_story(12, now=now, count=58, fetched=55),  # live 58: untouched
+            _probe_story(13, now=now, count=90, fetched=85),  # uncached: skip
+        ]
+        for s in stories:
+            db.upsert_story(s)
+        db.upsert_tldr_cache(11, "k11", "old tldr")
+        db.upsert_tldr_cache(12, "k12", "old tldr")
+
+        probed: list[int] = []
+        live = {11: 200, 12: 58}
+
+        async def fake_probe(found: list, timeout_s: float) -> dict[int, int]:
+            probed.extend(s.id for s in found)
+            out: dict[int, int] = {}
+            for s in found:
+                row = db.get_story(s.id)
+                if row is not None and live[s.id] > (row.comment_count or 0):
+                    out[s.id] = live[s.id]
+            return out
+
+        hydrated: list[int] = []
+
+        async def fake_fetch_story(
+            client: object, sid: int, db_: object, *, force: bool = False
+        ) -> object:
+            assert force is True
+            hydrated.append(sid)
+            row = db.get_story(sid)
+            assert row is not None
+            return row
+
+        monkeypatch.setattr(pipeline, "_probe_live_counts", fake_probe)
+        monkeypatch.setattr(pipeline, "fetch_story", fake_fetch_story)
+
+        config = Config()
+        assert await refresh_grown_threads(config, db, stories, now=now) == 1
+        assert probed == [11, 12]
+        assert hydrated == [11]
+        row11 = db.get_story(11)
+        row12 = db.get_story(12)
+        row13 = db.get_story(13)
+        assert row11 is not None and row11.comment_count == 200
+        assert row12 is not None and row12.comment_count == 58
+        assert row13 is not None and row13.comment_count == 90
+
+        # Cap + known-growth exclusion: reload like fetch_candidates_only
+        # does after a grown cycle — story 11 now shows DB growth 120 >= 26,
+        # so the normal prewarm path owns it and the single probe slot falls
+        # to 12 (live equals stored: nothing to do).
+        probed.clear()
+        hydrated.clear()
+        reloaded = [s for s in (db.get_story(s.id) for s in stories) if s is not None]
+        assert len(reloaded) == 3
+        capped = dc_replace(config, tldr_probe_max_threads_per_regen=1)
+        assert await refresh_grown_threads(capped, db, reloaded, now=now) == 0
+        assert probed == [12]
+        assert hydrated == []
+    finally:
+        db.close()
+
+
+async def test_fetch_story_preserves_article_body() -> None:
+    """Algolia carries no article body: a force-refresh must carry the
+    stored one over instead of wiping it to discussion-only."""
+    from database import Database, Story
+    from pipeline.enrichment import fetch_story
+
+    now = time.time()
+    db = Database(":memory:")
+    try:
+        db.upsert_story(
+            Story(
+                id=49616239,
+                title="South Park rename",
+                url="https://example.com/south-park",
+                score=100,
+                time=int(now - 6 * 3600),
+                text_content="South Park rename body",
+                source="hn",
+                comment_count=83,
+                comment_count_at_fetch=80,
+                top_comments="earlier top comments here",
+                article_body="FULL BODY TEXT",
+            )
+        )
+
+        class FakeResponse:
+            status_code = 200
+
+            def json(self) -> dict:
+                return {
+                    "type": "story",
+                    "title": "South Park rename",
+                    "url": "https://example.com/south-park",
+                    "points": 101,
+                    "num_comments": 120,
+                    "created_at_i": int(now - 6 * 3600),
+                    "story_text": "",
+                    "children": [
+                        {
+                            "type": "comment",
+                            "id": 1,
+                            "text": "A brand new top-level comment with more than sixty characters in it.",
+                            "children": [],
+                        }
+                    ],
+                }
+
+        class FakeClient:
+            async def get(self, url: str) -> FakeResponse:
+                return FakeResponse()
+
+        result = await fetch_story(cast(Any, FakeClient()), 49616239, db, force=True)
+        assert result is not None
+        assert result.article_body == "FULL BODY TEXT"
+        assert "FULL BODY TEXT" in result.text_content
+        stored = db.get_story(49616239)
+        assert stored is not None and stored.article_body == "FULL BODY TEXT"
+    finally:
+        db.close()
+
+
+def test_growth_threshold_values() -> None:
+    from pipeline import _growth_threshold
+
+    assert _growth_threshold(80) == 26
+    assert _growth_threshold(10) == 5
+    assert _growth_threshold(0) == 5

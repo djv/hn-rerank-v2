@@ -8472,3 +8472,22 @@ texts, both under onnxruntime `CPUExecutionProvider`.
 - Design note: first cut threaded `db` explicitly through
   `generate_detailed_tldr`, which broke 24 existing mocks; reverted to the
   global recorder (set/restore in tests) for zero call-site churn.
+
+## 2026-09-09 — regen growth-gated TLDR refresh (Firebase probe)
+
+- Cause of stale prefetched TLDRs on hot threads: DB comment counts lag CH
+  1-24h, so `_needs_hn_prewarm` (growth >= max(fetched//3, 5)) never fires
+  and the prefetch stale-lane sees a frozen cache key. Only a tap
+  (`fetch_story(force=True)`) unstuck it.
+- Fix, strictly on known new content: `refresh_grown_threads` in regen
+  probes Firebase `/v0/item/<id>.json` descendants (~500 bytes, no auth)
+  for young cached-TLDR threads with sub-threshold DB growth (cap 20,
+  velocity-ordered, `tldr_probe_max_threads_per_regen`). Counts heal upward
+  regardless; Algolia force-hydration fires only on confirmed upward
+  movement past the last fetched count. Key change then flows through the
+  existing stale-lane — no new LLM path, zero spend when the top selection
+  is stable.
+- Incidental fix (would have become systematic): `fetch_story` wiped
+  `article_body=""` on every force-refresh, degrading the TLDR to
+  discussion-only in the DB row. Now preserves the stored body (and the
+  tap path benefits too). Covered by `test_fetch_story_preserves_article_body`.

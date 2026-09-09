@@ -140,6 +140,14 @@ class Config:
     tldr_refresh_recent_hours: float = 72.0
     tldr_refresh_min_comments: int = 30
     tldr_refresh_min_comments_per_hour: float = 8.0
+    # Regen live-count probe (Firebase descendants): for young HN threads
+    # with a cached TLDR whose DB-visible growth is sub-threshold, confirm
+    # the live count before spending a full comment hydration. Hydration
+    # (Algolia, real-time) fires only on confirmed growth >= the
+    # _needs_hn_prewarm threshold, so LLM regen happens strictly on known
+    # new content. 0 disables probing.
+    tldr_probe_max_threads_per_regen: int = 20
+    tldr_probe_timeout_seconds: float = 10.0
     # Public demo abuse limits. Cached TLDR hits bypass the uncached TLDR
     # quota; these limits protect only new enrichment/LLM work and vote writes.
     tldr_uncached_per_user_limit: int = 12

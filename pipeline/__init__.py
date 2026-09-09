@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 
+import httpx
 import numpy as np
 from numpy.typing import NDArray
 
@@ -214,10 +216,7 @@ def build_cold_deck(
 
     cand_scores = np.array([story.score for story in candidates])
     cand_velocities = np.array(
-        [
-            story.score / max((now_ts - story.time) / 3600.0, 0.1)
-            for story in candidates
-        ]
+        [story.score / max((now_ts - story.time) / 3600.0, 0.1) for story in candidates]
     )
     story_id_to_idx = {story.id: idx for idx, story in enumerate(candidates)}
 
@@ -326,7 +325,9 @@ def load_production_candidate_stories(
                 ),
             )
     hn_stories = [
-        s for s in (Database._row_to_story(row) for row in hn_rows) if is_summarizable(s)
+        s
+        for s in (Database._row_to_story(row) for row in hn_rows)
+        if is_summarizable(s)
     ]
     archive_stories = [
         s
@@ -334,16 +335,16 @@ def load_production_candidate_stories(
         if is_summarizable(s)
     ]
     rss_stories = [
-        s for s in (Database._row_to_story(row) for row in rss_rows) if is_summarizable(s)
+        s
+        for s in (Database._row_to_story(row) for row in rss_rows)
+        if is_summarizable(s)
     ]
     trace.set_count("pool_hn", len(hn_stories))
     trace.set_count("pool_archive", len(archive_stories))
     trace.set_count("pool_rss", len(rss_stories))
     if rss_stories:
         oldest_rss_time = min(s.time for s in rss_stories)
-        trace.set_count(
-            "pool_rss_oldest_age_h", int((now - oldest_rss_time) / 3600)
-        )
+        trace.set_count("pool_rss_oldest_age_h", int((now - oldest_rss_time) / 3600))
     return hn_stories + rss_stories + archive_stories
 
 
@@ -355,10 +356,13 @@ def _voted_story_ids(db: Database, user_id: int) -> set[int]:
     same exclusion as an in-memory mask over the cached candidate pool
     instead of a SQL filter.
     """
-    rows = db.execute(
-        "SELECT story_id FROM feedback WHERE user_id = ?", (user_id,)
-    )
+    rows = db.execute("SELECT story_id FROM feedback WHERE user_id = ?", (user_id,))
     return {row[0] for row in rows}
+
+
+def _growth_threshold(fetched: int) -> int:
+    """Known-growth bar: max(fetched // 3, 5) — ~33% with a 5-comment floor."""
+    return max(fetched // 3, 5)
 
 
 def _needs_hn_prewarm(s: Story) -> bool:
@@ -366,9 +370,8 @@ def _needs_hn_prewarm(s: Story) -> bool:
 
     Triggers when (a) ``top_comments`` is empty, (b) we have no fetch
     history (``comment_count_at_fetch <= 0``), or (c) the live comment
-    count has grown meaningfully since the last prewarm: at least
-    ``max(fetched // 3, 5)`` new comments — roughly 33% growth with a
-    5-comment floor.
+    count has grown meaningfully since the last prewarm (see
+    ``_growth_threshold``).
 
     The threshold catches the 1->284 "stale single-comment stub" case
     (WORKLOG 2026-06-29) and keeps small stories (10-50 fetched comments)
@@ -388,8 +391,177 @@ def _needs_hn_prewarm(s: Story) -> bool:
     if fetched <= 0:
         return True
     growth = (s.comment_count or 0) - fetched
-    threshold = max(fetched // 3, 5)
-    return growth >= threshold
+    return growth >= _growth_threshold(fetched)
+
+
+# Firebase item endpoint: live descendants only (~500 bytes, no auth). The
+# cheap "do we know there's new content" probe — full comment trees still
+# come from Algolia, and only after confirmed growth.
+_FIREBASE_ITEM_URL = "https://hacker-news.firebaseio.com/v0/item/{sid}.json"
+_PROBE_CONCURRENCY = 5
+_HYDRATE_CONCURRENCY = 4
+
+
+def _probe_eligible_threads(
+    candidates: Sequence[Story],
+    cached_ids: set[int],
+    recent_hours: float,
+    now: float,
+) -> list[Story]:
+    """Young cached-TLDR threads whose DB-visible growth is sub-threshold.
+
+    Invisible to ``_needs_hn_prewarm`` (growth < bar) but possibly still
+    growing — the DB count lags CH by 1-24h. Velocity-ordered so the regen
+    cap spends probes on the hottest threads first. Stories with known
+    growth or no fetch history are excluded: the normal prewarm path
+    already owns them.
+    """
+    eligible: list[Story] = []
+    for s in candidates:
+        if not is_hn_source(s.source):
+            continue
+        if not s.top_comments or s.id not in cached_ids:
+            continue
+        if s.time <= 0:
+            continue
+        age_hours = (now - s.time) / 3600.0
+        if age_hours <= 0 or age_hours > recent_hours:
+            continue
+        fetched = s.comment_count_at_fetch or 0
+        if fetched <= 0:
+            continue
+        growth = (s.comment_count or 0) - fetched
+        if growth >= _growth_threshold(fetched):
+            continue
+        eligible.append(s)
+    eligible.sort(
+        key=lambda s: (s.comment_count or 0) / max((now - s.time) / 3600.0, 1e-6),
+        reverse=True,
+    )
+    return eligible
+
+
+async def _probe_live_counts(
+    stories: Sequence[Story], timeout_s: float
+) -> dict[int, int]:
+    """Live Firebase descendants per story id.
+
+    Failures, unparseable bodies, and counts that move backwards are
+    silently omitted — the caller treats absence as "no known growth".
+    """
+    counts: dict[int, int] = {}
+    if not stories:
+        return counts
+    sem = asyncio.Semaphore(_PROBE_CONCURRENCY)
+
+    async with httpx.AsyncClient(timeout=timeout_s) as client:
+
+        async def _one(s: Story) -> tuple[int, int] | None:
+            async with sem:
+                try:
+                    resp = await client.get(_FIREBASE_ITEM_URL.format(sid=s.id))
+                except Exception as exc:
+                    logging.warning("tldr_probe story_id=%s failed: %r", s.id, exc)
+                    return None
+                if resp.status_code != 200:
+                    logging.warning(
+                        "tldr_probe story_id=%s status=%s", s.id, resp.status_code
+                    )
+                    return None
+                try:
+                    body = resp.json()
+                    live = int((body or {}).get("descendants") or 0)
+                except Exception:
+                    logging.warning("tldr_probe story_id=%s unparseable body", s.id)
+                    return None
+                if live <= (s.comment_count or 0):
+                    return None
+                return (s.id, live)
+
+        for result in await asyncio.gather(*(_one(s) for s in stories)):
+            if result is not None:
+                counts[result[0]] = result[1]
+    return counts
+
+
+async def refresh_grown_threads(
+    config: Config,
+    db: Database,
+    candidates: Sequence[Story],
+    *,
+    now: float | None = None,
+) -> int:
+    """Probe live counts for young cached threads; hydrate confirmed growth.
+
+    Only when we know there's new content: hydration (real-time Algolia
+    force-refresh — CH would hand back the same lagged data the probe just
+    beat) fires strictly for threads whose probed live count exceeds the
+    last fetched count. Counts are healed upward first, so even a failed
+    hydration still fixes the velocity gate the tap path reads. The
+    prefetch stale lane then regenerates TLDRs whose inputs actually
+    changed — no new LLM path, zero spend when the top selection is stable.
+
+    Returns the number of stories re-hydrated. Per-story failures are log
+    lines, never fatal to regen.
+    """
+    at = time.time() if now is None else now
+    cap = config.tldr_probe_max_threads_per_regen
+    if cap <= 0:
+        return 0
+    checked = confirmed = hydrated = 0
+    try:
+        cached_ids = set(db.get_tldr_cache_keys([s.id for s in candidates if s.id > 0]))
+        eligible = _probe_eligible_threads(
+            candidates, cached_ids, config.tldr_refresh_recent_hours, at
+        )[:cap]
+        checked = len(eligible)
+        if not eligible:
+            return 0
+        by_id = {s.id: s for s in eligible}
+        live_counts = await _probe_live_counts(
+            eligible, config.tldr_probe_timeout_seconds
+        )
+        for sid, live in live_counts.items():
+            s = by_id[sid]
+            if live > (s.comment_count or 0):
+                db.upsert_story(replace(s, comment_count=live))
+        grown_ids = [
+            sid
+            for sid, live in live_counts.items()
+            if live > (by_id[sid].comment_count_at_fetch or 0)
+        ]
+        confirmed = len(grown_ids)
+        if grown_ids:
+            hsem = asyncio.Semaphore(_HYDRATE_CONCURRENCY)
+
+            async with httpx.AsyncClient(timeout=15.0) as client:
+
+                async def _hydrate(sid: int) -> bool:
+                    async with hsem:
+                        try:
+                            updated = await fetch_story(client, sid, db, force=True)
+                        except Exception as exc:
+                            logging.warning(
+                                "tldr_probe hydrate story_id=%s failed: %r", sid, exc
+                            )
+                            return False
+                        return updated is not None
+
+                hydrated = sum(
+                    1
+                    for ok in await asyncio.gather(
+                        *(_hydrate(sid) for sid in grown_ids)
+                    )
+                    if ok
+                )
+        return hydrated
+    finally:
+        logging.info(
+            "tldr_probe checked=%s confirmed=%s hydrated=%s",
+            checked,
+            confirmed,
+            hydrated,
+        )
 
 
 def is_summarizable(story: Story) -> bool:
@@ -732,6 +904,19 @@ async def fetch_candidates_only(
         except Exception:
             logging.exception("fetch_candidates_only: HN dupe callback failed")
 
+    # Growth-gated live refresh: probe young cached threads for real
+    # comment growth (CH counts lag 1-24h), hydrate confirmed ones before
+    # prewarm/prefetch so the stale TLDR lane sees fresh inputs. Counts
+    # only move upward; failures are per-story log lines inside.
+    try:
+        grown = await refresh_grown_threads(config, db, candidates)
+    except Exception:
+        logging.exception("fetch_candidates_only: growth refresh failed")
+        grown = 0
+    if grown:
+        refreshed = {s.id: s for s in db.get_stories([s.id for s in candidates])}
+        candidates = [refreshed.get(s.id, s) for s in candidates]
+
     # HN prewarm
     if config.prewarm_hn_full and embedder is not None:
         needs_prewarm = [s.id for s in candidates if _needs_hn_prewarm(s)]
@@ -809,7 +994,9 @@ def refresh_reddit_candidates(
     for feed_url in feed_urls:
         cached = reddit_feed_cache.get(feed_url)
         if cached is None:
-            db.record_reddit_feed_failure(feed_url, "fetch returned no snapshot", now_ts)
+            db.record_reddit_feed_failure(
+                feed_url, "fetch returned no snapshot", now_ts
+            )
             continue
         for story in cached:
             existing = db.get_story(story.id)
@@ -821,9 +1008,7 @@ def refresh_reddit_candidates(
             ) != (story.title, story.url, story.time, story.self_text):
                 changed_ids.add(story.id)
             db.upsert_story(story)
-        db.record_reddit_feed_success(
-            feed_url, [story.id for story in cached], now_ts
-        )
+        db.record_reddit_feed_success(feed_url, [story.id for story in cached], now_ts)
 
     prewarm_ids: list[int] = []
     if config.prewarm_reddit_full:
