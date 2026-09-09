@@ -52,7 +52,7 @@ SELF_TEXT_PROMPT_MIN_CHARS = 300
 REDDIT_COMMENTS_CACHE_CHAR_LIMIT = 10_000
 REDDIT_COMMENT_LIMIT = 40
 REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dashboard"
-TLDR_PROMPT_VERSION = "detail-v6"
+TLDR_PROMPT_VERSION = "detail-v7"
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
 _PROMPT_CACHE: dict[str, str] = {}
 # Seam for tests: swap in a controllable timer to make debounce/regen tests

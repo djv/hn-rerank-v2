@@ -340,6 +340,19 @@ def test_prompts_render_budget_placeholder(template: str, fields: dict) -> None:
     assert "4-6 bullets, max 200 words" in prompt
 
 
+@pytest.mark.parametrize("template", ["discussion_only_v4.txt", "discussion_v4.txt"])
+def test_discussion_prompts_use_freeform_headings(template: str) -> None:
+    """Discussion prompts must ask for freeform thread-specific headings,
+    never a fixed Consensus/Disagreement/Caveat label set — the fixed set
+    makes the model repeat the same buckets on every story."""
+    import server
+
+    prompt = server._load_prompt(template)
+    assert "####" in prompt
+    for label in ("Consensus:", "Disagreement:", "Caveat:"):
+        assert label not in prompt
+
+
 def test_token_redirect(app_env):
     port, _, _, _, user = app_env
     resp = httpx.get(f"http://127.0.0.1:{port}/u/{user.token}", follow_redirects=False)
