@@ -265,6 +265,11 @@ TOP_COMMENT_MAX_PER_THREAD = 6
 GOOD_TOPLEVEL_MIN_LEN = 200
 GOOD_TOPLEVEL_MIN_REPLIES = 3
 TOP_COMMENT_TOP_LEVEL_BUDGET = TOP_COMMENT_LIMIT // 3
+# Comment join for storage: explicit markdown boundary so the TLDR prompt
+# sees segments, not soup. Matches server.py's COMMENT_PROMPT_CHAR_LIMIT —
+# retain everything the prompt assembler will actually use.
+HN_COMMENTS_SEPARATOR = "\n\n---\n\n"
+HN_COMMENTS_CACHE_CHAR_LIMIT = 24_000
 HOT_MIN_SCORE = 20
 DASHBOARD_QUEUE_SIZE = 12
 PRIMARY_PER_COMBO = 12
@@ -515,6 +520,30 @@ def _select_top_comments(
             break
 
     return selected
+
+
+def join_top_comments(
+    texts: list[str], limit: int = HN_COMMENTS_CACHE_CHAR_LIMIT
+) -> str:
+    """Join selected comment texts on a markdown boundary, within budget.
+
+    Boundary-aware: each comment is appended whole or not at all — never
+    sliced mid-comment. Oversized comments are skipped, not truncating the
+    pack. Blank entries are skipped.
+    """
+    parts: list[str] = []
+    total = 0
+    for text in texts:
+        if not text or not text.strip():
+            continue
+        sep_len = 0 if not parts else len(HN_COMMENTS_SEPARATOR)
+        if total + sep_len + len(text) > limit:
+            continue
+        if parts:
+            parts.append(HN_COMMENTS_SEPARATOR)
+        parts.append(text)
+        total += sep_len + len(text)
+    return "".join(parts)
 
 
 def compose_story_text(

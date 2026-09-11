@@ -4901,6 +4901,40 @@ def test_min_comment_length_filter():
     assert "Sixty-one character" in texts[0]
 
 
+def test_join_top_comments_uses_separator_and_budget() -> None:
+    """Stored top_comments join on a markdown boundary and never slice
+    a comment mid-way; blanks are skipped."""
+    from pipeline import join_top_comments
+    from pipeline.ranking import (
+        HN_COMMENTS_CACHE_CHAR_LIMIT,
+        HN_COMMENTS_SEPARATOR,
+    )
+
+    assert join_top_comments([]) == ""
+    assert join_top_comments(["  ", ""]) == ""
+    assert join_top_comments(["one"]) == "one"
+    joined = join_top_comments(["alpha", "beta", "gamma"])
+    assert joined == HN_COMMENTS_SEPARATOR.join(["alpha", "beta", "gamma"])
+    # Whole-or-nothing: a comment that would overflow the budget is
+    # dropped entirely instead of truncated mid-comment.
+    head = "h" * 100
+    exact = "t" * HN_COMMENTS_CACHE_CHAR_LIMIT
+    assert join_top_comments([head, exact]) == head
+    assert len(join_top_comments([head, exact])) <= HN_COMMENTS_CACHE_CHAR_LIMIT
+    # An oversized head must not block smaller comments behind it.
+    oversized = "t" * (HN_COMMENTS_CACHE_CHAR_LIMIT + 1)
+    assert join_top_comments([oversized, "small"]) == "small"
+    assert join_top_comments([oversized]) == ""
+
+
+def test_hn_comments_cache_limit_matches_prompt() -> None:
+    """Storage must retain everything the TLDR prompt will use."""
+    import server
+    from pipeline.ranking import HN_COMMENTS_CACHE_CHAR_LIMIT
+
+    assert HN_COMMENTS_CACHE_CHAR_LIMIT == server.COMMENT_PROMPT_CHAR_LIMIT
+
+
 def test_hot_badge_requires_minimum_score(db, embedder):
     """Stories with score < HOT_MIN_SCORE must not get is_hot even with high velocity."""
     now = time.time()
@@ -7597,6 +7631,56 @@ async def test_probe_live_counts_parses_defensively(monkeypatch) -> None:
     assert await _probe_live_counts(stories, 10.0) == {1: 120}
 
 
+async def test_refresh_grown_threads_hot_bypass_ignores_memory(monkeypatch) -> None:
+    """Probe memory must not starve the hottest threads: velocity top-3
+    re-probe within the same cap even when memory suppresses them."""
+    import pipeline
+    from database import Database
+    from pipeline import Config, refresh_grown_threads
+
+    now = time.time()
+    db = Database(":memory:")
+    try:
+        stories = [
+            _probe_story(21, now=now, count=300, fetched=290, age_h=2.0),
+            _probe_story(22, now=now, count=90, fetched=85, age_h=6.0),
+            _probe_story(23, now=now, count=85, fetched=80, age_h=6.0),
+            _probe_story(24, now=now, count=84, fetched=80, age_h=6.0),
+        ]
+        for s in stories:
+            db.upsert_story(s)
+            db.upsert_tldr_cache(s.id, f"k{s.id}", "old tldr")
+        # Memory suppresses everything (same DB counts as last probe).
+        memory: dict[int, tuple[float, int]] = {
+            s.id: (now, s.comment_count or 0) for s in stories
+        }
+
+        probed: list[int] = []
+
+        async def fake_probe(found: list, timeout_s: float) -> dict[int, int]:
+            probed.extend(s.id for s in found)
+            return {}
+
+        async def fake_fetch_story(
+            client: object, sid: int, db_: object, *, force: bool = False
+        ) -> object:
+            raise AssertionError("no growth confirmed, must not hydrate")
+
+        monkeypatch.setattr(pipeline, "_probe_live_counts", fake_probe)
+        monkeypatch.setattr(pipeline, "fetch_story", fake_fetch_story)
+
+        config = Config()
+        hydrated_n, _ = await refresh_grown_threads(
+            config, db, stories, now=now, memory=memory
+        )
+        assert hydrated_n == 0
+        # Hottest three (21, 22, 23 by velocity) probe despite memory;
+        # the coldest (24) stays suppressed.
+        assert probed == [21, 22, 23]
+    finally:
+        db.close()
+
+
 async def test_refresh_grown_threads_only_hydrates_confirmed(monkeypatch) -> None:
     """End of the 'known new content' rule: probes run for eligible cached
     threads, but the heavy hydration fires only where the probe confirms
@@ -7666,7 +7750,8 @@ async def test_refresh_grown_threads_only_hydrates_confirmed(monkeypatch) -> Non
         # Cap + known-growth exclusion: reload like fetch_candidates_only
         # does after a grown cycle — story 11 now shows DB growth 120 >= 26,
         # so the normal prewarm path owns it; 12 was probed with no change,
-        # so memory suppresses the re-probe. Nothing fires.
+        # but the hot-thread bypass re-probes the single hottest eligible
+        # thread within the cap. No growth confirmed, so nothing hydrates.
         probed.clear()
         hydrated.clear()
         reloaded = [s for s in (db.get_story(s.id) for s in stories) if s is not None]
@@ -7675,21 +7760,22 @@ async def test_refresh_grown_threads_only_hydrates_confirmed(monkeypatch) -> Non
         assert await refresh_grown_threads(
             capped, db, reloaded, now=now, memory=memory
         ) == (0, set())
-        assert probed == []
+        assert probed == [12]
         assert hydrated == []
 
-        # Probe memory: a further immediate repeat still probes nothing.
-        # A CH count move re-arms the probe.
+        # Repeat: the bypass keeps probing the hottest eligible thread;
+        # hydration still needs confirmed growth, so still nothing fires.
+        # A CH count move re-arms the normal (non-bypass) probe as well.
         assert await refresh_grown_threads(
             capped, db, reloaded, now=now, memory=memory
         ) == (0, set())
-        assert probed == []
+        assert probed == [12, 12]
         db.upsert_story(replace(reloaded[1], comment_count=59))
         rearmed = [s for s in (db.get_story(s.id) for s in stories) if s is not None]
         assert await refresh_grown_threads(
             capped, db, rearmed, now=now, memory=memory
         ) == (0, set())
-        assert probed == [12]
+        assert probed == [12, 12, 12]
     finally:
         db.close()
 

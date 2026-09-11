@@ -30,6 +30,7 @@ from .ranking import (
     compose_story_text,
     _extract_comments_recursive,
     _select_top_comments,
+    join_top_comments,
 )
 
 
@@ -132,7 +133,7 @@ async def fetch_story(
         children = item.get("children", [])
         all_comments = _extract_comments_recursive(children)
         selected = _select_top_comments(all_comments)
-        top_comment_texts = " ".join(c["text"] for c in selected)[:10000]
+        top_comment_texts = join_top_comments([c["text"] for c in selected])
 
         # Algolia carries no article body: preserve the stored one, or every
         # force-refresh (tap active-refresh today, regen growth-refresh next)
@@ -255,7 +256,7 @@ def prewarm_top_stories(
         children = item.get("children") or []
         all_comments = _extract_comments_recursive(children)
         selected = _select_top_comments(all_comments)
-        top_comments = " ".join(c["text"] for c in selected)[:10000]
+        top_comments = join_top_comments([c["text"] for c in selected])
         if not top_comments:
             continue
         comment_count = coerce_int(

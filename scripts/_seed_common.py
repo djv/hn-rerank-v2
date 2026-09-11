@@ -25,6 +25,7 @@ from pipeline import (
     get_or_compute_embeddings,
     _extract_comments_recursive,
     _select_top_comments,
+    join_top_comments,
 )
 
 
@@ -106,7 +107,7 @@ def _apply_ch_comments_to_story(story: Story, item: ChItem) -> Story:
     children = item.get("children") or []
     all_comments = _extract_comments_recursive(children)
     selected = _select_top_comments(all_comments)
-    top_comments = " ".join(c["text"] for c in selected)[:10000]
+    top_comments = join_top_comments([c["text"] for c in selected])
 
     story_text = clean_text(str(item.get("story_text") or item.get("text") or ""))
     self_text = (

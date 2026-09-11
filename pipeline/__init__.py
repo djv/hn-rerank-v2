@@ -77,6 +77,7 @@ from .ranking import (
     clean_text,
     compose_story_text,
     get_or_compute_embeddings,
+    join_top_comments,
     mmr_filter,
     rerank_candidates,
     source_category_onehot,
@@ -537,7 +538,15 @@ async def refresh_grown_threads(
             or at - m[0] >= _PROBE_MEMORY_TTL_S
         ]
         skipped = len(eligible) - len(fresh)
-        eligible = fresh[:cap]
+        # Hot-thread bypass: eligible is velocity-ordered, so eligible[:3]
+        # are the hottest threads. Probe memory must not starve them for
+        # 24h when the cap is contended — they join within the same cap.
+        bypass_ids = {s.id for s in eligible[:3]}
+        bypassed = [s for s in eligible if s.id in bypass_ids]
+        rest = [s for s in fresh if s.id not in bypass_ids]
+        revived = sum(1 for s in bypassed if all(f.id != s.id for f in fresh))
+        eligible = (bypassed + rest)[:cap]
+        skipped -= revived
         checked = len(eligible)
         if not eligible:
             return (0, set())

@@ -2704,12 +2704,11 @@ def test_flask_test_client_tldr_skips_refresh_for_cached_quiet_recent_thread(
     assert resp.get_json()["cached"] is True
 
 
+@pytest.mark.parametrize("stored_count", [20, 60])
 def test_flask_test_client_tldr_tap_probe_hydrates_confirmed_growth(
-    test_env: Any, monkeypatch: pytest.MonkeyPatch
+    test_env: Any, monkeypatch: pytest.MonkeyPatch, stored_count: int
 ) -> None:
-    """Tap-time probe hit: a live count beating the DB count heals
-    comment_count and force-hydrates, so a grown thread regenerates its
-    TLDR instead of serving the stale cached one."""
+    """Unfetched live comments trigger hydration even after count healing."""
     import server
 
     _, db, _, handler, user = test_env
@@ -2719,11 +2718,11 @@ def test_flask_test_client_tldr_tap_probe_hydrates_confirmed_growth(
         title="Grown thread story",
         url="https://example.com/grown-thread",
         score=50,
-        time=int(now - 2 * 3600),  # 2h old
+        time=int(now - 10 * 3600),  # below the active velocity threshold
         text_content="Grown thread story. Body.",
         source="hn",
-        comment_count=20,  # 10/hr but below the 30-comment active floor
-        comment_count_at_fetch=20,  # ... so only the tap probe can notice growth
+        comment_count=stored_count,
+        comment_count_at_fetch=20,  # tap must compare live against this count
         self_text="",
         top_comments="Old prewarmed comments.",
         article_body="Body.",
@@ -2777,6 +2776,81 @@ def test_flask_test_client_tldr_tap_probe_hydrates_confirmed_growth(
     healed = db.get_story(grown_story.id)
     assert healed is not None
     assert healed.comment_count == 60
+
+
+def test_flask_test_client_tldr_heals_count_past_lagging_hydrate(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Algolia lags Firebase: when hydration returns fewer comments than
+    the probe-confirmed live count, the DB count keeps the live number
+    and the response reports both live and summarized counts."""
+    import server
+
+    _, db, _, handler, user = test_env
+    now = time.time()
+    grown_story = Story(
+        id=1734,
+        title="Lagging hydrate story",
+        url="https://example.com/lagging-hydrate",
+        score=50,
+        time=int(now - 2 * 3600),  # 2h old
+        text_content="Lagging hydrate story. Body.",
+        source="hn",
+        comment_count=20,  # below the 30-comment active floor
+        comment_count_at_fetch=20,  # ... so only the tap probe notices growth
+        self_text="",
+        top_comments="Old prewarmed comments.",
+        article_body="Body.",
+    )
+    db.upsert_story(grown_story)
+    cached_key = server._tldr_cache_key(
+        title=grown_story.title,
+        self_text=grown_story.self_text or "",
+        top_comments=grown_story.top_comments or "",
+        article_body=grown_story.article_body or "",
+    )
+    db.upsert_tldr_cache(grown_story.id, cached_key, "Stale cached TLDR")
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+
+    async def mock_probe_live_counts(stories, timeout_s):
+        return {grown_story.id: 60}
+
+    monkeypatch.setattr("pipeline._probe_live_counts", mock_probe_live_counts)
+
+    async def mock_fetch_story(client_, sid, db_, *, force=False):
+        current = db_.get_story(sid)
+        assert current is not None
+        # Algolia view of the world: only 40 of the 60 live comments.
+        updated = replace(
+            current,
+            top_comments="Freshly hydrated comments.",
+            comment_count=40,
+            comment_count_at_fetch=40,
+        )
+        db_.upsert_story(updated)
+        return updated
+
+    monkeypatch.setattr("pipeline.fetch_story", mock_fetch_story)
+
+    async def mock_generate_detailed_tldr(
+        title: str, self_text: str, top_comments: str, article_body: str
+    ) -> "server.TldrResult":
+        return server.TldrResult(kind="ok", tldr=f"Fresh TLDR: {top_comments}")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    resp = client.post("/api/tldr-detail", json={"story_id": grown_story.id})
+
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["cached"] is False
+    assert body["comment_count_live"] == 60
+    assert body["comment_count_summarized"] == 40
+    healed = db.get_story(grown_story.id)
+    assert healed is not None
+    assert healed.comment_count == 60
+    assert healed.comment_count_at_fetch == 40
 
 
 def test_flask_test_client_tldr_tap_probe_failure_serves_cached(
@@ -4382,6 +4456,59 @@ def test_terminal_theme_contract() -> None:
         assert token in template
 
 
+def test_forced_tldr_refresh_serializes_requests() -> None:
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node is required to execute browser refresh logic")
+    _, script = _read_template_and_static()
+    start = script.index("    async function openTldrDetail(")
+    end = script.index("    const KEY_ACTIONS", start)
+    harness = (
+        r"""
+const assert = require('node:assert/strict');
+const content = {dataset: {}, style: {display: 'none'}};
+const card = {dataset: {storyId: '1'}, querySelector: selector =>
+  selector === '.tldr-detail-content' ? content : null};
+const tldrCache = new Map([[1, 'old summary']]);
+const tldrRetryAt = new Map([[1, Date.now() + 600000]]);
+const apiPath = path => path;
+let calls = 0, finish;
+const fetch = () => {
+  calls++;
+  return new Promise(resolve => { finish = resolve; });
+};
+const response = {ok: true, json: async () => ({tldr: 'fresh summary'})};
+const parseSimpleMarkdown = text => text;
+const styleTldrLabels = () => {};
+const enhanceTldrContent = () => {};
+const ensureTldrRefreshButton = () => {};
+"""
+        + script[start:end]
+        + r"""
+(async () => {
+  const first = openTldrDetail(card, {force: true});
+  await openTldrDetail(card, {force: true});
+  await openTldrDetail(card);
+  assert.equal(calls, 1);
+  finish(response);
+  await first;
+  assert.equal(content.dataset.loading, undefined);
+  assert.equal(tldrCache.get(1), 'fresh summary');
+  const next = openTldrDetail(card, {force: true});
+  assert.equal(calls, 2);
+  finish(response);
+  await next;
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+    )
+    subprocess.run(
+        [node, "-e", harness], check=True, capture_output=True, text=True, timeout=10
+    )
+
+
 def test_prefetch_follows_navigation_order() -> None:
     import shutil
     import subprocess
@@ -5799,6 +5926,15 @@ def test_deck_actions_restore_native_focus_to_active_card() -> None:
         "document.body.classList.toggle('fullscreen');\n        focusActiveCard();"
         in key_actions
     )
+    assert "t: () => refreshTldr()" in key_actions
+    assert "s: () => refreshDeck()" in key_actions
+    assert "function refreshTldr(card)" in inline_script
+    assert "openTldrDetail(card || activeCard, { force: true })" in inline_script
+    assert "function refreshDeck()" in inline_script
+    assert "queueRefill(false)" in inline_script
+    assert "refreshTldr(card);" in inline_script
+    assert ">t</span> re-summarize TLDR" in template
+    assert ">s</span> refresh deck" in template
     key_action_buttons = inline_script.split(
         "document.querySelectorAll('[data-key-action]').forEach", 1
     )[1].split("async function fetchRefillDoc", 1)[0]

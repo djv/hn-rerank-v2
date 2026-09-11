@@ -2104,6 +2104,16 @@
       });
     }
 
+    // Manual refresh helpers shared by the re-summarize button and the
+    // t/s hotkeys below. refreshTldr force-refreshes (bypasses cache and
+    // cooldown); refreshDeck re-fetches deck cards without advancing.
+    function refreshTldr(card) {
+      openTldrDetail(card || activeCard, { force: true });
+    }
+    function refreshDeck() {
+      queueRefill(false);
+    }
+
     // Re-summarize control, idempotent: one button per TLDR block that
     // force-refreshes this card's summary (new comments) on explicit tap.
     // Never wired from prefetch — only from successful renders below.
@@ -2115,7 +2125,7 @@
       btn.textContent = '↻ re-summarize';
       btn.addEventListener('click', (e) => {
         e.stopPropagation();
-        openTldrDetail(card, { force: true });
+        refreshTldr(card);
       });
       contentDiv.appendChild(btn);
     }
@@ -2130,7 +2140,7 @@
       const storyTitle = card.querySelector('.story-title a')?.textContent || '';
 
       let contentDiv = card.querySelector('.tldr-detail-content');
-      if (contentDiv?.dataset.loading === 'true' && !force) {
+      if (contentDiv?.dataset.loading === 'true') {
         return;
       }
       if (contentDiv && contentDiv.style.display !== 'none' && !contentDiv.dataset.error && !force) {
@@ -2227,6 +2237,8 @@
       d: () => setFilter('sort', 'date'),
       e: () => setFilter('age', 'recent'),
       a: () => setFilter('age', 'archive'),
+      t: () => refreshTldr(),
+      s: () => refreshDeck(),
       // m/h/n (source filter) temporarily disabled alongside the source
       // toggle UI — see pipeline/render.py::_build_tab_groups.
       f: () => {

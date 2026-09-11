@@ -2464,10 +2464,10 @@ def _tldr_tap_probe_growth(
 ) -> tuple[Story, bool]:
     """Firebase live-count check for a single tap; heals comment_count on growth.
 
-    Returns (story, grew): grew is True only when live beats the DB count,
-    in which case the healed story is already upserted. Probe failures,
-    unparseable bodies, and backwards counts fall through as (story, False)
-    — the tap serves cached, never blocks.
+    Returns (story, grew): grew means live exceeds the last fetched count,
+    even if the stored count already reflects that growth. Heal the stored
+    count independently, upwards only. Probe failures and missing counts
+    fall through as (story, False).
     """
     from pipeline import _probe_live_counts
 
@@ -2483,14 +2483,15 @@ def _tldr_tap_probe_growth(
         logging.exception("tldr tap probe failed for story_id=%s", story.id)
         return (story, False)
     live = live_counts.get(story.id, 0)
-    if live <= (story.comment_count or 0):
+    if live > (story.comment_count or 0):
+        story = replace(story, comment_count=live)
+        db.upsert_story(story)
+    if live <= (story.comment_count_at_fetch or 0):
         return (story, False)
-    healed = replace(story, comment_count=live)
-    db.upsert_story(healed)
     logging.info(
         "tldr_detail story_id=%s result=tap_probe_growth live=%s", story.id, live
     )
-    return (healed, True)
+    return (story, True)
 
 
 def _serve_cached_tldr(
@@ -2599,6 +2600,7 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
         # gets one live-count check first; confirmed growth falls through to
         # hydration below instead of serving stale. Miss/failure serves cached.
         tap_probed_growth = False
+        live_comment_count: int | None = None
         if (
             cached_tldr
             and not needs_active_refresh
@@ -2608,6 +2610,8 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             story, tap_probed_growth = _tldr_tap_probe_growth(
                 runtime.db, runtime.config, story
             )
+            if tap_probed_growth:
+                live_comment_count = story.comment_count
         if (
             cached_tldr
             and not needs_active_refresh
@@ -2782,6 +2786,16 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
 
         if isinstance(hn_updated, Story):
             story = hn_updated
+            if (
+                live_comment_count is not None
+                and (story.comment_count or 0) < live_comment_count
+            ):
+                # Algolia lags Firebase: never move the count backwards
+                # below the live descendants the probe just confirmed.
+                # comment_count_at_fetch keeps Algolia's number — it is
+                # what the summarized comments actually reflect.
+                story = replace(story, comment_count=live_comment_count)
+                runtime.db.upsert_story(story)
         elif isinstance(hn_updated, Exception):
             logging.error(
                 "Failed to dynamically fetch comments for TLDR: %r", hn_updated
@@ -2932,7 +2946,8 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
         _maybe_cache_tldr(runtime.db, story.id, cache_key, result)
         logging.info(
             "tldr_detail story_id=%s result=generated cache_key=%s "
-            "tldr_total_ms=%.0f hydrate_ms=%.0f(hnsrc=%.0f/%.0f/art=%.0f) llm_ms=%.0f",
+            "tldr_total_ms=%.0f hydrate_ms=%.0f(hnsrc=%.0f/%.0f/art=%.0f) llm_ms=%.0f "
+            "live=%s summarized_at_fetch=%s",
             story.id,
             cache_key[:12],
             tldr_total_ms,
@@ -2941,8 +2956,16 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             hydrate_src_ms,
             hydrate_article_ms,
             llm_ms,
+            live_comment_count,
+            story.comment_count_at_fetch,
         )
-        payload = {"ok": True, "tldr": result.tldr, "cached": False}
+        payload = {
+            "ok": True,
+            "tldr": result.tldr,
+            "cached": False,
+            "comment_count_live": live_comment_count,
+            "comment_count_summarized": story.comment_count_at_fetch,
+        }
         if not result.cacheable:
             payload["retryable"] = True
         return _flask_json_response(payload)

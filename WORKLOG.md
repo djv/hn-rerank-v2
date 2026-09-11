@@ -8587,3 +8587,50 @@ texts, both under onnxruntime `CPUExecutionProvider`.
   comment chain (+ `_ranked_comment` test factory), explicit hydration
   result union in the tap path, `tuple[Any, ...]`/`dict[str, Any]` for
   sqlite rows. `ty check` and `ruff check` stay clean.
+
+## 2026-09-10 — comment join + freshness (tap heal, hot bypass, counts)
+
+- Assumption audit first: `clean_text` does NOT strip `---` (regex
+  `[#*^\\/|\\-_+]{3,}` holds a `\\`-`_` range, `-` is the range operator,
+  so `-` itself is not in the class) — separator survives all paths.
+  Live proof on 49639090: Firebase 355 / Algolia tree 334 / DB 280;
+  selector yields 289 substantive -> 40 capped (14970 chars) stored as
+  exactly 10000, i.e. ~1/3 lost mid-comment.
+- (1) `top_comments` now joins on `\n\n---\n\n` via
+  `ranking.join_top_comments` (whole-comment-or-nothing up to
+  `HN_COMMENTS_CACHE_CHAR_LIMIT = 24_000`, matching the prompt cap),
+  at `enrichment.py` single + prewarm paths and `_seed_common.py`
+  seeder. Old rows miss the cache key naturally; stale fallback covers.
+- (2a) Regen: velocity top-3 bypass probe memory within the same cap
+  (`refresh_grown_threads`) — hottest threads can't starve 24h.
+- (2b) Tap: probe-confirmed live count floor-survives a lagging Algolia
+  hydrate (`comment_count` never moves back below live; `at_fetch` keeps
+  Algolia's number as the honest summarized count); generated TLDRs log
+  and return `comment_count_live` / `comment_count_summarized`.
+- Tests: join separator/budget/blank-skip, storage==prompt cap parity,
+  bypass-ignore-memory, lagging-hydrate heal + payload fields; updated
+  `only_hydrates_confirmed` memory narrative. 752 passed, ruff + ty clean.
+- Review follow-up: `join_top_comments` packs greedily (`continue`, not
+  `break`) so one oversized head comment is skipped instead of voiding
+  the whole pack.
+
+## 2026-09-10 — t/s hotkeys for TLDR + deck refresh
+
+- `t` force-refreshes active TLDR (`refreshTldr` -> `openTldrDetail force:true`); `s` re-fetches deck (`refreshDeck` -> `queueRefill(false)`, non-advancing, coalesced).
+- Shared helpers: re-summarize button and hotkeys call the same `refreshTldr(card)`; no new server code/state.
+- Side-rail legend gains display-only `t`/`s` rows; contract test pins KEY_ACTIONS + helpers + legend.
+
+## 2026-09-11 — refresh review fixes
+
+- Tap freshness compares live comments with `comment_count_at_fetch`, not
+  the already-healed stored count. Stored counts still only heal upwards.
+- Forced TLDR refresh respects the per-card loading guard, preventing
+  overlapping requests from repeated hotkeys while preserving explicit
+  cache/cooldown bypass after the current request finishes.
+- Regression coverage: cached endpoint with already-known unfetched growth;
+  executable browser test for overlapping ordinary/forced refreshes and
+  a subsequent explicit refresh. Existing September 10 WIP preserved.
+- Validation: 754 tests passed (one pre-existing unawaited-coroutine test
+  warning); Ruff, touched-file formatting, Ty and diff checks passed.
+  Restarted service; dashboard 200 with the new loading guard, forced TLDR
+  generated in 3.46s, subsequent request cached; no request errors.
