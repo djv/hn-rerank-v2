@@ -5047,7 +5047,7 @@ async def test_call_llm_responses_success_and_429(monkeypatch) -> None:
     async def allow_acquire(*, estimated_tokens=0):
         return True
 
-    async def noop_record(**kwargs):
+    def noop_record(**kwargs):
         return None
 
     monkeypatch.setattr(server.llm_limiter, "acquire", allow_acquire)
