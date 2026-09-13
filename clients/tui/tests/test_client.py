@@ -228,3 +228,16 @@ async def test_rate_limit_and_zero_reset() -> None:
         await pilot.pause(0.2)
         assert app.target == 0
         assert app.feed and app.feed.ready and app.feed.version == 0
+
+
+async def test_stale_poll_does_not_cancel_summary_for_same_selection() -> None:
+    fake = FakeServer()
+    fake.feed = sample_feed(0, 1)
+    fake.delay_summary = 1.4
+    app = Reader(api=fake.api())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await pilot.pause(2.1)
+        assert "Summary 1" in app.query_one(Markdown)._markdown
+        assert (
+            len([r for r in fake.requests if r.url.path.endswith("tldr-detail")]) == 1
+        )

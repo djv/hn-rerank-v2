@@ -169,6 +169,7 @@ class Reader(App[None]):
         self.pending = False
         self.target: int | None = None
         self.selection_serial = 0
+        self.summary_story_id: int | None = None
         self.reading = False
         self.setting_up = False
 
@@ -223,6 +224,7 @@ class Reader(App[None]):
         if self.setting_up:
             return
         self.setting_up = True
+        self.summary_story_id = None
         self.selection_serial += 1
         self.workers.cancel_group(self, "summary")
         self.workers.cancel_group(self, "refresh")
@@ -279,6 +281,7 @@ class Reader(App[None]):
             )
             self.schedule_summary()
         else:
+            self.summary_story_id = None
             self.selection_serial += 1
             self.workers.cancel_group(self, "summary")
             self.query_one("#summary", Markdown).update(
@@ -294,9 +297,10 @@ class Reader(App[None]):
         self.schedule_summary()
 
     def schedule_summary(self) -> None:
-        self.selection_serial += 1
         story = self.selected()
-        if story:
+        if story and story.id != self.summary_story_id:
+            self.summary_story_id = story.id
+            self.selection_serial += 1
             self.load_summary(story.id, self.selection_serial)
 
     @work(group="summary", exclusive=True)
@@ -357,6 +361,7 @@ class Reader(App[None]):
             self.status(("Showing stale stories. " if self.feed else "") + str(exc))
 
     def action_refresh(self) -> None:
+        self.summary_story_id = None
         self.refresh_feed()
 
     def action_move(self, delta: int) -> None:
