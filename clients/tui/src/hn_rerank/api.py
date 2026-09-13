@@ -56,6 +56,8 @@ class Profile:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "server", normalize_server(self.server))
+        if not isinstance(self.token, str):
+            raise TypeError("Invalid profile token.")
         if (
             not self.token
             or not self.token.isascii()
