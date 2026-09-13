@@ -23,6 +23,8 @@ class InvalidProfile(APIError):
 
 
 def normalize_server(value: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError("Invalid server URL.")
     parsed = urlsplit(value.strip())
     if (
         parsed.scheme not in {"http", "https"}

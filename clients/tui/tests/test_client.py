@@ -264,3 +264,18 @@ foreach ($p in @($env:HN_RERANK_CONFIG_PATH, (Split-Path $env:HN_RERANK_CONFIG_P
         env={**os.environ, "HN_RERANK_CONFIG_PATH": str(path)},
     )
     assert result.returncode == 0
+
+
+@pytest.mark.parametrize("token", [None, 42, [], {}])
+async def test_malformed_profile_response_returns_safe_error(token: object) -> None:
+    api = API(
+        "https://example.org/",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"token": token})
+        ),
+    )
+    try:
+        with pytest.raises(InvalidProfile, match="invalid profile"):
+            await api.validate()
+    finally:
+        await api.close()
