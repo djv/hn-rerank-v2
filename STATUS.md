@@ -2,15 +2,14 @@
 
 - Objective: polish the terminal reader with a warm editorial style.
 - Owner: none; save-state refreshed 2026-09-13, no resource locks held.
-- Result: client styling and responsive filters implemented in the working tree;
-  wheel and sdist rebuilt. Server/API/VPS unchanged. User requested wrap-up and save-state.
-- Verification: 25 client tests passed / 1 Windows-only skip; backend 541 passed /
-  1 skipped; Ruff and ty clean. Isolated rebuilt wheel startup passed from /tmp.
-  Populated, code-summary, empty/error and setup renders inspected; resize tests
-  cover 60, 80, 100 and 140 columns including reading scroll and focus.
-- Unresolved: this revision has not run cross-platform CI or been committed/pushed.
-  Laptop graphical preview launched, but its actual terminal window was not
-  captured successfully; native visual verification remains incomplete.
-  PyPI publication still requires credentials.
-- Next action: review/commit the client changes and run cross-platform CI; finish
-  native terminal visual verification. See [FINDINGS.md](FINDINGS.md).
+- Result: editorial styling committed (`89b5994`) and pushed with an import-sort
+  fix (`45ca54f`). A setup-screen guard fix is committed locally (`763cc20`,
+  unpushed). Server/API/VPS unchanged.
+- Verification: backend 541 passed / 1 skipped; client 25 passed / 1 Windows-only
+  skip; Ruff and ty clean (also under ruff 0.16.7). Isolated rebuilt wheel startup
+  passed from /tmp. CI `34739910637`: ubuntu/macos green, Windows red on
+  `test_setup.py::test_import_validates_then_persists_and_relaunches`
+  (`#headlines` NoMatches from a straggler highlight during teardown).
+- Unresolved: Windows CI red pending push of `763cc20` and rerun. Native terminal
+  visual verification incomplete. PyPI publication still requires credentials.
+- Next action: push the guard fix and watch `tui.yml` to green. See [FINDINGS.md](FINDINGS.md).

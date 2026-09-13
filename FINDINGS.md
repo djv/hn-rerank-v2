@@ -19,11 +19,20 @@
   -m clients.tui.tests.preview --headless`; omit --headless for a synthetic terminal
   exercise. No production profile or server is used. Graphical windows launched,
   but a successful capture of the actual preview window was not obtained.
-- Pending: fresh cross-platform CI, native visual confirmation, commit/push and
-  credential-dependent PyPI publication. Earlier CI below covers the old revision.
-- Rollback: changes are uncommitted in app.py plus new editorial tests/preview;
-  review the diff before selectively reversing. Existing unrelated untracked files
-  were preserved. Wheel/sdist can be rebuilt from the previous source if needed.
+- Pending: push of guard fix `763cc20`, Windows CI rerun, native visual
+  confirmation, and credential-dependent PyPI publication.
+  Earlier CI below covers the old revision.
+- Rollback: editorial work is committed (`89b5994`, `45ca54f` pushed; `763cc20`
+  local-only) — revert with `git revert` or reset to `origin/feat/terminal-client`.
+  Existing unrelated untracked files were preserved.
+  Wheel/sdist can be rebuilt from the previous source if needed.
+- CI 2026-09-13: run `34739788455` failed all OS on ruff 0.16 I001 import order
+  (local ruff was 0.15.17 and passed); fixed in `45ca54f`. Rerun `34739910637`:
+  ubuntu/macos green, Windows red on
+  `test_setup.py::test_import_validates_then_persists_and_relaunches` —
+  `on_option_list_option_highlighted` queried `#headlines` while the Setup
+  screen was active (straggler highlight during teardown). Guarded in `763cc20`
+  (`setting_up`/existence early return); local client suite green.
 
 ## Laptop project and package — 2026-09-13
 
