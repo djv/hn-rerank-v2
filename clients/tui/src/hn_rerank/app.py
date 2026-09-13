@@ -96,7 +96,7 @@ class Setup(ModalScreen[Profile | None]):
             await (
                 api.feed()
             )  # Verify API compatibility before persisting the credential.
-            save_profile(profile, self.path)
+            await asyncio.to_thread(save_profile, profile, self.path)
             self.dismiss(profile)
         except (APIError, ValueError, OSError) as exc:
             message = (

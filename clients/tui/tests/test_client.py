@@ -7,8 +7,6 @@ from pathlib import Path
 
 import httpx
 import pytest
-from textual.widgets import Input, Markdown, OptionList, Select, Static
-
 from hn_rerank.api import (
     API,
     APIError,
@@ -19,6 +17,7 @@ from hn_rerank.api import (
 )
 from hn_rerank.app import Reader, Setup
 from hn_rerank.models import Feed, FeedStory
+from textual.widgets import Input, Markdown, OptionList, Select, Static
 
 
 def sample_feed(version: int = 0, target: int = 0) -> Feed:
@@ -241,3 +240,26 @@ async def test_stale_poll_does_not_cancel_summary_for_same_selection() -> None:
         assert (
             len([r for r in fake.requests if r.url.path.endswith("tldr-detail")]) == 1
         )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows DACL verification")
+def test_windows_profile_has_private_acl(tmp_path: Path) -> None:
+    import subprocess
+
+    path = tmp_path / "private" / "profile.json"
+    save_profile(Profile("https://example.org/hn/", "private"), path)
+    script = """
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+foreach ($p in @($env:HN_RERANK_CONFIG_PATH, (Split-Path $env:HN_RERANK_CONFIG_PATH))) {
+    $acl = Get-Acl -LiteralPath $p
+    if (-not $acl.AreAccessRulesProtected -or $acl.Access.Count -ne 1) { exit 1 }
+    if ($acl.Access[0].IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -ne $sid) { exit 2 }
+}
+"""
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        check=False,
+        env={**os.environ, "HN_RERANK_CONFIG_PATH": str(path)},
+    )
+    assert result.returncode == 0

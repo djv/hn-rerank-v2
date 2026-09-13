@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -87,9 +88,45 @@ def load_profile(path: Path) -> Profile | None:
         ) from exc
 
 
+def restrict_permissions(path: Path, *, directory: bool = False) -> None:
+    if os.name != "nt":
+        path.chmod(0o700 if directory else 0o600)
+        return
+    # chmod on Windows does not set a private DACL. Replace it with an
+    # owner-only ACL through the OS-provided PowerShell, without shell interpolation.
+    script = """
+$ErrorActionPreference = 'Stop'
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+if ($env:HN_RERANK_DIRECTORY -eq '1') {
+    $acl = New-Object System.Security.AccessControl.DirectorySecurity
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+} else {
+    $acl = New-Object System.Security.AccessControl.FileSecurity
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'Allow')
+}
+$acl.SetOwner($sid)
+$acl.SetAccessRuleProtection($true, $false)
+$acl.AddAccessRule($rule)
+Set-Acl -LiteralPath $env:HN_RERANK_CONFIG_PATH -AclObject $acl
+"""
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            **os.environ,
+            "HN_RERANK_CONFIG_PATH": str(path),
+            "HN_RERANK_DIRECTORY": "1" if directory else "0",
+        },
+    )
+    if result.returncode:
+        raise OSError("Could not restrict profile permissions.")
+
+
 def save_profile(profile: Profile, path: Path) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path.parent.chmod(0o700)
+    restrict_permissions(path.parent, directory=True)
     fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".profile-")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
@@ -97,7 +134,7 @@ def save_profile(profile: Profile, path: Path) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
-        path.chmod(0o600)
+        restrict_permissions(path)
     finally:
         Path(temporary).unlink(missing_ok=True)
 

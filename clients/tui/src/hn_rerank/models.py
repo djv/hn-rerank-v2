@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
 import math
+from dataclasses import asdict, dataclass
 from typing import Any
 
 
@@ -39,7 +39,7 @@ class Feed:
     @classmethod
     def parse(cls, data: Any) -> Feed:
         if not isinstance(data, dict):
-            raise ValueError("Invalid feed response")
+            raise TypeError("Invalid feed response")
         if data.get("api_version") != 1:
             raise ValueError("Unsupported feed API; update hn-rerank.")
         try:
