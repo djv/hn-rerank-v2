@@ -228,6 +228,8 @@ class Reader(App[None]):
         self.selection_serial += 1
         self.workers.cancel_group(self, "summary")
         self.workers.cancel_group(self, "refresh")
+        self.workers.cancel_group(self, "vote")
+        self.pending = False
         self.push_screen(Setup(self.config_path, self.server, message), self.connected)
 
     async def connected(self, profile: Profile | None) -> None:

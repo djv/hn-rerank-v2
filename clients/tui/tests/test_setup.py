@@ -96,3 +96,17 @@ async def test_undo_restores_story_during_stale_refresh() -> None:
         selected = app.selected()
         assert selected and selected.id == 1
         assert [story.id for story in app.stories] == [1, 2]
+
+
+async def test_profile_setup_cancels_pending_vote_state() -> None:
+    fake = FakeServer()
+    fake.delay_vote = 0.4
+    app = Reader(api=fake.api())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await pilot.pause(0.2)
+        app.action_vote("up")
+        await pilot.pause(0.05)
+        app.setup("Profile changed")
+        await pilot.pause(0.5)
+        assert isinstance(app.screen, Setup)
+        assert not app.pending and not app.rated and not app.history
