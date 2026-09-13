@@ -13,13 +13,13 @@
 +        if isinstance(html, DashboardDocument)
 +        else patched
 +    )
- 
- 
+
+
  def _extract_cards_fragment(html: bytes) -> bytes:
 @@ -3085,6 +3092,35 @@
              {"error": "No session"}, status=HTTPStatus.UNAUTHORIZED
          )
- 
+
 +    @app.get("/api/feed")
 +    def feed() -> ResponseReturnValue:
 +        from dataclasses import replace
@@ -55,7 +55,7 @@
 --- a/pipeline/render.py
 +++ b/pipeline/render.py
 @@ -2,6 +2,7 @@
- 
+
  from datetime import datetime
  import time
 +import random
@@ -64,7 +64,7 @@
  from urllib.parse import urlparse
 @@ -9,6 +10,7 @@
  from jinja2 import Environment, FileSystemLoader
- 
+
  from database import Database, Story
 +from clients.tui.src.hn_rerank.models import Feed, FeedStory
  from .config import (
@@ -72,8 +72,8 @@
      CH_ARCHIVE_SOURCE,
 @@ -327,6 +329,56 @@
      )
- 
- 
+
+
 +class DashboardDocument(bytes):
 +    """HTML and its wire representation travel atomically through the SWR cache."""
 +
@@ -130,7 +130,7 @@
 @@ -355,10 +407,11 @@
      )
      hot_badge_percentile = int(round(config.model.hot_badge_percentile))
- 
+
 +    cards = _build_dashboard_cards(ranked, hot_badge_percentile=hot_badge_percentile)
      template = env.get_template("index.html")
      html_content = template.render(
