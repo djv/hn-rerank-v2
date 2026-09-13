@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import webbrowser
+import time
 from pathlib import Path
 from typing import ClassVar
 from urllib.parse import urlsplit
@@ -11,15 +12,17 @@ from textual import events, work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
+from textual.theme import Theme
 from textual.widgets import (
     Button,
-    Footer,
     Input,
     Label,
     Markdown,
     OptionList,
     Select,
     Static,
+    Tab,
+    Tabs,
 )
 from textual.widgets.option_list import Option
 
@@ -36,6 +39,28 @@ from .api import (
 from .models import Feed, FeedStory
 
 
+def story_metadata(story: FeedStory) -> str:
+    domain = urlsplit(story.article_url).hostname or story.source
+    seconds = max(0, int(time.time()) - story.time)
+    age = (
+        f"{seconds // 86400}d"
+        if seconds >= 86400
+        else f"{seconds // 3600}h"
+        if seconds >= 3600
+        else f"{seconds // 60}m"
+    )
+    return f"{domain} · {story.points} pts · {story.comments or 0} comments · {age} ago"
+
+
+def headline(story: FeedStory, selected: bool | None = None) -> Text:
+    text = Text()
+    if selected is not None:
+        text.append("> " if selected else "  ", style="bold #FF914D")
+    text.append(story.title, style="bold #EEE8DD")
+    text.append("\n" + story_metadata(story), style="#AAA399")
+    return text
+
+
 class Summary(Markdown):
     can_focus = True
     BINDINGS: ClassVar[list[tuple[str, str, str]]] = [
@@ -48,10 +73,18 @@ class Summary(Markdown):
 
 class Setup(ModalScreen[Profile | None]):
     CSS = """
-    Setup { align: center middle; }
-    #setup { width: 70; max-width: 95%; height: auto; padding: 1 2; border: round $accent; }
-    #setup-message { height: auto; margin: 1 0; }
-    Input { margin-bottom: 1; }
+    Setup { align: center middle; background: #171717; color: #EEE8DD; }
+    #setup { width: 70; max-width: 95%; height: auto; max-height: 100%;
+             overflow-y: auto; padding: 1 2; background: #171717; }
+    #setup-title { text-style: bold; }
+    #setup-message { height: auto; margin: 1 0; color: #AAA399; }
+    #setup-message.error { color: #FFB4A6; }
+    .setup-section { margin-top: 1; text-style: bold; }
+    Setup Input { margin: 0 0 1 0; background: #222222; border: tall #44403B; }
+    Setup Input:focus { border: tall #FF914D; }
+    Setup Button { background: #292724; color: #EEE8DD; border: none; }
+    Setup Button:focus { text-style: bold underline; color: #FF914D; }
+    #quit { margin-top: 1; background: #171717; color: #AAA399; }
     """
 
     def __init__(self, path: Path, server: str | None, message: str = "") -> None:
@@ -63,15 +96,17 @@ class Setup(ModalScreen[Profile | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="setup"):
-            yield Label("HN Rerank — connect your profile")
+            yield Label("HN Rerank", id="setup-title")
             yield Static(
                 self.message
                 or "Import a profile link, or enter a server URL and create a new profile.",
                 id="setup-message",
                 markup=False,
             )
+            yield Label("Import an existing profile", classes="setup-section")
             yield Input(placeholder="https://host/hn/u/TOKEN", password=True, id="link")
             yield Button("Import profile", id="import")
+            yield Label("Start a new profile", classes="setup-section")
             yield Input(
                 value=self.server or "", placeholder="https://host/hn/", id="server"
             )
@@ -104,7 +139,10 @@ class Setup(ModalScreen[Profile | None]):
                 if not isinstance(exc, OSError)
                 else "Could not save profile configuration. Check directory permissions."
             )
-            self.query_one("#setup-message", Static).update(message)
+            self.query_one("#setup-message", Static).update(
+                message + " Check your details and try again."
+            )
+            self.query_one("#setup-message").add_class("error")
         finally:
             if api:
                 await api.close()
@@ -121,19 +159,49 @@ class Setup(ModalScreen[Profile | None]):
             for button in self.query(Button):
                 button.disabled = True
             self.query_one("#setup-message", Static).update("Connecting…")
+            self.query_one("#setup-message").remove_class("error")
             self.connect(event.button.id == "create")
 
 
 class Reader(App[None]):
     TITLE = "HN Rerank"
     CSS = """
+    Screen { background: #171717; color: #EEE8DD; }
+    #brand { height: 1; padding: 0 1; text-style: bold; }
     #filters { height: 3; }
-    Select { width: 1fr; }
+    Select { width: 1fr; display: none; }
+    SelectCurrent { background: #222222; border: tall #44403B; }
+    Select:focus SelectCurrent { border: tall #FF914D; }
+    Tabs { width: auto; }
+    #sort-tabs { width: 60; }
+    Tab { color: #AAA399; padding: 0 1; }
+    Tab.-active { color: #FF914D; text-style: bold; }
+    Tabs:focus Tab.-active { text-style: bold underline; }
+    Underline > .underline--bar { color: #FF914D; background: #171717; }
     #panes { height: 1fr; }
-    #headlines { width: 1fr; height: 1fr; }
-    #summary { width: 2fr; height: 1fr; padding: 0 2; overflow-y: auto; }
-    #status { height: auto; max-height: 3; padding: 0 1; color: $text-muted; }
-    .narrow #headlines, .narrow #summary { width: 1fr; }
+    #headlines { width: 1fr; height: 1fr; background: #171717;
+                 border: none; padding: 0; }
+    #headlines > .option-list--option { padding: 0 1; }
+    #headlines > .option-list--option-highlighted {
+        background: #292724; color: #EEE8DD;
+    }
+    #headlines:focus { background-tint: #171717 0%; }
+    #headlines:focus > .option-list--option-highlighted { text-style: none; }
+    #reading-pane { width: 2fr; height: 1fr; border-left: solid #44403B; }
+    #story-heading { height: auto; max-height: 8; padding: 1 2; }
+    #summary { width: 1fr; height: 1fr; padding: 0 2; overflow-y: auto;
+               background: #171717; color: #EEE8DD; }
+    MarkdownH1, MarkdownH2, MarkdownH3 { margin: 1 0; padding: 0;
+        border: none; background: #171717; color: #EEE8DD; text-style: bold; text-align: left; }
+    MarkdownParagraph, MarkdownBulletList, MarkdownOrderedList { margin: 0 0 1 0; }
+    MarkdownBlockQuote { border-left: solid #AAA399; background: #222222; margin: 0 0 1 0; }
+    MarkdownFence { background: #222222; margin: 0 0 1 0; padding: 1; }
+    #status { height: auto; max-height: 3; padding: 0 1; color: #AAA399; }
+    #status.error { color: #FFB4A6; text-style: bold; }
+    #shortcuts { height: 1; padding: 0 1; color: #AAA399; }
+    .narrow Tabs { display: none; }
+    .narrow Select { display: block; }
+    .narrow #headlines, .narrow #reading-pane { width: 1fr; border: none; }
     """
     BINDINGS: ClassVar[list[tuple[str, str, str]]] = [
         ("j", "move(1)", "Down"),
@@ -158,6 +226,23 @@ class Reader(App[None]):
         api: API | None = None,
     ) -> None:
         super().__init__()
+        self.register_theme(
+            Theme(
+                name="editorial",
+                primary="#AAA399",
+                secondary="#AAA399",
+                accent="#FF914D",
+                foreground="#EEE8DD",
+                background="#171717",
+                surface="#222222",
+                panel="#292724",
+                error="#FFB4A6",
+                success="#AAA399",
+                warning="#AAA399",
+                dark=True,
+            )
+        )
+        self.theme = "editorial"
         self.server = normalize_server(server) if server else None
         self.config_path = config_path or profile_path()
         self.api = api
@@ -174,7 +259,20 @@ class Reader(App[None]):
         self.setting_up = False
 
     def compose(self) -> ComposeResult:
+        yield Static("HN Rerank", id="brand")
         with Horizontal(id="filters"):
+            yield Tabs(
+                *(
+                    Tab(s.title(), id=f"sort-{s}")
+                    for s in ("recommended", "popular", "explore", "date")
+                ),
+                id="sort-tabs",
+            )
+            yield Tabs(
+                Tab("Recent", id="age-recent"),
+                Tab("Archive", id="age-archive"),
+                id="age-tabs",
+            )
             yield Select(
                 [(s.title(), s) for s in ("recommended", "popular", "explore", "date")],
                 value="recommended",
@@ -189,9 +287,11 @@ class Reader(App[None]):
             )
         with Horizontal(id="panes"):
             yield OptionList(id="headlines")
-            yield Summary("Connecting…", id="summary", open_links=False)
+            with Vertical(id="reading-pane"):
+                yield Static("", id="story-heading", markup=False)
+                yield Summary("Connecting…", id="summary", open_links=False)
         yield Static("Loading…", id="status", markup=False)
-        yield Footer()
+        yield Static("", id="shortcuts", markup=False)
 
     def on_mount(self) -> None:
         self.layout_panes()
@@ -201,8 +301,9 @@ class Reader(App[None]):
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         return not self.setting_up and not isinstance(self.focused, (Input, Select))
 
-    def status(self, message: str) -> None:
+    def status(self, message: str, *, error: bool = False) -> None:
         self.query_one("#status", Static).update(message)
+        self.query_one("#status").set_class(error, "error")
 
     @work(group="startup", exclusive=True)
     async def start(self) -> None:
@@ -218,7 +319,7 @@ class Reader(App[None]):
         except InvalidProfile as exc:
             self.setup(str(exc))
         except APIError as exc:
-            self.status(str(exc))
+            self.status(str(exc) + " Press r to retry.", error=True)
 
     def setup(self, message: str = "") -> None:
         if self.setting_up:
@@ -269,9 +370,7 @@ class Reader(App[None]):
         headlines.add_options(
             [
                 Option(
-                    Text(
-                        f"{s.title}\n{s.points} pts · {s.comments or 0} comments · {s.source}"
-                    ),
+                    headline(s, s.id == select_id),
                     id=str(s.id),
                 )
                 for s in self.stories
@@ -283,6 +382,7 @@ class Reader(App[None]):
             )
             self.schedule_summary()
         else:
+            self.query_one("#story-heading", Static).update("")
             self.summary_story_id = None
             self.selection_serial += 1
             self.workers.cancel_group(self, "summary")
@@ -291,16 +391,33 @@ class Reader(App[None]):
             )
 
     def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id in {"sort", "age"}:
+            self.query_one(
+                f"#{event.select.id}-tabs", Tabs
+            ).active = f"{event.select.id}-{event.value}"
         self.rebuild()
+
+    def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
+        if event.tab.id:
+            group, value = event.tab.id.split("-", 1)
+            self.query_one(f"#{group}", Select).value = value
 
     def on_option_list_option_highlighted(
         self, event: OptionList.OptionHighlighted
     ) -> None:
+        listing = self.query_one("#headlines", OptionList)
+        for index, story in enumerate(self.stories):
+            listing.replace_option_prompt(
+                str(story.id), headline(story, index == listing.highlighted)
+            )
         self.schedule_summary()
 
     def schedule_summary(self) -> None:
         story = self.selected()
         if story and story.id != self.summary_story_id:
+            self.query_one("#story-heading", Static).update(headline(story))
+            self.query_one("#summary", Markdown).update("Loading summary…")
+            self.query_one("#summary", Markdown).scroll_home(animate=False)
             self.summary_story_id = story.id
             self.selection_serial += 1
             self.load_summary(story.id, self.selection_serial)
@@ -323,7 +440,10 @@ class Reader(App[None]):
             self.setup(str(exc))
         except APIError as exc:
             if serial == self.selection_serial and self.query("#summary"):
-                self.query_one("#summary", Markdown).update(str(exc))
+                self.query_one("#summary", Markdown).update(
+                    "Summary unavailable. Press **r** to retry."
+                )
+                self.status(str(exc) + " Press r to retry.", error=True)
 
     @work(group="refresh", exclusive=True)
     async def refresh_feed(self) -> None:
@@ -360,7 +480,12 @@ class Reader(App[None]):
         except InvalidProfile as exc:
             self.setup(str(exc))
         except APIError as exc:
-            self.status(("Showing stale stories. " if self.feed else "") + str(exc))
+            self.status(
+                ("Showing stale stories. " if self.feed else "")
+                + str(exc)
+                + " Press r to retry.",
+                error=True,
+            )
 
     def action_refresh(self) -> None:
         self.summary_story_id = None
@@ -423,7 +548,11 @@ class Reader(App[None]):
         except InvalidProfile as exc:
             self.setup(str(exc))
         except APIError as exc:
-            self.status(str(exc))
+            self.status(
+                str(exc)
+                + " Vote not confirmed; r refreshes, then check before voting again.",
+                error=True,
+            )
         finally:
             self.pending = False
 
@@ -455,7 +584,18 @@ class Reader(App[None]):
         narrow = (self.size.width if width is None else width) < 100
         self.set_class(narrow, "narrow")
         self.query_one("#headlines").display = not narrow or not self.reading
+        self.query_one("#reading-pane").display = not narrow or self.reading
         self.query_one("#summary").display = not narrow or self.reading
+        self.query_one("#shortcuts", Static).update(
+            "j/k scroll · Esc headlines · o article · ? help · q quit"
+            if self.reading
+            else "j/k move · Enter read · 1/2/3 vote · ? help · q quit"
+        )
+
+    def on_descendant_focus(self, event: events.DescendantFocus) -> None:
+        if event.widget.id in {"summary", "headlines"}:
+            self.reading = event.widget.id == "summary"
+            self.layout_panes()
 
     def on_resize(self, event: events.Resize) -> None:
         if self.query("#panes"):

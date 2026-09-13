@@ -1,5 +1,30 @@
 # HN Rerank findings
 
+## Editorial terminal client — 2026-09-13
+
+- Implemented: charcoal/ivory theme, restrained orange tabs/focus/selection,
+  explicit `>` marker, domain/points/comments/age metadata, summary heading,
+  Markdown spacing, thin pane divider and context-sensitive shortcut footer.
+  Setup separates import and creation. Existing credential/API code is unchanged.
+- Agent-tested: 25 client tests passed / 1 Windows-only skip; backend 541 passed /
+  1 skipped. Ruff and ty clean. Rebuilt wheel version and headless setup startup
+  passed outside the checkout. New tests cover 60/80/100/140 columns, filters,
+  focus, preserved reading scroll and selection, setup validation and empty/errors.
+- Visual evidence: offline SVG renders under /tmp/hn-editorial-*.svg inspected
+  for populated/code, empty/error and setup states, including a long headline.
+  NO_COLOR=1 is set in the agent shell; color preview explicitly unsets it.
+  OptionList vertical component padding clips metadata in Textual 8, so options
+  use horizontal padding and a literal marker instead of a decorative border.
+- Preview: `env -u NO_COLOR TERM=xterm-256color COLORTERM=truecolor uv run python
+  -m clients.tui.tests.preview --headless`; omit --headless for a synthetic terminal
+  exercise. No production profile or server is used. Graphical windows launched,
+  but a successful capture of the actual preview window was not obtained.
+- Pending: fresh cross-platform CI, native visual confirmation, commit/push and
+  credential-dependent PyPI publication. Earlier CI below covers the old revision.
+- Rollback: changes are uncommitted in app.py plus new editorial tests/preview;
+  review the diff before selectively reversing. Existing unrelated untracked files
+  were preserved. Wheel/sdist can be rebuilt from the previous source if needed.
+
 ## Laptop project and package — 2026-09-13
 
 - Agent-tested: checkout moved from `/home/d/hn-rerank-v2` to `/home/d/hn-rerank`;

@@ -19,3 +19,12 @@ Local build: `uv build --project clients/tui`.
 Local launch: `uvx --from /absolute/path/to/hn_rerank-0.1.0-py3-none-any.whl hn-rerank`.
 If the package name cannot be registered, publish as `hn-rerank-tui` and run
 `uvx --from hn-rerank-tui hn-rerank`.
+
+## Reader appearance
+
+The charcoal and ivory reader uses orange for active filters and focus. A `>`
+marker identifies the selected headline without relying on color. At 100 columns
+and above, filter tabs sit over a one-third headline/two-thirds summary layout.
+Smaller terminals use dropdowns; Enter opens reading and Escape returns to headlines.
+Resize and focus changes preserve reading position. Run the offline preview from
+the repository root with `uv run python -m clients.tui.tests.preview --headless`.
