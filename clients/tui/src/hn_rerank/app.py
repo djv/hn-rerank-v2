@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import webbrowser
 import time
+import webbrowser
 from pathlib import Path
 from typing import ClassVar
 from urllib.parse import urlsplit

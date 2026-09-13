@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from dataclasses import replace
+
 from textual.pilot import Pilot
 from textual.widgets import Select
-from dataclasses import replace
+
 from hn_rerank.app import Reader
+
 from .test_editorial import EditorialServer
 
 

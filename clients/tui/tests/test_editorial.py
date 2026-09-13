@@ -8,6 +8,7 @@ import pytest
 from textual.widgets import Input, Markdown, OptionList, Select, Static, Tabs
 
 from hn_rerank.app import Reader, Setup
+
 from .test_client import FakeServer
 
 
