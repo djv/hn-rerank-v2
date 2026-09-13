@@ -52,7 +52,9 @@ On 2026-09-13, `/home/d/hn-rerank-v2` moved to `/home/d/hn-rerank` after an
 inventory found one worktree, no tracked WIP and no other process using the old
 path. `.opencode/`, `.playwright-mcp/` and the existing `docs/` contents were
 preserved. No operational old-path references were found in project files,
-user systemd units or `~/bin`. Reinstalled the uv environment to repair absolute
+user systemd units or `~/bin`. Updated the project trust entry in
+`/home/d/.codex/config.toml`; its private rollback copy is
+`/home/d/.local/state/hn-rerank-rename/codex-config-before.toml`. Reinstalled the uv environment to repair absolute
 console-script shebangs; `uv run pytest` resolves the new environment.
 The GitHub repository name and VPS directory were not renamed. Historical records
 retain their original paths. To roll back the laptop move, first check active
