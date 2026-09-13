@@ -1,0 +1,39 @@
+name: Terminal client
+on:
+  push:
+    paths: ['clients/tui/**', '.github/workflows/tui.yml']
+  pull_request:
+    paths: ['clients/tui/**', '.github/workflows/tui.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  client:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: '3.12'
+      - name: Copy standalone package outside backend workspace
+        shell: bash
+        run: |
+          uv run --no-project python -c 'import os, shutil; shutil.copytree("clients/tui", os.path.join(os.environ["RUNNER_TEMP"], "tui"), ignore=shutil.ignore_patterns(".venv", "dist", "__pycache__", ".pytest_cache"))'
+      - name: Test, check and build standalone client
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP/tui"
+          uv run pytest tests -q
+          uv run ruff check src tests
+          uv run ty check src tests
+          uv build
+      - name: Install wheel and check headless startup outside source tree
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP"
+          uvx --from "$RUNNER_TEMP"/tui/dist/*.whl hn-rerank --version
+          uv run --no-project --with "$RUNNER_TEMP"/tui/dist/*.whl python -c 'import asyncio, importlib.util; from hn_rerank.app import Reader; assert importlib.util.find_spec("numpy") is None; exec("async def smoke():\n    async with Reader().run_test() as pilot:\n        await pilot.pause()\nasyncio.run(smoke())")'

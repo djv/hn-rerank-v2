@@ -490,3 +490,34 @@ viewport so it fills remaining vertical space and scrolls internally via
 ### 4.3 Client-side Rendering
 
 The raw Markdown response is formatted on the fly using a robust, line-by-line parser (`parseSimpleMarkdown`) to render headers, bold text, and lists safely.
+
+
+## Terminal client and feed API
+
+`clients/tui/` is an independent Hatchling package (Python 3.12+), published as
+`hn-rerank`. Its runtime dependencies are Textual, HTTPX and platformdirs.
+The backend imports dependency-free dataclasses from
+`clients.tui.src.hn_rerank.models` directly from the checkout; it does not install
+terminal dependencies in production. The uv workspace installs the client only
+in the backend's development group for tests and type checking.
+
+`pipeline.render.prepare_feed` builds metadata and ordered filter membership from
+exactly the cards rendered by the website. `DashboardDocument`, a bytes subclass,
+attaches the typed feed to those HTML bytes. The existing per-user cache therefore
+stores and evicts both representations together, including stale and version-zero
+cold decks. `/api/feed` authenticates through the existing profile cookie and
+returns API version 1, stories, orders, feedback counts, snapshot/target versions
+and readiness with `Cache-Control: no-store`. It neither ranks nor migrates data.
+
+The client imports a profile link or explicitly creates a profile, validates it
+and API compatibility, then atomically saves a private configuration file outside
+uv's cache. Requests stay on one normalized deployment URL and never follow
+redirects. Async summary workers debounce selections by 300ms and reject late
+results; feedback is serialized and never automatically retried. Recently rated
+IDs remain excluded across stale refreshes; readiness polling accepts zero and
+server resets. The latest successful vote can be cleared and its story restored.
+
+See [terminal release instructions](docs/TUI_RELEASE.md) for packaging, deployment,
+verification and the laptop directory rename. Production source has newer behavior
+than this laptop base: the scoped deployment preserves its Explore shuffle and
+its stale-page current-version patching.

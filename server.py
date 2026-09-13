@@ -2051,6 +2051,27 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
             {"error": "No session"}, status=HTTPStatus.UNAUTHORIZED
         )
 
+    @app.get("/api/feed")
+    def feed() -> ResponseReturnValue:
+        from dataclasses import replace
+        from clients.tui.src.hn_rerank.models import Feed
+        from pipeline.render import DashboardDocument
+
+        user = _flask_user(runtime)
+        if not user:
+            return _flask_json_response({"error": "No session"}, status=401)
+        html = runtime._render_dashboard_for_user(user)
+        target = runtime._dashboard_version(user.id)
+        if isinstance(html, DashboardDocument):
+            snapshot = replace(html.feed, target_version=target,
+                               ready=html.feed.version >= target)
+        else:
+            snapshot = Feed(1, [], {}, runtime.db.count_feedback_by_action(user.id),
+                            0, target, False)
+        response = _flask_json_response(snapshot.to_dict())
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
     @app.get("/api/ranking-ready")
     def ranking_ready() -> ResponseReturnValue:
         return _handle_flask_ranking_ready(runtime)

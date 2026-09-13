@@ -6750,3 +6750,14 @@ fixed short length regardless of how much source material existed.
 **Files**: `pipeline/enrichment.py`, `server.py`, `prompts/article_only_v4.txt`,
 `prompts/article_v4.txt`, `prompts/discussion_v4.txt`, `tests/test_pipeline.py`,
 `tests/test_server.py`, `WORKLOG.md`.
+
+
+## 2026-09-13 — terminal client and laptop rename
+
+Added an independently buildable Textual reader under `clients/tui/`, an
+authenticated feed API sharing the HTML ranking cache, profile persistence,
+async summaries, feedback/undo and ranking synchronization. Renamed the laptop
+checkout to `/home/d/hn-rerank` and repaired uv entry points. Existing backend
+tests now accept a laptop model location and generate fresh RSS fixture dates.
+Release procedure and verification: [docs/TUI_RELEASE.md](docs/TUI_RELEASE.md).
+Current result and remaining publication work: [STATUS.md](STATUS.md).

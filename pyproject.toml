@@ -26,6 +26,7 @@ dev = [
     "pytest-xdist>=3.6",
     "ruff>=0.14",
     "ty>=0.0.10",
+    "hn-rerank",
 ]
 dl-experiment = [
     "torch>=2.12",
@@ -36,3 +37,11 @@ pythonpath = ["."]
 asyncio_mode = "auto"
 markers = ["slow: slow tests (~60s); run with `pytest -m slow`"]
 addopts = "-m 'not slow'"
+
+[tool.uv.workspace]
+members = [
+    "clients/tui",
+]
+
+[tool.uv.sources]
+hn-rerank = { workspace = true }
