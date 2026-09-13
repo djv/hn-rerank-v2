@@ -405,6 +405,8 @@ class Reader(App[None]):
     def on_option_list_option_highlighted(
         self, event: OptionList.OptionHighlighted
     ) -> None:
+        if self.setting_up or not self.query("#headlines"):
+            return
         listing = self.query_one("#headlines", OptionList)
         for index, story in enumerate(self.stories):
             listing.replace_option_prompt(
