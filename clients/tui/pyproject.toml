@@ -21,3 +21,10 @@ asyncio_mode = "auto"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hn_rerank"]
+
+[tool.ruff]
+src = ["src", "tests"]
+target-version = "py312"
+
+[tool.ruff.lint.isort]
+known-first-party = ["hn_rerank", "test_client"]

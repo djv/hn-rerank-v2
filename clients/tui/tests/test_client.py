@@ -7,6 +7,8 @@ from pathlib import Path
 
 import httpx
 import pytest
+from textual.widgets import Input, Markdown, OptionList, Select, Static
+
 from hn_rerank.api import (
     API,
     APIError,
@@ -17,7 +19,6 @@ from hn_rerank.api import (
 )
 from hn_rerank.app import Reader, Setup
 from hn_rerank.models import Feed, FeedStory
-from textual.widgets import Input, Markdown, OptionList, Select, Static
 
 
 def sample_feed(version: int = 0, target: int = 0) -> Feed:

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import hn_rerank.app as app_module
 import httpx
 import pytest
+from textual.widgets import Input, OptionList
+
+import hn_rerank.app as app_module
 from hn_rerank.api import API, Profile, load_profile, save_profile
 from hn_rerank.app import Reader, Setup
 from test_client import FakeServer
-from textual.widgets import Input, OptionList
 
 
 async def test_import_validates_then_persists_and_relaunches(
@@ -27,7 +28,10 @@ async def test_import_validates_then_persists_and_relaunches(
         assert isinstance(app.screen, Setup)
         app.screen.query_one("#link", Input).value = "https://example.org/hn/u/test"
         await pilot.click("#import")
-        await pilot.pause(0.2)
+        for _ in range(100):
+            if app.feed is not None:
+                break
+            await pilot.pause(0.1)
         assert load_profile(path) == Profile("https://example.org/hn/", "test")
         assert app.feed is not None
     app = Reader(config_path=path)
