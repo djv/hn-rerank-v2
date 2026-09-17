@@ -36,6 +36,7 @@ fable lacked) — into one canonical roadmap, deduped and re-numbered. Merged
   Reddit circuit are all already in journalctl or directly queryable in the
   DB; a live status endpoint only pays off with an external poller, and none
   exists here. See WORKLOG.md 2026-07-10.
+- 🔍 **Re-verified 2026-09-14** (tree + WORKLOG): PERF-3 (SVC fits per warm), REF-1 (3 late `server` imports in `pipeline/enrichment.py`), REF-2 (`class Handler` global at `server.py:963`), REF-3 (no `TldrDetailService`), F1/F2/F3, B1/B2/B3 still open. Jul Flask route migration did not complete the REF items. TUI client + laptop rename (STATUS.md 2026-09-13) shipped outside roadmap scope.
 
 ---
 
@@ -70,6 +71,8 @@ replacement/suppression behavior, and p50/p95 `hn_dupes_ms` before/after via
 `perf_report.py`.
 
 ### PERF-2. Stop paying a full warm per vote (S-M)
+
+**Status 2026-09-14: partial.** Shipped 2026-06-29: 1s vote-warm debounce (`server.py` `_WARM_DEBOUNCE_S`), rapid-vote drain, same-user coalescing, ready-gated refill, completed-deck polling (WORKLOG.md digests 2026-06-29). Remaining: the core ask — every vote still calls `_trigger_warm`; refills are not yet served from the stale ranking with a rerank every Nth vote.
 
 **Biggest felt win, smallest diff.** A 30-swipe session currently triggers
 ~30 full reranks (1s debounce, server.py `_WARM_DEBOUNCE_S`). One vote among
@@ -254,6 +257,8 @@ profile persistence through `/u/<token>`.
 ## 4. Infrastructure / ops (remaining)
 
 ### OPS-1. Decouple Reddit from core regeneration (M, 1-2 days)
+
+**Status 2026-09-14: partial.** Shipped 2026-06-28: rate limiter + backoff + circuit breaker, single-coordinator fetch queue, 2h topfeed cache (WORKLOG.md digests 2026-06-28). Remaining: the core ask — topfeed phase still blocks regen until drain (90-min timeout); HN regen does not yet publish independently on circuit-open. Note: production candidate legs are currently HN-only.
 
 **High priority.** Persist per-feed freshness, retry, and circuit-breaker
 state in SQLite. Core ClickHouse/HN regeneration should use the last

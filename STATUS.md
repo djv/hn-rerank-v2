@@ -1,0 +1,13 @@
+# HN Rerank status
+
+- Objective: maintain the shipped terminal reader and prepare uvx/PyPI release.
+- Owner: none; save-state refreshed 2026-09-17, no resource locks held.
+- Result: terminal client, feed API, project rename, editorial styling, and VPS
+  integration are implemented and pushed on `feat/terminal-client` through `e7cfc0f`.
+- Verification: backend 541 passed / 1 skipped; client 25 passed / 1 Windows-only
+  skip; Ruff and ty clean (also under ruff 0.16.7). Isolated rebuilt wheel startup
+  passed from /tmp. Latest `tui.yml` CI run `34805118943` passed.
+- Unresolved: native terminal visual verification and credential-dependent PyPI
+  publication remain. Latest `tui.yml` run for the current branch passed.
+- Next action: obtain PyPI publishing credentials, then publish and verify `uvx hn-rerank`.
+  See [FINDINGS.md](FINDINGS.md).

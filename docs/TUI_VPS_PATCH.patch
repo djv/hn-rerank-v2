@@ -1,0 +1,399 @@
+--- a/server.py
++++ b/server.py
+@@ -1927,7 +1927,14 @@
+     end = html.find(b'"', value_start)
+     if end == -1:
+         return html
+-    return html[:value_start] + str(version).encode() + html[end:]
++    from pipeline.render import DashboardDocument
++
++    patched = html[:value_start] + str(version).encode() + html[end:]
++    return (
++        DashboardDocument(patched, html.feed)
++        if isinstance(html, DashboardDocument)
++        else patched
++    )
+
+
+ def _extract_cards_fragment(html: bytes) -> bytes:
+@@ -3085,6 +3092,35 @@
+             {"error": "No session"}, status=HTTPStatus.UNAUTHORIZED
+         )
+
++    @app.get("/api/feed")
++    def feed() -> ResponseReturnValue:
++        from dataclasses import replace
++        from clients.tui.src.hn_rerank.models import Feed
++        from pipeline.render import DashboardDocument
++
++        user = _flask_user(runtime)
++        if not user:
++            return _flask_json_response({"error": "No session"}, status=401)
++        html = runtime._render_dashboard_for_user(user)
++        target = runtime._dashboard_version(user.id)
++        if isinstance(html, DashboardDocument):
++            snapshot = replace(
++                html.feed, target_version=target, ready=html.feed.version >= target
++            )
++        else:
++            snapshot = Feed(
++                1,
++                [],
++                {},
++                runtime.db.count_feedback_by_action(user.id),
++                0,
++                target,
++                False,
++            )
++        response = _flask_json_response(snapshot.to_dict())
++        response.headers["Cache-Control"] = "no-store"
++        return response
++
+     @app.get("/api/ranking-ready")
+     def ranking_ready() -> ResponseReturnValue:
+         return _handle_flask_ranking_ready(runtime)
+--- a/pipeline/render.py
++++ b/pipeline/render.py
+@@ -2,6 +2,7 @@
+
+ from datetime import datetime
+ import time
++import random
+ from dataclasses import dataclass
+ from pathlib import Path
+ from urllib.parse import urlparse
+@@ -9,6 +10,7 @@
+ from jinja2 import Environment, FileSystemLoader
+
+ from database import Database, Story
++from clients.tui.src.hn_rerank.models import Feed, FeedStory
+ from .config import (
+     BQ_ARCHIVE_SOURCE,
+     CH_ARCHIVE_SOURCE,
+@@ -327,6 +329,56 @@
+     )
+
+
++class DashboardDocument(bytes):
++    """HTML and its wire representation travel atomically through the SWR cache."""
++
++    feed: Feed
++
++    def __new__(cls, html: bytes, feed: Feed) -> DashboardDocument:
++        document = super().__new__(cls, html)
++        document.feed = feed
++        return document
++
++
++def prepare_feed(
++    cards: list[DashboardCardView], counts: dict[str, int], version: int, target: int
++) -> Feed:
++    stories = [
++        FeedStory(
++            id=c.story.id,
++            title=c.story.title,
++            article_url=c.article_url,
++            comments_url=c.comments_url,
++            source=c.story.source,
++            points=c.story.score,
++            comments=c.story.comment_count,
++            time=c.story.time,
++            rank_score=c.score,
++            memberships=c.combo_keys.split(),
++            popular=c.sort_popular_attr == "1",
++            explore=c.sort_explore_attr == "1",
++        )
++        for c in cards
++    ]
++    orders: dict[str, list[int]] = {}
++    for age in ("recent", "archive"):
++        for sort in ("recommended", "popular", "explore", "date"):
++            selected = [
++                s
++                for s in stories
++                if f"{age}_mixed" in s.memberships
++                and (sort != "popular" or s.popular)
++                and (sort != "explore" or s.explore)
++            ]
++            selected.sort(
++                key=lambda s: s.time if sort == "date" else s.rank_score, reverse=True
++            )
++            if sort == "explore":
++                random.shuffle(selected)
++            orders[f"{sort}:{age}"] = [s.id for s in selected]
++    return Feed(1, stories, orders, counts, version, target, version >= target)
++
++
+ def generate_dashboard_bytes(
+     ranked: list[RankedStory],
+     config: Config,
+@@ -355,10 +407,11 @@
+     )
+     hot_badge_percentile = int(round(config.model.hot_badge_percentile))
+
++    cards = _build_dashboard_cards(ranked, hot_badge_percentile=hot_badge_percentile)
+     template = env.get_template("index.html")
+     html_content = template.render(
+         timestamp=datetime.now().strftime("%Y-%m-%d %H:%M"),
+-        cards=_build_dashboard_cards(ranked, hot_badge_percentile=hot_badge_percentile),
++        cards=cards,
+         tab_groups=_build_tab_groups(),
+         badge_legend=BADGE_LEGEND,
+         server_port=config.server_port,
+@@ -369,4 +422,12 @@
+         dashboard_version=dashboard_version or 0,
+         dashboard_latest_version=dashboard_latest_version or 0,
+     )
+-    return html_content.encode("utf-8")
++    return DashboardDocument(
++        html_content.encode("utf-8"),
++        prepare_feed(
++            cards,
++            raw_vote_counts,
++            dashboard_version or 0,
++            dashboard_latest_version or 0,
++        ),
++    )
+--- /dev/null
++++ b/clients/tui/src/hn_rerank/__init__.py
+@@ -0,0 +1 @@
++"""HN Rerank. Importing the API models needs only the standard library."""
+--- /dev/null
++++ b/clients/tui/src/hn_rerank/models.py
+@@ -0,0 +1,102 @@
++"""Version-one wire contract; deliberately free of terminal/backend dependencies."""
++
++from __future__ import annotations
++
++from dataclasses import asdict, dataclass
++import math
++from typing import Any
++
++
++@dataclass(frozen=True)
++class FeedStory:
++    id: int
++    title: str
++    article_url: str
++    comments_url: str
++    source: str
++    points: int
++    comments: int | None
++    time: int
++    rank_score: float
++    memberships: list[str]
++    popular: bool
++    explore: bool
++
++
++@dataclass(frozen=True)
++class Feed:
++    api_version: int
++    stories: list[FeedStory]
++    orders: dict[str, list[int]]
++    feedback_counts: dict[str, int]
++    version: int
++    target_version: int
++    ready: bool
++
++    def to_dict(self) -> dict[str, object]:
++        return asdict(self)
++
++    @classmethod
++    def parse(cls, data: Any) -> Feed:
++        if not isinstance(data, dict):
++            raise ValueError("Invalid feed response")
++        if data.get("api_version") != 1:
++            raise ValueError("Unsupported feed API; update hn-rerank.")
++        try:
++            stories = [FeedStory(**story) for story in data["stories"]]
++            result = cls(
++                1,
++                stories,
++                data["orders"],
++                data["feedback_counts"],
++                data["version"],
++                data["target_version"],
++                data["ready"],
++            )
++            if (
++                type(result.version) is not int
++                or result.version < 0
++                or type(result.target_version) is not int
++                or result.target_version < 0
++                or type(result.ready) is not bool
++            ):
++                raise ValueError("Invalid ranking state")
++            for story in stories:
++                if (
++                    type(story.id) is not int
++                    or any(
++                        not isinstance(value, str)
++                        for value in (
++                            story.title,
++                            story.article_url,
++                            story.comments_url,
++                            story.source,
++                        )
++                    )
++                    or type(story.points) is not int
++                    or type(story.time) is not int
++                    or (story.comments is not None and type(story.comments) is not int)
++                    or type(story.popular) is not bool
++                    or type(story.explore) is not bool
++                    or not isinstance(story.rank_score, (int, float))
++                    or not math.isfinite(story.rank_score)
++                    or not isinstance(story.memberships, list)
++                    or any(not isinstance(key, str) for key in story.memberships)
++                ):
++                    raise ValueError("Invalid story")
++            ids = {story.id for story in stories}
++            if any(
++                not isinstance(key, str)
++                or not isinstance(order, list)
++                or any(type(sid) is not int or sid not in ids for sid in order)
++                for key, order in result.orders.items()
++            ):
++                raise ValueError("Invalid filter order")
++            if len(ids) != len(stories) or any(
++                type(value) is not int or value < 0
++                for value in result.feedback_counts.values()
++            ):
++                raise ValueError("Invalid feedback counts or duplicate stories")
++            return result
++        except (KeyError, TypeError, AttributeError) as exc:
++            raise ValueError("Invalid feed response") from exc
+--- /dev/null
++++ b/tests/test_feed_api.py
+@@ -0,0 +1,131 @@
++from __future__ import annotations
++
++import threading
++import time
++from pathlib import Path
++from typing import Any
++from werkzeug.test import TestResponse
++
++from bs4 import BeautifulSoup
++
++from database import Database, Story, User
++from pipeline import Config, RankedStory
++from pipeline.render import DashboardDocument, generate_dashboard_bytes
++from server import Handler, create_app
++
++
++def payload(response: TestResponse) -> Any:
++    data = response.get_json()
++    assert isinstance(data, dict)
++    return data
++
++
++def test_feed_parity_authentication_stale_cache_and_eviction(tmp_path: Path) -> None:
++    db = Database(str(tmp_path / "feed.db"))
++
++    class Runtime(Handler):
++        _dashboard_cache = {}
++        _dashboard_versions = {}
++        _cold_stories = []
++
++        @classmethod
++        def _trigger_warm(cls, user: User, version: int) -> None:
++            pass
++
++    Runtime.db = db
++    Runtime.config = Config(db_path=db.db_path)
++    Runtime.regen_event = threading.Event()
++    user = db.create_user("feed-user")
++    other = db.create_user("other-user")
++    ranked = [
++        RankedStory(
++            Story(
++                i,
++                f"Story {i}",
++                f"https://example.org/{i}",
++                i * 10,
++                i * 100,
++                "text",
++                comment_count=i,
++                discussion_url=f"https://news.ycombinator.com/item?id={i}",
++            ),
++            score=float(4 - i),
++            best_match_title="",
++            combo_keys="recent_hn recent_mixed"
++            if i < 3
++            else "archive_hn archive_mixed",
++            is_hot=i == 1,
++            is_novel=i == 2,
++        )
++        for i in (1, 2, 3)
++    ]
++    Runtime._cold_stories = ranked
++    client = create_app(Runtime).test_client()
++    assert client.get("/api/feed").status_code == 401
++    client.set_cookie("hn_token", user.token)
++    response = client.get("/api/feed")
++    feed = payload(response)
++    assert response.headers["Cache-Control"] == "no-store"
++    assert feed["version"] == 0 and feed["ready"] is True
++    html = client.get("/").data
++    cards = BeautifulSoup(html, "html.parser").select(".story-card")
++    assert [int(str(card["data-story-id"])) for card in cards] == [
++        story["id"] for story in feed["stories"]
++    ]
++    for age in ("recent", "archive"):
++        for sort in ("recommended", "popular", "explore", "date"):
++            matching = [
++                c
++                for c in cards
++                if f"{age}_mixed" in str(c["data-combo"]).split()
++                and (
++                    sort not in {"popular", "explore"} or c[f"data-sort-{sort}"] == "1"
++                )
++            ]
++            matching.sort(
++                key=lambda c: float(
++                    str(c["data-time" if sort == "date" else "data-score"])
++                ),
++                reverse=True,
++            )
++            assert feed["orders"][f"{sort}:{age}"] == [
++                int(str(c["data-story-id"])) for c in matching
++            ]
++    document = generate_dashboard_bytes(
++        ranked, Runtime.config, db, user.id, user.token, 0, 0
++    )
++    assert isinstance(document, DashboardDocument)
++    Runtime._dashboard_cache[f"dashboard_{user.id}"] = (document, time.time(), 0)
++    for item in ranked:
++        db.upsert_story(item.story)
++    vote = client.post("/api/feedback", json={"story_id": 1, "action": "up"})
++    assert payload(vote)["target_version"] == 1
++    stale = payload(client.get("/api/feed"))
++    assert stale["stories"] == feed["stories"]
++    assert stale["version"] == 0 and stale["target_version"] == 1 and not stale["ready"]
++    assert (
++        BeautifulSoup(client.get("/").data, "html.parser").select(".story-card")
++        == cards
++    )
++    client.set_cookie("hn_token", other.token)
++    assert payload(client.get("/api/feed"))["feedback_counts"]["up"] == 0
++    client.set_cookie("hn_token", user.token)
++    warmed = generate_dashboard_bytes(
++        ranked[1:], Runtime.config, db, user.id, user.token, 1, 1
++    )
++    Runtime._dashboard_cache[f"dashboard_{user.id}"] = (warmed, time.time(), 1)
++    assert payload(client.get("/api/feed"))["orders"]["recommended:recent"] == [2]
++    assert payload(client.get("/api/feed"))["feedback_counts"]["up"] == 1
++    assert (
++        payload(client.post("/api/feedback", json={"story_id": 1, "action": "clear"}))[
++            "target_version"
++        ]
++        == 2
++    )
++    Runtime._dashboard_cache["dashboard_other"] = (warmed, time.time() + 1, 1)
++    Runtime._enforce_cache_cap(1)
++    assert f"dashboard_{user.id}" not in Runtime._dashboard_cache
++    Runtime._cold_stories = []
++    empty = payload(client.get("/api/feed"))
++    assert not empty["ready"] and empty["stories"] == []
++    db.close()

@@ -203,79 +203,14 @@ runtime dep (e.g. jax, tensorflow), give it its own
 - **Version semantics**: `dashboard_version=0` is valid cold-deck data.
   Client-side version comparisons must use `Number.isFinite()`, not truthiness.
 
-## HN data sources (architecture overview)
+## HN data sources
 
-The dashboard uses two external data sources for HN stories. Algolia was
-removed from the live `hn` source pipeline on 2026-06-26; CH is now the
-sole source for the live 30-day window and bulk operations.
-
-| Source | Used for | Why |
-|---|---|---|
-| **ClickHouse** (`hackernews_history`) | Live 30-day window (`query_live_window`), bulk comment hydration (archive seed), bulk prewarm (top-50 ranked) | Single SQL query for N stories; 10-100× faster than per-story Algolia |
-| **Algolia** (`hn.algolia.com`) | Single-story items fallback (lazy TLDR detail for stories outside prewarm) | Real-time, no CH equivalent for one-off fetches; used only as fallback |
-| **BigQuery** (`bigquery-public-data.hacker_news.full`) | Backup archive seeder (manual) | Same data as CH; slower; requires `gcloud`/`bq` auth |
-
-The live `hn` source pipeline (`fetch_candidates` in `pipeline.py`) now
-issues **1 CH call per regen**:
-
-1. `ch_client.query_live_window(days=30, min_score=5, limit=5000)` — every
-   live HN story from the past 30 days with all fields (title, url,
-   score, descendants, time, text).
-
-The prewarm (comment text for all HN candidates with `comment_count > 0` and
-empty `top_comments`) is a second CH call inside `fetch_candidates_only`,
-at regen time — not on the render path. Every user's first dashboard render
-finds the candidate rows already populated. The first 4 cards any user sees
-have `top_comments` already populated — no Algolia wait and no render-time
-prewarm latency.
-
-Stories with no content to summarize (self_text, top_comments, and article_body
-all empty, and no HN comment_count > 0) are filtered out by `is_summarizable()`
-in `fetch_candidates`. Config knobs `prewarm_hn_full`, `prewarm_reddit_full`,
-and `prewarm_lesswrong_full` (default true) control prewarm scope; set to false
-to revert to top-by-score prewarm (`regen_prewarm_top_n=50` default; Reddit
-prewarm is now driven by `reddit_prewarm_top_per_sub=10` — top 10 hot per sub
-from the topfeed cache, not by score from a DB query).
-
-CH has 1-24h latency for brand-new content (vs Algolia's real-time).
-With a 3h regen cycle, worst case is 4h lag for stories posted in the
-last hour. Acceptable for "best of HN" view; the swipe deck mostly
-shows older stories anyway.
-
-The CH bulk client lives in `ch_client.py`. The
-previous per-story parallel Algolia hydration (used for archive seeding
-before 2026-06-26) is preserved in
-`scripts/_archive/algolia/` as a fallback if CH
-becomes unavailable.
+Live source pipeline, fetch window, prewarm, and archive seeders: [ARCHITECTURE.md](ARCHITECTURE.md) §3.6 (ClickHouse window) + Archive seeders. Do not duplicate that reference here.
 
 ## See also
 - [WORKLOG.md](WORKLOG.md) — recent changes and operational events
+- [docs/BACKUP.md](docs/BACKUP.md) — DB backup/restore runbook
 
-## Backup
-
-The HN database is backed up daily to Google Drive via a systemd user timer.
-
-- Script: `scripts/backup_hn_db.sh`
-- Service: `~/.config/systemd/user/hn-rewrite-backup.service`
-- Timer: `~/.config/systemd/user/hn-rewrite-backup.timer` (active)
-- Target: `drive:hn-rewrite/backups/<YYYYMMDDTHHMMSSZ>/hn_rewrite.db`
-- Retention: 30 most recent snapshots (env: `HN_KEEP_N=30`)
-- Logs: `journalctl --user -u hn-rewrite-backup.service`
-
-### Manual backup
-
-```bash
-./scripts/backup_hn_db.sh                          # default config
-HN_DB_PATH=/path/to/other.db ./scripts/backup_hn_db.sh
-HN_KEEP_N=7 ./scripts/backup_hn_db.sh             # keep 7
-```
-
-### Restore
-
-```bash
-LATEST=$(rclone lsf --dirs-only drive:hn-rewrite/backups/ | sort -r | head -1)
-rclone copy drive:hn-rewrite/backups/$LATEST/hn_rewrite.db ./hn_rewrite.db
-sqlite3 hn_rewrite.db "PRAGMA integrity_check;"
 ## Testing notes
 
 - **Curl sessions**: first-visit `GET /` creates one user, sets `hn_token`, and serves the dashboard directly. `/u/<token>` only imports an existing profile onto a new device. Always use `-c cookie.txt -b cookie.txt` when testing live API flows with curl so subsequent requests keep the same profile.

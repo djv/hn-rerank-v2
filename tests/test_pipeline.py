@@ -1,5 +1,6 @@
 from typing import Any, cast
 import asyncio
+import os
 import numpy as np
 import pytest
 import time
@@ -316,9 +317,10 @@ def test_build_cold_deck_computes_popular_badges_but_not_explore(
 
 
 @pytest.fixture(scope="module")
-def embedder():
-    # Uses the real downloaded ONNX model (shared across worktrees)
-    return Embedder()
+def embedder() -> Embedder:
+    # Real model, with a laptop override so tests never require the VPS filesystem.
+    model_dir = os.environ.get("HN_TEST_ONNX_MODEL_DIR")
+    return Embedder(model_dir) if model_dir else Embedder()
 
 
 def test_embedder_uses_configured_batch_and_ort_variant(monkeypatch):
@@ -1041,7 +1043,7 @@ async def test_build_reddit_topfeed_serializes_and_sets_user_agent(
     def rss_doc(title: str, link: str) -> str:
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0"><channel><title>Test</title>
-<item><title>{title}</title><link>{link}</link><pubDate>Tue, 23 Jun 2026 12:00:00 GMT</pubDate><description>Substantial test summary text for ranking.</description></item>
+<item><title>{title}</title><link>{link}</link><pubDate>{time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())}</pubDate><description>Substantial test summary text for ranking.</description></item>
 </channel></rss>"""
 
     class MockClient:
@@ -1132,7 +1134,7 @@ async def test_build_reddit_topfeed_populates_self_text(tmp_path, monkeypatch):
         return f"""<?xml version="1.0"?>
 <rss><channel>
 <item><title>{title}</title><link>{link}</link>
-<pubDate>Tue, 23 Jun 2026 12:00:00 GMT</pubDate>
+<pubDate>{time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())}</pubDate>
 <description>{body}</description>
 </item></channel></rss>"""
 
@@ -1242,7 +1244,7 @@ async def test_build_reddit_topfeed_cache_miss_fetches_and_caches(
     def rss_doc(title: str, link: str) -> str:
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0"><channel><title>Test</title>
-<item><title>{title}</title><link>{link}</link><pubDate>Tue, 23 Jun 2026 12:00:00 GMT</pubDate><description>test body</description></item>
+<item><title>{title}</title><link>{link}</link><pubDate>{time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())}</pubDate><description>test body</description></item>
 </channel></rss>"""
 
     class MockResp:
