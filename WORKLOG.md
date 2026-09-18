@@ -3,6 +3,56 @@
 Append-only log of notable changes, fixes, and operational events.
 Entries from 2026-09 onward are kept in full below; June–July 2026 live as one-line digests with full text in [WORKLOG-archive/archive-2026-06-07.tar.gz](WORKLOG-archive/archive-2026-06-07.tar.gz).
 ## Recent detail (2026-09)
+## 2026-09-17 — TUI: vote toast removed, restrained color accents
+
+Per user request: votes no longer fire a `notify()` toast — the status-line
+confirmation (`Vote saved.` / `Vote cleared.`) is enough. A bit more color:
+headline metadata now tints domain blue (`#8AB4F8`), points sage (`#A8C7A0`),
+comments light warm grey, age muted; footer counts color `+`/`~`/`−` green /
+amber / red; brand headline orange; theme `success`/`warning` sage / amber.
+Plain-text status content is unchanged. Evidence: client suite 32 passed /
+1 Windows-only skip, Ruff and ty clean, headless SVG render shows the new
+accents with no toast.
+
+## 2026-09-17 — TUI states, setup modal, reading pane and vote toast
+
+The remaining polish bundles landed. Empty filters show a `# Nothing here`
+notice and feed failures show `# Could not reach server` with the detail and
+retry line in the reading pane (`show_failure()` / `last_error`, so late
+`rebuild()` calls re-render the failure instead of clobbering it); recovery
+clears it on the next successful refresh. The setup modal is now a real card:
+translucent scrim, round-bordered `#1C1B19` panel, full-width aligned buttons
+with a background-lift focus. The reading pane caps at 100 columns with a
+hairline under the headline block, and the focus-accent border is gated on a
+`has-story` class so empty states keep the muted divider. Votes fire a 2s
+`notify()` toast since rated rows vanish silently. Evidence: offline SVG
+renders inspected for all four states, client suite 32 passed / 1 Windows-only
+skip, Ruff and ty clean. All ROADMAP §6 polish items are done.
+
+## 2026-09-17 — TUI visual polish: selection, scrollbars, footer, age guard
+
+Unselected headlines dim to `#D2CCC1` (metadata `#9A948A`) so the selected row
+— ivory bold
+on a lifted `#2E2B27` band, plus the `>` marker — reads without relying on color.
+Theme variables give both panes a visible scrollbar; the reading pane's thumb
+previously rendered `#000000` on `#171717`, i.e. invisibly. `#status` and
+`#shortcuts` moved into one docked footer bar (`#1D1C1A`, hairline top): the
+counts line follows the current filter ("N shown · + ~ −") and is restored by
+`context_status()` after transient messages, and errors are prefixed `✗`.
+`story_age()` omits or buckets implausible timestamps instead of rendering
+placeholder data as "20000d ago". Evidence: offline SVG renders
+(`clients/tui/tests/preview.py`, inspected before and after), client suite 27
+passed / 1 Windows-only skip, Ruff and ty clean. Remaining polish proposals are
+queued in [ROADMAP.md](ROADMAP.md) §6.
+
+## 2026-09-17 — reading-view vote hint and focus cue
+
+The TUI footer now advertises `1/2/3 vote` while reading (votes already worked
+with the summary pane focused; only the hint was missing). The reading pane's
+left border turns the accent orange while it holds focus (`#reading-pane` with
+`has-story:focus-within`),
+so Enter visibly moves focus to the article. Client tests, Ruff and ty pass.
+
 ## 2026-09-13 — terminal client and laptop rename
 
 Added an independently buildable Textual reader under `clients/tui/`, an

@@ -39,26 +39,64 @@ from .api import (
 from .models import Feed, FeedStory
 
 
+# Hacker News launched in 2006; earlier timestamps are missing or placeholder data.
+EARLIEST_STORY_TIME = 1_136_073_600
+
+
+def story_age(story: FeedStory) -> str:
+    """Compact relative age; empty when the timestamp is missing or implausible."""
+    if story.time < EARLIEST_STORY_TIME:
+        return ""
+    seconds = max(0, int(time.time()) - story.time)
+    for ceiling, divisor, unit in (
+        (3600, 60, "m"),
+        (86400, 3600, "h"),
+        (2592000, 86400, "d"),
+        (31536000, 2592000, "mo"),
+    ):
+        if seconds < ceiling:
+            return f"{seconds // divisor}{unit}"
+    return f"{seconds // 31536000}y"
+
+
 def story_metadata(story: FeedStory) -> str:
     domain = urlsplit(story.article_url).hostname or story.source
-    seconds = max(0, int(time.time()) - story.time)
-    age = (
-        f"{seconds // 86400}d"
-        if seconds >= 86400
-        else f"{seconds // 3600}h"
-        if seconds >= 3600
-        else f"{seconds // 60}m"
-    )
-    return f"{domain} · {story.points} pts · {story.comments or 0} comments · {age} ago"
+    parts = [domain, f"{story.points} pts", f"{story.comments or 0} comments"]
+    age = story_age(story)
+    if age:
+        parts.append(f"{age} ago")
+    return " · ".join(parts)
 
 
 def headline(story: FeedStory, selected: bool | None = None) -> Text:
     text = Text()
     if selected is not None:
         text.append("> " if selected else "  ", style="bold #FF914D")
-    text.append(story.title, style="bold #EEE8DD")
-    text.append("\n" + story_metadata(story), style="#AAA399")
+    text.append(
+        story.title, style="bold #EEE8DD" if selected is not False else "#D2CCC1"
+    )
+    text.append("\n")
+    domain = urlsplit(story.article_url).hostname or story.source
+    text.append(domain, style="#8AB4F8")
+    text.append(" · ", style="#6B655D")
+    text.append(f"{story.points} pts", style="#A8C7A0")
+    text.append(" · ", style="#6B655D")
+    text.append(f"{story.comments or 0} comments", style="#C6C1B8")
+    age = story_age(story)
+    if age:
+        text.append(" · ", style="#6B655D")
+        text.append(f"{age} ago", style="#8F897F")
     return text
+
+
+EMPTY_NOTICE = (
+    "# Nothing here\n\nNo stories in this filter. "
+    "Change filters or press **r** to refresh."
+)
+
+
+def feed_failure_notice(detail: str) -> str:
+    return f"# Could not reach server\n\n{detail}\n\nPress **r** to retry."
 
 
 class Summary(Markdown):
@@ -73,18 +111,19 @@ class Summary(Markdown):
 
 class Setup(ModalScreen[Profile | None]):
     CSS = """
-    Setup { align: center middle; background: #171717; color: #EEE8DD; }
+    Setup { align: center middle; background: rgba(14,14,14,0.7); color: #EEE8DD; }
     #setup { width: 70; max-width: 95%; height: auto; max-height: 100%;
-             overflow-y: auto; padding: 1 2; background: #171717; }
+             overflow-y: auto; padding: 1 2; background: #1C1B19;
+             border: round #44403B; }
     #setup-title { text-style: bold; }
     #setup-message { height: auto; margin: 1 0; color: #AAA399; }
     #setup-message.error { color: #FFB4A6; }
     .setup-section { margin-top: 1; text-style: bold; }
     Setup Input { margin: 0 0 1 0; background: #222222; border: tall #44403B; }
     Setup Input:focus { border: tall #FF914D; }
-    Setup Button { background: #292724; color: #EEE8DD; border: none; }
-    Setup Button:focus { text-style: bold underline; color: #FF914D; }
-    #quit { margin-top: 1; background: #171717; color: #AAA399; }
+    Setup Button { width: 1fr; background: #292724; color: #EEE8DD; border: none; }
+    Setup Button:focus { background: #2E2B27; color: #FF914D; text-style: bold; }
+    #quit { margin-top: 1; background: #1C1B19; color: #AAA399; }
     """
 
     def __init__(self, path: Path, server: str | None, message: str = "") -> None:
@@ -167,7 +206,7 @@ class Reader(App[None]):
     TITLE = "HN Rerank"
     CSS = """
     Screen { background: #171717; color: #EEE8DD; }
-    #brand { height: 1; padding: 0 1; text-style: bold; }
+    #brand { height: 1; padding: 0 1; text-style: bold; color: #FF914D; }
     #filters { height: 3; }
     Select { width: 1fr; display: none; }
     SelectCurrent { background: #222222; border: tall #44403B; }
@@ -183,12 +222,15 @@ class Reader(App[None]):
                  border: none; padding: 0; }
     #headlines > .option-list--option { padding: 0 1; }
     #headlines > .option-list--option-highlighted {
-        background: #292724; color: #EEE8DD;
+        background: #2E2B27; color: #EEE8DD;
     }
     #headlines:focus { background-tint: #171717 0%; }
     #headlines:focus > .option-list--option-highlighted { text-style: none; }
-    #reading-pane { width: 2fr; height: 1fr; border-left: solid #44403B; }
-    #story-heading { height: auto; max-height: 8; padding: 1 2; }
+    #reading-pane { width: 2fr; height: 1fr; border-left: solid #44403B;
+                    max-width: 100; }
+    #reading-pane.has-story:focus-within { border-left: solid #FF914D; }
+    #story-heading { height: auto; max-height: 8; padding: 1 2;
+                     border-bottom: solid #2A2825; }
     #summary { width: 1fr; height: 1fr; padding: 0 2; overflow-y: auto;
                background: #171717; color: #EEE8DD; }
     MarkdownH1, MarkdownH2, MarkdownH3 { margin: 1 0; padding: 0;
@@ -196,9 +238,12 @@ class Reader(App[None]):
     MarkdownParagraph, MarkdownBulletList, MarkdownOrderedList { margin: 0 0 1 0; }
     MarkdownBlockQuote { border-left: solid #AAA399; background: #222222; margin: 0 0 1 0; }
     MarkdownFence { background: #222222; margin: 0 0 1 0; padding: 1; }
-    #status { height: auto; max-height: 3; padding: 0 1; color: #AAA399; }
+    #footer { dock: bottom; height: auto; max-height: 4; background: #1D1C1A;
+              border-top: solid #2A2825; }
+    #status { width: 1fr; height: auto; max-height: 3; padding: 0 1; color: #AAA399; }
+    #status.context { color: #C6C1B8; }
     #status.error { color: #FFB4A6; text-style: bold; }
-    #shortcuts { height: 1; padding: 0 1; color: #AAA399; }
+    #shortcuts { width: auto; height: auto; padding: 0 1; color: #8F897F; }
     .narrow Tabs { display: none; }
     .narrow Select { display: block; }
     .narrow #headlines, .narrow #reading-pane { width: 1fr; border: none; }
@@ -237,9 +282,17 @@ class Reader(App[None]):
                 surface="#222222",
                 panel="#292724",
                 error="#FFB4A6",
-                success="#AAA399",
-                warning="#AAA399",
+                success="#A8C7A0",
+                warning="#E5C07B",
                 dark=True,
+                variables={
+                    "scrollbar": "#44403B",
+                    "scrollbar-hover": "#6B655D",
+                    "scrollbar-active": "#FF914D",
+                    "scrollbar-background": "#1D1C1A",
+                    "scrollbar-background-hover": "#1D1C1A",
+                    "scrollbar-background-active": "#1D1C1A",
+                },
             )
         )
         self.theme = "editorial"
@@ -257,6 +310,8 @@ class Reader(App[None]):
         self.summary_story_id: int | None = None
         self.reading = False
         self.setting_up = False
+        self.status_mode = "context"
+        self.last_error: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Static("HN Rerank", id="brand")
@@ -290,8 +345,9 @@ class Reader(App[None]):
             with Vertical(id="reading-pane"):
                 yield Static("", id="story-heading", markup=False)
                 yield Summary("Connecting…", id="summary", open_links=False)
-        yield Static("Loading…", id="status", markup=False)
-        yield Static("", id="shortcuts", markup=False)
+        with Horizontal(id="footer"):
+            yield Static("Loading…", id="status", markup=False)
+            yield Static("", id="shortcuts", markup=False)
 
     def on_mount(self) -> None:
         self.layout_panes()
@@ -302,8 +358,41 @@ class Reader(App[None]):
         return not self.setting_up and not isinstance(self.focused, (Input, Select))
 
     def status(self, message: str, *, error: bool = False) -> None:
-        self.query_one("#status", Static).update(message)
-        self.query_one("#status").set_class(error, "error")
+        """Show a transient message; context_status() restores the counts line."""
+        self.status_mode = "error" if error else "message"
+        widget = self.query_one("#status", Static)
+        widget.update(("✗ " if error else "") + message)
+        widget.set_class(error, "error")
+        widget.set_class(False, "context")
+
+    def context_status(self) -> None:
+        """Counts line for the current filter; only replaces an earlier counts line."""
+        if self.status_mode != "context" or not self.query("#status"):
+            return
+        counts = self.feed.feedback_counts if self.feed else {}
+        line = Text()
+        line.append(f"{len(self.stories)} shown", style="#C6C1B8")
+        line.append(" · ", style="#6B655D")
+        line.append(f"+{counts.get('up', 0)}", style="#A8C7A0")
+        line.append(" ", style="#6B655D")
+        line.append(f"~{counts.get('neutral', 0)}", style="#E5C07B")
+        line.append(" ", style="#6B655D")
+        line.append(f"−{counts.get('down', 0)}", style="#FFB4A6")
+        widget = self.query_one("#status", Static)
+        widget.update(line)
+        widget.set_class(False, "error")
+        widget.set_class(True, "context")
+
+    def show_failure(self, detail: str) -> None:
+        """Failure copy in the reading pane when no feed has loaded yet."""
+        self.last_error = detail
+        if self.feed is not None or not self.query("#summary"):
+            return
+        self.query_one("#story-heading", Static).update("")
+        self.summary_story_id = None
+        self.selection_serial += 1
+        self.workers.cancel_group(self, "summary")
+        self.query_one("#summary", Markdown).update(feed_failure_notice(detail))
 
     @work(group="startup", exclusive=True)
     async def start(self) -> None:
@@ -320,6 +409,7 @@ class Reader(App[None]):
             self.setup(str(exc))
         except APIError as exc:
             self.status(str(exc) + " Press r to retry.", error=True)
+            self.show_failure(str(exc))
 
     def setup(self, message: str = "") -> None:
         if self.setting_up:
@@ -387,8 +477,12 @@ class Reader(App[None]):
             self.selection_serial += 1
             self.workers.cancel_group(self, "summary")
             self.query_one("#summary", Markdown).update(
-                "No stories in this filter. Change filters or press **r** to refresh."
+                feed_failure_notice(self.last_error)
+                if self.feed is None and self.last_error
+                else EMPTY_NOTICE
             )
+        self.query_one("#reading-pane").set_class(bool(self.stories), "has-story")
+        self.context_status()
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id in {"sort", "age"}:
@@ -443,7 +537,7 @@ class Reader(App[None]):
         except APIError as exc:
             if serial == self.selection_serial and self.query("#summary"):
                 self.query_one("#summary", Markdown).update(
-                    "Summary unavailable. Press **r** to retry."
+                    "# Summary unavailable\n\nPress **r** to retry."
                 )
                 self.status(str(exc) + " Press r to retry.", error=True)
 
@@ -468,10 +562,9 @@ class Reader(App[None]):
                     self.target = max(self.target, feed.target_version)
                 self.rebuild()
                 if feed.ready and feed.version >= self.target:
-                    counts = feed.feedback_counts
-                    self.status(
-                        f"{len(self.stories)} stories · +{counts.get('up', 0)} ~{counts.get('neutral', 0)} −{counts.get('down', 0)}"
-                    )
+                    self.status_mode = "context"
+                    self.last_error = None
+                    self.context_status()
                     return
                 self.status("Showing available stories while ranking updates…")
                 await asyncio.sleep(1)
@@ -488,6 +581,7 @@ class Reader(App[None]):
                 + " Press r to retry.",
                 error=True,
             )
+            self.show_failure(str(exc))
 
     def action_refresh(self) -> None:
         self.summary_story_id = None
@@ -588,11 +682,19 @@ class Reader(App[None]):
         self.query_one("#headlines").display = not narrow or not self.reading
         self.query_one("#reading-pane").display = not narrow or self.reading
         self.query_one("#summary").display = not narrow or self.reading
-        self.query_one("#shortcuts", Static).update(
-            "j/k scroll · Esc headlines · o article · ? help · q quit"
-            if self.reading
-            else "j/k move · Enter read · 1/2/3 vote · ? help · q quit"
-        )
+        if narrow:
+            hints = (
+                "j/k scroll · 1/2/3 vote · Esc back"
+                if self.reading
+                else "Enter read · 1/2/3 vote · ? help"
+            )
+        else:
+            hints = (
+                "j/k scroll · 1/2/3 vote · Esc headlines · o article · ? help · q quit"
+                if self.reading
+                else "j/k move · Enter read · 1/2/3 vote · ? help · q quit"
+            )
+        self.query_one("#shortcuts", Static).update(hints)
 
     def on_descendant_focus(self, event: events.DescendantFocus) -> None:
         if event.widget.id in {"summary", "headlines"}:

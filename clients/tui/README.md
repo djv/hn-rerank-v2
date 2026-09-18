@@ -22,9 +22,22 @@ If the package name cannot be registered, publish as `hn-rerank-tui` and run
 
 ## Reader appearance
 
-The charcoal and ivory reader uses orange for active filters and focus. A `>`
+The charcoal and ivory reader uses orange for the brand, active filters and
+focus, with restrained blue/sage/amber accents in metadata and vote counts. A `>`
 marker identifies the selected headline without relying on color. At 100 columns
 and above, filter tabs sit over a one-third headline/two-thirds summary layout.
 Smaller terminals use dropdowns; Enter opens reading and Escape returns to headlines.
 Resize and focus changes preserve reading position. Run the offline preview from
 the repository root with `uv run python -m clients.tui.tests.preview --headless`.
+
+Unselected headlines are dimmed, so the selected row (ivory on a lifted band,
+plus the `>` marker) reads first. One docked footer bar carries the current
+filter's counts on the left (`2 shown · +0 ~0 −0`) and context-sensitive keys on
+the right; failures appear there with a `✗` prefix and replace the counts until
+the next successful refresh. Scrollbars follow the theme, and stories without a
+usable timestamp simply omit the age.
+
+Empty filters and feed failures get headed notices in the reading pane rather
+than a bare line; the setup form is a bordered card on a dimmed scrim; the
+reading pane caps at 100 columns with a hairline under the headline; votes
+confirm in the status line.
