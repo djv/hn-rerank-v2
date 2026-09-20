@@ -8962,3 +8962,14 @@ service. Client source, packaging and publication handoff live on the laptop at
   clean; Textual pilot fit check rendered 8/8 sampled recommended stories
   inside the 27-line reading viewport at 145x38. Service restarted; feed and
   cached summary requests returned 200.
+
+## 2026-09-20 — TLDR emphasis standardization (detail-v10)
+
+- The terminal reader accented `**bold**` terms but single-marker emphasis
+  (`*term*`, `_term_`) rendered as uncoloured italic, while the browser maps
+  both to `<strong>`. `_normalize_tldr_markdown` now rewrites single-marker
+  emphasis to `**bold**` (word boundaries keep `snake_case` intact), and the
+  reader accents the `em` component too. `TLDR_PROMPT_VERSION` is
+  `detail-v10`, so cached summaries regenerate.
+- Validation: backend 770 passed with four workers; client 39 passed /
+  1 Windows-only skip; ruff, format and ty clean.

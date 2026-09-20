@@ -56,7 +56,7 @@ ARTICLE_SECTION_MIN_CHARS = 500
 REDDIT_COMMENTS_CACHE_CHAR_LIMIT = 10_000
 REDDIT_COMMENT_LIMIT = 40
 REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dashboard"
-TLDR_PROMPT_VERSION = "detail-v9"
+TLDR_PROMPT_VERSION = "detail-v10"
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
 _PROMPT_CACHE: dict[str, str] = {}
 # Seam for tests: swap in a controllable timer to make debounce/regen tests
@@ -132,6 +132,11 @@ def _normalize_tldr_markdown(text: str) -> str:
         # prompt's flat `-` convention; normalize so cached summaries and
         # the renderer see one marker style.
         line = re.sub(r"^(\s*)\*\s+", r"\1- ", line)
+        # Single-marker emphasis is italic in CommonMark but bold in the
+        # dashboard renderer; standardize on bold so both clients agree and
+        # the terminal accent covers every emphasized term.
+        line = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"**\1**", line)
+        line = re.sub(r"(?<![A-Za-z0-9_])_([^_\n]+)_(?![A-Za-z0-9_])", r"**\1**", line)
         stripped = line.strip()
         if _looks_like_plain_heading(stripped):
             lines.append(f"### {stripped}")

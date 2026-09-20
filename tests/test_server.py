@@ -3703,6 +3703,20 @@ def test_normalize_tldr_markdown_converts_star_bullets() -> None:
     assert normalized == "- **Nitter** resumes service.\n- plain point"
 
 
+def test_normalize_tldr_markdown_bolds_single_marker_emphasis() -> None:
+    """Single-marker emphasis is italic in CommonMark but bold in the
+    dashboard; both clients must agree, and intra-word underscores and
+    existing bold must be left alone."""
+    import server
+
+    normalized = server._normalize_tldr_markdown(
+        "- pronouns (e.g., *him/her*, _his/hers_) stay **bold** and snake_case intact"
+    )
+    assert normalized == (
+        "- pronouns (e.g., **him/her**, **his/hers**) stay **bold** and snake_case intact"
+    )
+
+
 def test_reddit_rss_helpers_extract_post_and_comment_text():
     import server
 
