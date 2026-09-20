@@ -167,6 +167,25 @@ async def test_setup_typing_does_not_trigger_actions(tmp_path: Path) -> None:
         assert not (tmp_path / "missing.json").exists()
 
 
+async def test_narrow_select_focus_keeps_escape_and_focus_moves_reachable() -> None:
+    fake = FakeServer()
+    app = Reader(api=fake.api())
+    async with app.run_test(size=(80, 30)) as pilot:
+        await pilot.pause(0.6)
+        await pilot.press("tab")
+        selector = app.query_one("#sort", Select)
+        assert app.focused is selector
+        assert app.check_action("focus_next", ()) is True
+        assert app.check_action("quit", ()) is True
+        assert app.check_action("vote", ("up",)) is False
+        await pilot.press("tab")
+        await pilot.pause()
+        assert app.focused is not selector
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app.focused is app.query_one("#headlines", OptionList)
+
+
 def test_profile_persistence_and_redaction(tmp_path: Path) -> None:
     profile = Profile.from_link("https://example.org/hn/u/secret_token")
     assert profile.server == "https://example.org/hn/"

@@ -5,8 +5,8 @@ profile with your server URL, for example `https://your-host/hn/`.
 `--server URL` selects a deployment; credentials from another server are never reused.
 The server retains its existing access policy: installing the client does not grant access.
 
-Keys: j/k or arrows navigate/scroll; Tab changes focus; Enter reads; Escape returns;
-1/2/3 vote positive/neutral/negative; u undoes the latest successful vote;
+Keys: j/k or arrows navigate/scroll; Tab changes focus; Enter reads (again to return);
+Escape returns; 1/2/3 vote positive/neutral/negative; u undoes the latest successful vote;
 o/c open article/comments; r refreshes; ? shows help; q quits.
 Use the sort and age selectors to change filters. Below 100 columns only one pane shows.
 

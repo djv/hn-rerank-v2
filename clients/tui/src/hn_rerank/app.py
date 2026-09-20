@@ -233,9 +233,11 @@ class Reader(App[None]):
                      border-bottom: solid #2A2825; }
     #summary { width: 1fr; height: 1fr; padding: 0 2; overflow-y: auto;
                background: #171717; color: #EEE8DD; }
-    MarkdownH1, MarkdownH2, MarkdownH3 { margin: 1 0; padding: 0;
-        border: none; background: #171717; color: #EEE8DD; text-style: bold; text-align: left; }
-    MarkdownParagraph, MarkdownBulletList, MarkdownOrderedList { margin: 0 0 1 0; }
+    MarkdownH1, MarkdownH2, MarkdownH3, MarkdownH4, MarkdownH5, MarkdownH6 {
+        margin: 1 0 0 0; padding: 0;
+        border: none; background: #171717; color: #EEE8DD; text-style: bold;
+        content-align: left top; }
+    MarkdownParagraph, MarkdownBulletList, MarkdownOrderedList { margin: 0; }
     MarkdownBlockQuote { border-left: solid #AAA399; background: #222222; margin: 0 0 1 0; }
     MarkdownFence { background: #222222; margin: 0 0 1 0; padding: 1; }
     #footer { dock: bottom; height: auto; max-height: 4; background: #1D1C1A;
@@ -309,6 +311,7 @@ class Reader(App[None]):
         self.selection_serial = 0
         self.summary_story_id: int | None = None
         self.reading = False
+        self.help_open = False
         self.setting_up = False
         self.status_mode = "context"
         self.last_error: str | None = None
@@ -355,7 +358,14 @@ class Reader(App[None]):
         self.start()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        return not self.setting_up and not isinstance(self.focused, (Input, Select))
+        if self.setting_up or isinstance(self.focused, Input):
+            return False
+        # A focused selector owns typing keys, but focus movement and quit must
+        # stay reachable or the keyboard gets stuck on the dropdown.
+        return not (
+            isinstance(self.focused, Select)
+            and action in {"move", "vote", "undo", "read", "refresh", "open_url"}
+        )
 
     def status(self, message: str, *, error: bool = False) -> None:
         """Show a transient message; context_status() restores the counts line."""
@@ -415,6 +425,7 @@ class Reader(App[None]):
         if self.setting_up:
             return
         self.setting_up = True
+        self.help_open = False
         self.summary_story_id = None
         self.selection_serial += 1
         self.workers.cancel_group(self, "summary")
@@ -435,6 +446,8 @@ class Reader(App[None]):
         self.restored.clear()
         self.history.clear()
         self.target = None
+        self.help_open = False
+        self.summary_story_id = None
         self.setting_up = False
         self.refresh_feed()
 
@@ -470,6 +483,10 @@ class Reader(App[None]):
             headlines.highlighted = next(
                 (i for i, s in enumerate(self.stories) if s.id == select_id), 0
             )
+            # Fresh feed data can carry new points/comments; keep the reading
+            # heading in step even when the selection id has not changed.
+            if selected := self.selected():
+                self.query_one("#story-heading", Static).update(headline(selected))
             self.schedule_summary()
         else:
             self.query_one("#story-heading", Static).update("")
@@ -510,6 +527,8 @@ class Reader(App[None]):
 
     def schedule_summary(self) -> None:
         story = self.selected()
+        if self.help_open:
+            return
         if story and story.id != self.summary_story_id:
             self.query_one("#story-heading", Static).update(headline(story))
             self.query_one("#summary", Markdown).update("Loading summary…")
@@ -584,6 +603,7 @@ class Reader(App[None]):
             self.show_failure(str(exc))
 
     def action_refresh(self) -> None:
+        self.help_open = False
         self.summary_story_id = None
         self.refresh_feed()
 
@@ -682,17 +702,18 @@ class Reader(App[None]):
         self.query_one("#headlines").display = not narrow or not self.reading
         self.query_one("#reading-pane").display = not narrow or self.reading
         self.query_one("#summary").display = not narrow or self.reading
+        votes = "1 up · 2 neutral · 3 down"
         if narrow:
             hints = (
-                "j/k scroll · 1/2/3 vote · Esc back"
+                f"j/k scroll · {votes} · Esc back"
                 if self.reading
-                else "Enter read · 1/2/3 vote · ? help"
+                else f"Enter read · {votes} · ? help"
             )
         else:
             hints = (
-                "j/k scroll · 1/2/3 vote · Esc headlines · o article · ? help · q quit"
+                f"j/k scroll · {votes} · Esc back · ? help · q quit"
                 if self.reading
-                else "j/k move · Enter read · 1/2/3 vote · ? help · q quit"
+                else f"j/k move · Enter read · {votes} · ? help · q quit"
             )
         self.query_one("#shortcuts", Static).update(hints)
 
@@ -705,10 +726,16 @@ class Reader(App[None]):
         if self.query("#panes"):
             self.layout_panes(event.size.width)
 
-    def action_read(self) -> None:
+    def focus_summary(self) -> None:
         self.reading = True
         self.layout_panes()
         self.query_one("#summary", Markdown).focus()
+
+    def action_read(self) -> None:
+        if self.focused is self.query_one("#summary", Markdown):
+            self.action_headlines()
+            return
+        self.focus_summary()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         self.action_read()
@@ -717,14 +744,19 @@ class Reader(App[None]):
         self.reading = False
         self.layout_panes()
         self.query_one("#headlines", OptionList).focus()
+        if self.help_open:
+            self.help_open = False
+            self.schedule_summary()
 
     def action_help(self) -> None:
+        self.help_open = True
+        self.summary_story_id = None
         self.selection_serial += 1
         self.workers.cancel_group(self, "summary")
         self.query_one("#summary", Markdown).update(
-            "# Shortcuts\n\nj/k or arrows: navigate / scroll. Tab: focus. Enter: read. Escape: headlines.\n\n1/2/3: positive / neutral / negative. u: undo latest vote. o/c: article / comments. r: refresh. q: quit.\n\nUse the selectors for Recommended, Popular, Explore, Date and Recent / Archive. Votes are never automatically retried after network errors."
+            "# Shortcuts\n\nj/k or arrows: navigate / scroll. Tab: focus. Enter: read or return to headlines. Escape: headlines.\n\n1/2/3: positive / neutral / negative. u: undo latest vote. o/c: article / comments. r: refresh. q: quit.\n\nUse the selectors for Recommended, Popular, Explore, Date and Recent / Archive. Votes are never automatically retried after network errors."
         )
-        self.action_read()
+        self.focus_summary()
 
     async def on_unmount(self) -> None:
         self.selection_serial += 1

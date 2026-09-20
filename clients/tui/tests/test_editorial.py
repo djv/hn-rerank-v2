@@ -114,6 +114,36 @@ async def test_setup_layout_and_error(width: int, tmp_path: Path) -> None:
         assert "try again" in str(message.content)
 
 
+async def test_footer_hints_spell_out_vote_directions() -> None:
+    fake = FakeServer()
+    app = Reader(api=fake.api())
+    async with app.run_test(size=(100, 35)) as pilot:
+        await pilot.pause(0.6)
+        hints = app.query_one("#shortcuts", Static)
+        assert "1 up · 2 neutral · 3 down" in str(hints.content)
+        await pilot.press("enter")
+        await pilot.pause()
+        assert "1 up · 2 neutral · 3 down" in str(hints.content)
+        assert app.query_one("#shortcuts").region.height == 1
+        assert app.query_one("#status").region.height == 1
+
+
+async def test_enter_in_reading_returns_to_headlines() -> None:
+    fake = FakeServer()
+    app = Reader(api=fake.api())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await pilot.pause(0.6)
+        listing = app.query_one(OptionList)
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.reading
+        assert app.query_one(Markdown).has_focus
+        await pilot.press("enter")
+        await pilot.pause()
+        assert not app.reading
+        assert listing.has_focus
+
+
 async def test_empty_and_error_recovery() -> None:
     fake = FakeServer()
     app = Reader(api=fake.api())
@@ -211,6 +241,47 @@ async def test_reading_measure_cap() -> None:
         await pilot.pause(0.6)
         assert app.query_one("#reading-pane").region.width <= 100
         assert app.query_one("#story-heading").styles.border_bottom[0] == "solid"
+
+
+async def test_summary_headings_align_left_like_body() -> None:
+    fake = EditorialServer()
+    app = Reader(api=fake.api())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await pilot.pause(0.6)
+        heading = app.query("#summary MarkdownH1").first()
+        assert heading.styles.content_align == ("left", "top")
+
+
+async def test_help_escape_restores_story_view_and_survives_refresh() -> None:
+    fake = EditorialServer()
+    app = Reader(api=fake.api())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await pilot.pause(0.6)
+        assert "Section 0" in app.query_one(Markdown)._markdown
+        await pilot.press("?")
+        await pilot.pause()
+        assert "Shortcuts" in app.query_one(Markdown)._markdown
+        app.rebuild()  # A feed refresh must not steal the open help pane.
+        await pilot.pause()
+        assert "Shortcuts" in app.query_one(Markdown)._markdown
+        await pilot.press("escape")
+        await pilot.pause(0.5)
+        assert "Section 0" in app.query_one(Markdown)._markdown
+
+
+async def test_reading_heading_tracks_refreshed_story_data() -> None:
+    fake = FakeServer()
+    app = Reader(api=fake.api())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await pilot.pause(0.6)
+        fake.feed.stories[0] = replace(fake.feed.stories[0], points=999, comments=123)
+        app.action_refresh()
+        await pilot.pause(0.6)
+        selected = app.selected()
+        assert selected and selected.id == 1
+        heading = str(app.query_one("#story-heading", Static).content)
+        assert "999 pts" in heading
+        assert "123 comments" in heading
 
 
 async def test_vote_statusline_confirms_without_toast() -> None:
