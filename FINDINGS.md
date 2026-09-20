@@ -1,5 +1,26 @@
 # HN Rerank findings
 
+## Editorial terminal client — 2026-09-20 review
+
+- Live review against the VPS deployment (throwaway profile) found and fixed
+  four defects: selector focus could strand every keybinding below 100 columns;
+  Escape out of help left the Shortcuts text in the reading pane; a feed
+  refresh with an unchanged selection left the heading on stale points and
+  comments; and `text-align` never overrode Textual's centered H1 content
+  alignment. The footer now labels the vote keys (`1 up · 2 neutral · 3 down`)
+  and Enter returns from reading to headlines.
+- Article + Discussion now fit one screen. Companion server work landed on
+  `origin/main` as `detail-v9`: section budgets target 45/70/90 words and a
+  deterministic cap keeps at most four bullets and one `####` heading per
+  section. The reader renders Markdown blocks without per-block margins; the
+  Textual pilot measured 8/8 sampled recommended stories inside the 27-line
+  reading pane at 145×38 (4/8 before).
+- Verified: client suite 38 passed / 1 Windows-only skip; Ruff and ty clean;
+  live terminal sessions at 145×38 and 80×30 exercised filters, reading,
+  voting/undo/neutral, help, empty and failure states. New tests cover the
+  help exit, refreshed-heading sync, footer vote labels, Enter toggle,
+  heading alignment and narrow-layout selector escape.
+
 ## Editorial terminal client — 2026-09-17 handoff refresh
 
 - Current state: full visual polish is implemented on `feat/terminal-client` in
