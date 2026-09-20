@@ -1,5 +1,16 @@
 # HN Rerank findings
 
+## Terminal reader — reading mode removed — 2026-09-20
+
+- With Article + Discussion fitting one screen, the Enter-driven reading mode
+  was redundant. Enter no longer toggles a view; the summary pane is always
+  visible, `j/k` only move the headline list, arrows scroll the focused pane,
+  and Escape just closes help. Below 100 columns the list now stacks above the
+  summary instead of swapping panes, so both stay visible.
+- Verified: client 39 passed / 1 Windows-only skip; standalone copy with fresh
+  deps (ruff 0.16.8, ty 0.0.82) clean; in-tree ruff/format/ty clean; narrow
+  80×30 render inspected.
+
 ## Terminal reader / origin/main merge — 2026-09-20
 
 - Merged the 98-commit backend line into the terminal-reader branch (`354acd6`).
@@ -27,7 +38,7 @@
   refresh with an unchanged selection left the heading on stale points and
   comments; and `text-align` never overrode Textual's centered H1 content
   alignment. The footer now labels the vote keys (`1 up · 2 neutral · 3 down`)
-  and Enter returns from reading to headlines.
+  and Enter toggled back to headlines (that mode was removed later).
 - Article + Discussion now fit one screen. Companion server work landed on
   `origin/main` as `detail-v9`: section budgets target 45/70/90 words and a
   deterministic cap keeps at most four bullets and one `####` heading per

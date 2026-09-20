@@ -249,7 +249,11 @@ class Reader(App[None]):
     #shortcuts { width: auto; height: auto; padding: 0 1; color: #8F897F; }
     .narrow Tabs { display: none; }
     .narrow Select { display: block; }
-    .narrow #headlines, .narrow #reading-pane { width: 1fr; border: none; }
+    .narrow #panes { layout: vertical; }
+    .narrow #headlines { width: 1fr; height: 2fr; }
+    .narrow #reading-pane { width: 1fr; height: 3fr; border-left: none;
+                            border-top: solid #44403B; }
+    .narrow #reading-pane.has-story:focus-within { border-top: solid #FF914D; }
     """
     BINDINGS: ClassVar[list[tuple[str, str, str]]] = [
         ("j", "move(1)", "Down"),
@@ -261,7 +265,6 @@ class Reader(App[None]):
         ("o", "open_url('article_url')", "Article"),
         ("c", "open_url('comments_url')", "Comments"),
         ("r", "refresh", "Refresh"),
-        ("enter", "read", "Read"),
         ("escape", "headlines", "Back"),
         ("?", "help", "Help"),
         ("q", "quit", "Quit"),
@@ -311,7 +314,6 @@ class Reader(App[None]):
         self.target: int | None = None
         self.selection_serial = 0
         self.summary_story_id: int | None = None
-        self.reading = False
         self.help_open = False
         self.setting_up = False
         self.status_mode = "context"
@@ -617,18 +619,11 @@ class Reader(App[None]):
         self.refresh_feed()
 
     def action_move(self, delta: int) -> None:
-        if self.focused is self.query_one("#summary", Markdown) or (
-            self.size.width < 100 and self.reading
-        ):
-            self.query_one("#summary", Markdown).scroll_relative(
-                y=delta * 3, animate=False
+        listing = self.query_one("#headlines", OptionList)
+        if self.stories:
+            listing.highlighted = max(
+                0, min(len(self.stories) - 1, (listing.highlighted or 0) + delta)
             )
-        else:
-            listing = self.query_one("#headlines", OptionList)
-            if self.stories:
-                listing.highlighted = max(
-                    0, min(len(self.stories) - 1, (listing.highlighted or 0) + delta)
-                )
 
     def action_vote(self, action: str) -> None:
         story = self.selected()
@@ -708,50 +703,18 @@ class Reader(App[None]):
     def layout_panes(self, width: int | None = None) -> None:
         narrow = (self.size.width if width is None else width) < 100
         self.set_class(narrow, "narrow")
-        self.query_one("#headlines").display = not narrow or not self.reading
-        self.query_one("#reading-pane").display = not narrow or self.reading
-        self.query_one("#summary").display = not narrow or self.reading
-        votes = "1 up · 2 neutral · 3 down"
-        if narrow:
-            hints = (
-                f"j/k scroll · {votes} · Esc back"
-                if self.reading
-                else f"Enter read · {votes} · ? help"
-            )
-        else:
-            hints = (
-                f"j/k scroll · {votes} · Esc back · ? help · q quit"
-                if self.reading
-                else f"j/k move · Enter read · {votes} · ? help · q quit"
-            )
-        self.query_one("#shortcuts", Static).update(hints)
-
-    def on_descendant_focus(self, event: events.DescendantFocus) -> None:
-        if event.widget.id in {"summary", "headlines"}:
-            self.reading = event.widget.id == "summary"
-            self.layout_panes()
+        self.query_one("#shortcuts", Static).update(
+            "j/k move · 1 up · 2 neutral · 3 down · ? help · q quit"
+        )
 
     def on_resize(self, event: events.Resize) -> None:
         if self.query("#panes"):
             self.layout_panes(event.size.width)
 
     def focus_summary(self) -> None:
-        self.reading = True
-        self.layout_panes()
         self.query_one("#summary", Markdown).focus()
 
-    def action_read(self) -> None:
-        if self.focused is self.query_one("#summary", Markdown):
-            self.action_headlines()
-            return
-        self.focus_summary()
-
-    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
-        self.action_read()
-
     def action_headlines(self) -> None:
-        self.reading = False
-        self.layout_panes()
         self.query_one("#headlines", OptionList).focus()
         if self.help_open:
             self.help_open = False
@@ -763,7 +726,7 @@ class Reader(App[None]):
         self.selection_serial += 1
         self.workers.cancel_group(self, "summary")
         self.query_one("#summary", Markdown).update(
-            "# Shortcuts\n\nj/k or arrows: navigate / scroll. Tab: focus. Enter: read or return to headlines. Escape: headlines.\n\n1/2/3: positive / neutral / negative. u: undo latest vote. o/c: article / comments. r: refresh. q: quit.\n\nUse the selectors for Recommended, Popular, Explore, Date and Recent / Archive. Votes are never automatically retried after network errors."
+            "# Shortcuts\n\nj/k: move the headline list. Arrows: scroll the focused pane. Tab: focus. Escape: close this help.\n\n1/2/3: up / neutral / down. u: undo latest vote. o/c: article / comments. r: refresh. ?: this help. q: quit.\n\nUse the selectors for Recommended, Popular, Explore, Date and Recent / Archive. Votes are never automatically retried after network errors."
         )
         self.focus_summary()
 

@@ -50,7 +50,7 @@ class EditorialServer(FakeServer):
 
 
 @pytest.mark.parametrize("width", [60, 80, 100, 140])
-async def test_editorial_filters_reading_and_resize(width: int) -> None:
+async def test_editorial_filters_and_resize(width: int) -> None:
     fake = EditorialServer()
     fake.feed.stories[0] = replace(
         fake.feed.stories[0],
@@ -61,10 +61,17 @@ async def test_editorial_filters_reading_and_resize(width: int) -> None:
     async with app.run_test(size=(width, 35)) as pilot:
         await pilot.pause(0.6)
         listing = app.query_one(OptionList)
+        summary = app.query_one(Markdown)
         assert app.query_one("#sort-tabs", Tabs).display == (width >= 100)
         assert app.query_one("#sort", Select).display == (width < 100)
         assert "example.org" in str(app.query_one("#story-heading", Static).content)
         assert listing.highlighted == 0
+        assert listing.display and summary.display
+        if width < 100:
+            assert (
+                app.query_one("#reading-pane").region.y
+                > app.query_one("#headlines").region.y
+            )
         if width >= 100:
             await pilot.click("#sort-popular")
         else:
@@ -72,12 +79,8 @@ async def test_editorial_filters_reading_and_resize(width: int) -> None:
         await pilot.pause()
         assert [s.id for s in app.stories] == [1]
         assert app.query_one("#sort-tabs", Tabs).active == "sort-popular"
-        listing.focus()
-        await pilot.press("enter")
-        await pilot.pause()
-        assert app.query_one("#reading-pane").has_pseudo_class("focus-within")
-        summary = app.query_one(Markdown)
-        await pilot.press("j", "j", "j")
+        summary.focus()
+        await pilot.press("down", "down", "down")
         await pilot.pause()
         scroll = summary.scroll_y
         assert scroll > 0
@@ -90,10 +93,10 @@ async def test_editorial_filters_reading_and_resize(width: int) -> None:
             assert summary._markdown == content
             assert summary.scroll_y == scroll
             assert summary.has_focus
-        await pilot.press("escape")
-        assert not app.query_one("#reading-pane").has_pseudo_class("focus-within")
-        assert listing.has_focus and listing.display
-        await pilot.press("enter")
+        # j/k only move the headline list, even while the summary is focused.
+        summary.focus()
+        await pilot.press("j")
+        await pilot.pause()
         assert summary.scroll_y == scroll
 
 
@@ -122,27 +125,24 @@ async def test_footer_hints_spell_out_vote_directions() -> None:
         await pilot.pause(0.6)
         hints = app.query_one("#shortcuts", Static)
         assert "1 up · 2 neutral · 3 down" in str(hints.content)
-        await pilot.press("enter")
-        await pilot.pause()
-        assert "1 up · 2 neutral · 3 down" in str(hints.content)
+        assert "j/k move" in str(hints.content)
         assert app.query_one("#shortcuts").region.height == 1
         assert app.query_one("#status").region.height == 1
 
 
-async def test_enter_in_reading_returns_to_headlines() -> None:
+async def test_enter_does_not_toggle_view() -> None:
     fake = FakeServer()
     app = Reader(api=fake.api())
     async with app.run_test(size=(120, 35)) as pilot:
         await pilot.pause(0.6)
         listing = app.query_one(OptionList)
-        await pilot.press("enter")
-        await pilot.pause()
-        assert app.reading
-        assert app.query_one(Markdown).has_focus
-        await pilot.press("enter")
-        await pilot.pause()
-        assert not app.reading
+        summary = app.query_one(Markdown)
         assert listing.has_focus
+        await pilot.press("enter")
+        await pilot.pause()
+        assert listing.has_focus
+        assert not summary.has_focus
+        assert listing.display and summary.display
 
 
 async def test_empty_and_error_recovery() -> None:

@@ -111,11 +111,14 @@ async def test_navigation_resize_filters_and_late_summary(tmp_path: Path) -> Non
         assert selected and selected.id == 2
         assert "Summary 2" in app.query_one(Markdown)._markdown
         await pilot.resize_terminal(80, 25)
-        await pilot.press("enter")
-        assert not listing.display
-        assert app.query_one(Markdown).display
-        await pilot.press("escape")
+        await pilot.pause()
         assert listing.display
+        assert app.query_one(Markdown).display
+        assert "narrow" in app.classes
+        assert (
+            app.query_one("#reading-pane").region.y
+            > app.query_one("#headlines").region.y
+        )
         app.query_one("#age", Select).value = "archive"
         await pilot.pause()
         assert [s.id for s in app.stories] == [3]
@@ -172,7 +175,9 @@ async def test_narrow_select_focus_keeps_escape_and_focus_moves_reachable() -> N
     app = Reader(api=fake.api())
     async with app.run_test(size=(80, 30)) as pilot:
         await pilot.pause(0.6)
-        await pilot.press("tab")
+        # Narrow keeps both panes visible, so the summary sits between the
+        # headline list and the selectors in the focus chain.
+        await pilot.press("tab", "tab")
         selector = app.query_one("#sort", Select)
         assert app.focused is selector
         assert app.check_action("focus_next", ()) is True

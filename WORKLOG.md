@@ -8973,3 +8973,13 @@ service. Client source, packaging and publication handoff live on the laptop at
   `detail-v10`, so cached summaries regenerate.
 - Validation: backend 770 passed with four workers; client 39 passed /
   1 Windows-only skip; ruff, format and ty clean.
+
+## 2026-09-20 — Terminal reader: drop the reading mode
+
+- Article + Discussion now fit one screen, so the Enter reading mode was
+  redundant. Enter is unbound; the summary pane is always visible, `j/k` only
+  move the headline list, arrows scroll the focused pane, and Escape closes
+  help. Below 100 columns the list stacks above the summary instead of
+  swapping panes. Footer hints, help text and the client README follow.
+- Validation: client 39 passed / 1 Windows-only skip; standalone copy with
+  fresh deps (ruff 0.16.8, ty 0.0.82) clean; in-tree ruff/format/ty clean.

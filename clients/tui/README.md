@@ -5,10 +5,11 @@ profile with your server URL, for example `https://your-host/hn/`.
 `--server URL` selects a deployment; credentials from another server are never reused.
 The server retains its existing access policy: installing the client does not grant access.
 
-Keys: j/k or arrows navigate/scroll; Tab changes focus; Enter reads (again to return);
-Escape returns; 1/2/3 vote positive/neutral/negative; u undoes the latest successful vote;
-o/c open article/comments; r refreshes; ? shows help; q quits.
-Use the sort and age selectors to change filters. Below 100 columns only one pane shows.
+Keys: j/k or arrows navigate/scroll; Tab changes focus; 1/2/3 vote
+positive/neutral/negative; u undoes the latest successful vote; o/c open
+article/comments; r refreshes; ? shows help; q quits. Escape closes help.
+Use the sort and age selectors to change filters. Below 100 columns the
+headline list stacks above the summary; the summary is always visible.
 
 Configuration lives in platformdirs' user config directory (`hn-rerank/profile.json`),
 outside uv's cache. The profile token is a credential: keep that file and profile links private.
@@ -28,8 +29,8 @@ Bold key terms in a summary take the same orange, and single-marker emphasis
 (italic) does too, so emphasis reads without extra chrome. A `>` marker
 identifies the selected headline without relying on color. At 100 columns and
 above, filter tabs sit over a one-third headline/two-thirds summary layout.
-Smaller terminals use dropdowns; Enter opens reading (again to leave) and
-Escape returns to headlines.
+Smaller terminals use dropdowns and stack the list above the summary; both
+panes stay visible and the summary scrolls in place.
 Resize and focus changes preserve reading position. Run the offline preview from
 the repository root with `uv run python -m clients.tui.tests.preview --headless`.
 

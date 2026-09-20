@@ -17,7 +17,7 @@ from .test_editorial import EditorialServer
 async def inspect(pilot: Pilot) -> None:
     await pilot.pause(3)
     pilot.app.save_screenshot("hn-editorial-populated.svg", path="/tmp")
-    await pilot.press("enter", "j", "j", "escape", "j", "1", "u", "?", "r")
+    await pilot.press("j", "j", "j", "1", "u", "?", "r")
     await pilot.pause(3)
     app = pilot.app
     if isinstance(app, Reader):
