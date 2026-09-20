@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import time
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -9,6 +10,7 @@ from urllib.parse import urlparse
 from jinja2 import Environment, FileSystemLoader
 
 from database import Database, Story
+from clients.tui.src.hn_rerank.models import Feed, FeedStory
 from .config import (
     BQ_ARCHIVE_SOURCE,
     CH_ARCHIVE_SOURCE,
@@ -327,6 +329,56 @@ def _build_tab_groups() -> tuple[TabGroupView, ...]:
     )
 
 
+class DashboardDocument(bytes):
+    """HTML and its wire representation travel atomically through the SWR cache."""
+
+    feed: Feed
+
+    def __new__(cls, html: bytes, feed: Feed) -> DashboardDocument:
+        document = super().__new__(cls, html)
+        document.feed = feed
+        return document
+
+
+def prepare_feed(
+    cards: list[DashboardCardView], counts: dict[str, int], version: int, target: int
+) -> Feed:
+    stories = [
+        FeedStory(
+            id=c.story.id,
+            title=c.story.title,
+            article_url=c.article_url,
+            comments_url=c.comments_url,
+            source=c.story.source,
+            points=c.story.score,
+            comments=c.story.comment_count,
+            time=c.story.time,
+            rank_score=c.score,
+            memberships=c.combo_keys.split(),
+            popular=c.sort_popular_attr == "1",
+            explore=c.sort_explore_attr == "1",
+        )
+        for c in cards
+    ]
+    orders: dict[str, list[int]] = {}
+    for age in ("recent", "archive"):
+        for sort in ("recommended", "popular", "explore", "date"):
+            selected = [
+                s
+                for s in stories
+                if f"{age}_mixed" in s.memberships
+                and (sort != "popular" or s.popular)
+                and (sort != "explore" or s.explore)
+            ]
+            selected.sort(
+                key=lambda s: s.time if sort == "date" else s.rank_score, reverse=True
+            )
+            if sort == "explore":
+                random.shuffle(selected)
+            orders[f"{sort}:{age}"] = [s.id for s in selected]
+    return Feed(1, stories, orders, counts, version, target, version >= target)
+
+
 def generate_dashboard_bytes(
     ranked: list[RankedStory],
     config: Config,
@@ -355,10 +407,11 @@ def generate_dashboard_bytes(
     )
     hot_badge_percentile = int(round(config.model.hot_badge_percentile))
 
+    cards = _build_dashboard_cards(ranked, hot_badge_percentile=hot_badge_percentile)
     template = env.get_template("index.html")
     html_content = template.render(
         timestamp=datetime.now().strftime("%Y-%m-%d %H:%M"),
-        cards=_build_dashboard_cards(ranked, hot_badge_percentile=hot_badge_percentile),
+        cards=cards,
         tab_groups=_build_tab_groups(),
         badge_legend=BADGE_LEGEND,
         server_port=config.server_port,
@@ -369,4 +422,12 @@ def generate_dashboard_bytes(
         dashboard_version=dashboard_version or 0,
         dashboard_latest_version=dashboard_latest_version or 0,
     )
-    return html_content.encode("utf-8")
+    return DashboardDocument(
+        html_content.encode("utf-8"),
+        prepare_feed(
+            cards,
+            raw_vote_counts,
+            dashboard_version or 0,
+            dashboard_latest_version or 0,
+        ),
+    )

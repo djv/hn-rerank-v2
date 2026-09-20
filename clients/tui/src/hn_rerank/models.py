@@ -1,0 +1,102 @@
+"""Version-one wire contract; deliberately free of terminal/backend dependencies."""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+import math
+from typing import Any
+
+
+@dataclass(frozen=True)
+class FeedStory:
+    id: int
+    title: str
+    article_url: str
+    comments_url: str
+    source: str
+    points: int
+    comments: int | None
+    time: int
+    rank_score: float
+    memberships: list[str]
+    popular: bool
+    explore: bool
+
+
+@dataclass(frozen=True)
+class Feed:
+    api_version: int
+    stories: list[FeedStory]
+    orders: dict[str, list[int]]
+    feedback_counts: dict[str, int]
+    version: int
+    target_version: int
+    ready: bool
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+    @classmethod
+    def parse(cls, data: Any) -> Feed:
+        if not isinstance(data, dict):
+            raise ValueError("Invalid feed response")
+        if data.get("api_version") != 1:
+            raise ValueError("Unsupported feed API; update hn-rerank.")
+        try:
+            stories = [FeedStory(**story) for story in data["stories"]]
+            result = cls(
+                1,
+                stories,
+                data["orders"],
+                data["feedback_counts"],
+                data["version"],
+                data["target_version"],
+                data["ready"],
+            )
+            if (
+                type(result.version) is not int
+                or result.version < 0
+                or type(result.target_version) is not int
+                or result.target_version < 0
+                or type(result.ready) is not bool
+            ):
+                raise ValueError("Invalid ranking state")
+            for story in stories:
+                if (
+                    type(story.id) is not int
+                    or any(
+                        not isinstance(value, str)
+                        for value in (
+                            story.title,
+                            story.article_url,
+                            story.comments_url,
+                            story.source,
+                        )
+                    )
+                    or type(story.points) is not int
+                    or type(story.time) is not int
+                    or (story.comments is not None and type(story.comments) is not int)
+                    or type(story.popular) is not bool
+                    or type(story.explore) is not bool
+                    or not isinstance(story.rank_score, (int, float))
+                    or not math.isfinite(story.rank_score)
+                    or not isinstance(story.memberships, list)
+                    or any(not isinstance(key, str) for key in story.memberships)
+                ):
+                    raise ValueError("Invalid story")
+            ids = {story.id for story in stories}
+            if any(
+                not isinstance(key, str)
+                or not isinstance(order, list)
+                or any(type(sid) is not int or sid not in ids for sid in order)
+                for key, order in result.orders.items()
+            ):
+                raise ValueError("Invalid filter order")
+            if len(ids) != len(stories) or any(
+                type(value) is not int or value < 0
+                for value in result.feedback_counts.values()
+            ):
+                raise ValueError("Invalid feedback counts or duplicate stories")
+            return result
+        except (KeyError, TypeError, AttributeError) as exc:
+            raise ValueError("Invalid feed response") from exc
