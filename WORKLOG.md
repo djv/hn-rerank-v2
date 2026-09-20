@@ -8634,3 +8634,84 @@ texts, both under onnxruntime `CPUExecutionProvider`.
   warning); Ruff, touched-file formatting, Ty and diff checks passed.
   Restarted service; dashboard 200 with the new loading guard, forced TLDR
   generated in 3.46s, subsequent request cached; no request errors.
+
+## 2026-09-11 — property-led refresh persistence and RSS identity fixes
+
+- Added Hypothesis properties before production edits. Successful refresh
+  persistence and RSS identity protection failed; failed-fetch preservation
+  passed. Hypothesis shrank the refresh disagreement to 20 repetitions each
+  of old/new text, and identity overwrite to ID -1 with an upvote.
+- HN tap and bulk hydration now explicitly replace comment snapshots and
+  fetched-count markers together. Routine ingestion cannot restore comments
+  with a lower fetched-count marker. Hydration returns/embeds persisted rows.
+- Atomic SQLite conflict guard prevents a different RSS URL overwriting an
+  existing non-positive ID. RSS/Reddit ingestion skips conflicts, including
+  Reddit snapshot and prewarm membership; existing IDs and feedback stay put.
+- Properties exercise both hydration paths, stale re-ingestion, failed
+  requests, feedback preservation, actual RSS parsing with a known 31-bit
+  hash collision in both orders, and Reddit snapshot/prewarm exclusion.
+- No ID migration or historical data repair; colliding new URLs are skipped.
+- Validation: 760 tests passed with four workers (16.42s); six property
+  cases passed under the 300-example CI profile (24.88s); Ruff, touched-file
+  formatting, Ty and diff checks passed. Restarted service; dashboard and
+  cached/forced/cached TLDR requests all returned 200. Forced generation
+  took 4.52s and the next request reused its persisted cache key. No request
+  errors in the bounded post-restart log check.
+
+## 2026-09-11 — stronger property oracles
+
+- Refresh properties now assert exact fetched comment text, composed text,
+  returned/persisted row agreement and independent live/fetched counts for
+  both tap and bulk paths. Collision tests require StoryIdentityConflict,
+  not an arbitrary ValueError.
+- Added generated refresh/ingestion/count-heal sequences, checking snapshot
+  and live-count invariants after every operation against retained history.
+- Replaced KNN helper-to-helper parity with scalar dot products, full-sort
+  top-k means and first-maximum reference indices. Covers empty inputs,
+  zero k, oversized k, chunk boundaries, negative similarities and ties.
+  Dyadic inputs make tie expectations exact across float32/float64; the
+  wider CI profile now applies instead of a fixed 50-example override.
+- Added an exhaustive small-input oracle for whole-comment packing: among
+  all budget-feasible subsets, prefer earlier comments lexicographically.
+  Explicit examples cover oversized heads, exact separator boundaries and
+  blank-only input.
+- In-process mutation checks rejected empty packing, mid-comment truncation,
+  zero KNN outputs, ignored authoritative refresh and stale snapshot
+  replacement. No additional production changes or service restart.
+- Validation: nine targeted property cases passed with the 300-example CI
+  profile (27.23s); full suite 762 passed with four workers (16.00s).
+  Ruff, touched-file formatting, Ty and diff checks passed.
+
+## 2026-09-11 — properties caught stale fitted-model reuse
+
+- Added real data-flow invariants: vote/clear/revote sequences preserve
+  per-user labels and dedup exclusions; embedding lookups preserve batch
+  alignment, reject stale text/model/dimension entries, reuse metadata-only
+  changes and recompute only changed texts (or every row for a new model).
+- A cached-versus-fresh fitting property failed before the fix for all three
+  changes: feedback text enrichment, source reclassification and model gamma.
+  Hypothesis shrank each failure to seed 0. The unchanged-input control
+  passed, separating stale-cache behavior from classifier randomness.
+- Fixed model-cache identity to include current feedback vectors, encoder
+  version, ordered labels/text lengths/sources and model configuration in
+  addition to votes and schema version. Lookup follows the already-required
+  feedback embedding refresh, while hits still skip LOOCV matrices and fitting.
+- Validation: five new property cases passed under the 300-example CI profile
+  (30.62s); final full suite 767 passed with four workers (18.24s). Ruff,
+  touched-file formatting, Ty and diff checks passed. Service restarted;
+  dashboard and cached/forced/cached TLDR requests returned 200, personalized
+  warming completed with a model-cache miss, and no request errors appeared
+  in the bounded post-restart log check.
+
+
+## 2026-09-13 — backward-compatible terminal feed API
+
+Scoped feed API port deployed without replacing the newer VPS code or its WIP.
+Pre/post full suites: 767/768 passed; Ruff and ty clean; service restarted.
+Dedicated profile integration verified HTTPS feed, Markdown summary, feedback,
+ranking readiness, undo to zero votes and profile identity. No schema or access
+policy changes. Source rollback copies and hashes: 
+`/home/dev/hn-rewrite/shared/deploy-backups/20260913-tui-feed/`. Recheck concurrent
+changes before restoring server.py and pipeline/render.py, then restart this
+service. Client source, packaging and publication handoff live on the laptop at
+`/home/d/hn-rerank`; the VPS directory was not renamed.

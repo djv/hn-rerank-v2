@@ -51,6 +51,22 @@ To prevent constraint violations or data loss during cleanup:
 * `prune_stories` leaves feedback-associated stories intact (`id NOT IN (SELECT story_id FROM feedback)`). It is dormant — nothing in the live pipeline calls it; only tests exercise it today.
 * `get_all_feedback` and `get_feedback_for_training` perform a `LEFT JOIN` against `stories` to resolve attributes dynamically.
 
+HN comment hydration writes an authoritative snapshot through
+`upsert_story(..., comments_authoritative=True)`: selected comments and
+`comment_count_at_fetch` are replaced together, even when fresh text is shorter.
+Routine ingestion preserves comments with a higher fetched-count marker and
+otherwise prefers longer text; a retained comment snapshot retains its marker.
+Failed or empty HN comment fetches preserve existing comments. Tap hydration
+returns the persisted story; bulk hydration embeds the persisted story.
+`comment_count` remains an upwards-only observation, separate from the snapshot.
+
+RSS URL hashes retain their existing IDs. An atomic UPSERT guard rejects a
+conflicting URL on a non-positive story ID (`StoryIdentityConflict`). Ordinary
+RSS and Reddit ingestion log and skip conflicts; rejected entries are excluded
+from returned candidates, Reddit snapshots and prewarm. Existing story identity
+and feedback remain intact. This detects collisions; it does not allocate an
+alternative ID or repair historical collisions.
+
 ### 3.2 Embedding Model & Feature Space
 
 #### Embedding Model Choice
@@ -123,7 +139,18 @@ process RSS increased from 730MiB to 834MiB; the host had 2.6GiB available.
 
 #### Per-User SVM Model Cache (Schema-Versioned)
 
-The trained classifier/scaler tuple is cached in-process in `_MODEL_CACHE` (a lock-guarded `cachetools.LRUCache`, max 20 active entries by default) keyed on `(user_id, feedback_signature, _MODEL_SCHEMA_VERSION)`. The signature is a SHA-256 of the user's feedback story IDs + actions + update timestamps; the schema version is bumped whenever the feature or classifier representation changes. `_MODEL_SCHEMA_VERSION = 4` also invalidates models built before singleton feedback self-exclusion was corrected. Schema version is the only viable invalidation key: the cache is in-memory only, so a runtime dimension check would mask future schema bugs.
+The trained classifier/scaler/cluster-centers tuple is cached in-process in
+`_MODEL_CACHE` (a lock-guarded `cachetools.LRUCache`, max 20 active entries by
+default) keyed on `(user_id, training_signature, _MODEL_SCHEMA_VERSION)`.
+The signature includes feedback IDs/actions/update timestamps, current
+feedback embedding bytes and encoder version, ordered training labels/text
+lengths/sources, and model configuration. Enrichment or source reclassification
+can therefore invalidate a fitted model without a new vote. Lookup occurs
+after feedback embedding refresh but before LOOCV feature construction;
+unchanged training inputs still reuse the fitted model. The schema version
+is bumped whenever feature or classifier representation changes.
+`_MODEL_SCHEMA_VERSION = 4` also invalidates models built before singleton
+feedback self-exclusion was corrected.
 
 #### Dual-Gate SVM Activation
 
@@ -695,3 +722,14 @@ hydration, and rebuilds cached decks once when a batch changes story content.
 SQLite retains per-feed success/retry metadata, ordered snapshot membership,
 and restart-safe global circuit cooldown state. Production ranking admits only
 recent rows whose source is derived from the currently configured feed list.
+
+
+## Terminal feed API
+
+`GET /api/feed` authenticates with the existing profile cookie and returns the
+version-one feed contract from `clients/tui/src/hn_rerank/models.py`. The backend
+imports this dependency-free module directly; no terminal or ML dependencies were
+added. `DashboardDocument` attaches a feed snapshot to the existing HTML bytes so
+per-user cache hits, stale fallback and eviction share the same ranked cards.
+`_patch_current_version` preserves this attachment. Feed orders retain production
+Explore shuffling; the disabled source selector remains disabled.
