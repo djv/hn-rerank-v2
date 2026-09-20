@@ -8715,3 +8715,16 @@ policy changes. Source rollback copies and hashes:
 changes before restoring server.py and pipeline/render.py, then restart this
 service. Client source, packaging and publication handoff live on the laptop at
 `/home/d/hn-rerank`; the VPS directory was not renamed.
+
+## 2026-09-20 — one-screen TLDR shape
+
+- The terminal reader could not show Article + Discussion without scrolling.
+  Section budgets now target 45/70/90 words by source volume (was
+  75/125/200) and `_shape_tldr` keeps at most four bullets and one `####`
+  heading per `###` section; `TLDR_PROMPT_VERSION` is `detail-v9` so cached
+  summaries regenerate. The reader renders Markdown blocks with zero
+  margins and one heading-separation line.
+- Validation: test_server.py 220 passed with four workers; ruff and ty
+  clean; Textual pilot fit check rendered 8/8 sampled recommended stories
+  inside the 27-line reading viewport at 145x38. Service restarted; feed and
+  cached summary requests returned 200.
