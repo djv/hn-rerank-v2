@@ -107,7 +107,7 @@
   one worktree, no other cwd users at move time, original untracked `.opencode/`,
   `.playwright-mcp/`, `docs/MANUAL_TESTING.md` preserved. GitHub name remains
   `djv/hn-rerank-v2`. uv console scripts were reinstalled and verified at the new path.
-- Agent-tested: `HN_TEST_ONNX_MODEL_DIR=/home/d/.cache/hn-rerank/onnx_model uv run
+- Agent-tested: `HN_ONNX_MODEL_DIR=/home/d/.cache/hn-rerank/onnx_model uv run
   pytest tests/ -n 4`: 541 passed, 1 skipped. Real test model copied from the VPS;
   no production DB copied or used by development tests. Client: 16 headless tests
   passed, 1 Windows-only test skipped locally; Ruff and ty clean. A laptop PTY exercised navigation, feedback, undo,

@@ -25,28 +25,16 @@
 
 ## Known issues / follow-ups (2026-09-20 merge)
 
-- `config.toml` pins the VPS model directory
-  (`/home/dev/hn-rewrite/shared/mxbai-embed-xsmall-v1`). Laptop test runs must
-  set `HN_ONNX_MODEL_DIR=/home/d/.cache/hn-rerank/onnx_model`. Docs still name
-  the stale `HN_TEST_ONNX_MODEL_DIR` (`docs/TUI_RELEASE.md`, `AGENTS.md`).
-- `origin/main`'s WORKLOG.md carried a committed `>>>>>>> theirs` conflict
-  marker; this merge removed it. Worth a scan for other stray markers.
+- Summary fit was verified on 8 sampled stories at 145×38. A long title shrinks
+  the reading viewport (heading `max-height: 8`); very long titles could still
+  push a summary to a second screen.
 - The TUI branch's WORKLOG vacuum (digests + `WORKLOG-archive/` tarball, commit
   `3f3bb28`) is superseded by the merged long-form WORKLOG. The archive file
   still exists; re-run the vacuum or drop the refactor deliberately.
 - The TUI branch's AGENTS.md slimming is likewise superseded by `origin/main`'s
   long guide. The slim version is preserved on `backup/tui-pre-merge`.
-- `origin/feat/tui-color-polish` is now stale; delete it after this push.
-- VPS deployment: pull the merge and restart `hn_rewrite.service` so the newer
-  `clients/tui/src/hn_rerank/models.py` is imported; follow the backup/verify
-  procedure in `docs/TUI_RELEASE.md`. Its "do not replace the laptop tree" note
-  is now obsolete and should be updated.
-- Summary fit was verified on 8 sampled stories at 145×38. A long title shrinks
-  the reading viewport (heading `max-height: 8`); very long titles could still
-  push a summary to a second screen.
-- Untracked tool artifacts `.opencode/` and `.playwright-mcp/` sit in the repo
-  root; consider `.gitignore` entries.
+- `docs/TUI_VPS_PATCH.patch` is the historical scoped-port patch, superseded by
+  the merge into `origin/main`; keep for history or delete deliberately.
 
-- Next action: push the merge to `origin/main`, delete the stale
-  `feat/tui-color-polish` branch, then obtain PyPI publishing credentials,
-  publish and verify `uvx hn-rerank`. See [FINDINGS.md](FINDINGS.md).
+- Next action: obtain PyPI publishing credentials, publish and verify
+  `uvx hn-rerank`. See [FINDINGS.md](FINDINGS.md).

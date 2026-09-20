@@ -6,7 +6,7 @@ From `/home/d/hn-rerank`:
 
 ```sh
 uv sync
-HN_TEST_ONNX_MODEL_DIR=/home/d/.cache/hn-rerank/onnx_model uv run pytest tests/ -n 4
+HN_ONNX_MODEL_DIR=/home/d/.cache/hn-rerank/onnx_model uv run pytest tests/ -n 4
 uv run pytest clients/tui/tests
 uv run ruff check .
 uv run ty check
@@ -15,7 +15,9 @@ cd /tmp
 uvx --from /home/d/hn-rerank/dist/hn_rerank-0.1.0-py3-none-any.whl hn-rerank
 ```
 
-The ONNX override is for the existing real-embedding backend tests only. Test
+The ONNX override is needed because `config.toml` pins the VPS model path
+(`HN_TEST_ONNX_MODEL_DIR` is not read; the variable is `HN_ONNX_MODEL_DIR`).
+It applies to the real-embedding backend tests only. Test
 DBs are temporary. The client itself needs no model, database or backend extras.
 `.github/workflows/tui.yml` copies the package outside the workspace on Linux,
 macOS and Windows, runs headless tests, builds it and starts the installed wheel.
@@ -33,18 +35,29 @@ After uploading, test that exact index command from outside the checkout.
 
 ## Deployment
 
-The actual VPS service is `hn_rewrite.service`, with working directory
-`/home/dev/hn-rewrite/main`. Its code is newer than this laptop checkout and has
-uncommitted work. Do not replace it with the laptop tree, run a broad sync or
-reset its changes. Port only the feed route, shared rendering snapshot, model
-module and the stale-HTML helper's preservation of `DashboardDocument`.
-Production Explore is shuffled; preserve that behavior in its feed orders.
-Inspect fresh source hashes and service state, keep backups, run tests, restart
-only this service, then use a dedicated test profile for authenticated feed,
-summary, feedback/undo and ranking readiness checks. Keep the existing network
-access policy. Public package availability is independent of server access.
+`origin/main` is the single source of truth, and the VPS checkout at
+`/home/dev/hn-rewrite/main` is a clean worktree of it. Tag the current commit
+first, then deploy:
 
-Current deployment evidence and rollback paths belong in [FINDINGS](../FINDINGS.md).
+```sh
+ssh hetzner 'cd /home/dev/hn-rewrite/main && git tag deploy-pre-<change> \
+  $(git rev-parse --short HEAD) && git pull --ff-only origin main'
+ssh hetzner 'cd /home/dev/hn-rewrite/main && /home/dev/.local/bin/uv sync'
+ssh hetzner 'systemctl --user restart hn_rewrite.service'
+```
+
+Rollback is `git reset --hard deploy-pre-<change>` plus a restart. The service
+is a systemd **user** unit (`systemctl --user ...`) running
+`uv run python server.py` on 127.0.0.1:8766 behind Caddy; production Explore
+stays shuffled and `_patch_current_version` preserves the attached
+`DashboardDocument` feed.
+
+After restart, smoke the dashboard plus cached/uncached `POST /api/tldr-detail`
+with a dedicated test profile, and scan
+`journalctl --user -u hn_rewrite.service --since '1 min ago'` for errors. Keep
+the existing network access policy; public package availability is independent
+of server access. Deployment evidence and rollback paths live in
+[FINDINGS](../FINDINGS.md).
 
 ## Laptop rename
 

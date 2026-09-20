@@ -20,3 +20,5 @@ eval_results/
 cookie.txt
 calibration_plot.png
 hn_rewrite.db.*
+.opencode/
+.playwright-mcp/
