@@ -26,6 +26,14 @@ async def inspect(pilot: Pilot) -> None:
         await pilot.pause()
         app.save_screenshot("hn-editorial-empty.svg", path="/tmp")
         app.status("Could not reach server. Press r to retry.", error=True)
+        app.workers.cancel_group(app, "refresh")
+        app.workers.cancel_group(app, "vote")
+        app.workers.cancel_group(app, "summary")
+        await pilot.pause(1.0)
+        app.feed = None
+        app.stories = []
+        app.show_failure("Could not reach server.")
+        await pilot.pause()
         app.save_screenshot("hn-editorial-error.svg", path="/tmp")
         app.setup()
         await pilot.pause()
