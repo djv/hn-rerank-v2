@@ -7,9 +7,10 @@ The server retains its existing access policy: installing the client does not gr
 
 Keys: j/k or arrows navigate/scroll; Tab changes focus; 1/2/3 vote
 positive/neutral/negative; u undoes the latest successful vote; o/c open
-article/comments; r refreshes; ? shows help; q quits. Escape closes help.
-Use the sort and age selectors to change filters. Below 100 columns the
-headline list stacks above the summary; the summary is always visible.
+article/comments; r refreshes; ? shows help; q quits. Enter opens a read mode
+when the summary overflows its pane (the footer hint appears only then);
+Escape leaves it or closes help. Use the sort and age selectors to change
+filters. Below 100 columns the headline list stacks above the summary.
 
 Configuration lives in platformdirs' user config directory (`hn-rerank/profile.json`),
 outside uv's cache. The profile token is a credential: keep that file and profile links private.
@@ -30,7 +31,10 @@ Bold key terms in a summary take the same orange, and single-marker emphasis
 identifies the selected headline without relying on color. At 100 columns and
 above, filter tabs sit over a one-third headline/two-thirds summary layout.
 Smaller terminals use dropdowns and stack the list above the summary; both
-panes stay visible and the summary scrolls in place.
+panes stay visible and the summary scrolls in place. When a summary is taller
+than its pane, Enter expands it (full height on small terminals) and the
+footer advertises the key; fitting summaries keep the plain layout with the
+key disabled.
 Resize and focus changes preserve reading position. Run the offline preview from
 the repository root with `uv run python -m clients.tui.tests.preview --headless`.
 

@@ -145,6 +145,44 @@ async def test_enter_does_not_toggle_view() -> None:
         assert listing.display and summary.display
 
 
+async def test_read_mode_only_when_summary_overflows() -> None:
+    short = FakeServer()
+    app = Reader(api=short.api())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await pilot.pause(0.6)
+        hints = app.query_one("#shortcuts", Static)
+        assert "Enter read" not in str(hints.content)
+        listing = app.query_one(OptionList)
+        await pilot.press("enter")
+        await pilot.pause()
+        assert listing.has_focus
+        assert not app.reading
+
+    long = EditorialServer()
+    app = Reader(api=long.api())
+    async with app.run_test(size=(80, 30)) as pilot:
+        await pilot.pause(0.6)
+        hints = app.query_one("#shortcuts", Static)
+        for _ in range(20):
+            if "Enter read" in str(hints.content):
+                break
+            await pilot.pause(0.2)
+        assert "Enter read" in str(hints.content)
+        listing = app.query_one(OptionList)
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.reading
+        assert not listing.display
+        assert app.query_one(Markdown).has_focus
+        await pilot.press("j")
+        await pilot.pause()
+        assert app.query_one(Markdown).scroll_y > 0
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not app.reading
+        assert listing.display
+
+
 async def test_empty_and_error_recovery() -> None:
     fake = FakeServer()
     app = Reader(api=fake.api())

@@ -10,13 +10,13 @@
   `a47b8de`): selector focus no longer strands every keybinding, Escape out of
   help restores the story summary, the reading heading follows refreshed data,
   headings align left, the footer labels the vote keys
-  (`1 up · 2 neutral · 3 down`), Enter no longer opens a reading mode (the
-  summary is always visible and `j/k` only move the list), and Markdown blocks
-  render without per-block margins. Server `detail-v10` targets 45/70/90 words,
-  caps each section at four bullets and one `####` heading, and bolds
-  single-marker emphasis so Article + Discussion fit one TUI screen.
+  (`1 up · 2 neutral · 3 down`), Enter opens read mode only when the summary
+  overflows its pane (otherwise the key and hint stay disabled), and Markdown
+  blocks render without per-block margins. Server `detail-v10` targets
+  45/70/90 words, caps each section at four bullets and one `####` heading,
+  and bolds single-marker emphasis so Article + Discussion fit one TUI screen.
 - Verification: backend 770 passed with
-  `HN_ONNX_MODEL_DIR=/home/d/.cache/hn-rerank/onnx_model`; client 39 passed /
+  `HN_ONNX_MODEL_DIR=/home/d/.cache/hn-rerank/onnx_model`; client 40 passed /
   1 Windows-only skip; Ruff and ty clean. Offline SVG renders inspected;
   native terminal sessions at 145×38 and 80×30 exercised filters, reading,
   voting/undo, help, empty and failure states; the Textual pilot measured 8/8

@@ -13,6 +13,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.theme import Theme
+from textual.timer import Timer
 from textual.widgets import (
     Button,
     Input,
@@ -254,6 +255,8 @@ class Reader(App[None]):
     .narrow #reading-pane { width: 1fr; height: 3fr; border-left: none;
                             border-top: solid #44403B; }
     .narrow #reading-pane.has-story:focus-within { border-top: solid #FF914D; }
+    .narrow.reading #headlines { display: none; }
+    .narrow.reading #reading-pane { height: 1fr; }
     """
     BINDINGS: ClassVar[list[tuple[str, str, str]]] = [
         ("j", "move(1)", "Down"),
@@ -265,6 +268,7 @@ class Reader(App[None]):
         ("o", "open_url('article_url')", "Article"),
         ("c", "open_url('comments_url')", "Comments"),
         ("r", "refresh", "Refresh"),
+        ("enter", "read", "Read"),
         ("escape", "headlines", "Back"),
         ("?", "help", "Help"),
         ("q", "quit", "Quit"),
@@ -314,6 +318,9 @@ class Reader(App[None]):
         self.target: int | None = None
         self.selection_serial = 0
         self.summary_story_id: int | None = None
+        self.reading = False
+        self.can_read = False
+        self._read_timers: list[Timer] = []
         self.help_open = False
         self.setting_up = False
         self.status_mode = "context"
@@ -357,11 +364,15 @@ class Reader(App[None]):
 
     def on_mount(self) -> None:
         self.layout_panes()
+        self.set_interval(1.0, self.refresh_read_state)
         self.query_one("#headlines", OptionList).focus()
         self.start()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         if self.setting_up or isinstance(self.focused, Input):
+            return False
+        # Read mode exists only while the summary overflows its pane.
+        if action == "read" and (not self.can_read or self.help_open):
             return False
         # A focused selector owns typing keys, but focus movement and quit must
         # stay reachable or the keyboard gets stuck on the dropdown.
@@ -406,6 +417,7 @@ class Reader(App[None]):
         self.selection_serial += 1
         self.workers.cancel_group(self, "summary")
         self.query_one("#summary", Markdown).update(feed_failure_notice(detail))
+        self.schedule_read_state()
 
     @work(group="startup", exclusive=True)
     async def start(self) -> None:
@@ -505,6 +517,7 @@ class Reader(App[None]):
                 if self.feed is None and self.last_error
                 else EMPTY_NOTICE
             )
+            self.schedule_read_state()
         self.query_one("#reading-pane").set_class(bool(self.stories), "has-story")
         self.context_status()
 
@@ -547,6 +560,7 @@ class Reader(App[None]):
             self.summary_story_id = story.id
             self.selection_serial += 1
             self.load_summary(story.id, self.selection_serial)
+            self.schedule_read_state()
 
     @work(group="summary", exclusive=True)
     async def load_summary(self, story_id: int, serial: int) -> None:
@@ -558,10 +572,12 @@ class Reader(App[None]):
         ):
             return
         self.query_one("#summary", Markdown).update("Loading summary…")
+        self.schedule_read_state()
         try:
             summary = await self.api.summary(story_id)
             if serial == self.selection_serial and self.query("#summary"):
                 self.query_one("#summary", Markdown).update(summary)
+                self.schedule_read_state()
         except InvalidProfile as exc:
             self.setup(str(exc))
         except APIError as exc:
@@ -569,6 +585,7 @@ class Reader(App[None]):
                 self.query_one("#summary", Markdown).update(
                     "# Summary unavailable\n\nPress **r** to retry."
                 )
+                self.schedule_read_state()
                 self.status(str(exc) + " Press r to retry.", error=True)
 
     @work(group="refresh", exclusive=True)
@@ -619,6 +636,11 @@ class Reader(App[None]):
         self.refresh_feed()
 
     def action_move(self, delta: int) -> None:
+        if self.reading:
+            self.query_one("#summary", Markdown).scroll_relative(
+                y=delta * 3, animate=False
+            )
+            return
         listing = self.query_one("#headlines", OptionList)
         if self.stories:
             listing.highlighted = max(
@@ -703,22 +725,82 @@ class Reader(App[None]):
     def layout_panes(self, width: int | None = None) -> None:
         narrow = (self.size.width if width is None else width) < 100
         self.set_class(narrow, "narrow")
-        self.query_one("#shortcuts", Static).update(
-            "j/k move · 1 up · 2 neutral · 3 down · ? help · q quit"
-        )
+        self.set_class(self.reading, "reading")
+        votes = "1 up · 2 neutral · 3 down"
+        if narrow:
+            if self.reading:
+                hints = f"j/k scroll · Esc back · {votes} · ? help"
+            elif self.can_read:
+                hints = f"Enter read · {votes} · ? help"
+            else:
+                hints = f"j/k move · {votes} · ? help"
+        elif self.reading:
+            hints = f"j/k scroll · Esc headlines · {votes} · ? help · q quit"
+        elif self.can_read:
+            hints = f"j/k move · Enter read · {votes} · ? help · q quit"
+        else:
+            hints = f"j/k move · {votes} · ? help · q quit"
+        self.query_one("#shortcuts", Static).update(hints)
+
+    def schedule_read_state(self) -> None:
+        """Re-evaluate read mode once the refreshed summary has been laid out.
+
+        The immediate callback catches cached content; the staggered timers
+        catch the layout pass that first reports the summary's overflow.
+        """
+        self.call_after_refresh(self.refresh_read_state)
+        for timer in self._read_timers:
+            timer.stop()
+        self._read_timers = [
+            self.set_timer(delay, self.refresh_read_state) for delay in (0.1, 0.3, 0.6)
+        ]
+
+    def refresh_read_state(self) -> None:
+        """Offer read mode only while the summary overflows its pane.
+
+        Frozen while reading, so expanding the pane cannot flip the state and
+        bounce the layout back and forth.
+        """
+        if self.reading or not self.query("#summary"):
+            return
+        summary = self.query_one("#summary", Markdown)
+        can_read = summary.virtual_size.height > summary.container_size.height
+        if can_read != self.can_read:
+            self.can_read = can_read
+            self.layout_panes()
 
     def on_resize(self, event: events.Resize) -> None:
         if self.query("#panes"):
             self.layout_panes(event.size.width)
+            self.schedule_read_state()
 
     def focus_summary(self) -> None:
         self.query_one("#summary", Markdown).focus()
 
+    def action_read(self) -> None:
+        if not self.can_read and not self.reading:
+            return
+        self.reading = not self.reading
+        self.layout_panes()
+        if self.reading:
+            self.query_one("#summary", Markdown).focus()
+        else:
+            self.query_one("#headlines", OptionList).focus()
+            self.schedule_read_state()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        self.action_read()
+
     def action_headlines(self) -> None:
+        was_reading = self.reading
+        self.reading = False
+        self.layout_panes()
         self.query_one("#headlines", OptionList).focus()
         if self.help_open:
             self.help_open = False
             self.schedule_summary()
+        elif was_reading:
+            self.schedule_read_state()
 
     def action_help(self) -> None:
         self.help_open = True
@@ -726,9 +808,10 @@ class Reader(App[None]):
         self.selection_serial += 1
         self.workers.cancel_group(self, "summary")
         self.query_one("#summary", Markdown).update(
-            "# Shortcuts\n\nj/k: move the headline list. Arrows: scroll the focused pane. Tab: focus. Escape: close this help.\n\n1/2/3: up / neutral / down. u: undo latest vote. o/c: article / comments. r: refresh. ?: this help. q: quit.\n\nUse the selectors for Recommended, Popular, Explore, Date and Recent / Archive. Votes are never automatically retried after network errors."
+            "# Shortcuts\n\nj/k: move the headline list. Arrows: scroll the focused pane. Tab: focus. Escape: close this help.\n\nEnter: expand a summary that overflows its pane, and leave that mode again. 1/2/3: up / neutral / down. u: undo latest vote. o/c: article / comments. r: refresh. ?: this help. q: quit.\n\nUse the selectors for Recommended, Popular, Explore, Date and Recent / Archive. Votes are never automatically retried after network errors."
         )
         self.focus_summary()
+        self.schedule_read_state()
 
     async def on_unmount(self) -> None:
         self.selection_serial += 1

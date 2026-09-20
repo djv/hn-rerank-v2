@@ -8983,3 +8983,15 @@ service. Client source, packaging and publication handoff live on the laptop at
   swapping panes. Footer hints, help text and the client README follow.
 - Validation: client 39 passed / 1 Windows-only skip; standalone copy with
   fresh deps (ruff 0.16.8, ty 0.0.82) clean; in-tree ruff/format/ty clean.
+
+## 2026-09-20 — Terminal reader: read mode gated on summary overflow
+
+- The read mode returns only where it is needed: Enter is enabled — and the
+  footer advertises it — only while the summary overflows its pane. Enter
+  expands the summary (full height below 100 columns; focus plus `j/k`
+  scrolling above) and Escape leaves it. Fitting summaries keep the plain
+  layout with the key disabled and no hint. Read mode freezes while active so
+  the expanded pane cannot flip the state, and the overflow check re-runs
+  after each render and resize.
+- Validation: client 40 passed / 1 Windows-only skip; standalone copy with
+  fresh deps (ruff 0.16.8, ty 0.0.82) clean; in-tree ruff/format/ty clean.
