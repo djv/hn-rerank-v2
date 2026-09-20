@@ -6,7 +6,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal, Generator, TypeAlias
+from typing import Any, Literal, Generator, NamedTuple, TypeAlias
 from contextlib import contextmanager
 import queue
 import numpy as np
@@ -15,6 +15,25 @@ from numpy.typing import NDArray
 
 Action: TypeAlias = Literal["up", "neutral", "down"]
 HnDupeStatus: TypeAlias = Literal["canonical", "no_match", "retry"]
+InteractionEventType: TypeAlias = Literal[
+    "impression", "article_open", "comments_open", "dwell"
+]
+STRICT_SCHEMA_VERSION = 2
+
+
+class StoryIdentityConflict(ValueError):
+    """An RSS ID is already owned by a different URL."""
+
+
+def coerce_int(value: Any, default: int = 0) -> int:
+    """Lenient int() for external payloads (CH rows, Algolia items, seed
+    JSONL): None/unparseable collapse to `default` instead of raising."""
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 @dataclass(frozen=True)
@@ -80,6 +99,33 @@ class RankPerfSample:
 
 
 @dataclass(frozen=True)
+class InteractionEvent:
+    """One explicit client interaction, normalized at the HTTP boundary."""
+
+    event_id: str
+    client_session_id: str
+    user_id: int
+    story_id: int
+    event_type: InteractionEventType
+    dashboard_version: int
+    position: int
+    sort_mode: str
+    age_filter: str
+    source_filter: str
+    ranker_arm: str
+    occurred_at: float
+    duration_ms: int | None = None
+
+
+class InteractionInsertResult(NamedTuple):
+    """Outcome of an interaction-event batch insert."""
+
+    inserted: int
+    duplicates: int
+    unknown: int
+
+
+@dataclass(frozen=True)
 class HnDupeResolution:
     source_story_id: int
     canonical_story_id: int | None
@@ -88,6 +134,17 @@ class HnDupeResolution:
     next_check_at: float
     failure_count: int
     last_error: str
+
+
+@dataclass(frozen=True)
+class RedditFeedState:
+    feed_url: str
+    last_attempt_at: float
+    last_success_at: float
+    failure_count: int
+    next_retry_at: float
+    last_error: str
+    item_count: int
 
 
 class Database:
@@ -109,16 +166,48 @@ class Database:
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("PRAGMA busy_timeout=5000")
             self._pool.put(conn)
+        self.pool_slow_waits = 0
         if not read_only:
-            self._create_tables()
+            try:
+                self._assert_schema_compatible()
+                self._create_tables()
+            except Exception:
+                self.close()
+                raise
 
     @contextmanager
     def conn(self) -> Generator[sqlite3.Connection, None, None]:
+        start = time.perf_counter()
         conn = self._pool.get()
+        waited_ms = (time.perf_counter() - start) * 1000.0
+        if waited_ms > 100.0:
+            # Contention signal: all pool connections were checked out
+            # (regen bulk writes vs vote-warms). Counted for tests, logged
+            # for joining slow warms against pool pressure.
+            self.pool_slow_waits += 1
+            logging.warning("db_pool_wait_ms=%.1f", waited_ms)
         try:
             yield conn
         finally:
             self._pool.put(conn)
+
+    def _assert_schema_compatible(self) -> None:
+        with self.conn() as conn:
+            tables = conn.execute(
+                "SELECT name, strict FROM pragma_table_list "
+                "WHERE schema='main' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+            if not tables:
+                return
+            non_strict = [str(name) for name, strict in tables if strict != 1]
+            version_row = conn.execute("PRAGMA user_version").fetchone()
+            version = int(version_row[0]) if version_row else 0
+            if non_strict or version != STRICT_SCHEMA_VERSION:
+                raise RuntimeError(
+                    "Database schema requires explicit STRICT migration; run "
+                    "`uv run python scripts/migrate_db_to_strict.py` while the "
+                    f"service is stopped (version={version}, non_strict={non_strict})"
+                )
 
     def _create_tables(self) -> None:
         with self.conn() as conn:
@@ -139,7 +228,7 @@ class Database:
                         self_text      TEXT NOT NULL DEFAULT '',
                         top_comments   TEXT NOT NULL DEFAULT '',
                         article_body   TEXT NOT NULL DEFAULT ''
-                    )
+                    ) STRICT
                 """)
                 cursor = conn.execute("PRAGMA table_info(stories)")
                 columns = {row[1] for row in cursor.fetchall()}
@@ -172,13 +261,24 @@ class Database:
                         text_hash     TEXT NOT NULL DEFAULT '',
                         embedding     BLOB NOT NULL,
                         FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE
-                    )
+                    ) STRICT
                 """)
                 cursor = conn.execute("PRAGMA table_info(embeddings)")
                 emb_columns = {row[1] for row in cursor.fetchall()}
                 if "text_hash" not in emb_columns:
                     conn.execute(
                         "ALTER TABLE embeddings ADD COLUMN text_hash TEXT NOT NULL DEFAULT ''"
+                    )
+                # Provenance for the embedding contract (WORKLOG 2026-09-07):
+                # model_sha/dim are recorded on new rows only and never enter
+                # the match predicate, so legacy rows keep hitting as-is.
+                if "model_sha" not in emb_columns:
+                    conn.execute(
+                        "ALTER TABLE embeddings ADD COLUMN model_sha TEXT NOT NULL DEFAULT ''"
+                    )
+                if "dim" not in emb_columns:
+                    conn.execute(
+                        "ALTER TABLE embeddings ADD COLUMN dim INTEGER NOT NULL DEFAULT 0"
                     )
 
                 conn.execute("""
@@ -189,7 +289,7 @@ class Database:
                         created_at  REAL NOT NULL,
                         PRIMARY KEY (story_id, cache_key),
                         FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE
-                    )
+                    ) STRICT
                 """)
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_tldr_cache_story ON tldr_cache(story_id)"
@@ -206,12 +306,24 @@ class Database:
                         next_retry_at  REAL NOT NULL DEFAULT 0,
                         updated_at     REAL NOT NULL,
                         FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE
-                    )
+                    ) STRICT
                 """)
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_article_fetch_failures_url "
                     "ON article_fetch_failures(url)"
                 )
+
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS llm_usage_daily (
+                        day              TEXT NOT NULL,
+                        provider         TEXT NOT NULL,
+                        calls            INTEGER NOT NULL DEFAULT 0,
+                        input_tokens     INTEGER NOT NULL DEFAULT 0,
+                        output_tokens    INTEGER NOT NULL DEFAULT 0,
+                        reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (day, provider)
+                    ) STRICT
+                """)
 
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS rank_perf (
@@ -226,11 +338,43 @@ class Database:
                         model_cache     TEXT NOT NULL,
                         stories         INTEGER NOT NULL,
                         fields_json     TEXT NOT NULL
-                    )
+                    ) STRICT
                 """)
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_rank_perf_recorded_at "
                     "ON rank_perf(recorded_at)"
+                )
+
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS interaction_events (
+                        event_id           TEXT PRIMARY KEY,
+                        client_session_id  TEXT NOT NULL,
+                        user_id             INTEGER NOT NULL,
+                        story_id            INTEGER NOT NULL,
+                        event_type         TEXT NOT NULL CHECK(
+                            event_type IN ('impression', 'article_open',
+                                           'comments_open', 'dwell')
+                        ),
+                        dashboard_version  INTEGER NOT NULL CHECK(dashboard_version >= 0),
+                        position            INTEGER NOT NULL CHECK(position >= 0),
+                        sort_mode           TEXT NOT NULL,
+                        age_filter          TEXT NOT NULL,
+                        source_filter       TEXT NOT NULL,
+                        ranker_arm          TEXT NOT NULL,
+                        occurred_at         REAL NOT NULL,
+                        duration_ms         INTEGER CHECK(
+                            duration_ms IS NULL OR duration_ms >= 0
+                        ),
+                        received_at         REAL NOT NULL
+                    ) STRICT
+                """)
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_interaction_events_user_time "
+                    "ON interaction_events(user_id, occurred_at)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_interaction_events_story_time "
+                    "ON interaction_events(story_id, occurred_at)"
                 )
 
                 conn.execute("""
@@ -244,12 +388,44 @@ class Database:
                         last_error TEXT NOT NULL DEFAULT '',
                         FOREIGN KEY (source_story_id) REFERENCES stories(id) ON DELETE CASCADE,
                         FOREIGN KEY (canonical_story_id) REFERENCES stories(id) ON DELETE SET NULL
-                    )
+                    ) STRICT
                 """)
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_hn_dupe_resolutions_due "
                     "ON hn_dupe_resolutions(next_check_at)"
                 )
+
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS reddit_feed_state (
+                        feed_url TEXT PRIMARY KEY,
+                        last_attempt_at REAL NOT NULL,
+                        last_success_at REAL NOT NULL DEFAULT 0,
+                        failure_count INTEGER NOT NULL DEFAULT 0,
+                        next_retry_at REAL NOT NULL DEFAULT 0,
+                        last_error TEXT NOT NULL DEFAULT '',
+                        item_count INTEGER NOT NULL DEFAULT 0
+                    ) STRICT
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS reddit_feed_items (
+                        feed_url TEXT NOT NULL,
+                        story_id INTEGER NOT NULL,
+                        position INTEGER NOT NULL,
+                        observed_at REAL NOT NULL,
+                        PRIMARY KEY (feed_url, story_id),
+                        FOREIGN KEY (feed_url) REFERENCES reddit_feed_state(feed_url)
+                            ON DELETE CASCADE,
+                        FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE
+                    ) STRICT
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS reddit_circuit_state (
+                        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                        consecutive_429 INTEGER NOT NULL,
+                        retry_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    ) STRICT
+                """)
 
                 # Run migration of article_cache to stories table if article_cache exists
                 tbl_cursor = conn.execute(
@@ -273,7 +449,7 @@ class Database:
                         id          INTEGER PRIMARY KEY,
                         token       TEXT UNIQUE NOT NULL,
                         created_at  REAL NOT NULL
-                    )
+                    ) STRICT
                 """)
 
                 # Multi-user feedback migration
@@ -293,7 +469,7 @@ class Database:
                                 updated_at  REAL NOT NULL,
                                 PRIMARY KEY (user_id, story_id),
                                 FOREIGN KEY (story_id) REFERENCES stories(id)
-                            )
+                            ) STRICT
                         """)
                         conn.execute(
                             "INSERT OR IGNORE INTO users (id, token, created_at) VALUES (1, 'default', ?)",
@@ -318,7 +494,7 @@ class Database:
                                 updated_at  REAL NOT NULL,
                                 PRIMARY KEY (user_id, story_id),
                                 FOREIGN KEY (story_id) REFERENCES stories(id)
-                            )
+                            ) STRICT
                         """)
                         conn.execute(
                             "INSERT OR IGNORE INTO users (id, token, created_at) VALUES (1, 'default', ?)",
@@ -343,8 +519,10 @@ class Database:
                             updated_at  REAL NOT NULL,
                             PRIMARY KEY (user_id, story_id),
                             FOREIGN KEY (story_id) REFERENCES stories(id)
-                        )
+                        ) STRICT
                     """)
+
+                conn.execute(f"PRAGMA user_version={STRICT_SCHEMA_VERSION}")
 
     def close(self) -> None:
         while not self._pool.empty():
@@ -355,7 +533,14 @@ class Database:
                 break
 
     # Stories
-    def upsert_story(self, story: Story) -> None:
+    def upsert_story(
+        self, story: Story, *, comments_authoritative: bool = False
+    ) -> None:
+        """Merge ingestion metadata, or replace a successfully fetched comment snapshot.
+
+        Authoritative comments and their fetched-count marker move together;
+        routine ingestion cannot replace a newer fetched snapshot with an older one.
+        """
         with self.conn() as conn:
             # Check if the story already exists and has longer cached content
             cursor = conn.execute(
@@ -372,11 +557,11 @@ class Database:
                 final_self = (
                     story.self_text if len(story.self_text) >= len(db_self) else db_self
                 )
-                final_comments = (
-                    story.top_comments
-                    if len(story.top_comments) >= len(db_comments)
-                    else db_comments
+                take_comments = comments_authoritative or (
+                    story.comment_count_at_fetch >= (row[4] or 0)
+                    and len(story.top_comments) >= len(db_comments)
                 )
+                final_comments = story.top_comments if take_comments else db_comments
                 final_body = (
                     story.article_body
                     if len(story.article_body) >= len(db_body)
@@ -394,7 +579,7 @@ class Database:
                     if (story.comment_count or 0) >= (row[3] or 0)
                     else row[3]
                 )
-                final_ccaf = max(story.comment_count_at_fetch or 0, row[4] or 0)
+                final_ccaf = story.comment_count_at_fetch if take_comments else row[4]
                 final_discussion_url = story.discussion_url or row[5]
 
                 # Recompose or merge metadata if any field changed
@@ -428,7 +613,7 @@ class Database:
                     )
 
             with conn:
-                conn.execute(
+                result = conn.execute(
                     """
                     INSERT INTO stories (
                         id, title, url, score, time, text_content, source,
@@ -454,6 +639,7 @@ class Database:
                         self_text=excluded.self_text,
                         top_comments=excluded.top_comments,
                         article_body=excluded.article_body
+                    WHERE stories.id > 0 OR stories.url IS excluded.url
                     """,
                     (
                         story.id,
@@ -472,9 +658,13 @@ class Database:
                         story.article_body,
                     ),
                 )
+                if result.rowcount == 0:
+                    raise StoryIdentityConflict(
+                        f"RSS story ID {story.id} belongs to another URL"
+                    )
 
     @staticmethod
-    def _row_to_story(row: tuple) -> Story:
+    def _row_to_story(row: tuple[Any, ...]) -> Story:
         return Story(
             id=row[0],
             title=row[1],
@@ -539,11 +729,15 @@ class Database:
 
     # HN explicit duplicate canonicalization cache
     @staticmethod
-    def _row_to_hn_dupe_resolution(row: tuple) -> HnDupeResolution:
+    def _row_to_hn_dupe_resolution(row: tuple[Any, ...]) -> HnDupeResolution:
         return HnDupeResolution(
-            source_story_id=int(row[0]), canonical_story_id=row[1], status=row[2],
-            checked_at=float(row[3]), next_check_at=float(row[4]),
-            failure_count=int(row[5]), last_error=str(row[6] or ""),
+            source_story_id=int(row[0]),
+            canonical_story_id=row[1],
+            status=row[2],
+            checked_at=float(row[3]),
+            next_check_at=float(row[4]),
+            failure_count=int(row[5]),
+            last_error=str(row[6] or ""),
         )
 
     def get_hn_dupe_resolutions(
@@ -582,9 +776,7 @@ class Database:
             ).fetchall()
         return [int(row[0]) for row in rows]
 
-    def upsert_hn_dupe_resolution(
-        self, resolution: HnDupeResolution
-    ) -> None:
+    def upsert_hn_dupe_resolution(self, resolution: HnDupeResolution) -> None:
         with self.conn() as conn:
             with conn:
                 conn.execute(
@@ -593,9 +785,15 @@ class Database:
                     "ON CONFLICT(source_story_id) DO UPDATE SET canonical_story_id=excluded.canonical_story_id, "
                     "status=excluded.status, checked_at=excluded.checked_at, next_check_at=excluded.next_check_at, "
                     "failure_count=excluded.failure_count, last_error=excluded.last_error",
-                    (resolution.source_story_id, resolution.canonical_story_id, resolution.status,
-                     resolution.checked_at, resolution.next_check_at, resolution.failure_count,
-                     resolution.last_error[:500]),
+                    (
+                        resolution.source_story_id,
+                        resolution.canonical_story_id,
+                        resolution.status,
+                        resolution.checked_at,
+                        resolution.next_check_at,
+                        resolution.failure_count,
+                        resolution.last_error[:500],
+                    ),
                 )
 
     def prune_stories(self, max_age_days: int = 60) -> int:
@@ -616,24 +814,48 @@ class Database:
         model_version: str,
         text_hash: str,
         vec: NDArray[np.float32],
+        model_sha: str = "",
+        dim: int = 0,
     ) -> None:
         blob = vec.astype(np.float32).tobytes()
+        if dim <= 0:
+            dim = int(vec.shape[0]) if vec.ndim == 1 else 0
         with self.conn() as conn:
             with conn:
                 conn.execute(
                     """
-                    INSERT INTO embeddings (story_id, model_version, text_hash, embedding)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO embeddings (story_id, model_version, text_hash, embedding, model_sha, dim)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     ON CONFLICT(story_id) DO UPDATE SET
                         model_version=excluded.model_version,
                         text_hash=excluded.text_hash,
-                        embedding=excluded.embedding
+                        embedding=excluded.embedding,
+                        model_sha=excluded.model_sha,
+                        dim=excluded.dim
                     """,
-                    (story_id, model_version, text_hash, blob),
+                    (story_id, model_version, text_hash, blob, model_sha, dim),
                 )
 
+    @staticmethod
+    def _decode_embedding_blob(
+        blob: bytes, *, expected_dim: int, story_id: int
+    ) -> NDArray[np.float32] | None:
+        # Length guard: a row whose bytes don't match the live dim is a
+        # corrupt or foreign-dim vector. Skipping it as a miss (re-encoded
+        # on demand) beats the old inhomogeneous-shape ValueError that
+        # broke every rerank. expected_dim=0 preserves legacy behavior.
+        if expected_dim > 0 and len(blob) != expected_dim * 4:
+            logging.warning(
+                "embedding_dim_mismatch story_id=%s blob_bytes=%s expected_dim=%s; treating as miss",
+                story_id,
+                len(blob),
+                expected_dim,
+            )
+            return None
+        return np.frombuffer(blob, dtype=np.float32)
+
     def get_embedding(
-        self, story_id: int, model_version: str, text_hash: str
+        self, story_id: int, model_version: str, text_hash: str, expected_dim: int = 0
     ) -> NDArray[np.float32] | None:
         with self.conn() as conn:
             cursor = conn.execute(
@@ -643,10 +865,16 @@ class Database:
             row = cursor.fetchone()
             if not row:
                 return None
-            return np.frombuffer(row[0], dtype=np.float32)
+            return self._decode_embedding_blob(
+                row[0], expected_dim=expected_dim, story_id=story_id
+            )
 
     def get_embeddings_batch(
-        self, ids: list[int], model_version: str, hashes: dict[int, str]
+        self,
+        ids: list[int],
+        model_version: str,
+        hashes: dict[int, str],
+        expected_dim: int = 0,
     ) -> dict[int, NDArray[np.float32]]:
         if not ids:
             return {}
@@ -659,10 +887,23 @@ class Database:
         with self.conn() as conn:
             cursor = conn.execute(query, params)
             res = {}
+            skipped = 0
             for row in cursor.fetchall():
                 sid, h, blob = row[0], row[1], row[2]
                 if hashes.get(sid) == h:
-                    res[sid] = np.frombuffer(blob, dtype=np.float32)
+                    vec = self._decode_embedding_blob(
+                        blob, expected_dim=expected_dim, story_id=sid
+                    )
+                    if vec is None:
+                        skipped += 1
+                        continue
+                    res[sid] = vec
+            if skipped:
+                logging.warning(
+                    "embeddings_batch_skipped_dim_mismatch skipped=%s ids=%s",
+                    skipped,
+                    len(ids),
+                )
             return res
 
     # TLDR cache
@@ -712,6 +953,55 @@ class Database:
                     """,
                     (story_id, cache_key, tldr, time.time()),
                 )
+
+    # LLM usage (spend visibility; additive, never blocks serving)
+    def record_llm_usage(
+        self,
+        provider: str,
+        input_tokens: int | None,
+        output_tokens: int | None,
+        reasoning_tokens: int | None,
+    ) -> None:
+        day = time.strftime("%Y-%m-%d")
+        with self.conn() as conn:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO llm_usage_daily
+                        (day, provider, calls, input_tokens, output_tokens, reasoning_tokens)
+                    VALUES (?, ?, 1, ?, ?, ?)
+                    ON CONFLICT(day, provider) DO UPDATE SET
+                        calls = calls + 1,
+                        input_tokens = input_tokens + excluded.input_tokens,
+                        output_tokens = output_tokens + excluded.output_tokens,
+                        reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens
+                    """,
+                    (
+                        day,
+                        provider,
+                        input_tokens or 0,
+                        output_tokens or 0,
+                        reasoning_tokens or 0,
+                    ),
+                )
+
+    def get_llm_usage_day(self, day: str) -> list[dict[str, int | str]]:
+        with self.conn() as conn:
+            rows = conn.execute(
+                "SELECT provider, calls, input_tokens, output_tokens, reasoning_tokens"
+                " FROM llm_usage_daily WHERE day = ? ORDER BY provider",
+                (day,),
+            ).fetchall()
+            return [
+                {
+                    "provider": row[0],
+                    "calls": row[1],
+                    "input_tokens": row[2],
+                    "output_tokens": row[3],
+                    "reasoning_tokens": row[4],
+                }
+                for row in rows
+            ]
 
     # Feedback
     def upsert_feedback(
@@ -897,11 +1187,111 @@ class Database:
                 vote_times.append(updated_at)
             return stories, labels, vote_times
 
-    def execute(self, sql: str, params: tuple = ()) -> list[tuple]:
+    def get_capped_dwell_by_story(
+        self,
+        user_id: int,
+        cap_ms: int = 120_000,
+        before_ts: float | None = None,
+    ) -> dict[int, float]:
+        """Per-story capped dwell sums for sample_weight experiments (B3).
+
+        Mirrors scripts/ledger_report.py aggregation: each dwell event
+        contributes min(max(duration_ms, 0), cap_ms). before_ts bounds
+        occurred_at for leak-free temporal eval; serving omits it.
+        """
+        query = """
+            SELECT story_id, SUM(MIN(MAX(COALESCE(duration_ms, 0), 0), ?))
+            FROM interaction_events
+            WHERE user_id = ? AND event_type = 'dwell'
+        """
+        params: list[float | int] = [cap_ms, user_id]
+        if before_ts is not None:
+            query += " AND occurred_at <= ?"
+            params.append(before_ts)
+        query += " GROUP BY story_id"
+        with self.conn() as conn:
+            return {
+                int(story_id): float(total)
+                for story_id, total in conn.execute(query, params).fetchall()
+            }
+
+    def execute(self, sql: str, params: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
         with self.conn() as conn:
             with conn:
                 cursor = conn.execute(sql, params)
                 return cursor.fetchall()
+
+    def record_reddit_feed_success(
+        self, feed_url: str, story_ids: list[int], now_ts: float
+    ) -> None:
+        """Atomically replace one feed's ordered successful snapshot."""
+        with self.conn() as conn:
+            with conn:
+                conn.execute(
+                    "INSERT INTO reddit_feed_state "
+                    "(feed_url, last_attempt_at, last_success_at, failure_count, "
+                    "next_retry_at, last_error, item_count) VALUES (?, ?, ?, 0, 0, '', ?) "
+                    "ON CONFLICT(feed_url) DO UPDATE SET last_attempt_at=excluded.last_attempt_at, "
+                    "last_success_at=excluded.last_success_at, failure_count=0, "
+                    "next_retry_at=0, last_error='', item_count=excluded.item_count",
+                    (feed_url, now_ts, now_ts, len(story_ids)),
+                )
+                conn.execute(
+                    "DELETE FROM reddit_feed_items WHERE feed_url = ?", (feed_url,)
+                )
+                conn.executemany(
+                    "INSERT INTO reddit_feed_items "
+                    "(feed_url, story_id, position, observed_at) VALUES (?, ?, ?, ?)",
+                    [
+                        (feed_url, story_id, position, now_ts)
+                        for position, story_id in enumerate(story_ids)
+                    ],
+                )
+
+    def record_reddit_feed_failure(
+        self, feed_url: str, error: str, now_ts: float
+    ) -> None:
+        with self.conn() as conn:
+            with conn:
+                row = conn.execute(
+                    "SELECT failure_count FROM reddit_feed_state WHERE feed_url = ?",
+                    (feed_url,),
+                ).fetchone()
+                failures = (int(row[0]) if row else 0) + 1
+                retry = now_ts + min(300.0 * (2 ** (failures - 1)), 14400.0)
+                conn.execute(
+                    "INSERT INTO reddit_feed_state "
+                    "(feed_url, last_attempt_at, failure_count, next_retry_at, last_error) "
+                    "VALUES (?, ?, ?, ?, ?) ON CONFLICT(feed_url) DO UPDATE SET "
+                    "last_attempt_at=excluded.last_attempt_at, failure_count=excluded.failure_count, "
+                    "next_retry_at=excluded.next_retry_at, last_error=excluded.last_error",
+                    (feed_url, now_ts, failures, retry, error[:500]),
+                )
+
+    def get_reddit_feed_state(self, feed_url: str) -> RedditFeedState | None:
+        rows = self.execute(
+            "SELECT feed_url, last_attempt_at, last_success_at, failure_count, "
+            "next_retry_at, last_error, item_count FROM reddit_feed_state WHERE feed_url = ?",
+            (feed_url,),
+        )
+        return RedditFeedState(*rows[0]) if rows else None
+
+    def save_reddit_circuit_state(
+        self, consecutive_429: int, retry_at: float, now_ts: float
+    ) -> None:
+        self.execute(
+            "INSERT INTO reddit_circuit_state "
+            "(singleton, consecutive_429, retry_at, updated_at) VALUES (1, ?, ?, ?) "
+            "ON CONFLICT(singleton) DO UPDATE SET consecutive_429=excluded.consecutive_429, "
+            "retry_at=excluded.retry_at, updated_at=excluded.updated_at",
+            (consecutive_429, retry_at, now_ts),
+        )
+
+    def get_reddit_circuit_state(self) -> tuple[int, float] | None:
+        rows = self.execute(
+            "SELECT consecutive_429, retry_at FROM reddit_circuit_state WHERE singleton = 1"
+        )
+        return (int(rows[0][0]), float(rows[0][1])) if rows else None
 
     # Rank perf telemetry
     def insert_rank_perf(self, sample: RankPerfSample) -> None:
@@ -929,8 +1319,88 @@ class Database:
                     ),
                 )
 
+    def insert_interaction_events(
+        self, events: list[InteractionEvent]
+    ) -> InteractionInsertResult:
+        """Insert a batch of events and return ``(inserted, duplicates, unknown)``.
+
+        Event IDs are the idempotency key.  Story IDs are checked only for
+        new events; replaying an event remains a no-op even if its story has
+        since been pruned from the story corpus.  New events referencing a
+        story ID absent from ``stories`` are skipped and counted as
+        ``unknown`` — they never fail the rest of the batch.
+        """
+        if not events:
+            return InteractionInsertResult(0, 0, 0)
+        with self.conn() as conn:
+            with conn:
+                event_ids = [event.event_id for event in events]
+                placeholders = ",".join("?" for _ in event_ids)
+                existing_rows = conn.execute(
+                    "SELECT event_id FROM interaction_events "
+                    f"WHERE event_id IN ({placeholders})",
+                    event_ids,
+                ).fetchall()
+                existing_ids = {str(row[0]) for row in existing_rows}
+                new_story_ids = {
+                    event.story_id
+                    for event in events
+                    if event.event_id not in existing_ids
+                }
+                unknown_story_ids: set[int] = set()
+                if new_story_ids:
+                    story_placeholders = ",".join("?" for _ in new_story_ids)
+                    story_rows = conn.execute(
+                        f"SELECT id FROM stories WHERE id IN ({story_placeholders})",
+                        tuple(new_story_ids),
+                    ).fetchall()
+                    known_story_ids = {int(row[0]) for row in story_rows}
+                    unknown_story_ids = new_story_ids - known_story_ids
+
+                received_at = time.time()
+                inserted = 0
+                unknown = 0
+                for event in events:
+                    if (
+                        event.event_id not in existing_ids
+                        and event.story_id in unknown_story_ids
+                    ):
+                        unknown += 1
+                        continue
+                    cursor = conn.execute(
+                        """
+                        INSERT INTO interaction_events (
+                            event_id, client_session_id, user_id, story_id,
+                            event_type, dashboard_version, position, sort_mode,
+                            age_filter, source_filter, ranker_arm, occurred_at,
+                            duration_ms, received_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(event_id) DO NOTHING
+                        """,
+                        (
+                            event.event_id,
+                            event.client_session_id,
+                            event.user_id,
+                            event.story_id,
+                            event.event_type,
+                            event.dashboard_version,
+                            event.position,
+                            event.sort_mode,
+                            event.age_filter,
+                            event.source_filter,
+                            event.ranker_arm,
+                            event.occurred_at,
+                            event.duration_ms,
+                            received_at,
+                        ),
+                    )
+                    inserted += cursor.rowcount
+                return InteractionInsertResult(
+                    inserted, len(events) - inserted - unknown, unknown
+                )
+
     # Article fetch failure memory
-    def get_article_fetch_failure(self, story_id: int) -> dict | None:
+    def get_article_fetch_failure(self, story_id: int) -> dict[str, Any] | None:
         with self.conn() as conn:
             row = conn.execute(
                 """
@@ -1022,6 +1492,15 @@ class Database:
         with self.conn() as conn:
             row = conn.execute(
                 "SELECT id, token, created_at FROM users WHERE token = ?", (token,)
+            ).fetchone()
+            if row:
+                return User(id=row[0], token=row[1], created_at=row[2])
+            return None
+
+    def get_user_by_id(self, user_id: int) -> User | None:
+        with self.conn() as conn:
+            row = conn.execute(
+                "SELECT id, token, created_at FROM users WHERE id = ?", (user_id,)
             ).fetchone()
             if row:
                 return User(id=row[0], token=row[1], created_at=row[2])

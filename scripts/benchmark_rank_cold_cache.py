@@ -5,7 +5,6 @@ import hashlib
 import json
 import statistics
 import sys
-import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
@@ -16,22 +15,15 @@ if str(ROOT) not in sys.path:
 
 from database import Database, Story  # noqa: E402
 from pipeline import (  # noqa: E402
-    BQ_ARCHIVE_CANDIDATE_LIMIT,
-    BQ_ARCHIVE_SOURCE,
-    CH_ARCHIVE_CANDIDATE_LIMIT,
-    CH_ARCHIVE_SOURCE,
     Config,
     Embedder,
     RankTrace,
     _MODEL_CACHE,
     _MODEL_CACHE_LOCK,
     fast_rerank_for_user,
-    is_summarizable,
+    load_production_candidate_stories,
     story_embedding_text,
 )
-
-EMBEDDING_MODEL_VERSION = "all-MiniLM-L6-v2|mean|norm|256"
-
 
 def _clear_model_cache() -> None:
     with _MODEL_CACHE_LOCK:
@@ -54,39 +46,17 @@ def _heaviest_user_id(db: Database) -> int:
 
 
 def _candidate_stories(db: Database, config: Config, user_id: int) -> list[Story]:
-    now_ts = int(time.time())
-    cutoff_ts = now_ts - (config.days * 86400)
-    recent_rows = db.execute(
-        "SELECT id, title, url, score, time, text_content, source, comment_count, "
-        "       discussion_url, comment_count_at_fetch, "
-        "       CASE WHEN self_text != '' OR top_comments != '' OR article_body != '' "
-        "            THEN '1' ELSE '' END AS self_text, "
-        "       '' AS top_comments, '' AS article_body "
-        "FROM stories WHERE time >= ? AND source NOT IN (?, ?) "
-        "AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?)",
-        (cutoff_ts, BQ_ARCHIVE_SOURCE, CH_ARCHIVE_SOURCE, user_id),
+    return load_production_candidate_stories(
+        db,
+        config,
+        user_id=user_id,
+        exclude_feedback=True,
     )
-    archive_rows = db.execute(
-        "SELECT id, title, url, score, time, text_content, source, comment_count, "
-        "       discussion_url, comment_count_at_fetch, "
-        "       CASE WHEN self_text != '' OR top_comments != '' OR article_body != '' "
-        "            THEN '1' ELSE '' END AS self_text, "
-        "       '' AS top_comments, '' AS article_body "
-        "FROM stories INDEXED BY idx_stories_archive_score_time "
-        f"WHERE source IN ('{BQ_ARCHIVE_SOURCE}', '{CH_ARCHIVE_SOURCE}') "
-        "AND text_content != '' "
-        "AND id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?) "
-        "ORDER BY score DESC, time DESC LIMIT ?",
-        (
-            user_id,
-            BQ_ARCHIVE_CANDIDATE_LIMIT + CH_ARCHIVE_CANDIDATE_LIMIT,
-        ),
-    )
-    stories = [Database._row_to_story(row) for row in recent_rows + archive_rows]
-    return [s for s in stories if is_summarizable(s)]
 
 
-def _missing_embedding_count(db: Database, stories: list[Story]) -> int:
+def _missing_embedding_count(
+    db: Database, stories: list[Story], model_version: str
+) -> int:
     hashes = {
         story.id: hashlib.sha256(
             story_embedding_text(story).encode("utf-8")
@@ -94,7 +64,7 @@ def _missing_embedding_count(db: Database, stories: list[Story]) -> int:
         for story in stories
     }
     cached = db.get_embeddings_batch(
-        [story.id for story in stories], EMBEDDING_MODEL_VERSION, hashes
+        [story.id for story in stories], model_version, hashes
     )
     return len(stories) - len(cached)
 
@@ -104,8 +74,12 @@ def _preflight_read_only_embeddings(
 ) -> dict[str, int]:
     candidates = _candidate_stories(db, config, user_id)
     feedback_stories, _labels, _vote_times = db.get_feedback_for_training(user_id)
-    candidate_missing = _missing_embedding_count(db, candidates)
-    feedback_missing = _missing_embedding_count(db, feedback_stories)
+    candidate_missing = _missing_embedding_count(
+        db, candidates, config.embedding_model_version
+    )
+    feedback_missing = _missing_embedding_count(
+        db, feedback_stories, config.embedding_model_version
+    )
     return {
         "candidates": len(candidates),
         "feedback": len(feedback_stories),
@@ -247,6 +221,8 @@ def main() -> None:
 
         embedder = Embedder(
             config.onnx_model_dir,
+            model_version=config.embedding_model_version,
+            max_tokens=config.embedding_max_tokens,
             batch_size=config.embedding_batch_size,
             ort_variant=config.embedding_ort_variant,
         )

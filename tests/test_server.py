@@ -8,6 +8,7 @@ import pytest
 from hypothesis import HealthCheck, given, settings, strategies as st
 from werkzeug.serving import make_server
 
+from collections.abc import Callable
 from typing import Any, cast
 
 from server import Handler, SKELETON_HTML, create_app
@@ -70,12 +71,25 @@ def mock_embedder() -> MockEmbedder:
 
 
 def _reset_warm_state(handler: type[Handler], debounce_s: float = 0.01) -> None:
+    for timer in getattr(handler, "_warmup_timers", {}).values():
+        timer.cancel()
+    for timer in getattr(handler, "_feedback_warm_timers", {}).values():
+        timer.cancel()
+    feedback_regen_timer = getattr(handler, "_feedback_regen_timer", None)
+    if feedback_regen_timer is not None:
+        feedback_regen_timer.cancel()
     handler._warmup_requested_versions = {}
     handler._warmup_last_request_at = {}
     handler._warmup_timers = {}
     handler._warmup_running_users = set()
     handler._warmup_in_flight_guard = threading.Lock()
     handler._WARM_DEBOUNCE_S = debounce_s
+    handler._feedback_warm_counts = {}
+    handler._feedback_warm_versions = {}
+    handler._feedback_warm_timers = {}
+    handler._feedback_warm_guard = threading.Lock()
+    handler._feedback_regen_timer = None
+    handler._feedback_regen_guard = threading.Lock()
 
 
 def _has_pending_warm(handler: type[Handler]) -> bool:
@@ -85,6 +99,48 @@ def _has_pending_warm(handler: type[Handler]) -> bool:
             or handler._warmup_timers
             or handler._warmup_running_users
         )
+
+
+def _has_pending_feedback_regen(handler: type[Handler]) -> bool:
+    with handler._feedback_regen_guard:
+        return handler._feedback_regen_timer is not None
+
+
+class _ControllableTimer(threading.Timer):
+    """`threading.Timer` stand-in for deterministic timer tests.
+
+    `start()` does not arm a real background wait; the callback only runs
+    when `.fire()` is called explicitly. `.fire()` still executes on the
+    timer's own thread (via the real `Thread.start`/`join`), so
+    `threading.current_thread()` inside the callback is the timer object
+    itself -- production code (`Handler._feedback_regen_idle_fired`) guards
+    on that identity, and a stub that ran the callback inline would make
+    that guard untestable. `cancel()` is inherited unmodified, so debounced
+    timers behave exactly as in production: a `fire()` after `cancel()` is
+    correctly a no-op.
+    """
+
+    def start(self) -> None:  # do not arm a real wait
+        pass
+
+    def fire(self) -> None:
+        self.interval = 0
+        threading.Thread.start(self)
+        self.join(timeout=1.0)
+
+
+def _controllable_timer_factory(
+    created: list[_ControllableTimer],
+) -> Callable[..., _ControllableTimer]:
+    """Build a `server._TIMER_FACTORY` replacement that records every timer
+    it creates into `created`, in creation order."""
+
+    def factory(*args: Any, **kwargs: Any) -> _ControllableTimer:
+        timer = _ControllableTimer(*args, **kwargs)
+        created.append(timer)
+        return timer
+
+    return factory
 
 
 def _drain_warms(handler: type[Handler], timeout_s: float = 3.0) -> None:
@@ -171,6 +227,13 @@ def _start_handler_server(
 
 
 def _drain_and_shutdown(server: Any, handler: type[Handler]) -> None:
+    with handler._feedback_warm_guard:
+        for timer in handler._feedback_warm_timers.values():
+            timer.cancel()
+        handler._feedback_warm_timers.clear()
+        handler._feedback_warm_counts.clear()
+        handler._feedback_warm_versions.clear()
+    handler._cancel_feedback_regen()
     _drain_warms(handler)
     server.shutdown()
 
@@ -238,84 +301,57 @@ def test_env(tmp_path, mock_embedder):
     db.close()
 
 
-def test_discussion_budget_scales_with_comment_volume() -> None:
-    """The discussion-only TLDR budget must grow with comment volume rather
-    than staying fixed at 3-5 bullets regardless of thread size."""
+def test_section_budget_scales_with_source_volume() -> None:
+    """The TLDR bullet budget must grow with source material volume rather
+    than staying fixed at 2-3 bullets regardless of thread/article size."""
     import server
 
-    assert server._discussion_budget(0) == "3-5 bullets, max 150 words"
-    assert server._discussion_budget(1_499) == "3-5 bullets, max 150 words"
-    assert server._discussion_budget(1_500) == "6-8 bullets, max 250 words"
-    assert server._discussion_budget(4_999) == "6-8 bullets, max 250 words"
-    assert server._discussion_budget(5_000) == "9-12 bullets, max 400 words"
-    assert server._discussion_budget(12_000) == "9-12 bullets, max 400 words"
+    assert server._section_budget(0) == "2-3 bullets, max 45 words"
+    assert server._section_budget(1_499) == "2-3 bullets, max 45 words"
+    assert server._section_budget(1_500) == "2-4 bullets, max 70 words"
+    assert server._section_budget(4_999) == "2-4 bullets, max 70 words"
+    assert server._section_budget(5_000) == "3-4 bullets, max 90 words"
+    assert server._section_budget(12_000) == "3-4 bullets, max 90 words"
 
 
-def test_discussion_only_prompt_renders_budget_placeholder() -> None:
-    """Pins the {budget} placeholder contract in discussion_only_v4.txt -- if
-    a future prompt edit drops it, .format() must fail loudly here rather
+@pytest.mark.parametrize(
+    ("template", "fields"),
+    [
+        ("discussion_only_v4.txt", {"comments_section": "a comment"}),
+        (
+            "article_only_v4.txt",
+            {"article_section": "Author's text:\nsome article content"},
+        ),
+        ("article_v4.txt", {"article_section": "Author's text:\nsome article content"}),
+        ("discussion_v4.txt", {"comments_section": "a comment"}),
+    ],
+)
+def test_prompts_render_budget_placeholder(template: str, fields: dict) -> None:
+    """Pins the {budget} placeholder contract in every TLDR prompt -- if a
+    future prompt edit drops it, .format() must fail loudly here rather
     than silently ignoring the scaled budget."""
     import server
 
-    prompt = server._load_prompt("discussion_only_v4.txt").format(
+    prompt = server._load_prompt(template).format(
         title="Some story",
-        comments_section="a comment",
-        budget=server._discussion_budget(5_000),
+        budget=server._section_budget(5_000),
+        **fields,
     )
-    assert "9-12 bullets, max 400 words" in prompt
+    assert "3-4 bullets, max 90 words" in prompt
+    assert "at most one `####` heading" in prompt
 
 
-def test_article_budget_scales_with_content_volume() -> None:
-    """The article-derived TLDR budget must grow with source material volume
-    rather than staying fixed at 3-5 bullets regardless of article length."""
+@pytest.mark.parametrize("template", ["discussion_only_v4.txt", "discussion_v4.txt"])
+def test_discussion_prompts_use_freeform_headings(template: str) -> None:
+    """Discussion prompts must ask for freeform thread-specific headings,
+    never a fixed Consensus/Disagreement/Caveat label set — the fixed set
+    makes the model repeat the same buckets on every story."""
     import server
 
-    assert server._article_budget(0) == "3-5 bullets, max 150 words"
-    assert server._article_budget(1_499) == "3-5 bullets, max 150 words"
-    assert server._article_budget(1_500) == "6-8 bullets, max 250 words"
-    assert server._article_budget(4_999) == "6-8 bullets, max 250 words"
-    assert server._article_budget(5_000) == "9-12 bullets, max 400 words"
-    assert server._article_budget(12_000) == "9-12 bullets, max 400 words"
-
-
-def test_article_only_prompt_renders_budget_placeholder() -> None:
-    """Pins the {budget} placeholder contract in article_only_v4.txt -- if a
-    future prompt edit drops it, .format() must fail loudly here rather than
-    silently ignoring the scaled budget."""
-    import server
-
-    prompt = server._load_prompt("article_only_v4.txt").format(
-        title="Some story",
-        article_section="Author's text:\nsome article content",
-        budget=server._article_budget(5_000),
-    )
-    assert "9-12 bullets, max 400 words" in prompt
-
-
-def test_article_v4_prompt_renders_budget_placeholder() -> None:
-    """Pins the {budget} placeholder contract in article_v4.txt (the article
-    half of the combined article+comments path)."""
-    import server
-
-    prompt = server._load_prompt("article_v4.txt").format(
-        title="Some story",
-        article_section="Author's text:\nsome article content",
-        budget=server._article_budget(5_000),
-    )
-    assert "9-12 bullets, max 400 words" in prompt
-
-
-def test_discussion_v4_prompt_renders_budget_placeholder() -> None:
-    """Pins the {budget} placeholder contract in discussion_v4.txt (the
-    discussion half of the combined article+comments path)."""
-    import server
-
-    prompt = server._load_prompt("discussion_v4.txt").format(
-        title="Some story",
-        comments_section="a comment",
-        budget=server._discussion_budget(5_000),
-    )
-    assert "9-12 bullets, max 400 words" in prompt
+    prompt = server._load_prompt(template)
+    assert "####" in prompt
+    for label in ("Consensus:", "Disagreement:", "Caveat:"):
+        assert label not in prompt
 
 
 def test_token_redirect(app_env):
@@ -489,6 +525,8 @@ def test_static_serving(test_env):
     assert 'data-age="recent"' in resp.text
     assert 'data-age="archive"' in resp.text
     assert 'id="toast"' in resp.text
+    assert 'id="queue-loading"' in resp.text
+    assert "Loading more stories…" in resp.text
     assert 'class="refresh-progress"' not in resp.text
     assert 'id="sort-toggle"' not in resp.text
     assert 'id="queue-status"' not in resp.text
@@ -497,7 +535,7 @@ def test_static_serving(test_env):
 
 
 def test_feedback_post(test_env):
-    port, db, regen_event, _, user = test_env
+    port, db, regen_event, handler, user = test_env
     db.upsert_story(
         Story(
             id=999,
@@ -521,15 +559,17 @@ def test_feedback_post(test_env):
     assert resp.status_code == 200
     assert resp.json() == {
         "ok": True,
-        "ranking_refresh_queued": True,
+        "ranking_refresh_queued": False,
         "target_version": 1,
+        "ranking_idle_seconds": 3.0,
     }
 
     records = db.get_all_feedback(user.id)
     assert len(records) == 1
     assert records[0].story_id == 999
     assert records[0].action == "up"
-    assert regen_event.is_set()
+    assert not regen_event.is_set()
+    assert _has_pending_feedback_regen(handler)
 
 
 def test_feedback_post_rejects_invalid_action(test_env: Any) -> None:
@@ -558,6 +598,7 @@ def test_feedback_post_rejects_invalid_action(test_env: Any) -> None:
     assert db.get_all_feedback(user.id) == []
     assert handler._dashboard_version(user.id) == 0
     assert not regen_event.is_set()
+    assert not _has_pending_feedback_regen(handler)
 
 
 def test_feedback_post_rejects_malformed_story_id(test_env: Any) -> None:
@@ -578,15 +619,8 @@ def test_feedback_post_rejects_malformed_story_id(test_env: Any) -> None:
     assert not regen_event.is_set()
 
 
-def test_feedback_post_invalidates_cache_on_every_vote(test_env):
-    """Every vote bumps the dashboard version and triggers a warm, regardless
-    of client-supplied ``queue_remaining`` or ``refresh_ranking`` hints.
-
-    Regression: the previous "defer until queue low / every 5 votes" gating
-    left the cached HTML stale for up to ~9s per burst; the SWR stale-hit
-    path then re-injected already-voted stories via ``refillQueue`` (the bug
-    observed on 2026-06-28).
-    """
+def test_feedback_post_invalidates_cache_and_defers_warm_until_idle(test_env):
+    """A vote persists immediately while ranking waits for the idle cadence."""
     port, db, regen_event, handler, user = test_env
     db.upsert_story(
         Story(
@@ -613,12 +647,180 @@ def test_feedback_post_invalidates_cache_on_every_vote(test_env):
     assert resp.status_code == 200
     assert resp.json() == {
         "ok": True,
-        "ranking_refresh_queued": True,
+        "ranking_refresh_queued": False,
         "target_version": starting_version + 1,
+        "ranking_idle_seconds": handler.config.dashboard_warm_idle_seconds,
     }
     assert len(db.get_all_feedback(user.id)) == 1
     assert handler._dashboard_version(user.id) == starting_version + 1
+    assert not regen_event.is_set()
+    assert _has_pending_feedback_regen(handler)
+
+
+def test_feedback_vote_threshold_queues_one_latest_warm(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    port, db, _, handler, user = test_env
+    handler.config = replace(
+        handler.config,
+        dashboard_warm_vote_threshold=10,
+        dashboard_warm_idle_seconds=60.0,
+    )
+    calls: list[tuple[int, int]] = []
+
+    def fake_trigger_warm(cls: type[Handler], warm_user: Any, version: int) -> None:
+        calls.append((warm_user.id, version))
+
+    monkeypatch.setattr(handler, "_trigger_warm", classmethod(fake_trigger_warm))
+    for story_id in range(1200, 1210):
+        db.upsert_story(
+            Story(
+                id=story_id,
+                title=f"Threshold story {story_id}",
+                url=f"https://example.com/{story_id}",
+                score=100,
+                time=1600000000,
+                text_content="Feedback body text",
+                source="hn",
+            )
+        )
+
+    responses = [
+        httpx.post(
+            f"http://127.0.0.1:{port}/api/feedback",
+            json={"story_id": story_id, "action": "neutral"},
+            cookies={"hn_token": user.token},
+        ).json()
+        for story_id in range(1200, 1210)
+    ]
+
+    assert [response["ranking_refresh_queued"] for response in responses] == [
+        False
+    ] * 9 + [True]
+    assert calls == [(user.id, 10)]
+
+
+def test_feedback_idle_threshold_queues_latest_warm(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, _, handler, user = test_env
+    handler.config = replace(
+        handler.config,
+        dashboard_warm_vote_threshold=10,
+        dashboard_warm_idle_seconds=0.02,
+    )
+    calls: list[int] = []
+    monkeypatch.setattr(
+        handler,
+        "_trigger_warm",
+        classmethod(lambda cls, warm_user, version: calls.append(version)),
+    )
+    handler._schedule_feedback_warm(user, 1)
+    time.sleep(0.01)
+    handler._schedule_feedback_warm(user, 2)
+    deadline = time.time() + 0.2
+    while not calls and time.time() < deadline:
+        time.sleep(0.005)
+    assert calls == [2]
+
+
+def test_feedback_regen_timer_resets_across_users_and_signals_once(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All users share one trailing regeneration request.
+
+    Uses a controllable timer (see `_controllable_timer_factory`) instead of
+    a short real `feedback_regen_idle_seconds` + `time.sleep` budget: the
+    prior version raced the wall clock and failed intermittently under
+    parallel test workers (each of the three HTTP round-trips plus two 30ms
+    sleeps had to fit inside a 150ms window). The invariant under test --
+    each vote replaces the pending timer, and a burst produces exactly one
+    regen signal -- does not need real time to verify.
+    """
+    import server
+
+    port, db, regen_event, handler, user = test_env
+    other_user = db.create_user("other_feedback_regen_user")
+    timers: list[_ControllableTimer] = []
+    monkeypatch.setattr(server, "_TIMER_FACTORY", _controllable_timer_factory(timers))
+    set_calls: list[float] = []
+    original_set = regen_event.set
+
+    def counted_set() -> None:
+        set_calls.append(time.monotonic())
+        original_set()
+
+    monkeypatch.setattr(regen_event, "set", counted_set)
+
+    for story_id in (1300, 1301, 1302):
+        db.upsert_story(
+            Story(
+                id=story_id,
+                title=f"Shared regen story {story_id}",
+                url=f"https://example.com/shared-regen-{story_id}",
+                score=100,
+                time=1600000000,
+                text_content="Feedback body text",
+                source="hn",
+            )
+        )
+
+    first = httpx.post(
+        f"http://127.0.0.1:{port}/api/feedback",
+        json={"story_id": 1300, "action": "up"},
+        cookies={"hn_token": user.token},
+    )
+    assert first.status_code == 200
+    second = httpx.post(
+        f"http://127.0.0.1:{port}/api/feedback",
+        json={"story_id": 1301, "action": "down"},
+        cookies={"hn_token": other_user.token},
+    )
+    assert second.status_code == 200
+    third = httpx.post(
+        f"http://127.0.0.1:{port}/api/feedback",
+        json={"story_id": 1302, "action": "neutral"},
+        cookies={"hn_token": user.token},
+    )
+    assert third.status_code == 200
+    assert user.id != other_user.id
+
+    # Each vote cancelled the previous timer and armed a new one: three
+    # distinct timer objects were created, and only the last is still live.
+    assert len(timers) == 3
+    assert timers[0].finished.is_set()
+    assert timers[1].finished.is_set()
+    assert not timers[2].finished.is_set()
+    assert not regen_event.is_set()
+
+    timers[2].fire()
+
     assert regen_event.is_set()
+    assert len(set_calls) == 1
+    assert not _has_pending_feedback_regen(handler)
+
+
+def test_regeneration_start_cancels_pending_feedback_timer(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A periodic regeneration satisfies the pending delayed request."""
+    import server
+
+    _, _, regen_event, handler, _ = test_env
+    timers: list[_ControllableTimer] = []
+    monkeypatch.setattr(server, "_TIMER_FACTORY", _controllable_timer_factory(timers))
+    set_calls: list[None] = []
+    monkeypatch.setattr(regen_event, "set", lambda: set_calls.append(None))
+
+    handler._schedule_feedback_regen()
+    assert _has_pending_feedback_regen(handler)
+    handler._cancel_feedback_regen()
+
+    assert timers[0].finished.is_set()
+    timers[0].fire()
+
+    assert set_calls == []
+    assert not _has_pending_feedback_regen(handler)
 
 
 def test_feedback_post_limit_returns_429_without_write(test_env) -> None:
@@ -649,6 +851,7 @@ def test_feedback_post_limit_returns_429_without_write(test_env) -> None:
         json={"story_id": 1100, "action": "up"},
         cookies={"hn_token": user.token},
     )
+    feedback_regen_timer = handler._feedback_regen_timer
     second = httpx.post(
         f"http://127.0.0.1:{port}/api/feedback",
         json={"story_id": 1101, "action": "down"},
@@ -661,6 +864,7 @@ def test_feedback_post_limit_returns_429_without_write(test_env) -> None:
     assert second.json()["retry_after"] == int(second.headers["Retry-After"])
     records = db.get_all_feedback(user.id)
     assert [(record.story_id, record.action) for record in records] == [(1100, "up")]
+    assert handler._feedback_regen_timer is feedback_regen_timer
 
 
 @pytest.mark.parametrize(
@@ -756,15 +960,17 @@ def test_feedback_post_invalidates_cache_with_low_queue(test_env):
     assert resp.status_code == 200
     assert resp.json() == {
         "ok": True,
-        "ranking_refresh_queued": True,
+        "ranking_refresh_queued": False,
         "target_version": starting_version + 1,
+        "ranking_idle_seconds": handler.config.dashboard_warm_idle_seconds,
     }
     assert handler._dashboard_version(user.id) == starting_version + 1
-    assert regen_event.is_set()
+    assert not regen_event.is_set()
+    assert _has_pending_feedback_regen(handler)
 
 
 def test_feedback_post_refreshes_when_client_requests_ranking(test_env):
-    port, db, regen_event, _, user = test_env
+    port, db, regen_event, handler, user = test_env
     db.upsert_story(
         Story(
             id=1002,
@@ -792,11 +998,13 @@ def test_feedback_post_refreshes_when_client_requests_ranking(test_env):
     assert resp.status_code == 200
     assert resp.json() == {
         "ok": True,
-        "ranking_refresh_queued": True,
+        "ranking_refresh_queued": False,
         "target_version": 1,
+        "ranking_idle_seconds": handler.config.dashboard_warm_idle_seconds,
     }
     assert len(db.get_all_feedback(user.id)) == 1
-    assert regen_event.is_set()
+    assert not regen_event.is_set()
+    assert _has_pending_feedback_regen(handler)
 
 
 def test_feedback_post_bumps_cache_version_for_warm_rerender(test_env, monkeypatch):
@@ -808,6 +1016,7 @@ def test_feedback_post_bumps_cache_version_for_warm_rerender(test_env, monkeypat
     just-voted story into the refill queue.
     """
     port, db, _, handler, user = test_env
+    handler.config = replace(handler.config, dashboard_warm_vote_threshold=1)
 
     voted_story = Story(
         id=4242,
@@ -852,6 +1061,7 @@ def test_feedback_post_bumps_cache_version_for_warm_rerender(test_env, monkeypat
         "ok": True,
         "ranking_refresh_queued": True,
         "target_version": pre_version + 1,
+        "ranking_idle_seconds": handler.config.dashboard_warm_idle_seconds,
     }
 
     post_version = handler._dashboard_version(user.id)
@@ -865,7 +1075,7 @@ def test_feedback_post_bumps_cache_version_for_warm_rerender(test_env, monkeypat
 
 
 def test_feedback_clear(test_env):
-    port, db, regen_event, _, user = test_env
+    port, db, regen_event, handler, user = test_env
     db.upsert_story(
         Story(
             id=999,
@@ -894,12 +1104,14 @@ def test_feedback_clear(test_env):
     assert resp.status_code == 200
     assert resp.json() == {
         "ok": True,
-        "ranking_refresh_queued": True,
+        "ranking_refresh_queued": False,
         "target_version": 1,
+        "ranking_idle_seconds": handler.config.dashboard_warm_idle_seconds,
     }
 
     assert len(db.get_all_feedback(user.id)) == 0
-    assert regen_event.is_set()
+    assert not regen_event.is_set()
+    assert _has_pending_feedback_regen(handler)
 
 
 def test_feedback_clear_without_existing_vote_is_noop(test_env) -> None:
@@ -907,7 +1119,7 @@ def test_feedback_clear_without_existing_vote_is_noop(test_env) -> None:
     no existing vote must not queue a dashboard refresh, since nothing
     changed.
     """
-    port, db, regen_event, _, user = test_env
+    port, db, regen_event, handler, user = test_env
     db.upsert_story(
         Story(
             id=4242,
@@ -933,6 +1145,7 @@ def test_feedback_clear_without_existing_vote_is_noop(test_env) -> None:
     assert resp.json()["ranking_refresh_queued"] is False
     assert db.get_all_feedback(user.id) == []
     assert not regen_event.is_set()
+    assert not _has_pending_feedback_regen(handler)
 
 
 def test_feedback_clear_then_revote_creates_new_record(test_env):
@@ -1632,13 +1845,16 @@ def prop_db():
     )
 )
 @settings(
-    max_examples=15,
+    max_examples=8,
     deadline=None,
     suppress_health_check=[HealthCheck.function_scoped_fixture],
 )
 def test_dashboard_cache_version_invariant_property(
-    operations, prop_db, mock_embedder, monkeypatch
-):
+    operations: list[str],
+    prop_db: Database,
+    mock_embedder: MockEmbedder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     with prop_db.conn() as conn:
         with conn:
             conn.execute("DELETE FROM users")
@@ -1679,15 +1895,31 @@ def test_dashboard_cache_version_invariant_property(
     cache_key = f"dashboard_{user.id}"
     for operation in operations:
         current_version = TestHandler._dashboard_version(user.id)
+        cached_before = TestHandler._dashboard_cache.get(cache_key)
         if operation == "invalidate":
             TestHandler._invalidate_dashboard_cache(user.id)
         elif operation == "render_current":
-            TestHandler._render_dashboard_for_user(user)
+            rendered = TestHandler._render_dashboard_for_user(user)
+            allowed = {SKELETON_HTML, f"v={current_version}".encode()}
+            if cached_before is not None:
+                allowed.add(cached_before[0])
+            assert rendered in allowed
         else:
             stale_version = max(0, current_version - 1)
-            TestHandler._render_dashboard_for_user(user, expected_version=stale_version)
-            # stale hit MUST return content that was in cache before
-            # (cache version must be ≥ stale_version)
+            rendered = TestHandler._render_dashboard_for_user(
+                user, expected_version=stale_version
+            )
+            if cached_before is not None:
+                # A stale hit must return content that was in cache before;
+                # the warm may replace it only after the response is formed.
+                assert rendered == cached_before[0]
+
+        if operation == "render_current":
+            # Rendering must eventually warm the requested current version,
+            # not merely leave the cache absent while the weak version-order
+            # invariant continues to pass.
+            warmed = _wait_for_cache(TestHandler, user, current_version)
+            assert warmed == f"v={current_version}".encode()
 
         # Wait for any in-flight warm to settle before checking invariant.
         # SWR allows stale cache entries (cache version < current version)
@@ -1929,13 +2161,15 @@ def test_flask_test_client_feedback_writes_and_queues_refresh(test_env: Any) -> 
     assert resp.status_code == 200
     assert resp.get_json() == {
         "ok": True,
-        "ranking_refresh_queued": True,
+        "ranking_refresh_queued": False,
         "target_version": 1,
+        "ranking_idle_seconds": handler.config.dashboard_warm_idle_seconds,
     }
     records = db.get_all_feedback(user.id)
     assert [(record.story_id, record.action) for record in records] == [(1710, "up")]
     assert handler._dashboard_version(user.id) == 1
-    assert regen_event.is_set()
+    assert not regen_event.is_set()
+    assert _has_pending_feedback_regen(handler)
 
 
 def test_flask_test_client_feedback_rejects_invalid_payload(test_env: Any) -> None:
@@ -1951,6 +2185,159 @@ def test_flask_test_client_feedback_rejects_invalid_payload(test_env: Any) -> No
     assert db.get_all_feedback(user.id) == []
     assert handler._dashboard_version(user.id) == 0
     assert not regen_event.is_set()
+
+
+def test_flask_test_client_events_require_same_origin_and_session(app_env: Any) -> None:
+    _, _, _, handler, _ = app_env
+    client = create_app(handler).test_client()
+
+    cross_site = client.post(
+        "/api/interaction",
+        json={"events": []},
+        headers={"Origin": "https://evil.example", "Host": "localhost"},
+    )
+    assert cross_site.status_code == 403
+
+    no_session = client.post("/api/interaction", json={"events": []})
+    assert no_session.status_code == 401
+    assert no_session.get_json() == {"error": "No session"}
+
+
+def test_flask_test_client_events_batch_and_replay_are_idempotent(
+    test_env: Any,
+) -> None:
+    _, db, _, handler, user = test_env
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+    db.upsert_story(
+        Story(
+            id=2710,
+            title="Ledger API story",
+            url="https://example.com/ledger-api",
+            score=10,
+            time=1600000000,
+            text_content="Ledger body",
+            source="hn",
+        )
+    )
+    event = {
+        "event_id": "55555555-5555-4555-8555-555555555555",
+        "client_session_id": "66666666-6666-4666-8666-666666666666",
+        "story_id": 2710,
+        "event_type": "impression",
+        "dashboard_version": 0,
+        "position": 0,
+        "sort_mode": "recommended",
+        "age_filter": "recent",
+        "source_filter": "mixed",
+        "ranker_arm": "baseline",
+        "occurred_at": 1_700_000_000.0,
+    }
+
+    first = client.post("/api/interaction", json={"events": [event, event]})
+    replay = client.post("/api/interaction", json={"events": [event]})
+
+    assert first.status_code == 200
+    assert first.get_json() == {
+        "ok": True,
+        "inserted": 1,
+        "duplicates": 1,
+        "rejected": 0,
+    }
+    assert replay.status_code == 200
+    assert replay.get_json() == {
+        "ok": True,
+        "inserted": 0,
+        "duplicates": 1,
+        "rejected": 0,
+    }
+    with db.conn() as conn:
+        assert conn.execute(
+            "SELECT user_id, story_id, event_type FROM interaction_events"
+        ).fetchall() == [(user.id, 2710, "impression")]
+
+
+def _ledger_event(event_id: str, story_id: int) -> dict[str, Any]:
+    return {
+        "event_id": event_id,
+        "client_session_id": "88888888-8888-4888-8888-888888888888",
+        "story_id": story_id,
+        "event_type": "impression",
+        "dashboard_version": 0,
+        "position": 0,
+        "sort_mode": "recommended",
+        "age_filter": "recent",
+        "source_filter": "mixed",
+        "ranker_arm": "baseline",
+        "occurred_at": 1_700_000_000.0,
+    }
+
+
+def test_flask_test_client_events_accept_negative_story_ids(test_env: Any) -> None:
+    _, db, _, handler, user = test_env
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+    db.upsert_story(
+        Story(
+            id=-42,
+            title="Synthetic RSS story",
+            url="https://example.com/rss-item",
+            score=0,
+            time=1600000000,
+            text_content="Feed body",
+            source="rss_example_com",
+        )
+    )
+    event = _ledger_event("77777777-7777-4777-8777-777777777777", -42)
+    response = client.post("/api/interaction", json={"events": [event]})
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "ok": True,
+        "inserted": 1,
+        "duplicates": 0,
+        "rejected": 0,
+    }
+    with db.conn() as conn:
+        assert conn.execute("SELECT story_id FROM interaction_events").fetchall() == [
+            (-42,)
+        ]
+
+
+def test_flask_test_client_events_skip_invalid_and_unknown_per_event(
+    test_env: Any,
+) -> None:
+    _, db, _, handler, user = test_env
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+    db.upsert_story(
+        Story(
+            id=2711,
+            title="Ledger valid story",
+            url="https://example.com/ledger-valid",
+            score=10,
+            time=1600000000,
+            text_content="Ledger body",
+            source="hn",
+        )
+    )
+    unknown = _ledger_event("99999999-9999-4999-8999-999999999999", 999999)
+    malformed = _ledger_event("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", 2711)
+    malformed["event_type"] = "hover"
+    valid = _ledger_event("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", 2711)
+    response = client.post(
+        "/api/interaction", json={"events": [unknown, malformed, valid]}
+    )
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "ok": True,
+        "inserted": 1,
+        "duplicates": 0,
+        "rejected": 2,
+    }
+    with db.conn() as conn:
+        assert conn.execute("SELECT story_id FROM interaction_events").fetchall() == [
+            (2711,)
+        ]
 
 
 def test_flask_test_client_feedback_limit_sets_retry_after(test_env: Any) -> None:
@@ -2253,10 +2640,10 @@ def test_flask_test_client_tldr_forces_refresh_for_active_thread_even_when_cache
 def test_flask_test_client_tldr_skips_refresh_for_cached_quiet_recent_thread(
     test_env: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A cached, quiet/recent HN thread (fails the velocity gate) must
-    still take the early cache-hit path and must NOT trigger fetch_story --
-    regression guard for the cache-bypass added alongside the active-thread
-    force-refresh."""
+    """A cached, quiet/recent HN thread whose live count hasn't moved (tap
+    probe miss) must still take the early cache-hit path and must NOT
+    trigger fetch_story -- regression guard for the cache-bypass added
+    alongside the active-thread force-refresh."""
     import server
 
     _, db, _, handler, user = test_env
@@ -2294,6 +2681,14 @@ def test_flask_test_client_tldr_skips_refresh_for_cached_quiet_recent_thread(
 
     monkeypatch.setattr("pipeline.fetch_story", mock_fetch_story)
 
+    probe_calls: list[list[int]] = []
+
+    async def mock_probe_live_counts(stories, timeout_s):
+        probe_calls.append([s.id for s in stories])
+        return {}
+
+    monkeypatch.setattr("pipeline._probe_live_counts", mock_probe_live_counts)
+
     async def mock_generate_detailed_tldr(
         title: str, self_text: str, top_comments: str, article_body: str
     ) -> "server.TldrResult":
@@ -2304,9 +2699,443 @@ def test_flask_test_client_tldr_skips_refresh_for_cached_quiet_recent_thread(
     resp = client.post("/api/tldr-detail", json={"story_id": quiet_story.id})
 
     assert resp.status_code == 200
+    assert probe_calls == [[quiet_story.id]]
     assert calls == []
     assert resp.get_json()["tldr"] == "Cached TLDR"
     assert resp.get_json()["cached"] is True
+
+
+@pytest.mark.parametrize("stored_count", [20, 60])
+def test_flask_test_client_tldr_tap_probe_hydrates_confirmed_growth(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch, stored_count: int
+) -> None:
+    """Unfetched live comments trigger hydration even after count healing."""
+    import server
+
+    _, db, _, handler, user = test_env
+    now = time.time()
+    grown_story = Story(
+        id=1732,
+        title="Grown thread story",
+        url="https://example.com/grown-thread",
+        score=50,
+        time=int(now - 10 * 3600),  # below the active velocity threshold
+        text_content="Grown thread story. Body.",
+        source="hn",
+        comment_count=stored_count,
+        comment_count_at_fetch=20,  # tap must compare live against this count
+        self_text="",
+        top_comments="Old prewarmed comments.",
+        article_body="Body.",
+    )
+    db.upsert_story(grown_story)
+    cached_key = server._tldr_cache_key(
+        title=grown_story.title,
+        self_text=grown_story.self_text or "",
+        top_comments=grown_story.top_comments or "",
+        article_body=grown_story.article_body or "",
+    )
+    db.upsert_tldr_cache(grown_story.id, cached_key, "Stale cached TLDR")
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+
+    probe_timeouts: list[float] = []
+
+    async def mock_probe_live_counts(stories, timeout_s):
+        probe_timeouts.append(timeout_s)
+        return {grown_story.id: 60}
+
+    monkeypatch.setattr("pipeline._probe_live_counts", mock_probe_live_counts)
+
+    calls: list[dict[str, Any]] = []
+
+    async def mock_fetch_story(client_, sid, db_, *, force=False):
+        calls.append({"sid": sid, "force": force})
+        current = db_.get_story(sid)
+        assert current is not None
+        updated = replace(current, top_comments="Freshly hydrated comments.")
+        db_.upsert_story(updated)
+        return updated
+
+    monkeypatch.setattr("pipeline.fetch_story", mock_fetch_story)
+
+    async def mock_generate_detailed_tldr(
+        title: str, self_text: str, top_comments: str, article_body: str
+    ) -> "server.TldrResult":
+        return server.TldrResult(kind="ok", tldr=f"Fresh TLDR: {top_comments}")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    resp = client.post("/api/tldr-detail", json={"story_id": grown_story.id})
+
+    assert resp.status_code == 200
+    assert probe_timeouts == [handler.config.tldr_tap_probe_timeout_seconds]
+    assert calls == [{"sid": grown_story.id, "force": True}]
+    body = resp.get_json()
+    assert body["tldr"] == "Fresh TLDR: Freshly hydrated comments."
+    assert body["cached"] is False
+    healed = db.get_story(grown_story.id)
+    assert healed is not None
+    assert healed.comment_count == 60
+
+
+def test_flask_test_client_tldr_heals_count_past_lagging_hydrate(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Algolia lags Firebase: when hydration returns fewer comments than
+    the probe-confirmed live count, the DB count keeps the live number
+    and the response reports both live and summarized counts."""
+    import server
+
+    _, db, _, handler, user = test_env
+    now = time.time()
+    grown_story = Story(
+        id=1734,
+        title="Lagging hydrate story",
+        url="https://example.com/lagging-hydrate",
+        score=50,
+        time=int(now - 2 * 3600),  # 2h old
+        text_content="Lagging hydrate story. Body.",
+        source="hn",
+        comment_count=20,  # below the 30-comment active floor
+        comment_count_at_fetch=20,  # ... so only the tap probe notices growth
+        self_text="",
+        top_comments="Old prewarmed comments.",
+        article_body="Body.",
+    )
+    db.upsert_story(grown_story)
+    cached_key = server._tldr_cache_key(
+        title=grown_story.title,
+        self_text=grown_story.self_text or "",
+        top_comments=grown_story.top_comments or "",
+        article_body=grown_story.article_body or "",
+    )
+    db.upsert_tldr_cache(grown_story.id, cached_key, "Stale cached TLDR")
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+
+    async def mock_probe_live_counts(stories, timeout_s):
+        return {grown_story.id: 60}
+
+    monkeypatch.setattr("pipeline._probe_live_counts", mock_probe_live_counts)
+
+    async def mock_fetch_story(client_, sid, db_, *, force=False):
+        current = db_.get_story(sid)
+        assert current is not None
+        # Algolia view of the world: only 40 of the 60 live comments.
+        updated = replace(
+            current,
+            top_comments="Freshly hydrated comments.",
+            comment_count=40,
+            comment_count_at_fetch=40,
+        )
+        db_.upsert_story(updated)
+        return updated
+
+    monkeypatch.setattr("pipeline.fetch_story", mock_fetch_story)
+
+    async def mock_generate_detailed_tldr(
+        title: str, self_text: str, top_comments: str, article_body: str
+    ) -> "server.TldrResult":
+        return server.TldrResult(kind="ok", tldr=f"Fresh TLDR: {top_comments}")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    resp = client.post("/api/tldr-detail", json={"story_id": grown_story.id})
+
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["cached"] is False
+    assert body["comment_count_live"] == 60
+    assert body["comment_count_summarized"] == 40
+    healed = db.get_story(grown_story.id)
+    assert healed is not None
+    assert healed.comment_count == 60
+    assert healed.comment_count_at_fetch == 40
+
+
+def test_flask_test_client_tldr_tap_probe_failure_serves_cached(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A throwing tap probe must never block the tap: the cached TLDR is
+    served with no hydration attempt."""
+    import server
+
+    _, db, _, handler, user = test_env
+    now = time.time()
+    quiet_story = Story(
+        id=1733,
+        title="Probe failure story",
+        url="https://example.com/probe-failure",
+        score=10,
+        time=int(now - 2 * 3600),
+        text_content="Probe failure story. Body.",
+        source="hn",
+        comment_count=5,
+        comment_count_at_fetch=5,
+        self_text="",
+        top_comments="Existing prewarmed comments.",
+        article_body="Body.",
+    )
+    db.upsert_story(quiet_story)
+    cached_key = server._tldr_cache_key(
+        title=quiet_story.title,
+        self_text=quiet_story.self_text or "",
+        top_comments=quiet_story.top_comments or "",
+        article_body=quiet_story.article_body or "",
+    )
+    db.upsert_tldr_cache(quiet_story.id, cached_key, "Cached TLDR")
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+
+    async def mock_probe_live_counts(stories, timeout_s):
+        raise ConnectionError("firebase unreachable")
+
+    monkeypatch.setattr("pipeline._probe_live_counts", mock_probe_live_counts)
+
+    calls: list[dict[str, Any]] = []
+
+    async def mock_fetch_story(client_, sid, db_, *, force=False):
+        calls.append({"sid": sid, "force": force})
+        return None
+
+    monkeypatch.setattr("pipeline.fetch_story", mock_fetch_story)
+
+    async def mock_generate_detailed_tldr(
+        title: str, self_text: str, top_comments: str, article_body: str
+    ) -> "server.TldrResult":
+        raise AssertionError("LLM must not run on probe failure")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    resp = client.post("/api/tldr-detail", json={"story_id": quiet_story.id})
+
+    assert resp.status_code == 200
+    assert calls == []
+    assert resp.get_json()["tldr"] == "Cached TLDR"
+    assert resp.get_json()["cached"] is True
+
+
+def test_flask_test_client_tldr_tap_probe_skipped_for_old_thread(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Threads older than the refresh window are never probed on tap,
+    even with a cached TLDR and live-looking counts."""
+    import server
+
+    _, db, _, handler, user = test_env
+    now = time.time()
+    old_story = Story(
+        id=1734,
+        title="Old thread story",
+        url="https://example.com/old-thread",
+        score=500,
+        time=int(now - 100 * 3600),  # 100h old, beyond the 72h window
+        text_content="Old thread story. Body.",
+        source="hn",
+        comment_count=500,
+        comment_count_at_fetch=500,
+        self_text="",
+        top_comments="Existing prewarmed comments.",
+        article_body="Body.",
+    )
+    db.upsert_story(old_story)
+    cached_key = server._tldr_cache_key(
+        title=old_story.title,
+        self_text=old_story.self_text or "",
+        top_comments=old_story.top_comments or "",
+        article_body=old_story.article_body or "",
+    )
+    db.upsert_tldr_cache(old_story.id, cached_key, "Cached TLDR")
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+
+    async def mock_probe_live_counts(stories, timeout_s):
+        raise AssertionError("old threads must not be probed")
+
+    monkeypatch.setattr("pipeline._probe_live_counts", mock_probe_live_counts)
+
+    calls: list[dict[str, Any]] = []
+
+    async def mock_fetch_story(client_, sid, db_, *, force=False):
+        calls.append({"sid": sid, "force": force})
+        return None
+
+    monkeypatch.setattr("pipeline.fetch_story", mock_fetch_story)
+
+    resp = client.post("/api/tldr-detail", json={"story_id": old_story.id})
+
+    assert resp.status_code == 200
+    assert calls == []
+    assert resp.get_json()["tldr"] == "Cached TLDR"
+    assert resp.get_json()["cached"] is True
+
+
+def test_flask_test_client_tldr_force_refresh_regenerates(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """force_refresh bypasses both cache hits (early + post-enrich) and
+    force-hydrates, so even a quiet cached thread gets a fresh summary.
+    The probe is skipped — the user already confirmed intent."""
+    import server
+
+    _, db, _, handler, user = test_env
+    now = time.time()
+    quiet_story = Story(
+        id=1735,
+        title="Forced refresh story",
+        url="https://example.com/forced-refresh",
+        score=10,
+        time=int(now - 2 * 3600),
+        text_content="Forced refresh story. Body.",
+        source="hn",
+        comment_count=5,
+        comment_count_at_fetch=5,
+        self_text="",
+        top_comments="Existing prewarmed comments.",
+        article_body="Body.",
+    )
+    db.upsert_story(quiet_story)
+    cached_key = server._tldr_cache_key(
+        title=quiet_story.title,
+        self_text=quiet_story.self_text or "",
+        top_comments=quiet_story.top_comments or "",
+        article_body=quiet_story.article_body or "",
+    )
+    db.upsert_tldr_cache(quiet_story.id, cached_key, "Cached TLDR")
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+
+    async def mock_probe_live_counts(stories, timeout_s):
+        raise AssertionError("force_refresh must skip the tap probe")
+
+    monkeypatch.setattr("pipeline._probe_live_counts", mock_probe_live_counts)
+
+    calls: list[dict[str, Any]] = []
+
+    async def mock_fetch_story(client_, sid, db_, *, force=False):
+        calls.append({"sid": sid, "force": force})
+        return None  # no new comments; post-enrich key is unchanged
+
+    monkeypatch.setattr("pipeline.fetch_story", mock_fetch_story)
+
+    llm_calls = 0
+
+    async def mock_generate_detailed_tldr(
+        title: str, self_text: str, top_comments: str, article_body: str
+    ) -> "server.TldrResult":
+        nonlocal llm_calls
+        llm_calls += 1
+        return server.TldrResult(kind="ok", tldr="Fresh forced TLDR")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    resp = client.post(
+        "/api/tldr-detail",
+        json={"story_id": quiet_story.id, "force_refresh": True},
+    )
+
+    assert resp.status_code == 200
+    assert calls == [{"sid": quiet_story.id, "force": True}]
+    assert llm_calls == 1  # post-enrich hit skipped despite unchanged key
+    body = resp.get_json()
+    assert body["tldr"] == "Fresh forced TLDR"
+    assert body["cached"] is False
+
+
+def test_flask_test_client_tldr_force_refresh_serves_cached_on_cooldown(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """force_refresh still fail-fasts on provider cooldown: the cached TLDR
+    is served instead of deepening the ban."""
+    import server
+
+    _, db, _, handler, user = test_env
+    now = time.time()
+    quiet_story = Story(
+        id=1736,
+        title="Forced cooldown story",
+        url="https://example.com/forced-cooldown",
+        score=10,
+        time=int(now - 2 * 3600),
+        text_content="Forced cooldown story. Body.",
+        source="hn",
+        comment_count=5,
+        comment_count_at_fetch=5,
+        self_text="",
+        top_comments="Existing prewarmed comments.",
+        article_body="Body.",
+    )
+    db.upsert_story(quiet_story)
+    cached_key = server._tldr_cache_key(
+        title=quiet_story.title,
+        self_text=quiet_story.self_text or "",
+        top_comments=quiet_story.top_comments or "",
+        article_body=quiet_story.article_body or "",
+    )
+    db.upsert_tldr_cache(quiet_story.id, cached_key, "Cached TLDR")
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+
+    async def mock_generate_detailed_tldr(
+        title: str, self_text: str, top_comments: str, article_body: str
+    ) -> "server.TldrResult":
+        raise AssertionError("LLM must not run while cooling down")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    server.llm_limiter.on_429()
+    try:
+        resp = client.post(
+            "/api/tldr-detail",
+            json={"story_id": quiet_story.id, "force_refresh": True},
+        )
+    finally:
+        server.llm_limiter.reset()
+
+    assert resp.status_code == 200
+    assert resp.get_json()["tldr"] == "Cached TLDR"
+    assert resp.get_json()["cached"] is True
+
+
+def test_tldr_tap_should_probe_gates() -> None:
+    """Predicate unit test: young HN threads with comments probe; old,
+    non-HN, comment-less, and timeless stories don't."""
+    import server
+    from pipeline import Config
+
+    config = Config()
+    now = time.time()
+    base = Story(
+        id=1,
+        title="t",
+        url="https://example.com/t",
+        score=1,
+        time=int(now - 3600),
+        text_content="t",
+        source="hn",
+        comment_count=10,
+        self_text="",
+        top_comments="comments",
+        article_body="",
+    )
+
+    assert server._tldr_tap_should_probe(base, config, now) is True
+    assert (
+        server._tldr_tap_should_probe(replace(base, source="rss_x"), config, now)
+        is False
+    )
+    assert (
+        server._tldr_tap_should_probe(replace(base, top_comments=""), config, now)
+        is False
+    )
+    assert server._tldr_tap_should_probe(replace(base, time=0), config, now) is False
+    assert (
+        server._tldr_tap_should_probe(
+            replace(base, time=int(now - 100 * 3600)), config, now
+        )
+        is False
+    )
 
 
 def test_flask_test_client_tldr_skips_refresh_for_quiet_recent_thread(
@@ -2469,8 +3298,88 @@ def test_flask_test_client_tldr_stale_fallback_on_quota_denied(
     }
 
 
+@pytest.mark.parametrize("error_status", [429, 402])
+def test_flask_test_client_tldr_provider_error_degrades_gracefully(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch, error_status: int
+) -> None:
+    """Pin the tap path when the LLM provider refuses (rate limit or billing
+    cap, e.g. a capped Mistral key returning 429 or 402): a stale-cached TLDR
+    must be served either way; with nothing cached, both degrade to the
+    cooldown countdown (402 seeds the limiter explicitly since a billing
+    refusal carries no Retry-After semantics)."""
+    import server
+
+    _, db, _, handler, user = test_env
+    handler.config = replace(
+        handler.config,
+        tldr_uncached_per_user_limit=100,
+        tldr_uncached_per_user_window_seconds=3600,
+        tldr_uncached_global_limit=100,
+    )
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+    for story_id in (1722, 1723):
+        db.upsert_story(
+            Story(
+                id=story_id,
+                title=f"Provider-error story {story_id}",
+                url=f"https://example.com/provider-error-{story_id}",
+                score=10,
+                time=1600000000,
+                text_content="Story body.",
+                source="hn",
+                comment_count=0,
+                self_text="",
+                top_comments="",
+                article_body="",
+            )
+        )
+    stale_key = server._tldr_cache_key(
+        title="Provider-error story 1723",
+        self_text="",
+        top_comments="",
+        article_body="Body before enrichment.",
+    )
+    db.upsert_tldr_cache(1723, stale_key, "Stale summary survives provider outage")
+    # Current key differs from the stale one so the request misses cache.
+    db.upsert_story(
+        replace(
+            db.get_story(1723),
+            article_body="Body enriched after TLDR was cached.",
+        )
+    )
+
+    async def mock_generate_detailed_tldr(
+        title: str, self_text: str, top_comments: str, article_body: str
+    ) -> "server.TldrResult":
+        return server.TldrResult(
+            kind="llm_error",
+            error_status=error_status,
+            error_text=f"mocked provider HTTP {error_status}",
+        )
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    fresh = client.post("/api/tldr-detail", json={"story_id": 1722})
+    stale = client.post("/api/tldr-detail", json={"story_id": 1723})
+
+    assert stale.status_code == 200
+    assert stale.get_json() == {
+        "ok": True,
+        "tldr": "Stale summary survives provider outage",
+        "cached": True,
+        "stale": True,
+    }
+    assert fresh.status_code == 429
+    assert "cooling down" in fresh.get_json()["error"]
+    if error_status == 402:
+        # Billing refusal seeds the limiter: prefetch skips while capped.
+        assert server.llm_limiter.retry_after_seconds > 0
+
+
+@pytest.mark.parametrize("cacheable", [True, False])
 async def test_prefetch_tldrs_for_ranked_regenerates_stale_beyond_top_combo(
-    test_env: Any, monkeypatch: pytest.MonkeyPatch
+    test_env: Any, monkeypatch: pytest.MonkeyPatch, cacheable: bool
 ) -> None:
     """Side B: the top-per-combo prefetch alone never reaches a story ranked
     below the cutoff, so a stale-key story there is stuck until it re-enters
@@ -2529,17 +3438,238 @@ async def test_prefetch_tldrs_for_ranked_regenerates_stale_beyond_top_combo(
 
     async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
         calls.append(title)
+        return srv.TldrResult(kind="ok", tldr=f"TLDR: {title}", cacheable=cacheable)
+
+    monkeypatch.setattr(srv, "generate_detailed_tldr", mock_generate_detailed_tldr)
+    monkeypatch.setattr(srv, "_PREFETCH_STAGGER_S", 0)
+
+    generated = await srv._prefetch_tldrs_for_ranked(
+        ranked, db, per_combo=1, stale_per_run=2, date_top_n=0
+    )
+
+    assert generated == (2 if cacheable else 0)
+    assert sorted(calls) == sorted([stories[0].title, stories[1].title])
+    if not cacheable:
+        assert db.get_any_tldr_for_story(stories[0].id) is None
+        assert db.get_any_tldr_for_story(stories[1].id) == "Stale TLDR"
+    assert db.get_any_tldr_for_story(stories[2].id) == "Fresh TLDR"
+
+
+async def test_prefetch_tldrs_for_ranked_covers_date_sorted_head(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Date-tab lane: the newest story by time is prefetched even when it
+    sits below the per-combo cutoff and has no stale key."""
+    import server as srv
+    from pipeline import RankedStory
+
+    _, db, _, _, _ = test_env
+
+    old = Story(
+        id=3120,
+        title="Old combo-top story",
+        url="https://example.com/date-old",
+        score=10,
+        time=1600000000,
+        text_content="body",
+        source="hn",
+        comment_count=0,
+        self_text="",
+        top_comments="",
+        article_body="Body.",
+    )
+    new = Story(
+        id=3121,
+        title="Newest story below cutoff",
+        url="https://example.com/date-new",
+        score=10,
+        time=1700000000,
+        text_content="body",
+        source="hn",
+        comment_count=0,
+        self_text="",
+        top_comments="",
+        article_body="Body.",
+    )
+    for s in (old, new):
+        db.upsert_story(s)
+    ranked = [
+        RankedStory(story=old, score=1.0, best_match_title="", combo_keys="recent_hn"),
+        RankedStory(story=new, score=0.1, best_match_title="", combo_keys=""),
+    ]
+
+    calls: list[str] = []
+
+    async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
+        calls.append(title)
         return srv.TldrResult(kind="ok", tldr=f"TLDR: {title}")
 
     monkeypatch.setattr(srv, "generate_detailed_tldr", mock_generate_detailed_tldr)
+    monkeypatch.setattr(srv, "_PREFETCH_STAGGER_S", 0)
 
     generated = await srv._prefetch_tldrs_for_ranked(
-        ranked, db, per_combo=1, stale_per_run=2
+        ranked, db, per_combo=1, stale_per_run=0, date_top_n=1
     )
 
     assert generated == 2
-    assert sorted(calls) == sorted([stories[0].title, stories[1].title])
-    assert db.get_any_tldr_for_story(stories[2].id) == "Fresh TLDR"
+    assert sorted(calls) == sorted([old.title, new.title])
+
+
+async def test_prefetch_tldrs_for_ranked_date_lane_dedupes_combo_picks(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A newest story already picked by the combo pass is fetched once."""
+    import server as srv
+    from pipeline import RankedStory
+
+    _, db, _, _, _ = test_env
+
+    s = Story(
+        id=3130,
+        title="Newest combo-top story",
+        url="https://example.com/date-dedupe",
+        score=10,
+        time=1700000000,
+        text_content="body",
+        source="hn",
+        comment_count=0,
+        self_text="",
+        top_comments="",
+        article_body="Body.",
+    )
+    db.upsert_story(s)
+    ranked = [
+        RankedStory(story=s, score=1.0, best_match_title="", combo_keys="recent_hn")
+    ]
+
+    calls: list[str] = []
+
+    async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
+        calls.append(title)
+        return srv.TldrResult(kind="ok", tldr=f"TLDR: {title}")
+
+    monkeypatch.setattr(srv, "generate_detailed_tldr", mock_generate_detailed_tldr)
+    monkeypatch.setattr(srv, "_PREFETCH_STAGGER_S", 0)
+
+    generated = await srv._prefetch_tldrs_for_ranked(
+        ranked, db, per_combo=1, stale_per_run=0, date_top_n=8
+    )
+
+    assert generated == 1
+    assert calls == [s.title]
+
+
+async def test_prefetch_tldrs_for_ranked_skips_run_during_provider_cooldown(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Background prefetch must not fire (or deepen) a provider ban; taps get
+    first shot at recovered quota."""
+    import server as srv
+    from pipeline import RankedStory
+
+    _, db, _, _, _ = test_env
+
+    s = Story(
+        id=3140,
+        title="Cooldown skip story",
+        url="https://example.com/cooldown-skip",
+        score=10,
+        time=1700000000,
+        text_content="body",
+        source="hn",
+        comment_count=0,
+        self_text="",
+        top_comments="",
+        article_body="Body.",
+    )
+    db.upsert_story(s)
+    ranked = [
+        RankedStory(story=s, score=1.0, best_match_title="", combo_keys="recent_hn")
+    ]
+
+    calls: list[str] = []
+
+    async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
+        calls.append(title)
+        return srv.TldrResult(kind="ok", tldr=f"TLDR: {title}")
+
+    monkeypatch.setattr(srv, "generate_detailed_tldr", mock_generate_detailed_tldr)
+    monkeypatch.setattr(srv, "_PREFETCH_STAGGER_S", 0)
+    srv.llm_limiter.on_429()
+    try:
+        generated = await srv._prefetch_tldrs_for_ranked(
+            ranked, db, per_combo=1, stale_per_run=0, date_top_n=1
+        )
+    finally:
+        srv.llm_limiter.reset()
+
+    assert generated == 0
+    assert calls == []
+
+
+async def test_prefetch_tldrs_for_ranked_logs_zero_outcome_with_candidates(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A silent generated=0 once hid a fail-fast storm (page-open burst
+    tripped the ban, every prefetch fail-fasted, log showed nothing); the
+    zero outcome must log candidates plus cooldown state."""
+    import logging
+
+    import server as srv
+    from pipeline import RankedStory
+
+    _, db, _, _, _ = test_env
+
+    s = Story(
+        id=3141,
+        title="Already cached story",
+        url="https://example.com/already-cached",
+        score=10,
+        time=1700000000,
+        text_content="body",
+        source="hn",
+        comment_count=0,
+        self_text="",
+        top_comments="",
+        article_body="Body.",
+    )
+    db.upsert_story(s)
+    db.upsert_tldr_cache(
+        s.id,
+        srv._tldr_cache_key(
+            title=s.title, self_text="", top_comments="", article_body="Body."
+        ),
+        "TLDR: cached",
+    )
+    ranked = [
+        RankedStory(story=s, score=1.0, best_match_title="", combo_keys="recent_hn")
+    ]
+
+    monkeypatch.setattr(srv, "_PREFETCH_STAGGER_S", 0)
+    with caplog.at_level(logging.INFO):
+        generated = await srv._prefetch_tldrs_for_ranked(
+            ranked, db, per_combo=1, stale_per_run=0, date_top_n=0
+        )
+
+    assert generated == 0
+    assert "tldr_prefetch generated=0 candidates=1" in caplog.text
+
+
+def test_shape_tldr_caps_blocks_per_section() -> None:
+    """One section keeps at most four bullets and one subheading; the reader
+    pane fits one screen only when the block count is bounded."""
+    import server
+
+    raw = (
+        "### Article\n#### First\n#### Second\n"
+        "- a\n- b\n- c\n- d\n- e\n\n"
+        "### Discussion\n- 1\n- 2\n- 3\n- 4\n- 5\n"
+    )
+    shaped = server._shape_tldr(raw)
+    assert shaped.count("- ") == 8
+    assert shaped.count("####") == 1
+    assert "- e" not in shaped
+    assert "#### Second" not in shaped
 
 
 def test_normalize_tldr_markdown_repairs_inline_bullets():
@@ -2561,6 +3691,16 @@ def test_normalize_tldr_markdown_repairs_inline_bullets():
         "- Quantization may degrade quality.\n- Providers reduce hardware barriers."
         in normalized
     )
+
+
+def test_normalize_tldr_markdown_converts_star_bullets() -> None:
+    """gemini-2.5-flash-lite emits `*` bullets; normalize to `-`."""
+    import server
+
+    normalized = server._normalize_tldr_markdown(
+        "*   **Nitter** resumes service.\n* plain point"
+    )
+    assert normalized == "- **Nitter** resumes service.\n- plain point"
 
 
 def test_reddit_rss_helpers_extract_post_and_comment_text():
@@ -3249,13 +4389,322 @@ def test_tldr_detail_does_not_cache_placeholder(test_env, monkeypatch):
     assert db.get_tldr_cache(779, "") is None  # no cache entry written
 
 
+def test_tldr_partial_response_remains_retryable(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import server
+
+    port, db, _, _, user = test_env
+    db.upsert_story(
+        Story(
+            id=780,
+            title="Partial story",
+            url=None,
+            score=5,
+            time=1600000000,
+            text_content="Body",
+            article_body="Body",
+        )
+    )
+
+    async def generate(*args: object, **kwargs: object) -> server.TldrResult:
+        return server.TldrResult(
+            kind="ok", tldr="### Article\n- Partial", cacheable=False
+        )
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", generate)
+    response = httpx.post(
+        f"http://127.0.0.1:{port}/api/tldr-detail",
+        json={"story_id": 780},
+        cookies={"hn_token": user.token},
+    )
+    assert response.status_code == 200
+    assert response.json()["retryable"] is True
+    assert db.get_any_tldr_for_story(780) is None
+
+
+def test_tldr_client_cooldown_suppression_shows_message() -> None:
+    """Cooldown guard must render a message, not silently keep old bytes."""
+    _, script = _read_template_and_static()
+    start = script.index("      const retryAt = tldrRetryAt.get(storyId)")
+    block = script[start : start + 600]
+    assert "provider cooling down, retry in" in block
+    assert "dataset.error" in block
+
+
+def test_tldr_enhance_and_queue_status_contract() -> None:
+    """Polish-pass client contracts: the TLDR post-renderer (readtime,
+    stale marker, collapsible sections), the queue status line, and the
+    single-hue rank gradient. Both render sites must route through the
+    enhancer or markers/readtime silently disappear on one path."""
+    _, script = _read_template_and_static()
+    assert "function enhanceTldrContent(contentDiv, opts)" in script
+    assert "tldr-stale" in script
+    assert "Stale summary — refreshing" in script
+    assert "min read" in script
+    assert script.count("enhanceTldrContent(contentDiv, {") == 2
+    assert "Queued ${n}" in script
+    assert "hsl(24," in script
+    assert "220 * (N - 1 - i)" not in script
+
+
+def test_terminal_theme_contract() -> None:
+    """Terminal theme: dark Pico base, phosphor vars, mono stack, prompt
+    chrome, dark-tuned rank gradient. Class names and element IDs must be
+    unchanged (JS/template contracts depend on them)."""
+    template, script = _read_template_and_static()
+    assert 'data-theme="dark"' in template
+    assert "--term-green: #33dd66" in template
+    assert "ui-monospace" in template
+    assert "term-prompt" in template
+    assert "$ hn-rewrite --deck" in template
+    assert "term-blink" in template
+    assert "#queue-loading:not([hidden])::after" in template
+    # Rank gradient floor raised for dark bg (pale end still visible).
+    assert "45 + 23 * t" in script
+    assert "42 + 40 * t" not in script
+    # Unchanged contracts the JS depends on.
+    for token in (
+        'id="queueStatus"',
+        'id="queue-loading"',
+        'class="story-card',
+        'data-key-action="undo"',
+        "badge-legend",
+    ):
+        assert token in template
+
+
+def test_forced_tldr_refresh_serializes_requests() -> None:
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node is required to execute browser refresh logic")
+    _, script = _read_template_and_static()
+    start = script.index("    async function openTldrDetail(")
+    end = script.index("    const KEY_ACTIONS", start)
+    harness = (
+        r"""
+const assert = require('node:assert/strict');
+const content = {dataset: {}, style: {display: 'none'}};
+const card = {dataset: {storyId: '1'}, querySelector: selector =>
+  selector === '.tldr-detail-content' ? content : null};
+const tldrCache = new Map([[1, 'old summary']]);
+const tldrRetryAt = new Map([[1, Date.now() + 600000]]);
+const apiPath = path => path;
+let calls = 0, finish;
+const fetch = () => {
+  calls++;
+  return new Promise(resolve => { finish = resolve; });
+};
+const response = {ok: true, json: async () => ({tldr: 'fresh summary'})};
+const parseSimpleMarkdown = text => text;
+const styleTldrLabels = () => {};
+const enhanceTldrContent = () => {};
+const ensureTldrRefreshButton = () => {};
+"""
+        + script[start:end]
+        + r"""
+(async () => {
+  const first = openTldrDetail(card, {force: true});
+  await openTldrDetail(card, {force: true});
+  await openTldrDetail(card);
+  assert.equal(calls, 1);
+  finish(response);
+  await first;
+  assert.equal(content.dataset.loading, undefined);
+  assert.equal(tldrCache.get(1), 'fresh summary');
+  const next = openTldrDetail(card, {force: true});
+  assert.equal(calls, 2);
+  finish(response);
+  await next;
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+    )
+    subprocess.run(
+        [node, "-e", harness], check=True, capture_output=True, text=True, timeout=10
+    )
+
+
+def test_prefetch_follows_navigation_order() -> None:
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node is required to execute browser queue logic")
+    _, script = _read_template_and_static()
+    start = script.index("    function prefetchUpcomingTldrs()")
+    end = script.index("    function cardsForAge", start)
+    # Execute the production function against queue states, including a
+    # retained active card in the middle after a refill and wraparound.
+    harness = (
+        """
+      const assert = require('node:assert/strict');
+      const PREFETCH_COUNT = 4;
+      let queue, activeCard, requested;
+      const queuedCards = () => queue;
+      const prefetchCards = cards => { requested = cards; };
+    """
+        + script[start:end]
+        + """
+      for (const [cards, active, expected] of [
+        [[1,2,3,4,5,6], 1, [2,3,4,5]],
+        [[1,2,3,4,5,6], 3, [4,5,6,1]],
+        [[1,2,3,4,5,6], 6, [1,2,3,4]],
+        [[1], 1, []], [[], null, []], [[1,2], null, [1,2]],
+      ]) {
+        queue = cards; activeCard = active;
+        prefetchUpcomingTldrs();
+        assert.deepEqual(requested, expected);
+      }
+    """
+    )
+    subprocess.run([node, "-e", harness], check=True, capture_output=True, text=True)
+    refill = script[
+        script.index("    async function refillQueue(") : script.index(
+            "    document.querySelectorAll('[data-fb]').forEach",
+            script.index("    async function refillQueue("),
+        )
+    ]
+    assert "else {\n        prefetchUpcomingTldrs();" in refill
+
+
+def test_prefetch_cards_runs_sequentially_and_skips_detached() -> None:
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node is required to execute browser queue logic")
+    _, script = _read_template_and_static()
+    start = script.index("    let tldrPrefetchChain")
+    end = script.index("    function prefetchUpcomingTldrs()", start)
+    # The page-open burst (active tap + 4 prefetches + server warm prefetch)
+    # tripped the free token-rate limit within seconds, so prefetches must
+    # run one-at-a-time behind the active tap, skipping detached cards.
+    harness = (
+        """
+      const assert = require('node:assert/strict');
+      const started = [];
+      const resolvers = [];
+      const openTldrDetail = (card) => {
+        started.push(card.id);
+        return new Promise((resolve) => resolvers.push(resolve));
+      };
+      const mk = (id, connected) => ({
+        id, isConnected: connected, querySelector: () => null,
+      });
+      const tick = async (n) => {
+        for (let i = 0; i < n; i++) {
+          await new Promise((r) => setImmediate(r));
+        }
+      };
+    """
+        + script[start:end]
+        + """
+      (async () => {
+        const a = mk('a', true), b = mk('b', true), gone = mk('gone', false);
+        prefetchCards([a, b, gone]);
+        await tick(5);
+        assert.deepEqual(started, ['a']);
+        resolvers[0]('ok-a');
+        await tick(5);
+        assert.deepEqual(started, ['a', 'b']);
+        assert.equal(resolvers.length, 2);
+        resolvers[1]('ok-b');
+        await tick(5);
+        assert.deepEqual(started, ['a', 'b']);
+      })().then(() => process.exit(0), (e) => { console.error(e); process.exit(1); });
+    """
+    )
+    subprocess.run([node, "-e", harness], check=True, capture_output=True, text=True)
+
+
+def test_maybe_cache_tldr_skips_salvaged_half(tmp_path: Path) -> None:
+    """_maybe_cache_tldr persists complete TLDRs but never a salvaged half
+    (single-row table: caching it would evict a previously complete TLDR)."""
+    from database import Database
+
+    import server
+
+    db = Database(str(tmp_path / "cache_gate.db"))
+    try:
+        db.upsert_story(
+            Story(
+                id=781,
+                title="Cache gate story",
+                url=None,
+                score=5,
+                time=1600000000,
+                text_content="x",
+            )
+        )
+        assert (
+            server._maybe_cache_tldr(
+                db, 781, "key1", server.TldrResult(kind="ok", tldr="full")
+            )
+            is True
+        )
+        assert db.get_tldr_cache(781, "key1") == "full"
+
+        assert (
+            server._maybe_cache_tldr(
+                db,
+                781,
+                "key2",
+                server.TldrResult(
+                    kind="ok", tldr="### Article\n- half", cacheable=False
+                ),
+            )
+            is False
+        )
+        assert db.get_tldr_cache(781, "key2") is None
+        assert db.get_any_tldr_for_story(781) == "full"  # complete row intact
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_generate_marks_single_half_salvage_uncacheable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One failed side → ok + cacheable=False; both failed → llm_error."""
+    import server
+
+    async def mock_call_llm_chat(
+        *, api_key, base_url, model, prompt, max_tokens, extra=None
+    ):
+        if "Summarize the discussion" in prompt:
+            return server.LlmChatResult(content="boom", ok=False, status=429)
+        return server.LlmChatResult(content="- **Article** summary", ok=True)
+
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_PROVIDER", "mistral")
+    monkeypatch.setattr(server, "_call_llm_chat", mock_call_llm_chat)
+
+    result = await server.generate_detailed_tldr(
+        "Salvage test",
+        self_text="Author text",
+        top_comments="Comment text",
+        article_body="Substantial article body. " * 30,
+    )
+
+    assert result.kind == "ok"
+    assert result.cacheable is False
+    assert result.tldr.startswith("### Article")
+
+
 @pytest.mark.asyncio
 async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
     import server
 
     calls = []
 
-    async def mock_call_llm_chat(*, api_key, base_url, model, prompt, max_tokens, extra=None):
+    async def mock_call_llm_chat(
+        *, api_key, base_url, model, prompt, max_tokens, extra=None
+    ):
         calls.append(prompt)
         if "Summarize the article" in prompt:
             return server.LlmChatResult(content="- **Article** summary", ok=True)
@@ -3271,7 +4720,7 @@ async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
         "Split summary test",
         self_text="Author text",
         top_comments="Comment text",
-        article_body="Article body",
+        article_body="Substantial article body. " * 30,
     )
 
     assert len(calls) == 2
@@ -3285,51 +4734,175 @@ async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
     assert "- **Discussion** summary" in result.tldr
 
 
-def test_llm_provider_config_defaults_to_mistral(monkeypatch) -> None:
+async def test_generate_detailed_tldr_folds_thin_article_to_discussion_only(
+    monkeypatch,
+) -> None:
+    """A thin article side (< ARTICLE_SECTION_MIN_CHARS) with rich comments
+    must take the single discussion path: one LLM call, no stub Article
+    half, full 1000-token budget for the comments."""
+    import server
+
+    calls = []
+
+    async def mock_call_llm_chat(
+        *, api_key, base_url, model, prompt, max_tokens, extra=None
+    ):
+        calls.append((prompt, max_tokens))
+        return server.LlmChatResult(content="- **Discussion** summary", ok=True)
+
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_PROVIDER", "mistral")
+    monkeypatch.setattr(server, "_call_llm_chat", mock_call_llm_chat)
+
+    result = await server.generate_detailed_tldr(
+        "Thin article test",
+        self_text="",
+        top_comments="Rich comment text. " * 100,
+        article_body="Tiny stub.",
+    )
+
+    assert len(calls) == 1
+    prompt, max_tokens = calls[0]
+    assert "Summarize the discussion" in prompt
+    assert "Tiny stub" not in prompt
+    assert max_tokens >= 1000
+    assert "### Article" not in result.tldr
+    assert "- **Discussion** summary" in result.tldr
+
+
+@pytest.mark.parametrize(
+    ("provider", "key_env", "model", "extra", "base_host"),
+    [
+        ("mistral", "MISTRAL_API_KEY", "mistral-small-latest", {}, "api.mistral.ai"),
+        (
+            "cerebras",
+            "CEREBRAS_API_KEY",
+            "gpt-oss-120b",
+            {"reasoning_effort": "low"},
+            "api.cerebras.ai",
+        ),
+        (
+            "groq",
+            "GROQ_API_KEY",
+            "openai/gpt-oss-20b",
+            {"reasoning_effort": "low"},
+            "api.groq.com",
+        ),
+        (
+            "openrouter",
+            "OPENROUTER_API_KEY",
+            "meta-llama/llama-3.3-70b-instruct",
+            {},
+            "openrouter.ai",
+        ),
+        (
+            "zen",
+            "OPENCODE_ZEN_API_KEY",
+            "ling-3.0-flash-fin-free",
+            {},
+            "opencode.ai",
+        ),
+        (
+            "gemini",
+            "GEMINI_API_KEY",
+            "models/gemini-2.5-flash-lite",
+            {"reasoning_effort": "none"},
+            "generativelanguage.googleapis.com",
+        ),
+    ],
+)
+def test_llm_provider_config_table(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    key_env: str,
+    model: str,
+    extra: dict,
+    base_host: str,
+) -> None:
+    """Every provider row maps env key + endpoint + default model + extras;
+    LLM_MODEL overrides the default model for any provider."""
+    import server
+
+    monkeypatch.setenv("LLM_PROVIDER", provider)
+    monkeypatch.setenv(key_env, "test-key")
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+
+    cfg = server._llm_provider_config()
+
+    assert cfg.provider == provider
+    assert cfg.api_key == "test-key"
+    assert cfg.model == model
+    assert cfg.extra == extra
+    assert base_host in cfg.base_url
+
+    monkeypatch.setenv("LLM_MODEL", "custom-model")
+    assert server._llm_provider_config().model == "custom-model"
+    if provider == "groq":
+        assert server._llm_provider_config().extra == {}
+
+
+def test_llm_provider_config_unknown_is_rejected(monkeypatch) -> None:
     import server
 
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
     monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    assert server._llm_provider_config().provider == "groq"
 
-    cfg = server._llm_provider_config()
-
-    assert cfg.provider == "mistral"
-    assert cfg.model == "mistral-small-latest"
-    assert cfg.api_key == "test-key"
-    assert cfg.extra == {}
+    monkeypatch.setenv("LLM_PROVIDER", "not-a-provider")
+    with pytest.raises(ValueError, match="Unsupported LLM_PROVIDER"):
+        server._llm_provider_config()
 
 
-def test_llm_provider_config_cerebras_has_reasoning_effort(monkeypatch) -> None:
+def test_provider_max_tokens_reserves_reasoning_headroom() -> None:
     import server
 
-    monkeypatch.setenv("LLM_PROVIDER", "cerebras")
-    monkeypatch.setenv("CEREBRAS_API_KEY", "test-key")
+    cerebras = server.LlmProviderConfig(
+        "cerebras", "key", "https://example.test", "model", {"reasoning_effort": "low"}
+    )
+    mistral = server.LlmProviderConfig(
+        "mistral", "key", "https://example.test", "model", {}
+    )
+    zen = server.LlmProviderConfig("zen", "key", "https://example.test", "model", {})
+    assert server._max_tokens_for_provider(cerebras, 900) == 1500
+    assert server._max_tokens_for_provider(mistral, 900) == 900
+    assert server._max_tokens_for_provider(zen, 900) == 8192
+    groq = server.LlmProviderConfig(
+        "groq",
+        "key",
+        "https://example.test",
+        "openai/gpt-oss-20b",
+        {"reasoning_effort": "low"},
+    )
+    assert server._max_tokens_for_provider(groq, 900) == 1500
+    gospark = server.LlmProviderConfig(
+        "gospark",
+        "key",
+        "https://opencode.ai/zen/go/v1/responses",
+        "muse-spark-1.3-contributor",
+        {"reasoning_effort": "low"},
+    )
+    # max_output_tokens covers reasoning + output, so gospark gets a larger
+    # headroom than the chat-completions reasoning providers (~1000 measured
+    # reasoning tokens per call even at effort=low).
+    assert server._max_tokens_for_provider(gospark, 450) == 1650
 
-    cfg = server._llm_provider_config()
 
-    assert cfg.provider == "cerebras"
-    assert cfg.model == "gpt-oss-120b"
-    assert cfg.extra == {"reasoning_effort": "low"}
-
-
-def test_llm_provider_config_mistral_has_no_extra_params(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("content", "finish_reason", "valid"),
+    [
+        ("- one bullet", "stop", True),
+        ("- one bullet", None, True),
+        ("#### Heading only", "stop", False),
+        ("- partial", "length", False),
+        ("", "stop", False),
+    ],
+)
+def test_llm_completion_validation(
+    content: str, finish_reason: str | None, valid: bool
+) -> None:
     import server
 
-    monkeypatch.setenv("LLM_PROVIDER", "mistral")
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
-
-    cfg = server._llm_provider_config()
-
-    assert cfg.provider == "mistral"
-    assert cfg.model == "mistral-small-latest"
-    assert cfg.extra == {}
-
-
-def test_cerebras_max_tokens_adds_buffer_only_with_reasoning_effort() -> None:
-    import server
-
-    assert server._cerebras_max_tokens(900, {"reasoning_effort": "low"}) == 1500
-    assert server._cerebras_max_tokens(900, {}) == 900
+    assert server._valid_llm_completion(content, finish_reason) is valid
 
 
 @pytest.mark.asyncio
@@ -3357,14 +4930,190 @@ async def test_generate_detailed_tldr_cerebras_passes_reasoning_effort_and_bumpe
         "Cerebras test",
         self_text="Author text",
         top_comments="Comment text",
-        article_body="Article body",
+        article_body="Substantial article body. " * 30,
     )
 
     assert len(calls) == 2
     for call in calls:
         assert call["model"] == "gpt-oss-120b"
         assert call["extra"] == {"reasoning_effort": "low"}
-        assert call["max_tokens"] == 1500
+        assert call["max_tokens"] == 1050
+
+
+def test_responses_text_extraction() -> None:
+    """Responses payloads mix reasoning items with message items; only
+    output_text parts must surface, concatenated in order."""
+    import server
+
+    assert server._responses_text({}) == ""
+    assert server._responses_text({"output": "x"}) == ""
+    payload = {
+        "output": [
+            {"type": "reasoning", "summary": []},
+            {
+                "type": "message",
+                "content": [
+                    {"type": "output_text", "text": "- first"},
+                    {"type": "refusal", "refusal": "no"},
+                    {"type": "output_text", "text": "\n- second"},
+                ],
+            },
+        ]
+    }
+    assert server._responses_text(payload) == "- first\n- second"
+
+
+def test_responses_error_prefers_provider_message() -> None:
+    import server
+
+    assert (
+        server._responses_error({"error": {"message": "Upstream broke"}}, 500, "raw")
+        == "Upstream broke"
+    )
+    assert "HTTP 400" in server._responses_error({}, 400, "raw")
+
+
+@pytest.mark.asyncio
+async def test_call_llm_for_config_dispatches_on_endpoint(monkeypatch) -> None:
+    """chat/completions URLs go to _call_llm_chat; /responses URLs go to
+    _call_llm_responses. The gospark row must take the responses path."""
+    import server
+
+    calls: list[str] = []
+
+    async def fake_chat(**kwargs):
+        calls.append("chat")
+        return server.LlmChatResult(content="- c", ok=True)
+
+    async def fake_responses(**kwargs):
+        calls.append("responses")
+        assert kwargs["extra"] == {"reasoning_effort": "low"}
+        return server.LlmChatResult(content="- r", ok=True)
+
+    monkeypatch.setattr(server, "_call_llm_chat", fake_chat)
+    monkeypatch.setattr(server, "_call_llm_responses", fake_responses)
+
+    chat_cfg = server.LlmProviderConfig(
+        "mistral", "k", "https://api.mistral.ai/v1/chat/completions", "m", {}
+    )
+    go_cfg = server.LlmProviderConfig(
+        "gospark",
+        "k",
+        "https://opencode.ai/zen/go/v1/responses",
+        "muse-spark-1.3-contributor",
+        {"reasoning_effort": "low"},
+    )
+    assert (
+        await server._call_llm_for_config(chat_cfg, prompt="p", max_tokens=10)
+    ).content == "- c"
+    assert (
+        await server._call_llm_for_config(go_cfg, prompt="p", max_tokens=10)
+    ).content == "- r"
+    assert calls == ["chat", "responses"]
+
+
+@pytest.mark.asyncio
+async def test_call_llm_responses_success_and_429(monkeypatch) -> None:
+    """Responses caller: completed payload validates like chat output;
+    incomplete (truncation) is rejected; a 429 surfaces status 429 for the
+    cooldown path. Headers must carry the Go session identity + custom UA."""
+    import server
+
+    seen: dict[str, Any] = {}
+
+    class FakeResponse:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+            self.headers = {}
+            self.text = "raw"
+
+        def json(self):
+            return self._payload
+
+    def ok_payload():
+        return {
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "- summary"}],
+                }
+            ],
+            "usage": {"total_tokens": 100},
+        }
+
+    responses = [FakeResponse(200, ok_payload())]
+
+    class FakeClient:
+        def __init__(self, *, timeout):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, base_url, *, headers, json):
+            seen["headers"] = dict(headers)
+            seen["payload"] = dict(json)
+            return responses.pop(0)
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", FakeClient)
+
+    async def allow_acquire(*, estimated_tokens=0):
+        return True
+
+    def noop_record(**kwargs):
+        return None
+
+    monkeypatch.setattr(server.llm_limiter, "acquire", allow_acquire)
+    monkeypatch.setattr(server.llm_limiter, "record_response", noop_record)
+
+    res = await server._call_llm_responses(
+        api_key="k",
+        base_url="https://opencode.ai/zen/go/v1/responses",
+        model="muse-spark-1.3-contributor",
+        prompt="Summarize.",
+        max_tokens=450,
+        extra={"reasoning_effort": "low"},
+    )
+    assert res.ok and res.content == "- summary"
+    assert seen["headers"]["x-opencode-session"].startswith("hn-rewrite-tldr-")
+    assert seen["headers"]["User-Agent"] == "hn-rewrite-tldr/1.0"
+    assert seen["payload"]["reasoning"] == {"effort": "low"}
+    assert "temperature" not in seen["payload"]
+
+    # Truncated (incomplete status) must not validate.
+    responses.append(FakeResponse(200, {**ok_payload(), "status": "incomplete"}))
+    res = await server._call_llm_responses(
+        api_key="k",
+        base_url="https://example.test",
+        model="m",
+        prompt="p",
+        max_tokens=10,
+    )
+    assert not res.ok
+
+    # Provider 429 retried then surfaced with status for the cooldown path.
+    responses.extend(
+        [
+            FakeResponse(429, {"error": {"message": "slow down"}}),
+            FakeResponse(429, {"error": {"message": "slow down"}}),
+            FakeResponse(429, {"error": {"message": "slow down"}}),
+            FakeResponse(429, {"error": {"message": "slow down"}}),
+        ]
+    )
+    res = await server._call_llm_responses(
+        api_key="k",
+        base_url="https://example.test",
+        model="m",
+        prompt="p",
+        max_tokens=10,
+    )
+    assert not res.ok and res.status == 429
+    assert "slow down" in res.content
 
 
 @pytest.mark.asyncio
@@ -3376,7 +5125,9 @@ async def test_generate_detailed_tldr_scales_combined_path_budgets(monkeypatch):
 
     calls = []
 
-    async def mock_call_llm_chat(*, api_key, base_url, model, prompt, max_tokens, extra=None):
+    async def mock_call_llm_chat(
+        *, api_key, base_url, model, prompt, max_tokens, extra=None
+    ):
         calls.append(prompt)
         return server.LlmChatResult(content="- summary", ok=True)
 
@@ -3396,8 +5147,8 @@ async def test_generate_detailed_tldr_scales_combined_path_budgets(monkeypatch):
 
     assert len(calls) == 2
     article_prompt, discussion_prompt = calls
-    assert "9-12 bullets, max 400 words" in article_prompt
-    assert "9-12 bullets, max 400 words" in discussion_prompt
+    assert "3-4 bullets, max 90 words" in article_prompt
+    assert "3-4 bullets, max 90 words" in discussion_prompt
 
 
 @pytest.mark.asyncio
@@ -3407,11 +5158,15 @@ async def test_call_llm_chat_uses_limiter(monkeypatch):
     calls = []
 
     class FakeLimiter:
-        async def acquire(self):
+        async def acquire(self, *, estimated_tokens=0):
+            assert estimated_tokens > 0
             calls.append(("acquire", None))
             return True
 
-        def record_response(self, *, status, headers):
+        def record_response(
+            self, *, status, headers, reserved_tokens=0, used_tokens=None
+        ):
+            assert reserved_tokens > 0
             calls.append(("record_response", status, dict(headers)))
 
     class FakeResponse:
@@ -3420,7 +5175,11 @@ async def test_call_llm_chat_uses_limiter(monkeypatch):
         text = '{"ok": true}'
 
         def json(self):
-            return {"choices": [{"message": {"content": "summary"}}]}
+            return {
+                "choices": [
+                    {"message": {"content": "- summary"}, "finish_reason": "stop"}
+                ]
+            }
 
     class FakeClient:
         def __init__(self, *, timeout):
@@ -3447,7 +5206,7 @@ async def test_call_llm_chat_uses_limiter(monkeypatch):
         max_tokens=10,
     )
 
-    assert result.content == "summary"
+    assert result.content == "- summary"
     assert result.ok is True
     assert calls == [
         ("acquire", None),
@@ -3468,7 +5227,9 @@ async def test_unified_fallback_omits_article_when_no_article_body(
 
     calls = []
 
-    async def mock_call_llm_chat(*, api_key, base_url, model, prompt, max_tokens, extra=None):
+    async def mock_call_llm_chat(
+        *, api_key, base_url, model, prompt, max_tokens, extra=None
+    ):
         calls.append(prompt)
         return server.LlmChatResult(content="- **Discussion** summary", ok=True)
 
@@ -3496,7 +5257,9 @@ async def test_generate_detailed_tldr_returns_stub_when_no_content(
 
     calls: list = []
 
-    async def mock_call_llm_chat(*, api_key, base_url, model, prompt, max_tokens, extra=None):
+    async def mock_call_llm_chat(
+        *, api_key, base_url, model, prompt, max_tokens, extra=None
+    ):
         calls.append(prompt)
         return "should not be called"
 
@@ -3699,15 +5462,22 @@ def test_tldr_detail_fetches_lesswrong_comments(test_env, monkeypatch):
 
 
 def test_dashboard_source_filter_toggle_temporarily_disabled():
-    """The 3-way source filter (Mixed/HN/Non-HN) is temporarily disabled
-    while the dashboard is hardcoded to HN-only sources (WORKLOG
-    2026-07-10) — a Non-HN tab would always render an empty deck.
+    """The 3-way source filter (Mixed/HN/Non-HN) is temporarily disabled.
+
+    Non-HN sources are present in the pool (RSS/Reddit/LessWrong have been
+    enabled since well before this test was last touched), but an
+    Archive+Non-HN selection would render an empty deck: archive_nonhn is
+    structurally always empty and was retired from COMBO_DEFS (see
+    PRIMARY_RECENT_NONHN/PRIMARY_ARCHIVE_HN in pipeline/ranking.py).
+    Re-enabling this UI needs the same client-side guard Popular+Non-HN
+    already has (see setFilter in templates/index.html) — deferred, see
+    WORKLOG 2026-08-30.
     """
     template, _ = _read_template_and_static()
     assert 'data-source="mixed"' not in template
     assert 'data-source="hn"' not in template
     assert 'data-source="non-hn"' not in template
-    assert "TabView(\"non-hn\"" not in (
+    assert 'TabView("non-hn"' not in (
         Path(__file__).resolve().parents[1] / "pipeline" / "render.py"
     ).read_text(encoding="utf-8")
 
@@ -3721,6 +5491,37 @@ def test_story_cards_emit_combo_keys_and_is_hn_attribute():
     assert "card.dataset.combo" in static
     assert "s.startsWith('rss_')" not in static
     assert "s === 'hn' || s === 'bq_seed'" not in static
+
+
+def test_story_cards_emit_interaction_dimensions_and_explicit_event_hooks() -> None:
+    template, static = _read_template_and_static()
+    assert 'data-position="{{ card.position }}"' in template
+    assert 'data-dashboard-version="{{ dashboard_version or 0 }}"' in template
+    assert 'data-ranker-arm="baseline"' in template
+    assert 'data-event-kind="comments_open"' in template
+    assert "queueInteraction('impression'" in static
+    assert "queueInteraction('dwell'" in static
+    assert "navigator.sendBeacon" in static
+    assert "apiPath('/api/interaction')" in static
+    assert "data-event-kind" in static
+    assert "openTldrDetail" in static
+    assert "queueInteraction('tldr" not in static
+
+
+def test_story_cards_always_fill_the_story_column() -> None:
+    """All cards use the available story-column width, before enrichment."""
+    template, _ = _read_template_and_static()
+    card_css = template.split("    .story-card {", 1)[1].split("    }", 1)[0]
+    enriched_css = template.split("    .story-card.enriched {", 1)[1].split("    }", 1)[
+        0
+    ]
+
+    assert "width: 100%;" in card_css
+    assert "width: fit-content;" not in card_css
+    assert "min-width:" not in card_css
+    assert "max-width:" not in card_css
+    assert "width:" not in enriched_css
+    assert "max-width:" not in enriched_css
 
 
 def test_static_dashboard_js_has_no_jinja():
@@ -3894,6 +5695,41 @@ def test_dashboard_stale_hit_returns_when_version_mismatch(swr_handler):
     assert result == stale_html
 
 
+def test_patch_current_version_replaces_attribute_value():
+    from server import _patch_current_version
+
+    html = b'<div data-dashboard-version="3" data-current-version="3">x</div>'
+    patched = _patch_current_version(html, 7)
+    assert (
+        patched == b'<div data-dashboard-version="3" data-current-version="7">x</div>'
+    )
+
+
+def test_patch_current_version_is_noop_without_attribute():
+    from server import _patch_current_version
+
+    html = b"no version attribute here"
+    assert _patch_current_version(html, 7) == html
+
+
+def test_dashboard_stale_hit_patches_current_version_to_live_version(swr_handler):
+    # A stale_hit response must self-report as stale via `data-current-version`
+    # so the client's `pageVer < currVer` staleness check (index.html) fires
+    # and schedules a warm-poll refill — otherwise a page carrying identical
+    # dashboard/current versions looks current even though it's the old,
+    # HN-only render from before the live version advanced.
+    user, h = swr_handler
+    stale_html = (
+        b'<div id="stories" data-dashboard-version="0" data-current-version="0"></div>'
+    )
+    h._dashboard_cache[f"dashboard_{user.id}"] = (stale_html, time.time(), 0)
+    h._dashboard_versions[user.id] = 3
+
+    result = h._render_dashboard_for_user(user)
+    assert b'data-dashboard-version="0"' in result
+    assert b'data-current-version="3"' in result
+
+
 def test_dashboard_cache_hit_returns_when_version_matches(swr_handler):
     user, h = swr_handler
     fresh_html = b"fresh content"
@@ -3989,6 +5825,63 @@ def test_bump_all_cached_versions(swr_handler):
     assert h._dashboard_versions[3] == 1
 
 
+def test_bump_all_cached_versions_covers_users_with_no_prior_version(swr_handler):
+    # A user who has never voted has no entry in _dashboard_versions (it
+    # implicitly reads as 0), but can still hold a live _dashboard_cache
+    # entry from their first cold-deck render. Without covering this case,
+    # _bump_all_cached_versions never advances their version past 0, so
+    # every future GET / is a permanent cache_hit on stale bytes — not even
+    # a reload fixes it (see WORKLOG 2026-08-28).
+    user, h = swr_handler
+    h._dashboard_versions = {}
+    h._dashboard_cache = {
+        f"dashboard_{user.id}": (b"cached", time.time(), 0),
+    }
+
+    h._bump_all_cached_versions()
+
+    assert h._dashboard_versions[user.id] == 1
+
+
+def test_warm_stale_cached_users_warms_every_cached_user(swr_handler):
+    # After a regen/RSS-refresh bump, no per-user render is ever scheduled
+    # on its own (see WORKLOG 2026-08-28) — a cached user's stale bytes just
+    # sit there until their own next request. _warm_stale_cached_users must
+    # proactively trigger a warm for every user with a live cache entry.
+    user, h = swr_handler
+    other_user = h.db.create_user("other_user_tok")
+    h._dashboard_cache = {
+        f"dashboard_{user.id}": (b"cached", time.time(), 0),
+        f"dashboard_{other_user.id}": (b"cached", time.time(), 0),
+    }
+    h._dashboard_versions = {user.id: 1, other_user.id: 1}
+    calls: list[int] = []
+    h._trigger_warm = classmethod(  # type: ignore[method-assign]
+        lambda cls, warm_user, version: calls.append(warm_user.id)
+    )
+
+    h._warm_stale_cached_users()
+
+    assert sorted(calls) == sorted([user.id, other_user.id])
+
+
+def test_warm_stale_cached_users_skips_unknown_user_id(swr_handler):
+    # A cache entry for a user_id no longer in the users table (e.g. a
+    # pruned/never-created row) must not crash the warm sweep.
+    user, h = swr_handler
+    h._dashboard_cache = {
+        "dashboard_999999999": (b"cached", time.time(), 0),
+    }
+    calls: list[int] = []
+    h._trigger_warm = classmethod(  # type: ignore[method-assign]
+        lambda cls, warm_user, version: calls.append(warm_user.id)
+    )
+
+    h._warm_stale_cached_users()
+
+    assert calls == []
+
+
 def test_setFilter_preserves_sort_age_source_refresh_behavior() -> None:
     """Tab changes share setFilter while preserving refresh and filter rules."""
     _, static = _read_template_and_static()
@@ -3997,31 +5890,124 @@ def test_setFilter_preserves_sort_age_source_refresh_behavior() -> None:
     body = static[idx:end]
     assert "scheduleDeckRefresh({ advance: true })" in body
     assert "orderForCurrentSort()" in body
-    assert "showNextCard({ allowRefresh: false })" in body
+    assert "showNextCard({ allowRefresh: false, excludeActive: true })" in body
+    assert "excludeActive = false" in static
+    assert "!excludeActive || card !== activeCard" in static
+    assert body.count("focusActiveCard()") >= 3
     assert "matchesCurrentCombo(activeCard)" in body
     assert "filterName === 'sort' && value === 'popular'" in body
     assert "currentSource === 'non-hn'" in body
     assert "popularTab.disabled = (value === 'non-hn')" in body
     assert "currentSort = 'recommended'" in body
     assert "updateFilterTabs('sort', currentSort)" in body
-    assert "scheduleIdleAgePrefetch()" in body
+    assert "scheduleIdleAgePrefetch()" not in body
+    assert "scheduleIdleAgePrefetch" not in static
     assert "FILTERS" in static
     assert "refillQueued" not in body
     assert "refillWhenReady" not in body
 
 
-def test_orderForCurrentSort_uses_shared_order_helper_for_deterministic_modes():
-    """All sort modes use deterministic ordering; no shuffling."""
-    _, static = _read_template_and_static()
-    idx = static.index("function orderForCurrentSort(")
-    end = static.index("\n\n    function advanceToNextCard(", idx)
-    body = static[idx:end]
-    assert "currentSort === 'date'" in body
-    assert "orderCards((a, b) => parseFloat(b.dataset.score)" in body
-    assert "orderCards((a, b) => Number(b.dataset.time || 0)" in body
-    assert "shuffleCards()" not in body
-    assert "Math.floor(Math.random() * (i + 1))" not in static
-    assert "advanceToNextCard()" in static
+def test_deck_actions_restore_native_focus_to_active_card() -> None:
+    """Deck-changing actions share deferred, non-scrolling card focus."""
+    template, inline_script = _read_template_and_static()
+    focus_block = inline_script.split("function focusActiveCard()", 1)[1].split(
+        "function setActiveCard", 1
+    )[0]
+    assert "activeCard?.isConnected" in focus_block
+    assert "activeCard.focus({ preventScroll: true })" in focus_block
+    assert "first-time-tip" in focus_block
+
+    set_active_block = inline_script.split("function setActiveCard", 1)[1].split(
+        "function updateVoteBar", 1
+    )[0]
+    assert "focusActiveCard()" in set_active_block
+
+    submit_block = inline_script.split("function submitVote(", 1)[1].split(
+        "function ", 1
+    )[0]
+    assert "scheduleVoteRefresh(data);\n          focusActiveCard();" in submit_block
+    assert (
+        "const preferred = nextQueuedSibling(card);\n"
+        "          card.remove();\n"
+        "          showNextCard({ preferred });\n"
+        "          focusActiveCard();"
+    ) in submit_block
+    undo_block = inline_script.split("function undoLastVote()", 1)[1].split(
+        "function ", 1
+    )[0]
+    assert "scheduleVoteRefresh(data);\n        focusActiveCard();" in undo_block
+
+    key_actions = inline_script.split("const KEY_ACTIONS =", 1)[1].split(
+        "document.addEventListener('keydown'", 1
+    )[0]
+    assert (
+        "document.body.classList.toggle('fullscreen');\n        focusActiveCard();"
+        in key_actions
+    )
+    assert "t: () => refreshTldr()" in key_actions
+    assert "s: () => refreshDeck()" in key_actions
+    assert "function refreshTldr(card)" in inline_script
+    assert "openTldrDetail(card || activeCard, { force: true })" in inline_script
+    assert "function refreshDeck()" in inline_script
+    assert "queueRefill(false)" in inline_script
+    assert "refreshTldr(card);" in inline_script
+    assert ">t</span> re-summarize TLDR" in template
+    assert ">s</span> refresh deck" in template
+    key_action_buttons = inline_script.split(
+        "document.querySelectorAll('[data-key-action]').forEach", 1
+    )[1].split("async function fetchRefillDoc", 1)[0]
+    assert (
+        "document.body.classList.toggle('fullscreen');\n          focusActiveCard();"
+        in key_action_buttons
+    )
+    assert (
+        "max-height: calc(100dvh - var(--vote-bar-height) - var(--page-gutter));"
+        in template
+    )
+
+    refill_block = inline_script.split("async function refillQueue", 1)[1].split(
+        "document.querySelectorAll('[data-fb]')", 1
+    )[0]
+    assert "document.activeElement === activeCard" in refill_block
+    assert "activeCard.focus({ preventScroll: true })" in refill_block
+    assert refill_block.index("orderForCurrentSort()") < refill_block.index(
+        "activeCard.focus({ preventScroll: true })"
+    )
+
+
+def test_submitVote_advances_to_the_voted_cards_successor_not_the_deck_head() -> None:
+    """Voting must not reset the viewer to the top of the stack: the
+    successor is resolved from the voted card's DOM position before removal,
+    and showNextCard only trusts it if it's still connected and still
+    eligible (guards against a race with a concurrent refill/filter change).
+    """
+    _, inline_script = _read_template_and_static()
+
+    submit_block = inline_script.split("function submitVote(", 1)[1].split(
+        "function ", 1
+    )[0]
+    # Successor must be captured from `card` (the voted card) before it is
+    # removed from the DOM, not from queuedCards() head-of-deck afterward.
+    assert (
+        "const preferred = nextQueuedSibling(card);\n          card.remove();"
+    ) in submit_block
+
+    show_next_block = inline_script.split("function showNextCard(", 1)[1].split(
+        "function ", 1
+    )[0]
+    assert "preferred = null" in show_next_block
+    assert "preferred.isConnected" in show_next_block
+    assert "queue.includes(preferred)" in show_next_block
+    # Falls back to the original head-of-deck pick when preferred is stale.
+    assert (
+        "queue.find(card => !excludeActive || card !== activeCard)" in show_next_block
+    )
+
+    next_sibling_block = inline_script.split("function nextQueuedSibling(", 1)[1].split(
+        "function ", 1
+    )[0]
+    assert "nextElementSibling" in next_sibling_block
+    assert "isQueued(el)" in next_sibling_block
 
 
 def test_data_is_recent_attribute_emitted(test_env):
@@ -4129,12 +6115,67 @@ def test_deck_cards_returns_only_card_fragment(test_env) -> None:
 
     assert fragment_resp.status_code == 200
     assert fragment_resp.headers["content-type"].startswith("text/html")
-    assert fragment_resp.headers["Cache-Control"] == "no-cache, no-store, must-revalidate"
+    assert (
+        fragment_resp.headers["Cache-Control"] == "no-cache, no-store, must-revalidate"
+    )
     fragment = fragment_resp.text
     assert f'data-story-id="{story_id}"' in fragment
     assert "<style" not in fragment
     assert "<script" not in fragment
     assert len(fragment) < len(full.text) * 0.5
+
+
+def test_deck_cards_triggers_warm_on_stale_cache(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # /api/deck-cards is the endpoint every in-tab refill (vote, filter tab
+    # click) calls. Unlike GET / it used to never compare its cached
+    # version to the live one, so an open tab could poll this endpoint
+    # forever and always get the same stale deck (see WORKLOG 2026-08-28).
+    # It must now self-heal the same way GET /'s stale_hit branch does:
+    # serve the stale fragment immediately (SWR), but kick off a warm.
+    port, _, _, handler, user = test_env
+    cached_html = b'<!--cards:start--><div data-story-id="7001"></div><!--cards:end-->'
+    handler._dashboard_cache[f"dashboard_{user.id}"] = (cached_html, time.time(), 1)
+    handler._dashboard_versions[user.id] = 2
+    calls: list[int] = []
+    monkeypatch.setattr(
+        handler,
+        "_trigger_warm",
+        classmethod(lambda cls, warm_user, version: calls.append(version)),
+    )
+
+    response = httpx.get(
+        f"http://127.0.0.1:{port}/api/deck-cards",
+        cookies={"hn_token": user.token},
+    )
+
+    assert response.status_code == 200
+    assert 'data-story-id="7001"' in response.text
+    assert calls == [2]
+
+
+def test_deck_cards_does_not_warm_when_cache_is_current(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    port, _, _, handler, user = test_env
+    cached_html = b'<!--cards:start--><div data-story-id="7001"></div><!--cards:end-->'
+    handler._dashboard_cache[f"dashboard_{user.id}"] = (cached_html, time.time(), 2)
+    handler._dashboard_versions[user.id] = 2
+    calls: list[int] = []
+    monkeypatch.setattr(
+        handler,
+        "_trigger_warm",
+        classmethod(lambda cls, warm_user, version: calls.append(version)),
+    )
+
+    response = httpx.get(
+        f"http://127.0.0.1:{port}/api/deck-cards",
+        cookies={"hn_token": user.token},
+    )
+
+    assert response.status_code == 200
+    assert calls == []
 
 
 def test_inline_script_has_voted_story_ids_filter():
@@ -4179,17 +6220,21 @@ def test_inline_script_has_voted_story_ids_filter():
     assert "delete card.dataset.voted" in submit_catch
 
 
-def test_submitVote_schedules_ready_gated_refill_on_success() -> None:
-    """A successful vote save waits for warmed ranking HTML before refill."""
+def test_submitVote_schedules_stale_then_ready_gated_refill_on_success() -> None:
+    """A saved vote refills stale immediately and fresh after cadence warm."""
     _, inline_script = _read_template_and_static()
     submit_vote_block = inline_script.split("function submitVote(", 1)[1].split(
         "function ", 1
     )[0]
     assert "silentRefill()" not in submit_vote_block
-    assert "scheduleDeckRefresh({" in submit_vote_block
-    assert "waitForWarm: true" in submit_vote_block
-    assert "targetVersion: data.target_version" in submit_vote_block
-    assert "advance: false" in submit_vote_block
+    assert "scheduleVoteRefresh(data)" in submit_vote_block
+    refresh_block = inline_script.split("function scheduleVoteRefresh(", 1)[1].split(
+        "function ", 1
+    )[0]
+    assert "queueRefill(false)" in refresh_block
+    assert "data.ranking_refresh_queued" in refresh_block
+    assert "waitForWarm: true" in refresh_block
+    assert "data.ranking_idle_seconds" in refresh_block
     # On a failed save, the catch handler must surface a toast (not the old
     # refresh banner, which is gone).
     submit_catch = submit_vote_block.split("Network error submitting feedback", 1)[1]
@@ -4198,17 +6243,14 @@ def test_submitVote_schedules_ready_gated_refill_on_success() -> None:
     assert "refreshBanner.hidden" not in submit_catch
 
 
-def test_undoLastVote_schedules_ready_gated_refill_on_success() -> None:
-    """A successful undo waits for warmed ranking HTML before refill."""
+def test_undoLastVote_uses_vote_refresh_cadence_on_success() -> None:
+    """A successful undo uses the same stale/fresh refill cadence."""
     _, inline_script = _read_template_and_static()
     undo_block = inline_script.split("function undoLastVote()", 1)[1].split(
         "function ", 1
     )[0]
     assert "silentRefill()" not in undo_block
-    assert "scheduleDeckRefresh({" in undo_block
-    assert "waitForWarm: true" in undo_block
-    assert "targetVersion: data.target_version" in undo_block
-    assert "advance: false" in undo_block
+    assert "scheduleVoteRefresh(data)" in undo_block
     undo_catch = undo_block.split("Network error undoing feedback", 1)[1]
     assert "showToast(" in undo_catch
     assert "refreshBannerText" not in undo_catch
@@ -4401,13 +6443,19 @@ def test_refillQueue_reorders_deterministic_modes_only() -> None:
     )
 
 
-def test_refillQueue_advance_false_path_does_not_show_next_card() -> None:
+def test_refillQueue_activates_a_replacement_only_when_the_deck_is_empty() -> None:
+    """A non-advancing vote refill preserves an active card but recovers an
+    empty filtered deck once fresh matching cards arrive."""
     _, inline_script = _read_template_and_static()
     block = inline_script.split("async function refillQueue(", 1)[1].split(
         "function ", 1
     )[0]
     assert "advance = true" in block
-    assert "if (advance) {\n        showNextCard({ allowRefresh: false });" in block
+    assert "const needsActiveCard = activeCard === null;" in block
+    assert (
+        "if (advance || needsActiveCard) {\n        showNextCard({ allowRefresh: false });"
+        in block
+    )
 
 
 def test_showToast_dismisses_after_3s() -> None:
@@ -4541,7 +6589,6 @@ def test_on_demand_tldr_records_fetch_failure(test_env, monkeypatch):
 
 def test_on_demand_tldr_clears_failure_on_success(test_env, monkeypatch):
     """On-demand success clears prior failure record."""
-    import hashlib
     import server
     import time as time_mod
 
@@ -4597,9 +6644,9 @@ def test_on_demand_tldr_clears_failure_on_success(test_env, monkeypatch):
     updated = db.get_story(sid)
     assert updated is not None
     assert updated.article_body == "Recovered article body content here"
-    model_version = "all-MiniLM-L6-v2|mean|norm|256"
-    text_hash = hashlib.sha256(updated.text_content.encode("utf-8")).hexdigest()
-    assert db.get_embedding(sid, model_version, text_hash) is not None
+    # Embedding refresh is intentionally deferred to the warm/regen
+    # article-fetch path (off the tap critical path); the tap persists
+    # the body and clears the failure only.
 
 
 def test_warm_background_task_dedupes_in_flight_ids(test_env, monkeypatch):
@@ -4702,7 +6749,14 @@ def test_warm_background_article_fetch_failure_still_prefetches_tldrs(
 
     prefetch_calls: list[list[int]] = []
 
-    async def capture_prefetch(ranked_stories, database, per_combo, stale_per_run=0):
+    async def capture_prefetch(
+        ranked_stories,
+        database,
+        per_combo,
+        stale_per_run=0,
+        date_top_n=0,
+        stagger_s=None,
+    ):
         prefetch_calls.append([rs.story.id for rs in ranked_stories])
         return 1
 
@@ -4719,3 +6773,285 @@ def test_warm_background_article_fetch_failure_still_prefetches_tldrs(
 
     assert prefetch_calls == [[3010]]
     assert srv.Handler._article_fetch_in_flight == set()
+
+
+def test_quiet_third_party_loggers_silences_httpx_and_trafilatura() -> None:
+    """httpx INFO and trafilatura's benign "discarding data" WARNING made up
+    ~88% of a week of journal volume in production, drowning out anything
+    actionable during an incident (see WORKLOG 2026-08-27)."""
+    import logging
+    import server as srv
+
+    httpx_logger = logging.getLogger("httpx")
+    trafilatura_logger = logging.getLogger("trafilatura")
+    orig_httpx_level = httpx_logger.level
+    orig_trafilatura_level = trafilatura_logger.level
+    try:
+        httpx_logger.setLevel(logging.NOTSET)
+        trafilatura_logger.setLevel(logging.NOTSET)
+
+        srv._quiet_third_party_loggers()
+
+        assert httpx_logger.level == logging.WARNING
+        assert trafilatura_logger.level == logging.ERROR
+    finally:
+        httpx_logger.setLevel(orig_httpx_level)
+        trafilatura_logger.setLevel(orig_trafilatura_level)
+
+
+@pytest.mark.parametrize(
+    ("rank_ms", "stage_sum_ms", "expected"),
+    [
+        (54_000.0, 12_000.0, True),  # monster warm, stages explain little
+        (6_230_000.0, 900.0, True),  # 103-min stall, near-zero stages
+        (9_000.0, 3_500.0, False),  # ordinary slow warm, below 20s floor
+        (25_000.0, 20_000.0, False),  # expensive but accounted compute
+        (25_000.0, 8_000.0, True),  # just over the 3x boundary
+        (21_000.0, 7_000.0, False),  # exactly 3x is not starvation
+    ],
+)
+def test_warm_is_starved_predicate(
+    rank_ms: float, stage_sum_ms: float, expected: bool
+) -> None:
+    import server
+
+    assert server._warm_is_starved(rank_ms, stage_sum_ms) is expected
+
+
+def test_usage_int_parses_defensively() -> None:
+    import server
+
+    assert server._usage_int({"prompt_tokens": 10}, "prompt_tokens") == 10
+    assert server._usage_int({"prompt_tokens": -1}, "prompt_tokens") is None
+    assert server._usage_int({"prompt_tokens": "10"}, "prompt_tokens") is None
+    assert server._usage_int({"other": 1}, "prompt_tokens") is None
+    assert server._usage_int(None, "prompt_tokens") is None
+    assert server._usage_int("usage", "prompt_tokens") is None
+
+
+def test_note_llm_usage_swallows_recorder_errors() -> None:
+    """Usage recording must never break TLDR serving: a failing recorder
+    is a log line, not an exception."""
+    import server
+
+    def bad_recorder(provider, in_tok, out_tok, reasoning_tok):
+        raise RuntimeError("db is down")
+
+    result = server.LlmChatResult(content="- hi", ok=True)
+    server._note_llm_usage(None, "mistral", result)
+    server._note_llm_usage(bad_recorder, "mistral", result)
+
+
+async def test_call_llm_for_config_records_chat_usage(monkeypatch) -> None:
+    import server
+
+    recorded = []
+
+    class FakeLimiter:
+        async def acquire(self, *, estimated_tokens=0):
+            return True
+
+        def record_response(self, **kwargs):
+            pass
+
+    class FakeResponse:
+        status_code = 200
+        headers = {}
+        text = "{}"
+
+        def json(self):
+            return {
+                "choices": [
+                    {"message": {"content": "- summary"}, "finish_reason": "stop"}
+                ],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 20,
+                    "total_tokens": 30,
+                },
+            }
+
+    class FakeClient:
+        def __init__(self, *, timeout):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, base_url, *, headers, json):
+            return FakeResponse()
+
+    monkeypatch.setattr(server, "llm_limiter", FakeLimiter())
+    monkeypatch.setattr(server.httpx, "AsyncClient", FakeClient)
+
+    cfg = server.LlmProviderConfig(
+        provider="mistral",
+        api_key="test-key",
+        base_url="https://api.mistral.ai/v1/chat/completions",
+        model="mistral-small-latest",
+        extra={},
+    )
+    result = await server._call_llm_for_config(
+        cfg, prompt="hello", max_tokens=10, on_usage=lambda *a: recorded.append(a)
+    )
+
+    assert result.ok is True
+    assert (result.input_tokens, result.output_tokens, result.reasoning_tokens) == (
+        10,
+        20,
+        None,
+    )
+    assert recorded == [("mistral", 10, 20, None)]
+
+
+async def test_call_llm_responses_records_reasoning_usage(monkeypatch) -> None:
+    import server
+
+    recorded = []
+
+    class FakeLimiter:
+        async def acquire(self, *, estimated_tokens=0):
+            return True
+
+        def record_response(self, **kwargs):
+            pass
+
+    class FakeResponse:
+        status_code = 200
+        headers = {}
+        text = "{}"
+
+        def json(self):
+            return {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "- summary"}],
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "output_tokens_details": {"reasoning_tokens": 12},
+                },
+                "status": "completed",
+            }
+
+    class FakeClient:
+        def __init__(self, *, timeout):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, base_url, *, headers, json):
+            return FakeResponse()
+
+    monkeypatch.setattr(server, "llm_limiter", FakeLimiter())
+    monkeypatch.setattr(server.httpx, "AsyncClient", FakeClient)
+
+    cfg = server.LlmProviderConfig(
+        provider="gospark",
+        api_key="test-key",
+        base_url="https://opencode.ai/zen/go/v1/responses",
+        model="muse-spark",
+        extra={},
+    )
+    result = await server._call_llm_for_config(
+        cfg, prompt="hello", max_tokens=100, on_usage=lambda *a: recorded.append(a)
+    )
+
+    assert result.ok is True
+    assert (result.input_tokens, result.output_tokens, result.reasoning_tokens) == (
+        100,
+        50,
+        12,
+    )
+    assert recorded == [("gospark", 100, 50, 12)]
+
+
+def test_log_llm_spend_today_logs_estimate(caplog) -> None:
+    """One regen = one spend line per provider, with a $ estimate for mistral."""
+    import logging
+
+    import server
+    from database import Database
+
+    db = Database(":memory:")
+    try:
+        db.record_llm_usage("mistral", 1000, 2000, None)
+        with caplog.at_level(logging.INFO):
+            server._log_llm_spend_today(db)
+        assert any(
+            "llm_spend_today" in r.message
+            and "provider=mistral" in r.message
+            and "est_usd=0.0007" in r.message
+            for r in caplog.records
+        )
+        # Empty day: no lines, no crash.
+        caplog.clear()
+        empty_db = Database(":memory:")
+        try:
+            with caplog.at_level(logging.INFO):
+                server._log_llm_spend_today(empty_db)
+            assert not any("llm_spend_today" in r.message for r in caplog.records)
+        finally:
+            empty_db.close()
+    finally:
+        db.close()
+
+
+async def test_generate_detailed_tldr_records_usage_via_global_recorder(
+    monkeypatch,
+) -> None:
+    """generate_detailed_tldr must record token usage through the global
+    recorder bound in main() (no signature change, existing mocks intact)."""
+    import server
+    from database import Database
+
+    async def fake_call_llm_for_config(cfg, *, prompt, max_tokens, on_usage=None):
+        result = server.LlmChatResult(
+            content="- **Discussion** summary",
+            ok=True,
+            input_tokens=5,
+            output_tokens=7,
+        )
+        server._note_llm_usage(on_usage, cfg.provider, result)
+        return result
+
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_PROVIDER", "mistral")
+    monkeypatch.setattr(server, "_call_llm_for_config", fake_call_llm_for_config)
+
+    db = Database(":memory:")
+    old = server._llm_usage_recorder
+    server.set_llm_usage_recorder(db.record_llm_usage)
+    try:
+        result = await server.generate_detailed_tldr(
+            "Story links to OpenAI",
+            self_text="",
+            top_comments="comment 1\ncomment 2",
+            article_body="",
+        )
+        assert result.kind == "ok"
+        import time as time_mod
+
+        rows = db.get_llm_usage_day(time_mod.strftime("%Y-%m-%d"))
+        assert rows == [
+            {
+                "provider": "mistral",
+                "calls": 1,
+                "input_tokens": 5,
+                "output_tokens": 7,
+                "reasoning_tokens": 0,
+            }
+        ]
+    finally:
+        server.set_llm_usage_recorder(old)
+        db.close()

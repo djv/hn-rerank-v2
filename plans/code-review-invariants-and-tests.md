@@ -1,5 +1,9 @@
 # Code Review, Invariants, and Test Plan
 
+**Superseded:** `pipeline.py:NNNN` line references below predate the
+`pipeline/` package split (see ARCHITECTURE.md) and no longer resolve.
+Historical record only.
+
 **Scope:** `server.py`, `pipeline.py`, `database.py`, `templates/index.html`,
 and the existing test suite (`tests/test_pipeline.py`, `test_server.py`,
 `test_database.py`, `test_fetch.py`, `test_eval.py`).

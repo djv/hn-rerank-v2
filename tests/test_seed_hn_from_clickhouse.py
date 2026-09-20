@@ -236,7 +236,7 @@ async def test_comment_hydration_success_updates_embedding(monkeypatch):
         assert story.comment_count_at_fetch == 2
         assert "Substantive comment" in story.text_content
 
-        model_version = "all-MiniLM-L6-v2|mean|norm|256"
+        model_version = DummyEmbedder.model_version
         text_hash = hashlib.sha256(
             story_embedding_text(story).encode("utf-8")
         ).hexdigest()
@@ -377,7 +377,7 @@ async def test_reconcile_preserves_recent_hn_and_promotes_aged_hn(
         assert promoted is not None
         assert promoted.source == "ch_seed"
         assert "Rich cached comments" in promoted.top_comments
-        model_version = "all-MiniLM-L6-v2|mean|norm|256"
+        model_version = DummyEmbedder.model_version
         stored_hash = hashlib.sha256(
             story_embedding_text(promoted).encode("utf-8")
         ).hexdigest()

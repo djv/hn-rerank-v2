@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime
 import time
+import random
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 from jinja2 import Environment, FileSystemLoader
 
@@ -57,6 +59,7 @@ class VoteCountsView:
 class DashboardCardView:
     story: Story
     score: float
+    position: int
     best_match_title: str
     badges: tuple[BadgeView, ...]
     combo_keys: str
@@ -67,6 +70,7 @@ class DashboardCardView:
     is_recent_attr: str
     article_url: str
     comments_url: str
+    domain: str
     source_label: str
     time_ago: str
     show_source_badge: bool
@@ -150,6 +154,38 @@ def _get_pico_css() -> str:
     return _pico_css_cache
 
 
+def _domain_of(*urls: str) -> str:
+    """First registrable-looking hostname across the given URLs.
+
+    Lowercased, www-stripped, punycode left as-is (honest, no network).
+    Empty when no URL carries a hostname — the template hides the chip.
+    """
+    for url in urls:
+        if not url:
+            continue
+        try:
+            host = urlparse(url).hostname or ""
+        except ValueError:
+            continue
+        host = host.lower().removeprefix("www.")
+        if host:
+            return host
+    return ""
+
+
+# Badge legend for the side rail: icon + short label per kind, in a stable
+# display order. Tooltips stay on the card badges themselves; the legend is
+# a reminder, not documentation.
+BADGE_LEGEND: tuple[tuple[str, str], ...] = (
+    ("🔥", "Hot"),
+    ("🏆", "Top"),
+    ("💬", "Talk"),
+    ("🤔", "Unsure"),
+    ("✨", "Novel"),
+    ("🎯", "Similar"),
+)
+
+
 def _build_badges(
     item: RankedStory, *, hot_badge_percentile: int
 ) -> tuple[BadgeView, ...]:
@@ -218,12 +254,13 @@ def _build_dashboard_cards(
     ranked: list[RankedStory], *, hot_badge_percentile: int
 ) -> list[DashboardCardView]:
     cards: list[DashboardCardView] = []
-    for item in ranked:
+    for position, item in enumerate(ranked):
         story = item.story
         cards.append(
             DashboardCardView(
                 story=story,
                 score=item.score,
+                position=position,
                 best_match_title=item.best_match_title,
                 badges=_build_badges(item, hot_badge_percentile=hot_badge_percentile),
                 combo_keys=item.combo_keys,
@@ -242,6 +279,7 @@ def _build_dashboard_cards(
                 is_recent_attr="1" if item.is_recent else "0",
                 article_url=story.url or "",
                 comments_url=story.discussion_url or "",
+                domain=_domain_of(story.url or "", story.discussion_url or ""),
                 source_label=source_label_filter(story.source),
                 time_ago=time_ago_filter(story.time),
                 show_source_badge=story.source != "hn",
@@ -252,10 +290,17 @@ def _build_dashboard_cards(
 
 
 def _build_tab_groups() -> tuple[TabGroupView, ...]:
-    # Source filter (Mixed/HN/Non-HN) is temporarily disabled: the dashboard
-    # is hardcoded to HN-only sources for now (see WORKLOG 2026-07-10), so a
-    # Non-HN tab would always render an empty deck. Re-add the TabGroupView
-    # below when non-HN sources return to the candidate pool.
+    # Source filter (Mixed/HN/Non-HN) is temporarily disabled. The claim
+    # that non-HN sources are absent from the candidate pool is stale —
+    # the RSS/Reddit/LessWrong leg has been enabled since well before this
+    # comment was last touched (config.non_hn_candidates_enabled=true;
+    # see WORKLOG 2026-08-28/2026-08-30) — but re-enabling this UI still
+    # needs client-side work: an Archive+Non-HN selection currently has no
+    # matching combo (archive_nonhn is structurally always empty, see
+    # PRIMARY_RECENT_NONHN/PRIMARY_ARCHIVE_HN in pipeline/ranking.py) and
+    # would need the same kind of guard the client already has for
+    # Popular+Non-HN. Deferred (2026-08-30 user decision); re-add the
+    # TabGroupView below alongside that client-side guard.
     return (
         TabGroupView(
             key="sort",
@@ -328,6 +373,8 @@ def prepare_feed(
             selected.sort(
                 key=lambda s: s.time if sort == "date" else s.rank_score, reverse=True
             )
+            if sort == "explore":
+                random.shuffle(selected)
             orders[f"{sort}:{age}"] = [s.id for s in selected]
     return Feed(1, stories, orders, counts, version, target, version >= target)
 
@@ -366,6 +413,7 @@ def generate_dashboard_bytes(
         timestamp=datetime.now().strftime("%Y-%m-%d %H:%M"),
         cards=cards,
         tab_groups=_build_tab_groups(),
+        badge_legend=BADGE_LEGEND,
         server_port=config.server_port,
         pico_css=pico_css,
         user_id=user_id,

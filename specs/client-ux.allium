@@ -32,6 +32,7 @@ external entity Browser {}
 
 enum SortMode { recommended | popular | explore | date }
 enum TldrOutcome { summarized | nothing_to_summarize | failed }
+enum InteractionKind { impression | article_open | comments_open | dwell }
 
 -- Unlike ranking/SegmentSource (hn | non_hn), the navigation filter has a
 -- third state: mixed, the default view showing the full pool regardless
@@ -54,6 +55,15 @@ entity NavigationFilter {
 entity OnboardingTip {
     browser: Browser
     dismissed: Boolean
+}
+
+entity InteractionEvent {
+    viewer: ranking/User
+    story: ranking/Story
+    kind: InteractionKind
+    session_id: String
+    position: Integer
+    duration_ms: Integer?
 }
 
 external entity TldrView {
@@ -113,6 +123,11 @@ rule SelectAge {
     ensures: NavigationFilter{viewer}.age = age
 }
 
+rule RecordInteraction {
+    when: RecordInteraction(viewer, story, kind)
+    ensures: InteractionEvent.created(viewer: viewer, story: story, kind: kind)
+}
+
 invariant PopularSortRequiresHnSource {
     for f in NavigationFilters:
         f.sort = popular implies f.source = hn
@@ -142,6 +157,7 @@ surface StoryDeck {
         ranking/ClearVote(viewer, card.story)
             when exists ranking/Vote{user: viewer, story: card.story}
         ViewTldr(viewer, card.story)
+        RecordInteraction(viewer, card.story, kind)
 
     @guarantee OneCardAtATime
         -- Exactly one card is "active" for a viewer at any moment.
@@ -173,6 +189,12 @@ surface StoryDeck {
         -- card returns the cached view without a new request. A
         -- TldrView with outcome failed is never cached - re-opening
         -- the card retries.
+
+    @guarantee ExplicitInteractionTelemetry
+        -- Impressions are recorded when a card becomes active, dwell is
+        -- recorded when that active interval ends, and article/comments
+        -- opens are recorded only for explicit link actions. Automatic TLDR
+        -- requests and enrichment do not count as viewer intent.
 
     @guidance
         -- Filtering (sort/age/source) narrows which already-fetched

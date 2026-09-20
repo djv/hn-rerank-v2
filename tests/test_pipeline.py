@@ -1,10 +1,12 @@
-from typing import Any, cast
+from typing import Any, Literal, cast
 import asyncio
-import os
+import hashlib
 import numpy as np
 import pytest
+import re
 import time
 from collections.abc import Callable
+from email.utils import formatdate
 from numpy.typing import NDArray
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +21,7 @@ from pipeline import (
     Embedder,
     ModelConfig,
     RankTrace,
+    RankedComment,
     RankedStory,
     RssConfig,
     clean_text,
@@ -46,6 +49,7 @@ from pipeline import (
     fast_rerank_for_user,
     HOT_MIN_SCORE,
 )
+from pipeline.ranking import PrecomputedRbfSVC
 from pipeline.hn_dupes import HnDupeResolver
 
 
@@ -54,6 +58,61 @@ def db():
     db_instance = Database(":memory:")
     yield db_instance
     db_instance.close()
+
+
+def test_dashboard_polish_renders_domain_legend_and_queue_status(
+    db: Database,
+) -> None:
+    """End-to-end render wiring for the polish pass: www-stripped domain
+    chip on cards, badge legend + rank legend + queue status in the rail,
+    and the undo key row. Guards the render.py context (badge_legend) that
+    Jinja would otherwise swallow silently when missing."""
+    from pipeline import render
+
+    assert render._domain_of("https://WWW.Example.COM/a", "") == "example.com"
+    assert render._domain_of("", "https://news.ycombinator.com/item?id=1") == (
+        "news.ycombinator.com"
+    )
+    assert render._domain_of("", "") == ""
+    assert render._domain_of("not a url", "") == ""
+    assert [label for _, label in render.BADGE_LEGEND] == [
+        "Hot",
+        "Top",
+        "Talk",
+        "Unsure",
+        "Novel",
+        "Similar",
+    ]
+
+    story = Story(
+        id=424242,
+        title="Polish render probe",
+        url="https://www.example.com/some-article",
+        score=100,
+        time=1600000000,
+        text_content="",
+    )
+    db.upsert_story(story)
+    html = render.generate_dashboard_bytes(
+        [ranking.RankedStory(story=story, score=1.0, best_match_title="")],
+        Config(),
+        db,
+    ).decode("utf-8")
+    assert '<span class="domain-chip">example.com</span>' in html
+    assert "🔥 Hot" in html
+    assert 'id="queueStatus"' in html
+    assert "top-ranked → bottom" in html
+    assert 'data-key-action="undo"' in html
+
+
+def _recent_pubdate(days_ago: float = 1.0) -> str:
+    """RFC-822 pubDate `days_ago` days in the past.
+    Reddit topfeed factories filter entries against a
+    `now - days * 86400` cutoff (see `build_reddit_topfeed_factories`
+    in pipeline/enrichment.py), so a hardcoded date silently ages out
+    of the window and yields an empty feed. Always generate relative.
+    """
+    return formatdate(time.time() - days_ago * 86400, usegmt=True)
 
 
 def test_config_load_missing_file_returns_dataclass_defaults(tmp_path):
@@ -102,6 +161,13 @@ def test_config_rejects_invalid_embedding_batch_size():
         Config(embedding_batch_size=0)
 
 
+def test_config_rejects_nonpositive_feedback_regen_idle_seconds() -> None:
+    with pytest.raises(
+        ValueError, match="feedback_regen_idle_seconds must be positive"
+    ):
+        Config(feedback_regen_idle_seconds=0)
+
+
 def test_config_rejects_invalid_embedding_ort_variant():
     with pytest.raises(ValueError, match="embedding_ort_variant must be one of"):
         Config(embedding_ort_variant=cast(Any, "approximate_gelu"))
@@ -113,6 +179,7 @@ def test_config_load_checked_in_config_contains_only_runtime_overrides():
     config = Config.load(str(config_path))
 
     assert config.server_port == 8766
+    assert config.feedback_regen_idle_seconds == 300.0
     assert config.article_fetch_max_per_run == 50
     assert config.model.svm_c == 0.1
     assert config.model.svm_gamma == 0.03
@@ -279,18 +346,21 @@ def test_build_cold_deck_combo_keys_and_flags(
     for story in (recent_hn, archive_hn, recent_non_hn):
         db.upsert_story(story)
 
-    cold = pipeline.build_cold_deck(db, Config())
+    # "https://rss.blog" -> _rss_source_name -> "rss_blog", matching
+    # recent_non_hn's source, so the RSS leg actually picks it up.
+    config = Config(rss=RssConfig(feeds=("https://rss.blog",)))
+    cold = pipeline.build_cold_deck(db, config)
     by_id = {item.story.id: item for item in cold}
 
-    # Dashboard is hardcoded to HN sources only for now — non-HN story 3
-    # is filtered out at the SQL level.
-    assert 3 not in by_id
     assert by_id[1].combo_keys == "recent_hn recent_mixed"
     assert by_id[1].is_recent is True
     assert by_id[1].is_non_hn is False
     assert by_id[2].combo_keys == "archive_hn archive_mixed"
     assert by_id[2].is_recent is False
     assert by_id[2].is_non_hn is False
+    assert by_id[3].combo_keys == "recent_non-hn recent_mixed"
+    assert by_id[3].is_recent is True
+    assert by_id[3].is_non_hn is True
 
 
 def test_build_cold_deck_computes_popular_badges_but_not_explore(
@@ -316,11 +386,47 @@ def test_build_cold_deck_computes_popular_badges_but_not_explore(
     assert item.is_hot is True
 
 
+class _HashEmbedder(Embedder):
+    """Deterministic L2-normalized fake encoder (md5-seeded gaussian/text).
+
+    Differentiation is random-but-stable, so structural assertions (badge
+    floors, tiers, ordering mechanics, SVM plumbing) hold at ~0 cost vs a
+    2.5s ONNX load + per-test encodes. Tests asserting *semantic*
+    similarity use `_real_embedder`. __init__ overridden per the
+    mock-embedder rule in AGENTS.md.
+    """
+
+    def __init__(self) -> None:
+        self.batch_size = 32
+        self.max_tokens = 4096
+
+    def encode(
+        self, texts: list[str], batch_size: int | None = None
+    ) -> NDArray[np.float32]:
+        vecs: list[NDArray[np.float32]] = []
+        for text in texts:
+            seed = int.from_bytes(hashlib.md5(text.encode()).digest()[:8], "little")
+            rng = np.random.default_rng(seed)
+            vec = rng.standard_normal(384).astype(np.float32)
+            vec /= np.linalg.norm(vec)
+            vecs.append(vec)
+        if not vecs:
+            return np.empty((0, 384), dtype=np.float32)
+        return np.stack(vecs).astype(np.float32)
+
+
 @pytest.fixture(scope="module")
+def _real_embedder() -> Embedder:
+    # Uses the real downloaded ONNX model (shared across worktrees).
+    # Only for tests asserting real-model semantics or output shape.
+    return Embedder()
+
+
+@pytest.fixture()
 def embedder() -> Embedder:
-    # Real model, with a laptop override so tests never require the VPS filesystem.
-    model_dir = os.environ.get("HN_TEST_ONNX_MODEL_DIR")
-    return Embedder(model_dir) if model_dir else Embedder()
+    # Deterministic fake: rank/badge/tier tests exercise logic, not the
+    # encoder. Function-scoped (trivial setup) for order-independence.
+    return _HashEmbedder()
 
 
 def test_embedder_uses_configured_batch_and_ort_variant(monkeypatch):
@@ -341,7 +447,7 @@ def test_embedder_uses_configured_batch_and_ort_variant(monkeypatch):
         ):
             assert padding is True
             assert truncation is True
-            assert max_length == 512
+            assert max_length == 4096
             assert return_tensors == "np"
             width = max(1, max(len(text) for text in texts))
             input_ids = np.ones((len(texts), width), dtype=np.int64)
@@ -409,9 +515,9 @@ def test_embedder_uses_configured_batch_and_ort_variant(monkeypatch):
     assert session.options.inter_op_num_threads == 1
 
 
-def test_embedder_output_shape(embedder):
+def test_embedder_output_shape(_real_embedder):
     texts = ["Hello world", "Hacker News rewrite plan"]
-    embs = embedder.encode(texts)
+    embs = _real_embedder.encode(texts)
     assert embs.shape == (2, 384)
     # Check normalization: norms should be close to 1.0
     norms = np.linalg.norm(embs, axis=1)
@@ -434,7 +540,7 @@ def test_embedder_cache_hit(db, embedder):
     assert embs1.shape == (1, 384)
 
     # Second call: check if cached
-    model_version = "all-MiniLM-L6-v2|mean|norm|256"
+    model_version = embedder.model_version
     import hashlib
 
     shash = hashlib.sha256(story.text_content.encode("utf-8")).hexdigest()
@@ -630,7 +736,7 @@ def test_rank_no_feedback_fallback(db, embedder):
     assert ranked[1].score >= 0
 
 
-def test_rank_svm_path(db, embedder):
+def test_rank_svm_path(db, _real_embedder):
     config = Config()
     user = db.create_user("test_token_svm")
     # 20 up + 20 down = both gates pass (n_up >= 20, n_down >= 20)
@@ -676,14 +782,14 @@ def test_rank_svm_path(db, embedder):
             text_content="Delicious chocolate chip cake baking guide.",
         ),
     ]
-    cand_embs = embedder.encode([s.text_content for s in candidates])
+    cand_embs = _real_embedder.encode([s.text_content for s in candidates])
 
     ranked = _score_and_rank(
         candidates=candidates,
         candidate_embeddings=cand_embs,
         db=db,
         config=config,
-        embedder=embedder,
+        embedder=_real_embedder,
     )
 
     assert len(ranked) == 2
@@ -898,6 +1004,91 @@ async def test_rss_feed_retains_full_content_body(monkeypatch):
     assert len(stories[0].self_text) <= RSS_SELF_TEXT_CHAR_LIMIT
 
 
+@pytest.mark.asyncio
+async def test_fetch_and_parse_feed_transport_error_logs_warning_not_error(
+    monkeypatch, caplog
+):
+    """A transport error that survives the urllib fallback too (genuine
+    network-down) is expected/transient -- logged at WARNING with no
+    traceback, not ERROR. Regression for the 2026-08-27 fix: previously
+    any exception here (transport errors included) hit a bare
+    `except Exception: logging.error(...)`, indistinguishable from a
+    real bug."""
+    import logging
+    from urllib.error import URLError
+
+    import httpx
+
+    from pipeline import _fetch_and_parse_feed
+
+    logging.getLogger().setLevel(logging.NOTSET)
+    caplog.set_level(logging.INFO)
+
+    class MockClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, url, headers=None):
+            raise httpx.RemoteProtocolError("peer closed connection")
+
+    monkeypatch.setattr("pipeline.enrichment.httpx.AsyncClient", MockClient)
+    monkeypatch.setattr(
+        "http_fetch.urlopen", lambda *a, **k: (_ for _ in ()).throw(URLError("down"))
+    )
+
+    stories = await _fetch_and_parse_feed(
+        "https://example.com/feed.xml",
+        per_feed=10,
+        cutoff=0,
+        now=1_000_000,
+        exclude_urls=set(),
+    )
+    assert stories == []
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("Failed to fetch RSS feed" in r.message for r in warnings)
+    assert errors == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_and_parse_feed_unexpected_error_logs_exception_with_traceback(
+    monkeypatch, caplog
+):
+    """A non-network exception (e.g. a real bug) must be logged with a
+    full traceback (logging.exception), per the no-silent-failures rule
+    -- not merged into the same quiet path as an expected transport
+    failure."""
+    import logging
+
+    from pipeline import _fetch_and_parse_feed
+
+    caplog.set_level(logging.INFO)
+
+    def boom(feed_url):
+        raise RuntimeError("unexpected parsing bug")
+
+    monkeypatch.setattr("pipeline.enrichment._rss_source_name", boom)
+
+    stories = await _fetch_and_parse_feed(
+        "https://example.com/feed.xml",
+        per_feed=10,
+        cutoff=0,
+        now=1_000_000,
+        exclude_urls=set(),
+    )
+    assert stories == []
+    error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(error_records) == 1
+    assert "Unexpected error fetching RSS feed" in error_records[0].message
+    assert error_records[0].exc_info is not None
+
+
 def test_is_summarizable_with_content():
     """Stories with self_text, top_comments, or article_body are summarizable."""
     from pipeline import Story
@@ -1043,7 +1234,7 @@ async def test_build_reddit_topfeed_serializes_and_sets_user_agent(
     def rss_doc(title: str, link: str) -> str:
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0"><channel><title>Test</title>
-<item><title>{title}</title><link>{link}</link><pubDate>{time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())}</pubDate><description>Substantial test summary text for ranking.</description></item>
+<item><title>{title}</title><link>{link}</link><pubDate>{_recent_pubdate()}</pubDate><description>Substantial test summary text for ranking.</description></item>
 </channel></rss>"""
 
     class MockClient:
@@ -1134,7 +1325,7 @@ async def test_build_reddit_topfeed_populates_self_text(tmp_path, monkeypatch):
         return f"""<?xml version="1.0"?>
 <rss><channel>
 <item><title>{title}</title><link>{link}</link>
-<pubDate>{time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())}</pubDate>
+<pubDate>{_recent_pubdate()}</pubDate>
 <description>{body}</description>
 </item></channel></rss>"""
 
@@ -1244,7 +1435,7 @@ async def test_build_reddit_topfeed_cache_miss_fetches_and_caches(
     def rss_doc(title: str, link: str) -> str:
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0"><channel><title>Test</title>
-<item><title>{title}</title><link>{link}</link><pubDate>{time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())}</pubDate><description>test body</description></item>
+<item><title>{title}</title><link>{link}</link><pubDate>{_recent_pubdate()}</pubDate><description>test body</description></item>
 </channel></rss>"""
 
     class MockResp:
@@ -1363,24 +1554,60 @@ async def test_prewarm_reddit_top_stories_skips_if_already_populated(
     assert updated.comment_count is None  # unchanged
 
 
-@given(st.lists(st.floats(0.0, 1.0, allow_nan=False), min_size=2, max_size=50))
-def test_mmr_output_is_subset(scores):
+@given(
+    cluster_ids=st.lists(
+        st.integers(min_value=0, max_value=19), min_size=2, max_size=50
+    ),
+    scores=st.lists(st.floats(0.0, 1.0, allow_nan=False), min_size=2, max_size=50),
+    limit=st.integers(min_value=1, max_value=10),
+)
+def test_mmr_output_matches_cluster_survivor_oracle(
+    cluster_ids: list[int], scores: list[float], limit: int
+) -> None:
+    # Pair up cluster_ids/scores to a common length so every story has both.
+    n = min(len(cluster_ids), len(scores))
+    cluster_ids = cluster_ids[:n]
+    scores = scores[:n]
+
+    # Twenty orthonormal basis vectors: identical embeddings within a cluster
+    # (dot == 1.0, always merged) and orthogonal across clusters (dot ==
+    # 0.0, never merged) -- this makes the sim > threshold discard branch
+    # in mmr_filter deterministic instead of accidental.
+    basis = np.eye(20, 384, dtype=np.float32)
+
+    story_ids = list(range(n))
     ranked = []
     embeddings_map = {}
-    for i, s in enumerate(scores):
+    for i, (cid, s) in enumerate(zip(cluster_ids, scores)):
         story = Story(id=i, title=f"S{i}", url=None, score=0, time=0, text_content="")
         ranked.append(RankedStory(story=story, score=s, best_match_title=""))
-        v = np.zeros(384, dtype=np.float32)
-        v[i % 384] = 1.0
-        embeddings_map[i] = v
+        embeddings_map[i] = basis[cid]
 
-    filtered = mmr_filter(ranked, embeddings_map, threshold=0.85, limit=10)
+    # Production callers feed mmr_filter stories already sorted by score.
+    ranked.sort(key=lambda item: item.score, reverse=True)
+
+    filtered = mmr_filter(ranked, embeddings_map, threshold=0.85, limit=limit)
 
     filtered_ids = [item.story.id for item in filtered]
     input_ids = [item.story.id for item in ranked]
-    for fid in filtered_ids:
-        assert fid in input_ids
-    assert filtered_ids == sorted(filtered_ids, key=lambda x: input_ids.index(x))
+
+    # The reference model is exactly the contract implemented by mmr_filter:
+    # retain the first (highest-scored) story from each embedding cluster,
+    # preserving ranked order, then stop at the requested limit.
+    cluster_of = {i: cluster_ids[i] for i in story_ids}
+    expected_ids = []
+    seen_clusters = set()
+    for item in ranked:
+        c = cluster_of[item.story.id]
+        if c not in seen_clusters:
+            seen_clusters.add(c)
+            expected_ids.append(item.story.id)
+            if len(expected_ids) == limit:
+                break
+
+    assert filtered_ids == expected_ids
+    assert len(filtered_ids) == min(limit, len(seen_clusters))
+    assert all(fid in input_ids for fid in filtered_ids)
 
 
 def test_rerank_candidates_mmr_config_switch(db, embedder, monkeypatch):
@@ -1516,23 +1743,68 @@ def test_rank_no_feedback_frontpage_sort(db, embedder):
     assert ranked[0].story.id == 2
 
 
-@given(text=st.text(), min_len=st.integers(min_value=0, max_value=100))
-@settings(max_examples=25)
-def test_clean_text_properties(text, min_len):
-    import re
+_CLEAN_TEXT_NOISE = st.sampled_from(
+    [
+        "<b>",
+        "</b>",
+        "<div class='x'>",
+        "<script>alert(1)</script>",
+        "&amp;",
+        "&#x27;",
+        "&lt;",
+        "⠀⠁⠒",  # braille
+        "─━",  # box-drawing, also in the stripped range
+    ]
+)
 
+
+@st.composite
+def _clean_text_payload_and_noise(draw: st.DrawFn) -> tuple[str, str]:
+    """Noise plus a payload long enough to clear clean_text's 0.5 density floor.
+
+    clean_text only ever removes characters and never removes alphanumerics, so
+    with k payload words (5 alnum + 1 space each) and N noise characters the
+    cleaned density is at least 5k / (6k - 1 + N); requiring 4k >= N - 1 keeps
+    that at or above 0.5 for every draw.
+    """
+    fragments = draw(
+        st.lists(st.one_of(st.text(max_size=20), _CLEAN_TEXT_NOISE), max_size=15)
+    )
+    noise = "".join(fragments)
+    words = max(4, (len(noise) + 3) // 4)
+    payload = " ".join(
+        draw(
+            st.lists(
+                st.sampled_from(["alpha", "beta", "gamma", "delta"]),
+                min_size=words,
+                max_size=words,
+            )
+        )
+    )
+    return payload, noise
+
+
+@given(
+    pair=_clean_text_payload_and_noise(),
+    min_len=st.integers(min_value=0, max_value=10),
+)
+@settings(max_examples=30)
+def test_clean_text_properties(pair: tuple[str, str], min_len: int) -> None:
+    payload, noise = pair
+    text = payload + noise
     cleaned = clean_text(text, min_len=min_len)
 
-    if cleaned != "":
-        # Length constraint
-        assert len(cleaned) > min_len
-        # Alphanumeric density
-        alnum = sum(c.isalnum() for c in cleaned)
-        assert alnum / len(cleaned) >= 0.5
-        # No Braille
-        assert not re.search(r"[\u2800-\u28FF]", cleaned)
-        # No unescaped tags
-        assert not re.search(r"<[^>]+>", cleaned)
+    # The meaningful prefix is long enough to survive min_len and provides
+    # an oracle stronger than "empty output is acceptable".
+    assert cleaned != ""
+    assert len(cleaned) > min_len
+    assert all(word in cleaned for word in payload.split())
+
+    # Safety and normalization invariants apply to every non-empty result.
+    alnum = sum(c.isalnum() for c in cleaned)
+    assert alnum / len(cleaned) >= 0.5
+    assert not re.search(r"[\u2800-\u28FF]", cleaned)
+    assert not re.search(r"<[^>]+>", cleaned)
 
 
 def test_svm_personalization_features_exclude_engagement_source_metadata():
@@ -1568,27 +1840,40 @@ def test_svm_personalization_features_exclude_engagement_source_metadata():
 
 
 @given(
-    feedback_actions=st.lists(
-        st.sampled_from(["up", "neutral", "down"]), min_size=0, max_size=20
-    ),
+    up_count=st.integers(min_value=2, max_value=5),
+    down_count=st.integers(min_value=2, max_value=5),
+    neutral_count=st.integers(min_value=0, max_value=3),
     cand_count=st.integers(min_value=1, max_value=10),
+    seed=st.integers(min_value=0, max_value=2**31 - 1),
 )
 @settings(
-    max_examples=25,
+    max_examples=10,
     suppress_health_check=[HealthCheck.function_scoped_fixture],
     deadline=1000,
 )
-def test_svm_fitting_robustness(embedder, feedback_actions, cand_count):
+def test_svm_fitting_robustness(
+    embedder: Embedder,
+    up_count: int,
+    down_count: int,
+    neutral_count: int,
+    cand_count: int,
+    seed: int,
+) -> None:
+    rng = np.random.default_rng(seed)
+    feedback_actions: list[Literal["up", "down", "neutral"]] = (
+        ["up"] * up_count + ["down"] * down_count + ["neutral"] * neutral_count
+    )
+    rng.shuffle(feedback_actions)
     db = Database(":memory:")
     try:
         user = db.create_user("test_token_robustness")
-        model_version = "all-MiniLM-L6-v2|mean|norm|256"
+        model_version = embedder.model_version
         for i, action in enumerate(feedback_actions):
             story = Story(
                 id=1000 + i,
                 title=f"Feedback Story {i}",
                 url=None,
-                score=np.random.randint(0, 1000),
+                score=int(rng.integers(0, 1000)),
                 time=int(1600000000 + i * 100),
                 text_content=f"Sample semantic content for history {i}",
             )
@@ -1597,7 +1882,10 @@ def test_svm_fitting_robustness(embedder, feedback_actions, cand_count):
             shash = hashlib.sha256(story.text_content.encode("utf-8")).hexdigest()
             db.upsert_story(story)
             db.upsert_embedding(
-                story.id, model_version, shash, np.random.randn(384).astype(np.float32)
+                story.id,
+                model_version,
+                shash,
+                rng.standard_normal(384).astype(np.float32),
             )
             db.upsert_feedback(user.id, story.id, action)
 
@@ -1608,21 +1896,22 @@ def test_svm_fitting_robustness(embedder, feedback_actions, cand_count):
                     id=i,
                     title=f"Candidate Story {i}",
                     url=None,
-                    score=np.random.randint(0, 500),
+                    score=int(rng.integers(0, 500)),
                     time=int(1600000000),
                     text_content=f"Sample candidate content {i}",
                 )
             )
 
-        cand_embs = np.random.randn(cand_count, 384).astype(np.float32)
-        config = Config()
+        cand_embs = rng.standard_normal((cand_count, 384)).astype(np.float32)
+        config = Config(model=ModelConfig(min_up_for_svm=2, min_down_for_svm=2))
         ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
 
         assert len(ranked) == cand_count
         for item in ranked:
             assert 0.0 <= item.score <= 1.0
-            if not feedback_actions:
-                assert 0.0 <= item.score <= 1.0
+            assert item.prob_down is not None
+            assert item.prob_neutral is not None
+            assert item.prob_up is not None
     finally:
         db.close()
 
@@ -2466,6 +2755,48 @@ def test_load_production_candidate_stories_feedback_switch_and_summarizable_filt
     assert [story.id for story in included] == [1]
 
 
+def test_load_production_candidate_stories_rss_leg_reaches_full_window(
+    db: Database,
+) -> None:
+    """A limit above the in-window row count must not truncate the RSS leg
+    to a slice of the configured `days` window.
+
+    Regression guard for the ~4-day effective RSS window found in
+    production (recent_candidate_rss_limit=500 against ~4,200 in-window
+    rows, ORDER BY time DESC — see WORKLOG 2026-08-28/2026-08-30):
+    with a limit that clears the row count, every in-window row must come
+    back, including the oldest ones near the `days` cutoff.
+    """
+    user = db.create_user("rss_full_window")
+    now = 2_000_000_000
+    config = Config(
+        days=30,
+        recent_candidate_hn_limit=0,
+        recent_candidate_rss_limit=10,
+        rss=RssConfig(feeds=("https://rss.a",)),
+    )
+    in_window_ages_days = [0.1, 5, 15, 25, 29.9]
+    for i, age_days in enumerate(in_window_ages_days):
+        db.upsert_story(
+            _candidate_story(
+                100 + i,
+                source="rss_a",
+                score=0,
+                time_ts=now - int(age_days * 86400),
+            )
+        )
+    # Just outside the 30-day window — must not appear.
+    db.upsert_story(
+        _candidate_story(200, source="rss_a", score=0, time_ts=now - 31 * 86400)
+    )
+
+    candidates = load_production_candidate_stories(
+        db, config, user_id=user.id, exclude_feedback=True, now_ts=now
+    )
+
+    assert {story.id for story in candidates} == {100, 101, 102, 103, 104}
+
+
 def test_fast_rerank_for_user_zero_vote_returns_cold_deck(
     db: Database, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2519,7 +2850,7 @@ def test_soft_blend_min_alpha_curve() -> None:
             )
 
 
-def test_no_cliff_at_n_10(db: Database, embedder: Embedder) -> None:
+def test_no_cliff_at_n_10(db: Database, _real_embedder: Embedder) -> None:
     """At n=10, SVM doesn't fire (threshold=20). Ranking is tier-2 centroid-diff."""
     config = Config()
     user = db.create_user("test_token_no_cliff")
@@ -2578,9 +2909,9 @@ def test_no_cliff_at_n_10(db: Database, embedder: Embedder) -> None:
             text_content="How to make perfect sourdough bread at home.",
         ),
     ]
-    cand_embs = embedder.encode([s.text_content for s in candidates])
+    cand_embs = _real_embedder.encode([s.text_content for s in candidates])
 
-    ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
+    ranked = _score_and_rank(candidates, cand_embs, db, config, _real_embedder)
 
     assert len(ranked) == 3
     # Finance candidate is closest to upvotes (centroid formula). Should rank first.
@@ -2658,7 +2989,9 @@ def test_tier1_tier2_blend_with_only_upvotes(db: Database, embedder: Embedder) -
     assert ranked[1].story.id != ranked[2].story.id
 
 
-def test_tier2_pure_at_60_plus_one_class(db: Database, embedder: Embedder) -> None:
+def test_tier2_pure_at_60_plus_one_class(
+    db: Database, _real_embedder: Embedder
+) -> None:
     """60 upvotes (n_feedback=60, α_2=1.0) → pure tier2 centroid, finance first."""
     config = Config()
     user = db.create_user("test_token_pure_tier2")
@@ -2706,8 +3039,8 @@ def test_tier2_pure_at_60_plus_one_class(db: Database, embedder: Embedder) -> No
             source="hn",
         ),
     ]
-    cand_embs = embedder.encode([s.text_content for s in candidates])
-    ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
+    cand_embs = _real_embedder.encode([s.text_content for s in candidates])
+    ranked = _score_and_rank(candidates, cand_embs, db, config, _real_embedder)
 
     assert len(ranked) == 3
     # Pure centroid (sim_up): finance > AI > baking
@@ -2716,7 +3049,7 @@ def test_tier2_pure_at_60_plus_one_class(db: Database, embedder: Embedder) -> No
 
 
 def test_tier1_active_at_tier3_activation_boundary(
-    db: Database, embedder: Embedder
+    db: Database, _real_embedder: Embedder
 ) -> None:
     """19 up/19 down (n_feedback=38) then 20/20 (n_feedback=40).
     At both points tier1 weight is non-zero: 1-38/50=0.24 and 1-40/50=0.20."""
@@ -2777,8 +3110,8 @@ def test_tier1_active_at_tier3_activation_boundary(
             source="hn",
         ),
     ]
-    cand_embs = embedder.encode([s.text_content for s in candidates])
-    ranked_19 = _score_and_rank(candidates, cand_embs, db, config, embedder)
+    cand_embs = _real_embedder.encode([s.text_content for s in candidates])
+    ranked_19 = _score_and_rank(candidates, cand_embs, db, config, _real_embedder)
 
     # Add one more of each class (20 up, 20 down, n_feedback=40, n_min=20)
     db.upsert_story(
@@ -2804,7 +3137,7 @@ def test_tier1_active_at_tier3_activation_boundary(
     )
     db.upsert_feedback(user.id, 219, "down")
 
-    ranked_20 = _score_and_rank(candidates, cand_embs, db, config, embedder)
+    ranked_20 = _score_and_rank(candidates, cand_embs, db, config, _real_embedder)
 
     assert len(ranked_19) == 3
     assert len(ranked_20) == 3
@@ -2823,7 +3156,7 @@ def test_tier1_active_at_tier3_activation_boundary(
     )
 
 
-def test_three_way_blend_at_30_30(db: Database, embedder: Embedder) -> None:
+def test_three_way_blend_at_30_30(db: Database, _real_embedder: Embedder) -> None:
     """30 up/30 down (n_feedback=60, α_2=1.0, α_3≈0.167) → tier2-t3 blend."""
     config = Config()
     user = db.create_user("test_token_three_way")
@@ -2882,8 +3215,8 @@ def test_three_way_blend_at_30_30(db: Database, embedder: Embedder) -> None:
             source="hn",
         ),
     ]
-    cand_embs = embedder.encode([s.text_content for s in candidates])
-    ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
+    cand_embs = _real_embedder.encode([s.text_content for s in candidates])
+    ranked = _score_and_rank(candidates, cand_embs, db, config, _real_embedder)
 
     assert len(ranked) == 3
     # Tier2 + tier3 blend: finance first, baking last
@@ -2906,7 +3239,7 @@ def test_three_way_blend_at_30_30(db: Database, embedder: Embedder) -> None:
     ],
 )
 def test_blend_weights_monotonic(
-    db: Database, embedder: Embedder, n_up: int, n_down: int
+    db: Database, _real_embedder: Embedder, n_up: int, n_down: int
 ) -> None:
     """Verify blend weights change monotonically with feedback count."""
     config = Config()
@@ -2968,8 +3301,8 @@ def test_blend_weights_monotonic(
         ),
     ]
     # All equal score/time so gravity gives equal tier1 scores
-    cand_embs = embedder.encode([s.text_content for s in candidates])
-    ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
+    cand_embs = _real_embedder.encode([s.text_content for s in candidates])
+    ranked = _score_and_rank(candidates, cand_embs, db, config, _real_embedder)
 
     assert len(ranked) == 3
     n_fb = n_up + n_down
@@ -2988,7 +3321,7 @@ def test_blend_weights_monotonic(
         )
 
 
-def test_three_way_weights_sum_to_one(db: Database, embedder: Embedder) -> None:
+def test_three_way_weights_sum_to_one(db: Database, _real_embedder: Embedder) -> None:
     """At 50 up/50 down, α_2=1.0, α_3=0.5, weights: t1=0, t2=0.5, t3=0.5.
     Finance should still rank first, baking last."""
     config = Config()
@@ -3048,15 +3381,15 @@ def test_three_way_weights_sum_to_one(db: Database, embedder: Embedder) -> None:
             source="hn",
         ),
     ]
-    cand_embs = embedder.encode([s.text_content for s in candidates])
-    ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
+    cand_embs = _real_embedder.encode([s.text_content for s in candidates])
+    ranked = _score_and_rank(candidates, cand_embs, db, config, _real_embedder)
 
     assert len(ranked) == 3
     assert ranked[0].story.id == 2
     assert ranked[-1].story.id == 3
 
 
-def test_tier3_pure_at_80_each(db: Database, embedder: Embedder) -> None:
+def test_tier3_pure_at_80_each(db: Database, _real_embedder: Embedder) -> None:
     """80 up/80 down (n_min=80, α_3=1.0) → pure tier3 SVM ranking."""
     config = Config()
     user = db.create_user("test_token_pure_tier3")
@@ -3115,8 +3448,8 @@ def test_tier3_pure_at_80_each(db: Database, embedder: Embedder) -> None:
             source="hn",
         ),
     ]
-    cand_embs = embedder.encode([s.text_content for s in candidates])
-    ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
+    cand_embs = _real_embedder.encode([s.text_content for s in candidates])
+    ranked = _score_and_rank(candidates, cand_embs, db, config, _real_embedder)
 
     assert len(ranked) == 3
     assert ranked[0].story.id == 2
@@ -3134,8 +3467,10 @@ def test_novel_archive_pass_surfaces_archive_novel(
 
     This test constructs archive candidates with low max_sim (novel-
     qualifying) and asserts they appear in `final` with is_novel=True.
-    The top 2 by distance (sim 0.05, 0.10) are picked by the
-    novel-archive pass (slot_limit=5).
+    The archive fillers outnumber PRIMARY_ARCHIVE_HN so Primary is fully
+    saturated by fillers (higher score), leaving the low-score novel
+    targets in the Explore pool; the novel pass then sorts by distance
+    (= 1 - sim) desc and takes the top DISCOVERY_PER_BADGE.
     """
     config = Config(count=40)
     user = db.create_user("test_novel_archive")
@@ -3154,20 +3489,24 @@ def test_novel_archive_pass_surfaces_archive_novel(
     db.upsert_feedback(user.id, 100, "up")
 
     now = int(time.time())
+    from pipeline import DISCOVERY_PER_BADGE
+    from pipeline.ranking import PRIMARY_ARCHIVE_HN
+
+    n_archive_filler = PRIMARY_ARCHIVE_HN + 4
+    novel_sims = [round(0.05 + 0.05 * i, 2) for i in range(DISCOVERY_PER_BADGE + 1)]
+
     # Setup:
     #   12 recent primary (high score, sim 0.5) fill the primary ranked set.
-    #   12 archive fillers (high score, sim 0.5) — they have sim 0.5 too,
-    #     so they don't qualify as novel and are not picked by novel-archive
-    #     (which sorts by distance desc).
-    #   4 archive novel targets (low score, sim 0.05..0.20) — the test target.
-    # Archive novel sims: [0.05, 0.10, 0.15, 0.20]. The novel-archive pass
-    # sorts by distance (= 1 - sim) desc and takes the top 5. All 4 novel
-    # targets have higher distance than the archive fillers (sim 0.5 →
-    # dist 0.5), so the top of the novel-archive pool is the 4 novel
-    # targets; the pass picks 4 of them and (with slot_limit=5) leaves room
-    # for an additional 1 archive filler (the 4th filler is the 5th by
-    # distance, with sim 0.5 → dist 0.5, tied with the others — last pick
-    # depends on stable sort order).
+    #   n_archive_filler archive fillers (high score, sim 0.5) — they have
+    #     sim 0.5 too, so they don't qualify as novel, and there are more of
+    #     them than PRIMARY_ARCHIVE_HN so Primary is saturated by fillers
+    #     alone, none of the novel targets below leak into Primary.
+    #   DISCOVERY_PER_BADGE+1 archive novel targets (low score, sim 0.05..)
+    #     — one more than the cap, so the worst can be asserted excluded.
+    # Fillers outscore novel targets (200+ vs 5), so Primary picks the top
+    # PRIMARY_ARCHIVE_HN fillers, leaving all novel targets (plus the filler
+    # overflow) in the Explore pool; the novel pass there sorts by distance
+    # (= 1 - sim) desc and takes the top DISCOVERY_PER_BADGE.
     candidates = []
     for i in range(12):
         candidates.append(
@@ -3182,7 +3521,7 @@ def test_novel_archive_pass_surfaces_archive_novel(
                 comment_count=0,
             )
         )
-    for i in range(12):
+    for i in range(n_archive_filler):
         candidates.append(
             Story(
                 id=12 + i,
@@ -3195,10 +3534,11 @@ def test_novel_archive_pass_surfaces_archive_novel(
                 comment_count=0,
             )
         )
-    for i, sim in enumerate([0.05, 0.10, 0.15, 0.20]):
+    novel_id_base = 12 + n_archive_filler
+    for i, sim in enumerate(novel_sims):
         candidates.append(
             Story(
-                id=24 + i,
+                id=novel_id_base + i,
                 title=f"ANovel {i}",
                 url=None,
                 score=5,
@@ -3209,39 +3549,39 @@ def test_novel_archive_pass_surfaces_archive_novel(
             )
         )
 
-    cand_embs = np.zeros((28, 384), dtype=np.float32)
+    n_candidates = len(candidates)
+    cand_embs = np.zeros((n_candidates, 384), dtype=np.float32)
     for i in range(12):
         cand_embs[i, 0] = 0.5
         cand_embs[i, 50 + i] = np.sqrt(0.75)
-    for i in range(12):
+    for i in range(n_archive_filler):
         cand_embs[12 + i, 0] = 0.5
         cand_embs[12 + i, 150 + i] = np.sqrt(0.75)
-    for i, s in enumerate([0.05, 0.10, 0.15, 0.20]):
-        cand_embs[24 + i, 0] = s
-        cand_embs[24 + i, 300 + i] = np.sqrt(max(1.0 - s * s, 0.0))
+    for i, s in enumerate(novel_sims):
+        cand_embs[novel_id_base + i, 0] = s
+        cand_embs[novel_id_base + i, 300 + i] = np.sqrt(max(1.0 - s * s, 0.0))
 
     ranked = rerank_candidates(
         db, config, embedder, candidates, cand_embs, user_id=user.id
     )
 
     by_id = {r.story.id: r for r in ranked}
-    # With per-combo DISCOVERY_PER_BADGE=2, only the top 2 by distance
-    # (ids 24 and 25, sim=0.05, 0.10) get is_novel. The other two
-    # (ids 26, 27) may appear via other passes (Popular, Similar, etc.)
-    # but should not have is_novel.
-    from pipeline import DISCOVERY_PER_BADGE
-
-    novel_ids = [
-        aid for aid in (24, 25, 26, 27) if aid in by_id and by_id[aid].is_novel
-    ]
+    novel_ids_all = [novel_id_base + i for i in range(len(novel_sims))]
+    # With per-combo DISCOVERY_PER_BADGE, only the top-N by distance get
+    # is_novel; the one extra target (worst sim) may appear via other
+    # passes (Popular, Similar, etc.) but should not have is_novel.
+    novel_ids = [aid for aid in novel_ids_all if aid in by_id and by_id[aid].is_novel]
     assert len(novel_ids) >= DISCOVERY_PER_BADGE, (
         f"Expected at least {DISCOVERY_PER_BADGE} novel picks, got {novel_ids}"
     )
-    # The top by distance (sim 0.05, 0.10) must be among the novel picks.
-    for aid in (24, 25):
+    # The top by distance must be among the novel picks.
+    for aid, sim_label in zip(
+        novel_ids_all[:DISCOVERY_PER_BADGE],
+        (f"{sim:.2f}" for sim in novel_sims[:DISCOVERY_PER_BADGE]),
+    ):
         assert aid in by_id, f"Archive novel id={aid} should be in final"
         assert by_id[aid].is_novel, (
-            f"Archive novel id={aid} (sim={'0.05' if aid == 24 else '0.10'}) should have is_novel=True"
+            f"Archive novel id={aid} (sim={sim_label}) should have is_novel=True"
         )
         assert not by_id[aid].is_recent, (
             f"Archive novel id={aid} should be is_recent=False"
@@ -3251,27 +3591,26 @@ def test_novel_archive_pass_surfaces_archive_novel(
 def test_each_badge_floored_at_five_per_cohort(
     db: Database, embedder: Embedder
 ) -> None:
-    """Every non-Hot badge must appear >=5 times in recent AND >=5 times
-    in archive of the final deck (the user's explicit "at least (5,5)
-    for each" expectation).
+    """Every non-Hot badge must appear >=DISCOVERY_PER_BADGE times in recent
+    AND >=DISCOVERY_PER_BADGE times in archive of the final deck (the
+    user's explicit "at least (N,N) for each" expectation).
 
-    The rank-based cascade guarantees this via per-cohort top-5
-    discovery passes for each non-Hot badge:
-      cascade: hot, high-engagement-recent/archive, discussion-recent/archive
-      parallel (with stacking): novel-recent/archive, similar-recent/archive,
-                                 uncertain-recent/archive
-    Each pass takes the top 5 stories in its age cohort by the badge
-    metric. The cascade passes are mutually exclusive; the parallel
-    passes can stack with each other and with cascade picks.
+    The rank-based cascade guarantees this via per-cohort top-N discovery
+    passes for each non-Hot badge:
+      cascade (mutually exclusive): hot, high-engagement, discussion
+      explore (also mutually exclusive with each other, but independent
+               of the cascade so a card can carry both): novel, similar,
+               uncertain
+    Each pass takes the top DISCOVERY_PER_BADGE stories in its age cohort
+    by the badge metric.
 
-    Pool sizing: 30 recent + 30 archive is the minimum safe cohort size
-    for the structural floor to hold. With ``primary_limit=12`` and 3
-    cascade passes per cohort consuming up to 15 candidates (5+5+5),
-    the worst case (primary takes 12 + cascade takes 15 = 27) leaves
-    ``30 - 27 = 3`` in the cohort for the parallel group — still
-    enough to fill the 5-slot cap (the cap is the *target*; if the
-    cohort has fewer candidates we get fewer). For this test we size
-    the cohorts so the floor (5 per cohort per badge) holds.
+    Pool sizing: because Explore's three passes are serial (each excludes
+    the previous pass's picks), the explore-eligible remainder of a
+    cohort — pool size minus that combo's primary quota — must hold at
+    least ``3 * DISCOVERY_PER_BADGE`` candidates for every badge to reach
+    the floor. Sized dynamically below from ``PRIMARY_PER_COMBO`` /
+    ``PRIMARY_ARCHIVE_HN`` and ``DISCOVERY_PER_BADGE`` with a +5 margin,
+    so the floor holds regardless of the constant's current value.
 
     Feedback: 20 distinct upvotes, 20 distinct downvotes, 20 distinct
     neutral. The feedback table has a UNIQUE(user_id, story_id, action)
@@ -3330,10 +3669,21 @@ def test_each_badge_floored_at_five_per_cohort(
         )
         db.upsert_feedback(user.id, 880 + i, "neutral")
 
+    from pipeline import DISCOVERY_PER_BADGE
+    from pipeline.ranking import PRIMARY_ARCHIVE_HN, PRIMARY_PER_COMBO
+
+    # Explore's Unsure/Novel/Similar passes are serial (mutually exclusive,
+    # see ranking.py), so each cohort's explore-eligible pool (pool size
+    # minus that combo's primary quota) must hold at least
+    # 3 * DISCOVERY_PER_BADGE candidates for every badge to reach the floor;
+    # +5 margin keeps this from being a knife's-edge fit.
+    n_recent = PRIMARY_PER_COMBO + 3 * DISCOVERY_PER_BADGE + 5
+    n_archive = PRIMARY_ARCHIVE_HN + 3 * DISCOVERY_PER_BADGE + 5
+
     now = int(time.time())
     candidates: list[Story] = []
-    # 30 recent (3d old), distinct texts, scores 100..390, cc 20..165.
-    for i in range(30):
+    # Recent (3d old), distinct texts, ascending scores/comment counts.
+    for i in range(n_recent):
         candidates.append(
             Story(
                 id=i,
@@ -3349,8 +3699,8 @@ def test_each_badge_floored_at_five_per_cohort(
                 comment_count=20 + i * 5,
             )
         )
-    # 30 archive (90d old), distinct texts, scores 500..1950, cc 200..780.
-    for i in range(30):
+    # Archive (90d old), distinct texts, ascending scores/comment counts.
+    for i in range(n_archive):
         candidates.append(
             Story(
                 id=100 + i,
@@ -3376,8 +3726,6 @@ def test_each_badge_floored_at_five_per_cohort(
     archive = [r for r in ranked if not r.is_recent]
     assert len(recent) >= 2, f"recent cohort too small in final: {len(recent)}"
     assert len(archive) >= 2, f"archive cohort too small in final: {len(archive)}"
-
-    from pipeline import DISCOVERY_PER_BADGE
 
     for attr in (
         "is_high_engagement",
@@ -3406,22 +3754,32 @@ def _make_combo_deck_inputs() -> tuple[
 ]:
     """Build synthetic inputs for a direct ``_assemble_combo_deck`` call.
 
-    24 recent HN candidates: ids 0-11 score high enough to fill
-    ``PRIMARY_PER_COMBO`` (12) and land in Primary; ids 12-23 score low
-    (never Hot/Top/Talk-eligible) and form the Explore-only pool, split
-    into three disjoint groups of 4 for Unsure/Novel/Similar respectively:
-      - Unsure pool: ids 12-15, each with a distinct prob_down (entropy
-        peaks at prob_down=1/3 and falls off monotonically toward 1, so
-        prob_down=0.34/0.5/0.7/0.9 gives strictly *decreasing* entropy
-        12 > 13 > 14 > 15).
-      - Novel pool: ids 16-19, cand_max_sim strictly increasing 16 < 17 <
-        18 < 19 (novel sort key = 1 - max_sim, so 16 is most novel). All
-        other ids default to max_sim=0.99 (i.e. "not novel") so they can't
-        outrank the intended novel pool.
-      - Similar pool: ids 20-23, cand_closest_up strictly decreasing
-        20 > 21 > 22 > 23 (20 is most similar). All other ids default to
-        closest_up=0.0, below every value in the similar pool.
+    12 recent HN primary candidates (ids 0-11, high score) fill
+    ``PRIMARY_PER_COMBO`` (12) and land in Primary. Three disjoint,
+    low-score Explore-only groups of ``DISCOVERY_PER_BADGE + 2`` ids each
+    follow — one extra beyond the cap so a feedback-match test can exclude
+    the top pick and still have more than enough left to fill the badge,
+    leaving the single worst candidate excluded:
+      - Unsure pool (starts at ``UNSURE_BASE``=12): each id gets a distinct
+        prob_down (entropy peaks at prob_down=1/3 and falls off
+        monotonically toward 1, so prob_down values increasing from 0.34
+        give strictly *decreasing* entropy in id order).
+      - Novel pool (starts right after Unsure): cand_max_sim strictly
+        increasing (novel sort key = 1 - max_sim, so the lowest-sim id is
+        most novel). All other ids default to max_sim=0.99 ("not novel")
+        so they can't outrank the intended novel pool.
+      - Similar pool (starts right after Novel): cand_closest_up strictly
+        decreasing (the highest-sim id is most similar). All other ids
+        default to closest_up=0.0, below every value in the similar pool.
     """
+    from pipeline import DISCOVERY_PER_BADGE
+
+    group_size = DISCOVERY_PER_BADGE + 2
+    unsure_base = 12
+    novel_base = unsure_base + group_size
+    similar_base = novel_base + group_size
+    n_total = similar_base + group_size
+
     now = int(time.time())
     candidates: list[Story] = []
     for i in range(12):
@@ -3437,7 +3795,7 @@ def _make_combo_deck_inputs() -> tuple[
                 comment_count=0,
             )
         )
-    for i in range(12, 24):
+    for i in range(12, n_total):
         candidates.append(
             Story(
                 id=i,
@@ -3459,7 +3817,10 @@ def _make_combo_deck_inputs() -> tuple[
         )
         for s in candidates
     ]
-    unsure_probs = {12: 0.34, 13: 0.5, 14: 0.7, 15: 0.9}
+    unsure_probs = {
+        unsure_base + i: round(0.34 + 0.6 * i / (group_size - 1), 4)
+        for i in range(group_size)
+    }
     ranked = [
         replace(
             r,
@@ -3479,12 +3840,18 @@ def _make_combo_deck_inputs() -> tuple[
     cand_velocities = np.array([0.0 for _ in candidates], dtype=np.float32)
 
     cand_max_sim = np.full(len(candidates), 0.99, dtype=np.float32)
-    novel_sims = {16: 0.1, 17: 0.4, 18: 0.6, 19: 0.9}
+    novel_sims = {
+        novel_base + i: round(0.05 + 0.9 * i / (group_size - 1), 4)
+        for i in range(group_size)
+    }
     for sid, sim in novel_sims.items():
         cand_max_sim[story_id_to_idx[sid]] = sim
 
     cand_closest_up = np.zeros(len(candidates), dtype=np.float32)
-    similar_sims = {20: 0.9, 21: 0.6, 22: 0.4, 23: 0.1}
+    similar_sims = {
+        similar_base + i: round(0.95 - 0.9 * i / (group_size - 1), 4)
+        for i in range(group_size)
+    }
     for sid, sim in similar_sims.items():
         cand_closest_up[story_id_to_idx[sid]] = sim
 
@@ -3506,14 +3873,24 @@ def test_explore_badges_backfill_past_feedback_matches() -> None:
     user already voted on — a duplicate that ``canonicalize_hn_dupes`` would
     drop downstream with no replacement, silently shrinking the deck.
     """
+    from pipeline import DISCOVERY_PER_BADGE
+
     config = Config(count=40)
     ranked, recent_cutoff, cand_scores, cand_velocities, idx_for, explore = (
         _make_combo_deck_inputs()
     )
 
-    # The best-ranked candidate in each badge's pool duplicates feedback:
-    # id 12 (highest entropy), id 16 (most novel), id 20 (most similar).
-    feedback_matched_ids = {12, 16, 20}
+    # group_size = DISCOVERY_PER_BADGE + 2 ids per badge pool (see
+    # _make_combo_deck_inputs); group index 0 is the best-ranked candidate
+    # in each pool (highest entropy / most novel / most similar), and the
+    # last index is the worst.
+    group_size = DISCOVERY_PER_BADGE + 2
+    unsure_base = 12
+    novel_base = unsure_base + group_size
+    similar_base = novel_base + group_size
+
+    # The best-ranked candidate in each badge's pool duplicates feedback.
+    feedback_matched_ids = {unsure_base, novel_base, similar_base}
 
     def is_feedback_match(story: Story) -> bool:
         return story.id in feedback_matched_ids
@@ -3530,8 +3907,6 @@ def test_explore_badges_backfill_past_feedback_matches() -> None:
         is_feedback_match=is_feedback_match,
     )
 
-    from pipeline import DISCOVERY_PER_BADGE
-
     unsure_ids = {r.story.id for r in final if r.is_uncertain}
     novel_ids = {r.story.id for r in final if r.is_novel}
     similar_ids = {r.story.id for r in final if r.is_similar}
@@ -3541,22 +3916,34 @@ def test_explore_badges_backfill_past_feedback_matches() -> None:
     assert len(similar_ids) == DISCOVERY_PER_BADGE, similar_ids
 
     # The feedback-matched top pick in each pool must be excluded ...
-    assert 12 not in unsure_ids
-    assert 16 not in novel_ids
-    assert 20 not in similar_ids
-    # ... and backfilled with the next-best candidate in that pool.
-    assert unsure_ids == {13, 14}
-    assert novel_ids == {17, 18}
-    assert similar_ids == {21, 22}
+    assert unsure_base not in unsure_ids
+    assert novel_base not in novel_ids
+    assert similar_base not in similar_ids
+    # ... and backfilled with the next-best candidates in that pool, with
+    # the single worst candidate (last index) dropped for lack of room.
+    assert unsure_ids == set(
+        range(unsure_base + 1, unsure_base + 1 + DISCOVERY_PER_BADGE)
+    )
+    assert novel_ids == set(range(novel_base + 1, novel_base + 1 + DISCOVERY_PER_BADGE))
+    assert similar_ids == set(
+        range(similar_base + 1, similar_base + 1 + DISCOVERY_PER_BADGE)
+    )
 
 
 def test_explore_badges_no_feedback_match_predicate_is_unaffected() -> None:
     """``is_feedback_match=None`` (cold-deck / no-feedback path) preserves
     the pre-existing top-N-by-rank behavior exactly."""
+    from pipeline import DISCOVERY_PER_BADGE
+
     config = Config(count=40)
     ranked, recent_cutoff, cand_scores, cand_velocities, idx_for, explore = (
         _make_combo_deck_inputs()
     )
+
+    group_size = DISCOVERY_PER_BADGE + 2
+    unsure_base = 12
+    novel_base = unsure_base + group_size
+    similar_base = novel_base + group_size
 
     final = ranking._assemble_combo_deck(
         ranked,
@@ -3574,9 +3961,177 @@ def test_explore_badges_no_feedback_match_predicate_is_unaffected() -> None:
     novel_ids = {r.story.id for r in final if r.is_novel}
     similar_ids = {r.story.id for r in final if r.is_similar}
 
-    assert unsure_ids == {12, 13}
-    assert novel_ids == {16, 17}
-    assert similar_ids == {20, 21}
+    assert unsure_ids == set(range(unsure_base, unsure_base + DISCOVERY_PER_BADGE))
+    assert novel_ids == set(range(novel_base, novel_base + DISCOVERY_PER_BADGE))
+    assert similar_ids == set(range(similar_base, similar_base + DISCOVERY_PER_BADGE))
+
+
+def _make_mixed_combo_deck_inputs(
+    n_recent_hn: int,
+    n_recent_nonhn: int,
+    n_archive_hn: int,
+    n_archive_nonhn: int,
+) -> tuple[
+    list[RankedStory],
+    int,
+    NDArray[np.float32],
+    NDArray[np.float32],
+    Callable[[int], int],
+]:
+    """Build a ``ranked`` list spanning all four age/source cells, for
+    testing ``_assemble_combo_deck``'s combo assignment directly.
+
+    Ids are assigned by cell so callers can identify which cell a result
+    came from: recent_hn -> 0.., recent_nonhn -> 1000.., archive_hn ->
+    2000.., archive_nonhn -> 3000... Every candidate gets a distinct score
+    (higher id = lower score within a cell) so top-N selection is
+    deterministic.
+    """
+    now = int(time.time())
+    recent_cutoff = now - 30 * 86400
+    candidates: list[Story] = []
+
+    def _add(n: int, id_base: int, source: str, recent: bool) -> None:
+        story_time = now - 3600 if recent else recent_cutoff - 3600
+        for i in range(n):
+            candidates.append(
+                Story(
+                    id=id_base + i,
+                    title=f"{source} {i}",
+                    url=None,
+                    score=1000 - i,
+                    time=story_time,
+                    text_content=f"{source} story {i}",
+                    source=source,
+                    comment_count=0,
+                )
+            )
+
+    _add(n_recent_hn, 0, "hn", recent=True)
+    _add(n_recent_nonhn, 1000, "rss_a", recent=True)
+    _add(n_archive_hn, 2000, CH_ARCHIVE_SOURCE, recent=False)
+    _add(n_archive_nonhn, 3000, "rss_a", recent=False)
+
+    ranked = [
+        RankedStory(story=s, score=float(s.score), best_match_title="")
+        for s in candidates
+    ]
+    idx_for = {s.id: idx for idx, s in enumerate(candidates)}.__getitem__
+    cand_scores = np.array([s.score for s in candidates], dtype=np.float32)
+    cand_velocities = np.zeros(len(candidates), dtype=np.float32)
+    return ranked, recent_cutoff, cand_scores, cand_velocities, idx_for
+
+
+def test_assemble_combo_deck_never_emits_archive_nonhn() -> None:
+    """archive_nonhn (time < recent_cutoff AND non-HN source) is
+    structurally unreachable in production (see PRIMARY_RECENT_NONHN /
+    PRIMARY_ARCHIVE_HN comment in pipeline/ranking.py) and was retired
+    from COMBO_DEFS. Even when the input `ranked` list does contain rows
+    that would fall in that cell (e.g. if a future config change widened
+    the RSS leg's window past 30 days), no emitted combo_keys may
+    reference it — regression guard against the dead combo silently
+    reappearing.
+    """
+    config = Config(count=40)
+    ranked, recent_cutoff, cand_scores, cand_velocities, idx_for = (
+        _make_mixed_combo_deck_inputs(
+            n_recent_hn=4, n_recent_nonhn=4, n_archive_hn=4, n_archive_nonhn=4
+        )
+    )
+
+    final = ranking._assemble_combo_deck(
+        ranked,
+        config=config,
+        recent_cutoff=recent_cutoff,
+        cand_scores=cand_scores,
+        cand_velocities=cand_velocities,
+        idx_for=idx_for,
+        embeddings_map=None,
+        explore=None,
+    )
+
+    assert 3000 not in {r.story.id for r in final}, (
+        "archive_nonhn candidates must never be selected"
+    )
+    for r in final:
+        assert "archive_non-hn" not in r.combo_keys, r.combo_keys
+
+
+def test_assemble_combo_deck_honours_asymmetric_primary_limits() -> None:
+    """Per-combo primary quotas after retiring archive_nonhn: recent_hn
+    keeps PRIMARY_PER_COMBO, recent_nonhn and archive_hn absorb its freed
+    slots (see WORKLOG 2026-08-30).
+
+    Checked via the combo_primary_<id> trace counter rather than by
+    re-deriving primary membership from combo_keys — Popular badges (Hot/
+    Top/Talk, HN only) can append additional cards beyond primary_limit
+    when the combo pool is large, so combo_keys membership alone
+    overcounts primary for recent_hn/archive_hn.
+    """
+    from pipeline.ranking import (
+        PRIMARY_ARCHIVE_HN,
+        PRIMARY_PER_COMBO,
+        PRIMARY_RECENT_NONHN,
+    )
+
+    config = Config(count=200)
+    # Oversupply every cell so the primary_limit, not pool size, binds.
+    n = max(PRIMARY_PER_COMBO, PRIMARY_RECENT_NONHN, PRIMARY_ARCHIVE_HN) + 10
+    ranked, recent_cutoff, cand_scores, cand_velocities, idx_for = (
+        _make_mixed_combo_deck_inputs(
+            n_recent_hn=n, n_recent_nonhn=n, n_archive_hn=n, n_archive_nonhn=0
+        )
+    )
+    trace = RankTrace()
+
+    ranking._assemble_combo_deck(
+        ranked,
+        config=config,
+        recent_cutoff=recent_cutoff,
+        cand_scores=cand_scores,
+        cand_velocities=cand_velocities,
+        idx_for=idx_for,
+        embeddings_map=None,
+        explore=None,
+        trace=trace,
+    )
+
+    assert trace.counts["combo_primary_recent_hn"] == PRIMARY_PER_COMBO
+    assert trace.counts["combo_primary_recent_nonhn"] == PRIMARY_RECENT_NONHN
+    assert trace.counts["combo_primary_archive_hn"] == PRIMARY_ARCHIVE_HN
+
+
+def test_assemble_combo_deck_sets_trace_counters_for_three_combos() -> None:
+    """Trace counters are emitted for exactly the three surviving combos —
+    no archive_nonhn counters, since that combo no longer exists."""
+    config = Config(count=40)
+    ranked, recent_cutoff, cand_scores, cand_velocities, idx_for = (
+        _make_mixed_combo_deck_inputs(
+            n_recent_hn=2, n_recent_nonhn=2, n_archive_hn=2, n_archive_nonhn=2
+        )
+    )
+    trace = RankTrace()
+
+    ranking._assemble_combo_deck(
+        ranked,
+        config=config,
+        recent_cutoff=recent_cutoff,
+        cand_scores=cand_scores,
+        cand_velocities=cand_velocities,
+        idx_for=idx_for,
+        embeddings_map=None,
+        explore=None,
+        trace=trace,
+    )
+
+    for combo_id in ("recent_hn", "recent_nonhn", "archive_hn"):
+        assert f"combo_pool_{combo_id}" in trace.counts
+        assert f"combo_primary_{combo_id}" in trace.counts
+        assert f"combo_badges_{combo_id}" in trace.counts
+    assert "combo_pool_archive_nonhn" not in trace.counts
+    # The archive_nonhn rows in the input are simply invisible to every
+    # combo — not merged into archive_hn or any other cell.
+    assert trace.counts["combo_pool_archive_hn"] == 2
 
 
 def test_cascade_badges_mutually_exclusive(db: Database, embedder: Embedder) -> None:
@@ -3946,13 +4501,15 @@ def test_hot_badge_threshold_uses_config_percentile(
     assert len(hot_ids) == 1, f"Expected 1 hot at p99.5, got {len(hot_ids)}"
 
     # 50th pct: p50 ≈ 105. Ids 0..9 clear the threshold. Slot cap is
-    # DISCOVERY_PER_BADGE, so only the top 2 by velocity get Hot.
+    # DISCOVERY_PER_BADGE, so only the top DISCOVERY_PER_BADGE by velocity
+    # get Hot.
     config2 = Config(count=40, model=ModelConfig(hot_badge_percentile=50.0))
     ranked2 = rerank_candidates(db, config2, embedder, candidates, cand_embs)
     hot2 = {r.story.id for r in ranked2 if r.is_hot}
-    assert 0 in hot2
-    assert 1 in hot2
-    assert 2 not in hot2, "Should only get DISCOVERY_PER_BADGE hot cards"
+    assert set(range(DISCOVERY_PER_BADGE)) <= hot2
+    assert DISCOVERY_PER_BADGE not in hot2, (
+        "Should only get DISCOVERY_PER_BADGE hot cards"
+    )
     assert len(hot2) == DISCOVERY_PER_BADGE, (
         f"Expected {DISCOVERY_PER_BADGE} hot at p50, got {len(hot2)}"
     )
@@ -4009,7 +4566,9 @@ def test_tier1_gravity_at_zero_feedback(db: Database, embedder: Embedder) -> Non
     assert gravity_sorted[0].story.id == 2
 
 
-def test_tier3_svm_at_60_plus_with_gates(db: Database, embedder: Embedder) -> None:
+def test_tier3_svm_at_60_plus_with_gates(
+    db: Database, _real_embedder: Embedder
+) -> None:
     """30 up + 30 down: both gates pass, α=(30-20)/60=0.167, ranking correct."""
     config = Config()
     user = db.create_user("test_token_tier3")
@@ -4057,9 +4616,9 @@ def test_tier3_svm_at_60_plus_with_gates(db: Database, embedder: Embedder) -> No
             text_content="Delicious chocolate chip cake baking guide.",
         ),
     ]
-    cand_embs = embedder.encode([s.text_content for s in candidates])
+    cand_embs = _real_embedder.encode([s.text_content for s in candidates])
 
-    ranked = _score_and_rank(candidates, cand_embs, db, config, embedder)
+    ranked = _score_and_rank(candidates, cand_embs, db, config, _real_embedder)
 
     assert len(ranked) == 2
     # AI story should rank first (SVM learned upvote pattern)
@@ -4073,7 +4632,7 @@ def test_tier3_svm_at_60_plus_with_gates(db: Database, embedder: Embedder) -> No
 def _seed_feedback(db: Database, user_id: int, n_up: int, n_down: int) -> None:
     import hashlib
 
-    model_version = "all-MiniLM-L6-v2|mean|norm|256"
+    model_version = Embedder.model_version
     for i in range(n_up):
         story = Story(
             id=100 + i,
@@ -4177,15 +4736,39 @@ def test_min_class_blend_mid(db: Database, embedder: Embedder) -> None:
 # ── Comment selection algorithm tests ──
 
 
+def _ranked_comment(
+    cid: int,
+    text: str,
+    *,
+    depth: int = 0,
+    thread: int = 0,
+    order: tuple[int, ...] = (0,),
+    descendants: int = 0,
+    text_len: int = 80,
+) -> RankedComment:
+    return {
+        "id": cid,
+        "text": text,
+        "score": 0,
+        "depth": depth,
+        "top_thread_index": thread,
+        "sibling_index": cid,
+        "order_path": order,
+        "reply_count": 0,
+        "descendant_count": descendants,
+        "text_len": text_len,
+    }
+
+
 def test_comment_rank_key_no_score_dimension():
     """_comment_rank_key no longer includes the score (depth-penalty) dimension."""
     from pipeline import _comment_rank_key
 
     keys = [
         _comment_rank_key(
-            {"descendant_count": 10, "text_len": 200, "order_path": (0,)}
+            _ranked_comment(1, "c0", order=(0,), descendants=10, text_len=200)
         ),
-        _comment_rank_key({"descendant_count": 0, "text_len": 500, "order_path": (1,)}),
+        _comment_rank_key(_ranked_comment(2, "c1", thread=1, order=(1,), text_len=500)),
     ]
     assert len(keys[0]) == 3  # descendant_count, text_len, order_path
     # Higher descendant_count sorts first
@@ -4196,22 +4779,13 @@ def test_select_top_comments_drops_low_quality_toplevel():
     """Short, low-reply top-level should not be selected as 'good'."""
     from pipeline import _select_top_comments
 
-    good = {
-        "text": "Long substantive comment with a lot of text content that should easily pass the good top-level minimum length requirement and be useful for TLDR summaries.",
-        "depth": 0,
-        "descendant_count": 0,
-        "top_thread_index": 0,
-        "text_len": 200,
-        "order_path": (0,),
-    }
-    bad = {
-        "text": "Nice article!",
-        "depth": 0,
-        "descendant_count": 0,
-        "top_thread_index": 1,
-        "text_len": 14,
-        "order_path": (1,),
-    }
+    good = _ranked_comment(
+        1,
+        "Long substantive comment with a lot of text content that should easily pass the good top-level minimum length requirement and be useful for TLDR summaries.",
+        order=(0,),
+        text_len=200,
+    )
+    bad = _ranked_comment(2, "Nice article!", thread=1, order=(1,), text_len=14)
     selected = _select_top_comments([bad, good], limit=1)
     sel_texts = [c["text"] for c in selected]
     assert any("Long substantive comment" in t for t in sel_texts)
@@ -4222,25 +4796,23 @@ def test_select_top_comments_adaptive_cores_small_story():
     from pipeline import _select_top_comments
 
     roots = [
-        {
-            "text": f"Substantive top-level {i} with enough text to pass the good top-level threshold.",
-            "depth": 0,
-            "descendant_count": 5,
-            "top_thread_index": i,
-            "text_len": 80,
-            "order_path": (i,),
-        }
+        _ranked_comment(
+            100 + i,
+            f"Substantive top-level {i} with enough text to pass the good top-level threshold.",
+            thread=i,
+            order=(i,),
+            descendants=5,
+        )
         for i in range(2)
     ]
     replies = [
-        {
-            "text": f"Substantive reply {i} with enough context to pass the minimum length for comment extraction.",
-            "depth": 1,
-            "descendant_count": 0,
-            "top_thread_index": 0,
-            "text_len": 100,
-            "order_path": (0, i),
-        }
+        _ranked_comment(
+            200 + i,
+            f"Substantive reply {i} with enough context to pass the minimum length for comment extraction.",
+            depth=1,
+            order=(0, i),
+            text_len=100,
+        )
         for i in range(5)
     ]
     selected = _select_top_comments(roots + replies, limit=10)
@@ -4257,27 +4829,28 @@ def test_select_top_comments_top_level_budget_caps():
     from pipeline import _select_top_comments
 
     top_level = [
-        {
-            "text": f"Top {i} with enough text to pass the quality threshold.",
-            "depth": 0,
-            "descendant_count": 10,
-            "top_thread_index": i,
-            "text_len": 100,
-            "order_path": (i,),
-        }
+        _ranked_comment(
+            i,
+            f"Top {i} with enough text to pass the quality threshold.",
+            thread=i,
+            order=(i,),
+            descendants=10,
+            text_len=100,
+        )
         for i in range(30)
     ]
     # Replies in threads 4-7 have higher descendant_count than top-level (12 > 10),
     # so the filler prefers them over additional top-level, keeping count near budget.
     replies = [
-        {
-            "text": f"Reply {t}.{j} substantial text content for TLDR context and discussion summary.",
-            "depth": 1,
-            "descendant_count": 3 if t < 4 else 12,
-            "top_thread_index": t,
-            "text_len": 150,
-            "order_path": (t, j),
-        }
+        _ranked_comment(
+            1000 + t * 10 + j,
+            f"Reply {t}.{j} substantial text content for TLDR context and discussion summary.",
+            depth=1,
+            thread=t,
+            order=(t, j),
+            descendants=3 if t < 4 else 12,
+            text_len=150,
+        )
         for t in range(8)
         for j in range(6)
     ]
@@ -4290,22 +4863,15 @@ def test_select_top_comments_long_reply_beats_short_toplevel():
     """A long, substantive reply should be selected over a short, low-reply top-level."""
     from pipeline import _select_top_comments
 
-    short_top = {
-        "text": "Short top-level.",
-        "depth": 0,
-        "descendant_count": 0,
-        "top_thread_index": 0,
-        "text_len": 18,
-        "order_path": (0,),
-    }
-    long_reply = {
-        "text": "Long substantive reply with enough text to easily pass the minimum extraction length and be useful.",
-        "depth": 2,
-        "descendant_count": 0,
-        "top_thread_index": 1,
-        "text_len": 110,
-        "order_path": (1,),
-    }
+    short_top = _ranked_comment(1, "Short top-level.", order=(0,), text_len=18)
+    long_reply = _ranked_comment(
+        2,
+        "Long substantive reply with enough text to easily pass the minimum extraction length and be useful.",
+        depth=2,
+        thread=1,
+        order=(1,),
+        text_len=110,
+    )
     selected = _select_top_comments([short_top, long_reply], limit=5)
     sel_texts = [c["text"] for c in selected]
     assert any("Long substantive reply" in t for t in sel_texts)
@@ -4333,6 +4899,40 @@ def test_min_comment_length_filter():
     assert len(texts) == 1  # only the 61-char comment passes
     assert "Short." not in texts[0]
     assert "Sixty-one character" in texts[0]
+
+
+def test_join_top_comments_uses_separator_and_budget() -> None:
+    """Stored top_comments join on a markdown boundary and never slice
+    a comment mid-way; blanks are skipped."""
+    from pipeline import join_top_comments
+    from pipeline.ranking import (
+        HN_COMMENTS_CACHE_CHAR_LIMIT,
+        HN_COMMENTS_SEPARATOR,
+    )
+
+    assert join_top_comments([]) == ""
+    assert join_top_comments(["  ", ""]) == ""
+    assert join_top_comments(["one"]) == "one"
+    joined = join_top_comments(["alpha", "beta", "gamma"])
+    assert joined == HN_COMMENTS_SEPARATOR.join(["alpha", "beta", "gamma"])
+    # Whole-or-nothing: a comment that would overflow the budget is
+    # dropped entirely instead of truncated mid-comment.
+    head = "h" * 100
+    exact = "t" * HN_COMMENTS_CACHE_CHAR_LIMIT
+    assert join_top_comments([head, exact]) == head
+    assert len(join_top_comments([head, exact])) <= HN_COMMENTS_CACHE_CHAR_LIMIT
+    # An oversized head must not block smaller comments behind it.
+    oversized = "t" * (HN_COMMENTS_CACHE_CHAR_LIMIT + 1)
+    assert join_top_comments([oversized, "small"]) == "small"
+    assert join_top_comments([oversized]) == ""
+
+
+def test_hn_comments_cache_limit_matches_prompt() -> None:
+    """Storage must retain everything the TLDR prompt will use."""
+    import server
+    from pipeline.ranking import HN_COMMENTS_CACHE_CHAR_LIMIT
+
+    assert HN_COMMENTS_CACHE_CHAR_LIMIT == server.COMMENT_PROMPT_CHAR_LIMIT
 
 
 def test_hot_badge_requires_minimum_score(db, embedder):
@@ -4396,6 +4996,58 @@ class _DummyEmbedder(Embedder):
         if len(texts):
             arr[:, 0] = 1.0
         return arr
+
+
+class _CountingDummyEmbedder(_DummyEmbedder):
+    def __init__(self) -> None:
+        super().__init__()
+        self.encode_calls = 0
+
+    def encode(
+        self, texts: list[str], batch_size: int | None = None
+    ) -> NDArray[np.float32]:
+        self.encode_calls += 1
+        return super().encode(texts, batch_size)
+
+
+def test_get_or_compute_embeddings_legacy_rows_all_hit_no_reencode() -> None:
+    """Contract rollout must not invalidate one stored row: legacy rows
+    (no sha/dim provenance) match by version+hash and encode never runs."""
+    import hashlib
+
+    db = Database(":memory:")
+    try:
+        stories = [
+            Story(
+                id=901 + i,
+                title=f"Legacy {i}",
+                url=None,
+                score=i,
+                time=1700000000,
+                text_content=f"legacy body {i}",
+            )
+            for i in range(3)
+        ]
+        for s in stories:
+            db.upsert_story(s)
+        embedder = _CountingDummyEmbedder()
+        for s in stories:
+            text_hash = hashlib.sha256(
+                story_embedding_text(s).encode("utf-8")
+            ).hexdigest()
+            db.upsert_embedding(
+                s.id,
+                embedder.model_version,
+                text_hash,
+                np.zeros(384, dtype=np.float32),
+            )
+
+        result = get_or_compute_embeddings(stories, embedder, db)
+
+        assert result.shape == (3, 384)
+        assert embedder.encode_calls == 0
+    finally:
+        db.close()
 
 
 def test_prewarm_top_stories_empty_list_returns_zero() -> None:
@@ -4742,11 +5394,12 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
     story when the slot cap forces a cut.
 
     With per-combo discovery slots (DISCOVERY_PER_BADGE), the cut is at
-    position 2. We construct scores so the 2nd-by-distance story has a
-    very low score; pure-distance ranking keeps it; a score-blended
-    ranking would have dropped it for a higher-score story.
+    position DISCOVERY_PER_BADGE. We construct scores so the last-kept
+    (by distance) story has a very low score; pure-distance ranking keeps
+    it; a score-blended ranking would have dropped it for the first
+    excluded (higher-score) story.
     """
-    from pipeline import PRIMARY_PER_COMBO
+    from pipeline import DISCOVERY_PER_BADGE, PRIMARY_PER_COMBO
 
     config = Config(count=40)
     user = db.create_user("test_novel_distance")
@@ -4767,8 +5420,9 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
 
     # Primary fillers (high score) + controlled extras (low score, varied sim).
     # The novel pass picks DISCOVERY_PER_BADGE by distance. We arrange so
-    # the 2nd-by-distance (id=13, sim=0.15, score=1) is low-score; a score-
-    # blended ranking would drop it for id=14 (sim=0.30, score=50).
+    # the last-by-distance kept id has a very low score, and the first
+    # excluded id (worse distance) has a high score; a score-blended
+    # ranking would have swapped the two.
     now = int(time.time())
     candidates = []
     for i in range(PRIMARY_PER_COMBO):
@@ -4784,8 +5438,11 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
                 comment_count=0,
             )
         )
-    extra_scores = [10, 1, 50, 10]  # id=13 score=1, id=14 score=50
-    extra_sims = [0.10, 0.15, 0.30, 0.45]  # distances: 0.90, 0.85, 0.70, 0.55
+    extra_scores = [10] * (DISCOVERY_PER_BADGE + 2)
+    extra_scores[DISCOVERY_PER_BADGE - 1] = 1  # last kept, very low score
+    extra_scores[DISCOVERY_PER_BADGE] = 50  # first excluded, high score
+    # Strictly increasing sim -> strictly decreasing distance/novelty.
+    extra_sims = [round(0.10 + 0.05 * i, 2) for i in range(DISCOVERY_PER_BADGE + 2)]
     for i, sc in enumerate(extra_scores):
         candidates.append(
             Story(
@@ -4815,17 +5472,19 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
     )
 
     by_id = {r.story.id: r for r in ranked}
-    # id=13 (sim=0.15, dist=0.85, score=1 — very low) is 2nd-by-distance.
-    # Pure-distance ranking keeps it; score-blended would drop it for id=14.
-    assert by_id[PRIMARY_PER_COMBO + 1].is_novel, (
-        f"id={PRIMARY_PER_COMBO + 1} (sim=0.15, dist=0.85, score=1) should be novel"
+    kept_id = PRIMARY_PER_COMBO + (DISCOVERY_PER_BADGE - 1)
+    excluded_id = PRIMARY_PER_COMBO + DISCOVERY_PER_BADGE
+    # kept_id (very low score) is the last-by-distance story within the cap.
+    # Pure-distance ranking keeps it; score-blended would drop it for
+    # excluded_id instead.
+    assert by_id[kept_id].is_novel, (
+        f"id={kept_id} (worst distance kept, score=1) should be novel"
     )
-    # id=14 (sim=0.30, dist=0.70, score=50 — high score) is 3rd-by-distance.
-    # Beyond DISCOVERY_PER_BADGE cut, so NOT novel despite higher score.
-    target_high_score = PRIMARY_PER_COMBO + 2
-    if target_high_score in by_id:
-        assert not by_id[target_high_score].is_novel, (
-            f"id={target_high_score} (higher score, worse distance) must NOT be novel"
+    # excluded_id (high score) is just beyond the DISCOVERY_PER_BADGE cut,
+    # so NOT novel despite the higher score.
+    if excluded_id in by_id:
+        assert not by_id[excluded_id].is_novel, (
+            f"id={excluded_id} (higher score, worse distance) must NOT be novel"
         )
 
 
@@ -5127,9 +5786,7 @@ def test_fetch_candidates_only_persists_topfeed_before_prewarm(
         )
         monkeypatch.setattr("reddit_fetch_queue.queue", _NoopQueue())
 
-        asyncio.run(
-            pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
-        )
+        pipeline.refresh_reddit_candidates(config, db, _DummyEmbedder())
         # Story was persisted in phase 1.5 before prewarm was built.
         assert db.get_story(42) is not None
         # And the prewarm factory was given the story's id.
@@ -5235,9 +5892,7 @@ def test_fetch_candidates_only_caps_reddit_prewarm(monkeypatch) -> None:
         )
         monkeypatch.setattr("reddit_fetch_queue.queue", _NoopQueue())
 
-        asyncio.run(
-            pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
-        )
+        pipeline.refresh_reddit_candidates(config, db, _DummyEmbedder())
         assert captured_factory_ids
         assert len(captured_factory_ids[0]) == 4
     finally:
@@ -5332,9 +5987,7 @@ def test_fetch_candidates_only_skips_already_hydrated_reddit(monkeypatch) -> Non
         )
         monkeypatch.setattr("reddit_fetch_queue.queue", _NoopQueue())
 
-        asyncio.run(
-            pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
-        )
+        pipeline.refresh_reddit_candidates(config, db, _DummyEmbedder())
         assert captured_factory_ids
         assert 10 not in captured_factory_ids[0]
         assert 20 in captured_factory_ids[0]
@@ -5675,9 +6328,7 @@ def test_fetch_candidates_only_prewarms_top_n_per_sub_from_cache(
             reddit_fetch_queue, "wait_until_empty", fake_wait_until_empty
         )
 
-        asyncio.run(
-            pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
-        )
+        pipeline.refresh_reddit_candidates(config, db, _DummyEmbedder())
         assert len(captured_ids) == 1
         # 3 subs × 2 per sub = 6 IDs
         assert len(captured_ids[0]) == 6
@@ -6053,6 +6704,34 @@ def _clear_model_cache() -> None:
     _MODEL_CACHE.clear()
 
 
+def test_precomputed_rbf_svc_matches_regular_svc() -> None:
+    from sklearn.svm import SVC
+
+    rng = np.random.default_rng(42)
+    training = rng.normal(size=(90, 12))
+    candidates = rng.normal(size=(47, 12))
+    labels = [index % 3 for index in range(len(training))]
+    weights = np.ones(len(training), dtype=np.float64)
+
+    regular = SVC(C=0.1, kernel="rbf", gamma=0.03, decision_function_shape="ovr")
+    regular.fit(training, labels, sample_weight=weights)
+    precomputed = PrecomputedRbfSVC(c=0.1, gamma=0.03, chunk_size=7)
+    precomputed.fit(training, labels, sample_weight=weights)
+
+    expected = regular.decision_function(candidates)
+    actual = precomputed.decision_function(candidates)
+    assert np.allclose(actual, expected, rtol=1e-7, atol=1e-9)
+    assert np.array_equal(
+        np.argsort(-actual[:, 2], kind="stable")[:40],
+        np.argsort(-expected[:, 2], kind="stable")[:40],
+    )
+
+
+def test_precomputed_rbf_svc_validates_chunk_size() -> None:
+    with pytest.raises(ValueError, match="chunk_size must be positive"):
+        PrecomputedRbfSVC(c=0.1, gamma=0.03, chunk_size=0)
+
+
 def _make_story(db: Database, sid: int) -> None:
     db.upsert_story(
         Story(
@@ -6178,31 +6857,55 @@ def test_model_cache_eviction() -> None:
     assert _get_cached_model(1, "sig4") is not None
 
 
-@settings(max_examples=50, deadline=None)
+@settings(deadline=None)
 @given(
     n_query=st.integers(min_value=0, max_value=40),
     n_ref=st.integers(min_value=0, max_value=40),
     dim=st.integers(min_value=1, max_value=8),
-    k=st.integers(min_value=1, max_value=40),
+    k=st.integers(min_value=0, max_value=40),
     chunk_size=st.integers(min_value=1, max_value=16),
     seed=st.integers(min_value=0, max_value=2**31 - 1),
 )
-def test_knn_mean_and_max_matches_separate_helpers(
+def test_knn_mean_and_max_matches_brute_force_oracle(
     n_query: int, n_ref: int, dim: int, k: int, chunk_size: int, seed: int
 ) -> None:
-    """The fused helper must be bit-for-bit equivalent to the pair it replaces."""
+    """All three helpers match scalar dot products and a full sorted reduction."""
     rng = np.random.default_rng(seed)
-    query = rng.standard_normal((n_query, dim)).astype(np.float32)
-    ref = rng.standard_normal((n_ref, dim)).astype(np.float32)
+    # A small integer alphabet deliberately produces duplicate references,
+    # exact ties, negative matches and zero vectors as well as ordinary rows.
+    query = rng.integers(-2, 3, (n_query, dim)).astype(np.float32)
+    ref = rng.integers(-2, 3, (n_ref, dim)).astype(np.float32)
+    # Dyadic coordinates make dot products exact in float32 and float64.
+    # This lets the independent scalar oracle assert exact tie winners
+    # without mistaking BLAS rounding near a tie for an attribution bug.
+    query /= 8
+    ref /= 8
 
-    fused_mean, fused_max = ranking._knn_mean_and_max(
+    fused_mean, fused_max, fused_argmax = ranking._knn_mean_and_max(
         query, ref, k, chunk_size=chunk_size
     )
     sep_mean = ranking._knn_similarity(query, ref, k, chunk_size=chunk_size)
     sep_max = ranking._chunked_max_dot(query, ref, chunk_size=chunk_size)
 
-    np.testing.assert_allclose(fused_mean, sep_mean, rtol=0, atol=1e-6)
-    np.testing.assert_allclose(fused_max, sep_max, rtol=0, atol=1e-6)
+    expected_mean: list[float] = []
+    expected_max: list[float] = []
+    expected_argmax: list[int] = []
+    for row in query:
+        similarities = [
+            sum(float(a) * float(b) for a, b in zip(row, candidate))
+            for candidate in ref
+        ]
+        top = sorted(similarities, reverse=True)[:k]
+        expected_mean.append(sum(top) / len(top) if top else 0.0)
+        maximum = max(similarities) if similarities else 0.0
+        expected_max.append(maximum)
+        expected_argmax.append(similarities.index(maximum) if similarities else -1)
+
+    for means in (fused_mean, sep_mean):
+        np.testing.assert_allclose(means, expected_mean, rtol=0, atol=1e-6)
+    for maxima in (fused_max, sep_max):
+        np.testing.assert_allclose(maxima, expected_max, rtol=0, atol=1e-6)
+    np.testing.assert_array_equal(fused_argmax, expected_argmax)
 
 
 def test_rank_trace_records_and_formats_fields() -> None:
@@ -6725,3 +7428,440 @@ def test_article_fetch_http_4xx_becomes_permanent(db, monkeypatch):
     assert failure is not None
     assert failure["failure_count"] == 3
     assert failure["permanent"] == 1
+
+
+def _f2_story(sid: int, title: str = "t") -> Story:
+    return Story(
+        id=sid,
+        title=title,
+        url=None,
+        score=0,
+        time=0,
+        text_content="",
+        source="hn",
+    )
+
+
+def _f2_ranked(sids: list[int]) -> list:
+    return [
+        ranking.RankedStory(story=_f2_story(i), score=1.0, best_match_title="")
+        for i in sids
+    ]
+
+
+def _f2_context(n_cands: int, idx: list[int], sims: list[float], titles: list[str]):
+    return ranking.RankScoreContext(
+        cand_closest_up=np.array(sims, dtype=np.float32),
+        cand_closest_up_idx=np.array(idx, dtype=np.int64),
+        fb_up_titles=titles,
+    )
+
+
+def test_fill_best_match_titles_happy_path() -> None:
+    ctx = _f2_context(3, [0, 1, 0], [0.9, 0.8, 0.9], ["Up A", "Up B"])
+    out = ranking._fill_best_match_titles(
+        _f2_ranked([10, 11, 12]),
+        [_f2_story(10), _f2_story(11), _f2_story(12)],
+        ctx,
+    )
+    assert [r.best_match_title for r in out] == ["Up A", "Up B", "Up A"]
+
+
+def test_fill_best_match_titles_cold_and_floor() -> None:
+    ranked = _f2_ranked([10])
+    cands = [_f2_story(10)]
+    # No context (cold user): untouched, same objects.
+    assert ranking._fill_best_match_titles(ranked, cands, None) == ranked
+    assert (
+        ranking._fill_best_match_titles(ranked, cands, ranking.RankScoreContext())
+        == ranked
+    )
+    # Below the similarity floor: silent.
+    ctx = _f2_context(1, [0], [0.10], ["Up A"])
+    assert ranking._fill_best_match_titles(ranked, cands, ctx)[0].best_match_title == ""
+    # Invalid argmax row and missing title: silent.
+    ctx = _f2_context(1, [-1], [0.95], ["Up A"])
+    assert ranking._fill_best_match_titles(ranked, cands, ctx)[0].best_match_title == ""
+    ctx = _f2_context(1, [5], [0.95], ["Up A"])
+    assert ranking._fill_best_match_titles(ranked, cands, ctx)[0].best_match_title == ""
+    ctx = _f2_context(1, [0], [0.95], [""])
+    assert ranking._fill_best_match_titles(ranked, cands, ctx)[0].best_match_title == ""
+    # Unknown story id: untouched.
+    ctx = _f2_context(1, [0], [0.95], ["Up A"])
+    out = ranking._fill_best_match_titles(_f2_ranked([99]), cands, ctx)
+    assert out[0].best_match_title == ""
+
+
+def test_fill_best_match_titles_render_escapes() -> None:
+    """A quoted/malicious upvoted title must render escaped, never raw."""
+    from pipeline import render
+
+    story = _f2_story(10, "C <b>ard</b>")
+    ranked = [
+        ranking.RankedStory(story=story, score=1.0, best_match_title='Up "quoted" <x>')
+    ]
+    html = render.generate_dashboard_bytes(
+        ranked, Config(), Database(":memory:")
+    ).decode("utf-8")
+    assert "Because you upvoted:" in html
+    assert "Up &#34;quoted&#34;" in html or "Up &quot;quoted&quot;" in html
+    assert 'Up "quoted" <x>' not in html
+
+
+def _embedder_with_fake_session() -> Embedder:
+    """Real Embedder.encode without ONNX: fake tokenizer + session."""
+    emb = Embedder.__new__(Embedder)
+    emb.batch_size = 32
+    emb.max_tokens = 4096
+
+    def fake_tokenizer(batch_texts: list[str], **kwargs: object) -> dict[str, object]:
+        n = len(batch_texts)
+        return {
+            "input_ids": SimpleNamespace(shape=(n, 8)),
+            "attention_mask": np.ones((n, 8), dtype=np.int64),
+        }
+
+    emb.tokenizer = fake_tokenizer
+    emb.session = cast(
+        Any,
+        SimpleNamespace(
+            get_inputs=lambda: [
+                SimpleNamespace(name="input_ids"),
+                SimpleNamespace(name="attention_mask"),
+            ],
+            run=lambda _o, _i: [np.ones((1, 8, 4), dtype=np.float32)],
+        ),
+    )
+    return emb
+
+
+def test_encode_slow_warn_fires_only_over_threshold(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Stall monsters must be loud: encode() over the slow threshold emits
+    embedding_slow; fast encodes stay at embedding_perf info only."""
+    import logging
+
+    emb = _embedder_with_fake_session()
+    monkeypatch.setattr(ranking, "_EMBEDDING_SLOW_WARN_SECONDS", 0.0)
+    with caplog.at_level(logging.DEBUG):
+        emb.encode(["hello world"])
+    assert any("embedding_slow" in r.message for r in caplog.records)
+
+    caplog.clear()
+    monkeypatch.setattr(ranking, "_EMBEDDING_SLOW_WARN_SECONDS", 1e9)
+    with caplog.at_level(logging.DEBUG):
+        result = emb.encode(["hello world"])
+    assert result.shape == (1, 4)
+    assert not any("embedding_slow" in r.message for r in caplog.records)
+
+
+def _probe_story(
+    sid: int,
+    *,
+    now: float,
+    age_h: float = 6.0,
+    count: int = 83,
+    fetched: int = 80,
+    top: str = "some earlier top comments",
+    source: str = "hn",
+) -> Story:
+    return Story(
+        id=sid,
+        title=f"Probe story {sid}",
+        url=None,
+        score=10,
+        time=int(now - age_h * 3600.0),
+        text_content=f"Probe story {sid} body",
+        source=source,
+        comment_count=count,
+        comment_count_at_fetch=fetched,
+        top_comments=top,
+    )
+
+
+def test_probe_eligible_threads_filters_and_orders() -> None:
+    """Only young cached threads with sub-threshold DB growth are probe
+    candidates; known-growth, history-less, sourceless and old threads stay
+    on their existing paths. Hottest velocity first."""
+    from pipeline import _probe_eligible_threads
+
+    now = time.time()
+    stories = [
+        _probe_story(1, now=now),  # eligible, velocity ~13.8/hr
+        _probe_story(2, now=now, count=200, fetched=100),  # known growth
+        _probe_story(3, now=now, count=40, fetched=0),  # no history
+        _probe_story(4, now=now, count=90, fetched=85, top=""),  # empty top
+        _probe_story(5, now=now, count=90, fetched=85, source="rss_x"),  # non-hn
+        _probe_story(6, now=now, count=90, fetched=85, age_h=100.0),  # old
+        _probe_story(7, now=now, count=60, fetched=55, age_h=1.0),  # vel 60/hr
+        _probe_story(8, now=now),  # same as 1 but uncached
+    ]
+    cached = {1, 2, 3, 4, 5, 6, 7}
+    out = _probe_eligible_threads(stories, cached, 72.0, now)
+    assert [s.id for s in out] == [7, 1]
+
+
+async def test_probe_live_counts_parses_defensively(monkeypatch) -> None:
+    """Firebase probe: only upward, parseable counts survive; every failure
+    mode is a skip, never an exception or a backward move."""
+    import httpx
+    from pipeline import _probe_live_counts
+
+    now = time.time()
+    stories = [_probe_story(i, now=now, count=80) for i in (1, 2, 3, 4, 5)]
+
+    class FakeResponse:
+        def __init__(self, status: int, body: object):
+            self.status_code = status
+            self._body = body
+
+        def json(self) -> object:
+            if isinstance(self._body, Exception):
+                raise self._body
+            return self._body
+
+    payloads = {
+        1: FakeResponse(200, {"descendants": 120}),  # good
+        2: FakeResponse(200, {}),  # missing -> 0, not upward
+        3: FakeResponse(500, {}),  # status
+        4: FakeResponse(200, {"descendants": 50}),  # backwards
+        5: FakeResponse(200, ValueError("nope")),  # unparseable
+    }
+
+    class FakeClient:
+        def __init__(self, *, timeout: float):
+            pass
+
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        async def get(self, url: str) -> FakeResponse:
+            sid = int(url.split("/item/")[1].split(".json")[0])
+            if sid == 5:
+                raise ConnectionError("down")
+            return payloads[sid]
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    assert await _probe_live_counts(stories, 10.0) == {1: 120}
+
+
+async def test_refresh_grown_threads_hot_bypass_ignores_memory(monkeypatch) -> None:
+    """Probe memory must not starve the hottest threads: velocity top-3
+    re-probe within the same cap even when memory suppresses them."""
+    import pipeline
+    from database import Database
+    from pipeline import Config, refresh_grown_threads
+
+    now = time.time()
+    db = Database(":memory:")
+    try:
+        stories = [
+            _probe_story(21, now=now, count=300, fetched=290, age_h=2.0),
+            _probe_story(22, now=now, count=90, fetched=85, age_h=6.0),
+            _probe_story(23, now=now, count=85, fetched=80, age_h=6.0),
+            _probe_story(24, now=now, count=84, fetched=80, age_h=6.0),
+        ]
+        for s in stories:
+            db.upsert_story(s)
+            db.upsert_tldr_cache(s.id, f"k{s.id}", "old tldr")
+        # Memory suppresses everything (same DB counts as last probe).
+        memory: dict[int, tuple[float, int]] = {
+            s.id: (now, s.comment_count or 0) for s in stories
+        }
+
+        probed: list[int] = []
+
+        async def fake_probe(found: list, timeout_s: float) -> dict[int, int]:
+            probed.extend(s.id for s in found)
+            return {}
+
+        async def fake_fetch_story(
+            client: object, sid: int, db_: object, *, force: bool = False
+        ) -> object:
+            raise AssertionError("no growth confirmed, must not hydrate")
+
+        monkeypatch.setattr(pipeline, "_probe_live_counts", fake_probe)
+        monkeypatch.setattr(pipeline, "fetch_story", fake_fetch_story)
+
+        config = Config()
+        hydrated_n, _ = await refresh_grown_threads(
+            config, db, stories, now=now, memory=memory
+        )
+        assert hydrated_n == 0
+        # Hottest three (21, 22, 23 by velocity) probe despite memory;
+        # the coldest (24) stays suppressed.
+        assert probed == [21, 22, 23]
+    finally:
+        db.close()
+
+
+async def test_refresh_grown_threads_only_hydrates_confirmed(monkeypatch) -> None:
+    """End of the 'known new content' rule: probes run for eligible cached
+    threads, but the heavy hydration fires only where the probe confirms
+    upward movement. The cap takes hottest first; known-growth threads
+    belong to the normal prewarm path."""
+    from dataclasses import replace as dc_replace
+
+    import pipeline
+    from database import Database
+    from pipeline import Config, refresh_grown_threads
+
+    now = time.time()
+    db = Database(":memory:")
+    try:
+        stories = [
+            _probe_story(11, now=now, count=83, fetched=80),  # live 200: hydrate
+            _probe_story(12, now=now, count=58, fetched=55),  # live 58: untouched
+            _probe_story(13, now=now, count=90, fetched=85),  # uncached: skip
+        ]
+        for s in stories:
+            db.upsert_story(s)
+        db.upsert_tldr_cache(11, "k11", "old tldr")
+        db.upsert_tldr_cache(12, "k12", "old tldr")
+
+        probed: list[int] = []
+        live = {11: 200, 12: 58}
+
+        async def fake_probe(found: list, timeout_s: float) -> dict[int, int]:
+            probed.extend(s.id for s in found)
+            out: dict[int, int] = {}
+            for s in found:
+                row = db.get_story(s.id)
+                if row is not None and live[s.id] > (row.comment_count or 0):
+                    out[s.id] = live[s.id]
+            return out
+
+        hydrated: list[int] = []
+
+        async def fake_fetch_story(
+            client: object, sid: int, db_: object, *, force: bool = False
+        ) -> object:
+            assert force is True
+            hydrated.append(sid)
+            row = db.get_story(sid)
+            assert row is not None
+            return row
+
+        monkeypatch.setattr(pipeline, "_probe_live_counts", fake_probe)
+        monkeypatch.setattr(pipeline, "fetch_story", fake_fetch_story)
+
+        config = Config()
+        memory: dict[int, tuple[float, int]] = {}
+        hydrated_n, touched = await refresh_grown_threads(
+            config, db, stories, now=now, memory=memory
+        )
+        assert (hydrated_n, touched) == (1, {11})
+        assert probed == [11, 12]
+        assert hydrated == [11]
+        row11 = db.get_story(11)
+        row12 = db.get_story(12)
+        row13 = db.get_story(13)
+        assert row11 is not None and row11.comment_count == 200
+        assert row12 is not None and row12.comment_count == 58
+        assert row13 is not None and row13.comment_count == 90
+        assert set(memory) == {11, 12}
+
+        # Cap + known-growth exclusion: reload like fetch_candidates_only
+        # does after a grown cycle — story 11 now shows DB growth 120 >= 26,
+        # so the normal prewarm path owns it; 12 was probed with no change,
+        # but the hot-thread bypass re-probes the single hottest eligible
+        # thread within the cap. No growth confirmed, so nothing hydrates.
+        probed.clear()
+        hydrated.clear()
+        reloaded = [s for s in (db.get_story(s.id) for s in stories) if s is not None]
+        assert len(reloaded) == 3
+        capped = dc_replace(config, tldr_probe_max_threads_per_regen=1)
+        assert await refresh_grown_threads(
+            capped, db, reloaded, now=now, memory=memory
+        ) == (0, set())
+        assert probed == [12]
+        assert hydrated == []
+
+        # Repeat: the bypass keeps probing the hottest eligible thread;
+        # hydration still needs confirmed growth, so still nothing fires.
+        # A CH count move re-arms the normal (non-bypass) probe as well.
+        assert await refresh_grown_threads(
+            capped, db, reloaded, now=now, memory=memory
+        ) == (0, set())
+        assert probed == [12, 12]
+        db.upsert_story(replace(reloaded[1], comment_count=59))
+        rearmed = [s for s in (db.get_story(s.id) for s in stories) if s is not None]
+        assert await refresh_grown_threads(
+            capped, db, rearmed, now=now, memory=memory
+        ) == (0, set())
+        assert probed == [12, 12, 12]
+    finally:
+        db.close()
+
+
+async def test_fetch_story_preserves_article_body() -> None:
+    """Algolia carries no article body: a force-refresh must carry the
+    stored one over instead of wiping it to discussion-only."""
+    from database import Database, Story
+    from pipeline.enrichment import fetch_story
+
+    now = time.time()
+    db = Database(":memory:")
+    try:
+        db.upsert_story(
+            Story(
+                id=49616239,
+                title="South Park rename",
+                url="https://example.com/south-park",
+                score=100,
+                time=int(now - 6 * 3600),
+                text_content="South Park rename body",
+                source="hn",
+                comment_count=83,
+                comment_count_at_fetch=80,
+                top_comments="earlier top comments here",
+                article_body="FULL BODY TEXT",
+            )
+        )
+
+        class FakeResponse:
+            status_code = 200
+
+            def json(self) -> dict:
+                return {
+                    "type": "story",
+                    "title": "South Park rename",
+                    "url": "https://example.com/south-park",
+                    "points": 101,
+                    "num_comments": 120,
+                    "created_at_i": int(now - 6 * 3600),
+                    "story_text": "",
+                    "children": [
+                        {
+                            "type": "comment",
+                            "id": 1,
+                            "text": "A brand new top-level comment with more than sixty characters in it.",
+                            "children": [],
+                        }
+                    ],
+                }
+
+        class FakeClient:
+            async def get(self, url: str) -> FakeResponse:
+                return FakeResponse()
+
+        result = await fetch_story(cast(Any, FakeClient()), 49616239, db, force=True)
+        assert result is not None
+        assert result.article_body == "FULL BODY TEXT"
+        assert "FULL BODY TEXT" in result.text_content
+        stored = db.get_story(49616239)
+        assert stored is not None and stored.article_body == "FULL BODY TEXT"
+    finally:
+        db.close()
+
+
+def test_growth_threshold_values() -> None:
+    from pipeline import _growth_threshold
+
+    assert _growth_threshold(80) == 26
+    assert _growth_threshold(10) == 5
+    assert _growth_threshold(0) == 5

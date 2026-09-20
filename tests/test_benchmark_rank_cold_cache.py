@@ -12,6 +12,7 @@ import pytest
 
 from database import Database, Story
 from pipeline import RankTrace, story_embedding_text
+from pipeline.config import DEFAULT_EMBEDDING_MODEL_VERSION
 from scripts import benchmark_rank_cold_cache as bench
 
 
@@ -19,7 +20,7 @@ def _cache_embedding(db: Database, story: Story) -> None:
     text_hash = hashlib.sha256(story_embedding_text(story).encode("utf-8")).hexdigest()
     db.upsert_embedding(
         story.id,
-        bench.EMBEDDING_MODEL_VERSION,
+        DEFAULT_EMBEDDING_MODEL_VERSION,
         text_hash,
         np.zeros(384, dtype=np.float32),
     )
@@ -85,6 +86,8 @@ def test_benchmark_rank_cold_cache_outputs_json(
             "benchmark_rank_cold_cache.py",
             "--db",
             str(db_path),
+            "--config",
+            str(tmp_path / "missing-config.toml"),
             "--cold-runs",
             "1",
             "--warm-runs",

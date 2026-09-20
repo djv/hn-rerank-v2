@@ -166,11 +166,11 @@ def test_slow_task_blocks_subsequent_tasks() -> None:
 
 
 def test_enqueue_spread_distributes_evenly() -> None:
-    """20 tasks across 1s should be spread 50ms apart."""
+    """20 tasks across 0.2s should be spread 10ms apart."""
     q = RedditFetchQueue()
     q.reset()
     q.POLL_INTERVAL = 0.001
-    q.SPREAD_WINDOW_TOPFEEDS = 1.0
+    q.SPREAD_WINDOW_TOPFEEDS = 0.2
     starts: list[float] = []
     base = time.monotonic()
 
@@ -182,12 +182,12 @@ def test_enqueue_spread_distributes_evenly() -> None:
 
     q.enqueue_spread(20, base, "topfeed", [timed() for _ in range(20)])
     assert q.wait_until_empty(timeout=2.0) is True
-    # Stride is 1.0 / 20 = 0.05s
-    # First task runs immediately, last at ~0.95s
+    # Stride is 0.2 / 20 = 0.01s
+    # First task runs immediately, last at ~0.19s
     assert len(starts) == 20
-    assert starts[-1] - starts[0] >= 0.8  # wide spread
-    # Median should be ~0.5s
-    assert 0.4 <= starts[9] <= 0.6
+    assert starts[-1] - starts[0] >= 0.15  # wide spread
+    # Median should be ~0.1s
+    assert 0.05 <= starts[9] <= 0.15
 
 
 def test_reset_clears_pending_and_signals_idle() -> None:
@@ -258,6 +258,45 @@ def test_enqueue_all_reddit_fetches_empty_inputs_noop() -> None:
     q.enqueue_all_reddit_fetches([], [])
     assert q.wait_until_empty(timeout=0.1) is True
     assert q.stats()["pending"] == 0
+
+
+def test_task_overrun_delays_next_task_by_full_gap() -> None:
+    """A task that overruns its scheduled stride (e.g. a Reddit 429 retry
+    wait) must not let the next task fire at its stale ``target_at``,
+    which has already elapsed by the time the overrunning task returns.
+    The next task must wait a full ``min_gap`` from the overrunning
+    task's actual completion, not from its pre-computed schedule slot.
+
+    Regression test for the 2026-08-01 429-cascade finding: consecutive
+    queued tasks collapsed to ~1.5s real spacing whenever a single 429
+    retry backoff (~57s) exceeded the 50s scheduled stride, because
+    `_pop_ready` only checked the stale `target_at` and not how long had
+    actually elapsed since the previous task finished.
+    """
+    q = RedditFetchQueue()
+    q.reset()
+    q.POLL_INTERVAL = 0.001
+    q.SPREAD_WINDOW_TOPFEEDS = 0.06  # stride = 0.06 / 2 = 0.03s
+    started: list[float] = []
+    base = time.monotonic()
+
+    def timed() -> CoroFactory:
+        async def factory() -> None:
+            started.append(time.monotonic())
+
+        return factory
+
+    # Task 0 overruns its 0.03s slot by sleeping 0.15s (simulates a
+    # 429-retry wait far exceeding the scheduled stride).
+    q.enqueue_spread(2, base, "topfeed", [_sleeper(0.15), timed()])
+    assert q.wait_until_empty(timeout=2.0) is True
+    task0_finish = base + 0.15
+    gap = started[0] - task0_finish
+    # Task 1's stale target_at (base + 0.03s) elapsed long before task 0
+    # finished; without the fix it fires almost immediately after task 0
+    # (gap ~0). With the fix it must wait a further ~stride (0.03s) from
+    # task 0's actual completion.
+    assert gap >= 0.03 * 0.8, f"gap={gap:.4f}s, expected >= {0.03 * 0.8:.4f}s"
 
 
 def test_enqueue_all_reddit_fetches_uses_class_default_when_no_min_stride() -> None:

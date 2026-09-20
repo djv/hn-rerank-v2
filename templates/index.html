@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="light">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -13,6 +13,16 @@
       --pico-primary: #ff6600;
       --pico-primary-background: #ff6600;
       --pico-primary-hover: #e05a00;
+      /* Terminal theme (green phosphor): dark Pico base + mono + phosphor
+         accents. System mono stack only — no webfonts (local-first). */
+      --term-green: #33dd66;
+      --term-green-dim: #1d7a3c;
+      --term-amber: #ffb000;
+      --term-bg: #0a0e0a;
+      --term-panel: #0e140e;
+      --pico-border-radius: 2px;
+      --pico-font-family: ui-monospace, SFMono-Regular, Menlo, Consolas,
+        "Liberation Mono", monospace;
       --page-gutter: 1rem;
       --vote-bar-height: 3.2rem;
       --card-bottom-gap: 0.5rem;
@@ -29,6 +39,78 @@
       padding-top: 0;
       padding-bottom: var(--page-gutter);
       overflow: hidden;
+      background: var(--term-bg);
+    }
+
+    main, .deck-wrap, .swipe-side {
+      background: transparent;
+    }
+
+    /* Terminal chrome: prompt header, blocky panels, micro-labels. */
+    .term-prompt {
+      font-size: 0.8rem;
+      color: var(--term-green);
+      margin-bottom: 0.6rem;
+      overflow-wrap: anywhere;
+    }
+    .term-prompt .term-cursor {
+      display: inline-block;
+      width: 0.55em;
+      height: 1em;
+      background: var(--term-green);
+      vertical-align: text-bottom;
+      margin-left: 0.15em;
+    }
+
+    .tab-label, .swipe-keys, .badge-legend, .rank-legend, .queue-status,
+    .card-actions, .refresh-banner {
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      font-size: 0.72rem;
+    }
+
+    .key-hint {
+      border: 1px solid var(--term-green-dim);
+      color: var(--term-green);
+      border-radius: 2px;
+    }
+
+    .vote-btn {
+      border-radius: 2px;
+    }
+    .vote-btn.active {
+      border-color: var(--term-green);
+      color: var(--term-green);
+    }
+
+    /* Warming activity dot: blinking block cursor, CSS only. */
+    @keyframes term-blink {
+      0%, 49% { opacity: 1; }
+      50%, 100% { opacity: 0; }
+    }
+    #queue-loading:not([hidden])::after {
+      content: "▮";
+      color: var(--term-green);
+      margin-left: 0.4em;
+      animation: term-blink 1s steps(1) infinite;
+    }
+
+    .tldr-toggle {
+      color: var(--term-green);
+    }
+    .tldr-detail {
+      border-left: 2px solid var(--term-green-dim);
+    }
+    .tldr-detail-content h3 {
+      color: var(--term-green);
+    }
+    .tldr-error, .tldr-stale {
+      color: var(--term-amber);
+    }
+    .domain-chip {
+      border: 1px solid var(--term-green-dim);
+      border-radius: 2px;
+      padding: 0 0.3em;
     }
 
     body.fullscreen {
@@ -106,7 +188,8 @@
       flex: 0 0 170px;
       color: var(--pico-muted-color);
       font-size: 0.8rem;
-      max-height: calc(100vh - 1.5rem);
+      max-height: calc(100vh - var(--vote-bar-height) - var(--page-gutter));
+      max-height: calc(100dvh - var(--vote-bar-height) - var(--page-gutter));
       overflow-y: auto;
       overflow-x: hidden;
       padding-right: 0.5rem;
@@ -321,19 +404,23 @@
       flex: 1 1 902px;
     }
 
+    .queue-loading {
+      margin: 2rem 0;
+      color: var(--pico-muted-color);
+      text-align: center;
+    }
+
     .story-card {
       display: none;
       margin-right: auto;
       margin-left: auto;
       margin-bottom: 0.4rem;
-      width: fit-content;
-      min-width: min(60ch, 100%);
-      max-width: 902px;
+      width: 100%;
       padding: 0.5rem;
-      border-radius: 6px;
-      border: 1px solid var(--pico-card-border-color);
+      border-radius: 2px;
+      border: 1px solid var(--term-green-dim);
       border-left: 7px solid transparent;
-      background: var(--pico-card-background-color);
+      background: var(--term-panel);
       transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1), transform 0.2s, box-shadow 0.2s;
       opacity: 1;
       overflow: hidden;
@@ -429,8 +516,6 @@
     }
 
     .story-card.enriched {
-      width: 100%;
-      max-width: none;
       border-top-color: color-mix(in srgb, var(--pico-card-border-color) 90%, hsl(120, 50%, 50%) 10%);
       border-right-color: color-mix(in srgb, var(--pico-card-border-color) 90%, hsl(120, 50%, 50%) 10%);
       border-bottom-color: color-mix(in srgb, var(--pico-card-border-color) 90%, hsl(120, 50%, 50%) 10%);
@@ -715,6 +800,84 @@
       border-color: #dc3545 !important;
     }
 
+    .domain-chip {
+      display: inline-block;
+      font-size: 0.72rem;
+      color: var(--pico-muted-color);
+      overflow-wrap: anywhere;
+    }
+
+    .badge-legend {
+      margin-top: 0.65rem;
+      padding-top: 0.5rem;
+      border-top: 1px solid var(--pico-muted-border-color);
+      font-size: 0.72rem;
+      color: var(--pico-muted-color);
+      line-height: 1.7;
+    }
+    .badge-legend-item {
+      display: inline-block;
+      margin-right: 0.45rem;
+      white-space: nowrap;
+    }
+
+    .rank-legend {
+      margin-top: 0.35rem;
+      font-size: 0.72rem;
+      color: var(--pico-muted-color);
+      display: flex;
+      align-items: center;
+      gap: 0.35rem;
+    }
+    .rank-legend-swatch {
+      display: inline-block;
+      width: 1.6rem;
+      height: 0.55rem;
+      border-radius: 3px;
+      background: linear-gradient(to right, hsl(24, 100%, 45%), hsl(24, 80%, 68%));
+    }
+
+    .queue-status {
+      margin-top: 0.65rem;
+      font-size: 0.75rem;
+      color: var(--pico-muted-color);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .tldr-readtime {
+      font-size: 0.72rem;
+      color: var(--pico-muted-color);
+      margin-bottom: 0.25rem;
+    }
+    .tldr-stale {
+      font-size: 0.75rem;
+      font-style: italic;
+      color: var(--pico-muted-color);
+      margin-bottom: 0.25rem;
+    }
+    .tldr-refresh-btn {
+      font-size: 0.72rem;
+      font-family: inherit;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--term-green);
+      background: none;
+      border: none;
+      padding: 0;
+      margin-top: 0.25rem;
+      cursor: pointer;
+    }
+    .tldr-detail-content details {
+      margin-bottom: 0.15rem;
+    }
+    .tldr-detail-content details > summary {
+      cursor: pointer;
+      list-style-position: outside;
+    }
+    .tldr-detail-content details > summary h3 {
+      display: inline;
+    }
+
     .refresh-banner {
       position: fixed;
       top: 0.75rem;
@@ -851,6 +1014,9 @@
       {% include "components/story_card.html" %}
       {% endfor %}
       <!--cards:end-->
+      <p id="queue-loading" class="queue-loading" hidden role="status" aria-live="polite">
+        Loading more stories…
+      </p>
       </div>
 
       {% include "components/side_rail.html" %}
@@ -871,6 +1037,7 @@
     // Swipe deck state
     const storiesContainer = document.getElementById('stories');
     const toastEl = document.getElementById('toast');
+    const queueLoadingEl = document.getElementById('queue-loading');
     const sortTabs = Array.from(document.querySelectorAll('[data-sort]'));
     const ageTabs = Array.from(document.querySelectorAll('[data-age]'));
     const sourceTabs = Array.from(document.querySelectorAll('.tab-btn[data-source]'));
@@ -886,10 +1053,9 @@
     const votedStoryIds = new Set();
     const feedbackChains = new Map();
     const MAX_QUEUE = 12;
-    const PREFETCH_COUNT = 2;
-    const IDLE_INACTIVE_PREFETCH_COUNT = 2;
+    const PREFETCH_COUNT = 4;
     const tldrCache = new Map(); // storyId (number) → raw TLDR markdown (string)
-    let idleAgePrefetchHandle = null;
+    const tldrRetryAt = new Map(); // storyId → earliest retry time
     let toastTimer = null;
     let refillInFlight = false;
     let queuedRefillAdvance = null;
@@ -897,7 +1063,27 @@
     let warmMinVersion = null;
     let latestWarmTargetVersion = null;
     let lastScheduledWarmVersion = null;
+    let voteWarmIdleTimer = null;
+    let latestVoteTargetVersion = null;
     const VOTED_STORAGE_LIMIT = 1000;
+    const INTERACTION_QUEUE_LIMIT = 256;
+    const INTERACTION_BATCH_SIZE = 64;
+    const INTERACTION_RETRY_DELAY_MS = 5000;
+    const clientSessionId = (() => {
+      try {
+        const key = 'hnRewrite:interactionSessionId';
+        const existing = window.sessionStorage.getItem(key);
+        if (existing) return existing;
+        const created = crypto.randomUUID();
+        window.sessionStorage.setItem(key, created);
+        return created;
+      } catch {
+        return crypto.randomUUID();
+      }
+    })();
+    const interactionEvents = [];
+    let interactionFlushInFlight = false;
+    let activeInteraction = null;
 
     function cards() {
       return Array.from(storiesContainer.querySelectorAll('.story-card'));
@@ -914,14 +1100,113 @@
       return true;
     }
 
-    function queuedCards() {
-      return cards().filter(card => !card.dataset.voted && matchesCurrentCombo(card) && matchesCurrentAxes(card));
+    function isQueued(card) {
+      return !card.dataset.voted && matchesCurrentCombo(card) && matchesCurrentAxes(card);
     }
 
-    // Map a story's rank position (sorted by data-score desc) to a hue.
-    // Rank 1 (top) = blue, rank N (bottom) = red. Rank-percentile mapping
-    // (rather than linear-in-score) ensures visually distinguishable colors
-    // even when the score distribution clusters near 1.0.
+    function queuedCards() {
+      return cards().filter(isQueued);
+    }
+
+    function nextQueuedSibling(card) {
+      for (let el = card.nextElementSibling; el; el = el.nextElementSibling) {
+        if (el.classList.contains('story-card') && isQueued(el)) return el;
+      }
+      return null;
+    }
+
+    function newInteractionEventId() {
+      return crypto.randomUUID();
+    }
+
+    function queueInteraction(eventType, card, durationMs = null) {
+      if (!card) return;
+      const visiblePosition = queuedCards().indexOf(card);
+      const position = visiblePosition >= 0
+        ? visiblePosition
+        : Number(card.dataset.position || 0);
+      if (visiblePosition >= 0) card.dataset.position = String(visiblePosition);
+      interactionEvents.push({
+        event_id: newInteractionEventId(),
+        client_session_id: clientSessionId,
+        story_id: Number(card.dataset.storyId),
+        event_type: eventType,
+        dashboard_version: Number(card.dataset.dashboardVersion || storiesContainer?.dataset.dashboardVersion || 0),
+        position: Math.max(0, position),
+        sort_mode: currentSort,
+        age_filter: currentAge,
+        source_filter: currentSource,
+        ranker_arm: card.dataset.rankerArm || 'baseline',
+        occurred_at: Date.now() / 1000,
+        ...(durationMs === null ? {} : {duration_ms: Math.round(durationMs)})
+      });
+      while (interactionEvents.length > INTERACTION_QUEUE_LIMIT) {
+        interactionEvents.shift();
+      }
+      scheduleInteractionFlush();
+    }
+
+    function flushInteractionEvents() {
+      if (interactionFlushInFlight || interactionEvents.length === 0) return;
+      const batch = interactionEvents.slice(0, INTERACTION_BATCH_SIZE);
+      const payload = JSON.stringify({events: batch});
+      const body = new Blob([payload], {type: 'application/json'});
+      // Some privacy extensions block URL paths containing "events". Keep
+      // the ingestion contract identical, but use a neutral client path.
+      const path = apiPath('/api/interaction');
+      if (navigator.sendBeacon && navigator.sendBeacon(path, body)) {
+        interactionEvents.splice(0, batch.length);
+        if (interactionEvents.length > 0) scheduleInteractionFlush();
+        return;
+      }
+      interactionFlushInFlight = true;
+      let retryDelayMs = 0;
+      fetch(path, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: payload,
+        keepalive: true
+      }).then(resp => {
+        // A non-429 4xx is the server's permanent verdict on this payload;
+        // keeping it queued would poison every subsequent flush.
+        const permanentlyRejected = resp.status >= 400 && resp.status < 500 && resp.status !== 429;
+        if (resp.ok || permanentlyRejected) {
+          interactionEvents.splice(0, batch.length);
+        } else {
+          retryDelayMs = INTERACTION_RETRY_DELAY_MS;
+        }
+      }).catch(() => {
+        // Keep the bounded queue for the next activation or page lifecycle event.
+        retryDelayMs = INTERACTION_RETRY_DELAY_MS;
+      }).finally(() => {
+        interactionFlushInFlight = false;
+        if (interactionEvents.length > 0) scheduleInteractionFlush(retryDelayMs);
+      });
+    }
+
+    function scheduleInteractionFlush(delayMs = 0) {
+      window.setTimeout(flushInteractionEvents, delayMs);
+    }
+
+    function beginInteraction(card, emitImpression = true) {
+      if (!card) return;
+      activeInteraction = {card, startedAt: performance.now()};
+      if (emitImpression) queueInteraction('impression', card);
+    }
+
+    function endInteraction() {
+      if (!activeInteraction) return;
+      const elapsed = Math.max(0, performance.now() - activeInteraction.startedAt);
+      queueInteraction('dwell', activeInteraction.card, elapsed);
+      activeInteraction = null;
+    }
+
+    // Map a story's rank position (sorted by data-score desc) to an
+    // HN-orange intensity. Rank 1 (top) = saturated orange, rank N =
+    // pale tint. Single-hue (rather than blue->red) so the encoding reads
+    // as "more relevant -> less" instead of "good -> bad", which fought
+    // voting semantics. Rank-percentile mapping keeps colors
+    // distinguishable even when scores cluster near 1.0.
     function applyGradient() {
       const cards = Array.from(document.querySelectorAll('.story-card'));
       const N = cards.length;
@@ -930,15 +1215,25 @@
         .map(card => ({ card, score: parseFloat(card.dataset.score) || 0 }))
         .sort((a, b) => b.score - a.score);
       ranked.forEach((entry, i) => {
-        // i=0 -> top rank -> blue (220); i=N-1 -> bottom -> red (0)
-        const hue = 220 * (N - 1 - i) / (N - 1);
-        entry.card.style.borderLeftColor = `hsl(${hue.toFixed(1)}, 70%, 40%)`;
-        entry.card.style.backgroundColor = `color-mix(in srgb, var(--pico-card-background-color) 96%, hsl(${hue.toFixed(1)}, 70%, 50%) 4%)`;
+        // t=0 -> top rank -> saturated (45%); t=1 -> bottom -> still
+        // visible on the dark terminal bg (68%, floor raised vs light).
+        const t = N === 1 ? 0 : i / (N - 1);
+        const light = (45 + 23 * t).toFixed(1);
+        const sat = Math.round(100 - 20 * t);
+        entry.card.style.borderLeftColor = `hsl(24, ${sat}%, ${light}%)`;
+        entry.card.style.backgroundColor = `color-mix(in srgb, var(--pico-card-background-color) 96%, hsl(24, ${sat}%, ${light}%) 4%)`;
       });
     }
 
     function orderCards(comparator) {
-      const cards = Array.from(document.querySelectorAll('.story-card'));
+      // Exclude the active card: it's the only visible card (the rest are
+      // display:none), so reordering it is a no-op visually but the
+      // appendChild move resets its internal scroll position (it's the
+      // element the user is actively reading/scrolling). Leaving it in
+      // place avoids that disruption; its stale DOM position only affects
+      // queuedCards() ordering, and it's removed from the queue on vote
+      // anyway.
+      const cards = Array.from(document.querySelectorAll('.story-card')).filter(card => card !== activeCard);
       cards.sort(comparator);
       cards.forEach(card => storiesContainer.appendChild(card));
     }
@@ -946,6 +1241,8 @@
     function orderForCurrentSort() {
       if (currentSort === 'date') {
         orderCards((a, b) => Number(b.dataset.time || 0) - Number(a.dataset.time || 0));
+      } else if (currentSort === 'explore') {
+        orderCards(() => Math.random() - 0.5);
       } else {
         orderCards((a, b) => parseFloat(b.dataset.score) - parseFloat(a.dataset.score));
       }
@@ -959,26 +1256,67 @@
       setActiveCard(next);
     }
 
+    function focusActiveCard() {
+      // Let the first-time tip retain its initial focus until dismissed.
+      const tip = document.getElementById('first-time-tip');
+      if (
+        activeCard?.isConnected &&
+        (!tip || tip.hidden || !tip.contains(document.activeElement))
+      ) {
+        activeCard.focus({ preventScroll: true });
+      }
+    }
+
     function setActiveCard(card) {
+      const changed = activeCard !== card;
+      if (changed) {
+        endInteraction();
+      }
       cards().forEach(c => c.classList.toggle('active', c === card));
       activeCard = card || null;
       if (activeCard) {
+        if (changed) {
+          beginInteraction(activeCard, true);
+        } else if (activeInteraction === null) {
+          beginInteraction(activeCard, false);
+        }
         openTldrDetail(activeCard);
         voteBar.hidden = false;
         updateVoteBar();
-        // Focus the card so native scroll keys (space, PgUp/PgDn, Home/End,
-        // arrows) target its scrollable content instead of the page body.
-        // Skip while the first-time tip owns focus so we don't steal it.
-        const tip = document.getElementById('first-time-tip');
-        if (!tip || tip.hidden || !tip.contains(document.activeElement)) {
-          activeCard.focus({ preventScroll: true });
-        }
+        focusActiveCard();
       } else {
         document.querySelectorAll('[data-fb]').forEach(btn => btn.classList.remove('active'));
         voteBar.hidden = true;
       }
+      updateQueueLoading();
       prefetchUpcomingTldrs();
-      scheduleIdleAgePrefetch();
+    }
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') {
+        endInteraction();
+        flushInteractionEvents();
+      } else if (activeCard && activeInteraction === null) {
+        beginInteraction(activeCard, false);
+      }
+    });
+    window.addEventListener('pagehide', () => {
+      endInteraction();
+      flushInteractionEvents();
+    });
+
+    function updateQueueLoading() {
+      const refreshPending = (
+        refillInFlight || warmPollInFlight || voteWarmIdleTimer !== null
+      );
+      queueLoadingEl.hidden = !(refreshPending && activeCard === null);
+      const statusEl = document.getElementById('queueStatus');
+      if (statusEl) {
+        const n = queuedCards().length;
+        statusEl.textContent = refreshPending
+          ? `Queued ${n} · warming…`
+          : `Queued ${n}`;
+      }
     }
 
     function updateVoteBar() {
@@ -987,8 +1325,14 @@
       });
     }
 
-    function showNextCard({ allowRefresh = true } = {}) {
-      const next = queuedCards()[0];
+    function showNextCard({ allowRefresh = true, excludeActive = false, preferred = null } = {}) {
+      const queue = queuedCards();
+      const usePreferred =
+        preferred && preferred.isConnected && queue.includes(preferred) &&
+        (!excludeActive || preferred !== activeCard);
+      const next = usePreferred
+        ? preferred
+        : queue.find(card => !excludeActive || card !== activeCard);
       if (next) {
         setActiveCard(next);
         return;
@@ -1036,9 +1380,11 @@
           activeCard.classList.remove('active');
         }
         orderForCurrentSort();
-        showNextCard({ allowRefresh: false });
+        // Recommended and Date can both include the visible card. A sort
+        // change must still move to the newly ordered deck immediately.
+        showNextCard({ allowRefresh: false, excludeActive: true });
+        focusActiveCard();
         scheduleDeckRefresh({ advance: true });
-        scheduleIdleAgePrefetch();
         return;
       }
 
@@ -1051,8 +1397,8 @@
         }
         orderForCurrentSort();
         showNextCard({ allowRefresh: false });
+        focusActiveCard();
         scheduleDeckRefresh({ advance: true });
-        scheduleIdleAgePrefetch();
         return;
       }
 
@@ -1073,6 +1419,7 @@
       }
       orderForCurrentSort();
       showNextCard({ allowRefresh: false });
+      focusActiveCard();
       scheduleDeckRefresh({ advance: true });
     }
 
@@ -1107,7 +1454,10 @@
           return line;
         })
         .join('\n')
-        .replace(/(\S)\s+-\s+(?=\S)/g, '$1\n- ');
+        // Inline-bullet rule mirrors server._normalize_tldr_markdown — keep
+        // the character class identical ([.!;?:]) or cached/stale rows will
+        // render differently from fresh ones.
+        .replace(/([.!;?:])\s+-\s+(?=\S)/g, '$1\n- ');
     }
 
     function parseSimpleMarkdown(text) {
@@ -1269,6 +1619,29 @@
       queueRefill(advance);
     }
 
+    function scheduleVoteRefresh(data) {
+      latestVoteTargetVersion = data.target_version;
+      queueRefill(false);
+      if (voteWarmIdleTimer !== null) {
+        window.clearTimeout(voteWarmIdleTimer);
+        voteWarmIdleTimer = null;
+      }
+      if (data.ranking_refresh_queued) {
+        scheduleDeckRefresh({ waitForWarm: true, targetVersion: data.target_version, advance: false });
+        return;
+      }
+      const idleMs = Number(data.ranking_idle_seconds) * 1000;
+      if (!Number.isFinite(idleMs) || idleMs <= 0) return;
+      voteWarmIdleTimer = window.setTimeout(() => {
+        voteWarmIdleTimer = null;
+        if (latestVoteTargetVersion !== null) {
+          scheduleDeckRefresh({ waitForWarm: true, targetVersion: latestVoteTargetVersion, advance: false });
+        }
+        updateQueueLoading();
+      }, idleMs);
+      updateQueueLoading();
+    }
+
     function queueRefill(advance) {
       queuedRefillAdvance = queuedRefillAdvance === null ? advance : queuedRefillAdvance || advance;
       runRefillLoop();
@@ -1279,6 +1652,7 @@
         return;
       }
       refillInFlight = true;
+      updateQueueLoading();
       try {
         while (queuedRefillAdvance !== null) {
           const advance = queuedRefillAdvance;
@@ -1291,6 +1665,7 @@
         }
       } finally {
         refillInFlight = false;
+        updateQueueLoading();
       }
     }
 
@@ -1299,6 +1674,7 @@
         return;
       }
       warmPollInFlight = true;
+      updateQueueLoading();
       try {
         while (warmMinVersion !== null && latestWarmTargetVersion !== null) {
           const minVersion = warmMinVersion;
@@ -1322,6 +1698,8 @@
         warmPollInFlight = false;
         if (warmMinVersion !== null && latestWarmTargetVersion !== null) {
           runWarmPollLoop();
+        } else {
+          updateQueueLoading();
         }
       }
     }
@@ -1378,6 +1756,7 @@
         } else if (action === 'toggle-panel') {
           sidePanel.classList.toggle('visible');
           document.body.classList.toggle('fullscreen');
+          focusActiveCard();
         } else {
           submitVote(action);
         }
@@ -1402,6 +1781,9 @@
     }
 
     async function refillQueue({ advance = true } = {}) {
+      // Reordering re-appends the active card. Preserve its native scrolling
+      // focus across that DOM move, without taking focus from a link/control.
+      const restoreActiveCardFocus = document.activeElement === activeCard;
       const newDoc = await fetchRefillDoc();
 
       cards().forEach(card => {
@@ -1432,8 +1814,18 @@
 
       applyGradient();
       orderForCurrentSort();
-      if (advance) {
+      if (restoreActiveCardFocus && activeCard?.isConnected) {
+        activeCard.focus({ preventScroll: true });
+      }
+      // Vote refreshes normally leave the visible card alone. If the last
+      // card for the active filters was voted away, though, a non-advancing
+      // fresh refill must activate the first replacement instead of leaving
+      // the deck empty until the user changes filters.
+      const needsActiveCard = activeCard === null;
+      if (advance || needsActiveCard) {
         showNextCard({ allowRefresh: false });
+      } else {
+        prefetchUpcomingTldrs();
       }
     }
 
@@ -1441,6 +1833,15 @@
       btn.addEventListener('click', () => {
         submitVote(btn.dataset.fb);
       });
+    });
+
+    storiesContainer.addEventListener('click', (e) => {
+      const link = e.target.closest('a[data-event-kind]');
+      if (link) {
+        const card = link.closest('.story-card');
+        queueInteraction(link.dataset.eventKind, card);
+        flushInteractionEvents();
+      }
     });
 
     storiesContainer.addEventListener('click', async (e) => {
@@ -1457,12 +1858,33 @@
       await openTldrDetail(card);
     });
 
-    function prefetchUpcomingTldrs() {
-      queuedCards().slice(0, PREFETCH_COUNT).forEach(card => {
+    // Page-open stampede guard: the active card plus 4 upcoming prefetches
+    // used to fire simultaneously (up to 10 LLM calls at once, on top of the
+    // server warm prefetch) and trip the free token-rate limit within
+    // seconds — every card then showed salvaged halves or 429s. Chain
+    // prefetches one-at-a-time behind the active tap, so a slow provider
+    // naturally back-pressures the queue. Detached cards (voted away while
+    // queued) are skipped instead of burning quota.
+    let tldrPrefetchChain = Promise.resolve();
+    function prefetchCards(cards) {
+      cards.forEach(card => {
         if (!card.querySelector('.tldr-detail-content')) {
-          openTldrDetail(card);
+          tldrPrefetchChain = tldrPrefetchChain.then(() => {
+            if (card.isConnected) {
+              return openTldrDetail(card);
+            }
+            return null;
+          }).catch(() => {});
         }
       });
+    }
+
+    function prefetchUpcomingTldrs() {
+      const queue = queuedCards();
+      const index = queue.indexOf(activeCard);
+      // Follow navigation order, including wraparound after the last card.
+      const upcoming = index < 0 ? queue : queue.slice(index + 1).concat(queue.slice(0, index));
+      prefetchCards(upcoming.slice(0, PREFETCH_COUNT));
     }
 
     function cardsForAge(age) {
@@ -1471,28 +1893,6 @@
         if (age === 'archive') return card.dataset.isRecent === '0';
         return card.dataset.isRecent === '1';
       });
-    }
-
-    function scheduleIdleAgePrefetch() {
-      if (idleAgePrefetchHandle) {
-        return;
-      }
-      const otherAge = currentAge === 'recent' ? 'archive' : 'recent';
-      const run = () => {
-        idleAgePrefetchHandle = null;
-        cardsForAge(otherAge)
-          .slice(0, IDLE_INACTIVE_PREFETCH_COUNT)
-          .forEach(card => {
-            if (!card.querySelector('.tldr-detail-content')) {
-              openTldrDetail(card);
-            }
-          });
-      };
-      if ('requestIdleCallback' in window) {
-        idleAgePrefetchHandle = window.requestIdleCallback(run, { timeout: 2500 });
-      } else {
-        idleAgePrefetchHandle = window.setTimeout(run, 1500);
-      }
     }
 
     function sendFeedback(storyId, action) {
@@ -1586,18 +1986,17 @@
 
       window.setTimeout(() => {
         if (card.dataset.voted === action) {
+          const preferred = nextQueuedSibling(card);
           card.remove();
-          showNextCard();
+          showNextCard({ preferred });
+          focusActiveCard();
         }
       }, 150);
 
       const savePromise = enqueueFeedback(storyId, action)
         .then(data => {
-          scheduleDeckRefresh({
-            waitForWarm: true,
-            targetVersion: data.target_version,
-            advance: false,
-          });
+          scheduleVoteRefresh(data);
+          focusActiveCard();
           return data;
         })
         .catch(err => {
@@ -1639,11 +2038,8 @@
       setActiveCard(card);
 
       enqueueFeedback(storyId, 'clear').then(data => {
-        scheduleDeckRefresh({
-          waitForWarm: true,
-          targetVersion: data.target_version,
-          advance: false,
-        });
+        scheduleVoteRefresh(data);
+        focusActiveCard();
         return data;
       }).catch(err => {
         console.error('Network error undoing feedback', err);
@@ -1658,13 +2054,87 @@
       const attr = kind === 'article' ? 'articleUrl' : 'commentsUrl';
       const url = card.dataset[attr];
       if (!url) return;
+      queueInteraction(kind === 'article' ? 'article_open' : 'comments_open', card);
+      flushInteractionEvents();
       window.open(url, '_blank', 'noopener,noreferrer');
     }
 
-    async function openTldrDetail(card) {
+    // Post-render TLDR enhancements, idempotent: strips its own markers
+    // first so retries/re-renders never duplicate them. opts.stale adds a
+    // "stale, refreshing" marker for provisional content. Section wrapping
+    // is skipped when the markdown has no ### headers (single-path TLDRs).
+    function enhanceTldrContent(contentDiv, opts) {
+      const stale = !!(opts && opts.stale);
+      contentDiv.querySelectorAll('.tldr-readtime, .tldr-stale').forEach(el => el.remove());
+      const words = contentDiv.textContent.trim().split(/\s+/).filter(Boolean).length;
+      const readtime = document.createElement('div');
+      readtime.className = 'tldr-readtime';
+      readtime.textContent = words <= 1 ? '' : `~${Math.max(1, Math.round(words / 200))} min read · ${words} words`;
+      if (readtime.textContent) {
+        contentDiv.prepend(readtime);
+      }
+      if (stale) {
+        const marker = document.createElement('p');
+        marker.className = 'tldr-stale';
+        marker.textContent = 'Stale summary — refreshing in the background…';
+        const anchor = contentDiv.querySelector('.tldr-readtime');
+        if (anchor) {
+          anchor.after(marker);
+        } else {
+          contentDiv.prepend(marker);
+        }
+      }
+      const headers = Array.from(contentDiv.children).filter(el => el.tagName === 'H3');
+      if (headers.length === 0 || contentDiv.querySelector('details') !== null) {
+        return;
+      }
+      headers.forEach(h3 => {
+        const details = document.createElement('details');
+        details.open = true;
+        const summary = document.createElement('summary');
+        summary.append(...h3.childNodes);
+        details.append(summary);
+        h3.replaceWith(details);
+        let next = details.nextSibling;
+        while (next && !(next.tagName === 'H3')) {
+          const move = next;
+          next = next.nextSibling;
+          details.append(move);
+        }
+      });
+    }
+
+    // Manual refresh helpers shared by the re-summarize button and the
+    // t/s hotkeys below. refreshTldr force-refreshes (bypasses cache and
+    // cooldown); refreshDeck re-fetches deck cards without advancing.
+    function refreshTldr(card) {
+      openTldrDetail(card || activeCard, { force: true });
+    }
+    function refreshDeck() {
+      queueRefill(false);
+    }
+
+    // Re-summarize control, idempotent: one button per TLDR block that
+    // force-refreshes this card's summary (new comments) on explicit tap.
+    // Never wired from prefetch — only from successful renders below.
+    function ensureTldrRefreshButton(card, contentDiv) {
+      contentDiv.querySelectorAll('.tldr-refresh-btn').forEach(el => el.remove());
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'tldr-refresh-btn';
+      btn.textContent = '↻ re-summarize';
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        refreshTldr(card);
+      });
+      contentDiv.appendChild(btn);
+    }
+
+    async function openTldrDetail(card, opts) {
       if (!card) {
         return;
       }
+      const force = !!(opts && opts.force);
 
       const storyId = Number(card.dataset.storyId);
       const storyTitle = card.querySelector('.story-title a')?.textContent || '';
@@ -1673,7 +2143,7 @@
       if (contentDiv?.dataset.loading === 'true') {
         return;
       }
-      if (contentDiv && contentDiv.style.display !== 'none' && !contentDiv.dataset.error) {
+      if (contentDiv && contentDiv.style.display !== 'none' && !contentDiv.dataset.error && !force) {
         return;
       }
       if (!contentDiv) {
@@ -1682,11 +2152,22 @@
         contentDiv.style.display = 'none';
         card.appendChild(contentDiv);
       }
-      const cached = tldrCache.get(storyId);
+      const cached = force ? undefined : tldrCache.get(storyId);
       if (cached !== undefined) {
         delete contentDiv.dataset.error;
         contentDiv.innerHTML = parseSimpleMarkdown(cached);
         styleTldrLabels(contentDiv);
+        enhanceTldrContent(contentDiv, { stale: false });
+        ensureTldrRefreshButton(card, contentDiv);
+        contentDiv.style.display = 'block';
+        return;
+      }
+
+      const retryAt = tldrRetryAt.get(storyId) || 0;
+      if (!force && Date.now() < retryAt) {
+        const secs = Math.max(1, Math.ceil((retryAt - Date.now()) / 1000));
+        contentDiv.textContent = 'TLDR: provider cooling down, retry in ' + secs + 's';
+        contentDiv.dataset.error = 'true';
         contentDiv.style.display = 'block';
         return;
       }
@@ -1700,7 +2181,7 @@
         const resp = await fetch(detailApiPath, {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ story_id: storyId, story_title: storyTitle })
+          body: JSON.stringify({ story_id: storyId, story_title: storyTitle, force_refresh: force })
         });
         if (resp.ok) {
           const data = await resp.json();
@@ -1711,16 +2192,23 @@
             // filter switch, next-card cycle) retries instead of showing
             // this placeholder/stale summary forever.
             contentDiv.dataset.error = 'true';
+            tldrRetryAt.set(storyId, Date.now() + 60000);
           } else {
             tldrCache.set(storyId, data.tldr);
             delete contentDiv.dataset.error;
           }
           contentDiv.innerHTML = parseSimpleMarkdown(data.tldr);
           styleTldrLabels(contentDiv);
+          enhanceTldrContent(contentDiv, { stale: !!(data.retryable || data.stale) });
+          if (!data.retryable && !data.stale) {
+            ensureTldrRefreshButton(card, contentDiv);
+          }
           contentDiv.style.display = 'block';
         } else {
           const errData = await resp.json().catch(() => ({}));
           const errorMsg = errData.error || `HTTP ${resp.status}`;
+          const retryAfter = Number(resp.headers.get('Retry-After') || errData.retry_after || 30);
+          tldrRetryAt.set(storyId, Date.now() + Math.max(1, Number.isFinite(retryAfter) ? retryAfter : 30) * 1000);
           contentDiv.textContent = 'TLDR: ' + errorMsg;
           contentDiv.dataset.error = 'true';
           contentDiv.style.display = 'block';
@@ -1749,12 +2237,15 @@
       d: () => setFilter('sort', 'date'),
       e: () => setFilter('age', 'recent'),
       a: () => setFilter('age', 'archive'),
+      t: () => refreshTldr(),
+      s: () => refreshDeck(),
       // m/h/n (source filter) temporarily disabled alongside the source
       // toggle UI — see pipeline/render.py::_build_tab_groups.
       f: () => {
         const panel = document.querySelector('.swipe-side');
         panel.classList.toggle('visible');
         document.body.classList.toggle('fullscreen');
+        focusActiveCard();
       },
     };
 

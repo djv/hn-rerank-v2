@@ -8,13 +8,17 @@ import re
 import threading
 import time
 from dataclasses import replace
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+from urllib.error import URLError
 from urllib.parse import urlparse
 
 import feedparser
 import httpx
 
-from database import Database, Story
+from database import Database, Story, StoryIdentityConflict, coerce_int
+
+if TYPE_CHECKING:
+    from ch_client import ChItem
 from reddit_fetch_queue import CoroFactory
 from reddit_feed_cache import cache as reddit_feed_cache
 from reddit_limiter import limiter as reddit_limiter
@@ -26,6 +30,7 @@ from .ranking import (
     compose_story_text,
     _extract_comments_recursive,
     _select_top_comments,
+    join_top_comments,
 )
 
 
@@ -37,16 +42,7 @@ REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dash
 RSS_SELF_TEXT_CHAR_LIMIT = 8_000
 
 
-def _coerce_int(value, default: int = 0) -> int:
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _ch_story_item_to_story(item: dict) -> Story | None:
+def _ch_story_item_to_story(item: ChItem) -> Story | None:
     """Convert a CH live-window item dict (Algolia shape) to a Story row.
 
     The CH live_window query returns the same fields as Algolia items
@@ -54,7 +50,7 @@ def _ch_story_item_to_story(item: dict) -> Story | None:
     children). For live `hn` source, we insert directly with the CH
     data; comment hydration is handled later by the bulk prewarm path.
     """
-    sid = _coerce_int(item.get("id"))
+    sid = coerce_int(item.get("id"))
     title = clean_text(str(item.get("title") or ""))
     if sid <= 0 or not title:
         return None
@@ -66,13 +62,13 @@ def _ch_story_item_to_story(item: dict) -> Story | None:
         id=sid,
         title=title,
         url=item.get("url") or None,
-        score=_coerce_int(item.get("points")),
-        time=_coerce_int(item.get("created_at_i")),
+        score=coerce_int(item.get("points")),
+        time=coerce_int(item.get("created_at_i")),
         text_content=text_content,
         source="hn",
-        comment_count=_coerce_int(item.get("num_comments")),
+        comment_count=coerce_int(item.get("num_comments")),
         discussion_url=f"https://news.ycombinator.com/item?id={sid}",
-        comment_count_at_fetch=_coerce_int(item.get("num_comments")),
+        comment_count_at_fetch=coerce_int(item.get("num_comments")),
         self_text=self_text,
         top_comments="",
         article_body="",
@@ -105,9 +101,9 @@ async def fetch_story(
             else:
                 return None
         if not force:
-            comments_stale = story.top_comments == "" or (
-                story.comment_count or 0
-            ) > (story.comment_count_at_fetch or 0)
+            comments_stale = story.top_comments == "" or (story.comment_count or 0) > (
+                story.comment_count_at_fetch or 0
+            )
             if not comments_stale:
                 return story
             if story.top_comments != "" and (story.comment_count_at_fetch or 0) > 50:
@@ -137,13 +133,17 @@ async def fetch_story(
         children = item.get("children", [])
         all_comments = _extract_comments_recursive(children)
         selected = _select_top_comments(all_comments)
-        top_comment_texts = " ".join(c["text"] for c in selected)[:10000]
+        top_comment_texts = join_top_comments([c["text"] for c in selected])
 
+        # Algolia carries no article body: preserve the stored one, or every
+        # force-refresh (tap active-refresh today, regen growth-refresh next)
+        # would wipe it and silently degrade the TLDR to discussion-only.
+        existing_body = story.article_body if story is not None else ""
         text_content = compose_story_text(
             title=title,
             self_text=story_text,
             comments=top_comment_texts,
-            article_body="",
+            article_body=existing_body,
         )
 
         if not text_content:
@@ -179,14 +179,19 @@ async def fetch_story(
             else len(all_comments),
             self_text=story_text,
             top_comments=top_comment_texts,
-            article_body="",
+            article_body=existing_body,
         )
 
-        db.upsert_story(story)
-        return story
+        db.upsert_story(story, comments_authoritative=bool(top_comment_texts))
+        return db.get_story(sid)
     except Exception as e:
         logging.error("Error fetching story %s: %r", sid, e)
         return story if story else None
+
+
+# Stories per CH fetch chunk in prewarm_top_stories. Keeps a single failed
+# chunk (network blip, CH overload) from zeroing out an entire prewarm run.
+_PREWARM_CHUNK_SIZE = 100
 
 
 def prewarm_top_stories(
@@ -224,11 +229,20 @@ def prewarm_top_stories(
     if not target_ids:
         return 0
 
-    try:
-        ch_items = query_stories_with_comments(target_ids, max_levels=max_levels)
-    except Exception as exc:
-        logging.warning("prewarm_top_stories: CH bulk query failed (%r)", exc)
-        return 0
+    # Chunk the CH fetch: one chunk failing (network blip, CH overload)
+    # should cost that chunk, not the entire prewarm run.
+    ch_items: dict[int, ChItem] = {}
+    for i in range(0, len(target_ids), _PREWARM_CHUNK_SIZE):
+        chunk = target_ids[i : i + _PREWARM_CHUNK_SIZE]
+        try:
+            ch_items.update(query_stories_with_comments(chunk, max_levels=max_levels))
+        except Exception as exc:
+            logging.warning(
+                "prewarm_top_stories: CH bulk query failed for chunk of %d (%r)",
+                len(chunk),
+                exc,
+            )
+            continue
 
     if not ch_items:
         return 0
@@ -242,10 +256,10 @@ def prewarm_top_stories(
         children = item.get("children") or []
         all_comments = _extract_comments_recursive(children)
         selected = _select_top_comments(all_comments)
-        top_comments = " ".join(c["text"] for c in selected)[:10000]
+        top_comments = join_top_comments([c["text"] for c in selected])
         if not top_comments:
             continue
-        comment_count = _coerce_int(
+        comment_count = coerce_int(
             item.get("num_comments"), existing.comment_count or 0
         )
         new_text_content = compose_story_text(
@@ -263,8 +277,10 @@ def prewarm_top_stories(
             comment_count=comment_count,
             comment_count_at_fetch=comment_count,
         )
-        db.upsert_story(updated_story)
-        updated.append(updated_story)
+        db.upsert_story(updated_story, comments_authoritative=True)
+        persisted = db.get_story(sid)
+        if persisted is not None:
+            updated.append(persisted)
 
     if updated and embedder is not None:
         get_or_compute_embeddings(updated, embedder, db)
@@ -367,7 +383,9 @@ def _merge_source_context(
         )
     else:
         top_comments = ctx.top_comments
-    new_text = compose_story_text(story.title, self_text, top_comments, article_body or "")
+    new_text = compose_story_text(
+        story.title, self_text, top_comments, article_body or ""
+    )
     return replace(
         story,
         self_text=self_text,
@@ -684,8 +702,18 @@ async def _fetch_and_parse_feed(
             stories.append(story)
 
         return stories
-    except Exception as e:
-        logging.error("Failed to fetch RSS feed %s: %r", feed_url, e)
+    except (URLError, httpx.HTTPError) as e:
+        # Both httpx and the urllib fallback (fetch_with_urllib_fallback)
+        # were exhausted -- a genuine network-down/DNS/timeout condition,
+        # or a status code neither side treats as retryable. Expected and
+        # transient; not worth a full traceback.
+        logging.warning("Failed to fetch RSS feed %s: %r", feed_url, e)
+        return []
+    except Exception:
+        # Anything else (malformed feed content, a parsing bug, ...) is
+        # unexpected -- keep the full traceback per the project's
+        # no-silent-failures rule.
+        logging.exception("Unexpected error fetching RSS feed %s", feed_url)
         return []
 
 
@@ -765,7 +793,11 @@ async def fetch_rss_feeds(
     all_stories: list[Story] = []
     for res in feed_results:
         for s in res:
-            db.upsert_story(s)
+            try:
+                db.upsert_story(s)
+            except StoryIdentityConflict:
+                logging.warning("rss_identity_conflict story_id=%s url=%s", s.id, s.url)
+                continue
             all_stories.append(s)
 
     return all_stories
@@ -959,7 +991,7 @@ async def fetch_and_cache_article_bodies(
     from server import ARTICLE_BODY_CHAR_LIMIT, _fetch_article_body_with_result
 
     sem = asyncio.Semaphore(max(1, concurrency))
-    model_version = "all-MiniLM-L6-v2|mean|norm|256"
+    model_version = embedder.model_version
 
     success = [0]
     error_counts: dict[str, int] = {}
@@ -980,7 +1012,14 @@ async def fetch_and_cache_article_bodies(
                     db.upsert_story(updated)
                     new_vec = embedder.encode([new_text])[0]
                     new_hash = hashlib.sha256(new_text.encode("utf-8")).hexdigest()
-                    db.upsert_embedding(story.id, model_version, new_hash, new_vec)
+                    db.upsert_embedding(
+                        story.id,
+                        model_version,
+                        new_hash,
+                        new_vec,
+                        model_sha=embedder.model_onnx_sha,
+                        dim=embedder.embedding_dim,
+                    )
                     db.clear_article_fetch_failure(story.id)
                     success[0] += 1
                     return story.id, updated

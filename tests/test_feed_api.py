@@ -101,8 +101,12 @@ def test_feed_parity_authentication_stale_cache_and_eviction(tmp_path: Path) -> 
     vote = client.post("/api/feedback", json={"story_id": 1, "action": "up"})
     assert payload(vote)["target_version"] == 1
     stale = payload(client.get("/api/feed"))
+    assert stale["stories"] == feed["stories"]
     assert stale["version"] == 0 and stale["target_version"] == 1 and not stale["ready"]
-    assert client.get("/").data == document
+    assert (
+        BeautifulSoup(client.get("/").data, "html.parser").select(".story-card")
+        == cards
+    )
     client.set_cookie("hn_token", other.token)
     assert payload(client.get("/api/feed"))["feedback_counts"]["up"] == 0
     client.set_cookie("hn_token", user.token)

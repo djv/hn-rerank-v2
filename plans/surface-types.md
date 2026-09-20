@@ -1,5 +1,10 @@
 # Add `Discussion-rich` and `High-engagement` surfaces
 
+**Completed.** Both surfaces shipped as `is_discussion_rich` /
+`is_high_engagement` on `RankedStory` (`pipeline/ranking.py`), rendered as
+the "Talk-worthy" and "Top" badges (`pipeline/render.py`). Kept here as the
+design record.
+
 ## Goal
 Add two new post-MMR surfaces that mirror the existing `is_uncertain` and `is_novel`
 pattern: a boolean flag on `RankedStory`, a post-rank surfacing pass that pulls
@@ -60,6 +65,10 @@ disappear during cold start when they're arguably most useful.
 ## Changes
 
 ### `pipeline.py`
+
+**Superseded:** line references in this section predate the `pipeline/`
+package split (see ARCHITECTURE.md) and no longer resolve. Historical record
+only.
 
 **1. `RankedStory` dataclass (line 93)**
 - Add `is_discussion_rich: bool = False`

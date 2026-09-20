@@ -28,8 +28,9 @@ dev = [
     "ty>=0.0.10",
     "hn-rerank",
 ]
-dl-experiment = [
-    "torch>=2.12",
+embedding-experiment = [
+    "huggingface-hub>=0.25",
+    "scipy>=1.14",
 ]
 
 [tool.pytest.ini_options]

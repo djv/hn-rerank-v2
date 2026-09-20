@@ -9,6 +9,7 @@ Output ONE section only:
 Markdown formatting:
 - FLAT structure only — no nested list levels.
 - Short bullet points (-) with **bold** key terms.
+Use at most one `####` heading, and only when the section has three or more bullets.
 - Keep each bullet point to a single short sentence.
 - Do not put multiple bullets on one line.
 

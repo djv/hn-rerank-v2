@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tomllib
 from dataclasses import dataclass, field, fields, replace
 from typing import Any, Literal
@@ -10,6 +11,8 @@ class ModelConfig:
     svm_c: float = 0.2
     svm_gamma: float | str = 0.03
     svm_kernel: str = "rbf"
+    svm_precomputed_enabled: bool = False
+    svm_precomputed_chunk_size: int = 512
     neutral_weight: float = 0.0
     enable_mmr: bool = False
     diversity_threshold: float = 0.75
@@ -27,8 +30,15 @@ class ModelConfig:
 
 
 # Shared across all worktrees of this repo (sibling to the `main` checkout)
-# so the 87MB model and secrets never need copying/symlinking per worktree.
-DEFAULT_ONNX_MODEL_DIR = "/home/dev/hn-rewrite/shared/onnx_model"
+# so the ~90MB model and secrets never need copying/symlinking per worktree.
+# Kept in sync with config.toml's [hn_rewrite] onnx_model_dir/
+# embedding_model_version/embedding_max_tokens -- these are the fallback
+# used only when config.toml doesn't override them (it currently does not).
+DEFAULT_ONNX_MODEL_DIR = os.environ.get(
+    "HN_ONNX_MODEL_DIR", "/home/dev/hn-rewrite/shared/mxbai-embed-xsmall-v1"
+)
+DEFAULT_EMBEDDING_MODEL_VERSION = "mxbai-embed-xsmall-v1|mean|norm|4096"
+DEFAULT_EMBEDDING_MAX_TOKENS = 4096
 DEFAULT_ENV_PATH = "/home/dev/hn-rewrite/shared/.env"
 
 BQ_ARCHIVE_SOURCE = "bq_seed"
@@ -57,6 +67,8 @@ class Config:
     days: int = 30
     count: int = 40
     onnx_model_dir: str = DEFAULT_ONNX_MODEL_DIR
+    embedding_model_version: str = DEFAULT_EMBEDDING_MODEL_VERSION
+    embedding_max_tokens: int = DEFAULT_EMBEDDING_MAX_TOKENS
     embedding_batch_size: int = 32
     embedding_ort_variant: Literal[
         "current",
@@ -94,14 +106,33 @@ class Config:
     # embedding, SVM feature prep, and decision_function. The
     # is_uncertain discovery pass is allowed to shift because that
     # signal is orthogonal to the SQL ordering.
+    #
+    # rss_limit matches hn_limit (was 500, ~4,200 in-window rows) so the
+    # `ORDER BY time DESC` leg actually reaches the full `days` window
+    # instead of truncating to the newest ~4 days of it (see WORKLOG
+    # 2026-08-30: pool_rss_oldest_age_h measured ~93h against a 30-day
+    # window). There's no non-HN engagement signal to sort by instead —
+    # score is 0 for nearly all non-HN rows — so once the limit clears
+    # the in-window row count, the ordering stops mattering and the
+    # ranker's own scoring picks the winners from the full window.
     recent_candidate_hn_limit: int = 5000
-    recent_candidate_rss_limit: int = 500
-    tldr_prefetch_per_combo: int = 5
+    recent_candidate_rss_limit: int = 5000
+    non_hn_candidates_enabled: bool = True
+    tldr_prefetch_per_combo: int = 2
     # After the top-per-combo pass, regenerate up to this many additional
     # cold-deck stories whose cached TLDR's cache_key no longer matches
     # current story content (e.g. article_body was enriched after the TLDR
     # was generated). 0 disables. See server.py::_prefetch_tldrs_for_ranked.
-    tldr_prefetch_stale_per_run: int = 3
+    # Kept small: bulk prefetch trips Groq free-tier bans (875s retry-after
+    # observed 2026-09-07), so the steady-state budget is ~10 stories/run.
+    tldr_prefetch_stale_per_run: int = 1
+    # Date-tab coverage: newest-first head of the cold deck, matching the
+    # client's date sort (story.time desc). Deduped against combo picks.
+    tldr_prefetch_date_top_n: int = 3
+    # Seconds between background TLDR prefetch LLM starts (capped at 15s
+    # total offset). Gemini free allows ~10-15 RPM, so a Gemini deployment
+    # wants ~5.0; Groq free tolerates 1.0.
+    tldr_prefetch_stagger_seconds: float = 1.0
     # On-demand HN comment refresh (tldr-detail): forces a real-time Algolia
     # re-fetch for recent, high-velocity threads even when top_comments is
     # already populated from prewarm, since CH prewarm has 1-24h latency on
@@ -109,6 +140,20 @@ class Config:
     tldr_refresh_recent_hours: float = 72.0
     tldr_refresh_min_comments: int = 30
     tldr_refresh_min_comments_per_hour: float = 8.0
+    # Regen live-count probe (Firebase descendants): for young HN threads
+    # with a cached TLDR whose DB-visible growth is sub-threshold, confirm
+    # the live count before spending a full comment hydration. Hydration
+    # (Algolia, real-time) fires only on confirmed growth >= the
+    # _needs_hn_prewarm threshold, so LLM regen happens strictly on known
+    # new content. 0 disables probing.
+    tldr_probe_max_threads_per_regen: int = 20
+    tldr_probe_timeout_seconds: float = 10.0
+    # Tap-time live-count probe (Firebase descendants): on TLDR open of a
+    # young HN thread that would otherwise serve cached, confirm the live
+    # count before trusting the cache. Ungated by velocity by design — the
+    # user is already looking at this story. Miss/failure serves cached.
+    # Kept small so cached taps stay snappy; 0 disables tap probing.
+    tldr_tap_probe_timeout_seconds: float = 3.0
     # Public demo abuse limits. Cached TLDR hits bypass the uncached TLDR
     # quota; these limits protect only new enrichment/LLM work and vote writes.
     tldr_uncached_per_user_limit: int = 12
@@ -119,6 +164,9 @@ class Config:
     feedback_per_user_window_seconds: int = 600
     feedback_global_limit: int = 2000
     feedback_global_window_seconds: int = 3600
+    dashboard_warm_vote_threshold: int = 10
+    dashboard_warm_idle_seconds: float = 3.0
+    feedback_regen_idle_seconds: float = 300.0
     session_create_per_ip_limit: int = 60
     session_create_per_ip_window_seconds: int = 3600
     profile_link_per_ip_limit: int = 120
@@ -129,6 +177,18 @@ class Config:
     def __post_init__(self) -> None:
         if self.embedding_batch_size <= 0:
             raise ValueError("embedding_batch_size must be positive")
+        if not self.embedding_model_version.strip():
+            raise ValueError("embedding_model_version must not be empty")
+        if self.embedding_max_tokens <= 0:
+            raise ValueError("embedding_max_tokens must be positive")
+        if self.dashboard_warm_vote_threshold <= 0:
+            raise ValueError("dashboard_warm_vote_threshold must be positive")
+        if self.dashboard_warm_idle_seconds <= 0:
+            raise ValueError("dashboard_warm_idle_seconds must be positive")
+        if self.feedback_regen_idle_seconds <= 0:
+            raise ValueError("feedback_regen_idle_seconds must be positive")
+        if self.model.svm_precomputed_chunk_size <= 0:
+            raise ValueError("svm_precomputed_chunk_size must be positive")
         if self.embedding_ort_variant not in {
             "current",
             "spin_off",

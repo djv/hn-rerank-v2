@@ -3,7 +3,7 @@
 ## Context
 
 This is a personal, single-user, local-first Hacker News reranking dashboard.
-`GET /` is SWR-cached (`Handler._dashboard_cache`, server.py:920) — the
+`GET /` is SWR-cached (`Handler._dashboard_cache`, server.py:984) — the
 user-facing latency that matters is **vote → warm completion → ready-gated
 refill**, not page-render time. Deployment shape is SQLite + one systemd
 service; do not reach for Postgres, Redis, a message broker, FAISS, or a deep
@@ -36,7 +36,13 @@ fable lacked) — into one canonical roadmap, deduped and re-numbered. Merged
   Reddit circuit are all already in journalctl or directly queryable in the
   DB; a live status endpoint only pays off with an external poller, and none
   exists here. See WORKLOG.md 2026-07-10.
-- 🔍 **Re-verified 2026-09-14** (tree + WORKLOG): PERF-3 (SVC fits per warm), REF-1 (3 late `server` imports in `pipeline/enrichment.py`), REF-2 (`class Handler` global at `server.py:963`), REF-3 (no `TldrDetailService`), F1/F2/F3, B1/B2/B3 still open. Jul Flask route migration did not complete the REF items. TUI client + laptop rename (STATUS.md 2026-09-13) shipped outside roadmap scope.
+- ✅ **Interaction measurement ledger** — 2026-07-12. Added additive STRICT
+  schema v2, idempotent `POST /api/interaction`, bounded client batching,
+  explicit impression/dwell/link telemetry, and backup-verified migration
+  tooling. The neutral client path avoids privacy extensions that block URLs
+  containing "events". The ledger is observation-only: ranking, regeneration,
+  TLDR behavior, and source selection are unchanged. Analysis and experiment
+  assignment remain follow-up work.
 
 ---
 
@@ -72,16 +78,22 @@ replacement/suppression behavior, and p50/p95 `hn_dupes_ms` before/after via
 
 ### PERF-2. Stop paying a full warm per vote (S-M)
 
-**Status 2026-09-14: partial.** Shipped 2026-06-29: 1s vote-warm debounce (`server.py` `_WARM_DEBOUNCE_S`), rapid-vote drain, same-user coalescing, ready-gated refill, completed-deck polling (WORKLOG.md digests 2026-06-29). Remaining: the core ask — every vote still calls `_trigger_warm`; refills are not yet served from the stale ranking with a rerank every Nth vote.
+**Completed 2026-07-11 (`748d3c8`).** Feedback now invalidates the dashboard
+immediately and refills from the stale cached deck while the client suppresses
+voted story IDs. Per-user warm work is coalesced until either the configurable
+vote threshold is reached (default 10) or the configurable idle timer fires
+(default 3 seconds). The implementation preserves version/ready-gating
+semantics and is covered by threshold, idle, stale-refill, and warm-coalescing
+tests.
 
-**Biggest felt win, smallest diff.** A 30-swipe session currently triggers
-~30 full reranks (1s debounce, server.py `_WARM_DEBOUNCE_S`). One vote among
-thousands of feedback rows barely moves the ranking, and the client already
-suppresses `votedStoryIds` locally. Policy change in `_handle_flask_feedback`
-/ `_trigger_warm`: serve refills immediately from the *stale* ranking minus
-voted cards, and only ready-gate a real rerank every Nth vote (e.g. N=10) or
-after T seconds idle. Effect: vote→refill goes from several seconds to
-~instant for most votes, with zero model work.
+**Biggest felt win, smallest diff.** Before this change, a 30-swipe session
+triggered ~30 full reranks (1s debounce, server.py `_WARM_DEBOUNCE_S`). One
+vote among thousands of feedback rows barely moves the ranking, and the client
+already suppresses `votedStoryIds` locally. Policy change in
+`_handle_flask_feedback` / `_trigger_warm`: serve refills immediately from the
+*stale* ranking minus voted cards, and only ready-gate a real rerank every Nth
+vote (e.g. N=10) or after T seconds idle. Effect: vote→refill goes from several
+seconds to ~instant for most votes, with zero model work.
 
 Keep it configurable (a knob, not a hard-coded "every ten votes") and test
 freshness/version semantics rather than assuming a fixed cadence. Extend the
@@ -90,6 +102,23 @@ existing `test_ready_gated_refill_*` / warm-coalescing tests
 10 cards, confirm instant refills + one real warm.
 
 ### PERF-3. Precomputed-kernel SVM inference (M-L, 2-4 days)
+
+**Completed 2026-07-12.** Production now uses the exact precomputed RBF model
+with candidate inference chunked at 512 rows and the original libsvm path
+retained behind a config fallback. The live production-shaped cold benchmark
+reduced decision inference from 5.83s to 0.58s and total ranking from 12.86s to
+6.58s; warm runs measured 0.56-0.58s decision and about 5.1s total. Peak RSS
+rose from 730MiB to 834MiB on a host with 2.6GiB available. Exact top-40 parity
+means temporal ranking metrics are unchanged by construction.
+
+**Read-only benchmark completed 2026-07-12.** On the live user-1 shape (7,910
+candidates, 3,347 training rows), current libsvm inference took 5.78s versus
+445ms to construct the candidate kernel plus 301ms for precomputed inference.
+The top-40 ordering was identical and maximum absolute decision drift was
+`3.12e-7`. Explicit kernel arrays occupied about 101MiB (candidate) and 43MiB
+(training), so the production design must bound peak memory. Reproduce with
+`scripts/benchmark_precomputed_svm.py`; it opens SQLite read-only and refuses
+to run if required embeddings are absent.
 
 **Stable bottleneck, but the highest-effort/least-certain item — do after
 PERF-1/PERF-2, not before.** `SVC.decision_function` is consistently ~5s:
@@ -120,19 +149,12 @@ ordering/tie behavior, temporal-evaluation parity, full-suite verification,
 peak-memory sampling. Do not materialize a full candidate-by-training kernel
 while the service is memory constrained.
 
-### PERF-4. Cache the candidate matrix per regen cycle (S, demoted)
+### PERF-4. Cache the candidate matrix per regen cycle — **Done 2026-07-28**
 
-**Demote until instrumented** — a production-shaped read found only two
-embedding misses, so the occasional 15s `candidate_embedding` tail is likely
-concurrency/content-change related, not "recompute from scratch every warm."
-Add finer substage tracing first (cache hit/miss count, SQLite read, hashing,
-ONNX compute, competing regen/background work) before retaining full
-candidate matrices in memory. Every warm currently re-runs
-`load_production_candidate_stories` and `get_or_compute_embeddings` against
-the DB; candidates only change 4-hourly, so holding `(stories,
-embedding_matrix)` in-process keyed by regen generation is plausible
-(~8000×384 float32 ≈ 12MB, not a memory concern), but confirm the tail is
-actually recompute-bound before adding the cache.
+Shipped as `pipeline/candidate_cache.py`: a process-wide `CandidatePool`
+holding `(stories, embedding_matrix)` keyed by regen generation, with
+`pool_cache=hit|miss` visible in `rank_perf` logging. See
+`ARCHITECTURE.md` §"Shared candidate pool cache (2026-07-28)" for the design.
 
 ---
 
@@ -167,7 +189,7 @@ changed story.
 ### REF-2. Replace class-global `Handler` state with an injected runtime (M, 2-3 days)
 
 **Highest correctness/testability payoff.** All `Handler` state is
-class-level (server.py:915-934), shared process-wide — why conftest needs
+class-level (server.py:~980-1010), shared process-wide — why conftest needs
 autouse singleton-reset fixtures and why parallel test isolation is fragile.
 Introduce an `AppRuntime`/instance (`config`, `db`, `embedder`, regen event,
 public-demo limiter) and a `DashboardService` owning versions, render locks,
@@ -193,8 +215,8 @@ mapping — move cache-key construction, source hydration, LLM generation,
 fallback behavior, and persistence behind the service. Don't start with
 Blueprints; they'd just relocate the same tangled handler.
 
-Then, as a fourth refactor once that boundary exists: extract the ~945-line
-inline `<script>` in `index.html` (52% of the only template) to
+Then, as a fourth refactor once that boundary exists: extract the 1000+-line
+inline `<script>` in `index.html` (over half of the only template) to
 `static/deck.js`. Cuts every dashboard render's payload, ends the
 template-string-test brittleness for JS internals, opens the door to real
 JS/browser unit tests, and gives `tests/test_server.py`'s template assertions
@@ -210,34 +232,24 @@ ordering, active-HN refresh, stale-TLDR fallback, and the rule that
 
 ### F1. Personal archive: true save/read-later + SQLite FTS5 search (M, 1-2 days)
 
-**Highest daily-driver feature.** Right now upvote conflates "good signal"
-with "want to keep." Add a `saved_items` table independent of `feedback`, a
-save button + keyboard shortcut, and a `/library` view backed by SQLite FTS5
-over title, self_text, article_body, and cached TLDRs. A save must **never**
-alter the SVM training label — that's the ranking-isolation invariant to
-test. The killer daily-driver query is "I saw something about X three weeks
-ago"; the corpus already exists, it just isn't searchable. Stdlib, local-first,
-no new deps: one FTS5 virtual table synced by trigger from `stories` +
-`tldr_cache`.
-
-Test: migration, FTS sync after story/TLDR writes, result quality on a
-temporary DB, and ranking isolation.
+**⛔ Rejected 2026-09-08 — the user doesn't want it.** Kept for the record
+so future sessions don't re-propose it. Original pitch: a `saved_items`
+table independent of `feedback`, a save button + keyboard shortcut, and a
+`/library` view backed by SQLite FTS5 over title, self_text, article_body,
+and cached TLDRs.
 
 ### F2. "Because you upvoted …" attribution on cards (S-M, 0.5-1 day)
 
-**High trust/debug value.** The rank pass already computes each candidate's
-nearest upvoted feedback story (`cand_closest_up`, reused via
-`RankScoreContext`). Populate `RankedStory.best_match_title` from that
-existing computation and render a compact, collapsible "Because you upvoted
-…" line plus existing provenance badges. Do **not** present a fabricated
-calibrated probability. Cheap — the data exists at rank time, no new
-full-pool similarity pass. Builds trust and makes bad recommendations
-diagnosable: when the deck goes weird, you'll see exactly which old upvote is
-dragging it. Natural follow-on: a "less like this" action that downweights
-that neighbor.
+**✅ Completed 2026-09-08 (`9a83ffd`).** `RankedStory.best_match_title` is
+populated from the already-computed KNN argmax (`cand_closest_up_idx`,
+no new matmul), gated by `ATTRIBUTION_MIN_SIM=0.35`, rendered as a
+"Because you upvoted …" line on cards.
 
-Test: cold users, deleted feedback stories, HTML escaping, no new similarity
-pass added.
+**Follow-on considered and rejected 2026-09-08:** a "less like this" action
+downweighting the attributed neighbor. Two designs were explored (a separate
+per-user mute table with its own button; then downvote-implicates-neighbor
+via a `feedback.attributed_neighbor_id` edge) and both scrapped — no second
+mechanism, downvote semantics unchanged. See WORKLOG.md.
 
 ### F3. Explore/exploit dial (S, ~1 day)
 
@@ -258,13 +270,12 @@ profile persistence through `/u/<token>`.
 
 ### OPS-1. Decouple Reddit from core regeneration (M, 1-2 days)
 
-**Status 2026-09-14: partial.** Shipped 2026-06-28: rate limiter + backoff + circuit breaker, single-coordinator fetch queue, 2h topfeed cache (WORKLOG.md digests 2026-06-28). Remaining: the core ask — topfeed phase still blocks regen until drain (90-min timeout); HN regen does not yet publish independently on circuit-open. Note: production candidate legs are currently HN-only.
-
-**High priority.** Persist per-feed freshness, retry, and circuit-breaker
-state in SQLite. Core ClickHouse/HN regeneration should use the last
-successful Reddit cache and publish independently while Reddit continues
-best-effort hydration; a later successful Reddit batch can trigger a
-lightweight invalidation.
+**Completed 2026-07-12.** Core ClickHouse/HN and ordinary RSS regeneration
+now publishes without waiting for Reddit. A coalescing Reddit worker refreshes
+topfeeds and comments asynchronously, persists per-feed snapshots/retry state
+and the global circuit cooldown in SQLite, and invalidates the deck once per
+changed batch. Recent rows from all currently configured non-HN feeds are
+again eligible for the mixed deck; removed and historical feed rows are not.
 
 Test with a fake queue/clock: HN regeneration succeeds on schedule when
 Reddit is circuit-open, stale Reddit data remains visible with a clear
@@ -282,6 +293,15 @@ sign-off per the DB-safety rule.)
 
 ### B1. Test preference drift explicitly
 
+**Blocked, not just low-priority — read 2026-08-14, see WORKLOG.md.**
+`scripts/ledger_report.py`'s drift gate found `feedback.updated_at` is
+mutation time, not vote-creation time: all 1,386 of user 1's upvote rows
+show `updated_at` inside the last 60 days (a STRICT-schema-migration and
+other bulk-touch artifact), so recent-vs-older centroid drift isn't
+measurable from the current column. Needs a true vote-creation timestamp
+(or first-seen `interaction_events` fallback) before this item can even be
+evaluated, let alone built.
+
 The ranker receives feedback timestamps but doesn't use them — a 2024-vintage
 upvote counts the same as yesterday's. Add a configuration-gated exponential
 time-decay factor to existing sample weights (half-life ~6 months, one
@@ -294,6 +314,12 @@ Test class gates, cache invalidation, source-level time-split metrics.
 
 ### B2. Add online comparison before adopting model changes
 
+**Confirmed unmeasurable retroactively, 2026-08-14.** `ranker_arm` is
+`'baseline'` on all ~8,000 logged `interaction_events` rows — there is no
+historical data to mine here; it can only be measured by first turning
+interleaving on. Gated on REF-2 (per B3 note below) rather than
+independently actionable today.
+
 NDCG on historical splits ≠ what you actually upvote. Use deterministic
 team-draft interleaving for a baseline vs. experimental deck (built for n=1):
 interleave decks from ranker A and B, record which variant's cards win votes,
@@ -304,6 +330,16 @@ ranking tweak (PERF-3 parity check, B1 decay, F3 dial) into a measured
 decision instead of vibes.
 
 ### B3. Build an impression ledger; don't discard implicit signals
+
+**Ledger exists (2026-07-12) and its consumer is now the recommended next
+step — read 2026-08-14, see WORKLOG.md.** `scripts/ledger_report.py` found
+capped dwell time predicts eventual vote direction with rank-AUC 0.771 (up
+vs. down, 159/171 story-sums, `--since 2026-07-15`) — well above noise. This
+clears the gate the roadmap set for treating dwell as a real signal. Next
+step is the *consumer*: fold capped per-story dwell into `_score_and_rank`
+as a `sample_weight` modifier (or an `eval_ranker_variants.py` label),
+gated the same way B1 would be — one flag, promote only on time-split NDCG
+improvement, never let it silently become a labeling ground truth.
 
 Dwell time per card, TLDR expansions, discussion-link clicks, saves all
 happen client-side and vanish today. Record deck version, rank, source,
@@ -349,12 +385,31 @@ Each item is a visual change only; behavior and the wire contract stay fixed.
 
 1. ~~O2 (metrics table)~~ — done, baseline available via `perf_report.py`.
 2. ~~O1 (backup repair + drill)~~ — done.
-3. **PERF-1** — make HN duplicate resolution local-only during warm ranking.
-4. **PERF-2** — rerank cadence / stale-deck refill policy (biggest felt win).
-5. **PERF-3** (+ **PERF-4** if substage tracing shows it matters) — precomputed
-   kernel SVM, with parity and memory gates.
-6. **OPS-1** — isolate Reddit from core regeneration.
-7. **REF-1 → REF-2 → REF-3**, then **F1-F3** and **B1-B3** by appetite.
+3. ~~**PERF-1** — make HN duplicate resolution local-only during warm
+   ranking~~ — done.
+4. ~~**PERF-2** — rerank cadence / stale-deck refill policy~~ — done.
+5. ~~**PERF-3** — precomputed kernel SVM~~ — done.
+5b. ~~**PERF-4** — cache the candidate matrix per regen cycle~~ — done
+   (`pipeline/candidate_cache.py`, 2026-07-28).
+6. ~~**OPS-1** — isolate Reddit from core regeneration~~ — done.
+7. ~~read the interaction ledger (`scripts/ledger_report.py`)~~ — done,
+   2026-08-14. Result: B1 blocked (no true vote-creation timestamp), B2
+   unmeasurable retroactively (constant `ranker_arm`), **B3 cleared**
+   (dwell rank-AUC 0.771). See WORKLOG.md.
+8. ~~**B3's consumer** (dwell as a `sample_weight` modifier), then
+   **REF-1 → REF-2 → REF-3**, then **F1-F3** by appetite. B1/B2 stay
+   blocked/deferred until their prerequisites above are addressed.~~ —
+   rewritten 2026-09-08: F2 shipped early, F1 rejected outright. New order:
+   **F3 dial → B3 consumer → REF-1 → REF-2 → REF-3** by appetite. B1/B2 stay
+   blocked/deferred. — updated 2026-09-09: **B3 consumer KILLED by eval**
+   (`margin3_dwell` vs production on latest-20% window, 5 temporal folds:
+   NDCG@40 −0.005±0.059, MAP +0.003±0.025, median rank +6; strictly worse
+   than plain `margin3_up` on every headline metric; leak check clean so
+   the null is trustworthy). Univariate dwell AUC ≠ ranking lift — dwell
+   tracks exposure, upweighting it flattens the margin. New order:
+   **F3 dial → REF-1 → REF-2 → REF-3** by appetite. Warm-latency options (bounded RBF shortlist, etc.) live
+   in ARCHITECTURE.md §3.5 as saved options, not roadmap items — warm is
+   ~4s steady-state, so they stay parked unless it regresses.
 
 ## Verification (applies to whichever items proceed)
 
