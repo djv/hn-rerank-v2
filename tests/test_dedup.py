@@ -12,7 +12,7 @@ from dedup import (
     dedup_ranked,
     normalize_url,
 )
-from hypothesis import HealthCheck, given, settings, strategies as st
+from hypothesis import given, settings, strategies as st
 from pipeline import Config, Embedder, fast_rerank_for_user
 
 
@@ -40,6 +40,15 @@ def test_normalize_url_handles_basic_variants() -> None:
     )
     assert normalize_url("https://EXAMPLE.com/Path") == normalize_url(
         "https://example.com/Path"
+    )
+    assert normalize_url("http://example.com:80/path") == normalize_url(
+        "http://example.com/path"
+    )
+    assert normalize_url("https://example.com:443/path") == normalize_url(
+        "https://example.com/path"
+    )
+    assert normalize_url("https://example.com:8443/path") == (
+        "example.com:8443/path"
     )
 
 
@@ -93,21 +102,56 @@ def test_normalize_url_real_world_hn() -> None:
     assert url1 == url2
 
 
-@settings(max_examples=20, suppress_health_check=[HealthCheck.function_scoped_fixture])
-@given(
-    st.sampled_from(
-        [
-            "https://www.example.com/path",
-            "https://Example.com/Path",
-            "https://example.com/path/",
-            "https://example.com/path?utm_source=hn",
-        ]
-    )
-)
-def test_normalize_url_property_idempotent_on_variants(raw: str) -> None:
-    once = normalize_url(raw)
-    twice = normalize_url(once)
-    assert once == twice
+_URL_HOSTS = ["example.com", "news.ycombinator.com", "my-blog.dev"]
+_URL_TRACKERS = ["utm_source", "utm_medium", "fbclid", "gclid", "msclkid"]
+_URL_PATH_SEGMENT = st.text(alphabet="abcdefghijklmnopqrstuvwxyz0123456789", min_size=1, max_size=8)
+
+
+@st.composite
+def _noisy_and_clean_url(draw: st.DrawFn) -> tuple[str, str]:
+    """Build a (noisy, clean) URL pair that `normalize_url` must equate.
+
+    `noisy` layers on scheme choice, a `www.` prefix, host casing, a
+    trailing slash, tracking-param noise, and a fragment -- every
+    dimension `normalize_url` claims to strip -- on top of the same
+    host/path as `clean`.
+    """
+    host = draw(st.sampled_from(_URL_HOSTS))
+    path_segs = draw(st.lists(_URL_PATH_SEGMENT, min_size=0, max_size=3))
+    path = "/" + "/".join(path_segs) if path_segs else ""
+    trackers = draw(st.sets(st.sampled_from(_URL_TRACKERS), max_size=3))
+    scheme = draw(st.sampled_from(["http", "https"]))
+    www = draw(st.booleans())
+    upper_host = draw(st.booleans())
+    trailing_slash = draw(st.booleans())
+    fragment = draw(st.sampled_from(["", "section", "top"]))
+
+    noisy_host = ("www." if www else "") + (host.upper() if upper_host else host)
+    noisy_path = path + ("/" if trailing_slash and path else "")
+    query_parts = [f"{t}=x" for t in sorted(trackers)]
+    noisy_query = ("?" + "&".join(query_parts)) if query_parts else ""
+    noisy_frag = f"#{fragment}" if fragment else ""
+    noisy = f"{scheme}://{noisy_host}{noisy_path}{noisy_query}{noisy_frag}"
+
+    clean = f"https://{host}{path}"
+    return noisy, clean
+
+
+@settings(max_examples=100)
+@given(pair=_noisy_and_clean_url())
+def test_normalize_url_property_idempotent_on_variants(pair: tuple[str, str]) -> None:
+    noisy, clean = pair
+
+    # Every noise dimension normalize_url documents stripping (scheme,
+    # www, case, trailing slash, trackers, fragment) collapses to the
+    # same canonical form as the already-clean URL.
+    normalized_noisy = normalize_url(noisy)
+    normalized_clean = normalize_url(clean)
+    assert normalized_noisy == normalized_clean
+
+    # And normalization is idempotent on both forms.
+    assert normalize_url(normalized_noisy) == normalized_noisy
+    assert normalize_url(normalized_clean) == normalized_clean
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +204,19 @@ def test_dedup_ranked_prefers_higher_score_within_same_source() -> None:
     b = _story(2, url="https://example.com/a", source="hn", score=500)
     out = dedup_ranked([a, b], [], DedupConfig())
     assert [s.id for s in out] == [2]
+
+
+def test_dedup_ranked_same_score_keeps_first_occurrence() -> None:
+    """Same source + same score: the earlier-ranked story wins, not the later.
+
+    Regression: `_story_sort_key` used `-position` as its tiebreak, so a
+    same-source/same-score duplicate bucket kept the *later* input instead
+    of the earlier one (the ranker had already ordered them).
+    """
+    a = _story(1, url="https://example.com/a", source="hn", score=100)
+    b = _story(2, url="https://example.com/a", source="hn", score=100)
+    assert [s.id for s in dedup_ranked([a, b], [], DedupConfig())] == [1]
+    assert [s.id for s in dedup_ranked([b, a], [], DedupConfig())] == [2]
 
 
 def test_dedup_ranked_keeps_null_url_stories_through() -> None:
@@ -313,6 +370,18 @@ def test_embedding_cosine_source_preference_tiebreak() -> None:
     out = dedup_ranked([a, b], [], DedupConfig(), embeddings=embeddings)
     assert len(out) == 1
     assert out[0].id == 2  # HN wins even though slashdot was first
+
+
+def test_embedding_cosine_same_score_keeps_first_occurrence() -> None:
+    """Same source + same score: embedding dedup keeps earlier-ranked story."""
+    a = _story(1, url="https://a.com/x", source="hn", score=100)
+    b = _story(2, url="https://b.com/x", source="hn", score=100)
+    v = _unit_vec(1)
+    embeddings = {1: v, 2: v}
+    out = dedup_ranked([a, b], [], DedupConfig(), embeddings=embeddings)
+    assert [s.id for s in out] == [1]
+    out = dedup_ranked([b, a], [], DedupConfig(), embeddings=embeddings)
+    assert [s.id for s in out] == [2]
 
 
 def test_embedding_cosine_no_embedding_for_story() -> None:

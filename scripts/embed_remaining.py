@@ -6,37 +6,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from database import Database, Story
+from database import Database
 from pipeline import Config, Embedder, get_or_compute_embeddings
-
-STORY_COLS = (
-    "id, title, url, score, time, text_content, source, "
-    "comment_count, discussion_url, comment_count_at_fetch, "
-    "self_text, top_comments, article_body"
-)
-
-
-def rows_to_stories(rows: list[tuple]) -> list[Story]:
-    out: list[Story] = []
-    for r in rows:
-        out.append(
-            Story(
-                id=int(r[0]),
-                title=str(r[1] or ""),
-                url=str(r[2]) if r[2] else None,
-                score=int(r[3] or 0),
-                time=int(r[4] or 0),
-                text_content=str(r[5] or ""),
-                source=str(r[6] or ""),
-                comment_count=int(r[7] or 0),
-                discussion_url=str(r[8] or ""),
-                comment_count_at_fetch=int(r[9] or 0),
-                self_text=str(r[10] or ""),
-                top_comments=str(r[11] or ""),
-                article_body=str(r[12] or ""),
-            )
-        )
-    return out
+from scripts._seed_common import STORY_COLS, rows_to_stories
 
 
 def main() -> None:
@@ -46,17 +18,30 @@ def main() -> None:
     db = Database(config.db_path)
     embedder = Embedder(
         config.onnx_model_dir,
+        model_version=config.embedding_model_version,
+        max_tokens=config.embedding_max_tokens,
         batch_size=config.embedding_batch_size,
         ort_variant=config.embedding_ort_variant,
     )
 
+    # NOT EXISTS on model_version (not a LEFT JOIN ... IS NULL on story_id)
+    # so this also catches stories whose only embeddings row is stale --
+    # e.g. left over from a prior encoder before an embedding_model_version
+    # switch in config.toml. `embeddings` is one row per story_id
+    # (upsert_embedding does ON CONFLICT(story_id) DO UPDATE), so a story
+    # last embedded under an old model never resurfaces via a plain
+    # "any embedding exists" check.
     rows = db.execute(
-        "SELECT s.id FROM stories s "
-        "LEFT JOIN embeddings e ON e.story_id = s.id "
-        "WHERE e.story_id IS NULL"
+        "SELECT s.id FROM stories s WHERE NOT EXISTS "
+        "(SELECT 1 FROM embeddings e WHERE e.story_id = s.id AND e.model_version = ?)",
+        (embedder.model_version,),
     )
     unembedded_ids = [int(r[0]) for r in rows]
-    logging.info("stories missing embeddings: %s", len(unembedded_ids))
+    logging.info(
+        "stories missing/stale embeddings for model_version=%s: %s",
+        embedder.model_version,
+        len(unembedded_ids),
+    )
 
     computed = 0
     for i in range(0, len(unembedded_ids), 500):

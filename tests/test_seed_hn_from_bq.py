@@ -233,7 +233,7 @@ async def test_comment_hydration_success_updates_embedding(monkeypatch):
         assert story.comment_count_at_fetch == 2
         assert "Substantive comment" in story.text_content
 
-        model_version = "all-MiniLM-L6-v2|mean|norm|256"
+        model_version = DummyEmbedder.model_version
         text_hash = hashlib.sha256(
             story_embedding_text(story).encode("utf-8")
         ).hexdigest()

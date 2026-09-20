@@ -125,6 +125,8 @@ def main() -> None:
         user_id = args.user_id if args.user_id is not None else _heaviest_user_id(db)
         embedder = Embedder(
             base.onnx_model_dir,
+            model_version=base.embedding_model_version,
+            max_tokens=base.embedding_max_tokens,
             batch_size=base.embedding_batch_size,
             ort_variant=base.embedding_ort_variant,
         )

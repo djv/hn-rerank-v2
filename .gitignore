@@ -15,7 +15,10 @@ public/
 .mimocode/
 eval_ranker_*.json
 *_sweep_*.json
+eval_no_hn_features.json
 eval_results/
 cookie.txt
 calibration_plot.png
 hn_rewrite.db.*
+.opencode/
+.playwright-mcp/

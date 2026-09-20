@@ -16,10 +16,22 @@ until the spread completes.
 
 State machine:
 
-  - `enqueue_spread` clears `_idle_event` and pushes N tasks with
-    evenly-spaced target timestamps.
-  - The worker loop pops tasks whose `target_at <= now` and runs them
-    one at a time (synchronous from the caller's perspective).
+  - `enqueue_spread` clears `_idle_event`, pushes N tasks with
+    evenly-spaced target timestamps, and records the computed stride
+    as `_current_min_gap`.
+  - The worker loop pops tasks whose `target_at <= now` AND whose
+    `_current_min_gap` has elapsed since the previously dispatched
+    task actually finished, and runs them one at a time (synchronous
+    from the caller's perspective). The second condition exists
+    because `target_at` alone assumes zero task duration: a task whose
+    factory retries internally (e.g. a Reddit 429 backoff, commonly
+    ~57s) can overrun its scheduled slot, leaving the next task's
+    `target_at` already stale by the time the worker is free again. On
+    2026-08-01, production logs showed exactly this — a 429-retry wait
+    on one task collapsed the gap before the next task's HTTP request
+    to ~1.5s (the limiter's bare `INTER_REQUEST_DELAY` floor), well
+    under Reddit's real tolerance, causing a self-reinforcing 429
+    cascade (see WORKLOG 2026-08-01 "429-cascade").
   - When the heap is empty, the worker sets `_idle_event` and sleeps
     for `POLL_INTERVAL` before re-checking.
   - `wait_until_empty` returns when `_idle_event` is set (or the
@@ -82,6 +94,17 @@ class RedditFetchQueue:
         self._stop = threading.Event()
         self._completed = 0
         self._failed = 0
+        # Reservation floor for the *next* dispatch, in the same spirit as
+        # RedditRateLimiter._next_allowed_at (reddit_limiter.py): a task's
+        # pre-computed `target_at` assumes zero task duration, so it goes
+        # stale the moment a task overruns its slot (e.g. a 429-retry wait
+        # inside the factory). `_last_dispatch_at` records when the most
+        # recently *dispatched* task actually finished, and `_pop_ready`
+        # requires `_current_min_gap` to elapse from there too — closing
+        # the gap a stale `target_at` would otherwise leave wide open. See
+        # WORKLOG 2026-08-01 "429-cascade" for the incident this fixes.
+        self._last_dispatch_at: float = 0.0
+        self._current_min_gap: float = self.MIN_FETCH_SPACING
         self._thread = threading.Thread(
             target=self._worker, name="reddit-fetch-queue", daemon=True
         )
@@ -121,6 +144,7 @@ class RedditFetchQueue:
         stride = window_seconds / n
         with self._lock:
             self._idle_event.clear()
+            self._current_min_gap = stride
             for i, factory in enumerate(factories):
                 heapq.heappush(
                     self._heap,
@@ -202,10 +226,16 @@ class RedditFetchQueue:
                 self._idle_event.set()
                 return None
             task = self._heap[0]
-            if task.target_at <= now:
-                heapq.heappop(self._heap)
-                return task
-            return None
+            # A task is ready only once BOTH its own schedule slot has
+            # arrived AND at least `_current_min_gap` has elapsed since the
+            # last dispatched task actually finished. The second condition
+            # is what keeps a retry-induced overrun on one task from
+            # collapsing the spacing on the next — see `__init__`.
+            floor = max(task.target_at, self._last_dispatch_at + self._current_min_gap)
+            if floor > now:
+                return None
+            heapq.heappop(self._heap)
+            return task
 
     def _worker(self) -> None:
         while not self._stop.is_set():
@@ -220,6 +250,9 @@ class RedditFetchQueue:
             except Exception:
                 self._failed += 1
                 logger.exception("reddit_fetch_queue task %s failed", task.task_id)
+            finally:
+                with self._lock:
+                    self._last_dispatch_at = time.monotonic()
 
     def shutdown(self, timeout: float = WORKER_JOIN_TIMEOUT) -> None:
         """Stop the worker thread. For tests and graceful shutdown only."""
@@ -233,6 +266,8 @@ class RedditFetchQueue:
             self._idle_event.set()
             self._completed = 0
             self._failed = 0
+            self._last_dispatch_at = 0.0
+            self._current_min_gap = self.MIN_FETCH_SPACING
 
     def stats(self) -> dict[str, int]:
         with self._lock:

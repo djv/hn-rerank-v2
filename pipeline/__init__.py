@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from typing import Any
 
+import httpx
 import numpy as np
 from numpy.typing import NDArray
 
-from database import Database, Story
-from reddit_fetch_queue import CoroFactory
+from database import Database, Story, StoryIdentityConflict, coerce_int
 
 # ruff: noqa: F401 — re-exports for the public pipeline namespace.
 from .config import (
@@ -36,6 +38,7 @@ from .ranking import (
     PRIMARY_PER_COMBO,
     RankScoreContext,
     RankTrace,
+    RankedComment,
     RankedStory,
     SOURCE_CATEGORIES,
     TOP_COMMENT_CORE_THREADS,
@@ -64,7 +67,6 @@ from .ranking import (
     _minmax01,
     _positive_cluster_centers,
     _positive_cluster_similarity,
-    _rank_percentiles,
     _score_and_rank,
     _select_top_comments,
     _set_cached_model,
@@ -75,6 +77,7 @@ from .ranking import (
     clean_text,
     compose_story_text,
     get_or_compute_embeddings,
+    join_top_comments,
     mmr_filter,
     rerank_candidates,
     source_category_onehot,
@@ -86,7 +89,6 @@ from .enrichment import (
     REDDIT_RSS_USER_AGENT,
     _article_failure_retry_time,
     _ch_story_item_to_story,
-    _coerce_int,
     _fetch_and_parse_feed,
     _is_fetchable_article_url,
     _merge_source_context,
@@ -104,6 +106,11 @@ from .enrichment import (
     select_article_fetch_candidates,
 )
 from .hn_dupes import _load_feedback_context, _matches_feedback, canonicalize_hn_dupes
+from .candidate_cache import (
+    CandidatePool,
+    get_candidate_pool,
+    invalidate_candidate_pool,
+)
 
 from .render import (
     generate_dashboard_bytes,
@@ -116,46 +123,28 @@ from reddit_limiter import limiter as reddit_limiter
 COLD_DECK_LIMIT = 100
 
 
+@dataclass(frozen=True)
+class RedditRefreshResult:
+    feeds: int
+    changed_stories: int
+    hydrated_stories: int
+    prewarm_candidates: int
+
+    @property
+    def changed(self) -> bool:
+        return self.changed_stories > 0 or self.hydrated_stories > 0
+
+
 def _combo_keys_for_story(story: Story, recent_cutoff: int) -> str:
     age = "recent" if story.time >= recent_cutoff else "archive"
     source = "hn" if is_hn_source(story.source) else "non-hn"
     return f"{age}_{source} {age}_mixed"
 
 
-def build_cold_deck(
-    db: Database, config: Config, user_id: int | None = None
-) -> list[RankedStory]:
-    """Build a gravity-sorted, badge-annotated fallback deck — no embeddings,
-    no personalization.
-
-    Uses the same tier-1 gravity formula as ``_score_and_rank`` so a
-    zero-vote user sees the same ranking as the cold deck.  See
-    ``fast_rerank_for_user`` for the 0-vote short-circuit.
-
-    Reuses the same HN-only candidate legs (recent + archive) as the
-    personalized dashboard via ``load_production_candidate_stories``, and
-    the same non-personalized Popular badge assembly (Hot/Top/Talk) as
-    ``rerank_candidates`` via ``_assemble_combo_deck``, so cold-start decks
-    have Popular and Archive combos populated instead of being flat
-    recent-only cards. Explore (Unsure/Novel/Similar) is intentionally
-    skipped — it's personalized and requires feedback to compute against.
-
-    When *user_id* is provided, already-voted stories are excluded.
-    """
-    now_ts = int(time.time())
-    candidates = load_production_candidate_stories(
-        db,
-        config,
-        user_id=user_id,
-        exclude_feedback=user_id is not None,
-        now_ts=now_ts,
-    )
-    candidates = [story for story in candidates if is_summarizable(story)]
-    if not candidates:
-        return []
-
-    recent_cutoff = now_ts - (30 * 86400)
-    ranked = [
+def cold_ranked_candidates(candidates: list[Story], now_ts: int) -> list[RankedStory]:
+    """Production zero-feedback scores and browser eligibility before selection."""
+    recent_cutoff = now_ts - 30 * 86400
+    return [
         RankedStory(
             story=story,
             score=story.score / ((now_ts - story.time) / 3600.0 + 2.0) ** 1.8,
@@ -167,12 +156,68 @@ def build_cold_deck(
         for story in candidates
     ]
 
+
+def build_cold_deck(
+    db: Database,
+    config: Config,
+    user_id: int | None = None,
+    embedder: Embedder | None = None,
+    trace: RankTrace | _NullTrace = NULL_TRACE,
+    *,
+    candidates: list[Story] | None = None,
+) -> list[RankedStory]:
+    """Build a gravity-sorted, badge-annotated fallback deck — no embeddings,
+    no personalization.
+
+    Uses the same tier-1 gravity formula as ``_score_and_rank`` so a
+    zero-vote user sees the same ranking as the cold deck.  See
+    ``fast_rerank_for_user`` for the 0-vote short-circuit.
+
+    Reuses the same production candidate legs as the
+    personalized dashboard via ``load_production_candidate_stories``, and
+    the same non-personalized Popular badge assembly (Hot/Top/Talk) as
+    ``rerank_candidates`` via ``_assemble_combo_deck``, so cold-start decks
+    have Popular and Archive combos populated instead of being flat
+    recent-only cards. Explore (Unsure/Novel/Similar) is intentionally
+    skipped — it's personalized and requires feedback to compute against.
+
+    When *user_id* is provided, already-voted stories are excluded.
+
+    When *embedder* is provided, the candidate pool is served from the
+    process-wide cache (``pipeline.candidate_cache``) instead of a fresh
+    SQL load — this is the production path (server.py passes the runtime
+    embedder), and avoids re-paying the ~2-8s candidate SQL/embedding cost
+    on every cold-deck build. Without an embedder (e.g. offline tests),
+    falls back to a direct, uncached load; cold-deck ranking never uses
+    embeddings so behavior is identical either way.
+    """
+    now_ts = int(time.time())
+    if candidates is None:
+        if embedder is not None:
+            pool = get_candidate_pool(db, config, embedder, trace=trace)
+            if user_id is not None:
+                voted_ids = frozenset(_voted_story_ids(db, user_id))
+                candidates, _ = pool.without_feedback(voted_ids)
+            else:
+                candidates = list(pool.stories)
+        else:
+            candidates = load_production_candidate_stories(
+                db,
+                config,
+                user_id=user_id,
+                exclude_feedback=user_id is not None,
+                now_ts=now_ts,
+                trace=trace,
+            )
+    if not candidates:
+        return []
+
+    recent_cutoff = now_ts - (30 * 86400)
+    ranked = cold_ranked_candidates(candidates, now_ts)
+
     cand_scores = np.array([story.score for story in candidates])
     cand_velocities = np.array(
-        [
-            story.score / max((now_ts - story.time) / 3600.0, 0.1)
-            for story in candidates
-        ]
+        [story.score / max((now_ts - story.time) / 3600.0, 0.1) for story in candidates]
     )
     story_id_to_idx = {story.id: idx for idx, story in enumerate(candidates)}
 
@@ -185,6 +230,7 @@ def build_cold_deck(
         idx_for=story_id_to_idx.__getitem__,
         embeddings_map=None,
         explore=None,
+        trace=trace,
     )
     return cold[:COLD_DECK_LIMIT]
 
@@ -196,14 +242,22 @@ def load_production_candidate_stories(
     user_id: int | None,
     exclude_feedback: bool,
     now_ts: int | None = None,
+    trace: RankTrace | _NullTrace = NULL_TRACE,
 ) -> list[Story]:
     """Load the same candidate legs used by the personalized dashboard.
 
     ``exclude_feedback=False`` is for offline evaluation: the initial pool
     needs feedback stories present so held-out folds can be measured.
 
-    Hardcoded to HN sources only (``hn``, ``bq_seed``, ``ch_seed``) for
-    now — non-HN legs (RSS/Reddit/LessWrong) are disabled.
+    Runs three legs: recent HN by gravity, archive HN seeds (``bq_seed``/
+    ``ch_seed``) by score, and — when ``config.non_hn_candidates_enabled``
+    and ``config.rss.enabled`` — recent rows from the currently configured
+    RSS/Reddit/LessWrong feeds. Sets ``pool_hn``, ``pool_archive``,
+    ``pool_rss`` (post-``is_summarizable`` counts) and, when the RSS leg
+    runs, ``pool_rss_oldest_age_h`` (age in hours of the oldest RSS row
+    returned, exposing how much of the configured ``days`` window that
+    leg's ``LIMIT`` actually reaches) on *trace* for diagnosing candidate
+    pool composition.
     """
     if exclude_feedback and user_id is None:
         raise ValueError("user_id is required when exclude_feedback=True")
@@ -219,8 +273,8 @@ def load_production_candidate_stories(
         (user_id,) if exclude_feedback and user_id else ()
     )
 
-    # HN-only production legs: recent HN by gravity, archive HN seeds by
-    # score. Non-HN legs (RSS/Reddit/LessWrong) are disabled for now.
+    # Production legs: recent HN by gravity, archive HN seeds by score,
+    # and (when enabled) recent rows from currently configured feeds.
     hn_rows = db.execute(
         "SELECT id, title, url, score, time, text_content, source, comment_count, "
         "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
@@ -250,12 +304,66 @@ def load_production_candidate_stories(
             BQ_ARCHIVE_CANDIDATE_LIMIT + CH_ARCHIVE_CANDIDATE_LIMIT,
         ),
     )
-    rows = hn_rows + archive_rows
-    return [
-        story
-        for story in (Database._row_to_story(row) for row in rows)
-        if is_summarizable(story)
+    rss_rows: list[tuple[Any, ...]] = []
+    if config.non_hn_candidates_enabled and config.rss.enabled:
+        configured_sources = tuple(
+            dict.fromkeys(_rss_source_name(feed) for feed in config.rss.feeds)
+        )
+        if configured_sources:
+            placeholders = ",".join("?" for _ in configured_sources)
+            rss_rows = db.execute(
+                "SELECT id, title, url, score, time, text_content, source, comment_count, "
+                "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
+                "FROM stories "
+                f"WHERE time >= ? AND source IN ({placeholders}) "
+                f"{feedback_filter}"
+                "ORDER BY time DESC LIMIT ?",
+                (
+                    cutoff_ts,
+                    *configured_sources,
+                    *feedback_params,
+                    config.recent_candidate_rss_limit,
+                ),
+            )
+    hn_stories = [
+        s
+        for s in (Database._row_to_story(row) for row in hn_rows)
+        if is_summarizable(s)
     ]
+    archive_stories = [
+        s
+        for s in (Database._row_to_story(row) for row in archive_rows)
+        if is_summarizable(s)
+    ]
+    rss_stories = [
+        s
+        for s in (Database._row_to_story(row) for row in rss_rows)
+        if is_summarizable(s)
+    ]
+    trace.set_count("pool_hn", len(hn_stories))
+    trace.set_count("pool_archive", len(archive_stories))
+    trace.set_count("pool_rss", len(rss_stories))
+    if rss_stories:
+        oldest_rss_time = min(s.time for s in rss_stories)
+        trace.set_count("pool_rss_oldest_age_h", int((now - oldest_rss_time) / 3600))
+    return hn_stories + rss_stories + archive_stories
+
+
+def _voted_story_ids(db: Database, user_id: int) -> set[int]:
+    """All story IDs a user has left feedback on, any action.
+
+    Mirrors the ``id NOT IN (SELECT story_id FROM feedback WHERE user_id = ?)``
+    exclusion in ``load_production_candidate_stories`` — used to apply the
+    same exclusion as an in-memory mask over the cached candidate pool
+    instead of a SQL filter.
+    """
+    rows = db.execute("SELECT story_id FROM feedback WHERE user_id = ?", (user_id,))
+    return {row[0] for row in rows}
+
+
+def _growth_threshold(fetched: int) -> int:
+    """Known-growth bar: max(fetched // 3, 5) — ~33% with a 5-comment floor."""
+    return max(fetched // 3, 5)
 
 
 def _needs_hn_prewarm(s: Story) -> bool:
@@ -263,9 +371,8 @@ def _needs_hn_prewarm(s: Story) -> bool:
 
     Triggers when (a) ``top_comments`` is empty, (b) we have no fetch
     history (``comment_count_at_fetch <= 0``), or (c) the live comment
-    count has grown meaningfully since the last prewarm: at least
-    ``max(fetched // 3, 5)`` new comments — roughly 33% growth with a
-    5-comment floor.
+    count has grown meaningfully since the last prewarm (see
+    ``_growth_threshold``).
 
     The threshold catches the 1->284 "stale single-comment stub" case
     (WORKLOG 2026-06-29) and keeps small stories (10-50 fetched comments)
@@ -285,8 +392,218 @@ def _needs_hn_prewarm(s: Story) -> bool:
     if fetched <= 0:
         return True
     growth = (s.comment_count or 0) - fetched
-    threshold = max(fetched // 3, 5)
-    return growth >= threshold
+    return growth >= _growth_threshold(fetched)
+
+
+# Firebase item endpoint: live descendants only (~500 bytes, no auth). The
+# cheap "do we know there's new content" probe — full comment trees still
+# come from Algolia, and only after confirmed growth.
+_FIREBASE_ITEM_URL = "https://hacker-news.firebaseio.com/v0/item/{sid}.json"
+_PROBE_CONCURRENCY = 5
+_HYDRATE_CONCURRENCY = 4
+
+
+def _probe_eligible_threads(
+    candidates: Sequence[Story],
+    cached_ids: set[int],
+    recent_hours: float,
+    now: float,
+) -> list[Story]:
+    """Young cached-TLDR threads whose DB-visible growth is sub-threshold.
+
+    Invisible to ``_needs_hn_prewarm`` (growth < bar) but possibly still
+    growing — the DB count lags CH by 1-24h. Velocity-ordered so the regen
+    cap spends probes on the hottest threads first. Stories with known
+    growth or no fetch history are excluded: the normal prewarm path
+    already owns them.
+    """
+    eligible: list[Story] = []
+    for s in candidates:
+        if not is_hn_source(s.source):
+            continue
+        if not s.top_comments or s.id not in cached_ids:
+            continue
+        if s.time <= 0:
+            continue
+        age_hours = (now - s.time) / 3600.0
+        if age_hours <= 0 or age_hours > recent_hours:
+            continue
+        fetched = s.comment_count_at_fetch or 0
+        if fetched <= 0:
+            continue
+        growth = (s.comment_count or 0) - fetched
+        if growth >= _growth_threshold(fetched):
+            continue
+        eligible.append(s)
+    eligible.sort(
+        key=lambda s: (s.comment_count or 0) / max((now - s.time) / 3600.0, 1e-6),
+        reverse=True,
+    )
+    return eligible
+
+
+async def _probe_live_counts(
+    stories: Sequence[Story], timeout_s: float
+) -> dict[int, int]:
+    """Live Firebase descendants per story id.
+
+    Failures, unparseable bodies, and counts that move backwards are
+    silently omitted — the caller treats absence as "no known growth".
+    """
+    counts: dict[int, int] = {}
+    if not stories:
+        return counts
+    sem = asyncio.Semaphore(_PROBE_CONCURRENCY)
+
+    async with httpx.AsyncClient(timeout=timeout_s) as client:
+
+        async def _one(s: Story) -> tuple[int, int] | None:
+            async with sem:
+                try:
+                    resp = await client.get(_FIREBASE_ITEM_URL.format(sid=s.id))
+                except Exception as exc:
+                    logging.warning("tldr_probe story_id=%s failed: %r", s.id, exc)
+                    return None
+                if resp.status_code != 200:
+                    logging.warning(
+                        "tldr_probe story_id=%s status=%s", s.id, resp.status_code
+                    )
+                    return None
+                try:
+                    body = resp.json()
+                    live = int((body or {}).get("descendants") or 0)
+                except Exception:
+                    logging.warning("tldr_probe story_id=%s unparseable body", s.id)
+                    return None
+                if live <= (s.comment_count or 0):
+                    return None
+                return (s.id, live)
+
+        for result in await asyncio.gather(*(_one(s) for s in stories)):
+            if result is not None:
+                counts[result[0]] = result[1]
+    return counts
+
+
+# Regen-local probe memory: sid -> (probed_at, count_seen). Stops flat
+# threads (live count stuck between DB count and at_fetch) from burning a
+# probe slot every regen. Re-probe when the DB count moves (new CH info)
+# or after _PROBE_MEMORY_TTL_S. Injectable via refresh_grown_threads's
+# `memory` param so tests stay order-independent.
+_PROBE_MEMORY: dict[int, tuple[float, int]] = {}
+_PROBE_MEMORY_TTL_S = 24 * 3600
+_PROBE_MEMORY_MAX = 2000
+
+
+async def refresh_grown_threads(
+    config: Config,
+    db: Database,
+    candidates: Sequence[Story],
+    *,
+    now: float | None = None,
+    memory: dict[int, tuple[float, int]] | None = None,
+) -> tuple[int, set[int]]:
+    """Probe live counts for young cached threads; hydrate confirmed growth.
+
+    Only when we know there's new content: hydration (real-time Algolia
+    force-refresh — CH would hand back the same lagged data the probe just
+    beat) fires strictly for threads whose probed live count exceeds the
+    last fetched count. Counts are healed upward first, so even a failed
+    hydration still fixes the velocity gate the tap path reads. The
+    prefetch stale lane then regenerates TLDRs whose inputs actually
+    changed — no new LLM path, zero spend when the top selection is stable.
+
+    Returns (hydrated, touched): re-hydrated count plus every id whose DB
+    row was upserted (count heals included) so the caller can reload
+    exactly those candidates. Per-story failures are log lines, never
+    fatal to regen.
+    """
+    at = time.time() if now is None else now
+    cap = config.tldr_probe_max_threads_per_regen
+    if cap <= 0:
+        return (0, set())
+    mem = _PROBE_MEMORY if memory is None else memory
+    checked = confirmed = hydrated = skipped = 0
+    touched: set[int] = set()
+    try:
+        cached_ids = set(db.get_tldr_cache_keys([s.id for s in candidates if s.id > 0]))
+        eligible = _probe_eligible_threads(
+            candidates, cached_ids, config.tldr_refresh_recent_hours, at
+        )
+        fresh = [
+            s
+            for s in eligible
+            if (m := mem.get(s.id)) is None
+            or (s.comment_count or 0) != m[1]
+            or at - m[0] >= _PROBE_MEMORY_TTL_S
+        ]
+        skipped = len(eligible) - len(fresh)
+        # Hot-thread bypass: eligible is velocity-ordered, so eligible[:3]
+        # are the hottest threads. Probe memory must not starve them for
+        # 24h when the cap is contended — they join within the same cap.
+        bypass_ids = {s.id for s in eligible[:3]}
+        bypassed = [s for s in eligible if s.id in bypass_ids]
+        rest = [s for s in fresh if s.id not in bypass_ids]
+        revived = sum(1 for s in bypassed if all(f.id != s.id for f in fresh))
+        eligible = (bypassed + rest)[:cap]
+        skipped -= revived
+        checked = len(eligible)
+        if not eligible:
+            return (0, set())
+        by_id = {s.id: s for s in eligible}
+        live_counts = await _probe_live_counts(
+            eligible, config.tldr_probe_timeout_seconds
+        )
+        for s in eligible:
+            mem[s.id] = (at, s.comment_count or 0)
+            if len(mem) > _PROBE_MEMORY_MAX:
+                oldest = min(mem, key=lambda k: mem[k][0])
+                del mem[oldest]
+        for sid, live in live_counts.items():
+            s = by_id[sid]
+            if live > (s.comment_count or 0):
+                db.upsert_story(replace(s, comment_count=live))
+                touched.add(sid)
+        grown_ids = [
+            sid
+            for sid, live in live_counts.items()
+            if live > (by_id[sid].comment_count_at_fetch or 0)
+        ]
+        confirmed = len(grown_ids)
+        if grown_ids:
+            hsem = asyncio.Semaphore(_HYDRATE_CONCURRENCY)
+
+            async with httpx.AsyncClient(timeout=15.0) as client:
+
+                async def _hydrate(sid: int) -> bool:
+                    async with hsem:
+                        try:
+                            updated = await fetch_story(client, sid, db, force=True)
+                        except Exception as exc:
+                            logging.warning(
+                                "tldr_probe hydrate story_id=%s failed: %r", sid, exc
+                            )
+                            return False
+                        if updated is not None:
+                            touched.add(sid)
+                        return updated is not None
+
+                hydrated = sum(
+                    1
+                    for ok in await asyncio.gather(
+                        *(_hydrate(sid) for sid in grown_ids)
+                    )
+                    if ok
+                )
+        return (hydrated, touched)
+    finally:
+        logging.info(
+            "tldr_probe checked=%s confirmed=%s hydrated=%s skipped=%s",
+            checked,
+            confirmed,
+            hydrated,
+            skipped,
+        )
 
 
 def is_summarizable(story: Story) -> bool:
@@ -358,17 +675,17 @@ async def fetch_candidates(
         s.id: s for s in db.get_stories([item["id"] for item in live_window])
     }
     for item in live_window:
-        sid = _coerce_int(item.get("id"))
+        sid = coerce_int(item.get("id"))
         if sid <= 0 or sid in exclude_ids:
             continue
         fresh_metadata[sid] = {
-            "score": _coerce_int(item.get("points")),
-            "comment_count": _coerce_int(item.get("num_comments")),
+            "score": coerce_int(item.get("points")),
+            "comment_count": coerce_int(item.get("num_comments")),
         }
         existing = existing_stories.get(sid)
         if existing is not None:
-            new_score = _coerce_int(item.get("points"), existing.score)
-            new_comments = _coerce_int(
+            new_score = coerce_int(item.get("points"), existing.score)
+            new_comments = coerce_int(
                 item.get("num_comments"), existing.comment_count or 0
             )
             has_changes = new_score != existing.score or new_comments != (
@@ -448,8 +765,11 @@ def fast_rerank_for_user(
     trace.set_count("feedback_total", n_feedback)
     if n_feedback == 0:
         trace.set_label("model_cache", "skipped_cold_deck")
-        cold_deck = build_cold_deck(db, config)
-        return canonicalize_hn_dupes(
+        # Zero-feedback cold deck is a pure gravity/time ranking — no
+        # embeddings needed, so don't force the (embedder-requiring)
+        # candidate pool cache here; keep the direct, uncached load.
+        cold_deck = build_cold_deck(db, config, trace=trace)
+        cold_final = canonicalize_hn_dupes(
             cold_deck,
             db,
             selected_limit=config.count,
@@ -457,21 +777,24 @@ def fast_rerank_for_user(
             feedback_actions=tuple(config.model.dedup_exclude_actions),
             trace=trace,
         )
+        trace.set_count(
+            "deck_nonhn_final",
+            sum(1 for r in cold_final if not is_hn_source(r.story.source)),
+        )
+        return cold_final
 
     with trace.stage("candidate_sql"):
-        candidates = load_production_candidate_stories(
-            db,
-            config,
-            user_id=user_id,
-            exclude_feedback=True,
-        )
+        pool = get_candidate_pool(db, config, embedder, trace=trace)
+        voted_ids = frozenset(_voted_story_ids(db, user_id))
+    if not pool.stories:
+        return []
+
+    with trace.stage("candidate_embedding"):
+        candidates, cand_embeddings = pool.without_feedback(voted_ids)
     if trace is not None:
         trace.set_count("candidates", len(candidates))
     if not candidates:
         return []
-
-    with trace.stage("candidate_embedding"):
-        cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
 
     # Built once per request and threaded into badge assembly so the
     # Explore passes (Unsure/Novel/Similar) can skip-and-backfill past
@@ -491,7 +814,28 @@ def fast_rerank_for_user(
         trace=trace,
         is_feedback_match=lambda s: _matches_feedback(s, feedback_context),
     )
+    trace.set_count(
+        "deck_nonhn_pre_dedup",
+        sum(1 for r in ranked if not is_hn_source(r.story.source)),
+    )
 
+    return finalize_ranked_deck(
+        ranked, candidates, cand_embeddings, db, config, embedder, user_id, trace=trace
+    )
+
+
+def finalize_ranked_deck(
+    ranked: list[RankedStory],
+    candidates: list[Story],
+    cand_embeddings: NDArray[np.float32],
+    db: Database,
+    config: Config,
+    embedder: Embedder,
+    user_id: int,
+    *,
+    trace: RankTrace | _NullTrace = NULL_TRACE,
+) -> list[RankedStory]:
+    """Shared serving/evaluation deduplication and canonicalization boundary."""
     with trace.stage("dedup"):
         id_to_emb: dict[int, NDArray[np.float32]] = {
             s.id: vec for s, vec in zip(candidates, cand_embeddings)
@@ -504,8 +848,12 @@ def fast_rerank_for_user(
             embeddings=id_to_emb,
             embedder=embedder,
         )
+    trace.set_count(
+        "deck_nonhn_post_dedup",
+        sum(1 for r in deduped if not is_hn_source(r.story.source)),
+    )
     with trace.stage("hn_dupes"):
-        return canonicalize_hn_dupes(
+        final = canonicalize_hn_dupes(
             deduped,
             db,
             candidate_stories=candidates,
@@ -514,6 +862,11 @@ def fast_rerank_for_user(
             feedback_actions=tuple(config.model.dedup_exclude_actions),
             trace=trace,
         )
+    trace.set_count(
+        "deck_nonhn_final",
+        sum(1 for r in final if not is_hn_source(r.story.source)),
+    )
+    return final
 
 
 def _apply_dedup_to_ranked(
@@ -577,36 +930,7 @@ async def fetch_candidates_only(
     prewarm_top_n: int | None = None,
     on_hn_candidates: Callable[[Sequence[Story]], None] | None = None,
 ) -> None:
-    """Fetch new candidates into shared DB; prewarm top-N hot per sub.
-
-    The Reddit fetch pipeline runs in two phases via the shared
-    :class:`reddit_fetch_queue.RedditFetchQueue`:
-
-    1. **Topfeed phase.** All 41 subreddit topfeeds are enqueued at a
-       fixed 50s stride. Reddit returns entries in hot/score-desc order
-       and the factory stores them in ``reddit_feed_cache`` in that
-       order. The phase blocks until the queue drains (with a generous
-       90-min timeout for slow networks / rate-limit backoffs).
-    2. **Prewarm phase.** After the topfeed phase completes, the first
-       ``config.reddit_prewarm_top_per_sub`` (default 10) stories per
-       subreddit are read from the cache. These are the hottest
-       ``N * 41`` stories across all subs. Per-post RSS fetches for
-       their comments are enqueued at ``config.reddit_min_fetch_spacing_seconds``
-       (default 30s) stride. Multi-cycle completion is expected: the
-       90-min drain timeout covers ~180 of 410 prewarm tasks; the rest
-       finish in subsequent cycles.
-
-    The two-phase flow is needed because the prewarm IDs come from the
-    topfeed cache, which is populated by the topfeed phase. A single
-    interleaved enqueue can't do that — the prewarm factories would have
-    no IDs to enqueue.
-
-    New Reddit stories discovered by this cycle's topfeed are ranked in
-    this cycle (their stories are upserted post-drain) but their
-    per-post comment fetch is best-effort. Stories already in the cache
-    from a previous cycle's topfeed are prewarmed in this cycle.
-    """
-    from reddit_fetch_queue import queue as reddit_fetch_queue
+    """Fetch and publish core candidates without waiting for Reddit."""
 
     feedback_records = db.get_all_feedback()
     feedback_ids = {f.story_id for f in feedback_records}
@@ -621,6 +945,20 @@ async def fetch_candidates_only(
             on_hn_candidates([story for story in candidates if story.source == "hn"])
         except Exception:
             logging.exception("fetch_candidates_only: HN dupe callback failed")
+
+    # Growth-gated live refresh: probe young cached threads for real
+    # comment growth (CH counts lag 1-24h), hydrate confirmed ones before
+    # prewarm/prefetch so the stale TLDR lane sees fresh inputs. Reload
+    # every touched row: counts heal upward even without hydration, and the
+    # prewarm gate below must read the healed counts.
+    try:
+        _, touched = await refresh_grown_threads(config, db, candidates)
+    except Exception:
+        logging.exception("fetch_candidates_only: growth refresh failed")
+        touched = set()
+    if touched:
+        refreshed = {s.id: s for s in db.get_stories(sorted(touched))}
+        candidates = [refreshed.get(s.id, s) for s in candidates]
 
     # HN prewarm
     if config.prewarm_hn_full and embedder is not None:
@@ -650,127 +988,6 @@ async def fetch_candidates_only(
                     len(top_ids),
                 )
 
-    # Reddit topfeed + prewarm via the shared queue. Both are enqueued
-    # together via `enqueue_all_reddit_fetches` so they interleave on a
-    # single `min_stride_seconds` window. The single drain at the end of
-    # the regen flow handles the case where the queue never fully drains
-    # (we log a warning but continue — prewarm counts reflect only what
-    # ran).
-    topfeed_factories, reddit_feed_urls = build_reddit_topfeed_factories(
-        list(config.rss.feeds),
-        config.rss.per_feed_limit,
-        config.days,
-        feedback_urls,
-    )
-
-    prewarm_ids: list[int] = []
-    prewarm_factories: list[CoroFactory] = []
-    prewarm_updated_ids: list[int] = []
-
-    if topfeed_factories:
-        # Phase 1: topfeed. Enqueue all 41 subs at a fixed 50s stride.
-        # The factory writes parsed Stories to ``reddit_feed_cache`` in
-        # the order Reddit returned them (hot/score-desc). We don't need
-        # any prewarm IDs before this phase completes — the prewarm phase
-        # reads the cache to determine the top-N per sub.
-        reddit_fetch_queue.enqueue_all_reddit_fetches(
-            topfeed_factories,
-            [],
-            min_stride_seconds=50.0,
-        )
-        # 41 subs × 50s = 2050s nominal; 90-min drain gives ample slack
-        # for 429 backoffs and slow networks.
-        topfeed_drained = reddit_fetch_queue.wait_until_empty(timeout=5400.0)
-        if not topfeed_drained:
-            logging.warning(
-                "fetch_candidates_only: reddit topfeed queue did not drain "
-                "in 5400s, continuing with partial cache"
-            )
-
-    # Phase 1.5: persist cached topfeed stories into SQLite. The prewarm
-    # factories load each story row from the DB with `db.get_story`, so
-    # the rows must exist before prewarm is enqueued. Without this step
-    # brand-new topfeed discoveries would no-op through the prewarm
-    # factory's missing-row short-circuit.
-    if topfeed_factories and reddit_feed_urls:
-        for feed_url in reddit_feed_urls:
-            cached = reddit_feed_cache.get(feed_url)
-            if cached:
-                for story in cached:
-                    if db.get_story(story.id) is not None:
-                        continue
-                    db.upsert_story(story)
-
-    if config.prewarm_reddit_full and reddit_feed_urls:
-        # Phase 2: prewarm. After the topfeed phase, read the cache and
-        # take the first ``reddit_prewarm_top_per_sub`` stories per
-        # subreddit. These are the hottest N per sub across all 41 subs.
-        # Skip rows whose DB copy already has `top_comments` (already
-        # hydrated by a previous cycle), and stop at
-        # ``reddit_prewarm_max_per_cycle`` to keep the per-cycle work
-        # bounded under current rate limits.
-        n_per_sub = config.reddit_prewarm_top_per_sub
-        max_per_cycle = config.reddit_prewarm_max_per_cycle
-        for feed_url in reddit_feed_urls:
-            if max_per_cycle <= 0 or len(prewarm_ids) >= max_per_cycle:
-                break
-            cached = reddit_feed_cache.get(feed_url)
-            if not cached:
-                continue
-            for story in cached[:n_per_sub]:
-                if len(prewarm_ids) >= max_per_cycle:
-                    break
-                existing = db.get_story(story.id)
-                if existing and existing.top_comments:
-                    continue
-                prewarm_ids.append(story.id)
-
-        if prewarm_ids:
-            prewarm_factories, prewarm_updated_ids = build_reddit_prewarm_factories(
-                prewarm_ids, db
-            )
-
-        if prewarm_factories:
-            reddit_fetch_queue.enqueue_all_reddit_fetches(
-                [],
-                prewarm_factories,
-                min_stride_seconds=config.reddit_min_fetch_spacing_seconds,
-            )
-            # 90-min drain covers ~180 of 410 at 30s stride. The rest
-            # continue in the background and finish over the next 2-3
-            # regen cycles. Multi-cycle completion is by design.
-            prewarm_drained = reddit_fetch_queue.wait_until_empty(timeout=5400.0)
-            if not prewarm_drained:
-                logging.warning(
-                    "fetch_candidates_only: reddit prewarm queue did not "
-                    "drain in 5400s, continuing with partial comments"
-                )
-
-    if topfeed_factories or prewarm_factories:
-        # Post-drain: collect Reddit topfeed stories from cache and
-        # extend the candidates list. Persistence was handled by the
-        # Phase 1.5 upsert loop above; re-upsert here is redundant.
-        for feed_url in reddit_feed_urls:
-            cached = reddit_feed_cache.get(feed_url)
-            if cached:
-                candidates.extend(cached)
-
-        # Post-drain: recompute embeddings for stories whose
-        # `top_comments`/`self_text` changed during prewarm.
-        if prewarm_updated_ids and embedder is not None:
-            updated_stories = [db.get_story(sid) for sid in prewarm_updated_ids]
-            updated_stories = [s for s in updated_stories if s is not None]
-            if updated_stories:
-                get_or_compute_embeddings(updated_stories, embedder, db)
-
-        logging.info(
-            "Regen: reddit topfeed=%d prewarm=%d (top_per_sub=%d, prewarm_ids=%d)",
-            len(reddit_feed_urls),
-            len(prewarm_updated_ids),
-            config.reddit_prewarm_top_per_sub,
-            len(prewarm_ids),
-        )
-
     # LessWrong prewarm
     if config.prewarm_lesswrong_full:
         needs_prewarm_lw = [
@@ -785,3 +1002,109 @@ async def fetch_candidates_only(
                 prewarmed,
                 len(needs_prewarm_lw),
             )
+
+
+def refresh_reddit_candidates(
+    config: Config,
+    db: Database,
+    embedder: Embedder | None,
+) -> RedditRefreshResult:
+    """Run the slow Reddit refresh phases outside core regeneration."""
+    from reddit_fetch_queue import queue as reddit_fetch_queue
+
+    now_ts = time.time()
+    feedback_urls = {f.url for f in db.get_all_feedback() if f.url}
+    eligible_feeds = [
+        feed
+        for feed in config.rss.feeds
+        if (state := db.get_reddit_feed_state(feed)) is None
+        or state.next_retry_at <= now_ts
+    ]
+    factories, feed_urls = build_reddit_topfeed_factories(
+        eligible_feeds,
+        config.rss.per_feed_limit,
+        config.days,
+        feedback_urls,
+    )
+    if factories:
+        reddit_fetch_queue.enqueue_all_reddit_fetches(
+            factories, [], min_stride_seconds=50.0
+        )
+        if not reddit_fetch_queue.wait_until_empty(timeout=5400.0):
+            logging.warning("reddit_refresh: topfeed queue timed out")
+
+    changed_ids: set[int] = set()
+    for feed_url in feed_urls:
+        cached = reddit_feed_cache.get(feed_url)
+        if cached is None:
+            db.record_reddit_feed_failure(
+                feed_url, "fetch returned no snapshot", now_ts
+            )
+            continue
+        accepted_ids: list[int] = []
+        for story in cached:
+            existing = db.get_story(story.id)
+            try:
+                db.upsert_story(story)
+            except StoryIdentityConflict:
+                logging.warning(
+                    "rss_identity_conflict story_id=%s url=%s", story.id, story.url
+                )
+                continue
+            accepted_ids.append(story.id)
+            if existing is None or (
+                existing.title,
+                existing.url,
+                existing.time,
+                existing.self_text,
+            ) != (story.title, story.url, story.time, story.self_text):
+                changed_ids.add(story.id)
+        db.record_reddit_feed_success(feed_url, accepted_ids, now_ts)
+
+    prewarm_ids: list[int] = []
+    if config.prewarm_reddit_full:
+        for feed_url in feed_urls:
+            if len(prewarm_ids) >= config.reddit_prewarm_max_per_cycle:
+                break
+            for story in (reddit_feed_cache.get(feed_url) or [])[
+                : config.reddit_prewarm_top_per_sub
+            ]:
+                if len(prewarm_ids) >= config.reddit_prewarm_max_per_cycle:
+                    break
+                existing = db.get_story(story.id)
+                if (
+                    existing is not None
+                    and existing.url == story.url
+                    and not existing.top_comments
+                ):
+                    prewarm_ids.append(story.id)
+
+    prewarm_factories, updated_ids = build_reddit_prewarm_factories(prewarm_ids, db)
+    if prewarm_factories:
+        reddit_fetch_queue.enqueue_all_reddit_fetches(
+            [],
+            prewarm_factories,
+            min_stride_seconds=config.reddit_min_fetch_spacing_seconds,
+        )
+        if not reddit_fetch_queue.wait_until_empty(timeout=5400.0):
+            logging.warning("reddit_refresh: prewarm queue timed out")
+
+    if updated_ids and embedder is not None:
+        updated = [story for sid in updated_ids if (story := db.get_story(sid))]
+        if updated:
+            get_or_compute_embeddings(updated, embedder, db)
+
+    result = RedditRefreshResult(
+        feeds=len(feed_urls),
+        changed_stories=len(changed_ids),
+        hydrated_stories=len(set(updated_ids)),
+        prewarm_candidates=len(prewarm_ids),
+    )
+    logging.info(
+        "reddit_refresh_complete feeds=%d changed=%d hydrated=%d candidates=%d",
+        result.feeds,
+        result.changed_stories,
+        result.hydrated_stories,
+        result.prewarm_candidates,
+    )
+    return result

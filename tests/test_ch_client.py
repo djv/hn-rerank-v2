@@ -167,6 +167,27 @@ def test_query_stories_bulk_returns_stories_only(
     assert result[1]["type"] == "story"
 
 
+# ---------- comment query shape (regression) ----------
+#
+# Incident 2026-07-23..07-26: the old _build_comments_bulk_query joined
+# against `(SELECT * FROM hackernews_history FINAL WHERE type = 'comment'
+# ...)` once per tree level, which reliably exceeded play.clickhouse.com's
+# query memory limit (Code: 241, MEMORY_LIMIT_EXCEEDED) and zeroed out HN
+# comment prewarm for days. The fix walks `kids` arrays with `id IN (...)`
+# lookups instead. Guard against reintroducing the expensive shape.
+
+
+def test_comment_queries_do_not_join_or_scan_full_table() -> None:
+    story_query = ch_client._build_story_kids_query([1, 2, 3])
+    level_query = ch_client._build_comment_level_query([10, 11, 12])
+    for query in (story_query, level_query):
+        assert "INNER JOIN" not in query
+        assert "FINAL" not in query
+        # Every comment/story lookup must be scoped to explicit IDs, never
+        # a bare table scan filtered only by type.
+        assert "IN (" in query
+
+
 # ---------- query_comments_bulk ----------
 
 
@@ -182,41 +203,35 @@ def test_query_comments_bulk_validates_levels() -> None:
 def test_query_comments_bulk_groups_by_story_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """query_comments_bulk walks story.kids -> comment.kids level by level,
+    grouping comments by the root story_id via the walk itself (CH rows
+    carry no story_id column)."""
+
     def fake_post(url, **kwargs):
-        return _MockResponse(
-            200,
-            {
-                "data": [
-                    {
-                        "id": 10,
-                        "type": "comment",
-                        "parent": 1,
-                        "story_id": 1,
-                        "ts": 100,
-                        "text": "a",
-                        "kids": [],
-                    },
-                    {
-                        "id": 11,
-                        "type": "comment",
-                        "parent": 1,
-                        "story_id": 1,
-                        "ts": 200,
-                        "text": "b",
-                        "kids": [],
-                    },
-                    {
-                        "id": 20,
-                        "type": "comment",
-                        "parent": 2,
-                        "story_id": 2,
-                        "ts": 300,
-                        "text": "c",
-                        "kids": [],
-                    },
-                ]
-            },
-        )
+        query = kwargs.get("content", "")
+        if "type = 'story'" in query:
+            # Story 1 has two level-0 comments (10, 11); story 2 has one (20).
+            return _MockResponse(
+                200,
+                {
+                    "data": [
+                        {"id": 1, "kids": [10, 11]},
+                        {"id": 2, "kids": [20]},
+                    ]
+                },
+            )
+        if "type = 'comment'" in query:
+            return _MockResponse(
+                200,
+                {
+                    "data": [
+                        {"id": 10, "by": "u1", "parent": 1, "text": "a", "kids": []},
+                        {"id": 11, "by": "u2", "parent": 1, "text": "b", "kids": []},
+                        {"id": 20, "by": "u3", "parent": 2, "text": "c", "kids": []},
+                    ]
+                },
+            )
+        return _MockResponse(200, {"data": []})
 
     monkeypatch.setattr(ch_client.httpx, "post", fake_post)
     result = query_comments_bulk([1, 2, 99], max_levels=2)
@@ -224,6 +239,47 @@ def test_query_comments_bulk_groups_by_story_id(
     assert len(result[2]) == 1
     assert result[99] == []  # not in payload
     assert {c["id"] for c in result[1]} == {10, 11}
+
+
+def test_query_comments_bulk_walks_multiple_levels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reply to a level-0 comment is fetched via a second-level query."""
+    calls: list[str] = []
+
+    def fake_post(url, **kwargs):
+        query = kwargs.get("content", "")
+        calls.append(query)
+        if "type = 'story'" in query:
+            return _MockResponse(200, {"data": [{"id": 1, "kids": [10]}]})
+        # Both comment-level requests share the "type = 'comment'" shape;
+        # distinguish by which ID is being asked about.
+        if "IN (10)" in query:
+            return _MockResponse(
+                200,
+                {
+                    "data": [
+                        {"id": 10, "by": "u1", "parent": 1, "text": "a", "kids": [11]},
+                    ]
+                },
+            )
+        if "IN (11)" in query:
+            return _MockResponse(
+                200,
+                {
+                    "data": [
+                        {"id": 11, "by": "u2", "parent": 10, "text": "b", "kids": []},
+                    ]
+                },
+            )
+        return _MockResponse(200, {"data": []})
+
+    monkeypatch.setattr(ch_client.httpx, "post", fake_post)
+    result = query_comments_bulk([1], max_levels=5)
+    assert {c["id"] for c in result[1]} == {10, 11}
+    # story_kids + level0 (id=10) + level1 (id=11) = 3 requests, not one
+    # single mega-join.
+    assert len(calls) == 3
 
 
 # ---------- query_stories_with_comments ----------

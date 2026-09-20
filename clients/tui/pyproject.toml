@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hn-rerank"
+version = "0.1.0"
+description = "A minimal terminal reader for your HN Rerank profile"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["textual>=8.2.8,<9", "httpx>=0.28,<1", "platformdirs>=4,<5"]
+
+[project.scripts]
+hn-rerank = "hn_rerank.__main__:main"
+
+[dependency-groups]
+dev = ["pytest>=9", "pytest-asyncio>=1", "ruff>=0.14", "ty>=0.0.10"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hn_rerank"]
+
+[tool.ruff]
+src = ["src", "tests"]
+target-version = "py312"
+
+[tool.ruff.lint.isort]
+known-first-party = ["hn_rerank", "test_client"]

@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import html
+import json
 import logging
 import re
+import resource
 import threading
 import time
 from collections import Counter
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Literal, TypeAlias
+from typing import Any, Literal, TYPE_CHECKING, TypeAlias, TypedDict
 
 import numpy as np
 import onnxruntime as ort
@@ -19,18 +21,39 @@ from bs4 import BeautifulSoup
 from cachetools import LRUCache
 from numpy.typing import NDArray
 from sklearn.cluster import KMeans
+from sklearn.metrics.pairwise import rbf_kernel
 from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
-from transformers import AutoTokenizer
 
 from database import Database, Story
 from .config import (
     BQ_ARCHIVE_SOURCE,
     CH_ARCHIVE_SOURCE,
     Config,
+    DEFAULT_EMBEDDING_MAX_TOKENS,
+    DEFAULT_EMBEDDING_MODEL_VERSION,
     DEFAULT_ONNX_MODEL_DIR,
     is_hn_source,
 )
+from .model_manifest import ModelManifest, verify_model_dir
+
+if TYPE_CHECKING:
+    from ch_client import ChItem
+
+
+# Lazy seam: `transformers` costs ~0.9s at import and is only needed to
+# construct a real Embedder. Production imports it on first use;
+# tests patch this name directly (see
+# test_embedder_uses_configured_batch_and_ort_variant).
+AutoTokenizer: Any = None
+
+
+def _tokenizer_cls() -> Any:
+    if AutoTokenizer is not None:
+        return AutoTokenizer
+    from transformers import AutoTokenizer as _Cls
+
+    return _Cls
 
 
 EmbeddingOrtVariant: TypeAlias = Literal[
@@ -41,22 +64,87 @@ EmbeddingOrtVariant: TypeAlias = Literal[
 ]
 
 
+def _process_rss_kb() -> int | None:
+    """Return current process RSS on Linux, or None when unavailable."""
+    try:
+        with Path("/proc/self/status").open(encoding="utf-8") as status:
+            for line in status:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
 # SVM model cache: keyed on (user_id, feedback_signature, schema_version)
 # to skip SVC.fit(). Bump _MODEL_SCHEMA_VERSION whenever the feature schema
 # (number / semantics of meta columns appended to the embedding) changes;
 # the cache key then changes for every user, forcing a clean re-fit.
 _MODEL_CACHE_STORAGE_MAXSIZE = 10_000
+
+
 # Cached value: (svm, scaler, positive_cluster_centers). The centers depend
 # only on the up-voted feedback embeddings — same invalidation as the SVM —
 # so they are cached alongside it to skip the per-regen KMeans on cache hits.
 # ``centers`` may be None for entries written before this field existed (or by
 # tests); callers must fall back to recomputing when it is None.
-_CachedModel = tuple[SVC, StandardScaler, "NDArray[np.float32] | None"]
+class PrecomputedRbfSVC:
+    """Exact RBF SVC with bounded candidate-kernel inference memory."""
+
+    def __init__(self, *, c: float, gamma: float, chunk_size: int) -> None:
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        self.gamma = gamma
+        self.chunk_size = chunk_size
+        self._svc = SVC(
+            C=c,
+            kernel="precomputed",
+            cache_size=16,
+            random_state=0,
+            decision_function_shape="ovr",
+        )
+        self._training_features: NDArray[np.float64] | None = None
+
+    @property
+    def classes_(self) -> NDArray[np.int64]:
+        return self._svc.classes_
+
+    def fit(
+        self,
+        features: NDArray[np.float64],
+        labels: list[int],
+        *,
+        sample_weight: NDArray[np.float64],
+    ) -> PrecomputedRbfSVC:
+        self._training_features = np.asarray(features)
+        kernel = rbf_kernel(features, features, gamma=self.gamma)
+        self._svc.fit(kernel, labels, sample_weight=sample_weight)
+        return self
+
+    def decision_function(self, features: NDArray[np.float64]) -> NDArray[np.float64]:
+        if self._training_features is None:
+            raise RuntimeError("fit must run before decision_function")
+        chunks = []
+        for start in range(0, len(features), self.chunk_size):
+            kernel = rbf_kernel(
+                features[start : start + self.chunk_size],
+                self._training_features,
+                gamma=self.gamma,
+            )
+            chunks.append(self._svc.decision_function(kernel))
+        if not chunks:
+            width = len(self.classes_) if len(self.classes_) > 2 else 1
+            return np.empty((0, width), dtype=np.float64)
+        return np.concatenate(chunks, axis=0)
+
+
+_CachedClassifier: TypeAlias = SVC | PrecomputedRbfSVC
+_CachedModel = tuple[_CachedClassifier, StandardScaler, "NDArray[np.float32] | None"]
 _MODEL_CACHE: LRUCache[tuple[int, str, int], _CachedModel] = LRUCache(
     maxsize=_MODEL_CACHE_STORAGE_MAXSIZE
 )
 _MODEL_CACHE_LOCK = threading.Lock()
-_MODEL_SCHEMA_VERSION = 2  # +1 whenever meta-column schema changes (see ARCHITECTURE)
+_MODEL_SCHEMA_VERSION = 4  # +1 whenever model/feature schema changes (see ARCHITECTURE)
 
 
 @dataclass
@@ -125,6 +213,10 @@ class RankScoreContext:
     cand_closest_up: NDArray[np.float32] | None = None
     cand_closest_down: NDArray[np.float32] | None = None
     cand_closest_neutral: NDArray[np.float32] | None = None
+    # F2 attribution: argmax row (into fb_up_titles) of the closest upvoted
+    # feedback story per candidate, plus the aligned up-story titles.
+    cand_closest_up_idx: NDArray[np.int64] | None = None
+    fb_up_titles: list[str] = field(default_factory=list)
 
 
 def _feedback_signature(db: Database, user_id: int) -> str:
@@ -135,9 +227,7 @@ def _feedback_signature(db: Database, user_id: int) -> str:
     return hasher.hexdigest()
 
 
-def _get_cached_model(
-    user_id: int | None, signature: str
-) -> _CachedModel | None:
+def _get_cached_model(user_id: int | None, signature: str) -> _CachedModel | None:
     if user_id is None:
         return None
     with _MODEL_CACHE_LOCK:
@@ -151,7 +241,7 @@ def _get_cached_model(
 def _set_cached_model(
     user_id: int | None,
     signature: str,
-    svm: SVC,
+    svm: _CachedClassifier,
     scaler: StandardScaler,
     maxsize: int = 20,
     *,
@@ -175,10 +265,24 @@ TOP_COMMENT_MAX_PER_THREAD = 6
 GOOD_TOPLEVEL_MIN_LEN = 200
 GOOD_TOPLEVEL_MIN_REPLIES = 3
 TOP_COMMENT_TOP_LEVEL_BUDGET = TOP_COMMENT_LIMIT // 3
+# Comment join for storage: explicit markdown boundary so the TLDR prompt
+# sees segments, not soup. Matches server.py's COMMENT_PROMPT_CHAR_LIMIT —
+# retain everything the prompt assembler will actually use.
+HN_COMMENTS_SEPARATOR = "\n\n---\n\n"
+HN_COMMENTS_CACHE_CHAR_LIMIT = 24_000
 HOT_MIN_SCORE = 20
 DASHBOARD_QUEUE_SIZE = 12
 PRIMARY_PER_COMBO = 12
-DISCOVERY_PER_BADGE = 2
+# archive_nonhn (time < recent_cutoff AND non-HN source) is structurally
+# always empty: the RSS leg is the only source of non-HN candidates, and
+# it's windowed to time >= recent_cutoff (see load_production_candidate_
+# stories), so no row can ever satisfy both. That combo was retired from
+# COMBO_DEFS below (see WORKLOG 2026-08-30) and its 12 primary + 6 explore
+# slots redistributed to the two combos most starved of non-HN/archive
+# coverage, rather than left unspent.
+PRIMARY_RECENT_NONHN = 20
+PRIMARY_ARCHIVE_HN = 16
+DISCOVERY_PER_BADGE = 5
 SOURCE_CATEGORIES: tuple[str, ...] = ("hn_live", "archive", "reddit", "rss")
 
 
@@ -243,6 +347,10 @@ def clean_text(raw_text: str, min_len: int = 0) -> str:
         except Exception:
             txt = re.sub(r"<[^>]*>", " ", raw_text)
         txt = html.unescape(txt)
+        # Unescaping can recreate tag-looking fragments (for example
+        # ``&lt;0>`` becomes ``<0>``) after BeautifulSoup has parsed the input.
+        # Strip those residual tags before applying the text-only invariants.
+        txt = re.sub(r"<[^>]*>", " ", txt)
 
     txt = re.sub(r"[\u2800-\u28FF\u2500-\u27BF]+", "", txt)
     txt = re.sub(r"[#*^\\/|\\-_+]{3,}", "", txt)
@@ -257,15 +365,34 @@ def clean_text(raw_text: str, min_len: int = 0) -> str:
     return txt
 
 
+class RankedComment(TypedDict):
+    """Normalized comment from ``_extract_comments_recursive``.
+
+    ``id`` stays ``Any`` (opaque JSON passthrough, never arithmeticked);
+    everything the ranker reads is explicitly typed.
+    """
+
+    id: Any
+    text: str
+    score: int
+    depth: int
+    top_thread_index: int | None
+    sibling_index: int
+    order_path: tuple[int, ...]
+    reply_count: int
+    descendant_count: int
+    text_len: int
+
+
 def _extract_comments_recursive(
-    children: list,
+    children: Sequence[ChItem] | Sequence[dict[str, Any]],
     depth: int = 0,
     parent_points: int = 0,
     top_thread_index: int | None = None,
     order_path: tuple[int, ...] = (),
-) -> list[dict]:
+) -> list[RankedComment]:
     MIN_COMMENT_LENGTH = 60
-    results = []
+    results: list[RankedComment] = []
     for sibling_index, child in enumerate(children):
         if not isinstance(child, dict) or child.get("type") != "comment":
             continue
@@ -306,7 +433,7 @@ def _extract_comments_recursive(
     return results
 
 
-def _comment_rank_key(comment: dict) -> tuple:
+def _comment_rank_key(comment: RankedComment) -> tuple[int, int, tuple[int, ...]]:
     return (
         -comment["descendant_count"],
         -min(comment["text_len"], 3000),
@@ -315,9 +442,9 @@ def _comment_rank_key(comment: dict) -> tuple:
 
 
 def _select_top_comments(
-    comments: list[dict],
+    comments: list[RankedComment],
     limit: int = TOP_COMMENT_LIMIT,
-) -> list[dict]:
+) -> list[RankedComment]:
     """Select comment text for embeddings/TLDRs.
 
     Prefer large discussion cores (top engaged threads) and breadth of
@@ -329,15 +456,17 @@ def _select_top_comments(
     if not comments:
         return []
 
-    selected = []
-    selected_indexes = set()
+    selected: list[RankedComment] = []
+    selected_indexes: set[int] = set()
     per_thread: dict[int, int] = {}
 
-    def add(comment: dict) -> None:
+    def add(comment: RankedComment) -> None:
         if len(selected) >= limit:
             return
         index = id(comment)
         thread_index = comment["top_thread_index"]
+        if thread_index is None:
+            return
         if index in selected_indexes:
             return
         if per_thread.get(thread_index, 0) >= TOP_COMMENT_MAX_PER_THREAD:
@@ -357,14 +486,17 @@ def _select_top_comments(
     n_cores = min(TOP_COMMENT_CORE_THREADS, len(good_top_level))
     core_roots = sorted(
         good_top_level,
-        key=lambda c: (-c["descendant_count"], c["top_thread_index"]),
+        key=lambda c: (
+            -c["descendant_count"],
+            c["top_thread_index"] if c["top_thread_index"] is not None else -1,
+        ),
     )[:n_cores]
     core_threads = {c["top_thread_index"] for c in core_roots}
 
     for root in sorted(core_roots, key=_comment_rank_key):
         add(root)
 
-    for thread_index in sorted(core_threads):
+    for thread_index in sorted(t for t in core_threads if t is not None):
         replies = [
             c
             for c in comments
@@ -388,6 +520,30 @@ def _select_top_comments(
             break
 
     return selected
+
+
+def join_top_comments(
+    texts: list[str], limit: int = HN_COMMENTS_CACHE_CHAR_LIMIT
+) -> str:
+    """Join selected comment texts on a markdown boundary, within budget.
+
+    Boundary-aware: each comment is appended whole or not at all — never
+    sliced mid-comment. Oversized comments are skipped, not truncating the
+    pack. Blank entries are skipped.
+    """
+    parts: list[str] = []
+    total = 0
+    for text in texts:
+        if not text or not text.strip():
+            continue
+        sep_len = 0 if not parts else len(HN_COMMENTS_SEPARATOR)
+        if total + sep_len + len(text) > limit:
+            continue
+        if parts:
+            parts.append(HN_COMMENTS_SEPARATOR)
+        parts.append(text)
+        total += sep_len + len(text)
+    return "".join(parts)
 
 
 def compose_story_text(
@@ -442,38 +598,132 @@ def _embedding_session_options(ort_variant: EmbeddingOrtVariant) -> ort.SessionO
     if ort_variant == "spin_off_graph_all":
         session_options.add_session_config_entry("session.intra_op.allow_spinning", "0")
         session_options.add_session_config_entry("session.inter_op.allow_spinning", "0")
-        session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        session_options.graph_optimization_level = (
+            ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        )
         return session_options
     if ort_variant == "spin_off_auto_threads":
         session_options.add_session_config_entry("session.intra_op.allow_spinning", "0")
         session_options.add_session_config_entry("session.inter_op.allow_spinning", "0")
-        session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        session_options.graph_optimization_level = (
+            ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        )
         session_options.intra_op_num_threads = 0
         session_options.inter_op_num_threads = 1
         return session_options
     raise ValueError(f"Unknown embedding ORT variant: {ort_variant}")
 
 
-# Algolia Fetching
+# Single encode() calls slower than this get a loud WARN (stall monsters:
+# one giant batch hogging CPU next to a warm, see WORKLOG 2026-09-08).
+# Seam for tests: patched to 0 to force the WARN without a real 10s stall.
+_EMBEDDING_SLOW_WARN_SECONDS = 10.0
+
+
 class Embedder:
+    model_version = DEFAULT_EMBEDDING_MODEL_VERSION
+    max_tokens = DEFAULT_EMBEDDING_MAX_TOKENS
+    # Provenance for new embedding rows (class attrs so test doubles that
+    # skip __init__ still expose them; real inits overwrite below).
+    model_onnx_sha: str = ""
+    embedding_dim: int = 384
+    model_manifest: ModelManifest | None = None
+
     def __init__(
         self,
         model_dir: str = DEFAULT_ONNX_MODEL_DIR,
         *,
+        model_version: str = DEFAULT_EMBEDDING_MODEL_VERSION,
+        max_tokens: int = DEFAULT_EMBEDDING_MAX_TOKENS,
         batch_size: int = 32,
         ort_variant: EmbeddingOrtVariant = "current",
     ) -> None:
+        if not model_version.strip():
+            raise ValueError("model_version must not be empty")
+        if max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
+        self.model_version = model_version
+        self.max_tokens = max_tokens
         self.batch_size = batch_size
-        self.tokenizer: Any = AutoTokenizer.from_pretrained(model_dir)
+        self.tokenizer: Any = _tokenizer_cls().from_pretrained(model_dir)
         session_options = _embedding_session_options(ort_variant)
         self.session = ort.InferenceSession(
             str(Path(model_dir) / "model.onnx"),
             sess_options=session_options,
             providers=["CPUExecutionProvider"],
         )
-        self.max_tokens = 512
+        self.model_manifest, mismatches = self._check_manifest(model_dir)
+        self.model_onnx_sha = (self.model_manifest.files or {}).get("model.onnx", "")
+        self.embedding_dim = self._resolve_embedding_dim(model_dir)
+        if mismatches:
+            # Warn-and-serve: the bytes changed under the recorded baseline,
+            # but stored vectors keep matching (version string untouched).
+            # Loud log, no refusal — uptime beats strictness here.
+            logging.error(
+                "embedding_model_changed dir=%s serving_recorded_vectors "
+                "mismatches=%s (re-baseline deliberately via setup_model.py)",
+                model_dir,
+                "; ".join(mismatches),
+            )
+
+    @staticmethod
+    def _manifest_repo() -> str:
+        return "mixedbread-ai/mxbai-embed-xsmall-v1"
+
+    def _check_manifest(self, model_dir: str) -> tuple[ModelManifest, list[str]]:
+        # Manifest IO must never break init (read-only mounts, fake dirs in
+        # tests) and must never write: baselines belong to setup_model.py,
+        # so request paths and test doubles can't alter prod state.
+        # Verification is best-effort; serving is not gated on it.
+        try:
+            stored, mismatches = verify_model_dir(
+                model_dir, self._manifest_repo(), self._manifest_revision()
+            )
+        except OSError as exc:
+            logging.warning(
+                "embedding_manifest_check_skipped dir=%s error=%r", model_dir, exc
+            )
+            return (
+                ModelManifest(repo="", revision="", files={}, created_at=0.0),
+                [],
+            )
+        if stored is None:
+            logging.warning(
+                "embedding_manifest_missing dir=%s; run setup_model.py to baseline",
+                model_dir,
+            )
+            return ModelManifest(repo="", revision="", files={}, created_at=0.0), []
+        return stored, mismatches
+
+    @staticmethod
+    def _manifest_revision() -> str:
+        try:
+            from setup_model import MODEL_REPO, MODEL_REVISION
+
+            if MODEL_REPO == Embedder._manifest_repo():
+                return MODEL_REVISION
+        except ImportError:
+            pass
+        return "main"
+
+    @staticmethod
+    def _resolve_embedding_dim(model_dir: str) -> int:
+        try:
+            hidden = json.loads((Path(model_dir) / "config.json").read_text())[
+                "hidden_size"
+            ]
+            dim = int(hidden)
+            if dim > 0:
+                return dim
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        logging.warning(
+            "embedding_dim unreadable from %s/config.json; falling back to 384",
+            model_dir,
+        )
+        return 384
 
     def encode(
         self, texts: list[str], batch_size: int | None = None
@@ -485,6 +735,10 @@ class Embedder:
         if effective_batch_size <= 0:
             raise ValueError("batch_size must be positive")
 
+        started = time.perf_counter()
+        rss_before_kb = _process_rss_kb()
+        batch_count = 0
+        longest_tokens = 0
         embeddings = []
         for i in range(0, len(texts), effective_batch_size):
             batch_texts = texts[i : i + effective_batch_size]
@@ -495,6 +749,8 @@ class Embedder:
                 max_length=self.max_tokens,
                 return_tensors="np",
             )
+            batch_count += 1
+            longest_tokens = max(longest_tokens, int(inputs["input_ids"].shape[1]))
 
             onnx_inputs = {}
             for input_meta in self.session.get_inputs():
@@ -521,7 +777,40 @@ class Embedder:
 
             embeddings.append(normalized_embeddings)
 
-        return np.concatenate(embeddings, axis=0)
+        result = np.concatenate(embeddings, axis=0)
+        rss_after_kb = _process_rss_kb()
+        rss_delta_kb = (
+            rss_after_kb - rss_before_kb
+            if rss_before_kb is not None and rss_after_kb is not None
+            else None
+        )
+        duration_s = time.perf_counter() - started
+        logging.info(
+            "embedding_perf texts=%d batches=%d batch_size=%d max_tokens=%d "
+            "longest_tokens=%d duration_ms=%.1f rss_before_kb=%s "
+            "rss_after_kb=%s rss_delta_kb=%s peak_rss_kb=%d",
+            len(texts),
+            batch_count,
+            effective_batch_size,
+            self.max_tokens,
+            longest_tokens,
+            duration_s * 1000,
+            rss_before_kb,
+            rss_after_kb,
+            rss_delta_kb,
+            resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        )
+        if duration_s >= _EMBEDDING_SLOW_WARN_SECONDS:
+            logging.warning(
+                "embedding_slow texts=%d batches=%d longest_tokens=%d "
+                "duration_s=%.1f (threshold_s=%.1f)",
+                len(texts),
+                batch_count,
+                longest_tokens,
+                duration_s,
+                _EMBEDDING_SLOW_WARN_SECONDS,
+            )
+        return result
 
 
 def get_or_compute_embeddings(
@@ -541,16 +830,25 @@ def get_or_compute_embeddings(
     }
 
     ids = [s.id for s in stories]
-    model_version = "all-MiniLM-L6-v2|mean|norm|256"
+    model_version = embedder.model_version
 
-    cached = db.get_embeddings_batch(ids, model_version, story_hashes)
+    cached = db.get_embeddings_batch(
+        ids, model_version, story_hashes, expected_dim=embedder.embedding_dim
+    )
     missing_stories = [s for s in stories if s.id not in cached]
 
     if missing_stories:
         texts = [embedding_texts[s.id] for s in missing_stories]
         computed = embedder.encode(texts)
         for s, vec in zip(missing_stories, computed):
-            db.upsert_embedding(s.id, model_version, story_hashes[s.id], vec)
+            db.upsert_embedding(
+                s.id,
+                model_version,
+                story_hashes[s.id],
+                vec,
+                model_sha=embedder.model_onnx_sha,
+                dim=embedder.embedding_dim,
+            )
             cached[s.id] = vec
 
     return np.array([cached[story_id] for story_id in ids], dtype=np.float32)
@@ -596,26 +894,30 @@ def _knn_mean_and_max(
     ref_emb: NDArray[np.float32],
     k: int,
     chunk_size: int = _SIM_CHUNK_SIZE,
-) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
-    """Fused (top-k mean, max) cosine similarity in a single dot pass.
+) -> tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.int64]]:
+    """Fused (top-k mean, max, argmax) cosine similarity in a single dot pass.
 
     Exactly equivalent to the pair
     ``(_knn_similarity(query, ref, k), _chunked_max_dot(query, ref))`` but
     computes the ``query @ ref.T`` matrix once instead of twice — the max is
     just the top-1 of the same similarity rows the k-NN mean already reduces.
+    The argmax row index (into ref) is one extra reduction over the same
+    chunk; callers needing attribution (F2) get it with no new matmul.
     """
     n = query_emb.shape[0]
     if ref_emb.shape[0] == 0:
         zeros = np.zeros(n, dtype=np.float32)
-        return zeros, zeros.copy()
+        return zeros, zeros.copy(), np.full(n, -1, dtype=np.int64)
     n_ref = ref_emb.shape[0]
     k_actual = min(k, n_ref)
     mean_out = np.zeros(n, dtype=np.float32)
     max_out = np.zeros(n, dtype=np.float32)
+    argmax_out = np.full(n, -1, dtype=np.int64)
     for start in range(0, n, chunk_size):
         end = min(start + chunk_size, n)
         sim_chunk = query_emb[start:end] @ ref_emb.T
         max_out[start:end] = np.max(sim_chunk, axis=1)
+        argmax_out[start:end] = np.argmax(sim_chunk, axis=1)
         if k_actual <= 0:
             continue
         if k_actual == n_ref:
@@ -623,7 +925,11 @@ def _knn_mean_and_max(
         else:
             topk = np.partition(sim_chunk, n_ref - k_actual, axis=1)[:, -k_actual:]
         mean_out[start:end] = topk.mean(axis=1)
-    return mean_out.astype(np.float32), max_out.astype(np.float32)
+    return (
+        mean_out.astype(np.float32),
+        max_out.astype(np.float32),
+        argmax_out,
+    )
 
 
 def _chunked_max_dot(
@@ -745,16 +1051,6 @@ def _minmax01(values: np.ndarray) -> NDArray[np.float32]:
     return ((values - values.min()) / span).astype(np.float32)
 
 
-def _rank_percentiles(values: np.ndarray) -> NDArray[np.float32]:
-    values = np.asarray(values, dtype=np.float32)
-    if len(values) <= 1:
-        return np.ones(len(values), dtype=np.float32)
-    order = np.argsort(values, kind="mergesort")
-    ranks = np.empty(len(values), dtype=np.float32)
-    ranks[order] = np.linspace(0.0, 1.0, len(values), dtype=np.float32)
-    return ranks
-
-
 def _softmax_rows(values: np.ndarray) -> NDArray[np.float32]:
     values = np.asarray(values, dtype=np.float32)
     shifted = values - values.max(axis=1, keepdims=True)
@@ -768,25 +1064,17 @@ def _loocv_knn_features(
     class_indices: np.ndarray,
     k: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    n = len(class_embs)
-    sim_mat = fb_embeddings @ class_embs.T
-    if n > 1:
-        for idx, tp in enumerate(class_indices):
-            sim_mat[tp, idx] = -2.0
-    sim_to = np.zeros(len(fb_embeddings), dtype=np.float32)
-    k_eff = min(k, n)
-    for i in range(len(fb_embeddings)):
-        sims = sim_mat[i]
-        exclude = 1 if i in class_indices else 0
-        n_available = max(1, n - exclude)
-        k_use = min(k_eff, n_available)
-        sim_to[i] = _topk_mean(sims, k_use)
-    sim_mat_clean = fb_embeddings @ class_embs.T
-    if n > 1:
-        for idx, tp in enumerate(class_indices):
-            sim_mat_clean[tp, idx] = -1.0
-    closest = np.max(sim_mat_clean, axis=1)
-    return sim_to, closest
+    means = np.zeros(len(fb_embeddings), dtype=np.float32)
+    closest = np.zeros(len(fb_embeddings), dtype=np.float32)
+    similarities = fb_embeddings @ class_embs.T
+    own_columns = {int(row): column for column, row in enumerate(class_indices)}
+    for row, values in enumerate(similarities):
+        if row in own_columns:
+            values = np.delete(values, own_columns[row])
+        if len(values):
+            means[row] = _topk_mean(values, min(k, len(values)))
+            closest[row] = values.max()
+    return means, closest
 
 
 def _score_and_rank(
@@ -832,13 +1120,11 @@ def _score_and_rank(
         and len(unique_classes) >= 2
     ):
         try:
-            # Model cache lookup is intentionally before training-feature
-            # construction. Cache hits still need candidate-side features,
-            # but they do not need LOOCV training matrices.
+            # Lookup precedes training-feature construction, but follows
+            # embedding refresh: enrichment can change training inputs
+            # without changing any vote or its timestamp.
             fb_sig = _feedback_signature(db, user_id) if user_id is not None else ""
             cached_model: _CachedModel | None = None
-            if fb_sig:
-                cached_model = _get_cached_model(user_id, fb_sig)
 
             if trace is not None:
                 with trace.stage("feedback_embedding"):
@@ -851,6 +1137,25 @@ def _score_and_rank(
                 )
             if score_context is not None:
                 score_context.feedback_embeddings = fb_embeddings
+
+            if fb_sig:
+                signature = hashlib.sha256(fb_sig.encode())
+                signature.update(fb_embeddings.tobytes())
+                signature.update(
+                    json.dumps(
+                        [
+                            embedder.model_version,
+                            asdict(config.model),
+                            [
+                                (s.id, label, len(s.text_content), s.source)
+                                for s, label in zip(feedback_stories, feedback_labels)
+                            ],
+                        ],
+                        sort_keys=True,
+                    ).encode()
+                )
+                fb_sig = signature.hexdigest()
+                cached_model = _get_cached_model(user_id, fb_sig)
 
             # Personalization: mean/closest per class from ALL real feedback
             fb_labels_arr = np.array(feedback_labels)
@@ -870,10 +1175,10 @@ def _score_and_rank(
                 # Fused (top-k mean, max) per class — one dot pass each instead
                 # of the two _knn_similarity/_chunked_max_dot recomputed the
                 # same candidate @ feedback matrix twice.
-                cand_sim_to_up, cand_closest_up = _knn_mean_and_max(
-                    candidate_embeddings, fb_up_embs, k
+                cand_sim_to_up, cand_closest_up, cand_closest_up_idx = (
+                    _knn_mean_and_max(candidate_embeddings, fb_up_embs, k)
                 )
-                cand_sim_to_down, cand_closest_down = _knn_mean_and_max(
+                cand_sim_to_down, cand_closest_down, _ = _knn_mean_and_max(
                     candidate_embeddings, fb_down_embs, k
                 )
                 cand_closest_neutral = _chunked_max_dot(
@@ -914,6 +1219,10 @@ def _score_and_rank(
                 )
             if score_context is not None:
                 score_context.cand_closest_up = cand_closest_up.astype(np.float32)
+                score_context.cand_closest_up_idx = cand_closest_up_idx
+                score_context.fb_up_titles = [
+                    feedback_stories[i].title for i in np.flatnonzero(up_mask)
+                ]
                 score_context.cand_closest_down = cand_closest_down.astype(np.float32)
                 score_context.cand_closest_neutral = cand_closest_neutral.astype(
                     np.float32
@@ -926,98 +1235,116 @@ def _score_and_rank(
             else:
                 if trace is not None:
                     trace.set_label("model_cache", "miss")
-                with trace.stage("svm_training_feature_prep"):
-                    # LOOCV k-NN for training: exclude self from reference set
-                    fb_sim_to_up = np.zeros(len(fb_embeddings), dtype=np.float32)
-                    fb_sim_to_down = np.zeros(len(fb_embeddings), dtype=np.float32)
-                    if n_up > 0:
-                        up_indices = np.where(up_mask)[0]
-                        fb_sim_to_up, fb_closest_up = _loocv_knn_features(
-                            fb_embeddings, fb_up_embs, up_indices, k
+                    with trace.stage("svm_training_feature_prep"):
+                        # LOOCV k-NN for training: exclude self from reference set
+                        fb_sim_to_up = np.zeros(len(fb_embeddings), dtype=np.float32)
+                        fb_sim_to_down = np.zeros(len(fb_embeddings), dtype=np.float32)
+                        if n_up > 0:
+                            up_indices = np.where(up_mask)[0]
+                            fb_sim_to_up, fb_closest_up = _loocv_knn_features(
+                                fb_embeddings, fb_up_embs, up_indices, k
+                            )
+                        else:
+                            fb_closest_up = np.zeros(
+                                len(fb_embeddings), dtype=np.float32
+                            )
+
+                        if n_down > 0:
+                            down_indices = np.where(down_mask)[0]
+                            fb_sim_to_down, fb_closest_down = _loocv_knn_features(
+                                fb_embeddings, fb_down_embs, down_indices, k
+                            )
+                        else:
+                            fb_closest_down = np.zeros(
+                                len(fb_embeddings), dtype=np.float32
+                            )
+
+                        fb_positive_cluster_sim = (
+                            _similarity_to_positive_cluster_centers(
+                                fb_embeddings, positive_cluster_centers
+                            )
                         )
-                    else:
-                        fb_closest_up = np.zeros(len(fb_embeddings), dtype=np.float32)
 
-                    if n_down > 0:
-                        down_indices = np.where(down_mask)[0]
-                        fb_sim_to_down, fb_closest_down = _loocv_knn_features(
-                            fb_embeddings, fb_down_embs, down_indices, k
+                        fb_text_lengths = np.array(
+                            [len(s.text_content) for s in feedback_stories]
                         )
+
+                        # 4-binary source category one-hot per feedback story.
+                        fb_source_onehot = source_category_stack(
+                            [s.source for s in feedback_stories]
+                        )
+                        fb_is_hn_live = fb_source_onehot[:, 0]
+                        fb_is_archive = fb_source_onehot[:, 1]
+                        fb_is_reddit = fb_source_onehot[:, 2]
+                        fb_is_rss = fb_source_onehot[:, 3]
+
+                        fb_features = _svm_personalization_features(
+                            fb_embeddings,
+                            text_lengths=fb_text_lengths,
+                            sim_to_upvoted=fb_sim_to_up,
+                            sim_to_downvoted=fb_sim_to_down,
+                            closest_upvoted=fb_closest_up,
+                            closest_downvoted=fb_closest_down,
+                            positive_cluster_similarity=fb_positive_cluster_sim,
+                            is_hn_live=fb_is_hn_live,
+                            is_archive=fb_is_archive,
+                            is_reddit=fb_is_reddit,
+                            is_rss=fb_is_rss,
+                        )
+
+                    # Ensure all three classes (0, 1, 2) are present
+                    missing = {0, 1, 2} - set(feedback_labels)
+                    if missing:
+                        fb_features = np.concatenate(
+                            [
+                                fb_features,
+                                np.zeros(
+                                    (len(missing), fb_features.shape[1]),
+                                    dtype=np.float32,
+                                ),
+                            ],
+                            axis=0,
+                        )
+                        labels = list(feedback_labels) + list(missing)
                     else:
-                        fb_closest_down = np.zeros(len(fb_embeddings), dtype=np.float32)
+                        labels = list(feedback_labels)
 
-                    fb_positive_cluster_sim = _similarity_to_positive_cluster_centers(
-                        fb_embeddings, positive_cluster_centers
-                    )
+                    # Compute balanced weights for real feedback; 1e-6 for dummies
+                    counts = Counter(feedback_labels)
+                    n_classes = len(counts)
+                    n_real = len(feedback_labels)
+                    weights = [
+                        n_real / (n_classes * counts[lbl]) for lbl in feedback_labels
+                    ]
+                    weights.extend([1e-6] * len(missing))
+                    sample_weights = np.array(weights, dtype=np.float64)
 
-                    fb_text_lengths = np.array(
-                        [len(s.text_content) for s in feedback_stories]
+                    scaler = StandardScaler()
+                    fb_features_meta_scaled = np.clip(
+                        scaler.fit_transform(fb_features[:, emb_dim:]), -2.5, 2.5
                     )
-
-                    # 4-binary source category one-hot per feedback story.
-                    fb_source_onehot = source_category_stack(
-                        [s.source for s in feedback_stories]
+                    fb_features_scaled = np.hstack(
+                        [fb_features[:, :emb_dim], fb_features_meta_scaled]
                     )
-                    fb_is_hn_live = fb_source_onehot[:, 0]
-                    fb_is_archive = fb_source_onehot[:, 1]
-                    fb_is_reddit = fb_source_onehot[:, 2]
-                    fb_is_rss = fb_source_onehot[:, 3]
-
-                    fb_features = _svm_personalization_features(
-                        fb_embeddings,
-                        text_lengths=fb_text_lengths,
-                        sim_to_upvoted=fb_sim_to_up,
-                        sim_to_downvoted=fb_sim_to_down,
-                        closest_upvoted=fb_closest_up,
-                        closest_downvoted=fb_closest_down,
-                        positive_cluster_similarity=fb_positive_cluster_sim,
-                        is_hn_live=fb_is_hn_live,
-                        is_archive=fb_is_archive,
-                        is_reddit=fb_is_reddit,
-                        is_rss=fb_is_rss,
+                if config.model.svm_precomputed_enabled:
+                    if config.model.svm_kernel != "rbf" or not isinstance(
+                        config.model.svm_gamma, float
+                    ):
+                        raise ValueError("precomputed SVM requires a numeric RBF gamma")
+                    svm: _CachedClassifier = PrecomputedRbfSVC(
+                        c=config.model.svm_c,
+                        gamma=config.model.svm_gamma,
+                        chunk_size=config.model.svm_precomputed_chunk_size,
                     )
-
-                # Ensure all three classes (0, 1, 2) are present
-                missing = {0, 1, 2} - set(feedback_labels)
-                if missing:
-                    fb_features = np.concatenate(
-                        [
-                            fb_features,
-                            np.zeros(
-                                (len(missing), fb_features.shape[1]), dtype=np.float32
-                            ),
-                        ],
-                        axis=0,
-                    )
-                    labels = list(feedback_labels) + list(missing)
                 else:
-                    labels = list(feedback_labels)
-
-                # Compute balanced weights for real feedback; 1e-6 for dummies
-                counts = Counter(feedback_labels)
-                n_classes = len(counts)
-                n_real = len(feedback_labels)
-                weights = [
-                    n_real / (n_classes * counts[lbl]) for lbl in feedback_labels
-                ]
-                weights.extend([1e-6] * len(missing))
-                sample_weights = np.array(weights, dtype=np.float64)
-
-                scaler = StandardScaler()
-                fb_features_meta_scaled = np.clip(
-                    scaler.fit_transform(fb_features[:, emb_dim:]), -2.5, 2.5
-                )
-                fb_features_scaled = np.hstack(
-                    [fb_features[:, :emb_dim], fb_features_meta_scaled]
-                )
-                svm = SVC(
-                    C=config.model.svm_c,
-                    kernel=config.model.svm_kernel,
-                    gamma=config.model.svm_gamma,
-                    cache_size=16,
-                    random_state=0,
-                    decision_function_shape="ovr",
-                )
+                    svm = SVC(
+                        C=config.model.svm_c,
+                        kernel=config.model.svm_kernel,
+                        gamma=config.model.svm_gamma,
+                        cache_size=16,
+                        random_state=0,
+                        decision_function_shape="ovr",
+                    )
                 if trace is not None:
                     with trace.stage("svm_fit"):
                         svm.fit(
@@ -1060,6 +1387,7 @@ def _score_and_rank(
                 probs = _softmax_rows(decision)
             scores = _minmax01(raw_scores)
         except Exception as e:
+            trace.set_label("svm_fit", "error")
             logging.error("Failed to fit feedback SVM: %r", e)
     elif trace is not None:
         trace.set_label("model_cache", "skipped")
@@ -1103,7 +1431,9 @@ def _score_and_rank(
     # SVM already has the prior signal directly and the boost double-counted.
     tier1_scores = np.array(
         [
-            s.score / max(((now - s.time) / 3600.0 + 2.0) ** 1.8, 0.1)
+            # Clamp age at zero: a story newer than `now` (clock skew) would
+            # otherwise raise a negative base to a fractional power (complex).
+            s.score / max((max((now - s.time) / 3600.0, 0.0) + 2.0) ** 1.8, 0.1)
             for s in candidates
         ],
         dtype=np.float32,
@@ -1163,6 +1493,7 @@ def _score_and_rank(
                     )
                 )
         except (ValueError, IndexError, NameError) as e:
+            trace.set_label("svm_probs", "error")
             logging.error("Error mapping probability class indices: %r", e)
             ranked = []
 
@@ -1251,6 +1582,7 @@ def _assemble_combo_deck(
     embeddings_map: dict[int, NDArray[np.float32]] | None,
     explore: ExploreContext | None,
     is_feedback_match: Callable[[Story], bool] | None = None,
+    trace: RankTrace | _NullTrace = NULL_TRACE,
 ) -> list[RankedStory]:
     """Bucket ``ranked`` into per-combo primary + badge cards.
 
@@ -1286,9 +1618,7 @@ def _assemble_combo_deck(
     def _hot_sort_key(r: RankedStory) -> float:
         return float(cand_velocities[idx_for(r.story.id)])
 
-    def _take_unmatched(
-        items: list[RankedStory], n: int
-    ) -> list[RankedStory]:
+    def _take_unmatched(items: list[RankedStory], n: int) -> list[RankedStory]:
         """Take the first *n* items from an already-sorted list, skipping
         (and backfilling past) any that duplicate voted-on feedback.
 
@@ -1312,7 +1642,9 @@ def _assemble_combo_deck(
         return float(get_entropy(r))
 
     # Per-combo deck construction. Three combos: recent_hn, recent_nonhn,
-    # archive_hn. Each combo gets PRIMARY_PER_COMBO primary cards (MMR if
+    # archive_hn (a fourth, archive_nonhn, is structurally always empty —
+    # see the PRIMARY_RECENT_NONHN/PRIMARY_ARCHIVE_HN comment above — and
+    # has been retired). Each combo gets its own primary quota (MMR if
     # enabled, otherwise top-score), plus DISCOVERY_PER_BADGE cards for each
     # of Hot/Top/Talk (Popular, HN only) and Unsure/Novel/Similar (Explore).
     #
@@ -1320,9 +1652,8 @@ def _assemble_combo_deck(
     # age+source without computing offsets (e.g. "recent_hn recent_mixed").
     COMBO_DEFS: list[tuple[str, str, int]] = [
         ("recent", "hn", PRIMARY_PER_COMBO),
-        ("recent", "nonhn", PRIMARY_PER_COMBO),
-        ("archive", "hn", PRIMARY_PER_COMBO),
-        ("archive", "nonhn", PRIMARY_PER_COMBO),
+        ("recent", "nonhn", PRIMARY_RECENT_NONHN),
+        ("archive", "hn", PRIMARY_ARCHIVE_HN),
     ]
 
     final: list[RankedStory] = []
@@ -1339,7 +1670,12 @@ def _assemble_combo_deck(
         else:
             combo_pool = [r for r in age_pool if not is_hn_source(r.story.source)]
 
+        combo_id = f"{age}_{source}"
+        trace.set_count(f"combo_pool_{combo_id}", len(combo_pool))
+
         if not combo_pool:
+            trace.set_count(f"combo_primary_{combo_id}", 0)
+            trace.set_count(f"combo_badges_{combo_id}", 0)
             continue
 
         source_key = age + ("_hn" if source == "hn" else "_non-hn")
@@ -1348,12 +1684,13 @@ def _assemble_combo_deck(
         # --- Primary selection ---
         if primary_limit > 0:
             if config.model.enable_mmr and embeddings_map:
-                primary = mmr_filter(
-                    combo_pool,
-                    embeddings_map,
-                    threshold=config.model.diversity_threshold,
-                    limit=primary_limit,
-                )
+                with trace.stage("combo_mmr"):
+                    primary = mmr_filter(
+                        combo_pool,
+                        embeddings_map,
+                        threshold=config.model.diversity_threshold,
+                        limit=primary_limit,
+                    )
             else:
                 combo_sort = sorted(combo_pool, key=lambda r: r.score, reverse=True)
                 primary = combo_sort[:primary_limit]
@@ -1364,6 +1701,8 @@ def _assemble_combo_deck(
         else:
             primary = []
 
+        trace.set_count(f"combo_primary_{combo_id}", len(primary))
+        badge_baseline = len(final)
         primary_ids = {r.story.id for r in primary}
 
         # --- Popular (HN only): Hot + Top + Talk ---
@@ -1465,7 +1804,9 @@ def _assemble_combo_deck(
                     )
                 else:
                     final.append(
-                        replace(r, combo_keys=f"{source_key} {mixed_key}", **badge_flags)
+                        replace(
+                            r, combo_keys=f"{source_key} {mixed_key}", **badge_flags
+                        )
                     )
 
             unsure_items = _take_unmatched(
@@ -1503,6 +1844,8 @@ def _assemble_combo_deck(
             for r in similar_items:
                 _merge_or_append(r, is_similar=True)
                 explore_picked.add(r.story.id)
+
+        trace.set_count(f"combo_badges_{combo_id}", len(final) - badge_baseline)
 
     # Set is_recent and is_non_hn on every story in `final` (these flags are
     # source/time based, not rank-based, so they always reflect the current
@@ -1568,6 +1911,80 @@ def rerank_candidates(
         score_context=score_context,
     )
 
+    return assemble_ranked_deck(
+        ranked,
+        candidates,
+        cand_embeddings,
+        db,
+        config,
+        embedder,
+        user_id=user_id,
+        score_context=score_context,
+        trace=trace,
+        is_feedback_match=is_feedback_match,
+    )
+
+
+# Minimum closest-up similarity for showing an attribution. A bogus
+# "because you upvoted X" on a weak match is worse than none.
+ATTRIBUTION_MIN_SIM = 0.35
+
+
+def _fill_best_match_titles(
+    final: list[RankedStory],
+    candidates: list[Story],
+    score_context: RankScoreContext | None,
+) -> list[RankedStory]:
+    """F2 attribution: name the closest upvoted story per deck card.
+
+    Uses the argmax indices already computed for features (no new matmul).
+    Empty when cold (no feedback), when the argmax is invalid, when the
+    feedback title is gone, or below ATTRIBUTION_MIN_SIM.
+    """
+    if (
+        score_context is None
+        or score_context.cand_closest_up_idx is None
+        or score_context.cand_closest_up is None
+        or not score_context.fb_up_titles
+    ):
+        return final
+    row_of = {s.id: i for i, s in enumerate(candidates)}
+    titles = score_context.fb_up_titles
+    filled: list[RankedStory] = []
+    for r in final:
+        row = row_of.get(r.story.id)
+        title = ""
+        if row is not None:
+            fb_row = int(score_context.cand_closest_up_idx[row])
+            if (
+                0 <= fb_row < len(titles)
+                and float(score_context.cand_closest_up[row]) >= ATTRIBUTION_MIN_SIM
+                and titles[fb_row]
+            ):
+                title = titles[fb_row]
+        filled.append(replace(r, best_match_title=title) if title else r)
+    return filled
+
+
+def assemble_ranked_deck(
+    ranked: list[RankedStory],
+    candidates: list[Story],
+    cand_embeddings: NDArray[np.float32],
+    db: Database,
+    config: Config,
+    embedder: Embedder,
+    *,
+    user_id: int | None = None,
+    score_context: RankScoreContext | None = None,
+    trace: RankTrace | _NullTrace = NULL_TRACE,
+    is_feedback_match: Callable[[Story], bool] | None = None,
+) -> list[RankedStory]:
+    """Attach production combo membership and discovery to an existing ranking."""
+    if not candidates:
+        return []
+    if score_context is None:
+        score_context = RankScoreContext()
+
     # Build MMR embeddings map once (used per combo)
     embeddings_map: dict[int, NDArray[np.float32]] = {}
     if config.model.enable_mmr:
@@ -1629,16 +2046,19 @@ def rerank_candidates(
     story_id_to_idx = {s.id: idx for idx, s in enumerate(candidates)}
     idx_for = story_id_to_idx.__getitem__
 
-    return _assemble_combo_deck(
-        ranked,
-        config=config,
-        recent_cutoff=recent_cutoff,
-        cand_scores=cand_scores,
-        cand_velocities=cand_velocities,
-        idx_for=idx_for,
-        embeddings_map=embeddings_map,
-        explore=ExploreContext(
-            cand_max_sim=cand_max_sim, cand_closest_up=cand_closest_up
-        ),
-        is_feedback_match=is_feedback_match,
-    )
+    with trace.stage("combo_assembly"):
+        final = _assemble_combo_deck(
+            ranked,
+            config=config,
+            recent_cutoff=recent_cutoff,
+            cand_scores=cand_scores,
+            cand_velocities=cand_velocities,
+            idx_for=idx_for,
+            embeddings_map=embeddings_map,
+            explore=ExploreContext(
+                cand_max_sim=cand_max_sim, cand_closest_up=cand_closest_up
+            ),
+            is_feedback_match=is_feedback_match,
+            trace=trace,
+        )
+    return _fill_best_match_titles(final, candidates, score_context)

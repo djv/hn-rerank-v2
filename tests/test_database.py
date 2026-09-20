@@ -1,9 +1,14 @@
 import time
 import sqlite3
+from pathlib import Path
 import numpy as np
 import pytest
 from hypothesis import given, strategies as st, settings, HealthCheck
-from database import Database, Story
+from database import Database, InteractionEvent, Story
+from scripts.migrate_interaction_events import (
+    migrate_database as migrate_interaction_events,
+)
+from scripts.migrate_db_to_strict import migrate_database
 
 
 @pytest.fixture
@@ -99,6 +104,275 @@ def test_read_only_database_opens_existing_db_without_writes(tmp_path) -> None:
             )
     finally:
         readonly.close()
+
+
+def test_fresh_database_uses_strict_tables_and_schema_version(tmp_path) -> None:
+    db_path = tmp_path / "strict.db"
+    database = Database(str(db_path))
+    database.close()
+
+    with sqlite3.connect(db_path) as conn:
+        application_tables = conn.execute(
+            "SELECT name, strict FROM pragma_table_list "
+            "WHERE schema='main' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        assert application_tables
+        assert all(strict == 1 for _, strict in application_tables)
+        assert conn.execute("PRAGMA user_version").fetchone() == (2,)
+
+        with pytest.raises(sqlite3.IntegrityError, match="datatype mismatch"):
+            conn.execute(
+                "INSERT INTO stories "
+                "(id, title, score, time, text_content, source, fetched_at) "
+                "VALUES ('not-an-id', 'Title', 1, 1, 'Text', 'hn', 1.0)"
+            )
+
+
+def test_database_rejects_unmigrated_flexible_schema(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE stories (id INTEGER PRIMARY KEY)")
+
+    with pytest.raises(RuntimeError, match="explicit STRICT migration"):
+        Database(str(db_path))
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone() == (0,)
+        assert conn.execute(
+            "SELECT strict FROM pragma_table_list WHERE name='stories'"
+        ).fetchone() == (0,)
+
+
+def test_interaction_migration_backs_up_and_is_additive(tmp_path: Path) -> None:
+    source = tmp_path / "legacy-strict.db"
+    with sqlite3.connect(source) as conn:
+        conn.execute("CREATE TABLE stories (id INTEGER PRIMARY KEY) STRICT")
+        conn.execute("INSERT INTO stories VALUES (1)")
+        conn.execute("PRAGMA user_version=1")
+
+    backup = migrate_interaction_events(source)
+
+    assert backup.exists()
+    with sqlite3.connect(source) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone() == (2,)
+        assert conn.execute(
+            "SELECT strict FROM pragma_table_list WHERE name='interaction_events'"
+        ).fetchone() == (1,)
+        assert conn.execute("SELECT COUNT(*) FROM stories").fetchone() == (1,)
+        assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+    with sqlite3.connect(backup) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone() == (1,)
+        assert conn.execute("SELECT COUNT(*) FROM stories").fetchone() == (1,)
+
+
+def test_interaction_events_are_strict_idempotent_and_isolated(db: Database) -> None:
+    db.upsert_story(
+        Story(id=501, title="Ledger story", url=None, score=1, time=1, text_content="x")
+    )
+    event = InteractionEvent(
+        event_id="11111111-1111-4111-8111-111111111111",
+        client_session_id="22222222-2222-4222-8222-222222222222",
+        user_id=7,
+        story_id=501,
+        event_type="impression",
+        dashboard_version=0,
+        position=3,
+        sort_mode="recommended",
+        age_filter="recent",
+        source_filter="mixed",
+        ranker_arm="baseline",
+        occurred_at=1_700_000_000.0,
+    )
+    assert db.insert_interaction_events([event, event]) == (1, 1, 0)
+    assert db.insert_interaction_events([event]) == (0, 1, 0)
+    with db.conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM interaction_events").fetchone() == (
+            1,
+        )
+        assert conn.execute(
+            "SELECT strict FROM pragma_table_list WHERE name='interaction_events'"
+        ).fetchone() == (1,)
+        indexes = {
+            row[1] for row in conn.execute("PRAGMA index_list(interaction_events)")
+        }
+        assert "idx_interaction_events_user_time" in indexes
+        assert "idx_interaction_events_story_time" in indexes
+
+
+def test_interaction_events_skip_unknown_story_per_event(db: Database) -> None:
+    db.upsert_story(
+        Story(id=502, title="Known story", url=None, score=1, time=1, text_content="x")
+    )
+    unknown = InteractionEvent(
+        event_id="33333333-3333-4333-8333-333333333333",
+        client_session_id="44444444-4444-4444-8444-444444444444",
+        user_id=1,
+        story_id=999999,
+        event_type="article_open",
+        dashboard_version=1,
+        position=0,
+        sort_mode="recommended",
+        age_filter="recent",
+        source_filter="mixed",
+        ranker_arm="baseline",
+        occurred_at=1_700_000_000.0,
+    )
+    known = InteractionEvent(
+        event_id="55555555-5555-4555-8555-555555555556",
+        client_session_id="44444444-4444-4444-8444-444444444444",
+        user_id=1,
+        story_id=502,
+        event_type="impression",
+        dashboard_version=1,
+        position=1,
+        sort_mode="recommended",
+        age_filter="recent",
+        source_filter="mixed",
+        ranker_arm="baseline",
+        occurred_at=1_700_000_000.0,
+    )
+    assert db.insert_interaction_events([unknown, known]) == (1, 0, 1)
+    with db.conn() as conn:
+        assert conn.execute("SELECT story_id FROM interaction_events").fetchall() == [
+            (502,)
+        ]
+
+
+def test_capped_dwell_by_story_sums_caps_and_cuts_at_before_ts(
+    db: Database,
+) -> None:
+    """B3 sample_weight source: per-story dwell sums with per-event cap
+    and an occurred_at cutoff for leak-free temporal eval."""
+    for sid in (601, 602):
+        db.upsert_story(
+            Story(
+                id=sid, title="Dwell story", url=None, score=1, time=1, text_content="x"
+            )
+        )
+
+    def dwell(event_id: str, story_id: int, duration_ms: int, occurred_at: float):
+        return InteractionEvent(
+            event_id=event_id,
+            client_session_id="22222222-2222-4222-8222-222222222222",
+            user_id=7,
+            story_id=story_id,
+            event_type="dwell",
+            dashboard_version=0,
+            position=0,
+            sort_mode="recommended",
+            age_filter="recent",
+            source_filter="mixed",
+            ranker_arm="baseline",
+            occurred_at=occurred_at,
+            duration_ms=duration_ms,
+        )
+
+    impression = InteractionEvent(
+        event_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        client_session_id="22222222-2222-4222-8222-222222222222",
+        user_id=7,
+        story_id=601,
+        event_type="impression",
+        dashboard_version=0,
+        position=0,
+        sort_mode="recommended",
+        age_filter="recent",
+        source_filter="mixed",
+        ranker_arm="baseline",
+        occurred_at=1_700_000_100.0,
+    )
+    events = [
+        impression,  # non-dwell rows never contribute
+        dwell("b0000000-0000-4000-8000-000000000001", 601, 30_000, 1_700_000_100.0),
+        dwell("b0000000-0000-4000-8000-000000000002", 601, 200_000, 1_700_000_200.0),
+        dwell("b0000000-0000-4000-8000-000000000003", 601, 10_000, 1_700_000_900.0),
+        dwell("b0000000-0000-4000-8000-000000000004", 602, 5_000, 1_700_000_100.0),
+    ]
+    assert db.insert_interaction_events(events) == (5, 0, 0)
+
+    # 200s event capped at the 120s default; story 602 untouched by cutoff.
+    assert db.get_capped_dwell_by_story(7) == {601: 160_000.0, 602: 5_000.0}
+    assert db.get_capped_dwell_by_story(7, before_ts=1_700_000_500.0) == {
+        601: 150_000.0,
+        602: 5_000.0,
+    }
+    assert db.get_capped_dwell_by_story(7, cap_ms=10_000) == {
+        601: 30_000.0,
+        602: 5_000.0,
+    }
+    assert db.get_capped_dwell_by_story(8) == {}
+
+
+def test_strict_migration_preserves_schema_and_removes_orphan_caches(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "legacy.db"
+    destination = tmp_path / "strict.db"
+    with sqlite3.connect(source) as conn:
+        conn.executescript(
+            """
+            PRAGMA foreign_keys=OFF;
+            CREATE TABLE stories (id INTEGER PRIMARY KEY, title TEXT NOT NULL);
+            CREATE TABLE embeddings (
+                story_id INTEGER PRIMARY KEY,
+                embedding BLOB NOT NULL,
+                FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE
+            );
+            CREATE TABLE tldr_cache (
+                story_id INTEGER NOT NULL,
+                cache_key TEXT NOT NULL,
+                PRIMARY KEY (story_id, cache_key),
+                FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE
+            );
+            CREATE INDEX idx_story_title ON stories(title);
+            INSERT INTO stories VALUES (1, 'kept');
+            INSERT INTO embeddings VALUES (1, X'0102');
+            INSERT INTO embeddings VALUES (2, X'0304');
+            INSERT INTO tldr_cache VALUES (1, 'kept');
+            INSERT INTO tldr_cache VALUES (3, 'orphan');
+            """
+        )
+
+    result = migrate_database(source, destination, remove_orphan_caches=True)
+
+    assert result.removed_orphans == {"embeddings": 1, "tldr_cache": 1}
+    with sqlite3.connect(source) as conn:
+        assert conn.execute("SELECT count(*) FROM embeddings").fetchone() == (2,)
+        assert conn.execute("SELECT count(*) FROM tldr_cache").fetchone() == (2,)
+    with sqlite3.connect(destination) as conn:
+        assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert conn.execute("SELECT count(*) FROM embeddings").fetchone() == (1,)
+        assert conn.execute("SELECT count(*) FROM tldr_cache").fetchone() == (1,)
+        assert conn.execute(
+            "SELECT strict FROM pragma_table_list WHERE name='stories'"
+        ).fetchone() == (1,)
+        assert conn.execute(
+            "SELECT count(*) FROM sqlite_schema WHERE name='idx_story_title'"
+        ).fetchone() == (1,)
+
+
+def test_strict_migration_refuses_orphans_without_explicit_permission(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "legacy.db"
+    destination = tmp_path / "strict.db"
+    with sqlite3.connect(source) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE stories (id INTEGER PRIMARY KEY);
+            CREATE TABLE embeddings (
+                story_id INTEGER PRIMARY KEY,
+                FOREIGN KEY (story_id) REFERENCES stories(id)
+            );
+            PRAGMA foreign_keys=OFF;
+            INSERT INTO embeddings VALUES (99);
+            """
+        )
+
+    with pytest.raises(RuntimeError, match="--remove-orphan-caches"):
+        migrate_database(source, destination, remove_orphan_caches=False)
+    assert source.exists()
+    assert not destination.exists()
 
 
 def test_archive_score_time_index_created(db: Database) -> None:
@@ -221,6 +495,48 @@ def test_get_embeddings_batch(db):
     batch2 = db.get_embeddings_batch([1, 2], "v1", bad_hashes)
     assert len(batch2) == 1
     assert 2 not in batch2
+
+
+def test_upsert_embedding_records_provenance(db):
+    from database import Story
+
+    db.upsert_story(Story(id=7, title="S", url=None, score=1, time=1, text_content="T"))
+    vec = np.ones(384, dtype=np.float32)
+    db.upsert_embedding(7, "v1", "h", vec, model_sha="abc123", dim=384)
+
+    with db.conn() as conn:
+        row = conn.execute(
+            "SELECT model_sha, dim, length(embedding) FROM embeddings WHERE story_id = 7"
+        ).fetchone()
+    assert row is not None
+    assert row[0] == "abc123"
+    assert row[1] == 384
+    assert row[2] == 384 * 4
+
+    # Provenance columns never gate the match: legacy callers omit them.
+    assert db.get_embedding(7, "v1", "h") is not None
+
+
+def test_get_embeddings_batch_skips_wrong_dim_row(db, caplog):
+    import logging
+
+    from database import Story
+
+    db.upsert_story(Story(id=8, title="S", url=None, score=1, time=1, text_content="T"))
+    db.upsert_story(Story(id=9, title="S", url=None, score=1, time=1, text_content="T"))
+    db.upsert_embedding(8, "v1", "h8", np.ones(384, dtype=np.float32))
+    db.upsert_embedding(9, "v1", "h9", np.ones(8, dtype=np.float32))
+
+    with caplog.at_level(logging.WARNING):
+        batch = db.get_embeddings_batch(
+            [8, 9], "v1", {8: "h8", 9: "h9"}, expected_dim=384
+        )
+    assert list(batch) == [8]
+    assert "embedding_dim_mismatch" in caplog.text
+
+    # expected_dim=0 preserves legacy behavior (no length check).
+    legacy = db.get_embeddings_batch([9], "v1", {9: "h9"})
+    assert list(legacy) == [9]
 
 
 def test_tldr_cache_roundtrip_replaces_stale_entries(db):
@@ -612,11 +928,16 @@ def test_feedback_training_data(db):
         min_size=5,
         max_size=50,
     ),
-    # Indices of stories to attach feedback to
-    feedback_indices=st.sets(st.integers(min_value=0, max_value=49)),
+    data=st.data(),
 )
 @settings(max_examples=25, suppress_health_check=[HealthCheck.function_scoped_fixture])
-def test_story_pruning_integrity_invariants(fetched_offsets, feedback_indices):
+def test_story_pruning_integrity_invariants(fetched_offsets, data):
+    # Indices of stories to attach feedback to -- drawn against the
+    # actual story count so every index is live (a fixed 0..49 range
+    # went dead whenever fewer than 50 stories were generated).
+    feedback_indices = data.draw(
+        st.sets(st.integers(min_value=0, max_value=len(fetched_offsets) - 1))
+    )
     db = Database(":memory:")
     try:
         user = db.create_user("test_token_hypothesis")
@@ -645,7 +966,7 @@ def test_story_pruning_integrity_invariants(fetched_offsets, feedback_indices):
             )
 
             # Apply feedback if indexed
-            has_feedback = i in feedback_indices and i < len(fetched_offsets)
+            has_feedback = i in feedback_indices
             if has_feedback:
                 db.upsert_feedback(user.id, i, "up")
 
@@ -690,6 +1011,13 @@ def test_user_management(db):
     # Test get_or_create_user
     existing = db.get_or_create_user("tok123")
     assert existing.id == user.id
+
+    # Test get_user_by_id
+    by_id = db.get_user_by_id(user.id)
+    assert by_id is not None
+    assert by_id.token == "tok123"
+
+    assert db.get_user_by_id(-999999) is None
 
     new_user = db.get_or_create_user("new_tok")
     assert new_user.token == "new_tok"
@@ -760,3 +1088,55 @@ def test_count_feedback_by_action(db):
 
     db.upsert_feedback(user.id, 1, "down")  # change vote
     assert db.count_feedback_by_action(user.id) == {"up": 0, "neutral": 1, "down": 2}
+
+
+def test_pool_wait_over_threshold_is_counted_and_logged(tmp_path, caplog) -> None:
+    """Pool exhaustion must be visible: when all 5 connections are checked
+    out, the next checkout waits, and waits over 100ms increment
+    pool_slow_waits plus emit db_pool_wait_ms (the regen-contention signal
+    slow warms are joined against)."""
+    import threading
+    import time
+
+    db = Database(str(tmp_path / "pool.db"))
+    try:
+        assert db.pool_slow_waits == 0
+        held = [db._pool.get() for _ in range(5)]
+        done: dict[str, bool] = {}
+
+        def worker() -> None:
+            with db.conn():
+                done["ok"] = True
+
+        t = threading.Thread(target=worker)
+        t.start()
+        time.sleep(0.15)
+        for c in held:
+            db._pool.put(c)
+        t.join(timeout=5)
+        assert done.get("ok") is True
+        assert db.pool_slow_waits >= 1
+        assert any("db_pool_wait_ms=" in r.message for r in caplog.records)
+    finally:
+        db.close()
+
+
+def test_llm_usage_daily_accumulates_per_provider(db: Database) -> None:
+    """Spend visibility must be additive: repeated calls accumulate into one
+    (day, provider) row, and None usage (provider omitted it) counts as 0."""
+    db.record_llm_usage("mistral", 1000, 200, None)
+    db.record_llm_usage("mistral", 500, 100, None)
+    db.record_llm_usage("gospark", 2000, 300, 900)
+
+    rows = db.get_llm_usage_day(time.strftime("%Y-%m-%d"))
+    by_provider = {r["provider"]: r for r in rows}
+    assert by_provider["mistral"] == {
+        "provider": "mistral",
+        "calls": 2,
+        "input_tokens": 1500,
+        "output_tokens": 300,
+        "reasoning_tokens": 0,
+    }
+    assert by_provider["gospark"]["calls"] == 1
+    assert by_provider["gospark"]["reasoning_tokens"] == 900
+    assert db.get_llm_usage_day("1999-01-01") == []
