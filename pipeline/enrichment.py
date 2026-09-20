@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 import feedparser
 import httpx
 
-from database import Database, Story, coerce_int
+from database import Database, Story, StoryIdentityConflict, coerce_int
 
 if TYPE_CHECKING:
     from ch_client import ChItem
@@ -182,8 +182,8 @@ async def fetch_story(
             article_body=existing_body,
         )
 
-        db.upsert_story(story)
-        return story
+        db.upsert_story(story, comments_authoritative=bool(top_comment_texts))
+        return db.get_story(sid)
     except Exception as e:
         logging.error("Error fetching story %s: %r", sid, e)
         return story if story else None
@@ -277,8 +277,10 @@ def prewarm_top_stories(
             comment_count=comment_count,
             comment_count_at_fetch=comment_count,
         )
-        db.upsert_story(updated_story)
-        updated.append(updated_story)
+        db.upsert_story(updated_story, comments_authoritative=True)
+        persisted = db.get_story(sid)
+        if persisted is not None:
+            updated.append(persisted)
 
     if updated and embedder is not None:
         get_or_compute_embeddings(updated, embedder, db)
@@ -791,7 +793,11 @@ async def fetch_rss_feeds(
     all_stories: list[Story] = []
     for res in feed_results:
         for s in res:
-            db.upsert_story(s)
+            try:
+                db.upsert_story(s)
+            except StoryIdentityConflict:
+                logging.warning("rss_identity_conflict story_id=%s url=%s", s.id, s.url)
+                continue
             all_stories.append(s)
 
     return all_stories

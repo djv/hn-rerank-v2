@@ -21,6 +21,10 @@ InteractionEventType: TypeAlias = Literal[
 STRICT_SCHEMA_VERSION = 2
 
 
+class StoryIdentityConflict(ValueError):
+    """An RSS ID is already owned by a different URL."""
+
+
 def coerce_int(value: Any, default: int = 0) -> int:
     """Lenient int() for external payloads (CH rows, Algolia items, seed
     JSONL): None/unparseable collapse to `default` instead of raising."""
@@ -529,7 +533,14 @@ class Database:
                 break
 
     # Stories
-    def upsert_story(self, story: Story) -> None:
+    def upsert_story(
+        self, story: Story, *, comments_authoritative: bool = False
+    ) -> None:
+        """Merge ingestion metadata, or replace a successfully fetched comment snapshot.
+
+        Authoritative comments and their fetched-count marker move together;
+        routine ingestion cannot replace a newer fetched snapshot with an older one.
+        """
         with self.conn() as conn:
             # Check if the story already exists and has longer cached content
             cursor = conn.execute(
@@ -546,11 +557,11 @@ class Database:
                 final_self = (
                     story.self_text if len(story.self_text) >= len(db_self) else db_self
                 )
-                final_comments = (
-                    story.top_comments
-                    if len(story.top_comments) >= len(db_comments)
-                    else db_comments
+                take_comments = comments_authoritative or (
+                    story.comment_count_at_fetch >= (row[4] or 0)
+                    and len(story.top_comments) >= len(db_comments)
                 )
+                final_comments = story.top_comments if take_comments else db_comments
                 final_body = (
                     story.article_body
                     if len(story.article_body) >= len(db_body)
@@ -568,7 +579,7 @@ class Database:
                     if (story.comment_count or 0) >= (row[3] or 0)
                     else row[3]
                 )
-                final_ccaf = max(story.comment_count_at_fetch or 0, row[4] or 0)
+                final_ccaf = story.comment_count_at_fetch if take_comments else row[4]
                 final_discussion_url = story.discussion_url or row[5]
 
                 # Recompose or merge metadata if any field changed
@@ -602,7 +613,7 @@ class Database:
                     )
 
             with conn:
-                conn.execute(
+                result = conn.execute(
                     """
                     INSERT INTO stories (
                         id, title, url, score, time, text_content, source,
@@ -628,6 +639,7 @@ class Database:
                         self_text=excluded.self_text,
                         top_comments=excluded.top_comments,
                         article_body=excluded.article_body
+                    WHERE stories.id > 0 OR stories.url IS excluded.url
                     """,
                     (
                         story.id,
@@ -646,6 +658,10 @@ class Database:
                         story.article_body,
                     ),
                 )
+                if result.rowcount == 0:
+                    raise StoryIdentityConflict(
+                        f"RSS story ID {story.id} belongs to another URL"
+                    )
 
     @staticmethod
     def _row_to_story(row: tuple[Any, ...]) -> Story:

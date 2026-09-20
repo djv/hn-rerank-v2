@@ -6857,22 +6857,29 @@ def test_model_cache_eviction() -> None:
     assert _get_cached_model(1, "sig4") is not None
 
 
-@settings(max_examples=50, deadline=None)
+@settings(deadline=None)
 @given(
     n_query=st.integers(min_value=0, max_value=40),
     n_ref=st.integers(min_value=0, max_value=40),
     dim=st.integers(min_value=1, max_value=8),
-    k=st.integers(min_value=1, max_value=40),
+    k=st.integers(min_value=0, max_value=40),
     chunk_size=st.integers(min_value=1, max_value=16),
     seed=st.integers(min_value=0, max_value=2**31 - 1),
 )
-def test_knn_mean_and_max_matches_separate_helpers(
+def test_knn_mean_and_max_matches_brute_force_oracle(
     n_query: int, n_ref: int, dim: int, k: int, chunk_size: int, seed: int
 ) -> None:
-    """The fused helper must be bit-for-bit equivalent to the pair it replaces."""
+    """All three helpers match scalar dot products and a full sorted reduction."""
     rng = np.random.default_rng(seed)
-    query = rng.standard_normal((n_query, dim)).astype(np.float32)
-    ref = rng.standard_normal((n_ref, dim)).astype(np.float32)
+    # A small integer alphabet deliberately produces duplicate references,
+    # exact ties, negative matches and zero vectors as well as ordinary rows.
+    query = rng.integers(-2, 3, (n_query, dim)).astype(np.float32)
+    ref = rng.integers(-2, 3, (n_ref, dim)).astype(np.float32)
+    # Dyadic coordinates make dot products exact in float32 and float64.
+    # This lets the independent scalar oracle assert exact tie winners
+    # without mistaking BLAS rounding near a tie for an attribution bug.
+    query /= 8
+    ref /= 8
 
     fused_mean, fused_max, fused_argmax = ranking._knn_mean_and_max(
         query, ref, k, chunk_size=chunk_size
@@ -6880,14 +6887,25 @@ def test_knn_mean_and_max_matches_separate_helpers(
     sep_mean = ranking._knn_similarity(query, ref, k, chunk_size=chunk_size)
     sep_max = ranking._chunked_max_dot(query, ref, chunk_size=chunk_size)
 
-    np.testing.assert_allclose(fused_mean, sep_mean, rtol=0, atol=1e-6)
-    np.testing.assert_allclose(fused_max, sep_max, rtol=0, atol=1e-6)
-    if n_ref > 0:
-        np.testing.assert_array_equal(
-            fused_argmax, np.argmax(query @ ref.T, axis=1).astype(np.int64)
-        )
-    else:
-        np.testing.assert_array_equal(fused_argmax, np.full(n_query, -1))
+    expected_mean: list[float] = []
+    expected_max: list[float] = []
+    expected_argmax: list[int] = []
+    for row in query:
+        similarities = [
+            sum(float(a) * float(b) for a, b in zip(row, candidate))
+            for candidate in ref
+        ]
+        top = sorted(similarities, reverse=True)[:k]
+        expected_mean.append(sum(top) / len(top) if top else 0.0)
+        maximum = max(similarities) if similarities else 0.0
+        expected_max.append(maximum)
+        expected_argmax.append(similarities.index(maximum) if similarities else -1)
+
+    for means in (fused_mean, sep_mean):
+        np.testing.assert_allclose(means, expected_mean, rtol=0, atol=1e-6)
+    for maxima in (fused_max, sep_max):
+        np.testing.assert_allclose(maxima, expected_max, rtol=0, atol=1e-6)
+    np.testing.assert_array_equal(fused_argmax, expected_argmax)
 
 
 def test_rank_trace_records_and_formats_fields() -> None:

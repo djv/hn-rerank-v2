@@ -11,7 +11,7 @@ import httpx
 import numpy as np
 from numpy.typing import NDArray
 
-from database import Database, Story, coerce_int
+from database import Database, Story, StoryIdentityConflict, coerce_int
 
 # ruff: noqa: F401 — re-exports for the public pipeline namespace.
 from .config import (
@@ -1041,8 +1041,17 @@ def refresh_reddit_candidates(
                 feed_url, "fetch returned no snapshot", now_ts
             )
             continue
+        accepted_ids: list[int] = []
         for story in cached:
             existing = db.get_story(story.id)
+            try:
+                db.upsert_story(story)
+            except StoryIdentityConflict:
+                logging.warning(
+                    "rss_identity_conflict story_id=%s url=%s", story.id, story.url
+                )
+                continue
+            accepted_ids.append(story.id)
             if existing is None or (
                 existing.title,
                 existing.url,
@@ -1050,8 +1059,7 @@ def refresh_reddit_candidates(
                 existing.self_text,
             ) != (story.title, story.url, story.time, story.self_text):
                 changed_ids.add(story.id)
-            db.upsert_story(story)
-        db.record_reddit_feed_success(feed_url, [story.id for story in cached], now_ts)
+        db.record_reddit_feed_success(feed_url, accepted_ids, now_ts)
 
     prewarm_ids: list[int] = []
     if config.prewarm_reddit_full:
@@ -1064,7 +1072,11 @@ def refresh_reddit_candidates(
                 if len(prewarm_ids) >= config.reddit_prewarm_max_per_cycle:
                     break
                 existing = db.get_story(story.id)
-                if existing is None or not existing.top_comments:
+                if (
+                    existing is not None
+                    and existing.url == story.url
+                    and not existing.top_comments
+                ):
                     prewarm_ids.append(story.id)
 
     prewarm_factories, updated_ids = build_reddit_prewarm_factories(prewarm_ids, db)
