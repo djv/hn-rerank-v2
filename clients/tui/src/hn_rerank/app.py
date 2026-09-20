@@ -240,6 +240,8 @@ class Reader(App[None]):
     MarkdownParagraph, MarkdownBulletList, MarkdownOrderedList { margin: 0; }
     MarkdownBlockQuote { border-left: solid #AAA399; background: #222222; margin: 0 0 1 0; }
     MarkdownFence { background: #222222; margin: 0 0 1 0; padding: 1; }
+    #summary MarkdownBlock > .strong { color: #FF914D; text-style: bold; }
+    #summary MarkdownBlock > .em { color: #FF914D; }
     #footer { dock: bottom; height: auto; max-height: 4; background: #1D1C1A;
               border-top: solid #2A2825; }
     #status { width: 1fr; height: auto; max-height: 3; padding: 0 1; color: #AAA399; }

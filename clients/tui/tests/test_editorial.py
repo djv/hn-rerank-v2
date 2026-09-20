@@ -7,6 +7,7 @@ from typing import cast
 
 import httpx
 import pytest
+from rich.color import Color
 from rich.text import Text
 from textual.widgets import Button, Input, Markdown, OptionList, Select, Static, Tabs
 
@@ -241,6 +242,19 @@ async def test_reading_measure_cap() -> None:
         await pilot.pause(0.6)
         assert app.query_one("#reading-pane").region.width <= 100
         assert app.query_one("#story-heading").styles.border_bottom[0] == "solid"
+
+
+async def test_summary_emphasis_uses_accent_color() -> None:
+    fake = EditorialServer()
+    app = Reader(api=fake.api())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await pilot.pause(0.6)
+        block = app.query("#summary MarkdownBlock").first()
+        strong = block.get_component_rich_style("strong")
+        em = block.get_component_rich_style("em")
+        assert strong.color == Color.parse("#FF914D")
+        assert strong.bold
+        assert em.color == Color.parse("#FF914D")
 
 
 async def test_summary_headings_align_left_like_body() -> None:

@@ -23,10 +23,13 @@ If the package name cannot be registered, publish as `hn-rerank-tui` and run
 ## Reader appearance
 
 The charcoal and ivory reader uses orange for the brand, active filters and
-focus, with restrained blue/sage/amber accents in metadata and vote counts. A `>`
-marker identifies the selected headline without relying on color. At 100 columns
-and above, filter tabs sit over a one-third headline/two-thirds summary layout.
-Smaller terminals use dropdowns; Enter opens reading and Escape returns to headlines.
+focus, with restrained blue/sage/amber accents in metadata and vote counts.
+Bold key terms in a summary take the same orange, and single-marker emphasis
+(italic) does too, so emphasis reads without extra chrome. A `>` marker
+identifies the selected headline without relying on color. At 100 columns and
+above, filter tabs sit over a one-third headline/two-thirds summary layout.
+Smaller terminals use dropdowns; Enter opens reading (again to leave) and
+Escape returns to headlines.
 Resize and focus changes preserve reading position. Run the offline preview from
 the repository root with `uv run python -m clients.tui.tests.preview --headless`.
 
