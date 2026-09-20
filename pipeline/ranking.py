@@ -11,7 +11,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, TYPE_CHECKING, TypeAlias, TypedDict
 
@@ -1120,13 +1120,11 @@ def _score_and_rank(
         and len(unique_classes) >= 2
     ):
         try:
-            # Model cache lookup is intentionally before training-feature
-            # construction. Cache hits still need candidate-side features,
-            # but they do not need LOOCV training matrices.
+            # Lookup precedes training-feature construction, but follows
+            # embedding refresh: enrichment can change training inputs
+            # without changing any vote or its timestamp.
             fb_sig = _feedback_signature(db, user_id) if user_id is not None else ""
             cached_model: _CachedModel | None = None
-            if fb_sig:
-                cached_model = _get_cached_model(user_id, fb_sig)
 
             if trace is not None:
                 with trace.stage("feedback_embedding"):
@@ -1139,6 +1137,25 @@ def _score_and_rank(
                 )
             if score_context is not None:
                 score_context.feedback_embeddings = fb_embeddings
+
+            if fb_sig:
+                signature = hashlib.sha256(fb_sig.encode())
+                signature.update(fb_embeddings.tobytes())
+                signature.update(
+                    json.dumps(
+                        [
+                            embedder.model_version,
+                            asdict(config.model),
+                            [
+                                (s.id, label, len(s.text_content), s.source)
+                                for s, label in zip(feedback_stories, feedback_labels)
+                            ],
+                        ],
+                        sort_keys=True,
+                    ).encode()
+                )
+                fb_sig = signature.hexdigest()
+                cached_model = _get_cached_model(user_id, fb_sig)
 
             # Personalization: mean/closest per class from ALL real feedback
             fb_labels_arr = np.array(feedback_labels)
