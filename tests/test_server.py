@@ -310,8 +310,8 @@ def test_section_budget_scales_with_source_volume() -> None:
     assert server._section_budget(1_499) == "2-3 bullets, max 45 words"
     assert server._section_budget(1_500) == "2-4 bullets, max 70 words"
     assert server._section_budget(4_999) == "2-4 bullets, max 70 words"
-    assert server._section_budget(5_000) == "3-5 bullets, max 100 words"
-    assert server._section_budget(12_000) == "3-5 bullets, max 100 words"
+    assert server._section_budget(5_000) == "3-4 bullets, max 90 words"
+    assert server._section_budget(12_000) == "3-4 bullets, max 90 words"
 
 
 @pytest.mark.parametrize(
@@ -337,7 +337,7 @@ def test_prompts_render_budget_placeholder(template: str, fields: dict) -> None:
         budget=server._section_budget(5_000),
         **fields,
     )
-    assert "3-5 bullets, max 100 words" in prompt
+    assert "3-4 bullets, max 90 words" in prompt
     assert "at most one `####` heading" in prompt
 
 
@@ -3655,6 +3655,23 @@ async def test_prefetch_tldrs_for_ranked_logs_zero_outcome_with_candidates(
     assert "tldr_prefetch generated=0 candidates=1" in caplog.text
 
 
+def test_shape_tldr_caps_blocks_per_section() -> None:
+    """One section keeps at most four bullets and one subheading; the reader
+    pane fits one screen only when the block count is bounded."""
+    import server
+
+    raw = (
+        "### Article\n#### First\n#### Second\n"
+        "- a\n- b\n- c\n- d\n- e\n\n"
+        "### Discussion\n- 1\n- 2\n- 3\n- 4\n- 5\n"
+    )
+    shaped = server._shape_tldr(raw)
+    assert shaped.count("- ") == 8
+    assert shaped.count("####") == 1
+    assert "- e" not in shaped
+    assert "#### Second" not in shaped
+
+
 def test_normalize_tldr_markdown_repairs_inline_bullets():
     import server
 
@@ -5130,8 +5147,8 @@ async def test_generate_detailed_tldr_scales_combined_path_budgets(monkeypatch):
 
     assert len(calls) == 2
     article_prompt, discussion_prompt = calls
-    assert "3-5 bullets, max 100 words" in article_prompt
-    assert "3-5 bullets, max 100 words" in discussion_prompt
+    assert "3-4 bullets, max 90 words" in article_prompt
+    assert "3-4 bullets, max 90 words" in discussion_prompt
 
 
 @pytest.mark.asyncio

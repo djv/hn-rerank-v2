@@ -56,7 +56,7 @@ ARTICLE_SECTION_MIN_CHARS = 500
 REDDIT_COMMENTS_CACHE_CHAR_LIMIT = 10_000
 REDDIT_COMMENT_LIMIT = 40
 REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dashboard"
-TLDR_PROMPT_VERSION = "detail-v8"
+TLDR_PROMPT_VERSION = "detail-v9"
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
 _PROMPT_CACHE: dict[str, str] = {}
 # Seam for tests: swap in a controllable timer to make debounce/regen tests
@@ -146,6 +146,36 @@ def _normalize_tldr_markdown(text: str) -> str:
     normalized = "\n".join(lines)
     normalized = re.sub(r"([.!;?:])\s+-\s+(?=\S)", r"\1\n- ", normalized)
     return normalized.strip()
+
+
+def _cap_tldr_structure(
+    text: str, *, max_bullets: int = 4, max_subheadings: int = 1
+) -> str:
+    """Bound the block count of one TLDR section for a one-screen reading pane.
+
+    Prompt budgets ask for this shape, but models still overshoot, and the
+    terminal pane only fits one screen when bullets and subheadings are few.
+    """
+    out: list[str] = []
+    bullets = subheadings = 0
+    for line in text.split("\n"):
+        if line.startswith("### "):
+            bullets = subheadings = 0
+        elif line.startswith("####"):
+            subheadings += 1
+            if subheadings > max_subheadings:
+                continue
+        elif line.startswith("- "):
+            bullets += 1
+            if bullets > max_bullets:
+                continue
+        out.append(line)
+    return "\n".join(out).strip()
+
+
+def _shape_tldr(text: str) -> str:
+    """Normalize model Markdown, then cap its structure for the reader."""
+    return _cap_tldr_structure(_normalize_tldr_markdown(text))
 
 
 def _looks_like_plain_heading(line: str) -> bool:
@@ -1031,7 +1061,7 @@ def _section_budget(source_chars: int) -> str:
         return "2-3 bullets, max 45 words"
     if source_chars < 5_000:
         return "2-4 bullets, max 70 words"
-    return "3-5 bullets, max 100 words"
+    return "3-4 bullets, max 90 words"
 
 
 async def generate_detailed_tldr(
@@ -1099,7 +1129,7 @@ async def generate_detailed_tldr(
             ("Article", article_result),
             ("Discussion", discussion_result),
         ):
-            if result.ok and (text := _normalize_tldr_markdown(result.content)):
+            if result.ok and (text := _shape_tldr(result.content)):
                 good.append((label, text))
         if len(good) == 2:
             return TldrResult(
@@ -1142,7 +1172,7 @@ async def generate_detailed_tldr(
         on_usage=on_usage,
     )
     if result.ok:
-        if text := _normalize_tldr_markdown(result.content):
+        if text := _shape_tldr(result.content):
             return TldrResult(kind="ok", tldr=text)
         return TldrResult(kind="llm_error", error_text="empty LLM response")
     return _llm_error_from(result)
