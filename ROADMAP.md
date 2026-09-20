@@ -320,6 +320,31 @@ Test event idempotency and session/card association.
 
 ---
 
+## 6. Terminal reader (TUI) polish — accepted 2026-09-17
+
+Accepted work on the shipped `clients/tui` reader, outside the ledger above.
+Each item is a visual change only; behavior and the wire contract stay fixed.
+
+- [x] Quick wins — dimmed unselected headlines, lifted selection band, themed
+  scrollbars (the reading-pane thumb used to paint black on near-black), one
+  docked footer with hairline, per-filter counts and `✗` errors, age guard for
+  timestamp-less stories. Verified 2026-09-17: 27 client tests pass / 1 Windows
+  skip, Ruff and ty clean, offline SVG render inspected.
+- [x] States — empty-filter block and failure copy in the reading pane, instead
+  of the message sitting top-left while the only error signal is the footer line.
+  `last_error` survives late rebuilds; recovery clears it. Verified 2026-09-17:
+  failure/recovery test, 32 client tests pass / 1 Windows skip, offline SVG
+  render inspected.
+- [x] Setup modal — scrim plus bordered panel (the form used to float on blank
+  black with no modal chrome). Full-width aligned buttons, background-lift
+  focus. Verified 2026-09-17: scrim/border/button-width test, SVG inspected.
+- [x] Reading pane — hairline under the headline block and a 100-column cap so
+  prose does not run the full width on wide terminals. The focus-accent border
+  is gated on `has-story` so empty states keep the muted divider. Verified
+  2026-09-17: wide-terminal measure test, SVG inspected.
+- [x] Vote-confirmation toast (`notify()`, 2s) — voted rows used to disappear
+  with no feedback. Verified 2026-09-17: notification test.
+
 ## Suggested order
 
 1. ~~O2 (metrics table)~~ — done, baseline available via `perf_report.py`.

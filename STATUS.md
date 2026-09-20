@@ -15,5 +15,8 @@
   renders of the populated, empty, error and setup states inspected 2026-09-17.
 - Unresolved: native terminal visual verification and credential-dependent PyPI
   publication remain. Latest `tui.yml` run for the current branch passed.
-- Next action: obtain PyPI publishing credentials, then publish and verify `uvx hn-rerank`.
-  See [FINDINGS.md](FINDINGS.md).
+|- Next action: open a PR for `feat/tui-color-polish` (pushed to GitHub 2026-09-17;
+  local `main` diverged from `origin/main`, merge has conflicts — resolving is
+  deferred), then obtain PyPI publishing credentials, publish and verify
+  `uvx hn-rerank`. Branch also fetched on the VPS (service untouched, no server
+  code changed). See [FINDINGS.md](FINDINGS.md).

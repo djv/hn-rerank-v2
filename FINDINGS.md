@@ -2,9 +2,16 @@
 
 ## Editorial terminal client — 2026-09-17 handoff refresh
 
-- Current state: warm editorial polish is implemented on `feat/terminal-client`; no additional code changes were needed for this handoff.
-- Agent-tested: client suite 25 passed / 1 Windows-only skip; Ruff and ty clean; headless visual preview exited successfully.
-- Remaining: native terminal visual confirmation and credential-dependent PyPI publication.
+- Current state: full visual polish is implemented on `feat/terminal-client` in
+  the working tree, uncommitted, on top of the reading-focus cue: selection
+  contrast, themed scrollbars, docked footer with per-filter counts and `✗`
+  errors, age guard, headed empty/error notices (`show_failure()`/`last_error`
+  with recovery), setup card, 100-col reading cap with headline hairline, and
+  vote toast. ROADMAP §6 polish is fully done.
+- Agent-tested: client suite 32 passed / 1 Windows-only skip; Ruff and ty clean;
+  offline SVG renders inspected for populated/empty/error/setup states.
+- Remaining: native terminal visual confirmation and credential-dependent PyPI
+  publication.
 
 ## Editorial terminal client — 2026-09-13
 
