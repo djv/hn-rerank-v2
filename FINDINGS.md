@@ -1,5 +1,24 @@
 # HN Rerank findings
 
+## Terminal reader / origin/main merge — 2026-09-20
+
+- Merged the 98-commit backend line into the terminal-reader branch (`354acd6`).
+  Resolutions: backend files and tests take `origin/main`; `clients/tui/**`
+  keeps the branch side (the newer feed models the server imports); WORKLOG
+  keeps origin/main's full history plus the TUI entries and drops a stray
+  committed `>>>>>>> theirs` marker; ROADMAP restores §6; ARCHITECTURE adds the
+  client package section; AGENTS.md stays origin/main's long form.
+- `uv.lock` then regenerated to include the `clients/tui` workspace member
+  (`6a0dc99`); the origin/main lock predated the member.
+- Verified: backend 769 passed with `HN_ONNX_MODEL_DIR`; client 38 passed /
+  1 Windows-only skip; Ruff and ty clean.
+- Open follow-ups (config path pinning, stale env-var docs, superseded WORKLOG
+  vacuum and AGENTS slimming, stale remote branch, VPS pull + restart) are
+  listed in [STATUS.md](STATUS.md).
+- Rollback: `backup/tui-pre-merge` marks the pre-merge tip; the merge commit's
+  first parent is the terminal-reader line and the second is `origin/main`
+  `97e1e25`.
+
 ## Editorial terminal client — 2026-09-20 review
 
 - Live review against the VPS deployment (throwaway profile) found and fixed
