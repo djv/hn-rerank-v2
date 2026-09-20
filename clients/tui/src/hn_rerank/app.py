@@ -38,7 +38,6 @@ from .api import (
 )
 from .models import Feed, FeedStory
 
-
 # Hacker News launched in 2006; earlier timestamps are missing or placeholder data.
 EARLIEST_STORY_TIME = 1_136_073_600
 
@@ -462,6 +461,10 @@ class Reader(App[None]):
         )
 
     def rebuild(self, select_id: int | None = None) -> None:
+        # Teardown removes nodes before the final messages drain; ignore late
+        # rebuilds rather than raising NoMatches.
+        if not self.query("#headlines"):
+            return
         old = self.selected()
         if select_id is None and old:
             select_id = old.id
@@ -504,16 +507,20 @@ class Reader(App[None]):
         self.context_status()
 
     def on_select_changed(self, event: Select.Changed) -> None:
-        if event.select.id in {"sort", "age"}:
-            self.query_one(
-                f"#{event.select.id}-tabs", Tabs
-            ).active = f"{event.select.id}-{event.value}"
+        tabs_id = f"#{event.select.id}-tabs"
+        if event.select.id in {"sort", "age"} and self.query(tabs_id):
+            self.query_one(tabs_id, Tabs).active = f"{event.select.id}-{event.value}"
         self.rebuild()
 
     def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
-        if event.tab.id:
-            group, value = event.tab.id.split("-", 1)
-            self.query_one(f"#{group}", Select).value = value
+        if not event.tab.id:
+            return
+        group, value = event.tab.id.split("-", 1)
+        # Teardown and the first layout pass can activate a tab before the
+        # matching selector is queryable; ignore rather than raise NoMatches.
+        if not self.query(f"#{group}"):
+            return
+        self.query_one(f"#{group}", Select).value = value
 
     def on_option_list_option_highlighted(
         self, event: OptionList.OptionHighlighted
