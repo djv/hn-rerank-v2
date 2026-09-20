@@ -29,5 +29,6 @@ Comments:
 {comments_section}
 
 IMPORTANT:
+Use at most one `####` heading, and only when the section has three or more bullets.
 - Use ONLY information present in the comments below. Do not expand on the topic with outside knowledge.
 - Do NOT write an Article or Story section. Do NOT summarize the title as if it were article content.

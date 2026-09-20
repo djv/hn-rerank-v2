@@ -306,12 +306,12 @@ def test_section_budget_scales_with_source_volume() -> None:
     than staying fixed at 2-3 bullets regardless of thread/article size."""
     import server
 
-    assert server._section_budget(0) == "2-3 bullets, max 75 words"
-    assert server._section_budget(1_499) == "2-3 bullets, max 75 words"
-    assert server._section_budget(1_500) == "3-4 bullets, max 125 words"
-    assert server._section_budget(4_999) == "3-4 bullets, max 125 words"
-    assert server._section_budget(5_000) == "4-6 bullets, max 200 words"
-    assert server._section_budget(12_000) == "4-6 bullets, max 200 words"
+    assert server._section_budget(0) == "2-3 bullets, max 45 words"
+    assert server._section_budget(1_499) == "2-3 bullets, max 45 words"
+    assert server._section_budget(1_500) == "2-4 bullets, max 70 words"
+    assert server._section_budget(4_999) == "2-4 bullets, max 70 words"
+    assert server._section_budget(5_000) == "3-5 bullets, max 100 words"
+    assert server._section_budget(12_000) == "3-5 bullets, max 100 words"
 
 
 @pytest.mark.parametrize(
@@ -337,7 +337,8 @@ def test_prompts_render_budget_placeholder(template: str, fields: dict) -> None:
         budget=server._section_budget(5_000),
         **fields,
     )
-    assert "4-6 bullets, max 200 words" in prompt
+    assert "3-5 bullets, max 100 words" in prompt
+    assert "at most one `####` heading" in prompt
 
 
 @pytest.mark.parametrize("template", ["discussion_only_v4.txt", "discussion_v4.txt"])
@@ -5129,8 +5130,8 @@ async def test_generate_detailed_tldr_scales_combined_path_budgets(monkeypatch):
 
     assert len(calls) == 2
     article_prompt, discussion_prompt = calls
-    assert "4-6 bullets, max 200 words" in article_prompt
-    assert "4-6 bullets, max 200 words" in discussion_prompt
+    assert "3-5 bullets, max 100 words" in article_prompt
+    assert "3-5 bullets, max 100 words" in discussion_prompt
 
 
 @pytest.mark.asyncio

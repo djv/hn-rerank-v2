@@ -56,7 +56,7 @@ ARTICLE_SECTION_MIN_CHARS = 500
 REDDIT_COMMENTS_CACHE_CHAR_LIMIT = 10_000
 REDDIT_COMMENT_LIMIT = 40
 REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dashboard"
-TLDR_PROMPT_VERSION = "detail-v7"
+TLDR_PROMPT_VERSION = "detail-v8"
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
 _PROMPT_CACHE: dict[str, str] = {}
 # Seam for tests: swap in a controllable timer to make debounce/regen tests
@@ -1028,10 +1028,10 @@ def _tldr_cache_key(
 def _section_budget(source_chars: int) -> str:
     """Bullet/word budget scaled by capped source length (thin input → terse)."""
     if source_chars < 1_500:
-        return "2-3 bullets, max 75 words"
+        return "2-3 bullets, max 45 words"
     if source_chars < 5_000:
-        return "3-4 bullets, max 125 words"
-    return "4-6 bullets, max 200 words"
+        return "2-4 bullets, max 70 words"
+    return "3-5 bullets, max 100 words"
 
 
 async def generate_detailed_tldr(
