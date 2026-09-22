@@ -1,5 +1,7 @@
 Summarize the article for a knowledgeable reader.
 Use ONLY information from the article below.
+Cover each major section or topic of the piece, including material near the
+end — never summarize only the opening.
 
 Output ONE section only:
 

@@ -1,5 +1,29 @@
 # HN Rerank findings
 
+## Import AI 473 TLDR drops the tail of a long newsletter — 2026-09-22
+
+- Story `Import AI 473` (jack-clark.net, VPS `stories.id = -1607225291`) headlined
+  three topics: US superintelligence strategy, brain chimeras, machine
+  hermeneutics. The cached TLDR (824 chars, 4 bullets) covers the RAND strategy
+  plus one chimera bullet; machine hermeneutics is absent entirely.
+- Not a fetch bug for this story: stored `article_body` is 24,067 chars (under
+  the 30k `ARTICLE_BODY_CHAR_LIMIT`) and contains all three topics (RAND @ch15,
+  chimera @ch8150, hermeneutics @ch21382). The full body goes into the prompt.
+- Structural cause is prompt/budget: `_section_budget()` caps output at
+  "3-4 bullets, max 90 words" for ANY input over 5k chars, and
+  `prompts/article_v4.txt` says "Summarize the article" with no
+  cover-each-section instruction — so the model writes a lead-biased summary
+  and the section starting 88% into the text is dropped.
+- Caveats: jack-clark.net now serves a JS browser-check to curl, so the source
+  page could not be re-verified; the stored text ends with a personal-dream
+  coda that reads like a natural ending. The TLDR's freeform "### Summary"
+  heading was model-chosen (freeform headings allowed since prompt v7).
+- Fix needs a product call: `afafefc` deliberately targets one-screen summaries,
+  which conflicts with covering every section of a 24k-char newsletter. Any
+  prompt change bumps `TLDR_PROMPT_VERSION` and invalidates the whole
+  `tldr_cache` — plan around the 120/hr uncached limit and the Mistral $10 cap.
+- Read-only investigation: VPS SELECTs plus one curl; no code or data changed.
+
 ## Terminal reader — read mode gated on overflow — 2026-09-20
 
 - Article + Discussion fit one screen for most stories, so the read mode is

@@ -311,7 +311,13 @@ def test_section_budget_scales_with_source_volume() -> None:
     assert server._section_budget(1_500) == "2-4 bullets, max 70 words"
     assert server._section_budget(4_999) == "2-4 bullets, max 70 words"
     assert server._section_budget(5_000) == "3-4 bullets, max 90 words"
-    assert server._section_budget(12_000) == "3-4 bullets, max 90 words"
+    assert server._section_budget(11_999) == "3-4 bullets, max 90 words"
+    assert server._section_budget(12_000) == "4-6 bullets, max 140 words"
+    assert server._section_budget(19_999) == "4-6 bullets, max 140 words"
+    assert server._section_budget(20_000) == "5-8 bullets, max 200 words"
+    # Import AI 473 shape: a 24k-char three-topic newsletter must earn room
+    # for every major section, not a lead-only summary.
+    assert server._section_budget(24_067) == "5-8 bullets, max 200 words"
 
 
 @pytest.mark.parametrize(
@@ -339,6 +345,17 @@ def test_prompts_render_budget_placeholder(template: str, fields: dict) -> None:
     )
     assert "3-4 bullets, max 90 words" in prompt
     assert "at most one `####` heading" in prompt
+
+
+@pytest.mark.parametrize("template", ["article_v4.txt", "article_only_v4.txt"])
+def test_article_prompts_require_full_piece_coverage(template: str) -> None:
+    """Article prompts must instruct coverage of every major section — a
+    lead-only summary drops trailing sections of long newsletters (Import AI
+    473 lost its third topic starting 88% into the text)."""
+    import server
+
+    prompt = server._load_prompt(template)
+    assert "each major section" in prompt
 
 
 @pytest.mark.parametrize("template", ["discussion_only_v4.txt", "discussion_v4.txt"])

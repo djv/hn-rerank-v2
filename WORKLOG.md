@@ -1,5 +1,25 @@
 # Worklog: hn-rewrite
 
+## 2026-09-22 — TLDR: full-piece coverage budgets, provider to gospark
+
+- Import AI 473 investigation (see FINDINGS.md): a 24,067-char three-topic
+  newsletter was summarized in 4 bullets, dropping its third topic entirely.
+  The stored article body was complete — the "3-4 bullets, max 90 words" cap
+  for any input over 5k chars plus no cover-each-section instruction produced
+  the lead-only summary.
+- `_section_budget` gains two tiers (4-6 bullets/140 words for 12-20k chars,
+  5-8/200 for 20k+); lower tiers unchanged so normal stories stay one-screen.
+  Article prompts now instruct covering each major section including trailing
+  material. `TLDR_PROMPT_VERSION` detail-v10 → v11: cache keys rotate, old
+  entries keep serving, and regen happens lazily plus the prefetch trickle
+  within the 120/hr uncached limit.
+- `LLM_PROVIDER` mistral → gospark (muse-spark-1.3-contributor over the
+  Responses API; client code already in tree, +1200-token reasoning headroom
+  already handled). Spend log shows n/a estimates for non-Mistral providers.
+- Validation: backend 772 passed; Ruff, format, ty clean. Deployed with git
+  pull plus a service restart; dashboard 200 with cached/uncached TLDR smoke
+  taps and a clean post-restart journal scan.
+
 ## 2026-09-22 — TUI: prefetch nearby summaries
 
 - The terminal reader now warms summaries ahead of the selection. The selected

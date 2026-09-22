@@ -21,10 +21,12 @@
   server-side parity assertions in `tests/test_feed_api.py`. The reader also
   prefetches the next stories' summaries one at a time and caches them for the
   session (`--prefetch N`, default 2, 0 disables), pausing on rate limits and
-  never caching stale/partial responses.
-- Verification: backend 769 passed plus one load-sensitive
-  `test_reddit_fetch_queue` spread-timing flake that passes in isolation
-  (full-suite run with `-n 2` on a loaded host); client 62 passed /
+  never caching stale/partial responses. Server `detail-v11` scales TLDR
+  budgets for long multi-section pieces (up to 5-8 bullets/200 words at 20k+
+  chars) and instructs full-piece coverage after Import AI 473 lost its tail;
+  `LLM_PROVIDER` is gospark (muse-spark-1.3-contributor).
+- Verification: backend 772 passed
+  (full-suite run with `-n 2` on a loaded host, `HN_ONNX_MODEL_DIR` set); client 62 passed /
   1 Windows-only skip; Ruff, format, ty and `uv lock --check` clean. Offline SVG renders inspected;
   native terminal sessions at 145×38 and 80×30 exercised filters, reading,
   voting/undo, help, empty and failure states; the Textual pilot measured 8/8

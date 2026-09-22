@@ -1,5 +1,7 @@
 Summarize the article for a knowledgeable reader.
 Use ONLY information from the text below.
+Cover each major section or topic of the piece, including material near the
+end — never summarize only the opening.
 {budget}, summarizing the article.
 Use a FLAT structure — no nested list levels. If a sub-topic has multiple bullets, use a `####` heading for the sub-topic followed by top-level bullets — NEVER use `- **Label**:` to introduce a group of content bullets. Example:
 #### Criticism of US control
