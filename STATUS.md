@@ -1,53 +1,49 @@
 # HN Rerank status
 
-## Objective and scope
+## Objective
 
-Improve eval controls and training deduplication only. User also authorized
-committing/deploying the earlier TLDR coverage fix and TUI impression logging.
-Full-body embedding work remains deferred; no publication tuning or automatic
-ranking rollout. Previous status archived in
-`docs/status-archive/2026-09-22-before-ranking-deploy.md`.
+Scoped ranking investigation and authorized Import AI duplicate-vote cleanup
+are complete. Keep production ranking unchanged; no further work scheduled.
+Full-body embedding work remains deferred.
 
 ## Verified result
 
-- Code commit `f03c34e` pushed to origin/main and deployed to VPS
-  `/home/dev/hn-rewrite/main`; service restarted successfully. VPS code tree
-  clean. Prior identical TLDR patch preserved in named stash
-  `pre-f03c34e-deploy-identical-detail-v12` (not reapplied or dropped).
-- Dashboard HTTP 200. Import AI 473 served its cached seven-bullet v12 summary;
-  another uncached story generated successfully via Muse Spark in ~13 seconds.
-  Neither response was stale/retryable. Bounded journal scans found no errors.
-- TUI restarted in `work:1.1` using the same default profile (profile SHA-256
-  unchanged). An actual selected-story impression reached the VPS ledger:
-  `tui_observed`, Recommended/Recent, position 0. No votes changed by deployment.
-  Restart reset the view from Explore to Recommended.
-- `publication_affinity_enabled=false` and
-  `deduplicate_training_feedback=false` verified from deployed config.
-- Exact staged snapshot: 795 backend tests passed with two niced workers.
-  Client: 63 passed / 1 Windows-only skip. Ruff/format/ty clean. Initial
-  snapshot test attempt lacked Git provenance; after initializing an isolated
-  source-only Git snapshot, full backend suite passed.
+- Pushed/deployed: code `f03c34e`, documentation `b0c73cb`. TLDR detail-v12
+  preserves scaled article/discussion budgets; Muse Spark serves summaries.
+  Import AI 473 coverage verified, including machine hermeneutics.
+- TUI selected-story impression logging deployed and verified in the VPS
+  ledger. Default profile preserved. Dashboard/cached/uncached summary checks
+  passed; service active and bounded journal scans clean at last verification.
+- Commit snapshot checks: 795 backend tests passed; client 63 passed / one
+  Windows-only skip; Ruff/format/ty clean.
+- Confirmation evaluation: 995 judged items, three chronological folds.
+  Production/dedup NDCG@10 **0.7603/0.7138**, MAP **0.4992/0.4956**.
+  Development gain did not confirm. Both `publication_affinity_enabled` and
+  `deduplicate_training_feedback` remain false. The confirmation period is
+  consumed; do not tune against it or claim these replay metrics are live
+  recommendation quality.
+- User-authorized cleanup removed exactly three older duplicate Import AI
+  upvotes (458/459/460). Newer votes and all six article rows preserved;
+  13 Jack Clark upvotes remain. Service restarted and dashboard verified 200.
+  Full SQLite backup and exact affected-row manifest retained privately at
+  `/home/dev/hn-rewrite/shared/feedback-cleanup-backups/20260922T201813Z/`.
+  Earlier eval artifacts describe the pre-cleanup feedback snapshot.
 
-## Evaluation and remaining uncertainty
+## Workspace / evidence
 
-- Three development folds, five shuffled-label seeds, isolated single-thread
-  VPS evaluation completed. Expected shuffled NDCG@10 0.3402; observed means:
-  production 0.3352, publication 0.3545, training dedup 0.3211.
-- Dedup real NDCG@10 0.8502 versus production 0.8054; MAP slightly worse
-  (0.4664 vs 0.4682). Gain concentrated in one fold. Judged-only replay scores
-  are not live-feed quality; this is not sufficient evidence to enable it.
-- Detailed evidence and private artifact paths: FINDINGS.md. Latest 20%
-  confirmation period remains untested. No eval jobs left running.
+- Local uncommitted documentation records confirmation and cleanup:
+  `FINDINGS.md`, `WORKLOG.md`, `STATUS.md`, and this save's status archive.
+- Deferred uncommitted embedding WIP, not deployed:
+  `pipeline/embedding_sections.py`, `scripts/bakeoff_embedding_models.py`,
+  `tests/test_embedding_sections.py`. Preserve; do not accidentally stage.
+- Detailed evidence/report paths: `FINDINGS.md`. Previous status archived in
+  `docs/status-archive/2026-09-22-before-final-save.md`.
+- Remote pre-deploy TLDR patch remains safely preserved in named stash
+  `pre-f03c34e-deploy-identical-detail-v12`. No eval jobs left running.
 
-## Preserved uncommitted work (excluded from deployment)
+## Blocker / next step
 
-- `pipeline/embedding_sections.py`
-- `scripts/bakeoff_embedding_models.py`
-- `tests/test_embedding_sections.py`
-
-## Next step / blockers
-
-If ranking work resumes, predeclare a production-vs-dedup confirmation test;
-do not tune against it or enable ranking flags without reviewing results.
-No deployment blocker. Separate older project blocker: PyPI publishing
-credentials still needed. No further work scheduled in this session.
+No operational blocker. Stop here unless asked to continue. Any new ranking
+experiment needs a fresh evidence plan or future feedback, not repeated
+confirmation tuning. Documentation changes above are not yet committed.
+Separate existing project blocker: PyPI publication needs credentials.

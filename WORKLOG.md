@@ -1,5 +1,15 @@
 # Worklog: hn-rewrite
 
+## 2026-09-22 — User-authorized Import AI duplicate feedback cleanup
+
+- With explicit authorization, removed exactly three older redundant upvote
+  rows for issues 458/459/460, keeping newer votes and every story row.
+  Matching URL/action and unchanged timestamps checked under an immediate
+  transaction. Full private backup and row manifest retained; see FINDINGS.
+- Verified 13 remaining Jack Clark upvotes and all six affected story rows.
+  Restarted service to clear caches; active, dashboard 200, bounded log scan
+  clean. No ranking experiment enabled or unrelated feedback changed.
+
 ## 2026-09-22 — Wrapped, pushed and deployed f03c34e
 
 - Committed requested ranking/eval, TLDR v12 and TUI logging scope; pushed

@@ -1,5 +1,43 @@
 # HN Rerank findings
 
+## Authorized duplicate Import AI vote cleanup — 2026-09-22
+
+- User explicitly chose cleanup of duplicate feedback records. Scope limited
+  to the three previously identified Import AI 458/459/460 pairs for user 1.
+- Deleted only older feedback rows for story IDs -9281630763986,
+  -78711871060061, -129256259946967. Retained newer upvotes on
+  -623350225, -851489639, -1662778741. Verified exact matching URL/action,
+  newer timestamp, and no concurrent changes since backup before deletion.
+- Full SQLite/WAL-consistent backup (quick_check ok), plus exact affected-row
+  manifest, retained privately on VPS under
+  `/home/dev/hn-rewrite/shared/feedback-cleanup-backups/20260922T201813Z/`.
+  Files: `before.sqlite`, `affected-votes.json`. Restore individual rows if
+  required, not the whole database over later feedback.
+- Transaction verification: total feedback decreased by exactly 3; story
+  count unchanged; all six article rows and all retained votes intact.
+  Read-only post-check: jack-clark.net has 13 upvotes, no neutral/downvotes.
+- Service restarted to clear cached profile/model state; active, dashboard
+  200, bounded journal scan clean. Training-dedup experiment remains off.
+  Earlier evaluation artifacts describe the pre-cleanup feedback snapshot.
+
+## Reserved training-dedup confirmation — 2026-09-22
+
+- Ran only production vs deduplicated, no tuning, isolated nice-19 single
+  CPU-thread job. `--candidate-pool heldout-feedback --confirmation --folds 3
+  --variants deduplicated`. Verified frozen configuration and confirmation
+  boundary match the preceding development run. 332/332/331 held-out items,
+  all retained after normalized-URL group isolation, 83/98/120 positives.
+- Production/dedup means: NDCG@10 0.76029/0.71383; NDCG@40
+  0.56584/0.54434; MAP 0.49923/0.49562. Per-fold NDCG@10:
+  0.6620/0.5837, 0.8390/0.7779, 0.7799/0.7799. The development
+  top-10 gain did not replicate. Keep dedup disabled; no production changes.
+- This remains retrospective judged-only discrimination, not live retrieval
+  quality. Three folds are not a significance guarantee, but these results
+  do not justify rollout. The reserved period has now been used and must
+  not be described as untouched or repeatedly tuned against.
+- Report: `/home/d/.local/state/hn-rerank-eval/dedup-confirmation.json`;
+  VPS `/tmp/hn-publication-eval/confirmation.json`. No eval job left running.
+
 ## Commit and deployment verification — 2026-09-22
 
 - `f03c34e` pushed and deployed to VPS. Only pre-deploy remote change was
