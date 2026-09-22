@@ -37,11 +37,29 @@ Runtime restart/live smoke verification is outstanding. No production data was
 changed by freshness tests. Reddit retains its four-hour feed TTL and existing
 rate limits; archive rows are not fully refetched each cycle.
 
-## Handoff / next step
+## Deployment verified — ab858ed live on VPS
 
-User explicitly authorized: (1) separate source refresh from summary generation,
-(2) deploy isolated freshness/client changes, (3) investigate LessWrong ranking.
-Do NOT ask again for that deployment authorization. No ranking changes authorized.
+Commit `ab858ed` (freshness/client only; web JSON refill WIP deliberately left
+unstaged) was verified in worktree `../hn-rerank-verify` at the exact commit:
+backend **812 passed** (813 dirty-tree minus the one unstaged web test),
+TUI **75 passed / 1 skipped** (79 minus 4 unstaged web-validation tests),
+Ruff/format/ty clean in both trees. Worktree venvs were re-pinned to system
+Python 3.12 / SQLite 3.45.1 after a fresh sync pulled 3.14/3.50 and tripped
+two unrelated migration integrity tests — environment artifact, not a code
+regression. Worktree removed after verification.
+
+Pushed `8155162..ab858ed` to `origin/main`. VPS `/home/dev/hn-rewrite/main`
+was clean at `8155162` with the `pre-f03c34e-deploy-identical-detail-v12`
+stash preserved; fast-forwarded to `ab858ed`, service restarted, active.
+Live checks: dashboard 200, `/api/feed` 200 (68 stories, 25 badged),
+`/api/tldr-cache/<id>` 200 on hit / 401 unauthenticated, error journal clean,
+first regen completed with `prewarmed 9/9 LessWrong candidates`.
+
+Reported LW story healed operationally via deployed app code (no manual SQL):
+`comment_count` 4→28, `at_fetch` 23→28, `score` 0→138, matching live
+LessWrong GraphQL. A second restart published it; post-restart regen completed
+clean. Two transient `ConnectTimeout`s preceded the heal (LW tarpitting the VPS
+IP after the regen burst + probes); cleared after ~4 min. No ranking changes.
 
 Latest local additions (not committed/deployed):
 - `background_cadence.py`: thread-safe single-flight start-to-start gate.
@@ -64,7 +82,17 @@ Ranking investigation completed to model-sensitivity level:
 - Snapshot retained `/tmp/hn-freshness-attribution-snapshot.db` on VPS, chmod 600.
   It contains private data; do not copy into repo or publish.
 
-Deployment is the remaining task. Preserve all unrelated WIP. Suggested steps:
+Known freshness gap (not fixed by this deploy): regen prewarm only rechecks
+stories still surfacing in current RSS feeds. Deck-visible stories aged out of
+feeds (like the healed 13-day-old LW post) never get rechecked automatically;
+healing those needs either on-demand refresh or extending prewarm selection to
+snapshot/deck-visible stories — future work, needs a design pass.
+
+Remaining WIP (still local, undeployed): web JSON refill migration in
+`templates/index.html`, `pipeline/render.py`,
+`clients/tui/src/hn_rerank/models.py`, `tests/test_feed_api.py`,
+`clients/tui/tests/test_boundaries.py`, plus one test hunk in
+`tests/test_server.py`. Suggested steps for that separate track:
 1. Inspect fresh status/diff. Stage only freshness/TUI files, not the web JSON
    refill migration. The latter lives in `templates/index.html`,
    `pipeline/render.py`, `clients/tui/src/hn_rerank/models.py`,

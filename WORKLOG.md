@@ -1,5 +1,16 @@
 # Worklog: hn-rewrite
 
+## Deployed ab858ed, healed reported LW story
+
+- Verified commit in an isolated worktree (backend 812, TUI 75+1 skip,
+  lint/types clean), pushed `8155162..ab858ed`, fast-forwarded VPS from a
+  clean `8155162` (stash preserved), restarted service. Dashboard/feed/cache
+  endpoint live checks pass; error journal clean; regen prewarmed 9/9 LW.
+- Reported story (`hXozGp2rsbZgXnH3o`) healed via deployed prewarm path:
+  4→28 comments, at_fetch 23→28, score 0→138. Restart published it.
+- Known gap: prewarm covers only fresh feed candidates, not deck-visible
+  stories aged out of feeds. Future work, no ranking change authorized.
+
 ## Handoff: independent summary cadence and ranking attribution
 
 - User authorized isolated freshness/client deployment; not yet performed.
