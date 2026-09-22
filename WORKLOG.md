@@ -1,5 +1,20 @@
 # Worklog: hn-rewrite
 
+## 2026-09-22 — Wrapped, pushed and deployed f03c34e
+
+- Committed requested ranking/eval, TLDR v12 and TUI logging scope; pushed
+  origin/main. Preserved embedding WIP outside the commit. Exact staged
+  snapshot passed 795 backend tests; client 63 passed/1 skipped; lint/types
+  clean. Initial export lacked Git metadata required by eval tests; rerun
+  with isolated source-only Git snapshot passed, no code workaround needed.
+- Preserved identical remote server.py WIP in a named stash before fast-forward
+  deployment. Service active; dashboard/cached/uncached summary smoke passed,
+  Muse Spark confirmed, bounded error scans clean. Ranking flags stay off.
+- Restarted default-profile TUI without changing profile file or votes;
+  verified its first impression persisted in the server ledger. View reset
+  to Recommended/Recent. Archived old STATUS and saved concise current state,
+  evidence, deferred files and next step. No further work scheduled.
+
 ## 2026-09-22 — Commit scope and TUI selected-story logging
 
 - User authorized committing ranking/eval work, deployed TLDR fix and TUI

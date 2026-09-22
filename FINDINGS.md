@@ -1,5 +1,25 @@
 # HN Rerank findings
 
+## Commit and deployment verification — 2026-09-22
+
+- `f03c34e` pushed and deployed to VPS. Only pre-deploy remote change was
+  server.py, byte-identical to the committed v12 fix (SHA-256
+  `91fa1931ee4963ded153317f25ff8111e425d6564513d10b6c12a57449c0e510`).
+  Preserved via named stash `pre-f03c34e-deploy-identical-detail-v12`; clean
+  fast-forward then service restart. No stash dropped, no feedback modified.
+- Dashboard HTTP 200; Import AI 473 returned cached v12 output (1030 chars);
+  uncached story -2028198065 generated 505 chars via Muse Spark in ~13s.
+  Both ok, neither stale/retryable. Bounded journal scans free of
+  ERROR/Traceback/Exception. Deployed experiment flags both false.
+- Restarted existing TUI pane work:1.1, default profile hash unchanged. SQL
+  read-only verification found new ledger event: impression, story 49803863,
+  position 0, recommended/recent, ranker_arm tui_observed. This verifies the
+  real client-to-server insertion path, not just a mocked endpoint.
+- Exact staged tree passed 795 backend tests; full client suite 63 passed,
+  one Windows-only skip. Deferred embedding code and tests were excluded
+  from staging/deployment and preserved locally. No live ranking experiment
+  enabled. Documentation-only wrap-up follows the code commit.
+
 ## Five-seed controls and training deduplication — 2026-09-22
 
 - User narrowed scope to eval controls + training deduplication only. No
