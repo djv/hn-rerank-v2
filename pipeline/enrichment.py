@@ -392,7 +392,7 @@ def _merge_source_context(
         top_comments=top_comments,
         text_content=new_text,
         discussion_url=story.discussion_url or story.url,
-        comment_count=story.comment_count or ctx.comment_count or None,
+        comment_count=max(story.comment_count or 0, ctx.comment_count) or None,
         comment_count_at_fetch=max(story.comment_count_at_fetch, ctx.comment_count),
         score=max(story.score, getattr(ctx, "score", story.score)),
     )
@@ -522,11 +522,16 @@ async def prewarm_lesswrong_stories(
         self_text_fresh = not story.self_text or len(ctx.self_text) > len(
             story.self_text
         )
-        if not (top_comments_fresh or self_text_fresh):
+        metadata_fresh = (
+            ctx.comment_count > (story.comment_count or 0)
+            or ctx.comment_count > story.comment_count_at_fetch
+            or ctx.score > story.score
+        )
+        if not (top_comments_fresh or self_text_fresh or metadata_fresh):
             continue
 
         updated = _merge_source_context(
-            story, ctx, story.article_body, prefer_longer_comments=False
+            story, ctx, story.article_body, prefer_longer_comments=True
         )
         if not updated.text_content:
             continue

@@ -6523,7 +6523,9 @@ def test_fetch_candidates_only_falls_back_to_top_n_when_disabled(monkeypatch) ->
         db.close()
 
 
-def test_fetch_candidates_only_prewarms_all_lesswrong_when_full(monkeypatch) -> None:
+def test_fetch_candidates_only_prewarms_all_lesswrong_when_full(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Regen prewarms all LessWrong candidates when prewarm_lesswrong_full=True."""
     db = Database(":memory:")
     try:
@@ -6586,8 +6588,8 @@ def test_fetch_candidates_only_prewarms_all_lesswrong_when_full(monkeypatch) -> 
             pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
         )
         assert len(captured_ids) == 1
-        # Stories without top_comments: 10, 11
-        assert sorted(captured_ids[0]) == [10, 11]
+        # Hydrated stories also need fresh engagement metadata.
+        assert sorted(captured_ids[0]) == [10, 11, 12]
 
     finally:
         db.close()
@@ -6650,8 +6652,10 @@ def test_prewarm_lesswrong_stories_refetches_when_only_one_field_is_stale(
         db.close()
 
 
+@pytest.mark.parametrize("fresh_count", [1, 23])
 def test_prewarm_lesswrong_stories_skips_when_both_fields_already_richer(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_count: int,
 ) -> None:
     """If both top_comments and self_text are already populated and the
     new data is no richer, skip (no upsert)."""
@@ -6665,6 +6669,8 @@ def test_prewarm_lesswrong_stories_skips_when_both_fields_already_richer(
             Story(
                 id=43,
                 title="already-prewarmed",
+                comment_count=4,
+                comment_count_at_fetch=4,
                 url="https://www.lesswrong.com/posts/def456/already",
                 score=100,
                 time=100,
@@ -6679,7 +6685,7 @@ def test_prewarm_lesswrong_stories_skips_when_both_fields_already_richer(
             return LessWrongContext(
                 self_text="x" * 100,
                 top_comments="y" * 100,
-                comment_count=1,
+                comment_count=fresh_count,
                 score=10,
             )
 
@@ -6688,12 +6694,15 @@ def test_prewarm_lesswrong_stories_skips_when_both_fields_already_richer(
         updated = asyncio.run(
             pipeline.prewarm_lesswrong_stories([43], db, embedder=None)
         )
-        assert updated == 0
+        assert updated == (1 if fresh_count > 4 else 0)
         row = db.get_story(43)
         assert row is not None
         # Untouched
         assert row.self_text == long_body
         assert row.top_comments == long_comments
+        assert row.comment_count == max(4, fresh_count)
+        assert row.comment_count_at_fetch == max(4, fresh_count)
+        assert row.score == 100
         # score: max(100, 10) = 100 (no change)
 
     finally:

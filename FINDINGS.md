@@ -1,5 +1,26 @@
 # HN Rerank findings
 
+## LessWrong score attribution — snapshot counterfactual
+
+The primary profile's feed had 10 LessWrong stories at Recent Recommended
+positions 1–10. An offline SQLite backup (private on VPS) contained 114 eligible
+LessWrong candidates. `scripts/diagnose_source_scores.py` held training rows and
+candidate embeddings fixed while altering only candidate source/length metadata:
+
+| Candidate metadata | LW median score | Median paired change |
+|---|---:|---:|
+| Actual | 0.9587 | 0 |
+| Source category changed to HN | 0.2892 | -0.4544 |
+| Text length changed to HN median | 0.9704 | +0.0115 |
+| Both changed | 0.9360 | -0.0193 |
+
+HN median text length was 3,520 characters; LW median was 9,827.5. This exposes
+strong nonlinear source/length interactions, not a client sorting bug or simply
+an additive LessWrong boost. Source features group RSS together, not LessWrong
+alone. Single-feature ablations can be out-of-distribution; these are model
+sensitivities, not causal evidence of user preference or quality probabilities.
+Do not tune against the consumed confirmation set. No ranker changes made.
+
 ## Authorized duplicate Import AI vote cleanup — 2026-09-22
 
 - User explicitly chose cleanup of duplicate feedback records. Scope limited

@@ -13,10 +13,14 @@ Escape leaves it or closes help. Use the sort and age selectors to change
 filters. Below 100 columns the headline list stacks above the summary.
 
 Summaries are cached for the session and the next stories in the list are
-prefetched one at a time after the selected summary settles, so j/k navigation
-is instant. The default is two stories ahead; `--prefetch N` changes that and
-`--prefetch 0` disables it. Speculative requests pause on rate limits, and
-stale or partial responses are shown but never cached.
+prefetched one at a time after the selected summary settles. The default is ten
+stories ahead; `--prefetch N` changes that and `--prefetch 0` disables it.
+Background requests only read the server's current summary cache: they never
+hydrate sources or generate paid summaries. Cache misses remain available for
+normal on-selection generation, and are not rechecked for at least one minute.
+Older servers without the cache-only endpoint safely disable speculation via
+error cooldown rather than falling back to generation. Stale or partial
+responses are shown on selection but never cached.
 
 Selected-story transitions that remain selected for at least one second send
 best-effort impression events to your configured server's existing interaction

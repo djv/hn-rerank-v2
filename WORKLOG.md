@@ -1,5 +1,62 @@
 # Worklog: hn-rewrite
 
+## Handoff: independent summary cadence and ranking attribution
+
+- User authorized isolated freshness/client deployment; not yet performed.
+- Added process-wide single-flight automatic-summary gate with independent
+  four-hour start cadence, leaving hourly source regen and article work free
+  to run. Foreground summaries unchanged. Restart resets gate; no dollar-cap
+  guarantee. Property/concurrency tests added; full backend 813 passed,
+  Ruff/ty clean. TUI previous full run 79 passed / one skip.
+- Snapshot-only source/length counterfactuals completed; `FINDINGS.md` records
+  large nonlinear interactions. Ranking unchanged.
+- Detailed deployment isolation instructions and file boundaries in STATUS.md.
+
+## Cache-only client lookahead (local, undeployed)
+
+- VPS inspection: load 0.12/0.16/0.26, ~4.2 GB available, service ~1.88 GB.
+  There is headroom; source limits and summary costs remain constraints.
+- Added authenticated `GET /api/tldr-cache/<signed story ID>`: current-content
+  cache hit or 204 miss, no source hydration or LLM invocation. The TUI now
+  looks ahead ten stories instead of two using only this endpoint; selection
+  retains normal generation. Misses back off for a minute; errors retain the
+  existing cooldown. Older servers cannot accidentally generate via fallback.
+- No increase to LLM generation limits. Existing hourly core-refresh WIP still
+  needs deployment review: more cycles can create more summary opportunities
+  even with unchanged per-run limits, so this is not a daily spending guarantee.
+
+## Freshness lifecycle review and regression coverage (local, undeployed)
+
+- Mapped existing acquisition, hydration, snapshot, deck, and client lifecycles
+  in `docs/freshness-lifecycle.md`. No new queue or ranking changes.
+- Provisional patch shortens core regen default to one hour, includes hydrated
+  LessWrong candidates, and persists higher counts/scores even with unchanged
+  or shorter fetched text. Existing richer content is retained.
+- Added generated refresh-sequence properties for merge idempotence, delayed
+  metadata responses, and end-to-end LessWrong prewarm persistence without
+  richer text. Tests use in-memory databases, no network or production writes.
+- Client now probes ranking versions every minute while idle, reuses the
+  existing refresh path only on changes, and preserves selection. Defers during
+  reading/help/setup/voting/refresh; passive failures keep the usable deck.
+  Integration tests cover unchanged/new/reset versions and interaction guards.
+- Reddit still uses its existing four-hour feed TTL and rate-limited queue;
+  archive rows are not fully refetched. No claim of hourly freshness for those.
+
+## 2026-09-22 — TUI badge legend and headline placement (local WIP)
+
+- `b` opens the six-badge legend in the summary pane; Escape returns to the
+  story. Badge emoji now precede headlines (not appended to metadata).
+  Terminal glyph size cannot be changed independently of the terminal font.
+
+## 2026-09-22 — Web refills consume shared feed JSON (local WIP)
+
+- Added typed badge details and web card presentation fields to `/api/feed`;
+  TUI still reads emoji icons. Web initial paint remains Jinja; refill now
+  builds cards from JSON with DOM text nodes, preserving active card and
+  already-voted suppression. The legacy HTML fragment endpoint remains.
+- Not yet deployed. Full HTML-cache decoupling is deferred; JSON feed still
+  shares the HTML render cache, so do not claim server-rendering savings.
+
 ## 2026-09-22 — Deployed TUI badge emoji, verified live
 
 - Pushed `8155162` (plus stacked `f451bd7` experiment and `224055c` status

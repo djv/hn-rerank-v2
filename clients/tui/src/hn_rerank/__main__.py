@@ -16,9 +16,9 @@ def main() -> None:
     parser.add_argument(
         "--prefetch",
         type=int,
-        default=2,
+        default=10,
         metavar="N",
-        help="Prefetch summaries for the next N stories in the list (0 disables).",
+        help="Fetch cached summaries for the next N stories (default 10; 0 disables).",
     )
     parser.add_argument("--version", action="version", version="hn-rerank 0.1.0")
     args = parser.parse_args()

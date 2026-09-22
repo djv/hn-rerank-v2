@@ -78,6 +78,8 @@ def headline(story: FeedStory, selected: bool | None = None) -> Text:
     text = Text()
     if selected is not None:
         text.append("> " if selected else "  ", style="bold #FF914D")
+    if story.badges:
+        text.append(" ".join(story.badges) + " ")
     text.append(
         story.title, style="bold #EEE8DD" if selected is not False else "#D2CCC1"
     )
@@ -92,8 +94,6 @@ def headline(story: FeedStory, selected: bool | None = None) -> Text:
     if age:
         text.append(" · ", style="#6B655D")
         text.append(f"{age} ago", style="#8F897F")
-    if story.badges:
-        text.append(" " + "".join(story.badges))
     return text
 
 
@@ -279,6 +279,7 @@ class Reader(App[None]):
         ("enter", "read", "Read"),
         ("escape", "headlines", "Back"),
         ("?", "help", "Help"),
+        ("b", "badge_legend", "Badges"),
         ("q", "quit", "Quit"),
     ]
 
@@ -287,7 +288,7 @@ class Reader(App[None]):
         server: str | None = None,
         config_path: Path | None = None,
         api: API | None = None,
-        prefetch: int = 2,
+        prefetch: int = 10,
     ) -> None:
         super().__init__()
         self.register_theme(
@@ -382,6 +383,7 @@ class Reader(App[None]):
     def on_mount(self) -> None:
         self.layout_panes()
         self.set_interval(1.0, self.refresh_read_state)
+        self.set_interval(60.0, self.poll_feed_version)
         self.query_one("#headlines", OptionList).focus()
         self.start()
 
@@ -712,7 +714,7 @@ class Reader(App[None]):
                     continue
                 self.prefetching.add(story_id)
                 try:
-                    summary = await self.api.summary(story_id)
+                    summary = await self.api.cached_summary(story_id)
                 except InvalidProfile:
                     self.prefetch_queue.clear()
                     return
@@ -725,6 +727,9 @@ class Reader(App[None]):
                     return
                 finally:
                     self.prefetching.discard(story_id)
+                if summary is None:
+                    self.prefetch_retry_at[story_id] = time.monotonic() + 60.0
+                    continue
                 if summary.provisional:
                     # Not cacheable, and not worth retrying on every rebuild.
                     self.prefetch_retry_at[story_id] = (
@@ -741,6 +746,42 @@ class Reader(App[None]):
                 and time.monotonic() >= self.prefetch_cooldown_until
             ):
                 self.start_prefetch()
+
+    def can_poll_feed(self) -> bool:
+        return bool(
+            self.api
+            and self.feed
+            and not self.setting_up
+            and not self.pending
+            and not self.reading
+            and not self.help_open
+            and not any(
+                worker.group in {"refresh", "vote"} and worker.is_running
+                for worker in self.workers
+            )
+        )
+
+    async def poll_feed_version(self) -> None:
+        """Observe published versions without interrupting reading or voting."""
+        if not self.can_poll_feed():
+            return
+        api, feed = self.api, self.feed
+        assert api is not None and feed is not None
+        try:
+            _, current = await api.ready(feed.version)
+        except APIError:
+            # Passive checks must not replace a usable deck with an error.
+            # Manual refresh retains its visible error/retry behavior.
+            return
+        if (
+            self.api is api
+            and self.feed is feed
+            and self.can_poll_feed()
+            and current != feed.version
+        ):
+            # A lower version is a server restart, not an obsolete response.
+            # Drop local summaries too: the new generation may have new text.
+            self.action_refresh()
 
     @work(group="refresh", exclusive=True)
     async def refresh_feed(self) -> None:
@@ -888,17 +929,17 @@ class Reader(App[None]):
         votes = "1 up · 2 neutral · 3 down"
         if narrow:
             if self.reading:
-                hints = f"j/k scroll · Esc back · {votes} · ? help"
+                hints = f"j/k scroll · Esc back · {votes} · b badges · ? help"
             elif self.can_read:
-                hints = f"Enter read · {votes} · ? help"
+                hints = f"Enter read · {votes} · b badges · ? help"
             else:
-                hints = f"j/k move · {votes} · ? help"
+                hints = f"j/k move · {votes} · b badges · ? help"
         elif self.reading:
-            hints = f"j/k scroll · Esc headlines · {votes} · ? help · q quit"
+            hints = f"j/k scroll · Esc headlines · {votes} · b badges · ? help · q quit"
         elif self.can_read:
-            hints = f"j/k move · Enter read · {votes} · ? help · q quit"
+            hints = f"j/k move · Enter read · {votes} · b badges · ? help · q quit"
         else:
-            hints = f"j/k move · {votes} · ? help · q quit"
+            hints = f"j/k move · {votes} · b badges · ? help · q quit"
         self.query_one("#shortcuts", Static).update(hints)
 
     def schedule_read_state(self) -> None:
@@ -961,13 +1002,27 @@ class Reader(App[None]):
         elif was_reading:
             self.schedule_read_state()
 
+    def action_badge_legend(self) -> None:
+        self.help_open = True
+        self.summary_story_id = None
+        self.selection_serial += 1
+        self.workers.cancel_group(self, "summary")
+        self.query_one("#summary", Markdown).update(
+            "# Badge legend\n\n"
+            "🔥 **Hot** — rising fast · 🏆 **Top** — high score · 💬 **Talk** — many comments\n\n"
+            "🤔 **Unsure** — model uncertain · ✨ **Novel** — unlike your votes · 🎯 **Similar** — matches your upvotes\n\n"
+            "Escape: return to the story. ?: shortcuts."
+        )
+        self.focus_summary()
+        self.schedule_read_state()
+
     def action_help(self) -> None:
         self.help_open = True
         self.summary_story_id = None
         self.selection_serial += 1
         self.workers.cancel_group(self, "summary")
         self.query_one("#summary", Markdown).update(
-            "# Shortcuts\n\nj/k: move the headline list. Arrows: scroll the focused pane. Tab: focus. Escape: close this help.\n\nEnter: expand a summary that overflows its pane, and leave that mode again. 1/2/3: up / neutral / down. u: undo latest vote. o/c: article / comments. r: refresh. ?: this help. q: quit.\n\nUse the selectors for Recommended, Popular, Explore, Date and Recent / Archive. Votes are never automatically retried after network errors."
+            "# Shortcuts\n\nj/k: move the headline list. Arrows: scroll the focused pane. Tab: focus. Escape: close this help.\n\nEnter: expand a summary that overflows its pane, and leave that mode again. 1/2/3: up / neutral / down. u: undo latest vote. o/c: article / comments. r: refresh. b: badge legend. ?: this help. q: quit.\n\nUse the selectors for Recommended, Popular, Explore, Date and Recent / Archive. Votes are never automatically retried after network errors."
         )
         self.focus_summary()
         self.schedule_read_state()

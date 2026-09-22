@@ -6837,6 +6837,7 @@ def test_warm_background_article_fetch_failure_still_prefetches_tldrs(
 
     monkeypatch.setattr(pipeline, "fetch_and_cache_article_bodies", failing_fetch)
     monkeypatch.setattr(srv, "_prefetch_tldrs_for_ranked", capture_prefetch)
+    monkeypatch.setattr(srv.Handler, "_tldr_prefetch_gate", srv.BackgroundCadence())
 
     srv.Handler._warm_background_tasks(
         ranked,

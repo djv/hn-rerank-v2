@@ -29,8 +29,15 @@ class PrefetchServer(FakeServer):
         self.rate_limited: set[int] = set()
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/api/tldr-detail"):
-            story_id = json.loads(request.content)["story_id"]
+        if (
+            request.url.path.endswith("/api/tldr-detail")
+            or "/api/tldr-cache/" in request.url.path
+        ):
+            story_id = (
+                int(request.url.path.rsplit("/", 1)[1])
+                if "/api/tldr-cache/" in request.url.path
+                else json.loads(request.content)["story_id"]
+            )
             self.summary_ids.append(story_id)
             if story_id in self.rate_limited:
                 return httpx.Response(429, headers={"Retry-After": "30"})
@@ -56,6 +63,11 @@ async def test_prefetch_warms_next_stories_then_serves_from_cache() -> None:
     async with app.run_test(size=(120, 35)) as pilot:
         await wait_for(pilot, lambda: app.summaries.keys() >= {2, 3})
         assert fake.summary_ids[:3] == [1, 2, 3]  # active tap first, then in order
+        generation = [
+            r for r in fake.requests if r.url.path.endswith("/api/tldr-detail")
+        ]
+        assert len(generation) == 1
+        assert json.loads(generation[0].content)["story_id"] == 1
         assert app.summaries[2] == "# Summary 2"
         # Revisiting a prefetched story renders from cache without another tap.
         app.query_one(OptionList).focus()
@@ -63,6 +75,31 @@ async def test_prefetch_warms_next_stories_then_serves_from_cache() -> None:
         await pilot.pause()
         assert "Summary 2" in app.query_one(Markdown)._markdown
         assert fake.summary_ids.count(2) == 1
+
+
+async def test_cache_miss_never_generates_until_selected() -> None:
+    class MissServer(PrefetchServer):
+        async def __call__(self, request: httpx.Request) -> httpx.Response:
+            if "/api/tldr-cache/" in request.url.path:
+                self.requests.append(request)
+                return httpx.Response(204)
+            return await super().__call__(request)
+
+    fake = MissServer()
+    app = Reader(api=fake.api())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await wait_for(pilot, lambda: 2 in app.prefetch_retry_at)
+        assert fake.summary_ids == [1]
+        assert 2 not in app.summaries
+        app.rebuild()
+        await pilot.pause(0.1)
+        assert (
+            len([r for r in fake.requests if r.url.path.endswith("/tldr-cache/2")]) == 1
+        )
+        app.query_one(OptionList).focus()
+        await pilot.press("j")
+        await wait_for(pilot, lambda: 2 in app.summaries)
+        assert fake.summary_ids == [1, 2]
 
 
 async def test_prefetch_zero_disables_speculation() -> None:

@@ -249,8 +249,9 @@ def test_headline_shows_badge_emoji() -> None:
         False,
         badges=["\U0001f525", "\U0001f3c6"],
     )
-    assert "\U0001f525\U0001f3c6" in headline(story).plain
-    assert "\U0001f525" not in headline(replace(story, badges=[])).plain
+    assert headline(story).plain.startswith("🔥 🏆 Story")
+    assert headline(story, selected=True).plain.startswith("> 🔥 🏆 Story")
+    assert headline(replace(story, badges=[])).plain.startswith("Story")
 
 
 async def test_failure_copy_in_reading_pane() -> None:
@@ -329,6 +330,30 @@ async def test_summary_headings_align_left_like_body() -> None:
         await pilot.pause(0.6)
         heading = app.query("#summary MarkdownH1").first()
         assert heading.styles.content_align == ("left", "top")
+
+
+async def test_badge_legend_hotkey_and_escape_restore_story() -> None:
+    app = Reader(api=EditorialServer().api())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await pilot.pause(0.6)
+        await pilot.press("b")
+        await pilot.pause()
+        legend = app.query_one(Markdown)._markdown
+        for badge in (
+            "🔥 **Hot**",
+            "🏆 **Top**",
+            "💬 **Talk**",
+            "🤔 **Unsure**",
+            "✨ **Novel**",
+            "🎯 **Similar**",
+        ):
+            assert badge in legend
+        app.rebuild()
+        await pilot.pause()
+        assert "Badge legend" in app.query_one(Markdown)._markdown
+        await pilot.press("escape")
+        await pilot.pause(0.5)
+        assert "Section 0" in app.query_one(Markdown)._markdown
 
 
 async def test_help_escape_restores_story_view_and_survives_refresh() -> None:

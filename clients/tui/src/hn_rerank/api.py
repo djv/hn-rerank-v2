@@ -257,6 +257,23 @@ class API:
                 "Invalid feed response. Check the server API version."
             ) from exc
 
+    async def cached_summary(self, story_id: int) -> Summary | None:
+        """Read existing summaries only; old servers fail without generation."""
+        response = await self.request("GET", f"api/tldr-cache/{story_id}")
+        if response.status_code == 204:
+            return None
+        try:
+            data = response.json()
+            value = data["tldr"]
+            if not isinstance(value, str):
+                raise TypeError("Invalid summary")
+            return Summary(
+                value,
+                provisional=data.get("stale") is True or data.get("retryable") is True,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise APIError("Invalid cached summary.") from exc
+
     async def summary(self, story_id: int) -> Summary:
         response = await self.request(
             "POST", "api/tldr-detail", json={"story_id": story_id}

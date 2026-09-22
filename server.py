@@ -32,6 +32,7 @@ from flask import Flask, Response, jsonify, redirect, request
 from flask.typing import ResponseReturnValue
 import httpx
 
+from background_cadence import BackgroundCadence
 from database import (
     Database,
     InteractionEvent,
@@ -1368,6 +1369,7 @@ class Handler:
     _cold_stories: list[RankedStory] = []
     _article_fetch_in_flight: set[int] = set()
     _warm_bg_lock = threading.Lock()
+    _tldr_prefetch_gate = BackgroundCadence()
     _render_locks: dict[int, threading.Lock] = {}
     _render_locks_guard = threading.Lock()
     _warmup_requested_versions: dict[int, int] = {}
@@ -1925,17 +1927,26 @@ class Handler:
 
         stale_per_run = config.tldr_prefetch_stale_per_run
         date_top_n = config.tldr_prefetch_date_top_n
-        if (per_combo > 0 or stale_per_run > 0 or date_top_n > 0) and final:
-            asyncio.run(
-                _prefetch_tldrs_for_ranked(
-                    final,
-                    db,
-                    per_combo,
-                    stale_per_run,
-                    date_top_n,
-                    stagger_s=config.tldr_prefetch_stagger_seconds,
-                )
+        if (
+            (per_combo > 0 or stale_per_run > 0 or date_top_n > 0)
+            and final
+            and cls._tldr_prefetch_gate.claim(
+                time.monotonic(), config.tldr_prefetch_interval_seconds
             )
+        ):
+            try:
+                asyncio.run(
+                    _prefetch_tldrs_for_ranked(
+                        final,
+                        db,
+                        per_combo,
+                        stale_per_run,
+                        date_top_n,
+                        stagger_s=config.tldr_prefetch_stagger_seconds,
+                    )
+                )
+            finally:
+                cls._tldr_prefetch_gate.finish()
 
 
 _DASHBOARD_CACHE_KEY_PREFIX = "dashboard_"
@@ -3241,6 +3252,29 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
         if cross_site_response is not None:
             return cross_site_response
         return _handle_flask_interaction_events(runtime)
+
+    @app.get("/api/tldr-cache/<int(signed=True):story_id>")
+    def tldr_cache(story_id: int) -> ResponseReturnValue:
+        """Read-only speculation: never hydrate sources or invoke the LLM."""
+        if not _flask_user(runtime):
+            return _flask_json_response({"error": "No session"}, status=401)
+        story = runtime.db.get_story(story_id)
+        if story is None:
+            return Response(status=204)
+        key = _tldr_cache_key(
+            title=story.title,
+            self_text=story.self_text or "",
+            top_comments=story.top_comments or "",
+            article_body=story.article_body or "",
+        )
+        cached = runtime.db.get_tldr_cache(story_id, key)
+        response = (
+            _serve_cached_tldr(cached, story_id, key, "prefetch_cache_hit")
+            if cached
+            else Response(status=204)
+        )
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
 
     @app.route("/api/tldr-detail", methods=["POST"], provide_automatic_options=False)
     def tldr_detail() -> ResponseReturnValue:

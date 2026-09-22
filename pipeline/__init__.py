@@ -990,11 +990,7 @@ async def fetch_candidates_only(
 
     # LessWrong prewarm
     if config.prewarm_lesswrong_full:
-        needs_prewarm_lw = [
-            s.id
-            for s in candidates
-            if s.source == "rss_lesswrong_com" and not s.top_comments
-        ]
+        needs_prewarm_lw = [s.id for s in candidates if s.source == "rss_lesswrong_com"]
         if needs_prewarm_lw:
             prewarmed = await prewarm_lesswrong_stories(needs_prewarm_lw, db, embedder)
             logging.info(

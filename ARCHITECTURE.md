@@ -731,6 +731,26 @@ version-one feed contract from `clients/tui/src/hn_rerank/models.py`. The backen
 imports this dependency-free module directly; no terminal or ML dependencies were
 added. `DashboardDocument` attaches a feed snapshot to the existing HTML bytes so
 per-user cache hits, stale fallback and eviction share the same ranked cards.
+Freshness lifecycle and known source-specific limits are mapped in
+[docs/freshness-lifecycle.md](docs/freshness-lifecycle.md). Core regeneration
+now defaults to an hourly wait between cycles and rechecks hydrated LessWrong
+candidates. Count-only growth persists without replacing richer stored text.
+The authenticated `/api/tldr-cache/<signed story ID>` endpoint returns only a
+summary matching current stored content (204 on miss); it does not fetch source
+content or invoke an LLM. TUI lookahead reads this endpoint for the next ten
+stories sequentially, retaining ordinary generation only on selection.
+
+The terminal client checks ranking versions every minute while idle and uses
+its existing refresh path on changes; reading, help and voting defer the check.
+This does not bypass Reddit rate limits or promise real-time HN upstream data.
+
+The terminal client prefixes headline titles with badge emoji and offers a
+`b` legend hotkey (Escape returns to the story). Story JSON now includes badge details (kind/icon/label/tooltip) and card
+presentation fields. The browser keeps server-rendered initial paint but uses
+`/api/feed` JSON for refills, building DOM nodes with textContent instead of
+injecting story text as HTML. `/api/deck-cards` remains available for older
+clients. HTML rendering still occurs on warm and cold feed requests; decoupling
+that cache is a separate performance change, not part of the refill migration.
 `_patch_current_version` preserves this attachment. Feed orders retain production
 Explore shuffling; the disabled source selector remains disabled. Story entries
 also carry `badges`, the card badge icons in display order, rendered at the end

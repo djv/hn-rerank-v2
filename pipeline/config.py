@@ -80,7 +80,7 @@ class Config:
         "spin_off_auto_threads",
     ] = "current"
     server_port: int = 8765
-    regen_interval_seconds: int = 14400
+    regen_interval_seconds: int = 3600
     regen_initial_delay_seconds: int = 30
     regen_prewarm_top_n: int = 50
     prewarm_hn_full: bool = True
@@ -121,6 +121,8 @@ class Config:
     recent_candidate_hn_limit: int = 5000
     recent_candidate_rss_limit: int = 5000
     non_hn_candidates_enabled: bool = True
+    # Independent of source regeneration and per-user warm frequency.
+    tldr_prefetch_interval_seconds: int = 14400
     tldr_prefetch_per_combo: int = 2
     # After the top-per-combo pass, regenerate up to this many additional
     # cold-deck stories whose cached TLDR's cache_key no longer matches
@@ -178,6 +180,8 @@ class Config:
     rss: RssConfig = field(default_factory=RssConfig)
 
     def __post_init__(self) -> None:
+        if self.tldr_prefetch_interval_seconds <= 0:
+            raise ValueError("tldr_prefetch_interval_seconds must be positive")
         if self.embedding_batch_size <= 0:
             raise ValueError("embedding_batch_size must be positive")
         if not self.embedding_model_version.strip():

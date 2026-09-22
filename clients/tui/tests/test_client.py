@@ -71,8 +71,12 @@ class FakeServer:
             return httpx.Response(200, json={"user_id": 1, "token": "test"})
         if path.endswith("/api/feed"):
             return httpx.Response(200, json=self.feed.to_dict())
-        if path.endswith("/api/tldr-detail"):
-            story_id = json.loads(request.content)["story_id"]
+        if path.endswith("/api/tldr-detail") or "/api/tldr-cache/" in path:
+            story_id = (
+                int(path.rsplit("/", 1)[1])
+                if "/api/tldr-cache/" in path
+                else json.loads(request.content)["story_id"]
+            )
             await asyncio.sleep(self.delay_summary if story_id == 1 else 0)
             return httpx.Response(
                 200, json={"ok": True, "tldr": f"# Summary {story_id}"}
