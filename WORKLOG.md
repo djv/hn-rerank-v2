@@ -1,5 +1,15 @@
 # Worklog: hn-rewrite
 
+## 2026-09-22 — TUI headlines show badge emoji
+
+- `/api/feed` story entries now carry `badges` (card badge icons in display
+  order, via `prepare_feed`); `FeedStory.badges` defaults to empty so payloads
+  from older servers still parse, while older clients get the usual version
+  hint. Terminal headlines append the icons at the end of the metadata line.
+- Tests: feed-API badge assertions (hot/novel/empty), headline emoji test,
+  missing-badges tolerance. Backend 806 passed; client 65 passed/1 skipped;
+  ruff/format/ty clean in both trees.
+
 ## 2026-09-22 — User-authorized Import AI duplicate feedback cleanup
 
 - With explicit authorization, removed exactly three older redundant upvote

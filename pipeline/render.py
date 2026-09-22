@@ -357,6 +357,7 @@ def prepare_feed(
             memberships=c.combo_keys.split(),
             popular=c.sort_popular_attr == "1",
             explore=c.sort_explore_attr == "1",
+            badges=[badge.icon for badge in c.badges],
         )
         for c in cards
     ]

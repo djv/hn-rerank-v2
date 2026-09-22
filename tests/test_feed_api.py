@@ -68,6 +68,11 @@ def test_feed_parity_authentication_stale_cache_and_eviction(tmp_path: Path) -> 
     feed = payload(response)
     parsed = Feed.parse(feed)
     assert parsed.api_version == 1
+    assert [story.badges for story in parsed.stories] == [
+        ["\U0001f525"],
+        ["\u2728"],
+        [],
+    ]
     assert [story.id for story in parsed.stories] == [
         story["id"] for story in feed["stories"]
     ]

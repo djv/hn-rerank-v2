@@ -92,6 +92,8 @@ def headline(story: FeedStory, selected: bool | None = None) -> Text:
     if age:
         text.append(" · ", style="#6B655D")
         text.append(f"{age} ago", style="#8F897F")
+    if story.badges:
+        text.append(" " + "".join(story.badges))
     return text
 
 

@@ -111,6 +111,14 @@ def test_parse_rejects_boolean_rank_score(rank_score: bool) -> None:
         Feed.parse(replace(sample_feed(), stories=[story]).to_dict())
 
 
+def test_parse_tolerates_missing_badges_from_older_servers() -> None:
+    payload = sample_feed().to_dict()
+    stories = cast("list[dict[str, object]]", payload["stories"])
+    for story in stories:
+        del story["badges"]
+    assert [story.badges for story in Feed.parse(payload).stories] == [[], [], []]
+
+
 @pytest.mark.parametrize(
     "server",
     [

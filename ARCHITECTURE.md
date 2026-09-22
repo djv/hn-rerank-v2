@@ -732,7 +732,10 @@ imports this dependency-free module directly; no terminal or ML dependencies wer
 added. `DashboardDocument` attaches a feed snapshot to the existing HTML bytes so
 per-user cache hits, stale fallback and eviction share the same ranked cards.
 `_patch_current_version` preserves this attachment. Feed orders retain production
-Explore shuffling; the disabled source selector remains disabled.
+Explore shuffling; the disabled source selector remains disabled. Story entries
+also carry `badges`, the card badge icons in display order, rendered at the end
+of terminal headlines; payloads from older servers omit the field and the
+client defaults it to empty.
 
 ### Terminal client package
 

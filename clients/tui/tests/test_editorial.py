@@ -11,7 +11,14 @@ from rich.color import Color
 from rich.text import Text
 from textual.widgets import Button, Input, Markdown, OptionList, Select, Static, Tabs
 
-from hn_rerank.app import EMPTY_NOTICE, Reader, Setup, story_age, story_metadata
+from hn_rerank.app import (
+    EMPTY_NOTICE,
+    Reader,
+    Setup,
+    headline,
+    story_age,
+    story_metadata,
+)
 from hn_rerank.models import FeedStory
 
 from .test_client import FakeServer
@@ -224,6 +231,26 @@ def test_story_age_guard_and_buckets() -> None:
     assert story_age(replace(story, time=now - 45 * 86400)) == "1mo"
     assert story_age(replace(story, time=now - 400 * 86400)) == "1y"
     assert story_metadata(replace(story, time=now - 5 * 86400)).endswith("5d ago")
+
+
+def test_headline_shows_badge_emoji() -> None:
+    story = FeedStory(
+        1,
+        "Story",
+        "https://example.org/a",
+        "https://news.ycombinator.com/item?id=1",
+        "hn",
+        10,
+        None,
+        0,
+        1.0,
+        ["recent_mixed"],
+        False,
+        False,
+        badges=["\U0001f525", "\U0001f3c6"],
+    )
+    assert "\U0001f525\U0001f3c6" in headline(story).plain
+    assert "\U0001f525" not in headline(replace(story, badges=[])).plain
 
 
 async def test_failure_copy_in_reading_pane() -> None:

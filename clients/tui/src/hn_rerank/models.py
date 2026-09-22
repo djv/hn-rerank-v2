@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
@@ -21,6 +21,7 @@ class FeedStory:
     memberships: list[str]
     popular: bool
     explore: bool
+    badges: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -83,6 +84,8 @@ class Feed:
                     or not math.isfinite(story.rank_score)
                     or not isinstance(story.memberships, list)
                     or any(not isinstance(key, str) for key in story.memberships)
+                    or not isinstance(story.badges, list)
+                    or any(not isinstance(badge, str) for badge in story.badges)
                 ):
                     raise ValueError("Invalid story")
             ids = {story.id for story in stories}
