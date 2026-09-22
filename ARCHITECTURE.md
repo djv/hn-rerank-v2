@@ -741,7 +741,10 @@ Explore shuffling; the disabled source selector remains disabled.
 uv workspace installs it in the backend's development group only, so production
 keeps no terminal dependencies. The client imports a profile link or creates a
 profile, validates it and API compatibility, then atomically saves a private
-config file. Requests stay on one normalized deployment URL and never follow
+config file. A deployment URL is accepted only if httpx itself can parse it
+(ports, unprintable and non-IDNA hosts are rejected at setup), and malformed
+feed payloads raise `ValueError` inside the API error path instead of escaping
+a worker. Requests stay on one normalized deployment URL and never follow
 redirects; summary workers debounce selections by 300 ms and reject late
 results; feedback is serialized and never automatically retried, and the latest
 successful vote can be cleared. See

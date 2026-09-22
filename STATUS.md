@@ -1,7 +1,7 @@
 # HN Rerank status
 
 - Objective: maintain the shipped terminal reader and prepare uvx/PyPI release.
-- Owner: none; save-state refreshed 2026-09-20, no resource locks held.
+- Owner: none; save-state refreshed 2026-09-22, no resource locks held.
 - Result: the terminal reader line is merged with `origin/main` (merge commit
   `354acd6`, plus `6a0dc99` for the workspace lock). Backend code takes
   `origin/main` (server.py, pipeline/render.py, tests, uv.lock); the client
@@ -15,9 +15,14 @@
   blocks render without per-block margins. Server `detail-v10` targets
   45/70/90 words, caps each section at four bullets and one `####` heading,
   and bolds single-marker emphasis so Article + Discussion fit one TUI screen.
-- Verification: backend 770 passed with
-  `HN_ONNX_MODEL_DIR=/home/d/.cache/hn-rerank/onnx_model`; client 40 passed /
-  1 Windows-only skip; Ruff and ty clean. Offline SVG renders inspected;
+  The 2026-09-22 boundary hardening is in: deployment URLs must parse with
+  httpx (ports, unprintable and non-IDNA hosts) and `Feed.parse` raises only
+  `ValueError` for invalid payloads, covered by Hypothesis properties and
+  server-side parity assertions in `tests/test_feed_api.py`.
+- Verification: backend 769 passed plus one load-sensitive
+  `test_reddit_fetch_queue` spread-timing flake that passes in isolation
+  (full-suite run with `-n 2` on a loaded host); client 56 passed /
+  1 Windows-only skip; Ruff, format, ty and `uv lock --check` clean. Offline SVG renders inspected;
   native terminal sessions at 145×38 and 80×30 exercised filters, reading,
   voting/undo, help, empty and failure states; the Textual pilot measured 8/8
   live summaries inside the 27-line reading pane.

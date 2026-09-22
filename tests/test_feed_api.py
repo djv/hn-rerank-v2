@@ -8,6 +8,7 @@ from werkzeug.test import TestResponse
 
 from bs4 import BeautifulSoup
 
+from clients.tui.src.hn_rerank.models import Feed
 from database import Database, Story, User
 from pipeline import Config, RankedStory
 from pipeline.render import DashboardDocument, generate_dashboard_bytes
@@ -65,6 +66,11 @@ def test_feed_parity_authentication_stale_cache_and_eviction(tmp_path: Path) -> 
     client.set_cookie("hn_token", user.token)
     response = client.get("/api/feed")
     feed = payload(response)
+    parsed = Feed.parse(feed)
+    assert parsed.api_version == 1
+    assert [story.id for story in parsed.stories] == [
+        story["id"] for story in feed["stories"]
+    ]
     assert response.headers["Cache-Control"] == "no-store"
     assert feed["version"] == 0 and feed["ready"] is True
     html = client.get("/").data
@@ -101,6 +107,7 @@ def test_feed_parity_authentication_stale_cache_and_eviction(tmp_path: Path) -> 
     vote = client.post("/api/feedback", json={"story_id": 1, "action": "up"})
     assert payload(vote)["target_version"] == 1
     stale = payload(client.get("/api/feed"))
+    assert not Feed.parse(stale).ready
     assert stale["stories"] == feed["stories"]
     assert stale["version"] == 0 and stale["target_version"] == 1 and not stale["ready"]
     assert (
@@ -127,5 +134,6 @@ def test_feed_parity_authentication_stale_cache_and_eviction(tmp_path: Path) -> 
     assert f"dashboard_{user.id}" not in Runtime._dashboard_cache
     Runtime._cold_stories = []
     empty = payload(client.get("/api/feed"))
+    assert not Feed.parse(empty).stories
     assert not empty["ready"] and empty["stories"] == []
     db.close()

@@ -39,7 +39,7 @@ class Feed:
     @classmethod
     def parse(cls, data: Any) -> Feed:
         if not isinstance(data, dict):
-            raise TypeError("Invalid feed response")
+            raise ValueError("Invalid feed response")
         if data.get("api_version") != 1:
             raise ValueError("Unsupported feed API; update hn-rerank.")
         try:
@@ -78,6 +78,7 @@ class Feed:
                     or (story.comments is not None and type(story.comments) is not int)
                     or type(story.popular) is not bool
                     or type(story.explore) is not bool
+                    or isinstance(story.rank_score, bool)
                     or not isinstance(story.rank_score, (int, float))
                     or not math.isfinite(story.rank_score)
                     or not isinstance(story.memberships, list)
@@ -98,5 +99,5 @@ class Feed:
             ):
                 raise ValueError("Invalid feedback counts or duplicate stories")
             return result
-        except (KeyError, TypeError, AttributeError) as exc:
+        except (KeyError, TypeError, AttributeError, OverflowError) as exc:
             raise ValueError("Invalid feed response") from exc

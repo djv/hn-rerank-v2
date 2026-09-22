@@ -43,10 +43,23 @@ def normalize_server(value: str) -> str:
         "::1",
     }:
         raise ValueError("Use HTTPS for a remote server to protect your profile.")
+    try:
+        _port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Enter an http(s) server URL with a valid port.") from exc
     path = parsed.path.rstrip("/") + "/"
     if any(part in {".", ".."} for part in unquote(path).split("/")):
         raise ValueError("Invalid server path.")
-    return urlunsplit((parsed.scheme, parsed.netloc.lower(), path, "", ""))
+    normalized = urlunsplit((parsed.scheme, parsed.netloc.lower(), path, "", ""))
+    # The validator must accept exactly what the HTTP layer can request.
+    # httpx raises InvalidURL (not RequestError) for unprintable characters
+    # or hosts that cannot be IDNA-encoded; without this check such a URL
+    # would escape every API caller as an uncaught exception.
+    try:
+        httpx.URL(normalized)
+    except httpx.InvalidURL as exc:
+        raise ValueError("Enter a server URL the client can request.") from exc
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -170,7 +183,7 @@ class API:
             response = await self.client.request(
                 method, self.server + path, headers=headers, json=json
             )
-        except httpx.RequestError as exc:
+        except (httpx.RequestError, httpx.InvalidURL) as exc:
             raise APIError(
                 "Connection failed. Press r to refresh; votes are not retried."
             ) from exc
@@ -212,7 +225,7 @@ class API:
         response = await self.request("GET", "api/feed")
         try:
             return Feed.parse(response.json())
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
             raise APIError(
                 "Invalid feed response. Check the server API version."
             ) from exc

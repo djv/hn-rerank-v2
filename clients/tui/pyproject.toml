@@ -14,7 +14,7 @@ dependencies = ["textual>=8.2.8,<9", "httpx>=0.28,<1", "platformdirs>=4,<5"]
 hn-rerank = "hn_rerank.__main__:main"
 
 [dependency-groups]
-dev = ["pytest>=9", "pytest-asyncio>=1", "ruff>=0.14", "ty>=0.0.10"]
+dev = ["pytest>=9", "pytest-asyncio>=1", "hypothesis>=6.150", "ruff>=0.14", "ty>=0.0.10"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

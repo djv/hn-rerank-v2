@@ -1,5 +1,31 @@
 # Worklog: hn-rewrite
 
+## 2026-09-22 — TUI boundary hardening: unrequestable URLs and feed parsing
+
+- Review of `clients/tui` found two paths where validation accepted input the
+  HTTP layer or parser could not handle; both killed a Textual worker and left
+  the UI silent. `normalize_server` never read `parsed.port` and never checked
+  the normalized URL against httpx, so `https://host:abc/…` (or a control
+  character / non-IDNA host) was saved to the profile and then raised an
+  uncaught `httpx.InvalidURL` — which is not a `RequestError` — on the first
+  request. `Feed.parse` raised `TypeError` for a non-object payload while
+  `API.feed` caught only `ValueError`, and `math.isfinite` overflowed on
+  arbitrary-precision JSON integers; both escaped the refresh worker.
+- Fixes: `normalize_server` validates the port and requires `httpx.URL` to
+  parse the normalized URL; `API.request` catches `httpx.InvalidURL` as a
+  backstop; `Feed.parse` raises `ValueError` for every invalid payload
+  (non-object, boolean or unrepresentable `rank_score`) and `API.feed`
+  catches `(TypeError, ValueError)`. `clients/tui` gained a `hypothesis` dev
+  dependency; new `tests/test_boundaries.py` holds two properties (`Feed.parse`
+  is total over JSON; every accepted server URL is requestable and
+  normalization is idempotent) plus explicit regressions. The server-side
+  `tests/test_feed_api.py` now runs `Feed.parse` over the ready, stale and
+  empty `/api/feed` payloads to pin the shared wire contract.
+- Validation: client 56 passed / 1 Windows-only skip (boundary file 16 passed;
+  a standalone copy outside the workspace with fresh deps also green). Backend
+  769 passed with one load-sensitive `test_reddit_fetch_queue` spread-timing
+  flake that passes in isolation; ruff, format, ty and `uv lock --check` clean.
+
 ## 2026-09-17 — TUI: vote toast removed, restrained color accents
 
 Per user request: votes no longer fire a `notify()` toast — the status-line
