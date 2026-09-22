@@ -18,10 +18,13 @@
   The 2026-09-22 boundary hardening is in: deployment URLs must parse with
   httpx (ports, unprintable and non-IDNA hosts) and `Feed.parse` raises only
   `ValueError` for invalid payloads, covered by Hypothesis properties and
-  server-side parity assertions in `tests/test_feed_api.py`.
+  server-side parity assertions in `tests/test_feed_api.py`. The reader also
+  prefetches the next stories' summaries one at a time and caches them for the
+  session (`--prefetch N`, default 2, 0 disables), pausing on rate limits and
+  never caching stale/partial responses.
 - Verification: backend 769 passed plus one load-sensitive
   `test_reddit_fetch_queue` spread-timing flake that passes in isolation
-  (full-suite run with `-n 2` on a loaded host); client 56 passed /
+  (full-suite run with `-n 2` on a loaded host); client 62 passed /
   1 Windows-only skip; Ruff, format, ty and `uv lock --check` clean. Offline SVG renders inspected;
   native terminal sessions at 145×38 and 80×30 exercised filters, reading,
   voting/undo, help, empty and failure states; the Textual pilot measured 8/8

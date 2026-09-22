@@ -747,5 +747,7 @@ feed payloads raise `ValueError` inside the API error path instead of escaping
 a worker. Requests stay on one normalized deployment URL and never follow
 redirects; summary workers debounce selections by 300 ms and reject late
 results; feedback is serialized and never automatically retried, and the latest
-successful vote can be cleared. See
+successful vote can be cleared. Summaries are cached per session and the next
+few stories are prefetched sequentially after the selected one settles, with
+provisional responses excluded from the cache. See
 [terminal release instructions](docs/TUI_RELEASE.md).

@@ -258,7 +258,7 @@ async def test_stale_poll_does_not_cancel_summary_for_same_selection() -> None:
     fake = FakeServer()
     fake.feed = sample_feed(0, 1)
     fake.delay_summary = 1.4
-    app = Reader(api=fake.api())
+    app = Reader(api=fake.api(), prefetch=0)
     async with app.run_test(size=(120, 35)) as pilot:
         await pilot.pause(2.1)
         assert "Summary 1" in app.query_one(Markdown)._markdown

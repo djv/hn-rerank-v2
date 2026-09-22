@@ -12,6 +12,12 @@ when the summary overflows its pane (the footer hint appears only then);
 Escape leaves it or closes help. Use the sort and age selectors to change
 filters. Below 100 columns the headline list stacks above the summary.
 
+Summaries are cached for the session and the next stories in the list are
+prefetched one at a time after the selected summary settles, so j/k navigation
+is instant. The default is two stories ahead; `--prefetch N` changes that and
+`--prefetch 0` disables it. Speculative requests pause on rate limits, and
+stale or partial responses are shown but never cached.
+
 Configuration lives in platformdirs' user config directory (`hn-rerank/profile.json`),
 outside uv's cache. The profile token is a credential: keep that file and profile links private.
 Requests do not follow redirects or retry ambiguous votes. Refresh after a connection failure;

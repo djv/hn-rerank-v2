@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 import webbrowser
+from collections import deque
 from pathlib import Path
 from typing import ClassVar
 from urllib.parse import urlsplit
@@ -41,6 +42,9 @@ from .models import Feed, FeedStory
 
 # Hacker News launched in 2006; earlier timestamps are missing or placeholder data.
 EARLIEST_STORY_TIME = 1_136_073_600
+
+# Pause speculative prefetch after any API error; foreground taps keep priority.
+PREFETCH_COOLDOWN_SECONDS = 60.0
 
 
 def story_age(story: FeedStory) -> str:
@@ -279,6 +283,7 @@ class Reader(App[None]):
         server: str | None = None,
         config_path: Path | None = None,
         api: API | None = None,
+        prefetch: int = 2,
     ) -> None:
         super().__init__()
         self.register_theme(
@@ -325,6 +330,13 @@ class Reader(App[None]):
         self.setting_up = False
         self.status_mode = "context"
         self.last_error: str | None = None
+        self.prefetch = max(0, prefetch)
+        self.summaries: dict[int, str] = {}
+        self.prefetching: set[int] = set()
+        self.prefetch_queue: deque[int] = deque()
+        self.prefetch_retry_at: dict[int, float] = {}
+        self.prefetch_active = False
+        self.prefetch_cooldown_until = 0.0
 
     def compose(self) -> ComposeResult:
         yield Static("HN Rerank", id="brand")
@@ -444,6 +456,7 @@ class Reader(App[None]):
         self.summary_story_id = None
         self.selection_serial += 1
         self.workers.cancel_group(self, "summary")
+        self.workers.cancel_group(self, "prefetch")
         self.workers.cancel_group(self, "refresh")
         self.workers.cancel_group(self, "vote")
         self.pending = False
@@ -460,6 +473,12 @@ class Reader(App[None]):
         self.rated.clear()
         self.restored.clear()
         self.history.clear()
+        self.summaries.clear()
+        self.prefetch_queue.clear()
+        self.prefetching.clear()
+        self.prefetch_retry_at.clear()
+        self.prefetch_cooldown_until = 0.0
+        self.workers.cancel_group(self, "prefetch")
         self.target = None
         self.help_open = False
         self.summary_story_id = None
@@ -555,11 +574,16 @@ class Reader(App[None]):
             return
         if story and story.id != self.summary_story_id:
             self.query_one("#story-heading", Static).update(headline(story))
-            self.query_one("#summary", Markdown).update("Loading summary…")
-            self.query_one("#summary", Markdown).scroll_home(animate=False)
             self.summary_story_id = story.id
             self.selection_serial += 1
-            self.load_summary(story.id, self.selection_serial)
+            cached = self.summaries.get(story.id)
+            if cached is not None:
+                self.query_one("#summary", Markdown).update(cached)
+                self.schedule_prefetch()
+            else:
+                self.query_one("#summary", Markdown).update("Loading summary…")
+                self.load_summary(story.id, self.selection_serial)
+            self.query_one("#summary", Markdown).scroll_home(animate=False)
             self.schedule_read_state()
 
     @work(group="summary", exclusive=True)
@@ -576,8 +600,11 @@ class Reader(App[None]):
         try:
             summary = await self.api.summary(story_id)
             if serial == self.selection_serial and self.query("#summary"):
-                self.query_one("#summary", Markdown).update(summary)
+                if not summary.provisional:
+                    self.summaries[story_id] = summary.text
+                self.query_one("#summary", Markdown).update(summary.text)
                 self.schedule_read_state()
+                self.schedule_prefetch()
         except InvalidProfile as exc:
             self.setup(str(exc))
         except APIError as exc:
@@ -587,6 +614,86 @@ class Reader(App[None]):
                 )
                 self.schedule_read_state()
                 self.status(str(exc) + " Press r to retry.", error=True)
+
+    def schedule_prefetch(self) -> None:
+        """Queue the stories just after the selection for a background warm.
+
+        Speculative work stays conservative: only stories ahead in the current
+        filter, never the selected one, and the queue is rebuilt on every
+        selection so an abandoned neighborhood is dropped. Foreground summary
+        taps always go first, and any error pauses the whole chain.
+        """
+        if self.prefetch <= 0 or not self.api or self.setting_up:
+            return
+        if time.monotonic() < self.prefetch_cooldown_until:
+            return
+        story = self.selected()
+        if story is None:
+            return
+        index = next(
+            (i for i, item in enumerate(self.stories) if item.id == story.id), None
+        )
+        if index is None:
+            return
+        now = time.monotonic()
+        self.prefetch_queue = deque(
+            item.id
+            for item in self.stories[index + 1 : index + 1 + self.prefetch]
+            if item.id not in self.summaries
+            and item.id not in self.prefetching
+            and self.prefetch_retry_at.get(item.id, 0.0) <= now
+        )
+        self.start_prefetch()
+
+    def start_prefetch(self) -> None:
+        if (
+            self.prefetch_active
+            or not self.prefetch_queue
+            or self.setting_up
+            or not self.is_mounted
+        ):
+            return
+        self.prefetch_active = True
+        self.prefetch_summaries()
+
+    @work(group="prefetch")
+    async def prefetch_summaries(self) -> None:
+        try:
+            while self.prefetch_queue and self.api is not None:
+                story_id = self.prefetch_queue.popleft()
+                if story_id in self.summaries or story_id in self.prefetching:
+                    continue
+                self.prefetching.add(story_id)
+                try:
+                    summary = await self.api.summary(story_id)
+                except InvalidProfile:
+                    self.prefetch_queue.clear()
+                    return
+                except APIError:
+                    # Speculative work must not fight a rate limit or provider
+                    # cooldown; pause the chain and let foreground taps win.
+                    self.prefetch_cooldown_until = (
+                        time.monotonic() + PREFETCH_COOLDOWN_SECONDS
+                    )
+                    return
+                finally:
+                    self.prefetching.discard(story_id)
+                if summary.provisional:
+                    # Not cacheable, and not worth retrying on every rebuild.
+                    self.prefetch_retry_at[story_id] = (
+                        time.monotonic() + PREFETCH_COOLDOWN_SECONDS
+                    )
+                else:
+                    self.summaries[story_id] = summary.text
+        finally:
+            self.prefetch_active = False
+            if (
+                self.prefetch_queue
+                and not self.setting_up
+                and self.is_mounted
+                and time.monotonic() >= self.prefetch_cooldown_until
+            ):
+                self.start_prefetch()
 
     @work(group="refresh", exclusive=True)
     async def refresh_feed(self) -> None:
@@ -633,6 +740,11 @@ class Reader(App[None]):
     def action_refresh(self) -> None:
         self.help_open = False
         self.summary_story_id = None
+        self.summaries.clear()
+        self.prefetch_queue.clear()
+        self.prefetch_retry_at.clear()
+        self.prefetch_cooldown_until = 0.0
+        self.workers.cancel_group(self, "prefetch")
         self.refresh_feed()
 
     def action_move(self, delta: int) -> None:

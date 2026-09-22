@@ -22,6 +22,18 @@ class InvalidProfile(APIError):
     pass
 
 
+@dataclass(frozen=True)
+class Summary:
+    """Summary text plus whether the server marked it provisional.
+
+    Provisional responses (a stale fallback or a retryable partial) are shown
+    but must not be cached: a later attempt may produce a complete summary.
+    """
+
+    text: str
+    provisional: bool = False
+
+
 def normalize_server(value: str) -> str:
     if not isinstance(value, str):
         raise TypeError("Invalid server URL.")
@@ -230,15 +242,19 @@ class API:
                 "Invalid feed response. Check the server API version."
             ) from exc
 
-    async def summary(self, story_id: int) -> str:
+    async def summary(self, story_id: int) -> Summary:
         response = await self.request(
             "POST", "api/tldr-detail", json={"story_id": story_id}
         )
         try:
-            value = response.json()["tldr"]
+            data = response.json()
+            value = data["tldr"]
             if not isinstance(value, str):
                 raise TypeError("Invalid summary")
-            return value
+            return Summary(
+                value,
+                provisional=data.get("stale") is True or data.get("retryable") is True,
+            )
         except (KeyError, TypeError, ValueError) as exc:
             raise APIError(
                 "Summary unavailable. Select another story or refresh."

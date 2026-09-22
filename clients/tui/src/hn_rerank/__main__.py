@@ -13,10 +13,19 @@ def main() -> None:
         "--server",
         help="Server URL, including deployment prefix (for example https://host/hn/)",
     )
+    parser.add_argument(
+        "--prefetch",
+        type=int,
+        default=2,
+        metavar="N",
+        help="Prefetch summaries for the next N stories in the list (0 disables).",
+    )
     parser.add_argument("--version", action="version", version="hn-rerank 0.1.0")
     args = parser.parse_args()
+    if args.prefetch < 0:
+        parser.error("--prefetch must be 0 or greater")
     try:
-        app = Reader(server=args.server)
+        app = Reader(server=args.server, prefetch=args.prefetch)
     except ValueError as exc:
         parser.error(str(exc))
     app.run()

@@ -1,5 +1,24 @@
 # Worklog: hn-rewrite
 
+## 2026-09-22 — TUI: prefetch nearby summaries
+
+- The terminal reader now warms summaries ahead of the selection. The selected
+  story's summary is fetched first; once it settles, the next `--prefetch N`
+  stories in the current filter are fetched one at a time (default 2, 0
+  disables) and cached client-side, so `j`/`k` navigation renders instantly and
+  revisiting a story costs no request. The queue is rebuilt on every selection,
+  so an abandoned neighborhood is dropped instead of burning quota.
+- Mirrors the web dashboard's guardrails: requests are chained sequentially
+  (never parallel), any API error pauses the whole chain for 60 s so foreground
+  taps keep priority, and provisional responses (`stale` or `retryable`) are
+  displayed but never cached or re-queued for 60 s, so a later attempt can
+  replace them.
+- `API.summary` now returns a `Summary(text, provisional)` model instead of a
+  bare string; `r` clears the session cache and cancels in-flight prefetches.
+- Validation: client 62 passed / 1 Windows-only skip (new `test_prefetch.py`
+  covers ordering, cache-on-revisit, `--prefetch 0`, rate-limit stop, stale
+  non-caching, refresh invalidation and CLI parsing); Ruff, format and ty clean.
+
 ## 2026-09-22 — TUI boundary hardening: unrequestable URLs and feed parsing
 
 - Review of `clients/tui` found two paths where validation accepted input the
