@@ -30,6 +30,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from database import Database, Story  # noqa: E402
+from pipeline.embedding_sections import (  # noqa: E402
+    SECTION_LAYOUT_VERSION,
+    section_texts,
+    pool_sections,
+)
 from pipeline import (  # noqa: E402
     Config,
     DEFAULT_ONNX_MODEL_DIR,
@@ -134,6 +139,7 @@ def _encode(
     pooling: Pooling,
     max_tokens: int,
     batch_size: int,
+    reject_truncation: bool = False,
 ) -> tuple[NDArray[np.float32], float]:
     tokenizer: Any = AutoTokenizer.from_pretrained(tokenizer_dir)
     session = ort.InferenceSession(
@@ -145,6 +151,14 @@ def _encode(
     chunks: list[NDArray[np.float32]] = []
     started = time.perf_counter()
     for start in range(0, len(texts), batch_size):
+        if reject_truncation:
+            lengths = tokenizer(texts[start : start + batch_size], truncation=False)[
+                "input_ids"
+            ]
+            if any(len(ids) > max_tokens for ids in lengths):
+                raise ValueError(
+                    "Full-body chunk exceeds token budget; reduce chunk size instead of truncating"
+                )
         inputs = tokenizer(
             texts[start : start + batch_size],
             padding=True,
@@ -289,6 +303,7 @@ def main() -> None:
         default=256,
     )
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--layout", choices=("leading", "full-body"), default="leading")
     parser.add_argument(
         "--max-candidates",
         type=int,
@@ -357,7 +372,14 @@ def main() -> None:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     all_stories = list({s.id: s for s in stories + feedback_stories}.values())
-    texts = [story_embedding_text(story) for story in all_stories]
+    grouped_texts = [
+        section_texts(story)
+        if args.layout == "full-body"
+        else [story_embedding_text(story)]
+        for story in all_stories
+    ]
+    texts = [text for group in grouped_texts for text in group]
+    offsets = np.cumsum([0] + [len(group) for group in grouped_texts])
     all_index = {s.id: i for i, s in enumerate(all_stories)}
     story_ids = np.array([story.id for story in stories], dtype=np.int64)
     text_hashes = _embedding_text_hashes(stories)
@@ -368,6 +390,8 @@ def main() -> None:
     report: dict[str, object] = {
         "user_id": user_id,
         "candidate_count": len(stories),
+        "layout": args.layout,
+        "encoded_chunks": len(texts),
         "max_tokens": args.max_tokens,
         "batch_size": args.batch_size,
         "max_candidates": args.max_candidates,
@@ -381,7 +405,10 @@ def main() -> None:
 
     for name in args.models:
         spec = MODELS[name]
-        path = _snapshot_path(args.output_dir, name, args.max_tokens)
+        layout_name = (
+            f"{name}-{SECTION_LAYOUT_VERSION}" if args.layout == "full-body" else name
+        )
+        path = _snapshot_path(args.output_dir, layout_name, args.max_tokens)
         if not args.force and _snapshot_matches(
             path,
             stories,
@@ -403,13 +430,24 @@ def main() -> None:
             pooling=spec.pooling,
             max_tokens=args.max_tokens,
             batch_size=args.batch_size,
+            reject_truncation=args.layout == "full-body",
         )
+        if args.layout == "full-body":
+            embeddings = np.stack(
+                [
+                    pool_sections(embeddings[offsets[i] : offsets[i + 1]])
+                    for i in range(len(all_stories))
+                ]
+            )
         if embeddings.shape != (len(all_stories), 384):
             raise RuntimeError(
                 f"{name} emitted {embeddings.shape}; this bakeoff only supports 384 dimensions"
             )
         np.savez_compressed(
             path,
+            layout=np.array(
+                SECTION_LAYOUT_VERSION if args.layout == "full-body" else "leading"
+            ),
             story_ids=story_ids,
             text_hashes=text_hashes,
             embeddings=embeddings[[all_index[s.id] for s in stories]],
@@ -444,7 +482,9 @@ def main() -> None:
         model_results.append(result)
         print(json.dumps(result, sort_keys=True))
 
-    report_path = args.output_dir / f"bakeoff-tokens{args.max_tokens}.json"
+    report_path = (
+        args.output_dir / f"bakeoff-{args.layout}-tokens{args.max_tokens}.json"
+    )
     report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(f"wrote {report_path}")
 
