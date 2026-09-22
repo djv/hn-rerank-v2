@@ -1,5 +1,14 @@
 # Worklog: hn-rewrite
 
+## 2026-09-22 — Deployed TUI badge emoji, verified live
+
+- Pushed `8155162` (plus stacked `f451bd7` experiment and `224055c` status
+  update) to `origin/main`; VPS fast-forwarded cleanly, named stash
+  `pre-f03c34e-deploy-identical-detail-v12` preserved, service restarted.
+- Live: dashboard 200, `/api/feed` 200 with 68 stories, 25 carrying badges
+  (hot/top/talk icons confirmed in payload); bounded error-level journal
+  scan clean. Terminal headlines show the icons after the next feed refresh.
+
 ## 2026-09-22 — TUI headlines show badge emoji
 
 - `/api/feed` story entries now carry `badges` (card badge icons in display
