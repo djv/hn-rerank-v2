@@ -31,11 +31,13 @@ Full-body embedding work remains deferred.
 
 ## Workspace / evidence
 
-- Local uncommitted documentation records confirmation and cleanup:
-  `FINDINGS.md`, `WORKLOG.md`, `STATUS.md`, and this save's status archive.
-- Deferred uncommitted embedding WIP, not deployed:
+- Confirmation and cleanup documentation committed and pushed (`45857de`):
+  `FINDINGS.md`, `WORKLOG.md`, `STATUS.md`, plus the status archive.
+- Full-body embedding experiment committed (`f451bd7`), still not deployed:
   `pipeline/embedding_sections.py`, `scripts/bakeoff_embedding_models.py`,
-  `tests/test_embedding_sections.py`. Preserve; do not accidentally stage.
+  `tests/test_embedding_sections.py`. Offline bakeoff use only; the live
+  ranking path does not import it. Test-suite speedup (~37s to ~23.5s at
+  `-n 4` with `HN_ONNX_MODEL_DIR` set) committed in `ff8eaaf`.
 - Detailed evidence/report paths: `FINDINGS.md`. Previous status archived in
   `docs/status-archive/2026-09-22-before-final-save.md`.
 - Remote pre-deploy TLDR patch remains safely preserved in named stash
@@ -45,5 +47,6 @@ Full-body embedding work remains deferred.
 
 No operational blocker. Stop here unless asked to continue. Any new ranking
 experiment needs a fresh evidence plan or future feedback, not repeated
-confirmation tuning. Documentation changes above are not yet committed.
-Separate existing project blocker: PyPI publication needs credentials.
+confirmation tuning. `45857de` and `ff8eaaf` are pushed to `origin/main`;
+`f451bd7` (embedding experiment) remains local-only. Separate existing
+project blocker: PyPI publication needs credentials.
