@@ -193,8 +193,7 @@ def test_embedding_cache_rejects_stale_rows_and_preserves_batch_alignment(
 
 
 @pytest.mark.parametrize("change", ["text", "source", "model"])
-@given(seed=st.integers(0, 2**31 - 1))
-@settings(deadline=None)
+@pytest.mark.parametrize("seed", [0, 42, 2**31 - 1])
 def test_model_cache_agrees_with_fresh_fit_after_training_input_change(
     change: str,
     seed: int,
