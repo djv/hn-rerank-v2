@@ -4,7 +4,7 @@ import json
 import os
 import subprocess
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from urllib.parse import unquote, urlsplit, urlunsplit
 
@@ -12,6 +12,21 @@ import httpx
 from platformdirs import user_config_path
 
 from .models import Feed
+
+
+@dataclass(frozen=True)
+class Impression:
+    event_id: str
+    client_session_id: str
+    story_id: int
+    dashboard_version: int
+    position: int
+    sort_mode: str
+    age_filter: str
+    occurred_at: float
+    event_type: str = "impression"
+    source_filter: str = "mixed"
+    ranker_arm: str = "tui_observed"
 
 
 class APIError(Exception):
@@ -259,6 +274,9 @@ class API:
             raise APIError(
                 "Summary unavailable. Select another story or refresh."
             ) from exc
+
+    async def impression(self, event: Impression) -> None:
+        await self.request("POST", "api/interaction", json={"events": [asdict(event)]})
 
     async def vote(self, story_id: int, action: str) -> int:
         response = await self.request(

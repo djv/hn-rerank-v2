@@ -18,6 +18,13 @@ is instant. The default is two stories ahead; `--prefetch N` changes that and
 `--prefetch 0` disables it. Speculative requests pause on rate limits, and
 stale or partial responses are shown but never cached.
 
+Selected-story transitions that remain selected for at least one second send
+best-effort impression events to your configured server's existing interaction
+ledger: story ID, zero-based list position, filters, feed version, time and a
+random session ID. Prefetches do not count; failures never block reading.
+This measures selection, not attention or terminal-window visibility. Events
+are not sent to a separate analytics service and are not retried.
+
 Configuration lives in platformdirs' user config directory (`hn-rerank/profile.json`),
 outside uv's cache. The profile token is a credential: keep that file and profile links private.
 Requests do not follow redirects or retry ambiguous votes. Refresh after a connection failure;

@@ -5148,6 +5148,50 @@ async def test_call_llm_responses_success_and_429(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "article_chars,comment_chars",
+    [(24_067, 0), (0, 24_000), (24_067, 13_000), (5_000, 24_000)],
+)
+async def test_generated_tldr_preserves_scaled_bullet_allowance(
+    monkeypatch: pytest.MonkeyPatch, article_chars: int, comment_chars: int
+) -> None:
+    import server
+
+    async def fake_call(
+        cfg: server.LlmProviderConfig,
+        *,
+        prompt: str,
+        max_tokens: int,
+        on_usage: server.LlmUsageRecorder | None = None,
+    ) -> server.LlmChatResult:
+        return server.LlmChatResult(
+            ok=True, content="\n".join(f"- Topic {i}" for i in range(1, 10))
+        )
+
+    monkeypatch.setenv("LLM_PROVIDER", "mistral")
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setattr(server, "_call_llm_for_config", fake_call)
+    result = await server.generate_detailed_tldr(
+        "Newsletter",
+        article_body="a" * article_chars,
+        top_comments="c" * comment_chars,
+    )
+    assert result.kind == "ok"
+    assert result.cacheable
+    sections = [part for part in result.tldr.split("### ") if part.strip()]
+    expected = [
+        8 if size >= 20_000 else 6 if size >= 12_000 else 4
+        for size in (article_chars, comment_chars)
+        if size
+    ]
+    assert len(sections) == len(expected)
+    for section, count in zip(sections, expected, strict=True):
+        assert section.count("- Topic ") == count
+        assert f"- Topic {count}" in section
+        assert f"- Topic {count + 1}" not in section
+
+
+@pytest.mark.asyncio
 async def test_generate_detailed_tldr_scales_combined_path_budgets(monkeypatch):
     """The combined article+comments path must inject volume-scaled budgets
     into both halves rather than staying fixed-length regardless of input

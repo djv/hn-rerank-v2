@@ -192,6 +192,42 @@ def test_make_fold_removes_training_feedback_but_keeps_held_out() -> None:
     assert [story.id for story in fold.test_stories] == [3]
 
 
+@pytest.mark.parametrize("judged_only", [False, True])
+def test_fold_groups_crossposts_and_replay_keeps_all_test_classes(
+    judged_only: bool,
+) -> None:
+    from dataclasses import replace
+    from scripts.eval_ranker_variants import _make_fold
+
+    rows = [_eval_story(i) for i in range(1, 8)]
+    original_url = rows[0].url
+    assert original_url is not None
+    rows[1] = replace(rows[1], url=original_url + "?utm_source=other")
+    rows[3] = replace(rows[3], url=rows[2].url)
+    emb = np.eye(7, 384, dtype=np.float32)
+    fold = _make_fold(
+        rows,
+        emb,
+        rows,
+        np.arange(7),
+        np.arange(7, dtype=float),
+        np.array([2, 2, 0, 2, 1, 2, 0]),
+        np.arange(7),
+        np.array([0]),
+        np.array([1, 2, 3, 4, 5]),
+        Config(),
+        feedback_embeddings=emb,
+        needs_experimental=False,
+        judged_only=judged_only,
+    )
+    assert [s.id for s in fold.test_stories] == [3, 5, 6]
+    assert fold.test_actions.tolist() == [0, 1, 2]
+    assert [s.id for s in fold.candidates] == (
+        [3, 5, 6] if judged_only else [3, 5, 6, 7]
+    )
+    np.testing.assert_array_equal(fold.cand_emb[0], emb[2])
+
+
 def _metric_fold(test_ids: list[int], test_actions: list[int]):
     from scripts.eval_ranker_variants import FoldData
 

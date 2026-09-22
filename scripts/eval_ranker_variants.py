@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 from database import Database, Story
+from dedup import normalize_url
 from pipeline import (
     Config,
     Embedder,
@@ -988,8 +989,15 @@ def _metrics(
             "p75_rank": float(np.percentile(ranks, 75)) if ranks else None,
             "brier_up": None,
         }
-        for k in (12, 40, 100, 200):
+        for k in (10, 12, 40, 100, 200):
             ideal = sum(1 / math.log2(i + 2) for i in range(min(n_up, k)))
+            result[f"random_expected_ndcg_at_{k}"] = (
+                (n_up / len(eligible))
+                * sum(1 / math.log2(i + 2) for i in range(min(k, len(ids))))
+                / ideal
+                if ideal and eligible
+                else None
+            )
             result[f"ndcg_at_{k}"] = (
                 sum(1 / math.log2(p + 2) for p in ranks if p < k) / ideal
                 if ideal
@@ -1073,11 +1081,40 @@ def _make_fold(
     *,
     feedback_embeddings: np.ndarray | None = None,
     needs_experimental: bool = True,
+    judged_only: bool = False,
 ) -> FoldData:
     train_story_indices = valid_positions[train_pos]
     test_story_indices = valid_positions[test_pos]
-    train_ids = {fb_stories[idx].id for idx in train_story_indices}
-    cand_mask = np.array([s.id not in train_ids for s in candidates], dtype=bool)
+
+    def group_key(story: Story) -> str:
+        return str(normalize_url(story.url) or f"story:{story.id}")
+
+    # Keep the first held-out vote per article; never evaluate a cross-post of
+    # an article already present in training. Identity matches production URL
+    # normalization, including tracking-parameter removal.
+    train_groups = {group_key(fb_stories[idx]) for idx in train_story_indices}
+    seen_groups = set(train_groups)
+    keep_test = []
+    for position in sorted(
+        test_pos, key=lambda p: (fb_vote_times[p], fb_stories[valid_positions[p]].id)
+    ):
+        key = group_key(fb_stories[valid_positions[position]])
+        if key not in seen_groups:
+            keep_test.append(position)
+            seen_groups.add(key)
+    test_pos = np.asarray(keep_test, dtype=int)
+    test_story_indices = valid_positions[test_pos]
+    test_ids = {fb_stories[idx].id for idx in test_story_indices}
+    # Deduplicate candidate articles too, preferring the held-out story ID so
+    # an equivalent unjudged cross-post cannot hide a judged item.
+    retained: set[int] = set()
+    seen_candidates = set(train_groups)
+    for item in sorted(candidates, key=lambda s: (s.id not in test_ids, s.id)):
+        key = group_key(item)
+        if key not in seen_candidates and (not judged_only or item.id in test_ids):
+            retained.add(item.id)
+            seen_candidates.add(key)
+    cand_mask = np.array([s.id in retained for s in candidates], dtype=bool)
     fold_candidates = [s for i, s in enumerate(candidates) if cand_mask[i]]
     fold_cand_emb = cand_emb[cand_mask]
 
@@ -1266,6 +1303,18 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
     parser.add_argument("--user-id", type=int)
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument(
+        "--leak-seeds",
+        type=int,
+        default=5,
+        help="Number of independent label permutations with --leak-check",
+    )
+    parser.add_argument(
+        "--candidate-pool",
+        choices=("current", "heldout-feedback"),
+        default="current",
+        help="Current production pool or judged-only retrospective replay of each held-out block; not comparable metrics.",
+    )
+    parser.add_argument(
         "--split",
         choices=("temporal", "stratified"),
         default="temporal",
@@ -1302,9 +1351,9 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
         help=(
             "After running the normal variant suite, run it again with "
             "y (labels) shuffled (fixed seed). A trustworthy harness should "
-            "see shuffled NDCG@40 drop to random baseline (~0.10 for "
-            "n_test=80/n_cand=7000). High shuffled values indicate data "
-            "leakage in the offline harness."
+            "compare shuffled scores to the pool's relevance prevalence, "
+            "not a fixed threshold (judged-only replay has many positives). "
+            "Elevated shuffled scores require investigation or more seeds."
         ),
     )
     parser.add_argument(
@@ -1331,7 +1380,13 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
         value = getattr(args, option)
         if value is not None and (not math.isfinite(value) or value <= 0):
             parser.error(f"--{option.replace('_', '-')} must be finite and positive")
-    for option in ("folds", "max_candidates", "max_feedback_per_class", "window_days"):
+    for option in (
+        "folds",
+        "leak_seeds",
+        "max_candidates",
+        "max_feedback_per_class",
+        "window_days",
+    ):
         value = getattr(args, option)
         if value is not None and value <= 0:
             parser.error(f"--{option.replace('_', '-')} must be positive")
@@ -1435,14 +1490,34 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
         parser.error(
             "--max-candidates cannot change a frozen embedding snapshot; cap it at bakeoff creation"
         )
-    candidates, cand_emb = _load_production_candidates(
-        db,
-        eval_config,
-        user.id,
-        embeddings_file=args.embeddings_file,
-        max_candidates=args.max_candidates,
-        required_story_ids={s.id for s in fb_stories},
-    )
+    if args.candidate_pool == "heldout-feedback":
+        if args.embeddings_file or args.max_candidates:
+            parser.error(
+                "heldout-feedback cannot use embedding snapshots or candidate caps"
+            )
+        candidates = list(fb_stories)
+        hashes = dict(
+            zip(
+                [s.id for s in candidates],
+                _embedding_text_hashes(candidates),
+                strict=True,
+            )
+        )
+        cand_emb = _validated_embeddings(
+            candidates,
+            db.get_embeddings_batch(
+                [s.id for s in candidates], config.embedding_model_version, hashes
+            ),
+        )
+    else:
+        candidates, cand_emb = _load_production_candidates(
+            db,
+            eval_config,
+            user.id,
+            embeddings_file=args.embeddings_file,
+            max_candidates=args.max_candidates,
+            required_story_ids={s.id for s in fb_stories},
+        )
     cand_id_to_idx = {s.id: i for i, s in enumerate(candidates)}
     fb_to_cand = np.array([cand_id_to_idx.get(s.id, -1) for s in fb_stories])
 
@@ -1493,13 +1568,45 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
         }
 
     print(
-        f"user={user.token} candidates={len(candidates)} "
+        f"user_id={user.id} candidates={len(candidates)} "
         f"valid_feedback={len(y)} labels={Counter(y)}"
     )
     print(f"candidate_recall={candidate_recall}")
 
     variants = {
         "production": lambda fold: _production_scores(fold, production_config, db),
+        "deduplicated": lambda fold: _production_scores(
+            fold,
+            replace(
+                production_config,
+                model=replace(
+                    production_config.model, deduplicate_training_feedback=True
+                ),
+            ),
+            db,
+        ),
+        "deduplicated_publication": lambda fold: _production_scores(
+            fold,
+            replace(
+                production_config,
+                model=replace(
+                    production_config.model,
+                    deduplicate_training_feedback=True,
+                    publication_affinity_enabled=True,
+                ),
+            ),
+            db,
+        ),
+        "publication_affinity": lambda fold: _production_scores(
+            fold,
+            replace(
+                production_config,
+                model=replace(
+                    production_config.model, publication_affinity_enabled=True
+                ),
+            ),
+            db,
+        ),
         "margin3_up": lambda fold: _scores_margin_3class(fold, config),
         "linear_svc_up": lambda fold: _scores_linear_svc_up(fold, config),
         "logreg_up": lambda fold: _scores_logreg_up(fold, config),
@@ -1576,10 +1683,16 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
     )
 
     baselines = {
+        "random": lambda fold: (
+            np.random.default_rng(0).random(len(fold.candidates)),
+            None,
+        ),
         "candidate_order": lambda fold: _scores_candidate_order(fold),
         "gravity": lambda fold: _scores_gravity(fold),
         "centroid_up_minus_down": lambda fold: _scores_centroid_up_minus_down(fold),
     }
+
+    fold_audit: list[dict[str, int]] = []
 
     def _run_scorers(
         scorers: dict[str, Any],
@@ -1605,11 +1718,21 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
                 split.test_pos,
                 config,
                 feedback_embeddings=feedback_embeddings,
+                judged_only=args.candidate_pool == "heldout-feedback",
                 needs_experimental=any(
                     name != "production" and not name.startswith("svm_")
                     for name in variants
                 ),
             )
+            if not label:
+                fold_audit.append(
+                    {
+                        "fold": split.fold_no,
+                        "test_rows_before_group_isolation": len(split.test_pos),
+                        "test_rows_after_group_isolation": len(fold.test_stories),
+                        "candidate_rows_after_group_isolation": len(fold.candidates),
+                    }
+                )
             with _fold_database(fold, config, db) as fold_db:
                 fold = replace(fold, runtime_db=fold_db)
                 with _reuse_preprocessing():
@@ -1624,8 +1747,7 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
                                 config,
                                 probs,
                                 source_db=db,
-                                calibration_available=name != "production"
-                                and not name.startswith("svm_"),
+                                calibration_available=name == "logreg_up",
                             )
                         )
             print(f"{label}fold {split.fold_no}/{len(splits)} done")
@@ -1636,17 +1758,16 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
     baseline_results = {name: combined[name] for name in baselines}
 
     report: dict[str, Any] = {
-        "schema_version": 2,
-        "interpretation": "Recovery of known held-out feedback on a current snapshot; unknown relevance is unjudged. Feedback updated_at approximates chronology with rare corrections. No historical content or candidate snapshots; not causal reading-quality estimates. Confirmation is reusable historical evidence.",
+        "schema_version": 4,
+        "interpretation": "Retrospective recovery of held-out feedback using current stored content; not historical exposure or causal reading-quality evaluation. heldout-feedback is judged-only discrimination, with higher positive density: do not compare its metrics to current-pool results. URL groups are isolated from training and deduplicated in test/candidates; semantic duplicates may remain. Feedback updated_at approximates chronology. Confirmation is reusable historical evidence.",
         "relevance": {"up": 1, "neutral": 0, "down": 0},
         "variation": "std is fold variation, not uncertainty of a causal estimate",
         "config": {
             "split": split_label,
             "split_mode": args.split,
             "temporal_initial_train_frac": 0.5 if args.split == "temporal" else None,
-            "candidate_loader": "production_legs",
+            "candidate_loader": args.candidate_pool,
             "window_days": window_days,
-            "user_token": user.token,
             "user_id": user.id,
             "n_candidates": len(candidates),
             "n_feedback_valid": len(y),
@@ -1709,32 +1830,48 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
         del report["config"]["temporal_initial_train_frac"]
     report["variants"] = _aggregate_results(results)
     report["baselines"] = _aggregate_results(baseline_results)
+    report["group_isolation"] = fold_audit
+    report["coverage_warnings"] = {
+        name: {
+            lane: [
+                i + 1
+                for i, row in enumerate(rows)
+                if row[lane]["eligible_positives"] < 10
+                or row[lane]["judged_cards"] < 20
+            ]
+            for lane in rows[0]
+        }
+        for name, rows in results.items()
+    }
+    # Listed folds lack even ten positives/twenty judged cards; absence of a
+    # warning is not a statistical power guarantee. Never treat null as zero.
 
     if args.leak_check:
-        print(f"\n=== Leak check: shuffling y (n={len(y)}, seed=0) ===")
-        y_shuffled = np.random.default_rng(0).permutation(y)
-        _validate_splits(
-            splits,
-            y_shuffled,
-            split_mode=f"{split_label} leak-check",
-            required_train_labels=required_train_labels,
-        )
-        leak_combined = _run_scorers(
-            variants | baselines, y_shuffled, label="[leak-check] "
-        )
-        leak_results = {name: leak_combined[name] for name in variants}
-        leak_baseline_results = {name: leak_combined[name] for name in baselines}
-        report["leak_check"] = {
-            "config": {
-                "y_seed": 0,
-                "n_feedback_valid": len(y_shuffled),
-                "labels": {str(k): int(v) for k, v in Counter(y_shuffled).items()},
-            },
-            "variants": {},
-            "baselines": {},
-        }
-        report["leak_check"]["variants"] = _aggregate_results(leak_results)
-        report["leak_check"]["baselines"] = _aggregate_results(leak_baseline_results)
+        permutations = []
+        for seed in range(args.leak_seeds):
+            print(f"\n=== Leak check: shuffling y (n={len(y)}, seed={seed}) ===")
+            y_shuffled = np.random.default_rng(seed).permutation(y)
+            _validate_splits(
+                splits,
+                y_shuffled,
+                split_mode=f"{split_label} leak-check",
+                required_train_labels=required_train_labels,
+            )
+            leak_combined = _run_scorers(
+                variants | baselines, y_shuffled, label=f"[leak-check seed={seed}] "
+            )
+            permutations.append(
+                {
+                    "seed": seed,
+                    "variants": _aggregate_results(
+                        {name: leak_combined[name] for name in variants}
+                    ),
+                    "baselines": _aggregate_results(
+                        {name: leak_combined[name] for name in baselines}
+                    ),
+                }
+            )
+        report["leak_check"] = {"permutations": permutations}
 
     report["paired_differences_against_production"] = _paired_differences(combined)
     Path(args.output).write_text(json.dumps(report, indent=2, allow_nan=False))

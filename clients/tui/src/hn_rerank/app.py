@@ -7,6 +7,7 @@ from collections import deque
 from pathlib import Path
 from typing import ClassVar
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 from rich.text import Text
 from textual import events, work
@@ -32,6 +33,7 @@ from .api import (
     API,
     APIError,
     InvalidProfile,
+    Impression,
     Profile,
     load_profile,
     normalize_server,
@@ -322,6 +324,7 @@ class Reader(App[None]):
         self.pending = False
         self.target: int | None = None
         self.selection_serial = 0
+        self.interaction_session = str(uuid4())
         self.summary_story_id: int | None = None
         self.reading = False
         self.can_read = False
@@ -459,6 +462,7 @@ class Reader(App[None]):
         self.workers.cancel_group(self, "prefetch")
         self.workers.cancel_group(self, "refresh")
         self.workers.cancel_group(self, "vote")
+        self.workers.cancel_group(self, "impression")
         self.pending = False
         self.push_screen(Setup(self.config_path, self.server, message), self.connected)
 
@@ -469,6 +473,7 @@ class Reader(App[None]):
         if self.api:
             await self.api.close()
         self.api = API(profile.server, profile.token)
+        self.interaction_session = str(uuid4())
         self.feed = None
         self.rated.clear()
         self.restored.clear()
@@ -576,6 +581,20 @@ class Reader(App[None]):
             self.query_one("#story-heading", Static).update(headline(story))
             self.summary_story_id = story.id
             self.selection_serial += 1
+            if self.feed is not None:
+                self.record_impression(
+                    Impression(
+                        event_id=str(uuid4()),
+                        client_session_id=self.interaction_session,
+                        story_id=story.id,
+                        dashboard_version=self.feed.version,
+                        position=self.stories.index(story),
+                        sort_mode=str(self.query_one("#sort", Select).value),
+                        age_filter=str(self.query_one("#age", Select).value),
+                        occurred_at=time.time(),
+                    ),
+                    self.selection_serial,
+                )
             cached = self.summaries.get(story.id)
             if cached is not None:
                 self.query_one("#summary", Markdown).update(cached)
@@ -585,6 +604,32 @@ class Reader(App[None]):
                 self.load_summary(story.id, self.selection_serial)
             self.query_one("#summary", Markdown).scroll_home(animate=False)
             self.schedule_read_state()
+
+    @work(group="impression", exclusive=True)
+    async def record_impression(self, event: Impression, serial: int) -> None:
+        # Only a selected card visible for >=1s counts, not prefetched stories.
+        api = self.api
+        await asyncio.sleep(1.0)
+        selected = self.selected() if self.query("#headlines") else None
+        if (
+            api is None
+            or api is not self.api
+            or serial != self.selection_serial
+            or self.setting_up
+            or self.help_open
+            or selected is None
+            or selected.id != event.story_id
+            or self.feed is None
+            or self.feed.version != event.dashboard_version
+            or str(self.query_one("#sort", Select).value) != event.sort_mode
+            or str(self.query_one("#age", Select).value) != event.age_filter
+        ):
+            return
+        try:
+            await api.impression(event)
+        except APIError:
+            # Best effort; telemetry must never interrupt reading or voting.
+            pass
 
     @work(group="summary", exclusive=True)
     async def load_summary(self, story_id: int, serial: int) -> None:

@@ -144,7 +144,7 @@ _MODEL_CACHE: LRUCache[tuple[int, str, int], _CachedModel] = LRUCache(
     maxsize=_MODEL_CACHE_STORAGE_MAXSIZE
 )
 _MODEL_CACHE_LOCK = threading.Lock()
-_MODEL_SCHEMA_VERSION = 4  # +1 whenever model/feature schema changes (see ARCHITECTURE)
+_MODEL_SCHEMA_VERSION = 6  # +1 whenever model/feature schema changes (see ARCHITECTURE)
 
 
 @dataclass
@@ -1097,6 +1097,26 @@ def _score_and_rank(
         user_id=user_id
     )
 
+    if config.model.deduplicate_training_feedback:
+        from .feedback import deduplicate_feedback
+
+        feedback_stories, feedback_labels, _vote_times = deduplicate_feedback(
+            feedback_stories, feedback_labels, _vote_times
+        )
+
+    publication_train: NDArray[np.float32] | None = None
+    publication_candidates: NDArray[np.float32] | None = None
+    if config.model.publication_affinity_enabled:
+        from .publication import publication_features
+
+        publication_train, publication_candidates = publication_features(
+            feedback_stories,
+            feedback_labels,
+            _vote_times,
+            candidates,
+            strength=config.model.publication_prior_strength,
+        )
+
     n_feedback = len(feedback_labels)
     if trace is not None:
         trace.set_count("feedback_total", n_feedback)
@@ -1147,7 +1167,15 @@ def _score_and_rank(
                             embedder.model_version,
                             asdict(config.model),
                             [
-                                (s.id, label, len(s.text_content), s.source)
+                                (
+                                    s.id,
+                                    label,
+                                    len(s.text_content),
+                                    s.source,
+                                    s.url
+                                    if config.model.publication_affinity_enabled
+                                    else None,
+                                )
                                 for s, label in zip(feedback_stories, feedback_labels)
                             ],
                         ],
@@ -1216,6 +1244,10 @@ def _score_and_rank(
                     is_archive=cand_is_archive,
                     is_reddit=cand_is_reddit,
                     is_rss=cand_is_rss,
+                )
+            if publication_candidates is not None:
+                cand_features = np.concatenate(
+                    [cand_features, publication_candidates], axis=1
                 )
             if score_context is not None:
                 score_context.cand_closest_up = cand_closest_up.astype(np.float32)
@@ -1290,6 +1322,11 @@ def _score_and_rank(
                             is_archive=fb_is_archive,
                             is_reddit=fb_is_reddit,
                             is_rss=fb_is_rss,
+                        )
+
+                    if publication_train is not None:
+                        fb_features = np.concatenate(
+                            [fb_features, publication_train], axis=1
                         )
 
                     # Ensure all three classes (0, 1, 2) are present

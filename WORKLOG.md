@@ -1,5 +1,98 @@
 # Worklog: hn-rewrite
 
+## 2026-09-22 — Commit scope and TUI selected-story logging
+
+- User authorized committing ranking/eval work, deployed TLDR fix and TUI
+  logging. Deferred full-body embedding helper/bakeoff changes stay outside
+  the commit; their tests were separated from training-dedup tests.
+- TUI uses the existing authenticated interaction endpoint for best-effort
+  impressions after a selection remains for one second, with position,
+  filters, feed version and a random session ID. Prefetch is excluded;
+  profile/selection changes cancel pending events. No external analytics,
+  no retries, and failures do not block reading. Selected-state measurement
+  is not proof of attention or terminal foreground visibility.
+- Client pilot verifies rapid navigation exclusion, stable-selection logging,
+  context fields, no rebuild duplication, and graceful unsupported endpoint.
+  Running TUI not restarted; live ledger verification remains pending.
+
+## 2026-09-22 — Scope narrowed: eval controls and training dedup only
+
+- Added five-seed shuffled-label controls, random ranking baseline and
+  prevalence-aware expected random NDCG (report schema 4). Added optional
+  latest-vote-per-normalized-URL training dedup; default off, no DB mutation.
+- Completed already-running isolated eval; multiseed null scores broadly
+  track chance, dedup top-10 gain is fold-dependent and MAP slightly worse.
+  Record full aggregate evidence in FINDINGS.md; no rollout justified yet.
+- Deferred WIP already started before scope reduction: section-embedding
+  helper/bakeoff layout and TUI selected-card impressions using existing
+  local interaction endpoint. No live changes for either. Files remain
+  uncommitted; do not silently discard or deploy the mixed workspace.
+- Backend 797 passed (-n 2); client 63 passed/1 skipped; Ruff, format and ty
+  clean. Production ranking and running TUI session unchanged.
+
+## 2026-09-22 — Improve ranking evaluation coverage and group isolation
+
+- Added separate heldout-feedback replay, retaining all three judged classes
+  without relying on current-window overlap. Strict URL group exclusion and
+  test/candidate deduplication use production URL normalization. Added @10,
+  coverage warnings, before/after isolation counts and report schema 3.
+- Stopped reporting uncalibrated SVM Brier scores. Documented replay's high
+  relevance prevalence, exposure bias and current-content limitation in
+  docs/RANKER_EVALUATION.md. Runtime ranking/service unchanged.
+- Added regressions for training cross-post exclusion (including tracking
+  URLs), repeated test groups, retained down/neutral/up items, and embedding
+  alignment in both modes. Full suite: 793 passed (-n 2); lint/format/ty clean.
+- Ran isolated single-thread VPS replay plus shuffled labels. Affinity is
+  essentially tied on NDCG@10 and worse on MAP; keep disabled. Shuffled
+  affinity score remains elevated and requires follow-up; no leakage-free
+  claim. Detailed aggregates and artifact locations in FINDINGS.md.
+
+## 2026-09-22 — Publication preference experiment (disabled)
+
+- Added read-only `scripts/audit_publication.py`. Live audit corrects the
+  earlier title-match count: jack-clark.net has 16 upvotes across 13 exact
+  article URLs; three issues have old/new RSS duplicate IDs. No neutral/down
+  publication votes. No production ranking changes or feedback edits.
+- Added `pipeline/publication.py`: conservative hostname identity, shared-host
+  exclusions, exact normalized URL grouping, latest-vote deduplication, and
+  smoothed three-class contrasts plus support. Training features see strictly
+  earlier timestamps, excluding their entire own URL group; equal-time votes
+  cannot see each other. Prior uses eligible publication history, not votes on
+  ambiguous shared hosts. This differs from the initial all-votes prior plan.
+- Optional SVM metadata is behind `publication_affinity_enabled=false` with
+  prior strength 10 (experimental, not tuned). Embeddings stay unscaled;
+  model schema bumps to 5 and cache signature includes URLs when enabled.
+- Added `publication_affinity` evaluation variant. Removed profile credentials
+  from eval console/report output. No live benchmark run yet: duplicate-safe
+  temporal evaluation and score attribution remain prerequisites to enabling.
+- Tests cover temporal/self/duplicate exclusion, unseen publishers, SVM fit
+  and repeated scoring, and read-only audit. Full suite 791 passed (-n 2);
+  Ruff/ty clean. Production flag remains off; no improvement claimed.
+
+## 2026-09-22 — TLDR: preserve scaled output budgets (detail-v12)
+
+- Review found that `_shape_tldr` still discarded every bullet after the
+  fourth, regardless of the v11 prompt allowance. The live four-bullet result
+  did not establish that Muse ignored the prompt; raw model output was not
+  inspected. The earlier coverage diagnosis was therefore incomplete.
+- Prompt and output shaping now share source-length limits. Both article and
+  discussion sections may grow independently to six or eight bullets, using
+  the actual capped input length. Cache version advances to detail-v12 so
+  previously truncated v11 results are not treated as fresh.
+- Generation-path regressions cover article-only, discussion-only, and mixed
+  tiers in both dual-section directions, asserting tail bullets survive and
+  excess bullets are still capped.
+- Checked locally: 776 tests passed with two workers; Ruff, format, ty and
+  diff checks clean. Deployed server.py directly with matching SHA-256 and
+  restarted the service. Backup: shared/deploy-backups/detail-v12/server.py.before
+  on the VPS. Both local changes and the VPS server.py patch are uncommitted.
+- Live: dashboard 200; Import AI 473 regenerated in ~9s via Muse Spark, seven
+  bullets covering all six major sections of the stored article (RAND,
+  xenocortical mice, pacing, uncensored models, RSI, machine hermeneutics).
+  Repeat request returned an identical cached summary. Bounded post-restart
+  journal scan showed no ERROR/Traceback/Exception; generation and cache-hit
+  entries confirmed the same new cache key. No cache flush performed.
+
 ## 2026-09-22 — TLDR: full-piece coverage budgets, provider to gospark
 
 - Import AI 473 investigation (see FINDINGS.md): a 24,067-char three-topic

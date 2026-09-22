@@ -1,5 +1,84 @@
 # HN Rerank findings
 
+## Five-seed controls and training deduplication — 2026-09-22
+
+- User narrowed scope to eval controls + training deduplication only. No
+  deployment. Deferred section-embedding and TUI-impression WIP preserved.
+- Completed isolated single-thread/nice-19 VPS replay: 3 development folds,
+  five independent shuffled-label seeds. Four already-started variants ran;
+  no further publication tuning. Expected shuffled NDCG@10 averaged 0.3402.
+  Production shuffled mean 0.3352 (seed means 0.2766–0.4024); publication
+  0.3545 (0.2613–0.4498); dedup 0.3211 (0.2829–0.3863); combined 0.3725
+  (0.2604–0.4822). Prior one-seed elevation is not consistently reproduced;
+  five seeds do not prove absence of leakage. These are descriptive seed
+  means, not independent-fold confidence intervals.
+- Real production/dedup: NDCG@10 0.80537/0.85016, NDCG@40
+  0.61111/0.61219, MAP 0.46820/0.46637. Dedup per-fold NDCG@10:
+  0.7530/0.7975/1.0000 versus 0.8205/0.7949/0.8007. Gain concentrated in
+  fold 3; mixed outcomes do not justify claiming a general improvement.
+- Dedup uses latest vote per production-normalized URL (ID tie-break), only
+  in training memory; original feedback rows remain intact. Disabled by
+  default. Publication canonical URLs now also use production normalization.
+- Artifact: `/home/d/.local/state/hn-rerank-eval/publication-multiseed.json`
+  (VPS `/tmp/hn-publication-eval/multiseed.json`, report schema 4). Confirmation
+  period untouched. Next scoped step: predeclared production-vs-dedup
+  confirmation evaluation, no hyperparameter search.
+
+## Group-isolated judged-feedback replay — 2026-09-22
+
+- Added `--candidate-pool heldout-feedback` to retain past rated stories,
+  with all three labels; current-pool evaluation remains a separate mode.
+  Shared production URL normalization excludes training cross-posts and
+  deduplicates test/candidates. Effective test counts: 657/661/662 from
+  664/663/663 (ten overlapping/repeated test rows removed). All replay
+  candidates judged; average 175 eligible positives per fold.
+- Low-priority, single-thread isolated VPS run, 3 development folds plus
+  shuffled-label control. No production changes. Replay report:
+  `/home/d/.local/state/hn-rerank-eval/publication-replay.json` locally and
+  `/tmp/hn-publication-eval/replay.json` on VPS (schema 2 artifact immediately
+  before the new report contract was versioned to 3).
+- Production vs affinity: NDCG@10 0.80537 / 0.80493;
+  NDCG@40 0.61111 / 0.61074; MAP 0.46820 / 0.46231.
+  No demonstrated benefit from enabling affinity. High levels reflect the
+  judged-only, exposure-selected pool and cannot be compared to live-pool
+  NDCG (~0.03). Stored content is current, not historical.
+- Shuffled control: NDCG@10 0.27660 / 0.43605;
+  NDCG@40 0.32250 / 0.41762; MAP 0.32604 / 0.35010.
+  Affinity control is elevated: one seed/three folds does NOT establish
+  leakage absence. Investigate with multiple permutations and null baselines
+  before treating small differences as meaningful. Latest confirmation data
+  remains untested. Semantic duplicates beyond normalized URL remain possible.
+- New metrics include @10, coverage warnings, group-isolation counts; SVM
+  Brier reporting disabled. See docs/RANKER_EVALUATION.md for mode semantics.
+
+## Publication-affinity initial evaluation — 2026-09-22
+
+- Ran production vs `publication_affinity` on a read-only SQLite backup in
+  `/tmp/hn-publication-eval` on VPS; production source/config unchanged. One
+  thread, nice 19, cached embeddings only. Command: `uv run python
+  scripts/eval_ranker_variants.py --config eval.toml --user-id 1 --variants
+  publication_affinity --folds 3 --output result.json` (via production venv,
+  isolated source). 12,671 candidates, 3,981 development votes; latest 20%
+  timestamp groups reserved, no confirmation or label-shuffle run.
+- Mean raw NDCG@12: 0.01826 → 0; NDCG@40: 0.03135 → 0;
+  MAP: 0.02133 → 0.01321. No evidence for enabling this implementation.
+- Major limits: only 85/20/2 eligible positive judgments across folds;
+  current candidate pool contains only 314/1664 saved positive stories.
+  Recommended Recent mixed had ZERO judged cards across development folds,
+  so this does not measure current newsletter recommendation quality.
+- Separate exact normalized URL overlap audit found 3/2/0 test stories with
+  same-article training history. Not yet a duplicate-group-clean evaluation.
+  Identity excludes ambiguous shared hosts, so this is a lower-bound audit.
+  Snapshot retrieval is retrospective, not historical exposure evaluation.
+- Initial scoring finished but report writing failed because archived source
+  had no Git metadata. Initialized an isolated source-only Git snapshot and
+  reran successfully. Report: VPS `/tmp/hn-publication-eval/result.json`;
+  local `/home/d/.local/state/hn-rerank-eval/publication-first.json`.
+  Private report stays outside Git. Treat affinity Brier output as invalid:
+  SVM decision softmax is uncalibrated, despite evaluator's generic label.
+- Decision: keep feature disabled. Improve group isolation and held-out
+  candidate coverage before tuning; retain the current production ranker.
+
 ## Import AI 473 TLDR drops the tail of a long newsletter — 2026-09-22
 
 - Story `Import AI 473` (jack-clark.net, VPS `stories.id = -1607225291`) headlined

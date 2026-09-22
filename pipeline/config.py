@@ -13,6 +13,9 @@ class ModelConfig:
     svm_kernel: str = "rbf"
     svm_precomputed_enabled: bool = False
     svm_precomputed_chunk_size: int = 512
+    deduplicate_training_feedback: bool = False
+    publication_affinity_enabled: bool = False
+    publication_prior_strength: float = 10.0
     neutral_weight: float = 0.0
     enable_mmr: bool = False
     diversity_threshold: float = 0.75
