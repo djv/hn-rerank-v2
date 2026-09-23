@@ -254,6 +254,30 @@ def test_headline_shows_badge_emoji() -> None:
     assert headline(replace(story, badges=[])).plain.startswith("Story")
 
 
+def test_headline_hides_unknown_reddit_score_and_shows_subreddit() -> None:
+    story = FeedStory(
+        1,
+        "Story",
+        "https://www.reddit.com/r/LocalLLaMA/comments/abc/slug/",
+        "https://www.reddit.com/r/LocalLLaMA/comments/abc/slug/",
+        "rss_reddit_localllama",
+        0,
+        None,
+        0,
+        1.0,
+        ["recent_mixed"],
+        False,
+        False,
+    )
+    rendered = headline(story).plain
+    assert "r/localllama" in rendered
+    assert "0 pts" not in rendered
+    assert headline(replace(story, points=5)).plain.count("5 pts") == 1
+    hn = replace(story, source="hn", article_url="https://example.org/a")
+    assert "example.org" in headline(hn).plain
+    assert "0 pts" in headline(hn).plain
+
+
 async def test_failure_copy_in_reading_pane() -> None:
     server = UnreachableServer()
     app = Reader(api=server.api())

@@ -84,10 +84,16 @@ def headline(story: FeedStory, selected: bool | None = None) -> Text:
         story.title, style="bold #EEE8DD" if selected is not False else "#D2CCC1"
     )
     text.append("\n")
-    domain = urlsplit(story.article_url).hostname or story.source
+    if story.source.startswith("rss_reddit_") and len(story.source) > 11:
+        domain = f"r/{story.source[11:]}"
+    else:
+        domain = urlsplit(story.article_url).hostname or story.source
     text.append(domain, style="#8AB4F8")
-    text.append(" · ", style="#6B655D")
-    text.append(f"{story.points} pts", style="#A8C7A0")
+    # Reddit RSS carries no scores (0/8487 rows have one): 0 means unknown,
+    # not zero. The web card already hides zero scores; match that here.
+    if story.points > 0 or not story.source.startswith("rss_reddit_"):
+        text.append(" · ", style="#6B655D")
+        text.append(f"{story.points} pts", style="#A8C7A0")
     text.append(" · ", style="#6B655D")
     text.append(f"{story.comments or 0} comments", style="#C6C1B8")
     age = story_age(story)
