@@ -1,5 +1,23 @@
 # HN Rerank status
 
+## Current TLDR deployment — daa8112
+
+Fixed pane budgets deployed to VPS: article-only and discussion-only target
+240 words / 6–8 bullets; combined targets 120 words / 3–4 bullets per section.
+No viewport dimensions or resize-driven regeneration. Short sources may stay
+short. Replaces the undeployed article-only doubling experiment.
+
+Verified exact VPS commit: 820 backend tests passed, Ruff/format/ty clean.
+Service restarted active; dashboard 200, Latent Space bio-security generation
+succeeded, subsequent cached request 200; bounded journal showed no errors.
+Live output was 7 bullets / 414 whitespace-delimited words (previously 4 bullets,
+564 characters): meaningfully longer, but model overshot the 240-word prompt
+target. Actual TUI screen fit remains unverified; no hard word truncation.
+
+Unrelated local TUI, web rail and refill WIP remains uncommitted and was not
+sent to the VPS. Next: inspect actual reading-pane fit before further tuning.
+
+
 ## Objective
 
 Simplify freshness using existing workers and publication/version paths. Fix
