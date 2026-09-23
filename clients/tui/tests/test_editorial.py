@@ -14,9 +14,7 @@ from textual.widgets import Button, Input, Markdown, OptionList, Select, Static,
 from hn_rerank.app import (
     EMPTY_NOTICE,
     Reader,
-    blend_popular,
     Setup,
-    diversify_order,
     headline,
     headline_domain,
     headline_points,
@@ -316,62 +314,6 @@ def test_headline_separators_share_columns_across_stories() -> None:
     assert dots == [i for i, char in enumerate(second) if char == "·"]
     assert "pts" not in second
     assert "r/localllama" in second
-
-
-def test_diversify_order_caps_sources_and_total() -> None:
-    lookup = {
-        i: replace(
-            FeedStory(
-                1,
-                "S",
-                "https://example.org",
-                "https://example.org/x",
-                "hn",
-                1,
-                0,
-                0,
-                1.0,
-                ["recent_mixed"],
-                False,
-                False,
-            ),
-            id=i,
-            source="rss_lesswrong_com" if i % 2 else "hn",
-        )
-        for i in range(1, 41)
-    }
-    order = list(range(1, 41)) + [999]
-    picked = diversify_order(order, lookup)
-    assert len(picked) == 8  # 4 per source over 2 sources
-    assert picked == [1, 2, 3, 4, 5, 6, 7, 8]
-    many = {i: replace(lookup[1], id=i, source=f"rss_src_{i}") for i in range(100)}
-    assert len(diversify_order(list(range(100)), many)) == 30
-
-
-def test_blend_popular_weaves_every_third_slot() -> None:
-    def story(i: int, popular: bool) -> FeedStory:
-        return FeedStory(
-            i,
-            f"S{i}",
-            "https://example.org",
-            "https://example.org/x",
-            "hn",
-            1,
-            0,
-            0,
-            float(100 - i),
-            ["recent_mixed"],
-            popular,
-            False,
-        )
-
-    lookup = {i: story(i, i > 6) for i in range(1, 13)}
-    full = list(range(1, 13))
-    picked = [1, 2, 3, 4, 5, 6]
-    blended = blend_popular(picked, full, lookup, every=3, limit=30)
-    assert blended == [1, 2, 3, 7, 4, 5, 8, 6]
-    assert blend_popular(picked, full, lookup, every=0) == picked
-    assert len(blend_popular(picked, full, lookup, every=1, limit=8)) == 8
 
 
 def test_headline_truncates_long_domains_to_fit() -> None:
