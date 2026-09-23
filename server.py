@@ -57,7 +57,7 @@ ARTICLE_SECTION_MIN_CHARS = 500
 REDDIT_COMMENTS_CACHE_CHAR_LIMIT = 10_000
 REDDIT_COMMENT_LIMIT = 40
 REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dashboard"
-TLDR_PROMPT_VERSION = "detail-v12"
+TLDR_PROMPT_VERSION = "detail-v13"
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
 _PROMPT_CACHE: dict[str, str] = {}
 # Seam for tests: swap in a controllable timer to make debounce/regen tests
@@ -179,9 +179,13 @@ def _cap_tldr_structure(
     return "\n".join(out).strip()
 
 
-def _shape_tldr(text: str, *, source_chars: int = 5_000) -> str:
-    """Normalize Markdown and preserve the source-sized section allowance."""
+def _shape_tldr(
+    text: str, *, source_chars: int = 5_000, single_section: bool = False
+) -> str:
+    """Normalize Markdown and preserve the fixed reading-pane allowance."""
     _, max_bullets, _ = _section_limits(source_chars)
+    if single_section:
+        max_bullets *= 2
     return _cap_tldr_structure(_normalize_tldr_markdown(text), max_bullets=max_bullets)
 
 
@@ -1063,22 +1067,20 @@ def _tldr_cache_key(
 
 
 def _section_limits(source_chars: int) -> tuple[int, int, int]:
-    """Shared minimum/maximum bullets and word limit for prompt and shaping."""
-    if source_chars < 1_500:
-        return 2, 3, 45
-    if source_chars < 5_000:
-        return 2, 4, 70
-    if source_chars < 12_000:
-        return 3, 4, 90
-    if source_chars < 20_000:
-        return 4, 6, 140
-    return 5, 8, 200
+    """Fixed half-pane allowance; source length does not set the budget."""
+    return 3, 4, 120
 
 
-def _section_budget(source_chars: int) -> str:
-    """Budget scaled by the length of the actual prompt source."""
+def _section_budget(source_chars: int, *, single_section: bool = False) -> str:
+    """Fixed reading-pane budget; never depends on client dimensions."""
     minimum, maximum, words = _section_limits(source_chars)
-    return f"{minimum}-{maximum} bullets, max {words} words"
+    if single_section:
+        minimum, maximum, words = minimum * 2, maximum * 2, words * 2
+    return (
+        f"{minimum}-{maximum} bullets, aim for {words} words. "
+        "Use concrete details and explanations, not just topic labels. "
+        "Use fewer words and bullets if the source is thin; never pad or invent details"
+    )
 
 
 async def generate_detailed_tldr(
@@ -1176,12 +1178,16 @@ async def generate_detailed_tldr(
     if article_section:
         name, section = "article_only_v4.txt", article_section
         prompt = _load_prompt(name).format(
-            title=title, article_section=section, budget=_section_budget(len(section))
+            title=title,
+            article_section=section,
+            budget=_section_budget(len(section), single_section=True),
         )
     else:
         name, section = "discussion_only_v4.txt", comments_section
         prompt = _load_prompt(name).format(
-            title=title, comments_section=section, budget=_section_budget(len(section))
+            title=title,
+            comments_section=section,
+            budget=_section_budget(len(section), single_section=True),
         )
 
     result = await _call_llm_for_config(
@@ -1191,7 +1197,11 @@ async def generate_detailed_tldr(
         on_usage=on_usage,
     )
     if result.ok:
-        if text := _shape_tldr(result.content, source_chars=len(section)):
+        if text := _shape_tldr(
+            result.content,
+            source_chars=len(section),
+            single_section=True,
+        ):
             return TldrResult(kind="ok", tldr=text)
         return TldrResult(kind="llm_error", error_text="empty LLM response")
     return _llm_error_from(result)

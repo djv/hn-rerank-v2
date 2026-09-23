@@ -9,7 +9,7 @@ Use a FLAT structure — no nested list levels. If a sub-topic has multiple bull
 - **Precedent exists** in...
 (NOT `- **Criticism of US control**:` followed by siblings.)
 Use **bold** key terms.
-Keep each bullet to one short sentence.
+Use one or two sentences per bullet to explain the finding, reasoning, or consequence.
 Use at most one `####` heading, and only when the section has three or more bullets.
 
 Title: {title}

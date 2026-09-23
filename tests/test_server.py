@@ -301,23 +301,15 @@ def test_env(tmp_path, mock_embedder):
     db.close()
 
 
-def test_section_budget_scales_with_source_volume() -> None:
-    """The TLDR bullet budget must grow with source material volume rather
-    than staying fixed at 2-3 bullets regardless of thread/article size."""
+@pytest.mark.parametrize("size", [0, 1499, 1500, 5000, 10440, 12000, 20000, 30000])
+def test_fixed_pane_budget(size: int) -> None:
     import server
 
-    assert server._section_budget(0) == "2-3 bullets, max 45 words"
-    assert server._section_budget(1_499) == "2-3 bullets, max 45 words"
-    assert server._section_budget(1_500) == "2-4 bullets, max 70 words"
-    assert server._section_budget(4_999) == "2-4 bullets, max 70 words"
-    assert server._section_budget(5_000) == "3-4 bullets, max 90 words"
-    assert server._section_budget(11_999) == "3-4 bullets, max 90 words"
-    assert server._section_budget(12_000) == "4-6 bullets, max 140 words"
-    assert server._section_budget(19_999) == "4-6 bullets, max 140 words"
-    assert server._section_budget(20_000) == "5-8 bullets, max 200 words"
-    # Import AI 473 shape: a 24k-char three-topic newsletter must earn room
-    # for every major section, not a lead-only summary.
-    assert server._section_budget(24_067) == "5-8 bullets, max 200 words"
+    assert server._section_budget(size, single_section=True).startswith(
+        "6-8 bullets, aim for 240 words"
+    )
+    assert server._section_budget(size).startswith("3-4 bullets, aim for 120 words")
+    assert "never pad or invent" in server._section_budget(size)
 
 
 @pytest.mark.parametrize(
@@ -343,7 +335,7 @@ def test_prompts_render_budget_placeholder(template: str, fields: dict) -> None:
         budget=server._section_budget(5_000),
         **fields,
     )
-    assert "3-4 bullets, max 90 words" in prompt
+    assert "3-4 bullets, aim for 120 words" in prompt
     assert "at most one `####` heading" in prompt
 
 
@@ -5150,9 +5142,9 @@ async def test_call_llm_responses_success_and_429(monkeypatch) -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "article_chars,comment_chars",
-    [(24_067, 0), (0, 24_000), (24_067, 13_000), (5_000, 24_000)],
+    [(10_440, 0), (24_067, 0), (0, 24_000), (24_067, 13_000), (5_000, 24_000)],
 )
-async def test_generated_tldr_preserves_scaled_bullet_allowance(
+async def test_generated_tldr_preserves_fixed_pane_allowance(
     monkeypatch: pytest.MonkeyPatch, article_chars: int, comment_chars: int
 ) -> None:
     import server
@@ -5164,8 +5156,10 @@ async def test_generated_tldr_preserves_scaled_bullet_allowance(
         max_tokens: int,
         on_usage: server.LlmUsageRecorder | None = None,
     ) -> server.LlmChatResult:
+        words = 120 if article_chars and comment_chars else 240
+        assert f"aim for {words} words" in prompt
         return server.LlmChatResult(
-            ok=True, content="\n".join(f"- Topic {i}" for i in range(1, 10))
+            ok=True, content="\n".join(f"- Topic {i}" for i in range(1, 20))
         )
 
     monkeypatch.setenv("LLM_PROVIDER", "mistral")
@@ -5179,11 +5173,7 @@ async def test_generated_tldr_preserves_scaled_bullet_allowance(
     assert result.kind == "ok"
     assert result.cacheable
     sections = [part for part in result.tldr.split("### ") if part.strip()]
-    expected = [
-        8 if size >= 20_000 else 6 if size >= 12_000 else 4
-        for size in (article_chars, comment_chars)
-        if size
-    ]
+    expected = [4, 4] if article_chars and comment_chars else [8]
     assert len(sections) == len(expected)
     for section, count in zip(sections, expected, strict=True):
         assert section.count("- Topic ") == count
@@ -5222,8 +5212,8 @@ async def test_generate_detailed_tldr_scales_combined_path_budgets(monkeypatch):
 
     assert len(calls) == 2
     article_prompt, discussion_prompt = calls
-    assert "3-4 bullets, max 90 words" in article_prompt
-    assert "3-4 bullets, max 90 words" in discussion_prompt
+    assert "3-4 bullets, aim for 120 words" in article_prompt
+    assert "3-4 bullets, aim for 120 words" in discussion_prompt
 
 
 @pytest.mark.asyncio
