@@ -74,7 +74,32 @@ def story_metadata(story: FeedStory) -> str:
     return " · ".join(parts)
 
 
-def headline(story: FeedStory, selected: bool | None = None) -> Text:
+def headline_domain(story: FeedStory) -> str:
+    if story.source.startswith("rss_reddit_") and len(story.source) > 11:
+        return f"r/{story.source[11:]}"
+    domain = urlsplit(story.article_url).hostname or story.source
+    return domain[4:] if domain.startswith("www.") else domain
+
+
+def headline_points(story: FeedStory) -> str:
+    # Reddit RSS carries no scores (0/8487 rows have one): 0 means unknown,
+    # not zero. The web card already hides zero scores; match that here.
+    if story.points > 0 or not story.source.startswith("rss_reddit_"):
+        return f"{story.points} pts"
+    return ""
+
+
+def headline(
+    story: FeedStory,
+    selected: bool | None = None,
+    widths: tuple[int, int, int] = (0, 0, 0),
+) -> Text:
+    """Headline with column-aligned `·` separators when *widths* is given.
+
+    *widths* holds the (domain, points, comments) segment widths across the
+    visible list; each row pads its segments so the separators line up.
+    Unknown Reddit scores pad as blank space to preserve the columns.
+    """
     text = Text()
     if selected is not None:
         text.append("> " if selected else "  ", style="bold #FF914D")
@@ -84,19 +109,20 @@ def headline(story: FeedStory, selected: bool | None = None) -> Text:
         story.title, style="bold #EEE8DD" if selected is not False else "#D2CCC1"
     )
     text.append("\n")
-    if story.source.startswith("rss_reddit_") and len(story.source) > 11:
-        domain = f"r/{story.source[11:]}"
-    else:
-        domain = urlsplit(story.article_url).hostname or story.source
+    domain = headline_domain(story)
+    if widths[0] > len(domain):
+        domain = domain.ljust(widths[0])
     text.append(domain, style="#8AB4F8")
-    # Reddit RSS carries no scores (0/8487 rows have one): 0 means unknown,
-    # not zero. The web card already hides zero scores; match that here.
-    if story.points > 0 or not story.source.startswith("rss_reddit_"):
+    points = headline_points(story)
+    if points or widths[1]:
         text.append(" · ", style="#6B655D")
-        text.append(f"{story.points} pts", style="#A8C7A0")
-    text.append(" · ", style="#6B655D")
-    text.append(f"{story.comments or 0} comments", style="#C6C1B8")
+        text.append(points.ljust(widths[1]) if widths[1] else points, style="#A8C7A0")
+    comments = f"{story.comments or 0} comments"
     age = story_age(story)
+    text.append(" · ", style="#6B655D")
+    if age and widths[2] > len(comments):
+        comments = comments.ljust(widths[2])
+    text.append(comments, style="#C6C1B8")
     if age:
         text.append(" · ", style="#6B655D")
         text.append(f"{age} ago", style="#8F897F")
@@ -508,6 +534,17 @@ class Reader(App[None]):
             else None
         )
 
+    def meta_widths(self) -> tuple[int, int, int]:
+        """Per-segment widths so headline `·` separators share columns."""
+        return (
+            max((len(headline_domain(s)) for s in self.stories), default=0),
+            max((len(headline_points(s)) for s in self.stories), default=0),
+            max(
+                (len(f"{s.comments or 0} comments") for s in self.stories),
+                default=0,
+            ),
+        )
+
     def rebuild(self, select_id: int | None = None) -> None:
         # Teardown removes nodes before the final messages drain; ignore late
         # rebuilds rather than raising NoMatches.
@@ -523,10 +560,11 @@ class Reader(App[None]):
         self.stories = [lookup[sid] for sid in order if sid not in self.rated]
         headlines = self.query_one("#headlines", OptionList)
         headlines.clear_options()
+        widths = self.meta_widths()
         headlines.add_options(
             [
                 Option(
-                    headline(s, s.id == select_id),
+                    headline(s, s.id == select_id, widths),
                     id=str(s.id),
                 )
                 for s in self.stories
@@ -577,9 +615,11 @@ class Reader(App[None]):
         if self.setting_up or not self.query("#headlines"):
             return
         listing = self.query_one("#headlines", OptionList)
+        widths = self.meta_widths()
         for index, story in enumerate(self.stories):
             listing.replace_option_prompt(
-                str(story.id), headline(story, index == listing.highlighted)
+                str(story.id),
+                headline(story, index == listing.highlighted, widths),
             )
         self.schedule_summary()
 

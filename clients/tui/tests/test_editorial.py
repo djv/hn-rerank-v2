@@ -16,6 +16,8 @@ from hn_rerank.app import (
     Reader,
     Setup,
     headline,
+    headline_domain,
+    headline_points,
     story_age,
     story_metadata,
 )
@@ -276,6 +278,42 @@ def test_headline_hides_unknown_reddit_score_and_shows_subreddit() -> None:
     hn = replace(story, source="hn", article_url="https://example.org/a")
     assert "example.org" in headline(hn).plain
     assert "0 pts" in headline(hn).plain
+
+
+def test_headline_separators_share_columns_across_stories() -> None:
+    base = FeedStory(
+        1,
+        "Story",
+        "https://example.org/a",
+        "https://news.ycombinator.com/item?id=1",
+        "hn",
+        5,
+        7,
+        0,
+        1.0,
+        ["recent_mixed"],
+        False,
+        False,
+    )
+    reddit = replace(
+        base,
+        id=2,
+        article_url="https://www.reddit.com/r/LocalLLaMA/comments/abc/slug/",
+        source="rss_reddit_localllama",
+        points=0,
+        comments=1234,
+    )
+    widths = (
+        max(len(headline_domain(base)), len(headline_domain(reddit))),
+        max(len(headline_points(base)), len(headline_points(reddit))),
+        max(len("7 comments"), len("1234 comments")),
+    )
+    first = headline(base, True, widths).plain.splitlines()[1]
+    second = headline(reddit, False, widths).plain.splitlines()[1]
+    dots = [i for i, char in enumerate(first) if char == "·"]
+    assert dots == [i for i, char in enumerate(second) if char == "·"]
+    assert "0 pts" not in second
+    assert "r/localllama" in second
 
 
 async def test_failure_copy_in_reading_pane() -> None:
