@@ -30,7 +30,7 @@ async def test_passive_poll_only_fetches_changed_versions(version: int) -> None:
         assert selected is not None
         assert selected.id == 2
         if version != 2:
-            assert "· 77" in str(app.query_one("#story-heading", Static).content)
+            assert "· 💬 77" in str(app.query_one("#story-heading", Static).content)
 
 
 @pytest.mark.parametrize("state", ["pending", "reading", "help_open", "setting_up"])

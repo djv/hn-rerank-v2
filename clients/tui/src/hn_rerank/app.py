@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import unicodedata
 import webbrowser
 from collections import deque
 from pathlib import Path
@@ -91,6 +92,18 @@ def limit_recommended(
     return head + extras
 
 
+def _cell_len(text: str) -> int:
+    """Terminal cell width (wide emoji count double)."""
+    return sum(
+        2 if unicodedata.east_asian_width(char) in ("W", "F") else 1 for char in text
+    )
+
+
+def _pad_cells(text: str, width: int) -> str:
+    padding = width - _cell_len(text)
+    return text + " " * padding if padding > 0 else text
+
+
 def headline_domain(story: FeedStory) -> str:
     if story.source.startswith("rss_reddit_") and len(story.source) > 11:
         return f"r/{story.source[11:]}"
@@ -102,7 +115,7 @@ def headline_points(story: FeedStory) -> str:
     # Reddit RSS carries no scores (0/8487 rows have one): 0 means unknown,
     # not zero. The web card already hides zero scores; match that here.
     if story.points > 0 or not story.source.startswith("rss_reddit_"):
-        return str(story.points)
+        return f"▲ {story.points}"
     return ""
 
 
@@ -127,20 +140,23 @@ def headline(
     )
     text.append("\n")
     domain = headline_domain(story)
-    if widths[0] and len(domain) > widths[0]:
+    if widths[0] and _cell_len(domain) > widths[0]:
         domain = domain[: widths[0] - 1] + "…" if widths[0] > 1 else "…"
-    elif widths[0] > len(domain):
-        domain = domain.ljust(widths[0])
+    elif widths[0]:
+        domain = _pad_cells(domain, widths[0])
     text.append(domain, style="#8AB4F8")
     points = headline_points(story)
     if points or widths[1]:
         text.append(" · ", style="#6B655D")
-        text.append(points.ljust(widths[1]) if widths[1] else points, style="#A8C7A0")
-    comments = str(story.comments or 0)
+        text.append(
+            _pad_cells(points, widths[1]) if widths[1] else points,
+            style="#A8C7A0",
+        )
+    comments = f"💬 {story.comments or 0}"
     age = story_age(story)
     text.append(" · ", style="#6B655D")
-    if age and widths[2] > len(comments):
-        comments = comments.ljust(widths[2])
+    if age and widths[2]:
+        comments = _pad_cells(comments, widths[2])
     text.append(comments, style="#C6C1B8")
     if age:
         text.append(" · ", style="#6B655D")
@@ -562,10 +578,10 @@ class Reader(App[None]):
         column is capped with ellipsis so the whole row fits on one line.
         """
         widths = [
-            max((len(headline_domain(s)) for s in self.stories), default=0),
-            max((len(headline_points(s)) for s in self.stories), default=0),
+            max((_cell_len(headline_domain(s)) for s in self.stories), default=0),
+            max((_cell_len(headline_points(s)) for s in self.stories), default=0),
             max(
-                (len(str(s.comments or 0)) for s in self.stories),
+                (_cell_len(f"💬 {s.comments or 0}") for s in self.stories),
                 default=0,
             ),
         ]

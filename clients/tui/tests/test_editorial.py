@@ -275,10 +275,10 @@ def test_headline_hides_unknown_reddit_score_and_shows_subreddit() -> None:
     rendered = headline(story).plain
     assert "r/localllama" in rendered
     assert "pts" not in rendered
-    assert "· 5 ·" in headline(replace(story, points=5)).plain
+    assert "· ▲ 5 ·" in headline(replace(story, points=5)).plain
     hn = replace(story, source="hn", article_url="https://example.org/a")
     assert "example.org" in headline(hn).plain
-    assert "· 0 ·" in headline(hn).plain
+    assert "· ▲ 0 ·" in headline(hn).plain
 
 
 def test_headline_separators_share_columns_across_stories() -> None:
@@ -307,7 +307,7 @@ def test_headline_separators_share_columns_across_stories() -> None:
     widths = (
         max(len(headline_domain(base)), len(headline_domain(reddit))),
         max(len(headline_points(base)), len(headline_points(reddit))),
-        max(len("7 comments"), len("1234 comments")),
+        max(len("💬 7"), len("💬 1234")),
     )
     first = headline(base, True, widths).plain.splitlines()[1]
     second = headline(reddit, False, widths).plain.splitlines()[1]
@@ -359,7 +359,7 @@ def test_headline_truncates_long_domains_to_fit() -> None:
     )
     assert (
         headline(long_domain, True, (10, 1, 1)).plain.splitlines()[1]
-        == "marginalr… · 5 · 7"
+        == "marginalr… · ▲ 5 · 💬 7"
     )
     assert "marginalrevolution.com" in headline(long_domain).plain
 
@@ -494,7 +494,7 @@ async def test_reading_heading_tracks_refreshed_story_data() -> None:
         selected = app.selected()
         assert selected and selected.id == 1
         heading = str(app.query_one("#story-heading", Static).content)
-        assert "· 999 · 123" in heading
+        assert "· ▲ 999 · 💬 123" in heading
 
 
 async def test_vote_statusline_confirms_without_toast() -> None:
