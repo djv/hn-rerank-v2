@@ -16,6 +16,7 @@ from hn_rerank.app import (
     Reader,
     Setup,
     headline,
+    limit_recommended,
     headline_domain,
     headline_points,
     story_age,
@@ -314,6 +315,31 @@ def test_headline_separators_share_columns_across_stories() -> None:
     assert dots == [i for i, char in enumerate(second) if char == "·"]
     assert "pts" not in second
     assert "r/localllama" in second
+
+
+def test_limit_recommended_keeps_all_popular() -> None:
+    def story(i: int, popular: bool) -> FeedStory:
+        return FeedStory(
+            i,
+            f"S{i}",
+            "https://example.org",
+            "https://example.org/x",
+            "hn",
+            1,
+            0,
+            0,
+            float(100 - i),
+            ["recent_mixed"],
+            popular,
+            False,
+        )
+
+    lookup = {i: story(i, i % 10 == 0) for i in range(1, 51)}
+    assert limit_recommended(list(range(1, 51)), lookup) == list(range(1, 31)) + [
+        40,
+        50,
+    ]
+    assert limit_recommended([1, 2], lookup) == [1, 2]
 
 
 def test_headline_truncates_long_domains_to_fit() -> None:

@@ -74,6 +74,23 @@ def story_metadata(story: FeedStory) -> str:
     return " · ".join(parts)
 
 
+RECOMMENDED_LIMIT = 30
+
+
+def limit_recommended(
+    order: list[int], lookup: dict[int, FeedStory], limit: int = RECOMMENDED_LIMIT
+) -> list[int]:
+    """First *limit* in rank order, plus any popular stories cut off.
+
+    Popular-flagged stories are never dropped by the truncation.
+    """
+    head, tail = order[:limit], order[limit:]
+    extras = [
+        sid for sid in tail if (story := lookup.get(sid)) is not None and story.popular
+    ]
+    return head + extras
+
+
 def headline_domain(story: FeedStory) -> str:
     if story.source.startswith("rss_reddit_") and len(story.source) > 11:
         return f"r/{story.source[11:]}"
@@ -570,6 +587,8 @@ class Reader(App[None]):
         age = self.query_one("#age", Select).value
         lookup = {story.id: story for story in self.feed.stories} if self.feed else {}
         order = self.feed.orders.get(f"{sort}:{age}", []) if self.feed else []
+        if sort == "recommended":
+            order = limit_recommended(order, lookup)
         self.stories = [
             lookup[sid]
             for sid in order
