@@ -1,8 +1,14 @@
 # HN Rerank status
 
-## Current TLDR deployment — daa8112
+## Current TLDR deployment — b77afc6
 
-Fixed pane budgets deployed to VPS: article-only and discussion-only target
+Discussion emphasis (detail-v14) deployed and live-tested: the reported Reddit
+story regenerated successfully with bold key terms in all 4 Discussion bullets.
+Exact VPS suite 820 passed; Ruff/format/ty clean. Service active after restart,
+dashboard and cached summary 200, bounded journal clean. Subscriptions unchanged.
+
+
+Fixed pane budgets from daa8112 remain deployed to VPS: article-only and discussion-only target
 240 words / 6–8 bullets; combined targets 120 words / 3–4 bullets per section.
 No viewport dimensions or resize-driven regeneration. Short sources may stay
 short. Replaces the undeployed article-only doubling experiment.
