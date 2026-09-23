@@ -76,6 +76,7 @@ def story_metadata(story: FeedStory) -> str:
 
 RECOMMENDED_LIMIT = 30
 RECOMMENDED_PER_SOURCE_CAP = 4
+RECOMMENDED_POPULAR_EVERY = 3
 
 
 def diversify_order(
@@ -99,6 +100,36 @@ def diversify_order(
         seen[story.source] = seen.get(story.source, 0) + 1
         picked.append(sid)
     return picked
+
+
+def blend_popular(
+    picked: list[int],
+    full_order: list[int],
+    lookup: dict[int, FeedStory],
+    every: int = RECOMMENDED_POPULAR_EVERY,
+    limit: int = RECOMMENDED_LIMIT,
+) -> list[int]:
+    """Weave popular-flagged stories into the queue every *every* slots.
+
+    Candidates come from the full rank order (skipping stories already
+    picked); output stays capped at *limit* in rank-priority order.
+    """
+    if every <= 0:
+        return picked[:limit]
+    remaining = [
+        sid
+        for sid in full_order
+        if sid not in set(picked)
+        and (story := lookup.get(sid)) is not None
+        and story.popular
+    ]
+    blended: list[int] = []
+    queue = list(picked)
+    while queue and len(blended) < limit:
+        blended.append(queue.pop(0))
+        if len(blended) % every == 0 and remaining:
+            blended.append(remaining.pop(0))
+    return blended[:limit]
 
 
 def headline_domain(story: FeedStory) -> str:
@@ -598,7 +629,7 @@ class Reader(App[None]):
         lookup = {story.id: story for story in self.feed.stories} if self.feed else {}
         order = self.feed.orders.get(f"{sort}:{age}", []) if self.feed else []
         if sort == "recommended":
-            order = diversify_order(order, lookup)
+            order = blend_popular(diversify_order(order, lookup), order, lookup)
         self.stories = [
             lookup[sid]
             for sid in order
