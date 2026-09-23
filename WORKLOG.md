@@ -1,5 +1,17 @@
 # Worklog: hn-rewrite
 
+## Recommended queue capped, unsummarizable hidden, quota doubled
+
+- TUI recommended orders now cap at 30 cards / 4 per source (client-side,
+  rank order preserved; other sorts unchanged). Compact one-line metadata
+  (`domain · pts · comments · age`) with column-aligned separators and
+  width-capped ellipsis domains.
+- Foreground summary failures hide the story for the session (auto-advance,
+  `r` restores); InvalidProfile still routes to setup.
+- Server TLDR quotas doubled (per-user 12→24/hr, global 60→120/hr) against
+  current gospark usage; watch spend/bans. Deployed with service restart;
+  dashboard 200, error journal clean.
+
 ## Deployed ab858ed, healed reported LW story
 
 - Verified commit in an isolated worktree (backend 812, TUI 75+1 skip,
