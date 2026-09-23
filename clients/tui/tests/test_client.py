@@ -258,6 +258,51 @@ async def test_rate_limit_and_zero_reset() -> None:
         assert app.feed and app.feed.ready and app.feed.version == 0
 
 
+class FailSummaryServer(FakeServer):
+    """Fails foreground taps for chosen stories; cache reads always miss."""
+
+    def __init__(self, fail_ids: set[int]) -> None:
+        super().__init__()
+        self.fail_ids = fail_ids
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/api/tldr-detail"):
+            story_id = json.loads(request.content)["story_id"]
+            if story_id in self.fail_ids:
+                return httpx.Response(500)
+        if "/api/tldr-cache/" in request.url.path:
+            return httpx.Response(204)
+        return await super().__call__(request)
+
+
+async def test_summary_failure_hides_story_until_refresh(
+    tmp_path: Path,
+) -> None:
+    fake = FailSummaryServer({1})
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while 1 not in app.unavailable:
+            if asyncio.get_running_loop().time() > deadline:
+                raise AssertionError("story 1 was not hidden")
+            await pilot.pause(0.05)
+        assert [s.id for s in app.stories] == [2]
+        selected = app.selected()
+        assert selected is not None and selected.id == 2
+        assert "Skipped story 1" in str(app.query_one("#status", Static).content)
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while "Summary 2" not in app.query_one(Markdown)._markdown:
+            if asyncio.get_running_loop().time() > deadline:
+                raise AssertionError("story 2 summary did not load")
+            await pilot.pause(0.05)
+        app.action_refresh()
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while [s.id for s in app.stories] != [1, 2]:
+            if asyncio.get_running_loop().time() > deadline:
+                raise AssertionError("refresh did not restore story 1")
+            await pilot.pause(0.05)
+
+
 async def test_stale_poll_does_not_cancel_summary_for_same_selection() -> None:
     fake = FakeServer()
     fake.feed = sample_feed(0, 1)

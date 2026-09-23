@@ -15,6 +15,7 @@ from hn_rerank.app import (
     EMPTY_NOTICE,
     Reader,
     Setup,
+    diversify_order,
     headline,
     headline_domain,
     headline_points,
@@ -273,11 +274,11 @@ def test_headline_hides_unknown_reddit_score_and_shows_subreddit() -> None:
     )
     rendered = headline(story).plain
     assert "r/localllama" in rendered
-    assert "0 pts" not in rendered
-    assert headline(replace(story, points=5)).plain.count("5 pts") == 1
+    assert "pts" not in rendered
+    assert "· 5 ·" in headline(replace(story, points=5)).plain
     hn = replace(story, source="hn", article_url="https://example.org/a")
     assert "example.org" in headline(hn).plain
-    assert "0 pts" in headline(hn).plain
+    assert "· 0 ·" in headline(hn).plain
 
 
 def test_headline_separators_share_columns_across_stories() -> None:
@@ -312,8 +313,60 @@ def test_headline_separators_share_columns_across_stories() -> None:
     second = headline(reddit, False, widths).plain.splitlines()[1]
     dots = [i for i, char in enumerate(first) if char == "·"]
     assert dots == [i for i, char in enumerate(second) if char == "·"]
-    assert "0 pts" not in second
+    assert "pts" not in second
     assert "r/localllama" in second
+
+
+def test_diversify_order_caps_sources_and_total() -> None:
+    lookup = {
+        i: replace(
+            FeedStory(
+                1,
+                "S",
+                "https://example.org",
+                "https://example.org/x",
+                "hn",
+                1,
+                0,
+                0,
+                1.0,
+                ["recent_mixed"],
+                False,
+                False,
+            ),
+            id=i,
+            source="rss_lesswrong_com" if i % 2 else "hn",
+        )
+        for i in range(1, 41)
+    }
+    order = list(range(1, 41)) + [999]
+    picked = diversify_order(order, lookup)
+    assert len(picked) == 8  # 4 per source over 2 sources
+    assert picked == [1, 2, 3, 4, 5, 6, 7, 8]
+    many = {i: replace(lookup[1], id=i, source=f"rss_src_{i}") for i in range(100)}
+    assert len(diversify_order(list(range(100)), many)) == 30
+
+
+def test_headline_truncates_long_domains_to_fit() -> None:
+    long_domain = FeedStory(
+        1,
+        "Story",
+        "https://marginalrevolution.com/posts/abc/slug",
+        "https://marginalrevolution.com/posts/abc/slug",
+        "rss_marginalrevolution_com",
+        5,
+        7,
+        0,
+        1.0,
+        ["recent_mixed"],
+        False,
+        False,
+    )
+    assert (
+        headline(long_domain, True, (10, 1, 1)).plain.splitlines()[1]
+        == "marginalr… · 5 · 7"
+    )
+    assert "marginalrevolution.com" in headline(long_domain).plain
 
 
 async def test_failure_copy_in_reading_pane() -> None:
@@ -446,8 +499,7 @@ async def test_reading_heading_tracks_refreshed_story_data() -> None:
         selected = app.selected()
         assert selected and selected.id == 1
         heading = str(app.query_one("#story-heading", Static).content)
-        assert "999 pts" in heading
-        assert "123 comments" in heading
+        assert "· 999 · 123" in heading
 
 
 async def test_vote_statusline_confirms_without_toast() -> None:

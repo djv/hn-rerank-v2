@@ -74,6 +74,33 @@ def story_metadata(story: FeedStory) -> str:
     return " · ".join(parts)
 
 
+RECOMMENDED_LIMIT = 30
+RECOMMENDED_PER_SOURCE_CAP = 4
+
+
+def diversify_order(
+    order: list[int],
+    lookup: dict[int, FeedStory],
+    limit: int = RECOMMENDED_LIMIT,
+    per_source_cap: int = RECOMMENDED_PER_SOURCE_CAP,
+) -> list[int]:
+    """Cap the recommended queue for breadth: at most *per_source_cap*
+    cards per source, *limit* total, preserving server rank order."""
+    picked: list[int] = []
+    seen: dict[str, int] = {}
+    for sid in order:
+        if len(picked) >= limit:
+            break
+        story = lookup.get(sid)
+        if story is None:
+            continue
+        if seen.get(story.source, 0) >= per_source_cap:
+            continue
+        seen[story.source] = seen.get(story.source, 0) + 1
+        picked.append(sid)
+    return picked
+
+
 def headline_domain(story: FeedStory) -> str:
     if story.source.startswith("rss_reddit_") and len(story.source) > 11:
         return f"r/{story.source[11:]}"
@@ -85,7 +112,7 @@ def headline_points(story: FeedStory) -> str:
     # Reddit RSS carries no scores (0/8487 rows have one): 0 means unknown,
     # not zero. The web card already hides zero scores; match that here.
     if story.points > 0 or not story.source.startswith("rss_reddit_"):
-        return f"{story.points} pts"
+        return str(story.points)
     return ""
 
 
@@ -110,14 +137,16 @@ def headline(
     )
     text.append("\n")
     domain = headline_domain(story)
-    if widths[0] > len(domain):
+    if widths[0] and len(domain) > widths[0]:
+        domain = domain[: widths[0] - 1] + "…" if widths[0] > 1 else "…"
+    elif widths[0] > len(domain):
         domain = domain.ljust(widths[0])
     text.append(domain, style="#8AB4F8")
     points = headline_points(story)
     if points or widths[1]:
         text.append(" · ", style="#6B655D")
         text.append(points.ljust(widths[1]) if widths[1] else points, style="#A8C7A0")
-    comments = f"{story.comments or 0} comments"
+    comments = str(story.comments or 0)
     age = story_age(story)
     text.append(" · ", style="#6B655D")
     if age and widths[2] > len(comments):
@@ -125,7 +154,7 @@ def headline(
     text.append(comments, style="#C6C1B8")
     if age:
         text.append(" · ", style="#6B655D")
-        text.append(f"{age} ago", style="#8F897F")
+        text.append(age, style="#8F897F")
     return text
 
 
@@ -354,6 +383,7 @@ class Reader(App[None]):
         self.feed: Feed | None = None
         self.stories: list[FeedStory] = []
         self.rated: set[int] = set()
+        self.unavailable: set[int] = set()
         self.restored: dict[int, FeedStory] = {}
         self.history: list[FeedStory] = []
         self.pending = False
@@ -512,6 +542,7 @@ class Reader(App[None]):
         self.interaction_session = str(uuid4())
         self.feed = None
         self.rated.clear()
+        self.unavailable.clear()
         self.restored.clear()
         self.history.clear()
         self.summaries.clear()
@@ -534,16 +565,25 @@ class Reader(App[None]):
             else None
         )
 
-    def meta_widths(self) -> tuple[int, int, int]:
-        """Per-segment widths so headline `·` separators share columns."""
-        return (
+    def meta_widths(self, available: int = 0) -> tuple[int, int, int]:
+        """Per-segment widths so headline `·` separators share columns.
+
+        When *available* (metadata content width) is positive, the domain
+        column is capped with ellipsis so the whole row fits on one line.
+        """
+        widths = [
             max((len(headline_domain(s)) for s in self.stories), default=0),
             max((len(headline_points(s)) for s in self.stories), default=0),
             max(
-                (len(f"{s.comments or 0} comments") for s in self.stories),
+                (len(str(s.comments or 0)) for s in self.stories),
                 default=0,
             ),
-        )
+        ]
+        age_w = max((len(story_age(s)) for s in self.stories), default=0)
+        total = widths[0] + 3 + widths[1] + 3 + widths[2] + 3 + age_w
+        if available > 0 and total > available and widths[0] > 8:
+            widths[0] = max(8, widths[0] - (total - available))
+        return (widths[0], widths[1], widths[2])
 
     def rebuild(self, select_id: int | None = None) -> None:
         # Teardown removes nodes before the final messages drain; ignore late
@@ -557,10 +597,17 @@ class Reader(App[None]):
         age = self.query_one("#age", Select).value
         lookup = {story.id: story for story in self.feed.stories} if self.feed else {}
         order = self.feed.orders.get(f"{sort}:{age}", []) if self.feed else []
-        self.stories = [lookup[sid] for sid in order if sid not in self.rated]
+        if sort == "recommended":
+            order = diversify_order(order, lookup)
+        self.stories = [
+            lookup[sid]
+            for sid in order
+            if sid not in self.rated and sid not in self.unavailable
+        ]
         headlines = self.query_one("#headlines", OptionList)
         headlines.clear_options()
-        widths = self.meta_widths()
+        # Option padding (1 each side) plus the 2-cell selection marker.
+        widths = self.meta_widths(max(0, headlines.size.width - 4))
         headlines.add_options(
             [
                 Option(
@@ -615,7 +662,7 @@ class Reader(App[None]):
         if self.setting_up or not self.query("#headlines"):
             return
         listing = self.query_one("#headlines", OptionList)
-        widths = self.meta_widths()
+        widths = self.meta_widths(max(0, listing.size.width - 4))
         for index, story in enumerate(self.stories):
             listing.replace_option_prompt(
                 str(story.id),
@@ -704,11 +751,22 @@ class Reader(App[None]):
             self.setup(str(exc))
         except APIError as exc:
             if serial == self.selection_serial and self.query("#summary"):
-                self.query_one("#summary", Markdown).update(
-                    "# Summary unavailable\n\nPress **r** to retry."
+                # Undisplayable summaries leave the deck: the failure may be
+                # transient (quota/cooldown), so this hides for the session
+                # only — refresh restores. InvalidProfile goes to setup above.
+                self.unavailable.add(story_id)
+                current = [s.id for s in self.stories]
+                try:
+                    advance: int | None = current[current.index(story_id) + 1]
+                except (ValueError, IndexError):
+                    advance = next(
+                        (sid for sid in reversed(current) if sid != story_id), None
+                    )
+                self.rebuild(select_id=advance)
+                self.status(
+                    f"Skipped story {story_id} — summary unavailable ({exc}). "
+                    "r restores hidden stories."
                 )
-                self.schedule_read_state()
-                self.status(str(exc) + " Press r to retry.", error=True)
 
     def schedule_prefetch(self) -> None:
         """Queue the stories just after the selection for a background warm.
@@ -875,6 +933,7 @@ class Reader(App[None]):
         self.help_open = False
         self.summary_story_id = None
         self.summaries.clear()
+        self.unavailable.clear()
         self.prefetch_queue.clear()
         self.prefetch_retry_at.clear()
         self.prefetch_cooldown_until = 0.0
