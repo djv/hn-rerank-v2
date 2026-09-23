@@ -1,4 +1,4 @@
-# Fixed TLDR pane budget (detail-v13)
+# Fixed TLDR pane budget (detail-v14)
 
 Summaries target a fixed 240-word reading pane, independent of client size,
 zoom, fullscreen, and source length. No dimensions are sent to the server.
@@ -13,6 +13,13 @@ Output shaping caps bullets at eight total. Existing token ceilings remain.
 The prompt-version bump invalidates exact-key caches; regeneration occurs on
 normal demand/prefetch. Provider/quota fallback can still serve a stale summary.
 No extraction, layout, zoom handlers, or client key bindings change in this deploy.
+
+## Discussion emphasis (detail-v14)
+
+The combined Discussion prompt now explicitly requires **bold** key terms in
+every content bullet, matching the emphasis instruction in the other summary
+paths. Budgets are unchanged. The cache-version bump makes existing exact-key
+summaries regenerate on demand; provider/quota fallback can still serve stale text.
 
 ## Deployment verification
 

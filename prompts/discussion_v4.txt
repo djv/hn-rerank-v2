@@ -10,6 +10,7 @@ Use at most one `####` heading, and only when the section has three or more bull
 Group bullets under freeform `####` headings that describe what this specific
 thread is actually about — pick heading names that fit this discussion, not
 a fixed set reused across every story.
+Use **bold** key terms in every content bullet, highlighting a concrete name, concept, or tradeoff.
 Do not put multiple bullets on one line.
 If the comments are thin or low-signal, say so explicitly.
 

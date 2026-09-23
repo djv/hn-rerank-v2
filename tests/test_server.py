@@ -5182,10 +5182,10 @@ async def test_generated_tldr_preserves_fixed_pane_allowance(
 
 
 @pytest.mark.asyncio
-async def test_generate_detailed_tldr_scales_combined_path_budgets(monkeypatch):
-    """The combined article+comments path must inject volume-scaled budgets
-    into both halves rather than staying fixed-length regardless of input
-    size (matches article-only/discussion-only scaling)."""
+async def test_generate_detailed_tldr_combined_prompt_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both generation calls receive their fixed budget and emphasis instruction."""
     import server
 
     calls = []
@@ -5214,6 +5214,8 @@ async def test_generate_detailed_tldr_scales_combined_path_budgets(monkeypatch):
     article_prompt, discussion_prompt = calls
     assert "3-4 bullets, aim for 120 words" in article_prompt
     assert "3-4 bullets, aim for 120 words" in discussion_prompt
+    assert "Use **bold** key terms" in article_prompt
+    assert "Use **bold** key terms in every content bullet" in discussion_prompt
 
 
 @pytest.mark.asyncio
