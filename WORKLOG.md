@@ -10,6 +10,8 @@
   4→28 comments, at_fetch 23→28, score 0→138. Restart published it.
 - Known gap: prewarm covers only fresh feed candidates, not deck-visible
   stories aged out of feeds. Future work, no ranking change authorized.
+- Zero-score backfill closed at 47/54; remaining 7 kept (2 carry votes).
+  Retry heal on next session rather than deleting.
 
 ## Handoff: independent summary cadence and ranking attribution
 

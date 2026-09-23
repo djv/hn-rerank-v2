@@ -88,6 +88,12 @@ feeds (like the healed 13-day-old LW post) never get rechecked automatically;
 healing those needs either on-demand refresh or extending prewarm selection to
 snapshot/deck-visible stories — future work, needs a design pass.
 
+Zero-score LW backfill: 47/54 healed via the app prewarm path (38 serial,
+9 with 6-way parallel). 7 remain, all LessWrong-throttled timeouts, still
+score=0. Deletion declined: 2 of the 7 carry user feedback that deletion
+would orphan (project rule: never destructively modify the DB). Retry the
+heal later; do not DELETE these rows.
+
 Remaining WIP (still local, undeployed): web JSON refill migration in
 `templates/index.html`, `pipeline/render.py`,
 `clients/tui/src/hn_rerank/models.py`, `tests/test_feed_api.py`,
