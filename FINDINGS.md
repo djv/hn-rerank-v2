@@ -21,6 +21,34 @@ alone. Single-feature ablations can be out-of-distribution; these are model
 sensitivities, not causal evidence of user preference or quality probabilities.
 Do not tune against the consumed confirmation set. No ranker changes made.
 
+## LessWrong concentration — model-driver attribution (snapshot-only)
+
+`scripts/diagnose_rank_drivers.py` reuses the production-trained SVM/scaler
+via the model cache (reconstruction fidelity: top-100 overlap 100/100, rank
+correlation 1.0) on a disposable read-only snapshot for user 1.
+
+- Tier math: with 5003 feedback (1671 up / 1569 down), alpha_2 = alpha_3 = 1,
+  so final scores are 100% SVM decision. HN gravity and centroid similarity
+  have exactly zero weight for this profile.
+- Raw SVM margins: LW median +2.15 vs HN/other-RSS median -0.21.
+- Neutralizing all 10 meta features collapses the LW-vs-HN gap (+2.36 → +0.01)
+  and sinks mean LW rank 1758 → 4688. Zeroing all 384 embedding dims barely
+  moves it (gap 2.35, rank 1859). The advantage lives in meta, not raw text.
+- No single meta column explains it (per-column drops shift the gap only
+  ~0.03–0.16): the RBF SVM learned a joint pattern, not one dominant feature.
+- Training revealed preference matches: RSS up-rate 43.8% (highest), HN-live
+  30.6% (lowest). Within RSS, upvoted items are ~3.6x longer (median 6033 vs
+  1676 chars); HN shows no length split. Decided LW votes are 71% up (25/35).
+- LW candidates combine all three learned signals: is_rss=1, very long
+  (median 9827 chars), high similarity to upvoted content (0.70 vs 0.48–0.55).
+
+Conclusion: the concentration is faithful personalization of recorded votes,
+not a client bug or an additive source boost (the SVM cannot even distinguish
+LW from other RSS — same one-hot bucket). Concentration rotates among RSS
+sources as candidate sets change. Any diversity intervention is a product
+decision requiring explicit authorization and an evidence plan; the
+confirmation set is consumed and must not be tuned against.
+
 ## Authorized duplicate Import AI vote cleanup — 2026-09-22
 
 - User explicitly chose cleanup of duplicate feedback records. Scope limited
