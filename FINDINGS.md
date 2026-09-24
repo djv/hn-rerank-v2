@@ -1,5 +1,21 @@
 # HN Rerank findings
 
+## TUI focus-visibility evidence (2026-09-24)
+
+- Screenshot rig: `clients/tui` pilot harness (`export_screenshot` → SVG) +
+  `google-chrome --headless --screenshot` → PNG; outputs in `/tmp/tui_*.png`
+  (narrow/wide × headlines/sort/summary focus). Rig script removed after
+  use; recreate from WORKLOG recipe if needed.
+- Key results: orange pane frames only on focus; amber `#5A3A12` selected
+  row (full `#FF914D` washed out metadata, `#3D2A17` too faint);
+  `Select:focus` never fires (focus lands on inner `SelectCurrent`) — fixed
+  with `:focus-within`; `outline` spills on 1-row widgets — permanent
+  invisible border recolored on focus instead; `SelectCurrent` needs
+  explicit `height: 3` once bordered (border-box squeezes text otherwise).
+- `wmctrl -x -a Navigator.firefox` verified live for focus pull.
+- Flaky TUI test observed once (fail → pass on rerun, same code); test name
+  not captured — rerun full TUI suite before committing the UI batch.
+
 ## Client-side heavy work (2026-09-23)
 
 - Compute is not the bottleneck anywhere: local ONNX embed of 68 stories =

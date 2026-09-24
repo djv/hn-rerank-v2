@@ -74,6 +74,11 @@ async def test_editorial_filters_and_resize(width: int) -> None:
         summary = app.query_one(Markdown)
         assert app.query_one("#sort-tabs", Tabs).display == (width >= 100)
         assert app.query_one("#sort", Select).display == (width < 100)
+        sort_control = app.query_one("#sort-tabs" if width >= 100 else "#sort")
+        age_control = app.query_one("#age-tabs" if width >= 100 else "#age")
+        assert sort_control.region.y == age_control.region.y
+        assert sort_control.region.right <= age_control.region.x
+        assert age_control.region.right <= width
         assert "example.org" in str(app.query_one("#story-heading", Static).content)
         assert listing.highlighted == 0
         assert listing.display and summary.display
@@ -108,6 +113,50 @@ async def test_editorial_filters_and_resize(width: int) -> None:
         await pilot.press("j")
         await pilot.pause()
         assert summary.scroll_y == scroll
+
+
+async def test_focused_pane_shows_accent_border() -> None:
+    app = Reader(api=FakeServer().api())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await pilot.pause(0.4)
+        headlines = app.query_one("#headlines", OptionList)
+        headlines.focus()
+        await pilot.pause()
+        assert headlines.styles.border_top[1].hex.upper() == "#FF914D"
+        app.query_one(Markdown).focus()
+        await pilot.pause()
+        assert headlines.styles.border_top[1].hex.upper() == "#171717"
+
+
+@pytest.mark.parametrize("width", [60, 120])
+async def test_filter_change_starts_at_first_story(width: int) -> None:
+    app = Reader(api=FakeServer().api())
+    async with app.run_test(size=(width, 35)) as pilot:
+        await pilot.pause(0.4)
+        listing = app.query_one("#headlines", OptionList)
+        listing.highlighted = 1
+        await pilot.pause()
+        selected = app.selected()
+        assert selected is not None and selected.id == 2
+        if width < 100:
+            app.query_one("#sort", Select).value = "date"
+        else:
+            await pilot.click("#sort-date")
+        await pilot.pause()
+        assert [story.id for story in app.stories] == [2, 1]
+        assert listing.highlighted == 0
+        selected = app.selected()
+        assert selected is not None and selected.id == 2
+        if width < 100:
+            app.query_one("#sort", Select).value = "recommended"
+        else:
+            await pilot.click("#sort-recommended")
+        await pilot.pause()
+        assert listing.highlighted == 0
+        selected = app.selected()
+        assert selected is not None and selected.id == 1
+        assert listing.scroll_y == 0
+        assert app.query_one("#story-heading", Static).outer_size.height <= 4
 
 
 @pytest.mark.parametrize("width", [60, 80, 100, 140])

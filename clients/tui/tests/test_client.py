@@ -351,6 +351,42 @@ async def test_empty_summary_hides_story_until_refresh(
             await pilot.pause(0.05)
 
 
+def test_open_in_firefox_reuses_running_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess as stdlib_subprocess
+
+    import hn_rerank.app as app_module
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/firefox")
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *a, **k: stdlib_subprocess.CompletedProcess(a[0], 0),
+    )
+    monkeypatch.setattr("subprocess.Popen", lambda argv, **k: calls.append(argv))
+    app_module.open_in_firefox("https://example.org/x")
+    assert calls == [["/usr/bin/firefox", "--new-tab", "https://example.org/x"]]
+
+
+def test_open_in_firefox_launches_when_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess as stdlib_subprocess
+
+    import hn_rerank.app as app_module
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/firefox")
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *a, **k: stdlib_subprocess.CompletedProcess(a[0], 1),
+    )
+    monkeypatch.setattr("subprocess.Popen", lambda argv, **k: calls.append(argv))
+    app_module.open_in_firefox("https://example.org/x")
+    assert calls == [["/usr/bin/firefox", "https://example.org/x"]]
+
+
 async def test_stale_poll_does_not_cancel_summary_for_same_selection() -> None:
     fake = FakeServer()
     fake.feed = sample_feed(0, 1)

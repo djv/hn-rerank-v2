@@ -1,5 +1,14 @@
 # Worklog: hn-rewrite
 
+## Local TUI filter navigation and heading spacing (uncommitted)
+
+- Switching sort or age starts at the first story and scrolls the headline list
+  home; ordinary feed refresh still preserves the selected story.
+- Removed one row of vertical padding from the reading pane's story heading.
+  Brand and filter controls share the top line; narrow-screen controls retain
+  two rows of header space and slim selectors.
+- Focused TUI tests cover dropdown and tab switching at 60/120 columns.
+
 ## Empty stories flagged and skipped (7698e0c live)
 
 - `tldr-detail` no-content path returns `empty: true` (still retryable,

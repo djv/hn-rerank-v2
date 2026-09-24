@@ -28,6 +28,11 @@ from textual.widgets import (
     Tab,
     Tabs,
 )
+from textual.widgets._select import (
+    NonSelectableStatic,
+    SelectCurrent,
+    SelectOverlay,
+)
 from textual.widgets.option_list import Option
 
 from .api import (
@@ -44,6 +49,57 @@ from .api import (
 from .models import Feed, FeedStory
 
 DEFAULT_SERVER = "https://ubuntu-8gb-nbg1-1.tailca4726.ts.net:8443/hn/"
+
+
+def open_in_firefox(url: str) -> None:
+    """Open a URL in the running Firefox window, launching one if needed."""
+    import shutil
+    import subprocess
+
+    firefox = shutil.which("firefox")
+    if firefox is None:
+        webbrowser.open(url)
+        return
+    running = (
+        subprocess.run(
+            ["pgrep", "-x", "firefox"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode
+        == 0
+    )
+    subprocess.Popen(
+        [firefox, "--new-tab", url] if running else [firefox, url],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    if shutil.which("wmctrl") is not None:
+        subprocess.run(
+            ["wmctrl", "-x", "-a", "Navigator.firefox"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+class ArrowLeftCurrent(SelectCurrent):
+    """SelectCurrent with the toggle arrow ahead of the label."""
+
+    def compose(self) -> ComposeResult:
+        yield NonSelectableStatic("▼", classes="arrow down-arrow")
+        yield NonSelectableStatic("▲", classes="arrow up-arrow")
+        yield NonSelectableStatic(self.placeholder, id="label")
+
+
+class Dropdown(Select):
+    """Select that reads arrow-first; overlay behavior unchanged."""
+
+    def compose(self) -> ComposeResult:
+        yield ArrowLeftCurrent(self.prompt)
+        yield SelectOverlay(type_to_search=self._type_to_search).data_bind(
+            compact=Select.compact
+        )
+
 
 # Hacker News launched in 2006; earlier timestamps are missing or placeholder data.
 EARLIEST_STORY_TIME = 1_136_073_600
@@ -300,30 +356,38 @@ class Reader(App[None]):
     TITLE = "HN Rerank"
     CSS = """
     Screen { background: #171717; color: #EEE8DD; }
-    #brand { height: 1; padding: 0 1; text-style: bold; color: #FF914D; }
-    #filters { height: 3; }
-    Select { width: 1fr; display: none; }
-    SelectCurrent { background: #222222; border: tall #44403B; }
-    Select:focus SelectCurrent { border: tall #FF914D; }
+    #filters { height: 2; align-vertical: top; }
+    Select { width: auto; height: auto; display: none; }
+    .filter-caption { width: auto; height: 1; padding: 0 1 0 2; color: #8F897F; display: none; }
+    .narrow .filter-caption { display: block; }
+    SelectCurrent { background: transparent; border: none; height: 1; width: auto; padding: 0 2; }
+    SelectCurrent .arrow { padding: 0 1 0 0; }
+    SelectCurrent Static#label { width: auto; }
+    Select:focus-within > SelectCurrent { background: #FF914D; }
+    Select:focus-within Static#label { color: #171717; }
+    Select:focus-within .arrow { color: #171717; }
+    .narrow #filters { height: 1; }
     Tabs { width: auto; }
-    #sort-tabs { width: 60; }
+    #sort-tabs { width: 58; }
+    #age-tabs { width: 20; }
     Tab { color: #AAA399; padding: 0 1; }
     Tab.-active { color: #FF914D; text-style: bold; }
     Tabs:focus Tab.-active { text-style: bold underline; }
     Underline > .underline--bar { color: #FF914D; background: #171717; }
     #panes { height: 1fr; }
     #headlines { width: 1fr; height: 1fr; background: #171717;
-                 border: none; padding: 0; }
+                 border: solid #171717; padding: 0; }
+    #headlines:focus { border: solid #FF914D; }
     #headlines > .option-list--option { padding: 0 1; }
     #headlines > .option-list--option-highlighted {
-        background: #2E2B27; color: #EEE8DD;
+        background: #5A3A12; color: #FFFFFF; text-style: bold;
     }
-    #headlines:focus { background-tint: #171717 0%; }
-    #headlines:focus > .option-list--option-highlighted { text-style: none; }
+    #headlines:focus > .option-list--option-highlighted { text-style: none;
+        border-left: solid #FF914D; }
     #reading-pane { width: 2fr; height: 1fr; border-left: solid #44403B;
                     max-width: 100; }
     #reading-pane.has-story:focus-within { border-left: solid #FF914D; }
-    #story-heading { height: auto; max-height: 8; padding: 1 2;
+    #story-heading { height: auto; max-height: 6; padding: 0 1;
                      border-bottom: solid #2A2825; }
     #summary { width: 1fr; height: 1fr; padding: 0 2; overflow-y: auto;
                background: #171717; color: #EEE8DD; }
@@ -345,7 +409,7 @@ class Reader(App[None]):
     .narrow Tabs { display: none; }
     .narrow Select { display: block; }
     .narrow #panes { layout: vertical; }
-    .narrow #headlines { width: 1fr; height: 2fr; }
+    .narrow #headlines { width: 1fr; height: 1fr; }
     .narrow #reading-pane { width: 1fr; height: 3fr; border-left: none;
                             border-top: solid #44403B; }
     .narrow #reading-pane.has-story:focus-within { border-top: solid #FF914D; }
@@ -435,7 +499,6 @@ class Reader(App[None]):
         self.prefetch_cooldown_until = 0.0
 
     def compose(self) -> ComposeResult:
-        yield Static("HN Rerank", id="brand")
         with Horizontal(id="filters"):
             yield Tabs(
                 *(
@@ -449,13 +512,15 @@ class Reader(App[None]):
                 Tab("Archive", id="age-archive"),
                 id="age-tabs",
             )
-            yield Select(
+            yield Static("Sort", classes="filter-caption")
+            yield Dropdown(
                 [(s.title(), s) for s in ("recommended", "popular", "explore", "date")],
                 value="recommended",
                 allow_blank=False,
                 id="sort",
             )
-            yield Select(
+            yield Static("Age", classes="filter-caption")
+            yield Dropdown(
                 [("Recent", "recent"), ("Archive", "archive")],
                 value="recent",
                 allow_blank=False,
@@ -658,6 +723,8 @@ class Reader(App[None]):
             headlines.highlighted = next(
                 (i for i, s in enumerate(self.stories) if s.id == select_id), 0
             )
+            if select_id == -1:  # Filter change: no story has this ID.
+                headlines.scroll_home(animate=False)
             # Fresh feed data can carry new points/comments; keep the reading
             # heading in step even when the selection id has not changed.
             if selected := self.selected():
@@ -685,7 +752,7 @@ class Reader(App[None]):
         tabs_id = f"#{event.select.id}-tabs"
         if event.select.id in {"sort", "age"} and self.query(tabs_id):
             self.query_one(tabs_id, Tabs).active = f"{event.select.id}-{event.value}"
-        self.rebuild()
+        self.rebuild(select_id=-1)
 
     def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
         if not event.tab.id or event.tab.id != event.tabs.active:
@@ -1117,7 +1184,7 @@ class Reader(App[None]):
         story = self.selected()
         url = getattr(story, field, "") if story else ""
         if urlsplit(url).scheme in {"http", "https"}:
-            webbrowser.open(url)
+            open_in_firefox(url)
         else:
             self.status("No link available for this story.")
 
