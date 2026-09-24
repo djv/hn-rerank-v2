@@ -183,63 +183,61 @@ async def test_footer_hints_spell_out_vote_directions() -> None:
     async with app.run_test(size=(100, 35)) as pilot:
         await pilot.pause(0.6)
         hints = app.query_one("#shortcuts", Static)
-        assert "1 up · 2 neutral · 3 down" in str(hints.content)
+        assert "1 up · 2 neutral · 3 down → next story" in str(hints.content)
         assert "j/k move" in str(hints.content)
         assert app.query_one("#shortcuts").region.height == 1
         assert app.query_one("#status").region.height == 1
 
 
-async def test_enter_does_not_toggle_view() -> None:
+async def test_narrow_footer_keeps_status_visible() -> None:
     fake = FakeServer()
     app = Reader(api=fake.api())
-    async with app.run_test(size=(120, 35)) as pilot:
+    async with app.run_test(size=(51, 37)) as pilot:
+        await pilot.pause(0.6)
+        status = app.query_one("#status").region
+        hints = app.query_one("#shortcuts").region
+        # Stacked rows: status keeps the full width instead of being squeezed out.
+        assert status.width == hints.width > 40
+        assert status.y < hints.y
+        assert hints.height == 2
+
+
+@pytest.mark.parametrize("size", [(51, 37), (80, 30), (140, 40)])
+@pytest.mark.parametrize("exit_key", ["enter", "escape"])
+@pytest.mark.parametrize("long_summary", [False, True])
+async def test_enter_zooms_tldr(
+    size: tuple[int, int], exit_key: str, long_summary: bool
+) -> None:
+    fake = EditorialServer() if long_summary else FakeServer()
+    app = Reader(api=fake.api())
+    async with app.run_test(size=size) as pilot:
         await pilot.pause(0.6)
         listing = app.query_one(OptionList)
         summary = app.query_one(Markdown)
-        assert listing.has_focus
-        await pilot.press("enter")
-        await pilot.pause()
-        assert listing.has_focus
-        assert not summary.has_focus
-        assert listing.display and summary.display
-
-
-async def test_read_mode_only_when_summary_overflows() -> None:
-    short = FakeServer()
-    app = Reader(api=short.api())
-    async with app.run_test(size=(120, 35)) as pilot:
-        await pilot.pause(0.6)
         hints = app.query_one("#shortcuts", Static)
-        assert "Enter read" not in str(hints.content)
-        listing = app.query_one(OptionList)
-        await pilot.press("enter")
-        await pilot.pause()
         assert listing.has_focus
-        assert not app.reading
-
-    long = EditorialServer()
-    app = Reader(api=long.api())
-    async with app.run_test(size=(80, 30)) as pilot:
-        await pilot.pause(0.6)
-        hints = app.query_one("#shortcuts", Static)
-        for _ in range(20):
-            if "Enter read" in str(hints.content):
-                break
-            await pilot.pause(0.2)
-        assert "Enter read" in str(hints.content)
-        listing = app.query_one(OptionList)
+        assert "Enter zoom" in str(hints.content)
+        selected = app.selected()
         await pilot.press("enter")
         await pilot.pause()
         assert app.reading
         assert not listing.display
-        assert app.query_one(Markdown).has_focus
-        await pilot.press("j")
-        await pilot.pause()
-        assert app.query_one(Markdown).scroll_y > 0
-        await pilot.press("escape")
+        assert summary.has_focus
+        pane = app.query_one("#reading-pane").region
+        available = app.query_one("#panes").region
+        assert pane.width == min(100, available.width)
+        assert abs((pane.x - available.x) - (available.right - pane.right)) <= 1
+        assert "Enter/Esc back" in str(hints.content)
+        if long_summary and summary.max_scroll_y > 0:
+            await pilot.press("j")
+            await pilot.pause()
+            assert summary.scroll_y > 0
+        await pilot.press(exit_key)
         await pilot.pause()
         assert not app.reading
-        assert listing.display
+        assert listing.display and listing.has_focus
+        assert app.selected() == selected
+        assert "Enter zoom" in str(hints.content)
 
 
 async def test_empty_and_error_recovery() -> None:
@@ -589,3 +587,18 @@ async def test_footer_counts_follow_filters() -> None:
         assert str(app.query_one("#status", Static).content).startswith("✗ ")
         app.rebuild()
         assert "Could not reach server" in str(app.query_one("#status", Static).content)
+
+
+async def test_narrow_footer_fits_error_and_zoom_shortcuts() -> None:
+    app = Reader(api=FakeServer().api())
+    async with app.run_test(size=(51, 37)) as pilot:
+        await pilot.pause(0.6)
+        await pilot.press("enter")
+        app.status("Connection failed. " * 10, error=True)
+        await pilot.pause()
+        status = app.query_one("#status").region
+        hints = app.query_one("#shortcuts").region
+        footer = app.query_one("#footer").content_region
+        assert status.height == 3
+        assert status.bottom <= hints.y
+        assert hints.bottom <= footer.bottom

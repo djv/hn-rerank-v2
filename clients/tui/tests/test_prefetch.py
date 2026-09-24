@@ -86,7 +86,7 @@ async def test_cache_miss_never_generates_until_selected() -> None:
             return await super().__call__(request)
 
     fake = MissServer()
-    app = Reader(api=fake.api())
+    app = Reader(api=fake.api(), prefetch_generate=0)
     async with app.run_test(size=(120, 35)) as pilot:
         await wait_for(pilot, lambda: 2 in app.prefetch_retry_at)
         assert fake.summary_ids == [1]
@@ -119,7 +119,10 @@ async def test_prefetch_stops_on_rate_limit() -> None:
     async with app.run_test(size=(120, 35)) as pilot:
         await wait_for(pilot, lambda: 2 in fake.summary_ids)
         await pilot.pause(0.3)
-        assert 3 not in fake.summary_ids  # chain paused, not merely slowed
+        before = list(fake.summary_ids)
+        app.schedule_prefetch()
+        await pilot.pause(0.1)
+        assert fake.summary_ids == before  # no new work during cooldown
         assert 2 not in app.summaries  # nothing provisional cached
         assert app.prefetch_cooldown_until > 0
 
@@ -158,7 +161,12 @@ def test_cli_prefetch_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, int] = {}
 
     class FakeReader:
-        def __init__(self, server: str | None = None, prefetch: int = 2) -> None:
+        def __init__(
+            self,
+            server: str | None = None,
+            prefetch: int = 2,
+            prefetch_generate: int = 3,
+        ) -> None:
             captured["prefetch"] = prefetch
 
         def run(self) -> None:
@@ -171,3 +179,112 @@ def test_cli_prefetch_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys, "argv", ["hn-rerank", "--prefetch", "-1"])
     with pytest.raises(SystemExit):
         main_module.main()
+
+
+class NavigationServer(PrefetchServer):
+    """Uncached navigation targets plus a generation gate for catch-up races."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        base = self.feed.stories[0]
+        self.feed = replace(
+            self.feed,
+            stories=[replace(base, id=i, title=f"Story {i}") for i in range(1, 31)],
+            orders={
+                "recommended:recent": list(range(1, 26)),
+                "popular:recent": [26, 27],
+                "explore:recent": [28, 29],
+                "date:recent": [30],
+            },
+        )
+        self.generated: list[int] = []
+        self.cached: list[int] = []
+        self.blocked: set[int] = set()
+        self.release = asyncio.Event()
+        self.active = 0
+        self.peak = 0
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        if "/api/tldr-cache/" in request.url.path:
+            self.requests.append(request)
+            sid = int(request.url.path.rsplit("/", 1)[1])
+            self.cached.append(sid)
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            try:
+                await asyncio.sleep(0.03)
+                return httpx.Response(204)
+            finally:
+                self.active -= 1
+        if request.url.path.endswith("/api/tldr-detail"):
+            sid = json.loads(request.content)["story_id"]
+            self.generated.append(sid)
+            if sid in self.blocked:
+                await self.release.wait()
+        return await super().__call__(request)
+
+
+async def test_navigation_prefetch_generates_nearby_and_other_sorts() -> None:
+    fake = NavigationServer()
+    app = Reader(api=fake.api())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await wait_for(
+            pilot, lambda: app.summaries.keys() >= {1, 2, 3, 4, 26, 27, 28, 29, 30}
+        )
+        await wait_for(pilot, lambda: 21 in fake.cached)
+        assert 5 not in fake.generated  # deeper cache misses wait until nearby
+        assert 22 not in fake.cached
+        assert 1 < fake.peak <= 4
+        await pilot.press("j")
+        await wait_for(pilot, lambda: 5 in app.summaries)  # rolling window refills
+        await pilot.press("k")
+        assert "Summary 1" in app.query_one(Markdown)._markdown
+        await pilot.press("s")
+        await pilot.pause()
+        assert "Summary 26" in app.query_one(Markdown)._markdown
+        assert fake.generated.count(26) == 1
+        await pilot.press("1")
+        await wait_for(
+            pilot, lambda: (story := app.selected()) is not None and story.id == 27
+        )
+        assert "Summary 27" in app.query_one(Markdown)._markdown
+        assert fake.generated.count(27) == 1
+
+
+async def test_selecting_inflight_generation_reuses_request() -> None:
+    fake = NavigationServer()
+    fake.blocked = {2}
+    app = Reader(api=fake.api())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await wait_for(pilot, lambda: 2 in fake.generated)
+        await pilot.press("j")
+        await pilot.pause(0.4)
+        assert fake.generated.count(2) == 1
+        fake.release.set()
+        await wait_for(pilot, lambda: "Summary 2" in app.query_one(Markdown)._markdown)
+        assert fake.generated.count(2) == 1
+
+
+async def test_refresh_cancels_prefetch_generation() -> None:
+    fake = NavigationServer()
+    fake.blocked = {2, 3, 4}
+    app = Reader(api=fake.api())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await wait_for(pilot, lambda: {2, 3, 4} <= set(fake.generated))
+        old = list(app.prefetch_requests.values())
+        app.action_refresh()
+        await pilot.pause(0.2)
+        assert all(task.done() for task in old)
+        fake.release.set()
+        await wait_for(pilot, lambda: 2 in app.summaries)
+
+
+async def test_prefetch_runs_while_selected_story_generates() -> None:
+    fake = NavigationServer()
+    fake.blocked = {1}
+    app = Reader(api=fake.api())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await wait_for(pilot, lambda: 2 in app.summaries)
+        assert 1 not in app.summaries
+        fake.release.set()
+        await wait_for(pilot, lambda: 1 in app.summaries)

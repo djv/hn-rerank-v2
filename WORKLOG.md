@@ -1,5 +1,67 @@
 # Worklog: hn-rewrite
 
+## 2026-09-24 TUI commit review
+
+- Reproduced a clipped footer at 51 columns: three error lines plus two
+  shortcut lines and the border exceeded the five-row cap. Removed the
+  footer cap; the status text retains its own three-row maximum. Added a
+  layout regression test that verifies both widgets fit inside the footer.
+- Final checks: TUI 121 passed/1 skipped, backend 821 passed, Ruff/format/ty
+  clean. Relaunched the client and verified 44 stories render.
+- Prepared `Improve TUI zoom and navigation prefetch`; user subsequently
+  authorized committing and pushing the reviewed changes.
+
+## 2026-09-24 Navigation-aware TLDR prefetch (uncommitted)
+
+- Default forward cache window is 20, with four concurrent background requests.
+  The previous three and first three stories in other sorts are also warmed.
+- Generate missing TLDRs for the next three, previous three, and other-sort
+  entry points. User explicitly authorized generation, including sort/vote/j/k
+  navigation. `--prefetch-generate 0` restores cache-only behavior.
+- Prefetch starts alongside the selected request. Selection joins in-flight
+  work; cached summaries survive sort changes. Cache misses becoming nearby
+  can be generated immediately instead of waiting for the cache retry timer.
+- API errors halt new speculation for 60 seconds. TaskGroup owns parallel
+  workers; refresh/shutdown cancel work. Empty/provisional results stay uncached.
+- Tests cover sort/vote/j/k navigation, bounded concurrency, generation scope,
+  foreground joins, refresh cancellation and prefetch during a slow foreground.
+- Validation: TUI 120 passed/1 skipped; backend 821 passed with local model
+  override; Ruff, formatting and ty clean. No server code changed.
+
+## 2026-09-24 Voting advance hint (uncommitted)
+
+- Footer now says `1 up · 2 neutral · 3 down → next story`, making the
+  existing vote-to-advance flow explicit. Hints now sit below status at all
+  widths, so the longer legend cannot squeeze the story counts into a sliver.
+- Checks: TUI 116 passed/1 skipped; backend 821 passed with local model
+  override; Ruff/format/ty clean. Relaunched `work:3.1` and verified the
+  new legend live, then restored TLDR zoom.
+
+## 2026-09-24 TUI TLDR zoom (uncommitted)
+
+- Enter hides the article list and gives the TLDR pane the full available
+  height at every terminal size, including short summaries. The zoomed pane
+  is centered and capped at 100 columns on wide terminals.
+- Enter or Escape restores the list and its focus; footer and help show the
+  zoom/return controls. Existing narrow footer/frame changes are preserved.
+- Regression tests cover short/long summaries, three terminal sizes, both
+  exit keys, selected-story preservation, pane dimensions and focus.
+- User confirmed fullscreen behavior works in the live session before the
+  subsequent centered-column refinement. Offline preview now captures zoom
+  at `/tmp/hn-editorial-zoom.svg`.
+- Checks: TUI 116 passed/1 skipped; backend 821 passed with the local ONNX
+  model path override; Ruff, touched-file format, ty and diff checks clean.
+
+## TUI narrow footer and focus frame (uncommitted)
+
+- At narrow widths (e.g. a 51-column tmux pane) the hints took the whole
+  footer, so status and errors had zero width. The narrow footer now stacks
+  status above the hints. Narrow hints drop `b badges`; `?` help still lists it.
+- The wide `#reading-pane:focus-within` left edge outranked `.narrow` and
+  drew a half box. The narrow rule now cancels it, leaving only a top edge.
+- Screenshots at 51x37, 80x30, 100x35 and 140x40 (`/tmp/tui-shots`), plus a
+  live `hn` launch in narrow mode: status and frame are correct.
+
 ## TUI review fixes (uncommitted)
 
 - `--server` defaulted to `DEFAULT_SERVER`, so every launch counted as an

@@ -44,6 +44,7 @@ from .api import (
     InvalidProfile,
     Impression,
     Profile,
+    Summary as SummaryResult,
     TransientError,
     load_profile,
     normalize_server,
@@ -118,8 +119,11 @@ class Dropdown(Select):
 # Hacker News launched in 2006; earlier timestamps are missing or placeholder data.
 EARLIEST_STORY_TIME = 1_136_073_600
 
-# Pause speculative prefetch after any API error; foreground taps keep priority.
+# Pause new speculative prefetch after background API errors.
 PREFETCH_COOLDOWN_SECONDS = 60.0
+DEFAULT_PREFETCH = 20
+DEFAULT_PREFETCH_GENERATE = 3
+PREFETCH_CONCURRENCY = 4
 
 
 def story_age(story: FeedStory) -> str:
@@ -414,20 +418,24 @@ class Reader(App[None]):
     MarkdownFence { background: #222222; margin: 0 0 1 0; padding: 1; }
     #summary MarkdownBlock > .strong { color: #FF914D; text-style: bold; }
     #summary MarkdownBlock > .em { color: #FF914D; }
-    #footer { dock: bottom; height: auto; max-height: 4; background: #1D1C1A;
+    #footer { dock: bottom; layout: vertical; height: auto; background: #1D1C1A;
               border-top: solid #2A2825; }
     #status { width: 1fr; height: auto; max-height: 3; padding: 0 1; color: #AAA399; }
     #status.context { color: #C6C1B8; }
     #status.error { color: #FFB4A6; text-style: bold; }
-    #shortcuts { width: auto; height: auto; padding: 0 1; color: #8F897F; }
+    #shortcuts { width: 1fr; height: auto; padding: 0 1; color: #8F897F; }
     .narrow Tabs { display: none; }
     .narrow Select { display: block; }
     .narrow #panes { layout: vertical; }
     .narrow #headlines { width: 1fr; height: 1fr; }
     .narrow #reading-pane { width: 1fr; height: 3fr; border-left: none;
                             border-top: solid #44403B; }
-    .narrow #reading-pane.has-story:focus-within { border-top: solid #FF914D; }
-    .narrow.reading #headlines { display: none; }
+    /* The wide focus rule outranks `.narrow #reading-pane`; cancel its left edge. */
+    .narrow #reading-pane.has-story:focus-within { border-top: solid #FF914D;
+                                                   border-left: none; }
+    .reading #headlines { display: none; }
+    .reading #panes { align-horizontal: center; }
+    .reading #reading-pane { width: 1fr; max-width: 100; }
     .narrow.reading #reading-pane { height: 1fr; }
     """
     BINDINGS: ClassVar[list[tuple[str, str, str]]] = [
@@ -453,7 +461,8 @@ class Reader(App[None]):
         server: str | None = None,
         config_path: Path | None = None,
         api: API | None = None,
-        prefetch: int = 10,
+        prefetch: int = DEFAULT_PREFETCH,
+        prefetch_generate: int = DEFAULT_PREFETCH_GENERATE,
     ) -> None:
         super().__init__()
         self.register_theme(
@@ -508,11 +517,15 @@ class Reader(App[None]):
         self.status_mode = "context"
         self.last_error: str | None = None
         self.prefetch = max(0, prefetch)
+        self.prefetch_generate = min(self.prefetch, max(0, prefetch_generate))
+        self.prefetch_requests: dict[int, asyncio.Task[SummaryResult | None]] = {}
+        self.prefetch_cache_misses: set[int] = set()
         self.summaries: dict[int, str] = {}
         self.prefetching: set[int] = set()
         self.prefetch_queue: deque[int] = deque()
         self.prefetch_retry_at: dict[int, float] = {}
         self.prefetch_active = False
+        self.closing = False
         self.prefetch_cooldown_until = 0.0
 
     def compose(self) -> ComposeResult:
@@ -562,8 +575,12 @@ class Reader(App[None]):
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         if self.setting_up or isinstance(self.focused, Input):
             return False
-        # Read mode exists only while the summary overflows its pane.
-        if action == "read" and (not self.can_read or self.help_open):
+        # Zoom is available for any selected story.
+        if (
+            action == "read"
+            and not self.reading
+            and (not self.can_read or self.help_open)
+        ):
             return False
         # A focused selector owns typing keys, but focus movement and quit must
         # stay reachable or the keyboard gets stuck on the dropdown.
@@ -672,6 +689,7 @@ class Reader(App[None]):
         self.prefetch_queue.clear()
         self.prefetching.clear()
         self.prefetch_retry_at.clear()
+        self.prefetch_cache_misses.clear()
         self.prefetch_cooldown_until = 0.0
         self.workers.cancel_group(self, "prefetch")
         self.target = None
@@ -892,8 +910,18 @@ class Reader(App[None]):
             self.query_one("#summary", Markdown).update(previous)
             self.status("Regenerating summary…")
         self.schedule_read_state()
+        self.schedule_prefetch()
         try:
-            summary = await self.api.summary(story_id, force_refresh=force_refresh)
+            # Reuse background work when navigation catches up with it.
+            request = self.prefetch_requests.get(story_id)
+            if not force_refresh and story_id in self.summaries:
+                summary = SummaryResult(self.summaries[story_id])
+            elif not force_refresh and request is not None:
+                summary = await asyncio.shield(request)
+                if summary is None:
+                    summary = await self.api.summary(story_id)
+            else:
+                summary = await self.api.summary(story_id, force_refresh=force_refresh)
             if serial == self.selection_serial and self.query("#summary"):
                 if summary.empty:
                     # Server found nothing summarizable: same session-hide
@@ -949,39 +977,67 @@ class Reader(App[None]):
         self.rebuild(select_id=advance)
         self.status(f"Skipped story {story_id} — {reason}. r restores hidden stories.")
 
-    def schedule_prefetch(self) -> None:
-        """Queue the stories just after the selection for a background warm.
-
-        Speculative work stays conservative: only stories ahead in the current
-        filter, never the selected one, and the queue is rebuilt on every
-        selection so an abandoned neighborhood is dropped. Foreground summary
-        taps always go first, and any error pauses the whole chain.
-        """
-        if self.prefetch <= 0 or not self.api or self.setting_up:
-            return
-        if time.monotonic() < self.prefetch_cooldown_until:
-            return
+    def prefetch_targets(self, depth: int) -> list[int]:
+        """Upcoming stories, nearby history, and entry points into other sorts."""
+        if depth <= 0 or not self.feed or not self.query("#headlines"):
+            return []
         story = self.selected()
         if story is None:
-            return
-        index = next(
-            (i for i, item in enumerate(self.stories) if item.id == story.id), None
+            return []
+        index = self.stories.index(story)
+        ids = [item.id for item in self.stories[index + 1 : index + 1 + depth]]
+        ids.extend(
+            item.id for item in reversed(self.stories[max(0, index - 3) : index])
         )
-        if index is None:
+        lookup = {item.id: item for item in self.feed.stories}
+        age = self.query_one("#age", Select).value
+        sort = self.query_one("#sort", Select).value
+        for other in self.SORT_CYCLE:
+            if other == sort:
+                continue
+            order = self.feed.orders.get(f"{other}:{age}", [])
+            if other == "recommended":
+                order = limit_recommended(order, lookup)
+            eligible = [
+                sid
+                for sid in order
+                if sid not in self.rated and sid not in self.unavailable
+            ]
+            ids.extend(eligible[: min(depth, 3)])
+        return list(
+            dict.fromkeys(
+                sid
+                for sid in ids
+                if sid != story.id
+                and sid not in self.rated
+                and sid not in self.unavailable
+            )
+        )
+
+    def schedule_prefetch(self) -> None:
+        """Refill the bounded rolling window, retaining cached summaries across sorts."""
+        if self.prefetch <= 0 or not self.api or self.setting_up:
             return
         now = time.monotonic()
+        if now < self.prefetch_cooldown_until:
+            return
+        generate = set(self.prefetch_targets(self.prefetch_generate))
         self.prefetch_queue = deque(
-            item.id
-            for item in self.stories[index + 1 : index + 1 + self.prefetch]
-            if item.id not in self.summaries
-            and item.id not in self.prefetching
-            and self.prefetch_retry_at.get(item.id, 0.0) <= now
+            sid
+            for sid in self.prefetch_targets(self.prefetch)
+            if sid not in self.summaries
+            and sid not in self.prefetching
+            and (
+                self.prefetch_retry_at.get(sid, 0.0) <= now
+                or (sid in self.prefetch_cache_misses and sid in generate)
+            )
         )
         self.start_prefetch()
 
     def start_prefetch(self) -> None:
         if (
             self.prefetch_active
+            or self.closing
             or not self.prefetch_queue
             or self.setting_up
             or not self.is_mounted
@@ -990,42 +1046,66 @@ class Reader(App[None]):
         self.prefetch_active = True
         self.prefetch_summaries()
 
+    async def fetch_prefetched_summary(self, story_id: int) -> SummaryResult | None:
+        api = self.api
+        if api is None:
+            return None
+        summary = await api.cached_summary(story_id)
+        if summary is None:
+            self.prefetch_cache_misses.add(story_id)
+            # Recheck the current window after I/O: a sort change can abandon it.
+            if (
+                story_id in self.prefetch_targets(self.prefetch_generate)
+                and time.monotonic() >= self.prefetch_cooldown_until
+            ):
+                summary = await api.summary(story_id)
+        return summary
+
+    async def prefetch_loop(self) -> None:
+        while (
+            self.prefetch_queue
+            and self.api is not None
+            and time.monotonic() >= self.prefetch_cooldown_until
+        ):
+            story_id = self.prefetch_queue.popleft()
+            if story_id in self.summaries or story_id in self.prefetching:
+                continue
+            self.prefetching.add(story_id)
+            request = asyncio.create_task(self.fetch_prefetched_summary(story_id))
+            self.prefetch_requests[story_id] = request
+            try:
+                summary = await request
+            except APIError:
+                # Already-running requests may finish; no new work during cooldown.
+                self.prefetch_cooldown_until = (
+                    time.monotonic() + PREFETCH_COOLDOWN_SECONDS
+                )
+                self.prefetch_queue.clear()
+                return
+            finally:
+                self.prefetching.discard(story_id)
+                self.prefetch_requests.pop(story_id, None)
+            if summary is None or summary.provisional or summary.empty:
+                self.prefetch_retry_at[story_id] = (
+                    time.monotonic() + PREFETCH_COOLDOWN_SECONDS
+                )
+                if summary is not None:
+                    self.prefetch_cache_misses.discard(story_id)
+            else:
+                self.prefetch_cache_misses.discard(story_id)
+                self.summaries[story_id] = summary.text
+
     @work(group="prefetch")
     async def prefetch_summaries(self) -> None:
         try:
-            while self.prefetch_queue and self.api is not None:
-                story_id = self.prefetch_queue.popleft()
-                if story_id in self.summaries or story_id in self.prefetching:
-                    continue
-                self.prefetching.add(story_id)
-                try:
-                    summary = await self.api.cached_summary(story_id)
-                except InvalidProfile:
-                    self.prefetch_queue.clear()
-                    return
-                except APIError:
-                    # Speculative work must not fight a rate limit or provider
-                    # cooldown; pause the chain and let foreground taps win.
-                    self.prefetch_cooldown_until = (
-                        time.monotonic() + PREFETCH_COOLDOWN_SECONDS
-                    )
-                    return
-                finally:
-                    self.prefetching.discard(story_id)
-                if summary is None:
-                    self.prefetch_retry_at[story_id] = time.monotonic() + 60.0
-                    continue
-                if summary.provisional:
-                    # Not cacheable, and not worth retrying on every rebuild.
-                    self.prefetch_retry_at[story_id] = (
-                        time.monotonic() + PREFETCH_COOLDOWN_SECONDS
-                    )
-                else:
-                    self.summaries[story_id] = summary.text
+            async with asyncio.TaskGroup() as group:
+                for _ in range(PREFETCH_CONCURRENCY):
+                    group.create_task(self.prefetch_loop())
         finally:
             self.prefetch_active = False
             if (
                 self.prefetch_queue
+                and not self.closing
                 and not self.setting_up
                 and self.is_mounted
                 and time.monotonic() >= self.prefetch_cooldown_until
@@ -1145,6 +1225,7 @@ class Reader(App[None]):
             self.unavailable.clear()
         self.prefetch_queue.clear()
         self.prefetch_retry_at.clear()
+        self.prefetch_cache_misses.clear()
         self.prefetch_cooldown_until = 0.0
         self.workers.cancel_group(self, "prefetch")
         self.refresh_feed()
@@ -1240,28 +1321,27 @@ class Reader(App[None]):
         narrow = (self.size.width if width is None else width) < 100
         self.set_class(narrow, "narrow")
         self.set_class(self.reading, "reading")
-        votes = "1 up · 2 neutral · 3 down"
+        votes = "1 up · 2 neutral · 3 down → next story"
         if narrow:
+            # Narrow hints may wrap; the badge key stays listed in ? help.
             if self.reading:
-                hints = f"j/k scroll · Esc back · {votes} · b badges · ? help"
+                hints = f"j/k scroll · Enter/Esc back · {votes}"
             elif self.can_read:
-                hints = f"Enter read · {votes} · b badges · ? help"
+                hints = f"Enter zoom · {votes} · ? help"
             else:
-                hints = f"j/k move · {votes} · b badges · ? help"
+                hints = f"j/k move · {votes} · ? help"
         elif self.reading:
-            hints = f"j/k scroll · Esc headlines · {votes} · b badges · ? help · q quit"
+            hints = (
+                f"j/k scroll · Enter/Esc back · {votes} · b badges · ? help · q quit"
+            )
         elif self.can_read:
-            hints = f"j/k move · Enter read · {votes} · b badges · ? help · q quit"
+            hints = f"j/k move · Enter zoom · {votes} · b badges · ? help · q quit"
         else:
             hints = f"j/k move · {votes} · b badges · ? help · q quit"
         self.query_one("#shortcuts", Static).update(hints)
 
     def schedule_read_state(self) -> None:
-        """Re-evaluate read mode once the refreshed summary has been laid out.
-
-        The immediate callback catches cached content; the staggered timers
-        catch the layout pass that first reports the summary's overflow.
-        """
+        """Refresh zoom availability after deferred selection and content updates."""
         self.call_after_refresh(self.refresh_read_state)
         for timer in self._read_timers:
             timer.stop()
@@ -1270,15 +1350,10 @@ class Reader(App[None]):
         ]
 
     def refresh_read_state(self) -> None:
-        """Offer read mode only while the summary overflows its pane.
-
-        Frozen while reading, so expanding the pane cannot flip the state and
-        bounce the layout back and forth.
-        """
-        if self.reading or not self.query("#summary"):
+        """Offer zoom whenever a story is selected, regardless of summary length."""
+        if self.reading or not self.query("#summary") or not self.query("#headlines"):
             return
-        summary = self.query_one("#summary", Markdown)
-        can_read = summary.virtual_size.height > summary.container_size.height
+        can_read = self.selected() is not None
         if can_read != self.can_read:
             self.can_read = can_read
             self.layout_panes()
@@ -1336,12 +1411,14 @@ class Reader(App[None]):
         self.selection_serial += 1
         self.workers.cancel_group(self, "summary")
         self.query_one("#summary", Markdown).update(
-            "# Shortcuts\n\nj/k: move the headline list. Arrows: scroll the focused pane. Tab: focus. Escape: close this help.\n\nEnter: expand a summary that overflows its pane, and leave that mode again. 1/2/3: up / neutral / down. u: undo latest vote. o/c: article / comments. r: refresh and regenerate selected summary. s: cycle sort. b: badge legend. ?: this help. q: quit.\n\nUse the selectors for Recommended, Popular, Explore, Date and Recent / Archive. Votes are never automatically retried after network errors."
+            "# Shortcuts\n\nj/k: move the headline list. Arrows: scroll the focused pane. Tab: focus. Escape: close this help.\n\nEnter: hide the article list and zoom the TLDR pane. Enter or Escape: return to the article list. In zoom mode, j/k scroll the TLDR. 1/2/3: up / neutral / down. u: undo latest vote. o/c: article / comments. r: refresh and regenerate selected summary. s: cycle sort. b: badge legend. ?: this help. q: quit.\n\nUse the selectors for Recommended, Popular, Explore, Date and Recent / Archive. Votes are never automatically retried after network errors."
         )
         self.focus_summary()
         self.schedule_read_state()
 
     async def on_unmount(self) -> None:
+        self.closing = True
+        self.prefetch_queue.clear()
         self.selection_serial += 1
         self.workers.cancel_all()
         if self.api:

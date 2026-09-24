@@ -6,21 +6,27 @@ profile with your server URL, for example `https://your-host/hn/`.
 The server retains its existing access policy: installing the client does not grant access.
 
 Keys: j/k or arrows navigate/scroll; Tab changes focus; 1/2/3 vote
-positive/neutral/negative; u undoes the latest successful vote; o/c open
-article/comments; r refreshes; ? shows help; q quits. Enter opens a read mode
-when the summary overflows its pane (the footer hint appears only then);
-Escape leaves it or closes help. Use the sort and age selectors to change
+positive/neutral/negative and advance to the next story; u undoes the latest
+successful vote; o/c open article/comments; r refreshes; ? shows help; q quits.
+Enter hides the article list and zooms the TLDR pane; Enter or Escape returns
+to the list. Escape also closes help. Use the sort and age selectors to change
 filters. Below 100 columns the headline list stacks above the summary.
 
-Summaries are cached for the session and the next stories in the list are
-prefetched one at a time after the selected summary settles. The default is ten
-stories ahead; `--prefetch N` changes that and `--prefetch 0` disables it.
-Background requests only read the server's current summary cache: they never
-hydrate sources or generate paid summaries. Cache misses remain available for
-normal on-selection generation, and are not rechecked for at least one minute.
-Older servers without the cache-only endpoint safely disable speculation via
-error cooldown rather than falling back to generation. Stale or partial
-responses are shown on selection but never cached.
+Summaries are cached for the session across sort changes. Up to four background
+requests warm the next 20 stories, the previous three, and the first three
+stories in each other sort for the current age filter. Prefetch starts alongside
+the selected summary and refills as you navigate or vote.
+
+Missing TLDRs are generated for the next three stories, the previous three,
+and the first three in each other sort. This uses the normal server generation
+path and may incur provider usage; deeper stories only read existing caches.
+`--prefetch N` adjusts forward cache depth (`0` disables all prefetch).
+`--prefetch-generate N` adjusts forward generation depth and the other-sort
+entry window (up to three); `0` keeps all background work cache-only.
+Navigation reuses an in-flight prefetch instead of issuing a duplicate request.
+Errors pause new background requests for a minute; requests already running may
+finish. Empty, stale or partial responses are never cached. Rapid navigation
+can still outrun generation, and changing the age filter warms its own targets.
 
 Selected-story transitions that remain selected for at least one second send
 best-effort impression events to your configured server's existing interaction
@@ -48,10 +54,11 @@ Bold key terms in a summary take the same orange, and single-marker emphasis
 identifies the selected headline without relying on color. At 100 columns and
 above, filter tabs sit over a one-third headline/two-thirds summary layout.
 Smaller terminals use dropdowns and stack the list above the summary; both
-panes stay visible and the summary scrolls in place. When a summary is taller
-than its pane, Enter expands it (full height on small terminals) and the
-footer advertises the key; fitting summaries keep the plain layout with the
-key disabled.
+panes stay visible and the summary scrolls in place. Enter zooms the TLDR pane
+to full height at every terminal size,
+even for short summaries. On wide terminals the pane is centered and capped
+at 100 columns for comfortable reading. Enter or Escape restores the article
+list. The footer shows the zoom and return keys for the current mode.
 Press `r` to refresh the feed and request a fresh server-generated summary for
 only the selected story. Automatic refreshes keep using the server cache.
 Regeneration still respects provider limits and does not guarantee a longer summary.

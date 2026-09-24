@@ -1,5 +1,27 @@
 # HN Rerank findings
 
+## TUI review and narrow-pane evidence (2026-09-24)
+
+- `--server` bug: the argparse default made `explicit_server` always set,
+  contradicting the WORKLOG intent ("mismatch guard only for explicit
+  `--server`"). No effect on the user's own profile, which already uses
+  `DEFAULT_SERVER`.
+- Live 51-column pane (`work:3.2`): the hints `Static` (`width: auto`)
+  consumed the whole footer, leaving `#status` (`1fr`) at 0 cells. Status and
+  error messages were never visible in narrow mode.
+- Half-box frame: `#reading-pane.has-story:focus-within` (id + class +
+  pseudo) outranks `.narrow #reading-pane` (id + class), so its left border
+  leaked into narrow mode.
+- Test time is spread across Textual pilot tests with real `pilot.pause`
+  calls; no single slow test (max 3.5 s). xdist `-n 4`: 90 s → 25 s.
+- Screenshot rig: `/tmp/tui-shots/shots.py` (EditorialServer, no profile
+  access). Pilot `save_screenshot` produces SVG; `google-chrome --headless=new
+  --screenshot --window-size=<viewBox>` produces PNG.
+- `hn` is an alias to the editable `clients/tui/.venv/bin/hn-rerank`, so the
+  checkout is live without a reinstall.
+- The earlier one-off TUI flake did not recur across roughly 8 full-suite
+  runs today.
+
 ## TUI focus-visibility evidence (2026-09-24)
 
 - Screenshot rig: `clients/tui` pilot harness (`export_screenshot` → SVG) +
@@ -422,3 +444,49 @@ appropriately under target, no padding). Combined Reddit case verified
 previously (bold in 4/4 Discussion bullets). Latent Space article-only
 overshoot (414 words vs 240 target) already recorded in STATUS.md. No new
 prompt tuning demonstrated; prompts untouched.
+
+## 2026-09-24 TLDR zoom
+
+The existing read action was gated on summary overflow, and only the narrow
+CSS hid headlines. Zoom now accepts any selected story and hides headlines
+at every width. The follow-up reading-width refinement centers the zoomed
+pane and retains the 100-column cap; narrow terminals use their full width.
+Both Enter and Escape restore list focus. Tests verify dimensions, focus, selection and
+footer controls for short/long content at 51, 80 and 140 columns.
+
+Validation: TUI 116 passed, 1 skipped; backend 821 passed using the local
+`HN_ONNX_MODEL_DIR=/home/d/.cache/hn-rerank/onnx_model` override. The initial
+backend run had 18 setup errors because its default model path points at
+the VPS. Ruff/format/ty clean. User independently reported fullscreen works.
+No backend deployment or database changes were needed.
+
+## 2026-09-24 Vote-to-advance footer
+
+Adding `→ next story` exposed a cramped wide footer at 100 columns: status
+shrunk to seven cells. Stacking status above shortcuts at all widths keeps
+counts readable. At 51 columns the shortcuts wrap onto two lines.
+
+## 2026-09-24 Navigation-aware prefetch
+
+Previous default: ten cache-only lookups in sequence after foreground completion.
+Missing server summaries were not generated until selection. New rolling window:
+20 forward cache targets, previous three, other-sort first three; generation for
+next three plus previous/other-sort neighbors, four background requests maximum.
+The selected story reuses an in-flight request. Existing server cache/generation
+endpoints suffice. Tests verify navigation readiness and one request per generated
+selection; live provider latency can still exceed rapid navigation.
+
+Live verification after relaunch: 44 stories in `work:3.1`. A bounded VPS
+journal read showed concurrent cache hits/misses and successful generation
+(2026-09-24 20:57:05 UTC, story 49525378, HTTP 200, 9280 ms total). This
+confirms live cache access and generation, not guaranteed readiness for every
+possible rapid navigation path. No server mutation/restart was performed.
+
+## 2026-09-24 Pre-commit review
+
+Reproduced and fixed one issue: at 51 columns in zoom mode, a three-line
+error plus the two-line legend overran the footer by one row. A new layout
+test failed with `hints.bottom=38`, `footer.bottom=37`; removing the overall
+footer height cap makes all rows visible. Status remains limited to three
+lines. Reviewed navigation prefetch bounds, cache-only opt-out, cancellation,
+rate-limit handling, request reuse and documentation; no other blocker found.
