@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 import unicodedata
 import webbrowser
@@ -740,6 +741,14 @@ class Reader(App[None]):
         order = self.feed.orders.get(f"{sort}:{age}", []) if self.feed else []
         if sort == "recommended":
             order = limit_recommended(order, lookup)
+        if sort == "explore":
+            # Explore is a discovery deck: reshuffle client-side on every
+            # rebuild so each visit is a fresh random order. The server
+            # order only shuffles once per dashboard version (cached),
+            # which would otherwise pin the deck for hours. Copy first:
+            # feed.orders is shared with prefetch entry points.
+            order = list(order)
+            random.shuffle(order)
         self.stories = [
             lookup[sid]
             for sid in order

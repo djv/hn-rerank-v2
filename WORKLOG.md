@@ -1,5 +1,18 @@
 # Worklog: hn-rewrite
 
+## 2026-09-24 TUI explore sort shuffles client-side
+
+- TUI `rebuild()` now shuffles a copy of the explore order on every rebuild,
+  so each visit to Explore is a fresh random deck. Previously the client
+  rendered the server order verbatim, which shuffles only once per cached
+  dashboard version and pins the deck for hours. `feed.orders` is copied
+  before shuffling; prefetch entry points into other sorts still use the
+  stable server order. Other sorts are untouched.
+- Validation: new `test_explore_sort_is_shuffled` (deterministic reverse
+  stand-in for `random.shuffle`) passes; full TUI suite 122 passed /
+  1 skipped; `ruff check`, `ruff format --check`, and `ty check` clean.
+  Backend suite untouched by this change.
+
 ## 2026-09-24 TUI commit review
 
 - Reproduced a clipped footer at 51 columns: three error lines plus two

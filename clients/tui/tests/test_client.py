@@ -559,6 +559,38 @@ async def test_s_cycles_sort_modes(tmp_path: Path) -> None:
             assert [s.id for s in app.stories] == story_ids
 
 
+async def test_explore_sort_is_shuffled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Explore reshuffles client-side instead of following server rank order."""
+    from dataclasses import replace
+
+    fake = FakeServer()
+    fake.feed = replace(
+        fake.feed, orders={**fake.feed.orders, "explore:recent": [1, 2]}
+    )
+
+    def reverse(order: list[int]) -> None:
+        order[:] = order[::-1]
+
+    monkeypatch.setattr("random.shuffle", reverse)
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        await pilot.pause(0.4)
+        app.query_one(OptionList).focus()
+        assert [s.id for s in app.stories] == [1, 2]
+        await pilot.press("s")  # popular: untouched by the shuffle.
+        await pilot.pause(0.3)
+        assert [s.id for s in app.stories] == [1]
+        await pilot.press("s")  # explore: reversed server order.
+        await pilot.pause(0.3)
+        assert str(app.query_one("#sort", Select).value) == "explore"
+        assert [s.id for s in app.stories] == [2, 1]
+        # Rebuild must copy: the shared server order stays intact for
+        # prefetch entry points into other sorts.
+        assert fake.feed.orders["explore:recent"] == [1, 2]
+
+
 class FlakySummaryServer(FakeServer):
     """Rate-limits foreground taps for story 1; cache reads always miss."""
 
