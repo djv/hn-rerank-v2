@@ -9,6 +9,12 @@
   `ARCHITECTURE.md` override note updated to 240/240.
 - Validation: backend 803 passed (18 pre-existing test_pipeline errors,
   identical with the change stashed); ruff clean. No `.py` changes.
+- Deployed `247f0c1`: pushed, VPS `main` worktree fast-forwarded clean to
+  `247f0c1` (explore worktree untouched), `config.toml` on host confirms
+  240/240, service restarted 22:04:31 UTC. Dashboard 200, zero
+  `quota_denied` in the minutes after restart (pre-restart log showed
+  them under the old 120 limits). Remaining journal noise is transient
+  RSS DNS/fetch failures, unrelated.
 
 ## 2026-09-24 TUI reversible sort order
 
