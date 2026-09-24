@@ -6025,6 +6025,15 @@ def test_deck_actions_restore_native_focus_to_active_card() -> None:
     assert "refreshTldr(card);" in inline_script
     assert ">t</span> re-summarize TLDR" in template
     assert ">s</span> refresh deck" in template
+    for hint, label in (
+        ("r", "sort recommended"),
+        ("p", "sort popular"),
+        ("x", "sort explore"),
+        ("d", "sort date"),
+        ("e", "age recent"),
+        ("a", "age archive"),
+    ):
+        assert f">{hint}</span> {label}" in template
     key_action_buttons = inline_script.split(
         "document.querySelectorAll('[data-key-action]').forEach", 1
     )[1].split("async function fetchRefillDoc", 1)[0]
@@ -6032,6 +6041,10 @@ def test_deck_actions_restore_native_focus_to_active_card() -> None:
         "document.body.classList.toggle('fullscreen');\n          focusActiveCard();"
         in key_action_buttons
     )
+    # Side-rail open rows must open, not vote: runKeyAction routes them to
+    # openStoryUrl instead of falling through to submitVote.
+    assert "openStoryUrl('article')" in key_action_buttons
+    assert "openStoryUrl('comments')" in key_action_buttons
     assert (
         "max-height: calc(100dvh - var(--vote-bar-height) - var(--page-gutter));"
         in template
@@ -6499,6 +6512,20 @@ def test_stale_page_check_treats_version_zero_as_finite() -> None:
     assert "Number.isFinite(pageVer)" in block
     assert "Number.isFinite(currVer)" in block
     assert "pageVer && currVer" not in block
+
+
+def test_refill_uses_feed_json_and_safe_dom_text() -> None:
+    _, script = _read_template_and_static()
+    assert "fetch('/api/feed', { cache: 'no-store' })" in script
+    assert "const incoming = await fetchRefillCards();" in script
+    assert "feed.stories.map(story => feedCard(story, feed.version))" in script
+    assert "link.textContent = story.title;" in script
+    assert (
+        "reason.textContent = `Because you upvoted: ${story.best_match_title}`;"
+        in script
+    )
+    assert "card !== activeCard" in script
+    assert "votedStoryIds.has(Number(storyId))" in script
 
 
 def test_refillQueue_reorders_deterministic_modes_only() -> None:

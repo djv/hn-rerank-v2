@@ -7,7 +7,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from textual.widgets import Input, Markdown, OptionList, Select, Static
+from textual.widgets import Input, Markdown, OptionList, Select, Static, Tabs
 
 from hn_rerank.api import (
     API,
@@ -463,3 +463,61 @@ async def test_refresh_forces_only_selected_summary(tmp_path: Path) -> None:
             for r in fake.requests
             if r.url.path.endswith("/api/tldr-detail")
         )
+
+
+@pytest.mark.parametrize("width", [73, 146])
+@pytest.mark.parametrize("origin", ["cycle", "tabs", "age"])
+async def test_rapid_filter_changes_settle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, width: int, origin: str
+) -> None:
+    app = Reader(api=FakeServer().api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(width, 38)) as pilot:
+        await pilot.pause(0.5)
+        rebuilds = 0
+        original = app.rebuild
+
+        def counted_rebuild(select_id: int | None = None) -> None:
+            nonlocal rebuilds
+            rebuilds += 1
+            original(select_id)
+
+        monkeypatch.setattr(app, "rebuild", counted_rebuild)
+        group, expected = ("age", "archive") if origin == "age" else ("sort", "date")
+        # No yielding: reproduce several queued changes before either widget
+        # has handled its peer's messages.
+        if origin == "cycle":
+            for _ in range(3):
+                app.action_cycle_sort()
+        elif origin == "tabs":
+            for value in ("popular", "explore", "date"):
+                app.query_one("#sort-tabs", Tabs).active = f"sort-{value}"
+        else:
+            for value in ("archive", "recent", "archive"):
+                app.query_one("#age", Select).value = value
+        await pilot.pause(0.4)
+        assert app.query_one(f"#{group}", Select).value == expected
+        assert app.query_one(f"#{group}-tabs", Tabs).active == f"{group}-{expected}"
+        settled = rebuilds
+        assert 0 < settled <= 3
+        await pilot.pause(0.4)
+        assert rebuilds == settled  # No self-sustaining Select/Tabs echo.
+
+
+async def test_s_cycles_sort_modes(tmp_path: Path) -> None:
+    fake = FakeServer()
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        await pilot.pause(0.4)
+        app.query_one(OptionList).focus()
+        assert str(app.query_one("#sort", Select).value) == "recommended"
+        assert [s.id for s in app.stories] == [1, 2]
+        for expected, story_ids in (
+            ("popular", [1]),
+            ("explore", [2]),
+            ("date", [2, 1]),
+            ("recommended", [1, 2]),
+        ):
+            await pilot.press("s")
+            await pilot.pause(0.3)
+            assert str(app.query_one("#sort", Select).value) == expected
+            assert [s.id for s in app.stories] == story_ids

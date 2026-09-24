@@ -111,6 +111,15 @@ def test_parse_rejects_boolean_rank_score(rank_score: bool) -> None:
         Feed.parse(replace(sample_feed(), stories=[story]).to_dict())
 
 
+@pytest.mark.parametrize("badges", [None, [42], [{"kind": 7}], "hot"])
+def test_parse_rejects_malformed_badge_details(badges: object) -> None:
+    payload = sample_feed().to_dict()
+    stories = cast("list[dict[str, object]]", payload["stories"])
+    stories[0]["badge_details"] = badges
+    with pytest.raises(ValueError):
+        Feed.parse(payload)
+
+
 def test_parse_tolerates_missing_badges_from_older_servers() -> None:
     payload = sample_feed().to_dict()
     stories = cast("list[dict[str, object]]", payload["stories"])

@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 from jinja2 import Environment, FileSystemLoader
 
 from database import Database, Story
-from clients.tui.src.hn_rerank.models import Feed, FeedStory
+from clients.tui.src.hn_rerank.models import Feed, FeedBadge, FeedStory
 from .config import (
     BQ_ARCHIVE_SOURCE,
     CH_ARCHIVE_SOURCE,
@@ -358,6 +358,14 @@ def prepare_feed(
             popular=c.sort_popular_attr == "1",
             explore=c.sort_explore_attr == "1",
             badges=[badge.icon for badge in c.badges],
+            badge_details=[
+                FeedBadge(badge.kind, badge.icon, badge.label, badge.tooltip)
+                for badge in c.badges
+            ],
+            best_match_title=c.best_match_title,
+            source_label=c.source_label,
+            domain=c.domain,
+            enriched=c.is_enriched,
         )
         for c in cards
     ]

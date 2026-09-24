@@ -116,7 +116,7 @@ async def test_setup_layout_and_error(width: int, tmp_path: Path) -> None:
     async with app.run_test(size=(width, 35)) as pilot:
         await pilot.pause()
         assert isinstance(app.screen, Setup)
-        for name in ("link", "import", "server", "create", "quit"):
+        for name in ("link", "import", "token", "use-token", "create", "quit"):
             widget = app.screen.query_one("#" + name)
             assert widget.region.right <= width
             assert 0 <= widget.region.y < 35

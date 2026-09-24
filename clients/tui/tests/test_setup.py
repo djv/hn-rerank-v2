@@ -23,7 +23,7 @@ async def test_import_validates_then_persists_and_relaunches(
         lambda server, token=None: API(server, token, httpx.MockTransport(fake)),
     )
     path = tmp_path / "profile.json"
-    app = Reader(config_path=path)
+    app = Reader(config_path=path, server="https://example.org/hn/")
     async with app.run_test(size=(100, 40)) as pilot:
         await pilot.pause()
         assert isinstance(app.screen, Setup)
@@ -35,10 +35,36 @@ async def test_import_validates_then_persists_and_relaunches(
             await pilot.pause(0.1)
         assert load_profile(path) == Profile("https://example.org/hn/", "test")
         assert app.feed is not None
-    app = Reader(config_path=path)
+    app = Reader(config_path=path, server="https://example.org/hn/")
     async with app.run_test() as pilot:
         await pilot.pause(0.2)
         assert not isinstance(app.screen, Setup)
+        assert app.feed is not None
+
+
+async def test_token_uses_default_server_then_persists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeServer()
+    monkeypatch.setattr(
+        app_module,
+        "API",
+        lambda server, token=None: API(server, token, httpx.MockTransport(fake)),
+    )
+    path = tmp_path / "profile.json"
+    app = Reader(config_path=path)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await pilot.pause()
+        assert isinstance(app.screen, Setup)
+        app.screen.query_one("#token", Input).value = "test"
+        await pilot.click("#use-token")
+        for _ in range(100):
+            if app.feed is not None:
+                break
+            await pilot.pause(0.1)
+        from hn_rerank.app import DEFAULT_SERVER
+
+        assert load_profile(path) == Profile(DEFAULT_SERVER, "test")
         assert app.feed is not None
 
 
@@ -58,7 +84,7 @@ async def test_invalid_saved_profile_returns_to_setup_without_create(
     )
     path = tmp_path / "profile.json"
     save_profile(Profile("https://example.org/hn/", "invalid"), path)
-    app = Reader(config_path=path)
+    app = Reader(config_path=path, server="https://example.org/hn/")
     async with app.run_test() as pilot:
         await pilot.pause(0.2)
         assert isinstance(app.screen, Setup)

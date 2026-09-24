@@ -43,6 +43,8 @@ from .api import (
 )
 from .models import Feed, FeedStory
 
+DEFAULT_SERVER = "https://ubuntu-8gb-nbg1-1.tailca4726.ts.net:8443/hn/"
+
 # Hacker News launched in 2006; earlier timestamps are missing or placeholder data.
 EARLIEST_STORY_TIME = 1_136_073_600
 
@@ -201,11 +203,18 @@ class Setup(ModalScreen[Profile | None]):
     #quit { margin-top: 1; background: #1C1B19; color: #AAA399; }
     """
 
-    def __init__(self, path: Path, server: str | None, message: str = "") -> None:
+    def __init__(
+        self,
+        path: Path,
+        server: str | None,
+        message: str = "",
+        explicit_server: str | None = None,
+    ) -> None:
         super().__init__()
         self.path = path
         self.server = server
         self.message = message
+        self.explicit_server = explicit_server
         self.pending = False
 
     def compose(self) -> ComposeResult:
@@ -220,23 +229,33 @@ class Setup(ModalScreen[Profile | None]):
             yield Label("Import an existing profile", classes="setup-section")
             yield Input(placeholder="https://host/hn/u/TOKEN", password=True, id="link")
             yield Button("Import profile", id="import")
+            yield Label("Use an existing token", classes="setup-section")
+            yield Input(placeholder="Profile token", password=True, id="token")
+            yield Button("Use token", id="use-token")
             yield Label("Start a new profile", classes="setup-section")
-            yield Input(
-                value=self.server or "", placeholder="https://host/hn/", id="server"
-            )
             yield Button("Create new profile", id="create")
             yield Button("Quit", id="quit")
 
     @work(exclusive=True)
-    async def connect(self, create: bool) -> None:
+    async def connect(self, mode: str) -> None:
         api: API | None = None
         try:
-            if create:
-                api = API(self.query_one("#server", Input).value)
+            if mode == "create":
+                api = API(self.server or DEFAULT_SERVER)
                 profile = await api.create()
+            elif mode == "use-token":
+                profile = Profile(
+                    self.server or DEFAULT_SERVER,
+                    self.query_one("#token", Input).value.strip(),
+                )
+                api = API(profile.server, profile.token)
+                profile = await api.validate()
             else:
                 profile = Profile.from_link(self.query_one("#link", Input).value)
-                if self.server and normalize_server(self.server) != profile.server:
+                if (
+                    self.explicit_server
+                    and normalize_server(self.explicit_server) != profile.server
+                ):
                     raise ValueError(
                         "Profile link does not match --server. Use the matching deployment."
                     )
@@ -268,13 +287,13 @@ class Setup(ModalScreen[Profile | None]):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "quit":
             self.app.exit()
-        elif not self.pending:
+        elif event.button.id in ("import", "use-token", "create") and not self.pending:
             self.pending = True
             for button in self.query(Button):
                 button.disabled = True
             self.query_one("#setup-message", Static).update("Connecting…")
             self.query_one("#setup-message").remove_class("error")
-            self.connect(event.button.id == "create")
+            self.connect(str(event.button.id))
 
 
 class Reader(App[None]):
@@ -343,6 +362,7 @@ class Reader(App[None]):
         ("o", "open_url('article_url')", "Article"),
         ("c", "open_url('comments_url')", "Comments"),
         ("r", "refresh", "Refresh"),
+        ("s", "cycle_sort", "Sort"),
         ("enter", "read", "Read"),
         ("escape", "headlines", "Back"),
         ("?", "help", "Help"),
@@ -383,7 +403,8 @@ class Reader(App[None]):
             )
         )
         self.theme = "editorial"
-        self.server = normalize_server(server) if server else None
+        self.explicit_server = normalize_server(server) if server else None
+        self.server = self.explicit_server or DEFAULT_SERVER
         self.config_path = config_path or profile_path()
         self.api = api
         self.feed: Feed | None = None
@@ -466,7 +487,8 @@ class Reader(App[None]):
         # stay reachable or the keyboard gets stuck on the dropdown.
         return not (
             isinstance(self.focused, Select)
-            and action in {"move", "vote", "undo", "read", "refresh", "open_url"}
+            and action
+            in {"move", "vote", "undo", "read", "refresh", "open_url", "cycle_sort"}
         )
 
     def status(self, message: str, *, error: bool = False) -> None:
@@ -537,7 +559,15 @@ class Reader(App[None]):
         self.workers.cancel_group(self, "vote")
         self.workers.cancel_group(self, "impression")
         self.pending = False
-        self.push_screen(Setup(self.config_path, self.server, message), self.connected)
+        self.push_screen(
+            Setup(
+                self.config_path,
+                self.server,
+                message,
+                explicit_server=self.explicit_server,
+            ),
+            self.connected,
+        )
 
     async def connected(self, profile: Profile | None) -> None:
         if profile is None:
@@ -648,13 +678,17 @@ class Reader(App[None]):
         self.context_status()
 
     def on_select_changed(self, event: Select.Changed) -> None:
+        # Queued changes can outlive their value after rapid sort cycling.
+        # Replaying them into Tabs would start an endless two-way echo.
+        if event.value != event.select.value:
+            return
         tabs_id = f"#{event.select.id}-tabs"
         if event.select.id in {"sort", "age"} and self.query(tabs_id):
             self.query_one(tabs_id, Tabs).active = f"{event.select.id}-{event.value}"
         self.rebuild()
 
     def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
-        if not event.tab.id:
+        if not event.tab.id or event.tab.id != event.tabs.active:
             return
         group, value = event.tab.id.split("-", 1)
         # Teardown and the first layout pass can activate a tab before the
@@ -965,6 +999,22 @@ class Reader(App[None]):
             )
             self.show_failure(str(exc))
 
+    SORT_CYCLE: ClassVar[tuple[str, ...]] = (
+        "recommended",
+        "popular",
+        "explore",
+        "date",
+    )
+
+    def action_cycle_sort(self) -> None:
+        """Advance the sort selector one step (wraps to recommended)."""
+        select = self.query_one("#sort", Select)
+        try:
+            index = self.SORT_CYCLE.index(str(select.value))
+        except ValueError:
+            index = -1
+        select.value = self.SORT_CYCLE[(index + 1) % len(self.SORT_CYCLE)]
+
     def action_refresh(self, *, force_summary: bool = True) -> None:
         story = self.selected()
         self.force_summary_id = story.id if force_summary and story else None
@@ -1171,7 +1221,7 @@ class Reader(App[None]):
         self.selection_serial += 1
         self.workers.cancel_group(self, "summary")
         self.query_one("#summary", Markdown).update(
-            "# Shortcuts\n\nj/k: move the headline list. Arrows: scroll the focused pane. Tab: focus. Escape: close this help.\n\nEnter: expand a summary that overflows its pane, and leave that mode again. 1/2/3: up / neutral / down. u: undo latest vote. o/c: article / comments. r: refresh and regenerate selected summary. b: badge legend. ?: this help. q: quit.\n\nUse the selectors for Recommended, Popular, Explore, Date and Recent / Archive. Votes are never automatically retried after network errors."
+            "# Shortcuts\n\nj/k: move the headline list. Arrows: scroll the focused pane. Tab: focus. Escape: close this help.\n\nEnter: expand a summary that overflows its pane, and leave that mode again. 1/2/3: up / neutral / down. u: undo latest vote. o/c: article / comments. r: refresh and regenerate selected summary. s: cycle sort. b: badge legend. ?: this help. q: quit.\n\nUse the selectors for Recommended, Popular, Explore, Date and Recent / Archive. Votes are never automatically retried after network errors."
         )
         self.focus_summary()
         self.schedule_read_state()

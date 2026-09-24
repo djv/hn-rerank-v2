@@ -73,6 +73,10 @@ def test_feed_parity_authentication_stale_cache_and_eviction(tmp_path: Path) -> 
         ["\u2728"],
         [],
     ]
+    assert parsed.stories[0].badge_details[0].kind == "hot"
+    assert parsed.stories[0].badge_details[0].icon == "🔥"
+    assert parsed.stories[0].badge_details[0].tooltip
+    assert parsed.stories[0].domain == "example.org"
     assert [story.id for story in parsed.stories] == [
         story["id"] for story in feed["stories"]
     ]

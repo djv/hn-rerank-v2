@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from .app import Reader
+from .app import DEFAULT_SERVER, Reader
 
 
 def main() -> None:
@@ -11,7 +11,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--server",
-        help="Server URL, including deployment prefix (for example https://host/hn/)",
+        default=DEFAULT_SERVER,
+        help="Server URL, including deployment prefix (default: %(default)s)",
     )
     parser.add_argument(
         "--prefetch",

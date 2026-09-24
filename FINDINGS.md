@@ -1,5 +1,22 @@
 # HN Rerank findings
 
+## Client-side heavy work (2026-09-23)
+
+- Compute is not the bottleneck anywhere: local ONNX embed of 68 stories =
+  0.18s (3ms/story) on 8 CPU cores; server (4 cores) likewise trivial.
+  Ranking/SVM cost is rounding error.
+- Real server "heavy" = LLM TLDR API calls ($/rate-limit bound, Groq
+  default; ~155 tldr journal lines/hr) + network I/O (CH/LW/Reddit).
+  Feedback DB must stay server-side (multi-device + backup).
+- Client: 8 cores/11GB, no GPU, ollama binary present but no daemon/models.
+  A 3-8B q4 local model would fit RAM at ~10-30 tok/s (5-15s/summary),
+  quality below Groq-70B/Mistral.
+- Recommendation: (1) client-side TLDR via BYO Groq key with server
+  fallback — removes all server quota pressure, trivial HTTP reuse;
+  (2) local TUI disk cache for summaries; (3) ollama only as offline
+  fallback experiment. Do NOT move ranking/embeddings client-side:
+  no measurable gain, splits model/feedback source of truth.
+
 ## LessWrong score attribution — snapshot counterfactual
 
 The primary profile's feed had 10 LessWrong stories at Recent Recommended

@@ -1753,6 +1753,10 @@
         const action = btn.dataset.keyAction;
         if (action === 'undo') {
           undoLastVote();
+        } else if (action === 'open-article') {
+          openStoryUrl('article');
+        } else if (action === 'open-comments') {
+          openStoryUrl('comments');
         } else if (action === 'toggle-panel') {
           sidePanel.classList.toggle('visible');
           document.body.classList.toggle('fullscreen');
@@ -1770,21 +1774,99 @@
       });
     });
 
-    async function fetchRefillDoc() {
-      const resp = await fetch('/api/deck-cards', { cache: 'no-store' });
-      if (!resp.ok) {
-        throw new Error(`Refill failed: ${resp.status}`);
+    function feedCard(story, version) {
+      const card = document.createElement('article');
+      card.className = 'story-card' + (story.enriched ? ' enriched' : '');
+      card.tabIndex = -1;
+      Object.assign(card.dataset, {
+        combo: story.memberships.join(' '), storyId: String(story.id),
+        position: '0', dashboardVersion: String(version), rankerArm: 'baseline',
+        score: String(story.rank_score), time: String(story.time),
+        storySource: story.source, isHn: story.source === 'hn' ? '1' : '0',
+        sortPopular: story.popular ? '1' : '0', sortExplore: story.explore ? '1' : '0',
+        isRecent: story.memberships.some(key => key.startsWith('recent_')) ? '1' : '0',
+        articleUrl: story.article_url, commentsUrl: story.comments_url
+      });
+      const header = document.createElement('div');
+      header.className = 'story-header';
+      for (const badge of story.badge_details || []) {
+        const span = document.createElement('span');
+        span.className = 'badge badge--' + badge.kind;
+        span.title = badge.tooltip;
+        span.textContent = `${badge.icon} ${badge.label}`;
+        header.appendChild(span);
       }
-      const htmlText = await resp.text();
-      const parser = new DOMParser();
-      return parser.parseFromString(htmlText, 'text/html');
+      if (story.source !== 'hn') {
+        const source = document.createElement('span');
+        source.className = 'source-badge';
+        source.title = story.source;
+        source.textContent = story.source_label;
+        header.appendChild(source);
+      }
+      if (story.domain) {
+        const domain = document.createElement('span');
+        domain.className = 'domain-chip';
+        domain.textContent = story.domain;
+        header.appendChild(domain);
+      }
+      if (story.points > 0) {
+        const points = document.createElement('span');
+        points.textContent = `${story.points} pts`;
+        header.appendChild(points);
+      }
+      const age = document.createElement('span');
+      const seconds = Math.max(0, Math.floor(Date.now() / 1000) - story.time);
+      age.textContent = seconds < 60 ? `${seconds}s ago` : seconds < 3600
+        ? `${Math.floor(seconds / 60)}m ago` : seconds < 86400
+        ? `${Math.floor(seconds / 3600)}h ago` : `${Math.floor(seconds / 86400)}d ago`;
+      header.appendChild(age);
+      if (story.comments_url) {
+        const comments = document.createElement('a');
+        comments.href = story.comments_url;
+        comments.dataset.eventKind = 'comments_open';
+        comments.target = '_blank';
+        comments.rel = 'noopener';
+        comments.textContent = `💬${story.comments === null ? '' : ' ' + story.comments} comments`;
+        header.appendChild(comments);
+      }
+      card.appendChild(header);
+      const heading = document.createElement('h2');
+      heading.className = 'story-title';
+      const link = document.createElement('a');
+      link.href = story.article_url || story.comments_url;
+      link.dataset.eventKind = story.article_url ? 'article_open' : 'comments_open';
+      link.target = '_blank';
+      link.rel = 'noopener';
+      link.textContent = story.title;
+      heading.appendChild(link);
+      card.appendChild(heading);
+      const footer = document.createElement('div');
+      footer.className = 'story-footer';
+      card.appendChild(footer);
+      if (story.best_match_title) {
+        const reason = document.createElement('p');
+        reason.className = 'match-reason';
+        reason.textContent = `Because you upvoted: ${story.best_match_title}`;
+        card.appendChild(reason);
+      }
+      return card;
+    }
+
+    async function fetchRefillCards() {
+      const resp = await fetch('/api/feed', { cache: 'no-store' });
+      if (!resp.ok) throw new Error(`Refill failed: ${resp.status}`);
+      const feed = await resp.json();
+      if (feed.api_version !== 1 || !Array.isArray(feed.stories)) {
+        throw new Error('Unsupported feed response');
+      }
+      return feed.stories.map(story => feedCard(story, feed.version));
     }
 
     async function refillQueue({ advance = true } = {}) {
       // Reordering re-appends the active card. Preserve its native scrolling
       // focus across that DOM move, without taking focus from a link/control.
       const restoreActiveCardFocus = document.activeElement === activeCard;
-      const newDoc = await fetchRefillDoc();
+      const incoming = await fetchRefillCards();
 
       cards().forEach(card => {
         if (card !== activeCard) {
@@ -1792,7 +1874,6 @@
         }
       });
       const existing = new Set(cards().map(card => card.dataset.storyId));
-      const incoming = Array.from(newDoc.querySelectorAll('.story-card'));
       let suppressedVoted = 0;
       for (const card of incoming) {
         const storyId = card.dataset.storyId;

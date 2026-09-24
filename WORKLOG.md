@@ -1,5 +1,25 @@
 # Worklog: hn-rewrite
 
+## Empty stories flagged and skipped (7698e0c live)
+
+- `tldr-detail` no-content path returns `empty: true` (still retryable,
+  uncached). TUI hides empty stories for the session via shared `_hide_story`;
+  web shows a compact notice instead of the placeholder sentence.
+- Cause for 49580255: 4 HN comments all <60 chars (dropped), Reuters 401.
+  Limits kept; feed-time filtering out of scope (needs hydration to judge).
+- Staging miss caught by worktree ty gate: format edit shifted a hunk header
+  and the filter silently dropped `_hide_story`; amended before push.
+- Verified at exact commit (backend 820, TUI 22+1, ruff/format/ty), VPS suite
+  820, restarted, live 49580255 returns empty:true, journal clean.
+
+## TUI setup hardcoded to default server with token option
+
+- `DEFAULT_SERVER` hardcoded (tailscale deployment URL); `--server` still
+  overrides. Setup screen drops the server prompt: import link, use existing
+  token on the default server, or create new profile. Server-mismatch guard
+  applies only to an explicitly passed `--server`.
+- Tests: setup/editorial ids updated, token-flow test added; setup suite green.
+
 ## Recommended queue capped, unsummarizable hidden, quota doubled
 
 - TUI recommended orders now cap at 30 cards / 4 per source (client-side,
@@ -9279,6 +9299,47 @@ service. Client source, packaging and publication handoff live on the laptop at
   after each render and resize.
 - Validation: client 40 passed / 1 Windows-only skip; standalone copy with
   fresh deps (ruff 0.16.8, ty 0.0.82) clean; in-tree ruff/format/ty clean.
+
+## 2026-09-23 — Dashboard hotkeys: fix rail open clicks, document sort/age keys
+
+- The side-rail `o`/`c` rows advertised "open article/comments" but
+  `runKeyAction` funneled every action except `undo`/`toggle-panel` into
+  `submitVote()`, so clicking them recorded a bogus vote and swiped the
+  card away. Keyboard `o`/`c` were already correct. `runKeyAction` now
+  routes `open-article`/`open-comments` to `openStoryUrl()`.
+- The rail legend omitted 6 working shortcuts (`r`/`p`/`x`/`d` sort,
+  `e`/`a` age). Added as display-only rows, matching the existing `t`/`s`
+  pattern (keyboard already handled by `KEY_ACTIONS`).
+- Tests: new legend-row assertions plus `openStoryUrl` routing asserts in
+  the `KEY_ACTIONS`/rail test.
+- Validation: full backend 813 passed (`-n 4`,
+  `HN_ONNX_MODEL_DIR=/home/d/.cache/hn-rerank/onnx_model`); ruff, format,
+  ty clean. (Without the model env var, 18 `test_pipeline` errors are
+  HuggingFace download failures — environmental, unrelated.)
+
+## 2026-09-23 — Consistent discussion emphasis and source review
+
+Added explicit bold-key-terms instruction to the combined Discussion prompt,
+which lacked the instruction present in Article and discussion-only prompts.
+Prompt version detail-v14 rotates cache keys on deployment. Generation-path
+test verifies both combined prompts request emphasis. Local verification:
+236 server / 821 full backend tests passed, Ruff/format/ty clean. Not deployed;
+live restart/regeneration verification remains pending.
+
+Source inventory and editorial recommendations: docs/source-review.md. Local
+and VPS config hashes matched; production inspection was read-only. No feed
+subscriptions changed. Content availability counts are not preference scores.
+
+## 2026-09-23 — Larger article-only summaries (local, not deployed)
+
+Doubled article-only prompt bullet/word budgets and matching output bullet cap.
+Discussion-only and paired article/discussion budgets remain unchanged. The
+Latent Space bio-security story's ~10.4k-character prompt now allows 6–8 bullets
+and 180 words instead of 3–4 and 90. No extraction changes. Prompt version v13
+invalidates old exact-key cache entries upon deployment; stale fallback remains.
+Verified 237 server tests and 822 full backend tests, lint/type checks clean.
+Runtime restart and live generation verification remain pending deployment.
+
 ## 2026-09-23 — TUI: manual refresh regenerates the selected summary
 
 Manual `r` now passes `force_refresh=true` for the selected story through
@@ -9301,3 +9362,28 @@ filter/background-enrichment gap is real, but attribution to individual feeds
 remains unverified; source selection and fetch scheduling are unchanged.
 Backend 821 passed; TUI 94 passed / 1 skipped; lint/format/types clean. No
 production deployment, database edits, or terminal manipulation performed.
+
+## 2026-09-23 — TUI: prevent sort/age synchronization echo
+
+Rapid sort changes queued obsolete Select.Changed and Tabs.TabActivated events.
+Each handler replayed stale values into the other widget, sustaining a loop of
+filter rebuilds and visual flicker. Both handlers now ignore events that no
+longer match their originating widget's current value. Existing valid changes
+still synchronize normally. No input sent to the user's running terminal.
+
+Regression tests exercise rapid sort cycling, direct tab changes, and age
+changes at widths 73 and 146; assert matching widgets and no further rebuilds
+after settling. Client: 92 passed / 1 skipped. Backend: 821 passed. Ruff,
+touched-file format checks, ty and diff whitespace checks clean. Local only;
+restart the TUI to load the fix (not restarted automatically).
+
+## 2026-09-23 — TUI: `s` cycles sort modes
+
+- `s` was unbound in the terminal client while `r`/`d`/`p` carry no sort
+  meaning there (`r` = refresh; sort lives in the dropdowns). `s` now
+  advances the sort selector recommended → popular → explore → date →
+  recommended via `action_cycle_sort`, reusing the existing
+  `Select.Changed` → tabs-sync → rebuild path. Blocked while a selector
+  owns focus (same guard as the other keys) and documented in `?` help.
+- Validation: new `test_s_cycles_sort_modes` passes; full client suite 85
+  passed / 1 skipped; ruff, format clean.

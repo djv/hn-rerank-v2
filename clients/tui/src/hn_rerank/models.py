@@ -8,6 +8,14 @@ from typing import Any
 
 
 @dataclass(frozen=True)
+class FeedBadge:
+    kind: str
+    icon: str
+    label: str
+    tooltip: str
+
+
+@dataclass(frozen=True)
 class FeedStory:
     id: int
     title: str
@@ -22,6 +30,11 @@ class FeedStory:
     popular: bool
     explore: bool
     badges: list[str] = field(default_factory=list)
+    badge_details: list[FeedBadge] = field(default_factory=list)
+    best_match_title: str = ""
+    source_label: str = ""
+    domain: str = ""
+    enriched: bool = False
 
 
 @dataclass(frozen=True)
@@ -44,7 +57,13 @@ class Feed:
         if data.get("api_version") != 1:
             raise ValueError("Unsupported feed API; update hn-rerank.")
         try:
-            stories = [FeedStory(**story) for story in data["stories"]]
+            stories = []
+            for raw_story in data["stories"]:
+                story_data: dict[str, Any] = dict(raw_story)
+                story_data["badge_details"] = [
+                    FeedBadge(**badge) for badge in story_data.get("badge_details", [])
+                ]
+                stories.append(FeedStory(**story_data))
             result = cls(
                 1,
                 stories,
@@ -86,6 +105,29 @@ class Feed:
                     or any(not isinstance(key, str) for key in story.memberships)
                     or not isinstance(story.badges, list)
                     or any(not isinstance(badge, str) for badge in story.badges)
+                    or not isinstance(story.badge_details, list)
+                    or any(
+                        not isinstance(badge, FeedBadge)
+                        or any(
+                            not isinstance(value, str)
+                            for value in (
+                                badge.kind,
+                                badge.icon,
+                                badge.label,
+                                badge.tooltip,
+                            )
+                        )
+                        for badge in story.badge_details
+                    )
+                    or any(
+                        not isinstance(value, str)
+                        for value in (
+                            story.best_match_title,
+                            story.source_label,
+                            story.domain,
+                        )
+                    )
+                    or type(story.enriched) is not bool
                 ):
                     raise ValueError("Invalid story")
             ids = {story.id for story in stories}
