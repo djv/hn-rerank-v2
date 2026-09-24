@@ -490,3 +490,16 @@ test failed with `hints.bottom=38`, `footer.bottom=37`; removing the overall
 footer height cap makes all rows visible. Status remains limited to three
 lines. Reviewed navigation prefetch bounds, cache-only opt-out, cancellation,
 rate-limit handling, request reuse and documentation; no other blocker found.
+
+## 2026-09-24 Post-push CI status
+
+Head `71de3b4c3049d36d22a15b3745bfd1dfac1e3b81` is pushed to `origin/main`.
+Backend CI succeeded: https://github.com/djv/hn-rerank-v2/actions/runs/36059751527
+Terminal client failed: https://github.com/djv/hn-rerank-v2/actions/runs/36059751541
+
+All terminal-client test jobs passed before lint: Windows 122 passed; Linux
+and macOS 121 passed/1 skipped. Each Ruff step reports eight errors, including
+I001 imports and SIM102 nested conditions (`tests/test_client.py:566`).
+`.github/workflows/tui.yml` copies the package outside the backend workspace
+before running `uv run ruff check src tests`; reproduce that isolation for
+the next fix. No code changes or CI reruns were performed for this status save.
