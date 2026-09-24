@@ -450,6 +450,7 @@ class Reader(App[None]):
         ("c", "open_url('comments_url')", "Comments"),
         ("r", "refresh", "Refresh"),
         ("s", "cycle_sort", "Sort"),
+        ("v", "reverse_sort", "Reverse"),
         ("enter", "read", "Read"),
         ("escape", "headlines", "Back"),
         ("?", "help", "Help"),
@@ -500,6 +501,9 @@ class Reader(App[None]):
         # Headline row state as last rendered: column widths and marked story.
         self._row_widths: tuple[int, int, int] | None = None
         self._marked_id: int | None = None
+        # View preference: show the current sort bottom-first. Sticky
+        # across sort cycling and feed refreshes until toggled back.
+        self.reverse_sort = False
         self.rated: set[int] = set()
         self.unavailable: set[int] = set()
         self.restored: dict[int, FeedStory] = {}
@@ -588,7 +592,16 @@ class Reader(App[None]):
         return not (
             isinstance(self.focused, Select)
             and action
-            in {"move", "vote", "undo", "read", "refresh", "open_url", "cycle_sort"}
+            in {
+                "move",
+                "vote",
+                "undo",
+                "read",
+                "refresh",
+                "open_url",
+                "cycle_sort",
+                "reverse_sort",
+            }
         )
 
     def status(self, message: str, *, error: bool = False) -> None:
@@ -612,6 +625,9 @@ class Reader(App[None]):
         line.append(f"~{counts.get('neutral', 0)}", style="#E5C07B")
         line.append(" ", style="#6B655D")
         line.append(f"−{counts.get('down', 0)}", style="#FFB4A6")
+        if self.reverse_sort:
+            line.append(" · ", style="#6B655D")
+            line.append("reversed", style="#E5C07B")
         widget = self.query_one("#status", Static)
         widget.update(line)
         widget.set_class(False, "error")
@@ -749,6 +765,8 @@ class Reader(App[None]):
             # feed.orders is shared with prefetch entry points.
             order = list(order)
             random.shuffle(order)
+        if self.reverse_sort:
+            order = order[::-1]
         self.stories = [
             lookup[sid]
             for sid in order
@@ -1216,6 +1234,13 @@ class Reader(App[None]):
             index = -1
         select.value = self.SORT_CYCLE[(index + 1) % len(self.SORT_CYCLE)]
 
+    def action_reverse_sort(self) -> None:
+        """Flip the headline list and focus the new first item."""
+        self.reverse_sort = not self.reverse_sort
+        # select_id=-1: filter-change behavior, highlight index 0 and
+        # scroll home instead of following the previously selected story.
+        self.rebuild(select_id=-1)
+
     def action_refresh(
         self, *, force_summary: bool = True, restore_hidden: bool = True
     ) -> None:
@@ -1420,7 +1445,30 @@ class Reader(App[None]):
         self.selection_serial += 1
         self.workers.cancel_group(self, "summary")
         self.query_one("#summary", Markdown).update(
-            "# Shortcuts\n\nj/k: move the headline list. Arrows: scroll the focused pane. Tab: focus. Escape: close this help.\n\nEnter: hide the article list and zoom the TLDR pane. Enter or Escape: return to the article list. In zoom mode, j/k scroll the TLDR. 1/2/3: up / neutral / down. u: undo latest vote. o/c: article / comments. r: refresh and regenerate selected summary. s: cycle sort. b: badge legend. ?: this help. q: quit.\n\nUse the selectors for Recommended, Popular, Explore, Date and Recent / Archive. Votes are never automatically retried after network errors."
+            "# Shortcuts\n\n"
+            "## Move\n\n"
+            "- `j` / `k`: move the headline list\n"
+            "- `Tab`: switch focus between panes\n"
+            "- Arrow keys: scroll the focused pane\n\n"
+            "## Read\n\n"
+            "- `Enter`: zoom the TLDR pane (hide the article list)\n"
+            "- `Enter` / `Escape`: return to the article list\n"
+            "- In zoom mode, `j` / `k` scroll the TLDR\n\n"
+            "## Vote\n\n"
+            "- `1` / `2` / `3`: up / neutral / down (advances to next story)\n"
+            "- `u`: undo latest vote\n\n"
+            "## Sort\n\n"
+            "- `s`: cycle sort (Recommended → Popular → Explore → Date)\n"
+            "- `v`: reverse sort order\n"
+            "- Selectors: sort and Recent / Archive\n\n"
+            "## Other\n\n"
+            "- `o` / `c`: open article / comments\n"
+            "- `r`: refresh and regenerate selected summary\n"
+            "- `b`: badge legend\n"
+            "- `?`: this help\n"
+            "- `q`: quit\n"
+            "- `Escape`: close this help\n\n"
+            "Votes are never automatically retried after network errors."
         )
         self.focus_summary()
         self.schedule_read_state()

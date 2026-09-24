@@ -591,6 +591,39 @@ async def test_explore_sort_is_shuffled(
         assert fake.feed.orders["explore:recent"] == [1, 2]
 
 
+async def test_v_reverses_sort_order(tmp_path: Path) -> None:
+    """v flips the headline list; toggling back restores rank order."""
+    fake = FakeServer()
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        await pilot.pause(0.4)
+        app.query_one(OptionList).focus()
+        assert [s.id for s in app.stories] == [1, 2]
+        await pilot.press("v")
+        await pilot.pause(0.3)
+        assert [s.id for s in app.stories] == [2, 1]
+        # The flip focuses the new first item and flags the footer.
+        selected = app.selected()
+        assert selected is not None and selected.id == 2
+        assert app.query_one(OptionList).highlighted == 0
+        assert "reversed" in str(app.query_one("#status", Static).content)
+        await pilot.press("v")
+        await pilot.pause(0.3)
+        assert [s.id for s in app.stories] == [1, 2]
+        assert "reversed" not in str(app.query_one("#status", Static).content)
+        # Reverse sticks across sort cycling (popular has one story).
+        await pilot.press("v")
+        await pilot.press("s")
+        await pilot.pause(0.3)
+        assert str(app.query_one("#sort", Select).value) == "popular"
+        assert [s.id for s in app.stories] == [1]
+        await pilot.press("s")
+        await pilot.press("s")
+        await pilot.pause(0.3)
+        assert str(app.query_one("#sort", Select).value) == "date"
+        assert [s.id for s in app.stories] == [1, 2]
+
+
 class FlakySummaryServer(FakeServer):
     """Rate-limits foreground taps for story 1; cache reads always miss."""
 

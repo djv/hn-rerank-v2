@@ -1,5 +1,18 @@
 # Worklog: hn-rewrite
 
+## 2026-09-24 TUI reversible sort order
+
+- `v` (`reverse_sort`) flips the headline list between rank order and its
+  reverse. The `reverse_sort` flag is sticky across sort cycling and feed
+  refreshes, applies after the explore shuffle, and never mutates the
+  shared `feed.orders`. Toggling focuses the new first item (filter-change
+  behavior), not the previously selected story. Guarded while a selector
+  owns focus (same as `s`); documented in `?` help. While reversed, the
+  footer counts line gains a `reversed` marker so the state is visible.
+- Validation: new `test_v_reverses_sort_order` passes; full TUI suite 123
+  passed / 1 skipped; `ruff check`, `ruff format --check`, `ty check`
+  clean. Backend untouched. Uncommitted; restart the TUI to load it.
+
 ## 2026-09-24 TUI explore sort shuffles client-side
 
 - TUI `rebuild()` now shuffles a copy of the explore order on every rebuild,
