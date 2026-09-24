@@ -1,17 +1,19 @@
 # HN Rerank status
 
-## Local reader audit — not deployed
+## Reader refresh deploy — 0404066 live on VPS
 
-Objective: simplify refresh/summary/coverage improvements using existing paths.
-Verified and fixed cooldown fallback masking failed refresh, plus TUI losing
-readable text/selection when forced regeneration fails. Backend 821 passed;
-TUI 94 passed / 1 skipped; Ruff/format/ty clean. User terminal untouched.
-Next: coverage inspection done 2026-09-24 (evidence in FINDINGS.md) — fetch
-failures are a vacuum (1 transient row), snippets pass is_summarizable, so
-the pre-rank-filter theory is unproven and no scheduling change was made.
-Summary spot-check shows no new prompt issue. Awaiting authorization to
-commit focused reader files and deploy/restart for live verification.
-Details: docs/reader-improvements.md. Preserve all unrelated local WIP.
+Cooldown fallback now marks blocked refresh retryable (with reason + delay)
+instead of disguising it as a cache hit; TUI preserves readable text and
+selection when forced regeneration fails. Verified in worktree at the exact
+commit (backend 820, TUI subset 83+1 skip, Ruff/format/ty clean), pushed
+bb39263..0404066, VPS fast-forwarded clean with no stash to preserve.
+Exact VPS suite 820 passed; service restarted, active. Live: dashboard 200,
+uncached regeneration 200 then cached hit 200 with no retryable flag on the
+normal path, strict journal error scan clean. Coverage inspection (FINDINGS.md)
+left scheduling untouched; summary spot-check showed no new prompt issue.
+Leftover local WIP (TUI s-cycle + echo guard, web refill, ranking, source
+review) stays uncommitted and was never on the VPS path. Details:
+docs/reader-improvements.md.
 
 ## Current TLDR deployment — b77afc6
 
