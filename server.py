@@ -2994,6 +2994,10 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
                     # a transient upstream 429 clears) may find real content,
                     # so the client must not treat this as a final answer.
                     "retryable": True,
+                    # Machine flag: hydration found nothing summarizable
+                    # (short-only comments, blocked article). Clients skip
+                    # rendering this as a real summary.
+                    "empty": True,
                 }
             )
         if result.kind == "llm_error":

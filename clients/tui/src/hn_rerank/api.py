@@ -43,10 +43,13 @@ class Summary:
 
     Provisional responses (a stale fallback or a retryable partial) are shown
     but must not be cached: a later attempt may produce a complete summary.
+    Empty responses mean hydration found nothing summarizable; clients skip
+    them instead of rendering the placeholder sentence.
     """
 
     text: str
     provisional: bool = False
+    empty: bool = False
 
 
 def normalize_server(value: str) -> str:
@@ -287,6 +290,7 @@ class API:
             return Summary(
                 value,
                 provisional=data.get("stale") is True or data.get("retryable") is True,
+                empty=data.get("empty") is True,
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise APIError(

@@ -2185,25 +2185,35 @@
         });
         if (resp.ok) {
           const data = await resp.json();
-          if (data.retryable || data.stale) {
-            // Provisional content: a transient no-content attempt
-            // (retryable) or a stale/quota fallback summary (stale) -
-            // don't cache it as final, so the next open (card re-click,
-            // filter switch, next-card cycle) retries instead of showing
-            // this placeholder/stale summary forever.
+          if (data.empty) {
+            // Server found nothing summarizable: compact notice instead of
+            // the placeholder sentence. Still retryable later (comments may
+            // grow, the article may unblock), never cached.
             contentDiv.dataset.error = 'true';
             tldrRetryAt.set(storyId, Date.now() + 60000);
+            contentDiv.textContent = 'TLDR: no summarizable content for this story yet.';
+            contentDiv.style.display = 'block';
           } else {
-            tldrCache.set(storyId, data.tldr);
-            delete contentDiv.dataset.error;
+            if (data.retryable || data.stale) {
+              // Provisional content: a transient no-content attempt
+              // (retryable) or a stale/quota fallback summary (stale) -
+              // don't cache it as final, so the next open (card re-click,
+              // filter switch, next-card cycle) retries instead of showing
+              // this placeholder/stale summary forever.
+              contentDiv.dataset.error = 'true';
+              tldrRetryAt.set(storyId, Date.now() + 60000);
+            } else {
+              tldrCache.set(storyId, data.tldr);
+              delete contentDiv.dataset.error;
+            }
+            contentDiv.innerHTML = parseSimpleMarkdown(data.tldr);
+            styleTldrLabels(contentDiv);
+            enhanceTldrContent(contentDiv, { stale: !!(data.retryable || data.stale) });
+            if (!data.retryable && !data.stale) {
+              ensureTldrRefreshButton(card, contentDiv);
+            }
+            contentDiv.style.display = 'block';
           }
-          contentDiv.innerHTML = parseSimpleMarkdown(data.tldr);
-          styleTldrLabels(contentDiv);
-          enhanceTldrContent(contentDiv, { stale: !!(data.retryable || data.stale) });
-          if (!data.retryable && !data.stale) {
-            ensureTldrRefreshButton(card, contentDiv);
-          }
-          contentDiv.style.display = 'block';
         } else {
           const errData = await resp.json().catch(() => ({}));
           const errorMsg = errData.error || `HTTP ${resp.status}`;

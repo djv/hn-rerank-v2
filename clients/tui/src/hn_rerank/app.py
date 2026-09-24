@@ -761,6 +761,11 @@ class Reader(App[None]):
         try:
             summary = await self.api.summary(story_id, force_refresh=force_refresh)
             if serial == self.selection_serial and self.query("#summary"):
+                if summary.empty:
+                    # Server found nothing summarizable: same session-hide
+                    # as undisplayable failures, never rendered or cached.
+                    self._hide_story(story_id, "no summarizable content")
+                    return
                 if not summary.provisional:
                     self.summaries[story_id] = summary.text
                 self.query_one("#summary", Markdown).update(summary.text)
@@ -786,19 +791,18 @@ class Reader(App[None]):
                 # Undisplayable summaries leave the deck: the failure may be
                 # transient (quota/cooldown), so this hides for the session
                 # only — refresh restores. InvalidProfile goes to setup above.
-                self.unavailable.add(story_id)
-                current = [s.id for s in self.stories]
-                try:
-                    advance: int | None = current[current.index(story_id) + 1]
-                except (ValueError, IndexError):
-                    advance = next(
-                        (sid for sid in reversed(current) if sid != story_id), None
-                    )
-                self.rebuild(select_id=advance)
-                self.status(
-                    f"Skipped story {story_id} — summary unavailable ({exc}). "
-                    "r restores hidden stories."
-                )
+                self._hide_story(story_id, f"summary unavailable ({exc})")
+
+    def _hide_story(self, story_id: int, reason: str) -> None:
+        """Drop a story from the deck for this session; refresh restores."""
+        self.unavailable.add(story_id)
+        current = [s.id for s in self.stories]
+        try:
+            advance: int | None = current[current.index(story_id) + 1]
+        except (ValueError, IndexError):
+            advance = next((sid for sid in reversed(current) if sid != story_id), None)
+        self.rebuild(select_id=advance)
+        self.status(f"Skipped story {story_id} — {reason}. r restores hidden stories.")
 
     def schedule_prefetch(self) -> None:
         """Queue the stories just after the selection for a background warm.

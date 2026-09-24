@@ -4412,6 +4412,8 @@ def test_tldr_detail_does_not_cache_placeholder(test_env, monkeypatch):
     assert call_count == 2  # both requests regenerated (no cache write)
     assert resp1.json()["cached"] is False
     assert resp2.json()["cached"] is False
+    assert resp1.json()["empty"] is True  # clients skip, never render
+    assert resp1.json()["retryable"] is True
     assert db.get_tldr_cache(779, "") is None  # no cache entry written
 
 
