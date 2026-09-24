@@ -11,8 +11,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--server",
-        default=DEFAULT_SERVER,
-        help="Server URL, including deployment prefix (default: %(default)s)",
+        default=None,
+        # None keeps a saved profile's server; only an explicit flag overrides it.
+        help=f"Server URL, including deployment prefix (default: {DEFAULT_SERVER})",
     )
     parser.add_argument(
         "--prefetch",

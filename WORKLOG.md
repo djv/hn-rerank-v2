@@ -1,5 +1,25 @@
 # Worklog: hn-rewrite
 
+## TUI review fixes (uncommitted)
+
+- `--server` defaulted to `DEFAULT_SERVER`, so every launch counted as an
+  explicit override. A profile saved for another server was forced back to
+  Setup, and importing a link for that server failed the mismatch guard.
+  argparse now defaults to `None`, and `start()` compares only
+  `explicit_server`.
+- New `api.TransientError` (connection failure, 429). `load_summary` shows it
+  in the pane and keeps the story. Before this, each `j` press during a
+  cooldown or network blip hid another story. 5xx and `empty` still hide.
+- Version polls call `action_refresh(restore_hidden=False)`, so hidden or
+  empty stories stay hidden until a manual `r`.
+- `open_in_firefox`: `OSError` and timeouts fall back to `webbrowser.open`
+  instead of crashing the app. `wmctrl` failures are ignored.
+- Highlight changes re-render only the old and new marker rows, or every row
+  when a resize changes the column widths.
+- textual pinned to `<8.3` because `Dropdown` imports `textual.widgets._select`.
+- Added `pytest-xdist` to the TUI dev group: `-n 4` takes the suite from about
+  90 s to 25 s (105 passed, 1 skipped).
+
 ## Local TUI filter navigation and heading spacing (uncommitted)
 
 - Switching sort or age starts at the first story and scrolls the headline list

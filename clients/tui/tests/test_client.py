@@ -557,3 +557,61 @@ async def test_s_cycles_sort_modes(tmp_path: Path) -> None:
             await pilot.pause(0.3)
             assert str(app.query_one("#sort", Select).value) == expected
             assert [s.id for s in app.stories] == story_ids
+
+
+class FlakySummaryServer(FakeServer):
+    """Rate-limits foreground taps for story 1; cache reads always miss."""
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/api/tldr-detail"):
+            if json.loads(request.content)["story_id"] == 1:
+                return httpx.Response(429, headers={"Retry-After": "30"})
+        if "/api/tldr-cache/" in request.url.path:
+            return httpx.Response(204)
+        return await super().__call__(request)
+
+
+async def test_transient_summary_failure_keeps_story(tmp_path: Path) -> None:
+    fake = FlakySummaryServer()
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while "Rate limited" not in app.query_one(Markdown)._markdown:
+            if asyncio.get_running_loop().time() > deadline:
+                raise AssertionError("rate limit was not shown")
+            await pilot.pause(0.05)
+        assert 1 not in app.unavailable
+        assert [s.id for s in app.stories] == [1, 2]
+        selected = app.selected()
+        assert selected is not None and selected.id == 1
+
+
+async def test_version_poll_keeps_hidden_stories_hidden(tmp_path: Path) -> None:
+    fake = FakeServer()
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        await pilot.pause(0.3)
+        app.unavailable.add(1)
+        app.action_refresh(force_summary=False, restore_hidden=False)
+        await pilot.pause(0.3)
+        assert [s.id for s in app.stories] == [2]
+        app.action_refresh()
+        await pilot.pause(0.3)
+        assert [s.id for s in app.stories] == [1, 2]
+
+
+def test_open_in_firefox_falls_back_on_launch_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hn_rerank.app as app_module
+
+    opened: list[str] = []
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/firefox")
+
+    def missing(*args: object, **kwargs: object) -> None:
+        raise FileNotFoundError("pgrep")
+
+    monkeypatch.setattr("subprocess.run", missing)
+    monkeypatch.setattr(app_module.webbrowser, "open", opened.append)
+    app_module.open_in_firefox("https://example.org/x")
+    assert opened == ["https://example.org/x"]

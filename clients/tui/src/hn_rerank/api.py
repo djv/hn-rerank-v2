@@ -37,6 +37,10 @@ class InvalidProfile(APIError):
     pass
 
 
+class TransientError(APIError):
+    """Connection failure or rate limit: says nothing about the story itself."""
+
+
 @dataclass(frozen=True)
 class Summary:
     """Summary text plus whether the server marked it provisional.
@@ -214,7 +218,7 @@ class API:
                 method, self.server + path, headers=headers, json=json
             )
         except (httpx.RequestError, httpx.InvalidURL) as exc:
-            raise APIError(
+            raise TransientError(
                 "Connection failed. Press r to refresh; votes are not retried."
             ) from exc
         if response.status_code in {401, 403}:
@@ -224,7 +228,7 @@ class API:
         if response.status_code == 429:
             delay = response.headers.get("Retry-After", "a few")
             delay = delay if delay.isdigit() else "a few"
-            raise APIError(f"Rate limited. Try again in {delay} seconds.")
+            raise TransientError(f"Rate limited. Try again in {delay} seconds.")
         if response.is_redirect:
             raise APIError(
                 "Server redirected the request. Check the server URL and deployment prefix."

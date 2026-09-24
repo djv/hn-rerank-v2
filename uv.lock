@@ -322,6 +322,7 @@ dev = [
     { name = "hypothesis" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
+    { name = "pytest-xdist" },
     { name = "ruff" },
     { name = "ty" },
 ]
@@ -330,7 +331,7 @@ dev = [
 requires-dist = [
     { name = "httpx", specifier = ">=0.28,<1" },
     { name = "platformdirs", specifier = ">=4,<5" },
-    { name = "textual", specifier = ">=8.2.8,<9" },
+    { name = "textual", specifier = ">=8.2.8,<8.3" },
 ]
 
 [package.metadata.requires-dev]
@@ -338,6 +339,7 @@ dev = [
     { name = "hypothesis", specifier = ">=6.150" },
     { name = "pytest", specifier = ">=9" },
     { name = "pytest-asyncio", specifier = ">=1" },
+    { name = "pytest-xdist", specifier = ">=3" },
     { name = "ruff", specifier = ">=0.14" },
     { name = "ty", specifier = ">=0.0.10" },
 ]

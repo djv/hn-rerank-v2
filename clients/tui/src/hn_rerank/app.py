@@ -28,6 +28,9 @@ from textual.widgets import (
     Tab,
     Tabs,
 )
+
+# Private module: Dropdown reuses Select's internals, so pyproject pins
+# textual to the tested minor release.
 from textual.widgets._select import (
     NonSelectableStatic,
     SelectCurrent,
@@ -41,6 +44,7 @@ from .api import (
     InvalidProfile,
     Impression,
     Profile,
+    TransientError,
     load_profile,
     normalize_server,
     profile_path,
@@ -60,26 +64,36 @@ def open_in_firefox(url: str) -> None:
     if firefox is None:
         webbrowser.open(url)
         return
-    running = (
-        subprocess.run(
-            ["pgrep", "-x", "firefox"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode
-        == 0
-    )
-    subprocess.Popen(
-        [firefox, "--new-tab", url] if running else [firefox, url],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    if shutil.which("wmctrl") is not None:
-        subprocess.run(
-            ["wmctrl", "-x", "-a", "Navigator.firefox"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+    # A missing pgrep/wmctrl or a failed launch must not crash the reader.
+    try:
+        running = (
+            subprocess.run(
+                ["pgrep", "-x", "firefox"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            ).returncode
+            == 0
         )
+        subprocess.Popen(
+            [firefox, "--new-tab", url] if running else [firefox, url],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        webbrowser.open(url)
+        return
+    if shutil.which("wmctrl") is not None:
+        try:
+            subprocess.run(
+                ["wmctrl", "-x", "-a", "Navigator.firefox"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass  # Focusing the window is cosmetic.
 
 
 class ArrowLeftCurrent(SelectCurrent):
@@ -473,6 +487,9 @@ class Reader(App[None]):
         self.api = api
         self.feed: Feed | None = None
         self.stories: list[FeedStory] = []
+        # Headline row state as last rendered: column widths and marked story.
+        self._row_widths: tuple[int, int, int] | None = None
+        self._marked_id: int | None = None
         self.rated: set[int] = set()
         self.unavailable: set[int] = set()
         self.restored: dict[int, FeedStory] = {}
@@ -599,7 +616,11 @@ class Reader(App[None]):
         try:
             if self.api is None:
                 profile = load_profile(self.config_path)
-                if profile is None or (self.server and self.server != profile.server):
+                # Only an explicit --server overrides the saved profile's server;
+                # the default must not force setup for a profile saved elsewhere.
+                if profile is None or (
+                    self.explicit_server and self.explicit_server != profile.server
+                ):
                     self.setup()
                     return
                 self.api = API(profile.server, profile.token)
@@ -710,6 +731,8 @@ class Reader(App[None]):
         headlines.clear_options()
         # Option padding (1 each side) plus the 2-cell selection marker.
         widths = self.meta_widths(max(0, headlines.size.width - 4))
+        self._row_widths = widths
+        self._marked_id = select_id
         headlines.add_options(
             [
                 Option(
@@ -771,11 +794,21 @@ class Reader(App[None]):
             return
         listing = self.query_one("#headlines", OptionList)
         widths = self.meta_widths(max(0, listing.size.width - 4))
-        for index, story in enumerate(self.stories):
+        current = self.selected()
+        current_id = current.id if current else None
+        # Only the old and new marker rows change, unless a resize moved the
+        # column widths; re-rendering every row on each keypress is wasted work.
+        if widths == self._row_widths:
+            changed = {self._marked_id, current_id}
+            rows = [s for s in self.stories if s.id in changed]
+        else:
+            rows = self.stories
+        for story in rows:
             listing.replace_option_prompt(
-                str(story.id),
-                headline(story, index == listing.highlighted, widths),
+                str(story.id), headline(story, story.id == current_id, widths)
             )
+        self._row_widths = widths
+        self._marked_id = current_id
         self.schedule_summary()
 
     def schedule_summary(self) -> None:
@@ -887,6 +920,17 @@ class Reader(App[None]):
                     self.status(
                         f"Kept previous summary — refresh failed ({exc}).", error=True
                     )
+                    self.schedule_read_state()
+                    return
+                if isinstance(exc, TransientError):
+                    # A dropped connection or rate limit says nothing about
+                    # this story; hiding here would drain the deck while
+                    # the user keeps moving through a cooldown.
+                    self.query_one("#summary", Markdown).update(
+                        f"# Summary unavailable\n\n{exc}\n\n"
+                        "Move away and back, or press **r**, to try again."
+                    )
+                    self.status(str(exc), error=True)
                     self.schedule_read_state()
                     return
                 # Undisplayable summaries leave the deck: the failure may be
@@ -1022,7 +1066,8 @@ class Reader(App[None]):
         ):
             # A lower version is a server restart, not an obsolete response.
             # Drop local summaries too: the new generation may have new text.
-            self.action_refresh(force_summary=False)
+            # Hidden stories stay hidden; only a manual r restores them.
+            self.action_refresh(force_summary=False, restore_hidden=False)
 
     @work(group="refresh", exclusive=True)
     async def refresh_feed(self) -> None:
@@ -1082,7 +1127,9 @@ class Reader(App[None]):
             index = -1
         select.value = self.SORT_CYCLE[(index + 1) % len(self.SORT_CYCLE)]
 
-    def action_refresh(self, *, force_summary: bool = True) -> None:
+    def action_refresh(
+        self, *, force_summary: bool = True, restore_hidden: bool = True
+    ) -> None:
         story = self.selected()
         self.force_summary_id = story.id if force_summary and story else None
         self.help_open = False
@@ -1094,7 +1141,8 @@ class Reader(App[None]):
         self.summaries.clear()
         if previous is not None and story is not None:
             self.summaries[story.id] = previous
-        self.unavailable.clear()
+        if restore_hidden:
+            self.unavailable.clear()
         self.prefetch_queue.clear()
         self.prefetch_retry_at.clear()
         self.prefetch_cooldown_until = 0.0

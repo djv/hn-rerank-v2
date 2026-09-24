@@ -141,3 +141,22 @@ async def test_profile_setup_cancels_pending_vote_state() -> None:
         await pilot.pause(0.5)
         assert isinstance(app.screen, Setup)
         assert not app.pending and not app.rated and not app.history
+
+
+async def test_default_server_keeps_saved_profile_elsewhere(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeServer()
+    monkeypatch.setattr(
+        app_module,
+        "API",
+        lambda server, token=None: API(server, token, httpx.MockTransport(fake)),
+    )
+    path = tmp_path / "profile.json"
+    save_profile(Profile("http://localhost:8000/", "test"), path)
+    # No --server flag: the saved profile's server wins over DEFAULT_SERVER.
+    app = Reader(config_path=path)
+    async with app.run_test() as pilot:
+        await pilot.pause(0.2)
+        assert not isinstance(app.screen, Setup)
+        assert app.api is not None and app.api.server == "http://localhost:8000/"
