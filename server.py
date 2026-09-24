@@ -2700,7 +2700,18 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
         retry_after = llm_limiter.retry_after_seconds
         if retry_after:
             if cached_tldr:
-                return _serve_cached_tldr(cached_tldr, story.id, cache_key, "cache_hit")
+                # The text is current, but a requested refresh did not happen.
+                # Mark it retryable rather than disguising this as a normal hit.
+                return _flask_json_response(
+                    {
+                        "ok": True,
+                        "tldr": cached_tldr,
+                        "cached": True,
+                        "retryable": True,
+                        "reason": "provider_cooldown",
+                        "retry_after_seconds": retry_after,
+                    }
+                )
             fallback = _stale_tldr_fallback_response(
                 runtime.db, story.id, "provider_cooldown"
             )

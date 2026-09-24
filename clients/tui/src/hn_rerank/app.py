@@ -397,6 +397,7 @@ class Reader(App[None]):
         self.selection_serial = 0
         self.interaction_session = str(uuid4())
         self.summary_story_id: int | None = None
+        self.force_summary_id: int | None = None
         self.reading = False
         self.can_read = False
         self._read_timers: list[Timer] = []
@@ -698,13 +699,18 @@ class Reader(App[None]):
                     ),
                     self.selection_serial,
                 )
-            cached = self.summaries.get(story.id)
+            force_refresh = story.id == self.force_summary_id
+            self.force_summary_id = None
+            cached = None if force_refresh else self.summaries.get(story.id)
             if cached is not None:
                 self.query_one("#summary", Markdown).update(cached)
                 self.schedule_prefetch()
             else:
-                self.query_one("#summary", Markdown).update("Loading summary…")
-                self.load_summary(story.id, self.selection_serial)
+                if story.id not in self.summaries:
+                    self.query_one("#summary", Markdown).update("Loading summary…")
+                self.load_summary(
+                    story.id, self.selection_serial, force_refresh=force_refresh
+                )
             self.query_one("#summary", Markdown).scroll_home(animate=False)
             self.schedule_read_state()
 
@@ -735,7 +741,9 @@ class Reader(App[None]):
             pass
 
     @work(group="summary", exclusive=True)
-    async def load_summary(self, story_id: int, serial: int) -> None:
+    async def load_summary(
+        self, story_id: int, serial: int, *, force_refresh: bool = False
+    ) -> None:
         await asyncio.sleep(0.3)
         if (
             not self.api
@@ -743,20 +751,38 @@ class Reader(App[None]):
             or not self.query("#summary")
         ):
             return
-        self.query_one("#summary", Markdown).update("Loading summary…")
+        previous = self.summaries.get(story_id)
+        if previous is None:
+            self.query_one("#summary", Markdown).update("Loading summary…")
+        else:
+            self.query_one("#summary", Markdown).update(previous)
+            self.status("Regenerating summary…")
         self.schedule_read_state()
         try:
-            summary = await self.api.summary(story_id)
+            summary = await self.api.summary(story_id, force_refresh=force_refresh)
             if serial == self.selection_serial and self.query("#summary"):
                 if not summary.provisional:
                     self.summaries[story_id] = summary.text
                 self.query_one("#summary", Markdown).update(summary.text)
+                if summary.provisional:
+                    self.status(
+                        "Summary may be outdated or incomplete. Press r to retry."
+                    )
+                elif force_refresh:
+                    self.status("Summary regenerated.")
                 self.schedule_read_state()
                 self.schedule_prefetch()
         except InvalidProfile as exc:
             self.setup(str(exc))
         except APIError as exc:
             if serial == self.selection_serial and self.query("#summary"):
+                if previous is not None:
+                    self.query_one("#summary", Markdown).update(previous)
+                    self.status(
+                        f"Kept previous summary — refresh failed ({exc}).", error=True
+                    )
+                    self.schedule_read_state()
+                    return
                 # Undisplayable summaries leave the deck: the failure may be
                 # transient (quota/cooldown), so this hides for the session
                 # only — refresh restores. InvalidProfile goes to setup above.
@@ -891,7 +917,7 @@ class Reader(App[None]):
         ):
             # A lower version is a server restart, not an obsolete response.
             # Drop local summaries too: the new generation may have new text.
-            self.action_refresh()
+            self.action_refresh(force_summary=False)
 
     @work(group="refresh", exclusive=True)
     async def refresh_feed(self) -> None:
@@ -935,10 +961,18 @@ class Reader(App[None]):
             )
             self.show_failure(str(exc))
 
-    def action_refresh(self) -> None:
+    def action_refresh(self, *, force_summary: bool = True) -> None:
+        story = self.selected()
+        self.force_summary_id = story.id if force_summary and story else None
         self.help_open = False
         self.summary_story_id = None
+        # Invalidate an older request immediately, not only after feed refresh.
+        self.selection_serial += 1
+        self.workers.cancel_group(self, "summary")
+        previous = self.summaries.get(story.id) if story and force_summary else None
         self.summaries.clear()
+        if previous is not None and story is not None:
+            self.summaries[story.id] = previous
         self.unavailable.clear()
         self.prefetch_queue.clear()
         self.prefetch_retry_at.clear()
@@ -1133,7 +1167,7 @@ class Reader(App[None]):
         self.selection_serial += 1
         self.workers.cancel_group(self, "summary")
         self.query_one("#summary", Markdown).update(
-            "# Shortcuts\n\nj/k: move the headline list. Arrows: scroll the focused pane. Tab: focus. Escape: close this help.\n\nEnter: expand a summary that overflows its pane, and leave that mode again. 1/2/3: up / neutral / down. u: undo latest vote. o/c: article / comments. r: refresh. b: badge legend. ?: this help. q: quit.\n\nUse the selectors for Recommended, Popular, Explore, Date and Recent / Archive. Votes are never automatically retried after network errors."
+            "# Shortcuts\n\nj/k: move the headline list. Arrows: scroll the focused pane. Tab: focus. Escape: close this help.\n\nEnter: expand a summary that overflows its pane, and leave that mode again. 1/2/3: up / neutral / down. u: undo latest vote. o/c: article / comments. r: refresh and regenerate selected summary. b: badge legend. ?: this help. q: quit.\n\nUse the selectors for Recommended, Popular, Explore, Date and Recent / Archive. Votes are never automatically retried after network errors."
         )
         self.focus_summary()
         self.schedule_read_state()

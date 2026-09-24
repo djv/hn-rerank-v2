@@ -52,6 +52,10 @@ panes stay visible and the summary scrolls in place. When a summary is taller
 than its pane, Enter expands it (full height on small terminals) and the
 footer advertises the key; fitting summaries keep the plain layout with the
 key disabled.
+Press `r` to refresh the feed and request a fresh server-generated summary for
+only the selected story. Automatic refreshes keep using the server cache.
+Regeneration still respects provider limits and does not guarantee a longer summary.
+
 Resize and focus changes preserve reading position. Run the offline preview from
 the repository root with `uv run python -m clients.tui.tests.preview --headless`.
 

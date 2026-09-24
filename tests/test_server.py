@@ -3105,6 +3105,9 @@ def test_flask_test_client_tldr_force_refresh_serves_cached_on_cooldown(
     assert resp.status_code == 200
     assert resp.get_json()["tldr"] == "Cached TLDR"
     assert resp.get_json()["cached"] is True
+    assert resp.get_json()["retryable"] is True
+    assert resp.get_json()["reason"] == "provider_cooldown"
+    assert resp.get_json()["retry_after_seconds"] > 0
 
 
 def test_tldr_tap_should_probe_gates() -> None:

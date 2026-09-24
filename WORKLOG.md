@@ -9279,3 +9279,25 @@ service. Client source, packaging and publication handoff live on the laptop at
   after each render and resize.
 - Validation: client 40 passed / 1 Windows-only skip; standalone copy with
   fresh deps (ruff 0.16.8, ty 0.0.82) clean; in-tree ruff/format/ty clean.
+## 2026-09-23 — TUI: manual refresh regenerates the selected summary
+
+Manual `r` now passes `force_refresh=true` for the selected story through
+`API.summary`; passive version polling explicitly keeps cache-friendly refresh.
+Other stories and speculative lookahead remain cache-friendly. Help and README
+explain that regeneration respects provider limits and cannot guarantee length.
+An integration test checks manual keypress and passive refresh request payloads.
+
+## 2026-09-23 — Small refresh fixes after code audit (local only)
+
+Verified existing cached/stale/retryable response semantics; avoided adding a
+status framework. Cooldown fallback with an exact cache hit now marks refresh
+as retryable and exposes reason/delay rather than pretending it completed.
+TUI preserves the selected cached text during forced regeneration and retains
+it/selection on API failure; provisional responses get a short status notice.
+Refresh invalidates and cancels older summary work immediately.
+
+Audit and reduced next steps: docs/reader-improvements.md. The contentless RSS
+filter/background-enrichment gap is real, but attribution to individual feeds
+remains unverified; source selection and fetch scheduling are unchanged.
+Backend 821 passed; TUI 94 passed / 1 skipped; lint/format/types clean. No
+production deployment, database edits, or terminal manipulation performed.

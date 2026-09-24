@@ -1,5 +1,18 @@
 # HN Rerank status
 
+## Local reader audit — not deployed
+
+Objective: simplify refresh/summary/coverage improvements using existing paths.
+Verified and fixed cooldown fallback masking failed refresh, plus TUI losing
+readable text/selection when forced regeneration fails. Backend 821 passed;
+TUI 94 passed / 1 skipped; Ruff/format/ty clean. User terminal untouched.
+Next: coverage inspection done 2026-09-24 (evidence in FINDINGS.md) — fetch
+failures are a vacuum (1 transient row), snippets pass is_summarizable, so
+the pre-rank-filter theory is unproven and no scheduling change was made.
+Summary spot-check shows no new prompt issue. Awaiting authorization to
+commit focused reader files and deploy/restart for live verification.
+Details: docs/reader-improvements.md. Preserve all unrelated local WIP.
+
 ## Current TLDR deployment — b77afc6
 
 Discussion emphasis (detail-v14) deployed and live-tested: the reported Reddit

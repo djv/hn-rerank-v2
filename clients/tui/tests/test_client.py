@@ -352,3 +352,66 @@ async def test_malformed_profile_response_returns_safe_error(token: object) -> N
             await api.validate()
     finally:
         await api.close()
+
+
+@pytest.mark.parametrize("provisional", [False, True])
+async def test_refresh_keeps_readable_summary_and_reports_failure(
+    tmp_path: Path, provisional: bool
+) -> None:
+    class RefreshServer(FakeServer):
+        async def __call__(self, request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/api/tldr-detail") and json.loads(
+                request.content
+            ).get("force_refresh"):
+                self.requests.append(request)
+                await asyncio.sleep(0.3)
+                if provisional:
+                    return httpx.Response(
+                        200,
+                        json={"tldr": "# Summary 1", "cached": True, "retryable": True},
+                    )
+                return httpx.Response(503, json={"error": "Provider unavailable"})
+            return await super().__call__(request)
+
+    fake = RefreshServer()
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        await pilot.pause(0.8)
+        assert app.summaries[1] == "# Summary 1"
+        app.query_one(OptionList).focus()
+        await pilot.press("r")
+        await pilot.pause(0.1)
+        assert "Summary 1" in app.query_one("#summary", Markdown)._markdown
+        await pilot.pause(0.9)
+        selected = app.selected()
+        assert selected is not None and selected.id == 1
+        assert 1 not in app.unavailable
+        assert "Summary 1" in app.query_one("#summary", Markdown)._markdown
+        status = str(app.query_one("#status", Static).content)
+        assert ("outdated or incomplete" if provisional else "refresh failed") in status
+
+
+async def test_refresh_forces_only_selected_summary(tmp_path: Path) -> None:
+    fake = FakeServer()
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        await pilot.pause(0.5)
+        app.query_one(OptionList).focus()
+        fake.requests.clear()
+        await pilot.press("r")
+        await pilot.pause(0.8)
+        forced = [
+            json.loads(r.content)
+            for r in fake.requests
+            if r.url.path.endswith("/api/tldr-detail")
+            and json.loads(r.content).get("force_refresh")
+        ]
+        assert forced == [{"story_id": 1, "force_refresh": True}]
+        fake.requests.clear()
+        app.action_refresh(force_summary=False)
+        await pilot.pause(0.8)
+        assert not any(
+            json.loads(r.content).get("force_refresh")
+            for r in fake.requests
+            if r.url.path.endswith("/api/tldr-detail")
+        )

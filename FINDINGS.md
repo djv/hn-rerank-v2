@@ -365,3 +365,27 @@ confirmation set is consumed and must not be tuned against.
   changes before restoring those two files, then restart only `hn_rewrite.service`.
   The new dependency-free model/test files may remain inert on rollback. No DB
   rollback is needed. Laptop rename rollback is in the release instructions.
+
+## 2026-09-24 reader-plan coverage inspection (read-only, VPS DB)
+
+Replicated docs/source-review.md 30-day content check: asterisk 0/4,
+Hugging Face 0/23, OCaml.org 3/27, Lobsters 16/123 stories with >=300 chars
+self_text/article_body or any top_comments. All-time fully-empty counts are
+small (HF 12/104, OCaml 6/103, Lobsters/Asterisk 0). article_fetch_failures
+holds exactly one row across all four sources (a transient Lobsters
+ConnectTimeout) — the fetcher is not failing on these rows, it is not
+attempting them (or attempts predate the table).
+
+Nuance for the doc's starvation theory: is_summarizable() accepts ANY
+nonempty text, so HF rows with 36–62 char RSS snippets pass the filter and
+reach ranking; only fully-empty rows are filtered pre-rank. Sampled HF rows
+have short self_text, zero article_body, zero comments, fetchable public blog
+URLs, no failure rows. Whether they miss the 50-slot article-fetch budget on
+rank or another gate is unproven — no scheduling change made.
+
+Summary spot-check (mixed set): discussion-only HN thread 49555155 renders
+6 bolded bullets and explicitly notes thin/author-only signal (~190 words,
+appropriately under target, no padding). Combined Reddit case verified
+previously (bold in 4/4 Discussion bullets). Latent Space article-only
+overshoot (414 words vs 240 target) already recorded in STATUS.md. No new
+prompt tuning demonstrated; prompts untouched.

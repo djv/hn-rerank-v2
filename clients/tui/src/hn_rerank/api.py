@@ -274,10 +274,11 @@ class API:
         except (KeyError, TypeError, ValueError) as exc:
             raise APIError("Invalid cached summary.") from exc
 
-    async def summary(self, story_id: int) -> Summary:
-        response = await self.request(
-            "POST", "api/tldr-detail", json={"story_id": story_id}
-        )
+    async def summary(self, story_id: int, *, force_refresh: bool = False) -> Summary:
+        payload: dict[str, object] = {"story_id": story_id}
+        if force_refresh:
+            payload["force_refresh"] = True
+        response = await self.request("POST", "api/tldr-detail", json=payload)
         try:
             data = response.json()
             value = data["tldr"]
