@@ -1,5 +1,15 @@
 # Worklog: hn-rewrite
 
+## 2026-09-24 TLDR quotas doubled again (240/240)
+
+- Uncached-TLDR quota kept tripping heavy TUI use: `config.toml`
+  `tldr_uncached_per_user_limit` and `tldr_uncached_global_limit` both
+  120/hr -> 240/hr (windows stay 1h). Code defaults in
+  `pipeline/config.py` (24/120) untouched; deployed host uses config.toml.
+  `ARCHITECTURE.md` override note updated to 240/240.
+- Validation: backend 803 passed (18 pre-existing test_pipeline errors,
+  identical with the change stashed); ruff clean. No `.py` changes.
+
 ## 2026-09-24 TUI reversible sort order
 
 - `v` (`reverse_sort`) flips the headline list between rank order and its
