@@ -1848,7 +1848,7 @@ def _clean_text_payload_and_noise(draw: st.DrawFn) -> tuple[str, str]:
     pair=_clean_text_payload_and_noise(),
     min_len=st.integers(min_value=0, max_value=10),
 )
-@settings(max_examples=30)
+@settings(max_examples=30, deadline=None)  # HTML parsing; >200ms under -n 4 load
 def test_clean_text_properties(pair: tuple[str, str], min_len: int) -> None:
     payload, noise = pair
     text = payload + noise
