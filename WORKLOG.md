@@ -1,5 +1,40 @@
 # Worklog: hn-rewrite
 
+## 2026-09-25 Security: TLDR XSS and article-fetch SSRF
+
+From a project review. Two fixes:
+
+- **Stored XSS through TLDRs.** `parseSimpleMarkdown` (`templates/index.html`)
+  fed LLM output to the bundled snarkdown and then `innerHTML`. Snarkdown
+  passes raw HTML through and allows `javascript:` links, and TLDR text comes
+  from untrusted articles and comments. `tldr_cache` is shared across users,
+  so one poisoned summary would reach everyone; `/api/user` returns the
+  session token, so `httponly` would not have protected it. The fix escapes
+  `& < >` before snarkdown, drops `<img>`, and keeps only `http(s)` links,
+  which now open with `target="_blank" rel="noopener noreferrer nofollow"`.
+  Markdown `>` blockquotes now render as literal text; TLDRs don't use them.
+  `tests/test_server.py::test_tldr_markdown_neutralizes_html_and_unsafe_links`
+  runs the real renderer under Node.
+- **SSRF and unbounded body in the article fetcher.**
+  `_fetch_article_body_with_result` followed redirects to any host and read
+  the whole body into memory. It now goes through `http_fetch.guarded_get`,
+  which checks every hop against public-only addresses and streams the body
+  under a 5 MB cap. The 403 fallback uses `guarded_urllib_fetch`, which has
+  the same checks. It also no longer repeats the httpx GET before trying
+  urllib (it used to go through `fetch_with_urllib_fallback`). Blocked URLs
+  return `error="unsafe_url"`, `permanent=True`, so proactive fetches don't
+  retry them. The loopback-server tests in `tests/test_fetch.py` stub the
+  guard with an autouse fixture, and the `.get()`-only mocks moved to
+  `httpx.MockTransport`.
+
+Not changed (from the same review): per-IP rate limits probably key on
+Caddy's `127.0.0.1` because Caddy has no `trusted_proxies`, so they likely
+act as one global bucket. Needs a live check.
+
+Verification: 846 passed at `-n 4`; ruff, ruff format (touched files) and
+ty are clean. Not restarted or smoke-tested live; this ran in a cloud
+session without the service.
+
 ## 2026-09-25 Terminal client CI: lint and type fixes, prefetch guard bug
 
 `.github/workflows/tui.yml` copies `clients/tui` outside the workspace, and
@@ -20,6 +55,7 @@ passed while CI failed with 8 ruff errors.
 - Verified in an isolated copy with the workflow's steps: 123 passed / 1
   skipped, ruff, ty, build, and the wheel smoke test. The in-tree root
   checks also pass, and both ruff 0.15.17 and 0.16.9 accept the result.
+
 
 ## 2026-09-25 SessionStart hook for Claude Code cloud sessions
 

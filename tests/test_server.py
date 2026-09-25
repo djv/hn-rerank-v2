@@ -4502,6 +4502,59 @@ def test_terminal_theme_contract() -> None:
         assert token in template
 
 
+def test_tldr_markdown_neutralizes_html_and_unsafe_links() -> None:
+    """LLM TLDR text lands in innerHTML: raw HTML must render as text and
+    only http(s) links survive, while normal markdown still formats."""
+    import json as _json
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node is required to execute the TLDR markdown renderer")
+    _, script = _read_template_and_static()
+    start = script.index("    const TAGS=")
+    end = script.index("    function styleTldrLabels(")
+    cases = {
+        "img": "- Point: <img src=x onerror=alert(1)>",
+        "script": "Intro <script>alert(1)</script> & more",
+        "js_link": "- [click](javascript:alert(1))",
+        "spaced_js_link": "- [click]( javascript:alert(1))",
+        "entity_js_link": "[x](&#106;avascript:alert(1))",
+        "data_link": "[x](data:text/html,<b>hi</b>)",
+        "md_image": "![a](https://evil.example/pixel.png)",
+        "ok_link": "- **Key:** see [docs](https://example.com/a?b=1&c=2)",
+        "code": "use `a < b && c` here",
+    }
+    harness = (
+        script[start:end]
+        + f"\nconst cases = {_json.dumps(cases)};\n"
+        + "const out = {}; for (const [k, v] of Object.entries(cases)) "
+        + "out[k] = parseSimpleMarkdown(v);\nconsole.log(JSON.stringify(out));\n"
+    )
+    completed = subprocess.run(
+        [node, "-e", harness], check=True, capture_output=True, text=True, timeout=10
+    )
+    out: dict[str, str] = _json.loads(completed.stdout)
+
+    for html in out.values():
+        assert "<img" not in html
+        assert "<script" not in html
+        assert 'href="javascript' not in html.replace(" ", "")
+        assert 'href="&amp;#106;' not in html
+        assert 'href="data:' not in html
+    assert "&lt;img src=x onerror=alert(1)&gt;" in out["img"]
+    assert "&lt;script&gt;" in out["script"]
+    assert "&amp; more" in out["script"]
+    assert "<a>click</a>" in out["js_link"]
+    assert "<strong>Key:</strong>" in out["ok_link"]
+    assert (
+        '<a href="https://example.com/a?b=1&amp;c=2" target="_blank" '
+        'rel="noopener noreferrer nofollow">docs</a>'
+    ) in out["ok_link"]
+    assert "<code>a &lt; b &amp;&amp; c</code>" in out["code"]
+
+
 def test_forced_tldr_refresh_serializes_requests() -> None:
     import shutil
     import subprocess

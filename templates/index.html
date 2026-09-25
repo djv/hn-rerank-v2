@@ -1462,8 +1462,20 @@
         .replace(/([.!;?:])\s+-\s+(?=\S)/g, '$1\n- ');
     }
 
+    function escapeHtml(str) {
+      return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    // TLDRs summarize untrusted articles/comments and go into innerHTML, so
+    // LLM output is text, not HTML: escape it before snarkdown (which passes
+    // raw HTML through), leaving only tags snarkdown itself emits; then drop
+    // images and any link that isn't http(s) (javascript:, data:, ...).
     function parseSimpleMarkdown(text) {
-      return snarkdown(normalizeTldrMarkdown(text));
+      return snarkdown(escapeHtml(normalizeTldrMarkdown(text)))
+        .replace(/<img [^>]*>/g, '')
+        .replace(/<a href="([^"]*)">/g, (_, href) => (/^https?:\/\//i.test(href)
+          ? `<a href="${href}" target="_blank" rel="noopener noreferrer nofollow">`
+          : '<a>'));
     }
 
     function styleTldrLabels(container) {

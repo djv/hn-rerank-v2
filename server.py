@@ -44,7 +44,7 @@ from database import (
 from pipeline import Config, DEFAULT_ENV_PATH, Embedder, RankedStory, is_hn_source
 from llm_limiter import limiter as llm_limiter
 from reddit_limiter import limiter as reddit_limiter
-from http_fetch import fetch_with_urllib_fallback
+import http_fetch
 
 ARTICLE_BODY_CHAR_LIMIT = 30_000
 SELF_TEXT_PROMPT_CHAR_LIMIT = 16_000
@@ -384,12 +384,16 @@ async def _fetch_article_body_with_result(url: str) -> ArticleFetchResult:
 
     for attempt in range(2):
         try:
-            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-                resp = await client.get(url, headers=headers)
-                if resp.status_code in (429, 503) and attempt == 0:
+            # Redirects are followed inside guarded_get so every hop gets the
+            # SSRF check; the body is streamed under a byte cap.
+            async with httpx.AsyncClient(
+                timeout=10.0, follow_redirects=False
+            ) as client:
+                resp = await http_fetch.guarded_get(client, url, headers)
+                if resp.status in (429, 503) and attempt == 0:
                     await asyncio.sleep(1)
                     continue
-                if resp.status_code == 200:
+                if resp.status == 200:
                     ct = (resp.headers.get("content-type") or "").lower()
                     if ct and not ct.startswith(
                         ("text/html", "application/xhtml+xml", "text/xml", "text/plain")
@@ -402,9 +406,12 @@ async def _fetch_article_body_with_result(url: str) -> ArticleFetchResult:
                         return ArticleFetchResult(
                             status=200, error="non_html", permanent=True
                         )
-                elif resp.status_code in (403, 503) and attempt == 0:
-                    status, html, _headers = await fetch_with_urllib_fallback(
-                        client, url, headers
+                elif resp.status == 403 and attempt == 0:
+                    # httpx's TLS fingerprint is often blocked where urllib's
+                    # system-OpenSSL handshake gets through (see http_fetch).
+                    logging.info("%s: httpx 403, retrying with urllib", url)
+                    status, html = await asyncio.to_thread(
+                        http_fetch.guarded_urllib_fetch, url, headers["User-Agent"]
                     )
                     if status != 200:
                         return ArticleFetchResult(
@@ -417,10 +424,13 @@ async def _fetch_article_body_with_result(url: str) -> ArticleFetchResult:
                         )
                 else:
                     return ArticleFetchResult(
-                        status=resp.status_code,
-                        error=f"http_{resp.status_code}",
-                        permanent=resp.status_code in (404, 410),
+                        status=resp.status,
+                        error=f"http_{resp.status}",
+                        permanent=resp.status in (404, 410),
                     )
+        except http_fetch.UnsafeUrlError as e:
+            logging.warning("article fetch blocked for %s: %s", url, e)
+            return ArticleFetchResult(error="unsafe_url", permanent=True)
         except Exception as e:
             return ArticleFetchResult(error=type(e).__name__)
 

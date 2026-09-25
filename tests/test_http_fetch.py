@@ -10,6 +10,7 @@ from urllib.error import HTTPError, URLError
 import httpx
 import pytest
 
+import http_fetch
 from http_fetch import fetch_with_urllib_fallback, urllib_fetch
 
 
@@ -151,10 +152,10 @@ async def test_fetch_with_urllib_fallback_retries_on_transport_error() -> None:
     """A RemoteProtocolError from httpx must fall back to urllib, not
     propagate -- this is the exact bug: the transport error previously
     skipped the fallback entirely."""
-    client = _FakeAsyncClient(
-        [httpx.RemoteProtocolError("peer closed connection")]
-    )
-    with patch("http_fetch.urllib_fetch", return_value=(200, "recovered")) as mock_fetch:
+    client = _FakeAsyncClient([httpx.RemoteProtocolError("peer closed connection")])
+    with patch(
+        "http_fetch.urllib_fetch", return_value=(200, "recovered")
+    ) as mock_fetch:
         status, body, headers = await fetch_with_urllib_fallback(
             client, "https://example.com/feed", {"User-Agent": "ua"}
         )
@@ -163,7 +164,9 @@ async def test_fetch_with_urllib_fallback_retries_on_transport_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fetch_with_urllib_fallback_transport_error_then_urllib_also_fails() -> None:
+async def test_fetch_with_urllib_fallback_transport_error_then_urllib_also_fails() -> (
+    None
+):
     """If the urllib fallback also fails (non-200), return that status
     cleanly instead of raising -- callers treat any non-200 the same way
     regardless of which path produced it."""
@@ -180,7 +183,9 @@ async def test_fetch_with_urllib_fallback_still_falls_back_on_403() -> None:
     """Existing status-code fallback path is unchanged by the new
     transport-error handling."""
     client = _FakeAsyncClient([_FakeHttpxResponse(403)])
-    with patch("http_fetch.urllib_fetch", return_value=(200, "via urllib")) as mock_fetch:
+    with patch(
+        "http_fetch.urllib_fetch", return_value=(200, "via urllib")
+    ) as mock_fetch:
         status, body, headers = await fetch_with_urllib_fallback(
             client, "https://example.com/feed", {"User-Agent": "ua"}
         )
@@ -199,3 +204,104 @@ async def test_fetch_with_urllib_fallback_non_fallback_status_passes_through() -
         )
     assert (status, body, headers) == (404, "", {"x": "y"})
     mock_fetch.assert_not_called()
+
+
+# --- SSRF guard + size cap (guarded_get / check_public_url) ---
+
+
+@pytest.mark.parametrize(
+    ("addr", "public"),
+    [
+        ("93.184.215.14", True),
+        ("2606:2800:21f:cb07:6820:80da:af6b:8b2c", True),
+        ("127.0.0.1", False),
+        ("10.1.2.3", False),
+        ("172.16.0.1", False),
+        ("192.168.1.1", False),
+        ("169.254.169.254", False),  # cloud metadata
+        ("100.100.100.100", False),  # Tailscale CGNAT
+        ("0.0.0.0", False),
+        ("::1", False),
+        ("fe80::1%eth0", False),
+        ("fd7a:115c:a1e0::1", False),  # Tailscale ULA
+        ("::ffff:127.0.0.1", False),  # v4-mapped loopback
+        ("224.0.0.1", False),
+    ],
+)
+def test_is_public_ip(addr: str, public: bool) -> None:
+    assert http_fetch._is_public_ip(addr) is public
+
+
+@pytest.mark.parametrize(
+    "url", ["file:///etc/passwd", "gopher://example.com/", "http:///nohost"]
+)
+def test_check_public_url_rejects_bad_scheme_or_host(url: str) -> None:
+    with pytest.raises(http_fetch.UnsafeUrlError):
+        http_fetch.check_public_url(url)
+
+
+def test_check_public_url_rejects_any_private_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host with one public and one private A record is still refused."""
+    monkeypatch.setattr(
+        http_fetch, "_resolve_host", lambda host, port: ["93.184.215.14", "10.0.0.1"]
+    )
+    with pytest.raises(http_fetch.UnsafeUrlError):
+        http_fetch.check_public_url("https://example.com/")
+
+
+def _public_resolver(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        http_fetch, "_resolve_host", lambda host, port: ["93.184.215.14"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_guarded_get_truncates_oversized_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _public_resolver(monkeypatch)
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, content=b"a" * 5000)
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        resp = await http_fetch.guarded_get(
+            client, "https://example.com/big", {}, max_bytes=1000
+        )
+    assert resp.status == 200
+    assert resp.truncated is True
+    assert resp.text == "a" * 1000
+
+
+@pytest.mark.asyncio
+async def test_guarded_get_follows_public_redirect_and_decodes_charset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _public_resolver(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/old":
+            return httpx.Response(301, headers={"location": "/new"})
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html; charset=iso-8859-1"},
+            content="café".encode("latin-1"),
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        resp = await http_fetch.guarded_get(client, "https://example.com/old", {})
+    assert (resp.status, resp.text, resp.truncated) == (200, "café", False)
+
+
+@pytest.mark.asyncio
+async def test_guarded_get_caps_redirect_chain(monkeypatch: pytest.MonkeyPatch) -> None:
+    _public_resolver(monkeypatch)
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(302, headers={"location": "/loop"})
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(http_fetch.UnsafeUrlError, match="too many redirects"):
+            await http_fetch.guarded_get(
+                client, "https://example.com/loop", {}, max_redirects=3
+            )

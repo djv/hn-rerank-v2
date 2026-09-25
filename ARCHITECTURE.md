@@ -607,6 +607,7 @@ To improve semantic ranking quality and render TLDRs instantly, the background p
 Fetch flow (server.py `_fetch_article_body`):
 1. **Cache lookup**: Directly reads `story.article_body` (invalidated or refreshed when story URL changes).
 2. **Fetch** (if cache miss): HTTP GET with Chrome 131 browser-grade headers. Single retry on 429/503 after 1s sleep.
+   - **SSRF guard + size cap** (`http_fetch.guarded_get`): story URLs are chosen by whoever submitted them, so every hop (redirects are followed manually, max 5) must be http(s) and resolve only to public addresses — loopback, RFC1918, link-local/metadata, and Tailscale's `100.64.0.0/10` / `fd7a:…` are refused as `error="unsafe_url"`, `permanent=True`. The body is streamed and cut off at `ARTICLE_MAX_BYTES` (5 MB). The 403 → urllib fallback uses `guarded_urllib_fetch` with the same per-hop check and cap. Residual gap: DNS rebinding between the check and the connect.
 3. **Extraction chain**: jusText first, then a BeautifulSoup semantic pass (strips non-content tags, prefers `<article>`/`<main>` containers), then `trafilatura.extract()` (robust against 100+ site templates), with a raw-text fallback last.
 4. **Cache write**: Stores up to 15,000 characters of extracted text inside the `stories.article_body` column.
 

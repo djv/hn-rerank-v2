@@ -9,12 +9,141 @@ handshake (via urllib) gets through.
 from __future__ import annotations
 
 import asyncio
+import codecs
+import ipaddress
 import logging
+import socket
+from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+from urllib.parse import urljoin, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 import httpx
+
+# Article URLs are chosen by whoever submitted the story, so fetches of them
+# must not reach loopback/private/tailnet hosts (SSRF) or buffer an unbounded
+# body. 5 MB comfortably exceeds real article HTML; ARTICLE_BODY_CHAR_LIMIT
+# truncates the extracted text far below that anyway.
+ARTICLE_MAX_BYTES = 5_000_000
+ARTICLE_MAX_REDIRECTS = 5
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+
+
+class UnsafeUrlError(ValueError):
+    """URL scheme or resolved address is not allowed for outbound fetches."""
+
+
+def _resolve_host(host: str, port: int) -> list[str]:
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    return [str(info[4][0]) for info in infos]
+
+
+def _is_public_ip(raw: str) -> bool:
+    ip = ipaddress.ip_address(raw.split("%", 1)[0])
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    # is_global excludes loopback, RFC1918, link-local (cloud metadata),
+    # and 100.64.0.0/10 (Tailscale CGNAT range).
+    return ip.is_global and not ip.is_multicast
+
+
+def check_public_url(url: str) -> None:
+    """Raise UnsafeUrlError unless ``url`` is http(s) to public addresses only.
+
+    DNS failures propagate as OSError, like a failed connect would. There is
+    a residual DNS-rebinding window between this check and the connect;
+    closing it would need a pinned-IP transport, which isn't worth it here.
+    """
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https"):
+        raise UnsafeUrlError(f"scheme not allowed: {parts.scheme!r}")
+    host = parts.hostname
+    if not host:
+        raise UnsafeUrlError("missing host")
+    try:
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+    except ValueError as e:
+        raise UnsafeUrlError(f"bad port: {e}") from e
+    addrs = _resolve_host(host, port)
+    if not addrs or not all(_is_public_ip(a) for a in addrs):
+        raise UnsafeUrlError(f"non-public address for host {host!r}")
+
+
+def _decode_body(body: bytes, charset: str | None) -> str:
+    encoding = "utf-8"
+    if charset:
+        try:
+            encoding = codecs.lookup(charset).name
+        except LookupError:
+            pass
+    return body.decode(encoding, errors="replace")
+
+
+@dataclass(frozen=True)
+class GuardedResponse:
+    status: int
+    headers: httpx.Headers
+    text: str
+    truncated: bool = False
+
+
+async def guarded_get(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict[str, str],
+    *,
+    max_bytes: int = ARTICLE_MAX_BYTES,
+    max_redirects: int = ARTICLE_MAX_REDIRECTS,
+) -> GuardedResponse:
+    """GET with an SSRF check on every hop and a streamed body-size cap.
+
+    ``client`` must not follow redirects itself; they are followed here so
+    each Location is re-checked. Non-200 responses return an empty body.
+    Bodies over ``max_bytes`` are cut off (``truncated=True``) rather than
+    rejected: the extractor only needs the first part of the page.
+    """
+    for _ in range(max_redirects + 1):
+        await asyncio.to_thread(check_public_url, url)
+        async with client.stream("GET", url, headers=headers) as resp:
+            location = resp.headers.get("location")
+            if resp.status_code in _REDIRECT_STATUSES and location:
+                url = urljoin(url, location)
+                continue
+            if resp.status_code != 200:
+                return GuardedResponse(resp.status_code, resp.headers, "")
+            buf = bytearray()
+            truncated = False
+            async for chunk in resp.aiter_bytes():
+                buf += chunk
+                if len(buf) > max_bytes:
+                    del buf[max_bytes:]
+                    truncated = True
+                    break
+            text = _decode_body(bytes(buf), resp.charset_encoding)
+            return GuardedResponse(200, resp.headers, text, truncated)
+    raise UnsafeUrlError(f"too many redirects (>{max_redirects})")
+
+
+class _CheckedRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]  # stdlib signature is untyped
+        check_public_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def guarded_urllib_fetch(
+    url: str, user_agent: str, *, max_bytes: int = ARTICLE_MAX_BYTES
+) -> tuple[int, str]:
+    """``urllib_fetch`` with the same SSRF check (every hop) and size cap."""
+    check_public_url(url)
+    opener = build_opener(_CheckedRedirectHandler)
+    req = Request(url, headers={"User-Agent": user_agent})
+    try:
+        with opener.open(req, timeout=15) as resp:
+            body = resp.read(max_bytes)
+            return resp.status, _decode_body(body, resp.headers.get_content_charset())
+    except HTTPError as e:
+        return e.code, ""
 
 
 def urllib_fetch(url: str, user_agent: str) -> tuple[int, str]:
