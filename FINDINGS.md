@@ -503,3 +503,22 @@ I001 imports and SIM102 nested conditions (`tests/test_client.py:566`).
 `.github/workflows/tui.yml` copies the package outside the backend workspace
 before running `uv run ruff check src tests`; reproduce that isolation for
 the next fix. No code changes or CI reruns were performed for this status save.
+
+## 2026-09-24 Quota doubling evidence (240/hr, deployed)
+
+Pre-restart journal showed `tldr_detail ... result=stale_fallback
+reason=quota_denied` under the old 120/hr limits. After pulling `247f0c1`
+to the VPS `main` worktree and restarting `hn_rewrite.service` (22:04:31
+UTC, new PID 597572), host `config.toml` confirms 240/240 and zero
+`quota_denied` lines appear post-restart; dashboard returns 200.
+
+VPS layout for future deploys: `/home/dev/hn-rewrite` repo with worktrees
+`main` (live, `WorkingDirectory` of `hn_rewrite.service`, runs
+`uv run python server.py`) and `hn-rewrite-explore` (separate branch,
+left alone). Deploy = push, `git pull --ff-only` (must be clean),
+`systemctl --user restart hn_rewrite.service`, smoke test dashboard +
+`api/ranking-ready`, scan journal for `quota_denied`/tracebacks.
+
+Backend suite note: 803 passed with 18 `test_pipeline.py` errors that are
+pre-existing/environmental (HF repo-id validation); verified identical
+with the quota change stashed, so they do not gate config-only changes.

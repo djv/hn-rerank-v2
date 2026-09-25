@@ -67,8 +67,10 @@ Press `s` to cycle Recommended → Popular → Explore → Date.
 Resize and focus changes preserve reading position. Run the offline preview from
 the repository root with `uv run python -m clients.tui.tests.preview --headless`.
 
-Unselected headlines are dimmed, so the selected row (ivory on a lifted band,
-plus the `>` marker) reads first. One docked footer bar carries the current
+The reader follows the local clock: a light paper theme from 06:00 to 19:59,
+the dark editorial theme otherwise (checked every minute; a theme picked from
+the command palette holds until the next boundary). Unselected headlines are
+dimmed, so the selected row (a lifted band plus the `>` marker) reads first. One docked footer bar carries the current
 filter's counts on the left (`2 shown · +0 ~0 −0`) and context-sensitive keys on
 the right; failures appear there with a `✗` prefix and replace the counts until
 the next successful refresh. Scrollbars follow the theme, and stories without a

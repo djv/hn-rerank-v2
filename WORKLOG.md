@@ -1,5 +1,28 @@
 # Worklog: hn-rewrite
 
+## 2026-09-25 Date sort shows the newest sent cards
+
+User-reported: Date looked oldest-first. The order was descending, but since
+`5d3375b` Date only held the Recommended top-24 re-sorted by time. Live
+`/api/feed` had 4 recent stories aged 1-4h (Popular/Explore only) while the
+newest Date card was 6.4 days old. `prepare_feed` now builds `date:*` from
+every sent card in the age combo (still newest first), and the web
+`matchesCurrentAxes` no longer filters Date by `data-sort-recommended`.
+Recommended keeps its 24 cap; the sent pool is already bounded (~45/age).
+
+## 2026-09-25 TUI: clock-based light/dark theme
+
+The user asked for a light TUI theme, switched automatically by the local clock
+(light 06:00-19:59). `clients/tui/src/hn_rerank/app.py` now defines
+`DARK_PALETTE`/`LIGHT_PALETTE`, registers `editorial` and `editorial-light`
+Textual themes that expose each palette as `$hn-*` CSS variables, and replaces
+hardcoded CSS hex with those variables. Rich-styled text (headlines, heading,
+footer counts) reads the module `PALETTE`, and `Reader.restyle()` re-renders it
+on every theme change. `apply_clock_theme` runs at startup and every 60s. It
+only switches when the clock's pick changes, so a manual palette choice holds
+until the next boundary. Tests pin the dark theme via an autouse fixture and add
+switch coverage.
+
 ## 2026-09-25 Fix three findings from the cloud workflow check
 
 - **`Config.days` now drives the HN live window.** `fetch_candidates`
@@ -135,6 +158,7 @@ act as one global bucket. Needs a live check.
 Verification: 846 passed at `-n 4`; ruff, ruff format (touched files) and
 ty are clean. Not restarted or smoke-tested live; this ran in a cloud
 session without the service.
+
 
 ## 2026-09-25 Terminal client CI: lint and type fixes, prefetch guard bug
 
