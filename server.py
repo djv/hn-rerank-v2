@@ -5,6 +5,7 @@ import gc
 import hashlib
 import html
 import json
+import ipaddress
 import logging
 import os
 import random
@@ -75,21 +76,40 @@ class RateLimitResult:
 class FixedWindowLimiter:
     """Thread-safe fixed-window limiter for local public-demo protection."""
 
+    # How often to drop idle buckets; keys are per-IP/per-user, so without
+    # this the dict grows by one entry per address ever seen.
+    SWEEP_INTERVAL_SECONDS = 300.0
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._buckets: dict[str, deque[float]] = {}
+        self._windows: dict[str, int] = {}
+        self._last_sweep: float | None = None
+
+    def _sweep(self, now: float) -> None:
+        for key in list(self._buckets):
+            bucket = self._buckets[key]
+            if not bucket or bucket[-1] <= now - self._windows[key]:
+                del self._buckets[key]
+                del self._windows[key]
 
     def try_acquire(
         self, checks: Sequence[tuple[str, int, int]], now: float | None = None
     ) -> RateLimitResult:
         now = time.monotonic() if now is None else now
         with self._lock:
+            if self._last_sweep is None:
+                self._last_sweep = now
+            elif now - self._last_sweep >= self.SWEEP_INTERVAL_SECONDS:
+                self._sweep(now)
+                self._last_sweep = now
             retry_after = 0
             normalized: list[tuple[str, int, int, deque[float]]] = []
             for key, limit, window_seconds in checks:
                 if limit <= 0 or window_seconds <= 0:
                     continue
                 bucket = self._buckets.setdefault(key, deque())
+                self._windows[key] = window_seconds
                 cutoff = now - window_seconds
                 while bucket and bucket[0] <= cutoff:
                     bucket.popleft()
@@ -2080,12 +2100,26 @@ def _flask_user(runtime: type[Handler]) -> User | None:
     return runtime.db.get_user_by_token(token)
 
 
+def _is_local_proxy_hop(hop: str) -> bool:
+    try:
+        return ipaddress.ip_address(hop).is_loopback
+    except ValueError:
+        return False
+
+
 def _flask_client_ip() -> str:
-    forwarded_for = request.headers.get("X-Forwarded-For", "")
-    if forwarded_for:
-        first = forwarded_for.split(",", 1)[0].strip()
-        if first:
-            return first
+    """Rightmost X-Forwarded-For hop that isn't one of our local proxies.
+
+    The leftmost value is whatever the client sent, so keying rate limits on
+    it lets anyone pick their own bucket. Each proxy (Tailscale Funnel, then
+    Caddy with `trusted_proxies`) appends the peer it saw, so walking from the
+    right past loopback hops yields the address our own edge recorded.
+    """
+    hops = request.headers.get("X-Forwarded-For", "").split(",")
+    for hop in reversed(hops):
+        hop = hop.strip()
+        if hop and not _is_local_proxy_hop(hop):
+            return hop
     return request.remote_addr or "127.0.0.1"
 
 

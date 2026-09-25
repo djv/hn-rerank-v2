@@ -1,5 +1,37 @@
 # Worklog: hn-rewrite
 
+## 2026-09-25 Rate-limit client IP, limiter sweep, stale eval reports
+
+Follow-ups to the review in the entry below.
+
+- **Client IP for per-IP limits.** `_flask_client_ip` used the leftmost
+  `X-Forwarded-For` value, which the client controls. Also, `Caddyfile` had
+  no `trusted_proxies`, so Caddy most likely discarded Tailscale Funnel's
+  header and sent `127.0.0.1` for every visitor. That would put all
+  session-create (60/h) and profile-link (120/h) traffic in one shared
+  bucket. This was not verified live. Changes: `Caddyfile` gains a global
+  `servers { trusted_proxies static 127.0.0.1/32 ::1/128 }`, and
+  `_flask_client_ip` takes the rightmost non-loopback hop. Existing tests
+  already sent `"<client>, 127.0.0.1"`, so those semantics are unchanged.
+  New test: rotating the leftmost value doesn't create a new bucket.
+  **Deploy:** copy the Caddyfile, then run `caddy validate --config
+  /home/dev/hn_rerank/Caddyfile` and `caddy reload --config ...`, then
+  restart `hn_rewrite.service`. After that, confirm the logs show real
+  client IPs, not `127.0.0.1`. The remaining assumption: Funnel must
+  overwrite, not pass through, any `X-Forwarded-For` the client sends. If
+  it passes it through, the rightmost hop is still the one Funnel
+  appended, so the limit still keys on the real address.
+- **`FixedWindowLimiter` memory.** It never dropped buckets, so it kept one
+  entry per IP or user forever. It now records each key's window and, every
+  `SWEEP_INTERVAL_SECONDS` (300), drops buckets whose newest hit is outside
+  the window.
+- **Stale reports removed.** Deleted `eval_report.json` (it used the retired
+  `5-fold-stratified` split, which `eval_ranker_variants.py` now refuses;
+  its producer `eval.py` no longer exists; no test reads it) and the two
+  `eval_gospark_bakeoff*_2026-09-08.json` files. All three are now in
+  `.gitignore`. The bakeoff numbers are still recorded in the 2026-09-08
+  entry.
+
 ## 2026-09-25 Security: TLDR XSS and article-fetch SSRF
 
 From a project review. Two fixes:

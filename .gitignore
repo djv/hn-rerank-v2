@@ -22,3 +22,5 @@ calibration_plot.png
 hn_rewrite.db.*
 .opencode/
 .playwright-mcp/
+eval_report.json
+eval_gospark_bakeoff*.json

@@ -461,6 +461,46 @@ def test_dashboard_route_session_creation_limit_uses_forwarded_for(
     assert second.headers["Retry-After"] == "3600"
 
 
+def test_session_creation_limit_ignores_spoofed_leftmost_forwarded_for(
+    test_env,
+) -> None:
+    """Rotating a client-supplied leftmost XFF value must not mint a fresh
+    bucket: the key is the rightmost non-loopback hop our edge appended."""
+    port, _, _, TestHandler, _ = test_env
+    TestHandler.config = replace(
+        TestHandler.config,
+        session_create_per_ip_limit=1,
+        session_create_per_ip_window_seconds=3600,
+    )
+
+    statuses = [
+        httpx.get(
+            f"http://127.0.0.1:{port}/",
+            headers={"X-Forwarded-For": f"198.51.100.{i}, 203.0.113.20, ::1"},
+            follow_redirects=False,
+        ).status_code
+        for i in range(3)
+    ]
+
+    assert statuses == [200, 429, 429]
+
+
+def test_fixed_window_limiter_sweeps_idle_buckets() -> None:
+    from server import FixedWindowLimiter
+
+    limiter = FixedWindowLimiter()
+    sweep = FixedWindowLimiter.SWEEP_INTERVAL_SECONDS
+    for i in range(50):
+        assert limiter.try_acquire([(f"ip:{i}", 5, 60)], now=0.0).allowed
+    assert limiter.try_acquire([("long", 1, 3600)], now=0.0).allowed
+
+    # After the sweep interval, expired 60s buckets are dropped while the
+    # still-active 1h bucket keeps enforcing its limit.
+    assert not limiter.try_acquire([("long", 1, 3600)], now=sweep).allowed
+    assert set(limiter._buckets) == {"long"}
+    assert limiter.try_acquire([("ip:0", 5, 60)], now=sweep).allowed
+
+
 def test_dashboard_authenticated_visit_does_not_consume_session_creation_quota(
     test_env,
 ) -> None:
