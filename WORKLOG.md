@@ -5,8 +5,10 @@
 Added `.claude/hooks/session-start.sh`, registered in `.claude/settings.json`.
 It runs only when `CLAUDE_CODE_REMOTE=true`, runs `uv sync`, then fetches
 the 6 mxbai-embed-xsmall-v1 files from Hugging Face into
-`/home/dev/hn-rewrite/shared/mxbai-embed-xsmall-v1` (the path `config.toml`
-pins). It skips files that already exist and does not call `setup_model.py`,
+`$HN_ONNX_MODEL_DIR` (the cloud environment sets `./onnx_model`, which is
+gitignored; the tests read this path). It then symlinks the host path that
+`config.toml` pins (`/home/dev/hn-rewrite/shared/mxbai-embed-xsmall-v1`) to
+that directory so the server finds the model too. It skips files that already exist and does not call `setup_model.py`,
 because Pico CSS is committed and jsdelivr may be blocked. A failed download
 only prints a warning. Without the model, 18 tests error in cloud sessions;
 with it, the full suite runs 822 passed in ~15s at `-n 4`.

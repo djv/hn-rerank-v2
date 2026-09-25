@@ -12,9 +12,11 @@ cd "${CLAUDE_PROJECT_DIR:-$(dirname "$0")/../..}"
 # Default group only (dev); embedding-experiment stays opt-in.
 uv sync
 
-# config.toml pins onnx_model_dir to this host path; mirror it in the container.
-# Same files as setup_model.py minus Pico CSS (committed; jsdelivr is blocked).
-MODEL_DIR="/home/dev/hn-rewrite/shared/mxbai-embed-xsmall-v1"
+# Tests read HN_ONNX_MODEL_DIR (pipeline/config.py); config.toml pins the
+# server's onnx_model_dir to the host path, which gets a symlink below.
+# Same files as setup_model.py minus Pico CSS (committed; jsdelivr may be blocked).
+CONFIG_MODEL_DIR="/home/dev/hn-rewrite/shared/mxbai-embed-xsmall-v1"
+MODEL_DIR="${HN_ONNX_MODEL_DIR:-$CONFIG_MODEL_DIR}"
 HF_BASE="https://huggingface.co/mixedbread-ai/mxbai-embed-xsmall-v1/resolve/main"
 mkdir -p "$MODEL_DIR"
 
@@ -37,4 +39,9 @@ if ! fetch_all; then
   # Non-fatal: without huggingface.co in the network allowlist, ~18
   # model-dependent tests error but everything else still works.
   echo "WARNING: model download failed (is huggingface.co allowed?)" >&2
+fi
+
+if [ -s "$MODEL_DIR/model.onnx" ] && [ ! -e "$CONFIG_MODEL_DIR" ]; then
+  mkdir -p "$(dirname "$CONFIG_MODEL_DIR")"
+  ln -s "$(realpath "$MODEL_DIR")" "$CONFIG_MODEL_DIR"
 fi
