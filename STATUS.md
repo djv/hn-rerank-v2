@@ -1,41 +1,31 @@
 # HN Rerank status
 
 ## Objective
-Ship the TUI sort/discovery improvements and relieve TLDR quota pressure
-on the VPS (quotas 120/hr → 240/hr, deployed).
+Deploy the rate-limit client-IP fix (`b4fb589` line, now `origin/main`
+`f5cbb16`) on the VPS, including Caddy `trusted_proxies`.
 
 ## Verified result
-- Committed and pushed to `origin/main`: `5b82157` (TUI explore shuffles
-  client-side per rebuild), `0dc1832` (`v` reverses any sort with focus-top
-  plus footer `reversed` marker, sectioned `?` help), `df579d0` (prior WIP
-  status save), `247f0c1` (uncached-TLDR quotas 120/hr → 240/hr per-user
-  and global), `4f2feca` (deploy note). Tree clean.
-- TUI: explore is a fresh random deck each visit; `v` flips rank order,
-  focuses the new first item, shows `reversed` in the footer counts line;
-  `?` help is sectioned (Move/Read/Vote/Sort/Other). Local TUI suite 123
-  passed / 1 skipped; `ruff check`, `ruff format --check`, `ty check` clean
-  via `uv run --frozen` in `clients/tui`.
-- Backend: no `.py` changes for the quota bump. Full suite 803 passed;
-  18 `test_pipeline.py` errors are pre-existing and environmental
-  (identical with the change stashed); `ruff check` clean.
-- VPS deploy: `main` worktree fast-forwarded clean to `247f0c1` (explore
-  worktree untouched), host `config.toml` confirms 240/240,
-  `hn_rewrite.service` restarted 22:04:31 UTC, dashboard 200, zero
-  `quota_denied` after restart (old process denied under the 120 limits
-  right up to the restart). Remaining journal noise is transient RSS
-  DNS/fetch failures.
+- VPS `main` worktree at `f5cbb16` (clean); `uv sync`; VPS suite 860
+  passed. GitHub CI `ci` green for `f5cbb16`.
+- Caddy upgraded 2.6.2 (Ubuntu) → 2.11.4 (official apt repo); 2.6.2
+  rejected `servers { trusted_proxies }`. Runs as system unit
+  `hn-dashboard.service` from the tracked `Caddyfile`; packaged
+  `caddy.service` stays disabled. Admin API shows `trusted_proxies`
+  static `127.0.0.1/32`, `::1/128` live.
+- Smoke test on the VPS and from the laptop via the Funnel URL: `/hn/`,
+  `/api/feed`, `/hn/api/feed` 200; `tldr-detail` uncached then
+  `cached=True`; journal clean.
+- Loopback capture from the laptop: app receives
+  `X-Forwarded-For: <laptop IPv6>, 127.0.0.1`, so `_flask_client_ip()`
+  keys on the real client. A client-sent `X-Forwarded-For: 1.2.3.4` never
+  arrives: Funnel overwrites it.
 
 ## Blocker / limits
-- Remote CI for the new pushes (`0dc1832`, `247f0c1`, `4f2feca`) not yet
-  checked — backend workflow and Terminal client workflow (tests + lint
-  on 3 platforms) need a green confirmation.
-- Provider-side caps (Mistral spend cap / Groq tier) remain the real
-  ceiling: ours quotas no longer bind at 240/hr, so any further denials
-  are provider cooldowns, and generation spend can now run ~2x hotter.
-- 18 pre-existing `test_pipeline` errors (environmental) still open.
-- The TUI itself needs a relaunch to pick up the sort changes; the VPS
-  restart only affects the server.
+- Smoke tests created throwaway users in the live DB (fresh cookie jars).
+- Non-interactive SSH lacks `~/.local/bin` on PATH; export it before `uv`.
+- 18 pre-existing environmental `test_pipeline` errors on the laptop.
+- Another session has uncommitted ranking/eval WIP in the laptop checkout.
 
 ## Next step
-Check the GitHub Actions runs for the new pushes; if green, relaunch the
-TUI and watch VPS `quota_denied`/spend under the 240/hr quotas.
+None for the deploy. Relaunch the TUI to pick up the current Date view
+(12 newest stories in the deck, `f5cbb16`).

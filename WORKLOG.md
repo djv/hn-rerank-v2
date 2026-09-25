@@ -1,5 +1,20 @@
 # Worklog: hn-rewrite
 
+## 2026-09-25 Deployed f5cbb16; Caddy 2.11.4; Funnel XFF verified
+
+- VPS fast-forwarded to `f5cbb16` (contains `b4fb589`); VPS suite 860
+  passed. First attempt at `b4fb589` was rolled back to `9a9cbf7`: Ubuntu's
+  Caddy 2.6.2 rejects `servers { trusted_proxies }`. The user upgraded
+  Caddy to 2.11.4 from the official apt repo; `caddy.service` stays
+  disabled (Caddy runs as system unit `hn-dashboard.service`).
+- `caddy validate`/`reload` clean; admin API shows `trusted_proxies`
+  live. Service restarted; dashboard, feed and cached/uncached
+  `tldr-detail` pass on the VPS and from the laptop via Funnel.
+- Verified the assumption from the rate-limit entry below: a loopback
+  capture showed `X-Forwarded-For: <laptop IPv6>, 127.0.0.1` reaching the
+  app, and a client-sent `X-Forwarded-For: 1.2.3.4` replaced by Funnel,
+  so client IPs are real and not spoofable through Funnel.
+
 ## 2026-09-25 Date view: the 12 newest stories in the deck
 
 The user saw hour-old Popular stories missing from Date: Date was the top
