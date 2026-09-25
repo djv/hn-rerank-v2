@@ -5003,9 +5003,9 @@ def test_provider_max_tokens_reserves_reasoning_headroom() -> None:
         {"reasoning_effort": "low"},
     )
     # max_output_tokens covers reasoning + output, so gospark gets a larger
-    # headroom than the chat-completions reasoning providers (~1000 measured
-    # reasoning tokens per call even at effort=low).
-    assert server._max_tokens_for_provider(gospark, 450) == 1650
+    # headroom than the chat-completions reasoning providers (reasoning runs
+    # 350-1000 tokens at effort=low, with outliers past 1,600).
+    assert server._max_tokens_for_provider(gospark, 450) == 2450
 
 
 @pytest.mark.parametrize(

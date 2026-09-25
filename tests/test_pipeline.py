@@ -1977,6 +1977,28 @@ async def test_fetch_candidates_returns_tuple(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_fetch_candidates_live_window_honors_config_days(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The HN live window spans `Config.days`, like the RSS leg, rather
+    than a hard-coded 30."""
+    from database import Database
+    from pipeline import Config, fetch_candidates
+
+    db_file = tmp_path / "test.db"
+    db = Database(str(db_file))
+    seen: list[int] = []
+
+    def fake_live_window(**kw: int) -> list[object]:
+        seen.append(kw["days"])
+        return []
+
+    monkeypatch.setattr("ch_client.query_live_window", fake_live_window)
+    await fetch_candidates(Config(db_path=str(db_file), days=7), set(), set(), db)
+    assert seen == [7]
+
+
+@pytest.mark.asyncio
 async def test_fetch_candidates_ch_live_window_inserts_new(tmp_path, monkeypatch):
     """CH live_window returns story fields; fetch_candidates inserts them
     into the DB with source='hn'."""

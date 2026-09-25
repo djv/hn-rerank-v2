@@ -384,7 +384,7 @@ Live-verified post-fix: a 12-vote swipe burst against a fresh user brought
 path this fix was meant to unlock.
 
 ### 3.6 ClickHouse Candidate Fetch Window
-The live-window fetch (`pipeline.fetch_candidates`) uses `ch_client.query_live_window(days=30, min_score=5, limit=5000)` to pull all live HN stories from the past 30 days. This single SQL query returns every story with title, url, score, descendants, time, and self-text — no pagination, no per-story items call needed. Stories with `score < 5` are filtered at the query level. Result count is typically 2000-5000 rows; query time <2s on CH Playground. The 30-day window (widened from 7d on 2026-06-29) gives 7-30d HN stories a "second chance" to be re-discovered, re-scored, and re-ranked on every regen; without it, stories that fell out of the live window would stay frozen in the DB with stale scores and never re-enter the candidate pool.
+The live-window fetch (`pipeline.fetch_candidates`) uses `ch_client.query_live_window(days=config.days, min_score=5, limit=5000)` to pull all live HN stories from the past `days` (default 30; before 2026-09-25 this call hard-coded 30 and ignored `Config.days`). This single SQL query returns every story with title, url, score, descendants, time, and self-text — no pagination, no per-story items call needed. Stories with `score < 5` are filtered at the query level. Result count is typically 2000-5000 rows; query time <2s on CH Playground. The 30-day window (widened from 7d on 2026-06-29) gives 7-30d HN stories a "second chance" to be re-discovered, re-scored, and re-ranked on every regen; without it, stories that fell out of the live window would stay frozen in the DB with stale scores and never re-enter the candidate pool.
 
 The same function reads `bq_seed` and `ch_seed` archive rows from the SQLite DB (no network) ordered by `score DESC, time DESC` and capped at 4,000 total (2,000 per source). Both archive sources are HN-compatible for ranking gravity, TLDR comment fetching, and eval/source features. Source label `BQ Seed` or `CH Seed` is preserved for provenance. Normal age pruning skips both.
 
@@ -653,7 +653,7 @@ It uses four different prompt paths depending on what content is available
 Section budgets scale with capped source length (`_section_budget`): <1.5K
 chars → 2-3 bullets max 75 words; <5K → 3-4 bullets max 125 words; else
 4-6 bullets max 200 words. Reasoning providers get headroom on top of the
-base caps (`_max_tokens_for_provider`: +1200 gospark, +600 groq/cerebras).
+base caps (`_max_tokens_for_provider`: +2000 gospark, +600 groq/cerebras).
 Provider responses are dispatched on endpoint shape (`/responses` suffix →
 Responses API).
 

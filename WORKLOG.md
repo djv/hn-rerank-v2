@@ -1,5 +1,27 @@
 # Worklog: hn-rewrite
 
+## 2026-09-25 Fix three findings from the cloud workflow check
+
+- **`Config.days` now drives the HN live window.** `fetch_candidates`
+  passes `days=config.days` to `query_live_window` rather than a
+  hard-coded 30. There is no behavior change at the default of 30. New
+  test: `test_fetch_candidates_live_window_honors_config_days`.
+- **gospark output headroom +1200 → +2000** (`_max_tokens_for_provider`;
+  the 450 base goes from a 1,650 to a 2,450 cap). Reasoning at effort=low
+  measured 351-977 tokens on 20 of 21 calls, but one used 1,647, used up
+  the cap, and dropped the article section (`partial_not_cached`). Visible
+  output stays within the base, so the extra headroom only costs tokens
+  when reasoning actually runs long.
+- **SessionStart hook baselines the model manifest** by calling
+  `setup_model.ensure_manifest()` after the download, the same way
+  `setup_model.py` does, so cloud sessions no longer log
+  `embedding_manifest_missing`. A mismatch warns instead of failing the
+  hook.
+
+Also deleted, with the user's OK, the empty schema-only `hn_rewrite.db`
+that the old `--help` bug created in this container. It had 0 stories,
+0 feedback and 0 embeddings; the VPS DB was not involved.
+
 ## 2026-09-25 Cloud-session workflow check; `--help` ran six DB scripts
 
 Checked, in a Claude Code cloud session (no local DB, keys through the

@@ -1058,9 +1058,10 @@ def _max_tokens_for_provider(cfg: LlmProviderConfig, base: int) -> int:
         return 8_192
     if cfg.provider == "gospark" and "reasoning_effort" in cfg.extra:
         # Responses API deducts reasoning from the same max_output_tokens
-        # bucket; measured ~900-1050 reasoning tokens per TLDR call even at
-        # effort=low, so the headroom must cover reasoning + full output.
-        return base + 1200
+        # bucket. Reasoning is usually 350-1000 tokens at effort=low, but a
+        # 1,647-token outlier exhausted the old +1200 cap and dropped the
+        # article section (WORKLOG 2026-09-25); +2000 covers it plus output.
+        return base + 2000
     if cfg.provider in {"cerebras", "groq"} and "reasoning_effort" in cfg.extra:
         return base + 600
     return base

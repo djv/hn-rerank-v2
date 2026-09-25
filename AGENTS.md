@@ -234,8 +234,8 @@ sole source for the live 30-day window and bulk operations.
 The live `hn` source pipeline (`fetch_candidates` in `pipeline/__init__.py`) now
 issues **2 CH calls per regen**:
 
-1. `ch_client.query_live_window(days=30, min_score=5, limit=5000)` — every
-   live HN story from the past 30 days with all fields (title, url,
+1. `ch_client.query_live_window(days=config.days, min_score=5, limit=5000)` —
+   every live HN story from the past `days` (default 30) with all fields (title, url,
    score, descendants, time, text).
 2. The prewarm (comment text for all HN candidates with `comment_count > 0` and
    empty `top_comments`), inside `fetch_candidates_only`,

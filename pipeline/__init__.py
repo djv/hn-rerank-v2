@@ -641,8 +641,9 @@ async def fetch_candidates(
 
     One CH call does the work the old code did with ~125 Algolia calls:
 
-    `ch_client.query_live_window(days=30, min_score=5, limit=5000)` returns
-    every live HN story from the past 30 days with all fields populated
+    `ch_client.query_live_window(days=config.days, min_score=5, limit=5000)`
+    returns every live HN story from the past `config.days` (default 30) days
+    with all fields populated
     (title, url, score, descendants, time, text). No per-story items
     call needed.
 
@@ -660,7 +661,7 @@ async def fetch_candidates(
     # 1. Live window from CH (replaces ~125 Algolia search + items calls)
     try:
         live_window = query_live_window(
-            days=30,
+            days=config.days,
             min_score=5,
             limit=LIVE_WINDOW_LIMIT,
         )

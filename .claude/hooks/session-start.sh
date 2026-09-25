@@ -45,3 +45,14 @@ if [ -s "$MODEL_DIR/model.onnx" ] && [ ! -e "$CONFIG_MODEL_DIR" ]; then
   mkdir -p "$(dirname "$CONFIG_MODEL_DIR")"
   ln -s "$(realpath "$MODEL_DIR")" "$CONFIG_MODEL_DIR"
 fi
+
+# Baseline the model manifest like setup_model.py does, so the Embedder
+# doesn't log embedding_manifest_missing on every start. Writes into
+# $MODEL_DIR (DEFAULT_ONNX_MODEL_DIR reads HN_ONNX_MODEL_DIR), which the
+# config path above symlinks to. A mismatch against an existing baseline
+# is reported, not fatal.
+if [ -s "$MODEL_DIR/model.onnx" ]; then
+  HN_ONNX_MODEL_DIR="$MODEL_DIR" uv run python -c \
+    "import setup_model; setup_model.ensure_manifest()" \
+    || echo "WARNING: model manifest check failed" >&2
+fi
