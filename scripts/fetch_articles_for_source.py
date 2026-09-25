@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+
 import asyncio
 import logging
 import sys
@@ -21,7 +23,7 @@ from scripts._seed_common import STORY_COLS as _COLS, rows_to_stories
 ARTICLE_BODY_CHAR_LIMIT = 15_000
 
 
-async def main() -> None:
+async def _main_async() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     config = Config.load("config.toml")
@@ -106,5 +108,10 @@ async def main() -> None:
     logging.info("done")
 
 
+def main() -> None:
+    argparse.ArgumentParser(description=__doc__).parse_args()
+    asyncio.run(_main_async())
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

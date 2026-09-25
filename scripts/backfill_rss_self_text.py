@@ -6,6 +6,8 @@ No destructive operations of any kind.
 
 from __future__ import annotations
 
+import argparse
+
 import logging
 import sqlite3
 import sys
@@ -32,6 +34,7 @@ def _strip_title_prefix(text_content: str, title: str) -> str | None:
 
 
 def main() -> int:
+    argparse.ArgumentParser(description=__doc__).parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     db = Database()
 

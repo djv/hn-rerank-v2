@@ -24,3 +24,4 @@ hn_rewrite.db.*
 .playwright-mcp/
 eval_report.json
 eval_gospark_bakeoff*.json
+smoke_report_*.json

@@ -1,11 +1,12 @@
 """CLI boot smoke tests: every argparse entry point must survive --help.
 
 Guards the bug class where a malformed help string (e.g. a bare `%`)
-crashes argument formatting before the command runs. Only scripts that
-call ``parse_args`` are listed: the remaining mains take no CLI flags,
-so invoking them would *run* the script instead of printing help.
-All listed mains build their parser before any side effect (audited),
-so ``--help`` always exits during argument parsing.
+crashes argument formatting before the command runs, and the one where a
+DB-writing script with no parser treats ``--help`` as "run now" (the
+one-shot backfills below used to do exactly that). Every listed main
+builds its parser before any side effect, so ``--help`` always exits
+during argument parsing. ``server.py`` and ``setup_model.py`` are not
+listed: they take no flags and are safe to start.
 """
 
 import importlib
@@ -17,6 +18,9 @@ import pytest
 
 SCRIPT_MAINS = [
     "backfill_hn_comments",
+    "backfill_lesswrong_score",
+    "backfill_reddit_metadata",
+    "backfill_rss_self_text",
     "bakeoff_embedding_models",
     "bakeoff_tldr_providers",
     "bench_qwen_embed_speed",
@@ -27,6 +31,9 @@ SCRIPT_MAINS = [
     "cap_sweep",
     "deck_composition_report",
     "drop_dead_tables",
+    "embed_remaining",
+    "fetch_articles_for_source",
+    "hydrate_ch_seed",
     "ledger_report",
     "migrate_db_to_strict",
     "migrate_interaction_events",

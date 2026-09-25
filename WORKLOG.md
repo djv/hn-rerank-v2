@@ -1,5 +1,52 @@
 # Worklog: hn-rewrite
 
+## 2026-09-25 Cloud-session workflow check; `--help` ran six DB scripts
+
+Checked, in a Claude Code cloud session (no local DB, keys through the
+agent proxy), each workflow on the "what can run in the cloud" list.
+Everything ran against a throwaway scratchpad DB, never `hn_rewrite.db`.
+
+**Bug fixed: `--help` ran live backfills.** `hydrate_ch_seed`,
+`backfill_lesswrong_score`, `backfill_reddit_metadata`,
+`backfill_rss_self_text`, `embed_remaining` and `fetch_articles_for_source`
+had no argument parser. `--help` was ignored and the script ran against the
+default `hn_rewrite.db`; on the VPS that is the live DB. In this session it
+created an empty, schema-only `hn_rewrite.db` in the repo root (gitignored;
+left in place per the DB rule). Each now parses arguments first (no flags;
+the docstring is the description), and the async ones get a sync `main()`
+wrapper. All six were added to `tests/test_cli_boot.py::SCRIPT_MAINS`, which
+used to leave them out on purpose.
+
+**Results** (4 CPUs, 15 GB RAM):
+
+| Workflow | Result |
+|---|---|
+| pytest `-n 4` / ruff / ty | 854 passed in ~16s; clean |
+| `seed_hn_from_clickhouse.py --dry-run --limit 200` | 200 rows in 2.6s |
+| `seed_smoke_test.py --skip-bq --limit 50` | OK. No `bq`/`gcloud` CLI, so the BQ side can't run. It writes `smoke_report_*.json` to cwd (now gitignored) |
+| Demo server + regen + prewarm | Full-size first regen (4,880 candidates) is CPU-bound, about 1-2s per long text, likely an hour or more. With `pipeline.LIVE_WINDOW_LIMIT = 400` patched in a driver: 838 candidates, regen done in ~6 min |
+| Live TLDRs (`LLM_PROVIDER=gospark`) | Works once the environment has the opencode key: uncached 24s, cached 11ms. Needs a placeholder `OPENCODE_GO_API_KEY` env var, because `generate_detailed_tldr` returns early without one; the proxy supplies the real key |
+| `bakeoff_tldr_providers.py --stories 2 --providers gospark` | 2/2 ok (~15s each). DB path is hard-coded to `./hn_rewrite.db` |
+| `eval_ranker_variants.py` (temporal, synthetic votes) | Runs in 4s; NDCG@10 0.107 vs random 0.012 on a planted keyword preference |
+| `diagnose_rank_drivers.py`, `diagnose_source_scores.py` | Run on a `.backup()` snapshot |
+| Swipe deck via `/api/feed` + `/api/interaction` + `/api/feedback` | 24 votes bump the version 0→24; the re-ranked top 15 moves toward the planted topics |
+| `ledger_report.py`, `deck_composition_report.py` | Run. `--from-rank-perf` defaults to user 1; pass `--user-id` |
+| `hydrate_ch_seed.py` / backfills | Run (no-op on the demo DB) |
+| Embedding bakeoff/bench | `uv sync --group embedding-experiment` works; needs real votes |
+
+**Findings, not fixed:**
+- `fetch_candidates` hard-codes `query_live_window(days=30, ...)`, so
+  `Config.days` does not affect the HN live window.
+- 1 of 21 gospark calls came back `status=incomplete`: reasoning used
+  1,647 of the 1,650-token cap (`_max_tokens_for_provider`: 450 + 1,200),
+  so the article section was dropped (`partial_not_cached`). The other 20
+  used 351-977 reasoning tokens. Worth watching in `llm_usage` before
+  raising the headroom.
+- Environment limits, not bugs: github.com pages return 403 and LessWrong
+  is unreachable from the cloud network.
+- The SessionStart hook doesn't write the embedding manifest, so every
+  start logs `embedding_manifest_missing` (harmless).
+
 ## 2026-09-25 Rate-limit client IP, limiter sweep, stale eval reports
 
 Follow-ups to the review in the entry below.
