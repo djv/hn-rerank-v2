@@ -1,5 +1,22 @@
 # Worklog: hn-rewrite
 
+## 2026-09-25 Fix: empty Explore / unpersonalized deck after a restart
+
+Symptom: Explore empty, Recommended not personalized, until the user voted
+or reloaded. Cause: dashboard versions live in memory and reset to 0 on
+restart. A voted user with no cache got the cold deck (no Unsure/Novel/
+Similar picks, because the cold path passes `explore=None`) rendered as
+`dashboard_version=0` with `dashboard_latest_version=0`. The page and
+`/api/feed` therefore reported it as current (`ready=true`), so the web
+client never polled `ranking-ready` and the TUI never refetched. The
+personalized warm did finish about 0.7s later, but nobody asked for it.
+Fix (`_render_dashboard_for_user`): when a voted user gets the cold deck at
+version 0, bump their version first, so the page reads 0 < 1 and polls,
+and `/api/feed` reports `ready=false` until the warm lands. Checked live on
+a restarted demo server: page 0/1, feed `ready=false`, then `ready_version=1`
+and Explore 9 cards. Test: `test_no_cache_user_gets_cold_deck_and_warm_is_scheduled`
+is parametrized over start version 3→3 and 0→1.
+
 ## 2026-09-25 Date view: time-stratified coverage
 
 Follow-up to the entry below: Date then went 1-4h straight to 6.4 days.

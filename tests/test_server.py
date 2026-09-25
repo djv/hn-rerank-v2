@@ -1473,9 +1473,13 @@ def test_dashboard_cache_uses_feedback_versions(test_env, mock_embedder, monkeyp
     assert len(calls) == 2
 
 
+@pytest.mark.parametrize(("start_version", "target_version"), [(3, 3), (0, 1)])
 def test_no_cache_user_gets_cold_deck_and_warm_is_scheduled(
-    test_env, monkeypatch: pytest.MonkeyPatch
+    test_env, monkeypatch: pytest.MonkeyPatch, start_version: int, target_version: int
 ) -> None:
+    """A voted user without a cache gets the cold deck and a warm. At
+    version 0 (fresh after a restart) the version is bumped so the cold deck
+    doesn't claim to be current and clients poll for the personalized deck."""
     _, db, _, handler, user = test_env
     story = Story(
         id=991,
@@ -1504,7 +1508,7 @@ def test_no_cache_user_gets_cold_deck_and_warm_is_scheduled(
     calls: list[tuple[int, int]] = []
     rendered: list[dict[str, object]] = []
     handler._dashboard_cache = {}
-    handler._dashboard_versions = {user.id: 3}
+    handler._dashboard_versions = {user.id: start_version}
 
     def fake_generate_dashboard_bytes(
         ranked: list[RankedStory],
@@ -1537,7 +1541,8 @@ def test_no_cache_user_gets_cold_deck_and_warm_is_scheduled(
     html = handler._render_dashboard_for_user(user)
 
     assert html == b"cold html"
-    assert calls == [(user.id, 3)]
+    assert calls == [(user.id, target_version)]
+    assert handler._dashboard_version(user.id) == target_version
     rank = rendered[0]
     ranked_list = cast(list[RankedStory], rank["ranked"])
     story_ids = [rs.story.id for rs in ranked_list]
@@ -1546,7 +1551,7 @@ def test_no_cache_user_gets_cold_deck_and_warm_is_scheduled(
     assert rank["user_id"] == user.id
     assert rank["user_token"] == user.token
     assert rank["dashboard_version"] == 0
-    assert rank["dashboard_latest_version"] == 3
+    assert rank["dashboard_latest_version"] == target_version
 
 
 def test_no_cache_zero_feedback_user_gets_cold_deck_no_warm(

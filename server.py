@@ -1480,6 +1480,13 @@ class Handler:
         if cold_stories:
             from pipeline import generate_dashboard_bytes
 
+            if n_feedback > 0 and expected_version == 0:
+                # After a restart, versions reset to 0, so a cold deck would
+                # claim to be current (rendered 0 == latest 0): clients never
+                # poll for the personalized warm, and Explore stays empty
+                # because the cold deck has no Unsure/Novel/Similar picks.
+                # Bump so the page and /api/feed report a newer target.
+                expected_version = cls._invalidate_dashboard_cache(user.id)
             html = generate_dashboard_bytes(
                 cold_stories,
                 cls.config,
