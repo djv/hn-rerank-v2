@@ -1223,124 +1223,41 @@ async def test_fetch_and_parse_feed_unexpected_error_logs_exception_with_traceba
     assert error_records[0].exc_info is not None
 
 
-def test_is_summarizable_with_content():
-    """Stories with self_text, top_comments, or article_body are summarizable."""
-    from pipeline import Story
-
-    s = Story(
+@given(
+    source=st.sampled_from(
+        ["hn", "bq_seed", "ch_seed", "rss_lesswrong_com", "rss_reddit_com", "rss_x"]
+    ),
+    texts=st.tuples(*[st.sampled_from(["", " ", "text"])] * 3),
+    comment_count=st.none() | st.integers(-1, 3),
+    count_at_fetch=st.integers(-1, 3),
+)
+def test_is_summarizable_matches_spec(
+    source: str,
+    texts: tuple[str, str, str],
+    comment_count: int | None,
+    count_at_fetch: int,
+) -> None:
+    """Summarizable iff some text is present, or it is an HN-family or
+    LessWrong story whose comments can be fetched (either count > 0)."""
+    self_text, top_comments, article_body = texts
+    story = pipeline.Story(
         id=1,
         title="X",
         url=None,
         score=5,
         time=100,
-        text_content="x",
-        source="rss",
-        self_text="Some text",
+        text_content="",
+        source=source,
+        comment_count=comment_count,
+        comment_count_at_fetch=count_at_fetch,
+        self_text=self_text,
+        top_comments=top_comments,
+        article_body=article_body,
     )
-    assert pipeline.is_summarizable(s)
-
-    s = Story(
-        id=2,
-        title="X",
-        url=None,
-        score=5,
-        time=100,
-        text_content="x",
-        source="rss",
-        top_comments="Some comments",
+    fetchable = source in {"hn", "bq_seed", "ch_seed", "rss_lesswrong_com"} and (
+        (comment_count or 0) > 0 or (count_at_fetch or 0) > 0
     )
-    assert pipeline.is_summarizable(s)
-
-    s = Story(
-        id=3,
-        title="X",
-        url=None,
-        score=5,
-        time=100,
-        text_content="x",
-        source="rss",
-        article_body="Some body",
-    )
-    assert pipeline.is_summarizable(s)
-
-
-def test_is_summarizable_hn_with_comments():
-    """HN stories with comment_count > 0 but no inline text are summarizable
-    (comments can be fetched on-demand or prewarmed at regen)."""
-    from pipeline import Story
-
-    s = Story(
-        id=1,
-        title="X",
-        url=None,
-        score=5,
-        time=100,
-        text_content="x",
-        source="hn",
-        comment_count=10,
-        comment_count_at_fetch=10,
-    )
-    assert pipeline.is_summarizable(s)
-
-
-def test_is_summarizable_hn_zero_comments_no_content():
-    """HN stories with 0 comments and no text content are NOT summarizable."""
-    from pipeline import Story
-
-    s = Story(
-        id=1, title="X", url=None, score=5, time=100, text_content="x", source="hn"
-    )
-    assert not pipeline.is_summarizable(s)
-
-
-def test_is_summarizable_non_hn_no_content():
-    """Non-HN stories with no text content are NOT summarizable."""
-    from pipeline import Story
-
-    s = Story(
-        id=1,
-        title="X",
-        url=None,
-        score=5,
-        time=100,
-        text_content="x",
-        source="rss_reddit_test",
-    )
-    assert not pipeline.is_summarizable(s)
-
-
-def test_is_summarizable_lesswrong_with_comments():
-    """LessWrong stories with comment_count > 0 are summarizable (prewarmed)."""
-    from pipeline import Story
-
-    s = Story(
-        id=1,
-        title="X",
-        url=None,
-        score=5,
-        time=100,
-        text_content="x",
-        source="rss_lesswrong_com",
-        comment_count=3,
-        comment_count_at_fetch=3,
-    )
-    assert pipeline.is_summarizable(s)
-
-
-def test_is_summarizable_lesswrong_zero_comments():
-    """LessWrong stories with 0 comments and no text are NOT summarizable."""
-    from pipeline import Story
-
-    s = Story(
-        id=1,
-        title="X",
-        url=None,
-        score=5,
-        time=100,
-        text_content="x",
-        source="rss_lesswrong_com",
-    )
-    assert not pipeline.is_summarizable(s)
+    assert pipeline.is_summarizable(story) == (any(texts) or fetchable)
 
 
 @pytest.mark.asyncio

@@ -41,8 +41,9 @@ def test_urllib_fetch_returns_200_with_body() -> None:
     assert text == "hello world"
 
 
-def test_urllib_fetch_handles_403_without_raising() -> None:
-    """A 403 (or any 4xx/5xx) must return ``(status, \"\")``, not raise.
+@pytest.mark.parametrize("code", [403, 429, 500, 503])
+def test_urllib_fetch_returns_error_status_without_raising(code: int) -> None:
+    """Any 4xx/5xx returns ``(status, "")`` instead of raising.
 
     Regression: pre-fix, the uncaught ``HTTPError`` propagated from
     ``urlopen`` and silently dropped topfeed tasks when both httpx and
@@ -50,47 +51,12 @@ def test_urllib_fetch_handles_403_without_raising() -> None:
     was stalled for 25+ minutes because of this. See WORKLOG
     2026-06-29 for the diagnosis.
     """
-    err = HTTPError(
-        "https://www.reddit.com/r/MachineLearning/top/.rss",
-        403,
-        "Forbidden",
-        _empty_msg(),
-        io.BytesIO(b"block page"),
-    )
-    with patch("http_fetch.urlopen", side_effect=err):
-        status, text = urllib_fetch("https://www.reddit.com/x", "ua")
-    assert status == 403
-    assert text == ""
-
-
-def test_urllib_fetch_handles_429_without_raising() -> None:
     msg = _empty_msg()
     msg["Retry-After"] = "30"
-    err = HTTPError(
-        "https://www.reddit.com/r/x",
-        429,
-        "Too Many Requests",
-        msg,
-        io.BytesIO(b""),
-    )
-    with patch("http_fetch.urlopen", side_effect=err):
-        status, text = urllib_fetch("https://www.reddit.com/x", "ua")
-    assert status == 429
-    assert text == ""
-
-
-def test_urllib_fetch_handles_500_without_raising() -> None:
-    err = HTTPError(
-        "https://example.com/x",
-        500,
-        "Internal Server Error",
-        _empty_msg(),
-        io.BytesIO(b""),
-    )
+    err = HTTPError("https://example.com/x", code, "err", msg, io.BytesIO(b"body"))
     with patch("http_fetch.urlopen", side_effect=err):
         status, text = urllib_fetch("https://example.com/x", "ua")
-    assert status == 500
-    assert text == ""
+    assert (status, text) == (code, "")
 
 
 def test_urllib_fetch_propagates_network_errors() -> None:

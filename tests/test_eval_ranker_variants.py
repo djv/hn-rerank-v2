@@ -1,6 +1,5 @@
-"""AST-based checks for scripts/eval_ranker_variants.py."""
+"""Tests for scripts/eval_ranker_variants.py."""
 
-import ast
 from pathlib import Path
 
 import numpy as np
@@ -9,37 +8,22 @@ import pytest
 from database import Story
 from pipeline import Config
 
-SCRIPT = Path(__file__).parent.parent / "scripts" / "eval_ranker_variants.py"
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--split", "stratified"],  # retired: chronological evaluation only
+        ["--leak-check", "--leak-seeds", "0"],
+        ["--folds", "0"],
+    ],
+)
+def test_cli_rejects_invalid_evaluation_setups(argv: list[str]) -> None:
+    """Bad setups fail at argument parsing, before any DB or model work."""
+    from scripts.eval_ranker_variants import main
 
-def test_leak_check_flag_in_help() -> None:
-    """--leak-check must be wired into argparse.
-
-    Parses the script's source for `argparse.ArgumentParser.add_argument`
-    calls containing the literal `--leak-check`. Cheaper than booting a
-    subprocess (the script imports sklearn + onnx at top, ~2.5s).
-    """
-    tree = ast.parse(SCRIPT.read_text())
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            if node.func.attr != "add_argument":
-                continue
-            for arg in node.args:
-                if isinstance(arg, ast.Constant) and arg.value == "--leak-check":
-                    return
-    pytest.fail("--leak-check not in any argparse add_argument call")
-
-
-def test_split_flag_in_help() -> None:
-    tree = ast.parse(SCRIPT.read_text())
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            if node.func.attr != "add_argument":
-                continue
-            for arg in node.args:
-                if isinstance(arg, ast.Constant) and arg.value == "--split":
-                    return
-    pytest.fail("--split not in any argparse add_argument call")
+    with pytest.raises(SystemExit) as error:
+        main(argv)
+    assert error.value.code == 2
 
 
 def _eval_story(sid: int) -> Story:

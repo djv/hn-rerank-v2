@@ -1213,14 +1213,6 @@ def test_feedback_clear_then_revote_creates_new_record(test_env):
     assert records[0].action == "down"
 
 
-def test_ranking_ready_requires_session(test_env) -> None:
-    port, _, _, _, _ = test_env
-
-    resp = httpx.get(f"http://127.0.0.1:{port}/api/ranking-ready?version=0")
-
-    assert resp.status_code == 401
-
-
 @pytest.mark.parametrize("version", ["", "abc", "-1", "1.2"])
 def test_ranking_ready_rejects_invalid_version(test_env, version: str) -> None:
     port, _, _, _, user = test_env
@@ -1867,14 +1859,34 @@ def test_cors_headers(app_env):
     assert "POST" in resp.headers.get("access-control-allow-methods", "")
 
 
-def test_flask_test_client_user_requires_session(app_env) -> None:
-    _, _, _, handler, _ = app_env
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [
+        ("GET", "/api/user", None),
+        ("GET", "/api/feed", None),
+        ("GET", "/api/deck-cards", None),
+        ("GET", "/api/ranking-ready?version=0", None),
+        ("GET", "/api/tldr-cache/1", None),
+        ("POST", "/api/feedback", {"story_id": 1, "action": "up"}),
+    ],
+)
+def test_session_scoped_endpoints_reject_missing_cookie(
+    app_env: Any, method: str, path: str, body: dict[str, int | str] | None
+) -> None:
+    """Without a session cookie every per-user endpoint answers 401 and none
+    of them silently creates a user (only GET / does that)."""
+    _, db, _, handler, _ = app_env
     client = create_app(handler).test_client()
+    with db.conn() as conn:
+        users_before = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
 
-    resp = client.get("/api/user")
+    resp = client.open(
+        path, method=method, json=body, headers={"Origin": "http://localhost"}
+    )
 
     assert resp.status_code == 401
-    assert resp.get_json() == {"error": "No session"}
+    with db.conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == users_before
 
 
 def test_flask_test_client_user_returns_session(app_env: Any) -> None:
@@ -1976,16 +1988,6 @@ def test_flask_test_client_profile_link_limit_uses_forwarded_for(
     }
 
 
-def test_flask_test_client_ranking_ready_requires_session(app_env: Any) -> None:
-    _, _, _, handler, _ = app_env
-    client = create_app(handler).test_client()
-
-    resp = client.get("/api/ranking-ready?version=0")
-
-    assert resp.status_code == 401
-    assert resp.get_json() == {"error": "No session"}
-
-
 def test_flask_test_client_ranking_ready_validates_version(app_env: Any) -> None:
     _, _, _, handler, user = app_env
     client = create_app(handler).test_client()
@@ -2038,20 +2040,6 @@ def test_flask_test_client_feedback_rejects_cross_site(app_env: Any) -> None:
 
     assert resp.status_code == 403
     assert resp.get_json() == {"error": "Cross-site POSTs are not allowed"}
-
-
-def test_flask_test_client_feedback_requires_session(app_env: Any) -> None:
-    _, _, _, handler, _ = app_env
-    client = create_app(handler).test_client()
-
-    resp = client.post(
-        "/api/feedback",
-        json={"story_id": 1, "action": "up"},
-        headers={"Origin": "http://localhost"},
-    )
-
-    assert resp.status_code == 401
-    assert resp.get_json() == {"error": "No session"}
 
 
 def test_flask_test_client_feedback_writes_and_queues_refresh(test_env: Any) -> None:
@@ -3911,35 +3899,30 @@ def test_tldr_detail_dynamic_fetch(test_env, monkeypatch):
     assert updated_story.article_body == "Fetched article body text"
 
 
-def test_tldr_detail_dynamic_fetch_for_bq_seed(test_env, monkeypatch):
+@pytest.mark.parametrize(("source", "story_id"), [("bq_seed", 779), ("ch_seed", 771)])
+def test_tldr_detail_hydrates_archive_seed_comments_on_demand(
+    test_env, monkeypatch, source: str, story_id: int
+):
+    """Archive rows have no prewarmed comments; a TLDR tap fetches them."""
     port, db, _, _, user = test_env
     db.upsert_story(
         Story(
-            id=779,
-            title="BQ dynamic test",
-            url="https://example.com/bq-dynamic-test",
+            id=story_id,
+            title="Archive dynamic test",
+            url=f"https://example.com/{source}-dynamic-test",
             score=100,
             time=1600000000,
-            text_content="BQ dynamic test.",
-            source="bq_seed",
+            text_content="Archive dynamic test.",
+            source=source,
             comment_count=5,
-            discussion_url="https://news.ycombinator.com/item?id=779",
-            comment_count_at_fetch=0,
-            self_text="",
-            top_comments="",
-            article_body="",
+            discussion_url=f"https://news.ycombinator.com/item?id={story_id}",
         )
     )
 
     async def mock_fetch_story(client, sid, database, *, force=False):
-        story = database.get_story(sid)
         from dataclasses import replace
 
-        updated = replace(
-            story,
-            top_comments="Fetched BQ comments",
-            text_content="BQ dynamic test. Fetched BQ comments",
-        )
+        updated = replace(database.get_story(sid), top_comments="Fetched comments")
         database.upsert_story(updated)
         return updated
 
@@ -3960,71 +3943,13 @@ def test_tldr_detail_dynamic_fetch_for_bq_seed(test_env, monkeypatch):
 
     resp = httpx.post(
         f"http://127.0.0.1:{port}/api/tldr-detail",
-        json={"story_id": 779},
+        json={"story_id": story_id},
         cookies={"hn_token": user.token},
     )
 
     assert resp.status_code == 200
-    assert "Fetched BQ comments" in resp.json()["tldr"]
-    assert db.get_story(779).top_comments == "Fetched BQ comments"
-
-
-def test_tldr_detail_dynamic_fetch_for_ch_seed(test_env, monkeypatch):
-    port, db, _, _, user = test_env
-    db.upsert_story(
-        Story(
-            id=771,
-            title="CH dynamic test",
-            url="https://example.com/ch-dynamic-test",
-            score=100,
-            time=1600000000,
-            text_content="CH dynamic test.",
-            source="ch_seed",
-            comment_count=5,
-            discussion_url="https://news.ycombinator.com/item?id=771",
-            comment_count_at_fetch=0,
-            self_text="",
-            top_comments="",
-            article_body="",
-        )
-    )
-
-    async def mock_fetch_story(client, sid, database, *, force=False):
-        story = database.get_story(sid)
-        from dataclasses import replace
-
-        updated = replace(
-            story,
-            top_comments="Fetched CH comments",
-            text_content="CH dynamic test. Fetched CH comments",
-        )
-        database.upsert_story(updated)
-        return updated
-
-    async def mock_fetch_article_body_with_result(url):
-        return server.ArticleFetchResult(error="empty_extraction")
-
-    async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
-        return server.TldrResult(kind="ok", tldr=f"TLDR: {title} | {top_comments}")
-
-    import server
-    import pipeline
-
-    monkeypatch.setattr(pipeline, "fetch_story", mock_fetch_story)
-    monkeypatch.setattr(
-        server, "_fetch_article_body_with_result", mock_fetch_article_body_with_result
-    )
-    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
-
-    resp = httpx.post(
-        f"http://127.0.0.1:{port}/api/tldr-detail",
-        json={"story_id": 771},
-        cookies={"hn_token": user.token},
-    )
-
-    assert resp.status_code == 200
-    assert "Fetched CH comments" in resp.json()["tldr"]
-    assert db.get_story(771).top_comments == "Fetched CH comments"
+    assert "Fetched comments" in resp.json()["tldr"]
+    assert db.get_story(story_id).top_comments == "Fetched comments"
 
 
 def test_tldr_detail_uses_cached_summary(test_env, monkeypatch):
@@ -4355,57 +4280,6 @@ def test_tldr_partial_response_remains_retryable(
     assert response.status_code == 200
     assert response.json()["retryable"] is True
     assert db.get_any_tldr_for_story(780) is None
-
-
-def test_tldr_client_cooldown_suppression_shows_message() -> None:
-    """Cooldown guard must render a message, not silently keep old bytes."""
-    _, script = _read_template_and_static()
-    start = script.index("      const retryAt = tldrRetryAt.get(storyId)")
-    block = script[start : start + 600]
-    assert "provider cooling down, retry in" in block
-    assert "dataset.error" in block
-
-
-def test_tldr_enhance_and_queue_status_contract() -> None:
-    """Polish-pass client contracts: the TLDR post-renderer (readtime,
-    stale marker, collapsible sections), the queue status line, and the
-    single-hue rank gradient. Both render sites must route through the
-    enhancer or markers/readtime silently disappear on one path."""
-    _, script = _read_template_and_static()
-    assert "function enhanceTldrContent(contentDiv, opts)" in script
-    assert "tldr-stale" in script
-    assert "Stale summary — refreshing" in script
-    assert "min read" in script
-    assert script.count("enhanceTldrContent(contentDiv, {") == 2
-    assert "Queued ${n}" in script
-    assert "hsl(24," in script
-    assert "220 * (N - 1 - i)" not in script
-
-
-def test_terminal_theme_contract() -> None:
-    """Terminal theme: dark Pico base, phosphor vars, mono stack, prompt
-    chrome, dark-tuned rank gradient. Class names and element IDs must be
-    unchanged (JS/template contracts depend on them)."""
-    template, script = _read_template_and_static()
-    assert 'data-theme="dark"' in template
-    assert "--term-green: #33dd66" in template
-    assert "ui-monospace" in template
-    assert "term-prompt" in template
-    assert "$ hn-rewrite --deck" in template
-    assert "term-blink" in template
-    assert "#queue-loading:not([hidden])::after" in template
-    # Rank gradient floor raised for dark bg (pale end still visible).
-    assert "45 + 23 * t" in script
-    assert "42 + 40 * t" not in script
-    # Unchanged contracts the JS depends on.
-    for token in (
-        'id="queueStatus"',
-        'id="queue-loading"',
-        'class="story-card',
-        'data-key-action="undo"',
-        "badge-legend",
-    ):
-        assert token in template
 
 
 def test_tldr_markdown_neutralizes_html_and_unsafe_links() -> None:
@@ -5492,69 +5366,6 @@ def test_tldr_detail_fetches_lesswrong_comments(test_env, monkeypatch):
     assert updated_story.score == 132
 
 
-def test_dashboard_source_filter_toggle_temporarily_disabled():
-    """The 3-way source filter (Mixed/HN/Non-HN) is temporarily disabled.
-
-    Non-HN sources are present in the pool (RSS/Reddit/LessWrong have been
-    enabled since well before this test was last touched), but an
-    Archive+Non-HN selection would render an empty deck: archive_nonhn is
-    structurally always empty and was retired from COMBO_DEFS (see
-    PRIMARY_RECENT_NONHN/PRIMARY_ARCHIVE_HN in pipeline/ranking.py).
-    Re-enabling this UI needs the same client-side guard Popular+Non-HN
-    already has (see setFilter in templates/index.html) — deferred, see
-    WORKLOG 2026-08-30.
-    """
-    template, _ = _read_template_and_static()
-    assert 'data-source="mixed"' not in template
-    assert 'data-source="hn"' not in template
-    assert 'data-source="non-hn"' not in template
-    assert 'TabView("non-hn"' not in (
-        Path(__file__).resolve().parents[1] / "pipeline" / "render.py"
-    ).read_text(encoding="utf-8")
-
-
-def test_story_cards_emit_combo_keys_and_is_hn_attribute():
-    """Each .story-card carries data-combo for client age+source filtering
-    and data-is-hn for server-side is_non_hn tracking."""
-    template, static = _read_template_and_static()
-    assert 'data-combo="{{ card.combo_keys }}"' in template
-    assert 'data-is-hn="{{ card.is_hn_attr }}"' in template
-    assert "card.dataset.combo" in static
-    assert "s.startsWith('rss_')" not in static
-    assert "s === 'hn' || s === 'bq_seed'" not in static
-
-
-def test_story_cards_emit_interaction_dimensions_and_explicit_event_hooks() -> None:
-    template, static = _read_template_and_static()
-    assert 'data-position="{{ card.position }}"' in template
-    assert 'data-dashboard-version="{{ dashboard_version or 0 }}"' in template
-    assert 'data-ranker-arm="baseline"' in template
-    assert 'data-event-kind="comments_open"' in template
-    assert "queueInteraction('impression'" in static
-    assert "queueInteraction('dwell'" in static
-    assert "navigator.sendBeacon" in static
-    assert "apiPath('/api/interaction')" in static
-    assert "data-event-kind" in static
-    assert "openTldrDetail" in static
-    assert "queueInteraction('tldr" not in static
-
-
-def test_story_cards_always_fill_the_story_column() -> None:
-    """All cards use the available story-column width, before enrichment."""
-    template, _ = _read_template_and_static()
-    card_css = template.split("    .story-card {", 1)[1].split("    }", 1)[0]
-    enriched_css = template.split("    .story-card.enriched {", 1)[1].split("    }", 1)[
-        0
-    ]
-
-    assert "width: 100%;" in card_css
-    assert "width: fit-content;" not in card_css
-    assert "min-width:" not in card_css
-    assert "max-width:" not in card_css
-    assert "width:" not in enriched_css
-    assert "max-width:" not in enriched_css
-
-
 def test_static_dashboard_js_has_no_jinja():
     """The inline <script> in the template is served as-is by Jinja2, so it
     must not contain Jinja2 directives."""
@@ -5963,8 +5774,8 @@ def test_submitVote_advances_to_the_voted_cards_successor_not_the_deck_head() ->
     assert "isQueued(el)" in next_sibling_block
 
 
-def test_data_is_recent_attribute_emitted(test_env):
-    """Per-card data-is-recent attribute is set correctly based on story age."""
+def test_rendered_cards_carry_client_contract_attributes(test_env):
+    """Served cards carry age, combo, source, position and version attributes."""
     import re
 
     port, db, regen_event, handler, user = test_env
@@ -6024,14 +5835,25 @@ def test_data_is_recent_attribute_emitted(test_env):
     assert 'data-is-recent="1"' in recent_card
     assert 'data-is-recent="0"' in old_card
 
+    # Every served card carries the attributes the client filters, orders and
+    # logs interactions by.
+    from bs4 import BeautifulSoup
 
-def test_deck_cards_requires_session(app_env: Any) -> None:
-    port, _, _, _, _ = app_env
-
-    resp = httpx.get(f"http://127.0.0.1:{port}/api/deck-cards")
-
-    assert resp.status_code == 401
-    assert resp.json() == {"error": "No session"}
+    soup = BeautifulSoup(text, "html.parser")
+    stories_el = soup.select_one("#stories")
+    assert stories_el is not None
+    page_version = stories_el["data-dashboard-version"]
+    cards = soup.select("article.story-card")
+    assert [int(str(c["data-position"])) for c in cards] == list(range(len(cards)))
+    for card in cards:
+        combos = str(card["data-combo"]).split()
+        age = "recent" if card["data-is-recent"] == "1" else "archive"
+        assert f"{age}_mixed" in combos
+        assert card["data-is-hn"] == "1"  # both fixtures are HN-family sources
+        assert card["data-dashboard-version"] == page_version
+        assert card["data-ranker-arm"] == "baseline"
+        kinds = {a["data-event-kind"] for a in card.select("a[data-event-kind]")}
+        assert "comments_open" in kinds
 
 
 def test_deck_cards_returns_only_card_fragment(test_env) -> None:
@@ -6141,257 +5963,6 @@ def test_deck_cards_does_not_warm_when_cache_is_current(
     assert calls == []
 
 
-def test_inline_script_has_voted_story_ids_filter():
-    """The client-side ``votedStoryIds`` Set and the refillQueue filter are
-    the defense-in-depth for the 2026-06-28 stale-fetch bug: even if a SWR
-    stale-hit returns the pre-vote HTML, refillQueue suppresses any incoming
-    card whose storyId is in the session-scoped voted set.
-    """
-    template, inline_script = _read_template_and_static()
-    assert "votedStoryIds = new Set()" in inline_script
-    assert 'data-user-id="{{ user_id or 0 }}"' in template
-    assert "function seedVotedStoryIdsFromStorage()" in inline_script
-    assert "readStoredVotedStoryIds().forEach" in inline_script
-    assert "card.dataset.voted = 'stored'" in inline_script
-    assert "card.remove()" in inline_script
-    assert "seedVotedStoryIdsFromStorage();" in inline_script
-    # submitVote adds to the set; undoLastVote removes from it
-    submit_vote_block = inline_script.split("function submitVote(", 1)[1].split(
-        "function ", 1
-    )[0]
-    assert "rememberVotedStoryId(storyId)" in submit_vote_block
-    undo_block = inline_script.split("function undoLastVote()", 1)[1].split(
-        "function ", 1
-    )[0]
-    assert "forgetVotedStoryId(storyId)" in undo_block
-    assert "hnRewrite:votedStoryIds:${userId}" in inline_script
-    assert "window.localStorage.setItem" in inline_script
-    # refillQueue must skip incoming cards whose id is in the set
-    refill_block = inline_script.split("function refillQueue(", 1)[1].split(
-        "function ", 1
-    )[0]
-    assert "votedStoryIds.has(Number(storyId))" in refill_block
-    # The sendFeedback catch handler must roll back the in-memory "voted"
-    # state when the request fails. Otherwise a transient network error
-    # would leave the storyId in votedStoryIds for the rest of the session
-    # and refillQueue would suppress that story from the next refill even
-    # though no vote was actually saved to the DB.
-    submit_catch = inline_script.split("Network error submitting feedback", 1)[1].split(
-        ".finally", 1
-    )[0]
-    assert "forgetVotedStoryId(storyId)" in submit_catch
-    assert "delete card.dataset.voted" in submit_catch
-
-
-def test_submitVote_schedules_stale_then_ready_gated_refill_on_success() -> None:
-    """A saved vote refills stale immediately and fresh after cadence warm."""
-    _, inline_script = _read_template_and_static()
-    submit_vote_block = inline_script.split("function submitVote(", 1)[1].split(
-        "function ", 1
-    )[0]
-    assert "silentRefill()" not in submit_vote_block
-    assert "scheduleVoteRefresh(data)" in submit_vote_block
-    refresh_block = inline_script.split("function scheduleVoteRefresh(", 1)[1].split(
-        "function ", 1
-    )[0]
-    assert "queueRefill(false)" in refresh_block
-    assert "data.ranking_refresh_queued" in refresh_block
-    assert "waitForWarm: true" in refresh_block
-    assert "data.ranking_idle_seconds" in refresh_block
-    # On a failed save, the catch handler must surface a toast (not the old
-    # refresh banner, which is gone).
-    submit_catch = submit_vote_block.split("Network error submitting feedback", 1)[1]
-    assert "showToast(" in submit_catch
-    assert "refreshBannerText" not in submit_catch
-    assert "refreshBanner.hidden" not in submit_catch
-
-
-def test_undoLastVote_uses_vote_refresh_cadence_on_success() -> None:
-    """A successful undo uses the same stale/fresh refill cadence."""
-    _, inline_script = _read_template_and_static()
-    undo_block = inline_script.split("function undoLastVote()", 1)[1].split(
-        "function ", 1
-    )[0]
-    assert "silentRefill()" not in undo_block
-    assert "scheduleVoteRefresh(data)" in undo_block
-    undo_catch = undo_block.split("Network error undoing feedback", 1)[1]
-    assert "showToast(" in undo_catch
-    assert "refreshBannerText" not in undo_catch
-
-
-def test_feedback_client_serializes_per_story_operations() -> None:
-    """Same-story vote/undo/revote requests share one promise chain."""
-    _, inline_script = _read_template_and_static()
-    enqueue_block = inline_script.split("function enqueueFeedback(", 1)[1].split(
-        "function ", 1
-    )[0]
-    assert "feedbackChains = new Map()" in inline_script
-    assert "feedbackChains.get(storyId) || Promise.resolve()" in enqueue_block
-    assert ".catch(() => {})" in enqueue_block
-    assert ".then(() => sendFeedback(storyId, action))" in enqueue_block
-    assert "feedbackChains.set(storyId, tracked)" in enqueue_block
-
-    submit_vote_block = inline_script.split("function submitVote(", 1)[1].split(
-        "function ", 1
-    )[0]
-    undo_block = inline_script.split("function undoLastVote()", 1)[1].split(
-        "function ", 1
-    )[0]
-    assert "enqueueFeedback(storyId, action)" in submit_vote_block
-    assert "enqueueFeedback(storyId, 'clear')" in undo_block
-    assert "Promise.resolve(savePromise).finally" not in undo_block
-    assert "sendFeedback(storyId, 'clear'" not in undo_block
-
-
-def test_failed_vote_clears_last_vote_only_when_current() -> None:
-    """A failed save can clear undo state only for the current vote id."""
-    _, inline_script = _read_template_and_static()
-    assert "let nextVoteId = 1" in inline_script
-    submit_vote_block = inline_script.split("function submitVote(", 1)[1].split(
-        "function ", 1
-    )[0]
-    assert "id: nextVoteId++" in submit_vote_block
-    submit_catch = submit_vote_block.split("Network error submitting feedback", 1)[1]
-    assert "if (lastVote?.id === vote.id)" in submit_catch
-    guarded_block = submit_catch.split("if (lastVote?.id === vote.id)", 1)[1].split(
-        "showToast", 1
-    )[0]
-    assert "lastVote = null" in guarded_block
-    assert "forgetVotedStoryId(storyId)" in guarded_block
-    assert "delete card.dataset.voted" in guarded_block
-
-
-def test_stale_failed_vote_handler_does_not_remove_newer_vote_state() -> None:
-    """The failed-save rollback is guarded so stale handlers cannot undo revotes."""
-    _, inline_script = _read_template_and_static()
-    submit_vote_block = inline_script.split("function submitVote(", 1)[1].split(
-        "function ", 1
-    )[0]
-    submit_catch = submit_vote_block.split("Network error submitting feedback", 1)[1]
-    pre_guard = submit_catch.split("if (lastVote?.id === vote.id)", 1)[0]
-    assert "forgetVotedStoryId(storyId)" not in pre_guard
-    assert "delete card.dataset.voted" not in pre_guard
-
-
-def test_vote_count_helpers_apply_and_rollback_once() -> None:
-    """Vote counts increment optimistically, decrement on undo, and roll back
-    a failed save only when that vote was not already undone.
-    """
-    _, inline_script = _read_template_and_static()
-    assert "function adjustVoteCount(action, delta)" in inline_script
-    assert "function incrementVoteCount(vote)" in inline_script
-    assert "function decrementVoteCount(vote)" in inline_script
-    assert "if (vote.countApplied)" in inline_script
-    assert "if (!vote.countApplied)" in inline_script
-
-    submit_vote_block = inline_script.split("function submitVote(", 1)[1].split(
-        "function ", 1
-    )[0]
-    undo_block = inline_script.split("function undoLastVote()", 1)[1].split(
-        "function ", 1
-    )[0]
-    assert "incrementVoteCount(vote)" in submit_vote_block
-    assert "if (!vote.undone)" in submit_vote_block
-    assert "decrementVoteCount(vote)" in submit_vote_block
-    assert "vote.undone = true" in undo_block
-    assert "decrementVoteCount(vote)" in undo_block
-
-
-def test_revote_after_undo_cannot_be_followed_by_stale_clear() -> None:
-    """Undo clears through the per-story chain, so revote queues after clear."""
-    _, inline_script = _read_template_and_static()
-    undo_block = inline_script.split("function undoLastVote()", 1)[1].split(
-        "function ", 1
-    )[0]
-    assert "vote.undone = true" in undo_block
-    assert "delete card.dataset.voted" in undo_block
-    assert "setActiveCard(card)" in undo_block
-    assert "enqueueFeedback(storyId, 'clear')" in undo_block
-
-    submit_vote_block = inline_script.split("function submitVote(", 1)[1].split(
-        "function ", 1
-    )[0]
-    assert "if (!card || card.dataset.voted)" in submit_vote_block
-    assert "enqueueFeedback(storyId, action)" in submit_vote_block
-
-
-def test_scheduleDeckRefresh_serializes_refill_lane() -> None:
-    """The refill lane serializes fetches while coalescing queued advance
-    requests."""
-    _, inline_script = _read_template_and_static()
-    block = inline_script.split("async function runRefillLoop()", 1)[1].split(
-        "function ", 1
-    )[0]
-    assert "if (refillInFlight)" in block
-    assert "while (queuedRefillAdvance !== null)" in block
-    assert "await refillQueue({ advance })" in block
-    queue_block = inline_script.split("function queueRefill(", 1)[1].split(
-        "async function runRefillLoop", 1
-    )[0]
-    assert "queuedRefillAdvance || advance" in queue_block
-
-
-def test_ready_gated_refill_uses_non_advancing_refill() -> None:
-    _, inline_script = _read_template_and_static()
-    block = inline_script.split("async function runWarmPollLoop()", 1)[1].split(
-        "async function waitForRankingReady", 1
-    )[0]
-    assert (
-        "const readyVersion = await waitForRankingReady(minVersion, targetVersion)"
-        in block
-    )
-    assert "await waitForVoteRemoval()" in block
-    assert "queueRefill(false)" in block
-    assert "warmMinVersion = readyVersion + 1" in block
-    assert "latestWarmTargetVersion = null" in block
-
-
-def test_ready_gated_refill_drains_active_before_queued_version() -> None:
-    _, inline_script = _read_template_and_static()
-    schedule_block = inline_script.split("function scheduleDeckRefresh(", 1)[1].split(
-        "function queueRefill", 1
-    )[0]
-    assert "lastScheduledWarmVersion" in schedule_block
-    assert "targetVersion <= lastScheduledWarmVersion" in schedule_block
-    assert "latestWarmTargetVersion = Math.max" in schedule_block
-    assert "warmMinVersion === null" in schedule_block
-    assert "warmMinVersion = targetVersion" in schedule_block
-
-    loop_block = inline_script.split("async function runWarmPollLoop()", 1)[1].split(
-        "async function waitForRankingReady", 1
-    )[0]
-    assert (
-        "while (warmMinVersion !== null && latestWarmTargetVersion !== null)"
-        in loop_block
-    )
-    assert "const minVersion = warmMinVersion" in loop_block
-    assert "const targetVersion = latestWarmTargetVersion" in loop_block
-    assert "queueRefill(false)" in loop_block
-    assert "if (readyVersion >= latestWarmTargetVersion)" in loop_block
-
-
-def test_waitForRankingReady_timeout_does_not_refill() -> None:
-    _, inline_script = _read_template_and_static()
-    block = inline_script.split("async function waitForRankingReady(", 1)[1].split(
-        "sortTabs.forEach", 1
-    )[0]
-    assert "rankingReadyPath(minVersion, targetVersion)" in block
-    assert "Date.now() - startedAt <= 30000" in block
-    assert "return null" in block
-    assert "refillQueue" not in block
-    assert "queueRefill" not in block
-
-
-def test_stale_page_check_treats_version_zero_as_finite() -> None:
-    _, inline_script = _read_template_and_static()
-    block = inline_script.split("// If the page was served from a stale cache", 1)[
-        1
-    ].split("</script>", 1)[0]
-    assert "Number.isFinite(pageVer)" in block
-    assert "Number.isFinite(currVer)" in block
-    assert "pageVer && currVer" not in block
-
-
 def test_refill_uses_feed_json_and_safe_dom_text() -> None:
     _, script = _read_template_and_static()
     assert "fetch('/api/feed', { cache: 'no-store' })" in script
@@ -6407,47 +5978,6 @@ def test_refill_uses_feed_json_and_safe_dom_text() -> None:
     )
     assert "card !== activeCard" in script
     assert "votedStoryIds.has(Number(storyId))" in script
-
-
-def test_refillQueue_reorders_deterministic_modes_only() -> None:
-    """After appending new cards, refillQueue always re-applies the active
-    sort for all modes (no more shuffle special-case)."""
-    _, inline_script = _read_template_and_static()
-    block = inline_script.split("async function refillQueue(", 1)[1].split(
-        "function ", 1
-    )[0]
-    assert "orderForCurrentSort()" in block
-    assert "showNextCard({ allowRefresh: false })" in block
-    assert block.index("orderForCurrentSort()") < block.index(
-        "showNextCard({ allowRefresh: false })"
-    )
-
-
-def test_refillQueue_activates_a_replacement_only_when_the_deck_is_empty() -> None:
-    """A non-advancing vote refill preserves an active card but recovers an
-    empty filtered deck once fresh matching cards arrive."""
-    _, inline_script = _read_template_and_static()
-    block = inline_script.split("async function refillQueue(", 1)[1].split(
-        "function ", 1
-    )[0]
-    assert "advance = true" in block
-    assert "const needsActiveCard = activeCard === null;" in block
-    assert (
-        "if (advance || needsActiveCard) {\n        showNextCard({ allowRefresh: false });"
-        in block
-    )
-
-
-def test_showToast_dismisses_after_3s() -> None:
-    """showToast shows the toast and auto-dismisses after 3000ms."""
-    _, inline_script = _read_template_and_static()
-    block = inline_script.split("function showToast(message, variant)", 1)[1].split(
-        "function ", 1
-    )[0]
-    assert "toastEl.hidden = false" in block
-    assert "toastEl.hidden = true" in block
-    assert "3000" in block
-    assert "clearTimeout(toastTimer)" in block
 
 
 def test_justext_rejects_sidebar_boilerplate() -> None:

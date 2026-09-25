@@ -1052,6 +1052,9 @@
     let currentSource = 'mixed';
     const votedStoryIds = new Set();
     const feedbackChains = new Map();
+    // storyId -> id of the newest vote on it, so a late failure of an older
+    // vote can roll back only when nothing newer has replaced it.
+    const latestVoteIds = new Map();
     const MAX_QUEUE = 12;
     const PREFETCH_COUNT = 4;
     const tldrCache = new Map(); // storyId (number) → raw TLDR markdown (string)
@@ -2018,7 +2021,9 @@
       const next = previous
         .catch(() => {})
         .then(() => sendFeedback(storyId, action));
-      const tracked = next.finally(() => {
+      // The chain entry only sequences requests; callers handle `next`'s
+      // failure, so the entry itself must never reject unhandled.
+      const tracked = next.catch(() => {}).finally(() => {
         if (feedbackChains.get(storyId) === tracked) {
           feedbackChains.delete(storyId);
         }
@@ -2066,6 +2071,7 @@
         countApplied: false,
         undone: false,
       };
+      latestVoteIds.set(storyId, vote.id);
       rememberVotedStoryId(storyId);
       card.dataset.voted = action;
       document.querySelectorAll('[data-fb]').forEach(btn => {
@@ -2107,6 +2113,9 @@
           }
           if (lastVote?.id === vote.id) {
             lastVote = null;
+          }
+          if (latestVoteIds.get(storyId) === vote.id) {
+            latestVoteIds.delete(storyId);
             forgetVotedStoryId(storyId);
             delete card.dataset.voted;
           }

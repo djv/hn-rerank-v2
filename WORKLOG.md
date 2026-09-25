@@ -1,5 +1,42 @@
 # Worklog: hn-rewrite
 
+## 2026-09-25 Tests: execute the client script instead of grepping it; two vote bugs
+
+**Client bugs found by executing the vote code** (`templates/index.html`):
+- A failed vote save only rolled back when that vote was still the global
+  `lastVote`. Vote on A, then B, and A's save fails: A stayed hidden and in
+  `votedStoryIds` (persisted in localStorage), so an unsaved story was
+  suppressed from refills. The rollback now keys on a per-story
+  `latestVoteIds` map, which keeps the original protection (a late failure
+  from vote → undo → revote on the same story still can't clobber the
+  revote).
+- `enqueueFeedback` stored `next.finally(...)` in the per-story chain, so
+  every failed save with no later request on that story left an unhandled
+  rejection ("Uncaught (in promise)"). The chain entry now swallows the
+  error; callers still handle `next`.
+
+**Test changes (843 tests, ~17 s at -n 4):**
+- New `tests/test_client_js.py`: a small harness extracts named functions
+  from the inline script (brace matching that skips strings and comments)
+  and runs them under Node with DOM/fetch stubs and a virtual clock. It
+  covers vote/undo/revote serialization and counts, failed-save rollback
+  (including the two bugs above), refill-lane coalescing, the warm-poll
+  loop (intermediate version, 30 s timeout), the vote refresh idle path,
+  refillQueue filtering and activation, and the version-0 stale-page check.
+- Removed 23 `test_server.py` tests that only grepped JS/CSS source (17
+  replaced by the executed tests; 6 cosmetic pins: theme colors, toast 3 s,
+  CSS width, cooldown text, enhancer strings, disabled source tabs). The card
+  attribute contract is now checked on real rendered HTML with BeautifulSoup
+  (`test_rendered_cards_carry_client_contract_attributes`).
+- Property tests replace example clusters: `is_summarizable` against an
+  independent spec (6 tests → 1); dedup URL exclusion by vote action over
+  noisy/clean URL pairs (4 → 1).
+- Parametrized duplicates: urllib HTTP-error handling (3 → 1, +503), the
+  archive-seed TLDR hydration (bq/ch → 1), and five scattered
+  "requires session" tests → one over every session-scoped endpoint, which
+  also asserts no user row is created. `eval_ranker_variants` AST
+  "flag exists" tests → behavioral CLI rejection tests.
+
 ## 2026-09-25 Simplify the dashboard cache and warm state machine
 
 A review of the load/fetch/cache lifecycle after the restart fix (entry

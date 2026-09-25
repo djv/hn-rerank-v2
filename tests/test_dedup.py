@@ -6,7 +6,7 @@ from typing import Literal, cast
 
 import numpy as np
 import pytest
-from database import Database, FeedbackRecord, Story
+from database import Action, Database, FeedbackRecord, Story
 from dedup import (
     DedupConfig,
     dedup_ranked,
@@ -47,9 +47,7 @@ def test_normalize_url_handles_basic_variants() -> None:
     assert normalize_url("https://example.com:443/path") == normalize_url(
         "https://example.com/path"
     )
-    assert normalize_url("https://example.com:8443/path") == (
-        "example.com:8443/path"
-    )
+    assert normalize_url("https://example.com:8443/path") == ("example.com:8443/path")
 
 
 def test_normalize_url_strips_trackers() -> None:
@@ -104,7 +102,9 @@ def test_normalize_url_real_world_hn() -> None:
 
 _URL_HOSTS = ["example.com", "news.ycombinator.com", "my-blog.dev"]
 _URL_TRACKERS = ["utm_source", "utm_medium", "fbclid", "gclid", "msclkid"]
-_URL_PATH_SEGMENT = st.text(alphabet="abcdefghijklmnopqrstuvwxyz0123456789", min_size=1, max_size=8)
+_URL_PATH_SEGMENT = st.text(
+    alphabet="abcdefghijklmnopqrstuvwxyz0123456789", min_size=1, max_size=8
+)
 
 
 @st.composite
@@ -259,36 +259,24 @@ def _fb(
     )
 
 
-def test_dedup_ranked_excludes_upvoted_url() -> None:
-    """Voting the HN version of an article drops the Reddit version too."""
-    candidate = _story(2, url="https://www.theverge.com/x", source="rss_reddit_x")
-    feedback = [_fb(1, "up", url="https://www.theverge.com/x", title="...")]
+@settings(max_examples=60)
+@given(
+    pair=_noisy_and_clean_url(),
+    action=st.sampled_from(["up", "neutral", "down"]),
+    candidate_is_noisy=st.booleans(),
+)
+def test_dedup_ranked_url_exclusion_follows_vote_action(
+    pair: tuple[str, str], action: Action, candidate_is_noisy: bool
+) -> None:
+    """A candidate whose URL normalizes to a voted URL is dropped for up and
+    neutral votes (the user already saw that article) but kept after a
+    downvote, whichever side carries the tracking/scheme/www noise."""
+    noisy, clean = pair
+    candidate_url, voted_url = (noisy, clean) if candidate_is_noisy else (clean, noisy)
+    candidate = _story(2, url=candidate_url, source="rss_reddit_x")
+    feedback = [_fb(1, action, url=voted_url, title="...")]
     out = dedup_ranked([candidate], feedback, DedupConfig())
-    assert out == []
-
-
-def test_dedup_ranked_excludes_neutral_voted_url() -> None:
-    candidate = _story(2, url="https://www.theverge.com/x", source="rss_reddit_x")
-    feedback = [_fb(1, "neutral", url="https://www.theverge.com/x", title="...")]
-    out = dedup_ranked([candidate], feedback, DedupConfig())
-    assert out == []
-
-
-def test_dedup_ranked_does_not_exclude_downvoted_url() -> None:
-    """Downvotes do not suppress alternate versions of the same article."""
-    candidate = _story(2, url="https://www.theverge.com/x", source="rss_reddit_x")
-    feedback = [_fb(1, "down", url="https://www.theverge.com/x", title="...")]
-    out = dedup_ranked([candidate], feedback, DedupConfig())
-    assert [s.id for s in out] == [2]
-
-
-def test_dedup_ranked_url_exclusion_uses_normalization() -> None:
-    candidate = _story(
-        2, url="https://www.theverge.com/x?utm_source=hn", source="rss_reddit_x"
-    )
-    feedback = [_fb(1, "up", url="http://theverge.com/x", title="...")]
-    out = dedup_ranked([candidate], feedback, DedupConfig())
-    assert out == []
+    assert [s.id for s in out] == ([] if action in ("up", "neutral") else [2])
 
 
 # ---------------------------------------------------------------------------
