@@ -15,16 +15,24 @@ from hn_rerank.app import (
     EMPTY_NOTICE,
     Reader,
     Setup,
+    LIGHT_PALETTE,
     headline,
     headline_domain,
     headline_points,
     limit_recommended,
     story_age,
     story_metadata,
+    theme_for_hour,
 )
 from hn_rerank.models import FeedStory
 
 from .test_client import FakeServer
+
+
+@pytest.fixture(autouse=True)
+def dark_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Colour assertions pin the dark palette regardless of the wall clock."""
+    monkeypatch.setattr("hn_rerank.app.theme_for_hour", lambda _hour: "editorial")
 
 
 class UnreachableServer(FakeServer):
@@ -602,3 +610,41 @@ async def test_narrow_footer_fits_error_and_zoom_shortcuts() -> None:
         assert status.height == 3
         assert status.bottom <= hints.y
         assert hints.bottom <= footer.bottom
+
+
+def test_theme_follows_local_hour() -> None:
+    assert [theme_for_hour(h) for h in (5, 6, 19, 20)] == [
+        "editorial",
+        "editorial-light",
+        "editorial-light",
+        "editorial",
+    ]
+
+
+async def test_clock_switch_restyles_css_and_rich_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = Reader(api=EditorialServer().api())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await pilot.pause(0.6)
+        assert app.theme == "editorial"
+        monkeypatch.setattr(
+            "hn_rerank.app.theme_for_hour", lambda _hour: "editorial-light"
+        )
+        app.apply_clock_theme()
+        await pilot.pause()
+        assert app.theme == "editorial-light"
+        assert app.screen.styles.background.hex.upper() == LIGHT_PALETTE["bg"]
+        listing = app.query_one(OptionList)
+        styles = {
+            str(span.style)
+            for index in range(listing.option_count)
+            for span in cast(Text, listing.get_option_at_index(index).prompt).spans
+        }
+        assert {LIGHT_PALETTE["link"], LIGHT_PALETTE["good"]} <= styles
+        status = cast(Text, app.query_one("#status", Static).content)
+        assert LIGHT_PALETTE["good"] in {str(span.style) for span in status.spans}
+        # A manual theme pick holds until the clock's choice changes again.
+        app.theme = "editorial"
+        app.apply_clock_theme()
+        assert app.theme == "editorial"

@@ -1,5 +1,18 @@
 # Worklog: hn-rewrite
 
+## 2026-09-25 TUI: clock-based light/dark theme
+
+The user asked for a light TUI theme, switched automatically by the local clock
+(light 06:00-19:59). `clients/tui/src/hn_rerank/app.py` now defines
+`DARK_PALETTE`/`LIGHT_PALETTE`, registers `editorial` and `editorial-light`
+Textual themes that expose each palette as `$hn-*` CSS variables, and replaces
+hardcoded CSS hex with those variables. Rich-styled text (headlines, heading,
+footer counts) reads the module `PALETTE`, and `Reader.restyle()` re-renders it
+on every theme change. `apply_clock_theme` runs at startup and every 60s. It
+only switches when the clock's pick changes, so a manual palette choice holds
+until the next boundary. Tests pin the dark theme via an autouse fixture and add
+switch coverage.
+
 ## 2026-09-25 Terminal client CI: lint and type fixes, prefetch guard bug
 
 `.github/workflows/tui.yml` copies `clients/tui` outside the workspace, and

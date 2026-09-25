@@ -56,6 +56,93 @@ from .models import Feed, FeedStory
 
 DEFAULT_SERVER = "https://ubuntu-8gb-nbg1-1.tailca4726.ts.net:8443/hn/"
 
+DARK_PALETTE: dict[str, str] = {
+    "bg": "#171717",
+    "fg": "#EEE8DD",
+    "title-dim": "#D2CCC1",
+    "soft": "#C6C1B8",
+    "muted": "#AAA399",
+    "faint": "#8F897F",
+    "sep": "#6B655D",
+    "accent": "#FF914D",
+    "link": "#8AB4F8",
+    "good": "#A8C7A0",
+    "warn": "#E5C07B",
+    "bad": "#FFB4A6",
+    "surface": "#222222",
+    "panel": "#292724",
+    "bar": "#1D1C1A",
+    "modal": "#1C1B19",
+    "button-focus": "#2E2B27",
+    "border": "#44403B",
+    "rule": "#2A2825",
+    "select-bg": "#5A3A12",
+    "select-fg": "#FFFFFF",
+    "overlay": "rgba(14,14,14,0.7)",
+}
+LIGHT_PALETTE: dict[str, str] = {
+    "bg": "#FAF7F2",
+    "fg": "#1F1D1A",
+    "title-dim": "#3A3631",
+    "soft": "#4A453F",
+    "muted": "#5F5850",
+    "faint": "#7A7369",
+    "sep": "#A8A195",
+    "accent": "#C4520F",
+    "link": "#1F5FBF",
+    "good": "#2E7D32",
+    "warn": "#9A6700",
+    "bad": "#B3261E",
+    "surface": "#F0EBE3",
+    "panel": "#E8E2D8",
+    "bar": "#F2EDE5",
+    "modal": "#F2EDE5",
+    "button-focus": "#E0D8CB",
+    "border": "#CFC7BA",
+    "rule": "#E3DDD3",
+    "select-bg": "#F6DCC4",
+    "select-fg": "#1F1D1A",
+    "overlay": "rgba(60,50,40,0.35)",
+}
+PALETTES: dict[str, dict[str, str]] = {
+    "editorial": DARK_PALETTE,
+    "editorial-light": LIGHT_PALETTE,
+}
+# Rich Text styles are baked at render time, so they read the active palette.
+PALETTE: dict[str, str] = dict(DARK_PALETTE)
+LIGHT_HOURS = range(6, 20)  # Local 06:00-19:59 uses the light theme.
+
+
+def theme_for_hour(hour: int) -> str:
+    return "editorial-light" if hour in LIGHT_HOURS else "editorial"
+
+
+def editorial_theme(name: str) -> Theme:
+    p = PALETTES[name]
+    return Theme(
+        name=name,
+        primary=p["muted"],
+        secondary=p["muted"],
+        accent=p["accent"],
+        foreground=p["fg"],
+        background=p["bg"],
+        surface=p["surface"],
+        panel=p["panel"],
+        error=p["bad"],
+        success=p["good"],
+        warning=p["warn"],
+        dark=p is DARK_PALETTE,
+        variables={
+            "scrollbar": p["border"],
+            "scrollbar-hover": p["sep"],
+            "scrollbar-active": p["accent"],
+            "scrollbar-background": p["bar"],
+            "scrollbar-background-hover": p["bar"],
+            "scrollbar-background-active": p["bar"],
+            **{f"hn-{key}": value for key, value in p.items()},
+        },
+    )
+
 
 def open_in_firefox(url: str) -> None:
     """Open a URL in the running Firefox window, launching one if needed."""
@@ -211,11 +298,14 @@ def headline(
     """
     text = Text()
     if selected is not None:
-        text.append("> " if selected else "  ", style="bold #FF914D")
+        text.append("> " if selected else "  ", style=f"bold {PALETTE['accent']}")
     if story.badges:
         text.append(" ".join(story.badges) + " ")
     text.append(
-        story.title, style="bold #EEE8DD" if selected is not False else "#D2CCC1"
+        story.title,
+        style=f"bold {PALETTE['fg']}"
+        if selected is not False
+        else PALETTE["title-dim"],
     )
     text.append("\n")
     domain = headline_domain(story)
@@ -223,23 +313,23 @@ def headline(
         domain = domain[: widths[0] - 1] + "…" if widths[0] > 1 else "…"
     elif widths[0]:
         domain = _pad_cells(domain, widths[0])
-    text.append(domain, style="#8AB4F8")
+    text.append(domain, style=PALETTE["link"])
     points = headline_points(story)
     if points or widths[1]:
-        text.append(" · ", style="#6B655D")
+        text.append(" · ", style=PALETTE["sep"])
         text.append(
             _pad_cells(points, widths[1]) if widths[1] else points,
-            style="#A8C7A0",
+            style=PALETTE["good"],
         )
     comments = f"💬 {story.comments or 0}"
     age = story_age(story)
-    text.append(" · ", style="#6B655D")
+    text.append(" · ", style=PALETTE["sep"])
     if age and widths[2]:
         comments = _pad_cells(comments, widths[2])
-    text.append(comments, style="#C6C1B8")
+    text.append(comments, style=PALETTE["soft"])
     if age:
-        text.append(" · ", style="#6B655D")
-        text.append(age, style="#8F897F")
+        text.append(" · ", style=PALETTE["sep"])
+        text.append(age, style=PALETTE["faint"])
     return text
 
 
@@ -265,19 +355,19 @@ class Summary(Markdown):
 
 class Setup(ModalScreen[Profile | None]):
     CSS = """
-    Setup { align: center middle; background: rgba(14,14,14,0.7); color: #EEE8DD; }
+    Setup { align: center middle; background: $hn-overlay; color: $hn-fg; }
     #setup { width: 70; max-width: 95%; height: auto; max-height: 100%;
-             overflow-y: auto; padding: 1 2; background: #1C1B19;
-             border: round #44403B; }
+             overflow-y: auto; padding: 1 2; background: $hn-modal;
+             border: round $hn-border; }
     #setup-title { text-style: bold; }
-    #setup-message { height: auto; margin: 1 0; color: #AAA399; }
-    #setup-message.error { color: #FFB4A6; }
+    #setup-message { height: auto; margin: 1 0; color: $hn-muted; }
+    #setup-message.error { color: $hn-bad; }
     .setup-section { margin-top: 1; text-style: bold; }
-    Setup Input { margin: 0 0 1 0; background: #222222; border: tall #44403B; }
-    Setup Input:focus { border: tall #FF914D; }
-    Setup Button { width: 1fr; background: #292724; color: #EEE8DD; border: none; }
-    Setup Button:focus { background: #2E2B27; color: #FF914D; text-style: bold; }
-    #quit { margin-top: 1; background: #1C1B19; color: #AAA399; }
+    Setup Input { margin: 0 0 1 0; background: $hn-surface; border: tall $hn-border; }
+    Setup Input:focus { border: tall $hn-accent; }
+    Setup Button { width: 1fr; background: $hn-panel; color: $hn-fg; border: none; }
+    Setup Button:focus { background: $hn-button-focus; color: $hn-accent; text-style: bold; }
+    #quit { margin-top: 1; background: $hn-modal; color: $hn-muted; }
     """
 
     def __init__(
@@ -376,65 +466,65 @@ class Setup(ModalScreen[Profile | None]):
 class Reader(App[None]):
     TITLE = "HN Rerank"
     CSS = """
-    Screen { background: #171717; color: #EEE8DD; }
+    Screen { background: $hn-bg; color: $hn-fg; }
     #filters { height: 2; align-vertical: top; }
     Select { width: auto; height: auto; display: none; }
-    .filter-caption { width: auto; height: 1; padding: 0 1 0 2; color: #8F897F; display: none; }
+    .filter-caption { width: auto; height: 1; padding: 0 1 0 2; color: $hn-faint; display: none; }
     .narrow .filter-caption { display: block; }
     SelectCurrent { background: transparent; border: none; height: 1; width: auto; padding: 0 2; }
     SelectCurrent .arrow { padding: 0 1 0 0; }
     SelectCurrent Static#label { width: auto; }
-    Select:focus-within > SelectCurrent { background: #FF914D; }
-    Select:focus-within Static#label { color: #171717; }
-    Select:focus-within .arrow { color: #171717; }
+    Select:focus-within > SelectCurrent { background: $hn-accent; }
+    Select:focus-within Static#label { color: $hn-bg; }
+    Select:focus-within .arrow { color: $hn-bg; }
     .narrow #filters { height: 1; }
     Tabs { width: auto; }
     #sort-tabs { width: 58; }
     #age-tabs { width: 20; }
-    Tab { color: #AAA399; padding: 0 1; }
-    Tab.-active { color: #FF914D; text-style: bold; }
+    Tab { color: $hn-muted; padding: 0 1; }
+    Tab.-active { color: $hn-accent; text-style: bold; }
     Tabs:focus Tab.-active { text-style: bold underline; }
-    Underline > .underline--bar { color: #FF914D; background: #171717; }
+    Underline > .underline--bar { color: $hn-accent; background: $hn-bg; }
     #panes { height: 1fr; }
-    #headlines { width: 1fr; height: 1fr; background: #171717;
-                 border: solid #171717; padding: 0; }
-    #headlines:focus { border: solid #FF914D; }
+    #headlines { width: 1fr; height: 1fr; background: $hn-bg;
+                 border: solid $hn-bg; padding: 0; }
+    #headlines:focus { border: solid $hn-accent; }
     #headlines > .option-list--option { padding: 0 1; }
     #headlines > .option-list--option-highlighted {
-        background: #5A3A12; color: #FFFFFF; text-style: bold;
+        background: $hn-select-bg; color: $hn-select-fg; text-style: bold;
     }
     #headlines:focus > .option-list--option-highlighted { text-style: none;
-        border-left: solid #FF914D; }
-    #reading-pane { width: 2fr; height: 1fr; border-left: solid #44403B;
+        border-left: solid $hn-accent; }
+    #reading-pane { width: 2fr; height: 1fr; border-left: solid $hn-border;
                     max-width: 100; }
-    #reading-pane.has-story:focus-within { border-left: solid #FF914D; }
+    #reading-pane.has-story:focus-within { border-left: solid $hn-accent; }
     #story-heading { height: auto; max-height: 6; padding: 0 1;
-                     border-bottom: solid #2A2825; }
+                     border-bottom: solid $hn-rule; }
     #summary { width: 1fr; height: 1fr; padding: 0 2; overflow-y: auto;
-               background: #171717; color: #EEE8DD; }
+               background: $hn-bg; color: $hn-fg; }
     MarkdownH1, MarkdownH2, MarkdownH3, MarkdownH4, MarkdownH5, MarkdownH6 {
         margin: 1 0 0 0; padding: 0;
-        border: none; background: #171717; color: #EEE8DD; text-style: bold;
+        border: none; background: $hn-bg; color: $hn-fg; text-style: bold;
         content-align: left top; }
     MarkdownParagraph, MarkdownBulletList, MarkdownOrderedList { margin: 0; }
-    MarkdownBlockQuote { border-left: solid #AAA399; background: #222222; margin: 0 0 1 0; }
-    MarkdownFence { background: #222222; margin: 0 0 1 0; padding: 1; }
-    #summary MarkdownBlock > .strong { color: #FF914D; text-style: bold; }
-    #summary MarkdownBlock > .em { color: #FF914D; }
-    #footer { dock: bottom; layout: vertical; height: auto; background: #1D1C1A;
-              border-top: solid #2A2825; }
-    #status { width: 1fr; height: auto; max-height: 3; padding: 0 1; color: #AAA399; }
-    #status.context { color: #C6C1B8; }
-    #status.error { color: #FFB4A6; text-style: bold; }
-    #shortcuts { width: 1fr; height: auto; padding: 0 1; color: #8F897F; }
+    MarkdownBlockQuote { border-left: solid $hn-muted; background: $hn-surface; margin: 0 0 1 0; }
+    MarkdownFence { background: $hn-surface; margin: 0 0 1 0; padding: 1; }
+    #summary MarkdownBlock > .strong { color: $hn-accent; text-style: bold; }
+    #summary MarkdownBlock > .em { color: $hn-accent; }
+    #footer { dock: bottom; layout: vertical; height: auto; background: $hn-bar;
+              border-top: solid $hn-rule; }
+    #status { width: 1fr; height: auto; max-height: 3; padding: 0 1; color: $hn-muted; }
+    #status.context { color: $hn-soft; }
+    #status.error { color: $hn-bad; text-style: bold; }
+    #shortcuts { width: 1fr; height: auto; padding: 0 1; color: $hn-faint; }
     .narrow Tabs { display: none; }
     .narrow Select { display: block; }
     .narrow #panes { layout: vertical; }
     .narrow #headlines { width: 1fr; height: 1fr; }
     .narrow #reading-pane { width: 1fr; height: 3fr; border-left: none;
-                            border-top: solid #44403B; }
+                            border-top: solid $hn-border; }
     /* The wide focus rule outranks `.narrow #reading-pane`; cancel its left edge. */
-    .narrow #reading-pane.has-story:focus-within { border-top: solid #FF914D;
+    .narrow #reading-pane.has-story:focus-within { border-top: solid $hn-accent;
                                                    border-left: none; }
     .reading #headlines { display: none; }
     .reading #panes { align-horizontal: center; }
@@ -469,31 +559,10 @@ class Reader(App[None]):
         prefetch_generate: int = DEFAULT_PREFETCH_GENERATE,
     ) -> None:
         super().__init__()
-        self.register_theme(
-            Theme(
-                name="editorial",
-                primary="#AAA399",
-                secondary="#AAA399",
-                accent="#FF914D",
-                foreground="#EEE8DD",
-                background="#171717",
-                surface="#222222",
-                panel="#292724",
-                error="#FFB4A6",
-                success="#A8C7A0",
-                warning="#E5C07B",
-                dark=True,
-                variables={
-                    "scrollbar": "#44403B",
-                    "scrollbar-hover": "#6B655D",
-                    "scrollbar-active": "#FF914D",
-                    "scrollbar-background": "#1D1C1A",
-                    "scrollbar-background-hover": "#1D1C1A",
-                    "scrollbar-background-active": "#1D1C1A",
-                },
-            )
-        )
-        self.theme = "editorial"
+        for name in PALETTES:
+            self.register_theme(editorial_theme(name))
+        self.clock_theme = ""
+        self.apply_clock_theme()
         self.explicit_server = normalize_server(server) if server else None
         self.server = self.explicit_server or DEFAULT_SERVER
         self.config_path = config_path or profile_path()
@@ -576,8 +645,36 @@ class Reader(App[None]):
         self.layout_panes()
         self.set_interval(1.0, self.refresh_read_state)
         self.set_interval(60.0, self.poll_feed_version)
+        self.set_interval(60.0, self.apply_clock_theme)
+        self.theme_changed_signal.subscribe(self, lambda _theme: self.restyle())
         self.query_one("#headlines", OptionList).focus()
         self.start()
+
+    def apply_clock_theme(self) -> None:
+        """Follow the local clock, but only when the clock's pick changes, so a
+        theme chosen from the command palette holds until the next boundary."""
+        name = theme_for_hour(time.localtime().tm_hour)
+        if name == self.clock_theme:
+            return
+        self.clock_theme = name
+        self.theme = name
+        PALETTE.update(PALETTES[name])
+
+    def restyle(self) -> None:
+        """Re-render Rich-styled text (headlines, heading, counts) in the
+        palette of the current theme; CSS-styled widgets follow on their own."""
+        PALETTE.update(PALETTES.get(self.theme, DARK_PALETTE))
+        if not self.query("#headlines"):
+            return
+        headlines = self.query_one("#headlines", OptionList)
+        widths = self._row_widths or (0, 0, 0)
+        for story in self.stories:
+            headlines.replace_option_prompt(
+                str(story.id), headline(story, story.id == self._marked_id, widths)
+            )
+        if selected := self.selected():
+            self.query_one("#story-heading", Static).update(headline(selected))
+        self.context_status()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         if self.setting_up or isinstance(self.focused, Input):
@@ -620,16 +717,16 @@ class Reader(App[None]):
             return
         counts = self.feed.feedback_counts if self.feed else {}
         line = Text()
-        line.append(f"{len(self.stories)} shown", style="#C6C1B8")
-        line.append(" · ", style="#6B655D")
-        line.append(f"+{counts.get('up', 0)}", style="#A8C7A0")
-        line.append(" ", style="#6B655D")
-        line.append(f"~{counts.get('neutral', 0)}", style="#E5C07B")
-        line.append(" ", style="#6B655D")
-        line.append(f"−{counts.get('down', 0)}", style="#FFB4A6")
+        line.append(f"{len(self.stories)} shown", style=PALETTE["soft"])
+        line.append(" · ", style=PALETTE["sep"])
+        line.append(f"+{counts.get('up', 0)}", style=PALETTE["good"])
+        line.append(" ", style=PALETTE["sep"])
+        line.append(f"~{counts.get('neutral', 0)}", style=PALETTE["warn"])
+        line.append(" ", style=PALETTE["sep"])
+        line.append(f"−{counts.get('down', 0)}", style=PALETTE["bad"])
         if self.reverse_sort:
-            line.append(" · ", style="#6B655D")
-            line.append("reversed", style="#E5C07B")
+            line.append(" · ", style=PALETTE["sep"])
+            line.append("reversed", style=PALETTE["warn"])
         widget = self.query_one("#status", Static)
         widget.update(line)
         widget.set_class(False, "error")
