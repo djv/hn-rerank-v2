@@ -10,7 +10,7 @@ from email.utils import formatdate
 from numpy.typing import NDArray
 from pathlib import Path
 from types import SimpleNamespace
-from hypothesis import given, strategies as st, settings, HealthCheck
+from hypothesis import HealthCheck, example, given, settings, strategies as st
 from collections.abc import Iterator
 
 from database import Database, HnDupeResolution, Story
@@ -160,6 +160,9 @@ def _date_deck(
     ),
     voted_mask=st.lists(st.booleans(), max_size=60),
 )
+# Story times are whole seconds: a hair over 7 days truncates onto the cutoff,
+# which is inside the window (time >= cutoff).
+@example(stories=[(7.0000000001, 1.0)], voted_mask=[])
 def test_date_view_is_top_scores_of_last_week_newest_first(
     stories: list[tuple[float, float]], voted_mask: list[bool]
 ) -> None:
@@ -172,12 +175,13 @@ def test_date_view_is_top_scores_of_last_week_newest_first(
         (
             (score, i + 1)
             for i, (age, score) in enumerate(stories)
-            if age < ranking.DATE_WINDOW_DAYS and i + 1 not in voted
+            if int(age * 86400) <= ranking.DATE_WINDOW_DAYS * 86400
+            and i + 1 not in voted
         ),
         reverse=True,
     )[: ranking.DATE_LIMIT]
     assert set(dated) == {sid for _, sid in eligible}
-    ages = {i + 1: age for i, (age, _) in enumerate(stories)}
+    ages = {i + 1: int(age * 86400) for i, (age, _) in enumerate(stories)}
     assert [ages[sid] for sid in dated] == sorted(ages[sid] for sid in dated)
     assert {r.story.id for r in final if r.is_date_pick} == set(dated)
 
@@ -7956,7 +7960,7 @@ def policy_db(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Database]:
     db.close()
 
 
-@settings(max_examples=60)
+@settings(max_examples=60, deadline=None)  # real SQLite commits per example
 @given(
     errors=st.lists(
         st.sampled_from(["empty_extraction", "http_403", "http_500", "timeout"]),
