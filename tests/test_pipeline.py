@@ -60,9 +60,10 @@ def db():
     db_instance.close()
 
 
-def test_feed_caps_recommended_and_date_and_drops_unused_cards() -> None:
-    """Recommended/Date carry at most RECOMMENDED_LIMIT per age (top by
-    score); cards in no view never reach the client, badge cards stay."""
+def test_feed_caps_recommended_and_drops_unused_cards() -> None:
+    """Recommended carries at most RECOMMENDED_LIMIT per age (top by score);
+    cards in no view never reach the client, badge cards stay, and Date
+    lists every sent card newest first."""
     from pipeline import render
 
     limit = render.RECOMMENDED_LIMIT
@@ -92,7 +93,7 @@ def test_feed_caps_recommended_and_date_and_drops_unused_cards() -> None:
 
     top_ids = set(range(limit))
     assert set(feed.orders["recommended:recent"]) == top_ids
-    assert set(feed.orders["date:recent"]) == top_ids
+    assert feed.orders["date:recent"] == sorted(top_ids | {999}, reverse=True)
     assert feed.orders["popular:recent"] == [999]
     assert {s.id for s in feed.stories} == top_ids | {999}
 

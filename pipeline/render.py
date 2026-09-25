@@ -18,9 +18,9 @@ from .config import (
 )
 from .ranking import RankedStory
 
-# Recommended/Date show at most this many cards per age (top by score);
+# Recommended shows at most this many cards per age (top by score);
 # Popular and Explore keep their own badge quotas. Cards in no view are
-# dropped so the server sends a short deck.
+# dropped so the server sends a short deck; Date covers all sent cards.
 RECOMMENDED_LIMIT = 24
 
 
@@ -403,7 +403,9 @@ def prepare_feed(
                 if f"{age}_mixed" in s.memberships
                 and (sort != "popular" or s.popular)
                 and (sort != "explore" or s.explore)
-                and (sort not in ("recommended", "date") or s.id in recommended_ids)
+                # Date spans every card sent for this age (newest first), not
+                # just Recommended, so fresh Popular/Explore stories surface.
+                and (sort != "recommended" or s.id in recommended_ids)
             ]
             selected.sort(
                 key=lambda s: s.time if sort == "date" else s.rank_score, reverse=True

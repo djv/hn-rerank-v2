@@ -1,5 +1,15 @@
 # Worklog: hn-rewrite
 
+## 2026-09-25 Date sort shows the newest sent cards
+
+User-reported: Date looked oldest-first. The order was descending, but since
+`5d3375b` Date only held the Recommended top-24 re-sorted by time. Live
+`/api/feed` had 4 recent stories aged 1-4h (Popular/Explore only) while the
+newest Date card was 6.4 days old. `prepare_feed` now builds `date:*` from
+every sent card in the age combo (still newest first), and the web
+`matchesCurrentAxes` no longer filters Date by `data-sort-recommended`.
+Recommended keeps its 24 cap; the sent pool is already bounded (~45/age).
+
 ## 2026-09-25 TUI: clock-based light/dark theme
 
 The user asked for a light TUI theme, switched automatically by the local clock

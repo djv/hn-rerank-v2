@@ -1097,8 +1097,7 @@
     function matchesCurrentAxes(card) {
       if (currentSort === 'popular' && card.dataset.sortPopular !== '1') return false;
       if (currentSort === 'explore' && card.dataset.sortExplore !== '1') return false;
-      if ((currentSort === 'recommended' || currentSort === 'date')
-          && card.dataset.sortRecommended === '0') return false;
+      if (currentSort === 'recommended' && card.dataset.sortRecommended === '0') return false;
       return true;
     }
 
