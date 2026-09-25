@@ -20,7 +20,8 @@ from .ranking import RankedStory
 
 # Recommended shows at most this many cards per age (top by score);
 # Popular and Explore keep their own badge quotas. Cards in no view are
-# dropped so the server sends a short deck; Date covers all sent cards.
+# dropped so the server sends a short deck; Date covers all sent cards,
+# including the ranking's Date-only time-coverage picks.
 RECOMMENDED_LIMIT = 24
 
 
@@ -261,7 +262,11 @@ def _build_dashboard_cards(
 ) -> list[DashboardCardView]:
     recommended_ids: set[int] = set()
     for age in ("recent", "archive"):
-        in_age = [r for r in ranked if f"{age}_mixed" in r.combo_keys.split()]
+        in_age = [
+            r
+            for r in ranked
+            if f"{age}_mixed" in r.combo_keys.split() and not r.is_date_only
+        ]
         in_age.sort(key=lambda r: r.score, reverse=True)
         recommended_ids.update(r.story.id for r in in_age[:RECOMMENDED_LIMIT])
     # Cards outside any age deck (no *_mixed key) aren't subject to the cap.
@@ -270,6 +275,7 @@ def _build_dashboard_cards(
         for r in ranked
         if not any(key.endswith("_mixed") for key in r.combo_keys.split())
     )
+    date_only_ids = {r.story.id for r in ranked if r.is_date_only}
     cards: list[DashboardCardView] = []
     for position, item in enumerate(ranked):
         story = item.story
@@ -309,7 +315,8 @@ def _build_dashboard_cards(
     return [
         c
         for c in cards
-        if "1" in (c.sort_recommended_attr, c.sort_popular_attr, c.sort_explore_attr)
+        if c.story.id in date_only_ids
+        or "1" in (c.sort_recommended_attr, c.sort_popular_attr, c.sort_explore_attr)
     ]
 
 

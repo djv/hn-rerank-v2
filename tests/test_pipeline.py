@@ -98,6 +98,102 @@ def test_feed_caps_recommended_and_drops_unused_cards() -> None:
     assert {s.id for s in feed.stories} == top_ids | {999}
 
 
+@settings(max_examples=100)
+@given(
+    times=st.lists(st.integers(0, 10_000), min_size=0, max_size=80),
+    slices=st.integers(1, 30),
+    seed=st.integers(0, 2**32 - 1),
+)
+def test_time_stratified_picks_best_per_equal_count_slice(
+    times: list[int], slices: int, seed: int
+) -> None:
+    """One pick per equal-count time slice, the slice's best score, so the
+    picks span the pool's whole time range whatever its density."""
+    rng = np.random.default_rng(seed)
+    pool = [
+        RankedStory(
+            story=Story(id=i, title="", url=None, score=1, time=t, text_content=""),
+            score=float(rng.random()),
+            best_match_title="",
+        )
+        for i, t in enumerate(times)
+    ]
+    picks = ranking.time_stratified_picks(pool, slices)
+
+    assert len(picks) == min(slices, len(pool))
+    by_time = sorted(pool, key=lambda r: r.story.time, reverse=True)
+    for pick, chunk in zip(
+        picks,
+        np.array_split(np.arange(len(by_time)), max(1, min(slices, len(by_time)))),
+        strict=False,
+    ):
+        assert pick.score == max(by_time[i].score for i in chunk)
+
+
+def test_time_stratified_picks_skips_to_next_best_in_slice() -> None:
+    pool = [
+        RankedStory(
+            story=Story(id=i, title="", url=None, score=1, time=i, text_content=""),
+            score=float(i),
+            best_match_title="",
+        )
+        for i in range(4)
+    ]
+    picks = ranking.time_stratified_picks(pool, 1, skip=lambda s: s.id == 3)
+    assert [r.story.id for r in picks] == [2]
+
+
+def test_date_view_covers_the_window_when_top_scores_cluster_in_time() -> None:
+    """Regression: every high-scoring story was old, so Date (a re-sort of
+    score-picked cards) jumped from hours-old to days-old stories. Date-only
+    time-slice picks fill the gap without entering the other views."""
+    from pipeline import render
+
+    now = int(time.time())
+    day = 86400
+    recent_cutoff = now - 30 * day
+    # 300 stories over 30 days; score rises with age, so score-only picks
+    # are all ~30 days old.
+    stories = [
+        Story(
+            id=i,
+            title=f"Story {i}",
+            url=None,
+            score=10,
+            time=now - i * 8640,
+            text_content="",
+            source="hn",
+        )
+        for i in range(300)
+    ]
+    ranked = [
+        RankedStory(story=s, score=float(s.id), best_match_title="") for s in stories
+    ]
+    zeros = np.zeros(len(stories), dtype=np.float32)
+    final = ranking._assemble_combo_deck(
+        ranked,
+        config=Config(count=40),
+        recent_cutoff=recent_cutoff,
+        cand_scores=zeros,
+        cand_velocities=zeros,
+        idx_for=lambda sid: sid,
+        embeddings_map=None,
+        explore=None,
+    )
+    cards = render._build_dashboard_cards(final, hot_badge_percentile=99)
+    feed = render.prepare_feed(cards, {}, 1, 1)
+
+    times = {s.id: s.time for s in feed.stories}
+    dated = [times[sid] for sid in feed.orders["date:recent"]]
+    assert dated == sorted(dated, reverse=True)
+    assert now - dated[0] < 2 * day
+    assert max(a - b for a, b in zip(dated, dated[1:], strict=False)) < 3 * day
+    date_only = {r.story.id for r in final if r.is_date_only}
+    assert date_only
+    for view in ("recommended", "popular", "explore"):
+        assert not date_only & set(feed.orders[f"{view}:recent"])
+
+
 def test_dashboard_polish_renders_domain_legend_and_queue_status(
     db: Database,
 ) -> None:
