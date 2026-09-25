@@ -18,6 +18,11 @@ from .config import (
 )
 from .ranking import RankedStory
 
+# Recommended/Date show at most this many cards per age (top by score);
+# Popular and Explore keep their own badge quotas. Cards in no view are
+# dropped so the server sends a short deck.
+RECOMMENDED_LIMIT = 24
+
 
 @dataclass(frozen=True)
 class BadgeView:
@@ -67,6 +72,7 @@ class DashboardCardView:
     is_hn_attr: str
     sort_popular_attr: str
     sort_explore_attr: str
+    sort_recommended_attr: str
     is_recent_attr: str
     article_url: str
     comments_url: str
@@ -253,6 +259,17 @@ def _build_badges(
 def _build_dashboard_cards(
     ranked: list[RankedStory], *, hot_badge_percentile: int
 ) -> list[DashboardCardView]:
+    recommended_ids: set[int] = set()
+    for age in ("recent", "archive"):
+        in_age = [r for r in ranked if f"{age}_mixed" in r.combo_keys.split()]
+        in_age.sort(key=lambda r: r.score, reverse=True)
+        recommended_ids.update(r.story.id for r in in_age[:RECOMMENDED_LIMIT])
+    # Cards outside any age deck (no *_mixed key) aren't subject to the cap.
+    recommended_ids.update(
+        r.story.id
+        for r in ranked
+        if not any(key.endswith("_mixed") for key in r.combo_keys.split())
+    )
     cards: list[DashboardCardView] = []
     for position, item in enumerate(ranked):
         story = item.story
@@ -276,6 +293,9 @@ def _build_dashboard_cards(
                     if item.is_uncertain or item.is_similar or item.is_novel
                     else "0"
                 ),
+                sort_recommended_attr=(
+                    "1" if item.story.id in recommended_ids else "0"
+                ),
                 is_recent_attr="1" if item.is_recent else "0",
                 article_url=story.url or "",
                 comments_url=story.discussion_url or "",
@@ -286,7 +306,11 @@ def _build_dashboard_cards(
                 show_score=story.score > 0,
             )
         )
-    return cards
+    return [
+        c
+        for c in cards
+        if "1" in (c.sort_recommended_attr, c.sort_popular_attr, c.sort_explore_attr)
+    ]
 
 
 def _build_tab_groups() -> tuple[TabGroupView, ...]:
@@ -369,6 +393,7 @@ def prepare_feed(
         )
         for c in cards
     ]
+    recommended_ids = {c.story.id for c in cards if c.sort_recommended_attr == "1"}
     orders: dict[str, list[int]] = {}
     for age in ("recent", "archive"):
         for sort in ("recommended", "popular", "explore", "date"):
@@ -378,6 +403,7 @@ def prepare_feed(
                 if f"{age}_mixed" in s.memberships
                 and (sort != "popular" or s.popular)
                 and (sort != "explore" or s.explore)
+                and (sort not in ("recommended", "date") or s.id in recommended_ids)
             ]
             selected.sort(
                 key=lambda s: s.time if sort == "date" else s.rank_score, reverse=True

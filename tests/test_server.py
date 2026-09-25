@@ -6518,7 +6518,10 @@ def test_refill_uses_feed_json_and_safe_dom_text() -> None:
     _, script = _read_template_and_static()
     assert "fetch('/api/feed', { cache: 'no-store' })" in script
     assert "const incoming = await fetchRefillCards();" in script
-    assert "feed.stories.map(story => feedCard(story, feed.version))" in script
+    assert (
+        "feed.stories.map(story => feedCard(story, feed.version, "
+        "recommended.has(story.id)))"
+    ) in script
     assert "link.textContent = story.title;" in script
     assert (
         "reason.textContent = `Because you upvoted: ${story.best_match_title}`;"

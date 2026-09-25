@@ -283,7 +283,14 @@ PRIMARY_PER_COMBO = 12
 # (2026-09-25): a 73-card recent deck was too much to load on the client.
 PRIMARY_RECENT_NONHN = 10
 PRIMARY_ARCHIVE_HN = 16
-DISCOVERY_PER_BADGE = 3
+# Popular (Hot/Top/Talk) shares one budget per HN combo so the tab stays
+# above ~10 cards even in archive, where Hot never fires: recent splits
+# 4/4/4, archive 0/6/6. Explore is capped per badge; non-HN gets fewer
+# slots because recent_hn and recent_non-hn both feed the recent Explore
+# tab (2*3 + 1*3 = 9 recent, 2*3 = 6 archive).
+POPULAR_PER_COMBO = 12
+EXPLORE_PER_BADGE = 2
+EXPLORE_PER_BADGE_NONHN = 1
 SOURCE_CATEGORIES: tuple[str, ...] = ("hn_live", "archive", "reddit", "rss")
 
 
@@ -1683,8 +1690,9 @@ def _assemble_combo_deck(
     # archive_hn (a fourth, archive_nonhn, is structurally always empty —
     # see the PRIMARY_RECENT_NONHN/PRIMARY_ARCHIVE_HN comment above — and
     # has been retired). Each combo gets its own primary quota (MMR if
-    # enabled, otherwise top-score), plus DISCOVERY_PER_BADGE cards for each
-    # of Hot/Top/Talk (Popular, HN only) and Unsure/Novel/Similar (Explore).
+    # enabled, otherwise top-score), plus up to POPULAR_PER_COMBO cards split
+    # across Hot/Top/Talk (Popular, HN only) and EXPLORE_PER_BADGE (or
+    # EXPLORE_PER_BADGE_NONHN) cards for each of Unsure/Novel/Similar (Explore).
     #
     # Cards carry space-separated combo_keys so the client can filter by
     # age+source without computing offsets (e.g. "recent_hn recent_mixed").
@@ -1760,32 +1768,33 @@ def _assemble_combo_deck(
                 if r.story.score >= HOT_MIN_SCORE
                 and cand_velocities[idx_for(r.story.id)] >= hot_threshold
             ]
-            if hot_pool:
-                hot_pool.sort(key=_hot_sort_key, reverse=True)
-                for r in hot_pool[:DISCOVERY_PER_BADGE]:
-                    existing = next(
-                        (i for i, f in enumerate(final) if f.story.id == r.story.id),
-                        None,
+            hot_pool.sort(key=_hot_sort_key, reverse=True)
+            hot_picks = hot_pool[: POPULAR_PER_COMBO // 3]
+            n_hot = len(hot_picks)
+            for r in hot_picks:
+                existing = next(
+                    (i for i, f in enumerate(final) if f.story.id == r.story.id),
+                    None,
+                )
+                new_r = replace(r, is_hot=True, combo_keys=f"{source_key} {mixed_key}")
+                if existing is not None:
+                    final[existing] = replace(
+                        final[existing],
+                        is_hot=True,
+                        combo_keys=f"{source_key} {mixed_key}",
                     )
-                    new_r = replace(
-                        r, is_hot=True, combo_keys=f"{source_key} {mixed_key}"
-                    )
-                    if existing is not None:
-                        final[existing] = replace(
-                            final[existing],
-                            is_hot=True,
-                            combo_keys=f"{source_key} {mixed_key}",
-                        )
-                    else:
-                        final.append(new_r)
+                else:
+                    final.append(new_r)
 
-            # Top: full combo_pool minus Hot picks, sorted by engagement score
+            # Top: full combo_pool minus Hot picks, sorted by engagement score.
+            # Top and Talk split whatever Popular budget Hot left unused.
+            top_limit = (POPULAR_PER_COMBO - n_hot + 1) // 2
             hot_and_primary = {r.story.id for r in final if r.is_hot} | primary_ids
             top_pool = sorted(
                 [r for r in combo_pool if r.story.id not in hot_and_primary],
                 key=_engagement_sort_key,
                 reverse=True,
-            )[:DISCOVERY_PER_BADGE]
+            )[:top_limit]
             for r in top_pool:
                 final.append(
                     replace(
@@ -1806,7 +1815,7 @@ def _assemble_combo_deck(
                 ],
                 key=_discussion_sort_key,
                 reverse=True,
-            )[:DISCOVERY_PER_BADGE]
+            )[: POPULAR_PER_COMBO - n_hot - len(top_pool)]
             for r in talk_pool:
                 final.append(
                     replace(
@@ -1822,6 +1831,9 @@ def _assemble_combo_deck(
         # old parallel-pass design. Within Explore, Unsure/Novel/Similar
         # are serial (mutually exclusive) to keep the badge mix varied.
         if explore is not None:
+            explore_per_badge = (
+                EXPLORE_PER_BADGE if source == "hn" else EXPLORE_PER_BADGE_NONHN
+            )
             explore_pool = [r for r in combo_pool if r.story.id not in primary_ids]
             explore_picked = set[int]()  # only track Explore picks, not Popular
 
@@ -1853,7 +1865,7 @@ def _assemble_combo_deck(
                     key=_entropy_sort_key,
                     reverse=True,
                 ),
-                DISCOVERY_PER_BADGE,
+                explore_per_badge,
             )
             for r in unsure_items:
                 _merge_or_append(r, is_uncertain=True)
@@ -1865,7 +1877,7 @@ def _assemble_combo_deck(
                     key=_novel_sort_key,
                     reverse=True,
                 ),
-                DISCOVERY_PER_BADGE,
+                explore_per_badge,
             )
             for r in novel_items:
                 _merge_or_append(r, is_novel=True)
@@ -1877,7 +1889,7 @@ def _assemble_combo_deck(
                     key=_similar_sort_key,
                     reverse=True,
                 ),
-                DISCOVERY_PER_BADGE,
+                explore_per_badge,
             )
             for r in similar_items:
                 _merge_or_append(r, is_similar=True)

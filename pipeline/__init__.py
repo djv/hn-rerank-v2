@@ -32,9 +32,11 @@ from .config import (
 from .ranking import (
     COMMENT_DEPTH_PENALTY,
     DASHBOARD_QUEUE_SIZE,
-    DISCOVERY_PER_BADGE,
+    EXPLORE_PER_BADGE,
+    EXPLORE_PER_BADGE_NONHN,
     Embedder,
     HOT_MIN_SCORE,
+    POPULAR_PER_COMBO,
     PRIMARY_PER_COMBO,
     RankScoreContext,
     RankTrace,

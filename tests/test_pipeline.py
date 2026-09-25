@@ -60,6 +60,43 @@ def db():
     db_instance.close()
 
 
+def test_feed_caps_recommended_and_date_and_drops_unused_cards() -> None:
+    """Recommended/Date carry at most RECOMMENDED_LIMIT per age (top by
+    score); cards in no view never reach the client, badge cards stay."""
+    from pipeline import render
+
+    limit = render.RECOMMENDED_LIMIT
+
+    def ranked(story_id: int, score: float, **flags: bool) -> RankedStory:
+        story = Story(
+            id=story_id,
+            title=f"Story {story_id}",
+            url=None,
+            score=10,
+            time=1600000000 + story_id,
+            text_content="",
+            source="hn",
+        )
+        return RankedStory(
+            story=story,
+            score=score,
+            best_match_title="",
+            combo_keys="recent_hn recent_mixed",
+            **flags,
+        )
+
+    items = [ranked(i, 100.0 - i) for i in range(limit + 5)]
+    items.append(ranked(999, -1.0, is_high_engagement=True))
+    cards = render._build_dashboard_cards(items, hot_badge_percentile=99)
+    feed = render.prepare_feed(cards, {}, 1, 1)
+
+    top_ids = set(range(limit))
+    assert set(feed.orders["recommended:recent"]) == top_ids
+    assert set(feed.orders["date:recent"]) == top_ids
+    assert feed.orders["popular:recent"] == [999]
+    assert {s.id for s in feed.stories} == top_ids | {999}
+
+
 def test_dashboard_polish_renders_domain_legend_and_queue_status(
     db: Database,
 ) -> None:
@@ -3470,7 +3507,7 @@ def test_novel_archive_pass_surfaces_archive_novel(
     The archive fillers outnumber PRIMARY_ARCHIVE_HN so Primary is fully
     saturated by fillers (higher score), leaving the low-score novel
     targets in the Explore pool; the novel pass then sorts by distance
-    (= 1 - sim) desc and takes the top DISCOVERY_PER_BADGE.
+    (= 1 - sim) desc and takes the top EXPLORE_PER_BADGE.
     """
     config = Config(count=40)
     user = db.create_user("test_novel_archive")
@@ -3489,11 +3526,11 @@ def test_novel_archive_pass_surfaces_archive_novel(
     db.upsert_feedback(user.id, 100, "up")
 
     now = int(time.time())
-    from pipeline import DISCOVERY_PER_BADGE
+    from pipeline import EXPLORE_PER_BADGE
     from pipeline.ranking import PRIMARY_ARCHIVE_HN
 
     n_archive_filler = PRIMARY_ARCHIVE_HN + 4
-    novel_sims = [round(0.05 + 0.05 * i, 2) for i in range(DISCOVERY_PER_BADGE + 1)]
+    novel_sims = [round(0.05 + 0.05 * i, 2) for i in range(EXPLORE_PER_BADGE + 1)]
 
     # Setup:
     #   12 recent primary (high score, sim 0.5) fill the primary ranked set.
@@ -3501,12 +3538,12 @@ def test_novel_archive_pass_surfaces_archive_novel(
     #     sim 0.5 too, so they don't qualify as novel, and there are more of
     #     them than PRIMARY_ARCHIVE_HN so Primary is saturated by fillers
     #     alone, none of the novel targets below leak into Primary.
-    #   DISCOVERY_PER_BADGE+1 archive novel targets (low score, sim 0.05..)
+    #   EXPLORE_PER_BADGE+1 archive novel targets (low score, sim 0.05..)
     #     — one more than the cap, so the worst can be asserted excluded.
     # Fillers outscore novel targets (200+ vs 5), so Primary picks the top
     # PRIMARY_ARCHIVE_HN fillers, leaving all novel targets (plus the filler
     # overflow) in the Explore pool; the novel pass there sorts by distance
-    # (= 1 - sim) desc and takes the top DISCOVERY_PER_BADGE.
+    # (= 1 - sim) desc and takes the top EXPLORE_PER_BADGE.
     candidates = []
     for i in range(12):
         candidates.append(
@@ -3567,17 +3604,17 @@ def test_novel_archive_pass_surfaces_archive_novel(
 
     by_id = {r.story.id: r for r in ranked}
     novel_ids_all = [novel_id_base + i for i in range(len(novel_sims))]
-    # With per-combo DISCOVERY_PER_BADGE, only the top-N by distance get
+    # With per-combo EXPLORE_PER_BADGE, only the top-N by distance get
     # is_novel; the one extra target (worst sim) may appear via other
     # passes (Popular, Similar, etc.) but should not have is_novel.
     novel_ids = [aid for aid in novel_ids_all if aid in by_id and by_id[aid].is_novel]
-    assert len(novel_ids) >= DISCOVERY_PER_BADGE, (
-        f"Expected at least {DISCOVERY_PER_BADGE} novel picks, got {novel_ids}"
+    assert len(novel_ids) >= EXPLORE_PER_BADGE, (
+        f"Expected at least {EXPLORE_PER_BADGE} novel picks, got {novel_ids}"
     )
     # The top by distance must be among the novel picks.
     for aid, sim_label in zip(
-        novel_ids_all[:DISCOVERY_PER_BADGE],
-        (f"{sim:.2f}" for sim in novel_sims[:DISCOVERY_PER_BADGE]),
+        novel_ids_all[:EXPLORE_PER_BADGE],
+        (f"{sim:.2f}" for sim in novel_sims[:EXPLORE_PER_BADGE]),
     ):
         assert aid in by_id, f"Archive novel id={aid} should be in final"
         assert by_id[aid].is_novel, (
@@ -3589,8 +3626,8 @@ def test_novel_archive_pass_surfaces_archive_novel(
 
 
 def test_each_badge_floored_per_cohort(db: Database, embedder: Embedder) -> None:
-    """Every non-Hot badge must appear >=DISCOVERY_PER_BADGE times in recent
-    AND >=DISCOVERY_PER_BADGE times in archive of the final deck (the
+    """Every non-Hot badge must appear >=EXPLORE_PER_BADGE times in recent
+    AND >=EXPLORE_PER_BADGE times in archive of the final deck (the
     user's explicit "at least (N,N) for each" expectation).
 
     The rank-based cascade guarantees this via per-cohort top-N discovery
@@ -3599,15 +3636,15 @@ def test_each_badge_floored_per_cohort(db: Database, embedder: Embedder) -> None
       explore (also mutually exclusive with each other, but independent
                of the cascade so a card can carry both): novel, similar,
                uncertain
-    Each pass takes the top DISCOVERY_PER_BADGE stories in its age cohort
+    Each pass takes the top EXPLORE_PER_BADGE stories in its age cohort
     by the badge metric.
 
     Pool sizing: because Explore's three passes are serial (each excludes
     the previous pass's picks), the explore-eligible remainder of a
     cohort — pool size minus that combo's primary quota — must hold at
-    least ``3 * DISCOVERY_PER_BADGE`` candidates for every badge to reach
+    least ``3 * EXPLORE_PER_BADGE`` candidates for every badge to reach
     the floor. Sized dynamically below from ``PRIMARY_PER_COMBO`` /
-    ``PRIMARY_ARCHIVE_HN`` and ``DISCOVERY_PER_BADGE`` with a +5 margin,
+    ``PRIMARY_ARCHIVE_HN`` and ``EXPLORE_PER_BADGE`` with a +5 margin,
     so the floor holds regardless of the constant's current value.
 
     Feedback: 20 distinct upvotes, 20 distinct downvotes, 20 distinct
@@ -3667,16 +3704,16 @@ def test_each_badge_floored_per_cohort(db: Database, embedder: Embedder) -> None
         )
         db.upsert_feedback(user.id, 880 + i, "neutral")
 
-    from pipeline import DISCOVERY_PER_BADGE
+    from pipeline import EXPLORE_PER_BADGE
     from pipeline.ranking import PRIMARY_ARCHIVE_HN, PRIMARY_PER_COMBO
 
     # Explore's Unsure/Novel/Similar passes are serial (mutually exclusive,
     # see ranking.py), so each cohort's explore-eligible pool (pool size
     # minus that combo's primary quota) must hold at least
-    # 3 * DISCOVERY_PER_BADGE candidates for every badge to reach the floor;
+    # 3 * EXPLORE_PER_BADGE candidates for every badge to reach the floor;
     # +5 margin keeps this from being a knife's-edge fit.
-    n_recent = PRIMARY_PER_COMBO + 3 * DISCOVERY_PER_BADGE + 5
-    n_archive = PRIMARY_ARCHIVE_HN + 3 * DISCOVERY_PER_BADGE + 5
+    n_recent = PRIMARY_PER_COMBO + 3 * EXPLORE_PER_BADGE + 5
+    n_archive = PRIMARY_ARCHIVE_HN + 3 * EXPLORE_PER_BADGE + 5
 
     now = int(time.time())
     candidates: list[Story] = []
@@ -3734,11 +3771,11 @@ def test_each_badge_floored_per_cohort(db: Database, embedder: Embedder) -> None
     ):
         n_recent = sum(1 for r in recent if getattr(r, attr))
         n_archive = sum(1 for r in archive if getattr(r, attr))
-        assert n_recent >= DISCOVERY_PER_BADGE, (
-            f"{attr} must appear >= {DISCOVERY_PER_BADGE} in recent (got {n_recent})"
+        assert n_recent >= EXPLORE_PER_BADGE, (
+            f"{attr} must appear >= {EXPLORE_PER_BADGE} in recent (got {n_recent})"
         )
-        assert n_archive >= DISCOVERY_PER_BADGE, (
-            f"{attr} must appear >= {DISCOVERY_PER_BADGE} in archive (got {n_archive})"
+        assert n_archive >= EXPLORE_PER_BADGE, (
+            f"{attr} must appear >= {EXPLORE_PER_BADGE} in archive (got {n_archive})"
         )
 
 
@@ -3754,7 +3791,7 @@ def _make_combo_deck_inputs() -> tuple[
 
     12 recent HN primary candidates (ids 0-11, high score) fill
     ``PRIMARY_PER_COMBO`` (12) and land in Primary. Three disjoint,
-    low-score Explore-only groups of ``DISCOVERY_PER_BADGE + 2`` ids each
+    low-score Explore-only groups of ``EXPLORE_PER_BADGE + 2`` ids each
     follow — one extra beyond the cap so a feedback-match test can exclude
     the top pick and still have more than enough left to fill the badge,
     leaving the single worst candidate excluded:
@@ -3770,9 +3807,9 @@ def _make_combo_deck_inputs() -> tuple[
         decreasing (the highest-sim id is most similar). All other ids
         default to closest_up=0.0, below every value in the similar pool.
     """
-    from pipeline import DISCOVERY_PER_BADGE
+    from pipeline import EXPLORE_PER_BADGE
 
-    group_size = DISCOVERY_PER_BADGE + 2
+    group_size = EXPLORE_PER_BADGE + 2
     unsure_base = 12
     novel_base = unsure_base + group_size
     similar_base = novel_base + group_size
@@ -3866,23 +3903,23 @@ def test_explore_badges_backfill_past_feedback_matches() -> None:
     instead of silently losing badge slots.
 
     Reproduces the bug found for a heavy voter (user=1): without
-    ``is_feedback_match``, the naive top-``DISCOVERY_PER_BADGE`` slice picks
+    ``is_feedback_match``, the naive top-``EXPLORE_PER_BADGE`` slice picks
     the best-ranked candidate per badge even when it duplicates a story the
     user already voted on — a duplicate that ``canonicalize_hn_dupes`` would
     drop downstream with no replacement, silently shrinking the deck.
     """
-    from pipeline import DISCOVERY_PER_BADGE
+    from pipeline import EXPLORE_PER_BADGE
 
     config = Config(count=40)
     ranked, recent_cutoff, cand_scores, cand_velocities, idx_for, explore = (
         _make_combo_deck_inputs()
     )
 
-    # group_size = DISCOVERY_PER_BADGE + 2 ids per badge pool (see
+    # group_size = EXPLORE_PER_BADGE + 2 ids per badge pool (see
     # _make_combo_deck_inputs); group index 0 is the best-ranked candidate
     # in each pool (highest entropy / most novel / most similar), and the
     # last index is the worst.
-    group_size = DISCOVERY_PER_BADGE + 2
+    group_size = EXPLORE_PER_BADGE + 2
     unsure_base = 12
     novel_base = unsure_base + group_size
     similar_base = novel_base + group_size
@@ -3909,9 +3946,9 @@ def test_explore_badges_backfill_past_feedback_matches() -> None:
     novel_ids = {r.story.id for r in final if r.is_novel}
     similar_ids = {r.story.id for r in final if r.is_similar}
 
-    assert len(unsure_ids) == DISCOVERY_PER_BADGE, unsure_ids
-    assert len(novel_ids) == DISCOVERY_PER_BADGE, novel_ids
-    assert len(similar_ids) == DISCOVERY_PER_BADGE, similar_ids
+    assert len(unsure_ids) == EXPLORE_PER_BADGE, unsure_ids
+    assert len(novel_ids) == EXPLORE_PER_BADGE, novel_ids
+    assert len(similar_ids) == EXPLORE_PER_BADGE, similar_ids
 
     # The feedback-matched top pick in each pool must be excluded ...
     assert unsure_base not in unsure_ids
@@ -3920,25 +3957,25 @@ def test_explore_badges_backfill_past_feedback_matches() -> None:
     # ... and backfilled with the next-best candidates in that pool, with
     # the single worst candidate (last index) dropped for lack of room.
     assert unsure_ids == set(
-        range(unsure_base + 1, unsure_base + 1 + DISCOVERY_PER_BADGE)
+        range(unsure_base + 1, unsure_base + 1 + EXPLORE_PER_BADGE)
     )
-    assert novel_ids == set(range(novel_base + 1, novel_base + 1 + DISCOVERY_PER_BADGE))
+    assert novel_ids == set(range(novel_base + 1, novel_base + 1 + EXPLORE_PER_BADGE))
     assert similar_ids == set(
-        range(similar_base + 1, similar_base + 1 + DISCOVERY_PER_BADGE)
+        range(similar_base + 1, similar_base + 1 + EXPLORE_PER_BADGE)
     )
 
 
 def test_explore_badges_no_feedback_match_predicate_is_unaffected() -> None:
     """``is_feedback_match=None`` (cold-deck / no-feedback path) preserves
     the pre-existing top-N-by-rank behavior exactly."""
-    from pipeline import DISCOVERY_PER_BADGE
+    from pipeline import EXPLORE_PER_BADGE
 
     config = Config(count=40)
     ranked, recent_cutoff, cand_scores, cand_velocities, idx_for, explore = (
         _make_combo_deck_inputs()
     )
 
-    group_size = DISCOVERY_PER_BADGE + 2
+    group_size = EXPLORE_PER_BADGE + 2
     unsure_base = 12
     novel_base = unsure_base + group_size
     similar_base = novel_base + group_size
@@ -3959,9 +3996,9 @@ def test_explore_badges_no_feedback_match_predicate_is_unaffected() -> None:
     novel_ids = {r.story.id for r in final if r.is_novel}
     similar_ids = {r.story.id for r in final if r.is_similar}
 
-    assert unsure_ids == set(range(unsure_base, unsure_base + DISCOVERY_PER_BADGE))
-    assert novel_ids == set(range(novel_base, novel_base + DISCOVERY_PER_BADGE))
-    assert similar_ids == set(range(similar_base, similar_base + DISCOVERY_PER_BADGE))
+    assert unsure_ids == set(range(unsure_base, unsure_base + EXPLORE_PER_BADGE))
+    assert novel_ids == set(range(novel_base, novel_base + EXPLORE_PER_BADGE))
+    assert similar_ids == set(range(similar_base, similar_base + EXPLORE_PER_BADGE))
 
 
 def _make_mixed_combo_deck_inputs(
@@ -4421,10 +4458,10 @@ def test_parallel_can_stack_within(
 
     monkeypatch.setattr("pipeline.ranking.get_or_compute_embeddings", mock_gce)
 
-    from pipeline import PRIMARY_PER_COMBO, DISCOVERY_PER_BADGE
+    from pipeline import PRIMARY_PER_COMBO, EXPLORE_PER_BADGE
 
     now = int(time.time())
-    n_total = PRIMARY_PER_COMBO + DISCOVERY_PER_BADGE + 4  # primary + room
+    n_total = PRIMARY_PER_COMBO + EXPLORE_PER_BADGE + 4  # primary + room
     candidates: list[Story] = []
     for i in range(n_total):
         score = 200 - i * 5
@@ -4468,9 +4505,11 @@ def test_hot_badge_threshold_uses_config_percentile(
     """is_hot respects hot_badge_percentile from config.
 
     The Hot pass runs against the full combo pool and can badge primary
-    cards. Slot limit is DISCOVERY_PER_BADGE.
+    cards. Slot limit is POPULAR_PER_COMBO // 3.
     """
-    from pipeline import DISCOVERY_PER_BADGE
+    from pipeline import POPULAR_PER_COMBO
+
+    hot_cap = POPULAR_PER_COMBO // 3
 
     now = int(time.time())
     # 20 stories, scores 10..200 (step 10), all 1h old so velocity = score.
@@ -4499,18 +4538,13 @@ def test_hot_badge_threshold_uses_config_percentile(
     assert len(hot_ids) == 1, f"Expected 1 hot at p99.5, got {len(hot_ids)}"
 
     # 50th pct: p50 ≈ 105. Ids 0..9 clear the threshold. Slot cap is
-    # DISCOVERY_PER_BADGE, so only the top DISCOVERY_PER_BADGE by velocity
-    # get Hot.
+    # hot_cap, so only the top hot_cap by velocity get Hot.
     config2 = Config(count=40, model=ModelConfig(hot_badge_percentile=50.0))
     ranked2 = rerank_candidates(db, config2, embedder, candidates, cand_embs)
     hot2 = {r.story.id for r in ranked2 if r.is_hot}
-    assert set(range(DISCOVERY_PER_BADGE)) <= hot2
-    assert DISCOVERY_PER_BADGE not in hot2, (
-        "Should only get DISCOVERY_PER_BADGE hot cards"
-    )
-    assert len(hot2) == DISCOVERY_PER_BADGE, (
-        f"Expected {DISCOVERY_PER_BADGE} hot at p50, got {len(hot2)}"
-    )
+    assert set(range(hot_cap)) <= hot2
+    assert hot_cap not in hot2, "Should only get hot_cap hot cards"
+    assert len(hot2) == hot_cap, f"Expected {hot_cap} hot at p50, got {len(hot2)}"
 
 
 def test_tier1_gravity_at_zero_feedback(db: Database, embedder: Embedder) -> None:
@@ -5270,7 +5304,7 @@ def test_candidate_similar_to_neutral_is_not_novel(db, embedder, monkeypatch):
     by_id = {r.story.id: r for r in ranked}
 
     # id=3 (far from all feedback, max_sim=0, dist=1.0) is the most
-    # novel and should be in the top DISCOVERY_PER_BADGE by distance.
+    # novel and should be in the top EXPLORE_PER_BADGE by distance.
     assert 3 in by_id, "id=3 (far from all feedback) should be in final"
     assert by_id[3].is_novel, (
         f"id=3 (far from feedback) should be novel; got is_novel={by_id[3].is_novel}"
@@ -5374,7 +5408,7 @@ def test_no_neutral_feedback_uses_up_down_only_for_novel(db, embedder, monkeypat
     by_id = {r.story.id: r for r in ranked}
 
     # id=2 (max_sim=0, dist=1.0) is the most novel; it's in the top
-    # DISCOVERY_PER_BADGE by distance.
+    # EXPLORE_PER_BADGE by distance.
     assert 2 in by_id, "id=2 (not similar to any) should be in final"
     assert by_id[2].is_novel, (
         f"Candidate 2 should be novel; got is_novel={by_id[2].is_novel}"
@@ -5391,13 +5425,13 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
     A low-score, high-distance story beats a higher-score, lower-distance
     story when the slot cap forces a cut.
 
-    With per-combo discovery slots (DISCOVERY_PER_BADGE), the cut is at
-    position DISCOVERY_PER_BADGE. We construct scores so the last-kept
+    With per-combo discovery slots (EXPLORE_PER_BADGE), the cut is at
+    position EXPLORE_PER_BADGE. We construct scores so the last-kept
     (by distance) story has a very low score; pure-distance ranking keeps
     it; a score-blended ranking would have dropped it for the first
     excluded (higher-score) story.
     """
-    from pipeline import DISCOVERY_PER_BADGE, PRIMARY_PER_COMBO
+    from pipeline import EXPLORE_PER_BADGE, PRIMARY_PER_COMBO
 
     config = Config(count=40)
     user = db.create_user("test_novel_distance")
@@ -5417,7 +5451,7 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
     db.upsert_feedback(user.id, 100, "up")
 
     # Primary fillers (high score) + controlled extras (low score, varied sim).
-    # The novel pass picks DISCOVERY_PER_BADGE by distance. We arrange so
+    # The novel pass picks EXPLORE_PER_BADGE by distance. We arrange so
     # the last-by-distance kept id has a very low score, and the first
     # excluded id (worse distance) has a high score; a score-blended
     # ranking would have swapped the two.
@@ -5436,11 +5470,11 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
                 comment_count=0,
             )
         )
-    extra_scores = [10] * (DISCOVERY_PER_BADGE + 2)
-    extra_scores[DISCOVERY_PER_BADGE - 1] = 1  # last kept, very low score
-    extra_scores[DISCOVERY_PER_BADGE] = 50  # first excluded, high score
+    extra_scores = [10] * (EXPLORE_PER_BADGE + 2)
+    extra_scores[EXPLORE_PER_BADGE - 1] = 1  # last kept, very low score
+    extra_scores[EXPLORE_PER_BADGE] = 50  # first excluded, high score
     # Strictly increasing sim -> strictly decreasing distance/novelty.
-    extra_sims = [round(0.10 + 0.05 * i, 2) for i in range(DISCOVERY_PER_BADGE + 2)]
+    extra_sims = [round(0.10 + 0.05 * i, 2) for i in range(EXPLORE_PER_BADGE + 2)]
     for i, sc in enumerate(extra_scores):
         candidates.append(
             Story(
@@ -5470,15 +5504,15 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
     )
 
     by_id = {r.story.id: r for r in ranked}
-    kept_id = PRIMARY_PER_COMBO + (DISCOVERY_PER_BADGE - 1)
-    excluded_id = PRIMARY_PER_COMBO + DISCOVERY_PER_BADGE
+    kept_id = PRIMARY_PER_COMBO + (EXPLORE_PER_BADGE - 1)
+    excluded_id = PRIMARY_PER_COMBO + EXPLORE_PER_BADGE
     # kept_id (very low score) is the last-by-distance story within the cap.
     # Pure-distance ranking keeps it; score-blended would drop it for
     # excluded_id instead.
     assert by_id[kept_id].is_novel, (
         f"id={kept_id} (worst distance kept, score=1) should be novel"
     )
-    # excluded_id (high score) is just beyond the DISCOVERY_PER_BADGE cut,
+    # excluded_id (high score) is just beyond the EXPLORE_PER_BADGE cut,
     # so NOT novel despite the higher score.
     if excluded_id in by_id:
         assert not by_id[excluded_id].is_novel, (

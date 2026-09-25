@@ -1,5 +1,20 @@
 # Worklog: hn-rewrite
 
+## 2026-09-25 Per-view targets: Popular >10, Explore <12, Recommended/Date <25
+
+Follow-up to the deck shrink below. The user set per-view targets.
+- `DISCOVERY_PER_BADGE` was split (`pipeline/ranking.py`). Popular now shares
+  `POPULAR_PER_COMBO = 12` per HN combo: Hot takes up to 4, then Top and
+  Talk split what Hot left, so recent is 4/4/4 and archive (no Hot) is 6/6.
+  Explore uses `EXPLORE_PER_BADGE = 2` (1 on recent_non-hn), which caps the
+  Explore tab at 9 recent and 6 archive.
+- `pipeline/render.py` caps Recommended/Date at `RECOMMENDED_LIMIT = 24` per
+  age (top by score) and drops cards that are in no view. This applies to the
+  HTML deck and to `/api/feed`. The web client reads the flag from
+  `data-sort-recommended`, and on refill from the capped `recommended:*`
+  orders. The feed JSON schema is unchanged: running TUI clients build
+  `FeedStory(**json)` and would crash on a new key.
+
 ## 2026-09-25 Smaller deck: non-HN primary 20 → 10, per-badge 5 → 3
 
 User-reported: the Date tab showed 73 recent articles, too many to load on
