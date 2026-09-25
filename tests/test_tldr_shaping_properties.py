@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from hypothesis import given, settings, strategies as st
+from hypothesis import example, given, settings, strategies as st
 
 import server
 from tests.test_client_js import _inline_script, js_functions, run_node
@@ -42,6 +42,9 @@ def test_normalize_is_idempotent(text: str) -> None:
 
 @settings(max_examples=300)
 @given(text=_DOC, max_bullets=st.integers(1, 6), max_subheadings=st.integers(0, 2))
+# Found in CI: stripping the result promoted the indented first bullet past
+# the cap. Pinned because CI does not keep Hypothesis' example database.
+@example(text="  - :\n- :", max_bullets=1, max_subheadings=0)
 def test_cap_bounds_each_section_and_only_drops_lines(
     text: str, max_bullets: int, max_subheadings: int
 ) -> None:
