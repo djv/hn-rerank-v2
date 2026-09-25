@@ -279,10 +279,11 @@ PRIMARY_PER_COMBO = 12
 # stories), so no row can ever satisfy both. That combo was retired from
 # COMBO_DEFS below (see WORKLOG 2026-08-30) and its 12 primary + 6 explore
 # slots redistributed to the two combos most starved of non-HN/archive
-# coverage, rather than left unspent.
-PRIMARY_RECENT_NONHN = 20
+# coverage, rather than left unspent. Both quotas were later trimmed
+# (2026-09-25): a 73-card recent deck was too much to load on the client.
+PRIMARY_RECENT_NONHN = 10
 PRIMARY_ARCHIVE_HN = 16
-DISCOVERY_PER_BADGE = 5
+DISCOVERY_PER_BADGE = 3
 SOURCE_CATEGORIES: tuple[str, ...] = ("hn_live", "archive", "reddit", "rss")
 
 

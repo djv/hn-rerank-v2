@@ -3588,9 +3588,7 @@ def test_novel_archive_pass_surfaces_archive_novel(
         )
 
 
-def test_each_badge_floored_at_five_per_cohort(
-    db: Database, embedder: Embedder
-) -> None:
+def test_each_badge_floored_per_cohort(db: Database, embedder: Embedder) -> None:
     """Every non-Hot badge must appear >=DISCOVERY_PER_BADGE times in recent
     AND >=DISCOVERY_PER_BADGE times in archive of the final deck (the
     user's explicit "at least (N,N) for each" expectation).

@@ -1,5 +1,19 @@
 # Worklog: hn-rewrite
 
+## 2026-09-25 Smaller deck: non-HN primary 20 → 10, per-badge 5 → 3
+
+User-reported: the Date tab showed 73 recent articles, too many to load on
+the client. Date and Recommended render the same `{age}_mixed` set (Date
+only re-sorts by time), so the count came from deck construction. Live VPS
+`/api/feed` confirmed it: user 151 had 73 recent / 40 archive cards, user 1
+had 43 / 26.
+
+Lowered `PRIMARY_RECENT_NONHN` 20 → 10 and `DISCOVERY_PER_BADGE` 5 → 3
+(`pipeline/ranking.py`). Worst case is now ~49 recent (30 HN + 19 non-HN)
+and ~31 archive cards. Popular drops to at most 9 per combo (was 15).
+Renamed `test_each_badge_floored_at_five_per_cohort` to
+`test_each_badge_floored_per_cohort`; it was already sized off the constant.
+
 ## 2026-09-24 TLDR quotas doubled again (240/240)
 
 - Uncached-TLDR quota kept tripping heavy TUI use: `config.toml`
