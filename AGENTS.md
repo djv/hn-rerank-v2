@@ -212,10 +212,16 @@ runtime dep (e.g. jax, tensorflow), give it its own
   in `templates/index.html`. Tab buttons use `data-source`, `data-sort`,
   `data-age` — scope selectors to `.tab-btn[data-*]`. When adding `data-*` to
   templates, verify no JS selector collides with them.
-- **Template tests**: `tests/test_server.py` pins CSS/JS contracts via
-  template-string assertions. Update them when `templates/index.html` changes.
-  Avoid adding tests that only check exact strings without validating runtime
-  behavior (the user will request their removal).
+- **Client script tests execute the code**: `tests/test_client_js.py`
+  extracts named functions from the inline script (`js_functions(script,
+  "submitVote", ...)`) and runs them under Node with small DOM/fetch stubs and
+  a virtual clock (`run_node`). Test new client logic that way, asserting
+  behavior (ordering, rollback, coalescing), not source substrings. A few
+  structural string checks remain in `tests/test_server.py` (keydown guard,
+  focus restore, `setFilter`); update them when `templates/index.html`
+  changes. Rendered-HTML contracts are checked on real renders with
+  BeautifulSoup. Avoid tests that only check exact strings without validating
+  runtime behavior (the user will request their removal).
 - **Version semantics**: `dashboard_version=0` is valid cold-deck data.
   Client-side version comparisons must use `Number.isFinite()`, not truthiness.
 
