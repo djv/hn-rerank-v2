@@ -53,7 +53,8 @@ class Feed:
     @classmethod
     def parse(cls, data: Any) -> Feed:
         if not isinstance(data, dict):
-            raise ValueError("Invalid feed response")
+            # Parse failures are ValueError by contract (tests/test_boundaries.py).
+            raise ValueError("Invalid feed response")  # noqa: TRY004
         if data.get("api_version") != 1:
             raise ValueError("Unsupported feed API; update hn-rerank.")
         try:

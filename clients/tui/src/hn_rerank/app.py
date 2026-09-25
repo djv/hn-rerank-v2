@@ -42,16 +42,16 @@ from textual.widgets.option_list import Option
 from .api import (
     API,
     APIError,
-    InvalidProfile,
     Impression,
+    InvalidProfile,
     Profile,
-    Summary as SummaryResult,
     TransientError,
     load_profile,
     normalize_server,
     profile_path,
     save_profile,
 )
+from .api import Summary as SummaryResult
 from .models import Feed, FeedStory
 
 DEFAULT_SERVER = "https://ubuntu-8gb-nbg1-1.tailca4726.ts.net:8443/hn/"
@@ -74,6 +74,7 @@ def open_in_firefox(url: str) -> None:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=2,
+                check=False,
             ).returncode
             == 0
         )
@@ -93,6 +94,7 @@ def open_in_firefox(url: str) -> None:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=2,
+                check=False,
             )
         except (OSError, subprocess.SubprocessError):
             pass  # Focusing the window is cosmetic.
@@ -185,7 +187,7 @@ def headline_domain(story: FeedStory) -> str:
     if story.source.startswith("rss_reddit_") and len(story.source) > 11:
         return f"r/{story.source[11:]}"
     domain = urlsplit(story.article_url).hostname or story.source
-    return domain[4:] if domain.startswith("www.") else domain
+    return domain.removeprefix("www.")
 
 
 def headline_points(story: FeedStory) -> str:
@@ -1067,7 +1069,7 @@ class Reader(App[None]):
             or self.closing
             or not self.prefetch_queue
             or self.setting_up
-            or not self.is_mounted
+            or not self.is_running
         ):
             return
         self.prefetch_active = True
@@ -1134,7 +1136,7 @@ class Reader(App[None]):
                 self.prefetch_queue
                 and not self.closing
                 and not self.setting_up
-                and self.is_mounted
+                and self.is_running
                 and time.monotonic() >= self.prefetch_cooldown_until
             ):
                 self.start_prefetch()

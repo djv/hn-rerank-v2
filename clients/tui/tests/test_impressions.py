@@ -5,6 +5,7 @@ import json
 from textual.widgets import OptionList
 
 from hn_rerank.app import Reader
+
 from .test_client import FakeServer
 
 

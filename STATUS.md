@@ -28,6 +28,7 @@ Finish the TUI navigation improvements and get the standalone client CI green.
 - Generation uses provider capacity and can still be outrun by rapid navigation.
 
 ## Next step
-Reproduce `.github/workflows/tui.yml` in an isolated standalone package,
-fix its eight lint errors, rerun its checks, then commit/push the CI fix.
-Status-only changes from this save are not committed.
+Resolved 2026-09-25: the terminal client lint failures came from the newer
+ruff/ty that the lockfile-less standalone copy installs. Fixed, together
+with a dead `is_mounted` prefetch guard; see WORKLOG.md. Confirm that
+`.github/workflows/tui.yml` passes on the push.

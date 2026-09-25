@@ -628,9 +628,11 @@ class FlakySummaryServer(FakeServer):
     """Rate-limits foreground taps for story 1; cache reads always miss."""
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/api/tldr-detail"):
-            if json.loads(request.content)["story_id"] == 1:
-                return httpx.Response(429, headers={"Retry-After": "30"})
+        if (
+            request.url.path.endswith("/api/tldr-detail")
+            and json.loads(request.content)["story_id"] == 1
+        ):
+            return httpx.Response(429, headers={"Retry-After": "30"})
         if "/api/tldr-cache/" in request.url.path:
             return httpx.Response(204)
         return await super().__call__(request)

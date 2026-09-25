@@ -1,5 +1,26 @@
 # Worklog: hn-rewrite
 
+## 2026-09-25 Terminal client CI: lint and type fixes, prefetch guard bug
+
+`.github/workflows/tui.yml` copies `clients/tui` outside the workspace, and
+the copy has no lockfile, so CI installs the newest ruff (0.16.9) and ty.
+The in-tree workspace lock pins ruff 0.15.17, which is why local checks
+passed while CI failed with 8 ruff errors.
+- Ruff fixes: sorted imports (`app.py`, `test_editorial.py`,
+  `test_impressions.py`), `check=False` on the two `subprocess.run` calls,
+  `str.removeprefix`, and one nested `if` merged in `test_client.py`.
+  `Feed.parse` keeps raising `ValueError` for non-dict input: parse failures
+  are `ValueError` by contract (`tests/test_boundaries.py`), so TRY004 gets a
+  documented `noqa`.
+- Once ruff passed, the newer ty also failed on a real bug. `Reader`'s
+  prefetch guards used `self.is_mounted`, which on Textual's `App` is a
+  method (`is_mounted(widget)`), so `not self.is_mounted` was always False
+  and `and self.is_mounted` always True: both guards did nothing. They now
+  use `App.is_running`, which matches the intent from `8751fb5`.
+- Verified in an isolated copy with the workflow's steps: 123 passed / 1
+  skipped, ruff, ty, build, and the wheel smoke test. The in-tree root
+  checks also pass, and both ruff 0.15.17 and 0.16.9 accept the result.
+
 ## 2026-09-25 SessionStart hook for Claude Code cloud sessions
 
 Added `.claude/hooks/session-start.sh`, registered in `.claude/settings.json`.
