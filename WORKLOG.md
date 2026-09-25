@@ -1,5 +1,23 @@
 # Worklog: hn-rewrite
 
+## 2026-09-25 Date view: time-stratified coverage
+
+Follow-up to the entry below: Date then went 1-4h straight to 6.4 days.
+The deck is picked by score over the whole 30-day window with nothing
+time-aware, and the VPS DB had 100-170 unvoted HN stories per day in that
+gap, so the gap came from selection, not from votes or supply. The user
+asked for a generic fix rather than a per-day rule.
+
+`_assemble_combo_deck` now ends with a Date pass: per age, the pool
+(limited to `COMBO_DEFS` combos, so archive_nonhn stays retired) is split by
+time into `DATE_SLICES_PER_AGE = 24` equal-count slices and each slice's
+best-scored, non-feedback-dupe story is added (`time_stratified_picks`).
+Slices follow density, so it works for Recent and Archive alike. New cards
+get `is_date_only`: render keeps them, excludes them from the Recommended
+cap, and they reach the web/TUI only through the `date:*` orders. Tests: a
+Hypothesis property for the helper, a skip test, and a deck-to-feed
+regression that fails with a 28-day gap when the pass is disabled.
+
 ## 2026-09-25 Date sort shows the newest sent cards
 
 User-reported: Date looked oldest-first. The order was descending, but since
