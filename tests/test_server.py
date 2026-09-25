@@ -11,7 +11,7 @@ from werkzeug.serving import make_server
 from collections.abc import Callable
 from typing import Any, cast
 
-from server import Handler, SKELETON_HTML, create_app
+from server import DeckState, Handler, SKELETON_HTML, create_app
 from pipeline import Config, Embedder, RankedStory
 from database import Database, Story
 
@@ -70,35 +70,21 @@ def mock_embedder() -> MockEmbedder:
     return MockEmbedder()
 
 
-def _reset_warm_state(handler: type[Handler], debounce_s: float = 0.01) -> None:
-    for timer in getattr(handler, "_warmup_timers", {}).values():
-        timer.cancel()
-    for timer in getattr(handler, "_feedback_warm_timers", {}).values():
-        timer.cancel()
+def _reset_warm_state(handler: type[Handler]) -> None:
     feedback_regen_timer = getattr(handler, "_feedback_regen_timer", None)
     if feedback_regen_timer is not None:
         feedback_regen_timer.cancel()
-    handler._warmup_requested_versions = {}
-    handler._warmup_last_request_at = {}
-    handler._warmup_timers = {}
-    handler._warmup_running_users = set()
-    handler._warmup_in_flight_guard = threading.Lock()
-    handler._WARM_DEBOUNCE_S = debounce_s
+    handler._scheduler = None
+    handler._pool_generation = 1
     handler._feedback_warm_counts = {}
-    handler._feedback_warm_versions = {}
-    handler._feedback_warm_timers = {}
     handler._feedback_warm_guard = threading.Lock()
     handler._feedback_regen_timer = None
     handler._feedback_regen_guard = threading.Lock()
 
 
 def _has_pending_warm(handler: type[Handler]) -> bool:
-    with handler._warmup_in_flight_guard:
-        return bool(
-            handler._warmup_requested_versions
-            or handler._warmup_timers
-            or handler._warmup_running_users
-        )
+    scheduler = handler.__dict__.get("_scheduler")
+    return scheduler is not None and scheduler.busy()
 
 
 def _has_pending_feedback_regen(handler: type[Handler]) -> bool:
@@ -144,12 +130,20 @@ def _controllable_timer_factory(
 
 
 def _drain_warms(handler: type[Handler], timeout_s: float = 3.0) -> None:
-    drain_deadline = time.time() + timeout_s
-    while _has_pending_warm(handler) and time.time() < drain_deadline:
-        time.sleep(0.01)
+    scheduler = handler.__dict__.get("_scheduler")
+    if scheduler is not None:
+        scheduler.wait_idle(timeout_s)
 
 
-def test_warm_timer_collects_after_failed_warm(
+def _cancel_warms(handler: type[Handler]) -> None:
+    """Teardown: drop queued (e.g. vote-debounced) warms, finish running ones."""
+    scheduler = handler.__dict__.get("_scheduler")
+    if scheduler is not None:
+        scheduler.clear_pending()
+        scheduler.wait_idle(3.0)
+
+
+def test_warm_job_collects_after_failed_warm(
     prop_db: Database, mock_embedder: MockEmbedder, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class TestHandler(Handler):
@@ -158,41 +152,31 @@ def test_warm_timer_collects_after_failed_warm(
     TestHandler.config = Config(db_path=prop_db.db_path, server_port=0)
     TestHandler.db = prop_db
     TestHandler.embedder = mock_embedder
-    TestHandler._dashboard_cache = {}
+    TestHandler._decks = {}
     TestHandler._dashboard_versions = {}
     TestHandler._cold_stories = []
-    TestHandler._render_locks = {}
     _reset_warm_state(TestHandler)
 
     user = prop_db.create_user("warm_gc")
-    TestHandler._warmup_requested_versions[user.id] = 1
-    TestHandler._warmup_last_request_at[user.id] = (
-        time.monotonic() - TestHandler._WARM_DEBOUNCE_S
-    )
-    TestHandler._warmup_timers[user.id] = cast(
-        threading.Timer, threading.current_thread()
-    )
     calls: list[str] = []
 
     def fake_run(cls, user_arg, version):
         calls.append(f"run:{version}")
         raise RuntimeError("boom")
 
-    def fake_finish(cls, user_arg, version):
-        calls.append(f"finish:{version}")
-
     def fake_collect(cls):
         calls.append("collect")
 
     monkeypatch.setattr(TestHandler, "_run_warm_attempt", classmethod(fake_run))
-    monkeypatch.setattr(TestHandler, "_finish_warm_attempt", classmethod(fake_finish))
     monkeypatch.setattr(
         TestHandler, "_collect_after_warm_attempt", classmethod(fake_collect)
     )
 
-    TestHandler._warm_timer_fired(user)
+    TestHandler._trigger_warm(user, 2)
+    _drain_warms(TestHandler)
 
-    assert calls == ["run:1", "finish:1", "collect"]
+    assert calls == ["run:2", "collect"]
+    assert not _has_pending_warm(TestHandler)
 
 
 def _start_handler_server(
@@ -213,10 +197,9 @@ def _start_handler_server(
     TestHandler.db = db
     TestHandler.embedder = embedder
     TestHandler.regen_event = regen_event
-    TestHandler._dashboard_cache = {}
+    TestHandler._decks = {}
     TestHandler._dashboard_versions = {}
     TestHandler._cold_stories = []
-    TestHandler._render_locks = {}
     _reset_warm_state(TestHandler)
     TestHandler.reset_public_demo_limiter()
 
@@ -228,13 +211,9 @@ def _start_handler_server(
 
 def _drain_and_shutdown(server: Any, handler: type[Handler]) -> None:
     with handler._feedback_warm_guard:
-        for timer in handler._feedback_warm_timers.values():
-            timer.cancel()
-        handler._feedback_warm_timers.clear()
         handler._feedback_warm_counts.clear()
-        handler._feedback_warm_versions.clear()
     handler._cancel_feedback_regen()
-    _drain_warms(handler)
+    _cancel_warms(handler)
     server.shutdown()
 
 
@@ -558,8 +537,8 @@ def test_static_serving(test_env):
     # Pre-warm cache so HTTP request hits cached dashboard.
     result = handler._render_dashboard_for_user(user)
     assert result == SKELETON_HTML
-    # Wait for warm to complete (debounce is 10ms, so ~20ms total)
-    _wait_for_cache(handler, user, 0, timeout=3.0)
+    # The skeleton queued a warm for the live version.
+    _wait_for_cache(handler, user, handler._dashboard_version(user.id), timeout=3.0)
     # Now HTTP request should hit the cache
     resp = httpx.get(
         f"http://127.0.0.1:{port}/",
@@ -609,7 +588,7 @@ def test_feedback_post(test_env):
     assert resp.json() == {
         "ok": True,
         "ranking_refresh_queued": False,
-        "target_version": 1,
+        "target_version": 2,
         "ranking_idle_seconds": 3.0,
     }
 
@@ -645,7 +624,7 @@ def test_feedback_post_rejects_invalid_action(test_env: Any) -> None:
     assert resp.status_code == 400
     assert resp.json() == {"error": "Invalid feedback"}
     assert db.get_all_feedback(user.id) == []
-    assert handler._dashboard_version(user.id) == 0
+    assert handler._dashboard_version(user.id) == handler._pool_generation
     assert not regen_event.is_set()
     assert not _has_pending_feedback_regen(handler)
 
@@ -664,7 +643,7 @@ def test_feedback_post_rejects_malformed_story_id(test_env: Any) -> None:
         assert resp.json() == {"error": "Invalid feedback"}
 
     assert db.get_all_feedback(user.id) == []
-    assert handler._dashboard_version(user.id) == 0
+    assert handler._dashboard_version(user.id) == handler._pool_generation
     assert not regen_event.is_set()
 
 
@@ -685,7 +664,7 @@ def test_feedback_post_invalidates_cache_and_defers_warm_until_idle(test_env):
     regen_event.clear()
 
     starting_version = handler._dashboard_version(user.id)
-    assert starting_version == 0
+    assert starting_version == handler._pool_generation
 
     resp = httpx.post(
         f"http://127.0.0.1:{port}/api/feedback",
@@ -715,10 +694,12 @@ def test_feedback_vote_threshold_queues_one_latest_warm(
         dashboard_warm_vote_threshold=10,
         dashboard_warm_idle_seconds=60.0,
     )
-    calls: list[tuple[int, int]] = []
+    calls: list[tuple[int, int, float]] = []
 
-    def fake_trigger_warm(cls: type[Handler], warm_user: Any, version: int) -> None:
-        calls.append((warm_user.id, version))
+    def fake_trigger_warm(
+        cls: type[Handler], warm_user: Any, version: int, delay_s: float = 0.0
+    ) -> None:
+        calls.append((warm_user.id, version, delay_s))
 
     monkeypatch.setattr(handler, "_trigger_warm", classmethod(fake_trigger_warm))
     for story_id in range(1200, 1210):
@@ -746,31 +727,36 @@ def test_feedback_vote_threshold_queues_one_latest_warm(
     assert [response["ranking_refresh_queued"] for response in responses] == [
         False
     ] * 9 + [True]
-    assert calls == [(user.id, 10)]
+    # Each vote below the threshold (re)starts the idle wait; the 10th vote
+    # asks for the latest version immediately.
+    assert calls == [(user.id, 1 + n, 60.0) for n in range(1, 10)] + [
+        (user.id, 11, 0.0)
+    ]
 
 
 def test_feedback_idle_threshold_queues_latest_warm(
     test_env: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Votes below the threshold debounce: one warm, for the latest version,
+    after the idle pause."""
     _, _, _, handler, user = test_env
     handler.config = replace(
         handler.config,
         dashboard_warm_vote_threshold=10,
-        dashboard_warm_idle_seconds=0.02,
+        dashboard_warm_idle_seconds=0.05,
     )
-    calls: list[int] = []
+    ran: list[int] = []
     monkeypatch.setattr(
         handler,
-        "_trigger_warm",
-        classmethod(lambda cls, warm_user, version: calls.append(version)),
+        "_run_warm_attempt",
+        classmethod(lambda cls, warm_user, version: ran.append(version)),
     )
-    handler._schedule_feedback_warm(user, 1)
-    time.sleep(0.01)
     handler._schedule_feedback_warm(user, 2)
-    deadline = time.time() + 0.2
-    while not calls and time.time() < deadline:
-        time.sleep(0.005)
-    assert calls == [2]
+    time.sleep(0.02)
+    handler._schedule_feedback_warm(user, 3)
+    assert ran == []
+    _drain_warms(handler)
+    assert ran == [3]
 
 
 def test_feedback_regen_timer_resets_across_users_and_signals_once(
@@ -950,7 +936,7 @@ def test_feedback_post_rejects_cross_site_posts(
     assert resp.status_code == 403
     assert resp.json() == {"error": "Cross-site POSTs are not allowed"}
     assert db.get_all_feedback(user.id) == []
-    assert handler._dashboard_version(user.id) == 0
+    assert handler._dashboard_version(user.id) == handler._pool_generation
     assert not regen_event.is_set()
 
 
@@ -1048,7 +1034,7 @@ def test_feedback_post_refreshes_when_client_requests_ranking(test_env):
     assert resp.json() == {
         "ok": True,
         "ranking_refresh_queued": False,
-        "target_version": 1,
+        "target_version": 2,
         "ranking_idle_seconds": handler.config.dashboard_warm_idle_seconds,
     }
     assert len(db.get_all_feedback(user.id)) == 1
@@ -1098,7 +1084,7 @@ def test_feedback_post_bumps_cache_version_for_warm_rerender(test_env, monkeypat
     )
 
     pre_version = handler._dashboard_version(user.id)
-    assert pre_version == 0
+    assert pre_version == handler._pool_generation
 
     resp = httpx.post(
         f"http://127.0.0.1:{port}/api/feedback",
@@ -1119,8 +1105,9 @@ def test_feedback_post_bumps_cache_version_for_warm_rerender(test_env, monkeypat
         "cannot return the pre-vote HTML"
     )
 
-    fresh_html = _wait_for_cache(handler, user, post_version)
-    assert f"version={post_version}" in fresh_html.decode()
+    _wait_for_cache(handler, user, post_version)
+    fresh_html = handler._render_dashboard_for_user(user)
+    assert f"version={post_version} excluded={voted_story.id}" in fresh_html.decode()
 
 
 def test_feedback_clear(test_env):
@@ -1154,7 +1141,7 @@ def test_feedback_clear(test_env):
     assert resp.json() == {
         "ok": True,
         "ranking_refresh_queued": False,
-        "target_version": 1,
+        "target_version": 2,
         "ranking_idle_seconds": handler.config.dashboard_warm_idle_seconds,
     }
 
@@ -1254,7 +1241,7 @@ def test_ranking_ready_false_when_cache_missing_or_older(test_env, monkeypatch) 
         calls.append((warm_user.id, version))
 
     monkeypatch.setattr(handler, "_trigger_warm", classmethod(fake_trigger_warm))
-    target_version = handler._invalidate_dashboard_cache(user.id)
+    target_version = handler._bump_user_version(user.id)
 
     missing_resp = httpx.get(
         f"http://127.0.0.1:{port}/api/ranking-ready?version={target_version}",
@@ -1272,11 +1259,7 @@ def test_ranking_ready_false_when_cache_missing_or_older(test_env, monkeypatch) 
         "cached_version": None,
     }
 
-    handler._dashboard_cache[f"dashboard_{user.id}"] = (
-        b"older",
-        time.time(),
-        target_version - 1,
-    )
+    handler._decks[user.id] = DeckState([], time.time(), target_version - 1)
     older_resp = httpx.get(
         f"http://127.0.0.1:{port}/api/ranking-ready?version={target_version}",
         cookies={"hn_token": user.token},
@@ -1296,12 +1279,8 @@ def test_ranking_ready_true_only_from_cached_version(test_env, monkeypatch) -> N
         calls.append((warm_user.id, version))
 
     monkeypatch.setattr(handler, "_trigger_warm", classmethod(fake_trigger_warm))
-    target_version = handler._invalidate_dashboard_cache(user.id)
-    handler._dashboard_cache[f"dashboard_{user.id}"] = (
-        b"fresh",
-        time.time(),
-        target_version,
-    )
+    target_version = handler._bump_user_version(user.id)
+    handler._decks[user.id] = DeckState([], time.time(), target_version)
 
     resp = httpx.get(
         f"http://127.0.0.1:{port}/api/ranking-ready?version={target_version}",
@@ -1323,12 +1302,8 @@ def test_ranking_ready_true_only_from_cached_version(test_env, monkeypatch) -> N
 
 def test_ranking_ready_true_for_older_requested_version(test_env) -> None:
     port, _, _, handler, user = test_env
-    newer_version = handler._invalidate_dashboard_cache(user.id)
-    handler._dashboard_cache[f"dashboard_{user.id}"] = (
-        b"newer",
-        time.time(),
-        newer_version,
-    )
+    newer_version = handler._bump_user_version(user.id)
+    handler._decks[user.id] = DeckState([], time.time(), newer_version)
 
     resp = httpx.get(
         f"http://127.0.0.1:{port}/api/ranking-ready?version={newer_version - 1}",
@@ -1352,16 +1327,12 @@ def test_ranking_ready_returns_intermediate_cached_version(
         calls.append((warm_user.id, version))
 
     monkeypatch.setattr(handler, "_trigger_warm", classmethod(fake_trigger_warm))
-    for expected_version in (1, 2, 3):
-        assert handler._invalidate_dashboard_cache(user.id) == expected_version
-    handler._dashboard_cache[f"dashboard_{user.id}"] = (
-        b"intermediate",
-        time.time(),
-        2,
-    )
+    for expected_version in (2, 3, 4):
+        assert handler._bump_user_version(user.id) == expected_version
+    handler._decks[user.id] = DeckState([], time.time(), 3)
 
     resp = httpx.get(
-        f"http://127.0.0.1:{port}/api/ranking-ready?min_version=1&target_version=3",
+        f"http://127.0.0.1:{port}/api/ranking-ready?min_version=2&target_version=4",
         cookies={"hn_token": user.token},
     )
 
@@ -1369,23 +1340,19 @@ def test_ranking_ready_returns_intermediate_cached_version(
     assert resp.json() == {
         "ok": True,
         "ready": True,
-        "ready_version": 2,
-        "min_version": 1,
-        "target_version": 3,
-        "current_version": 3,
-        "cached_version": 2,
+        "ready_version": 3,
+        "min_version": 2,
+        "target_version": 4,
+        "current_version": 4,
+        "cached_version": 3,
     }
-    assert calls == [(user.id, 3)]
+    assert calls == [(user.id, 4)]
 
 
 def test_ranking_ready_version_param_remains_compat_alias(test_env) -> None:
     port, _, _, handler, user = test_env
-    target_version = handler._invalidate_dashboard_cache(user.id)
-    handler._dashboard_cache[f"dashboard_{user.id}"] = (
-        b"fresh",
-        time.time(),
-        target_version,
-    )
+    target_version = handler._bump_user_version(user.id)
+    handler._decks[user.id] = DeckState([], time.time(), target_version)
 
     resp = httpx.get(
         f"http://127.0.0.1:{port}/api/ranking-ready?version={target_version}",
@@ -1399,12 +1366,11 @@ def test_ranking_ready_version_param_remains_compat_alias(test_env) -> None:
 
 
 def _wait_for_cache(handler, user, expected_version, timeout=3.0):
-    key = f"dashboard_{user.id}"
     deadline = time.time() + timeout
     while time.time() < deadline:
-        cached = handler._dashboard_cache.get(key)
-        if cached and cached[2] == expected_version:
-            return cached[0]
+        deck = handler._decks.get(user.id)
+        if deck is not None and deck.version == expected_version:
+            return deck
         time.sleep(0.01)
     raise AssertionError(
         f"Cache for user {user.id} version {expected_version} not populated within {timeout}s"
@@ -1420,10 +1386,9 @@ def test_dashboard_cache_uses_feedback_versions(test_env, mock_embedder, monkeyp
     TestHandler.config = Config(db_path=db.db_path, server_port=0)
     TestHandler.db = db
     TestHandler.embedder = mock_embedder
-    TestHandler._dashboard_cache = {}
+    TestHandler._decks = {}
     TestHandler._dashboard_versions = {}
     TestHandler._cold_stories = []
-    TestHandler._render_locks = {}
     _reset_warm_state(TestHandler)
 
     calls = []
@@ -1445,41 +1410,34 @@ def test_dashboard_cache_uses_feedback_versions(test_env, mock_embedder, monkeyp
         pipeline, "generate_dashboard_bytes", fake_generate_dashboard_bytes
     )
 
-    # SWR: first call returns skeleton, warm thread renders async
+    # No deck and an empty pool: skeleton now, warm queued for version 1.
     assert TestHandler._render_dashboard_for_user(user) == SKELETON_HTML
-    assert len(calls) == 0
-    with TestHandler._warmup_in_flight_guard:
-        assert user.id in TestHandler._warmup_timers
-
-    # Wait for warm to complete version 0
-    html_v0 = _wait_for_cache(TestHandler, user, 0)
-    assert html_v0 == b"version=0"
+    _wait_for_cache(TestHandler, user, 1)
     assert len(calls) == 1
 
-    # Second call hits cache
-    assert TestHandler._render_dashboard_for_user(user) == b"version=0"
+    # Second call hits the cached deck.
+    assert TestHandler._render_dashboard_for_user(user) == b"version=1"
     assert len(calls) == 1
 
-    # Invalidate bumps version
-    version = TestHandler._invalidate_dashboard_cache(user.id)
-    assert version == 1
+    # A vote bumps the version.
+    version = TestHandler._bump_user_version(user.id)
+    assert version == 2
 
-    # SWR: returns stale (version 0), triggers warm for version 1
-    assert TestHandler._render_dashboard_for_user(user) == b"version=0"
-
-    # Wait for warm to complete version 1
-    html_v1 = _wait_for_cache(TestHandler, user, 1)
-    assert html_v1 == b"version=1"
+    # SWR: the stale deck still renders immediately and a warm is queued.
+    TestHandler._render_dashboard_for_user(user)
+    _wait_for_cache(TestHandler, user, 2)
+    assert TestHandler._render_dashboard_for_user(user) == b"version=2"
     assert len(calls) == 2
 
 
-@pytest.mark.parametrize(("start_version", "target_version"), [(3, 3), (0, 1)])
+@pytest.mark.parametrize("vote_counter", [3, 0])
 def test_no_cache_user_gets_cold_deck_and_warm_is_scheduled(
-    test_env, monkeypatch: pytest.MonkeyPatch, start_version: int, target_version: int
+    test_env, monkeypatch: pytest.MonkeyPatch, vote_counter: int
 ) -> None:
-    """A voted user without a cache gets the cold deck and a warm. At
-    version 0 (fresh after a restart) the version is bumped so the cold deck
-    doesn't claim to be current and clients poll for the personalized deck."""
+    """A voted user without a deck gets the cold deck (as version 0) and a
+    warm. The pool generation starts at 1, so the target is always ahead of
+    the cold deck -- including right after a restart, when the in-memory vote
+    counter is 0 -- and clients poll for the personalized deck."""
     _, db, _, handler, user = test_env
     story = Story(
         id=991,
@@ -1507,8 +1465,9 @@ def test_no_cache_user_gets_cold_deck_and_warm_is_scheduled(
     db.upsert_story(unvoted)
     calls: list[tuple[int, int]] = []
     rendered: list[dict[str, object]] = []
-    handler._dashboard_cache = {}
-    handler._dashboard_versions = {user.id: start_version}
+    handler._decks = {}
+    handler._dashboard_versions = {user.id: vote_counter}
+    target_version = handler._pool_generation + vote_counter
 
     def fake_generate_dashboard_bytes(
         ranked: list[RankedStory],
@@ -1528,7 +1487,7 @@ def test_no_cache_user_gets_cold_deck_and_warm_is_scheduled(
         )
         return b"cold html"
 
-    def fake_trigger_warm(cls, warm_user, version: int) -> None:
+    def fake_trigger_warm(cls, warm_user, version: int, delay_s: float = 0.0) -> None:
         calls.append((warm_user.id, version))
 
     import pipeline
@@ -1542,7 +1501,6 @@ def test_no_cache_user_gets_cold_deck_and_warm_is_scheduled(
 
     assert html == b"cold html"
     assert calls == [(user.id, target_version)]
-    assert handler._dashboard_version(user.id) == target_version
     rank = rendered[0]
     ranked_list = cast(list[RankedStory], rank["ranked"])
     story_ids = [rs.story.id for rs in ranked_list]
@@ -1578,7 +1536,7 @@ def test_no_cache_zero_feedback_user_gets_cold_deck_no_warm(
         )
     ]
     calls: list[tuple[int, int]] = []
-    handler._dashboard_cache = {}
+    handler._decks = {}
     handler._dashboard_versions = {user.id: 0}
     handler._cold_stories = cold
 
@@ -1619,10 +1577,9 @@ def test_stale_warm_render_does_not_overwrite_current_cache(
     TestHandler.config = Config(db_path=db.db_path, server_port=0)
     TestHandler.db = db
     TestHandler.embedder = mock_embedder
-    TestHandler._dashboard_cache = {}
+    TestHandler._decks = {}
     TestHandler._dashboard_versions = {}
     TestHandler._cold_stories = []
-    TestHandler._render_locks = {}
     _reset_warm_state(TestHandler)
 
     def fake_fast_rerank_for_user(database, config, embedder, user_id, **kwargs):
@@ -1640,30 +1597,16 @@ def test_stale_warm_render_does_not_overwrite_current_cache(
         pipeline, "generate_dashboard_bytes", fake_generate_dashboard_bytes
     )
 
-    old_version = TestHandler._invalidate_dashboard_cache(user.id)
-    new_version = TestHandler._invalidate_dashboard_cache(user.id)
-    assert (old_version, new_version) == (1, 2)
+    TestHandler._bump_user_version(user.id)
+    new_version = TestHandler._bump_user_version(user.id)
+    assert new_version == 3
 
-    cache_key = f"dashboard_{user.id}"
+    TestHandler._trigger_warm(user, new_version)
+    current = _wait_for_cache(TestHandler, user, new_version)
 
-    # SWR: returns skeleton, triggers warm for version 2
-    assert (
-        TestHandler._render_dashboard_for_user(user, expected_version=new_version)
-        == SKELETON_HTML
-    )
-
-    # Wait for warm to complete
-    current_html = _wait_for_cache(TestHandler, user, new_version)
-    assert TestHandler._dashboard_cache[cache_key][2] == new_version
-
-    # Stale hit: request with old_version returns current (version 2) cached content
-    stale_html = TestHandler._render_dashboard_for_user(
-        user, expected_version=old_version
-    )
-    assert stale_html == current_html
-    assert stale_html == current_html
-    # Cache should NOT have been overwritten — still version 2
-    assert TestHandler._dashboard_cache[cache_key][2] == new_version
+    # A late job for an older version must not replace the newer deck.
+    TestHandler._run_warm_attempt(user, new_version - 1)
+    assert TestHandler._decks[user.id] is current
 
 
 def test_active_warm_commits_when_dashboard_version_advances(
@@ -1677,10 +1620,9 @@ def test_active_warm_commits_when_dashboard_version_advances(
     TestHandler.config = Config(db_path=db.db_path, server_port=0)
     TestHandler.db = db
     TestHandler.embedder = mock_embedder
-    TestHandler._dashboard_cache = {}
+    TestHandler._decks = {}
     TestHandler._dashboard_versions = {}
     TestHandler._cold_stories = []
-    TestHandler._render_locks = {}
     _reset_warm_state(TestHandler)
 
     rank_started = threading.Event()
@@ -1703,78 +1645,25 @@ def test_active_warm_commits_when_dashboard_version_advances(
         pipeline, "generate_dashboard_bytes", fake_generate_dashboard_bytes
     )
 
-    cache_key = f"dashboard_{user.id}"
-    TestHandler._dashboard_cache[cache_key] = (b"stale content", time.time(), 0)
+    TestHandler._decks[user.id] = DeckState([], time.time(), 0)
     TestHandler._dashboard_versions[user.id] = 1
 
-    TestHandler._trigger_warm(user, version=1)
+    TestHandler._trigger_warm(user, version=2)
     assert rank_started.wait(timeout=2.0)
 
-    bumped_version = TestHandler._invalidate_dashboard_cache(user.id)
-    assert bumped_version == 2
+    bumped_version = TestHandler._bump_user_version(user.id)
+    assert bumped_version == 3
 
     allow_rank_to_finish.set()
 
     _drain_warms(TestHandler)
 
-    cached = TestHandler._dashboard_cache[cache_key]
-    assert cached[0] == b"fresh content"
-    assert cached[2] == 1
+    # The in-flight warm still commits the version it was asked for; the
+    # newer version is behind it, so the next read queues another warm.
+    assert TestHandler._decks[user.id].version == 2
 
     rank_perf_rows = db.execute("SELECT COUNT(*) FROM rank_perf")
     assert rank_perf_rows[0][0] == 1
-
-
-def test_active_warm_after_lock_wait_still_ranks_and_commits(
-    test_env, mock_embedder, monkeypatch
-) -> None:
-    _, db, _, _, user = test_env
-
-    class TestHandler(Handler):
-        pass
-
-    TestHandler.config = Config(db_path=db.db_path, server_port=0)
-    TestHandler.db = db
-    TestHandler.embedder = mock_embedder
-    TestHandler._dashboard_cache = {}
-    TestHandler._dashboard_versions = {}
-    TestHandler._cold_stories = []
-    TestHandler._render_locks = {}
-    _reset_warm_state(TestHandler)
-
-    rank_called = threading.Event()
-
-    def fake_fast_rerank_for_user(database, config, embedder, user_id, **kwargs):
-        rank_called.set()
-        return []
-
-    def fake_generate_dashboard_bytes(
-        ranked, config, database, user_id, user_token, **kwargs
-    ):
-        return b"stale warm content"
-
-    import pipeline
-
-    monkeypatch.setattr(pipeline, "fast_rerank_for_user", fake_fast_rerank_for_user)
-    monkeypatch.setattr(
-        pipeline, "generate_dashboard_bytes", fake_generate_dashboard_bytes
-    )
-
-    cache_key = f"dashboard_{user.id}"
-    lock = TestHandler._get_render_lock(user.id)
-    TestHandler._dashboard_versions[user.id] = 1
-
-    with lock:
-        TestHandler._trigger_warm(user, version=1)
-        time.sleep(0.05)
-        TestHandler._dashboard_versions[user.id] = 2
-
-    _drain_warms(TestHandler)
-
-    assert not _has_pending_warm(TestHandler)
-    assert rank_called.is_set()
-    assert TestHandler._dashboard_cache[cache_key][0] == b"stale warm content"
-    assert TestHandler._dashboard_cache[cache_key][2] == 1
 
 
 def test_rapid_vote_warms_coalesce_to_latest_version(
@@ -1788,11 +1677,10 @@ def test_rapid_vote_warms_coalesce_to_latest_version(
     TestHandler.config = Config(db_path=db.db_path, server_port=0)
     TestHandler.db = db
     TestHandler.embedder = mock_embedder
-    TestHandler._dashboard_cache = {}
+    TestHandler._decks = {}
     TestHandler._dashboard_versions = {}
     TestHandler._cold_stories = []
-    TestHandler._render_locks = {}
-    _reset_warm_state(TestHandler, debounce_s=0.05)
+    _reset_warm_state(TestHandler)
 
     ranked_versions: list[int] = []
 
@@ -1813,16 +1701,20 @@ def test_rapid_vote_warms_coalesce_to_latest_version(
         pipeline, "generate_dashboard_bytes", fake_generate_dashboard_bytes
     )
 
-    for expected_version in (1, 2, 3):
-        version = TestHandler._invalidate_dashboard_cache(user.id)
+    TestHandler.config = replace(
+        TestHandler.config,
+        dashboard_warm_vote_threshold=10,
+        dashboard_warm_idle_seconds=0.05,
+    )
+    for expected_version in (2, 3, 4):
+        version = TestHandler._bump_user_version(user.id)
         assert version == expected_version
-        TestHandler._trigger_warm(user, version=version)
+        TestHandler._schedule_feedback_warm(user, version)
 
-    html = _wait_for_cache(TestHandler, user, expected_version=3)
+    _wait_for_cache(TestHandler, user, expected_version=4)
 
-    assert html == b"version=3"
-    assert ranked_versions == [3]
-    assert TestHandler._dashboard_cache[f"dashboard_{user.id}"][2] == 3
+    assert TestHandler._render_dashboard_for_user(user) == b"version=4"
+    assert ranked_versions == [4]
 
 
 def test_warm_loops_to_newer_version_requested_while_ranking(
@@ -1836,10 +1728,9 @@ def test_warm_loops_to_newer_version_requested_while_ranking(
     TestHandler.config = Config(db_path=db.db_path, server_port=0)
     TestHandler.db = db
     TestHandler.embedder = mock_embedder
-    TestHandler._dashboard_cache = {}
+    TestHandler._decks = {}
     TestHandler._dashboard_versions = {}
     TestHandler._cold_stories = []
-    TestHandler._render_locks = {}
     _reset_warm_state(TestHandler)
 
     rank_started = threading.Event()
@@ -1866,21 +1757,20 @@ def test_warm_loops_to_newer_version_requested_while_ranking(
         pipeline, "generate_dashboard_bytes", fake_generate_dashboard_bytes
     )
 
-    version_1 = TestHandler._invalidate_dashboard_cache(user.id)
-    assert version_1 == 1
+    version_1 = TestHandler._bump_user_version(user.id)
+    assert version_1 == 2
     TestHandler._trigger_warm(user, version=version_1)
     assert rank_started.wait(timeout=2.0)
 
-    version_2 = TestHandler._invalidate_dashboard_cache(user.id)
-    assert version_2 == 2
+    version_2 = TestHandler._bump_user_version(user.id)
+    assert version_2 == 3
     TestHandler._trigger_warm(user, version=version_2)
     allow_first_rank_to_finish.set()
 
-    html = _wait_for_cache(TestHandler, user, expected_version=2)
+    _wait_for_cache(TestHandler, user, expected_version=3)
 
-    assert html == b"version=2"
-    assert ranked_versions == [1, 2]
-    assert TestHandler._dashboard_cache[f"dashboard_{user.id}"][2] == 2
+    assert TestHandler._render_dashboard_for_user(user) == b"version=3"
+    assert ranked_versions == [2, 3]
 
 
 @pytest.fixture(scope="module")
@@ -1893,7 +1783,7 @@ def prop_db():
 
 @given(
     operations=st.lists(
-        st.sampled_from(["invalidate", "render_current", "render_stale"]),
+        st.sampled_from(["invalidate", "pool_changed", "render"]),
         min_size=1,
         max_size=40,
     )
@@ -1925,73 +1815,44 @@ def test_dashboard_cache_version_invariant_property(
     TestHandler.config = Config(db_path=prop_db.db_path, server_port=0)
     TestHandler.db = prop_db
     TestHandler.embedder = mock_embedder
-    TestHandler._dashboard_cache = {}
+    TestHandler._decks = {}
     TestHandler._dashboard_versions = {}
     TestHandler._cold_stories = []
-    TestHandler._render_locks = {}
     _reset_warm_state(TestHandler)
 
     def fake_fast_rerank_for_user(database, config, embedder, user_id, **kwargs):
         return []
 
-    def fake_generate_dashboard_bytes(
-        ranked, config, database, user_id, user_token, **kwargs
-    ):
-        return f"v={TestHandler._dashboard_version(user_id)}".encode()
-
     import pipeline
 
     monkeypatch.setattr(pipeline, "fast_rerank_for_user", fake_fast_rerank_for_user)
+    monkeypatch.setattr(pipeline, "generate_dashboard_bytes", _fake_render)
     monkeypatch.setattr(
-        pipeline, "generate_dashboard_bytes", fake_generate_dashboard_bytes
+        TestHandler, "_rebuild_cold_deck", classmethod(lambda cls: None)
     )
 
-    cache_key = f"dashboard_{user.id}"
     for operation in operations:
-        current_version = TestHandler._dashboard_version(user.id)
-        cached_before = TestHandler._dashboard_cache.get(cache_key)
         if operation == "invalidate":
-            TestHandler._invalidate_dashboard_cache(user.id)
-        elif operation == "render_current":
-            rendered = TestHandler._render_dashboard_for_user(user)
-            allowed = {SKELETON_HTML, f"v={current_version}".encode()}
-            if cached_before is not None:
-                allowed.add(cached_before[0])
-            assert rendered in allowed
+            TestHandler._bump_user_version(user.id)
+        elif operation == "pool_changed":
+            TestHandler._pool_changed()
         else:
-            stale_version = max(0, current_version - 1)
-            rendered = TestHandler._render_dashboard_for_user(
-                user, expected_version=stale_version
-            )
-            if cached_before is not None:
-                # A stale hit must return content that was in cache before;
-                # the warm may replace it only after the response is formed.
-                assert rendered == cached_before[0]
+            current = TestHandler._dashboard_version(user.id)
+            rendered = TestHandler._render_dashboard_for_user(user)
+            if rendered != SKELETON_HTML:
+                # Every render reports the live version as its target and
+                # never claims to be newer than it.
+                page_version, target = map(
+                    int, rendered.decode().split()[0][2:].split("/")
+                )
+                assert target == current
+                assert page_version <= current
+            # Rendering queues whatever warm is needed: the deck catches up.
+            _wait_for_cache(TestHandler, user, current)
 
-        if operation == "render_current":
-            # Rendering must eventually warm the requested current version,
-            # not merely leave the cache absent while the weak version-order
-            # invariant continues to pass.
-            warmed = _wait_for_cache(TestHandler, user, current_version)
-            assert warmed == f"v={current_version}".encode()
-
-        # Wait for any in-flight warm to settle before checking invariant.
-        # SWR allows stale cache entries (cache version < current version)
-        # between invalidation and warm completion.
-        deadline = time.time() + 3.0
-        while time.time() < deadline:
-            cached = TestHandler._dashboard_cache.get(cache_key)
-            cur_ver = TestHandler._dashboard_version(user.id)
-            if cached is None or cached[2] <= cur_ver:
-                break
-            time.sleep(0.01)
-        cached = TestHandler._dashboard_cache.get(cache_key)
-        if cached is not None:
-            cur_ver = TestHandler._dashboard_version(user.id)
-            assert cached[2] <= cur_ver, (
-                f"cache version {cached[2]} > dashboard version "
-                f"{cur_ver} after op={operation}"
-            )
+        deck = TestHandler._decks.get(user.id)
+        if deck is not None:
+            assert deck.version <= TestHandler._dashboard_version(user.id)
 
     # Drain in-flight warm threads before monkeypatch cleanup so they don't
     # capture our fakes and leak into subsequent tests.
@@ -2148,7 +2009,7 @@ def test_flask_test_client_ranking_ready_reports_missing_cache(
         calls.append((warm_user.id, version))
 
     monkeypatch.setattr(handler, "_trigger_warm", classmethod(fake_trigger_warm))
-    version = handler._invalidate_dashboard_cache(user.id)
+    version = handler._bump_user_version(user.id)
 
     resp = client.get(f"/api/ranking-ready?min_version={version}&target_version=3")
 
@@ -2216,12 +2077,12 @@ def test_flask_test_client_feedback_writes_and_queues_refresh(test_env: Any) -> 
     assert resp.get_json() == {
         "ok": True,
         "ranking_refresh_queued": False,
-        "target_version": 1,
+        "target_version": 2,
         "ranking_idle_seconds": handler.config.dashboard_warm_idle_seconds,
     }
     records = db.get_all_feedback(user.id)
     assert [(record.story_id, record.action) for record in records] == [(1710, "up")]
-    assert handler._dashboard_version(user.id) == 1
+    assert handler._dashboard_version(user.id) == 2
     assert not regen_event.is_set()
     assert _has_pending_feedback_regen(handler)
 
@@ -2237,7 +2098,7 @@ def test_flask_test_client_feedback_rejects_invalid_payload(test_env: Any) -> No
     assert resp.status_code == 400
     assert resp.get_json() == {"error": "Invalid feedback"}
     assert db.get_all_feedback(user.id) == []
-    assert handler._dashboard_version(user.id) == 0
+    assert handler._dashboard_version(user.id) == handler._pool_generation
     assert not regen_event.is_set()
 
 
@@ -5711,7 +5572,7 @@ def test_dashboard_renders_user_vote_counts_zero_for_no_feedback(test_env):
     """Fresh user with no feedback → all three counts are 0."""
     port, db, regen_event, handler, user = test_env
     assert handler._render_dashboard_for_user(user) == SKELETON_HTML
-    _wait_for_cache(handler, user, 0, timeout=3.0)
+    _wait_for_cache(handler, user, handler._dashboard_version(user.id), timeout=3.0)
     resp = httpx.get(
         f"http://127.0.0.1:{port}/",
         cookies={"hn_token": user.token},
@@ -5756,7 +5617,7 @@ def test_dashboard_renders_user_vote_counts_with_feedback(test_env):
         db.upsert_feedback(user.id, 4000 + i, "down")
 
     assert handler._render_dashboard_for_user(user) == SKELETON_HTML
-    _wait_for_cache(handler, user, 0, timeout=3.0)
+    _wait_for_cache(handler, user, handler._dashboard_version(user.id), timeout=3.0)
     resp = httpx.get(
         f"http://127.0.0.1:{port}/",
         cookies={"hn_token": user.token},
@@ -5797,7 +5658,7 @@ def test_dashboard_vote_counts_aggregate_across_refreshes(test_env):
         db.upsert_feedback(user.id, 6000 + i, "down")
 
     assert handler._render_dashboard_for_user(user) == SKELETON_HTML
-    _wait_for_cache(handler, user, 0, timeout=3.0)
+    _wait_for_cache(handler, user, handler._dashboard_version(user.id), timeout=3.0)
     resp = httpx.get(
         f"http://127.0.0.1:{port}/",
         cookies={"hn_token": user.token},
@@ -5825,8 +5686,15 @@ def test_dashboard_skeleton_returns_when_no_cache(test_env):
     assert b'meta http-equiv="refresh" content="1"' in resp.content
 
 
+def _fake_render(ranked: list[RankedStory], *args: object, **kwargs: object) -> bytes:
+    """Render stub that exposes what the handler asked for."""
+    version = kwargs["dashboard_version"]
+    current = kwargs["dashboard_latest_version"]
+    return f"v={version}/{current} n={len(ranked)}".encode()
+
+
 @pytest.fixture
-def swr_handler(test_env, mock_embedder):
+def swr_handler(test_env, mock_embedder, monkeypatch: pytest.MonkeyPatch):
     _, db, _, _, user = test_env
 
     class SwrHandler(Handler):
@@ -5835,221 +5703,123 @@ def swr_handler(test_env, mock_embedder):
     SwrHandler.config = Config(db_path=db.db_path, server_port=0)
     SwrHandler.db = db
     SwrHandler.embedder = mock_embedder
-    SwrHandler._dashboard_cache = {}
+    SwrHandler._decks = {}
     SwrHandler._dashboard_versions = {}
     SwrHandler._cold_stories = []
-    SwrHandler._render_locks = {}
     _reset_warm_state(SwrHandler)
 
     import pipeline
 
-    old_fast_rerank = pipeline.fast_rerank_for_user
-    old_gen_bytes = pipeline.generate_dashboard_bytes
-    pipeline.fast_rerank_for_user = lambda db, c, e, uid: []  # type: ignore
-    pipeline.generate_dashboard_bytes = lambda *a, **kw: b""  # type: ignore
+    monkeypatch.setattr(pipeline, "fast_rerank_for_user", lambda *a, **kw: [])
+    monkeypatch.setattr(pipeline, "generate_dashboard_bytes", _fake_render)
 
     yield user, SwrHandler
 
-    _drain_warms(SwrHandler)
-    pipeline.fast_rerank_for_user = old_fast_rerank
-    pipeline.generate_dashboard_bytes = old_gen_bytes
+    _cancel_warms(SwrHandler)
 
 
-def test_dashboard_stale_hit_returns_when_version_mismatch(swr_handler):
+def _deck(version: int, built_at: float | None = None) -> DeckState:
+    return DeckState([], time.time() if built_at is None else built_at, version)
+
+
+def test_dashboard_stale_hit_renders_deck_as_stale_and_queues_warm(swr_handler):
+    # A stale deck is still served immediately, but rendered with the live
+    # version as data-current-version so the client's pageVer < currVer
+    # check fires and it polls for the refreshed deck.
     user, h = swr_handler
-    stale_html = b"stale content"
-    h._dashboard_cache[f"dashboard_{user.id}"] = (stale_html, time.time(), 0)
-    h._dashboard_versions[user.id] = 1
-
-    result = h._render_dashboard_for_user(user)
-    assert result == stale_html
-
-
-def test_patch_current_version_replaces_attribute_value():
-    from server import _patch_current_version
-
-    html = b'<div data-dashboard-version="3" data-current-version="3">x</div>'
-    patched = _patch_current_version(html, 7)
-    assert (
-        patched == b'<div data-dashboard-version="3" data-current-version="7">x</div>'
+    h._decks[user.id] = _deck(1)
+    h._dashboard_versions[user.id] = 2  # current = generation 1 + 2 = 3
+    calls: list[tuple[int, int]] = []
+    h._trigger_warm = classmethod(  # type: ignore[method-assign]
+        lambda cls, warm_user, version, delay_s=0.0: calls.append(
+            (warm_user.id, version)
+        )
     )
 
-
-def test_patch_current_version_is_noop_without_attribute():
-    from server import _patch_current_version
-
-    html = b"no version attribute here"
-    assert _patch_current_version(html, 7) == html
+    assert h._render_dashboard_for_user(user) == b"v=1/3 n=0"
+    assert calls == [(user.id, 3)]
 
 
-def test_dashboard_stale_hit_patches_current_version_to_live_version(swr_handler):
-    # A stale_hit response must self-report as stale via `data-current-version`
-    # so the client's `pageVer < currVer` staleness check (index.html) fires
-    # and schedules a warm-poll refill — otherwise a page carrying identical
-    # dashboard/current versions looks current even though it's the old,
-    # HN-only render from before the live version advanced.
+def test_dashboard_cache_hit_renders_current_without_warm(swr_handler):
     user, h = swr_handler
-    stale_html = (
-        b'<div id="stories" data-dashboard-version="0" data-current-version="0"></div>'
-    )
-    h._dashboard_cache[f"dashboard_{user.id}"] = (stale_html, time.time(), 0)
-    h._dashboard_versions[user.id] = 3
-
-    result = h._render_dashboard_for_user(user)
-    assert b'data-dashboard-version="0"' in result
-    assert b'data-current-version="3"' in result
-
-
-def test_dashboard_cache_hit_returns_when_version_matches(swr_handler):
-    user, h = swr_handler
-    fresh_html = b"fresh content"
-    h._dashboard_cache[f"dashboard_{user.id}"] = (fresh_html, time.time(), 0)
-    h._dashboard_versions[user.id] = 0
-
-    result = h._render_dashboard_for_user(user)
-    assert result == fresh_html
-
-
-def test_trigger_warm_dedup(swr_handler):
-    user, h = swr_handler
-    h._trigger_warm(user, version=42)
-    h._trigger_warm(user, version=42)
-
-    with h._warmup_in_flight_guard:
-        assert user.id in h._warmup_timers
-        assert h._warmup_requested_versions[user.id] == 42
-        assert len(h._warmup_timers) == 1
-
-
-def test_trigger_warm_different_versions_coalesce(swr_handler):
-    user, h = swr_handler
-    h._trigger_warm(user, version=1)
-    h._trigger_warm(user, version=2)
-
-    with h._warmup_in_flight_guard:
-        assert user.id in h._warmup_timers
-        assert h._warmup_requested_versions[user.id] == 2
-        assert len(h._warmup_timers) == 1
-
-
-def test_trigger_warm_same_version_does_not_extend_deadline(swr_handler):
-    user, h = swr_handler
-    h._WARM_DEBOUNCE_S = 0.2
-    h._trigger_warm(user, version=1)
-
-    with h._warmup_in_flight_guard:
-        first_request_at = h._warmup_last_request_at[user.id]
-        first_timer = h._warmup_timers[user.id]
-
-    time.sleep(0.03)
-    for _ in range(3):
-        h._trigger_warm(user, version=1)
-        time.sleep(0.01)
-
-    with h._warmup_in_flight_guard:
-        assert h._warmup_requested_versions[user.id] == 1
-        assert h._warmup_last_request_at[user.id] == first_request_at
-        assert h._warmup_timers[user.id] is first_timer
-
-
-def test_trigger_warm_stale_request_does_not_restart_timer(swr_handler):
-    user, h = swr_handler
-    h._WARM_DEBOUNCE_S = 0.2
     h._dashboard_versions[user.id] = 2
-    h._trigger_warm(user, version=2)
+    h._decks[user.id] = _deck(3)
 
-    with h._warmup_in_flight_guard:
-        first_request_at = h._warmup_last_request_at[user.id]
-        first_timer = h._warmup_timers[user.id]
+    assert h._render_dashboard_for_user(user) == b"v=3/3 n=0"
+    assert not _has_pending_warm(h)
 
-    time.sleep(0.03)
+
+def test_trigger_warm_coalesces_to_newest_pending_version(swr_handler):
+    user, h = swr_handler
+    h._dashboard_versions[user.id] = 41
+    h._trigger_warm(user, version=42, delay_s=5.0)
+    h._trigger_warm(user, version=42, delay_s=5.0)
+    assert h._warm_scheduler().pending_version(user.id) == 42
+
+    other = h.db.create_user("coalesce_other")
+    h._trigger_warm(other, version=1, delay_s=5.0)
+    h._dashboard_versions[other.id] = 1
+    h._trigger_warm(other, version=2, delay_s=5.0)
+    assert h._warm_scheduler().pending_version(other.id) == 2
+
+
+def test_trigger_warm_skips_when_deck_is_fresh(swr_handler):
+    user, h = swr_handler
+    h._decks[user.id] = _deck(h._dashboard_version(user.id))
     h._trigger_warm(user, version=1)
-
-    with h._warmup_in_flight_guard:
-        assert h._warmup_requested_versions[user.id] == 2
-        assert h._warmup_last_request_at[user.id] == first_request_at
-        assert h._warmup_timers[user.id] is first_timer
+    assert not _has_pending_warm(h)
 
 
-def test_enforce_cache_cap(swr_handler):
+def test_trigger_warm_never_requests_below_live_version(swr_handler):
+    # A late request for an old version still builds the live one.
     user, h = swr_handler
+    h._dashboard_versions[user.id] = 4
+    h._trigger_warm(user, version=1, delay_s=5.0)
+    assert h._warm_scheduler().pending_version(user.id) == 5
+
+
+def test_evict_old_decks_keeps_newest(swr_handler):
+    user, h = swr_handler
+    h._MAX_CACHED_DECKS = 100
     for i in range(102):
-        h._dashboard_cache[f"dashboard_{i}"] = (b"", float(i), 0)
+        h._decks[i] = _deck(0, built_at=float(i))
 
-    h._enforce_cache_cap(max_entries=100)
+    with h._dashboard_versions_guard:
+        h._evict_old_decks_locked()
 
-    assert len(h._dashboard_cache) == 100
-    assert "dashboard_0" not in h._dashboard_cache
-    assert "dashboard_1" not in h._dashboard_cache
-    assert "dashboard_99" in h._dashboard_cache
-    assert "dashboard_101" in h._dashboard_cache
+    assert len(h._decks) == 100
+    assert 0 not in h._decks and 1 not in h._decks
+    assert 99 in h._decks and 101 in h._decks
 
 
-def test_bump_all_cached_versions(swr_handler):
+def test_pool_changed_stales_every_deck_and_queues_cached_users(swr_handler):
+    # Regen/RSS refresh bumps the pool generation once: every user's live
+    # version advances (including users with no vote counter and users with
+    # no cached deck), and each cached user gets a refresh queued. A cached
+    # deck for a user id no longer in the users table is skipped.
     user, h = swr_handler
-    h._dashboard_versions = {1: 5, 2: 10, 3: 0}
-    h._bump_all_cached_versions()
-
-    assert h._dashboard_versions[1] == 6
-    assert h._dashboard_versions[2] == 11
-    assert h._dashboard_versions[3] == 1
-
-
-def test_bump_all_cached_versions_covers_users_with_no_prior_version(swr_handler):
-    # A user who has never voted has no entry in _dashboard_versions (it
-    # implicitly reads as 0), but can still hold a live _dashboard_cache
-    # entry from their first cold-deck render. Without covering this case,
-    # _bump_all_cached_versions never advances their version past 0, so
-    # every future GET / is a permanent cache_hit on stale bytes — not even
-    # a reload fixes it (see WORKLOG 2026-08-28).
-    user, h = swr_handler
-    h._dashboard_versions = {}
-    h._dashboard_cache = {
-        f"dashboard_{user.id}": (b"cached", time.time(), 0),
-    }
-
-    h._bump_all_cached_versions()
-
-    assert h._dashboard_versions[user.id] == 1
-
-
-def test_warm_stale_cached_users_warms_every_cached_user(swr_handler):
-    # After a regen/RSS-refresh bump, no per-user render is ever scheduled
-    # on its own (see WORKLOG 2026-08-28) — a cached user's stale bytes just
-    # sit there until their own next request. _warm_stale_cached_users must
-    # proactively trigger a warm for every user with a live cache entry.
-    user, h = swr_handler
-    other_user = h.db.create_user("other_user_tok")
-    h._dashboard_cache = {
-        f"dashboard_{user.id}": (b"cached", time.time(), 0),
-        f"dashboard_{other_user.id}": (b"cached", time.time(), 0),
-    }
-    h._dashboard_versions = {user.id: 1, other_user.id: 1}
-    calls: list[int] = []
-    h._trigger_warm = classmethod(  # type: ignore[method-assign]
-        lambda cls, warm_user, version: calls.append(warm_user.id)
+    other = h.db.create_user("pool_other")
+    h._dashboard_versions = {user.id: 2}
+    h._decks = {user.id: _deck(3), other.id: _deck(1), 999999999: _deck(1)}
+    rebuilt: list[bool] = []
+    h._rebuild_cold_deck = classmethod(  # type: ignore[method-assign]
+        lambda cls: rebuilt.append(True)
     )
-
-    h._warm_stale_cached_users()
-
-    assert sorted(calls) == sorted([user.id, other_user.id])
-
-
-def test_warm_stale_cached_users_skips_unknown_user_id(swr_handler):
-    # A cache entry for a user_id no longer in the users table (e.g. a
-    # pruned/never-created row) must not crash the warm sweep.
-    user, h = swr_handler
-    h._dashboard_cache = {
-        "dashboard_999999999": (b"cached", time.time(), 0),
-    }
-    calls: list[int] = []
+    calls: list[tuple[int, int]] = []
     h._trigger_warm = classmethod(  # type: ignore[method-assign]
-        lambda cls, warm_user, version: calls.append(warm_user.id)
+        lambda cls, warm_user, version, delay_s=0.0: calls.append(
+            (warm_user.id, version)
+        )
     )
+    before = {uid: h._dashboard_version(uid) for uid in (user.id, other.id, 12345)}
 
-    h._warm_stale_cached_users()
+    h._pool_changed()
 
-    assert calls == []
+    assert rebuilt == [True]
+    assert {uid: h._dashboard_version(uid) for uid in before} == {
+        uid: v + 1 for uid, v in before.items()
+    }
+    assert sorted(calls) == sorted([(user.id, 4), (other.id, 2)])
 
 
 def test_setFilter_preserves_sort_age_source_refresh_behavior() -> None:
@@ -6228,7 +5998,7 @@ def test_data_is_recent_attribute_emitted(test_env):
         )
     )
     handler._render_dashboard_for_user(user)
-    _wait_for_cache(handler, user, 0, timeout=3.0)
+    _wait_for_cache(handler, user, handler._dashboard_version(user.id), timeout=3.0)
     resp = httpx.get(
         f"http://127.0.0.1:{port}/",
         cookies={"hn_token": user.token},
@@ -6284,7 +6054,7 @@ def test_deck_cards_returns_only_card_fragment(test_env) -> None:
         )
     )
     handler._render_dashboard_for_user(user)
-    _wait_for_cache(handler, user, 0, timeout=3.0)
+    _wait_for_cache(handler, user, handler._dashboard_version(user.id), timeout=3.0)
 
     full = httpx.get(
         f"http://127.0.0.1:{port}/",
@@ -6319,13 +6089,18 @@ def test_deck_cards_triggers_warm_on_stale_cache(
     # serve the stale fragment immediately (SWR), but kick off a warm.
     port, _, _, handler, user = test_env
     cached_html = b'<!--cards:start--><div data-story-id="7001"></div><!--cards:end-->'
-    handler._dashboard_cache[f"dashboard_{user.id}"] = (cached_html, time.time(), 1)
-    handler._dashboard_versions[user.id] = 2
+    import pipeline
+
+    monkeypatch.setattr(
+        pipeline, "generate_dashboard_bytes", lambda *a, **kw: cached_html
+    )
+    handler._decks[user.id] = DeckState([], time.time(), 1)
+    handler._dashboard_versions[user.id] = 2  # current = 3
     calls: list[int] = []
     monkeypatch.setattr(
         handler,
         "_trigger_warm",
-        classmethod(lambda cls, warm_user, version: calls.append(version)),
+        classmethod(lambda cls, warm_user, version, delay_s=0.0: calls.append(version)),
     )
 
     response = httpx.get(
@@ -6335,7 +6110,7 @@ def test_deck_cards_triggers_warm_on_stale_cache(
 
     assert response.status_code == 200
     assert 'data-story-id="7001"' in response.text
-    assert calls == [2]
+    assert calls == [3]
 
 
 def test_deck_cards_does_not_warm_when_cache_is_current(
@@ -6343,13 +6118,18 @@ def test_deck_cards_does_not_warm_when_cache_is_current(
 ) -> None:
     port, _, _, handler, user = test_env
     cached_html = b'<!--cards:start--><div data-story-id="7001"></div><!--cards:end-->'
-    handler._dashboard_cache[f"dashboard_{user.id}"] = (cached_html, time.time(), 2)
-    handler._dashboard_versions[user.id] = 2
+    import pipeline
+
+    monkeypatch.setattr(
+        pipeline, "generate_dashboard_bytes", lambda *a, **kw: cached_html
+    )
+    handler._decks[user.id] = DeckState([], time.time(), 3)
+    handler._dashboard_versions[user.id] = 2  # current = 3
     calls: list[int] = []
     monkeypatch.setattr(
         handler,
         "_trigger_warm",
-        classmethod(lambda cls, warm_user, version: calls.append(version)),
+        classmethod(lambda cls, warm_user, version, delay_s=0.0: calls.append(version)),
     )
 
     response = httpx.get(

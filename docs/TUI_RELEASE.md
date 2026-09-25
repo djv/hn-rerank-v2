@@ -49,8 +49,8 @@ ssh hetzner 'systemctl --user restart hn_rewrite.service'
 Rollback is `git reset --hard deploy-pre-<change>` plus a restart. The service
 is a systemd **user** unit (`systemctl --user ...`) running
 `uv run python server.py` on 127.0.0.1:8766 behind Caddy; production Explore
-stays shuffled and `_patch_current_version` preserves the attached
-`DashboardDocument` feed.
+stays shuffled, and the feed is rendered from the cached deck on each read
+(`DeckState`), alongside the HTML.
 
 After restart, smoke the dashboard plus cached/uncached `POST /api/tldr-detail`
 with a dedicated test profile, and scan

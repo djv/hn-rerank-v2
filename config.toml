@@ -6,6 +6,9 @@ embedding_max_tokens = 4096
 embedding_batch_size = 1
 dashboard_warm_vote_threshold = 10
 dashboard_warm_idle_seconds = 3.0
+# Concurrent personalized re-ranks (votes, stale loads, post-regen refreshes
+# of every cached user). 2 leaves CPU headroom for requests on the 4-core VPS.
+warm_pool_size = 2
 feedback_regen_idle_seconds = 300.0
 non_hn_candidates_enabled = true
 tldr_uncached_per_user_limit = 240

@@ -11,8 +11,7 @@ from bs4 import BeautifulSoup
 from clients.tui.src.hn_rerank.models import Feed
 from database import Database, Story, User
 from pipeline import Config, RankedStory
-from pipeline.render import DashboardDocument, generate_dashboard_bytes
-from server import Handler, create_app
+from server import DeckState, Handler, create_app
 
 
 def payload(response: TestResponse) -> Any:
@@ -25,12 +24,12 @@ def test_feed_parity_authentication_stale_cache_and_eviction(tmp_path: Path) -> 
     db = Database(str(tmp_path / "feed.db"))
 
     class Runtime(Handler):
-        _dashboard_cache = {}
+        _decks = {}
         _dashboard_versions = {}
         _cold_stories = []
 
         @classmethod
-        def _trigger_warm(cls, user: User, version: int) -> None:
+        def _trigger_warm(cls, user: User, version: int, delay_s: float = 0.0) -> None:
             pass
 
     Runtime.db = db
@@ -81,7 +80,8 @@ def test_feed_parity_authentication_stale_cache_and_eviction(tmp_path: Path) -> 
         story["id"] for story in feed["stories"]
     ]
     assert response.headers["Cache-Control"] == "no-store"
-    assert feed["version"] == 0 and feed["ready"] is True
+    # No votes: the shared cold deck is this user's current deck.
+    assert feed["version"] == 1 and feed["ready"] is True
     html = client.get("/").data
     cards = BeautifulSoup(html, "html.parser").select(".story-card")
     assert [int(str(card["data-story-id"])) for card in cards] == [
@@ -106,19 +106,15 @@ def test_feed_parity_authentication_stale_cache_and_eviction(tmp_path: Path) -> 
             assert feed["orders"][f"{sort}:{age}"] == [
                 int(str(c["data-story-id"])) for c in matching
             ]
-    document = generate_dashboard_bytes(
-        ranked, Runtime.config, db, user.id, user.token, 0, 0
-    )
-    assert isinstance(document, DashboardDocument)
-    Runtime._dashboard_cache[f"dashboard_{user.id}"] = (document, time.time(), 0)
+    Runtime._decks[user.id] = DeckState(ranked, time.time(), 1)
     for item in ranked:
         db.upsert_story(item.story)
     vote = client.post("/api/feedback", json={"story_id": 1, "action": "up"})
-    assert payload(vote)["target_version"] == 1
+    assert payload(vote)["target_version"] == 2
     stale = payload(client.get("/api/feed"))
     assert not Feed.parse(stale).ready
     assert stale["stories"] == feed["stories"]
-    assert stale["version"] == 0 and stale["target_version"] == 1 and not stale["ready"]
+    assert stale["version"] == 1 and stale["target_version"] == 2 and not stale["ready"]
     assert (
         BeautifulSoup(client.get("/").data, "html.parser").select(".story-card")
         == cards
@@ -126,21 +122,20 @@ def test_feed_parity_authentication_stale_cache_and_eviction(tmp_path: Path) -> 
     client.set_cookie("hn_token", other.token)
     assert payload(client.get("/api/feed"))["feedback_counts"]["up"] == 0
     client.set_cookie("hn_token", user.token)
-    warmed = generate_dashboard_bytes(
-        ranked[1:], Runtime.config, db, user.id, user.token, 1, 1
-    )
-    Runtime._dashboard_cache[f"dashboard_{user.id}"] = (warmed, time.time(), 1)
+    Runtime._decks[user.id] = DeckState(ranked[1:], time.time(), 2)
     assert payload(client.get("/api/feed"))["orders"]["recommended:recent"] == [2]
     assert payload(client.get("/api/feed"))["feedback_counts"]["up"] == 1
     assert (
         payload(client.post("/api/feedback", json={"story_id": 1, "action": "clear"}))[
             "target_version"
         ]
-        == 2
+        == 3
     )
-    Runtime._dashboard_cache["dashboard_other"] = (warmed, time.time() + 1, 1)
-    Runtime._enforce_cache_cap(1)
-    assert f"dashboard_{user.id}" not in Runtime._dashboard_cache
+    Runtime._MAX_CACHED_DECKS = 1
+    Runtime._decks[other.id] = DeckState(ranked, time.time() + 1, 1)
+    with Runtime._dashboard_versions_guard:
+        Runtime._evict_old_decks_locked()
+    assert user.id not in Runtime._decks
     Runtime._cold_stories = []
     empty = payload(client.get("/api/feed"))
     assert not Feed.parse(empty).stories

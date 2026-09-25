@@ -15,7 +15,8 @@ versions, content-presence tests and queues. There is no unified per-story
 
 Startup delay -> event or interval wait -> fetch candidates -> HN growth probes
 and comment prewarm -> LessWrong prewarm -> invalidate shared candidate pool /
-rebuild cold deck -> bump dashboard versions -> schedule cached-user warms ->
+rebuild cold deck -> bump the pool generation (every deck goes stale) -> queue
+cached-user warms on the bounded warm pool ->
 submit independent Reddit refresh and article/TLDR background work -> wait.
 
 The deployed default is four hours **after completion**, not a fixed wall-clock
@@ -55,12 +56,18 @@ ranking masks feedback out of the shared pool.
 
 ### Per-user deck (`server.py:Handler`)
 
-- Matching version: serve cached document immediately; no age-based expiration.
-- Old version: serve stale document and request background warm.
-- No document: serve cold deck or skeleton; schedule personalization as needed.
-- Warm: debounce, coalesce requested version, one running warm per user, rank
-  from local candidate snapshot, atomically publish HTML+feed document, then
-  schedule another attempt if a newer version was requested.
+- Version = pool generation + the user's vote counter (generation starts at 1).
+- Matching version: render the cached deck immediately; no age-based expiration.
+- Old version: render the stale deck (reporting the live version as target) and
+  queue a background warm.
+- No deck: users with votes get the cold deck as version 0 plus a queued warm;
+  users without votes get the shared cold deck as current; an empty pool gets
+  the skeleton plus a queued warm.
+- Warm (`warm_scheduler.py`): per user, one pending job at the newest version
+  and one running job, on `warm_pool_size` workers; votes debounce through it.
+  A warm ranks from the local candidate snapshot and publishes a `DeckState`;
+  HTML and feed JSON are rendered from it on read. A version requested while a
+  rank runs is built right after it.
 - Core and changed Reddit completion explicitly rebuild/invalidate and publish
   new versions. Background article/summary work does not itself perform that
   complete publication sequence.

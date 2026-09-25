@@ -361,7 +361,7 @@ def _build_tab_groups() -> tuple[TabGroupView, ...]:
 
 
 class DashboardDocument(bytes):
-    """HTML and its wire representation travel atomically through the SWR cache."""
+    """HTML plus the `/api/feed` snapshot built by the same render."""
 
     feed: Feed
 

@@ -3,7 +3,7 @@
 ## Context
 
 This is a personal, single-user, local-first Hacker News reranking dashboard.
-`GET /` is SWR-cached (`Handler._dashboard_cache`, server.py:984) — the
+`GET /` serves the cached per-user deck (`Handler._decks`, rendered on read) — the
 user-facing latency that matters is **vote → warm completion → ready-gated
 refill**, not page-render time. Deployment shape is SQLite + one systemd
 service; do not reach for Postgres, Redis, a message broker, FAISS, or a deep

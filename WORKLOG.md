@@ -1,5 +1,59 @@
 # Worklog: hn-rewrite
 
+## 2026-09-25 Simplify the dashboard cache and warm state machine
+
+A review of the load/fetch/cache lifecycle after the restart fix (entry
+below) found layered cruft. Changes (server-side only; the web client and the
+`/api/ranking-ready`, `/api/deck-cards` and `/api/feed` contracts are
+unchanged):
+
+- **Bounded, coalescing warm scheduler** (`warm_scheduler.py`). Per user: at
+  most one pending job (newest version wins) and one running job; at most
+  `warm_pool_size` (new config knob, default 2) running overall. It replaces
+  `_warmup_requested_versions`/`_last_request_at`/`_timers`/`_running_users`,
+  the `_WARM_DEBOUNCE_S = 0.0` debounce (whose timers and remaining-time math
+  never delayed anything), per-user render locks, triple-checked cache reads,
+  and the vote-idle timers (`_feedback_warm_timers/_versions`). Vote debounce
+  is now a delay on the same request. Before this, a regen started one rank
+  thread per cached user (up to 100 at once), a likely source of
+  `dashboard_warm_starved`; now at most 2 run.
+- **Derived versions.** Version = `_pool_generation + per-user vote counter`.
+  Regen/RSS refresh is `Handler._pool_changed()`: rebuild the cold deck, bump
+  the generation once, queue a refresh for each cached user. This replaces
+  `_bump_all_cached_versions` (and its cache-key parsing workaround) and
+  `_warm_stale_cached_users`. The generation starts at 1, so a cold deck
+  (version 0) is always behind its target; the special-case restart bump
+  from the previous entry is gone because the invariant now holds
+  structurally.
+- **Cache the deck, render on read.** `_decks: dict[int, DeckState(ranked,
+  built_at, version)]` replaces `_dashboard_cache["dashboard_<id>"] =
+  (html, ts, version)`. HTML and feed JSON are rendered from the deck on
+  every read with the live version, so `_patch_current_version` (byte
+  patching of `data-current-version`) is gone. `/api/deck-cards` now reuses
+  `_render_dashboard_for_user` instead of its own copy of the stale-cache
+  handling. Cost: a cache-hit GET / renders in about 30 ms instead of
+  returning cached bytes; `rank_perf.html_ms` is now 0 for warms.
+- **Not-ready shapes.** A user with no votes gets the shared cold deck as
+  their current deck (no warm, `ready=true`); a user with votes but no deck
+  gets the cold deck minus voted stories as version 0 plus a warm; the
+  skeleton only appears when the pool is empty, and it queues a warm too.
+- **Smaller fixes:** deck eviction now runs under the versions lock (the old
+  `_enforce_cache_cap` sorted the dict unlocked, and a concurrent insert
+  could raise); the unreachable `skipped_stale` branch is removed.
+
+Observed, not changed: the vote idle debounce rarely delays anything. Any
+read after a vote (the client's own refill via `/api/deck-cards`, or a
+`/api/feed` poll) sees a stale deck and asks for an immediate warm; the old
+code behaved the same way.
+
+Verification: 857 passed (`-n 4`, ~16 s), ruff/format/ty clean. New
+`tests/test_warm_scheduler.py` (coalescing, one job per key, pool bound,
+debounce, failure isolation, clear_pending); handler tests rewritten against
+`DeckState`/scheduler; the Hypothesis invariant test now also exercises
+pool changes. On a restarted demo server: a voted user's first load is 0/1,
+the warm lands in 0.43 s and Explore has 9 cards; a new user gets 1/1
+`ready=true`; a vote goes 2 → warm → ready.
+
 ## 2026-09-25 Fix: empty Explore / unpersonalized deck after a restart
 
 Symptom: Explore empty, Recommended not personalized, until the user voted

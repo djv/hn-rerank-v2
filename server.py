@@ -46,6 +46,7 @@ from pipeline import Config, DEFAULT_ENV_PATH, Embedder, RankedStory, is_hn_sour
 from llm_limiter import limiter as llm_limiter
 from reddit_limiter import limiter as reddit_limiter
 import http_fetch
+from warm_scheduler import WarmScheduler
 
 ARTICLE_BODY_CHAR_LIMIT = 30_000
 SELF_TEXT_PROMPT_CHAR_LIMIT = 16_000
@@ -1399,29 +1400,55 @@ SKELETON_HTML = b"""<!DOCTYPE html>
 <body><p>Loading your personalized dashboard...</p></body></html>"""
 
 
+@dataclass(frozen=True)
+class DeckState:
+    """A user's personalized ranking and the dashboard version it was built for.
+
+    HTML and `/api/feed` JSON are rendered from this on every read, so the
+    current version is always rendered in rather than patched into bytes.
+    """
+
+    ranked: list[RankedStory]
+    built_at: float
+    version: int
+
+
 class Handler:
+    """Per-user dashboard state machine.
+
+    - Version: ``_pool_generation + _dashboard_versions[user]``. A vote bumps
+      the user's counter; a regen/RSS refresh bumps the generation once, which
+      makes every deck stale. The generation starts at 1, so a cold deck
+      (rendered as version 0) is always behind its target, including right
+      after a restart when all of this in-memory state is gone.
+    - Deck: ``_decks[user]`` is fresh when ``deck.version >= version``.
+      A read never blocks on ranking: it renders the cached deck (fresh or
+      stale), or the cold deck for a user with votes but no deck yet, and
+      queues a warm when that isn't current. Clients see ``version < target``
+      and poll ``/api/ranking-ready`` until the warm lands.
+    - Warms: ``_warm_scheduler()`` coalesces requests per user (newest
+      version wins, at most one running per user) on a pool of
+      ``config.warm_pool_size`` workers. Votes debounce through it
+      (``dashboard_warm_idle_seconds``, or immediately at
+      ``dashboard_warm_vote_threshold`` votes).
+    """
+
     config: Config
     db: Database
     embedder: Embedder
     regen_event: threading.Event
-    _dashboard_cache: dict[str, tuple[bytes, float, int]] = {}
+    _decks: dict[int, DeckState] = {}
+    _MAX_CACHED_DECKS = 100
+    _pool_generation: int = 1
     _dashboard_versions: dict[int, int] = {}
     _dashboard_versions_guard = threading.Lock()
+    _scheduler: WarmScheduler[int, User] | None = None
+    _scheduler_guard = threading.Lock()
     _cold_stories: list[RankedStory] = []
     _article_fetch_in_flight: set[int] = set()
     _warm_bg_lock = threading.Lock()
     _tldr_prefetch_gate = BackgroundCadence()
-    _render_locks: dict[int, threading.Lock] = {}
-    _render_locks_guard = threading.Lock()
-    _warmup_requested_versions: dict[int, int] = {}
-    _warmup_last_request_at: dict[int, float] = {}
-    _warmup_timers: dict[int, threading.Timer] = {}
-    _warmup_running_users: set[int] = set()
-    _warmup_in_flight_guard = threading.Lock()
-    _WARM_DEBOUNCE_S: float = 0.0
     _feedback_warm_counts: dict[int, int] = {}
-    _feedback_warm_versions: dict[int, int] = {}
-    _feedback_warm_timers: dict[int, threading.Timer] = {}
     _feedback_warm_guard = threading.Lock()
     _feedback_regen_timer: threading.Timer | None = None
     _feedback_regen_guard = threading.Lock()
@@ -1432,158 +1459,131 @@ class Handler:
         cls._public_demo_limiter = FixedWindowLimiter()
 
     @classmethod
-    def _render_dashboard_for_user(
-        cls, user: User, expected_version: int | None = None
+    def _render_deck(
+        cls, user: User, ranked: list[RankedStory], version: int, current: int
     ) -> bytes:
-        """Render personalized dashboard with SWR semantics."""
-        request_start = time.perf_counter()
-        cache_key = f"dashboard_{user.id}"
-        if expected_version is None:
-            expected_version = cls._dashboard_version(user.id)
+        from pipeline import generate_dashboard_bytes
 
-        cached = cls._dashboard_cache.get(cache_key)
-
-        # Cache hit with matching version → return immediately
-        if cached and cached[2] == expected_version:
-            logging.info(
-                "dashboard_render user_id=%s version=%s result=cache_hit elapsed_ms=%.1f cache_age_s=%.1f",
-                user.id,
-                expected_version,
-                (time.perf_counter() - request_start) * 1000,
-                time.time() - cached[1],
-            )
-            return cached[0]
-
-        # Stale cache (wrong version) → return stale, trigger warm
-        if cached:
-            logging.info(
-                "dashboard_render user_id=%s version=%s result=stale_hit cache_version=%s elapsed_ms=%.1f",
-                user.id,
-                expected_version,
-                cached[2],
-                (time.perf_counter() - request_start) * 1000,
-            )
-            cls._trigger_warm(user, expected_version)
-            return _patch_current_version(cached[0], expected_version)
-
-        # No per-user cache → render the cold deck, then warm the
-        # personalized version in the background.
-        n_feedback = sum(cls.db.count_feedback_by_action(user.id).values())
-        if n_feedback > 0:
-            from pipeline import build_cold_deck
-
-            cold_stories = build_cold_deck(
-                cls.db, cls.config, user_id=user.id, embedder=cls.embedder
-            )
-        else:
-            cold_stories = cls._cold_stories
-        if cold_stories:
-            from pipeline import generate_dashboard_bytes
-
-            if n_feedback > 0 and expected_version == 0:
-                # After a restart, versions reset to 0, so a cold deck would
-                # claim to be current (rendered 0 == latest 0): clients never
-                # poll for the personalized warm, and Explore stays empty
-                # because the cold deck has no Unsure/Novel/Similar picks.
-                # Bump so the page and /api/feed report a newer target.
-                expected_version = cls._invalidate_dashboard_cache(user.id)
-            html = generate_dashboard_bytes(
-                cold_stories,
-                cls.config,
-                cls.db,
-                user.id,
-                user.token,
-                dashboard_version=0,
-                dashboard_latest_version=cls._dashboard_version(user.id),
-            )
-            logging.info(
-                "dashboard_render user_id=%s version=%s result=cold_deck stories=%s elapsed_ms=%.1f",
-                user.id,
-                expected_version,
-                len(cold_stories),
-                (time.perf_counter() - request_start) * 1000,
-            )
-            if n_feedback > 0:
-                cls._trigger_warm(user, expected_version)
-            return html
-
-        # No cache and no cold deck → return skeleton, trigger warm
-        logging.info(
-            "dashboard_render user_id=%s version=%s result=skeleton elapsed_ms=%.1f",
+        return generate_dashboard_bytes(
+            ranked,
+            cls.config,
+            cls.db,
             user.id,
-            expected_version,
-            (time.perf_counter() - request_start) * 1000,
+            user.token,
+            dashboard_version=version,
+            dashboard_latest_version=current,
         )
-        cls._trigger_warm(user, expected_version)
-        return SKELETON_HTML
 
     @classmethod
-    def _get_render_lock(cls, user_id: int) -> threading.Lock:
-        with cls._render_locks_guard:
-            lock = cls._render_locks.get(user_id)
-            if lock is None:
-                lock = threading.Lock()
-                cls._render_locks[user_id] = lock
-            return lock
+    def _render_dashboard_for_user(cls, user: User) -> bytes:
+        """Render the user's dashboard now; queue a warm if it isn't current."""
+        request_start = time.perf_counter()
+        current = cls._dashboard_version(user.id)
+        deck = cls._decks.get(user.id)
+
+        if deck is not None:
+            result = "cache_hit"
+            if deck.version < current:
+                result = "stale_hit"
+                cls._trigger_warm(user, current)
+            html = cls._render_deck(user, deck.ranked, deck.version, current)
+            logging.info(
+                "dashboard_render user_id=%s version=%s result=%s deck_version=%s"
+                " elapsed_ms=%.1f deck_age_s=%.1f",
+                user.id,
+                current,
+                result,
+                deck.version,
+                (time.perf_counter() - request_start) * 1000,
+                time.time() - deck.built_at,
+            )
+            return html
+
+        n_feedback = sum(cls.db.count_feedback_by_action(user.id).values())
+        if n_feedback == 0:
+            # Nothing to personalize: the shared cold deck is this user's
+            # current deck, so it renders as current and needs no warm.
+            ranked, version = cls._cold_stories, current
+        else:
+            # Votes but no deck yet (first visit on this device since a
+            # restart, or evicted): the cold deck minus voted stories, as
+            # version 0, while the personalized deck is built.
+            from pipeline import build_cold_deck
+
+            cls._trigger_warm(user, current)
+            ranked = build_cold_deck(
+                cls.db, cls.config, user_id=user.id, embedder=cls.embedder
+            )
+            version = 0
+
+        if not ranked:
+            # Empty pool (first boot before any regen): the warm is the only
+            # way this user gets a deck; the skeleton page reloads itself.
+            cls._trigger_warm(user, current)
+            logging.info(
+                "dashboard_render user_id=%s version=%s result=skeleton elapsed_ms=%.1f",
+                user.id,
+                current,
+                (time.perf_counter() - request_start) * 1000,
+            )
+            return SKELETON_HTML
+        html = cls._render_deck(user, ranked, version, current)
+        logging.info(
+            "dashboard_render user_id=%s version=%s result=cold_deck stories=%s"
+            " elapsed_ms=%.1f",
+            user.id,
+            current,
+            len(ranked),
+            (time.perf_counter() - request_start) * 1000,
+        )
+        return html
 
     @classmethod
     def _dashboard_version(cls, user_id: int) -> int:
         with cls._dashboard_versions_guard:
-            return cls._dashboard_versions.get(user_id, 0)
+            return cls._pool_generation + cls._dashboard_versions.get(user_id, 0)
 
     @classmethod
-    def _invalidate_dashboard_cache(cls, user_id: int) -> int:
+    def _bump_user_version(cls, user_id: int) -> int:
         with cls._dashboard_versions_guard:
-            version = cls._dashboard_versions.get(user_id, 0) + 1
-            cls._dashboard_versions[user_id] = version
-            logging.info(
-                "dashboard_cache_invalidated user_id=%s version=%s", user_id, version
-            )
-            return version
+            count = cls._dashboard_versions.get(user_id, 0) + 1
+            cls._dashboard_versions[user_id] = count
+            version = cls._pool_generation + count
+        logging.info("dashboard_version_bumped user_id=%s version=%s", user_id, version)
+        return version
+
+    @classmethod
+    def _warm_scheduler(cls) -> WarmScheduler[int, User]:
+        # Looked up on cls itself so test subclasses get their own pool.
+        with cls._scheduler_guard:
+            scheduler = cls.__dict__.get("_scheduler")
+            if scheduler is None:
+                scheduler = WarmScheduler(
+                    cls._run_warm_job,
+                    workers=cls.config.warm_pool_size,
+                    name="dashboard-warm",
+                )
+                cls._scheduler = scheduler
+            return scheduler
+
+    @classmethod
+    def _trigger_warm(cls, user: User, version: int, delay_s: float = 0.0) -> None:
+        version = max(version, cls._dashboard_version(user.id))
+        deck = cls._decks.get(user.id)
+        if deck is not None and deck.version >= version:
+            return
+        cls._warm_scheduler().request(user.id, user, version, delay_s)
 
     @classmethod
     def _schedule_feedback_warm(cls, user: User, version: int) -> bool:
-        """Schedule a warm at the vote threshold or after an idle pause."""
+        """Warm after an idle pause, or now once enough votes pile up."""
         with cls._feedback_warm_guard:
-            user_id = user.id
-            count = cls._feedback_warm_counts.get(user_id, 0) + 1
-            cls._feedback_warm_counts[user_id] = count
-            cls._feedback_warm_versions[user_id] = version
-            previous = cls._feedback_warm_timers.pop(user_id, None)
-            if previous is not None:
-                previous.cancel()
-
-            if count >= cls.config.dashboard_warm_vote_threshold:
-                cls._feedback_warm_counts[user_id] = 0
-                cls._feedback_warm_versions.pop(user_id, None)
-                threshold_reached = True
-            else:
-                timer = threading.Timer(
-                    cls.config.dashboard_warm_idle_seconds,
-                    cls._feedback_warm_idle_fired,
-                    args=(user,),
-                )
-                timer.daemon = True
-                cls._feedback_warm_timers[user_id] = timer
-                timer.start()
-                threshold_reached = False
-
-        if threshold_reached:
-            cls._trigger_warm(user, version)
+            count = cls._feedback_warm_counts.get(user.id, 0) + 1
+            threshold_reached = count >= cls.config.dashboard_warm_vote_threshold
+            cls._feedback_warm_counts[user.id] = 0 if threshold_reached else count
+        delay_s = 0.0 if threshold_reached else cls.config.dashboard_warm_idle_seconds
+        cls._trigger_warm(user, version, delay_s=delay_s)
         return threshold_reached
-
-    @classmethod
-    def _feedback_warm_idle_fired(cls, user: User) -> None:
-        with cls._feedback_warm_guard:
-            user_id = user.id
-            timer = cls._feedback_warm_timers.get(user_id)
-            if timer is not threading.current_thread():
-                return
-            cls._feedback_warm_timers.pop(user_id, None)
-            version = cls._feedback_warm_versions.pop(user_id, None)
-            cls._feedback_warm_counts[user_id] = 0
-        if version is not None:
-            cls._trigger_warm(user, version)
 
     @classmethod
     def _schedule_feedback_regen(cls) -> None:
@@ -1625,66 +1625,13 @@ class Handler:
             logging.info("feedback_regen_pending_satisfied")
 
     @classmethod
-    def _trigger_warm(cls, user: User, version: int) -> None:
-        current_version = cls._dashboard_version(user.id)
-        effective_version = max(version, current_version)
-        with cls._warmup_in_flight_guard:
-            previous_version = cls._warmup_requested_versions.get(user.id)
-            if previous_version is not None and effective_version <= previous_version:
-                return
-            cls._warmup_requested_versions[user.id] = effective_version
-            cls._warmup_last_request_at[user.id] = time.monotonic()
-            cls._schedule_warm_timer_locked(user, cls._WARM_DEBOUNCE_S)
-
-    @classmethod
-    def _schedule_warm_timer_locked(
-        cls, user: User, delay_seconds: float
-    ) -> threading.Timer:
-        previous_timer = cls._warmup_timers.get(user.id)
-        if previous_timer is not None:
-            previous_timer.cancel()
-        timer = threading.Timer(
-            delay_seconds,
-            cls._warm_timer_fired,
-            args=(user,),
-        )
-        timer.daemon = True
-        cls._warmup_timers[user.id] = timer
-        timer.start()
-        return timer
-
-    @classmethod
-    def _warm_timer_fired(cls, user: User) -> None:
-        with cls._warmup_in_flight_guard:
-            timer = cls._warmup_timers.get(user.id)
-            if timer is not threading.current_thread():
-                return
-            requested_version = cls._warmup_requested_versions.get(user.id)
-            last_request_at = cls._warmup_last_request_at.get(user.id)
-            if requested_version is None or last_request_at is None:
-                cls._warmup_timers.pop(user.id, None)
-                return
-            elapsed_s = time.monotonic() - last_request_at
-            remaining_s = cls._WARM_DEBOUNCE_S - elapsed_s
-            if remaining_s > 0:
-                cls._schedule_warm_timer_locked(user, remaining_s)
-                return
-            cls._warmup_timers.pop(user.id, None)
-            if user.id in cls._warmup_running_users:
-                return
-            cls._warmup_running_users.add(user.id)
-
+    def _run_warm_job(cls, user: User, version: int) -> None:
+        with cls._feedback_warm_guard:
+            cls._feedback_warm_counts.pop(user.id, None)
         try:
-            cls._run_warm_attempt(user, requested_version)
-        except Exception as e:
-            logging.exception(
-                "Failed warming dashboard cache for user_id=%s: %s", user.id, e
-            )
+            cls._run_warm_attempt(user, version)
         finally:
-            try:
-                cls._finish_warm_attempt(user, requested_version)
-            finally:
-                cls._collect_after_warm_attempt()
+            cls._collect_after_warm_attempt()
 
     @classmethod
     def _collect_after_warm_attempt(cls) -> None:
@@ -1697,221 +1644,122 @@ class Handler:
 
     @classmethod
     def _run_warm_attempt(cls, user: User, requested_version: int) -> None:
-        warm_start = time.perf_counter()
-        cache_key = f"dashboard_{user.id}"
-
-        cached = cls._dashboard_cache.get(cache_key)
-        if cached and cached[2] >= requested_version:
+        deck = cls._decks.get(user.id)
+        if deck is not None and deck.version >= requested_version:
             return
 
-        with cls._dashboard_versions_guard:
-            if cls._dashboard_versions.get(user.id, 0) < requested_version:
-                logging.info(
-                    "dashboard_warm user_id=%s version=%s result=skipped_stale elapsed_ms=%.1f",
-                    user.id,
-                    requested_version,
-                    (time.perf_counter() - warm_start) * 1000,
-                )
-                return
+        from pipeline import RankTrace, fast_rerank_for_user
 
-        lock = cls._get_render_lock(user.id)
-        with lock:
-            cached = cls._dashboard_cache.get(cache_key)
-            if cached and cached[2] >= requested_version:
-                return
-
-            from pipeline import (
-                RankTrace,
-                fast_rerank_for_user,
-                generate_dashboard_bytes,
-            )
-
-            trace = RankTrace()
-            render_start = time.perf_counter()
-            with trace.stage("rank_total"):
-                final = fast_rerank_for_user(
-                    cls.db,
-                    cls.config,
-                    cls.embedder,
-                    user.id,
-                    trace=trace,
-                )
-            rank_ms = (time.perf_counter() - render_start) * 1000
-
-            html_start = time.perf_counter()
-            html = generate_dashboard_bytes(
-                final,
-                cls.config,
+        trace = RankTrace()
+        render_start = time.perf_counter()
+        with trace.stage("rank_total"):
+            final = fast_rerank_for_user(
                 cls.db,
+                cls.config,
+                cls.embedder,
                 user.id,
-                user.token,
-                dashboard_version=requested_version,
-                dashboard_latest_version=cls._dashboard_version(user.id),
+                trace=trace,
             )
-            html_ms = (time.perf_counter() - html_start) * 1000
+        rank_ms = (time.perf_counter() - render_start) * 1000
 
-            with cls._dashboard_versions_guard:
-                cached = cls._dashboard_cache.get(cache_key)
-                if cached and cached[2] > requested_version:
-                    logging.info(
-                        "dashboard_warm user_id=%s version=%s result=skipped_newer_cache_after_rank elapsed_ms=%.1f cache_version=%s",
-                        user.id,
-                        requested_version,
-                        (time.perf_counter() - warm_start) * 1000,
-                        cached[2],
-                    )
-                    return
-                cls._dashboard_cache[cache_key] = (
-                    html,
-                    time.time(),
-                    requested_version,
-                )
-            cls._enforce_cache_cap()
+        with cls._dashboard_versions_guard:
+            cls._decks[user.id] = DeckState(final, time.time(), requested_version)
+            cls._evict_old_decks_locked()
 
-            logging.info(
-                "dashboard_warm user_id=%s version=%s result=completed rank_ms=%.1f html_ms=%.1f stories=%s",
+        logging.info(
+            "dashboard_warm user_id=%s version=%s result=completed rank_ms=%.1f stories=%s",
+            user.id,
+            requested_version,
+            rank_ms,
+            len(final),
+        )
+        logging.info("rank_perf %s", trace.format_log_fields())
+
+        fields = trace.to_log_fields()
+        stage_sum_ms = sum(
+            value
+            for key, value in fields.items()
+            if key.endswith("_ms")
+            and key != "rank_total_ms"
+            and isinstance(value, (int, float))
+        )
+        if _warm_is_starved(rank_ms, stage_sum_ms):
+            # Starvation signature: the thread was stalled, not computing.
+            # Stages explain <1/3 of wall time (regen contention, pool
+            # exhaustion, or host-level stalls — see WORKLOG 2026-09-08).
+            logging.warning(
+                "dashboard_warm_starved user_id=%s version=%s rank_ms=%.1f"
+                " stage_sum_ms=%.1f model_cache=%s",
                 user.id,
                 requested_version,
                 rank_ms,
-                html_ms,
-                len(final),
+                stage_sum_ms,
+                trace.labels.get("model_cache", ""),
             )
-            logging.info("rank_perf %s", trace.format_log_fields())
+        sample = RankPerfSample(
+            recorded_at=time.time(),
+            user_id=user.id,
+            version=requested_version,
+            rank_total_ms=rank_ms,
+            # HTML is rendered on read now, not in the warm (see DeckState).
+            html_ms=0.0,
+            candidates=int(trace.counts.get("candidates", 0)),
+            feedback_total=int(trace.counts.get("feedback_total", 0)),
+            model_cache=trace.labels.get("model_cache", ""),
+            stories=len(final),
+            fields=fields,
+        )
+        try:
+            cls.db.insert_rank_perf(sample)
+        except Exception:
+            logging.exception("rank_perf persist failed")
 
-            fields = trace.to_log_fields()
-            stage_sum_ms = sum(
-                value
-                for key, value in fields.items()
-                if key.endswith("_ms")
-                and key != "rank_total_ms"
-                and isinstance(value, (int, float))
+        per_combo = cls.config.tldr_prefetch_per_combo
+        stale_per_run = cls.config.tldr_prefetch_stale_per_run
+        if cls.config.article_fetch_max_per_run > 0 or (
+            (per_combo > 0 or stale_per_run > 0) and final
+        ):
+            t = threading.Thread(
+                target=lambda: cls._warm_background_tasks(
+                    final,
+                    cls.db,
+                    cls.embedder,
+                    cls.config,
+                    per_combo,
+                ),
+                daemon=True,
             )
-            if _warm_is_starved(rank_ms, stage_sum_ms):
-                # Starvation signature: the thread was stalled, not computing.
-                # Stages explain <1/3 of wall time (regen contention, pool
-                # exhaustion, or host-level stalls — see WORKLOG 2026-09-08).
-                logging.warning(
-                    "dashboard_warm_starved user_id=%s version=%s rank_ms=%.1f"
-                    " stage_sum_ms=%.1f model_cache=%s",
-                    user.id,
-                    requested_version,
-                    rank_ms,
-                    stage_sum_ms,
-                    trace.labels.get("model_cache", ""),
-                )
-            sample = RankPerfSample(
-                recorded_at=time.time(),
-                user_id=user.id,
-                version=requested_version,
-                rank_total_ms=rank_ms,
-                html_ms=html_ms,
-                candidates=int(trace.counts.get("candidates", 0)),
-                feedback_total=int(trace.counts.get("feedback_total", 0)),
-                model_cache=trace.labels.get("model_cache", ""),
-                stories=len(final),
-                fields=fields,
-            )
-            try:
-                cls.db.insert_rank_perf(sample)
-            except Exception:
-                logging.exception("rank_perf persist failed")
-
-            per_combo = cls.config.tldr_prefetch_per_combo
-            stale_per_run = cls.config.tldr_prefetch_stale_per_run
-            if cls.config.article_fetch_max_per_run > 0 or (
-                (per_combo > 0 or stale_per_run > 0) and final
-            ):
-                t = threading.Thread(
-                    target=lambda: cls._warm_background_tasks(
-                        final,
-                        cls.db,
-                        cls.embedder,
-                        cls.config,
-                        per_combo,
-                    ),
-                    daemon=True,
-                )
-                t.start()
+            t.start()
 
     @classmethod
-    def _finish_warm_attempt(cls, user: User, completed_version: int) -> None:
-        with cls._warmup_in_flight_guard:
-            user_id = user.id
-            cls._warmup_running_users.discard(user_id)
-            requested_version = cls._warmup_requested_versions.get(user_id)
-            if requested_version is None:
-                cls._warmup_last_request_at.pop(user_id, None)
-                cls._warmup_timers.pop(user_id, None)
-                return
-            if requested_version == completed_version:
-                cls._warmup_requested_versions.pop(user_id, None)
-                cls._warmup_last_request_at.pop(user_id, None)
-                timer = cls._warmup_timers.pop(user_id, None)
-                if timer is not None:
-                    timer.cancel()
-                return
-
-            last_request_at = cls._warmup_last_request_at.get(user_id, time.monotonic())
-            remaining_s = max(
-                0.0, cls._WARM_DEBOUNCE_S - (time.monotonic() - last_request_at)
-            )
-            cls._schedule_warm_timer_locked(user, remaining_s)
-
-    @classmethod
-    def _enforce_cache_cap(cls, max_entries: int = 100) -> None:
-        if len(cls._dashboard_cache) <= max_entries:
+    def _evict_old_decks_locked(cls) -> None:
+        excess = len(cls._decks) - cls._MAX_CACHED_DECKS
+        if excess <= 0:
             return
-        keys = sorted(
-            cls._dashboard_cache.keys(),
-            key=lambda k: cls._dashboard_cache[k][1],
-        )
-        for k in keys[:-max_entries]:
-            del cls._dashboard_cache[k]
+        oldest = sorted(cls._decks, key=lambda uid: cls._decks[uid].built_at)
+        for uid in oldest[:excess]:
+            del cls._decks[uid]
 
     @classmethod
-    def _bump_all_cached_versions(cls) -> None:
-        # Union with cache-derived user_ids, not just _dashboard_versions'
-        # existing keys: a user who has never voted has no entry there (it
-        # implicitly reads as version 0 via `_dashboard_version`), but can
-        # still hold a live `_dashboard_cache` entry from their first
-        # cold-deck render. Without this, such a user's version never
-        # advances past 0, so every future GET / is a permanent cache_hit on
-        # stale bytes — not even a reload fixes it (see WORKLOG 2026-08-28).
-        cache_user_ids = {
-            uid
-            for uid in (_cache_key_user_id(key) for key in cls._dashboard_cache)
-            if uid is not None
-        }
-        with cls._dashboard_versions_guard:
-            all_uids = set(cls._dashboard_versions) | cache_user_ids
-            for uid in all_uids:
-                cls._dashboard_versions[uid] = cls._dashboard_versions.get(uid, 0) + 1
-        logging.info(
-            "bump_all_cached_versions count=%s",
-            len(cls._dashboard_versions),
-        )
+    def _pool_changed(cls) -> None:
+        """New candidates arrived (regen / RSS refresh): every deck is stale.
 
-    @classmethod
-    def _warm_stale_cached_users(cls) -> None:
-        """Proactively warm every user with a live dashboard cache entry.
-
-        Regen and RSS-refresh both bump every tracked user's dashboard
-        version (`_bump_all_cached_versions`) but never re-render anyone's
-        cache — nothing else schedules a warm, so a cached user's bytes just
-        sit stale until their own next request happens to trigger one (see
-        WORKLOG 2026-08-28). Call this right after a version bump so cached
-        decks actually refresh in the background instead of waiting on user
-        activity. Bounded by the existing ~100-entry `_dashboard_cache` cap
-        (`_enforce_cache_cap`), so this can't warm-storm the full user table.
+        Rebuild the shared cold deck, bump the pool generation once, and queue
+        a refresh for each cached user on the bounded warm pool.
         """
-        for key in list(cls._dashboard_cache.keys()):
-            uid = _cache_key_user_id(key)
-            if uid is None:
-                continue
-            user = cls.db.get_user_by_id(uid)
-            if user is None:
-                continue
-            cls._trigger_warm(user, cls._dashboard_version(uid))
+        cls._rebuild_cold_deck()
+        with cls._dashboard_versions_guard:
+            cls._pool_generation += 1
+            cached_user_ids = list(cls._decks)
+        for user_id in cached_user_ids:
+            user = cls.db.get_user_by_id(user_id)
+            if user is not None:
+                cls._trigger_warm(user, cls._dashboard_version(user_id))
+        logging.info(
+            "pool_changed generation=%s refresh_queued=%s",
+            cls._pool_generation,
+            len(cached_user_ids),
+        )
 
     @classmethod
     def _rebuild_cold_deck(cls) -> None:
@@ -1997,51 +1845,8 @@ class Handler:
                 cls._tldr_prefetch_gate.finish()
 
 
-_DASHBOARD_CACHE_KEY_PREFIX = "dashboard_"
-
-
-def _cache_key_user_id(cache_key: str) -> int | None:
-    """Parse the user id out of a ``_dashboard_cache`` key, or ``None``."""
-    if not cache_key.startswith(_DASHBOARD_CACHE_KEY_PREFIX):
-        return None
-    suffix = cache_key[len(_DASHBOARD_CACHE_KEY_PREFIX) :]
-    return int(suffix) if suffix.isdigit() else None
-
-
 _CARDS_START = b"<!--cards:start-->"
 _CARDS_END = b"<!--cards:end-->"
-_CURRENT_VERSION_ATTR = b'data-current-version="'
-
-
-def _patch_current_version(html: bytes, version: int) -> bytes:
-    """Rewrite the ``data-current-version`` attribute to *version*.
-
-    ``data-current-version`` is baked into cached HTML at render time
-    (``dashboard_latest_version`` at the time of that render). A stale-cache
-    response reuses old bytes whose ``data-dashboard-version`` and
-    ``data-current-version`` were equal at render time, so without this patch
-    a stale response silently claims to be current — defeating the client's
-    own ``pageVer < currVer`` staleness check (``templates/index.html``) and
-    leaving it without a warm-poll refill (see WORKLOG 2026-08-28). Byte-level
-    find/replace, no HTML parsing, mirroring ``_extract_cards_fragment``. A
-    no-op (returns *html* unchanged) if the attribute isn't present, e.g. in
-    tests that stub out rendering with plain bytes.
-    """
-    start = html.find(_CURRENT_VERSION_ATTR)
-    if start == -1:
-        return html
-    value_start = start + len(_CURRENT_VERSION_ATTR)
-    end = html.find(b'"', value_start)
-    if end == -1:
-        return html
-    from pipeline.render import DashboardDocument
-
-    patched = html[:value_start] + str(version).encode() + html[end:]
-    return (
-        DashboardDocument(patched, html.feed)
-        if isinstance(html, DashboardDocument)
-        else patched
-    )
 
 
 def _extract_cards_fragment(html: bytes) -> bytes:
@@ -2343,7 +2148,7 @@ def _handle_flask_feedback(runtime: type[Handler]) -> Response:
         # Every vote invalidates immediately. Personalized ranking is
         # cadence-gated; global candidate regeneration waits for a quiet period.
         # Stale cached refills remain safe because the client filters voted IDs.
-        version = runtime._invalidate_dashboard_cache(user.id)
+        version = runtime._bump_user_version(user.id)
         warm_queued = runtime._schedule_feedback_warm(user, version)
         runtime._schedule_feedback_regen()
 
@@ -3165,15 +2970,14 @@ def _handle_flask_ranking_ready(runtime: type[Handler]) -> Response:
         target_version = parsed_target
 
     current_version = runtime._dashboard_version(user.id)
-    cached = runtime._dashboard_cache.get(f"dashboard_{user.id}")
-    cached_version = cached[2] if cached is not None else None
-    ready = cached is not None and cached[2] >= min_version
+    deck = runtime._decks.get(user.id)
+    cached_version = deck.version if deck is not None else None
+    ready = cached_version is not None and cached_version >= min_version
     ready_version = cached_version if ready else None
-    warm_version = current_version
-    if (cached_version is None or cached_version < warm_version) and (
+    if (cached_version is None or cached_version < current_version) and (
         current_version >= min_version
     ):
-        runtime._trigger_warm(user, warm_version)
+        runtime._trigger_warm(user, current_version)
 
     return _flask_json_response(
         {
@@ -3268,23 +3072,9 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
             return _flask_json_response(
                 {"error": "No session"}, status=HTTPStatus.UNAUTHORIZED
             )
-        cached = runtime._dashboard_cache.get(f"dashboard_{user.id}")
-        html = (
-            cached[0]
-            if cached is not None
-            else runtime._render_dashboard_for_user(user)
-        )
-        # Unlike GET /, this endpoint used to serve `cached` unconditionally
-        # with no version check — an open tab's in-DOM refills (vote, filter
-        # tab click) could poll it forever and always get the same stale
-        # deck, since regen/RSS-refresh bumps the live version but never
-        # re-renders any user's cache (see WORKLOG 2026-08-28). Mirror
-        # `_render_dashboard_for_user`'s stale_hit self-heal: still serve the
-        # (possibly stale) fragment immediately, but kick off a warm.
-        if cached is not None:
-            current_version = runtime._dashboard_version(user.id)
-            if cached[2] < current_version:
-                runtime._trigger_warm(user, current_version)
+        # Same path as GET /: serves the cached (possibly stale) deck or the
+        # cold deck immediately and queues a warm when it isn't current.
+        html = runtime._render_dashboard_for_user(user)
         fragment = _extract_cards_fragment(html)
         response = Response(
             fragment, status=HTTPStatus.OK, content_type="text/html; charset=utf-8"
@@ -3413,9 +3203,7 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
     embedder = Handler.embedder
 
     def publish_reddit_changes() -> None:
-        Handler._rebuild_cold_deck()
-        Handler._bump_all_cached_versions()
-        Handler._warm_stale_cached_users()
+        Handler._pool_changed()
 
     from reddit_refresh import RedditRefreshWorker
 
@@ -3455,9 +3243,7 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
                 )
             )
             logging.info("regen_fetch_done")
-            Handler._rebuild_cold_deck()
-            Handler._bump_all_cached_versions()
-            Handler._warm_stale_cached_users()
+            Handler._pool_changed()
             logging.info("regen_rebuild_done")
             _log_llm_spend_today(db)
             reddit_worker.submit()
