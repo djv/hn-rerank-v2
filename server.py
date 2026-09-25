@@ -159,8 +159,17 @@ def _normalize_tldr_markdown(text: str) -> str:
         # Single-marker emphasis is italic in CommonMark but bold in the
         # dashboard renderer; standardize on bold so both clients agree and
         # the terminal accent covers every emphasized term.
-        line = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"**\1**", line)
-        line = re.sub(r"(?<![A-Za-z0-9_])_([^_\n]+)_(?![A-Za-z0-9_])", r"**\1**", line)
+        # Repeat until stable: converting an inner pair can expose an outer
+        # one (`_:_X_:_`), and normalization must be idempotent because
+        # cached summaries are normalized again on read.
+        for _ in range(8):
+            previous = line
+            line = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"**\1**", line)
+            line = re.sub(
+                r"(?<![A-Za-z0-9_])_([^_\n]+)_(?![A-Za-z0-9_])", r"**\1**", line
+            )
+            if line == previous:
+                break
         stripped = line.strip()
         if _looks_like_plain_heading(stripped):
             lines.append(f"### {stripped}")

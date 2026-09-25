@@ -34,6 +34,8 @@ _DOC = st.lists(_LINE, max_size=16).map("\n".join)
 
 @settings(max_examples=300)
 @given(text=_DOC)
+# Found on the VPS: bolding the inner `_X_` exposed an outer `_..._` pair.
+@example(text="_:_X_:_")
 def test_normalize_is_idempotent(text: str) -> None:
     """Cached summaries are normalized again on read; that must be a no-op."""
     once = server._normalize_tldr_markdown(text)
