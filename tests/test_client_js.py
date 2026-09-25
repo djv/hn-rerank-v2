@@ -693,3 +693,37 @@ def test_refill_cards_come_from_feed_and_date_view_ignores_age() -> None:
         "recommended:archive": [3],
     }
     assert "<img src=x onerror=alert(1)>" in result["title"]
+
+
+def test_every_view_caps_at_view_limit_and_voted_cards_backfill() -> None:
+    """queuedCards() shows at most VIEW_LIMIT cards per view; voting one lets
+    the next card past the cap in, and the post-vote sibling stays inside the
+    capped queue."""
+    script = _inline_script()
+    match = re.search(r"const VIEW_LIMIT = (\d+);", script)
+    assert match is not None
+    functions = js_functions(script, "queuedCards", "nextQueuedSibling")
+    result = run_node(
+        f"const VIEW_LIMIT = {match.group(1)};\n"
+        + r"""
+const deck = Array.from({ length: 20 }, (_, i) => ({ id: i + 1, dataset: {} }));
+deck.forEach((c, i) => { c.nextElementSibling = deck[i + 1] || null; });
+function cards() { return deck; }
+function isQueued(card) { return !card.dataset.voted; }
+"""
+        + functions
+        + r"""
+const ids = () => queuedCards().map(c => c.id);
+const before = ids();
+deck[0].dataset.voted = 'up';
+const after = ids();
+const lastSibling = nextQueuedSibling(deck[12]);
+console.log(JSON.stringify({ before, after, sibling: nextQueuedSibling(deck[0]).id,
+                             past: lastSibling && lastSibling.id }));
+"""
+    )
+    assert int(match.group(1)) == 12
+    assert result["before"] == list(range(1, 13))
+    assert result["after"] == list(range(2, 14))
+    assert result["sibling"] == 2
+    assert result["past"] is None  # card 14 is beyond the cap

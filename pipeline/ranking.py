@@ -283,18 +283,20 @@ PRIMARY_PER_COMBO = 12
 # (2026-09-25): a 73-card recent deck was too much to load on the client.
 PRIMARY_RECENT_NONHN = 10
 PRIMARY_ARCHIVE_HN = 16
-# Popular (Hot/Top/Talk) shares one budget per HN combo so the tab stays
-# above ~10 cards even in archive, where Hot never fires: recent splits
-# 4/4/4, archive 0/6/6. Explore is capped per badge; non-HN gets fewer
-# slots because recent_hn and recent_non-hn both feed the recent Explore
-# tab (2*3 + 1*3 = 9 recent, 2*3 = 6 archive).
+# Every sort aims to show 12 cards; clients cap each view at 12 (see
+# VIEW_LIMIT in templates/index.html and the TUI), so a view may send more.
+# Popular (Hot/Top/Talk) shares one budget per HN combo so the tab reaches
+# 12 even in archive, where Hot never fires: recent splits 4/4/4, archive
+# 0/6/6. Explore is capped per badge; non-HN gets fewer slots because
+# recent_hn and recent_non-hn both feed the recent Explore tab
+# (4*3 + 1*3 = 15 recent, 4*3 = 12 archive).
 POPULAR_PER_COMBO = 12
-EXPLORE_PER_BADGE = 2
+EXPLORE_PER_BADGE = 4
 EXPLORE_PER_BADGE_NONHN = 1
 # Date view: the DATE_LIMIT best-scored stories posted in the last
 # DATE_WINDOW_DAYS, shown newest first (same list whichever Age tab is on).
 DATE_WINDOW_DAYS = 7
-DATE_LIMIT = 10
+DATE_LIMIT = 12
 SOURCE_CATEGORIES: tuple[str, ...] = ("hn_live", "archive", "reddit", "rss")
 
 

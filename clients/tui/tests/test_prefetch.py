@@ -231,9 +231,9 @@ async def test_navigation_prefetch_generates_nearby_and_other_sorts() -> None:
         await wait_for(
             pilot, lambda: app.summaries.keys() >= {1, 2, 3, 4, 26, 27, 28, 29, 30}
         )
-        await wait_for(pilot, lambda: 21 in fake.cached)
+        await wait_for(pilot, lambda: 12 in fake.cached)
         assert 5 not in fake.generated  # deeper cache misses wait until nearby
-        assert 22 not in fake.cached
+        assert 13 not in fake.cached  # past the 12-story view cap
         assert 1 < fake.peak <= 4
         await pilot.press("j")
         await wait_for(pilot, lambda: 5 in app.summaries)  # rolling window refills

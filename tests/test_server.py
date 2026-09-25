@@ -5771,7 +5771,7 @@ def test_submitVote_advances_to_the_voted_cards_successor_not_the_deck_head() ->
         "function ", 1
     )[0]
     assert "nextElementSibling" in next_sibling_block
-    assert "isQueued(el)" in next_sibling_block
+    assert "queue.includes(el)" in next_sibling_block  # capped view
 
 
 def test_rendered_cards_carry_client_contract_attributes(test_env):

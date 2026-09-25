@@ -22,8 +22,9 @@ from .ranking import RankedStory
 
 # Recommended shows at most this many cards per age (top by score);
 # Popular and Explore keep their own badge quotas. Cards in no view are
-# dropped so the server sends a short deck; Date covers all sent cards,
-# including the ranking's Date-only time-coverage picks.
+# dropped so the server sends a short deck; Date is the ranking's flagged
+# is_date_pick cards. Clients show 12 per view, so the rest of the 24 are
+# the backfill that slides in as cards are voted.
 RECOMMENDED_LIMIT = 24
 
 

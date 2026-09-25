@@ -19,7 +19,6 @@ from hn_rerank.app import (
     headline,
     headline_domain,
     headline_points,
-    limit_recommended,
     story_age,
     story_metadata,
     theme_for_hour,
@@ -372,8 +371,10 @@ def test_headline_separators_share_columns_across_stories() -> None:
     assert "r/localllama" in second
 
 
-def test_limit_recommended_keeps_all_popular() -> None:
-    def story(i: int, popular: bool) -> FeedStory:
+async def test_every_sort_shows_at_most_view_limit(tmp_path: Path) -> None:
+    """Each sort caps at 12; reverse flips those 12; rated ones backfill."""
+
+    def story(i: int) -> FeedStory:
         return FeedStory(
             i,
             f"S{i}",
@@ -385,16 +386,34 @@ def test_limit_recommended_keeps_all_popular() -> None:
             0,
             float(100 - i),
             ["recent_mixed"],
-            popular,
-            False,
+            True,
+            True,
         )
 
-    lookup = {i: story(i, i % 10 == 0) for i in range(1, 51)}
-    assert limit_recommended(list(range(1, 51)), lookup) == list(range(1, 31)) + [
-        40,
-        50,
-    ]
-    assert limit_recommended([1, 2], lookup) == [1, 2]
+    ids = list(range(1, 21))
+    fake = FakeServer()
+    fake.feed = replace(
+        fake.feed,
+        stories=[story(i) for i in ids],
+        orders={f"{sort}:recent": ids for sort in Reader.SORT_CYCLE},
+    )
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        await pilot.pause(0.4)
+        app.query_one(OptionList).focus()
+        for _ in Reader.SORT_CYCLE:
+            assert len(app.stories) == 12
+            await pilot.press("s")
+            await pilot.pause(0.3)
+        assert str(app.query_one("#sort", Select).value) == "recommended"
+        assert [s.id for s in app.stories] == ids[:12]
+        await pilot.press("v")
+        await pilot.pause(0.3)
+        assert [s.id for s in app.stories] == ids[:12][::-1]
+        await pilot.press("v")
+        app.rated.add(1)
+        app.rebuild()
+        assert [s.id for s in app.stories] == ids[1:13]
 
 
 def test_headline_truncates_long_domains_to_fit() -> None:

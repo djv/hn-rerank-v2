@@ -1,5 +1,23 @@
 # Worklog: hn-rewrite
 
+## 2026-09-25 Every sort shows 12 stories
+
+The user asked for 12 stories in every sort, truncating at the client
+where the server sends more. Before: Recommended 24, Popular 12, Explore
+9 recent / 6 archive, Date 10.
+
+- Server: `EXPLORE_PER_BADGE` 2 → 4 (Explore now 15 recent / 12 archive),
+  `DATE_LIMIT` 10 → 12. Popular was already 12; Recommended stays at 24
+  so votes have backfill.
+- Web client: `VIEW_LIMIT = 12` caps `queuedCards()`; `nextQueuedSibling`
+  walks the capped queue. TUI: `VIEW_LIMIT = 12` caps every sort after
+  dropping rated/unavailable stories and before reverse; the
+  Recommended-only 30 cap with popular extras (`limit_recommended`) is gone,
+  so prefetch no longer reaches past the 12 shown.
+- Tests: an executed Node test for the cap and backfill, a TUI test
+  (every sort 12, reverse flips those 12, rated stories backfill); the
+  prefetch window test now expects the 12-story edge.
+
 ## 2026-09-25 Date view: top 10 of the last 7 days
 
 The user found Date at 51 cards: it listed every sent card for the age

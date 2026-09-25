@@ -241,21 +241,9 @@ def story_metadata(story: FeedStory) -> str:
     return " · ".join(parts)
 
 
-RECOMMENDED_LIMIT = 30
-
-
-def limit_recommended(
-    order: list[int], lookup: dict[int, FeedStory], limit: int = RECOMMENDED_LIMIT
-) -> list[int]:
-    """First *limit* in rank order, plus any popular stories cut off.
-
-    Popular-flagged stories are never dropped by the truncation.
-    """
-    head, tail = order[:limit], order[limit:]
-    extras = [
-        sid for sid in tail if (story := lookup.get(sid)) is not None and story.popular
-    ]
-    return head + extras
+# Every sort shows at most this many stories (matches the web client);
+# unrated stories past the cap slide in as ones ahead are rated.
+VIEW_LIMIT = 12
 
 
 def _cell_len(text: str) -> int:
@@ -854,8 +842,6 @@ class Reader(App[None]):
         age = self.query_one("#age", Select).value
         lookup = {story.id: story for story in self.feed.stories} if self.feed else {}
         order = self.feed.orders.get(f"{sort}:{age}", []) if self.feed else []
-        if sort == "recommended":
-            order = limit_recommended(order, lookup)
         if sort == "explore":
             # Explore is a discovery deck: reshuffle client-side on every
             # rebuild so each visit is a fresh random order. The server
@@ -864,13 +850,13 @@ class Reader(App[None]):
             # feed.orders is shared with prefetch entry points.
             order = list(order)
             random.shuffle(order)
-        if self.reverse_sort:
-            order = order[::-1]
         self.stories = [
             lookup[sid]
             for sid in order
             if sid not in self.rated and sid not in self.unavailable
-        ]
+        ][:VIEW_LIMIT]
+        if self.reverse_sort:
+            self.stories.reverse()
         headlines = self.query_one("#headlines", OptionList)
         headlines.clear_options()
         # Option padding (1 each side) plus the 2-cell selection marker.
@@ -1115,15 +1101,12 @@ class Reader(App[None]):
         ids.extend(
             item.id for item in reversed(self.stories[max(0, index - 3) : index])
         )
-        lookup = {item.id: item for item in self.feed.stories}
         age = self.query_one("#age", Select).value
         sort = self.query_one("#sort", Select).value
         for other in self.SORT_CYCLE:
             if other == sort:
                 continue
             order = self.feed.orders.get(f"{other}:{age}", [])
-            if other == "recommended":
-                order = limit_recommended(order, lookup)
             eligible = [
                 sid
                 for sid in order

@@ -1113,13 +1113,18 @@
       return !card.dataset.voted && matchesCurrentCombo(card) && matchesCurrentAxes(card);
     }
 
+    // Every sort shows at most this many cards; unvoted cards past the cap
+    // slide in as cards ahead of them are voted.
+    const VIEW_LIMIT = 12;
+
     function queuedCards() {
-      return cards().filter(isQueued);
+      return cards().filter(isQueued).slice(0, VIEW_LIMIT);
     }
 
     function nextQueuedSibling(card) {
+      const queue = queuedCards();
       for (let el = card.nextElementSibling; el; el = el.nextElementSibling) {
-        if (el.classList.contains('story-card') && isQueued(el)) return el;
+        if (queue.includes(el)) return el;
       }
       return null;
     }
