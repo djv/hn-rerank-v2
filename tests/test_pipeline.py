@@ -10,7 +10,7 @@ from email.utils import formatdate
 from numpy.typing import NDArray
 from pathlib import Path
 from types import SimpleNamespace
-from hypothesis import HealthCheck, example, given, settings, strategies as st
+from hypothesis import HealthCheck, given, settings, strategies as st
 from collections.abc import Iterator
 
 from database import Database, HnDupeResolution, Story
@@ -62,145 +62,113 @@ def db():
     db_instance.close()
 
 
+def _feed_ranked(
+    story_id: int,
+    score: float,
+    *,
+    time: int | None = None,
+    combo_keys: str = "recent_hn recent_mixed",
+    **flags: bool,
+) -> RankedStory:
+    story = Story(
+        id=story_id,
+        title=f"Story {story_id}",
+        url=None,
+        score=10,
+        time=1600000000 + story_id if time is None else time,
+        text_content="",
+        source="hn",
+    )
+    return RankedStory(
+        story=story,
+        score=score,
+        best_match_title="",
+        combo_keys=combo_keys,
+        **flags,
+    )
+
+
 def test_feed_caps_recommended_and_drops_unused_cards() -> None:
     """Recommended carries at most RECOMMENDED_LIMIT per age (top by score);
     cards in no view never reach the client, badge cards stay, and Date
-    lists exactly the Date picks newest first (a pick beyond the
-    Recommended cap is still sent)."""
+    lists every sent card newest first."""
     from pipeline import render
 
     limit = render.RECOMMENDED_LIMIT
-
-    def ranked(story_id: int, score: float, **flags: bool) -> RankedStory:
-        story = Story(
-            id=story_id,
-            title=f"Story {story_id}",
-            url=None,
-            score=10,
-            time=1600000000 + story_id,
-            text_content="",
-            source="hn",
-        )
-        return RankedStory(
-            story=story,
-            score=score,
-            best_match_title="",
-            combo_keys="recent_hn recent_mixed",
-            **flags,
-        )
-
-    items = [
-        ranked(i, 100.0 - i, is_date_pick=i in (3, limit + 2)) for i in range(limit + 5)
-    ]
-    items.append(ranked(999, -1.0, is_high_engagement=True))
+    items = [_feed_ranked(i, 100.0 - i) for i in range(limit + 5)]
+    items.append(_feed_ranked(999, -1.0, is_high_engagement=True))
     cards = render._build_dashboard_cards(items, hot_badge_percentile=99)
     feed = render.prepare_feed(cards, {}, 1, 1)
 
     top_ids = set(range(limit))
     assert set(feed.orders["recommended:recent"]) == top_ids
-    assert feed.orders["date:recent"] == [limit + 2, 3]
-    assert feed.orders["date:archive"] == feed.orders["date:recent"]
     assert feed.orders["popular:recent"] == [999]
-    assert {s.id for s in feed.stories} == top_ids | {999, limit + 2}
+    assert {s.id for s in feed.stories} == top_ids | {999}
+    assert feed.orders["date:recent"] == sorted(top_ids | {999}, reverse=True)
+    assert feed.orders["date:archive"] == feed.orders["date:recent"]
 
 
-def _date_deck(
-    ages_and_scores: list[tuple[float, float]],
-    voted: frozenset[int] = frozenset(),
-) -> tuple[list[RankedStory], dict[int, float]]:
-    """Assemble a deck from (age in days, model score) stories."""
+def test_date_view_puts_a_fresh_low_score_popular_story_first() -> None:
+    """Regression: an hour-old Popular story with a low model score was
+    missing from Date (then the top model scores of the week). Date is now
+    the deck newest first, so it leads."""
     from pipeline import render
 
-    now = int(time.time())
-    stories = [
-        Story(
-            id=i + 1,
-            title=f"Story {i}",
-            url=None,
-            score=10,
-            time=now - int(age * 86400),
-            text_content="",
-            source="hn",
-        )
-        for i, (age, _) in enumerate(ages_and_scores)
-    ]
-    ranked = sorted(
-        (
-            RankedStory(story=s, score=score, best_match_title="")
-            for s, (_, score) in zip(stories, ages_and_scores, strict=True)
-        ),
-        key=lambda r: r.score,
-        reverse=True,
-    )
-    zeros = np.zeros(len(stories) + 1, dtype=np.float32)
-    final = ranking._assemble_combo_deck(
-        ranked,
-        config=Config(count=40),
-        recent_cutoff=now - 30 * 86400,
-        cand_scores=zeros,
-        cand_velocities=zeros,
-        idx_for=lambda sid: sid,
-        embeddings_map=None,
-        explore=None,
-        is_feedback_match=lambda story: story.id in voted,
-        date_cutoff=now - ranking.DATE_WINDOW_DAYS * 86400,
-    )
-    cards = render._build_dashboard_cards(final, hot_badge_percentile=99)
+    now = 1_700_000_000
+    items = [_feed_ranked(i, 100.0 - i, time=now - 86400 - i * 3600) for i in range(30)]
+    items.append(_feed_ranked(500, -5.0, time=now - 3600, is_hot=True))
+    cards = render._build_dashboard_cards(items, hot_badge_percentile=99)
     feed = render.prepare_feed(cards, {}, 1, 1)
-    scores = {r.story.id: r.score for r in ranked}
-    return final, {sid: scores[sid] for sid in feed.orders["date:recent"]}
+    assert feed.orders["date:recent"][0] == 500
 
 
 @settings(max_examples=60, deadline=None)
 @given(
     stories=st.lists(
-        st.tuples(st.floats(0.01, 29.9), st.floats(-5, 5, allow_nan=False)),
-        max_size=60,
-        unique_by=lambda t: t[1],
-    ),
-    voted_mask=st.lists(st.booleans(), max_size=60),
-)
-# Story times are whole seconds: a hair over 7 days truncates onto the cutoff,
-# which is inside the window (time >= cutoff).
-@example(stories=[(7.0000000001, 1.0)], voted_mask=[])
-def test_date_view_is_top_scores_of_last_week_newest_first(
-    stories: list[tuple[float, float]], voted_mask: list[bool]
-) -> None:
-    """Date = the DATE_LIMIT best-scored unvoted-duplicate stories posted in
-    the last DATE_WINDOW_DAYS, listed newest first, identical for both ages."""
-    voted = frozenset(i + 1 for i, v in enumerate(voted_mask[: len(stories)]) if v)
-    final, dated = _date_deck(stories, voted)
-
-    eligible = sorted(
-        (
-            (score, i + 1)
-            for i, (age, score) in enumerate(stories)
-            if int(age * 86400) <= ranking.DATE_WINDOW_DAYS * 86400
-            and i + 1 not in voted
+        st.tuples(
+            st.integers(0, 60 * 86400),  # age in seconds
+            st.floats(-5, 5, allow_nan=False),  # model score
+            st.sampled_from(["recent", "archive"]),
+            st.booleans(),  # popular
+            st.booleans(),  # explore
         ),
-        reverse=True,
-    )[: ranking.DATE_LIMIT]
-    assert set(dated) == {sid for _, sid in eligible}
-    ages = {i + 1: int(age * 86400) for i, (age, _) in enumerate(stories)}
-    assert [ages[sid] for sid in dated] == sorted(ages[sid] for sid in dated)
-    assert {r.story.id for r in final if r.is_date_pick} == set(dated)
-
-
-def test_date_view_orders_match_for_both_ages_and_only_date_extras_are_hidden() -> None:
+        max_size=60,
+    )
+)
+def test_date_view_is_every_other_view_newest_first(
+    stories: list[tuple[int, float, str, bool, bool]],
+) -> None:
+    """Date = the union of Recommended, Popular and Explore over both ages,
+    newest first, identical under either Age tab."""
     from pipeline import render
 
-    final, dated = _date_deck(
-        [(29.0 - i * 0.1, 100.0 - i) for i in range(30)]  # old, high scores
-        + [(i * 0.5 + 0.1, float(i)) for i in range(12)]  # last week, low
-    )
-    cards = render._build_dashboard_cards(final, hot_badge_percentile=99)
+    now = 1_700_000_000
+    items = [
+        _feed_ranked(
+            i + 1,
+            score,
+            time=now - age,
+            combo_keys=f"{cohort}_hn {cohort}_mixed",
+            is_hot=popular,
+            is_novel=explore,
+        )
+        for i, (age, score, cohort, popular, explore) in enumerate(stories)
+    ]
+    cards = render._build_dashboard_cards(items, hot_badge_percentile=99)
     feed = render.prepare_feed(cards, {}, 1, 1)
-    assert len(dated) == ranking.DATE_LIMIT
-    assert feed.orders["date:archive"] == feed.orders["date:recent"]
-    date_only = {r.story.id for r in final if r.is_date_only}
-    assert date_only and date_only <= set(dated)
-    for view in ("recommended", "popular", "explore"):
-        assert not date_only & set(feed.orders[f"{view}:recent"])
+    times = {s.id: s.time for s in feed.stories}
+    in_views = {
+        sid
+        for key, order in feed.orders.items()
+        if not key.startswith("date:")
+        for sid in order
+    }
+    dated = feed.orders["date:recent"]
+    assert set(dated) == in_views == set(times)
+    assert [times[sid] for sid in dated] == sorted(
+        (times[sid] for sid in dated), reverse=True
+    )
+    assert feed.orders["date:archive"] == dated
 
 
 def test_dashboard_polish_renders_domain_legend_and_queue_status(

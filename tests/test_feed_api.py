@@ -55,7 +55,6 @@ def test_feed_parity_authentication_stale_cache_and_eviction(tmp_path: Path) -> 
             if i < 3
             else "archive_hn archive_mixed",
             is_hot=i == 1,
-            is_date_pick=i in (1, 3),
             is_novel=i == 2,
         )
         for i in (1, 2, 3)

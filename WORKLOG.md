@@ -1,5 +1,22 @@
 # Worklog: hn-rewrite
 
+## 2026-09-25 Date view: the 12 newest stories in the deck
+
+The user saw hour-old Popular stories missing from Date: Date was the top
+model scores of the last 7 days, and a fresh Hot story with a low model
+score never made that cut. They chose: Date = the newest stories among
+those already in Recommended, Popular or Explore.
+
+- Ranking no longer picks Date stories: `DATE_LIMIT`, `DATE_WINDOW_DAYS`,
+  `RankedStory.is_date_pick`/`is_date_only` and the `date_cutoff` argument
+  are gone, so no Date-only cards are sent.
+- `pipeline/render.py` marks every sent card as Date; `date:*` orders are
+  the whole deck newest first (same for both ages), and the clients' 12-card
+  cap makes Date the 12 newest. Feed schema unchanged.
+- Tests: a property test (Date = union of the other views, newest first,
+  both ages equal) and a regression for a low-score, hour-old Popular story
+  leading Date.
+
 ## 2026-09-25 Every sort shows 12 stories
 
 The user asked for 12 stories in every sort, truncating at the client

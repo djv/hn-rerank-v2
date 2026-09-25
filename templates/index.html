@@ -1094,7 +1094,7 @@
 
     function matchesCurrentCombo(card) {
       const combos = (card.dataset.combo || '').split(' ');
-      // Date is one last-week list whichever Age tab is selected.
+      // Date is the whole deck newest first, whichever Age tab is selected.
       if (currentSort === 'date') {
         return combos.some(combo => combo.endsWith('_' + currentSource));
       }

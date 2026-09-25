@@ -293,10 +293,6 @@ PRIMARY_ARCHIVE_HN = 16
 POPULAR_PER_COMBO = 12
 EXPLORE_PER_BADGE = 4
 EXPLORE_PER_BADGE_NONHN = 1
-# Date view: the DATE_LIMIT best-scored stories posted in the last
-# DATE_WINDOW_DAYS, shown newest first (same list whichever Age tab is on).
-DATE_WINDOW_DAYS = 7
-DATE_LIMIT = 12
 SOURCE_CATEGORIES: tuple[str, ...] = ("hn_live", "archive", "reddit", "rss")
 
 
@@ -347,9 +343,6 @@ class RankedStory:
     is_similar: bool = False
     is_non_hn: bool = False
     is_recent: bool = False
-    # Picked only for the Date view's time coverage (in no other view).
-    is_date_only: bool = False  # in the deck only because Date picked it
-    is_date_pick: bool = False  # member of the Date view
     combo_keys: str = ""
 
 
@@ -1637,7 +1630,6 @@ def _assemble_combo_deck(
     explore: ExploreContext | None,
     is_feedback_match: Callable[[Story], bool] | None = None,
     trace: RankTrace | _NullTrace = NULL_TRACE,
-    date_cutoff: int | None = None,
 ) -> list[RankedStory]:
     """Bucket ``ranked`` into per-combo primary + badge cards.
 
@@ -1907,43 +1899,6 @@ def _assemble_combo_deck(
 
         trace.set_count(f"combo_badges_{combo_id}", len(final) - badge_baseline)
 
-    # --- Date: top model scores from the last DATE_WINDOW_DAYS ---
-    # Picks already in the deck are flagged; the rest are added as Date-only
-    # cards. Only combos in COMBO_DEFS may contribute.
-    if date_cutoff is None:
-        date_cutoff = recent_cutoff + (30 - DATE_WINDOW_DAYS) * 86400
-    live_combos = {(age, source) for age, source, _ in COMBO_DEFS}
-    window = sorted(
-        (
-            r
-            for r in ranked
-            if r.story.time >= date_cutoff
-            and ("recent", "hn" if is_hn_source(r.story.source) else "nonhn")
-            in live_combos
-            and (is_feedback_match is None or not is_feedback_match(r.story))
-        ),
-        key=lambda r: r.score,
-        reverse=True,
-    )[:DATE_LIMIT]
-    position = {r.story.id: i for i, r in enumerate(final)}
-    added = 0
-    for r in window:
-        i = position.get(r.story.id)
-        if i is not None:
-            final[i] = replace(final[i], is_date_pick=True)
-            continue
-        source_key = "recent" + ("_hn" if is_hn_source(r.story.source) else "_non-hn")
-        final.append(
-            replace(
-                r,
-                is_date_pick=True,
-                is_date_only=True,
-                combo_keys=f"{source_key} recent_mixed",
-            )
-        )
-        added += 1
-    trace.set_count("date_only_recent", added)
-
     # Set is_recent and is_non_hn on every story in `final` (these flags are
     # source/time based, not rank-based, so they always reflect the current
     # candidate's metadata regardless of how it was selected).
@@ -2148,7 +2103,6 @@ def assemble_ranked_deck(
             ranked,
             config=config,
             recent_cutoff=recent_cutoff,
-            date_cutoff=int(now_ts) - DATE_WINDOW_DAYS * 86400,
             cand_scores=cand_scores,
             cand_velocities=cand_velocities,
             idx_for=idx_for,

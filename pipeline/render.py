@@ -22,9 +22,10 @@ from .ranking import RankedStory
 
 # Recommended shows at most this many cards per age (top by score);
 # Popular and Explore keep their own badge quotas. Cards in no view are
-# dropped so the server sends a short deck; Date is the ranking's flagged
-# is_date_pick cards. Clients show 12 per view, so the rest of the 24 are
-# the backfill that slides in as cards are voted.
+# dropped so the server sends a short deck. Date lists every card that is in
+# another view, newest first, for both Age tabs. Clients show 12 per view
+# (so Date is the 12 newest in the deck); the rest are the backfill that
+# slides in as cards are voted.
 RECOMMENDED_LIMIT = 24
 
 
@@ -266,11 +267,7 @@ def _build_dashboard_cards(
 ) -> list[DashboardCardView]:
     recommended_ids: set[int] = set()
     for age in ("recent", "archive"):
-        in_age = [
-            r
-            for r in ranked
-            if f"{age}_mixed" in r.combo_keys.split() and not r.is_date_only
-        ]
+        in_age = [r for r in ranked if f"{age}_mixed" in r.combo_keys.split()]
         in_age.sort(key=lambda r: r.score, reverse=True)
         recommended_ids.update(r.story.id for r in in_age[:RECOMMENDED_LIMIT])
     # Cards outside any age deck (no *_mixed key) aren't subject to the cap.
@@ -305,7 +302,8 @@ def _build_dashboard_cards(
                 sort_recommended_attr=(
                     "1" if item.story.id in recommended_ids else "0"
                 ),
-                sort_date_attr="1" if item.is_date_pick else "0",
+                # Every card kept below is in another view, so in Date.
+                sort_date_attr="1",
                 is_recent_attr="1" if item.is_recent else "0",
                 article_url=story.url or "",
                 comments_url=story.discussion_url or "",
@@ -319,13 +317,7 @@ def _build_dashboard_cards(
     return [
         c
         for c in cards
-        if "1"
-        in (
-            c.sort_recommended_attr,
-            c.sort_popular_attr,
-            c.sort_explore_attr,
-            c.sort_date_attr,
-        )
+        if "1" in (c.sort_recommended_attr, c.sort_popular_attr, c.sort_explore_attr)
     ]
 
 
@@ -417,8 +409,8 @@ def prepare_feed(
             selected = [
                 s
                 for s in stories
-                # Date is one list (top model scores of the last week) that
-                # ignores the Age axis, so both ages carry it.
+                # Date is one list (the deck, newest first) that ignores the
+                # Age axis, so both ages carry it.
                 if (
                     s.id in date_ids
                     if sort == "date"
