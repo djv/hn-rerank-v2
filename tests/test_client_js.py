@@ -12,10 +12,12 @@ import json
 import re
 import shutil
 import subprocess
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
 import pytest
+from hypothesis import given, settings, strategies as st
 
 _TEMPLATE = Path(__file__).resolve().parents[1] / "templates" / "index.html"
 
@@ -42,6 +44,9 @@ def _matching(text: str, open_idx: int, pair: str) -> int:
         if quote is None and text.startswith("/*", i):
             i = text.index("*/", i) + 2
             continue
+        if quote is None and ch == "/" and _starts_regex(text, i):
+            i = _skip_regex(text, i)
+            continue
         if quote is not None:
             if ch == "\\":
                 i += 2
@@ -58,6 +63,41 @@ def _matching(text: str, open_idx: int, pair: str) -> int:
                 return i + 1
         i += 1
     raise ValueError(f"unbalanced {pair} from {open_idx}")
+
+
+def _starts_regex(text: str, i: int) -> bool:
+    """A ``/`` begins a regex literal when it follows an operator, an opening
+    bracket or a keyword-like position rather than a value."""
+    j = i - 1
+    while j >= 0 and text[j] in " \t\n":
+        j -= 1
+    return (
+        j < 0
+        or text[j] in "(,=:[!&|?{};+-*%<>~^"
+        or text[max(0, j - 5) : j + 1].endswith("return")
+    )
+
+
+def _skip_regex(text: str, i: int) -> int:
+    """Index just past the regex literal starting at ``text[i] == "/"``."""
+    i += 1
+    in_class = False
+    while text[i] != "\n":
+        ch = text[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "[":
+            in_class = True
+        elif ch == "]":
+            in_class = False
+        elif ch == "/" and not in_class:
+            i += 1
+            while text[i].isalpha():  # flags
+                i += 1
+            return i
+        i += 1
+    raise ValueError(f"unterminated regex literal at {i}")
 
 
 def js_functions(script: str, *names: str) -> str:
@@ -484,3 +524,76 @@ def test_vote_refresh_refills_now_and_polls_for_warm_after_idle() -> None:
     assert result["refills"] == [False, False]
     assert result["polls"] == [2]
     assert result["waited"] >= 3000
+
+
+_HOSTILE_FRAGMENTS = [
+    "<img src=x onerror=alert(1)>",
+    "<script>alert(1)</script>",
+    "<svg/onload=alert(1)>",
+    '"><b onmouseover=alert(1)>',
+    "[t](javascript:alert(1))",
+    "[t]( JaVaScRiPt:alert(1))",
+    "[t](&#106;avascript:alert(1))",
+    "[t](data:text/html,<b>x</b>)",
+    '[t](https://ok.example/" onmouseover="alert(1))',
+    "![a](https://img.example/p.png)",
+    "[ok](https://ok.example/a?b=1&c=2)",
+    "**bold** _em_ `a < b` ~~s~~",
+    "```js\n<b>x</b>\n```",
+    "- item <i>x</i>\n- two",
+    "### Heading <u>x</u>",
+    "> quote",
+    "Label: value & more",
+    "&lt;already&gt;",
+    "\n\n",
+]
+_ALLOWED_TAGS = {
+    "a", "br", "code", "em", "h1", "h2", "h3", "h4", "h5", "h6",
+    "hr", "li", "ol", "pre", "s", "strong", "ul",
+}  # fmt: skip
+
+
+class _TagAudit(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.problems: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag not in _ALLOWED_TAGS:
+            self.problems.append(f"tag <{tag}>")
+        for name, value in attrs:
+            if tag == "a" and name == "href":
+                if not re.match(r"https?://", value or "", re.IGNORECASE):
+                    self.problems.append(f"href {value!r}")
+            elif tag == "a" and name in {"target", "rel"}:
+                continue
+            elif tag in {"pre", "code"} and name == "class":
+                continue
+            else:
+                self.problems.append(f"attr {name}= on <{tag}>")
+
+
+@settings(max_examples=12, deadline=None)
+@given(
+    docs=st.lists(
+        st.lists(st.sampled_from(_HOSTILE_FRAGMENTS), min_size=1, max_size=6).map(
+            lambda parts: " ".join(parts)
+        ),
+        min_size=20,
+        max_size=40,
+    )
+)
+def test_tldr_markdown_output_only_contains_safe_markup(docs: list[str]) -> None:
+    """Whatever an LLM echoes from a hostile page, the rendered TLDR holds
+    only whitelisted tags, no event-handler attributes, and http(s) links."""
+    script = _inline_script()
+    start = script.index("    const TAGS=")
+    end = script.index("    function styleTldrLabels(")
+    outputs = run_node(
+        script[start:end]
+        + f"\nconsole.log(JSON.stringify({json.dumps(docs)}.map(parseSimpleMarkdown)));\n"
+    )
+    for doc, html in zip(docs, outputs, strict=True):
+        audit = _TagAudit()
+        audit.feed(html)
+        assert audit.problems == [], (doc, html, audit.problems)

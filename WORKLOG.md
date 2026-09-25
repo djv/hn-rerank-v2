@@ -1,5 +1,39 @@
 # Worklog: hn-rewrite
 
+## 2026-09-25 Property tests for rate limits, client IP, SSRF, scheduler, TLDR shaping
+
+New properties, each mutation-checked (the property fails when the code
+under test is deliberately broken):
+- `FixedWindowLimiter` decisions equal an independent sliding-window model
+  across idle-bucket sweeps. The first strategy spread hits over 3 keys and
+  missed a broken sweep; traffic is now concentrated on fewer keys, with gaps
+  on the scale of the windows and the 300 s sweep, and the mutation is
+  caught. Multi-bucket checks are all-or-nothing.
+- `_flask_client_ip` returns the rightmost non-loopback X-Forwarded-For hop
+  whatever a client prepends, and falls back to the socket address.
+- `_is_public_ip` agrees for an IPv4 address and its IPv4-mapped IPv6 form,
+  and rejects every private/loopback/link-local/CGNAT/ULA range.
+- `WarmScheduler`: for any interleaving of non-decreasing per-key requests,
+  jobs for one key never overlap, built versions never go backwards, the
+  newest version is always built, and the pool bound holds.
+- TLDR renderer (Node): over generated hostile Markdown, output contains only
+  whitelisted tags, no event-handler attributes, and only http(s) links.
+  Removing `escapeHtml` makes it fail.
+- `_normalize_tldr_markdown` is idempotent; `_cap_tldr_structure` only drops
+  lines, holds every section to its caps, and is idempotent; the client's
+  `normalizeTldrMarkdown` is a no-op on server-normalized text (the
+  cross-language mirror the code comments warn about).
+
+Found by the scheduler property: a request for the version a job was already
+building queued a duplicate run behind it. Readiness polls re-request the
+in-flight version every ~400 ms, so each poll during a warm cost an extra
+job and `gc.collect()`. The scheduler now tracks the running version and
+drops requests it already covers (test:
+`test_request_for_the_running_version_is_not_queued_again`).
+
+The Node function extractor in `tests/test_client_js.py` now skips comments,
+template literals and regex literals.
+
 ## 2026-09-25 Tests: execute the client script instead of grepping it; two vote bugs
 
 **Client bugs found by executing the vote code** (`templates/index.html`):

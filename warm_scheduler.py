@@ -9,7 +9,8 @@ and at most ``workers`` jobs run at once overall.
 earlier than ``now + delay_s``. Requests coalesce: the pending version only
 ever rises; a positive delay restarts the wait (debounce), a zero delay makes
 the job runnable now. A request that arrives while the key's job is running
-stays pending and runs after it, so the newest version always gets built.
+stays pending and runs after it, so the newest version always gets built;
+one for a version the running job already covers is dropped.
 """
 
 from __future__ import annotations
@@ -49,13 +50,16 @@ class WarmScheduler(Generic[K, P]):
         self._name = name
         self._cond = threading.Condition()
         self._pending: dict[K, _Pending[P]] = {}
-        self._running: set[K] = set()
+        # key -> version of the job currently running for it
+        self._running: dict[K, int] = {}
         self._threads: list[threading.Thread] = []
 
     def request(self, key: K, payload: P, version: int, delay_s: float = 0.0) -> None:
         now = self._clock()
         with self._cond:
             pending = self._pending.get(key)
+            if pending is None and self._running.get(key, version - 1) >= version:
+                return  # the running job already builds this version
             if pending is None:
                 self._pending[key] = _Pending(payload, version, now + delay_s)
             else:
@@ -115,7 +119,7 @@ class WarmScheduler(Generic[K, P]):
             return None
         _, key = min(ready, key=lambda item: item[0])
         job = self._pending.pop(key)
-        self._running.add(key)
+        self._running[key] = job.version
         return key, job
 
     def _next_wait_locked(self) -> float | None:
@@ -142,5 +146,5 @@ class WarmScheduler(Generic[K, P]):
                 )
             finally:
                 with self._cond:
-                    self._running.discard(key)
+                    self._running.pop(key, None)
                     self._cond.notify_all()

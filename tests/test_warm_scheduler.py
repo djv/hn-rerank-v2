@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import random
 import threading
 import time
+
+from hypothesis import given, settings, strategies as st
 
 from warm_scheduler import WarmScheduler
 
@@ -125,3 +128,89 @@ def test_clear_pending_drops_queued_jobs() -> None:
     sched.clear_pending()
     assert sched.wait_idle(1)
     assert ran == []
+
+
+@settings(max_examples=40, deadline=None)
+@given(
+    requests=st.lists(
+        st.tuples(st.integers(0, 3), st.integers(1, 20), st.sampled_from([0.0, 0.01])),
+        min_size=1,
+        max_size=25,
+    ),
+    workers=st.integers(1, 3),
+    seed=st.integers(0, 2**16),
+)
+def test_scheduler_invariants_hold_for_any_request_sequence(
+    requests: list[tuple[int, int, float]], workers: int, seed: int
+) -> None:
+    """For any interleaving of non-decreasing per-key requests: jobs for one
+    key never overlap, a key's built versions never go backwards, the newest requested version is always
+    built, and no more than `workers` jobs run at once. (A version may be
+    built again if it is requested after its job finished; skipping
+    finished work is the caller's cache check, not the scheduler's.)"""
+    rng = random.Random(seed)
+    lock = threading.Lock()
+    running: set[int] = set()
+    overlaps: list[int] = []
+    peak = 0
+    built: dict[int, list[int]] = {}
+
+    def run(key: int, version: int) -> None:
+        nonlocal peak
+        with lock:
+            if key in running:
+                overlaps.append(key)
+            running.add(key)
+            peak = max(peak, len(running))
+        time.sleep(rng.choice([0.0, 0.001, 0.003]))
+        with lock:
+            built.setdefault(key, []).append(version)
+            running.discard(key)
+
+    # The handler only ever requests max(requested, live version), so each
+    # key's request stream is non-decreasing; model that.
+    highest: dict[int, int] = {}
+    stream = []
+    for key, version, delay in requests:
+        highest[key] = max(highest.get(key, 0), version)
+        stream.append((key, highest[key], delay))
+    requests = stream
+
+    sched: WarmScheduler[int, int] = WarmScheduler(run, workers=workers)
+    for key, version, delay in requests:
+        sched.request(key, key, version, delay_s=delay)
+        if rng.random() < 0.3:
+            time.sleep(0.001)
+    assert sched.wait_idle(5)
+
+    assert overlaps == []
+    assert peak <= workers
+    for key in {k for k, _, _ in requests}:
+        versions = built[key]
+        assert versions == sorted(versions)
+        assert versions[-1] == max(v for k, v, _ in requests if k == key)
+
+
+def test_request_for_the_running_version_is_not_queued_again() -> None:
+    """Readiness polls re-request the in-flight version every few hundred ms;
+    they must not queue a duplicate job behind it."""
+    started = threading.Event()
+    release = threading.Event()
+    ran: list[int] = []
+
+    def run(key: int, version: int) -> None:
+        started.set()
+        release.wait(2)
+        ran.append(version)
+
+    sched: WarmScheduler[int, int] = WarmScheduler(run, workers=1)
+    sched.request(1, 1, 5)
+    assert started.wait(2)
+    for _ in range(3):
+        sched.request(1, 1, 5)
+        sched.request(1, 1, 4)
+    assert sched.pending_version(1) is None
+    sched.request(1, 1, 6)  # newer: must run after the current job
+    release.set()
+    assert sched.wait_idle(2)
+    assert ran == [5, 6]
