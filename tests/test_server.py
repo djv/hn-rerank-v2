@@ -5963,23 +5963,6 @@ def test_deck_cards_does_not_warm_when_cache_is_current(
     assert calls == []
 
 
-def test_refill_uses_feed_json_and_safe_dom_text() -> None:
-    _, script = _read_template_and_static()
-    assert "fetch('/api/feed', { cache: 'no-store' })" in script
-    assert "const incoming = await fetchRefillCards();" in script
-    assert (
-        "feed.stories.map(story => feedCard(story, feed.version, "
-        "recommended.has(story.id)))"
-    ) in script
-    assert "link.textContent = story.title;" in script
-    assert (
-        "reason.textContent = `Because you upvoted: ${story.best_match_title}`;"
-        in script
-    )
-    assert "card !== activeCard" in script
-    assert "votedStoryIds.has(Number(storyId))" in script
-
-
 def test_justext_rejects_sidebar_boilerplate() -> None:
     """jusText must classify navigation/sidebar <article> fragments as
     boilerplate and extract only the main content paragraph."""

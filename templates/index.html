@@ -1093,14 +1093,19 @@
     }
 
     function matchesCurrentCombo(card) {
-      const target = currentAge + '_' + currentSource;
-      return (card.dataset.combo || '').split(' ').includes(target);
+      const combos = (card.dataset.combo || '').split(' ');
+      // Date is one last-week list whichever Age tab is selected.
+      if (currentSort === 'date') {
+        return combos.some(combo => combo.endsWith('_' + currentSource));
+      }
+      return combos.includes(currentAge + '_' + currentSource);
     }
 
     function matchesCurrentAxes(card) {
       if (currentSort === 'popular' && card.dataset.sortPopular !== '1') return false;
       if (currentSort === 'explore' && card.dataset.sortExplore !== '1') return false;
       if (currentSort === 'recommended' && card.dataset.sortRecommended === '0') return false;
+      if (currentSort === 'date' && card.dataset.sortDate !== '1') return false;
       return true;
     }
 
@@ -1790,7 +1795,7 @@
       });
     });
 
-    function feedCard(story, version, recommended) {
+    function feedCard(story, version, recommended, dated = false) {
       const card = document.createElement('article');
       card.className = 'story-card' + (story.enriched ? ' enriched' : '');
       card.tabIndex = -1;
@@ -1800,7 +1805,7 @@
         score: String(story.rank_score), time: String(story.time),
         storySource: story.source, isHn: story.source === 'hn' ? '1' : '0',
         sortPopular: story.popular ? '1' : '0', sortExplore: story.explore ? '1' : '0',
-        sortRecommended: recommended ? '1' : '0',
+        sortRecommended: recommended ? '1' : '0', sortDate: dated ? '1' : '0',
         isRecent: story.memberships.some(key => key.startsWith('recent_')) ? '1' : '0',
         articleUrl: story.article_url, commentsUrl: story.comments_url
       });
@@ -1882,7 +1887,10 @@
         ...(orders['recommended:recent'] || []),
         ...(orders['recommended:archive'] || []),
       ]);
-      return feed.stories.map(story => feedCard(story, feed.version, recommended.has(story.id)));
+      const dated = new Set(orders['date:recent'] || []);
+      return feed.stories.map(story => feedCard(
+        story, feed.version, recommended.has(story.id), dated.has(story.id),
+      ));
     }
 
     async function refillQueue({ advance = true } = {}) {

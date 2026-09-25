@@ -597,3 +597,99 @@ def test_tldr_markdown_output_only_contains_safe_markup(docs: list[str]) -> None
         audit = _TagAudit()
         audit.feed(html)
         assert audit.problems == [], (doc, html, audit.problems)
+
+
+_FEED_DOM_STUBS = r"""
+function el(tag) {
+  return {
+    tag, dataset: {}, children: [], className: '', textContent: '',
+    appendChild(child) { this.children.push(child); return child; },
+    setAttribute(name, value) { this[name] = value; },
+    get innerHTML() { throw new Error('refill must not use innerHTML'); },
+    set innerHTML(v) { throw new Error('refill must not use innerHTML'); },
+  };
+}
+const document = { createElement: el };
+function textOf(node) {
+  return (node.textContent || '') + node.children.map(textOf).join('');
+}
+let currentSort = 'recommended', currentAge = 'recent', currentSource = 'mixed';
+"""
+
+
+def test_refill_cards_come_from_feed_and_date_view_ignores_age() -> None:
+    """Refill builds cards from /api/feed JSON with text nodes only (a title
+    full of markup stays text), and Date keeps exactly the server's last-week
+    picks under either Age tab while other views stay age-scoped."""
+    feed = {
+        "api_version": 1,
+        "version": 3,
+        "stories": [
+            {
+                "id": sid,
+                "title": title,
+                "memberships": [f"{age}_hn", f"{age}_mixed"],
+                "time": 1000 - sid,
+                "rank_score": 1.0,
+                "source": "hn",
+                "popular": False,
+                "explore": False,
+                "badges": [],
+                "badge_details": [],
+                "best_match_title": "",
+                "article_url": "",
+                "comments_url": "",
+                "domain": "",
+                "points": 1,
+                "comments": 0,
+                "source_label": "HN",
+                "enriched": False,
+            }
+            for sid, title, age in [
+                (1, "<img src=x onerror=alert(1)>", "recent"),
+                (2, "recent, not in Date", "recent"),
+                (3, "archive story", "archive"),
+            ]
+        ],
+        "orders": {
+            "recommended:recent": [1, 2],
+            "recommended:archive": [3],
+            "date:recent": [1],
+            "date:archive": [1],
+        },
+    }
+    functions = js_functions(
+        _inline_script(),
+        "feedCard",
+        "fetchRefillCards",
+        "matchesCurrentCombo",
+        "matchesCurrentAxes",
+    )
+    result = run_node(
+        _FEED_DOM_STUBS
+        + f"const FEED = {json.dumps(feed)};\n"
+        + "async function fetch() { return { ok: true, json: async () => FEED }; }\n"
+        + functions
+        + r"""
+(async () => {
+  const cards = await fetchRefillCards();
+  const visible = {};
+  for (const [sort, age] of [['date', 'recent'], ['date', 'archive'],
+                             ['recommended', 'recent'], ['recommended', 'archive']]) {
+    currentSort = sort; currentAge = age;
+    visible[`${sort}:${age}`] = cards
+      .filter(c => matchesCurrentCombo(c) && matchesCurrentAxes(c))
+      .map(c => Number(c.dataset.storyId));
+  }
+  console.log(JSON.stringify({ visible, title: textOf(cards[0]) }));
+})().catch(e => console.log(JSON.stringify({ error: String(e.stack) })));
+"""
+    )
+    assert "error" not in result, result.get("error")
+    assert result["visible"] == {
+        "date:recent": [1],
+        "date:archive": [1],
+        "recommended:recent": [1, 2],
+        "recommended:archive": [3],
+    }
+    assert "<img src=x onerror=alert(1)>" in result["title"]

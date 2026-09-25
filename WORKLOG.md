@@ -1,5 +1,27 @@
 # Worklog: hn-rewrite
 
+## 2026-09-25 Date view: top 10 of the last 7 days
+
+The user found Date at 51 cards: it listed every sent card for the age
+(Recommended 24 + Popular 12 + Explore 9) plus 24 time-slice picks. They
+chose a simple rule instead: Date = the 10 best model scores among stories
+posted in the last 7 days, newest first. The time-slice pass
+(`time_stratified_picks`, `DATE_SLICES_PER_AGE`) is gone; `DATE_WINDOW_DAYS`
+and `DATE_LIMIT` in `pipeline/ranking.py` set the rule.
+
+- Ranking flags picks with a new `RankedStory.is_date_pick`; picks not
+  otherwise in the deck are still added as `is_date_only` (hidden from the
+  other views and the Recommended cap).
+- `date:recent` and `date:archive` carry the same list, so Date ignores the
+  Age tab (a 7-day window never overlaps Archive). The web client filters
+  Date on the new `data-sort-date` attribute and skips the age check there;
+  refills read Date membership from `date:recent`. The feed schema is
+  unchanged, so older TUI builds keep working.
+- Tests: a property test against an independent spec (window, top 10,
+  feedback duplicates skipped, newest first; mutation-checked), a test that
+  Date-only cards stay out of the other views, and an executed Node test for
+  refill cards and Date/age filtering (it replaces a source-string check).
+
 ## 2026-09-25 Performance: render 8x faster, re-rank 28% faster; a vacuous test
 
 Measured on the scratchpad demo DB (829 candidates, a 184-vote user): 20

@@ -55,6 +55,7 @@ def test_feed_parity_authentication_stale_cache_and_eviction(tmp_path: Path) -> 
             if i < 3
             else "archive_hn archive_mixed",
             is_hot=i == 1,
+            is_date_pick=i in (1, 3),
             is_novel=i == 2,
         )
         for i in (1, 2, 3)
@@ -92,9 +93,14 @@ def test_feed_parity_authentication_stale_cache_and_eviction(tmp_path: Path) -> 
             matching = [
                 c
                 for c in cards
-                if f"{age}_mixed" in str(c["data-combo"]).split()
-                and (
-                    sort not in {"popular", "explore"} or c[f"data-sort-{sort}"] == "1"
+                if (
+                    c["data-sort-date"] == "1"  # Date ignores the Age axis
+                    if sort == "date"
+                    else f"{age}_mixed" in str(c["data-combo"]).split()
+                    and (
+                        sort not in {"popular", "explore"}
+                        or c[f"data-sort-{sort}"] == "1"
+                    )
                 )
             ]
             matching.sort(

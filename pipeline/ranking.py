@@ -291,10 +291,10 @@ PRIMARY_ARCHIVE_HN = 16
 POPULAR_PER_COMBO = 12
 EXPLORE_PER_BADGE = 2
 EXPLORE_PER_BADGE_NONHN = 1
-# Date view coverage per age: the age's pool is split by time into this many
-# equal-count slices and each slice contributes its best-scored story, so
-# Date has no long empty stretch however dense the pool is.
-DATE_SLICES_PER_AGE = 24
+# Date view: the DATE_LIMIT best-scored stories posted in the last
+# DATE_WINDOW_DAYS, shown newest first (same list whichever Age tab is on).
+DATE_WINDOW_DAYS = 7
+DATE_LIMIT = 10
 SOURCE_CATEGORIES: tuple[str, ...] = ("hn_live", "archive", "reddit", "rss")
 
 
@@ -346,7 +346,8 @@ class RankedStory:
     is_non_hn: bool = False
     is_recent: bool = False
     # Picked only for the Date view's time coverage (in no other view).
-    is_date_only: bool = False
+    is_date_only: bool = False  # in the deck only because Date picked it
+    is_date_pick: bool = False  # member of the Date view
     combo_keys: str = ""
 
 
@@ -1564,34 +1565,6 @@ def _score_and_rank(
         return sorted(ranked, key=lambda x: x.score, reverse=True)
 
 
-def time_stratified_picks(
-    pool: Sequence[RankedStory],
-    slices: int,
-    skip: Callable[[Story], bool] | None = None,
-) -> list[RankedStory]:
-    """Best-scored story from each of *slices* equal-count time slices.
-
-    Slices follow story density rather than fixed durations, so the picks
-    span the pool's whole time range for any window length. Stories for
-    which *skip* returns true are passed over in favour of the slice's
-    next best.
-    """
-    if slices <= 0 or not pool:
-        return []
-    by_time = sorted(pool, key=lambda r: r.story.time, reverse=True)
-    picks: list[RankedStory] = []
-    for chunk in np.array_split(np.arange(len(by_time)), min(slices, len(by_time))):
-        ranked_chunk = sorted(
-            (by_time[i] for i in chunk), key=lambda r: r.score, reverse=True
-        )
-        pick = next(
-            (r for r in ranked_chunk if skip is None or not skip(r.story)), None
-        )
-        if pick is not None:
-            picks.append(pick)
-    return picks
-
-
 # MMR
 def mmr_filter(
     ranked: list[RankedStory],
@@ -1662,6 +1635,7 @@ def _assemble_combo_deck(
     explore: ExploreContext | None,
     is_feedback_match: Callable[[Story], bool] | None = None,
     trace: RankTrace | _NullTrace = NULL_TRACE,
+    date_cutoff: int | None = None,
 ) -> list[RankedStory]:
     """Bucket ``ranked`` into per-combo primary + badge cards.
 
@@ -1931,34 +1905,42 @@ def _assemble_combo_deck(
 
         trace.set_count(f"combo_badges_{combo_id}", len(final) - badge_baseline)
 
-    # --- Date: time-stratified coverage per age ---
-    # Score-picked cards cluster in time, which leaves Date (all of an age's
-    # cards, newest first) with multi-day gaps. Add each time slice's best
-    # story; ones already in another view need nothing extra.
-    # Only combos in COMBO_DEFS may contribute (archive_nonhn stays retired).
+    # --- Date: top model scores from the last DATE_WINDOW_DAYS ---
+    # Picks already in the deck are flagged; the rest are added as Date-only
+    # cards. Only combos in COMBO_DEFS may contribute.
+    if date_cutoff is None:
+        date_cutoff = recent_cutoff + (30 - DATE_WINDOW_DAYS) * 86400
     live_combos = {(age, source) for age, source, _ in COMBO_DEFS}
-    in_final = {r.story.id for r in final}
-    for age in ("recent", "archive"):
-        age_pool = [
+    window = sorted(
+        (
             r
             for r in ranked
-            if (r.story.time >= recent_cutoff) == (age == "recent")
-            and (age, "hn" if is_hn_source(r.story.source) else "nonhn") in live_combos
-        ]
-        dated = time_stratified_picks(
-            age_pool, DATE_SLICES_PER_AGE, skip=is_feedback_match
-        )
-        added = 0
-        for r in dated:
-            if r.story.id in in_final:
-                continue
-            source_key = age + ("_hn" if is_hn_source(r.story.source) else "_non-hn")
-            final.append(
-                replace(r, is_date_only=True, combo_keys=f"{source_key} {age}_mixed")
+            if r.story.time >= date_cutoff
+            and ("recent", "hn" if is_hn_source(r.story.source) else "nonhn")
+            in live_combos
+            and (is_feedback_match is None or not is_feedback_match(r.story))
+        ),
+        key=lambda r: r.score,
+        reverse=True,
+    )[:DATE_LIMIT]
+    position = {r.story.id: i for i, r in enumerate(final)}
+    added = 0
+    for r in window:
+        i = position.get(r.story.id)
+        if i is not None:
+            final[i] = replace(final[i], is_date_pick=True)
+            continue
+        source_key = "recent" + ("_hn" if is_hn_source(r.story.source) else "_non-hn")
+        final.append(
+            replace(
+                r,
+                is_date_pick=True,
+                is_date_only=True,
+                combo_keys=f"{source_key} recent_mixed",
             )
-            in_final.add(r.story.id)
-            added += 1
-        trace.set_count(f"date_only_{age}", added)
+        )
+        added += 1
+    trace.set_count("date_only_recent", added)
 
     # Set is_recent and is_non_hn on every story in `final` (these flags are
     # source/time based, not rank-based, so they always reflect the current
@@ -2164,6 +2146,7 @@ def assemble_ranked_deck(
             ranked,
             config=config,
             recent_cutoff=recent_cutoff,
+            date_cutoff=int(now_ts) - DATE_WINDOW_DAYS * 86400,
             cand_scores=cand_scores,
             cand_velocities=cand_velocities,
             idx_for=idx_for,

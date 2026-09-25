@@ -75,6 +75,7 @@ class DashboardCardView:
     is_hn_attr: str
     sort_popular_attr: str
     sort_explore_attr: str
+    sort_date_attr: str
     sort_recommended_attr: str
     is_recent_attr: str
     article_url: str
@@ -277,7 +278,6 @@ def _build_dashboard_cards(
         for r in ranked
         if not any(key.endswith("_mixed") for key in r.combo_keys.split())
     )
-    date_only_ids = {r.story.id for r in ranked if r.is_date_only}
     cards: list[DashboardCardView] = []
     for position, item in enumerate(ranked):
         story = item.story
@@ -304,6 +304,7 @@ def _build_dashboard_cards(
                 sort_recommended_attr=(
                     "1" if item.story.id in recommended_ids else "0"
                 ),
+                sort_date_attr="1" if item.is_date_pick else "0",
                 is_recent_attr="1" if item.is_recent else "0",
                 article_url=story.url or "",
                 comments_url=story.discussion_url or "",
@@ -317,8 +318,13 @@ def _build_dashboard_cards(
     return [
         c
         for c in cards
-        if c.story.id in date_only_ids
-        or "1" in (c.sort_recommended_attr, c.sort_popular_attr, c.sort_explore_attr)
+        if "1"
+        in (
+            c.sort_recommended_attr,
+            c.sort_popular_attr,
+            c.sort_explore_attr,
+            c.sort_date_attr,
+        )
     ]
 
 
@@ -403,18 +409,23 @@ def prepare_feed(
         for c in cards
     ]
     recommended_ids = {c.story.id for c in cards if c.sort_recommended_attr == "1"}
+    date_ids = {c.story.id for c in cards if c.sort_date_attr == "1"}
     orders: dict[str, list[int]] = {}
     for age in ("recent", "archive"):
         for sort in ("recommended", "popular", "explore", "date"):
             selected = [
                 s
                 for s in stories
-                if f"{age}_mixed" in s.memberships
-                and (sort != "popular" or s.popular)
-                and (sort != "explore" or s.explore)
-                # Date spans every card sent for this age (newest first), not
-                # just Recommended, so fresh Popular/Explore stories surface.
-                and (sort != "recommended" or s.id in recommended_ids)
+                # Date is one list (top model scores of the last week) that
+                # ignores the Age axis, so both ages carry it.
+                if (
+                    s.id in date_ids
+                    if sort == "date"
+                    else f"{age}_mixed" in s.memberships
+                    and (sort != "popular" or s.popular)
+                    and (sort != "explore" or s.explore)
+                    and (sort != "recommended" or s.id in recommended_ids)
+                )
             ]
             selected.sort(
                 key=lambda s: s.time if sort == "date" else s.rank_score, reverse=True
