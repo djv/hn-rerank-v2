@@ -13,9 +13,9 @@ from textual.widgets import Button, Input, Markdown, OptionList, Select, Static,
 
 from hn_rerank.app import (
     EMPTY_NOTICE,
+    LIGHT_PALETTE,
     Reader,
     Setup,
-    LIGHT_PALETTE,
     headline,
     headline_domain,
     headline_points,
