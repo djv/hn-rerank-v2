@@ -3,6 +3,8 @@ import sqlite3
 from pathlib import Path
 import numpy as np
 import pytest
+from typing import Any, cast
+
 from hypothesis import given, strategies as st, settings, HealthCheck
 from database import Database, InteractionEvent, Story
 from scripts.migrate_interaction_events import (
@@ -1140,3 +1142,27 @@ def test_llm_usage_daily_accumulates_per_provider(db: Database) -> None:
     assert by_provider["gospark"]["calls"] == 1
     assert by_provider["gospark"]["reasoning_tokens"] == 900
     assert db.get_llm_usage_day("1999-01-01") == []
+
+
+@given(
+    value=st.none()
+    | st.booleans()
+    | st.integers()
+    | st.floats()
+    | st.text(max_size=12)
+    | st.binary(max_size=6)
+    | st.lists(st.integers(), max_size=2)
+    | st.dictionaries(st.text(max_size=3), st.integers(), max_size=2)
+)
+def test_coerce_int_never_raises_and_agrees_with_int(value: object) -> None:
+    """External payloads (CH/Algolia/JSONL) can hold anything, including
+    Infinity and NaN; coerce_int falls back to the default instead of
+    raising, and otherwise matches int()."""
+    from database import coerce_int
+
+    result = coerce_int(value, default=-7)
+    try:
+        expected = int(cast(Any, value))  # probing int()'s own behavior
+    except (TypeError, ValueError, OverflowError):
+        expected = -7
+    assert result == expected

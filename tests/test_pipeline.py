@@ -11,6 +11,8 @@ from numpy.typing import NDArray
 from pathlib import Path
 from types import SimpleNamespace
 from hypothesis import given, strategies as st, settings, HealthCheck
+from collections.abc import Iterator
+
 from database import Database, HnDupeResolution, Story
 from dataclasses import replace
 import pipeline
@@ -7503,8 +7505,8 @@ def test_article_fetch_http_4xx_becomes_permanent(db, monkeypatch):
 
     failure = db.get_article_fetch_failure(story.id)
     assert failure is not None
-    assert failure["failure_count"] == 3
-    assert failure["permanent"] == 1
+    assert failure.failure_count == 3
+    assert failure.permanent is True
 
 
 def _f2_story(sid: int, title: str = "t") -> Story:
@@ -7942,3 +7944,110 @@ def test_growth_threshold_values() -> None:
     assert _growth_threshold(80) == 26
     assert _growth_threshold(10) == 5
     assert _growth_threshold(0) == 5
+
+
+@pytest.fixture(scope="module")
+def policy_db(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Database]:
+    db = Database(str(tmp_path_factory.mktemp("policy") / "policy.db"))
+    yield db
+    db.close()
+
+
+@settings(max_examples=60)
+@given(
+    errors=st.lists(
+        st.sampled_from(["empty_extraction", "http_403", "http_500", "timeout"]),
+        min_size=1,
+        max_size=6,
+    ),
+    story_id=st.integers(1, 10**9),
+)
+def test_article_failure_policy_backoff_and_permanence(
+    policy_db: Database, errors: list[str], story_id: int
+) -> None:
+    """Consecutive failures of one error kind: the count matches, backoff
+    doubles from 1 h up to a 1-day cap, and extraction/auth failures turn
+    permanent exactly at the third attempt while others never do."""
+    from pipeline.enrichment import record_article_fetch_failure_outcome
+
+    db = policy_db
+    db.upsert_story(
+        Story(
+            id=story_id,
+            title="t",
+            url="https://x.example/a",
+            score=1,
+            time=1,
+            text_content="t",
+        )
+    )
+    db.clear_article_fetch_failure(story_id)
+    error = errors[0]
+    for attempt in range(1, len(errors) + 1):
+        now = 1_000_000.0 + attempt
+        record_article_fetch_failure_outcome(
+            db,
+            story_id,
+            "https://x.example/a",
+            status=None,
+            error=error,
+            permanent=False,
+            now_ts=now,
+        )
+        failure = db.get_article_fetch_failure(story_id)
+        assert failure is not None
+        assert failure.failure_count == attempt
+        repeat_permanent = error in {"empty_extraction", "http_403"} and attempt >= 3
+        assert failure.permanent is repeat_permanent
+        if not repeat_permanent:
+            expected_delay = min(86400, 3600 * 2 ** (attempt - 1))
+            assert failure.next_retry_at == pytest.approx(now + expected_delay)
+
+
+def _toml_literal(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return f'"{value}"'
+    return repr(value)
+
+
+def test_config_load_rejects_wrongly_typed_values(tmp_path: Path) -> None:
+    """Every scalar config key is type-checked at load: a wrong TOML kind is a
+    ValueError naming the key; the right kind loads (ints widen to floats)."""
+    import typing
+
+    from pipeline.config import Config, ModelConfig, RssConfig
+
+    samples: dict[object, tuple[object, object]] = {
+        int: (7, "7"),
+        float: (7, "7.0"),
+        bool: (True, 1),
+        str: ("x", 3),
+    }
+    sections = [
+        (Config, "hn_rewrite", ""),
+        (ModelConfig, "hn_rewrite.model", "model."),
+        (RssConfig, "hn_rewrite.rss", "rss."),
+    ]
+    checked = 0
+    for cls, table, prefix in sections:
+        for name, tp in typing.get_type_hints(cls).items():
+            if tp not in samples:
+                continue
+            good, bad = samples[tp]
+            for value, ok in ((good, True), (bad, False)):
+                path = tmp_path / f"{table}.{name}.{ok}.toml"
+                path.write_text(f"[{table}]\n{name} = {_toml_literal(value)}\n")
+                if ok:
+                    loaded = Config.load(str(path))
+                    target = loaded
+                    for part in prefix.rstrip(".").split(".") if prefix else []:
+                        target = getattr(target, part)
+                    assert getattr(target, name) == value
+                    assert type(getattr(target, name)) is tp
+                else:
+                    with pytest.raises(ValueError, match=rf"\b{name}\b"):
+                        Config.load(str(path))
+            checked += 1
+    assert checked > 60  # every scalar field across the three sections

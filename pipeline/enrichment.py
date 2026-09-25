@@ -818,9 +818,9 @@ def _article_fetch_failure_active(
     now_ts: float,
 ) -> bool:
     failure = db.get_article_fetch_failure(story_id)
-    if not failure:
+    if failure is None:
         return False
-    return bool(failure["permanent"]) or float(failure["next_retry_at"]) > now_ts
+    return failure.permanent or failure.next_retry_at > now_ts
 
 
 def _article_fetch_extra_priority(
@@ -977,6 +977,54 @@ def _article_failure_retry_time(failure_count: int, now_ts: float) -> float:
     return now_ts + delay_seconds
 
 
+# Errors that become permanent after this many consecutive failures: pages
+# that extract to nothing, and sites that refuse us (auth walls, bot blocks).
+_ARTICLE_REPEAT_PERMANENT_ERRORS = frozenset(
+    {"empty_extraction", "http_401", "http_403"}
+)
+_ARTICLE_REPEAT_PERMANENT_AFTER = 3
+_ARTICLE_PERMANENT_RETRY_S = 3650 * 86400
+
+
+def record_article_fetch_failure_outcome(
+    db: Database,
+    story_id: int,
+    url: str,
+    *,
+    status: int | None,
+    error: str | None,
+    permanent: bool,
+    now_ts: float | None = None,
+) -> None:
+    """Record one failed article fetch under the shared retry policy.
+
+    Exponential backoff (1 h doubling, capped at 1 day); permanent when the
+    fetcher said so (404/410, non-HTML, blocked URL) or after repeated
+    empty extractions / 401 / 403. Used by the proactive fetcher and by the
+    TLDR tap path so both apply the same rules.
+    """
+    now_ts = time.time() if now_ts is None else now_ts
+    previous = db.get_article_fetch_failure(story_id)
+    failure_count = (previous.failure_count if previous else 0) + 1
+    permanent = permanent or (
+        error in _ARTICLE_REPEAT_PERMANENT_ERRORS
+        and failure_count >= _ARTICLE_REPEAT_PERMANENT_AFTER
+    )
+    next_retry_at = (
+        now_ts + _ARTICLE_PERMANENT_RETRY_S
+        if permanent
+        else _article_failure_retry_time(failure_count, now_ts)
+    )
+    db.record_article_fetch_failure(
+        story_id,
+        url,
+        status=status,
+        error=error,
+        permanent=permanent,
+        next_retry_at=next_retry_at,
+    )
+
+
 async def fetch_and_cache_article_bodies(
     *,
     db: Database,
@@ -1029,31 +1077,13 @@ async def fetch_and_cache_article_bodies(
                     success[0] += 1
                     return story.id, updated
 
-                now_ts = time.time()
-                previous = db.get_article_fetch_failure(story.id)
-                previous_count = int(previous["failure_count"]) if previous else 0
-                failure_count = previous_count + 1
-                permanent = (
-                    result.permanent
-                    or (result.error == "empty_extraction" and failure_count >= 3)
-                    or (
-                        result.error is not None
-                        and result.error in ("http_401", "http_403")
-                        and failure_count >= 3
-                    )
-                )
-                next_retry_at = (
-                    now_ts + 3650 * 86400
-                    if permanent
-                    else _article_failure_retry_time(failure_count, now_ts)
-                )
-                db.record_article_fetch_failure(
+                record_article_fetch_failure_outcome(
+                    db,
                     story.id,
                     story.url or "",
                     status=result.status,
                     error=result.error,
-                    permanent=permanent,
-                    next_retry_at=next_retry_at,
+                    permanent=result.permanent,
                 )
                 error_key = result.error or (
                     f"http_{result.status}" if result.status else "unknown"
@@ -1066,17 +1096,13 @@ async def fetch_and_cache_article_bodies(
                     story.id,
                     story.url or "",
                 )
-                now_ts = time.time()
-                previous = db.get_article_fetch_failure(story.id)
-                previous_count = int(previous["failure_count"]) if previous else 0
-                failure_count = previous_count + 1
-                db.record_article_fetch_failure(
+                record_article_fetch_failure_outcome(
+                    db,
                     story.id,
                     story.url or "",
                     status=None,
                     error="internal_exception",
                     permanent=False,
-                    next_retry_at=_article_failure_retry_time(failure_count, now_ts),
                 )
                 error_counts["internal_exception"] = (
                     error_counts.get("internal_exception", 0) + 1

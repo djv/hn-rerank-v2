@@ -17,11 +17,11 @@ import time
 import math
 import uuid
 from collections import deque
-from collections.abc import Callable, Coroutine, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypeVar, cast
 from urllib.parse import urlparse, urlunparse
 
 import feedparser
@@ -47,6 +47,8 @@ from llm_limiter import limiter as llm_limiter
 from reddit_limiter import limiter as reddit_limiter
 import http_fetch
 from warm_scheduler import WarmScheduler
+
+_LaneT = TypeVar("_LaneT")
 
 ARTICLE_BODY_CHAR_LIMIT = 30_000
 SELF_TEXT_PROMPT_CHAR_LIMIT = 16_000
@@ -671,7 +673,7 @@ async def _fetch_lesswrong_context(post_id: str) -> LessWrongContext | None:
     )
 
 
-def _usage_int(usage: Any, key: str) -> int | None:
+def _usage_int(usage: object, key: str) -> int | None:
     """Defensive usage-field reader: non-negative ints only, else None."""
     if not isinstance(usage, dict):
         return None
@@ -2167,11 +2169,14 @@ def _handle_flask_feedback(runtime: type[Handler]) -> Response:
         )
 
 
-def _parse_interaction_event(raw_event: Any, user_id: int) -> InteractionEvent:
+def _parse_interaction_event(raw_event: object, user_id: int) -> InteractionEvent:
     """Validate one raw ledger event; raises ValueError on any bad field."""
     event_types = {"impression", "article_open", "comments_open", "dwell"}
     if not isinstance(raw_event, dict):
         raise ValueError("each event must be an object")
+    # JSON objects have string keys; every value stays `object` and is
+    # narrowed field by field below.
+    raw_event = cast("dict[str, object]", raw_event)
     required = {
         "event_id",
         "client_session_id",
@@ -2658,15 +2663,19 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
 
         # Lane results by name; values are the lane return or the caught
         # Exception (lanes fail independently — see _timed).
-        HydrationOut = dict[
-            str,
-            Story
-            | RedditRssContext
-            | LessWrongContext
-            | ArticleFetchResult
-            | Exception
-            | None,
-        ]
+        async def _timed(
+            name: str, coro: Awaitable[_LaneT] | None
+        ) -> tuple[_LaneT | Exception | None, float | None]:
+            """Run one hydration lane; a failure is returned, not raised, so
+            the other lanes still finish. ``None`` lanes are skipped."""
+            if coro is None:
+                return None, None
+            t0 = time.perf_counter()
+            try:
+                return await coro, (time.perf_counter() - t0) * 1000.0
+            except Exception as e:
+                logging.error("TLDR hydration lane %s failed: %r", name, e)
+                return e, (time.perf_counter() - t0) * 1000.0
 
         async def _gather_hydration() -> tuple[
             Story | Exception | None,
@@ -2674,43 +2683,21 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             ArticleFetchResult | Exception | None,
             dict[str, float],
         ]:
-            tasks: dict[str, Coroutine[Any, Any, object]] = {}
-            if hn_needed:
-                tasks["hn"] = _hn_lane()
-            if src_kind is not None:
-                tasks["src"] = _src_lane()
-            if article_eligible:
-                tasks["article"] = _article_lane()
-            if not tasks:
-                return None, None, None, {}
-
-            async def _timed(name: str, coro: Any) -> tuple[str, Any, float]:
-                t0 = time.perf_counter()
-                try:
-                    return name, await coro, (time.perf_counter() - t0) * 1000.0
-                except Exception as e:
-                    logging.error("TLDR hydration lane %s failed: %r", name, e)
-                    return name, e, (time.perf_counter() - t0) * 1000.0
-
-            gathered = await asyncio.gather(
-                *(_timed(name, coro) for name, coro in tasks.items())
+            (hn, hn_ms), (src, src_ms), (article, article_ms) = await asyncio.gather(
+                _timed("hn", _hn_lane() if hn_needed else None),
+                _timed("src", _src_lane() if src_kind is not None else None),
+                _timed("article", _article_lane() if article_eligible else None),
             )
-            out: HydrationOut = {}
-            timings: dict[str, float] = {}
-            for name, value, ms in gathered:
-                out[name] = value
-                timings[name] = ms
-            # dict.get can't narrow per-key: each lane only ever stores its
-            # own result type (see tasks above), so these casts are safe.
-            return (
-                cast("Story | Exception | None", out.get("hn")),
-                cast(
-                    "RedditRssContext | LessWrongContext | Exception | None",
-                    out.get("src"),
-                ),
-                cast("ArticleFetchResult | Exception | None", out.get("article")),
-                timings,
-            )
+            timings = {
+                name: ms
+                for name, ms in (
+                    ("hn", hn_ms),
+                    ("src", src_ms),
+                    ("article", article_ms),
+                )
+                if ms is not None
+            }
+            return hn, src, article, timings
 
         t_hydrate = time.perf_counter()
         hn_updated: Story | Exception | None = None
@@ -2763,10 +2750,8 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             logging.error("TLDR source-context lane failed: %r", remote_context)
 
         if article_result is not None and not isinstance(article_result, Exception):
-            from pipeline import (
-                _article_failure_retry_time,
-                compose_story_text,
-            )
+            from pipeline import compose_story_text
+            from pipeline.enrichment import record_article_fetch_failure_outcome
 
             result = article_result
             if result.body:
@@ -2789,31 +2774,13 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
                 # there); running ONNX encode here would block the tap.
                 story = updated_story
             else:
-                now_ts = time.time()
-                previous = runtime.db.get_article_fetch_failure(story.id)
-                previous_count = int(previous["failure_count"]) if previous else 0
-                failure_count = previous_count + 1
-                permanent = (
-                    result.permanent
-                    or (result.error == "empty_extraction" and failure_count >= 3)
-                    or (
-                        result.error is not None
-                        and result.error in ("http_401", "http_403")
-                        and failure_count >= 3
-                    )
-                )
-                next_retry_at = (
-                    now_ts + 3650 * 86400
-                    if permanent
-                    else _article_failure_retry_time(failure_count, now_ts)
-                )
-                runtime.db.record_article_fetch_failure(
+                record_article_fetch_failure_outcome(
+                    runtime.db,
                     story.id,
                     story.url or "",
                     status=result.status,
                     error=result.error,
-                    permanent=permanent,
-                    next_retry_at=next_retry_at,
+                    permanent=result.permanent,
                 )
         elif isinstance(article_result, Exception):
             logging.error("TLDR article lane failed: %r", article_result)

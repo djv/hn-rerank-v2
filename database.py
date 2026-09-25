@@ -25,14 +25,15 @@ class StoryIdentityConflict(ValueError):
     """An RSS ID is already owned by a different URL."""
 
 
-def coerce_int(value: Any, default: int = 0) -> int:
+def coerce_int(value: object, default: int = 0) -> int:
     """Lenient int() for external payloads (CH rows, Algolia items, seed
-    JSONL): None/unparseable collapse to `default` instead of raising."""
-    if value is None:
+    JSONL): None, unparseable and non-finite values collapse to `default`
+    instead of raising."""
+    if not isinstance(value, (int, float, str, bytes)):
         return default
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (ValueError, OverflowError):
         return default
 
 
@@ -51,6 +52,20 @@ class Story:
     self_text: str = ""
     top_comments: str = ""
     article_body: str = ""
+
+
+@dataclass(frozen=True)
+class ArticleFetchFailure:
+    """One row of ``article_fetch_failures``: retry state for a story's URL."""
+
+    story_id: int
+    url: str
+    failure_count: int
+    last_status: int | None
+    last_error: str
+    permanent: bool
+    next_retry_at: float
+    updated_at: float
 
 
 @dataclass(frozen=True)
@@ -1400,7 +1415,7 @@ class Database:
                 )
 
     # Article fetch failure memory
-    def get_article_fetch_failure(self, story_id: int) -> dict[str, Any] | None:
+    def get_article_fetch_failure(self, story_id: int) -> ArticleFetchFailure | None:
         with self.conn() as conn:
             row = conn.execute(
                 """
@@ -1413,16 +1428,16 @@ class Database:
             ).fetchone()
             if not row:
                 return None
-            return {
-                "story_id": row[0],
-                "url": row[1],
-                "failure_count": row[2],
-                "last_status": row[3],
-                "last_error": row[4],
-                "permanent": bool(row[5]),
-                "next_retry_at": row[6],
-                "updated_at": row[7],
-            }
+            return ArticleFetchFailure(
+                story_id=int(row[0]),
+                url=str(row[1]),
+                failure_count=int(row[2]),
+                last_status=None if row[3] is None else int(row[3]),
+                last_error=str(row[4]),
+                permanent=bool(row[5]),
+                next_retry_at=float(row[6]),
+                updated_at=float(row[7]),
+            )
 
     def record_article_fetch_failure(
         self,

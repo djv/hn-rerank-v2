@@ -6092,9 +6092,9 @@ def test_on_demand_tldr_records_fetch_failure(test_env, monkeypatch):
 
     failure = db.get_article_fetch_failure(1001)
     assert failure is not None
-    assert failure["last_status"] == 403
-    assert failure["last_error"] == "http_403"
-    assert failure["failure_count"] == 1
+    assert failure.last_status == 403
+    assert failure.last_error == "http_403"
+    assert failure.failure_count == 1
 
 
 def test_on_demand_tldr_clears_failure_on_success(test_env, monkeypatch):

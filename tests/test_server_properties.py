@@ -148,3 +148,53 @@ def test_is_public_ip_rejects_private_ranges(
     import http_fetch
 
     assert not http_fetch._is_public_ip(str(ip))
+
+
+_JSON = st.recursive(
+    st.none() | st.booleans() | st.integers() | st.floats() | st.text(max_size=8),
+    lambda inner: (
+        st.lists(inner, max_size=3)
+        | st.dictionaries(st.text(max_size=8), inner, max_size=3)
+    ),
+    max_leaves=10,
+)
+_VALID_EVENT = st.fixed_dictionaries(
+    {
+        "event_id": st.uuids().map(str),
+        "client_session_id": st.uuids().map(str),
+        "story_id": st.integers(1, 2**40) | st.integers(-(2**40), -1),
+        "event_type": st.sampled_from(["impression", "article_open", "comments_open"]),
+        "dashboard_version": st.integers(0, 10**6),
+        "position": st.integers(0, 500),
+        "sort_mode": st.text(min_size=1, max_size=64),
+        "age_filter": st.text(min_size=1, max_size=64),
+        "source_filter": st.text(min_size=1, max_size=64),
+        "ranker_arm": st.text(min_size=1, max_size=64),
+        "occurred_at": st.floats(1, 4e9),
+    }
+)
+
+
+@given(
+    raw=_JSON
+    | _VALID_EVENT.flatmap(
+        lambda event: st.dictionaries(
+            st.sampled_from(sorted(event)), _JSON, max_size=3
+        ).map(lambda patch: {**event, **patch})
+    )
+)
+def test_interaction_event_parser_only_raises_value_error(raw: object) -> None:
+    """Untrusted JSON either parses or is rejected with ValueError (a 400),
+    never another exception type (a 500)."""
+    try:
+        server._parse_interaction_event(raw, user_id=1)
+    except ValueError:
+        pass
+
+
+@given(event=_VALID_EVENT)
+def test_valid_interaction_events_round_trip(event: dict[str, object]) -> None:
+    parsed = server._parse_interaction_event(event, user_id=7)
+    assert parsed.user_id == 7
+    for field in ("event_id", "story_id", "event_type", "position", "sort_mode"):
+        assert getattr(parsed, field) == event[field]

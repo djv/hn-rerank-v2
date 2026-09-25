@@ -14,7 +14,8 @@ import ipaddress
 import logging
 import socket
 from dataclasses import dataclass
-from typing import Any
+from http.client import HTTPMessage
+from typing import IO, Protocol
 from urllib.error import HTTPError
 from urllib.parse import urljoin, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
@@ -28,6 +29,12 @@ import httpx
 ARTICLE_MAX_BYTES = 5_000_000
 ARTICLE_MAX_REDIRECTS = 5
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+
+
+class _HttpGetClient(Protocol):
+    """The slice of ``httpx.AsyncClient`` the fallback helper uses."""
+
+    async def get(self, url: str, *, headers: dict[str, str]) -> httpx.Response: ...
 
 
 class UnsafeUrlError(ValueError):
@@ -126,7 +133,15 @@ async def guarded_get(
 
 
 class _CheckedRedirectHandler(HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]  # stdlib signature is untyped
+    def redirect_request(
+        self,
+        req: Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: HTTPMessage,
+        newurl: str,
+    ) -> Request | None:
         check_public_url(newurl)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
@@ -176,7 +191,7 @@ async def _retry_via_urllib(
 
 
 async def fetch_with_urllib_fallback(
-    client: Any,
+    client: _HttpGetClient,
     url: str,
     headers: dict[str, str],
     *,

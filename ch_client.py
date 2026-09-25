@@ -48,7 +48,7 @@ import threading
 import time
 from typing import Any, TypedDict
 
-from cachetools import TLRUCache
+from cachetools import TTLCache
 import httpx
 
 from database import coerce_int
@@ -62,40 +62,27 @@ _CACHE_TTL_SINGLE_SECONDS = 900
 _CACHE_MAX_ENTRIES = 128
 
 
-def _cache_ttu(key: tuple[Any, ...], _value: Any, now: float) -> float:
-    return now + _ttl_for_key(key)
-
-
-_cache: TLRUCache[tuple[Any, ...], Any] = TLRUCache(
+# Bulk entries are keyed by (sorted story ids, comment depth); single-story
+# entries by (story id, comment depth). The timers look up time.monotonic at
+# call time so tests can drive expiry.
+_bulk_cache: TTLCache[tuple[tuple[int, ...], int], dict[int, ChItem]] = TTLCache(
     maxsize=_CACHE_MAX_ENTRIES,
-    ttu=_cache_ttu,
+    ttl=_CACHE_TTL_BULK_SECONDS,
+    timer=lambda: time.monotonic(),
+)
+_single_cache: TTLCache[tuple[int, int], ChItem] = TTLCache(
+    maxsize=_CACHE_MAX_ENTRIES,
+    ttl=_CACHE_TTL_SINGLE_SECONDS,
     timer=lambda: time.monotonic(),
 )
 _cache_lock = threading.Lock()
 
 
-def _cache_get(key: tuple[Any, ...]) -> Any | None:
-    with _cache_lock:
-        return _cache.get(key)
-
-
-def _cache_put(key: tuple[Any, ...], value: Any) -> None:
-    with _cache_lock:
-        _cache[key] = value
-
-
-def _ttl_for_key(key: tuple[Any, ...]) -> int:
-    return (
-        _CACHE_TTL_SINGLE_SECONDS
-        if key[0] == "single_story"
-        else _CACHE_TTL_BULK_SECONDS
-    )
-
-
 def clear_cache() -> None:
     """Drop all cached entries. Test helper."""
     with _cache_lock:
-        _cache.clear()
+        _bulk_cache.clear()
+        _single_cache.clear()
 
 
 def _post_ch(query: str) -> list[dict[str, Any]]:
@@ -371,8 +358,9 @@ def query_stories_with_comments(
     """
     if not story_ids:
         return {}
-    bulk_key = ("stories_with_comments", tuple(sorted(story_ids)), max_levels)
-    cached = _cache_get(bulk_key)
+    bulk_key = (tuple(sorted(story_ids)), max_levels)
+    with _cache_lock:
+        cached = _bulk_cache.get(bulk_key)
     if cached is not None:
         return cached
     stories = query_stories_bulk(story_ids)
@@ -381,7 +369,8 @@ def query_stories_with_comments(
     comments_by_story = query_comments_bulk(list(stories.keys()), max_levels)
     for sid, item in stories.items():
         item["children"] = comments_by_story.get(sid, [])
-    _cache_put(bulk_key, stories)
+    with _cache_lock:
+        _bulk_cache[bulk_key] = stories
     return stories
 
 
@@ -393,8 +382,9 @@ def query_single_story(story_id: int, max_levels: int = 5) -> ChItem | None:
     """
     if story_id <= 0:
         raise ValueError("story_id must be a positive integer")
-    key = ("single_story", int(story_id), int(max_levels))
-    cached = _cache_get(key)
+    key = (int(story_id), int(max_levels))
+    with _cache_lock:
+        cached = _single_cache.get(key)
     if cached is not None:
         return cached
     story_rows = _post_ch(_build_single_story_query(story_id))
@@ -403,5 +393,6 @@ def query_single_story(story_id: int, max_levels: int = 5) -> ChItem | None:
     story_dict = _build_story_dict(story_rows[0])
     comments_by_story = query_comments_bulk([story_id], max_levels)
     story_dict["children"] = comments_by_story.get(story_id, [])
-    _cache_put(key, story_dict)
+    with _cache_lock:
+        _single_cache[key] = story_dict
     return story_dict

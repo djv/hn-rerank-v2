@@ -3,7 +3,18 @@ from __future__ import annotations
 import os
 import tomllib
 from dataclasses import dataclass, field, fields, replace
-from typing import Any, Literal
+from types import UnionType
+from typing import (
+    TYPE_CHECKING,
+    Literal,
+    TypeVar,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
+
+if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
 
 
 @dataclass(frozen=True)
@@ -242,30 +253,80 @@ class Config:
             raise ValueError(
                 "Unknown hn_rewrite config key(s): " + ", ".join(sorted(unknown_root))
             )
+        root_values = _typed_values(cls, root_values, section="hn_rewrite")
 
         model = _overlay_dataclass_config(
             defaults.model,
             model_cfg,
             section="hn_rewrite.model",
-            tuple_fields={"dedup_exclude_actions"},
         )
         rss = _overlay_dataclass_config(
             defaults.rss,
             rss_cfg,
             section="hn_rewrite.rss",
-            tuple_fields={"feeds"},
         )
 
         return replace(defaults, **root_values, model=model, rss=rss)
 
 
+_DC = TypeVar("_DC", bound="DataclassInstance")
+
+
+def _coerce_toml_value(value: object, tp: object, where: str) -> object:
+    """Check a TOML value against a dataclass field's declared type.
+
+    TOML already distinguishes ints, floats, bools and strings, so this only
+    widens int -> float and array -> tuple; anything else that doesn't match
+    is a config error reported with its key, not a crash later at use.
+    """
+    if tp is bool:
+        if isinstance(value, bool):
+            return value
+    elif tp is int:
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    elif tp is float:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+    elif tp is str:
+        if isinstance(value, str):
+            return value
+    elif get_origin(tp) is tuple:
+        (item_tp, _) = get_args(tp)
+        if isinstance(value, (list, tuple)):
+            return tuple(_coerce_toml_value(v, item_tp, where) for v in value)
+    elif get_origin(tp) is Literal:
+        if value in get_args(tp):
+            return value
+    elif isinstance(tp, UnionType):
+        for option in get_args(tp):
+            try:
+                return _coerce_toml_value(value, option, where)
+            except ValueError:
+                continue
+    raise ValueError(f"{where} must be {_type_name(tp)}, got {value!r}")
+
+
+def _type_name(tp: object) -> str:
+    return getattr(tp, "__name__", None) or str(tp)
+
+
+def _typed_values(
+    cls: type[DataclassInstance], values: dict[str, object], *, section: str
+) -> dict[str, object]:
+    hints = get_type_hints(cls)
+    return {
+        name: _coerce_toml_value(value, hints[name], f"{section}.{name}")
+        for name, value in values.items()
+    }
+
+
 def _overlay_dataclass_config(
-    defaults: Any,
-    config: Any,
+    defaults: _DC,
+    config: object,
     *,
     section: str,
-    tuple_fields: set[str] | None = None,
-) -> Any:
+) -> _DC:
     if not isinstance(config, dict):
         raise ValueError(f"[{section}] must be a table")
 
@@ -276,8 +337,5 @@ def _overlay_dataclass_config(
             f"Unknown {section} config key(s): " + ", ".join(sorted(unknown))
         )
 
-    values = dict(config)
-    for name in tuple_fields or set():
-        if name in values:
-            values[name] = tuple(values[name])
-    return replace(defaults, **values)
+    values = {str(key): value for key, value in config.items()}
+    return replace(defaults, **_typed_values(type(defaults), values, section=section))

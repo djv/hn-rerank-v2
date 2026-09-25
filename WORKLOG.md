@@ -1,5 +1,36 @@
 # Worklog: hn-rewrite
 
+## 2026-09-25 Stronger typing at boundaries; shared article-failure policy
+
+- **Config values are type-checked at load** (`pipeline/config.py`). TOML
+  values used to be copied into the dataclasses unchecked, so
+  `server_port = "8766"` or `warm_pool_size = 2.5` loaded silently and failed
+  far away. `_coerce_toml_value` checks each key against its declared type
+  (bool/int/float/str, `tuple[str, ...]`, Literal, unions; ints widen to
+  float, arrays to tuples) and raises `ValueError` naming the key. This
+  replaced `_overlay_dataclass_config`'s `Any -> Any` signature and its
+  hand-listed `tuple_fields`; it is now generic over the dataclass type.
+  A test covers every scalar field of all three sections.
+- **`ArticleFetchFailure`** dataclass replaces the `dict[str, Any]` returned
+  by `Database.get_article_fetch_failure`. The retry/permanence policy was
+  copied in three places (the TLDR tap path in `server.py`, the proactive
+  fetcher, and its exception path); it is now
+  `pipeline.enrichment.record_article_fetch_failure_outcome`, with a
+  property test (count, 1 h → 1 day backoff, permanent exactly at the third
+  empty-extraction/401/403).
+- **`coerce_int`** takes `object` and no longer raises `OverflowError` on
+  `Infinity` (Python's json accepts it in external payloads); a property test
+  checks that it never raises and otherwise matches `int()`.
+- `_parse_interaction_event` / `_usage_int` take `object` (validators must
+  narrow); property tests check the ledger parser raises only `ValueError`
+  (a 400, never a 500) on arbitrary JSON and round-trips valid events.
+- TLDR hydration lanes are gathered as separately typed awaitables. This
+  replaces a `dict[str, object]` round-trip with three `cast`s.
+- `http_fetch`: a `Protocol` for the fallback helper's client, and the
+  redirect-handler override is typed instead of `type: ignore`d.
+- `ch_client`: two typed `TTLCache`s (bulk 1 h, single story 15 min)
+  replace one `TLRUCache[tuple[Any, ...], Any]` keyed by a string tag.
+
 ## 2026-09-25 Property tests for rate limits, client IP, SSRF, scheduler, TLDR shaping
 
 New properties, each mutation-checked (the property fails when the code
