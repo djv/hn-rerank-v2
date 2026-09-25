@@ -770,7 +770,11 @@ def fast_rerank_for_user(
     """Fast rerank for a specific user. Called on each dashboard request."""
     trace.set_count("user_id", user_id)
 
-    n_feedback = sum(db.count_feedback_by_action(user_id).values())
+    # One feedback snapshot serves every stage of this rank: the cold-deck
+    # decision, the voted-story mask, dupe matching, dedup and HN
+    # canonicalization (each used to query the feedback table separately).
+    feedback = db.get_all_feedback(user_id=user_id)
+    n_feedback = len(feedback)
     trace.set_count("feedback_total", n_feedback)
     if n_feedback == 0:
         trace.set_label("model_cache", "skipped_cold_deck")
@@ -794,7 +798,7 @@ def fast_rerank_for_user(
 
     with trace.stage("candidate_sql"):
         pool = get_candidate_pool(db, config, embedder, trace=trace)
-        voted_ids = frozenset(_voted_story_ids(db, user_id))
+        voted_ids = frozenset(f.story_id for f in feedback)
     if not pool.stories:
         return []
 
@@ -810,9 +814,6 @@ def fast_rerank_for_user(
     # candidates that duplicate a story the user already voted on, instead
     # of silently losing badge slots to the downstream `canonicalize_hn_dupes`
     # feedback-match drop (see WORKLOG 2026-07-10).
-    # One feedback snapshot for every stage of this rank (dupe matching,
-    # URL/embedding dedup, HN canonicalization) instead of a reload each.
-    feedback = db.get_all_feedback(user_id=user_id)
     feedback_context = build_feedback_context(
         feedback, tuple(config.model.dedup_exclude_actions)
     )
