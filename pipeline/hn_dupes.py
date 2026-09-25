@@ -6,7 +6,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 from fractions import Fraction
@@ -15,7 +15,7 @@ from typing import Literal, Protocol, TypeAlias, TypeVar, cast
 
 import httpx
 
-from database import Database, HnDupeResolution, Story
+from database import Database, FeedbackRecord, HnDupeResolution, Story
 from dedup import NormalizedUrl, normalize_url
 from .ranking import RankedStory, clean_text, compose_story_text
 
@@ -403,8 +403,13 @@ def canonicalize_hn_dupes(
     feedback_actions: tuple[str, ...] = ("up", "neutral"),
     resolver: HnDupeResolver | None = None,
     trace: _TraceCounter | None = None,
+    feedback_context: FeedbackDupeContext | None = None,
 ) -> list[RankedStory]:
-    """Replace or suppress selected HN cards with canonical duplicate targets."""
+    """Replace or suppress selected HN cards with canonical duplicate targets.
+
+    *feedback_context* lets a caller that already built it for this user and
+    ``feedback_actions`` skip reloading the user's feedback.
+    """
     if not ranked:
         return ranked
 
@@ -414,11 +419,12 @@ def canonicalize_hn_dupes(
 
     candidate_by_id = {story.id: story for story in candidate_stories}
     original_output_ids = {item.story.id for item in ranked}
-    feedback_context = _load_feedback_context(
-        db,
-        user_id=user_id,
-        actions=feedback_actions,
-    )
+    if feedback_context is None:
+        feedback_context = _load_feedback_context(
+            db,
+            user_id=user_id,
+            actions=feedback_actions,
+        )
     source_ids = list(
         dict.fromkeys(
             item.story.id
@@ -544,13 +550,19 @@ def _load_feedback_context(
 ) -> FeedbackDupeContext:
     if user_id is None or not actions:
         return FeedbackDupeContext(story_ids=set(), urls=set(), hn_stories=[])
+    return build_feedback_context(db.get_all_feedback(user_id=user_id), actions)
 
+
+def build_feedback_context(
+    feedback: Iterable[FeedbackRecord], actions: tuple[str, ...]
+) -> FeedbackDupeContext:
+    """The voted-story index used to suppress duplicates of voted stories."""
     action_set = set(actions)
     story_ids: set[int] = set()
     urls: set[NormalizedUrl] = set()
     hn_stories: list[Story] = []
     title_keys: list[tuple[str, frozenset[str]]] = []
-    for record in db.get_all_feedback(user_id=user_id):
+    for record in feedback:
         if record.action not in action_set:
             continue
         story_ids.add(record.story_id)

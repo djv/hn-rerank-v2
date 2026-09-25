@@ -1,5 +1,45 @@
 # Worklog: hn-rewrite
 
+## 2026-09-25 Performance: render 8x faster, re-rank 28% faster; a vacuous test
+
+Measured on the scratchpad demo DB (829 candidates, a 184-vote user): 20
+warm runs each on the committed baseline and on the change, identical DB
+copies.
+
+| Path | Before | After |
+|---|---|---|
+| `generate_dashboard_bytes` (render on read) | 30.1 ms | 3.7 ms |
+| `fast_rerank_for_user` (warm) | 61.1 ms | 44.1 ms |
+
+- **Render:** `generate_dashboard_bytes` built a new Jinja `Environment`
+  per call, so every render recompiled the ~2,400-line `index.html`. That
+  was hidden while HTML was cached and cost ~27 ms per read once decks were
+  rendered on read. Now one process-wide environment (`_template_env`;
+  FileSystemLoader auto-reload still picks up template edits).
+- **Re-rank:** `dedup.normalize_url` is pure and ran ~630 times per rank on
+  the same pool URLs; it is now `lru_cache`d (65,536 entries). The user's
+  feedback was loaded 4 times per rank (dupe matching, dedup, HN
+  canonicalization, model-cache key); one snapshot is now threaded through
+  the first three (`build_feedback_context`, optional
+  `feedback`/`feedback_context` parameters that keep the eval path
+  unchanged), which also means every stage sees the same feedback.
+- **Output unchanged:** order, badges and combos are identical to the
+  baseline. Scores differ only in the 5th decimal, and the unchanged
+  baseline run twice on identical data shows the same noise (first-use
+  embeddings from multithreaded ONNX are not bit-reproducible).
+- **Vacuous test fixed:** `test_fast_rerank_for_user_excludes_upvoted_duplicate`
+  passed on an empty deck: the unvoted Reddit mirror had no text, so the
+  summarizable filter dropped it and the function returned before dedup ran,
+  and the test only asserted absences. It now has a summarizable mirror and
+  a control story that must survive, patches both embedding entry points,
+  and asserts at most 2 feedback loads per rank. A scan found no other
+  absence-only rank tests.
+- **Cap edge case (found by the new property):** `_cap_tldr_structure`
+  ended with `.strip()`, which could promote an indented first bullet to
+  top level after capping and exceed the cap. It now trims only surrounding
+  blank lines. This can't happen in production today (input is already
+  normalized), but the function no longer depends on that.
+
 ## 2026-09-25 Stronger typing at boundaries; shared article-failure policy
 
 - **Config values are type-checked at load** (`pipeline/config.py`). TOML

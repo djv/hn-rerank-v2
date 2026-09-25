@@ -48,10 +48,9 @@ def test_cap_bounds_each_section_and_only_drops_lines(
     capped = server._cap_tldr_structure(
         text, max_bullets=max_bullets, max_subheadings=max_subheadings
     )
-    # Only drops lines: the output is an ordered subsequence of the input
-    # (the result as a whole is stripped, so compare stripped lines).
-    remaining = iter(line.strip() for line in text.split("\n"))
-    kept = [line.strip() for line in capped.split("\n")] if capped else []
+    # Only drops lines: the output is an ordered subsequence of the input.
+    remaining = iter(text.split("\n"))
+    kept = capped.split("\n") if capped else []
     assert all(any(line == r for r in remaining) for line in kept)
     # Every ### section respects both caps.
     bullets = subheadings = 0

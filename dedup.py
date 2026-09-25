@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
@@ -60,6 +61,9 @@ _TRACKING_QUERY_PARAMS: Final[frozenset[str]] = frozenset(
 )
 
 
+# Pure and called for every candidate and feedback URL on every rank; the
+# candidate pool is shared across ranks, so the same URLs recur constantly.
+@functools.lru_cache(maxsize=65536)
 def normalize_url(raw: str | None) -> NormalizedUrl | None:
     """Return a canonical form of *raw* suitable for equality comparisons.
 

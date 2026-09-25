@@ -462,24 +462,49 @@ def test_fast_rerank_for_user_excludes_upvoted_duplicate(db, monkeypatch) -> Non
         text_content="reddit text",
         source="rss_reddit_x",
         comment_count=2,
+        self_text="reddit discussion of the article",  # summarizable
     )
-    db.upsert_story(hn)
-    db.upsert_story(reddit)
+    # Unrelated candidate: proves the deck is not simply empty, so the
+    # mirror's absence below is the URL exclusion's doing.
+    control = Story(
+        id=77012,
+        title="Something else entirely",
+        url="https://other.example/post",
+        score=50,
+        time=now - 3600,
+        text_content="control text",
+        source="hn",
+        comment_count=3,
+    )
+    for story in (hn, reddit, control):
+        db.upsert_story(story)
     db.upsert_feedback(user.id, hn_id, "up")
 
-    monkeypatch.setattr(
-        "pipeline.get_or_compute_embeddings",
-        lambda stories, embedder, db_inst: np.zeros(
-            (len(stories), 384), dtype=np.float32
-        ),
-    )
+    def zero_embeddings(stories, embedder, db_inst):
+        return np.zeros((len(stories), 384), dtype=np.float32)
+
+    monkeypatch.setattr("pipeline.get_or_compute_embeddings", zero_embeddings)
+    monkeypatch.setattr("pipeline.ranking.get_or_compute_embeddings", zero_embeddings)
+    loads: list[int] = []
+    get_all_feedback = db.get_all_feedback
+
+    def counted_get_all_feedback(user_id: int | None = None) -> list[FeedbackRecord]:
+        loads.append(user_id or 0)
+        return get_all_feedback(user_id=user_id)
+
+    monkeypatch.setattr(db, "get_all_feedback", counted_get_all_feedback)
     config = Config(days=30)
     ranked = fast_rerank_for_user(db, config, cast(Embedder, object()), user.id)
     survivor_ids = {r.story.id for r in ranked}
     # The HN story is excluded (already in feedback), and the Reddit story
     # is excluded by URL-match against the upvoted feedback.
+    assert control.id in survivor_ids
     assert hn_id not in survivor_ids
     assert reddit_id not in survivor_ids
+    # One feedback snapshot serves dupe matching, dedup and HN
+    # canonicalization (they used to reload it three times); the model-cache
+    # signature inside rerank_candidates may add one more.
+    assert 1 <= len(loads) <= 2
 
 
 # ---------------------------------------------------------------------------

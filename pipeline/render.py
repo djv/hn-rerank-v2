@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import functools
+
 from datetime import datetime
 import time
 import random
@@ -423,6 +425,17 @@ def prepare_feed(
     return Feed(1, stories, orders, counts, version, target, version >= target)
 
 
+@functools.cache
+def _template_env() -> Environment:
+    """One Jinja environment per process, so compiled templates are reused
+    across renders (a fresh environment recompiled index.html every time).
+    FileSystemLoader's default auto_reload still picks up edited templates."""
+    env = Environment(loader=FileSystemLoader("templates"), autoescape=True)
+    env.filters["time_ago"] = time_ago_filter
+    env.filters["source_label"] = source_label_filter
+    return env
+
+
 def generate_dashboard_bytes(
     ranked: list[RankedStory],
     config: Config,
@@ -433,10 +446,7 @@ def generate_dashboard_bytes(
     dashboard_latest_version: int | None = None,
 ) -> bytes:
     """Render dashboard to bytes without writing to disk."""
-    env = Environment(loader=FileSystemLoader("templates"), autoescape=True)
-    env.filters["time_ago"] = time_ago_filter
-    env.filters["source_label"] = source_label_filter
-
+    env = _template_env()
     pico_css = _get_pico_css()
 
     raw_vote_counts = (

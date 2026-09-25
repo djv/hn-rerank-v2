@@ -11,7 +11,7 @@ import httpx
 import numpy as np
 from numpy.typing import NDArray
 
-from database import Database, Story, StoryIdentityConflict, coerce_int
+from database import Database, FeedbackRecord, Story, StoryIdentityConflict, coerce_int
 
 # ruff: noqa: F401 — re-exports for the public pipeline namespace.
 from .config import (
@@ -107,7 +107,13 @@ from .enrichment import (
     prewarm_top_stories,
     select_article_fetch_candidates,
 )
-from .hn_dupes import _load_feedback_context, _matches_feedback, canonicalize_hn_dupes
+from .hn_dupes import (
+    FeedbackDupeContext,
+    _load_feedback_context,
+    _matches_feedback,
+    build_feedback_context,
+    canonicalize_hn_dupes,
+)
 from .candidate_cache import (
     CandidatePool,
     get_candidate_pool,
@@ -804,8 +810,11 @@ def fast_rerank_for_user(
     # candidates that duplicate a story the user already voted on, instead
     # of silently losing badge slots to the downstream `canonicalize_hn_dupes`
     # feedback-match drop (see WORKLOG 2026-07-10).
-    feedback_context = _load_feedback_context(
-        db, user_id=user_id, actions=tuple(config.model.dedup_exclude_actions)
+    # One feedback snapshot for every stage of this rank (dupe matching,
+    # URL/embedding dedup, HN canonicalization) instead of a reload each.
+    feedback = db.get_all_feedback(user_id=user_id)
+    feedback_context = build_feedback_context(
+        feedback, tuple(config.model.dedup_exclude_actions)
     )
     ranked = rerank_candidates(
         db=db,
@@ -823,7 +832,16 @@ def fast_rerank_for_user(
     )
 
     return finalize_ranked_deck(
-        ranked, candidates, cand_embeddings, db, config, embedder, user_id, trace=trace
+        ranked,
+        candidates,
+        cand_embeddings,
+        db,
+        config,
+        embedder,
+        user_id,
+        trace=trace,
+        feedback=feedback,
+        feedback_context=feedback_context,
     )
 
 
@@ -837,8 +855,15 @@ def finalize_ranked_deck(
     user_id: int,
     *,
     trace: RankTrace | _NullTrace = NULL_TRACE,
+    feedback: list[FeedbackRecord] | None = None,
+    feedback_context: FeedbackDupeContext | None = None,
 ) -> list[RankedStory]:
-    """Shared serving/evaluation deduplication and canonicalization boundary."""
+    """Shared serving/evaluation deduplication and canonicalization boundary.
+
+    *feedback* / *feedback_context* are this user's feedback (and its
+    dedup index for ``config.model.dedup_exclude_actions``) when the caller
+    already loaded them; otherwise each stage loads its own.
+    """
     with trace.stage("dedup"):
         id_to_emb: dict[int, NDArray[np.float32]] = {
             s.id: vec for s, vec in zip(candidates, cand_embeddings)
@@ -850,6 +875,7 @@ def finalize_ranked_deck(
             user_id,
             embeddings=id_to_emb,
             embedder=embedder,
+            feedback=feedback,
         )
     trace.set_count(
         "deck_nonhn_post_dedup",
@@ -864,6 +890,7 @@ def finalize_ranked_deck(
             user_id=user_id,
             feedback_actions=tuple(config.model.dedup_exclude_actions),
             trace=trace,
+            feedback_context=feedback_context,
         )
     trace.set_count(
         "deck_nonhn_final",
@@ -879,6 +906,7 @@ def _apply_dedup_to_ranked(
     user_id: int,
     embeddings: dict[int, NDArray[np.float32]] | None = None,
     embedder: Embedder | None = None,
+    feedback: list[FeedbackRecord] | None = None,
 ) -> list[RankedStory]:
     """Filter *ranked* through :func:`dedup.dedup_ranked`.
 
@@ -895,7 +923,8 @@ def _apply_dedup_to_ranked(
         embedding_cosine_threshold=model_cfg.dedup_embedding_cosine_threshold,
         exclude_actions=tuple(model_cfg.dedup_exclude_actions),
     )
-    feedback = db.get_all_feedback(user_id=user_id)
+    if feedback is None:
+        feedback = db.get_all_feedback(user_id=user_id)
 
     # Merge feedback story embeddings so cross-source duplicates (e.g.
     # Slashdot rewriting an HN story the user has already voted on) can

@@ -199,7 +199,9 @@ def _cap_tldr_structure(
             if bullets > max_bullets:
                 continue
         out.append(line)
-    return "\n".join(out).strip()
+    # Trim surrounding blank lines only: stripping spaces would promote an
+    # indented first bullet to top level and break the cap just applied.
+    return "\n".join(out).strip("\n")
 
 
 def _shape_tldr(
