@@ -10,6 +10,12 @@
   lookup trusts pool candidates. `malloc_trim(0)` after warms and regens.
 - Live after deploy (7e010cc): RSS 677 MB after the first regen (was 1.12 GB
   at the same point); dashboard, feed and TLDR smoke OK, no log errors.
+- Regen peak (~1.6 GB) is not the candidate lists: RSS sampled every 0.4s
+  through a live regen sits at ~600-800 MB and spikes only while ONNX embeds
+  a long text (1.56 GB at longest_tokens=2709, max_tokens=4096; attention
+  memory grows with length squared), falling back within ~2s. Lowering it
+  means shorter embedding inputs, which changes embeddings and ranking; left
+  as is (VPS has ~5 GB free).
 
 ## 2026-09-26 TUI review fixes, round 2
 
