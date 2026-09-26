@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import gc
 import hashlib
 import html
@@ -1316,22 +1317,28 @@ async def _prefetch_tldrs_for_ranked(
     if stale_per_run > 0:
         remaining = [rs for rs in ranked_stories if rs.story.id not in seen]
         cached_keys = db.get_tldr_cache_keys([rs.story.id for rs in remaining])
-        for rs in remaining:
+        keyed = [rs.story.id for rs in remaining if rs.story.id in cached_keys]
+        # Deck stories carry no TLDR source text (candidate pool); read it in
+        # small batches, since this usually stops after a few stale hits.
+        for start in range(0, len(keyed), 100):
             if stale_added >= stale_per_run:
                 break
-            stored_key = cached_keys.get(rs.story.id)
-            if stored_key is None:
-                continue
-            current_key = _tldr_cache_key(
-                title=rs.story.title,
-                self_text=rs.story.self_text or "",
-                top_comments=rs.story.top_comments or "",
-                article_body=rs.story.article_body or "",
-            )
-            if current_key != stored_key:
-                seen.add(rs.story.id)
-                story_ids.append(rs.story.id)
-                stale_added += 1
+            batch = keyed[start : start + 100]
+            by_id = {story.id: story for story in db.get_stories(batch)}
+            for story_id in batch:
+                story = by_id.get(story_id)
+                if stale_added >= stale_per_run or story is None:
+                    continue
+                current_key = _tldr_cache_key(
+                    title=story.title,
+                    self_text=story.self_text or "",
+                    top_comments=story.top_comments or "",
+                    article_body=story.article_body or "",
+                )
+                if current_key != cached_keys[story_id]:
+                    seen.add(story_id)
+                    story_ids.append(story_id)
+                    stale_added += 1
 
     if not story_ids:
         return 0
@@ -1423,6 +1430,17 @@ class DeckState:
     ranked: list[RankedStory]
     built_at: float
     version: int
+
+
+def _load_malloc_trim() -> Callable[[int], int] | None:
+    """glibc's malloc_trim, or None on other libcs (macOS, musl)."""
+    try:
+        return ctypes.CDLL("libc.so.6").malloc_trim
+    except (OSError, AttributeError):
+        return None
+
+
+_MALLOC_TRIM = _load_malloc_trim()
 
 
 class Handler:
@@ -1680,6 +1698,10 @@ class Handler:
         except Exception:
             logging.debug("warm_gc result=failed", exc_info=True)
             return
+        # A rank frees ~300 MB that glibc keeps in its arenas; hand it back
+        # (VPS probe 2026-09-26: RSS 933 -> 619 MB after one warm).
+        if _MALLOC_TRIM is not None:
+            _MALLOC_TRIM(0)
         logging.debug("warm_gc result=completed collected=%s", collected)
 
     @classmethod

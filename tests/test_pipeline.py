@@ -2467,6 +2467,32 @@ def test_canonicalize_hn_dupes_replaces_selected_story_preserving_metadata(
     assert result[0].combo_keys == "recent_hn recent_mixed"
 
 
+def test_canonicalize_hn_dupes_uses_candidate_pool_copy_without_text(
+    db: Database,
+) -> None:
+    """A candidate target is summarizable by admission even though the pool's
+    copy carries no TLDR text (here: no comments, article body only)."""
+    duplicate = _candidate_story(100, source="hn", score=10, time_ts=1000)
+    canonical = _candidate_story(
+        200, source="hn", score=50, time_ts=900, comment_count=0
+    )
+    db.upsert_story(duplicate)
+    db.upsert_story(canonical)
+    now = time.time()
+    db.upsert_hn_dupe_resolution(
+        HnDupeResolution(100, 200, "canonical", now, now + 86400, 0, "")
+    )
+    pool_copy = replace(canonical, article_body="")
+
+    result = pipeline.canonicalize_hn_dupes(
+        [RankedStory(story=duplicate, score=1.0, best_match_title="")],
+        db,
+        candidate_stories=[duplicate, pool_copy],
+    )
+
+    assert [item.story for item in result] == [pool_copy]
+
+
 def test_canonicalize_hn_dupes_drops_when_target_already_in_output(
     db: Database,
 ) -> None:

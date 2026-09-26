@@ -3354,30 +3354,37 @@ async def test_prefetch_tldrs_for_ranked_regenerates_stale_beyond_top_combo(
     for s in stories:
         db.upsert_story(s)
 
+    # Deck stories are candidate-pool copies without TLDR source text; the
+    # scan must compare against the DB's text, not the empty copy.
     ranked = [
-        RankedStory(story=s, score=1.0, best_match_title="", combo_keys="recent_hn")
+        RankedStory(
+            story=replace(s, self_text="", top_comments="", article_body=""),
+            score=1.0,
+            best_match_title="",
+            combo_keys="recent_hn",
+        )
         for s in stories
     ]
 
-    # stories[1]: beyond the per_combo=1 cutoff, cached under a stale key
+    # stories[2]: beyond the per_combo=1 cutoff, cached under a stale key
     # (article_body changed since it was cached) -> must be regenerated.
     stale_key = srv._tldr_cache_key(
-        title=stories[1].title,
+        title=stories[2].title,
         self_text="",
         top_comments="",
         article_body="Old body before enrichment.",
     )
-    db.upsert_tldr_cache(stories[1].id, stale_key, "Stale TLDR")
+    db.upsert_tldr_cache(stories[2].id, stale_key, "Stale TLDR")
 
-    # stories[2]: beyond the cutoff, cached under the *current* key ->
-    # must NOT be regenerated even with the stale scan enabled.
+    # stories[1]: beyond the cutoff, cached under the *current* key and ahead
+    # of the stale one -> must NOT be regenerated or use the one stale slot.
     fresh_key = srv._tldr_cache_key(
-        title=stories[2].title,
+        title=stories[1].title,
         self_text="",
         top_comments="",
         article_body="New body.",
     )
-    db.upsert_tldr_cache(stories[2].id, fresh_key, "Fresh TLDR")
+    db.upsert_tldr_cache(stories[1].id, fresh_key, "Fresh TLDR")
 
     calls: list[str] = []
 
@@ -3389,15 +3396,15 @@ async def test_prefetch_tldrs_for_ranked_regenerates_stale_beyond_top_combo(
     monkeypatch.setattr(srv, "_PREFETCH_STAGGER_S", 0)
 
     generated = await srv._prefetch_tldrs_for_ranked(
-        ranked, db, per_combo=1, stale_per_run=2, date_top_n=0
+        ranked, db, per_combo=1, stale_per_run=1, date_top_n=0
     )
 
     assert generated == (2 if cacheable else 0)
-    assert sorted(calls) == sorted([stories[0].title, stories[1].title])
+    assert sorted(calls) == sorted([stories[0].title, stories[2].title])
     if not cacheable:
         assert db.get_any_tldr_for_story(stories[0].id) is None
-        assert db.get_any_tldr_for_story(stories[1].id) == "Stale TLDR"
-    assert db.get_any_tldr_for_story(stories[2].id) == "Fresh TLDR"
+        assert db.get_any_tldr_for_story(stories[2].id) == "Stale TLDR"
+    assert db.get_any_tldr_for_story(stories[1].id) == "Fresh TLDR"
 
 
 async def test_prefetch_tldrs_for_ranked_covers_date_sorted_head(

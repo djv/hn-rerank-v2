@@ -10,6 +10,7 @@ mask-per-user.
 from __future__ import annotations
 
 import threading
+from dataclasses import replace
 import time
 from typing import Any
 
@@ -156,3 +157,39 @@ def test_concurrent_get_candidate_pool_builds_once(db: Database) -> None:
     assert len(pools) == 8
     assert all(p is pools[0] for p in pools)
     assert embedder.encode_calls == 1
+
+
+def test_pool_embeds_full_text_but_keeps_no_tldr_source_text(db: Database) -> None:
+    """Pool stories drop self_text/top_comments/article_body (memory); the
+    embeddings are still computed from the full story text."""
+
+    class RecordingEmbedder(CountingEmbedder):
+        def __init__(self) -> None:
+            super().__init__()
+            self.texts: list[str] = []
+
+        def encode(self, texts: list[str], batch_size: int | None = None) -> Any:
+            self.texts.extend(texts)
+            return super().encode(texts, batch_size)
+
+    db.upsert_story(
+        replace(
+            _story(1),
+            text_content="",
+            self_text="Self post body",
+            top_comments="A top comment",
+            article_body="Article body words",
+        )
+    )
+    embedder = RecordingEmbedder()
+    pool = get_candidate_pool(db, Config(), embedder)
+
+    assert [s.id for s in pool.stories] == [1]
+    assert (
+        pool.stories[0].self_text,
+        pool.stories[0].top_comments,
+        pool.stories[0].article_body,
+    ) == ("", "", "")
+    assert any("Article body words" in text for text in embedder.texts)
+    full = db.get_story(1)
+    assert full is not None and full.article_body == "Article body words"

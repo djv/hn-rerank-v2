@@ -519,8 +519,11 @@ def _lookup_canonical_story(
     from . import is_summarizable
 
     target_story = candidate_by_id.get(target_id)
-    if target_story is None:
-        target_story = db.get_story(target_id)
+    if target_story is not None:
+        # Candidates were admitted by is_summarizable when loaded; the
+        # candidate pool's copies drop the text that check reads.
+        return target_story
+    target_story = db.get_story(target_id)
     if target_story is None or not is_summarizable(target_story):
         return None
     return target_story
