@@ -372,6 +372,15 @@ own build instead of leaking a stale pool across test cases; production runs
 one long-lived `Database` for the process lifetime, so this scoping is a
 no-op there.
 
+Pool stories are ranking copies (2026-09-26): `self_text`, `top_comments` and
+`article_body` are emptied after embeddings are computed (~190 MB of ~12.6k
+stories on the VPS). Ranking reads only `text_content` (its length). Anything
+that needs TLDR source text reads the story from the DB: the TLDR paths
+already did, and the warm prefetch's stale-key scan now does too. HN dupe
+resolution trusts pool candidates as summarizable (they were filtered at
+load). `server.py` calls glibc `malloc_trim(0)` after each warm and regen, so
+freed heap goes back to the OS (live RSS after a regen: ~1.1 GB -> ~0.68 GB).
+
 `fast_rerank_for_user`'s zero-feedback branch intentionally keeps calling
 `build_cold_deck` *without* an embedder — a 0-vote cold deck is pure
 gravity/time ranking and has never touched embeddings, so routing it through

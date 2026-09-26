@@ -1,5 +1,16 @@
 # Worklog: hn-rewrite
 
+## 2026-09-26 Server memory: ~1.1 GB -> ~0.68 GB RSS
+
+- Probe on a VPS DB copy: startup ~240 MB, candidate pool +340 MB (story
+  text: top_comments 142 MB, text_content 108 MB, article_body 32 MB,
+  self_text 13 MB), and each rank/regen freed ~300 MB that glibc kept.
+- Pool stories now drop self_text/top_comments/article_body after embedding;
+  the stale-TLDR scan reads text from the DB in batches of 100; HN dupe
+  lookup trusts pool candidates. `malloc_trim(0)` after warms and regens.
+- Live after deploy (7e010cc): RSS 677 MB after the first regen (was 1.12 GB
+  at the same point); dashboard, feed and TLDR smoke OK, no log errors.
+
 ## 2026-09-26 TUI review fixes, round 2
 
 - Prefetch liveness comes from the worker, not a flag: a worker cancelled
