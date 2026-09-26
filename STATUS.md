@@ -17,8 +17,8 @@ offline, and check the best candidate against the user's own judgement.
 ## Blocker / limits
 - The newest 20% of votes has been looked at three times; only votes after
   2026-09-25 are a clean holdout.
-- 18 pre-existing environmental `test_pipeline` errors on the laptop
-  (missing local model files).
+- Without the ONNX model (laptop), 18 real-model `test_pipeline` tests skip
+  with a setup hint; `uv run python setup_model.py` enables them.
 
 ## Next step
 None required. Optional: after a few hundred new votes, rerun

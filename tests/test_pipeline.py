@@ -1,6 +1,7 @@
 from typing import Any, Literal, cast
 import asyncio
 import hashlib
+import os
 import numpy as np
 import pytest
 import re
@@ -530,6 +531,14 @@ class _HashEmbedder(Embedder):
 def _real_embedder() -> Embedder:
     # Uses the real downloaded ONNX model (shared across worktrees).
     # Only for tests asserting real-model semantics or output shape.
+    # Skipped where the model is absent (a fresh laptop checkout), but never
+    # in CI, which downloads it: a missing model there must fail loudly.
+    model_dir = Path(ranking.DEFAULT_ONNX_MODEL_DIR)
+    if not (model_dir / "model.onnx").is_file() and not os.environ.get("CI"):
+        pytest.skip(
+            f"no ONNX model in {model_dir}; run `uv run python setup_model.py`"
+            " or set HN_ONNX_MODEL_DIR"
+        )
     return Embedder()
 
 

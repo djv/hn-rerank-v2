@@ -15,6 +15,10 @@
 - `scripts/benchmark_embeddings.py` imports `transformers` lazily (same seam
   as `pipeline/ranking.py`), saving ~0.8s of collection per xdist worker.
   The file was also run through `ruff format`.
+- The 18 `test_pipeline` errors on a checkout without the ONNX model (the
+  `_real_embedder` fixture) are now skips with a hint (`uv run python
+  setup_model.py` or `HN_ONNX_MODEL_DIR`). Under `CI` they still error, since
+  CI downloads the model and a missing one there is a real failure.
 - What remains: ~4s of per-worker startup and collection, and ~35s of CPU in
   a long tail, mostly Hypothesis property tests. Under 12s at `-n 4` would
   mean fewer Hypothesis examples; not done.
