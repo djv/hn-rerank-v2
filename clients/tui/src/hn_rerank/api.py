@@ -11,7 +11,7 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 import httpx
 from platformdirs import user_config_path
 
-from .models import Feed
+from .models import Feed, terminal_safe
 
 
 @dataclass(frozen=True)
@@ -275,7 +275,7 @@ class API:
             if not isinstance(value, str):
                 raise TypeError("Invalid summary")
             return Summary(
-                value,
+                terminal_safe(value),
                 provisional=data.get("stale") is True or data.get("retryable") is True,
             )
         except (KeyError, TypeError, ValueError) as exc:
@@ -292,7 +292,7 @@ class API:
             if not isinstance(value, str):
                 raise TypeError("Invalid summary")
             return Summary(
-                value,
+                terminal_safe(value),
                 provisional=data.get("stale") is True or data.get("retryable") is True,
                 empty=data.get("empty") is True,
             )

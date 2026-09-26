@@ -591,6 +591,51 @@ async def test_explore_sort_is_shuffled(
         assert fake.feed.orders["explore:recent"] == [1, 2]
 
 
+async def test_explore_order_is_stable_within_a_visit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rebuilds (votes, polls) keep Explore's order; leaving and coming back
+    reshuffles."""
+    from dataclasses import replace
+
+    fake = FakeServer()
+    fake.feed = replace(
+        fake.feed, orders={**fake.feed.orders, "explore:recent": [1, 2, 3]}
+    )
+    shuffles = 0
+
+    def rotate(order: list[int]) -> None:
+        # Each full draw rotates one step further, so a redraw is visible.
+        nonlocal shuffles
+        if len(order) == 3:
+            shuffles += 1
+            k = shuffles % 3
+            order[:] = order[k:] + order[:k]
+
+    monkeypatch.setattr("random.shuffle", rotate)
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        await pilot.pause(0.4)
+        app.query_one(OptionList).focus()
+        await pilot.press("s", "s")
+        await pilot.pause(0.3)
+        assert str(app.query_one("#sort", Select).value) == "explore"
+        first = [s.id for s in app.stories]
+        assert sorted(first) == [1, 2, 3]
+        for _ in range(3):
+            app.rebuild()
+        assert [s.id for s in app.stories] == first
+        assert shuffles == 1
+        app.rated.add(first[0])
+        app.rebuild()
+        assert [s.id for s in app.stories] == first[1:]
+        app.rated.clear()
+        await pilot.press("s", "s", "s", "s")  # full cycle back to explore
+        await pilot.pause(0.3)
+        assert str(app.query_one("#sort", Select).value) == "explore"
+        assert [s.id for s in app.stories] != first
+
+
 async def test_v_reverses_sort_order(tmp_path: Path) -> None:
     """v flips the headline list; toggling back restores rank order."""
     fake = FakeServer()

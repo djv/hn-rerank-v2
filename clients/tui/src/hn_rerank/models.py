@@ -3,8 +3,30 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
+
+
+# C0 controls except tab/newline, DEL, and C1 controls. Server text (titles
+# from third-party feeds, LLM summaries) is untrusted; ESC/CSI/OSC sequences
+# would otherwise reach the terminal raw (Rich only strips a few of these).
+_TERMINAL_CONTROLS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def terminal_safe(text: str) -> str:
+    """Drop control characters that a terminal would interpret."""
+    return _TERMINAL_CONTROLS.sub("", text)
+
+
+def _terminal_safe_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return terminal_safe(value)
+    if isinstance(value, list):
+        return [
+            terminal_safe(item) if isinstance(item, str) else item for item in value
+        ]
+    return value
 
 
 @dataclass(frozen=True)
@@ -60,9 +82,18 @@ class Feed:
         try:
             stories = []
             for raw_story in data["stories"]:
-                story_data: dict[str, Any] = dict(raw_story)
+                story_data: dict[str, Any] = {
+                    key: _terminal_safe_value(value)
+                    for key, value in dict(raw_story).items()
+                }
                 story_data["badge_details"] = [
-                    FeedBadge(**badge) for badge in story_data.get("badge_details", [])
+                    FeedBadge(
+                        **{
+                            key: _terminal_safe_value(value)
+                            for key, value in dict(badge).items()
+                        }
+                    )
+                    for badge in story_data.get("badge_details", [])
                 ]
                 stories.append(FeedStory(**story_data))
             result = cls(

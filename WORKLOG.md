@@ -1,8 +1,25 @@
 # Worklog: hn-rewrite
 
+## 2026-09-26 TUI review fixes: stable Explore, terminal-safe text
+
+- Explore reshuffled on every rebuild (each vote, and every second while the
+  ranking caught up), so the visible 12 kept changing and the selection jumped
+  to the top. The shuffle is now kept per `explore:<age>` view: stories keep
+  their place, new ones are shuffled in after them, and leaving the view
+  discards it so the next visit gets a fresh order. Prefetch into Explore uses
+  the same order the user will see.
+- Feed strings (titles, domains, badges) and TLDR text drop C0/C1 control
+  characters (except tab/newline) at parse time (`models.terminal_safe`), so a
+  hostile feed title or LLM output can't send ESC/OSC sequences (terminal
+  title, OSC 52 clipboard) to the terminal. The inert remainder of a stripped
+  sequence (e.g. `]0;...`) still shows as text.
+- Tests: Explore stability/revisit, summary sanitising, and the feed
+  round-trip property now draws escape sequences and raw controls and checks
+  them against an independent spec (Unicode `Cc` minus tab/newline).
+
 ## 2026-09-26 Server review fixes: TLDR session gate, vote debounce
 
-From a server/TUI code review (findings reported in chat; TUI fixes pending).
+From a server/TUI code review (findings reported in chat).
 
 - `/api/tldr-detail`: uncached generation (including `force_refresh`) now
   needs a session. Sessionless callers get a stale cached TLDR or `401`, so

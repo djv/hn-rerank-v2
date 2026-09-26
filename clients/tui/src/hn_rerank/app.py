@@ -565,6 +565,11 @@ class Reader(App[None]):
         self.reverse_sort = False
         self.rated: set[int] = set()
         self.unavailable: set[int] = set()
+        # Explore's client-side shuffle per "explore:<age>" view, kept stable
+        # across rebuilds (votes, polls, feed refreshes) and dropped when the
+        # user leaves that view, so each visit gets a fresh order.
+        self.explore_orders: dict[str, list[int]] = {}
+        self.view_key: str | None = None
         self.restored: dict[int, FeedStory] = {}
         self.history: list[FeedStory] = []
         self.pending = False
@@ -830,6 +835,23 @@ class Reader(App[None]):
             widths[0] = max(8, widths[0] - (total - available))
         return (widths[0], widths[1], widths[2])
 
+    def view_order(self, key: str) -> list[int]:
+        """Story order for a "<sort>:<age>" view as the user sees it."""
+        order = self.feed.orders.get(key, []) if self.feed else []
+        if not key.startswith("explore:"):
+            return order
+        # Explore is a discovery deck: shuffle client-side, since the server
+        # order only reshuffles once per dashboard version and would pin the
+        # deck for hours. Stories already placed keep their position; new
+        # ones are shuffled in after them. Copies: feed.orders is shared.
+        members = set(order)
+        kept = [sid for sid in self.explore_orders.get(key, []) if sid in members]
+        placed = set(kept)
+        fresh = [sid for sid in order if sid not in placed]
+        random.shuffle(fresh)
+        self.explore_orders[key] = kept + fresh
+        return list(self.explore_orders[key])
+
     def rebuild(self, select_id: int | None = None) -> None:
         # Teardown removes nodes before the final messages drain; ignore late
         # rebuilds rather than raising NoMatches.
@@ -841,15 +863,8 @@ class Reader(App[None]):
         sort = self.query_one("#sort", Select).value
         age = self.query_one("#age", Select).value
         lookup = {story.id: story for story in self.feed.stories} if self.feed else {}
-        order = self.feed.orders.get(f"{sort}:{age}", []) if self.feed else []
-        if sort == "explore":
-            # Explore is a discovery deck: reshuffle client-side on every
-            # rebuild so each visit is a fresh random order. The server
-            # order only shuffles once per dashboard version (cached),
-            # which would otherwise pin the deck for hours. Copy first:
-            # feed.orders is shared with prefetch entry points.
-            order = list(order)
-            random.shuffle(order)
+        self.view_key = f"{sort}:{age}"
+        order = self.view_order(self.view_key)
         self.stories = [
             lookup[sid]
             for sid in order
@@ -905,6 +920,8 @@ class Reader(App[None]):
         tabs_id = f"#{event.select.id}-tabs"
         if event.select.id in {"sort", "age"} and self.query(tabs_id):
             self.query_one(tabs_id, Tabs).active = f"{event.select.id}-{event.value}"
+        if self.view_key is not None:
+            self.explore_orders.pop(self.view_key, None)  # next visit reshuffles
         self.rebuild(select_id=-1)
 
     def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
@@ -1106,7 +1123,7 @@ class Reader(App[None]):
         for other in self.SORT_CYCLE:
             if other == sort:
                 continue
-            order = self.feed.orders.get(f"{other}:{age}", [])
+            order = self.view_order(f"{other}:{age}")
             eligible = [
                 sid
                 for sid in order

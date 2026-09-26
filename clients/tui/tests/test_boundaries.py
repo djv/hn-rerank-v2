@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+import unicodedata
+from dataclasses import fields, replace
 from typing import cast
 
 import httpx
@@ -11,7 +12,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from hn_rerank.api import API, APIError, normalize_server
-from hn_rerank.models import Feed, FeedStory
+from hn_rerank.models import Feed, FeedBadge, FeedStory
 
 from .test_client import sample_feed
 
@@ -26,11 +27,49 @@ _JSON = st.recursive(
 )
 
 
+# Text as a hostile feed or LLM could send it: plain text interleaved with
+# terminal escape sequences and raw C0/C1 control characters.
+_UNTRUSTED_TEXT = st.lists(
+    st.one_of(
+        st.text(max_size=6),
+        st.sampled_from(
+            ["\x1b[31m", "\x1b]0;PWNED\x1b\\", "\x1b]52;c;eA==\x07", "\x9b2J"]
+        ),
+        st.characters(max_codepoint=0x9F),
+    ),
+    max_size=6,
+).map("".join)
+
+
+def _strip_controls(text: str) -> str:
+    """Spec: Unicode Cc (C0, DEL, C1) are removed, except tab and newline."""
+    return "".join(c for c in text if c in "\t\n" or unicodedata.category(c) != "Cc")
+
+
+def _terminal_view(feed: Feed) -> Feed:
+    """The feed with every displayed string passed through the spec."""
+
+    def clean(obj: FeedStory | FeedBadge) -> FeedStory | FeedBadge:
+        changes: dict[str, object] = {}
+        for f in fields(obj):
+            value = getattr(obj, f.name)
+            if isinstance(value, str):
+                changes[f.name] = _strip_controls(value)
+            elif isinstance(value, list):
+                changes[f.name] = [
+                    _strip_controls(item) if isinstance(item, str) else clean(item)
+                    for item in value
+                ]
+        return replace(obj, **changes)
+
+    return replace(feed, stories=[cast(FeedStory, clean(s)) for s in feed.stories])
+
+
 @st.composite
 def _feed_stories(draw: st.DrawFn) -> FeedStory:
     return FeedStory(
         id=draw(st.integers(min_value=0)),
-        title=draw(st.text(max_size=20)),
+        title=draw(_UNTRUSTED_TEXT),
         article_url=draw(st.text(max_size=20)),
         comments_url=draw(st.text(max_size=20)),
         source=draw(st.text(max_size=10)),
@@ -41,6 +80,20 @@ def _feed_stories(draw: st.DrawFn) -> FeedStory:
         memberships=draw(st.lists(st.text(max_size=8), max_size=3)),
         popular=draw(st.booleans()),
         explore=draw(st.booleans()),
+        badges=draw(st.lists(_UNTRUSTED_TEXT, max_size=2)),
+        badge_details=draw(
+            st.lists(
+                st.builds(
+                    FeedBadge,
+                    _UNTRUSTED_TEXT,
+                    _UNTRUSTED_TEXT,
+                    _UNTRUSTED_TEXT,
+                    _UNTRUSTED_TEXT,
+                ),
+                max_size=2,
+            )
+        ),
+        domain=draw(_UNTRUSTED_TEXT),
     )
 
 
@@ -72,7 +125,9 @@ def _feeds(draw: st.DrawFn) -> Feed:
 @given(_feeds())
 @settings(deadline=None)
 def test_parse_round_trips_valid_wire_payloads(feed: Feed) -> None:
-    assert Feed.parse(feed.to_dict()) == feed
+    """Valid payloads parse to the same feed, minus terminal control
+    characters in any displayed string; everything else is kept."""
+    assert Feed.parse(feed.to_dict()) == _terminal_view(feed)
 
 
 @st.composite
@@ -219,5 +274,24 @@ async def test_request_converts_invalid_url_to_api_error(
     try:
         with pytest.raises(APIError, match="Connection failed"):
             await api.validate()
+    finally:
+        await api.close()
+
+
+async def test_summaries_drop_terminal_control_sequences() -> None:
+    hostile = "# Title\x1b]0;PWNED\x1b\\\n\n\x1b[31mred\x9b2J text\r\n\tend\x07"
+    api = API(
+        "https://example.org/hn/",
+        "token",
+        httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"ok": True, "tldr": hostile})
+        ),
+    )
+    try:
+        for summary in (await api.summary(1), await api.cached_summary(1)):
+            assert summary is not None
+            assert summary.text == _strip_controls(hostile)
+            assert "\x1b" not in summary.text and "\x9b" not in summary.text
+            assert "\n\tend" in summary.text  # layout whitespace survives
     finally:
         await api.close()
