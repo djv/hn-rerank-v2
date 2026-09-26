@@ -25,6 +25,7 @@ from hn_rerank.app import (
 )
 from hn_rerank.models import FeedStory
 
+from ._settle import settle
 from .test_client import FakeServer
 
 
@@ -58,7 +59,7 @@ class EditorialServer(FakeServer):
                             f"## Section {i}\n\nA paragraph with **emphasis** and a useful explanation.\n\n"
                             "- First point\n- Second point\n\n> A quoted observation.\n\n"
                             '```python\nprint("hello reader")\n```'
-                            for i in range(5)
+                            for i in range(3)
                         )
                     ),
                 },
@@ -76,7 +77,7 @@ async def test_editorial_filters_and_resize(width: int) -> None:
     )
     app = Reader(api=fake.api())
     async with app.run_test(size=(width, 35)) as pilot:
-        await pilot.pause(0.6)
+        await settle(pilot)
         listing = app.query_one(OptionList)
         summary = app.query_one(Markdown)
         assert app.query_one("#sort-tabs", Tabs).display == (width >= 100)
@@ -107,7 +108,8 @@ async def test_editorial_filters_and_resize(width: int) -> None:
         scroll = summary.scroll_y
         assert scroll > 0
         content = summary._markdown
-        for new_width in (60, 80, 100, 140, width):
+        # Every start width reaches every other through this sweep; run it once.
+        for new_width in (60, 80, 100, 140, width) if width == 140 else ():
             await pilot.resize_terminal(new_width, 35)
             await pilot.pause()
             selected = app.selected()
@@ -125,7 +127,7 @@ async def test_editorial_filters_and_resize(width: int) -> None:
 async def test_focused_pane_shows_accent_border() -> None:
     app = Reader(api=FakeServer().api())
     async with app.run_test(size=(120, 35)) as pilot:
-        await pilot.pause(0.4)
+        await settle(pilot)
         headlines = app.query_one("#headlines", OptionList)
         headlines.focus()
         await pilot.pause()
@@ -139,7 +141,7 @@ async def test_focused_pane_shows_accent_border() -> None:
 async def test_filter_change_starts_at_first_story(width: int) -> None:
     app = Reader(api=FakeServer().api())
     async with app.run_test(size=(width, 35)) as pilot:
-        await pilot.pause(0.4)
+        await settle(pilot)
         listing = app.query_one("#headlines", OptionList)
         listing.highlighted = 1
         await pilot.pause()
@@ -188,7 +190,7 @@ async def test_footer_hints_spell_out_vote_directions() -> None:
     fake = FakeServer()
     app = Reader(api=fake.api())
     async with app.run_test(size=(100, 35)) as pilot:
-        await pilot.pause(0.6)
+        await settle(pilot)
         hints = app.query_one("#shortcuts", Static)
         assert "1 up · 2 neutral · 3 down → next story" in str(hints.content)
         assert "j/k move" in str(hints.content)
@@ -200,7 +202,7 @@ async def test_narrow_footer_keeps_status_visible() -> None:
     fake = FakeServer()
     app = Reader(api=fake.api())
     async with app.run_test(size=(51, 37)) as pilot:
-        await pilot.pause(0.6)
+        await settle(pilot)
         status = app.query_one("#status").region
         hints = app.query_one("#shortcuts").region
         # Stacked rows: status keeps the full width instead of being squeezed out.
@@ -210,51 +212,50 @@ async def test_narrow_footer_keeps_status_visible() -> None:
 
 
 @pytest.mark.parametrize("size", [(51, 37), (80, 30), (140, 40)])
-@pytest.mark.parametrize("exit_key", ["enter", "escape"])
 @pytest.mark.parametrize("long_summary", [False, True])
-async def test_enter_zooms_tldr(
-    size: tuple[int, int], exit_key: str, long_summary: bool
-) -> None:
+async def test_enter_zooms_tldr(size: tuple[int, int], long_summary: bool) -> None:
     fake = EditorialServer() if long_summary else FakeServer()
     app = Reader(api=fake.api())
     async with app.run_test(size=size) as pilot:
-        await pilot.pause(0.6)
+        await settle(pilot)
         listing = app.query_one(OptionList)
         summary = app.query_one(Markdown)
         hints = app.query_one("#shortcuts", Static)
         assert listing.has_focus
         assert "Enter zoom" in str(hints.content)
-        selected = app.selected()
-        await pilot.press("enter")
-        await pilot.pause()
-        assert app.reading
-        assert not listing.display
-        assert summary.has_focus
-        pane = app.query_one("#reading-pane").region
-        available = app.query_one("#panes").region
-        assert pane.width == min(100, available.width)
-        assert abs((pane.x - available.x) - (available.right - pane.right)) <= 1
-        assert "Enter/Esc back" in str(hints.content)
-        if long_summary and summary.max_scroll_y > 0:
-            await pilot.press("j")
+        for exit_key in ("enter", "escape"):
+            selected = app.selected()
+            await pilot.press("enter")
             await pilot.pause()
-            assert summary.scroll_y > 0
-        await pilot.press(exit_key)
-        await pilot.pause()
-        assert not app.reading
-        assert listing.display and listing.has_focus
-        assert app.selected() == selected
-        assert "Enter zoom" in str(hints.content)
+            assert app.reading
+            assert not listing.display
+            assert summary.has_focus
+            pane = app.query_one("#reading-pane").region
+            available = app.query_one("#panes").region
+            assert pane.width == min(100, available.width)
+            assert abs((pane.x - available.x) - (available.right - pane.right)) <= 1
+            assert "Enter/Esc back" in str(hints.content)
+            if long_summary:
+                assert summary.max_scroll_y > 0
+                await pilot.press("j")
+                await pilot.pause()
+                assert summary.scroll_y > 0
+            await pilot.press(exit_key)
+            await pilot.pause()
+            assert not app.reading
+            assert listing.display and listing.has_focus
+            assert app.selected() == selected
+            assert "Enter zoom" in str(hints.content)
 
 
 async def test_empty_and_error_recovery() -> None:
     fake = FakeServer()
     app = Reader(api=fake.api())
     async with app.run_test(size=(100, 35)) as pilot:
-        await pilot.pause(0.6)
+        await settle(pilot)
         fake.fail_vote = True
         app.action_vote("up")
-        await pilot.pause(0.2)
+        await settle(pilot)
         assert app.query_one("#status").has_class("error")
         assert "check before voting" in str(app.query_one("#status", Static).content)
         app.query_one("#age", Select).value = "archive"
@@ -372,7 +373,7 @@ def test_headline_separators_share_columns_across_stories() -> None:
 
 
 async def test_every_sort_shows_at_most_view_limit(tmp_path: Path) -> None:
-    """Each sort caps at 12; reverse flips those 12; rated ones backfill."""
+    """Each sort caps at 12; rated ones backfill."""
 
     def story(i: int) -> FeedStory:
         return FeedStory(
@@ -399,18 +400,14 @@ async def test_every_sort_shows_at_most_view_limit(tmp_path: Path) -> None:
     )
     app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
     async with app.run_test(size=(120, 35)) as pilot:
-        await pilot.pause(0.4)
+        await settle(pilot)
         app.query_one(OptionList).focus()
         for _ in Reader.SORT_CYCLE:
             assert len(app.stories) == 12
             await pilot.press("s")
-            await pilot.pause(0.3)
+            await settle(pilot)
         assert str(app.query_one("#sort", Select).value) == "recommended"
         assert [s.id for s in app.stories] == ids[:12]
-        await pilot.press("v")
-        await pilot.pause(0.3)
-        assert [s.id for s in app.stories] == ids[:12][::-1]
-        await pilot.press("v")
         app.rated.add(1)
         app.rebuild()
         assert [s.id for s in app.stories] == ids[1:13]
@@ -442,7 +439,7 @@ async def test_failure_copy_in_reading_pane() -> None:
     server = UnreachableServer()
     app = Reader(api=server.api())
     async with app.run_test(size=(120, 35)) as pilot:
-        await pilot.pause(0.6)
+        await settle(pilot)
         assert app.feed is None
         markdown = app.query_one(Markdown)._markdown
         assert "# Could not reach server" in markdown
@@ -452,7 +449,7 @@ async def test_failure_copy_in_reading_pane() -> None:
         assert not str(app.query_one("#story-heading", Static).content)
         server.fail_feed = False
         app.action_refresh()
-        await pilot.pause(0.6)
+        await settle(pilot)
         assert [s.id for s in app.stories] == [1, 2]
         assert "Could not reach server" not in app.query_one(Markdown)._markdown
         assert str(app.query_one("#status", Static).content) == "2 shown · +0 ~0 −0"
@@ -462,7 +459,7 @@ async def test_empty_notice_heading() -> None:
     fake = FakeServer()
     app = Reader(api=fake.api())
     async with app.run_test(size=(100, 35)) as pilot:
-        await pilot.pause(0.6)
+        await settle(pilot)
         app.query_one("#age", Select).value = "archive"
         app.query_one("#sort", Select).value = "popular"
         await pilot.pause()
@@ -489,7 +486,7 @@ async def test_reading_measure_cap() -> None:
     fake = EditorialServer()
     app = Reader(api=fake.api())
     async with app.run_test(size=(220, 40)) as pilot:
-        await pilot.pause(0.6)
+        await settle(pilot)
         assert app.query_one("#reading-pane").region.width <= 100
         assert app.query_one("#story-heading").styles.border_bottom[0] == "solid"
 
@@ -498,7 +495,7 @@ async def test_summary_emphasis_uses_accent_color() -> None:
     fake = EditorialServer()
     app = Reader(api=fake.api())
     async with app.run_test(size=(120, 35)) as pilot:
-        await pilot.pause(0.6)
+        await settle(pilot)
         block = app.query("#summary MarkdownBlock").first()
         strong = block.get_component_rich_style("strong")
         em = block.get_component_rich_style("em")
@@ -511,7 +508,7 @@ async def test_summary_headings_align_left_like_body() -> None:
     fake = EditorialServer()
     app = Reader(api=fake.api())
     async with app.run_test(size=(120, 35)) as pilot:
-        await pilot.pause(0.6)
+        await settle(pilot)
         heading = app.query("#summary MarkdownH1").first()
         assert heading.styles.content_align == ("left", "top")
 
@@ -519,7 +516,7 @@ async def test_summary_headings_align_left_like_body() -> None:
 async def test_badge_legend_hotkey_and_escape_restore_story() -> None:
     app = Reader(api=EditorialServer().api())
     async with app.run_test(size=(120, 35)) as pilot:
-        await pilot.pause(0.6)
+        await settle(pilot)
         await pilot.press("b")
         await pilot.pause()
         legend = app.query_one(Markdown)._markdown
@@ -536,7 +533,7 @@ async def test_badge_legend_hotkey_and_escape_restore_story() -> None:
         await pilot.pause()
         assert "Badge legend" in app.query_one(Markdown)._markdown
         await pilot.press("escape")
-        await pilot.pause(0.5)
+        await settle(pilot)
         assert "Section 0" in app.query_one(Markdown)._markdown
 
 
@@ -544,7 +541,7 @@ async def test_help_escape_restores_story_view_and_survives_refresh() -> None:
     fake = EditorialServer()
     app = Reader(api=fake.api())
     async with app.run_test(size=(120, 35)) as pilot:
-        await pilot.pause(0.6)
+        await settle(pilot)
         assert "Section 0" in app.query_one(Markdown)._markdown
         await pilot.press("?")
         await pilot.pause()
@@ -553,7 +550,7 @@ async def test_help_escape_restores_story_view_and_survives_refresh() -> None:
         await pilot.pause()
         assert "Shortcuts" in app.query_one(Markdown)._markdown
         await pilot.press("escape")
-        await pilot.pause(0.5)
+        await settle(pilot)
         assert "Section 0" in app.query_one(Markdown)._markdown
 
 
@@ -561,10 +558,10 @@ async def test_reading_heading_tracks_refreshed_story_data() -> None:
     fake = FakeServer()
     app = Reader(api=fake.api())
     async with app.run_test(size=(120, 35)) as pilot:
-        await pilot.pause(0.6)
+        await settle(pilot)
         fake.feed.stories[0] = replace(fake.feed.stories[0], points=999, comments=123)
         app.action_refresh()
-        await pilot.pause(0.6)
+        await settle(pilot)
         selected = app.selected()
         assert selected and selected.id == 1
         heading = str(app.query_one("#story-heading", Static).content)
@@ -575,10 +572,10 @@ async def test_vote_statusline_confirms_without_toast() -> None:
     fake = FakeServer()
     app = Reader(api=fake.api())
     async with app.run_test(size=(120, 35)) as pilot:
-        await pilot.pause(0.6)
+        await settle(pilot)
         app.query_one(OptionList).focus()
         app.action_vote("up")
-        await pilot.pause(0.5)
+        await settle(pilot)
         assert [n.message for n in app._notifications] == []
         assert app.rated == {1}
         assert not app.query_one("#status").has_class("error")
@@ -588,7 +585,7 @@ async def test_footer_counts_follow_filters() -> None:
     fake = EditorialServer()
     app = Reader(api=fake.api())
     async with app.run_test(size=(120, 35)) as pilot:
-        await pilot.pause(0.6)
+        await settle(pilot)
         status = app.query_one("#status", Static)
         assert str(status.content) == "2 shown · +0 ~0 −0"
         assert status.has_class("context")
@@ -619,7 +616,7 @@ async def test_footer_counts_follow_filters() -> None:
 async def test_narrow_footer_fits_error_and_zoom_shortcuts() -> None:
     app = Reader(api=FakeServer().api())
     async with app.run_test(size=(51, 37)) as pilot:
-        await pilot.pause(0.6)
+        await settle(pilot)
         await pilot.press("enter")
         app.status("Connection failed. " * 10, error=True)
         await pilot.pause()
@@ -645,7 +642,7 @@ async def test_clock_switch_restyles_css_and_rich_text(
 ) -> None:
     app = Reader(api=EditorialServer().api())
     async with app.run_test(size=(120, 35)) as pilot:
-        await pilot.pause(0.6)
+        await settle(pilot)
         assert app.theme == "editorial"
         monkeypatch.setattr(
             "hn_rerank.app.theme_for_hour", lambda _hour: "editorial-light"

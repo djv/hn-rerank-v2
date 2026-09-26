@@ -19,6 +19,7 @@ from hn_rerank.api import (
 )
 from hn_rerank.app import Reader, Setup
 from hn_rerank.models import Feed, FeedStory
+from ._settle import settle
 
 
 def sample_feed(version: int = 0, target: int = 0) -> Feed:
@@ -105,7 +106,7 @@ async def test_navigation_resize_filters_and_late_summary(tmp_path: Path) -> Non
     fake.delay_summary = 0.7
     app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
     async with app.run_test(size=(120, 35)) as pilot:
-        await pilot.pause(0.4)
+        await settle(pilot)
         listing = app.query_one(OptionList)
         listing.focus()
         assert [s.id for s in app.stories] == [1, 2]
@@ -139,7 +140,7 @@ async def test_vote_duplicate_failure_undo_and_stale_exclusion(tmp_path: Path) -
         app.query_one(OptionList).focus()
         app.action_vote("up")
         app.action_vote("down")
-        await pilot.pause(0.3)
+        await settle(pilot)
         votes = [r for r in fake.requests if r.url.path.endswith("/feedback")]
         assert len(votes) == 1
         assert app.rated == {1}
@@ -148,13 +149,13 @@ async def test_vote_duplicate_failure_undo_and_stale_exclusion(tmp_path: Path) -
         await pilot.pause(0.1)
         assert [s.id for s in app.stories] == [2]
         app.action_undo()
-        await pilot.pause(0.3)
+        await settle(pilot)
         assert not app.rated and not app.history
         selected = app.selected()
         assert selected and selected.id == 1
         fake.fail_vote = True
         app.action_vote("down")
-        await pilot.pause(0.3)
+        await settle(pilot)
         assert not app.rated and not app.history
         selected = app.selected()
         assert selected and selected.id == 1
@@ -178,7 +179,7 @@ async def test_narrow_select_focus_keeps_escape_and_focus_moves_reachable() -> N
     fake = FakeServer()
     app = Reader(api=fake.api())
     async with app.run_test(size=(80, 30)) as pilot:
-        await pilot.pause(0.6)
+        await settle(pilot)
         # Narrow keeps both panes visible, so the summary sits between the
         # headline list and the selectors in the focus chain.
         await pilot.press("tab", "tab")
@@ -253,7 +254,7 @@ async def test_rate_limit_and_zero_reset() -> None:
     app = Reader(api=fake.api())
     app.target = 12
     async with app.run_test() as pilot:
-        await pilot.pause(0.2)
+        await settle(pilot)
         assert app.target == 0
         assert app.feed and app.feed.ready and app.feed.version == 0
 
@@ -479,7 +480,7 @@ async def test_refresh_forces_only_selected_summary(tmp_path: Path) -> None:
     fake = FakeServer()
     app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
     async with app.run_test(size=(120, 35)) as pilot:
-        await pilot.pause(0.5)
+        await settle(pilot)
         app.query_one(OptionList).focus()
         fake.requests.clear()
         await pilot.press("r")
@@ -508,7 +509,7 @@ async def test_rapid_filter_changes_settle(
 ) -> None:
     app = Reader(api=FakeServer().api(), config_path=tmp_path / "profile.json")
     async with app.run_test(size=(width, 38)) as pilot:
-        await pilot.pause(0.5)
+        await settle(pilot)
         rebuilds = 0
         original = app.rebuild
 
@@ -530,12 +531,12 @@ async def test_rapid_filter_changes_settle(
         else:
             for value in ("archive", "recent", "archive"):
                 app.query_one("#age", Select).value = value
-        await pilot.pause(0.4)
+        await settle(pilot)
         assert app.query_one(f"#{group}", Select).value == expected
         assert app.query_one(f"#{group}-tabs", Tabs).active == f"{group}-{expected}"
         settled = rebuilds
         assert 0 < settled <= 3
-        await pilot.pause(0.4)
+        await settle(pilot)
         assert rebuilds == settled  # No self-sustaining Select/Tabs echo.
 
 
@@ -543,7 +544,7 @@ async def test_s_cycles_sort_modes(tmp_path: Path) -> None:
     fake = FakeServer()
     app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
     async with app.run_test(size=(120, 35)) as pilot:
-        await pilot.pause(0.4)
+        await settle(pilot)
         app.query_one(OptionList).focus()
         assert str(app.query_one("#sort", Select).value) == "recommended"
         assert [s.id for s in app.stories] == [1, 2]
@@ -554,7 +555,7 @@ async def test_s_cycles_sort_modes(tmp_path: Path) -> None:
             ("recommended", [1, 2]),
         ):
             await pilot.press("s")
-            await pilot.pause(0.3)
+            await settle(pilot)
             assert str(app.query_one("#sort", Select).value) == expected
             assert [s.id for s in app.stories] == story_ids
 
@@ -576,14 +577,14 @@ async def test_explore_sort_is_shuffled(
     monkeypatch.setattr("random.shuffle", reverse)
     app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
     async with app.run_test(size=(120, 35)) as pilot:
-        await pilot.pause(0.4)
+        await settle(pilot)
         app.query_one(OptionList).focus()
         assert [s.id for s in app.stories] == [1, 2]
         await pilot.press("s")  # popular: untouched by the shuffle.
-        await pilot.pause(0.3)
+        await settle(pilot)
         assert [s.id for s in app.stories] == [1]
         await pilot.press("s")  # explore: reversed server order.
-        await pilot.pause(0.3)
+        await settle(pilot)
         assert str(app.query_one("#sort", Select).value) == "explore"
         assert [s.id for s in app.stories] == [2, 1]
         # Rebuild must copy: the shared server order stays intact for
@@ -615,10 +616,10 @@ async def test_explore_order_is_stable_within_a_visit(
     monkeypatch.setattr("random.shuffle", rotate)
     app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
     async with app.run_test(size=(120, 35)) as pilot:
-        await pilot.pause(0.4)
+        await settle(pilot)
         app.query_one(OptionList).focus()
         await pilot.press("s", "s")
-        await pilot.pause(0.3)
+        await settle(pilot)
         assert str(app.query_one("#sort", Select).value) == "explore"
         first = [s.id for s in app.stories]
         assert sorted(first) == [1, 2, 3]
@@ -631,42 +632,9 @@ async def test_explore_order_is_stable_within_a_visit(
         assert [s.id for s in app.stories] == first[1:]
         app.rated.clear()
         await pilot.press("s", "s", "s", "s")  # full cycle back to explore
-        await pilot.pause(0.3)
+        await settle(pilot)
         assert str(app.query_one("#sort", Select).value) == "explore"
         assert [s.id for s in app.stories] != first
-
-
-async def test_v_reverses_sort_order(tmp_path: Path) -> None:
-    """v flips the headline list; toggling back restores rank order."""
-    fake = FakeServer()
-    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
-    async with app.run_test(size=(120, 35)) as pilot:
-        await pilot.pause(0.4)
-        app.query_one(OptionList).focus()
-        assert [s.id for s in app.stories] == [1, 2]
-        await pilot.press("v")
-        await pilot.pause(0.3)
-        assert [s.id for s in app.stories] == [2, 1]
-        # The flip focuses the new first item and flags the footer.
-        selected = app.selected()
-        assert selected is not None and selected.id == 2
-        assert app.query_one(OptionList).highlighted == 0
-        assert "reversed" in str(app.query_one("#status", Static).content)
-        await pilot.press("v")
-        await pilot.pause(0.3)
-        assert [s.id for s in app.stories] == [1, 2]
-        assert "reversed" not in str(app.query_one("#status", Static).content)
-        # Reverse sticks across sort cycling (popular has one story).
-        await pilot.press("v")
-        await pilot.press("s")
-        await pilot.pause(0.3)
-        assert str(app.query_one("#sort", Select).value) == "popular"
-        assert [s.id for s in app.stories] == [1]
-        await pilot.press("s")
-        await pilot.press("s")
-        await pilot.pause(0.3)
-        assert str(app.query_one("#sort", Select).value) == "date"
-        assert [s.id for s in app.stories] == [1, 2]
 
 
 class FlakySummaryServer(FakeServer):
@@ -702,13 +670,13 @@ async def test_version_poll_keeps_hidden_stories_hidden(tmp_path: Path) -> None:
     fake = FakeServer()
     app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
     async with app.run_test(size=(120, 35)) as pilot:
-        await pilot.pause(0.3)
+        await settle(pilot)
         app.unavailable.add(1)
         app.refresh_passively()
-        await pilot.pause(0.3)
+        await settle(pilot)
         assert [s.id for s in app.stories] == [2]
         app.action_refresh()
-        await pilot.pause(0.3)
+        await settle(pilot)
         assert [s.id for s in app.stories] == [1, 2]
 
 
@@ -727,3 +695,90 @@ def test_open_in_firefox_falls_back_on_launch_error(
     monkeypatch.setattr(app_module.webbrowser, "open", opened.append)
     app_module.open_in_firefox("https://example.org/x")
     assert opened == ["https://example.org/x"]
+
+
+async def test_y_copies_comments_link_else_article_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import dataclasses
+
+    import hn_rerank.app as app_module
+
+    copied: list[str] = []
+
+    def copy(url: str) -> bool:
+        copied.append(url)
+        return True
+
+    monkeypatch.setattr(app_module, "copy_with_system_tool", copy)
+    fake = FakeServer()
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        await pilot.press("y")
+        assert copied == ["https://news.ycombinator.com/item?id=1"]
+        selected = app.selected()
+        assert selected is not None
+        no_comments = dataclasses.replace(selected, comments_url="")
+        monkeypatch.setattr(app, "selected", lambda: no_comments)
+        await pilot.press("y")
+        assert copied[-1] == "https://example.org/1"
+        monkeypatch.setattr(
+            app,
+            "selected",
+            lambda: dataclasses.replace(no_comments, article_url="javascript:x"),
+        )
+        await pilot.press("y")
+        assert len(copied) == 2
+
+
+def test_copy_with_system_tool_skips_failing_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess
+
+    import hn_rerank.app as app_module
+
+    calls: list[list[str]] = []
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+
+    def run(command: list[str], **kwargs: object) -> None:
+        calls.append(command)
+        if command[0] != "xsel":
+            raise subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr("subprocess.run", run)
+    assert app_module.copy_with_system_tool("u") is True
+    assert [c[0] for c in calls] == ["pbcopy", "xclip", "xsel"]
+
+
+async def test_failed_refresh_does_not_force_a_later_regeneration(
+    tmp_path: Path,
+) -> None:
+    """r arms a forced regeneration; if the feed fetch fails it must disarm."""
+
+    class FeedFailServer(FakeServer):
+        fail_feed = False
+
+        async def __call__(self, request: httpx.Request) -> httpx.Response:
+            if self.fail_feed and request.url.path.endswith("/api/feed"):
+                return httpx.Response(500)
+            return await super().__call__(request)
+
+    fake = FeedFailServer()
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        fake.fail_feed = True
+        app.action_refresh()
+        await settle(pilot)
+        assert app.force_summary_id is None
+        fake.fail_feed = False
+        app.action_refresh(force_summary=False)
+        await settle(pilot)
+        assert not any(
+            r.url.path.endswith("/api/tldr-detail")
+            and json.loads(r.content).get("force_refresh")
+            for r in fake.requests
+        )

@@ -9,6 +9,7 @@ from textual.widgets import Markdown, Static
 
 from hn_rerank.app import Reader
 from tests.test_client import FakeServer, sample_feed
+from ._settle import settle
 
 
 @pytest.mark.parametrize("version", [0, 2, 3])
@@ -17,14 +18,14 @@ async def test_passive_poll_only_fetches_changed_versions(version: int) -> None:
     fake.feed = sample_feed(2, 2)
     app = Reader(api=fake.api())
     async with app.run_test(size=(120, 35)) as pilot:
-        await pilot.pause(0.5)
+        await settle(pilot)
         await pilot.press("j")
         await pilot.pause()
         fake.requests.clear()
         fake.feed = sample_feed(version, version)
         fake.feed.stories[1] = replace(fake.feed.stories[1], comments=77)
         await app.poll_feed_version()
-        await pilot.pause(0.5)
+        await settle(pilot)
         fetches = [r for r in fake.requests if r.url.path.endswith("/api/feed")]
         assert len(fetches) == (0 if version == 2 else 1)
         selected = app.selected()
@@ -39,7 +40,7 @@ async def test_passive_poll_defers_during_interaction(state: str) -> None:
     fake = FakeServer()
     app = Reader(api=fake.api())
     async with app.run_test() as pilot:
-        await pilot.pause(0.5)
+        await settle(pilot)
         fake.requests.clear()
         setattr(app, state, True)
         await app.poll_feed_version()
@@ -56,7 +57,7 @@ async def test_passive_poll_failure_keeps_existing_deck() -> None:
     fake = OfflineProbe()
     app = Reader(api=fake.api())
     async with app.run_test() as pilot:
-        await pilot.pause(0.5)
+        await settle(pilot)
         original = app.feed
         status = str(app.query_one("#status", Static).content)
         await app.poll_feed_version()
@@ -71,14 +72,14 @@ async def test_passive_version_change_leaves_the_open_summary_alone() -> None:
     fake.feed = sample_feed(2, 2)
     app = Reader(api=fake.api())
     async with app.run_test(size=(120, 35)) as pilot:
-        await pilot.pause(0.5)
+        await settle(pilot)
         await pilot.press("j")
-        await pilot.pause(0.6)
+        await settle(pilot)
         assert app.summaries.get(2) == "# Summary 2"
         fake.requests.clear()
         fake.feed = sample_feed(3, 3)
         await app.poll_feed_version()
-        await pilot.pause(0.6)
+        await settle(pilot)
         assert app.feed is not None and app.feed.version == 3
         summarized = [
             int(r.url.path.rsplit("/", 1)[1])

@@ -1,5 +1,20 @@
 # Worklog: hn-rewrite
 
+## 2026-09-26 TUI: `y` copies link; faster TUI tests
+
+- `y` copies the comments URL (article URL if none) via OSC 52 plus
+  wl-copy/xclip/xsel/pbcopy off the event loop; blocked while a selector has focus.
+- TUI suite at `-n 4`: 54-60s -> ~39s wall, ~40% less CPU. Fixed
+  `pilot.pause(0.2-0.6)` became `tests/_settle.py::settle` (wait until no
+  workers/loading), except 4 tests that hold requests in flight. Zoom test runs
+  both exit keys per session (12 -> 6 cases); resize sweep runs once; the
+  long-summary fixture has 3 sections (still scrolls at all sizes, now asserted).
+  Floor is Textual's ~0.5s CPU per app lifecycle; `-n 8` gives ~24s.
+- Review fixes: a passive version poll no longer strands the selected summary
+  on "Loading summary…" when it cancels the prefetch that summary joined; a
+  failed `r` no longer leaves a forced regeneration armed. Reverse sort (`v`)
+  removed: it logged reversed list positions as ranks in impressions.
+
 ## 2026-09-26 Server memory: ~1.1 GB -> ~0.68 GB RSS
 
 - Probe on a VPS DB copy: startup ~240 MB, candidate pool +340 MB (story

@@ -16,6 +16,7 @@ from textual.widgets import Markdown, OptionList
 from hn_rerank.app import Reader
 
 from .test_client import FakeServer, sample_feed
+from ._settle import settle
 
 
 class PrefetchServer(FakeServer):
@@ -107,7 +108,7 @@ async def test_prefetch_zero_disables_speculation() -> None:
     app = Reader(api=fake.api(), prefetch=0)
     async with app.run_test(size=(120, 35)) as pilot:
         await wait_for(pilot, lambda: app.summaries.get(1) == "# Summary 1")
-        await pilot.pause(0.3)
+        await settle(pilot)
         assert fake.summary_ids == [1]
         assert not app.prefetch_queue
 
@@ -118,7 +119,7 @@ async def test_prefetch_stops_on_rate_limit() -> None:
     app = Reader(api=fake.api(), prefetch=2)
     async with app.run_test(size=(120, 35)) as pilot:
         await wait_for(pilot, lambda: 2 in fake.summary_ids)
-        await pilot.pause(0.3)
+        await settle(pilot)
         before = list(fake.summary_ids)
         app.schedule_prefetch()
         await pilot.pause(0.1)
@@ -136,7 +137,7 @@ async def test_stale_summaries_are_shown_but_not_cached() -> None:
         await wait_for(pilot, lambda: fake.summary_ids.count(3) == 1)
         assert 2 not in app.summaries  # provisional response, retry later
         app.rebuild()  # rebuilds must not re-queue a provisional story
-        await pilot.pause(0.2)
+        await settle(pilot)
         assert fake.summary_ids.count(2) == 1
         app.query_one(OptionList).focus()
         await pilot.press("j")
@@ -263,6 +264,21 @@ async def test_selecting_inflight_generation_reuses_request() -> None:
         fake.release.set()
         await wait_for(pilot, lambda: "Summary 2" in app.query_one(Markdown)._markdown)
         assert fake.generated.count(2) == 1
+
+
+async def test_passive_refresh_does_not_strand_a_joined_summary() -> None:
+    """A version poll cancels prefetch; the summary waiting on it must retry."""
+    fake = NavigationServer()
+    fake.blocked = {2}
+    app = Reader(api=fake.api())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await wait_for(pilot, lambda: 2 in fake.generated)
+        await pilot.press("j")
+        await pilot.pause(0.4)  # load_summary is now awaiting the prefetch.
+        app.refresh_passively()
+        await pilot.pause(0.2)
+        fake.release.set()
+        await wait_for(pilot, lambda: "Summary 2" in app.query_one(Markdown)._markdown)
 
 
 async def test_refresh_cancels_prefetch_generation() -> None:

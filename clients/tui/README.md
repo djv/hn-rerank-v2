@@ -7,7 +7,8 @@ The server retains its existing access policy: installing the client does not gr
 
 Keys: j/k or arrows navigate/scroll; Tab changes focus; 1/2/3 vote
 positive/neutral/negative and advance to the next story; u undoes the latest
-successful vote; o/c open article/comments; r refreshes; ? shows help; q quits.
+successful vote; o/c open article/comments;
+y copies the comments link (or the article link if there is none); r refreshes; ? shows help; q quits.
 Enter hides the article list and zooms the TLDR pane; Enter or Escape returns
 to the list. Escape also closes help. Use the sort and age selectors to change
 filters. Below 100 columns the headline list stacks above the summary.

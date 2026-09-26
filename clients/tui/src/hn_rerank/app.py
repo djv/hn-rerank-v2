@@ -145,6 +145,33 @@ def editorial_theme(name: str) -> Theme:
     )
 
 
+def copy_with_system_tool(text: str) -> bool:
+    """Copy text with wl-copy, xclip, xsel or pbcopy; False when none worked."""
+    import os
+    import shutil
+    import subprocess
+
+    commands = [["pbcopy"], ["xclip", "-selection", "clipboard"], ["xsel", "-ib"]]
+    if os.environ.get("WAYLAND_DISPLAY"):
+        commands.insert(0, ["wl-copy"])
+    for command in commands:
+        if shutil.which(command[0]) is None:
+            continue
+        try:
+            subprocess.run(
+                command,
+                input=text.encode(),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+                check=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        return True
+    return False
+
+
 def open_in_firefox(url: str) -> None:
     """Open a URL in the running Firefox window, launching one if needed."""
     import shutil
@@ -529,9 +556,9 @@ class Reader(App[None]):
         ("u", "undo", "Undo"),
         ("o", "open_url('article_url')", "Article"),
         ("c", "open_url('comments_url')", "Comments"),
+        ("y", "copy_url", "Copy link"),
         ("r", "refresh", "Refresh"),
         ("s", "cycle_sort", "Sort"),
-        ("v", "reverse_sort", "Reverse"),
         ("enter", "read", "Read"),
         ("escape", "headlines", "Back"),
         ("?", "help", "Help"),
@@ -563,7 +590,6 @@ class Reader(App[None]):
         self._marked_id: int | None = None
         # View preference: show the current sort bottom-first. Sticky
         # across sort cycling and feed refreshes until toggled back.
-        self.reverse_sort = False
         self.rated: set[int] = set()
         self.unavailable: set[int] = set()
         # Explore's client-side shuffle per "explore:<age>" view, kept stable
@@ -697,8 +723,8 @@ class Reader(App[None]):
                 "read",
                 "refresh",
                 "open_url",
+                "copy_url",
                 "cycle_sort",
-                "reverse_sort",
             }
         )
 
@@ -723,9 +749,6 @@ class Reader(App[None]):
         line.append(f"~{counts.get('neutral', 0)}", style=PALETTE["warn"])
         line.append(" ", style=PALETTE["sep"])
         line.append(f"−{counts.get('down', 0)}", style=PALETTE["bad"])
-        if self.reverse_sort:
-            line.append(" · ", style=PALETTE["sep"])
-            line.append("reversed", style=PALETTE["warn"])
         widget = self.query_one("#status", Static)
         widget.update(line)
         widget.set_class(False, "error")
@@ -880,8 +903,6 @@ class Reader(App[None]):
             for sid in order
             if sid not in self.rated and sid not in self.unavailable
         ][:VIEW_LIMIT]
-        if self.reverse_sort:
-            self.stories.reverse()
         headlines = self.query_one("#headlines", OptionList)
         headlines.clear_options()
         # Option padding (1 each side) plus the 2-cell selection marker.
@@ -1058,6 +1079,13 @@ class Reader(App[None]):
             elif not force_refresh and request is not None:
                 try:
                     summary = await asyncio.shield(request)
+                except asyncio.CancelledError:
+                    # A passive refresh cancels prefetch; only our own
+                    # cancellation should stop this load.
+                    task = asyncio.current_task()
+                    if not request.cancelled() or (task and task.cancelling()):
+                        raise
+                    summary = None
                 except (InvalidProfile, TransientError):
                     raise
                 except APIError:
@@ -1329,8 +1357,11 @@ class Reader(App[None]):
                 if not ready and attempt == 29:
                     self.status("Ranking is still updating. Press r to check again.")
         except InvalidProfile as exc:
+            self.force_summary_id = None
             self.setup(str(exc))
         except APIError as exc:
+            # The r that armed it failed; a later selection must use the cache.
+            self.force_summary_id = None
             self.status(
                 ("Showing stale stories. " if self.feed else "")
                 + str(exc)
@@ -1354,13 +1385,6 @@ class Reader(App[None]):
         except ValueError:
             index = -1
         select.value = self.SORT_CYCLE[(index + 1) % len(self.SORT_CYCLE)]
-
-    def action_reverse_sort(self) -> None:
-        """Flip the headline list and focus the new first item."""
-        self.reverse_sort = not self.reverse_sort
-        # select_id=-1: filter-change behavior, highlight index 0 and
-        # scroll home instead of following the previously selected story.
-        self.rebuild(select_id=-1)
 
     def action_refresh(
         self, *, force_summary: bool = True, restore_hidden: bool = True
@@ -1503,6 +1527,28 @@ class Reader(App[None]):
         else:
             self.status("No link available for this story.")
 
+    async def action_copy_url(self) -> None:
+        """Copy the comments link, or the article link when there is none."""
+        story = self.selected()
+        url = next(
+            (
+                u
+                for u in ((story.comments_url, story.article_url) if story else ())
+                if urlsplit(u).scheme in {"http", "https"}
+            ),
+            "",
+        )
+        if not url:
+            self.status("No link available for this story.")
+            return
+        # OSC 52 needs terminal support; a system clipboard tool covers the rest.
+        self.copy_to_clipboard(url)
+        # A hung clipboard owner must not freeze the reader.
+        if await asyncio.to_thread(copy_with_system_tool, url):
+            self.status(f"Copied {url}")
+        else:
+            self.status(f"Sent to terminal clipboard (needs OSC 52): {url}")
+
     def layout_panes(self, width: int | None = None) -> None:
         narrow = (self.size.width if width is None else width) < 100
         self.set_class(narrow, "narrow")
@@ -1611,10 +1657,10 @@ class Reader(App[None]):
             "- `u`: undo latest vote\n\n"
             "## Sort\n\n"
             "- `s`: cycle sort (Recommended → Popular → Explore → Date)\n"
-            "- `v`: reverse sort order\n"
             "- Selectors: sort and Recent / Archive\n\n"
             "## Other\n\n"
             "- `o` / `c`: open article / comments\n"
+            "- `y`: copy comments link (article link if none)\n"
             "- `r`: refresh and regenerate selected summary\n"
             "- `b`: badge legend\n"
             "- `?`: this help\n"

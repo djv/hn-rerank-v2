@@ -13,6 +13,7 @@ from hn_rerank.app import Reader, Setup
 from hn_rerank.models import Feed
 
 from .test_client import FakeServer
+from ._settle import settle
 
 
 async def test_import_validates_then_persists_and_relaunches(
@@ -39,7 +40,7 @@ async def test_import_validates_then_persists_and_relaunches(
         assert app.feed is not None
     app = Reader(config_path=path, server="https://example.org/hn/")
     async with app.run_test() as pilot:
-        await pilot.pause(0.2)
+        await settle(pilot)
         assert not isinstance(app.screen, Setup)
         assert app.feed is not None
 
@@ -88,7 +89,7 @@ async def test_invalid_saved_profile_returns_to_setup_without_create(
     save_profile(Profile("https://example.org/hn/", "invalid"), path)
     app = Reader(config_path=path, server="https://example.org/hn/")
     async with app.run_test() as pilot:
-        await pilot.pause(0.2)
+        await settle(pilot)
         assert isinstance(app.screen, Setup)
         assert calls == ["/hn/api/user"]
         assert load_profile(path) == Profile("https://example.org/hn/", "invalid")
@@ -136,11 +137,11 @@ async def test_profile_setup_cancels_pending_vote_state() -> None:
     fake.delay_vote = 0.4
     app = Reader(api=fake.api())
     async with app.run_test(size=(120, 35)) as pilot:
-        await pilot.pause(0.2)
+        await settle(pilot)
         app.action_vote("up")
         await pilot.pause(0.05)
         app.setup("Profile changed")
-        await pilot.pause(0.5)
+        await settle(pilot)
         assert isinstance(app.screen, Setup)
         assert not app.pending and not app.rated and not app.history
 
@@ -159,7 +160,7 @@ async def test_default_server_keeps_saved_profile_elsewhere(
     # No --server flag: the saved profile's server wins over DEFAULT_SERVER.
     app = Reader(config_path=path)
     async with app.run_test() as pilot:
-        await pilot.pause(0.2)
+        await settle(pilot)
         assert not isinstance(app.screen, Setup)
         assert app.api is not None and app.api.server == "http://localhost:8000/"
 
@@ -187,7 +188,7 @@ async def test_rejected_saved_profile_reconnects_on_its_own_server(
     save_profile(Profile("https://mine.example/hn/", "revoked"), path)
     app = Reader(config_path=path)
     async with app.run_test(size=(100, 40)) as pilot:
-        await pilot.pause(0.2)
+        await settle(pilot)
         assert isinstance(app.screen, Setup)
         app.screen.query_one("#token", Input).value = "test"
         await pilot.click("#use-token")

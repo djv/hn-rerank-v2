@@ -7,13 +7,14 @@ from textual.widgets import OptionList
 from hn_rerank.app import Reader
 
 from .test_client import FakeServer
+from ._settle import settle
 
 
 async def test_selected_impression_is_delayed_not_prefetched_and_best_effort() -> None:
     fake = FakeServer()  # /api/interaction returns 404: reading must continue.
     app = Reader(api=fake.api(), prefetch=2)
     async with app.run_test(size=(120, 35)) as pilot:
-        await pilot.pause(0.3)
+        await settle(pilot)
         app.query_one(OptionList).focus()
         await pilot.press("j")
         await pilot.pause(1.2)
