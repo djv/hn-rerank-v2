@@ -29,7 +29,14 @@ def test_feed_parity_authentication_stale_cache_and_eviction(tmp_path: Path) -> 
         _cold_stories = []
 
         @classmethod
-        def _trigger_warm(cls, user: User, version: int, delay_s: float = 0.0) -> None:
+        def _trigger_warm(
+            cls,
+            user: User,
+            version: int,
+            delay_s: float = 0.0,
+            *,
+            expedite: bool = True,
+        ) -> None:
             pass
 
     Runtime.db = db

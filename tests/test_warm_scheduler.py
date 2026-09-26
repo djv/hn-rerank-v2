@@ -102,6 +102,57 @@ def test_positive_delay_debounces_and_zero_delay_runs_now() -> None:
     assert ran and ran[0] - t1 < 1.0
 
 
+def test_passive_request_with_nothing_pending_runs_now() -> None:
+    """A stale render still starts a warm when no vote warm is queued."""
+    ran: list[int] = []
+    sched: WarmScheduler[int, int] = WarmScheduler(
+        lambda p, v: ran.append(v), workers=1
+    )
+    sched.request(2, 2, 1, expedite=False)
+    assert sched.wait_idle(2)
+    assert ran == [1]
+
+
+@settings(max_examples=60, deadline=None)
+@given(
+    delay=st.floats(1.0, 10.0),
+    events=st.lists(
+        st.tuples(
+            st.booleans(),  # True = vote (debounced), False = passive poll/render
+            st.floats(0.0, 1.0),  # gap before it, as a fraction of time left
+            st.integers(0, 5),  # version bump
+        ),
+        max_size=30,
+    ),
+)
+def test_passive_requests_never_move_the_vote_deadline(
+    delay: float, events: list[tuple[bool, float, int]]
+) -> None:
+    """For any interleaving of debounced vote requests and passive stale-render
+    or readiness-poll requests, the pending job's deadline is set by the last
+    vote alone and its version is the highest requested. The fake clock never
+    reaches the deadline, so no worker takes the job mid-sequence."""
+    now = 100.0
+    sched: WarmScheduler[int, int] = WarmScheduler(
+        lambda p, v: None, workers=1, clock=lambda: now
+    )
+    version = 1
+    sched.request(1, 1, version, delay_s=delay)
+    deadline = now + delay
+    for is_vote, gap, bump in events:
+        now += gap * (deadline - now) * 0.99  # strictly before the deadline
+        version += bump
+        if is_vote:
+            sched.request(1, 1, version, delay_s=delay)
+            deadline = now + delay
+        else:
+            sched.request(1, 1, version, expedite=False)
+        assert now < deadline
+    assert sched.pending_version(1) == version
+    assert sched._pending[1].not_before == deadline
+    sched.clear_pending()
+
+
 def test_failed_job_is_logged_and_worker_survives() -> None:
     ran: list[int] = []
 

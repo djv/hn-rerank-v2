@@ -1250,10 +1250,12 @@ def test_ranking_ready_rejects_invalid_version(test_env, version: str) -> None:
 
 def test_ranking_ready_false_when_cache_missing_or_older(test_env, monkeypatch) -> None:
     port, _, _, handler, user = test_env
-    calls: list[tuple[int, int]] = []
+    calls: list[tuple[int, int, bool]] = []
 
-    def fake_trigger_warm(cls, warm_user, version: int) -> None:
-        calls.append((warm_user.id, version))
+    def fake_trigger_warm(
+        cls, warm_user, version: int, delay_s: float = 0.0, expedite: bool = True
+    ) -> None:
+        calls.append((warm_user.id, version, expedite))
 
     monkeypatch.setattr(handler, "_trigger_warm", classmethod(fake_trigger_warm))
     target_version = handler._bump_user_version(user.id)
@@ -1283,14 +1285,15 @@ def test_ranking_ready_false_when_cache_missing_or_older(test_env, monkeypatch) 
     assert older_resp.status_code == 200
     assert older_resp.json()["ready"] is False
     assert older_resp.json()["cached_version"] == target_version - 1
-    assert calls == [(user.id, target_version), (user.id, target_version)]
+    # Polls are passive: they must not cut short a queued vote-debounce warm.
+    assert calls == [(user.id, target_version, False), (user.id, target_version, False)]
 
 
 def test_ranking_ready_true_only_from_cached_version(test_env, monkeypatch) -> None:
     port, _, _, handler, user = test_env
     calls: list[tuple[int, int]] = []
 
-    def fake_trigger_warm(cls, warm_user, version: int) -> None:
+    def fake_trigger_warm(cls, warm_user, version: int, **_: Any) -> None:
         calls.append((warm_user.id, version))
 
     monkeypatch.setattr(handler, "_trigger_warm", classmethod(fake_trigger_warm))
@@ -1338,7 +1341,7 @@ def test_ranking_ready_returns_intermediate_cached_version(
     port, _, _, handler, user = test_env
     calls: list[tuple[int, int]] = []
 
-    def fake_trigger_warm(cls, warm_user, version: int) -> None:
+    def fake_trigger_warm(cls, warm_user, version: int, **_: Any) -> None:
         calls.append((warm_user.id, version))
 
     monkeypatch.setattr(handler, "_trigger_warm", classmethod(fake_trigger_warm))
@@ -1502,7 +1505,9 @@ def test_no_cache_user_gets_cold_deck_and_warm_is_scheduled(
         )
         return b"cold html"
 
-    def fake_trigger_warm(cls, warm_user, version: int, delay_s: float = 0.0) -> None:
+    def fake_trigger_warm(
+        cls, warm_user, version: int, delay_s: float = 0.0, **_: Any
+    ) -> None:
         calls.append((warm_user.id, version))
 
     import pipeline
@@ -1565,7 +1570,7 @@ def test_no_cache_zero_feedback_user_gets_cold_deck_no_warm(
     ) -> bytes:
         return b"cold html"
 
-    def fake_trigger_warm(cls, warm_user, version: int) -> None:
+    def fake_trigger_warm(cls, warm_user, version: int, **_: Any) -> None:
         calls.append((warm_user.id, version))
 
     import pipeline
@@ -2030,7 +2035,9 @@ def test_flask_test_client_ranking_ready_reports_missing_cache(
     client.set_cookie("hn_token", user.token)
     calls: list[tuple[int, int]] = []
 
-    def fake_trigger_warm(cls: type[Handler], warm_user: Any, version: int) -> None:
+    def fake_trigger_warm(
+        cls: type[Handler], warm_user: Any, version: int, **_: Any
+    ) -> None:
         calls.append((warm_user.id, version))
 
     monkeypatch.setattr(handler, "_trigger_warm", classmethod(fake_trigger_warm))
@@ -4227,6 +4234,53 @@ def test_tldr_uncached_global_limit_blocks_second_session(
     assert calls == ["Global TLDR story 784"]
 
 
+def test_tldr_detail_uncached_requires_session(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sessionless clients get cached TLDRs only; never spend the LLM budget."""
+    port, db, _, _, _ = test_env
+    db.upsert_story(
+        Story(
+            id=786,
+            title="Sessionless TLDR story",
+            url="https://example.com/sessionless-tldr",
+            score=10,
+            time=1600000000,
+            text_content="Story body.",
+            source="hn",
+            comment_count=0,
+            self_text="",
+            top_comments="",
+            article_body="Story body.",
+        )
+    )
+    calls: list[str] = []
+
+    async def mock_generate_detailed_tldr(
+        title: str, self_text: str, top_comments: str, article_body: str
+    ) -> "server.TldrResult":
+        calls.append(title)
+        return server.TldrResult(kind="ok", tldr=f"TLDR: {title}")
+
+    import server
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+
+    for body in ({"story_id": 786}, {"story_id": 786, "force_refresh": True}):
+        response = httpx.post(f"http://127.0.0.1:{port}/api/tldr-detail", json=body)
+        assert response.status_code == 401
+    assert calls == []
+
+    db.upsert_tldr_cache(786, "old-key", "Old TLDR")
+    stale = httpx.post(
+        f"http://127.0.0.1:{port}/api/tldr-detail",
+        json={"story_id": 786, "force_refresh": True},
+    )
+    assert stale.status_code == 200
+    assert stale.json()["tldr"] == "Old TLDR"
+    assert calls == []
+
+
 def test_tldr_detail_does_not_cache_placeholder(test_env, monkeypatch):
     """A story with no content returns the placeholder but does not cache it."""
     port, db, _, _, user = test_env
@@ -5572,15 +5626,16 @@ def test_dashboard_stale_hit_renders_deck_as_stale_and_queues_warm(swr_handler):
     user, h = swr_handler
     h._decks[user.id] = _deck(1)
     h._dashboard_versions[user.id] = 2  # current = generation 1 + 2 = 3
-    calls: list[tuple[int, int]] = []
+    calls: list[tuple[int, int, bool]] = []
     h._trigger_warm = classmethod(  # type: ignore[method-assign]
-        lambda cls, warm_user, version, delay_s=0.0: calls.append(
-            (warm_user.id, version)
+        lambda cls, warm_user, version, delay_s=0.0, expedite=True: calls.append(
+            (warm_user.id, version, expedite)
         )
     )
 
     assert h._render_dashboard_for_user(user) == b"v=1/3 n=0"
-    assert calls == [(user.id, 3)]
+    # Passive: must not cut short a queued vote-debounce warm.
+    assert calls == [(user.id, 3, False)]
 
 
 def test_dashboard_cache_hit_renders_current_without_warm(swr_handler):
@@ -5650,7 +5705,7 @@ def test_pool_changed_stales_every_deck_and_queues_cached_users(swr_handler):
     )
     calls: list[tuple[int, int]] = []
     h._trigger_warm = classmethod(  # type: ignore[method-assign]
-        lambda cls, warm_user, version, delay_s=0.0: calls.append(
+        lambda cls, warm_user, version, delay_s=0.0, **_: calls.append(
             (warm_user.id, version)
         )
     )
@@ -5954,7 +6009,9 @@ def test_deck_cards_triggers_warm_on_stale_cache(
     monkeypatch.setattr(
         handler,
         "_trigger_warm",
-        classmethod(lambda cls, warm_user, version, delay_s=0.0: calls.append(version)),
+        classmethod(
+            lambda cls, warm_user, version, delay_s=0.0, **_: calls.append(version)
+        ),
     )
 
     response = local_http.get(
@@ -5983,7 +6040,9 @@ def test_deck_cards_does_not_warm_when_cache_is_current(
     monkeypatch.setattr(
         handler,
         "_trigger_warm",
-        classmethod(lambda cls, warm_user, version, delay_s=0.0: calls.append(version)),
+        classmethod(
+            lambda cls, warm_user, version, delay_s=0.0, **_: calls.append(version)
+        ),
     )
 
     response = local_http.get(

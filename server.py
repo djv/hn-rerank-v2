@@ -1498,7 +1498,8 @@ class Handler:
             result = "cache_hit"
             if deck.version < current:
                 result = "stale_hit"
-                cls._trigger_warm(user, current)
+                # Passive: a queued vote-debounce warm keeps its delay.
+                cls._trigger_warm(user, current, expedite=False)
             html = cls._render_deck(user, deck.ranked, deck.version, current)
             logging.info(
                 "dashboard_render user_id=%s version=%s result=%s deck_version=%s"
@@ -1580,12 +1581,21 @@ class Handler:
             return scheduler
 
     @classmethod
-    def _trigger_warm(cls, user: User, version: int, delay_s: float = 0.0) -> None:
+    def _trigger_warm(
+        cls,
+        user: User,
+        version: int,
+        delay_s: float = 0.0,
+        *,
+        expedite: bool = True,
+    ) -> None:
         version = max(version, cls._dashboard_version(user.id))
         deck = cls._decks.get(user.id)
         if deck is not None and deck.version >= version:
             return
-        cls._warm_scheduler().request(user.id, user, version, delay_s)
+        cls._warm_scheduler().request(
+            user.id, user, version, delay_s, expedite=expedite
+        )
 
     @classmethod
     def _schedule_feedback_warm(cls, user: User, version: int) -> bool:
@@ -2594,6 +2604,16 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
                 "Summary provider is cooling down. Please try again later.", retry_after
             )
 
+        # Cached summaries stay public; spending the LLM budget needs a
+        # session, so a sessionless client can't drain the shared quota.
+        if user is None:
+            fallback = _stale_tldr_fallback_response(runtime.db, story.id, "no_session")
+            if fallback:
+                return fallback
+            return _flask_json_response(
+                {"error": "No session"}, status=HTTPStatus.UNAUTHORIZED
+            )
+
         quota = _acquire_tldr_uncached_quota(runtime, user)
         if not quota.allowed:
             fallback = _stale_tldr_fallback_response(
@@ -2955,7 +2975,7 @@ def _handle_flask_ranking_ready(runtime: type[Handler]) -> Response:
     if (cached_version is None or cached_version < current_version) and (
         current_version >= min_version
     ):
-        runtime._trigger_warm(user, current_version)
+        runtime._trigger_warm(user, current_version, expedite=False)
 
     return _flask_json_response(
         {

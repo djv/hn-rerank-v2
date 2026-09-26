@@ -8,7 +8,9 @@ and at most ``workers`` jobs run at once overall.
 ``request(key, version, delay_s)`` records that ``version`` is wanted no
 earlier than ``now + delay_s``. Requests coalesce: the pending version only
 ever rises; a positive delay restarts the wait (debounce), a zero delay makes
-the job runnable now. A request that arrives while the key's job is running
+the job runnable now unless ``expedite=False``, which leaves an already
+pending job's wait alone (passive "this deck is stale" requests must not
+cut short a vote debounce). A request that arrives while the key's job is running
 stays pending and runs after it, so the newest version always gets built;
 one for a version the running job already covers is dropped.
 """
@@ -54,7 +56,15 @@ class WarmScheduler(Generic[K, P]):
         self._running: dict[K, int] = {}
         self._threads: list[threading.Thread] = []
 
-    def request(self, key: K, payload: P, version: int, delay_s: float = 0.0) -> None:
+    def request(
+        self,
+        key: K,
+        payload: P,
+        version: int,
+        delay_s: float = 0.0,
+        *,
+        expedite: bool = True,
+    ) -> None:
         now = self._clock()
         with self._cond:
             pending = self._pending.get(key)
@@ -65,9 +75,10 @@ class WarmScheduler(Generic[K, P]):
             else:
                 pending.payload = payload
                 pending.version = max(pending.version, version)
-                pending.not_before = (
-                    now + delay_s if delay_s > 0 else min(pending.not_before, now)
-                )
+                if delay_s > 0:
+                    pending.not_before = now + delay_s
+                elif expedite:
+                    pending.not_before = min(pending.not_before, now)
             self._ensure_workers_locked()
             self._cond.notify_all()
 

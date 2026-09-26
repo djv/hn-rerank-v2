@@ -1,5 +1,20 @@
 # Worklog: hn-rewrite
 
+## 2026-09-26 Server review fixes: TLDR session gate, vote debounce
+
+From a server/TUI code review (findings reported in chat; TUI fixes pending).
+
+- `/api/tldr-detail`: uncached generation (including `force_refresh`) now
+  needs a session. Sessionless callers get a stale cached TLDR or `401`, so
+  an anonymous loop can no longer spend the shared 240/hr quota. Deployed
+  per-user and global limits are still both 240 — one session can still use
+  the whole global budget.
+- Vote debounce: a stale_hit render (e.g. the client's post-vote
+  `/api/feed` refill) and `/api/ranking-ready` polls pulled the queued 3s
+  vote warm forward to "now", so every vote reranked immediately.
+  `WarmScheduler.request(..., expedite=False)` keeps a pending job's wait;
+  both passive call sites use it.
+
 ## 2026-09-26 Hypothesis budgets: quarter locally, `deep` opt-in
 
 - One-off 10x run (every property test at 10x its examples, at least 1000;
