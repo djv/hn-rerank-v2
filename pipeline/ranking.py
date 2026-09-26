@@ -1139,8 +1139,7 @@ def _score_and_rank(
         )
 
     n_feedback = len(feedback_labels)
-    if trace is not None:
-        trace.set_count("feedback_total", n_feedback)
+    trace.set_count("feedback_total", n_feedback)
     if score_context is not None:
         score_context.feedback_labels = list(feedback_labels)
 
@@ -1150,10 +1149,9 @@ def _score_and_rank(
     n_up = int((fb_labels_arr == 2).sum())
     n_down = int((fb_labels_arr == 0).sum())
     n_neutral = int((fb_labels_arr == 1).sum())
-    if trace is not None:
-        trace.set_count("feedback_up", n_up)
-        trace.set_count("feedback_down", n_down)
-        trace.set_count("feedback_neutral", n_neutral)
+    trace.set_count("feedback_up", n_up)
+    trace.set_count("feedback_down", n_down)
+    trace.set_count("feedback_neutral", n_neutral)
 
     if (
         n_up >= config.model.min_up_for_svm
@@ -1167,12 +1165,7 @@ def _score_and_rank(
             fb_sig = _feedback_signature(db, user_id) if user_id is not None else ""
             cached_model: _CachedModel | None = None
 
-            if trace is not None:
-                with trace.stage("feedback_embedding"):
-                    fb_embeddings = get_or_compute_embeddings(
-                        feedback_stories, embedder, db
-                    )
-            else:
+            with trace.stage("feedback_embedding"):
                 fb_embeddings = get_or_compute_embeddings(
                     feedback_stories, embedder, db
                 )
@@ -1286,113 +1279,105 @@ def _score_and_rank(
                 )
 
             if cached_model is not None:
-                if trace is not None:
-                    trace.set_label("model_cache", "hit")
+                trace.set_label("model_cache", "hit")
                 svm, scaler, _ = cached_model
             else:
-                if trace is not None:
-                    trace.set_label("model_cache", "miss")
-                    with trace.stage("svm_training_feature_prep"):
-                        # LOOCV k-NN for training: exclude self from reference set
-                        fb_sim_to_up = np.zeros(len(fb_embeddings), dtype=np.float32)
-                        fb_sim_to_down = np.zeros(len(fb_embeddings), dtype=np.float32)
-                        if n_up > 0:
-                            up_indices = np.where(up_mask)[0]
-                            fb_sim_to_up, fb_closest_up = _loocv_knn_features(
-                                fb_embeddings, fb_up_embs, up_indices, k
-                            )
-                        else:
-                            fb_closest_up = np.zeros(
-                                len(fb_embeddings), dtype=np.float32
-                            )
-
-                        if n_down > 0:
-                            down_indices = np.where(down_mask)[0]
-                            fb_sim_to_down, fb_closest_down = _loocv_knn_features(
-                                fb_embeddings, fb_down_embs, down_indices, k
-                            )
-                        else:
-                            fb_closest_down = np.zeros(
-                                len(fb_embeddings), dtype=np.float32
-                            )
-
-                        fb_positive_cluster_sim = (
-                            _similarity_to_positive_cluster_centers(
-                                fb_embeddings, positive_cluster_centers
-                            )
+                trace.set_label("model_cache", "miss")
+                with trace.stage("svm_training_feature_prep"):
+                    # LOOCV k-NN for training: exclude self from reference set
+                    fb_sim_to_up = np.zeros(len(fb_embeddings), dtype=np.float32)
+                    fb_sim_to_down = np.zeros(len(fb_embeddings), dtype=np.float32)
+                    if n_up > 0:
+                        up_indices = np.where(up_mask)[0]
+                        fb_sim_to_up, fb_closest_up = _loocv_knn_features(
+                            fb_embeddings, fb_up_embs, up_indices, k
                         )
-
-                        fb_text_lengths = np.array(
-                            [len(s.text_content) for s in feedback_stories]
-                        )
-
-                        # 4-binary source category one-hot per feedback story.
-                        fb_source_onehot = source_category_stack(
-                            [s.source for s in feedback_stories]
-                        )
-                        fb_is_hn_live = fb_source_onehot[:, 0]
-                        fb_is_archive = fb_source_onehot[:, 1]
-                        fb_is_reddit = fb_source_onehot[:, 2]
-                        fb_is_rss = fb_source_onehot[:, 3]
-
-                        fb_features = _svm_personalization_features(
-                            fb_embeddings,
-                            text_lengths=fb_text_lengths,
-                            sim_to_upvoted=fb_sim_to_up,
-                            sim_to_downvoted=fb_sim_to_down,
-                            closest_upvoted=fb_closest_up,
-                            closest_downvoted=fb_closest_down,
-                            positive_cluster_similarity=fb_positive_cluster_sim,
-                            is_hn_live=fb_is_hn_live,
-                            is_archive=fb_is_archive,
-                            is_reddit=fb_is_reddit,
-                            is_rss=fb_is_rss,
-                        )
-
-                    if publication_train is not None:
-                        fb_features = np.concatenate(
-                            [fb_features, publication_train], axis=1
-                        )
-                    if config.model.engagement_features_enabled:
-                        fb_features = np.concatenate(
-                            [fb_features, _engagement_features(feedback_stories)],
-                            axis=1,
-                        )
-
-                    # Ensure all three classes (0, 1, 2) are present
-                    missing = {0, 1, 2} - set(feedback_labels)
-                    if missing:
-                        fb_features = np.concatenate(
-                            [
-                                fb_features,
-                                np.zeros(
-                                    (len(missing), fb_features.shape[1]),
-                                    dtype=np.float32,
-                                ),
-                            ],
-                            axis=0,
-                        )
-                        labels = list(feedback_labels) + list(missing)
                     else:
-                        labels = list(feedback_labels)
+                        fb_closest_up = np.zeros(len(fb_embeddings), dtype=np.float32)
 
-                    # Compute balanced weights for real feedback; 1e-6 for dummies
-                    counts = Counter(feedback_labels)
-                    n_classes = len(counts)
-                    n_real = len(feedback_labels)
-                    weights = [
-                        n_real / (n_classes * counts[lbl]) for lbl in feedback_labels
-                    ]
-                    weights.extend([1e-6] * len(missing))
-                    sample_weights = np.array(weights, dtype=np.float64)
+                    if n_down > 0:
+                        down_indices = np.where(down_mask)[0]
+                        fb_sim_to_down, fb_closest_down = _loocv_knn_features(
+                            fb_embeddings, fb_down_embs, down_indices, k
+                        )
+                    else:
+                        fb_closest_down = np.zeros(len(fb_embeddings), dtype=np.float32)
 
-                    scaler = StandardScaler()
-                    fb_features_meta_scaled = np.clip(
-                        scaler.fit_transform(fb_features[:, emb_dim:]), -2.5, 2.5
+                    fb_positive_cluster_sim = _similarity_to_positive_cluster_centers(
+                        fb_embeddings, positive_cluster_centers
                     )
-                    fb_features_scaled = np.hstack(
-                        [fb_features[:, :emb_dim], fb_features_meta_scaled]
+
+                    fb_text_lengths = np.array(
+                        [len(s.text_content) for s in feedback_stories]
                     )
+
+                    # 4-binary source category one-hot per feedback story.
+                    fb_source_onehot = source_category_stack(
+                        [s.source for s in feedback_stories]
+                    )
+                    fb_is_hn_live = fb_source_onehot[:, 0]
+                    fb_is_archive = fb_source_onehot[:, 1]
+                    fb_is_reddit = fb_source_onehot[:, 2]
+                    fb_is_rss = fb_source_onehot[:, 3]
+
+                    fb_features = _svm_personalization_features(
+                        fb_embeddings,
+                        text_lengths=fb_text_lengths,
+                        sim_to_upvoted=fb_sim_to_up,
+                        sim_to_downvoted=fb_sim_to_down,
+                        closest_upvoted=fb_closest_up,
+                        closest_downvoted=fb_closest_down,
+                        positive_cluster_similarity=fb_positive_cluster_sim,
+                        is_hn_live=fb_is_hn_live,
+                        is_archive=fb_is_archive,
+                        is_reddit=fb_is_reddit,
+                        is_rss=fb_is_rss,
+                    )
+
+                if publication_train is not None:
+                    fb_features = np.concatenate(
+                        [fb_features, publication_train], axis=1
+                    )
+                if config.model.engagement_features_enabled:
+                    fb_features = np.concatenate(
+                        [fb_features, _engagement_features(feedback_stories)],
+                        axis=1,
+                    )
+
+                # Ensure all three classes (0, 1, 2) are present
+                missing = {0, 1, 2} - set(feedback_labels)
+                if missing:
+                    fb_features = np.concatenate(
+                        [
+                            fb_features,
+                            np.zeros(
+                                (len(missing), fb_features.shape[1]),
+                                dtype=np.float32,
+                            ),
+                        ],
+                        axis=0,
+                    )
+                    labels = list(feedback_labels) + list(missing)
+                else:
+                    labels = list(feedback_labels)
+
+                # Compute balanced weights for real feedback; 1e-6 for dummies
+                counts = Counter(feedback_labels)
+                n_classes = len(counts)
+                n_real = len(feedback_labels)
+                weights = [
+                    n_real / (n_classes * counts[lbl]) for lbl in feedback_labels
+                ]
+                weights.extend([1e-6] * len(missing))
+                sample_weights = np.array(weights, dtype=np.float64)
+
+                scaler = StandardScaler()
+                fb_features_meta_scaled = np.clip(
+                    scaler.fit_transform(fb_features[:, emb_dim:]), -2.5, 2.5
+                )
+                fb_features_scaled = np.hstack(
+                    [fb_features[:, :emb_dim], fb_features_meta_scaled]
+                )
                 if config.model.svm_precomputed_enabled:
                     if config.model.svm_kernel != "rbf" or not isinstance(
                         config.model.svm_gamma, float
@@ -1412,12 +1397,7 @@ def _score_and_rank(
                         random_state=0,
                         decision_function_shape="ovr",
                     )
-                if trace is not None:
-                    with trace.stage("svm_fit"):
-                        svm.fit(
-                            fb_features_scaled, labels, sample_weight=sample_weights
-                        )
-                else:
+                with trace.stage("svm_fit"):
                     svm.fit(fb_features_scaled, labels, sample_weight=sample_weights)
                 if fb_sig:
                     _set_cached_model(
@@ -1439,10 +1419,7 @@ def _score_and_rank(
 
             class_order = list(svm.classes_)
             idx_up = class_order.index(2)
-            if trace is not None:
-                with trace.stage("decision"):
-                    decision = svm.decision_function(cand_features_scaled)
-            else:
+            with trace.stage("decision"):
                 decision = svm.decision_function(cand_features_scaled)
             if decision.ndim == 1:
                 raw_scores = decision if class_order[-1] == 2 else -decision
@@ -1456,7 +1433,7 @@ def _score_and_rank(
         except Exception as e:
             trace.set_label("svm_fit", "error")
             logging.error("Failed to fit feedback SVM: %r", e)
-    elif trace is not None:
+    else:
         trace.set_label("model_cache", "skipped")
 
     svm_scores = scores
@@ -1961,14 +1938,10 @@ def rerank_candidates(
     """
     if not candidates:
         return []
-    if trace is not None:
-        trace.set_count("candidates", len(candidates))
+    trace.set_count("candidates", len(candidates))
 
     if cand_embeddings is None:
-        if trace is not None:
-            with trace.stage("candidate_embedding"):
-                cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
-        else:
+        with trace.stage("candidate_embedding"):
             cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
 
     score_context = RankScoreContext()
