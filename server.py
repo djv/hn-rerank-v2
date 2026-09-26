@@ -1443,6 +1443,14 @@ def _load_malloc_trim() -> Callable[[int], int] | None:
 _MALLOC_TRIM = _load_malloc_trim()
 
 
+def _release_freed_heap() -> None:
+    """Return freed heap to the OS. A rank or regen frees hundreds of MB that
+    glibc otherwise keeps in its arenas (VPS probe 2026-09-26: 933 -> 619 MB
+    RSS after one rank)."""
+    if _MALLOC_TRIM is not None:
+        _MALLOC_TRIM(0)
+
+
 class Handler:
     """Per-user dashboard state machine.
 
@@ -1698,10 +1706,7 @@ class Handler:
         except Exception:
             logging.debug("warm_gc result=failed", exc_info=True)
             return
-        # A rank frees ~300 MB that glibc keeps in its arenas; hand it back
-        # (VPS probe 2026-09-26: RSS 933 -> 619 MB after one warm).
-        if _MALLOC_TRIM is not None:
-            _MALLOC_TRIM(0)
+        _release_freed_heap()
         logging.debug("warm_gc result=completed collected=%s", collected)
 
     @classmethod
@@ -3352,6 +3357,8 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
             )
             logging.info("regen_fetch_done")
             Handler._pool_changed()
+            gc.collect()
+            _release_freed_heap()
             logging.info("regen_rebuild_done")
             _log_llm_spend_today(db)
             reddit_worker.submit()
