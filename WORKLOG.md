@@ -1,5 +1,24 @@
 # Worklog: hn-rewrite
 
+## 2026-09-26 Test suite: 42s -> 35s serial, 15s -> 14s at -n 4
+
+- `tests/test_server.py`: its 67 `httpx.get/post/options` calls to the local
+  test server went through `local_http` (`verify=False`); each bare call
+  built a TLS context from the CA bundle (~48ms in the cloud container).
+  The file dropped from ~14s to ~9.5s single-process.
+- `test_flask_test_client_tldr_provider_error_degrades_gracefully` fetched
+  `https://example.com/...` for real through the article lane (0.4s each,
+  and a failure offline). The article fetch is now stubbed; no test makes
+  outbound HTTP (checked with a per-test httpx send hook).
+- `_wait_for_cache` polls every 1ms instead of 10ms:
+  `test_dashboard_cache_version_invariant_property` 1.95s -> 0.9s.
+- `scripts/benchmark_embeddings.py` imports `transformers` lazily (same seam
+  as `pipeline/ranking.py`), saving ~0.8s of collection per xdist worker.
+  The file was also run through `ruff format`.
+- What remains: ~4s of per-worker startup and collection, and ~35s of CPU in
+  a long tail, mostly Hypothesis property tests. Under 12s at `-n 4` would
+  mean fewer Hypothesis examples; not done.
+
 ## 2026-09-25 Ranking-quality study: baselines, hill climb, embeddings
 
 Offline only; production ranking, config and embeddings unchanged. Results

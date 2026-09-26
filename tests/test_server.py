@@ -18,6 +18,27 @@ from database import Database, Story
 import numpy as np
 
 
+class _LocalHttp:
+    """httpx's module-level helpers build a fresh client per call, and with
+    it a TLS context loaded from the CA bundle (20-50 ms each). These tests
+    only speak plain HTTP to 127.0.0.1, so skip certificate loading."""
+
+    @staticmethod
+    def get(url: str, **kwargs: Any) -> httpx.Response:
+        return httpx.get(url, verify=False, **kwargs)
+
+    @staticmethod
+    def post(url: str, **kwargs: Any) -> httpx.Response:
+        return httpx.post(url, verify=False, **kwargs)
+
+    @staticmethod
+    def options(url: str, **kwargs: Any) -> httpx.Response:
+        return httpx.options(url, verify=False, **kwargs)
+
+
+local_http = _LocalHttp()
+
+
 class MockEmbedder(Embedder):
     """Drop-in stand-in for pipeline.Embedder with no model load.
 
@@ -344,7 +365,9 @@ def test_discussion_prompts_use_freeform_headings(template: str) -> None:
 
 def test_token_redirect(app_env):
     port, _, _, _, user = app_env
-    resp = httpx.get(f"http://127.0.0.1:{port}/u/{user.token}", follow_redirects=False)
+    resp = local_http.get(
+        f"http://127.0.0.1:{port}/u/{user.token}", follow_redirects=False
+    )
     assert resp.status_code == 302
     assert resp.headers["Location"] == "../"
     assert "hn_token" in resp.headers.get("Set-Cookie", "")
@@ -355,7 +378,7 @@ def test_token_redirect_unknown_token_does_not_create_user(app_env):
     with db.conn() as conn:
         before = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
 
-    resp = httpx.get(
+    resp = local_http.get(
         f"http://127.0.0.1:{port}/u/not-a-real-token",
         follow_redirects=False,
     )
@@ -368,7 +391,7 @@ def test_token_redirect_unknown_token_does_not_create_user(app_env):
 
 def test_first_visit_serves_dashboard_and_sets_cookie(app_env):
     port, _, _, _, _ = app_env
-    resp = httpx.get(f"http://127.0.0.1:{port}/", follow_redirects=False)
+    resp = local_http.get(f"http://127.0.0.1:{port}/", follow_redirects=False)
     assert resp.status_code == 200
     assert "Location" not in resp.headers
     assert "hn_token" in resp.headers.get("Set-Cookie", "")
@@ -380,7 +403,7 @@ def test_dashboard_route_no_user_creates_token_inline(app_env):
     with db.conn() as conn:
         before = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
 
-    resp = httpx.get(f"http://127.0.0.1:{port}/", follow_redirects=False)
+    resp = local_http.get(f"http://127.0.0.1:{port}/", follow_redirects=False)
 
     assert resp.status_code == 200
     assert "Location" not in resp.headers
@@ -390,7 +413,7 @@ def test_dashboard_route_no_user_creates_token_inline(app_env):
     assert after == before + 1
 
     cookie = resp.headers["Set-Cookie"].split(";", 1)[0].split("=", 1)[1]
-    follow = httpx.get(f"http://127.0.0.1:{port}/", cookies={"hn_token": cookie})
+    follow = local_http.get(f"http://127.0.0.1:{port}/", cookies={"hn_token": cookie})
     assert follow.status_code == 200
     with db.conn() as conn:
         persisted = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
@@ -402,7 +425,7 @@ def test_unknown_cookie_does_not_create_user(app_env) -> None:
     with db.conn() as conn:
         before = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
 
-    resp = httpx.get(
+    resp = local_http.get(
         f"http://127.0.0.1:{port}/api/user",
         cookies={"hn_token": "forged-token"},
     )
@@ -424,12 +447,12 @@ def test_dashboard_route_session_creation_limit_uses_forwarded_for(
     )
     headers = {"X-Forwarded-For": "203.0.113.10, 127.0.0.1"}
 
-    first = httpx.get(
+    first = local_http.get(
         f"http://127.0.0.1:{port}/",
         headers=headers,
         follow_redirects=False,
     )
-    second = httpx.get(
+    second = local_http.get(
         f"http://127.0.0.1:{port}/",
         headers=headers,
         follow_redirects=False,
@@ -453,7 +476,7 @@ def test_session_creation_limit_ignores_spoofed_leftmost_forwarded_for(
     )
 
     statuses = [
-        httpx.get(
+        local_http.get(
             f"http://127.0.0.1:{port}/",
             headers={"X-Forwarded-For": f"198.51.100.{i}, 203.0.113.20, ::1"},
             follow_redirects=False,
@@ -491,13 +514,13 @@ def test_dashboard_authenticated_visit_does_not_consume_session_creation_quota(
     )
     headers = {"X-Forwarded-For": "203.0.113.11"}
 
-    authenticated = httpx.get(
+    authenticated = local_http.get(
         f"http://127.0.0.1:{port}/",
         headers=headers,
         cookies={"hn_token": user.token},
         follow_redirects=False,
     )
-    anonymous = httpx.get(
+    anonymous = local_http.get(
         f"http://127.0.0.1:{port}/",
         headers=headers,
         follow_redirects=False,
@@ -516,12 +539,12 @@ def test_token_redirect_profile_link_limit_uses_forwarded_for(test_env) -> None:
     )
     headers = {"X-Forwarded-For": "203.0.113.12, 127.0.0.1"}
 
-    first = httpx.get(
+    first = local_http.get(
         f"http://127.0.0.1:{port}/u/{user.token}",
         headers=headers,
         follow_redirects=False,
     )
-    second = httpx.get(
+    second = local_http.get(
         f"http://127.0.0.1:{port}/u/{user.token}",
         headers=headers,
         follow_redirects=False,
@@ -540,7 +563,7 @@ def test_static_serving(test_env):
     # The skeleton queued a warm for the live version.
     _wait_for_cache(handler, user, handler._dashboard_version(user.id), timeout=3.0)
     # Now HTTP request should hit the cache
-    resp = httpx.get(
+    resp = local_http.get(
         f"http://127.0.0.1:{port}/",
         cookies={"hn_token": user.token},
         follow_redirects=True,
@@ -579,7 +602,7 @@ def test_feedback_post(test_env):
         "story_id": 999,
         "action": "up",
     }
-    resp = httpx.post(
+    resp = local_http.post(
         f"http://127.0.0.1:{port}/api/feedback",
         json=feedback_payload,
         cookies={"hn_token": user.token},
@@ -615,7 +638,7 @@ def test_feedback_post_rejects_invalid_action(test_env: Any) -> None:
     )
     regen_event.clear()
 
-    resp = httpx.post(
+    resp = local_http.post(
         f"http://127.0.0.1:{port}/api/feedback",
         json={"story_id": 998, "action": "sideways"},
         cookies={"hn_token": user.token},
@@ -634,7 +657,7 @@ def test_feedback_post_rejects_malformed_story_id(test_env: Any) -> None:
     regen_event.clear()
 
     for story_id in ("999", None, True):
-        resp = httpx.post(
+        resp = local_http.post(
             f"http://127.0.0.1:{port}/api/feedback",
             json={"story_id": story_id, "action": "up"},
             cookies={"hn_token": user.token},
@@ -666,7 +689,7 @@ def test_feedback_post_invalidates_cache_and_defers_warm_until_idle(test_env):
     starting_version = handler._dashboard_version(user.id)
     assert starting_version == handler._pool_generation
 
-    resp = httpx.post(
+    resp = local_http.post(
         f"http://127.0.0.1:{port}/api/feedback",
         json={"story_id": 1000, "action": "up", "queue_remaining": 8},
         cookies={"hn_token": user.token},
@@ -716,7 +739,7 @@ def test_feedback_vote_threshold_queues_one_latest_warm(
         )
 
     responses = [
-        httpx.post(
+        local_http.post(
             f"http://127.0.0.1:{port}/api/feedback",
             json={"story_id": story_id, "action": "neutral"},
             cookies={"hn_token": user.token},
@@ -800,19 +823,19 @@ def test_feedback_regen_timer_resets_across_users_and_signals_once(
             )
         )
 
-    first = httpx.post(
+    first = local_http.post(
         f"http://127.0.0.1:{port}/api/feedback",
         json={"story_id": 1300, "action": "up"},
         cookies={"hn_token": user.token},
     )
     assert first.status_code == 200
-    second = httpx.post(
+    second = local_http.post(
         f"http://127.0.0.1:{port}/api/feedback",
         json={"story_id": 1301, "action": "down"},
         cookies={"hn_token": other_user.token},
     )
     assert second.status_code == 200
-    third = httpx.post(
+    third = local_http.post(
         f"http://127.0.0.1:{port}/api/feedback",
         json={"story_id": 1302, "action": "neutral"},
         cookies={"hn_token": user.token},
@@ -881,13 +904,13 @@ def test_feedback_post_limit_returns_429_without_write(test_env) -> None:
         )
     regen_event.clear()
 
-    first = httpx.post(
+    first = local_http.post(
         f"http://127.0.0.1:{port}/api/feedback",
         json={"story_id": 1100, "action": "up"},
         cookies={"hn_token": user.token},
     )
     feedback_regen_timer = handler._feedback_regen_timer
-    second = httpx.post(
+    second = local_http.post(
         f"http://127.0.0.1:{port}/api/feedback",
         json={"story_id": 1101, "action": "down"},
         cookies={"hn_token": user.token},
@@ -926,7 +949,7 @@ def test_feedback_post_rejects_cross_site_posts(
     )
     regen_event.clear()
 
-    resp = httpx.post(
+    resp = local_http.post(
         f"http://127.0.0.1:{port}/api/feedback",
         json={"story_id": 1102, "action": "up"},
         headers=headers,
@@ -954,7 +977,7 @@ def test_feedback_post_accepts_same_origin_post(test_env) -> None:
         )
     )
 
-    resp = httpx.post(
+    resp = local_http.post(
         f"http://127.0.0.1:{port}/api/feedback",
         json={"story_id": 1103, "action": "up"},
         headers={"Origin": f"http://127.0.0.1:{port}", "Sec-Fetch-Site": "same-origin"},
@@ -986,7 +1009,7 @@ def test_feedback_post_invalidates_cache_with_low_queue(test_env):
 
     starting_version = handler._dashboard_version(user.id)
 
-    resp = httpx.post(
+    resp = local_http.post(
         f"http://127.0.0.1:{port}/api/feedback",
         json={"story_id": 1001, "action": "up", "queue_remaining": 4},
         cookies={"hn_token": user.token},
@@ -1019,7 +1042,7 @@ def test_feedback_post_refreshes_when_client_requests_ranking(test_env):
     )
     regen_event.clear()
 
-    resp = httpx.post(
+    resp = local_http.post(
         f"http://127.0.0.1:{port}/api/feedback",
         json={
             "story_id": 1002,
@@ -1086,7 +1109,7 @@ def test_feedback_post_bumps_cache_version_for_warm_rerender(test_env, monkeypat
     pre_version = handler._dashboard_version(user.id)
     assert pre_version == handler._pool_generation
 
-    resp = httpx.post(
+    resp = local_http.post(
         f"http://127.0.0.1:{port}/api/feedback",
         json={"story_id": voted_story.id, "action": "up", "queue_remaining": 6},
         cookies={"hn_token": user.token},
@@ -1132,7 +1155,7 @@ def test_feedback_clear(test_env):
         "story_id": 999,
         "action": "clear",
     }
-    resp = httpx.post(
+    resp = local_http.post(
         f"http://127.0.0.1:{port}/api/feedback",
         json=clear_payload,
         cookies={"hn_token": user.token},
@@ -1170,7 +1193,7 @@ def test_feedback_clear_without_existing_vote_is_noop(test_env) -> None:
     assert db.get_all_feedback(user.id) == []
     regen_event.clear()
 
-    resp = httpx.post(
+    resp = local_http.post(
         f"http://127.0.0.1:{port}/api/feedback",
         json={"story_id": 4242, "action": "clear"},
         cookies={"hn_token": user.token},
@@ -1199,7 +1222,7 @@ def test_feedback_clear_then_revote_creates_new_record(test_env):
     )
 
     for action in ("up", "clear", "down"):
-        resp = httpx.post(
+        resp = local_http.post(
             f"http://127.0.0.1:{port}/api/feedback",
             json={"story_id": 1003, "action": action},
             cookies={"hn_token": user.token},
@@ -1217,7 +1240,7 @@ def test_feedback_clear_then_revote_creates_new_record(test_env):
 def test_ranking_ready_rejects_invalid_version(test_env, version: str) -> None:
     port, _, _, _, user = test_env
 
-    resp = httpx.get(
+    resp = local_http.get(
         f"http://127.0.0.1:{port}/api/ranking-ready?version={version}",
         cookies={"hn_token": user.token},
     )
@@ -1235,7 +1258,7 @@ def test_ranking_ready_false_when_cache_missing_or_older(test_env, monkeypatch) 
     monkeypatch.setattr(handler, "_trigger_warm", classmethod(fake_trigger_warm))
     target_version = handler._bump_user_version(user.id)
 
-    missing_resp = httpx.get(
+    missing_resp = local_http.get(
         f"http://127.0.0.1:{port}/api/ranking-ready?version={target_version}",
         cookies={"hn_token": user.token},
     )
@@ -1252,7 +1275,7 @@ def test_ranking_ready_false_when_cache_missing_or_older(test_env, monkeypatch) 
     }
 
     handler._decks[user.id] = DeckState([], time.time(), target_version - 1)
-    older_resp = httpx.get(
+    older_resp = local_http.get(
         f"http://127.0.0.1:{port}/api/ranking-ready?version={target_version}",
         cookies={"hn_token": user.token},
     )
@@ -1274,7 +1297,7 @@ def test_ranking_ready_true_only_from_cached_version(test_env, monkeypatch) -> N
     target_version = handler._bump_user_version(user.id)
     handler._decks[user.id] = DeckState([], time.time(), target_version)
 
-    resp = httpx.get(
+    resp = local_http.get(
         f"http://127.0.0.1:{port}/api/ranking-ready?version={target_version}",
         cookies={"hn_token": user.token},
     )
@@ -1297,7 +1320,7 @@ def test_ranking_ready_true_for_older_requested_version(test_env) -> None:
     newer_version = handler._bump_user_version(user.id)
     handler._decks[user.id] = DeckState([], time.time(), newer_version)
 
-    resp = httpx.get(
+    resp = local_http.get(
         f"http://127.0.0.1:{port}/api/ranking-ready?version={newer_version - 1}",
         cookies={"hn_token": user.token},
     )
@@ -1323,7 +1346,7 @@ def test_ranking_ready_returns_intermediate_cached_version(
         assert handler._bump_user_version(user.id) == expected_version
     handler._decks[user.id] = DeckState([], time.time(), 3)
 
-    resp = httpx.get(
+    resp = local_http.get(
         f"http://127.0.0.1:{port}/api/ranking-ready?min_version=2&target_version=4",
         cookies={"hn_token": user.token},
     )
@@ -1346,7 +1369,7 @@ def test_ranking_ready_version_param_remains_compat_alias(test_env) -> None:
     target_version = handler._bump_user_version(user.id)
     handler._decks[user.id] = DeckState([], time.time(), target_version)
 
-    resp = httpx.get(
+    resp = local_http.get(
         f"http://127.0.0.1:{port}/api/ranking-ready?version={target_version}",
         cookies={"hn_token": user.token},
     )
@@ -1363,7 +1386,7 @@ def _wait_for_cache(handler, user, expected_version, timeout=3.0):
         deck = handler._decks.get(user.id)
         if deck is not None and deck.version == expected_version:
             return deck
-        time.sleep(0.01)
+        time.sleep(0.001)
     raise AssertionError(
         f"Cache for user {user.id} version {expected_version} not populated within {timeout}s"
     )
@@ -1853,7 +1876,7 @@ def test_dashboard_cache_version_invariant_property(
 
 def test_cors_headers(app_env):
     port, _, _, _, _ = app_env
-    resp = httpx.options(f"http://127.0.0.1:{port}/api/feedback")
+    resp = local_http.options(f"http://127.0.0.1:{port}/api/feedback")
     assert resp.status_code == 204
     assert resp.headers.get("access-control-allow-origin") == "*"
     assert "POST" in resp.headers.get("access-control-allow-methods", "")
@@ -3264,7 +3287,16 @@ def test_flask_test_client_tldr_provider_error_degrades_gracefully(
             error_text=f"mocked provider HTTP {error_status}",
         )
 
+    async def mock_fetch_article_body_with_result(
+        url: str,
+    ) -> "server.ArticleFetchResult":
+        # No outbound request: this test is about the provider refusal.
+        return server.ArticleFetchResult(status=404, error="http_404")
+
     monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
+    monkeypatch.setattr(
+        server, "_fetch_article_body_with_result", mock_fetch_article_body_with_result
+    )
 
     fresh = client.post("/api/tldr-detail", json={"story_id": 1722})
     stale = client.post("/api/tldr-detail", json={"story_id": 1723})
@@ -3759,7 +3791,7 @@ async def test_reddit_rss_context_caps_comments_and_cached_chars(monkeypatch):
 def test_tldr_handler_returns_404_for_missing_story(app_env):
     port, _, _, _, user = app_env
 
-    resp = httpx.post(
+    resp = local_http.post(
         f"http://127.0.0.1:{port}/api/tldr-detail",
         json={"story_id": 987654321},
         cookies={"hn_token": user.token},
@@ -3812,7 +3844,7 @@ def test_tldr_detail_fetches_reddit_rss_comments(test_env, monkeypatch):
     )
     monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
 
-    resp = httpx.post(
+    resp = local_http.post(
         f"http://127.0.0.1:{port}/api/tldr-detail",
         json={"story_id": -1234},
         cookies={"hn_token": user.token},
@@ -3882,7 +3914,7 @@ def test_tldr_detail_dynamic_fetch(test_env, monkeypatch):
     monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
 
     # Request TLDR
-    resp = httpx.post(
+    resp = local_http.post(
         f"http://127.0.0.1:{port}/api/tldr-detail",
         json={"story_id": 777},
         cookies={"hn_token": user.token},
@@ -3941,7 +3973,7 @@ def test_tldr_detail_hydrates_archive_seed_comments_on_demand(
     )
     monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
 
-    resp = httpx.post(
+    resp = local_http.post(
         f"http://127.0.0.1:{port}/api/tldr-detail",
         json={"story_id": story_id},
         cookies={"hn_token": user.token},
@@ -3985,12 +4017,12 @@ def test_tldr_detail_uses_cached_summary(test_env, monkeypatch):
 
     monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
 
-    resp1 = httpx.post(
+    resp1 = local_http.post(
         f"http://127.0.0.1:{port}/api/tldr-detail",
         json={"story_id": 778},
         cookies={"hn_token": user.token},
     )
-    resp2 = httpx.post(
+    resp2 = local_http.post(
         f"http://127.0.0.1:{port}/api/tldr-detail",
         json={"story_id": 778},
         cookies={"hn_token": user.token},
@@ -4062,12 +4094,12 @@ def test_tldr_cached_response_bypasses_uncached_quota(test_env, monkeypatch) -> 
 
     monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
 
-    first = httpx.post(
+    first = local_http.post(
         f"http://127.0.0.1:{port}/api/tldr-detail",
         json={"story_id": uncached_story.id},
         cookies={"hn_token": user.token},
     )
-    second = httpx.post(
+    second = local_http.post(
         f"http://127.0.0.1:{port}/api/tldr-detail",
         json={"story_id": cached_story.id},
         cookies={"hn_token": user.token},
@@ -4120,12 +4152,12 @@ def test_tldr_uncached_per_session_limit_blocks_generation(
 
     monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
 
-    first = httpx.post(
+    first = local_http.post(
         f"http://127.0.0.1:{port}/api/tldr-detail",
         json={"story_id": 782},
         cookies={"hn_token": user.token},
     )
-    second = httpx.post(
+    second = local_http.post(
         f"http://127.0.0.1:{port}/api/tldr-detail",
         json={"story_id": 783},
         cookies={"hn_token": user.token},
@@ -4179,12 +4211,12 @@ def test_tldr_uncached_global_limit_blocks_second_session(
 
     monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
 
-    first = httpx.post(
+    first = local_http.post(
         f"http://127.0.0.1:{port}/api/tldr-detail",
         json={"story_id": 784},
         cookies={"hn_token": user.token},
     )
-    second = httpx.post(
+    second = local_http.post(
         f"http://127.0.0.1:{port}/api/tldr-detail",
         json={"story_id": 785},
         cookies={"hn_token": other_user.token},
@@ -4227,12 +4259,12 @@ def test_tldr_detail_does_not_cache_placeholder(test_env, monkeypatch):
 
     monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
 
-    resp1 = httpx.post(
+    resp1 = local_http.post(
         f"http://127.0.0.1:{port}/api/tldr-detail",
         json={"story_id": 779},
         cookies={"hn_token": user.token},
     )
-    resp2 = httpx.post(
+    resp2 = local_http.post(
         f"http://127.0.0.1:{port}/api/tldr-detail",
         json={"story_id": 779},
         cookies={"hn_token": user.token},
@@ -4272,7 +4304,7 @@ def test_tldr_partial_response_remains_retryable(
         )
 
     monkeypatch.setattr(server, "generate_detailed_tldr", generate)
-    response = httpx.post(
+    response = local_http.post(
         f"http://127.0.0.1:{port}/api/tldr-detail",
         json={"story_id": 780},
         cookies={"hn_token": user.token},
@@ -5345,7 +5377,7 @@ def test_tldr_detail_fetches_lesswrong_comments(test_env, monkeypatch):
     )
     monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
 
-    resp = httpx.post(
+    resp = local_http.post(
         f"http://127.0.0.1:{port}/api/tldr-detail",
         json={"story_id": -3000},
         cookies={"hn_token": user.token},
@@ -5384,7 +5416,7 @@ def test_dashboard_renders_user_vote_counts_zero_for_no_feedback(test_env):
     port, db, regen_event, handler, user = test_env
     assert handler._render_dashboard_for_user(user) == SKELETON_HTML
     _wait_for_cache(handler, user, handler._dashboard_version(user.id), timeout=3.0)
-    resp = httpx.get(
+    resp = local_http.get(
         f"http://127.0.0.1:{port}/",
         cookies={"hn_token": user.token},
         follow_redirects=True,
@@ -5429,7 +5461,7 @@ def test_dashboard_renders_user_vote_counts_with_feedback(test_env):
 
     assert handler._render_dashboard_for_user(user) == SKELETON_HTML
     _wait_for_cache(handler, user, handler._dashboard_version(user.id), timeout=3.0)
-    resp = httpx.get(
+    resp = local_http.get(
         f"http://127.0.0.1:{port}/",
         cookies={"hn_token": user.token},
         follow_redirects=True,
@@ -5470,7 +5502,7 @@ def test_dashboard_vote_counts_aggregate_across_refreshes(test_env):
 
     assert handler._render_dashboard_for_user(user) == SKELETON_HTML
     _wait_for_cache(handler, user, handler._dashboard_version(user.id), timeout=3.0)
-    resp = httpx.get(
+    resp = local_http.get(
         f"http://127.0.0.1:{port}/",
         cookies={"hn_token": user.token},
         follow_redirects=True,
@@ -5487,7 +5519,7 @@ def test_dashboard_vote_counts_aggregate_across_refreshes(test_env):
 
 def test_dashboard_skeleton_returns_when_no_cache(test_env):
     port, db, regen_event, _, user = test_env
-    resp = httpx.get(
+    resp = local_http.get(
         f"http://127.0.0.1:{port}/",
         cookies={"hn_token": "test_token"},
         follow_redirects=True,
@@ -5810,7 +5842,7 @@ def test_rendered_cards_carry_client_contract_attributes(test_env):
     )
     handler._render_dashboard_for_user(user)
     _wait_for_cache(handler, user, handler._dashboard_version(user.id), timeout=3.0)
-    resp = httpx.get(
+    resp = local_http.get(
         f"http://127.0.0.1:{port}/",
         cookies={"hn_token": user.token},
         follow_redirects=True,
@@ -5878,12 +5910,12 @@ def test_deck_cards_returns_only_card_fragment(test_env) -> None:
     handler._render_dashboard_for_user(user)
     _wait_for_cache(handler, user, handler._dashboard_version(user.id), timeout=3.0)
 
-    full = httpx.get(
+    full = local_http.get(
         f"http://127.0.0.1:{port}/",
         cookies={"hn_token": user.token},
         follow_redirects=True,
     )
-    fragment_resp = httpx.get(
+    fragment_resp = local_http.get(
         f"http://127.0.0.1:{port}/api/deck-cards",
         cookies={"hn_token": user.token},
     )
@@ -5925,7 +5957,7 @@ def test_deck_cards_triggers_warm_on_stale_cache(
         classmethod(lambda cls, warm_user, version, delay_s=0.0: calls.append(version)),
     )
 
-    response = httpx.get(
+    response = local_http.get(
         f"http://127.0.0.1:{port}/api/deck-cards",
         cookies={"hn_token": user.token},
     )
@@ -5954,7 +5986,7 @@ def test_deck_cards_does_not_warm_when_cache_is_current(
         classmethod(lambda cls, warm_user, version, delay_s=0.0: calls.append(version)),
     )
 
-    response = httpx.get(
+    response = local_http.get(
         f"http://127.0.0.1:{port}/api/deck-cards",
         cookies={"hn_token": user.token},
     )
@@ -6066,7 +6098,7 @@ def test_on_demand_tldr_records_fetch_failure(test_env, monkeypatch):
     monkeypatch.setattr(server, "_fetch_article_body_with_result", mock_fetch)
     monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_tldr)
 
-    resp = httpx.post(
+    resp = local_http.post(
         f"http://127.0.0.1:{port}/api/tldr-detail",
         json={"story_id": 1001},
         cookies={"hn_token": user.token},
@@ -6123,7 +6155,7 @@ def test_on_demand_tldr_clears_failure_on_success(test_env, monkeypatch):
     monkeypatch.setattr(server, "_fetch_article_body_with_result", mock_fetch)
     monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_tldr)
 
-    resp = httpx.post(
+    resp = local_http.post(
         f"http://127.0.0.1:{port}/api/tldr-detail",
         json={"story_id": sid},
         cookies={"hn_token": user.token},
