@@ -337,4 +337,4 @@ chmod 600 ../shared/.env
 
 ## Testing notes
 
-- **Curl sessions**: first-visit `GET /` creates one user, sets `hn_token`, and serves the dashboard directly. `/u/<token>` only imports an existing profile onto a new device. Always use `-c cookie.txt -b cookie.txt` when testing live API flows with curl so subsequent requests keep the same profile.
+- **Curl sessions**: first-visit `GET /` creates one user, sets `hn_token`, and serves the dashboard directly. `/u/<token>` only imports an existing profile onto a new device (a device that already holds a different profile gets a confirm page; the switch is a same-origin POST). Always use `-c cookie.txt -b cookie.txt` when testing live API flows with curl so subsequent requests keep the same profile.

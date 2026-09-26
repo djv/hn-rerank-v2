@@ -6640,3 +6640,153 @@ async def test_generate_detailed_tldr_records_usage_via_global_recorder(
     finally:
         server.set_llm_usage_recorder(old)
         db.close()
+
+
+def _article_only_story(story_id: int) -> Story:
+    return Story(
+        id=story_id,
+        title=f"Article story {story_id}",
+        url=f"https://example.com/article-{story_id}",
+        score=10,
+        time=1600000000,
+        text_content="Story body.",
+        source="hn",
+        comment_count=0,
+        self_text="",
+        top_comments="",
+        article_body="Story body.",
+    )
+
+
+def test_profile_link_asks_before_replacing_another_live_session(
+    test_env: Any,
+) -> None:
+    """Another site can link a visitor to /u/<its token>; a GET must not
+    silently swap the visitor's existing profile. Only a same-origin POST
+    switches; a device without a profile still switches in one click."""
+    _, db, _, handler, user = test_env
+    other = db.create_user("other_profile_token")
+    app = create_app(handler)
+
+    def client_with(token: str | None) -> Any:
+        client = app.test_client()
+        if token is not None:
+            client.set_cookie("hn_token", token)
+        return client
+
+    ask = client_with(other.token).get(f"/u/{user.token}")
+    assert ask.status_code == 200
+    assert "Set-Cookie" not in ask.headers
+    assert ask.headers["Referrer-Policy"] == "no-referrer"
+    assert b'<form method="post">' in ask.data
+
+    cross = client_with(other.token).post(
+        f"/u/{user.token}", headers={"Sec-Fetch-Site": "cross-site"}
+    )
+    assert cross.status_code == 403
+    assert "Set-Cookie" not in cross.headers
+
+    switch = client_with(other.token).post(
+        f"/u/{user.token}", headers={"Sec-Fetch-Site": "same-origin"}
+    )
+    assert switch.status_code == 302
+    assert switch.headers["Set-Cookie"].startswith(f"hn_token={user.token}")
+
+    for token in (None, user.token, "stale-token-not-in-db"):
+        direct = client_with(token).get(f"/u/{user.token}")
+        assert direct.status_code == 302
+        assert direct.headers["Set-Cookie"].startswith(f"hn_token={user.token}")
+
+
+@pytest.mark.parametrize(
+    ("proto", "secure"), [("https", True), ("http", False), (None, False)]
+)
+def test_session_cookie_is_secure_only_over_https(
+    test_env: Any, proto: str | None, secure: bool
+) -> None:
+    _, _, _, handler, user = test_env
+    app = create_app(handler)
+    headers = {"X-Forwarded-Proto": proto} if proto else {}
+
+    for path in ("/", f"/u/{user.token}"):
+        cookie = app.test_client().get(path, headers=headers).headers["Set-Cookie"]
+        assert cookie.startswith("hn_token=")
+        assert ("; Secure" in cookie) is secure
+
+
+@pytest.mark.parametrize("path", ["/api/feedback", "/api/tldr-detail"])
+@pytest.mark.parametrize("body", ["[]", "1", '"story"', "null"])
+def test_non_object_json_bodies_are_bad_requests(
+    test_env: Any, path: str, body: str
+) -> None:
+    _, _, _, handler, user = test_env
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+
+    resp = client.post(path, data=body, content_type="application/json")
+
+    assert resp.status_code == 400
+
+
+def test_vote_on_unknown_story_is_404_without_spending_quota(
+    test_env: Any,
+) -> None:
+    _, db, _, handler, user = test_env
+    handler.config = replace(handler.config, feedback_per_user_limit=1)
+    db.upsert_story(_article_only_story(1901))
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+
+    missing = client.post(
+        "/api/feedback", json={"story_id": 99_999_991, "action": "up"}
+    )
+    real = client.post("/api/feedback", json={"story_id": 1901, "action": "up"})
+
+    assert missing.status_code == 404
+    assert real.status_code == 200
+
+
+def test_tldr_generation_cap_serves_stale_or_busy_and_always_releases(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Over the concurrency cap, a request gets the stale TLDR or a short
+    429 without calling the LLM or spending quota; a held slot is released
+    however the request ends, including when generation raises."""
+    import server
+
+    _, db, _, handler, user = test_env
+    for story_id in (1902, 1903):
+        db.upsert_story(_article_only_story(story_id))
+    db.upsert_tldr_cache(1903, "old-key", "Old TLDR")
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+    llm_calls: list[str] = []
+
+    async def fail_generate(
+        title: str, self_text: str, top_comments: str, article_body: str
+    ) -> "server.TldrResult":
+        llm_calls.append(title)
+        raise RuntimeError("provider exploded")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", fail_generate)
+
+    handler.config = replace(
+        handler.config,
+        tldr_max_concurrent_generations=0,
+        tldr_uncached_per_user_limit=1,
+    )
+    busy = client.post("/api/tldr-detail", json={"story_id": 1902})
+    stale = client.post(
+        "/api/tldr-detail", json={"story_id": 1903, "force_refresh": True}
+    )
+    assert busy.status_code == 429
+    assert busy.headers["Retry-After"] == "5"
+    assert stale.status_code == 200
+    assert stale.get_json()["tldr"] == "Old TLDR"
+    assert llm_calls == []
+
+    handler.config = replace(handler.config, tldr_max_concurrent_generations=1)
+    failed = client.post("/api/tldr-detail", json={"story_id": 1902})
+    assert llm_calls == ["Article story 1902"]
+    assert failed.status_code >= 400
+    assert handler._tldr_generations == 0

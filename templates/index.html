@@ -1880,7 +1880,7 @@
     }
 
     async function fetchRefillCards() {
-      const resp = await fetch('/api/feed', { cache: 'no-store' });
+      const resp = await fetch(apiPath('/api/feed'), { cache: 'no-store' });
       if (!resp.ok) throw new Error(`Refill failed: ${resp.status}`);
       const feed = await resp.json();
       if (feed.api_version !== 1 || !Array.isArray(feed.stories)) {

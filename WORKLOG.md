@@ -1,5 +1,36 @@
 # Worklog: hn-rewrite
 
+## 2026-09-26 Server review fixes, round 2
+
+- `/u/<token>` no longer silently replaces a different live profile: `GET`
+  shows a confirm page, the switch is a same-origin `POST`. A device with no
+  (or a dead) profile still switches in one click.
+- Session cookie gets `Secure` when `X-Forwarded-Proto` is `https`. Unverified
+  on the VPS whether Funnel/Caddy send `https`; if not, the cookie is
+  unchanged (no breakage). Check `Set-Cookie` through Funnel after deploy.
+- Uncached TLDR generations capped at `tldr_max_concurrent_generations = 8`
+  (all users); over the cap: stale TLDR or `429` + `Retry-After: 5`, no quota
+  spent. Slot released in `teardown_request`, including on exceptions.
+- Non-object JSON bodies to `/api/feedback` and `/api/tldr-detail` return 400
+  (were 500); a vote on an unknown story returns 404 before spending quota
+  (was an FK IntegrityError 500). New `Database.story_exists`.
+- Card links keep only http(s) schemes (`_web_url`); property test against a
+  WHATWG-style scheme spec with tab/newline/control-char tricks.
+- Reddit circuit breaker (from the cloud review): a half-open probe whose
+  caller never reported (network error or non-200/429 status; neither call
+  site reports those) left `_probing` set, so every later `acquire()` failed
+  until restart. An unreported probe now counts as failed after a full
+  `CIRCUIT_COOLDOWN` and the next probe is admitted.
+- `pipeline/ranking.py`: removed 10 always-true `if trace is not None:`
+  guards (`trace` defaults to `NULL_TRACE`, never None); the SVM training
+  feature prep lived inside one, so a `trace=None` caller would have hit a
+  NameError. Checked equal by AST to the old code with the guards removed.
+- Cloud review (compacted `review/all` branch) also flagged the documented
+  SSRF DNS-rebinding window (kept as accepted) and a "duplicate" `rss_`
+  strip in `render.py` (intentional, for legacy `rss_rss_*` rows).
+- Deck refill fetches `apiPath('/api/feed')` (was a hard-coded `/api/feed`
+  that only worked because Caddy also proxies bare `/api/*`).
+
 ## 2026-09-26 TUI review fixes: stable Explore, terminal-safe text
 
 - Explore reshuffled on every rebuild (each vote, and every second while the

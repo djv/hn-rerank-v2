@@ -664,11 +664,19 @@ def test_refill_cards_come_from_feed_and_date_view_ignores_age() -> None:
         "fetchRefillCards",
         "matchesCurrentCombo",
         "matchesCurrentAxes",
+        "routePrefix",
+        "apiPath",
     )
     result = run_node(
         _FEED_DOM_STUBS
         + f"const FEED = {json.dumps(feed)};\n"
-        + "async function fetch() { return { ok: true, json: async () => FEED }; }\n"
+        # Served under the /hn prefix: the feed must be fetched there too.
+        + "const window = { location: { pathname: '/hn/' } };\n"
+        + "const fetched = [];\n"
+        + "async function fetch(url) {\n"
+        + "  fetched.push(url);\n"
+        + "  return { ok: true, json: async () => FEED };\n"
+        + "}\n"
         + functions
         + r"""
 (async () => {
@@ -681,11 +689,12 @@ def test_refill_cards_come_from_feed_and_date_view_ignores_age() -> None:
       .filter(c => matchesCurrentCombo(c) && matchesCurrentAxes(c))
       .map(c => Number(c.dataset.storyId));
   }
-  console.log(JSON.stringify({ visible, title: textOf(cards[0]) }));
+  console.log(JSON.stringify({ visible, fetched, title: textOf(cards[0]) }));
 })().catch(e => console.log(JSON.stringify({ error: String(e.stack) })));
 """
     )
     assert "error" not in result, result.get("error")
+    assert result["fetched"] == ["/hn/api/feed"]
     assert result["visible"] == {
         "date:recent": [1],
         "date:archive": [1],

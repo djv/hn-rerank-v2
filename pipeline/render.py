@@ -166,6 +166,18 @@ def _get_pico_css() -> str:
     return _pico_css_cache
 
 
+def _web_url(url: str | None) -> str:
+    """The URL if it is http(s), else "": card links go into href and
+    window.open, and third-party feeds are untrusted (javascript:, data:)."""
+    if not url:
+        return ""
+    try:
+        scheme = urlparse(url.strip()).scheme.lower()
+    except ValueError:
+        return ""
+    return url if scheme in ("http", "https") else ""
+
+
 def _domain_of(*urls: str) -> str:
     """First registrable-looking hostname across the given URLs.
 
@@ -305,8 +317,8 @@ def _build_dashboard_cards(
                 # Every card kept below is in another view, so in Date.
                 sort_date_attr="1",
                 is_recent_attr="1" if item.is_recent else "0",
-                article_url=story.url or "",
-                comments_url=story.discussion_url or "",
+                article_url=_web_url(story.url),
+                comments_url=_web_url(story.discussion_url),
                 domain=_domain_of(story.url or "", story.discussion_url or ""),
                 source_label=source_label_filter(story.source),
                 time_ago=time_ago_filter(story.time),

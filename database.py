@@ -711,6 +711,13 @@ class Database:
                 return None
             return self._row_to_story(row)
 
+    def story_exists(self, story_id: int) -> bool:
+        with self.conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM stories WHERE id = ?", (story_id,)
+            ).fetchone()
+            return row is not None
+
     def get_stories(self, ids: list[int]) -> list[Story]:
         if not ids:
             return []

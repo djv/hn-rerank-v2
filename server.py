@@ -29,7 +29,8 @@ import justext
 import trafilatura
 from bs4 import BeautifulSoup
 from bs4.element import Tag
-from flask import Flask, Response, jsonify, redirect, request
+from flask import Flask, Response, g, jsonify, redirect, request
+from werkzeug.wrappers import Response as BaseResponse
 from flask.typing import ResponseReturnValue
 import httpx
 
@@ -528,6 +529,7 @@ def _is_low_signal_reddit_comment(author: str, text: str) -> bool:
 LESSWRONG_COMMENT_LIMIT = 20
 MAX_CONTENT_LENGTH = 10**6  # 1MB cap on POST bodies
 MAX_INTERACTION_EVENTS = 64
+TLDR_BUSY_RETRY_AFTER_SECONDS = 5
 INTERACTION_EVENT_REQUESTS_PER_MINUTE = 120
 INTERACTION_EVENT_GLOBAL_REQUESTS_PER_MINUTE = 10_000
 
@@ -1466,10 +1468,28 @@ class Handler:
     _feedback_regen_timer: threading.Timer | None = None
     _feedback_regen_guard = threading.Lock()
     _public_demo_limiter = FixedWindowLimiter()
+    # Uncached TLDR generations in flight (hydration + LLM, up to ~2 min
+    # each). Capped so a burst can't pile up request threads that also
+    # contend for the DB pool with warms and regen.
+    _tldr_generations = 0
+    _tldr_generations_guard = threading.Lock()
 
     @classmethod
     def reset_public_demo_limiter(cls) -> None:
         cls._public_demo_limiter = FixedWindowLimiter()
+
+    @classmethod
+    def _try_start_tldr_generation(cls) -> bool:
+        with cls._tldr_generations_guard:
+            if cls._tldr_generations >= cls.config.tldr_max_concurrent_generations:
+                return False
+            cls._tldr_generations += 1
+            return True
+
+    @classmethod
+    def _finish_tldr_generation(cls) -> None:
+        with cls._tldr_generations_guard:
+            cls._tldr_generations = max(0, cls._tldr_generations - 1)
 
     @classmethod
     def _render_deck(
@@ -1897,15 +1917,23 @@ def _no_cache_dashboard_response(
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
     if set_session_cookie and user is not None:
-        response.set_cookie(
-            "hn_token",
-            user.token,
-            max_age=31536000,
-            path="/",
-            samesite="Lax",
-            httponly=True,
-        )
+        _set_session_cookie(response, user.token)
     return response
+
+
+def _set_session_cookie(response: BaseResponse, token: str) -> None:
+    # Secure only when the proxy reports https: the app is also reachable
+    # over plain http, where a Secure cookie would never be stored.
+    origin = _flask_request_origin()
+    response.set_cookie(
+        "hn_token",
+        token,
+        max_age=31536000,
+        path="/",
+        samesite="Lax",
+        httponly=True,
+        secure=origin is not None and origin[0] == "https",
+    )
 
 
 def _flask_json_response(
@@ -2136,6 +2164,10 @@ def _handle_flask_feedback(runtime: type[Handler]) -> Response:
                 {"error": "Invalid JSON body"}, status=HTTPStatus.BAD_REQUEST
             )
 
+        if not isinstance(data, dict):
+            return _flask_json_response(
+                {"error": "Invalid feedback"}, status=HTTPStatus.BAD_REQUEST
+            )
         story_id = data.get("story_id")
         action = data.get("action")
         if (
@@ -2145,6 +2177,13 @@ def _handle_flask_feedback(runtime: type[Handler]) -> Response:
         ):
             return _flask_json_response(
                 {"error": "Invalid feedback"}, status=HTTPStatus.BAD_REQUEST
+            )
+
+        # Votes reference stories (FK); an unknown id would otherwise fail
+        # the insert as a 500 after spending a quota slot.
+        if action != "clear" and not runtime.db.story_exists(story_id):
+            return _flask_json_response(
+                {"error": "Story not found"}, status=HTTPStatus.NOT_FOUND
             )
 
         quota = _acquire_feedback_quota(runtime, user)
@@ -2511,7 +2550,7 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
                 {"error": "Invalid JSON body"}, status=HTTPStatus.BAD_REQUEST
             )
 
-        story_id_raw = data.get("story_id")
+        story_id_raw = data.get("story_id") if isinstance(data, dict) else None
         if not isinstance(story_id_raw, int) or isinstance(story_id_raw, bool):
             return _flask_json_response(
                 {"error": "Invalid request: story_id must be an integer"},
@@ -2613,6 +2652,18 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             return _flask_json_response(
                 {"error": "No session"}, status=HTTPStatus.UNAUTHORIZED
             )
+
+        # Before the quota, so a busy rejection doesn't spend it. Released
+        # by the app's teardown_request hook however the request ends.
+        if not runtime._try_start_tldr_generation():
+            fallback = _stale_tldr_fallback_response(runtime.db, story.id, "busy")
+            if fallback:
+                return fallback
+            return _flask_rate_limit_response(
+                "Summaries are busy. Please try again in a few seconds.",
+                TLDR_BUSY_RETRY_AFTER_SECONDS,
+            )
+        g.tldr_generation_runtime = runtime
 
         quota = _acquire_tldr_uncached_quota(runtime, user)
         if not quota.allowed:
@@ -2990,14 +3041,50 @@ def _handle_flask_ranking_ready(runtime: type[Handler]) -> Response:
     )
 
 
+_PROFILE_SWITCH_PAGE = b"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Switch profile?</title></head>
+<body style="font-family: system-ui, sans-serif; max-width: 32rem; margin: 3rem auto; padding: 0 1rem">
+<h1>Switch profile?</h1>
+<p>This device already has a profile. Switching replaces it here; save its
+profile link first if you want to come back to it.</p>
+<form method="post"><button type="submit">Switch to this profile</button></form>
+<p><a href="../">Keep my current profile</a></p>
+</body></html>
+"""
+
+
+def _profile_switch_confirm_response() -> Response:
+    response = Response(
+        _PROFILE_SWITCH_PAGE,
+        status=HTTPStatus.OK,
+        content_type="text/html; charset=utf-8",
+    )
+    response.headers["Cache-Control"] = "no-store"
+    # The page URL holds a profile token; don't leak it to linked pages.
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
 def create_app(runtime: type[Handler] = Handler) -> Flask:
     app = Flask(__name__)
 
-    @app.get("/u/<path:token>")
+    @app.teardown_request
+    def release_tldr_generation(_exc: BaseException | None) -> None:
+        held = g.pop("tldr_generation_runtime", None)
+        if held is not None:
+            held._finish_tldr_generation()
+
+    @app.route("/u/<path:token>", methods=["GET", "POST"])
     def profile_link(token: str) -> ResponseReturnValue:
         token = token.strip("/")
         if not token:
             return Response(status=HTTPStatus.BAD_REQUEST)
+        if request.method == "POST":
+            cross_site_response = _flask_cross_site_post_response()
+            if cross_site_response is not None:
+                return cross_site_response
 
         quota = _acquire_profile_link_quota(runtime)
         if not quota.allowed:
@@ -3010,15 +3097,19 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
         if not user:
             return Response(status=HTTPStatus.NOT_FOUND)
 
+        # A link must not silently replace another live profile on this
+        # device (another site could link a visitor into its own profile):
+        # a plain GET only asks; the switch is a same-origin POST.
+        current = _flask_user(runtime)
+        if (
+            request.method == "GET"
+            and current is not None
+            and current.token != user.token
+        ):
+            return _profile_switch_confirm_response()
+
         response = redirect("../", code=302)
-        response.set_cookie(
-            "hn_token",
-            user.token,
-            max_age=31536000,
-            path="/",
-            samesite="Lax",
-            httponly=True,
-        )
+        _set_session_cookie(response, user.token)
         return response
 
     @app.get("/api/user")

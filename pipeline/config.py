@@ -179,6 +179,9 @@ class Config:
     tldr_uncached_per_user_window_seconds: int = 3600
     tldr_uncached_global_limit: int = 120
     tldr_uncached_global_window_seconds: int = 3600
+    # Uncached TLDR generations running at once, all users; extra requests
+    # get a stale cached TLDR or a short 429 instead of queueing a thread.
+    tldr_max_concurrent_generations: int = 8
     feedback_per_user_limit: int = 120
     feedback_per_user_window_seconds: int = 600
     feedback_global_limit: int = 2000
