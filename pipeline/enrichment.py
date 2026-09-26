@@ -573,16 +573,6 @@ def _rss_source_name(feed_url: str) -> str:
     return f"rss_{domain.replace('.', '_')}"
 
 
-def _urllib_fetch(url: str, user_agent: str) -> tuple[int, str]:
-    """Sync fetch via urllib.
-    Re-exported from http_fetch for backward compatibility with
-    callers that import it from pipeline (e.g. server.py). Prefer
-    `http_fetch.urllib_fetch` for new code."""
-    from http_fetch import urllib_fetch as _impl
-
-    return _impl(url, user_agent)
-
-
 def _parse_rate_limit_reset(headers: dict[str, str]) -> float | None:
     """Extract Reddit's x-ratelimit-reset value (seconds) from response headers.
 

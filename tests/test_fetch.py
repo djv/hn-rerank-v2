@@ -9,8 +9,7 @@ from server import (
     _fetch_article_body_with_result,
 )
 
-_RealAsyncClient = httpx.AsyncClient
-_real_check_public_url = http_fetch.check_public_url
+_real_is_public_ip = http_fetch._is_public_ip
 
 
 @pytest.fixture(autouse=True)
@@ -24,20 +23,18 @@ def mock_asyncio_sleep(monkeypatch):
 @pytest.fixture(autouse=True)
 def allow_loopback_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
     """The local test servers below live on 127.0.0.1, which the SSRF guard
-    rejects; tests of the guard itself restore ``_real_check_public_url``."""
-    monkeypatch.setattr(http_fetch, "check_public_url", lambda url: None)
+    rejects; tests of the guard itself restore ``_real_is_public_ip``."""
+    monkeypatch.setattr(http_fetch, "_is_public_ip", lambda ip: True)
 
 
 def _patch_transport(
     monkeypatch: pytest.MonkeyPatch,
     handler: Callable[[httpx.Request], httpx.Response],
 ) -> None:
-    import server
-
-    def factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
-        return _RealAsyncClient(*args, transport=httpx.MockTransport(handler), **kwargs)
-
-    monkeypatch.setattr(server.httpx, "AsyncClient", factory)
+    """Swap guarded_get's transport for a mock (no sockets, so no guard)."""
+    monkeypatch.setattr(
+        http_fetch, "_public_only_transport", lambda: httpx.MockTransport(handler)
+    )
 
 
 _ARTICLE_HTML = """\
@@ -316,40 +313,20 @@ async def test_fetch_allows_missing_content_type(
 
 
 @pytest.mark.asyncio
-async def test_fetch_blocks_private_redirect_target(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A public article URL that redirects to a private address is refused
-    before the private hop is requested."""
-    monkeypatch.setattr(http_fetch, "check_public_url", _real_check_public_url)
-    resolved = {"example.com": "93.184.215.14", "internal.test": "10.0.0.5"}
-    monkeypatch.setattr(
-        http_fetch, "_resolve_host", lambda host, port: [resolved[host]]
-    )
-    requested: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requested.append(str(request.url))
-        return httpx.Response(302, headers={"location": "http://internal.test/admin"})
-
-    _patch_transport(monkeypatch, handler)
-
-    result = await _fetch_article_body_with_result("https://example.com/a")
-    assert result.error == "unsafe_url"
-    assert result.permanent is True
-    assert requested == ["https://example.com/a"]
-
-
-@pytest.mark.asyncio
 async def test_fetch_blocks_loopback_without_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(http_fetch, "check_public_url", _real_check_public_url)
+    """The real guard, end to end: a story URL pointing at this machine is a
+    permanent unsafe_url failure and the local server never sees a request.
+    Redirect, rebinding and urllib cases: tests/test_http_fetch.py."""
+    monkeypatch.setattr(http_fetch, "_is_public_ip", _real_is_public_ip)
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def status(handler: Any) -> tuple[int, bytes]:
         raise AssertionError("loopback URL must not be requested")
 
-    _patch_transport(monkeypatch, handler)
-
-    result = await _fetch_article_body_with_result("http://127.0.0.1:8766/api/user")
-    assert result.error == "unsafe_url"
+    result, calls = await _serve("api/user", status)
+    assert result is None
+    assert calls == 0
+    detailed = await _fetch_article_body_with_result("http://127.0.0.1:8766/api/user")
+    assert detailed.error == "unsafe_url"
+    assert detailed.permanent is True

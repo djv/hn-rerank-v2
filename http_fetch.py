@@ -10,17 +10,30 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import http.client
 import ipaddress
 import logging
 import socket
+import ssl
+from collections.abc import Iterable
 from dataclasses import dataclass
 from http.client import HTTPMessage
-from typing import IO, Protocol
-from urllib.error import HTTPError
+from typing import IO, Any, Protocol
+from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
+from urllib.request import (
+    HTTPHandler,
+    HTTPRedirectHandler,
+    HTTPSHandler,
+    ProxyHandler,
+    Request,
+    build_opener,
+    urlopen,
+)
 
+import httpcore
 import httpx
+from httpcore import SOCKET_OPTION
 
 # Article URLs are chosen by whoever submitted the story, so fetches of them
 # must not reach loopback/private/tailnet hosts (SSRF) or buffer an unbounded
@@ -55,26 +68,73 @@ def _is_public_ip(raw: str) -> bool:
     return ip.is_global and not ip.is_multicast
 
 
-def check_public_url(url: str) -> None:
-    """Raise UnsafeUrlError unless ``url`` is http(s) to public addresses only.
-
-    DNS failures propagate as OSError, like a failed connect would. There is
-    a residual DNS-rebinding window between this check and the connect;
-    closing it would need a pinned-IP transport, which isn't worth it here.
-    """
-    parts = urlsplit(url)
-    if parts.scheme not in ("http", "https"):
-        raise UnsafeUrlError(f"scheme not allowed: {parts.scheme!r}")
-    host = parts.hostname
-    if not host:
-        raise UnsafeUrlError("missing host")
-    try:
-        port = parts.port or (443 if parts.scheme == "https" else 80)
-    except ValueError as e:
-        raise UnsafeUrlError(f"bad port: {e}") from e
+def _public_addresses(host: str, port: int) -> list[str]:
+    """Resolve ``host`` once and return its addresses, or raise UnsafeUrlError
+    if any is non-public. Callers connect to these exact addresses, so a DNS
+    answer can't change between the check and the connect (rebinding)."""
     addrs = _resolve_host(host, port)
     if not addrs or not all(_is_public_ip(a) for a in addrs):
         raise UnsafeUrlError(f"non-public address for host {host!r}")
+    return addrs
+
+
+def check_url(url: str) -> None:
+    """Raise UnsafeUrlError unless ``url`` is http(s) with a host and valid
+    port. Addresses are checked at connect time (``_public_addresses``)."""
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https"):
+        raise UnsafeUrlError(f"scheme not allowed: {parts.scheme!r}")
+    if not parts.hostname:
+        raise UnsafeUrlError("missing host")
+    try:
+        parts.port
+    except ValueError as e:
+        raise UnsafeUrlError(f"bad port: {e}") from e
+
+
+class _PublicOnlyBackend(httpcore.AsyncNetworkBackend):
+    """httpcore network backend that connects only to validated public
+    addresses. TLS still verifies the certificate against the URL's host:
+    httpcore passes the origin hostname to start_tls, not the address."""
+
+    def __init__(self, inner: httpcore.AsyncNetworkBackend) -> None:
+        self._inner = inner
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Iterable[SOCKET_OPTION] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        addrs = await asyncio.to_thread(_public_addresses, host, port)
+        return await self._inner.connect_tcp(
+            addrs[0], port, timeout, local_address, socket_options
+        )
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Iterable[SOCKET_OPTION] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        raise UnsafeUrlError("unix sockets not allowed")
+
+    async def sleep(self, seconds: float) -> None:
+        await self._inner.sleep(seconds)
+
+
+def _public_only_transport() -> httpx.AsyncHTTPTransport:
+    transport = httpx.AsyncHTTPTransport()
+    # httpx has no public hook for the network backend; wrap its pool's.
+    # tests/test_http_fetch.py exercises this against real sockets, so an
+    # httpx upgrade that moves these attributes fails loudly there.
+    pool = transport._pool
+    if not isinstance(pool, httpcore.AsyncConnectionPool):  # proxy pools
+        raise TypeError("unexpected httpx transport pool")
+    pool._network_backend = _PublicOnlyBackend(pool._network_backend)
+    return transport
 
 
 def _decode_body(body: bytes, charset: str | None) -> str:
@@ -96,40 +156,88 @@ class GuardedResponse:
 
 
 async def guarded_get(
-    client: httpx.AsyncClient,
     url: str,
     headers: dict[str, str],
     *,
+    timeout: float = 10.0,
     max_bytes: int = ARTICLE_MAX_BYTES,
     max_redirects: int = ARTICLE_MAX_REDIRECTS,
 ) -> GuardedResponse:
-    """GET with an SSRF check on every hop and a streamed body-size cap.
+    """GET an untrusted URL: public addresses only, a streamed size cap.
 
-    ``client`` must not follow redirects itself; they are followed here so
-    each Location is re-checked. Non-200 responses return an empty body.
-    Bodies over ``max_bytes`` are cut off (``truncated=True``) rather than
-    rejected: the extractor only needs the first part of the page.
+    Every connection (including each redirect hop, followed here so its
+    scheme is checked) goes only to addresses validated by that same
+    connection's DNS lookup. Non-200 responses return an empty body. Bodies
+    over ``max_bytes`` are cut off (``truncated=True``) rather than rejected:
+    the extractor only needs the first part of the page. Env proxies are
+    ignored (a proxy would hide the destination from the check).
     """
-    for _ in range(max_redirects + 1):
-        await asyncio.to_thread(check_public_url, url)
-        async with client.stream("GET", url, headers=headers) as resp:
-            location = resp.headers.get("location")
-            if resp.status_code in _REDIRECT_STATUSES and location:
-                url = urljoin(url, location)
-                continue
-            if resp.status_code != 200:
-                return GuardedResponse(resp.status_code, resp.headers, "")
-            buf = bytearray()
-            truncated = False
-            async for chunk in resp.aiter_bytes():
-                buf += chunk
-                if len(buf) > max_bytes:
-                    del buf[max_bytes:]
-                    truncated = True
-                    break
-            text = _decode_body(bytes(buf), resp.charset_encoding)
-            return GuardedResponse(200, resp.headers, text, truncated)
+    async with httpx.AsyncClient(
+        transport=_public_only_transport(),
+        timeout=timeout,
+        follow_redirects=False,
+        trust_env=False,
+    ) as client:
+        for _ in range(max_redirects + 1):
+            check_url(url)
+            async with client.stream("GET", url, headers=headers) as resp:
+                location = resp.headers.get("location")
+                if resp.status_code in _REDIRECT_STATUSES and location:
+                    url = urljoin(url, location)
+                    continue
+                if resp.status_code != 200:
+                    return GuardedResponse(resp.status_code, resp.headers, "")
+                buf = bytearray()
+                truncated = False
+                async for chunk in resp.aiter_bytes():
+                    buf += chunk
+                    if len(buf) > max_bytes:
+                        del buf[max_bytes:]
+                        truncated = True
+                        break
+                text = _decode_body(bytes(buf), resp.charset_encoding)
+                return GuardedResponse(200, resp.headers, text, truncated)
     raise UnsafeUrlError(f"too many redirects (>{max_redirects})")
+
+
+def _connect_public(
+    address: tuple[str, int],
+    timeout: float | None = None,
+    source_address: tuple[str, int] | None = None,
+    *args: object,
+    **kwargs: object,
+) -> socket.socket:
+    host, port = address
+    ip = _public_addresses(host, port)[0]
+    return socket.create_connection((ip, port), timeout, source_address)
+
+
+class _PublicHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._create_connection = _connect_public
+
+
+class _PublicHTTPSConnection(http.client.HTTPSConnection):
+    # connect() dials via _create_connection, then wraps TLS with
+    # server_hostname=self.host, so the certificate is checked by name.
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._create_connection = _connect_public
+
+
+class _PublicHTTPHandler(HTTPHandler):
+    def http_open(self, req: Request) -> http.client.HTTPResponse:
+        return self.do_open(_PublicHTTPConnection, req)
+
+
+class _PublicHTTPSHandler(HTTPSHandler):
+    def __init__(self) -> None:
+        self._ssl_context = ssl.create_default_context()
+        super().__init__(context=self._ssl_context)
+
+    def https_open(self, req: Request) -> http.client.HTTPResponse:
+        return self.do_open(_PublicHTTPSConnection, req, context=self._ssl_context)
 
 
 class _CheckedRedirectHandler(HTTPRedirectHandler):
@@ -142,16 +250,22 @@ class _CheckedRedirectHandler(HTTPRedirectHandler):
         headers: HTTPMessage,
         newurl: str,
     ) -> Request | None:
-        check_public_url(newurl)
+        check_url(newurl)  # e.g. no ftp:// hop, which has its own handler
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def guarded_urllib_fetch(
     url: str, user_agent: str, *, max_bytes: int = ARTICLE_MAX_BYTES
 ) -> tuple[int, str]:
-    """``urllib_fetch`` with the same SSRF check (every hop) and size cap."""
-    check_public_url(url)
-    opener = build_opener(_CheckedRedirectHandler)
+    """``urllib_fetch`` for untrusted URLs: same connect-time address check
+    as ``guarded_get`` on every hop, same size cap, no env proxies."""
+    check_url(url)
+    opener = build_opener(
+        ProxyHandler({}),
+        _PublicHTTPHandler,
+        _PublicHTTPSHandler,
+        _CheckedRedirectHandler,
+    )
     req = Request(url, headers={"User-Agent": user_agent})
     try:
         with opener.open(req, timeout=15) as resp:
@@ -159,6 +273,11 @@ def guarded_urllib_fetch(
             return resp.status, _decode_body(body, resp.headers.get_content_charset())
     except HTTPError as e:
         return e.code, ""
+    except URLError as e:
+        # urllib wraps connect errors, including our UnsafeUrlError.
+        if isinstance(e.reason, UnsafeUrlError):
+            raise e.reason from e
+        raise
 
 
 def urllib_fetch(url: str, user_agent: str) -> tuple[int, str]:

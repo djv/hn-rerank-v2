@@ -1,5 +1,21 @@
 # Worklog: hn-rewrite
 
+## 2026-09-26 SSRF guard checks at connect time (DNS rebinding closed)
+
+- `http_fetch`: the public-address check moved from a pre-request DNS lookup
+  (`check_public_url`, removed) into the connection layer of both clients
+  (httpcore network backend for httpx; `http.client` connection subclass for
+  the urllib fallback). One lookup per connection, and the client dials the
+  validated address, so a DNS answer can't change between check and connect.
+  `check_url` now only validates scheme/host/port. Env proxies ignored.
+- Simplified: `guarded_get(url, headers, timeout=...)` owns its client
+  (server.py no longer builds one); removed the `pipeline.enrichment
+  ._urllib_fetch` back-compat shim (script imports `http_fetch.urllib_fetch`).
+- Tests use real local sockets; the rebinding test resolves a name that
+  doesn't exist in real DNS and fails if either client re-resolves.
+- httpx exposes no hook for the network backend, so the wrap goes through
+  `transport._pool._network_backend`; the socket tests catch an upgrade break.
+
 ## 2026-09-26 Server review fixes, round 2
 
 - `/u/<token>` no longer silently replaces a different live profile: `GET`
@@ -26,7 +42,7 @@
   feature prep lived inside one, so a `trace=None` caller would have hit a
   NameError. Checked equal by AST to the old code with the guards removed.
 - Cloud review (compacted `review/all` branch) also flagged the documented
-  SSRF DNS-rebinding window (kept as accepted) and a "duplicate" `rss_`
+  SSRF DNS-rebinding window (closed in the next entry) and a "duplicate" `rss_`
   strip in `render.py` (intentional, for legacy `rss_rss_*` rows).
 - Deck refill fetches `apiPath('/api/feed')` (was a hard-coded `/api/feed`
   that only worked because Caddy also proxies bare `/api/*`).

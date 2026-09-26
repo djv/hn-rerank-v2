@@ -96,7 +96,6 @@ from .enrichment import (
     _merge_source_context,
     _reddit_subreddit_from_feed_url,
     _rss_source_name,
-    _urllib_fetch,
     build_reddit_prewarm_factories,
     build_reddit_topfeed_factories,
     fetch_and_cache_article_bodies,

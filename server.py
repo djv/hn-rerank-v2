@@ -419,50 +419,47 @@ async def _fetch_article_body_with_result(url: str) -> ArticleFetchResult:
 
     for attempt in range(2):
         try:
-            # Redirects are followed inside guarded_get so every hop gets the
-            # SSRF check; the body is streamed under a byte cap.
-            async with httpx.AsyncClient(
-                timeout=10.0, follow_redirects=False
-            ) as client:
-                resp = await http_fetch.guarded_get(client, url, headers)
-                if resp.status in (429, 503) and attempt == 0:
-                    await asyncio.sleep(1)
-                    continue
-                if resp.status == 200:
-                    ct = (resp.headers.get("content-type") or "").lower()
-                    if ct and not ct.startswith(
-                        ("text/html", "application/xhtml+xml", "text/xml", "text/plain")
-                    ):
-                        return ArticleFetchResult(
-                            status=200, error="non_html", permanent=True
-                        )
-                    html = resp.text
-                    if "\x00" in html:
-                        return ArticleFetchResult(
-                            status=200, error="non_html", permanent=True
-                        )
-                elif resp.status == 403 and attempt == 0:
-                    # httpx's TLS fingerprint is often blocked where urllib's
-                    # system-OpenSSL handshake gets through (see http_fetch).
-                    logging.info("%s: httpx 403, retrying with urllib", url)
-                    status, html = await asyncio.to_thread(
-                        http_fetch.guarded_urllib_fetch, url, headers["User-Agent"]
-                    )
-                    if status != 200:
-                        return ArticleFetchResult(
-                            status=status,
-                            error=f"http_{status}",
-                        )
-                    if "\x00" in html:
-                        return ArticleFetchResult(
-                            status=200, error="non_html", permanent=True
-                        )
-                else:
+            # guarded_get connects only to validated public addresses (every
+            # redirect hop) and streams the body under a byte cap.
+            resp = await http_fetch.guarded_get(url, headers, timeout=10.0)
+            if resp.status in (429, 503) and attempt == 0:
+                await asyncio.sleep(1)
+                continue
+            if resp.status == 200:
+                ct = (resp.headers.get("content-type") or "").lower()
+                if ct and not ct.startswith(
+                    ("text/html", "application/xhtml+xml", "text/xml", "text/plain")
+                ):
                     return ArticleFetchResult(
-                        status=resp.status,
-                        error=f"http_{resp.status}",
-                        permanent=resp.status in (404, 410),
+                        status=200, error="non_html", permanent=True
                     )
+                html = resp.text
+                if "\x00" in html:
+                    return ArticleFetchResult(
+                        status=200, error="non_html", permanent=True
+                    )
+            elif resp.status == 403 and attempt == 0:
+                # httpx's TLS fingerprint is often blocked where urllib's
+                # system-OpenSSL handshake gets through (see http_fetch).
+                logging.info("%s: httpx 403, retrying with urllib", url)
+                status, html = await asyncio.to_thread(
+                    http_fetch.guarded_urllib_fetch, url, headers["User-Agent"]
+                )
+                if status != 200:
+                    return ArticleFetchResult(
+                        status=status,
+                        error=f"http_{status}",
+                    )
+                if "\x00" in html:
+                    return ArticleFetchResult(
+                        status=200, error="non_html", permanent=True
+                    )
+            else:
+                return ArticleFetchResult(
+                    status=resp.status,
+                    error=f"http_{resp.status}",
+                    permanent=resp.status in (404, 410),
+                )
         except http_fetch.UnsafeUrlError as e:
             logging.warning("article fetch blocked for %s: %s", url, e)
             return ArticleFetchResult(error="unsafe_url", permanent=True)
