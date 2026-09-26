@@ -50,6 +50,12 @@ Reports: `~/.local/state/hn-rerank-eval/*-20260925.json` (private).
   order at the top. Decision: keep production; the offline gain does not
   show up in the user's own judgement. Clean holdout: votes after
   2026-09-25.
+- Score correction from the orderings (`scripts/fit_score_adjustment.py`:
+  production logit + weighted points/comments/age/HN-source/challenger,
+  pairwise logistic, leave-one-batch-out, C 0.1–1): production alone 43/80;
+  +points 43/80; every other set worse (23–38/80, +all 29/80). Fitted
+  weights are tiny and flip between folds: 8 batches carry no usable
+  correction. Revisit only with several dozen batches.
 - Tooling: `scripts/summarize_eval_report.py` (composite + fold wins),
   `scripts/encode_replay_embeddings.py`, `scripts/calibrate_rankings.py`
   (hand-order 5 disputed stories; pairwise agreement per ranker).
