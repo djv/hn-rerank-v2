@@ -24,3 +24,8 @@ offline, and check the best candidate against the user's own judgement.
 None required. Optional: after a few hundred new votes, rerun
 `eval_ranker_variants.py` on votes after 2026-09-25 to recheck the
 challenger.
+- Optional: `server.py` holds ~1.1 GB anonymous RSS, flat from minute 3
+  to 9 after boot (2026-09-26, VPS); ONNX models are only ~90 MB each.
+  Suspects: warm scheduler, `_MODEL_CACHE` in `pipeline/ranking.py`,
+  batch embedding loads. Profile with `tracemalloc` or `py-spy` if RAM
+  gets tight.
