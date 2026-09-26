@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 
 import httpx
 import pytest
-from textual.widgets import Static
+from textual.widgets import Markdown, Static
 
 from hn_rerank.app import Reader
 from tests.test_client import FakeServer, sample_feed
@@ -61,3 +62,31 @@ async def test_passive_poll_failure_keeps_existing_deck() -> None:
         await app.poll_feed_version()
         assert app.feed is original
         assert str(app.query_one("#status", Static).content) == status
+
+
+async def test_passive_version_change_leaves_the_open_summary_alone() -> None:
+    """A new published version (4h regen, a vote from another device) must
+    not blank or refetch the summary being read."""
+    fake = FakeServer()
+    fake.feed = sample_feed(2, 2)
+    app = Reader(api=fake.api())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await pilot.pause(0.5)
+        await pilot.press("j")
+        await pilot.pause(0.6)
+        assert app.summaries.get(2) == "# Summary 2"
+        fake.requests.clear()
+        fake.feed = sample_feed(3, 3)
+        await app.poll_feed_version()
+        await pilot.pause(0.6)
+        assert app.feed is not None and app.feed.version == 3
+        summarized = [
+            int(r.url.path.rsplit("/", 1)[1])
+            if "/api/tldr-cache/" in r.url.path
+            else json.loads(r.content)["story_id"]
+            for r in fake.requests
+            if r.url.path.endswith("/api/tldr-detail")
+            or "/api/tldr-cache/" in r.url.path
+        ]
+        assert 2 not in summarized
+        assert "Summary 2" in app.query_one(Markdown)._markdown

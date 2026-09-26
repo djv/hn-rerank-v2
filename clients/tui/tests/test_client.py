@@ -704,7 +704,7 @@ async def test_version_poll_keeps_hidden_stories_hidden(tmp_path: Path) -> None:
     async with app.run_test(size=(120, 35)) as pilot:
         await pilot.pause(0.3)
         app.unavailable.add(1)
-        app.action_refresh(force_summary=False, restore_hidden=False)
+        app.refresh_passively()
         await pilot.pause(0.3)
         assert [s.id for s in app.stories] == [2]
         app.action_refresh()

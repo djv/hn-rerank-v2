@@ -1,5 +1,24 @@
 # Worklog: hn-rewrite
 
+## 2026-09-26 TUI review fixes, round 2
+
+- Prefetch liveness comes from the worker, not a flag: a worker cancelled
+  before its first step (start and cancel in one tick) no longer leaves
+  prefetch off for the session.
+- Setup after a rejected saved token reopens on that profile's server, not
+  `DEFAULT_SERVER`.
+- `Feed.parse` ignores unknown story/badge keys, so a server can add optional
+  fields within `api_version` 1 without breaking installed clients.
+- A failed background cache read (500, or 404 on an older server) for the
+  selected story falls back to `POST /api/tldr-detail` instead of hiding it.
+- A passive version change (regen, vote from another device) keeps the open
+  summary: no blank, refetch or scroll reset. Manual `r` is unchanged.
+- Undo restores a story only into the views it was voted from, at the
+  server's position (Date by time, others by rank score).
+- Deployed 793e047 to the VPS and smoke-tested over Funnel: `Secure` cookie,
+  `/u` confirm page and same-origin switch (cross-site POST 403), uncached
+  TLDR with a live article fetch through the SSRF guard. No log errors.
+
 ## 2026-09-26 SSRF guard checks at connect time (DNS rebinding closed)
 
 - `http_fetch`: the public-address check moved from a pre-request DNS lookup

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any
 
 
@@ -59,6 +59,12 @@ class FeedStory:
     enriched: bool = False
 
 
+# Unknown keys are ignored so a server can add optional fields within
+# api_version 1 without breaking already-installed clients.
+_STORY_FIELDS = frozenset(f.name for f in fields(FeedStory))
+_BADGE_FIELDS = frozenset(f.name for f in fields(FeedBadge))
+
+
 @dataclass(frozen=True)
 class Feed:
     api_version: int
@@ -85,12 +91,14 @@ class Feed:
                 story_data: dict[str, Any] = {
                     key: _terminal_safe_value(value)
                     for key, value in dict(raw_story).items()
+                    if key in _STORY_FIELDS
                 }
                 story_data["badge_details"] = [
                     FeedBadge(
                         **{
                             key: _terminal_safe_value(value)
                             for key, value in dict(badge).items()
+                            if key in _BADGE_FIELDS
                         }
                     )
                     for badge in story_data.get("badge_details", [])

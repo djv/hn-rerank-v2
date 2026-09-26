@@ -130,6 +130,28 @@ def test_parse_round_trips_valid_wire_payloads(feed: Feed) -> None:
     assert Feed.parse(feed.to_dict()) == _terminal_view(feed)
 
 
+@given(_feeds(), st.data())
+@settings(deadline=None)
+def test_parse_ignores_fields_added_by_newer_servers(
+    feed: Feed, data: st.DataObject
+) -> None:
+    """A newer server may add optional keys anywhere in the payload without
+    bumping api_version; the parsed feed is unchanged."""
+    payload = feed.to_dict()
+    known = {f.name for cls in (Feed, FeedStory, FeedBadge) for f in fields(cls)}
+    extra = st.dictionaries(
+        st.text(min_size=1, max_size=8).filter(lambda k: k not in known),
+        _JSON,
+        max_size=3,
+    )
+    payload.update(data.draw(extra))
+    for story in cast("list[dict[str, object]]", payload["stories"]):
+        story.update(data.draw(extra))
+        for badge in cast("list[dict[str, object]]", story["badge_details"]):
+            badge.update(data.draw(extra))
+    assert Feed.parse(payload) == _terminal_view(feed)
+
+
 @st.composite
 def _malformed_payloads(draw: st.DrawFn) -> object:
     payload = draw(_feeds()).to_dict()

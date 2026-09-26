@@ -38,6 +38,7 @@ from textual.widgets._select import (
     SelectOverlay,
 )
 from textual.widgets.option_list import Option
+from textual.worker import Worker, get_current_worker
 
 from .api import (
     API,
@@ -572,6 +573,9 @@ class Reader(App[None]):
         self.view_key: str | None = None
         self.restored: dict[int, FeedStory] = {}
         self.history: list[FeedStory] = []
+        # Views ("<sort>:<age>") each voted story was listed in, so undo puts
+        # it back only where the server had it.
+        self.vote_views: dict[int, list[str]] = {}
         self.pending = False
         self.target: int | None = None
         self.selection_serial = 0
@@ -593,7 +597,9 @@ class Reader(App[None]):
         self.prefetching: set[int] = set()
         self.prefetch_queue: deque[int] = deque()
         self.prefetch_retry_at: dict[int, float] = {}
-        self.prefetch_active = False
+        # The running prefetch worker. A worker cancelled before its first step
+        # never runs its finally, so liveness comes from the worker itself.
+        self.prefetch_worker: Worker | None = None
         self.closing = False
         self.prefetch_cooldown_until = 0.0
 
@@ -749,6 +755,8 @@ class Reader(App[None]):
                 ):
                     self.setup()
                     return
+                # A rejected token reopens setup on the profile's deployment.
+                self.server = profile.server
                 self.api = API(profile.server, profile.token)
             await self.api.validate()
             self.refresh_feed()
@@ -787,6 +795,7 @@ class Reader(App[None]):
             return
         if self.api:
             await self.api.close()
+        self.server = profile.server
         self.api = API(profile.server, profile.token)
         self.interaction_session = str(uuid4())
         self.feed = None
@@ -794,6 +803,7 @@ class Reader(App[None]):
         self.unavailable.clear()
         self.restored.clear()
         self.history.clear()
+        self.vote_views.clear()
         self.summaries.clear()
         self.prefetch_queue.clear()
         self.prefetching.clear()
@@ -1046,7 +1056,14 @@ class Reader(App[None]):
             if not force_refresh and story_id in self.summaries:
                 summary = SummaryResult(self.summaries[story_id])
             elif not force_refresh and request is not None:
-                summary = await asyncio.shield(request)
+                try:
+                    summary = await asyncio.shield(request)
+                except (InvalidProfile, TransientError):
+                    raise
+                except APIError:
+                    # A failed background cache read says nothing about
+                    # whether this story can be summarized; ask directly.
+                    summary = None
                 if summary is None:
                     summary = await self.api.summary(story_id)
             else:
@@ -1160,17 +1177,20 @@ class Reader(App[None]):
         )
         self.start_prefetch()
 
+    def prefetch_running(self) -> bool:
+        worker = self.prefetch_worker
+        return worker is not None and not worker.is_cancelled and not worker.is_finished
+
     def start_prefetch(self) -> None:
         if (
-            self.prefetch_active
+            self.prefetch_running()
             or self.closing
             or not self.prefetch_queue
             or self.setting_up
             or not self.is_running
         ):
             return
-        self.prefetch_active = True
-        self.prefetch_summaries()
+        self.prefetch_worker = self.prefetch_summaries()
 
     async def fetch_prefetched_summary(self, story_id: int) -> SummaryResult | None:
         api = self.api
@@ -1228,9 +1248,13 @@ class Reader(App[None]):
                 for _ in range(PREFETCH_CONCURRENCY):
                     group.create_task(self.prefetch_loop())
         finally:
-            self.prefetch_active = False
+            # A cancelled worker may finish after its replacement started.
+            current = self.prefetch_worker is get_current_worker()
+            if current:
+                self.prefetch_worker = None
             if (
-                self.prefetch_queue
+                current
+                and self.prefetch_queue
                 and not self.closing
                 and not self.setting_up
                 and self.is_running
@@ -1271,9 +1295,7 @@ class Reader(App[None]):
             and current != feed.version
         ):
             # A lower version is a server restart, not an obsolete response.
-            # Drop local summaries too: the new generation may have new text.
-            # Hidden stories stay hidden; only a manual r restores them.
-            self.action_refresh(force_summary=False, restore_hidden=False)
+            self.refresh_passively()
 
     @work(group="refresh", exclusive=True)
     async def refresh_feed(self) -> None:
@@ -1363,6 +1385,24 @@ class Reader(App[None]):
         self.workers.cancel_group(self, "prefetch")
         self.refresh_feed()
 
+    def refresh_passively(self) -> None:
+        """Load a newly published version without disturbing the open story.
+
+        Other cached summaries are dropped (the new generation may have new
+        text); the one being read stays, with its scroll position. Hidden
+        stories stay hidden; only a manual r restores them.
+        """
+        story = self.selected()
+        kept = self.summaries.get(story.id) if story else None
+        self.summaries.clear()
+        if story is not None and kept is not None:
+            self.summaries[story.id] = kept
+        self.prefetch_queue.clear()
+        self.prefetch_retry_at.clear()
+        self.prefetch_cache_misses.clear()
+        self.workers.cancel_group(self, "prefetch")
+        self.refresh_feed()
+
     def action_move(self, delta: int) -> None:
         if self.reading:
             self.query_one("#summary", Markdown).scroll_relative(
@@ -1393,6 +1433,11 @@ class Reader(App[None]):
             return
         self.workers.cancel_group(self, "refresh")
         self.status("Saving vote…")
+        views = [
+            key
+            for key, order in (self.feed.orders.items() if self.feed else ())
+            if story.id in order
+        ]
         try:
             self.target = await self.api.vote(story.id, action)
             if action == "clear":
@@ -1412,6 +1457,7 @@ class Reader(App[None]):
                 self.rated.add(story.id)
                 self.restored.pop(story.id, None)
                 self.history.append(story)
+                self.vote_views[story.id] = views
                 self.rebuild(next_id)
             self.status("Vote cleared." if action == "clear" else "Vote saved.")
             self.refresh_feed()
@@ -1427,20 +1473,27 @@ class Reader(App[None]):
             self.pending = False
 
     def restore_story(self, story: FeedStory) -> None:
+        """Put an undone story back in the views it was voted from, where the
+        server orders it: Date by time, the rest by rank score."""
         if not self.feed:
             return
         if all(item.id != story.id for item in self.feed.stories):
             self.feed.stories.append(story)
-        for age in ("recent", "archive"):
-            for sort in ("recommended", "popular", "explore", "date"):
-                if (
-                    f"{age}_mixed" in story.memberships
-                    and (sort != "popular" or story.popular)
-                    and (sort != "explore" or story.explore)
-                ):
-                    order = self.feed.orders.setdefault(f"{sort}:{age}", [])
-                    if story.id not in order:
-                        order.insert(0, story.id)
+        by_id = {item.id: item for item in self.feed.stories}
+        for key in self.vote_views.get(story.id, []):
+            order = self.feed.orders.setdefault(key, [])
+            if story.id in order:
+                continue
+            by_time = key.startswith("date:")
+
+            def rank(item: FeedStory, by_time: bool = by_time) -> float:
+                return item.time if by_time else item.rank_score
+
+            index = next(
+                (i for i, sid in enumerate(order) if rank(by_id[sid]) < rank(story)),
+                len(order),
+            )
+            order.insert(index, story.id)
 
     def action_open_url(self, field: str) -> None:
         story = self.selected()

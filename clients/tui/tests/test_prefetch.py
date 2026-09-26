@@ -288,3 +288,38 @@ async def test_prefetch_runs_while_selected_story_generates() -> None:
         assert 1 not in app.summaries
         fake.release.set()
         await wait_for(pilot, lambda: 1 in app.summaries)
+
+
+async def test_prefetch_cancelled_before_its_first_step_can_restart() -> None:
+    """A start and a cancel in the same tick (e.g. a highlight then r) must
+    not leave prefetch looking busy for the rest of the session."""
+    fake = PrefetchServer()
+    app = Reader(api=fake.api(), prefetch=2)
+    async with app.run_test(size=(120, 35)) as pilot:
+        await wait_for(pilot, lambda: app.summaries.keys() >= {2, 3})
+        app.prefetch_queue.extend([2, 3])
+        app.start_prefetch()
+        app.action_refresh()
+        await wait_for(pilot, lambda: app.summaries.keys() >= {2, 3})
+
+
+async def test_failed_background_cache_read_falls_back_to_generation() -> None:
+    """Selecting a story whose in-flight cache read then fails (500, or 404
+    on an older server) asks for the summary directly instead of hiding it."""
+
+    class CacheFailServer(PrefetchServer):
+        async def __call__(self, request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/api/tldr-cache/2"):
+                await asyncio.sleep(0.6)
+                return httpx.Response(500)
+            return await super().__call__(request)
+
+    fake = CacheFailServer()
+    app = Reader(api=fake.api(), prefetch=2)
+    async with app.run_test(size=(120, 35)) as pilot:
+        await wait_for(pilot, lambda: 2 in app.prefetch_requests)
+        app.query_one(OptionList).focus()
+        await pilot.press("j")
+        await wait_for(pilot, lambda: app.summaries.get(2) == "# Summary 2")
+        assert 2 not in app.unavailable
+        assert "Summary 2" in app.query_one(Markdown)._markdown
