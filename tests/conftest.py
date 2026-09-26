@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Iterator
 
@@ -13,13 +14,51 @@ from reddit_fetch_queue import queue as reddit_fetch_queue
 from reddit_limiter import limiter as reddit_limiter
 from llm_limiter import limiter as llm_limiter
 
-# `dev` (fast local iteration) vs `ci` (wider search, no per-example deadline
-# since CI hosts are noisier). Profiles are opt-in so ordinary pytest runs
-# retain Hypothesis' normal example count.
+# Example budgets (HYPOTHESIS_PROFILE):
+# - unset, local: a quarter of each test's examples (at least 10, or all of
+#   them if fewer). A 10x run on 2026-09-26 found nothing, so everyday runs
+#   trade depth for speed.
+# - unset under CI: Hypothesis auto-selects the `ci` profile below (300 for
+#   tests without their own @settings); explicit counts stay unscaled.
+# - `deep`: 10x each test's count, at least 1000, no deadline. A one-off
+#   search, several minutes: `HYPOTHESIS_PROFILE=deep uv run pytest tests/ -n 4`.
+# - `dev` / `ci`: plain Hypothesis profiles (50 / 300 examples) for tests
+#   without their own @settings; unscaled.
+# A test's own @settings(max_examples=...) overrides any profile, so the
+# scaled modes rewrite each test's final settings at collection instead.
 settings.register_profile("dev", max_examples=50)
 settings.register_profile("ci", max_examples=300, deadline=None, print_blob=True)
-if profile_name := os.environ.get("HYPOTHESIS_PROFILE"):
-    settings.load_profile(profile_name)
+settings.register_profile("deep", deadline=None, print_blob=True)
+_PROFILE = os.environ.get("HYPOTHESIS_PROFILE") or (
+    "" if os.environ.get("CI") else "fast"
+)
+if _PROFILE not in ("", "fast"):
+    settings.load_profile(_PROFILE)
+
+
+def _scaled_examples(n: int) -> int:
+    if _PROFILE == "deep":
+        return max(1000, n * 10)
+    return max(math.ceil(n / 4), min(n, 10))
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    if _PROFILE not in ("fast", "deep"):
+        return
+    seen: set[int] = set()
+    for item in items:
+        test = getattr(item, "obj", None)
+        test = getattr(test, "__func__", test)  # test-class methods are bound
+        current = getattr(test, "_hypothesis_internal_use_settings", None)
+        # Parametrized items share one function: scale it once.
+        if test is None or current is None or id(test) in seen:
+            continue
+        seen.add(id(test))
+        test._hypothesis_internal_use_settings = settings(
+            current,
+            max_examples=_scaled_examples(current.max_examples),
+            **({"deadline": None} if _PROFILE == "deep" else {}),
+        )
 
 
 @pytest.fixture(autouse=True)

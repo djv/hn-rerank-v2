@@ -1,5 +1,15 @@
 # Worklog: hn-rewrite
 
+## 2026-09-26 Hypothesis budgets: quarter locally, `deep` opt-in
+
+- One-off 10x run (every property test at 10x its examples, at least 1000;
+  873 passed in 7 min at `-n 4`): no falsifying examples.
+- `tests/conftest.py` now scales each property test's final settings at
+  collection: local runs use a quarter (at least 10, or all if fewer; 25 for
+  tests without `@settings`); `HYPOTHESIS_PROFILE=deep` uses 10x (at least
+  1000, no deadline); under `CI` nothing is scaled. Local `-n 4`: ~14s ->
+  ~11.7s, under the 12s target.
+
 ## 2026-09-26 Test suite: 42s -> 35s serial, 15s -> 14s at -n 4
 
 - `tests/test_server.py`: its 67 `httpx.get/post/options` calls to the local
