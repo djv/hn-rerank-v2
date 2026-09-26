@@ -1,5 +1,32 @@
 # Worklog: hn-rewrite
 
+## 2026-09-25 Ranking-quality study: baselines, hill climb, embeddings
+
+Offline only; production ranking, config and embeddings unchanged. Results
+and caveats in FINDINGS.md ("Ranking-quality study — 2026-09-25").
+
+- `scripts/eval_ranker_variants.py`: AUC metrics (`auc_up_vs_rest`,
+  `auc_up_vs_down`); `prod[...]`/`produd[...]`/`prodlr[...]` variant names
+  carrying ModelConfig overrides and blend weights; study variants
+  (`logreg_*`, `knn_up_minus_down`, `production_up_minus_down`,
+  `ensemble_production_logreg`); `--replay-embeddings` (repeatable, heldout-
+  feedback only); embedding dimension no longer hard-coded to 384.
+- New scripts: `summarize_eval_report.py`, `encode_replay_embeddings.py`,
+  `calibrate_rankings.py` (hand-order 5 disputed stories per batch).
+- `ModelConfig.engagement_features_enabled` (default off): log1p points and
+  comments as SVM meta columns. Evaluated as a loss; kept only as an opt-in.
+- Headline: on development folds, SVM C=4/γ=0.05 + logreg rank blend and a
+  stronger 512-token embedding (bge-base+mxbai concat) lift the composite
+  0.669 → 0.754 (8/8 folds); on the reused newest-votes block only
+  whole-list AUC improves and top-of-list metrics are too noisy to separate.
+  Hand orderings (8 batches) tied: production 54% of pairs, challenger
+  46%. Production ranking kept unchanged.
+- `calibrate_rankings.py` caches scores
+  (`~/.local/state/hn-rerank-eval/calibration-scores.{json,npy}`, keyed on
+  snapshot, config and challenger; ~2.5 s restart instead of ~45 s) and
+  builds each batch so the two rankers order every pair differently,
+  breaking ties toward embedding-distant topics.
+
 ## 2026-09-25 Deployed f5cbb16; Caddy 2.11.4; Funnel XFF verified
 
 - VPS fast-forwarded to `f5cbb16` (contains `b4fb589`); VPS suite 860

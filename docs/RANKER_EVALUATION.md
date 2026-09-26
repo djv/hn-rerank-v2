@@ -55,3 +55,30 @@ Keep detailed reports (feedback IDs/configuration) outside Git; record only
 aggregate results in FINDINGS.md. The source directory needs Git metadata
 for report provenance; do not run a bare archive without initializing an
 isolated source snapshot. Do not copy credentials into experiment folders.
+
+## Hill-climbing and embedding comparisons (added 2026-09-25)
+
+- Metrics now include `auc_up_vs_rest` / `auc_up_vs_down`: the share of
+  (upvote, other) pairs ordered upvote-first over every judged card. 0.5 is
+  random; it is far steadier than NDCG@k on ~350–700-card blocks.
+- Variant names can carry `ModelConfig` overrides (`;`-separated, since
+  `--variants` is comma-separated): `prod[svm_c=4.0;svm_gamma=0.05]` is
+  production with those settings, `produd[...]` scores it
+  softmax(up) − softmax(down), and `prodlr[...;lr_weight=0.6;knn_weight=0]`
+  percentile-rank-blends it with `logreg_up_minus_down` (and optionally the
+  kNN score).
+- `--replay-embeddings FILE.npz` (heldout-feedback only) swaps in another
+  model's vectors for every feedback story, text-hash checked. Repeat it to
+  concatenate models (each part scaled by 1/√k). Make files with
+  `scripts/encode_replay_embeddings.py` (`--repo`, `--pooling`,
+  `--max-tokens`, `--prefix`, `--title-only`, or `--from-db` to export the
+  stored production vectors). Non-384-d runs skip the dashboard-deck
+  metrics, whose dedup is 384-d only; raw ranking metrics are unaffected.
+- `scripts/summarize_eval_report.py REPORT.json ...` prints fold means, a
+  composite (mean of AUC vs rest, MAP, NDCG@12, NDCG@40 and 1 − top-40
+  downvote share) and how many folds beat production.
+- `scripts/calibrate_rankings.py --db SNAPSHOT` asks you to order 5
+  unvoted stories on which production and the challenger disagree near the
+  top; every pair in a batch is one the rankers order differently, spread
+  across topics. Scores are cached per snapshot/config, so restarts are
+  quick. `--report` gives each ranker's pairwise agreement with you.

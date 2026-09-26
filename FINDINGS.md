@@ -1,5 +1,59 @@
 # HN Rerank findings
 
+## Ranking-quality study — 2026-09-25
+
+Setup: `eval_ranker_variants.py --candidate-pool heldout-feedback`, user 1
+(5,189 votes: 1,707 up / 1,813 neutral / 1,669 down), temporal expanding
+folds over the development 80%; newest 20% reserved. Composite = mean of
+AUC(up vs rest), MAP, NDCG@12, NDCG@40, 1 − downvote share of top 40.
+Reports: `~/.local/state/hn-rerank-eval/*-20260925.json` (private).
+
+- Baselines (3 folds): production AUC 0.697 / MAP 0.428; up−down centroid
+  0.715 / 0.424; random 0.52 / 0.27; HN gravity 0.39 / 0.22 (worse than
+  random: upvotes lean away from high-points stories). Shuffled-label
+  controls sit at AUC ≈ 0.50 for every scorer (5 seeds), incl. new variants.
+- Plain logistic regression beat production on dev (AUC 0.78 vs 0.70) but
+  the pre-declared confirmation on the newest 20% tied/lost (AUC 0.739 vs
+  0.737, NDCG@12 0.645 vs 0.720, top-40 downvotes 12.5% vs 2.5%). Not adopted.
+- Hill climb (8 folds, composite; production 0.669): SVM C 0.1→4 with
+  γ 0.05 → 0.705 (8/8 folds); + percentile-rank blend with
+  logreg P(up)−P(down) → 0.714. Flat/negative: knn_k, positive_cluster_k,
+  training dedup, P(up)−P(down) for the SVM, kNN in the blend, HN
+  points/comments features (`engagement_features_enabled`, opt-in, 0.635 at
+  C=0.1). Confirmation second look (already used once, so contaminated):
+  blend 0.717 vs production 0.715 — within noise.
+- Embeddings (replay-only `--replay-embeddings`, 512 tokens, blend
+  composite): mxbai-xsmall@4096 0.714, mxbai-xsmall@512 0.732, bge-base-
+  en-v1.5@512 0.743 (C=4, γ=0.025, logreg weight 0.6; neighbours
+  0.733–0.741). Shorter context does not hurt; a stronger model helps.
+  Concatenated bge-base+mxbai@512 (each /√2): 0.752–0.754, 8/8 folds, best
+  on every metric (AUC 0.804, MAP 0.58, NDCG@12 0.77, top-40 downvotes 2.2%);
+  arctic-embed-m-v1.5@512 alone 0.747, arctic+bge+mxbai 0.746, nomic-embed-
+  text-v1.5@512 ("classification: " prefix) 0.744; stored@4096+bge 0.723. Stronger
+  embeddings cluster at 0.745–0.754 (differences within fold noise).
+- Short context / titles (blend, dev): mxbai@128 0.699, @256 0.719, @512
+  0.732, @4096 0.714; bge title-only 0.681, title+body concat 0.713 < body
+  0.743. 512 tokens of body is the sweet spot; titles alone lose signal.
+- Confirmation (newest 20%, third look, so contaminated; 3 blocks, ~100
+  upvotes each): production 0.715 composite; blend on stored embeddings
+  0.717; bge+mxbai blend 0.678 and arctic blend 0.662 despite AUC
+  0.766/0.765 vs 0.737. Top-of-list metrics swing 0.18–0.82 per block
+  (NDCG@12) and top-40 downvote gaps are 1–3 cards, so the newest block
+  cannot separate candidates at the top; whole-list AUC favours the new
+  embeddings in the two later blocks.
+- Hand orderings (`calibrate_rankings.py`, stored mxbai embeddings,
+  challenger = C=4/γ=0.05 + logreg weight 0.4; 8 batches of 5 stories on
+  which the two rankers order every pair differently): production agrees
+  with the user on 43/80 pairs (54%), challenger 37/80; batches 5–3. First
+  3 batches 20–10 for production, next 5 batches 23–27: noise. Every
+  ordered story sat in both rankers' top 5%, so they differ only in fine
+  order at the top. Decision: keep production; the offline gain does not
+  show up in the user's own judgement. Clean holdout: votes after
+  2026-09-25.
+- Tooling: `scripts/summarize_eval_report.py` (composite + fold wins),
+  `scripts/encode_replay_embeddings.py`, `scripts/calibrate_rankings.py`
+  (hand-order 5 disputed stories; pairwise agreement per ranker).
+
 ## TUI review and narrow-pane evidence (2026-09-24)
 
 - `--server` bug: the argparse default made `explicit_server` always set,

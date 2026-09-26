@@ -1,31 +1,26 @@
 # HN Rerank status
 
 ## Objective
-Deploy the rate-limit client-IP fix (`b4fb589` line, now `origin/main`
-`f5cbb16`) on the VPS, including Caddy `trusted_proxies`.
+Improve ranking quality for user 1: establish baselines, hill-climb
+offline, and check the best candidate against the user's own judgement.
 
 ## Verified result
-- VPS `main` worktree at `f5cbb16` (clean); `uv sync`; VPS suite 860
-  passed. GitHub CI `ci` green for `f5cbb16`.
-- Caddy upgraded 2.6.2 (Ubuntu) → 2.11.4 (official apt repo); 2.6.2
-  rejected `servers { trusted_proxies }`. Runs as system unit
-  `hn-dashboard.service` from the tracked `Caddyfile`; packaged
-  `caddy.service` stays disabled. Admin API shows `trusted_proxies`
-  static `127.0.0.1/32`, `::1/128` live.
-- Smoke test on the VPS and from the laptop via the Funnel URL: `/hn/`,
-  `/api/feed`, `/hn/api/feed` 200; `tldr-detail` uncached then
-  `cached=True`; journal clean.
-- Loopback capture from the laptop: app receives
-  `X-Forwarded-For: <laptop IPv6>, 127.0.0.1`, so `_flask_client_ip()`
-  keys on the real client. A client-sent `X-Forwarded-For: 1.2.3.4` never
-  arrives: Funnel overwrites it.
+- Offline (8 dev folds, composite): production 0.669; SVM C=4/γ=0.05 +
+  logreg rank blend 0.714; + bge-base+mxbai 512-token embeddings 0.754.
+  Newest-vote confirmation block too noisy at the top to separate them.
+- Hand orderings, 8 batches (`scripts/calibrate_rankings.py`): production
+  agrees on 43/80 pairs, challenger 37/80 — a tie.
+- Decision: production ranking, config and embeddings unchanged. Study
+  tooling committed; `engagement_features_enabled` is opt-in, default off.
+- Details: FINDINGS.md "Ranking-quality study — 2026-09-25".
 
 ## Blocker / limits
-- Smoke tests created throwaway users in the live DB (fresh cookie jars).
-- Non-interactive SSH lacks `~/.local/bin` on PATH; export it before `uv`.
-- 18 pre-existing environmental `test_pipeline` errors on the laptop.
-- Another session has uncommitted ranking/eval WIP in the laptop checkout.
+- The newest 20% of votes has been looked at three times; only votes after
+  2026-09-25 are a clean holdout.
+- 18 pre-existing environmental `test_pipeline` errors on the laptop
+  (missing local model files).
 
 ## Next step
-None for the deploy. Relaunch the TUI to pick up the current Date view
-(12 newest stories in the deck, `f5cbb16`).
+None required. Optional: after a few hundred new votes, rerun
+`eval_ranker_variants.py` on votes after 2026-09-25 to recheck the
+challenger.

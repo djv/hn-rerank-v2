@@ -967,6 +967,17 @@ def _topk_mean(values: NDArray[np.float32], k: int) -> float:
     return float(np.partition(values, len(values) - k_actual)[-k_actual:].mean())
 
 
+def _engagement_features(stories: Sequence[Story]) -> NDArray[np.float32]:
+    """log1p HN points and comment count (meta columns; StandardScaled later)."""
+    return np.array(
+        [
+            [np.log1p(max(s.score, 0)), np.log1p(max(s.comment_count or 0, 0))]
+            for s in stories
+        ],
+        dtype=np.float32,
+    ).reshape(len(stories), 2)
+
+
 def _svm_personalization_features(
     embeddings: NDArray[np.float32],
     text_lengths: np.ndarray,
@@ -1259,6 +1270,10 @@ def _score_and_rank(
                 cand_features = np.concatenate(
                     [cand_features, publication_candidates], axis=1
                 )
+            if config.model.engagement_features_enabled:
+                cand_features = np.concatenate(
+                    [cand_features, _engagement_features(candidates)], axis=1
+                )
             if score_context is not None:
                 score_context.cand_closest_up = cand_closest_up.astype(np.float32)
                 score_context.cand_closest_up_idx = cand_closest_up_idx
@@ -1337,6 +1352,11 @@ def _score_and_rank(
                     if publication_train is not None:
                         fb_features = np.concatenate(
                             [fb_features, publication_train], axis=1
+                        )
+                    if config.model.engagement_features_enabled:
+                        fb_features = np.concatenate(
+                            [fb_features, _engagement_features(feedback_stories)],
+                            axis=1,
                         )
 
                     # Ensure all three classes (0, 1, 2) are present

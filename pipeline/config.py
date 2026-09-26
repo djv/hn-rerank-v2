@@ -27,6 +27,9 @@ class ModelConfig:
     deduplicate_training_feedback: bool = False
     publication_affinity_enabled: bool = False
     publication_prior_strength: float = 10.0
+    # Opt-in (evaluation, 2026-09-25): log1p HN points and comment count as
+    # two extra SVM meta columns.
+    engagement_features_enabled: bool = False
     neutral_weight: float = 0.0
     enable_mmr: bool = False
     diversity_threshold: float = 0.75
