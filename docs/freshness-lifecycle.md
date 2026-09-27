@@ -19,8 +19,9 @@ rebuild cold deck -> bump the pool generation (every deck goes stale) -> queue
 cached-user warms on the bounded warm pool ->
 submit independent Reddit refresh and article/TLDR background work -> wait.
 
-The deployed default is four hours **after completion**, not a fixed wall-clock
-cadence. Feedback can also trigger regeneration after an idle period. The core
+The default is one hour **after completion**, not a fixed wall-clock
+cadence. Votes don't trigger regeneration (the trailing feedback timer was
+removed 2026-09-26). The core
 loop is serial; adding more frequent triggers does not create concurrent core
 runs. A failed cycle is logged and returns to the wait loop.
 

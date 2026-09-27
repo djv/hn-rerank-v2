@@ -200,7 +200,6 @@ class Config:
     # stale page loads and post-regen refreshes all share it, so a regen that
     # marks every cached user stale can't start one rank thread per user.
     warm_pool_size: int = 2
-    feedback_regen_idle_seconds: float = 300.0
     session_create_per_ip_limit: int = 60
     session_create_per_ip_window_seconds: int = 3600
     profile_link_per_ip_limit: int = 120
@@ -223,8 +222,6 @@ class Config:
             raise ValueError("dashboard_warm_idle_seconds must be positive")
         if self.warm_pool_size < 1:
             raise ValueError("warm_pool_size must be >= 1")
-        if self.feedback_regen_idle_seconds <= 0:
-            raise ValueError("feedback_regen_idle_seconds must be positive")
         if self.model.svm_precomputed_chunk_size <= 0:
             raise ValueError("svm_precomputed_chunk_size must be positive")
         if self.embedding_ort_variant not in {

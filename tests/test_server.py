@@ -7,7 +7,6 @@ import httpx
 import pytest
 from werkzeug.serving import make_server
 
-from collections.abc import Callable
 from typing import Any, cast
 
 from server import DeckState, Handler, SKELETON_HTML, create_app
@@ -91,15 +90,10 @@ def mock_embedder() -> MockEmbedder:
 
 
 def _reset_warm_state(handler: type[Handler]) -> None:
-    feedback_regen_timer = getattr(handler, "_feedback_regen_timer", None)
-    if feedback_regen_timer is not None:
-        feedback_regen_timer.cancel()
     handler._scheduler = None
     handler._pool_generation = 1
     handler._feedback_warm_counts = {}
     handler._feedback_warm_guard = threading.Lock()
-    handler._feedback_regen_timer = None
-    handler._feedback_regen_guard = threading.Lock()
 
 
 def _make_voter(db: Database, user_id: int, story_id: int = 900_001) -> None:
@@ -112,48 +106,6 @@ def _make_voter(db: Database, user_id: int, story_id: int = 900_001) -> None:
 def _has_pending_warm(handler: type[Handler]) -> bool:
     scheduler = handler.__dict__.get("_scheduler")
     return scheduler is not None and scheduler.busy()
-
-
-def _has_pending_feedback_regen(handler: type[Handler]) -> bool:
-    with handler._feedback_regen_guard:
-        return handler._feedback_regen_timer is not None
-
-
-class _ControllableTimer(threading.Timer):
-    """`threading.Timer` stand-in for deterministic timer tests.
-
-    `start()` does not arm a real background wait; the callback only runs
-    when `.fire()` is called explicitly. `.fire()` still executes on the
-    timer's own thread (via the real `Thread.start`/`join`), so
-    `threading.current_thread()` inside the callback is the timer object
-    itself -- production code (`Handler._feedback_regen_idle_fired`) guards
-    on that identity, and a stub that ran the callback inline would make
-    that guard untestable. `cancel()` is inherited unmodified, so debounced
-    timers behave exactly as in production: a `fire()` after `cancel()` is
-    correctly a no-op.
-    """
-
-    def start(self) -> None:  # do not arm a real wait
-        pass
-
-    def fire(self) -> None:
-        self.interval = 0
-        threading.Thread.start(self)
-        self.join(timeout=1.0)
-
-
-def _controllable_timer_factory(
-    created: list[_ControllableTimer],
-) -> Callable[..., _ControllableTimer]:
-    """Build a `server._TIMER_FACTORY` replacement that records every timer
-    it creates into `created`, in creation order."""
-
-    def factory(*args: Any, **kwargs: Any) -> _ControllableTimer:
-        timer = _ControllableTimer(*args, **kwargs)
-        created.append(timer)
-        return timer
-
-    return factory
 
 
 def _drain_warms(handler: type[Handler], timeout_s: float = 3.0) -> None:
@@ -239,7 +191,6 @@ def _start_handler_server(
 def _drain_and_shutdown(server: Any, handler: type[Handler]) -> None:
     with handler._feedback_warm_guard:
         handler._feedback_warm_counts.clear()
-    handler._cancel_feedback_regen()
     _cancel_warms(handler)
     server.shutdown()
 
@@ -627,7 +578,6 @@ def test_feedback_post(test_env):
     assert records[0].story_id == 999
     assert records[0].action == "up"
     assert not regen_event.is_set()
-    assert _has_pending_feedback_regen(handler)
 
 
 def test_feedback_post_rejects_invalid_action(test_env: Any) -> None:
@@ -656,7 +606,6 @@ def test_feedback_post_rejects_invalid_action(test_env: Any) -> None:
     assert db.get_all_feedback(user.id) == []
     assert handler._dashboard_version(user.id) == handler._pool_generation
     assert not regen_event.is_set()
-    assert not _has_pending_feedback_regen(handler)
 
 
 def test_feedback_post_rejects_malformed_story_id(test_env: Any) -> None:
@@ -712,7 +661,6 @@ def test_feedback_post_invalidates_cache_and_defers_warm_until_idle(test_env):
     assert len(db.get_all_feedback(user.id)) == 1
     assert handler._dashboard_version(user.id) == starting_version + 1
     assert not regen_event.is_set()
-    assert _has_pending_feedback_regen(handler)
 
 
 def test_feedback_vote_threshold_queues_one_latest_warm(
@@ -789,105 +737,6 @@ def test_feedback_idle_threshold_queues_latest_warm(
     assert ran == [3]
 
 
-def test_feedback_regen_timer_resets_across_users_and_signals_once(
-    test_env: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """All users share one trailing regeneration request.
-
-    Uses a controllable timer (see `_controllable_timer_factory`) instead of
-    a short real `feedback_regen_idle_seconds` + `time.sleep` budget: the
-    prior version raced the wall clock and failed intermittently under
-    parallel test workers (each of the three HTTP round-trips plus two 30ms
-    sleeps had to fit inside a 150ms window). The invariant under test --
-    each vote replaces the pending timer, and a burst produces exactly one
-    regen signal -- does not need real time to verify.
-    """
-    import server
-
-    port, db, regen_event, handler, user = test_env
-    other_user = db.create_user("other_feedback_regen_user")
-    timers: list[_ControllableTimer] = []
-    monkeypatch.setattr(server, "_TIMER_FACTORY", _controllable_timer_factory(timers))
-    set_calls: list[float] = []
-    original_set = regen_event.set
-
-    def counted_set() -> None:
-        set_calls.append(time.monotonic())
-        original_set()
-
-    monkeypatch.setattr(regen_event, "set", counted_set)
-
-    for story_id in (1300, 1301, 1302):
-        db.upsert_story(
-            Story(
-                id=story_id,
-                title=f"Shared regen story {story_id}",
-                url=f"https://example.com/shared-regen-{story_id}",
-                score=100,
-                time=1600000000,
-                text_content="Feedback body text",
-                source="hn",
-            )
-        )
-
-    first = local_http.post(
-        f"http://127.0.0.1:{port}/api/feedback",
-        json={"story_id": 1300, "action": "up"},
-        cookies={"hn_token": user.token},
-    )
-    assert first.status_code == 200
-    second = local_http.post(
-        f"http://127.0.0.1:{port}/api/feedback",
-        json={"story_id": 1301, "action": "down"},
-        cookies={"hn_token": other_user.token},
-    )
-    assert second.status_code == 200
-    third = local_http.post(
-        f"http://127.0.0.1:{port}/api/feedback",
-        json={"story_id": 1302, "action": "neutral"},
-        cookies={"hn_token": user.token},
-    )
-    assert third.status_code == 200
-    assert user.id != other_user.id
-
-    # Each vote cancelled the previous timer and armed a new one: three
-    # distinct timer objects were created, and only the last is still live.
-    assert len(timers) == 3
-    assert timers[0].finished.is_set()
-    assert timers[1].finished.is_set()
-    assert not timers[2].finished.is_set()
-    assert not regen_event.is_set()
-
-    timers[2].fire()
-
-    assert regen_event.is_set()
-    assert len(set_calls) == 1
-    assert not _has_pending_feedback_regen(handler)
-
-
-def test_regeneration_start_cancels_pending_feedback_timer(
-    test_env: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A periodic regeneration satisfies the pending delayed request."""
-    import server
-
-    _, _, regen_event, handler, _ = test_env
-    timers: list[_ControllableTimer] = []
-    monkeypatch.setattr(server, "_TIMER_FACTORY", _controllable_timer_factory(timers))
-    set_calls: list[None] = []
-    monkeypatch.setattr(regen_event, "set", lambda: set_calls.append(None))
-
-    handler._schedule_feedback_regen()
-    assert _has_pending_feedback_regen(handler)
-    handler._cancel_feedback_regen()
-
-    assert timers[0].finished.is_set()
-    timers[0].fire()
-
-    assert set_calls == []
-    assert not _has_pending_feedback_regen(handler)
-
-
 def test_feedback_post_limit_returns_429_without_write(test_env) -> None:
     port, db, regen_event, handler, user = test_env
     handler.config = Config(
@@ -916,7 +765,6 @@ def test_feedback_post_limit_returns_429_without_write(test_env) -> None:
         json={"story_id": 1100, "action": "up"},
         cookies={"hn_token": user.token},
     )
-    feedback_regen_timer = handler._feedback_regen_timer
     second = local_http.post(
         f"http://127.0.0.1:{port}/api/feedback",
         json={"story_id": 1101, "action": "down"},
@@ -929,7 +777,6 @@ def test_feedback_post_limit_returns_429_without_write(test_env) -> None:
     assert second.json()["retry_after"] == int(second.headers["Retry-After"])
     records = db.get_all_feedback(user.id)
     assert [(record.story_id, record.action) for record in records] == [(1100, "up")]
-    assert handler._feedback_regen_timer is feedback_regen_timer
 
 
 @pytest.mark.parametrize(
@@ -1031,7 +878,6 @@ def test_feedback_post_invalidates_cache_with_low_queue(test_env):
     }
     assert handler._dashboard_version(user.id) == starting_version + 1
     assert not regen_event.is_set()
-    assert _has_pending_feedback_regen(handler)
 
 
 def test_feedback_post_refreshes_when_client_requests_ranking(test_env):
@@ -1069,7 +915,6 @@ def test_feedback_post_refreshes_when_client_requests_ranking(test_env):
     }
     assert len(db.get_all_feedback(user.id)) == 1
     assert not regen_event.is_set()
-    assert _has_pending_feedback_regen(handler)
 
 
 def test_feedback_post_bumps_cache_version_for_warm_rerender(test_env, monkeypatch):
@@ -1177,7 +1022,6 @@ def test_feedback_clear(test_env):
 
     assert len(db.get_all_feedback(user.id)) == 0
     assert not regen_event.is_set()
-    assert _has_pending_feedback_regen(handler)
 
 
 def test_feedback_clear_without_existing_vote_is_noop(test_env) -> None:
@@ -1211,7 +1055,6 @@ def test_feedback_clear_without_existing_vote_is_noop(test_env) -> None:
     assert resp.json()["ranking_refresh_queued"] is False
     assert db.get_all_feedback(user.id) == []
     assert not regen_event.is_set()
-    assert not _has_pending_feedback_regen(handler)
 
 
 def test_feedback_clear_then_revote_creates_new_record(test_env):
@@ -2039,7 +1882,6 @@ def test_flask_test_client_feedback_writes_and_queues_refresh(test_env: Any) -> 
     assert [(record.story_id, record.action) for record in records] == [(1710, "up")]
     assert handler._dashboard_version(user.id) == 2
     assert not regen_event.is_set()
-    assert _has_pending_feedback_regen(handler)
 
 
 def test_flask_test_client_feedback_rejects_invalid_payload(test_env: Any) -> None:

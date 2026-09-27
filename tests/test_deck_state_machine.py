@@ -67,16 +67,6 @@ class _FakeScheduler:
             self.pending[key] = (payload, version)
 
 
-class _InertTimer:
-    daemon = False
-
-    def start(self) -> None:
-        pass
-
-    def cancel(self) -> None:
-        pass
-
-
 def _ranked(story_id: int) -> RankedStory:
     story = Story(story_id, f"Story {story_id}", None, 10, 1000 + story_id, "text")
     return RankedStory(
@@ -115,8 +105,6 @@ class DeckMachine(RuleBasedStateMachine):
         Runtime.regen_event = threading.Event()
         Runtime._feedback_warm_counts = {}
         Runtime._feedback_warm_guard = threading.Lock()
-        Runtime._feedback_regen_timer = None
-        Runtime._feedback_regen_guard = threading.Lock()
         Runtime.reset_public_demo_limiter()
         self.runtime = Runtime
         self.pool = [_ranked(i) for i in STORY_IDS[:5]]
@@ -322,7 +310,6 @@ def test_deck_versions_state_machine(
 
     monkeypatch.setattr(pipeline, "fast_rerank_for_user", fake_rank)
     monkeypatch.setattr(pipeline, "generate_dashboard_bytes", fake_render)
-    monkeypatch.setattr(server, "_TIMER_FACTORY", lambda *a, **k: _InertTimer())
     monkeypatch.setattr(Handler, "_rebuild_cold_deck", classmethod(rebuild_cold_deck))
     monkeypatch.setattr(
         Handler, "_collect_after_warm_attempt", classmethod(lambda cls: None)

@@ -1,5 +1,24 @@
 # Worklog: hn-rewrite
 
+## 2026-09-26 Server: votes no longer trigger a global regen
+
+Stage S4 of `docs/server-web-alignment-plan.md`, approved after the evidence:
+- Every vote restarted a process-wide 300s timer that then ran a full regen
+  (ClickHouse fetch, cold-deck rebuild, generation bump, re-rank of every
+  cached user) and reset the hourly regen clock.
+- It dates from `7ba5972` (2026-06-18), when regen re-rendered the one static
+  page, so a vote had to trigger it. `2d09766` added per-user invalidation but
+  kept the trigger; `e94178f` only debounced it.
+- The only feedback use on the regen path is `fetch_candidates` skipping voted
+  stories (all users) when refreshing CH scores, archive seeds and RSS/Reddit
+  entries. The served pool comes from SQL with per-user vote exclusion, so the
+  voter gains nothing over their own 3s warm; running it early only stopped
+  refreshing voted stories sooner, for everyone.
+- Removed the timer, `feedback_regen_idle_seconds` (config and `config.toml`),
+  `_TIMER_FACTORY` and their tests. Hourly regen and per-user warms are
+  unchanged. Follow-up noted: `fetch_candidates` excluding every user's voted
+  stories from refresh is a cross-user leak worth fixing separately.
+
 ## 2026-09-26 Server: one deck decision, monotonic versions, idempotent votes
 
 Stage S1 of `docs/server-web-alignment-plan.md`.

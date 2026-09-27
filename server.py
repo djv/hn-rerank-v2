@@ -67,10 +67,6 @@ REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dash
 TLDR_PROMPT_VERSION = "detail-v14"
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
 _PROMPT_CACHE: dict[str, str] = {}
-# Seam for tests: swap in a controllable timer to make debounce/regen tests
-# deterministic instead of racing the real clock. Production always uses the
-# real threading.Timer.
-_TIMER_FACTORY: Callable[..., threading.Timer] = threading.Timer
 
 
 @dataclass(frozen=True)
@@ -1515,8 +1511,6 @@ class Handler:
     _tldr_prefetch_gate = BackgroundCadence()
     _feedback_warm_counts: dict[int, int] = {}
     _feedback_warm_guard = threading.Lock()
-    _feedback_regen_timer: threading.Timer | None = None
-    _feedback_regen_guard = threading.Lock()
     _public_demo_limiter = FixedWindowLimiter()
     # Uncached TLDR generations in flight (hydration + LLM, up to ~2 min
     # each). Capped so a burst can't pile up request threads that also
@@ -1676,45 +1670,6 @@ class Handler:
         delay_s = 0.0 if threshold_reached else cls.config.dashboard_warm_idle_seconds
         cls._trigger_warm(user, version, delay_s=delay_s)
         return threshold_reached
-
-    @classmethod
-    def _schedule_feedback_regen(cls) -> None:
-        """Restart the process-wide trailing regeneration timer."""
-        with cls._feedback_regen_guard:
-            previous = cls._feedback_regen_timer
-            if previous is not None:
-                previous.cancel()
-            timer = _TIMER_FACTORY(
-                cls.config.feedback_regen_idle_seconds,
-                cls._feedback_regen_idle_fired,
-            )
-            timer.daemon = True
-            cls._feedback_regen_timer = timer
-            timer.start()
-        logging.info(
-            "feedback_regen_scheduled idle_seconds=%.1f",
-            cls.config.feedback_regen_idle_seconds,
-        )
-
-    @classmethod
-    def _feedback_regen_idle_fired(cls) -> None:
-        with cls._feedback_regen_guard:
-            if cls._feedback_regen_timer is not threading.current_thread():
-                return
-            cls._feedback_regen_timer = None
-        logging.info("feedback_regen_idle_elapsed")
-        cls.regen_event.set()
-
-    @classmethod
-    def _cancel_feedback_regen(cls) -> None:
-        """Retire feedback-delayed work satisfied by a regeneration."""
-        with cls._feedback_regen_guard:
-            timer = cls._feedback_regen_timer
-            cls._feedback_regen_timer = None
-            if timer is not None:
-                timer.cancel()
-        if timer is not None:
-            logging.info("feedback_regen_pending_satisfied")
 
     @classmethod
     def _run_warm_job(cls, user: User, version: int) -> None:
@@ -2247,12 +2202,12 @@ def _handle_flask_feedback(runtime: type[Handler]) -> Response:
                 }
             )
 
-        # Every vote invalidates immediately. Personalized ranking is
-        # cadence-gated; global candidate regeneration waits for a quiet period.
-        # Stale cached refills remain safe because the client filters voted IDs.
+        # Every vote invalidates immediately; the user's re-rank is
+        # cadence-gated. Votes never trigger a global regeneration: the
+        # candidate pool doesn't depend on them (per-user ranking excludes
+        # voted stories itself).
         version = runtime._bump_user_version(user.id)
         warm_queued = runtime._schedule_feedback_warm(user, version)
-        runtime._schedule_feedback_regen()
 
         return _flask_json_response(
             {
@@ -3305,12 +3260,6 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
         if triggered:
             event.clear()
 
-        # A periodic or explicitly triggered regeneration satisfies any
-        # feedback-delayed request that was still pending. Clear the event
-        # again to close the race with a timer firing as the timeout elapsed.
-        Handler._cancel_feedback_regen()
-        event.clear()
-
         logging.info("Regeneration triggered. Fetching candidates...")
         try:
             from pipeline import fetch_candidates_only
@@ -3410,7 +3359,6 @@ def main() -> None:
     except KeyboardInterrupt:
         logging.info("Shutting down...")
     finally:
-        Handler._cancel_feedback_regen()
         db.close()
 
 
