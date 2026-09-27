@@ -221,7 +221,6 @@ class DeckMachine(RuleBasedStateMachine):
         ready = client.get(f"/api/ranking-ready?min_version={target}").get_json()
         page = client.get("/").get_data(as_text=True)
 
-        assert ready["cached_version"] == version
         assert ready["current_version"] == target == self.current(index)
         assert feed["ready"] is ready["ready"] is (version >= target)
         if feed["stories"] or version:

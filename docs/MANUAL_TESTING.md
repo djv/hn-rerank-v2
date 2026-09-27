@@ -31,14 +31,14 @@ DevTools:
 
 1. Pick a story you find interesting → click **▲** (upvote).
 2. The card should immediately change state (e.g. button gets `data-voted="up"`, color change). No full page reload.
-3. Open DevTools → Network → POST `/api/feedback`. Response: `{"ok": true, "ranking_refresh_queued": true}`.
+3. Open DevTools → Network → POST `/api/feedback`. Response: `{"ok": true, "target_version": <n>}`.
 4. Click **▼** on the same story → state changes to downvoted. The card may not visibly reorder immediately.
 5. Click **✕** on it → vote cleared.
 6. Upvote 5–10 different stories. Then refresh the page (F5).
 7. The previously upvoted stories should be ranked higher than before.
 
 What to check:
-- `POST /api/feedback` returns `ranking_refresh_queued: true` for new votes, `false` for re-votes on the same `(user, story)` with the same `action`.
+- `POST /api/feedback` returns a higher `target_version` for a new vote, and the same one for a re-vote on the same `(user, story)` with the same `action` (nothing changes).
 - After ~1 s of voting, the next dashboard request is a stale-while-revalidate hit (no skeleton, just the old dashboard). Within a few seconds the warm finishes and the new ranking shows up.
 - Vote-clear (`action: "clear"`) should remove the card's `data-voted` attribute and free that story to be ranked neutrally.
 

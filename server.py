@@ -2219,11 +2219,7 @@ def _handle_flask_feedback(runtime: type[Handler]) -> Response:
             # nothing is refreshed (a client retrying a vote it isn't sure
             # landed gets the version it already has).
             return _flask_json_response(
-                {
-                    "ok": True,
-                    "ranking_refresh_queued": False,
-                    "target_version": runtime._dashboard_version(user.id),
-                }
+                {"ok": True, "target_version": runtime._dashboard_version(user.id)}
             )
 
         # Every vote invalidates immediately; the user's re-rank is
@@ -2231,16 +2227,8 @@ def _handle_flask_feedback(runtime: type[Handler]) -> Response:
         # candidate pool doesn't depend on them (per-user ranking excludes
         # voted stories itself).
         version = runtime._bump_user_version(user.id)
-        warm_queued = runtime._schedule_feedback_warm(user, version)
-
-        return _flask_json_response(
-            {
-                "ok": True,
-                "ranking_refresh_queued": warm_queued,
-                "target_version": version,
-                "ranking_idle_seconds": runtime.config.dashboard_warm_idle_seconds,
-            }
-        )
+        runtime._schedule_feedback_warm(user, version)
+        return _flask_json_response({"ok": True, "target_version": version})
     except Exception:
         logging.exception("Error handling feedback")
         return _flask_json_response(
@@ -3106,39 +3094,21 @@ def _handle_flask_ranking_ready(runtime: type[Handler]) -> Response:
             {"error": "No session"}, status=HTTPStatus.UNAUTHORIZED
         )
 
-    raw_min_versions = request.args.getlist("min_version")
-    raw_legacy_versions = request.args.getlist("version")
-    if raw_min_versions and raw_legacy_versions:
-        return _invalid_version_response()
-    raw_versions = raw_min_versions or raw_legacy_versions
+    # Clients send the version they wait for; older TUIs also send
+    # target_version, which is ignored.
+    raw_versions = request.args.getlist("min_version")
     if len(raw_versions) != 1:
         return _invalid_version_response()
-
     min_version = _parse_non_negative_version(raw_versions[0])
     if min_version is None:
         return _invalid_version_response()
 
-    raw_target_versions = request.args.getlist("target_version")
-    if len(raw_target_versions) > 1:
-        return _invalid_version_response()
-    target_version = min_version
-    if raw_target_versions:
-        parsed_target = _parse_non_negative_version(raw_target_versions[0])
-        if parsed_target is None:
-            return _invalid_version_response()
-        target_version = parsed_target
-
     view = runtime._deck_for_user(user)
-    ready = view.version >= min_version
     return _flask_json_response(
         {
             "ok": True,
-            "ready": ready,
-            "ready_version": view.version if ready else None,
-            "min_version": min_version,
-            "target_version": target_version,
+            "ready": view.version >= min_version,
             "current_version": view.current,
-            "cached_version": view.version,
         }
     )
 

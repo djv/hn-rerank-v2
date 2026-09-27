@@ -1461,7 +1461,7 @@
       const wanted = snapshot.ready ? snapshot.version : snapshot.target_version;
       let data;
       try {
-        const resp = await request(`/api/ranking-ready?min_version=${wanted}&target_version=${wanted}`);
+        const resp = await request(`/api/ranking-ready?min_version=${wanted}`);
         if (!resp.ok) return;
         data = await resp.json();
       } catch {

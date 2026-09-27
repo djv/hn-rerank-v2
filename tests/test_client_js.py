@@ -424,9 +424,7 @@ def test_poller_reloads_only_for_a_newer_deck(
     console.log(JSON.stringify({{ asked, reloading: pending('/api/feed').length }}));
     """)
     wanted = 5 if ready else 7
-    assert result["asked"] == [
-        f"/api/ranking-ready?min_version={wanted}&target_version={wanted}"
-    ]
+    assert result["asked"] == [f"/api/ranking-ready?min_version={wanted}"]
     assert result["reloading"] == (1 if reloads else 0)
 
 

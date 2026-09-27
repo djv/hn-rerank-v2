@@ -569,9 +569,7 @@ def test_feedback_post(test_env):
     assert resp.status_code == 200
     assert resp.json() == {
         "ok": True,
-        "ranking_refresh_queued": False,
         "target_version": 2,
-        "ranking_idle_seconds": 3.0,
     }
 
     records = db.get_all_feedback(user.id)
@@ -655,9 +653,7 @@ def test_feedback_post_invalidates_cache_and_defers_warm_until_idle(test_env):
     assert resp.status_code == 200
     assert resp.json() == {
         "ok": True,
-        "ranking_refresh_queued": False,
         "target_version": starting_version + 1,
-        "ranking_idle_seconds": handler.config.dashboard_warm_idle_seconds,
     }
     assert len(db.get_all_feedback(user.id)) == 1
     assert handler._dashboard_version(user.id) == starting_version + 1
@@ -703,9 +699,7 @@ def test_feedback_vote_threshold_queues_one_latest_warm(
         for story_id in range(1200, 1210)
     ]
 
-    assert [response["ranking_refresh_queued"] for response in responses] == [
-        False
-    ] * 9 + [True]
+    assert [response["target_version"] for response in responses] == list(range(2, 12))
     # Each vote below the threshold (re)starts the idle wait; the 10th vote
     # asks for the latest version immediately.
     assert calls == [(user.id, 1 + n, 60.0) for n in range(1, 10)] + [
@@ -873,9 +867,7 @@ def test_feedback_post_invalidates_cache_with_low_queue(test_env):
     assert resp.status_code == 200
     assert resp.json() == {
         "ok": True,
-        "ranking_refresh_queued": False,
         "target_version": starting_version + 1,
-        "ranking_idle_seconds": handler.config.dashboard_warm_idle_seconds,
     }
     assert handler._dashboard_version(user.id) == starting_version + 1
     assert not regen_event.is_set()
@@ -910,9 +902,7 @@ def test_feedback_post_refreshes_when_client_requests_ranking(test_env):
     assert resp.status_code == 200
     assert resp.json() == {
         "ok": True,
-        "ranking_refresh_queued": False,
         "target_version": 2,
-        "ranking_idle_seconds": handler.config.dashboard_warm_idle_seconds,
     }
     assert len(db.get_all_feedback(user.id)) == 1
     assert not regen_event.is_set()
@@ -970,9 +960,7 @@ def test_feedback_post_bumps_cache_version_for_warm_rerender(test_env, monkeypat
     assert resp.status_code == 200
     assert resp.json() == {
         "ok": True,
-        "ranking_refresh_queued": True,
         "target_version": pre_version + 1,
-        "ranking_idle_seconds": handler.config.dashboard_warm_idle_seconds,
     }
 
     post_version = handler._dashboard_version(user.id)
@@ -1016,9 +1004,7 @@ def test_feedback_clear(test_env):
     assert resp.status_code == 200
     assert resp.json() == {
         "ok": True,
-        "ranking_refresh_queued": False,
         "target_version": 2,
-        "ranking_idle_seconds": handler.config.dashboard_warm_idle_seconds,
     }
 
     assert len(db.get_all_feedback(user.id)) == 0
@@ -1053,7 +1039,10 @@ def test_feedback_clear_without_existing_vote_is_noop(test_env) -> None:
 
     assert resp.status_code == 200
     assert resp.json()["ok"] is True
-    assert resp.json()["ranking_refresh_queued"] is False
+    assert resp.json() == {
+        "ok": True,
+        "target_version": handler._dashboard_version(user.id),
+    }
     assert db.get_all_feedback(user.id) == []
     assert not regen_event.is_set()
 
@@ -1092,7 +1081,7 @@ def test_ranking_ready_rejects_invalid_version(test_env, version: str) -> None:
     port, _, _, _, user = test_env
 
     resp = local_http.get(
-        f"http://127.0.0.1:{port}/api/ranking-ready?version={version}",
+        f"http://127.0.0.1:{port}/api/ranking-ready?min_version={version}",
         cookies={"hn_token": user.token},
     )
 
@@ -1113,7 +1102,7 @@ def test_ranking_ready_false_when_cache_missing_or_older(test_env, monkeypatch) 
     target_version = handler._bump_user_version(user.id)
 
     missing_resp = local_http.get(
-        f"http://127.0.0.1:{port}/api/ranking-ready?version={target_version}",
+        f"http://127.0.0.1:{port}/api/ranking-ready?min_version={target_version}",
         cookies={"hn_token": user.token},
     )
 
@@ -1122,22 +1111,17 @@ def test_ranking_ready_false_when_cache_missing_or_older(test_env, monkeypatch) 
     assert missing_resp.json() == {
         "ok": True,
         "ready": False,
-        "ready_version": None,
-        "min_version": target_version,
-        "target_version": target_version,
         "current_version": target_version,
-        "cached_version": 0,
     }
 
     handler._decks[user.id] = DeckState([], time.time(), target_version - 1)
     older_resp = local_http.get(
-        f"http://127.0.0.1:{port}/api/ranking-ready?version={target_version}",
+        f"http://127.0.0.1:{port}/api/ranking-ready?min_version={target_version}",
         cookies={"hn_token": user.token},
     )
 
     assert older_resp.status_code == 200
     assert older_resp.json()["ready"] is False
-    assert older_resp.json()["cached_version"] == target_version - 1
     # Without a deck the warm is urgent; polling a stale deck is passive and
     # must not cut short a queued vote-debounce warm.
     assert calls == [(user.id, target_version, True), (user.id, target_version, False)]
@@ -1155,7 +1139,7 @@ def test_ranking_ready_true_only_from_cached_version(test_env, monkeypatch) -> N
     handler._decks[user.id] = DeckState([], time.time(), target_version)
 
     resp = local_http.get(
-        f"http://127.0.0.1:{port}/api/ranking-ready?version={target_version}",
+        f"http://127.0.0.1:{port}/api/ranking-ready?min_version={target_version}",
         cookies={"hn_token": user.token},
     )
 
@@ -1163,11 +1147,7 @@ def test_ranking_ready_true_only_from_cached_version(test_env, monkeypatch) -> N
     assert resp.json() == {
         "ok": True,
         "ready": True,
-        "ready_version": target_version,
-        "min_version": target_version,
-        "target_version": target_version,
         "current_version": target_version,
-        "cached_version": target_version,
     }
     assert calls == []
 
@@ -1178,15 +1158,13 @@ def test_ranking_ready_true_for_older_requested_version(test_env) -> None:
     handler._decks[user.id] = DeckState([], time.time(), newer_version)
 
     resp = local_http.get(
-        f"http://127.0.0.1:{port}/api/ranking-ready?version={newer_version - 1}",
+        f"http://127.0.0.1:{port}/api/ranking-ready?min_version={newer_version - 1}",
         cookies={"hn_token": user.token},
     )
 
     assert resp.status_code == 200
     assert resp.json()["ready"] is True
-    assert resp.json()["ready_version"] == newer_version
-    assert resp.json()["min_version"] == newer_version - 1
-    assert resp.json()["cached_version"] == newer_version
+    assert resp.json()["current_version"] == newer_version
 
 
 def test_ranking_ready_returns_intermediate_cached_version(
@@ -1213,29 +1191,26 @@ def test_ranking_ready_returns_intermediate_cached_version(
     assert resp.json() == {
         "ok": True,
         "ready": True,
-        "ready_version": 3,
-        "min_version": 2,
-        "target_version": 4,
         "current_version": 4,
-        "cached_version": 3,
     }
     assert calls == [(user.id, 4)]
 
 
-def test_ranking_ready_version_param_remains_compat_alias(test_env) -> None:
+def test_ranking_ready_ignores_target_version_and_rejects_the_old_alias(
+    test_env,
+) -> None:
     port, _, _, handler, user = test_env
-    target_version = handler._bump_user_version(user.id)
-    handler._decks[user.id] = DeckState([], time.time(), target_version)
-
-    resp = local_http.get(
-        f"http://127.0.0.1:{port}/api/ranking-ready?version={target_version}",
+    current = handler._dashboard_version(user.id)
+    ok = local_http.get(
+        f"http://127.0.0.1:{port}/api/ranking-ready?min_version={current}&target_version=1",
         cookies={"hn_token": user.token},
     )
-
-    assert resp.status_code == 200
-    assert resp.json()["ready"] is True
-    assert resp.json()["ready_version"] == target_version
-    assert resp.json()["min_version"] == target_version
+    assert ok.json() == {"ok": True, "ready": True, "current_version": current}
+    legacy = local_http.get(
+        f"http://127.0.0.1:{port}/api/ranking-ready?version={current}",
+        cookies={"hn_token": user.token},
+    )
+    assert legacy.status_code == 400
 
 
 def _wait_for_cache(handler, user, expected_version, timeout=3.0):
@@ -1673,7 +1648,7 @@ def test_cors_headers(app_env):
     [
         ("GET", "/api/user", None),
         ("GET", "/api/feed", None),
-        ("GET", "/api/ranking-ready?version=0", None),
+        ("GET", "/api/ranking-ready?min_version=0", None),
         ("GET", "/api/tldr-cache/1", None),
         ("POST", "/api/feedback", {"story_id": 1, "action": "up"}),
     ],
@@ -1801,7 +1776,7 @@ def test_flask_test_client_ranking_ready_validates_version(app_env: Any) -> None
     client = create_app(handler).test_client()
     client.set_cookie("hn_token", user.token)
 
-    resp = client.get("/api/ranking-ready?version=-1")
+    resp = client.get("/api/ranking-ready?min_version=-1")
 
     assert resp.status_code == 400
     assert resp.get_json() == {"error": "Invalid version"}
@@ -1830,11 +1805,7 @@ def test_flask_test_client_ranking_ready_reports_missing_cache(
     assert resp.get_json() == {
         "ok": True,
         "ready": False,
-        "ready_version": None,
-        "min_version": version,
-        "target_version": 3,
         "current_version": version,
-        "cached_version": 0,
     }
     assert calls == [(user.id, version)]
 
@@ -1875,9 +1846,7 @@ def test_flask_test_client_feedback_writes_and_queues_refresh(test_env: Any) -> 
     assert resp.status_code == 200
     assert resp.get_json() == {
         "ok": True,
-        "ranking_refresh_queued": False,
         "target_version": 2,
-        "ranking_idle_seconds": handler.config.dashboard_warm_idle_seconds,
     }
     records = db.get_all_feedback(user.id)
     assert [(record.story_id, record.action) for record in records] == [(1710, "up")]

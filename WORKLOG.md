@@ -1,5 +1,15 @@
 # Worklog: hn-rewrite
 
+## 2026-09-26 API: ranking-ready and feedback return what clients read
+
+Stage C1 of `docs/server-web-alignment-plan.md`. `GET /api/ranking-ready`
+takes `min_version` and returns `{ok, ready, current_version}` (dropped
+`ready_version`, `cached_version` and the echoed versions; the legacy
+`version=` alias is now a 400; `target_version` from older TUIs is
+ignored). `POST /api/feedback` returns `{ok, target_version}` (dropped
+`ranking_refresh_queued` and `ranking_idle_seconds`, which only the old web
+refill timer read). Both clients already read only these fields.
+
 ## 2026-09-26 Web client: keys match the terminal client
 
 Stage W4 of `docs/server-web-alignment-plan.md`. `j`/`k` move, `1`/`2`/`3`
