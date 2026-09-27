@@ -25,6 +25,8 @@ and, since 2026-09-26, which sources feed it.
   TUI's poller/votes/summaries/keys, slimmer ranking-ready/feedback.
   All live on the VPS since 2026-09-27 02:02 UTC (`f7cfbe7`); smoked in
   headless Chrome over the tailnet (read-only) with a clean journal.
+- Page runs in headless Chrome in CI (`tests/test_browser.py`); unused CSS
+  removed. VPS at `c1c676b` since 2026-09-27 11:22 UTC, smoked clean.
 
 ## Blocker / limits
 - New feeds and the Reddit throttle have under a day of data.

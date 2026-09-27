@@ -1,5 +1,12 @@
 # Worklog: hn-rewrite
 
+## 2026-09-27 Deployed `c1c676b` (browser test, CSS sweep)
+
+VPS fast-forwarded from `f7cfbe7`, restarted 11:22:43 UTC. Headless Chrome
+over the tailnet (read-only, no votes): 57 stories, 12 in view, summary
+loaded, `j`/`h` and the poller work, layout unchanged from the pre-sweep
+screenshot; only a favicon 404. No tracebacks or `[ERROR]` lines.
+
 ## 2026-09-27 Dead-code sweep after the web client rewrite
 
 Removed CSS for classes no page, component or script emits any more
