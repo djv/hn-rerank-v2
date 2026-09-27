@@ -1,5 +1,17 @@
 # Worklog: hn-rewrite
 
+## 2026-09-26 Web client: keys match the terminal client
+
+Stage W4 of `docs/server-web-alignment-plan.md`. `j`/`k` move, `1`/`2`/`3`
+vote, `u` undo, `o`/`c` open, `y` copy link, `r` refresh, `s`/`l`/`h` sorts,
+`?` help; web-only `a` (age), `b` (panel), `f` (fullscreen). Dropped the old
+`k`/`j`/`l` votes, `r`/`p`/`x`/`d`/`e` direct filters, `t` (use `r` or the
+re-summarize button) and the tab-label mnemonics. The side rail, vote-bar
+titles and the key overview are updated; the overview shows once more for
+everyone (new flag) and `?` reopens it (it could not be dismissed after the
+first visit before). Test: the key map runs under Node against recorded
+actions; checked headless.
+
 ## 2026-09-26 Web client: feed JSON, one reload path, ordered votes, shared summaries
 
 Stages W1-W3 of `docs/server-web-alignment-plan.md` (one commit: all three

@@ -320,10 +320,10 @@ def _build_tab_groups() -> tuple[TabGroupView, ...]:
             data_attr="sort",
             segmented=False,
             tabs=(
-                TabView("recommended", "<u>R</u>ecommended", True),
-                TabView("popular", "<u>P</u>opular"),
-                TabView("explore", "E<u>x</u>plore"),
-                TabView("date", "<u>D</u>ate"),
+                TabView("recommended", "Recommended", True),
+                TabView("popular", "Popular"),
+                TabView("explore", "Explore"),
+                TabView("date", "Date"),
             ),
         ),
         TabGroupView(
@@ -333,7 +333,7 @@ def _build_tab_groups() -> tuple[TabGroupView, ...]:
             data_attr="age",
             segmented=True,
             tabs=(
-                TabView("recent", "R<u>e</u>cent", True),
+                TabView("recent", "Recent", True),
                 TabView("archive", "<u>A</u>rchive"),
             ),
         ),

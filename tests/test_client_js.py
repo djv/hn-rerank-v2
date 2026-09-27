@@ -200,18 +200,43 @@ def test_tldr_markdown_output_only_contains_safe_markup(docs: list[str]) -> None
         assert audit.problems == [], (doc, html, audit.problems)
 
 
-
-
 # The dashboard client: feed, views, votes, freshness, summaries -------------
 
 _CLIENT_FUNCTIONS = (
-    "parseFeed", "viewKey", "viewOrder", "restoreStory", "setFeed", "render",
-    "activeCard", "setActive", "move", "updateStatus", "setFilter", "cycleSort",
-    "tintByRank", "feedCard", "routePrefix", "apiPath", "request", "reload",
-    "pollFeedVersion", "setVoteCounts", "adjustVoteCount", "applyVote",
-    "applyUndo", "vote", "undo", "submit", "summaryFor", "track",
-    "lookupSummary", "generateSummary", "keepSummary", "loadSummary",
-    "withPrefetchSlot", "prefetchUpcoming",
+    "parseFeed",
+    "viewKey",
+    "viewOrder",
+    "restoreStory",
+    "setFeed",
+    "render",
+    "activeCard",
+    "setActive",
+    "move",
+    "updateStatus",
+    "setFilter",
+    "cycleSort",
+    "tintByRank",
+    "feedCard",
+    "routePrefix",
+    "apiPath",
+    "request",
+    "reload",
+    "pollFeedVersion",
+    "setVoteCounts",
+    "adjustVoteCount",
+    "applyVote",
+    "applyUndo",
+    "vote",
+    "undo",
+    "submit",
+    "summaryFor",
+    "track",
+    "lookupSummary",
+    "generateSummary",
+    "keepSummary",
+    "loadSummary",
+    "withPrefetchSlot",
+    "prefetchUpcoming",
 )
 
 _CLIENT_DOM = r"""
@@ -292,7 +317,9 @@ console.error = () => {}; console.debug = () => {};
 def _client_harness(scenario: str) -> Any:
     script = _inline_script()
     constants = script[
-        script.index("    const VIEW_LIMIT = ") : script.index("    let activeInteraction = null;\n")
+        script.index("    const VIEW_LIMIT = ") : script.index(
+            "    let activeInteraction = null;\n"
+        )
     ]
     first = "    const FIRST = Symbol('first');\n"
     assert first in script
@@ -313,7 +340,9 @@ def _client_harness(scenario: str) -> Any:
     return result
 
 
-def test_votes_hide_at_once_go_out_in_order_and_a_failure_reverts_only_its_story() -> None:
+def test_votes_hide_at_once_go_out_in_order_and_a_failure_reverts_only_its_story() -> (
+    None
+):
     result = _client_harness(r"""
     setFeed(makeFeed([1, 2, 3, 4]));
     const start = state();
@@ -366,7 +395,11 @@ def test_undo_puts_the_story_back_where_the_server_ranks_it() -> None:
     assert result["undone"]["active"] == 2
     assert result["undone"]["counts"] == [0, 0, 0]
     assert result["sent"] == [{"story_id": 2, "action": "clear"}]
-    assert result["end"]["visible"] == [1, 3, 4] and result["end"]["counts"] == [0, 1, 0]
+    assert result["end"]["visible"] == [1, 3, 4] and result["end"]["counts"] == [
+        0,
+        1,
+        0,
+    ]
 
 
 @pytest.mark.parametrize(
@@ -476,3 +509,48 @@ def test_cards_are_built_from_text_only() -> None:
     assert "<img src=x onerror=alert(1)>" in result["text"]
     assert "Because you upvoted: <b>x</b>" in result["text"]
     assert result["id"] == "9" and result["version"] == "5"
+
+
+def test_keys_match_the_terminal_client() -> None:
+    """The key map runs the same actions as the TUI's bindings (plus the
+    web-only a and f)."""
+    script = _inline_script()
+    start = script.index("    const KEY_ACTIONS = {")
+    keymap = script[start : script.index("    };\n", start) + len("    };\n")]
+    result = run_node(
+        r"""
+const done = [];
+const record = name => (...args) => done.push([name, ...args]);
+const move = record('move'), vote = record('vote'), undo = record('undo');
+const openStoryUrl = record('open'), copyLink = record('copy'), reload = record('reload');
+const cycleSort = record('sort'), setFilter = record('filter'), showHelp = record('help');
+const togglePanel = record('fullscreen');
+let currentAge = 'recent';
+const sidePanel = { classList: { toggle: () => done.push(['panel']) } };
+"""
+        + keymap
+        + r"""
+const out = {};
+for (const key of Object.keys(KEY_ACTIONS)) { done.length = 0; KEY_ACTIONS[key](); out[key] = done[0]; }
+console.log(JSON.stringify(out));
+"""
+    )
+    assert result == {
+        "j": ["move", 1],
+        "k": ["move", -1],
+        "1": ["vote", "up"],
+        "2": ["vote", "neutral"],
+        "3": ["vote", "down"],
+        "u": ["undo"],
+        "o": ["open", "article"],
+        "c": ["open", "comments"],
+        "y": ["copy"],
+        "r": ["reload", {"manual": True}],
+        "s": ["sort", 1],
+        "l": ["sort", 1],
+        "h": ["sort", -1],
+        "a": ["filter", "age", "archive"],
+        "b": ["panel"],
+        "?": ["help"],
+        "f": ["fullscreen"],
+    }

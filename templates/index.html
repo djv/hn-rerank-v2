@@ -2054,21 +2054,41 @@
       flushInteractionEvents();
     });
 
+    function copyLink() {
+      const story = storiesById.get(activeId);
+      const url = story && (story.comments_url || story.article_url);
+      if (!url) return;
+      navigator.clipboard.writeText(url).then(
+        () => showToast(`Copied ${url}`, 'success'),
+        () => showToast(url, 'info'),
+      );
+    }
+
+    function showHelp() {
+      const tip = document.getElementById('first-time-tip');
+      if (!tip) return;
+      tip.hidden = false;
+      tip.querySelector('[data-dismiss-tip]')?.focus();
+    }
+
+    // The terminal client's keys; a (age) and f (fullscreen) are web-only.
     const KEY_ACTIONS = {
-      k: () => vote('up'),
-      j: () => vote('down'),
-      l: () => vote('neutral'),
+      j: () => move(1),
+      k: () => move(-1),
+      1: () => vote('up'),
+      2: () => vote('neutral'),
+      3: () => vote('down'),
+      u: () => undo(),
       o: () => openStoryUrl('article'),
       c: () => openStoryUrl('comments'),
-      u: () => undo(),
-      r: () => setFilter('sort', 'recommended'),
-      p: () => setFilter('sort', 'popular'),
-      x: () => setFilter('sort', 'explore'),
-      d: () => setFilter('sort', 'date'),
-      e: () => setFilter('age', 'recent'),
-      a: () => setFilter('age', 'archive'),
-      t: () => activeId !== null && loadSummary(activeId, { force: true }),
-      s: () => reload({ manual: true }),
+      y: () => copyLink(),
+      r: () => reload({ manual: true }),
+      s: () => cycleSort(1),
+      l: () => cycleSort(1),
+      h: () => cycleSort(-1),
+      a: () => setFilter('age', currentAge === 'recent' ? 'archive' : 'recent'),
+      b: () => sidePanel.classList.toggle('visible'),
+      '?': () => showHelp(),
       f: () => togglePanel(),
     };
 
@@ -2087,21 +2107,21 @@
       }
     });
 
-    // First-time tip dismissal
+    // The key overview: shown once on a first visit, then on ?. The flag
+    // changed with the keys, so everyone sees the new ones once.
     (function() {
       const tip = document.getElementById('first-time-tip');
-      const flag = 'hn_first_tip_seen_v2';
-      if (tip && !localStorage.getItem(flag)) {
-        tip.hidden = false;
-        tip.querySelector('[data-dismiss-tip]')?.focus();
-        const dismiss = () => {
-          tip.hidden = true;
-          localStorage.setItem(flag, '1');
-        };
-        tip.querySelector('[data-dismiss-tip]')?.addEventListener('click', dismiss);
-        tip.addEventListener('click', (e) => { if (e.target === tip) dismiss(); });
-        tip.addEventListener('keydown', (e) => { if (e.key === 'Escape') dismiss(); });
-      }
+      const flag = 'hn_first_tip_seen_v3';
+      if (!tip) return;
+      const dismiss = () => {
+        tip.hidden = true;
+        localStorage.setItem(flag, '1');
+        focusActiveCard();
+      };
+      tip.querySelector('[data-dismiss-tip]')?.addEventListener('click', dismiss);
+      tip.addEventListener('click', (e) => { if (e.target === tip) dismiss(); });
+      tip.addEventListener('keydown', (e) => { if (e.key === 'Escape') dismiss(); });
+      if (!localStorage.getItem(flag)) showHelp();
     })();
 
     setFeed(readEmbeddedFeed() || parseFeed({

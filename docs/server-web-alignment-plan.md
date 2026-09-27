@@ -2,7 +2,7 @@
 
 Status: approved 2026-09-26, in progress. Done: S1 (also removed
 `/api/deck-cards`, planned for S3, and fixed a stale-deck gap the state
-machine found; see WORKLOG), S4 (vote-triggered regen dropped), S2, S3. Server first, then web, then one
+machine found; see WORKLOG), S4 (vote-triggered regen dropped), S2, S3, W1-W3 (one commit), W4. Server first, then web, then one
 contract cleanup; one commit per stage, tests green at every commit. Nothing
 is deployed until the end, and the VPS deploy waits for your OK.
 
