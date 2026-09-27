@@ -82,6 +82,11 @@ HN baseline: 6031 / 1696 / 21%.
   r/transit (27% up / 36% down), r/MachineLearning (34% / 38%).
 - No AI provider blogs (user preference, 2026-09-27): deepmind.google,
   research.google and huggingface.co feeds dropped too.
+- Independent sites user 1 upvotes on HN, added 2026-09-27: dynomight.net
+  (3/5 up), borretti.me (3/4), martinalderson.com (3/4), vickiboykis.com
+  (3/4), e360.yale.edu (3/5), sciencedaily.com (5/9). Small samples; judge
+  with `source_yield_report.py` after a few weeks. Skipped: newyorker
+  (paywall), macrumors (3 down of 7), seangoedecke (2 down of 6).
 - Reddit 429s ~150/day: mostly one retry, circuit opened once in 3 days,
   no feed failed. Cause: each regen refreshes every subreddit, and votes
   trigger a regen about every 20 minutes; only ~4 of 21 weekly-top feeds

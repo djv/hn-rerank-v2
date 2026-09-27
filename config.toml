@@ -86,11 +86,18 @@ feeds = [
     "https://erikbern.com/feed",
     "https://evidence.nihr.ac.uk/feed/",
     "https://www.quantamagazine.org/feed/",
+    "https://e360.yale.edu/feed.xml",
+    "https://www.sciencedaily.com/rss/top/science.xml",
     "https://aeon.co/feed.rss",
     "https://discourse.haskell.org/latest.rss",
 
     # Software / systems / AI coding
     "https://jvns.ca/atom.xml",
+    # Independent writers user 1 upvotes on HN (3 of 4-5 votes each)
+    "https://dynomight.net/feed.xml",
+    "https://borretti.me/feed.xml",
+    "https://martinalderson.com/feed.xml",
+    "https://vickiboykis.com/index.xml",
 
     # Progress / cities / infrastructure
     "https://worksinprogress.co/rss.xml",
