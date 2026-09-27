@@ -20,6 +20,7 @@ SCRIPT_MAINS = [
     "backfill_hn_comments",
     "backfill_lesswrong_score",
     "backfill_reddit_metadata",
+    "backfill_rss_articles",
     "backfill_rss_self_text",
     "bakeoff_embedding_models",
     "bakeoff_tldr_providers",
