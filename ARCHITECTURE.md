@@ -729,6 +729,9 @@ Core regeneration publishes ClickHouse/HN and ordinary RSS candidates without
 waiting for Reddit's deliberately slow request queue. `RedditRefreshWorker`
 coalesces refresh requests, runs topfeed discovery followed by bounded comment
 hydration, and rebuilds cached decks once when a batch changes story content.
+Every regen requests a refresh, but starts are spaced by
+`reddit_refresh_min_interval_seconds` (2h); a request inside the window waits
+for it to end, which keeps Reddit 429s down while weekly-top feeds barely move.
 SQLite retains per-feed success/retry metadata, ordered snapshot membership,
 and restart-safe global circuit cooldown state. Production ranking admits only
 recent rows whose source is derived from the currently configured feed list.

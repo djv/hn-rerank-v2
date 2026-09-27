@@ -111,6 +111,11 @@ class Config:
     # subreddit per fetch at the limiter's natural 2s+jitter cadence,
     # but the queue spreads them out at 50s for 429 backoff headroom).
     reddit_min_fetch_spacing_seconds: float = 30.0
+    # Start-to-start spacing of full subreddit refreshes. Each regen asks
+    # for one (votes trigger regens every ~20 min), but weekly-top feeds
+    # barely change; a request inside the window waits for it to end.
+    # 0 disables the throttle.
+    reddit_refresh_min_interval_seconds: float = 7200.0
     article_fetch_max_per_run: int = 50
     article_fetch_concurrency: int = 10
     article_fetch_max_age_days: int = 30

@@ -14,7 +14,11 @@ from reddit_limiter import RedditCircuitSnapshot, limiter as reddit_limiter
 
 
 class RedditRefreshWorker:
-    """Run at most one Reddit refresh and retain one pending rerun."""
+    """Run at most one Reddit refresh and retain one pending rerun.
+
+    Refresh starts are spaced by ``reddit_refresh_min_interval_seconds``; a
+    rerun requested sooner is deferred to the end of that window.
+    """
 
     def __init__(
         self,
@@ -30,6 +34,7 @@ class RedditRefreshWorker:
         self._condition = threading.Condition()
         self._pending = False
         self._stopping = False
+        self._last_started: float | None = None
         self._thread = threading.Thread(
             target=self._run, name="reddit-refresh", daemon=True
         )
@@ -54,9 +59,16 @@ class RedditRefreshWorker:
             with self._condition:
                 while not self._pending and not self._stopping:
                     self._condition.wait()
+                interval = self._config.reddit_refresh_min_interval_seconds
+                while not self._stopping and self._last_started is not None:
+                    remaining = self._last_started + interval - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self._condition.wait(timeout=remaining)
                 if self._stopping:
                     return
                 self._pending = False
+                self._last_started = time.monotonic()
             try:
                 from pipeline import refresh_reddit_candidates
 
