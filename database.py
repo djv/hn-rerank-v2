@@ -1031,19 +1031,22 @@ class Database:
         user_id: int,
         story_id: int,
         action: Action,
-    ) -> None:
+    ) -> bool:
+        """Record a vote; False when the story already had this vote."""
         with self.conn() as conn:
             with conn:
-                conn.execute(
+                cursor = conn.execute(
                     """
                     INSERT INTO feedback (user_id, story_id, action, updated_at)
                     VALUES (?, ?, ?, ?)
                     ON CONFLICT(user_id, story_id) DO UPDATE SET
                         action=excluded.action,
                         updated_at=excluded.updated_at
+                    WHERE feedback.action != excluded.action
                     """,
                     (user_id, story_id, action, time.time()),
                 )
+                return cursor.rowcount > 0
 
     def get_all_feedback(self, user_id: int | None = None) -> list[FeedbackRecord]:
         with self.conn() as conn:

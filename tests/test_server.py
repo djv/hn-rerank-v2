@@ -5,7 +5,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import httpx
 import pytest
-from hypothesis import HealthCheck, given, settings, strategies as st
 from werkzeug.serving import make_server
 
 from collections.abc import Callable
@@ -101,6 +100,13 @@ def _reset_warm_state(handler: type[Handler]) -> None:
     handler._feedback_warm_guard = threading.Lock()
     handler._feedback_regen_timer = None
     handler._feedback_regen_guard = threading.Lock()
+
+
+def _make_voter(db: Database, user_id: int, story_id: int = 900_001) -> None:
+    """Give a user one vote: only voters get a personalized deck (a user
+    without votes is served the shared cold deck and never warmed)."""
+    db.upsert_story(Story(story_id, "Voted story", None, 1, 1, "text", source="hn"))
+    db.upsert_feedback(user_id, story_id, "up")
 
 
 def _has_pending_warm(handler: type[Handler]) -> bool:
@@ -556,7 +562,8 @@ def test_token_redirect_profile_link_limit_uses_forwarded_for(test_env) -> None:
 
 
 def test_static_serving(test_env):
-    port, _, _, handler, user = test_env
+    port, db, _, handler, user = test_env
+    _make_voter(db, user.id)
     # Pre-warm cache so HTTP request hits cached dashboard.
     result = handler._render_dashboard_for_user(user)
     assert result == SKELETON_HTML
@@ -1249,7 +1256,8 @@ def test_ranking_ready_rejects_invalid_version(test_env, version: str) -> None:
 
 
 def test_ranking_ready_false_when_cache_missing_or_older(test_env, monkeypatch) -> None:
-    port, _, _, handler, user = test_env
+    port, db, _, handler, user = test_env
+    _make_voter(db, user.id)
     calls: list[tuple[int, int, bool]] = []
 
     def fake_trigger_warm(
@@ -1266,6 +1274,7 @@ def test_ranking_ready_false_when_cache_missing_or_older(test_env, monkeypatch) 
     )
 
     assert missing_resp.status_code == 200
+    # No deck yet: the cold deck (version 0) is served while the warm runs.
     assert missing_resp.json() == {
         "ok": True,
         "ready": False,
@@ -1273,7 +1282,7 @@ def test_ranking_ready_false_when_cache_missing_or_older(test_env, monkeypatch) 
         "min_version": target_version,
         "target_version": target_version,
         "current_version": target_version,
-        "cached_version": None,
+        "cached_version": 0,
     }
 
     handler._decks[user.id] = DeckState([], time.time(), target_version - 1)
@@ -1285,8 +1294,9 @@ def test_ranking_ready_false_when_cache_missing_or_older(test_env, monkeypatch) 
     assert older_resp.status_code == 200
     assert older_resp.json()["ready"] is False
     assert older_resp.json()["cached_version"] == target_version - 1
-    # Polls are passive: they must not cut short a queued vote-debounce warm.
-    assert calls == [(user.id, target_version, False), (user.id, target_version, False)]
+    # Without a deck the warm is urgent; polling a stale deck is passive and
+    # must not cut short a queued vote-debounce warm.
+    assert calls == [(user.id, target_version, True), (user.id, target_version, False)]
 
 
 def test_ranking_ready_true_only_from_cached_version(test_env, monkeypatch) -> None:
@@ -1338,7 +1348,8 @@ def test_ranking_ready_true_for_older_requested_version(test_env) -> None:
 def test_ranking_ready_returns_intermediate_cached_version(
     test_env, monkeypatch
 ) -> None:
-    port, _, _, handler, user = test_env
+    port, db, _, handler, user = test_env
+    _make_voter(db, user.id)
     calls: list[tuple[int, int]] = []
 
     def fake_trigger_warm(cls, warm_user, version: int, **_: Any) -> None:
@@ -1409,6 +1420,7 @@ def test_dashboard_cache_uses_feedback_versions(test_env, mock_embedder, monkeyp
     TestHandler._cold_stories = []
     _reset_warm_state(TestHandler)
 
+    _make_voter(db, user.id)
     calls = []
 
     def fake_fast_rerank_for_user(database, config, embedder, user_id, **kwargs):
@@ -1452,10 +1464,10 @@ def test_dashboard_cache_uses_feedback_versions(test_env, mock_embedder, monkeyp
 def test_no_cache_user_gets_cold_deck_and_warm_is_scheduled(
     test_env, monkeypatch: pytest.MonkeyPatch, vote_counter: int
 ) -> None:
-    """A voted user without a deck gets the cold deck (as version 0) and a
-    warm. The pool generation starts at 1, so the target is always ahead of
-    the cold deck -- including right after a restart, when the in-memory vote
-    counter is 0 -- and clients poll for the personalized deck."""
+    """A voted user without a deck gets the shared cold deck minus their
+    votes, as version 0, and a warm. The target is always ahead of the cold
+    deck -- including right after a restart, when the in-memory vote counter
+    is 0 -- and clients poll for the personalized deck."""
     _, db, _, handler, user = test_env
     story = Story(
         id=991,
@@ -1481,6 +1493,9 @@ def test_no_cache_user_gets_cold_deck_and_warm_is_scheduled(
         comment_count=1,
     )
     db.upsert_story(unvoted)
+    handler._cold_stories = [
+        RankedStory(story=s, score=1.0, best_match_title="") for s in (story, unvoted)
+    ]
     calls: list[tuple[int, int]] = []
     rendered: list[dict[str, object]] = []
     handler._decks = {}
@@ -1678,12 +1693,12 @@ def test_active_warm_commits_when_dashboard_version_advances(
 
     _drain_warms(TestHandler)
 
-    # The in-flight warm still commits the version it was asked for; the
-    # newer version is behind it, so the next read queues another warm.
-    assert TestHandler._decks[user.id].version == 2
+    # The in-flight warm commits the version it ranked; the vote that landed
+    # meanwhile queues a follow-up warm, which brings the deck current.
+    assert TestHandler._decks[user.id].version == 3
 
     rank_perf_rows = db.execute("SELECT COUNT(*) FROM rank_perf")
-    assert rank_perf_rows[0][0] == 1
+    assert rank_perf_rows[0][0] == 2
 
 
 def test_rapid_vote_warms_coalesce_to_latest_version(
@@ -1801,84 +1816,6 @@ def prop_db():
         db.close()
 
 
-@given(
-    operations=st.lists(
-        st.sampled_from(["invalidate", "pool_changed", "render"]),
-        min_size=1,
-        max_size=40,
-    )
-)
-@settings(
-    max_examples=8,
-    deadline=None,
-    suppress_health_check=[HealthCheck.function_scoped_fixture],
-)
-def test_dashboard_cache_version_invariant_property(
-    operations: list[str],
-    prop_db: Database,
-    mock_embedder: MockEmbedder,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    with prop_db.conn() as conn:
-        with conn:
-            conn.execute("DELETE FROM users")
-            conn.execute("DELETE FROM stories")
-            conn.execute("DELETE FROM feedback")
-            conn.execute("DELETE FROM embeddings")
-            conn.execute("DELETE FROM tldr_cache")
-            conn.execute("DELETE FROM article_fetch_failures")
-    user = prop_db.create_user("prop_user")
-
-    class TestHandler(Handler):
-        pass
-
-    TestHandler.config = Config(db_path=prop_db.db_path, server_port=0)
-    TestHandler.db = prop_db
-    TestHandler.embedder = mock_embedder
-    TestHandler._decks = {}
-    TestHandler._dashboard_versions = {}
-    TestHandler._cold_stories = []
-    _reset_warm_state(TestHandler)
-
-    def fake_fast_rerank_for_user(database, config, embedder, user_id, **kwargs):
-        return []
-
-    import pipeline
-
-    monkeypatch.setattr(pipeline, "fast_rerank_for_user", fake_fast_rerank_for_user)
-    monkeypatch.setattr(pipeline, "generate_dashboard_bytes", _fake_render)
-    monkeypatch.setattr(
-        TestHandler, "_rebuild_cold_deck", classmethod(lambda cls: None)
-    )
-
-    for operation in operations:
-        if operation == "invalidate":
-            TestHandler._bump_user_version(user.id)
-        elif operation == "pool_changed":
-            TestHandler._pool_changed()
-        else:
-            current = TestHandler._dashboard_version(user.id)
-            rendered = TestHandler._render_dashboard_for_user(user)
-            if rendered != SKELETON_HTML:
-                # Every render reports the live version as its target and
-                # never claims to be newer than it.
-                page_version, target = map(
-                    int, rendered.decode().split()[0][2:].split("/")
-                )
-                assert target == current
-                assert page_version <= current
-            # Rendering queues whatever warm is needed: the deck catches up.
-            _wait_for_cache(TestHandler, user, current)
-
-        deck = TestHandler._decks.get(user.id)
-        if deck is not None:
-            assert deck.version <= TestHandler._dashboard_version(user.id)
-
-    # Drain in-flight warm threads before monkeypatch cleanup so they don't
-    # capture our fakes and leak into subsequent tests.
-    _drain_warms(TestHandler)
-
-
 def test_cors_headers(app_env):
     port, _, _, _, _ = app_env
     resp = local_http.options(f"http://127.0.0.1:{port}/api/feedback")
@@ -1892,7 +1829,6 @@ def test_cors_headers(app_env):
     [
         ("GET", "/api/user", None),
         ("GET", "/api/feed", None),
-        ("GET", "/api/deck-cards", None),
         ("GET", "/api/ranking-ready?version=0", None),
         ("GET", "/api/tldr-cache/1", None),
         ("POST", "/api/feedback", {"story_id": 1, "action": "up"}),
@@ -2030,7 +1966,8 @@ def test_flask_test_client_ranking_ready_validates_version(app_env: Any) -> None
 def test_flask_test_client_ranking_ready_reports_missing_cache(
     test_env: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _, _, _, handler, user = test_env
+    _, db, _, handler, user = test_env
+    _make_voter(db, user.id)
     client = create_app(handler).test_client()
     client.set_cookie("hn_token", user.token)
     calls: list[tuple[int, int]] = []
@@ -2053,7 +1990,7 @@ def test_flask_test_client_ranking_ready_reports_missing_cache(
         "min_version": version,
         "target_version": 3,
         "current_version": version,
-        "cached_version": None,
+        "cached_version": 0,
     }
     assert calls == [(user.id, version)]
 
@@ -5475,8 +5412,6 @@ def test_static_dashboard_js_has_no_jinja():
 def test_dashboard_renders_user_vote_counts_zero_for_no_feedback(test_env):
     """Fresh user with no feedback → all three counts are 0."""
     port, db, regen_event, handler, user = test_env
-    assert handler._render_dashboard_for_user(user) == SKELETON_HTML
-    _wait_for_cache(handler, user, handler._dashboard_version(user.id), timeout=3.0)
     resp = local_http.get(
         f"http://127.0.0.1:{port}/",
         cookies={"hn_token": user.token},
@@ -5580,6 +5515,7 @@ def test_dashboard_vote_counts_aggregate_across_refreshes(test_env):
 
 def test_dashboard_skeleton_returns_when_no_cache(test_env):
     port, db, regen_event, _, user = test_env
+    _make_voter(db, user.id)
     resp = local_http.get(
         f"http://127.0.0.1:{port}/",
         cookies={"hn_token": "test_token"},
@@ -5611,6 +5547,7 @@ def swr_handler(test_env, mock_embedder, monkeypatch: pytest.MonkeyPatch):
     SwrHandler._dashboard_versions = {}
     SwrHandler._cold_stories = []
     _reset_warm_state(SwrHandler)
+    _make_voter(db, user.id)
 
     import pipeline
 
@@ -5902,6 +5839,7 @@ def test_rendered_cards_carry_client_contract_attributes(test_env):
             comment_count=5,
         )
     )
+    _make_voter(db, user.id)
     handler._render_dashboard_for_user(user)
     _wait_for_cache(handler, user, handler._dashboard_version(user.id), timeout=3.0)
     resp = local_http.get(
@@ -5948,117 +5886,6 @@ def test_rendered_cards_carry_client_contract_attributes(test_env):
         assert card["data-ranker-arm"] == "baseline"
         kinds = {a["data-event-kind"] for a in card.select("a[data-event-kind]")}
         assert "comments_open" in kinds
-
-
-def test_deck_cards_returns_only_card_fragment(test_env) -> None:
-    """The fragment must carry the same cards as the full page but none of
-    the static shell (Pico CSS, custom CSS, inline JS) - that's the whole
-    point of the slim refill endpoint."""
-    port, db, regen_event, handler, user = test_env
-    now = int(time.time())
-    story_id = 6001
-    db.upsert_story(
-        Story(
-            id=story_id,
-            title="Deck cards fragment story",
-            url=None,
-            score=250,
-            time=now - 3600,
-            text_content="A story with content.",
-            source="hn",
-            comment_count=4,
-        )
-    )
-    handler._render_dashboard_for_user(user)
-    _wait_for_cache(handler, user, handler._dashboard_version(user.id), timeout=3.0)
-
-    full = local_http.get(
-        f"http://127.0.0.1:{port}/",
-        cookies={"hn_token": user.token},
-        follow_redirects=True,
-    )
-    fragment_resp = local_http.get(
-        f"http://127.0.0.1:{port}/api/deck-cards",
-        cookies={"hn_token": user.token},
-    )
-
-    assert fragment_resp.status_code == 200
-    assert fragment_resp.headers["content-type"].startswith("text/html")
-    assert (
-        fragment_resp.headers["Cache-Control"] == "no-cache, no-store, must-revalidate"
-    )
-    fragment = fragment_resp.text
-    assert f'data-story-id="{story_id}"' in fragment
-    assert "<style" not in fragment
-    assert "<script" not in fragment
-    assert len(fragment) < len(full.text) * 0.5
-
-
-def test_deck_cards_triggers_warm_on_stale_cache(
-    test_env: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # /api/deck-cards is the endpoint every in-tab refill (vote, filter tab
-    # click) calls. Unlike GET / it used to never compare its cached
-    # version to the live one, so an open tab could poll this endpoint
-    # forever and always get the same stale deck (see WORKLOG 2026-08-28).
-    # It must now self-heal the same way GET /'s stale_hit branch does:
-    # serve the stale fragment immediately (SWR), but kick off a warm.
-    port, _, _, handler, user = test_env
-    cached_html = b'<!--cards:start--><div data-story-id="7001"></div><!--cards:end-->'
-    import pipeline
-
-    monkeypatch.setattr(
-        pipeline, "generate_dashboard_bytes", lambda *a, **kw: cached_html
-    )
-    handler._decks[user.id] = DeckState([], time.time(), 1)
-    handler._dashboard_versions[user.id] = 2  # current = 3
-    calls: list[int] = []
-    monkeypatch.setattr(
-        handler,
-        "_trigger_warm",
-        classmethod(
-            lambda cls, warm_user, version, delay_s=0.0, **_: calls.append(version)
-        ),
-    )
-
-    response = local_http.get(
-        f"http://127.0.0.1:{port}/api/deck-cards",
-        cookies={"hn_token": user.token},
-    )
-
-    assert response.status_code == 200
-    assert 'data-story-id="7001"' in response.text
-    assert calls == [3]
-
-
-def test_deck_cards_does_not_warm_when_cache_is_current(
-    test_env: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    port, _, _, handler, user = test_env
-    cached_html = b'<!--cards:start--><div data-story-id="7001"></div><!--cards:end-->'
-    import pipeline
-
-    monkeypatch.setattr(
-        pipeline, "generate_dashboard_bytes", lambda *a, **kw: cached_html
-    )
-    handler._decks[user.id] = DeckState([], time.time(), 3)
-    handler._dashboard_versions[user.id] = 2  # current = 3
-    calls: list[int] = []
-    monkeypatch.setattr(
-        handler,
-        "_trigger_warm",
-        classmethod(
-            lambda cls, warm_user, version, delay_s=0.0, **_: calls.append(version)
-        ),
-    )
-
-    response = local_http.get(
-        f"http://127.0.0.1:{port}/api/deck-cards",
-        cookies={"hn_token": user.token},
-    )
-
-    assert response.status_code == 200
-    assert calls == []
 
 
 def test_justext_rejects_sidebar_boilerplate() -> None:

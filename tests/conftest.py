@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import pytest
 from hypothesis import settings
@@ -59,6 +59,15 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             max_examples=_scaled_examples(current.max_examples),
             **({"deadline": None} if _PROFILE == "deep" else {}),
         )
+
+
+@pytest.fixture
+def hypothesis_examples() -> Callable[[int], int]:
+    """The same budget for settings built at run time (a state machine run
+    via `run_state_machine_as_test`), which collection can't rewrite."""
+    if _PROFILE in ("fast", "deep"):
+        return _scaled_examples
+    return lambda n: n
 
 
 @pytest.fixture(autouse=True)

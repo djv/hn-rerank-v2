@@ -91,7 +91,7 @@ You don't need to test this in a normal session — it's a long-running backgrou
 | Skeleton never goes away | Warm thread errored | `journalctl --user -u hn_rewrite.service -e` |
 | Card shows but TLDR spins forever | Mistral API issue | `journalctl` for "Mistral"/"tldr" lines |
 | Buttons click but nothing changes | JS console error | DevTools → Console |
-| Vote submitted, but ranking doesn't update on F5 | `expected_version` mismatch | `journalctl` for `result=stale_hit` vs `result=cache_hit` |
+| Vote submitted, but ranking doesn't update on F5 | `expected_version` mismatch | `journalctl` for `dashboard_render ... result=stale` vs `result=current` |
 | 500 on dashboard | Pipeline exception | `journalctl` for stack trace |
 | Skeleton on every F5 | Cache not warming | Check `_wait_for_cache`-style polling in tests for hints |
 

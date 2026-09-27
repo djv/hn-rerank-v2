@@ -373,17 +373,6 @@ def _build_tab_groups() -> tuple[TabGroupView, ...]:
     )
 
 
-class DashboardDocument(bytes):
-    """HTML plus the `/api/feed` snapshot built by the same render."""
-
-    feed: Feed
-
-    def __new__(cls, html: bytes, feed: Feed) -> DashboardDocument:
-        document = super().__new__(cls, html)
-        document.feed = feed
-        return document
-
-
 def prepare_feed(
     cards: list[DashboardCardView], counts: dict[str, int], version: int, target: int
 ) -> Feed:
@@ -441,6 +430,20 @@ def prepare_feed(
     return Feed(1, stories, orders, counts, version, target, version >= target)
 
 
+def build_feed(
+    ranked: list[RankedStory],
+    config: Config,
+    counts: dict[str, int],
+    version: int,
+    target: int,
+) -> Feed:
+    """The `/api/feed` snapshot of a deck, without rendering the page."""
+    cards = _build_dashboard_cards(
+        ranked, hot_badge_percentile=int(round(config.model.hot_badge_percentile))
+    )
+    return prepare_feed(cards, counts, version, target)
+
+
 @functools.cache
 def _template_env() -> Environment:
     """One Jinja environment per process, so compiled templates are reused
@@ -492,12 +495,4 @@ def generate_dashboard_bytes(
         dashboard_version=dashboard_version or 0,
         dashboard_latest_version=dashboard_latest_version or 0,
     )
-    return DashboardDocument(
-        html_content.encode("utf-8"),
-        prepare_feed(
-            cards,
-            raw_vote_counts,
-            dashboard_version or 0,
-            dashboard_latest_version or 0,
-        ),
-    )
+    return html_content.encode("utf-8")

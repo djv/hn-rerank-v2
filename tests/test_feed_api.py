@@ -27,6 +27,7 @@ def test_feed_parity_authentication_stale_cache_and_eviction(tmp_path: Path) -> 
         _decks = {}
         _dashboard_versions = {}
         _cold_stories = []
+        _pool_generation = 1
 
         @classmethod
         def _trigger_warm(
@@ -123,18 +124,22 @@ def test_feed_parity_authentication_stale_cache_and_eviction(tmp_path: Path) -> 
         db.upsert_story(item.story)
     vote = client.post("/api/feedback", json={"story_id": 1, "action": "up"})
     assert payload(vote)["target_version"] == 2
+    # Repeating a vote changes nothing, so nothing new is ranked.
+    again = client.post("/api/feedback", json={"story_id": 1, "action": "up"})
+    assert payload(again)["target_version"] == 2
     stale = payload(client.get("/api/feed"))
     assert not Feed.parse(stale).ready
-    assert stale["stories"] == feed["stories"]
+    # The stale deck is served without the story just voted on.
+    assert stale["stories"] == feed["stories"][1:]
     assert stale["version"] == 1 and stale["target_version"] == 2 and not stale["ready"]
-    assert (
-        BeautifulSoup(client.get("/").data, "html.parser").select(".story-card")
-        == cards
-    )
+    page = BeautifulSoup(client.get("/").data, "html.parser")
+    assert [card["data-story-id"] for card in page.select(".story-card")] == [
+        card["data-story-id"] for card in cards[1:]
+    ]
     client.set_cookie("hn_token", other.token)
     assert payload(client.get("/api/feed"))["feedback_counts"]["up"] == 0
     client.set_cookie("hn_token", user.token)
-    Runtime._decks[user.id] = DeckState(ranked[1:], time.time(), 2)
+    Runtime._decks[user.id] = DeckState(ranked, time.time(), 2)
     assert payload(client.get("/api/feed"))["orders"]["recommended:recent"] == [2]
     assert payload(client.get("/api/feed"))["feedback_counts"]["up"] == 1
     assert (
@@ -148,8 +153,10 @@ def test_feed_parity_authentication_stale_cache_and_eviction(tmp_path: Path) -> 
     with Runtime._dashboard_versions_guard:
         Runtime._evict_old_decks_locked()
     assert user.id not in Runtime._decks
+    # No votes left: the shared cold deck is current, even when it is empty.
     Runtime._cold_stories = []
     empty = payload(client.get("/api/feed"))
     assert not Feed.parse(empty).stories
-    assert not empty["ready"] and empty["stories"] == []
+    assert empty["ready"] and empty["stories"] == []
+    assert empty["version"] == empty["target_version"] == 3
     db.close()

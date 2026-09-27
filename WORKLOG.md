@@ -1,5 +1,39 @@
 # Worklog: hn-rewrite
 
+## 2026-09-26 Server: one deck decision, monotonic versions, idempotent votes
+
+Stage S1 of `docs/server-web-alignment-plan.md`.
+- `Handler._deck_for_user` is the only place a read picks a deck; `/`,
+  `/api/feed` and `/api/ranking-ready` all use it. Before, `ranking-ready`
+  warmed and cached a personalized deck for users with no votes (so every
+  60s TUI poll from a new user added them to the regen re-rank set), and a
+  voter without a deck got `build_cold_deck(user_id=...)` on every page load
+  until the warm landed. Now: no votes = shared cold deck at the current
+  version, never warmed or cached; votes without a deck = shared cold deck
+  minus their votes as version 0 plus one warm.
+- Voted stories are never served, from any deck (clients only hide their own
+  in-flight votes).
+- `/api/feed` is built without rendering the page (`render.build_feed`);
+  `DashboardDocument` is gone.
+- Versions start at the boot time in ms, so they only increase across
+  restarts (they restarted at 1 before).
+- A vote that changes nothing (same action again) queues nothing and keeps
+  the version; `upsert_feedback` reports whether a row changed.
+- Fix found by the new state machine: a warm queued before a regen and run
+  after it left a stale deck with no warm queued (a regen only re-warms
+  cached decks), so the reranked deck waited for the next poll. A warm now
+  labels its deck with the version current when ranking starts and queues a
+  follow-up if a vote or regen lands while it ranks.
+- Removed `/api/deck-cards`, `_extract_cards_fragment` and the card markers
+  (no caller since refills moved to `/api/feed`).
+- Tests: `tests/test_deck_state_machine.py` (Hypothesis `RuleBasedStateMachine`
+  over votes, clears, regens, restarts, reads, and warms with a regen or vote
+  landing mid-rank; ~1.5s locally). Mutation-checked: dropping the 0-vote
+  rule, the voted filter, the repeat-vote no-op, the follow-up warm or the
+  start-of-rank label each fails it. It replaces
+  `test_dashboard_cache_version_invariant_property`. New `hypothesis_examples`
+  fixture applies the local budget to run-time settings.
+
 ## 2026-09-26 TUI simplification (timeouts, summaries, freshness, votes)
 
 - Timeouts: 10s for feed/cache/vote/poll requests, 150s for `tldr-detail`

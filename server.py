@@ -36,6 +36,7 @@ from flask.typing import ResponseReturnValue
 import httpx
 
 from background_cadence import BackgroundCadence
+from clients.tui.src.hn_rerank.models import Feed
 from database import (
     Database,
     InteractionEvent,
@@ -1434,6 +1435,28 @@ class DeckState:
     version: int
 
 
+@dataclass(frozen=True)
+class DeckView:
+    """What a read serves: the page, `/api/feed` and `/api/ranking-ready`
+    all come from `Handler._deck_for_user`, so they always agree."""
+
+    ranked: list[RankedStory]
+    # The deck's version; 0 is the cold deck shown while the first warm runs.
+    version: int
+    # The user's current version, which a queued warm is building.
+    current: int
+
+    @property
+    def ready(self) -> bool:
+        return self.version >= self.current
+
+
+def _boot_epoch_ms() -> int:
+    """Where versions start: boot time in ms, so they keep increasing across
+    restarts (a process bumps far less than once per ms)."""
+    return time.time_ns() // 1_000_000
+
+
 def _load_malloc_trim() -> Callable[[int], int] | None:
     """glibc's malloc_trim, or None on other libcs (macOS, musl)."""
     try:
@@ -1458,14 +1481,16 @@ class Handler:
 
     - Version: ``_pool_generation + _dashboard_versions[user]``. A vote bumps
       the user's counter; a regen/RSS refresh bumps the generation once, which
-      makes every deck stale. The generation starts at 1, so a cold deck
-      (rendered as version 0) is always behind its target, including right
-      after a restart when all of this in-memory state is gone.
-    - Deck: ``_decks[user]`` is fresh when ``deck.version >= version``.
-      A read never blocks on ranking: it renders the cached deck (fresh or
-      stale), or the cold deck for a user with votes but no deck yet, and
-      queues a warm when that isn't current. Clients see ``version < target``
-      and poll ``/api/ranking-ready`` until the warm lands.
+      makes every deck stale. The generation starts at the boot time in ms,
+      so versions only increase, across restarts too, and a cold deck
+      (version 0) is always behind its target.
+    - Deck: ``_deck_for_user`` is the only place a read picks one. No votes:
+      the shared cold deck is current, and nothing is warmed or cached. Votes:
+      the cached deck (fresh when ``deck.version >= version``), or the cold
+      deck as version 0 while the first warm runs. A read never blocks on
+      ranking; it queues a warm when the deck isn't current, and clients
+      poll ``/api/ranking-ready`` until it lands. Voted stories are never
+      served.
     - Warms: ``_warm_scheduler()`` coalesces requests per user (newest
       version wins, at most one running per user) on a pool of
       ``config.warm_pool_size`` workers. Votes debounce through it
@@ -1479,7 +1504,7 @@ class Handler:
     regen_event: threading.Event
     _decks: dict[int, DeckState] = {}
     _MAX_CACHED_DECKS = 100
-    _pool_generation: int = 1
+    _pool_generation: int = _boot_epoch_ms()
     _dashboard_versions: dict[int, int] = {}
     _dashboard_versions_guard = threading.Lock()
     _scheduler: WarmScheduler[int, User] | None = None
@@ -1533,69 +1558,68 @@ class Handler:
         )
 
     @classmethod
-    def _render_dashboard_for_user(cls, user: User) -> bytes:
-        """Render the user's dashboard now; queue a warm if it isn't current."""
-        request_start = time.perf_counter()
+    def _deck_for_user(cls, user: User) -> DeckView:
+        """Pick the deck a read serves; queue a warm when it isn't current."""
+        from pipeline import _voted_story_ids
+
         current = cls._dashboard_version(user.id)
+        voted = _voted_story_ids(cls.db, user.id)
+        if not voted:
+            # Nothing to personalize: the shared cold deck is current. A deck
+            # left from votes since cleared would only be re-ranked by every
+            # regen for nothing.
+            with cls._dashboard_versions_guard:
+                cls._decks.pop(user.id, None)
+            return DeckView(cls._cold_stories, current, current)
         deck = cls._decks.get(user.id)
-
-        if deck is not None:
-            result = "cache_hit"
-            if deck.version < current:
-                result = "stale_hit"
-                # Passive: a queued vote-debounce warm keeps its delay.
-                cls._trigger_warm(user, current, expedite=False)
-            html = cls._render_deck(user, deck.ranked, deck.version, current)
-            logging.info(
-                "dashboard_render user_id=%s version=%s result=%s deck_version=%s"
-                " elapsed_ms=%.1f deck_age_s=%.1f",
-                user.id,
-                current,
-                result,
-                deck.version,
-                (time.perf_counter() - request_start) * 1000,
-                time.time() - deck.built_at,
-            )
-            return html
-
-        n_feedback = sum(cls.db.count_feedback_by_action(user.id).values())
-        if n_feedback == 0:
-            # Nothing to personalize: the shared cold deck is this user's
-            # current deck, so it renders as current and needs no warm.
-            ranked, version = cls._cold_stories, current
+        if deck is None:
+            # Votes but no deck yet (first read since a restart, or evicted).
+            ranked, version = cls._cold_stories, 0
         else:
-            # Votes but no deck yet (first visit on this device since a
-            # restart, or evicted): the cold deck minus voted stories, as
-            # version 0, while the personalized deck is built.
-            from pipeline import build_cold_deck
+            ranked, version = deck.ranked, deck.version
+        if version < current:
+            # A stale deck's warm is passive: a queued vote-debounce warm
+            # keeps its delay.
+            cls._trigger_warm(user, current, expedite=deck is None)
+        return DeckView(
+            [item for item in ranked if item.story.id not in voted], version, current
+        )
 
-            cls._trigger_warm(user, current)
-            ranked = build_cold_deck(
-                cls.db, cls.config, user_id=user.id, embedder=cls.embedder
-            )
-            version = 0
-
-        if not ranked:
-            # Empty pool (first boot before any regen): the warm is the only
-            # way this user gets a deck; the skeleton page reloads itself.
-            cls._trigger_warm(user, current)
-            logging.info(
-                "dashboard_render user_id=%s version=%s result=skeleton elapsed_ms=%.1f",
-                user.id,
-                current,
-                (time.perf_counter() - request_start) * 1000,
-            )
-            return SKELETON_HTML
-        html = cls._render_deck(user, ranked, version, current)
+    @classmethod
+    def _render_dashboard_for_user(cls, user: User) -> bytes:
+        request_start = time.perf_counter()
+        view = cls._deck_for_user(user)
+        if not view.ranked and view.version == 0:
+            # An empty cold deck (first boot before any regen) while the warm
+            # builds this user's deck; the skeleton page reloads itself.
+            html, result = SKELETON_HTML, "skeleton"
+        else:
+            html = cls._render_deck(user, view.ranked, view.version, view.current)
+            result = "current" if view.ready else "stale"
         logging.info(
-            "dashboard_render user_id=%s version=%s result=cold_deck stories=%s"
-            " elapsed_ms=%.1f",
+            "dashboard_render user_id=%s version=%s result=%s deck_version=%s"
+            " stories=%s elapsed_ms=%.1f",
             user.id,
-            current,
-            len(ranked),
+            view.current,
+            result,
+            view.version,
+            len(view.ranked),
             (time.perf_counter() - request_start) * 1000,
         )
         return html
+
+    @classmethod
+    def _feed_for_user(cls, user: User) -> Feed:
+        from pipeline.render import build_feed
+
+        view = cls._deck_for_user(user)
+        return build_feed(
+            view.ranked,
+            cls.config,
+            cls.db.count_feedback_by_action(user.id),
+            view.version,
+            view.current,
+        )
 
     @classmethod
     def _dashboard_version(cls, user_id: int) -> int:
@@ -1716,6 +1740,10 @@ class Handler:
         deck = cls._decks.get(user.id)
         if deck is not None and deck.version >= requested_version:
             return
+        # Ranking reads the votes and pool as they are now, so the deck is
+        # at least as new as the current version (a regen may have landed
+        # since this warm was queued).
+        requested_version = max(requested_version, cls._dashboard_version(user.id))
 
         from pipeline import RankTrace, fast_rerank_for_user
 
@@ -1734,6 +1762,9 @@ class Handler:
         with cls._dashboard_versions_guard:
             cls._decks[user.id] = DeckState(final, time.time(), requested_version)
             cls._evict_old_decks_locked()
+        # A vote or regen while ranking: warm again. (A regen only re-warms
+        # cached decks, and this one wasn't cached yet.)
+        cls._trigger_warm(user, cls._dashboard_version(user.id))
 
         logging.info(
             "dashboard_warm user_id=%s version=%s result=completed rank_ms=%.1f stories=%s",
@@ -1912,25 +1943,6 @@ class Handler:
                 )
             finally:
                 cls._tldr_prefetch_gate.finish()
-
-
-_CARDS_START = b"<!--cards:start-->"
-_CARDS_END = b"<!--cards:end-->"
-
-
-def _extract_cards_fragment(html: bytes) -> bytes:
-    """Slice the rendered card markup out of a full dashboard render.
-
-    Byte-level find/slice (no HTML parsing) so the fragment is guaranteed
-    to be exactly the markup between the sentinel comments in index.html.
-    Returns an empty fragment for skeleton/cold-deck-less renders, which
-    carry no sentinels and no cards either way.
-    """
-    start = html.find(_CARDS_START)
-    end = html.find(_CARDS_END)
-    if start == -1 or end == -1:
-        return b""
-    return html[start + len(_CARDS_START) : end]
 
 
 def _no_cache_dashboard_response(
@@ -2220,18 +2232,20 @@ def _handle_flask_feedback(runtime: type[Handler]) -> Response:
             )
 
         if action == "clear":
-            # Clearing a vote that doesn't exist is a no-op: no state
-            # changed, so no dashboard refresh should be queued.
-            if not runtime.db.delete_feedback(user.id, story_id):
-                return _flask_json_response(
-                    {
-                        "ok": True,
-                        "ranking_refresh_queued": False,
-                        "target_version": runtime._dashboard_version(user.id),
-                    }
-                )
+            changed = runtime.db.delete_feedback(user.id, story_id)
         else:
-            runtime.db.upsert_feedback(user.id, story_id, action)
+            changed = runtime.db.upsert_feedback(user.id, story_id, action)
+        if not changed:
+            # Clearing a missing vote or repeating one changes nothing, so
+            # nothing is refreshed (a client retrying a vote it isn't sure
+            # landed gets the version it already has).
+            return _flask_json_response(
+                {
+                    "ok": True,
+                    "ranking_refresh_queued": False,
+                    "target_version": runtime._dashboard_version(user.id),
+                }
+            )
 
         # Every vote invalidates immediately. Personalized ranking is
         # cadence-gated; global candidate regeneration waits for a quiet period.
@@ -3044,25 +3058,17 @@ def _handle_flask_ranking_ready(runtime: type[Handler]) -> Response:
             return _invalid_version_response()
         target_version = parsed_target
 
-    current_version = runtime._dashboard_version(user.id)
-    deck = runtime._decks.get(user.id)
-    cached_version = deck.version if deck is not None else None
-    ready = cached_version is not None and cached_version >= min_version
-    ready_version = cached_version if ready else None
-    if (cached_version is None or cached_version < current_version) and (
-        current_version >= min_version
-    ):
-        runtime._trigger_warm(user, current_version, expedite=False)
-
+    view = runtime._deck_for_user(user)
+    ready = view.version >= min_version
     return _flask_json_response(
         {
             "ok": True,
             "ready": ready,
-            "ready_version": ready_version,
+            "ready_version": view.version if ready else None,
             "min_version": min_version,
             "target_version": target_version,
-            "current_version": current_version,
-            "cached_version": cached_version,
+            "current_version": view.current,
+            "cached_version": view.version,
         }
     )
 
@@ -3149,55 +3155,16 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
 
     @app.get("/api/feed")
     def feed() -> ResponseReturnValue:
-        from dataclasses import replace
-        from clients.tui.src.hn_rerank.models import Feed
-        from pipeline.render import DashboardDocument
-
         user = _flask_user(runtime)
         if not user:
             return _flask_json_response({"error": "No session"}, status=401)
-        html = runtime._render_dashboard_for_user(user)
-        target = runtime._dashboard_version(user.id)
-        if isinstance(html, DashboardDocument):
-            snapshot = replace(
-                html.feed, target_version=target, ready=html.feed.version >= target
-            )
-        else:
-            snapshot = Feed(
-                1,
-                [],
-                {},
-                runtime.db.count_feedback_by_action(user.id),
-                0,
-                target,
-                False,
-            )
-        response = _flask_json_response(snapshot.to_dict())
+        response = _flask_json_response(runtime._feed_for_user(user).to_dict())
         response.headers["Cache-Control"] = "no-store"
         return response
 
     @app.get("/api/ranking-ready")
     def ranking_ready() -> ResponseReturnValue:
         return _handle_flask_ranking_ready(runtime)
-
-    @app.get("/api/deck-cards")
-    def deck_cards() -> ResponseReturnValue:
-        user = _flask_user(runtime)
-        if not user:
-            return _flask_json_response(
-                {"error": "No session"}, status=HTTPStatus.UNAUTHORIZED
-            )
-        # Same path as GET /: serves the cached (possibly stale) deck or the
-        # cold deck immediately and queues a warm when it isn't current.
-        html = runtime._render_dashboard_for_user(user)
-        fragment = _extract_cards_fragment(html)
-        response = Response(
-            fragment, status=HTTPStatus.OK, content_type="text/html; charset=utf-8"
-        )
-        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-        response.headers["Pragma"] = "no-cache"
-        response.headers["Expires"] = "0"
-        return response
 
     @app.get("/")
     @app.get("/index.html")

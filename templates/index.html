@@ -1009,11 +1009,9 @@
            data-user-token="{{ user_token or '' }}"
            data-dashboard-version="{{ dashboard_version }}"
            data-current-version="{{ dashboard_latest_version }}">
-      <!--cards:start-->
       {% for card in cards %}
       {% include "components/story_card.html" %}
       {% endfor %}
-      <!--cards:end-->
       <p id="queue-loading" class="queue-loading" hidden role="status" aria-live="polite">
         Loading more stories…
       </p>
