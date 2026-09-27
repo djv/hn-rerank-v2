@@ -25,6 +25,7 @@ async def settle(pilot: Pilot, timeout: float = 5.0) -> None:
         loading = any(
             "Loading summary" in widget._markdown for widget in app.query(Markdown)
         )
+        busy = busy or bool(getattr(app, "summary_requests", None))
         if not busy and not loading:
             break
         if asyncio.get_running_loop().time() > deadline:

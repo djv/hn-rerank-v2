@@ -6,6 +6,11 @@
   generation (was 45s for everything; the server allows ~2 min).
 - Zoom availability is a property (`a story is selected`); removed the 3
   read-state timers, the 1s interval and 12 `schedule_read_state()` calls.
+- Summaries: one request per story in `summary_requests`, shared by the
+  selection and prefetch (`summary_task`); prefetch starts tasks under a
+  `Semaphore(4)` instead of a queue + worker + 4 loops + restart logic. Only
+  refresh/setup/quit cancel a request, and a passive refresh spares the
+  selected story's, so a waiting selection can no longer be stranded.
 
 ## 2026-09-26 TUI: `y` copies link; faster TUI tests
 

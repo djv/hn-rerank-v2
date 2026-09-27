@@ -5,7 +5,6 @@ import random
 import time
 import unicodedata
 import webbrowser
-from collections import deque
 from pathlib import Path
 from typing import ClassVar
 from urllib.parse import urlsplit
@@ -37,7 +36,6 @@ from textual.widgets._select import (
     SelectOverlay,
 )
 from textual.widgets.option_list import Option
-from textual.worker import Worker, get_current_worker
 
 from .api import (
     API,
@@ -612,17 +610,19 @@ class Reader(App[None]):
         self.last_error: str | None = None
         self.prefetch = max(0, prefetch)
         self.prefetch_generate = min(self.prefetch, max(0, prefetch_generate))
-        self.prefetch_requests: dict[int, asyncio.Task[SummaryResult | None]] = {}
-        self.prefetch_cache_misses: set[int] = set()
+        # Complete summaries, and at most one request per story in flight. The
+        # selection and prefetch share that request; only refresh, setup and
+        # quit cancel it, never a caller that stopped waiting.
         self.summaries: dict[int, str] = {}
-        self.prefetching: set[int] = set()
-        self.prefetch_queue: deque[int] = deque()
+        self.summary_requests: dict[int, asyncio.Task[SummaryResult | None]] = {}
+        # Prefetch backoff: provisional/empty/failed results wait until the
+        # time; a cache miss (time of the miss) may still generate once the
+        # story is near the selection.
         self.prefetch_retry_at: dict[int, float] = {}
-        # The running prefetch worker. A worker cancelled before its first step
-        # never runs its finally, so liveness comes from the worker itself.
-        self.prefetch_worker: Worker | None = None
-        self.closing = False
+        self.prefetch_misses: dict[int, float] = {}
         self.prefetch_cooldown_until = 0.0
+        self.prefetch_slots = asyncio.Semaphore(PREFETCH_CONCURRENCY)
+        self.closing = False
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="filters"):
@@ -790,7 +790,7 @@ class Reader(App[None]):
         self.summary_story_id = None
         self.selection_serial += 1
         self.workers.cancel_group(self, "summary")
-        self.workers.cancel_group(self, "prefetch")
+        self.cancel_summary_requests()
         self.workers.cancel_group(self, "refresh")
         self.workers.cancel_group(self, "vote")
         self.workers.cancel_group(self, "impression")
@@ -820,13 +820,8 @@ class Reader(App[None]):
         self.restored.clear()
         self.history.clear()
         self.vote_views.clear()
-        self.summaries.clear()
-        self.prefetch_queue.clear()
-        self.prefetching.clear()
-        self.prefetch_retry_at.clear()
-        self.prefetch_cache_misses.clear()
+        self.reset_summaries()
         self.prefetch_cooldown_until = 0.0
-        self.workers.cancel_group(self, "prefetch")
         self.target = None
         self.help_open = False
         self.summary_story_id = None
@@ -1061,40 +1056,14 @@ class Reader(App[None]):
         else:
             self.query_one("#summary", Markdown).update(previous)
             self.status("Regenerating summary…")
-        self.schedule_prefetch()
         try:
-            # Reuse background work when navigation catches up with it.
-            request = self.prefetch_requests.get(story_id)
-            if not force_refresh and story_id in self.summaries:
-                summary = SummaryResult(self.summaries[story_id])
-            elif not force_refresh and request is not None:
-                try:
-                    summary = await asyncio.shield(request)
-                except asyncio.CancelledError:
-                    # A passive refresh cancels prefetch; only our own
-                    # cancellation should stop this load.
-                    task = asyncio.current_task()
-                    if not request.cancelled() or (task and task.cancelling()):
-                        raise
-                    summary = None
-                except (InvalidProfile, TransientError):
-                    raise
-                except APIError:
-                    # A failed background cache read says nothing about
-                    # whether this story can be summarized; ask directly.
-                    summary = None
-                if summary is None:
-                    summary = await self.api.summary(story_id)
-            else:
-                summary = await self.api.summary(story_id, force_refresh=force_refresh)
+            summary = await self.await_summary(story_id, force=force_refresh)
             if serial == self.selection_serial and self.query("#summary"):
                 if summary.empty:
                     # Server found nothing summarizable: same session-hide
                     # as undisplayable failures, never rendered or cached.
                     self._hide_story(story_id, "no summarizable content")
                     return
-                if not summary.provisional:
-                    self.summaries[story_id] = summary.text
                 self.query_one("#summary", Markdown).update(summary.text)
                 if summary.provisional:
                     self.status(
@@ -1127,6 +1096,25 @@ class Reader(App[None]):
                 # transient (quota/cooldown), so this hides for the session
                 # only — refresh restores. InvalidProfile goes to setup above.
                 self._hide_story(story_id, f"summary unavailable ({exc})")
+
+    async def await_summary(
+        self, story_id: int, *, force: bool = False
+    ) -> SummaryResult:
+        """The summary for the selected story, joining any request in flight."""
+        if not force and (text := self.summaries.get(story_id)) is not None:
+            return SummaryResult(text)
+        task = self.summary_task(story_id, force=force)
+        # Start prefetch after the selected request, so it goes out first.
+        self.schedule_prefetch()
+        # Shielded: moving to another story must not cancel shared work.
+        summary = await asyncio.shield(task)
+        if summary is None:
+            # Speculation came back empty-handed (skipped, cache miss, or a
+            # failed cache read); ask for this story directly.
+            summary = await asyncio.shield(self.summary_task(story_id))
+        if summary is None:
+            raise TransientError("Not connected. Press r to retry.")
+        return summary
 
     def _hide_story(self, story_id: int, reason: str) -> None:
         """Drop a story from the deck for this session; refresh restores."""
@@ -1174,109 +1162,122 @@ class Reader(App[None]):
         )
 
     def schedule_prefetch(self) -> None:
-        """Refill the bounded rolling window, retaining cached summaries across sorts."""
-        if self.prefetch <= 0 or not self.api or self.setting_up:
+        """Start background requests for stories around the selection."""
+        if self.prefetch <= 0 or not self.api or self.setting_up or self.closing:
             return
         now = time.monotonic()
         if now < self.prefetch_cooldown_until:
             return
         generate = set(self.prefetch_targets(self.prefetch_generate))
-        self.prefetch_queue = deque(
-            sid
-            for sid in self.prefetch_targets(self.prefetch)
-            if sid not in self.summaries
-            and sid not in self.prefetching
-            and (
-                self.prefetch_retry_at.get(sid, 0.0) <= now
-                or (sid in self.prefetch_cache_misses and sid in generate)
-            )
+        for sid in self.prefetch_targets(self.prefetch):
+            missed = self.prefetch_misses.get(sid)
+            if (
+                sid in self.summaries
+                or sid in self.summary_requests
+                or self.prefetch_retry_at.get(sid, 0.0) > now
+                or (
+                    missed is not None
+                    and now - missed < PREFETCH_COOLDOWN_SECONDS
+                    and sid not in generate
+                )
+            ):
+                continue
+            self.summary_task(sid, background=True)
+
+    def summary_task(
+        self, story_id: int, *, background: bool = False, force: bool = False
+    ) -> asyncio.Task[SummaryResult | None]:
+        """The one request for a story: reuse it, or start it."""
+        task = self.summary_requests.get(story_id)
+        if task is not None and not task.done() and not force:
+            return task
+        if task is not None:
+            task.cancel()
+        task = asyncio.create_task(
+            self.fetch_summary(story_id, background=background, force=force)
         )
-        self.start_prefetch()
+        self.summary_requests[story_id] = task
 
-    def prefetch_running(self) -> bool:
-        worker = self.prefetch_worker
-        return worker is not None and not worker.is_cancelled and not worker.is_finished
+        def done(task: asyncio.Task[SummaryResult | None]) -> None:
+            if self.summary_requests.get(story_id) is task:
+                del self.summary_requests[story_id]
+            if not task.cancelled():
+                task.exception()  # Awaiting callers handle it; none may be left.
 
-    def start_prefetch(self) -> None:
-        if (
-            self.prefetch_running()
-            or self.closing
-            or not self.prefetch_queue
-            or self.setting_up
-            or not self.is_running
-        ):
-            return
-        self.prefetch_worker = self.prefetch_summaries()
+        task.add_done_callback(done)
+        return task
 
-    async def fetch_prefetched_summary(self, story_id: int) -> SummaryResult | None:
+    def cancel_summary_requests(self, keep: int | None = None) -> None:
+        for sid, task in list(self.summary_requests.items()):
+            if sid != keep:
+                task.cancel()
+
+    def reset_summaries(
+        self, *, keep_text: int | None = None, keep_request: int | None = None
+    ) -> None:
+        """Forget summaries (a new deck may carry new text) and prefetch state."""
+        kept = self.summaries.get(keep_text) if keep_text is not None else None
+        self.summaries.clear()
+        if keep_text is not None and kept is not None:
+            self.summaries[keep_text] = kept
+        self.cancel_summary_requests(keep=keep_request)
+        self.prefetch_retry_at.clear()
+        self.prefetch_misses.clear()
+
+    async def fetch_summary(
+        self, story_id: int, *, background: bool, force: bool
+    ) -> SummaryResult | None:
         api = self.api
         if api is None:
             return None
-        summary = await api.cached_summary(story_id)
-        if summary is None:
-            self.prefetch_cache_misses.add(story_id)
-            # Recheck the current window after I/O: a sort change can abandon it.
-            if (
-                story_id in self.prefetch_targets(self.prefetch_generate)
-                and time.monotonic() >= self.prefetch_cooldown_until
-            ):
-                summary = await api.summary(story_id)
-        return summary
-
-    async def prefetch_loop(self) -> None:
-        while (
-            self.prefetch_queue
-            and self.api is not None
-            and time.monotonic() >= self.prefetch_cooldown_until
-        ):
-            story_id = self.prefetch_queue.popleft()
-            if story_id in self.summaries or story_id in self.prefetching:
-                continue
-            self.prefetching.add(story_id)
-            request = asyncio.create_task(self.fetch_prefetched_summary(story_id))
-            self.prefetch_requests[story_id] = request
-            try:
-                summary = await request
-            except APIError:
-                # Already-running requests may finish; no new work during cooldown.
-                self.prefetch_cooldown_until = (
-                    time.monotonic() + PREFETCH_COOLDOWN_SECONDS
-                )
-                self.prefetch_queue.clear()
-                return
-            finally:
-                self.prefetching.discard(story_id)
-                self.prefetch_requests.pop(story_id, None)
-            if summary is None or summary.provisional or summary.empty:
+        if background:
+            async with self.prefetch_slots:
+                summary = await self.speculate(api, story_id)
+        else:
+            summary = await api.summary(story_id, force_refresh=force)
+        if summary is not None and api is self.api:
+            if summary.provisional or summary.empty:
+                # Shown (or hidden) by the selection, never cached.
                 self.prefetch_retry_at[story_id] = (
                     time.monotonic() + PREFETCH_COOLDOWN_SECONDS
                 )
-                if summary is not None:
-                    self.prefetch_cache_misses.discard(story_id)
             else:
-                self.prefetch_cache_misses.discard(story_id)
                 self.summaries[story_id] = summary.text
+                self.prefetch_retry_at.pop(story_id, None)
+        return summary
 
-    @work(group="prefetch")
-    async def prefetch_summaries(self) -> None:
+    def speculation_wanted(self, story_id: int, *, generate: bool = False) -> bool:
+        """Still worth fetching: selected, or inside the current window."""
+        selected = self.selected() if self.query("#headlines") else None
+        if selected is not None and selected.id == story_id:
+            return True
+        if time.monotonic() < self.prefetch_cooldown_until:
+            return False
+        depth = self.prefetch_generate if generate else self.prefetch
+        return story_id in self.prefetch_targets(depth)
+
+    async def speculate(self, api: API, story_id: int) -> SummaryResult | None:
+        """Read the server cache; generate only for stories near the selection.
+
+        Returns None when there is nothing to show yet, so a selection waiting
+        on this request asks for the story directly.
+        """
+        # Recheck after waiting for a slot: navigation can abandon the target.
+        if not self.speculation_wanted(story_id):
+            return None
         try:
-            async with asyncio.TaskGroup() as group:
-                for _ in range(PREFETCH_CONCURRENCY):
-                    group.create_task(self.prefetch_loop())
-        finally:
-            # A cancelled worker may finish after its replacement started.
-            current = self.prefetch_worker is get_current_worker()
-            if current:
-                self.prefetch_worker = None
-            if (
-                current
-                and self.prefetch_queue
-                and not self.closing
-                and not self.setting_up
-                and self.is_running
-                and time.monotonic() >= self.prefetch_cooldown_until
-            ):
-                self.start_prefetch()
+            summary = await api.cached_summary(story_id)
+            if summary is None:
+                self.prefetch_misses[story_id] = time.monotonic()
+                if self.speculation_wanted(story_id, generate=True):
+                    summary = await api.summary(story_id)
+        except APIError as exc:
+            # Requests already running may finish; nothing new for a minute.
+            self.prefetch_cooldown_until = time.monotonic() + PREFETCH_COOLDOWN_SECONDS
+            if isinstance(exc, (InvalidProfile, TransientError)):
+                raise
+            return None
+        return summary
 
     def can_poll_feed(self) -> bool:
         return bool(
@@ -1384,17 +1385,11 @@ class Reader(App[None]):
         # Invalidate an older request immediately, not only after feed refresh.
         self.selection_serial += 1
         self.workers.cancel_group(self, "summary")
-        previous = self.summaries.get(story.id) if story and force_summary else None
-        self.summaries.clear()
-        if previous is not None and story is not None:
-            self.summaries[story.id] = previous
+        # The old text stays on screen while the forced request regenerates it.
+        self.reset_summaries(keep_text=story.id if story and force_summary else None)
         if restore_hidden:
             self.unavailable.clear()
-        self.prefetch_queue.clear()
-        self.prefetch_retry_at.clear()
-        self.prefetch_cache_misses.clear()
         self.prefetch_cooldown_until = 0.0
-        self.workers.cancel_group(self, "prefetch")
         self.refresh_feed()
 
     def refresh_passively(self) -> None:
@@ -1405,14 +1400,8 @@ class Reader(App[None]):
         stories stay hidden; only a manual r restores them.
         """
         story = self.selected()
-        kept = self.summaries.get(story.id) if story else None
-        self.summaries.clear()
-        if story is not None and kept is not None:
-            self.summaries[story.id] = kept
-        self.prefetch_queue.clear()
-        self.prefetch_retry_at.clear()
-        self.prefetch_cache_misses.clear()
-        self.workers.cancel_group(self, "prefetch")
+        keep = story.id if story else None
+        self.reset_summaries(keep_text=keep, keep_request=keep)
         self.refresh_feed()
 
     def action_move(self, delta: int) -> None:
@@ -1641,8 +1630,8 @@ class Reader(App[None]):
 
     async def on_unmount(self) -> None:
         self.closing = True
-        self.prefetch_queue.clear()
         self.selection_serial += 1
         self.workers.cancel_all()
+        self.cancel_summary_requests()
         if self.api:
             await self.api.close()

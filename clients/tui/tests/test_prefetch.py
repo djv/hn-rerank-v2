@@ -89,7 +89,7 @@ async def test_cache_miss_never_generates_until_selected() -> None:
     fake = MissServer()
     app = Reader(api=fake.api(), prefetch_generate=0)
     async with app.run_test(size=(120, 35)) as pilot:
-        await wait_for(pilot, lambda: 2 in app.prefetch_retry_at)
+        await wait_for(pilot, lambda: 2 in app.prefetch_misses)
         assert fake.summary_ids == [1]
         assert 2 not in app.summaries
         app.rebuild()
@@ -110,7 +110,7 @@ async def test_prefetch_zero_disables_speculation() -> None:
         await wait_for(pilot, lambda: app.summaries.get(1) == "# Summary 1")
         await settle(pilot)
         assert fake.summary_ids == [1]
-        assert not app.prefetch_queue
+        assert not app.summary_requests
 
 
 async def test_prefetch_stops_on_rate_limit() -> None:
@@ -287,7 +287,7 @@ async def test_refresh_cancels_prefetch_generation() -> None:
     app = Reader(api=fake.api())
     async with app.run_test(size=(120, 35)) as pilot:
         await wait_for(pilot, lambda: {2, 3, 4} <= set(fake.generated))
-        old = list(app.prefetch_requests.values())
+        old = list(app.summary_requests.values())
         app.action_refresh()
         await pilot.pause(0.2)
         assert all(task.done() for task in old)
@@ -306,15 +306,15 @@ async def test_prefetch_runs_while_selected_story_generates() -> None:
         await wait_for(pilot, lambda: 1 in app.summaries)
 
 
-async def test_prefetch_cancelled_before_its_first_step_can_restart() -> None:
+async def test_prefetch_cancelled_in_the_same_tick_can_restart() -> None:
     """A start and a cancel in the same tick (e.g. a highlight then r) must
     not leave prefetch looking busy for the rest of the session."""
     fake = PrefetchServer()
     app = Reader(api=fake.api(), prefetch=2)
     async with app.run_test(size=(120, 35)) as pilot:
         await wait_for(pilot, lambda: app.summaries.keys() >= {2, 3})
-        app.prefetch_queue.extend([2, 3])
-        app.start_prefetch()
+        app.reset_summaries()
+        app.schedule_prefetch()
         app.action_refresh()
         await wait_for(pilot, lambda: app.summaries.keys() >= {2, 3})
 
@@ -333,7 +333,7 @@ async def test_failed_background_cache_read_falls_back_to_generation() -> None:
     fake = CacheFailServer()
     app = Reader(api=fake.api(), prefetch=2)
     async with app.run_test(size=(120, 35)) as pilot:
-        await wait_for(pilot, lambda: 2 in app.prefetch_requests)
+        await wait_for(pilot, lambda: 2 in app.summary_requests)
         app.query_one(OptionList).focus()
         await pilot.press("j")
         await wait_for(pilot, lambda: app.summaries.get(2) == "# Summary 2")
