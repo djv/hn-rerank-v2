@@ -33,14 +33,12 @@ svm_precomputed_chunk_size = 512
 [hn_rewrite.rss]
 feeds = [
     "https://lobste.rs/top/rss",
-    "https://tildes.net/topics.rss",
     "https://www.lesswrong.com/feed.xml?view=frontpage&karmaThreshold=20",
     "https://rss.slashdot.org/Slashdot/slashdotMain",
     "https://mshibanami.github.io/GitHubTrendingRSS/weekly/all.xml",
     "https://mshibanami.github.io/GitHubTrendingRSS/weekly/python.xml",
     "https://mshibanami.github.io/GitHubTrendingRSS/weekly/haskell.xml",
     "https://www.reddit.com/r/MachineLearning/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/programming/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/LocalLLaMA/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/haskell/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/ocaml/top/.rss?t=week&limit=25",
@@ -50,7 +48,6 @@ feeds = [
     "https://www.reddit.com/r/transit/top/.rss?t=week&limit=25",
 
     "https://www.reddit.com/r/dataengineering/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/awardtravel/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/CreditCards/top/.rss?t=week&limit=25",
 
     # AI / coding agents
@@ -58,7 +55,6 @@ feeds = [
     "https://www.reddit.com/r/ChatGPTCoding/top/.rss?t=week&limit=25",
 
     # Programming languages / CS depth
-    "https://www.reddit.com/r/ProgrammingLanguages/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/Compilers/top/.rss?t=week&limit=25",
 
     # Finance / tax / nomad money
