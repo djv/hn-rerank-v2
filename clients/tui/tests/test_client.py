@@ -7,7 +7,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from textual.widgets import Input, Markdown, OptionList, Select, Static
+from textual.widgets import Input, Markdown, OptionList, Select, Static, Tabs
 
 from hn_rerank.api import (
     API,
@@ -19,6 +19,7 @@ from hn_rerank.api import (
 )
 from hn_rerank.app import Reader, Setup
 from hn_rerank.models import Feed, FeedStory
+from ._settle import settle
 
 
 def sample_feed(version: int = 0, target: int = 0) -> Feed:
@@ -71,8 +72,12 @@ class FakeServer:
             return httpx.Response(200, json={"user_id": 1, "token": "test"})
         if path.endswith("/api/feed"):
             return httpx.Response(200, json=self.feed.to_dict())
-        if path.endswith("/api/tldr-detail"):
-            story_id = json.loads(request.content)["story_id"]
+        if path.endswith("/api/tldr-detail") or "/api/tldr-cache/" in path:
+            story_id = (
+                int(path.rsplit("/", 1)[1])
+                if "/api/tldr-cache/" in path
+                else json.loads(request.content)["story_id"]
+            )
             await asyncio.sleep(self.delay_summary if story_id == 1 else 0)
             return httpx.Response(
                 200, json={"ok": True, "tldr": f"# Summary {story_id}"}
@@ -101,7 +106,7 @@ async def test_navigation_resize_filters_and_late_summary(tmp_path: Path) -> Non
     fake.delay_summary = 0.7
     app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
     async with app.run_test(size=(120, 35)) as pilot:
-        await pilot.pause(0.4)
+        await settle(pilot)
         listing = app.query_one(OptionList)
         listing.focus()
         assert [s.id for s in app.stories] == [1, 2]
@@ -126,35 +131,50 @@ async def test_navigation_resize_filters_and_late_summary(tmp_path: Path) -> Non
         assert listing.display and app.query_one(Markdown).display
 
 
-async def test_vote_duplicate_failure_undo_and_stale_exclusion(tmp_path: Path) -> None:
+async def test_rapid_votes_apply_in_order_undo_and_failure_revert(
+    tmp_path: Path,
+) -> None:
     fake = FakeServer()
     fake.delay_vote = 0.15
     app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
     async with app.run_test(size=(120, 35)) as pilot:
-        await pilot.pause(0.15)
+        await settle(pilot)
         app.query_one(OptionList).focus()
+        # Both apply at once; the second lands on the next story, not dropped.
         app.action_vote("up")
-        app.action_vote("down")
-        await pilot.pause(0.3)
-        votes = [r for r in fake.requests if r.url.path.endswith("/feedback")]
-        assert len(votes) == 1
-        assert app.rated == {1}
         assert [s.id for s in app.stories] == [2]
+        app.action_vote("down")
+        assert not app.stories and app.rated == {1, 2}
+        await settle(pilot)
+        votes = [
+            json.loads(r.content)
+            for r in fake.requests
+            if r.url.path.endswith("/feedback")
+        ]
+        assert votes == [
+            {"story_id": 1, "action": "up"},
+            {"story_id": 2, "action": "down"},
+        ]
         app.action_refresh()
-        await pilot.pause(0.1)
-        assert [s.id for s in app.stories] == [2]
+        await settle(pilot)
+        assert not app.stories  # voted stories stay out of a refreshed deck
         app.action_undo()
-        await pilot.pause(0.3)
-        assert not app.rated and not app.history
+        await settle(pilot)
+        assert app.rated == {1} and [s.id for s in app.history] == [1]
         selected = app.selected()
-        assert selected and selected.id == 1
+        assert selected and selected.id == 2
+        # A failed vote puts the story back, selected, and is not retried.
         fake.fail_vote = True
+        fake.requests.clear()
         app.action_vote("down")
-        await pilot.pause(0.3)
-        assert not app.rated and not app.history
+        assert app.rated == {1, 2}
+        await settle(pilot)
+        assert app.rated == {1} and [s.id for s in app.history] == [1]
         selected = app.selected()
-        assert selected and selected.id == 1
-        assert "secret" not in str(app.query_one("#status", Static).content)
+        assert selected and selected.id == 2
+        assert len([r for r in fake.requests if r.url.path.endswith("/feedback")]) == 1
+        status = str(app.query_one("#status", Static).content)
+        assert "not confirmed" in status and "secret" not in status
 
 
 async def test_setup_typing_does_not_trigger_actions(tmp_path: Path) -> None:
@@ -174,7 +194,7 @@ async def test_narrow_select_focus_keeps_escape_and_focus_moves_reachable() -> N
     fake = FakeServer()
     app = Reader(api=fake.api())
     async with app.run_test(size=(80, 30)) as pilot:
-        await pilot.pause(0.6)
+        await settle(pilot)
         # Narrow keeps both panes visible, so the summary sits between the
         # headline list and the selectors in the focus chain.
         await pilot.press("tab", "tab")
@@ -247,18 +267,145 @@ async def test_rate_limit_and_zero_reset() -> None:
     await api.close()
     fake = FakeServer()
     app = Reader(api=fake.api())
-    app.target = 12
     async with app.run_test() as pilot:
-        await pilot.pause(0.2)
-        assert app.target == 0
+        await settle(pilot)
         assert app.feed and app.feed.ready and app.feed.version == 0
+
+
+class FailSummaryServer(FakeServer):
+    """Fails foreground taps for chosen stories; cache reads always miss."""
+
+    def __init__(self, fail_ids: set[int]) -> None:
+        super().__init__()
+        self.fail_ids = fail_ids
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/api/tldr-detail"):
+            story_id = json.loads(request.content)["story_id"]
+            if story_id in self.fail_ids:
+                return httpx.Response(500)
+        if "/api/tldr-cache/" in request.url.path:
+            return httpx.Response(204)
+        return await super().__call__(request)
+
+
+async def test_summary_failure_hides_story_until_refresh(
+    tmp_path: Path,
+) -> None:
+    fake = FailSummaryServer({1})
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while 1 not in app.unavailable:
+            if asyncio.get_running_loop().time() > deadline:
+                raise AssertionError("story 1 was not hidden")
+            await pilot.pause(0.05)
+        assert [s.id for s in app.stories] == [2]
+        selected = app.selected()
+        assert selected is not None and selected.id == 2
+        assert "Skipped story 1" in str(app.query_one("#status", Static).content)
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while "Summary 2" not in app.query_one(Markdown)._markdown:
+            if asyncio.get_running_loop().time() > deadline:
+                raise AssertionError("story 2 summary did not load")
+            await pilot.pause(0.05)
+        app.action_refresh()
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while [s.id for s in app.stories] != [1, 2]:
+            if asyncio.get_running_loop().time() > deadline:
+                raise AssertionError("refresh did not restore story 1")
+            await pilot.pause(0.05)
+
+
+class EmptySummaryServer(FakeServer):
+    """Returns the no-content flag for chosen stories; cache reads miss."""
+
+    def __init__(self, empty_ids: set[int]) -> None:
+        super().__init__()
+        self.empty_ids = empty_ids
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/api/tldr-detail"):
+            story_id = json.loads(request.content)["story_id"]
+            if story_id in self.empty_ids:
+                return httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "tldr": "No article body or discussion available.",
+                        "cached": False,
+                        "retryable": True,
+                        "empty": True,
+                    },
+                )
+        if "/api/tldr-cache/" in request.url.path:
+            return httpx.Response(204)
+        return await super().__call__(request)
+
+
+async def test_empty_summary_hides_story_until_refresh(
+    tmp_path: Path,
+) -> None:
+    fake = EmptySummaryServer({1})
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while 1 not in app.unavailable:
+            if asyncio.get_running_loop().time() > deadline:
+                raise AssertionError("empty story 1 was not hidden")
+            await pilot.pause(0.05)
+        assert [s.id for s in app.stories] == [2]
+        assert 1 not in app.summaries  # placeholder never cached
+        assert "Skipped story 1" in str(app.query_one("#status", Static).content)
+        app.action_refresh()
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while [s.id for s in app.stories] != [1, 2]:
+            if asyncio.get_running_loop().time() > deadline:
+                raise AssertionError("refresh did not restore story 1")
+            await pilot.pause(0.05)
+
+
+def test_open_in_firefox_reuses_running_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess as stdlib_subprocess
+
+    import hn_rerank.app as app_module
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/firefox")
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *a, **k: stdlib_subprocess.CompletedProcess(a[0], 0),
+    )
+    monkeypatch.setattr("subprocess.Popen", lambda argv, **k: calls.append(argv))
+    app_module.open_in_firefox("https://example.org/x")
+    assert calls == [["/usr/bin/firefox", "--new-tab", "https://example.org/x"]]
+
+
+def test_open_in_firefox_launches_when_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess as stdlib_subprocess
+
+    import hn_rerank.app as app_module
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/firefox")
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *a, **k: stdlib_subprocess.CompletedProcess(a[0], 1),
+    )
+    monkeypatch.setattr("subprocess.Popen", lambda argv, **k: calls.append(argv))
+    app_module.open_in_firefox("https://example.org/x")
+    assert calls == [["/usr/bin/firefox", "https://example.org/x"]]
 
 
 async def test_stale_poll_does_not_cancel_summary_for_same_selection() -> None:
     fake = FakeServer()
     fake.feed = sample_feed(0, 1)
     fake.delay_summary = 1.4
-    app = Reader(api=fake.api())
+    app = Reader(api=fake.api(), prefetch=0)
     async with app.run_test(size=(120, 35)) as pilot:
         await pilot.pause(2.1)
         assert "Summary 1" in app.query_one(Markdown)._markdown
@@ -303,3 +450,412 @@ async def test_malformed_profile_response_returns_safe_error(token: object) -> N
             await api.validate()
     finally:
         await api.close()
+
+
+@pytest.mark.parametrize("provisional", [False, True])
+async def test_refresh_keeps_readable_summary_and_reports_failure(
+    tmp_path: Path, provisional: bool
+) -> None:
+    class RefreshServer(FakeServer):
+        async def __call__(self, request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/api/tldr-detail") and json.loads(
+                request.content
+            ).get("force_refresh"):
+                self.requests.append(request)
+                await asyncio.sleep(0.3)
+                if provisional:
+                    return httpx.Response(
+                        200,
+                        json={"tldr": "# Summary 1", "cached": True, "retryable": True},
+                    )
+                return httpx.Response(503, json={"error": "Provider unavailable"})
+            return await super().__call__(request)
+
+    fake = RefreshServer()
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        await pilot.pause(0.8)
+        assert app.summaries[1] == "# Summary 1"
+        app.query_one(OptionList).focus()
+        await pilot.press("r")
+        await pilot.pause(0.1)
+        assert "Summary 1" in app.query_one("#summary", Markdown)._markdown
+        await pilot.pause(0.9)
+        selected = app.selected()
+        assert selected is not None and selected.id == 1
+        assert 1 not in app.unavailable
+        assert "Summary 1" in app.query_one("#summary", Markdown)._markdown
+        status = str(app.query_one("#status", Static).content)
+        assert ("outdated or incomplete" if provisional else "refresh failed") in status
+
+
+async def test_refresh_forces_only_selected_summary(tmp_path: Path) -> None:
+    fake = FakeServer()
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        app.query_one(OptionList).focus()
+        fake.requests.clear()
+        await pilot.press("r")
+        await pilot.pause(0.8)
+        forced = [
+            json.loads(r.content)
+            for r in fake.requests
+            if r.url.path.endswith("/api/tldr-detail")
+            and json.loads(r.content).get("force_refresh")
+        ]
+        assert forced == [{"story_id": 1, "force_refresh": True}]
+        fake.requests.clear()
+        app.reload(manual=False)
+        await pilot.pause(0.8)
+        assert not any(
+            json.loads(r.content).get("force_refresh")
+            for r in fake.requests
+            if r.url.path.endswith("/api/tldr-detail")
+        )
+
+
+@pytest.mark.parametrize("width", [73, 146])
+@pytest.mark.parametrize("origin", ["cycle", "tabs", "age"])
+async def test_rapid_filter_changes_settle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, width: int, origin: str
+) -> None:
+    app = Reader(api=FakeServer().api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(width, 38)) as pilot:
+        await settle(pilot)
+        rebuilds = 0
+        original = app.rebuild
+
+        def counted_rebuild(select_id: int | None = None) -> None:
+            nonlocal rebuilds
+            rebuilds += 1
+            original(select_id)
+
+        monkeypatch.setattr(app, "rebuild", counted_rebuild)
+        group, expected = ("age", "archive") if origin == "age" else ("sort", "date")
+        # No yielding: reproduce several queued changes before either widget
+        # has handled its peer's messages.
+        if origin == "cycle":
+            for _ in range(3):
+                app.action_cycle_sort()
+        elif origin == "tabs":
+            for value in ("popular", "explore", "date"):
+                app.query_one("#sort-tabs", Tabs).active = f"sort-{value}"
+        else:
+            for value in ("archive", "recent", "archive"):
+                app.query_one("#age", Select).value = value
+        await settle(pilot)
+        assert app.query_one(f"#{group}", Select).value == expected
+        assert app.query_one(f"#{group}-tabs", Tabs).active == f"{group}-{expected}"
+        settled = rebuilds
+        assert 0 < settled <= 3
+        await settle(pilot)
+        assert rebuilds == settled  # No self-sustaining Select/Tabs echo.
+
+
+async def test_s_cycles_sort_modes(tmp_path: Path) -> None:
+    fake = FakeServer()
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        app.query_one(OptionList).focus()
+        assert str(app.query_one("#sort", Select).value) == "recommended"
+        assert [s.id for s in app.stories] == [1, 2]
+        for expected, story_ids in (
+            ("popular", [1]),
+            ("explore", [2]),
+            ("date", [2, 1]),
+            ("recommended", [1, 2]),
+        ):
+            await pilot.press("s")
+            await settle(pilot)
+            assert str(app.query_one("#sort", Select).value) == expected
+            assert [s.id for s in app.stories] == story_ids
+
+
+async def test_explore_sort_is_shuffled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Explore reshuffles client-side instead of following server rank order."""
+    from dataclasses import replace
+
+    fake = FakeServer()
+    fake.feed = replace(
+        fake.feed, orders={**fake.feed.orders, "explore:recent": [1, 2]}
+    )
+
+    def reverse(order: list[int]) -> None:
+        order[:] = order[::-1]
+
+    monkeypatch.setattr("random.shuffle", reverse)
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        app.query_one(OptionList).focus()
+        assert [s.id for s in app.stories] == [1, 2]
+        await pilot.press("s")  # popular: untouched by the shuffle.
+        await settle(pilot)
+        assert [s.id for s in app.stories] == [1]
+        await pilot.press("s")  # explore: reversed server order.
+        await settle(pilot)
+        assert str(app.query_one("#sort", Select).value) == "explore"
+        assert [s.id for s in app.stories] == [2, 1]
+        # Rebuild must copy: the shared server order stays intact for
+        # prefetch entry points into other sorts.
+        assert fake.feed.orders["explore:recent"] == [1, 2]
+
+
+async def test_explore_order_is_stable_within_a_visit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rebuilds (votes, polls) keep Explore's order; leaving and coming back
+    reshuffles."""
+    from dataclasses import replace
+
+    fake = FakeServer()
+    fake.feed = replace(
+        fake.feed, orders={**fake.feed.orders, "explore:recent": [1, 2, 3]}
+    )
+    shuffles = 0
+
+    def rotate(order: list[int]) -> None:
+        # Each full draw rotates one step further, so a redraw is visible.
+        nonlocal shuffles
+        if len(order) == 3:
+            shuffles += 1
+            k = shuffles % 3
+            order[:] = order[k:] + order[:k]
+
+    monkeypatch.setattr("random.shuffle", rotate)
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        app.query_one(OptionList).focus()
+        await pilot.press("s", "s")
+        await settle(pilot)
+        assert str(app.query_one("#sort", Select).value) == "explore"
+        first = [s.id for s in app.stories]
+        assert sorted(first) == [1, 2, 3]
+        for _ in range(3):
+            app.rebuild()
+        assert [s.id for s in app.stories] == first
+        assert shuffles == 1
+        app.rated.add(first[0])
+        app.rebuild()
+        assert [s.id for s in app.stories] == first[1:]
+        app.rated.clear()
+        await pilot.press("s", "s", "s", "s")  # full cycle back to explore
+        await settle(pilot)
+        assert str(app.query_one("#sort", Select).value) == "explore"
+        assert [s.id for s in app.stories] != first
+
+
+class FlakySummaryServer(FakeServer):
+    """Rate-limits foreground taps for story 1; cache reads always miss."""
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        if (
+            request.url.path.endswith("/api/tldr-detail")
+            and json.loads(request.content)["story_id"] == 1
+        ):
+            return httpx.Response(429, headers={"Retry-After": "30"})
+        if "/api/tldr-cache/" in request.url.path:
+            return httpx.Response(204)
+        return await super().__call__(request)
+
+
+async def test_transient_summary_failure_keeps_story(tmp_path: Path) -> None:
+    fake = FlakySummaryServer()
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while "Rate limited" not in app.query_one(Markdown)._markdown:
+            if asyncio.get_running_loop().time() > deadline:
+                raise AssertionError("rate limit was not shown")
+            await pilot.pause(0.05)
+        assert 1 not in app.unavailable
+        assert [s.id for s in app.stories] == [1, 2]
+        selected = app.selected()
+        assert selected is not None and selected.id == 1
+
+
+async def test_version_poll_keeps_hidden_stories_hidden(tmp_path: Path) -> None:
+    fake = FakeServer()
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        app.unavailable.add(1)
+        app.reload(manual=False)
+        await settle(pilot)
+        assert [s.id for s in app.stories] == [2]
+        app.action_refresh()
+        await settle(pilot)
+        assert [s.id for s in app.stories] == [1, 2]
+
+
+def test_open_in_firefox_falls_back_on_launch_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hn_rerank.app as app_module
+
+    opened: list[str] = []
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/firefox")
+
+    def missing(*args: object, **kwargs: object) -> None:
+        raise FileNotFoundError("pgrep")
+
+    monkeypatch.setattr("subprocess.run", missing)
+    monkeypatch.setattr(app_module.webbrowser, "open", opened.append)
+    app_module.open_in_firefox("https://example.org/x")
+    assert opened == ["https://example.org/x"]
+
+
+async def test_y_copies_comments_link_else_article_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import dataclasses
+
+    import hn_rerank.app as app_module
+
+    copied: list[str] = []
+
+    def copy(url: str) -> bool:
+        copied.append(url)
+        return True
+
+    monkeypatch.setattr(app_module, "copy_with_system_tool", copy)
+    fake = FakeServer()
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        await pilot.press("y")
+        assert copied == ["https://news.ycombinator.com/item?id=1"]
+        selected = app.selected()
+        assert selected is not None
+        no_comments = dataclasses.replace(selected, comments_url="")
+        monkeypatch.setattr(app, "selected", lambda: no_comments)
+        await pilot.press("y")
+        assert copied[-1] == "https://example.org/1"
+        monkeypatch.setattr(
+            app,
+            "selected",
+            lambda: dataclasses.replace(no_comments, article_url="javascript:x"),
+        )
+        await pilot.press("y")
+        assert len(copied) == 2
+
+
+def test_copy_with_system_tool_skips_failing_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess
+
+    import hn_rerank.app as app_module
+
+    calls: list[list[str]] = []
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+
+    def run(command: list[str], **kwargs: object) -> None:
+        calls.append(command)
+        if command[0] != "xsel":
+            raise subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr("subprocess.run", run)
+    assert app_module.copy_with_system_tool("u") is True
+    assert [c[0] for c in calls] == ["pbcopy", "xclip", "xsel"]
+
+
+async def test_failed_refresh_does_not_force_a_later_regeneration(
+    tmp_path: Path,
+) -> None:
+    """r arms a forced regeneration; if the feed fetch fails it must disarm."""
+
+    class FeedFailServer(FakeServer):
+        fail_feed = False
+
+        async def __call__(self, request: httpx.Request) -> httpx.Response:
+            if self.fail_feed and request.url.path.endswith("/api/feed"):
+                return httpx.Response(500)
+            return await super().__call__(request)
+
+    fake = FeedFailServer()
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        fake.fail_feed = True
+        app.action_refresh()
+        await settle(pilot)
+        fake.fail_feed = False
+        app.reload(manual=False)
+        await settle(pilot)
+        app.query_one(OptionList).focus()
+        await pilot.press("j", "k")
+        await settle(pilot)
+        forced = [
+            r
+            for r in fake.requests
+            if r.url.path.endswith("/api/tldr-detail")
+            and json.loads(r.content).get("force_refresh")
+        ]
+        assert len(forced) == 1  # only the r itself
+
+
+async def test_only_summary_generation_gets_the_long_timeout() -> None:
+    from hn_rerank.api import GENERATION_TIMEOUT, REQUEST_TIMEOUT
+
+    seen: dict[str, float] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen[request.url.path.rsplit("/", 1)[-1]] = request.extensions["timeout"][
+            "read"
+        ]
+        if request.url.path.endswith("/api/tldr-detail"):
+            return httpx.Response(200, json={"ok": True, "tldr": "# T"})
+        return httpx.Response(204)
+
+    api = API("https://example.org/hn/", "test", httpx.MockTransport(handler))
+    await api.summary(1)
+    await api.cached_summary(1)
+    await api.close()
+    assert seen == {"tldr-detail": GENERATION_TIMEOUT, "1": REQUEST_TIMEOUT}
+
+
+async def test_failed_undo_hides_the_story_again(tmp_path: Path) -> None:
+    fake = FakeServer()
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        app.query_one(OptionList).focus()
+        app.action_vote("up")
+        await settle(pilot)
+        fake.fail_vote = True
+        app.action_undo()
+        assert not app.rated  # shown at once
+        await settle(pilot)
+        assert app.rated == {1} and [s.id for s in app.history] == [1]
+        assert [s.id for s in app.stories] == [2]
+        assert "not confirmed" in str(app.query_one("#status", Static).content)
+
+
+async def test_h_and_l_step_through_sorts_and_wrap(tmp_path: Path) -> None:
+    fake = FakeServer()
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        app.query_one(OptionList).focus()
+        sort = app.query_one("#sort", Select)
+        seen = []
+        for key in "llllhh":
+            await pilot.press(key)
+            await pilot.pause()
+            seen.append(str(sort.value))
+        assert seen == [
+            "popular",
+            "explore",
+            "date",
+            "recommended",
+            "date",
+            "explore",
+        ]
+        assert app.query_one("#sort-tabs", Tabs).active == "sort-explore"

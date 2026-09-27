@@ -33,6 +33,8 @@ For each affected row:
 
 from __future__ import annotations
 
+import argparse
+
 import sys
 from pathlib import Path
 
@@ -66,6 +68,7 @@ def _count_lesswrong_comments(top_comments: str) -> int:
 
 
 def main() -> None:
+    argparse.ArgumentParser(description=__doc__).parse_args()
     db = Database(str(DB_PATH))
     with db.conn() as conn:
         rows = conn.execute(

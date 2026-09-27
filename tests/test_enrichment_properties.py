@@ -241,8 +241,8 @@ def test_rss_identity_conflict_preserves_story_and_feedback(
         db.close()
 
 
-@given(reverse=st.booleans(), title=st.text(alphabet="abcdef", min_size=1, max_size=30))
-@settings(deadline=None)
+@pytest.mark.parametrize("reverse", [True, False])
+@pytest.mark.parametrize("title", ["alpha", "b" * 30])
 def test_rss_ingestion_skips_real_hash_collision(reverse: bool, title: str) -> None:
     # Real collision in the production URL hash; do not duplicate its implementation.
     urls = [

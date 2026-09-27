@@ -3,7 +3,18 @@ from __future__ import annotations
 import os
 import tomllib
 from dataclasses import dataclass, field, fields, replace
-from typing import Any, Literal
+from types import UnionType
+from typing import (
+    TYPE_CHECKING,
+    Literal,
+    TypeVar,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
+
+if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
 
 
 @dataclass(frozen=True)
@@ -13,6 +24,12 @@ class ModelConfig:
     svm_kernel: str = "rbf"
     svm_precomputed_enabled: bool = False
     svm_precomputed_chunk_size: int = 512
+    deduplicate_training_feedback: bool = False
+    publication_affinity_enabled: bool = False
+    publication_prior_strength: float = 10.0
+    # Opt-in (evaluation, 2026-09-25): log1p HN points and comment count as
+    # two extra SVM meta columns.
+    engagement_features_enabled: bool = False
     neutral_weight: float = 0.0
     enable_mmr: bool = False
     diversity_threshold: float = 0.75
@@ -77,7 +94,7 @@ class Config:
         "spin_off_auto_threads",
     ] = "current"
     server_port: int = 8765
-    regen_interval_seconds: int = 14400
+    regen_interval_seconds: int = 3600
     regen_initial_delay_seconds: int = 30
     regen_prewarm_top_n: int = 50
     prewarm_hn_full: bool = True
@@ -94,7 +111,15 @@ class Config:
     # subreddit per fetch at the limiter's natural 2s+jitter cadence,
     # but the queue spreads them out at 50s for 429 backoff headroom).
     reddit_min_fetch_spacing_seconds: float = 30.0
+    # Start-to-start spacing of full subreddit refreshes. Each regen asks
+    # for one (votes trigger regens every ~20 min), but weekly-top feeds
+    # barely change; a request inside the window waits for it to end.
+    # 0 disables the throttle.
+    reddit_refresh_min_interval_seconds: float = 7200.0
     article_fetch_max_per_run: int = 50
+    # Regen-time article fetches for new RSS snippet stories regardless of
+    # rank (the warm path only reaches stories already near the top). 0 off.
+    rss_article_prewarm_max_per_run: int = 30
     article_fetch_concurrency: int = 10
     article_fetch_max_age_days: int = 30
     max_cached_models: int = 20
@@ -118,6 +143,8 @@ class Config:
     recent_candidate_hn_limit: int = 5000
     recent_candidate_rss_limit: int = 5000
     non_hn_candidates_enabled: bool = True
+    # Independent of source regeneration and per-user warm frequency.
+    tldr_prefetch_interval_seconds: int = 14400
     tldr_prefetch_per_combo: int = 2
     # After the top-per-combo pass, regenerate up to this many additional
     # cold-deck stories whose cached TLDR's cache_key no longer matches
@@ -156,17 +183,23 @@ class Config:
     tldr_tap_probe_timeout_seconds: float = 3.0
     # Public demo abuse limits. Cached TLDR hits bypass the uncached TLDR
     # quota; these limits protect only new enrichment/LLM work and vote writes.
-    tldr_uncached_per_user_limit: int = 12
+    tldr_uncached_per_user_limit: int = 24
     tldr_uncached_per_user_window_seconds: int = 3600
-    tldr_uncached_global_limit: int = 60
+    tldr_uncached_global_limit: int = 120
     tldr_uncached_global_window_seconds: int = 3600
+    # Uncached TLDR generations running at once, all users; extra requests
+    # get a stale cached TLDR or a short 429 instead of queueing a thread.
+    tldr_max_concurrent_generations: int = 8
     feedback_per_user_limit: int = 120
     feedback_per_user_window_seconds: int = 600
     feedback_global_limit: int = 2000
     feedback_global_window_seconds: int = 3600
     dashboard_warm_vote_threshold: int = 10
     dashboard_warm_idle_seconds: float = 3.0
-    feedback_regen_idle_seconds: float = 300.0
+    # Personalized re-ranks run on a bounded pool (warm_scheduler.py): votes,
+    # stale page loads and post-regen refreshes all share it, so a regen that
+    # marks every cached user stale can't start one rank thread per user.
+    warm_pool_size: int = 2
     session_create_per_ip_limit: int = 60
     session_create_per_ip_window_seconds: int = 3600
     profile_link_per_ip_limit: int = 120
@@ -175,6 +208,8 @@ class Config:
     rss: RssConfig = field(default_factory=RssConfig)
 
     def __post_init__(self) -> None:
+        if self.tldr_prefetch_interval_seconds <= 0:
+            raise ValueError("tldr_prefetch_interval_seconds must be positive")
         if self.embedding_batch_size <= 0:
             raise ValueError("embedding_batch_size must be positive")
         if not self.embedding_model_version.strip():
@@ -185,8 +220,8 @@ class Config:
             raise ValueError("dashboard_warm_vote_threshold must be positive")
         if self.dashboard_warm_idle_seconds <= 0:
             raise ValueError("dashboard_warm_idle_seconds must be positive")
-        if self.feedback_regen_idle_seconds <= 0:
-            raise ValueError("feedback_regen_idle_seconds must be positive")
+        if self.warm_pool_size < 1:
+            raise ValueError("warm_pool_size must be >= 1")
         if self.model.svm_precomputed_chunk_size <= 0:
             raise ValueError("svm_precomputed_chunk_size must be positive")
         if self.embedding_ort_variant not in {
@@ -229,30 +264,80 @@ class Config:
             raise ValueError(
                 "Unknown hn_rewrite config key(s): " + ", ".join(sorted(unknown_root))
             )
+        root_values = _typed_values(cls, root_values, section="hn_rewrite")
 
         model = _overlay_dataclass_config(
             defaults.model,
             model_cfg,
             section="hn_rewrite.model",
-            tuple_fields={"dedup_exclude_actions"},
         )
         rss = _overlay_dataclass_config(
             defaults.rss,
             rss_cfg,
             section="hn_rewrite.rss",
-            tuple_fields={"feeds"},
         )
 
         return replace(defaults, **root_values, model=model, rss=rss)
 
 
+_DC = TypeVar("_DC", bound="DataclassInstance")
+
+
+def _coerce_toml_value(value: object, tp: object, where: str) -> object:
+    """Check a TOML value against a dataclass field's declared type.
+
+    TOML already distinguishes ints, floats, bools and strings, so this only
+    widens int -> float and array -> tuple; anything else that doesn't match
+    is a config error reported with its key, not a crash later at use.
+    """
+    if tp is bool:
+        if isinstance(value, bool):
+            return value
+    elif tp is int:
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    elif tp is float:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+    elif tp is str:
+        if isinstance(value, str):
+            return value
+    elif get_origin(tp) is tuple:
+        (item_tp, _) = get_args(tp)
+        if isinstance(value, (list, tuple)):
+            return tuple(_coerce_toml_value(v, item_tp, where) for v in value)
+    elif get_origin(tp) is Literal:
+        if value in get_args(tp):
+            return value
+    elif isinstance(tp, UnionType):
+        for option in get_args(tp):
+            try:
+                return _coerce_toml_value(value, option, where)
+            except ValueError:
+                continue
+    raise ValueError(f"{where} must be {_type_name(tp)}, got {value!r}")
+
+
+def _type_name(tp: object) -> str:
+    return getattr(tp, "__name__", None) or str(tp)
+
+
+def _typed_values(
+    cls: type[DataclassInstance], values: dict[str, object], *, section: str
+) -> dict[str, object]:
+    hints = get_type_hints(cls)
+    return {
+        name: _coerce_toml_value(value, hints[name], f"{section}.{name}")
+        for name, value in values.items()
+    }
+
+
 def _overlay_dataclass_config(
-    defaults: Any,
-    config: Any,
+    defaults: _DC,
+    config: object,
     *,
     section: str,
-    tuple_fields: set[str] | None = None,
-) -> Any:
+) -> _DC:
     if not isinstance(config, dict):
         raise ValueError(f"[{section}] must be a table")
 
@@ -263,8 +348,5 @@ def _overlay_dataclass_config(
             f"Unknown {section} config key(s): " + ", ".join(sorted(unknown))
         )
 
-    values = dict(config)
-    for name in tuple_fields or set():
-        if name in values:
-            values[name] = tuple(values[name])
-    return replace(defaults, **values)
+    values = {str(key): value for key, value in config.items()}
+    return replace(defaults, **_typed_values(type(defaults), values, section=section))

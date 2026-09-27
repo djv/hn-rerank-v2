@@ -422,6 +422,29 @@ async def test_probe_failure_resets_cooldown(
 
 
 @pytest.mark.asyncio
+async def test_unreported_probe_does_not_wedge_the_circuit(
+    limiter: RedditRateLimiter, fake_clock: FakeClock
+) -> None:
+    """A probe whose caller never reports (network error or a 5xx; callers
+    only report 200/429) counts as failed after a full cooldown: the next
+    probe is admitted instead of the circuit staying open until restart."""
+    limiter.CIRCUIT_COOLDOWN = 300.0
+    for _ in range(3):
+        limiter.on_429()
+    fake_clock.advance(300.0)
+    assert await limiter.acquire() is True  # probe admitted, never reported
+
+    fake_clock.advance(299.0)
+    assert await limiter.acquire() is False
+    fake_clock.advance(2.0)
+    assert await limiter.acquire() is True  # next probe
+    assert await limiter.acquire() is False  # still one probe at a time
+
+    limiter.on_success()
+    assert limiter.circuit_open is False
+
+
+@pytest.mark.asyncio
 async def test_concurrent_acquire_staggers_reservations(
     limiter: RedditRateLimiter, fake_clock: FakeClock, sleep_recorder: SleepRecorder
 ) -> None:

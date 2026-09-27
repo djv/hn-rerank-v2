@@ -13,7 +13,7 @@ Markdown formatting:
 - Group bullets under freeform `####` headings named for what this
   specific thread is actually about — never reuse a fixed label set
   (no Consensus/Disagreement/Caveat-style buckets).
-- Short bullet points (-) with **bold** key terms, one sentence each.
+- Bullet points (-) with **bold** key terms, one or two sentences each.
   Every bullet must carry a concrete specific: a number, name, reason,
   tradeoff, or quoted position. Drop throat-clearing and any bullet
   that merely restates the story title.

@@ -6,16 +6,41 @@ profile with your server URL, for example `https://your-host/hn/`.
 The server retains its existing access policy: installing the client does not grant access.
 
 Keys: j/k or arrows navigate/scroll; Tab changes focus; 1/2/3 vote
-positive/neutral/negative; u undoes the latest successful vote; o/c open
-article/comments; r refreshes; ? shows help; q quits. Enter opens a read mode
-when the summary overflows its pane (the footer hint appears only then);
-Escape leaves it or closes help. Use the sort and age selectors to change
+positive/neutral/negative and advance to the next story at once (votes are sent
+in order in the background; a failed one puts its story back with an error);
+u undoes the latest vote; o/c open article/comments;
+y copies the comments link (or the article link if there is none); r refreshes; ? shows help; q quits.
+Enter hides the article list and zooms the TLDR pane; Enter or Escape returns
+to the list. Escape also closes help. Use the sort and age selectors to change
 filters. Below 100 columns the headline list stacks above the summary.
+
+Summaries are cached for the session across sort changes. Up to four background
+requests warm the next 20 stories, the previous three, and the first three
+stories in each other sort for the current age filter. Prefetch starts alongside
+the selected summary and refills as you navigate or vote.
+
+Missing TLDRs are generated for the next three stories, the previous three,
+and the first three in each other sort. This uses the normal server generation
+path and may incur provider usage; deeper stories only read existing caches.
+`--prefetch N` adjusts forward cache depth (`0` disables all prefetch).
+`--prefetch-generate N` adjusts forward generation depth and the other-sort
+entry window (up to three); `0` keeps all background work cache-only.
+Navigation reuses an in-flight prefetch instead of issuing a duplicate request.
+Errors pause new background requests for a minute; requests already running may
+finish. Empty, stale or partial responses are never cached. Rapid navigation
+can still outrun generation, and changing the age filter warms its own targets.
+
+Selected-story transitions that remain selected for at least one second send
+best-effort impression events to your configured server's existing interaction
+ledger: story ID, zero-based list position, filters, feed version, time and a
+random session ID. Prefetches do not count; failures never block reading.
+This measures selection, not attention or terminal-window visibility. Events
+are not sent to a separate analytics service and are not retried.
 
 Configuration lives in platformdirs' user config directory (`hn-rerank/profile.json`),
 outside uv's cache. The profile token is a credential: keep that file and profile links private.
-Requests do not follow redirects or retry ambiguous votes. Refresh after a connection failure;
-undo can clear the latest confirmed vote. Reading requires an online server; no local ML.
+Requests do not follow redirects or retry ambiguous votes. Refresh after a connection failure.
+Reading requires an online server; no local ML.
 
 Local build: `uv build --project clients/tui`.
 Local launch: `uvx --from /absolute/path/to/hn_rerank-0.1.0-py3-none-any.whl hn-rerank`.
@@ -31,15 +56,27 @@ Bold key terms in a summary take the same orange, and single-marker emphasis
 identifies the selected headline without relying on color. At 100 columns and
 above, filter tabs sit over a one-third headline/two-thirds summary layout.
 Smaller terminals use dropdowns and stack the list above the summary; both
-panes stay visible and the summary scrolls in place. When a summary is taller
-than its pane, Enter expands it (full height on small terminals) and the
-footer advertises the key; fitting summaries keep the plain layout with the
-key disabled.
+panes stay visible and the summary scrolls in place. Enter zooms the TLDR pane
+to full height at every terminal size,
+even for short summaries. On wide terminals the pane is centered and capped
+at 100 columns for comfortable reading. Enter or Escape restores the article
+list. The footer shows the zoom and return keys for the current mode.
+Press `r` to refresh the feed and request a fresh server-generated summary for
+only the selected story. Automatic refreshes keep using the server cache:
+once a minute the reader checks for a newer deck (a regen, a vote from another
+device, or the reranked deck after your vote) and reloads it without touching
+the open story.
+Regeneration still respects provider limits and does not guarantee a longer summary.
+Press `s` to cycle Recommended → Popular → Explore → Date; `h` / `l` step to
+the previous / next sort.
+
 Resize and focus changes preserve reading position. Run the offline preview from
 the repository root with `uv run python -m clients.tui.tests.preview --headless`.
 
-Unselected headlines are dimmed, so the selected row (ivory on a lifted band,
-plus the `>` marker) reads first. One docked footer bar carries the current
+The reader follows the local clock: a light paper theme from 06:00 to 19:59,
+the dark editorial theme otherwise (checked every minute; a theme picked from
+the command palette holds until the next boundary). Unselected headlines are
+dimmed, so the selected row (a lifted band plus the `>` marker) reads first. One docked footer bar carries the current
 filter's counts on the left (`2 shown · +0 ~0 −0`) and context-sensitive keys on
 the right; failures appear there with a `✗` prefix and replace the counts until
 the next successful refresh. Scrollbars follow the theme, and stories without a

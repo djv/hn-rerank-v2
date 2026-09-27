@@ -8,6 +8,7 @@ import re
 import threading
 import time
 from dataclasses import replace
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Protocol
 from urllib.error import URLError
 from urllib.parse import urlparse
@@ -40,6 +41,8 @@ REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dash
 # Matches server.py's SELF_TEXT_PROMPT_CHAR_LIMIT: no point retaining RSS
 # content beyond what the TLDR prompt assembler will actually use.
 RSS_SELF_TEXT_CHAR_LIMIT = 8_000
+# LessWrong GraphQL during regen prewarm (tap-time fetches keep 15s).
+LESSWRONG_PREWARM_TIMEOUT_S = 45.0
 
 
 def _ch_story_item_to_story(item: ChItem) -> Story | None:
@@ -392,7 +395,7 @@ def _merge_source_context(
         top_comments=top_comments,
         text_content=new_text,
         discussion_url=story.discussion_url or story.url,
-        comment_count=story.comment_count or ctx.comment_count or None,
+        comment_count=max(story.comment_count or 0, ctx.comment_count) or None,
         comment_count_at_fetch=max(story.comment_count_at_fetch, ctx.comment_count),
         score=max(story.score, getattr(ctx, "score", story.score)),
     )
@@ -499,7 +502,10 @@ async def prewarm_lesswrong_stories(
             continue
 
         try:
-            ctx = await _fetch_lesswrong_context(post_id)
+            # Background prewarm: a slow connect costs no user latency.
+            ctx = await _fetch_lesswrong_context(
+                post_id, timeout_s=LESSWRONG_PREWARM_TIMEOUT_S
+            )
         except Exception as exc:
             logging.warning(
                 "prewarm_lesswrong: fetch failed for story_id=%s: %r",
@@ -522,11 +528,16 @@ async def prewarm_lesswrong_stories(
         self_text_fresh = not story.self_text or len(ctx.self_text) > len(
             story.self_text
         )
-        if not (top_comments_fresh or self_text_fresh):
+        metadata_fresh = (
+            ctx.comment_count > (story.comment_count or 0)
+            or ctx.comment_count > story.comment_count_at_fetch
+            or ctx.score > story.score
+        )
+        if not (top_comments_fresh or self_text_fresh or metadata_fresh):
             continue
 
         updated = _merge_source_context(
-            story, ctx, story.article_body, prefer_longer_comments=False
+            story, ctx, story.article_body, prefer_longer_comments=True
         )
         if not updated.text_content:
             continue
@@ -566,16 +577,6 @@ def _rss_source_name(feed_url: str) -> str:
         if domain.startswith(prefix):
             domain = domain[len(prefix) :]
     return f"rss_{domain.replace('.', '_')}"
-
-
-def _urllib_fetch(url: str, user_agent: str) -> tuple[int, str]:
-    """Sync fetch via urllib.
-    Re-exported from http_fetch for backward compatibility with
-    callers that import it from pipeline (e.g. server.py). Prefer
-    `http_fetch.urllib_fetch` for new code."""
-    from http_fetch import urllib_fetch as _impl
-
-    return _impl(url, user_agent)
 
 
 def _parse_rate_limit_reset(headers: dict[str, str]) -> float | None:
@@ -813,9 +814,9 @@ def _article_fetch_failure_active(
     now_ts: float,
 ) -> bool:
     failure = db.get_article_fetch_failure(story_id)
-    if not failure:
+    if failure is None:
         return False
-    return bool(failure["permanent"]) or float(failure["next_retry_at"]) > now_ts
+    return failure.permanent or failure.next_retry_at > now_ts
 
 
 def _article_fetch_extra_priority(
@@ -844,6 +845,8 @@ _PAYWALL_DOMAINS: frozenset[str] = frozenset(
         "wsj.com",
         "reuters.com",
         "axios.com",
+        # Bot-blocked (403 on every fetch, 2026-09-27).
+        "openai.com",
     }
 )
 
@@ -904,6 +907,57 @@ def _is_fetchable_article_url(url: str) -> bool:
     return True
 
 
+def _article_fetch_eligible(
+    story: Story, db: Database, min_time: float, now_ts: float
+) -> bool:
+    if not story.url or story.article_body:
+        return False
+    if not _is_fetchable_article_url(story.url):
+        return False
+    if story.source.startswith("rss_reddit_") or story.source == "rss_lesswrong_com":
+        return False
+    if story.time < min_time:
+        return False
+    if _article_fetch_failure_active(db, story.id, now_ts):
+        return False
+    return True
+
+
+def select_rss_article_prewarm(
+    candidates: Sequence[Story],
+    db: Database,
+    *,
+    max_per_run: int,
+    max_age_days: int = 30,
+    now_ts: float | None = None,
+) -> list[Story]:
+    """Newest RSS stories (not Reddit/LessWrong) still lacking article text.
+
+    The warm-path fetcher only reaches stories that already rank near the
+    top, so a feed that ships a short snippet never earns the text that
+    would let it rank. Rows are re-read from the DB: feed parsing yields
+    fresh objects without the stored body.
+    """
+    if max_per_run <= 0:
+        return []
+    now_ts = time.time() if now_ts is None else now_ts
+    min_time = now_ts - (max_age_days * 86400)
+    rss_ids = [
+        s.id
+        for s in candidates
+        if s.source.startswith("rss_")
+        and not s.source.startswith("rss_reddit_")
+        and s.source != "rss_lesswrong_com"
+    ]
+    stored = [
+        s
+        for s in db.get_stories(rss_ids)
+        if _article_fetch_eligible(s, db, min_time, now_ts)
+    ]
+    stored.sort(key=lambda s: s.time, reverse=True)
+    return stored[:max_per_run]
+
+
 def select_article_fetch_candidates(
     *,
     ranked: list[RankedStory],
@@ -925,20 +979,7 @@ def select_article_fetch_candidates(
     min_time = now_ts - (max_age_days * 86400)
 
     def eligible(story: Story) -> bool:
-        if not story.url or story.article_body:
-            return False
-        if not _is_fetchable_article_url(story.url):
-            return False
-        if (
-            story.source.startswith("rss_reddit_")
-            or story.source == "rss_lesswrong_com"
-        ):
-            return False
-        if story.time < min_time:
-            return False
-        if _article_fetch_failure_active(db, story.id, now_ts):
-            return False
-        return True
+        return _article_fetch_eligible(story, db, min_time, now_ts)
 
     selected: list[Story] = []
     selected_ids: set[int] = set()
@@ -970,6 +1011,54 @@ def select_article_fetch_candidates(
 def _article_failure_retry_time(failure_count: int, now_ts: float) -> float:
     delay_seconds = min(86400, 3600 * (2 ** max(0, failure_count - 1)))
     return now_ts + delay_seconds
+
+
+# Errors that become permanent after this many consecutive failures: pages
+# that extract to nothing, and sites that refuse us (auth walls, bot blocks).
+_ARTICLE_REPEAT_PERMANENT_ERRORS = frozenset(
+    {"empty_extraction", "http_401", "http_403"}
+)
+_ARTICLE_REPEAT_PERMANENT_AFTER = 3
+_ARTICLE_PERMANENT_RETRY_S = 3650 * 86400
+
+
+def record_article_fetch_failure_outcome(
+    db: Database,
+    story_id: int,
+    url: str,
+    *,
+    status: int | None,
+    error: str | None,
+    permanent: bool,
+    now_ts: float | None = None,
+) -> None:
+    """Record one failed article fetch under the shared retry policy.
+
+    Exponential backoff (1 h doubling, capped at 1 day); permanent when the
+    fetcher said so (404/410, non-HTML, blocked URL) or after repeated
+    empty extractions / 401 / 403. Used by the proactive fetcher and by the
+    TLDR tap path so both apply the same rules.
+    """
+    now_ts = time.time() if now_ts is None else now_ts
+    previous = db.get_article_fetch_failure(story_id)
+    failure_count = (previous.failure_count if previous else 0) + 1
+    permanent = permanent or (
+        error in _ARTICLE_REPEAT_PERMANENT_ERRORS
+        and failure_count >= _ARTICLE_REPEAT_PERMANENT_AFTER
+    )
+    next_retry_at = (
+        now_ts + _ARTICLE_PERMANENT_RETRY_S
+        if permanent
+        else _article_failure_retry_time(failure_count, now_ts)
+    )
+    db.record_article_fetch_failure(
+        story_id,
+        url,
+        status=status,
+        error=error,
+        permanent=permanent,
+        next_retry_at=next_retry_at,
+    )
 
 
 async def fetch_and_cache_article_bodies(
@@ -1024,31 +1113,13 @@ async def fetch_and_cache_article_bodies(
                     success[0] += 1
                     return story.id, updated
 
-                now_ts = time.time()
-                previous = db.get_article_fetch_failure(story.id)
-                previous_count = int(previous["failure_count"]) if previous else 0
-                failure_count = previous_count + 1
-                permanent = (
-                    result.permanent
-                    or (result.error == "empty_extraction" and failure_count >= 3)
-                    or (
-                        result.error is not None
-                        and result.error in ("http_401", "http_403")
-                        and failure_count >= 3
-                    )
-                )
-                next_retry_at = (
-                    now_ts + 3650 * 86400
-                    if permanent
-                    else _article_failure_retry_time(failure_count, now_ts)
-                )
-                db.record_article_fetch_failure(
+                record_article_fetch_failure_outcome(
+                    db,
                     story.id,
                     story.url or "",
                     status=result.status,
                     error=result.error,
-                    permanent=permanent,
-                    next_retry_at=next_retry_at,
+                    permanent=result.permanent,
                 )
                 error_key = result.error or (
                     f"http_{result.status}" if result.status else "unknown"
@@ -1061,17 +1132,13 @@ async def fetch_and_cache_article_bodies(
                     story.id,
                     story.url or "",
                 )
-                now_ts = time.time()
-                previous = db.get_article_fetch_failure(story.id)
-                previous_count = int(previous["failure_count"]) if previous else 0
-                failure_count = previous_count + 1
-                db.record_article_fetch_failure(
+                record_article_fetch_failure_outcome(
+                    db,
                     story.id,
                     story.url or "",
                     status=None,
                     error="internal_exception",
                     permanent=False,
-                    next_retry_at=_article_failure_retry_time(failure_count, now_ts),
                 )
                 error_counts["internal_exception"] = (
                     error_counts.get("internal_exception", 0) + 1

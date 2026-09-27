@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 from database import Database, Story
+from dedup import normalize_url
 from pipeline import (
     Config,
     Embedder,
@@ -121,11 +122,15 @@ def _snapshot_context(path: str | Path) -> tuple[Config, float, str]:
 def _validated_embeddings(
     stories: list[Story], cached: dict[int, np.ndarray]
 ) -> np.ndarray:
+    # Production is 384-d; replay embeddings from other models may differ, but
+    # every vector must share one dimension.
+    dims = {v.shape for v in cached.values()}
+    dim = dims.pop()[0] if len(dims) == 1 else 384
     invalid = [
         s.id
         for s in stories
         if s.id not in cached
-        or cached[s.id].shape != (384,)
+        or cached[s.id].shape != (dim,)
         or not np.isfinite(cached[s.id]).all()
         or not np.isclose(np.linalg.norm(cached[s.id]), 1.0, atol=1e-3)
     ]
@@ -135,13 +140,14 @@ def _validated_embeddings(
             f"missing/invalid IDs (first 20): {invalid[:20]}"
         )
     return np.asarray([cached[s.id] for s in stories], dtype=np.float32).reshape(
-        -1, 384
+        -1, dim
     )
 
 
 class _FrozenEmbedder(Embedder):
-    def __init__(self, model_version: str) -> None:
+    def __init__(self, model_version: str, embedding_dim: int = 384) -> None:
         self.model_version = model_version
+        self.embedding_dim = embedding_dim
 
     def encode(self, texts: list[str], batch_size: int | None = None) -> np.ndarray:
         raise RuntimeError("Evaluation attempted to compute an uncaptured embedding")
@@ -237,7 +243,7 @@ def _production_scores(
             fold.cand_emb,
             db,
             config,
-            _FrozenEmbedder(config.embedding_model_version),
+            _FrozenEmbedder(config.embedding_model_version, fold.cand_emb.shape[1]),
             trace=trace,
             score_context=score_context,
         )
@@ -300,7 +306,7 @@ def _recommended(
         )
         for i in np.argsort(-scores, kind="stable")
     ]
-    embedder = _FrozenEmbedder(config.embedding_model_version)
+    embedder = _FrozenEmbedder(config.embedding_model_version, fold.cand_emb.shape[1])
     with _fold_database(fold, config, source_db) as db:
         context = _load_feedback_context(
             db, user_id=1, actions=tuple(config.model.dedup_exclude_actions)
@@ -322,7 +328,7 @@ def _recommended(
             train_emb = (
                 fold.train_emb
                 if fold.train_emb is not None
-                else fold.x_train_base[:, :384]
+                else fold.x_train_base[:, : fold.cand_emb.shape[1]]
             )
             for label in (0, 1, 2):
                 fold.similarities[label] = _chunked_max_dot(
@@ -649,10 +655,14 @@ def _tier2_scores(
     up_emb = train_emb[y_train == 2]
     down_emb = train_emb[y_train == 0]
     up_centroid = (
-        up_emb.mean(axis=0) if len(up_emb) else np.zeros(384, dtype=np.float32)
+        up_emb.mean(axis=0)
+        if len(up_emb)
+        else np.zeros(cand_emb.shape[1], dtype=np.float32)
     )
     down_centroid = (
-        down_emb.mean(axis=0) if len(down_emb) else np.zeros(384, dtype=np.float32)
+        down_emb.mean(axis=0)
+        if len(down_emb)
+        else np.zeros(cand_emb.shape[1], dtype=np.float32)
     )
     scores = cand_emb @ up_centroid - cand_emb @ down_centroid
     return ((scores - scores.min()) / (scores.max() - scores.min() + 1e-8)).astype(
@@ -945,6 +955,154 @@ def _scores_logreg_up(
     return scores.astype(np.float32), probs
 
 
+def _scores_logreg(
+    fold: FoldData,
+    config: Config,
+    *,
+    c: float | None = None,
+    target: str = "up",
+    embedding_only: bool = False,
+    binary: bool = False,
+    half_life_days: float | None = None,
+) -> tuple[np.ndarray, None]:
+    """Logistic-regression family for the 2026-09-25 ranking study.
+
+    target "up" scores P(up); "up_minus_down" scores P(up) - P(down) (needs
+    the 3-class fit). binary fits up vs not-up. embedding_only drops the
+    kNN/length meta columns. half_life_days decays older training votes.
+    """
+    x_train, x_cand, y, _ = _prepare_linear_model_inputs(fold, config)
+    if embedding_only:
+        emb_dim = fold.cand_emb.shape[1]
+        x_train, x_cand = x_train[:, :emb_dim], x_cand[:, :emb_dim]
+    if binary:
+        y = (y == 2).astype(int)
+    weights = _balanced_weights(y)
+    if half_life_days is not None:
+        weights = weights * _recency_decay(
+            float(fold.train_vote_times.max()), fold.train_vote_times, half_life_days
+        )
+    clf = LogisticRegression(
+        C=config.model.svm_c if c is None else c,
+        solver="lbfgs",
+        max_iter=2000,
+        random_state=0,
+    )
+    clf.fit(x_train, y, sample_weight=weights)
+    probs = clf.predict_proba(x_cand)
+    classes = list(clf.classes_)
+    up = probs[:, classes.index(1 if binary else 2)]
+    if target == "up_minus_down":
+        if binary:
+            raise ValueError("up_minus_down needs the 3-class fit")
+        up = up - probs[:, classes.index(0)]
+    return up.astype(np.float32), None
+
+
+def _scores_production_up_minus_down(
+    fold: FoldData, config: Config, source_db: Database | None
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Production features and SVM, scored softmax(up) - softmax(down)."""
+    _, probs = _production_scores(fold, config, source_db)
+    if probs is None:
+        raise RuntimeError("Production returned no class probabilities")
+    return (probs[:, 2] - probs[:, 0]).astype(np.float32), probs
+
+
+def _scores_knn_up_minus_down(
+    fold: FoldData, config: Config
+) -> tuple[np.ndarray, None]:
+    """Mean top-k similarity to upvotes minus to downvotes; no model fit."""
+    if fold.train_emb is None:
+        raise ValueError("kNN scoring needs training embeddings")
+    sim_up, sim_down, _, _ = _candidate_similarity_features(
+        fold.cand_emb, fold.train_emb, fold.y_train, config.model.knn_k
+    )
+    return (sim_up - sim_down).astype(np.float32), None
+
+
+def _load_replay_embeddings(
+    path: Path, expected_hashes: dict[int, Any]
+) -> dict[int, np.ndarray]:
+    """Vectors from an encode_replay_embeddings.py file, keyed by story ID.
+
+    Every expected story must be present with the same embedding-text hash,
+    so a model comparison never silently mixes in stale or missing texts.
+    """
+    with np.load(path, allow_pickle=False) as data:
+        ids = [int(i) for i in data["story_ids"]]
+        hashes = dict(zip(ids, (str(h) for h in data["text_hashes"]), strict=True))
+        vectors = dict(zip(ids, data["embeddings"], strict=True))
+    missing = [sid for sid in expected_hashes if sid not in vectors]
+    stale = [
+        sid
+        for sid, digest in expected_hashes.items()
+        if sid in hashes and hashes[sid] != str(digest)
+    ]
+    if missing or stale:
+        raise ValueError(
+            f"Replay embeddings do not match: {len(missing)} missing, "
+            f"{len(stale)} with changed text"
+        )
+    return {sid: vectors[sid] for sid in expected_hashes}
+
+
+def _load_concatenated_replay(
+    paths: list[Path], expected_hashes: dict[int, Any]
+) -> dict[int, np.ndarray]:
+    """One or more replay files joined per story, each part scaled 1/sqrt(k)."""
+    parts = [_load_replay_embeddings(path, expected_hashes) for path in paths]
+    scale = np.float32(1.0 / np.sqrt(len(parts)))
+    return {
+        sid: np.concatenate([part[sid] for part in parts]).astype(np.float32) * scale
+        for sid in expected_hashes
+    }
+
+
+def _parse_model_overrides(spec: str) -> dict[str, float | int | bool]:
+    """``svm_c=2;knn_k=20`` -> ModelConfig overrides, typed by the field's default.
+
+    Used by ``prod[...]`` variant names to hill-climb production settings.
+    """
+    defaults = asdict(ModelConfig())
+    overrides: dict[str, float | int | bool] = {}
+    for item in filter(None, (part.strip() for part in spec.split(";"))):
+        key, sep, raw = item.partition("=")
+        if not sep or key not in defaults:
+            raise ValueError(f"Unknown ModelConfig override: {item!r}")
+        default = defaults[key]
+        if isinstance(default, bool):
+            overrides[key] = raw.lower() in {"1", "true", "yes"}
+        elif isinstance(default, int):
+            overrides[key] = int(raw)
+        elif isinstance(default, float) or key == "svm_gamma":
+            overrides[key] = float(raw)
+        else:
+            raise ValueError(f"ModelConfig field {key!r} is not numeric/bool")
+    return overrides
+
+
+def _weighted_rank_blend(
+    scores: dict[str, np.ndarray], *, lr_weight: float, knn_weight: float
+) -> np.ndarray:
+    """Percentile-rank blend; production gets 1 - lr_weight - knn_weight."""
+    weights = {
+        "production": 1.0 - lr_weight - knn_weight,
+        "logreg": lr_weight,
+        "knn": knn_weight,
+    }
+    if min(weights.values()) < 0:
+        raise ValueError(f"Blend weights must be non-negative: {weights}")
+    return sum(
+        (w * _percentile_scores(scores[key]) for key, w in weights.items() if w),
+        start=np.zeros(len(scores["production"]), dtype=np.float32),
+    ).astype(np.float32)
+
+
+def _rank_average(*scores: np.ndarray) -> np.ndarray:
+    return np.mean([_percentile_scores(s) for s in scores], axis=0).astype(np.float32)
+
+
 def _metrics(
     scores: np.ndarray,
     fold: FoldData,
@@ -988,8 +1146,31 @@ def _metrics(
             "p75_rank": float(np.percentile(ranks, 75)) if ranks else None,
             "brier_up": None,
         }
-        for k in (12, 40, 100, 200):
+        # Prevalence-free pairwise ranking quality over every judged card:
+        # the share of (upvote, other) pairs ordered upvote-first. 0.5 is
+        # random. Unlike NDCG@k it uses the whole list, so it is far less
+        # noisy on ~700-card folds.
+        for other_name, others in (("rest", (0, 1)), ("down", (0,))):
+            ups_seen = pairs = n_other = 0
+            for sid in ids:
+                label = judged.get(sid)
+                if sid in positives:
+                    ups_seen += 1
+                elif label in others:
+                    pairs += ups_seen
+                    n_other += 1
+            result[f"auc_up_vs_{other_name}"] = (
+                pairs / (n_up * n_other) if n_up and n_other else None
+            )
+        for k in (10, 12, 40, 100, 200):
             ideal = sum(1 / math.log2(i + 2) for i in range(min(n_up, k)))
+            result[f"random_expected_ndcg_at_{k}"] = (
+                (n_up / len(eligible))
+                * sum(1 / math.log2(i + 2) for i in range(min(k, len(ids))))
+                / ideal
+                if ideal and eligible
+                else None
+            )
             result[f"ndcg_at_{k}"] = (
                 sum(1 / math.log2(p + 2) for p in ranks if p < k) / ideal
                 if ideal
@@ -1040,6 +1221,10 @@ def _metrics(
             limit=config.count,
         )
         output["mmr"] = compute([r.story.id for r in top], candidate_ids)
+    if fold.cand_emb.shape[1] != 384:
+        # Deck assembly runs production dedup, which is 384-d only; replay
+        # embeddings from other models are compared on the raw ranking.
+        return output
     deck = _recommended(scores, fold, config, probs, source_db)
     from pipeline.config import is_hn_source
 
@@ -1073,11 +1258,40 @@ def _make_fold(
     *,
     feedback_embeddings: np.ndarray | None = None,
     needs_experimental: bool = True,
+    judged_only: bool = False,
 ) -> FoldData:
     train_story_indices = valid_positions[train_pos]
     test_story_indices = valid_positions[test_pos]
-    train_ids = {fb_stories[idx].id for idx in train_story_indices}
-    cand_mask = np.array([s.id not in train_ids for s in candidates], dtype=bool)
+
+    def group_key(story: Story) -> str:
+        return str(normalize_url(story.url) or f"story:{story.id}")
+
+    # Keep the first held-out vote per article; never evaluate a cross-post of
+    # an article already present in training. Identity matches production URL
+    # normalization, including tracking-parameter removal.
+    train_groups = {group_key(fb_stories[idx]) for idx in train_story_indices}
+    seen_groups = set(train_groups)
+    keep_test = []
+    for position in sorted(
+        test_pos, key=lambda p: (fb_vote_times[p], fb_stories[valid_positions[p]].id)
+    ):
+        key = group_key(fb_stories[valid_positions[position]])
+        if key not in seen_groups:
+            keep_test.append(position)
+            seen_groups.add(key)
+    test_pos = np.asarray(keep_test, dtype=int)
+    test_story_indices = valid_positions[test_pos]
+    test_ids = {fb_stories[idx].id for idx in test_story_indices}
+    # Deduplicate candidate articles too, preferring the held-out story ID so
+    # an equivalent unjudged cross-post cannot hide a judged item.
+    retained: set[int] = set()
+    seen_candidates = set(train_groups)
+    for item in sorted(candidates, key=lambda s: (s.id not in test_ids, s.id)):
+        key = group_key(item)
+        if key not in seen_candidates and (not judged_only or item.id in test_ids):
+            retained.add(item.id)
+            seen_candidates.add(key)
+    cand_mask = np.array([s.id in retained for s in candidates], dtype=bool)
     fold_candidates = [s for i, s in enumerate(candidates) if cand_mask[i]]
     fold_cand_emb = cand_emb[cand_mask]
 
@@ -1179,7 +1393,7 @@ def _temporal_splits(
 
 
 def _variant_requires_all_labels(name: str) -> bool:
-    all_label_prefixes = ("margin3", "linear_svc", "logreg")
+    all_label_prefixes = ("margin3", "linear_svc", "logreg", "ensemble", "prodlr")
     return name.startswith(all_label_prefixes)
 
 
@@ -1260,11 +1474,34 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
         ),
     )
     parser.add_argument(
+        "--replay-embeddings",
+        type=Path,
+        action="append",
+        help=(
+            "heldout-feedback only: .npz from scripts/encode_replay_embeddings.py "
+            "replacing stored embeddings for every feedback story (text-hash "
+            "checked), to compare embedding models. Repeat to concatenate "
+            "several models (each scaled by 1/sqrt(k), so vectors stay unit)."
+        ),
+    )
+    parser.add_argument(
         "--embedding-label",
         help="Human-readable embedding specification recorded in the JSON report.",
     )
     parser.add_argument("--user-id", type=int)
     parser.add_argument("--folds", type=int, default=5)
+    parser.add_argument(
+        "--leak-seeds",
+        type=int,
+        default=5,
+        help="Number of independent label permutations with --leak-check",
+    )
+    parser.add_argument(
+        "--candidate-pool",
+        choices=("current", "heldout-feedback"),
+        default="current",
+        help="Current production pool or judged-only retrospective replay of each held-out block; not comparable metrics.",
+    )
     parser.add_argument(
         "--split",
         choices=("temporal", "stratified"),
@@ -1302,9 +1539,9 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
         help=(
             "After running the normal variant suite, run it again with "
             "y (labels) shuffled (fixed seed). A trustworthy harness should "
-            "see shuffled NDCG@40 drop to random baseline (~0.10 for "
-            "n_test=80/n_cand=7000). High shuffled values indicate data "
-            "leakage in the offline harness."
+            "compare shuffled scores to the pool's relevance prevalence, "
+            "not a fixed threshold (judged-only replay has many positives). "
+            "Elevated shuffled scores require investigation or more seeds."
         ),
     )
     parser.add_argument(
@@ -1331,7 +1568,13 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
         value = getattr(args, option)
         if value is not None and (not math.isfinite(value) or value <= 0):
             parser.error(f"--{option.replace('_', '-')} must be finite and positive")
-    for option in ("folds", "max_candidates", "max_feedback_per_class", "window_days"):
+    for option in (
+        "folds",
+        "leak_seeds",
+        "max_candidates",
+        "max_feedback_per_class",
+        "window_days",
+    ):
         value = getattr(args, option)
         if value is not None and value <= 0:
             parser.error(f"--{option.replace('_', '-')} must be positive")
@@ -1435,14 +1678,38 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
         parser.error(
             "--max-candidates cannot change a frozen embedding snapshot; cap it at bakeoff creation"
         )
-    candidates, cand_emb = _load_production_candidates(
-        db,
-        eval_config,
-        user.id,
-        embeddings_file=args.embeddings_file,
-        max_candidates=args.max_candidates,
-        required_story_ids={s.id for s in fb_stories},
-    )
+    if args.candidate_pool == "heldout-feedback":
+        if args.embeddings_file or args.max_candidates:
+            parser.error(
+                "heldout-feedback cannot use embedding snapshots or candidate caps"
+            )
+        candidates = list(fb_stories)
+        hashes = dict(
+            zip(
+                [s.id for s in candidates],
+                _embedding_text_hashes(candidates),
+                strict=True,
+            )
+        )
+        cand_emb = _validated_embeddings(
+            candidates,
+            _load_concatenated_replay(args.replay_embeddings, hashes)
+            if args.replay_embeddings
+            else db.get_embeddings_batch(
+                [s.id for s in candidates], config.embedding_model_version, hashes
+            ),
+        )
+    else:
+        if args.replay_embeddings:
+            parser.error("--replay-embeddings needs --candidate-pool heldout-feedback")
+        candidates, cand_emb = _load_production_candidates(
+            db,
+            eval_config,
+            user.id,
+            embeddings_file=args.embeddings_file,
+            max_candidates=args.max_candidates,
+            required_story_ids={s.id for s in fb_stories},
+        )
     cand_id_to_idx = {s.id: i for i, s in enumerate(candidates)}
     fb_to_cand = np.array([cand_id_to_idx.get(s.id, -1) for s in fb_stories])
 
@@ -1471,7 +1738,9 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
         )
         feedback_embeddings = _validated_embeddings(
             fb_stories,
-            db.get_embeddings_batch(
+            _load_concatenated_replay(args.replay_embeddings, hashes)
+            if args.replay_embeddings
+            else db.get_embeddings_batch(
                 [s.id for s in fb_stories], config.embedding_model_version, hashes
             ),
         )
@@ -1493,13 +1762,45 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
         }
 
     print(
-        f"user={user.token} candidates={len(candidates)} "
+        f"user_id={user.id} candidates={len(candidates)} "
         f"valid_feedback={len(y)} labels={Counter(y)}"
     )
     print(f"candidate_recall={candidate_recall}")
 
     variants = {
         "production": lambda fold: _production_scores(fold, production_config, db),
+        "deduplicated": lambda fold: _production_scores(
+            fold,
+            replace(
+                production_config,
+                model=replace(
+                    production_config.model, deduplicate_training_feedback=True
+                ),
+            ),
+            db,
+        ),
+        "deduplicated_publication": lambda fold: _production_scores(
+            fold,
+            replace(
+                production_config,
+                model=replace(
+                    production_config.model,
+                    deduplicate_training_feedback=True,
+                    publication_affinity_enabled=True,
+                ),
+            ),
+            db,
+        ),
+        "publication_affinity": lambda fold: _production_scores(
+            fold,
+            replace(
+                production_config,
+                model=replace(
+                    production_config.model, publication_affinity_enabled=True
+                ),
+            ),
+            db,
+        ),
         "margin3_up": lambda fold: _scores_margin_3class(fold, config),
         "linear_svc_up": lambda fold: _scores_linear_svc_up(fold, config),
         "logreg_up": lambda fold: _scores_logreg_up(fold, config),
@@ -1520,7 +1821,33 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
             fold, config, cluster=True, source=True, tierblend=True
         ),
         "tier2_centroid": lambda fold: (fold.tier2_scores.copy(), None),
+        # 2026-09-25 ranking study (see FINDINGS.md).
+        "logreg_up_minus_down": lambda fold: _scores_logreg(
+            fold, config, target="up_minus_down"
+        ),
+        "logreg_binary_up": lambda fold: _scores_logreg(fold, config, binary=True),
+        "logreg_emb_only": lambda fold: _scores_logreg(
+            fold, config, embedding_only=True
+        ),
+        "logreg_up_recency60d": lambda fold: _scores_logreg(
+            fold, config, half_life_days=60.0
+        ),
+        "production_up_minus_down": lambda fold: _scores_production_up_minus_down(
+            fold, production_config, db
+        ),
+        "knn_up_minus_down": lambda fold: _scores_knn_up_minus_down(fold, config),
+        "ensemble_production_logreg": lambda fold: (
+            _rank_average(
+                _production_scores(fold, production_config, db)[0],
+                _scores_logreg(fold, config)[0],
+            ),
+            None,
+        ),
     }
+    for c in (0.01, 0.03, 0.3, 1.0, 3.0):
+        variants[f"logreg_up_c{c}"] = lambda fold, c=c: _scores_logreg(
+            fold, config, c=c
+        )
     if args.svm_c is not None or args.svm_gamma is not None:
         variants["svm_override"] = lambda fold: _production_scores(fold, config, db)
         requested.append("svm_override")
@@ -1536,6 +1863,53 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
                     fold, tuned, db
                 )
                 requested.append(name)
+    # Hill-climbing names: prod[spec] = production with ModelConfig overrides;
+    # produd[spec] scores it softmax(up) - softmax(down); prodlr[spec] rank-
+    # averages it with logreg_up_minus_down.
+    for name in requested:
+        prefix, bracket, rest = name.partition("[")
+        if not bracket or not rest.endswith("]"):
+            continue
+        spec = rest[:-1].split(";")
+        blend = {
+            key: float(value)
+            for key, _, value in (item.partition("=") for item in spec)
+            if key in ("lr_weight", "knn_weight")
+        }
+        model_spec = ";".join(
+            item
+            for item in spec
+            if item.partition("=")[0] not in ("lr_weight", "knn_weight")
+        )
+        tuned = replace(
+            production_config,
+            model=replace(
+                production_config.model, **_parse_model_overrides(model_spec)
+            ),
+        )
+        if prefix == "prod":
+            variants[name] = lambda fold, tuned=tuned: _production_scores(
+                fold, tuned, db
+            )
+        elif prefix == "produd":
+            variants[name] = lambda fold, tuned=tuned: _scores_production_up_minus_down(
+                fold, tuned, db
+            )
+        elif prefix == "prodlr":
+            variants[name] = lambda fold, tuned=tuned, blend=blend: (
+                _weighted_rank_blend(
+                    {
+                        "production": _production_scores(fold, tuned, db)[0],
+                        "logreg": _scores_logreg(fold, config, target="up_minus_down")[
+                            0
+                        ],
+                        "knn": _scores_knn_up_minus_down(fold, config)[0],
+                    },
+                    lr_weight=blend.get("lr_weight", 0.5),
+                    knn_weight=blend.get("knn_weight", 0.0),
+                ),
+                None,
+            )
     if requested:
         missing = sorted(set(requested) - set(variants))
         if missing:
@@ -1576,10 +1950,16 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
     )
 
     baselines = {
+        "random": lambda fold: (
+            np.random.default_rng(0).random(len(fold.candidates)),
+            None,
+        ),
         "candidate_order": lambda fold: _scores_candidate_order(fold),
         "gravity": lambda fold: _scores_gravity(fold),
         "centroid_up_minus_down": lambda fold: _scores_centroid_up_minus_down(fold),
     }
+
+    fold_audit: list[dict[str, int]] = []
 
     def _run_scorers(
         scorers: dict[str, Any],
@@ -1605,11 +1985,21 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
                 split.test_pos,
                 config,
                 feedback_embeddings=feedback_embeddings,
+                judged_only=args.candidate_pool == "heldout-feedback",
                 needs_experimental=any(
                     name != "production" and not name.startswith("svm_")
                     for name in variants
                 ),
             )
+            if not label:
+                fold_audit.append(
+                    {
+                        "fold": split.fold_no,
+                        "test_rows_before_group_isolation": len(split.test_pos),
+                        "test_rows_after_group_isolation": len(fold.test_stories),
+                        "candidate_rows_after_group_isolation": len(fold.candidates),
+                    }
+                )
             with _fold_database(fold, config, db) as fold_db:
                 fold = replace(fold, runtime_db=fold_db)
                 with _reuse_preprocessing():
@@ -1624,8 +2014,7 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
                                 config,
                                 probs,
                                 source_db=db,
-                                calibration_available=name != "production"
-                                and not name.startswith("svm_"),
+                                calibration_available=name == "logreg_up",
                             )
                         )
             print(f"{label}fold {split.fold_no}/{len(splits)} done")
@@ -1636,17 +2025,16 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
     baseline_results = {name: combined[name] for name in baselines}
 
     report: dict[str, Any] = {
-        "schema_version": 2,
-        "interpretation": "Recovery of known held-out feedback on a current snapshot; unknown relevance is unjudged. Feedback updated_at approximates chronology with rare corrections. No historical content or candidate snapshots; not causal reading-quality estimates. Confirmation is reusable historical evidence.",
+        "schema_version": 4,
+        "interpretation": "Retrospective recovery of held-out feedback using current stored content; not historical exposure or causal reading-quality evaluation. heldout-feedback is judged-only discrimination, with higher positive density: do not compare its metrics to current-pool results. URL groups are isolated from training and deduplicated in test/candidates; semantic duplicates may remain. Feedback updated_at approximates chronology. Confirmation is reusable historical evidence.",
         "relevance": {"up": 1, "neutral": 0, "down": 0},
         "variation": "std is fold variation, not uncertainty of a causal estimate",
         "config": {
             "split": split_label,
             "split_mode": args.split,
             "temporal_initial_train_frac": 0.5 if args.split == "temporal" else None,
-            "candidate_loader": "production_legs",
+            "candidate_loader": args.candidate_pool,
             "window_days": window_days,
-            "user_token": user.token,
             "user_id": user.id,
             "n_candidates": len(candidates),
             "n_feedback_valid": len(y),
@@ -1700,6 +2088,9 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
                 subprocess.check_output(["git", "diff", "HEAD"])
             ).hexdigest(),
             "embedding_label": args.embedding_label,
+            "replay_embeddings": [str(path) for path in args.replay_embeddings]
+            if args.replay_embeddings
+            else None,
             "embeddings_file": args.embeddings_file,
         },
         "variants": {},
@@ -1709,32 +2100,48 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
         del report["config"]["temporal_initial_train_frac"]
     report["variants"] = _aggregate_results(results)
     report["baselines"] = _aggregate_results(baseline_results)
+    report["group_isolation"] = fold_audit
+    report["coverage_warnings"] = {
+        name: {
+            lane: [
+                i + 1
+                for i, row in enumerate(rows)
+                if row[lane]["eligible_positives"] < 10
+                or row[lane]["judged_cards"] < 20
+            ]
+            for lane in rows[0]
+        }
+        for name, rows in results.items()
+    }
+    # Listed folds lack even ten positives/twenty judged cards; absence of a
+    # warning is not a statistical power guarantee. Never treat null as zero.
 
     if args.leak_check:
-        print(f"\n=== Leak check: shuffling y (n={len(y)}, seed=0) ===")
-        y_shuffled = np.random.default_rng(0).permutation(y)
-        _validate_splits(
-            splits,
-            y_shuffled,
-            split_mode=f"{split_label} leak-check",
-            required_train_labels=required_train_labels,
-        )
-        leak_combined = _run_scorers(
-            variants | baselines, y_shuffled, label="[leak-check] "
-        )
-        leak_results = {name: leak_combined[name] for name in variants}
-        leak_baseline_results = {name: leak_combined[name] for name in baselines}
-        report["leak_check"] = {
-            "config": {
-                "y_seed": 0,
-                "n_feedback_valid": len(y_shuffled),
-                "labels": {str(k): int(v) for k, v in Counter(y_shuffled).items()},
-            },
-            "variants": {},
-            "baselines": {},
-        }
-        report["leak_check"]["variants"] = _aggregate_results(leak_results)
-        report["leak_check"]["baselines"] = _aggregate_results(leak_baseline_results)
+        permutations = []
+        for seed in range(args.leak_seeds):
+            print(f"\n=== Leak check: shuffling y (n={len(y)}, seed={seed}) ===")
+            y_shuffled = np.random.default_rng(seed).permutation(y)
+            _validate_splits(
+                splits,
+                y_shuffled,
+                split_mode=f"{split_label} leak-check",
+                required_train_labels=required_train_labels,
+            )
+            leak_combined = _run_scorers(
+                variants | baselines, y_shuffled, label=f"[leak-check seed={seed}] "
+            )
+            permutations.append(
+                {
+                    "seed": seed,
+                    "variants": _aggregate_results(
+                        {name: leak_combined[name] for name in variants}
+                    ),
+                    "baselines": _aggregate_results(
+                        {name: leak_combined[name] for name in baselines}
+                    ),
+                }
+            )
+        report["leak_check"] = {"permutations": permutations}
 
     report["paired_differences_against_production"] = _paired_differences(combined)
     Path(args.output).write_text(json.dumps(report, indent=2, allow_nan=False))

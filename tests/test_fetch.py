@@ -1,11 +1,15 @@
+from collections.abc import Callable
 from typing import Any
 import pytest
 import asyncio
 import httpx
+import http_fetch
 from server import (
     _fetch_article_body,
     _fetch_article_body_with_result,
 )
+
+_real_is_public_ip = http_fetch._is_public_ip
 
 
 @pytest.fixture(autouse=True)
@@ -14,6 +18,23 @@ def mock_asyncio_sleep(monkeypatch):
         pass
 
     monkeypatch.setattr(asyncio, "sleep", mock_sleep)
+
+
+@pytest.fixture(autouse=True)
+def allow_loopback_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The local test servers below live on 127.0.0.1, which the SSRF guard
+    rejects; tests of the guard itself restore ``_real_is_public_ip``."""
+    monkeypatch.setattr(http_fetch, "_is_public_ip", lambda ip: True)
+
+
+def _patch_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    handler: Callable[[httpx.Request], httpx.Response],
+) -> None:
+    """Swap guarded_get's transport for a mock (no sockets, so no guard)."""
+    monkeypatch.setattr(
+        http_fetch, "_public_only_transport", lambda: httpx.MockTransport(handler)
+    )
 
 
 _ARTICLE_HTML = """\
@@ -226,28 +247,18 @@ async def test_fetch_real_urls():
 
 
 @pytest.mark.asyncio
-async def test_fetch_rejects_non_html_content_type(monkeypatch):
+async def test_fetch_rejects_non_html_content_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Content-Type guard: non-HTML types return non_html/permanent."""
-    import server
-
-    class MockClient:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            pass
-
-        async def get(self, url, headers=None):
-            return httpx.Response(
-                200,
-                headers={"content-type": "application/pdf"},
-                text="%PDF-1.4\n\x00\x00\x00",
-            )
-
-    monkeypatch.setattr(server.httpx, "AsyncClient", MockClient)
+    _patch_transport(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            headers={"content-type": "application/pdf"},
+            text="%PDF-1.4\n\x00\x00\x00",
+        ),
+    )
 
     result = await _fetch_article_body_with_result("https://example.com/doc.pdf")
     assert result.body is None
@@ -256,28 +267,14 @@ async def test_fetch_rejects_non_html_content_type(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_fetch_allows_text_plain(monkeypatch):
+async def test_fetch_allows_text_plain(monkeypatch: pytest.MonkeyPatch) -> None:
     """Content-Type guard: text/plain is allowed."""
-    import server
-
-    class MockClient:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            pass
-
-        async def get(self, url, headers=None):
-            return httpx.Response(
-                200,
-                headers={"content-type": "text/plain"},
-                text=_ARTICLE_HTML,
-            )
-
-    monkeypatch.setattr(server.httpx, "AsyncClient", MockClient)
+    _patch_transport(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200, headers={"content-type": "text/plain"}, text=_ARTICLE_HTML
+        ),
+    )
 
     result = await _fetch_article_body_with_result("https://example.com/plain")
     assert result.body is not None
@@ -285,28 +282,16 @@ async def test_fetch_allows_text_plain(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_fetch_rejects_uppercase_content_type(monkeypatch):
+async def test_fetch_rejects_uppercase_content_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Content-Type guard: mixed-case is handled via .lower()."""
-    import server
-
-    class MockClient:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            pass
-
-        async def get(self, url, headers=None):
-            return httpx.Response(
-                200,
-                headers={"content-type": "Application/PDF"},
-                text="%PDF",
-            )
-
-    monkeypatch.setattr(server.httpx, "AsyncClient", MockClient)
+    _patch_transport(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200, headers={"content-type": "Application/PDF"}, text="%PDF"
+        ),
+    )
 
     result = await _fetch_article_body_with_result("https://example.com/Doc.PDF")
     assert result.error == "non_html"
@@ -314,25 +299,34 @@ async def test_fetch_rejects_uppercase_content_type(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_fetch_allows_missing_content_type(monkeypatch):
+async def test_fetch_allows_missing_content_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Content-Type guard: missing header falls through to extraction."""
-    import server
-
-    class MockClient:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            pass
-
-        async def get(self, url, headers=None):
-            return httpx.Response(200, headers={}, text=_ARTICLE_HTML)
-
-    monkeypatch.setattr(server.httpx, "AsyncClient", MockClient)
+    _patch_transport(
+        monkeypatch, lambda request: httpx.Response(200, text=_ARTICLE_HTML)
+    )
 
     result = await _fetch_article_body_with_result("https://example.com/noct")
     assert result.body is not None
     assert result.error is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_blocks_loopback_without_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real guard, end to end: a story URL pointing at this machine is a
+    permanent unsafe_url failure and the local server never sees a request.
+    Redirect, rebinding and urllib cases: tests/test_http_fetch.py."""
+    monkeypatch.setattr(http_fetch, "_is_public_ip", _real_is_public_ip)
+
+    def status(handler: Any) -> tuple[int, bytes]:
+        raise AssertionError("loopback URL must not be requested")
+
+    result, calls = await _serve("api/user", status)
+    assert result is None
+    assert calls == 0
+    detailed = await _fetch_article_body_with_result("http://127.0.0.1:8766/api/user")
+    assert detailed.error == "unsafe_url"
+    assert detailed.permanent is True

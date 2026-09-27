@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+
 import logging
 import sys
 from pathlib import Path
@@ -12,6 +14,7 @@ from scripts._seed_common import STORY_COLS, rows_to_stories
 
 
 def main() -> None:
+    argparse.ArgumentParser(description=__doc__).parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     config = Config.load("config.toml")

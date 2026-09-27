@@ -11,7 +11,7 @@ import httpx
 import numpy as np
 from numpy.typing import NDArray
 
-from database import Database, Story, StoryIdentityConflict, coerce_int
+from database import Database, FeedbackRecord, Story, StoryIdentityConflict, coerce_int
 
 # ruff: noqa: F401 — re-exports for the public pipeline namespace.
 from .config import (
@@ -32,9 +32,11 @@ from .config import (
 from .ranking import (
     COMMENT_DEPTH_PENALTY,
     DASHBOARD_QUEUE_SIZE,
-    DISCOVERY_PER_BADGE,
+    EXPLORE_PER_BADGE,
+    EXPLORE_PER_BADGE_NONHN,
     Embedder,
     HOT_MIN_SCORE,
+    POPULAR_PER_COMBO,
     PRIMARY_PER_COMBO,
     RankScoreContext,
     RankTrace,
@@ -94,7 +96,6 @@ from .enrichment import (
     _merge_source_context,
     _reddit_subreddit_from_feed_url,
     _rss_source_name,
-    _urllib_fetch,
     build_reddit_prewarm_factories,
     build_reddit_topfeed_factories,
     fetch_and_cache_article_bodies,
@@ -104,8 +105,15 @@ from .enrichment import (
     prewarm_reddit_top_stories,
     prewarm_top_stories,
     select_article_fetch_candidates,
+    select_rss_article_prewarm,
 )
-from .hn_dupes import _load_feedback_context, _matches_feedback, canonicalize_hn_dupes
+from .hn_dupes import (
+    FeedbackDupeContext,
+    _load_feedback_context,
+    _matches_feedback,
+    build_feedback_context,
+    canonicalize_hn_dupes,
+)
 from .candidate_cache import (
     CandidatePool,
     get_candidate_pool,
@@ -639,8 +647,9 @@ async def fetch_candidates(
 
     One CH call does the work the old code did with ~125 Algolia calls:
 
-    `ch_client.query_live_window(days=30, min_score=5, limit=5000)` returns
-    every live HN story from the past 30 days with all fields populated
+    `ch_client.query_live_window(days=config.days, min_score=5, limit=5000)`
+    returns every live HN story from the past `config.days` (default 30) days
+    with all fields populated
     (title, url, score, descendants, time, text). No per-story items
     call needed.
 
@@ -658,7 +667,7 @@ async def fetch_candidates(
     # 1. Live window from CH (replaces ~125 Algolia search + items calls)
     try:
         live_window = query_live_window(
-            days=30,
+            days=config.days,
             min_score=5,
             limit=LIVE_WINDOW_LIMIT,
         )
@@ -761,7 +770,11 @@ def fast_rerank_for_user(
     """Fast rerank for a specific user. Called on each dashboard request."""
     trace.set_count("user_id", user_id)
 
-    n_feedback = sum(db.count_feedback_by_action(user_id).values())
+    # One feedback snapshot serves every stage of this rank: the cold-deck
+    # decision, the voted-story mask, dupe matching, dedup and HN
+    # canonicalization (each used to query the feedback table separately).
+    feedback = db.get_all_feedback(user_id=user_id)
+    n_feedback = len(feedback)
     trace.set_count("feedback_total", n_feedback)
     if n_feedback == 0:
         trace.set_label("model_cache", "skipped_cold_deck")
@@ -785,7 +798,7 @@ def fast_rerank_for_user(
 
     with trace.stage("candidate_sql"):
         pool = get_candidate_pool(db, config, embedder, trace=trace)
-        voted_ids = frozenset(_voted_story_ids(db, user_id))
+        voted_ids = frozenset(f.story_id for f in feedback)
     if not pool.stories:
         return []
 
@@ -801,8 +814,8 @@ def fast_rerank_for_user(
     # candidates that duplicate a story the user already voted on, instead
     # of silently losing badge slots to the downstream `canonicalize_hn_dupes`
     # feedback-match drop (see WORKLOG 2026-07-10).
-    feedback_context = _load_feedback_context(
-        db, user_id=user_id, actions=tuple(config.model.dedup_exclude_actions)
+    feedback_context = build_feedback_context(
+        feedback, tuple(config.model.dedup_exclude_actions)
     )
     ranked = rerank_candidates(
         db=db,
@@ -820,7 +833,16 @@ def fast_rerank_for_user(
     )
 
     return finalize_ranked_deck(
-        ranked, candidates, cand_embeddings, db, config, embedder, user_id, trace=trace
+        ranked,
+        candidates,
+        cand_embeddings,
+        db,
+        config,
+        embedder,
+        user_id,
+        trace=trace,
+        feedback=feedback,
+        feedback_context=feedback_context,
     )
 
 
@@ -834,8 +856,15 @@ def finalize_ranked_deck(
     user_id: int,
     *,
     trace: RankTrace | _NullTrace = NULL_TRACE,
+    feedback: list[FeedbackRecord] | None = None,
+    feedback_context: FeedbackDupeContext | None = None,
 ) -> list[RankedStory]:
-    """Shared serving/evaluation deduplication and canonicalization boundary."""
+    """Shared serving/evaluation deduplication and canonicalization boundary.
+
+    *feedback* / *feedback_context* are this user's feedback (and its
+    dedup index for ``config.model.dedup_exclude_actions``) when the caller
+    already loaded them; otherwise each stage loads its own.
+    """
     with trace.stage("dedup"):
         id_to_emb: dict[int, NDArray[np.float32]] = {
             s.id: vec for s, vec in zip(candidates, cand_embeddings)
@@ -847,6 +876,7 @@ def finalize_ranked_deck(
             user_id,
             embeddings=id_to_emb,
             embedder=embedder,
+            feedback=feedback,
         )
     trace.set_count(
         "deck_nonhn_post_dedup",
@@ -861,6 +891,7 @@ def finalize_ranked_deck(
             user_id=user_id,
             feedback_actions=tuple(config.model.dedup_exclude_actions),
             trace=trace,
+            feedback_context=feedback_context,
         )
     trace.set_count(
         "deck_nonhn_final",
@@ -876,6 +907,7 @@ def _apply_dedup_to_ranked(
     user_id: int,
     embeddings: dict[int, NDArray[np.float32]] | None = None,
     embedder: Embedder | None = None,
+    feedback: list[FeedbackRecord] | None = None,
 ) -> list[RankedStory]:
     """Filter *ranked* through :func:`dedup.dedup_ranked`.
 
@@ -892,7 +924,8 @@ def _apply_dedup_to_ranked(
         embedding_cosine_threshold=model_cfg.dedup_embedding_cosine_threshold,
         exclude_actions=tuple(model_cfg.dedup_exclude_actions),
     )
-    feedback = db.get_all_feedback(user_id=user_id)
+    if feedback is None:
+        feedback = db.get_all_feedback(user_id=user_id)
 
     # Merge feedback story embeddings so cross-source duplicates (e.g.
     # Slashdot rewriting an HN story the user has already voted on) can
@@ -990,17 +1023,34 @@ async def fetch_candidates_only(
 
     # LessWrong prewarm
     if config.prewarm_lesswrong_full:
-        needs_prewarm_lw = [
-            s.id
-            for s in candidates
-            if s.source == "rss_lesswrong_com" and not s.top_comments
-        ]
+        needs_prewarm_lw = [s.id for s in candidates if s.source == "rss_lesswrong_com"]
         if needs_prewarm_lw:
             prewarmed = await prewarm_lesswrong_stories(needs_prewarm_lw, db, embedder)
             logging.info(
                 "Regen: prewarmed %d/%d LessWrong candidates (full mode)",
                 prewarmed,
                 len(needs_prewarm_lw),
+            )
+
+    # RSS article text, independent of rank
+    if embedder is not None:
+        rss_targets = select_rss_article_prewarm(
+            candidates,
+            db,
+            max_per_run=config.rss_article_prewarm_max_per_run,
+            max_age_days=config.article_fetch_max_age_days,
+        )
+        if rss_targets:
+            fetched = await fetch_and_cache_article_bodies(
+                db=db,
+                embedder=embedder,
+                stories=rss_targets,
+                concurrency=config.article_fetch_concurrency,
+            )
+            logging.info(
+                "Regen: fetched article text for %d/%d RSS candidates",
+                len(fetched),
+                len(rss_targets),
             )
 
 

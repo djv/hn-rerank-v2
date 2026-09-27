@@ -1,6 +1,8 @@
+import json
 from typing import Any, Literal, cast
 import asyncio
 import hashlib
+import os
 import numpy as np
 import pytest
 import re
@@ -10,7 +12,9 @@ from email.utils import formatdate
 from numpy.typing import NDArray
 from pathlib import Path
 from types import SimpleNamespace
-from hypothesis import given, strategies as st, settings, HealthCheck
+from hypothesis import HealthCheck, given, settings, strategies as st
+from collections.abc import Iterator
+
 from database import Database, HnDupeResolution, Story
 from dataclasses import replace
 import pipeline
@@ -60,6 +64,115 @@ def db():
     db_instance.close()
 
 
+def _feed_ranked(
+    story_id: int,
+    score: float,
+    *,
+    time: int | None = None,
+    combo_keys: str = "recent_hn recent_mixed",
+    **flags: bool,
+) -> RankedStory:
+    story = Story(
+        id=story_id,
+        title=f"Story {story_id}",
+        url=None,
+        score=10,
+        time=1600000000 + story_id if time is None else time,
+        text_content="",
+        source="hn",
+    )
+    return RankedStory(
+        story=story,
+        score=score,
+        best_match_title="",
+        combo_keys=combo_keys,
+        **flags,
+    )
+
+
+def test_feed_caps_recommended_and_drops_unused_cards() -> None:
+    """Recommended carries at most RECOMMENDED_LIMIT per age (top by score);
+    cards in no view never reach the client, badge cards stay, and Date
+    lists every sent card newest first."""
+    from pipeline import render
+
+    limit = render.RECOMMENDED_LIMIT
+    items = [_feed_ranked(i, 100.0 - i) for i in range(limit + 5)]
+    items.append(_feed_ranked(999, -1.0, is_high_engagement=True))
+    cards = render._build_dashboard_cards(items, hot_badge_percentile=99)
+    feed = render.prepare_feed(cards, {}, 1, 1)
+
+    top_ids = set(range(limit))
+    assert set(feed.orders["recommended:recent"]) == top_ids
+    assert feed.orders["popular:recent"] == [999]
+    assert {s.id for s in feed.stories} == top_ids | {999}
+    assert feed.orders["date:recent"] == sorted(top_ids | {999}, reverse=True)
+    assert feed.orders["date:archive"] == feed.orders["date:recent"]
+
+
+def test_date_view_puts_a_fresh_low_score_popular_story_first() -> None:
+    """Regression: an hour-old Popular story with a low model score was
+    missing from Date (then the top model scores of the week). Date is now
+    the deck newest first, so it leads."""
+    from pipeline import render
+
+    now = 1_700_000_000
+    items = [_feed_ranked(i, 100.0 - i, time=now - 86400 - i * 3600) for i in range(30)]
+    items.append(_feed_ranked(500, -5.0, time=now - 3600, is_hot=True))
+    cards = render._build_dashboard_cards(items, hot_badge_percentile=99)
+    feed = render.prepare_feed(cards, {}, 1, 1)
+    assert feed.orders["date:recent"][0] == 500
+
+
+@settings(max_examples=60, deadline=None)
+@given(
+    stories=st.lists(
+        st.tuples(
+            st.integers(0, 60 * 86400),  # age in seconds
+            st.floats(-5, 5, allow_nan=False),  # model score
+            st.sampled_from(["recent", "archive"]),
+            st.booleans(),  # popular
+            st.booleans(),  # explore
+        ),
+        max_size=60,
+    )
+)
+def test_date_view_is_every_other_view_newest_first(
+    stories: list[tuple[int, float, str, bool, bool]],
+) -> None:
+    """Date = the union of Recommended, Popular and Explore over both ages,
+    newest first, identical under either Age tab."""
+    from pipeline import render
+
+    now = 1_700_000_000
+    items = [
+        _feed_ranked(
+            i + 1,
+            score,
+            time=now - age,
+            combo_keys=f"{cohort}_hn {cohort}_mixed",
+            is_hot=popular,
+            is_novel=explore,
+        )
+        for i, (age, score, cohort, popular, explore) in enumerate(stories)
+    ]
+    cards = render._build_dashboard_cards(items, hot_badge_percentile=99)
+    feed = render.prepare_feed(cards, {}, 1, 1)
+    times = {s.id: s.time for s in feed.stories}
+    in_views = {
+        sid
+        for key, order in feed.orders.items()
+        if not key.startswith("date:")
+        for sid in order
+    }
+    dated = feed.orders["date:recent"]
+    assert set(dated) == in_views == set(times)
+    assert [times[sid] for sid in dated] == sorted(
+        (times[sid] for sid in dated), reverse=True
+    )
+    assert feed.orders["date:archive"] == dated
+
+
 def test_dashboard_polish_renders_domain_legend_and_queue_status(
     db: Database,
 ) -> None:
@@ -98,11 +211,22 @@ def test_dashboard_polish_renders_domain_legend_and_queue_status(
         Config(),
         db,
     ).decode("utf-8")
-    assert '<span class="domain-chip">example.com</span>' in html
+    assert _embedded_feed(html)["stories"][0]["domain"] == "example.com"
     assert "🔥 Hot" in html
     assert 'id="queueStatus"' in html
     assert "top-ranked → bottom" in html
     assert 'data-key-action="undo"' in html
+
+
+def _embedded_feed(html: str) -> dict[str, Any]:
+    """The deck a rendered page carries for the client (/api/feed JSON)."""
+    from bs4 import BeautifulSoup
+
+    script = BeautifulSoup(html, "html.parser").select_one("script#feed-data")
+    assert script is not None
+    data = json.loads(script.get_text())
+    assert isinstance(data, dict)
+    return data
 
 
 def _recent_pubdate(days_ago: float = 1.0) -> str:
@@ -161,13 +285,6 @@ def test_config_rejects_invalid_embedding_batch_size():
         Config(embedding_batch_size=0)
 
 
-def test_config_rejects_nonpositive_feedback_regen_idle_seconds() -> None:
-    with pytest.raises(
-        ValueError, match="feedback_regen_idle_seconds must be positive"
-    ):
-        Config(feedback_regen_idle_seconds=0)
-
-
 def test_config_rejects_invalid_embedding_ort_variant():
     with pytest.raises(ValueError, match="embedding_ort_variant must be one of"):
         Config(embedding_ort_variant=cast(Any, "approximate_gelu"))
@@ -179,7 +296,6 @@ def test_config_load_checked_in_config_contains_only_runtime_overrides():
     config = Config.load(str(config_path))
 
     assert config.server_port == 8766
-    assert config.feedback_regen_idle_seconds == 300.0
     assert config.article_fetch_max_per_run == 50
     assert config.model.svm_c == 0.1
     assert config.model.svm_gamma == 0.03
@@ -419,6 +535,14 @@ class _HashEmbedder(Embedder):
 def _real_embedder() -> Embedder:
     # Uses the real downloaded ONNX model (shared across worktrees).
     # Only for tests asserting real-model semantics or output shape.
+    # Skipped where the model is absent (a fresh laptop checkout), but never
+    # in CI, which downloads it: a missing model there must fail loudly.
+    model_dir = Path(ranking.DEFAULT_ONNX_MODEL_DIR)
+    if not (model_dir / "model.onnx").is_file() and not os.environ.get("CI"):
+        pytest.skip(
+            f"no ONNX model in {model_dir}; run `uv run python setup_model.py`"
+            " or set HN_ONNX_MODEL_DIR"
+        )
     return Embedder()
 
 
@@ -1089,124 +1213,41 @@ async def test_fetch_and_parse_feed_unexpected_error_logs_exception_with_traceba
     assert error_records[0].exc_info is not None
 
 
-def test_is_summarizable_with_content():
-    """Stories with self_text, top_comments, or article_body are summarizable."""
-    from pipeline import Story
-
-    s = Story(
+@given(
+    source=st.sampled_from(
+        ["hn", "bq_seed", "ch_seed", "rss_lesswrong_com", "rss_reddit_com", "rss_x"]
+    ),
+    texts=st.tuples(*[st.sampled_from(["", " ", "text"])] * 3),
+    comment_count=st.none() | st.integers(-1, 3),
+    count_at_fetch=st.integers(-1, 3),
+)
+def test_is_summarizable_matches_spec(
+    source: str,
+    texts: tuple[str, str, str],
+    comment_count: int | None,
+    count_at_fetch: int,
+) -> None:
+    """Summarizable iff some text is present, or it is an HN-family or
+    LessWrong story whose comments can be fetched (either count > 0)."""
+    self_text, top_comments, article_body = texts
+    story = pipeline.Story(
         id=1,
         title="X",
         url=None,
         score=5,
         time=100,
-        text_content="x",
-        source="rss",
-        self_text="Some text",
+        text_content="",
+        source=source,
+        comment_count=comment_count,
+        comment_count_at_fetch=count_at_fetch,
+        self_text=self_text,
+        top_comments=top_comments,
+        article_body=article_body,
     )
-    assert pipeline.is_summarizable(s)
-
-    s = Story(
-        id=2,
-        title="X",
-        url=None,
-        score=5,
-        time=100,
-        text_content="x",
-        source="rss",
-        top_comments="Some comments",
+    fetchable = source in {"hn", "bq_seed", "ch_seed", "rss_lesswrong_com"} and (
+        (comment_count or 0) > 0 or (count_at_fetch or 0) > 0
     )
-    assert pipeline.is_summarizable(s)
-
-    s = Story(
-        id=3,
-        title="X",
-        url=None,
-        score=5,
-        time=100,
-        text_content="x",
-        source="rss",
-        article_body="Some body",
-    )
-    assert pipeline.is_summarizable(s)
-
-
-def test_is_summarizable_hn_with_comments():
-    """HN stories with comment_count > 0 but no inline text are summarizable
-    (comments can be fetched on-demand or prewarmed at regen)."""
-    from pipeline import Story
-
-    s = Story(
-        id=1,
-        title="X",
-        url=None,
-        score=5,
-        time=100,
-        text_content="x",
-        source="hn",
-        comment_count=10,
-        comment_count_at_fetch=10,
-    )
-    assert pipeline.is_summarizable(s)
-
-
-def test_is_summarizable_hn_zero_comments_no_content():
-    """HN stories with 0 comments and no text content are NOT summarizable."""
-    from pipeline import Story
-
-    s = Story(
-        id=1, title="X", url=None, score=5, time=100, text_content="x", source="hn"
-    )
-    assert not pipeline.is_summarizable(s)
-
-
-def test_is_summarizable_non_hn_no_content():
-    """Non-HN stories with no text content are NOT summarizable."""
-    from pipeline import Story
-
-    s = Story(
-        id=1,
-        title="X",
-        url=None,
-        score=5,
-        time=100,
-        text_content="x",
-        source="rss_reddit_test",
-    )
-    assert not pipeline.is_summarizable(s)
-
-
-def test_is_summarizable_lesswrong_with_comments():
-    """LessWrong stories with comment_count > 0 are summarizable (prewarmed)."""
-    from pipeline import Story
-
-    s = Story(
-        id=1,
-        title="X",
-        url=None,
-        score=5,
-        time=100,
-        text_content="x",
-        source="rss_lesswrong_com",
-        comment_count=3,
-        comment_count_at_fetch=3,
-    )
-    assert pipeline.is_summarizable(s)
-
-
-def test_is_summarizable_lesswrong_zero_comments():
-    """LessWrong stories with 0 comments and no text are NOT summarizable."""
-    from pipeline import Story
-
-    s = Story(
-        id=1,
-        title="X",
-        url=None,
-        score=5,
-        time=100,
-        text_content="x",
-        source="rss_lesswrong_com",
-    )
-    assert not pipeline.is_summarizable(s)
+    assert pipeline.is_summarizable(story) == (any(texts) or fetchable)
 
 
 @pytest.mark.asyncio
@@ -1788,7 +1829,7 @@ def _clean_text_payload_and_noise(draw: st.DrawFn) -> tuple[str, str]:
     pair=_clean_text_payload_and_noise(),
     min_len=st.integers(min_value=0, max_value=10),
 )
-@settings(max_examples=30)
+@settings(max_examples=30, deadline=None)  # HTML parsing; >200ms under -n 4 load
 def test_clean_text_properties(pair: tuple[str, str], min_len: int) -> None:
     payload, noise = pair
     text = payload + noise
@@ -1937,6 +1978,28 @@ async def test_fetch_candidates_returns_tuple(tmp_path, monkeypatch):
     assert isinstance(candidates, list)
     assert isinstance(count, int)
     assert count == len(candidates)
+
+
+@pytest.mark.asyncio
+async def test_fetch_candidates_live_window_honors_config_days(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The HN live window spans `Config.days`, like the RSS leg, rather
+    than a hard-coded 30."""
+    from database import Database
+    from pipeline import Config, fetch_candidates
+
+    db_file = tmp_path / "test.db"
+    db = Database(str(db_file))
+    seen: list[int] = []
+
+    def fake_live_window(**kw: int) -> list[object]:
+        seen.append(kw["days"])
+        return []
+
+    monkeypatch.setattr("ch_client.query_live_window", fake_live_window)
+    await fetch_candidates(Config(db_path=str(db_file), days=7), set(), set(), db)
+    assert seen == [7]
 
 
 @pytest.mark.asyncio
@@ -2406,6 +2469,32 @@ def test_canonicalize_hn_dupes_replaces_selected_story_preserving_metadata(
     assert result[0].best_match_title == "match"
     assert result[0].is_hot
     assert result[0].combo_keys == "recent_hn recent_mixed"
+
+
+def test_canonicalize_hn_dupes_uses_candidate_pool_copy_without_text(
+    db: Database,
+) -> None:
+    """A candidate target is summarizable by admission even though the pool's
+    copy carries no TLDR text (here: no comments, article body only)."""
+    duplicate = _candidate_story(100, source="hn", score=10, time_ts=1000)
+    canonical = _candidate_story(
+        200, source="hn", score=50, time_ts=900, comment_count=0
+    )
+    db.upsert_story(duplicate)
+    db.upsert_story(canonical)
+    now = time.time()
+    db.upsert_hn_dupe_resolution(
+        HnDupeResolution(100, 200, "canonical", now, now + 86400, 0, "")
+    )
+    pool_copy = replace(canonical, article_body="")
+
+    result = pipeline.canonicalize_hn_dupes(
+        [RankedStory(story=duplicate, score=1.0, best_match_title="")],
+        db,
+        candidate_stories=[duplicate, pool_copy],
+    )
+
+    assert [item.story for item in result] == [pool_copy]
 
 
 def test_canonicalize_hn_dupes_drops_when_target_already_in_output(
@@ -3470,7 +3559,7 @@ def test_novel_archive_pass_surfaces_archive_novel(
     The archive fillers outnumber PRIMARY_ARCHIVE_HN so Primary is fully
     saturated by fillers (higher score), leaving the low-score novel
     targets in the Explore pool; the novel pass then sorts by distance
-    (= 1 - sim) desc and takes the top DISCOVERY_PER_BADGE.
+    (= 1 - sim) desc and takes the top EXPLORE_PER_BADGE.
     """
     config = Config(count=40)
     user = db.create_user("test_novel_archive")
@@ -3489,11 +3578,11 @@ def test_novel_archive_pass_surfaces_archive_novel(
     db.upsert_feedback(user.id, 100, "up")
 
     now = int(time.time())
-    from pipeline import DISCOVERY_PER_BADGE
+    from pipeline import EXPLORE_PER_BADGE
     from pipeline.ranking import PRIMARY_ARCHIVE_HN
 
     n_archive_filler = PRIMARY_ARCHIVE_HN + 4
-    novel_sims = [round(0.05 + 0.05 * i, 2) for i in range(DISCOVERY_PER_BADGE + 1)]
+    novel_sims = [round(0.05 + 0.05 * i, 2) for i in range(EXPLORE_PER_BADGE + 1)]
 
     # Setup:
     #   12 recent primary (high score, sim 0.5) fill the primary ranked set.
@@ -3501,12 +3590,12 @@ def test_novel_archive_pass_surfaces_archive_novel(
     #     sim 0.5 too, so they don't qualify as novel, and there are more of
     #     them than PRIMARY_ARCHIVE_HN so Primary is saturated by fillers
     #     alone, none of the novel targets below leak into Primary.
-    #   DISCOVERY_PER_BADGE+1 archive novel targets (low score, sim 0.05..)
+    #   EXPLORE_PER_BADGE+1 archive novel targets (low score, sim 0.05..)
     #     — one more than the cap, so the worst can be asserted excluded.
     # Fillers outscore novel targets (200+ vs 5), so Primary picks the top
     # PRIMARY_ARCHIVE_HN fillers, leaving all novel targets (plus the filler
     # overflow) in the Explore pool; the novel pass there sorts by distance
-    # (= 1 - sim) desc and takes the top DISCOVERY_PER_BADGE.
+    # (= 1 - sim) desc and takes the top EXPLORE_PER_BADGE.
     candidates = []
     for i in range(12):
         candidates.append(
@@ -3567,17 +3656,17 @@ def test_novel_archive_pass_surfaces_archive_novel(
 
     by_id = {r.story.id: r for r in ranked}
     novel_ids_all = [novel_id_base + i for i in range(len(novel_sims))]
-    # With per-combo DISCOVERY_PER_BADGE, only the top-N by distance get
+    # With per-combo EXPLORE_PER_BADGE, only the top-N by distance get
     # is_novel; the one extra target (worst sim) may appear via other
     # passes (Popular, Similar, etc.) but should not have is_novel.
     novel_ids = [aid for aid in novel_ids_all if aid in by_id and by_id[aid].is_novel]
-    assert len(novel_ids) >= DISCOVERY_PER_BADGE, (
-        f"Expected at least {DISCOVERY_PER_BADGE} novel picks, got {novel_ids}"
+    assert len(novel_ids) >= EXPLORE_PER_BADGE, (
+        f"Expected at least {EXPLORE_PER_BADGE} novel picks, got {novel_ids}"
     )
     # The top by distance must be among the novel picks.
     for aid, sim_label in zip(
-        novel_ids_all[:DISCOVERY_PER_BADGE],
-        (f"{sim:.2f}" for sim in novel_sims[:DISCOVERY_PER_BADGE]),
+        novel_ids_all[:EXPLORE_PER_BADGE],
+        (f"{sim:.2f}" for sim in novel_sims[:EXPLORE_PER_BADGE]),
     ):
         assert aid in by_id, f"Archive novel id={aid} should be in final"
         assert by_id[aid].is_novel, (
@@ -3588,11 +3677,9 @@ def test_novel_archive_pass_surfaces_archive_novel(
         )
 
 
-def test_each_badge_floored_at_five_per_cohort(
-    db: Database, embedder: Embedder
-) -> None:
-    """Every non-Hot badge must appear >=DISCOVERY_PER_BADGE times in recent
-    AND >=DISCOVERY_PER_BADGE times in archive of the final deck (the
+def test_each_badge_floored_per_cohort(db: Database, embedder: Embedder) -> None:
+    """Every non-Hot badge must appear >=EXPLORE_PER_BADGE times in recent
+    AND >=EXPLORE_PER_BADGE times in archive of the final deck (the
     user's explicit "at least (N,N) for each" expectation).
 
     The rank-based cascade guarantees this via per-cohort top-N discovery
@@ -3601,15 +3688,15 @@ def test_each_badge_floored_at_five_per_cohort(
       explore (also mutually exclusive with each other, but independent
                of the cascade so a card can carry both): novel, similar,
                uncertain
-    Each pass takes the top DISCOVERY_PER_BADGE stories in its age cohort
+    Each pass takes the top EXPLORE_PER_BADGE stories in its age cohort
     by the badge metric.
 
     Pool sizing: because Explore's three passes are serial (each excludes
     the previous pass's picks), the explore-eligible remainder of a
     cohort — pool size minus that combo's primary quota — must hold at
-    least ``3 * DISCOVERY_PER_BADGE`` candidates for every badge to reach
+    least ``3 * EXPLORE_PER_BADGE`` candidates for every badge to reach
     the floor. Sized dynamically below from ``PRIMARY_PER_COMBO`` /
-    ``PRIMARY_ARCHIVE_HN`` and ``DISCOVERY_PER_BADGE`` with a +5 margin,
+    ``PRIMARY_ARCHIVE_HN`` and ``EXPLORE_PER_BADGE`` with a +5 margin,
     so the floor holds regardless of the constant's current value.
 
     Feedback: 20 distinct upvotes, 20 distinct downvotes, 20 distinct
@@ -3669,16 +3756,16 @@ def test_each_badge_floored_at_five_per_cohort(
         )
         db.upsert_feedback(user.id, 880 + i, "neutral")
 
-    from pipeline import DISCOVERY_PER_BADGE
+    from pipeline import EXPLORE_PER_BADGE
     from pipeline.ranking import PRIMARY_ARCHIVE_HN, PRIMARY_PER_COMBO
 
     # Explore's Unsure/Novel/Similar passes are serial (mutually exclusive,
     # see ranking.py), so each cohort's explore-eligible pool (pool size
     # minus that combo's primary quota) must hold at least
-    # 3 * DISCOVERY_PER_BADGE candidates for every badge to reach the floor;
+    # 3 * EXPLORE_PER_BADGE candidates for every badge to reach the floor;
     # +5 margin keeps this from being a knife's-edge fit.
-    n_recent = PRIMARY_PER_COMBO + 3 * DISCOVERY_PER_BADGE + 5
-    n_archive = PRIMARY_ARCHIVE_HN + 3 * DISCOVERY_PER_BADGE + 5
+    n_recent = PRIMARY_PER_COMBO + 3 * EXPLORE_PER_BADGE + 5
+    n_archive = PRIMARY_ARCHIVE_HN + 3 * EXPLORE_PER_BADGE + 5
 
     now = int(time.time())
     candidates: list[Story] = []
@@ -3736,11 +3823,11 @@ def test_each_badge_floored_at_five_per_cohort(
     ):
         n_recent = sum(1 for r in recent if getattr(r, attr))
         n_archive = sum(1 for r in archive if getattr(r, attr))
-        assert n_recent >= DISCOVERY_PER_BADGE, (
-            f"{attr} must appear >= {DISCOVERY_PER_BADGE} in recent (got {n_recent})"
+        assert n_recent >= EXPLORE_PER_BADGE, (
+            f"{attr} must appear >= {EXPLORE_PER_BADGE} in recent (got {n_recent})"
         )
-        assert n_archive >= DISCOVERY_PER_BADGE, (
-            f"{attr} must appear >= {DISCOVERY_PER_BADGE} in archive (got {n_archive})"
+        assert n_archive >= EXPLORE_PER_BADGE, (
+            f"{attr} must appear >= {EXPLORE_PER_BADGE} in archive (got {n_archive})"
         )
 
 
@@ -3756,7 +3843,7 @@ def _make_combo_deck_inputs() -> tuple[
 
     12 recent HN primary candidates (ids 0-11, high score) fill
     ``PRIMARY_PER_COMBO`` (12) and land in Primary. Three disjoint,
-    low-score Explore-only groups of ``DISCOVERY_PER_BADGE + 2`` ids each
+    low-score Explore-only groups of ``EXPLORE_PER_BADGE + 2`` ids each
     follow — one extra beyond the cap so a feedback-match test can exclude
     the top pick and still have more than enough left to fill the badge,
     leaving the single worst candidate excluded:
@@ -3772,9 +3859,9 @@ def _make_combo_deck_inputs() -> tuple[
         decreasing (the highest-sim id is most similar). All other ids
         default to closest_up=0.0, below every value in the similar pool.
     """
-    from pipeline import DISCOVERY_PER_BADGE
+    from pipeline import EXPLORE_PER_BADGE
 
-    group_size = DISCOVERY_PER_BADGE + 2
+    group_size = EXPLORE_PER_BADGE + 2
     unsure_base = 12
     novel_base = unsure_base + group_size
     similar_base = novel_base + group_size
@@ -3868,23 +3955,23 @@ def test_explore_badges_backfill_past_feedback_matches() -> None:
     instead of silently losing badge slots.
 
     Reproduces the bug found for a heavy voter (user=1): without
-    ``is_feedback_match``, the naive top-``DISCOVERY_PER_BADGE`` slice picks
+    ``is_feedback_match``, the naive top-``EXPLORE_PER_BADGE`` slice picks
     the best-ranked candidate per badge even when it duplicates a story the
     user already voted on — a duplicate that ``canonicalize_hn_dupes`` would
     drop downstream with no replacement, silently shrinking the deck.
     """
-    from pipeline import DISCOVERY_PER_BADGE
+    from pipeline import EXPLORE_PER_BADGE
 
     config = Config(count=40)
     ranked, recent_cutoff, cand_scores, cand_velocities, idx_for, explore = (
         _make_combo_deck_inputs()
     )
 
-    # group_size = DISCOVERY_PER_BADGE + 2 ids per badge pool (see
+    # group_size = EXPLORE_PER_BADGE + 2 ids per badge pool (see
     # _make_combo_deck_inputs); group index 0 is the best-ranked candidate
     # in each pool (highest entropy / most novel / most similar), and the
     # last index is the worst.
-    group_size = DISCOVERY_PER_BADGE + 2
+    group_size = EXPLORE_PER_BADGE + 2
     unsure_base = 12
     novel_base = unsure_base + group_size
     similar_base = novel_base + group_size
@@ -3911,9 +3998,9 @@ def test_explore_badges_backfill_past_feedback_matches() -> None:
     novel_ids = {r.story.id for r in final if r.is_novel}
     similar_ids = {r.story.id for r in final if r.is_similar}
 
-    assert len(unsure_ids) == DISCOVERY_PER_BADGE, unsure_ids
-    assert len(novel_ids) == DISCOVERY_PER_BADGE, novel_ids
-    assert len(similar_ids) == DISCOVERY_PER_BADGE, similar_ids
+    assert len(unsure_ids) == EXPLORE_PER_BADGE, unsure_ids
+    assert len(novel_ids) == EXPLORE_PER_BADGE, novel_ids
+    assert len(similar_ids) == EXPLORE_PER_BADGE, similar_ids
 
     # The feedback-matched top pick in each pool must be excluded ...
     assert unsure_base not in unsure_ids
@@ -3922,25 +4009,25 @@ def test_explore_badges_backfill_past_feedback_matches() -> None:
     # ... and backfilled with the next-best candidates in that pool, with
     # the single worst candidate (last index) dropped for lack of room.
     assert unsure_ids == set(
-        range(unsure_base + 1, unsure_base + 1 + DISCOVERY_PER_BADGE)
+        range(unsure_base + 1, unsure_base + 1 + EXPLORE_PER_BADGE)
     )
-    assert novel_ids == set(range(novel_base + 1, novel_base + 1 + DISCOVERY_PER_BADGE))
+    assert novel_ids == set(range(novel_base + 1, novel_base + 1 + EXPLORE_PER_BADGE))
     assert similar_ids == set(
-        range(similar_base + 1, similar_base + 1 + DISCOVERY_PER_BADGE)
+        range(similar_base + 1, similar_base + 1 + EXPLORE_PER_BADGE)
     )
 
 
 def test_explore_badges_no_feedback_match_predicate_is_unaffected() -> None:
     """``is_feedback_match=None`` (cold-deck / no-feedback path) preserves
     the pre-existing top-N-by-rank behavior exactly."""
-    from pipeline import DISCOVERY_PER_BADGE
+    from pipeline import EXPLORE_PER_BADGE
 
     config = Config(count=40)
     ranked, recent_cutoff, cand_scores, cand_velocities, idx_for, explore = (
         _make_combo_deck_inputs()
     )
 
-    group_size = DISCOVERY_PER_BADGE + 2
+    group_size = EXPLORE_PER_BADGE + 2
     unsure_base = 12
     novel_base = unsure_base + group_size
     similar_base = novel_base + group_size
@@ -3961,9 +4048,9 @@ def test_explore_badges_no_feedback_match_predicate_is_unaffected() -> None:
     novel_ids = {r.story.id for r in final if r.is_novel}
     similar_ids = {r.story.id for r in final if r.is_similar}
 
-    assert unsure_ids == set(range(unsure_base, unsure_base + DISCOVERY_PER_BADGE))
-    assert novel_ids == set(range(novel_base, novel_base + DISCOVERY_PER_BADGE))
-    assert similar_ids == set(range(similar_base, similar_base + DISCOVERY_PER_BADGE))
+    assert unsure_ids == set(range(unsure_base, unsure_base + EXPLORE_PER_BADGE))
+    assert novel_ids == set(range(novel_base, novel_base + EXPLORE_PER_BADGE))
+    assert similar_ids == set(range(similar_base, similar_base + EXPLORE_PER_BADGE))
 
 
 def _make_mixed_combo_deck_inputs(
@@ -4423,10 +4510,10 @@ def test_parallel_can_stack_within(
 
     monkeypatch.setattr("pipeline.ranking.get_or_compute_embeddings", mock_gce)
 
-    from pipeline import PRIMARY_PER_COMBO, DISCOVERY_PER_BADGE
+    from pipeline import PRIMARY_PER_COMBO, EXPLORE_PER_BADGE
 
     now = int(time.time())
-    n_total = PRIMARY_PER_COMBO + DISCOVERY_PER_BADGE + 4  # primary + room
+    n_total = PRIMARY_PER_COMBO + EXPLORE_PER_BADGE + 4  # primary + room
     candidates: list[Story] = []
     for i in range(n_total):
         score = 200 - i * 5
@@ -4470,9 +4557,11 @@ def test_hot_badge_threshold_uses_config_percentile(
     """is_hot respects hot_badge_percentile from config.
 
     The Hot pass runs against the full combo pool and can badge primary
-    cards. Slot limit is DISCOVERY_PER_BADGE.
+    cards. Slot limit is POPULAR_PER_COMBO // 3.
     """
-    from pipeline import DISCOVERY_PER_BADGE
+    from pipeline import POPULAR_PER_COMBO
+
+    hot_cap = POPULAR_PER_COMBO // 3
 
     now = int(time.time())
     # 20 stories, scores 10..200 (step 10), all 1h old so velocity = score.
@@ -4501,18 +4590,13 @@ def test_hot_badge_threshold_uses_config_percentile(
     assert len(hot_ids) == 1, f"Expected 1 hot at p99.5, got {len(hot_ids)}"
 
     # 50th pct: p50 ≈ 105. Ids 0..9 clear the threshold. Slot cap is
-    # DISCOVERY_PER_BADGE, so only the top DISCOVERY_PER_BADGE by velocity
-    # get Hot.
+    # hot_cap, so only the top hot_cap by velocity get Hot.
     config2 = Config(count=40, model=ModelConfig(hot_badge_percentile=50.0))
     ranked2 = rerank_candidates(db, config2, embedder, candidates, cand_embs)
     hot2 = {r.story.id for r in ranked2 if r.is_hot}
-    assert set(range(DISCOVERY_PER_BADGE)) <= hot2
-    assert DISCOVERY_PER_BADGE not in hot2, (
-        "Should only get DISCOVERY_PER_BADGE hot cards"
-    )
-    assert len(hot2) == DISCOVERY_PER_BADGE, (
-        f"Expected {DISCOVERY_PER_BADGE} hot at p50, got {len(hot2)}"
-    )
+    assert set(range(hot_cap)) <= hot2
+    assert hot_cap not in hot2, "Should only get hot_cap hot cards"
+    assert len(hot2) == hot_cap, f"Expected {hot_cap} hot at p50, got {len(hot2)}"
 
 
 def test_tier1_gravity_at_zero_feedback(db: Database, embedder: Embedder) -> None:
@@ -5272,7 +5356,7 @@ def test_candidate_similar_to_neutral_is_not_novel(db, embedder, monkeypatch):
     by_id = {r.story.id: r for r in ranked}
 
     # id=3 (far from all feedback, max_sim=0, dist=1.0) is the most
-    # novel and should be in the top DISCOVERY_PER_BADGE by distance.
+    # novel and should be in the top EXPLORE_PER_BADGE by distance.
     assert 3 in by_id, "id=3 (far from all feedback) should be in final"
     assert by_id[3].is_novel, (
         f"id=3 (far from feedback) should be novel; got is_novel={by_id[3].is_novel}"
@@ -5376,7 +5460,7 @@ def test_no_neutral_feedback_uses_up_down_only_for_novel(db, embedder, monkeypat
     by_id = {r.story.id: r for r in ranked}
 
     # id=2 (max_sim=0, dist=1.0) is the most novel; it's in the top
-    # DISCOVERY_PER_BADGE by distance.
+    # EXPLORE_PER_BADGE by distance.
     assert 2 in by_id, "id=2 (not similar to any) should be in final"
     assert by_id[2].is_novel, (
         f"Candidate 2 should be novel; got is_novel={by_id[2].is_novel}"
@@ -5393,13 +5477,13 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
     A low-score, high-distance story beats a higher-score, lower-distance
     story when the slot cap forces a cut.
 
-    With per-combo discovery slots (DISCOVERY_PER_BADGE), the cut is at
-    position DISCOVERY_PER_BADGE. We construct scores so the last-kept
+    With per-combo discovery slots (EXPLORE_PER_BADGE), the cut is at
+    position EXPLORE_PER_BADGE. We construct scores so the last-kept
     (by distance) story has a very low score; pure-distance ranking keeps
     it; a score-blended ranking would have dropped it for the first
     excluded (higher-score) story.
     """
-    from pipeline import DISCOVERY_PER_BADGE, PRIMARY_PER_COMBO
+    from pipeline import EXPLORE_PER_BADGE, PRIMARY_PER_COMBO
 
     config = Config(count=40)
     user = db.create_user("test_novel_distance")
@@ -5419,7 +5503,7 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
     db.upsert_feedback(user.id, 100, "up")
 
     # Primary fillers (high score) + controlled extras (low score, varied sim).
-    # The novel pass picks DISCOVERY_PER_BADGE by distance. We arrange so
+    # The novel pass picks EXPLORE_PER_BADGE by distance. We arrange so
     # the last-by-distance kept id has a very low score, and the first
     # excluded id (worse distance) has a high score; a score-blended
     # ranking would have swapped the two.
@@ -5438,11 +5522,11 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
                 comment_count=0,
             )
         )
-    extra_scores = [10] * (DISCOVERY_PER_BADGE + 2)
-    extra_scores[DISCOVERY_PER_BADGE - 1] = 1  # last kept, very low score
-    extra_scores[DISCOVERY_PER_BADGE] = 50  # first excluded, high score
+    extra_scores = [10] * (EXPLORE_PER_BADGE + 2)
+    extra_scores[EXPLORE_PER_BADGE - 1] = 1  # last kept, very low score
+    extra_scores[EXPLORE_PER_BADGE] = 50  # first excluded, high score
     # Strictly increasing sim -> strictly decreasing distance/novelty.
-    extra_sims = [round(0.10 + 0.05 * i, 2) for i in range(DISCOVERY_PER_BADGE + 2)]
+    extra_sims = [round(0.10 + 0.05 * i, 2) for i in range(EXPLORE_PER_BADGE + 2)]
     for i, sc in enumerate(extra_scores):
         candidates.append(
             Story(
@@ -5472,15 +5556,15 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
     )
 
     by_id = {r.story.id: r for r in ranked}
-    kept_id = PRIMARY_PER_COMBO + (DISCOVERY_PER_BADGE - 1)
-    excluded_id = PRIMARY_PER_COMBO + DISCOVERY_PER_BADGE
+    kept_id = PRIMARY_PER_COMBO + (EXPLORE_PER_BADGE - 1)
+    excluded_id = PRIMARY_PER_COMBO + EXPLORE_PER_BADGE
     # kept_id (very low score) is the last-by-distance story within the cap.
     # Pure-distance ranking keeps it; score-blended would drop it for
     # excluded_id instead.
     assert by_id[kept_id].is_novel, (
         f"id={kept_id} (worst distance kept, score=1) should be novel"
     )
-    # excluded_id (high score) is just beyond the DISCOVERY_PER_BADGE cut,
+    # excluded_id (high score) is just beyond the EXPLORE_PER_BADGE cut,
     # so NOT novel despite the higher score.
     if excluded_id in by_id:
         assert not by_id[excluded_id].is_novel, (
@@ -6523,7 +6607,9 @@ def test_fetch_candidates_only_falls_back_to_top_n_when_disabled(monkeypatch) ->
         db.close()
 
 
-def test_fetch_candidates_only_prewarms_all_lesswrong_when_full(monkeypatch) -> None:
+def test_fetch_candidates_only_prewarms_all_lesswrong_when_full(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Regen prewarms all LessWrong candidates when prewarm_lesswrong_full=True."""
     db = Database(":memory:")
     try:
@@ -6586,8 +6672,8 @@ def test_fetch_candidates_only_prewarms_all_lesswrong_when_full(monkeypatch) -> 
             pipeline.fetch_candidates_only(config, db, embedder=_DummyEmbedder())
         )
         assert len(captured_ids) == 1
-        # Stories without top_comments: 10, 11
-        assert sorted(captured_ids[0]) == [10, 11]
+        # Hydrated stories also need fresh engagement metadata.
+        assert sorted(captured_ids[0]) == [10, 11, 12]
 
     finally:
         db.close()
@@ -6624,7 +6710,7 @@ def test_prewarm_lesswrong_stories_refetches_when_only_one_field_is_stale(
             )
         )
 
-        async def fake_fetch(post_id):
+        async def fake_fetch(post_id: str, timeout_s: float = 15.0) -> LessWrongContext:
             return LessWrongContext(
                 self_text="shorter new body from graphql",
                 top_comments="fresh comment from graphql",
@@ -6650,8 +6736,10 @@ def test_prewarm_lesswrong_stories_refetches_when_only_one_field_is_stale(
         db.close()
 
 
+@pytest.mark.parametrize("fresh_count", [1, 23])
 def test_prewarm_lesswrong_stories_skips_when_both_fields_already_richer(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_count: int,
 ) -> None:
     """If both top_comments and self_text are already populated and the
     new data is no richer, skip (no upsert)."""
@@ -6665,6 +6753,8 @@ def test_prewarm_lesswrong_stories_skips_when_both_fields_already_richer(
             Story(
                 id=43,
                 title="already-prewarmed",
+                comment_count=4,
+                comment_count_at_fetch=4,
                 url="https://www.lesswrong.com/posts/def456/already",
                 score=100,
                 time=100,
@@ -6675,11 +6765,11 @@ def test_prewarm_lesswrong_stories_skips_when_both_fields_already_richer(
             )
         )
 
-        async def fake_fetch(post_id):
+        async def fake_fetch(post_id: str, timeout_s: float = 15.0) -> LessWrongContext:
             return LessWrongContext(
                 self_text="x" * 100,
                 top_comments="y" * 100,
-                comment_count=1,
+                comment_count=fresh_count,
                 score=10,
             )
 
@@ -6688,12 +6778,15 @@ def test_prewarm_lesswrong_stories_skips_when_both_fields_already_richer(
         updated = asyncio.run(
             pipeline.prewarm_lesswrong_stories([43], db, embedder=None)
         )
-        assert updated == 0
+        assert updated == (1 if fresh_count > 4 else 0)
         row = db.get_story(43)
         assert row is not None
         # Untouched
         assert row.self_text == long_body
         assert row.top_comments == long_comments
+        assert row.comment_count == max(4, fresh_count)
+        assert row.comment_count_at_fetch == max(4, fresh_count)
+        assert row.score == 100
         # score: max(100, 10) = 100 (no change)
 
     finally:
@@ -7222,6 +7315,62 @@ def test_select_article_fetch_excludes_lesswrong(db):
     assert result == []
 
 
+def test_rss_article_prewarm_picks_newest_snippets_from_stored_rows(
+    db: Database,
+) -> None:
+    """Thin RSS rows get fetched whatever their rank; stored bodies count."""
+    now = 2_000_000_000.0
+
+    def story(
+        sid: int, source: str, age_days: float, *, url: str = "", article_body: str = ""
+    ) -> Story:
+        return Story(
+            id=sid,
+            title=f"s{sid}",
+            url=url or f"https://example.com/{sid}",
+            score=1,
+            time=int(now - age_days * 86400),
+            text_content="snippet",
+            source=source,
+            article_body=article_body,
+        )
+
+    rows = [
+        story(1, "rss_aeon_co", 1),
+        story(2, "rss_aeon_co", 3),
+        story(3, "rss_aeon_co", 2, article_body="already fetched"),
+        story(4, "rss_reddit_rust", 1),
+        story(5, "rss_lesswrong_com", 1),
+        story(6, "hn", 1),
+        story(7, "rss_aeon_co", 40),
+        story(8, "rss_aeon_co", 1, url="https://example.com/paper.pdf"),
+        story(9, "rss_aeon_co", 0.5),
+    ]
+    for row in rows:
+        db.upsert_story(row)
+    db.record_article_fetch_failure(
+        9,
+        "https://example.com/9",
+        status=429,
+        error="http_429",
+        permanent=False,
+        next_retry_at=now + 3600,
+    )
+    # Feed parsing hands back fresh objects without the stored body.
+    parsed = [replace(row, article_body="") for row in rows]
+
+    picked = pipeline.select_rss_article_prewarm(
+        parsed, db, max_per_run=10, max_age_days=30, now_ts=now
+    )
+    assert [s.id for s in picked] == [1, 2]
+
+    capped = pipeline.select_rss_article_prewarm(
+        parsed, db, max_per_run=1, max_age_days=30, now_ts=now
+    )
+    assert [s.id for s in capped] == [1]
+    assert pipeline.select_rss_article_prewarm(parsed, db, max_per_run=0) == []
+
+
 def test_article_fetch_batch_logs_summary(db, caplog, monkeypatch):
     """fetch_and_cache_article_bodies emits ok/failed/errors summary."""
     import logging
@@ -7348,6 +7497,7 @@ def test_is_fetchable_article_url():
     assert not _is_fetchable_article_url(
         "https://www.axios.com/2026/06/12/some-article"
     )
+    assert not _is_fetchable_article_url("https://openai.com/index/some-launch/")
 
     # YouTube
     assert not _is_fetchable_article_url("https://www.youtube.com/watch?v=abc123")
@@ -7426,8 +7576,8 @@ def test_article_fetch_http_4xx_becomes_permanent(db, monkeypatch):
 
     failure = db.get_article_fetch_failure(story.id)
     assert failure is not None
-    assert failure["failure_count"] == 3
-    assert failure["permanent"] == 1
+    assert failure.failure_count == 3
+    assert failure.permanent is True
 
 
 def _f2_story(sid: int, title: str = "t") -> Story:
@@ -7503,9 +7653,28 @@ def test_fill_best_match_titles_render_escapes() -> None:
     html = render.generate_dashboard_bytes(
         ranked, Config(), Database(":memory:")
     ).decode("utf-8")
-    assert "Because you upvoted:" in html
-    assert "Up &#34;quoted&#34;" in html or "Up &quot;quoted&quot;" in html
-    assert 'Up "quoted" <x>' not in html
+    # Cards are built from the embedded feed as text; the JSON itself must
+    # not let markup out of its <script> element.
+    [card] = _embedded_feed(html)["stories"]
+    assert card["best_match_title"] == 'Up "quoted" <x>'
+    assert card["title"] == "C <b>ard</b>"
+    assert "<x>" not in html and "<b>ard" not in html
+
+
+def test_embedded_feed_cannot_close_its_script_element() -> None:
+    """A title that tries to end the JSON <script> stays data."""
+    from pipeline import render
+
+    hostile = "</script><script>alert(1)</script><!--"
+    story = _f2_story(11, hostile)
+    html = render.generate_dashboard_bytes(
+        [ranking.RankedStory(story=story, score=1.0, best_match_title=hostile)],
+        Config(),
+        Database(":memory:"),
+    ).decode("utf-8")
+    [card] = _embedded_feed(html)["stories"]
+    assert card["title"] == hostile and card["best_match_title"] == hostile
+    assert html.count("<script") == 2  # the feed and the client, nothing injected
 
 
 def _embedder_with_fake_session() -> Embedder:
@@ -7865,3 +8034,110 @@ def test_growth_threshold_values() -> None:
     assert _growth_threshold(80) == 26
     assert _growth_threshold(10) == 5
     assert _growth_threshold(0) == 5
+
+
+@pytest.fixture(scope="module")
+def policy_db(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Database]:
+    db = Database(str(tmp_path_factory.mktemp("policy") / "policy.db"))
+    yield db
+    db.close()
+
+
+@settings(max_examples=60, deadline=None)  # real SQLite commits per example
+@given(
+    errors=st.lists(
+        st.sampled_from(["empty_extraction", "http_403", "http_500", "timeout"]),
+        min_size=1,
+        max_size=6,
+    ),
+    story_id=st.integers(1, 10**9),
+)
+def test_article_failure_policy_backoff_and_permanence(
+    policy_db: Database, errors: list[str], story_id: int
+) -> None:
+    """Consecutive failures of one error kind: the count matches, backoff
+    doubles from 1 h up to a 1-day cap, and extraction/auth failures turn
+    permanent exactly at the third attempt while others never do."""
+    from pipeline.enrichment import record_article_fetch_failure_outcome
+
+    db = policy_db
+    db.upsert_story(
+        Story(
+            id=story_id,
+            title="t",
+            url="https://x.example/a",
+            score=1,
+            time=1,
+            text_content="t",
+        )
+    )
+    db.clear_article_fetch_failure(story_id)
+    error = errors[0]
+    for attempt in range(1, len(errors) + 1):
+        now = 1_000_000.0 + attempt
+        record_article_fetch_failure_outcome(
+            db,
+            story_id,
+            "https://x.example/a",
+            status=None,
+            error=error,
+            permanent=False,
+            now_ts=now,
+        )
+        failure = db.get_article_fetch_failure(story_id)
+        assert failure is not None
+        assert failure.failure_count == attempt
+        repeat_permanent = error in {"empty_extraction", "http_403"} and attempt >= 3
+        assert failure.permanent is repeat_permanent
+        if not repeat_permanent:
+            expected_delay = min(86400, 3600 * 2 ** (attempt - 1))
+            assert failure.next_retry_at == pytest.approx(now + expected_delay)
+
+
+def _toml_literal(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return f'"{value}"'
+    return repr(value)
+
+
+def test_config_load_rejects_wrongly_typed_values(tmp_path: Path) -> None:
+    """Every scalar config key is type-checked at load: a wrong TOML kind is a
+    ValueError naming the key; the right kind loads (ints widen to floats)."""
+    import typing
+
+    from pipeline.config import Config, ModelConfig, RssConfig
+
+    samples: dict[object, tuple[object, object]] = {
+        int: (7, "7"),
+        float: (7, "7.0"),
+        bool: (True, 1),
+        str: ("x", 3),
+    }
+    sections = [
+        (Config, "hn_rewrite", ""),
+        (ModelConfig, "hn_rewrite.model", "model."),
+        (RssConfig, "hn_rewrite.rss", "rss."),
+    ]
+    checked = 0
+    for cls, table, prefix in sections:
+        for name, tp in typing.get_type_hints(cls).items():
+            if tp not in samples:
+                continue
+            good, bad = samples[tp]
+            for value, ok in ((good, True), (bad, False)):
+                path = tmp_path / f"{table}.{name}.{ok}.toml"
+                path.write_text(f"[{table}]\n{name} = {_toml_literal(value)}\n")
+                if ok:
+                    loaded = Config.load(str(path))
+                    target = loaded
+                    for part in prefix.rstrip(".").split(".") if prefix else []:
+                        target = getattr(target, part)
+                    assert getattr(target, name) == value
+                    assert type(getattr(target, name)) is tp
+                else:
+                    with pytest.raises(ValueError, match=rf"\b{name}\b"):
+                        Config.load(str(path))
+            checked += 1
+    assert checked > 60  # every scalar field across the three sections

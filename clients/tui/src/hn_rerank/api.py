@@ -4,14 +4,29 @@ import json
 import os
 import subprocess
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 import httpx
 from platformdirs import user_config_path
 
-from .models import Feed
+from .models import Feed, terminal_safe
+
+
+@dataclass(frozen=True)
+class Impression:
+    event_id: str
+    client_session_id: str
+    story_id: int
+    dashboard_version: int
+    position: int
+    sort_mode: str
+    age_filter: str
+    occurred_at: float
+    event_type: str = "impression"
+    source_filter: str = "mixed"
+    ranker_arm: str = "tui_observed"
 
 
 class APIError(Exception):
@@ -20,6 +35,25 @@ class APIError(Exception):
 
 class InvalidProfile(APIError):
     pass
+
+
+class TransientError(APIError):
+    """Connection failure or rate limit: says nothing about the story itself."""
+
+
+@dataclass(frozen=True)
+class Summary:
+    """Summary text plus whether the server marked it provisional.
+
+    Provisional responses (a stale fallback or a retryable partial) are shown
+    but must not be cached: a later attempt may produce a complete summary.
+    Empty responses mean hydration found nothing summarizable; clients skip
+    them instead of rendering the placeholder sentence.
+    """
+
+    text: str
+    provisional: bool = False
+    empty: bool = False
 
 
 def normalize_server(value: str) -> str:
@@ -43,10 +77,23 @@ def normalize_server(value: str) -> str:
         "::1",
     }:
         raise ValueError("Use HTTPS for a remote server to protect your profile.")
+    try:
+        _port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Enter an http(s) server URL with a valid port.") from exc
     path = parsed.path.rstrip("/") + "/"
     if any(part in {".", ".."} for part in unquote(path).split("/")):
         raise ValueError("Invalid server path.")
-    return urlunsplit((parsed.scheme, parsed.netloc.lower(), path, "", ""))
+    normalized = urlunsplit((parsed.scheme, parsed.netloc.lower(), path, "", ""))
+    # The validator must accept exactly what the HTTP layer can request.
+    # httpx raises InvalidURL (not RequestError) for unprintable characters
+    # or hosts that cannot be IDNA-encoded; without this check such a URL
+    # would escape every API caller as an uncaught exception.
+    try:
+        httpx.URL(normalized)
+    except httpx.InvalidURL as exc:
+        raise ValueError("Enter a server URL the client can request.") from exc
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -143,6 +190,12 @@ def save_profile(profile: Profile, path: Path) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
+# Feed, cache reads, votes and polls are quick; a tldr-detail call may hydrate
+# the article and run the LLM, which the server allows up to ~2 minutes.
+REQUEST_TIMEOUT = 10.0
+GENERATION_TIMEOUT = 150.0
+
+
 class API:
     def __init__(
         self,
@@ -153,14 +206,19 @@ class API:
         self.server = normalize_server(server)
         self._token = token
         self.client = httpx.AsyncClient(
-            timeout=45, follow_redirects=False, transport=transport
+            timeout=REQUEST_TIMEOUT, follow_redirects=False, transport=transport
         )
 
     async def close(self) -> None:
         await self.client.aclose()
 
     async def request(
-        self, method: str, path: str, json: dict[str, object] | None = None
+        self,
+        method: str,
+        path: str,
+        json: dict[str, object] | None = None,
+        *,
+        timeout: float = REQUEST_TIMEOUT,
     ) -> httpx.Response:
         # All paths are internal constants; reject absolute/escaping inputs anyway.
         if path.startswith("/") or ":" in path or ".." in path:
@@ -168,10 +226,10 @@ class API:
         headers = {"Cookie": f"hn_token={self._token}"} if self._token else {}
         try:
             response = await self.client.request(
-                method, self.server + path, headers=headers, json=json
+                method, self.server + path, headers=headers, json=json, timeout=timeout
             )
-        except httpx.RequestError as exc:
-            raise APIError(
+        except (httpx.RequestError, httpx.InvalidURL) as exc:
+            raise TransientError(
                 "Connection failed. Press r to refresh; votes are not retried."
             ) from exc
         if response.status_code in {401, 403}:
@@ -181,7 +239,7 @@ class API:
         if response.status_code == 429:
             delay = response.headers.get("Retry-After", "a few")
             delay = delay if delay.isdigit() else "a few"
-            raise APIError(f"Rate limited. Try again in {delay} seconds.")
+            raise TransientError(f"Rate limited. Try again in {delay} seconds.")
         if response.is_redirect:
             raise APIError(
                 "Server redirected the request. Check the server URL and deployment prefix."
@@ -212,24 +270,52 @@ class API:
         response = await self.request("GET", "api/feed")
         try:
             return Feed.parse(response.json())
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
             raise APIError(
                 "Invalid feed response. Check the server API version."
             ) from exc
 
-    async def summary(self, story_id: int) -> str:
-        response = await self.request(
-            "POST", "api/tldr-detail", json={"story_id": story_id}
-        )
+    async def cached_summary(self, story_id: int) -> Summary | None:
+        """Read existing summaries only; old servers fail without generation."""
+        response = await self.request("GET", f"api/tldr-cache/{story_id}")
+        if response.status_code == 204:
+            return None
         try:
-            value = response.json()["tldr"]
+            data = response.json()
+            value = data["tldr"]
             if not isinstance(value, str):
                 raise TypeError("Invalid summary")
-            return value
+            return Summary(
+                terminal_safe(value),
+                provisional=data.get("stale") is True or data.get("retryable") is True,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise APIError("Invalid cached summary.") from exc
+
+    async def summary(self, story_id: int, *, force_refresh: bool = False) -> Summary:
+        payload: dict[str, object] = {"story_id": story_id}
+        if force_refresh:
+            payload["force_refresh"] = True
+        response = await self.request(
+            "POST", "api/tldr-detail", json=payload, timeout=GENERATION_TIMEOUT
+        )
+        try:
+            data = response.json()
+            value = data["tldr"]
+            if not isinstance(value, str):
+                raise TypeError("Invalid summary")
+            return Summary(
+                terminal_safe(value),
+                provisional=data.get("stale") is True or data.get("retryable") is True,
+                empty=data.get("empty") is True,
+            )
         except (KeyError, TypeError, ValueError) as exc:
             raise APIError(
                 "Summary unavailable. Select another story or refresh."
             ) from exc
+
+    async def impression(self, event: Impression) -> None:
+        await self.request("POST", "api/interaction", json={"events": [asdict(event)]})
 
     async def vote(self, story_id: int, action: str) -> int:
         response = await self.request(

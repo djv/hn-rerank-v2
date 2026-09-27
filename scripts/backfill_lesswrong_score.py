@@ -22,6 +22,8 @@ Run: ``uv run python scripts/backfill_lesswrong_score.py``
 
 from __future__ import annotations
 
+import argparse
+
 import asyncio
 import logging
 import sqlite3
@@ -131,6 +133,7 @@ async def main_async() -> int:
 
 
 def main() -> int:
+    argparse.ArgumentParser(description=__doc__).parse_args()
     return asyncio.run(main_async())
 
 

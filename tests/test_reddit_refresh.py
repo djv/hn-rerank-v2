@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import cast
 
 import pipeline
+import pytest
 
 from database import Database, Story
 from pipeline import Config, RssConfig
@@ -51,7 +52,9 @@ def test_reddit_limiter_snapshot_restore_preserves_open_circuit() -> None:
     assert restored.circuit_open is True
 
 
-def test_reddit_worker_coalesces_one_pending_refresh(monkeypatch) -> None:
+def test_reddit_worker_coalesces_one_pending_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     db = Database(":memory:")
     started = threading.Event()
     release = threading.Event()
@@ -68,8 +71,9 @@ def test_reddit_worker_coalesces_one_pending_refresh(monkeypatch) -> None:
         return SimpleNamespace(changed=False)
 
     monkeypatch.setattr(pipeline, "refresh_reddit_candidates", fake_refresh)
+    config = Config(reddit_refresh_min_interval_seconds=0.0)
     worker = RedditRefreshWorker(
-        Config(), db, cast(Embedder, SimpleNamespace()), lambda: None
+        config, db, cast(Embedder, SimpleNamespace()), lambda: None
     )
     try:
         worker.submit()
@@ -82,6 +86,64 @@ def test_reddit_worker_coalesces_one_pending_refresh(monkeypatch) -> None:
     finally:
         worker.shutdown()
         db.close()
+
+
+def test_reddit_worker_defers_rerun_until_interval_ends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = Database(":memory:")
+    starts: list[float] = []
+    first = threading.Event()
+    second = threading.Event()
+
+    def fake_refresh(config, worker_db, embedder):
+        starts.append(time.monotonic())
+        (first if len(starts) == 1 else second).set()
+        return SimpleNamespace(changed=False)
+
+    monkeypatch.setattr(pipeline, "refresh_reddit_candidates", fake_refresh)
+    config = Config(reddit_refresh_min_interval_seconds=0.3)
+    worker = RedditRefreshWorker(
+        config, db, cast(Embedder, SimpleNamespace()), lambda: None
+    )
+    try:
+        worker.submit()  # the first refresh starts at once
+        assert first.wait(timeout=1.0)
+        worker.submit()
+        worker.submit()  # coalesced with the one above
+        assert second.wait(timeout=2.0)
+        assert starts[1] - starts[0] >= 0.3
+        time.sleep(0.4)
+        assert len(starts) == 2
+    finally:
+        worker.shutdown()
+        db.close()
+
+
+def test_reddit_worker_shutdown_interrupts_deferred_rerun(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = Database(":memory:")
+    calls: list[int] = []
+    first = threading.Event()
+
+    def fake_refresh(config, worker_db, embedder):
+        calls.append(1)
+        first.set()
+        return SimpleNamespace(changed=False)
+
+    monkeypatch.setattr(pipeline, "refresh_reddit_candidates", fake_refresh)
+    config = Config(reddit_refresh_min_interval_seconds=3600.0)
+    worker = RedditRefreshWorker(
+        config, db, cast(Embedder, SimpleNamespace()), lambda: None
+    )
+    worker.submit()
+    assert first.wait(timeout=1.0)
+    worker.submit()  # deferred for an hour
+    worker.shutdown(timeout=1.0)
+    assert not worker._thread.is_alive()
+    assert calls == [1]
+    db.close()
 
 
 def test_non_hn_candidates_use_only_configured_recent_feeds() -> None:

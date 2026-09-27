@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+
 import asyncio
 import logging
 import sys
@@ -13,15 +15,15 @@ from pipeline import (
     Embedder,
     compose_story_text,
     get_or_compute_embeddings,
-    _urllib_fetch,
 )
+from http_fetch import urllib_fetch
 from server import _extract_article_body
 from scripts._seed_common import STORY_COLS as _COLS, rows_to_stories
 
 ARTICLE_BODY_CHAR_LIMIT = 15_000
 
 
-async def main() -> None:
+async def _main_async() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     config = Config.load("config.toml")
@@ -55,7 +57,7 @@ async def main() -> None:
 
         ok = 0
         for s in stories:
-            status, body = _urllib_fetch(
+            status, body = urllib_fetch(
                 s.url or "", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
             )
             if status != 200:
@@ -106,5 +108,10 @@ async def main() -> None:
     logging.info("done")
 
 
+def main() -> None:
+    argparse.ArgumentParser(description=__doc__).parse_args()
+    asyncio.run(_main_async())
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

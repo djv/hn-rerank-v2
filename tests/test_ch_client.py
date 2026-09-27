@@ -459,17 +459,18 @@ def test_cache_ttl_expiry(monkeypatch: pytest.MonkeyPatch) -> None:
     assert call_count["n"] == 4  # 2 more HTTP calls
 
 
-def test_cache_lru_eviction() -> None:
-    """Insert > MAX entries; the cache cap should hold."""
+def test_cache_size_is_capped() -> None:
     for i in range(ch_client._CACHE_MAX_ENTRIES + 5):
-        ch_client._cache_put(("bulk", (i,), 5), "v")
-    assert len(ch_client._cache) <= ch_client._CACHE_MAX_ENTRIES
+        with ch_client._cache_lock:
+            ch_client._bulk_cache[((i,), 5)] = {}
+    assert len(ch_client._bulk_cache) == ch_client._CACHE_MAX_ENTRIES
 
 
 def test_cache_clear() -> None:
-    ch_client._cache_put(("foo",), "bar")
+    with ch_client._cache_lock:
+        ch_client._bulk_cache[((1,), 5)] = {}
     ch_client.clear_cache()
-    assert len(ch_client._cache) == 0
+    assert len(ch_client._bulk_cache) == len(ch_client._single_cache) == 0
 
 
 def test_cache_key_normalization(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import time
+import unicodedata
 import webbrowser
+from dataclasses import replace
 from pathlib import Path
 from typing import ClassVar
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 from rich.text import Text
 from textual import events, work
@@ -13,7 +17,6 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.theme import Theme
-from textual.timer import Timer
 from textual.widgets import (
     Button,
     Input,
@@ -25,22 +28,218 @@ from textual.widgets import (
     Tab,
     Tabs,
 )
+
+# Private module: Dropdown reuses Select's internals, so pyproject pins
+# textual to the tested minor release.
+from textual.widgets._select import (
+    NonSelectableStatic,
+    SelectCurrent,
+    SelectOverlay,
+)
 from textual.widgets.option_list import Option
 
 from .api import (
     API,
     APIError,
+    Impression,
     InvalidProfile,
     Profile,
+    TransientError,
     load_profile,
     normalize_server,
     profile_path,
     save_profile,
 )
+from .api import Summary as SummaryResult
 from .models import Feed, FeedStory
+
+DEFAULT_SERVER = "https://proxy.example.net:8443/hn/"
+
+DARK_PALETTE: dict[str, str] = {
+    "bg": "#171717",
+    "fg": "#EEE8DD",
+    "title-dim": "#D2CCC1",
+    "soft": "#C6C1B8",
+    "muted": "#AAA399",
+    "faint": "#8F897F",
+    "sep": "#6B655D",
+    "accent": "#FF914D",
+    "link": "#8AB4F8",
+    "good": "#A8C7A0",
+    "warn": "#E5C07B",
+    "bad": "#FFB4A6",
+    "surface": "#222222",
+    "panel": "#292724",
+    "bar": "#1D1C1A",
+    "modal": "#1C1B19",
+    "button-focus": "#2E2B27",
+    "border": "#44403B",
+    "rule": "#2A2825",
+    "select-bg": "#5A3A12",
+    "select-fg": "#FFFFFF",
+    "overlay": "rgba(14,14,14,0.7)",
+}
+LIGHT_PALETTE: dict[str, str] = {
+    "bg": "#FAF7F2",
+    "fg": "#1F1D1A",
+    "title-dim": "#3A3631",
+    "soft": "#4A453F",
+    "muted": "#5F5850",
+    "faint": "#7A7369",
+    "sep": "#A8A195",
+    "accent": "#C4520F",
+    "link": "#1F5FBF",
+    "good": "#2E7D32",
+    "warn": "#9A6700",
+    "bad": "#B3261E",
+    "surface": "#F0EBE3",
+    "panel": "#E8E2D8",
+    "bar": "#F2EDE5",
+    "modal": "#F2EDE5",
+    "button-focus": "#E0D8CB",
+    "border": "#CFC7BA",
+    "rule": "#E3DDD3",
+    "select-bg": "#F6DCC4",
+    "select-fg": "#1F1D1A",
+    "overlay": "rgba(60,50,40,0.35)",
+}
+PALETTES: dict[str, dict[str, str]] = {
+    "editorial": DARK_PALETTE,
+    "editorial-light": LIGHT_PALETTE,
+}
+# Rich Text styles are baked at render time, so they read the active palette.
+PALETTE: dict[str, str] = dict(DARK_PALETTE)
+LIGHT_HOURS = range(6, 20)  # Local 06:00-19:59 uses the light theme.
+
+
+def theme_for_hour(hour: int) -> str:
+    return "editorial-light" if hour in LIGHT_HOURS else "editorial"
+
+
+def editorial_theme(name: str) -> Theme:
+    p = PALETTES[name]
+    return Theme(
+        name=name,
+        primary=p["muted"],
+        secondary=p["muted"],
+        accent=p["accent"],
+        foreground=p["fg"],
+        background=p["bg"],
+        surface=p["surface"],
+        panel=p["panel"],
+        error=p["bad"],
+        success=p["good"],
+        warning=p["warn"],
+        dark=p is DARK_PALETTE,
+        variables={
+            "scrollbar": p["border"],
+            "scrollbar-hover": p["sep"],
+            "scrollbar-active": p["accent"],
+            "scrollbar-background": p["bar"],
+            "scrollbar-background-hover": p["bar"],
+            "scrollbar-background-active": p["bar"],
+            **{f"hn-{key}": value for key, value in p.items()},
+        },
+    )
+
+
+def copy_with_system_tool(text: str) -> bool:
+    """Copy text with wl-copy, xclip, xsel or pbcopy; False when none worked."""
+    import os
+    import shutil
+    import subprocess
+
+    commands = [["pbcopy"], ["xclip", "-selection", "clipboard"], ["xsel", "-ib"]]
+    if os.environ.get("WAYLAND_DISPLAY"):
+        commands.insert(0, ["wl-copy"])
+    for command in commands:
+        if shutil.which(command[0]) is None:
+            continue
+        try:
+            subprocess.run(
+                command,
+                input=text.encode(),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+                check=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        return True
+    return False
+
+
+def open_in_firefox(url: str) -> None:
+    """Open a URL in the running Firefox window, launching one if needed."""
+    import shutil
+    import subprocess
+
+    firefox = shutil.which("firefox")
+    if firefox is None:
+        webbrowser.open(url)
+        return
+    # A missing pgrep/wmctrl or a failed launch must not crash the reader.
+    try:
+        running = (
+            subprocess.run(
+                ["pgrep", "-x", "firefox"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+                check=False,
+            ).returncode
+            == 0
+        )
+        subprocess.Popen(
+            [firefox, "--new-tab", url] if running else [firefox, url],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        webbrowser.open(url)
+        return
+    if shutil.which("wmctrl") is not None:
+        try:
+            subprocess.run(
+                ["wmctrl", "-x", "-a", "Navigator.firefox"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass  # Focusing the window is cosmetic.
+
+
+class ArrowLeftCurrent(SelectCurrent):
+    """SelectCurrent with the toggle arrow ahead of the label."""
+
+    def compose(self) -> ComposeResult:
+        yield NonSelectableStatic("▼", classes="arrow down-arrow")
+        yield NonSelectableStatic("▲", classes="arrow up-arrow")
+        yield NonSelectableStatic(self.placeholder, id="label")
+
+
+class Dropdown(Select):
+    """Select that reads arrow-first; overlay behavior unchanged."""
+
+    def compose(self) -> ComposeResult:
+        yield ArrowLeftCurrent(self.prompt)
+        yield SelectOverlay(type_to_search=self._type_to_search).data_bind(
+            compact=Select.compact
+        )
+
 
 # Hacker News launched in 2006; earlier timestamps are missing or placeholder data.
 EARLIEST_STORY_TIME = 1_136_073_600
+
+# Pause new speculative prefetch after background API errors.
+PREFETCH_COOLDOWN_SECONDS = 60.0
+DEFAULT_PREFETCH = 20
+DEFAULT_PREFETCH_GENERATE = 3
+PREFETCH_CONCURRENCY = 4
 
 
 def story_age(story: FeedStory) -> str:
@@ -68,24 +267,83 @@ def story_metadata(story: FeedStory) -> str:
     return " · ".join(parts)
 
 
-def headline(story: FeedStory, selected: bool | None = None) -> Text:
+# Every sort shows at most this many stories (matches the web client);
+# unrated stories past the cap slide in as ones ahead are rated.
+VIEW_LIMIT = 12
+
+
+def _cell_len(text: str) -> int:
+    """Terminal cell width (wide emoji count double)."""
+    return sum(
+        2 if unicodedata.east_asian_width(char) in ("W", "F") else 1 for char in text
+    )
+
+
+def _pad_cells(text: str, width: int) -> str:
+    padding = width - _cell_len(text)
+    return text + " " * padding if padding > 0 else text
+
+
+def headline_domain(story: FeedStory) -> str:
+    if story.source.startswith("rss_reddit_") and len(story.source) > 11:
+        return f"r/{story.source[11:]}"
+    domain = urlsplit(story.article_url).hostname or story.source
+    return domain.removeprefix("www.")
+
+
+def headline_points(story: FeedStory) -> str:
+    # Reddit RSS carries no scores (0/8487 rows have one): 0 means unknown,
+    # not zero. The web card already hides zero scores; match that here.
+    if story.points > 0 or not story.source.startswith("rss_reddit_"):
+        return f"▲ {story.points}"
+    return ""
+
+
+def headline(
+    story: FeedStory,
+    selected: bool | None = None,
+    widths: tuple[int, int, int] = (0, 0, 0),
+) -> Text:
+    """Headline with column-aligned `·` separators when *widths* is given.
+
+    *widths* holds the (domain, points, comments) segment widths across the
+    visible list; each row pads its segments so the separators line up.
+    Unknown Reddit scores pad as blank space to preserve the columns.
+    """
     text = Text()
     if selected is not None:
-        text.append("> " if selected else "  ", style="bold #FF914D")
+        text.append("> " if selected else "  ", style=f"bold {PALETTE['accent']}")
+    if story.badges:
+        text.append(" ".join(story.badges) + " ")
     text.append(
-        story.title, style="bold #EEE8DD" if selected is not False else "#D2CCC1"
+        story.title,
+        style=f"bold {PALETTE['fg']}"
+        if selected is not False
+        else PALETTE["title-dim"],
     )
     text.append("\n")
-    domain = urlsplit(story.article_url).hostname or story.source
-    text.append(domain, style="#8AB4F8")
-    text.append(" · ", style="#6B655D")
-    text.append(f"{story.points} pts", style="#A8C7A0")
-    text.append(" · ", style="#6B655D")
-    text.append(f"{story.comments or 0} comments", style="#C6C1B8")
+    domain = headline_domain(story)
+    if widths[0] and _cell_len(domain) > widths[0]:
+        domain = domain[: widths[0] - 1] + "…" if widths[0] > 1 else "…"
+    elif widths[0]:
+        domain = _pad_cells(domain, widths[0])
+    text.append(domain, style=PALETTE["link"])
+    points = headline_points(story)
+    if points or widths[1]:
+        text.append(" · ", style=PALETTE["sep"])
+        text.append(
+            _pad_cells(points, widths[1]) if widths[1] else points,
+            style=PALETTE["good"],
+        )
+    comments = f"💬 {story.comments or 0}"
     age = story_age(story)
+    text.append(" · ", style=PALETTE["sep"])
+    if age and widths[2]:
+        comments = _pad_cells(comments, widths[2])
+    text.append(comments, style=PALETTE["soft"])
     if age:
-        text.append(" · ", style="#6B655D")
-        text.append(f"{age} ago", style="#8F897F")
+        text.append(" · ", style=PALETTE["sep"])
+        text.append(age, style=PALETTE["faint"])
     return text
 
 
@@ -111,26 +369,33 @@ class Summary(Markdown):
 
 class Setup(ModalScreen[Profile | None]):
     CSS = """
-    Setup { align: center middle; background: rgba(14,14,14,0.7); color: #EEE8DD; }
+    Setup { align: center middle; background: $hn-overlay; color: $hn-fg; }
     #setup { width: 70; max-width: 95%; height: auto; max-height: 100%;
-             overflow-y: auto; padding: 1 2; background: #1C1B19;
-             border: round #44403B; }
+             overflow-y: auto; padding: 1 2; background: $hn-modal;
+             border: round $hn-border; }
     #setup-title { text-style: bold; }
-    #setup-message { height: auto; margin: 1 0; color: #AAA399; }
-    #setup-message.error { color: #FFB4A6; }
+    #setup-message { height: auto; margin: 1 0; color: $hn-muted; }
+    #setup-message.error { color: $hn-bad; }
     .setup-section { margin-top: 1; text-style: bold; }
-    Setup Input { margin: 0 0 1 0; background: #222222; border: tall #44403B; }
-    Setup Input:focus { border: tall #FF914D; }
-    Setup Button { width: 1fr; background: #292724; color: #EEE8DD; border: none; }
-    Setup Button:focus { background: #2E2B27; color: #FF914D; text-style: bold; }
-    #quit { margin-top: 1; background: #1C1B19; color: #AAA399; }
+    Setup Input { margin: 0 0 1 0; background: $hn-surface; border: tall $hn-border; }
+    Setup Input:focus { border: tall $hn-accent; }
+    Setup Button { width: 1fr; background: $hn-panel; color: $hn-fg; border: none; }
+    Setup Button:focus { background: $hn-button-focus; color: $hn-accent; text-style: bold; }
+    #quit { margin-top: 1; background: $hn-modal; color: $hn-muted; }
     """
 
-    def __init__(self, path: Path, server: str | None, message: str = "") -> None:
+    def __init__(
+        self,
+        path: Path,
+        server: str | None,
+        message: str = "",
+        explicit_server: str | None = None,
+    ) -> None:
         super().__init__()
         self.path = path
         self.server = server
         self.message = message
+        self.explicit_server = explicit_server
         self.pending = False
 
     def compose(self) -> ComposeResult:
@@ -145,23 +410,33 @@ class Setup(ModalScreen[Profile | None]):
             yield Label("Import an existing profile", classes="setup-section")
             yield Input(placeholder="https://host/hn/u/TOKEN", password=True, id="link")
             yield Button("Import profile", id="import")
+            yield Label("Use an existing token", classes="setup-section")
+            yield Input(placeholder="Profile token", password=True, id="token")
+            yield Button("Use token", id="use-token")
             yield Label("Start a new profile", classes="setup-section")
-            yield Input(
-                value=self.server or "", placeholder="https://host/hn/", id="server"
-            )
             yield Button("Create new profile", id="create")
             yield Button("Quit", id="quit")
 
     @work(exclusive=True)
-    async def connect(self, create: bool) -> None:
+    async def connect(self, mode: str) -> None:
         api: API | None = None
         try:
-            if create:
-                api = API(self.query_one("#server", Input).value)
+            if mode == "create":
+                api = API(self.server or DEFAULT_SERVER)
                 profile = await api.create()
+            elif mode == "use-token":
+                profile = Profile(
+                    self.server or DEFAULT_SERVER,
+                    self.query_one("#token", Input).value.strip(),
+                )
+                api = API(profile.server, profile.token)
+                profile = await api.validate()
             else:
                 profile = Profile.from_link(self.query_one("#link", Input).value)
-                if self.server and normalize_server(self.server) != profile.server:
+                if (
+                    self.explicit_server
+                    and normalize_server(self.explicit_server) != profile.server
+                ):
                     raise ValueError(
                         "Profile link does not match --server. Use the matching deployment."
                     )
@@ -193,69 +468,81 @@ class Setup(ModalScreen[Profile | None]):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "quit":
             self.app.exit()
-        elif not self.pending:
+        elif event.button.id in ("import", "use-token", "create") and not self.pending:
             self.pending = True
             for button in self.query(Button):
                 button.disabled = True
             self.query_one("#setup-message", Static).update("Connecting…")
             self.query_one("#setup-message").remove_class("error")
-            self.connect(event.button.id == "create")
+            self.connect(str(event.button.id))
 
 
 class Reader(App[None]):
     TITLE = "HN Rerank"
     CSS = """
-    Screen { background: #171717; color: #EEE8DD; }
-    #brand { height: 1; padding: 0 1; text-style: bold; color: #FF914D; }
-    #filters { height: 3; }
-    Select { width: 1fr; display: none; }
-    SelectCurrent { background: #222222; border: tall #44403B; }
-    Select:focus SelectCurrent { border: tall #FF914D; }
+    Screen { background: $hn-bg; color: $hn-fg; }
+    #filters { height: 2; align-vertical: top; }
+    Select { width: auto; height: auto; display: none; }
+    .filter-caption { width: auto; height: 1; padding: 0 1 0 2; color: $hn-faint; display: none; }
+    .narrow .filter-caption { display: block; }
+    SelectCurrent { background: transparent; border: none; height: 1; width: auto; padding: 0 2; }
+    SelectCurrent .arrow { padding: 0 1 0 0; }
+    SelectCurrent Static#label { width: auto; }
+    Select:focus-within > SelectCurrent { background: $hn-accent; }
+    Select:focus-within Static#label { color: $hn-bg; }
+    Select:focus-within .arrow { color: $hn-bg; }
+    .narrow #filters { height: 1; }
     Tabs { width: auto; }
-    #sort-tabs { width: 60; }
-    Tab { color: #AAA399; padding: 0 1; }
-    Tab.-active { color: #FF914D; text-style: bold; }
+    #sort-tabs { width: 58; }
+    #age-tabs { width: 20; }
+    Tab { color: $hn-muted; padding: 0 1; }
+    Tab.-active { color: $hn-accent; text-style: bold; }
     Tabs:focus Tab.-active { text-style: bold underline; }
-    Underline > .underline--bar { color: #FF914D; background: #171717; }
+    Underline > .underline--bar { color: $hn-accent; background: $hn-bg; }
     #panes { height: 1fr; }
-    #headlines { width: 1fr; height: 1fr; background: #171717;
-                 border: none; padding: 0; }
+    #headlines { width: 1fr; height: 1fr; background: $hn-bg;
+                 border: solid $hn-bg; padding: 0; }
+    #headlines:focus { border: solid $hn-accent; }
     #headlines > .option-list--option { padding: 0 1; }
     #headlines > .option-list--option-highlighted {
-        background: #2E2B27; color: #EEE8DD;
+        background: $hn-select-bg; color: $hn-select-fg; text-style: bold;
     }
-    #headlines:focus { background-tint: #171717 0%; }
-    #headlines:focus > .option-list--option-highlighted { text-style: none; }
-    #reading-pane { width: 2fr; height: 1fr; border-left: solid #44403B;
+    #headlines:focus > .option-list--option-highlighted { text-style: none;
+        border-left: solid $hn-accent; }
+    #reading-pane { width: 2fr; height: 1fr; border-left: solid $hn-border;
                     max-width: 100; }
-    #reading-pane.has-story:focus-within { border-left: solid #FF914D; }
-    #story-heading { height: auto; max-height: 8; padding: 1 2;
-                     border-bottom: solid #2A2825; }
+    #reading-pane.has-story:focus-within { border-left: solid $hn-accent; }
+    #story-heading { height: auto; max-height: 6; padding: 0 1;
+                     border-bottom: solid $hn-rule; }
     #summary { width: 1fr; height: 1fr; padding: 0 2; overflow-y: auto;
-               background: #171717; color: #EEE8DD; }
+               background: $hn-bg; color: $hn-fg; }
     MarkdownH1, MarkdownH2, MarkdownH3, MarkdownH4, MarkdownH5, MarkdownH6 {
         margin: 1 0 0 0; padding: 0;
-        border: none; background: #171717; color: #EEE8DD; text-style: bold;
+        border: none; background: $hn-bg; color: $hn-fg; text-style: bold;
         content-align: left top; }
     MarkdownParagraph, MarkdownBulletList, MarkdownOrderedList { margin: 0; }
-    MarkdownBlockQuote { border-left: solid #AAA399; background: #222222; margin: 0 0 1 0; }
-    MarkdownFence { background: #222222; margin: 0 0 1 0; padding: 1; }
-    #summary MarkdownBlock > .strong { color: #FF914D; text-style: bold; }
-    #summary MarkdownBlock > .em { color: #FF914D; }
-    #footer { dock: bottom; height: auto; max-height: 4; background: #1D1C1A;
-              border-top: solid #2A2825; }
-    #status { width: 1fr; height: auto; max-height: 3; padding: 0 1; color: #AAA399; }
-    #status.context { color: #C6C1B8; }
-    #status.error { color: #FFB4A6; text-style: bold; }
-    #shortcuts { width: auto; height: auto; padding: 0 1; color: #8F897F; }
+    MarkdownBlockQuote { border-left: solid $hn-muted; background: $hn-surface; margin: 0 0 1 0; }
+    MarkdownFence { background: $hn-surface; margin: 0 0 1 0; padding: 1; }
+    #summary MarkdownBlock > .strong { color: $hn-accent; text-style: bold; }
+    #summary MarkdownBlock > .em { color: $hn-accent; }
+    #footer { dock: bottom; layout: vertical; height: auto; background: $hn-bar;
+              border-top: solid $hn-rule; }
+    #status { width: 1fr; height: auto; max-height: 3; padding: 0 1; color: $hn-muted; }
+    #status.context { color: $hn-soft; }
+    #status.error { color: $hn-bad; text-style: bold; }
+    #shortcuts { width: 1fr; height: auto; padding: 0 1; color: $hn-faint; }
     .narrow Tabs { display: none; }
     .narrow Select { display: block; }
     .narrow #panes { layout: vertical; }
-    .narrow #headlines { width: 1fr; height: 2fr; }
+    .narrow #headlines { width: 1fr; height: 1fr; }
     .narrow #reading-pane { width: 1fr; height: 3fr; border-left: none;
-                            border-top: solid #44403B; }
-    .narrow #reading-pane.has-story:focus-within { border-top: solid #FF914D; }
-    .narrow.reading #headlines { display: none; }
+                            border-top: solid $hn-border; }
+    /* The wide focus rule outranks `.narrow #reading-pane`; cancel its left edge. */
+    .narrow #reading-pane.has-story:focus-within { border-top: solid $hn-accent;
+                                                   border-left: none; }
+    .reading #headlines { display: none; }
+    .reading #panes { align-horizontal: center; }
+    .reading #reading-pane { width: 1fr; max-width: 100; }
     .narrow.reading #reading-pane { height: 1fr; }
     """
     BINDINGS: ClassVar[list[tuple[str, str, str]]] = [
@@ -267,10 +554,15 @@ class Reader(App[None]):
         ("u", "undo", "Undo"),
         ("o", "open_url('article_url')", "Article"),
         ("c", "open_url('comments_url')", "Comments"),
+        ("y", "copy_url", "Copy link"),
         ("r", "refresh", "Refresh"),
+        ("s", "cycle_sort", "Sort"),
+        ("h", "cycle_sort(-1)", "Prev sort"),
+        ("l", "cycle_sort(1)", "Next sort"),
         ("enter", "read", "Read"),
         ("escape", "headlines", "Back"),
         ("?", "help", "Help"),
+        ("b", "badge_legend", "Badges"),
         ("q", "quit", "Quit"),
     ]
 
@@ -279,55 +571,61 @@ class Reader(App[None]):
         server: str | None = None,
         config_path: Path | None = None,
         api: API | None = None,
+        prefetch: int = DEFAULT_PREFETCH,
+        prefetch_generate: int = DEFAULT_PREFETCH_GENERATE,
     ) -> None:
         super().__init__()
-        self.register_theme(
-            Theme(
-                name="editorial",
-                primary="#AAA399",
-                secondary="#AAA399",
-                accent="#FF914D",
-                foreground="#EEE8DD",
-                background="#171717",
-                surface="#222222",
-                panel="#292724",
-                error="#FFB4A6",
-                success="#A8C7A0",
-                warning="#E5C07B",
-                dark=True,
-                variables={
-                    "scrollbar": "#44403B",
-                    "scrollbar-hover": "#6B655D",
-                    "scrollbar-active": "#FF914D",
-                    "scrollbar-background": "#1D1C1A",
-                    "scrollbar-background-hover": "#1D1C1A",
-                    "scrollbar-background-active": "#1D1C1A",
-                },
-            )
-        )
-        self.theme = "editorial"
-        self.server = normalize_server(server) if server else None
+        for name in PALETTES:
+            self.register_theme(editorial_theme(name))
+        self.clock_theme = ""
+        self.apply_clock_theme()
+        self.explicit_server = normalize_server(server) if server else None
+        self.server = self.explicit_server or DEFAULT_SERVER
         self.config_path = config_path or profile_path()
         self.api = api
         self.feed: Feed | None = None
         self.stories: list[FeedStory] = []
+        # Headline row state as last rendered: column widths and marked story.
+        self._row_widths: tuple[int, int, int] | None = None
+        self._marked_id: int | None = None
         self.rated: set[int] = set()
+        self.unavailable: set[int] = set()
+        # Explore's client-side shuffle per "explore:<age>" view, kept stable
+        # across rebuilds (votes, polls, feed refreshes) and dropped when the
+        # user leaves that view, so each visit gets a fresh order.
+        self.explore_orders: dict[str, list[int]] = {}
+        self.view_key: str | None = None
         self.restored: dict[int, FeedStory] = {}
         self.history: list[FeedStory] = []
-        self.pending = False
-        self.target: int | None = None
+        # Views ("<sort>:<age>") each voted story was listed in, so undo puts
+        # it back only where the server had it.
+        self.vote_views: dict[int, list[str]] = {}
+        self.vote_lock = asyncio.Lock()
         self.selection_serial = 0
+        self.interaction_session = str(uuid4())
         self.summary_story_id: int | None = None
         self.reading = False
-        self.can_read = False
-        self._read_timers: list[Timer] = []
         self.help_open = False
         self.setting_up = False
         self.status_mode = "context"
         self.last_error: str | None = None
+        self.prefetch = max(0, prefetch)
+        self.prefetch_generate = min(self.prefetch, max(0, prefetch_generate))
+        # Complete summaries, and at most one request per story in flight. The
+        # selection and prefetch share that request; only refresh, setup and
+        # quit cancel it, never a caller that stopped waiting.
+        self.summaries: dict[int, str] = {}
+        self.summary_requests: dict[int, asyncio.Task[SummaryResult | None]] = {}
+        # Prefetch backoff: provisional/empty/failed results wait until the
+        # time; a cache miss (time of the miss) may still generate once the
+        # story is near the selection.
+        self.prefetch_retry_at: dict[int, float] = {}
+        self.prefetch_misses: dict[int, float] = {}
+        self.prefetch_cooldown_until = 0.0
+        self.prefetch_slots = asyncio.Semaphore(PREFETCH_CONCURRENCY)
+        self.closing = False
 
     def compose(self) -> ComposeResult:
-        yield Static("HN Rerank", id="brand")
         with Horizontal(id="filters"):
             yield Tabs(
                 *(
@@ -341,13 +639,15 @@ class Reader(App[None]):
                 Tab("Archive", id="age-archive"),
                 id="age-tabs",
             )
-            yield Select(
+            yield Static("Sort", classes="filter-caption")
+            yield Dropdown(
                 [(s.title(), s) for s in ("recommended", "popular", "explore", "date")],
                 value="recommended",
                 allow_blank=False,
                 id="sort",
             )
-            yield Select(
+            yield Static("Age", classes="filter-caption")
+            yield Dropdown(
                 [("Recent", "recent"), ("Archive", "archive")],
                 value="recent",
                 allow_blank=False,
@@ -364,21 +664,63 @@ class Reader(App[None]):
 
     def on_mount(self) -> None:
         self.layout_panes()
-        self.set_interval(1.0, self.refresh_read_state)
+        self.set_interval(60.0, self.poll_feed_version)
+        self.set_interval(60.0, self.apply_clock_theme)
+        self.theme_changed_signal.subscribe(self, lambda _theme: self.restyle())
         self.query_one("#headlines", OptionList).focus()
         self.start()
+
+    def apply_clock_theme(self) -> None:
+        """Follow the local clock, but only when the clock's pick changes, so a
+        theme chosen from the command palette holds until the next boundary."""
+        name = theme_for_hour(time.localtime().tm_hour)
+        if name == self.clock_theme:
+            return
+        self.clock_theme = name
+        self.theme = name
+        PALETTE.update(PALETTES[name])
+
+    def restyle(self) -> None:
+        """Re-render Rich-styled text (headlines, heading, counts) in the
+        palette of the current theme; CSS-styled widgets follow on their own."""
+        PALETTE.update(PALETTES.get(self.theme, DARK_PALETTE))
+        if not self.query("#headlines"):
+            return
+        headlines = self.query_one("#headlines", OptionList)
+        widths = self._row_widths or (0, 0, 0)
+        for story in self.stories:
+            headlines.replace_option_prompt(
+                str(story.id), headline(story, story.id == self._marked_id, widths)
+            )
+        if selected := self.selected():
+            self.query_one("#story-heading", Static).update(headline(selected))
+        self.context_status()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         if self.setting_up or isinstance(self.focused, Input):
             return False
-        # Read mode exists only while the summary overflows its pane.
-        if action == "read" and (not self.can_read or self.help_open):
+        # Zoom is available for any selected story.
+        if (
+            action == "read"
+            and not self.reading
+            and (not self.can_read or self.help_open)
+        ):
             return False
         # A focused selector owns typing keys, but focus movement and quit must
         # stay reachable or the keyboard gets stuck on the dropdown.
         return not (
             isinstance(self.focused, Select)
-            and action in {"move", "vote", "undo", "read", "refresh", "open_url"}
+            and action
+            in {
+                "move",
+                "vote",
+                "undo",
+                "read",
+                "refresh",
+                "open_url",
+                "copy_url",
+                "cycle_sort",
+            }
         )
 
     def status(self, message: str, *, error: bool = False) -> None:
@@ -395,13 +737,13 @@ class Reader(App[None]):
             return
         counts = self.feed.feedback_counts if self.feed else {}
         line = Text()
-        line.append(f"{len(self.stories)} shown", style="#C6C1B8")
-        line.append(" · ", style="#6B655D")
-        line.append(f"+{counts.get('up', 0)}", style="#A8C7A0")
-        line.append(" ", style="#6B655D")
-        line.append(f"~{counts.get('neutral', 0)}", style="#E5C07B")
-        line.append(" ", style="#6B655D")
-        line.append(f"−{counts.get('down', 0)}", style="#FFB4A6")
+        line.append(f"{len(self.stories)} shown", style=PALETTE["soft"])
+        line.append(" · ", style=PALETTE["sep"])
+        line.append(f"+{counts.get('up', 0)}", style=PALETTE["good"])
+        line.append(" ", style=PALETTE["sep"])
+        line.append(f"~{counts.get('neutral', 0)}", style=PALETTE["warn"])
+        line.append(" ", style=PALETTE["sep"])
+        line.append(f"−{counts.get('down', 0)}", style=PALETTE["bad"])
         widget = self.query_one("#status", Static)
         widget.update(line)
         widget.set_class(False, "error")
@@ -417,16 +759,21 @@ class Reader(App[None]):
         self.selection_serial += 1
         self.workers.cancel_group(self, "summary")
         self.query_one("#summary", Markdown).update(feed_failure_notice(detail))
-        self.schedule_read_state()
 
     @work(group="startup", exclusive=True)
     async def start(self) -> None:
         try:
             if self.api is None:
                 profile = load_profile(self.config_path)
-                if profile is None or (self.server and self.server != profile.server):
+                # Only an explicit --server overrides the saved profile's server;
+                # the default must not force setup for a profile saved elsewhere.
+                if profile is None or (
+                    self.explicit_server and self.explicit_server != profile.server
+                ):
                     self.setup()
                     return
+                # A rejected token reopens setup on the profile's deployment.
+                self.server = profile.server
                 self.api = API(profile.server, profile.token)
             await self.api.validate()
             self.refresh_feed()
@@ -444,10 +791,19 @@ class Reader(App[None]):
         self.summary_story_id = None
         self.selection_serial += 1
         self.workers.cancel_group(self, "summary")
+        self.cancel_summary_requests()
         self.workers.cancel_group(self, "refresh")
         self.workers.cancel_group(self, "vote")
-        self.pending = False
-        self.push_screen(Setup(self.config_path, self.server, message), self.connected)
+        self.workers.cancel_group(self, "impression")
+        self.push_screen(
+            Setup(
+                self.config_path,
+                self.server,
+                message,
+                explicit_server=self.explicit_server,
+            ),
+            self.connected,
+        )
 
     async def connected(self, profile: Profile | None) -> None:
         if profile is None:
@@ -455,12 +811,17 @@ class Reader(App[None]):
             return
         if self.api:
             await self.api.close()
+        self.server = profile.server
         self.api = API(profile.server, profile.token)
+        self.interaction_session = str(uuid4())
         self.feed = None
         self.rated.clear()
+        self.unavailable.clear()
         self.restored.clear()
         self.history.clear()
-        self.target = None
+        self.vote_views.clear()
+        self.reset_summaries()
+        self.prefetch_cooldown_until = 0.0
         self.help_open = False
         self.summary_story_id = None
         self.setting_up = False
@@ -474,6 +835,43 @@ class Reader(App[None]):
             else None
         )
 
+    def meta_widths(self, available: int = 0) -> tuple[int, int, int]:
+        """Per-segment widths so headline `·` separators share columns.
+
+        When *available* (metadata content width) is positive, the domain
+        column is capped with ellipsis so the whole row fits on one line.
+        """
+        widths = [
+            max((_cell_len(headline_domain(s)) for s in self.stories), default=0),
+            max((_cell_len(headline_points(s)) for s in self.stories), default=0),
+            max(
+                (_cell_len(f"💬 {s.comments or 0}") for s in self.stories),
+                default=0,
+            ),
+        ]
+        age_w = max((len(story_age(s)) for s in self.stories), default=0)
+        total = widths[0] + 3 + widths[1] + 3 + widths[2] + 3 + age_w
+        if available > 0 and total > available and widths[0] > 8:
+            widths[0] = max(8, widths[0] - (total - available))
+        return (widths[0], widths[1], widths[2])
+
+    def view_order(self, key: str) -> list[int]:
+        """Story order for a "<sort>:<age>" view as the user sees it."""
+        order = self.feed.orders.get(key, []) if self.feed else []
+        if not key.startswith("explore:"):
+            return order
+        # Explore is a discovery deck: shuffle client-side, since the server
+        # order only reshuffles once per dashboard version and would pin the
+        # deck for hours. Stories already placed keep their position; new
+        # ones are shuffled in after them. Copies: feed.orders is shared.
+        members = set(order)
+        kept = [sid for sid in self.explore_orders.get(key, []) if sid in members]
+        placed = set(kept)
+        fresh = [sid for sid in order if sid not in placed]
+        random.shuffle(fresh)
+        self.explore_orders[key] = kept + fresh
+        return list(self.explore_orders[key])
+
     def rebuild(self, select_id: int | None = None) -> None:
         # Teardown removes nodes before the final messages drain; ignore late
         # rebuilds rather than raising NoMatches.
@@ -485,14 +883,23 @@ class Reader(App[None]):
         sort = self.query_one("#sort", Select).value
         age = self.query_one("#age", Select).value
         lookup = {story.id: story for story in self.feed.stories} if self.feed else {}
-        order = self.feed.orders.get(f"{sort}:{age}", []) if self.feed else []
-        self.stories = [lookup[sid] for sid in order if sid not in self.rated]
+        self.view_key = f"{sort}:{age}"
+        order = self.view_order(self.view_key)
+        self.stories = [
+            lookup[sid]
+            for sid in order
+            if sid not in self.rated and sid not in self.unavailable
+        ][:VIEW_LIMIT]
         headlines = self.query_one("#headlines", OptionList)
         headlines.clear_options()
+        # Option padding (1 each side) plus the 2-cell selection marker.
+        widths = self.meta_widths(max(0, headlines.size.width - 4))
+        self._row_widths = widths
+        self._marked_id = select_id
         headlines.add_options(
             [
                 Option(
-                    headline(s, s.id == select_id),
+                    headline(s, s.id == select_id, widths),
                     id=str(s.id),
                 )
                 for s in self.stories
@@ -502,6 +909,8 @@ class Reader(App[None]):
             headlines.highlighted = next(
                 (i for i, s in enumerate(self.stories) if s.id == select_id), 0
             )
+            if select_id == -1:  # Filter change: no story has this ID.
+                headlines.scroll_home(animate=False)
             # Fresh feed data can carry new points/comments; keep the reading
             # heading in step even when the selection id has not changed.
             if selected := self.selected():
@@ -517,18 +926,24 @@ class Reader(App[None]):
                 if self.feed is None and self.last_error
                 else EMPTY_NOTICE
             )
-            self.schedule_read_state()
         self.query_one("#reading-pane").set_class(bool(self.stories), "has-story")
+        self.layout_panes()
         self.context_status()
 
     def on_select_changed(self, event: Select.Changed) -> None:
+        # Queued changes can outlive their value after rapid sort cycling.
+        # Replaying them into Tabs would start an endless two-way echo.
+        if event.value != event.select.value:
+            return
         tabs_id = f"#{event.select.id}-tabs"
         if event.select.id in {"sort", "age"} and self.query(tabs_id):
             self.query_one(tabs_id, Tabs).active = f"{event.select.id}-{event.value}"
-        self.rebuild()
+        if self.view_key is not None:
+            self.explore_orders.pop(self.view_key, None)  # next visit reshuffles
+        self.rebuild(select_id=-1)
 
     def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
-        if not event.tab.id:
+        if not event.tab.id or event.tab.id != event.tabs.active:
             return
         group, value = event.tab.id.split("-", 1)
         # Teardown and the first layout pass can activate a tab before the
@@ -543,10 +958,22 @@ class Reader(App[None]):
         if self.setting_up or not self.query("#headlines"):
             return
         listing = self.query_one("#headlines", OptionList)
-        for index, story in enumerate(self.stories):
+        widths = self.meta_widths(max(0, listing.size.width - 4))
+        current = self.selected()
+        current_id = current.id if current else None
+        # Only the old and new marker rows change, unless a resize moved the
+        # column widths; re-rendering every row on each keypress is wasted work.
+        if widths == self._row_widths:
+            changed = {self._marked_id, current_id}
+            rows = [s for s in self.stories if s.id in changed]
+        else:
+            rows = self.stories
+        for story in rows:
             listing.replace_option_prompt(
-                str(story.id), headline(story, index == listing.highlighted)
+                str(story.id), headline(story, story.id == current_id, widths)
             )
+        self._row_widths = widths
+        self._marked_id = current_id
         self.schedule_summary()
 
     def schedule_summary(self) -> None:
@@ -555,15 +982,61 @@ class Reader(App[None]):
             return
         if story and story.id != self.summary_story_id:
             self.query_one("#story-heading", Static).update(headline(story))
-            self.query_one("#summary", Markdown).update("Loading summary…")
-            self.query_one("#summary", Markdown).scroll_home(animate=False)
             self.summary_story_id = story.id
             self.selection_serial += 1
-            self.load_summary(story.id, self.selection_serial)
-            self.schedule_read_state()
+            if self.feed is not None:
+                self.record_impression(
+                    Impression(
+                        event_id=str(uuid4()),
+                        client_session_id=self.interaction_session,
+                        story_id=story.id,
+                        dashboard_version=self.feed.version,
+                        position=self.stories.index(story),
+                        sort_mode=str(self.query_one("#sort", Select).value),
+                        age_filter=str(self.query_one("#age", Select).value),
+                        occurred_at=time.time(),
+                    ),
+                    self.selection_serial,
+                )
+            cached = self.summaries.get(story.id)
+            if cached is not None:
+                self.query_one("#summary", Markdown).update(cached)
+                self.schedule_prefetch()
+            else:
+                self.query_one("#summary", Markdown).update("Loading summary…")
+                self.load_summary(story.id, self.selection_serial)
+            self.query_one("#summary", Markdown).scroll_home(animate=False)
+
+    @work(group="impression", exclusive=True)
+    async def record_impression(self, event: Impression, serial: int) -> None:
+        # Only a selected card visible for >=1s counts, not prefetched stories.
+        api = self.api
+        await asyncio.sleep(1.0)
+        selected = self.selected() if self.query("#headlines") else None
+        if (
+            api is None
+            or api is not self.api
+            or serial != self.selection_serial
+            or self.setting_up
+            or self.help_open
+            or selected is None
+            or selected.id != event.story_id
+            or self.feed is None
+            or self.feed.version != event.dashboard_version
+            or str(self.query_one("#sort", Select).value) != event.sort_mode
+            or str(self.query_one("#age", Select).value) != event.age_filter
+        ):
+            return
+        try:
+            await api.impression(event)
+        except APIError:
+            # Best effort; telemetry must never interrupt reading or voting.
+            pass
 
     @work(group="summary", exclusive=True)
-    async def load_summary(self, story_id: int, serial: int) -> None:
+    async def load_summary(
+        self, story_id: int, serial: int, *, force_refresh: bool = False
+    ) -> None:
         await asyncio.sleep(0.3)
         if (
             not self.api
@@ -571,69 +1044,344 @@ class Reader(App[None]):
             or not self.query("#summary")
         ):
             return
-        self.query_one("#summary", Markdown).update("Loading summary…")
-        self.schedule_read_state()
+        previous = self.summaries.get(story_id)
+        if previous is None:
+            self.query_one("#summary", Markdown).update("Loading summary…")
+        else:
+            self.query_one("#summary", Markdown).update(previous)
+            self.status("Regenerating summary…")
         try:
-            summary = await self.api.summary(story_id)
+            summary = await self.await_summary(story_id, force=force_refresh)
             if serial == self.selection_serial and self.query("#summary"):
-                self.query_one("#summary", Markdown).update(summary)
-                self.schedule_read_state()
+                if summary.empty:
+                    # Server found nothing summarizable: same session-hide
+                    # as undisplayable failures, never rendered or cached.
+                    self._hide_story(story_id, "no summarizable content")
+                    return
+                self.query_one("#summary", Markdown).update(summary.text)
+                if summary.provisional:
+                    self.status(
+                        "Summary may be outdated or incomplete. Press r to retry."
+                    )
+                elif force_refresh:
+                    self.status("Summary regenerated.")
+                self.schedule_prefetch()
         except InvalidProfile as exc:
             self.setup(str(exc))
         except APIError as exc:
             if serial == self.selection_serial and self.query("#summary"):
-                self.query_one("#summary", Markdown).update(
-                    "# Summary unavailable\n\nPress **r** to retry."
+                if previous is not None:
+                    self.query_one("#summary", Markdown).update(previous)
+                    self.status(
+                        f"Kept previous summary — refresh failed ({exc}).", error=True
+                    )
+                    return
+                if isinstance(exc, TransientError):
+                    # A dropped connection or rate limit says nothing about
+                    # this story; hiding here would drain the deck while
+                    # the user keeps moving through a cooldown.
+                    self.query_one("#summary", Markdown).update(
+                        f"# Summary unavailable\n\n{exc}\n\n"
+                        "Move away and back, or press **r**, to try again."
+                    )
+                    self.status(str(exc), error=True)
+                    return
+                # Undisplayable summaries leave the deck: the failure may be
+                # transient (quota/cooldown), so this hides for the session
+                # only — refresh restores. InvalidProfile goes to setup above.
+                self._hide_story(story_id, f"summary unavailable ({exc})")
+
+    async def await_summary(
+        self, story_id: int, *, force: bool = False
+    ) -> SummaryResult:
+        """The summary for the selected story, joining any request in flight."""
+        if not force and (text := self.summaries.get(story_id)) is not None:
+            return SummaryResult(text)
+        task = self.summary_task(story_id, force=force)
+        # Start prefetch after the selected request, so it goes out first.
+        self.schedule_prefetch()
+        # Shielded: moving to another story must not cancel shared work.
+        summary = await asyncio.shield(task)
+        if summary is None:
+            # Speculation came back empty-handed (skipped, cache miss, or a
+            # failed cache read); ask for this story directly.
+            summary = await asyncio.shield(self.summary_task(story_id))
+        if summary is None:
+            raise TransientError("Not connected. Press r to retry.")
+        return summary
+
+    def _hide_story(self, story_id: int, reason: str) -> None:
+        """Drop a story from the deck for this session; refresh restores."""
+        self.unavailable.add(story_id)
+        current = [s.id for s in self.stories]
+        try:
+            advance: int | None = current[current.index(story_id) + 1]
+        except (ValueError, IndexError):
+            advance = next((sid for sid in reversed(current) if sid != story_id), None)
+        self.rebuild(select_id=advance)
+        self.status(f"Skipped story {story_id} — {reason}. r restores hidden stories.")
+
+    def prefetch_targets(self, depth: int) -> list[int]:
+        """Upcoming stories, nearby history, and entry points into other sorts."""
+        if depth <= 0 or not self.feed or not self.query("#headlines"):
+            return []
+        story = self.selected()
+        if story is None:
+            return []
+        index = self.stories.index(story)
+        ids = [item.id for item in self.stories[index + 1 : index + 1 + depth]]
+        ids.extend(
+            item.id for item in reversed(self.stories[max(0, index - 3) : index])
+        )
+        age = self.query_one("#age", Select).value
+        sort = self.query_one("#sort", Select).value
+        for other in self.SORT_CYCLE:
+            if other == sort:
+                continue
+            order = self.view_order(f"{other}:{age}")
+            eligible = [
+                sid
+                for sid in order
+                if sid not in self.rated and sid not in self.unavailable
+            ]
+            ids.extend(eligible[: min(depth, 3)])
+        return list(
+            dict.fromkeys(
+                sid
+                for sid in ids
+                if sid != story.id
+                and sid not in self.rated
+                and sid not in self.unavailable
+            )
+        )
+
+    def schedule_prefetch(self) -> None:
+        """Start background requests for stories around the selection."""
+        if self.prefetch <= 0 or not self.api or self.setting_up or self.closing:
+            return
+        now = time.monotonic()
+        if now < self.prefetch_cooldown_until:
+            return
+        generate = set(self.prefetch_targets(self.prefetch_generate))
+        for sid in self.prefetch_targets(self.prefetch):
+            missed = self.prefetch_misses.get(sid)
+            if (
+                sid in self.summaries
+                or sid in self.summary_requests
+                or self.prefetch_retry_at.get(sid, 0.0) > now
+                or (
+                    missed is not None
+                    and now - missed < PREFETCH_COOLDOWN_SECONDS
+                    and sid not in generate
                 )
-                self.schedule_read_state()
-                self.status(str(exc) + " Press r to retry.", error=True)
+            ):
+                continue
+            self.summary_task(sid, background=True)
+
+    def summary_task(
+        self, story_id: int, *, background: bool = False, force: bool = False
+    ) -> asyncio.Task[SummaryResult | None]:
+        """The one request for a story: reuse it, or start it."""
+        task = self.summary_requests.get(story_id)
+        if task is not None and not task.done() and not force:
+            return task
+        if task is not None:
+            task.cancel()
+        task = asyncio.create_task(
+            self.fetch_summary(story_id, background=background, force=force)
+        )
+        self.summary_requests[story_id] = task
+
+        def done(task: asyncio.Task[SummaryResult | None]) -> None:
+            if self.summary_requests.get(story_id) is task:
+                del self.summary_requests[story_id]
+            if not task.cancelled():
+                task.exception()  # Awaiting callers handle it; none may be left.
+
+        task.add_done_callback(done)
+        return task
+
+    def cancel_summary_requests(self, keep: int | None = None) -> None:
+        for sid, task in list(self.summary_requests.items()):
+            if sid != keep:
+                task.cancel()
+
+    def reset_summaries(
+        self, *, keep_text: int | None = None, keep_request: int | None = None
+    ) -> None:
+        """Forget summaries (a new deck may carry new text) and prefetch state."""
+        kept = self.summaries.get(keep_text) if keep_text is not None else None
+        self.summaries.clear()
+        if keep_text is not None and kept is not None:
+            self.summaries[keep_text] = kept
+        self.cancel_summary_requests(keep=keep_request)
+        self.prefetch_retry_at.clear()
+        self.prefetch_misses.clear()
+
+    async def fetch_summary(
+        self, story_id: int, *, background: bool, force: bool
+    ) -> SummaryResult | None:
+        api = self.api
+        if api is None:
+            return None
+        if background:
+            async with self.prefetch_slots:
+                summary = await self.speculate(api, story_id)
+        else:
+            summary = await api.summary(story_id, force_refresh=force)
+        if summary is not None and api is self.api:
+            if summary.provisional or summary.empty:
+                # Shown (or hidden) by the selection, never cached.
+                self.prefetch_retry_at[story_id] = (
+                    time.monotonic() + PREFETCH_COOLDOWN_SECONDS
+                )
+            else:
+                self.summaries[story_id] = summary.text
+                self.prefetch_retry_at.pop(story_id, None)
+        return summary
+
+    def speculation_wanted(self, story_id: int, *, generate: bool = False) -> bool:
+        """Still worth fetching: selected, or inside the current window."""
+        selected = self.selected() if self.query("#headlines") else None
+        if selected is not None and selected.id == story_id:
+            return True
+        if time.monotonic() < self.prefetch_cooldown_until:
+            return False
+        depth = self.prefetch_generate if generate else self.prefetch
+        return story_id in self.prefetch_targets(depth)
+
+    async def speculate(self, api: API, story_id: int) -> SummaryResult | None:
+        """Read the server cache; generate only for stories near the selection.
+
+        Returns None when there is nothing to show yet, so a selection waiting
+        on this request asks for the story directly.
+        """
+        # Recheck after waiting for a slot: navigation can abandon the target.
+        if not self.speculation_wanted(story_id):
+            return None
+        try:
+            summary = await api.cached_summary(story_id)
+            if summary is None:
+                self.prefetch_misses[story_id] = time.monotonic()
+                if self.speculation_wanted(story_id, generate=True):
+                    summary = await api.summary(story_id)
+        except APIError as exc:
+            # Requests already running may finish; nothing new for a minute.
+            self.prefetch_cooldown_until = time.monotonic() + PREFETCH_COOLDOWN_SECONDS
+            if isinstance(exc, (InvalidProfile, TransientError)):
+                raise
+            return None
+        return summary
+
+    def can_poll_feed(self) -> bool:
+        return bool(
+            self.api
+            and self.feed
+            and not self.setting_up
+            and not self.reading
+            and not self.help_open
+            and not any(
+                worker.group in {"refresh", "vote"} and worker.is_running
+                for worker in self.workers
+            )
+        )
+
+    async def poll_feed_version(self) -> None:
+        """Every minute: reload when the server has a newer deck than ours."""
+        if not self.can_poll_feed():
+            return
+        api, feed = self.api, self.feed
+        assert api is not None and feed is not None
+        # A current deck waits for any new version (regen, a vote elsewhere);
+        # a stale one waits for the reranked deck it is missing.
+        wanted = feed.version if feed.ready else feed.target_version
+        try:
+            ready, current = await api.ready(wanted)
+        except APIError:
+            # Passive checks must not replace a usable deck with an error.
+            return
+        # A lower version is a server restart, not an obsolete response.
+        newer = current != feed.version if feed.ready else ready or current < wanted
+        if self.api is api and self.feed is feed and self.can_poll_feed() and newer:
+            self.reload(manual=False)
 
     @work(group="refresh", exclusive=True)
-    async def refresh_feed(self) -> None:
+    async def refresh_feed(self, *, announce: bool = True) -> None:
         if not self.api or self.setting_up:
             return
-        self.status("Refreshing…")
+        if announce:
+            self.status("Refreshing…")
         try:
-            for attempt in range(30):
-                feed = await self.api.feed()
-                self.feed = feed
-                if feed.ready:
-                    self.restored.clear()
-                else:
-                    for restored in self.restored.values():
-                        self.restore_story(restored)
-                # Versions are process-local; a lower target is a valid server reset.
-                if self.target is None or feed.target_version < self.target:
-                    self.target = feed.target_version
-                else:
-                    self.target = max(self.target, feed.target_version)
-                self.rebuild()
-                if feed.ready and feed.version >= self.target:
-                    self.status_mode = "context"
-                    self.last_error = None
-                    self.context_status()
-                    return
-                self.status("Showing available stories while ranking updates…")
-                await asyncio.sleep(1)
-                ready, current = await self.api.ready(self.target)
-                self.target = min(self.target, current)
-                if not ready and attempt == 29:
-                    self.status("Ranking is still updating. Press r to check again.")
+            feed = await self.api.feed()
         except InvalidProfile as exc:
             self.setup(str(exc))
+            return
         except APIError as exc:
-            self.status(
-                ("Showing stale stories. " if self.feed else "")
-                + str(exc)
-                + " Press r to retry.",
-                error=True,
-            )
-            self.show_failure(str(exc))
+            if announce or self.feed is None:
+                self.status(
+                    ("Showing stale stories. " if self.feed else "")
+                    + str(exc)
+                    + " Press r to retry.",
+                    error=True,
+                )
+                self.show_failure(str(exc))
+            return
+        self.feed = feed
+        self.last_error = None
+        if feed.ready:
+            self.restored.clear()
+        else:
+            # Until the reranked deck lands, it may lack undone stories.
+            for restored in self.restored.values():
+                self.restore_story(restored)
+        if announce or (feed.ready and self.status_mode != "error"):
+            # A current deck replaces the ranking notice; errors stay put.
+            self.status_mode = "context"
+        self.rebuild()
+        if announce and not feed.ready:
+            self.status("Showing available stories while ranking updates…")
+
+    SORT_CYCLE: ClassVar[tuple[str, ...]] = (
+        "recommended",
+        "popular",
+        "explore",
+        "date",
+    )
+
+    def action_cycle_sort(self, delta: int = 1) -> None:
+        """Move the sort selector by *delta* steps, wrapping at either end."""
+        select = self.query_one("#sort", Select)
+        try:
+            index = self.SORT_CYCLE.index(str(select.value))
+        except ValueError:
+            index = -1 if delta > 0 else 0
+        select.value = self.SORT_CYCLE[(index + delta) % len(self.SORT_CYCLE)]
 
     def action_refresh(self) -> None:
-        self.help_open = False
-        self.summary_story_id = None
-        self.refresh_feed()
+        self.reload(manual=True)
+
+    def reload(self, *, manual: bool) -> None:
+        """Reload the feed; cached summaries go (a new deck may carry new text).
+
+        The poller's refresh leaves the open story, its summary and scroll
+        alone. A manual r also regenerates the selected summary and restores
+        stories hidden this session.
+        """
+        story = self.selected()
+        keep = story.id if story else None
+        # The old text stays on screen while a forced request regenerates it.
+        self.reset_summaries(keep_text=keep, keep_request=None if manual else keep)
+        if manual:
+            self.help_open = False
+            self.unavailable.clear()
+            self.prefetch_cooldown_until = 0.0
+            self.selection_serial += 1
+            self.summary_story_id = keep
+            if story is None:
+                self.workers.cancel_group(self, "summary")
+            else:
+                self.load_summary(story.id, self.selection_serial, force_refresh=True)
+        self.refresh_feed(announce=manual)
 
     def action_move(self, delta: int) -> None:
         if self.reading:
@@ -648,131 +1396,158 @@ class Reader(App[None]):
             )
 
     def action_vote(self, action: str) -> None:
+        """Hide the story and move on now; the server hears about it next."""
         story = self.selected()
-        if story and not self.pending:
-            self.pending = True
-            self.submit(story, action)
+        if story is None:
+            return
+        self.apply_vote(story)
+        self.submit(story, action)
 
     def action_undo(self) -> None:
-        if self.history and not self.pending:
-            self.pending = True
-            self.submit(self.history[-1], "clear")
+        if self.history:
+            story = self.history[-1]
+            self.apply_undo(story)
+            self.submit(story, "clear")
+
+    def apply_vote(self, story: FeedStory) -> None:
+        index = next((i for i, s in enumerate(self.stories) if s.id == story.id), 0)
+        remaining = [item for item in self.stories if item.id != story.id]
+        next_id = remaining[min(index, len(remaining) - 1)].id if remaining else None
+        self.rated.add(story.id)
+        self.restored.pop(story.id, None)
+        self.history.append(story)
+        self.vote_views[story.id] = [
+            key
+            for key, order in (self.feed.orders.items() if self.feed else ())
+            if story.id in order
+        ]
+        self.rebuild(next_id)
+
+    def apply_undo(self, story: FeedStory) -> None:
+        if story in self.history:
+            self.history.remove(story)
+        self.rated.discard(story.id)
+        self.restored[story.id] = story
+        self.restore_story(story)
+        self.rebuild(story.id)
 
     @work(group="vote")
     async def submit(self, story: FeedStory, action: str) -> None:
-        if not self.api:
-            self.pending = False
+        api = self.api
+        if api is None:
             return
-        self.workers.cancel_group(self, "refresh")
         self.status("Saving vote…")
-        try:
-            self.target = await self.api.vote(story.id, action)
-            if action == "clear":
-                self.history.pop()
-                self.rated.discard(story.id)
-                self.restored[story.id] = story
-                self.restore_story(story)
-                self.rebuild(story.id)
-            else:
-                index = next(
-                    (i for i, item in enumerate(self.stories) if item.id == story.id), 0
-                )
-                remaining = [item for item in self.stories if item.id != story.id]
-                next_id = (
-                    remaining[min(index, len(remaining) - 1)].id if remaining else None
-                )
-                self.rated.add(story.id)
-                self.restored.pop(story.id, None)
-                self.history.append(story)
-                self.rebuild(next_id)
-            self.status("Vote cleared." if action == "clear" else "Vote saved.")
-            self.refresh_feed()
-        except InvalidProfile as exc:
-            self.setup(str(exc))
-        except APIError as exc:
-            self.status(
-                str(exc)
-                + " Vote not confirmed; r refreshes, then check before voting again.",
-                error=True,
-            )
-        finally:
-            self.pending = False
+        # One at a time, so the server sees votes and undos in the order made.
+        async with self.vote_lock:
+            try:
+                target = await api.vote(story.id, action)
+            except InvalidProfile as exc:
+                self.setup(str(exc))
+                return
+            except APIError as exc:
+                if api is self.api:
+                    # Never retried: the server may or may not have it.
+                    if action == "clear":
+                        self.apply_vote(story)
+                    else:
+                        self.apply_undo(story)
+                    self.status(
+                        "Vote not confirmed, so the story is back; check before"
+                        f" voting again. {exc}",
+                        error=True,
+                    )
+                return
+        if api is not self.api:
+            return
+        if self.feed is not None and target > self.feed.version:
+            # The poller loads the reranked deck once the server has it.
+            self.feed = replace(self.feed, target_version=target, ready=False)
+        self.status("Vote cleared." if action == "clear" else "Vote saved.")
 
     def restore_story(self, story: FeedStory) -> None:
+        """Put an undone story back in the views it was voted from, where the
+        server orders it: Date by time, the rest by rank score."""
         if not self.feed:
             return
         if all(item.id != story.id for item in self.feed.stories):
             self.feed.stories.append(story)
-        for age in ("recent", "archive"):
-            for sort in ("recommended", "popular", "explore", "date"):
-                if (
-                    f"{age}_mixed" in story.memberships
-                    and (sort != "popular" or story.popular)
-                    and (sort != "explore" or story.explore)
-                ):
-                    order = self.feed.orders.setdefault(f"{sort}:{age}", [])
-                    if story.id not in order:
-                        order.insert(0, story.id)
+        by_id = {item.id: item for item in self.feed.stories}
+        for key in self.vote_views.get(story.id, []):
+            order = self.feed.orders.setdefault(key, [])
+            if story.id in order:
+                continue
+            by_time = key.startswith("date:")
+
+            def rank(item: FeedStory, by_time: bool = by_time) -> float:
+                return item.time if by_time else item.rank_score
+
+            index = next(
+                (i for i, sid in enumerate(order) if rank(by_id[sid]) < rank(story)),
+                len(order),
+            )
+            order.insert(index, story.id)
 
     def action_open_url(self, field: str) -> None:
         story = self.selected()
         url = getattr(story, field, "") if story else ""
         if urlsplit(url).scheme in {"http", "https"}:
-            webbrowser.open(url)
+            open_in_firefox(url)
         else:
             self.status("No link available for this story.")
+
+    async def action_copy_url(self) -> None:
+        """Copy the comments link, or the article link when there is none."""
+        story = self.selected()
+        url = next(
+            (
+                u
+                for u in ((story.comments_url, story.article_url) if story else ())
+                if urlsplit(u).scheme in {"http", "https"}
+            ),
+            "",
+        )
+        if not url:
+            self.status("No link available for this story.")
+            return
+        # OSC 52 needs terminal support; a system clipboard tool covers the rest.
+        self.copy_to_clipboard(url)
+        # A hung clipboard owner must not freeze the reader.
+        if await asyncio.to_thread(copy_with_system_tool, url):
+            self.status(f"Copied {url}")
+        else:
+            self.status(f"Sent to terminal clipboard (needs OSC 52): {url}")
 
     def layout_panes(self, width: int | None = None) -> None:
         narrow = (self.size.width if width is None else width) < 100
         self.set_class(narrow, "narrow")
         self.set_class(self.reading, "reading")
-        votes = "1 up · 2 neutral · 3 down"
+        votes = "1 up · 2 neutral · 3 down → next story"
         if narrow:
+            # Narrow hints may wrap; the badge key stays listed in ? help.
             if self.reading:
-                hints = f"j/k scroll · Esc back · {votes} · ? help"
+                hints = f"j/k scroll · Enter/Esc back · {votes}"
             elif self.can_read:
-                hints = f"Enter read · {votes} · ? help"
+                hints = f"Enter zoom · {votes} · ? help"
             else:
                 hints = f"j/k move · {votes} · ? help"
         elif self.reading:
-            hints = f"j/k scroll · Esc headlines · {votes} · ? help · q quit"
+            hints = (
+                f"j/k scroll · Enter/Esc back · {votes} · b badges · ? help · q quit"
+            )
         elif self.can_read:
-            hints = f"j/k move · Enter read · {votes} · ? help · q quit"
+            hints = f"j/k move · Enter zoom · {votes} · b badges · ? help · q quit"
         else:
-            hints = f"j/k move · {votes} · ? help · q quit"
+            hints = f"j/k move · {votes} · b badges · ? help · q quit"
         self.query_one("#shortcuts", Static).update(hints)
 
-    def schedule_read_state(self) -> None:
-        """Re-evaluate read mode once the refreshed summary has been laid out.
-
-        The immediate callback catches cached content; the staggered timers
-        catch the layout pass that first reports the summary's overflow.
-        """
-        self.call_after_refresh(self.refresh_read_state)
-        for timer in self._read_timers:
-            timer.stop()
-        self._read_timers = [
-            self.set_timer(delay, self.refresh_read_state) for delay in (0.1, 0.3, 0.6)
-        ]
-
-    def refresh_read_state(self) -> None:
-        """Offer read mode only while the summary overflows its pane.
-
-        Frozen while reading, so expanding the pane cannot flip the state and
-        bounce the layout back and forth.
-        """
-        if self.reading or not self.query("#summary"):
-            return
-        summary = self.query_one("#summary", Markdown)
-        can_read = summary.virtual_size.height > summary.container_size.height
-        if can_read != self.can_read:
-            self.can_read = can_read
-            self.layout_panes()
+    @property
+    def can_read(self) -> bool:
+        """Zoom is offered whenever a story is selected."""
+        return bool(self.query("#headlines")) and self.selected() is not None
 
     def on_resize(self, event: events.Resize) -> None:
         if self.query("#panes"):
             self.layout_panes(event.size.width)
-            self.schedule_read_state()
 
     def focus_summary(self) -> None:
         self.query_one("#summary", Markdown).focus()
@@ -786,21 +1561,30 @@ class Reader(App[None]):
             self.query_one("#summary", Markdown).focus()
         else:
             self.query_one("#headlines", OptionList).focus()
-            self.schedule_read_state()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         self.action_read()
 
     def action_headlines(self) -> None:
-        was_reading = self.reading
         self.reading = False
         self.layout_panes()
         self.query_one("#headlines", OptionList).focus()
         if self.help_open:
             self.help_open = False
             self.schedule_summary()
-        elif was_reading:
-            self.schedule_read_state()
+
+    def action_badge_legend(self) -> None:
+        self.help_open = True
+        self.summary_story_id = None
+        self.selection_serial += 1
+        self.workers.cancel_group(self, "summary")
+        self.query_one("#summary", Markdown).update(
+            "# Badge legend\n\n"
+            "🔥 **Hot** — rising fast · 🏆 **Top** — high score · 💬 **Talk** — many comments\n\n"
+            "🤔 **Unsure** — model uncertain · ✨ **Novel** — unlike your votes · 🎯 **Similar** — matches your upvotes\n\n"
+            "Escape: return to the story. ?: shortcuts."
+        )
+        self.focus_summary()
 
     def action_help(self) -> None:
         self.help_open = True
@@ -808,13 +1592,38 @@ class Reader(App[None]):
         self.selection_serial += 1
         self.workers.cancel_group(self, "summary")
         self.query_one("#summary", Markdown).update(
-            "# Shortcuts\n\nj/k: move the headline list. Arrows: scroll the focused pane. Tab: focus. Escape: close this help.\n\nEnter: expand a summary that overflows its pane, and leave that mode again. 1/2/3: up / neutral / down. u: undo latest vote. o/c: article / comments. r: refresh. ?: this help. q: quit.\n\nUse the selectors for Recommended, Popular, Explore, Date and Recent / Archive. Votes are never automatically retried after network errors."
+            "# Shortcuts\n\n"
+            "## Move\n\n"
+            "- `j` / `k`: move the headline list\n"
+            "- `Tab`: switch focus between panes\n"
+            "- Arrow keys: scroll the focused pane\n\n"
+            "## Read\n\n"
+            "- `Enter`: zoom the TLDR pane (hide the article list)\n"
+            "- `Enter` / `Escape`: return to the article list\n"
+            "- In zoom mode, `j` / `k` scroll the TLDR\n\n"
+            "## Vote\n\n"
+            "- `1` / `2` / `3`: up / neutral / down (advances to next story)\n"
+            "- `u`: undo latest vote\n\n"
+            "## Sort\n\n"
+            "- `s`: cycle sort (Recommended → Popular → Explore → Date)\n"
+            "- `h` / `l`: previous / next sort\n"
+            "- Selectors: sort and Recent / Archive\n\n"
+            "## Other\n\n"
+            "- `o` / `c`: open article / comments\n"
+            "- `y`: copy comments link (article link if none)\n"
+            "- `r`: refresh and regenerate selected summary\n"
+            "- `b`: badge legend\n"
+            "- `?`: this help\n"
+            "- `q`: quit\n"
+            "- `Escape`: close this help\n\n"
+            "Votes are never automatically retried after network errors."
         )
         self.focus_summary()
-        self.schedule_read_state()
 
     async def on_unmount(self) -> None:
+        self.closing = True
         self.selection_serial += 1
         self.workers.cancel_all()
+        self.cancel_summary_requests()
         if self.api:
             await self.api.close()

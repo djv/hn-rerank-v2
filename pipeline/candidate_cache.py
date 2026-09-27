@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Mapping
 
 import numpy as np
@@ -31,6 +31,10 @@ from .ranking import NULL_TRACE, Embedder, RankTrace, _NullTrace
 @dataclass(frozen=True)
 class CandidatePool:
     """A shared snapshot of production candidate stories and their embeddings.
+
+    Stories are ranking copies: ``self_text``, ``top_comments`` and
+    ``article_body`` are empty (~190 MB across ~12k stories on the VPS,
+    2026-09-26). TLDR paths re-read the story from the DB.
 
     ``stories[i]`` and ``embeddings[i]`` always describe the same story.
     """
@@ -60,6 +64,12 @@ class CandidatePool:
         )
         kept_stories = [s for s, keep in zip(self.stories, keep_mask) if keep]
         return kept_stories, self.embeddings[keep_mask]
+
+
+def _ranking_copy(story: Story) -> Story:
+    """Drop the TLDR source text; ranking reads only ``text_content`` (its
+    length), and embeddings are computed before the copy."""
+    return replace(story, self_text="", top_comments="", article_body="")
 
 
 _lock = threading.Lock()
@@ -122,6 +132,7 @@ def get_candidate_pool(
             db, config, user_id=None, exclude_feedback=False, trace=trace
         )
         embeddings = get_or_compute_embeddings(stories, embedder, db)
+        stories = [_ranking_copy(story) for story in stories]
         index_by_id = {story.id: idx for idx, story in enumerate(stories)}
         _pool = CandidatePool(
             stories=tuple(stories),

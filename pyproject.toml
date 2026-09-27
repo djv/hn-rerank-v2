@@ -19,6 +19,9 @@ dependencies = [
 ]
 
 [dependency-groups]
+browser = [
+    "playwright>=1.63.0",
+]
 dev = [
     "pytest>=9.0",
     "pytest-asyncio>=1.3",
@@ -36,8 +39,11 @@ embedding-experiment = [
 [tool.pytest.ini_options]
 pythonpath = ["."]
 asyncio_mode = "auto"
-markers = ["slow: slow tests (~60s); run with `pytest -m slow`"]
-addopts = "-m 'not slow'"
+markers = [
+    "slow: slow tests (~60s); run with `pytest -m slow`",
+    "browser: headless-Chrome page tests; `uv run --group browser pytest -m browser`",
+]
+addopts = "-m 'not slow and not browser'"
 
 [tool.uv.workspace]
 members = [

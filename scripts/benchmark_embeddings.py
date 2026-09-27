@@ -13,7 +13,6 @@ from typing import Any, Sequence
 import numpy as np
 import onnxruntime as ort
 from numpy.typing import NDArray
-from transformers import AutoTokenizer
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -21,6 +20,19 @@ if str(ROOT) not in sys.path:
 
 from database import Database  # noqa: E402
 from pipeline import Config, story_embedding_text  # noqa: E402
+
+# Lazy seam, as in pipeline/ranking.py: `transformers` costs ~0.8s at import
+# and every pytest worker imports this module to collect its tests. Tests
+# patch this name directly.
+AutoTokenizer: Any = None
+
+
+def _tokenizer_cls() -> Any:
+    if AutoTokenizer is not None:
+        return AutoTokenizer
+    from transformers import AutoTokenizer as _Cls
+
+    return _Cls
 
 
 PRODUCTION_BATCH_SIZE = 32
@@ -63,7 +75,7 @@ VARIANT_SPECS: dict[str, VariantSpec] = {
 
 class BenchmarkEmbedder:
     def __init__(self, model_dir: str, variant: VariantSpec) -> None:
-        self.tokenizer: Any = AutoTokenizer.from_pretrained(model_dir)
+        self.tokenizer: Any = _tokenizer_cls().from_pretrained(model_dir)
         session_options = _session_options_for_variant(variant)
         self.session: Any = ort.InferenceSession(
             str(Path(model_dir) / "model.onnx"),
@@ -87,7 +99,9 @@ class BenchmarkEmbedder:
                 max_length=self.max_tokens,
                 return_tensors="np",
             )
-            onnx_inputs = {name: inputs[name] for name in self.input_names if name in inputs}
+            onnx_inputs = {
+                name: inputs[name] for name in self.input_names if name in inputs
+            }
             outputs = self.session.run(None, onnx_inputs)
             token_embeddings = outputs[0]
             attention_mask = inputs["attention_mask"]
@@ -120,7 +134,9 @@ def _session_options_for_variant(variant: VariantSpec) -> Any:
         session_options.add_session_config_entry("session.intra_op.allow_spinning", "0")
         session_options.add_session_config_entry("session.inter_op.allow_spinning", "0")
     if variant.graph_all:
-        session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        session_options.graph_optimization_level = (
+            ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        )
     return session_options
 
 
@@ -139,9 +155,7 @@ def _selected_variants(value: str) -> list[str]:
     variants = _parse_csv(value)
     unknown = sorted(set(variants) - set(VARIANT_SPECS))
     if unknown:
-        raise argparse.ArgumentTypeError(
-            "unknown variant(s): " + ", ".join(unknown)
-        )
+        raise argparse.ArgumentTypeError("unknown variant(s): " + ", ".join(unknown))
     return variants
 
 
@@ -154,10 +168,7 @@ def load_sample_texts(db: Database, sample_size: int, seed: int) -> list[str]:
         FROM stories
         """
     )
-    texts = [
-        story_embedding_text(Database._row_to_story(row)).strip()
-        for row in rows
-    ]
+    texts = [story_embedding_text(Database._row_to_story(row)).strip() for row in rows]
     texts = [text for text in texts if text]
     rng = random.Random(seed)
     rng.shuffle(texts)
@@ -283,7 +294,9 @@ def _baseline_embeddings(model_dir: str, texts: list[str]) -> NDArray[np.float32
 
 
 def _print_table(results: list[dict[str, Any]]) -> None:
-    print("variant                batch  sample  median_ms  docs/sec  ms/doc  min_cosine  max_abs")
+    print(
+        "variant                batch  sample  median_ms  docs/sec  ms/doc  min_cosine  max_abs"
+    )
     for row in results:
         print(
             f"{row['variant']:<22} {row['batch_size']:>5} {row['sample_size']:>7} "
@@ -297,7 +310,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Benchmark local ONNX embedding session and batch-size variants."
     )
-    parser.add_argument("--db", default=None, help="SQLite DB path; defaults to config.")
+    parser.add_argument(
+        "--db", default=None, help="SQLite DB path; defaults to config."
+    )
     parser.add_argument("--config", default="config.toml")
     parser.add_argument("--sample-size", type=int, default=512)
     parser.add_argument("--runs", type=int, default=3)
@@ -336,7 +351,7 @@ def main() -> None:
     if not texts:
         raise SystemExit("No non-empty story embedding texts found.")
 
-    tokenizer = AutoTokenizer.from_pretrained(config.onnx_model_dir)
+    tokenizer = _tokenizer_cls().from_pretrained(config.onnx_model_dir)
     token_stats = token_length_percentiles(tokenizer, texts)
     baseline = _baseline_embeddings(config.onnx_model_dir, texts)
 

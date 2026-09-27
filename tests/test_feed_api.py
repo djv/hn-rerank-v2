@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 from pathlib import Path
@@ -8,10 +9,10 @@ from werkzeug.test import TestResponse
 
 from bs4 import BeautifulSoup
 
+from clients.tui.src.hn_rerank.models import Feed
 from database import Database, Story, User
 from pipeline import Config, RankedStory
-from pipeline.render import DashboardDocument, generate_dashboard_bytes
-from server import Handler, create_app
+from server import DeckState, Handler, create_app
 
 
 def payload(response: TestResponse) -> Any:
@@ -20,16 +21,46 @@ def payload(response: TestResponse) -> Any:
     return data
 
 
+def page_feed(client: Any) -> Any:
+    """The deck the page carries for the client."""
+    script = BeautifulSoup(client.get("/").data, "html.parser").select_one(
+        "script#feed-data"
+    )
+    assert script is not None
+    return json.loads(script.get_text())
+
+
+def same_deck(a: Any, b: Any) -> bool:
+    """Equal feeds, up to Explore's per-render shuffle."""
+
+    def norm(feed: Any) -> Any:
+        orders = {
+            key: sorted(order) if key.startswith("explore:") else order
+            for key, order in feed["orders"].items()
+        }
+        return {**feed, "orders": orders}
+
+    return norm(a) == norm(b)
+
+
 def test_feed_parity_authentication_stale_cache_and_eviction(tmp_path: Path) -> None:
     db = Database(str(tmp_path / "feed.db"))
 
     class Runtime(Handler):
-        _dashboard_cache = {}
+        _decks = {}
         _dashboard_versions = {}
         _cold_stories = []
+        _pool_generation = 1
 
         @classmethod
-        def _trigger_warm(cls, user: User, version: int) -> None:
+        def _trigger_warm(
+            cls,
+            user: User,
+            version: int,
+            delay_s: float = 0.0,
+            *,
+            expedite: bool = True,
+        ) -> None:
             pass
 
     Runtime.db = db
@@ -65,67 +96,59 @@ def test_feed_parity_authentication_stale_cache_and_eviction(tmp_path: Path) -> 
     client.set_cookie("hn_token", user.token)
     response = client.get("/api/feed")
     feed = payload(response)
-    assert response.headers["Cache-Control"] == "no-store"
-    assert feed["version"] == 0 and feed["ready"] is True
-    html = client.get("/").data
-    cards = BeautifulSoup(html, "html.parser").select(".story-card")
-    assert [int(str(card["data-story-id"])) for card in cards] == [
+    parsed = Feed.parse(feed)
+    assert parsed.api_version == 1
+    assert [story.badges for story in parsed.stories] == [
+        ["\U0001f525"],
+        ["\u2728"],
+        [],
+    ]
+    assert parsed.stories[0].badge_details[0].kind == "hot"
+    assert parsed.stories[0].badge_details[0].icon == "🔥"
+    assert parsed.stories[0].badge_details[0].tooltip
+    assert parsed.stories[0].domain == "example.org"
+    assert [story.id for story in parsed.stories] == [
         story["id"] for story in feed["stories"]
     ]
-    for age in ("recent", "archive"):
-        for sort in ("recommended", "popular", "explore", "date"):
-            matching = [
-                c
-                for c in cards
-                if f"{age}_mixed" in str(c["data-combo"]).split()
-                and (
-                    sort not in {"popular", "explore"} or c[f"data-sort-{sort}"] == "1"
-                )
-            ]
-            matching.sort(
-                key=lambda c: float(
-                    str(c["data-time" if sort == "date" else "data-score"])
-                ),
-                reverse=True,
-            )
-            assert feed["orders"][f"{sort}:{age}"] == [
-                int(str(c["data-story-id"])) for c in matching
-            ]
-    document = generate_dashboard_bytes(
-        ranked, Runtime.config, db, user.id, user.token, 0, 0
-    )
-    assert isinstance(document, DashboardDocument)
-    Runtime._dashboard_cache[f"dashboard_{user.id}"] = (document, time.time(), 0)
+    assert response.headers["Cache-Control"] == "no-store"
+    # No votes: the shared cold deck is this user's current deck.
+    assert feed["version"] == 1 and feed["ready"] is True
+    assert same_deck(page_feed(client), feed)
+    Runtime._decks[user.id] = DeckState(ranked, time.time(), 1)
     for item in ranked:
         db.upsert_story(item.story)
     vote = client.post("/api/feedback", json={"story_id": 1, "action": "up"})
-    assert payload(vote)["target_version"] == 1
+    assert payload(vote)["target_version"] == 2
+    # Repeating a vote changes nothing, so nothing new is ranked.
+    again = client.post("/api/feedback", json={"story_id": 1, "action": "up"})
+    assert payload(again)["target_version"] == 2
     stale = payload(client.get("/api/feed"))
-    assert stale["stories"] == feed["stories"]
-    assert stale["version"] == 0 and stale["target_version"] == 1 and not stale["ready"]
-    assert (
-        BeautifulSoup(client.get("/").data, "html.parser").select(".story-card")
-        == cards
-    )
+    assert not Feed.parse(stale).ready
+    # The stale deck is served without the story just voted on.
+    assert stale["stories"] == feed["stories"][1:]
+    assert stale["version"] == 1 and stale["target_version"] == 2 and not stale["ready"]
+    assert same_deck(page_feed(client), stale)
     client.set_cookie("hn_token", other.token)
     assert payload(client.get("/api/feed"))["feedback_counts"]["up"] == 0
     client.set_cookie("hn_token", user.token)
-    warmed = generate_dashboard_bytes(
-        ranked[1:], Runtime.config, db, user.id, user.token, 1, 1
-    )
-    Runtime._dashboard_cache[f"dashboard_{user.id}"] = (warmed, time.time(), 1)
+    Runtime._decks[user.id] = DeckState(ranked, time.time(), 2)
     assert payload(client.get("/api/feed"))["orders"]["recommended:recent"] == [2]
     assert payload(client.get("/api/feed"))["feedback_counts"]["up"] == 1
     assert (
         payload(client.post("/api/feedback", json={"story_id": 1, "action": "clear"}))[
             "target_version"
         ]
-        == 2
+        == 3
     )
-    Runtime._dashboard_cache["dashboard_other"] = (warmed, time.time() + 1, 1)
-    Runtime._enforce_cache_cap(1)
-    assert f"dashboard_{user.id}" not in Runtime._dashboard_cache
+    Runtime._MAX_CACHED_DECKS = 1
+    Runtime._decks[other.id] = DeckState(ranked, time.time() + 1, 1)
+    with Runtime._dashboard_versions_guard:
+        Runtime._evict_old_decks_locked()
+    assert user.id not in Runtime._decks
+    # No votes left: the shared cold deck is current, even when it is empty.
     Runtime._cold_stories = []
     empty = payload(client.get("/api/feed"))
-    assert not empty["ready"] and empty["stories"] == []
+    assert not Feed.parse(empty).stories
+    assert empty["ready"] and empty["stories"] == []
+    assert empty["version"] == empty["target_version"] == 3
     db.close()

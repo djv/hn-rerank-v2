@@ -48,3 +48,5 @@ jobs:
         env:
           HN_ONNX_MODEL_DIR: ${{ runner.temp }}/onnx-model
         run: uv run pytest tests/ -n 4 -q
+      - name: Browser tests
+        run: uv run --group browser pytest tests/test_browser.py -m browser -q

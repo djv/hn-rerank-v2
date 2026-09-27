@@ -6,10 +6,12 @@ embedding_max_tokens = 4096
 embedding_batch_size = 1
 dashboard_warm_vote_threshold = 10
 dashboard_warm_idle_seconds = 3.0
-feedback_regen_idle_seconds = 300.0
+# Concurrent personalized re-ranks (votes, stale loads, post-regen refreshes
+# of every cached user). 2 leaves CPU headroom for requests on the 4-core VPS.
+warm_pool_size = 2
 non_hn_candidates_enabled = true
-tldr_uncached_per_user_limit = 120
-tldr_uncached_global_limit = 120
+tldr_uncached_per_user_limit = 240
+tldr_uncached_global_limit = 240
 # Mistral Tier 1 is TPM-bound (100K/min; a cold tap costs ~13K tokens over
 # 2 calls), so spread background prefetch starts: 10 candidates x 2 calls
 # over ~30s stays inside the rolling token window when most are cached.
@@ -29,54 +31,36 @@ svm_precomputed_chunk_size = 512
 
 [hn_rewrite.rss]
 feeds = [
-    "https://lobste.rs/top/rss",
-    "https://tildes.net/topics.rss",
     "https://www.lesswrong.com/feed.xml?view=frontpage&karmaThreshold=20",
     "https://rss.slashdot.org/Slashdot/slashdotMain",
     "https://mshibanami.github.io/GitHubTrendingRSS/weekly/all.xml",
     "https://mshibanami.github.io/GitHubTrendingRSS/weekly/python.xml",
     "https://mshibanami.github.io/GitHubTrendingRSS/weekly/haskell.xml",
     "https://www.reddit.com/r/MachineLearning/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/programming/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/LocalLLaMA/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/haskell/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/ocaml/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/selfhosted/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/Bogleheads/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/ExpatFIRE/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/transit/top/.rss?t=week&limit=25",
 
-    "https://www.reddit.com/r/dataengineering/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/awardtravel/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/CreditCards/top/.rss?t=week&limit=25",
 
     # AI / coding agents
     "https://www.reddit.com/r/AI_Agents/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/ChatGPTCoding/top/.rss?t=week&limit=25",
-
-    # Programming languages / CS depth
-    "https://www.reddit.com/r/ProgrammingLanguages/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/Compilers/top/.rss?t=week&limit=25",
 
     # Finance / tax / nomad money
     "https://www.reddit.com/r/financialindependence/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/fatFIRE/top/.rss?t=week&limit=25",
 
-    # Urbanism / cities
-    "https://www.reddit.com/r/Urbanism/top/.rss?t=week&limit=25",
-
     # Travel / gear / nomad logistics
     "https://www.reddit.com/r/onebag/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/digitalnomad/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/expats/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/eupersonalfinance/top/.rss?t=week&limit=25",
 
     "https://simonwillison.net/atom/everything/",
     "https://www.interconnects.ai/feed",
     "https://jack-clark.net/feed/",
-    "https://research.google/blog/rss/",
-    "https://deepmind.google/blog/rss.xml",
-    "https://huggingface.co/blog/feed.xml",
-    "https://github.blog/engineering/feed/",
-    "https://blog.cloudflare.com/rss/",
     "https://www.construction-physics.com/feed",
     "https://www.bitsaboutmoney.com/archive/rss/",
     "https://earlyretirementnow.com/feed/",
@@ -84,9 +68,12 @@ feeds = [
     "https://pedestrianobservations.com/feed/",
     "https://humantransit.org/feed",
     "https://eugeneyan.com/rss/",
-    "https://huyenchip.com/feed.xml",
     "https://www.latent.space/feed",
-    "https://lwn.net/headlines/rss",
+    "https://www.understandingai.org/feed",
+    "https://www.dwarkesh.com/feed",
+    "https://newsletter.pragmaticengineer.com/feed",
+    "https://www.oneusefulthing.org/feed",
+    "https://thezvi.substack.com/feed",
     "https://blog.janestreet.com/feed.xml",
     "https://www.tweag.io/rss.xml",
     "https://well-typed.com/blog/rss2.xml",
@@ -99,13 +86,18 @@ feeds = [
     "https://erikbern.com/feed",
     "https://evidence.nihr.ac.uk/feed/",
     "https://www.quantamagazine.org/feed/",
+    "https://e360.yale.edu/feed.xml",
+    "https://www.sciencedaily.com/rss/top/science.xml",
     "https://aeon.co/feed.rss",
     "https://discourse.haskell.org/latest.rss",
 
     # Software / systems / AI coding
-    "https://danluu.com/atom.xml",
     "https://jvns.ca/atom.xml",
-    "https://pluralistic.net/feed/",
+    # Independent writers
+    "https://dynomight.net/feed.xml",
+    "https://borretti.me/feed.xml",
+    "https://martinalderson.com/feed.xml",
+    "https://vickiboykis.com/index.xml",
 
     # Progress / cities / infrastructure
     "https://worksinprogress.co/rss.xml",

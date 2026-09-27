@@ -3,8 +3,38 @@
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
+import re
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any
+
+
+# C0 controls except tab/newline, DEL, and C1 controls. Server text (titles
+# from third-party feeds, LLM summaries) is untrusted; ESC/CSI/OSC sequences
+# would otherwise reach the terminal raw (Rich only strips a few of these).
+_TERMINAL_CONTROLS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def terminal_safe(text: str) -> str:
+    """Drop control characters that a terminal would interpret."""
+    return _TERMINAL_CONTROLS.sub("", text)
+
+
+def _terminal_safe_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return terminal_safe(value)
+    if isinstance(value, list):
+        return [
+            terminal_safe(item) if isinstance(item, str) else item for item in value
+        ]
+    return value
+
+
+@dataclass(frozen=True)
+class FeedBadge:
+    kind: str
+    icon: str
+    label: str
+    tooltip: str
 
 
 @dataclass(frozen=True)
@@ -21,6 +51,18 @@ class FeedStory:
     memberships: list[str]
     popular: bool
     explore: bool
+    badges: list[str] = field(default_factory=list)
+    badge_details: list[FeedBadge] = field(default_factory=list)
+    best_match_title: str = ""
+    source_label: str = ""
+    domain: str = ""
+    enriched: bool = False
+
+
+# Unknown keys are ignored so a server can add optional fields within
+# api_version 1 without breaking already-installed clients.
+_STORY_FIELDS = frozenset(f.name for f in fields(FeedStory))
+_BADGE_FIELDS = frozenset(f.name for f in fields(FeedBadge))
 
 
 @dataclass(frozen=True)
@@ -39,11 +81,29 @@ class Feed:
     @classmethod
     def parse(cls, data: Any) -> Feed:
         if not isinstance(data, dict):
-            raise TypeError("Invalid feed response")
+            # Parse failures are ValueError by contract (tests/test_boundaries.py).
+            raise ValueError("Invalid feed response")  # noqa: TRY004
         if data.get("api_version") != 1:
             raise ValueError("Unsupported feed API; update hn-rerank.")
         try:
-            stories = [FeedStory(**story) for story in data["stories"]]
+            stories = []
+            for raw_story in data["stories"]:
+                story_data: dict[str, Any] = {
+                    key: _terminal_safe_value(value)
+                    for key, value in dict(raw_story).items()
+                    if key in _STORY_FIELDS
+                }
+                story_data["badge_details"] = [
+                    FeedBadge(
+                        **{
+                            key: _terminal_safe_value(value)
+                            for key, value in dict(badge).items()
+                            if key in _BADGE_FIELDS
+                        }
+                    )
+                    for badge in story_data.get("badge_details", [])
+                ]
+                stories.append(FeedStory(**story_data))
             result = cls(
                 1,
                 stories,
@@ -78,10 +138,36 @@ class Feed:
                     or (story.comments is not None and type(story.comments) is not int)
                     or type(story.popular) is not bool
                     or type(story.explore) is not bool
+                    or isinstance(story.rank_score, bool)
                     or not isinstance(story.rank_score, (int, float))
                     or not math.isfinite(story.rank_score)
                     or not isinstance(story.memberships, list)
                     or any(not isinstance(key, str) for key in story.memberships)
+                    or not isinstance(story.badges, list)
+                    or any(not isinstance(badge, str) for badge in story.badges)
+                    or not isinstance(story.badge_details, list)
+                    or any(
+                        not isinstance(badge, FeedBadge)
+                        or any(
+                            not isinstance(value, str)
+                            for value in (
+                                badge.kind,
+                                badge.icon,
+                                badge.label,
+                                badge.tooltip,
+                            )
+                        )
+                        for badge in story.badge_details
+                    )
+                    or any(
+                        not isinstance(value, str)
+                        for value in (
+                            story.best_match_title,
+                            story.source_label,
+                            story.domain,
+                        )
+                    )
+                    or type(story.enriched) is not bool
                 ):
                     raise ValueError("Invalid story")
             ids = {story.id for story in stories}
@@ -98,5 +184,5 @@ class Feed:
             ):
                 raise ValueError("Invalid feedback counts or duplicate stories")
             return result
-        except (KeyError, TypeError, AttributeError) as exc:
+        except (KeyError, TypeError, AttributeError, OverflowError) as exc:
             raise ValueError("Invalid feed response") from exc

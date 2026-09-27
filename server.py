@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import gc
 import hashlib
 import html
 import json
+import ipaddress
 import logging
 import os
 import random
@@ -16,11 +18,11 @@ import time
 import math
 import uuid
 from collections import deque
-from collections.abc import Callable, Coroutine, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypeVar, cast
 from urllib.parse import urlparse, urlunparse
 
 import feedparser
@@ -28,10 +30,13 @@ import justext
 import trafilatura
 from bs4 import BeautifulSoup
 from bs4.element import Tag
-from flask import Flask, Response, jsonify, redirect, request
+from flask import Flask, Response, g, jsonify, redirect, request
+from werkzeug.wrappers import Response as BaseResponse
 from flask.typing import ResponseReturnValue
 import httpx
 
+from background_cadence import BackgroundCadence
+from clients.tui.src.hn_rerank.models import Feed
 from database import (
     Database,
     InteractionEvent,
@@ -43,7 +48,11 @@ from database import (
 from pipeline import Config, DEFAULT_ENV_PATH, Embedder, RankedStory, is_hn_source
 from llm_limiter import limiter as llm_limiter
 from reddit_limiter import limiter as reddit_limiter
-from http_fetch import fetch_with_urllib_fallback
+import http_fetch
+from single_flight import SingleFlight
+from warm_scheduler import WarmScheduler
+
+_LaneT = TypeVar("_LaneT")
 
 ARTICLE_BODY_CHAR_LIMIT = 30_000
 SELF_TEXT_PROMPT_CHAR_LIMIT = 16_000
@@ -56,13 +65,9 @@ ARTICLE_SECTION_MIN_CHARS = 500
 REDDIT_COMMENTS_CACHE_CHAR_LIMIT = 10_000
 REDDIT_COMMENT_LIMIT = 40
 REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dashboard"
-TLDR_PROMPT_VERSION = "detail-v10"
+TLDR_PROMPT_VERSION = "detail-v14"
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
 _PROMPT_CACHE: dict[str, str] = {}
-# Seam for tests: swap in a controllable timer to make debounce/regen tests
-# deterministic instead of racing the real clock. Production always uses the
-# real threading.Timer.
-_TIMER_FACTORY: Callable[..., threading.Timer] = threading.Timer
 
 
 @dataclass(frozen=True)
@@ -74,21 +79,40 @@ class RateLimitResult:
 class FixedWindowLimiter:
     """Thread-safe fixed-window limiter for local public-demo protection."""
 
+    # How often to drop idle buckets; keys are per-IP/per-user, so without
+    # this the dict grows by one entry per address ever seen.
+    SWEEP_INTERVAL_SECONDS = 300.0
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._buckets: dict[str, deque[float]] = {}
+        self._windows: dict[str, int] = {}
+        self._last_sweep: float | None = None
+
+    def _sweep(self, now: float) -> None:
+        for key in list(self._buckets):
+            bucket = self._buckets[key]
+            if not bucket or bucket[-1] <= now - self._windows[key]:
+                del self._buckets[key]
+                del self._windows[key]
 
     def try_acquire(
         self, checks: Sequence[tuple[str, int, int]], now: float | None = None
     ) -> RateLimitResult:
         now = time.monotonic() if now is None else now
         with self._lock:
+            if self._last_sweep is None:
+                self._last_sweep = now
+            elif now - self._last_sweep >= self.SWEEP_INTERVAL_SECONDS:
+                self._sweep(now)
+                self._last_sweep = now
             retry_after = 0
             normalized: list[tuple[str, int, int, deque[float]]] = []
             for key, limit, window_seconds in checks:
                 if limit <= 0 or window_seconds <= 0:
                     continue
                 bucket = self._buckets.setdefault(key, deque())
+                self._windows[key] = window_seconds
                 cutoff = now - window_seconds
                 while bucket and bucket[0] <= cutoff:
                     bucket.popleft()
@@ -135,8 +159,17 @@ def _normalize_tldr_markdown(text: str) -> str:
         # Single-marker emphasis is italic in CommonMark but bold in the
         # dashboard renderer; standardize on bold so both clients agree and
         # the terminal accent covers every emphasized term.
-        line = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"**\1**", line)
-        line = re.sub(r"(?<![A-Za-z0-9_])_([^_\n]+)_(?![A-Za-z0-9_])", r"**\1**", line)
+        # Repeat until stable: converting an inner pair can expose an outer
+        # one (`_:_X_:_`), and normalization must be idempotent because
+        # cached summaries are normalized again on read.
+        for _ in range(8):
+            previous = line
+            line = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"**\1**", line)
+            line = re.sub(
+                r"(?<![A-Za-z0-9_])_([^_\n]+)_(?![A-Za-z0-9_])", r"**\1**", line
+            )
+            if line == previous:
+                break
         stripped = line.strip()
         if _looks_like_plain_heading(stripped):
             lines.append(f"### {stripped}")
@@ -175,12 +208,19 @@ def _cap_tldr_structure(
             if bullets > max_bullets:
                 continue
         out.append(line)
-    return "\n".join(out).strip()
+    # Trim surrounding blank lines only: stripping spaces would promote an
+    # indented first bullet to top level and break the cap just applied.
+    return "\n".join(out).strip("\n")
 
 
-def _shape_tldr(text: str) -> str:
-    """Normalize model Markdown, then cap its structure for the reader."""
-    return _cap_tldr_structure(_normalize_tldr_markdown(text))
+def _shape_tldr(
+    text: str, *, source_chars: int = 5_000, single_section: bool = False
+) -> str:
+    """Normalize Markdown and preserve the fixed reading-pane allowance."""
+    _, max_bullets, _ = _section_limits(source_chars)
+    if single_section:
+        max_bullets *= 2
+    return _cap_tldr_structure(_normalize_tldr_markdown(text), max_bullets=max_bullets)
 
 
 def _looks_like_plain_heading(line: str) -> bool:
@@ -378,43 +418,50 @@ async def _fetch_article_body_with_result(url: str) -> ArticleFetchResult:
 
     for attempt in range(2):
         try:
-            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-                resp = await client.get(url, headers=headers)
-                if resp.status_code in (429, 503) and attempt == 0:
-                    await asyncio.sleep(1)
-                    continue
-                if resp.status_code == 200:
-                    ct = (resp.headers.get("content-type") or "").lower()
-                    if ct and not ct.startswith(
-                        ("text/html", "application/xhtml+xml", "text/xml", "text/plain")
-                    ):
-                        return ArticleFetchResult(
-                            status=200, error="non_html", permanent=True
-                        )
-                    html = resp.text
-                    if "\x00" in html:
-                        return ArticleFetchResult(
-                            status=200, error="non_html", permanent=True
-                        )
-                elif resp.status_code in (403, 503) and attempt == 0:
-                    status, html, _headers = await fetch_with_urllib_fallback(
-                        client, url, headers
-                    )
-                    if status != 200:
-                        return ArticleFetchResult(
-                            status=status,
-                            error=f"http_{status}",
-                        )
-                    if "\x00" in html:
-                        return ArticleFetchResult(
-                            status=200, error="non_html", permanent=True
-                        )
-                else:
+            # guarded_get connects only to validated public addresses (every
+            # redirect hop) and streams the body under a byte cap.
+            resp = await http_fetch.guarded_get(url, headers, timeout=10.0)
+            if resp.status in (429, 503) and attempt == 0:
+                await asyncio.sleep(1)
+                continue
+            if resp.status == 200:
+                ct = (resp.headers.get("content-type") or "").lower()
+                if ct and not ct.startswith(
+                    ("text/html", "application/xhtml+xml", "text/xml", "text/plain")
+                ):
                     return ArticleFetchResult(
-                        status=resp.status_code,
-                        error=f"http_{resp.status_code}",
-                        permanent=resp.status_code in (404, 410),
+                        status=200, error="non_html", permanent=True
                     )
+                html = resp.text
+                if "\x00" in html:
+                    return ArticleFetchResult(
+                        status=200, error="non_html", permanent=True
+                    )
+            elif resp.status == 403 and attempt == 0:
+                # httpx's TLS fingerprint is often blocked where urllib's
+                # system-OpenSSL handshake gets through (see http_fetch).
+                logging.info("%s: httpx 403, retrying with urllib", url)
+                status, html = await asyncio.to_thread(
+                    http_fetch.guarded_urllib_fetch, url, headers["User-Agent"]
+                )
+                if status != 200:
+                    return ArticleFetchResult(
+                        status=status,
+                        error=f"http_{status}",
+                    )
+                if "\x00" in html:
+                    return ArticleFetchResult(
+                        status=200, error="non_html", permanent=True
+                    )
+            else:
+                return ArticleFetchResult(
+                    status=resp.status,
+                    error=f"http_{resp.status}",
+                    permanent=resp.status in (404, 410),
+                )
+        except http_fetch.UnsafeUrlError as e:
+            logging.warning("article fetch blocked for %s: %s", url, e)
+            return ArticleFetchResult(error="unsafe_url", permanent=True)
         except Exception as e:
             return ArticleFetchResult(error=type(e).__name__)
 
@@ -478,6 +525,10 @@ def _is_low_signal_reddit_comment(author: str, text: str) -> bool:
 LESSWRONG_COMMENT_LIMIT = 20
 MAX_CONTENT_LENGTH = 10**6  # 1MB cap on POST bodies
 MAX_INTERACTION_EVENTS = 64
+TLDR_BUSY_RETRY_AFTER_SECONDS = 5
+# How long a request waits for another request's generation of the same
+# story: as long as clients wait for their own (the TUI allows 150s).
+TLDR_JOIN_TIMEOUT_SECONDS = 150.0
 INTERACTION_EVENT_REQUESTS_PER_MINUTE = 120
 INTERACTION_EVENT_GLOBAL_REQUESTS_PER_MINUTE = 10_000
 
@@ -577,7 +628,9 @@ async def _fetch_reddit_rss_context(url: str | None) -> RedditRssContext | None:
     )
 
 
-async def _fetch_lesswrong_context(post_id: str) -> LessWrongContext | None:
+async def _fetch_lesswrong_context(
+    post_id: str, timeout_s: float = 15.0
+) -> LessWrongContext | None:
     query = """
     query($id: String!) {
       post(input: { selector: { _id: $id } }) {
@@ -589,7 +642,7 @@ async def _fetch_lesswrong_context(post_id: str) -> LessWrongContext | None:
     }
     """
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=timeout_s) as client:
             resp = await client.post(
                 "https://www.lesswrong.com/graphql",
                 json={"query": query, "variables": {"id": post_id}},
@@ -634,7 +687,7 @@ async def _fetch_lesswrong_context(post_id: str) -> LessWrongContext | None:
     )
 
 
-def _usage_int(usage: Any, key: str) -> int | None:
+def _usage_int(usage: object, key: str) -> int | None:
     """Defensive usage-field reader: non-negative ints only, else None."""
     if not isinstance(usage, dict):
         return None
@@ -1022,9 +1075,10 @@ def _max_tokens_for_provider(cfg: LlmProviderConfig, base: int) -> int:
         return 8_192
     if cfg.provider == "gospark" and "reasoning_effort" in cfg.extra:
         # Responses API deducts reasoning from the same max_output_tokens
-        # bucket; measured ~900-1050 reasoning tokens per TLDR call even at
-        # effort=low, so the headroom must cover reasoning + full output.
-        return base + 1200
+        # bucket. Reasoning is usually 350-1000 tokens at effort=low, but a
+        # 1,647-token outlier exhausted the old +1200 cap and dropped the
+        # article section (WORKLOG 2026-09-25); +2000 covers it plus output.
+        return base + 2000
     if cfg.provider in {"cerebras", "groq"} and "reasoning_effort" in cfg.extra:
         return base + 600
     return base
@@ -1060,13 +1114,21 @@ def _tldr_cache_key(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _section_budget(source_chars: int) -> str:
-    """Bullet/word budget scaled by capped source length (thin input → terse)."""
-    if source_chars < 1_500:
-        return "2-3 bullets, max 45 words"
-    if source_chars < 5_000:
-        return "2-4 bullets, max 70 words"
-    return "3-4 bullets, max 90 words"
+def _section_limits(source_chars: int) -> tuple[int, int, int]:
+    """Fixed half-pane allowance; source length does not set the budget."""
+    return 3, 4, 120
+
+
+def _section_budget(source_chars: int, *, single_section: bool = False) -> str:
+    """Fixed reading-pane budget; never depends on client dimensions."""
+    minimum, maximum, words = _section_limits(source_chars)
+    if single_section:
+        minimum, maximum, words = minimum * 2, maximum * 2, words * 2
+    return (
+        f"{minimum}-{maximum} bullets, aim for {words} words. "
+        "Use concrete details and explanations, not just topic labels. "
+        "Use fewer words and bullets if the source is thin; never pad or invent details"
+    )
 
 
 async def generate_detailed_tldr(
@@ -1130,11 +1192,13 @@ async def generate_detailed_tldr(
             ),
         )
         good: list[tuple[str, str]] = []
-        for label, result in (
-            ("Article", article_result),
-            ("Discussion", discussion_result),
+        for label, result, source in (
+            ("Article", article_result, article_section),
+            ("Discussion", discussion_result, comments_section),
         ):
-            if result.ok and (text := _shape_tldr(result.content)):
+            if result.ok and (
+                text := _shape_tldr(result.content, source_chars=len(source))
+            ):
                 good.append((label, text))
         if len(good) == 2:
             return TldrResult(
@@ -1162,12 +1226,16 @@ async def generate_detailed_tldr(
     if article_section:
         name, section = "article_only_v4.txt", article_section
         prompt = _load_prompt(name).format(
-            title=title, article_section=section, budget=_section_budget(len(section))
+            title=title,
+            article_section=section,
+            budget=_section_budget(len(section), single_section=True),
         )
     else:
         name, section = "discussion_only_v4.txt", comments_section
         prompt = _load_prompt(name).format(
-            title=title, comments_section=section, budget=_section_budget(len(section))
+            title=title,
+            comments_section=section,
+            budget=_section_budget(len(section), single_section=True),
         )
 
     result = await _call_llm_for_config(
@@ -1177,7 +1245,11 @@ async def generate_detailed_tldr(
         on_usage=on_usage,
     )
     if result.ok:
-        if text := _shape_tldr(result.content):
+        if text := _shape_tldr(
+            result.content,
+            source_chars=len(section),
+            single_section=True,
+        ):
             return TldrResult(kind="ok", tldr=text)
         return TldrResult(kind="llm_error", error_text="empty LLM response")
     return _llm_error_from(result)
@@ -1248,22 +1320,28 @@ async def _prefetch_tldrs_for_ranked(
     if stale_per_run > 0:
         remaining = [rs for rs in ranked_stories if rs.story.id not in seen]
         cached_keys = db.get_tldr_cache_keys([rs.story.id for rs in remaining])
-        for rs in remaining:
+        keyed = [rs.story.id for rs in remaining if rs.story.id in cached_keys]
+        # Deck stories carry no TLDR source text (candidate pool); read it in
+        # small batches, since this usually stops after a few stale hits.
+        for start in range(0, len(keyed), 100):
             if stale_added >= stale_per_run:
                 break
-            stored_key = cached_keys.get(rs.story.id)
-            if stored_key is None:
-                continue
-            current_key = _tldr_cache_key(
-                title=rs.story.title,
-                self_text=rs.story.self_text or "",
-                top_comments=rs.story.top_comments or "",
-                article_body=rs.story.article_body or "",
-            )
-            if current_key != stored_key:
-                seen.add(rs.story.id)
-                story_ids.append(rs.story.id)
-                stale_added += 1
+            batch = keyed[start : start + 100]
+            by_id = {story.id: story for story in db.get_stories(batch)}
+            for story_id in batch:
+                story = by_id.get(story_id)
+                if stale_added >= stale_per_run or story is None:
+                    continue
+                current_key = _tldr_cache_key(
+                    title=story.title,
+                    self_text=story.self_text or "",
+                    top_comments=story.top_comments or "",
+                    article_body=story.article_body or "",
+                )
+                if current_key != cached_keys[story_id]:
+                    seen.add(story_id)
+                    story_ids.append(story_id)
+                    stale_added += 1
 
     if not story_ids:
         return 0
@@ -1300,13 +1378,24 @@ async def _prefetch_tldrs_for_ranked(
         if index > 0 and stagger > 0:
             await asyncio.sleep(min(index * stagger, 15.0))
         async with sem:
-            result = await generate_detailed_tldr(
-                title,
-                self_text=self_text,
-                top_comments=top_comments,
-                article_body=article_body,
-            )
-        return _maybe_cache_tldr(db, story_id, cache_key, result)
+            # A tap generating this story right now covers it; while this
+            # one runs, taps wait for it instead of starting their own.
+            flight = Handler._tldr_flights.try_lead(story_id)
+            if flight is None:
+                return False
+            reply: TldrReply | None = None
+            try:
+                result = await generate_detailed_tldr(
+                    title,
+                    self_text=self_text,
+                    top_comments=top_comments,
+                    article_body=article_body,
+                )
+                cached = _maybe_cache_tldr(db, story_id, cache_key, result)
+                reply = _tldr_result_reply(db, story_id, result)
+                return cached
+            finally:
+                Handler._tldr_flights.land(story_id, flight, reply)
 
     results = await asyncio.gather(
         *(_prefetch_one(i, sid) for i, sid in enumerate(story_ids)),
@@ -1344,284 +1433,269 @@ SKELETON_HTML = b"""<!DOCTYPE html>
 <body><p>Loading your personalized dashboard...</p></body></html>"""
 
 
+@dataclass(frozen=True)
+class DeckState:
+    """A user's personalized ranking and the dashboard version it was built for.
+
+    HTML and `/api/feed` JSON are rendered from this on every read, so the
+    current version is always rendered in rather than patched into bytes.
+    """
+
+    ranked: list[RankedStory]
+    built_at: float
+    version: int
+
+
+@dataclass(frozen=True)
+class DeckView:
+    """What a read serves: the page, `/api/feed` and `/api/ranking-ready`
+    all come from `Handler._deck_for_user`, so they always agree."""
+
+    ranked: list[RankedStory]
+    # The deck's version; 0 is the cold deck shown while the first warm runs.
+    version: int
+    # The user's current version, which a queued warm is building.
+    current: int
+
+    @property
+    def ready(self) -> bool:
+        return self.version >= self.current
+
+
+def _boot_epoch_ms() -> int:
+    """Where versions start: boot time in ms, so they keep increasing across
+    restarts (a process bumps far less than once per ms)."""
+    return time.time_ns() // 1_000_000
+
+
+def _load_malloc_trim() -> Callable[[int], int] | None:
+    """glibc's malloc_trim, or None on other libcs (macOS, musl)."""
+    try:
+        return ctypes.CDLL("libc.so.6").malloc_trim
+    except (OSError, AttributeError):
+        return None
+
+
+_MALLOC_TRIM = _load_malloc_trim()
+
+
+def _release_freed_heap() -> None:
+    """Return freed heap to the OS. A rank or regen frees hundreds of MB that
+    glibc otherwise keeps in its arenas (VPS probe 2026-09-26: 933 -> 619 MB
+    RSS after one rank)."""
+    if _MALLOC_TRIM is not None:
+        _MALLOC_TRIM(0)
+
+
 class Handler:
+    """Per-user dashboard state machine.
+
+    - Version: ``_pool_generation + _dashboard_versions[user]``. A vote bumps
+      the user's counter; a regen/RSS refresh bumps the generation once, which
+      makes every deck stale. The generation starts at the boot time in ms,
+      so versions only increase, across restarts too, and a cold deck
+      (version 0) is always behind its target.
+    - Deck: ``_deck_for_user`` is the only place a read picks one. No votes:
+      the shared cold deck is current, and nothing is warmed or cached. Votes:
+      the cached deck (fresh when ``deck.version >= version``), or the cold
+      deck as version 0 while the first warm runs. A read never blocks on
+      ranking; it queues a warm when the deck isn't current, and clients
+      poll ``/api/ranking-ready`` until it lands. Voted stories are never
+      served.
+    - Warms: ``_warm_scheduler()`` coalesces requests per user (newest
+      version wins, at most one running per user) on a pool of
+      ``config.warm_pool_size`` workers. Votes debounce through it
+      (``dashboard_warm_idle_seconds``, or immediately at
+      ``dashboard_warm_vote_threshold`` votes).
+    """
+
     config: Config
     db: Database
     embedder: Embedder
     regen_event: threading.Event
-    _dashboard_cache: dict[str, tuple[bytes, float, int]] = {}
+    _decks: dict[int, DeckState] = {}
+    _MAX_CACHED_DECKS = 100
+    _pool_generation: int = _boot_epoch_ms()
     _dashboard_versions: dict[int, int] = {}
     _dashboard_versions_guard = threading.Lock()
+    _scheduler: WarmScheduler[int, User] | None = None
+    _scheduler_guard = threading.Lock()
     _cold_stories: list[RankedStory] = []
     _article_fetch_in_flight: set[int] = set()
     _warm_bg_lock = threading.Lock()
-    _render_locks: dict[int, threading.Lock] = {}
-    _render_locks_guard = threading.Lock()
-    _warmup_requested_versions: dict[int, int] = {}
-    _warmup_last_request_at: dict[int, float] = {}
-    _warmup_timers: dict[int, threading.Timer] = {}
-    _warmup_running_users: set[int] = set()
-    _warmup_in_flight_guard = threading.Lock()
-    _WARM_DEBOUNCE_S: float = 0.0
+    _tldr_prefetch_gate = BackgroundCadence()
     _feedback_warm_counts: dict[int, int] = {}
-    _feedback_warm_versions: dict[int, int] = {}
-    _feedback_warm_timers: dict[int, threading.Timer] = {}
     _feedback_warm_guard = threading.Lock()
-    _feedback_regen_timer: threading.Timer | None = None
-    _feedback_regen_guard = threading.Lock()
     _public_demo_limiter = FixedWindowLimiter()
+    # Uncached TLDR generations in flight (hydration + LLM, up to ~2 min
+    # each). Capped so a burst can't pile up request threads that also
+    # contend for the DB pool with warms and regen.
+    _tldr_generations = 0
+    _tldr_generations_guard = threading.Lock()
+    # Summaries being generated, by story: taps and the warm prefetch share one.
+    _tldr_flights: SingleFlight[int, TldrReply] = SingleFlight()
 
     @classmethod
     def reset_public_demo_limiter(cls) -> None:
         cls._public_demo_limiter = FixedWindowLimiter()
 
     @classmethod
-    def _render_dashboard_for_user(
-        cls, user: User, expected_version: int | None = None
-    ) -> bytes:
-        """Render personalized dashboard with SWR semantics."""
-        request_start = time.perf_counter()
-        cache_key = f"dashboard_{user.id}"
-        if expected_version is None:
-            expected_version = cls._dashboard_version(user.id)
-
-        cached = cls._dashboard_cache.get(cache_key)
-
-        # Cache hit with matching version → return immediately
-        if cached and cached[2] == expected_version:
-            logging.info(
-                "dashboard_render user_id=%s version=%s result=cache_hit elapsed_ms=%.1f cache_age_s=%.1f",
-                user.id,
-                expected_version,
-                (time.perf_counter() - request_start) * 1000,
-                time.time() - cached[1],
-            )
-            return cached[0]
-
-        # Stale cache (wrong version) → return stale, trigger warm
-        if cached:
-            logging.info(
-                "dashboard_render user_id=%s version=%s result=stale_hit cache_version=%s elapsed_ms=%.1f",
-                user.id,
-                expected_version,
-                cached[2],
-                (time.perf_counter() - request_start) * 1000,
-            )
-            cls._trigger_warm(user, expected_version)
-            return _patch_current_version(cached[0], expected_version)
-
-        # No per-user cache → render the cold deck, then warm the
-        # personalized version in the background.
-        n_feedback = sum(cls.db.count_feedback_by_action(user.id).values())
-        if n_feedback > 0:
-            from pipeline import build_cold_deck
-
-            cold_stories = build_cold_deck(
-                cls.db, cls.config, user_id=user.id, embedder=cls.embedder
-            )
-        else:
-            cold_stories = cls._cold_stories
-        if cold_stories:
-            from pipeline import generate_dashboard_bytes
-
-            html = generate_dashboard_bytes(
-                cold_stories,
-                cls.config,
-                cls.db,
-                user.id,
-                user.token,
-                dashboard_version=0,
-                dashboard_latest_version=cls._dashboard_version(user.id),
-            )
-            logging.info(
-                "dashboard_render user_id=%s version=%s result=cold_deck stories=%s elapsed_ms=%.1f",
-                user.id,
-                expected_version,
-                len(cold_stories),
-                (time.perf_counter() - request_start) * 1000,
-            )
-            if n_feedback > 0:
-                cls._trigger_warm(user, expected_version)
-            return html
-
-        # No cache and no cold deck → return skeleton, trigger warm
-        logging.info(
-            "dashboard_render user_id=%s version=%s result=skeleton elapsed_ms=%.1f",
-            user.id,
-            expected_version,
-            (time.perf_counter() - request_start) * 1000,
-        )
-        cls._trigger_warm(user, expected_version)
-        return SKELETON_HTML
+    def _try_start_tldr_generation(cls) -> bool:
+        with cls._tldr_generations_guard:
+            if cls._tldr_generations >= cls.config.tldr_max_concurrent_generations:
+                return False
+            cls._tldr_generations += 1
+            return True
 
     @classmethod
-    def _get_render_lock(cls, user_id: int) -> threading.Lock:
-        with cls._render_locks_guard:
-            lock = cls._render_locks.get(user_id)
-            if lock is None:
-                lock = threading.Lock()
-                cls._render_locks[user_id] = lock
-            return lock
+    def _finish_tldr_generation(cls) -> None:
+        with cls._tldr_generations_guard:
+            cls._tldr_generations = max(0, cls._tldr_generations - 1)
+
+    @classmethod
+    def _render_deck(
+        cls, user: User, ranked: list[RankedStory], version: int, current: int
+    ) -> bytes:
+        from pipeline import generate_dashboard_bytes
+
+        return generate_dashboard_bytes(
+            ranked,
+            cls.config,
+            cls.db,
+            user.id,
+            user.token,
+            dashboard_version=version,
+            dashboard_latest_version=current,
+        )
+
+    @classmethod
+    def _deck_for_user(cls, user: User) -> DeckView:
+        """Pick the deck a read serves; queue a warm when it isn't current."""
+        from pipeline import _voted_story_ids
+
+        current = cls._dashboard_version(user.id)
+        voted = _voted_story_ids(cls.db, user.id)
+        if not voted:
+            # Nothing to personalize: the shared cold deck is current. A deck
+            # left from votes since cleared would only be re-ranked by every
+            # regen for nothing.
+            with cls._dashboard_versions_guard:
+                cls._decks.pop(user.id, None)
+            return DeckView(cls._cold_stories, current, current)
+        deck = cls._decks.get(user.id)
+        if deck is None:
+            # Votes but no deck yet (first read since a restart, or evicted).
+            ranked, version = cls._cold_stories, 0
+        else:
+            ranked, version = deck.ranked, deck.version
+        if version < current:
+            # A stale deck's warm is passive: a queued vote-debounce warm
+            # keeps its delay.
+            cls._trigger_warm(user, current, expedite=deck is None)
+        return DeckView(
+            [item for item in ranked if item.story.id not in voted], version, current
+        )
+
+    @classmethod
+    def _render_dashboard_for_user(cls, user: User) -> bytes:
+        request_start = time.perf_counter()
+        view = cls._deck_for_user(user)
+        if not view.ranked and view.version == 0:
+            # An empty cold deck (first boot before any regen) while the warm
+            # builds this user's deck; the skeleton page reloads itself.
+            html, result = SKELETON_HTML, "skeleton"
+        else:
+            html = cls._render_deck(user, view.ranked, view.version, view.current)
+            result = "current" if view.ready else "stale"
+        logging.info(
+            "dashboard_render user_id=%s version=%s result=%s deck_version=%s"
+            " stories=%s elapsed_ms=%.1f",
+            user.id,
+            view.current,
+            result,
+            view.version,
+            len(view.ranked),
+            (time.perf_counter() - request_start) * 1000,
+        )
+        return html
+
+    @classmethod
+    def _feed_for_user(cls, user: User) -> Feed:
+        from pipeline.render import build_feed
+
+        view = cls._deck_for_user(user)
+        return build_feed(
+            view.ranked,
+            cls.config,
+            cls.db.count_feedback_by_action(user.id),
+            view.version,
+            view.current,
+        )
 
     @classmethod
     def _dashboard_version(cls, user_id: int) -> int:
         with cls._dashboard_versions_guard:
-            return cls._dashboard_versions.get(user_id, 0)
+            return cls._pool_generation + cls._dashboard_versions.get(user_id, 0)
 
     @classmethod
-    def _invalidate_dashboard_cache(cls, user_id: int) -> int:
+    def _bump_user_version(cls, user_id: int) -> int:
         with cls._dashboard_versions_guard:
-            version = cls._dashboard_versions.get(user_id, 0) + 1
-            cls._dashboard_versions[user_id] = version
-            logging.info(
-                "dashboard_cache_invalidated user_id=%s version=%s", user_id, version
-            )
-            return version
+            count = cls._dashboard_versions.get(user_id, 0) + 1
+            cls._dashboard_versions[user_id] = count
+            version = cls._pool_generation + count
+        logging.info("dashboard_version_bumped user_id=%s version=%s", user_id, version)
+        return version
+
+    @classmethod
+    def _warm_scheduler(cls) -> WarmScheduler[int, User]:
+        # Looked up on cls itself so test subclasses get their own pool.
+        with cls._scheduler_guard:
+            scheduler = cls.__dict__.get("_scheduler")
+            if scheduler is None:
+                scheduler = WarmScheduler(
+                    cls._run_warm_job,
+                    workers=cls.config.warm_pool_size,
+                    name="dashboard-warm",
+                )
+                cls._scheduler = scheduler
+            return scheduler
+
+    @classmethod
+    def _trigger_warm(
+        cls,
+        user: User,
+        version: int,
+        delay_s: float = 0.0,
+        *,
+        expedite: bool = True,
+    ) -> None:
+        version = max(version, cls._dashboard_version(user.id))
+        deck = cls._decks.get(user.id)
+        if deck is not None and deck.version >= version:
+            return
+        cls._warm_scheduler().request(
+            user.id, user, version, delay_s, expedite=expedite
+        )
 
     @classmethod
     def _schedule_feedback_warm(cls, user: User, version: int) -> bool:
-        """Schedule a warm at the vote threshold or after an idle pause."""
+        """Warm after an idle pause, or now once enough votes pile up."""
         with cls._feedback_warm_guard:
-            user_id = user.id
-            count = cls._feedback_warm_counts.get(user_id, 0) + 1
-            cls._feedback_warm_counts[user_id] = count
-            cls._feedback_warm_versions[user_id] = version
-            previous = cls._feedback_warm_timers.pop(user_id, None)
-            if previous is not None:
-                previous.cancel()
-
-            if count >= cls.config.dashboard_warm_vote_threshold:
-                cls._feedback_warm_counts[user_id] = 0
-                cls._feedback_warm_versions.pop(user_id, None)
-                threshold_reached = True
-            else:
-                timer = threading.Timer(
-                    cls.config.dashboard_warm_idle_seconds,
-                    cls._feedback_warm_idle_fired,
-                    args=(user,),
-                )
-                timer.daemon = True
-                cls._feedback_warm_timers[user_id] = timer
-                timer.start()
-                threshold_reached = False
-
-        if threshold_reached:
-            cls._trigger_warm(user, version)
+            count = cls._feedback_warm_counts.get(user.id, 0) + 1
+            threshold_reached = count >= cls.config.dashboard_warm_vote_threshold
+            cls._feedback_warm_counts[user.id] = 0 if threshold_reached else count
+        delay_s = 0.0 if threshold_reached else cls.config.dashboard_warm_idle_seconds
+        cls._trigger_warm(user, version, delay_s=delay_s)
         return threshold_reached
 
     @classmethod
-    def _feedback_warm_idle_fired(cls, user: User) -> None:
+    def _run_warm_job(cls, user: User, version: int) -> None:
         with cls._feedback_warm_guard:
-            user_id = user.id
-            timer = cls._feedback_warm_timers.get(user_id)
-            if timer is not threading.current_thread():
-                return
-            cls._feedback_warm_timers.pop(user_id, None)
-            version = cls._feedback_warm_versions.pop(user_id, None)
-            cls._feedback_warm_counts[user_id] = 0
-        if version is not None:
-            cls._trigger_warm(user, version)
-
-    @classmethod
-    def _schedule_feedback_regen(cls) -> None:
-        """Restart the process-wide trailing regeneration timer."""
-        with cls._feedback_regen_guard:
-            previous = cls._feedback_regen_timer
-            if previous is not None:
-                previous.cancel()
-            timer = _TIMER_FACTORY(
-                cls.config.feedback_regen_idle_seconds,
-                cls._feedback_regen_idle_fired,
-            )
-            timer.daemon = True
-            cls._feedback_regen_timer = timer
-            timer.start()
-        logging.info(
-            "feedback_regen_scheduled idle_seconds=%.1f",
-            cls.config.feedback_regen_idle_seconds,
-        )
-
-    @classmethod
-    def _feedback_regen_idle_fired(cls) -> None:
-        with cls._feedback_regen_guard:
-            if cls._feedback_regen_timer is not threading.current_thread():
-                return
-            cls._feedback_regen_timer = None
-        logging.info("feedback_regen_idle_elapsed")
-        cls.regen_event.set()
-
-    @classmethod
-    def _cancel_feedback_regen(cls) -> None:
-        """Retire feedback-delayed work satisfied by a regeneration."""
-        with cls._feedback_regen_guard:
-            timer = cls._feedback_regen_timer
-            cls._feedback_regen_timer = None
-            if timer is not None:
-                timer.cancel()
-        if timer is not None:
-            logging.info("feedback_regen_pending_satisfied")
-
-    @classmethod
-    def _trigger_warm(cls, user: User, version: int) -> None:
-        current_version = cls._dashboard_version(user.id)
-        effective_version = max(version, current_version)
-        with cls._warmup_in_flight_guard:
-            previous_version = cls._warmup_requested_versions.get(user.id)
-            if previous_version is not None and effective_version <= previous_version:
-                return
-            cls._warmup_requested_versions[user.id] = effective_version
-            cls._warmup_last_request_at[user.id] = time.monotonic()
-            cls._schedule_warm_timer_locked(user, cls._WARM_DEBOUNCE_S)
-
-    @classmethod
-    def _schedule_warm_timer_locked(
-        cls, user: User, delay_seconds: float
-    ) -> threading.Timer:
-        previous_timer = cls._warmup_timers.get(user.id)
-        if previous_timer is not None:
-            previous_timer.cancel()
-        timer = threading.Timer(
-            delay_seconds,
-            cls._warm_timer_fired,
-            args=(user,),
-        )
-        timer.daemon = True
-        cls._warmup_timers[user.id] = timer
-        timer.start()
-        return timer
-
-    @classmethod
-    def _warm_timer_fired(cls, user: User) -> None:
-        with cls._warmup_in_flight_guard:
-            timer = cls._warmup_timers.get(user.id)
-            if timer is not threading.current_thread():
-                return
-            requested_version = cls._warmup_requested_versions.get(user.id)
-            last_request_at = cls._warmup_last_request_at.get(user.id)
-            if requested_version is None or last_request_at is None:
-                cls._warmup_timers.pop(user.id, None)
-                return
-            elapsed_s = time.monotonic() - last_request_at
-            remaining_s = cls._WARM_DEBOUNCE_S - elapsed_s
-            if remaining_s > 0:
-                cls._schedule_warm_timer_locked(user, remaining_s)
-                return
-            cls._warmup_timers.pop(user.id, None)
-            if user.id in cls._warmup_running_users:
-                return
-            cls._warmup_running_users.add(user.id)
-
+            cls._feedback_warm_counts.pop(user.id, None)
         try:
-            cls._run_warm_attempt(user, requested_version)
-        except Exception as e:
-            logging.exception(
-                "Failed warming dashboard cache for user_id=%s: %s", user.id, e
-            )
+            cls._run_warm_attempt(user, version)
         finally:
-            try:
-                cls._finish_warm_attempt(user, requested_version)
-            finally:
-                cls._collect_after_warm_attempt()
+            cls._collect_after_warm_attempt()
 
     @classmethod
     def _collect_after_warm_attempt(cls) -> None:
@@ -1630,225 +1704,130 @@ class Handler:
         except Exception:
             logging.debug("warm_gc result=failed", exc_info=True)
             return
+        _release_freed_heap()
         logging.debug("warm_gc result=completed collected=%s", collected)
 
     @classmethod
     def _run_warm_attempt(cls, user: User, requested_version: int) -> None:
-        warm_start = time.perf_counter()
-        cache_key = f"dashboard_{user.id}"
-
-        cached = cls._dashboard_cache.get(cache_key)
-        if cached and cached[2] >= requested_version:
+        deck = cls._decks.get(user.id)
+        if deck is not None and deck.version >= requested_version:
             return
+        # Ranking reads the votes and pool as they are now, so the deck is
+        # at least as new as the current version (a regen may have landed
+        # since this warm was queued).
+        requested_version = max(requested_version, cls._dashboard_version(user.id))
+
+        from pipeline import RankTrace, fast_rerank_for_user
+
+        trace = RankTrace()
+        render_start = time.perf_counter()
+        with trace.stage("rank_total"):
+            final = fast_rerank_for_user(
+                cls.db,
+                cls.config,
+                cls.embedder,
+                user.id,
+                trace=trace,
+            )
+        rank_ms = (time.perf_counter() - render_start) * 1000
 
         with cls._dashboard_versions_guard:
-            if cls._dashboard_versions.get(user.id, 0) < requested_version:
-                logging.info(
-                    "dashboard_warm user_id=%s version=%s result=skipped_stale elapsed_ms=%.1f",
-                    user.id,
-                    requested_version,
-                    (time.perf_counter() - warm_start) * 1000,
-                )
-                return
+            cls._decks[user.id] = DeckState(final, time.time(), requested_version)
+            cls._evict_old_decks_locked()
+        # A vote or regen while ranking: warm again. (A regen only re-warms
+        # cached decks, and this one wasn't cached yet.)
+        cls._trigger_warm(user, cls._dashboard_version(user.id))
 
-        lock = cls._get_render_lock(user.id)
-        with lock:
-            cached = cls._dashboard_cache.get(cache_key)
-            if cached and cached[2] >= requested_version:
-                return
+        logging.info(
+            "dashboard_warm user_id=%s version=%s result=completed rank_ms=%.1f stories=%s",
+            user.id,
+            requested_version,
+            rank_ms,
+            len(final),
+        )
+        logging.info("rank_perf %s", trace.format_log_fields())
 
-            from pipeline import (
-                RankTrace,
-                fast_rerank_for_user,
-                generate_dashboard_bytes,
-            )
-
-            trace = RankTrace()
-            render_start = time.perf_counter()
-            with trace.stage("rank_total"):
-                final = fast_rerank_for_user(
-                    cls.db,
-                    cls.config,
-                    cls.embedder,
-                    user.id,
-                    trace=trace,
-                )
-            rank_ms = (time.perf_counter() - render_start) * 1000
-
-            html_start = time.perf_counter()
-            html = generate_dashboard_bytes(
-                final,
-                cls.config,
-                cls.db,
-                user.id,
-                user.token,
-                dashboard_version=requested_version,
-                dashboard_latest_version=cls._dashboard_version(user.id),
-            )
-            html_ms = (time.perf_counter() - html_start) * 1000
-
-            with cls._dashboard_versions_guard:
-                cached = cls._dashboard_cache.get(cache_key)
-                if cached and cached[2] > requested_version:
-                    logging.info(
-                        "dashboard_warm user_id=%s version=%s result=skipped_newer_cache_after_rank elapsed_ms=%.1f cache_version=%s",
-                        user.id,
-                        requested_version,
-                        (time.perf_counter() - warm_start) * 1000,
-                        cached[2],
-                    )
-                    return
-                cls._dashboard_cache[cache_key] = (
-                    html,
-                    time.time(),
-                    requested_version,
-                )
-            cls._enforce_cache_cap()
-
-            logging.info(
-                "dashboard_warm user_id=%s version=%s result=completed rank_ms=%.1f html_ms=%.1f stories=%s",
+        fields = trace.to_log_fields()
+        stage_sum_ms = sum(
+            value
+            for key, value in fields.items()
+            if key.endswith("_ms")
+            and key != "rank_total_ms"
+            and isinstance(value, (int, float))
+        )
+        if _warm_is_starved(rank_ms, stage_sum_ms):
+            # Starvation signature: the thread was stalled, not computing.
+            # Stages explain <1/3 of wall time (regen contention, pool
+            # exhaustion, or host-level stalls — see WORKLOG 2026-09-08).
+            logging.warning(
+                "dashboard_warm_starved user_id=%s version=%s rank_ms=%.1f"
+                " stage_sum_ms=%.1f model_cache=%s",
                 user.id,
                 requested_version,
                 rank_ms,
-                html_ms,
-                len(final),
+                stage_sum_ms,
+                trace.labels.get("model_cache", ""),
             )
-            logging.info("rank_perf %s", trace.format_log_fields())
+        sample = RankPerfSample(
+            recorded_at=time.time(),
+            user_id=user.id,
+            version=requested_version,
+            rank_total_ms=rank_ms,
+            # HTML is rendered on read now, not in the warm (see DeckState).
+            html_ms=0.0,
+            candidates=int(trace.counts.get("candidates", 0)),
+            feedback_total=int(trace.counts.get("feedback_total", 0)),
+            model_cache=trace.labels.get("model_cache", ""),
+            stories=len(final),
+            fields=fields,
+        )
+        try:
+            cls.db.insert_rank_perf(sample)
+        except Exception:
+            logging.exception("rank_perf persist failed")
 
-            fields = trace.to_log_fields()
-            stage_sum_ms = sum(
-                value
-                for key, value in fields.items()
-                if key.endswith("_ms")
-                and key != "rank_total_ms"
-                and isinstance(value, (int, float))
+        if _wants_background_tasks(cls.config, final):
+            t = threading.Thread(
+                target=lambda: cls._warm_background_tasks(
+                    final,
+                    cls.db,
+                    cls.embedder,
+                    cls.config,
+                    cls.config.tldr_prefetch_per_combo,
+                ),
+                daemon=True,
             )
-            if _warm_is_starved(rank_ms, stage_sum_ms):
-                # Starvation signature: the thread was stalled, not computing.
-                # Stages explain <1/3 of wall time (regen contention, pool
-                # exhaustion, or host-level stalls — see WORKLOG 2026-09-08).
-                logging.warning(
-                    "dashboard_warm_starved user_id=%s version=%s rank_ms=%.1f"
-                    " stage_sum_ms=%.1f model_cache=%s",
-                    user.id,
-                    requested_version,
-                    rank_ms,
-                    stage_sum_ms,
-                    trace.labels.get("model_cache", ""),
-                )
-            sample = RankPerfSample(
-                recorded_at=time.time(),
-                user_id=user.id,
-                version=requested_version,
-                rank_total_ms=rank_ms,
-                html_ms=html_ms,
-                candidates=int(trace.counts.get("candidates", 0)),
-                feedback_total=int(trace.counts.get("feedback_total", 0)),
-                model_cache=trace.labels.get("model_cache", ""),
-                stories=len(final),
-                fields=fields,
-            )
-            try:
-                cls.db.insert_rank_perf(sample)
-            except Exception:
-                logging.exception("rank_perf persist failed")
-
-            per_combo = cls.config.tldr_prefetch_per_combo
-            stale_per_run = cls.config.tldr_prefetch_stale_per_run
-            if cls.config.article_fetch_max_per_run > 0 or (
-                (per_combo > 0 or stale_per_run > 0) and final
-            ):
-                t = threading.Thread(
-                    target=lambda: cls._warm_background_tasks(
-                        final,
-                        cls.db,
-                        cls.embedder,
-                        cls.config,
-                        per_combo,
-                    ),
-                    daemon=True,
-                )
-                t.start()
+            t.start()
 
     @classmethod
-    def _finish_warm_attempt(cls, user: User, completed_version: int) -> None:
-        with cls._warmup_in_flight_guard:
-            user_id = user.id
-            cls._warmup_running_users.discard(user_id)
-            requested_version = cls._warmup_requested_versions.get(user_id)
-            if requested_version is None:
-                cls._warmup_last_request_at.pop(user_id, None)
-                cls._warmup_timers.pop(user_id, None)
-                return
-            if requested_version == completed_version:
-                cls._warmup_requested_versions.pop(user_id, None)
-                cls._warmup_last_request_at.pop(user_id, None)
-                timer = cls._warmup_timers.pop(user_id, None)
-                if timer is not None:
-                    timer.cancel()
-                return
-
-            last_request_at = cls._warmup_last_request_at.get(user_id, time.monotonic())
-            remaining_s = max(
-                0.0, cls._WARM_DEBOUNCE_S - (time.monotonic() - last_request_at)
-            )
-            cls._schedule_warm_timer_locked(user, remaining_s)
-
-    @classmethod
-    def _enforce_cache_cap(cls, max_entries: int = 100) -> None:
-        if len(cls._dashboard_cache) <= max_entries:
+    def _evict_old_decks_locked(cls) -> None:
+        excess = len(cls._decks) - cls._MAX_CACHED_DECKS
+        if excess <= 0:
             return
-        keys = sorted(
-            cls._dashboard_cache.keys(),
-            key=lambda k: cls._dashboard_cache[k][1],
-        )
-        for k in keys[:-max_entries]:
-            del cls._dashboard_cache[k]
+        oldest = sorted(cls._decks, key=lambda uid: cls._decks[uid].built_at)
+        for uid in oldest[:excess]:
+            del cls._decks[uid]
 
     @classmethod
-    def _bump_all_cached_versions(cls) -> None:
-        # Union with cache-derived user_ids, not just _dashboard_versions'
-        # existing keys: a user who has never voted has no entry there (it
-        # implicitly reads as version 0 via `_dashboard_version`), but can
-        # still hold a live `_dashboard_cache` entry from their first
-        # cold-deck render. Without this, such a user's version never
-        # advances past 0, so every future GET / is a permanent cache_hit on
-        # stale bytes — not even a reload fixes it (see WORKLOG 2026-08-28).
-        cache_user_ids = {
-            uid
-            for uid in (_cache_key_user_id(key) for key in cls._dashboard_cache)
-            if uid is not None
-        }
-        with cls._dashboard_versions_guard:
-            all_uids = set(cls._dashboard_versions) | cache_user_ids
-            for uid in all_uids:
-                cls._dashboard_versions[uid] = cls._dashboard_versions.get(uid, 0) + 1
-        logging.info(
-            "bump_all_cached_versions count=%s",
-            len(cls._dashboard_versions),
-        )
+    def _pool_changed(cls) -> None:
+        """New candidates arrived (regen / RSS refresh): every deck is stale.
 
-    @classmethod
-    def _warm_stale_cached_users(cls) -> None:
-        """Proactively warm every user with a live dashboard cache entry.
-
-        Regen and RSS-refresh both bump every tracked user's dashboard
-        version (`_bump_all_cached_versions`) but never re-render anyone's
-        cache — nothing else schedules a warm, so a cached user's bytes just
-        sit stale until their own next request happens to trigger one (see
-        WORKLOG 2026-08-28). Call this right after a version bump so cached
-        decks actually refresh in the background instead of waiting on user
-        activity. Bounded by the existing ~100-entry `_dashboard_cache` cap
-        (`_enforce_cache_cap`), so this can't warm-storm the full user table.
+        Rebuild the shared cold deck, bump the pool generation once, and queue
+        a refresh for each cached user on the bounded warm pool.
         """
-        for key in list(cls._dashboard_cache.keys()):
-            uid = _cache_key_user_id(key)
-            if uid is None:
-                continue
-            user = cls.db.get_user_by_id(uid)
-            if user is None:
-                continue
-            cls._trigger_warm(user, cls._dashboard_version(uid))
+        cls._rebuild_cold_deck()
+        with cls._dashboard_versions_guard:
+            cls._pool_generation += 1
+            cached_user_ids = list(cls._decks)
+        for user_id in cached_user_ids:
+            user = cls.db.get_user_by_id(user_id)
+            if user is not None:
+                cls._trigger_warm(user, cls._dashboard_version(user_id))
+        logging.info(
+            "pool_changed generation=%s refresh_queued=%s",
+            cls._pool_generation,
+            len(cached_user_ids),
+        )
 
     @classmethod
     def _rebuild_cold_deck(cls) -> None:
@@ -1912,79 +1891,37 @@ class Handler:
 
         stale_per_run = config.tldr_prefetch_stale_per_run
         date_top_n = config.tldr_prefetch_date_top_n
-        if (per_combo > 0 or stale_per_run > 0 or date_top_n > 0) and final:
-            asyncio.run(
-                _prefetch_tldrs_for_ranked(
-                    final,
-                    db,
-                    per_combo,
-                    stale_per_run,
-                    date_top_n,
-                    stagger_s=config.tldr_prefetch_stagger_seconds,
-                )
+        if (
+            (per_combo > 0 or stale_per_run > 0 or date_top_n > 0)
+            and final
+            and cls._tldr_prefetch_gate.claim(
+                time.monotonic(), config.tldr_prefetch_interval_seconds
             )
+        ):
+            try:
+                asyncio.run(
+                    _prefetch_tldrs_for_ranked(
+                        final,
+                        db,
+                        per_combo,
+                        stale_per_run,
+                        date_top_n,
+                        stagger_s=config.tldr_prefetch_stagger_seconds,
+                    )
+                )
+            finally:
+                cls._tldr_prefetch_gate.finish()
 
 
-_DASHBOARD_CACHE_KEY_PREFIX = "dashboard_"
-
-
-def _cache_key_user_id(cache_key: str) -> int | None:
-    """Parse the user id out of a ``_dashboard_cache`` key, or ``None``."""
-    if not cache_key.startswith(_DASHBOARD_CACHE_KEY_PREFIX):
-        return None
-    suffix = cache_key[len(_DASHBOARD_CACHE_KEY_PREFIX) :]
-    return int(suffix) if suffix.isdigit() else None
-
-
-_CARDS_START = b"<!--cards:start-->"
-_CARDS_END = b"<!--cards:end-->"
-_CURRENT_VERSION_ATTR = b'data-current-version="'
-
-
-def _patch_current_version(html: bytes, version: int) -> bytes:
-    """Rewrite the ``data-current-version`` attribute to *version*.
-
-    ``data-current-version`` is baked into cached HTML at render time
-    (``dashboard_latest_version`` at the time of that render). A stale-cache
-    response reuses old bytes whose ``data-dashboard-version`` and
-    ``data-current-version`` were equal at render time, so without this patch
-    a stale response silently claims to be current — defeating the client's
-    own ``pageVer < currVer`` staleness check (``templates/index.html``) and
-    leaving it without a warm-poll refill (see WORKLOG 2026-08-28). Byte-level
-    find/replace, no HTML parsing, mirroring ``_extract_cards_fragment``. A
-    no-op (returns *html* unchanged) if the attribute isn't present, e.g. in
-    tests that stub out rendering with plain bytes.
-    """
-    start = html.find(_CURRENT_VERSION_ATTR)
-    if start == -1:
-        return html
-    value_start = start + len(_CURRENT_VERSION_ATTR)
-    end = html.find(b'"', value_start)
-    if end == -1:
-        return html
-    from pipeline.render import DashboardDocument
-
-    patched = html[:value_start] + str(version).encode() + html[end:]
-    return (
-        DashboardDocument(patched, html.feed)
-        if isinstance(html, DashboardDocument)
-        else patched
+def _wants_background_tasks(config: Config, ranked: list[RankedStory]) -> bool:
+    """Whether `Handler._warm_background_tasks` has anything to do for a deck:
+    article bodies to fetch or summaries to prefetch."""
+    return bool(ranked) and (
+        config.article_fetch_max_per_run > 0
+        or config.tldr_prefetch_per_combo > 0
+        or config.tldr_prefetch_stale_per_run > 0
+        or config.tldr_prefetch_date_top_n > 0
     )
-
-
-def _extract_cards_fragment(html: bytes) -> bytes:
-    """Slice the rendered card markup out of a full dashboard render.
-
-    Byte-level find/slice (no HTML parsing) so the fragment is guaranteed
-    to be exactly the markup between the sentinel comments in index.html.
-    Returns an empty fragment for skeleton/cold-deck-less renders, which
-    carry no sentinels and no cards either way.
-    """
-    start = html.find(_CARDS_START)
-    end = html.find(_CARDS_END)
-    if start == -1 or end == -1:
-        return b""
-    return html[start + len(_CARDS_START) : end]
 
 
 def _no_cache_dashboard_response(
@@ -1997,15 +1934,23 @@ def _no_cache_dashboard_response(
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
     if set_session_cookie and user is not None:
-        response.set_cookie(
-            "hn_token",
-            user.token,
-            max_age=31536000,
-            path="/",
-            samesite="Lax",
-            httponly=True,
-        )
+        _set_session_cookie(response, user.token)
     return response
+
+
+def _set_session_cookie(response: BaseResponse, token: str) -> None:
+    # Secure only when the proxy reports https: the app is also reachable
+    # over plain http, where a Secure cookie would never be stored.
+    origin = _flask_request_origin()
+    response.set_cookie(
+        "hn_token",
+        token,
+        max_age=31536000,
+        path="/",
+        samesite="Lax",
+        httponly=True,
+        secure=origin is not None and origin[0] == "https",
+    )
 
 
 def _flask_json_response(
@@ -2036,12 +1981,26 @@ def _flask_user(runtime: type[Handler]) -> User | None:
     return runtime.db.get_user_by_token(token)
 
 
+def _is_local_proxy_hop(hop: str) -> bool:
+    try:
+        return ipaddress.ip_address(hop).is_loopback
+    except ValueError:
+        return False
+
+
 def _flask_client_ip() -> str:
-    forwarded_for = request.headers.get("X-Forwarded-For", "")
-    if forwarded_for:
-        first = forwarded_for.split(",", 1)[0].strip()
-        if first:
-            return first
+    """Rightmost X-Forwarded-For hop that isn't one of our local proxies.
+
+    The leftmost value is whatever the client sent, so keying rate limits on
+    it lets anyone pick their own bucket. Each proxy (Tailscale Funnel, then
+    Caddy with `trusted_proxies`) appends the peer it saw, so walking from the
+    right past loopback hops yields the address our own edge recorded.
+    """
+    hops = request.headers.get("X-Forwarded-For", "").split(",")
+    for hop in reversed(hops):
+        hop = hop.strip()
+        if hop and not _is_local_proxy_hop(hop):
+            return hop
     return request.remote_addr or "127.0.0.1"
 
 
@@ -2222,6 +2181,10 @@ def _handle_flask_feedback(runtime: type[Handler]) -> Response:
                 {"error": "Invalid JSON body"}, status=HTTPStatus.BAD_REQUEST
             )
 
+        if not isinstance(data, dict):
+            return _flask_json_response(
+                {"error": "Invalid feedback"}, status=HTTPStatus.BAD_REQUEST
+            )
         story_id = data.get("story_id")
         action = data.get("action")
         if (
@@ -2233,6 +2196,13 @@ def _handle_flask_feedback(runtime: type[Handler]) -> Response:
                 {"error": "Invalid feedback"}, status=HTTPStatus.BAD_REQUEST
             )
 
+        # Votes reference stories (FK); an unknown id would otherwise fail
+        # the insert as a 500 after spending a quota slot.
+        if action != "clear" and not runtime.db.story_exists(story_id):
+            return _flask_json_response(
+                {"error": "Story not found"}, status=HTTPStatus.NOT_FOUND
+            )
+
         quota = _acquire_feedback_quota(runtime, user)
         if not quota.allowed:
             return _flask_rate_limit_response(
@@ -2241,34 +2211,24 @@ def _handle_flask_feedback(runtime: type[Handler]) -> Response:
             )
 
         if action == "clear":
-            # Clearing a vote that doesn't exist is a no-op: no state
-            # changed, so no dashboard refresh should be queued.
-            if not runtime.db.delete_feedback(user.id, story_id):
-                return _flask_json_response(
-                    {
-                        "ok": True,
-                        "ranking_refresh_queued": False,
-                        "target_version": runtime._dashboard_version(user.id),
-                    }
-                )
+            changed = runtime.db.delete_feedback(user.id, story_id)
         else:
-            runtime.db.upsert_feedback(user.id, story_id, action)
+            changed = runtime.db.upsert_feedback(user.id, story_id, action)
+        if not changed:
+            # Clearing a missing vote or repeating one changes nothing, so
+            # nothing is refreshed (a client retrying a vote it isn't sure
+            # landed gets the version it already has).
+            return _flask_json_response(
+                {"ok": True, "target_version": runtime._dashboard_version(user.id)}
+            )
 
-        # Every vote invalidates immediately. Personalized ranking is
-        # cadence-gated; global candidate regeneration waits for a quiet period.
-        # Stale cached refills remain safe because the client filters voted IDs.
-        version = runtime._invalidate_dashboard_cache(user.id)
-        warm_queued = runtime._schedule_feedback_warm(user, version)
-        runtime._schedule_feedback_regen()
-
-        return _flask_json_response(
-            {
-                "ok": True,
-                "ranking_refresh_queued": warm_queued,
-                "target_version": version,
-                "ranking_idle_seconds": runtime.config.dashboard_warm_idle_seconds,
-            }
-        )
+        # Every vote invalidates immediately; the user's re-rank is
+        # cadence-gated. Votes never trigger a global regeneration: the
+        # candidate pool doesn't depend on them (per-user ranking excludes
+        # voted stories itself).
+        version = runtime._bump_user_version(user.id)
+        runtime._schedule_feedback_warm(user, version)
+        return _flask_json_response({"ok": True, "target_version": version})
     except Exception:
         logging.exception("Error handling feedback")
         return _flask_json_response(
@@ -2276,11 +2236,14 @@ def _handle_flask_feedback(runtime: type[Handler]) -> Response:
         )
 
 
-def _parse_interaction_event(raw_event: Any, user_id: int) -> InteractionEvent:
+def _parse_interaction_event(raw_event: object, user_id: int) -> InteractionEvent:
     """Validate one raw ledger event; raises ValueError on any bad field."""
     event_types = {"impression", "article_open", "comments_open", "dwell"}
     if not isinstance(raw_event, dict):
         raise ValueError("each event must be an object")
+    # JSON objects have string keys; every value stays `object` and is
+    # narrowed field by field below.
+    raw_event = cast("dict[str, object]", raw_event)
     required = {
         "event_id",
         "client_session_id",
@@ -2536,9 +2499,33 @@ def _tldr_tap_probe_growth(
     return (story, True)
 
 
-def _serve_cached_tldr(
+@dataclass(frozen=True)
+class TldrReply:
+    """A `/api/tldr-detail` answer as data, so every request waiting on the
+    same generation can be sent the same one."""
+
+    payload: dict[str, object]
+    status: HTTPStatus = HTTPStatus.OK
+    retry_after_seconds: int | None = None
+
+    def response(self) -> Response:
+        headers = None
+        if self.retry_after_seconds is not None:
+            headers = {"Retry-After": str(self.retry_after_seconds)}
+        return _flask_json_response(self.payload, status=self.status, headers=headers)
+
+
+def _rate_limited_reply(message: str, retry_after_seconds: int) -> TldrReply:
+    return TldrReply(
+        {"error": message, "retry_after": retry_after_seconds},
+        HTTPStatus.TOO_MANY_REQUESTS,
+        retry_after_seconds,
+    )
+
+
+def _cached_tldr_reply(
     cached_tldr: str, story_id: int, cache_key: str, event: str
-) -> Response:
+) -> TldrReply:
     """Log + serve an exact-key cache hit (early or post-enrich)."""
     logging.info(
         "tldr_detail story_id=%s result=%s cache_key=%s",
@@ -2546,12 +2533,10 @@ def _serve_cached_tldr(
         event,
         cache_key[:12],
     )
-    return _flask_json_response({"ok": True, "tldr": cached_tldr, "cached": True})
+    return TldrReply({"ok": True, "tldr": cached_tldr, "cached": True})
 
 
-def _stale_tldr_fallback_response(
-    db: Database, story_id: int, reason: str
-) -> Response | None:
+def _stale_tldr_fallback(db: Database, story_id: int, reason: str) -> TldrReply | None:
     stale_tldr = db.get_any_tldr_for_story(story_id)
     if not stale_tldr:
         return None
@@ -2560,9 +2545,60 @@ def _stale_tldr_fallback_response(
         story_id,
         reason,
     )
-    return _flask_json_response(
-        {"ok": True, "tldr": stale_tldr, "cached": True, "stale": True}
-    )
+    return TldrReply({"ok": True, "tldr": stale_tldr, "cached": True, "stale": True})
+
+
+def _tldr_result_reply(
+    db: Database,
+    story_id: int,
+    result: TldrResult,
+    extra: dict[str, object] | None = None,
+) -> TldrReply:
+    """The reply for a finished generation, from a tap or the prefetch."""
+    if result.kind == "no_content":
+        return TldrReply(
+            {
+                "ok": True,
+                "tldr": "No article body or discussion available to summarize for this story.",
+                "cached": False,
+                # Not persisted to tldr_cache: a later retry (e.g. after
+                # a transient upstream 429 clears) may find real content,
+                # so the client must not treat this as a final answer.
+                "retryable": True,
+                # Machine flag: hydration found nothing summarizable
+                # (short-only comments, blocked article). Clients skip
+                # rendering this as a real summary.
+                "empty": True,
+            }
+        )
+    if result.kind == "llm_error":
+        fallback = _stale_tldr_fallback(db, story_id, "llm_error")
+        if fallback:
+            return fallback
+        if result.error_status in (429, 402):
+            if result.error_status == 402:
+                # Billing refusal (e.g. spend cap): no Retry-After
+                # semantics, so seed the cooldown explicitly. Escalates
+                # with consecutive 402s via the limiter backoff and
+                # self-clears, like a 429.
+                llm_limiter.on_429()
+            return _rate_limited_reply(
+                "Summary provider is cooling down. Please try again later.",
+                max(1, llm_limiter.retry_after_seconds),
+            )
+        return TldrReply(
+            {"error": "Failed to generate TLDR. Please try again later."},
+            HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+    payload: dict[str, object] = {
+        "ok": True,
+        "tldr": result.tldr,
+        "cached": False,
+        **(extra or {}),
+    }
+    if not result.cacheable:
+        payload["retryable"] = True
+    return TldrReply(payload)
 
 
 def _maybe_cache_tldr(
@@ -2581,6 +2617,308 @@ def _maybe_cache_tldr(
     return True
 
 
+@dataclass(frozen=True)
+class _TldrTap:
+    """What the gates learned about a tap, for the generation behind them."""
+
+    story: Story
+    force_refresh: bool
+    needs_active_refresh: bool
+    needs_empty_fetch: bool
+    tap_probed_growth: bool
+    live_comment_count: int | None
+
+
+_UNFINISHED_TLDR_REPLY = TldrReply(
+    {"error": "The summary being generated didn't finish. Please try again."},
+    HTTPStatus.SERVICE_UNAVAILABLE,
+)
+
+
+def _generate_tldr_reply(
+    runtime: type[Handler], user: User, tap: _TldrTap
+) -> TldrReply:
+    """Slot, quota, hydration and the LLM call for one story's summary."""
+    story = tap.story
+    force_refresh = tap.force_refresh
+    needs_active_refresh = tap.needs_active_refresh
+    needs_empty_fetch = tap.needs_empty_fetch
+    tap_probed_growth = tap.tap_probed_growth
+    live_comment_count = tap.live_comment_count
+    article_body = story.article_body or None
+
+    # Before the quota, so a busy rejection doesn't spend it. Released
+    # by the app's teardown_request hook however the request ends.
+    if not runtime._try_start_tldr_generation():
+        fallback = _stale_tldr_fallback(runtime.db, story.id, "busy")
+        if fallback:
+            return fallback
+        return _rate_limited_reply(
+            "Summaries are busy. Please try again in a few seconds.",
+            TLDR_BUSY_RETRY_AFTER_SECONDS,
+        )
+    g.tldr_generation_runtime = runtime
+
+    quota = _acquire_tldr_uncached_quota(runtime, user)
+    if not quota.allowed:
+        fallback = _stale_tldr_fallback(runtime.db, story.id, "quota_denied")
+        if fallback:
+            return fallback
+        return _rate_limited_reply(
+            "Demo TLDR quota reached. Cached summaries still work; please try a new summary later.",
+            quota.retry_after_seconds,
+        )
+
+    t_tap = time.perf_counter()
+    hydrate_ms = 0.0
+    hydrate_hn_ms = 0.0
+    hydrate_src_ms = 0.0
+    hydrate_article_ms = 0.0
+
+    # Hydration lanes (HN thread refresh, Reddit/LW context, article
+    # body) are independent by source — the article lane excludes
+    # reddit/LW sources and the source lane only runs for them — so run
+    # all eligible lanes concurrently instead of back-to-back. Merges
+    # below apply in the original order to preserve semantics.
+    hn_needed = (
+        needs_empty_fetch
+        or needs_active_refresh
+        or tap_probed_growth
+        or (force_refresh and is_hn_source(story.source) and bool(story.top_comments))
+    )
+    src_kind: str | None = None
+    if story.url and (not story.self_text or not story.top_comments):
+        if story.source.startswith("rss_reddit_"):
+            src_kind = "reddit"
+        elif story.source == "rss_lesswrong_com":
+            src_kind = "lesswrong"
+    from pipeline import _is_fetchable_article_url
+
+    article_eligible = (
+        article_body is None
+        and story.url
+        and src_kind is None
+        and len(story.self_text) < 500
+        and _is_fetchable_article_url(story.url)
+    )
+    _lw_post_id: str | None = None
+    if src_kind == "lesswrong" and story.url:
+        _lw_post_id = _extract_lesswrong_post_id(story.url)
+        if not _lw_post_id:
+            src_kind = None
+
+    async def _hn_lane() -> Story | None:
+        from pipeline import fetch_story
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            return await fetch_story(
+                client,
+                story.id,
+                runtime.db,
+                force=needs_active_refresh or tap_probed_growth or force_refresh,
+            )
+
+    async def _src_lane() -> RedditRssContext | LessWrongContext | None:
+        if src_kind == "reddit":
+            assert story.url is not None
+            return await _fetch_reddit_rss_context(story.url)
+        if src_kind == "lesswrong":
+            assert _lw_post_id is not None
+            return await _fetch_lesswrong_context(_lw_post_id)
+        return None
+
+    async def _article_lane() -> ArticleFetchResult | None:
+        assert story.url is not None
+        return await _fetch_article_body_with_result(story.url)
+
+    # Lane results by name; values are the lane return or the caught
+    # Exception (lanes fail independently — see _timed).
+    async def _timed(
+        name: str, coro: Awaitable[_LaneT] | None
+    ) -> tuple[_LaneT | Exception | None, float | None]:
+        """Run one hydration lane; a failure is returned, not raised, so
+        the other lanes still finish. ``None`` lanes are skipped."""
+        if coro is None:
+            return None, None
+        t0 = time.perf_counter()
+        try:
+            return await coro, (time.perf_counter() - t0) * 1000.0
+        except Exception as e:
+            logging.error("TLDR hydration lane %s failed: %r", name, e)
+            return e, (time.perf_counter() - t0) * 1000.0
+
+    async def _gather_hydration() -> tuple[
+        Story | Exception | None,
+        RedditRssContext | LessWrongContext | Exception | None,
+        ArticleFetchResult | Exception | None,
+        dict[str, float],
+    ]:
+        (hn, hn_ms), (src, src_ms), (article, article_ms) = await asyncio.gather(
+            _timed("hn", _hn_lane() if hn_needed else None),
+            _timed("src", _src_lane() if src_kind is not None else None),
+            _timed("article", _article_lane() if article_eligible else None),
+        )
+        timings = {
+            name: ms
+            for name, ms in (
+                ("hn", hn_ms),
+                ("src", src_ms),
+                ("article", article_ms),
+            )
+            if ms is not None
+        }
+        return hn, src, article, timings
+
+    t_hydrate = time.perf_counter()
+    hn_updated: Story | Exception | None = None
+    remote_context: RedditRssContext | LessWrongContext | Exception | None = None
+    article_result: ArticleFetchResult | Exception | None = None
+    if hn_needed or src_kind is not None or article_eligible:
+        try:
+            hn_updated, remote_context, article_result, _timings = asyncio.run(
+                _gather_hydration()
+            )
+            hydrate_hn_ms = _timings.get("hn", 0.0)
+            hydrate_src_ms = _timings.get("src", 0.0)
+            hydrate_article_ms = _timings.get("article", 0.0)
+        except Exception as e:
+            logging.error("Failed to hydrate story for TLDR: %r", e)
+    hydrate_ms = (time.perf_counter() - t_hydrate) * 1000.0
+
+    if isinstance(hn_updated, Story):
+        story = hn_updated
+        if (
+            live_comment_count is not None
+            and (story.comment_count or 0) < live_comment_count
+        ):
+            # Algolia lags Firebase: never move the count backwards
+            # below the live descendants the probe just confirmed.
+            # comment_count_at_fetch keeps Algolia's number — it is
+            # what the summarized comments actually reflect.
+            story = replace(story, comment_count=live_comment_count)
+            runtime.db.upsert_story(story)
+    elif isinstance(hn_updated, Exception):
+        logging.error("Failed to dynamically fetch comments for TLDR: %r", hn_updated)
+
+    article_body = story.article_body or article_body
+
+    # Merge the concurrently fetched source context (same semantics as
+    # the old sequential block; eligibility was snapshotted above).
+    if not isinstance(remote_context, Exception):
+        if remote_context and (remote_context.self_text or remote_context.top_comments):
+            from pipeline import _merge_source_context
+
+            story = _merge_source_context(
+                story, remote_context, article_body, prefer_longer_comments=True
+            )
+            runtime.db.upsert_story(story)
+    else:
+        logging.error("TLDR source-context lane failed: %r", remote_context)
+
+    if article_result is not None and not isinstance(article_result, Exception):
+        from pipeline import compose_story_text
+        from pipeline.enrichment import record_article_fetch_failure_outcome
+
+        result = article_result
+        if result.body:
+            article_body = result.body[:ARTICLE_BODY_CHAR_LIMIT]
+            new_text = compose_story_text(
+                story.title,
+                story.self_text,
+                story.top_comments,
+                article_body,
+            )
+            updated_story = replace(
+                story,
+                article_body=article_body,
+                text_content=new_text,
+            )
+            runtime.db.upsert_story(updated_story)
+            runtime.db.clear_article_fetch_failure(story.id)
+            # Embedding refresh intentionally left to the warm/regen
+            # article-fetch path (pipeline/enrichment.py re-embeds
+            # there); running ONNX encode here would block the tap.
+            story = updated_story
+        else:
+            record_article_fetch_failure_outcome(
+                runtime.db,
+                story.id,
+                story.url or "",
+                status=result.status,
+                error=result.error,
+                permanent=result.permanent,
+            )
+    elif isinstance(article_result, Exception):
+        logging.error("TLDR article lane failed: %r", article_result)
+
+    cache_key = _tldr_cache_key(
+        title=story.title,
+        self_text=story.self_text or "",
+        top_comments=story.top_comments or "",
+        article_body=article_body or "",
+    )
+    cached_tldr = runtime.db.get_tldr_cache(story.id, cache_key)
+    if cached_tldr and not force_refresh:
+        return _cached_tldr_reply(
+            cached_tldr, story.id, cache_key, "post_enrich_cache_hit"
+        )
+
+    t_llm = time.perf_counter()
+    result = asyncio.run(
+        generate_detailed_tldr(
+            story.title,
+            self_text=story.self_text or "",
+            top_comments=story.top_comments or "",
+            article_body=article_body or "",
+        )
+    )
+    llm_ms = (time.perf_counter() - t_llm) * 1000.0
+    tldr_total_ms = (time.perf_counter() - t_tap) * 1000.0
+    if result.kind == "llm_error":
+        logging.warning(
+            "tldr_detail story_id=%s result=llm_error cache_key=%s status=%s error=%s "
+            "tldr_total_ms=%.0f hydrate_ms=%.0f(hnsrc=%.0f/%.0f/art=%.0f) llm_ms=%.0f",
+            story.id,
+            cache_key[:12],
+            result.error_status,
+            result.error_text,
+            tldr_total_ms,
+            hydrate_ms,
+            hydrate_hn_ms,
+            hydrate_src_ms,
+            hydrate_article_ms,
+            llm_ms,
+        )
+        return _tldr_result_reply(runtime.db, story.id, result)
+    if result.kind == "no_content":
+        return _tldr_result_reply(runtime.db, story.id, result)
+    _maybe_cache_tldr(runtime.db, story.id, cache_key, result)
+    logging.info(
+        "tldr_detail story_id=%s result=generated cache_key=%s "
+        "tldr_total_ms=%.0f hydrate_ms=%.0f(hnsrc=%.0f/%.0f/art=%.0f) llm_ms=%.0f "
+        "live=%s summarized_at_fetch=%s",
+        story.id,
+        cache_key[:12],
+        tldr_total_ms,
+        hydrate_ms,
+        hydrate_hn_ms,
+        hydrate_src_ms,
+        hydrate_article_ms,
+        llm_ms,
+        live_comment_count,
+        story.comment_count_at_fetch,
+    )
+    return _tldr_result_reply(
+        runtime.db,
+        story.id,
+        result,
+        {
+            "comment_count_live": live_comment_count,
+            "comment_count_summarized": story.comment_count_at_fetch,
+        },
+    )
+
+
 def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
     try:
         user = _flask_user(runtime)
@@ -2594,7 +2932,7 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
                 {"error": "Invalid JSON body"}, status=HTTPStatus.BAD_REQUEST
             )
 
-        story_id_raw = data.get("story_id")
+        story_id_raw = data.get("story_id") if isinstance(data, dict) else None
         if not isinstance(story_id_raw, int) or isinstance(story_id_raw, bool):
             return _flask_json_response(
                 {"error": "Invalid request: story_id must be an integer"},
@@ -2661,356 +2999,71 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             and not force_refresh
             and not tap_probed_growth
         ):
-            return _serve_cached_tldr(cached_tldr, story.id, cache_key, "cache_hit")
+            return _cached_tldr_reply(
+                cached_tldr, story.id, cache_key, "cache_hit"
+            ).response()
 
         retry_after = llm_limiter.retry_after_seconds
         if retry_after:
             if cached_tldr:
-                return _serve_cached_tldr(cached_tldr, story.id, cache_key, "cache_hit")
-            fallback = _stale_tldr_fallback_response(
-                runtime.db, story.id, "provider_cooldown"
-            )
+                # The text is current, but a requested refresh did not happen.
+                # Mark it retryable rather than disguising this as a normal hit.
+                return _flask_json_response(
+                    {
+                        "ok": True,
+                        "tldr": cached_tldr,
+                        "cached": True,
+                        "retryable": True,
+                        "reason": "provider_cooldown",
+                        "retry_after_seconds": retry_after,
+                    }
+                )
+            fallback = _stale_tldr_fallback(runtime.db, story.id, "provider_cooldown")
             if fallback:
-                return fallback
+                return fallback.response()
             return _flask_rate_limit_response(
                 "Summary provider is cooling down. Please try again later.", retry_after
             )
 
-        quota = _acquire_tldr_uncached_quota(runtime, user)
-        if not quota.allowed:
-            fallback = _stale_tldr_fallback_response(
-                runtime.db, story.id, "quota_denied"
-            )
+        # Cached summaries stay public; spending the LLM budget needs a
+        # session, so a sessionless client can't drain the shared quota.
+        if user is None:
+            fallback = _stale_tldr_fallback(runtime.db, story.id, "no_session")
             if fallback:
-                return fallback
-            return _flask_rate_limit_response(
-                "Demo TLDR quota reached. Cached summaries still work; please try a new summary later.",
-                quota.retry_after_seconds,
-            )
-
-        t_tap = time.perf_counter()
-        hydrate_ms = 0.0
-        hydrate_hn_ms = 0.0
-        hydrate_src_ms = 0.0
-        hydrate_article_ms = 0.0
-
-        # Hydration lanes (HN thread refresh, Reddit/LW context, article
-        # body) are independent by source — the article lane excludes
-        # reddit/LW sources and the source lane only runs for them — so run
-        # all eligible lanes concurrently instead of back-to-back. Merges
-        # below apply in the original order to preserve semantics.
-        hn_needed = (
-            needs_empty_fetch
-            or needs_active_refresh
-            or tap_probed_growth
-            or (
-                force_refresh
-                and is_hn_source(story.source)
-                and bool(story.top_comments)
-            )
-        )
-        src_kind: str | None = None
-        if story.url and (not story.self_text or not story.top_comments):
-            if story.source.startswith("rss_reddit_"):
-                src_kind = "reddit"
-            elif story.source == "rss_lesswrong_com":
-                src_kind = "lesswrong"
-        from pipeline import _is_fetchable_article_url
-
-        article_eligible = (
-            article_body is None
-            and story.url
-            and src_kind is None
-            and len(story.self_text) < 500
-            and _is_fetchable_article_url(story.url)
-        )
-        _lw_post_id: str | None = None
-        if src_kind == "lesswrong" and story.url:
-            _lw_post_id = _extract_lesswrong_post_id(story.url)
-            if not _lw_post_id:
-                src_kind = None
-
-        async def _hn_lane() -> Story | None:
-            from pipeline import fetch_story
-
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                return await fetch_story(
-                    client,
-                    story_id,
-                    runtime.db,
-                    force=needs_active_refresh or tap_probed_growth or force_refresh,
-                )
-
-        async def _src_lane() -> RedditRssContext | LessWrongContext | None:
-            if src_kind == "reddit":
-                assert story.url is not None
-                return await _fetch_reddit_rss_context(story.url)
-            if src_kind == "lesswrong":
-                assert _lw_post_id is not None
-                return await _fetch_lesswrong_context(_lw_post_id)
-            return None
-
-        async def _article_lane() -> ArticleFetchResult | None:
-            assert story.url is not None
-            return await _fetch_article_body_with_result(story.url)
-
-        # Lane results by name; values are the lane return or the caught
-        # Exception (lanes fail independently — see _timed).
-        HydrationOut = dict[
-            str,
-            Story
-            | RedditRssContext
-            | LessWrongContext
-            | ArticleFetchResult
-            | Exception
-            | None,
-        ]
-
-        async def _gather_hydration() -> tuple[
-            Story | Exception | None,
-            RedditRssContext | LessWrongContext | Exception | None,
-            ArticleFetchResult | Exception | None,
-            dict[str, float],
-        ]:
-            tasks: dict[str, Coroutine[Any, Any, object]] = {}
-            if hn_needed:
-                tasks["hn"] = _hn_lane()
-            if src_kind is not None:
-                tasks["src"] = _src_lane()
-            if article_eligible:
-                tasks["article"] = _article_lane()
-            if not tasks:
-                return None, None, None, {}
-
-            async def _timed(name: str, coro: Any) -> tuple[str, Any, float]:
-                t0 = time.perf_counter()
-                try:
-                    return name, await coro, (time.perf_counter() - t0) * 1000.0
-                except Exception as e:
-                    logging.error("TLDR hydration lane %s failed: %r", name, e)
-                    return name, e, (time.perf_counter() - t0) * 1000.0
-
-            gathered = await asyncio.gather(
-                *(_timed(name, coro) for name, coro in tasks.items())
-            )
-            out: HydrationOut = {}
-            timings: dict[str, float] = {}
-            for name, value, ms in gathered:
-                out[name] = value
-                timings[name] = ms
-            # dict.get can't narrow per-key: each lane only ever stores its
-            # own result type (see tasks above), so these casts are safe.
-            return (
-                cast("Story | Exception | None", out.get("hn")),
-                cast(
-                    "RedditRssContext | LessWrongContext | Exception | None",
-                    out.get("src"),
-                ),
-                cast("ArticleFetchResult | Exception | None", out.get("article")),
-                timings,
-            )
-
-        t_hydrate = time.perf_counter()
-        hn_updated: Story | Exception | None = None
-        remote_context: RedditRssContext | LessWrongContext | Exception | None = None
-        article_result: ArticleFetchResult | Exception | None = None
-        if hn_needed or src_kind is not None or article_eligible:
-            try:
-                hn_updated, remote_context, article_result, _timings = asyncio.run(
-                    _gather_hydration()
-                )
-                hydrate_hn_ms = _timings.get("hn", 0.0)
-                hydrate_src_ms = _timings.get("src", 0.0)
-                hydrate_article_ms = _timings.get("article", 0.0)
-            except Exception as e:
-                logging.error("Failed to hydrate story for TLDR: %r", e)
-        hydrate_ms = (time.perf_counter() - t_hydrate) * 1000.0
-
-        if isinstance(hn_updated, Story):
-            story = hn_updated
-            if (
-                live_comment_count is not None
-                and (story.comment_count or 0) < live_comment_count
-            ):
-                # Algolia lags Firebase: never move the count backwards
-                # below the live descendants the probe just confirmed.
-                # comment_count_at_fetch keeps Algolia's number — it is
-                # what the summarized comments actually reflect.
-                story = replace(story, comment_count=live_comment_count)
-                runtime.db.upsert_story(story)
-        elif isinstance(hn_updated, Exception):
-            logging.error(
-                "Failed to dynamically fetch comments for TLDR: %r", hn_updated
-            )
-
-        article_body = story.article_body or article_body
-
-        # Merge the concurrently fetched source context (same semantics as
-        # the old sequential block; eligibility was snapshotted above).
-        if not isinstance(remote_context, Exception):
-            if remote_context and (
-                remote_context.self_text or remote_context.top_comments
-            ):
-                from pipeline import _merge_source_context
-
-                story = _merge_source_context(
-                    story, remote_context, article_body, prefer_longer_comments=True
-                )
-                runtime.db.upsert_story(story)
-        else:
-            logging.error("TLDR source-context lane failed: %r", remote_context)
-
-        if article_result is not None and not isinstance(article_result, Exception):
-            from pipeline import (
-                _article_failure_retry_time,
-                compose_story_text,
-            )
-
-            result = article_result
-            if result.body:
-                article_body = result.body[:ARTICLE_BODY_CHAR_LIMIT]
-                new_text = compose_story_text(
-                    story.title,
-                    story.self_text,
-                    story.top_comments,
-                    article_body,
-                )
-                updated_story = replace(
-                    story,
-                    article_body=article_body,
-                    text_content=new_text,
-                )
-                runtime.db.upsert_story(updated_story)
-                runtime.db.clear_article_fetch_failure(story.id)
-                # Embedding refresh intentionally left to the warm/regen
-                # article-fetch path (pipeline/enrichment.py re-embeds
-                # there); running ONNX encode here would block the tap.
-                story = updated_story
-            else:
-                now_ts = time.time()
-                previous = runtime.db.get_article_fetch_failure(story.id)
-                previous_count = int(previous["failure_count"]) if previous else 0
-                failure_count = previous_count + 1
-                permanent = (
-                    result.permanent
-                    or (result.error == "empty_extraction" and failure_count >= 3)
-                    or (
-                        result.error is not None
-                        and result.error in ("http_401", "http_403")
-                        and failure_count >= 3
-                    )
-                )
-                next_retry_at = (
-                    now_ts + 3650 * 86400
-                    if permanent
-                    else _article_failure_retry_time(failure_count, now_ts)
-                )
-                runtime.db.record_article_fetch_failure(
-                    story.id,
-                    story.url or "",
-                    status=result.status,
-                    error=result.error,
-                    permanent=permanent,
-                    next_retry_at=next_retry_at,
-                )
-        elif isinstance(article_result, Exception):
-            logging.error("TLDR article lane failed: %r", article_result)
-
-        cache_key = _tldr_cache_key(
-            title=story.title,
-            self_text=story.self_text or "",
-            top_comments=story.top_comments or "",
-            article_body=article_body or "",
-        )
-        cached_tldr = runtime.db.get_tldr_cache(story.id, cache_key)
-        if cached_tldr and not force_refresh:
-            return _serve_cached_tldr(
-                cached_tldr, story.id, cache_key, "post_enrich_cache_hit"
-            )
-
-        t_llm = time.perf_counter()
-        result = asyncio.run(
-            generate_detailed_tldr(
-                story.title,
-                self_text=story.self_text or "",
-                top_comments=story.top_comments or "",
-                article_body=article_body or "",
-            )
-        )
-        llm_ms = (time.perf_counter() - t_llm) * 1000.0
-        tldr_total_ms = (time.perf_counter() - t_tap) * 1000.0
-        if result.kind == "no_content":
+                return fallback.response()
             return _flask_json_response(
-                {
-                    "ok": True,
-                    "tldr": "No article body or discussion available to summarize for this story.",
-                    "cached": False,
-                    # Not persisted to tldr_cache: a later retry (e.g. after
-                    # a transient upstream 429 clears) may find real content,
-                    # so the client must not treat this as a final answer.
-                    "retryable": True,
-                }
+                {"error": "No session"}, status=HTTPStatus.UNAUTHORIZED
             )
-        if result.kind == "llm_error":
-            logging.warning(
-                "tldr_detail story_id=%s result=llm_error cache_key=%s status=%s error=%s "
-                "tldr_total_ms=%.0f hydrate_ms=%.0f(hnsrc=%.0f/%.0f/art=%.0f) llm_ms=%.0f",
+
+        # One generation per story: a request for a story already being
+        # generated (another tap, the TUI, the warm prefetch) waits for that
+        # result instead of spending a slot, quota and an LLM call of its own.
+        flight, leading = runtime._tldr_flights.join_or_lead(story.id)
+        if not leading:
+            reply = flight.wait(TLDR_JOIN_TIMEOUT_SECONDS)
+            logging.info(
+                "tldr_detail story_id=%s result=joined finished=%s",
                 story.id,
-                cache_key[:12],
-                result.error_status,
-                result.error_text,
-                tldr_total_ms,
-                hydrate_ms,
-                hydrate_hn_ms,
-                hydrate_src_ms,
-                hydrate_article_ms,
-                llm_ms,
+                reply is not None,
             )
-            fallback = _stale_tldr_fallback_response(runtime.db, story.id, "llm_error")
-            if fallback:
-                return fallback
-            if result.error_status in (429, 402):
-                if result.error_status == 402:
-                    # Billing refusal (e.g. spend cap): no Retry-After
-                    # semantics, so seed the cooldown explicitly. Escalates
-                    # with consecutive 402s via the limiter backoff and
-                    # self-clears, like a 429.
-                    llm_limiter.on_429()
-                return _flask_rate_limit_response(
-                    "Summary provider is cooling down. Please try again later.",
-                    max(1, llm_limiter.retry_after_seconds),
-                )
-            else:
-                error = "Failed to generate TLDR. Please try again later."
-            return _flask_json_response(
-                {"error": error}, status=HTTPStatus.SERVICE_UNAVAILABLE
+            return (reply or _UNFINISHED_TLDR_REPLY).response()
+        reply = None
+        try:
+            reply = _generate_tldr_reply(
+                runtime,
+                user,
+                _TldrTap(
+                    story=story,
+                    force_refresh=force_refresh,
+                    needs_active_refresh=needs_active_refresh,
+                    needs_empty_fetch=needs_empty_fetch,
+                    tap_probed_growth=tap_probed_growth,
+                    live_comment_count=live_comment_count,
+                ),
             )
-        _maybe_cache_tldr(runtime.db, story.id, cache_key, result)
-        logging.info(
-            "tldr_detail story_id=%s result=generated cache_key=%s "
-            "tldr_total_ms=%.0f hydrate_ms=%.0f(hnsrc=%.0f/%.0f/art=%.0f) llm_ms=%.0f "
-            "live=%s summarized_at_fetch=%s",
-            story.id,
-            cache_key[:12],
-            tldr_total_ms,
-            hydrate_ms,
-            hydrate_hn_ms,
-            hydrate_src_ms,
-            hydrate_article_ms,
-            llm_ms,
-            live_comment_count,
-            story.comment_count_at_fetch,
-        )
-        payload = {
-            "ok": True,
-            "tldr": result.tldr,
-            "cached": False,
-            "comment_count_live": live_comment_count,
-            "comment_count_summarized": story.comment_count_at_fetch,
-        }
-        if not result.cacheable:
-            payload["retryable"] = True
-        return _flask_json_response(payload)
+        finally:
+            runtime._tldr_flights.land(story.id, flight, reply)
+        return reply.response()
     except Exception:
         logging.exception("Error handling tldr-detail")
         return _flask_json_response(
@@ -3041,60 +3094,69 @@ def _handle_flask_ranking_ready(runtime: type[Handler]) -> Response:
             {"error": "No session"}, status=HTTPStatus.UNAUTHORIZED
         )
 
-    raw_min_versions = request.args.getlist("min_version")
-    raw_legacy_versions = request.args.getlist("version")
-    if raw_min_versions and raw_legacy_versions:
-        return _invalid_version_response()
-    raw_versions = raw_min_versions or raw_legacy_versions
+    # Clients send the version they wait for; older TUIs also send
+    # target_version, which is ignored.
+    raw_versions = request.args.getlist("min_version")
     if len(raw_versions) != 1:
         return _invalid_version_response()
-
     min_version = _parse_non_negative_version(raw_versions[0])
     if min_version is None:
         return _invalid_version_response()
 
-    raw_target_versions = request.args.getlist("target_version")
-    if len(raw_target_versions) > 1:
-        return _invalid_version_response()
-    target_version = min_version
-    if raw_target_versions:
-        parsed_target = _parse_non_negative_version(raw_target_versions[0])
-        if parsed_target is None:
-            return _invalid_version_response()
-        target_version = parsed_target
-
-    current_version = runtime._dashboard_version(user.id)
-    cached = runtime._dashboard_cache.get(f"dashboard_{user.id}")
-    cached_version = cached[2] if cached is not None else None
-    ready = cached is not None and cached[2] >= min_version
-    ready_version = cached_version if ready else None
-    warm_version = current_version
-    if (cached_version is None or cached_version < warm_version) and (
-        current_version >= min_version
-    ):
-        runtime._trigger_warm(user, warm_version)
-
+    view = runtime._deck_for_user(user)
     return _flask_json_response(
         {
             "ok": True,
-            "ready": ready,
-            "ready_version": ready_version,
-            "min_version": min_version,
-            "target_version": target_version,
-            "current_version": current_version,
-            "cached_version": cached_version,
+            "ready": view.version >= min_version,
+            "current_version": view.current,
         }
     )
+
+
+_PROFILE_SWITCH_PAGE = b"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Switch profile?</title></head>
+<body style="font-family: system-ui, sans-serif; max-width: 32rem; margin: 3rem auto; padding: 0 1rem">
+<h1>Switch profile?</h1>
+<p>This device already has a profile. Switching replaces it here; save its
+profile link first if you want to come back to it.</p>
+<form method="post"><button type="submit">Switch to this profile</button></form>
+<p><a href="../">Keep my current profile</a></p>
+</body></html>
+"""
+
+
+def _profile_switch_confirm_response() -> Response:
+    response = Response(
+        _PROFILE_SWITCH_PAGE,
+        status=HTTPStatus.OK,
+        content_type="text/html; charset=utf-8",
+    )
+    response.headers["Cache-Control"] = "no-store"
+    # The page URL holds a profile token; don't leak it to linked pages.
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
 
 
 def create_app(runtime: type[Handler] = Handler) -> Flask:
     app = Flask(__name__)
 
-    @app.get("/u/<path:token>")
+    @app.teardown_request
+    def release_tldr_generation(_exc: BaseException | None) -> None:
+        held = g.pop("tldr_generation_runtime", None)
+        if held is not None:
+            held._finish_tldr_generation()
+
+    @app.route("/u/<path:token>", methods=["GET", "POST"])
     def profile_link(token: str) -> ResponseReturnValue:
         token = token.strip("/")
         if not token:
             return Response(status=HTTPStatus.BAD_REQUEST)
+        if request.method == "POST":
+            cross_site_response = _flask_cross_site_post_response()
+            if cross_site_response is not None:
+                return cross_site_response
 
         quota = _acquire_profile_link_quota(runtime)
         if not quota.allowed:
@@ -3107,15 +3169,19 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
         if not user:
             return Response(status=HTTPStatus.NOT_FOUND)
 
+        # A link must not silently replace another live profile on this
+        # device (another site could link a visitor into its own profile):
+        # a plain GET only asks; the switch is a same-origin POST.
+        current = _flask_user(runtime)
+        if (
+            request.method == "GET"
+            and current is not None
+            and current.token != user.token
+        ):
+            return _profile_switch_confirm_response()
+
         response = redirect("../", code=302)
-        response.set_cookie(
-            "hn_token",
-            user.token,
-            max_age=31536000,
-            path="/",
-            samesite="Lax",
-            httponly=True,
-        )
+        _set_session_cookie(response, user.token)
         return response
 
     @app.get("/api/user")
@@ -3129,69 +3195,16 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
 
     @app.get("/api/feed")
     def feed() -> ResponseReturnValue:
-        from dataclasses import replace
-        from clients.tui.src.hn_rerank.models import Feed
-        from pipeline.render import DashboardDocument
-
         user = _flask_user(runtime)
         if not user:
             return _flask_json_response({"error": "No session"}, status=401)
-        html = runtime._render_dashboard_for_user(user)
-        target = runtime._dashboard_version(user.id)
-        if isinstance(html, DashboardDocument):
-            snapshot = replace(
-                html.feed, target_version=target, ready=html.feed.version >= target
-            )
-        else:
-            snapshot = Feed(
-                1,
-                [],
-                {},
-                runtime.db.count_feedback_by_action(user.id),
-                0,
-                target,
-                False,
-            )
-        response = _flask_json_response(snapshot.to_dict())
+        response = _flask_json_response(runtime._feed_for_user(user).to_dict())
         response.headers["Cache-Control"] = "no-store"
         return response
 
     @app.get("/api/ranking-ready")
     def ranking_ready() -> ResponseReturnValue:
         return _handle_flask_ranking_ready(runtime)
-
-    @app.get("/api/deck-cards")
-    def deck_cards() -> ResponseReturnValue:
-        user = _flask_user(runtime)
-        if not user:
-            return _flask_json_response(
-                {"error": "No session"}, status=HTTPStatus.UNAUTHORIZED
-            )
-        cached = runtime._dashboard_cache.get(f"dashboard_{user.id}")
-        html = (
-            cached[0]
-            if cached is not None
-            else runtime._render_dashboard_for_user(user)
-        )
-        # Unlike GET /, this endpoint used to serve `cached` unconditionally
-        # with no version check — an open tab's in-DOM refills (vote, filter
-        # tab click) could poll it forever and always get the same stale
-        # deck, since regen/RSS-refresh bumps the live version but never
-        # re-renders any user's cache (see WORKLOG 2026-08-28). Mirror
-        # `_render_dashboard_for_user`'s stale_hit self-heal: still serve the
-        # (possibly stale) fragment immediately, but kick off a warm.
-        if cached is not None:
-            current_version = runtime._dashboard_version(user.id)
-            if cached[2] < current_version:
-                runtime._trigger_warm(user, current_version)
-        fragment = _extract_cards_fragment(html)
-        response = Response(
-            fragment, status=HTTPStatus.OK, content_type="text/html; charset=utf-8"
-        )
-        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-        response.headers["Pragma"] = "no-cache"
-        response.headers["Expires"] = "0"
-        return response
 
     @app.get("/")
     @app.get("/index.html")
@@ -3228,6 +3241,29 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
         if cross_site_response is not None:
             return cross_site_response
         return _handle_flask_interaction_events(runtime)
+
+    @app.get("/api/tldr-cache/<int(signed=True):story_id>")
+    def tldr_cache(story_id: int) -> ResponseReturnValue:
+        """Read-only speculation: never hydrate sources or invoke the LLM."""
+        if not _flask_user(runtime):
+            return _flask_json_response({"error": "No session"}, status=401)
+        story = runtime.db.get_story(story_id)
+        if story is None:
+            return Response(status=204)
+        key = _tldr_cache_key(
+            title=story.title,
+            self_text=story.self_text or "",
+            top_comments=story.top_comments or "",
+            article_body=story.article_body or "",
+        )
+        cached = runtime.db.get_tldr_cache(story_id, key)
+        response = (
+            _cached_tldr_reply(cached, story_id, key, "prefetch_cache_hit").response()
+            if cached
+            else Response(status=204)
+        )
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
 
     @app.route("/api/tldr-detail", methods=["POST"], provide_automatic_options=False)
     def tldr_detail() -> ResponseReturnValue:
@@ -3289,9 +3325,7 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
     embedder = Handler.embedder
 
     def publish_reddit_changes() -> None:
-        Handler._rebuild_cold_deck()
-        Handler._bump_all_cached_versions()
-        Handler._warm_stale_cached_users()
+        Handler._pool_changed()
 
     from reddit_refresh import RedditRefreshWorker
 
@@ -3311,12 +3345,6 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
         if triggered:
             event.clear()
 
-        # A periodic or explicitly triggered regeneration satisfies any
-        # feedback-delayed request that was still pending. Clear the event
-        # again to close the race with a timer firing as the timeout elapsed.
-        Handler._cancel_feedback_regen()
-        event.clear()
-
         logging.info("Regeneration triggered. Fetching candidates...")
         try:
             from pipeline import fetch_candidates_only
@@ -3331,14 +3359,14 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
                 )
             )
             logging.info("regen_fetch_done")
-            Handler._rebuild_cold_deck()
-            Handler._bump_all_cached_versions()
-            Handler._warm_stale_cached_users()
+            Handler._pool_changed()
+            gc.collect()
+            _release_freed_heap()
             logging.info("regen_rebuild_done")
             _log_llm_spend_today(db)
             reddit_worker.submit()
 
-            if Handler._cold_stories:
+            if _wants_background_tasks(config, Handler._cold_stories):
                 t = threading.Thread(
                     target=lambda: Handler._warm_background_tasks(
                         list(Handler._cold_stories),
@@ -3416,7 +3444,6 @@ def main() -> None:
     except KeyboardInterrupt:
         logging.info("Shutting down...")
     finally:
-        Handler._cancel_feedback_regen()
         db.close()
 
 

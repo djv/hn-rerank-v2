@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+
 import asyncio
 import logging
 import sys
@@ -40,7 +42,7 @@ def batch_list(items: list, size: int):
         yield items[i : i + size]
 
 
-async def main() -> None:
+async def _main_async() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     config = Config.load("config.toml")
@@ -140,5 +142,10 @@ async def main() -> None:
     )
 
 
+def main() -> None:
+    argparse.ArgumentParser(description=__doc__).parse_args()
+    asyncio.run(_main_async())
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

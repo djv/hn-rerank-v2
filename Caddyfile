@@ -1,3 +1,12 @@
+{
+	servers {
+		# Tailscale Funnel connects from loopback and sets X-Forwarded-For to
+		# the real client. Without this, Caddy discards that header and every
+		# visitor reaches server.py as 127.0.0.1 (one shared rate-limit bucket).
+		trusted_proxies static 127.0.0.1/32 ::1/128
+	}
+}
+
 http://:8000 {
 	bind 127.0.0.1
 

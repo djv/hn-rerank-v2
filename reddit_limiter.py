@@ -77,16 +77,21 @@ class RedditRateLimiter:
         """
         with self._lock:
             if self._consecutive_429 >= self.MAX_CONSECUTIVE_429:
-                if self._probing:
-                    return False
                 now = time.monotonic()
+                # While probing, _circuit_opened_at is the probe's start. A
+                # probe that never reports (network error, 5xx: callers only
+                # report 200/429) counts as failed after a full cooldown, so
+                # the circuit can't stay wedged open until restart.
                 if now - self._circuit_opened_at < self.CIRCUIT_COOLDOWN:
                     return False
-                self._probing = True
                 logger.info(
-                    "reddit_limiter half-open probe admitted (cooldown=%.1fs elapsed)",
+                    "reddit_limiter half-open probe admitted "
+                    "(cooldown=%.1fs elapsed, previous probe unreported=%s)",
                     now - self._circuit_opened_at,
+                    self._probing,
                 )
+                self._probing = True
+                self._circuit_opened_at = now
             now = time.monotonic()
             delay = self.INTER_REQUEST_DELAY + random.uniform(
                 -self.JITTER_SECONDS, self.JITTER_SECONDS
@@ -155,10 +160,15 @@ class RedditRateLimiter:
         """Return restart-safe circuit state using a wall-clock retry time."""
         wall = time.time() if wall_time is None else wall_time
         with self._lock:
-            remaining = max(
-                0.0,
-                self.CIRCUIT_COOLDOWN - (time.monotonic() - self._circuit_opened_at),
-            ) if self._consecutive_429 >= self.MAX_CONSECUTIVE_429 else 0.0
+            remaining = (
+                max(
+                    0.0,
+                    self.CIRCUIT_COOLDOWN
+                    - (time.monotonic() - self._circuit_opened_at),
+                )
+                if self._consecutive_429 >= self.MAX_CONSECUTIVE_429
+                else 0.0
+            )
             return RedditCircuitSnapshot(self._consecutive_429, wall + remaining)
 
     def restore(self, snapshot: RedditCircuitSnapshot) -> None:

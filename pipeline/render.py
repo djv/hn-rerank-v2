@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import functools
+
 from datetime import datetime
-import time
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,13 +11,21 @@ from urllib.parse import urlparse
 from jinja2 import Environment, FileSystemLoader
 
 from database import Database, Story
-from clients.tui.src.hn_rerank.models import Feed, FeedStory
+from clients.tui.src.hn_rerank.models import Feed, FeedBadge, FeedStory
 from .config import (
     BQ_ARCHIVE_SOURCE,
     CH_ARCHIVE_SOURCE,
     Config,
 )
 from .ranking import RankedStory
+
+# Recommended shows at most this many cards per age (top by score);
+# Popular and Explore keep their own badge quotas. Cards in no view are
+# dropped so the server sends a short deck. Date lists every card that is in
+# another view, newest first, for both Age tabs. Clients show 12 per view
+# (so Date is the 12 newest in the deck); the rest are the backfill that
+# slides in as cards are voted.
+RECOMMENDED_LIMIT = 24
 
 
 @dataclass(frozen=True)
@@ -25,10 +34,6 @@ class BadgeView:
     icon: str
     label: str
     tooltip: str
-
-    @property
-    def css_class(self) -> str:
-        return f"badge badge--{self.kind}"
 
 
 @dataclass(frozen=True)
@@ -59,38 +64,18 @@ class VoteCountsView:
 class DashboardCardView:
     story: Story
     score: float
-    position: int
     best_match_title: str
     badges: tuple[BadgeView, ...]
     combo_keys: str
     is_enriched: bool
-    is_hn_attr: str
     sort_popular_attr: str
     sort_explore_attr: str
-    is_recent_attr: str
+    sort_date_attr: str
+    sort_recommended_attr: str
     article_url: str
     comments_url: str
     domain: str
     source_label: str
-    time_ago: str
-    show_source_badge: bool
-    show_score: bool
-
-
-def time_ago_filter(seconds: int) -> str:
-    diff = int(time.time()) - seconds
-    if diff < 0:
-        return "now"
-    if diff < 60:
-        return f"{diff}s ago"
-    minutes = diff // 60
-    if minutes < 60:
-        return f"{minutes}m ago"
-    hours = minutes // 60
-    if hours < 24:
-        return f"{hours}h ago"
-    days = hours // 24
-    return f"{days}d ago"
 
 
 def source_label_filter(source: str) -> str:
@@ -152,6 +137,18 @@ def _get_pico_css() -> str:
         path = Path("templates/pico.min.css")
         _pico_css_cache = path.read_text(encoding="utf-8") if path.exists() else ""
     return _pico_css_cache
+
+
+def _web_url(url: str | None) -> str:
+    """The URL if it is http(s), else "": card links go into href and
+    window.open, and third-party feeds are untrusted (javascript:, data:)."""
+    if not url:
+        return ""
+    try:
+        scheme = urlparse(url.strip()).scheme.lower()
+    except ValueError:
+        return ""
+    return url if scheme in ("http", "https") else ""
 
 
 def _domain_of(*urls: str) -> str:
@@ -253,19 +250,28 @@ def _build_badges(
 def _build_dashboard_cards(
     ranked: list[RankedStory], *, hot_badge_percentile: int
 ) -> list[DashboardCardView]:
+    recommended_ids: set[int] = set()
+    for age in ("recent", "archive"):
+        in_age = [r for r in ranked if f"{age}_mixed" in r.combo_keys.split()]
+        in_age.sort(key=lambda r: r.score, reverse=True)
+        recommended_ids.update(r.story.id for r in in_age[:RECOMMENDED_LIMIT])
+    # Cards outside any age deck (no *_mixed key) aren't subject to the cap.
+    recommended_ids.update(
+        r.story.id
+        for r in ranked
+        if not any(key.endswith("_mixed") for key in r.combo_keys.split())
+    )
     cards: list[DashboardCardView] = []
-    for position, item in enumerate(ranked):
+    for item in ranked:
         story = item.story
         cards.append(
             DashboardCardView(
                 story=story,
                 score=item.score,
-                position=position,
                 best_match_title=item.best_match_title,
                 badges=_build_badges(item, hot_badge_percentile=hot_badge_percentile),
                 combo_keys=item.combo_keys,
                 is_enriched=len(story.text_content) >= 1000,
-                is_hn_attr="0" if item.is_non_hn else "1",
                 sort_popular_attr=(
                     "1"
                     if item.is_hot or item.is_high_engagement or item.is_discussion_rich
@@ -276,17 +282,22 @@ def _build_dashboard_cards(
                     if item.is_uncertain or item.is_similar or item.is_novel
                     else "0"
                 ),
-                is_recent_attr="1" if item.is_recent else "0",
-                article_url=story.url or "",
-                comments_url=story.discussion_url or "",
+                sort_recommended_attr=(
+                    "1" if item.story.id in recommended_ids else "0"
+                ),
+                # Every card kept below is in another view, so in Date.
+                sort_date_attr="1",
+                article_url=_web_url(story.url),
+                comments_url=_web_url(story.discussion_url),
                 domain=_domain_of(story.url or "", story.discussion_url or ""),
                 source_label=source_label_filter(story.source),
-                time_ago=time_ago_filter(story.time),
-                show_source_badge=story.source != "hn",
-                show_score=story.score > 0,
             )
         )
-    return cards
+    return [
+        c
+        for c in cards
+        if "1" in (c.sort_recommended_attr, c.sort_popular_attr, c.sort_explore_attr)
+    ]
 
 
 def _build_tab_groups() -> tuple[TabGroupView, ...]:
@@ -309,10 +320,10 @@ def _build_tab_groups() -> tuple[TabGroupView, ...]:
             data_attr="sort",
             segmented=False,
             tabs=(
-                TabView("recommended", "<u>R</u>ecommended", True),
-                TabView("popular", "<u>P</u>opular"),
-                TabView("explore", "E<u>x</u>plore"),
-                TabView("date", "<u>D</u>ate"),
+                TabView("recommended", "Recommended", True),
+                TabView("popular", "Popular"),
+                TabView("explore", "Explore"),
+                TabView("date", "Date"),
             ),
         ),
         TabGroupView(
@@ -322,22 +333,11 @@ def _build_tab_groups() -> tuple[TabGroupView, ...]:
             data_attr="age",
             segmented=True,
             tabs=(
-                TabView("recent", "R<u>e</u>cent", True),
+                TabView("recent", "Recent", True),
                 TabView("archive", "<u>A</u>rchive"),
             ),
         ),
     )
-
-
-class DashboardDocument(bytes):
-    """HTML and its wire representation travel atomically through the SWR cache."""
-
-    feed: Feed
-
-    def __new__(cls, html: bytes, feed: Feed) -> DashboardDocument:
-        document = super().__new__(cls, html)
-        document.feed = feed
-        return document
 
 
 def prepare_feed(
@@ -357,18 +357,36 @@ def prepare_feed(
             memberships=c.combo_keys.split(),
             popular=c.sort_popular_attr == "1",
             explore=c.sort_explore_attr == "1",
+            badges=[badge.icon for badge in c.badges],
+            badge_details=[
+                FeedBadge(badge.kind, badge.icon, badge.label, badge.tooltip)
+                for badge in c.badges
+            ],
+            best_match_title=c.best_match_title,
+            source_label=c.source_label,
+            domain=c.domain,
+            enriched=c.is_enriched,
         )
         for c in cards
     ]
+    recommended_ids = {c.story.id for c in cards if c.sort_recommended_attr == "1"}
+    date_ids = {c.story.id for c in cards if c.sort_date_attr == "1"}
     orders: dict[str, list[int]] = {}
     for age in ("recent", "archive"):
         for sort in ("recommended", "popular", "explore", "date"):
             selected = [
                 s
                 for s in stories
-                if f"{age}_mixed" in s.memberships
-                and (sort != "popular" or s.popular)
-                and (sort != "explore" or s.explore)
+                # Date is one list (the deck, newest first) that ignores the
+                # Age axis, so both ages carry it.
+                if (
+                    s.id in date_ids
+                    if sort == "date"
+                    else f"{age}_mixed" in s.memberships
+                    and (sort != "popular" or s.popular)
+                    and (sort != "explore" or s.explore)
+                    and (sort != "recommended" or s.id in recommended_ids)
+                )
             ]
             selected.sort(
                 key=lambda s: s.time if sort == "date" else s.rank_score, reverse=True
@@ -377,6 +395,30 @@ def prepare_feed(
                 random.shuffle(selected)
             orders[f"{sort}:{age}"] = [s.id for s in selected]
     return Feed(1, stories, orders, counts, version, target, version >= target)
+
+
+def build_feed(
+    ranked: list[RankedStory],
+    config: Config,
+    counts: dict[str, int],
+    version: int,
+    target: int,
+) -> Feed:
+    """The `/api/feed` snapshot of a deck, without rendering the page."""
+    cards = _build_dashboard_cards(
+        ranked, hot_badge_percentile=int(round(config.model.hot_badge_percentile))
+    )
+    return prepare_feed(cards, counts, version, target)
+
+
+@functools.cache
+def _template_env() -> Environment:
+    """One Jinja environment per process, so compiled templates are reused
+    across renders (a fresh environment recompiled index.html every time).
+    FileSystemLoader's default auto_reload still picks up edited templates."""
+    env = Environment(loader=FileSystemLoader("templates"), autoescape=True)
+    env.filters["source_label"] = source_label_filter
+    return env
 
 
 def generate_dashboard_bytes(
@@ -389,10 +431,7 @@ def generate_dashboard_bytes(
     dashboard_latest_version: int | None = None,
 ) -> bytes:
     """Render dashboard to bytes without writing to disk."""
-    env = Environment(loader=FileSystemLoader("templates"), autoescape=True)
-    env.filters["time_ago"] = time_ago_filter
-    env.filters["source_label"] = source_label_filter
-
+    env = _template_env()
     pico_css = _get_pico_css()
 
     raw_vote_counts = (
@@ -408,10 +447,15 @@ def generate_dashboard_bytes(
     hot_badge_percentile = int(round(config.model.hot_badge_percentile))
 
     cards = _build_dashboard_cards(ranked, hot_badge_percentile=hot_badge_percentile)
+    # The page carries the deck as the same JSON /api/feed serves; the client
+    # builds every card from it.
+    feed = prepare_feed(
+        cards, raw_vote_counts, dashboard_version or 0, dashboard_latest_version or 0
+    )
     template = env.get_template("index.html")
     html_content = template.render(
         timestamp=datetime.now().strftime("%Y-%m-%d %H:%M"),
-        cards=cards,
+        feed=feed.to_dict(),
         tab_groups=_build_tab_groups(),
         badge_legend=BADGE_LEGEND,
         server_port=config.server_port,
@@ -419,15 +463,5 @@ def generate_dashboard_bytes(
         user_id=user_id,
         user_token=user_token,
         vote_counts=vote_counts,
-        dashboard_version=dashboard_version or 0,
-        dashboard_latest_version=dashboard_latest_version or 0,
     )
-    return DashboardDocument(
-        html_content.encode("utf-8"),
-        prepare_feed(
-            cards,
-            raw_vote_counts,
-            dashboard_version or 0,
-            dashboard_latest_version or 0,
-        ),
-    )
+    return html_content.encode("utf-8")
