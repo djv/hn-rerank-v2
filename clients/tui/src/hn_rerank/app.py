@@ -557,6 +557,8 @@ class Reader(App[None]):
         ("y", "copy_url", "Copy link"),
         ("r", "refresh", "Refresh"),
         ("s", "cycle_sort", "Sort"),
+        ("h", "cycle_sort(-1)", "Prev sort"),
+        ("l", "cycle_sort(1)", "Next sort"),
         ("enter", "read", "Read"),
         ("escape", "headlines", "Back"),
         ("?", "help", "Help"),
@@ -1332,7 +1334,8 @@ class Reader(App[None]):
             # Until the reranked deck lands, it may lack undone stories.
             for restored in self.restored.values():
                 self.restore_story(restored)
-        if announce:
+        if announce or (feed.ready and self.status_mode != "error"):
+            # A current deck replaces the ranking notice; errors stay put.
             self.status_mode = "context"
         self.rebuild()
         if announce and not feed.ready:
@@ -1345,14 +1348,14 @@ class Reader(App[None]):
         "date",
     )
 
-    def action_cycle_sort(self) -> None:
-        """Advance the sort selector one step (wraps to recommended)."""
+    def action_cycle_sort(self, delta: int = 1) -> None:
+        """Move the sort selector by *delta* steps, wrapping at either end."""
         select = self.query_one("#sort", Select)
         try:
             index = self.SORT_CYCLE.index(str(select.value))
         except ValueError:
-            index = -1
-        select.value = self.SORT_CYCLE[(index + 1) % len(self.SORT_CYCLE)]
+            index = -1 if delta > 0 else 0
+        select.value = self.SORT_CYCLE[(index + delta) % len(self.SORT_CYCLE)]
 
     def action_refresh(self) -> None:
         self.reload(manual=True)
@@ -1603,6 +1606,7 @@ class Reader(App[None]):
             "- `u`: undo latest vote\n\n"
             "## Sort\n\n"
             "- `s`: cycle sort (Recommended → Popular → Explore → Date)\n"
+            "- `h` / `l`: previous / next sort\n"
             "- Selectors: sort and Recent / Archive\n\n"
             "## Other\n\n"
             "- `o` / `c`: open article / comments\n"

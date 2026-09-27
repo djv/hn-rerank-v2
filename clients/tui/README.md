@@ -67,7 +67,8 @@ once a minute the reader checks for a newer deck (a regen, a vote from another
 device, or the reranked deck after your vote) and reloads it without touching
 the open story.
 Regeneration still respects provider limits and does not guarantee a longer summary.
-Press `s` to cycle Recommended → Popular → Explore → Date.
+Press `s` to cycle Recommended → Popular → Explore → Date; `h` / `l` step to
+the previous / next sort.
 
 Resize and focus changes preserve reading position. Run the offline preview from
 the repository root with `uv run python -m clients.tui.tests.preview --headless`.

@@ -836,3 +836,26 @@ async def test_failed_undo_hides_the_story_again(tmp_path: Path) -> None:
         assert app.rated == {1} and [s.id for s in app.history] == [1]
         assert [s.id for s in app.stories] == [2]
         assert "not confirmed" in str(app.query_one("#status", Static).content)
+
+
+async def test_h_and_l_step_through_sorts_and_wrap(tmp_path: Path) -> None:
+    fake = FakeServer()
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        app.query_one(OptionList).focus()
+        sort = app.query_one("#sort", Select)
+        seen = []
+        for key in "llllhh":
+            await pilot.press(key)
+            await pilot.pause()
+            seen.append(str(sort.value))
+        assert seen == [
+            "popular",
+            "explore",
+            "date",
+            "recommended",
+            "date",
+            "explore",
+        ]
+        assert app.query_one("#sort-tabs", Tabs).active == "sort-explore"

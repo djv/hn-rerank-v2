@@ -20,6 +20,10 @@
   `submit` sends votes/undos one at a time (`vote_lock`) so the server sees
   them in order. A failed request reverts that one change with an error and
   is not retried. Removed the `pending` lock that dropped a quick second vote.
+- Fix: the "Showing available stories while ranking updates…" notice stuck
+  after the poller loaded the ready deck (a passive reload never restored the
+  counts line). A ready reload now resets the status unless it is an error.
+- `h` / `l` step to the previous / next sort (wrapping); `s` still cycles.
 
 ## 2026-09-26 TUI: `y` copies link; faster TUI tests
 

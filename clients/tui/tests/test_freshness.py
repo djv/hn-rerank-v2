@@ -115,3 +115,19 @@ async def test_poll_after_vote_waits_for_the_reranked_deck() -> None:
         assert [r for r in fake.requests if r.url.path.endswith("/api/feed")]
         assert app.feed.ready and app.feed.version == 1
         assert 1 not in [s.id for s in app.stories]  # still voted
+
+
+async def test_ranking_notice_clears_when_the_ready_deck_arrives() -> None:
+    fake = FakeServer()
+    fake.feed = sample_feed(0, 1)  # stale deck while ranking runs
+    app = Reader(api=fake.api())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        status = app.query_one("#status", Static)
+        assert "ranking updates" in str(status.content)
+        fake.feed = sample_feed(1, 1)
+        await app.poll_feed_version()
+        await settle(pilot)
+        assert app.feed is not None and app.feed.ready
+        assert "ranking updates" not in str(status.content)
+        assert "shown" in str(status.content)
