@@ -1,28 +1,30 @@
 # HN Rerank status
 
 ## Objective
-Improve ranking quality for user 1: establish baselines, hill-climb
-offline, and check the best candidate against the user's own judgement.
+Align the server and the web dashboard with the terminal client's simpler
+model: one shared summary request per story, one poller and one reload
+path, optimistic ordered votes, two timeout classes.
 
 ## Verified result
-- Offline (8 dev folds, composite): production 0.669; SVM C=4/γ=0.05 +
-  logreg rank blend 0.714; + bge-base+mxbai 512-token embeddings 0.754.
-  Newest-vote confirmation block too noisy at the top to separate them.
-- Hand orderings, 8 batches (`scripts/calibrate_rankings.py`): production
-  agrees on 43/80 pairs, challenger 37/80 — a tie.
-- Decision: production ranking, config and embeddings unchanged. Study
-  tooling committed; `engagement_features_enabled` is opt-in, default off.
-- Details: FINDINGS.md "Ranking-quality study — 2026-09-25".
+- TUI simplified and pushed (2592706, 4274de9, ff85910, d1b4bea): timeouts
+  10s/150s; zoom as a property; `summary_requests` shared by selection and
+  prefetch under `Semaphore(4)`; 60s poller + `reload(manual=...)`; votes
+  hide at once and are sent in order, a failure reverts with an error.
+- TUI tests: 132 pass, ~25s at `-n 8`; ruff, format, ty clean. Read-only
+  live run against the VPS: feed, prefetched summaries, sort, zoom, quit OK.
+- Details: FINDINGS.md "TUI simplification — 2026-09-26".
 
 ## Blocker / limits
-- The newest 20% of votes has been looked at three times; only votes after
-  2026-09-25 are a clean holdout.
-- Without the ONNX model (laptop), 18 real-model `test_pipeline` tests skip
-  with a setup hint; `uv run python setup_model.py` enables them.
+- The GitHub repo is public: every push is public. `DEFAULT_SERVER` in
+  `clients/tui/src/hn_rerank/app.py` names the tailnet host.
+- Not published to PyPI (user's call); `dist/` wheel predates this work.
+- Another session is editing feeds/server files in parallel; coordinate
+  before touching `server.py`.
+- Ranking study (archived status) still holds: only votes after 2026-09-25
+  are a clean holdout.
 
 ## Next step
-None required. Optional: after a few hundred new votes, rerun
-`eval_ranker_variants.py` on votes after 2026-09-25 to recheck the
-challenger.
-- Done 2026-09-26: server RSS ~1.1 GB -> ~0.68 GB (WORKLOG). If it grows
-  again, the probe method is there: phase RSS before/after `malloc_trim`.
+Map the server (dashboard versions, `ranking-ready`, warm scheduler, cold
+deck, TLDR prefetch) and the web client (`templates/index.html` polling,
+voting, TLDR loading) against the TUI model; propose with diagrams, then
+refactor in stages.

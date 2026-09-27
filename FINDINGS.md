@@ -1,5 +1,28 @@
 # HN Rerank findings
 
+## TUI simplification — 2026-09-26
+
+- Review (code-review, high) of `clients/tui/src`: a passive refresh could
+  strand "Loading summary…" (it cancelled the prefetch the selection had
+  joined); a failed `r` left a forced regeneration armed; reverse sort
+  logged reversed list positions as impressions; 45s client timeout vs
+  ~2 min server generation; post-vote loop refetched the feed every 1s for
+  up to 30s. All fixed; reverse sort (`v`) removed.
+- Refactor in 4 commits (2592706, 4274de9, ff85910, d1b4bea). State removed:
+  prefetch queue/worker/`prefetching`/`prefetch_requests`/cache-miss set,
+  `target`, `force_summary_id`, `pending`, `can_read` field + 3 timers + 1s
+  interval. `app.py` 1680 -> 1625 lines (docstrings ate most line savings).
+- Test speed: 54-60s -> ~39s at `-n 4`, ~25s at `-n 8`. Floor is Textual,
+  ~0.5s CPU per app lifecycle (1.0s with the 5-section markdown fixture,
+  0.86s at 3 sections). Fixed sleeps became `tests/_settle.py::settle`.
+- Two undo-during-stale-deck tests had passed without reaching the
+  `restored` path once votes stopped refetching; they now reload the stale
+  deck and fail if that path is removed. Each new regression test was
+  checked to fail without its fix.
+- Live (read-only, `--prefetch-generate 0`, no votes): feed, prefetched
+  summaries on j, sort switch, zoom and quit all worked against the VPS.
+- Diagrams (today vs proposed): `/tmp/hn-tui-diagrams/` (not in git).
+
 ## Source yield review — 2026-09-26
 
 Per source, all users (stories fetched in 30d / shown / % of shown upvoted).

@@ -138,6 +138,8 @@
   (downloads the production ONNX model into `DEFAULT_ONNX_MODEL_DIR`,
   `pipeline/config.py`; no-ops if the files already exist)
 - Run tests: `uv run pytest tests/`
+- Run TUI tests: `cd clients/tui && uv run pytest tests -n 8` (~25s; Textual
+  startup costs ~0.5s CPU per test, so they parallelize well)
 - Run linting: `uv run ruff check .`
 - Run type checking: `uv run ty check` (Astral's `ty`; pre-existing
   diagnostics are tracked in the baseline; new code must introduce

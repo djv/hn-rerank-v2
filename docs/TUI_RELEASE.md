@@ -7,7 +7,7 @@ From `/home/d/hn-rerank`:
 ```sh
 uv sync
 HN_ONNX_MODEL_DIR=/home/d/.cache/hn-rerank/onnx_model uv run pytest tests/ -n 4
-uv run pytest clients/tui/tests
+uv run pytest clients/tui/tests -n 8
 uv run ruff check .
 uv run ty check
 uv build --package hn-rerank
