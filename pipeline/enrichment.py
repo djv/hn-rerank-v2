@@ -40,6 +40,8 @@ REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dash
 # Matches server.py's SELF_TEXT_PROMPT_CHAR_LIMIT: no point retaining RSS
 # content beyond what the TLDR prompt assembler will actually use.
 RSS_SELF_TEXT_CHAR_LIMIT = 8_000
+# LessWrong GraphQL during regen prewarm (tap-time fetches keep 15s).
+LESSWRONG_PREWARM_TIMEOUT_S = 45.0
 
 
 def _ch_story_item_to_story(item: ChItem) -> Story | None:
@@ -499,7 +501,10 @@ async def prewarm_lesswrong_stories(
             continue
 
         try:
-            ctx = await _fetch_lesswrong_context(post_id)
+            # Background prewarm: a slow connect costs no user latency.
+            ctx = await _fetch_lesswrong_context(
+                post_id, timeout_s=LESSWRONG_PREWARM_TIMEOUT_S
+            )
         except Exception as exc:
             logging.warning(
                 "prewarm_lesswrong: fetch failed for story_id=%s: %r",

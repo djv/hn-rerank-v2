@@ -627,7 +627,9 @@ async def _fetch_reddit_rss_context(url: str | None) -> RedditRssContext | None:
     )
 
 
-async def _fetch_lesswrong_context(post_id: str) -> LessWrongContext | None:
+async def _fetch_lesswrong_context(
+    post_id: str, timeout_s: float = 15.0
+) -> LessWrongContext | None:
     query = """
     query($id: String!) {
       post(input: { selector: { _id: $id } }) {
@@ -639,7 +641,7 @@ async def _fetch_lesswrong_context(post_id: str) -> LessWrongContext | None:
     }
     """
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=timeout_s) as client:
             resp = await client.post(
                 "https://www.lesswrong.com/graphql",
                 json={"query": query, "variables": {"id": post_id}},

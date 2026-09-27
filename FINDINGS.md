@@ -1,5 +1,35 @@
 # HN Rerank findings
 
+## Source yield review — 2026-09-26
+
+Per source, all users (stories fetched in 30d / shown / % of shown upvoted).
+HN baseline: 6031 / 1696 / 21%.
+
+- Above HN: latent.space 43/69/59%, Slashdot 251/69/52%, r/digitalnomad
+  160/69/47%, r/Bogleheads 159/67/37%.
+- Dropped (0-13%): Tildes 515/74/6% (36 downvotes), r/awardtravel,
+  r/programming, r/ProgrammingLanguages, r/Urbanism, r/selfhosted,
+  r/dataengineering, r/CreditCards.
+- Added (similar to the winners): understandingai, dwarkesh,
+  pragmaticengineer, oneusefulthing, thezvi, The Register, r/expats,
+  r/eupersonalfinance. Recheck their yield after a few weeks.
+- Fetched but rarely shown: text is thin, so the ranker has little to go on.
+  lobste.rs: 75/120 URLs are also HN stories and collapse into them.
+  LWN (41 article 403s, subscriber pages) and Aeon (38 article 429s)
+  keep only RSS snippets (~500-1000 chars vs 4-9k for Slashdot and
+  latent.space). r/Compilers has text but no upvotes from anyone.
+- Silent blogs are healthy feeds that post rarely (aphyr, jvns, eugeneyan,
+  pudding, earlyretirementnow); huyenchip last posted 2025-01.
+- Fetch errors 2026-09-23..25 were a VPS DNS outage (157 errors, all
+  feeds, 4 empty HN live windows; LessWrong's 18 "timeouts" are all in it).
+- Reddit 429s ~150/day: mostly one retry, circuit opened once in 3 days,
+  no feed failed. Cause: each regen refreshes every subreddit, and votes
+  trigger a regen about every 20 minutes; only ~4 of 21 weekly-top feeds
+  change per refresh.
+
+Query: stories x interaction_events (impression) x feedback, grouped by
+`stories.source`.
+
 ## Ranking-quality study — 2026-09-25
 
 Setup: `eval_ranker_variants.py --candidate-pool heldout-feedback`, user 1

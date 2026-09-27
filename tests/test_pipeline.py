@@ -6706,7 +6706,7 @@ def test_prewarm_lesswrong_stories_refetches_when_only_one_field_is_stale(
             )
         )
 
-        async def fake_fetch(post_id):
+        async def fake_fetch(post_id: str, timeout_s: float = 15.0) -> LessWrongContext:
             return LessWrongContext(
                 self_text="shorter new body from graphql",
                 top_comments="fresh comment from graphql",
@@ -6761,7 +6761,7 @@ def test_prewarm_lesswrong_stories_skips_when_both_fields_already_richer(
             )
         )
 
-        async def fake_fetch(post_id):
+        async def fake_fetch(post_id: str, timeout_s: float = 15.0) -> LessWrongContext:
             return LessWrongContext(
                 self_text="x" * 100,
                 top_comments="y" * 100,

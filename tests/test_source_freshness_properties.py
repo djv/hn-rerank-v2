@@ -7,7 +7,11 @@ import pytest
 from hypothesis import given, settings, strategies as st
 
 from database import Database, Story
-from pipeline.enrichment import _merge_source_context, prewarm_lesswrong_stories
+from pipeline.enrichment import (
+    LESSWRONG_PREWARM_TIMEOUT_S,
+    _merge_source_context,
+    prewarm_lesswrong_stories,
+)
 from pipeline.ranking import compose_story_text
 from server import LessWrongContext
 
@@ -100,8 +104,10 @@ def test_lesswrong_metadata_refresh_reaches_db_without_richer_text(
         score=11,
     )
 
-    async def fetch_context(post_id: str) -> LessWrongContext:
+    async def fetch_context(post_id: str, timeout_s: float) -> LessWrongContext:
         assert post_id == "abc123"
+        # Prewarm runs in the background, so it waits longer than a tap.
+        assert timeout_s == LESSWRONG_PREWARM_TIMEOUT_S
         return context
 
     db = Database(":memory:")
