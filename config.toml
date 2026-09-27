@@ -47,7 +47,6 @@ feeds = [
 
     # AI / coding agents
     "https://www.reddit.com/r/AI_Agents/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/ChatGPTCoding/top/.rss?t=week&limit=25",
 
     # Finance / tax / nomad money
     "https://www.reddit.com/r/financialindependence/top/.rss?t=week&limit=25",
@@ -65,8 +64,6 @@ feeds = [
     "https://research.google/blog/rss/",
     "https://deepmind.google/blog/rss.xml",
     "https://huggingface.co/blog/feed.xml",
-    "https://github.blog/engineering/feed/",
-    "https://blog.cloudflare.com/rss/",
     "https://www.construction-physics.com/feed",
     "https://www.bitsaboutmoney.com/archive/rss/",
     "https://earlyretirementnow.com/feed/",
@@ -96,9 +93,7 @@ feeds = [
     "https://discourse.haskell.org/latest.rss",
 
     # Software / systems / AI coding
-    "https://danluu.com/atom.xml",
     "https://jvns.ca/atom.xml",
-    "https://pluralistic.net/feed/",
 
     # Progress / cities / infrastructure
     "https://worksinprogress.co/rss.xml",

@@ -75,6 +75,11 @@ HN baseline: 6031 / 1696 / 21%.
   added, then removed at the user's request: no AI provider blogs. The Register, added the day before, had 4 up / 14 down of
   28 and was dropped; arstechnica.com (6/22) was not added. Query: feedback
   joined to stories, grouped by URL host.
+- Same scoring over every configured feed (its own stories, plus HN
+  stories from its host): dropped r/ChatGPTCoding (11 votes, 18% up, 36%
+  down), blog.cloudflare.com (0 up of 3 own + 4 HN), github.blog (0/4 HN),
+  pluralistic.net (0/5 own, 3 down), danluu.com (0/5 HN). Borderline, kept:
+  r/transit (27% up / 36% down), r/MachineLearning (34% / 38%).
 - Reddit 429s ~150/day: mostly one retry, circuit opened once in 3 days,
   no feed failed. Cause: each regen refreshes every subreddit, and votes
   trigger a regen about every 20 minutes; only ~4 of 21 weekly-top feeds
