@@ -34,7 +34,6 @@ svm_precomputed_chunk_size = 512
 feeds = [
     "https://www.lesswrong.com/feed.xml?view=frontpage&karmaThreshold=20",
     "https://rss.slashdot.org/Slashdot/slashdotMain",
-    "https://www.theregister.com/headlines.atom",
     "https://mshibanami.github.io/GitHubTrendingRSS/weekly/all.xml",
     "https://mshibanami.github.io/GitHubTrendingRSS/weekly/python.xml",
     "https://mshibanami.github.io/GitHubTrendingRSS/weekly/haskell.xml",
@@ -66,6 +65,13 @@ feeds = [
     "https://jack-clark.net/feed/",
     "https://research.google/blog/rss/",
     "https://deepmind.google/blog/rss.xml",
+    # AI lab announcements: the domains user 1 upvotes most on HN
+    # (openai.com 59%, anthropic.com 63%, blog.google 78%, mistral.ai 62%).
+    "https://openai.com/news/rss.xml",
+    "https://blog.google/technology/ai/rss/",
+    "https://mistral.ai/rss.xml",
+    # Anthropic has no official feed; community-generated one.
+    "https://raw.githubusercontent.com/Olshansk/rss-feeds/main/feeds/feed_anthropic_news.xml",
     "https://huggingface.co/blog/feed.xml",
     "https://github.blog/engineering/feed/",
     "https://blog.cloudflare.com/rss/",

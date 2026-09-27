@@ -69,6 +69,12 @@ HN baseline: 6031 / 1696 / 21%.
   5.9% -> 5.3%; 5/8 folds up), i.e. no drop. Rollback list (id, old source):
   VPS `~/hn-rewrite/relabel_rollback_20260927.tsv`; reports
   `~/.local/state/hn-rerank-eval/relabel-*-20260927.json` on the VPS.
+- Feed picks by user 1's past votes per URL domain (HN stories; overall
+  up rate 32%): AI lab announcements lead (blog.google 26/33 up,
+  anthropic.com 29/46, openai.com 29/49, mistral.ai 5/8), so their feeds
+  were added. The Register, added the day before, had 4 up / 14 down of
+  28 and was dropped; arstechnica.com (6/22) was not added. Query: feedback
+  joined to stories, grouped by URL host.
 - Reddit 429s ~150/day: mostly one retry, circuit opened once in 3 days,
   no feed failed. Cause: each regen refreshes every subreddit, and votes
   trigger a regen about every 20 minutes; only ~4 of 21 weekly-top feeds
