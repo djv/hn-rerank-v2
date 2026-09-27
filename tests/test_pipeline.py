@@ -1,3 +1,4 @@
+import json
 from typing import Any, Literal, cast
 import asyncio
 import hashlib
@@ -210,11 +211,22 @@ def test_dashboard_polish_renders_domain_legend_and_queue_status(
         Config(),
         db,
     ).decode("utf-8")
-    assert '<span class="domain-chip">example.com</span>' in html
+    assert _embedded_feed(html)["stories"][0]["domain"] == "example.com"
     assert "🔥 Hot" in html
     assert 'id="queueStatus"' in html
     assert "top-ranked → bottom" in html
     assert 'data-key-action="undo"' in html
+
+
+def _embedded_feed(html: str) -> dict[str, Any]:
+    """The deck a rendered page carries for the client (/api/feed JSON)."""
+    from bs4 import BeautifulSoup
+
+    script = BeautifulSoup(html, "html.parser").select_one("script#feed-data")
+    assert script is not None
+    data = json.loads(script.get_text())
+    assert isinstance(data, dict)
+    return data
 
 
 def _recent_pubdate(days_ago: float = 1.0) -> str:
@@ -7641,9 +7653,28 @@ def test_fill_best_match_titles_render_escapes() -> None:
     html = render.generate_dashboard_bytes(
         ranked, Config(), Database(":memory:")
     ).decode("utf-8")
-    assert "Because you upvoted:" in html
-    assert "Up &#34;quoted&#34;" in html or "Up &quot;quoted&quot;" in html
-    assert 'Up "quoted" <x>' not in html
+    # Cards are built from the embedded feed as text; the JSON itself must
+    # not let markup out of its <script> element.
+    [card] = _embedded_feed(html)["stories"]
+    assert card["best_match_title"] == 'Up "quoted" <x>'
+    assert card["title"] == "C <b>ard</b>"
+    assert "<x>" not in html and "<b>ard" not in html
+
+
+def test_embedded_feed_cannot_close_its_script_element() -> None:
+    """A title that tries to end the JSON <script> stays data."""
+    from pipeline import render
+
+    hostile = "</script><script>alert(1)</script><!--"
+    story = _f2_story(11, hostile)
+    html = render.generate_dashboard_bytes(
+        [ranking.RankedStory(story=story, score=1.0, best_match_title=hostile)],
+        Config(),
+        Database(":memory:"),
+    ).decode("utf-8")
+    [card] = _embedded_feed(html)["stories"]
+    assert card["title"] == hostile and card["best_match_title"] == hostile
+    assert html.count("<script") == 2  # the feed and the client, nothing injected
 
 
 def _embedder_with_fake_session() -> Embedder:

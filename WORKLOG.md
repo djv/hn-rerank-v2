@@ -1,5 +1,31 @@
 # Worklog: hn-rewrite
 
+## 2026-09-26 Web client: feed JSON, one reload path, ordered votes, shared summaries
+
+Stages W1-W3 of `docs/server-web-alignment-plan.md` (one commit: all three
+rewrite the same script). The dashboard script now follows the terminal
+client (ARCHITECTURE "Web client model"):
+- The page embeds the `/api/feed` snapshot; cards are built only by
+  `feedCard` (removed `components/story_card.html` and `badge.html`, and the
+  template-only `DashboardCardView` fields). Views come from `feed.orders`;
+  tab changes no longer refetch the deck and start at the view's first story.
+- One `reload()`, one 60s `ranking-ready` poller (plus on tab focus). Removed
+  the refill loop, the 30s warm-poll loop with 0.4-2.5s backoff, the vote
+  idle timer, the page-load version check and the localStorage voted ids.
+- Votes: one queue for all votes and undos (was one chain per story), failed
+  ones reverted and not retried, a saved one marks the deck stale. The old
+  150ms exit timer is gone with its bug (a vote failing inside it left the
+  card faded); the next card slides in instead.
+- Summaries: one request per story, cache-only lookahead, 4 prefetch slots,
+  60s backoff, 10s/150s deadlines via `AbortController`.
+- Tests: `tests/test_client_js.py` rewritten for the new functions under Node
+  (vote order and revert, undo placement, poller decisions, shared summary
+  requests and prefetch slots, views/backfill/Explore order, text-only
+  cards); page tests now read the embedded feed, including a `</script>`
+  title. Checked in headless Chrome (Playwright) against a throwaway server:
+  no console errors; votes, undo, poll-reload, sort change and a failed vote
+  all behave.
+
 ## 2026-09-26 Server: background-task spawn check; feed order properties
 
 Stage S3 of `docs/server-web-alignment-plan.md`.

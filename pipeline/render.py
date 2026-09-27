@@ -3,7 +3,6 @@ from __future__ import annotations
 import functools
 
 from datetime import datetime
-import time
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,10 +35,6 @@ class BadgeView:
     label: str
     tooltip: str
 
-    @property
-    def css_class(self) -> str:
-        return f"badge badge--{self.kind}"
-
 
 @dataclass(frozen=True)
 class TabView:
@@ -69,40 +64,18 @@ class VoteCountsView:
 class DashboardCardView:
     story: Story
     score: float
-    position: int
     best_match_title: str
     badges: tuple[BadgeView, ...]
     combo_keys: str
     is_enriched: bool
-    is_hn_attr: str
     sort_popular_attr: str
     sort_explore_attr: str
     sort_date_attr: str
     sort_recommended_attr: str
-    is_recent_attr: str
     article_url: str
     comments_url: str
     domain: str
     source_label: str
-    time_ago: str
-    show_source_badge: bool
-    show_score: bool
-
-
-def time_ago_filter(seconds: int) -> str:
-    diff = int(time.time()) - seconds
-    if diff < 0:
-        return "now"
-    if diff < 60:
-        return f"{diff}s ago"
-    minutes = diff // 60
-    if minutes < 60:
-        return f"{minutes}m ago"
-    hours = minutes // 60
-    if hours < 24:
-        return f"{hours}h ago"
-    days = hours // 24
-    return f"{days}d ago"
 
 
 def source_label_filter(source: str) -> str:
@@ -289,18 +262,16 @@ def _build_dashboard_cards(
         if not any(key.endswith("_mixed") for key in r.combo_keys.split())
     )
     cards: list[DashboardCardView] = []
-    for position, item in enumerate(ranked):
+    for item in ranked:
         story = item.story
         cards.append(
             DashboardCardView(
                 story=story,
                 score=item.score,
-                position=position,
                 best_match_title=item.best_match_title,
                 badges=_build_badges(item, hot_badge_percentile=hot_badge_percentile),
                 combo_keys=item.combo_keys,
                 is_enriched=len(story.text_content) >= 1000,
-                is_hn_attr="0" if item.is_non_hn else "1",
                 sort_popular_attr=(
                     "1"
                     if item.is_hot or item.is_high_engagement or item.is_discussion_rich
@@ -316,14 +287,10 @@ def _build_dashboard_cards(
                 ),
                 # Every card kept below is in another view, so in Date.
                 sort_date_attr="1",
-                is_recent_attr="1" if item.is_recent else "0",
                 article_url=_web_url(story.url),
                 comments_url=_web_url(story.discussion_url),
                 domain=_domain_of(story.url or "", story.discussion_url or ""),
                 source_label=source_label_filter(story.source),
-                time_ago=time_ago_filter(story.time),
-                show_source_badge=story.source != "hn",
-                show_score=story.score > 0,
             )
         )
     return [
@@ -450,7 +417,6 @@ def _template_env() -> Environment:
     across renders (a fresh environment recompiled index.html every time).
     FileSystemLoader's default auto_reload still picks up edited templates."""
     env = Environment(loader=FileSystemLoader("templates"), autoescape=True)
-    env.filters["time_ago"] = time_ago_filter
     env.filters["source_label"] = source_label_filter
     return env
 
@@ -481,10 +447,15 @@ def generate_dashboard_bytes(
     hot_badge_percentile = int(round(config.model.hot_badge_percentile))
 
     cards = _build_dashboard_cards(ranked, hot_badge_percentile=hot_badge_percentile)
+    # The page carries the deck as the same JSON /api/feed serves; the client
+    # builds every card from it.
+    feed = prepare_feed(
+        cards, raw_vote_counts, dashboard_version or 0, dashboard_latest_version or 0
+    )
     template = env.get_template("index.html")
     html_content = template.render(
         timestamp=datetime.now().strftime("%Y-%m-%d %H:%M"),
-        cards=cards,
+        feed=feed.to_dict(),
         tab_groups=_build_tab_groups(),
         badge_legend=BADGE_LEGEND,
         server_port=config.server_port,
@@ -492,7 +463,5 @@ def generate_dashboard_bytes(
         user_id=user_id,
         user_token=user_token,
         vote_counts=vote_counts,
-        dashboard_version=dashboard_version or 0,
-        dashboard_latest_version=dashboard_latest_version or 0,
     )
     return html_content.encode("utf-8")

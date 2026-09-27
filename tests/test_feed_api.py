@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 from pathlib import Path
@@ -18,6 +19,28 @@ def payload(response: TestResponse) -> Any:
     data = response.get_json()
     assert isinstance(data, dict)
     return data
+
+
+def page_feed(client: Any) -> Any:
+    """The deck the page carries for the client."""
+    script = BeautifulSoup(client.get("/").data, "html.parser").select_one(
+        "script#feed-data"
+    )
+    assert script is not None
+    return json.loads(script.get_text())
+
+
+def same_deck(a: Any, b: Any) -> bool:
+    """Equal feeds, up to Explore's per-render shuffle."""
+
+    def norm(feed: Any) -> Any:
+        orders = {
+            key: sorted(order) if key.startswith("explore:") else order
+            for key, order in feed["orders"].items()
+        }
+        return {**feed, "orders": orders}
+
+    return norm(a) == norm(b)
 
 
 def test_feed_parity_authentication_stale_cache_and_eviction(tmp_path: Path) -> None:
@@ -90,35 +113,7 @@ def test_feed_parity_authentication_stale_cache_and_eviction(tmp_path: Path) -> 
     assert response.headers["Cache-Control"] == "no-store"
     # No votes: the shared cold deck is this user's current deck.
     assert feed["version"] == 1 and feed["ready"] is True
-    html = client.get("/").data
-    cards = BeautifulSoup(html, "html.parser").select(".story-card")
-    assert [int(str(card["data-story-id"])) for card in cards] == [
-        story["id"] for story in feed["stories"]
-    ]
-    for age in ("recent", "archive"):
-        for sort in ("recommended", "popular", "explore", "date"):
-            matching = [
-                c
-                for c in cards
-                if (
-                    c["data-sort-date"] == "1"  # Date ignores the Age axis
-                    if sort == "date"
-                    else f"{age}_mixed" in str(c["data-combo"]).split()
-                    and (
-                        sort not in {"popular", "explore"}
-                        or c[f"data-sort-{sort}"] == "1"
-                    )
-                )
-            ]
-            matching.sort(
-                key=lambda c: float(
-                    str(c["data-time" if sort == "date" else "data-score"])
-                ),
-                reverse=True,
-            )
-            assert feed["orders"][f"{sort}:{age}"] == [
-                int(str(c["data-story-id"])) for c in matching
-            ]
+    assert same_deck(page_feed(client), feed)
     Runtime._decks[user.id] = DeckState(ranked, time.time(), 1)
     for item in ranked:
         db.upsert_story(item.story)
@@ -132,10 +127,7 @@ def test_feed_parity_authentication_stale_cache_and_eviction(tmp_path: Path) -> 
     # The stale deck is served without the story just voted on.
     assert stale["stories"] == feed["stories"][1:]
     assert stale["version"] == 1 and stale["target_version"] == 2 and not stale["ready"]
-    page = BeautifulSoup(client.get("/").data, "html.parser")
-    assert [card["data-story-id"] for card in page.select(".story-card")] == [
-        card["data-story-id"] for card in cards[1:]
-    ]
+    assert same_deck(page_feed(client), stale)
     client.set_cookie("hn_token", other.token)
     assert payload(client.get("/api/feed"))["feedback_counts"]["up"] == 0
     client.set_cookie("hn_token", user.token)

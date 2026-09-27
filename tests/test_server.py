@@ -1,3 +1,4 @@
+import json
 import threading
 import time
 from dataclasses import replace
@@ -4207,154 +4208,6 @@ def test_tldr_markdown_neutralizes_html_and_unsafe_links() -> None:
     assert "<code>a &lt; b &amp;&amp; c</code>" in out["code"]
 
 
-def test_forced_tldr_refresh_serializes_requests() -> None:
-    import shutil
-    import subprocess
-
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip("Node is required to execute browser refresh logic")
-    _, script = _read_template_and_static()
-    start = script.index("    async function openTldrDetail(")
-    end = script.index("    const KEY_ACTIONS", start)
-    harness = (
-        r"""
-const assert = require('node:assert/strict');
-const content = {dataset: {}, style: {display: 'none'}};
-const card = {dataset: {storyId: '1'}, querySelector: selector =>
-  selector === '.tldr-detail-content' ? content : null};
-const tldrCache = new Map([[1, 'old summary']]);
-const tldrRetryAt = new Map([[1, Date.now() + 600000]]);
-const apiPath = path => path;
-let calls = 0, finish;
-const fetch = () => {
-  calls++;
-  return new Promise(resolve => { finish = resolve; });
-};
-const response = {ok: true, json: async () => ({tldr: 'fresh summary'})};
-const parseSimpleMarkdown = text => text;
-const styleTldrLabels = () => {};
-const enhanceTldrContent = () => {};
-const ensureTldrRefreshButton = () => {};
-"""
-        + script[start:end]
-        + r"""
-(async () => {
-  const first = openTldrDetail(card, {force: true});
-  await openTldrDetail(card, {force: true});
-  await openTldrDetail(card);
-  assert.equal(calls, 1);
-  finish(response);
-  await first;
-  assert.equal(content.dataset.loading, undefined);
-  assert.equal(tldrCache.get(1), 'fresh summary');
-  const next = openTldrDetail(card, {force: true});
-  assert.equal(calls, 2);
-  finish(response);
-  await next;
-})().catch(error => { console.error(error); process.exitCode = 1; });
-"""
-    )
-    subprocess.run(
-        [node, "-e", harness], check=True, capture_output=True, text=True, timeout=10
-    )
-
-
-def test_prefetch_follows_navigation_order() -> None:
-    import shutil
-    import subprocess
-
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip("Node is required to execute browser queue logic")
-    _, script = _read_template_and_static()
-    start = script.index("    function prefetchUpcomingTldrs()")
-    end = script.index("    function cardsForAge", start)
-    # Execute the production function against queue states, including a
-    # retained active card in the middle after a refill and wraparound.
-    harness = (
-        """
-      const assert = require('node:assert/strict');
-      const PREFETCH_COUNT = 4;
-      let queue, activeCard, requested;
-      const queuedCards = () => queue;
-      const prefetchCards = cards => { requested = cards; };
-    """
-        + script[start:end]
-        + """
-      for (const [cards, active, expected] of [
-        [[1,2,3,4,5,6], 1, [2,3,4,5]],
-        [[1,2,3,4,5,6], 3, [4,5,6,1]],
-        [[1,2,3,4,5,6], 6, [1,2,3,4]],
-        [[1], 1, []], [[], null, []], [[1,2], null, [1,2]],
-      ]) {
-        queue = cards; activeCard = active;
-        prefetchUpcomingTldrs();
-        assert.deepEqual(requested, expected);
-      }
-    """
-    )
-    subprocess.run([node, "-e", harness], check=True, capture_output=True, text=True)
-    refill = script[
-        script.index("    async function refillQueue(") : script.index(
-            "    document.querySelectorAll('[data-fb]').forEach",
-            script.index("    async function refillQueue("),
-        )
-    ]
-    assert "else {\n        prefetchUpcomingTldrs();" in refill
-
-
-def test_prefetch_cards_runs_sequentially_and_skips_detached() -> None:
-    import shutil
-    import subprocess
-
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip("Node is required to execute browser queue logic")
-    _, script = _read_template_and_static()
-    start = script.index("    let tldrPrefetchChain")
-    end = script.index("    function prefetchUpcomingTldrs()", start)
-    # The page-open burst (active tap + 4 prefetches + server warm prefetch)
-    # tripped the free token-rate limit within seconds, so prefetches must
-    # run one-at-a-time behind the active tap, skipping detached cards.
-    harness = (
-        """
-      const assert = require('node:assert/strict');
-      const started = [];
-      const resolvers = [];
-      const openTldrDetail = (card) => {
-        started.push(card.id);
-        return new Promise((resolve) => resolvers.push(resolve));
-      };
-      const mk = (id, connected) => ({
-        id, isConnected: connected, querySelector: () => null,
-      });
-      const tick = async (n) => {
-        for (let i = 0; i < n; i++) {
-          await new Promise((r) => setImmediate(r));
-        }
-      };
-    """
-        + script[start:end]
-        + """
-      (async () => {
-        const a = mk('a', true), b = mk('b', true), gone = mk('gone', false);
-        prefetchCards([a, b, gone]);
-        await tick(5);
-        assert.deepEqual(started, ['a']);
-        resolvers[0]('ok-a');
-        await tick(5);
-        assert.deepEqual(started, ['a', 'b']);
-        assert.equal(resolvers.length, 2);
-        resolvers[1]('ok-b');
-        await tick(5);
-        assert.deepEqual(started, ['a', 'b']);
-      })().then(() => process.exit(0), (e) => { console.error(e); process.exit(1); });
-    """
-    )
-    subprocess.run([node, "-e", harness], check=True, capture_output=True, text=True)
-
-
 def test_maybe_cache_tldr_skips_salvaged_half(tmp_path: Path) -> None:
     """_maybe_cache_tldr persists complete TLDRs but never a salvaged half
     (single-row table: caching it would evict a previously complete TLDR)."""
@@ -5506,151 +5359,8 @@ def test_pool_changed_stales_every_deck_and_queues_cached_users(swr_handler):
     assert sorted(calls) == sorted([(user.id, 4), (other.id, 2)])
 
 
-def test_setFilter_preserves_sort_age_source_refresh_behavior() -> None:
-    """Tab changes share setFilter while preserving refresh and filter rules."""
-    _, static = _read_template_and_static()
-    idx = static.index("function setFilter(")
-    end = static.index("\n\n    applyGradient();", idx)
-    body = static[idx:end]
-    assert "scheduleDeckRefresh({ advance: true })" in body
-    assert "orderForCurrentSort()" in body
-    assert "showNextCard({ allowRefresh: false, excludeActive: true })" in body
-    assert "excludeActive = false" in static
-    assert "!excludeActive || card !== activeCard" in static
-    assert body.count("focusActiveCard()") >= 3
-    assert "matchesCurrentCombo(activeCard)" in body
-    assert "filterName === 'sort' && value === 'popular'" in body
-    assert "currentSource === 'non-hn'" in body
-    assert "popularTab.disabled = (value === 'non-hn')" in body
-    assert "currentSort = 'recommended'" in body
-    assert "updateFilterTabs('sort', currentSort)" in body
-    assert "scheduleIdleAgePrefetch()" not in body
-    assert "scheduleIdleAgePrefetch" not in static
-    assert "FILTERS" in static
-    assert "refillQueued" not in body
-    assert "refillWhenReady" not in body
-
-
-def test_deck_actions_restore_native_focus_to_active_card() -> None:
-    """Deck-changing actions share deferred, non-scrolling card focus."""
-    template, inline_script = _read_template_and_static()
-    focus_block = inline_script.split("function focusActiveCard()", 1)[1].split(
-        "function setActiveCard", 1
-    )[0]
-    assert "activeCard?.isConnected" in focus_block
-    assert "activeCard.focus({ preventScroll: true })" in focus_block
-    assert "first-time-tip" in focus_block
-
-    set_active_block = inline_script.split("function setActiveCard", 1)[1].split(
-        "function updateVoteBar", 1
-    )[0]
-    assert "focusActiveCard()" in set_active_block
-
-    submit_block = inline_script.split("function submitVote(", 1)[1].split(
-        "function ", 1
-    )[0]
-    assert "scheduleVoteRefresh(data);\n          focusActiveCard();" in submit_block
-    assert (
-        "const preferred = nextQueuedSibling(card);\n"
-        "          card.remove();\n"
-        "          showNextCard({ preferred });\n"
-        "          focusActiveCard();"
-    ) in submit_block
-    undo_block = inline_script.split("function undoLastVote()", 1)[1].split(
-        "function ", 1
-    )[0]
-    assert "scheduleVoteRefresh(data);\n        focusActiveCard();" in undo_block
-
-    key_actions = inline_script.split("const KEY_ACTIONS =", 1)[1].split(
-        "document.addEventListener('keydown'", 1
-    )[0]
-    assert (
-        "document.body.classList.toggle('fullscreen');\n        focusActiveCard();"
-        in key_actions
-    )
-    assert "t: () => refreshTldr()" in key_actions
-    assert "s: () => refreshDeck()" in key_actions
-    assert "function refreshTldr(card)" in inline_script
-    assert "openTldrDetail(card || activeCard, { force: true })" in inline_script
-    assert "function refreshDeck()" in inline_script
-    assert "queueRefill(false)" in inline_script
-    assert "refreshTldr(card);" in inline_script
-    assert ">t</span> re-summarize TLDR" in template
-    assert ">s</span> refresh deck" in template
-    for hint, label in (
-        ("r", "sort recommended"),
-        ("p", "sort popular"),
-        ("x", "sort explore"),
-        ("d", "sort date"),
-        ("e", "age recent"),
-        ("a", "age archive"),
-    ):
-        assert f">{hint}</span> {label}" in template
-    key_action_buttons = inline_script.split(
-        "document.querySelectorAll('[data-key-action]').forEach", 1
-    )[1].split("async function fetchRefillDoc", 1)[0]
-    assert (
-        "document.body.classList.toggle('fullscreen');\n          focusActiveCard();"
-        in key_action_buttons
-    )
-    # Side-rail open rows must open, not vote: runKeyAction routes them to
-    # openStoryUrl instead of falling through to submitVote.
-    assert "openStoryUrl('article')" in key_action_buttons
-    assert "openStoryUrl('comments')" in key_action_buttons
-    assert (
-        "max-height: calc(100dvh - var(--vote-bar-height) - var(--page-gutter));"
-        in template
-    )
-
-    refill_block = inline_script.split("async function refillQueue", 1)[1].split(
-        "document.querySelectorAll('[data-fb]')", 1
-    )[0]
-    assert "document.activeElement === activeCard" in refill_block
-    assert "activeCard.focus({ preventScroll: true })" in refill_block
-    assert refill_block.index("orderForCurrentSort()") < refill_block.index(
-        "activeCard.focus({ preventScroll: true })"
-    )
-
-
-def test_submitVote_advances_to_the_voted_cards_successor_not_the_deck_head() -> None:
-    """Voting must not reset the viewer to the top of the stack: the
-    successor is resolved from the voted card's DOM position before removal,
-    and showNextCard only trusts it if it's still connected and still
-    eligible (guards against a race with a concurrent refill/filter change).
-    """
-    _, inline_script = _read_template_and_static()
-
-    submit_block = inline_script.split("function submitVote(", 1)[1].split(
-        "function ", 1
-    )[0]
-    # Successor must be captured from `card` (the voted card) before it is
-    # removed from the DOM, not from queuedCards() head-of-deck afterward.
-    assert (
-        "const preferred = nextQueuedSibling(card);\n          card.remove();"
-    ) in submit_block
-
-    show_next_block = inline_script.split("function showNextCard(", 1)[1].split(
-        "function ", 1
-    )[0]
-    assert "preferred = null" in show_next_block
-    assert "preferred.isConnected" in show_next_block
-    assert "queue.includes(preferred)" in show_next_block
-    # Falls back to the original head-of-deck pick when preferred is stale.
-    assert (
-        "queue.find(card => !excludeActive || card !== activeCard)" in show_next_block
-    )
-
-    next_sibling_block = inline_script.split("function nextQueuedSibling(", 1)[1].split(
-        "function ", 1
-    )[0]
-    assert "nextElementSibling" in next_sibling_block
-    assert "queue.includes(el)" in next_sibling_block  # capped view
-
-
-def test_rendered_cards_carry_client_contract_attributes(test_env):
-    """Served cards carry age, combo, source, position and version attributes."""
-    import re
-
+def test_page_embeds_the_feed_the_client_builds_cards_from(test_env):
+    """The page carries the /api/feed deck; no server-rendered cards."""
     port, db, regen_event, handler, user = test_env
     now = int(time.time())
     # 2 recent HN stories, 2 old archive stories. The reranker should
@@ -5690,44 +5400,29 @@ def test_rendered_cards_carry_client_contract_attributes(test_env):
         follow_redirects=True,
     )
     assert resp.status_code == 200
-    text = resp.text
-    # Both cards should be in the HTML.
-    recent_card_pat = re.search(
-        rf'<article class="story-card[^"]*"[^>]*data-story-id="{recent_id}"[^>]*>',
-        text,
-        re.DOTALL,
-    )
-    old_card_pat = re.search(
-        rf'<article class="story-card[^"]*"[^>]*data-story-id="{old_id}"[^>]*>',
-        text,
-        re.DOTALL,
-    )
-    assert recent_card_pat is not None, "Recent story card not in HTML"
-    assert old_card_pat is not None, "Old story card not in HTML"
-    recent_card = recent_card_pat.group(0)
-    old_card = old_card_pat.group(0)
-    assert 'data-is-recent="1"' in recent_card
-    assert 'data-is-recent="0"' in old_card
-
-    # Every served card carries the attributes the client filters, orders and
-    # logs interactions by.
+    # The page carries the deck as the /api/feed snapshot; the client builds
+    # every card from it.
     from bs4 import BeautifulSoup
 
-    soup = BeautifulSoup(text, "html.parser")
-    stories_el = soup.select_one("#stories")
-    assert stories_el is not None
-    page_version = stories_el["data-dashboard-version"]
-    cards = soup.select("article.story-card")
-    assert [int(str(c["data-position"])) for c in cards] == list(range(len(cards)))
-    for card in cards:
-        combos = str(card["data-combo"]).split()
-        age = "recent" if card["data-is-recent"] == "1" else "archive"
-        assert f"{age}_mixed" in combos
-        assert card["data-is-hn"] == "1"  # both fixtures are HN-family sources
-        assert card["data-dashboard-version"] == page_version
-        assert card["data-ranker-arm"] == "baseline"
-        kinds = {a["data-event-kind"] for a in card.select("a[data-event-kind]")}
-        assert "comments_open" in kinds
+    from clients.tui.src.hn_rerank.models import Feed
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    embedded = soup.select_one("script#feed-data")
+    assert embedded is not None
+    assert not soup.select("article.story-card")
+    feed = Feed.parse(json.loads(embedded.get_text()))
+    api = local_http.get(
+        f"http://127.0.0.1:{port}/api/feed", cookies={"hn_token": user.token}
+    ).json()
+    # Same deck (Explore is shuffled per render).
+    assert [s.id for s in feed.stories] == [s["id"] for s in api["stories"]]
+    assert {k: sorted(v) for k, v in feed.orders.items()} == {
+        k: sorted(v) for k, v in api["orders"].items()
+    }
+    by_id = {story.id: story for story in feed.stories}
+    assert "recent_mixed" in by_id[recent_id].memberships
+    assert "archive_mixed" in by_id[old_id].memberships
+    assert recent_id in feed.orders["date:archive"]
 
 
 def test_justext_rejects_sidebar_boilerplate() -> None:

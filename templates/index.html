@@ -440,10 +440,15 @@
       outline: none;
     }
 
-    .story-card.fade-out {
-      opacity: 0;
-      transform: translateX(var(--swipe-exit-x, 0)) translateY(10px) rotate(var(--swipe-exit-rotate, 0deg));
-      pointer-events: none;
+    .story-card.card-enter {
+      animation: card-enter 0.18s ease-out;
+    }
+
+    @keyframes card-enter {
+      from {
+        opacity: 0.2;
+        transform: translateX(var(--enter-x, 0)) translateY(6px);
+      }
     }
 
     .story-card:hover {
@@ -1006,12 +1011,7 @@
     <div class="swipe-layout">
       <div id="stories"
            data-user-id="{{ user_id or 0 }}"
-           data-user-token="{{ user_token or '' }}"
-           data-dashboard-version="{{ dashboard_version }}"
-           data-current-version="{{ dashboard_latest_version }}">
-      {% for card in cards %}
-      {% include "components/story_card.html" %}
-      {% endfor %}
+           data-user-token="{{ user_token or '' }}">
       <p id="queue-loading" class="queue-loading" hidden role="status" aria-live="polite">
         Loading more stories…
       </p>
@@ -1025,51 +1025,68 @@
   {% include "components/vote_bar.html" %}
   {% include "components/first_time_tip.html" %}
 
+  <script type="application/json" id="feed-data">{{ feed | tojson }}</script>
   <script>
-    const presentStoryIds = new Set();
-    document.querySelectorAll('.story-card').forEach(card => {
-      const storyId = card.dataset.storyId;
-      presentStoryIds.add(storyId);
-    });
-
-    // Swipe deck state
+    // The deck comes with the page as the same JSON snapshot /api/feed serves,
+    // and every card is built from it, like the terminal client: one feed,
+    // one reload path, one 60s version poll, votes sent in order, and one
+    // summary request per story.
     const storiesContainer = document.getElementById('stories');
     const toastEl = document.getElementById('toast');
     const queueLoadingEl = document.getElementById('queue-loading');
-    const sortTabs = Array.from(document.querySelectorAll('[data-sort]'));
-    const ageTabs = Array.from(document.querySelectorAll('[data-age]'));
-    const sourceTabs = Array.from(document.querySelectorAll('.tab-btn[data-source]'));
+    const statusEl = document.getElementById('queueStatus');
+    const sortTabs = Array.from(document.querySelectorAll('.tab-btn[data-sort]'));
+    const ageTabs = Array.from(document.querySelectorAll('.tab-btn[data-age]'));
     const voteBar = document.querySelector('.vote-bar');
     const sidePanel = document.querySelector('.swipe-side');
     const filterToggleBtn = document.querySelector('.filter-toggle-btn');
-    let activeCard = null;
-    let lastVote = null;
-    let nextVoteId = 1;
-    let currentSort = 'recommended';
-    let currentAge = 'recent';
-    let currentSource = 'mixed';
-    const votedStoryIds = new Set();
-    const feedbackChains = new Map();
-    // storyId -> id of the newest vote on it, so a late failure of an older
-    // vote can roll back only when nothing newer has replaced it.
-    const latestVoteIds = new Map();
-    const MAX_QUEUE = 12;
-    const PREFETCH_COUNT = 4;
-    const tldrCache = new Map(); // storyId (number) → raw TLDR markdown (string)
-    const tldrRetryAt = new Map(); // storyId → earliest retry time
-    let toastTimer = null;
-    let refillInFlight = false;
-    let queuedRefillAdvance = null;
-    let warmPollInFlight = false;
-    let warmMinVersion = null;
-    let latestWarmTargetVersion = null;
-    let lastScheduledWarmVersion = null;
-    let voteWarmIdleTimer = null;
-    let latestVoteTargetVersion = null;
-    const VOTED_STORAGE_LIMIT = 1000;
+
+    // Every view shows at most this many cards; the rest slide in as cards
+    // ahead of them are voted.
+    const VIEW_LIMIT = 12;
+    const SORTS = ['recommended', 'popular', 'explore', 'date'];
+    const REQUEST_TIMEOUT_MS = 10000;
+    // tldr-detail may hydrate the article and call the LLM (~2 min worst case).
+    const GENERATION_TIMEOUT_MS = 150000;
+    const POLL_INTERVAL_MS = 60000;
+    // Upcoming cards: the next few may be generated, a few more only read
+    // from the summary cache.
+    const PREFETCH_GENERATE = 3;
+    const PREFETCH_LOOKAHEAD = 10;
+    const PREFETCH_CONCURRENCY = 4;
+    const RETRY_MS = 60000;
     const INTERACTION_QUEUE_LIMIT = 256;
     const INTERACTION_BATCH_SIZE = 64;
     const INTERACTION_RETRY_DELAY_MS = 5000;
+
+    let feed = null;
+    let storiesById = new Map();
+    let currentSort = 'recommended';
+    let currentAge = 'recent';
+    // Interaction-event dimension; the deck has no source filter.
+    const currentSource = 'mixed';
+    let activeId = null;
+    let visible = [];                   // the current view's stories, in order
+    const cardEls = new Map();          // story id -> card element
+    const rankTint = new Map();         // story id -> border colour by rank
+    // Votes this session: hidden at once, before the server hears of them.
+    const rated = new Set();
+    const history = [];                 // {story, action}, newest last, for undo
+    const voteViews = new Map();        // story id -> view keys it was voted from
+    const restored = new Map();         // undone stories, until the ranked deck lands
+    const exploreOrders = new Map();    // view key -> client-shuffled order
+    let voteChain = Promise.resolve();
+    let votesInFlight = 0;
+    let reloadInFlight = null;
+    let toastTimer = null;
+    const summaries = new Map();        // story id -> {text, provisional}
+    const summaryRequests = new Map();  // story id -> {promise, generate}
+    const summaryErrors = new Map();    // story id -> message
+    const retryAt = new Map();          // story id -> no generation before (ms)
+    const cacheMissAt = new Map();      // story id -> no cache lookup before (ms)
+    let prefetchPausedUntil = 0;
+    let prefetchSlots = PREFETCH_CONCURRENCY;
+    const prefetchWaiters = [];
     const clientSessionId = (() => {
       try {
         const key = 'hnRewrite:interactionSessionId';
@@ -1086,64 +1103,666 @@
     let interactionFlushInFlight = false;
     let activeInteraction = null;
 
-    function cards() {
-      return Array.from(storiesContainer.querySelectorAll('.story-card'));
-    }
+    // Feed and views ------------------------------------------------------
 
-    function matchesCurrentCombo(card) {
-      const combos = (card.dataset.combo || '').split(' ');
-      // Date is the whole deck newest first, whichever Age tab is selected.
-      if (currentSort === 'date') {
-        return combos.some(combo => combo.endsWith('_' + currentSource));
+    function parseFeed(data) {
+      if (!data || data.api_version !== 1 || !Array.isArray(data.stories) ||
+          typeof data.orders !== 'object' || data.orders === null) {
+        throw new Error('Unsupported feed response');
       }
-      return combos.includes(currentAge + '_' + currentSource);
+      return data;
     }
 
-    function matchesCurrentAxes(card) {
-      if (currentSort === 'popular' && card.dataset.sortPopular !== '1') return false;
-      if (currentSort === 'explore' && card.dataset.sortExplore !== '1') return false;
-      if (currentSort === 'recommended' && card.dataset.sortRecommended === '0') return false;
-      if (currentSort === 'date' && card.dataset.sortDate !== '1') return false;
-      return true;
-    }
-
-    function isQueued(card) {
-      return !card.dataset.voted && matchesCurrentCombo(card) && matchesCurrentAxes(card);
-    }
-
-    // Every sort shows at most this many cards; unvoted cards past the cap
-    // slide in as cards ahead of them are voted.
-    const VIEW_LIMIT = 12;
-
-    function queuedCards() {
-      return cards().filter(isQueued).slice(0, VIEW_LIMIT);
-    }
-
-    function nextQueuedSibling(card) {
-      const queue = queuedCards();
-      for (let el = card.nextElementSibling; el; el = el.nextElementSibling) {
-        if (queue.includes(el)) return el;
+    function readEmbeddedFeed() {
+      const el = document.getElementById('feed-data');
+      try {
+        return el ? parseFeed(JSON.parse(el.textContent)) : null;
+      } catch (err) {
+        console.error('Unreadable embedded feed', err);
+        return null;
       }
+    }
+
+    function viewKey() {
+      return `${currentSort}:${currentAge}`;
+    }
+
+    // Story order for a "<sort>:<age>" view. Explore is a discovery deck:
+    // shuffled here, since the server order only reshuffles per version.
+    // Stories already placed keep their position; new ones go after them.
+    function viewOrder(key) {
+      const order = (feed && feed.orders[key]) || [];
+      if (!key.startsWith('explore:')) return order;
+      const members = new Set(order);
+      const kept = (exploreOrders.get(key) || []).filter(id => members.has(id));
+      const placed = new Set(kept);
+      const fresh = order.filter(id => !placed.has(id));
+      for (let i = fresh.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [fresh[i], fresh[j]] = [fresh[j], fresh[i]];
+      }
+      const shuffled = kept.concat(fresh);
+      exploreOrders.set(key, shuffled);
+      return shuffled.slice();
+    }
+
+    // Put an undone story back in the views it was voted from, where the
+    // server orders it: Date by time, the rest by rank score.
+    function restoreStory(story) {
+      if (!feed) return;
+      if (!storiesById.has(story.id)) {
+        feed.stories.push(story);
+        storiesById.set(story.id, story);
+      }
+      for (const key of voteViews.get(story.id) || []) {
+        const order = feed.orders[key] || (feed.orders[key] = []);
+        if (order.includes(story.id)) continue;
+        const rank = item => (key.startsWith('date:') ? item.time : item.rank_score);
+        let index = order.findIndex(id => rank(storiesById.get(id)) < rank(story));
+        if (index < 0) index = order.length;
+        order.splice(index, 0, story.id);
+      }
+    }
+
+    function setFeed(next) {
+      feed = next;
+      storiesById = new Map(next.stories.map(story => [story.id, story]));
+      if (feed.ready) {
+        restored.clear();
+      } else {
+        // Until the reranked deck lands it may lack undone stories.
+        restored.forEach(restoreStory);
+      }
+      // Cards and summaries are rebuilt from the new deck (counts and text
+      // may have changed), except the open card's.
+      for (const [id, card] of cardEls) {
+        if (id !== activeId) {
+          card.remove();
+          cardEls.delete(id);
+        }
+      }
+      for (const id of Array.from(summaries.keys())) {
+        if (id !== activeId) summaries.delete(id);
+      }
+      cacheMissAt.clear();
+      if (votesInFlight === 0) setVoteCounts(feed.feedback_counts || {});
+      tintByRank();
+      render();
+    }
+
+    // Rebuild the queue for the current view. The active story stays active
+    // while it is in the view; when it leaves (voted, reloaded away) the
+    // story after it takes over. FIRST shows the view's first story.
+    const FIRST = Symbol('first');
+    function render(selectId = activeId) {
+      const previous = visible.map(story => story.id);
+      visible = viewOrder(viewKey())
+        .filter(id => !rated.has(id) && storiesById.has(id))
+        .slice(0, VIEW_LIMIT)
+        .map(id => storiesById.get(id));
+      const ids = visible.map(story => story.id);
+      let next = selectId === FIRST ? ids[0] ?? null : ids.includes(selectId) ? selectId : null;
+      const index = previous.indexOf(activeId);
+      if (next === null && selectId !== FIRST && index >= 0) {
+        next = previous.slice(index + 1).find(id => ids.includes(id))
+          ?? ids[Math.min(index, ids.length - 1)] ?? null;
+      }
+      if (next === null) next = ids[0] ?? null;
+      const wanted = new Set(ids);
+      for (const [id, card] of cardEls) {
+        if (!wanted.has(id) && card.isConnected) card.remove();
+      }
+      // Only the active card is displayed, so DOM order doesn't matter; an
+      // attached card is never moved (that would reset its scroll).
+      for (const story of visible) {
+        let card = cardEls.get(story.id);
+        if (!card) {
+          card = feedCard(story, feed.version);
+          cardEls.set(story.id, card);
+        }
+        if (!card.isConnected) storiesContainer.insertBefore(card, queueLoadingEl);
+      }
+      setActive(next);
+    }
+
+    function activeCard() {
+      return activeId === null ? null : cardEls.get(activeId) || null;
+    }
+
+    function setActive(id) {
+      const changed = id !== activeId;
+      if (changed) endInteraction();
+      activeId = id;
+      for (const [cardId, card] of cardEls) {
+        card.classList.toggle('active', cardId === id);
+      }
+      const card = activeCard();
+      if (card) {
+        if (changed) {
+          beginInteraction(card, true);
+        } else if (activeInteraction === null) {
+          beginInteraction(card, false);
+        }
+        voteBar.hidden = false;
+        loadSummary(id);
+        focusActiveCard();
+      } else {
+        voteBar.hidden = true;
+      }
+      updateStatus();
+      prefetchUpcoming();
+    }
+
+    function move(delta) {
+      if (visible.length === 0) return;
+      const index = visible.findIndex(story => story.id === activeId);
+      const next = (Math.max(index, 0) + delta + visible.length) % visible.length;
+      setActive(visible[next].id);
+    }
+
+    function updateStatus() {
+      const ranking = feed && !feed.ready;
+      queueLoadingEl.hidden = activeId !== null;
+      queueLoadingEl.textContent = !feed || ranking
+        ? 'Loading more stories…'
+        : 'Nothing left in this view. Try another sort, or refresh.';
+      if (statusEl) {
+        statusEl.textContent = `Queued ${visible.length}` + (ranking ? ' · ranking…' : '');
+      }
+    }
+
+    function focusActiveCard() {
+      // Let the first-time tip retain its initial focus until dismissed.
+      const tip = document.getElementById('first-time-tip');
+      const card = activeCard();
+      if (card?.isConnected && (!tip || tip.hidden || !tip.contains(document.activeElement))) {
+        card.focus({ preventScroll: true });
+      }
+    }
+
+    function setFilter(filterName, value) {
+      sidePanel.classList.remove('visible');
+      if (filterName === 'sort' && value !== currentSort) {
+        currentSort = value;
+        sortTabs.forEach(tab => tab.classList.toggle('active', tab.dataset.sort === value));
+      } else if (filterName === 'age' && value !== currentAge) {
+        currentAge = value;
+        ageTabs.forEach(tab => tab.classList.toggle('active', tab.dataset.age === value));
+      } else {
+        return;
+      }
+      // One card shows at a time: a new view starts at its first story.
+      render(FIRST);
+      focusActiveCard();
+    }
+
+    function cycleSort(delta) {
+      const index = SORTS.indexOf(currentSort);
+      setFilter('sort', SORTS[(index + delta + SORTS.length) % SORTS.length]);
+    }
+
+    // Rank 1 (top) = saturated orange, the last rank a pale tint. One hue,
+    // so it reads as "more relevant -> less" rather than good -> bad.
+    function tintByRank() {
+      rankTint.clear();
+      const ranked = (feed ? feed.stories : []).slice().sort((a, b) => b.rank_score - a.rank_score);
+      ranked.forEach((story, i) => {
+        const t = ranked.length <= 1 ? 0 : i / (ranked.length - 1);
+        rankTint.set(story.id, `hsl(24, ${Math.round(100 - 20 * t)}%, ${(45 + 23 * t).toFixed(1)}%)`);
+      });
+    }
+
+    function feedCard(story, version) {
+      const card = document.createElement('article');
+      card.className = 'story-card' + (story.enriched ? ' enriched' : '');
+      card.tabIndex = -1;
+      Object.assign(card.dataset, {
+        storyId: String(story.id), dashboardVersion: String(version),
+        rankerArm: 'baseline', storySource: story.source,
+        articleUrl: story.article_url, commentsUrl: story.comments_url,
+      });
+      const tint = rankTint.get(story.id);
+      if (tint && card.style) {
+        card.style.borderLeftColor = tint;
+        card.style.backgroundColor = `color-mix(in srgb, var(--pico-card-background-color) 96%, ${tint} 4%)`;
+      }
+      const header = document.createElement('div');
+      header.className = 'story-header';
+      for (const badge of story.badge_details || []) {
+        const span = document.createElement('span');
+        span.className = 'badge badge--' + badge.kind;
+        span.title = badge.tooltip;
+        span.textContent = `${badge.icon} ${badge.label}`;
+        header.appendChild(span);
+      }
+      if (story.source !== 'hn') {
+        const source = document.createElement('span');
+        source.className = 'source-badge';
+        source.title = story.source;
+        source.textContent = story.source_label;
+        header.appendChild(source);
+      }
+      if (story.domain) {
+        const domain = document.createElement('span');
+        domain.className = 'domain-chip';
+        domain.textContent = story.domain;
+        header.appendChild(domain);
+      }
+      if (story.points > 0) {
+        const points = document.createElement('span');
+        points.textContent = `${story.points} pts`;
+        header.appendChild(points);
+      }
+      const age = document.createElement('span');
+      const seconds = Math.max(0, Math.floor(Date.now() / 1000) - story.time);
+      age.textContent = seconds < 60 ? `${seconds}s ago` : seconds < 3600
+        ? `${Math.floor(seconds / 60)}m ago` : seconds < 86400
+        ? `${Math.floor(seconds / 3600)}h ago` : `${Math.floor(seconds / 86400)}d ago`;
+      header.appendChild(age);
+      if (story.comments_url) {
+        const comments = document.createElement('a');
+        comments.href = story.comments_url;
+        comments.dataset.eventKind = 'comments_open';
+        comments.target = '_blank';
+        comments.rel = 'noopener';
+        comments.textContent = `💬${story.comments === null ? '' : ' ' + story.comments} comments`;
+        header.appendChild(comments);
+      }
+      card.appendChild(header);
+      const heading = document.createElement('h2');
+      heading.className = 'story-title';
+      const link = document.createElement('a');
+      link.href = story.article_url || story.comments_url;
+      link.dataset.eventKind = story.article_url ? 'article_open' : 'comments_open';
+      link.target = '_blank';
+      link.rel = 'noopener';
+      link.textContent = story.title;
+      heading.appendChild(link);
+      card.appendChild(heading);
+      const footer = document.createElement('div');
+      footer.className = 'story-footer';
+      card.appendChild(footer);
+      if (story.best_match_title) {
+        const reason = document.createElement('p');
+        reason.className = 'match-reason';
+        reason.textContent = `Because you upvoted: ${story.best_match_title}`;
+        card.appendChild(reason);
+      }
+      return card;
+    }
+
+    // Network ---------------------------------------------------------------
+
+    function routePrefix() {
+      if (window.location.pathname.startsWith('/hn')) return '/hn';
+      return '';
+    }
+
+    function apiPath(path) {
+      return `${routePrefix()}${path}`;
+    }
+
+    function profileLink() {
+      const token = storiesContainer?.dataset.userToken || '';
+      if (!token) return '';
+      return `${window.location.origin}${routePrefix()}/u/${encodeURIComponent(token)}`;
+    }
+
+    // Every request has a deadline: 10s, or 150s for summary generation.
+    async function request(path, { method = 'GET', body, timeoutMs = REQUEST_TIMEOUT_MS } = {}) {
+      const controller = new AbortController();
+      const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+      const init = { method, cache: 'no-store', signal: controller.signal };
+      if (body !== undefined) {
+        init.headers = { 'Content-Type': 'application/json' };
+        init.body = JSON.stringify(body);
+      }
+      try {
+        return await fetch(apiPath(path), init);
+      } catch (err) {
+        throw new Error(err?.name === 'AbortError' ? 'Timed out' : 'Network error');
+      } finally {
+        window.clearTimeout(timer);
+      }
+    }
+
+    // Freshness -------------------------------------------------------------
+
+    // The one way a new deck arrives: the poller, and a manual refresh.
+    async function reload({ manual = false } = {}) {
+      if (manual) {
+        // Like a fresh page: regenerate the open summary too.
+        if (activeId !== null) loadSummary(activeId, { force: true });
+      }
+      if (reloadInFlight) return reloadInFlight;
+      reloadInFlight = (async () => {
+        try {
+          const resp = await request('/api/feed');
+          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+          setFeed(parseFeed(await resp.json()));
+        } catch (err) {
+          console.error('Failed to refresh deck', err);
+          if (manual) showToast(`Refresh failed: ${err.message}`, 'error');
+        } finally {
+          reloadInFlight = null;
+          updateStatus();
+        }
+      })();
+      updateStatus();
+      return reloadInFlight;
+    }
+
+    // Every minute (and when the tab comes back): reload when the server has
+    // a newer deck. A current deck waits for any new version (a regen, a vote
+    // elsewhere); a stale one waits for the reranked deck it is missing.
+    async function pollFeedVersion() {
+      if (!feed || reloadInFlight || document.visibilityState === 'hidden') return;
+      const snapshot = feed;
+      const wanted = snapshot.ready ? snapshot.version : snapshot.target_version;
+      let data;
+      try {
+        const resp = await request(`/api/ranking-ready?min_version=${wanted}&target_version=${wanted}`);
+        if (!resp.ok) return;
+        data = await resp.json();
+      } catch {
+        return;  // passive: keep the deck we have
+      }
+      if (feed !== snapshot || !Number.isFinite(data?.current_version)) return;
+      const newer = snapshot.ready ? data.current_version !== snapshot.version : data.ready === true;
+      if (newer) reload();
+    }
+
+    // Votes -------------------------------------------------------------------
+
+    function setVoteCounts(counts) {
+      for (const action of ['up', 'neutral', 'down']) {
+        const el = document.querySelector(`[data-vote-count="${action}"]`);
+        if (el) el.textContent = String(Math.max(0, Number(counts[action] || 0)));
+      }
+    }
+
+    function adjustVoteCount(action, delta) {
+      const el = document.querySelector(`[data-vote-count="${action}"]`);
+      if (el) el.textContent = String(Math.max(0, Number(el.textContent || '0') + delta));
+    }
+
+    function applyVote(story, action) {
+      rated.add(story.id);
+      restored.delete(story.id);
+      history.push({ story, action });
+      voteViews.set(story.id, Object.keys(feed.orders).filter(key => feed.orders[key].includes(story.id)));
+      adjustVoteCount(action, 1);
+      render();
+    }
+
+    function applyUndo(story) {
+      const index = history.findLastIndex(entry => entry.story.id === story.id);
+      if (index >= 0) {
+        adjustVoteCount(history[index].action, -1);
+        history.splice(index, 1);
+      }
+      rated.delete(story.id);
+      restored.set(story.id, story);
+      restoreStory(story);
+      render(story.id);
+    }
+
+    // Hide the story and move on now; the server hears about it next.
+    function vote(action) {
+      const story = storiesById.get(activeId);
+      if (!story) return;
+      applyVote(story, action);
+      enterFrom(action);
+      submit(story, action);
+    }
+
+    function undo() {
+      const entry = history[history.length - 1];
+      if (!entry) return;
+      applyUndo(entry.story);
+      submit(entry.story, 'clear', entry.action);
+    }
+
+    // One request at a time, so the server sees votes and undos in the order
+    // they were made. A failed one is reverted, never retried: the server may
+    // or may not have it.
+    function submit(story, action, undoneAction = null) {
+      votesInFlight += 1;
+      voteChain = voteChain.then(async () => {
+        let target;
+        try {
+          const resp = await request('/api/feedback', {
+            method: 'POST', body: { story_id: story.id, action },
+          });
+          const data = await resp.json().catch(() => ({}));
+          if (!resp.ok || data.ok !== true || !Number.isFinite(data.target_version)) {
+            throw new Error(data.error || `HTTP ${resp.status}`);
+          }
+          target = data.target_version;
+        } catch (err) {
+          if (action === 'clear') {
+            applyVote(story, undoneAction || 'neutral');
+          } else {
+            applyUndo(story);
+          }
+          showToast(`Vote not confirmed, so the story is back; check before voting again. (${err.message})`, 'error');
+          return;
+        }
+        if (feed && target > feed.version) {
+          // The poller loads the reranked deck once the server has it.
+          feed = { ...feed, target_version: target, ready: false };
+          updateStatus();
+        }
+      }).catch(err => console.error(err)).finally(() => {
+        votesInFlight -= 1;
+      });
+      return voteChain;
+    }
+
+    // The next card slides in from the side the vote pushed the last one to.
+    function enterFrom(action) {
+      const card = activeCard();
+      if (!card || !card.style) return;
+      card.style.setProperty('--enter-x', action === 'up' ? '-24px' : action === 'down' ? '24px' : '0');
+      card.classList.remove('card-enter');
+      void card.offsetWidth;
+      card.classList.add('card-enter');
+    }
+
+    function openStoryUrl(kind) {
+      const story = storiesById.get(activeId);
+      const url = story && (kind === 'article' ? story.article_url : story.comments_url);
+      if (!url) return;
+      queueInteraction(kind === 'article' ? 'article_open' : 'comments_open', activeCard());
+      flushInteractionEvents();
+      window.open(url, '_blank', 'noopener,noreferrer');
+    }
+
+    // Summaries -----------------------------------------------------------
+
+    // One request per story, shared by the open card and prefetch. A cache
+    // lookup never generates; a generation joins one already running (the
+    // server does the same across clients).
+    function summaryFor(id, { generate, force = false, background = false }) {
+      const now = Date.now();
+      const known = summaries.get(id);
+      if (!force && known && (!known.provisional || now < (retryAt.get(id) || 0))) {
+        return Promise.resolve(known);
+      }
+      const inFlight = summaryRequests.get(id);
+      if (inFlight) {
+        if (inFlight.generate || !generate) return inFlight.promise;
+        return inFlight.promise.then(found => (found && !found.provisional
+          ? found
+          : summaryFor(id, { generate, force, background })));
+      }
+      if (!generate) {
+        if (now < (cacheMissAt.get(id) || 0)) return Promise.resolve(null);
+        return track(id, false, lookupSummary(id));
+      }
+      if (!force && now < (retryAt.get(id) || 0)) return Promise.resolve(known || null);
+      return track(id, true, generateSummary(id, force, background));
+    }
+
+    function track(id, generate, promise) {
+      const entry = {
+        generate,
+        promise: promise.finally(() => {
+          if (summaryRequests.get(id) === entry) summaryRequests.delete(id);
+        }),
+      };
+      summaryRequests.set(id, entry);
+      return entry.promise;
+    }
+
+    async function lookupSummary(id) {
+      try {
+        const resp = await request(`/api/tldr-cache/${id}`);
+        if (resp.status === 200) {
+          const data = await resp.json();
+          if (typeof data.tldr === 'string') return keepSummary(id, data);
+        }
+      } catch (err) {
+        console.debug('summary cache lookup failed', err);
+      }
+      cacheMissAt.set(id, Date.now() + RETRY_MS);
       return null;
     }
 
-    function newInteractionEventId() {
-      return crypto.randomUUID();
+    async function generateSummary(id, force, background) {
+      let message;
+      let retryAfterS = RETRY_MS / 1000;
+      try {
+        const resp = await request('/api/tldr-detail', {
+          method: 'POST',
+          body: { story_id: id, force_refresh: force },
+          timeoutMs: GENERATION_TIMEOUT_MS,
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (resp.ok && data.empty) {
+          // Nothing summarizable yet (comments may grow, the article may
+          // unblock): a notice, retried later, never kept as a summary.
+          message = 'no summarizable content for this story yet.';
+        } else if (resp.ok && typeof data.tldr === 'string') {
+          summaryErrors.delete(id);
+          return keepSummary(id, data);
+        } else {
+          message = data.error || `HTTP ${resp.status}`;
+          const header = Number(resp.headers?.get?.('Retry-After') || data.retry_after);
+          if (Number.isFinite(header) && header > 0) retryAfterS = header;
+        }
+      } catch (err) {
+        message = err.message;
+      }
+      summaryErrors.set(id, message);
+      retryAt.set(id, Date.now() + retryAfterS * 1000);
+      if (background) prefetchPausedUntil = Date.now() + RETRY_MS;
+      return null;
     }
+
+    function keepSummary(id, data) {
+      // Stale or retryable text is shown but asked for again later.
+      const summary = { text: data.tldr, provisional: !!(data.stale || data.retryable) };
+      summaries.set(id, summary);
+      if (summary.provisional) retryAt.set(id, Date.now() + RETRY_MS);
+      return summary;
+    }
+
+    async function loadSummary(id, { force = false } = {}) {
+      const pending = summaryFor(id, { generate: true, force });
+      showSummary(id);
+      await pending;
+      showSummary(id);
+    }
+
+    // Draw a story's summary state into its card (open or not).
+    function showSummary(id) {
+      const card = cardEls.get(id);
+      if (!card) return;
+      let contentDiv = card.querySelector('.tldr-detail-content');
+      if (!contentDiv) {
+        contentDiv = document.createElement('div');
+        contentDiv.className = 'tldr-detail-content';
+        card.appendChild(contentDiv);
+      }
+      const summary = summaries.get(id);
+      const request = summaryRequests.get(id);
+      const loading = !!request && (request.generate || id === activeId);
+      delete contentDiv.dataset.error;
+      if (summary && !(loading && summary.provisional)) {
+        contentDiv.innerHTML = parseSimpleMarkdown(summary.text);
+        styleTldrLabels(contentDiv);
+        enhanceTldrContent(contentDiv, { stale: summary.provisional });
+        if (!summary.provisional) ensureTldrRefreshButton(id, contentDiv);
+      } else if (loading) {
+        contentDiv.textContent = 'Loading TLDR...';
+      } else if (summaryErrors.has(id)) {
+        contentDiv.textContent = 'TLDR: ' + summaryErrors.get(id);
+        contentDiv.dataset.error = 'true';
+      } else {
+        contentDiv.textContent = '';
+      }
+      contentDiv.style.display = contentDiv.textContent || contentDiv.children.length ? 'block' : 'none';
+    }
+
+    function ensureTldrRefreshButton(id, contentDiv) {
+      contentDiv.querySelectorAll('.tldr-refresh-btn').forEach(el => el.remove());
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'tldr-refresh-btn';
+      btn.textContent = '↻ re-summarize';
+      btn.addEventListener('click', e => {
+        e.stopPropagation();
+        loadSummary(id, { force: true });
+      });
+      contentDiv.appendChild(btn);
+    }
+
+    async function withPrefetchSlot(task) {
+      if (prefetchSlots > 0) {
+        prefetchSlots -= 1;
+      } else {
+        await new Promise(resolve => prefetchWaiters.push(resolve));
+      }
+      try {
+        return await task();
+      } finally {
+        const next = prefetchWaiters.shift();
+        if (next) next(); else prefetchSlots += 1;
+      }
+    }
+
+    // Upcoming cards in navigation order (wrapping): the nearest may be
+    // generated, the rest only read from the cache. A failed background
+    // generation pauses generating for a minute.
+    function prefetchUpcoming() {
+      const index = visible.findIndex(story => story.id === activeId);
+      if (index < 0) return;
+      const upcoming = visible.slice(index + 1).concat(visible.slice(0, index))
+        .slice(0, PREFETCH_LOOKAHEAD);
+      upcoming.forEach((story, i) => {
+        const id = story.id;
+        if (summaries.has(id) || summaryRequests.has(id)) return;
+        withPrefetchSlot(() => {
+          if (!visible.some(item => item.id === id) || summaries.has(id)) return null;
+          const generate = i < PREFETCH_GENERATE && Date.now() >= prefetchPausedUntil;
+          return summaryFor(id, { generate, background: true });
+        }).then(() => showSummary(id));
+      });
+    }
+
+    // Interactions -------------------------------------------------------
 
     function queueInteraction(eventType, card, durationMs = null) {
       if (!card) return;
-      const visiblePosition = queuedCards().indexOf(card);
-      const position = visiblePosition >= 0
-        ? visiblePosition
-        : Number(card.dataset.position || 0);
-      if (visiblePosition >= 0) card.dataset.position = String(visiblePosition);
+      const storyId = Number(card.dataset.storyId);
+      const position = visible.findIndex(story => story.id === storyId);
       interactionEvents.push({
-        event_id: newInteractionEventId(),
+        event_id: crypto.randomUUID(),
         client_session_id: clientSessionId,
-        story_id: Number(card.dataset.storyId),
+        story_id: storyId,
         event_type: eventType,
-        dashboard_version: Number(card.dataset.dashboardVersion || storiesContainer?.dataset.dashboardVersion || 0),
+        dashboard_version: Number(card.dataset.dashboardVersion || 0),
         position: Math.max(0, position),
         sort_mode: currentSort,
         age_filter: currentAge,
@@ -1213,230 +1832,6 @@
       activeInteraction = null;
     }
 
-    // Map a story's rank position (sorted by data-score desc) to an
-    // HN-orange intensity. Rank 1 (top) = saturated orange, rank N =
-    // pale tint. Single-hue (rather than blue->red) so the encoding reads
-    // as "more relevant -> less" instead of "good -> bad", which fought
-    // voting semantics. Rank-percentile mapping keeps colors
-    // distinguishable even when scores cluster near 1.0.
-    function applyGradient() {
-      const cards = Array.from(document.querySelectorAll('.story-card'));
-      const N = cards.length;
-      if (N <= 1) return;
-      const ranked = cards
-        .map(card => ({ card, score: parseFloat(card.dataset.score) || 0 }))
-        .sort((a, b) => b.score - a.score);
-      ranked.forEach((entry, i) => {
-        // t=0 -> top rank -> saturated (45%); t=1 -> bottom -> still
-        // visible on the dark terminal bg (68%, floor raised vs light).
-        const t = N === 1 ? 0 : i / (N - 1);
-        const light = (45 + 23 * t).toFixed(1);
-        const sat = Math.round(100 - 20 * t);
-        entry.card.style.borderLeftColor = `hsl(24, ${sat}%, ${light}%)`;
-        entry.card.style.backgroundColor = `color-mix(in srgb, var(--pico-card-background-color) 96%, hsl(24, ${sat}%, ${light}%) 4%)`;
-      });
-    }
-
-    function orderCards(comparator) {
-      // Exclude the active card: it's the only visible card (the rest are
-      // display:none), so reordering it is a no-op visually but the
-      // appendChild move resets its internal scroll position (it's the
-      // element the user is actively reading/scrolling). Leaving it in
-      // place avoids that disruption; its stale DOM position only affects
-      // queuedCards() ordering, and it's removed from the queue on vote
-      // anyway.
-      const cards = Array.from(document.querySelectorAll('.story-card')).filter(card => card !== activeCard);
-      cards.sort(comparator);
-      cards.forEach(card => storiesContainer.appendChild(card));
-    }
-
-    function orderForCurrentSort() {
-      if (currentSort === 'date') {
-        orderCards((a, b) => Number(b.dataset.time || 0) - Number(a.dataset.time || 0));
-      } else if (currentSort === 'explore') {
-        orderCards(() => Math.random() - 0.5);
-      } else {
-        orderCards((a, b) => parseFloat(b.dataset.score) - parseFloat(a.dataset.score));
-      }
-    }
-
-    function advanceToNextCard() {
-      const q = queuedCards();
-      if (q.length === 0) return;
-      const idx = activeCard ? q.indexOf(activeCard) : -1;
-      const next = q[(idx + 1) % q.length];
-      setActiveCard(next);
-    }
-
-    function focusActiveCard() {
-      // Let the first-time tip retain its initial focus until dismissed.
-      const tip = document.getElementById('first-time-tip');
-      if (
-        activeCard?.isConnected &&
-        (!tip || tip.hidden || !tip.contains(document.activeElement))
-      ) {
-        activeCard.focus({ preventScroll: true });
-      }
-    }
-
-    function setActiveCard(card) {
-      const changed = activeCard !== card;
-      if (changed) {
-        endInteraction();
-      }
-      cards().forEach(c => c.classList.toggle('active', c === card));
-      activeCard = card || null;
-      if (activeCard) {
-        if (changed) {
-          beginInteraction(activeCard, true);
-        } else if (activeInteraction === null) {
-          beginInteraction(activeCard, false);
-        }
-        openTldrDetail(activeCard);
-        voteBar.hidden = false;
-        updateVoteBar();
-        focusActiveCard();
-      } else {
-        document.querySelectorAll('[data-fb]').forEach(btn => btn.classList.remove('active'));
-        voteBar.hidden = true;
-      }
-      updateQueueLoading();
-      prefetchUpcomingTldrs();
-    }
-
-    document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'hidden') {
-        endInteraction();
-        flushInteractionEvents();
-      } else if (activeCard && activeInteraction === null) {
-        beginInteraction(activeCard, false);
-      }
-    });
-    window.addEventListener('pagehide', () => {
-      endInteraction();
-      flushInteractionEvents();
-    });
-
-    function updateQueueLoading() {
-      const refreshPending = (
-        refillInFlight || warmPollInFlight || voteWarmIdleTimer !== null
-      );
-      queueLoadingEl.hidden = !(refreshPending && activeCard === null);
-      const statusEl = document.getElementById('queueStatus');
-      if (statusEl) {
-        const n = queuedCards().length;
-        statusEl.textContent = refreshPending
-          ? `Queued ${n} · warming…`
-          : `Queued ${n}`;
-      }
-    }
-
-    function updateVoteBar() {
-      document.querySelectorAll('[data-fb]').forEach(btn => {
-        btn.classList.toggle('active', btn.dataset.fb === activeCard?.dataset.voted);
-      });
-    }
-
-    function showNextCard({ allowRefresh = true, excludeActive = false, preferred = null } = {}) {
-      const queue = queuedCards();
-      const usePreferred =
-        preferred && preferred.isConnected && queue.includes(preferred) &&
-        (!excludeActive || preferred !== activeCard);
-      const next = usePreferred
-        ? preferred
-        : queue.find(card => !excludeActive || card !== activeCard);
-      if (next) {
-        setActiveCard(next);
-        return;
-      }
-      setActiveCard(null);
-      if (allowRefresh) {
-        scheduleDeckRefresh({ advance: true });
-      }
-    }
-
-    const FILTERS = {
-      sort: { tabs: sortTabs, attr: 'data-sort' },
-      age: { tabs: ageTabs, attr: 'data-age' },
-      source: { tabs: sourceTabs, attr: 'data-source' },
-    };
-
-    function updateFilterTabs(filterName, value) {
-      const filter = FILTERS[filterName];
-      filter.tabs.forEach(tab => {
-        tab.classList.toggle('active', tab.getAttribute(filter.attr) === value);
-      });
-    }
-
-    function setFilter(filterName, value) {
-      if (filterName === 'sort' && value === 'popular' && currentSource === 'non-hn') {
-        return;
-      }
-      sidePanel.classList.remove('visible');
-
-      if (filterName === 'sort') {
-        if (value === currentSort) {
-          advanceToNextCard();
-          return;
-        }
-        currentSort = value;
-        updateFilterTabs('sort', currentSort);
-        sourceTabs.forEach(tab => {
-          tab.disabled = (value === 'popular' && tab.dataset.source !== 'hn');
-        });
-        if (value === 'popular' && currentSource !== 'hn') {
-          currentSource = 'hn';
-          updateFilterTabs('source', currentSource);
-        }
-        if (activeCard && !matchesCurrentAxes(activeCard)) {
-          activeCard.classList.remove('active');
-        }
-        orderForCurrentSort();
-        // Recommended and Date can both include the visible card. A sort
-        // change must still move to the newly ordered deck immediately.
-        showNextCard({ allowRefresh: false, excludeActive: true });
-        focusActiveCard();
-        scheduleDeckRefresh({ advance: true });
-        return;
-      }
-
-      if (filterName === 'age') {
-        if (value === currentAge) return;
-        currentAge = value;
-        updateFilterTabs('age', currentAge);
-        if (activeCard && (!matchesCurrentCombo(activeCard) || !matchesCurrentAxes(activeCard))) {
-          activeCard.classList.remove('active');
-        }
-        orderForCurrentSort();
-        showNextCard({ allowRefresh: false });
-        focusActiveCard();
-        scheduleDeckRefresh({ advance: true });
-        return;
-      }
-
-      if (filterName !== 'source') {
-        return;
-      }
-
-      currentSource = value;
-      updateFilterTabs('source', currentSource);
-      const popularTab = sortTabs.find(t => t.dataset.sort === 'popular');
-      if (popularTab) popularTab.disabled = (value === 'non-hn');
-      if (currentSort === 'popular' && value === 'non-hn') {
-        currentSort = 'recommended';
-        updateFilterTabs('sort', currentSort);
-      }
-      if (activeCard && (!matchesCurrentCombo(activeCard) || !matchesCurrentAxes(activeCard))) {
-        activeCard.classList.remove('active');
-      }
-      orderForCurrentSort();
-      showNextCard({ allowRefresh: false });
-      focusActiveCard();
-      scheduleDeckRefresh({ advance: true });
-    }
-
-    applyGradient();
-
     // Snarkdown - 1KB markdown parser (https://github.com/developit/snarkdown)
     const TAGS={'':['<em>','</em>'],_:['<strong>','</strong>'],'*':['<strong>','</strong>'],'~':['<s>','</s>'],'\n':['<br />'],' ':['<br />'],'-':['<hr />']};
     function outdent(str){return str.replace(RegExp('^'+(str.match(/^(\t| )+/)||'')[0],'gm'),'')}
@@ -1498,688 +1893,6 @@
       });
     }
 
-    function showToast(message, variant) {
-      const kind = variant || 'info';
-      toastEl.textContent = message;
-      toastEl.className = `toast toast--${kind}`;
-      toastEl.hidden = false;
-      if (toastTimer) {
-        clearTimeout(toastTimer);
-      }
-      toastTimer = window.setTimeout(() => {
-        toastEl.hidden = true;
-        toastTimer = null;
-      }, 3000);
-    }
-
-    const copyProfileLinkButton = document.getElementById('copyProfileLink');
-    if (copyProfileLinkButton) {
-      copyProfileLinkButton.addEventListener('click', async () => {
-        const link = profileLink();
-        if (!link) return;
-        try {
-          await navigator.clipboard.writeText(link);
-          showToast('Profile link copied', 'success');
-        } catch {
-          showToast(link, 'info');
-        }
-      });
-    }
-
-    function routePrefix() {
-      if (window.location.pathname.startsWith('/hn')) return '/hn';
-      return '';
-    }
-
-    function apiPath(path) {
-      return `${routePrefix()}${path}`;
-    }
-
-    function feedbackPath() {
-      return apiPath('/api/feedback');
-    }
-
-    function profileLink() {
-      const token = storiesContainer?.dataset.userToken || '';
-      if (!token) return '';
-      return `${window.location.origin}${routePrefix()}/u/${encodeURIComponent(token)}`;
-    }
-
-    function rankingReadyPath(minVersion, targetVersion) {
-      return `${apiPath('/api/ranking-ready')}?min_version=${encodeURIComponent(minVersion)}&target_version=${encodeURIComponent(targetVersion)}`;
-    }
-
-    function votedStorageKey() {
-      const userId = storiesContainer?.dataset.userId || '0';
-      return `hnRewrite:votedStoryIds:${userId}`;
-    }
-
-    function readStoredVotedStoryIds() {
-      try {
-        const raw = window.localStorage.getItem(votedStorageKey());
-        if (!raw) return [];
-        const parsed = JSON.parse(raw);
-        if (!Array.isArray(parsed)) return [];
-        return parsed
-          .map(value => Number(value))
-          .filter(value => Number.isSafeInteger(value));
-      } catch (err) {
-        console.debug('Unable to read persisted voted story ids', err);
-        return [];
-      }
-    }
-
-    function writeStoredVotedStoryIds() {
-      try {
-        const ids = Array.from(votedStoryIds)
-          .filter(value => Number.isSafeInteger(value))
-          .slice(-VOTED_STORAGE_LIMIT);
-        window.localStorage.setItem(votedStorageKey(), JSON.stringify(ids));
-      } catch (err) {
-        console.debug('Unable to persist voted story ids', err);
-      }
-    }
-
-    function rememberVotedStoryId(storyId) {
-      votedStoryIds.add(storyId);
-      writeStoredVotedStoryIds();
-    }
-
-    function forgetVotedStoryId(storyId) {
-      votedStoryIds.delete(storyId);
-      writeStoredVotedStoryIds();
-    }
-
-    function seedVotedStoryIdsFromStorage() {
-      readStoredVotedStoryIds().forEach(storyId => votedStoryIds.add(storyId));
-      let removedStoredVotes = 0;
-      cards().forEach(card => {
-        const storyId = Number(card.dataset.storyId);
-        if (votedStoryIds.has(storyId)) {
-          card.dataset.voted = 'stored';
-          card.remove();
-          removedStoredVotes += 1;
-        }
-      });
-      if (removedStoredVotes > 0) {
-        console.debug(
-          `removed ${removedStoredVotes} persisted voted card(s) from stale page cache`
-        );
-      }
-    }
-
-    function waitForVoteRemoval() {
-      if (!activeCard?.dataset.voted) {
-        return Promise.resolve();
-      }
-      return new Promise(resolve => {
-        window.requestAnimationFrame(() => {
-          if (!activeCard?.dataset.voted) {
-            resolve();
-            return;
-          }
-          window.setTimeout(resolve, 180);
-        });
-      });
-    }
-
-    function scheduleDeckRefresh({ advance = true, waitForWarm = false, targetVersion = null } = {}) {
-      if (waitForWarm) {
-        if (typeof targetVersion !== 'number' || !Number.isFinite(targetVersion) || targetVersion < 0) {
-          return;
-        }
-        if (lastScheduledWarmVersion !== null && targetVersion <= lastScheduledWarmVersion) {
-          return;
-        }
-        lastScheduledWarmVersion = targetVersion;
-        latestWarmTargetVersion = Math.max(latestWarmTargetVersion || 0, targetVersion);
-        if (warmMinVersion === null) {
-          warmMinVersion = targetVersion;
-        }
-        runWarmPollLoop();
-        return;
-      }
-
-      queueRefill(advance);
-    }
-
-    function scheduleVoteRefresh(data) {
-      latestVoteTargetVersion = data.target_version;
-      queueRefill(false);
-      if (voteWarmIdleTimer !== null) {
-        window.clearTimeout(voteWarmIdleTimer);
-        voteWarmIdleTimer = null;
-      }
-      if (data.ranking_refresh_queued) {
-        scheduleDeckRefresh({ waitForWarm: true, targetVersion: data.target_version, advance: false });
-        return;
-      }
-      const idleMs = Number(data.ranking_idle_seconds) * 1000;
-      if (!Number.isFinite(idleMs) || idleMs <= 0) return;
-      voteWarmIdleTimer = window.setTimeout(() => {
-        voteWarmIdleTimer = null;
-        if (latestVoteTargetVersion !== null) {
-          scheduleDeckRefresh({ waitForWarm: true, targetVersion: latestVoteTargetVersion, advance: false });
-        }
-        updateQueueLoading();
-      }, idleMs);
-      updateQueueLoading();
-    }
-
-    function queueRefill(advance) {
-      queuedRefillAdvance = queuedRefillAdvance === null ? advance : queuedRefillAdvance || advance;
-      runRefillLoop();
-    }
-
-    async function runRefillLoop() {
-      if (refillInFlight) {
-        return;
-      }
-      refillInFlight = true;
-      updateQueueLoading();
-      try {
-        while (queuedRefillAdvance !== null) {
-          const advance = queuedRefillAdvance;
-          queuedRefillAdvance = null;
-          try {
-            await refillQueue({ advance });
-          } catch (err) {
-            console.error('Failed to refresh deck', err);
-          }
-        }
-      } finally {
-        refillInFlight = false;
-        updateQueueLoading();
-      }
-    }
-
-    async function runWarmPollLoop() {
-      if (warmPollInFlight) {
-        return;
-      }
-      warmPollInFlight = true;
-      updateQueueLoading();
-      try {
-        while (warmMinVersion !== null && latestWarmTargetVersion !== null) {
-          const minVersion = warmMinVersion;
-          const targetVersion = latestWarmTargetVersion;
-          const readyVersion = await waitForRankingReady(minVersion, targetVersion);
-          if (readyVersion !== null) {
-            await waitForVoteRemoval();
-            queueRefill(false);
-            if (readyVersion >= latestWarmTargetVersion) {
-              warmMinVersion = null;
-              latestWarmTargetVersion = null;
-            } else {
-              warmMinVersion = readyVersion + 1;
-            }
-          } else if (targetVersion === latestWarmTargetVersion) {
-            warmMinVersion = null;
-            latestWarmTargetVersion = null;
-          }
-        }
-      } finally {
-        warmPollInFlight = false;
-        if (warmMinVersion !== null && latestWarmTargetVersion !== null) {
-          runWarmPollLoop();
-        } else {
-          updateQueueLoading();
-        }
-      }
-    }
-
-    async function waitForRankingReady(minVersion, targetVersion) {
-      const startedAt = Date.now();
-      let delayMs = 400;
-      while (Date.now() - startedAt <= 30000) {
-        await new Promise(resolve => window.setTimeout(resolve, delayMs));
-        try {
-          const resp = await fetch(rankingReadyPath(minVersion, targetVersion), { cache: 'no-store' });
-          if (!resp.ok) {
-            throw new Error(`Ranking readiness failed: ${resp.status}`);
-          }
-          const data = await resp.json();
-          if (data.ready && typeof data.ready_version === 'number') {
-            return data.ready_version;
-          }
-        } catch (err) {
-          console.error('Failed checking ranking readiness', err);
-        }
-        delayMs = Math.min(delayMs * 2, 2500);
-      }
-      return null;
-    }
-
-    sortTabs.forEach(tab => {
-      tab.addEventListener('click', () => setFilter('sort', tab.dataset.sort));
-    });
-    ageTabs.forEach(tab => {
-      tab.addEventListener('click', () => setFilter('age', tab.dataset.age));
-    });
-    sourceTabs.forEach(tab => {
-      tab.addEventListener('click', () => setFilter('source', tab.dataset.source));
-    });
-
-    filterToggleBtn.addEventListener('click', () => {
-      sidePanel.classList.toggle('visible');
-    });
-
-    document.addEventListener('click', (e) => {
-      if (sidePanel.classList.contains('visible') &&
-          !sidePanel.contains(e.target) &&
-          e.target !== filterToggleBtn) {
-        sidePanel.classList.remove('visible');
-      }
-    });
-
-    document.querySelectorAll('[data-key-action]').forEach(btn => {
-      const runKeyAction = () => {
-        const action = btn.dataset.keyAction;
-        if (action === 'undo') {
-          undoLastVote();
-        } else if (action === 'open-article') {
-          openStoryUrl('article');
-        } else if (action === 'open-comments') {
-          openStoryUrl('comments');
-        } else if (action === 'toggle-panel') {
-          sidePanel.classList.toggle('visible');
-          document.body.classList.toggle('fullscreen');
-          focusActiveCard();
-        } else {
-          submitVote(action);
-        }
-      };
-      btn.addEventListener('click', runKeyAction);
-      btn.addEventListener('keydown', e => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          runKeyAction();
-        }
-      });
-    });
-
-    function feedCard(story, version, recommended, dated = false) {
-      const card = document.createElement('article');
-      card.className = 'story-card' + (story.enriched ? ' enriched' : '');
-      card.tabIndex = -1;
-      Object.assign(card.dataset, {
-        combo: story.memberships.join(' '), storyId: String(story.id),
-        position: '0', dashboardVersion: String(version), rankerArm: 'baseline',
-        score: String(story.rank_score), time: String(story.time),
-        storySource: story.source, isHn: story.source === 'hn' ? '1' : '0',
-        sortPopular: story.popular ? '1' : '0', sortExplore: story.explore ? '1' : '0',
-        sortRecommended: recommended ? '1' : '0', sortDate: dated ? '1' : '0',
-        isRecent: story.memberships.some(key => key.startsWith('recent_')) ? '1' : '0',
-        articleUrl: story.article_url, commentsUrl: story.comments_url
-      });
-      const header = document.createElement('div');
-      header.className = 'story-header';
-      for (const badge of story.badge_details || []) {
-        const span = document.createElement('span');
-        span.className = 'badge badge--' + badge.kind;
-        span.title = badge.tooltip;
-        span.textContent = `${badge.icon} ${badge.label}`;
-        header.appendChild(span);
-      }
-      if (story.source !== 'hn') {
-        const source = document.createElement('span');
-        source.className = 'source-badge';
-        source.title = story.source;
-        source.textContent = story.source_label;
-        header.appendChild(source);
-      }
-      if (story.domain) {
-        const domain = document.createElement('span');
-        domain.className = 'domain-chip';
-        domain.textContent = story.domain;
-        header.appendChild(domain);
-      }
-      if (story.points > 0) {
-        const points = document.createElement('span');
-        points.textContent = `${story.points} pts`;
-        header.appendChild(points);
-      }
-      const age = document.createElement('span');
-      const seconds = Math.max(0, Math.floor(Date.now() / 1000) - story.time);
-      age.textContent = seconds < 60 ? `${seconds}s ago` : seconds < 3600
-        ? `${Math.floor(seconds / 60)}m ago` : seconds < 86400
-        ? `${Math.floor(seconds / 3600)}h ago` : `${Math.floor(seconds / 86400)}d ago`;
-      header.appendChild(age);
-      if (story.comments_url) {
-        const comments = document.createElement('a');
-        comments.href = story.comments_url;
-        comments.dataset.eventKind = 'comments_open';
-        comments.target = '_blank';
-        comments.rel = 'noopener';
-        comments.textContent = `💬${story.comments === null ? '' : ' ' + story.comments} comments`;
-        header.appendChild(comments);
-      }
-      card.appendChild(header);
-      const heading = document.createElement('h2');
-      heading.className = 'story-title';
-      const link = document.createElement('a');
-      link.href = story.article_url || story.comments_url;
-      link.dataset.eventKind = story.article_url ? 'article_open' : 'comments_open';
-      link.target = '_blank';
-      link.rel = 'noopener';
-      link.textContent = story.title;
-      heading.appendChild(link);
-      card.appendChild(heading);
-      const footer = document.createElement('div');
-      footer.className = 'story-footer';
-      card.appendChild(footer);
-      if (story.best_match_title) {
-        const reason = document.createElement('p');
-        reason.className = 'match-reason';
-        reason.textContent = `Because you upvoted: ${story.best_match_title}`;
-        card.appendChild(reason);
-      }
-      return card;
-    }
-
-    async function fetchRefillCards() {
-      const resp = await fetch(apiPath('/api/feed'), { cache: 'no-store' });
-      if (!resp.ok) throw new Error(`Refill failed: ${resp.status}`);
-      const feed = await resp.json();
-      if (feed.api_version !== 1 || !Array.isArray(feed.stories)) {
-        throw new Error('Unsupported feed response');
-      }
-      // Recommended/Date membership is carried by the server's capped orders.
-      const orders = feed.orders || {};
-      const recommended = new Set([
-        ...(orders['recommended:recent'] || []),
-        ...(orders['recommended:archive'] || []),
-      ]);
-      const dated = new Set(orders['date:recent'] || []);
-      return feed.stories.map(story => feedCard(
-        story, feed.version, recommended.has(story.id), dated.has(story.id),
-      ));
-    }
-
-    async function refillQueue({ advance = true } = {}) {
-      // Reordering re-appends the active card. Preserve its native scrolling
-      // focus across that DOM move, without taking focus from a link/control.
-      const restoreActiveCardFocus = document.activeElement === activeCard;
-      const incoming = await fetchRefillCards();
-
-      cards().forEach(card => {
-        if (card !== activeCard) {
-          card.remove();
-        }
-      });
-      const existing = new Set(cards().map(card => card.dataset.storyId));
-      let suppressedVoted = 0;
-      for (const card of incoming) {
-        const storyId = card.dataset.storyId;
-        if (!storyId || existing.has(storyId)) {
-          continue;
-        }
-        if (votedStoryIds.has(Number(storyId))) {
-          suppressedVoted += 1;
-          continue;
-        }
-        storiesContainer.appendChild(card);
-        existing.add(storyId);
-      }
-      if (suppressedVoted > 0) {
-        console.debug(
-          `refillQueue: suppressed ${suppressedVoted} already-voted card(s) from stale fetch`
-        );
-      }
-
-      applyGradient();
-      orderForCurrentSort();
-      if (restoreActiveCardFocus && activeCard?.isConnected) {
-        activeCard.focus({ preventScroll: true });
-      }
-      // Vote refreshes normally leave the visible card alone. If the last
-      // card for the active filters was voted away, though, a non-advancing
-      // fresh refill must activate the first replacement instead of leaving
-      // the deck empty until the user changes filters.
-      const needsActiveCard = activeCard === null;
-      if (advance || needsActiveCard) {
-        showNextCard({ allowRefresh: false });
-      } else {
-        prefetchUpcomingTldrs();
-      }
-    }
-
-    document.querySelectorAll('[data-fb]').forEach(btn => {
-      btn.addEventListener('click', () => {
-        submitVote(btn.dataset.fb);
-      });
-    });
-
-    storiesContainer.addEventListener('click', (e) => {
-      const link = e.target.closest('a[data-event-kind]');
-      if (link) {
-        const card = link.closest('.story-card');
-        queueInteraction(link.dataset.eventKind, card);
-        flushInteractionEvents();
-      }
-    });
-
-    storiesContainer.addEventListener('click', async (e) => {
-      const card = e.target.closest('.story-card');
-      if (!card) {
-        return;
-      }
-      if (
-        e.target.closest('a, button, input, textarea, select, summary, [role="button"], .tldr-detail-content') ||
-        window.getSelection()?.toString()
-      ) {
-        return;
-      }
-      await openTldrDetail(card);
-    });
-
-    // Page-open stampede guard: the active card plus 4 upcoming prefetches
-    // used to fire simultaneously (up to 10 LLM calls at once, on top of the
-    // server warm prefetch) and trip the free token-rate limit within
-    // seconds — every card then showed salvaged halves or 429s. Chain
-    // prefetches one-at-a-time behind the active tap, so a slow provider
-    // naturally back-pressures the queue. Detached cards (voted away while
-    // queued) are skipped instead of burning quota.
-    let tldrPrefetchChain = Promise.resolve();
-    function prefetchCards(cards) {
-      cards.forEach(card => {
-        if (!card.querySelector('.tldr-detail-content')) {
-          tldrPrefetchChain = tldrPrefetchChain.then(() => {
-            if (card.isConnected) {
-              return openTldrDetail(card);
-            }
-            return null;
-          }).catch(() => {});
-        }
-      });
-    }
-
-    function prefetchUpcomingTldrs() {
-      const queue = queuedCards();
-      const index = queue.indexOf(activeCard);
-      // Follow navigation order, including wraparound after the last card.
-      const upcoming = index < 0 ? queue : queue.slice(index + 1).concat(queue.slice(0, index));
-      prefetchCards(upcoming.slice(0, PREFETCH_COUNT));
-    }
-
-    function cardsForAge(age) {
-      return cards().filter(card => {
-        if (card.dataset.voted) return false;
-        if (age === 'archive') return card.dataset.isRecent === '0';
-        return card.dataset.isRecent === '1';
-      });
-    }
-
-    function sendFeedback(storyId, action) {
-      return fetch(feedbackPath(), {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          story_id: storyId,
-          action,
-          queue_remaining: queuedCards().length,
-        })
-      }).then(resp => {
-        if (!resp.ok) {
-          throw new Error(`Feedback failed: ${resp.status}`);
-        }
-        return resp.json();
-      });
-    }
-
-    function enqueueFeedback(storyId, action) {
-      const previous = feedbackChains.get(storyId) || Promise.resolve();
-      const next = previous
-        .catch(() => {})
-        .then(() => sendFeedback(storyId, action));
-      // The chain entry only sequences requests; callers handle `next`'s
-      // failure, so the entry itself must never reject unhandled.
-      const tracked = next.catch(() => {}).finally(() => {
-        if (feedbackChains.get(storyId) === tracked) {
-          feedbackChains.delete(storyId);
-        }
-      });
-      feedbackChains.set(storyId, tracked);
-      return next;
-    }
-
-    function adjustVoteCount(action, delta) {
-      const countEl = document.querySelector(`[data-vote-count="${action}"]`);
-      if (!countEl) {
-        return;
-      }
-      const nextCount = Math.max(0, Number(countEl.textContent || '0') + delta);
-      countEl.textContent = String(nextCount);
-    }
-
-    function incrementVoteCount(vote) {
-      if (vote.countApplied) {
-        return;
-      }
-      adjustVoteCount(vote.action, 1);
-      vote.countApplied = true;
-    }
-
-    function decrementVoteCount(vote) {
-      if (!vote.countApplied) {
-        return;
-      }
-      adjustVoteCount(vote.action, -1);
-      vote.countApplied = false;
-    }
-
-    function submitVote(action, card = activeCard) {
-      if (!card || card.dataset.voted) {
-        return;
-      }
-
-      const storyId = Number(card.dataset.storyId);
-      const vote = {
-        id: nextVoteId++,
-        storyId,
-        action,
-        card,
-        countApplied: false,
-        undone: false,
-      };
-      latestVoteIds.set(storyId, vote.id);
-      rememberVotedStoryId(storyId);
-      card.dataset.voted = action;
-      document.querySelectorAll('[data-fb]').forEach(btn => {
-        btn.classList.toggle('active', btn.dataset.fb === action);
-      });
-      incrementVoteCount(vote);
-
-      if (action === 'up') {
-        card.style.setProperty('--swipe-exit-x', '42px');
-        card.style.setProperty('--swipe-exit-rotate', '1.5deg');
-      } else if (action === 'down') {
-        card.style.setProperty('--swipe-exit-x', '-42px');
-        card.style.setProperty('--swipe-exit-rotate', '-1.5deg');
-      } else {
-        card.style.setProperty('--swipe-exit-x', '0');
-        card.style.setProperty('--swipe-exit-rotate', '0deg');
-      }
-      card.classList.add('fade-out');
-
-      window.setTimeout(() => {
-        if (card.dataset.voted === action) {
-          const preferred = nextQueuedSibling(card);
-          card.remove();
-          showNextCard({ preferred });
-          focusActiveCard();
-        }
-      }, 150);
-
-      const savePromise = enqueueFeedback(storyId, action)
-        .then(data => {
-          scheduleVoteRefresh(data);
-          focusActiveCard();
-          return data;
-        })
-        .catch(err => {
-          console.error('Network error submitting feedback', err);
-          if (!vote.undone) {
-            decrementVoteCount(vote);
-          }
-          if (lastVote?.id === vote.id) {
-            lastVote = null;
-          }
-          if (latestVoteIds.get(storyId) === vote.id) {
-            latestVoteIds.delete(storyId);
-            forgetVotedStoryId(storyId);
-            delete card.dataset.voted;
-          }
-          showToast('Vote failed to save', 'error');
-        });
-
-      vote.savePromise = savePromise;
-      lastVote = vote;
-    }
-
-    function undoLastVote() {
-      const vote = lastVote;
-      if (!vote) {
-        return;
-      }
-      lastVote = null;
-
-      const { storyId, card } = vote;
-      vote.undone = true;
-      forgetVotedStoryId(storyId);
-      delete card.dataset.voted;
-      decrementVoteCount(vote);
-      card.classList.remove('fade-out');
-      document.querySelectorAll('[data-fb]').forEach(btn => {
-        btn.classList.remove('active');
-      });
-      if (!card.isConnected) {
-        storiesContainer.insertBefore(card, storiesContainer.firstChild);
-      }
-      setActiveCard(card);
-
-      enqueueFeedback(storyId, 'clear').then(data => {
-        scheduleVoteRefresh(data);
-        focusActiveCard();
-        return data;
-      }).catch(err => {
-        console.error('Network error undoing feedback', err);
-        showToast('Undo failed to save', 'error');
-      });
-    }
-
-    function openStoryUrl(kind) {
-      const card = document.querySelector('.story-card.active, .story-card[data-active]')
-                || document.querySelector('.story-card');
-      if (!card) return;
-      const attr = kind === 'article' ? 'articleUrl' : 'commentsUrl';
-      const url = card.dataset[attr];
-      if (!url) return;
-      queueInteraction(kind === 'article' ? 'article_open' : 'comments_open', card);
-      flushInteractionEvents();
-      window.open(url, '_blank', 'noopener,noreferrer');
-    }
-
     // Post-render TLDR enhancements, idempotent: strips its own markers
     // first so retries/re-renders never duplicate them. opts.stale adds a
     // "stale, refreshing" marker for provisional content. Section wrapping
@@ -2225,159 +1938,138 @@
       });
     }
 
-    // Manual refresh helpers shared by the re-summarize button and the
-    // t/s hotkeys below. refreshTldr force-refreshes (bypasses cache and
-    // cooldown); refreshDeck re-fetches deck cards without advancing.
-    function refreshTldr(card) {
-      openTldrDetail(card || activeCard, { force: true });
-    }
-    function refreshDeck() {
-      queueRefill(false);
-    }
-
-    // Re-summarize control, idempotent: one button per TLDR block that
-    // force-refreshes this card's summary (new comments) on explicit tap.
-    // Never wired from prefetch — only from successful renders below.
-    function ensureTldrRefreshButton(card, contentDiv) {
-      contentDiv.querySelectorAll('.tldr-refresh-btn').forEach(el => el.remove());
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'tldr-refresh-btn';
-      btn.textContent = '↻ re-summarize';
-      btn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        refreshTldr(card);
-      });
-      contentDiv.appendChild(btn);
+    function showToast(message, variant) {
+      const kind = variant || 'info';
+      toastEl.textContent = message;
+      toastEl.className = `toast toast--${kind}`;
+      toastEl.hidden = false;
+      if (toastTimer) {
+        clearTimeout(toastTimer);
+      }
+      toastTimer = window.setTimeout(() => {
+        toastEl.hidden = true;
+        toastTimer = null;
+      }, 3000);
     }
 
-    async function openTldrDetail(card, opts) {
-      if (!card) {
-        return;
-      }
-      const force = !!(opts && opts.force);
+    // Wiring ----------------------------------------------------------------
 
-      const storyId = Number(card.dataset.storyId);
-      const storyTitle = card.querySelector('.story-title a')?.textContent || '';
-
-      let contentDiv = card.querySelector('.tldr-detail-content');
-      if (contentDiv?.dataset.loading === 'true') {
-        return;
-      }
-      if (contentDiv && contentDiv.style.display !== 'none' && !contentDiv.dataset.error && !force) {
-        return;
-      }
-      if (!contentDiv) {
-        contentDiv = document.createElement('div');
-        contentDiv.className = 'tldr-detail-content';
-        contentDiv.style.display = 'none';
-        card.appendChild(contentDiv);
-      }
-      const cached = force ? undefined : tldrCache.get(storyId);
-      if (cached !== undefined) {
-        delete contentDiv.dataset.error;
-        contentDiv.innerHTML = parseSimpleMarkdown(cached);
-        styleTldrLabels(contentDiv);
-        enhanceTldrContent(contentDiv, { stale: false });
-        ensureTldrRefreshButton(card, contentDiv);
-        contentDiv.style.display = 'block';
-        return;
-      }
-
-      const retryAt = tldrRetryAt.get(storyId) || 0;
-      if (!force && Date.now() < retryAt) {
-        const secs = Math.max(1, Math.ceil((retryAt - Date.now()) / 1000));
-        contentDiv.textContent = 'TLDR: provider cooling down, retry in ' + secs + 's';
-        contentDiv.dataset.error = 'true';
-        contentDiv.style.display = 'block';
-        return;
-      }
-
-      contentDiv.textContent = 'Loading TLDR...';
-      contentDiv.style.display = 'block';
-      contentDiv.dataset.loading = 'true';
-
-      const detailApiPath = apiPath('/api/tldr-detail');
-      try {
-        const resp = await fetch(detailApiPath, {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ story_id: storyId, story_title: storyTitle, force_refresh: force })
-        });
-        if (resp.ok) {
-          const data = await resp.json();
-          if (data.empty) {
-            // Server found nothing summarizable: compact notice instead of
-            // the placeholder sentence. Still retryable later (comments may
-            // grow, the article may unblock), never cached.
-            contentDiv.dataset.error = 'true';
-            tldrRetryAt.set(storyId, Date.now() + 60000);
-            contentDiv.textContent = 'TLDR: no summarizable content for this story yet.';
-            contentDiv.style.display = 'block';
-          } else {
-            if (data.retryable || data.stale) {
-              // Provisional content: a transient no-content attempt
-              // (retryable) or a stale/quota fallback summary (stale) -
-              // don't cache it as final, so the next open (card re-click,
-              // filter switch, next-card cycle) retries instead of showing
-              // this placeholder/stale summary forever.
-              contentDiv.dataset.error = 'true';
-              tldrRetryAt.set(storyId, Date.now() + 60000);
-            } else {
-              tldrCache.set(storyId, data.tldr);
-              delete contentDiv.dataset.error;
-            }
-            contentDiv.innerHTML = parseSimpleMarkdown(data.tldr);
-            styleTldrLabels(contentDiv);
-            enhanceTldrContent(contentDiv, { stale: !!(data.retryable || data.stale) });
-            if (!data.retryable && !data.stale) {
-              ensureTldrRefreshButton(card, contentDiv);
-            }
-            contentDiv.style.display = 'block';
-          }
-        } else {
-          const errData = await resp.json().catch(() => ({}));
-          const errorMsg = errData.error || `HTTP ${resp.status}`;
-          const retryAfter = Number(resp.headers.get('Retry-After') || errData.retry_after || 30);
-          tldrRetryAt.set(storyId, Date.now() + Math.max(1, Number.isFinite(retryAfter) ? retryAfter : 30) * 1000);
-          contentDiv.textContent = 'TLDR: ' + errorMsg;
-          contentDiv.dataset.error = 'true';
-          contentDiv.style.display = 'block';
-          console.warn('openTldrDetail failed:', errorMsg);
+    const copyProfileLinkButton = document.getElementById('copyProfileLink');
+    if (copyProfileLinkButton) {
+      copyProfileLinkButton.addEventListener('click', async () => {
+        const link = profileLink();
+        if (!link) return;
+        try {
+          await navigator.clipboard.writeText(link);
+          showToast('Profile link copied', 'success');
+        } catch {
+          showToast(link, 'info');
         }
-      } catch (err) {
-        contentDiv.textContent = 'TLDR: ' + (err.message || 'Network error');
-        contentDiv.dataset.error = 'true';
-        contentDiv.style.display = 'block';
-        console.error(err);
-      } finally {
-        delete contentDiv.dataset.loading;
-      }
+      });
     }
+
+    sortTabs.forEach(tab => {
+      tab.addEventListener('click', () => setFilter('sort', tab.dataset.sort));
+    });
+    ageTabs.forEach(tab => {
+      tab.addEventListener('click', () => setFilter('age', tab.dataset.age));
+    });
+
+    function togglePanel() {
+      sidePanel.classList.toggle('visible');
+      document.body.classList.toggle('fullscreen');
+      focusActiveCard();
+    }
+
+    filterToggleBtn.addEventListener('click', () => {
+      sidePanel.classList.toggle('visible');
+    });
+
+    document.addEventListener('click', (e) => {
+      if (sidePanel.classList.contains('visible') &&
+          !sidePanel.contains(e.target) &&
+          e.target !== filterToggleBtn) {
+        sidePanel.classList.remove('visible');
+      }
+    });
+
+    const KEY_ROW_ACTIONS = {
+      up: () => vote('up'),
+      neutral: () => vote('neutral'),
+      down: () => vote('down'),
+      undo: () => undo(),
+      'open-article': () => openStoryUrl('article'),
+      'open-comments': () => openStoryUrl('comments'),
+      'toggle-panel': () => togglePanel(),
+    };
+
+    document.querySelectorAll('[data-key-action]').forEach(btn => {
+      const runKeyAction = () => KEY_ROW_ACTIONS[btn.dataset.keyAction]?.();
+      btn.addEventListener('click', runKeyAction);
+      btn.addEventListener('keydown', e => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          runKeyAction();
+        }
+      });
+    });
+
+    document.querySelectorAll('[data-fb]').forEach(btn => {
+      btn.addEventListener('click', () => vote(btn.dataset.fb));
+    });
+
+    storiesContainer.addEventListener('click', (e) => {
+      const link = e.target.closest('a[data-event-kind]');
+      if (link) {
+        queueInteraction(link.dataset.eventKind, link.closest('.story-card'));
+        flushInteractionEvents();
+      }
+    });
+
+    // Clicking the card body retries a summary that failed.
+    storiesContainer.addEventListener('click', (e) => {
+      const card = e.target.closest('.story-card');
+      if (
+        !card ||
+        e.target.closest('a, button, input, textarea, select, summary, [role="button"], .tldr-detail-content') ||
+        window.getSelection()?.toString()
+      ) {
+        return;
+      }
+      loadSummary(Number(card.dataset.storyId));
+    });
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') {
+        endInteraction();
+        flushInteractionEvents();
+      } else {
+        const card = activeCard();
+        if (card && activeInteraction === null) beginInteraction(card, false);
+        pollFeedVersion();
+      }
+    });
+    window.addEventListener('pagehide', () => {
+      endInteraction();
+      flushInteractionEvents();
+    });
 
     const KEY_ACTIONS = {
-      k: () => submitVote('up'),
-      j: () => submitVote('down'),
-      l: () => submitVote('neutral'),
+      k: () => vote('up'),
+      j: () => vote('down'),
+      l: () => vote('neutral'),
       o: () => openStoryUrl('article'),
       c: () => openStoryUrl('comments'),
-      u: () => undoLastVote(),
+      u: () => undo(),
       r: () => setFilter('sort', 'recommended'),
       p: () => setFilter('sort', 'popular'),
       x: () => setFilter('sort', 'explore'),
       d: () => setFilter('sort', 'date'),
       e: () => setFilter('age', 'recent'),
       a: () => setFilter('age', 'archive'),
-      t: () => refreshTldr(),
-      s: () => refreshDeck(),
-      // m/h/n (source filter) temporarily disabled alongside the source
-      // toggle UI — see pipeline/render.py::_build_tab_groups.
-      f: () => {
-        const panel = document.querySelector('.swipe-side');
-        panel.classList.toggle('visible');
-        document.body.classList.toggle('fullscreen');
-        focusActiveCard();
-      },
+      t: () => activeId !== null && loadSummary(activeId, { force: true }),
+      s: () => reload({ manual: true }),
+      f: () => togglePanel(),
     };
 
     document.addEventListener('keydown', (e) => {
@@ -2388,8 +2080,7 @@
       ) {
         return;
       }
-      const key = e.key.toLowerCase();
-      const action = KEY_ACTIONS[key];
+      const action = KEY_ACTIONS[e.key.toLowerCase()];
       if (action) {
         e.preventDefault();
         action();
@@ -2413,19 +2104,11 @@
       }
     })();
 
-    seedVotedStoryIdsFromStorage();
-    setFilter('sort', 'recommended');
-    setFilter('age', 'recent');
-
-    // If the page was served from a stale cache, schedule a warm-polled
-    // refill so voted stories and outdated rankings are replaced as soon
-    // as the server finishes warming.
-    const storiesEl = document.getElementById('stories');
-    const pageVer = storiesEl ? parseInt(storiesEl.dataset.dashboardVersion) : NaN;
-    const currVer = storiesEl ? parseInt(storiesEl.dataset.currentVersion) : NaN;
-    if (Number.isFinite(pageVer) && Number.isFinite(currVer) && pageVer < currVer) {
-      scheduleDeckRefresh({ waitForWarm: true, targetVersion: currVer, advance: true });
-    }
+    setFeed(readEmbeddedFeed() || parseFeed({
+      api_version: 1, stories: [], orders: {}, feedback_counts: {},
+      version: 0, target_version: 0, ready: false,
+    }));
+    window.setInterval(pollFeedVersion, POLL_INTERVAL_MS);
   </script>
 </body>
 </html>
