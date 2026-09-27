@@ -275,7 +275,7 @@ async def test_passive_refresh_does_not_strand_a_joined_summary() -> None:
         await wait_for(pilot, lambda: 2 in fake.generated)
         await pilot.press("j")
         await pilot.pause(0.4)  # load_summary is now awaiting the prefetch.
-        app.refresh_passively()
+        app.reload(manual=False)
         await pilot.pause(0.2)
         fake.release.set()
         await wait_for(pilot, lambda: "Summary 2" in app.query_one(Markdown)._markdown)

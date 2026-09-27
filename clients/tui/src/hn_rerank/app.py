@@ -5,6 +5,7 @@ import random
 import time
 import unicodedata
 import webbrowser
+from dataclasses import replace
 from pathlib import Path
 from typing import ClassVar
 from urllib.parse import urlsplit
@@ -598,11 +599,9 @@ class Reader(App[None]):
         # it back only where the server had it.
         self.vote_views: dict[int, list[str]] = {}
         self.pending = False
-        self.target: int | None = None
         self.selection_serial = 0
         self.interaction_session = str(uuid4())
         self.summary_story_id: int | None = None
-        self.force_summary_id: int | None = None
         self.reading = False
         self.help_open = False
         self.setting_up = False
@@ -822,7 +821,6 @@ class Reader(App[None]):
         self.vote_views.clear()
         self.reset_summaries()
         self.prefetch_cooldown_until = 0.0
-        self.target = None
         self.help_open = False
         self.summary_story_id = None
         self.setting_up = False
@@ -999,18 +997,13 @@ class Reader(App[None]):
                     ),
                     self.selection_serial,
                 )
-            force_refresh = story.id == self.force_summary_id
-            self.force_summary_id = None
-            cached = None if force_refresh else self.summaries.get(story.id)
+            cached = self.summaries.get(story.id)
             if cached is not None:
                 self.query_one("#summary", Markdown).update(cached)
                 self.schedule_prefetch()
             else:
-                if story.id not in self.summaries:
-                    self.query_one("#summary", Markdown).update("Loading summary…")
-                self.load_summary(
-                    story.id, self.selection_serial, force_refresh=force_refresh
-                )
+                self.query_one("#summary", Markdown).update("Loading summary…")
+                self.load_summary(story.id, self.selection_serial)
             self.query_one("#summary", Markdown).scroll_home(animate=False)
 
     @work(group="impression", exclusive=True)
@@ -1294,70 +1287,58 @@ class Reader(App[None]):
         )
 
     async def poll_feed_version(self) -> None:
-        """Observe published versions without interrupting reading or voting."""
+        """Every minute: reload when the server has a newer deck than ours."""
         if not self.can_poll_feed():
             return
         api, feed = self.api, self.feed
         assert api is not None and feed is not None
+        # A current deck waits for any new version (regen, a vote elsewhere);
+        # a stale one waits for the reranked deck it is missing.
+        wanted = feed.version if feed.ready else feed.target_version
         try:
-            _, current = await api.ready(feed.version)
+            ready, current = await api.ready(wanted)
         except APIError:
             # Passive checks must not replace a usable deck with an error.
-            # Manual refresh retains its visible error/retry behavior.
             return
-        if (
-            self.api is api
-            and self.feed is feed
-            and self.can_poll_feed()
-            and current != feed.version
-        ):
-            # A lower version is a server restart, not an obsolete response.
-            self.refresh_passively()
+        # A lower version is a server restart, not an obsolete response.
+        newer = current != feed.version if feed.ready else ready or current < wanted
+        if self.api is api and self.feed is feed and self.can_poll_feed() and newer:
+            self.reload(manual=False)
 
     @work(group="refresh", exclusive=True)
-    async def refresh_feed(self) -> None:
+    async def refresh_feed(self, *, announce: bool = True) -> None:
         if not self.api or self.setting_up:
             return
-        self.status("Refreshing…")
+        if announce:
+            self.status("Refreshing…")
         try:
-            for attempt in range(30):
-                feed = await self.api.feed()
-                self.feed = feed
-                if feed.ready:
-                    self.restored.clear()
-                else:
-                    for restored in self.restored.values():
-                        self.restore_story(restored)
-                # Versions are process-local; a lower target is a valid server reset.
-                if self.target is None or feed.target_version < self.target:
-                    self.target = feed.target_version
-                else:
-                    self.target = max(self.target, feed.target_version)
-                self.rebuild()
-                if feed.ready and feed.version >= self.target:
-                    self.status_mode = "context"
-                    self.last_error = None
-                    self.context_status()
-                    return
-                self.status("Showing available stories while ranking updates…")
-                await asyncio.sleep(1)
-                ready, current = await self.api.ready(self.target)
-                self.target = min(self.target, current)
-                if not ready and attempt == 29:
-                    self.status("Ranking is still updating. Press r to check again.")
+            feed = await self.api.feed()
         except InvalidProfile as exc:
-            self.force_summary_id = None
             self.setup(str(exc))
+            return
         except APIError as exc:
-            # The r that armed it failed; a later selection must use the cache.
-            self.force_summary_id = None
-            self.status(
-                ("Showing stale stories. " if self.feed else "")
-                + str(exc)
-                + " Press r to retry.",
-                error=True,
-            )
-            self.show_failure(str(exc))
+            if announce or self.feed is None:
+                self.status(
+                    ("Showing stale stories. " if self.feed else "")
+                    + str(exc)
+                    + " Press r to retry.",
+                    error=True,
+                )
+                self.show_failure(str(exc))
+            return
+        self.feed = feed
+        self.last_error = None
+        if feed.ready:
+            self.restored.clear()
+        else:
+            # Until the reranked deck lands, it may lack undone stories.
+            for restored in self.restored.values():
+                self.restore_story(restored)
+        if announce:
+            self.status_mode = "context"
+        self.rebuild()
+        if announce and not feed.ready:
+            self.status("Showing available stories while ranking updates…")
 
     SORT_CYCLE: ClassVar[tuple[str, ...]] = (
         "recommended",
@@ -1375,34 +1356,31 @@ class Reader(App[None]):
             index = -1
         select.value = self.SORT_CYCLE[(index + 1) % len(self.SORT_CYCLE)]
 
-    def action_refresh(
-        self, *, force_summary: bool = True, restore_hidden: bool = True
-    ) -> None:
-        story = self.selected()
-        self.force_summary_id = story.id if force_summary and story else None
-        self.help_open = False
-        self.summary_story_id = None
-        # Invalidate an older request immediately, not only after feed refresh.
-        self.selection_serial += 1
-        self.workers.cancel_group(self, "summary")
-        # The old text stays on screen while the forced request regenerates it.
-        self.reset_summaries(keep_text=story.id if story and force_summary else None)
-        if restore_hidden:
-            self.unavailable.clear()
-        self.prefetch_cooldown_until = 0.0
-        self.refresh_feed()
+    def action_refresh(self) -> None:
+        self.reload(manual=True)
 
-    def refresh_passively(self) -> None:
-        """Load a newly published version without disturbing the open story.
+    def reload(self, *, manual: bool) -> None:
+        """Reload the feed; cached summaries go (a new deck may carry new text).
 
-        Other cached summaries are dropped (the new generation may have new
-        text); the one being read stays, with its scroll position. Hidden
-        stories stay hidden; only a manual r restores them.
+        The poller's refresh leaves the open story, its summary and scroll
+        alone. A manual r also regenerates the selected summary and restores
+        stories hidden this session.
         """
         story = self.selected()
         keep = story.id if story else None
-        self.reset_summaries(keep_text=keep, keep_request=keep)
-        self.refresh_feed()
+        # The old text stays on screen while a forced request regenerates it.
+        self.reset_summaries(keep_text=keep, keep_request=None if manual else keep)
+        if manual:
+            self.help_open = False
+            self.unavailable.clear()
+            self.prefetch_cooldown_until = 0.0
+            self.selection_serial += 1
+            self.summary_story_id = keep
+            if story is None:
+                self.workers.cancel_group(self, "summary")
+            else:
+                self.load_summary(story.id, self.selection_serial, force_refresh=True)
+        self.refresh_feed(announce=manual)
 
     def action_move(self, delta: int) -> None:
         if self.reading:
@@ -1432,7 +1410,6 @@ class Reader(App[None]):
         if not self.api:
             self.pending = False
             return
-        self.workers.cancel_group(self, "refresh")
         self.status("Saving vote…")
         views = [
             key
@@ -1440,7 +1417,9 @@ class Reader(App[None]):
             if story.id in order
         ]
         try:
-            self.target = await self.api.vote(story.id, action)
+            target = await self.api.vote(story.id, action)
+            if self.feed is not None and target > self.feed.version:
+                self.feed = replace(self.feed, target_version=target, ready=False)
             if action == "clear":
                 self.history.pop()
                 self.rated.discard(story.id)
@@ -1461,7 +1440,6 @@ class Reader(App[None]):
                 self.vote_views[story.id] = views
                 self.rebuild(next_id)
             self.status("Vote cleared." if action == "clear" else "Vote saved.")
-            self.refresh_feed()
         except InvalidProfile as exc:
             self.setup(str(exc))
         except APIError as exc:

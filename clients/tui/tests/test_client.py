@@ -252,10 +252,8 @@ async def test_rate_limit_and_zero_reset() -> None:
     await api.close()
     fake = FakeServer()
     app = Reader(api=fake.api())
-    app.target = 12
     async with app.run_test() as pilot:
         await settle(pilot)
-        assert app.target == 0
         assert app.feed and app.feed.ready and app.feed.version == 0
 
 
@@ -493,7 +491,7 @@ async def test_refresh_forces_only_selected_summary(tmp_path: Path) -> None:
         ]
         assert forced == [{"story_id": 1, "force_refresh": True}]
         fake.requests.clear()
-        app.action_refresh(force_summary=False)
+        app.reload(manual=False)
         await pilot.pause(0.8)
         assert not any(
             json.loads(r.content).get("force_refresh")
@@ -672,7 +670,7 @@ async def test_version_poll_keeps_hidden_stories_hidden(tmp_path: Path) -> None:
     async with app.run_test(size=(120, 35)) as pilot:
         await settle(pilot)
         app.unavailable.add(1)
-        app.refresh_passively()
+        app.reload(manual=False)
         await settle(pilot)
         assert [s.id for s in app.stories] == [2]
         app.action_refresh()
@@ -773,15 +771,19 @@ async def test_failed_refresh_does_not_force_a_later_regeneration(
         fake.fail_feed = True
         app.action_refresh()
         await settle(pilot)
-        assert app.force_summary_id is None
         fake.fail_feed = False
-        app.action_refresh(force_summary=False)
+        app.reload(manual=False)
         await settle(pilot)
-        assert not any(
-            r.url.path.endswith("/api/tldr-detail")
-            and json.loads(r.content).get("force_refresh")
+        app.query_one(OptionList).focus()
+        await pilot.press("j", "k")
+        await settle(pilot)
+        forced = [
+            r
             for r in fake.requests
-        )
+            if r.url.path.endswith("/api/tldr-detail")
+            and json.loads(r.content).get("force_refresh")
+        ]
+        assert len(forced) == 1  # only the r itself
 
 
 async def test_only_summary_generation_gets_the_long_timeout() -> None:

@@ -61,7 +61,10 @@ even for short summaries. On wide terminals the pane is centered and capped
 at 100 columns for comfortable reading. Enter or Escape restores the article
 list. The footer shows the zoom and return keys for the current mode.
 Press `r` to refresh the feed and request a fresh server-generated summary for
-only the selected story. Automatic refreshes keep using the server cache.
+only the selected story. Automatic refreshes keep using the server cache:
+once a minute the reader checks for a newer deck (a regen, a vote from another
+device, or the reranked deck after your vote) and reloads it without touching
+the open story.
 Regeneration still respects provider limits and does not guarantee a longer summary.
 Press `s` to cycle Recommended → Popular → Explore → Date.
 

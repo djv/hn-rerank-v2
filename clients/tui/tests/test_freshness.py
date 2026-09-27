@@ -5,7 +5,7 @@ from dataclasses import replace
 
 import httpx
 import pytest
-from textual.widgets import Markdown, Static
+from textual.widgets import Markdown, OptionList, Static
 
 from hn_rerank.app import Reader
 from tests.test_client import FakeServer, sample_feed
@@ -91,3 +91,27 @@ async def test_passive_version_change_leaves_the_open_summary_alone() -> None:
         ]
         assert 2 not in summarized
         assert "Summary 2" in app.query_one(Markdown)._markdown
+
+
+async def test_poll_after_vote_waits_for_the_reranked_deck() -> None:
+    """A vote marks the deck stale; the poller reloads once ranking lands."""
+    fake = FakeServer()
+    app = Reader(api=fake.api())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        app.query_one(OptionList).focus()
+        app.action_vote("up")
+        await settle(pilot)
+        assert app.feed is not None and not app.feed.ready
+        assert app.feed.target_version == 1
+        fake.feed = sample_feed(0, 1)  # still ranking
+        fake.requests.clear()
+        await app.poll_feed_version()
+        await settle(pilot)
+        assert not [r for r in fake.requests if r.url.path.endswith("/api/feed")]
+        fake.feed = sample_feed(1, 1)  # reranked deck published
+        await app.poll_feed_version()
+        await settle(pilot)
+        assert [r for r in fake.requests if r.url.path.endswith("/api/feed")]
+        assert app.feed.ready and app.feed.version == 1
+        assert 1 not in [s.id for s in app.stories]  # still voted

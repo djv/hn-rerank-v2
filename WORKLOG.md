@@ -11,6 +11,11 @@
   `Semaphore(4)` instead of a queue + worker + 4 loops + restart logic. Only
   refresh/setup/quit cancel a request, and a passive refresh spares the
   selected story's, so a waiting selection can no longer be stranded.
+- Freshness: one 60s poller and one `reload(manual=...)` path. A vote marks
+  the deck stale (`ready=False`, new target) instead of refetching the feed
+  every second for up to 30s; the poller reloads once `ranking-ready` says the
+  reranked deck exists. Removed `target` juggling, `force_summary_id` (r now
+  starts the forced load itself) and the duplicate passive/manual resets.
 
 ## 2026-09-26 TUI: `y` copies link; faster TUI tests
 
