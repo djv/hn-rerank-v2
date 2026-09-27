@@ -1786,18 +1786,14 @@ class Handler:
         except Exception:
             logging.exception("rank_perf persist failed")
 
-        per_combo = cls.config.tldr_prefetch_per_combo
-        stale_per_run = cls.config.tldr_prefetch_stale_per_run
-        if cls.config.article_fetch_max_per_run > 0 or (
-            (per_combo > 0 or stale_per_run > 0) and final
-        ):
+        if _wants_background_tasks(cls.config, final):
             t = threading.Thread(
                 target=lambda: cls._warm_background_tasks(
                     final,
                     cls.db,
                     cls.embedder,
                     cls.config,
-                    per_combo,
+                    cls.config.tldr_prefetch_per_combo,
                 ),
                 daemon=True,
             )
@@ -1915,6 +1911,17 @@ class Handler:
                 )
             finally:
                 cls._tldr_prefetch_gate.finish()
+
+
+def _wants_background_tasks(config: Config, ranked: list[RankedStory]) -> bool:
+    """Whether `Handler._warm_background_tasks` has anything to do for a deck:
+    article bodies to fetch or summaries to prefetch."""
+    return bool(ranked) and (
+        config.article_fetch_max_per_run > 0
+        or config.tldr_prefetch_per_combo > 0
+        or config.tldr_prefetch_stale_per_run > 0
+        or config.tldr_prefetch_date_top_n > 0
+    )
 
 
 def _no_cache_dashboard_response(
@@ -3389,7 +3396,7 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
             _log_llm_spend_today(db)
             reddit_worker.submit()
 
-            if Handler._cold_stories:
+            if _wants_background_tasks(config, Handler._cold_stories):
                 t = threading.Thread(
                     target=lambda: Handler._warm_background_tasks(
                         list(Handler._cold_stories),

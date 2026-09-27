@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import ipaddress
+import itertools
 from collections import deque
 
+import pytest
 from flask import Flask
 from hypothesis import given, settings, strategies as st
 
@@ -198,3 +200,55 @@ def test_valid_interaction_events_round_trip(event: dict[str, object]) -> None:
     assert parsed.user_id == 7
     for field in ("event_id", "story_id", "event_type", "position", "sort_mode"):
         assert getattr(parsed, field) == event[field]
+
+
+@pytest.mark.parametrize("deck_size", [0, 2])
+@pytest.mark.parametrize("knobs", list(itertools.product([0, 1], repeat=4)))
+def test_background_tasks_spawn_exactly_when_they_have_work(
+    knobs: tuple[int, int, int, int], deck_size: int
+) -> None:
+    """The spawn check and `_warm_background_tasks` agree: a thread starts
+    exactly when it would fetch articles or prefetch summaries. (All 32
+    on/off combinations: random draws rarely hit "only one knob on".)"""
+    from unittest import mock
+
+    import pipeline
+    from background_cadence import BackgroundCadence
+    from database import Story
+    from pipeline import Config, RankedStory
+
+    fetch, per_combo, stale, date_top_n = knobs
+    config = Config(
+        article_fetch_max_per_run=fetch,
+        tldr_prefetch_per_combo=per_combo,
+        tldr_prefetch_stale_per_run=stale,
+        tldr_prefetch_date_top_n=date_top_n,
+    )
+    deck = [
+        RankedStory(Story(i, "t", None, 1, 1, "x"), 1.0, "") for i in range(deck_size)
+    ]
+    work: list[str] = []
+
+    async def fetch_bodies(**_: object) -> None:
+        work.append("articles")
+
+    async def prefetch(*_: object, **__: object) -> int:
+        work.append("summaries")
+        return 0
+
+    class Runtime(server.Handler):
+        _tldr_prefetch_gate = BackgroundCadence()
+
+    with (
+        mock.patch.object(
+            pipeline,
+            "select_article_fetch_candidates",
+            lambda **kw: [r.story for r in kw["ranked"]],
+        ),
+        mock.patch.object(pipeline, "fetch_and_cache_article_bodies", fetch_bodies),
+        mock.patch.object(server, "_prefetch_tldrs_for_ranked", prefetch),
+    ):
+        Runtime._warm_background_tasks(
+            deck, mock.Mock(), mock.Mock(), config, per_combo
+        )
+    assert bool(work) == server._wants_background_tasks(config, deck)

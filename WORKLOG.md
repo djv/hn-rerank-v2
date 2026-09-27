@@ -1,5 +1,23 @@
 # Worklog: hn-rewrite
 
+## 2026-09-26 Server: background-task spawn check; feed order properties
+
+Stage S3 of `docs/server-web-alignment-plan.md`.
+- `_wants_background_tasks(config, deck)` is the one spawn check for the
+  article-fetch / summary-prefetch thread, after warms and after regen. The
+  warm's check ignored `tldr_prefetch_date_top_n`, so with article fetches
+  and combo/stale prefetch off, the Date-tab prefetch never ran; regen's
+  check spawned for any non-empty cold deck even with everything off. An
+  exhaustive test over all 32 on/off combinations checks the predicate
+  against what `_warm_background_tasks` actually does (random draws missed
+  the one-knob-on cases; the old check fails it).
+- `tests/test_render_properties.py`: `build_feed` over random decks (ties
+  common): orders only name sent stories, without duplicates; Recommended is
+  the top `RECOMMENDED_LIMIT` of the age's mixed deck by score; Popular and
+  Explore hold exactly their badge sets (Explore in any order); Date is every
+  sent story newest first for both ages; version/target/ready pass through;
+  `Feed.parse` round-trips the JSON. Clean at 1000 examples.
+
 ## 2026-09-26 Server: one summary generation per story
 
 Stage S2 of `docs/server-web-alignment-plan.md`.
