@@ -170,12 +170,14 @@ Markdown protocol does not bind agents; CI does — keep it green.
 
 ## Dependency groups
 
-`pyproject.toml` ships two groups beyond the runtime deps. Default
+`pyproject.toml` ships three groups beyond the runtime deps. Default
 `uv sync` installs only `dev` (linters, pytest, type checker). The
 `embedding-experiment` group is opt-in.
 
 - `dev` — pytest, pytest-asyncio, hypothesis, pytest-xdist, ruff, ty. Always
   installed by `uv sync`.
+- `browser` — `playwright` (drives the system Chrome; no browser download).
+  Only `tests/test_browser.py` needs it: `uv run --group browser ...`.
 - `embedding-experiment` (`48185b7`) — `huggingface-hub`, `scipy`. Required
   only by `scripts/bakeoff_embedding_models.py` and
   `scripts/bench_qwen_embed_speed.py` (embedding-model comparison tooling,
@@ -227,7 +229,10 @@ runtime dep (e.g. jax, tensorflow), give it its own
   structural string checks remain in `tests/test_server.py` (keydown guard,
   focus restore, `setFilter`); update them when `templates/index.html`
   changes. Rendered-HTML contracts are checked on real renders with
-  BeautifulSoup. Avoid tests that only check exact strings without validating
+  BeautifulSoup. The whole page runs in headless Chrome in
+  `tests/test_browser.py` (`uv run --group browser pytest tests/test_browser.py
+  -m browser`, ~6s; CI runs it); extend it for flows that cross
+  functions. Avoid tests that only check exact strings without validating
   runtime behavior (the user will request their removal).
 - **Version semantics**: `dashboard_version=0` is valid cold-deck data.
   Client-side version comparisons must use `Number.isFinite()`, not truthiness.

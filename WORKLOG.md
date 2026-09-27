@@ -1,5 +1,17 @@
 # Worklog: hn-rewrite
 
+## 2026-09-27 Browser test of the dashboard page, in CI
+
+`tests/test_browser.py` drives the real page in headless Chrome
+(Playwright, new `browser` dependency group) against an in-process server
+with a temp DB, fake ranking and fake LLM; every non-local request is
+aborted. One test covers summary load, escaped titles, vote/undo, the poll
+loading the re-ranked deck, sort change, a failed vote reverting with a
+toast, `j`/`l`/`?`/Escape, and no page errors or 4xx/5xx. Opt-in marker
+`browser` (excluded by default, like `slow`); CI runs it as its own step and
+fails instead of skipping if Chrome is missing. ~6s. Mutation check:
+removing the failed-vote revert makes it fail.
+
 ## 2026-09-27 Deployed the server/web alignment (`f7cfbe7`)
 
 - S1, S4 and S2 had already gone live with `b50e21f` (the feed deploy,
