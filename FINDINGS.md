@@ -55,6 +55,20 @@ HN baseline: 6031 / 1696 / 21%.
   Regen now fetches article text for up to 30 RSS snippet rows per run
   (1167 of 1669 recent rows had none); the first run got 30/30. Per-source
   report: `scripts/source_yield_report.py --since YYYY-MM-DD`.
+- Backfill 2026-09-27 (`scripts/backfill_rss_articles.py`, configured feeds
+  only): article text for 464/478 RSS rows (plus 185 before the
+  configured-feeds filter, mostly Tildes).
+- LessWrong: upvote rate is flat across karma (<50: 15%, 50-99: 24%,
+  100-199: 14%, 200+: 18%; n=16-39), so the karmaThreshold=20 feed stays.
+  thezvi.substack.com shares no titles with LessWrong.
+- Legacy source labels: 272 pre-June rows (tildes, digg, bare `rss`,
+  reddit_*, ...) had no source category, or RSS instead of Reddit, in the
+  ranker's one-hot. Relabelled with `scripts/relabel_legacy_sources.py`
+  after an 8-fold heldout-feedback eval on a DB copy: composite 0.669 ->
+  0.675 (MAP 0.484 -> 0.491, NDCG@40 0.527 -> 0.548, top-40 downvotes
+  5.9% -> 5.3%; 5/8 folds up), i.e. no drop. Rollback list (id, old source):
+  VPS `~/hn-rewrite/relabel_rollback_20260927.tsv`; reports
+  `~/.local/state/hn-rerank-eval/relabel-*-20260927.json` on the VPS.
 - Reddit 429s ~150/day: mostly one retry, circuit opened once in 3 days,
   no feed failed. Cause: each regen refreshes every subreddit, and votes
   trigger a regen about every 20 minutes; only ~4 of 21 weekly-top feeds
