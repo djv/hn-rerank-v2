@@ -1,5 +1,12 @@
 # Worklog: hn-rewrite
 
+## 2026-09-26 TUI simplification (timeouts, summaries, freshness, votes)
+
+- Timeouts: 10s for feed/cache/vote/poll requests, 150s for `tldr-detail`
+  generation (was 45s for everything; the server allows ~2 min).
+- Zoom availability is a property (`a story is selected`); removed the 3
+  read-state timers, the 1s interval and 12 `schedule_read_state()` calls.
+
 ## 2026-09-26 TUI: `y` copies link; faster TUI tests
 
 - `y` copies the comments URL (article URL if none) via OSC 52 plus

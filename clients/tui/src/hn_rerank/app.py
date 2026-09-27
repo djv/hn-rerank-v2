@@ -17,7 +17,6 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.theme import Theme
-from textual.timer import Timer
 from textual.widgets import (
     Button,
     Input,
@@ -588,8 +587,6 @@ class Reader(App[None]):
         # Headline row state as last rendered: column widths and marked story.
         self._row_widths: tuple[int, int, int] | None = None
         self._marked_id: int | None = None
-        # View preference: show the current sort bottom-first. Sticky
-        # across sort cycling and feed refreshes until toggled back.
         self.rated: set[int] = set()
         self.unavailable: set[int] = set()
         # Explore's client-side shuffle per "explore:<age>" view, kept stable
@@ -609,8 +606,6 @@ class Reader(App[None]):
         self.summary_story_id: int | None = None
         self.force_summary_id: int | None = None
         self.reading = False
-        self.can_read = False
-        self._read_timers: list[Timer] = []
         self.help_open = False
         self.setting_up = False
         self.status_mode = "context"
@@ -668,7 +663,6 @@ class Reader(App[None]):
 
     def on_mount(self) -> None:
         self.layout_panes()
-        self.set_interval(1.0, self.refresh_read_state)
         self.set_interval(60.0, self.poll_feed_version)
         self.set_interval(60.0, self.apply_clock_theme)
         self.theme_changed_signal.subscribe(self, lambda _theme: self.restyle())
@@ -764,7 +758,6 @@ class Reader(App[None]):
         self.selection_serial += 1
         self.workers.cancel_group(self, "summary")
         self.query_one("#summary", Markdown).update(feed_failure_notice(detail))
-        self.schedule_read_state()
 
     @work(group="startup", exclusive=True)
     async def start(self) -> None:
@@ -939,8 +932,8 @@ class Reader(App[None]):
                 if self.feed is None and self.last_error
                 else EMPTY_NOTICE
             )
-            self.schedule_read_state()
         self.query_one("#reading-pane").set_class(bool(self.stories), "has-story")
+        self.layout_panes()
         self.context_status()
 
     def on_select_changed(self, event: Select.Changed) -> None:
@@ -1024,7 +1017,6 @@ class Reader(App[None]):
                     story.id, self.selection_serial, force_refresh=force_refresh
                 )
             self.query_one("#summary", Markdown).scroll_home(animate=False)
-            self.schedule_read_state()
 
     @work(group="impression", exclusive=True)
     async def record_impression(self, event: Impression, serial: int) -> None:
@@ -1069,7 +1061,6 @@ class Reader(App[None]):
         else:
             self.query_one("#summary", Markdown).update(previous)
             self.status("Regenerating summary…")
-        self.schedule_read_state()
         self.schedule_prefetch()
         try:
             # Reuse background work when navigation catches up with it.
@@ -1111,7 +1102,6 @@ class Reader(App[None]):
                     )
                 elif force_refresh:
                     self.status("Summary regenerated.")
-                self.schedule_read_state()
                 self.schedule_prefetch()
         except InvalidProfile as exc:
             self.setup(str(exc))
@@ -1122,7 +1112,6 @@ class Reader(App[None]):
                     self.status(
                         f"Kept previous summary — refresh failed ({exc}).", error=True
                     )
-                    self.schedule_read_state()
                     return
                 if isinstance(exc, TransientError):
                     # A dropped connection or rate limit says nothing about
@@ -1133,7 +1122,6 @@ class Reader(App[None]):
                         "Move away and back, or press **r**, to try again."
                     )
                     self.status(str(exc), error=True)
-                    self.schedule_read_state()
                     return
                 # Undisplayable summaries leave the deck: the failure may be
                 # transient (quota/cooldown), so this hides for the session
@@ -1572,28 +1560,14 @@ class Reader(App[None]):
             hints = f"j/k move · {votes} · b badges · ? help · q quit"
         self.query_one("#shortcuts", Static).update(hints)
 
-    def schedule_read_state(self) -> None:
-        """Refresh zoom availability after deferred selection and content updates."""
-        self.call_after_refresh(self.refresh_read_state)
-        for timer in self._read_timers:
-            timer.stop()
-        self._read_timers = [
-            self.set_timer(delay, self.refresh_read_state) for delay in (0.1, 0.3, 0.6)
-        ]
-
-    def refresh_read_state(self) -> None:
-        """Offer zoom whenever a story is selected, regardless of summary length."""
-        if self.reading or not self.query("#summary") or not self.query("#headlines"):
-            return
-        can_read = self.selected() is not None
-        if can_read != self.can_read:
-            self.can_read = can_read
-            self.layout_panes()
+    @property
+    def can_read(self) -> bool:
+        """Zoom is offered whenever a story is selected."""
+        return bool(self.query("#headlines")) and self.selected() is not None
 
     def on_resize(self, event: events.Resize) -> None:
         if self.query("#panes"):
             self.layout_panes(event.size.width)
-            self.schedule_read_state()
 
     def focus_summary(self) -> None:
         self.query_one("#summary", Markdown).focus()
@@ -1607,21 +1581,17 @@ class Reader(App[None]):
             self.query_one("#summary", Markdown).focus()
         else:
             self.query_one("#headlines", OptionList).focus()
-            self.schedule_read_state()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         self.action_read()
 
     def action_headlines(self) -> None:
-        was_reading = self.reading
         self.reading = False
         self.layout_panes()
         self.query_one("#headlines", OptionList).focus()
         if self.help_open:
             self.help_open = False
             self.schedule_summary()
-        elif was_reading:
-            self.schedule_read_state()
 
     def action_badge_legend(self) -> None:
         self.help_open = True
@@ -1635,7 +1605,6 @@ class Reader(App[None]):
             "Escape: return to the story. ?: shortcuts."
         )
         self.focus_summary()
-        self.schedule_read_state()
 
     def action_help(self) -> None:
         self.help_open = True
@@ -1669,7 +1638,6 @@ class Reader(App[None]):
             "Votes are never automatically retried after network errors."
         )
         self.focus_summary()
-        self.schedule_read_state()
 
     async def on_unmount(self) -> None:
         self.closing = True

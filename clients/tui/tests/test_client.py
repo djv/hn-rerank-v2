@@ -782,3 +782,23 @@ async def test_failed_refresh_does_not_force_a_later_regeneration(
             and json.loads(r.content).get("force_refresh")
             for r in fake.requests
         )
+
+
+async def test_only_summary_generation_gets_the_long_timeout() -> None:
+    from hn_rerank.api import GENERATION_TIMEOUT, REQUEST_TIMEOUT
+
+    seen: dict[str, float] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen[request.url.path.rsplit("/", 1)[-1]] = request.extensions["timeout"][
+            "read"
+        ]
+        if request.url.path.endswith("/api/tldr-detail"):
+            return httpx.Response(200, json={"ok": True, "tldr": "# T"})
+        return httpx.Response(204)
+
+    api = API("https://example.org/hn/", "test", httpx.MockTransport(handler))
+    await api.summary(1)
+    await api.cached_summary(1)
+    await api.close()
+    assert seen == {"tldr-detail": GENERATION_TIMEOUT, "1": REQUEST_TIMEOUT}

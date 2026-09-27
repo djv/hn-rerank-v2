@@ -190,6 +190,12 @@ def save_profile(profile: Profile, path: Path) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
+# Feed, cache reads, votes and polls are quick; a tldr-detail call may hydrate
+# the article and run the LLM, which the server allows up to ~2 minutes.
+REQUEST_TIMEOUT = 10.0
+GENERATION_TIMEOUT = 150.0
+
+
 class API:
     def __init__(
         self,
@@ -200,14 +206,19 @@ class API:
         self.server = normalize_server(server)
         self._token = token
         self.client = httpx.AsyncClient(
-            timeout=45, follow_redirects=False, transport=transport
+            timeout=REQUEST_TIMEOUT, follow_redirects=False, transport=transport
         )
 
     async def close(self) -> None:
         await self.client.aclose()
 
     async def request(
-        self, method: str, path: str, json: dict[str, object] | None = None
+        self,
+        method: str,
+        path: str,
+        json: dict[str, object] | None = None,
+        *,
+        timeout: float = REQUEST_TIMEOUT,
     ) -> httpx.Response:
         # All paths are internal constants; reject absolute/escaping inputs anyway.
         if path.startswith("/") or ":" in path or ".." in path:
@@ -215,7 +226,7 @@ class API:
         headers = {"Cookie": f"hn_token={self._token}"} if self._token else {}
         try:
             response = await self.client.request(
-                method, self.server + path, headers=headers, json=json
+                method, self.server + path, headers=headers, json=json, timeout=timeout
             )
         except (httpx.RequestError, httpx.InvalidURL) as exc:
             raise TransientError(
@@ -285,7 +296,9 @@ class API:
         payload: dict[str, object] = {"story_id": story_id}
         if force_refresh:
             payload["force_refresh"] = True
-        response = await self.request("POST", "api/tldr-detail", json=payload)
+        response = await self.request(
+            "POST", "api/tldr-detail", json=payload, timeout=GENERATION_TIMEOUT
+        )
         try:
             data = response.json()
             value = data["tldr"]
