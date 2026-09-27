@@ -49,6 +49,7 @@ from pipeline import Config, DEFAULT_ENV_PATH, Embedder, RankedStory, is_hn_sour
 from llm_limiter import limiter as llm_limiter
 from reddit_limiter import limiter as reddit_limiter
 import http_fetch
+from single_flight import SingleFlight
 from warm_scheduler import WarmScheduler
 
 _LaneT = TypeVar("_LaneT")
@@ -525,6 +526,9 @@ LESSWRONG_COMMENT_LIMIT = 20
 MAX_CONTENT_LENGTH = 10**6  # 1MB cap on POST bodies
 MAX_INTERACTION_EVENTS = 64
 TLDR_BUSY_RETRY_AFTER_SECONDS = 5
+# How long a request waits for another request's generation of the same
+# story: as long as clients wait for their own (the TUI allows 150s).
+TLDR_JOIN_TIMEOUT_SECONDS = 150.0
 INTERACTION_EVENT_REQUESTS_PER_MINUTE = 120
 INTERACTION_EVENT_GLOBAL_REQUESTS_PER_MINUTE = 10_000
 
@@ -1374,13 +1378,24 @@ async def _prefetch_tldrs_for_ranked(
         if index > 0 and stagger > 0:
             await asyncio.sleep(min(index * stagger, 15.0))
         async with sem:
-            result = await generate_detailed_tldr(
-                title,
-                self_text=self_text,
-                top_comments=top_comments,
-                article_body=article_body,
-            )
-        return _maybe_cache_tldr(db, story_id, cache_key, result)
+            # A tap generating this story right now covers it; while this
+            # one runs, taps wait for it instead of starting their own.
+            flight = Handler._tldr_flights.try_lead(story_id)
+            if flight is None:
+                return False
+            reply: TldrReply | None = None
+            try:
+                result = await generate_detailed_tldr(
+                    title,
+                    self_text=self_text,
+                    top_comments=top_comments,
+                    article_body=article_body,
+                )
+                cached = _maybe_cache_tldr(db, story_id, cache_key, result)
+                reply = _tldr_result_reply(db, story_id, result)
+                return cached
+            finally:
+                Handler._tldr_flights.land(story_id, flight, reply)
 
     results = await asyncio.gather(
         *(_prefetch_one(i, sid) for i, sid in enumerate(story_ids)),
@@ -1517,6 +1532,8 @@ class Handler:
     # contend for the DB pool with warms and regen.
     _tldr_generations = 0
     _tldr_generations_guard = threading.Lock()
+    # Summaries being generated, by story: taps and the warm prefetch share one.
+    _tldr_flights: SingleFlight[int, TldrReply] = SingleFlight()
 
     @classmethod
     def reset_public_demo_limiter(cls) -> None:
@@ -2487,9 +2504,33 @@ def _tldr_tap_probe_growth(
     return (story, True)
 
 
-def _serve_cached_tldr(
+@dataclass(frozen=True)
+class TldrReply:
+    """A `/api/tldr-detail` answer as data, so every request waiting on the
+    same generation can be sent the same one."""
+
+    payload: dict[str, object]
+    status: HTTPStatus = HTTPStatus.OK
+    retry_after_seconds: int | None = None
+
+    def response(self) -> Response:
+        headers = None
+        if self.retry_after_seconds is not None:
+            headers = {"Retry-After": str(self.retry_after_seconds)}
+        return _flask_json_response(self.payload, status=self.status, headers=headers)
+
+
+def _rate_limited_reply(message: str, retry_after_seconds: int) -> TldrReply:
+    return TldrReply(
+        {"error": message, "retry_after": retry_after_seconds},
+        HTTPStatus.TOO_MANY_REQUESTS,
+        retry_after_seconds,
+    )
+
+
+def _cached_tldr_reply(
     cached_tldr: str, story_id: int, cache_key: str, event: str
-) -> Response:
+) -> TldrReply:
     """Log + serve an exact-key cache hit (early or post-enrich)."""
     logging.info(
         "tldr_detail story_id=%s result=%s cache_key=%s",
@@ -2497,12 +2538,10 @@ def _serve_cached_tldr(
         event,
         cache_key[:12],
     )
-    return _flask_json_response({"ok": True, "tldr": cached_tldr, "cached": True})
+    return TldrReply({"ok": True, "tldr": cached_tldr, "cached": True})
 
 
-def _stale_tldr_fallback_response(
-    db: Database, story_id: int, reason: str
-) -> Response | None:
+def _stale_tldr_fallback(db: Database, story_id: int, reason: str) -> TldrReply | None:
     stale_tldr = db.get_any_tldr_for_story(story_id)
     if not stale_tldr:
         return None
@@ -2511,9 +2550,60 @@ def _stale_tldr_fallback_response(
         story_id,
         reason,
     )
-    return _flask_json_response(
-        {"ok": True, "tldr": stale_tldr, "cached": True, "stale": True}
-    )
+    return TldrReply({"ok": True, "tldr": stale_tldr, "cached": True, "stale": True})
+
+
+def _tldr_result_reply(
+    db: Database,
+    story_id: int,
+    result: TldrResult,
+    extra: dict[str, object] | None = None,
+) -> TldrReply:
+    """The reply for a finished generation, from a tap or the prefetch."""
+    if result.kind == "no_content":
+        return TldrReply(
+            {
+                "ok": True,
+                "tldr": "No article body or discussion available to summarize for this story.",
+                "cached": False,
+                # Not persisted to tldr_cache: a later retry (e.g. after
+                # a transient upstream 429 clears) may find real content,
+                # so the client must not treat this as a final answer.
+                "retryable": True,
+                # Machine flag: hydration found nothing summarizable
+                # (short-only comments, blocked article). Clients skip
+                # rendering this as a real summary.
+                "empty": True,
+            }
+        )
+    if result.kind == "llm_error":
+        fallback = _stale_tldr_fallback(db, story_id, "llm_error")
+        if fallback:
+            return fallback
+        if result.error_status in (429, 402):
+            if result.error_status == 402:
+                # Billing refusal (e.g. spend cap): no Retry-After
+                # semantics, so seed the cooldown explicitly. Escalates
+                # with consecutive 402s via the limiter backoff and
+                # self-clears, like a 429.
+                llm_limiter.on_429()
+            return _rate_limited_reply(
+                "Summary provider is cooling down. Please try again later.",
+                max(1, llm_limiter.retry_after_seconds),
+            )
+        return TldrReply(
+            {"error": "Failed to generate TLDR. Please try again later."},
+            HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+    payload: dict[str, object] = {
+        "ok": True,
+        "tldr": result.tldr,
+        "cached": False,
+        **(extra or {}),
+    }
+    if not result.cacheable:
+        payload["retryable"] = True
+    return TldrReply(payload)
 
 
 def _maybe_cache_tldr(
@@ -2530,6 +2620,308 @@ def _maybe_cache_tldr(
         return False
     db.upsert_tldr_cache(story_id, cache_key, result.tldr)
     return True
+
+
+@dataclass(frozen=True)
+class _TldrTap:
+    """What the gates learned about a tap, for the generation behind them."""
+
+    story: Story
+    force_refresh: bool
+    needs_active_refresh: bool
+    needs_empty_fetch: bool
+    tap_probed_growth: bool
+    live_comment_count: int | None
+
+
+_UNFINISHED_TLDR_REPLY = TldrReply(
+    {"error": "The summary being generated didn't finish. Please try again."},
+    HTTPStatus.SERVICE_UNAVAILABLE,
+)
+
+
+def _generate_tldr_reply(
+    runtime: type[Handler], user: User, tap: _TldrTap
+) -> TldrReply:
+    """Slot, quota, hydration and the LLM call for one story's summary."""
+    story = tap.story
+    force_refresh = tap.force_refresh
+    needs_active_refresh = tap.needs_active_refresh
+    needs_empty_fetch = tap.needs_empty_fetch
+    tap_probed_growth = tap.tap_probed_growth
+    live_comment_count = tap.live_comment_count
+    article_body = story.article_body or None
+
+    # Before the quota, so a busy rejection doesn't spend it. Released
+    # by the app's teardown_request hook however the request ends.
+    if not runtime._try_start_tldr_generation():
+        fallback = _stale_tldr_fallback(runtime.db, story.id, "busy")
+        if fallback:
+            return fallback
+        return _rate_limited_reply(
+            "Summaries are busy. Please try again in a few seconds.",
+            TLDR_BUSY_RETRY_AFTER_SECONDS,
+        )
+    g.tldr_generation_runtime = runtime
+
+    quota = _acquire_tldr_uncached_quota(runtime, user)
+    if not quota.allowed:
+        fallback = _stale_tldr_fallback(runtime.db, story.id, "quota_denied")
+        if fallback:
+            return fallback
+        return _rate_limited_reply(
+            "Demo TLDR quota reached. Cached summaries still work; please try a new summary later.",
+            quota.retry_after_seconds,
+        )
+
+    t_tap = time.perf_counter()
+    hydrate_ms = 0.0
+    hydrate_hn_ms = 0.0
+    hydrate_src_ms = 0.0
+    hydrate_article_ms = 0.0
+
+    # Hydration lanes (HN thread refresh, Reddit/LW context, article
+    # body) are independent by source — the article lane excludes
+    # reddit/LW sources and the source lane only runs for them — so run
+    # all eligible lanes concurrently instead of back-to-back. Merges
+    # below apply in the original order to preserve semantics.
+    hn_needed = (
+        needs_empty_fetch
+        or needs_active_refresh
+        or tap_probed_growth
+        or (force_refresh and is_hn_source(story.source) and bool(story.top_comments))
+    )
+    src_kind: str | None = None
+    if story.url and (not story.self_text or not story.top_comments):
+        if story.source.startswith("rss_reddit_"):
+            src_kind = "reddit"
+        elif story.source == "rss_lesswrong_com":
+            src_kind = "lesswrong"
+    from pipeline import _is_fetchable_article_url
+
+    article_eligible = (
+        article_body is None
+        and story.url
+        and src_kind is None
+        and len(story.self_text) < 500
+        and _is_fetchable_article_url(story.url)
+    )
+    _lw_post_id: str | None = None
+    if src_kind == "lesswrong" and story.url:
+        _lw_post_id = _extract_lesswrong_post_id(story.url)
+        if not _lw_post_id:
+            src_kind = None
+
+    async def _hn_lane() -> Story | None:
+        from pipeline import fetch_story
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            return await fetch_story(
+                client,
+                story.id,
+                runtime.db,
+                force=needs_active_refresh or tap_probed_growth or force_refresh,
+            )
+
+    async def _src_lane() -> RedditRssContext | LessWrongContext | None:
+        if src_kind == "reddit":
+            assert story.url is not None
+            return await _fetch_reddit_rss_context(story.url)
+        if src_kind == "lesswrong":
+            assert _lw_post_id is not None
+            return await _fetch_lesswrong_context(_lw_post_id)
+        return None
+
+    async def _article_lane() -> ArticleFetchResult | None:
+        assert story.url is not None
+        return await _fetch_article_body_with_result(story.url)
+
+    # Lane results by name; values are the lane return or the caught
+    # Exception (lanes fail independently — see _timed).
+    async def _timed(
+        name: str, coro: Awaitable[_LaneT] | None
+    ) -> tuple[_LaneT | Exception | None, float | None]:
+        """Run one hydration lane; a failure is returned, not raised, so
+        the other lanes still finish. ``None`` lanes are skipped."""
+        if coro is None:
+            return None, None
+        t0 = time.perf_counter()
+        try:
+            return await coro, (time.perf_counter() - t0) * 1000.0
+        except Exception as e:
+            logging.error("TLDR hydration lane %s failed: %r", name, e)
+            return e, (time.perf_counter() - t0) * 1000.0
+
+    async def _gather_hydration() -> tuple[
+        Story | Exception | None,
+        RedditRssContext | LessWrongContext | Exception | None,
+        ArticleFetchResult | Exception | None,
+        dict[str, float],
+    ]:
+        (hn, hn_ms), (src, src_ms), (article, article_ms) = await asyncio.gather(
+            _timed("hn", _hn_lane() if hn_needed else None),
+            _timed("src", _src_lane() if src_kind is not None else None),
+            _timed("article", _article_lane() if article_eligible else None),
+        )
+        timings = {
+            name: ms
+            for name, ms in (
+                ("hn", hn_ms),
+                ("src", src_ms),
+                ("article", article_ms),
+            )
+            if ms is not None
+        }
+        return hn, src, article, timings
+
+    t_hydrate = time.perf_counter()
+    hn_updated: Story | Exception | None = None
+    remote_context: RedditRssContext | LessWrongContext | Exception | None = None
+    article_result: ArticleFetchResult | Exception | None = None
+    if hn_needed or src_kind is not None or article_eligible:
+        try:
+            hn_updated, remote_context, article_result, _timings = asyncio.run(
+                _gather_hydration()
+            )
+            hydrate_hn_ms = _timings.get("hn", 0.0)
+            hydrate_src_ms = _timings.get("src", 0.0)
+            hydrate_article_ms = _timings.get("article", 0.0)
+        except Exception as e:
+            logging.error("Failed to hydrate story for TLDR: %r", e)
+    hydrate_ms = (time.perf_counter() - t_hydrate) * 1000.0
+
+    if isinstance(hn_updated, Story):
+        story = hn_updated
+        if (
+            live_comment_count is not None
+            and (story.comment_count or 0) < live_comment_count
+        ):
+            # Algolia lags Firebase: never move the count backwards
+            # below the live descendants the probe just confirmed.
+            # comment_count_at_fetch keeps Algolia's number — it is
+            # what the summarized comments actually reflect.
+            story = replace(story, comment_count=live_comment_count)
+            runtime.db.upsert_story(story)
+    elif isinstance(hn_updated, Exception):
+        logging.error("Failed to dynamically fetch comments for TLDR: %r", hn_updated)
+
+    article_body = story.article_body or article_body
+
+    # Merge the concurrently fetched source context (same semantics as
+    # the old sequential block; eligibility was snapshotted above).
+    if not isinstance(remote_context, Exception):
+        if remote_context and (remote_context.self_text or remote_context.top_comments):
+            from pipeline import _merge_source_context
+
+            story = _merge_source_context(
+                story, remote_context, article_body, prefer_longer_comments=True
+            )
+            runtime.db.upsert_story(story)
+    else:
+        logging.error("TLDR source-context lane failed: %r", remote_context)
+
+    if article_result is not None and not isinstance(article_result, Exception):
+        from pipeline import compose_story_text
+        from pipeline.enrichment import record_article_fetch_failure_outcome
+
+        result = article_result
+        if result.body:
+            article_body = result.body[:ARTICLE_BODY_CHAR_LIMIT]
+            new_text = compose_story_text(
+                story.title,
+                story.self_text,
+                story.top_comments,
+                article_body,
+            )
+            updated_story = replace(
+                story,
+                article_body=article_body,
+                text_content=new_text,
+            )
+            runtime.db.upsert_story(updated_story)
+            runtime.db.clear_article_fetch_failure(story.id)
+            # Embedding refresh intentionally left to the warm/regen
+            # article-fetch path (pipeline/enrichment.py re-embeds
+            # there); running ONNX encode here would block the tap.
+            story = updated_story
+        else:
+            record_article_fetch_failure_outcome(
+                runtime.db,
+                story.id,
+                story.url or "",
+                status=result.status,
+                error=result.error,
+                permanent=result.permanent,
+            )
+    elif isinstance(article_result, Exception):
+        logging.error("TLDR article lane failed: %r", article_result)
+
+    cache_key = _tldr_cache_key(
+        title=story.title,
+        self_text=story.self_text or "",
+        top_comments=story.top_comments or "",
+        article_body=article_body or "",
+    )
+    cached_tldr = runtime.db.get_tldr_cache(story.id, cache_key)
+    if cached_tldr and not force_refresh:
+        return _cached_tldr_reply(
+            cached_tldr, story.id, cache_key, "post_enrich_cache_hit"
+        )
+
+    t_llm = time.perf_counter()
+    result = asyncio.run(
+        generate_detailed_tldr(
+            story.title,
+            self_text=story.self_text or "",
+            top_comments=story.top_comments or "",
+            article_body=article_body or "",
+        )
+    )
+    llm_ms = (time.perf_counter() - t_llm) * 1000.0
+    tldr_total_ms = (time.perf_counter() - t_tap) * 1000.0
+    if result.kind == "llm_error":
+        logging.warning(
+            "tldr_detail story_id=%s result=llm_error cache_key=%s status=%s error=%s "
+            "tldr_total_ms=%.0f hydrate_ms=%.0f(hnsrc=%.0f/%.0f/art=%.0f) llm_ms=%.0f",
+            story.id,
+            cache_key[:12],
+            result.error_status,
+            result.error_text,
+            tldr_total_ms,
+            hydrate_ms,
+            hydrate_hn_ms,
+            hydrate_src_ms,
+            hydrate_article_ms,
+            llm_ms,
+        )
+        return _tldr_result_reply(runtime.db, story.id, result)
+    if result.kind == "no_content":
+        return _tldr_result_reply(runtime.db, story.id, result)
+    _maybe_cache_tldr(runtime.db, story.id, cache_key, result)
+    logging.info(
+        "tldr_detail story_id=%s result=generated cache_key=%s "
+        "tldr_total_ms=%.0f hydrate_ms=%.0f(hnsrc=%.0f/%.0f/art=%.0f) llm_ms=%.0f "
+        "live=%s summarized_at_fetch=%s",
+        story.id,
+        cache_key[:12],
+        tldr_total_ms,
+        hydrate_ms,
+        hydrate_hn_ms,
+        hydrate_src_ms,
+        hydrate_article_ms,
+        llm_ms,
+        live_comment_count,
+        story.comment_count_at_fetch,
+    )
+    return _tldr_result_reply(
+        runtime.db,
+        story.id,
+        result,
+        {
+            "comment_count_live": live_comment_count,
+            "comment_count_summarized": story.comment_count_at_fetch,
+        },
+    )
 
 
 def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
@@ -2612,7 +3004,9 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             and not force_refresh
             and not tap_probed_growth
         ):
-            return _serve_cached_tldr(cached_tldr, story.id, cache_key, "cache_hit")
+            return _cached_tldr_reply(
+                cached_tldr, story.id, cache_key, "cache_hit"
+            ).response()
 
         retry_after = llm_limiter.retry_after_seconds
         if retry_after:
@@ -2629,11 +3023,9 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
                         "retry_after_seconds": retry_after,
                     }
                 )
-            fallback = _stale_tldr_fallback_response(
-                runtime.db, story.id, "provider_cooldown"
-            )
+            fallback = _stale_tldr_fallback(runtime.db, story.id, "provider_cooldown")
             if fallback:
-                return fallback
+                return fallback.response()
             return _flask_rate_limit_response(
                 "Summary provider is cooling down. Please try again later.", retry_after
             )
@@ -2641,326 +3033,42 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
         # Cached summaries stay public; spending the LLM budget needs a
         # session, so a sessionless client can't drain the shared quota.
         if user is None:
-            fallback = _stale_tldr_fallback_response(runtime.db, story.id, "no_session")
+            fallback = _stale_tldr_fallback(runtime.db, story.id, "no_session")
             if fallback:
-                return fallback
+                return fallback.response()
             return _flask_json_response(
                 {"error": "No session"}, status=HTTPStatus.UNAUTHORIZED
             )
 
-        # Before the quota, so a busy rejection doesn't spend it. Released
-        # by the app's teardown_request hook however the request ends.
-        if not runtime._try_start_tldr_generation():
-            fallback = _stale_tldr_fallback_response(runtime.db, story.id, "busy")
-            if fallback:
-                return fallback
-            return _flask_rate_limit_response(
-                "Summaries are busy. Please try again in a few seconds.",
-                TLDR_BUSY_RETRY_AFTER_SECONDS,
-            )
-        g.tldr_generation_runtime = runtime
-
-        quota = _acquire_tldr_uncached_quota(runtime, user)
-        if not quota.allowed:
-            fallback = _stale_tldr_fallback_response(
-                runtime.db, story.id, "quota_denied"
-            )
-            if fallback:
-                return fallback
-            return _flask_rate_limit_response(
-                "Demo TLDR quota reached. Cached summaries still work; please try a new summary later.",
-                quota.retry_after_seconds,
-            )
-
-        t_tap = time.perf_counter()
-        hydrate_ms = 0.0
-        hydrate_hn_ms = 0.0
-        hydrate_src_ms = 0.0
-        hydrate_article_ms = 0.0
-
-        # Hydration lanes (HN thread refresh, Reddit/LW context, article
-        # body) are independent by source — the article lane excludes
-        # reddit/LW sources and the source lane only runs for them — so run
-        # all eligible lanes concurrently instead of back-to-back. Merges
-        # below apply in the original order to preserve semantics.
-        hn_needed = (
-            needs_empty_fetch
-            or needs_active_refresh
-            or tap_probed_growth
-            or (
-                force_refresh
-                and is_hn_source(story.source)
-                and bool(story.top_comments)
-            )
-        )
-        src_kind: str | None = None
-        if story.url and (not story.self_text or not story.top_comments):
-            if story.source.startswith("rss_reddit_"):
-                src_kind = "reddit"
-            elif story.source == "rss_lesswrong_com":
-                src_kind = "lesswrong"
-        from pipeline import _is_fetchable_article_url
-
-        article_eligible = (
-            article_body is None
-            and story.url
-            and src_kind is None
-            and len(story.self_text) < 500
-            and _is_fetchable_article_url(story.url)
-        )
-        _lw_post_id: str | None = None
-        if src_kind == "lesswrong" and story.url:
-            _lw_post_id = _extract_lesswrong_post_id(story.url)
-            if not _lw_post_id:
-                src_kind = None
-
-        async def _hn_lane() -> Story | None:
-            from pipeline import fetch_story
-
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                return await fetch_story(
-                    client,
-                    story_id,
-                    runtime.db,
-                    force=needs_active_refresh or tap_probed_growth or force_refresh,
-                )
-
-        async def _src_lane() -> RedditRssContext | LessWrongContext | None:
-            if src_kind == "reddit":
-                assert story.url is not None
-                return await _fetch_reddit_rss_context(story.url)
-            if src_kind == "lesswrong":
-                assert _lw_post_id is not None
-                return await _fetch_lesswrong_context(_lw_post_id)
-            return None
-
-        async def _article_lane() -> ArticleFetchResult | None:
-            assert story.url is not None
-            return await _fetch_article_body_with_result(story.url)
-
-        # Lane results by name; values are the lane return or the caught
-        # Exception (lanes fail independently — see _timed).
-        async def _timed(
-            name: str, coro: Awaitable[_LaneT] | None
-        ) -> tuple[_LaneT | Exception | None, float | None]:
-            """Run one hydration lane; a failure is returned, not raised, so
-            the other lanes still finish. ``None`` lanes are skipped."""
-            if coro is None:
-                return None, None
-            t0 = time.perf_counter()
-            try:
-                return await coro, (time.perf_counter() - t0) * 1000.0
-            except Exception as e:
-                logging.error("TLDR hydration lane %s failed: %r", name, e)
-                return e, (time.perf_counter() - t0) * 1000.0
-
-        async def _gather_hydration() -> tuple[
-            Story | Exception | None,
-            RedditRssContext | LessWrongContext | Exception | None,
-            ArticleFetchResult | Exception | None,
-            dict[str, float],
-        ]:
-            (hn, hn_ms), (src, src_ms), (article, article_ms) = await asyncio.gather(
-                _timed("hn", _hn_lane() if hn_needed else None),
-                _timed("src", _src_lane() if src_kind is not None else None),
-                _timed("article", _article_lane() if article_eligible else None),
-            )
-            timings = {
-                name: ms
-                for name, ms in (
-                    ("hn", hn_ms),
-                    ("src", src_ms),
-                    ("article", article_ms),
-                )
-                if ms is not None
-            }
-            return hn, src, article, timings
-
-        t_hydrate = time.perf_counter()
-        hn_updated: Story | Exception | None = None
-        remote_context: RedditRssContext | LessWrongContext | Exception | None = None
-        article_result: ArticleFetchResult | Exception | None = None
-        if hn_needed or src_kind is not None or article_eligible:
-            try:
-                hn_updated, remote_context, article_result, _timings = asyncio.run(
-                    _gather_hydration()
-                )
-                hydrate_hn_ms = _timings.get("hn", 0.0)
-                hydrate_src_ms = _timings.get("src", 0.0)
-                hydrate_article_ms = _timings.get("article", 0.0)
-            except Exception as e:
-                logging.error("Failed to hydrate story for TLDR: %r", e)
-        hydrate_ms = (time.perf_counter() - t_hydrate) * 1000.0
-
-        if isinstance(hn_updated, Story):
-            story = hn_updated
-            if (
-                live_comment_count is not None
-                and (story.comment_count or 0) < live_comment_count
-            ):
-                # Algolia lags Firebase: never move the count backwards
-                # below the live descendants the probe just confirmed.
-                # comment_count_at_fetch keeps Algolia's number — it is
-                # what the summarized comments actually reflect.
-                story = replace(story, comment_count=live_comment_count)
-                runtime.db.upsert_story(story)
-        elif isinstance(hn_updated, Exception):
-            logging.error(
-                "Failed to dynamically fetch comments for TLDR: %r", hn_updated
-            )
-
-        article_body = story.article_body or article_body
-
-        # Merge the concurrently fetched source context (same semantics as
-        # the old sequential block; eligibility was snapshotted above).
-        if not isinstance(remote_context, Exception):
-            if remote_context and (
-                remote_context.self_text or remote_context.top_comments
-            ):
-                from pipeline import _merge_source_context
-
-                story = _merge_source_context(
-                    story, remote_context, article_body, prefer_longer_comments=True
-                )
-                runtime.db.upsert_story(story)
-        else:
-            logging.error("TLDR source-context lane failed: %r", remote_context)
-
-        if article_result is not None and not isinstance(article_result, Exception):
-            from pipeline import compose_story_text
-            from pipeline.enrichment import record_article_fetch_failure_outcome
-
-            result = article_result
-            if result.body:
-                article_body = result.body[:ARTICLE_BODY_CHAR_LIMIT]
-                new_text = compose_story_text(
-                    story.title,
-                    story.self_text,
-                    story.top_comments,
-                    article_body,
-                )
-                updated_story = replace(
-                    story,
-                    article_body=article_body,
-                    text_content=new_text,
-                )
-                runtime.db.upsert_story(updated_story)
-                runtime.db.clear_article_fetch_failure(story.id)
-                # Embedding refresh intentionally left to the warm/regen
-                # article-fetch path (pipeline/enrichment.py re-embeds
-                # there); running ONNX encode here would block the tap.
-                story = updated_story
-            else:
-                record_article_fetch_failure_outcome(
-                    runtime.db,
-                    story.id,
-                    story.url or "",
-                    status=result.status,
-                    error=result.error,
-                    permanent=result.permanent,
-                )
-        elif isinstance(article_result, Exception):
-            logging.error("TLDR article lane failed: %r", article_result)
-
-        cache_key = _tldr_cache_key(
-            title=story.title,
-            self_text=story.self_text or "",
-            top_comments=story.top_comments or "",
-            article_body=article_body or "",
-        )
-        cached_tldr = runtime.db.get_tldr_cache(story.id, cache_key)
-        if cached_tldr and not force_refresh:
-            return _serve_cached_tldr(
-                cached_tldr, story.id, cache_key, "post_enrich_cache_hit"
-            )
-
-        t_llm = time.perf_counter()
-        result = asyncio.run(
-            generate_detailed_tldr(
-                story.title,
-                self_text=story.self_text or "",
-                top_comments=story.top_comments or "",
-                article_body=article_body or "",
-            )
-        )
-        llm_ms = (time.perf_counter() - t_llm) * 1000.0
-        tldr_total_ms = (time.perf_counter() - t_tap) * 1000.0
-        if result.kind == "no_content":
-            return _flask_json_response(
-                {
-                    "ok": True,
-                    "tldr": "No article body or discussion available to summarize for this story.",
-                    "cached": False,
-                    # Not persisted to tldr_cache: a later retry (e.g. after
-                    # a transient upstream 429 clears) may find real content,
-                    # so the client must not treat this as a final answer.
-                    "retryable": True,
-                    # Machine flag: hydration found nothing summarizable
-                    # (short-only comments, blocked article). Clients skip
-                    # rendering this as a real summary.
-                    "empty": True,
-                }
-            )
-        if result.kind == "llm_error":
-            logging.warning(
-                "tldr_detail story_id=%s result=llm_error cache_key=%s status=%s error=%s "
-                "tldr_total_ms=%.0f hydrate_ms=%.0f(hnsrc=%.0f/%.0f/art=%.0f) llm_ms=%.0f",
+        # One generation per story: a request for a story already being
+        # generated (another tap, the TUI, the warm prefetch) waits for that
+        # result instead of spending a slot, quota and an LLM call of its own.
+        flight, leading = runtime._tldr_flights.join_or_lead(story.id)
+        if not leading:
+            reply = flight.wait(TLDR_JOIN_TIMEOUT_SECONDS)
+            logging.info(
+                "tldr_detail story_id=%s result=joined finished=%s",
                 story.id,
-                cache_key[:12],
-                result.error_status,
-                result.error_text,
-                tldr_total_ms,
-                hydrate_ms,
-                hydrate_hn_ms,
-                hydrate_src_ms,
-                hydrate_article_ms,
-                llm_ms,
+                reply is not None,
             )
-            fallback = _stale_tldr_fallback_response(runtime.db, story.id, "llm_error")
-            if fallback:
-                return fallback
-            if result.error_status in (429, 402):
-                if result.error_status == 402:
-                    # Billing refusal (e.g. spend cap): no Retry-After
-                    # semantics, so seed the cooldown explicitly. Escalates
-                    # with consecutive 402s via the limiter backoff and
-                    # self-clears, like a 429.
-                    llm_limiter.on_429()
-                return _flask_rate_limit_response(
-                    "Summary provider is cooling down. Please try again later.",
-                    max(1, llm_limiter.retry_after_seconds),
-                )
-            else:
-                error = "Failed to generate TLDR. Please try again later."
-            return _flask_json_response(
-                {"error": error}, status=HTTPStatus.SERVICE_UNAVAILABLE
+            return (reply or _UNFINISHED_TLDR_REPLY).response()
+        reply = None
+        try:
+            reply = _generate_tldr_reply(
+                runtime,
+                user,
+                _TldrTap(
+                    story=story,
+                    force_refresh=force_refresh,
+                    needs_active_refresh=needs_active_refresh,
+                    needs_empty_fetch=needs_empty_fetch,
+                    tap_probed_growth=tap_probed_growth,
+                    live_comment_count=live_comment_count,
+                ),
             )
-        _maybe_cache_tldr(runtime.db, story.id, cache_key, result)
-        logging.info(
-            "tldr_detail story_id=%s result=generated cache_key=%s "
-            "tldr_total_ms=%.0f hydrate_ms=%.0f(hnsrc=%.0f/%.0f/art=%.0f) llm_ms=%.0f "
-            "live=%s summarized_at_fetch=%s",
-            story.id,
-            cache_key[:12],
-            tldr_total_ms,
-            hydrate_ms,
-            hydrate_hn_ms,
-            hydrate_src_ms,
-            hydrate_article_ms,
-            llm_ms,
-            live_comment_count,
-            story.comment_count_at_fetch,
-        )
-        payload = {
-            "ok": True,
-            "tldr": result.tldr,
-            "cached": False,
-            "comment_count_live": live_comment_count,
-            "comment_count_summarized": story.comment_count_at_fetch,
-        }
-        if not result.cacheable:
-            payload["retryable"] = True
-        return _flask_json_response(payload)
+        finally:
+            runtime._tldr_flights.land(story.id, flight, reply)
+        return reply.response()
     except Exception:
         logging.exception("Error handling tldr-detail")
         return _flask_json_response(
@@ -3173,7 +3281,7 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
         )
         cached = runtime.db.get_tldr_cache(story_id, key)
         response = (
-            _serve_cached_tldr(cached, story_id, key, "prefetch_cache_hit")
+            _cached_tldr_reply(cached, story_id, key, "prefetch_cache_hit").response()
             if cached
             else Response(status=204)
         )

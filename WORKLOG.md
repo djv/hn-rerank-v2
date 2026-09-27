@@ -1,5 +1,28 @@
 # Worklog: hn-rewrite
 
+## 2026-09-26 Server: one summary generation per story
+
+Stage S2 of `docs/server-web-alignment-plan.md`.
+- Two taps on the same story, a tap and a web/TUI prefetch, or a tap and the
+  warm prefetch each took a generation slot and quota, hydrated the article
+  again and called the LLM again. Now `Handler._tldr_flights`
+  (`single_flight.SingleFlight`) allows one generation per story: later
+  requests wait (≤150s) for the leader's reply without a slot or quota, and
+  the warm prefetch skips stories a tap is generating (taps join the
+  prefetch's flight). A failed leader sends waiters `503`.
+- `_handle_flask_tldr_detail` (430 lines) is now gates (cache hit, cooldown,
+  session, join) plus `_generate_tldr_reply` (slot, quota, hydration, LLM),
+  which returns a `TldrReply` (payload, status, Retry-After) instead of a
+  Flask response. `_tldr_result_reply` builds the reply for a finished
+  generation for both taps and the prefetch.
+- Tests: `tests/test_single_flight.py` (Hypothesis: every joiner gets its
+  own key's leader result, keys released on landing) and
+  `tests/test_tldr_single_flight.py` (concurrent taps with 1 slot and 1 quota
+  make one LLM call and all get the same summary; a failed leader frees the
+  story; prefetch and taps never generate the same story twice).
+  Mutation-checked: dropping the join, the prefetch check, or landing on
+  failure each fails them.
+
 ## 2026-09-26 Server: votes no longer trigger a global regen
 
 Stage S4 of `docs/server-web-alignment-plan.md`, approved after the evidence:
