@@ -41,6 +41,7 @@ SCRIPT_MAINS = [
     "narrowing_report",
     "perf_report",
     "prepare_embedding_cache",
+    "relabel_legacy_sources",
     "remove_source_stories",
     "seed_hn_from_bq",
     "seed_hn_from_clickhouse",
