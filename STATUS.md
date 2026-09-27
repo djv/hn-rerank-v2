@@ -1,30 +1,32 @@
 # HN Rerank status
 
 ## Objective
-Align the server and the web dashboard with the terminal client's simpler
-model: one shared summary request per story, one poller and one reload
-path, optimistic ordered votes, two timeout classes.
+Improve what the dashboard shows user 1: ranking quality (2026-09-25 study)
+and, since 2026-09-26, which sources feed it.
 
 ## Verified result
-- TUI simplified and pushed (2592706, 4274de9, ff85910, d1b4bea): timeouts
-  10s/150s; zoom as a property; `summary_requests` shared by selection and
-  prefetch under `Semaphore(4)`; 60s poller + `reload(manual=...)`; votes
-  hide at once and are sent in order, a failure reverts with an error.
-- TUI tests: 132 pass, ~25s at `-n 8`; ruff, format, ty clean. Read-only
-  live run against the VPS: feed, prefetched summaries, sort, zoom, quit OK.
-- Details: FINDINGS.md "TUI simplification — 2026-09-26".
+- Ranking: production ranking, config and embeddings unchanged after the
+  study (challenger tied on hand orderings). FINDINGS.md "Ranking-quality
+  study — 2026-09-25".
+- Sources (2026-09-26/27, live on the VPS): 12 low-yield feeds dropped,
+  8 added (AI newsletters, The Register, r/expats, r/eupersonalfinance);
+  Reddit topfeeds refresh at most every 2h; regen fetches article text for
+  up to 30 RSS snippet rows per run, backlog backfilled; 272 legacy source
+  labels relabelled (eval composite 0.669 -> 0.675). FINDINGS.md "Source
+  yield review — 2026-09-26".
+- Tools: `scripts/source_yield_report.py` (per-source yield),
+  `scripts/backfill_rss_articles.py`, `scripts/relabel_legacy_sources.py`.
 
 ## Blocker / limits
-- The GitHub repo is public: every push is public. `DEFAULT_SERVER` in
-  `clients/tui/src/hn_rerank/app.py` names the tailnet host.
-- Not published to PyPI (user's call); `dist/` wheel predates this work.
-- Another session is editing feeds/server files in parallel; coordinate
-  before touching `server.py`.
-- Ranking study (archived status) still holds: only votes after 2026-09-25
-  are a clean holdout.
+- New feeds and the Reddit throttle have under a day of data.
+- Only votes after 2026-09-25 are a clean ranking holdout.
+- Without the ONNX model (laptop), 18 real-model `test_pipeline` tests skip
+  with a setup hint; `uv run python setup_model.py` enables them.
 
 ## Next step
-Map the server (dashboard versions, `ranking-ready`, warm scheduler, cold
-deck, TLDR prefetch) and the web client (`templates/index.html` polling,
-voting, TLDR loading) against the TUI model; propose with diagrams, then
-refactor in stages.
+- 2026-09-28 20:00 local: scheduled task `hn-feed-yield-check` reports
+  Reddit 429s, new-feed yield and article-text backlog; act on its
+  recommendation.
+- After a few hundred new votes (about a week): rerun
+  `eval_ranker_variants.py` on votes after 2026-09-25 to recheck the
+  challenger.
