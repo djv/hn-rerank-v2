@@ -44,6 +44,7 @@ SCRIPT_MAINS = [
     "seed_hn_from_bq",
     "seed_hn_from_clickhouse",
     "seed_smoke_test",
+    "source_yield_report",
 ]
 
 

@@ -32,7 +32,6 @@ svm_precomputed_chunk_size = 512
 
 [hn_rewrite.rss]
 feeds = [
-    "https://lobste.rs/top/rss",
     "https://www.lesswrong.com/feed.xml?view=frontpage&karmaThreshold=20",
     "https://rss.slashdot.org/Slashdot/slashdotMain",
     "https://www.theregister.com/headlines.atom",
@@ -51,9 +50,6 @@ feeds = [
     # AI / coding agents
     "https://www.reddit.com/r/AI_Agents/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/ChatGPTCoding/top/.rss?t=week&limit=25",
-
-    # Programming languages / CS depth
-    "https://www.reddit.com/r/Compilers/top/.rss?t=week&limit=25",
 
     # Finance / tax / nomad money
     "https://www.reddit.com/r/financialindependence/top/.rss?t=week&limit=25",
@@ -80,14 +76,12 @@ feeds = [
     "https://pedestrianobservations.com/feed/",
     "https://humantransit.org/feed",
     "https://eugeneyan.com/rss/",
-    "https://huyenchip.com/feed.xml",
     "https://www.latent.space/feed",
     "https://www.understandingai.org/feed",
     "https://www.dwarkesh.com/feed",
     "https://newsletter.pragmaticengineer.com/feed",
     "https://www.oneusefulthing.org/feed",
     "https://thezvi.substack.com/feed",
-    "https://lwn.net/headlines/rss",
     "https://blog.janestreet.com/feed.xml",
     "https://www.tweag.io/rss.xml",
     "https://well-typed.com/blog/rss2.xml",

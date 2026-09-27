@@ -8,6 +8,7 @@ import re
 import threading
 import time
 from dataclasses import replace
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Protocol
 from urllib.error import URLError
 from urllib.parse import urlparse
@@ -904,6 +905,57 @@ def _is_fetchable_article_url(url: str) -> bool:
     return True
 
 
+def _article_fetch_eligible(
+    story: Story, db: Database, min_time: float, now_ts: float
+) -> bool:
+    if not story.url or story.article_body:
+        return False
+    if not _is_fetchable_article_url(story.url):
+        return False
+    if story.source.startswith("rss_reddit_") or story.source == "rss_lesswrong_com":
+        return False
+    if story.time < min_time:
+        return False
+    if _article_fetch_failure_active(db, story.id, now_ts):
+        return False
+    return True
+
+
+def select_rss_article_prewarm(
+    candidates: Sequence[Story],
+    db: Database,
+    *,
+    max_per_run: int,
+    max_age_days: int = 30,
+    now_ts: float | None = None,
+) -> list[Story]:
+    """Newest RSS stories (not Reddit/LessWrong) still lacking article text.
+
+    The warm-path fetcher only reaches stories that already rank near the
+    top, so a feed that ships a short snippet never earns the text that
+    would let it rank. Rows are re-read from the DB: feed parsing yields
+    fresh objects without the stored body.
+    """
+    if max_per_run <= 0:
+        return []
+    now_ts = time.time() if now_ts is None else now_ts
+    min_time = now_ts - (max_age_days * 86400)
+    rss_ids = [
+        s.id
+        for s in candidates
+        if s.source.startswith("rss_")
+        and not s.source.startswith("rss_reddit_")
+        and s.source != "rss_lesswrong_com"
+    ]
+    stored = [
+        s
+        for s in db.get_stories(rss_ids)
+        if _article_fetch_eligible(s, db, min_time, now_ts)
+    ]
+    stored.sort(key=lambda s: s.time, reverse=True)
+    return stored[:max_per_run]
+
+
 def select_article_fetch_candidates(
     *,
     ranked: list[RankedStory],
@@ -925,20 +977,7 @@ def select_article_fetch_candidates(
     min_time = now_ts - (max_age_days * 86400)
 
     def eligible(story: Story) -> bool:
-        if not story.url or story.article_body:
-            return False
-        if not _is_fetchable_article_url(story.url):
-            return False
-        if (
-            story.source.startswith("rss_reddit_")
-            or story.source == "rss_lesswrong_com"
-        ):
-            return False
-        if story.time < min_time:
-            return False
-        if _article_fetch_failure_active(db, story.id, now_ts):
-            return False
-        return True
+        return _article_fetch_eligible(story, db, min_time, now_ts)
 
     selected: list[Story] = []
     selected_ids: set[int] = set()

@@ -117,6 +117,9 @@ class Config:
     # 0 disables the throttle.
     reddit_refresh_min_interval_seconds: float = 7200.0
     article_fetch_max_per_run: int = 50
+    # Regen-time article fetches for new RSS snippet stories regardless of
+    # rank (the warm path only reaches stories already near the top). 0 off.
+    rss_article_prewarm_max_per_run: int = 30
     article_fetch_concurrency: int = 10
     article_fetch_max_age_days: int = 30
     max_cached_models: int = 20

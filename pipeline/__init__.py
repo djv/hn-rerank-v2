@@ -105,6 +105,7 @@ from .enrichment import (
     prewarm_reddit_top_stories,
     prewarm_top_stories,
     select_article_fetch_candidates,
+    select_rss_article_prewarm,
 )
 from .hn_dupes import (
     FeedbackDupeContext,
@@ -1029,6 +1030,27 @@ async def fetch_candidates_only(
                 "Regen: prewarmed %d/%d LessWrong candidates (full mode)",
                 prewarmed,
                 len(needs_prewarm_lw),
+            )
+
+    # RSS article text, independent of rank
+    if embedder is not None:
+        rss_targets = select_rss_article_prewarm(
+            candidates,
+            db,
+            max_per_run=config.rss_article_prewarm_max_per_run,
+            max_age_days=config.article_fetch_max_age_days,
+        )
+        if rss_targets:
+            fetched = await fetch_and_cache_article_bodies(
+                db=db,
+                embedder=embedder,
+                stories=rss_targets,
+                concurrency=config.article_fetch_concurrency,
+            )
+            logging.info(
+                "Regen: fetched article text for %d/%d RSS candidates",
+                len(fetched),
+                len(rss_targets),
             )
 
 

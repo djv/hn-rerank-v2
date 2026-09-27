@@ -7311,6 +7311,62 @@ def test_select_article_fetch_excludes_lesswrong(db):
     assert result == []
 
 
+def test_rss_article_prewarm_picks_newest_snippets_from_stored_rows(
+    db: Database,
+) -> None:
+    """Thin RSS rows get fetched whatever their rank; stored bodies count."""
+    now = 2_000_000_000.0
+
+    def story(
+        sid: int, source: str, age_days: float, *, url: str = "", article_body: str = ""
+    ) -> Story:
+        return Story(
+            id=sid,
+            title=f"s{sid}",
+            url=url or f"https://example.com/{sid}",
+            score=1,
+            time=int(now - age_days * 86400),
+            text_content="snippet",
+            source=source,
+            article_body=article_body,
+        )
+
+    rows = [
+        story(1, "rss_aeon_co", 1),
+        story(2, "rss_aeon_co", 3),
+        story(3, "rss_aeon_co", 2, article_body="already fetched"),
+        story(4, "rss_reddit_rust", 1),
+        story(5, "rss_lesswrong_com", 1),
+        story(6, "hn", 1),
+        story(7, "rss_aeon_co", 40),
+        story(8, "rss_aeon_co", 1, url="https://example.com/paper.pdf"),
+        story(9, "rss_aeon_co", 0.5),
+    ]
+    for row in rows:
+        db.upsert_story(row)
+    db.record_article_fetch_failure(
+        9,
+        "https://example.com/9",
+        status=429,
+        error="http_429",
+        permanent=False,
+        next_retry_at=now + 3600,
+    )
+    # Feed parsing hands back fresh objects without the stored body.
+    parsed = [replace(row, article_body="") for row in rows]
+
+    picked = pipeline.select_rss_article_prewarm(
+        parsed, db, max_per_run=10, max_age_days=30, now_ts=now
+    )
+    assert [s.id for s in picked] == [1, 2]
+
+    capped = pipeline.select_rss_article_prewarm(
+        parsed, db, max_per_run=1, max_age_days=30, now_ts=now
+    )
+    assert [s.id for s in capped] == [1]
+    assert pipeline.select_rss_article_prewarm(parsed, db, max_per_run=0) == []
+
+
 def test_article_fetch_batch_logs_summary(db, caplog, monkeypatch):
     """fetch_and_cache_article_bodies emits ok/failed/errors summary."""
     import logging
