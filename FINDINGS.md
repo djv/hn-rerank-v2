@@ -45,6 +45,16 @@ HN baseline: 6031 / 1696 / 21%.
   pudding, earlyretirementnow); huyenchip last posted 2025-01.
 - Fetch errors 2026-09-23..25 were a VPS DNS outage (157 errors, all
   feeds, 4 empty HN live windows; LessWrong's 18 "timeouts" are all in it).
+  Cause: all VPS egress, DNS included, goes through the Proton WireGuard
+  tunnel (resolver 10.2.0.1, fallbacks 1.1.1.1/9.9.9.9 also via the tunnel),
+  so fallback resolvers cannot help. Errors stopped after proton.conf's
+  routing rules were rewritten on 2026-09-26 (system-setup, not this repo).
+  An empty live window only skips that regen's HN score refresh; ranking
+  reads stories from the DB, so the deck keeps its HN rows.
+- Follow-ups (2026-09-27): LWN, lobste.rs, r/Compilers, huyenchip dropped.
+  Regen now fetches article text for up to 30 RSS snippet rows per run
+  (1167 of 1669 recent rows had none); the first run got 30/30. Per-source
+  report: `scripts/source_yield_report.py --since YYYY-MM-DD`.
 - Reddit 429s ~150/day: mostly one retry, circuit opened once in 3 days,
   no feed failed. Cause: each regen refreshes every subreddit, and votes
   trigger a regen about every 20 minutes; only ~4 of 21 weekly-top feeds
