@@ -6,8 +6,9 @@ profile with your server URL, for example `https://your-host/hn/`.
 The server retains its existing access policy: installing the client does not grant access.
 
 Keys: j/k or arrows navigate/scroll; Tab changes focus; 1/2/3 vote
-positive/neutral/negative and advance to the next story; u undoes the latest
-successful vote; o/c open article/comments;
+positive/neutral/negative and advance to the next story at once (votes are sent
+in order in the background; a failed one puts its story back with an error);
+u undoes the latest vote; o/c open article/comments;
 y copies the comments link (or the article link if there is none); r refreshes; ? shows help; q quits.
 Enter hides the article list and zooms the TLDR pane; Enter or Escape returns
 to the list. Escape also closes help. Use the sort and age selectors to change
@@ -38,8 +39,8 @@ are not sent to a separate analytics service and are not retried.
 
 Configuration lives in platformdirs' user config directory (`hn-rerank/profile.json`),
 outside uv's cache. The profile token is a credential: keep that file and profile links private.
-Requests do not follow redirects or retry ambiguous votes. Refresh after a connection failure;
-undo can clear the latest confirmed vote. Reading requires an online server; no local ML.
+Requests do not follow redirects or retry ambiguous votes. Refresh after a connection failure.
+Reading requires an online server; no local ML.
 
 Local build: `uv build --project clients/tui`.
 Local launch: `uvx --from /absolute/path/to/hn_rerank-0.1.0-py3-none-any.whl hn-rerank`.

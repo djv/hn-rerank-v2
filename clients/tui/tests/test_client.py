@@ -131,35 +131,50 @@ async def test_navigation_resize_filters_and_late_summary(tmp_path: Path) -> Non
         assert listing.display and app.query_one(Markdown).display
 
 
-async def test_vote_duplicate_failure_undo_and_stale_exclusion(tmp_path: Path) -> None:
+async def test_rapid_votes_apply_in_order_undo_and_failure_revert(
+    tmp_path: Path,
+) -> None:
     fake = FakeServer()
     fake.delay_vote = 0.15
     app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
     async with app.run_test(size=(120, 35)) as pilot:
-        await pilot.pause(0.15)
-        app.query_one(OptionList).focus()
-        app.action_vote("up")
-        app.action_vote("down")
         await settle(pilot)
-        votes = [r for r in fake.requests if r.url.path.endswith("/feedback")]
-        assert len(votes) == 1
-        assert app.rated == {1}
+        app.query_one(OptionList).focus()
+        # Both apply at once; the second lands on the next story, not dropped.
+        app.action_vote("up")
         assert [s.id for s in app.stories] == [2]
+        app.action_vote("down")
+        assert not app.stories and app.rated == {1, 2}
+        await settle(pilot)
+        votes = [
+            json.loads(r.content)
+            for r in fake.requests
+            if r.url.path.endswith("/feedback")
+        ]
+        assert votes == [
+            {"story_id": 1, "action": "up"},
+            {"story_id": 2, "action": "down"},
+        ]
         app.action_refresh()
-        await pilot.pause(0.1)
-        assert [s.id for s in app.stories] == [2]
+        await settle(pilot)
+        assert not app.stories  # voted stories stay out of a refreshed deck
         app.action_undo()
         await settle(pilot)
-        assert not app.rated and not app.history
+        assert app.rated == {1} and [s.id for s in app.history] == [1]
         selected = app.selected()
-        assert selected and selected.id == 1
+        assert selected and selected.id == 2
+        # A failed vote puts the story back, selected, and is not retried.
         fake.fail_vote = True
+        fake.requests.clear()
         app.action_vote("down")
+        assert app.rated == {1, 2}
         await settle(pilot)
-        assert not app.rated and not app.history
+        assert app.rated == {1} and [s.id for s in app.history] == [1]
         selected = app.selected()
-        assert selected and selected.id == 1
-        assert "secret" not in str(app.query_one("#status", Static).content)
+        assert selected and selected.id == 2
+        assert len([r for r in fake.requests if r.url.path.endswith("/feedback")]) == 1
+        status = str(app.query_one("#status", Static).content)
+        assert "not confirmed" in status and "secret" not in status
 
 
 async def test_setup_typing_does_not_trigger_actions(tmp_path: Path) -> None:
@@ -804,3 +819,20 @@ async def test_only_summary_generation_gets_the_long_timeout() -> None:
     await api.cached_summary(1)
     await api.close()
     assert seen == {"tldr-detail": GENERATION_TIMEOUT, "1": REQUEST_TIMEOUT}
+
+
+async def test_failed_undo_hides_the_story_again(tmp_path: Path) -> None:
+    fake = FakeServer()
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        app.query_one(OptionList).focus()
+        app.action_vote("up")
+        await settle(pilot)
+        fake.fail_vote = True
+        app.action_undo()
+        assert not app.rated  # shown at once
+        await settle(pilot)
+        assert app.rated == {1} and [s.id for s in app.history] == [1]
+        assert [s.id for s in app.stories] == [2]
+        assert "not confirmed" in str(app.query_one("#status", Static).content)

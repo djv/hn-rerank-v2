@@ -35,7 +35,7 @@ async def test_passive_poll_only_fetches_changed_versions(version: int) -> None:
             assert "· 💬 77" in str(app.query_one("#story-heading", Static).content)
 
 
-@pytest.mark.parametrize("state", ["pending", "reading", "help_open", "setting_up"])
+@pytest.mark.parametrize("state", ["reading", "help_open", "setting_up"])
 async def test_passive_poll_defers_during_interaction(state: str) -> None:
     fake = FakeServer()
     app = Reader(api=fake.api())

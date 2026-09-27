@@ -598,7 +598,7 @@ class Reader(App[None]):
         # Views ("<sort>:<age>") each voted story was listed in, so undo puts
         # it back only where the server had it.
         self.vote_views: dict[int, list[str]] = {}
-        self.pending = False
+        self.vote_lock = asyncio.Lock()
         self.selection_serial = 0
         self.interaction_session = str(uuid4())
         self.summary_story_id: int | None = None
@@ -793,7 +793,6 @@ class Reader(App[None]):
         self.workers.cancel_group(self, "refresh")
         self.workers.cancel_group(self, "vote")
         self.workers.cancel_group(self, "impression")
-        self.pending = False
         self.push_screen(
             Setup(
                 self.config_path,
@@ -1277,7 +1276,6 @@ class Reader(App[None]):
             self.api
             and self.feed
             and not self.setting_up
-            and not self.pending
             and not self.reading
             and not self.help_open
             and not any(
@@ -1395,61 +1393,73 @@ class Reader(App[None]):
             )
 
     def action_vote(self, action: str) -> None:
+        """Hide the story and move on now; the server hears about it next."""
         story = self.selected()
-        if story and not self.pending:
-            self.pending = True
-            self.submit(story, action)
+        if story is None:
+            return
+        self.apply_vote(story)
+        self.submit(story, action)
 
     def action_undo(self) -> None:
-        if self.history and not self.pending:
-            self.pending = True
-            self.submit(self.history[-1], "clear")
+        if self.history:
+            story = self.history[-1]
+            self.apply_undo(story)
+            self.submit(story, "clear")
 
-    @work(group="vote")
-    async def submit(self, story: FeedStory, action: str) -> None:
-        if not self.api:
-            self.pending = False
-            return
-        self.status("Saving vote…")
-        views = [
+    def apply_vote(self, story: FeedStory) -> None:
+        index = next((i for i, s in enumerate(self.stories) if s.id == story.id), 0)
+        remaining = [item for item in self.stories if item.id != story.id]
+        next_id = remaining[min(index, len(remaining) - 1)].id if remaining else None
+        self.rated.add(story.id)
+        self.restored.pop(story.id, None)
+        self.history.append(story)
+        self.vote_views[story.id] = [
             key
             for key, order in (self.feed.orders.items() if self.feed else ())
             if story.id in order
         ]
-        try:
-            target = await self.api.vote(story.id, action)
-            if self.feed is not None and target > self.feed.version:
-                self.feed = replace(self.feed, target_version=target, ready=False)
-            if action == "clear":
-                self.history.pop()
-                self.rated.discard(story.id)
-                self.restored[story.id] = story
-                self.restore_story(story)
-                self.rebuild(story.id)
-            else:
-                index = next(
-                    (i for i, item in enumerate(self.stories) if item.id == story.id), 0
-                )
-                remaining = [item for item in self.stories if item.id != story.id]
-                next_id = (
-                    remaining[min(index, len(remaining) - 1)].id if remaining else None
-                )
-                self.rated.add(story.id)
-                self.restored.pop(story.id, None)
-                self.history.append(story)
-                self.vote_views[story.id] = views
-                self.rebuild(next_id)
-            self.status("Vote cleared." if action == "clear" else "Vote saved.")
-        except InvalidProfile as exc:
-            self.setup(str(exc))
-        except APIError as exc:
-            self.status(
-                str(exc)
-                + " Vote not confirmed; r refreshes, then check before voting again.",
-                error=True,
-            )
-        finally:
-            self.pending = False
+        self.rebuild(next_id)
+
+    def apply_undo(self, story: FeedStory) -> None:
+        if story in self.history:
+            self.history.remove(story)
+        self.rated.discard(story.id)
+        self.restored[story.id] = story
+        self.restore_story(story)
+        self.rebuild(story.id)
+
+    @work(group="vote")
+    async def submit(self, story: FeedStory, action: str) -> None:
+        api = self.api
+        if api is None:
+            return
+        self.status("Saving vote…")
+        # One at a time, so the server sees votes and undos in the order made.
+        async with self.vote_lock:
+            try:
+                target = await api.vote(story.id, action)
+            except InvalidProfile as exc:
+                self.setup(str(exc))
+                return
+            except APIError as exc:
+                if api is self.api:
+                    # Never retried: the server may or may not have it.
+                    if action == "clear":
+                        self.apply_vote(story)
+                    else:
+                        self.apply_undo(story)
+                    self.status(
+                        "Vote not confirmed, so the story is back; check before"
+                        f" voting again. {exc}",
+                        error=True,
+                    )
+                return
+        if api is not self.api:
+            return
+        if self.feed is not None and target > self.feed.version:
+            # The poller loads the reranked deck once the server has it.
+            self.feed = replace(self.feed, target_version=target, ready=False)
+        self.status("Vote cleared." if action == "clear" else "Vote saved.")
 
     def restore_story(self, story: FeedStory) -> None:
         """Put an undone story back in the views it was voted from, where the

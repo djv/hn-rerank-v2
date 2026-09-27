@@ -16,6 +16,10 @@
   every second for up to 30s; the poller reloads once `ranking-ready` says the
   reranked deck exists. Removed `target` juggling, `force_summary_id` (r now
   starts the forced load itself) and the duplicate passive/manual resets.
+- Votes are optimistic: the story hides and the selection advances at once;
+  `submit` sends votes/undos one at a time (`vote_lock`) so the server sees
+  them in order. A failed request reverts that one change with an error and
+  is not retried. Removed the `pending` lock that dropped a quick second vote.
 
 ## 2026-09-26 TUI: `y` copies link; faster TUI tests
 

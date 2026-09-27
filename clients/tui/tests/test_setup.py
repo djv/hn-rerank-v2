@@ -146,7 +146,7 @@ async def test_profile_setup_cancels_pending_vote_state() -> None:
         app.setup("Profile changed")
         await settle(pilot)
         assert isinstance(app.screen, Setup)
-        assert not app.pending and not app.rated and not app.history
+        assert not any(w.group == "vote" and w.is_running for w in app.workers)
 
 
 async def test_default_server_keeps_saved_profile_elsewhere(
