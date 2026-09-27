@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch article text for recent RSS snippet rows, draining the regen backlog.
+"""Fetch article text for recent snippet rows of configured RSS feeds.
 
 Uses the same selection and fetcher as regen (``select_rss_article_prewarm``
 + ``fetch_and_cache_article_bodies``): SSRF-guarded fetches, shared failure
@@ -28,6 +28,7 @@ if str(ROOT) not in sys.path:
 from database import Database  # noqa: E402
 from pipeline import (  # noqa: E402
     Config,
+    _rss_source_name,
     Embedder,
     fetch_and_cache_article_bodies,
     select_rss_article_prewarm,
@@ -49,13 +50,16 @@ def main() -> None:
     db = Database(config.db_path)
     try:
         cutoff = int(time.time()) - config.article_fetch_max_age_days * 86400
+        # Only feeds still configured: ranking never admits the others.
+        sources = sorted({_rss_source_name(feed) for feed in config.rss.feeds})
+        marks = ",".join("?" for _ in sources)
         candidates = db.get_stories(
             [
                 int(row[0])
                 for row in db.execute(
-                    "SELECT id FROM stories WHERE source LIKE 'rss\\_%' ESCAPE '\\' "
+                    f"SELECT id FROM stories WHERE source IN ({marks}) "
                     "AND time >= ? AND article_body = ''",
-                    (cutoff,),
+                    (*sources, cutoff),
                 )
             ]
         )
