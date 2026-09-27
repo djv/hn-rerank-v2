@@ -23,8 +23,8 @@ and, since 2026-09-26, which sources feed it.
   boot-epoch versions, no-op repeat votes, one summary generation per story,
   no vote-triggered regen, web client built from the embedded feed with the
   TUI's poller/votes/summaries/keys, slimmer ranking-ready/feedback.
-  S1/S4/S2 are live (VPS `b50e21f`, deployed with the feed commits);
-  `413a8b0..9e8fe77` (S3, web client, keys, API) are not deployed yet.
+  All live on the VPS since 2026-09-27 02:02 UTC (`f7cfbe7`); smoked in
+  headless Chrome over the tailnet (read-only) with a clean journal.
 
 ## Blocker / limits
 - New feeds and the Reddit throttle have under a day of data.
@@ -33,8 +33,6 @@ and, since 2026-09-26, which sources feed it.
   with a setup hint; `uv run python setup_model.py` enables them.
 
 ## Next step
-- Deploy `9e8fe77` to the VPS (waiting for the user's OK), then smoke the
-  dashboard in a browser, the TUI read-only, and scan the journal.
 - 2026-09-28 20:00 local: scheduled task `hn-feed-yield-check` reports
   Reddit 429s, new-feed yield, article-text backlog and whether to keep
   r/transit / r/MachineLearning; act on its recommendation.

@@ -1,5 +1,17 @@
 # Worklog: hn-rewrite
 
+## 2026-09-27 Deployed the server/web alignment (`f7cfbe7`)
+
+- S1, S4 and S2 had already gone live with `b50e21f` (the feed deploy,
+  01:25 UTC); no errors in the journal before this deploy.
+- VPS `main` fast-forwarded to `f7cfbe7`, service restarted 02:01:54 UTC,
+  serving from 02:02:30 (cold deck 59 stories). Headless Chrome over the
+  tailnet (read-only, no votes): 57-story feed, 12 in view, summary loaded,
+  `j`/`h` work, poller answered; only a favicon 404. `/api/feed` parses with
+  the TUI's `Feed.parse`; `ranking-ready` returns `{ok, ready,
+  current_version}`. No tracebacks or `[ERROR]` lines since the restart.
+  The smoke created two anonymous demo sessions (no votes).
+
 ## 2026-09-26 API: ranking-ready and feedback return what clients read
 
 Stage C1 of `docs/server-web-alignment-plan.md`. `GET /api/ranking-ready`
