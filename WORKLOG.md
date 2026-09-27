@@ -1,5 +1,17 @@
 # Worklog: hn-rewrite
 
+## 2026-09-27 Dead-code sweep after the web client rewrite
+
+Removed CSS for classes no page, component or script emits any more
+(~100 lines: the old refresh banner, vote buttons, queue pills, brand
+header, controls row, TLDR toggle/error, `badge--similar`, ...); fixed two
+docs that still named `story_card.html` and `time_ago_filter`. Python:
+vulture plus a repo-wide grep found no leftovers from this week's removals
+(every `Config` and render-view field is read). Older code only tests
+still call, left alone: `Database.get_or_create_user`/`get_embedding`,
+`server._fetch_article_body`, `hn_dupes.extract_hn_dupe_target_id`/
+`find_canonical_story_id`, `publication.IDENTITY_VERSION`.
+
 ## 2026-09-27 Browser test of the dashboard page, in CI
 
 `tests/test_browser.py` drives the real page in headless Chrome

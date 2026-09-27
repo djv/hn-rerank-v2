@@ -216,7 +216,7 @@ runtime dep (e.g. jax, tensorflow), give it its own
 ## Frontend notes
 
 - **Data-attribute collisions**: `data-*` attributes on story cards (e.g.
-  `data-story-source`, `data-story-id` in `templates/components/story_card.html`)
+  `data-story-id`, set by `feedCard` in `templates/index.html`)
   can be accidentally matched by generic `querySelectorAll('[data-*]')` selectors
   in `templates/index.html`. Tab buttons use `data-source`, `data-sort`,
   `data-age` — scope selectors to `.tab-btn[data-*]`. When adding `data-*` to

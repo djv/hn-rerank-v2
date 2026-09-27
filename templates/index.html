@@ -42,7 +42,7 @@
       background: var(--term-bg);
     }
 
-    main, .deck-wrap, .swipe-side {
+    main, .swipe-side {
       background: transparent;
     }
 
@@ -62,8 +62,7 @@
       margin-left: 0.15em;
     }
 
-    .tab-label, .swipe-keys, .badge-legend, .rank-legend, .queue-status,
-    .card-actions, .refresh-banner {
+    .swipe-keys, .badge-legend, .rank-legend, .queue-status {
       text-transform: uppercase;
       letter-spacing: 0.06em;
       font-size: 0.72rem;
@@ -73,14 +72,6 @@
       border: 1px solid var(--term-green-dim);
       color: var(--term-green);
       border-radius: 2px;
-    }
-
-    .vote-btn {
-      border-radius: 2px;
-    }
-    .vote-btn.active {
-      border-color: var(--term-green);
-      color: var(--term-green);
     }
 
     /* Warming activity dot: blinking block cursor, CSS only. */
@@ -95,16 +86,13 @@
       animation: term-blink 1s steps(1) infinite;
     }
 
-    .tldr-toggle {
-      color: var(--term-green);
-    }
     .tldr-detail {
       border-left: 2px solid var(--term-green-dim);
     }
     .tldr-detail-content h3 {
       color: var(--term-green);
     }
-    .tldr-error, .tldr-stale {
+    .tldr-stale {
       color: var(--term-amber);
     }
     .domain-chip {
@@ -125,22 +113,6 @@
       padding-bottom: 0.5rem;
     }
 
-    .brand h1 {
-      margin-bottom: 0;
-      font-size: 1.5rem;
-      font-weight: 800;
-    }
-
-    .brand span {
-      color: var(--pico-primary);
-    }
-
-    .meta-subtitle {
-      font-size: 0.8rem;
-      color: var(--pico-muted-color);
-      margin-top: 0.2rem;
-    }
-
     .share-link {
       display: block;
       margin: 0.2rem 0 0.65rem;
@@ -155,22 +127,6 @@
     }
     .share-link:hover {
       opacity: 1;
-    }
-
-    .controls-row {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-top: 0.5rem;
-      gap: 1rem;
-    }
-
-    .controls-row select {
-      width: auto;
-      margin-bottom: 0;
-      padding: 0.25rem 1.75rem 0.25rem 0.5rem;
-      font-size: 0.8rem;
-      height: auto;
     }
 
     .swipe-shell {
@@ -193,19 +149,6 @@
       overflow-y: auto;
       overflow-x: hidden;
       padding-right: 0.5rem;
-    }
-
-    .queue-pill {
-      display: block;
-      margin-bottom: 0.65rem;
-      padding: 0.45rem;
-      border: 1px solid var(--pico-muted-border-color);
-      border-radius: 4px;
-      background: var(--pico-card-background-color);
-      line-height: 1.25;
-    }
-    .queue-pill--bar {
-      padding: 0.45rem;
     }
 
     .toast {
@@ -244,10 +187,6 @@
       grid-template-columns: 1fr;
       gap: 0.35rem;
       margin-bottom: 0.3rem;
-    }
-
-    .tab-bar--grid-4 {
-      grid-template-columns: repeat(4, 1fr);
     }
 
     .tab-btn {
@@ -512,12 +451,6 @@
       background: hsl(15, 60%, 25%);
       color: hsl(15, 80%, 90%);
       border: 1px solid hsl(15, 60%, 35%);
-    }
-
-    .badge--similar {
-      background: hsl(210, 50%, 25%);
-      color: hsl(210, 80%, 90%);
-      border: 1px solid hsl(210, 50%, 35%);
     }
 
     .story-card.enriched {
@@ -883,36 +816,6 @@
       display: inline;
     }
 
-    .refresh-banner {
-      position: fixed;
-      top: 0.75rem;
-      left: 50%;
-      transform: translateX(-50%);
-      z-index: 1000;
-      display: flex;
-      align-items: center;
-      gap: 0.75rem;
-      padding: 0.45rem 0.6rem 0.45rem 0.85rem;
-      border: 1px solid rgba(255, 102, 0, 0.35);
-      border-radius: 6px;
-      background: rgba(255, 255, 255, 0.97);
-      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
-      color: #212529;
-      font-size: 0.85rem;
-    }
-
-    .refresh-banner[hidden] {
-      display: none;
-    }
-
-    .refresh-banner button {
-      width: auto;
-      margin: 0;
-      padding: 0.25rem 0.65rem;
-      font-size: 0.8rem;
-      line-height: 1.2;
-    }
-
     @media (max-width: 640px) {
       .swipe-layout {
         flex-direction: column;
@@ -1000,7 +903,6 @@
       .vote-counts { display: none; }
 
     }
-
 
   </style>
 </head>
