@@ -845,6 +845,8 @@ _PAYWALL_DOMAINS: frozenset[str] = frozenset(
         "wsj.com",
         "reuters.com",
         "axios.com",
+        # Bot-blocked (403 on every fetch, 2026-09-27).
+        "openai.com",
     }
 )
 

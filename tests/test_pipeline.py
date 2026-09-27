@@ -7493,6 +7493,7 @@ def test_is_fetchable_article_url():
     assert not _is_fetchable_article_url(
         "https://www.axios.com/2026/06/12/some-article"
     )
+    assert not _is_fetchable_article_url("https://openai.com/index/some-launch/")
 
     # YouTube
     assert not _is_fetchable_article_url("https://www.youtube.com/watch?v=abc123")
