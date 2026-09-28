@@ -51,7 +51,14 @@ from .api import (
     save_profile,
 )
 from .api import Summary as SummaryResult
-from .models import DEFAULT_WINDOW, WINDOW_LABELS, WINDOWS, Feed, FeedStory
+from .models import (
+    DEFAULT_WINDOW,
+    GRAVITY_TIME_SCALE,
+    WINDOW_LABELS,
+    WINDOWS,
+    Feed,
+    FeedStory,
+)
 
 DEFAULT_SERVER = "https://ubuntu-8gb-nbg1-1.tailca4726.ts.net:8443/hn/"
 
@@ -1589,8 +1596,8 @@ class Reader(App[None]):
 
     def restore_story(self, story: FeedStory) -> None:
         """Put an undone story back in the views of the window it was voted
-        from, where the server orders it: Popular by HN gravity, the rest by
-        rank score."""
+        from, where the server orders it: Popular by HN gravity on that
+        window's clock, the rest by rank score."""
         window, keys = self.vote_views.get(story.id, ("", []))
         feed = self.feeds.get(window)
         if feed is None:
@@ -1599,6 +1606,7 @@ class Reader(App[None]):
             feed.stories.append(story)
         by_id = {item.id: item for item in feed.stories}
         now = time.time()
+        scale = GRAVITY_TIME_SCALE.get(window, 1.0)
         for key in keys:
             order = feed.orders.setdefault(key, [])
             if story.id in order:
@@ -1608,7 +1616,7 @@ class Reader(App[None]):
             def rank(item: FeedStory, by_gravity: bool = by_gravity) -> float:
                 if by_gravity:
                     age_h = max(now - item.time, 0) / 3600
-                    return item.points / (age_h + 2) ** 1.8
+                    return item.points / (age_h / scale + 2) ** 1.8
                 return item.rank_score
 
             index = next(

@@ -34,6 +34,7 @@ from .ranking import (
     COMMENT_DEPTH_PENALTY,
     EXPLORE_PER_BADGE,
     Embedder,
+    GRAVITY_TIME_SCALE,
     HOT_MIN_SCORE,
     RankScoreContext,
     RankTrace,
@@ -256,7 +257,9 @@ def canonicalize_deck(
             kept.append(replace(r, story=out.story))
         if view == "popular":
             kept.sort(
-                key=lambda r: hn_gravity(r.story.score, r.story.time, now),
+                key=lambda r: hn_gravity(
+                    r.story.score, r.story.time, now, GRAVITY_TIME_SCALE[window]
+                ),
                 reverse=True,
             )
         return kept

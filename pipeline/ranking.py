@@ -289,6 +289,18 @@ WINDOW_SECONDS: dict[Window, int] = {
     "1w": 7 * 86400,
     "1m": 30 * 86400,
 }
+# Popular's gravity clock per window: age counts in units of this many hours,
+# a third of the window (archive: of a year). With HN's own clock (1 hour)
+# every window's Popular was the same few stories under a day old; on the
+# 2026-09-28 snapshot this clock gives 1w a median age of a day and 1m of a
+# week. Clients mirror this table for undo.
+GRAVITY_TIME_SCALE: dict[Window, float] = {
+    "12h": 4.0,
+    "1d": 8.0,
+    "1w": 56.0,
+    "1m": 240.0,
+    "archive": 2920.0,
+}
 SOURCE_CATEGORIES: tuple[str, ...] = ("hn_live", "archive", "reddit", "rss")
 
 
@@ -1598,10 +1610,12 @@ def get_entropy(r: RankedStory) -> float:
     return ent
 
 
-def hn_gravity(points: int, posted: int, now: float) -> float:
-    """HN front-page gravity, points / (age_hours + 2) ** 1.8, as in the
-    tier-1 blend of ``_score_and_rank`` (age clamped at zero)."""
-    return points / (max((now - posted) / 3600.0, 0.0) + 2.0) ** 1.8
+def hn_gravity(points: int, posted: int, now: float, time_scale: float = 1.0) -> float:
+    """HN front-page gravity, points / (age_hours / time_scale + 2) ** 1.8;
+    ``time_scale`` 1 is HN's own and the tier-1 blend of ``_score_and_rank``,
+    Popular uses ``GRAVITY_TIME_SCALE[window]`` (age clamped at zero)."""
+    age_hours = max((now - posted) / 3600.0, 0.0)
+    return points / (age_hours / time_scale + 2.0) ** 1.8
 
 
 def in_window(posted: int, window: Window, now: float) -> bool:
@@ -1731,7 +1745,8 @@ def assemble_window_deck(
     Per window (see ``in_window``):
 
     - Recommended: the top stories by model score, no source quota.
-    - Popular: the top HN stories by ``hn_gravity``. Each card
+    - Popular: the top HN stories by ``hn_gravity`` on the window's clock
+      (``GRAVITY_TIME_SCALE``). Each card
       gets one badge from its own numbers: 🔥 Hot when its velocity
       (points/hour) is in the pool's top ``hot_badge_percentile`` and it has
       ``HOT_MIN_SCORE`` points, else 💬 Talk when it has at least as many
@@ -1813,7 +1828,9 @@ def assemble_window_deck(
         recommended = pool[: VIEW_SIZE * SELECT_MARGIN]
         popular = sorted(
             (r for r in pool if is_hn_source(r.story.source)),
-            key=lambda r: hn_gravity(r.story.score, r.story.time, now),
+            key=lambda r: hn_gravity(
+                r.story.score, r.story.time, now, GRAVITY_TIME_SCALE[window]
+            ),
             reverse=True,
         )[: VIEW_SIZE * SELECT_MARGIN]
         picked = {r.story.id for r in recommended}

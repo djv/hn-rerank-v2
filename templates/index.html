@@ -923,6 +923,9 @@
     const SORTS = ['recommended', 'popular', 'explore'];
     // Time windows (pipeline WINDOWS), nested by age; archive is > 30 days.
     const WINDOWS = ['12h', '1d', '1w', '1m', 'archive'];
+    // Popular's gravity clock per window (pipeline GRAVITY_TIME_SCALE): age
+    // counts in units of this many hours.
+    const GRAVITY_TIME_SCALE = { '12h': 4, '1d': 8, '1w': 56, '1m': 240, archive: 2920 };
     const FEED_API_VERSION = 2;
     const REQUEST_TIMEOUT_MS = 10000;
     // tldr-detail may hydrate the article and call the LLM (~2 min worst case).
@@ -1044,8 +1047,8 @@
     }
 
     // Put an undone story back in the views of the window it was voted
-    // from, where the server orders it: Popular by HN gravity, the rest by
-    // rank score.
+    // from, where the server orders it: Popular by HN gravity on that
+    // window's clock, the rest by rank score.
     function restoreStory(story) {
       const entry = voteViews.get(story.id);
       const target = entry && (entry.window === currentWindow ? feed : feeds.get(entry.window));
@@ -1056,11 +1059,12 @@
       if (target === feed) storiesById.set(story.id, story);
       const byId = new Map(target.stories.map(item => [item.id, item]));
       const now = Date.now() / 1000;
+      const scale = GRAVITY_TIME_SCALE[entry.window] || 1;
       for (const key of entry.keys) {
         const order = target.orders[key] || (target.orders[key] = []);
         if (order.includes(story.id)) continue;
         const rank = item => (key === 'popular'
-          ? item.points / Math.pow(Math.max(0, now - item.time) / 3600 + 2, 1.8)
+          ? item.points / Math.pow(Math.max(0, now - item.time) / 3600 / scale + 2, 1.8)
           : item.rank_score);
         let index = order.findIndex(id => rank(byId.get(id)) < rank(story));
         if (index < 0) index = order.length;

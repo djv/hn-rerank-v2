@@ -23,6 +23,15 @@ WINDOW_LABELS: dict[Window, str] = {
     "1m": "1 month",
     "archive": "Archive",
 }
+# Popular's gravity clock per window (the server's GRAVITY_TIME_SCALE): age
+# counts in units of this many hours. Used to re-insert an undone story.
+GRAVITY_TIME_SCALE: dict[Window, float] = {
+    "12h": 4.0,
+    "1d": 8.0,
+    "1w": 56.0,
+    "1m": 240.0,
+    "archive": 2920.0,
+}
 # The three views of a window, the keys of Feed.orders.
 View = Literal["recommended", "popular", "explore"]
 VIEWS: tuple[View, ...] = get_args(View)

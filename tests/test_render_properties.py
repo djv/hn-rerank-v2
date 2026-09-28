@@ -14,6 +14,7 @@ from database import Story
 from pipeline import Config, RankedStory, is_hn_source
 from pipeline.ranking import (
     EXPLORE_PER_BADGE,
+    GRAVITY_TIME_SCALE,
     VIEW_SIZE,
     WINDOW_SECONDS,
     ExploreContext,
@@ -180,7 +181,10 @@ def test_window_views_hold_only_their_window_and_keep_their_orders(
         popular = feed.orders["popular"]
         assert all(is_hn_source(by_id[sid].source) for sid in popular)
         gravity = [
-            hn_gravity(by_id[sid].points, by_id[sid].time, _NOW) for sid in popular
+            hn_gravity(
+                by_id[sid].points, by_id[sid].time, _NOW, GRAVITY_TIME_SCALE[window]
+            )
+            for sid in popular
         ]
         assert gravity == sorted(gravity, reverse=True)
         for sid in popular:
@@ -291,3 +295,14 @@ def test_an_empty_window_is_served_empty_not_widened() -> None:
     # Served a day later, a story that aged out of a window leaves it.
     later = _NOW + 5 * _DAY
     assert build_feed(deck, "1w", Config(), {}, 1, 1, now=later).stories == []
+
+
+def test_a_week_of_popular_favours_its_big_stories_over_fresh_small_ones() -> None:
+    fresh = Story(1, "Fresh", None, 100, int(_NOW) - 3 * 3600, "", source="hn")
+    big = Story(2, "Big", None, 1000, int(_NOW) - 3 * _DAY, "", source="hn")
+    pool = [RankedStory(fresh, 0.0, ""), RankedStory(big, 0.0, "")]
+    deck = assemble_window_deck(pool, config=Config(), now=_NOW)
+    assert [r.story.id for r in deck.window("1w").popular] == [2, 1]
+    assert [r.story.id for r in deck.window("1d").popular] == [1]
+    # HN's own clock (1 hour) would put the fresh story first in every window.
+    assert hn_gravity(100, fresh.time, _NOW) > hn_gravity(1000, big.time, _NOW)

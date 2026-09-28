@@ -1,5 +1,19 @@
 # Worklog: hn-rewrite
 
+## 2026-09-28 Popular gravity runs on the window's clock
+
+User: "popular and date dont work well together cycling through the date
+settings doesnt change much and mostly showing items <1day". Live feed
+confirmed it: Popular's top 12 were identical in 12h/1d/1w/1m (median age
+3h), because HN gravity decays within hours. User chose "gravity scaled to
+the window". Plain stretching (age in units of window/24h) still left 1w
+all under a day old on the 2026-09-28 snapshot; a clock of a third of the
+window (`GRAVITY_TIME_SCALE`: 4/8/56/240/2920 hours) gives 1w a median age
+of 24h (6/12 under a day), 1m 7 days, and overlaps between neighbouring
+windows of 8/6/3 of 12 (was 11/12/12). Both clients mirror the table for
+undo re-insertion; `test_popular_gravity_clock_matches_the_server` keeps
+them equal.
+
 ## 2026-09-28 Deployed `fc6461f` (time window)
 
 VPS fast-forwarded from `c1c676b`, restarted 17:39 UTC. With the user's

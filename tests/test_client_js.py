@@ -665,3 +665,16 @@ def test_votes_and_undo_follow_a_story_across_windows() -> None:
     assert result["counts"] == [0, 0, 0]
     # Sent one at a time in the order made; the first is still in flight.
     assert result["sent"] == [{"story_id": 2, "action": "up"}]
+
+
+def test_popular_gravity_clock_matches_the_server() -> None:
+    from clients.tui.src.hn_rerank.models import GRAVITY_TIME_SCALE as TUI_SCALE
+    from pipeline.ranking import GRAVITY_TIME_SCALE
+
+    line = next(
+        line
+        for line in _inline_script().splitlines()
+        if "const GRAVITY_TIME_SCALE" in line
+    )
+    web = run_node(line + "\nconsole.log(JSON.stringify(GRAVITY_TIME_SCALE));")
+    assert web == GRAVITY_TIME_SCALE == TUI_SCALE

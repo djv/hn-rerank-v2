@@ -2403,7 +2403,10 @@ def test_canonical_replacement_leaves_windows_it_is_outside_and_views_refill(
             r.story.id for r in popular
         }
         gravity = [
-            ranking.hn_gravity(r.story.score, r.story.time, now) for r in popular
+            ranking.hn_gravity(
+                r.story.score, r.story.time, now, ranking.GRAVITY_TIME_SCALE[window]
+            )
+            for r in popular
         ]
         assert gravity == sorted(gravity, reverse=True)
     for window in ("12h", "1d"):

@@ -29,7 +29,8 @@ entity Story {
 -- Windows are nested by age (1d includes the 12h stories; 1m is the last
 -- 30 days); archive is everything older than 30 days.
 enum TimeWindow { h12 | d1 | w1 | m1 | archive }
--- recommended: model score; popular: HN stories by HN gravity; explore:
+-- recommended: model score; popular: HN stories by HN gravity on the
+-- window's clock (age in thirds of the window); explore:
 -- Unsure / Novel / Similar picks.
 enum DashboardView { recommended | popular | explore }
 
@@ -155,7 +156,7 @@ surface Dashboard {
 
     @guarantee ViewOrders
         -- The server's view order is authoritative: recommended and
-        -- explore by rank score, popular by HN gravity. Each popular card
+        -- explore by rank score, popular by the window's HN gravity. Each popular card
         -- carries exactly one of hot / popular / talked_about, from its
         -- own numbers. Explore holds at most explore_per_badge each of
         -- unsure / novel / similar and none of the window's recommended
