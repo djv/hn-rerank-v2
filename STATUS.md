@@ -27,6 +27,15 @@ and, since 2026-09-26, which sources feed it.
   headless Chrome over the tailnet (read-only) with a clean journal.
 - Page runs in headless Chrome in CI (`tests/test_browser.py`); unused CSS
   removed. VPS at `c1c676b` since 2026-09-27 11:22 UTC, smoked clean.
+- Ranker hill-climb (2026-09-28, offline, uncommitted tooling): best is
+  SVM C=2 + logreg rank blend 0.3 on stored embeddings: top-12 upvotes
+  7.50 -> 8.25 of 12 (n.s.), AUC 0.726 -> 0.769 (p=0.034), more discovery
+  and non-HN upvotes. Not deployed. FINDINGS.md "Incremental ranker
+  hill-climb — 2026-09-28". Laptop iGPU encoding (`--device gpu`) works.
+- Time-window selector (12h/1d/1w/1m/Archive replacing Date and Age,
+  per-window feed, client prefetch; Popular by HN gravity, no server
+  Explore shuffle) built in worktree `../hn-rerank-window` (branch
+  `time-window`, uncommitted); suite/TUI/browser/ruff/ty green on 3.12.
 
 ## Blocker / limits
 - New feeds and the Reddit throttle have under a day of data.
@@ -35,6 +44,10 @@ and, since 2026-09-26, which sources feed it.
   with a setup hint; `uv run python setup_model.py` enables them.
 
 ## Next step
+- Check the hill-climb best on votes after 2026-09-25 (fresh read-only VPS
+  snapshot) before any ranker change ships.
+- Review, commit and deploy the time-window branch (feed schema v2: web
+  and TUI must update together; live smoke after deploy).
 - 2026-09-28 20:00 local: scheduled task `hn-feed-yield-check` reports
   Reddit 429s, new-feed yield, article-text backlog and whether to keep
   r/transit / r/MachineLearning; act on its recommendation.

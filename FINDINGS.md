@@ -1,5 +1,81 @@
 # HN Rerank findings
 
+## Incremental ranker hill-climb — 2026-09-28
+
+Setup: `eval_ranker_variants.py --candidate-pool heldout-feedback`, user 1,
+snapshot 2026-09-25 (same development folds as the 2026-09-25 study; the
+newest 20% stays reserved). Each step changes one thing from the current
+best: first a small test (300 votes/class, 3 folds, ~1 min), then the full
+eval (all 5,189 votes, 8 folds, ~25 min) only if the small test is no
+worse on the top-12 upvote rate and better on AUC. Primary metric: upvote
+rate in the top 12 (the clients' 12-card view); also AUC(up vs rest),
+downvote/neutral share of the top 12, discovery upvotes (top-12 upvotes
+below the fold's median similarity to training upvotes) and non-HN
+upvotes. Reports: `/tmp/hn-eval-local/{small,full}-*.json` (not kept).
+
+| Step | Change | Small test | Full eval (vs previous best) | Kept |
+|---|---|---|---|---|
+| 1 | up-minus-down margin scoring | worse | – | no |
+| 1-2 | SVM C 0.1 → 2 | P@12 0.306→0.389, AUC 0.577→0.657, 3/3 folds | P@12 0.625→0.646 (p=0.52), AUC 0.726→0.759 (p=0.046), discovery 0.25→1.12 | yes |
+| 3 | mxbai-xsmall text cut at 512 tokens | 2/3 folds better | P@12 0.646→0.615 (worse 7/8), AUC +0.009 | no |
+| 4 | γ 0.015 / 0.05 at C=2 | P@12 lower | – | no |
+| 5 | + logreg rank blend, weight 0.3 (0.6 tested) | P@12 tie, AUC 0.657→0.674 | P@12 0.646→0.688 (p=0.10), AUC 0.759→0.769 (p=0.07) | yes |
+| 6 | body + comments as two 512-token vectors (mxbai-xsmall) | P@12 0.389→0.500 (1/3 folds), AUC 0.674→0.700 | P@12 0.688→0.635 (n.s.), AUC 0.769→0.788 (p=0.025, 7/8), discovery 1.25→0.12 | no (top 12 is the target) |
+
+Best so far, `prodlr[svm_c=2.0;lr_weight=0.3]`, vs production: top-12
+upvotes 7.50→8.25 of 12 (p=0.20), AUC 0.726→0.769 (p=0.034), downvotes
+0.62→0.38 and neutral 3.9→3.4 per top 12, discovery upvotes 0.25→1.25,
+non-HN upvotes 1.25→2.75. Caveats: the small test misled once (step 3:
+~1 story per fold at top 12); all steps share the development folds; the
+2026-09-25 C=4 + blend challenger failed on the newest votes and hand
+orderings, so votes after 2026-09-25 (a fresh snapshot) are the real test.
+
+Fresh votes: user 1 stopped on 2026-09-24; the user's new default profile
+is user 151 (363 votes, 2026-09-24 to 2026-09-28; 135 stories voted by
+both). Snapshot `snapshot-20260928.db` (read-only VPS copy);
+`scripts/merge_profiles_snapshot.py` builds a copy with user 900001 = 151's
+votes plus user 1's on other stories. `--holdout-after 1790380800` trains on
+votes before 2026-09-26 and tests on 151's 161 later votes (44 up):
+
+| Trained on | Ranker | Upvotes in top 12 | AUC ±95% |
+|---|---|---|---|
+| 151 only (live today) | production | 8 | 0.844 ± 0.08 |
+| 151 only | C=2 + blend 0.3 | 9 | 0.862 |
+| merged 1+151 | production | 7 | 0.837 |
+| merged 1+151 | C=2 / C=2 + blend 0.3 | 10 / 10 | 0.852 / 0.859 |
+
+Direction holds on unseen votes, within noise (one 12-card block). AUC is
+higher than on the development folds (0.73-0.77); not a text leak: text
+length, article presence and comment count alone give AUC 0.36-0.53.
+The live profile trains on 363 votes, not 5,500: merging needs the user's OK.
+
+Taste drift check (2026-09-28 snapshot): old votes stay useful. On the
+135 stories both profiles voted on, the same person agreed with their
+earlier vote 70% of the time (up to down: 2; down to up: 0). A logistic
+model on the stored embeddings, trained on 600 of user 1's votes from
+one month, predicts user 151's votes on the 228 unseen stories (48 up)
+about equally well:
+
+| Month voted | AUC |
+|---|---|
+| June | 0.83 |
+| July | 0.83 |
+| August | 0.75 |
+| September | 0.81 |
+
+All 5,189 votes give AUC 0.82 (95% CI 0.75-0.89); August and September
+alone give 0.79. Every vote was cast between June and September 2026, so
+this covers four months of taste; old stories are not the same as old
+votes.
+
+The earlier embedding screen (700 votes/class, 8 folds, same day) found
+body + comments as two 512-token vectors best at top 12 (0.656 vs 0.594
+full text at 512), within noise; bge-base, arctic-m-v2 and single-vector
+variants (averaged, weighted, split budget, chunked comments) did not
+beat it. On the laptop iGPU (OpenVINO f16, `--device gpu`) encoding is
+~4x faster than CPU (bge-base 0.21 s/story, mxbai-large 1.05 s/story at
+512 tokens); `scripts/bench_embed_gpu.py` times a model.
+
 ## TUI simplification — 2026-09-26
 
 - Review (code-review, high) of `clients/tui/src`: a passive refresh could

@@ -426,3 +426,38 @@ def test_concatenated_replay_embeddings_stay_unit_length(tmp_path: Path) -> None
     joined = _load_concatenated_replay(paths, {1: "h1", 2: "h2"})
     assert joined[1].shape == (5,)
     assert np.linalg.norm(joined[2]) == pytest.approx(1.0)
+
+
+def test_metrics_count_annoying_meh_and_discovery_cards_in_top_12() -> None:
+    from dataclasses import replace
+
+    from scripts.eval_ranker_variants import _metrics
+
+    fold = _metric_fold([1, 30, 5, 7], [2, 2, 0, 1])
+    # One training upvote whose similarity to candidate row r is r / 50, so
+    # rows below the median (ids 1-25) are the less familiar half.
+    up = (np.arange(384, dtype=np.float32) / 50.0)[None, :]
+    up[0, 50:] = 0.0
+    fold = replace(
+        fold,
+        train_stories=[_eval_story(999)],
+        train_emb=up,
+        train_vote_times=np.array([0.0]),
+        y_train=np.array([2]),
+    )
+    scores = -np.arange(50, dtype=np.float32)  # ids 1..12 are the top 12
+
+    metrics = _metrics(scores, fold, Config())["raw"]
+
+    assert metrics["known_downvote_fraction_at_12"] == 1 / 12
+    assert metrics["known_neutral_fraction_at_12"] == 1 / 12
+    assert metrics["discovery_upvotes_at_12"] == 1  # id 1: upvoted, unfamiliar
+    assert metrics["non_hn_upvotes_at_12"] == 0
+    # Reversed ranking: the top 12 are ids 39-50, all familiar, so the
+    # upvote there (id 40) is not a discovery.
+    reversed_fold = replace(
+        fold, test_stories=[_eval_story(40)], test_actions=np.array([2])
+    )
+    flipped = _metrics(np.arange(50, dtype=np.float32), reversed_fold, Config())["raw"]
+    assert flipped["up_recall_at_12"] == 1.0
+    assert flipped["discovery_upvotes_at_12"] == 0

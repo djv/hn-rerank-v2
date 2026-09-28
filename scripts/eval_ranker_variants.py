@@ -41,6 +41,7 @@ from pipeline import (
     mmr_filter,
     story_embedding_text,
 )
+from pipeline.config import is_hn_source
 
 
 @dataclass(frozen=True)
@@ -1019,6 +1020,22 @@ def _scores_knn_up_minus_down(
     return (sim_up - sim_down).astype(np.float32), None
 
 
+def sample_feedback_positions(labels: np.ndarray, per_class: int) -> np.ndarray:
+    """Sorted positions of at most ``per_class`` votes per label (seed 0).
+
+    Shared with encode_replay_embeddings.py so a subsampled screen only
+    encodes the stories the eval will use.
+    """
+    rng = np.random.default_rng(0)
+    keep: list[int] = []
+    for label in (0, 1, 2):
+        positions = np.where(labels == label)[0]
+        if len(positions) > per_class:
+            positions = rng.choice(positions, size=per_class, replace=False)
+        keep.extend(int(pos) for pos in positions)
+    return np.array(sorted(keep), dtype=int)
+
+
 def _load_replay_embeddings(
     path: Path, expected_hashes: dict[int, Any]
 ) -> dict[int, np.ndarray]:
@@ -1101,6 +1118,32 @@ def _rank_average(*scores: np.ndarray) -> np.ndarray:
     return np.mean([_percentile_scores(s) for s in scores], axis=0).astype(np.float32)
 
 
+# Characters of production embedding text (title + self + article +
+# comments). On user 1's votes (2026-09-28) about 14% are short, 56% medium
+# and 30% long.
+TEXT_LENGTH_BUCKETS: dict[str, tuple[int, float]] = {
+    "short": (0, 3000),
+    "medium": (3000, 8000),
+    "long": (8000, math.inf),
+}
+
+
+def _novel_candidate_ids(fold: FoldData) -> set[int]:
+    """Candidates in the less familiar half: max cosine to any training
+    upvote below the fold's median. Measured in the fold's own embedding
+    space, so the median keeps it comparable across embedding models."""
+    dim = fold.cand_emb.shape[1]
+    train = fold.train_emb if fold.train_emb is not None else fold.x_train_base[:, :dim]
+    ups = np.asarray(train)[fold.y_train == 2]
+    if not len(ups) or not len(fold.candidates):
+        return set()
+    max_sim = (np.asarray(fold.cand_emb) @ ups.T).max(axis=1)
+    cutoff = float(np.median(max_sim))
+    return {
+        s.id for s, sim in zip(fold.candidates, max_sim, strict=True) if sim < cutoff
+    }
+
+
 def _metrics(
     scores: np.ndarray,
     fold: FoldData,
@@ -1118,6 +1161,8 @@ def _metrics(
         s.id: int(a) for s, a in zip(fold.test_stories, fold.test_actions, strict=True)
     }
     candidate_ids = {s.id for s in fold.candidates}
+    novel_ids = _novel_candidate_ids(fold)
+    non_hn_ids = {s.id for s in fold.candidates if not is_hn_source(s.source)}
 
     def compute(ids: list[int], eligible: set[int]) -> dict:
         positives = {
@@ -1160,6 +1205,10 @@ def _metrics(
             result[f"auc_up_vs_{other_name}"] = (
                 pairs / (n_up * n_other) if n_up and n_other else None
             )
+            # Raw counts, so small slices (e.g. short texts) can be pooled
+            # across folds instead of averaging per-fold AUCs of 2-3 upvotes.
+            result[f"auc_up_vs_{other_name}_ordered_pairs"] = pairs
+            result[f"auc_up_vs_{other_name}_pairs"] = n_up * n_other
         for k in (10, 12, 40, 100, 200):
             ideal = sum(1 / math.log2(i + 2) for i in range(min(n_up, k)))
             result[f"random_expected_ndcg_at_{k}"] = (
@@ -1180,6 +1229,30 @@ def _metrics(
             result[f"hit_at_{k}"] = (
                 sum(sid in judged for sid in ids[:k]) / len(judged) if judged else None
             )
+        top12 = ids[:12]
+        if top12:
+            # What a 12-card view shows: annoying cards, "meh" cards, and
+            # upvotes the model found outside familiar ground (discovery).
+            result["known_downvote_fraction_at_12"] = sum(
+                judged.get(sid) == 0 for sid in top12
+            ) / len(top12)
+            result["known_neutral_fraction_at_12"] = sum(
+                judged.get(sid) == 1 for sid in top12
+            ) / len(top12)
+            result["non_hn_upvotes_at_12"] = sum(
+                sid in positives and sid in non_hn_ids for sid in top12
+            )
+            result["discovery_upvotes_at_12"] = sum(
+                sid in positives and sid in novel_ids for sid in top12
+            )
+        else:
+            for key in (
+                "known_downvote_fraction_at_12",
+                "known_neutral_fraction_at_12",
+                "non_hn_upvotes_at_12",
+                "discovery_upvotes_at_12",
+            ):
+                result[key] = None
         returned40 = len(ids[:40])
         result["known_upvote_fraction_at_40"] = (
             sum(p < 40 for p in ranks) / returned40 if returned40 else None
@@ -1205,6 +1278,15 @@ def _metrics(
         raise ValueError("Invalid scorer probability matrix")
     raw_ids = [fold.candidates[i].id for i in order]
     output = {"raw": compute(raw_ids, candidate_ids)}
+    # The same ranking restricted to stories of one text length, so an
+    # embedding strategy that only helps long (or short) stories shows up.
+    for bucket, (low, high) in TEXT_LENGTH_BUCKETS.items():
+        bucket_ids = {
+            s.id for s in fold.candidates if low <= len(story_embedding_text(s)) < high
+        }
+        output[f"raw_{bucket}"] = compute(
+            [sid for sid in raw_ids if sid in bucket_ids], bucket_ids
+        )
     if config.model.enable_mmr:
         ranked = [
             RankedStory(
@@ -1550,6 +1632,15 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
         action="store_true",
         help="Evaluate the reserved latest 20 percent of timestamp groups",
     )
+    parser.add_argument(
+        "--holdout-after",
+        type=float,
+        help=(
+            "One split instead of the folds: train on votes before this Unix "
+            "time, test on every vote from it on (no confirmation reserve). "
+            "For checking a candidate on votes newer than any tuning used."
+        ),
+    )
     parser.add_argument("--now", type=float, help="Frozen evaluation Unix timestamp")
     parser.add_argument(
         "--candidate-cap-seed",
@@ -1655,16 +1746,9 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
         raise ValueError("Invalid feedback labels or timestamps")
 
     if args.max_feedback_per_class is not None:
-        rng = np.random.default_rng(0)
-        keep_feedback_positions = []
-        for label in (0, 1, 2):
-            positions = np.where(valid_mask & (all_y == label))[0]
-            if len(positions) > args.max_feedback_per_class:
-                positions = rng.choice(
-                    positions, size=args.max_feedback_per_class, replace=False
-                )
-            keep_feedback_positions.extend(int(pos) for pos in positions)
-        keep_feedback_positions = np.array(sorted(keep_feedback_positions), dtype=int)
+        keep_feedback_positions = sample_feedback_positions(
+            all_y, args.max_feedback_per_class
+        )
         fb_stories = [fb_stories[i] for i in keep_feedback_positions]
         all_y = all_y[keep_feedback_positions]
         fb_vote_times = fb_vote_times[keep_feedback_positions]
@@ -1740,7 +1824,7 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
                 [s.id for s in fb_stories], config.embedding_model_version, hashes
             ),
         )
-    if not args.confirmation:
+    if not args.confirmation and args.holdout_after is None:
         valid_mask &= fb_vote_times < confirmation_start
 
     valid_positions = np.where(valid_mask)[0]
@@ -1923,7 +2007,19 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
         )
 
     split_label = "temporal-expanding"
-    splits = _temporal_splits(y, fb_vote_times, folds=args.folds)
+    if args.holdout_after is not None:
+        if args.confirmation:
+            parser.error("--holdout-after and --confirmation are exclusive")
+        split_label = "holdout-after"
+        splits = [
+            FoldSplit(
+                1,
+                np.flatnonzero(fb_vote_times < args.holdout_after),
+                np.flatnonzero(fb_vote_times >= args.holdout_after),
+            )
+        ]
+    else:
+        splits = _temporal_splits(y, fb_vote_times, folds=args.folds)
     if args.confirmation:
         reserved = np.unique(fb_vote_times[fb_vote_times >= confirmation_start])
         if len(reserved) < args.folds:
@@ -2013,7 +2109,7 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
                                 calibration_available=name == "logreg_up",
                             )
                         )
-            print(f"{label}fold {split.fold_no}/{len(splits)} done")
+            print(f"{label}fold {split.fold_no}/{len(splits)} done", flush=True)
         return results
 
     combined = _run_scorers(variants | baselines, y)
@@ -2068,6 +2164,7 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
             "frozen_config": asdict(config),
             "confirmation": args.confirmation,
             "confirmation_start": float(confirmation_start),
+            "holdout_after": args.holdout_after,
             "sampling": {
                 "max_candidates": args.max_candidates,
                 "max_feedback_per_class": args.max_feedback_per_class,

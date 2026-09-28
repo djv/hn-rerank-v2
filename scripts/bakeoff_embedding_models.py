@@ -9,7 +9,9 @@ contains the exact production candidate IDs and text hashes, so
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
+import importlib
 import json
 import sys
 import shutil
@@ -17,11 +19,11 @@ from unittest.mock import patch
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import numpy as np
 import onnxruntime as ort
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, list_repo_files
 from numpy.typing import NDArray
 from transformers import AutoTokenizer
 
@@ -53,7 +55,14 @@ from scripts.eval_ranker_variants import (  # noqa: E402
 )
 
 
-Pooling = Literal["mean", "cls"]
+# last: final non-padding token (decoder models such as Qwen3-Embedding).
+# sentence: the model's own "sentence_embedding" output (embeddinggemma).
+Pooling = Literal["mean", "cls", "last", "sentence"]
+POOLINGS: tuple[Pooling, ...] = ("mean", "cls", "last", "sentence")
+# "gpu" runs the ONNX graph through OpenVINO on the laptop's Intel iGPU
+# (f16; ~3x faster than CPU onnxruntime for 335M models at 512 tokens).
+Device = Literal["cpu", "gpu"]
+DEVICES: tuple[Device, ...] = ("cpu", "gpu")
 
 
 @dataclass(frozen=True)
@@ -114,12 +123,31 @@ def _session_options() -> ort.SessionOptions:
     return options
 
 
+EXTERNAL_DATA_MODEL_DIR = Path.home() / ".cache/hn-rerank-embedding-models"
+
+
 def _model_paths(spec: BakeoffModel) -> tuple[str, Path]:
     if spec.local_dir is not None:
         model_dir = Path(spec.local_dir)
         return str(model_dir), model_dir / spec.onnx_filename
     if spec.repo_id is None:
         raise ValueError(f"Model {spec.name} has no local directory or repository")
+    # Models over 2 GB (and some exports) keep weights in a sibling file.
+    # OpenVINO rejects that file when it is a Hugging Face cache symlink into
+    # blobs/, so such models are downloaded as plain files instead.
+    # Some exports split the weights further (model.onnx_data_1, ...).
+    data_files = [
+        name
+        for name in list_repo_files(spec.repo_id)
+        if name.startswith(spec.onnx_filename + "_data")
+    ]
+    if data_files:
+        local_dir = EXTERNAL_DATA_MODEL_DIR / spec.repo_id.replace("/", "--")
+        for filename in (spec.onnx_filename, *data_files):
+            hf_hub_download(
+                repo_id=spec.repo_id, filename=filename, local_dir=local_dir
+            )
+        return spec.repo_id, local_dir / spec.onnx_filename
     model_path = Path(
         hf_hub_download(repo_id=spec.repo_id, filename=spec.onnx_filename)
     )
@@ -140,19 +168,19 @@ def _encode(
     max_tokens: int,
     batch_size: int,
     reject_truncation: bool = False,
+    device: Device = "cpu",
 ) -> tuple[NDArray[np.float32], float]:
     tokenizer: Any = AutoTokenizer.from_pretrained(tokenizer_dir)
-    session = ort.InferenceSession(
-        str(model_path),
-        sess_options=_session_options(),
-        providers=["CPUExecutionProvider"],
-    )
-    input_names = {meta.name for meta in session.get_inputs()}
+    run, input_names = _runner(model_path, device)
+    # Encode shortest first so each batch pads little; rows are put back in
+    # input order at the end.
+    order = sorted(range(len(texts)), key=lambda index: len(texts[index]))
+    ordered = [texts[index] for index in order]
     chunks: list[NDArray[np.float32]] = []
     started = time.perf_counter()
-    for start in range(0, len(texts), batch_size):
+    for start in range(0, len(ordered), batch_size):
         if reject_truncation:
-            lengths = tokenizer(texts[start : start + batch_size], truncation=False)[
+            lengths = tokenizer(ordered[start : start + batch_size], truncation=False)[
                 "input_ids"
             ]
             if any(len(ids) > max_tokens for ids in lengths):
@@ -160,28 +188,138 @@ def _encode(
                     "Full-body chunk exceeds token budget; reduce chunk size instead of truncating"
                 )
         inputs = tokenizer(
-            texts[start : start + batch_size],
+            ordered[start : start + batch_size],
             padding=True,
+            # Few distinct shapes, so the GPU compiles few kernel variants.
+            pad_to_multiple_of=64 if device == "gpu" else None,
             truncation=True,
             max_length=max_tokens,
             return_tensors="np",
         )
-        outputs = session.run(
-            None, {name: inputs[name] for name in input_names if name in inputs}
-        )[0]
-        token_vectors = np.asarray(outputs, dtype=np.float32)
-        if pooling == "cls":
-            pooled = token_vectors[:, 0, :]
-        else:
-            mask = np.expand_dims(inputs["attention_mask"], axis=-1).astype(np.float32)
-            pooled = (token_vectors * mask).sum(axis=1) / np.clip(
-                mask.sum(axis=1), a_min=1e-9, a_max=None
-            )
+        outputs = run(_model_inputs(inputs, input_names))
+        pooled = _pool(outputs, inputs["attention_mask"], pooling)
         chunks.append(_normalize(pooled).astype(np.float32))
         completed = min(start + batch_size, len(texts))
         if completed == len(texts) or completed % max(batch_size, 100) == 0:
             print(f"{completed}/{len(texts)} encoded", flush=True)
-    return np.concatenate(chunks, axis=0), time.perf_counter() - started
+    encoded = np.concatenate(chunks, axis=0)
+    vectors = np.empty_like(encoded)
+    vectors[order] = encoded
+    return vectors, time.perf_counter() - started
+
+
+def _model_inputs(encoded: Any, input_names: set[str]) -> dict[str, NDArray[Any]]:
+    """Tokenizer output restricted to the graph's inputs, adding position_ids."""
+    feed = {name: encoded[name] for name in input_names if name in encoded}
+    mask = encoded["attention_mask"]
+    if "position_ids" in input_names:
+        # Correct for left or right padding.
+        feed["position_ids"] = np.clip(np.cumsum(mask, axis=1) - 1, 0, None).astype(
+            np.int64
+        )
+    if "token_type_ids" in input_names and "token_type_ids" not in feed:
+        feed["token_type_ids"] = np.zeros_like(encoded["input_ids"])
+    return feed
+
+
+def _pool(
+    outputs: dict[str, NDArray[Any]], attention_mask: NDArray[Any], pooling: Pooling
+) -> NDArray[np.float32]:
+    if pooling == "sentence":
+        return _normalize(np.asarray(outputs["sentence_embedding"], dtype=np.float32))
+    token_vectors = np.asarray(next(iter(outputs.values())), dtype=np.float32)
+    if pooling == "cls":
+        pooled = token_vectors[:, 0, :]
+    elif pooling == "last":
+        # Last position whose mask is 1, whichever side the tokenizer pads.
+        width = attention_mask.shape[1]
+        last = width - 1 - np.argmax(attention_mask[:, ::-1], axis=1)
+        pooled = token_vectors[np.arange(len(token_vectors)), last]
+    else:
+        mask = np.expand_dims(attention_mask, axis=-1).astype(np.float32)
+        pooled = (token_vectors * mask).sum(axis=1) / np.clip(
+            mask.sum(axis=1), a_min=1e-9, a_max=None
+        )
+    return _normalize(pooled)
+
+
+# Cached so repeated encodes (e.g. a warm-up pass) reuse the compiled GPU
+# kernels for each input shape.
+@functools.lru_cache(maxsize=2)
+def _runner(
+    model_path: Path, device: Device
+) -> tuple[Callable[[dict[str, NDArray[Any]]], dict[str, NDArray[Any]]], set[str]]:
+    """Return a function mapping model inputs to named outputs, and the input names."""
+    if device == "cpu":
+        session = ort.InferenceSession(
+            str(model_path),
+            sess_options=_session_options(),
+            providers=["CPUExecutionProvider"],
+        )
+        output_names = [meta.name for meta in session.get_outputs()]
+        cache = [
+            (
+                meta.name,
+                int(meta.shape[1]),
+                int(meta.shape[3]),
+                np.float16 if "float16" in meta.type else np.float32,
+            )
+            for meta in session.get_inputs()
+            if meta.name.startswith("past_key_values")
+        ]
+
+        def run_cpu(feed: dict[str, NDArray[Any]]) -> dict[str, NDArray[Any]]:
+            values = session.run(None, feed | _empty_cache(cache, feed))
+            return {
+                name: np.asarray(value)
+                for name, value in zip(output_names, values, strict=True)
+                if not name.startswith("present")
+            }
+
+        return run_cpu, {meta.name for meta in session.get_inputs()}
+    # Imported lazily: openvino is only in the embedding-experiment group, and
+    # via importlib so type checking does not need it installed. One LATENCY
+    # request: THROUGHPUT streams segfault on the UHD 620 (OpenVINO 2026.4),
+    # and static 512-token shapes or larger batches were no faster.
+    openvino: Any = importlib.import_module("openvino")
+    core = openvino.Core()
+    core.set_property({"CACHE_DIR": str(Path.home() / ".cache/openvino-hn-bench")})
+    model = core.read_model(str(model_path))
+    compiled = core.compile_model(model, "GPU", {"INFERENCE_PRECISION_HINT": "f16"})
+    request = compiled.create_infer_request()
+    cache = [
+        (
+            port.get_any_name(),
+            port.get_partial_shape()[1].get_length(),
+            port.get_partial_shape()[3].get_length(),
+            port.get_element_type().to_dtype(),
+        )
+        for port in model.inputs
+        if port.get_any_name().startswith("past_key_values")
+    ]
+    outputs = [
+        port
+        for port in compiled.outputs
+        if not port.get_any_name().startswith("present")
+    ]
+
+    def run(feed: dict[str, NDArray[Any]]) -> dict[str, NDArray[Any]]:
+        results = request.infer(feed | _empty_cache(cache, feed))
+        return {port.get_any_name(): np.array(results[port]) for port in outputs}
+
+    return run, {port.get_any_name() for port in model.inputs}
+
+
+def _empty_cache(
+    cache: list[tuple[str, int, int, Any]], feed: dict[str, NDArray[Any]]
+) -> dict[str, NDArray[Any]]:
+    """Zero-length past_key_values for decoder exports built for generation
+    (e.g. onnx-community Qwen3-Embedding), so one pass embeds the whole text."""
+    batch = len(feed["input_ids"])
+    return {
+        name: np.zeros((batch, heads, 0, dim), dtype=dtype)
+        for name, heads, dim, dtype in cache
+    }
 
 
 def _candidate_stories(
@@ -303,6 +441,12 @@ def main() -> None:
         default=256,
     )
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--device",
+        choices=DEVICES,
+        default="cpu",
+        help="gpu: OpenVINO on the Intel iGPU (needs the embedding-experiment group)",
+    )
     parser.add_argument("--layout", choices=("leading", "full-body"), default="leading")
     parser.add_argument(
         "--max-candidates",
@@ -431,6 +575,7 @@ def main() -> None:
             max_tokens=args.max_tokens,
             batch_size=args.batch_size,
             reject_truncation=args.layout == "full-body",
+            device=args.device,
         )
         if args.layout == "full-body":
             embeddings = np.stack(
