@@ -1,5 +1,13 @@
 # Worklog: hn-rewrite
 
+## 2026-09-28 Deployed `fc6461f` (time window)
+
+VPS fast-forwarded from `c1c676b`, restarted 17:39 UTC. With the user's
+profile (read-only): `/` 200 with the window picker; `/api/feed?window=`
+12h/1d/1w/1m/archive all 200 with 16 Recommended, 16 Popular, 15 Explore
+(36-47 stories); `window=2y` 400; the terminal client parses each feed and
+loads a TLDR. Journal: no errors. The window key is `d` (was `a`).
+
 ## 2026-09-28 Time window replaces the Date sort and Recent/Archive
 
 User request: "Date should be a separate drop down and it should affect the
