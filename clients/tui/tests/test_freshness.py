@@ -26,8 +26,13 @@ async def test_passive_poll_only_fetches_changed_versions(version: int) -> None:
         fake.feed.stories[1] = replace(fake.feed.stories[1], comments=77)
         await app.poll_feed_version()
         await settle(pilot)
-        fetches = [r for r in fake.requests if r.url.path.endswith("/api/feed")]
-        assert len(fetches) == (0 if version == 2 else 1)
+        # The selected window reloads; a new version also re-prefetches its
+        # neighbours (1w's are 1d and 1m) in the background.
+        fetches = fake.feed_requests()
+        assert fetches.count("1w") == (0 if version == 2 else 1)
+        assert sorted(w for w in fetches if w != "1w") == (
+            [] if version == 2 else ["1d", "1m"]
+        )
         selected = app.selected()
         assert selected is not None
         assert selected.id == 2

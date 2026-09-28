@@ -11,7 +11,7 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 import httpx
 from platformdirs import user_config_path
 
-from .models import Feed, terminal_safe
+from .models import DEFAULT_WINDOW, WINDOWS, Feed, terminal_safe
 
 
 @dataclass(frozen=True)
@@ -22,7 +22,7 @@ class Impression:
     dashboard_version: int
     position: int
     sort_mode: str
-    age_filter: str
+    window: str
     occurred_at: float
     event_type: str = "impression"
     source_filter: str = "mixed"
@@ -266,14 +266,22 @@ class API:
         await self.request("GET", "")
         return await self.validate()
 
-    async def feed(self) -> Feed:
-        response = await self.request("GET", "api/feed")
+    async def feed(self, window: str = DEFAULT_WINDOW) -> Feed:
+        """One time window of the deck."""
+        if window not in WINDOWS:
+            raise ValueError("Unknown time window")
+        response = await self.request("GET", f"api/feed?window={window}")
         try:
-            return Feed.parse(response.json())
-        except (TypeError, ValueError) as exc:
-            raise APIError(
-                "Invalid feed response. Check the server API version."
-            ) from exc
+            feed = Feed.parse(response.json())
+        except ValueError as exc:
+            # A schema mismatch says so (models: "update hn-rerank").
+            detail = str(exc) if "update" in str(exc) else "Invalid feed response."
+            raise APIError(detail) from exc
+        except TypeError as exc:
+            raise APIError("Invalid feed response.") from exc
+        if feed.window != window:
+            raise APIError("Invalid feed response: wrong time window.")
+        return feed
 
     async def cached_summary(self, story_id: int) -> Summary | None:
         """Read existing summaries only; old servers fail without generation."""

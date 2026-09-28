@@ -1,11 +1,31 @@
-"""Version-one wire contract; deliberately free of terminal/backend dependencies."""
+"""Feed wire contract; deliberately free of terminal/backend dependencies."""
 
 from __future__ import annotations
 
 import math
 import re
 from dataclasses import asdict, dataclass, field, fields
-from typing import Any
+from typing import Any, Literal, get_args
+
+# Feed schema number. 2 (2026-09-28): one time window per response, with
+# "recommended" / "popular" / "explore" orders; no memberships, no Date.
+FEED_API_VERSION = 2
+
+# Time windows, nested by age ("1d" includes the "12h" stories; "1m" is the
+# last 30 days), plus "archive": older than 30 days.
+Window = Literal["12h", "1d", "1w", "1m", "archive"]
+WINDOWS: tuple[Window, ...] = get_args(Window)
+DEFAULT_WINDOW: Window = "1w"
+WINDOW_LABELS: dict[Window, str] = {
+    "12h": "12 hours",
+    "1d": "1 day",
+    "1w": "1 week",
+    "1m": "1 month",
+    "archive": "Archive",
+}
+# The three views of a window, the keys of Feed.orders.
+View = Literal["recommended", "popular", "explore"]
+VIEWS: tuple[View, ...] = get_args(View)
 
 
 # C0 controls except tab/newline, DEL, and C1 controls. Server text (titles
@@ -48,9 +68,6 @@ class FeedStory:
     comments: int | None
     time: int
     rank_score: float
-    memberships: list[str]
-    popular: bool
-    explore: bool
     badges: list[str] = field(default_factory=list)
     badge_details: list[FeedBadge] = field(default_factory=list)
     best_match_title: str = ""
@@ -59,15 +76,18 @@ class FeedStory:
     enriched: bool = False
 
 
-# Unknown keys are ignored so a server can add optional fields within
-# api_version 1 without breaking already-installed clients.
+# Unknown keys are ignored so a server can add optional fields within an
+# api_version without breaking already-installed clients.
 _STORY_FIELDS = frozenset(f.name for f in fields(FeedStory))
 _BADGE_FIELDS = frozenset(f.name for f in fields(FeedBadge))
 
 
 @dataclass(frozen=True)
 class Feed:
+    """One time window of a deck: its stories and, per view, their order."""
+
     api_version: int
+    window: Window
     stories: list[FeedStory]
     orders: dict[str, list[int]]
     feedback_counts: dict[str, int]
@@ -83,7 +103,7 @@ class Feed:
         if not isinstance(data, dict):
             # Parse failures are ValueError by contract (tests/test_boundaries.py).
             raise ValueError("Invalid feed response")  # noqa: TRY004
-        if data.get("api_version") != 1:
+        if data.get("api_version") != FEED_API_VERSION:
             raise ValueError("Unsupported feed API; update hn-rerank.")
         try:
             stories = []
@@ -105,7 +125,8 @@ class Feed:
                 ]
                 stories.append(FeedStory(**story_data))
             result = cls(
-                1,
+                FEED_API_VERSION,
+                data["window"],
                 stories,
                 data["orders"],
                 data["feedback_counts"],
@@ -119,6 +140,7 @@ class Feed:
                 or type(result.target_version) is not int
                 or result.target_version < 0
                 or type(result.ready) is not bool
+                or result.window not in WINDOWS
             ):
                 raise ValueError("Invalid ranking state")
             for story in stories:
@@ -136,13 +158,9 @@ class Feed:
                     or type(story.points) is not int
                     or type(story.time) is not int
                     or (story.comments is not None and type(story.comments) is not int)
-                    or type(story.popular) is not bool
-                    or type(story.explore) is not bool
                     or isinstance(story.rank_score, bool)
                     or not isinstance(story.rank_score, (int, float))
                     or not math.isfinite(story.rank_score)
-                    or not isinstance(story.memberships, list)
-                    or any(not isinstance(key, str) for key in story.memberships)
                     or not isinstance(story.badges, list)
                     or any(not isinstance(badge, str) for badge in story.badges)
                     or not isinstance(story.badge_details, list)
@@ -171,8 +189,8 @@ class Feed:
                 ):
                     raise ValueError("Invalid story")
             ids = {story.id for story in stories}
-            if any(
-                not isinstance(key, str)
+            if not isinstance(result.orders, dict) or any(
+                key not in VIEWS
                 or not isinstance(order, list)
                 or any(type(sid) is not int or sid not in ids for sid in order)
                 for key, order in result.orders.items()

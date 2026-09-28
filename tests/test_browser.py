@@ -2,7 +2,7 @@
 
 The Node tests in test_client_js.py run single client functions against
 stubs; this drives the whole page: summaries, votes, undo, a failed vote,
-the ranked-deck poll, sort changes and keys. Opt-in (`-m browser`); needs
+the ranked-deck poll, sort and time-window changes and keys. Opt-in (`-m browser`); needs
 the `browser` dependency group and a system Chrome/Chromium:
 
     uv run --group browser pytest tests/test_browser.py -m browser
@@ -25,7 +25,7 @@ from werkzeug.serving import make_server
 import pipeline
 import server
 from database import Database, Story
-from pipeline import Config, RankedStory
+from pipeline import Config, RankedStory, WindowDeck, assemble_window_deck
 from server import Handler, TldrResult, create_app
 
 pytestmark = pytest.mark.browser
@@ -47,6 +47,10 @@ def _chrome() -> str | None:
     return None
 
 
+def _deck(ranked: list[RankedStory]) -> WindowDeck:
+    return assemble_window_deck(ranked, config=Config(), now=time.time())
+
+
 def _ranked(db: Database) -> list[RankedStory]:
     now = int(time.time())
     ranked = []
@@ -65,17 +69,7 @@ def _ranked(db: Database) -> list[RankedStory]:
             article_body=f"Body of story {i}. " * 20,
         )
         db.upsert_story(story)
-        age = "archive" if archive else "recent"
-        kind = "hn" if source == "hn" else "non-hn"
-        ranked.append(
-            RankedStory(
-                story,
-                score=1.0 - i / 50,
-                best_match_title="",
-                combo_keys=f"{age}_{kind} {age}_mixed",
-                is_recent=not archive,
-            )
-        )
+        ranked.append(RankedStory(story, score=1.0 - i / 50, best_match_title=""))
     return ranked
 
 
@@ -88,13 +82,15 @@ def dashboard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
 
     def fake_rank(
         db: Database, config: Config, embedder: object, user_id: int, **_: object
-    ) -> list[RankedStory]:
+    ) -> WindowDeck:
         voted = pipeline._voted_story_ids(db, user_id)
-        return [
-            replace(r, score=1.0 - r.score)  # the personal ranking inverts
-            for r in reversed(ranked)
-            if r.story.id not in voted
-        ]
+        return _deck(
+            [
+                replace(r, score=1.0 - r.score)  # the personal ranking inverts
+                for r in reversed(ranked)
+                if r.story.id not in voted
+            ]
+        )
 
     async def fake_llm(title: str, **_: str) -> TldrResult:
         return TldrResult(kind="ok", tldr=f"### Article\n- summary of {title}")
@@ -114,15 +110,14 @@ def dashboard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
         db_path=db.db_path,
         dashboard_warm_idle_seconds=0.2,
         article_fetch_max_per_run=0,
-        tldr_prefetch_per_combo=0,
+        tldr_prefetch_per_view=0,
         tldr_prefetch_stale_per_run=0,
-        tldr_prefetch_date_top_n=0,
     )
     Runtime.db = db
     # The fake ranking never embeds.
     Runtime.embedder = None  # ty: ignore[invalid-assignment]
     Runtime.regen_event = threading.Event()
-    Runtime._cold_stories = ranked
+    Runtime._cold_deck = _deck(ranked)
     Runtime._decks = {}
     Runtime._dashboard_versions = {}
     Runtime._scheduler = None
@@ -197,6 +192,7 @@ def _state(page: Any) -> dict[str, Any]:
             rated: [...rated],
             ready: feed.ready,
             sort: currentSort,
+            window: currentWindow,
             counts: [...document.querySelectorAll('[data-vote-count]')]
                 .map(e => e.textContent).join('/'),
             toast: toastEl.hidden ? '' : toastEl.textContent,
@@ -237,9 +233,9 @@ def test_dashboard_page_end_to_end(page: Any) -> None:
     assert not set(ranked["rated"]) & set(ranked["head"])
 
     # A sort change shows its head.
-    page.evaluate("() => setFilter('sort', 'date')")
-    by_date = _state(page)
-    assert by_date["active"] == by_date["head"][0]
+    page.evaluate("() => setFilter('sort', 'popular')")
+    popular = _state(page)
+    assert popular["active"] == popular["head"][0]
     page.evaluate("() => setFilter('sort', 'recommended')")
 
     # A vote the server never confirms is reverted, with a toast.
@@ -271,5 +267,24 @@ def test_dashboard_page_end_to_end(page: Any) -> None:
     assert page.is_visible("#first-time-tip")
     page.keyboard.press("Escape")
     assert page.is_hidden("#first-time-tip")
+
+    # Time windows: a moves to the next one (1m holds 1w's stories too), the
+    # picker jumps; each window shows only its own stories.
+    page.keyboard.press("d")
+    page.wait_for_function("() => currentWindow === '1m' && !feed.loading")
+    month = _state(page)
+    assert page.input_value("#window-select") == "1m"
+    assert month["head"] and all(sid <= BASE_ID + 28 for sid in month["head"])
+    page.select_option("#window-select", "archive")
+    page.wait_for_function(
+        "() => currentWindow === 'archive' && !feed.loading && visible.length > 0"
+    )
+    archive = _state(page)
+    assert all(sid > BASE_ID + 28 for sid in archive["head"])
+    assert archive["active"] == archive["head"][0]
+    page.select_option("#window-select", "12h")
+    page.wait_for_function("() => currentWindow === '12h' && !feed.loading")
+    assert _state(page)["head"] == []  # nothing that young: an empty view
+    assert "Nothing left in this view" in page.inner_text("#queue-loading")
 
     assert page.problems == []

@@ -83,10 +83,11 @@ async def test_editorial_filters_and_resize(width: int) -> None:
         assert app.query_one("#sort-tabs", Tabs).display == (width >= 100)
         assert app.query_one("#sort", Select).display == (width < 100)
         sort_control = app.query_one("#sort-tabs" if width >= 100 else "#sort")
-        age_control = app.query_one("#age-tabs" if width >= 100 else "#age")
-        assert sort_control.region.y == age_control.region.y
-        assert sort_control.region.right <= age_control.region.x
-        assert age_control.region.right <= width
+        window_control = app.query_one("#window", Select)
+        assert window_control.display
+        assert sort_control.region.y == window_control.region.y
+        assert sort_control.region.right <= window_control.region.x
+        assert window_control.region.right <= width
         assert "example.org" in str(app.query_one("#story-heading", Static).content)
         assert listing.highlighted == 0
         assert listing.display and summary.display
@@ -148,11 +149,11 @@ async def test_filter_change_starts_at_first_story(width: int) -> None:
         selected = app.selected()
         assert selected is not None and selected.id == 2
         if width < 100:
-            app.query_one("#sort", Select).value = "date"
+            app.query_one("#sort", Select).value = "explore"
         else:
-            await pilot.click("#sort-date")
+            await pilot.click("#sort-explore")
         await pilot.pause()
-        assert [story.id for story in app.stories] == [2, 1]
+        assert [story.id for story in app.stories] == [2]
         assert listing.highlighted == 0
         selected = app.selected()
         assert selected is not None and selected.id == 2
@@ -258,9 +259,9 @@ async def test_empty_and_error_recovery() -> None:
         await settle(pilot)
         assert app.query_one("#status").has_class("error")
         assert "check before voting" in str(app.query_one("#status", Static).content)
-        app.query_one("#age", Select).value = "archive"
+        app.query_one("#window", Select).value = "12h"
         app.query_one("#sort", Select).value = "popular"
-        await pilot.pause()
+        await settle(pilot)
         assert not app.stories
         assert "No stories" in app.query_one(Markdown)._markdown
         assert not str(app.query_one("#story-heading", Static).content)
@@ -278,9 +279,6 @@ def test_story_age_guard_and_buckets() -> None:
         None,
         0,
         1.0,
-        ["recent_mixed"],
-        False,
-        False,
     )
     # Placeholder timestamps must not render as "20000d ago".
     assert story_metadata(story) == "example.org · 10 pts · 0 comments"
@@ -302,9 +300,6 @@ def test_headline_shows_badge_emoji() -> None:
         None,
         0,
         1.0,
-        ["recent_mixed"],
-        False,
-        False,
         badges=["\U0001f525", "\U0001f3c6"],
     )
     assert headline(story).plain.startswith("🔥 🏆 Story")
@@ -323,9 +318,6 @@ def test_headline_hides_unknown_reddit_score_and_shows_subreddit() -> None:
         None,
         0,
         1.0,
-        ["recent_mixed"],
-        False,
-        False,
     )
     rendered = headline(story).plain
     assert "r/localllama" in rendered
@@ -347,9 +339,6 @@ def test_headline_separators_share_columns_across_stories() -> None:
         7,
         0,
         1.0,
-        ["recent_mixed"],
-        False,
-        False,
     )
     reddit = replace(
         base,
@@ -386,9 +375,6 @@ async def test_every_sort_shows_at_most_view_limit(tmp_path: Path) -> None:
             0,
             0,
             float(100 - i),
-            ["recent_mixed"],
-            True,
-            True,
         )
 
     ids = list(range(1, 21))
@@ -396,7 +382,7 @@ async def test_every_sort_shows_at_most_view_limit(tmp_path: Path) -> None:
     fake.feed = replace(
         fake.feed,
         stories=[story(i) for i in ids],
-        orders={f"{sort}:recent": ids for sort in Reader.SORT_CYCLE},
+        orders={sort: ids for sort in Reader.SORT_CYCLE},
     )
     app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
     async with app.run_test(size=(120, 35)) as pilot:
@@ -424,9 +410,6 @@ def test_headline_truncates_long_domains_to_fit() -> None:
         7,
         0,
         1.0,
-        ["recent_mixed"],
-        False,
-        False,
     )
     assert (
         headline(long_domain, True, (10, 1, 1)).plain.splitlines()[1]
@@ -460,9 +443,9 @@ async def test_empty_notice_heading() -> None:
     app = Reader(api=fake.api())
     async with app.run_test(size=(100, 35)) as pilot:
         await settle(pilot)
-        app.query_one("#age", Select).value = "archive"
+        app.query_one("#window", Select).value = "12h"
         app.query_one("#sort", Select).value = "popular"
-        await pilot.pause()
+        await settle(pilot)
         assert not app.stories
         assert app.query_one(Markdown)._markdown == EMPTY_NOTICE
         assert not app.query_one("#reading-pane").has_class("has-story")
@@ -604,8 +587,8 @@ async def test_footer_counts_follow_filters() -> None:
         # Metadata adds restrained color: blue domain, sage points, dim separators.
         assert {"bold #EEE8DD", "#D2CCC1", "#8AB4F8", "#A8C7A0"} <= styles
         app.query_one("#sort", Select).value = "popular"
-        app.query_one("#age", Select).value = "archive"
-        await pilot.pause()
+        app.query_one("#window", Select).value = "12h"
+        await settle(pilot)
         assert str(app.query_one("#status", Static).content) == "0 shown · +0 ~0 −0"
         app.status("Could not reach server.", error=True)
         assert str(app.query_one("#status", Static).content).startswith("✗ ")

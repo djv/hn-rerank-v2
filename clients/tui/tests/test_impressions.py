@@ -28,7 +28,7 @@ async def test_selected_impression_is_delayed_not_prefetched_and_best_effort() -
         assert event["story_id"] == 2
         assert event["position"] == 1
         assert event["sort_mode"] == "recommended"
-        assert event["age_filter"] == "recent"
+        assert event["window"] == "1w" and "age_filter" not in event
         assert event["event_type"] == "impression"
         assert event["dashboard_version"] == fake.feed.version
         # A normal rebuild/poll must not inflate impressions for this selection.

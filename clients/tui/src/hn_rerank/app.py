@@ -51,7 +51,7 @@ from .api import (
     save_profile,
 )
 from .api import Summary as SummaryResult
-from .models import Feed, FeedStory
+from .models import DEFAULT_WINDOW, WINDOW_LABELS, WINDOWS, Feed, FeedStory
 
 DEFAULT_SERVER = "https://ubuntu-8gb-nbg1-1.tailca4726.ts.net:8443/hn/"
 
@@ -348,8 +348,8 @@ def headline(
 
 
 EMPTY_NOTICE = (
-    "# Nothing here\n\nNo stories in this filter. "
-    "Change filters or press **r** to refresh."
+    "# Nothing here\n\nNo stories in this view. "
+    "Try another sort or time window, or press **r** to refresh."
 )
 
 
@@ -493,8 +493,8 @@ class Reader(App[None]):
     Select:focus-within .arrow { color: $hn-bg; }
     .narrow #filters { height: 1; }
     Tabs { width: auto; }
-    #sort-tabs { width: 58; }
-    #age-tabs { width: 20; }
+    #sort-tabs { width: 45; }
+    #window { display: block; }
     Tab { color: $hn-muted; padding: 0 1; }
     Tab.-active { color: $hn-accent; text-style: bold; }
     Tabs:focus Tab.-active { text-style: bold underline; }
@@ -559,6 +559,7 @@ class Reader(App[None]):
         ("s", "cycle_sort", "Sort"),
         ("h", "cycle_sort(-1)", "Prev sort"),
         ("l", "cycle_sort(1)", "Next sort"),
+        ("d", "cycle_window", "Window"),
         ("enter", "read", "Read"),
         ("escape", "headlines", "Back"),
         ("?", "help", "Help"),
@@ -583,23 +584,30 @@ class Reader(App[None]):
         self.server = self.explicit_server or DEFAULT_SERVER
         self.config_path = config_path or profile_path()
         self.api = api
+        # The selected window's feed; None while a window switch fetches it.
         self.feed: Feed | None = None
+        # Feeds of the current version by window: the selected one and
+        # neighbours prefetched in the background.
+        self.feeds: dict[str, Feed] = {}
+        # Neighbour prefetches tried, by (window, version): at most once each.
+        self.window_attempts: set[tuple[str, int]] = set()
+        self.window_prefetching = False
         self.stories: list[FeedStory] = []
         # Headline row state as last rendered: column widths and marked story.
         self._row_widths: tuple[int, int, int] | None = None
         self._marked_id: int | None = None
         self.rated: set[int] = set()
         self.unavailable: set[int] = set()
-        # Explore's client-side shuffle per "explore:<age>" view, kept stable
-        # across rebuilds (votes, polls, feed refreshes) and dropped when the
-        # user leaves that view, so each visit gets a fresh order.
+        # Explore's client-side shuffle per "<window>:explore" view, kept
+        # stable across rebuilds (votes, polls, feed refreshes) and dropped
+        # when the user leaves that view, so each visit gets a fresh order.
         self.explore_orders: dict[str, list[int]] = {}
         self.view_key: str | None = None
         self.restored: dict[int, FeedStory] = {}
         self.history: list[FeedStory] = []
-        # Views ("<sort>:<age>") each voted story was listed in, so undo puts
-        # it back only where the server had it.
-        self.vote_views: dict[int, list[str]] = {}
+        # The window and views (sorts) each voted story was listed in, so
+        # undo puts it back only where the server had it.
+        self.vote_views: dict[int, tuple[str, list[str]]] = {}
         self.vote_lock = asyncio.Lock()
         self.selection_serial = 0
         self.interaction_session = str(uuid4())
@@ -628,30 +636,22 @@ class Reader(App[None]):
     def compose(self) -> ComposeResult:
         with Horizontal(id="filters"):
             yield Tabs(
-                *(
-                    Tab(s.title(), id=f"sort-{s}")
-                    for s in ("recommended", "popular", "explore", "date")
-                ),
+                *(Tab(s.title(), id=f"sort-{s}") for s in self.SORT_CYCLE),
                 id="sort-tabs",
-            )
-            yield Tabs(
-                Tab("Recent", id="age-recent"),
-                Tab("Archive", id="age-archive"),
-                id="age-tabs",
             )
             yield Static("Sort", classes="filter-caption")
             yield Dropdown(
-                [(s.title(), s) for s in ("recommended", "popular", "explore", "date")],
+                [(s.title(), s) for s in self.SORT_CYCLE],
                 value="recommended",
                 allow_blank=False,
                 id="sort",
             )
-            yield Static("Age", classes="filter-caption")
+            yield Static("Window", classes="filter-caption")
             yield Dropdown(
-                [("Recent", "recent"), ("Archive", "archive")],
-                value="recent",
+                [(WINDOW_LABELS[w], w) for w in WINDOWS],
+                value=DEFAULT_WINDOW,
                 allow_blank=False,
-                id="age",
+                id="window",
             )
         with Horizontal(id="panes"):
             yield OptionList(id="headlines")
@@ -720,6 +720,7 @@ class Reader(App[None]):
                 "open_url",
                 "copy_url",
                 "cycle_sort",
+                "cycle_window",
             }
         )
 
@@ -815,6 +816,8 @@ class Reader(App[None]):
         self.api = API(profile.server, profile.token)
         self.interaction_session = str(uuid4())
         self.feed = None
+        self.feeds.clear()
+        self.window_attempts.clear()
         self.rated.clear()
         self.unavailable.clear()
         self.restored.clear()
@@ -855,15 +858,19 @@ class Reader(App[None]):
             widths[0] = max(8, widths[0] - (total - available))
         return (widths[0], widths[1], widths[2])
 
-    def view_order(self, key: str) -> list[int]:
-        """Story order for a "<sort>:<age>" view as the user sees it."""
-        order = self.feed.orders.get(key, []) if self.feed else []
-        if not key.startswith("explore:"):
+    def selected_window(self) -> str:
+        return str(self.query_one("#window", Select).value)
+
+    def view_order(self, sort: str) -> list[int]:
+        """Story order for a sort of the current window as the user sees it."""
+        order = self.feed.orders.get(sort, []) if self.feed else []
+        if sort != "explore" or self.feed is None:
             return order
         # Explore is a discovery deck: shuffle client-side, since the server
-        # order only reshuffles once per dashboard version and would pin the
-        # deck for hours. Stories already placed keep their position; new
-        # ones are shuffled in after them. Copies: feed.orders is shared.
+        # sends it in model-score order and would pin the deck for hours.
+        # Stories already placed keep their position; new ones are shuffled
+        # in after them. Copies: feed.orders is shared.
+        key = f"{self.feed.window}:{sort}"
         members = set(order)
         kept = [sid for sid in self.explore_orders.get(key, []) if sid in members]
         placed = set(kept)
@@ -880,11 +887,10 @@ class Reader(App[None]):
         old = self.selected()
         if select_id is None and old:
             select_id = old.id
-        sort = self.query_one("#sort", Select).value
-        age = self.query_one("#age", Select).value
+        sort = str(self.query_one("#sort", Select).value)
         lookup = {story.id: story for story in self.feed.stories} if self.feed else {}
-        self.view_key = f"{sort}:{age}"
-        order = self.view_order(self.view_key)
+        self.view_key = f"{self.selected_window()}:{sort}"
+        order = self.view_order(sort)
         self.stories = [
             lookup[sid]
             for sid in order
@@ -922,9 +928,11 @@ class Reader(App[None]):
             self.selection_serial += 1
             self.workers.cancel_group(self, "summary")
             self.query_one("#summary", Markdown).update(
-                feed_failure_notice(self.last_error)
-                if self.feed is None and self.last_error
-                else EMPTY_NOTICE
+                EMPTY_NOTICE
+                if self.feed is not None
+                else feed_failure_notice(self.last_error)
+                if self.last_error
+                else "Loading…"
             )
         self.query_one("#reading-pane").set_class(bool(self.stories), "has-story")
         self.layout_panes()
@@ -935,12 +943,14 @@ class Reader(App[None]):
         # Replaying them into Tabs would start an endless two-way echo.
         if event.value != event.select.value:
             return
-        tabs_id = f"#{event.select.id}-tabs"
-        if event.select.id in {"sort", "age"} and self.query(tabs_id):
-            self.query_one(tabs_id, Tabs).active = f"{event.select.id}-{event.value}"
+        if event.select.id == "sort" and self.query("#sort-tabs"):
+            self.query_one("#sort-tabs", Tabs).active = f"sort-{event.value}"
         if self.view_key is not None:
             self.explore_orders.pop(self.view_key, None)  # next visit reshuffles
-        self.rebuild(select_id=-1)
+        if event.select.id == "window":
+            self.show_window(str(event.value))
+        else:
+            self.rebuild(select_id=-1)
 
     def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
         if not event.tab.id or event.tab.id != event.tabs.active:
@@ -993,7 +1003,7 @@ class Reader(App[None]):
                         dashboard_version=self.feed.version,
                         position=self.stories.index(story),
                         sort_mode=str(self.query_one("#sort", Select).value),
-                        age_filter=str(self.query_one("#age", Select).value),
+                        window=self.feed.window,
                         occurred_at=time.time(),
                     ),
                     self.selection_serial,
@@ -1024,7 +1034,7 @@ class Reader(App[None]):
             or self.feed is None
             or self.feed.version != event.dashboard_version
             or str(self.query_one("#sort", Select).value) != event.sort_mode
-            or str(self.query_one("#age", Select).value) != event.age_filter
+            or self.feed.window != event.window
         ):
             return
         try:
@@ -1133,12 +1143,11 @@ class Reader(App[None]):
         ids.extend(
             item.id for item in reversed(self.stories[max(0, index - 3) : index])
         )
-        age = self.query_one("#age", Select).value
         sort = self.query_one("#sort", Select).value
         for other in self.SORT_CYCLE:
             if other == sort:
                 continue
-            order = self.view_order(f"{other}:{age}")
+            order = self.view_order(other)
             eligible = [
                 sid
                 for sid in order
@@ -1307,12 +1316,14 @@ class Reader(App[None]):
 
     @work(group="refresh", exclusive=True)
     async def refresh_feed(self, *, announce: bool = True) -> None:
+        """Fetch the selected window's feed and show it."""
         if not self.api or self.setting_up:
             return
+        api, window = self.api, self.selected_window()
         if announce:
             self.status("Refreshing…")
         try:
-            feed = await self.api.feed()
+            feed = await api.feed(window)
         except InvalidProfile as exc:
             self.setup(str(exc))
             return
@@ -1326,7 +1337,15 @@ class Reader(App[None]):
                 )
                 self.show_failure(str(exc))
             return
-        self.feed = feed
+        if api is not self.api:
+            return
+        if window != self.selected_window():
+            # The user moved to a cached window meanwhile: keep this one
+            # only as a cache entry of the version on screen.
+            if self.feed is not None and feed.version == self.feed.version:
+                self.feeds[window] = feed
+            return
+        self.set_feed(feed)
         self.last_error = None
         if feed.ready:
             self.restored.clear()
@@ -1340,13 +1359,117 @@ class Reader(App[None]):
         self.rebuild()
         if announce and not feed.ready:
             self.status("Showing available stories while ranking updates…")
+        self.schedule_window_prefetch()
 
-    SORT_CYCLE: ClassVar[tuple[str, ...]] = (
-        "recommended",
-        "popular",
-        "explore",
-        "date",
-    )
+    def set_feed(self, feed: Feed) -> None:
+        """Make *feed* the selected window's; a new version drops the cached
+        windows of other versions."""
+        self.feeds = {
+            window: cached
+            for window, cached in self.feeds.items()
+            if cached.version == feed.version
+        }
+        self.feeds[feed.window] = feed
+        self.feed = feed
+
+    def show_window(self, window: str) -> None:
+        """Switch to *window*: its cached feed of the version on screen, or
+        fetch it."""
+        current = self.feed
+        cached = self.feeds.get(window)
+        if current is not None and current.window == window:
+            self.rebuild(select_id=-1)
+        elif (
+            current is not None
+            and cached is not None
+            and cached.version == current.version
+        ):
+            # Same deck, so the ranking state (a pending vote's target) and
+            # counts on screen apply to it too.
+            self.set_feed(
+                replace(
+                    cached,
+                    target_version=current.target_version,
+                    ready=current.ready,
+                    feedback_counts=current.feedback_counts,
+                )
+            )
+            self.rebuild(select_id=-1)
+            self.schedule_window_prefetch()
+        else:
+            self.feed = None
+            self.rebuild(select_id=-1)
+            self.refresh_feed(announce=False)
+
+    def next_window_prefetch(self) -> str | None:
+        """A neighbour of the selected window not cached or tried for the
+        version on screen."""
+        feed = self.feed
+        if feed is None or feed.window not in WINDOWS:
+            return None
+        index = WINDOWS.index(feed.window)
+        for other in (index + 1, index - 1):
+            if not 0 <= other < len(WINDOWS):
+                continue
+            window = WINDOWS[other]
+            cached = self.feeds.get(window)
+            if (cached is not None and cached.version == feed.version) or (
+                window,
+                feed.version,
+            ) in self.window_attempts:
+                continue
+            return window
+        return None
+
+    def schedule_window_prefetch(self) -> None:
+        """Fetch the neighbouring windows' feeds in the background, one at a
+        time. Only feeds: never summaries."""
+        if (
+            self.window_prefetching
+            or self.api is None
+            or self.setting_up
+            or self.closing
+            or self.next_window_prefetch() is None
+        ):
+            return
+        self.window_prefetching = True
+        self.prefetch_windows()
+
+    @work(group="window-prefetch")
+    async def prefetch_windows(self) -> None:
+        try:
+            while (window := self.next_window_prefetch()) is not None:
+                api, feed = self.api, self.feed
+                if api is None or feed is None:
+                    return
+                self.window_attempts.add((window, feed.version))
+                try:
+                    fetched = await api.feed(window)
+                except APIError:
+                    continue
+                # A late answer is only a cache entry of the version on
+                # screen: it never replaces the selected window's feed.
+                if (
+                    api is self.api
+                    and self.feed is not None
+                    and fetched.version == self.feed.version
+                    and window != self.feed.window
+                    and window not in self.feeds
+                ):
+                    self.feeds[window] = fetched
+        finally:
+            self.window_prefetching = False
+
+    SORT_CYCLE: ClassVar[tuple[str, ...]] = ("recommended", "popular", "explore")
+
+    def action_cycle_window(self) -> None:
+        """Move the window selector to the next window, wrapping."""
+        select = self.query_one("#window", Select)
+        try:
+            index = WINDOWS.index(str(select.value))
+        except ValueError:
+            index = -1
+        select.value = WINDOWS[(index + 1) % len(WINDOWS)]
 
     def action_cycle_sort(self, delta: int = 1) -> None:
         """Move the sort selector by *delta* steps, wrapping at either end."""
@@ -1416,11 +1539,11 @@ class Reader(App[None]):
         self.rated.add(story.id)
         self.restored.pop(story.id, None)
         self.history.append(story)
-        self.vote_views[story.id] = [
-            key
-            for key, order in (self.feed.orders.items() if self.feed else ())
-            if story.id in order
-        ]
+        if self.feed is not None:
+            self.vote_views[story.id] = (
+                self.feed.window,
+                [key for key, order in self.feed.orders.items() if story.id in order],
+            )
         self.rebuild(next_id)
 
     def apply_undo(self, story: FeedStory) -> None:
@@ -1461,25 +1584,32 @@ class Reader(App[None]):
             return
         if self.feed is not None and target > self.feed.version:
             # The poller loads the reranked deck once the server has it.
-            self.feed = replace(self.feed, target_version=target, ready=False)
+            self.set_feed(replace(self.feed, target_version=target, ready=False))
         self.status("Vote cleared." if action == "clear" else "Vote saved.")
 
     def restore_story(self, story: FeedStory) -> None:
-        """Put an undone story back in the views it was voted from, where the
-        server orders it: Date by time, the rest by rank score."""
-        if not self.feed:
+        """Put an undone story back in the views of the window it was voted
+        from, where the server orders it: Popular by HN gravity, the rest by
+        rank score."""
+        window, keys = self.vote_views.get(story.id, ("", []))
+        feed = self.feeds.get(window)
+        if feed is None:
             return
-        if all(item.id != story.id for item in self.feed.stories):
-            self.feed.stories.append(story)
-        by_id = {item.id: item for item in self.feed.stories}
-        for key in self.vote_views.get(story.id, []):
-            order = self.feed.orders.setdefault(key, [])
+        if all(item.id != story.id for item in feed.stories):
+            feed.stories.append(story)
+        by_id = {item.id: item for item in feed.stories}
+        now = time.time()
+        for key in keys:
+            order = feed.orders.setdefault(key, [])
             if story.id in order:
                 continue
-            by_time = key.startswith("date:")
+            by_gravity = key == "popular"
 
-            def rank(item: FeedStory, by_time: bool = by_time) -> float:
-                return item.time if by_time else item.rank_score
+            def rank(item: FeedStory, by_gravity: bool = by_gravity) -> float:
+                if by_gravity:
+                    age_h = max(now - item.time, 0) / 3600
+                    return item.points / (age_h + 2) ** 1.8
+                return item.rank_score
 
             index = next(
                 (i for i, sid in enumerate(order) if rank(by_id[sid]) < rank(story)),
@@ -1605,9 +1735,11 @@ class Reader(App[None]):
             "- `1` / `2` / `3`: up / neutral / down (advances to next story)\n"
             "- `u`: undo latest vote\n\n"
             "## Sort\n\n"
-            "- `s`: cycle sort (Recommended → Popular → Explore → Date)\n"
+            "- `s`: cycle sort (Recommended → Popular → Explore)\n"
             "- `h` / `l`: previous / next sort\n"
-            "- Selectors: sort and Recent / Archive\n\n"
+            "- `a`: next time window (12 hours → 1 day → 1 week → 1 month"
+            " → Archive)\n"
+            "- Selectors: sort and time window\n\n"
             "## Other\n\n"
             "- `o` / `c`: open article / comments\n"
             "- `y`: copy comments link (article link if none)\n"

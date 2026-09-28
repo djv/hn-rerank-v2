@@ -1,7 +1,16 @@
 <aside class="swipe-side" aria-label="Queue and keyboard controls">
-  {% for group in tab_groups %}
-  {% include "components/tab_group.html" %}
-  {% endfor %}
+  <div class="tab-bar tab-bar--sort" data-filter="sort" aria-label="Sort order">
+    {% for value, label in sort_tabs %}
+    <button type="button" class="tab-btn{% if loop.first %} active{% endif %}" data-sort="{{ value }}">{{ label }}</button>
+    {% endfor %}
+  </div>
+  <label class="window-picker">Time window
+    <select id="window-select">
+      {% for value, label in windows %}
+      <option value="{{ value }}"{% if value == default_window %} selected{% endif %}>{{ label }}</option>
+      {% endfor %}
+    </select>
+  </label>
   {% if user_token %}
   <button type="button" class="share-link" id="copyProfileLink">Copy profile link</button>
   {% endif %}
@@ -17,7 +26,7 @@
     <span class="key-row"><span class="key-hint">y</span> copy link</span>
     <span class="key-row"><span class="key-hint">r</span> refresh</span>
     <span class="key-row"><span class="key-hint">h</span>/<span class="key-hint">l</span> previous / next sort</span>
-    <span class="key-row"><span class="key-hint">a</span> recent / archive</span>
+    <span class="key-row"><span class="key-hint">a</span> next time window</span>
     <span class="key-row" tabindex="0" data-key-action="toggle-panel"><span class="key-hint">f</span> fullscreen</span>
     <span class="key-row"><span class="key-hint">?</span> help</span>
   </div>

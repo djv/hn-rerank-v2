@@ -27,6 +27,7 @@ from sklearn.svm import LinearSVC, SVC
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
+from clients.tui.src.hn_rerank.models import DEFAULT_WINDOW
 from database import Database, Story
 from dedup import normalize_url
 from pipeline import (
@@ -34,6 +35,7 @@ from pipeline import (
     Embedder,
     ModelConfig,
     RankedStory,
+    WindowDeck,
     _knn_similarity,
     load_production_candidate_stories,
     mmr_filter,
@@ -286,14 +288,11 @@ def _recommended(
     config: Config,
     probs: np.ndarray | None,
     source_db: Database | None,
-) -> list[RankedStory]:
-    from pipeline import finalize_ranked_deck
+) -> WindowDeck:
+    """The production deck (every window's views) for this fold's scores."""
+    from pipeline import canonicalize_deck, finalize_ranked_deck
     from pipeline.ranking import assemble_ranked_deck
-    from pipeline.hn_dupes import (
-        _load_feedback_context,
-        _matches_feedback,
-        canonicalize_hn_dupes,
-    )
+    from pipeline.hn_dupes import _load_feedback_context, _matches_feedback
 
     ranked = [
         RankedStory(
@@ -315,10 +314,9 @@ def _recommended(
             from pipeline import build_cold_deck
 
             deck = build_cold_deck(db, config, candidates=fold.candidates)
-            return canonicalize_hn_dupes(
+            return canonicalize_deck(
                 deck,
                 db,
-                selected_limit=config.count,
                 user_id=1,
                 feedback_actions=tuple(config.model.dedup_exclude_actions),
             )
@@ -1225,22 +1223,20 @@ def _metrics(
         # Deck assembly runs production dedup, which is 384-d only; replay
         # embeddings from other models are compared on the raw ranking.
         return output
-    deck = _recommended(scores, fold, config, probs, source_db)
-    from pipeline.config import is_hn_source
+    from pipeline.ranking import in_window, serve_window
 
-    cutoff = int(time.time()) - 30 * 86400
-    for age in ("recent", "archive"):
-        for source in ("mixed", "hn", "non-hn"):
-            key = f"{age}_{source}"
-            eligible = {
-                s.id
-                for s in fold.candidates + [r.story for r in deck]
-                if (s.time >= cutoff) == (age == "recent")
-                and (source == "mixed" or is_hn_source(s.source) == (source == "hn"))
-            }
-            output[f"recommended_{key}"] = compute(
-                [r.story.id for r in deck if key in r.combo_keys.split()], eligible
-            )
+    # The Recommended view of the default window as a user is served it.
+    deck = _recommended(scores, fold, config, probs, source_db)
+    now = time.time()
+    served = serve_window(deck.window(DEFAULT_WINDOW), DEFAULT_WINDOW, now)
+    eligible = {
+        s.id
+        for s in fold.candidates + [r.story for r in served.recommended]
+        if in_window(s.time, DEFAULT_WINDOW, now)
+    }
+    output[f"recommended_{DEFAULT_WINDOW}"] = compute(
+        [r.story.id for r in served.recommended], eligible
+    )
     return output
 
 

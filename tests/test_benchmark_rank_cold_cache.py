@@ -11,7 +11,13 @@ import numpy as np
 import pytest
 
 from database import Database, Story
-from pipeline import RankTrace, story_embedding_text
+from pipeline import (
+    RankTrace,
+    RankedStory,
+    WindowDeck,
+    WindowViews,
+    story_embedding_text,
+)
 from pipeline.config import DEFAULT_EMBEDDING_MODEL_VERSION
 from scripts import benchmark_rank_cold_cache as bench
 
@@ -66,7 +72,7 @@ def test_benchmark_rank_cold_cache_outputs_json(
         embedder_arg: object,
         user_id: int,
         trace: RankTrace | None = None,
-    ) -> list[object]:
+    ) -> WindowDeck:
         _ = (config_arg, embedder_arg)
         assert user_id == user.id
         assert db_arg.read_only
@@ -75,7 +81,9 @@ def test_benchmark_rank_cold_cache_outputs_json(
         if trace is not None:
             trace.set_label("model_cache", "miss")
             trace.add_timing("candidate_sql", 1.0)
-        return [object()]
+        return WindowDeck(
+            {"1w": WindowViews(recommended=(RankedStory(candidate, 1.0, ""),))}
+        )
 
     monkeypatch.setattr(bench, "Embedder", lambda *args, **kwargs: object())
     monkeypatch.setattr(bench, "fast_rerank_for_user", fake_fast_rerank_for_user)

@@ -24,7 +24,11 @@ class PrefetchServer(FakeServer):
 
     def __init__(self) -> None:
         super().__init__()
-        self.feed = replace(sample_feed(), orders={"recommended:recent": [1, 2, 3]})
+        self.feed = replace(
+            sample_feed(),
+            stories=sample_feed().stories + sample_feed(window="archive").stories,
+            orders={"recommended": [1, 2, 3]},
+        )
         self.summary_ids: list[int] = []
         self.stale: set[int] = set()
         self.rate_limited: set[int] = set()
@@ -192,10 +196,9 @@ class NavigationServer(PrefetchServer):
             self.feed,
             stories=[replace(base, id=i, title=f"Story {i}") for i in range(1, 31)],
             orders={
-                "recommended:recent": list(range(1, 26)),
-                "popular:recent": [26, 27],
-                "explore:recent": [28, 29],
-                "date:recent": [30],
+                "recommended": list(range(1, 26)),
+                "popular": [26, 27],
+                "explore": [28, 29, 30],
             },
         )
         self.generated: list[int] = []

@@ -9,9 +9,9 @@ from werkzeug.test import TestResponse
 
 from bs4 import BeautifulSoup
 
-from clients.tui.src.hn_rerank.models import Feed
+from clients.tui.src.hn_rerank.models import FEED_API_VERSION, WINDOWS, Feed
 from database import Database, Story, User
-from pipeline import Config, RankedStory
+from pipeline import Config, RankedStory, WindowDeck, WindowViews
 from server import DeckState, Handler, create_app
 
 
@@ -30,91 +30,93 @@ def page_feed(client: Any) -> Any:
     return json.loads(script.get_text())
 
 
-def same_deck(a: Any, b: Any) -> bool:
-    """Equal feeds, up to Explore's per-render shuffle."""
+class _Runtime(Handler):
+    _decks = {}
+    _dashboard_versions = {}
+    _cold_deck = WindowDeck()
+    _pool_generation = 1
 
-    def norm(feed: Any) -> Any:
-        orders = {
-            key: sorted(order) if key.startswith("explore:") else order
-            for key, order in feed["orders"].items()
-        }
-        return {**feed, "orders": orders}
+    @classmethod
+    def _trigger_warm(
+        cls,
+        user: User,
+        version: int,
+        delay_s: float = 0.0,
+        *,
+        expedite: bool = True,
+    ) -> None:
+        pass
 
-    return norm(a) == norm(b)
 
-
-def test_feed_parity_authentication_stale_cache_and_eviction(tmp_path: Path) -> None:
-    db = Database(str(tmp_path / "feed.db"))
-
-    class Runtime(Handler):
+def _runtime(db: Database) -> type[Handler]:
+    class Runtime(_Runtime):
         _decks = {}
         _dashboard_versions = {}
-        _cold_stories = []
-        _pool_generation = 1
-
-        @classmethod
-        def _trigger_warm(
-            cls,
-            user: User,
-            version: int,
-            delay_s: float = 0.0,
-            *,
-            expedite: bool = True,
-        ) -> None:
-            pass
 
     Runtime.db = db
     Runtime.config = Config(db_path=db.db_path)
     Runtime.regen_event = threading.Event()
+    return Runtime
+
+
+def _story(i: int, age_s: float) -> Story:
+    return Story(
+        i,
+        f"Story {i}",
+        f"https://example.org/{i}",
+        i * 10,
+        int(time.time() - age_s),
+        "text",
+        comment_count=i,
+        discussion_url=f"https://news.ycombinator.com/item?id={i}",
+    )
+
+
+def test_feed_parity_authentication_stale_cache_and_eviction(tmp_path: Path) -> None:
+    db = Database(str(tmp_path / "feed.db"))
+    Runtime = _runtime(db)
     user = db.create_user("feed-user")
     other = db.create_user("other-user")
     ranked = [
         RankedStory(
-            Story(
-                i,
-                f"Story {i}",
-                f"https://example.org/{i}",
-                i * 10,
-                i * 100,
-                "text",
-                comment_count=i,
-                discussion_url=f"https://news.ycombinator.com/item?id={i}",
-            ),
+            _story(i, 3600 * i),
             score=float(4 - i),
             best_match_title="",
-            combo_keys="recent_hn recent_mixed"
-            if i < 3
-            else "archive_hn archive_mixed",
             is_hot=i == 1,
             is_novel=i == 2,
         )
         for i in (1, 2, 3)
     ]
-    Runtime._cold_stories = ranked
+    week = WindowViews(
+        recommended=tuple(ranked[1:]),
+        popular=(ranked[0],),
+        explore=(ranked[1],),
+    )
+    deck = WindowDeck({"1w": week})
+    Runtime._cold_deck = deck
     client = create_app(Runtime).test_client()
     assert client.get("/api/feed").status_code == 401
     client.set_cookie("hn_token", user.token)
     response = client.get("/api/feed")
     feed = payload(response)
     parsed = Feed.parse(feed)
-    assert parsed.api_version == 1
+    assert parsed.api_version == FEED_API_VERSION and parsed.window == "1w"
+    # One card per story, badges from every view of the window it is in.
+    assert [story.id for story in parsed.stories] == [2, 3, 1]
     assert [story.badges for story in parsed.stories] == [
-        ["\U0001f525"],
         ["\u2728"],
         [],
+        ["\U0001f525"],
     ]
-    assert parsed.stories[0].badge_details[0].kind == "hot"
-    assert parsed.stories[0].badge_details[0].icon == "🔥"
-    assert parsed.stories[0].badge_details[0].tooltip
+    assert parsed.orders == {"recommended": [2, 3], "popular": [1], "explore": [2]}
+    hot = parsed.stories[2].badge_details[0]
+    assert (hot.kind, hot.icon) == ("hot", "🔥") and hot.tooltip
     assert parsed.stories[0].domain == "example.org"
-    assert [story.id for story in parsed.stories] == [
-        story["id"] for story in feed["stories"]
-    ]
     assert response.headers["Cache-Control"] == "no-store"
     # No votes: the shared cold deck is this user's current deck.
     assert feed["version"] == 1 and feed["ready"] is True
-    assert same_deck(page_feed(client), feed)
-    Runtime._decks[user.id] = DeckState(ranked, time.time(), 1)
+    assert page_feed(client) == feed
+    Runtime._decks[user.id] = DeckState(deck, time.time(), 1)
     for item in ranked:
         db.upsert_story(item.story)
     vote = client.post("/api/feedback", json={"story_id": 1, "action": "up"})
@@ -124,15 +126,16 @@ def test_feed_parity_authentication_stale_cache_and_eviction(tmp_path: Path) -> 
     assert payload(again)["target_version"] == 2
     stale = payload(client.get("/api/feed"))
     assert not Feed.parse(stale).ready
-    # The stale deck is served without the story just voted on.
-    assert stale["stories"] == feed["stories"][1:]
+    # The stale deck is served without the story just voted on, in every view.
+    assert [s["id"] for s in stale["stories"]] == [2, 3]
+    assert stale["orders"]["popular"] == []
     assert stale["version"] == 1 and stale["target_version"] == 2 and not stale["ready"]
-    assert same_deck(page_feed(client), stale)
+    assert page_feed(client) == stale
     client.set_cookie("hn_token", other.token)
     assert payload(client.get("/api/feed"))["feedback_counts"]["up"] == 0
     client.set_cookie("hn_token", user.token)
-    Runtime._decks[user.id] = DeckState(ranked, time.time(), 2)
-    assert payload(client.get("/api/feed"))["orders"]["recommended:recent"] == [2]
+    Runtime._decks[user.id] = DeckState(deck, time.time(), 2)
+    assert payload(client.get("/api/feed"))["orders"]["recommended"] == [2, 3]
     assert payload(client.get("/api/feed"))["feedback_counts"]["up"] == 1
     assert (
         payload(client.post("/api/feedback", json={"story_id": 1, "action": "clear"}))[
@@ -141,14 +144,54 @@ def test_feed_parity_authentication_stale_cache_and_eviction(tmp_path: Path) -> 
         == 3
     )
     Runtime._MAX_CACHED_DECKS = 1
-    Runtime._decks[other.id] = DeckState(ranked, time.time() + 1, 1)
+    Runtime._decks[other.id] = DeckState(deck, time.time() + 1, 1)
     with Runtime._dashboard_versions_guard:
         Runtime._evict_old_decks_locked()
     assert user.id not in Runtime._decks
     # No votes left: the shared cold deck is current, even when it is empty.
-    Runtime._cold_stories = []
+    Runtime._cold_deck = WindowDeck()
     empty = payload(client.get("/api/feed"))
     assert not Feed.parse(empty).stories
     assert empty["ready"] and empty["stories"] == []
     assert empty["version"] == empty["target_version"] == 3
+    db.close()
+
+
+def test_feed_serves_the_requested_window_only(tmp_path: Path) -> None:
+    db = Database(str(tmp_path / "windows.db"))
+    Runtime = _runtime(db)
+    user = db.create_user("window-user")
+    ages = {"12h": 3600, "1d": 20 * 3600, "1w": 3 * 86400, "1m": 20 * 86400}
+    ages["archive"] = 90 * 86400
+    stories = {
+        w: RankedStory(_story(i, ages[w]), 1.0, "") for i, w in enumerate(ages, 1)
+    }
+    # Nested windows: every window up to 1m holds the stories younger than it.
+    Runtime._cold_deck = WindowDeck(
+        {
+            w: WindowViews(
+                recommended=tuple(stories[v] for v in WINDOWS[: WINDOWS.index(w) + 1])
+                if w != "archive"
+                else (stories["archive"],)
+            )
+            for w in WINDOWS
+        }
+    )
+    client = create_app(Runtime).test_client()
+    client.set_cookie("hn_token", user.token)
+    default = payload(client.get("/api/feed"))
+    assert default == payload(client.get("/api/feed?window=1w"))
+    assert default["window"] == "1w"
+    for i, window in enumerate(WINDOWS, 1):
+        feed = Feed.parse(payload(client.get(f"/api/feed?window={window}")))
+        assert feed.window == window
+        expected = [i] if window == "archive" else list(range(1, i + 1))
+        assert feed.orders["recommended"] == expected
+        assert [s.id for s in feed.stories] == expected
+    for bad in ("2d", "", "1W", "recent"):
+        response = client.get(f"/api/feed?window={bad}")
+        assert response.status_code == 400, bad
+        assert "window" in payload(response)["error"]
+    # The page embeds the default window.
+    assert page_feed(client)["window"] == "1w"
     db.close()

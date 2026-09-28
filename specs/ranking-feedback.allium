@@ -8,9 +8,8 @@
 --   - The cold-start -> personalized transition as accumulated votes grow
 --   - Discovery categorization (Hot / Popular / Talked-about / Unsure /
 --     Novel / Similar) shown to the user
---   - Diversity: near-duplicate suppression within a served deck
---     (config-gated; disabled by default in production)
---   - Segmentation of the dashboard by recency and source
+--   - Duplicate suppression across a served deck (before views are capped)
+--   - Segmentation of the dashboard by time window and view
 -- Excludes:
 --   - Story ingestion/sourcing from HN, Reddit, LessWrong, RSS (separate
 --     ingestion spec; this spec owns only the minimal Story shape needed
@@ -27,12 +26,16 @@ entity Story {
     url: String?
 }
 
-enum SegmentAge { recent | archive }
-enum SegmentSource { hn | non_hn }
+-- Windows are nested by age (1d includes the 12h stories; 1m is the last
+-- 30 days); archive is everything older than 30 days.
+enum TimeWindow { h12 | d1 | w1 | m1 | archive }
+-- recommended: model score; popular: HN stories by HN gravity; explore:
+-- Unsure / Novel / Similar picks.
+enum DashboardView { recommended | popular | explore }
 
 value DashboardSegment {
-    age: SegmentAge
-    source: SegmentSource
+    window: TimeWindow
+    view: DashboardView
 }
 
 enum DiscoveryBadgeKind { hot | popular | talked_about | unsure | novel | similar }
@@ -74,9 +77,10 @@ entity RankedCard {
 config {
     min_up_votes_for_personalization: Integer = 20
     min_down_votes_for_personalization: Integer = 20
-    enable_diversity_filter: Boolean = false
-    diversity_similarity_threshold: Decimal = 0.75
-    recent_window: Duration = 30.days
+    archive_after: Duration = 30.days
+    default_window: TimeWindow = w1
+    view_size: Integer = 16
+    explore_per_badge: Integer = 5
 }
 
 rule CastVote {
@@ -112,22 +116,19 @@ rule RankingInvalidated {
     ensures: DashboardRefreshQueued(user)
 }
 
-rule DiversityFilter {
-    when: card: RankedCard.created
-    requires: config.enable_diversity_filter
+rule DuplicatesSuppressedBeforeCap {
+    when: DashboardRefreshQueued(user)
 
-    for other in RankedCards where
-        other.for_user = card.for_user
-        and other.segment = card.segment
-        and other != card:
-        ensures:
-            if similarity(card.story, other.story) > config.diversity_similarity_threshold:
-                not exists other
+    ensures: DashboardDeckPublished(user)
 
     @guidance
-        -- Applied only within the primary (non-badge) selection of a
-        -- segment, in ranked order, so the higher-scored of two
-        -- near-duplicate stories survives.
+        -- Each view is picked at twice view_size; near-duplicate and
+        -- already-voted stories are removed (and HN reposts replaced by
+        -- their canonical story, which leaves any view whose window it
+        -- falls outside) across the whole deck at once, the higher-scored
+        -- of two duplicates surviving; only then is each view capped, so
+        -- the spares refill it. All five windows are published together
+        -- under one dashboard version.
 }
 
 surface Dashboard {
@@ -146,6 +147,19 @@ surface Dashboard {
         CastVote(viewer, card.story, reaction)
         ClearVote(viewer, card.story)
             when exists Vote{user: viewer, story: card.story}
+
+    @guarantee WindowMembershipAtServeTime
+        -- A card is served in a window only if its story is inside that
+        -- window at the time of the request, not only when the deck was
+        -- built: a short window is served short, never widened.
+
+    @guarantee ViewOrders
+        -- The server's view order is authoritative: recommended and
+        -- explore by rank score, popular by HN gravity. Each popular card
+        -- carries exactly one of hot / popular / talked_about, from its
+        -- own numbers. Explore holds at most explore_per_badge each of
+        -- unsure / novel / similar and none of the window's recommended
+        -- stories; it is empty until the viewer has voted.
 
     @guarantee PersonalizationRampsIn
         -- Ranking blends three tiers: cold-start (gravity), a feedback

@@ -36,7 +36,13 @@ from flask.typing import ResponseReturnValue
 import httpx
 
 from background_cadence import BackgroundCadence
-from clients.tui.src.hn_rerank.models import Feed
+from clients.tui.src.hn_rerank.models import (
+    DEFAULT_WINDOW,
+    VIEWS,
+    WINDOWS,
+    Feed,
+    Window,
+)
 from database import (
     Database,
     InteractionEvent,
@@ -45,7 +51,8 @@ from database import (
     Story,
     User,
 )
-from pipeline import Config, DEFAULT_ENV_PATH, Embedder, RankedStory, is_hn_source
+from pipeline import Config, DEFAULT_ENV_PATH, Embedder, WindowDeck, is_hn_source
+from pipeline.ranking import serve_window
 from llm_limiter import limiter as llm_limiter
 from reddit_limiter import limiter as reddit_limiter
 import http_fetch
@@ -1261,16 +1268,17 @@ _PREFETCH_STAGGER_S = 1.0
 
 
 async def _prefetch_tldrs_for_ranked(
-    ranked_stories: list[RankedStory],
+    deck: WindowDeck,
     db: Database,
-    per_combo: int,
+    per_view: int,
     stale_per_run: int = 0,
-    date_top_n: int = 8,
     stagger_s: float | None = None,
 ) -> int:
-    if (
-        per_combo <= 0 and stale_per_run <= 0 and date_top_n <= 0
-    ) or not ranked_stories:
+    """Summarize the first *per_view* stories of each view of the default
+    window, then up to *stale_per_run* deck stories whose cached summary no
+    longer matches their content."""
+    ranked_stories = deck.stories()
+    if (per_view <= 0 and stale_per_run <= 0) or not ranked_stories:
         return 0
 
     # Background work must not deepen a provider ban: fail-fast per call
@@ -1283,38 +1291,15 @@ async def _prefetch_tldrs_for_ranked(
         logging.info("tldr_prefetch skipped: provider cooldown %ss remaining", cooldown)
         return 0
 
-    combo_groups: dict[str, list[int]] = {}
-    if per_combo > 0:
-        for rs in ranked_stories:
-            for combo_key in rs.combo_keys.split():
-                if combo_key.endswith("_mixed"):
-                    continue
-                group = combo_groups.setdefault(combo_key, [])
-                if len(group) < per_combo:
-                    group.append(rs.story.id)
-                break
-
     seen: set[int] = set()
     story_ids: list[int] = []
-    for combo_key in ["recent_hn", "recent_non-hn", "archive_hn"]:
-        for sid in combo_groups.get(combo_key, []):
-            if sid not in seen:
-                seen.add(sid)
-                story_ids.append(sid)
-
-    # Date-tab lane: newest-first head of the deck, matching the client's
-    # date sort (story.time desc). Prefetch only covered combo tops before,
-    # so the Date tab's first cards always paid the full cold path.
-    date_added = 0
-    if date_top_n > 0:
-        by_time = sorted(ranked_stories, key=lambda rs: rs.story.time, reverse=True)
-        for rs in by_time:
-            if date_added >= date_top_n:
-                break
-            if rs.story.id not in seen:
-                seen.add(rs.story.id)
-                story_ids.append(rs.story.id)
-                date_added += 1
+    if per_view > 0:
+        views = serve_window(deck.window(DEFAULT_WINDOW), DEFAULT_WINDOW, time.time())
+        for name in VIEWS:
+            for rs in views.view(name)[:per_view]:
+                if rs.story.id not in seen:
+                    seen.add(rs.story.id)
+                    story_ids.append(rs.story.id)
 
     stale_added = 0
     if stale_per_run > 0:
@@ -1405,12 +1390,11 @@ async def _prefetch_tldrs_for_ranked(
 
     if generated:
         logging.info(
-            "tldr_prefetch generated=%s candidates=%s per_combo=%s stale_added=%s date_added=%s",
+            "tldr_prefetch generated=%s candidates=%s per_view=%s stale_added=%s",
             generated,
             len(story_ids),
-            per_combo,
+            per_view,
             stale_added,
-            date_added,
         )
     else:
         # Always log the zero outcome: a silent miss here once hid a real
@@ -1418,11 +1402,10 @@ async def _prefetch_tldrs_for_ranked(
         # prefetch fail-fasted, and the run returned 0 indistinguishable
         # from "everything already cached").
         logging.info(
-            "tldr_prefetch generated=0 candidates=%s per_combo=%s stale_added=%s date_added=%s cooldown_s=%.0f",
+            "tldr_prefetch generated=0 candidates=%s per_view=%s stale_added=%s cooldown_s=%.0f",
             len(story_ids),
-            per_combo,
+            per_view,
             stale_added,
-            date_added,
             llm_limiter.retry_after_seconds,
         )
     return generated
@@ -1435,13 +1418,14 @@ SKELETON_HTML = b"""<!DOCTYPE html>
 
 @dataclass(frozen=True)
 class DeckState:
-    """A user's personalized ranking and the dashboard version it was built for.
+    """A user's personalized deck (every window's views) and the dashboard
+    version it was built for.
 
     HTML and `/api/feed` JSON are rendered from this on every read, so the
     current version is always rendered in rather than patched into bytes.
     """
 
-    ranked: list[RankedStory]
+    deck: WindowDeck
     built_at: float
     version: int
 
@@ -1451,7 +1435,7 @@ class DeckView:
     """What a read serves: the page, `/api/feed` and `/api/ranking-ready`
     all come from `Handler._deck_for_user`, so they always agree."""
 
-    ranked: list[RankedStory]
+    deck: WindowDeck
     # The deck's version; 0 is the cold deck shown while the first warm runs.
     version: int
     # The user's current version, which a queued warm is building.
@@ -1520,7 +1504,7 @@ class Handler:
     _dashboard_versions_guard = threading.Lock()
     _scheduler: WarmScheduler[int, User] | None = None
     _scheduler_guard = threading.Lock()
-    _cold_stories: list[RankedStory] = []
+    _cold_deck: WindowDeck = WindowDeck()
     _article_fetch_in_flight: set[int] = set()
     _warm_bg_lock = threading.Lock()
     _tldr_prefetch_gate = BackgroundCadence()
@@ -1554,12 +1538,12 @@ class Handler:
 
     @classmethod
     def _render_deck(
-        cls, user: User, ranked: list[RankedStory], version: int, current: int
+        cls, user: User, deck: WindowDeck, version: int, current: int
     ) -> bytes:
         from pipeline import generate_dashboard_bytes
 
         return generate_dashboard_bytes(
-            ranked,
+            deck,
             cls.config,
             cls.db,
             user.id,
@@ -1581,31 +1565,29 @@ class Handler:
             # regen for nothing.
             with cls._dashboard_versions_guard:
                 cls._decks.pop(user.id, None)
-            return DeckView(cls._cold_stories, current, current)
-        deck = cls._decks.get(user.id)
-        if deck is None:
+            return DeckView(cls._cold_deck, current, current)
+        state = cls._decks.get(user.id)
+        if state is None:
             # Votes but no deck yet (first read since a restart, or evicted).
-            ranked, version = cls._cold_stories, 0
+            deck, version = cls._cold_deck, 0
         else:
-            ranked, version = deck.ranked, deck.version
+            deck, version = state.deck, state.version
         if version < current:
             # A stale deck's warm is passive: a queued vote-debounce warm
             # keeps its delay.
-            cls._trigger_warm(user, current, expedite=deck is None)
-        return DeckView(
-            [item for item in ranked if item.story.id not in voted], version, current
-        )
+            cls._trigger_warm(user, current, expedite=state is None)
+        return DeckView(deck.without(voted), version, current)
 
     @classmethod
     def _render_dashboard_for_user(cls, user: User) -> bytes:
         request_start = time.perf_counter()
         view = cls._deck_for_user(user)
-        if not view.ranked and view.version == 0:
+        if view.deck.is_empty() and view.version == 0:
             # An empty cold deck (first boot before any regen) while the warm
             # builds this user's deck; the skeleton page reloads itself.
             html, result = SKELETON_HTML, "skeleton"
         else:
-            html = cls._render_deck(user, view.ranked, view.version, view.current)
+            html = cls._render_deck(user, view.deck, view.version, view.current)
             result = "current" if view.ready else "stale"
         logging.info(
             "dashboard_render user_id=%s version=%s result=%s deck_version=%s"
@@ -1614,18 +1596,19 @@ class Handler:
             view.current,
             result,
             view.version,
-            len(view.ranked),
+            len(view.deck.stories()),
             (time.perf_counter() - request_start) * 1000,
         )
         return html
 
     @classmethod
-    def _feed_for_user(cls, user: User) -> Feed:
+    def _feed_for_user(cls, user: User, window: Window = DEFAULT_WINDOW) -> Feed:
         from pipeline.render import build_feed
 
         view = cls._deck_for_user(user)
         return build_feed(
-            view.ranked,
+            view.deck,
+            window,
             cls.config,
             cls.db.count_feedback_by_action(user.id),
             view.version,
@@ -1722,7 +1705,7 @@ class Handler:
         trace = RankTrace()
         render_start = time.perf_counter()
         with trace.stage("rank_total"):
-            final = fast_rerank_for_user(
+            deck = fast_rerank_for_user(
                 cls.db,
                 cls.config,
                 cls.embedder,
@@ -1732,7 +1715,7 @@ class Handler:
         rank_ms = (time.perf_counter() - render_start) * 1000
 
         with cls._dashboard_versions_guard:
-            cls._decks[user.id] = DeckState(final, time.time(), requested_version)
+            cls._decks[user.id] = DeckState(deck, time.time(), requested_version)
             cls._evict_old_decks_locked()
         # A vote or regen while ranking: warm again. (A regen only re-warms
         # cached decks, and this one wasn't cached yet.)
@@ -1743,7 +1726,7 @@ class Handler:
             user.id,
             requested_version,
             rank_ms,
-            len(final),
+            len(deck.stories()),
         )
         logging.info("rank_perf %s", trace.format_log_fields())
 
@@ -1778,7 +1761,7 @@ class Handler:
             candidates=int(trace.counts.get("candidates", 0)),
             feedback_total=int(trace.counts.get("feedback_total", 0)),
             model_cache=trace.labels.get("model_cache", ""),
-            stories=len(final),
+            stories=len(deck.stories()),
             fields=fields,
         )
         try:
@@ -1786,14 +1769,10 @@ class Handler:
         except Exception:
             logging.exception("rank_perf persist failed")
 
-        if _wants_background_tasks(cls.config, final):
+        if _wants_background_tasks(cls.config, deck):
             t = threading.Thread(
                 target=lambda: cls._warm_background_tasks(
-                    final,
-                    cls.db,
-                    cls.embedder,
-                    cls.config,
-                    cls.config.tldr_prefetch_per_combo,
+                    deck, cls.db, cls.embedder, cls.config
                 ),
                 daemon=True,
             )
@@ -1838,18 +1817,17 @@ class Handler:
         # so this rebuild (and every warm/cold-deck build until the next
         # regen) picks up the new rows instead of a stale snapshot.
         invalidate_candidate_pool()
-        cold_stories = build_cold_deck(cls.db, cls.config, embedder=cls.embedder)
-        cls._cold_stories = cold_stories
-        logging.info("cold_deck_rebuilt stories=%s", len(cold_stories))
+        cold_deck = build_cold_deck(cls.db, cls.config, embedder=cls.embedder)
+        cls._cold_deck = cold_deck
+        logging.info("cold_deck_rebuilt stories=%s", len(cold_deck.stories()))
 
     @classmethod
     def _warm_background_tasks(
         cls,
-        final: list[RankedStory],
+        deck: WindowDeck,
         db: Database,
         embedder: Embedder,
         config: Config,
-        per_combo: int,
     ) -> None:
         """Article body fetch (deduped by story ID) -> TLDR prefetch."""
         from pipeline import (
@@ -1857,10 +1835,13 @@ class Handler:
             fetch_and_cache_article_bodies,
         )
 
-        if config.article_fetch_max_per_run > 0 and final:
+        stories = deck.stories()
+        if config.article_fetch_max_per_run > 0 and stories:
             fetch_targets = select_article_fetch_candidates(
-                ranked=final,
-                dashboard_selected=final[: config.count],
+                ranked=stories,
+                dashboard_selected=serve_window(
+                    deck.window(DEFAULT_WINDOW), DEFAULT_WINDOW, time.time()
+                ).stories(),
                 db=db,
                 max_per_run=config.article_fetch_max_per_run,
                 max_age_days=config.article_fetch_max_age_days,
@@ -1889,11 +1870,11 @@ class Handler:
                         s.id for s in runnable
                     )
 
+        per_view = config.tldr_prefetch_per_view
         stale_per_run = config.tldr_prefetch_stale_per_run
-        date_top_n = config.tldr_prefetch_date_top_n
         if (
-            (per_combo > 0 or stale_per_run > 0 or date_top_n > 0)
-            and final
+            (per_view > 0 or stale_per_run > 0)
+            and stories
             and cls._tldr_prefetch_gate.claim(
                 time.monotonic(), config.tldr_prefetch_interval_seconds
             )
@@ -1901,11 +1882,10 @@ class Handler:
             try:
                 asyncio.run(
                     _prefetch_tldrs_for_ranked(
-                        final,
+                        deck,
                         db,
-                        per_combo,
+                        per_view,
                         stale_per_run,
-                        date_top_n,
                         stagger_s=config.tldr_prefetch_stagger_seconds,
                     )
                 )
@@ -1913,14 +1893,13 @@ class Handler:
                 cls._tldr_prefetch_gate.finish()
 
 
-def _wants_background_tasks(config: Config, ranked: list[RankedStory]) -> bool:
+def _wants_background_tasks(config: Config, deck: WindowDeck) -> bool:
     """Whether `Handler._warm_background_tasks` has anything to do for a deck:
     article bodies to fetch or summaries to prefetch."""
-    return bool(ranked) and (
+    return not deck.is_empty() and (
         config.article_fetch_max_per_run > 0
-        or config.tldr_prefetch_per_combo > 0
+        or config.tldr_prefetch_per_view > 0
         or config.tldr_prefetch_stale_per_run > 0
-        or config.tldr_prefetch_date_top_n > 0
     )
 
 
@@ -2252,7 +2231,7 @@ def _parse_interaction_event(raw_event: object, user_id: int) -> InteractionEven
         "dashboard_version",
         "position",
         "sort_mode",
-        "age_filter",
+        "window",
         "source_filter",
         "ranker_arm",
         "occurred_at",
@@ -2305,14 +2284,14 @@ def _parse_interaction_event(raw_event: object, user_id: int) -> InteractionEven
 
     dimensions = tuple(
         raw_event[name]
-        for name in ("sort_mode", "age_filter", "source_filter", "ranker_arm")
+        for name in ("sort_mode", "window", "source_filter", "ranker_arm")
     )
     if any(
         not isinstance(value, str) or not value or len(value) > 64
         for value in dimensions
     ):
         raise ValueError("event dimensions must be short strings")
-    sort_mode, age_filter, source_filter, ranker_arm = cast(
+    sort_mode, window, source_filter, ranker_arm = cast(
         tuple[str, str, str, str], dimensions
     )
 
@@ -2338,7 +2317,9 @@ def _parse_interaction_event(raw_event: object, user_id: int) -> InteractionEven
         dashboard_version=dashboard_version,
         position=position,
         sort_mode=sort_mode,
-        age_filter=age_filter,
+        # The time window goes in the ledger's age_filter column (no
+        # migration; it held the old Recent/Archive filter).
+        age_filter=window,
         source_filter=source_filter,
         ranker_arm=ranker_arm,
         occurred_at=float(occurred_at),
@@ -3198,7 +3179,15 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
         user = _flask_user(runtime)
         if not user:
             return _flask_json_response({"error": "No session"}, status=401)
-        response = _flask_json_response(runtime._feed_for_user(user).to_dict())
+        window = request.args.get("window", DEFAULT_WINDOW)
+        if window not in WINDOWS:
+            return _flask_json_response(
+                {"error": "window must be one of " + ", ".join(WINDOWS)},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+        response = _flask_json_response(
+            runtime._feed_for_user(user, cast(Window, window)).to_dict()
+        )
         response.headers["Cache-Control"] = "no-store"
         return response
 
@@ -3366,14 +3355,11 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
             _log_llm_spend_today(db)
             reddit_worker.submit()
 
-            if _wants_background_tasks(config, Handler._cold_stories):
+            cold_deck = Handler._cold_deck
+            if _wants_background_tasks(config, cold_deck):
                 t = threading.Thread(
                     target=lambda: Handler._warm_background_tasks(
-                        list(Handler._cold_stories),
-                        db,
-                        embedder,
-                        config,
-                        per_combo=config.tldr_prefetch_per_combo,
+                        cold_deck, db, embedder, config
                     ),
                     daemon=True,
                 )

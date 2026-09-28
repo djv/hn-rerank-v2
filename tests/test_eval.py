@@ -13,13 +13,15 @@ import numpy as np
 import pytest
 
 from database import Database, Story
-from pipeline import Config, build_cold_deck, finalize_ranked_deck, rerank_candidates
-from pipeline.hn_dupes import (
-    _load_feedback_context,
-    _matches_feedback,
-    canonicalize_hn_dupes,
+from pipeline import (
+    Config,
+    build_cold_deck,
+    canonicalize_deck,
+    finalize_ranked_deck,
+    rerank_candidates,
 )
-from pipeline.ranking import _loocv_knn_features, _score_and_rank
+from pipeline.hn_dupes import _load_feedback_context, _matches_feedback
+from pipeline.ranking import _loocv_knn_features, _score_and_rank, serve_window
 from scripts import eval_ranker_variants as evaluator
 
 NOW = 2_000_000_000.0
@@ -143,12 +145,11 @@ def test_production_scores_features_and_recommended_parity(precomputed: bool) ->
         actual_deck = evaluator._recommended(actual_scores, fold, config, probs, None)
         assert actual_deck == expected_deck
         metrics = evaluator._metrics(actual_scores, fold, config, probs)
-        for age in ("recent", "archive"):
-            for source in ("mixed", "hn", "non-hn"):
-                combo = f"{age}_{source}"
-                assert metrics[f"recommended_{combo}"]["returned_cards"] == sum(
-                    combo in r.combo_keys.split() for r in expected_deck
-                )
+        # Deck metrics: the default window's Recommended, as served.
+        served = serve_window(expected_deck.window("1w"), "1w", NOW)
+        assert served.recommended
+        assert metrics["recommended_1w"]["returned_cards"] == len(served.recommended)
+        assert not any(key.startswith("recommended_recent") for key in metrics)
         assert metrics["raw"]["brier_up"] is None  # softmax scores are not calibrated
 
 
@@ -165,17 +166,17 @@ def test_cold_deck_parity() -> None:
         patch("time.time", return_value=NOW),
         evaluator._fold_database(fold, config, None) as db,
     ):
-        expected = canonicalize_hn_dupes(
+        expected = canonicalize_deck(
             build_cold_deck(db, config, candidates=fold.candidates),
             db,
-            selected_limit=config.count,
             user_id=1,
         )
         actual = evaluator._recommended(
             np.arange(78, dtype=float), fold, config, None, None
         )
         assert actual == expected
-        assert not any(r.is_novel or r.is_uncertain or r.is_similar for r in actual)
+        assert not actual.is_empty()
+        assert all(not actual.window(w).explore for w in actual.windows)
 
 
 def test_failed_production_fit_aborts() -> None:
@@ -429,8 +430,8 @@ def test_canonical_replacement_uses_snapshot_target(tmp_path: Path) -> None:
     scores[[s.id for s in fold.candidates].index(source_id)] = 10
     with patch("time.time", return_value=NOW):
         deck = evaluator._recommended(scores, fold, Config(), None, source)
-    assert target.id in {r.story.id for r in deck}
-    assert source_id not in {r.story.id for r in deck}
+    assert target.id in {r.story.id for r in deck.stories()}
+    assert source_id not in {r.story.id for r in deck.stories()}
     source.close()
 
 

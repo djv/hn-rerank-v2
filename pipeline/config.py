@@ -145,17 +145,16 @@ class Config:
     non_hn_candidates_enabled: bool = True
     # Independent of source regeneration and per-user warm frequency.
     tldr_prefetch_interval_seconds: int = 14400
-    tldr_prefetch_per_combo: int = 2
-    # After the top-per-combo pass, regenerate up to this many additional
-    # cold-deck stories whose cached TLDR's cache_key no longer matches
+    # Summaries prefetched per view (Recommended/Popular/Explore) of the
+    # default window, 1w, after each warm and regen.
+    tldr_prefetch_per_view: int = 2
+    # After the per-view pass, regenerate up to this many additional
+    # deck stories whose cached TLDR's cache_key no longer matches
     # current story content (e.g. article_body was enriched after the TLDR
     # was generated). 0 disables. See server.py::_prefetch_tldrs_for_ranked.
     # Kept small: bulk prefetch trips Groq free-tier bans (875s retry-after
     # observed 2026-09-07), so the steady-state budget is ~10 stories/run.
     tldr_prefetch_stale_per_run: int = 1
-    # Date-tab coverage: newest-first head of the cold deck, matching the
-    # client's date sort (story.time desc). Deduped against combo picks.
-    tldr_prefetch_date_top_n: int = 3
     # Seconds between background TLDR prefetch LLM starts (capped at 15s
     # total offset). Gemini free allows ~10-15 RPM, so a Gemini deployment
     # wants ~5.0; Groq free tolerates 1.0.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
@@ -14,7 +15,7 @@ from flask.testing import FlaskClient
 
 import server
 from database import Database, Story, User
-from pipeline import Config, RankedStory
+from pipeline import Config, RankedStory, WindowDeck, WindowViews
 from server import Handler, TldrReply, TldrResult, create_app
 from single_flight import Flight, SingleFlight
 
@@ -168,13 +169,15 @@ def test_a_failed_leader_releases_the_story_and_followers_retry(
 
 
 def _prefetch(out: list[int]) -> threading.Thread:
-    ranked = [RankedStory(STORY, 1.0, "", combo_keys="recent_hn recent_mixed")]
+    # In the default window's Recommended view, which the prefetch walks.
+    recent = replace(STORY, time=int(time.time()) - 3600)
+    deck = WindowDeck({"1w": WindowViews(recommended=(RankedStory(recent, 1.0, ""),))})
 
     def run() -> None:
         out.append(
             asyncio.run(
                 server._prefetch_tldrs_for_ranked(
-                    ranked, Handler.db, per_combo=1, date_top_n=0, stagger_s=0
+                    deck, Handler.db, per_view=1, stagger_s=0
                 )
             )
         )

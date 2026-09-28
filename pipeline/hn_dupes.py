@@ -410,13 +410,44 @@ def canonicalize_hn_dupes(
     *feedback_context* lets a caller that already built it for this user and
     ``feedback_actions`` skip reloading the user's feedback.
     """
+    return [
+        item
+        for item in canonical_outcomes(
+            ranked,
+            db,
+            candidate_stories=candidate_stories,
+            selected_limit=selected_limit,
+            user_id=user_id,
+            feedback_actions=feedback_actions,
+            resolver=resolver,
+            trace=trace,
+            feedback_context=feedback_context,
+        )
+        if item is not None
+    ]
+
+
+def canonical_outcomes(
+    ranked: list[RankedStory],
+    db: Database,
+    *,
+    candidate_stories: Sequence[Story] = (),
+    selected_limit: int | None = None,
+    user_id: int | None = None,
+    feedback_actions: tuple[str, ...] = ("up", "neutral"),
+    resolver: HnDupeResolver | None = None,
+    trace: _TraceCounter | None = None,
+    feedback_context: FeedbackDupeContext | None = None,
+) -> list[RankedStory | None]:
+    """``canonicalize_hn_dupes`` per input card, aligned with *ranked*: the
+    card itself, the card carrying its canonical story, or ``None`` when it
+    is dropped (a duplicate of a voted story or of another card)."""
     if not ranked:
-        return ranked
+        return []
 
     selected_count = len(ranked) if selected_limit is None else max(0, selected_limit)
     if selected_count == 0:
-        return ranked
-
+        return list(ranked)
     candidate_by_id = {story.id: story for story in candidate_stories}
     original_output_ids = {item.story.id for item in ranked}
     if feedback_context is None:
@@ -439,14 +470,13 @@ def canonicalize_hn_dupes(
         trace, "hn_dupes_retry", sum(r.status == "retry" for r in resolutions.values())
     )
     emitted_ids: set[int] = set()
-    output: list[RankedStory] = []
+    output: list[RankedStory | None] = []
 
     for index, item in enumerate(ranked):
         story = item.story
         if index >= selected_count or story.source != "hn" or story.id <= 0:
-            if story.id not in emitted_ids:
-                output.append(item)
-                emitted_ids.add(story.id)
+            output.append(None if story.id in emitted_ids else item)
+            emitted_ids.add(story.id)
             continue
 
         resolution = resolutions.get(story.id)
@@ -461,12 +491,12 @@ def canonicalize_hn_dupes(
                 story.id,
             )
             emitted_ids.add(story.id)
+            output.append(None)
             continue
 
         if target_id is None:
-            if story.id not in emitted_ids:
-                output.append(item)
-                emitted_ids.add(story.id)
+            output.append(None if story.id in emitted_ids else item)
+            emitted_ids.add(story.id)
             continue
 
         if target_id in feedback_context.story_ids:
@@ -476,6 +506,7 @@ def canonicalize_hn_dupes(
                 target_id,
             )
             emitted_ids.add(story.id)
+            output.append(None)
             continue
 
         if target_id in original_output_ids or target_id in emitted_ids:
@@ -485,6 +516,7 @@ def canonicalize_hn_dupes(
                 target_id,
             )
             emitted_ids.add(story.id)
+            output.append(None)
             continue
 
         target_story = _lookup_canonical_story(
@@ -494,9 +526,8 @@ def canonicalize_hn_dupes(
         )
         if target_story is None:
             _increment_trace_count(trace, "hn_dupes_target_missing")
-            if story.id not in emitted_ids:
-                output.append(item)
-                emitted_ids.add(story.id)
+            output.append(None if story.id in emitted_ids else item)
+            emitted_ids.add(story.id)
             continue
 
         logging.info(
@@ -636,7 +667,7 @@ def _cached_ratio_ge(source_norm: str, target_norm: str) -> bool:
     threshold the full ratio() cannot reach it, so most dissimilar pairs
     resolve in O(n) char-counting instead of O(n²) matching. Identical
     verdicts to a bare ratio() call. The cache is warm-scoped in effect —
-    the same candidate/feedback title pairs recur across combos within a
+    the same candidate/feedback title pairs recur across windows within a
     warm and across consecutive warms — and bounded at 64k entries.
     """
     matcher = SequenceMatcher(None, source_norm, target_norm)

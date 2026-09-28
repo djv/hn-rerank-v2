@@ -429,7 +429,9 @@ def test_fast_rerank_for_user_dedups_duplicate_urls(db, monkeypatch) -> None:
         ),
     )
     config = Config(days=30)
-    ranked = fast_rerank_for_user(db, config, cast(Embedder, object()), user.id)
+    ranked = fast_rerank_for_user(
+        db, config, cast(Embedder, object()), user.id
+    ).stories()
     survivor_ids = {r.story.id for r in ranked}
     assert hn_id in survivor_ids
     assert reddit_id not in survivor_ids
@@ -494,7 +496,9 @@ def test_fast_rerank_for_user_excludes_upvoted_duplicate(db, monkeypatch) -> Non
 
     monkeypatch.setattr(db, "get_all_feedback", counted_get_all_feedback)
     config = Config(days=30)
-    ranked = fast_rerank_for_user(db, config, cast(Embedder, object()), user.id)
+    ranked = fast_rerank_for_user(
+        db, config, cast(Embedder, object()), user.id
+    ).stories()
     survivor_ids = {r.story.id for r in ranked}
     # The HN story is excluded (already in feedback), and the Reddit story
     # is excluded by URL-match against the upvoted feedback.

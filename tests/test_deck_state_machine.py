@@ -20,6 +20,7 @@ starts, and a regen or vote can land before it finishes.
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -38,7 +39,7 @@ from hypothesis.stateful import (
 import pipeline
 import server
 from database import Database, Story, User
-from pipeline import Config, Embedder, RankedStory
+from pipeline import Config, Embedder, RankedStory, WindowDeck, WindowViews
 from server import Handler, create_app
 
 STORY_IDS = list(range(1, 9))
@@ -68,14 +69,14 @@ class _FakeScheduler:
 
 
 def _ranked(story_id: int) -> RankedStory:
-    story = Story(story_id, f"Story {story_id}", None, 10, 1000 + story_id, "text")
-    return RankedStory(
-        story,
-        score=float(story_id),
-        best_match_title="",
-        combo_keys="recent_hn recent_mixed",
-        is_recent=True,
-    )
+    posted = int(time.time()) - 3600 - story_id
+    story = Story(story_id, f"Story {story_id}", None, 10, posted, "text")
+    return RankedStory(story, score=float(story_id), best_match_title="")
+
+
+def _deck(pool: list[RankedStory]) -> WindowDeck:
+    """The pool as the default window's Recommended view."""
+    return WindowDeck({"1w": WindowViews(recommended=tuple(pool))})
 
 
 class DeckMachine(RuleBasedStateMachine):
@@ -96,9 +97,8 @@ class DeckMachine(RuleBasedStateMachine):
             db_path=self.db.db_path,
             server_port=0,
             article_fetch_max_per_run=0,
-            tldr_prefetch_per_combo=0,
+            tldr_prefetch_per_view=0,
             tldr_prefetch_stale_per_run=0,
-            tldr_prefetch_date_top_n=0,
         )
         Runtime.db = self.db
         Runtime.embedder = cast(Embedder, None)
@@ -131,7 +131,7 @@ class DeckMachine(RuleBasedStateMachine):
         runtime._pool_generation = self.clock_ms
         runtime._scheduler = cast(Any, _FakeScheduler())
         runtime._feedback_warm_counts = {}
-        runtime._cold_stories = list(self.pool)
+        runtime._cold_deck = _deck(self.pool)
 
     @property
     def scheduler(self) -> _FakeScheduler:
@@ -140,11 +140,11 @@ class DeckMachine(RuleBasedStateMachine):
     def current(self, index: int) -> int:
         return self.runtime._dashboard_version(self.users[index].id)
 
-    def rank(self, user_id: int) -> list[RankedStory]:
+    def rank(self, user_id: int) -> WindowDeck:
         """`fast_rerank_for_user`: this user's pool minus their votes."""
         self.ranked_at = self.runtime._dashboard_version(user_id)
         voted = pipeline._voted_story_ids(self.db, user_id)
-        deck = [r for r in self.pool if r.story.id not in voted]
+        deck = _deck([r for r in self.pool if r.story.id not in voted])
         hook, self.during_rank = self.during_rank, None
         if hook is not None:
             hook()
@@ -284,11 +284,11 @@ def test_deck_versions_state_machine(
 ) -> None:
     def fake_rank(
         db: Database, config: Config, embedder: Embedder, user_id: int, **_: Any
-    ) -> list[RankedStory]:
+    ) -> WindowDeck:
         assert Machine.live is not None
         return Machine.live.rank(user_id)
 
-    def fake_render(ranked: list[RankedStory], *_: Any, **kwargs: Any) -> bytes:
+    def fake_render(deck: WindowDeck, *_: Any, **kwargs: Any) -> bytes:
         return f"v={kwargs['dashboard_version']}/{kwargs['dashboard_latest_version']}".encode()
 
     class Machine(DeckMachine):
@@ -305,7 +305,7 @@ def test_deck_versions_state_machine(
             return cls.live.pool
 
     def rebuild_cold_deck(cls: type[Handler]) -> None:
-        cls._cold_stories = list(Machine.current_pool())
+        cls._cold_deck = _deck(Machine.current_pool())
 
     monkeypatch.setattr(pipeline, "fast_rerank_for_user", fake_rank)
     monkeypatch.setattr(pipeline, "generate_dashboard_bytes", fake_render)

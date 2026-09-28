@@ -25,7 +25,7 @@ async def inspect(pilot: Pilot) -> None:
     await pilot.pause(3)
     app = pilot.app
     if isinstance(app, Reader):
-        app.query_one("#age", Select).value = "archive"
+        app.query_one("#window", Select).value = "12h"
         app.query_one("#sort", Select).value = "popular"
         await pilot.pause()
         app.save_screenshot("hn-editorial-empty.svg", path="/tmp")

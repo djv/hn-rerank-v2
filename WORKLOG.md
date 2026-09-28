@@ -1,5 +1,56 @@
 # Worklog: hn-rewrite
 
+## 2026-09-28 Time window replaces the Date sort and Recent/Archive
+
+User request: "Date should be a separate drop down and it should affect the
+other three tabs… 12 hours, one day, one week, one month"; "send less
+candidates from server, and client should prefetch likely next query in
+bg"; "Aim to simplify the server code." Plan: `plans/time-window.md`
+(user decisions: Recommended by pure model score, no source quota; Popular
+one pick, HN stories by gravity, no Hot/Top/Talk cascade; windows 12h / 1d /
+1w default / 1m / archive; send only the requested window), amended by the
+review in `plans/time-window-review.md` (serve-time window membership,
+dedup before the cap with refill, cold users get all windows, feed schema
+2, keep the `age_filter` column, eval metric, specs, client cache guards).
+
+- Ranking (`pipeline/ranking.py`): `assemble_window_deck` replaces
+  `_assemble_combo_deck`. Per window, from the scored pool at one `now`:
+  Recommended top by score, Popular top HN by `hn_gravity` with one badge
+  from the story's own numbers (🔥 if the old Hot predicate holds, else 💬
+  if comments ≥ points, else 🏆), Explore 5 each of Unsure/Novel/Similar
+  (serial, outside the window's Recommended picks, feedback-dupe backfill as
+  before). Picked at 2x (`SELECT_MARGIN`); `finalize_ranked_deck` dedups and
+  canonicalizes the whole deck once (`canonical_outcomes`,
+  `canonicalize_deck`, a replacement outside a window leaves it), and
+  `serve_window` drops stories that aged out and caps views at request time
+  (16; Explore 5 per badge). Cold deck: all five windows, no Explore.
+  Serving MMR dropped (`mmr_filter` kept for the eval).
+- Removed: combo keys and `memberships`, `is_recent`, `is_non_hn`,
+  `combo_keys`, the `PRIMARY_*`/`POPULAR_PER_COMBO`/`EXPLORE_PER_BADGE_NONHN`
+  quotas, the cascade, `RECOMMENDED_LIMIT`, the Date orders and sort,
+  `COLD_DECK_LIMIT`, `DashboardCardView`/`prepare_feed`/tab groups,
+  `components/tab_group.html` and the segmented-tab CSS, the prefetch date
+  lane and `tldr_prefetch_date_top_n`. `tldr_prefetch_per_combo` is now
+  `tldr_prefetch_per_view` (first N of each view of the 1w window).
+- Server: `DeckState`/`DeckView` hold a `WindowDeck` (all windows, one
+  version); `_deck_for_user` masks voted stories in every window.
+  `GET /api/feed?window=` (default 1w, unknown → 400) returns one window
+  with orders `recommended`/`popular`/`explore`; the page embeds 1w. Feed
+  schema 2 (`FEED_API_VERSION`, `Feed.window`); clients reject other
+  versions. Interaction events send `window`, stored in the `age_filter`
+  column (no migration).
+- Web client: a time-window dropdown replaces the Age tabs, `d` cycles
+  windows; per-window feed cache of one deck version, background neighbour
+  prefetch (one request at a time, once per version, never summaries,
+  dropped after a newer deck or a saved vote, never replaces the window on
+  screen). TUI: `#window` dropdown and `d`, same cache and prefetch.
+- Eval: deck metrics are `recommended_1w` (the served 1w Recommended view)
+  instead of the six combo metrics.
+- Lines: `pipeline/ranking.py` 2109 → 2035, `pipeline/render.py` 467 →
+  327, `server.py` 3451 → 3431 (`pipeline/__init__.py` 1160 → 1181 and
+  `hn_dupes.py` 763 → 794 for `canonicalize_deck`/`canonical_outcomes`).
+- Not deployed.
+
 ## 2026-09-27 Deployed `c1c676b` (browser test, CSS sweep)
 
 VPS fast-forwarded from `f7cfbe7`, restarted 11:22:43 UTC. Headless Chrome

@@ -25,6 +25,7 @@ from pipeline import (  # noqa: E402
     story_embedding_text,
 )
 
+
 def _clear_model_cache() -> None:
     with _MODEL_CACHE_LOCK:
         _MODEL_CACHE.clear()
@@ -91,9 +92,9 @@ def _preflight_read_only_embeddings(
 def _run_once(db: Database, config: Config, embedder: Embedder, user_id: int) -> dict:
     trace = RankTrace()
     with trace.stage("rank_total"):
-        ranked = fast_rerank_for_user(db, config, embedder, user_id, trace=trace)
+        deck = fast_rerank_for_user(db, config, embedder, user_id, trace=trace)
     fields = trace.to_log_fields()
-    fields["stories"] = len(ranked)
+    fields["stories"] = len(deck.stories())
     return fields
 
 

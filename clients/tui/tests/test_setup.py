@@ -116,15 +116,7 @@ async def test_undo_restores_story_during_stale_refresh() -> None:
         for order in fake.feed.orders.values():
             order[:] = [sid for sid in order if sid != 1]
         fake.feed.stories[:] = [story for story in fake.feed.stories if story.id != 1]
-        fake.feed = type(fake.feed)(
-            1,
-            fake.feed.stories,
-            fake.feed.orders,
-            fake.feed.feedback_counts,
-            0,
-            1,
-            False,
-        )
+        fake.feed = replace(fake.feed, version=0, target_version=1, ready=False)
         app.action_undo()
         await pilot.pause(0.3)
         app.reload(manual=False)  # the poller brings the stale deck
@@ -205,21 +197,19 @@ async def test_rejected_saved_profile_reconnects_on_its_own_server(
 
 
 async def test_undo_puts_story_back_only_where_the_server_listed_it() -> None:
-    """Undo during a stale refresh restores the story to the views it was
-    voted from, at the server's position: not newest in Date, and not into
-    Recommended when the server had left it out."""
+    """Undo during a stale refresh restores the story to the views of the
+    window it was voted from, at the server's position (Popular by gravity),
+    and not into Recommended when the server had left it out."""
     fake = FakeServer()
+    base = fake.feed.stories[0]
     stories = [
-        replace(story, memberships=["recent_mixed"], popular=True, explore=False)
-        for story in fake.feed.stories
+        replace(base, id=i, title=f"Story {i}", points=400 - 100 * i, rank_score=-i)
+        for i in (1, 2, 3)
     ]
-    original = {
-        "recommended:recent": [2, 3],
-        "popular:recent": [1, 2, 3],
-        "date:recent": [3, 2, 1],
-    }
+    original = {"recommended": [2, 3], "popular": [1, 2, 3]}
     fake.feed = Feed(
-        1,
+        2,
+        "1w",
         stories,
         {k: list(v) for k, v in original.items()},
         fake.feed.feedback_counts,
@@ -229,7 +219,7 @@ async def test_undo_puts_story_back_only_where_the_server_listed_it() -> None:
     )
     app = Reader(api=fake.api())
     async with app.run_test(size=(120, 35)) as pilot:
-        await pilot.pause(0.2)
+        await settle(pilot)
         app.query_one("#sort", Select).value = "popular"
         await pilot.pause(0.2)
         selected = app.selected()
@@ -238,7 +228,9 @@ async def test_undo_puts_story_back_only_where_the_server_listed_it() -> None:
         await pilot.pause(0.2)
         remaining = [story for story in stories if story.id != 1]
         orders = {k: [sid for sid in v if sid != 1] for k, v in original.items()}
-        fake.feed = Feed(1, remaining, orders, fake.feed.feedback_counts, 0, 1, False)
+        fake.feed = Feed(
+            2, "1w", remaining, orders, fake.feed.feedback_counts, 0, 1, False
+        )
         app.action_undo()
         await pilot.pause(0.3)
         app.reload(manual=False)  # the poller brings the stale deck

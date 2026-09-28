@@ -3,12 +3,12 @@
 
 Diagnoses "the deck is too short and looks HN-only" by printing, for one
 user, how many candidates survive each stage between the raw SQL pool and
-the final rendered deck: per-leg pool size, per-combo pool/primary/badge
-counts, and pre/post-dedup non-HN survivor counts. These are the counters
-added to ``RankTrace`` (see ``pool_hn``/``pool_rss``/``pool_archive``,
-``pool_rss_oldest_age_h``, ``combo_pool_*``/``combo_primary_*``/
-``combo_badges_*``, ``deck_nonhn_pre_dedup``/``deck_nonhn_post_dedup``/
-``deck_nonhn_final`` in ``pipeline/ranking.py`` and ``pipeline/__init__.py``).
+the final rendered deck: per-leg pool size, per-window pool size, and
+pre/post-dedup non-HN survivor counts. These are the counters added to
+``RankTrace`` (see ``pool_hn``/``pool_rss``/``pool_archive``,
+``pool_rss_oldest_age_h``, ``window_pool_*``, ``deck_nonhn_pre_dedup``/
+``deck_nonhn_post_dedup``/``deck_nonhn_final`` in ``pipeline/ranking.py``
+and ``pipeline/__init__.py``).
 
 Two modes:
 
@@ -40,12 +40,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from database import Database  # noqa: E402
+from clients.tui.src.hn_rerank.models import WINDOWS  # noqa: E402
 from pipeline import Config, Embedder, RankTrace, fast_rerank_for_user  # noqa: E402
-
-# Combo ids as produced by pipeline.ranking._assemble_combo_deck's COMBO_DEFS.
-# archive_nonhn was retired (see WORKLOG 2026-08-30) — it was structurally
-# always empty, so it no longer appears here.
-_COMBO_IDS = ("recent_hn", "recent_nonhn", "archive_hn")
 
 
 def _print_fields(fields: Mapping[str, object]) -> None:
@@ -59,12 +55,10 @@ def _print_fields(fields: Mapping[str, object]) -> None:
             " LIMIT actually reached)"
         )
     print()
-    print(f"  {'combo':<16}{'pool':>8}{'primary':>10}{'badges':>10}")
-    for combo_id in _COMBO_IDS:
-        pool = fields.get(f"combo_pool_{combo_id}", "-")
-        primary = fields.get(f"combo_primary_{combo_id}", "-")
-        badges = fields.get(f"combo_badges_{combo_id}", "-")
-        print(f"  {combo_id:<16}{pool!s:>8}{primary!s:>10}{badges!s:>10}")
+    print(f"  {'window':<16}{'pool':>8}")
+    for window in WINDOWS:
+        pool = fields.get(f"window_pool_{window}", "-")
+        print(f"  {window:<16}{pool!s:>8}")
     print()
     print(f"  deck_nonhn_pre_dedup  = {fields.get('deck_nonhn_pre_dedup', '?')}")
     print(f"  deck_nonhn_post_dedup = {fields.get('deck_nonhn_post_dedup', '?')}")
@@ -115,9 +109,9 @@ def _rerank_fresh(config: Config, user_id: int) -> None:
                 ort_variant=config.embedding_ort_variant,
             )
             trace = RankTrace()
-            ranked = fast_rerank_for_user(db, config, embedder, user_id, trace=trace)
+            deck = fast_rerank_for_user(db, config, embedder, user_id, trace=trace)
             fields = trace.to_log_fields()
-            fields["stories"] = len(ranked)
+            fields["stories"] = len(deck.stories())
             print(f"=== fresh rerank (scratch copy) user_id={user_id} ===")
             _print_fields(fields)
         finally:

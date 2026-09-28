@@ -8,13 +8,15 @@ import httpx
 import pytest
 from werkzeug.serving import make_server
 
+from collections.abc import Iterable
 from typing import Any, cast
 
 from server import DeckState, Handler, SKELETON_HTML, create_app
-from pipeline import Config, Embedder, RankedStory
+from pipeline import Config, Embedder, RankedStory, WindowDeck, WindowViews
 from database import Database, Story
 
 import numpy as np
+from bs4 import BeautifulSoup
 
 
 class _LocalHttp:
@@ -97,6 +99,11 @@ def _reset_warm_state(handler: type[Handler]) -> None:
     handler._feedback_warm_guard = threading.Lock()
 
 
+def _week_deck(items: Iterable[RankedStory]) -> WindowDeck:
+    """A deck whose 1w Recommended view holds *items*."""
+    return WindowDeck({"1w": WindowViews(recommended=tuple(items))})
+
+
 def _make_voter(db: Database, user_id: int, story_id: int = 900_001) -> None:
     """Give a user one vote: only voters get a personalized deck (a user
     without votes is served the shared cold deck and never warmed)."""
@@ -134,7 +141,7 @@ def test_warm_job_collects_after_failed_warm(
     TestHandler.embedder = mock_embedder
     TestHandler._decks = {}
     TestHandler._dashboard_versions = {}
-    TestHandler._cold_stories = []
+    TestHandler._cold_deck = WindowDeck()
     _reset_warm_state(TestHandler)
 
     user = prop_db.create_user("warm_gc")
@@ -179,7 +186,7 @@ def _start_handler_server(
     TestHandler.regen_event = regen_event
     TestHandler._decks = {}
     TestHandler._dashboard_versions = {}
-    TestHandler._cold_stories = []
+    TestHandler._cold_deck = WindowDeck()
     _reset_warm_state(TestHandler)
     TestHandler.reset_public_demo_limiter()
 
@@ -531,9 +538,13 @@ def test_static_serving(test_env):
     assert 'data-sort="recommended"' in resp.text
     assert 'data-sort="popular"' in resp.text
     assert 'data-sort="explore"' in resp.text
-    assert 'data-sort="date"' in resp.text
-    assert 'data-age="recent"' in resp.text
-    assert 'data-age="archive"' in resp.text
+    assert 'data-sort="date"' not in resp.text
+    # One time-window picker replaces the Recent/Archive tabs, 1w selected.
+    soup = BeautifulSoup(resp.text, "html.parser")
+    options = soup.select("select#window-select option")
+    assert [o["value"] for o in options] == ["12h", "1d", "1w", "1m", "archive"]
+    assert [o["value"] for o in options if o.has_attr("selected")] == ["1w"]
+    assert not soup.select("[data-age]")
     assert 'id="toast"' in resp.text
     assert 'id="queue-loading"' in resp.text
     assert "Loading more stories…" in resp.text
@@ -931,14 +942,14 @@ def test_feedback_post_bumps_cache_version_for_warm_rerender(test_env, monkeypat
     db.upsert_story(voted_story)
 
     def fake_fast_rerank_for_user(database, config, embedder, user_id, **kwargs):
-        return []
+        return WindowDeck()
 
     def fake_generate_dashboard_bytes(
         ranked, config, database, user_id, user_token, **kwargs
     ):
         version = handler._dashboard_version(user_id)
         body = f"version={version}"
-        if voted_story.id not in (s.id for s in ranked):
+        if voted_story.id not in (s.story.id for s in ranked.stories()):
             body += f" excluded={voted_story.id}"
         return body.encode()
 
@@ -1114,7 +1125,7 @@ def test_ranking_ready_false_when_cache_missing_or_older(test_env, monkeypatch) 
         "current_version": target_version,
     }
 
-    handler._decks[user.id] = DeckState([], time.time(), target_version - 1)
+    handler._decks[user.id] = DeckState(WindowDeck(), time.time(), target_version - 1)
     older_resp = local_http.get(
         f"http://127.0.0.1:{port}/api/ranking-ready?min_version={target_version}",
         cookies={"hn_token": user.token},
@@ -1136,7 +1147,7 @@ def test_ranking_ready_true_only_from_cached_version(test_env, monkeypatch) -> N
 
     monkeypatch.setattr(handler, "_trigger_warm", classmethod(fake_trigger_warm))
     target_version = handler._bump_user_version(user.id)
-    handler._decks[user.id] = DeckState([], time.time(), target_version)
+    handler._decks[user.id] = DeckState(WindowDeck(), time.time(), target_version)
 
     resp = local_http.get(
         f"http://127.0.0.1:{port}/api/ranking-ready?min_version={target_version}",
@@ -1155,7 +1166,7 @@ def test_ranking_ready_true_only_from_cached_version(test_env, monkeypatch) -> N
 def test_ranking_ready_true_for_older_requested_version(test_env) -> None:
     port, _, _, handler, user = test_env
     newer_version = handler._bump_user_version(user.id)
-    handler._decks[user.id] = DeckState([], time.time(), newer_version)
+    handler._decks[user.id] = DeckState(WindowDeck(), time.time(), newer_version)
 
     resp = local_http.get(
         f"http://127.0.0.1:{port}/api/ranking-ready?min_version={newer_version - 1}",
@@ -1180,7 +1191,7 @@ def test_ranking_ready_returns_intermediate_cached_version(
     monkeypatch.setattr(handler, "_trigger_warm", classmethod(fake_trigger_warm))
     for expected_version in (2, 3, 4):
         assert handler._bump_user_version(user.id) == expected_version
-    handler._decks[user.id] = DeckState([], time.time(), 3)
+    handler._decks[user.id] = DeckState(WindowDeck(), time.time(), 3)
 
     resp = local_http.get(
         f"http://127.0.0.1:{port}/api/ranking-ready?min_version=2&target_version=4",
@@ -1236,7 +1247,7 @@ def test_dashboard_cache_uses_feedback_versions(test_env, mock_embedder, monkeyp
     TestHandler.embedder = mock_embedder
     TestHandler._decks = {}
     TestHandler._dashboard_versions = {}
-    TestHandler._cold_stories = []
+    TestHandler._cold_deck = WindowDeck()
     _reset_warm_state(TestHandler)
 
     _make_voter(db, user.id)
@@ -1244,7 +1255,7 @@ def test_dashboard_cache_uses_feedback_versions(test_env, mock_embedder, monkeyp
 
     def fake_fast_rerank_for_user(database, config, embedder, user_id, **kwargs):
         calls.append(("rank", user_id))
-        return []
+        return WindowDeck()
 
     def fake_generate_dashboard_bytes(
         ranked, config, database, user_id, user_token, **kwargs
@@ -1312,9 +1323,9 @@ def test_no_cache_user_gets_cold_deck_and_warm_is_scheduled(
         comment_count=1,
     )
     db.upsert_story(unvoted)
-    handler._cold_stories = [
+    handler._cold_deck = _week_deck(
         RankedStory(story=s, score=1.0, best_match_title="") for s in (story, unvoted)
-    ]
+    )
     calls: list[tuple[int, int]] = []
     rendered: list[dict[str, object]] = []
     handler._decks = {}
@@ -1322,7 +1333,7 @@ def test_no_cache_user_gets_cold_deck_and_warm_is_scheduled(
     target_version = handler._pool_generation + vote_counter
 
     def fake_generate_dashboard_bytes(
-        ranked: list[RankedStory],
+        ranked: WindowDeck,
         config: Config,
         database: Database,
         user_id: int | None,
@@ -1356,8 +1367,8 @@ def test_no_cache_user_gets_cold_deck_and_warm_is_scheduled(
     assert html == b"cold html"
     assert calls == [(user.id, target_version)]
     rank = rendered[0]
-    ranked_list = cast(list[RankedStory], rank["ranked"])
-    story_ids = [rs.story.id for rs in ranked_list]
+    deck = cast(WindowDeck, rank["ranked"])
+    story_ids = [rs.story.id for rs in deck.stories()]
     assert story_ids == [992]
     assert 991 not in story_ids
     assert rank["user_id"] == user.id
@@ -1385,17 +1396,15 @@ def test_no_cache_zero_feedback_user_gets_cold_deck_no_warm(
             ),
             score=50.0,
             best_match_title="",
-            is_recent=True,
-            combo_keys="recent_hn recent_mixed",
         )
     ]
     calls: list[tuple[int, int]] = []
     handler._decks = {}
     handler._dashboard_versions = {user.id: 0}
-    handler._cold_stories = cold
+    handler._cold_deck = _week_deck(cold)
 
     def fake_generate_dashboard_bytes(
-        ranked: list[RankedStory],
+        ranked: WindowDeck,
         config: Config,
         database: Database,
         user_id: int | None,
@@ -1433,11 +1442,11 @@ def test_stale_warm_render_does_not_overwrite_current_cache(
     TestHandler.embedder = mock_embedder
     TestHandler._decks = {}
     TestHandler._dashboard_versions = {}
-    TestHandler._cold_stories = []
+    TestHandler._cold_deck = WindowDeck()
     _reset_warm_state(TestHandler)
 
     def fake_fast_rerank_for_user(database, config, embedder, user_id, **kwargs):
-        return []
+        return WindowDeck()
 
     def fake_generate_dashboard_bytes(
         ranked, config, database, user_id, user_token, **kwargs
@@ -1476,7 +1485,7 @@ def test_active_warm_commits_when_dashboard_version_advances(
     TestHandler.embedder = mock_embedder
     TestHandler._decks = {}
     TestHandler._dashboard_versions = {}
-    TestHandler._cold_stories = []
+    TestHandler._cold_deck = WindowDeck()
     _reset_warm_state(TestHandler)
 
     rank_started = threading.Event()
@@ -1485,7 +1494,7 @@ def test_active_warm_commits_when_dashboard_version_advances(
     def fake_fast_rerank_for_user(database, config, embedder, user_id, **kwargs):
         rank_started.set()
         assert allow_rank_to_finish.wait(timeout=2.0)
-        return []
+        return WindowDeck()
 
     def fake_generate_dashboard_bytes(
         ranked, config, database, user_id, user_token, **kwargs
@@ -1499,7 +1508,7 @@ def test_active_warm_commits_when_dashboard_version_advances(
         pipeline, "generate_dashboard_bytes", fake_generate_dashboard_bytes
     )
 
-    TestHandler._decks[user.id] = DeckState([], time.time(), 0)
+    TestHandler._decks[user.id] = DeckState(WindowDeck(), time.time(), 0)
     TestHandler._dashboard_versions[user.id] = 1
 
     TestHandler._trigger_warm(user, version=2)
@@ -1533,14 +1542,14 @@ def test_rapid_vote_warms_coalesce_to_latest_version(
     TestHandler.embedder = mock_embedder
     TestHandler._decks = {}
     TestHandler._dashboard_versions = {}
-    TestHandler._cold_stories = []
+    TestHandler._cold_deck = WindowDeck()
     _reset_warm_state(TestHandler)
 
     ranked_versions: list[int] = []
 
     def fake_fast_rerank_for_user(database, config, embedder, user_id, **kwargs):
         ranked_versions.append(TestHandler._dashboard_version(user_id))
-        return []
+        return WindowDeck()
 
     def fake_generate_dashboard_bytes(
         ranked, config, database, user_id, user_token, **kwargs
@@ -1584,7 +1593,7 @@ def test_warm_loops_to_newer_version_requested_while_ranking(
     TestHandler.embedder = mock_embedder
     TestHandler._decks = {}
     TestHandler._dashboard_versions = {}
-    TestHandler._cold_stories = []
+    TestHandler._cold_deck = WindowDeck()
     _reset_warm_state(TestHandler)
 
     rank_started = threading.Event()
@@ -1596,7 +1605,7 @@ def test_warm_loops_to_newer_version_requested_while_ranking(
         if len(ranked_versions) == 1:
             rank_started.set()
             assert allow_first_rank_to_finish.wait(timeout=2.0)
-        return []
+        return WindowDeck()
 
     def fake_generate_dashboard_bytes(
         ranked, config, database, user_id, user_token, **kwargs
@@ -1910,7 +1919,7 @@ def test_flask_test_client_events_batch_and_replay_are_idempotent(
         "dashboard_version": 0,
         "position": 0,
         "sort_mode": "recommended",
-        "age_filter": "recent",
+        "window": "1w",
         "source_filter": "mixed",
         "ranker_arm": "baseline",
         "occurred_at": 1_700_000_000.0,
@@ -1948,7 +1957,7 @@ def _ledger_event(event_id: str, story_id: int) -> dict[str, Any]:
         "dashboard_version": 0,
         "position": 0,
         "sort_mode": "recommended",
-        "age_filter": "recent",
+        "window": "1w",
         "source_filter": "mixed",
         "ranker_arm": "baseline",
         "occurred_at": 1_700_000_000.0,
@@ -3072,12 +3081,12 @@ def test_flask_test_client_tldr_provider_error_degrades_gracefully(
 
 
 @pytest.mark.parametrize("cacheable", [True, False])
-async def test_prefetch_tldrs_for_ranked_regenerates_stale_beyond_top_combo(
+async def test_prefetch_tldrs_for_ranked_regenerates_stale_beyond_the_view_tops(
     test_env: Any, monkeypatch: pytest.MonkeyPatch, cacheable: bool
 ) -> None:
-    """Side B: the top-per-combo prefetch alone never reaches a story ranked
+    """Side B: the top-per-view prefetch alone never reaches a story ranked
     below the cutoff, so a stale-key story there is stuck until it re-enters
-    the top N. `stale_per_run` scans the remainder of the cold deck for
+    the top N. `stale_per_run` scans the remainder of the deck for
     cache-key mismatches and regenerates a bounded number of them."""
     import server as srv
     from pipeline import RankedStory
@@ -3090,7 +3099,7 @@ async def test_prefetch_tldrs_for_ranked_regenerates_stale_beyond_top_combo(
             title=f"Stale scan story {i}",
             url=f"https://example.com/stale-scan-{i}",
             score=10,
-            time=1600000000,
+            time=int(time.time()) - 3600,
             text_content="body",
             source="hn",
             comment_count=0,
@@ -3105,17 +3114,16 @@ async def test_prefetch_tldrs_for_ranked_regenerates_stale_beyond_top_combo(
 
     # Deck stories are candidate-pool copies without TLDR source text; the
     # scan must compare against the DB's text, not the empty copy.
-    ranked = [
+    deck = _week_deck(
         RankedStory(
             story=replace(s, self_text="", top_comments="", article_body=""),
             score=1.0,
             best_match_title="",
-            combo_keys="recent_hn",
         )
         for s in stories
-    ]
+    )
 
-    # stories[2]: beyond the per_combo=1 cutoff, cached under a stale key
+    # stories[2]: beyond the per_view=1 cutoff, cached under a stale key
     # (article_body changed since it was cached) -> must be regenerated.
     stale_key = srv._tldr_cache_key(
         title=stories[2].title,
@@ -3145,7 +3153,7 @@ async def test_prefetch_tldrs_for_ranked_regenerates_stale_beyond_top_combo(
     monkeypatch.setattr(srv, "_PREFETCH_STAGGER_S", 0)
 
     generated = await srv._prefetch_tldrs_for_ranked(
-        ranked, db, per_combo=1, stale_per_run=1, date_top_n=0
+        deck, db, per_view=1, stale_per_run=1
     )
 
     assert generated == (2 if cacheable else 0)
@@ -3156,48 +3164,44 @@ async def test_prefetch_tldrs_for_ranked_regenerates_stale_beyond_top_combo(
     assert db.get_any_tldr_for_story(stories[1].id) == "Fresh TLDR"
 
 
-async def test_prefetch_tldrs_for_ranked_covers_date_sorted_head(
+async def test_prefetch_tldrs_for_ranked_walks_the_default_window_views(
     test_env: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Date-tab lane: the newest story by time is prefetched even when it
-    sits below the per-combo cutoff and has no stale key."""
+    """The first story of each view of the 1w window is summarized, once
+    even when it heads two views; other windows and lower ranks wait for a
+    tap."""
     import server as srv
-    from pipeline import RankedStory
 
     _, db, _, _, _ = test_env
 
-    old = Story(
-        id=3120,
-        title="Old combo-top story",
-        url="https://example.com/date-old",
-        score=10,
-        time=1600000000,
-        text_content="body",
-        source="hn",
-        comment_count=0,
-        self_text="",
-        top_comments="",
-        article_body="Body.",
-    )
-    new = Story(
-        id=3121,
-        title="Newest story below cutoff",
-        url="https://example.com/date-new",
-        score=10,
-        time=1700000000,
-        text_content="body",
-        source="hn",
-        comment_count=0,
-        self_text="",
-        top_comments="",
-        article_body="Body.",
-    )
-    for s in (old, new):
+    def story(i: int) -> RankedStory:
+        s = Story(
+            id=3120 + i,
+            title=f"View story {i}",
+            url=f"https://example.com/view-{i}",
+            score=10,
+            time=int(time.time()) - 3600,
+            text_content="body",
+            source="hn",
+            comment_count=0,
+            self_text="",
+            top_comments="",
+            article_body="Body.",
+        )
         db.upsert_story(s)
-    ranked = [
-        RankedStory(story=old, score=1.0, best_match_title="", combo_keys="recent_hn"),
-        RankedStory(story=new, score=0.1, best_match_title="", combo_keys=""),
-    ]
+        return RankedStory(story=s, score=1.0 - i / 10, best_match_title="")
+
+    top, second, popular_top, other = (story(i) for i in range(4))
+    deck = WindowDeck(
+        {
+            "1w": WindowViews(
+                recommended=(top, second),
+                popular=(popular_top, top),
+                explore=(replace(top, is_novel=True),),
+            ),
+            "1d": WindowViews(recommended=(other,)),
+        }
+    )
 
     calls: list[str] = []
 
@@ -3209,55 +3213,11 @@ async def test_prefetch_tldrs_for_ranked_covers_date_sorted_head(
     monkeypatch.setattr(srv, "_PREFETCH_STAGGER_S", 0)
 
     generated = await srv._prefetch_tldrs_for_ranked(
-        ranked, db, per_combo=1, stale_per_run=0, date_top_n=1
+        deck, db, per_view=1, stale_per_run=0
     )
 
     assert generated == 2
-    assert sorted(calls) == sorted([old.title, new.title])
-
-
-async def test_prefetch_tldrs_for_ranked_date_lane_dedupes_combo_picks(
-    test_env: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A newest story already picked by the combo pass is fetched once."""
-    import server as srv
-    from pipeline import RankedStory
-
-    _, db, _, _, _ = test_env
-
-    s = Story(
-        id=3130,
-        title="Newest combo-top story",
-        url="https://example.com/date-dedupe",
-        score=10,
-        time=1700000000,
-        text_content="body",
-        source="hn",
-        comment_count=0,
-        self_text="",
-        top_comments="",
-        article_body="Body.",
-    )
-    db.upsert_story(s)
-    ranked = [
-        RankedStory(story=s, score=1.0, best_match_title="", combo_keys="recent_hn")
-    ]
-
-    calls: list[str] = []
-
-    async def mock_generate_detailed_tldr(title, self_text, top_comments, article_body):
-        calls.append(title)
-        return srv.TldrResult(kind="ok", tldr=f"TLDR: {title}")
-
-    monkeypatch.setattr(srv, "generate_detailed_tldr", mock_generate_detailed_tldr)
-    monkeypatch.setattr(srv, "_PREFETCH_STAGGER_S", 0)
-
-    generated = await srv._prefetch_tldrs_for_ranked(
-        ranked, db, per_combo=1, stale_per_run=0, date_top_n=8
-    )
-
-    assert generated == 1
-    assert calls == [s.title]
+    assert sorted(calls) == sorted([top.story.title, popular_top.story.title])
 
 
 async def test_prefetch_tldrs_for_ranked_skips_run_during_provider_cooldown(
@@ -3275,7 +3235,7 @@ async def test_prefetch_tldrs_for_ranked_skips_run_during_provider_cooldown(
         title="Cooldown skip story",
         url="https://example.com/cooldown-skip",
         score=10,
-        time=1700000000,
+        time=int(time.time()) - 3600,
         text_content="body",
         source="hn",
         comment_count=0,
@@ -3284,9 +3244,7 @@ async def test_prefetch_tldrs_for_ranked_skips_run_during_provider_cooldown(
         article_body="Body.",
     )
     db.upsert_story(s)
-    ranked = [
-        RankedStory(story=s, score=1.0, best_match_title="", combo_keys="recent_hn")
-    ]
+    deck = _week_deck([RankedStory(story=s, score=1.0, best_match_title="")])
 
     calls: list[str] = []
 
@@ -3299,7 +3257,7 @@ async def test_prefetch_tldrs_for_ranked_skips_run_during_provider_cooldown(
     srv.llm_limiter.on_429()
     try:
         generated = await srv._prefetch_tldrs_for_ranked(
-            ranked, db, per_combo=1, stale_per_run=0, date_top_n=1
+            deck, db, per_view=1, stale_per_run=0
         )
     finally:
         srv.llm_limiter.reset()
@@ -3326,7 +3284,7 @@ async def test_prefetch_tldrs_for_ranked_logs_zero_outcome_with_candidates(
         title="Already cached story",
         url="https://example.com/already-cached",
         score=10,
-        time=1700000000,
+        time=int(time.time()) - 3600,
         text_content="body",
         source="hn",
         comment_count=0,
@@ -3342,14 +3300,12 @@ async def test_prefetch_tldrs_for_ranked_logs_zero_outcome_with_candidates(
         ),
         "TLDR: cached",
     )
-    ranked = [
-        RankedStory(story=s, score=1.0, best_match_title="", combo_keys="recent_hn")
-    ]
+    deck = _week_deck([RankedStory(story=s, score=1.0, best_match_title="")])
 
     monkeypatch.setattr(srv, "_PREFETCH_STAGGER_S", 0)
     with caplog.at_level(logging.INFO):
         generated = await srv._prefetch_tldrs_for_ranked(
-            ranked, db, per_combo=1, stale_per_run=0, date_top_n=0
+            deck, db, per_view=1, stale_per_run=0
         )
 
     assert generated == 0
@@ -5190,11 +5146,11 @@ def test_dashboard_skeleton_returns_when_no_cache(test_env):
     assert b'meta http-equiv="refresh" content="1"' in resp.content
 
 
-def _fake_render(ranked: list[RankedStory], *args: object, **kwargs: object) -> bytes:
+def _fake_render(deck: WindowDeck, *args: object, **kwargs: object) -> bytes:
     """Render stub that exposes what the handler asked for."""
     version = kwargs["dashboard_version"]
     current = kwargs["dashboard_latest_version"]
-    return f"v={version}/{current} n={len(ranked)}".encode()
+    return f"v={version}/{current} n={len(deck.stories())}".encode()
 
 
 @pytest.fixture
@@ -5209,13 +5165,13 @@ def swr_handler(test_env, mock_embedder, monkeypatch: pytest.MonkeyPatch):
     SwrHandler.embedder = mock_embedder
     SwrHandler._decks = {}
     SwrHandler._dashboard_versions = {}
-    SwrHandler._cold_stories = []
+    SwrHandler._cold_deck = WindowDeck()
     _reset_warm_state(SwrHandler)
     _make_voter(db, user.id)
 
     import pipeline
 
-    monkeypatch.setattr(pipeline, "fast_rerank_for_user", lambda *a, **kw: [])
+    monkeypatch.setattr(pipeline, "fast_rerank_for_user", lambda *a, **kw: WindowDeck())
     monkeypatch.setattr(pipeline, "generate_dashboard_bytes", _fake_render)
 
     yield user, SwrHandler
@@ -5224,7 +5180,9 @@ def swr_handler(test_env, mock_embedder, monkeypatch: pytest.MonkeyPatch):
 
 
 def _deck(version: int, built_at: float | None = None) -> DeckState:
-    return DeckState([], time.time() if built_at is None else built_at, version)
+    return DeckState(
+        WindowDeck(), time.time() if built_at is None else built_at, version
+    )
 
 
 def test_dashboard_stale_hit_renders_deck_as_stale_and_queues_warm(swr_handler):
@@ -5383,15 +5341,20 @@ def test_page_embeds_the_feed_the_client_builds_cards_from(test_env):
     api = local_http.get(
         f"http://127.0.0.1:{port}/api/feed", cookies={"hn_token": user.token}
     ).json()
-    # Same deck (Explore is shuffled per render).
+    # Same deck, same orders.
     assert [s.id for s in feed.stories] == [s["id"] for s in api["stories"]]
-    assert {k: sorted(v) for k, v in feed.orders.items()} == {
-        k: sorted(v) for k, v in api["orders"].items()
-    }
-    by_id = {story.id: story for story in feed.stories}
-    assert "recent_mixed" in by_id[recent_id].memberships
-    assert "archive_mixed" in by_id[old_id].memberships
-    assert recent_id in feed.orders["date:archive"]
+    assert feed.orders == api["orders"]
+    # The page carries the default window, 1w: the recent story, not the
+    # year-old one, which the archive window serves instead.
+    assert feed.window == api["window"] == "1w"
+    assert recent_id in feed.orders["recommended"]
+    assert old_id not in {s.id for s in feed.stories}
+    archive = local_http.get(
+        f"http://127.0.0.1:{port}/api/feed?window=archive",
+        cookies={"hn_token": user.token},
+    ).json()
+    assert old_id in archive["orders"]["recommended"]
+    assert recent_id not in {s["id"] for s in archive["stories"]}
 
 
 def test_justext_rejects_sidebar_boilerplate() -> None:
@@ -5611,11 +5574,11 @@ def test_warm_background_task_dedupes_in_flight_ids(test_env, monkeypatch):
     for s in [s1, s2, s3]:
         db.upsert_story(s)
 
-    ranked = [
+    deck = _week_deck(
         RankedStory(story=s, score=1.0, best_match_title="") for s in [s1, s2, s3]
-    ]
+    )
 
-    cfg = Config.load()
+    cfg = replace(Config.load(), tldr_prefetch_per_view=0)
 
     # Mark s1 and s2 as in-flight, leave s3 free
     srv.Handler._article_fetch_in_flight = {3001, 3002}
@@ -5630,13 +5593,7 @@ def test_warm_background_task_dedupes_in_flight_ids(test_env, monkeypatch):
 
     monkeypatch.setattr(pipeline, "fetch_and_cache_article_bodies", noop_fetch)
 
-    srv.Handler._warm_background_tasks(
-        ranked,
-        db,
-        MockEmbedder(),
-        cfg,
-        per_combo=0,
-    )
+    srv.Handler._warm_background_tasks(deck, db, MockEmbedder(), cfg)
 
     # Only s3 should have been added to in-flight during the task (then cleared)
     # s1 and s2 remain unchanged since they were already in-flight
@@ -5665,7 +5622,7 @@ def test_warm_background_article_fetch_failure_still_prefetches_tldrs(
         source="hn",
     )
     db.upsert_story(story)
-    ranked = [RankedStory(story=story, score=1.0, best_match_title="")]
+    deck = _week_deck([RankedStory(story=story, score=1.0, best_match_title="")])
     srv.Handler._article_fetch_in_flight = set()
 
     async def failing_fetch(*args, **kwargs):
@@ -5674,14 +5631,13 @@ def test_warm_background_article_fetch_failure_still_prefetches_tldrs(
     prefetch_calls: list[list[int]] = []
 
     async def capture_prefetch(
-        ranked_stories,
+        prefetch_deck,
         database,
-        per_combo,
+        per_view,
         stale_per_run=0,
-        date_top_n=0,
         stagger_s=None,
     ):
-        prefetch_calls.append([rs.story.id for rs in ranked_stories])
+        prefetch_calls.append([rs.story.id for rs in prefetch_deck.stories()])
         return 1
 
     monkeypatch.setattr(pipeline, "fetch_and_cache_article_bodies", failing_fetch)
@@ -5689,11 +5645,10 @@ def test_warm_background_article_fetch_failure_still_prefetches_tldrs(
     monkeypatch.setattr(srv.Handler, "_tldr_prefetch_gate", srv.BackgroundCadence())
 
     srv.Handler._warm_background_tasks(
-        ranked,
+        deck,
         db,
         MockEmbedder(),
-        Config(article_fetch_max_per_run=10),
-        per_combo=1,
+        Config(article_fetch_max_per_run=10, tldr_prefetch_per_view=1),
     )
 
     assert prefetch_calls == [[3010]]

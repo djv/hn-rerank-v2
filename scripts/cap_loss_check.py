@@ -16,6 +16,7 @@ from pipeline import (  # noqa: E402
     Embedder,
     RankTrace,
     fast_rerank_for_user,
+    is_hn_source,
 )
 
 
@@ -35,7 +36,7 @@ def _rank_top50(
     """Run one rank and return {id: {title, source, score, badges}} for
     the top 50, plus the trace fields dict."""
     trace = RankTrace()
-    ranked = fast_rerank_for_user(db, config, embedder, user_id, trace=trace)
+    ranked = fast_rerank_for_user(db, config, embedder, user_id, trace=trace).stories()
     out: dict[int, dict[str, Any]] = {}
     for r in ranked[:50]:
         badges: list[str] = []
@@ -45,7 +46,7 @@ def _rank_top50(
             badges.append("similar")
         if r.is_uncertain:
             badges.append("uncertain")
-        if r.is_non_hn:
+        if not is_hn_source(r.story.source):
             badges.append("non_hn")
         if r.is_hot:
             badges.append("hot")

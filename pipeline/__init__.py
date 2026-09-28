@@ -11,6 +11,7 @@ import httpx
 import numpy as np
 from numpy.typing import NDArray
 
+from clients.tui.src.hn_rerank.models import View, Window
 from database import Database, FeedbackRecord, Story, StoryIdentityConflict, coerce_int
 
 # ruff: noqa: F401 — re-exports for the public pipeline namespace.
@@ -31,13 +32,9 @@ from .config import (
 
 from .ranking import (
     COMMENT_DEPTH_PENALTY,
-    DASHBOARD_QUEUE_SIZE,
     EXPLORE_PER_BADGE,
-    EXPLORE_PER_BADGE_NONHN,
     Embedder,
     HOT_MIN_SCORE,
-    POPULAR_PER_COMBO,
-    PRIMARY_PER_COMBO,
     RankScoreContext,
     RankTrace,
     RankedComment,
@@ -49,6 +46,10 @@ from .ranking import (
     TOP_COMMENT_REPLIES_PER_CORE_THREAD,
     TOP_COMMENT_TOP_LEVEL_BUDGET,
     NULL_TRACE,
+    VIEW_SIZE,
+    WINDOW_SECONDS,
+    WindowDeck,
+    WindowViews,
     GOOD_TOPLEVEL_MIN_LEN,
     GOOD_TOPLEVEL_MIN_REPLIES,
     _LOG_TEXTLEN_SCALE,
@@ -58,7 +59,6 @@ from .ranking import (
     _MODEL_SCHEMA_VERSION,
     _NullTrace,
     _SIM_CHUNK_SIZE,
-    _assemble_combo_deck,
     _chunked_max_dot,
     _comment_rank_key,
     _extract_comments_recursive,
@@ -76,9 +76,12 @@ from .ranking import (
     _softmax_rows,
     _svm_personalization_features,
     _topk_mean,
+    assemble_window_deck,
     clean_text,
     compose_story_text,
     get_or_compute_embeddings,
+    hn_gravity,
+    in_window,
     join_top_comments,
     mmr_filter,
     rerank_candidates,
@@ -112,6 +115,7 @@ from .hn_dupes import (
     _load_feedback_context,
     _matches_feedback,
     build_feedback_context,
+    canonical_outcomes,
     canonicalize_hn_dupes,
 )
 from .candidate_cache import (
@@ -128,9 +132,6 @@ from reddit_feed_cache import cache as reddit_feed_cache
 from reddit_limiter import limiter as reddit_limiter
 
 
-COLD_DECK_LIMIT = 100
-
-
 @dataclass(frozen=True)
 class RedditRefreshResult:
     feeds: int
@@ -143,23 +144,13 @@ class RedditRefreshResult:
         return self.changed_stories > 0 or self.hydrated_stories > 0
 
 
-def _combo_keys_for_story(story: Story, recent_cutoff: int) -> str:
-    age = "recent" if story.time >= recent_cutoff else "archive"
-    source = "hn" if is_hn_source(story.source) else "non-hn"
-    return f"{age}_{source} {age}_mixed"
-
-
 def cold_ranked_candidates(candidates: list[Story], now_ts: int) -> list[RankedStory]:
-    """Production zero-feedback scores and browser eligibility before selection."""
-    recent_cutoff = now_ts - 30 * 86400
+    """Production zero-feedback scores: HN gravity."""
     return [
         RankedStory(
             story=story,
-            score=story.score / ((now_ts - story.time) / 3600.0 + 2.0) ** 1.8,
+            score=hn_gravity(story.score, story.time, now_ts),
             best_match_title="",
-            is_non_hn=(not is_hn_source(story.source)),
-            is_recent=(story.time >= recent_cutoff),
-            combo_keys=_combo_keys_for_story(story, recent_cutoff),
         )
         for story in candidates
     ]
@@ -173,21 +164,16 @@ def build_cold_deck(
     trace: RankTrace | _NullTrace = NULL_TRACE,
     *,
     candidates: list[Story] | None = None,
-) -> list[RankedStory]:
-    """Build a gravity-sorted, badge-annotated fallback deck — no embeddings,
-    no personalization.
+) -> WindowDeck:
+    """The non-personalized deck: gravity-scored window views, no
+    embeddings.
 
     Uses the same tier-1 gravity formula as ``_score_and_rank`` so a
-    zero-vote user sees the same ranking as the cold deck.  See
-    ``fast_rerank_for_user`` for the 0-vote short-circuit.
-
-    Reuses the same production candidate legs as the
-    personalized dashboard via ``load_production_candidate_stories``, and
-    the same non-personalized Popular badge assembly (Hot/Top/Talk) as
-    ``rerank_candidates`` via ``_assemble_combo_deck``, so cold-start decks
-    have Popular and Archive combos populated instead of being flat
-    recent-only cards. Explore (Unsure/Novel/Similar) is intentionally
-    skipped — it's personalized and requires feedback to compute against.
+    zero-vote user sees the same ranking as the cold deck (see
+    ``fast_rerank_for_user``'s 0-vote short-circuit), over the same
+    production candidate legs (``load_production_candidate_stories``), and
+    the same window picks as ``rerank_candidates``, less Explore: it is
+    personalized and needs feedback to compute against.
 
     When *user_id* is provided, already-voted stories are excluded.
 
@@ -218,29 +204,64 @@ def build_cold_deck(
                 trace=trace,
             )
     if not candidates:
-        return []
-
-    recent_cutoff = now_ts - (30 * 86400)
-    ranked = cold_ranked_candidates(candidates, now_ts)
-
-    cand_scores = np.array([story.score for story in candidates])
-    cand_velocities = np.array(
-        [story.score / max((now_ts - story.time) / 3600.0, 0.1) for story in candidates]
-    )
-    story_id_to_idx = {story.id: idx for idx, story in enumerate(candidates)}
-
-    cold = _assemble_combo_deck(
-        ranked,
+        return WindowDeck()
+    return assemble_window_deck(
+        cold_ranked_candidates(candidates, now_ts),
         config=config,
-        recent_cutoff=recent_cutoff,
-        cand_scores=cand_scores,
-        cand_velocities=cand_velocities,
-        idx_for=story_id_to_idx.__getitem__,
-        embeddings_map=None,
-        explore=None,
+        now=now_ts,
         trace=trace,
     )
-    return cold[:COLD_DECK_LIMIT]
+
+
+def canonicalize_deck(
+    deck: WindowDeck,
+    db: Database,
+    *,
+    candidate_stories: Sequence[Story] = (),
+    user_id: int | None = None,
+    feedback_actions: tuple[str, ...] = ("up", "neutral"),
+    trace: RankTrace | _NullTrace = NULL_TRACE,
+    feedback_context: FeedbackDupeContext | None = None,
+    now: float | None = None,
+) -> WindowDeck:
+    """``canonicalize_hn_dupes`` over every story of *deck* at once (score
+    order decides which of two duplicates stays), applied to each view. A
+    canonical story that falls outside a view's window leaves that view;
+    Popular is re-sorted by gravity since its stories may have changed."""
+    now = time.time() if now is None else now
+    stories = deck.stories()
+    outcomes = canonical_outcomes(
+        stories,
+        db,
+        candidate_stories=candidate_stories,
+        user_id=user_id,
+        feedback_actions=feedback_actions,
+        trace=trace,
+        feedback_context=feedback_context,
+    )
+    outcome_of = {r.story.id: out for r, out in zip(stories, outcomes)}
+
+    def remap(
+        window: Window, view: View, items: tuple[RankedStory, ...]
+    ) -> list[RankedStory]:
+        kept: list[RankedStory] = []
+        for r in items:
+            out = outcome_of.get(r.story.id)
+            if out is None:
+                continue
+            if out.story.id != r.story.id and not in_window(
+                out.story.time, window, now
+            ):
+                continue
+            kept.append(replace(r, story=out.story))
+        if view == "popular":
+            kept.sort(
+                key=lambda r: hn_gravity(r.story.score, r.story.time, now),
+                reverse=True,
+            )
+        return kept
+
+    return deck.map_views(remap)
 
 
 def load_production_candidate_stories(
@@ -766,8 +787,9 @@ def fast_rerank_for_user(
     embedder: Embedder,
     user_id: int,
     trace: RankTrace | _NullTrace = NULL_TRACE,
-) -> list[RankedStory]:
-    """Fast rerank for a specific user. Called on each dashboard request."""
+) -> WindowDeck:
+    """This user's deck: every window's views, deduplicated. Run by the
+    server's per-user warm."""
     trace.set_count("user_id", user_id)
 
     # One feedback snapshot serves every stage of this rank: the cold-deck
@@ -781,33 +803,27 @@ def fast_rerank_for_user(
         # Zero-feedback cold deck is a pure gravity/time ranking — no
         # embeddings needed, so don't force the (embedder-requiring)
         # candidate pool cache here; keep the direct, uncached load.
-        cold_deck = build_cold_deck(db, config, trace=trace)
-        cold_final = canonicalize_hn_dupes(
-            cold_deck,
+        cold_final = canonicalize_deck(
+            build_cold_deck(db, config, trace=trace),
             db,
-            selected_limit=config.count,
             user_id=user_id,
             feedback_actions=tuple(config.model.dedup_exclude_actions),
             trace=trace,
         )
-        trace.set_count(
-            "deck_nonhn_final",
-            sum(1 for r in cold_final if not is_hn_source(r.story.source)),
-        )
+        _count_nonhn(trace, "deck_nonhn_final", cold_final)
         return cold_final
 
     with trace.stage("candidate_sql"):
         pool = get_candidate_pool(db, config, embedder, trace=trace)
         voted_ids = frozenset(f.story_id for f in feedback)
     if not pool.stories:
-        return []
+        return WindowDeck()
 
     with trace.stage("candidate_embedding"):
         candidates, cand_embeddings = pool.without_feedback(voted_ids)
-    if trace is not None:
-        trace.set_count("candidates", len(candidates))
+    trace.set_count("candidates", len(candidates))
     if not candidates:
-        return []
+        return WindowDeck()
 
     # Built once per request and threaded into badge assembly so the
     # Explore passes (Unsure/Novel/Similar) can skip-and-backfill past
@@ -817,7 +833,7 @@ def fast_rerank_for_user(
     feedback_context = build_feedback_context(
         feedback, tuple(config.model.dedup_exclude_actions)
     )
-    ranked = rerank_candidates(
+    deck = rerank_candidates(
         db=db,
         config=config,
         embedder=embedder,
@@ -827,13 +843,10 @@ def fast_rerank_for_user(
         trace=trace,
         is_feedback_match=lambda s: _matches_feedback(s, feedback_context),
     )
-    trace.set_count(
-        "deck_nonhn_pre_dedup",
-        sum(1 for r in ranked if not is_hn_source(r.story.source)),
-    )
+    _count_nonhn(trace, "deck_nonhn_pre_dedup", deck)
 
     return finalize_ranked_deck(
-        ranked,
+        deck,
         candidates,
         cand_embeddings,
         db,
@@ -846,8 +859,14 @@ def fast_rerank_for_user(
     )
 
 
+def _count_nonhn(trace: RankTrace | _NullTrace, name: str, deck: WindowDeck) -> None:
+    trace.set_count(
+        name, sum(1 for r in deck.stories() if not is_hn_source(r.story.source))
+    )
+
+
 def finalize_ranked_deck(
-    ranked: list[RankedStory],
+    deck: WindowDeck,
     candidates: list[Story],
     cand_embeddings: NDArray[np.float32],
     db: Database,
@@ -858,8 +877,9 @@ def finalize_ranked_deck(
     trace: RankTrace | _NullTrace = NULL_TRACE,
     feedback: list[FeedbackRecord] | None = None,
     feedback_context: FeedbackDupeContext | None = None,
-) -> list[RankedStory]:
-    """Shared serving/evaluation deduplication and canonicalization boundary.
+) -> WindowDeck:
+    """Shared serving/evaluation deduplication and canonicalization boundary:
+    both run once over every story of the deck, and apply to each view.
 
     *feedback* / *feedback_context* are this user's feedback (and its
     dedup index for ``config.model.dedup_exclude_actions``) when the caller
@@ -869,34 +889,33 @@ def finalize_ranked_deck(
         id_to_emb: dict[int, NDArray[np.float32]] = {
             s.id: vec for s, vec in zip(candidates, cand_embeddings)
         }
-        deduped = _apply_dedup_to_ranked(
-            ranked,
-            db,
-            config,
-            user_id,
-            embeddings=id_to_emb,
-            embedder=embedder,
-            feedback=feedback,
+        survivors = {
+            r.story.id
+            for r in _apply_dedup_to_ranked(
+                deck.stories(),
+                db,
+                config,
+                user_id,
+                embeddings=id_to_emb,
+                embedder=embedder,
+                feedback=feedback,
+            )
+        }
+        deduped = deck.map_views(
+            lambda _w, _v, items: (r for r in items if r.story.id in survivors)
         )
-    trace.set_count(
-        "deck_nonhn_post_dedup",
-        sum(1 for r in deduped if not is_hn_source(r.story.source)),
-    )
+    _count_nonhn(trace, "deck_nonhn_post_dedup", deduped)
     with trace.stage("hn_dupes"):
-        final = canonicalize_hn_dupes(
+        final = canonicalize_deck(
             deduped,
             db,
             candidate_stories=candidates,
-            selected_limit=config.count,
             user_id=user_id,
             feedback_actions=tuple(config.model.dedup_exclude_actions),
             trace=trace,
             feedback_context=feedback_context,
         )
-    trace.set_count(
-        "deck_nonhn_final",
-        sum(1 for r in final if not is_hn_source(r.story.source)),
-    )
+    _count_nonhn(trace, "deck_nonhn_final", final)
     return final
 
 

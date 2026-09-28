@@ -204,10 +204,13 @@ def test_tldr_markdown_output_only_contains_safe_markup(docs: list[str]) -> None
 
 _CLIENT_FUNCTIONS = (
     "parseFeed",
+    "feedPath",
     "viewKey",
     "viewOrder",
     "restoreStory",
+    "showFeed",
     "setFeed",
+    "prefetchWindows",
     "render",
     "activeCard",
     "setActive",
@@ -215,6 +218,7 @@ _CLIENT_FUNCTIONS = (
     "updateStatus",
     "setFilter",
     "cycleSort",
+    "cycleWindow",
     "tintByRank",
     "feedCard",
     "routePrefix",
@@ -266,7 +270,7 @@ const document = {
 const window = { location: { pathname: '/' }, setTimeout, clearTimeout,
                  sessionStorage: { getItem: () => 'session', setItem() {} } };
 const voteBar = el('div'), sidePanel = el('aside');
-const sortTabs = [], ageTabs = [];
+const sortTabs = [], windowSelect = null;
 const toasts = [];
 function showToast(message, variant) { toasts.push(variant + ': ' + message); }
 function showSummary() {}
@@ -296,17 +300,16 @@ const fail = async path => {
 };
 function story(id, extra = {}) {
   return { id, title: `Story ${id}`, article_url: '', comments_url: '', source: 'hn', points: 1,
-           comments: 0, time: 1000 + id, rank_score: 100 - id, memberships: ['recent_hn', 'recent_mixed'],
-           popular: false, explore: true, badges: [], badge_details: [], best_match_title: '',
-           source_label: 'HN', domain: '', enriched: false, ...extra };
+           comments: 0, time: 1000 + id, rank_score: 100 - id, badges: [], badge_details: [],
+           best_match_title: '', source_label: 'HN', domain: '', enriched: false, ...extra };
 }
 function makeFeed(ids, extra = {}) {
-  const orders = { 'recommended:recent': ids.slice(), 'date:recent': ids.slice().reverse(),
-                   'explore:recent': ids.slice() };
-  return { api_version: 1, stories: ids.map(id => story(id)), orders,
+  const orders = { recommended: ids.slice(), popular: ids.slice().reverse(), explore: ids.slice() };
+  return { api_version: 2, window: '1w', stories: ids.map(id => story(id)), orders,
            feedback_counts: { up: 0, neutral: 0, down: 0 }, version: 5, target_version: 5,
            ready: true, ...extra };
 }
+const FEED = '/api/feed?window=';
 const state = () => ({ active: activeId, visible: visible.map(s => s.id), rated: [...rated],
                        ready: feed.ready, target: feed.target_version,
                        counts: ['up', 'neutral', 'down'].map(a => Number(counts[a].textContent)) });
@@ -381,7 +384,7 @@ def test_undo_puts_the_story_back_where_the_server_ranks_it() -> None:
     await answer('/api/feedback', 200, { ok: true, target_version: 6 });
     // A reload whose (stale) deck no longer has story 2.
     reload();
-    await answer('/api/feed', 200, makeFeed([1, 3, 4], { version: 5, target_version: 6, ready: false }));
+    await answer(FEED + '1w', 200, makeFeed([1, 3, 4], { version: 5, target_version: 6, ready: false }));
     const reloaded = state();
     undo();
     await flush();
@@ -421,7 +424,7 @@ def test_poller_reloads_only_for_a_newer_deck(
     await answer('/api/ranking-ready', 200,
                  {{ ok: true, ready: {str(answer_ready).lower()}, current_version: {current} }});
     await poll;
-    console.log(JSON.stringify({{ asked, reloading: pending('/api/feed').length }}));
+    console.log(JSON.stringify({{ asked, reloading: pending(FEED + '1w').length }}));
     """)
     wanted = 5 if ready else 7
     assert result["asked"] == [f"/api/ranking-ready?min_version={wanted}"]
@@ -478,20 +481,20 @@ def test_views_cap_backfill_start_at_the_head_and_keep_the_explore_order() -> No
     move(3);                                  // on story 4
     vote('up');
     const backfilled = { active: activeId, visible: visible.map(s => s.id) };
-    setFilter('sort', 'date');
-    const date = { active: activeId, first: visible[0].id };
+    setFilter('sort', 'popular');
+    const popular = { active: activeId, first: visible[0].id };
     setFilter('sort', 'explore');
-    const explore = viewOrder('explore:recent');
+    const explore = viewOrder('1w:explore');
     reload();
-    await answer('/api/feed', 200, makeFeed(ids.concat([21]), { version: 6, target_version: 6 }));
-    const exploreAfter = viewOrder('explore:recent');
-    console.log(JSON.stringify({ capped, backfilled, date, explore, exploreAfter }));
+    await answer(FEED + '1w', 200, makeFeed(ids.concat([21]), { version: 6, target_version: 6 }));
+    const exploreAfter = viewOrder('1w:explore');
+    console.log(JSON.stringify({ capped, backfilled, popular, explore, exploreAfter }));
     """)
     assert result["capped"] == list(range(1, 13))
     assert result["backfilled"]["active"] == 5
     assert result["backfilled"]["visible"] == [1, 2, 3, *range(5, 14)]
     # A new view starts at its first story.
-    assert result["date"] == {"active": 20, "first": 20}
+    assert result["popular"] == {"active": 20, "first": 20}
     # Explore keeps placed stories where they were; new ones go after.
     assert sorted(result["explore"]) == list(range(1, 21))
     assert result["exploreAfter"] == [*result["explore"], 21]
@@ -511,7 +514,7 @@ def test_cards_are_built_from_text_only() -> None:
 
 def test_keys_match_the_terminal_client() -> None:
     """The key map runs the same actions as the TUI's bindings (plus the
-    web-only a and f)."""
+    web-only f)."""
     script = _inline_script()
     start = script.index("    const KEY_ACTIONS = {")
     keymap = script[start : script.index("    };\n", start) + len("    };\n")]
@@ -521,9 +524,8 @@ const done = [];
 const record = name => (...args) => done.push([name, ...args]);
 const move = record('move'), vote = record('vote'), undo = record('undo');
 const openStoryUrl = record('open'), copyLink = record('copy'), reload = record('reload');
-const cycleSort = record('sort'), setFilter = record('filter'), showHelp = record('help');
+const cycleSort = record('sort'), cycleWindow = record('window'), showHelp = record('help');
 const togglePanel = record('fullscreen');
-let currentAge = 'recent';
 const sidePanel = { classList: { toggle: () => done.push(['panel']) } };
 """
         + keymap
@@ -547,8 +549,119 @@ console.log(JSON.stringify(out));
         "s": ["sort", 1],
         "l": ["sort", 1],
         "h": ["sort", -1],
-        "a": ["filter", "age", "archive"],
+        "d": ["window", 1],
         "b": ["panel"],
         "?": ["help"],
         "f": ["fullscreen"],
     }
+
+
+def test_window_switch_uses_the_cache_and_prefetches_neighbours_once_per_version() -> (
+    None
+):
+    result = _client_harness(r"""
+    setFeed(makeFeed([1, 2, 3]));
+    await flush();
+    // One background request at a time: 1w's neighbours, 1m then 1d.
+    const firstAsk = pending(FEED).map(c => c.url);
+    await answer(FEED + '1m', 200, makeFeed([4, 5], { window: '1m' }));
+    const secondAsk = pending(FEED).map(c => c.url);
+    await answer(FEED + '1d', 200, makeFeed([6], { window: '1d' }));
+    const idle = pending(FEED).length;
+    // A cached window shows at once, from its first story, without asking.
+    setFilter('window', '1m');
+    const shown = { window: currentWindow, visible: visible.map(s => s.id), active: activeId };
+    // ... and its own missing neighbour (archive) is fetched in the background.
+    const thirdAsk = pending(FEED).map(c => c.url);
+    // Back to 1w, then 1m again: nothing refetched for this version.
+    setFilter('window', '1w');
+    setFilter('window', '1m');
+    const noRefetch = pending(FEED).map(c => c.url);
+    console.log(JSON.stringify({ firstAsk, secondAsk, idle, shown, thirdAsk, noRefetch,
+                                 feedWindow: feed.window }));
+    """)
+    assert result["firstAsk"] == ["/api/feed?window=1m"]
+    assert result["secondAsk"] == ["/api/feed?window=1d"]
+    assert result["idle"] == 0
+    assert result["shown"] == {"window": "1m", "visible": [4, 5], "active": 4}
+    assert result["thirdAsk"] == ["/api/feed?window=archive"]
+    assert result["noRefetch"] == ["/api/feed?window=archive"]
+    assert result["feedWindow"] == "1m"
+
+
+def test_an_uncached_window_loads_in_front_and_a_late_prefetch_never_replaces_it() -> (
+    None
+):
+    result = _client_harness(r"""
+    setFeed(makeFeed([1, 2, 3]));
+    await flush();                             // background: 1m in flight
+    setFilter('window', '1m');                 // not cached yet: load it in front
+    const loading = { visible: visible.map(s => s.id), status: queueLoadingEl.textContent,
+                      asks: pending(FEED).map(c => c.url) };
+    // The background answer lands first: dropped, the window is still loading.
+    await answer(FEED + '1m', 200, makeFeed([7], { window: '1m' }));
+    const afterLate = { visible: visible.map(s => s.id), loading: Boolean(feed.loading) };
+    await answer(FEED + '1m', 200, makeFeed([4, 5], { window: '1m' }));
+    console.log(JSON.stringify({ loading, afterLate, end: state(), window: feed.window }));
+    """)
+    assert result["loading"]["visible"] == []
+    assert result["loading"]["status"] == "Loading more stories…"
+    assert result["loading"]["asks"] == ["/api/feed?window=1m"] * 2
+    assert result["afterLate"] == {"visible": [], "loading": True}
+    assert result["end"]["visible"] == [4, 5] and result["window"] == "1m"
+
+
+def test_a_vote_or_a_newer_deck_drops_background_windows_from_before_it() -> None:
+    result = _client_harness(r"""
+    setFeed(makeFeed([1, 2, 3]));
+    await flush();                             // background: 1m in flight
+    vote('up');                                // story 1
+    await flush();
+    await answer('/api/feedback', 200, { ok: true, target_version: 7 });
+    // The 1m answer was asked before the vote was saved: dropped.
+    await answer(FEED + '1m', 200, makeFeed([1, 4], { window: '1m' }));
+    const afterVote = { cached: [...feeds.keys()], ready: feed.ready, target: feed.target_version };
+    // The poller's reranked deck (a newer version) replaces every window.
+    const oldAsk = pending(FEED).map(c => c.url);   // the next neighbour, still version 5
+    reload();
+    await answer(FEED + '1w', 200, makeFeed([2, 3], { version: 7, target_version: 7 }));
+    // An answer for an older version never comes back into the cache.
+    await answer(FEED + '1d', 200, makeFeed([9], { window: '1d', version: 5, target_version: 5 }));
+    const newAsk = pending(FEED).map(c => c.url);   // neighbours again, for version 7
+    await answer(FEED + '1m', 200, makeFeed([4], { window: '1m', version: 7, target_version: 7 }));
+    console.log(JSON.stringify({ afterVote, oldAsk, newAsk, cached: [...feeds.keys()].sort(),
+                                 end: state() }));
+    """)
+    assert result["afterVote"] == {"cached": ["1w"], "ready": False, "target": 7}
+    assert result["oldAsk"] == ["/api/feed?window=1d"]
+    assert result["newAsk"] == ["/api/feed?window=1m"]
+    assert result["cached"] == ["1m", "1w"]
+    assert result["end"]["visible"] == [2, 3] and result["end"]["ready"] is True
+
+
+def test_votes_and_undo_follow_a_story_across_windows() -> None:
+    result = _client_harness(r"""
+    setFeed(makeFeed([1, 2, 3]));
+    await flush();
+    await answer(FEED + '1m', 200, makeFeed([2, 4], { window: '1m' }));
+    await answer(FEED + '1d', 200, makeFeed([5], { window: '1d' }));
+    move(1);                                   // story 2, in 1w and 1m
+    vote('up');
+    vote('down');                              // story 3, right after
+    setFilter('window', '1m');
+    const inMonth = visible.map(s => s.id);    // voted stories are hidden everywhere
+    undo();                                    // story 3 (voted in 1w) comes back there
+    undo();                                    // story 2 comes back in 1m too
+    const undone = visible.map(s => s.id);
+    setFilter('window', '1w');
+    const inWeek = visible.map(s => s.id);
+    await flush();
+    const sent = calls.filter(c => c.url.includes('/api/feedback')).map(c => c.body);
+    console.log(JSON.stringify({ inMonth, undone, inWeek, sent, counts: state().counts }));
+    """)
+    assert result["inMonth"] == [4]
+    assert result["undone"] == [2, 4]
+    assert result["inWeek"] == [1, 2, 3]
+    assert result["counts"] == [0, 0, 0]
+    # Sent one at a time in the order made; the first is still in flight.
+    assert result["sent"] == [{"story_id": 2, "action": "up"}]

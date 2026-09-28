@@ -7,7 +7,6 @@ import numpy as np
 import pytest
 import re
 import time
-from collections.abc import Callable
 from email.utils import formatdate
 from numpy.typing import NDArray
 from pathlib import Path
@@ -53,8 +52,21 @@ from pipeline import (
     fast_rerank_for_user,
     HOT_MIN_SCORE,
 )
-from pipeline.ranking import PrecomputedRbfSVC
+from pipeline.ranking import (
+    EXPLORE_PER_BADGE,
+    SELECT_MARGIN,
+    VIEW_SIZE,
+    PrecomputedRbfSVC,
+    WindowDeck,
+    WindowViews,
+    serve_window,
+)
 from pipeline.hn_dupes import HnDupeResolver
+from clients.tui.src.hn_rerank.models import WINDOWS, Window
+
+# Recommended picks kept per window before serving caps them at VIEW_SIZE:
+# a test that wants stories in Explore must push them past these.
+RECOMMENDED_PICKS = VIEW_SIZE * SELECT_MARGIN
 
 
 @pytest.fixture
@@ -64,113 +76,23 @@ def db():
     db_instance.close()
 
 
-def _feed_ranked(
-    story_id: int,
-    score: float,
-    *,
-    time: int | None = None,
-    combo_keys: str = "recent_hn recent_mixed",
-    **flags: bool,
-) -> RankedStory:
-    story = Story(
-        id=story_id,
-        title=f"Story {story_id}",
-        url=None,
-        score=10,
-        time=1600000000 + story_id if time is None else time,
-        text_content="",
-        source="hn",
-    )
-    return RankedStory(
-        story=story,
-        score=score,
-        best_match_title="",
-        combo_keys=combo_keys,
-        **flags,
+def _served(
+    deck: WindowDeck, window: Window = "1w", now: float | None = None
+) -> WindowViews:
+    """One window of *deck* as a user is served it at *now*."""
+    return serve_window(
+        deck.window(window), window, time.time() if now is None else now
     )
 
 
-def test_feed_caps_recommended_and_drops_unused_cards() -> None:
-    """Recommended carries at most RECOMMENDED_LIMIT per age (top by score);
-    cards in no view never reach the client, badge cards stay, and Date
-    lists every sent card newest first."""
-    from pipeline import render
-
-    limit = render.RECOMMENDED_LIMIT
-    items = [_feed_ranked(i, 100.0 - i) for i in range(limit + 5)]
-    items.append(_feed_ranked(999, -1.0, is_high_engagement=True))
-    cards = render._build_dashboard_cards(items, hot_badge_percentile=99)
-    feed = render.prepare_feed(cards, {}, 1, 1)
-
-    top_ids = set(range(limit))
-    assert set(feed.orders["recommended:recent"]) == top_ids
-    assert feed.orders["popular:recent"] == [999]
-    assert {s.id for s in feed.stories} == top_ids | {999}
-    assert feed.orders["date:recent"] == sorted(top_ids | {999}, reverse=True)
-    assert feed.orders["date:archive"] == feed.orders["date:recent"]
+def _served_by_id(deck: WindowDeck, window: Window = "1w") -> dict[int, RankedStory]:
+    """The served cards of one window, badges merged across its views."""
+    return {r.story.id: r for r in _served(deck, window).stories()}
 
 
-def test_date_view_puts_a_fresh_low_score_popular_story_first() -> None:
-    """Regression: an hour-old Popular story with a low model score was
-    missing from Date (then the top model scores of the week). Date is now
-    the deck newest first, so it leads."""
-    from pipeline import render
-
-    now = 1_700_000_000
-    items = [_feed_ranked(i, 100.0 - i, time=now - 86400 - i * 3600) for i in range(30)]
-    items.append(_feed_ranked(500, -5.0, time=now - 3600, is_hot=True))
-    cards = render._build_dashboard_cards(items, hot_badge_percentile=99)
-    feed = render.prepare_feed(cards, {}, 1, 1)
-    assert feed.orders["date:recent"][0] == 500
-
-
-@settings(max_examples=60, deadline=None)
-@given(
-    stories=st.lists(
-        st.tuples(
-            st.integers(0, 60 * 86400),  # age in seconds
-            st.floats(-5, 5, allow_nan=False),  # model score
-            st.sampled_from(["recent", "archive"]),
-            st.booleans(),  # popular
-            st.booleans(),  # explore
-        ),
-        max_size=60,
-    )
-)
-def test_date_view_is_every_other_view_newest_first(
-    stories: list[tuple[int, float, str, bool, bool]],
-) -> None:
-    """Date = the union of Recommended, Popular and Explore over both ages,
-    newest first, identical under either Age tab."""
-    from pipeline import render
-
-    now = 1_700_000_000
-    items = [
-        _feed_ranked(
-            i + 1,
-            score,
-            time=now - age,
-            combo_keys=f"{cohort}_hn {cohort}_mixed",
-            is_hot=popular,
-            is_novel=explore,
-        )
-        for i, (age, score, cohort, popular, explore) in enumerate(stories)
-    ]
-    cards = render._build_dashboard_cards(items, hot_badge_percentile=99)
-    feed = render.prepare_feed(cards, {}, 1, 1)
-    times = {s.id: s.time for s in feed.stories}
-    in_views = {
-        sid
-        for key, order in feed.orders.items()
-        if not key.startswith("date:")
-        for sid in order
-    }
-    dated = feed.orders["date:recent"]
-    assert set(dated) == in_views == set(times)
-    assert [times[sid] for sid in dated] == sorted(
-        (times[sid] for sid in dated), reverse=True
-    )
-    assert feed.orders["date:archive"] == dated
+def _one_card_deck(item: RankedStory, window: Window = "1w") -> WindowDeck:
+    """A deck with *item* as the only Recommended card of *window*."""
+    return WindowDeck({window: WindowViews(recommended=(item,))})
 
 
 def test_dashboard_polish_renders_domain_legend_and_queue_status(
@@ -202,12 +124,14 @@ def test_dashboard_polish_renders_domain_legend_and_queue_status(
         title="Polish render probe",
         url="https://www.example.com/some-article",
         score=100,
-        time=1600000000,
+        time=int(time.time()) - 3600,
         text_content="",
     )
     db.upsert_story(story)
     html = render.generate_dashboard_bytes(
-        [ranking.RankedStory(story=story, score=1.0, best_match_title="")],
+        _one_card_deck(
+            ranking.RankedStory(story=story, score=1.0, best_match_title="")
+        ),
         Config(),
         db,
     ).decode("utf-8")
@@ -409,7 +333,7 @@ def _cold_story(
 
 
 def test_build_cold_deck_empty_db(db: Database) -> None:
-    assert pipeline.build_cold_deck(db, Config()) == []
+    assert pipeline.build_cold_deck(db, Config()).is_empty()
 
 
 def test_build_cold_deck_score_order_and_summarizable_filter(
@@ -431,14 +355,15 @@ def test_build_cold_deck_score_order_and_summarizable_filter(
 
     cold = pipeline.build_cold_deck(db, Config())
 
-    assert [item.story.id for item in cold] == [3, 2]
+    recommended = cold.window("1w").recommended
+    assert [item.story.id for item in recommended] == [3, 2]
     gravity_div = 3.0**1.8
-    assert [item.score for item in cold] == pytest.approx(
+    assert [item.score for item in recommended] == pytest.approx(
         [100.0 / gravity_div, 10.0 / gravity_div]
     )
 
 
-def test_build_cold_deck_combo_keys_and_flags(
+def test_build_cold_deck_places_stories_in_their_windows(
     db: Database, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     now = 2_000_000_000
@@ -466,17 +391,21 @@ def test_build_cold_deck_combo_keys_and_flags(
     # recent_non_hn's source, so the RSS leg actually picks it up.
     config = Config(rss=RssConfig(feeds=("https://rss.blog",)))
     cold = pipeline.build_cold_deck(db, config)
-    by_id = {item.story.id: item for item in cold}
 
-    assert by_id[1].combo_keys == "recent_hn recent_mixed"
-    assert by_id[1].is_recent is True
-    assert by_id[1].is_non_hn is False
-    assert by_id[2].combo_keys == "archive_hn archive_mixed"
-    assert by_id[2].is_recent is False
-    assert by_id[2].is_non_hn is False
-    assert by_id[3].combo_keys == "recent_non-hn recent_mixed"
-    assert by_id[3].is_recent is True
-    assert by_id[3].is_non_hn is True
+    # Cold start: all five windows, from gravity, and no Explore.
+    assert set(cold.windows) == set(WINDOWS)
+    for window in WINDOWS:
+        views = cold.window(window)
+        recommended = {r.story.id for r in views.recommended}
+        popular = {r.story.id for r in views.popular}
+        assert views.explore == ()
+        if window == "archive":
+            # Only the 31-day-old seed story; Popular is HN sources only,
+            # and the BQ seed counts as HN.
+            assert recommended == popular == {2}
+        else:
+            assert recommended == {1, 3}
+            assert popular == {1}  # the RSS story is not Popular
 
 
 def test_build_cold_deck_computes_popular_badges_but_not_explore(
@@ -487,7 +416,9 @@ def test_build_cold_deck_computes_popular_badges_but_not_explore(
     (no feedback to compute it against) — see build_cold_deck docstring."""
     db.upsert_story(_cold_story(1, score=100, time_ts=int(time.time()) - 3600))
 
-    item = pipeline.build_cold_deck(db, Config())[0]
+    views = pipeline.build_cold_deck(db, Config()).window("1w")
+    assert views.explore == ()
+    [item] = views.stories()
 
     assert item.best_match_title == ""
     assert item.prob_down is None
@@ -498,8 +429,9 @@ def test_build_cold_deck_computes_popular_badges_but_not_explore(
     assert item.is_novel is False
     assert item.is_similar is False
     # Popular badges are non-personalized; the sole HN candidate is both
-    # highest-scoring and highest-velocity, so it earns Hot.
+    # highest-scoring and highest-velocity, so it earns Hot (and only Hot).
     assert item.is_hot is True
+    assert not (item.is_high_engagement or item.is_discussion_rich)
 
 
 class _HashEmbedder(Embedder):
@@ -1651,43 +1583,6 @@ def test_mmr_output_matches_cluster_survivor_oracle(
     assert all(fid in input_ids for fid in filtered_ids)
 
 
-def test_rerank_candidates_mmr_config_switch(db, embedder, monkeypatch):
-    candidates = [
-        Story(id=i, title=f"S{i}", url=None, score=10 - i, time=0, text_content=f"s{i}")
-        for i in range(3)
-    ]
-    embeddings = np.eye(3, 384, dtype=np.float32)
-
-    def fail_mmr(*args, **kwargs):
-        raise AssertionError("mmr_filter should not be called when enable_mmr=false")
-
-    monkeypatch.setattr(pipeline.ranking, "mmr_filter", fail_mmr)
-    rerank_candidates(
-        db=db,
-        config=Config(count=3, model=ModelConfig(enable_mmr=False)),
-        embedder=embedder,
-        candidates=candidates,
-        cand_embeddings=embeddings,
-    )
-
-    called = False
-
-    def mark_mmr(ranked, embeddings_map, threshold, limit):
-        nonlocal called
-        called = True
-        return ranked[:limit]
-
-    monkeypatch.setattr(pipeline.ranking, "mmr_filter", mark_mmr)
-    rerank_candidates(
-        db=db,
-        config=Config(count=3, model=ModelConfig(enable_mmr=True)),
-        embedder=embedder,
-        candidates=candidates,
-        cand_embeddings=embeddings,
-    )
-    assert called
-
-
 def test_personalization_and_diversity_config_defaults() -> None:
     """Pins the production defaults specs/ranking-feedback.allium's config
     block asserts (min_up/down_votes_for_personalization,
@@ -1704,13 +1599,10 @@ def test_personalization_and_diversity_config_defaults() -> None:
     assert defaults.diversity_threshold == 0.75
 
 
-def test_no_duplicate_story_within_segment_when_badge_and_primary_overlap(
-    db, embedder
-) -> None:
-    """A story that qualifies for both a primary/Popular badge slot and an
-    Explore badge (Novel/Similar) within the same (age, source) segment must
-    appear as a single card with both properties reflected, not as two cards.
-    Spec invariant: OneCardPerStoryPerSegment in specs/ranking-feedback.allium.
+def test_one_card_per_story_per_window_when_views_overlap(db, embedder) -> None:
+    """A story in both Recommended and Popular of a window is sent as one
+    card carrying the Popular badge, not as two cards. Spec invariant:
+    OneCardPerStoryPerWindow in specs/ranking-feedback.allium.
     """
     now = int(time.time())
     candidates = [
@@ -1740,17 +1632,17 @@ def test_no_duplicate_story_within_segment_when_badge_and_primary_overlap(
     cand_embs = embedder.encode([s.text_content for s in candidates])
 
     config = Config(count=40, model=ModelConfig(hot_badge_percentile=50.0))
-    ranked = rerank_candidates(db, config, embedder, candidates, cand_embs)
+    deck = rerank_candidates(db, config, embedder, candidates, cand_embs)
 
-    recent_hn_cards = [r for r in ranked if "recent_hn" in r.combo_keys]
-    ids = [r.story.id for r in recent_hn_cards]
-    assert len(ids) == len(set(ids)), (
-        f"story id(s) appear more than once within the recent_hn segment: {ids}"
-    )
-
-    zero_cards = [r for r in recent_hn_cards if r.story.id == 0]
-    assert len(zero_cards) == 1
-    assert zero_cards[0].is_hot is True
+    for window in ("1d", "1w", "1m"):
+        views = deck.window(window)
+        assert 0 in {r.story.id for r in views.recommended}
+        assert 0 in {r.story.id for r in views.popular}
+        cards = views.stories()
+        ids = [r.story.id for r in cards]
+        assert len(ids) == len(set(ids)), (window, ids)
+        [zero] = [r for r in cards if r.story.id == 0]
+        assert zero.is_hot is True
 
 
 def test_rank_no_feedback_frontpage_sort(db, embedder):
@@ -2365,11 +2257,12 @@ def test_fast_rerank_for_user_includes_old_bq_archive_story(db, monkeypatch):
         return np.zeros((len(stories), 384), dtype=np.float32)
 
     monkeypatch.setattr("pipeline.ranking.get_or_compute_embeddings", fake_embeddings)
-    ranked = fast_rerank_for_user(
-        db, Config(days=30), cast(Embedder, object()), user.id
-    )
+    deck = fast_rerank_for_user(db, Config(days=30), cast(Embedder, object()), user.id)
 
-    assert [item.story.id for item in ranked] == [9301]
+    # A 180-day-old seed story is served in the archive window only.
+    assert [item.story.id for item in deck.stories()] == [9301]
+    assert [item.story.id for item in _served(deck, "archive").recommended] == [9301]
+    assert all(not _served(deck, w).stories() for w in WINDOWS if w != "archive")
 
 
 def test_fast_rerank_for_user_filters_unsummarizable_stories(db, monkeypatch):
@@ -2408,11 +2301,9 @@ def test_fast_rerank_for_user_filters_unsummarizable_stories(db, monkeypatch):
         return np.zeros((len(stories), 384), dtype=np.float32)
 
     monkeypatch.setattr("pipeline.ranking.get_or_compute_embeddings", fake_embeddings)
-    ranked = fast_rerank_for_user(
-        db, Config(days=30), cast(Embedder, object()), user.id
-    )
+    deck = fast_rerank_for_user(db, Config(days=30), cast(Embedder, object()), user.id)
 
-    result_ids = {r.story.id for r in ranked}
+    result_ids = {r.story.id for r in deck.stories()}
     assert summarizable_id in result_ids
     assert unsummarizable_id not in result_ids
 
@@ -2447,7 +2338,6 @@ def test_canonicalize_hn_dupes_replaces_selected_story_preserving_metadata(
             score=0.77,
             best_match_title="match",
             is_hot=True,
-            combo_keys="recent_hn recent_mixed",
         )
     ]
     db.upsert_story(duplicate)
@@ -2468,7 +2358,87 @@ def test_canonicalize_hn_dupes_replaces_selected_story_preserving_metadata(
     assert result[0].score == 0.77
     assert result[0].best_match_title == "match"
     assert result[0].is_hot
-    assert result[0].combo_keys == "recent_hn recent_mixed"
+
+
+def _hour_old_pool(n: int, now: int) -> list[RankedStory]:
+    """*n* hour-old HN stories, ids 1..n, best model score first."""
+    return [
+        RankedStory(
+            story=_cold_story(sid, score=500 - sid, time_ts=now - 3600),
+            score=float(1000 - sid),
+            best_match_title="",
+        )
+        for sid in range(1, n + 1)
+    ]
+
+
+def test_canonical_replacement_leaves_windows_it_is_outside_and_views_refill(
+    db: Database,
+) -> None:
+    """A canonical HN dupe replaces its source in every view it is in,
+    keeping the source's rank; in a window the canonical story is too old
+    for, the card is dropped and the served view refills from the spare
+    picks, so it still has VIEW_SIZE stories."""
+    now = int(time.time())
+    pool = _hour_old_pool(RECOMMENDED_PICKS + 8, now)
+    canonical = _cold_story(500, score=50, time_ts=now - 3 * 86400)
+    for r in pool:
+        db.upsert_story(r.story)
+    db.upsert_story(canonical)
+    db.upsert_hn_dupe_resolution(
+        HnDupeResolution(1, 500, "canonical", now, now + 86400, 0, "")
+    )
+    deck = ranking.assemble_window_deck(pool, config=Config(), now=now)
+
+    final = pipeline.canonicalize_deck(
+        deck, db, candidate_stories=[r.story for r in pool] + [canonical], now=now
+    )
+
+    for window in ("1w", "1m"):
+        recommended = final.window(window).recommended
+        assert recommended[0].story == canonical  # at the source's rank
+        assert recommended[0].score == deck.window(window).recommended[0].score
+        popular = final.window(window).popular
+        assert 500 in {r.story.id for r in popular} and 1 not in {
+            r.story.id for r in popular
+        }
+        gravity = [
+            ranking.hn_gravity(r.story.score, r.story.time, now) for r in popular
+        ]
+        assert gravity == sorted(gravity, reverse=True)
+    for window in ("12h", "1d"):
+        views = final.window(window)
+        ids = {r.story.id for r in views.stories()}
+        assert not ids & {1, 500}, window
+        served = _served(final, window, now)
+        assert [r.story.id for r in served.recommended] == list(range(2, 2 + VIEW_SIZE))
+        assert len(served.popular) == VIEW_SIZE
+
+
+def test_finalize_dedups_before_the_cap_and_the_served_view_refills(
+    db: Database, embedder: Embedder
+) -> None:
+    """A duplicate URL removed by finalize_ranked_deck is gone from every
+    window, and the served view is refilled from the spare picks."""
+    user = db.create_user("dedup_refill")
+    now = int(time.time())
+    pool = _hour_old_pool(RECOMMENDED_PICKS + 8, now)
+    # Story 2 is story 1's article again, with a lower score: dedup drops it.
+    pool[1] = replace(pool[1], story=replace(pool[1].story, url=pool[0].story.url))
+    candidates = [r.story for r in pool]
+    cand_embs = np.eye(len(candidates), 384, dtype=np.float32)
+    deck = ranking.assemble_window_deck(pool, config=Config(), now=now)
+    assert 2 in {r.story.id for r in _served(deck, "12h", now).recommended}
+
+    final = pipeline.finalize_ranked_deck(
+        deck, candidates, cand_embs, db, Config(), embedder, user.id
+    )
+
+    assert 2 not in {r.story.id for r in final.stories()}
+    served = _served(final, "12h", now)
+    assert [r.story.id for r in served.recommended] == [1] + list(
+        range(3, 3 + VIEW_SIZE - 1)
+    )
 
 
 def test_canonicalize_hn_dupes_uses_candidate_pool_copy_without_text(
@@ -2897,16 +2867,19 @@ def test_fast_rerank_for_user_zero_vote_returns_cold_deck(
     monkeypatch.setattr(pipeline.time, "time", lambda: float(now))
     db.upsert_story(_cold_story(1, score=50, time_ts=now - 3600, source="hn"))
 
-    ranked = fast_rerank_for_user(
-        db, Config(days=30), cast(Embedder, object()), user.id
-    )
+    deck = fast_rerank_for_user(db, Config(days=30), cast(Embedder, object()), user.id)
 
     gravity_div = 3.0**1.8
-    assert len(ranked) == 1
-    assert ranked[0].story.id == 1
-    assert ranked[0].score == pytest.approx(50.0 / gravity_div)
-    assert ranked[0].is_recent is True
-    assert ranked[0].is_non_hn is False
+    # Cold start: every window is built; the hour-old story fills
+    # Recommended and Popular of each recent window, Explore stays empty.
+    assert set(deck.windows) == set(WINDOWS)
+    for window in ("12h", "1d", "1w", "1m"):
+        views = deck.window(window)
+        assert [r.story.id for r in views.recommended] == [1]
+        assert [r.story.id for r in views.popular] == [1]
+        assert views.explore == ()
+        assert views.recommended[0].score == pytest.approx(50.0 / gravity_div)
+    assert deck.window("archive").stories() == []
 
 
 def test_soft_blend_min_alpha_curve() -> None:
@@ -3547,19 +3520,14 @@ def test_tier3_pure_at_80_each(db: Database, _real_embedder: Embedder) -> None:
 def test_novel_archive_pass_surfaces_archive_novel(
     db: Database, embedder: Embedder, monkeypatch: "pytest.MonkeyPatch"
 ) -> None:
-    """The novel-archive discovery pass surfaces ✨ Novel stories in archive.
+    """The archive window's Explore surfaces ✨ Novel archive stories.
 
-    The novel pass is split per-age (novel-recent + novel-archive) so the
-    ✨ badge actually appears in both age buckets. Archive extras (low
-    score) are not in the primary ranked set; without a dedicated
-    novel-archive pass they would never be surfaced with ✨.
-
-    This test constructs archive candidates with low max_sim (novel-
-    qualifying) and asserts they appear in `final` with is_novel=True.
-    The archive fillers outnumber PRIMARY_ARCHIVE_HN so Primary is fully
-    saturated by fillers (higher score), leaving the low-score novel
-    targets in the Explore pool; the novel pass then sorts by distance
-    (= 1 - sim) desc and takes the top EXPLORE_PER_BADGE.
+    Explore runs per window, so low-score archive stories far from every
+    vote get ✨ in the archive window. The archive fillers outnumber the
+    window's Recommended picks, so Recommended is saturated by fillers
+    (higher score), leaving the low-score novel targets in the Explore
+    pool; the Novel pass sorts by distance (= 1 - sim) desc and the served
+    view keeps the top EXPLORE_PER_BADGE.
     """
     config = Config(count=40)
     user = db.create_user("test_novel_archive")
@@ -3578,24 +3546,18 @@ def test_novel_archive_pass_surfaces_archive_novel(
     db.upsert_feedback(user.id, 100, "up")
 
     now = int(time.time())
-    from pipeline import EXPLORE_PER_BADGE
-    from pipeline.ranking import PRIMARY_ARCHIVE_HN
-
-    n_archive_filler = PRIMARY_ARCHIVE_HN + 4
+    n_archive_filler = RECOMMENDED_PICKS + 4
     novel_sims = [round(0.05 + 0.05 * i, 2) for i in range(EXPLORE_PER_BADGE + 1)]
 
     # Setup:
-    #   12 recent primary (high score, sim 0.5) fill the primary ranked set.
-    #   n_archive_filler archive fillers (high score, sim 0.5) — they have
-    #     sim 0.5 too, so they don't qualify as novel, and there are more of
-    #     them than PRIMARY_ARCHIVE_HN so Primary is saturated by fillers
-    #     alone, none of the novel targets below leak into Primary.
+    #   12 recent stories (high score, sim 0.5), irrelevant to archive.
+    #   n_archive_filler archive fillers (high score, sim 0.5) — sim 0.5, so
+    #     not novel, and more of them than the archive window's Recommended
+    #     picks, so Recommended is saturated by fillers alone.
     #   EXPLORE_PER_BADGE+1 archive novel targets (low score, sim 0.05..)
-    #     — one more than the cap, so the worst can be asserted excluded.
-    # Fillers outscore novel targets (200+ vs 5), so Primary picks the top
-    # PRIMARY_ARCHIVE_HN fillers, leaving all novel targets (plus the filler
-    # overflow) in the Explore pool; the novel pass there sorts by distance
-    # (= 1 - sim) desc and takes the top EXPLORE_PER_BADGE.
+    #     — one more than the served cap, so the worst can be asserted
+    #     excluded. The Novel pass sorts the Explore pool by distance
+    #     (= 1 - sim) desc.
     candidates = []
     for i in range(12):
         candidates.append(
@@ -3650,19 +3612,16 @@ def test_novel_archive_pass_surfaces_archive_novel(
         cand_embs[novel_id_base + i, 0] = s
         cand_embs[novel_id_base + i, 300 + i] = np.sqrt(max(1.0 - s * s, 0.0))
 
-    ranked = rerank_candidates(
+    deck = rerank_candidates(
         db, config, embedder, candidates, cand_embs, user_id=user.id
     )
 
-    by_id = {r.story.id: r for r in ranked}
+    by_id = _served_by_id(deck, "archive")
     novel_ids_all = [novel_id_base + i for i in range(len(novel_sims))]
-    # With per-combo EXPLORE_PER_BADGE, only the top-N by distance get
-    # is_novel; the one extra target (worst sim) may appear via other
-    # passes (Popular, Similar, etc.) but should not have is_novel.
+    # Only the top EXPLORE_PER_BADGE by distance are served as Novel; the
+    # one extra target (worst sim) is not.
     novel_ids = [aid for aid in novel_ids_all if aid in by_id and by_id[aid].is_novel]
-    assert len(novel_ids) >= EXPLORE_PER_BADGE, (
-        f"Expected at least {EXPLORE_PER_BADGE} novel picks, got {novel_ids}"
-    )
+    assert novel_ids == novel_ids_all[:EXPLORE_PER_BADGE]
     # The top by distance must be among the novel picks.
     for aid, sim_label in zip(
         novel_ids_all[:EXPLORE_PER_BADGE],
@@ -3672,105 +3631,50 @@ def test_novel_archive_pass_surfaces_archive_novel(
         assert by_id[aid].is_novel, (
             f"Archive novel id={aid} (sim={sim_label}) should have is_novel=True"
         )
-        assert not by_id[aid].is_recent, (
-            f"Archive novel id={aid} should be is_recent=False"
-        )
+    # Archive stories never reach a recent window.
+    assert not set(novel_ids_all) & set(_served_by_id(deck, "1m"))
 
 
-def test_each_badge_floored_per_cohort(db: Database, embedder: Embedder) -> None:
-    """Every non-Hot badge must appear >=EXPLORE_PER_BADGE times in recent
-    AND >=EXPLORE_PER_BADGE times in archive of the final deck (the
-    user's explicit "at least (N,N) for each" expectation).
+def test_each_explore_badge_filled_per_window(db: Database, embedder: Embedder) -> None:
+    """Every Explore badge is served EXPLORE_PER_BADGE times in a recent
+    window AND in the archive window, and Popular/Recommended fill their
+    VIEW_SIZE, when the pool is big enough.
 
-    The rank-based cascade guarantees this via per-cohort top-N discovery
-    passes for each non-Hot badge:
-      cascade (mutually exclusive): hot, high-engagement, discussion
-      explore (also mutually exclusive with each other, but independent
-               of the cascade so a card can carry both): novel, similar,
-               uncertain
-    Each pass takes the top EXPLORE_PER_BADGE stories in its age cohort
-    by the badge metric.
+    Pool sizing: Explore's three passes are serial (each excludes the
+    previous pass's picks) and all exclude the window's Recommended picks,
+    so a window needs RECOMMENDED_PICKS + 3 * EXPLORE_PER_BADGE *
+    SELECT_MARGIN candidates (+5 margin) for every badge to reach the floor.
 
-    Pool sizing: because Explore's three passes are serial (each excludes
-    the previous pass's picks), the explore-eligible remainder of a
-    cohort — pool size minus that combo's primary quota — must hold at
-    least ``3 * EXPLORE_PER_BADGE`` candidates for every badge to reach
-    the floor. Sized dynamically below from ``PRIMARY_PER_COMBO`` /
-    ``PRIMARY_ARCHIVE_HN`` and ``EXPLORE_PER_BADGE`` with a +5 margin,
-    so the floor holds regardless of the constant's current value.
-
-    Feedback: 20 distinct upvotes, 20 distinct downvotes, 20 distinct
-    neutral. The feedback table has a UNIQUE(user_id, story_id, action)
-    constraint, so 20 votes of the same story collapse to 1 row. The
-    SVM requires ``n_up >= 20`` and ``n_down >= 20`` distinct stories
-    to fit and produce ``predict_proba`` output, which drives the
-    entropy signal for the Unsure badge and the similarity signals
-    for Novel and Similar.
+    Feedback: 20 distinct upvotes, 20 downvotes, 20 neutral, so the SVM
+    fits and produces the probabilities the Unsure badge needs.
     """
     config = Config(count=40)
     user = db.create_user("test_each_badge_floor_5")
 
-    for i in range(20):
-        db.upsert_story(
-            Story(
-                id=800 + i,
-                title=f"fb_up_{i}",
-                url=None,
-                score=10,
-                time=0,
-                text_content=(
-                    f"liked story number {i} about programming and "
-                    f"software engineering topic {chr(97 + (i % 26))}"
-                ),
+    for base, action, topic in (
+        (800, "up", "programming and software engineering"),
+        (840, "down", "cooking and kitchen"),
+        (880, "neutral", "travel and tourism"),
+    ):
+        for i in range(20):
+            db.upsert_story(
+                Story(
+                    id=base + i,
+                    title=f"fb_{action}_{i}",
+                    url=None,
+                    score=10,
+                    time=0,
+                    text_content=f"{action} story number {i} about {topic} {i}",
+                )
             )
-        )
-        db.upsert_feedback(user.id, 800 + i, "up")
-    for i in range(20):
-        db.upsert_story(
-            Story(
-                id=840 + i,
-                title=f"fb_down_{i}",
-                url=None,
-                score=10,
-                time=0,
-                text_content=(
-                    f"disliked story number {i} about cooking and "
-                    f"kitchen topic {chr(65 + (i % 26))}"
-                ),
-            )
-        )
-        db.upsert_feedback(user.id, 840 + i, "down")
-    for i in range(20):
-        db.upsert_story(
-            Story(
-                id=880 + i,
-                title=f"fb_neutral_{i}",
-                url=None,
-                score=10,
-                time=0,
-                text_content=(
-                    f"neutral story number {i} about travel and "
-                    f"tourism topic {chr(48 + (i % 10))}"
-                ),
-            )
-        )
-        db.upsert_feedback(user.id, 880 + i, "neutral")
+            db.upsert_feedback(user.id, base + i, action)
 
-    from pipeline import EXPLORE_PER_BADGE
-    from pipeline.ranking import PRIMARY_ARCHIVE_HN, PRIMARY_PER_COMBO
-
-    # Explore's Unsure/Novel/Similar passes are serial (mutually exclusive,
-    # see ranking.py), so each cohort's explore-eligible pool (pool size
-    # minus that combo's primary quota) must hold at least
-    # 3 * EXPLORE_PER_BADGE candidates for every badge to reach the floor;
-    # +5 margin keeps this from being a knife's-edge fit.
-    n_recent = PRIMARY_PER_COMBO + 3 * EXPLORE_PER_BADGE + 5
-    n_archive = PRIMARY_ARCHIVE_HN + 3 * EXPLORE_PER_BADGE + 5
+    n_per_window = RECOMMENDED_PICKS + 3 * EXPLORE_PER_BADGE * SELECT_MARGIN + 5
 
     now = int(time.time())
     candidates: list[Story] = []
-    # Recent (3d old), distinct texts, ascending scores/comment counts.
-    for i in range(n_recent):
+    # Recent (3d old) and archive (90d old), distinct texts.
+    for i in range(n_per_window):
         candidates.append(
             Story(
                 id=i,
@@ -3786,11 +3690,9 @@ def test_each_badge_floored_per_cohort(db: Database, embedder: Embedder) -> None
                 comment_count=20 + i * 5,
             )
         )
-    # Archive (90d old), distinct texts, ascending scores/comment counts.
-    for i in range(n_archive):
         candidates.append(
             Story(
-                id=100 + i,
+                id=1000 + i,
                 title=f"Archive {i}",
                 url=None,
                 score=500 + i * 50,
@@ -3805,148 +3707,102 @@ def test_each_badge_floored_per_cohort(db: Database, embedder: Embedder) -> None
         )
 
     cand_embs = embedder.encode([s.text_content for s in candidates])
-    ranked = rerank_candidates(
+    deck = rerank_candidates(
         db, config, embedder, candidates, cand_embs, user_id=user.id
     )
 
-    recent = [r for r in ranked if r.is_recent]
-    archive = [r for r in ranked if not r.is_recent]
-    assert len(recent) >= 2, f"recent cohort too small in final: {len(recent)}"
-    assert len(archive) >= 2, f"archive cohort too small in final: {len(archive)}"
-
-    for attr in (
-        "is_high_engagement",
-        "is_discussion_rich",
-        "is_novel",
-        "is_similar",
-        "is_uncertain",
-    ):
-        n_recent = sum(1 for r in recent if getattr(r, attr))
-        n_archive = sum(1 for r in archive if getattr(r, attr))
-        assert n_recent >= EXPLORE_PER_BADGE, (
-            f"{attr} must appear >= {EXPLORE_PER_BADGE} in recent (got {n_recent})"
-        )
-        assert n_archive >= EXPLORE_PER_BADGE, (
-            f"{attr} must appear >= {EXPLORE_PER_BADGE} in archive (got {n_archive})"
-        )
+    for window in ("1w", "archive"):
+        served = _served(deck, window)
+        assert len(served.recommended) == VIEW_SIZE, window
+        assert len(served.popular) == VIEW_SIZE, window
+        for attr in ("is_novel", "is_similar", "is_uncertain"):
+            n = sum(1 for r in served.explore if getattr(r, attr))
+            assert n == EXPLORE_PER_BADGE, f"{attr} in {window}: {n}"
 
 
-def _make_combo_deck_inputs() -> tuple[
-    list[RankedStory],
-    int,
-    NDArray[np.float32],
-    NDArray[np.float32],
-    Callable[[int], int],
-    ranking.ExploreContext,
-]:
-    """Build synthetic inputs for a direct ``_assemble_combo_deck`` call.
+def _make_explore_inputs() -> tuple[list[RankedStory], ranking.ExploreContext, int]:
+    """Synthetic inputs for a direct ``assemble_window_deck`` call.
 
-    12 recent HN primary candidates (ids 0-11, high score) fill
-    ``PRIMARY_PER_COMBO`` (12) and land in Primary. Three disjoint,
-    low-score Explore-only groups of ``EXPLORE_PER_BADGE + 2`` ids each
-    follow — one extra beyond the cap so a feedback-match test can exclude
-    the top pick and still have more than enough left to fill the badge,
-    leaving the single worst candidate excluded:
-      - Unsure pool (starts at ``UNSURE_BASE``=12): each id gets a distinct
-        prob_down (entropy peaks at prob_down=1/3 and falls off
-        monotonically toward 1, so prob_down values increasing from 0.34
-        give strictly *decreasing* entropy in id order).
-      - Novel pool (starts right after Unsure): cand_max_sim strictly
-        increasing (novel sort key = 1 - max_sim, so the lowest-sim id is
-        most novel). All other ids default to max_sim=0.99 ("not novel")
-        so they can't outrank the intended novel pool.
-      - Similar pool (starts right after Novel): cand_closest_up strictly
-        decreasing (the highest-sim id is most similar). All other ids
-        default to closest_up=0.0, below every value in the similar pool.
+    RECOMMENDED_PICKS HN candidates (ids 0.., high score) fill every recent
+    window's Recommended picks. Three disjoint, low-score Explore-only
+    groups of ``_EXPLORE_GROUP`` ids each follow — two beyond the stored
+    picks per badge (EXPLORE_PER_BADGE * SELECT_MARGIN), so no pass spills
+    into the next group:
+      - Unsure pool: each id gets a distinct prob_down (entropy peaks at
+        prob_down=1/3 and falls off monotonically toward 1, so prob_down
+        values increasing from 0.34 give strictly *decreasing* entropy in
+        id order). Only these ids have probabilities.
+      - Novel pool: cand_max_sim strictly increasing (novel sort key =
+        1 - max_sim, so the lowest-sim id is most novel). All other ids
+        default to max_sim=0.99 ("not novel").
+      - Similar pool: cand_closest_up strictly decreasing (the highest-sim
+        id is most similar). All other ids default to closest_up=0.0.
+    Returns the ranked pool, the Explore context and the assembly time.
     """
-    from pipeline import EXPLORE_PER_BADGE
-
-    group_size = EXPLORE_PER_BADGE + 2
-    unsure_base = 12
-    novel_base = unsure_base + group_size
-    similar_base = novel_base + group_size
-    n_total = similar_base + group_size
+    unsure_base = RECOMMENDED_PICKS
+    novel_base = unsure_base + _EXPLORE_GROUP
+    similar_base = novel_base + _EXPLORE_GROUP
+    n_total = similar_base + _EXPLORE_GROUP
 
     now = int(time.time())
-    candidates: list[Story] = []
-    for i in range(12):
-        candidates.append(
-            Story(
-                id=i,
-                title=f"Primary {i}",
-                url=None,
-                score=1000 - i,
-                time=now,
-                text_content=f"primary story {i}",
-                source="hn",
-                comment_count=0,
-            )
+    candidates = [
+        Story(
+            id=i,
+            title=f"{'Primary' if i < unsure_base else 'Explore'} {i}",
+            url=None,
+            score=1000 - i if i < unsure_base else 5,
+            time=now,
+            text_content=f"story {i}",
+            source="hn",
+            comment_count=0,
         )
-    for i in range(12, n_total):
-        candidates.append(
-            Story(
-                id=i,
-                title=f"Explore {i}",
-                url=None,
-                score=5,
-                time=now,
-                text_content=f"explore story {i}",
-                source="hn",
-                comment_count=0,
-            )
-        )
-
+        for i in range(n_total)
+    ]
+    unsure_probs = {
+        unsure_base + i: round(0.34 + 0.6 * i / (_EXPLORE_GROUP - 1), 4)
+        for i in range(_EXPLORE_GROUP)
+    }
     ranked = [
         RankedStory(
             story=s,
             score=float(s.score),
             best_match_title="",
+            prob_down=unsure_probs.get(s.id),
+            prob_neutral=None
+            if s.id not in unsure_probs
+            else (1 - unsure_probs[s.id]) / 2,
+            prob_up=None if s.id not in unsure_probs else (1 - unsure_probs[s.id]) / 2,
         )
         for s in candidates
     ]
-    unsure_probs = {
-        unsure_base + i: round(0.34 + 0.6 * i / (group_size - 1), 4)
-        for i in range(group_size)
-    }
-    ranked = [
-        replace(
-            r,
-            prob_down=unsure_probs[r.story.id],
-            prob_neutral=(1 - unsure_probs[r.story.id]) / 2,
-            prob_up=(1 - unsure_probs[r.story.id]) / 2,
-        )
-        if r.story.id in unsure_probs
-        else r
-        for r in ranked
-    ]
-
-    story_id_to_idx = {s.id: idx for idx, s in enumerate(candidates)}
-    idx_for = story_id_to_idx.__getitem__
-
-    cand_scores = np.array([s.score for s in candidates], dtype=np.float32)
-    cand_velocities = np.array([0.0 for _ in candidates], dtype=np.float32)
-
-    cand_max_sim = np.full(len(candidates), 0.99, dtype=np.float32)
-    novel_sims = {
-        novel_base + i: round(0.05 + 0.9 * i / (group_size - 1), 4)
-        for i in range(group_size)
-    }
-    for sid, sim in novel_sims.items():
-        cand_max_sim[story_id_to_idx[sid]] = sim
-
-    cand_closest_up = np.zeros(len(candidates), dtype=np.float32)
-    similar_sims = {
-        similar_base + i: round(0.95 - 0.9 * i / (group_size - 1), 4)
-        for i in range(group_size)
-    }
-    for sid, sim in similar_sims.items():
-        cand_closest_up[story_id_to_idx[sid]] = sim
-
-    recent_cutoff = now - 30 * 86400
+    row_of = {s.id: idx for idx, s in enumerate(candidates)}
+    cand_max_sim = np.full(n_total, 0.99, dtype=np.float32)
+    cand_closest_up = np.zeros(n_total, dtype=np.float32)
+    for i in range(_EXPLORE_GROUP):
+        step = i / (_EXPLORE_GROUP - 1)
+        cand_max_sim[row_of[novel_base + i]] = round(0.05 + 0.9 * step, 4)
+        cand_closest_up[row_of[similar_base + i]] = round(0.95 - 0.9 * step, 4)
     explore = ranking.ExploreContext(
-        cand_max_sim=cand_max_sim, cand_closest_up=cand_closest_up
+        cand_max_sim=cand_max_sim, cand_closest_up=cand_closest_up, row_of=row_of
     )
-    return ranked, recent_cutoff, cand_scores, cand_velocities, idx_for, explore
+    return ranked, explore, now
+
+
+_EXPLORE_GROUP = EXPLORE_PER_BADGE * SELECT_MARGIN + 2
+_UNSURE_BASE = RECOMMENDED_PICKS
+_NOVEL_BASE = _UNSURE_BASE + _EXPLORE_GROUP
+_SIMILAR_BASE = _NOVEL_BASE + _EXPLORE_GROUP
+
+
+def _served_explore_ids(
+    deck: WindowDeck, now: float
+) -> tuple[set[int], set[int], set[int]]:
+    explore = _served(deck, "1w", now).explore
+    return (
+        {r.story.id for r in explore if r.is_uncertain},
+        {r.story.id for r in explore if r.is_novel},
+        {r.story.id for r in explore if r.is_similar},
+    )
 
 
 def test_explore_badges_backfill_past_feedback_matches() -> None:
@@ -3955,614 +3811,186 @@ def test_explore_badges_backfill_past_feedback_matches() -> None:
     instead of silently losing badge slots.
 
     Reproduces the bug found for a heavy voter (user=1): without
-    ``is_feedback_match``, the naive top-``EXPLORE_PER_BADGE`` slice picks
-    the best-ranked candidate per badge even when it duplicates a story the
-    user already voted on — a duplicate that ``canonicalize_hn_dupes`` would
-    drop downstream with no replacement, silently shrinking the deck.
+    ``is_feedback_match``, the naive top-N slice picks the best-ranked
+    candidate per badge even when it duplicates a story the user already
+    voted on — a duplicate that ``canonicalize_hn_dupes`` would drop
+    downstream with no replacement, silently shrinking the deck.
     """
-    from pipeline import EXPLORE_PER_BADGE
-
-    config = Config(count=40)
-    ranked, recent_cutoff, cand_scores, cand_velocities, idx_for, explore = (
-        _make_combo_deck_inputs()
-    )
-
-    # group_size = EXPLORE_PER_BADGE + 2 ids per badge pool (see
-    # _make_combo_deck_inputs); group index 0 is the best-ranked candidate
-    # in each pool (highest entropy / most novel / most similar), and the
-    # last index is the worst.
-    group_size = EXPLORE_PER_BADGE + 2
-    unsure_base = 12
-    novel_base = unsure_base + group_size
-    similar_base = novel_base + group_size
-
+    ranked, explore, now = _make_explore_inputs()
     # The best-ranked candidate in each badge's pool duplicates feedback.
-    feedback_matched_ids = {unsure_base, novel_base, similar_base}
+    feedback_matched_ids = {_UNSURE_BASE, _NOVEL_BASE, _SIMILAR_BASE}
 
-    def is_feedback_match(story: Story) -> bool:
-        return story.id in feedback_matched_ids
-
-    final = ranking._assemble_combo_deck(
+    deck = ranking.assemble_window_deck(
         ranked,
-        config=config,
-        recent_cutoff=recent_cutoff,
-        cand_scores=cand_scores,
-        cand_velocities=cand_velocities,
-        idx_for=idx_for,
-        embeddings_map=None,
+        config=Config(count=40),
+        now=now,
         explore=explore,
-        is_feedback_match=is_feedback_match,
+        is_feedback_match=lambda story: story.id in feedback_matched_ids,
     )
 
-    unsure_ids = {r.story.id for r in final if r.is_uncertain}
-    novel_ids = {r.story.id for r in final if r.is_novel}
-    similar_ids = {r.story.id for r in final if r.is_similar}
-
-    assert len(unsure_ids) == EXPLORE_PER_BADGE, unsure_ids
-    assert len(novel_ids) == EXPLORE_PER_BADGE, novel_ids
-    assert len(similar_ids) == EXPLORE_PER_BADGE, similar_ids
-
-    # The feedback-matched top pick in each pool must be excluded ...
-    assert unsure_base not in unsure_ids
-    assert novel_base not in novel_ids
-    assert similar_base not in similar_ids
-    # ... and backfilled with the next-best candidates in that pool, with
-    # the single worst candidate (last index) dropped for lack of room.
+    unsure_ids, novel_ids, similar_ids = _served_explore_ids(deck, now)
+    # The feedback-matched top pick in each pool is excluded and backfilled
+    # with the next-best candidates in that pool.
     assert unsure_ids == set(
-        range(unsure_base + 1, unsure_base + 1 + EXPLORE_PER_BADGE)
+        range(_UNSURE_BASE + 1, _UNSURE_BASE + 1 + EXPLORE_PER_BADGE)
     )
-    assert novel_ids == set(range(novel_base + 1, novel_base + 1 + EXPLORE_PER_BADGE))
+    assert novel_ids == set(range(_NOVEL_BASE + 1, _NOVEL_BASE + 1 + EXPLORE_PER_BADGE))
     assert similar_ids == set(
-        range(similar_base + 1, similar_base + 1 + EXPLORE_PER_BADGE)
+        range(_SIMILAR_BASE + 1, _SIMILAR_BASE + 1 + EXPLORE_PER_BADGE)
     )
+    # No matched story is picked for any window.
+    for window in WINDOWS:
+        assert not feedback_matched_ids & {
+            r.story.id for r in deck.window(window).explore
+        }
 
 
 def test_explore_badges_no_feedback_match_predicate_is_unaffected() -> None:
-    """``is_feedback_match=None`` (cold-deck / no-feedback path) preserves
-    the pre-existing top-N-by-rank behavior exactly."""
-    from pipeline import EXPLORE_PER_BADGE
+    """``is_feedback_match=None`` (cold-deck / no-feedback path) keeps the
+    top-N-by-badge-metric picks exactly, excluding Recommended."""
+    ranked, explore, now = _make_explore_inputs()
 
-    config = Config(count=40)
-    ranked, recent_cutoff, cand_scores, cand_velocities, idx_for, explore = (
-        _make_combo_deck_inputs()
+    deck = ranking.assemble_window_deck(
+        ranked, config=Config(count=40), now=now, explore=explore
     )
 
-    group_size = EXPLORE_PER_BADGE + 2
-    unsure_base = 12
-    novel_base = unsure_base + group_size
-    similar_base = novel_base + group_size
-
-    final = ranking._assemble_combo_deck(
-        ranked,
-        config=config,
-        recent_cutoff=recent_cutoff,
-        cand_scores=cand_scores,
-        cand_velocities=cand_velocities,
-        idx_for=idx_for,
-        embeddings_map=None,
-        explore=explore,
-        is_feedback_match=None,
-    )
-
-    unsure_ids = {r.story.id for r in final if r.is_uncertain}
-    novel_ids = {r.story.id for r in final if r.is_novel}
-    similar_ids = {r.story.id for r in final if r.is_similar}
-
-    assert unsure_ids == set(range(unsure_base, unsure_base + EXPLORE_PER_BADGE))
-    assert novel_ids == set(range(novel_base, novel_base + EXPLORE_PER_BADGE))
-    assert similar_ids == set(range(similar_base, similar_base + EXPLORE_PER_BADGE))
-
-
-def _make_mixed_combo_deck_inputs(
-    n_recent_hn: int,
-    n_recent_nonhn: int,
-    n_archive_hn: int,
-    n_archive_nonhn: int,
-) -> tuple[
-    list[RankedStory],
-    int,
-    NDArray[np.float32],
-    NDArray[np.float32],
-    Callable[[int], int],
-]:
-    """Build a ``ranked`` list spanning all four age/source cells, for
-    testing ``_assemble_combo_deck``'s combo assignment directly.
-
-    Ids are assigned by cell so callers can identify which cell a result
-    came from: recent_hn -> 0.., recent_nonhn -> 1000.., archive_hn ->
-    2000.., archive_nonhn -> 3000... Every candidate gets a distinct score
-    (higher id = lower score within a cell) so top-N selection is
-    deterministic.
-    """
-    now = int(time.time())
-    recent_cutoff = now - 30 * 86400
-    candidates: list[Story] = []
-
-    def _add(n: int, id_base: int, source: str, recent: bool) -> None:
-        story_time = now - 3600 if recent else recent_cutoff - 3600
-        for i in range(n):
-            candidates.append(
-                Story(
-                    id=id_base + i,
-                    title=f"{source} {i}",
-                    url=None,
-                    score=1000 - i,
-                    time=story_time,
-                    text_content=f"{source} story {i}",
-                    source=source,
-                    comment_count=0,
-                )
-            )
-
-    _add(n_recent_hn, 0, "hn", recent=True)
-    _add(n_recent_nonhn, 1000, "rss_a", recent=True)
-    _add(n_archive_hn, 2000, CH_ARCHIVE_SOURCE, recent=False)
-    _add(n_archive_nonhn, 3000, "rss_a", recent=False)
-
-    ranked = [
-        RankedStory(story=s, score=float(s.score), best_match_title="")
-        for s in candidates
-    ]
-    idx_for = {s.id: idx for idx, s in enumerate(candidates)}.__getitem__
-    cand_scores = np.array([s.score for s in candidates], dtype=np.float32)
-    cand_velocities = np.zeros(len(candidates), dtype=np.float32)
-    return ranked, recent_cutoff, cand_scores, cand_velocities, idx_for
-
-
-def test_assemble_combo_deck_never_emits_archive_nonhn() -> None:
-    """archive_nonhn (time < recent_cutoff AND non-HN source) is
-    structurally unreachable in production (see PRIMARY_RECENT_NONHN /
-    PRIMARY_ARCHIVE_HN comment in pipeline/ranking.py) and was retired
-    from COMBO_DEFS. Even when the input `ranked` list does contain rows
-    that would fall in that cell (e.g. if a future config change widened
-    the RSS leg's window past 30 days), no emitted combo_keys may
-    reference it — regression guard against the dead combo silently
-    reappearing.
-    """
-    config = Config(count=40)
-    ranked, recent_cutoff, cand_scores, cand_velocities, idx_for = (
-        _make_mixed_combo_deck_inputs(
-            n_recent_hn=4, n_recent_nonhn=4, n_archive_hn=4, n_archive_nonhn=4
-        )
-    )
-
-    final = ranking._assemble_combo_deck(
-        ranked,
-        config=config,
-        recent_cutoff=recent_cutoff,
-        cand_scores=cand_scores,
-        cand_velocities=cand_velocities,
-        idx_for=idx_for,
-        embeddings_map=None,
-        explore=None,
-    )
-
-    assert 3000 not in {r.story.id for r in final}, (
-        "archive_nonhn candidates must never be selected"
-    )
-    for r in final:
-        assert "archive_non-hn" not in r.combo_keys, r.combo_keys
-
-
-def test_assemble_combo_deck_honours_asymmetric_primary_limits() -> None:
-    """Per-combo primary quotas after retiring archive_nonhn: recent_hn
-    keeps PRIMARY_PER_COMBO, recent_nonhn and archive_hn absorb its freed
-    slots (see WORKLOG 2026-08-30).
-
-    Checked via the combo_primary_<id> trace counter rather than by
-    re-deriving primary membership from combo_keys — Popular badges (Hot/
-    Top/Talk, HN only) can append additional cards beyond primary_limit
-    when the combo pool is large, so combo_keys membership alone
-    overcounts primary for recent_hn/archive_hn.
-    """
-    from pipeline.ranking import (
-        PRIMARY_ARCHIVE_HN,
-        PRIMARY_PER_COMBO,
-        PRIMARY_RECENT_NONHN,
-    )
-
-    config = Config(count=200)
-    # Oversupply every cell so the primary_limit, not pool size, binds.
-    n = max(PRIMARY_PER_COMBO, PRIMARY_RECENT_NONHN, PRIMARY_ARCHIVE_HN) + 10
-    ranked, recent_cutoff, cand_scores, cand_velocities, idx_for = (
-        _make_mixed_combo_deck_inputs(
-            n_recent_hn=n, n_recent_nonhn=n, n_archive_hn=n, n_archive_nonhn=0
-        )
-    )
-    trace = RankTrace()
-
-    ranking._assemble_combo_deck(
-        ranked,
-        config=config,
-        recent_cutoff=recent_cutoff,
-        cand_scores=cand_scores,
-        cand_velocities=cand_velocities,
-        idx_for=idx_for,
-        embeddings_map=None,
-        explore=None,
-        trace=trace,
-    )
-
-    assert trace.counts["combo_primary_recent_hn"] == PRIMARY_PER_COMBO
-    assert trace.counts["combo_primary_recent_nonhn"] == PRIMARY_RECENT_NONHN
-    assert trace.counts["combo_primary_archive_hn"] == PRIMARY_ARCHIVE_HN
-
-
-def test_assemble_combo_deck_sets_trace_counters_for_three_combos() -> None:
-    """Trace counters are emitted for exactly the three surviving combos —
-    no archive_nonhn counters, since that combo no longer exists."""
-    config = Config(count=40)
-    ranked, recent_cutoff, cand_scores, cand_velocities, idx_for = (
-        _make_mixed_combo_deck_inputs(
-            n_recent_hn=2, n_recent_nonhn=2, n_archive_hn=2, n_archive_nonhn=2
-        )
-    )
-    trace = RankTrace()
-
-    ranking._assemble_combo_deck(
-        ranked,
-        config=config,
-        recent_cutoff=recent_cutoff,
-        cand_scores=cand_scores,
-        cand_velocities=cand_velocities,
-        idx_for=idx_for,
-        embeddings_map=None,
-        explore=None,
-        trace=trace,
-    )
-
-    for combo_id in ("recent_hn", "recent_nonhn", "archive_hn"):
-        assert f"combo_pool_{combo_id}" in trace.counts
-        assert f"combo_primary_{combo_id}" in trace.counts
-        assert f"combo_badges_{combo_id}" in trace.counts
-    assert "combo_pool_archive_nonhn" not in trace.counts
-    # The archive_nonhn rows in the input are simply invisible to every
-    # combo — not merged into archive_hn or any other cell.
-    assert trace.counts["combo_pool_archive_hn"] == 2
-
-
-def test_cascade_badges_mutually_exclusive(db: Database, embedder: Embedder) -> None:
-    """Hot (🔥), Top (🏆), and Talk-worthy (💬) badges are mutually exclusive.
-
-    The cascade order is Hot → Top → Talk, with each pass excluding prior
-    picks from its pool. A story picked by Hot cannot also be picked by
-    Top (Hot is excluded from Top's pool), and a story picked by Top
-    cannot also be picked by Talk. This is the property that prevents
-    the "too many badges" feel — a Hot story shows 🔥 only, a Top
-    story shows 🏆 only, a Talk story shows 💬 only.
-
-    The test builds a 30-recent pool where the top 5 by velocity, the
-    top 5 by score, and the top 5 by comment_count overlap heavily.
-    """
-    config = Config(count=40)
-    now = int(time.time())
-    candidates: list[Story] = []
-    # 30 recent stories, all 1h old, with scores and comment counts that
-    # make the top-5 by velocity / score / comment_count largely
-    # overlap. Velocity ≈ score/age, so high-score stories are also
-    # high-velocity.
-    for i in range(30):
-        # Score 200..100 (desc), comment_count 200..100 (desc): the
-        # top-5 by score and top-5 by cc overlap exactly; the top-5
-        # by velocity (= score/age) also overlap with them since all
-        # stories are the same age.
-        score = max(10, 200 - i * 7)
-        cc = max(5, 200 - i * 7)
-        candidates.append(
-            Story(
-                id=i,
-                title=f"S{i}",
-                url=None,
-                score=score,
-                time=now - 3600,
-                text_content=f"story {i}",
-                source="hn",
-                comment_count=cc,
-            )
-        )
-    cand_embs = embedder.encode([s.text_content for s in candidates])
-    ranked = rerank_candidates(db, config, embedder, candidates, cand_embs)
-    by_id = {r.story.id: r for r in ranked}
-
-    # No story in final can have both Hot and Top, or Top and Talk.
-    # (Hot/Top overlap: Hot picks first, Top excludes Hot, so the 5 Hot
-    # stories must NOT be in the 5 Top. Top/Talk: same.)
-    for sid, r in by_id.items():
-        cascade = [r.is_hot, r.is_high_engagement, r.is_discussion_rich]
-        cascade_count = sum(cascade)
-        assert cascade_count <= 1, (
-            f"id={sid} has multiple cascade badges: "
-            f"is_hot={r.is_hot}, is_high_engagement={r.is_high_engagement}, "
-            f"is_discussion_rich={r.is_discussion_rich}"
-        )
-
-
-def test_cascade_top_excluded_from_talk(db: Database, embedder: Embedder) -> None:
-    """The Top-archive pass's 5 picks do not appear in the Talk-archive
-    pass's 5 picks, even when the top-5 by score and top-5 by comment
-    count in the archive cohort overlap exactly.
-
-    This is a stricter version of test_cascade_badges_mutually_exclusive
-    for the Top/Talk boundary in archive mode.
-    """
-    config = Config(count=40)
-    now = int(time.time())
-    candidates: list[Story] = []
-    # 30 archive (60d old) stories. High score == high cc so the top-5
-    # by score = the top-5 by cc; the cascade ensures they are
-    # different sets.
-    for i in range(30):
-        score = max(10, 2000 - i * 70)
-        cc = max(5, 2000 - i * 70)
-        candidates.append(
-            Story(
-                id=i,
-                title=f"Archive {i}",
-                url=None,
-                score=score,
-                time=now - 60 * 86400,
-                text_content=f"archive story {i}",
-                source="ch_seed",
-                comment_count=cc,
-            )
-        )
-    cand_embs = embedder.encode([s.text_content for s in candidates])
-    ranked = rerank_candidates(db, config, embedder, candidates, cand_embs)
-    archive = [r for r in ranked if not r.is_recent]
-
-    top_archive_ids = {r.story.id for r in archive if r.is_high_engagement}
-    talk_archive_ids = {r.story.id for r in archive if r.is_discussion_rich}
-    assert top_archive_ids, "expected Top-archive to surface some stories"
-    assert talk_archive_ids, "expected Talk-archive to surface some stories"
-    assert top_archive_ids.isdisjoint(talk_archive_ids), (
-        f"Top-archive and Talk-archive must be disjoint sets, got overlap: "
-        f"{top_archive_ids & talk_archive_ids}"
-    )
-
-
-def test_cascade_hot_excluded_from_top(db: Database, embedder: Embedder) -> None:
-    """The Hot pass's 5 picks do not appear in the high-engagement-recent
-    pass's 5 picks, even when velocity and score overlap.
-
-    Hot is global (recent-only by velocity) and runs first. Top-recent
-    runs second and excludes Hot picks. A high-velocity recent story
-    that is also high-score must be Hot, not Top.
-    """
-    config = Config(count=40)
-    now = int(time.time())
-    candidates: list[Story] = []
-    # 30 recent stories, 1h old. Velocity = score/1h. Top 5 by velocity
-    # and top 5 by score should overlap (since all have the same age).
-    for i in range(30):
-        score = max(10, 200 - i * 7)
-        candidates.append(
-            Story(
-                id=i,
-                title=f"S{i}",
-                url=None,
-                score=score,
-                time=now - 3600,
-                text_content=f"story {i}",
-                source="hn",
-                comment_count=5,
-            )
-        )
-    cand_embs = embedder.encode([s.text_content for s in candidates])
-    ranked = rerank_candidates(db, config, embedder, candidates, cand_embs)
-
-    hot_ids = {r.story.id for r in ranked if r.is_hot}
-    top_recent_ids = {
-        r.story.id for r in ranked if r.is_high_engagement and r.is_recent
+    unsure_ids, novel_ids, similar_ids = _served_explore_ids(deck, now)
+    assert unsure_ids == set(range(_UNSURE_BASE, _UNSURE_BASE + EXPLORE_PER_BADGE))
+    assert novel_ids == set(range(_NOVEL_BASE, _NOVEL_BASE + EXPLORE_PER_BADGE))
+    assert similar_ids == set(range(_SIMILAR_BASE, _SIMILAR_BASE + EXPLORE_PER_BADGE))
+    served = _served(deck, "1w", now)
+    assert not {r.story.id for r in served.explore} & {
+        r.story.id for r in deck.window("1w").recommended
     }
-    assert hot_ids, "expected Hot to surface some stories"
-    assert top_recent_ids, "expected Top-recent to surface some stories"
-    assert hot_ids.isdisjoint(top_recent_ids), (
-        f"Hot and Top-recent must be disjoint sets, got overlap: "
-        f"{hot_ids & top_recent_ids}"
+    # A voted Explore story is backfilled from the stored spare picks.
+    voted = deck.without({_UNSURE_BASE})
+    assert _served_explore_ids(voted, now)[0] == set(
+        range(_UNSURE_BASE + 1, _UNSURE_BASE + 1 + EXPLORE_PER_BADGE)
     )
 
 
-def test_cascade_can_stack_with_parallel(
-    db: Database, embedder: Embedder, monkeypatch
-) -> None:
-    """A cascade-badge story (e.g. Top) can also be badged by a parallel
-    pass (e.g. Unsure) — the parallel group sees the full ranked pool
-    and can pick the same story a cascade pass picked.
-
-    Setup: 20 distinct upvotes on "topic A" axis, 20 distinct downvotes
-    on "topic B" axis. Stories with embeddings close to a 50/50 mix of
-    the two axes have max entropy. We build 30 recent stories that all
-    have a 50/50 mix and varied scores. The SVM puts them all near the
-    decision boundary → high entropy. The top 12 by SVM score fill
-    primary; ids 12..16 are the Top-recent picks (highest score in
-    remaining_decorated). The parallel Unsure pass picks 5 from
-    `ranked` by entropy desc — these are the same stories the cascade
-    ranked high, so the parallel picks overlap with the Top picks.
-    """
-    config = Config(count=40)
-    user = db.create_user("test_cascade_stack")
-    for i in range(20):
-        db.upsert_story(
-            Story(
-                id=500 + i,
-                title=f"fb_up_{i}",
-                url=None,
-                score=10,
-                time=0,
-                text_content=f"upvote {i}",
-            )
-        )
-        db.upsert_feedback(user.id, 500 + i, "up")
-    for i in range(20):
-        db.upsert_story(
-            Story(
-                id=600 + i,
-                title=f"fb_down_{i}",
-                url=None,
-                score=10,
-                time=0,
-                text_content=f"downvote {i}",
-            )
-        )
-        db.upsert_feedback(user.id, 600 + i, "down")
-
-    def mock_gce(stories, embedder_arg, db_inst):
-        arr = np.zeros((len(stories), 384), dtype=np.float32)
-        for i, s in enumerate(stories):
-            if s.id < 500:
-                # 50/50 mix of axis A (upvotes) and axis B (downvotes)
-                # → max entropy. The unique-axis component keeps the
-                # embeddings distinct so the SVM gets a meaningful
-                # signal for ranking.
-                arr[i, 0] = 0.5
-                arr[i, 1] = 0.5
-                arr[i, 200 + s.id] = np.sqrt(0.5)
-        return arr
-
-    monkeypatch.setattr("pipeline.ranking.get_or_compute_embeddings", mock_gce)
-
+def _make_window_inputs(ages_days: list[float]) -> tuple[list[RankedStory], int]:
+    """One HN and one RSS story per age (ids 2i and 2i+1), distinct scores."""
     now = int(time.time())
-    candidates: list[Story] = []
-    for i in range(60):
-        score = 200 - i * 5
-        candidates.append(
-            Story(
-                id=i,
-                title=f"S{i}",
+    ranked = []
+    for i, age in enumerate(ages_days):
+        for j, source in enumerate(("hn", "rss_a")):
+            sid = 2 * i + j
+            story = Story(
+                id=sid,
+                title=f"{source} {i}",
                 url=None,
-                score=max(10, score),
-                time=now - 3 * 86400,
-                text_content=f"text {i}",
-                source="hn",
-                comment_count=20,
+                score=1000 - sid,
+                time=now - int(age * 86400),
+                text_content=f"{source} story {i}",
+                source=source,
+                comment_count=0,
             )
-        )
+            ranked.append(
+                RankedStory(story=story, score=float(1000 - sid), best_match_title="")
+            )
+    return ranked, now
 
-    cand_embs = np.zeros((60, 384), dtype=np.float32)
-    for i in range(60):
-        cand_embs[i, 0] = 0.5
-        cand_embs[i, 1] = 0.5
-        cand_embs[i, 200 + i] = np.sqrt(0.5)
 
-    ranked = rerank_candidates(
-        db, config, embedder, candidates, cand_embs, user_id=user.id
+def test_window_pools_are_nested_and_archive_is_the_rest() -> None:
+    """Every window gets a pool counter; 12h ⊆ 1d ⊆ 1w ⊆ 1m and archive is
+    everything older, so 1m + archive covers the pool exactly once. Non-HN
+    stories are Recommended in any window, archive too (no source quota),
+    but never Popular."""
+    ages = [0.1, 0.4, 0.9, 3, 6.5, 20, 29, 45, 200]
+    ranked, now = _make_window_inputs(ages)
+    trace = RankTrace()
+
+    deck = ranking.assemble_window_deck(
+        ranked, config=Config(count=40), now=now, trace=trace
     )
 
-    # There must be at least one story that ends up with both
-    # is_high_engagement AND is_uncertain, proving the parallel pass
-    # can stack onto a cascade pick.
-    stacked = [r for r in ranked if r.is_high_engagement and r.is_uncertain]
-    assert stacked, (
-        f"expected at least one story with both Top and Unsure, got none; "
-        f"top_ids={[r.story.id for r in ranked if r.is_high_engagement]}, "
-        f"unsure_ids={[r.story.id for r in ranked if r.is_uncertain]}"
-    )
+    pools = [trace.counts[f"window_pool_{w}"] for w in WINDOWS]
+    assert pools == [4, 6, 10, 14, 4]
+    assert pools[3] + pools[4] == len(ranked)
+    ids = {w: {r.story.id for r in deck.window(w).recommended} for w in WINDOWS}
+    assert ids["12h"] <= ids["1d"] <= ids["1w"] <= ids["1m"]
+    assert not ids["1m"] & ids["archive"]
+    assert ids["archive"] == {14, 15, 16, 17}
+    for window in WINDOWS:
+        assert all(r.story.source == "hn" for r in deck.window(window).popular)
 
 
-def test_parallel_can_stack_within(
-    db: Database, embedder: Embedder, monkeypatch
+def test_popular_badge_follows_the_storys_own_numbers(
+    db: Database, embedder: Embedder
 ) -> None:
-    """Explore badges (Unsure/Novel/Similar) and Popular badges can stack
-    on the same story within a combo. This verifies that the explore pool
-    is shared with the popular pool so a story picked for both lanes
-    gets multiple badges.
-
-    Uses controlled embeddings: all stories have a 50/50 mix of upvote
-    and downvote axes (high entropy). The Unsure pass picks the top-2 by
-    entropy. The Hot pass sees the full combo pool and can badge primary
-    cards. The top Hot-picked story should also be an Unsure pick.
-    """
-    config = Config(count=40)
-    user = db.create_user("test_parallel_stack2")
-    for i in range(20):
-        db.upsert_story(
-            Story(
-                id=700 + i,
-                title=f"fb_up_{i}",
-                url=None,
-                score=10,
-                time=0,
-                text_content=f"upvote {i}",
-            )
-        )
-        db.upsert_feedback(user.id, 700 + i, "up")
-    for i in range(20):
-        db.upsert_story(
-            Story(
-                id=720 + i,
-                title=f"fb_down_{i}",
-                url=None,
-                score=10,
-                time=0,
-                text_content=f"downvote {i}",
-            )
-        )
-        db.upsert_feedback(user.id, 720 + i, "down")
-
-    def mock_gce(stories, embedder_arg, db_inst):
-        arr = np.zeros((len(stories), 384), dtype=np.float32)
-        for i, s in enumerate(stories):
-            if s.id < 700:
-                arr[i, 0] = 0.5
-                arr[i, 1] = 0.5
-                arr[i, 200 + s.id] = np.sqrt(0.5)
-        return arr
-
-    monkeypatch.setattr("pipeline.ranking.get_or_compute_embeddings", mock_gce)
-
-    from pipeline import PRIMARY_PER_COMBO, EXPLORE_PER_BADGE
-
+    """Every Popular card gets exactly one of Hot (🔥), Talk (💬) and Top
+    (🏆), from its own numbers: Hot when it is fast (velocity percentile)
+    and has HOT_MIN_SCORE points, else Talk when it has at least as many
+    comments as points, else Top."""
     now = int(time.time())
-    n_total = PRIMARY_PER_COMBO + EXPLORE_PER_BADGE + 4  # primary + room
-    candidates: list[Story] = []
-    for i in range(n_total):
-        score = 200 - i * 5
-        candidates.append(
-            Story(
-                id=i,
-                title=f"S{i}",
-                url=None,
-                score=max(10, score),
-                time=now - 3 * 86400,
-                text_content=f"text {i}",
-                source="hn",
-                comment_count=20,
-            )
-        )
-    cand_embs = np.zeros((n_total, 384), dtype=np.float32)
-    for i in range(n_total):
-        cand_embs[i, 0] = 0.5
-        cand_embs[i, 1] = 0.5
-        cand_embs[i, 200 + i] = np.sqrt(0.5)
-
-    ranked = rerank_candidates(
-        db, config, embedder, candidates, cand_embs, user_id=user.id
-    )
-
-    # At least one story should have both a Popular badge (Hot from
-    # full-pool Hot pass) and an Explore badge (Unsure from shared pool).
-    stacked = [
-        r for r in ranked if (r.is_hot or r.is_high_engagement) and r.is_uncertain
+    candidates = [
+        # Fastest by far: Hot, although it has more comments than points.
+        _cold_story(1, score=900, time_ts=now - 3600, comment_count=950),
+        # Slow, more comments than points: Talk.
+        _cold_story(2, score=40, time_ts=now - 5 * 86400, comment_count=40),
+        # Slow, fewer comments than points: Top.
+        _cold_story(3, score=300, time_ts=now - 5 * 86400, comment_count=10),
+    ] + [
+        _cold_story(10 + i, score=20 + i, time_ts=now - 6 * 86400, comment_count=i)
+        for i in range(10)
     ]
-    assert stacked, (
-        f"expected at least one story with Popular+Explore stacking; "
-        f"hot_ids={[r.story.id for r in ranked if r.is_hot]}, "
-        f"unsure_ids={[r.story.id for r in ranked if r.is_uncertain]}"
+    cand_embs = embedder.encode([s.text_content + s.title for s in candidates])
+    deck = rerank_candidates(db, Config(count=40), embedder, candidates, cand_embs)
+
+    popular = {r.story.id: r for r in deck.window("1w").popular}
+    for r in popular.values():
+        assert sum([r.is_hot, r.is_discussion_rich, r.is_high_engagement]) == 1, r
+    assert popular[1].is_hot
+    assert popular[2].is_discussion_rich
+    assert popular[3].is_high_engagement
+
+
+def test_explore_and_popular_can_share_a_card() -> None:
+    """Explore excludes a window's Recommended stories, not its Popular
+    ones: a story with many points but a low model score can be both
+    Popular and Unsure, and is served as one card with both badges."""
+    now = int(time.time())
+    fillers = [
+        RankedStory(
+            story=_cold_story(i, score=5, time_ts=now - 86400),
+            score=100.0 - i * 0.01,
+            best_match_title="",
+            prob_down=0.98,
+            prob_neutral=0.01,
+            prob_up=0.01,
+        )
+        for i in range(RECOMMENDED_PICKS)
+    ]
+    target = RankedStory(
+        story=_cold_story(999, score=900, time_ts=now - 86400, comment_count=0),
+        score=-1.0,
+        best_match_title="",
+        prob_down=1 / 3,
+        prob_neutral=1 / 3,
+        prob_up=1 / 3,
     )
+    pool = fillers + [target]
+    explore = ranking.ExploreContext(
+        cand_max_sim=np.full(len(pool), 0.5, dtype=np.float32),
+        cand_closest_up=np.full(len(pool), 0.5, dtype=np.float32),
+        row_of={r.story.id: i for i, r in enumerate(pool)},
+    )
+    deck = ranking.assemble_window_deck(pool, config=Config(), now=now, explore=explore)
+
+    served = _served(deck, "1w", now)
+    assert 999 in {r.story.id for r in served.popular}
+    assert 999 in {r.story.id for r in served.explore if r.is_uncertain}
+    assert 999 not in {r.story.id for r in served.recommended}
+    [card] = [r for r in served.stories() if r.story.id == 999]
+    assert card.is_uncertain and (card.is_hot or card.is_high_engagement)
 
 
 def test_hot_badge_threshold_uses_config_percentile(
     db: Database, embedder: Embedder
 ) -> None:
-    """is_hot respects hot_badge_percentile from config.
-
-    The Hot pass runs against the full combo pool and can badge primary
-    cards. Slot limit is POPULAR_PER_COMBO // 3.
-    """
-    from pipeline import POPULAR_PER_COMBO
-
-    hot_cap = POPULAR_PER_COMBO // 3
-
+    """is_hot respects hot_badge_percentile from config: the percentile of
+    velocity is taken over the whole candidate pool."""
     now = int(time.time())
     # 20 stories, scores 10..200 (step 10), all 1h old so velocity = score.
     score_values = list(range(10, 210, 10))  # [10, 20, ..., 200]
@@ -4581,22 +4009,15 @@ def test_hot_badge_threshold_uses_config_percentile(
     ]
     cand_embs = embedder.encode([s.text_content for s in candidates])
 
-    # Default: 99.5th pct of [10..200] ≈ 199. Only id=0 (velocity 200) clears.
-    config = Config(count=40)
-    ranked = rerank_candidates(db, config, embedder, candidates, cand_embs)
-    hot_ids = {r.story.id for r in ranked if r.is_hot}
-    assert 0 in hot_ids
-    assert 1 not in hot_ids, "190-score story should NOT be hot at p99.5"
-    assert len(hot_ids) == 1, f"Expected 1 hot at p99.5, got {len(hot_ids)}"
+    def hot_ids(config: Config) -> set[int]:
+        deck = rerank_candidates(db, config, embedder, candidates, cand_embs)
+        return {r.story.id for r in deck.window("1w").popular if r.is_hot}
 
-    # 50th pct: p50 ≈ 105. Ids 0..9 clear the threshold. Slot cap is
-    # hot_cap, so only the top hot_cap by velocity get Hot.
-    config2 = Config(count=40, model=ModelConfig(hot_badge_percentile=50.0))
-    ranked2 = rerank_candidates(db, config2, embedder, candidates, cand_embs)
-    hot2 = {r.story.id for r in ranked2 if r.is_hot}
-    assert set(range(hot_cap)) <= hot2
-    assert hot_cap not in hot2, "Should only get hot_cap hot cards"
-    assert len(hot2) == hot_cap, f"Expected {hot_cap} hot at p50, got {len(hot2)}"
+    # Default: 99.5th pct of [10..200] ≈ 199. Only id=0 (velocity 200) clears.
+    assert hot_ids(Config(count=40)) == {0}
+    # 50th pct: p50 = 105. Ids 0..9 (scores 200..110) clear it.
+    config = Config(count=40, model=ModelConfig(hot_badge_percentile=50.0))
+    assert hot_ids(config) == set(range(10))
 
 
 def test_tier1_gravity_at_zero_feedback(db: Database, embedder: Embedder) -> None:
@@ -5058,7 +4479,9 @@ def test_hot_badge_requires_minimum_score(db, embedder):
         user_id=None,
     )
 
-    for r in result:
+    popular = [r for w in WINDOWS for r in result.window(w).popular]
+    assert 99 in {r.story.id for r in popular}
+    for r in popular:
         if r.is_hot:
             assert r.story.score >= HOT_MIN_SCORE, (
                 f"Story {r.story.id} (score={r.story.score}) has is_hot=True "
@@ -5302,14 +4725,12 @@ def test_candidate_similar_to_neutral_is_not_novel(db, embedder, monkeypatch):
         )
         db.upsert_feedback(user.id, sid, action)
 
-    # Controlled candidate embeddings. 3 targets + enough fillers
-    # to saturate PRIMARY_PER_COMBO (12) so targets land in discovery pool.
+    # Controlled candidate embeddings. 3 targets + enough fillers to
+    # saturate the Recommended picks so targets land in the Explore pool.
     # 1 -> close to neutral (axis 2), max_sim=0.95
     # 2 -> close to up (axis 0), max_sim=0.95
     # 3 -> far from all (axis 3), max_sim=0
-    from pipeline import PRIMARY_PER_COMBO
-
-    n_total = PRIMARY_PER_COMBO + 10  # fill primary + room for discovery
+    n_total = RECOMMENDED_PICKS + 10  # fill Recommended + room for Explore
     cand_embs = np.zeros((n_total, 384), dtype=np.float32)
     cand_embs[0, 2] = 0.95  # close to neutral
     cand_embs[1, 0] = 0.95  # close to up
@@ -5350,10 +4771,10 @@ def test_candidate_similar_to_neutral_is_not_novel(db, embedder, monkeypatch):
             )
         )
 
-    ranked = rerank_candidates(
+    deck = rerank_candidates(
         db, config, embedder, candidates, cand_embs, user_id=user.id
     )
-    by_id = {r.story.id: r for r in ranked}
+    by_id = _served_by_id(deck, "1w")
 
     # id=3 (far from all feedback, max_sim=0, dist=1.0) is the most
     # novel and should be in the top EXPLORE_PER_BADGE by distance.
@@ -5401,13 +4822,11 @@ def test_no_neutral_feedback_uses_up_down_only_for_novel(db, embedder, monkeypat
         )
         db.upsert_feedback(user.id, sid, action)
 
-    # Controlled candidate embeddings. 2 targets + enough fillers
-    # to saturate PRIMARY_PER_COMBO so targets land in discovery pool.
+    # Controlled candidate embeddings. 2 targets + enough fillers to
+    # saturate the Recommended picks so targets land in the Explore pool.
     # 1 -> close to up (axis 0), max_sim=0.95
     # 2 -> far from all (axis 3), max_sim=0
-    from pipeline import PRIMARY_PER_COMBO
-
-    n_total = PRIMARY_PER_COMBO + 8
+    n_total = RECOMMENDED_PICKS + 8
     cand_embs = np.zeros((n_total, 384), dtype=np.float32)
     cand_embs[0, 0] = 0.95
     cand_embs[1, 3] = 1.0
@@ -5454,10 +4873,10 @@ def test_no_neutral_feedback_uses_up_down_only_for_novel(db, embedder, monkeypat
             )
         )
 
-    ranked = rerank_candidates(
+    deck = rerank_candidates(
         db, config, embedder, candidates, cand_embs, user_id=user.id
     )
-    by_id = {r.story.id: r for r in ranked}
+    by_id = _served_by_id(deck, "1w")
 
     # id=2 (max_sim=0, dist=1.0) is the most novel; it's in the top
     # EXPLORE_PER_BADGE by distance.
@@ -5477,14 +4896,12 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
     A low-score, high-distance story beats a higher-score, lower-distance
     story when the slot cap forces a cut.
 
-    With per-combo discovery slots (EXPLORE_PER_BADGE), the cut is at
+    The served Novel view keeps EXPLORE_PER_BADGE, so the cut is at
     position EXPLORE_PER_BADGE. We construct scores so the last-kept
     (by distance) story has a very low score; pure-distance ranking keeps
     it; a score-blended ranking would have dropped it for the first
     excluded (higher-score) story.
     """
-    from pipeline import EXPLORE_PER_BADGE, PRIMARY_PER_COMBO
-
     config = Config(count=40)
     user = db.create_user("test_novel_distance")
 
@@ -5509,7 +4926,7 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
     # ranking would have swapped the two.
     now = int(time.time())
     candidates = []
-    for i in range(PRIMARY_PER_COMBO):
+    for i in range(RECOMMENDED_PICKS):
         candidates.append(
             Story(
                 id=i,
@@ -5530,7 +4947,7 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
     for i, sc in enumerate(extra_scores):
         candidates.append(
             Story(
-                id=PRIMARY_PER_COMBO + i,
+                id=RECOMMENDED_PICKS + i,
                 title=f"E{i}",
                 url=None,
                 score=sc,
@@ -5543,21 +4960,21 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
 
     n_total = len(candidates)
     cand_embs = np.zeros((n_total, 384), dtype=np.float32)
-    for i in range(PRIMARY_PER_COMBO):
+    for i in range(RECOMMENDED_PICKS):
         cand_embs[i, 0] = 0.5
         cand_embs[i, 50 + i] = np.sqrt(0.75)
     for i, s in enumerate(extra_sims):
-        idx = PRIMARY_PER_COMBO + i
+        idx = RECOMMENDED_PICKS + i
         cand_embs[idx, 0] = s
         cand_embs[idx, 100 + i] = np.sqrt(max(1.0 - s * s, 0.0))
 
-    ranked = rerank_candidates(
+    deck = rerank_candidates(
         db, config, embedder, candidates, cand_embs, user_id=user.id
     )
 
-    by_id = {r.story.id: r for r in ranked}
-    kept_id = PRIMARY_PER_COMBO + (EXPLORE_PER_BADGE - 1)
-    excluded_id = PRIMARY_PER_COMBO + EXPLORE_PER_BADGE
+    by_id = _served_by_id(deck, "1w")
+    kept_id = RECOMMENDED_PICKS + (EXPLORE_PER_BADGE - 1)
+    excluded_id = RECOMMENDED_PICKS + EXPLORE_PER_BADGE
     # kept_id (very low score) is the last-by-distance story within the cap.
     # Pure-distance ranking keeps it; score-blended would drop it for
     # excluded_id instead.
@@ -7146,8 +6563,8 @@ def test_two_leg_recent_zero_limits_do_not_error(
         recent_candidate_hn_limit=0,
         recent_candidate_rss_limit=0,
     )
-    ranked = fast_rerank_for_user(db, config, embedder, user.id)
-    assert isinstance(ranked, list)
+    deck = fast_rerank_for_user(db, config, embedder, user.id)
+    assert isinstance(deck, WindowDeck)
 
 
 def test_two_leg_recent_huge_limits_no_truncation_error(
@@ -7161,8 +6578,8 @@ def test_two_leg_recent_huge_limits_no_truncation_error(
         recent_candidate_hn_limit=1_000_000,
         recent_candidate_rss_limit=1_000_000,
     )
-    ranked = fast_rerank_for_user(db, config, embedder, user.id)
-    assert isinstance(ranked, list)
+    deck = fast_rerank_for_user(db, config, embedder, user.id)
+    assert isinstance(deck, WindowDeck)
 
 
 def test_two_leg_recent_preserves_hn_and_rss_legs(
@@ -7237,56 +6654,44 @@ def test_two_leg_recent_preserves_hn_and_rss_legs(
     assert {s.id for s in captured["rss"]} == {2}
 
 
-def test_is_recent_flag_inclusive_30d_boundary(
+def test_rerank_splits_recent_and_archive_at_30_days(
     db: Database, embedder: Embedder
 ) -> None:
-    """is_recent: time >= now - 30d → True (inclusive boundary).
+    """A story up to 30 days old is in the 1m window; one older is in the
+    archive window, and in no recent window.
 
     Stories are placed 1s on either side of the 30d boundary so the test
     is robust against wall-clock second drift between the test fixture
     capturing `now` and the reranker re-reading `time.time()`.
     """
-
     config = Config(count=40)
     now = int(time.time())
     candidates = [
         Story(
-            id=1,
-            title="Recent 1d",
+            id=sid,
+            title=title,
             url=None,
             score=100,
-            time=now - 86400,
-            text_content="Recent story 1 day old.",
+            time=now - age,
+            text_content=f"{title} story.",
             source="hn",
             comment_count=0,
-        ),
-        Story(
-            id=2,
-            title="Just inside 30d (recent side)",
-            url=None,
-            score=100,
-            time=now - 30 * 86400 + 1,
-            text_content="Story 30d - 1s old.",
-            source="hn",
-            comment_count=0,
-        ),
-        Story(
-            id=3,
-            title="Just outside 30d (archive side)",
-            url=None,
-            score=100,
-            time=now - 30 * 86400 - 1,
-            text_content="Story 30d + 1s old.",
-            source="hn",
-            comment_count=0,
-        ),
+        )
+        for sid, title, age in (
+            (1, "Recent 1d", 86400 - 60),
+            (2, "Just inside 30d", 30 * 86400 - 1),
+            (3, "Just outside 30d", 30 * 86400 + 1),
+        )
     ]
     cand_embs = embedder.encode([s.text_content for s in candidates])
-    ranked = rerank_candidates(db, config, embedder, candidates, cand_embs)
-    by_id = {r.story.id: r for r in ranked}
-    assert by_id[1].is_recent is True, "1d old should be recent"
-    assert by_id[2].is_recent is True, "30d - 1s should be recent"
-    assert by_id[3].is_recent is False, "30d + 1s should NOT be recent"
+    deck = rerank_candidates(db, config, embedder, candidates, cand_embs)
+
+    def ids(window: Window) -> set[int]:
+        return {r.story.id for r in deck.window(window).recommended}
+
+    assert ids("1d") == {1}
+    assert ids("1m") == {1, 2}
+    assert ids("archive") == {3}
 
 
 def test_select_article_fetch_excludes_lesswrong(db):
@@ -7586,17 +6991,34 @@ def _f2_story(sid: int, title: str = "t") -> Story:
         title=title,
         url=None,
         score=0,
-        time=0,
+        time=int(time.time()) - 60,
         text_content="",
         source="hn",
     )
 
 
-def _f2_ranked(sids: list[int]) -> list:
-    return [
-        ranking.RankedStory(story=_f2_story(i), score=1.0, best_match_title="")
-        for i in sids
-    ]
+def _f2_ranked(sids: list[int]) -> WindowDeck:
+    """A deck holding these stories as the 1w Recommended view."""
+    return WindowDeck(
+        {
+            "1w": WindowViews(
+                recommended=tuple(
+                    ranking.RankedStory(
+                        story=_f2_story(i), score=1.0, best_match_title=""
+                    )
+                    for i in sids
+                )
+            )
+        }
+    )
+
+
+def _f2_fill(
+    deck: WindowDeck, cands: list[Story], ctx: ranking.RankScoreContext | None
+) -> list[RankedStory]:
+    return list(
+        ranking._fill_best_match_titles(deck, cands, ctx).window("1w").recommended
+    )
 
 
 def _f2_context(n_cands: int, idx: list[int], sims: list[float], titles: list[str]):
@@ -7609,7 +7031,7 @@ def _f2_context(n_cands: int, idx: list[int], sims: list[float], titles: list[st
 
 def test_fill_best_match_titles_happy_path() -> None:
     ctx = _f2_context(3, [0, 1, 0], [0.9, 0.8, 0.9], ["Up A", "Up B"])
-    out = ranking._fill_best_match_titles(
+    out = _f2_fill(
         _f2_ranked([10, 11, 12]),
         [_f2_story(10), _f2_story(11), _f2_story(12)],
         ctx,
@@ -7621,24 +7043,24 @@ def test_fill_best_match_titles_cold_and_floor() -> None:
     ranked = _f2_ranked([10])
     cands = [_f2_story(10)]
     # No context (cold user): untouched, same objects.
-    assert ranking._fill_best_match_titles(ranked, cands, None) == ranked
+    assert ranking._fill_best_match_titles(ranked, cands, None) is ranked
     assert (
         ranking._fill_best_match_titles(ranked, cands, ranking.RankScoreContext())
-        == ranked
+        is ranked
     )
     # Below the similarity floor: silent.
     ctx = _f2_context(1, [0], [0.10], ["Up A"])
-    assert ranking._fill_best_match_titles(ranked, cands, ctx)[0].best_match_title == ""
+    assert _f2_fill(ranked, cands, ctx)[0].best_match_title == ""
     # Invalid argmax row and missing title: silent.
     ctx = _f2_context(1, [-1], [0.95], ["Up A"])
-    assert ranking._fill_best_match_titles(ranked, cands, ctx)[0].best_match_title == ""
+    assert _f2_fill(ranked, cands, ctx)[0].best_match_title == ""
     ctx = _f2_context(1, [5], [0.95], ["Up A"])
-    assert ranking._fill_best_match_titles(ranked, cands, ctx)[0].best_match_title == ""
+    assert _f2_fill(ranked, cands, ctx)[0].best_match_title == ""
     ctx = _f2_context(1, [0], [0.95], [""])
-    assert ranking._fill_best_match_titles(ranked, cands, ctx)[0].best_match_title == ""
+    assert _f2_fill(ranked, cands, ctx)[0].best_match_title == ""
     # Unknown story id: untouched.
     ctx = _f2_context(1, [0], [0.95], ["Up A"])
-    out = ranking._fill_best_match_titles(_f2_ranked([99]), cands, ctx)
+    out = _f2_fill(_f2_ranked([99]), cands, ctx)
     assert out[0].best_match_title == ""
 
 
@@ -7647,12 +7069,12 @@ def test_fill_best_match_titles_render_escapes() -> None:
     from pipeline import render
 
     story = _f2_story(10, "C <b>ard</b>")
-    ranked = [
+    deck = _one_card_deck(
         ranking.RankedStory(story=story, score=1.0, best_match_title='Up "quoted" <x>')
-    ]
-    html = render.generate_dashboard_bytes(
-        ranked, Config(), Database(":memory:")
-    ).decode("utf-8")
+    )
+    html = render.generate_dashboard_bytes(deck, Config(), Database(":memory:")).decode(
+        "utf-8"
+    )
     # Cards are built from the embedded feed as text; the JSON itself must
     # not let markup out of its <script> element.
     [card] = _embedded_feed(html)["stories"]
@@ -7668,7 +7090,9 @@ def test_embedded_feed_cannot_close_its_script_element() -> None:
     hostile = "</script><script>alert(1)</script><!--"
     story = _f2_story(11, hostile)
     html = render.generate_dashboard_bytes(
-        [ranking.RankedStory(story=story, score=1.0, best_match_title=hostile)],
+        _one_card_deck(
+            ranking.RankedStory(story=story, score=1.0, best_match_title=hostile)
+        ),
         Config(),
         Database(":memory:"),
     ).decode("utf-8")

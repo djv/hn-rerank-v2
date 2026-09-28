@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 import httpx
 import pytest
@@ -18,11 +20,12 @@ from hn_rerank.api import (
     save_profile,
 )
 from hn_rerank.app import Reader, Setup
-from hn_rerank.models import Feed, FeedStory
+from hn_rerank.models import Feed, FeedStory, Window
 from ._settle import settle
 
 
-def sample_feed(version: int = 0, target: int = 0) -> Feed:
+def sample_feed(version: int = 0, target: int = 0, window: Window = "1w") -> Feed:
+    """The 1w window holds stories 1 and 2; "archive" holds story 3."""
     stories = [
         FeedStory(
             i,
@@ -34,22 +37,21 @@ def sample_feed(version: int = 0, target: int = 0) -> Feed:
             10,
             i,
             float(4 - i),
-            ["recent_mixed"] if i < 3 else ["archive_mixed"],
-            i == 1,
-            i == 2,
         )
         for i in (1, 2, 3)
     ]
+    if window == "archive":
+        stories, orders = stories[2:], {"recommended": [3], "popular": [3]}
+    elif window == "1w":
+        stories = stories[:2]
+        orders = {"recommended": [1, 2], "popular": [1], "explore": [2]}
+    else:
+        stories, orders = [], {}
     return Feed(
-        1,
+        2,
+        window,
         stories,
-        {
-            "recommended:recent": [1, 2],
-            "recommended:archive": [3],
-            "popular:recent": [1],
-            "explore:recent": [2],
-            "date:recent": [2, 1],
-        },
+        orders,
         {"up": 0, "neutral": 0, "down": 0},
         version,
         target,
@@ -58,8 +60,12 @@ def sample_feed(version: int = 0, target: int = 0) -> Feed:
 
 
 class FakeServer:
+    """One deck: `feed` is its 1w window; other windows come from
+    `window_feeds` (or `sample_feed`) at the deck's version and state."""
+
     def __init__(self) -> None:
         self.feed = sample_feed()
+        self.window_feeds: dict[Window, Feed] = {}
         self.requests: list[httpx.Request] = []
         self.fail_vote = False
         self.delay_vote = 0.0
@@ -71,7 +77,8 @@ class FakeServer:
         if path.endswith("/api/user"):
             return httpx.Response(200, json={"user_id": 1, "token": "test"})
         if path.endswith("/api/feed"):
-            return httpx.Response(200, json=self.feed.to_dict())
+            window = cast(Window, request.url.params.get("window", "1w"))
+            return httpx.Response(200, json=self.feed_for(window).to_dict())
         if path.endswith("/api/tldr-detail") or "/api/tldr-cache/" in path:
             story_id = (
                 int(path.rsplit("/", 1)[1])
@@ -96,6 +103,26 @@ class FakeServer:
                 },
             )
         return httpx.Response(404)
+
+    def feed_for(self, window: Window) -> Feed:
+        if window == self.feed.window:
+            return self.feed
+        base = self.window_feeds.get(window) or sample_feed(window=window)
+        return replace(
+            base,
+            version=self.feed.version,
+            target_version=self.feed.target_version,
+            ready=self.feed.ready,
+            feedback_counts=self.feed.feedback_counts,
+        )
+
+    def feed_requests(self) -> list[str]:
+        """The window of every feed request, in order."""
+        return [
+            r.url.params.get("window", "")
+            for r in self.requests
+            if r.url.path.endswith("/api/feed")
+        ]
 
     def api(self) -> API:
         return API("https://example.org/hn/", "test", httpx.MockTransport(self))
@@ -124,8 +151,8 @@ async def test_navigation_resize_filters_and_late_summary(tmp_path: Path) -> Non
             app.query_one("#reading-pane").region.y
             > app.query_one("#headlines").region.y
         )
-        app.query_one("#age", Select).value = "archive"
-        await pilot.pause()
+        app.query_one("#window", Select).value = "archive"
+        await settle(pilot)
         assert [s.id for s in app.stories] == [3]
         await pilot.resize_terminal(120, 35)
         assert listing.display and app.query_one(Markdown).display
@@ -516,7 +543,7 @@ async def test_refresh_forces_only_selected_summary(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("width", [73, 146])
-@pytest.mark.parametrize("origin", ["cycle", "tabs", "age"])
+@pytest.mark.parametrize("origin", ["cycle", "tabs"])
 async def test_rapid_filter_changes_settle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, width: int, origin: str
 ) -> None:
@@ -532,23 +559,20 @@ async def test_rapid_filter_changes_settle(
             original(select_id)
 
         monkeypatch.setattr(app, "rebuild", counted_rebuild)
-        group, expected = ("age", "archive") if origin == "age" else ("sort", "date")
         # No yielding: reproduce several queued changes before either widget
         # has handled its peer's messages.
         if origin == "cycle":
-            for _ in range(3):
+            for _ in range(4):
                 app.action_cycle_sort()
-        elif origin == "tabs":
-            for value in ("popular", "explore", "date"):
-                app.query_one("#sort-tabs", Tabs).active = f"sort-{value}"
         else:
-            for value in ("archive", "recent", "archive"):
-                app.query_one("#age", Select).value = value
+            for value in ("popular", "explore", "popular", "explore"):
+                app.query_one("#sort-tabs", Tabs).active = f"sort-{value}"
         await settle(pilot)
-        assert app.query_one(f"#{group}", Select).value == expected
-        assert app.query_one(f"#{group}-tabs", Tabs).active == f"{group}-{expected}"
+        expected = "popular" if origin == "cycle" else "explore"
+        assert app.query_one("#sort", Select).value == expected
+        assert app.query_one("#sort-tabs", Tabs).active == f"sort-{expected}"
         settled = rebuilds
-        assert 0 < settled <= 3
+        assert 0 < settled <= 4
         await settle(pilot)
         assert rebuilds == settled  # No self-sustaining Select/Tabs echo.
 
@@ -564,7 +588,6 @@ async def test_s_cycles_sort_modes(tmp_path: Path) -> None:
         for expected, story_ids in (
             ("popular", [1]),
             ("explore", [2]),
-            ("date", [2, 1]),
             ("recommended", [1, 2]),
         ):
             await pilot.press("s")
@@ -580,9 +603,7 @@ async def test_explore_sort_is_shuffled(
     from dataclasses import replace
 
     fake = FakeServer()
-    fake.feed = replace(
-        fake.feed, orders={**fake.feed.orders, "explore:recent": [1, 2]}
-    )
+    fake.feed = replace(fake.feed, orders={**fake.feed.orders, "explore": [1, 2]})
 
     def reverse(order: list[int]) -> None:
         order[:] = order[::-1]
@@ -602,7 +623,7 @@ async def test_explore_sort_is_shuffled(
         assert [s.id for s in app.stories] == [2, 1]
         # Rebuild must copy: the shared server order stays intact for
         # prefetch entry points into other sorts.
-        assert fake.feed.orders["explore:recent"] == [1, 2]
+        assert fake.feed.orders["explore"] == [1, 2]
 
 
 async def test_explore_order_is_stable_within_a_visit(
@@ -614,7 +635,9 @@ async def test_explore_order_is_stable_within_a_visit(
 
     fake = FakeServer()
     fake.feed = replace(
-        fake.feed, orders={**fake.feed.orders, "explore:recent": [1, 2, 3]}
+        fake.feed,
+        stories=sample_feed(window="archive").stories + fake.feed.stories,
+        orders={**fake.feed.orders, "explore": [1, 2, 3]},
     )
     shuffles = 0
 
@@ -644,7 +667,7 @@ async def test_explore_order_is_stable_within_a_visit(
         app.rebuild()
         assert [s.id for s in app.stories] == first[1:]
         app.rated.clear()
-        await pilot.press("s", "s", "s", "s")  # full cycle back to explore
+        await pilot.press("s", "s", "s")  # full cycle back to explore
         await settle(pilot)
         assert str(app.query_one("#sort", Select).value) == "explore"
         assert [s.id for s in app.stories] != first
@@ -846,16 +869,9 @@ async def test_h_and_l_step_through_sorts_and_wrap(tmp_path: Path) -> None:
         app.query_one(OptionList).focus()
         sort = app.query_one("#sort", Select)
         seen = []
-        for key in "llllhh":
+        for key in "lllhh":
             await pilot.press(key)
             await pilot.pause()
             seen.append(str(sort.value))
-        assert seen == [
-            "popular",
-            "explore",
-            "date",
-            "recommended",
-            "date",
-            "explore",
-        ]
-        assert app.query_one("#sort-tabs", Tabs).active == "sort-explore"
+        assert seen == ["popular", "explore", "recommended", "explore", "popular"]
+        assert app.query_one("#sort-tabs", Tabs).active == "sort-popular"
