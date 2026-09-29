@@ -111,6 +111,7 @@ from .enrichment import (
     select_article_fetch_candidates,
     select_rss_article_prewarm,
 )
+from .ainews import AINEWS_SOURCE, AINEWS_TITLE_PREFIX, fetch_ainews_stories
 from .hn_dupes import (
     FeedbackDupeContext,
     _load_feedback_context,
@@ -341,6 +342,12 @@ def load_production_candidate_stories(
         configured_sources = tuple(
             dict.fromkeys(_rss_source_name(feed) for feed in config.rss.feeds)
         )
+        # AINews whole-issue rows stored before the per-topic split stay
+        # in the DB but are no longer candidates.
+        ainews_filter = ""
+        if config.ainews_enabled:
+            configured_sources += (AINEWS_SOURCE,)
+            ainews_filter = "AND title NOT LIKE ? "
         if configured_sources:
             placeholders = ",".join("?" for _ in configured_sources)
             rss_rows = db.execute(
@@ -348,11 +355,13 @@ def load_production_candidate_stories(
                 "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
                 "FROM stories "
                 f"WHERE time >= ? AND source IN ({placeholders}) "
+                f"{ainews_filter}"
                 f"{feedback_filter}"
                 "ORDER BY time DESC LIMIT ?",
                 (
                     cutoff_ts,
                     *configured_sources,
+                    *((f"{AINEWS_TITLE_PREFIX}%",) if ainews_filter else ()),
                     *feedback_params,
                     config.recent_candidate_rss_limit,
                 ),
@@ -768,7 +777,17 @@ async def fetch_candidates(
             days=config.days,
             exclude_urls=exclude_urls,
             db=db,
+            skip_title_prefixes=(AINEWS_TITLE_PREFIX,) if config.ainews_enabled else (),
         )
+        if config.ainews_enabled:
+            rss_stories += await fetch_ainews_stories(
+                config.ainews_feed_url,
+                config.days,
+                exclude_urls,
+                db,
+                max_tweets_per_run=config.ainews_max_tweets_per_run,
+                now=time.time(),
+            )
         deduped_candidates: list[Story] = list(candidates) + rss_stories
     else:
         deduped_candidates = list(candidates)

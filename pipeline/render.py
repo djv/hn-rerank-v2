@@ -71,6 +71,7 @@ def source_label_filter(source: str) -> str:
         "lobste_rs": "Lobsters",
         "discourse_haskell_org": "Haskell Discourse",
         "latent_space": "Latent Space",
+        "ainews": "AINews",
         "scottaaronson_blog": "Scott Aaronson",
         "simonwillison_net": "Simon Willison",
         "lwn_net": "LWN",

@@ -53,6 +53,7 @@ from database import (
 )
 from pipeline import Config, DEFAULT_ENV_PATH, Embedder, WindowDeck, is_hn_source
 from pipeline.ranking import serve_window
+from pipeline.ainews import AINEWS_SOURCE
 from llm_limiter import limiter as llm_limiter
 from reddit_limiter import limiter as reddit_limiter
 import http_fetch
@@ -2679,6 +2680,7 @@ def _generate_tldr_reply(
         article_body is None
         and story.url
         and src_kind is None
+        and story.source != AINEWS_SOURCE
         and len(story.self_text) < 500
         and _is_fetchable_article_url(story.url)
     )

@@ -1,5 +1,19 @@
 # Worklog: hn-rewrite
 
+## 2026-09-29 AINews per-topic source
+
+User: "make it a real source. To replace the single cards", keeping the
+Latent Space feed's other posts. New `rss_ainews` source
+(`pipeline/ainews.py`, ARCHITECTURE.md): regen splits each `[AINews]`
+issue into one story per Twitter-recap topic, bullets as `self_text`,
+fxtwitter tweet text as `top_comments`; the generic RSS path skips
+`[AINews]` entries and the candidate loader drops old whole-issue rows
+(kept in the DB). Config: `ainews_enabled`, `ainews_feed_url`,
+`ainews_max_tweets_per_run`. `scripts/ainews_topics.py` is now a read-only
+preview on the same code. An autouse conftest fixture stubs the regen leg so
+tests never reach the feed or fxtwitter. Live smoke (in-memory DB): 51
+topic stories, label "AINews". Not deployed (VPS SSH agent locked).
+
 ## 2026-09-28 AINews Reddit-recap subreddits
 
 User asked for AI Twitter as a source. Checked options: AINews (smol.ai,

@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 from reddit_fetch_queue import CoroFactory
 from reddit_feed_cache import cache as reddit_feed_cache
 from reddit_limiter import limiter as reddit_limiter
+from .ainews import AINEWS_SOURCE
 from .ranking import (
     Embedder,
     RankedStory,
@@ -599,6 +600,7 @@ async def _fetch_and_parse_feed(
     cutoff: float,
     now: float,
     exclude_urls: set[str],
+    skip_title_prefixes: tuple[str, ...] = (),
 ) -> list[Story]:
     """Fetch a single RSS feed (Reddit or non-Reddit) and parse to Stories.
 
@@ -653,6 +655,8 @@ async def _fetch_and_parse_feed(
                 continue
 
             title = entry.get("title", "Untitled")
+            if skip_title_prefixes and title.startswith(skip_title_prefixes):
+                continue
 
             summary = ""
             if "content" in entry and entry.content:
@@ -770,8 +774,12 @@ async def fetch_rss_feeds(
     days: int,
     exclude_urls: set[str],
     db: Database,
+    skip_title_prefixes: tuple[str, ...] = (),
 ) -> list[Story]:
     """Fetch non-Reddit RSS feeds synchronously and upsert to DB.
+
+    Entries whose title starts with one of ``skip_title_prefixes`` are
+    dropped (AINews issues, which ``pipeline.ainews`` splits by topic).
 
     Reddit RSS feeds are NOT fetched here — they are rate-limited and
     must be enqueued via :func:`build_reddit_topfeed_factories` plus
@@ -786,7 +794,9 @@ async def fetch_rss_feeds(
 
     other_feeds = [f for f in feeds if not _reddit_subreddit_from_feed_url(f)]
     tasks = [
-        _fetch_and_parse_feed(f, per_feed, cutoff, now, exclude_urls)
+        _fetch_and_parse_feed(
+            f, per_feed, cutoff, now, exclude_urls, skip_title_prefixes
+        )
         for f in other_feeds
     ]
     feed_results = list(await asyncio.gather(*tasks)) if tasks else []
@@ -907,6 +917,11 @@ def _is_fetchable_article_url(url: str) -> bool:
     return True
 
 
+# Sources whose text arrives complete: never fetch their URL as an article
+# (an AINews card's URL is the whole issue page).
+_NO_ARTICLE_SOURCES = frozenset({"rss_lesswrong_com", AINEWS_SOURCE})
+
+
 def _article_fetch_eligible(
     story: Story, db: Database, min_time: float, now_ts: float
 ) -> bool:
@@ -914,7 +929,7 @@ def _article_fetch_eligible(
         return False
     if not _is_fetchable_article_url(story.url):
         return False
-    if story.source.startswith("rss_reddit_") or story.source == "rss_lesswrong_com":
+    if story.source.startswith("rss_reddit_") or story.source in _NO_ARTICLE_SOURCES:
         return False
     if story.time < min_time:
         return False
@@ -931,7 +946,7 @@ def select_rss_article_prewarm(
     max_age_days: int = 30,
     now_ts: float | None = None,
 ) -> list[Story]:
-    """Newest RSS stories (not Reddit/LessWrong) still lacking article text.
+    """Newest RSS stories (not Reddit/LessWrong/AINews) still lacking article text.
 
     The warm-path fetcher only reaches stories that already rank near the
     top, so a feed that ships a short snippet never earns the text that
@@ -947,7 +962,7 @@ def select_rss_article_prewarm(
         for s in candidates
         if s.source.startswith("rss_")
         and not s.source.startswith("rss_reddit_")
-        and s.source != "rss_lesswrong_com"
+        and s.source not in _NO_ARTICLE_SOURCES
     ]
     stored = [
         s

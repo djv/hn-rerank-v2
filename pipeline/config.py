@@ -120,6 +120,11 @@ class Config:
     # Regen-time article fetches for new RSS snippet stories regardless of
     # rank (the warm path only reaches stories already near the top). 0 off.
     rss_article_prewarm_max_per_run: int = 30
+    # AINews issues split into one story per topic (pipeline/ainews.py);
+    # the generic RSS path then skips the feed's whole-issue entries.
+    ainews_enabled: bool = True
+    ainews_feed_url: str = "https://www.latent.space/feed"
+    ainews_max_tweets_per_run: int = 400
     article_fetch_concurrency: int = 10
     article_fetch_max_age_days: int = 30
     max_cached_models: int = 20
