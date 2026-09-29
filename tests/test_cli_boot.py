@@ -39,6 +39,7 @@ SCRIPT_MAINS = [
     "export_embedding_onnx",
     "encode_replay_embeddings",
     "fetch_articles_for_source",
+    "follow_pointer_threads",
     "hydrate_ch_seed",
     "ledger_report",
     "migrate_db_to_strict",
