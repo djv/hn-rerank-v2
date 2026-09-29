@@ -32,6 +32,13 @@ class ModelConfig:
     engagement_features_enabled: bool = False
     neutral_weight: float = 0.0
     enable_mmr: bool = False
+    # Opt-in (evaluation, 2026-09-29): rank-blend the final score with a dense
+    # logistic regression and a TF-IDF logistic regression (linear_blend.py).
+    linear_blend_enabled: bool = False
+    linear_blend_dense_weight: float = 0.2
+    linear_blend_tfidf_weight: float = 0.3
+    linear_blend_dense_c: float = 0.1
+    linear_blend_tfidf_c: float = 4.0
     diversity_threshold: float = 0.75
     knn_k: int = 10
     positive_cluster_k: int = 4

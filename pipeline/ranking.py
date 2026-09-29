@@ -36,6 +36,7 @@ from .config import (
     DEFAULT_ONNX_MODEL_DIR,
     is_hn_source,
 )
+from . import linear_blend
 from .model_manifest import ModelManifest, verify_model_dir
 
 if TYPE_CHECKING:
@@ -1119,6 +1120,8 @@ def _score_and_rank(
     now = time.time()
     scores = None
     probs = None
+    linear_models: linear_blend.LinearBlendModels | None = None
+    linear_dense_candidates: NDArray[np.float32] | None = None
     feedback_stories, feedback_labels, _vote_times = db.get_feedback_for_training(
         user_id=user_id
     )
@@ -1203,6 +1206,14 @@ def _score_and_rank(
                 )
                 fb_sig = signature.hexdigest()
                 cached_model = _get_cached_model(user_id, fb_sig)
+                if config.model.linear_blend_enabled and user_id is not None:
+                    linear_models = linear_blend.get_cached(
+                        (user_id, fb_sig, _MODEL_SCHEMA_VERSION)
+                    )
+                    if linear_models is None:
+                        # Refit the SVM too: the linear models train on its
+                        # scaled feature rows, which a cache hit skips.
+                        cached_model = None
 
             # Personalization: mean/closest per class from ALL real feedback
             fb_labels_arr = np.array(feedback_labels)
@@ -1404,6 +1415,27 @@ def _score_and_rank(
                     )
                 with trace.stage("svm_fit"):
                     svm.fit(fb_features_scaled, labels, sample_weight=sample_weights)
+                if config.model.linear_blend_enabled:
+                    try:
+                        with trace.stage("linear_blend_fit"):
+                            linear_models = linear_blend.fit_linear_blend(
+                                fb_features_scaled,
+                                labels,
+                                sample_weights,
+                                feedback_stories,
+                                feedback_labels,
+                                dense_c=config.model.linear_blend_dense_c,
+                                tfidf_c=config.model.linear_blend_tfidf_c,
+                            )
+                        if fb_sig and user_id is not None:
+                            linear_blend.set_cached(
+                                (user_id, fb_sig, _MODEL_SCHEMA_VERSION),
+                                linear_models,
+                                config.max_cached_models,
+                            )
+                    except Exception as e:
+                        trace.set_label("linear_blend_fit", "error")
+                        logging.error("Failed to fit linear blend: %r", e)
                 if fb_sig:
                     _set_cached_model(
                         user_id,
@@ -1422,6 +1454,7 @@ def _score_and_rank(
                     [cand_features[:, :emb_dim], cand_features_meta_scaled]
                 )
 
+            linear_dense_candidates = cand_features_scaled
             class_order = list(svm.classes_)
             idx_up = class_order.index(2)
             with trace.stage("decision"):
@@ -1523,6 +1556,25 @@ def _score_and_rank(
         scores = tier1_scores
 
     assert scores is not None
+
+    if (
+        linear_models is not None
+        and linear_dense_candidates is not None
+        and svm_scores is not None
+    ):
+        try:
+            with trace.stage("linear_blend_score"):
+                scores = linear_blend.blend_scores(
+                    linear_models,
+                    scores,
+                    linear_dense_candidates,
+                    candidates,
+                    dense_weight=config.model.linear_blend_dense_weight,
+                    tfidf_weight=config.model.linear_blend_tfidf_weight,
+                )
+        except Exception as e:
+            trace.set_label("linear_blend_score", "error")
+            logging.error("Failed to score linear blend: %r", e)
 
     ranked: list[RankedStory] = []
     if svm_probs is not None:
