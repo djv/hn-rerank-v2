@@ -392,11 +392,12 @@ async def test_empty_summary_hides_story_until_refresh(
             await pilot.pause(0.05)
 
 
-def test_open_in_chrome_opens_a_tab(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_open_in_browser_opens_a_tab(monkeypatch: pytest.MonkeyPatch) -> None:
     import subprocess as stdlib_subprocess
 
     import hn_rerank.app as app_module
 
+    monkeypatch.delenv("HN_RERANK_BROWSER", raising=False)
     calls: list[list[str]] = []
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr(
@@ -406,23 +407,36 @@ def test_open_in_chrome_opens_a_tab(monkeypatch: pytest.MonkeyPatch) -> None:
         ),
     )
     monkeypatch.setattr("subprocess.Popen", lambda argv, **k: calls.append(argv))
-    app_module.open_in_chrome("https://example.org/x")
+    app_module.open_in_browser("https://example.org/x")
     assert calls == [
         ["/usr/bin/google-chrome", "https://example.org/x"],
         ["wmctrl", "-x", "-a", "google-chrome.Google-chrome"],
     ]
 
 
-def test_open_in_chrome_without_chrome_uses_default_browser(
+def test_open_in_browser_without_chrome_uses_default_browser(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import hn_rerank.app as app_module
 
+    monkeypatch.delenv("HN_RERANK_BROWSER", raising=False)
     opened: list[str] = []
     monkeypatch.setattr("shutil.which", lambda name: None)
     monkeypatch.setattr(app_module.webbrowser, "open", opened.append)
-    app_module.open_in_chrome("https://example.org/x")
+    app_module.open_in_browser("https://example.org/x")
     assert opened == ["https://example.org/x"]
+
+
+def test_hn_rerank_browser_overrides_chrome(monkeypatch: pytest.MonkeyPatch) -> None:
+    import hn_rerank.app as app_module
+
+    monkeypatch.setenv("HN_RERANK_BROWSER", "surf -z 1.2")
+    calls: list[list[str]] = []
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: calls.append(a[0]))
+    monkeypatch.setattr("subprocess.Popen", lambda argv, **k: calls.append(argv))
+    app_module.open_in_browser("https://example.org/x")
+    assert calls == [["surf", "-z", "1.2", "https://example.org/x"]]
 
 
 async def test_stale_poll_does_not_cancel_summary_for_same_selection() -> None:
@@ -713,11 +727,12 @@ async def test_version_poll_keeps_hidden_stories_hidden(tmp_path: Path) -> None:
         assert [s.id for s in app.stories] == [1, 2]
 
 
-def test_open_in_chrome_falls_back_on_launch_error(
+def test_open_in_browser_falls_back_on_launch_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import hn_rerank.app as app_module
 
+    monkeypatch.delenv("HN_RERANK_BROWSER", raising=False)
     opened: list[str] = []
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/google-chrome")
 
@@ -726,7 +741,7 @@ def test_open_in_chrome_falls_back_on_launch_error(
 
     monkeypatch.setattr("subprocess.Popen", missing)
     monkeypatch.setattr(app_module.webbrowser, "open", opened.append)
-    app_module.open_in_chrome("https://example.org/x")
+    app_module.open_in_browser("https://example.org/x")
     assert opened == ["https://example.org/x"]
 
 

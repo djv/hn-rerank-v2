@@ -8,7 +8,8 @@ The server retains its existing access policy: installing the client does not gr
 Keys: j/k or arrows navigate/scroll; Tab changes focus; 1/2/3 vote
 positive/neutral/negative and advance to the next story at once (votes are sent
 in order in the background; a failed one puts its story back with an error);
-u undoes the latest vote; o/c open article/comments;
+u undoes the latest vote; o/c open article/comments (in Chrome, or in the
+command in `HN_RERANK_BROWSER`, e.g. `surf`);
 y copies the comments link (or the article link if there is none); r refreshes; ? shows help; q quits.
 Enter hides the article list and zooms the TLDR pane; Enter or Escape returns
 to the list. Escape also closes help. Use the sort and window selectors (or h/l and d) to change

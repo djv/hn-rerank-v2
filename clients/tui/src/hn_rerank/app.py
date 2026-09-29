@@ -177,12 +177,26 @@ def copy_with_system_tool(text: str) -> bool:
     return False
 
 
-def open_in_chrome(url: str) -> None:
-    """Open a URL in Chrome and bring its window forward. A running Chrome
-    adds the URL as a tab in its current window; otherwise it starts one."""
+def open_in_browser(url: str) -> None:
+    """Open a URL in `$HN_RERANK_BROWSER` (a command, e.g. `surf`) when set,
+    else in Chrome, bringing its window forward. A running Chrome adds the
+    URL as a tab in its current window; otherwise it starts one."""
+    import os
+    import shlex
     import shutil
     import subprocess
 
+    if custom := shlex.split(os.environ.get("HN_RERANK_BROWSER", "")):
+        try:
+            subprocess.Popen(
+                [*custom, url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            webbrowser.open(url)
+        return
     chrome = next(
         (
             path
@@ -1636,7 +1650,7 @@ class Reader(App[None]):
         story = self.selected()
         url = getattr(story, field, "") if story else ""
         if urlsplit(url).scheme in {"http", "https"}:
-            open_in_chrome(url)
+            open_in_browser(url)
         else:
             self.status("No link available for this story.")
 

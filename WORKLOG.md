@@ -1,5 +1,14 @@
 # Worklog: hn-rewrite
 
+## 2026-09-28 TUI browser override
+
+User wanted `o`/`c` to use a lightweight browser. `open_in_chrome` is now
+`open_in_browser`: when `HN_RERANK_BROWSER` is set (a command, split with
+`shlex`, e.g. `surf`), the URL goes to that command with no `wmctrl`
+raise; unset keeps the Chrome path. surf (WebKitGTK, one window per link)
+is installed and exported in `~/system-setup` `.bashrc`.
+`test_hn_rerank_browser_overrides_chrome` covers it.
+
 ## 2026-09-28 TUI footer on one row
 
 User: "hn tui Status should fit on one line. Currently it's two." The footer
