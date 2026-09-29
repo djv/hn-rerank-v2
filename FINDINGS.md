@@ -1,5 +1,46 @@
 # HN Rerank findings
 
+## TLDR providers and quality — 2026-09-29
+
+- `gofree` (longcat) since 17:02 UTC: 132 TLDRs, llm_ms p50 45 s, p90 61 s,
+  max 76 s; 25 llm_error, 35 half-only. Hydration under 2 s.
+- Bakeoff, 3 stories each (VPS `scripts/bakeoff_tldr_providers.py`):
+  gemini flash-lite 1.6-6 s 3/3; groq <1 s, 429 on the 3rd; cerebras 402;
+  gofree 20-52 s 3/3; mistral 2.2-3.9 s 3/3. Gemini free tier live: 4 taps,
+  then `GenerateRequestsPerDayPerProjectPerModel-FreeTier` quotaValue 20.
+- Key probe 20:28 UTC: mistral 200, groq 200, cerebras 402, zen 402
+  (funds), go 429 (monthly limit, resets 2026-10-06 16:28 UTC), openrouter
+  402 ($10.21 used of $10).
+- Mistral vs longcat on NSL, Pac-Bench, HN.watch: same facts, Mistral drops
+  names, versions and quotes. Mistral answered 1 of 3 discussion calls on
+  30230620 as prose (no bullets), which `_valid_llm_completion` rejects.
+- OpenRouter prices ($/day at ~520K in / 350K out): gpt-6-luna 0.23,
+  gemini-2.5-flash-lite 0.19, gpt-5-nano 0.17, gpt-oss-120b 0.08,
+  claude-haiku-4.5 2.27.
+- 1,104 stories link a tweet, 1,034 without article text; 90 archive rows
+  are pointer threads (comments under 400 chars with an HN item link).
+
+## ClickHouse source review — 2026-09-29
+
+Read-only review by a subagent, spot-checked:
+- Healthy: 5 `CH live_window failed` since Sep 23 (4 DNS, 1 "Too many
+  simultaneous queries"); none of MEMORY_LIMIT. Freshness: CH max(id) equal
+  to Firebase maxitem, newest item 26 s old at 20:36 UTC.
+- Sep 25 20:50 failed call: regen logged 4,068 candidates. The deck reads
+  live HN from the DB (`load_production_candidate_stories`), so the feed kept
+  its rows; scores went stale for one regen.
+- Comments were flat in GROUP BY order: on 49892245 every comment had
+  depth 0; top-level order differed from Firebase on 5/5 stories. After the
+  fix: 226 nodes vs 213 descendants, depth 12, order matches, 172/189
+  selectable comments below top level. 140 stories in 8.1 s at depth 30.
+- Depth 5 missed 10-22% (128 vs 165 of 210; 518 vs 573). Row-level
+  `deleted = 0` kept 30 of 5,428 comments deleted later.
+- CH had 7,511 live stories with score >= 5; `limit=5000` cut 2,511 (all
+  score 5-7, 56 from the last 24 h). DB held 5,148 live `hn` rows against a
+  5,000 deck cap.
+- Not fixed: `query_single_story` is test-only; ~140 HN stories re-prewarm
+  every regen (149 have <= 9 comments, likely under the 60-char minimum).
+
 ## Full-eval reruns of near-tie ideas — 2026-09-29
 
 The small test (900 votes, 3 folds) is too noisy for changes of ~0.01, so

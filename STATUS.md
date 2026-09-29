@@ -18,10 +18,19 @@ old profile, stopped 2026-09-24): ranking quality and which sources feed it.
 - Also live (from `f49ff0f`): time-window selector (12h/1d/1w/1m/Archive,
   `d` cycles; web and TUI reopen on the last window picked), AINews
   per-topic source (`rss_ainews`), 2026-09-26/27 source changes.
-- TLDRs (live `edb1316`, 2026-09-29 17:02 UTC): OpenCode Go plan limit
-  spent until ~2026-10-06, so `LLM_PROVIDER=gofree` (free
-  `longcat-2.5-preview-free` on the Go gateway, `reasoning_effort=low`).
-  Smoke: 5 of 6 TLDRs complete, 15-45s each. WORKLOG.md 2026-09-29.
+- TLDRs (live `ea1403b`, 2026-09-29 20:44 UTC): `LLM_PROVIDER=mistral`
+  (`mistral-small-latest`, paid key with a $10 cap), 2-4 s per TLDR; the
+  free `gofree` model took p50 45 s and left 60 of 132 failed or half-only.
+  Same stories: Mistral is correct but more generic than longcat. Fixes:
+  one retry when a reply has no bullets (lost halves), pointer threads
+  ("Comments moved to item?id=N") follow the link, tweet URLs summarized via
+  fxtwitter plus the page they link. Live checks: 32148318, 30230620.
+  FINDINGS.md "TLDR providers and quality".
+- ClickHouse source (live `7b1d70a`, 20:57 UTC): live-window query retried
+  3 times; comments nested in HN order up to 30 levels (was a flat list,
+  so thread-aware selection saw depth 0); live HN caps 5000 -> 10,000.
+  First regen: 9,187 candidates, no errors, dashboard 0.23 s; first rerank
+  over 10,111 candidates took 20 s. FINDINGS.md "ClickHouse source review".
 - TUI `a` (committed `48e460f`, tests pass): Claude Code in a tmux pane split beside
   the reader with the article/comments links and a dig-deeper prompt.
 - TUI status line (committed `48e460f`, 2026-09-29): always one row; long messages
@@ -69,9 +78,10 @@ old profile, stopped 2026-09-24): ranking quality and which sources feed it.
 ## Blocker / limits
 - Gemma side by side is not live and would need gemma on the VPS.
 - Blend gain is unconfirmed (flat on the newest 20%).
-- Go limit resets ~2026-10-06: then set `LLM_PROVIDER=gospark` in the
-  VPS `shared/.env` and restart. Luna via OpenAI needs an API key (none;
-  the ChatGPT plan only covers Codex).
+- Go limit resets 2026-10-06 16:28 UTC: then set `LLM_PROVIDER=gospark`
+  (now `mistral`) in the VPS `shared/.env` and restart. Mistral stops at its
+  $10 cap (balance not checked). OpenRouter, Zen and Cerebras have no
+  credit; Gemini free is 20 requests/day.
 - The merge's live effect needs ~100 new votes from 151 to read.
 - Offline gains over live are large on the full eval but flat on the newest 20%.
 - `/tmp` is wiped at boot: the eval dir is mirrored to
@@ -82,6 +92,10 @@ old profile, stopped 2026-09-24): ranking quality and which sources feed it.
 - Judge the live blend on new votes from 151 (up rate on shown stories
   before/after 17:17 UTC 2026-09-29). Rollback: `linear_blend_enabled =
   false`, `svm_c = 0.1` in `config.toml`, deploy, restart.
+- Measure a warm rerank with 10,111 candidates (first was 20 s vs 7.7 s
+  before); if it stays slow, lower `recent_candidate_hn_limit`.
+- Open TLDR gaps: a raw PDF stored as article text (46108780 fails);
+  archive dupe cards are not swapped by the dupe resolver (live `hn` only).
 - Restart the TUI reader to pick up the `a` key and one-row status line.
 - After ~100 new votes: compare 151's up rate on shown stories before and
   after the merge (`scripts/source_yield_report.py --user-id 151`).
