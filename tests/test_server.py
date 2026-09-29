@@ -4396,6 +4396,15 @@ def test_provider_max_tokens_reserves_reasoning_headroom() -> None:
     # headroom than the chat-completions reasoning providers (reasoning runs
     # 350-1000 tokens at effort=low, with outliers past 1,600).
     assert server._max_tokens_for_provider(gospark, 450) == 2450
+    gofree = server.LlmProviderConfig(
+        "gofree",
+        "key",
+        "https://opencode.ai/zen/go/v1/chat/completions",
+        "longcat-2.5-preview-free",
+        {},
+    )
+    # The free Go models reason silently; 450 alone came back empty.
+    assert server._max_tokens_for_provider(gofree, 450) == 2450
 
 
 @pytest.mark.parametrize(
@@ -4521,6 +4530,65 @@ async def test_call_llm_for_config_dispatches_on_endpoint(monkeypatch) -> None:
         await server._call_llm_for_config(go_cfg, prompt="p", max_tokens=10)
     ).content == "- r"
     assert calls == ["chat", "responses"]
+
+
+@pytest.mark.asyncio
+async def test_call_llm_chat_sends_go_session_only_to_the_go_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Go gateway's chat/completions rejects requests without
+    x-opencode-session and its free models need a longer timeout; other
+    chat providers get neither."""
+    import server
+
+    seen: list[tuple[float, dict[str, str]]] = []
+
+    class FakeResponse:
+        status_code = 200
+        headers: dict[str, str] = {}
+
+        def json(self) -> dict[str, Any]:
+            return {
+                "choices": [{"message": {"content": "- ok"}, "finish_reason": "stop"}],
+                "usage": {"total_tokens": 10},
+            }
+
+    class FakeClient:
+        def __init__(self, *, timeout: float) -> None:
+            self.timeout = timeout
+
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        async def post(
+            self, base_url: str, *, headers: dict[str, str], json: object
+        ) -> FakeResponse:
+            seen.append((self.timeout, dict(headers)))
+            return FakeResponse()
+
+    async def allow_acquire(*, estimated_tokens: int = 0) -> bool:
+        return True
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(server.llm_limiter, "acquire", allow_acquire)
+    monkeypatch.setattr(server.llm_limiter, "record_response", lambda **k: None)
+    for url in (
+        "https://opencode.ai/zen/go/v1/chat/completions",
+        "https://api.mistral.ai/v1/chat/completions",
+    ):
+        res = await server._call_llm_chat(
+            api_key="k", base_url=url, model="m", prompt="p", max_tokens=10
+        )
+        assert res.ok
+    (go_timeout, go_headers), (other_timeout, other_headers) = seen
+    assert go_timeout == 90.0 and other_timeout == 45.0
+    assert go_headers["x-opencode-session"].startswith("hn-rewrite-tldr-")
+    assert go_headers["User-Agent"] == "hn-rewrite-tldr/1.0"
+    assert "x-opencode-session" not in other_headers
+    assert "User-Agent" not in other_headers
 
 
 @pytest.mark.asyncio

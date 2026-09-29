@@ -722,21 +722,24 @@ async def _call_llm_chat(
         **(extra or {}),
     }
     estimated_tokens = len(prompt) // 3 + max_tokens
+    # The free Go models think for 15-45s on long discussions.
+    timeout = 90.0 if "/zen/go/" in base_url else 45.0
     try:
-        async with httpx.AsyncClient(timeout=45.0) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             for attempt in range(4):
                 if not await llm_limiter.acquire(estimated_tokens=estimated_tokens):
                     return LlmChatResult(
                         content="LLM quota cooldown; retry later.", ok=False, status=429
                     )
-                resp = await client.post(
-                    base_url,
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                )
+                headers = {
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                }
+                if "/zen/go/" in base_url:
+                    # The Go gateway rejects requests without a session id.
+                    headers["User-Agent"] = _GO_USER_AGENT
+                    headers["x-opencode-session"] = _go_session_id()
+                resp = await client.post(base_url, headers=headers, json=payload)
                 data = resp.json() if resp.status_code == 200 else {}
                 used_tokens = data.get("usage", {}).get("total_tokens")
                 llm_limiter.record_response(
@@ -1050,6 +1053,15 @@ _LLM_PROVIDERS: dict[str, tuple[str, str, str, dict[str, object]]] = {
         "muse-spark-1.3-contributor",
         {"reasoning_effort": "low"},
     ),
+    # Free models on the Go gateway (chat/completions); they answered while
+    # the Go plan's usage limit was spent (2026-09-29). LLM_MODEL picks
+    # another, e.g. space-bunny-free.
+    "gofree": (
+        "OPENCODE_GO_API_KEY",
+        "https://opencode.ai/zen/go/v1/chat/completions",
+        "longcat-2.5-preview-free",
+        {},
+    ),
     "gemini": (
         "GEMINI_API_KEY",
         "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
@@ -1086,6 +1098,10 @@ def _max_tokens_for_provider(cfg: LlmProviderConfig, base: int) -> int:
         # bucket. Reasoning is usually 350-1000 tokens at effort=low, but a
         # 1,647-token outlier exhausted the old +1200 cap and dropped the
         # article section (WORKLOG 2026-09-25); +2000 covers it plus output.
+        return base + 2000
+    if cfg.provider == "gofree":
+        # The free Go models reason without reporting it: 450 tokens came
+        # back empty (finish=length); a 2,450 cap stopped at ~1,450.
         return base + 2000
     if cfg.provider in {"cerebras", "groq"} and "reasoning_effort" in cfg.extra:
         return base + 600
