@@ -25,7 +25,8 @@ tldr_probe_max_threads_per_regen = 20
 tldr_tap_probe_timeout_seconds = 3.0
 
 [hn_rewrite.model]
-svm_c = 0.1
+svm_c = 4.0
+linear_blend_enabled = true
 svm_precomputed_enabled = true
 svm_precomputed_chunk_size = 512
 
