@@ -1,5 +1,13 @@
 # Worklog: hn-rewrite
 
+## 2026-09-29 Deployed `f49ff0f` (remember last window)
+
+VPS fast-forwarded from `d8643b5`, restarted 13:06 UTC (public URL up after
+~60s). `/hn/` 200 and serves the `hnWindow` code; with the user's profile
+all five `/api/feed?window=` 200 (17/20/17/17/46 stories). Journal: no
+errors. The unauthenticated page check created an empty user (190), like
+earlier smokes (188, 189). TUI restarted in tmux `work:2.1`.
+
 ## 2026-09-29 Clients reopen on the last time window
 
 User: "i dont like default date to be 1 week", then chose "Remember last".
