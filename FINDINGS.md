@@ -37,8 +37,14 @@
 - OpenRouter prices ($/day at ~520K in / 350K out): gpt-6-luna 0.23,
   gemini-2.5-flash-lite 0.19, gpt-5-nano 0.17, gpt-oss-120b 0.08,
   claude-haiku-4.5 2.27.
-- 1,104 stories link a tweet, 1,034 without article text; 90 archive rows
-  are pointer threads (comments under 400 chars with an HN item link).
+- 1,104 stories link a tweet, 1,034 without article text.
+- Pointer threads: "<= 400 chars with an HN link" matched 465 rows (402
+  live `hn`), mostly real threads citing others ("Related: <other story>",
+  "also saw it here", two comments). One comment opening with
+  moved/dupe/discussion wording or "moved the comments": 162 (124 `hn`, 34
+  `ch_seed`, 4 `bq_seed`); 160 followed. Under the loose rule (20:44-22:06
+  UTC) the service followed only 32148318 and 38507672 and cached no TLDR
+  for the 303 loose-only stories.
 
 ## ClickHouse source review — 2026-09-29
 

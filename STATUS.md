@@ -23,10 +23,15 @@ old profile, stopped 2026-09-24): ranking quality and which sources feed it.
   (`mistral-small-latest`, paid key with a $10 cap), 2-4 s per TLDR; the
   free `gofree` model took p50 45 s and left 60 of 132 failed or half-only.
   Same stories: Mistral is correct but more generic than longcat. Fixes:
-  one retry when a reply has no bullets (lost halves), pointer threads
-  ("Comments moved to item?id=N") follow the link, tweet URLs summarized via
-  fxtwitter plus the page they link. Live checks: 32148318, 30230620.
-  FINDINGS.md "TLDR providers and quality".
+  one retry when a reply has no bullets (lost halves), tweet URLs
+  summarized via fxtwitter plus the page they link. Pointer threads (one
+  short "Comments moved to / [dupe] / Discussion: item?id=N" comment, rule
+  `e491c38`) follow the link on tap and prefetch, and skip summaries cached
+  before the follow (38507672 served an invented discussion). Backfill
+  (`scripts/follow_pointer_threads.py`, 22:10 UTC): 160 of 162 followed and
+  embedded. A first, looser rule (live 20:44-22:06) matched 464, mostly real
+  threads; it wrote no TLDRs or comments for them (checked). FINDINGS.md
+  "TLDR providers and quality".
 - ClickHouse source (live `7b1d70a`, 20:57 UTC): live-window query retried
   3 times; comments nested in HN order up to 30 levels (was a flat list,
   so thread-aware selection saw depth 0); live HN caps 5000 -> 10,000.
