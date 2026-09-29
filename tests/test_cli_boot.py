@@ -17,6 +17,7 @@ from unittest.mock import patch
 import pytest
 
 SCRIPT_MAINS = [
+    "ainews_topics",
     "backfill_hn_comments",
     "backfill_lesswrong_score",
     "backfill_reddit_metadata",

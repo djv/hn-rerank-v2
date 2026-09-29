@@ -15,7 +15,17 @@ r/singularity 20, r/ClaudeAI 5, r/LocalLLM 5, r/ClaudeCode, r/StableDiffusion,
 r/ChatGPT. User asked to add the ones not already followed; they are now
 weekly-top RSS feeds in `config.toml`. Overlap with what user 1 sees on
 r/LocalLLaMA was not measured (VPS SSH agent locked; Reddit blocks the
-laptop).
+laptop). r/StableDiffusion and r/ChatGPT were dropped again as noisy.
+
+Prototype `scripts/ainews_topics.py` (read-only, not wired into regen):
+splits each `[AINews]` issue's Twitter recap into one card per bold-heading
+topic ("Top Story:" keeps its h2 subsections; ":"-ending sub-labels and
+"."-ending bold leads stay inside the topic; "Top tweets" and the Reddit
+recap are skipped), fetches every linked tweet from fxtwitter (JSON cache
+`~/.cache/hn-rerank/fxtwitter.json`), score = sum of tweet likes, and
+dedupes topics repeated across reposted issues. First run: 11 issues ->
+51 cards, 3-46k chars each, every linked tweet resolved. The newest issue
+in the feed can be a truncated preview ("Read more").
 
 ## 2026-09-28 TUI browser override
 
