@@ -206,6 +206,7 @@ label, chance 0.33) involve no fitting.
 | gemma | 0.676 | 0.701 | 0.730 | 0.709 | 0.692 | 0.518 | 0.366 | 0.839 |
 | harrier-270m (no prefix) | 0.670 | 0.699 | 0.720 | 0.698 | 0.692 | 0.478 | 0.385 | 0.679 |
 | harrier-0.6b (prefix) | 0.661 | 0.681 | 0.700 | 0.684 | 0.676 | 0.473 | 0.415 | 0.661 |
+| harrier-0.6b (no prefix) | 0.670 | 0.696 | 0.720 | 0.694 | 0.682 | 0.510 | 0.379 | 0.769 |
 
 - gemma's edge is real but small: few-shot (+0.014 at 25/class, SE 0.005),
   purer upvote neighbourhoods (0.52 vs 0.46) and much cleaner source
@@ -215,6 +216,13 @@ label, chance 0.33) involve no fitting.
   But it was encoded with the instruct prefix, and on harrier-270m the
   prefix cost ~0.02 AUC (0.729 with vs 0.752 without), so its
   no-prefix rerun is the fair test.
+- No-prefix rerun (2026-09-29): the prefix was the whole deficit. Taste AUC
+  0.760 logreg (best logreg of all) / 0.751 SVM, up vs down 0.869 (best),
+  top-12 up 0.70; few-shot and neighbourhoods level with gemma, topic
+  clusters between (V 0.77); temporal 0.694 still below stored (0.718).
+  Net: ties gemma, beats neither clearly, and is 2x its size (1.35 s/story
+  on the GPU). Encode decoder embedders (harrier) without the instruct
+  prefix on documents.
 
 ## TUI simplification — 2026-09-26
 
