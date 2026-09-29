@@ -12,7 +12,10 @@ positive/neutral/negative and advance to the next story at once (votes are sent
 in order in the background; a failed one puts its story back with an error);
 u undoes the latest vote; o/c open article/comments (in Chrome, or in the
 command in `HN_RERANK_BROWSER`, e.g. `surf`);
-y copies the comments link (or the article link if there is none); r refreshes; ? shows help; q quits.
+y copies the comments link (or the article link if there is none); a opens
+Claude Code in a tmux pane split beside the reader (in your home directory) with the article and
+comments links and a "dig deeper" prompt (`HN_RERANK_AGENT` overrides the
+`claude` command; outside tmux the prompt is copied instead); r refreshes; ? shows help; q quits.
 Enter hides the article list and zooms the TLDR pane; Enter or Escape returns
 to the list. Escape also closes help. Use the sort and window selectors (or h/l and d) to change
 filters. Below 100 columns the headline list stacks above the summary.
@@ -82,7 +85,7 @@ the command palette holds until the next boundary). Unselected headlines are
 dimmed, so the selected row (a lifted band plus the `>` marker) reads first. One docked footer bar carries the current
 filter's counts on the left (`2 shown · +0 ~0 −0`) and context-sensitive keys on
 the right, on one row whenever both fit (narrow panes and long messages stack
-them); failures appear there with a `✗` prefix and replace the counts until
+them; the status is always one row, cut with `…` when too long); failures appear there with a `✗` prefix and replace the counts until
 the next successful refresh. Scrollbars follow the theme, and stories without a
 usable timestamp simply omit the age.
 

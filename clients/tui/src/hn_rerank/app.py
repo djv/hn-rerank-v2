@@ -234,6 +234,58 @@ def open_in_browser(url: str) -> None:
             pass  # Focusing the window is cosmetic.
 
 
+def dig_deeper_prompt(story: FeedStory) -> str:
+    """The opening prompt for a rabbit-hole agent session on one story."""
+    links = [
+        f"{label}: {url}"
+        for label, url in (
+            ("Article", story.article_url),
+            ("Discussion", story.comments_url),
+        )
+        if urlsplit(url).scheme in {"http", "https"}
+    ]
+    return "\n".join(
+        [
+            f"Dig deeper into this story from my news reader: {story.title}",
+            *links,
+            "",
+            "Read the article and the discussion. Tell me the key ideas, what is"
+            " new or surprising, where commenters push back or add expertise, and"
+            " background or related work worth reading next. Then wait for my"
+            " follow-up questions.",
+        ]
+    )
+
+
+def open_agent_session(prompt: str) -> bool:
+    """Start `$HN_RERANK_AGENT` (default `claude`) on the prompt in a tmux
+    pane split beside the reader's, in the home directory; False outside
+    tmux or on failure."""
+    import os
+    import shlex
+    import subprocess
+
+    if not os.environ.get("TMUX"):
+        return False
+    agent = shlex.split(os.environ.get("HN_RERANK_AGENT", "")) or ["claude"]
+    # With several arguments tmux runs the command directly, so the prompt
+    # needs no shell quoting.
+    command = ["tmux", "split-window", "-h", "-c", str(Path.home())]
+    if pane := os.environ.get("TMUX_PANE"):
+        command += ["-t", pane]
+    try:
+        subprocess.run(
+            [*command, *agent, prompt],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return True
+
+
 class ArrowLeftCurrent(SelectCurrent):
     """SelectCurrent with the toggle arrow ahead of the label."""
 
@@ -548,7 +600,8 @@ class Reader(App[None]):
     #summary MarkdownBlock > .em { color: $hn-accent; }
     #footer { dock: bottom; layout: horizontal; height: auto; background: $hn-bar;
               border-top: solid $hn-rule; }
-    #status { width: auto; height: auto; max-height: 3; padding: 0 1; color: $hn-muted; }
+    #status { width: auto; height: 1; padding: 0 1; color: $hn-muted;
+              text-wrap: nowrap; text-overflow: ellipsis; }
     #status.context { color: $hn-soft; }
     #status.error { color: $hn-bad; text-style: bold; }
     #shortcuts { width: 1fr; height: auto; padding: 0 1; color: $hn-faint;
@@ -581,6 +634,7 @@ class Reader(App[None]):
         ("o", "open_url('article_url')", "Article"),
         ("c", "open_url('comments_url')", "Comments"),
         ("y", "copy_url", "Copy link"),
+        ("a", "dig_deeper", "Ask Claude"),
         ("r", "refresh", "Refresh"),
         ("s", "cycle_sort", "Sort"),
         ("h", "cycle_sort(-1)", "Prev sort"),
@@ -1667,6 +1721,21 @@ class Reader(App[None]):
         else:
             self.status("No link available for this story.")
 
+    async def action_dig_deeper(self) -> None:
+        """Open a Claude Code session on the story, or copy its prompt."""
+        story = self.selected()
+        if story is None:
+            self.status("No story selected.")
+            return
+        prompt = dig_deeper_prompt(story)
+        # tmux answers at once, but a wedged server must not freeze the reader.
+        if await asyncio.to_thread(open_agent_session, prompt):
+            self.status(f"Opened Claude on: {story.title}")
+            return
+        self.copy_to_clipboard(prompt)
+        await asyncio.to_thread(copy_with_system_tool, prompt)
+        self.status("Could not open a tmux pane; copied the Claude prompt.")
+
     async def action_copy_url(self) -> None:
         """Copy the comments link, or the article link when there is none."""
         story = self.selected()
@@ -1799,12 +1868,13 @@ class Reader(App[None]):
             "## Sort\n\n"
             "- `s`: cycle sort (Recommended → Popular → Explore)\n"
             "- `h` / `l`: previous / next sort\n"
-            "- `a`: next time window (12 hours → 1 day → 1 week → 1 month"
+            "- `d`: next time window (12 hours → 1 day → 1 week → 1 month"
             " → Archive)\n"
             "- Selectors: sort and time window\n\n"
             "## Other\n\n"
             "- `o` / `c`: open article / comments\n"
             "- `y`: copy comments link (article link if none)\n"
+            "- `a`: dig deeper: Claude Code in a tmux pane beside this one\n"
             "- `r`: refresh and regenerate selected summary\n"
             "- `b`: badge legend\n"
             "- `?`: this help\n"

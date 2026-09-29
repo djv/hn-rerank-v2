@@ -780,6 +780,96 @@ async def test_y_copies_comments_link_else_article_link(
         assert len(copied) == 2
 
 
+def test_open_agent_session_splits_the_readers_tmux_pane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess
+
+    import hn_rerank.app as app_module
+
+    calls: list[list[str]] = []
+    monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,1,0")
+    monkeypatch.setenv("TMUX_PANE", "%7")
+    monkeypatch.delenv("HN_RERANK_AGENT", raising=False)
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda argv, **k: calls.append(argv) or subprocess.CompletedProcess(argv, 0),
+    )
+    prompt = "Dig deeper 'quoted' $HOME\nArticle: https://example.org/1"
+    assert app_module.open_agent_session(prompt) is True
+    assert calls == [
+        ["tmux", "split-window", "-h", "-c", str(Path.home()), "-t", "%7"]
+        + ["claude", prompt]
+    ]
+    monkeypatch.setenv("HN_RERANK_AGENT", "claude --model opus")
+    app_module.open_agent_session("p")
+    assert calls[-1][-4:] == ["claude", "--model", "opus", "p"]
+
+
+def test_open_agent_session_fails_outside_tmux_or_on_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess
+
+    import hn_rerank.app as app_module
+
+    calls: list[list[str]] = []
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.setattr("subprocess.run", lambda argv, **k: calls.append(argv))
+    assert app_module.open_agent_session("p") is False
+    assert calls == []
+
+    def fail(argv: list[str], **kwargs: object) -> None:
+        raise subprocess.CalledProcessError(1, argv)
+
+    monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,1,0")
+    monkeypatch.setattr("subprocess.run", fail)
+    assert app_module.open_agent_session("p") is False
+
+
+async def test_a_opens_claude_with_story_links_else_copies_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import dataclasses
+
+    import hn_rerank.app as app_module
+
+    sessions: list[str] = []
+    copied: list[str] = []
+    opened = True
+
+    def open_session(prompt: str) -> bool:
+        sessions.append(prompt)
+        return opened
+
+    monkeypatch.setattr(app_module, "open_agent_session", open_session)
+    monkeypatch.setattr(app_module, "copy_with_system_tool", copied.append)
+    fake = FakeServer()
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        story = app.selected()
+        assert story is not None
+        await pilot.press("a")
+        await pilot.pause()
+        prompt = sessions[-1]
+        assert story.title in prompt
+        assert "Article: https://example.org/1" in prompt
+        assert "Discussion: https://news.ycombinator.com/item?id=1" in prompt
+        assert copied == []
+        # No usable comments link: the prompt carries the article alone.
+        bare = dataclasses.replace(story, comments_url="javascript:x")
+        monkeypatch.setattr(app, "selected", lambda: bare)
+        opened = False
+        await pilot.press("a")
+        await pilot.pause()
+        assert "Discussion" not in sessions[-1]
+        assert copied == [sessions[-1]]
+        assert "copied the Claude prompt" in str(
+            app.query_one("#status", Static).content
+        )
+
+
 def test_copy_with_system_tool_skips_failing_tools(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

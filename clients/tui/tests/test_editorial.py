@@ -637,7 +637,8 @@ async def test_narrow_footer_fits_error_and_zoom_shortcuts() -> None:
         status = app.query_one("#status").region
         hints = app.query_one("#shortcuts").region
         footer = app.query_one("#footer").content_region
-        assert status.height == 3
+        # A long message is cut to one row with an ellipsis, never wrapped.
+        assert status.height == 1
         assert status.bottom <= hints.y
         assert hints.bottom <= footer.bottom
 

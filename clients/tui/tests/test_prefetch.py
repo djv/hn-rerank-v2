@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from pathlib import Path
 from collections.abc import Callable
 from dataclasses import replace
 
@@ -171,6 +172,7 @@ def test_cli_prefetch_flag(monkeypatch: pytest.MonkeyPatch) -> None:
             server: str | None = None,
             prefetch: int = 2,
             prefetch_generate: int = 3,
+            window_file: Path | None = None,
         ) -> None:
             captured["prefetch"] = prefetch
 
