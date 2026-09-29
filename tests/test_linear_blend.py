@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Literal
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -176,6 +178,6 @@ def test_count_rows_cached_per_story_and_text(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(linear_blend._HASHER, "transform", counting)
     assert (linear_blend.count_rows(stories) != first).nnz == 0
     assert calls == []
-    edited = [stories[0].__class__(**{**stories[0].__dict__, "title": "new title"})]
+    edited = [replace(stories[0], title="new title")]
     linear_blend.count_rows(edited)
     assert calls == [1]
