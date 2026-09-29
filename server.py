@@ -1359,6 +1359,13 @@ async def generate_detailed_tldr(
     return _llm_error_from(result)
 
 
+def _is_unfollowed_pointer(story: Story) -> bool:
+    """An HN story whose stored discussion is still a pointer note."""
+    return is_hn_source(story.source) and (
+        pointer_thread_target(story.top_comments or "", source_id=story.id) is not None
+    )
+
+
 async def _follow_pointer_thread(db: Database, story: Story) -> Story:
     """Swap a pointer thread's lone "comments moved to item?id=N" note for
     the comments of thread N, persisted so cached TLDRs keep matching."""
@@ -1462,6 +1469,8 @@ async def _prefetch_tldrs_for_ranked(
         story = db.get_story(story_id)
         if not story:
             return False
+        if _is_unfollowed_pointer(story):
+            story = await _follow_pointer_thread(db, story)
 
         title = story.title
         self_text = story.self_text or ""
@@ -2958,9 +2967,7 @@ def _generate_tldr_reply(
     elif isinstance(article_result, Exception):
         logging.error("TLDR article lane failed: %r", article_result)
 
-    if is_hn_source(story.source) and pointer_thread_target(
-        story.top_comments or "", source_id=story.id
-    ):
+    if _is_unfollowed_pointer(story):
         story = asyncio.run(_follow_pointer_thread(runtime.db, story))
 
     cache_key = _tldr_cache_key(
@@ -3088,6 +3095,11 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             article_body=article_body or "",
         )
         cached_tldr = runtime.db.get_tldr_cache(story.id, cache_key)
+        if _is_unfollowed_pointer(story):
+            # A summary cached for a "Comments moved to item?id=N" note
+            # predates pointer following (it invented a discussion); hydrate
+            # so the follow runs and the key moves to the real thread.
+            cached_tldr = None
         # Tap-time probe: a young HN thread that would otherwise serve cached
         # gets one live-count check first; confirmed growth falls through to
         # hydration below instead of serving stale. Miss/failure serves cached.
@@ -3368,7 +3380,7 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
         if not _flask_user(runtime):
             return _flask_json_response({"error": "No session"}, status=401)
         story = runtime.db.get_story(story_id)
-        if story is None:
+        if story is None or _is_unfollowed_pointer(story):
             return Response(status=204)
         key = _tldr_cache_key(
             title=story.title,

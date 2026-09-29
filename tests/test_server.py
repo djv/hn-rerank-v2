@@ -6330,3 +6330,64 @@ def test_old_html_failure_does_not_block_tweet_urls(tmp_path: Path) -> None:
     )
     assert _article_fetch_failure_active(db, 1, 1e9) is True
     db.close()
+
+
+def test_pointer_thread_skips_stale_cache_and_follows(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A summary cached for a "Comments moved" note is not served (tap or
+    cache peek); the tap follows the link and summarizes the real thread."""
+    import pipeline.enrichment as enrichment
+    import server
+
+    _, db, _, handler, user = test_env
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+    note = "Comments moved to https://news.ycombinator.com/item?id=38505211."
+    story = Story(
+        id=38507672,
+        title="LLM Visualization",
+        url="https://bbycroft.net/llm",
+        score=972,
+        time=1_701_616_959,
+        text_content="LLM Visualization",
+        source="ch_seed",
+        comment_count=1,
+        comment_count_at_fetch=1,
+        top_comments=note,
+        article_body="Interactive 3D walkthrough of a GPT. " * 20,
+    )
+    db.upsert_story(story)
+    stale_key = server._tldr_cache_key(
+        title=story.title,
+        self_text="",
+        top_comments=note,
+        article_body=story.article_body,
+    )
+    db.upsert_tldr_cache(story.id, stale_key, "Invented discussion")
+
+    async def fake_thread(client: object, sid: int) -> str:
+        assert sid == 38505211
+        return "Real comment about the visualization."
+
+    seen: list[str] = []
+
+    async def fake_generate(
+        title: str, self_text: str, top_comments: str, article_body: str
+    ) -> "server.TldrResult":
+        seen.append(top_comments)
+        return server.TldrResult(kind="ok", tldr="Real summary")
+
+    monkeypatch.setattr(enrichment, "fetch_thread_comments", fake_thread)
+    monkeypatch.setattr(server, "generate_detailed_tldr", fake_generate)
+    monkeypatch.setattr(
+        server,
+        "_fetch_article_body_with_result",
+        lambda url: pytest.fail("article already stored"),
+    )
+
+    assert client.get(f"/api/tldr-cache/{story.id}").status_code == 204
+    resp = client.post("/api/tldr-detail", json={"story_id": story.id})
+
+    assert resp.get_json()["tldr"] == "Real summary"
+    assert seen == ["Real comment about the visualization."]
