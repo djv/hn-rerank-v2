@@ -5,15 +5,16 @@ Improve what the dashboard shows the user (live profile 151; user 1 is the
 old profile, stopped 2026-09-24): ranking quality and which sources feed it.
 
 ## Verified result
-- Linear blend live on the VPS since `26b9474` (2026-09-29 17:17 UTC), now
-  at `7d9c231` (17:27 UTC, hashed TF-IDF rows cached per story):
+- Linear blend live on the VPS since `26b9474` (2026-09-29 17:17 UTC):
   `svm_c = 4.0`, `linear_blend_enabled = true` (0.5 production + 0.2 dense
-  LR + 0.3 TF-IDF LR). No errors after restart; feed reads 200 in ~0.5 s via
-  Tailscale for every window. First rerank cost 21-29 s (fit 14 s,
-  scoring 8-9 s); with the row cache warm a rerank is 7.7 s (fit 3.6 s,
-  scoring 0.5 s; live before the blend: 4-13 s). The fit repeats after every
-  vote. A
-  "refresh failing" report matched the ~100 s restart gap, not a bug.
+  LR + 0.3 TF-IDF LR). Rerank after a vote (live `371a2bd`, 21:43-21:48
+  UTC, user voting, 11,360 candidates): 5.7-11 s, median ~7.4 s, one 17.9 s;
+  earlier the same evening 10-24 s. Fixes: the blend refit warm-starts from
+  the previous fit (0.3-1.3 s, was 5-18 s); background article/prewarm
+  embedding pauses while a rerank runs; article fetch embeds the stored
+  text (it re-embedded ~50 stories under the pool lock each regen, a 49 s
+  stall). The first rerank after a restart is still ~54 s (cold caches).
+  FINDINGS.md "Rerank latency — 2026-09-29".
   FINDINGS.md "Linear blend live: rank latency".
 - Also live (from `f49ff0f`): time-window selector (12h/1d/1w/1m/Archive,
   `d` cycles; web and TUI reopen on the last window picked), AINews
@@ -29,8 +30,8 @@ old profile, stopped 2026-09-24): ranking quality and which sources feed it.
 - ClickHouse source (live `7b1d70a`, 20:57 UTC): live-window query retried
   3 times; comments nested in HN order up to 30 levels (was a flat list,
   so thread-aware selection saw depth 0); live HN caps 5000 -> 10,000.
-  First regen: 9,187 candidates, no errors, dashboard 0.23 s; first rerank
-  over 10,111 candidates took 20 s. FINDINGS.md "ClickHouse source review".
+  First regen: 9,187 candidates, no errors, dashboard 0.23 s.
+  FINDINGS.md "ClickHouse source review".
 - TUI `a` (committed `48e460f`, tests pass): Claude Code in a tmux pane split beside
   the reader with the article/comments links and a dig-deeper prompt.
 - TUI status line (committed `48e460f`, 2026-09-29): always one row; long messages
@@ -92,8 +93,10 @@ old profile, stopped 2026-09-24): ranking quality and which sources feed it.
 - Judge the live blend on new votes from 151 (up rate on shown stories
   before/after 17:17 UTC 2026-09-29). Rollback: `linear_blend_enabled =
   false`, `svm_c = 0.1` in `config.toml`, deploy, restart.
-- Measure a warm rerank with 10,111 candidates (first was 20 s vs 7.7 s
-  before); if it stays slow, lower `recent_candidate_hn_limit`.
+- After the next hourly regen, check the pool rebuild no longer logs
+  `embedding_perf texts=~50` (stories fetched before `371a2bd` were
+  re-embedded at the 21:42 startup). If reranks drift above ~10 s, lower
+  `recent_candidate_hn_limit` (SVM decision and feature prep scale with it).
 - Open TLDR gaps: a raw PDF stored as article text (46108780 fails);
   archive dupe cards are not swapped by the dupe resolver (live `hn` only).
 - Restart the TUI reader to pick up the `a` key and one-row status line.

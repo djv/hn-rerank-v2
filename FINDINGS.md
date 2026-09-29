@@ -1,5 +1,25 @@
 # HN Rerank findings
 
+## Rerank latency — 2026-09-29
+
+- Before: `linear_blend_fit_ms` 5-18 s per vote (19:50-20:41 UTC, 10k
+  candidates); the 7.7 s "warm" figure was a best case. After the cap raise
+  (11,360 candidates) warm reranks were 15-22 s.
+- VPS probe, 151's 2,883 votes: hashed rows cold 2.4 s / warm 0.11 s; dense
+  LR 1.4 s; TF-IDF logreg C=4 ~44-50 lbfgs iterations, 7-14 s (229k kept
+  columns). Warm start from the fit one vote earlier: 12 iterations, 2.2 s
+  vs 13.9 s, Spearman 0.99999.
+- Spikes at 21:03 and 21:20 (`tier2_ms` 12-17 s, `dedup_ms` 8-12 s, normally
+  under 1 s) coincided with post-regen article fetch embedding one story at
+  a time and regen prewarm embedding ~1,000 stories.
+- 21:38 rerank 56 s: `candidate_sql_ms` 49 s behind the pool lock while the
+  rebuild embedded 51 stories (45.6 s). Those were articles fetched from
+  deck ranking copies (no comments): embedded under a hash of title +
+  article, then `upsert_story` merged comments into `text_content`.
+- After all fixes, 12 reranks while voting (21:43-21:48): total 5.7-11 s
+  (one 17.9 s), fit 0.3-1.3 s (occasionally 3-5 s), pool wait < 2 ms,
+  SVM decision 1.1-2.7 s, feature prep 0.75-3 s.
+
 ## TLDR providers and quality — 2026-09-29
 
 - `gofree` (longcat) since 17:02 UTC: 132 TLDRs, llm_ms p50 45 s, p90 61 s,
