@@ -35,6 +35,7 @@ from .ranking import (
     _extract_comments_recursive,
     _select_top_comments,
     join_top_comments,
+    story_embedding_text,
 )
 
 
@@ -1145,9 +1146,16 @@ async def fetch_and_cache_article_bodies(
                     )
                     updated = replace(story, article_body=body, text_content=new_text)
                     db.upsert_story(updated)
+                    # Deck stories are ranking copies without comments or
+                    # self text; the stored row merges them back in. Embed
+                    # the stored text, or its hash never matches and the
+                    # next pool rebuild re-embeds the story under the pool
+                    # lock (a 45 s rerank stall after each regen).
+                    updated = db.get_story(story.id) or updated
+                    embed_text = story_embedding_text(updated)
                     await rank_gate.wait_idle_async()
-                    new_vec = embedder.encode([new_text])[0]
-                    new_hash = hashlib.sha256(new_text.encode("utf-8")).hexdigest()
+                    new_vec = embedder.encode([embed_text])[0]
+                    new_hash = hashlib.sha256(embed_text.encode("utf-8")).hexdigest()
                     db.upsert_embedding(
                         story.id,
                         model_version,

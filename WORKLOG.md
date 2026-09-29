@@ -24,6 +24,15 @@ fetch and embedding, prewarm embeds in batches of 32 and waits between
 them (at most 120 s per wait). Only background paths wait, never code a
 rerank runs.
 
+The first post-deploy regen still stalled one rerank 56 s: `candidate_sql_ms`
+49 s, waiting on the pool lock while the rebuild re-embedded 51 stories
+(45.6 s). Cause, pre-existing: background article fetch works on deck
+stories, which are ranking copies without comments or self text. It
+embedded title + article and stored that hash, while `upsert_story` merged
+the comments back into `text_content`, so every fetched article was
+re-embedded (with the right text) at the next pool rebuild, under the lock.
+The fetch path now embeds the stored row's `story_embedding_text`.
+
 ## 2026-09-29 Linear blend refits start from the previous fit
 
 Warm reranks after the cap raise took 15-22 s, but `linear_blend_fit_ms`

@@ -7613,3 +7613,45 @@ def test_config_load_rejects_wrongly_typed_values(tmp_path: Path) -> None:
                         Config.load(str(path))
             checked += 1
     assert checked > 60  # every scalar field across the three sections
+
+
+def test_article_fetch_embeds_the_stored_text_of_a_ranking_copy(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deck story has no comments in memory; the embedding must match the
+    stored row (with comments), so the pool rebuild finds it cached."""
+    import asyncio
+
+    import server
+
+    full = Story(
+        id=301,
+        title="Article with a thread",
+        url="https://example.com/t",
+        score=10,
+        time=int(time.time()) - 3600,
+        text_content="Article with a thread",
+        source="hn",
+        top_comments="A long and useful comment about the article.",
+        comment_count=3,
+        comment_count_at_fetch=3,
+    )
+    db.upsert_story(full)
+    ranking_copy = replace(full, top_comments="", self_text="", article_body="")
+
+    async def dummy_fetch(url: str) -> server.ArticleFetchResult:
+        return server.ArticleFetchResult(body="The article body. " * 10, status=200)
+
+    monkeypatch.setattr(server, "_fetch_article_body_with_result", dummy_fetch)
+    embedder = _CountingDummyEmbedder()
+    asyncio.run(
+        pipeline.fetch_and_cache_article_bodies(
+            db=db, embedder=embedder, stories=[ranking_copy], concurrency=1
+        )
+    )
+    stored = db.get_story(301)
+    assert stored is not None and "useful comment" in stored.text_content
+    assert embedder.encode_calls == 1
+
+    pipeline.get_or_compute_embeddings([stored], embedder, db)
+    assert embedder.encode_calls == 1
