@@ -1067,3 +1067,19 @@ Correction: the "base" above (`svm_c=4` + 0.3 LR) is not live. Live is `producti
 | `--confirmation`, 4 folds | 0.667 → 0.667 | 0.739 → 0.751 | +0.011, p=0.38, 2/4 folds |
 
 Most of the full-eval gain over live comes from `svm_c` 0.1 → 4 plus the LR blend, not from TF-IDF alone (TF-IDF adds about +0.016 AUC on top). The newest-20% confirmation is flat, so treat the size of the gain as unconfirmed.
+
+### Linear blend live: rank latency — 2026-09-29
+
+Deployed `26b9474` (`svm_c = 4.0`, `linear_blend_enabled = true`), restart 17:17 UTC; server not listening until 17:18:45 (a refresh in that window gets "Connection failed"). No errors after restart. `rank_perf` for user 151 (2,845 votes, ~10k candidates):
+
+| | rank_total_ms |
+|---|---|
+| Before (12:00–17:17 UTC, 8 ranks) | 4,240–12,842 |
+| After, model cache miss | 29,259 (`linear_blend_fit_ms` 14,412, `linear_blend_score_ms` 7,815) |
+| After, model cache hit | 21,755 (`linear_blend_score_ms` 9,238) |
+
+Reads stay fast (`/api/feed` 8-10 ms on the VPS, ~0.5 s via Tailscale, all windows 200), since they serve the current deck while a rerank runs; the reranked deck after a vote arrives ~15-20 s later than before.
+
+### Hashed TF-IDF (per-story cached) vs live — 2026-09-29
+
+Production TF-IDF now hashes word 1-2 grams into 2^18 columns so a story's row is cached across retrains and ranks (first live rank: fit 14.4s, scoring 7.8s on 10k candidates). Columns seen in <2 training stories are dropped; idf and sublinear tf are fit on training votes. Same eval as above (stored embeddings, vs live `production`): full AUC 0.726 -> 0.788 (was 0.790), P@12 0.625 -> 0.708 (was 0.719); newest 20% AUC 0.739 -> 0.750 (was 0.751). Same gain within noise.

@@ -22,7 +22,7 @@ from urllib.parse import urlparse
 
 import numpy as np
 from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_extraction.text import TfidfTransformer, TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
@@ -47,7 +47,7 @@ from pipeline import (
 )
 from pipeline.config import is_hn_source
 from pipeline.linear_blend import (
-    make_tfidf_vectorizer,
+    count_rows,
     percentile_scores,
     tfidf_text as tfidf_text_full,
 )
@@ -1379,7 +1379,16 @@ def _tfidf_text(story: Story, text: str = "full") -> str:
 
 def _tfidf_features(fold: FoldData, text: str, char: bool) -> tuple[Any, Any]:
     """Sparse TF-IDF rows for training votes and candidates; the vocabulary
-    comes from the fold's training votes only."""
+    comes from the fold's training votes only. The default (word grams over
+    the full text) is the production hashed model."""
+    if not char and text == "full":
+        counts = count_rows(fold.train_stories)
+        keep = np.asarray((counts > 0).sum(axis=0)).ravel() >= 2
+        idf = TfidfTransformer(sublinear_tf=True)
+        return (
+            idf.fit_transform(counts[:, keep]),
+            idf.transform(count_rows(fold.candidates)[:, keep]),
+        )
     vectorizer = (
         TfidfVectorizer(
             analyzer="char_wb",
@@ -1389,7 +1398,13 @@ def _tfidf_features(fold: FoldData, text: str, char: bool) -> tuple[Any, Any]:
             sublinear_tf=True,
         )
         if char
-        else make_tfidf_vectorizer()
+        else TfidfVectorizer(
+            ngram_range=(1, 2),
+            min_df=2,
+            max_features=100_000,
+            sublinear_tf=True,
+            stop_words="english",
+        )
     )
     x_train = vectorizer.fit_transform(
         [_tfidf_text(s, text) for s in fold.train_stories]

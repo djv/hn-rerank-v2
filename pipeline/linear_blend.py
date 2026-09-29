@@ -7,6 +7,7 @@ each as an average-rank percentile, beat production on user 1's votes.
 
 from __future__ import annotations
 
+import hashlib
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -15,7 +16,8 @@ from urllib.parse import urlparse
 import numpy as np
 from cachetools import LRUCache
 from numpy.typing import NDArray
-from sklearn.feature_extraction.text import TfidfVectorizer
+from scipy.sparse import csr_matrix, vstack
+from sklearn.feature_extraction.text import HashingVectorizer, TfidfTransformer
 from sklearn.linear_model import LogisticRegression
 
 from database import Story
@@ -47,14 +49,41 @@ def tfidf_text(story: Story) -> str:
     )
 
 
-def make_tfidf_vectorizer() -> TfidfVectorizer:
-    return TfidfVectorizer(
-        ngram_range=(1, 2),
-        min_df=2,
-        max_features=100_000,
-        sublinear_tf=True,
-        stop_words="english",
-    )
+HASH_FEATURES = 2**18
+ROW_CACHE_MAXSIZE = 20_000
+
+# Word 1-2 gram counts hashed into a fixed space: a story's row never depends
+# on the vote set, so it is computed once per (story, text) and reused across
+# every retrain and rank. Tokenising 10k candidates costs ~8s per rank.
+_HASHER = HashingVectorizer(
+    ngram_range=(1, 2),
+    stop_words="english",
+    n_features=HASH_FEATURES,
+    alternate_sign=False,
+    norm=None,
+    dtype=np.float32,
+)
+_ROWS: LRUCache[tuple[int, bytes], csr_matrix] = LRUCache(maxsize=ROW_CACHE_MAXSIZE)
+_ROWS_LOCK = threading.Lock()
+
+
+def count_rows(stories: Sequence[Story]) -> csr_matrix:
+    """Hashed word 1-2 gram counts, one row per story (cached)."""
+    texts = [tfidf_text(s) for s in stories]
+    keys = [
+        (s.id, hashlib.blake2b(t.encode(), digest_size=8).digest())
+        for s, t in zip(stories, texts)
+    ]
+    with _ROWS_LOCK:
+        rows = [_ROWS.get(key) for key in keys]
+    missing = [i for i, row in enumerate(rows) if row is None]
+    if missing:
+        fresh = _HASHER.transform([texts[i] for i in missing]).tocsr()
+        with _ROWS_LOCK:
+            for pos, i in enumerate(missing):
+                rows[i] = fresh[pos]
+                _ROWS[keys[i]] = fresh[pos]
+    return vstack(rows, format="csr")
 
 
 def balanced_weights(labels: Sequence[int]) -> NDArray[np.float64]:
@@ -75,7 +104,8 @@ class LinearBlendModels:
     """Fitted per feedback signature; cached next to the SVM."""
 
     dense: LogisticRegression
-    vectorizer: TfidfVectorizer
+    keep: NDArray[np.bool_]  # hashed columns seen in >= 2 training stories
+    idf: TfidfTransformer
     tfidf: LogisticRegression
 
 
@@ -93,11 +123,13 @@ def fit_linear_blend(
     absent classes); ``stories``/``story_labels`` are the real votes only."""
     dense = LogisticRegression(C=dense_c, solver="lbfgs", max_iter=2000, random_state=0)
     dense.fit(dense_features, dense_labels, sample_weight=dense_weights)
-    vectorizer = make_tfidf_vectorizer()
-    x_train = vectorizer.fit_transform([tfidf_text(s) for s in stories])
+    counts = count_rows(stories)
+    keep = np.asarray((counts > 0).sum(axis=0)).ravel() >= 2
+    idf = TfidfTransformer(sublinear_tf=True)
+    x_train = idf.fit_transform(counts[:, keep])
     tfidf = LogisticRegression(C=tfidf_c, max_iter=3000, random_state=0)
     tfidf.fit(x_train, story_labels, sample_weight=balanced_weights(list(story_labels)))
-    return LinearBlendModels(dense=dense, vectorizer=vectorizer, tfidf=tfidf)
+    return LinearBlendModels(dense=dense, keep=keep, idf=idf, tfidf=tfidf)
 
 
 def blend_scores(
@@ -110,7 +142,7 @@ def blend_scores(
     tfidf_weight: float,
 ) -> NDArray[np.float32]:
     """Percentile-rank blend; production keeps the remaining weight."""
-    x_cand = models.vectorizer.transform([tfidf_text(s) for s in candidates])
+    x_cand = models.idf.transform(count_rows(candidates)[:, models.keep])
     return (
         (1.0 - dense_weight - tfidf_weight) * percentile_scores(production)
         + dense_weight
