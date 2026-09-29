@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 from reddit_fetch_queue import CoroFactory
 from reddit_feed_cache import cache as reddit_feed_cache
 from reddit_limiter import limiter as reddit_limiter
+from . import rank_gate
 from .ainews import AINEWS_SOURCE, tweet_id_from_url
 from .ranking import (
     Embedder,
@@ -214,6 +215,9 @@ async def fetch_story(
 _PREWARM_CHUNK_SIZE = 100
 
 
+_PREWARM_EMBED_BATCH = 32
+
+
 def prewarm_top_stories(
     story_ids: list[int],
     db: Database,
@@ -303,7 +307,13 @@ def prewarm_top_stories(
             updated.append(persisted)
 
     if updated and embedder is not None:
-        get_or_compute_embeddings(updated, embedder, db)
+        # Small batches so a rerank waiting on a vote is not stuck behind
+        # a 1,000-story embedding run (regen thread only, never a rerank).
+        for i in range(0, len(updated), _PREWARM_EMBED_BATCH):
+            rank_gate.wait_idle()
+            get_or_compute_embeddings(
+                updated[i : i + _PREWARM_EMBED_BATCH], embedder, db
+            )
 
     return len(updated)
 
@@ -1123,6 +1133,7 @@ async def fetch_and_cache_article_bodies(
     async def fetch_one(story: Story) -> tuple[int, Story | None]:
         async with sem:
             try:
+                await rank_gate.wait_idle_async()
                 result = await _fetch_article_body_with_result(story.url or "")
                 if result.body:
                     body = result.body[:ARTICLE_BODY_CHAR_LIMIT]
@@ -1134,6 +1145,7 @@ async def fetch_and_cache_article_bodies(
                     )
                     updated = replace(story, article_body=body, text_content=new_text)
                     db.upsert_story(updated)
+                    await rank_gate.wait_idle_async()
                     new_vec = embedder.encode([new_text])[0]
                     new_hash = hashlib.sha256(new_text.encode("utf-8")).hexdigest()
                     db.upsert_embedding(

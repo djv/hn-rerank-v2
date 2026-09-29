@@ -13,6 +13,17 @@ percentile, text and vectorizer code with production. Tests:
 `tests/test_linear_blend.py`. Eval tie-fix and TF-IDF/joint/half-life/source
 options: `PRODLR_OPTIONS` in `scripts/eval_ranker_variants.py`.
 
+## 2026-09-29 Background embedding pauses while a rerank runs
+
+Rerank spikes (21:03, 21:20 UTC: `tier2_ms` 12-17 s and `dedup_ms` 8-12 s,
+normally under 1 s) coincided with background work in the same process:
+post-regen article fetch re-embedding stories one by one and the regen
+prewarm embedding ~1,000 stories in one batch. `pipeline/rank_gate.py`:
+`_run_warm_attempt` marks reranks active; article fetch waits before each
+fetch and embedding, prewarm embeds in batches of 32 and waits between
+them (at most 120 s per wait). Only background paths wait, never code a
+rerank runs.
+
 ## 2026-09-29 Linear blend refits start from the previous fit
 
 Warm reranks after the cap raise took 15-22 s, but `linear_blend_fit_ms`

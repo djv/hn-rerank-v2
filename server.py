@@ -1825,11 +1825,11 @@ class Handler:
         # since this warm was queued).
         requested_version = max(requested_version, cls._dashboard_version(user.id))
 
-        from pipeline import RankTrace, fast_rerank_for_user
+        from pipeline import RankTrace, fast_rerank_for_user, rank_gate
 
         trace = RankTrace()
         render_start = time.perf_counter()
-        with trace.stage("rank_total"):
+        with rank_gate.ranking(), trace.stage("rank_total"):
             deck = fast_rerank_for_user(
                 cls.db,
                 cls.config,
