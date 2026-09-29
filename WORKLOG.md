@@ -1,5 +1,22 @@
 # Worklog: hn-rewrite
 
+## 2026-09-28 AINews Reddit-recap subreddits
+
+User asked for AI Twitter as a source. Checked options: AINews (smol.ai,
+now `[AINews]` posts in the already-configured `latent.space/feed`; one
+long issue per weekday, tweets paraphrased with x.com links; full tweet
+text is available from `api.fxtwitter.com/status/<id>` without touching
+x.com) and Bluesky (keyword search needs login; topic feeds are mostly hot
+takes; curated researcher lists are better but thin). Planned next, not
+built: split AINews issues into one card per topic, with linked tweet text.
+
+AINews's Reddit recap over 11 issues linked 45 posts: r/LocalLLaMA 28,
+r/singularity 20, r/ClaudeAI 5, r/LocalLLM 5, r/ClaudeCode, r/StableDiffusion,
+r/ChatGPT. User asked to add the ones not already followed; they are now
+weekly-top RSS feeds in `config.toml`. Overlap with what user 1 sees on
+r/LocalLLaMA was not measured (VPS SSH agent locked; Reddit blocks the
+laptop).
+
 ## 2026-09-28 TUI browser override
 
 User wanted `o`/`c` to use a lightweight browser. `open_in_chrome` is now
