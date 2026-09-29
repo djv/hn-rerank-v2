@@ -125,6 +125,20 @@ def extract_hn_dupe_target_id(comment_text: str, *, source_id: int) -> int | Non
     return target_ids[0] if target_ids else None
 
 
+# A thread whose whole discussion is this short and links another HN item is
+# a pointer ("Comments moved to item?id=N", "[dupe] more here: ..."); its
+# real discussion lives at the link. Archive rows longer than this that
+# carry a link are ordinary comments that cite another thread.
+POINTER_THREAD_MAX_CHARS = 400
+
+
+def pointer_thread_target(top_comments: str, *, source_id: int) -> int | None:
+    """The HN story a pointer thread sends readers to, else None."""
+    if not top_comments or len(top_comments) > POINTER_THREAD_MAX_CHARS:
+        return None
+    return extract_hn_dupe_target_id(top_comments, source_id=source_id)
+
+
 def story_from_firebase_item(item: FirebaseItem) -> Story | None:
     """Normalize a validated Firebase story item without writing it to SQLite."""
     story_id = _coerce_positive_int(item.get("id"))

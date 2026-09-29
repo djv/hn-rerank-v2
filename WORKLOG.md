@@ -13,6 +13,47 @@ percentile, text and vectorizer code with production. Tests:
 `tests/test_linear_blend.py`. Eval tie-fix and TF-IDF/joint/half-life/source
 options: `PRODLR_OPTIONS` in `scripts/eval_ranker_variants.py`.
 
+## 2026-09-29 TLDR latency on `gofree`; Gemini free tier now 20/day
+
+"TLDRs kinda slow": since 17:02 UTC, `gofree` (longcat) ran 132 TLDRs at
+p50 45 s / p90 61 s llm_ms; 25 llm_error + 35 half-only. Hydration is
+<2 s; it is all model time. Bakeoff (3 stories, VPS): gemini flash-lite
+1.6-6 s 3/3, groq <1 s but 429 on the 3rd, cerebras 402 (payment
+required), gofree 20-52 s 3/3. Switched to `gemini` at 20:17 UTC: 4 of 6
+live taps took 2-5 s, then 429 `GenerateRequestsPerDayPerProjectPerModel-FreeTier`
+quotaValue 20. The free tier is now 20 requests per model per day, not
+usable. Reverted to `gofree` at 20:24 UTC. At today's volume (~200
+calls, ~520K in / ~350K out tokens) paid flash-lite would cost cents/day.
+
+Key probe: only Mistral (paid, $10 cap) and Groq (free) answer; OpenRouter
+is out of credit, Zen/Cerebras need funds, Go's monthly limit resets
+2026-10-06 16:28 UTC. User chose Mistral: `LLM_PROVIDER=mistral` at 20:29
+UTC, 4/4 live taps 2.4-3.7 s. Revert to `gospark` after the Go reset.
+Same-story bakeoff vs longcat: Mistral is correct but more generic
+(fewer names, versions, quotes).
+
+Fixes from reviewing live TLDRs (user: "a lot of them have bad tldrs, no
+comments", "wrong comments" on 32148318):
+- Mistral-small answers a section as one prose paragraph about 1 in 3 times;
+  `_valid_llm_completion` rejects it and the TLDR loses a half.
+  `_call_llm_for_config` now re-asks once when a finished (non-`length`)
+  200 reply fails only the bullet check.
+- Pointer threads: 32148318's only comment is "Comments moved to
+  item?id=32145324", and the model invented a discussion from it. 90
+  archive rows have comments under 400 chars with an HN item link
+  (`pointer_thread_target`, `pipeline/hn_dupes.py`). `generate_detailed_tldr`
+  drops such comments; the tap path (`_follow_pointer_thread`) swaps in the
+  target thread's comments from Algolia (`fetch_thread_comments`) and
+  stores them. The dupe resolver still only swaps live `hn` cards.
+- Tweets: 1,034 tweet-URL stories had no article body (x.com serves no
+  article HTML; failures were recorded permanent `non_html`). Tweet URLs now
+  go through the fxtwitter mirror (`_fetch_tweet_body`): the tweet, quoted
+  tweet, and the first non-tweet page it links. Bodies start with
+  `Tweet by @` and are exempt from `ARTICLE_SECTION_MIN_CHARS`; old
+  non-`tweet_*` failures no longer block tweet URLs. Live check on
+  32148318: tweet + GitHub README, 1,493 chars; thread 32145324 gave 14K
+  chars of comments.
+
 ## 2026-09-29 TLDRs on free OpenCode Go models (`gofree`, deployed `edb1316`)
 
 The Go plan's usage limit was spent (`GoUsageLimitError`, retry-after

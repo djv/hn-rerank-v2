@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 from reddit_fetch_queue import CoroFactory
 from reddit_feed_cache import cache as reddit_feed_cache
 from reddit_limiter import limiter as reddit_limiter
-from .ainews import AINEWS_SOURCE
+from .ainews import AINEWS_SOURCE, tweet_id_from_url
 from .ranking import (
     Embedder,
     RankedStory,
@@ -83,6 +83,21 @@ def _empty_story(sid: int) -> Story:
     return Story(
         id=sid, title="", url=None, score=0, time=0, text_content="", source="hn"
     )
+
+
+async def fetch_thread_comments(client: httpx.AsyncClient, sid: int) -> str:
+    """Selected top comments of HN story *sid* from Algolia, without touching
+    the DB; "" when the item is missing or the fetch fails."""
+    try:
+        resp = await client.get(f"https://hn.algolia.com/api/v1/items/{sid}")
+        item = resp.json() if resp.status_code == 200 else None
+    except (httpx.HTTPError, ValueError) as exc:
+        logging.warning("thread comments fetch failed for %s: %r", sid, exc)
+        return ""
+    if not isinstance(item, dict) or item.get("type") != "story":
+        return ""
+    comments = _extract_comments_recursive(item.get("children", []))
+    return join_top_comments([c["text"] for c in _select_top_comments(comments)])
 
 
 async def fetch_story(
@@ -825,6 +840,10 @@ def _article_fetch_failure_active(
 ) -> bool:
     failure = db.get_article_fetch_failure(story_id)
     if failure is None:
+        return False
+    if tweet_id_from_url(failure.url) and not failure.last_error.startswith("tweet_"):
+        # Recorded by the HTML fetcher before tweets went through
+        # fxtwitter (2026-09-29); the tweet path gets its own attempt.
         return False
     return failure.permanent or failure.next_retry_at > now_ts
 

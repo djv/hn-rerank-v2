@@ -4208,6 +4208,50 @@ async def test_generate_marks_single_half_salvage_uncacheable(
 
 
 @pytest.mark.asyncio
+async def test_generate_retries_prose_reply_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A finished reply without bullets is re-asked once; HTTP errors are not."""
+    import server
+
+    calls: list[str] = []
+
+    async def mock_call_llm_chat(
+        *, api_key, base_url, model, prompt, max_tokens, extra=None
+    ):
+        side = "discussion" if "Summarize the discussion" in prompt else "article"
+        calls.append(side)
+        if side == "discussion" and calls.count("discussion") == 1:
+            content = "One prose paragraph about the thread."
+            return server.LlmChatResult(
+                content=content,
+                ok=server._valid_llm_completion(content, "stop"),
+                finish_reason="stop",
+            )
+        if side == "article":
+            return server.LlmChatResult(content="boom", ok=False, status=500)
+        return server.LlmChatResult(
+            content="- **Discussion** summary", ok=True, finish_reason="stop"
+        )
+
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_PROVIDER", "mistral")
+    monkeypatch.setattr(server, "_call_llm_chat", mock_call_llm_chat)
+
+    result = await server.generate_detailed_tldr(
+        "Retry test",
+        self_text="Author text",
+        top_comments="Comment text",
+        article_body="Substantial article body. " * 30,
+    )
+
+    assert calls.count("discussion") == 2
+    assert calls.count("article") == 1
+    assert result.kind == "ok"
+    assert result.tldr.startswith("### Discussion")
+
+
+@pytest.mark.asyncio
 async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
     import server
 
@@ -6153,3 +6197,136 @@ def test_tldr_generation_cap_serves_stale_or_busy_and_always_releases(
     assert llm_calls == ["Article story 1902"]
     assert failed.status_code >= 400
     assert handler._tldr_generations == 0
+
+
+@pytest.mark.asyncio
+async def test_tweet_url_fetches_tweet_and_linked_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pipeline.ainews as ainews
+    import server
+
+    async def fake_fetch_tweets(ids: list[str]) -> dict[str, ainews.Tweet]:
+        assert ids == ["15"]
+        return {
+            "15": ainews.Tweet(
+                id="15",
+                author="h0t_max",
+                text="We published a decryptor",
+                likes=1,
+                replies=0,
+                created=0,
+                links=("https://x.com/a/status/16", "https://github.com/x/y"),
+            )
+        }
+
+    fetched: list[str] = []
+    real_fetch = server._fetch_article_body_with_result
+
+    async def fake_article(url: str) -> server.ArticleFetchResult:
+        if "twitter.com" in url:
+            return await real_fetch(url)
+        fetched.append(url)
+        return server.ArticleFetchResult(body="README text", status=200)
+
+    monkeypatch.setattr(ainews, "fetch_tweets", fake_fetch_tweets)
+    monkeypatch.setattr(server, "_fetch_article_body_with_result", fake_article)
+
+    result = await fake_article("https://twitter.com/h0t_max/status/15")
+
+    assert fetched == ["https://github.com/x/y"]
+    assert result.body == (
+        "Tweet by @h0t_max:\nWe published a decryptor\n\n"
+        "Linked page (https://github.com/x/y):\nREADME text"
+    )
+
+
+@pytest.mark.asyncio
+async def test_generate_keeps_short_tweet_and_drops_pointer_comments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import server
+
+    prompts: list[str] = []
+
+    async def mock_call_llm_chat(
+        *, api_key, base_url, model, prompt, max_tokens, extra=None
+    ):
+        prompts.append(prompt)
+        return server.LlmChatResult(content="- **Point** summary", ok=True)
+
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_PROVIDER", "mistral")
+    monkeypatch.setattr(server, "_call_llm_chat", mock_call_llm_chat)
+
+    tweet = "Tweet by @a:\nshort tweet"
+    both = await server.generate_detailed_tldr(
+        "T", top_comments="A real comment about it.", article_body=tweet
+    )
+    assert both.tldr.startswith("### Article") and "### Discussion" in both.tldr
+
+    prompts.clear()
+    pointer = await server.generate_detailed_tldr(
+        "T",
+        top_comments="Comments moved to https://news.ycombinator.com/item?id=5.",
+        article_body=tweet,
+    )
+    assert len(prompts) == 1 and "Comments moved" not in prompts[0]
+    assert "### Discussion" not in pointer.tldr
+
+
+@pytest.mark.asyncio
+async def test_follow_pointer_thread_swaps_in_target_comments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pipeline.enrichment as enrichment
+    import server
+
+    db = Database(str(tmp_path / "p.db"))
+    story = Story(
+        id=10,
+        title="Intel Microcode Decryptor",
+        url="https://twitter.com/a/status/1",
+        score=830,
+        time=1_658_213_530,
+        text_content="Intel Microcode Decryptor",
+        source="ch_seed",
+        top_comments="Comments moved to https://news.ycombinator.com/item?id=9.",
+    )
+    db.upsert_story(story)
+
+    async def fake_thread(client: object, sid: int) -> str:
+        assert sid == 9
+        return "Real discussion from thread 9."
+
+    monkeypatch.setattr(enrichment, "fetch_thread_comments", fake_thread)
+
+    followed = await server._follow_pointer_thread(db, story)
+
+    assert followed.top_comments == "Real discussion from thread 9."
+    stored = db.get_story(10)
+    assert stored is not None and stored.top_comments == followed.top_comments
+    db.close()
+
+
+def test_old_html_failure_does_not_block_tweet_urls(tmp_path: Path) -> None:
+    from pipeline.enrichment import _article_fetch_failure_active
+
+    db = Database(str(tmp_path / "f.db"))
+    for sid, url in ((1, "https://twitter.com/a/status/1"), (2, "https://e.com/a")):
+        db.upsert_story(
+            Story(id=sid, title="t", url=url, score=1, time=1, text_content="t")
+        )
+        db.record_article_fetch_failure(
+            sid, url, error="non_html", permanent=True, next_retry_at=2e9
+        )
+    assert _article_fetch_failure_active(db, 1, 1e9) is False
+    assert _article_fetch_failure_active(db, 2, 1e9) is True
+    db.record_article_fetch_failure(
+        1,
+        "https://twitter.com/a/status/1",
+        error="tweet_unavailable",
+        next_retry_at=2e9,
+    )
+    assert _article_fetch_failure_active(db, 1, 1e9) is True
+    db.close()

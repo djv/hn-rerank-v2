@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from difflib import SequenceMatcher
 
 from hypothesis import HealthCheck, given, settings, strategies as st
+import pytest
 
 from database import Database, Story
 from pipeline.hn_dupes import (
@@ -425,3 +426,25 @@ def test_ratio_verdict_cache_reuses_pairs() -> None:
         assert info.hits == 1
     finally:
         _cached_ratio_ge.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("comments", "expected"),
+    [
+        ("Comments moved to https://news.ycombinator.com/item?id=32145324.", 32145324),
+        (
+            "[dupe] Some more over here: https://news.ycombinator.com/item?id=38354753",
+            38354753,
+        ),
+        ("Nothing linked here, just a short comment.", None),
+        (
+            "Long thread citing https://news.ycombinator.com/item?id=5 " + "x" * 500,
+            None,
+        ),
+        ("Self link https://news.ycombinator.com/item?id=7", None),
+    ],
+)
+def test_pointer_thread_target(comments: str, expected: int | None) -> None:
+    from pipeline.hn_dupes import pointer_thread_target
+
+    assert pointer_thread_target(comments, source_id=7) == expected

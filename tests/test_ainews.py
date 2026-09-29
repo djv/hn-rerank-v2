@@ -287,3 +287,41 @@ def test_article_prewarm_never_fetches_the_issue_page(
 ) -> None:
     topics = _run(db)
     assert select_rss_article_prewarm(topics, db, max_per_run=10, now_ts=NOW) == []
+
+
+def test_parse_tweet_keeps_expanded_links() -> None:
+    payload = {
+        "code": 200,
+        "tweet": {
+            "text": "decryptor https://github.com/x/y",
+            "author": {"screen_name": "a"},
+            "raw_text": {
+                "facets": [
+                    {"type": "url", "replacement": "https://github.com/x/y"},
+                    {
+                        "type": "media",
+                        "replacement": "https://x.com/a/status/9/photo/1",
+                    },
+                ]
+            },
+        },
+    }
+    tw = parse_tweet("9", payload)
+    assert tw is not None and tw.links == ("https://github.com/x/y",)
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        (
+            "https://twitter.com/h0t_max/status/1549155542786080774",
+            "1549155542786080774",
+        ),
+        ("https://x.com/a/status/12?s=20", "12"),
+        ("https://mobile.twitter.com/a/status/34", "34"),
+        ("https://example.com/x.com/a/status/56", None),
+        ("https://x.com/a", None),
+    ],
+)
+def test_tweet_id_from_url(url: str, expected: str | None) -> None:
+    assert ainews.tweet_id_from_url(url) == expected

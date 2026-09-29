@@ -54,6 +54,7 @@ from database import (
 from pipeline import Config, DEFAULT_ENV_PATH, Embedder, WindowDeck, is_hn_source
 from pipeline.ranking import serve_window
 from pipeline.ainews import AINEWS_SOURCE
+from pipeline.hn_dupes import pointer_thread_target
 from llm_limiter import limiter as llm_limiter
 from reddit_limiter import limiter as reddit_limiter
 import http_fetch
@@ -415,7 +416,45 @@ def _extract_article_body(html: str) -> str | None:
     return None
 
 
+# Article bodies built from a tweet start with this; such a body is the
+# story's real content even when shorter than ARTICLE_SECTION_MIN_CHARS.
+TWEET_BODY_PREFIX = "Tweet by @"
+
+
+async def _fetch_tweet_body(tweet_id: str) -> ArticleFetchResult:
+    """A tweet (via the fxtwitter mirror, never x.com) plus the page it links.
+
+    x.com serves no article HTML, so tweet links used to fail as non_html.
+    """
+    from pipeline import _is_fetchable_article_url
+    from pipeline.ainews import fetch_tweets, tweet_id_from_url
+
+    tweet = (await fetch_tweets([tweet_id])).get(tweet_id)
+    if tweet is None:
+        return ArticleFetchResult(error="tweet_unavailable")
+    body = f"{TWEET_BODY_PREFIX}{tweet.author}:\n{tweet.text}"
+    if tweet.quote_text:
+        body += f"\n\nQuoting:\n{tweet.quote_text}"
+    link = next(
+        (
+            u
+            for u in tweet.links
+            if tweet_id_from_url(u) is None and _is_fetchable_article_url(u)
+        ),
+        None,
+    )
+    if link:
+        page = await _fetch_article_body_with_result(link)
+        if page.body:
+            body += f"\n\nLinked page ({link}):\n{page.body}"
+    return ArticleFetchResult(body=body[:ARTICLE_BODY_CHAR_LIMIT], status=200)
+
+
 async def _fetch_article_body_with_result(url: str) -> ArticleFetchResult:
+    from pipeline.ainews import tweet_id_from_url
+
+    if tweet_id := tweet_id_from_url(url):
+        return await _fetch_tweet_body(tweet_id)
     headers = {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -976,6 +1015,41 @@ async def _call_llm_for_config(
     max_tokens: int,
     on_usage: LlmUsageRecorder | None = None,
 ) -> LlmChatResult:
+    """Call the provider, retrying once when a finished reply has no bullets.
+
+    Mistral-small sometimes answers a section as one prose paragraph
+    (finish=stop, rejected by _valid_llm_completion); about a third of
+    TLDRs lost a half this way on 2026-09-29. A second sample usually
+    comes back as bullets.
+    """
+    result = await _call_llm_once(
+        cfg, prompt=prompt, max_tokens=max_tokens, on_usage=on_usage
+    )
+    if _is_format_rejection(result):
+        logging.info("llm: reply had no bullets, retrying once")
+        result = await _call_llm_once(
+            cfg, prompt=prompt, max_tokens=max_tokens, on_usage=on_usage
+        )
+    return result
+
+
+def _is_format_rejection(result: LlmChatResult) -> bool:
+    """A complete 200 reply that failed only the bullet-format check."""
+    return (
+        not result.ok
+        and result.status is None
+        and result.finish_reason not in (None, "length")
+        and bool(result.content.strip())
+    )
+
+
+async def _call_llm_once(
+    cfg: LlmProviderConfig,
+    *,
+    prompt: str,
+    max_tokens: int,
+    on_usage: LlmUsageRecorder | None = None,
+) -> LlmChatResult:
     """Dispatch to the chat or responses caller based on endpoint shape."""
     api_key, base_url, model, extra = cfg.api_key, cfg.base_url, cfg.model, cfg.extra
     if base_url.rstrip("/").endswith("/responses"):
@@ -1180,6 +1254,10 @@ async def generate_detailed_tldr(
             f"\n\nArticle body:\n{article_body[:ARTICLE_BODY_CHAR_LIMIT]}"
         )
     comments_section = top_comments[:COMMENT_PROMPT_CHAR_LIMIT]
+    if pointer_thread_target(top_comments, source_id=0) is not None:
+        # "Comments moved to item?id=N" is not a discussion; summarizing it
+        # invented one (story 32148318). The tap path follows the link.
+        comments_section = top_comments = ""
 
     if not article_section and not top_comments:
         return TldrResult(kind="no_content")
@@ -1188,6 +1266,7 @@ async def generate_detailed_tldr(
         article_section
         and comments_section
         and len(article_section) < ARTICLE_SECTION_MIN_CHARS
+        and not article_body.startswith(TWEET_BODY_PREFIX)
     ):
         article_section = ""
 
@@ -1278,6 +1357,34 @@ async def generate_detailed_tldr(
             return TldrResult(kind="ok", tldr=text)
         return TldrResult(kind="llm_error", error_text="empty LLM response")
     return _llm_error_from(result)
+
+
+async def _follow_pointer_thread(db: Database, story: Story) -> Story:
+    """Swap a pointer thread's lone "comments moved to item?id=N" note for
+    the comments of thread N, persisted so cached TLDRs keep matching."""
+    if not is_hn_source(story.source):
+        return story
+    target = pointer_thread_target(story.top_comments or "", source_id=story.id)
+    if target is None:
+        return story
+    from pipeline import compose_story_text
+    from pipeline.enrichment import fetch_thread_comments
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        comments = await fetch_thread_comments(client, target)
+    if not comments:
+        return story
+    logging.info("tldr_detail story_id=%s pointer_thread=%s", story.id, target)
+    story = replace(
+        story,
+        top_comments=comments,
+        text_content=compose_story_text(
+            story.title, story.self_text, comments, story.article_body
+        ),
+    )
+    # Authoritative: the followed thread can be shorter than the note.
+    db.upsert_story(story, comments_authoritative=True)
+    return story
 
 
 # Stagger between background TLDR prefetch LLM starts (seconds, capped at
@@ -2850,6 +2957,11 @@ def _generate_tldr_reply(
             )
     elif isinstance(article_result, Exception):
         logging.error("TLDR article lane failed: %r", article_result)
+
+    if is_hn_source(story.source) and pointer_thread_target(
+        story.top_comments or "", source_id=story.id
+    ):
+        story = asyncio.run(_follow_pointer_thread(runtime.db, story))
 
     cache_key = _tldr_cache_key(
         title=story.title,

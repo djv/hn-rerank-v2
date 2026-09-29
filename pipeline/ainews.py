@@ -19,7 +19,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import feedparser
 import httpx
@@ -52,6 +52,8 @@ class Tweet:
     replies: int
     created: int
     quote_text: str = ""
+    # Expanded non-media links in the tweet (t.co resolved by fxtwitter).
+    links: tuple[str, ...] = ()
 
 
 @dataclass
@@ -197,6 +199,13 @@ def parse_tweet(tid: str, payload: dict[str, Any]) -> Tweet | None:
         return None
     author = t.get("author")
     quote = t.get("quote")
+    raw = t.get("raw_text")
+    facets = raw.get("facets") if isinstance(raw, dict) else None
+    links = tuple(
+        str(f["replacement"])
+        for f in facets or []
+        if isinstance(f, dict) and f.get("type") == "url" and f.get("replacement")
+    )
     return Tweet(
         id=tid,
         author=str(author.get("screen_name", "")) if isinstance(author, dict) else "",
@@ -205,7 +214,17 @@ def parse_tweet(tid: str, payload: dict[str, Any]) -> Tweet | None:
         replies=int(t.get("replies") or 0),
         created=int(t.get("created_timestamp") or 0),
         quote_text=str(quote.get("text", "")) if isinstance(quote, dict) else "",
+        links=links,
     )
+
+
+def tweet_id_from_url(url: str) -> str | None:
+    """Status id of an x.com/twitter.com tweet URL, else None."""
+    host = (urlparse(url).hostname or "").lower().removeprefix("www.")
+    if host not in {"x.com", "twitter.com", "mobile.twitter.com", "mobile.x.com"}:
+        return None
+    m = _TWEET_RE.search(url)
+    return m.group(2) if m else None
 
 
 async def fetch_tweets(ids: list[str], *, concurrency: int = 4) -> dict[str, Tweet]:
