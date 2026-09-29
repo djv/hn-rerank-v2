@@ -18,8 +18,9 @@ and, since 2026-09-26, which sources feed it.
 - AINews per-topic source (`rss_ainews`, 2026-09-29): each `[AINews]` issue in
   `latent.space/feed` becomes one card per Twitter-recap topic, with the linked
   tweets' text (fxtwitter) as discussion; whole-issue cards dropped. Added
-  r/singularity, r/ClaudeAI, r/LocalLLM, r/ClaudeCode. Live on the VPS at
-  `26c3736` since 04:06 UTC: first regen stored 51 topic cards, TLDR smoked.
+  r/singularity, r/ClaudeAI, r/LocalLLM, r/ClaudeCode (25 items each). Reader
+  `o` opens the topic's first tweet, `c` the topic in the issue. Live on the
+  VPS at `d8643b5` since 04:25 UTC; regen stored 51 cards, TLDR smoked.
 - Tools: `scripts/source_yield_report.py` (per-source yield),
   `scripts/backfill_rss_articles.py`, `scripts/relabel_legacy_sources.py`.
 
