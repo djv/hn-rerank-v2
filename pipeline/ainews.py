@@ -19,6 +19,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import quote
 
 import feedparser
 import httpx
@@ -33,7 +34,11 @@ AINEWS_TITLE_PREFIX = "[AINews]"
 FXTWITTER_URL = "https://api.fxtwitter.com/status/{id}"
 USER_AGENT = "hn-rewrite/1.0 (+https://github.com/local/hn-rewrite)"
 
-_TWEET_RE = re.compile(r"(?:x|twitter)\.com/\w+/status/(\d+)")
+_TWEET_RE = re.compile(r"(?:x|twitter)\.com/(\w+)/status/(\d+)")
+# Story ids hash this plus the topic's identity URL. The first layout
+# (2026-09-29 04:06-, no namespace) stored that URL as the story URL; a
+# negative id cannot change its URL, so the tweet/topic links needed new ids.
+_ID_NAMESPACE = "ainews-v2:"
 _SKIP_TOPICS = re.compile(r"^top tweets", re.I)
 _TOP_STORY = re.compile(r"^top story:\s*", re.I)
 
@@ -57,6 +62,7 @@ class TopicCard:
     title: str
     body: str
     tweet_ids: list[str] = field(default_factory=list)
+    first_tweet_url: str = ""
 
     @property
     def key(self) -> str:
@@ -64,9 +70,23 @@ class TopicCard:
         return hashlib.sha1(f"{self.title}\n{self.body}".encode()).hexdigest()[:12]
 
     @property
-    def url(self) -> str:
+    def identity_url(self) -> str:
+        """Stable per-topic key; never opened."""
         slug = re.sub(r"[^a-z0-9]+", "-", self.title.lower()).strip("-")[:60]
         return f"{self.issue_url}#{slug}"
+
+    @property
+    def topic_url(self) -> str:
+        """The issue, scrolled to this topic's heading by a text fragment."""
+        start = " ".join(self.title.split()[:8])
+        # "-" is fragment syntax (prefix-/-suffix), so it must be escaped too.
+        text = quote(start, safe="").replace("-", "%2D")
+        return f"{self.issue_url}#:~:text={text}"
+
+    @property
+    def story_url(self) -> str:
+        """Article link: the topic's first linked tweet, else the topic."""
+        return self.first_tweet_url or self.topic_url
 
 
 def _is_heading_para(el: Tag) -> bool:
@@ -130,8 +150,12 @@ def split_issue(
         chunks.append(f"## {text}" if el.name in ("h2", "h3") else text)
         for a in el.find_all("a", href=True):
             m = _TWEET_RE.search(str(a["href"]))
-            if m and m.group(1) not in current.tweet_ids:
-                current.tweet_ids.append(m.group(1))
+            if m and m.group(2) not in current.tweet_ids:
+                current.tweet_ids.append(m.group(2))
+                if not current.first_tweet_url:
+                    current.first_tweet_url = (
+                        f"https://x.com/{m.group(1)}/status/{m.group(2)}"
+                    )
     flush()
     return cards
 
@@ -215,9 +239,10 @@ def format_tweets(tweets: list[Tweet]) -> str:
     return "\n\n".join(parts)
 
 
-def _story_id(url: str) -> int:
-    """Same synthetic-id scheme as generic RSS rows."""
-    val = int.from_bytes(hashlib.md5(url.encode("utf-8")).digest()[:4], "big")
+def _story_id(card: TopicCard) -> int:
+    """Negative synthetic id, like generic RSS rows, from the topic key."""
+    key = f"{_ID_NAMESPACE}{card.identity_url}".encode()
+    val = int.from_bytes(hashlib.md5(key).digest()[:4], "big")
     return -(val % (2**31))
 
 
@@ -232,7 +257,9 @@ async def fetch_ainews_stories(
 ) -> list[Story]:
     """Fetch the feed, split issues into topic stories, upsert them.
 
-    Tweets are fetched once per story: a stored row that already has tweet
+    A story's URL (``o`` in the reader) is the topic's first linked tweet;
+    its discussion URL (``c``) is the issue scrolled to the topic. Tweets
+    are fetched once per story: a stored row that already has tweet
     text is reused as is. At most ``max_tweets_per_run`` tweets are fetched
     per call; cards past the cap are stored without tweets and filled in
     on a later run.
@@ -254,19 +281,19 @@ async def fetch_ainews_stories(
     cards = [
         c
         for c in parse_feed(content, cutoff=now - days * 86400)
-        if c.url not in exclude_urls
+        if c.story_url not in exclude_urls and c.topic_url not in exclude_urls
     ]
-    stored = {s.id: s for s in db.get_stories([_story_id(c.url) for c in cards])}
+    stored = {s.id: s for s in db.get_stories([_story_id(c) for c in cards])}
     to_fetch: list[str] = []
     for card in cards:
-        prior = stored.get(_story_id(card.url))
+        prior = stored.get(_story_id(card))
         if prior is None or not prior.top_comments:
             to_fetch.extend(card.tweet_ids)
     tweets = await fetch_tweets(list(dict.fromkeys(to_fetch))[:max_tweets_per_run])
 
     stories: list[Story] = []
     for card in cards:
-        sid = _story_id(card.url)
+        sid = _story_id(card)
         prior = stored.get(sid)
         card_tweets = [tweets[i] for i in card.tweet_ids if i in tweets]
         if prior is not None and prior.top_comments and not card_tweets:
@@ -276,11 +303,12 @@ async def fetch_ainews_stories(
         story = Story(
             id=sid,
             title=card.title,
-            url=card.url,
+            url=card.story_url,
             score=0,
             time=card.published,
             text_content=compose_story_text(card.title, card.body, comments),
             source=AINEWS_SOURCE,
+            discussion_url=card.topic_url,
             comment_count=len(card_tweets),
             comment_count_at_fetch=len(card_tweets),
             self_text=card.body,
@@ -290,7 +318,7 @@ async def fetch_ainews_stories(
             db.upsert_story(story)
         except StoryIdentityConflict:
             logging.warning(
-                "ainews_identity_conflict story_id=%s url=%s", sid, card.url
+                "ainews_identity_conflict story_id=%s url=%s", sid, card.story_url
             )
             continue
         stories.append(story)

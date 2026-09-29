@@ -131,11 +131,31 @@ def test_top_story_keeps_lead_subsections_and_sub_labels() -> None:
     assert top.tweet_ids == ["111", "222"]
 
 
-def test_cards_get_distinct_urls_and_keys() -> None:
+def test_cards_link_first_tweet_and_topic_heading() -> None:
     a, b = _split()
-    assert a.url == "https://l/p/i#model-x-launch-and-reactions"
-    assert a.url != b.url and a.key != b.key
-    assert b.tweet_ids == ["333"]
+    assert a.story_url == "https://x.com/lab/status/111"
+    assert a.topic_url == ("https://l/p/i#:~:text=Model%20X%20launch%20and%20reactions")
+    assert b.story_url == "https://x.com/dev/status/333"
+    assert a.identity_url != b.identity_url and a.key != b.key
+
+
+def test_card_without_tweets_links_the_topic() -> None:
+    issue = (
+        "<h1>AI Twitter Recap</h1><p><strong>Quiet Topic</strong></p>"
+        "<ul><li>No tweets, just <a href='https://example.com/a'>a link</a>.</li></ul>"
+    )
+    (card,) = split_issue(
+        issue, issue_title="I", issue_url="https://l/p/q", published=1
+    )
+    assert card.story_url == card.topic_url == "https://l/p/q#:~:text=Quiet%20Topic"
+
+
+def test_topic_url_escapes_fragment_syntax() -> None:
+    issue = "<h1>AI Twitter Recap</h1><p><strong>GPT-6, Astra &amp; More</strong></p><p>x</p>"
+    (card,) = split_issue(
+        issue, issue_title="I", issue_url="https://l/p/q", published=1
+    )
+    assert card.topic_url.endswith("#:~:text=GPT%2D6%2C%20Astra%20%26%20More")
 
 
 def test_parse_feed_keeps_new_ainews_issues_and_drops_reposted_topics() -> None:
@@ -175,6 +195,8 @@ def test_fetch_stores_topic_stories_with_bullets_and_tweets(
     ]
     top = db.get_story(stories[0].id)
     assert top is not None and top.source == AINEWS_SOURCE
+    assert top.url == "https://x.com/lab/status/111"
+    assert top.discussion_url is not None and "#:~:text=Model%20X" in top.discussion_url
     assert "Lab shipped Model X" in top.self_text
     assert "@u111 (5 likes): tweet 111" in top.top_comments
     assert "tweet 222" in top.top_comments and top.comment_count == 2
@@ -219,10 +241,23 @@ def test_generic_rss_skips_whole_ainews_issues(
     assert [s.title for s in stories] == ["A podcast"]
 
 
-def test_candidates_include_topics_and_drop_old_whole_issue_rows(
+def test_candidates_include_topics_and_drop_old_layout_rows(
     db: Database, fake_net: list[list[str]]
 ) -> None:
     topics = _run(db)
+    # A topic row from the first layout: issue#slug URL, no discussion link.
+    db.upsert_story(
+        Story(
+            id=-3,
+            title="Model X launch and reactions",
+            url="https://l.space/p/ainews-x#model-x-launch-and-reactions",
+            score=0,
+            time=NOW - 60,
+            text_content="t",
+            source=AINEWS_SOURCE,
+            self_text="text",
+        )
+    )
     for sid, title in ((-1, "[AINews] Whole issue"), (-2, "A podcast")):
         db.upsert_story(
             Story(
@@ -244,7 +279,7 @@ def test_candidates_include_topics_and_drop_old_whole_issue_rows(
         )
     }
     assert {s.id for s in topics} | {-2} <= ids
-    assert -1 not in ids
+    assert -1 not in ids and -3 not in ids
 
 
 def test_article_prewarm_never_fetches_the_issue_page(

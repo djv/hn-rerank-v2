@@ -66,7 +66,8 @@ def main() -> None:
         rows.append(
             {
                 "title": c.title,
-                "url": c.url,
+                "url": c.story_url,
+                "topic_url": c.topic_url,
                 "time": c.published,
                 "likes": likes,
                 "issue": c.issue_title,
@@ -76,7 +77,7 @@ def main() -> None:
         )
     for c in cards[: args.show]:
         card_tweets = [tweets[i] for i in c.tweet_ids if i in tweets]
-        print(f"\n===== {c.title}\n{c.url}\n\n{c.body[:1500]}")
+        print(f"\n===== {c.title}\n{c.story_url}\n{c.topic_url}\n\n{c.body[:1500]}")
         print(f"\n--- tweets\n{format_tweets(card_tweets)[:1500]}")
     if args.jsonl:
         with args.jsonl.open("w") as fh:

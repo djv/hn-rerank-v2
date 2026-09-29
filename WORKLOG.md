@@ -17,6 +17,17 @@ out-of-fold SVM/logreg scores plus metadata. It loses to the current best on
 the full eval; FINDINGS.md "Stacked ranker — 2026-09-29". `probe_embeddings.py
 --extra` adds few-shot, temporal and fit-free geometry probes.
 
+## 2026-09-29 AINews links: o opens the tweet, c the topic
+
+User: "o jumps to tweet, c to topic". A topic story's URL is now its first
+linked tweet (`https://x.com/<user>/status/<id>`, usually the primary
+source; the most-liked would need tweets fetched before the card exists),
+and `discussion_url` is the issue with a `#:~:text=` fragment for the
+topic heading (checked: 20/20 fragments occur on the live pages; `-`, `,`
+and `&` are escaped). A negative story id cannot change its URL, so ids now
+hash `ainews-v2:` + the topic key; the 51 first-layout rows stay in the DB
+and the candidate loader skips `rss_ainews` rows without `discussion_url`.
+
 ## 2026-09-29 AINews per-topic source
 
 User: "make it a real source. To replace the single cards", keeping the

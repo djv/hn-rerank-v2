@@ -342,12 +342,15 @@ def load_production_candidate_stories(
         configured_sources = tuple(
             dict.fromkeys(_rss_source_name(feed) for feed in config.rss.feeds)
         )
-        # AINews whole-issue rows stored before the per-topic split stay
-        # in the DB but are no longer candidates.
+        # AINews whole-issue rows stored before the per-topic split, and
+        # topic rows from its first layout (no discussion link, ids since
+        # replaced), stay in the DB but are no longer candidates.
         ainews_filter = ""
         if config.ainews_enabled:
             configured_sources += (AINEWS_SOURCE,)
-            ainews_filter = "AND title NOT LIKE ? "
+            ainews_filter = (
+                "AND title NOT LIKE ? AND NOT (source = ? AND discussion_url IS NULL) "
+            )
         if configured_sources:
             placeholders = ",".join("?" for _ in configured_sources)
             rss_rows = db.execute(
@@ -361,7 +364,11 @@ def load_production_candidate_stories(
                 (
                     cutoff_ts,
                     *configured_sources,
-                    *((f"{AINEWS_TITLE_PREFIX}%",) if ainews_filter else ()),
+                    *(
+                        (f"{AINEWS_TITLE_PREFIX}%", AINEWS_SOURCE)
+                        if ainews_filter
+                        else ()
+                    ),
                     *feedback_params,
                     config.recent_candidate_rss_limit,
                 ),
