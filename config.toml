@@ -52,8 +52,6 @@ feeds = [
     "https://www.reddit.com/r/ClaudeAI/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/LocalLLM/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/ClaudeCode/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/StableDiffusion/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/ChatGPT/top/.rss?t=week&limit=25",
 
     # Finance / tax / nomad money
     "https://www.reddit.com/r/financialindependence/top/.rss?t=week&limit=25",
