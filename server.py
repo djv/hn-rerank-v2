@@ -1060,7 +1060,8 @@ _LLM_PROVIDERS: dict[str, tuple[str, str, str, dict[str, object]]] = {
         "OPENCODE_GO_API_KEY",
         "https://opencode.ai/zen/go/v1/chat/completions",
         "longcat-2.5-preview-free",
-        {},
+        # Without it a 31k-char article spent the whole cap reasoning.
+        {"reasoning_effort": "low"},
     ),
     "gemini": (
         "GEMINI_API_KEY",
