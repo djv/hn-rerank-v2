@@ -5,17 +5,31 @@ Improve what the dashboard shows the user (live profile 151; user 1 is the
 old profile, stopped 2026-09-24): ranking quality and which sources feed it.
 
 ## Verified result
-- Live on the VPS at `f49ff0f` (2026-09-29 13:06 UTC): time-window selector
-  (12h/1d/1w/1m/Archive, `d` cycles; web and TUI reopen on the last window
-  picked), AINews per-topic source (`rss_ainews`), 2026-09-26/27 source
-  changes, server/web aligned with the TUI. Live ranker unchanged:
-  production (SVM C=0.1 on stored embeddings).
+- Linear blend live on the VPS since `26b9474` (2026-09-29 17:17 UTC), now
+  at `7d9c231` (17:27 UTC, hashed TF-IDF rows cached per story):
+  `svm_c = 4.0`, `linear_blend_enabled = true` (0.5 production + 0.2 dense
+  LR + 0.3 TF-IDF LR). No errors after restart; feed reads 200 in ~0.5 s via
+  Tailscale for every window. First rerank cost 21-29 s (fit 14 s,
+  scoring 8-9 s); with the row cache warm a rerank is 7.7 s (fit 3.6 s,
+  scoring 0.5 s; live before the blend: 4-13 s). The fit repeats after every
+  vote. A
+  "refresh failing" report matched the ~100 s restart gap, not a bug.
+  FINDINGS.md "Linear blend live: rank latency".
+- Also live (from `f49ff0f`): time-window selector (12h/1d/1w/1m/Archive,
+  `d` cycles; web and TUI reopen on the last window picked), AINews
+  per-topic source (`rss_ainews`), 2026-09-26/27 source changes.
 - TLDRs (live `edb1316`, 2026-09-29 17:02 UTC): OpenCode Go plan limit
   spent until ~2026-10-06, so `LLM_PROVIDER=gofree` (free
   `longcat-2.5-preview-free` on the Go gateway, `reasoning_effort=low`).
   Smoke: 5 of 6 TLDRs complete, 15-45s each. WORKLOG.md 2026-09-29.
-- TUI `a` (uncommitted, another session's work; tests pass): Claude Code in a tmux pane split beside
+- TUI `a` (committed `48e460f`, tests pass): Claude Code in a tmux pane split beside
   the reader with the article/comments links and a dig-deeper prompt.
+- TUI status line (committed `48e460f`, 2026-09-29): always one row; long messages
+  end in `…` instead of wrapping to 3 rows (hints still stack below when
+  both don't fit). TUI tests 152 pass, ruff clean.
+- TUI headline dividers (2026-09-29): tried and reverted at the user's call;
+  list unchanged. Rule rows cost a row per story; a meta-line underline
+  looked link-like. FINDINGS.md "TUI headline dividers".
 - Profile merge (live, 2026-09-29 14:01 UTC, user chose "July onward"):
   user 1's 2,332 votes since 2026-07-01 on stories 151 had not voted on
   copied to 151 (467 -> 2,799 votes). Backup
@@ -28,9 +42,8 @@ old profile, stopped 2026-09-24): ranking quality and which sources feed it.
   TF-IDF logreg 0.3). TF-IDF alone added AUC 0.791 -> 0.801 (7/8 folds) and
   was better or equal on all five unseen-vote checks (user 1's reserved
   newest 20%, 151's votes after 09-26/09-27, alone and merged).
-- Linear blend built and pushed (`f01dbba`, `21f870c`), off by default and
-  not deployed: `linear_blend_enabled` in `pipeline/linear_blend.py`.
-  Against the actual live ranker (`svm_c=0.1`, stored embeddings only) the
+- Linear blend offline case (`f01dbba`, `21f870c`, `pipeline/linear_blend.py`).
+  Against the previous live ranker (`svm_c=0.1`, stored embeddings only) the
   full eval gives AUC 0.726 -> 0.790 (p=0.017), P@12 0.625 -> 0.719; the
   newest-20% run is flat (AUC 0.739 -> 0.751, P@12 0.667 both). TF-IDF alone
   on top of svm_c=4 + LR: +0.016 AUC. Codex review: no leakage, but the
@@ -54,8 +67,8 @@ old profile, stopped 2026-09-24): ranking quality and which sources feed it.
   shown). FINDINGS.md "Feed yield check — 2026-09-29".
 
 ## Blocker / limits
-- Enabling the linear blend changes the live ranker: needs the user's OK.
-  Gemma side by side is not live and would need gemma on the VPS.
+- Gemma side by side is not live and would need gemma on the VPS.
+- Blend gain is unconfirmed (flat on the newest 20%).
 - Go limit resets ~2026-10-06: then set `LLM_PROVIDER=gospark` in the
   VPS `shared/.env` and restart. Luna via OpenAI needs an API key (none;
   the ChatGPT plan only covers Codex).
@@ -64,18 +77,12 @@ old profile, stopped 2026-09-24): ranking quality and which sources feed it.
 - `/tmp` is wiped at boot: the eval dir is mirrored to
   `~/.local/state/hn-rerank-eval/hn-eval-local` (last synced 2026-09-29 12:15);
   snapshots and merged copies live in `~/.local/state/hn-rerank-eval/`.
-- Empty `~/hn-rewrite/hn_rewrite.db` on the VPS (stray, harmless): delete
-  only with the user's OK.
 
 ## Next step
-- Built, off by default (`linear_blend_enabled`, `pipeline/linear_blend.py`):
-  0.5 production + 0.2 dense LR + 0.3 TF-IDF LR. Vs live (`svm_c=0.1`, stored
-  embeddings) AUC 0.726 -> 0.790 on the full eval, flat on the newest 20%.
-  Awaiting the user's OK to enable: `svm_c = 4.0` and
-  `linear_blend_enabled = true` in `config.toml`, deploy, restart. Then judge
-  on new votes from 151.
-- Commit the TUI `a` key (`clients/tui/`, WORKLOG entry already written)
-  when the user asks; restart the reader to use it.
+- Judge the live blend on new votes from 151 (up rate on shown stories
+  before/after 17:17 UTC 2026-09-29). Rollback: `linear_blend_enabled =
+  false`, `svm_c = 0.1` in `config.toml`, deploy, restart.
+- Restart the TUI reader to pick up the `a` key and one-row status line.
 - After ~100 new votes: compare 151's up rate on shown stories before and
   after the merge (`scripts/source_yield_report.py --user-id 151`).
 - Optional, low value: embedding queue (jina-v5-nano, mdbr-leaf-mt,
