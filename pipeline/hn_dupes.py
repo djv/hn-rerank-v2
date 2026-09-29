@@ -17,7 +17,12 @@ import httpx
 
 from database import Database, FeedbackRecord, HnDupeResolution, Story
 from dedup import NormalizedUrl, normalize_url
-from .ranking import RankedStory, clean_text, compose_story_text
+from .ranking import (
+    HN_COMMENTS_SEPARATOR,
+    RankedStory,
+    clean_text,
+    compose_story_text,
+)
 
 
 FirebaseItem: TypeAlias = Mapping[str, object]
@@ -125,16 +130,34 @@ def extract_hn_dupe_target_id(comment_text: str, *, source_id: int) -> int | Non
     return target_ids[0] if target_ids else None
 
 
-# A thread whose whole discussion is this short and links another HN item is
-# a pointer ("Comments moved to item?id=N", "[dupe] more here: ..."); its
-# real discussion lives at the link. Archive rows longer than this that
-# carry a link are ordinary comments that cite another thread.
+# A pointer thread's whole discussion is one short comment that sends readers
+# to the same story's discussion elsewhere: "Comments moved to item?id=N",
+# "[dupe] more here: ...", "Discussion (170 points, ...) <link>". Its real
+# discussion lives at the link. Not pointers: "Related: <other story>" (a
+# different article), and threads with more than one comment, whose other
+# comments are real discussion (both matched a looser rule on 2026-09-29).
 POINTER_THREAD_MAX_CHARS = 400
+_POINTER_OPENING = re.compile(
+    r"^\W*(?:yes\W+)?(?:\[?dupe\b|duplicate\b|comments?\s+(?:moved|merged)\b|"
+    r"(?:(?:some|more|other|earlier|previous|big|active)\s+)*discuss(?:ion|ed)\b)",
+    re.IGNORECASE,
+)
+# dang also writes "Although this post was first, we've moved the comments to".
+_MOVED_ANYWHERE = re.compile(
+    r"\b(?:moved|merged)\s+(?:the\s+)?comments\b", re.IGNORECASE
+)
 
 
 def pointer_thread_target(top_comments: str, *, source_id: int) -> int | None:
     """The HN story a pointer thread sends readers to, else None."""
-    if not top_comments or len(top_comments) > POINTER_THREAD_MAX_CHARS:
+    if (
+        not top_comments
+        or len(top_comments) > POINTER_THREAD_MAX_CHARS
+        or HN_COMMENTS_SEPARATOR in top_comments
+    ):
+        return None
+    text = html.unescape(top_comments)
+    if not (_POINTER_OPENING.match(text) or _MOVED_ANYWHERE.search(text)):
         return None
     return extract_hn_dupe_target_id(top_comments, source_id=source_id)
 

@@ -13,6 +13,22 @@ percentile, text and vectorizer code with production. Tests:
 `tests/test_linear_blend.py`. Eval tie-fix and TF-IDF/joint/half-life/source
 options: `PRODLR_OPTIONS` in `scripts/eval_ranker_variants.py`.
 
+## 2026-09-29 Pointer threads: stricter rule, stale caches, backfill
+
+User: "comments off" on 38507672, summarized at 20:33 from dang's "Comments
+moved to" note, before the follow shipped; its cache key still matched the
+note. Taps and `/api/tldr-cache` now skip the cache while stored comments
+are a pointer note, and prefetch follows first.
+
+A backfill dry run found 464 matches for the first rule (<= 400 chars plus
+an HN link), mostly live threads whose comments cite other threads
+("Related: <other story>", "also saw it here ...", or two real comments).
+That rule would have dropped or replaced real discussions. Now a pointer is
+one comment (no `HN_COMMENTS_SEPARATOR`) of <= 400 chars that opens with
+moved/dupe/duplicate/discussion wording or says "moved the comments": 162
+stories (124 live `hn`, 34 `ch_seed`, 4 `bq_seed`). `scripts/follow_pointer_threads.py`
+follows them all and embeds the new text.
+
 ## 2026-09-29 Background embedding pauses while a rerank runs
 
 Rerank spikes (21:03, 21:20 UTC: `tier2_ms` 12-17 s and `dedup_ms` 8-12 s,

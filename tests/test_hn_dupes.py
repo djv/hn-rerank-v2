@@ -438,6 +438,22 @@ def test_ratio_verdict_cache_reuses_pairs() -> None:
         ),
         ("Nothing linked here, just a short comment.", None),
         (
+            "Discussion (170 points, 2 days ago, 43 comments) "
+            "https://news.ycombinator.com/item?id=48612098",
+            48612098,
+        ),
+        (
+            "Although this post was first, we've moved the comments to "
+            "https://news.ycombinator.com/item?id=39827266.",
+            39827266,
+        ),
+        ("Related: Another story https://news.ycombinator.com/item?id=49434378", None),
+        (
+            "Discussion: https://news.ycombinator.com/item?id=11\n\n---\n\n"
+            "A real second comment.",
+            None,
+        ),
+        (
             "Long thread citing https://news.ycombinator.com/item?id=5 " + "x" * 500,
             None,
         ),
