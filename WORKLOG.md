@@ -1,5 +1,22 @@
 # Worklog: hn-rewrite
 
+## 2026-09-29 TLDRs on free OpenCode Go models (`gofree`, deployed `edb1316`)
+
+The Go plan's usage limit was spent (`GoUsageLimitError`, retry-after
+~604,000s = 7 days) so every TLDR 429'd into stale fallbacks. Zen
+`gpt-6-luna` needs account funds; Zen free models refuse non-OpenCode
+clients (`FreeTierError`). The Go gateway's free models still answer on
+chat/completions: new `gofree` provider (`longcat-2.5-preview-free`;
+`LLM_MODEL=space-bunny-free` also works), with the Go session headers on
+chat calls, a 90s timeout, +2000 tokens and `reasoning_effort=low` (without
+it a 31k-char article spent the whole cap reasoning). On one story both
+matched Muse's key facts and structure; 15-45s per TLDR. VPS
+`LLM_PROVIDER=gospark` -> `gofree` in `shared/.env`, restarted 17:02 UTC;
+live TLDRs 200 with both halves (5 of 6 complete, 1 discussion-only, not
+cached so retried). Revert: `LLM_PROVIDER=gospark` once the Go limit resets.
+Luna on the user's ChatGPT plan works via `codex exec` (14s, good) but is
+not wired in: no OpenAI API key exists.
+
 ## 2026-09-29 Deployed `f49ff0f` (remember last window)
 
 VPS fast-forwarded from `d8643b5`, restarted 13:06 UTC (public URL up after
