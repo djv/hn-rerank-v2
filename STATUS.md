@@ -15,6 +15,11 @@ and, since 2026-09-26, which sources feed it.
   fetches article text for up to 30 RSS snippet rows per run, backlog
   backfilled; 272 legacy source labels relabelled (eval composite 0.669 ->
   0.675). FINDINGS.md "Source yield review — 2026-09-26".
+- AINews per-topic source (`rss_ainews`, 2026-09-29): each `[AINews]` issue in
+  `latent.space/feed` becomes one card per Twitter-recap topic, with the linked
+  tweets' text (fxtwitter) as discussion; whole-issue cards dropped. Added
+  r/singularity, r/ClaudeAI, r/LocalLLM, r/ClaudeCode. Live on the VPS at
+  `26c3736` since 04:06 UTC: first regen stored 51 topic cards, TLDR smoked.
 - Tools: `scripts/source_yield_report.py` (per-source yield),
   `scripts/backfill_rss_articles.py`, `scripts/relabel_legacy_sources.py`.
 

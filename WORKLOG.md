@@ -1,5 +1,22 @@
 # Worklog: hn-rewrite
 
+## 2026-09-29 TUI: Space pages the TLDR, j/k change stories in zoom
+
+User: "add space key to pagedown the article in either view" and "j/k
+change articles in zoomed in view like in article list view". `Space`
+pages the TLDR down whether the list or the TLDR has focus; `j`/`k` now
+move to the next/previous story in zoom too (arrows still scroll there).
+Hints, `?` help and the README updated; tests in
+`clients/tui/tests/test_editorial.py`. The web client is unchanged.
+
+## 2026-09-29 Stacked ranker eval: rejected
+
+`eval_ranker_variants.py` gained `stack[mode=gbm|ordinal|pair|lr;
+feats=content|meta|both;<ModelConfig overrides>]`: a second-stage model over
+out-of-fold SVM/logreg scores plus metadata. It loses to the current best on
+the full eval; FINDINGS.md "Stacked ranker — 2026-09-29". `probe_embeddings.py
+--extra` adds few-shot, temporal and fit-free geometry probes.
+
 ## 2026-09-29 AINews per-topic source
 
 User: "make it a real source. To replace the single cards", keeping the
@@ -12,7 +29,10 @@ fxtwitter tweet text as `top_comments`; the generic RSS path skips
 `ainews_max_tweets_per_run`. `scripts/ainews_topics.py` is now a read-only
 preview on the same code. An autouse conftest fixture stubs the regen leg so
 tests never reach the feed or fxtwitter. Live smoke (in-memory DB): 51
-topic stories, label "AINews". Not deployed (VPS SSH agent locked).
+topic stories, label "AINews". Deployed `26c3736` 2026-09-29 04:06 UTC
+(tag `deploy-pre-ainews` = `45882a2`): first regen logged 51 topic stories, 400
+tweets fetched, completed without errors; uncached + cached `POST
+/api/tldr-detail` on an AINews card returned a sourced summary.
 
 ## 2026-09-28 AINews Reddit-recap subreddits
 
