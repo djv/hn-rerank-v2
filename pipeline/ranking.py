@@ -1426,6 +1426,9 @@ def _score_and_rank(
                                 feedback_labels,
                                 dense_c=config.model.linear_blend_dense_c,
                                 tfidf_c=config.model.linear_blend_tfidf_c,
+                                warm=linear_blend.latest(user_id)
+                                if user_id is not None
+                                else None,
                             )
                         if fb_sig and user_id is not None:
                             linear_blend.set_cached(

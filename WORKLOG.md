@@ -13,6 +13,18 @@ percentile, text and vectorizer code with production. Tests:
 `tests/test_linear_blend.py`. Eval tie-fix and TF-IDF/joint/half-life/source
 options: `PRODLR_OPTIONS` in `scripts/eval_ranker_variants.py`.
 
+## 2026-09-29 Linear blend refits start from the previous fit
+
+Warm reranks after the cap raise took 15-22 s, but `linear_blend_fit_ms`
+was already 5-18 s per vote before it (19:50-20:41 UTC); the 7.7 s in
+STATUS was a best case. On the VPS with 151's 2,883 votes the TF-IDF
+logreg at C=4 took ~50 lbfgs iterations (7-14 s; hashed rows cached, dense
+LR 1.4 s). `fit_linear_blend(..., warm=)` now starts both logregs from the
+user's previous fit (`linear_blend.latest`), projecting the TF-IDF
+coefficients onto the new kept columns: 12 iterations, 2.2 s vs 13.9 s,
+Spearman 0.99999 against the cold fit on the same votes. The first fit
+after a restart is still cold.
+
 ## 2026-09-29 ClickHouse source: retries, nested comment trees, higher caps
 
 Review (read-only) of the CH source; user picked fixes 1-3.

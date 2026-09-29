@@ -181,3 +181,52 @@ def test_count_rows_cached_per_story_and_text(monkeypatch: pytest.MonkeyPatch) -
     edited = [replace(stories[0], title="new title")]
     linear_blend.count_rows(edited)
     assert calls == [1]
+
+
+def test_warm_start_reaches_the_cold_fit_in_fewer_iterations() -> None:
+    """A refit started from the previous vote set's model lands on the same
+    solution (the problem is convex) but needs fewer solver iterations."""
+    rng = np.random.default_rng(3)
+    stories, labels = [], []
+    for i in range(120):
+        up = i % 3 != 0
+        words = (UP_WORDS if up else DOWN_WORDS).split()
+        picked = rng.choice(words, size=4)
+        stories.append(
+            Story(
+                id=5000 + i,
+                title=" ".join(picked),
+                url=f"https://s{i % 7}.example/{i}",
+                score=1,
+                time=1,
+                text_content=" ".join(rng.choice(words + ["misc", "news"], size=30)),
+            )
+        )
+        labels.append(2 if up else 0)
+    dense = rng.standard_normal((120, 16)).astype(np.float32)
+    weights = linear_blend.balanced_weights(labels)
+
+    def fit(n: int, warm: linear_blend.LinearBlendModels | None = None):
+        return linear_blend.fit_linear_blend(
+            dense[:n],
+            labels[:n],
+            weights[:n],
+            stories[:n],
+            labels[:n],
+            dense_c=0.1,
+            tfidf_c=4.0,
+            warm=warm,
+        )
+
+    previous = fit(119)
+    cold = fit(120)
+    warm = fit(120, warm=previous)
+
+    x = cold.idf.transform(linear_blend.count_rows(stories)[:, cold.keep])
+    np.testing.assert_allclose(
+        linear_blend.up_minus_down(warm.tfidf, x),
+        linear_blend.up_minus_down(cold.tfidf, x),
+        atol=0.02,
+    )
+    assert warm.tfidf.n_iter_[0] < cold.tfidf.n_iter_[0]
+    assert warm.dense.n_iter_[0] <= cold.dense.n_iter_[0]
