@@ -212,6 +212,29 @@ async def test_narrow_footer_keeps_status_visible() -> None:
         assert hints.height == 2
 
 
+async def test_wide_footer_is_one_row() -> None:
+    fake = FakeServer()
+    app = Reader(api=fake.api())
+    async with app.run_test(size=(146, 39)) as pilot:
+        await settle(pilot)
+        status = app.query_one("#status").region
+        hints = app.query_one("#shortcuts").region
+        assert status.y == hints.y
+        assert status.height == hints.height == 1
+        assert status.right <= hints.x
+        # A long message no longer fits beside the keys, so the footer stacks.
+        app.status("x" * 80)
+        await pilot.pause()
+        status = app.query_one("#status").region
+        hints = app.query_one("#shortcuts").region
+        assert status.y < hints.y
+        # The counts line brings the single row back.
+        app.status_mode = "context"
+        app.context_status()
+        await pilot.pause()
+        assert app.query_one("#status").region.y == app.query_one("#shortcuts").region.y
+
+
 @pytest.mark.parametrize("size", [(51, 37), (80, 30), (140, 40)])
 @pytest.mark.parametrize("long_summary", [False, True])
 async def test_enter_zooms_tldr(size: tuple[int, int], long_summary: bool) -> None:

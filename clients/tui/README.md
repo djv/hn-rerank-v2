@@ -78,7 +78,8 @@ the dark editorial theme otherwise (checked every minute; a theme picked from
 the command palette holds until the next boundary). Unselected headlines are
 dimmed, so the selected row (a lifted band plus the `>` marker) reads first. One docked footer bar carries the current
 filter's counts on the left (`2 shown · +0 ~0 −0`) and context-sensitive keys on
-the right; failures appear there with a `✗` prefix and replace the counts until
+the right, on one row whenever both fit (narrow panes and long messages stack
+them); failures appear there with a `✗` prefix and replace the counts until
 the next successful refresh. Scrollbars follow the theme, and stories without a
 usable timestamp simply omit the age.
 

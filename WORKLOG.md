@@ -1,5 +1,19 @@
 # Worklog: hn-rewrite
 
+## 2026-09-28 TUI footer on one row
+
+User: "hn tui Status should fit on one line. Currently it's two." The footer
+CSS was `layout: vertical`, so the counts and the key hints always took two
+rows, even at 146 columns. It is now one row (counts left, keys right) when
+both texts fit the width; `Reader.fit_footer` stacks them only when they
+don't (narrow panes, long status messages), keeping the narrow layout the
+2026-09-24 work introduced. `test_wide_footer_is_one_row` covers both.
+
+`o`/`c` now open links in Chrome (user: "o/c should open in chrome"):
+`open_in_chrome` replaces `open_in_firefox`. A running Chrome adds a tab to
+its window, then `wmctrl` raises it; without Chrome, or if the launch
+fails, it falls back to `webbrowser.open`.
+
 ## 2026-09-28 Popular gravity runs on the window's clock
 
 User: "popular and date dont work well together cycling through the date

@@ -392,40 +392,37 @@ async def test_empty_summary_hides_story_until_refresh(
             await pilot.pause(0.05)
 
 
-def test_open_in_firefox_reuses_running_window(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_open_in_chrome_opens_a_tab(monkeypatch: pytest.MonkeyPatch) -> None:
     import subprocess as stdlib_subprocess
 
     import hn_rerank.app as app_module
 
     calls: list[list[str]] = []
-    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/firefox")
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr(
         "subprocess.run",
-        lambda *a, **k: stdlib_subprocess.CompletedProcess(a[0], 0),
+        lambda *a, **k: (
+            calls.append(a[0]) or stdlib_subprocess.CompletedProcess(a[0], 0)
+        ),
     )
     monkeypatch.setattr("subprocess.Popen", lambda argv, **k: calls.append(argv))
-    app_module.open_in_firefox("https://example.org/x")
-    assert calls == [["/usr/bin/firefox", "--new-tab", "https://example.org/x"]]
+    app_module.open_in_chrome("https://example.org/x")
+    assert calls == [
+        ["/usr/bin/google-chrome", "https://example.org/x"],
+        ["wmctrl", "-x", "-a", "google-chrome.Google-chrome"],
+    ]
 
 
-def test_open_in_firefox_launches_when_absent(
+def test_open_in_chrome_without_chrome_uses_default_browser(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import subprocess as stdlib_subprocess
-
     import hn_rerank.app as app_module
 
-    calls: list[list[str]] = []
-    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/firefox")
-    monkeypatch.setattr(
-        "subprocess.run",
-        lambda *a, **k: stdlib_subprocess.CompletedProcess(a[0], 1),
-    )
-    monkeypatch.setattr("subprocess.Popen", lambda argv, **k: calls.append(argv))
-    app_module.open_in_firefox("https://example.org/x")
-    assert calls == [["/usr/bin/firefox", "https://example.org/x"]]
+    opened: list[str] = []
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.setattr(app_module.webbrowser, "open", opened.append)
+    app_module.open_in_chrome("https://example.org/x")
+    assert opened == ["https://example.org/x"]
 
 
 async def test_stale_poll_does_not_cancel_summary_for_same_selection() -> None:
@@ -716,20 +713,20 @@ async def test_version_poll_keeps_hidden_stories_hidden(tmp_path: Path) -> None:
         assert [s.id for s in app.stories] == [1, 2]
 
 
-def test_open_in_firefox_falls_back_on_launch_error(
+def test_open_in_chrome_falls_back_on_launch_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import hn_rerank.app as app_module
 
     opened: list[str] = []
-    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/firefox")
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/google-chrome")
 
     def missing(*args: object, **kwargs: object) -> None:
-        raise FileNotFoundError("pgrep")
+        raise FileNotFoundError("google-chrome")
 
-    monkeypatch.setattr("subprocess.run", missing)
+    monkeypatch.setattr("subprocess.Popen", missing)
     monkeypatch.setattr(app_module.webbrowser, "open", opened.append)
-    app_module.open_in_firefox("https://example.org/x")
+    app_module.open_in_chrome("https://example.org/x")
     assert opened == ["https://example.org/x"]
 
 

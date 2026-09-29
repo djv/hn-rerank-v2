@@ -177,29 +177,27 @@ def copy_with_system_tool(text: str) -> bool:
     return False
 
 
-def open_in_firefox(url: str) -> None:
-    """Open a URL in the running Firefox window, launching one if needed."""
+def open_in_chrome(url: str) -> None:
+    """Open a URL in Chrome and bring its window forward. A running Chrome
+    adds the URL as a tab in its current window; otherwise it starts one."""
     import shutil
     import subprocess
 
-    firefox = shutil.which("firefox")
-    if firefox is None:
+    chrome = next(
+        (
+            path
+            for name in ("google-chrome", "google-chrome-stable", "chromium")
+            if (path := shutil.which(name))
+        ),
+        None,
+    )
+    if chrome is None:
         webbrowser.open(url)
         return
-    # A missing pgrep/wmctrl or a failed launch must not crash the reader.
+    # A failed launch must not crash the reader.
     try:
-        running = (
-            subprocess.run(
-                ["pgrep", "-x", "firefox"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=2,
-                check=False,
-            ).returncode
-            == 0
-        )
         subprocess.Popen(
-            [firefox, "--new-tab", url] if running else [firefox, url],
+            [chrome, url],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
@@ -210,7 +208,7 @@ def open_in_firefox(url: str) -> None:
     if shutil.which("wmctrl") is not None:
         try:
             subprocess.run(
-                ["wmctrl", "-x", "-a", "Navigator.firefox"],
+                ["wmctrl", "-x", "-a", "google-chrome.Google-chrome"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=2,
@@ -532,12 +530,16 @@ class Reader(App[None]):
     MarkdownFence { background: $hn-surface; margin: 0 0 1 0; padding: 1; }
     #summary MarkdownBlock > .strong { color: $hn-accent; text-style: bold; }
     #summary MarkdownBlock > .em { color: $hn-accent; }
-    #footer { dock: bottom; layout: vertical; height: auto; background: $hn-bar;
+    #footer { dock: bottom; layout: horizontal; height: auto; background: $hn-bar;
               border-top: solid $hn-rule; }
-    #status { width: 1fr; height: auto; max-height: 3; padding: 0 1; color: $hn-muted; }
+    #status { width: auto; height: auto; max-height: 3; padding: 0 1; color: $hn-muted; }
     #status.context { color: $hn-soft; }
     #status.error { color: $hn-bad; text-style: bold; }
-    #shortcuts { width: 1fr; height: auto; padding: 0 1; color: $hn-faint; }
+    #shortcuts { width: 1fr; height: auto; padding: 0 1; color: $hn-faint;
+                 text-align: right; }
+    .stacked-footer #footer { layout: vertical; }
+    .stacked-footer #status { width: 1fr; }
+    .stacked-footer #shortcuts { text-align: left; }
     .narrow Tabs { display: none; }
     .narrow Select { display: block; }
     .narrow #panes { layout: vertical; }
@@ -623,6 +625,9 @@ class Reader(App[None]):
         self.help_open = False
         self.setting_up = False
         self.status_mode = "context"
+        # Footer texts, to put status and hints on one row when both fit.
+        self.status_text = ""
+        self.hints_text = ""
         self.last_error: str | None = None
         self.prefetch = max(0, prefetch)
         self.prefetch_generate = min(self.prefetch, max(0, prefetch_generate))
@@ -738,6 +743,7 @@ class Reader(App[None]):
         widget.update(("✗ " if error else "") + message)
         widget.set_class(error, "error")
         widget.set_class(False, "context")
+        self.fit_footer(status=("✗ " if error else "") + message)
 
     def context_status(self) -> None:
         """Counts line for the current filter; only replaces an earlier counts line."""
@@ -756,6 +762,7 @@ class Reader(App[None]):
         widget.update(line)
         widget.set_class(False, "error")
         widget.set_class(True, "context")
+        self.fit_footer(status=line.plain)
 
     def show_failure(self, detail: str) -> None:
         """Failure copy in the reading pane when no feed has loaded yet."""
@@ -1629,7 +1636,7 @@ class Reader(App[None]):
         story = self.selected()
         url = getattr(story, field, "") if story else ""
         if urlsplit(url).scheme in {"http", "https"}:
-            open_in_firefox(url)
+            open_in_chrome(url)
         else:
             self.status("No link available for this story.")
 
@@ -1677,6 +1684,25 @@ class Reader(App[None]):
         else:
             hints = f"j/k move · {votes} · b badges · ? help · q quit"
         self.query_one("#shortcuts", Static).update(hints)
+        self.fit_footer(hints=hints, width=width)
+
+    def fit_footer(
+        self,
+        *,
+        status: str | None = None,
+        hints: str | None = None,
+        width: int | None = None,
+    ) -> None:
+        """One footer row (status left, keys right) when both fit; otherwise
+        stack them so the status keeps the full width."""
+        if status is not None:
+            self.status_text = status
+        if hints is not None:
+            self.hints_text = hints
+        width = self.size.width if width is None else width
+        # Each widget pads one cell per side; keep a gap of two between them.
+        needed = _cell_len(self.status_text) + _cell_len(self.hints_text) + 6
+        self.set_class(needed > width, "stacked-footer")
 
     @property
     def can_read(self) -> bool:
