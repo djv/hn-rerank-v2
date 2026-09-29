@@ -1,6 +1,7 @@
 """Tests for scripts/eval_ranker_variants.py."""
 
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from hypothesis import given, settings, strategies as st
@@ -491,6 +492,51 @@ def test_smoothed_label_rates_shrink_toward_global_rate() -> None:
     np.testing.assert_allclose(rates[2], base)
 
 
+def _signal_fold(n: int = 150, n_train: int = 120) -> Any:
+    """Up votes share an embedding direction, a domain and a title word."""
+    from dataclasses import replace
+
+    from scripts.eval_ranker_variants import _make_fold
+
+    rng = np.random.default_rng(0)
+    y = rng.permutation(np.repeat([0, 1, 2], n // 3))
+    emb = rng.normal(size=(n, 384)).astype(np.float32) * 0.3
+    emb[:, 0] += np.where(y == 2, 2.0, np.where(y == 0, -2.0, 0.0))
+    emb /= np.linalg.norm(emb, axis=1, keepdims=True)
+    domains = {0: "down.example", 1: "mid.example", 2: "up.example"}
+    words = {0: "crypto", 1: "misc", 2: "compilers"}
+    stories = [
+        replace(
+            _eval_story(i + 1),
+            url=f"https://{domains[int(label)]}/{i}",
+            title=f"Story {i} about {words[int(label)]}",
+        )
+        for i, label in enumerate(y)
+    ]
+    return _make_fold(
+        stories,
+        emb,
+        stories,
+        np.arange(n),
+        np.arange(n, dtype=float) + 10.0,
+        y,
+        np.arange(n),
+        np.arange(n_train),
+        np.arange(n_train, n),
+        Config(),
+        feedback_embeddings=emb,
+        judged_only=True,
+    )
+
+
+def _ups_above_downs(fold: Any, scores: np.ndarray) -> bool:
+    by_id = dict(zip((s.id for s in fold.candidates), scores))
+    pairs = list(zip((s.id for s in fold.test_stories), fold.test_actions))
+    ups = [by_id[i] for i, a in pairs if a == 2]
+    downs = [by_id[i] for i, a in pairs if a == 0]
+    return min(ups) > max(downs)
+
+
 @pytest.mark.parametrize(
     ("mode", "feats"),
     [
@@ -503,41 +549,132 @@ def test_smoothed_label_rates_shrink_toward_global_rate() -> None:
     ],
 )
 def test_stack_ranks_learnable_signal_first(mode: str, feats: str) -> None:
-    """Up votes share a topic direction and a domain; every stack mode and
-    feature set should put held-out up stories above down stories."""
+    """Every stack mode and feature set puts held-out ups above downs."""
+    from scripts.eval_ranker_variants import _scores_stack
+
+    fold = _signal_fold()
+    scores, _ = _scores_stack(fold, Config(), 1.0, mode=mode, feats=feats)
+    assert _ups_above_downs(fold, scores)
+
+
+@pytest.mark.parametrize("target", ["updown", "up", "updown_only"])
+def test_logreg_targets_rank_learnable_signal_first(target: str) -> None:
+    from scripts.eval_ranker_variants import _scores_logreg_target
+
+    fold = _signal_fold()
+    assert _ups_above_downs(fold, _scores_logreg_target(fold, Config(), target))
+
+
+def test_tfidf_learns_title_words_and_domains() -> None:
+    from scripts.eval_ranker_variants import _scores_tfidf
+
+    fold = _signal_fold()
+    assert _ups_above_downs(fold, _scores_tfidf(fold, 4.0))
+
+
+def test_skipped_stories_join_training_only_before_cutoff() -> None:
+    """Shown-but-unvoted stories become training votes only when first shown
+    before the fold's training cutoff and no story of the same URL group is
+    trained or tested on."""
     from dataclasses import replace
 
-    from scripts.eval_ranker_variants import _make_fold, _scores_stack
+    from scripts.eval_ranker_variants import SkippedPool, _with_skipped
 
-    rng = np.random.default_rng(0)
-    n = 150
-    y = rng.permutation(np.repeat([0, 1, 2], n // 3))
-    emb = rng.normal(size=(n, 384)).astype(np.float32) * 0.3
-    emb[:, 0] += np.where(y == 2, 2.0, np.where(y == 0, -2.0, 0.0))
-    emb /= np.linalg.norm(emb, axis=1, keepdims=True)
-    domains = {0: "down.example", 1: "mid.example", 2: "up.example"}
-    stories = [
-        replace(_eval_story(i + 1), url=f"https://{domains[int(label)]}/{i}")
-        for i, label in enumerate(y)
+    fold = _signal_fold()
+    cutoff = float(fold.train_vote_times.max())
+    extra = [
+        replace(_eval_story(1000 + i), url=f"https://x.example/{i}") for i in range(2)
     ]
-    test_pos = np.arange(120, n)
-    fold = _make_fold(
-        stories,
-        emb,
-        stories,
-        np.arange(n),
-        np.arange(n, dtype=float) + 10.0,
-        y,
-        np.arange(n),
-        np.arange(120),
-        test_pos,
-        Config(),
-        feedback_embeddings=emb,
-        judged_only=True,
+    # A cross-post (new ID, same URL) of a held-out story is the same article.
+    cross_post = replace(_eval_story(2000), url=fold.candidates[0].url)
+    pool = SkippedPool(
+        stories=[
+            extra[0],
+            extra[1],
+            fold.train_stories[0],
+            fold.candidates[0],
+            cross_post,
+        ],
+        first_shown=np.array([cutoff - 1, cutoff + 1, cutoff - 1, cutoff - 1, 0.0]),
+        emb=np.tile(np.eye(384, dtype=np.float32)[1], (5, 1)),
     )
-    scores, _ = _scores_stack(fold, Config(), 1.0, mode=mode, feats=feats)
-    by_id = dict(zip((s.id for s in fold.candidates), scores))
-    test_ids = [s.id for s in fold.test_stories]
-    ups = [by_id[i] for i, a in zip(test_ids, fold.test_actions) if a == 2]
-    downs = [by_id[i] for i, a in zip(test_ids, fold.test_actions) if a == 0]
-    assert min(ups) > max(downs)
+    grown = _with_skipped(fold, pool, 0, 1.0, Config())
+    added = grown.train_stories[len(fold.train_stories) :]
+    assert [s.id for s in added] == [1000]
+    assert grown.y_train[-1] == 0 and len(grown.y_train) == len(fold.y_train) + 1
+    assert grown.x_train_base.shape[0] == len(grown.train_stories)
+    assert grown.x_cand_base.shape == fold.x_cand_base.shape
+    assert grown.candidates == fold.candidates and grown.runtime_db is None
+    assert _with_skipped(fold, pool, 0, 0.0, Config()) is fold
+
+
+def test_per_embedding_production_rejects_dims_that_do_not_split() -> None:
+    from scripts.eval_ranker_variants import _per_embedding_production
+
+    with pytest.raises(ValueError, match="do not split"):
+        _per_embedding_production(_signal_fold(), Config(), None, [100, 200])
+
+
+def test_auc_counts_tied_opposite_labels_as_half() -> None:
+    """An upvote and a downvote with the same score are one coin flip: AUC
+    0.5 whichever comes first in the list, not 0 or 1."""
+    from scripts.eval_ranker_variants import _metrics
+
+    for first, second in ((1, 2), (2, 1)):
+        fold = _metric_fold(
+            [first, second], [2 if first == 1 else 0, 0 if first == 1 else 2]
+        )
+        scores = np.zeros(50, dtype=np.float32)
+        raw = _metrics(scores, fold, Config())["raw"]
+        assert raw["auc_up_vs_rest"] == 0.5
+        assert raw["auc_up_vs_down"] == 0.5
+    # Distinct scores still count strictly.
+    fold = _metric_fold([1, 2], [2, 0])
+    raw = _metrics(-np.arange(50, dtype=np.float32), fold, Config())["raw"]
+    assert raw["auc_up_vs_rest"] == 1.0
+
+
+def test_percentile_scores_share_rank_on_ties() -> None:
+    from scripts.eval_ranker_variants import _percentile_scores
+
+    np.testing.assert_allclose(
+        _percentile_scores(np.array([3.0, 1.0, 1.0, 2.0])), [1.0, 1 / 6, 1 / 6, 2 / 3]
+    )
+    np.testing.assert_allclose(_percentile_scores(np.zeros(3)), [0.5, 0.5, 0.5])
+    np.testing.assert_allclose(_percentile_scores(np.array([7.0])), [1.0])
+
+
+@pytest.mark.parametrize(
+    ("text", "char"),
+    [("full", False), ("title", False), ("titledom", False), ("full", True)],
+)
+def test_tfidf_inputs_learn_the_signal(text: str, char: bool) -> None:
+    from scripts.eval_ranker_variants import _scores_tfidf
+
+    fold = _signal_fold()
+    assert _ups_above_downs(fold, _scores_tfidf(fold, 4.0, text=text, char=char))
+
+
+def test_joint_words_and_embeddings_learn_the_signal() -> None:
+    from scripts.eval_ranker_variants import _scores_joint
+
+    fold = _signal_fold()
+    assert _ups_above_downs(fold, _scores_joint(fold, Config(), 1.0, half_life=30.0))
+
+
+def test_source_prior_follows_training_vote_rates() -> None:
+    from dataclasses import replace
+
+    from scripts.eval_ranker_variants import _scores_source_prior
+
+    fold = _signal_fold()
+    source = {0: "rss_down", 1: "rss_mid", 2: "rss_up"}
+    train = [
+        replace(s, source=source[int(y)])
+        for s, y in zip(fold.train_stories, fold.y_train)
+    ]
+    labels = dict(zip((s.id for s in fold.test_stories), fold.test_actions))
+    cands = [replace(s, source=source[int(labels[s.id])]) for s in fold.candidates]
+    scores = _scores_source_prior(replace(fold, train_stories=train, candidates=cands))
+    by_label = {int(labels[s.id]): float(v) for s, v in zip(cands, scores, strict=True)}
+    assert by_label[2] > by_label[1] > by_label[0]

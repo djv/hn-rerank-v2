@@ -1,5 +1,102 @@
 # HN Rerank findings
 
+## Full-eval reruns of near-tie ideas — 2026-09-29
+
+The small test (900 votes, 3 folds) is too noisy for changes of ~0.01, so
+every near-tie went to the full eval (user 1, all votes, 8 folds). Base
+`prodlr[svm_c=4.0;lr_weight=0.3]`, stored + gemma: P@12 0.708, AUC 0.791.
+
+| variant | P@12 | AUC | folds better (AUC) |
+|---|---|---|---|
+| + TF-IDF 0.2 (`tfidf_weight=0.2`) | 0.729 (+0.021, n.s.) | 0.800 (+0.009, p=0.015) | 7/8 |
+| + TF-IDF 0.3 (lr 0.2) | 0.729 (+0.021, n.s.) | 0.801 (+0.011, p=0.021) | 7/8 |
+| one SVM per embedding (`dims=384+768`) | 0.656 (-0.052) | 0.801 (+0.011, p=0.004) | 8/8 |
+| logreg up vs rest (`lr_target=up`) | 0.698 | 0.790 | 3/8 |
+| stored only, base | 0.698 | 0.774 | - |
+| + skipped stories as down | 0.667 | 0.775 | 2/8 |
+| + skipped stories as neutral | 0.667 | 0.772 | 0/8 |
+
+TF-IDF (word 1-2 grams + domain/source tokens, logreg fit per fold) is the
+first idea to beat the base on AUC without costing the top 12; sklearn
+only, so deployable without gemma.
+
+Unseen votes (base -> `lr_weight=0.2;tfidf_weight=0.3`):
+
+| check | top-12 up | AUC |
+|---|---|---|
+| user 1 reserved newest 20% (`--confirmation --folds 4`, stored+gemma) | 0.646 -> 0.667 (P@12) | 0.768 -> 0.774 |
+| 151 alone, votes after 09-26 (stored) | 9 -> 10 | 0.848 -> 0.857 |
+| 151 + user 1 since Jul, after 09-26 | 8 -> 10 | 0.879 -> 0.890 |
+| 151 alone, after 09-27 | 7 -> 7 | 0.836 -> 0.861 |
+| 151 + user 1 since Jul, after 09-27 | 7 -> 7 | 0.913 -> 0.921 |
+
+Better or equal on every check, never worse; each gain alone is within
+noise. (151 runs after the tie-aware AUC fix, confirmation before it.) Per-embedding SVMs improve AUC but lose
+top-12 precision; skipped-story negatives and the binary target do nothing.
+
+## MMR diversity on the top 12 — 2026-09-29
+
+Production has `enable_mmr = false`. Full eval (user 1, all votes, 8 folds,
+stored embeddings), same run's raw ranking vs MMR-filtered, top-12 upvotes
+per fold (mean):
+
+| threshold | production raw -> MMR | prodlr C=4 + 0.3 raw -> MMR |
+|---|---|---|
+| 0.65 | 7.50 -> 6.12 | 8.38 -> 7.62 |
+| 0.75 | 7.50 -> 7.25 | 8.38 -> 8.00 |
+| 0.85 | 7.50 -> 7.38 | 8.38 -> 8.25 |
+
+MMR only costs upvotes (fewer at looser thresholds) and raises the neutral
+share; downvotes unchanged. Keep it off. Caveat: judged-only pool, so the
+metric cannot reward variety for its own sake.
+
+## Merging user 1's votes into the live profile (151) — 2026-09-29
+
+Snapshot `snapshot-20260929.db` (read-only VPS copy; 151 has 459 votes,
+2026-09-24 to 09-29). `scripts/compare_profiles.py --old 1 --new 151`:
+
+| | votes | up/neu/down | HN | archive (>30 d old when voted) | median story age |
+|---|---|---|---|---|---|
+| user 1, June | 2,713 | 39/29/31% | 85% | 36% | 20.7 d |
+| user 1, Jul-Sep | 2,476 | 20-30% up | 49-82% | 1-8% | 0.9-2.5 d |
+| user 151 | 459 | 23/32/45% | 67% | 2% | 5.5 d |
+
+- June is the archive "best of" deck: user 1 upvoted 59% of archive
+  stories vs 26% of live ones. 151 has barely seen archive stories.
+- 151 is harsher on HN (16% up vs user 1's 31%); non-HN up rates match
+  (37-38%).
+- Same person, stable taste: on 147 stories voted by both, 69% same label,
+  up->down 2, down->up 0; disagreements are about neutral.
+
+Eval: `merge_profiles_snapshot.py --variant ID[:DATE][:live]` builds
+merged users (151's votes plus user 1's on other stories) in
+`snapshot-20260929-merged2.db`; 6 user-1 votes whose stored embedding no
+longer matches the story text were dropped from that copy. Holdout = 151's
+votes after the cutoff (`--holdout-after`), `prodlr[svm_c=4.0;lr_weight=0.3]`
+on stored embeddings:
+
+| trained on | AUC, cut 09-26 (≈257 votes) | cut 09-27 (145-146) | top-12 up (26 / 27) |
+|---|---|---|---|
+| 151 only | 0.848 | 0.837 | 9 / 7 |
+| + all of user 1 | 0.869 | 0.888 | 8 / 7 |
+| + user 1 since Jul | 0.879 | 0.913 | 8 / 7 |
+| + user 1 since Aug | 0.853 | 0.893 | 6 / 6 |
+| + user 1 live only | 0.869 | 0.903 | 9 / 7 |
+| + user 1 live, since Jul | 0.879 | 0.914 | 9 / 7 |
+
+Codex review (read-only, `/tmp/hn-eval-local/codex-ml-review.md`): the
+AUC gain stands (at 09-27, the four dated/live merges keep the identical
+146-vote test set: 0.837 -> 0.89-0.91), but choosing among the merges does
+not: "since Jul" and "live since Jul" differ by one ordered pair; the
+cutoffs overlap; top-12 counts are unchanged or (since Aug) worse. URL-group
+isolation drops 1-2 of 151's test upvotes in some merged runs. Merge also
+removes user 1's vote whenever 151 ever voted on the story (retrospective).
+Conclusion: merging raises AUC on 151's later votes by ~0.03-0.08 without
+moving the 12-card top; which slice of user 1 is not decided by this data.
+A July-onward merge drops the archive-heavy June votes, matching the
+profile comparison. The live merge (writing 151's training votes in the
+VPS DB) is not done: it needs the user's decision.
+
 ## Feed yield check — 2026-09-29
 
 Read-only on the VPS (`26c3736`). The scheduled check assumed user 1, who
@@ -37,9 +134,13 @@ gemma.
 - Full eval (all votes, 8 folds; current best P@12 0.708, AUC 0.791,
   reproduced exactly): pair both 0.583 / 0.786 (better in 1/8 folds), lr
   both 0.521 / 0.779 (P@12 p=0.04). Both also raise the downvote share of
-  the top 12 (0.010 -> 0.062). Rejected: the metadata this adds does not
-  survive time-ordered folds, and restacking the content scores loses
-  the SVM's top-of-list precision.
+  the top 12 (0.010 -> 0.062). Rejected as implemented.
+- Codex review (2026-09-29) found the implementation flawed, so this does
+  not rule out stacking: inner folds reuse kNN-similarity features built
+  from all outer-training labels (inner leak), the age feature uses each
+  candidate's own vote time, `comment_count_at_fetch` is always 0 in
+  heldout-feedback rows, and the content cache ignores gamma/kernel. Also
+  repo-wide: AUC counts tied pairs as 0/1 instead of 0.5.
 
 ## What others do for small-data personal ranking — 2026-09-28
 
@@ -901,3 +1002,68 @@ left alone). Deploy = push, `git pull --ff-only` (must be clean),
 Backend suite note: 803 passed with 18 `test_pipeline.py` errors that are
 pre-existing/environmental (HF repo-id validation); verified identical
 with the quota change stashed, so they do not gate config-only changes.
+
+## 2026-09-29 TF-IDF tuning sweep (full eval, 5,189 votes, 8 folds)
+
+Reference: `prodlr[svm_c=4;lr_weight=0.2;tfidf_weight=0.3]` (P@12 0.729, AUC 0.801). Deltas are vs that reference.
+
+| Variant | P@12 | AUC | AUC delta |
+|---|---|---|---|
+| tfidf_text=title / titledom | 0.635 / 0.615 | 0.789 / 0.792 | -0.011 / -0.009 (worse; body text matters) |
+| tfidf_char=1 | 0.708 | 0.803 | +0.001 (noise) |
+| tfidf_c=1 / 16 | 0.719 / 0.719 | 0.799 / 0.802 | -0.002 / 0.000 |
+| tfidf_weight=0.4 | 0.740 | 0.804 | +0.003 (p=0.15, noise) |
+| lr_target=joint (with tfidf 0.3) | 0.708 | 0.805 | +0.004, better in 8/8 folds, P@12 -0.021 |
+| half_life=60 / 120 | 0.708 / 0.719 | 0.801 / 0.802 | 0.000 |
+| source_weight=0.1 | 0.677 | 0.806 | +0.004 (p=0.22); P@12 -0.052, non-HN 3.5 of top 12 |
+
+Conclusion: nothing beats the TF-IDF 0.3 blend beyond noise. Title-only text is clearly worse. Half-life, char n-grams and C do not matter. The joint target is the only consistent AUC gain (+0.004) but costs P@12, so it is not a win. Source prior trades top-12 hits for more non-HN. Keep word 1-2 grams over title+body+domain, C default, weight 0.3.
+
+Holdout check of the two near-winners (`/tmp/hn-eval-local/sweep1-holdout.sh`,
+`s1h_table.py`; merged 151 and user 900002, cutoffs 09-26/09-27, upvotes in
+the top 12 and AUC):
+
+| Holdout | TF-IDF 0.3 | TF-IDF 0.4 | 0.3 + joint |
+|---|---|---|---|
+| 09-26, 151 | 10, 0.857 | 11, 0.859 | 10, 0.859 |
+| 09-26, 900002 | 10, 0.890 | 11, 0.892 | 10, 0.888 |
+| 09-27, 151 | 7, 0.861 | 8, 0.866 | 7, 0.870 |
+| 09-27, 900002 | 7, 0.921 | 8, 0.926 | 8, 0.922 |
+
+Weight 0.4 is ahead on all four (+1 top-12 upvote, AUC +0.002 to +0.005).
+The holdouts overlap, so this is weak evidence, but it points the same way as
+the full eval (+0.003 AUC, P@12 +0.010). 0.3 vs 0.4 is a coin flip within
+noise. For production, 0.4 is no worse and possibly slightly better.
+
+### Final full eval and Codex review of the TF-IDF proposal — 2026-09-29
+
+Proposal: `prodlr[svm_c=4;lr_weight=0.2;tfidf_weight=0.3]` vs base `prodlr[svm_c=4;lr_weight=0.3]`, stored+gemma embeddings, user 1, tie-aware AUC.
+
+| Run | P@12 base → new | AUC base → new | AUC delta |
+|---|---|---|---|
+| Full, 8 folds | 0.708 → 0.729 | 0.791 → 0.801 | +0.011 [+0.002,+0.019] p=0.021, 7/8 folds |
+| `--confirmation` (newest 20%), 4 folds | 0.646 → 0.667 | 0.768 → 0.774 | +0.006 [-0.008,+0.019] p=0.28, 2/4 folds |
+
+P@12 gain is two extra hits in 96 slots (not significant). Codex found no TF-IDF vocabulary/IDF leakage; verdict: ship only behind a default-off, profile-scoped flag. Its caveats: the 151 "unseen" checks overlap and informed tuning, so they are not independent replications; the model is really 50% prod rank + 20% dense LR + 30% TF-IDF (kNN weight 0); the evidence uses stored+gemma but production has stored only; TF-IDF text is title + first 5,000 chars of `text_content` (may include comments, ignores component fields when empty); the scorer has no cold/sparse-profile fallback (needs both classes) and per-profile fit cost is unmeasured; `cmp.py` pairs by position and mixes pooled and mean-of-fold AUC. Full review: `~/.local/state/hn-rerank-eval/hn-eval-local/codex-tfidf-review-out.md`.
+
+### TF-IDF blend on stored embeddings only (what production has) — 2026-09-29
+
+Same comparison as above, `--replay-embeddings all-stored.npz` only (no Gemma).
+
+| Run | P@12 base → new | AUC base → new | AUC delta |
+|---|---|---|---|
+| Full, 8 folds | 0.698 → 0.719 | 0.774 → 0.790 | +0.016 [+0.006,+0.026] p=0.006, 7/8 folds |
+| `--confirmation`, 4 folds | 0.604 → 0.667 | 0.737 → 0.751 | +0.014 [-0.003,+0.030] p=0.084, 3/4 folds |
+
+The gain holds without Gemma, and is slightly larger (stored embeddings alone are weaker, so TF-IDF adds more). Caveats from the Codex review still apply.
+
+### Proposal vs the actual live ranker — 2026-09-29
+
+Correction: the "base" above (`svm_c=4` + 0.3 LR) is not live. Live is `production` with `svm_c=0.1` (config.toml), no LR or TF-IDF. Stored embeddings only, user 1:
+
+| Run | P@12 live → proposal | AUC live → proposal | AUC delta |
+|---|---|---|---|
+| Full, 8 folds | 0.625 → 0.719 | 0.726 → 0.790 | +0.063 [+0.015,+0.111] p=0.017, 7/8 folds |
+| `--confirmation`, 4 folds | 0.667 → 0.667 | 0.739 → 0.751 | +0.011, p=0.38, 2/4 folds |
+
+Most of the full-eval gain over live comes from `svm_c` 0.1 → 4 plus the LR blend, not from TF-IDF alone (TF-IDF adds about +0.016 AUC on top). The newest-20% confirmation is flat, so treat the size of the gain as unconfirmed.

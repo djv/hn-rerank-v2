@@ -1,5 +1,18 @@
 # Worklog: hn-rewrite
 
+## 2026-09-29 Opt-in linear blend (TF-IDF + dense LR), not enabled
+
+`pipeline/linear_blend.py` plus `linear_blend_*` in `ModelConfig` (all default
+off; `config.toml` unchanged): 0.5 production + 0.2 dense LR + 0.3 TF-IDF LR
+by percentile rank, cached with the SVM, falling back to production on any
+fit/score error. Global flag (one user). Offline vs live (`svm_c=0.1`,
+stored embeddings): AUC 0.726 -> 0.790 on the full eval, flat on the newest
+20% (FINDINGS.md). To enable: `svm_c = 4.0` and `linear_blend_enabled = true`
+in `[hn_rewrite.model]`, then restart. The eval script now shares the
+percentile, text and vectorizer code with production. Tests:
+`tests/test_linear_blend.py`. Eval tie-fix and TF-IDF/joint/half-life/source
+options: `PRODLR_OPTIONS` in `scripts/eval_ranker_variants.py`.
+
 ## 2026-09-29 TLDRs on free OpenCode Go models (`gofree`, deployed `edb1316`)
 
 The Go plan's usage limit was spent (`GoUsageLimitError`, retry-after
@@ -16,6 +29,38 @@ live TLDRs 200 with both halves (5 of 6 complete, 1 discussion-only, not
 cached so retried). Revert: `LLM_PROVIDER=gospark` once the Go limit resets.
 Luna on the user's ChatGPT plan works via `codex exec` (14s, good) but is
 not wired in: no OpenAI API key exists.
+
+## 2026-09-29 TUI: `a` digs deeper in Claude Code
+
+`a` splits the reader's tmux pane side by side and runs `claude` there (in
+the home directory) with a
+prompt naming the story and its article and discussion links, asking for
+the key ideas, pushback in the comments and related reading
+(`dig_deeper_prompt`/`open_agent_session` in `clients/tui/src/hn_rerank/app.py`).
+`HN_RERANK_AGENT` overrides the command; outside tmux, or if tmux fails, the
+prompt is copied instead. Checked on tmux 3.7c that a multi-line prompt with
+quotes, `$` and `&` reaches the command verbatim. Help text: the time-window
+key read `a`; it is `d`. Fixed `test_cli_prefetch_flag`, broken since
+44e19d3 added `window_file`.
+
+## 2026-09-29 Live DB: user 1's July-onward votes merged into profile 151
+
+User chose "July onward" (FINDINGS.md "Merging user 1's votes into the live
+profile (151)"). On the VPS, after a backup
+(`main/hn_rewrite.db.pre_merge_1_to_151_20260929T140130Z`, quick_check ok):
+one transaction inserted user 1's votes with `updated_at >= 2026-07-01` on
+stories 151 had not voted on, as user 151 with the original action and
+timestamp: 2,332 rows (584 up, 975 neutral, 773 down). 151: 467 -> 2,799
+votes; user 1 unchanged (5,189). Service restarted 14:03 UTC; 151's feed
+serves 200 with counts 691/1,125/983, ready. Undo: delete user 151's rows
+whose `(story_id, updated_at)` match user 1's and predate 2026-09-24, or
+restore the backup (loses votes cast after 14:01 UTC).
+
+The empty `~/hn-rewrite/hn_rewrite.db` on the VPS (0 bytes, 2026-08-16
+14:14:24 UTC) came from a Codex session started in the git root
+(`core.worktree = ~/hn-rewrite/main`) running `sqlite3 hn_rewrite.db`;
+sqlite creates a missing file on open. Harmless; the live DB is
+`~/hn-rewrite/main/hn_rewrite.db`.
 
 ## 2026-09-29 Deployed `f49ff0f` (remember last window)
 

@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 
 import numpy as np
 from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
@@ -45,6 +46,11 @@ from pipeline import (
     story_embedding_text,
 )
 from pipeline.config import is_hn_source
+from pipeline.linear_blend import (
+    make_tfidf_vectorizer,
+    percentile_scores,
+    tfidf_text as tfidf_text_full,
+)
 
 
 @dataclass(frozen=True)
@@ -716,12 +722,8 @@ def _recency_decay(
 
 
 def _percentile_scores(scores: np.ndarray) -> np.ndarray:
-    order = np.argsort(scores, kind="mergesort")
-    ranks = np.empty(len(scores), dtype=np.float32)
-    if len(scores) <= 1:
-        return np.ones(len(scores), dtype=np.float32)
-    ranks[order] = np.linspace(0.0, 1.0, len(scores), dtype=np.float32)
-    return ranks
+    """Ranks scaled to [0, 1]; equal scores share their average rank."""
+    return percentile_scores(scores)
 
 
 def _fit_svc_up_margin(
@@ -1246,6 +1248,335 @@ def _scores_stack(
     return np.asarray(scores, dtype=np.float32), None
 
 
+@dataclass(frozen=True)
+class SkippedPool:
+    """Stories the user was shown (impression events) with a valid stored
+    embedding: weak negatives once a fold drops those it trains or tests on."""
+
+    stories: list[Story]
+    first_shown: np.ndarray
+    emb: np.ndarray
+
+
+def _load_skipped_pool(db: Database, config: Config, user_id: int) -> SkippedPool:
+    with db.conn() as conn:
+        rows = conn.execute(
+            """SELECT story_id, MIN(occurred_at) FROM interaction_events
+               WHERE user_id = ? AND event_type = 'impression'
+               GROUP BY story_id""",
+            (user_id,),
+        ).fetchall()
+    shown = {int(sid): float(t) for sid, t in rows}
+    stories = [s for s in (db.get_story(sid) for sid in shown) if s is not None]
+    hashes = dict(
+        zip([s.id for s in stories], _embedding_text_hashes(stories), strict=True)
+    )
+    vectors = db.get_embeddings_batch(
+        [s.id for s in stories], config.embedding_model_version, hashes
+    )
+    kept = [
+        s
+        for s in stories
+        if s.id in vectors
+        and np.isfinite(vectors[s.id]).all()
+        and np.isclose(np.linalg.norm(vectors[s.id]), 1.0, atol=1e-3)
+    ]
+    return SkippedPool(
+        stories=kept,
+        first_shown=np.array([shown[s.id] for s in kept], dtype=np.float64),
+        emb=np.asarray([vectors[s.id] for s in kept], dtype=np.float32).reshape(
+            len(kept), -1
+        ),
+    )
+
+
+def _url_group(story: Story) -> str:
+    return str(normalize_url(story.url) or f"story:{story.id}")
+
+
+def _with_skipped(
+    fold: FoldData, pool: SkippedPool, label: int, frac: float, config: Config
+) -> FoldData:
+    """The fold with a share of shown-but-unvoted stories added as training
+    votes of *label*. Only stories first shown before the training cutoff
+    and neither trained nor tested on in this fold; production has no sample
+    weights, so the share (frac of the eligible pool) sets their weight.
+    Stories match by URL group, so a cross-post counts as the same article."""
+    if fold.train_emb is None or fold.train_emb.shape[1] != pool.emb.shape[1]:
+        raise ValueError("skipped negatives need the stored embeddings")
+    cutoff = float(fold.train_vote_times.max())
+    # URL groups, as in _make_fold: a cross-post of an article the fold
+    # trains or tests on must not come back as a synthetic vote.
+    known = {
+        _url_group(s) for s in fold.train_stories + fold.candidates + fold.test_stories
+    }
+    eligible: list[int] = []
+    for i, s in enumerate(pool.stories):
+        if pool.first_shown[i] < cutoff and _url_group(s) not in known:
+            eligible.append(i)
+            known.add(_url_group(s))
+    count = int(round(min(frac, 1.0) * len(eligible)))
+    if not count:
+        return fold
+    take = np.sort(np.random.default_rng(0).permutation(eligible)[:count])
+    train_stories = fold.train_stories + [pool.stories[i] for i in take]
+    train_emb = np.vstack([fold.train_emb, pool.emb[take]])
+    y_train = np.concatenate([fold.y_train, np.full(count, label, dtype=int)])
+    x_train_base, x_cand_base = _experimental_features(
+        train_emb, train_stories, y_train, fold.cand_emb, fold.candidates, config
+    )
+    return replace(
+        fold,
+        train_stories=train_stories,
+        train_emb=train_emb,
+        y_train=y_train,
+        train_vote_times=np.concatenate(
+            [fold.train_vote_times, pool.first_shown[take]]
+        ),
+        x_train_base=x_train_base,
+        x_cand_base=x_cand_base,
+        tier2_scores=_tier2_scores(fold.cand_emb, train_emb, y_train),
+        runtime_db=None,
+        similarities={},
+    )
+
+
+def _per_embedding_production(
+    fold: FoldData, config: Config, source_db: Database | None, dims: list[int]
+) -> np.ndarray:
+    """Production fitted on each side-by-side embedding alone (blocks of
+    *dims* columns, rescaled to unit length), rank-averaged."""
+    if fold.train_emb is None or sum(dims) != fold.cand_emb.shape[1]:
+        raise ValueError(f"dims {dims} do not split {fold.cand_emb.shape[1]} columns")
+    scale = np.float32(np.sqrt(len(dims)))
+    bounds = np.cumsum([0, *dims])
+    scores = []
+    for lo, hi in zip(bounds[:-1], bounds[1:]):
+        part = replace(
+            fold,
+            cand_emb=np.ascontiguousarray(fold.cand_emb[:, lo:hi]) * scale,
+            train_emb=np.ascontiguousarray(fold.train_emb[:, lo:hi]) * scale,
+            runtime_db=None,
+            similarities={},
+        )
+        scores.append(_production_scores(part, config, source_db)[0])
+    return _rank_average(*scores)
+
+
+def _tfidf_text(story: Story, text: str = "full") -> str:
+    """full: domain/source tokens + title + text start; title: title only;
+    titledom: tokens + title."""
+    domain = _story_domain(story).replace(".", "_") or story.source
+    tokens = f"dom_{domain} src_{story.source}"
+    if text == "title":
+        return story.title
+    if text == "titledom":
+        return f"{tokens} {story.title}"
+    if text != "full":
+        raise ValueError(f"Unknown tfidf_text {text!r}")
+    return tfidf_text_full(story)
+
+
+def _tfidf_features(fold: FoldData, text: str, char: bool) -> tuple[Any, Any]:
+    """Sparse TF-IDF rows for training votes and candidates; the vocabulary
+    comes from the fold's training votes only."""
+    vectorizer = (
+        TfidfVectorizer(
+            analyzer="char_wb",
+            ngram_range=(3, 5),
+            min_df=2,
+            max_features=200_000,
+            sublinear_tf=True,
+        )
+        if char
+        else make_tfidf_vectorizer()
+    )
+    x_train = vectorizer.fit_transform(
+        [_tfidf_text(s, text) for s in fold.train_stories]
+    )
+    return x_train, vectorizer.transform(
+        [_tfidf_text(s, text) for s in fold.candidates]
+    )
+
+
+def _vote_weights(fold: FoldData, y: np.ndarray, half_life: float | None) -> np.ndarray:
+    weights = _balanced_weights(y)
+    if half_life is not None:
+        weights = weights * _recency_decay(
+            float(fold.train_vote_times.max()), fold.train_vote_times, half_life
+        )
+    return weights
+
+
+def _up_minus_down(clf: LogisticRegression, x: Any) -> np.ndarray:
+    probs = clf.predict_proba(x)
+    classes = list(clf.classes_)
+    return (probs[:, classes.index(2)] - probs[:, classes.index(0)]).astype(np.float32)
+
+
+def _scores_tfidf(
+    fold: FoldData,
+    c: float,
+    *,
+    text: str = "full",
+    char: bool = False,
+    half_life: float | None = None,
+) -> np.ndarray:
+    """Word 1-2 gram (or char 3-5 gram) TF-IDF logistic regression,
+    P(up) - P(down)."""
+    x_train, x_cand = _tfidf_features(fold, text, char)
+    y = fold.y_train
+    clf = LogisticRegression(C=c, max_iter=3000, random_state=0)
+    clf.fit(x_train, y, sample_weight=_vote_weights(fold, y, half_life))
+    return _up_minus_down(clf, x_cand)
+
+
+def _scores_joint(
+    fold: FoldData,
+    config: Config,
+    c: float,
+    *,
+    text: str = "full",
+    half_life: float | None = None,
+) -> np.ndarray:
+    """One logistic regression over TF-IDF words and the dense features
+    (embeddings raw, metadata scaled) side by side, P(up) - P(down)."""
+    from scipy.sparse import csr_matrix, hstack
+
+    dense_train, dense_cand, y, _ = _prepare_linear_model_inputs(fold, config)
+    words_train, words_cand = _tfidf_features(fold, text, False)
+    x_train = hstack([words_train, csr_matrix(dense_train)]).tocsr()
+    x_cand = hstack([words_cand, csr_matrix(dense_cand)]).tocsr()
+    clf = LogisticRegression(C=c, max_iter=3000, random_state=0)
+    clf.fit(x_train, y, sample_weight=_vote_weights(fold, y, half_life))
+    return _up_minus_down(clf, x_cand)
+
+
+def _scores_source_prior(fold: FoldData) -> np.ndarray:
+    """Per-source up rate minus down rate from the training votes, shrunk
+    toward the overall rates; a nudge for sources voted differently."""
+    rates = _smoothed_label_rates(
+        [s.source for s in fold.train_stories],
+        fold.y_train,
+        [s.source for s in fold.candidates],
+    )
+    return (rates[:, 0] - rates[:, 1]).astype(np.float32)
+
+
+def _scores_logreg_target(
+    fold: FoldData, config: Config, target: str, half_life: float | None = None
+) -> np.ndarray:
+    """The blend's logistic regression. updown: 3-class P(up) - P(down)
+    (production challenger); up: binary up vs rest; updown_only: trained on
+    up and down votes only (neutral dropped), P(up)."""
+    if target == "updown":
+        return _scores_logreg(
+            fold, config, target="up_minus_down", half_life_days=half_life
+        )[0]
+    if target == "up":
+        return _scores_logreg(fold, config, binary=True, half_life_days=half_life)[0]
+    if target != "updown_only":
+        raise ValueError(f"Unknown lr_target {target!r}")
+    x_train, x_cand, y, _ = _prepare_linear_model_inputs(fold, config)
+    keep = y != 1
+    y_bin = (y[keep] == 2).astype(int)
+    clf = LogisticRegression(C=config.model.svm_c, max_iter=2000, random_state=0)
+    clf.fit(x_train[keep], y_bin, sample_weight=_balanced_weights(y_bin))
+    return clf.predict_proba(x_cand)[:, 1].astype(np.float32)
+
+
+PRODLR_OPTIONS = {
+    "lr_weight",
+    "knn_weight",
+    "tfidf_weight",
+    "tfidf_c",
+    "lr_target",
+    "skip_label",
+    "skip_frac",
+    "dims",
+    "tfidf_text",
+    "tfidf_char",
+    "joint_c",
+    "half_life",
+    "source_weight",
+}
+
+
+def _scores_prodlr(
+    fold: FoldData,
+    tuned: Config,
+    config: Config,
+    source_db: Database | None,
+    options: dict[str, str],
+    skipped_pool: SkippedPool | None,
+) -> np.ndarray:
+    """prodlr[...]: production (tuned) rank-blended with logistic regression
+    and optionally kNN and TF-IDF. Options: lr_weight (0.5), knn_weight,
+    tfidf_weight, tfidf_c (4), lr_target (updown|up|updown_only),
+    skip_label (down|neutral) + skip_frac (1.0) add shown-but-unvoted
+    stories as weak training votes, dims (e.g. 384+768) fits production on
+    each side-by-side embedding separately, tfidf_text (full|title|titledom)
+    and tfidf_char=1 (char 3-5 grams) pick the TF-IDF input, lr_target=joint
+    (+ joint_c, 1.0) replaces the logreg by one model over TF-IDF words and
+    dense features, half_life (days) decays older votes in the linear models,
+    source_weight blends a per-source vote prior."""
+    if "skip_label" in options:
+        if skipped_pool is None:
+            raise ValueError("skip_label needs the skipped pool")
+        label = {"down": 0, "neutral": 1}[options["skip_label"]]
+        fold = _with_skipped(
+            fold, skipped_pool, label, float(options.get("skip_frac", 1.0)), config
+        )
+    if "dims" in options:
+        dims = [int(d) for d in options["dims"].split("+")]
+        production = _per_embedding_production(fold, tuned, source_db, dims)
+    else:
+        production = _production_scores(fold, tuned, source_db)[0]
+    weights = {
+        key: float(options.get(key, default))
+        for key, default in (
+            ("lr_weight", 0.5),
+            ("knn_weight", 0.0),
+            ("tfidf_weight", 0.0),
+            ("source_weight", 0.0),
+        )
+    }
+    half_life = float(options["half_life"]) if "half_life" in options else None
+    text = options.get("tfidf_text", "full")
+    target = options.get("lr_target", "updown")
+    zeros = np.zeros(len(fold.candidates), dtype=np.float32)
+
+    def logreg() -> np.ndarray:
+        if target == "joint":
+            return _scores_joint(
+                fold,
+                config,
+                float(options.get("joint_c", 1.0)),
+                text=text,
+                half_life=half_life,
+            )
+        return _scores_logreg_target(fold, config, target, half_life)
+
+    scores = {
+        "production": production,
+        "logreg": logreg() if weights["lr_weight"] else zeros,
+        "knn": _scores_knn_up_minus_down(fold, config)[0]
+        if weights["knn_weight"]
+        else zeros,
+        "tfidf": _scores_tfidf(
+            fold,
+            float(options.get("tfidf_c", 4.0)),
+            text=text,
+            char=options.get("tfidf_char", "0") == "1",
+            half_life=half_life,
+        )
+        if weights["tfidf_weight"]
+        else zeros,
+        "source": _scores_source_prior(fold) if weights["source_weight"] else zeros,
+    }
+    return _weighted_rank_blend(scores, **weights)
+
+
 def _scores_knn_up_minus_down(
     fold: FoldData, config: Config
 ) -> tuple[np.ndarray, None]:
@@ -1336,13 +1667,20 @@ def _parse_model_overrides(spec: str) -> dict[str, float | int | bool]:
 
 
 def _weighted_rank_blend(
-    scores: dict[str, np.ndarray], *, lr_weight: float, knn_weight: float
+    scores: dict[str, np.ndarray],
+    *,
+    lr_weight: float,
+    knn_weight: float,
+    tfidf_weight: float = 0.0,
+    source_weight: float = 0.0,
 ) -> np.ndarray:
-    """Percentile-rank blend; production gets 1 - lr_weight - knn_weight."""
+    """Percentile-rank blend; production gets the rest of the weight."""
     weights = {
-        "production": 1.0 - lr_weight - knn_weight,
+        "production": 1.0 - lr_weight - knn_weight - tfidf_weight - source_weight,
         "logreg": lr_weight,
         "knn": knn_weight,
+        "tfidf": tfidf_weight,
+        "source": source_weight,
     }
     if min(weights.values()) < 0:
         raise ValueError(f"Blend weights must be non-negative: {weights}")
@@ -1402,7 +1740,11 @@ def _metrics(
     novel_ids = _novel_candidate_ids(fold)
     non_hn_ids = {s.id for s in fold.candidates if not is_hn_source(s.source)}
 
-    def compute(ids: list[int], eligible: set[int]) -> dict:
+    score_by_id = {s.id: float(v) for s, v in zip(fold.candidates, scores, strict=True)}
+
+    def compute(
+        ids: list[int], eligible: set[int], *, tie_scores: bool = False
+    ) -> dict:
         positives = {
             sid for sid, label in judged.items() if label == 2 and sid in eligible
         }
@@ -1431,15 +1773,30 @@ def _metrics(
         # the share of (upvote, other) pairs ordered upvote-first. 0.5 is
         # random. Unlike NDCG@k it uses the whole list, so it is far less
         # noisy on ~700-card folds.
+        # With tie_scores, cards of equal score form one group and each
+        # (upvote, other) pair inside it counts one half, not 0 or 1 by list
+        # position.
         for other_name, others in (("rest", (0, 1)), ("down", (0,))):
-            ups_seen = pairs = n_other = 0
-            for sid in ids:
-                label = judged.get(sid)
-                if sid in positives:
-                    ups_seen += 1
-                elif label in others:
-                    pairs += ups_seen
-                    n_other += 1
+            ups_seen = n_other = 0
+            pairs = 0.0
+            start = 0
+            while start < len(ids):
+                end = start + 1
+                if tie_scores:
+                    while (
+                        end < len(ids)
+                        and score_by_id[ids[end]] == score_by_id[ids[start]]
+                    ):
+                        end += 1
+                group = ids[start:end]
+                group_up = sum(sid in positives for sid in group)
+                group_other = sum(
+                    sid not in positives and judged.get(sid) in others for sid in group
+                )
+                pairs += ups_seen * group_other + 0.5 * group_up * group_other
+                ups_seen += group_up
+                n_other += group_other
+                start = end
             result[f"auc_up_vs_{other_name}"] = (
                 pairs / (n_up * n_other) if n_up and n_other else None
             )
@@ -1515,7 +1872,7 @@ def _metrics(
     ):
         raise ValueError("Invalid scorer probability matrix")
     raw_ids = [fold.candidates[i].id for i in order]
-    output = {"raw": compute(raw_ids, candidate_ids)}
+    output = {"raw": compute(raw_ids, candidate_ids, tie_scores=True)}
     # The same ranking restricted to stories of one text length, so an
     # embedding strategy that only helps long (or short) stories shows up.
     for bucket, (low, high) in TEXT_LENGTH_BUCKETS.items():
@@ -1523,7 +1880,7 @@ def _metrics(
             s.id for s in fold.candidates if low <= len(story_embedding_text(s)) < high
         }
         output[f"raw_{bucket}"] = compute(
-            [sid for sid in raw_ids if sid in bucket_ids], bucket_ids
+            [sid for sid in raw_ids if sid in bucket_ids], bucket_ids, tie_scores=True
         )
     if config.model.enable_mmr:
         ranked = [
@@ -1560,6 +1917,24 @@ def _metrics(
     return output
 
 
+def _experimental_features(
+    train_emb: np.ndarray,
+    train_stories: list[Story],
+    y_train: np.ndarray,
+    cand_emb: np.ndarray,
+    candidates: list[Story],
+    config: Config,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Embedding + length + kNN-similarity matrices for training and candidates."""
+    k = config.model.knn_k
+    train_sims = _loocv_similarity_features(train_emb, y_train, k)
+    cand_sims = _candidate_similarity_features(cand_emb, train_emb, y_train, k)
+    return (
+        _feature_matrix(train_emb, train_stories, *train_sims),
+        _feature_matrix(cand_emb, candidates, *cand_sims),
+    )
+
+
 def _make_fold(
     candidates: list[Story],
     cand_emb: np.ndarray,
@@ -1579,8 +1954,7 @@ def _make_fold(
     train_story_indices = valid_positions[train_pos]
     test_story_indices = valid_positions[test_pos]
 
-    def group_key(story: Story) -> str:
-        return str(normalize_url(story.url) or f"story:{story.id}")
+    group_key = _url_group
 
     # Keep the first held-out vote per article; never evaluate a cross-post of
     # an article already present in training. Identity matches production URL
@@ -1639,13 +2013,8 @@ def _make_fold(
             tier2_scores=_tier2_scores(fold_cand_emb, train_emb, y_train),
         )
 
-    train_sim_up, train_sim_down, train_closest_up, train_closest_down = (
-        _loocv_similarity_features(train_emb, y_train, config.model.knn_k)
-    )
-    cand_sim_up, cand_sim_down, cand_closest_up, cand_closest_down = (
-        _candidate_similarity_features(
-            fold_cand_emb, train_emb, y_train, config.model.knn_k
-        )
+    x_train_base, x_cand_base = _experimental_features(
+        train_emb, train_stories, y_train, fold_cand_emb, fold_candidates, config
     )
     return FoldData(
         train_emb=train_emb,
@@ -1656,22 +2025,8 @@ def _make_fold(
         test_actions=test_actions,
         test_vote_times=fb_vote_times[test_pos],
         train_vote_times=train_vote_times,
-        x_train_base=_feature_matrix(
-            train_emb,
-            train_stories,
-            train_sim_up,
-            train_sim_down,
-            train_closest_up,
-            train_closest_down,
-        ),
-        x_cand_base=_feature_matrix(
-            fold_cand_emb,
-            fold_candidates,
-            cand_sim_up,
-            cand_sim_down,
-            cand_closest_up,
-            cand_closest_down,
-        ),
+        x_train_base=x_train_base,
+        x_cand_base=x_cand_base,
         y_train=y_train,
         tier2_scores=_tier2_scores(fold_cand_emb, train_emb, y_train),
     )
@@ -2192,8 +2547,10 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
                 requested.append(name)
     # Hill-climbing names: prod[spec] = production with ModelConfig overrides;
     # produd[spec] scores it softmax(up) - softmax(down); prodlr[spec] rank-
-    # averages it with logreg_up_minus_down; stack[mode=..;feats=..;spec]
-    # is the second-stage ranker (_scores_stack) over the same SVM/logreg.
+    # averages it with logreg_up_minus_down (options: PRODLR_OPTIONS);
+    # stack[mode=..;feats=..;spec] is the second-stage ranker (_scores_stack)
+    # over the same SVM/logreg.
+    skipped_pool: SkippedPool | None = None
     for name in requested:
         prefix, bracket, rest = name.partition("[")
         if not bracket or not rest.endswith("]"):
@@ -2218,15 +2575,13 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
                 _scores_stack(fold, c, config.model.svm_c, mode=m, feats=f)
             )
             continue
-        blend = {
-            key: float(value)
+        options = {
+            key: value
             for key, _, value in (item.partition("=") for item in spec)
-            if key in ("lr_weight", "knn_weight")
+            if key in PRODLR_OPTIONS
         }
         model_spec = ";".join(
-            item
-            for item in spec
-            if item.partition("=")[0] not in ("lr_weight", "knn_weight")
+            item for item in spec if item.partition("=")[0] not in PRODLR_OPTIONS
         )
         tuned = replace(
             production_config,
@@ -2243,18 +2598,13 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
                 fold, tuned, db
             )
         elif prefix == "prodlr":
-            variants[name] = lambda fold, tuned=tuned, blend=blend: (
-                _weighted_rank_blend(
-                    {
-                        "production": _production_scores(fold, tuned, db)[0],
-                        "logreg": _scores_logreg(fold, config, target="up_minus_down")[
-                            0
-                        ],
-                        "knn": _scores_knn_up_minus_down(fold, config)[0],
-                    },
-                    lr_weight=blend.get("lr_weight", 0.5),
-                    knn_weight=blend.get("knn_weight", 0.0),
-                ),
+            if "skip_label" in options and skipped_pool is None:
+                skipped_pool = _load_skipped_pool(db, config, user.id)
+                print(
+                    f"skipped pool: {len(skipped_pool.stories)} shown stories (voted ones drop per fold)"
+                )
+            variants[name] = lambda fold, tuned=tuned, opts=options: (
+                _scores_prodlr(fold, tuned, config, db, opts, skipped_pool),
                 None,
             )
     if requested:
