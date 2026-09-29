@@ -11,7 +11,7 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 import httpx
 from platformdirs import user_config_path
 
-from .models import DEFAULT_WINDOW, WINDOWS, Feed, terminal_safe
+from .models import DEFAULT_WINDOW, WINDOWS, Feed, Window, terminal_safe
 
 
 @dataclass(frozen=True)
@@ -125,6 +125,28 @@ class Profile:
 
 def profile_path() -> Path:
     return user_config_path("hn-rerank", appauthor=False) / "profile.json"
+
+
+def window_path() -> Path:
+    return user_config_path("hn-rerank", appauthor=False) / "window"
+
+
+def load_window(path: Path) -> Window | None:
+    """The last time window picked, or None when unset or unreadable."""
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return next((window for window in WINDOWS if window == value), None)
+
+
+def save_window(window: str, path: Path) -> None:
+    """Best effort: an unwritable config dir only loses the preference."""
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.write_text(f"{window}\n", encoding="utf-8")
+    except OSError:
+        pass
 
 
 def load_profile(path: Path) -> Profile | None:

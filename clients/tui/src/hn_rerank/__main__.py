@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 
+from .api import window_path
 from .app import DEFAULT_PREFETCH, DEFAULT_PREFETCH_GENERATE, DEFAULT_SERVER, Reader
 
 
@@ -40,6 +41,7 @@ def main() -> None:
             server=args.server,
             prefetch=args.prefetch,
             prefetch_generate=args.prefetch_generate,
+            window_file=window_path(),
         )
     except ValueError as exc:
         parser.error(str(exc))

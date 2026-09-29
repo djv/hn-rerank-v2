@@ -1,5 +1,15 @@
 # Worklog: hn-rewrite
 
+## 2026-09-29 Clients reopen on the last time window
+
+User: "i dont like default date to be 1 week", then chose "Remember last".
+Web: the picked window goes to `localStorage` (`hnWindow`); on load the page
+still embeds the 1w feed and switches to the saved window right away.
+Terminal: `Reader(window_file=...)` reads/writes a `window` file next to
+`profile.json` (`__main__` passes it; tests pass none, so they never write).
+Unset or unreadable falls back to 1w. Tests: `tests/test_browser.py`
+(reload keeps Archive), `clients/tui/tests/test_windows.py`.
+
 ## 2026-09-29 TUI: Space pages the TLDR, j/k change stories in zoom
 
 User: "add space key to pagedown the article in either view" and "j/k

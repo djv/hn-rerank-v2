@@ -46,9 +46,11 @@ from .api import (
     Profile,
     TransientError,
     load_profile,
+    load_window,
     normalize_server,
     profile_path,
     save_profile,
+    save_window,
 )
 from .api import Summary as SummaryResult
 from .models import (
@@ -598,8 +600,15 @@ class Reader(App[None]):
         api: API | None = None,
         prefetch: int = DEFAULT_PREFETCH,
         prefetch_generate: int = DEFAULT_PREFETCH_GENERATE,
+        window_file: Path | None = None,
     ) -> None:
         super().__init__()
+        # The last window picked opens next time; None (tests) keeps 1w and
+        # never writes.
+        self.window_file = window_file
+        self.saved_window = (
+            load_window(window_file) if window_file else None
+        ) or DEFAULT_WINDOW
         for name in PALETTES:
             self.register_theme(editorial_theme(name))
         self.clock_theme = ""
@@ -676,7 +685,7 @@ class Reader(App[None]):
             yield Static("Window", classes="filter-caption")
             yield Dropdown(
                 [(WINDOW_LABELS[w], w) for w in WINDOWS],
-                value=DEFAULT_WINDOW,
+                value=self.saved_window,
                 allow_blank=False,
                 id="window",
             )
@@ -977,6 +986,9 @@ class Reader(App[None]):
         if self.view_key is not None:
             self.explore_orders.pop(self.view_key, None)  # next visit reshuffles
         if event.select.id == "window":
+            if self.window_file is not None and event.value != self.saved_window:
+                self.saved_window = str(event.value)
+                save_window(self.saved_window, self.window_file)
             self.show_window(str(event.value))
         else:
             self.rebuild(select_id=-1)

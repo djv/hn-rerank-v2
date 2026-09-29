@@ -945,6 +945,8 @@
     let storiesById = new Map();
     let currentSort = 'recommended';
     let currentWindow = '1w';
+    // The last time window picked opens next visit (the page embeds 1w).
+    const WINDOW_KEY = 'hnWindow';
     // Feeds by window, all of one deck version. A newer version replaces
     // them all; a saved vote bumps the generation, so a background request
     // sent before it can't bring back data from before the vote.
@@ -1251,6 +1253,7 @@
       } else if (filterName === 'window' && value !== currentWindow && WINDOWS.includes(value)) {
         currentWindow = value;
         if (windowSelect) windowSelect.value = value;
+        try { localStorage.setItem(WINDOW_KEY, value); } catch (err) { /* private mode */ }
         const cached = feeds.get(value);
         if (cached) {
           showFeed(cached, false);
@@ -2119,6 +2122,9 @@
       api_version: FEED_API_VERSION, window: currentWindow, stories: [], orders: {},
       feedback_counts: {}, version: 0, target_version: 0, ready: false,
     }));
+    let savedWindow = null;
+    try { savedWindow = localStorage.getItem(WINDOW_KEY); } catch (err) { /* private mode */ }
+    if (savedWindow && savedWindow !== currentWindow) setFilter('window', savedWindow);
     window.setInterval(pollFeedVersion, POLL_INTERVAL_MS);
   </script>
 </body>

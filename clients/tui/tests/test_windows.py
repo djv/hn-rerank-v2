@@ -6,8 +6,10 @@ import asyncio
 import json
 from collections.abc import Callable
 from dataclasses import replace
+from pathlib import Path
 
 import httpx
+import pytest
 from textual.pilot import Pilot
 from textual.widgets import OptionList, Select
 
@@ -209,3 +211,38 @@ async def test_rapid_votes_and_undo_across_windows() -> None:
         assert not app.rated
         # The pending rerank marks whichever window is on screen.
         assert app.feed is not None and not app.feed.ready
+
+
+async def test_last_window_opens_next_time(tmp_path: Path) -> None:
+    """The window picked is saved and the next start opens on it."""
+    window_file = tmp_path / "config" / "window"
+    fake = FakeServer()
+    fake.window_feeds = {"1m": window_feed("1m", [20, 21])}
+    app = Reader(api=fake.api(), window_file=window_file)
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        assert app.selected_window() == "1w"  # nothing saved yet
+        assert not window_file.exists()
+        await pilot.press("d")
+        await settle(pilot)
+        assert window_file.read_text(encoding="utf-8").strip() == "1m"
+
+    fake = FakeServer()
+    fake.window_feeds = {"1m": window_feed("1m", [20, 21])}
+    app = Reader(api=fake.api(), window_file=window_file)
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        assert app.selected_window() == "1m" and shown(app) == [20, 21]
+        assert fake.feed_requests()[0] == "1m"  # no 1w detour first
+
+
+@pytest.mark.parametrize("content", [b"", b"2w\n", b"\xff\xfe"])
+async def test_unusable_saved_window_falls_back_to_default(
+    tmp_path: Path, content: bytes
+) -> None:
+    window_file = tmp_path / "window"
+    window_file.write_bytes(content)
+    app = Reader(api=FakeServer().api(), window_file=window_file)
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        assert app.selected_window() == "1w"

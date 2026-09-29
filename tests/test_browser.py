@@ -287,4 +287,14 @@ def test_dashboard_page_end_to_end(page: Any) -> None:
     assert _state(page)["head"] == []  # nothing that young: an empty view
     assert "Nothing left in this view" in page.inner_text("#queue-loading")
 
+    # The last window picked opens on the next visit.
+    page.select_option("#window-select", "archive")
+    page.wait_for_function("() => currentWindow === 'archive' && !feed.loading")
+    page.reload()
+    page.wait_for_function(
+        "() => currentWindow === 'archive' && !feed.loading && visible.length > 0"
+    )
+    assert page.input_value("#window-select") == "archive"
+    assert all(sid > BASE_ID + 28 for sid in _state(page)["head"])
+
     assert page.problems == []
