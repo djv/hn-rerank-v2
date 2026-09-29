@@ -14,7 +14,7 @@ old profile, stopped 2026-09-24): ranking quality and which sources feed it.
   spent until ~2026-10-06, so `LLM_PROVIDER=gofree` (free
   `longcat-2.5-preview-free` on the Go gateway, `reasoning_effort=low`).
   Smoke: 5 of 6 TLDRs complete, 15-45s each. WORKLOG.md 2026-09-29.
-- TUI `a` (uncommitted, tests pass): Claude Code in a tmux pane split beside
+- TUI `a` (uncommitted, another session's work; tests pass): Claude Code in a tmux pane split beside
   the reader with the article/comments links and a dig-deeper prompt.
 - Profile merge (live, 2026-09-29 14:01 UTC, user chose "July onward"):
   user 1's 2,332 votes since 2026-07-01 on stories 151 had not voted on
@@ -28,11 +28,18 @@ old profile, stopped 2026-09-24): ranking quality and which sources feed it.
   TF-IDF logreg 0.3). TF-IDF alone added AUC 0.791 -> 0.801 (7/8 folds) and
   was better or equal on all five unseen-vote checks (user 1's reserved
   newest 20%, 151's votes after 09-26/09-27, alone and merged).
-- TF-IDF sweep (full eval + 151/900002 holdouts, FINDINGS.md "TF-IDF
-  tuning sweep"): nothing beats it beyond noise. Weight 0.4 vs 0.3 is a tie
-  leaning 0.4 (ahead on all 4 holdouts, +1 top-12 upvote). Title-only input,
-  source prior 0.1 and the joint words+embeddings model are worse at the top
-  12; char n-grams, TF-IDF C and half-life make no difference.
+- Linear blend built and pushed (`f01dbba`, `21f870c`), off by default and
+  not deployed: `linear_blend_enabled` in `pipeline/linear_blend.py`.
+  Against the actual live ranker (`svm_c=0.1`, stored embeddings only) the
+  full eval gives AUC 0.726 -> 0.790 (p=0.017), P@12 0.625 -> 0.719; the
+  newest-20% run is flat (AUC 0.739 -> 0.751, P@12 0.667 both). TF-IDF alone
+  on top of svm_c=4 + LR: +0.016 AUC. Codex review: no leakage, but the
+  "unseen votes" checks overlap and informed tuning, so the size of the gain
+  is unconfirmed. FINDINGS.md "Proposal vs the actual live ranker".
+- TF-IDF sweep (full eval, FINDINGS.md "TF-IDF tuning sweep"): nothing
+  beats weight 0.3 beyond noise. Title-only input, source prior 0.1 and the
+  joint model are worse at the top 12; char n-grams, TF-IDF C and half-life
+  make no difference.
 - Rejected on the full eval: MMR (costs upvotes at every threshold), one
   SVM per embedding (AUC up, top 12 down), skipped stories as weak
   negatives, binary up-vs-rest logreg, stacking as implemented (Codex found
@@ -47,13 +54,13 @@ old profile, stopped 2026-09-24): ranking quality and which sources feed it.
   shown). FINDINGS.md "Feed yield check — 2026-09-29".
 
 ## Blocker / limits
-- Deploying TF-IDF needs a production ranking change (`pipeline/ranking.py`)
-  and the user's OK; gemma side by side also needs gemma on the VPS.
+- Enabling the linear blend changes the live ranker: needs the user's OK.
+  Gemma side by side is not live and would need gemma on the VPS.
 - Go limit resets ~2026-10-06: then set `LLM_PROVIDER=gospark` in the
   VPS `shared/.env` and restart. Luna via OpenAI needs an API key (none;
   the ChatGPT plan only covers Codex).
 - The merge's live effect needs ~100 new votes from 151 to read.
-- Offline gains are ~0.01 AUC, each within noise alone.
+- Offline gains over live are large on the full eval but flat on the newest 20%.
 - `/tmp` is wiped at boot: the eval dir is mirrored to
   `~/.local/state/hn-rerank-eval/hn-eval-local` (last synced 2026-09-29 12:15);
   snapshots and merged copies live in `~/.local/state/hn-rerank-eval/`.
