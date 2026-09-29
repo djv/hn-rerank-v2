@@ -276,10 +276,44 @@ def test_query_comments_bulk_walks_multiple_levels(
 
     monkeypatch.setattr(ch_client.httpx, "post", fake_post)
     result = query_comments_bulk([1], max_levels=5)
-    assert {c["id"] for c in result[1]} == {10, 11}
+    assert [c["id"] for c in result[1]] == [10]
+    assert [c["id"] for c in result[1][0]["children"]] == [11]
     # story_kids + level0 (id=10) + level1 (id=11) = 3 requests, not one
     # single mega-join.
     assert len(calls) == 3
+
+
+def test_query_comments_bulk_nests_in_kids_order_and_blanks_removed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Top-level order follows the story's kids (HN rank), not CH row order;
+    a deleted comment keeps its place with empty text and its replies."""
+
+    def fake_post(url, **kwargs):
+        query = kwargs.get("content", "")
+        if "type = 'story'" in query:
+            return _MockResponse(200, {"data": [{"id": 1, "kids": [30, 20]}]})
+        if "IN (30,20)" in query:
+            return _MockResponse(
+                200,
+                {
+                    "data": [
+                        {"id": 20, "text": "second", "kids": [], "removed": 0},
+                        {"id": 30, "text": "gone", "kids": [31], "removed": 1},
+                    ]
+                },
+            )
+        if "IN (31)" in query:
+            return _MockResponse(
+                200, {"data": [{"id": 31, "text": "reply", "kids": [], "removed": 0}]}
+            )
+        return _MockResponse(200, {"data": []})
+
+    monkeypatch.setattr(ch_client.httpx, "post", fake_post)
+    tree = query_comments_bulk([1], max_levels=5)[1]
+    assert [c["id"] for c in tree] == [30, 20]
+    assert tree[0]["text"] == ""
+    assert [(c["id"], c["text"]) for c in tree[0]["children"]] == [(31, "reply")]
 
 
 # ---------- query_stories_with_comments ----------

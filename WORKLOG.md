@@ -13,6 +13,29 @@ percentile, text and vectorizer code with production. Tests:
 `tests/test_linear_blend.py`. Eval tie-fix and TF-IDF/joint/half-life/source
 options: `PRODLR_OPTIONS` in `scripts/eval_ranker_variants.py`.
 
+## 2026-09-29 ClickHouse source: retries, nested comment trees, higher caps
+
+Review (read-only) of the CH source; user picked fixes 1-3.
+- Live-window query retried 3 times (2 s, 8 s) before a regen gives up on
+  fresh scores. Sep 25 had one failed call ("fetched 4068 candidates"); the
+  deck still served live rows from the DB, so the cost was stale scores
+  and missing new stories for one regen, not an empty feed.
+- `query_comments_bulk` returned a flat list in CH GROUP BY order, so every
+  comment reached `_extract_comments_recursive` at depth 0 with no replies:
+  the thread-aware selection degraded to "longest comments". It now nests
+  replies under `children` in HN's `kids` order. Deleted/dead now come from
+  each comment's latest version (a row filter kept 30 of 5,428 comments
+  deleted later); removed comments stay as empty nodes so their replies
+  are walked. Depth 5 -> 30 (`DEFAULT_MAX_LEVELS`). Live check on
+  49892245: 226 nodes vs 213 descendants, depth 12, order matches
+  Firebase, 172 of 189 selectable comments below top level; 140 stories
+  in 8.1 s.
+- `LIVE_WINDOW_LIMIT` and `recent_candidate_hn_limit` 5000 -> 10,000 (CH had
+  7,511 live stories with score >= 5; the cut ones were all score 5-7).
+  A warning logs when the cap is hit.
+- CH freshness: newest item 26 s old at 20:36 UTC; docs no longer claim a
+  fixed 1-24h lag.
+
 ## 2026-09-29 TLDR latency on `gofree`; Gemini free tier now 20/day
 
 "TLDRs kinda slow": since 17:02 UTC, `gofree` (longcat) ran 132 TLDRs at

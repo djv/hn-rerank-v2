@@ -75,7 +75,7 @@ def is_hn_source(source: str) -> bool:
 
 BQ_ARCHIVE_CANDIDATE_LIMIT = 2000
 CH_ARCHIVE_CANDIDATE_LIMIT = 2000
-LIVE_WINDOW_LIMIT = 5000
+LIVE_WINDOW_LIMIT = 10_000
 
 
 @dataclass(frozen=True)
@@ -152,7 +152,7 @@ class Config:
     # score is 0 for nearly all non-HN rows — so once the limit clears
     # the in-window row count, the ordering stops mattering and the
     # ranker's own scoring picks the winners from the full window.
-    recent_candidate_hn_limit: int = 5000
+    recent_candidate_hn_limit: int = 10_000
     recent_candidate_rss_limit: int = 5000
     non_hn_candidates_enabled: bool = True
     # Independent of source regeneration and per-user warm frequency.

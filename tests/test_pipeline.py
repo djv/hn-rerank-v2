@@ -1896,6 +1896,50 @@ async def test_fetch_candidates_live_window_honors_config_days(
 
 
 @pytest.mark.asyncio
+async def test_fetch_candidates_retries_failed_live_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Transient CH failures are retried; the third attempt's rows land."""
+    import asyncio
+
+    from database import Database
+    from pipeline import Config, fetch_candidates
+
+    db_file = tmp_path / "test.db"
+    db = Database(str(db_file))
+    attempts: list[int] = []
+    sleeps: list[float] = []
+
+    def flaky_live_window(**kw: int) -> list[dict[str, object]]:
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise OSError("Temporary failure in name resolution")
+        return [
+            {
+                "id": 777,
+                "type": "story",
+                "title": "Retried story",
+                "url": "https://example.com/r",
+                "text": "",
+                "points": 40,
+                "num_comments": 3,
+                "created_at_i": 1770000000,
+            }
+        ]
+
+    async def no_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr("ch_client.query_live_window", flaky_live_window)
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+    candidates, _ = await fetch_candidates(
+        Config(db_path=str(db_file), days=30), set(), set(), db
+    )
+    assert len(attempts) == 3 and sleeps[:2] == [2.0, 8.0]
+    assert db.get_story(777) is not None
+
+
+@pytest.mark.asyncio
 async def test_fetch_candidates_ch_live_window_inserts_new(tmp_path, monkeypatch):
     """CH live_window returns story fields; fetch_candidates inserts them
     into the DB with source='hn'."""

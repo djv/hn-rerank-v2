@@ -687,7 +687,7 @@ async def fetch_candidates(
 
     One CH call does the work the old code did with ~125 Algolia calls:
 
-    `ch_client.query_live_window(days=config.days, min_score=5, limit=5000)`
+    `ch_client.query_live_window(days=config.days, min_score=5, limit=LIVE_WINDOW_LIMIT)`
     returns every live HN story from the past `config.days` (default 30) days
     with all fields populated
     (title, url, score, descendants, time, text). No per-story items
@@ -695,27 +695,49 @@ async def fetch_candidates(
 
     Archive seeds (`ch_seed`, `bq_seed`) are read from the DB only.
 
-    The 1-24h CH lag is acceptable: a 3h regen cycle means brand-new
-    stories surface within 4h. Algolia's single-story items API is
+    CH was near real time on 2026-09-29 (newest item under a minute old);
+    it has lagged 1-24h before. Algolia's single-story items API is
     preserved as a fallback for `ch_seed`/`bq_seed` lazy fetches.
 
     Comment text for the top-20 ranked cards is fetched by
     `prewarm_top_stories` on every dashboard render (not here).
     """
-    from ch_client import query_live_window
+    from ch_client import ChItem, query_live_window
 
-    # 1. Live window from CH (replaces ~125 Algolia search + items calls)
-    try:
-        live_window = query_live_window(
-            days=config.days,
-            min_score=5,
-            limit=LIVE_WINDOW_LIMIT,
+    # 1. Live window from CH (replaces ~125 Algolia search + items calls).
+    # play.clickhouse.com fails transiently (DNS, "Too many simultaneous
+    # queries"), so retry before giving up on fresh scores for this regen;
+    # the deck still serves the live rows already in the DB.
+    live_window: list[ChItem] = []
+    for attempt, delay in enumerate((2.0, 8.0, None)):
+        try:
+            live_window = query_live_window(
+                days=config.days,
+                min_score=5,
+                limit=LIVE_WINDOW_LIMIT,
+            )
+            break
+        except Exception as exc:
+            if delay is None:
+                logging.error(
+                    "fetch_candidates: CH live_window failed %d times (%r); "
+                    "live scores not refreshed this regen",
+                    attempt + 1,
+                    exc,
+                )
+            else:
+                logging.warning(
+                    "fetch_candidates: CH live_window attempt %d failed (%r)",
+                    attempt + 1,
+                    exc,
+                )
+                await asyncio.sleep(delay)
+    if len(live_window) >= LIVE_WINDOW_LIMIT:
+        logging.warning(
+            "fetch_candidates: CH live_window hit its %d-row cap; "
+            "lowest-scored live stories are cut",
+            LIVE_WINDOW_LIMIT,
         )
-    except Exception as exc:
-        logging.error(
-            "fetch_candidates: CH live_window failed (%r); live source empty", exc
-        )
-        live_window = []
 
     # 2. Build candidates from live window: insert new, update existing scores
     candidates: list[Story] = []

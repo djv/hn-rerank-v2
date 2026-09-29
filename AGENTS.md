@@ -252,7 +252,7 @@ sole source for the live 30-day window and bulk operations.
 The live `hn` source pipeline (`fetch_candidates` in `pipeline/__init__.py`) now
 issues **2 CH calls per regen**:
 
-1. `ch_client.query_live_window(days=config.days, min_score=5, limit=5000)` —
+1. `ch_client.query_live_window(days=config.days, min_score=5, limit=LIVE_WINDOW_LIMIT)` (10,000; retried 3 times) —
    every live HN story from the past `days` (default 30) with all fields (title, url,
    score, descendants, time, text).
 2. The prewarm (comment text for all HN candidates with `comment_count > 0` and
@@ -270,7 +270,8 @@ to revert to top-by-score prewarm (`regen_prewarm_top_n=50` default; Reddit
 prewarm is now driven by `reddit_prewarm_top_per_sub=10` — top 10 hot per sub
 from the topfeed cache, not by score from a DB query).
 
-CH has 1-24h latency for brand-new content (vs Algolia's real-time).
+CH was near real time on 2026-09-29 (newest item under a minute old) but has
+lagged 1-24h for brand-new content before (vs Algolia's real-time).
 With the default 4h regen cycle, worst case is 5h lag for stories posted in the
 last hour. Acceptable for "best of HN" view; the swipe deck mostly
 shows older stories anyway.

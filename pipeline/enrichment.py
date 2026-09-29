@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 import feedparser
 import httpx
 
+from ch_client import DEFAULT_MAX_LEVELS
 from database import Database, Story, StoryIdentityConflict, coerce_int
 
 if TYPE_CHECKING:
@@ -217,7 +218,7 @@ def prewarm_top_stories(
     story_ids: list[int],
     db: Database,
     embedder: Embedder | None = None,
-    max_levels: int = 5,
+    max_levels: int = DEFAULT_MAX_LEVELS,
 ) -> int:
     """Bulk-prewarm comment text for the top-N stories.
 
@@ -234,7 +235,7 @@ def prewarm_top_stories(
         db: Database instance for read + write.
         embedder: Optional Embedder; if provided, recomputes the embedding
             for any story whose text_content changed.
-        max_levels: comment tree depth (default 5; covers ~95% of trees).
+        max_levels: comment tree depth (``ch_client.DEFAULT_MAX_LEVELS``).
 
     Returns:
         Number of stories whose top_comments was updated.

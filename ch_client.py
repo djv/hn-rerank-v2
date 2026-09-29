@@ -16,7 +16,7 @@ size — see incident notes in WORKLOG.md.
 Public API:
 - query_live_window(days, min_score, limit) -> list of story metadata dicts
 - query_stories_bulk(story_ids) -> {id: story_dict} (no comments)
-- query_comments_bulk(story_ids, max_levels) -> {id: list of comment dicts}
+- query_comments_bulk(story_ids, max_levels) -> {id: nested top-level comments}
 - query_stories_with_comments(story_ids, max_levels) -> {id: full item dict}
 - query_single_story(story_id) -> item dict (lazy fallback; 15min cache)
 - clear_cache() -> None (test helper)
@@ -32,7 +32,7 @@ Each result item matches the Algolia items shape:
     "created_at_i": int,   # unix timestamp (stories only)
     "story_text": str,     # self-post text (stories only)
     "text": str,           # body (stories: self_text; comments: comment text)
-    "children": [comment, comment, ...],  # recursive (best-effort, max_levels)
+    "children": [comment, comment, ...],  # nested in HN kids order (max_levels)
   }
 
 Caching:
@@ -270,7 +270,13 @@ GROUP BY id
 
 
 def _build_comment_level_query(comment_ids: list[int]) -> str:
-    """Return comment rows (with their own `kids`) for an exact ID list."""
+    """Return comment rows (with their own `kids`) for an exact ID list.
+
+    Deleted/dead state is taken from each comment's latest version, not
+    filtered per row: a row-level `deleted = 0` kept comments deleted later
+    (their older versions pass). Removed comments still come back so the
+    walk reaches their replies; their text is blanked by the caller.
+    """
     ids_csv = ",".join(str(int(i)) for i in comment_ids)
     return f"""
 SELECT
@@ -278,59 +284,78 @@ SELECT
     any(by) AS by,
     any(parent) AS parent,
     argMax(text, update_time) AS text,
-    argMax(kids, update_time) AS kids
+    argMax(kids, update_time) AS kids,
+    argMax(deleted, update_time) OR argMax(dead, update_time) AS removed
 FROM hackernews_history
-WHERE id IN ({ids_csv}) AND type = 'comment' AND deleted = 0 AND dead = 0
+WHERE id IN ({ids_csv}) AND type = 'comment'
 GROUP BY id
 """
 
 
+# Deep enough for nearly every HN thread; each level is one small query and
+# the walk stops as soon as a level comes back empty. At 5 levels a sampled
+# thread lost 10-22% of its comments (2026-09-29).
+DEFAULT_MAX_LEVELS = 30
+
+
 def query_comments_bulk(
     story_ids: list[int],
-    max_levels: int = 5,
+    max_levels: int = DEFAULT_MAX_LEVELS,
 ) -> dict[int, list[ChItem]]:
-    """Return {story_id: [comment_dict, ...]} for the given stories.
+    """Return {story_id: [top-level comment, ...]} for the given stories.
 
     Walks the `kids` arrays breadth-first, one cheap `id IN (...)` query per
-    level, instead of joining against the full comments table. Each comment
-    dict has the Algolia items shape (id, type, text, kids). Children are
-    not recursively nested in the result; the caller is expected to use
-    parent IDs to reconstruct the tree if needed.
+    level, instead of joining against the full comments table, then nests
+    each comment's replies under `children` in HN's own `kids` order (HN
+    ranks top-level comments that way), so thread-aware comment selection
+    sees real depth and reply counts. Deleted/dead comments stay in the tree
+    with empty text so their replies keep their place.
     """
     if not story_ids:
         return {}
     if max_levels < 1:
         raise ValueError("max_levels must be >= 1")
 
-    by_story: dict[int, list[ChItem]] = {sid: [] for sid in story_ids}
+    root_kids: dict[int, list[int]] = {sid: [] for sid in story_ids}
+    nodes: dict[int, ChItem] = {}
+    node_kids: dict[int, list[int]] = {}
 
-    # frontier maps comment_id -> owning root story_id, for the level about
-    # to be fetched.
-    frontier: dict[int, int] = {}
+    frontier: list[int] = []
     for chunk in _chunked(list(story_ids)):
         for row in _post_ch(_build_story_kids_query(chunk)):
             sid = coerce_int(row.get("id"))
-            for kid in row.get("kids") or []:
-                frontier[coerce_int(kid)] = sid
+            kids = [coerce_int(k) for k in row.get("kids") or []]
+            if sid in root_kids:
+                root_kids[sid] = kids
+                frontier.extend(kids)
 
     level = 0
     while frontier and level < max_levels:
-        ids = list(frontier.keys())[:_MAX_LEVEL_FRONTIER]
-        next_frontier: dict[int, int] = {}
+        ids = list(dict.fromkeys(frontier))[:_MAX_LEVEL_FRONTIER]
+        next_frontier: list[int] = []
         for chunk in _chunked(ids):
             for row in _post_ch(_build_comment_level_query(chunk)):
                 cid = coerce_int(row.get("id"))
-                sid = frontier.get(cid)
-                if sid is None:
+                if cid in nodes:
                     continue
-                if sid in by_story:
-                    by_story[sid].append(_build_comment_dict(row))
-                for kid in row.get("kids") or []:
-                    next_frontier[coerce_int(kid)] = sid
+                node = _build_comment_dict(row)
+                if row.get("removed"):
+                    node["text"] = ""
+                nodes[cid] = node
+                kids = [coerce_int(k) for k in row.get("kids") or []]
+                node_kids[cid] = kids
+                next_frontier.extend(kids)
         frontier = next_frontier
         level += 1
 
-    return by_story
+    def attach(cid: int) -> ChItem:
+        node = nodes[cid]
+        node["children"] = [attach(k) for k in node_kids.get(cid, []) if k in nodes]
+        return node
+
+    return {
+        sid: [attach(k) for k in kids if k in nodes] for sid, kids in root_kids.items()
+    }
 
 
 def _build_single_story_query(story_id: int) -> str:
@@ -345,7 +370,7 @@ WHERE id = {int(story_id)}
 
 def query_stories_with_comments(
     story_ids: list[int],
-    max_levels: int = 5,
+    max_levels: int = DEFAULT_MAX_LEVELS,
 ) -> dict[int, ChItem]:
     """Return {story_id: item dict with children} for the given stories.
 
@@ -353,8 +378,7 @@ def query_stories_with_comments(
     roundtrip for comments, plus one for stories (could be combined but
     keeping them separate is simpler and the data volume is small).
 
-    Children are organized as a flat list keyed by parent id within the item
-    dict, so callers can reconstruct the tree by walking kids.
+    `children` holds the nested comment tree (see query_comments_bulk).
     """
     if not story_ids:
         return {}
@@ -374,7 +398,9 @@ def query_stories_with_comments(
     return stories
 
 
-def query_single_story(story_id: int, max_levels: int = 5) -> ChItem | None:
+def query_single_story(
+    story_id: int, max_levels: int = DEFAULT_MAX_LEVELS
+) -> ChItem | None:
     """Return a single story's item dict, or None if not found.
 
     Cache TTL: 15 min (single-story fetches are rare; only used as lazy
