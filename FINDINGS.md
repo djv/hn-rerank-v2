@@ -1,5 +1,74 @@
 # HN Rerank findings
 
+## Feed yield check — 2026-09-29
+
+Read-only on the VPS (`26c3736`). The scheduled check assumed user 1, who
+stopped voting on 2026-09-24; the live profile is user 151.
+- Reddit: `reddit_limiter 429` 63/day (09-27), 54 (09-28), was ~150/day;
+  full refreshes ~2h apart. Every configured subreddit refreshed within
+  ~2h except r/ocaml (7 failures, "fetch returned no snapshot", last ok
+  09-28 07:25). Stale rows in `reddit_feed_state` are dropped feeds.
+- Article text: 44 regen runs fetched 220/260 RSS article bodies; 531
+  recent rows of configured non-Reddit RSS feeds still have none.
+- Errors: none beyond handled feed read timeouts / server disconnects. The
+  15 "Failed with result 'exit-code'" lines are restarts (SIGTERM -> 143).
+- Yield since 09-27, user 151 (up/shown): HN 3/111 (38 of 53 votes down),
+  Latent Space 3/9, Zvi 3/5, r/LocalLLaMA 1/6, LessWrong 0/15. New feeds
+  mostly not shown yet. r/transit 0 up / 1 down, r/MachineLearning 1 up
+  of 2 shown: too few to decide, keep both.
+
+## Stacked ranker — 2026-09-29
+
+Second stage (`stack[...]`) over out-of-fold content scores (RBF SVM C=4
+margin, 3-class logreg P(up)-P(down); 5 inner folds, candidates get the
+mean of the inner models) and/or metadata (source and domain up/down rates
+shrunk toward the global rate, log points, log comments at fetch, log
+length, log age at vote, Show/Ask HN, HN vs other). Embeddings: stored +
+gemma.
+
+- Leak found and fixed: leave-one-out source/domain rates let gradient
+  boosting learn an inverted label signal (within a key the rate drops
+  exactly when the row's own vote is up); small-eval AUC fell to 0.58 and
+  metadata alone to 0.50. Out-of-fold rates fixed it
+  (`test_out_of_fold_label_rates_ignore_own_vote`).
+- Small test (300/class, 3 folds; current best P@12 0.528, AUC 0.721):
+  gbm both 0.528/0.717, ordinal both 0.500/0.714, pair both 0.556/0.730,
+  lr both 0.583/0.728; metadata alone AUC 0.57-0.59 on temporal folds.
+- Full eval (all votes, 8 folds; current best P@12 0.708, AUC 0.791,
+  reproduced exactly): pair both 0.583 / 0.786 (better in 1/8 folds), lr
+  both 0.521 / 0.779 (P@12 p=0.04). Both also raise the downvote share of
+  the top 12 (0.010 -> 0.062). Rejected: the metadata this adds does not
+  survive time-ordered folds, and restacking the content scores loses
+  the SVM's top-of-list precision.
+
+## What others do for small-data personal ranking — 2026-09-28
+
+Web survey (no code). Ranked by expected value per effort for ~5k explicit
+votes on one user, CPU only:
+1. Word TF-IDF (1-2grams + domain/submitter tokens) linear model next to
+   the dense SVM. Semantic Scholar feeds average a TF-IDF SVM and a SPECTER
+   SVM (arxiv.org/html/2301.10140v2); Scholar Inbox found TF-IDF lower AUC
+   but higher nDCG than embeddings (arxiv.org/html/2504.08385);
+   github.com/fredrik/rekorderlig ranks HN on words/domain/submitter.
+   Fit the vectorizer inside each fold.
+2. Unvoted stories as low-weight negatives (both systems above; Scholar
+   Inbox tunes count and weight). Draw only from before the fold cutoff.
+3. TabPFN as the stacker (~15 features, ~3k rows is its regime; ties
+   logreg on raw frozen embeddings, arxiv.org/html/2607.11007). Needs
+   torch in an opt-in group; check the license.
+4. Boosted lambdarank/pairwise (being tested as `stack[...]`); large gains
+   reported only at millions of rows (arxiv.org/abs/2608.13874).
+5. Exploration: uncertainty sampling (Scholar Inbox), LinUCB
+   (github.com/permacommons/habitfeed); needs a learning-curve simulation,
+   not AUC.
+6-8. Low value here: SetFit/contrastive fine-tuning (gains at 8-64
+   examples/class), LLM rankers or LLM-written profiles (popularity and
+   position bias, cost), two-tower/user embeddings (one user = the linear
+   model). Working personal feeds use linear models on embeddings
+   (adamwiggins.com/posts/a-bluesky-feed-for-one, scour.ing/docs/ranking).
+Scale check: Scholar Inbox embedding swaps moved AUC ~0.004; treat any
+single change worth >0.03 AUC here as a possible leak.
+
 ## Incremental ranker hill-climb — 2026-09-28
 
 Setup: `eval_ranker_variants.py --candidate-pool heldout-feedback`, user 1,
@@ -123,6 +192,29 @@ tuned-eval (3 folds) vs stored+gemma: 270m ties at best (AUC 0.708-0.726
 vs 0.720, n.s.). Research shortlist (classification-heavy MTEB, fits the
 UHD 620): jina-v5-text-nano (classification variant), Qwen3-Embedding-0.6B,
 KaLM-mini-v2.5, mdbr-leaf-mt (cheap VPS option).
+
+### Extra probes (`--extra`) and harrier-0.6b — 2026-09-28
+
+Same 900-story sample (300/class). Few-shot = AUC up vs rest from N votes
+per class (20 draws, ±SE); temporal = oldest 70% train, newest 30% test;
+centroid and nn10 (share of 10 nearest voted neighbours with the same
+label, chance 0.33) involve no fitting.
+
+| embedding | few 25 | few 50 | few 100 | temporal | centroid | nn10 up | nn10 dn | k-means V |
+|---|---|---|---|---|---|---|---|---|
+| stored | 0.662 | 0.694 | 0.716 | 0.718 | 0.695 | 0.461 | 0.384 | 0.669 |
+| gemma | 0.676 | 0.701 | 0.730 | 0.709 | 0.692 | 0.518 | 0.366 | 0.839 |
+| harrier-270m (no prefix) | 0.670 | 0.699 | 0.720 | 0.698 | 0.692 | 0.478 | 0.385 | 0.679 |
+| harrier-0.6b (prefix) | 0.661 | 0.681 | 0.700 | 0.684 | 0.676 | 0.473 | 0.415 | 0.661 |
+
+- gemma's edge is real but small: few-shot (+0.014 at 25/class, SE 0.005),
+  purer upvote neighbourhoods (0.52 vs 0.46) and much cleaner source
+  clusters (V 0.84 vs 0.67, only 74 stories / 5 sources). Stored keeps the
+  best temporal (newest-votes) AUC.
+- harrier-0.6b is worst on every metric except downvote neighbourhoods.
+  But it was encoded with the instruct prefix, and on harrier-270m the
+  prefix cost ~0.02 AUC (0.729 with vs 0.752 without), so its
+  no-prefix rerun is the fair test.
 
 ## TUI simplification — 2026-09-26
 

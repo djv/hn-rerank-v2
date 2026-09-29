@@ -14,6 +14,12 @@ probe's hyperparameters picked by inner cross-validation per embedding:
   regression macro-F1 predicting the source (subreddit, blog, site), and
   k-means V-measure against the source. A generic in-domain classification
   and clustering check that ignores the user's taste.
+- extra (--extra): where a bigger model could win without winning the
+  tuned eval. few-shot: AUC up vs rest from 25/50/100 votes per class
+  (logreg, 20 random draws), i.e. cold start. temporal: train on the oldest
+  70% of votes, test on the newest 30% (taste drift). geometry, no fitting:
+  up-minus-down centroid AUC (5-fold) and the share of each upvote's /
+  downvote's 10 nearest voted neighbours with the same label.
 
 Inputs are replay-embedding .npz files (story_ids + embeddings) from
 encode_replay_embeddings.py; only stories present in every file are used,
@@ -146,6 +152,75 @@ def _taste(
     return {key: float(np.mean([row[key] for row in rows])) for key in rows[0]}
 
 
+def _best_logreg(x: NDArray[np.float32], y: NDArray[np.int64], seed: int) -> float:
+    """Logreg C by inner 3-fold AUC (up vs rest)."""
+    inner = StratifiedKFold(n_splits=3, shuffle=True, random_state=seed)
+    best, best_auc = LOGREG_C[0], -1.0
+    for c in LOGREG_C:
+        aucs = [
+            _auc(y[val], _fit_score("logreg", (c,), x[fit], y[fit], x[val]), UP, None)
+            for fit, val in inner.split(x, y)
+        ]
+        if np.mean(aucs) > best_auc:
+            best, best_auc = c, float(np.mean(aucs))
+    return best
+
+
+def _few_shot(
+    x: NDArray[np.float32], y: NDArray[np.int64], per_class: int, seed: int
+) -> tuple[float, float]:
+    """Mean and standard error of AUC up vs rest over 20 draws of per_class
+    training votes per label; the rest is the test set."""
+    rng = np.random.default_rng(seed)
+    aucs = []
+    for _ in range(20):
+        train = np.concatenate(
+            [
+                rng.choice(np.flatnonzero(y == label), per_class, replace=False)
+                for label in (DOWN, NEUTRAL, UP)
+            ]
+        )
+        test = np.setdiff1d(np.arange(len(y)), train)
+        c = _best_logreg(x[train], y[train], int(rng.integers(1 << 30)))
+        score = _fit_score("logreg", (c,), x[train], y[train], x[test])
+        aucs.append(_auc(y[test], score, UP, None))
+    return float(np.mean(aucs)), float(np.std(aucs) / np.sqrt(len(aucs)))
+
+
+def _temporal(
+    x: NDArray[np.float32], y: NDArray[np.int64], times: NDArray[np.float64], seed: int
+) -> tuple[float, float]:
+    """Oldest 70% of votes train, newest 30% test: AUC up vs rest, up vs down."""
+    order = np.argsort(times, kind="mergesort")
+    cut = int(len(order) * 0.7)
+    train, test = order[:cut], order[cut:]
+    c = _best_logreg(x[train], y[train], seed)
+    score = _fit_score("logreg", (c,), x[train], y[train], x[test])
+    return _auc(y[test], score, UP, None), _auc(y[test], score, UP, DOWN)
+
+
+def _geometry(
+    x: NDArray[np.float32], y: NDArray[np.int64], seed: int
+) -> tuple[float, float, float]:
+    """Fit-free checks on unit vectors: 5-fold up-minus-down centroid AUC,
+    and the share of each up / down vote's 10 nearest voted neighbours
+    carrying the same label (chance is 1/3)."""
+    score = np.empty(len(y))
+    for train, test in StratifiedKFold(5, shuffle=True, random_state=seed).split(x, y):
+        up = x[train][y[train] == UP].mean(axis=0)
+        down = x[train][y[train] == DOWN].mean(axis=0)
+        score[test] = x[test] @ (up - down)
+    sims = x @ x.T
+    np.fill_diagonal(sims, -np.inf)
+    neighbours = y[np.argsort(-sims, axis=1)[:, :10]]
+    same = (neighbours == y[:, None]).mean(axis=1)
+    return (
+        _auc(y, score, UP, None),
+        float(same[y == UP].mean()),
+        float(same[y == DOWN].mean()),
+    )
+
+
 def _topic(
     x: NDArray[np.float32], sources: list[str], min_source: int, seed: int
 ) -> tuple[float, float, int, int]:
@@ -181,6 +256,9 @@ def main() -> None:
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--min-source", type=int, default=12)
+    parser.add_argument(
+        "--extra", action="store_true", help="few-shot, temporal, geometry"
+    )
     args = parser.parse_args()
 
     files = {
@@ -191,15 +269,17 @@ def main() -> None:
 
     config = Config.load(args.config)
     with frozen_database(config.db_path) as (db, _snapshot_hash):
-        stories, labels, _times = db.get_feedback_for_training(user_id=args.user_id)
+        stories, labels, vote_times = db.get_feedback_for_training(user_id=args.user_id)
     by_id = {
         story.id: (story, label)
         for story, label in zip(stories, labels, strict=True)
         if story.id in common
     }
+    time_by_id = dict(zip((s.id for s in stories), vote_times, strict=True))
     ids = np.array(sorted(by_id), dtype=np.int64)
     y = np.array([by_id[int(i)][1] for i in ids], dtype=np.int64)
     sources = [by_id[int(i)][0].source for i in ids]
+    times = np.array([time_by_id[int(i)] for i in ids], dtype=np.float64)
     print(
         f"stories {len(ids)} (down/neutral/up {np.bincount(y, minlength=3).tolist()})",
         flush=True,
@@ -235,6 +315,7 @@ def main() -> None:
     )
     print(header, flush=True)
     topic_lines = []
+    extra_lines = []
     for spec in args.embeddings:
         if spec == "meta":
             x = meta()
@@ -253,12 +334,29 @@ def main() -> None:
                 f"{r['auc_up_neutral']:6.3f} {r['up12']:5.2f} {r['down12']:5.2f}",
                 flush=True,
             )
+        if args.extra:
+            shots = "  ".join(
+                "{}/cls {:.3f}±{:.3f}".format(n, *_few_shot(x, y, n, args.seed))
+                for n in (25, 50, 100)
+            )
+            t_rest, t_down = _temporal(x, y, times, args.seed)
+            line = (
+                f"{label:38} few-shot {shots}  temporal {t_rest:.3f} up/dn {t_down:.3f}"
+            )
+            if spec != "meta":
+                centroid, nn_up, nn_down = _geometry(x, y, args.seed)
+                line += (
+                    f"  centroid {centroid:.3f}  nn10 up {nn_up:.3f} dn {nn_down:.3f}"
+                )
+            extra_lines.append(line)
         if spec != "meta":
             f1, vm, n, k = _topic(x, sources, args.min_source, args.seed)
             topic_lines.append(
                 f"{label:38} source F1 {f1:.3f}  k-means V {vm:.3f}  ({n} stories, {k} sources)"
             )
     print("\n".join(["topic:"] + topic_lines), flush=True)
+    if extra_lines:
+        print("\n".join(["extra:"] + extra_lines), flush=True)
 
 
 if __name__ == "__main__":

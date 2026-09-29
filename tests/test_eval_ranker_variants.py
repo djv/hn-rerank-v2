@@ -461,3 +461,83 @@ def test_metrics_count_annoying_meh_and_discovery_cards_in_top_12() -> None:
     flipped = _metrics(np.arange(50, dtype=np.float32), reversed_fold, Config())["raw"]
     assert flipped["up_recall_at_12"] == 1.0
     assert flipped["discovery_upvotes_at_12"] == 0
+
+
+def test_out_of_fold_label_rates_ignore_own_vote() -> None:
+    """With every key seen once, a row's rate is only the prior from the
+    other folds, identical for all rows (stratified folds). Leave-one-out
+    would give up rows a lower up-rate than down rows: a label leak."""
+    from scripts.eval_ranker_variants import _out_of_fold_label_rates
+
+    y = np.random.default_rng(0).permutation(np.repeat([0, 1, 2], 20))
+    rates = _out_of_fold_label_rates([f"k{i}" for i in range(60)], y)
+    np.testing.assert_allclose(rates, np.tile(rates[0], (60, 1)))
+    np.testing.assert_allclose(rates[0], [1 / 3, 1 / 3])
+
+
+def test_smoothed_label_rates_shrink_toward_global_rate() -> None:
+    from scripts.eval_ranker_variants import (
+        _STACK_PRIOR_STRENGTH,
+        _smoothed_label_rates,
+    )
+
+    keys = ["a", "b", "b"]
+    y = np.array([2, 0, 2])
+    base = np.array([2 / 3, 1 / 3])
+    k = _STACK_PRIOR_STRENGTH
+    rates = _smoothed_label_rates(keys, y, ["a", "b", "c"])
+    np.testing.assert_allclose(rates[0], (np.array([1, 0]) + k * base) / (1 + k))
+    np.testing.assert_allclose(rates[1], (np.array([1, 1]) + k * base) / (2 + k))
+    np.testing.assert_allclose(rates[2], base)
+
+
+@pytest.mark.parametrize(
+    ("mode", "feats"),
+    [
+        ("gbm", "both"),
+        ("ordinal", "both"),
+        ("pair", "both"),
+        ("lr", "both"),
+        ("lr", "content"),
+        ("lr", "meta"),
+    ],
+)
+def test_stack_ranks_learnable_signal_first(mode: str, feats: str) -> None:
+    """Up votes share a topic direction and a domain; every stack mode and
+    feature set should put held-out up stories above down stories."""
+    from dataclasses import replace
+
+    from scripts.eval_ranker_variants import _make_fold, _scores_stack
+
+    rng = np.random.default_rng(0)
+    n = 150
+    y = rng.permutation(np.repeat([0, 1, 2], n // 3))
+    emb = rng.normal(size=(n, 384)).astype(np.float32) * 0.3
+    emb[:, 0] += np.where(y == 2, 2.0, np.where(y == 0, -2.0, 0.0))
+    emb /= np.linalg.norm(emb, axis=1, keepdims=True)
+    domains = {0: "down.example", 1: "mid.example", 2: "up.example"}
+    stories = [
+        replace(_eval_story(i + 1), url=f"https://{domains[int(label)]}/{i}")
+        for i, label in enumerate(y)
+    ]
+    test_pos = np.arange(120, n)
+    fold = _make_fold(
+        stories,
+        emb,
+        stories,
+        np.arange(n),
+        np.arange(n, dtype=float) + 10.0,
+        y,
+        np.arange(n),
+        np.arange(120),
+        test_pos,
+        Config(),
+        feedback_embeddings=emb,
+        judged_only=True,
+    )
+    scores, _ = _scores_stack(fold, Config(), 1.0, mode=mode, feats=feats)
+    by_id = dict(zip((s.id for s in fold.candidates), scores))
+    test_ids = [s.id for s in fold.test_stories]
+    ups = [by_id[i] for i, a in zip(test_ids, fold.test_actions) if a == 2]
+    downs = [by_id[i] for i, a in zip(test_ids, fold.test_actions) if a == 0]
+    assert min(ups) > max(downs)

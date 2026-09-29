@@ -18,9 +18,12 @@ from collections import Counter
 from typing import Any
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
+from urllib.parse import urlparse
 
 import numpy as np
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import LinearSVC, SVC
 
@@ -59,6 +62,7 @@ class FoldData:
     train_emb: np.ndarray | None = None
     runtime_db: Database | None = None
     similarities: dict[int, np.ndarray] = field(default_factory=dict)
+    test_vote_times: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -1008,6 +1012,240 @@ def _scores_production_up_minus_down(
     return (probs[:, 2] - probs[:, 0]).astype(np.float32), probs
 
 
+STACK_MODES = ("gbm", "ordinal", "pair", "lr")
+STACK_FEATS = ("content", "meta", "both")
+# Pseudo-votes at the global rate behind every per-source/per-domain rate.
+_STACK_PRIOR_STRENGTH = 10.0
+_stack_content_cache: list[tuple[FoldData, tuple[float, float], Any]] = []
+
+
+def _story_domain(story: Story) -> str:
+    return (urlparse(story.url or "").hostname or "").removeprefix("www.")
+
+
+def _smoothed_label_rates(
+    keys_train: list[str], y_train: np.ndarray, keys_eval: list[str]
+) -> np.ndarray:
+    """Per-key (up, down) vote rates shrunk toward the global rates."""
+    y = np.asarray(y_train)
+    base = np.array([(y == 2).mean(), (y == 0).mean()]) if len(y) else np.zeros(2)
+    sums: dict[str, np.ndarray] = {}
+    counts: Counter[str] = Counter()
+    for key, label in zip(keys_train, y):
+        sums.setdefault(key, np.zeros(2))
+        sums[key] += (label == 2, label == 0)
+        counts[key] += 1
+    out = np.empty((len(keys_eval), 2))
+    for i, key in enumerate(keys_eval):
+        total = sums.get(key, np.zeros(2))
+        out[i] = (total + _STACK_PRIOR_STRENGTH * base) / (
+            counts[key] + _STACK_PRIOR_STRENGTH
+        )
+    return out
+
+
+def _out_of_fold_label_rates(
+    keys: list[str], y: np.ndarray, folds: int = 5
+) -> np.ndarray:
+    """Vote rates for the training rows themselves, each from the other
+    folds. Leave-one-out leaks: within a key the rate drops exactly when the
+    row's own vote is up, and trees learn that inverted signal."""
+    out = np.empty((len(keys), 2))
+    n_splits = min(folds, min(Counter(np.asarray(y).tolist()).values()))
+    for fit, ev in StratifiedKFold(n_splits, shuffle=True, random_state=0).split(
+        np.zeros(len(y)), y
+    ):
+        out[ev] = _smoothed_label_rates(
+            [keys[i] for i in fit], y[fit], [keys[i] for i in ev]
+        )
+    return out
+
+
+def _stack_meta_features(
+    stories: list[Story],
+    ages_seconds: np.ndarray,
+    train_stories: list[Story],
+    y_train: np.ndarray,
+    *,
+    is_train: bool,
+) -> np.ndarray:
+    """Content-free story features: source and domain vote priors (training
+    votes only), HN points, comments at fetch, text length, age when voted,
+    Show/Ask HN and HN-vs-other source. Points are the stored (latest) score,
+    not the score at vote time."""
+
+    def keys(items: list[Story]) -> tuple[list[str], list[str]]:
+        return [s.source for s in items], [_story_domain(s) or s.source for s in items]
+
+    train_sources, train_domains = keys(train_stories)
+    sources, domains = keys(stories)
+    if is_train:
+        source_rates = _out_of_fold_label_rates(sources, y_train)
+        domain_rates = _out_of_fold_label_rates(domains, y_train)
+    else:
+        source_rates = _smoothed_label_rates(train_sources, y_train, sources)
+        domain_rates = _smoothed_label_rates(train_domains, y_train, domains)
+    titles = [s.title.lower() for s in stories]
+    return np.column_stack(
+        [
+            source_rates,
+            domain_rates,
+            np.log1p([max(s.score, 0) for s in stories]),
+            np.log1p([max(s.comment_count_at_fetch, 0) for s in stories]),
+            np.log1p([len(s.text_content) for s in stories]),
+            np.log1p(np.maximum(ages_seconds, 0.0) / 3600.0),
+            [t.startswith("show hn") for t in titles],
+            [t.startswith("ask hn") for t in titles],
+            [is_hn_source(s.source) for s in stories],
+        ]
+    ).astype(np.float32)
+
+
+def _stack_content_scores(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    x_eval: np.ndarray,
+    emb_dim: int,
+    svm_config: Config,
+    lr_c: float,
+) -> np.ndarray:
+    """(SVM up margin, logreg P(up) - P(down)) for x_eval, fit on x_train."""
+    weights = _balanced_weights(y_train)
+    svm = _fit_svc_up_margin(x_train, x_eval, y_train, weights, svm_config, emb_dim)
+    xs_train, xs_eval = _fit_scale(x_train, x_eval, emb_dim)
+    clf = LogisticRegression(C=lr_c, solver="lbfgs", max_iter=2000, random_state=0)
+    clf.fit(xs_train, y_train, sample_weight=weights)
+    probs = clf.predict_proba(xs_eval)
+    classes = list(clf.classes_)
+    return np.column_stack(
+        [svm, probs[:, classes.index(2)] - probs[:, classes.index(0)]]
+    )
+
+
+def _stack_oof_content(
+    fold: FoldData, svm_config: Config, lr_c: float, inner_folds: int = 5
+) -> tuple[np.ndarray, np.ndarray]:
+    """Out-of-fold content scores for the training votes; candidates get the
+    mean of the inner models, so both sides come from 80%-data fits."""
+    key = (svm_config.model.svm_c, lr_c)
+    for cached_fold, cached_key, value in _stack_content_cache:
+        if cached_fold is fold and cached_key == key:
+            return value
+    x, y = fold.x_train_base, fold.y_train
+    emb_dim = fold.cand_emb.shape[1]
+    n_splits = min(inner_folds, min(Counter(y.tolist()).values()))
+    oof = np.zeros((len(y), 2))
+    cand = np.zeros((len(fold.x_cand_base), 2))
+    for tr, ev in StratifiedKFold(n_splits, shuffle=True, random_state=0).split(x, y):
+        oof[ev] = _stack_content_scores(x[tr], y[tr], x[ev], emb_dim, svm_config, lr_c)
+        cand += _stack_content_scores(
+            x[tr], y[tr], fold.x_cand_base, emb_dim, svm_config, lr_c
+        )
+    value = (oof, cand / n_splits)
+    _stack_content_cache[:] = [(fold, key, value)]
+    return value
+
+
+def _stack_features(
+    fold: FoldData, svm_config: Config, lr_c: float, feats: str
+) -> tuple[np.ndarray, np.ndarray]:
+    train_parts: list[np.ndarray] = []
+    cand_parts: list[np.ndarray] = []
+    if feats in ("content", "both"):
+        oof, cand = _stack_oof_content(fold, svm_config, lr_c)
+        train_parts.append(oof)
+        cand_parts.append(cand)
+    if feats in ("meta", "both"):
+        cutoff = float(fold.train_vote_times.max())
+        vote_time = (
+            dict(zip((s.id for s in fold.test_stories), fold.test_vote_times))
+            if fold.test_vote_times is not None
+            else {}
+        )
+        cand_ages = np.array(
+            [vote_time.get(s.id, cutoff) - s.time for s in fold.candidates]
+        )
+        train_ages = fold.train_vote_times - np.array(
+            [s.time for s in fold.train_stories]
+        )
+        train_parts.append(
+            _stack_meta_features(
+                fold.train_stories,
+                train_ages,
+                fold.train_stories,
+                fold.y_train,
+                is_train=True,
+            )
+        )
+        cand_parts.append(
+            _stack_meta_features(
+                fold.candidates,
+                cand_ages,
+                fold.train_stories,
+                fold.y_train,
+                is_train=False,
+            )
+        )
+    return np.hstack(train_parts), np.hstack(cand_parts)
+
+
+def _hgb(max_iter: int = 200) -> HistGradientBoostingClassifier:
+    return HistGradientBoostingClassifier(
+        max_depth=3,
+        learning_rate=0.05,
+        max_iter=max_iter,
+        l2_regularization=1.0,
+        min_samples_leaf=20,
+        random_state=0,
+    )
+
+
+def _scores_stack(
+    fold: FoldData, svm_config: Config, lr_c: float, *, mode: str, feats: str
+) -> tuple[np.ndarray, None]:
+    """Second-stage ranker over out-of-fold content scores and/or metadata.
+
+    gbm: 3-class gradient boosting, P(up) - P(down). ordinal: boosted
+    P(label >= neutral) + P(label >= up). lr: 3-class logistic regression.
+    pair: linear model on feature differences of differently-labelled vote
+    pairs (a pairwise ranking objective), scored by the learned weights.
+    """
+    x_train, x_cand = _stack_features(fold, svm_config, lr_c, feats)
+    y = fold.y_train
+    if mode == "gbm":
+        clf = _hgb().fit(x_train, y, sample_weight=_balanced_weights(y))
+        probs = clf.predict_proba(x_cand)
+        classes = list(clf.classes_)
+        scores = probs[:, classes.index(2)] - probs[:, classes.index(0)]
+    elif mode == "ordinal":
+        scores = np.zeros(len(x_cand))
+        for threshold in (1, 2):
+            target = (y >= threshold).astype(int)
+            clf = _hgb().fit(x_train, target, sample_weight=_balanced_weights(target))
+            scores += clf.predict_proba(x_cand)[:, 1]
+    else:
+        scaler = StandardScaler().fit(x_train)
+        xs_train, xs_cand = scaler.transform(x_train), scaler.transform(x_cand)
+        if mode == "lr":
+            clf = LogisticRegression(C=1.0, max_iter=2000, random_state=0)
+            clf.fit(xs_train, y, sample_weight=_balanced_weights(y))
+            probs = clf.predict_proba(xs_cand)
+            classes = list(clf.classes_)
+            scores = probs[:, classes.index(2)] - probs[:, classes.index(0)]
+        elif mode == "pair":
+            rng = np.random.default_rng(0)
+            i = rng.integers(0, len(y), 60_000)
+            j = rng.integers(0, len(y), 60_000)
+            keep = y[i] != y[j]
+            i, j = i[keep], j[keep]
+            clf = LogisticRegression(C=1.0, fit_intercept=False, max_iter=2000)
+            clf.fit(xs_train[i] - xs_train[j], (y[i] > y[j]).astype(int))
+            scores = xs_cand @ clf.coef_[0]
+        else:
+            raise ValueError(f"Unknown stack mode {mode!r}; use {STACK_MODES}")
+    return np.asarray(scores, dtype=np.float32), None
+
+
 def _scores_knn_up_minus_down(
     fold: FoldData, config: Config
 ) -> tuple[np.ndarray, None]:
@@ -1392,6 +1630,7 @@ def _make_fold(
             train_stories=train_stories,
             test_stories=test_stories,
             test_actions=test_actions,
+            test_vote_times=fb_vote_times[test_pos],
             train_vote_times=train_vote_times,
             x_train_base=empty,
             x_cand_base=empty,
@@ -1415,6 +1654,7 @@ def _make_fold(
         train_stories=train_stories,
         test_stories=test_stories,
         test_actions=test_actions,
+        test_vote_times=fb_vote_times[test_pos],
         train_vote_times=train_vote_times,
         x_train_base=_feature_matrix(
             train_emb,
@@ -1471,7 +1711,14 @@ def _temporal_splits(
 
 
 def _variant_requires_all_labels(name: str) -> bool:
-    all_label_prefixes = ("margin3", "linear_svc", "logreg", "ensemble", "prodlr")
+    all_label_prefixes = (
+        "margin3",
+        "linear_svc",
+        "logreg",
+        "ensemble",
+        "prodlr",
+        "stack",
+    )
     return name.startswith(all_label_prefixes)
 
 
@@ -1945,12 +2192,32 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
                 requested.append(name)
     # Hill-climbing names: prod[spec] = production with ModelConfig overrides;
     # produd[spec] scores it softmax(up) - softmax(down); prodlr[spec] rank-
-    # averages it with logreg_up_minus_down.
+    # averages it with logreg_up_minus_down; stack[mode=..;feats=..;spec]
+    # is the second-stage ranker (_scores_stack) over the same SVM/logreg.
     for name in requested:
         prefix, bracket, rest = name.partition("[")
         if not bracket or not rest.endswith("]"):
             continue
         spec = rest[:-1].split(";")
+        if prefix == "stack":
+            options = dict(item.partition("=")[::2] for item in spec if item)
+            mode = options.pop("mode", "gbm")
+            feats = options.pop("feats", "both")
+            if mode not in STACK_MODES or feats not in STACK_FEATS:
+                raise ValueError(f"Bad stack variant {name!r}")
+            stack_config = replace(
+                production_config,
+                model=replace(
+                    production_config.model,
+                    **_parse_model_overrides(
+                        ";".join(f"{k}={v}" for k, v in options.items())
+                    ),
+                ),
+            )
+            variants[name] = lambda fold, c=stack_config, m=mode, f=feats: (
+                _scores_stack(fold, c, config.model.svm_c, mode=m, feats=f)
+            )
+            continue
         blend = {
             key: float(value)
             for key, _, value in (item.partition("=") for item in spec)
