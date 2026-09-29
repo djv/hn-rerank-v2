@@ -61,8 +61,10 @@ Pooling = Literal["mean", "cls", "last", "sentence"]
 POOLINGS: tuple[Pooling, ...] = ("mean", "cls", "last", "sentence")
 # "gpu" runs the ONNX graph through OpenVINO on the laptop's Intel iGPU
 # (f16; ~3x faster than CPU onnxruntime for 335M models at 512 tokens).
-Device = Literal["cpu", "gpu"]
-DEVICES: tuple[Device, ...] = ("cpu", "gpu")
+# "gpu-f32" keeps full precision, for models whose activations overflow f16
+# (harrier-oss-v1 gives NaN at f16).
+Device = Literal["cpu", "gpu", "gpu-f32"]
+DEVICES: tuple[Device, ...] = ("cpu", "gpu", "gpu-f32")
 
 
 @dataclass(frozen=True)
@@ -172,9 +174,10 @@ def _encode(
 ) -> tuple[NDArray[np.float32], float]:
     tokenizer: Any = AutoTokenizer.from_pretrained(tokenizer_dir)
     run, input_names = _runner(model_path, device)
-    # Encode shortest first so each batch pads little; rows are put back in
-    # input order at the end.
-    order = sorted(range(len(texts)), key=lambda index: len(texts[index]))
+    # Encode longest first: each batch pads little, and a GPU that runs out
+    # of resources on the longest inputs fails at once instead of at the end.
+    # Rows are put back in input order at the end.
+    order = sorted(range(len(texts)), key=lambda index: -len(texts[index]))
     ordered = [texts[index] for index in order]
     chunks: list[NDArray[np.float32]] = []
     started = time.perf_counter()
@@ -191,7 +194,7 @@ def _encode(
             ordered[start : start + batch_size],
             padding=True,
             # Few distinct shapes, so the GPU compiles few kernel variants.
-            pad_to_multiple_of=64 if device == "gpu" else None,
+            pad_to_multiple_of=None if device == "cpu" else 64,
             truncation=True,
             max_length=max_tokens,
             return_tensors="np",
@@ -285,7 +288,8 @@ def _runner(
     core = openvino.Core()
     core.set_property({"CACHE_DIR": str(Path.home() / ".cache/openvino-hn-bench")})
     model = core.read_model(str(model_path))
-    compiled = core.compile_model(model, "GPU", {"INFERENCE_PRECISION_HINT": "f16"})
+    precision = "f32" if device == "gpu-f32" else "f16"
+    compiled = core.compile_model(model, "GPU", {"INFERENCE_PRECISION_HINT": precision})
     request = compiled.create_infer_request()
     cache = [
         (

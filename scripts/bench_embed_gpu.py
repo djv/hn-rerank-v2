@@ -40,6 +40,12 @@ def main() -> None:
     parser.add_argument("--config", default="config.toml")
     parser.add_argument("--user-id", type=int, default=1)
     parser.add_argument(
+        "--gpu-device",
+        choices=("gpu", "gpu-f32"),
+        default="gpu",
+        help="gpu-f32: full precision, for models that overflow f16",
+    )
+    parser.add_argument(
         "--repo",
         required=True,
         help="Hugging Face repo id, or a local export_embedding_onnx.py directory",
@@ -90,11 +96,11 @@ def main() -> None:
         return _encode(
             batch,
             tokenizer_dir=tokenizer_dir,
-            model_path=model_path if device == "gpu" else cpu_model_path,
+            model_path=cpu_model_path if device == "cpu" else model_path,
             pooling=args.pooling,
             max_tokens=args.max_tokens,
             batch_size=args.batch_size,
-            device="gpu" if device == "gpu" else "cpu",
+            device=args.gpu_device if device == "gpu" else "cpu",
         )
 
     # The first GPU pass includes kernel compilation per shape; time the second.

@@ -27,16 +27,23 @@ and, since 2026-09-26, which sources feed it.
   headless Chrome over the tailnet (read-only) with a clean journal.
 - Page runs in headless Chrome in CI (`tests/test_browser.py`); unused CSS
   removed. VPS at `c1c676b` since 2026-09-27 11:22 UTC, smoked clean.
-- Ranker hill-climb (2026-09-28, offline, uncommitted tooling): best is
-  SVM C=2 + logreg rank blend 0.3 on stored embeddings: top-12 upvotes
-  7.50 -> 8.25 of 12 (n.s.), AUC 0.726 -> 0.769 (p=0.034), more discovery
-  and non-HN upvotes. Not deployed. FINDINGS.md "Incremental ranker
-  hill-climb — 2026-09-28". Laptop iGPU encoding (`--device gpu`) works.
+- Ranker hill-climb (2026-09-28, offline): best on stored embeddings is
+  SVM C=2 + logreg rank blend 0.3 (top-12 upvotes 7.50 -> 8.25 of 12, AUC
+  0.726 -> 0.769 vs production). Best overall: stored + embeddinggemma-300m
+  side by side, C=4 + blend 0.3: top-12 0.688 -> 0.708, AUC 0.769 -> 0.791
+  (8/8 folds, p=0.002); fresh votes within noise. Not deployed (needs gemma
+  on the VPS). FINDINGS.md "Incremental ranker hill-climb — 2026-09-28".
 - Time-window selector (12h/1d/1w/1m/Archive replacing Date and Age,
   `d` cycles it; per-window feed schema v2, client prefetch; Popular by
   HN gravity, no server Explore shuffle): live on the VPS at `fc6461f`
   since 2026-09-28 17:39 UTC. Smoked: every window serves 16/16/15, bad
   window 400, the TUI parses the live feed, TLDR loads, journal clean.
+
+- Embedding probe (2026-09-28, offline): untuned per-embedding probes
+  (`scripts/probe_embeddings.py`) put harrier-270m level with gemma and
+  stored; metadata alone gets AUC 0.66; up vs neutral is the weak spot.
+  harrier-270m f16 NaN = Gemma 3 overflow, fixed by OpenVINO
+  `ACTIVATIONS_SCALE_FACTOR` 8. FINDINGS.md "Untuned embedding probe".
 
 ## Blocker / limits
 - New feeds and the Reddit throttle have under a day of data.
@@ -45,6 +52,22 @@ and, since 2026-09-26, which sources feed it.
   with a setup hint; `uv run python setup_model.py` enables them.
 
 ## Next step
+- After the 2026-09-28 reboot: `/tmp` is wiped at boot; the eval dir was
+  copied to `~/.local/state/hn-rerank-eval/hn-eval-local` (copy it back to
+  `/tmp/hn-eval-local`, whose scripts use that path). Then, one GPU job at
+  a time: finish harrier-0.6b (`s300-harrier06.partial.npz` resumes;
+  batch 2, GPU only, no CPU runs) and its evals, then jina-v5-nano,
+  mdbr-leaf-mt, Qwen3-0.6B f16, KaLM-mini-v2.5 (export with
+  `--trust-remote-code`, transformers 4.45.2) — commands in
+  `queue3.sh`/`try2.sh` there. Give every model two probe rows (alone,
+  stored+X) in `probe_embeddings.py`; judge against stored and gemma
+  alone, not only the tuned combo.
+- Reformulation (user approved to run after the reboot): stacked model =
+  out-of-fold content scores (SVM, logreg) + metadata (per-source upvote
+  prior, points/comments at fetch time, length, domain, age, Show/Ask HN)
+  into sklearn gradient boosting; then an ordinal/pairwise ranking
+  objective on the same features; ablations content/meta/both. Same folds
+  and metrics (top-12 upvotes, AUC, down/neutral share).
 - Check the hill-climb best on votes after 2026-09-25 (fresh read-only VPS
   snapshot) before any ranker change ships.
 - 2026-09-28 20:00 local: scheduled task `hn-feed-yield-check` reports

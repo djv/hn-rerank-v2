@@ -6,7 +6,7 @@ Setup: `eval_ranker_variants.py --candidate-pool heldout-feedback`, user 1,
 snapshot 2026-09-25 (same development folds as the 2026-09-25 study; the
 newest 20% stays reserved). Each step changes one thing from the current
 best: first a small test (300 votes/class, 3 folds, ~1 min), then the full
-eval (all 5,189 votes, 8 folds, ~25 min) only if the small test is no
+eval (all 5,189 votes, 8 folds, ~5 min) only if the small test is no
 worse on the top-12 upvote rate and better on AUC. Primary metric: upvote
 rate in the top 12 (the clients' 12-card view); also AUC(up vs rest),
 downvote/neutral share of the top 12, discovery upvotes (top-12 upvotes
@@ -21,8 +21,20 @@ upvotes. Reports: `/tmp/hn-eval-local/{small,full}-*.json` (not kept).
 | 4 | γ 0.015 / 0.05 at C=2 | P@12 lower | – | no |
 | 5 | + logreg rank blend, weight 0.3 (0.6 tested) | P@12 tie, AUC 0.657→0.674 | P@12 0.646→0.688 (p=0.10), AUC 0.759→0.769 (p=0.07) | yes |
 | 6 | body + comments as two 512-token vectors (mxbai-xsmall) | P@12 0.389→0.500 (1/3 folds), AUC 0.674→0.700 | P@12 0.688→0.635 (n.s.), AUC 0.769→0.788 (p=0.025, 7/8), discovery 1.25→0.12 | no (top 12 is the target) |
+| 7 | embeddinggemma-300m (512 tokens, classification prefix) instead of stored | P@12 0.389→0.611 (3/3), AUC 0.674→0.710 | P@12 0.688→0.594 (worse 6/8), AUC 0.769→0.794 (p=0.011, 7/8) | no |
+| 8 | stored + gemma side by side (50/50) | P@12 →0.500, AUC →0.706 (3/3, p=0.003) | P@12 0.688→0.667 (n.s.), AUC →0.785 (8/8, p=0.002), downvotes 0.031→0.010 | close |
+| 9 | stored + gemma, 30% gemma (70%: small AUC 0.716) | AUC 0.683 | P@12 0.656, AUC 0.782 | no |
+| 10 | step 8 retuned: C=4 (γ 0.015/0.06, blend 0.5 tested) | C=4 and blend 0.5 ≥ step 8 | **P@12 0.688→0.708 (4/8 better, n.s.), AUC 0.769→0.791 (8/8, p=0.002)**, downvotes 0.031→0.010 | yes |
 
-Best so far, `prodlr[svm_c=2.0;lr_weight=0.3]`, vs production: top-12
+Step 10 attribution: C=4 on stored alone gives P@12 0.698, AUC 0.774
+(+0.005); adding gemma at C=4 adds AUC +0.016 (8/8, p=0.004). On the
+fresh votes (below) step 10 gets AUC 0.885 ± 0.07 vs 0.859 and 9 vs 10
+upvotes in the top 12 (one card; noise). Shipping it needs gemma
+embeddings for every candidate on the VPS (not measured there; 0.45-0.6
+s/story on the laptop iGPU). The small test predicts AUC direction but
+not the top 12 (step 7: +0.22 small, -0.09 full).
+
+Best on stored embeddings (no re-encoding), `prodlr[svm_c=2.0;lr_weight=0.3]`, vs production: top-12
 upvotes 7.50→8.25 of 12 (p=0.20), AUC 0.726→0.769 (p=0.034), downvotes
 0.62→0.38 and neutral 3.9→3.4 per top 12, discovery upvotes 0.25→1.25,
 non-HN upvotes 1.25→2.75. Caveats: the small test misled once (step 3:
@@ -75,6 +87,42 @@ variants (averaged, weighted, split budget, chunked comments) did not
 beat it. On the laptop iGPU (OpenVINO f16, `--device gpu`) encoding is
 ~4x faster than CPU (bge-base 0.21 s/story, mxbai-large 1.05 s/story at
 512 tokens); `scripts/bench_embed_gpu.py` times a model.
+
+## Untuned embedding probe and 2026 models — 2026-09-28
+
+The hill-climb eval compares new embeddings with a ranker (C, gamma, blend)
+tuned on the stored ones, and against the tuned stored+gemma combo, so a
+new model can lose on fit alone. `scripts/probe_embeddings.py` scores each
+embedding file the same way, hyperparameters picked by inner CV per
+embedding (logreg, RBF SVM, cosine kNN), plus a taste-free check: source
+classification (macro-F1) and k-means V-measure on non-HN stories. `meta`
+= source one-hot + log points/comments/length, no text. 900-story sample
+(300/class), 5 folds, score P(up)-P(down):
+
+| Embedding | best AUC up vs rest | up vs down | up vs neutral | up in top 12 |
+|---|---|---|---|---|
+| meta (no text) | 0.661 (svm) | 0.696 | 0.626 | 0.50 |
+| stored mxbai-xsmall | 0.756 (svm) | 0.866 | 0.645 | 0.63 |
+| embeddinggemma-300m | 0.767 (svm) | 0.859 | 0.674 | 0.67 |
+| harrier-oss-v1-270m, no prefix | 0.752 (logreg/svm) | 0.850 | 0.654 | 0.63 |
+| harrier-270m, classify prefix | 0.729 (logreg) | 0.838 | 0.621 | 0.58 |
+
+Pairs (stored+X) and the remaining rows: `probe-s300*.log` in the saved
+eval dir (below). Up vs down is easy (0.85+); up vs neutral is where every
+embedding is weak (0.63-0.67), and metadata alone reaches 0.66 overall,
+signal the SVM-on-embeddings ranker barely uses.
+
+harrier-oss-v1 (Microsoft, 2026-03-30; MMTEB v2 66.5 / 69.0) is Gemma 3
+(270m) and Qwen3 (0.6b). 270m on the iGPU gives NaN at f16:
+`scripts/debug_fp16_overflow.py` traced RMSNorm-input Adds up to 2.7e7
+(f16 max 65504). OpenVINO's `ACTIVATIONS_SCALE_FACTOR` of 8+ on GPU fixes
+it (cos 1.0000 vs CPU f32); not yet wired into the encoder (it ran at f32,
+0.65 s/story). 0.6b: f32 ran out of GPU resources; f16 passed the check,
+then failed at 600/900 stories (batch 8); resumed with batch 2. Small
+tuned-eval (3 folds) vs stored+gemma: 270m ties at best (AUC 0.708-0.726
+vs 0.720, n.s.). Research shortlist (classification-heavy MTEB, fits the
+UHD 620): jina-v5-text-nano (classification variant), Qwen3-Embedding-0.6B,
+KaLM-mini-v2.5, mdbr-leaf-mt (cheap VPS option).
 
 ## TUI simplification — 2026-09-26
 

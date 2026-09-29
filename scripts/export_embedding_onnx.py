@@ -29,6 +29,11 @@ def main() -> None:
     parser.add_argument("--repo", required=True)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--opset", type=int, default=17)
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Load the repo's own modeling code (e.g. KaLM's bidirectional Qwen2)",
+    )
     args = parser.parse_args()
 
     # torch and onnx are not project dependencies (see the docstring); via
@@ -41,10 +46,15 @@ def main() -> None:
         args.repo.replace("/", "--") + "--export"
     )
     (output / "onnx").mkdir(parents=True, exist_ok=True)
-    tokenizer: Any = AutoTokenizer.from_pretrained(args.repo)
+    tokenizer: Any = AutoTokenizer.from_pretrained(
+        args.repo, trust_remote_code=args.trust_remote_code
+    )
     tokenizer.save_pretrained(output)
     model: Any = AutoModel.from_pretrained(
-        args.repo, torch_dtype=torch.float32, attn_implementation="eager"
+        args.repo,
+        torch_dtype=torch.float32,
+        attn_implementation="eager",
+        trust_remote_code=args.trust_remote_code,
     )
     model.eval()
 

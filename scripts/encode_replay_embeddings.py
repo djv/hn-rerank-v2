@@ -266,6 +266,9 @@ def main() -> None:
         _save(tmp, [stories[i] for i, _ in done], np.stack([v for _, v in done]), model)
         os.replace(tmp, path)
 
+    # Longest stories first, so a GPU that cannot fit them fails in the first
+    # piece rather than after most of the run.
+    todo.sort(key=lambda i: -len(text_of(stories[i])))
     seconds = 0.0
     step = max(args.checkpoint_every, 1)
     for start in range(0, len(todo), step):
