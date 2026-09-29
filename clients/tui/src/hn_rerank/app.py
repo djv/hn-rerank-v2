@@ -571,6 +571,7 @@ class Reader(App[None]):
     BINDINGS: ClassVar[list[tuple[str, str, str]]] = [
         ("j", "move(1)", "Down"),
         ("k", "move(-1)", "Up"),
+        ("space", "page_summary", "Page down"),
         ("1", "vote('up')", "+"),
         ("2", "vote('neutral')", "~"),
         ("3", "vote('down')", "−"),
@@ -1535,16 +1536,16 @@ class Reader(App[None]):
         self.refresh_feed(announce=manual)
 
     def action_move(self, delta: int) -> None:
-        if self.reading:
-            self.query_one("#summary", Markdown).scroll_relative(
-                y=delta * 3, animate=False
-            )
-            return
+        """Next/previous story, in the list and in zoom alike."""
         listing = self.query_one("#headlines", OptionList)
         if self.stories:
             listing.highlighted = max(
                 0, min(len(self.stories) - 1, (listing.highlighted or 0) + delta)
             )
+
+    def action_page_summary(self) -> None:
+        """Page the TLDR down from either view, whichever pane has focus."""
+        self.query_one("#summary", Markdown).scroll_page_down(animate=False)
 
     def action_vote(self, action: str) -> None:
         """Hide the story and move on now; the server hears about it next."""
@@ -1684,14 +1685,15 @@ class Reader(App[None]):
         if narrow:
             # Narrow hints may wrap; the badge key stays listed in ? help.
             if self.reading:
-                hints = f"j/k scroll · Enter/Esc back · {votes}"
+                hints = f"j/k story · Space page · Enter/Esc back · {votes}"
             elif self.can_read:
                 hints = f"Enter zoom · {votes} · ? help"
             else:
                 hints = f"j/k move · {votes} · ? help"
         elif self.reading:
             hints = (
-                f"j/k scroll · Enter/Esc back · {votes} · b badges · ? help · q quit"
+                f"j/k story · Space page · Enter/Esc back · {votes} · b badges"
+                " · ? help · q quit"
             )
         elif self.can_read:
             hints = f"j/k move · Enter zoom · {votes} · b badges · ? help · q quit"
@@ -1772,13 +1774,13 @@ class Reader(App[None]):
         self.query_one("#summary", Markdown).update(
             "# Shortcuts\n\n"
             "## Move\n\n"
-            "- `j` / `k`: move the headline list\n"
+            "- `j` / `k`: next / previous story (list or zoom view)\n"
             "- `Tab`: switch focus between panes\n"
             "- Arrow keys: scroll the focused pane\n\n"
             "## Read\n\n"
             "- `Enter`: zoom the TLDR pane (hide the article list)\n"
             "- `Enter` / `Escape`: return to the article list\n"
-            "- In zoom mode, `j` / `k` scroll the TLDR\n\n"
+            "- `Space`: page the TLDR down (list or zoom view)\n\n"
             "## Vote\n\n"
             "- `1` / `2` / `3`: up / neutral / down (advances to next story)\n"
             "- `u`: undo latest vote\n\n"

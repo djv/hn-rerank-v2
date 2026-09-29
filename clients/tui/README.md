@@ -5,7 +5,8 @@ profile with your server URL, for example `https://your-host/hn/`.
 `--server URL` selects a deployment; credentials from another server are never reused.
 The server retains its existing access policy: installing the client does not grant access.
 
-Keys: j/k or arrows navigate/scroll; Tab changes focus; 1/2/3 vote
+Keys: j/k next/previous story (list and zoom view); arrows scroll the focused
+pane; Space pages the TLDR down from either view; Tab changes focus; 1/2/3 vote
 positive/neutral/negative and advance to the next story at once (votes are sent
 in order in the background; a failed one puts its story back with an error);
 u undoes the latest vote; o/c open article/comments (in Chrome, or in the

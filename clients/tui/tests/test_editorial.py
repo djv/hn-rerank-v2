@@ -261,9 +261,17 @@ async def test_enter_zooms_tldr(size: tuple[int, int], long_summary: bool) -> No
             assert "Enter/Esc back" in str(hints.content)
             if long_summary:
                 assert summary.max_scroll_y > 0
-                await pilot.press("j")
-                await pilot.pause()
-                assert summary.scroll_y > 0
+            # j/k change stories in zoom as in the list.
+            await pilot.press("j")
+            await settle(pilot)
+            assert app.reading and summary.has_focus
+            moved = app.selected()
+            assert moved is not None and selected is not None
+            assert moved.id != selected.id
+            assert summary.scroll_y == 0
+            await pilot.press("k")
+            await settle(pilot)
+            assert app.selected() == selected
             await pilot.press(exit_key)
             await pilot.pause()
             assert not app.reading
@@ -670,3 +678,28 @@ async def test_clock_switch_restyles_css_and_rich_text(
         app.theme = "editorial"
         app.apply_clock_theme()
         assert app.theme == "editorial"
+
+
+@pytest.mark.parametrize("zoom", [False, True])
+async def test_space_pages_tldr_from_either_view(zoom: bool) -> None:
+    """Space pages the TLDR down whether the list or the TLDR has focus, and
+    leaves the selected headline alone."""
+    app = Reader(api=EditorialServer().api())
+    async with app.run_test(size=(120, 20)) as pilot:
+        await settle(pilot)
+        listing = app.query_one(OptionList)
+        summary = app.query_one(Markdown)
+        if zoom:
+            await pilot.press("enter")
+            await pilot.pause()
+        assert summary.has_focus == zoom and listing.has_focus != zoom
+        assert summary.max_scroll_y > summary.scrollable_content_region.height
+        selected = app.selected()
+        await pilot.press("space")
+        await pilot.pause()
+        first = summary.scroll_y
+        assert first == summary.scrollable_content_region.height
+        await pilot.press("space")
+        await pilot.pause()
+        assert summary.scroll_y == min(2 * first, summary.max_scroll_y)
+        assert app.selected() == selected
