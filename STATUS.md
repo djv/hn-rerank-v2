@@ -5,6 +5,15 @@ Improve what the dashboard shows the user (live profile 151; user 1 is the
 old profile, stopped 2026-09-24): ranking quality and which sources feed it.
 
 ## Verified result
+- Live `34051df` (2026-09-30 20:33 UTC, restart): 🧭 Interest replaces 🎯
+  Similar; impressions log badge kinds in the new
+  `interaction_events.badges` column (added on start, verified). After the
+  restart: dashboard 200, deck ready in ~20 s, 1d and 1w each serve 5 🤔 /
+  5 🧭 / 5 ✨ (1w 🧭: AI buildout, LeanFIRE in Bangkok, Opus 5.5 prompting
+  guide, city shape, Live Avatar), cached TLDR 0.4 s, no journal errors.
+  Not yet seen live: an impression with badges (no client events since
+  16:42; open tabs and the TUI need a reload); uncached TLDR not exercised
+  (every deck story cached). Tests 1018, TUI 156, browser, ruff, ty pass.
 - Live `2190914` (2026-09-30 16:38 UTC, restart): "Because you upvoted" on
   a Hot/Top/Talk/Unsure/Novel card needs similarity >= 0.85 (was 0.35 for
   all; 49908757 Ubuntu <- RTX 5090 at 0.70). After the restart: dashboard
