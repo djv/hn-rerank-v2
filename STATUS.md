@@ -5,6 +5,11 @@ Improve what the dashboard shows the user (live profile 151; user 1 is the
 old profile, stopped 2026-09-24): ranking quality and which sources feed it.
 
 ## Verified result
+- Review fixes (2026-09-30, `fdda723`..`6cd3739`, FINDINGS.md "Code review —
+  2026-09-30"): pointer-thread TLDR keying/backoff/rule, eval double blend
+  and dense-model mismatch, blend ramp and cache bounds, AINews regen
+  abort, three TUI bugs. Tests, ruff, ty and TUI tests pass. The tighter
+  pointer rule still matches all 109 live follows.
 - Linear blend live on the VPS since `26b9474` (2026-09-29 17:17 UTC):
   `svm_c = 4.0`, `linear_blend_enabled = true` (0.5 production + 0.2 dense
   LR + 0.3 TF-IDF LR). Rerank after a vote (live `371a2bd`, 21:43-21:48
@@ -64,7 +69,9 @@ old profile, stopped 2026-09-24): ranking quality and which sources feed it.
   newest-20% run is flat (AUC 0.739 -> 0.751, P@12 0.667 both). TF-IDF alone
   on top of svm_c=4 + LR: +0.016 AUC. Codex review: no leakage, but the
   "unseen votes" checks overlap and informed tuning, so the size of the gain
-  is unconfirmed. FINDINGS.md "Proposal vs the actual live ranker".
+  is unconfirmed. FINDINGS.md "Proposal vs the actual live ranker". The
+  dense part of those numbers was an approximation (5 meta columns, not
+  live's 10); fixed in `24dc55c`, not rerun.
 - TF-IDF sweep (full eval, FINDINGS.md "TF-IDF tuning sweep"): nothing
   beats weight 0.3 beyond noise. Title-only input, source prior 0.1 and the
   joint model are worse at the top 12; char n-grams, TF-IDF C and half-life
@@ -99,10 +106,13 @@ old profile, stopped 2026-09-24): ranking quality and which sources feed it.
 - Judge the live blend on new votes from 151 (up rate on shown stories
   before/after 17:17 UTC 2026-09-29). Rollback: `linear_blend_enabled =
   false`, `svm_c = 0.1` in `config.toml`, deploy, restart.
-- After the next hourly regen, check the pool rebuild no longer logs
-  `embedding_perf texts=~50` (stories fetched before `371a2bd` were
-  re-embedded at the 21:42 startup). If reranks drift above ~10 s, lower
-  `recent_candidate_hn_limit` (SVM decision and feature prep scale with it).
+- Rerun the blend eval with the fixed `prodlr` (live dense model) against
+  `prod[svm_c=0.1;linear_blend_enabled=false]`, full and newest-20%.
+- Regen embeds 10-29 texts after the 22:06 restart (checked 2026-09-30),
+  not ~50. If reranks drift above ~10 s, lower `recent_candidate_hn_limit`.
+- Open review items (FINDINGS.md "Code review — 2026-09-30"): CH playground
+  quota on repeated restarts, prefetch/hydration comment race, live-window
+  retry on deterministic errors, AINews shared-tweet cards.
 - Open TLDR gaps: a raw PDF stored as article text (46108780 fails);
   archive dupe cards are not swapped by the dupe resolver (live `hn` only).
 - After ~100 new votes: compare 151's up rate on shown stories before and

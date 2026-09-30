@@ -1,5 +1,31 @@
 # Worklog: hn-rewrite
 
+## 2026-09-30 Review fixes: pointer threads, eval, blend ramp, AINews, TUI
+
+From a three-agent review of 45882a2..9f97224 (FINDINGS.md "Code review —
+2026-09-30").
+- Pointer threads: the TLDR cache key drops a pointer note like generation
+  does, so pre-follow summaries (keyed on the note) never match and the
+  tap no longer bypasses every cached summary of an unfollowed pointer. A
+  failed follow is retried at most every 6 h per story (was every tap and
+  prefetch run, each spending quota and an Algolia fetch); the stale
+  fallback skips unfollowed pointer stories. Rule: "Duplicate code is…",
+  "Discussion of the underlying paper: <link>" and the destination's
+  "moved hither from" / "merged … into this thread" notes are not pointers.
+  All 109 live follows still match (checked against Algolia).
+- Eval: `prodlr`/`produd`/`stack`/SVM sweeps use production without the
+  blend (config.toml turns it on, so `prodlr` blended twice); `prodlr`'s
+  default dense logreg is the live one; logreg C is `linear_blend_dense_c`
+  (was `svm_c`, now 4.0). A failed blend aborts the fold.
+- Blend: weights scale with the SVM tier weight (`linear_blend_ramp`), one
+  cached fit per user (warm start dropped with it), row cache 20k -> 32k.
+  No change for profile 151 (past the ramp).
+- AINews: an unreachable feed (urllib's URLError) or a malformed fxtwitter
+  reply no longer aborts the whole regen; the call is also guarded.
+- TUI: `a` is blocked while a dropdown has focus; the agent command is
+  resolved on PATH first (tmux reported success when it could not start);
+  long status messages are cut in the middle so "Press r to retry." stays.
+
 ## 2026-09-29 TUI: faint divider between headlines
 
 `Reader` passes `None` between headline options, so Textual's OptionList draws
