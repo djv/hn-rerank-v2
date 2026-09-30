@@ -268,8 +268,8 @@ def test_dashboard_page_end_to_end(page: Any) -> None:
     page.keyboard.press("Escape")
     assert page.is_hidden("#first-time-tip")
 
-    # Time windows: a moves to the next one (1m holds 1w's stories too), the
-    # picker jumps; each window shows only its own stories.
+    # Time windows: d moves to the next one (1m holds 1w's stories too), D
+    # to the previous, the picker jumps; each window shows only its own stories.
     page.keyboard.press("d")
     page.wait_for_function("() => currentWindow === '1m' && !feed.loading")
     month = _state(page)
@@ -286,6 +286,9 @@ def test_dashboard_page_end_to_end(page: Any) -> None:
     page.wait_for_function("() => currentWindow === '12h' && !feed.loading")
     assert _state(page)["head"] == []  # nothing that young: an empty view
     assert "Nothing left in this view" in page.inner_text("#queue-loading")
+    page.keyboard.press("Shift+D")  # back one, wrapping: 12h -> archive
+    page.wait_for_function("() => currentWindow === 'archive' && !feed.loading")
+    assert page.input_value("#window-select") == "archive"
 
     # The last window picked opens on the next visit.
     page.select_option("#window-select", "archive")

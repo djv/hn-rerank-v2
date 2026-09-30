@@ -1,5 +1,12 @@
 # Worklog: hn-rewrite
 
+## 2026-09-30 Shift+D cycles the time window backwards
+
+- `D` (Shift+D) moves to the previous time window, wrapping (12h -> Archive),
+  in the web client (`KEY_ACTIONS.D`; the keydown handler tries the exact key
+  before lowercasing) and the TUI (`cycle_window(-1)`). Help texts updated.
+  Tests: key map, browser flow, TUI window test.
+
 ## 2026-09-30 ClickHouse quota, live-window retry, pointer-follow race
 
 Open items from the 2026-09-30 review.

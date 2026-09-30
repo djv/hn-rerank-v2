@@ -6,8 +6,8 @@ profile with your server URL, for example `https://your-host/hn/`.
 The server retains its existing access policy: installing the client does not grant access.
 
 Keys: j/k next/previous story (list and zoom view); arrows scroll the focused
-pane; Space pages the TLDR down from either view; d cycles the time window (the
-last one picked opens next time); Tab changes focus; 1/2/3 vote
+pane; Space pages the TLDR down from either view; d / D cycle the time window
+forward / back (the last one picked opens next time); Tab changes focus; 1/2/3 vote
 positive/neutral/negative and advance to the next story at once (votes are sent
 in order in the background; a failed one puts its story back with an error);
 u undoes the latest vote; o/c open article/comments (in Chrome, or in the

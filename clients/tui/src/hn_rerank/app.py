@@ -667,7 +667,8 @@ class Reader(App[None]):
         ("s", "cycle_sort", "Sort"),
         ("h", "cycle_sort(-1)", "Prev sort"),
         ("l", "cycle_sort(1)", "Next sort"),
-        ("d", "cycle_window", "Window"),
+        ("d", "cycle_window(1)", "Window"),
+        ("D", "cycle_window(-1)", "Prev window"),
         ("enter", "read", "Read"),
         ("escape", "headlines", "Back"),
         ("?", "help", "Help"),
@@ -1588,14 +1589,14 @@ class Reader(App[None]):
 
     SORT_CYCLE: ClassVar[tuple[str, ...]] = ("recommended", "popular", "explore")
 
-    def action_cycle_window(self) -> None:
-        """Move the window selector to the next window, wrapping."""
+    def action_cycle_window(self, delta: int = 1) -> None:
+        """Move the window selector by *delta* steps, wrapping at either end."""
         select = self.query_one("#window", Select)
         try:
             index = WINDOWS.index(str(select.value))
         except ValueError:
-            index = -1
-        select.value = WINDOWS[(index + 1) % len(WINDOWS)]
+            index = 0 if delta < 0 else -1
+        select.value = WINDOWS[(index + delta) % len(WINDOWS)]
 
     def action_cycle_sort(self, delta: int = 1) -> None:
         """Move the sort selector by *delta* steps, wrapping at either end."""
@@ -1899,8 +1900,8 @@ class Reader(App[None]):
             "## Sort\n\n"
             "- `s`: cycle sort (Recommended → Popular → Explore)\n"
             "- `h` / `l`: previous / next sort\n"
-            "- `d`: next time window (12 hours → 1 day → 1 week → 1 month"
-            " → Archive)\n"
+            "- `d` / `D`: next / previous time window (12 hours → 1 day →"
+            " 1 week → 1 month → Archive)\n"
             "- Selectors: sort and time window\n\n"
             "## Other\n\n"
             "- `o` / `c`: open article / comments\n"

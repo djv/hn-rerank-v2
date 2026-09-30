@@ -550,6 +550,7 @@ console.log(JSON.stringify(out));
         "l": ["sort", 1],
         "h": ["sort", -1],
         "d": ["window", 1],
+        "D": ["window", -1],
         "b": ["panel"],
         "?": ["help"],
         "f": ["fullscreen"],

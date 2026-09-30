@@ -2078,6 +2078,7 @@
       l: () => cycleSort(1),
       h: () => cycleSort(-1),
       d: () => cycleWindow(1),
+      D: () => cycleWindow(-1),
       b: () => sidePanel.classList.toggle('visible'),
       '?': () => showHelp(),
       f: () => togglePanel(),
@@ -2091,7 +2092,8 @@
       ) {
         return;
       }
-      const action = KEY_ACTIONS[e.key.toLowerCase()];
+      // Shift+D ("D") has its own action; other letters ignore Shift.
+      const action = KEY_ACTIONS[e.key] || KEY_ACTIONS[e.key.toLowerCase()];
       if (action) {
         e.preventDefault();
         action();

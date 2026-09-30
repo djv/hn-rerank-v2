@@ -86,6 +86,12 @@ async def test_select_and_d_key_switch_windows() -> None:
         await settle(pilot)
         assert app.selected_window() == "12h"  # wraps after Archive
         assert shown(app) == [10]
+        await pilot.press("D")  # back: 12h -> Archive, wrapping
+        await settle(pilot)
+        assert app.selected_window() == "archive"
+        await pilot.press("D")
+        await settle(pilot)
+        assert app.selected_window() == "1m"
 
 
 class GatedServer(FakeServer):
