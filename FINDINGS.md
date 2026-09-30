@@ -67,6 +67,21 @@ Read-only review by a subagent, spot-checked:
 - Not fixed: `query_single_story` is test-only; ~140 HN stories re-prewarm
   every regen (149 have <= 9 comments, likely under the 60-char minimum).
 
+## TUI headline dividers — 2026-09-29
+
+Tried on the TUI list (`#headlines`, Textual 8.2.8 OptionList). Kept: the
+`None` separator rows (user: "faint divider on its own line was ok").
+- CSS `border-bottom` on `.option-list--option`: ignored by OptionList.
+- `None` between options: a faint `─` row after each story (style via
+  `.option-list--separator`); takes no option index, so `highlighted` still
+  indexes `self.stories`. Costs one row per story; kept.
+- Underlining the meta line: zero rows, but Rich/Textual have no underline
+  colour, so it is drawn in each segment's colour (blue domain, green points)
+  and reads as links; stops at the age, not the row edge. Full-width padding
+  would go stale on resize (rows re-render only on highlight). User: revert.
+- Not tried: zebra background on alternate rows (zero rows; needs per-option
+  background, which OptionList does not expose without subclassing).
+
 ## Full-eval reruns of near-tie ideas — 2026-09-29
 
 The small test (900 votes, 3 folds) is too noisy for changes of ~0.01, so
@@ -915,7 +930,7 @@ confirmation set is consumed and must not be tuned against.
 
 ## Laptop project and package — 2026-09-13
 
-- Agent-tested: checkout moved from `/home/d/hn-rerank-v2` to `/home/d/hn-rerank`;
+- Agent-tested: checkout moved from `/home/d/hn-rerank-v2` to `/home/d/code/hn-rerank`;
   one worktree, no other cwd users at move time, original untracked `.opencode/`,
   `.playwright-mcp/`, `docs/MANUAL_TESTING.md` preserved. GitHub name remains
   `djv/hn-rerank-v2`. uv console scripts were reinstalled and verified at the new path.

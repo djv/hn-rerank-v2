@@ -1,5 +1,12 @@
 # Worklog: hn-rewrite
 
+## 2026-09-29 TUI: faint divider between headlines
+
+`Reader` passes `None` between headline options, so Textual's OptionList draws
+a `─` rule row in `$hn-rule` after each story except the last. Separators take
+no option index; `highlighted` still indexes `self.stories`. Costs one row per
+story. Alternatives tried and dropped: FINDINGS.md "TUI headline dividers".
+
 ## 2026-09-29 Opt-in linear blend (TF-IDF + dense LR), not enabled
 
 `pipeline/linear_blend.py` plus `linear_blend_*` in `ModelConfig` (all default

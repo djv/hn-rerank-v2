@@ -42,9 +42,10 @@ old profile, stopped 2026-09-24): ranking quality and which sources feed it.
 - TUI status line (committed `48e460f`, 2026-09-29): always one row; long messages
   end in `…` instead of wrapping to 3 rows (hints still stack below when
   both don't fit). TUI tests 152 pass, ruff clean.
-- TUI headline dividers (2026-09-29): tried and reverted at the user's call;
-  list unchanged. Rule rows cost a row per story; a meta-line underline
-  looked link-like. FINDINGS.md "TUI headline dividers".
+- TUI headline dividers (committed 2026-09-30): a faint `─` row between
+  stories (user: OK), live in the restarted reader; TUI tests 152 pass,
+  ruff/ty clean. A zero-row meta-line underline looked link-like; dropped.
+  FINDINGS.md "TUI headline dividers".
 - Profile merge (live, 2026-09-29 14:01 UTC, user chose "July onward"):
   user 1's 2,332 votes since 2026-07-01 on stories 151 had not voted on
   copied to 151 (467 -> 2,799 votes). Backup
@@ -104,7 +105,6 @@ old profile, stopped 2026-09-24): ranking quality and which sources feed it.
   `recent_candidate_hn_limit` (SVM decision and feature prep scale with it).
 - Open TLDR gaps: a raw PDF stored as article text (46108780 fails);
   archive dupe cards are not swapped by the dupe resolver (live `hn` only).
-- Restart the TUI reader to pick up the `a` key and one-row status line.
 - After ~100 new votes: compare 151's up rate on shown stories before and
   after the merge (`scripts/source_yield_report.py --user-id 151`).
 - Optional, low value: embedding queue (jina-v5-nano, mdbr-leaf-mt,

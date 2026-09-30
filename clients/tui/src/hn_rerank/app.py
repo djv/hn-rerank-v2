@@ -577,6 +577,7 @@ class Reader(App[None]):
                  border: solid $hn-bg; padding: 0; }
     #headlines:focus { border: solid $hn-accent; }
     #headlines > .option-list--option { padding: 0 1; }
+    #headlines > .option-list--separator { color: $hn-rule; }
     #headlines > .option-list--option-highlighted {
         background: $hn-select-bg; color: $hn-select-fg; text-style: bold;
     }
@@ -994,15 +995,14 @@ class Reader(App[None]):
         widths = self.meta_widths(max(0, headlines.size.width - 4))
         self._row_widths = widths
         self._marked_id = select_id
-        headlines.add_options(
-            [
-                Option(
-                    headline(s, s.id == select_id, widths),
-                    id=str(s.id),
-                )
-                for s in self.stories
-            ]
-        )
+        # A `None` between options draws a faint rule row; it does not take an
+        # option index, so `highlighted` still indexes `self.stories`.
+        options: list[Option | None] = []
+        for s in self.stories:
+            if options:
+                options.append(None)
+            options.append(Option(headline(s, s.id == select_id, widths), id=str(s.id)))
+        headlines.add_options(options)
         if self.stories:
             headlines.highlighted = next(
                 (i for i, s in enumerate(self.stories) if s.id == select_id), 0

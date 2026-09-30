@@ -2,7 +2,7 @@
 
 ## Build and verification
 
-From `/home/d/hn-rerank`:
+From `/home/d/code/hn-rerank`:
 
 ```sh
 uv sync
@@ -12,7 +12,7 @@ uv run ruff check .
 uv run ty check
 uv build --package hn-rerank
 cd /tmp
-uvx --from /home/d/hn-rerank/dist/hn_rerank-0.1.0-py3-none-any.whl hn-rerank
+uvx --from /home/d/code/hn-rerank/dist/hn_rerank-0.1.0-py3-none-any.whl hn-rerank
 ```
 
 The ONNX override is needed because `config.toml` pins the VPS model path
@@ -61,7 +61,7 @@ of server access. Deployment evidence and rollback paths live in
 
 ## Laptop rename
 
-On 2026-09-13, `/home/d/hn-rerank-v2` moved to `/home/d/hn-rerank` after an
+On 2026-09-13, `/home/d/hn-rerank-v2` moved to `/home/d/code/hn-rerank` after an
 inventory found one worktree, no tracked WIP and no other process using the old
 path. `.opencode/`, `.playwright-mcp/` and the existing `docs/` contents were
 preserved. No operational old-path references were found in project files,
