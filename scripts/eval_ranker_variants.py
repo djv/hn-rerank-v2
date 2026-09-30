@@ -266,6 +266,11 @@ def _production_scores(
         )
     if trace.labels.get("svm_probs") == "error":
         raise RuntimeError("Production probability mapping failed; aborting fold")
+    if "error" in (
+        trace.labels.get("linear_blend_fit"),
+        trace.labels.get("linear_blend_score"),
+    ):
+        raise RuntimeError("Production linear blend failed; aborting fold")
     if (
         score_context.cand_closest_up is not None
         and score_context.cand_closest_down is not None
@@ -291,6 +296,33 @@ def _production_scores(
         else None
     )
     return np.array([by_id[s.id].score for s in fold.candidates]), probabilities
+
+
+def _without_blend(config: Config) -> Config:
+    """The SVM ranker alone. config.toml turns the live linear blend on, so a
+    variant that blends production itself (prodlr, produd, stack, the SVM
+    sweeps) would otherwise blend it twice."""
+    return replace(config, model=replace(config.model, linear_blend_enabled=False))
+
+
+def _live_dense_scores(
+    fold: FoldData, tuned: Config, source_db: Database | None
+) -> np.ndarray:
+    """The live blend's dense logreg, as percentiles: production with the
+    blend on and all its weight on that model. It trains on the SVM's scaled
+    rows (every meta column, zero rows for absent classes) with C =
+    linear_blend_dense_c, which the eval's own logreg does not match."""
+    dense_only = replace(
+        tuned,
+        model=replace(
+            tuned.model,
+            linear_blend_enabled=True,
+            linear_blend_dense_weight=1.0,
+            linear_blend_tfidf_weight=0.0,
+            linear_blend_ramp=False,
+        ),
+    )
+    return _production_scores(fold, dense_only, source_db)[0]
 
 
 def _recommended(
@@ -988,7 +1020,7 @@ def _scores_logreg(
             float(fold.train_vote_times.max()), fold.train_vote_times, half_life_days
         )
     clf = LogisticRegression(
-        C=config.model.svm_c if c is None else c,
+        C=config.model.linear_blend_dense_c if c is None else c,
         solver="lbfgs",
         max_iter=2000,
         random_state=0,
@@ -1495,7 +1527,9 @@ def _scores_logreg_target(
     x_train, x_cand, y, _ = _prepare_linear_model_inputs(fold, config)
     keep = y != 1
     y_bin = (y[keep] == 2).astype(int)
-    clf = LogisticRegression(C=config.model.svm_c, max_iter=2000, random_state=0)
+    clf = LogisticRegression(
+        C=config.model.linear_blend_dense_c, max_iter=2000, random_state=0
+    )
     clf.fit(x_train[keep], y_bin, sample_weight=_balanced_weights(y_bin))
     return clf.predict_proba(x_cand)[:, 1].astype(np.float32)
 
@@ -1542,6 +1576,8 @@ def _scores_prodlr(
         fold = _with_skipped(
             fold, skipped_pool, label, float(options.get("skip_frac", 1.0)), config
         )
+    live_tuned = tuned
+    tuned = _without_blend(tuned)
     if "dims" in options:
         dims = [int(d) for d in options["dims"].split("+")]
         production = _per_embedding_production(fold, tuned, source_db, dims)
@@ -1570,6 +1606,10 @@ def _scores_prodlr(
                 text=text,
                 half_life=half_life,
             )
+        if target == "updown" and half_life is None and "skip_label" not in options:
+            # The live dense model; the other targets, half-lives and skipped
+            # votes keep the eval's own logreg (fewer meta columns).
+            return _live_dense_scores(fold, live_tuned, source_db)
         return _scores_logreg_target(fold, config, target, half_life)
 
     scores = {
@@ -2553,8 +2593,13 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
             for gamma in (0.01, 0.02, 0.03, 0.05, 0.1):
                 name = f"svm_c{c}_gamma{gamma}"
                 tuned = replace(
-                    production_config,
-                    model=replace(production_config.model, svm_c=c, svm_gamma=gamma),
+                    _without_blend(production_config),
+                    model=replace(
+                        production_config.model,
+                        svm_c=c,
+                        svm_gamma=gamma,
+                        linear_blend_enabled=False,
+                    ),
                 )
                 variants[name] = lambda fold, tuned=tuned: _production_scores(
                     fold, tuned, db
@@ -2578,7 +2623,7 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
             if mode not in STACK_MODES or feats not in STACK_FEATS:
                 raise ValueError(f"Bad stack variant {name!r}")
             stack_config = replace(
-                production_config,
+                _without_blend(production_config),
                 model=replace(
                     production_config.model,
                     **_parse_model_overrides(
@@ -2587,7 +2632,9 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
                 ),
             )
             variants[name] = lambda fold, c=stack_config, m=mode, f=feats: (
-                _scores_stack(fold, c, config.model.svm_c, mode=m, feats=f)
+                _scores_stack(
+                    fold, c, config.model.linear_blend_dense_c, mode=m, feats=f
+                )
             )
             continue
         options = {
@@ -2609,8 +2656,8 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
                 fold, tuned, db
             )
         elif prefix == "produd":
-            variants[name] = lambda fold, tuned=tuned: _scores_production_up_minus_down(
-                fold, tuned, db
+            variants[name] = lambda fold, tuned=_without_blend(tuned): (
+                _scores_production_up_minus_down(fold, tuned, db)
             )
         elif prefix == "prodlr":
             if "skip_label" in options and skipped_pool is None:

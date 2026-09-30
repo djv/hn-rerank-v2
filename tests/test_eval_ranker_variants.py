@@ -678,3 +678,38 @@ def test_source_prior_follows_training_vote_rates() -> None:
     scores = _scores_source_prior(replace(fold, train_stories=train, candidates=cands))
     by_label = {int(labels[s.id]): float(v) for s, v in zip(cands, scores, strict=True)}
     assert by_label[2] > by_label[1] > by_label[0]
+
+
+def test_prodlr_live_shape_matches_the_live_blend() -> None:
+    """prodlr with the live weights ranks exactly like production with the
+    live blend on at full ramp (a heavy voter), and its production part
+    carries no blend of its own."""
+    from dataclasses import replace
+
+    from scripts.eval_ranker_variants import _production_scores, _scores_prodlr
+
+    fold = _signal_fold()
+    base = Config()
+    live = replace(
+        base,
+        model=replace(
+            base.model,
+            linear_blend_enabled=True,
+            linear_blend_dense_weight=0.2,
+            linear_blend_tfidf_weight=0.3,
+            linear_blend_ramp=False,
+        ),
+    )
+    expected = _production_scores(fold, live)[0]
+    got = _scores_prodlr(
+        fold,
+        live,
+        base,
+        None,
+        {"lr_weight": "0.2", "tfidf_weight": "0.3", "tfidf_c": "4.0"},
+        None,
+    )
+    assert np.array_equal(
+        np.argsort(-expected, kind="stable"), np.argsort(-got, kind="stable")
+    )
+    np.testing.assert_allclose(got, expected, atol=1e-5)
