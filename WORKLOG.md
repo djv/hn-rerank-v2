@@ -1,5 +1,19 @@
 # Worklog: hn-rewrite
 
+## 2026-09-30 TUI: feed names, no fake zero counts, why-ranked line, wait counter
+
+- Headlines name a non-HN story's feed (`source_label`) instead of the linked
+  domain: the 5 AINews stories in the live 1w deck showed `x.com`.
+- A non-HN story's 0 points or 0 comments is hidden (12/47 live 1w stories
+  showed `▲ 0`; ScienceDaily, Slashdot and blogs showed `💬 0`); the web card
+  already hid zero scores. Blank columns now drop their `·` as well.
+- The reading-pane heading shows "Because you upvoted: …" (`best_match_title`,
+  on 42/47 live 1w stories; the web card had it, the TUI parsed but hid it).
+- "Loading summary…" counts seconds while a summary is on its way (uncached
+  ones take ~15 s).
+- Checked on a render of the live 1w feed (mocked API, nothing sent). TUI
+  tests 156 pass.
+
 ## 2026-09-30 Shift+D cycles the time window backwards
 
 - `D` (Shift+D) moves to the previous time window, wrapping (12h -> Archive),

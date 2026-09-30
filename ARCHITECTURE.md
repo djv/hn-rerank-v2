@@ -798,7 +798,12 @@ its existing refresh path on changes; reading, help and voting defer the check.
 This does not bypass Reddit rate limits or promise real-time HN upstream data.
 
 The terminal client prefixes headline titles with badge emoji and offers a
-`b` legend hotkey (Escape returns to the story). Story JSON now includes badge details (kind/icon/label/tooltip) and card
+`b` legend hotkey (Escape returns to the story). Its metadata row names a
+non-HN story's feed (`source_label`: AINews, LessWrong, r/sub) rather than
+the linked domain, and leaves out a non-HN story's zero points or comments
+(unknown, not zero; blank columns keep the rows aligned). The reading pane's
+heading adds the web card's "Because you upvoted: …" line
+(`best_match_title`), and a summary wait counts up ("Loading summary… 5s"). Story JSON now includes badge details (kind/icon/label/tooltip) and card
 presentation fields. The browser keeps server-rendered initial paint but uses
 `/api/feed` JSON for refills, building DOM nodes with textContent instead of
 injecting story text as HTML. Feed orders retain production

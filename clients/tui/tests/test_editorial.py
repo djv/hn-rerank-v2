@@ -16,10 +16,13 @@ from hn_rerank.app import (
     LIGHT_PALETTE,
     Reader,
     Setup,
+    _cell_len,
     headline,
+    headline_comments,
     headline_domain,
     headline_points,
     story_age,
+    story_heading,
     story_metadata,
     theme_for_hour,
 )
@@ -341,7 +344,7 @@ def test_headline_shows_badge_emoji() -> None:
     assert headline(replace(story, badges=[])).plain.startswith("Story")
 
 
-def test_headline_hides_unknown_reddit_score_and_shows_subreddit() -> None:
+def test_headline_hides_unknown_feed_counts_and_shows_subreddit() -> None:
     story = FeedStory(
         1,
         "Story",
@@ -354,12 +357,50 @@ def test_headline_hides_unknown_reddit_score_and_shows_subreddit() -> None:
         1.0,
     )
     rendered = headline(story).plain
-    assert "r/localllama" in rendered
-    assert "pts" not in rendered
-    assert "· ▲ 5 ·" in headline(replace(story, points=5)).plain
+    assert rendered.splitlines()[1] == "r/localllama"
+    assert headline(replace(story, points=5, comments=3)).plain.endswith(
+        "r/localllama · ▲ 5 · 💬 3"
+    )
+    # HN counts are real even at zero.
     hn = replace(story, source="hn", article_url="https://example.org/a")
-    assert "example.org" in headline(hn).plain
-    assert "· ▲ 0 ·" in headline(hn).plain
+    assert headline(hn).plain.endswith("example.org · ▲ 0 · 💬 0")
+
+
+def test_headline_names_the_feed_not_the_linked_domain() -> None:
+    ainews = FeedStory(
+        1,
+        "Story",
+        "https://x.com/someone/status/1",
+        "https://news.smol.ai/issues/1",
+        "rss_ainews",
+        0,
+        12,
+        0,
+        1.0,
+        source_label="AINews",
+    )
+    assert headline(ainews).plain.splitlines()[1] == "AINews · 💬 12"
+    hn = replace(ainews, source="hn", source_label="HN", points=3)
+    assert headline_domain(hn) == "x.com"
+
+
+def test_heading_says_why_a_story_is_recommended() -> None:
+    story = FeedStory(
+        1,
+        "Story",
+        "https://example.org/a",
+        "https://news.ycombinator.com/item?id=1",
+        "hn",
+        5,
+        7,
+        0,
+        1.0,
+    )
+    assert story_heading(story).plain == headline(story).plain
+    because = replace(story, best_match_title="Earlier story")
+    assert story_heading(because).plain.splitlines()[-1] == (
+        "Because you upvoted: Earlier story"
+    )
 
 
 def test_headline_separators_share_columns_across_stories() -> None:
@@ -374,6 +415,8 @@ def test_headline_separators_share_columns_across_stories() -> None:
         0,
         1.0,
     )
+    now = int(time.time())
+    base = replace(base, time=now - 3 * 3600)
     reddit = replace(
         base,
         id=2,
@@ -381,17 +424,28 @@ def test_headline_separators_share_columns_across_stories() -> None:
         source="rss_reddit_localllama",
         points=0,
         comments=1234,
+        time=now - 12 * 86400,
     )
+    blog = replace(base, id=3, source="rss_blog", points=0, comments=0)
+    stories = (base, reddit, blog)
     widths = (
-        max(len(headline_domain(base)), len(headline_domain(reddit))),
-        max(len(headline_points(base)), len(headline_points(reddit))),
-        max(len("💬 7"), len("💬 1234")),
+        max(_cell_len(headline_domain(s)) for s in stories),
+        max(_cell_len(headline_points(s)) for s in stories),
+        max(_cell_len(headline_comments(s)) for s in stories),
     )
-    first = headline(base, True, widths).plain.splitlines()[1]
-    second = headline(reddit, False, widths).plain.splitlines()[1]
-    dots = [i for i, char in enumerate(first) if char == "·"]
-    assert dots == [i for i, char in enumerate(second) if char == "·"]
-    assert "pts" not in second
+    first, second, third = (
+        headline(s, s is base, widths).plain.splitlines()[1] for s in stories
+    )
+    # Unknown counts leave blank columns: every row's age starts where the
+    # first row's does, and blank segments drop their separator too.
+    assert first.endswith("3h") and second.endswith("12d") and third.endswith("3h")
+    rows = (first, second, third)
+    assert len({_cell_len(row[: row.rindex("·")]) for row in rows}) == 1
+    assert _cell_len(first[: first.index("💬")]) == _cell_len(
+        second[: second.index("💬")]
+    )
+    assert "▲" not in second and "▲" not in third and "💬" not in third
+    assert third.count("·") == 1
     assert "r/localllama" in second
 
 
@@ -446,7 +500,7 @@ def test_headline_truncates_long_domains_to_fit() -> None:
         1.0,
     )
     assert (
-        headline(long_domain, True, (10, 1, 1)).plain.splitlines()[1]
+        headline(long_domain, True, (10, 3, 3)).plain.splitlines()[1]
         == "marginalr… · ▲ 5 · 💬 7"
     )
     assert "marginalrevolution.com" in headline(long_domain).plain
@@ -725,3 +779,21 @@ async def test_space_pages_tldr_from_either_view(zoom: bool) -> None:
         await pilot.pause()
         assert summary.scroll_y == min(2 * first, summary.max_scroll_y)
         assert app.selected() == selected
+
+
+async def test_a_slow_summary_counts_the_wait(tmp_path: Path) -> None:
+    fake = FakeServer()
+    fake.delay_summary = 2.5  # story 1, the first selected
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        summary = app.query_one("#summary", Markdown)
+        for _ in range(100):
+            if (
+                summary._markdown.startswith("Loading summary… ")
+                and summary._markdown[-1] == "s"
+            ):
+                break
+            await pilot.pause(0.05)
+        assert summary._markdown[len("Loading summary… ") : -1].isdigit()
+        await settle(pilot)
+        assert summary._markdown == "# Summary 1"

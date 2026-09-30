@@ -17,6 +17,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.theme import Theme
+from textual.timer import Timer
 from textual.widgets import (
     Button,
     Input,
@@ -385,6 +386,10 @@ def _pad_cells(text: str, width: int) -> str:
 
 
 def headline_domain(story: FeedStory) -> str:
+    # Feeds name themselves (AINews, not the x.com its items link to), as
+    # the web card's source badge does.
+    if story.source != "hn" and story.source_label:
+        return story.source_label
     if story.source.startswith("rss_reddit_") and len(story.source) > 11:
         return f"r/{story.source[11:]}"
     domain = urlsplit(story.article_url).hostname or story.source
@@ -392,10 +397,17 @@ def headline_domain(story: FeedStory) -> str:
 
 
 def headline_points(story: FeedStory) -> str:
-    # Reddit RSS carries no scores (0/8487 rows have one): 0 means unknown,
-    # not zero. The web card already hides zero scores; match that here.
-    if story.points > 0 or not story.source.startswith("rss_reddit_"):
+    # Most feeds carry no scores (Reddit RSS: 0/8487 rows have one), so a
+    # non-HN 0 means unknown, not zero. The web card hides zero scores too.
+    if story.points > 0 or story.source == "hn":
         return f"▲ {story.points}"
+    return ""
+
+
+def headline_comments(story: FeedStory) -> str:
+    # Likewise a non-HN 0 is a feed without comment counts (Slashdot, blogs).
+    if story.comments or story.source == "hn":
+        return f"💬 {story.comments or 0}"
     return ""
 
 
@@ -408,7 +420,8 @@ def headline(
 
     *widths* holds the (domain, points, comments) segment widths across the
     visible list; each row pads its segments so the separators line up.
-    Unknown Reddit scores pad as blank space to preserve the columns.
+    Unknown scores and comment counts pad as blank space, separator included,
+    to preserve the columns; without *widths* they are left out.
     """
     text = Text()
     if selected is not None:
@@ -428,22 +441,29 @@ def headline(
     elif widths[0]:
         domain = _pad_cells(domain, widths[0])
     text.append(domain, style=PALETTE["link"])
-    points = headline_points(story)
-    if points or widths[1]:
-        text.append(" · ", style=PALETTE["sep"])
-        text.append(
-            _pad_cells(points, widths[1]) if widths[1] else points,
-            style=PALETTE["good"],
-        )
-    comments = f"💬 {story.comments or 0}"
     age = story_age(story)
-    text.append(" · ", style=PALETTE["sep"])
-    if age and widths[2]:
-        comments = _pad_cells(comments, widths[2])
-    text.append(comments, style=PALETTE["soft"])
-    if age:
-        text.append(" · ", style=PALETTE["sep"])
-        text.append(age, style=PALETTE["faint"])
+    segments = (
+        (headline_points(story), widths[1], PALETTE["good"]),
+        # The last column needs no padding when nothing follows it.
+        (headline_comments(story), widths[2] if age else 0, PALETTE["soft"]),
+        (age, 0, PALETTE["faint"]),
+    )
+    for value, width, style in segments:
+        if value:
+            text.append(" · ", style=PALETTE["sep"])
+            text.append(_pad_cells(value, width), style=style)
+        elif width:
+            text.append(" " * (3 + width))
+    return text
+
+
+def story_heading(story: FeedStory) -> Text:
+    """The reading pane's heading: the headline, plus why the story is
+    recommended when the server says (as the web card does)."""
+    text = headline(story)
+    if story.best_match_title:
+        text.append("\nBecause you upvoted: ", style=PALETTE["faint"])
+        text.append(story.best_match_title, style=PALETTE["soft"])
     return text
 
 
@@ -812,7 +832,7 @@ class Reader(App[None]):
                 str(story.id), headline(story, story.id == self._marked_id, widths)
             )
         if selected := self.selected():
-            self.query_one("#story-heading", Static).update(headline(selected))
+            self.query_one("#story-heading", Static).update(story_heading(selected))
         self.context_status()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
@@ -972,10 +992,7 @@ class Reader(App[None]):
         widths = [
             max((_cell_len(headline_domain(s)) for s in self.stories), default=0),
             max((_cell_len(headline_points(s)) for s in self.stories), default=0),
-            max(
-                (_cell_len(f"💬 {s.comments or 0}") for s in self.stories),
-                default=0,
-            ),
+            max((_cell_len(headline_comments(s)) for s in self.stories), default=0),
         ]
         age_w = max((len(story_age(s)) for s in self.stories), default=0)
         total = widths[0] + 3 + widths[1] + 3 + widths[2] + 3 + age_w
@@ -1044,7 +1061,7 @@ class Reader(App[None]):
             # Fresh feed data can carry new points/comments; keep the reading
             # heading in step even when the selection id has not changed.
             if selected := self.selected():
-                self.query_one("#story-heading", Static).update(headline(selected))
+                self.query_one("#story-heading", Static).update(story_heading(selected))
             self.schedule_summary()
         else:
             self.query_one("#story-heading", Static).update("")
@@ -1118,7 +1135,7 @@ class Reader(App[None]):
         if self.help_open:
             return
         if story and story.id != self.summary_story_id:
-            self.query_one("#story-heading", Static).update(headline(story))
+            self.query_one("#story-heading", Static).update(story_heading(story))
             self.summary_story_id = story.id
             self.selection_serial += 1
             if self.feed is not None:
@@ -1174,6 +1191,7 @@ class Reader(App[None]):
     async def load_summary(
         self, story_id: int, serial: int, *, force_refresh: bool = False
     ) -> None:
+        started = time.monotonic()
         await asyncio.sleep(0.3)
         if (
             not self.api
@@ -1182,8 +1200,20 @@ class Reader(App[None]):
         ):
             return
         previous = self.summaries.get(story_id)
+        ticker: Timer | None = None
         if previous is None:
             self.query_one("#summary", Markdown).update("Loading summary…")
+
+            # A summary written on request takes ~15 s; count the wait so a
+            # slow one reads as working, not stuck.
+            def tick() -> None:
+                if serial == self.selection_serial and self.query("#summary"):
+                    elapsed = int(time.monotonic() - started)
+                    self.query_one("#summary", Markdown).update(
+                        f"Loading summary… {elapsed}s"
+                    )
+
+            ticker = self.set_interval(1.0, tick)
         else:
             self.query_one("#summary", Markdown).update(previous)
             self.status("Regenerating summary…")
@@ -1227,6 +1257,9 @@ class Reader(App[None]):
                 # transient (quota/cooldown), so this hides for the session
                 # only — refresh restores. InvalidProfile goes to setup above.
                 self._hide_story(story_id, f"summary unavailable ({exc})")
+        finally:
+            if ticker is not None:
+                ticker.stop()
 
     async def await_summary(
         self, story_id: int, *, force: bool = False
