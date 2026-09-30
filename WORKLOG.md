@@ -1,5 +1,22 @@
 # Worklog: hn-rewrite
 
+## 2026-09-30 Hot threads: live points/comments between regens; Interest icon 🎯
+
+- Why: Gemini 4 Argon (49913571, 1h old) showed 419 pts / 165 comments in
+  the TUI while HN had 444 / 218; `r` rewrote the summary and stored 449 /
+  183, but the counts stayed. Feeds copied counts from the candidate-pool
+  snapshot (hourly regen); DB writes in between never reached clients.
+- Feed counts now come from the DB at serve time; a 10-minute
+  `hot_refresh_loop` probes Firebase (score + descendants) for up to 30 of
+  the pool's busiest young HN threads (`tldr_refresh_*` gate), no LLM.
+  `counts_version` on `/api/ranking-ready` makes the TUI refetch the feed;
+  generated `tldr-detail` replies carry points/comments (TUI shows them at
+  once). CH's hourly pass no longer lowers stored points/comments.
+- Summaries still regenerate on open (user's choice, no background LLM):
+  `/api/tldr-cache` misses for an active thread grown past
+  `_growth_threshold`, so opening it asks `tldr-detail`.
+- Interest badge icon back to 🎯 (user request); 🧭 is retired.
+
 ## 2026-09-30 Explore: 🧭 Interest replaces 🎯 Similar; impressions log badges
 
 - Why: since 09-26 profile 151 upvoted 5.6% of shown Explore cards vs 26.8%

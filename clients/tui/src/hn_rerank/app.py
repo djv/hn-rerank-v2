@@ -756,6 +756,8 @@ class Reader(App[None]):
         self.status_text = ""
         self.hints_text = ""
         self.last_error: str | None = None
+        # The server's counts version at the last poll (None until seen).
+        self.counts_version: int | None = None
         self.prefetch = max(0, prefetch)
         self.prefetch_generate = min(self.prefetch, max(0, prefetch_generate))
         # Complete summaries, and at most one request per story in flight. The
@@ -1400,6 +1402,8 @@ class Reader(App[None]):
         else:
             summary = await api.summary(story_id, force_refresh=force)
         if summary is not None and api is self.api:
+            if summary.points is not None:
+                self.patch_counts(story_id, summary.points, summary.comments)
             if summary.provisional or summary.empty:
                 # Shown (or hidden) by the selection, never cached.
                 self.prefetch_retry_at[story_id] = (
@@ -1457,7 +1461,8 @@ class Reader(App[None]):
         )
 
     async def poll_feed_version(self) -> None:
-        """Every minute: reload when the server has a newer deck than ours."""
+        """Every minute: reload when the server has a newer deck than ours,
+        or refetch the feed when only stored points/comments changed."""
         if not self.can_poll_feed():
             return
         api, feed = self.api, self.feed
@@ -1466,14 +1471,24 @@ class Reader(App[None]):
         # a stale one waits for the reranked deck it is missing.
         wanted = feed.version if feed.ready else feed.target_version
         try:
-            ready, current = await api.ready(wanted)
+            readiness = await api.ready(wanted)
         except APIError:
             # Passive checks must not replace a usable deck with an error.
             return
+        if not (self.api is api and self.feed is feed and self.can_poll_feed()):
+            return
+        current = readiness.current
         # A lower version is a server restart, not an obsolete response.
-        newer = current != feed.version if feed.ready else ready or current < wanted
-        if self.api is api and self.feed is feed and self.can_poll_feed() and newer:
+        if feed.ready:
+            newer = current != feed.version
+        else:
+            newer = readiness.ready or current < wanted
+        seen, self.counts_version = self.counts_version, readiness.counts_version
+        if newer:
             self.reload(manual=False)
+        elif seen is not None and readiness.counts_version != seen:
+            # Same deck, fresher counts: summaries and the open story stay.
+            self.refresh_feed(announce=False)
 
     @work(group="refresh", exclusive=True)
     async def refresh_feed(self, *, announce: bool = True) -> None:
@@ -1506,6 +1521,7 @@ class Reader(App[None]):
             if self.feed is not None and feed.version == self.feed.version:
                 self.feeds[window] = feed
             return
+        self.forget_outgrown_summaries(feed)
         self.set_feed(feed)
         self.last_error = None
         if feed.ready:
@@ -1521,6 +1537,47 @@ class Reader(App[None]):
         if announce and not feed.ready:
             self.status("Showing available stories while ranking updates…")
         self.schedule_window_prefetch()
+
+    def forget_outgrown_summaries(self, feed: Feed) -> None:
+        """Drop kept summaries of stories that gained comments, except the
+        open one, so reopening asks the server again (it rewrites a busy
+        thread's summary once enough comments arrived)."""
+        if self.feed is None:
+            return
+        before = {story.id: story.comments or 0 for story in self.feed.stories}
+        for story in feed.stories:
+            if story.id != self.summary_story_id and (story.comments or 0) > before.get(
+                story.id, story.comments or 0
+            ):
+                self.summaries.pop(story.id, None)
+
+    def patch_counts(self, story_id: int, points: int, comments: int | None) -> None:
+        """Show the counts a summary reply carried; the feed's may be older."""
+        for feed in self.feeds.values():
+            for i, item in enumerate(feed.stories):
+                if item.id == story_id:
+                    feed.stories[i] = replace(item, points=points, comments=comments)
+        for i, item in enumerate(self.stories):
+            if item.id != story_id or (item.points, item.comments) == (
+                points,
+                comments,
+            ):
+                continue
+            story = replace(item, points=points, comments=comments)
+            self.stories[i] = story
+            if not self.query("#headlines"):
+                return
+            listing = self.query_one("#headlines", OptionList)
+            # A count gaining a digit can widen the metadata columns.
+            widths = self.meta_widths(max(0, listing.size.width - 4))
+            for row in [story] if widths == self._row_widths else self.stories:
+                listing.replace_option_prompt(
+                    str(row.id), headline(row, row.id == self._marked_id, widths)
+                )
+            self._row_widths = widths
+            selected = self.selected()
+            if selected is not None and selected.id == story_id:
+                self.query_one("#story-heading", Static).update(story_heading(story))
 
     def set_feed(self, feed: Feed) -> None:
         """Make *feed* the selected window's; a new version drops the cached
@@ -1908,7 +1965,7 @@ class Reader(App[None]):
         self.query_one("#summary", Markdown).update(
             "# Badge legend\n\n"
             "🔥 **Hot** — rising fast · 🏆 **Top** — high score · 💬 **Talk** — many comments\n\n"
-            "🤔 **Unsure** — model uncertain · ✨ **Novel** — unlike your votes · 🧭 **Interest** — an interest Recommended misses\n\n"
+            "🤔 **Unsure** — model uncertain · ✨ **Novel** — unlike your votes · 🎯 **Interest** — an interest Recommended misses\n\n"
             "Escape: return to the story. ?: shortcuts."
         )
         self.focus_summary()

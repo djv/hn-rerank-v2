@@ -2088,7 +2088,7 @@ ATTRIBUTION_MIN_SIM = 0.35
 # 0.77 on profile 151's 1w deck, 2026-09-30). They name one only on a close
 # match: 0.85 was picked by eye on that deck, just above the clear misses
 # (0.64-0.81); good and bad matches overlap, so it trades some good lines
-# for no bad ones. Interest (🧭) comes from the user's upvotes, so it keeps
+# for no bad ones. Interest (🎯) comes from the user's upvotes, so it keeps
 # the floor.
 BADGED_ATTRIBUTION_MIN_SIM = 0.85
 

@@ -70,6 +70,8 @@ class FakeServer:
         self.fail_vote = False
         self.delay_vote = 0.0
         self.delay_summary = 0.0
+        # Sent on ranking-ready when set, as current servers do.
+        self.counts_version: int | None = None
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -95,13 +97,13 @@ class FakeServer:
                 raise httpx.ReadError("secret URL must not appear", request=request)
             return httpx.Response(200, json={"ok": True, "target_version": 1})
         if path.endswith("/api/ranking-ready"):
-            return httpx.Response(
-                200,
-                json={
-                    "ready": self.feed.ready,
-                    "current_version": self.feed.target_version,
-                },
-            )
+            ready: dict[str, object] = {
+                "ready": self.feed.ready,
+                "current_version": self.feed.target_version,
+            }
+            if self.counts_version is not None:
+                ready["counts_version"] = self.counts_version
+            return httpx.Response(200, json=ready)
         return httpx.Response(404)
 
     def feed_for(self, window: Window) -> Feed:

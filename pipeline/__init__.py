@@ -490,22 +490,29 @@ def _probe_eligible_threads(
     return eligible
 
 
-async def _probe_live_counts(
-    stories: Sequence[Story], timeout_s: float
-) -> dict[int, int]:
-    """Live Firebase descendants per story id.
+@dataclass(frozen=True)
+class LiveCounts:
+    """A story's live Firebase numbers; ``score`` is None when absent."""
 
-    Failures, unparseable bodies, and counts that move backwards are
-    silently omitted — the caller treats absence as "no known growth".
+    score: int | None
+    descendants: int
+
+
+async def _probe_live_items(
+    stories: Sequence[Story], timeout_s: float
+) -> dict[int, LiveCounts]:
+    """Live Firebase points and descendants per story id.
+
+    Failures and unparseable bodies are logged and omitted.
     """
-    counts: dict[int, int] = {}
+    counts: dict[int, LiveCounts] = {}
     if not stories:
         return counts
     sem = asyncio.Semaphore(_PROBE_CONCURRENCY)
 
     async with httpx.AsyncClient(timeout=timeout_s) as client:
 
-        async def _one(s: Story) -> tuple[int, int] | None:
+        async def _one(s: Story) -> tuple[int, LiveCounts] | None:
             async with sem:
                 try:
                     resp = await client.get(_FIREBASE_ITEM_URL.format(sid=s.id))
@@ -518,12 +525,14 @@ async def _probe_live_counts(
                     )
                     return None
                 try:
-                    body = resp.json()
-                    live = int((body or {}).get("descendants") or 0)
+                    body = resp.json() or {}
+                    score = body.get("score")
+                    live = LiveCounts(
+                        score=None if score is None else int(score),
+                        descendants=int(body.get("descendants") or 0),
+                    )
                 except Exception:
                     logging.warning("tldr_probe story_id=%s unparseable body", s.id)
-                    return None
-                if live <= (s.comment_count or 0):
                     return None
                 return (s.id, live)
 
@@ -531,6 +540,98 @@ async def _probe_live_counts(
             if result is not None:
                 counts[result[0]] = result[1]
     return counts
+
+
+async def _probe_live_counts(
+    stories: Sequence[Story], timeout_s: float
+) -> dict[int, int]:
+    """Live Firebase descendants per story id.
+
+    Failures, unparseable bodies, and counts that move backwards are
+    silently omitted — the caller treats absence as "no known growth".
+    """
+    items = await _probe_live_items(stories, timeout_s)
+    return {
+        s.id: items[s.id].descendants
+        for s in stories
+        if s.id in items and items[s.id].descendants > (s.comment_count or 0)
+    }
+
+
+def hn_thread_looks_active(story: Story, config: Config, now: float) -> bool:
+    """Whether an HN story's comment thread is recent and busy enough to
+    warrant a forced real-time Algolia refresh in tldr-detail, or a live
+    count refresh between regens (``refresh_hot_counts``).
+
+    Prewarm's comment data comes from ClickHouse, which lags 1-24h behind
+    live HN for brand-new comments. Refreshing every view would be wasteful,
+    so this gates on: post age within a recent window, an absolute comment
+    floor (skip small threads), and comment velocity (comments/hour) above a
+    threshold — a proxy for "this thread is still actively accruing
+    comments right now," since the endpoint has no direct fetch-timestamp
+    signal to compare against.
+    """
+    if not is_hn_source(story.source):
+        return False
+    if story.time <= 0:
+        return False
+    age_hours = (now - story.time) / 3600.0
+    if age_hours <= 0 or age_hours > config.tldr_refresh_recent_hours:
+        return False
+    comment_count = story.comment_count or 0
+    if comment_count < config.tldr_refresh_min_comments:
+        return False
+    return (comment_count / age_hours) >= config.tldr_refresh_min_comments_per_hour
+
+
+def refresh_hot_counts(
+    config: Config,
+    db: Database,
+    candidates: Sequence[Story],
+    *,
+    now: float | None = None,
+) -> tuple[int, list[int]]:
+    """Refresh live points and comment counts of the busiest young HN threads.
+
+    The candidate pool only refreshes at the hourly regen, so a thread
+    gaining 200 comments an hour looks frozen in between. Take the pool's
+    HN stories with their stored counts (``get_story_counts``; the pool's
+    copies are snapshots), keep threads passing ``hn_thread_looks_active``,
+    and probe the ``hot_refresh_max_stories`` fastest (comments/hour) on
+    Firebase. Counts only: no comment hydration, no LLM — a summary is
+    rewritten when a reader opens the story. Returns (probed, changed ids).
+    """
+    limit = config.hot_refresh_max_stories
+    now = time.time() if now is None else now
+    young = [
+        s
+        for s in candidates
+        if is_hn_source(s.source)
+        and 0 < now - s.time <= config.tldr_refresh_recent_hours * 3600.0
+    ]
+    if limit <= 0 or not young:
+        return 0, []
+    stored = db.get_story_counts([s.id for s in young])
+    stories = [
+        replace(s, score=c.score, comment_count=c.comment_count)
+        for s in young
+        if (c := stored.get(s.id)) is not None
+    ]
+    stories = [s for s in stories if hn_thread_looks_active(s, config, now)]
+    stories.sort(key=lambda s: (s.comment_count or 0) / (now - s.time), reverse=True)
+    stories = stories[:limit]
+    if not stories:
+        return 0, []
+    live = asyncio.run(_probe_live_items(stories, config.tldr_probe_timeout_seconds))
+    changed: list[int] = []
+    for s in stories:
+        counts = live.get(s.id)
+        if counts is None:
+            continue
+        score = s.score if counts.score is None else counts.score
+        if db.update_story_counts(s.id, score, counts.descendants):
+            changed.append(s.id)
+    return len(stories), changed
 
 
 # Regen-local probe memory: sid -> (probed_at, count_seen). Stops flat
@@ -756,9 +857,14 @@ async def fetch_candidates(
         }
         existing = existing_stories.get(sid)
         if existing is not None:
-            new_score = coerce_int(item.get("points"), existing.score)
-            new_comments = coerce_int(
-                item.get("num_comments"), existing.comment_count or 0
+            # ClickHouse can lag the hot-thread refresh and TLDR hydration
+            # (Firebase/Algolia): never move stored counts backwards.
+            new_score = max(
+                existing.score, coerce_int(item.get("points"), existing.score)
+            )
+            new_comments = max(
+                existing.comment_count or 0,
+                coerce_int(item.get("num_comments"), existing.comment_count or 0),
             )
             has_changes = new_score != existing.score or new_comments != (
                 existing.comment_count or 0

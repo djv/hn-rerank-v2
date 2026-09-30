@@ -1123,6 +1123,7 @@ def test_ranking_ready_false_when_cache_missing_or_older(test_env, monkeypatch) 
         "ok": True,
         "ready": False,
         "current_version": target_version,
+        "counts_version": handler._current_counts_version(),
     }
 
     handler._decks[user.id] = DeckState(WindowDeck(), time.time(), target_version - 1)
@@ -1159,6 +1160,7 @@ def test_ranking_ready_true_only_from_cached_version(test_env, monkeypatch) -> N
         "ok": True,
         "ready": True,
         "current_version": target_version,
+        "counts_version": handler._current_counts_version(),
     }
     assert calls == []
 
@@ -1203,6 +1205,7 @@ def test_ranking_ready_returns_intermediate_cached_version(
         "ok": True,
         "ready": True,
         "current_version": 4,
+        "counts_version": handler._current_counts_version(),
     }
     assert calls == [(user.id, 4)]
 
@@ -1216,7 +1219,12 @@ def test_ranking_ready_ignores_target_version_and_rejects_the_old_alias(
         f"http://127.0.0.1:{port}/api/ranking-ready?min_version={current}&target_version=1",
         cookies={"hn_token": user.token},
     )
-    assert ok.json() == {"ok": True, "ready": True, "current_version": current}
+    assert ok.json() == {
+        "ok": True,
+        "ready": True,
+        "current_version": current,
+        "counts_version": handler._current_counts_version(),
+    }
     legacy = local_http.get(
         f"http://127.0.0.1:{port}/api/ranking-ready?version={current}",
         cookies={"hn_token": user.token},
@@ -1815,6 +1823,7 @@ def test_flask_test_client_ranking_ready_reports_missing_cache(
         "ok": True,
         "ready": False,
         "current_version": version,
+        "counts_version": handler._current_counts_version(),
     }
     assert calls == [(user.id, version)]
 
@@ -2561,6 +2570,7 @@ def test_flask_test_client_tldr_heals_count_past_lagging_hydrate(
         # Algolia view of the world: only 40 of the 60 live comments.
         updated = replace(
             current,
+            score=75,
             top_comments="Freshly hydrated comments.",
             comment_count=40,
             comment_count_at_fetch=40,
@@ -2577,6 +2587,7 @@ def test_flask_test_client_tldr_heals_count_past_lagging_hydrate(
 
     monkeypatch.setattr(server, "generate_detailed_tldr", mock_generate_detailed_tldr)
 
+    counts_version = handler._current_counts_version()
     resp = client.post("/api/tldr-detail", json={"story_id": grown_story.id})
 
     assert resp.status_code == 200
@@ -2584,6 +2595,9 @@ def test_flask_test_client_tldr_heals_count_past_lagging_hydrate(
     assert body["cached"] is False
     assert body["comment_count_live"] == 60
     assert body["comment_count_summarized"] == 40
+    # The counts clients should now show; feeds refetch on the new version.
+    assert (body["points"], body["comments"]) == (75, 60)
+    assert handler._current_counts_version() == counts_version + 1
     healed = db.get_story(grown_story.id)
     assert healed is not None
     assert healed.comment_count == 60
@@ -6537,3 +6551,76 @@ def test_failed_pointer_follow_backs_off_and_caches_article_summary(
     db.upsert_tldr_cache(43, "old-key", "Old summary")
     fallback = server._stale_tldr_fallback(db, 43, "busy")
     assert fallback is not None and fallback.payload["tldr"] == "Old summary"
+
+
+def test_hot_refresh_once_bumps_counts_version_only_on_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hot refresh probes the current pool's stories and tells clients
+    (``counts_version`` on /api/ranking-ready) only when a count moved."""
+    import pipeline
+    import pipeline.candidate_cache
+    import server
+
+    pool = (Story(7, "Hot", None, 1, int(time.time()), "t", comment_count=100),)
+    seen: list[tuple[Story, ...]] = []
+    changed: list[int] = [7]
+
+    def fake_refresh(
+        config: Config, db: Database, candidates: tuple[Story, ...]
+    ) -> tuple[int, list[int]]:
+        seen.append(candidates)
+        return 1, list(changed)
+
+    monkeypatch.setattr(
+        pipeline.candidate_cache, "cached_candidate_stories", lambda: pool
+    )
+    monkeypatch.setattr(pipeline, "refresh_hot_counts", fake_refresh)
+    before = Handler._current_counts_version()
+    assert server.hot_refresh_once(Config(), cast(Database, None)) == [7]
+    assert seen == [pool]
+    assert Handler._current_counts_version() == before + 1
+    changed.clear()
+    assert server.hot_refresh_once(Config(), cast(Database, None)) == []
+    assert Handler._current_counts_version() == before + 1
+
+
+def test_tldr_cache_misses_when_a_busy_thread_outgrew_its_summary(
+    test_env: Any,
+) -> None:
+    """Speculation must not keep serving a hot thread's summary once the
+    live count (hot refresh) grew past the growth threshold: a miss sends
+    the reader's open to tldr-detail, which refreshes and rewrites it."""
+    import server
+
+    _, db, _, handler, user = test_env
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+    story = Story(
+        id=4991,
+        title="Busy thread",
+        url=None,
+        score=400,
+        time=int(time.time() - 3600),
+        text_content="Busy thread. Comments.",
+        comment_count=183,
+        comment_count_at_fetch=183,
+        top_comments="Comments.",
+    )
+    db.upsert_story(story)
+    key = server._tldr_cache_key(
+        title=story.title, self_text="", top_comments="Comments.", article_body=""
+    )
+    db.upsert_tldr_cache(story.id, key, "Summary of 183 comments")
+    url = f"/api/tldr-cache/{story.id}"
+    assert client.get(url).get_json()["tldr"] == "Summary of 183 comments"
+    # 60 more comments: below max(183 // 3, 5) = 61, still current.
+    assert db.update_story_counts(story.id, 444, 243)
+    assert client.get(url).status_code == 200
+    assert db.update_story_counts(story.id, 450, 244)
+    assert client.get(url).status_code == 204
+    # An old thread's summary stays served however much it grew.
+    db.upsert_story(replace(story, id=4992, time=int(time.time() - 80 * 3600)))
+    db.upsert_tldr_cache(4992, key, "Old thread summary")
+    assert db.update_story_counts(4992, 450, 900)
+    assert client.get("/api/tldr-cache/4992").status_code == 200

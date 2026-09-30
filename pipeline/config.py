@@ -200,6 +200,11 @@ class Config:
     # user is already looking at this story. Miss/failure serves cached.
     # Kept small so cached taps stay snappy; 0 disables tap probing.
     tldr_tap_probe_timeout_seconds: float = 3.0
+    # Between hourly regens, refresh live points and comment counts
+    # (Firebase, no hydration or LLM) of the busiest young HN threads that
+    # pass the tldr_refresh_* gate. 0 disables either knob.
+    hot_refresh_interval_seconds: int = 600
+    hot_refresh_max_stories: int = 30
     # Public demo abuse limits. Cached TLDR hits bypass the uncached TLDR
     # quota; these limits protect only new enrichment/LLM work and vote writes.
     tldr_uncached_per_user_limit: int = 24

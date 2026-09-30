@@ -56,6 +56,26 @@ class Summary:
     text: str
     provisional: bool = False
     empty: bool = False
+    # Stored points/comments when the server just generated the summary:
+    # hydration can move them past what the feed showed.
+    points: int | None = None
+    comments: int | None = None
+
+
+@dataclass(frozen=True)
+class Readiness:
+    """`api/ranking-ready`: whether the awaited deck is ranked, the current
+    deck version, and the server's counts version (None from older servers),
+    which moves when stored points/comments change between decks."""
+
+    ready: bool
+    current: int
+    counts_version: int | None = None
+
+
+def _count(value: object) -> int | None:
+    """An optional non-negative count; anything else reads as absent."""
+    return value if type(value) is int and value >= 0 else None
 
 
 def normalize_server(value: str) -> str:
@@ -340,6 +360,8 @@ class API:
                 terminal_safe(value),
                 provisional=data.get("stale") is True or data.get("retryable") is True,
                 empty=data.get("empty") is True,
+                points=_count(data.get("points")),
+                comments=_count(data.get("comments")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise APIError(
@@ -364,7 +386,7 @@ class API:
                 "Vote result is uncertain; it will not be retried automatically."
             ) from exc
 
-    async def ready(self, target: int) -> tuple[bool, int]:
+    async def ready(self, target: int) -> Readiness:
         response = await self.request(
             "GET", f"api/ranking-ready?min_version={target}&target_version={target}"
         )
@@ -377,6 +399,6 @@ class API:
                 or type(data["ready"]) is not bool
             ):
                 raise ValueError("Invalid readiness")
-            return data["ready"], current
+            return Readiness(data["ready"], current, _count(data.get("counts_version")))
         except (KeyError, TypeError, ValueError) as exc:
             raise APIError("Invalid ranking status. Press r to refresh.") from exc

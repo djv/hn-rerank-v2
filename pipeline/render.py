@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+from collections.abc import Callable, Mapping, Sequence
 import time
 
 from datetime import datetime
@@ -10,7 +11,7 @@ from urllib.parse import urlparse
 
 from jinja2 import Environment, FileSystemLoader
 
-from database import Database
+from database import Database, StoryCounts
 from clients.tui.src.hn_rerank.models import (
     DEFAULT_WINDOW,
     FEED_API_VERSION,
@@ -145,7 +146,7 @@ BADGE_LEGEND: tuple[tuple[str, str], ...] = (
     ("💬", "Talk"),
     ("🤔", "Unsure"),
     ("✨", "Novel"),
-    ("🧭", "Interest"),
+    ("🎯", "Interest"),
 )
 
 
@@ -203,7 +204,7 @@ def _build_badges(item: RankedStory, *, hot_badge_percentile: int) -> list[FeedB
         badges.append(
             FeedBadge(
                 kind="interest",
-                icon="🧭",
+                icon="🎯",
                 label="Interest",
                 tooltip="Best story from one of your interests that Recommended misses",
             )
@@ -211,7 +212,9 @@ def _build_badges(item: RankedStory, *, hot_badge_percentile: int) -> list[FeedB
     return badges
 
 
-def _feed_story(item: RankedStory, *, hot_badge_percentile: int) -> FeedStory:
+def _feed_story(
+    item: RankedStory, *, hot_badge_percentile: int, counts: StoryCounts | None = None
+) -> FeedStory:
     story = item.story
     badges = _build_badges(item, hot_badge_percentile=hot_badge_percentile)
     return FeedStory(
@@ -220,8 +223,8 @@ def _feed_story(item: RankedStory, *, hot_badge_percentile: int) -> FeedStory:
         article_url=_web_url(story.url),
         comments_url=_web_url(story.discussion_url),
         source=story.source,
-        points=story.score,
-        comments=story.comment_count,
+        points=story.score if counts is None else counts.score,
+        comments=story.comment_count if counts is None else counts.comment_count,
         time=story.time,
         rank_score=item.score,
         badges=[badge.icon for badge in badges],
@@ -242,21 +245,33 @@ def build_feed(
     target: int,
     *,
     now: float | None = None,
+    live_counts: Callable[[Sequence[int]], Mapping[int, StoryCounts]] | None = None,
 ) -> Feed:
     """The `/api/feed` snapshot of one window of a deck as served at *now*
     (``serve_window``): its stories and each view's order, which is
     authoritative (Recommended and Explore by model score, Popular by HN
-    gravity; clients shuffle Explore themselves)."""
+    gravity; clients shuffle Explore themselves).
+
+    Points and comments come from *live_counts* when given: the deck's
+    stories are snapshots from the last pool build (hourly regen), and
+    counts refreshed since then (hot-thread refresh, TLDR hydration) live
+    only in the database. Order and badges stay as ranked."""
     views = serve_window(
         deck.window(window), window, time.time() if now is None else now
     )
     hot_badge_percentile = int(round(config.model.hot_badge_percentile))
+    items = views.stories()
+    stored = live_counts([item.story.id for item in items]) if live_counts else {}
     return Feed(
         FEED_API_VERSION,
         window,
         [
-            _feed_story(item, hot_badge_percentile=hot_badge_percentile)
-            for item in views.stories()
+            _feed_story(
+                item,
+                hot_badge_percentile=hot_badge_percentile,
+                counts=stored.get(item.story.id),
+            )
+            for item in items
         ],
         {name: [r.story.id for r in views.view(name)] for name in VIEWS},
         counts,
@@ -308,6 +323,7 @@ def generate_dashboard_bytes(
         raw_vote_counts,
         dashboard_version or 0,
         dashboard_latest_version or 0,
+        live_counts=db.get_story_counts,
     )
     template = env.get_template("index.html")
     html_content = template.render(

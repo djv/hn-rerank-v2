@@ -6,6 +6,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
+from collections.abc import Sequence
 from typing import Any, Literal, Generator, NamedTuple, TypeAlias
 from contextlib import contextmanager
 import queue
@@ -75,6 +76,15 @@ class SeedStoryState:
     id: int
     source: str
     has_top_comments: bool
+
+
+@dataclass(frozen=True)
+class StoryCounts:
+    """A story's stored points and comment count, read at serve time so
+    feeds show counts refreshed since the candidate pool was built."""
+
+    score: int
+    comment_count: int | None
 
 
 @dataclass(frozen=True)
@@ -759,6 +769,44 @@ class Database:
             )
             for row in rows
         }
+
+    def get_story_counts(self, ids: Sequence[int]) -> dict[int, StoryCounts]:
+        """Stored points and comment count for ``ids`` (absent ids omitted)."""
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        with self.conn() as conn:
+            rows = conn.execute(
+                f"SELECT id, score, comment_count FROM stories "
+                f"WHERE id IN ({placeholders})",
+                list(ids),
+            ).fetchall()
+        return {
+            int(row[0]): StoryCounts(
+                score=int(row[1] or 0),
+                comment_count=None if row[2] is None else int(row[2]),
+            )
+            for row in rows
+        }
+
+    def update_story_counts(
+        self, story_id: int, score: int, comment_count: int
+    ) -> bool:
+        """Set a story's live points and raise its comment count (never
+        lowered, as in ``upsert_story``). Returns whether the row changed."""
+        with self.conn() as conn:
+            with conn:
+                cursor = conn.execute(
+                    """
+                    UPDATE stories
+                    SET score = ?,
+                        comment_count = MAX(COALESCE(comment_count, 0), ?)
+                    WHERE id = ?
+                      AND (score != ? OR COALESCE(comment_count, 0) < ?)
+                    """,
+                    (score, comment_count, story_id, score, comment_count),
+                )
+                return cursor.rowcount > 0
 
     # HN explicit duplicate canonicalization cache
     @staticmethod

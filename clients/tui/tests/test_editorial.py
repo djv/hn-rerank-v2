@@ -597,7 +597,7 @@ async def test_badge_legend_hotkey_and_escape_restore_story() -> None:
             "💬 **Talk**",
             "🤔 **Unsure**",
             "✨ **Novel**",
-            "🧭 **Interest**",
+            "🎯 **Interest**",
         ):
             assert badge in legend
         app.rebuild()

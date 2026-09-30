@@ -51,7 +51,14 @@ from database import (
     Story,
     User,
 )
-from pipeline import Config, DEFAULT_ENV_PATH, Embedder, WindowDeck, is_hn_source
+from pipeline import (
+    Config,
+    DEFAULT_ENV_PATH,
+    Embedder,
+    WindowDeck,
+    hn_thread_looks_active,
+    is_hn_source,
+)
 from pipeline.ranking import serve_window
 from pipeline.ainews import AINEWS_SOURCE
 from pipeline.hn_dupes import pointer_thread_target
@@ -1671,6 +1678,9 @@ class Handler:
     _pool_generation: int = _boot_epoch_ms()
     _dashboard_versions: dict[int, int] = {}
     _dashboard_versions_guard = threading.Lock()
+    # Moves when stored points/comments change between pool builds (hot
+    # refresh, TLDR hydration); clients refetch the feed to show them.
+    _counts_version: int = 0
     _scheduler: WarmScheduler[int, User] | None = None
     _scheduler_guard = threading.Lock()
     _cold_deck: WindowDeck = WindowDeck()
@@ -1782,12 +1792,24 @@ class Handler:
             cls.db.count_feedback_by_action(user.id),
             view.version,
             view.current,
+            live_counts=cls.db.get_story_counts,
         )
 
     @classmethod
     def _dashboard_version(cls, user_id: int) -> int:
         with cls._dashboard_versions_guard:
             return cls._pool_generation + cls._dashboard_versions.get(user_id, 0)
+
+    @classmethod
+    def _current_counts_version(cls) -> int:
+        with cls._dashboard_versions_guard:
+            return cls._counts_version
+
+    @classmethod
+    def _bump_counts_version(cls) -> int:
+        with cls._dashboard_versions_guard:
+            cls._counts_version += 1
+            return cls._counts_version
 
     @classmethod
     def _bump_user_version(cls, user_id: int) -> int:
@@ -2591,29 +2613,18 @@ def _handle_flask_interaction_events(runtime: type[Handler]) -> Response:
         )
 
 
-def _hn_thread_looks_active(story: Story, config: Config, now: float) -> bool:
-    """Whether an HN story's comment thread is recent and busy enough to
-    warrant a forced real-time Algolia refresh in tldr-detail.
+def _hot_summary_is_stale(story: Story, config: Config, now: float) -> bool:
+    """Whether a busy young thread has grown well past the comments its
+    cached summary read (``_growth_threshold``; the hot refresh keeps
+    ``comment_count`` live between regens)."""
+    from pipeline import _growth_threshold
 
-    Prewarm's comment data comes from ClickHouse, which lags 1-24h behind
-    live HN for brand-new comments. Refreshing every view would be wasteful,
-    so this gates on: post age within a recent window, an absolute comment
-    floor (skip small threads), and comment velocity (comments/hour) above a
-    threshold — a proxy for "this thread is still actively accruing
-    comments right now," since the endpoint has no direct fetch-timestamp
-    signal to compare against.
-    """
-    if not is_hn_source(story.source):
-        return False
-    if story.time <= 0:
-        return False
-    age_hours = (now - story.time) / 3600.0
-    if age_hours <= 0 or age_hours > config.tldr_refresh_recent_hours:
-        return False
-    comment_count = story.comment_count or 0
-    if comment_count < config.tldr_refresh_min_comments:
-        return False
-    return (comment_count / age_hours) >= config.tldr_refresh_min_comments_per_hour
+    fetched = story.comment_count_at_fetch or 0
+    return (
+        fetched > 0
+        and hn_thread_looks_active(story, config, now)
+        and (story.comment_count or 0) - fetched >= _growth_threshold(fetched)
+    )
 
 
 def _tldr_tap_should_probe(story: Story, config: Config, now: float) -> bool:
@@ -2969,6 +2980,13 @@ def _generate_tldr_reply(
             # what the summarized comments actually reflect.
             story = replace(story, comment_count=live_comment_count)
             runtime.db.upsert_story(story)
+        stored = runtime.db.get_story_counts([story.id]).get(story.id)
+        if stored is not None and (stored.score, stored.comment_count) != (
+            tap.story.score,
+            tap.story.comment_count,
+        ):
+            # Feeds serve stored counts: tell clients to refetch.
+            runtime._bump_counts_version()
     elif isinstance(hn_updated, Exception):
         logging.error("Failed to dynamically fetch comments for TLDR: %r", hn_updated)
 
@@ -3083,6 +3101,9 @@ def _generate_tldr_reply(
         live_comment_count,
         story.comment_count_at_fetch,
     )
+    # Stored counts: hydration never lowers them, while Algolia's can lag
+    # the hot refresh's Firebase numbers.
+    stored = runtime.db.get_story_counts([story.id]).get(story.id)
     return _tldr_result_reply(
         runtime.db,
         story.id,
@@ -3090,6 +3111,8 @@ def _generate_tldr_reply(
         {
             "comment_count_live": live_comment_count,
             "comment_count_summarized": story.comment_count_at_fetch,
+            "points": stored.score if stored else story.score,
+            "comments": stored.comment_count if stored else story.comment_count,
         },
     )
 
@@ -3127,8 +3150,8 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
 
         # Recent, high-velocity HN threads bypass the cache hit below and the
         # dedicated "already cached" fast path, since CH prewarm data can be
-        # 1-24h stale for brand-new comments — see _hn_thread_looks_active.
-        needs_active_refresh = bool(story.top_comments) and _hn_thread_looks_active(
+        # 1-24h stale for brand-new comments — see hn_thread_looks_active.
+        needs_active_refresh = bool(story.top_comments) and hn_thread_looks_active(
             story, runtime.config, time.time()
         )
 
@@ -3284,6 +3307,7 @@ def _handle_flask_ranking_ready(runtime: type[Handler]) -> Response:
             "ok": True,
             "ready": view.version >= min_version,
             "current_version": view.current,
+            "counts_version": runtime._current_counts_version(),
         }
     )
 
@@ -3439,7 +3463,15 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
             top_comments=story.top_comments or "",
             article_body=story.article_body or "",
         )
-        cached = runtime.db.get_tldr_cache(story_id, key)
+        if _hot_summary_is_stale(story, runtime.config, time.time()):
+            # A miss, so opening the story asks tldr-detail, which refreshes
+            # the busy thread's comments and rewrites the summary.
+            logging.info(
+                "tldr_detail story_id=%s result=prefetch_cache_stale", story_id
+            )
+            cached = None
+        else:
+            cached = runtime.db.get_tldr_cache(story_id, key)
         response = (
             _cached_tldr_reply(cached, story_id, key, "prefetch_cache_hit").response()
             if cached
@@ -3563,6 +3595,40 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
             logging.exception("Background regeneration failed: %r", e)
 
 
+def hot_refresh_once(config: Config, db: Database) -> list[int]:
+    """Refresh live counts of the pool's busiest young HN threads; tell
+    clients (``counts_version``) when any stored count moved."""
+    from pipeline import rank_gate, refresh_hot_counts
+    from pipeline.candidate_cache import cached_candidate_stories
+
+    candidates = cached_candidate_stories()
+    rank_gate.wait_idle()
+    start = time.perf_counter()
+    probed, changed = refresh_hot_counts(config, db, candidates)
+    if changed:
+        Handler._bump_counts_version()
+    logging.info(
+        "hot_refresh probed=%s changed=%s ms=%.0f",
+        probed,
+        len(changed),
+        (time.perf_counter() - start) * 1000.0,
+    )
+    return changed
+
+
+def hot_refresh_loop(config: Config, db: Database) -> None:
+    """Between hourly regens, keep hot threads' points and comments live."""
+    interval = config.hot_refresh_interval_seconds
+    if interval <= 0:
+        return
+    while True:
+        time.sleep(interval)
+        try:
+            hot_refresh_once(config, db)
+        except Exception:
+            logging.exception("hot_refresh failed")
+
+
 def _quiet_third_party_loggers() -> None:
     """Silence third-party INFO/WARNING noise that isn't actionable.
 
@@ -3609,6 +3675,9 @@ def main() -> None:
     # Start regen thread
     t = threading.Thread(target=regen_loop, args=(config, regen_event, db), daemon=True)
     t.start()
+    threading.Thread(
+        target=hot_refresh_loop, args=(config, db), name="hot-refresh", daemon=True
+    ).start()
 
     # Start HTTP server
     server_host = "127.0.0.1"

@@ -195,3 +195,31 @@ def test_feed_serves_the_requested_window_only(tmp_path: Path) -> None:
     # The page embeds the default window.
     assert page_feed(client)["window"] == "1w"
     db.close()
+
+
+def test_feed_serves_stored_counts_not_the_deck_snapshot(tmp_path: Path) -> None:
+    """Decks hold story snapshots from the last pool build; points and
+    comments refreshed since (hot refresh, TLDR hydration) are served from
+    the DB by /api/feed and the page, while order stays as ranked."""
+    db = Database(str(tmp_path / "counts.db"))
+    Runtime = _runtime(db)
+    user = db.create_user("counts-user")
+    stored, unstored = _story(1, 3600), _story(2, 7200)
+    db.upsert_story(stored)
+    ranked = [
+        RankedStory(s, score=1.0, best_match_title="") for s in (stored, unstored)
+    ]
+    Runtime._cold_deck = WindowDeck({"1w": WindowViews(recommended=tuple(ranked))})
+    client = create_app(Runtime).test_client()
+    client.set_cookie("hn_token", user.token)
+    assert db.update_story_counts(1, 444, 218)
+
+    def counts(feed: Any) -> list[tuple[int, int, int]]:
+        return [(s["id"], s["points"], s["comments"]) for s in feed["stories"]]
+
+    feed = payload(client.get("/api/feed"))
+    # A story missing from the DB keeps its snapshot counts.
+    assert counts(feed) == [(1, 444, 218), (2, 20, 2)]
+    assert feed["orders"]["recommended"] == [1, 2]
+    assert counts(page_feed(client)) == counts(feed)
+    db.close()

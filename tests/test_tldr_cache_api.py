@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from database import Database, Story
+from pipeline import Config
 from server import Handler, _tldr_cache_key, create_app
 
 
@@ -13,6 +14,7 @@ def test_cache_only_endpoint_handles_misses_and_invalidated_inputs() -> None:
         pass
 
     Runtime.db = db
+    Runtime.config = Config()
     try:
         user = db.create_user("cache-reader")
         story = Story(-1, "Title", None, 0, 1, "Body", self_text="Body")

@@ -136,3 +136,74 @@ async def test_ranking_notice_clears_when_the_ready_deck_arrives() -> None:
         assert app.feed is not None and app.feed.ready
         assert "ranking updates" not in str(status.content)
         assert "shown" in str(status.content)
+
+
+async def test_counts_version_refetches_counts_and_keeps_the_open_summary() -> None:
+    """Between decks the server refreshes hot threads' counts: a new counts
+    version refetches the window only, shows the counts, keeps the open
+    summary, and forgets kept summaries of other stories that gained
+    comments so reopening asks the server again."""
+    fake = FakeServer()
+    fake.feed = sample_feed(2, 2)
+    fake.counts_version = 5
+    app = Reader(api=fake.api())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        await app.poll_feed_version()  # Records the baseline only.
+        await settle(pilot)
+        open_summary = app.summaries[1]
+        app.summaries[2] = "# Summary 2"
+        fake.requests.clear()
+        await app.poll_feed_version()
+        assert not fake.feed_requests()
+        fake.feed.stories[0] = replace(fake.feed.stories[0], points=444, comments=218)
+        fake.feed.stories[1] = replace(fake.feed.stories[1], comments=60)
+        fake.counts_version = 6
+        await app.poll_feed_version()
+        await settle(pilot)
+        assert fake.feed_requests() == ["1w"]
+        heading = str(app.query_one("#story-heading", Static).content)
+        assert "▲ 444" in heading and "💬 218" in heading
+        assert app.summaries[1] == open_summary
+        assert "Summary 1" in app.query_one("#summary", Markdown).source
+        assert 2 not in app.summaries
+
+
+async def test_generated_summary_counts_update_the_row_and_heading() -> None:
+    """r regenerates the summary from freshly fetched comments; the counts
+    that came with it show at once instead of at the next deck."""
+
+    class CountingServer(FakeServer):
+        async def __call__(self, request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/api/tldr-detail"):
+                self.requests.append(request)
+                story_id = json.loads(request.content)["story_id"]
+                return httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "tldr": f"# Fresh {story_id}",
+                        "points": 444,
+                        "comments": 218,
+                    },
+                )
+            return await super().__call__(request)
+
+    fake = CountingServer()
+    app = Reader(api=fake.api())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        app.query_one(OptionList).focus()
+        await pilot.press("r")
+        await settle(pilot)
+        selected = app.selected()
+        assert selected is not None and (selected.points, selected.comments) == (
+            444,
+            218,
+        )
+        heading = str(app.query_one("#story-heading", Static).content)
+        assert "▲ 444" in heading and "💬 218" in heading
+        row = app.query_one(OptionList).get_option(str(selected.id)).prompt
+        assert "444" in str(row) and "218" in str(row)
+        assert app.feed is not None
+        assert {(s.id, s.points) for s in app.feed.stories} >= {(selected.id, 444)}

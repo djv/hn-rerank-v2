@@ -14,7 +14,7 @@ from types import SimpleNamespace
 from hypothesis import HealthCheck, given, settings, strategies as st
 from collections.abc import Iterator
 
-from database import Database, HnDupeResolution, Story
+from database import Database, HnDupeResolution, Story, StoryCounts
 from dataclasses import replace
 import pipeline
 import pipeline.ranking as ranking
@@ -2052,6 +2052,13 @@ async def test_fetch_candidates_ch_live_window_updates_existing_score(
     assert story is not None
     assert story.score == 999
     assert any(s.id == 99 for s in candidates)
+
+    # A lagging CH snapshot never pulls fresher counts (hot refresh, TLDR
+    # hydration) back down.
+    ch_window[0] = {**ch_window[0], "points": 900, "num_comments": 3}
+    candidates, _ = await fetch_candidates(config, set(), set(), db)
+    assert db.get_story_counts([99]) == {99: StoryCounts(score=999, comment_count=5)}
+    assert [(s.score, s.comment_count) for s in candidates if s.id == 99] == [(999, 5)]
 
 
 @pytest.mark.asyncio
@@ -7915,3 +7922,102 @@ async def test_fetch_candidates_survives_ainews_failure(
     monkeypatch.setattr(pipeline, "fetch_ainews_stories", boom)
     candidates, count = await fetch_candidates(config, set(), set(), db)
     assert count == len(candidates)
+
+
+async def test_probe_live_items_reads_points_and_descendants(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hot refresh needs live points as well as descendants; a deleted
+    item (null body) reads as no points and no comments, bad bodies skip."""
+    import httpx
+    from pipeline import LiveCounts, _probe_live_items
+
+    now = time.time()
+    stories = [_probe_story(i, now=now) for i in (1, 2, 3)]
+    bodies: dict[int, object] = {
+        1: {"score": 444, "descendants": 218},
+        2: None,
+        3: {"score": "many", "descendants": 5},
+    }
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, body: object) -> None:
+            self._body = body
+
+        def json(self) -> object:
+            return self._body
+
+    class FakeClient:
+        def __init__(self, *, timeout: float) -> None:
+            pass
+
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        async def get(self, url: str) -> FakeResponse:
+            return FakeResponse(bodies[int(url.split("/item/")[1].split(".json")[0])])
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    assert await _probe_live_items(stories, 5.0) == {
+        1: LiveCounts(score=444, descendants=218),
+        2: LiveCounts(score=None, descendants=0),
+    }
+
+
+def test_refresh_hot_counts_updates_the_busiest_young_threads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Between regens the pool's counts are snapshots: rank young HN threads
+    by their stored comments/hour, probe the fastest within the cap, and
+    store live points and (never lower) comment counts."""
+    from pipeline import Config, LiveCounts, refresh_hot_counts
+
+    now = time.time()
+    db = Database(":memory:")
+    try:
+        pool = [
+            _probe_story(1, now=now, age_h=1.0, count=165),  # 165/h
+            _probe_story(2, now=now, age_h=5.0, count=100),  # 20/h in the pool
+            _probe_story(3, now=now, age_h=80.0, count=900),  # too old
+            _probe_story(4, now=now, age_h=10.0, count=40),  # 4/h: too slow
+            _probe_story(5, now=now, age_h=2.0, count=60),  # 30/h
+            _probe_story(6, now=now, age_h=1.0, count=500, source="rss"),
+        ]
+        for s in pool:
+            db.upsert_story(s)
+        # Since the pool was built, story 2 got busier (80/h) than story 5.
+        assert db.update_story_counts(2, 10, 400)
+        probed: list[int] = []
+        live = {
+            1: LiveCounts(score=444, descendants=218),
+            2: LiveCounts(score=12, descendants=350),
+        }
+
+        async def fake_probe(
+            stories: list[Story], timeout_s: float
+        ) -> dict[int, LiveCounts]:
+            probed.extend(s.id for s in stories)
+            return {s.id: live[s.id] for s in stories if s.id in live}
+
+        monkeypatch.setattr(pipeline, "_probe_live_items", fake_probe)
+        config = Config(hot_refresh_max_stories=2)
+        assert refresh_hot_counts(config, db, pool, now=now) == (2, [1, 2])
+        assert probed == [1, 2]
+        assert db.get_story_counts([1, 2, 5]) == {
+            1: StoryCounts(score=444, comment_count=218),
+            2: StoryCounts(score=12, comment_count=400),
+            5: StoryCounts(score=10, comment_count=60),
+        }
+        # Nothing moved since: no change to report.
+        assert refresh_hot_counts(config, db, pool, now=now) == (2, [])
+        assert refresh_hot_counts(Config(hot_refresh_max_stories=0), db, pool) == (
+            0,
+            [],
+        )
+    finally:
+        db.close()
