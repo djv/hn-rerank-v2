@@ -121,8 +121,9 @@ old profile, stopped 2026-09-24): ranking quality and which sources feed it.
 - Open review items (FINDINGS.md "Code review — 2026-09-30"): AINews
   shared-tweet cards, prose-reply retry for Responses-API providers, tweet
   `internal_exception` backoff. CH quota, pointer-follow race and
-  live-window retry fixed 2026-09-30 (WORKLOG); check the next regen logs
-  "prewarmed N/M" with M near the real new/grown count, not ~330.
+  live-window retry fixed 2026-09-30 (`bd2eaae`, live 07:03 UTC): the first
+  regen prewarmed 7/45 HN stories (was 5-8/~330 hourly), no warnings. Not
+  smoke-tested over HTTP (a cookie-less `GET /` creates a profile).
 - Open TLDR gaps: raw PDF stored as article text (46108780 fails);
   archive dupe cards not swapped by dupe resolver (live `hn` only).
 - Optional low value: embedding queue (jina-v5-nano, mdbr-leaf-mt, KaLM-mini)
