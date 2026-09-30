@@ -5,6 +5,17 @@ Improve what the dashboard shows the user (live profile 151; user 1 is the
 old profile, stopped 2026-09-24): ranking quality and which sources feed it.
 
 ## Verified result
+- Live `fcbfc9a` (2026-09-30 21:55 UTC, restart): hot threads' points and
+  comments stay live between regens (feeds read stored counts; a 10-min
+  Firebase refresh of the 30 busiest young HN threads, no LLM;
+  `counts_version` makes the TUI refetch; a generated TLDR reply carries
+  counts, so `r` shows them). Interest badge icon is 🎯 again. First run
+  22:05: `hot_refresh probed=20 changed=18 ms=729`; /api/feed showed
+  49913571 at 667/412, equal to Firebase. Dashboard 200 (0.28 s), legend
+  🎯 Interest, tldr-cache 204 for the outgrown Argon summary, uncached
+  TLDR 5.3 s, no journal errors. The TUI needs a restart for the new
+  client. Not yet seen: the TUI refetching on a counts_version change live.
+  Tests 1023, TUI 158, browser, ruff, ty pass.
 - Live `34051df` (2026-09-30 20:33 UTC, restart): 🧭 Interest replaces 🎯
   Similar; impressions log badge kinds in the new
   `interaction_events.badges` column (added on start, verified). After the
@@ -112,6 +123,9 @@ old profile, stopped 2026-09-24): ranking quality and which sources feed it.
   shown). FINDINGS.md "Feed yield check — 2026-09-29".
 
 ## Blocker / limits
+- The TLDR discussion call fails intermittently (`tldr: discussion call
+  failed (status=None), salvaging article-only`: 54 times in 2 days, also
+  before `fcbfc9a`); the partial summary is not cached. Cause not checked.
 - Gemma side by side is not live and would need gemma on the VPS.
 - Blend gain is unconfirmed (flat on the newest 20%).
 - Go limit resets 2026-10-06 16:28 UTC: then set `LLM_PROVIDER=gospark`
@@ -126,7 +140,7 @@ old profile, stopped 2026-09-24): ranking quality and which sources feed it.
 
 ## Next step
 - Explore badges (user, 2026-09-30): Unsure stays until ~2026-10-14, then
-  keep or drop it (and judge Novel, 🧭 Interest) from the per-badge upvote
+  keep or drop it (and judge Novel, 🎯 Interest) from the per-badge upvote
   rates in `interaction_events.badges`. Offline, Unsure's votes taught the
   ranker no more than random ones (FINDINGS.md "Do Unsure votes teach...").
 - Parked (user, 2026-09-30): title-based matching for "Because you
