@@ -1,5 +1,42 @@
 # HN Rerank findings
 
+## Code review — 2026-09-30
+
+Three review agents over 45882a2..9f97224 (server/TLDR/CH, ranking/eval,
+TUI/AINews). Fixed (WORKLOG 2026-09-30): pointer-follow retries and stale
+fallback, pointer false positives, eval double blend and dense-model
+mismatch, blend at the 20/20 gate, unbounded blend caches, AINews regen
+abort, TUI `a` guard, tmux agent check, status tail.
+
+- Eval mismatch, confirmed: `prodlr`'s dense logreg had 5 meta columns
+  (live: the SVM's 10, plus zero rows for absent classes) and took C from
+  `svm_c`. C matched only while config.toml had `svm_c = 0.1`, i.e. for
+  every run before 26b9474; the columns never matched. So the reported
+  prodlr numbers measured an approximation of the dense part; the TF-IDF
+  part matched live. Now `prodlr[svm_c=4;lr_weight=0.2;tfidf_weight=0.3]`
+  equals the live blend exactly for a heavy voter (test). Not rerun yet.
+- Pointer rule recheck against the live DB: 373 HN stories with 1-2
+  comments but several stored comments (the followed signature). Algolia
+  source threads: 109 match the committed rule, the rest do not or are
+  missing. A first tighter draft rejected 5 real pointers ("Discussed 2
+  days ago with 280 comments: <link>", "Previous discussion 11 days ago:
+  <link>"), so "discussion" is now rejected only when followed by
+  "of/about" something other than this/it. Final rule: all 109 still
+  match; none of the live follows was a misfire.
+- ClickHouse playground quota: 21:43 and 21:54 UTC 2026-09-29, prewarm
+  hit `queries_per_normalized_hash = 101/100` per hour during repeated
+  restarts (each restart prewarms; the comment walk is one query per
+  level per chunk). None after the 22:06 restart. Not fixed.
+- Open, not fixed: prefetch's follow can overwrite comments a concurrent
+  hydration just wrote; live-window retry also retries deterministic
+  errors (up to ~100 s of blocking httpx in the async regen); prose-reply
+  retry never fires for Responses-API providers (`finish=None`); tweet
+  `internal_exception` skips backoff; `_build_story_kids_query` filters
+  `deleted/dead` per row version; AINews cards sharing a tweet rebuild
+  each other partially, capped cards never refill, two topics leading
+  with the same tweet collapse in render dedup; warm start makes fits
+  depend on history (max 0.005 difference in P(up) - P(down)).
+
 ## Rerank latency — 2026-09-29
 
 - Before: `linear_blend_fit_ms` 5-18 s per vote (19:50-20:41 UTC, 10k
