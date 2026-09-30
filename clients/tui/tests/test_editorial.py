@@ -289,7 +289,10 @@ async def test_empty_and_error_recovery() -> None:
         app.action_vote("up")
         await settle(pilot)
         assert app.query_one("#status").has_class("error")
-        assert "check before voting" in str(app.query_one("#status", Static).content)
+        # Too long for 100 columns: cut in the middle, both ends readable.
+        shown = str(app.query_one("#status", Static).content)
+        assert shown.startswith("✗ Vote not confirmed") and "…" in shown
+        assert shown.endswith("Press r to refresh; votes are not retried.")
         app.query_one("#window", Select).value = "12h"
         app.query_one("#sort", Select).value = "popular"
         await settle(pilot)
@@ -641,6 +644,24 @@ async def test_narrow_footer_fits_error_and_zoom_shortcuts() -> None:
         assert status.height == 1
         assert status.bottom <= hints.y
         assert hints.bottom <= footer.bottom
+        # The cut is in the middle: what to do next stays readable.
+        app.status("Vote not confirmed by the server. " * 3 + "Press r to retry.")
+        await pilot.pause()
+        shown = str(app.query_one("#status", Static).content)
+        assert shown.startswith("Vote not confirmed") and "…" in shown
+        assert shown.endswith("Press r to retry.")
+        assert len(shown) <= 51 - 2
+
+
+def test_fit_middle_keeps_both_ends_within_width() -> None:
+    from hn_rerank.app import _cell_len, fit_middle
+
+    assert fit_middle("short", 20) == "short"
+    cut = fit_middle("Could not save the vote on story 12345. Press r to retry.", 30)
+    assert _cell_len(cut) <= 30
+    assert cut.startswith("Could not") and cut.endswith("r to retry.")
+    wide = fit_middle("🔥" * 30, 21)
+    assert _cell_len(wide) <= 21 and "…" in wide
 
 
 def test_theme_follows_local_hour() -> None:

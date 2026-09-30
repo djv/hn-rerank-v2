@@ -791,6 +791,7 @@ def test_open_agent_session_splits_the_readers_tmux_pane(
     monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,1,0")
     monkeypatch.setenv("TMUX_PANE", "%7")
     monkeypatch.delenv("HN_RERANK_AGENT", raising=False)
+    monkeypatch.setattr("shutil.which", lambda name: f"/opt/bin/{name}")
     monkeypatch.setattr(
         "subprocess.run",
         lambda argv, **k: calls.append(argv) or subprocess.CompletedProcess(argv, 0),
@@ -799,11 +800,11 @@ def test_open_agent_session_splits_the_readers_tmux_pane(
     assert app_module.open_agent_session(prompt) is True
     assert calls == [
         ["tmux", "split-window", "-h", "-c", str(Path.home()), "-t", "%7"]
-        + ["claude", prompt]
+        + ["/opt/bin/claude", prompt]
     ]
     monkeypatch.setenv("HN_RERANK_AGENT", "claude --model opus")
     app_module.open_agent_session("p")
-    assert calls[-1][-4:] == ["claude", "--model", "opus", "p"]
+    assert calls[-1][-4:] == ["/opt/bin/claude", "--model", "opus", "p"]
 
 
 def test_open_agent_session_fails_outside_tmux_or_on_error(
@@ -823,8 +824,16 @@ def test_open_agent_session_fails_outside_tmux_or_on_error(
         raise subprocess.CalledProcessError(1, argv)
 
     monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,1,0")
+    monkeypatch.setattr("shutil.which", lambda name: f"/opt/bin/{name}")
     monkeypatch.setattr("subprocess.run", fail)
     assert app_module.open_agent_session("p") is False
+
+    # No agent on PATH: tmux would open a pane that closes at once and still
+    # exit 0, so do not split at all (the caller copies the prompt instead).
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.setattr("subprocess.run", lambda argv, **k: calls.append(argv))
+    assert app_module.open_agent_session("p") is False
+    assert calls == []
 
 
 async def test_a_opens_claude_with_story_links_else_copies_prompt(
@@ -868,6 +877,13 @@ async def test_a_opens_claude_with_story_links_else_copies_prompt(
         assert "copied the Claude prompt" in str(
             app.query_one("#status", Static).content
         )
+        # A focused dropdown owns the keys: `a` must not open a pane.
+        count = len(sessions)
+        app.query_one("#window", Select).focus()
+        await pilot.pause()
+        await pilot.press("a")
+        await pilot.pause()
+        assert len(sessions) == count
 
 
 def test_copy_with_system_tool_skips_failing_tools(

@@ -263,11 +263,18 @@ def open_agent_session(prompt: str) -> bool:
     tmux or on failure."""
     import os
     import shlex
+    import shutil
     import subprocess
 
     if not os.environ.get("TMUX"):
         return False
     agent = shlex.split(os.environ.get("HN_RERANK_AGENT", "")) or ["claude"]
+    # tmux reports success even when the pane's command cannot start (the
+    # pane just closes), so resolve it here, on the reader's PATH.
+    executable = shutil.which(agent[0])
+    if executable is None:
+        return False
+    agent[0] = executable
     # With several arguments tmux runs the command directly, so the prompt
     # needs no shell quoting.
     command = ["tmux", "split-window", "-h", "-c", str(Path.home())]
@@ -350,6 +357,26 @@ def _cell_len(text: str) -> int:
     return sum(
         2 if unicodedata.east_asian_width(char) in ("W", "F") else 1 for char in text
     )
+
+
+def fit_middle(text: str, width: int) -> str:
+    """*text* in at most *width* cells, cut from the middle with `…`: the
+    start names what happened, the end often says what to do."""
+    if _cell_len(text) <= width or width < 8:
+        return text
+    tail_budget = (width - 1) * 3 // 5
+    head_budget = width - 1 - tail_budget
+    head = ""
+    for char in text:
+        if _cell_len(head + char) > head_budget:
+            break
+        head += char
+    tail = ""
+    for char in reversed(text):
+        if _cell_len(char + tail) > tail_budget:
+            break
+        tail = char + tail
+    return head.rstrip() + "…" + tail.lstrip()
 
 
 def _pad_cells(text: str, width: int) -> str:
@@ -810,6 +837,7 @@ class Reader(App[None]):
                 "refresh",
                 "open_url",
                 "copy_url",
+                "dig_deeper",
                 "cycle_sort",
                 "cycle_window",
             }
@@ -818,11 +846,14 @@ class Reader(App[None]):
     def status(self, message: str, *, error: bool = False) -> None:
         """Show a transient message; context_status() restores the counts line."""
         self.status_mode = "error" if error else "message"
+        text = ("✗ " if error else "") + message
         widget = self.query_one("#status", Static)
-        widget.update(("✗ " if error else "") + message)
         widget.set_class(error, "error")
         widget.set_class(False, "context")
-        self.fit_footer(status=("✗ " if error else "") + message)
+        self.fit_footer(status=text)
+        # The row is the full width once stacked; cut the middle so the
+        # subject and an actionable tail ("Press r to retry.") both survive.
+        widget.update(fit_middle(text, self.size.width - 2))
 
     def context_status(self) -> None:
         """Counts line for the current filter; only replaces an earlier counts line."""
