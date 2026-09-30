@@ -11,8 +11,8 @@ old profile, stopped 2026-09-24): ranking quality and which sources feed it.
   abort, three TUI bugs. Tests, ruff, ty and TUI tests pass. The tighter
   pointer rule still matches all 109 live follows. Live on the VPS since
   `28ddde5` (01:21 UTC 2026-09-30): dashboard 200, cached TLDR 0.4 s,
-  uncached 14 s, no journal warnings. Not yet seen live: a rerank and a
-  regen (AINews guard) after the restart.
+  uncached 14 s, no journal warnings. Since then hourly regens and 151's
+  reranks (3-46 s) run clean; AINews fetched tweets again at 06:27.
 - Linear blend live on the VPS since `26b9474` (2026-09-29 17:17 UTC):
   `svm_c = 4.0`, `linear_blend_enabled = true` (0.5 production + 0.2 dense
   LR + 0.3 TF-IDF LR). Rerank after a vote (live `371a2bd`, 21:43-21:48
@@ -106,19 +106,22 @@ old profile, stopped 2026-09-24): ranking quality and which sources feed it.
   snapshots and merged copies live in `~/.local/state/hn-rerank-eval/`.
 
 ## Next step
-- Judge the live blend on new votes from 151 (up rate on shown stories
-  before/after 17:17 UTC 2026-09-29). Rollback: `linear_blend_enabled =
-  false`, `svm_c = 0.1` in `config.toml`, deploy, restart.
-- Rerun the blend eval with the fixed `prodlr` (live dense model) against
-  `prod[svm_c=0.1;linear_blend_enabled=false]`, full and newest-20%.
-- Regen embeds 10-29 texts after the 22:06 restart (checked 2026-09-30),
-  not ~50. If reranks drift above ~10 s, lower `recent_candidate_hn_limit`.
+- **Embed-model hill-climb paused** (2026-09-30 15:28 UTC): Qwen3-0.6B small
+  test killed by memory pressure (685MB encoder, 11.5GB/11.5GB used); did not
+  reach checkpoint at 200 stories. harrier-270m small test: P@12 0.389 vs best
+  0.556, AUC 0.708 vs best 0.720 (not promising alone). Both deferred pending
+  memory recovery. Do not restart without explicit ask.
+- Live blend, first read (2026-09-30, 186 new votes from 151): HN up rate on
+  shown flat (10.0% -> 8.9%); the overall drop (13.8% -> 10.4%) is old
+  RSS/Archive stories; not significant, no rollback. Re-read after ~200 more
+  shown HN stories. Rollback: `linear_blend_enabled = false`, `svm_c = 0.1`
+  in `config.toml`, deploy, restart. FINDINGS.md "Live blend, first read".
+- Rerun the blend eval with fixed `prodlr` (live dense model, 10 SVM columns)
+  against `prod[svm_c=0.1;linear_blend_enabled=false]`, full and newest-20%.
 - Open review items (FINDINGS.md "Code review — 2026-09-30"): CH playground
   quota on repeated restarts, prefetch/hydration comment race, live-window
   retry on deterministic errors, AINews shared-tweet cards.
-- Open TLDR gaps: a raw PDF stored as article text (46108780 fails);
-  archive dupe cards are not swapped by the dupe resolver (live `hn` only).
-- After ~100 new votes: compare 151's up rate on shown stories before and
-  after the merge (`scripts/source_yield_report.py --user-id 151`).
-- Optional, low value: embedding queue (jina-v5-nano, mdbr-leaf-mt,
-  Qwen3-0.6B, KaLM-mini), all without instruct prefixes.
+- Open TLDR gaps: raw PDF stored as article text (46108780 fails);
+  archive dupe cards not swapped by dupe resolver (live `hn` only).
+- Optional low value: embedding queue (jina-v5-nano, mdbr-leaf-mt, KaLM-mini)
+  only if memory pressure resolves and small-test AUC > 0.01 above best.

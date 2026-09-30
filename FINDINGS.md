@@ -1,5 +1,45 @@
 # HN Rerank findings
 
+## Live blend, first read — 2026-09-30
+
+Profile 151, stories by first impression (read-only on the VPS DB at 06:55
+UTC; last 151 vote 01:04). Blend live since 2026-09-29 17:17 UTC.
+
+| period | shown | up | up/shown | up/voted |
+|---|---|---|---|---|
+| 09-22..25 | 287 | 61 | 21.3% | 26.3% |
+| 09-26..merge (09-29 14:01) | 420 | 58 | 13.8% | 19.6% |
+| merge, no blend | 65 | 10 | 15.4% | 20.0% |
+| blend | 211 | 22 | 10.4% | 15.1% |
+
+By source since 09-26 (pre vs blend): HN 10.0% (269) vs 8.9% (101); RSS and
+other 19.0% (216) vs 11.8% (110), with mean story age at impression 132 ->
+286 days (Archive-window browsing). The drop is in old non-HN stories, not
+in the ranked HN deck, and pre vs blend is not significant (z ~ 1.2). The up
+rate was already falling before the blend (21% -> 14%). Verdict: no evidence
+either way; no rollback. Note that SQLite compares `strftime` text above any
+number unless cast (`CAST(strftime('%s', ...) AS INT)`).
+
+## Embedding model hill-climb paused — 2026-09-30
+
+Setup: `encode_replay_embeddings.py --device gpu`, small test (300 votes/class,
+3 folds), vs stored + gemma best (step 10: P@12 0.556, AUC 0.721, n.s. on
+P@12 but 7/8 folds better AUC).
+
+- **harrier-270m** (Microsoft 2026-03-30, Gemma 3, MMTEB 66.5/69.0): GPU f32
+  encoding 0.65 s/story (no NaN at f16 after fixing RMSNorm overflow with
+  ACTIVATIONS_SCALE_FACTOR=8+); small test P@12 0.389 (vs best 0.556, n.s.),
+  AUC 0.708 (vs best 0.720, n.s.). Not promising alone. Included in full-eval
+  reject list (status).
+- **Qwen3-0.6B** (Alibaba 2026-09, 768-d, decode-embed, no instruct):
+  Encoding batch 8 on GPU, 900-story sample (300/class). Process killed by
+  system memory pressure 15:28 UTC at story ~100 (685MB encoder + 10GB
+  background, 11.5GB total). Did not reach checkpoint at 200 stories; no
+  partial reuse. Deferred pending memory recovery (3GB free now).
+
+Both models hit CPU/GPU constraints or memory limits on the laptop. None beat
+step 10. Hill-climb paused until memory stability confirmed.
+
 ## Code review — 2026-09-30
 
 Three review agents over 45882a2..9f97224 (server/TLDR/CH, ranking/eval,
