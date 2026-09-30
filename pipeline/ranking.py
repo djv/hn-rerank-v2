@@ -341,6 +341,8 @@ class RankedStory:
     story: Story
     score: float
     best_match_title: str
+    # Similarity to that upvoted story (0 when there is none).
+    best_match_sim: float = 0.0
     prob_down: float | None = None
     prob_neutral: float | None = None
     prob_up: float | None = None
@@ -1993,6 +1995,29 @@ def rerank_candidates(
 # Minimum closest-up similarity for showing an attribution. A bogus
 # "because you upvoted X" on a weak match is worse than none.
 ATTRIBUTION_MIN_SIM = 0.35
+# Badged cards (Hot/Top/Talk/Unsure/Novel) are in the deck for popularity
+# or exploration, not for resembling an upvote, and full-text similarity to
+# the nearest upvote is 0.6-0.8 for most loosely related stories (median
+# 0.77 on profile 151's 1w deck, 2026-09-30). They name one only on a close
+# match: 0.85 was picked by eye on that deck, just above the clear misses
+# (0.64-0.81); good and bad matches overlap, so it trades some good lines
+# for no bad ones. Similar (🎯) is a similarity badge, so it keeps the floor.
+BADGED_ATTRIBUTION_MIN_SIM = 0.85
+
+
+def card_attribution(r: RankedStory) -> str:
+    """The attribution a card shows, given its badges from every view
+    (``WindowViews.stories``)."""
+    badged = (
+        r.is_hot
+        or r.is_high_engagement
+        or r.is_discussion_rich
+        or r.is_uncertain
+        or r.is_novel
+    )
+    if badged and r.best_match_sim < BADGED_ATTRIBUTION_MIN_SIM:
+        return ""
+    return r.best_match_title
 
 
 def _fill_best_match_titles(
@@ -2018,22 +2043,19 @@ def _fill_best_match_titles(
     closest_up_idx = score_context.cand_closest_up_idx
     closest_up = score_context.cand_closest_up
 
-    def title_for(story_id: int) -> str:
+    def match_for(story_id: int) -> tuple[str, float]:
         row = row_of.get(story_id)
         if row is None:
-            return ""
+            return "", 0.0
         fb_row = int(closest_up_idx[row])
-        if (
-            0 <= fb_row < len(titles)
-            and float(closest_up[row]) >= ATTRIBUTION_MIN_SIM
-            and titles[fb_row]
-        ):
-            return titles[fb_row]
-        return ""
+        sim = float(closest_up[row])
+        if 0 <= fb_row < len(titles) and sim >= ATTRIBUTION_MIN_SIM and titles[fb_row]:
+            return titles[fb_row], sim
+        return "", 0.0
 
     def fill(r: RankedStory) -> RankedStory:
-        title = title_for(r.story.id)
-        return replace(r, best_match_title=title) if title else r
+        title, sim = match_for(r.story.id)
+        return replace(r, best_match_title=title, best_match_sim=sim) if title else r
 
     return deck.map_views(lambda _w, _v, items: (fill(r) for r in items))
 

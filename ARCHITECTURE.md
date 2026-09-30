@@ -311,7 +311,13 @@ authoritative, nothing is derived from badge flags.
 populated from the already-computed KNN argmax (`cand_closest_up_idx` → the
 nearest upvoted feedback title, no new matmul), shown only when the max
 similarity clears `ATTRIBUTION_MIN_SIM=0.35`. A weak-match attribution is
-worse than none, so cold users and sub-threshold cards show nothing.
+worse than none, so cold users and sub-threshold cards show nothing. Cards
+with a Hot/Top/Talk/Unsure/Novel badge from any view of their window need
+`BADGED_ATTRIBUTION_MIN_SIM=0.85` (`card_attribution`, applied when the feed
+is built): they are there for popularity or exploration, and full-text
+similarity to the nearest upvote is 0.6-0.8 for most loosely related pairs
+(the text includes comments), so 0.35 let through matches like "Ubuntu
+26.04.1" <- "NInfer Qwen … RTX 5090" (0.70). Similar (🎯) keeps 0.35.
 ### 3.5 Swipe Deck & Warm Refill
 The dashboard has a **Sort** (Recommended/Popular/Explore, side-rail tabs) and a **time window** (a dropdown: 12 hours, 1 day, 1 week, 1 month, Archive) that applies to all three sorts; each client reopens on the window last picked (web: `localStorage` `hnWindow`, switched to right after the embedded 1-week feed loads; terminal: a `window` file next to its `profile.json`), 1 week when nothing is saved; the Date sort and the Recent/Archive tabs were removed on 2026-09-28. Only one story card is visible at a time, and its TLDR opens automatically. The first few TLDRs for the active mode are prefetched immediately so advancing is usually instant. Keys match the terminal client (since 2026-09-26): `j`/`k` next/previous story, `1`/`2`/`3` upvote/neutral/downvote, `u` undo, `o`/`c` open article/comments, `y` copy the comments link (article link if none), `r` refresh (reload the deck and regenerate the open summary), `s`/`l` next sort, `h` previous sort, `?` the key overview, `d`/`D` (Shift+D) the next/previous time window; web-only `b` the side panel and `f` fullscreen. Arrow keys scroll inside the open TLDR. The global `keydown` guard only blocks text-input controls (`input`, `textarea`, `select`, `[contenteditable]`) and modifier-accelerated keys (`Ctrl`/`Cmd`/`Alt`); `<button>` and `<a>` focus does not suppress shortcuts. There is no source filter (the `Mixed`/`HN`/`Non-HN` selector stays disabled; interaction events record `source_filter=mixed`).
 

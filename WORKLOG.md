@@ -1,5 +1,26 @@
 # Worklog: hn-rewrite
 
+## 2026-09-30 "Because you upvoted" needs a close match on badged cards
+
+- Report: story 49908757 ("Ubuntu 26.04.1 LTS") said "Because you upvoted:
+  NInfer Qwen 3.8-27B … RTX 5090". Its nearest upvote by full-text embedding
+  scored 0.70, with the next seven at 0.63-0.67. On profile 151's 1w deck the
+  nearest-upvote similarity has median 0.77 and a median lead over the
+  runner-up of 0.015, so the 0.35 floor passed 42/47 cards, many incoherent
+  (SR-71A <- "Things we learned about LLMs in 2024"). The embedded text holds
+  up to 6000 chars of comments, which mostly drift to AI/hardware.
+- Title-only embeddings matched far better in a read-only check (creatine <-
+  creatine 0.84; Ubuntu's best 0.33), but the user chose the smaller change:
+  cards with a Hot/Top/Talk/Unsure/Novel badge name an upvote only at
+  similarity >= 0.85 (`BADGED_ATTRIBUTION_MIN_SIM`, `card_attribution` in
+  `build_feed`; `RankedStory.best_match_sim` carries the value). 0.85 was
+  picked by eye on that deck, just above the clear misses (0.64-0.81); good
+  and bad matches overlap (creatine 0.69 good, "Withdrawal phase" 0.88
+  weak), so no cutoff separates them cleanly. On the same
+  deck 22 of 42 attributions stay; all the clear misses go, as does "Prompting
+  Claude Opus 5.5" <- "Claude Opus 5" (0.82). Unbadged and Similar cards keep
+  0.35.
+
 ## 2026-09-30 TUI: feed names, no fake zero counts, why-ranked line, wait counter
 
 - Headlines name a non-HN story's feed (`source_label`) instead of the linked

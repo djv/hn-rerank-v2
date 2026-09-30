@@ -7200,6 +7200,55 @@ def test_fill_best_match_titles_happy_path() -> None:
         ctx,
     )
     assert [r.best_match_title for r in out] == ["Up A", "Up B", "Up A"]
+    assert [r.best_match_sim for r in out] == pytest.approx([0.9, 0.8, 0.9])
+
+
+def test_badged_cards_name_an_upvote_only_on_a_close_match() -> None:
+    """Hot/Top/Talk/Unsure/Novel cards are there for popularity or
+    exploration: they name an upvote only at BADGED_ATTRIBUTION_MIN_SIM,
+    even when the match comes from the story's unbadged Recommended entry.
+    Unbadged and Similar cards keep the plain floor."""
+    from pipeline import render
+
+    def item(sid: int, sim: float, **flags: bool) -> RankedStory:
+        return ranking.RankedStory(
+            story=_f2_story(sid),
+            score=1.0,
+            best_match_title=f"Up {sid}",
+            best_match_sim=sim,
+            **flags,
+        )
+
+    weak, close = 0.7, 0.9
+    assert ranking.ATTRIBUTION_MIN_SIM < weak < ranking.BADGED_ATTRIBUTION_MIN_SIM
+    assert close >= ranking.BADGED_ATTRIBUTION_MIN_SIM
+    deck = WindowDeck(
+        {
+            "1w": WindowViews(
+                recommended=(item(1, weak), item(2, close), item(3, weak)),
+                popular=(
+                    item(1, weak, is_hot=True),
+                    item(2, close, is_high_engagement=True),
+                    item(6, weak, is_discussion_rich=True),
+                ),
+                explore=(
+                    item(4, weak, is_uncertain=True),
+                    item(5, weak, is_similar=True),
+                    item(7, weak, is_novel=True),
+                ),
+            )
+        }
+    )
+    feed = render.build_feed(deck, "1w", Config(), {}, 1, 1)
+    assert {story.id: story.best_match_title for story in feed.stories} == {
+        1: "",
+        2: "Up 2",
+        3: "Up 3",
+        4: "",
+        5: "Up 5",
+        6: "",
+        7: "",
+    }
 
 
 def test_fill_best_match_titles_cold_and_floor() -> None:

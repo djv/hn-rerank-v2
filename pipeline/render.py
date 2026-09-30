@@ -26,7 +26,7 @@ from .config import (
     CH_ARCHIVE_SOURCE,
     Config,
 )
-from .ranking import RankedStory, WindowDeck, serve_window
+from .ranking import RankedStory, WindowDeck, card_attribution, serve_window
 
 # Side-rail sort tabs: (value, label).
 SORT_TABS: tuple[tuple[str, str], ...] = (
@@ -226,7 +226,7 @@ def _feed_story(item: RankedStory, *, hot_badge_percentile: int) -> FeedStory:
         rank_score=item.score,
         badges=[badge.icon for badge in badges],
         badge_details=badges,
-        best_match_title=item.best_match_title,
+        best_match_title=card_attribution(item),
         source_label=source_label_filter(story.source),
         domain=_domain_of(story.url or "", story.discussion_url or ""),
         enriched=len(story.text_content) >= 1000,
