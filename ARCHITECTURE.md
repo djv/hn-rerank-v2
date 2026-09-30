@@ -829,7 +829,9 @@ non-HN story's feed (`source_label`: AINews, LessWrong, r/sub) rather than
 the linked domain, and leaves out a non-HN story's zero points or comments
 (unknown, not zero; blank columns keep the rows aligned). The reading pane's
 heading adds the web card's "Because you upvoted: …" line
-(`best_match_title`), and a summary wait counts up ("Loading summary… 5s"). Story JSON now includes badge details (kind/icon/label/tooltip) and card
+(`best_match_title`), and a summary wait counts up ("Loading summary… 5s").
+Panes under 30 rows (`COMPACT_HEIGHT`, e.g. a small tmux split) drop that
+line and keep the footer to one row: the status, cut to fit, beside "? help". Story JSON now includes badge details (kind/icon/label/tooltip) and card
 presentation fields. The browser keeps server-rendered initial paint but uses
 `/api/feed` JSON for refills, building DOM nodes with textContent instead of
 injecting story text as HTML. Feed orders retain production

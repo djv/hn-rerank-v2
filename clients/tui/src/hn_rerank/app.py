@@ -351,6 +351,9 @@ def story_metadata(story: FeedStory) -> str:
 # Every sort shows at most this many stories (matches the web client);
 # unrated stories past the cap slide in as ones ahead are rated.
 VIEW_LIMIT = 12
+# Panes shorter than this many rows get one footer row (status and
+# "? help") and no "Because you upvoted" line in the reading heading.
+COMPACT_HEIGHT = 30
 
 
 def _cell_len(text: str) -> int:
@@ -457,11 +460,12 @@ def headline(
     return text
 
 
-def story_heading(story: FeedStory) -> Text:
+def story_heading(story: FeedStory, *, attribution: bool = True) -> Text:
     """The reading pane's heading: the headline, plus why the story is
-    recommended when the server says (as the web card does)."""
+    recommended when the server says (as the web card does) and there is
+    room (*attribution*)."""
     text = headline(story)
-    if story.best_match_title:
+    if attribution and story.best_match_title:
         text.append("\nBecause you upvoted: ", style=PALETTE["faint"])
         text.append(story.best_match_title, style=PALETTE["soft"])
     return text
@@ -657,6 +661,8 @@ class Reader(App[None]):
     .stacked-footer #footer { layout: vertical; }
     .stacked-footer #status { width: 1fr; }
     .stacked-footer #shortcuts { text-align: left; }
+    .compact #status { width: 1fr; }
+    .compact #shortcuts { width: auto; }
     .narrow Tabs { display: none; }
     .narrow Select { display: block; }
     .narrow #panes { layout: vertical; }
@@ -834,7 +840,7 @@ class Reader(App[None]):
                 str(story.id), headline(story, story.id == self._marked_id, widths)
             )
         if selected := self.selected():
-            self.query_one("#story-heading", Static).update(story_heading(selected))
+            self.query_one("#story-heading", Static).update(self.heading(selected))
         self.context_status()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
@@ -874,9 +880,13 @@ class Reader(App[None]):
         widget.set_class(error, "error")
         widget.set_class(False, "context")
         self.fit_footer(status=text)
-        # The row is the full width once stacked; cut the middle so the
-        # subject and an actionable tail ("Press r to retry.") both survive.
-        widget.update(fit_middle(text, self.size.width - 2))
+        # The row is the full width once stacked (beside the short hint in a
+        # short pane); cut the middle so the subject and an actionable tail
+        # ("Press r to retry.") both survive.
+        room = self.size.width - 2
+        if self.has_class("compact"):
+            room -= _cell_len(self.hints_text) + 2
+        widget.update(fit_middle(text, room))
 
     def context_status(self) -> None:
         """Counts line for the current filter; only replaces an earlier counts line."""
@@ -1063,7 +1073,7 @@ class Reader(App[None]):
             # Fresh feed data can carry new points/comments; keep the reading
             # heading in step even when the selection id has not changed.
             if selected := self.selected():
-                self.query_one("#story-heading", Static).update(story_heading(selected))
+                self.query_one("#story-heading", Static).update(self.heading(selected))
             self.schedule_summary()
         else:
             self.query_one("#story-heading", Static).update("")
@@ -1137,7 +1147,7 @@ class Reader(App[None]):
         if self.help_open:
             return
         if story and story.id != self.summary_story_id:
-            self.query_one("#story-heading", Static).update(story_heading(story))
+            self.query_one("#story-heading", Static).update(self.heading(story))
             self.summary_story_id = story.id
             self.selection_serial += 1
             if self.feed is not None:
@@ -1577,7 +1587,7 @@ class Reader(App[None]):
             self._row_widths = widths
             selected = self.selected()
             if selected is not None and selected.id == story_id:
-                self.query_one("#story-heading", Static).update(story_heading(story))
+                self.query_one("#story-heading", Static).update(self.heading(story))
 
     def set_feed(self, feed: Feed) -> None:
         """Make *feed* the selected window's; a new version drops the cached
@@ -1881,12 +1891,18 @@ class Reader(App[None]):
         else:
             self.status(f"Sent to terminal clipboard (needs OSC 52): {url}")
 
-    def layout_panes(self, width: int | None = None) -> None:
+    def layout_panes(self, width: int | None = None, height: int | None = None) -> None:
         narrow = (self.size.width if width is None else width) < 100
+        compact = (self.size.height if height is None else height) < COMPACT_HEIGHT
+        compact_changed = compact != self.has_class("compact")
         self.set_class(narrow, "narrow")
+        self.set_class(compact, "compact")
         self.set_class(self.reading, "reading")
         votes = "1 up · 2 neutral · 3 down → next story"
-        if narrow:
+        if compact:
+            # A short pane keeps the footer to one row; ? help lists the keys.
+            hints = "? help"
+        elif narrow:
             # Narrow hints may wrap; the badge key stays listed in ? help.
             if self.reading:
                 hints = f"j/k story · Space page · Enter/Esc back · {votes}"
@@ -1905,6 +1921,13 @@ class Reader(App[None]):
             hints = f"j/k move · {votes} · b badges · ? help · q quit"
         self.query_one("#shortcuts", Static).update(hints)
         self.fit_footer(hints=hints, width=width)
+        if compact_changed and (selected := self.selected()):
+            self.query_one("#story-heading", Static).update(self.heading(selected))
+
+    def heading(self, story: FeedStory) -> Text:
+        """The reading pane's heading; a short pane leaves out why the story
+        is recommended."""
+        return story_heading(story, attribution=not self.has_class("compact"))
 
     def fit_footer(
         self,
@@ -1922,7 +1945,9 @@ class Reader(App[None]):
         width = self.size.width if width is None else width
         # Each widget pads one cell per side; keep a gap of two between them.
         needed = _cell_len(self.status_text) + _cell_len(self.hints_text) + 6
-        self.set_class(needed > width, "stacked-footer")
+        # A short pane never stacks: the status is cut to fit beside the keys.
+        stacked = needed > width and not self.has_class("compact")
+        self.set_class(stacked, "stacked-footer")
 
     @property
     def can_read(self) -> bool:
@@ -1931,7 +1956,7 @@ class Reader(App[None]):
 
     def on_resize(self, event: events.Resize) -> None:
         if self.query("#panes"):
-            self.layout_panes(event.size.width)
+            self.layout_panes(event.size.width, event.size.height)
 
     def focus_summary(self) -> None:
         self.query_one("#summary", Markdown).focus()

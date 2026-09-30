@@ -797,3 +797,31 @@ async def test_a_slow_summary_counts_the_wait(tmp_path: Path) -> None:
         assert summary._markdown[len("Loading summary… ") : -1].isdigit()
         await settle(pilot)
         assert summary._markdown == "# Summary 1"
+
+
+async def test_short_pane_keeps_footer_and_heading_compact() -> None:
+    """A short pane (a small tmux split) reads the summary, not chrome: one
+    footer row with "? help", and no "Because you upvoted" line. Both come
+    back when the pane grows."""
+    fake = FakeServer()
+    fake.feed.stories[0] = replace(fake.feed.stories[0], best_match_title="Earlier")
+    app = Reader(api=fake.api())
+    async with app.run_test(size=(64, 23)) as pilot:
+        await settle(pilot)
+        await pilot.press("enter")
+        await pilot.pause()
+        status = app.query_one("#status").region
+        hints = app.query_one("#shortcuts", Static)
+        assert str(hints.content) == "? help"
+        assert status.height == hints.region.height == 1
+        assert status.y == hints.region.y and status.right <= hints.region.x
+        heading = app.query_one("#story-heading", Static)
+        assert "Because you upvoted" not in str(heading.content)
+        # A long message is cut beside the hint, never stacked.
+        app.status("Connection failed. " * 10, error=True)
+        await pilot.pause()
+        assert app.query_one("#status").region.y == hints.region.y
+        await pilot.resize_terminal(64, 40)
+        await pilot.pause()
+        assert "Because you upvoted: Earlier" in str(heading.content)
+        assert "j/k story" in str(hints.content)

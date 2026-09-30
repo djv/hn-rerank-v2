@@ -1,5 +1,14 @@
 # Worklog: hn-rewrite
 
+## 2026-09-30 TUI: compact layout for short panes
+
+- Why: in a 64x23 tmux pane the footer took 3 rows (status + key hints
+  wrapped to 2) and the heading 2 more for "Because you upvoted".
+- Panes under 30 rows (`COMPACT_HEIGHT`): the footer is one row (status cut
+  to fit beside "? help"; `?` lists every key) and the heading leaves out
+  "Because you upvoted". Taller panes are unchanged. The zoomed summary
+  gains 4 rows at 64x23.
+
 ## 2026-09-30 Hot threads: live points/comments between regens; Interest icon 🎯
 
 - Why: Gemini 4 Argon (49913571, 1h old) showed 419 pts / 165 comments in
