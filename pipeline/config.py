@@ -39,6 +39,10 @@ class ModelConfig:
     linear_blend_tfidf_weight: float = 0.3
     linear_blend_dense_c: float = 0.1
     linear_blend_tfidf_c: float = 4.0
+    # Scale the blend weights by the SVM's tier-3 weight, so the linear models
+    # ramp in with the SVM instead of taking half the ranking at the 20 up /
+    # 20 down gate. Off only in the eval, to read the dense model alone.
+    linear_blend_ramp: bool = True
     diversity_threshold: float = 0.75
     knn_k: int = 10
     positive_cluster_k: int = 4

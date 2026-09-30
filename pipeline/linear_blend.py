@@ -50,7 +50,11 @@ def tfidf_text(story: Story) -> str:
 
 
 HASH_FEATURES = 2**18
-ROW_CACHE_MAXSIZE = 20_000
+# A rank touches every candidate (caps: 10k live HN + 4k archive + 5k RSS)
+# plus each voter's ~2.9k training stories; below that, LRU evicts rows
+# before their reuse and every rank re-tokenises. ~3.4 KB a row (mean 395
+# nonzeros, 2026-09-29 snapshot), so ~110 MB when full.
+ROW_CACHE_MAXSIZE = 32_000
 
 # Word 1-2 gram counts hashed into a fixed space: a story's row never depends
 # on the vote set, so it is computed once per (story, text) and reused across
@@ -178,6 +182,9 @@ def blend_scores(
     ).astype(np.float32)
 
 
+# One fit per user, under its latest feedback signature: after a vote the
+# old fit is only the next fit's warm start (~7 MB each at ~229k kept
+# TF-IDF columns; a voting burst used to leave 20 of one user's).
 _CACHE: LRUCache[tuple[int, str, int], LinearBlendModels] = LRUCache(maxsize=10_000)
 _LOCK = threading.Lock()
 
@@ -187,7 +194,8 @@ def get_cached(key: tuple[int, str, int]) -> LinearBlendModels | None:
         return _CACHE.get(key)
 
 
-# Each user's most recent fit, a warm start for the next one.
+# Each cached user's most recent fit, a warm start for the next one; leaves
+# with the user's _CACHE entry.
 _LATEST: dict[int, LinearBlendModels] = {}
 
 
@@ -200,7 +208,10 @@ def set_cached(
     key: tuple[int, str, int], models: LinearBlendModels, maxsize: int
 ) -> None:
     with _LOCK:
+        for old in [k for k in _CACHE if k[0] == key[0] and k != key]:
+            del _CACHE[old]
         _CACHE[key] = models
         _LATEST[key[0]] = models
         while len(_CACHE) > maxsize:
-            _CACHE.popitem()
+            evicted, _ = _CACHE.popitem()
+            _LATEST.pop(evicted[0], None)

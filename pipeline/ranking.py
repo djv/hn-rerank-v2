@@ -1529,6 +1529,9 @@ def _score_and_rank(
     # Three-way blend between tier 1 (gravity), tier 2 (centroid), tier 3 (SVM)
     # α_2 ramps from 0→1 as n_feedback grows; tier 1 fades out smoothly.
     alpha_2 = float(np.clip(n_feedback / config.model.tier2_blend_window, 0.0, 1.0))
+    # The SVM tier's share; the linear blend (same votes, same kind of model)
+    # ramps in with it.
+    t3_weight = 0.0
 
     if svm_scores is not None and tier2_scores is not None:
         n_min = min(n_up, n_down)
@@ -1560,10 +1563,12 @@ def _score_and_rank(
 
     assert scores is not None
 
+    blend_share = t3_weight if config.model.linear_blend_ramp else 1.0
     if (
         linear_models is not None
         and linear_dense_candidates is not None
         and svm_scores is not None
+        and blend_share > 0.0
     ):
         try:
             with trace.stage("linear_blend_score"):
@@ -1572,8 +1577,8 @@ def _score_and_rank(
                     scores,
                     linear_dense_candidates,
                     candidates,
-                    dense_weight=config.model.linear_blend_dense_weight,
-                    tfidf_weight=config.model.linear_blend_tfidf_weight,
+                    dense_weight=config.model.linear_blend_dense_weight * blend_share,
+                    tfidf_weight=config.model.linear_blend_tfidf_weight * blend_share,
                 )
         except Exception as e:
             trace.set_label("linear_blend_score", "error")

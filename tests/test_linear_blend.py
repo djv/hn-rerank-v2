@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, cast
 
 from dataclasses import replace
 
@@ -84,14 +84,22 @@ def _rank(db: Database, user_id: int, config: Config) -> dict[int, float]:
     return {r.story.id: r.score for r in ranked}
 
 
-def _config(enabled: bool, *, dense: float = 0.2, tfidf: float = 0.3) -> Config:
+def _config(
+    enabled: bool,
+    *,
+    dense: float = 0.2,
+    tfidf: float = 0.3,
+    ramp: bool = False,
+    gate: int = 2,
+) -> Config:
     return Config(
         model=ModelConfig(
-            min_up_for_svm=2,
-            min_down_for_svm=2,
+            min_up_for_svm=gate,
+            min_down_for_svm=gate,
             linear_blend_enabled=enabled,
             linear_blend_dense_weight=dense,
             linear_blend_tfidf_weight=tfidf,
+            linear_blend_ramp=ramp,
         )
     )
 
@@ -230,3 +238,46 @@ def test_warm_start_reaches_the_cold_fit_in_fewer_iterations() -> None:
     )
     assert warm.tfidf.n_iter_[0] < cold.tfidf.n_iter_[0]
     assert warm.dense.n_iter_[0] <= cold.dense.n_iter_[0]
+
+
+def test_blend_ramps_in_with_the_svm_tier() -> None:
+    """At the 20 up / 20 down gate the SVM tier has no weight, so neither has
+    the blend: scores match the blend switched off. Past the gate the blend
+    moves the ranking (TF-IDF alone separates these candidates)."""
+    db = Database(":memory:")
+    try:
+        user_id = _seed(db, seed=4)
+        at_gate = _rank(
+            db, user_id, _config(True, tfidf=1.0, dense=0.0, ramp=True, gate=20)
+        )
+        assert at_gate == _rank(db, user_id, _config(False, gate=20))
+        past_gate = _rank(db, user_id, _config(True, tfidf=1.0, dense=0.0, ramp=True))
+        assert past_gate != _rank(db, user_id, _config(False))
+    finally:
+        db.close()
+
+
+def test_cache_keeps_one_fit_per_user_and_drops_warm_starts_with_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cachetools import LRUCache
+
+    monkeypatch.setattr(linear_blend, "_CACHE", LRUCache(maxsize=10_000))
+    monkeypatch.setattr(linear_blend, "_LATEST", {})
+    # Stand-ins: the cache never looks inside a fit.
+    fits = {
+        name: cast(linear_blend.LinearBlendModels, object())
+        for name in ("a1", "a2", "b1", "c1")
+    }
+
+    def put(user: int, sig: str) -> None:
+        linear_blend.set_cached((user, sig, 1), fits[sig], 2)
+
+    put(1, "a1")
+    put(1, "a2")
+    assert list(linear_blend._CACHE) == [(1, "a2", 1)]
+    assert linear_blend.latest(1) is fits["a2"]
+    put(2, "b1")
+    put(3, "c1")  # over maxsize 2: user 1, least recently used, leaves
+    assert set(linear_blend._CACHE) == {(2, "b1", 1), (3, "c1", 1)}
+    assert linear_blend.latest(1) is None
