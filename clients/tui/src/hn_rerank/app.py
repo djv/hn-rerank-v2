@@ -1149,6 +1149,7 @@ class Reader(App[None]):
                         sort_mode=str(self.query_one("#sort", Select).value),
                         window=self.feed.window,
                         occurred_at=time.time(),
+                        badges=[badge.kind for badge in story.badge_details],
                     ),
                     self.selection_serial,
                 )
@@ -1907,7 +1908,7 @@ class Reader(App[None]):
         self.query_one("#summary", Markdown).update(
             "# Badge legend\n\n"
             "🔥 **Hot** — rising fast · 🏆 **Top** — high score · 💬 **Talk** — many comments\n\n"
-            "🤔 **Unsure** — model uncertain · ✨ **Novel** — unlike your votes · 🎯 **Similar** — matches your upvotes\n\n"
+            "🤔 **Unsure** — model uncertain · ✨ **Novel** — unlike your votes · 🧭 **Interest** — an interest Recommended misses\n\n"
             "Escape: return to the story. ?: shortcuts."
         )
         self.focus_summary()

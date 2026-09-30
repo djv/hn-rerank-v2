@@ -27,6 +27,8 @@ class Impression:
     event_type: str = "impression"
     source_filter: str = "mixed"
     ranker_arm: str = "tui_observed"
+    # Badge kinds of the story as shown.
+    badges: list[str] = field(default_factory=list)
 
 
 class APIError(Exception):

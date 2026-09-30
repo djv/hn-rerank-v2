@@ -46,6 +46,10 @@ class ModelConfig:
     diversity_threshold: float = 0.75
     knn_k: int = 10
     positive_cluster_k: int = 4
+    # Explore's Interest picks: clusters of the user's upvotes (k=10 on
+    # profile 151 split AI into five and kept nomad life, health, investing,
+    # gadgets and maps/transit apart, 2026-09-30).
+    interest_cluster_k: int = 10
     tier2_blend_window: int = 50
     tier3_blend_window: int = 60
     min_up_for_svm: int = 20

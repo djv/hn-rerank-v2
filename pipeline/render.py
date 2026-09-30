@@ -145,7 +145,7 @@ BADGE_LEGEND: tuple[tuple[str, str], ...] = (
     ("💬", "Talk"),
     ("🤔", "Unsure"),
     ("✨", "Novel"),
-    ("🎯", "Similar"),
+    ("🧭", "Interest"),
 )
 
 
@@ -199,13 +199,13 @@ def _build_badges(item: RankedStory, *, hot_badge_percentile: int) -> list[FeedB
                 ),
             )
         )
-    if item.is_similar:
+    if item.is_interest:
         badges.append(
             FeedBadge(
-                kind="similar",
-                icon="🎯",
-                label="Similar",
-                tooltip="Most similar to your upvoted stories",
+                kind="interest",
+                icon="🧭",
+                label="Interest",
+                tooltip="Best story from one of your interests that Recommended misses",
             )
         )
     return badges

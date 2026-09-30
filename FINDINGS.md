@@ -1,5 +1,28 @@
 # HN Rerank findings
 
+## Do Unsure votes teach the ranker more? — 2026-09-30
+
+`scripts/eval_unsure_votes.py` on a live snapshot (profile 151, 3091 votes in
+time order, production ranker; results
+`~/.local/state/hn-rerank-eval/unsure-votes-20260930.json`). Train on the
+oldest votes, add N votes from the next 618 by strategy, test on the next 20%.
+AUC up-vs-rest (random: mean ± sd of 5 seeds):
+
+| split | N | entropy (Unsure) | random | top-scored | none / all |
+|---|---|---|---|---|---|
+| 0.6:0.2 | 100 | 0.856 | 0.861 ± 0.002 | 0.865 | 0.861 / 0.866 |
+| 0.6:0.2 | 300 | 0.860 | 0.862 ± 0.003 | 0.867 | |
+| 0.4:0.2 | 100 | 0.770 | 0.771 ± 0.002 | 0.769 | 0.767 / 0.798 |
+| 0.4:0.2 | 300 | 0.783 | 0.784 ± 0.003 | 0.787 | |
+
+- Entropy-picked votes never beat random (AUC up-vs-down and recall@40 agree);
+  top-scored votes, what Recommended already shows, help most in 3 of 4.
+  NDCG@12 swings ±0.03-0.05 between random seeds, too noisy to read.
+- Caveat: the pool is votes the user chose to cast, mostly on Recommended
+  cards, not the whole candidate set Unsure picks from.
+- With the live rate (Unsure-like Explore cards 1/78 upvoted), Unsure shows no
+  learning or reading value here.
+
 ## "Because you upvoted" coherence — 2026-09-30
 
 Report: 49908757 ("Ubuntu 26.04.1 LTS") said "Because you upvoted: NInfer

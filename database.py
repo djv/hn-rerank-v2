@@ -130,6 +130,8 @@ class InteractionEvent:
     ranker_arm: str
     occurred_at: float
     duration_ms: int | None = None
+    # Comma-joined badge kinds of the card as shown ("" when none or unknown).
+    badges: str = ""
 
 
 class InteractionInsertResult(NamedTuple):
@@ -383,6 +385,15 @@ class Database:
                         received_at         REAL NOT NULL
                     ) STRICT
                 """)
+                interaction_columns = {
+                    row[1]
+                    for row in conn.execute("PRAGMA table_info(interaction_events)")
+                }
+                if "badges" not in interaction_columns:
+                    conn.execute(
+                        "ALTER TABLE interaction_events "
+                        "ADD COLUMN badges TEXT NOT NULL DEFAULT ''"
+                    )
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_interaction_events_user_time "
                     "ON interaction_events(user_id, occurred_at)"
@@ -1398,8 +1409,8 @@ class Database:
                             event_id, client_session_id, user_id, story_id,
                             event_type, dashboard_version, position, sort_mode,
                             age_filter, source_filter, ranker_arm, occurred_at,
-                            duration_ms, received_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            duration_ms, received_at, badges
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(event_id) DO NOTHING
                         """,
                         (
@@ -1417,6 +1428,7 @@ class Database:
                             event.occurred_at,
                             event.duration_ms,
                             received_at,
+                            event.badges,
                         ),
                     )
                     inserted += cursor.rowcount

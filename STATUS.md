@@ -116,9 +116,19 @@ old profile, stopped 2026-09-24): ranking quality and which sources feed it.
   snapshots and merged copies live in `~/.local/state/hn-rerank-eval/`.
 
 ## Next step
-- Attribution: 0.85 is eyeballed on one deck. If lines still read wrong,
-  match on title embeddings instead (read-only check: coherent above ~0.55,
-  Ubuntu's best 0.33) or have the user rate ~60 pairs to set the cutoff.
+- Explore badges (user, 2026-09-30): Unsure stays until ~2026-10-14, then
+  keep or drop it (and judge Novel, 🧭 Interest) from the per-badge upvote
+  rates in `interaction_events.badges`. Offline, Unsure's votes taught the
+  ranker no more than random ones (FINDINGS.md "Do Unsure votes teach...").
+- Parked (user, 2026-09-30): title-based matching for "Because you
+  upvoted" (full-text similarity is flat; Ubuntu's best upvote 0.70). Plan:
+  time encoding ~11k titles on the VPS; title vectors in memory beside the
+  candidate pool (or an additive `title_embeddings` table if slow; the
+  `embeddings` PK is story_id, so no second row there); attribution = closest
+  upvote title at >= ~0.55 for all cards, replacing 0.35/0.85; SVM features,
+  Novel and Interest stay full-text. Before/after lines on 1d/1w for review,
+  then deploy and check rerank time. Current 0.85 badged cut is eyeballed on
+  one deck.
 - **Embed-model hill-climb paused** (2026-09-30 15:28 UTC): Qwen3-0.6B small
   test killed by memory pressure (685MB encoder, 11.5GB/11.5GB used); did not
   reach checkpoint at 200 stories. harrier-270m small test: P@12 0.389 vs best

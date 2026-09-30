@@ -31,6 +31,7 @@ async def test_selected_impression_is_delayed_not_prefetched_and_best_effort() -
         assert event["window"] == "1w" and "age_filter" not in event
         assert event["event_type"] == "impression"
         assert event["dashboard_version"] == fake.feed.version
+        assert event["badges"] == []  # the sample stories have none
         # A normal rebuild/poll must not inflate impressions for this selection.
         app.rebuild()
         await pilot.pause(1.1)

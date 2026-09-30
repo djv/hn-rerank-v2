@@ -116,7 +116,7 @@ def test_dashboard_polish_renders_domain_legend_and_queue_status(
         "Talk",
         "Unsure",
         "Novel",
-        "Similar",
+        "Interest",
     ]
 
     story = Story(
@@ -413,7 +413,7 @@ def test_build_cold_deck_computes_popular_badges_but_not_explore(
     db: Database,
 ) -> None:
     """Popular (Hot/Top/Talk) is non-personalized and computed on the cold
-    deck; Explore (Unsure/Novel/Similar) is personalized and always absent
+    deck; Explore (Unsure/Novel/Interest) is personalized and always absent
     (no feedback to compute it against) — see build_cold_deck docstring."""
     db.upsert_story(_cold_story(1, score=100, time_ts=int(time.time()) - 3600))
 
@@ -428,7 +428,7 @@ def test_build_cold_deck_computes_popular_badges_but_not_explore(
     # Explore badges require feedback to personalize against; always absent.
     assert item.is_uncertain is False
     assert item.is_novel is False
-    assert item.is_similar is False
+    assert item.is_interest is False
     # Popular badges are non-personalized; the sole HN candidate is both
     # highest-scoring and highest-velocity, so it earns Hot (and only Hot).
     assert item.is_hot is True
@@ -3799,7 +3799,7 @@ def test_each_explore_badge_filled_per_window(db: Database, embedder: Embedder) 
         served = _served(deck, window)
         assert len(served.recommended) == VIEW_SIZE, window
         assert len(served.popular) == VIEW_SIZE, window
-        for attr in ("is_novel", "is_similar", "is_uncertain"):
+        for attr in ("is_novel", "is_interest", "is_uncertain"):
             n = sum(1 for r in served.explore if getattr(r, attr))
             assert n == EXPLORE_PER_BADGE, f"{attr} in {window}: {n}"
 
@@ -3819,14 +3819,16 @@ def _make_explore_inputs() -> tuple[list[RankedStory], ranking.ExploreContext, i
       - Novel pool: cand_max_sim strictly increasing (novel sort key =
         1 - max_sim, so the lowest-sim id is most novel). All other ids
         default to max_sim=0.99 ("not novel").
-      - Similar pool: cand_closest_up strictly decreasing (the highest-sim
-        id is most similar). All other ids default to closest_up=0.0.
+      - Interest pool: each id is the only candidate of its own interest,
+        bigger interests first, so the round-robin takes them in id order.
+        Every other id belongs to interest 0, which the Recommended picks
+        cover, so it comes last.
     Returns the ranked pool, the Explore context and the assembly time.
     """
     unsure_base = RECOMMENDED_PICKS
     novel_base = unsure_base + _EXPLORE_GROUP
-    similar_base = novel_base + _EXPLORE_GROUP
-    n_total = similar_base + _EXPLORE_GROUP
+    interest_base = novel_base + _EXPLORE_GROUP
+    n_total = interest_base + _EXPLORE_GROUP
 
     now = int(time.time())
     candidates = [
@@ -3861,13 +3863,18 @@ def _make_explore_inputs() -> tuple[list[RankedStory], ranking.ExploreContext, i
     ]
     row_of = {s.id: idx for idx, s in enumerate(candidates)}
     cand_max_sim = np.full(n_total, 0.99, dtype=np.float32)
-    cand_closest_up = np.zeros(n_total, dtype=np.float32)
+    cand_interest = np.zeros(n_total, dtype=np.int64)
     for i in range(_EXPLORE_GROUP):
         step = i / (_EXPLORE_GROUP - 1)
         cand_max_sim[row_of[novel_base + i]] = round(0.05 + 0.9 * step, 4)
-        cand_closest_up[row_of[similar_base + i]] = round(0.95 - 0.9 * step, 4)
+        cand_interest[row_of[interest_base + i]] = i + 1
     explore = ranking.ExploreContext(
-        cand_max_sim=cand_max_sim, cand_closest_up=cand_closest_up, row_of=row_of
+        cand_max_sim=cand_max_sim,
+        cand_interest=cand_interest,
+        interest_sizes=np.array(
+            [1] + [100 - i for i in range(_EXPLORE_GROUP)], dtype=np.int64
+        ),
+        row_of=row_of,
     )
     return ranked, explore, now
 
@@ -3875,7 +3882,7 @@ def _make_explore_inputs() -> tuple[list[RankedStory], ranking.ExploreContext, i
 _EXPLORE_GROUP = EXPLORE_PER_BADGE * SELECT_MARGIN + 2
 _UNSURE_BASE = RECOMMENDED_PICKS
 _NOVEL_BASE = _UNSURE_BASE + _EXPLORE_GROUP
-_SIMILAR_BASE = _NOVEL_BASE + _EXPLORE_GROUP
+_INTEREST_BASE = _NOVEL_BASE + _EXPLORE_GROUP
 
 
 def _served_explore_ids(
@@ -3885,12 +3892,12 @@ def _served_explore_ids(
     return (
         {r.story.id for r in explore if r.is_uncertain},
         {r.story.id for r in explore if r.is_novel},
-        {r.story.id for r in explore if r.is_similar},
+        {r.story.id for r in explore if r.is_interest},
     )
 
 
 def test_explore_badges_backfill_past_feedback_matches() -> None:
-    """Explore passes (Unsure/Novel/Similar) skip candidates that duplicate
+    """Explore passes (Unsure/Novel/Interest) skip candidates that duplicate
     already-voted feedback and backfill from the rest of the sorted pool,
     instead of silently losing badge slots.
 
@@ -3902,7 +3909,7 @@ def test_explore_badges_backfill_past_feedback_matches() -> None:
     """
     ranked, explore, now = _make_explore_inputs()
     # The best-ranked candidate in each badge's pool duplicates feedback.
-    feedback_matched_ids = {_UNSURE_BASE, _NOVEL_BASE, _SIMILAR_BASE}
+    feedback_matched_ids = {_UNSURE_BASE, _NOVEL_BASE, _INTEREST_BASE}
 
     deck = ranking.assemble_window_deck(
         ranked,
@@ -3912,15 +3919,15 @@ def test_explore_badges_backfill_past_feedback_matches() -> None:
         is_feedback_match=lambda story: story.id in feedback_matched_ids,
     )
 
-    unsure_ids, novel_ids, similar_ids = _served_explore_ids(deck, now)
+    unsure_ids, novel_ids, interest_ids = _served_explore_ids(deck, now)
     # The feedback-matched top pick in each pool is excluded and backfilled
     # with the next-best candidates in that pool.
     assert unsure_ids == set(
         range(_UNSURE_BASE + 1, _UNSURE_BASE + 1 + EXPLORE_PER_BADGE)
     )
     assert novel_ids == set(range(_NOVEL_BASE + 1, _NOVEL_BASE + 1 + EXPLORE_PER_BADGE))
-    assert similar_ids == set(
-        range(_SIMILAR_BASE + 1, _SIMILAR_BASE + 1 + EXPLORE_PER_BADGE)
+    assert interest_ids == set(
+        range(_INTEREST_BASE + 1, _INTEREST_BASE + 1 + EXPLORE_PER_BADGE)
     )
     # No matched story is picked for any window.
     for window in WINDOWS:
@@ -3938,10 +3945,12 @@ def test_explore_badges_no_feedback_match_predicate_is_unaffected() -> None:
         ranked, config=Config(count=40), now=now, explore=explore
     )
 
-    unsure_ids, novel_ids, similar_ids = _served_explore_ids(deck, now)
+    unsure_ids, novel_ids, interest_ids = _served_explore_ids(deck, now)
     assert unsure_ids == set(range(_UNSURE_BASE, _UNSURE_BASE + EXPLORE_PER_BADGE))
     assert novel_ids == set(range(_NOVEL_BASE, _NOVEL_BASE + EXPLORE_PER_BADGE))
-    assert similar_ids == set(range(_SIMILAR_BASE, _SIMILAR_BASE + EXPLORE_PER_BADGE))
+    assert interest_ids == set(
+        range(_INTEREST_BASE, _INTEREST_BASE + EXPLORE_PER_BADGE)
+    )
     served = _served(deck, "1w", now)
     assert not {r.story.id for r in served.explore} & {
         r.story.id for r in deck.window("1w").recommended
@@ -3951,6 +3960,61 @@ def test_explore_badges_no_feedback_match_predicate_is_unaffected() -> None:
     assert _served_explore_ids(voted, now)[0] == set(
         range(_UNSURE_BASE + 1, _UNSURE_BASE + 1 + EXPLORE_PER_BADGE)
     )
+
+
+def test_interest_picks_go_round_robin_least_covered_interest_first() -> None:
+    """Each round takes every interest's best-scoring story; interests the
+    served Recommended covers least go first, then bigger ones."""
+    now = int(time.time())
+    # Recommended: RECOMMENDED_PICKS stories of interest 0; Novel takes the
+    # most novel ones (ids 800..). Left for Interest: interest 1 (big) holds
+    # ids 901 and 902, interest 2 (small) 903, interest 0 904, which scores
+    # best of the four.
+    fillers = [(i, 1000.0 - i, 0) for i in range(RECOMMENDED_PICKS)]
+    novel = [(800 + i, 1.0, 0) for i in range(EXPLORE_PER_BADGE * SELECT_MARGIN)]
+    rest = [(901, 50.0, 1), (902, 40.0, 1), (903, 30.0, 2), (904, 60.0, 0)]
+    stories = fillers + novel + rest
+    ranked = [
+        RankedStory(story=_f2_story(sid), score=score, best_match_title="")
+        for sid, score, _ in stories
+    ]
+    row_of = {r.story.id: i for i, r in enumerate(ranked)}
+    max_sim = np.full(len(ranked), 0.99, dtype=np.float32)
+    for sid, *_ in novel:
+        max_sim[row_of[sid]] = 0.1
+    explore = ranking.ExploreContext(
+        cand_max_sim=max_sim,
+        cand_interest=np.array([interest for *_, interest in stories], dtype=np.int64),
+        interest_sizes=np.array([30, 50, 10], dtype=np.int64),
+        row_of=row_of,
+    )
+    deck = ranking.assemble_window_deck(
+        ranked, config=Config(), now=now, explore=explore
+    )
+    picks = [r.story.id for r in deck.window("1w").explore if r.is_interest]
+    assert picks == [901, 903, 904, 902]
+    # Without interests there are no Interest picks.
+    bare = replace(explore, interest_sizes=np.zeros(0, dtype=np.int64))
+    deck = ranking.assemble_window_deck(ranked, config=Config(), now=now, explore=bare)
+    assert not any(r.is_interest for r in deck.window("1w").explore)
+
+
+def test_interest_centers_are_cached_and_warm_started() -> None:
+    rng = np.random.default_rng(0)
+    anchors = np.eye(8, dtype=np.float32)[:3]
+    ups = np.repeat(anchors, 10, axis=0) + rng.normal(0, 0.05, (30, 8))
+    ups = (ups / np.linalg.norm(ups, axis=1, keepdims=True)).astype(np.float32)
+    # No more upvotes than interests: the upvotes are the centers.
+    assert ranking.interest_centers(None, ups[:2], 3).shape == (2, 8)
+    first = ranking.interest_centers(424242, ups, 3)
+    assert first.shape == (3, 8)
+    assert np.allclose(np.linalg.norm(first, axis=1), 1.0, atol=1e-5)
+    assert ranking.interest_centers(424242, ups, 3) is first  # cache hit
+    # One more upvote: warm-started, so every center stays put.
+    more = np.vstack([ups, ups[:1] * 0.9 + anchors[1] * 0.1]).astype(np.float32)
+    moved = ranking.interest_centers(424242, more, 3)
+    assert moved is not first
+    assert np.all(np.max(moved @ first.T, axis=1) > 0.99)
 
 
 def _make_window_inputs(ages_days: list[float]) -> tuple[list[RankedStory], int]:
@@ -4057,7 +4121,8 @@ def test_explore_and_popular_can_share_a_card() -> None:
     pool = fillers + [target]
     explore = ranking.ExploreContext(
         cand_max_sim=np.full(len(pool), 0.5, dtype=np.float32),
-        cand_closest_up=np.full(len(pool), 0.5, dtype=np.float32),
+        cand_interest=np.zeros(len(pool), dtype=np.int64),
+        interest_sizes=np.zeros(0, dtype=np.int64),
         row_of={r.story.id: i for i, r in enumerate(pool)},
     )
     deck = ranking.assemble_window_deck(pool, config=Config(), now=now, explore=explore)
@@ -4943,7 +5008,7 @@ def test_candidate_similar_to_neutral_is_not_novel(db, embedder, monkeypatch):
     )
     # id=1 (close to neutral, max_sim=0.95) is not novel.
     # id=2 (close to up, max_sim=0.95) has high up-similarity so it
-    # may get is_similar but should NOT get is_novel.
+    # may get is_interest but should NOT get is_novel.
     for cid in (1, 2):
         if cid in by_id:
             assert not by_id[cid].is_novel, (
@@ -7207,7 +7272,7 @@ def test_badged_cards_name_an_upvote_only_on_a_close_match() -> None:
     """Hot/Top/Talk/Unsure/Novel cards are there for popularity or
     exploration: they name an upvote only at BADGED_ATTRIBUTION_MIN_SIM,
     even when the match comes from the story's unbadged Recommended entry.
-    Unbadged and Similar cards keep the plain floor."""
+    Unbadged and Interest cards keep the plain floor."""
     from pipeline import render
 
     def item(sid: int, sim: float, **flags: bool) -> RankedStory:
@@ -7233,7 +7298,7 @@ def test_badged_cards_name_an_upvote_only_on_a_close_match() -> None:
                 ),
                 explore=(
                     item(4, weak, is_uncertain=True),
-                    item(5, weak, is_similar=True),
+                    item(5, weak, is_interest=True),
                     item(7, weak, is_novel=True),
                 ),
             )

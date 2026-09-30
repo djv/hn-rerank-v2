@@ -284,12 +284,20 @@ the fully scored pool at one `now` for all five windows:
   as points, else 🏆 Top.
 * **Explore** (personalized decks only; the cold deck has none): Unsure
   (highest entropy; needs SVM probabilities), Novel (`1 - max_sim`, farthest
-  from every vote) and Similar (`cand_closest_up`), picked in that order, each
+  from every vote) and 🧭 Interest, picked in that order, each
   excluding earlier picks and the window's Recommended picks (spares
   included, since they refill Recommended), skipping (and
   backfilling past) stories that duplicate a voted one (`is_feedback_match`,
   WORKLOG 2026-07-10). Served 5 each (`EXPLORE_PER_BADGE`), in model-score
-  order.
+  order. Interest (replaced 🎯 Similar, 2026-09-30): `interest_centers`
+  clusters the user's upvote embeddings (KMeans, `interest_cluster_k=10`,
+  cached per user and warm-started from the last centers when upvotes
+  change); each candidate belongs to its nearest center. `interest_picks`
+  goes round-robin over the interests, those the served Recommended (first
+  `VIEW_SIZE`) covers least first, then bigger ones, taking each interest's
+  best-scoring unpicked story per round, so the served five show interests
+  Recommended misses. `scripts/preview_explore.py` prints a profile's picks
+  from a snapshot.
 
 Views are picked at `SELECT_MARGIN = 2` times their served size, then
 `finalize_ranked_deck` runs URL/embedding dedup and `canonicalize_deck`
@@ -305,7 +313,7 @@ window is served short, never widened. A card's badges are OR'd across the
 views of its window only (`WindowViews.stories`); the view orders are
 authoritative, nothing is derived from badge flags.
 
-**No knobs.** All percentile/min knobs are gone from `ModelConfig` and `config.toml` except `hot_badge_percentile` (the velocity p99.5 threshold of the Hot predicate). Velocity is structurally near-zero for archive stories, so archive Popular cards carry 🏆/💬, practically never 🔥. Unsure requires the SVM to have fit (`n_up >= min_up_for_svm=20` AND `n_down >= min_down_for_svm=20`); before that `prob_down is None` and Explore holds only Novel and Similar.
+**No knobs.** All percentile/min knobs are gone from `ModelConfig` and `config.toml` except `hot_badge_percentile` (the velocity p99.5 threshold of the Hot predicate). Velocity is structurally near-zero for archive stories, so archive Popular cards carry 🏆/💬, practically never 🔥. Unsure requires the SVM to have fit (`n_up >= min_up_for_svm=20` AND `n_down >= min_down_for_svm=20`); before that `prob_down is None` and Explore holds only Novel and Interest.
 
 **Attribution (F2, `9a83ffd`).** Cards carry a "Because you upvoted …" line
 populated from the already-computed KNN argmax (`cand_closest_up_idx` → the
@@ -317,7 +325,7 @@ with a Hot/Top/Talk/Unsure/Novel badge from any view of their window need
 is built): they are there for popularity or exploration, and full-text
 similarity to the nearest upvote is 0.6-0.8 for most loosely related pairs
 (the text includes comments), so 0.35 let through matches like "Ubuntu
-26.04.1" <- "NInfer Qwen … RTX 5090" (0.70). Similar (🎯) keeps 0.35.
+26.04.1" <- "NInfer Qwen … RTX 5090" (0.70). Interest (🧭) keeps 0.35.
 ### 3.5 Swipe Deck & Warm Refill
 The dashboard has a **Sort** (Recommended/Popular/Explore, side-rail tabs) and a **time window** (a dropdown: 12 hours, 1 day, 1 week, 1 month, Archive) that applies to all three sorts; each client reopens on the window last picked (web: `localStorage` `hnWindow`, switched to right after the embedded 1-week feed loads; terminal: a `window` file next to its `profile.json`), 1 week when nothing is saved; the Date sort and the Recent/Archive tabs were removed on 2026-09-28. Only one story card is visible at a time, and its TLDR opens automatically. The first few TLDRs for the active mode are prefetched immediately so advancing is usually instant. Keys match the terminal client (since 2026-09-26): `j`/`k` next/previous story, `1`/`2`/`3` upvote/neutral/downvote, `u` undo, `o`/`c` open article/comments, `y` copy the comments link (article link if none), `r` refresh (reload the deck and regenerate the open summary), `s`/`l` next sort, `h` previous sort, `?` the key overview, `d`/`D` (Shift+D) the next/previous time window; web-only `b` the side panel and `f` fullscreen. Arrow keys scroll inside the open TLDR. The global `keydown` guard only blocks text-input controls (`input`, `textarea`, `select`, `[contenteditable]`) and modifier-accelerated keys (`Ctrl`/`Cmd`/`Alt`); `<button>` and `<a>` focus does not suppress shortcuts. There is no source filter (the `Mixed`/`HN`/`Non-HN` selector stays disabled; interaction events record `source_filter=mixed`).
 
@@ -748,7 +756,11 @@ identity from the HTTP-only cookie, story ID, visible position, dashboard
 version, current sort, time window and source filter, and the active ranker arm.
 The API field is `window`; it is stored in the ledger's `age_filter` column,
 which kept its name (no migration) and holds `recent`/`archive` for events
-before 2026-09-28. TLDR
+before 2026-09-28. Since 2026-09-30 events may carry `badges`, the card's
+badge kinds as shown (e.g. `["interest", "hot"]`; web and terminal clients
+send them, older clients omit them), stored comma-joined in the added
+`badges` column (`''` for none or unknown), so per-badge outcomes can be read
+exactly. TLDR
 prefetches and automatic card enrichment do not generate interaction events.
 
 SQLite stores events indefinitely in the additive STRICT `interaction_events`

@@ -219,6 +219,8 @@ class RankScoreContext:
     # feedback story per candidate, plus the aligned up-story titles.
     cand_closest_up_idx: NDArray[np.int64] | None = None
     fb_up_titles: list[str] = field(default_factory=list)
+    # The upvoted stories' embeddings, for Explore's Interest clusters.
+    fb_up_embeddings: NDArray[np.float32] | None = None
 
 
 def _feedback_signature(db: Database, user_id: int) -> str:
@@ -277,7 +279,7 @@ HOT_MIN_SCORE = 20
 # in templates/index.html and the TUI) plus 4 that slide in as cards ahead
 # of them are voted.
 VIEW_SIZE = 16
-# Explore serves this many each of Unsure, Novel and Similar.
+# Explore serves this many each of Unsure, Novel and Interest.
 EXPLORE_PER_BADGE = 5
 # Views are picked at this multiple of their served size, so that dedup,
 # votes and stories ageing out of a window between warms leave enough.
@@ -351,7 +353,7 @@ class RankedStory:
     is_discussion_rich: bool = False
     is_high_engagement: bool = False
     is_hot: bool = False
-    is_similar: bool = False
+    is_interest: bool = False
 
 
 def clean_text(raw_text: str, min_len: int = 0) -> str:
@@ -1054,6 +1056,45 @@ def _positive_cluster_centers(
     return centers.astype(np.float32)
 
 
+# Explore's interests: KMeans over each user's upvotes, kept per user and
+# warm-started from the previous centers when the upvotes change (0.02 s vs
+# ~1 s from scratch for 735 upvotes on the VPS, 2026-09-30), so a vote moves
+# the interests a little instead of reshuffling them.
+_INTEREST_CACHE: LRUCache[int, tuple[str, NDArray[np.float32]]] = LRUCache(maxsize=64)
+_INTEREST_CACHE_LOCK = threading.Lock()
+
+
+def interest_centers(
+    user_id: int | None, up_embeddings: NDArray[np.float32], k: int
+) -> NDArray[np.float32]:
+    """Up to *k* L2-normalized centers of the user's upvote embeddings, one
+    per interest; the upvotes themselves when there are no more than *k*."""
+    dim = up_embeddings.shape[1] if up_embeddings.ndim == 2 else 0
+    if len(up_embeddings) == 0 or k <= 0:
+        return np.zeros((0, dim), dtype=np.float32)
+    unique = np.unique(up_embeddings.astype(np.float32), axis=0)
+    if len(unique) <= k:
+        return unique
+    signature = hashlib.sha256(unique.tobytes()).hexdigest()
+    previous = None
+    if user_id is not None:
+        with _INTEREST_CACHE_LOCK:
+            previous = _INTEREST_CACHE.get(user_id)
+    if previous is not None and previous[0] == signature:
+        return previous[1]
+    if previous is not None and previous[1].shape == (k, dim):
+        kmeans = KMeans(n_clusters=k, init=previous[1], n_init=1)
+    else:
+        kmeans = KMeans(n_clusters=k, n_init=3, random_state=0)
+    kmeans.fit(unique)
+    centers = kmeans.cluster_centers_.astype(np.float32)
+    centers /= np.clip(np.linalg.norm(centers, axis=1, keepdims=True), 1e-12, None)
+    if user_id is not None:
+        with _INTEREST_CACHE_LOCK:
+            _INTEREST_CACHE[user_id] = (signature, centers)
+    return centers
+
+
 def _positive_cluster_similarity(
     query_embeddings: NDArray[np.float32],
     positive_embeddings: NDArray[np.float32],
@@ -1291,6 +1332,7 @@ def _score_and_rank(
                 score_context.fb_up_titles = [
                     feedback_stories[i].title for i in np.flatnonzero(up_mask)
                 ]
+                score_context.fb_up_embeddings = fb_up_embs
                 score_context.cand_closest_down = cand_closest_down.astype(np.float32)
                 score_context.cand_closest_neutral = cand_closest_neutral.astype(
                     np.float32
@@ -1693,7 +1735,7 @@ def in_window(posted: int, window: Window, now: float) -> bool:
 class WindowViews:
     """The three views of one time window. Recommended is in model-score
     order and Popular in HN-gravity order. A cached deck's Explore is in
-    pick order (Unsure, then Novel, then Similar picks, each best first) so
+    pick order (Unsure, then Novel, then Interest picks, each best first) so
     ``serve_window`` can cap it per badge; a served Explore is in model-score
     order."""
 
@@ -1726,7 +1768,7 @@ class WindowViews:
                         is_high_engagement=prev.is_high_engagement
                         or r.is_high_engagement,
                         is_hot=prev.is_hot or r.is_hot,
-                        is_similar=prev.is_similar or r.is_similar,
+                        is_interest=prev.is_interest or r.is_interest,
                     )
                 )
         return list(merged.values())
@@ -1782,12 +1824,18 @@ class WindowDeck:
 @dataclass(frozen=True)
 class ExploreContext:
     """Per-candidate arrays for the personalized Explore picks (Unsure/Novel/
-    Similar), rows looked up by story id through ``row_of``. Absent
+    Interest), rows looked up by story id through ``row_of``. Absent
     (``None``) on the cold-deck path, which has no feedback to personalize
-    against."""
+    against.
+
+    ``cand_interest`` is each candidate's nearest interest (a cluster of the
+    user's upvotes, ``interest_centers``); ``interest_sizes`` counts the
+    upvotes in each. No interests (empty ``interest_sizes``), no Interest
+    picks."""
 
     cand_max_sim: NDArray[np.float32]
-    cand_closest_up: NDArray[np.float32]
+    cand_interest: NDArray[np.int64]
+    interest_sizes: NDArray[np.int64]
     row_of: Mapping[int, int]
 
 
@@ -1814,9 +1862,10 @@ def assemble_window_deck(
       ``HOT_MIN_SCORE`` points, else 💬 Talk when it has at least as many
       comments as points, else 🏆 Top.
     - Explore, only with *explore*: Unsure (highest entropy), Novel
-      (farthest from every vote) and Similar (closest to an upvote), picked
-      in that order, each excluding earlier picks and the window's
-      Recommended stories.
+      (farthest from every vote) and Interest (the best story of each of
+      the user's interests, least covered by the served Recommended first;
+      ``interest_picks``), picked in that order, each excluding earlier
+      picks and the window's Recommended stories.
       *is_feedback_match* marks stories that duplicate a voted one;
       Explore skips them and backfills from the rest (``canonicalize_hn_
       dupes`` would drop them downstream anyway; see WORKLOG 2026-07-10).
@@ -1876,12 +1925,49 @@ def assemble_window_deck(
                 lambda r: replace(r, is_novel=True),
                 False,
             ),
-            (
-                lambda r: float(ctx.cand_closest_up[ctx.row_of[r.story.id]]),
-                lambda r: replace(r, is_similar=True),
-                False,
-            ),
         ]
+
+    def interest_picks(
+        pool: list[RankedStory], shown: list[RankedStory], picked: set[int]
+    ) -> list[RankedStory]:
+        """Round-robin over the user's interests: each round takes every
+        interest's best-scoring story not yet picked (and not a voted
+        story's duplicate). Interests the *shown* Recommended stories cover
+        least go first, then bigger ones, so the served picks show the
+        interests Recommended misses."""
+        if explore is None or not len(explore.interest_sizes):
+            return []
+        ctx = explore
+        sizes = ctx.interest_sizes
+
+        def interest_of(r: RankedStory) -> int:
+            return int(ctx.cand_interest[ctx.row_of[r.story.id]])
+
+        covered = np.bincount([interest_of(r) for r in shown], minlength=len(sizes))
+        order = sorted(range(len(sizes)), key=lambda c: (covered[c], -sizes[c]))
+        queues: dict[int, list[RankedStory]] = {c: [] for c in order}
+        for r in pool:  # model-score order
+            if r.story.id not in picked:
+                queues[interest_of(r)].append(r)
+        heads = dict.fromkeys(order, 0)
+        out: list[RankedStory] = []
+        limit = EXPLORE_PER_BADGE * SELECT_MARGIN
+        while len(out) < limit:
+            took = False
+            for c in order:
+                queue = queues[c]
+                while heads[c] < len(queue):
+                    r = queue[heads[c]]
+                    heads[c] += 1
+                    if is_feedback_match is None or not is_feedback_match(r.story):
+                        out.append(replace(r, is_interest=True))
+                        took = True
+                        break
+                if len(out) >= limit:
+                    break
+            if not took:
+                break
+        return out
 
     windows: dict[Window, WindowViews] = {}
     for window in WINDOWS:
@@ -1908,6 +1994,7 @@ def assemble_window_deck(
             for r in take_unmatched(eligible, EXPLORE_PER_BADGE * SELECT_MARGIN):
                 picked.add(r.story.id)
                 explore_view.append(mark(r))
+        explore_view.extend(interest_picks(pool, recommended[:VIEW_SIZE], picked))
         windows[window] = WindowViews(
             tuple(recommended),
             tuple(popular_card(r) for r in popular),
@@ -1926,7 +2013,7 @@ def serve_window(views: WindowViews, window: Window, now: float) -> WindowViews:
         return [r for r in items if in_window(r.story.time, window, now)]
 
     explore: list[RankedStory] = []
-    for badge in ("is_uncertain", "is_novel", "is_similar"):
+    for badge in ("is_uncertain", "is_novel", "is_interest"):
         explore.extend(
             [r for r in current(views.explore) if getattr(r, badge)][:EXPLORE_PER_BADGE]
         )
@@ -2001,7 +2088,8 @@ ATTRIBUTION_MIN_SIM = 0.35
 # 0.77 on profile 151's 1w deck, 2026-09-30). They name one only on a close
 # match: 0.85 was picked by eye on that deck, just above the clear misses
 # (0.64-0.81); good and bad matches overlap, so it trades some good lines
-# for no bad ones. Similar (🎯) is a similarity badge, so it keeps the floor.
+# for no bad ones. Interest (🧭) comes from the user's upvotes, so it keeps
+# the floor.
 BADGED_ATTRIBUTION_MIN_SIM = 0.85
 
 
@@ -2095,6 +2183,7 @@ def assemble_ranked_deck(
             down_mask = fb_labels_arr == 0
             neutral_mask = fb_labels_arr == 1
             fb_embs = get_or_compute_embeddings(feedback_stories, embedder, db)
+            score_context.fb_up_embeddings = fb_embs[up_mask]
             cand_closest_up = (
                 _chunked_max_dot(cand_embeddings, fb_embs[up_mask])
                 if up_mask.any()
@@ -2116,6 +2205,20 @@ def assemble_ranked_deck(
             [cand_closest_up, cand_closest_down, cand_closest_neutral]
         )
 
+    with trace.stage("interest_clusters"):
+        up_embs = score_context.fb_up_embeddings
+        if up_embs is None:
+            up_embs = np.zeros((0, cand_embeddings.shape[1]), dtype=np.float32)
+        centers = interest_centers(user_id, up_embs, config.model.interest_cluster_k)
+        if len(centers):
+            cand_interest = np.argmax(cand_embeddings @ centers.T, axis=1)
+            interest_sizes = np.bincount(
+                np.argmax(up_embs @ centers.T, axis=1), minlength=len(centers)
+            )
+        else:
+            cand_interest = np.zeros(len(candidates), dtype=np.int64)
+            interest_sizes = np.zeros(0, dtype=np.int64)
+
     with trace.stage("window_assembly"):
         deck = assemble_window_deck(
             ranked,
@@ -2123,7 +2226,8 @@ def assemble_ranked_deck(
             now=time.time(),
             explore=ExploreContext(
                 cand_max_sim=cand_max_sim,
-                cand_closest_up=cand_closest_up,
+                cand_interest=cand_interest.astype(np.int64),
+                interest_sizes=interest_sizes.astype(np.int64),
                 row_of={s.id: idx for idx, s in enumerate(candidates)},
             ),
             is_feedback_match=is_feedback_match,

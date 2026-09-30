@@ -221,6 +221,7 @@ _CLIENT_FUNCTIONS = (
     "cycleWindow",
     "tintByRank",
     "feedCard",
+    "queueInteraction",
     "routePrefix",
     "apiPath",
     "request",
@@ -510,6 +511,19 @@ def test_cards_are_built_from_text_only() -> None:
     assert "<img src=x onerror=alert(1)>" in result["text"]
     assert "Because you upvoted: <b>x</b>" in result["text"]
     assert result["id"] == "9" and result["version"] == "5"
+
+
+def test_impressions_carry_the_cards_badge_kinds() -> None:
+    result = _client_harness(r"""
+    globalThis.scheduleInteractionFlush = () => {};
+    setFeed(makeFeed([9, 10]));
+    const badge = kind => ({ kind, icon: '*', label: kind, tooltip: '' });
+    queueInteraction('impression',
+                     feedCard(story(9, { badge_details: [badge('interest'), badge('hot')] }), 5));
+    queueInteraction('impression', feedCard(story(10), 5));
+    console.log(JSON.stringify(interactionEvents.map(e => [e.story_id, e.badges])));
+    """)
+    assert result == [[9, ["interest", "hot"]], [10, []]]
 
 
 def test_keys_match_the_terminal_client() -> None:

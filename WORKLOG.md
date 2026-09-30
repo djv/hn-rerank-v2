@@ -1,5 +1,29 @@
 # Worklog: hn-rewrite
 
+## 2026-09-30 Explore: 🧭 Interest replaces 🎯 Similar; impressions log badges
+
+- Why: since 09-26 profile 151 upvoted 5.6% of shown Explore cards vs 26.8%
+  of Recommended. Estimated per badge (badges were not logged; Explore cards
+  split into thirds by similarity to earlier votes): far-from-votes
+  (Novel-like) 1/78 up, 92% of votes down; the middle third (Unsure-like)
+  1/78; near-an-upvote (Similar-like) 14.1%. Similar used the same weak
+  full-text nearest-upvote signal as the old attribution.
+- Interest: KMeans (k=10) over the user's upvote embeddings, cached per user,
+  warm-started on change (0.02 s vs ~1 s cold on the VPS). Round-robin over
+  interests, least covered by the served Recommended first, best-scoring
+  story each. Preview on a live snapshot (`scripts/preview_explore.py`): 1w
+  surfaced "LeanFIRE in Bangkok" (nomad/FIRE) and "What is the best shape of
+  a city?" (maps/transit); 1d stayed mostly AI with two weak assignments.
+- Impressions carry `badges` (card badge kinds; web and TUI send them);
+  stored in an added `interaction_events.badges` column (`''` default).
+- Unsure checked offline (`scripts/eval_unsure_votes.py`, FINDINGS): votes on
+  the highest-entropy stories teach the ranker no more than random votes;
+  top-scored ones help most. User: keep Unsure, decide in ~2 weeks from the
+  logged per-badge upvote rates.
+- Preview slip: `uv run` in a VPS worktree re-pointed the live venv's
+  editable `hn-rerank` at that worktree for about a minute; `uv sync` in
+  `main` restored it, no journal errors. Next time: `uv run --no-sync`.
+
 ## 2026-09-30 "Because you upvoted" needs a close match on badged cards
 
 - Report: story 49908757 ("Ubuntu 26.04.1 LTS") said "Because you upvoted:

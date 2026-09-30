@@ -1301,6 +1301,7 @@
         storyId: String(story.id), dashboardVersion: String(version),
         rankerArm: 'baseline', storySource: story.source,
         articleUrl: story.article_url, commentsUrl: story.comments_url,
+        badges: (story.badge_details || []).map(badge => badge.kind).join(','),
       });
       const tint = rankTint.get(story.id);
       if (tint && card.style) {
@@ -1761,6 +1762,7 @@
         window: currentWindow,
         source_filter: currentSource,
         ranker_arm: card.dataset.rankerArm || 'baseline',
+        badges: (card.dataset.badges || '').split(',').filter(Boolean),
         occurred_at: Date.now() / 1000,
         ...(durationMs === null ? {} : {duration_ms: Math.round(durationMs)})
       });

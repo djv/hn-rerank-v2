@@ -2384,6 +2384,9 @@ def _handle_flask_feedback(runtime: type[Handler]) -> Response:
         )
 
 
+_BADGE_KIND_RE = re.compile(r"[a-z_]{1,24}")
+
+
 def _parse_interaction_event(raw_event: object, user_id: int) -> InteractionEvent:
     """Validate one raw ledger event; raises ValueError on any bad field."""
     event_types = {"impression", "article_open", "comments_open", "dwell"}
@@ -2406,7 +2409,7 @@ def _parse_interaction_event(raw_event: object, user_id: int) -> InteractionEven
         "occurred_at",
     }
     if not required.issubset(raw_event) or bool(
-        set(raw_event) - (required | {"duration_ms"})
+        set(raw_event) - (required | {"duration_ms", "badges"})
     ):
         raise ValueError("event has unexpected or missing fields")
 
@@ -2477,6 +2480,19 @@ def _parse_interaction_event(raw_event: object, user_id: int) -> InteractionEven
     if event_type != "dwell" and duration_ms is not None:
         raise ValueError("only dwell events may include duration_ms")
 
+    # The card's badge kinds as shown (optional: older clients omit them),
+    # so per-badge outcomes can be read from the ledger.
+    badges = raw_event.get("badges", [])
+    if (
+        not isinstance(badges, list)
+        or len(badges) > 8
+        or any(
+            not isinstance(kind, str) or not _BADGE_KIND_RE.fullmatch(kind)
+            for kind in badges
+        )
+    ):
+        raise ValueError("badges must be a short list of badge kinds")
+
     return InteractionEvent(
         event_id=event_id,
         client_session_id=client_session_id,
@@ -2493,6 +2509,7 @@ def _parse_interaction_event(raw_event: object, user_id: int) -> InteractionEven
         ranker_arm=ranker_arm,
         occurred_at=float(occurred_at),
         duration_ms=duration_ms,
+        badges=",".join(dict.fromkeys(cast("list[str]", badges))),
     )
 
 

@@ -42,8 +42,8 @@ def _rank_top50(
         badges: list[str] = []
         if r.is_novel:
             badges.append("novel")
-        if r.is_similar:
-            badges.append("similar")
+        if r.is_interest:
+            badges.append("interest")
         if r.is_uncertain:
             badges.append("uncertain")
         if not is_hn_source(r.story.source):

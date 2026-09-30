@@ -42,8 +42,8 @@ def _rank_top50_labels(
         badges: list[str] = []
         if r.is_novel:
             badges.append("novel")
-        if r.is_similar:
-            badges.append("similar")
+        if r.is_interest:
+            badges.append("interest")
         if r.is_uncertain:
             badges.append("uncertain")
         if not is_hn_source(r.story.source):
@@ -76,7 +76,7 @@ def _classify_loss(
         if label == "primary":
             counts["pri"] += 1
         else:
-            if "similar" in label:
+            if "interest" in label:
                 counts["sim"] += 1
             if "uncertain" in label:
                 counts["unc"] += 1

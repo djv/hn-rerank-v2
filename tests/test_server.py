@@ -1994,6 +1994,51 @@ def test_flask_test_client_events_accept_negative_story_ids(test_env: Any) -> No
         ]
 
 
+def test_flask_test_client_events_record_badges(test_env: Any) -> None:
+    """Impressions carry the card's badge kinds (deduplicated, in order);
+    events from clients that send none store ""; malformed lists are
+    rejected like any other bad field."""
+    _, db, _, handler, user = test_env
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+    db.upsert_story(
+        Story(
+            id=2711,
+            title="Badged story",
+            url="https://example.com/badged",
+            score=10,
+            time=1600000000,
+            text_content="Body",
+            source="hn",
+        )
+    )
+    badged = _ledger_event("99999999-9999-4999-8999-999999999991", 2711)
+    badged["badges"] = ["interest", "hot", "interest"]
+    plain = _ledger_event("99999999-9999-4999-8999-999999999992", 2711)
+    bad = [
+        _ledger_event(f"99999999-9999-4999-8999-99999999999{i}", 2711)
+        for i in range(3, 6)
+    ]
+    bad[0]["badges"] = "hot"
+    bad[1]["badges"] = ["Hot Story"]
+    bad[2]["badges"] = ["hot"] * 9
+    response = client.post("/api/interaction", json={"events": [badged, plain, *bad]})
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "ok": True,
+        "inserted": 2,
+        "duplicates": 0,
+        "rejected": 3,
+    }
+    with db.conn() as conn:
+        assert sorted(
+            conn.execute("SELECT event_id, badges FROM interaction_events").fetchall()
+        ) == [
+            ("99999999-9999-4999-8999-999999999991", "interest,hot"),
+            ("99999999-9999-4999-8999-999999999992", ""),
+        ]
+
+
 def test_flask_test_client_events_skip_invalid_and_unknown_per_event(
     test_env: Any,
 ) -> None:
