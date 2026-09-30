@@ -1,5 +1,40 @@
 # HN Rerank findings
 
+## "Because you upvoted" coherence — 2026-09-30
+
+Report: 49908757 ("Ubuntu 26.04.1 LTS") said "Because you upvoted: NInfer
+Qwen 3.8-27B uncensored on RTX 5090". Read-only on the VPS DB, profile 151
+(735 upvotes), stored full-text embeddings (mxbai-embed-xsmall, title +
+self + article + up to 6000 chars of comments):
+
+- Ubuntu's nearest upvote 0.70; the next seven 0.63-0.67. By title
+  embedding (64 tokens) its best is 0.33 ("The $60 Gaming PC").
+- Live 1w deck, 47 cards: nearest-upvote similarity min 0.23, median 0.77,
+  median lead over the runner-up 0.015; the 0.35 floor passed 42.
+- Clear misses: SR-71A <- "Things we learned about LLMs in 2024" (0.64),
+  Tank Body Problem <- a GPT-6 Astra post (0.65), Factorio <- "Small Models
+  Have Arrived" (0.76), Nvidia watchdog chip <- "Anthropic CEO says AI swarm"
+  (0.79), ESP32 BitNet <- Jamesob's local-LLM guide (0.81). Good matches
+  also sit low (creatine <- "Does creatine make you smarter?" 0.69, Opus 5.5
+  <- Opus 5 0.82) and weak ones high ("Withdrawal phase" 0.88, "The
+  Education of a Doomer" 0.89): no cutoff separates them.
+- Title-only nearest (median best 0.53) read far better: creatine 0.84,
+  Opus 0.93, SNL/Dario 0.61, Post-AGI 0.56; below ~0.5 it is noise.
+- Shipped (user's choice, `2190914`): cards with a Hot/Top/Talk/Unsure/Novel
+  badge need 0.85, picked by eye above the clear misses. On that deck 22 of
+  42 lines stay (all 20 dropped were 🔥 or 🤔). Live after restart: 1d deck
+  17/38 attributed, Ubuntu (🔥🎯) none.
+
+## TUI review — 2026-09-30
+
+Rendered the reader on the live 1w feed (mocked API; Textual SVG via
+headless Chrome, ImageMagick drops the text). Found: `▲ 0` on 12/47 non-HN
+cards (unknown, not zero), `x.com` for the 5 AINews items, the parsed
+`best_match_title` (42/47) never shown, a static "Loading summary…" during
+~15 s generations. Fixed in `9c17ac0`. Not done: below 100 columns the list
+gets 1fr vs the TLDR's 3fr (2 headlines at 90x39); badges are bare icons
+(labels only in the `b` legend).
+
 ## Live blend, first read — 2026-09-30
 
 Profile 151, stories by first impression (read-only on the VPS DB at 06:55

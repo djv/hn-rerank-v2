@@ -5,6 +5,16 @@ Improve what the dashboard shows the user (live profile 151; user 1 is the
 old profile, stopped 2026-09-24): ranking quality and which sources feed it.
 
 ## Verified result
+- Live `2190914` (2026-09-30 16:38 UTC, restart): "Because you upvoted" on
+  a Hot/Top/Talk/Unsure/Novel card needs similarity >= 0.85 (was 0.35 for
+  all; 49908757 Ubuntu <- RTX 5090 at 0.70). After the restart: dashboard
+  200, 1d deck ready in ~20 s with 17/38 attributed, cached TLDR 0.4 s, no
+  journal errors; uncached TLDR not exercised (every deck story cached).
+  Also in this deploy: `D` (Shift+D) cycles the window back (web and TUI).
+  TUI (`9c17ac0`, local reader): feed names instead of x.com, no `▲ 0`/`💬 0`
+  for non-HN feeds, "Because you upvoted" in the heading, summary wait
+  counter. Tests 1014, TUI 156, ruff, ty pass. FINDINGS.md "'Because you
+  upvoted' coherence", "TUI review".
 - Review fixes (2026-09-30, `fdda723`..`6cd3739`, FINDINGS.md "Code review —
   2026-09-30"): pointer-thread TLDR keying/backoff/rule, eval double blend
   and dense-model mismatch, blend ramp and cache bounds, AINews regen
@@ -25,7 +35,7 @@ old profile, stopped 2026-09-24): ranking quality and which sources feed it.
   FINDINGS.md "Rerank latency — 2026-09-29".
   FINDINGS.md "Linear blend live: rank latency".
 - Also live (from `f49ff0f`): time-window selector (12h/1d/1w/1m/Archive,
-  `d` cycles; web and TUI reopen on the last window picked), AINews
+  `d`/`D` cycle; web and TUI reopen on the last window picked), AINews
   per-topic source (`rss_ainews`), 2026-09-26/27 source changes.
 - TLDRs (live `ea1403b`, 2026-09-29 20:44 UTC): `LLM_PROVIDER=mistral`
   (`mistral-small-latest`, paid key with a $10 cap), 2-4 s per TLDR; the
@@ -106,6 +116,9 @@ old profile, stopped 2026-09-24): ranking quality and which sources feed it.
   snapshots and merged copies live in `~/.local/state/hn-rerank-eval/`.
 
 ## Next step
+- Attribution: 0.85 is eyeballed on one deck. If lines still read wrong,
+  match on title embeddings instead (read-only check: coherent above ~0.55,
+  Ubuntu's best 0.33) or have the user rate ~60 pairs to set the cutoff.
 - **Embed-model hill-climb paused** (2026-09-30 15:28 UTC): Qwen3-0.6B small
   test killed by memory pressure (685MB encoder, 11.5GB/11.5GB used); did not
   reach checkpoint at 200 stories. harrier-270m small test: P@12 0.389 vs best
