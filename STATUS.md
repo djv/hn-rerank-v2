@@ -9,7 +9,10 @@ old profile, stopped 2026-09-24): ranking quality and which sources feed it.
   2026-09-30"): pointer-thread TLDR keying/backoff/rule, eval double blend
   and dense-model mismatch, blend ramp and cache bounds, AINews regen
   abort, three TUI bugs. Tests, ruff, ty and TUI tests pass. The tighter
-  pointer rule still matches all 109 live follows.
+  pointer rule still matches all 109 live follows. Live on the VPS since
+  `28ddde5` (01:21 UTC 2026-09-30): dashboard 200, cached TLDR 0.4 s,
+  uncached 14 s, no journal warnings. Not yet seen live: a rerank and a
+  regen (AINews guard) after the restart.
 - Linear blend live on the VPS since `26b9474` (2026-09-29 17:17 UTC):
   `svm_c = 4.0`, `linear_blend_enabled = true` (0.5 production + 0.2 dense
   LR + 0.3 TF-IDF LR). Rerank after a vote (live `371a2bd`, 21:43-21:48
