@@ -6309,6 +6309,47 @@ async def test_follow_pointer_thread_swaps_in_target_comments(
     db.close()
 
 
+@pytest.mark.asyncio
+async def test_follow_pointer_thread_keeps_comments_hydrated_during_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real comments written while the follow was fetching are not
+    overwritten by the followed thread."""
+    import pipeline.enrichment as enrichment
+    import server
+
+    db = Database(str(tmp_path / "p.db"))
+    story = Story(
+        id=10,
+        title="Intel Microcode Decryptor",
+        url="https://e.com/a",
+        score=830,
+        time=1_658_213_530,
+        text_content="Intel Microcode Decryptor",
+        source="hn",
+        comment_count=1,
+        top_comments="Comments moved to https://news.ycombinator.com/item?id=9.",
+    )
+    db.upsert_story(story)
+
+    async def fake_thread(client: object, sid: int) -> str:
+        db.upsert_story(
+            replace(story, comment_count=40, top_comments="Fresh real discussion."),
+            comments_authoritative=True,
+        )
+        return "Real discussion from thread 9."
+
+    monkeypatch.setattr(enrichment, "fetch_thread_comments", fake_thread)
+
+    followed = await server._follow_pointer_thread(db, story)
+
+    stored = db.get_story(10)
+    assert stored is not None
+    assert stored.top_comments == "Fresh real discussion." == followed.top_comments
+    assert stored.comment_count == 40
+    db.close()
+
+
 def test_old_html_failure_does_not_block_tweet_urls(tmp_path: Path) -> None:
     from pipeline.enrichment import _article_fetch_failure_active
 

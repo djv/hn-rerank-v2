@@ -75,7 +75,7 @@ def _ch_story_item_to_story(item: ChItem) -> Story | None:
         source="hn",
         comment_count=coerce_int(item.get("num_comments")),
         discussion_url=f"https://news.ycombinator.com/item?id={sid}",
-        comment_count_at_fetch=coerce_int(item.get("num_comments")),
+        comment_count_at_fetch=0,
         self_text=self_text,
         top_comments="",
         article_body="",
@@ -245,7 +245,7 @@ def prewarm_top_stories(
     Returns:
         Number of stories whose top_comments was updated.
     """
-    from ch_client import query_stories_with_comments
+    from ch_client import is_transient_error, query_stories_with_comments
 
     if not story_ids:
         return 0
@@ -267,7 +267,8 @@ def prewarm_top_stories(
                 len(chunk),
                 exc,
             )
-            continue
+            if not is_transient_error(exc):
+                break
 
     if not ch_items:
         return 0
@@ -282,11 +283,23 @@ def prewarm_top_stories(
         all_comments = _extract_comments_recursive(children)
         selected = _select_top_comments(all_comments)
         top_comments = join_top_comments([c["text"] for c in selected])
-        if not top_comments:
-            continue
         comment_count = coerce_int(
             item.get("num_comments"), existing.comment_count or 0
         )
+        if not top_comments:
+            # Nothing usable (e.g. only one-word replies): mark the tree as
+            # fetched so the regen prewarm waits for growth instead of
+            # re-querying it every hour.
+            if not existing.top_comments:
+                db.upsert_story(
+                    replace(
+                        existing,
+                        comment_count=comment_count,
+                        comment_count_at_fetch=comment_count,
+                    ),
+                    comments_authoritative=True,
+                )
+            continue
         new_text_content = compose_story_text(
             title=existing.title,
             self_text=existing.self_text,

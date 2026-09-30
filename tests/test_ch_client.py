@@ -536,3 +536,35 @@ def test_cache_key_normalization(monkeypatch: pytest.MonkeyPatch) -> None:
     query_stories_with_comments([2, 1])
     # Same key (sorted), so should be cache hit on the second
     assert call_count["n"] == 2  # 2 calls for first (stories+comments), 0 for second
+
+
+# ---------- is_transient_error ----------
+
+
+def _ch_status_error(status: int, body: str) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "https://play.clickhouse.com/")
+    return httpx.HTTPStatusError(
+        f"Server error '{status}': {body}",
+        request=request,
+        response=httpx.Response(status, request=request),
+    )
+
+
+def test_is_transient_error_classifies_ch_failures() -> None:
+    from ch_client import is_transient_error
+
+    request = httpx.Request("POST", "https://play.clickhouse.com/")
+    assert is_transient_error(httpx.ConnectError("dns", request=request))
+    assert is_transient_error(OSError("Temporary failure in name resolution"))
+    assert is_transient_error(
+        _ch_status_error(500, "Code: 202. DB::Exception: Too many simultaneous queries")
+    )
+    assert is_transient_error(_ch_status_error(503, "Service Unavailable"))
+    assert not is_transient_error(
+        _ch_status_error(500, "Code: 201. DB::Exception: Quota for user `play`")
+    )
+    assert not is_transient_error(
+        _ch_status_error(500, "Code: 2020. DB::Exception: something else")
+    )
+    assert not is_transient_error(_ch_status_error(400, "Code: 62. Syntax error"))
+    assert not is_transient_error(ValueError("unexpected JSON payload shape"))

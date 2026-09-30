@@ -1405,12 +1405,23 @@ async def _follow_pointer_thread(db: Database, story: Story) -> Story:
         )
         return story
     _pointer_follow_failed.pop(story.id, None)
+    # The fetch awaited; a hydration may have rewritten the row meanwhile.
+    fresh = db.get_story(story.id) or story
+    if fresh.top_comments != story.top_comments and (
+        pointer_thread_target(fresh.top_comments or "", source_id=fresh.id) != target
+    ):
+        logging.info(
+            "tldr_detail story_id=%s pointer_thread=%s follow=superseded",
+            story.id,
+            target,
+        )
+        return fresh
     logging.info("tldr_detail story_id=%s pointer_thread=%s", story.id, target)
     story = replace(
-        story,
+        fresh,
         top_comments=comments,
         text_content=compose_story_text(
-            story.title, story.self_text, comments, story.article_body
+            fresh.title, fresh.self_text, comments, fresh.article_body
         ),
     )
     # Authoritative: the followed thread can be shorter than the note.

@@ -1,5 +1,23 @@
 # Worklog: hn-rewrite
 
+## 2026-09-30 ClickHouse quota, live-window retry, pointer-follow race
+
+Open items from the 2026-09-30 review.
+- Quota: ~330 small HN threads whose comments are all one-word replies
+  (3-15 chars) had `comment_count_at_fetch` set at insert but empty
+  `top_comments`, so every hourly regen re-fetched their trees ("prewarmed
+  8/326"), most of the playground's 100 queries/hour per query shape; a
+  restart's extra regen went over. New CH rows now start at
+  `comment_count_at_fetch = 0`, prewarm records an empty fetch, and such
+  threads are re-queried only after a new comment. Prewarm stops at the
+  first non-transient CH error (quota) instead of trying every chunk.
+- Live window: retried only on transient errors (network, Code 202/159/
+  209/210, HTTP 429/502-504); quota or syntax errors fail at once instead
+  of blocking the regen ~10 s more.
+- Pointer follow: re-reads the story after fetching the target thread and
+  writes on top of the fresh row; skips the write when a concurrent
+  hydration replaced the pointer note.
+
 ## 2026-09-30 Review fixes: pointer threads, eval, blend ramp, AINews, TUI
 
 From a three-agent review of 45882a2..9f97224 (FINDINGS.md "Code review —

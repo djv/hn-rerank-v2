@@ -66,10 +66,13 @@ abort, TUI `a` guard, tmux agent check, status tail.
 - ClickHouse playground quota: 21:43 and 21:54 UTC 2026-09-29, prewarm
   hit `queries_per_normalized_hash = 101/100` per hour during repeated
   restarts (each restart prewarms; the comment walk is one query per
-  level per chunk). None after the 22:06 restart. Not fixed.
-- Open, not fixed: prefetch's follow can overwrite comments a concurrent
-  hydration just wrote; live-window retry also retries deterministic
-  errors (up to ~100 s of blocking httpx in the async regen); prose-reply
+  level per chunk). None after the 22:06 restart. Cause (2026-09-30):
+  every regen re-fetched ~330 small threads whose comments are all
+  one-word replies (49809698: 9 comments of 3-15 chars), since an empty
+  selection wrote nothing back. Fixed (WORKLOG 2026-09-30).
+- Fixed 2026-09-30: prefetch's follow overwriting comments a concurrent
+  hydration just wrote; live-window retry of deterministic errors.
+- Open, not fixed: prose-reply
   retry never fires for Responses-API providers (`finish=None`); tweet
   `internal_exception` skips backoff; `_build_story_kids_query` filters
   `deleted/dead` per row version; AINews cards sharing a tweet rebuild

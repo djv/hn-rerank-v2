@@ -417,10 +417,10 @@ def _growth_threshold(fetched: int) -> int:
 def _needs_hn_prewarm(s: Story) -> bool:
     """Whether the regen prewarm should refresh this HN story's ``top_comments``.
 
-    Triggers when (a) ``top_comments`` is empty, (b) we have no fetch
-    history (``comment_count_at_fetch <= 0``), or (c) the live comment
-    count has grown meaningfully since the last prewarm (see
-    ``_growth_threshold``).
+    Triggers when (a) we have no fetch history (``comment_count_at_fetch
+    <= 0``), (b) ``top_comments`` is empty and any comment arrived since
+    the last fetch, or (c) the live comment count has grown meaningfully
+    since the last prewarm (see ``_growth_threshold``).
 
     The threshold catches the 1->284 "stale single-comment stub" case
     (WORKLOG 2026-06-29) and keeps small stories (10-50 fetched comments)
@@ -434,11 +434,11 @@ def _needs_hn_prewarm(s: Story) -> bool:
         return False
     if (s.comment_count or 0) <= 0:
         return False
-    if not s.top_comments:
-        return True
     fetched = s.comment_count_at_fetch or 0
     if fetched <= 0:
         return True
+    if not s.top_comments:
+        return (s.comment_count or 0) > fetched
     growth = (s.comment_count or 0) - fetched
     return growth >= _growth_threshold(fetched)
 
@@ -702,7 +702,7 @@ async def fetch_candidates(
     Comment text for the top-20 ranked cards is fetched by
     `prewarm_top_stories` on every dashboard render (not here).
     """
-    from ch_client import ChItem, query_live_window
+    from ch_client import ChItem, is_transient_error, query_live_window
 
     # 1. Live window from CH (replaces ~125 Algolia search + items calls).
     # play.clickhouse.com fails transiently (DNS, "Too many simultaneous
@@ -718,13 +718,14 @@ async def fetch_candidates(
             )
             break
         except Exception as exc:
-            if delay is None:
+            if delay is None or not is_transient_error(exc):
                 logging.error(
                     "fetch_candidates: CH live_window failed %d times (%r); "
                     "live scores not refreshed this regen",
                     attempt + 1,
                     exc,
                 )
+                break
             else:
                 logging.warning(
                     "fetch_candidates: CH live_window attempt %d failed (%r)",

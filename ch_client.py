@@ -44,6 +44,7 @@ Caching:
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 from typing import Any, TypedDict
@@ -113,6 +114,26 @@ def _post_ch(query: str) -> list[dict[str, Any]]:
     if isinstance(payload, list):
         return payload
     raise ValueError("ClickHouse returned an unexpected JSON payload shape")
+
+
+# CH error codes worth retrying: TOO_MANY_SIMULTANEOUS_QUERIES, TIMEOUT_EXCEEDED,
+# SOCKET_TIMEOUT, NETWORK_ERROR. The playground returns every DB error
+# (including QUOTA_EXCEEDED, Code 201) as HTTP 500, so the status alone
+# says nothing.
+_TRANSIENT_CH_CODES = frozenset({159, 202, 209, 210})
+_CH_CODE_RE = re.compile(r"Code: (\d+)\.")
+
+
+def is_transient_error(exc: BaseException) -> bool:
+    """Whether retrying a failed CH call soon could succeed."""
+    if isinstance(exc, (httpx.TransportError, OSError)):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        if exc.response.status_code in (429, 502, 503, 504):
+            return True
+        match = _CH_CODE_RE.search(str(exc))
+        return match is not None and int(match.group(1)) in _TRANSIENT_CH_CODES
+    return False
 
 
 class ChItem(TypedDict):

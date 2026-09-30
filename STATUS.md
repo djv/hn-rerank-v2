@@ -118,9 +118,11 @@ old profile, stopped 2026-09-24): ranking quality and which sources feed it.
   in `config.toml`, deploy, restart. FINDINGS.md "Live blend, first read".
 - Rerun the blend eval with fixed `prodlr` (live dense model, 10 SVM columns)
   against `prod[svm_c=0.1;linear_blend_enabled=false]`, full and newest-20%.
-- Open review items (FINDINGS.md "Code review — 2026-09-30"): CH playground
-  quota on repeated restarts, prefetch/hydration comment race, live-window
-  retry on deterministic errors, AINews shared-tweet cards.
+- Open review items (FINDINGS.md "Code review — 2026-09-30"): AINews
+  shared-tweet cards, prose-reply retry for Responses-API providers, tweet
+  `internal_exception` backoff. CH quota, pointer-follow race and
+  live-window retry fixed 2026-09-30 (WORKLOG); check the next regen logs
+  "prewarmed N/M" with M near the real new/grown count, not ~330.
 - Open TLDR gaps: raw PDF stored as article text (46108780 fails);
   archive dupe cards not swapped by dupe resolver (live `hn` only).
 - Optional low value: embedding queue (jina-v5-nano, mdbr-leaf-mt, KaLM-mini)

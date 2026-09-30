@@ -58,6 +58,14 @@ Routine ingestion preserves comments with a higher fetched-count marker and
 otherwise prefers longer text; a retained comment snapshot retains its marker.
 Failed or empty HN comment fetches preserve existing comments. Tap hydration
 returns the persisted story; bulk hydration embeds the persisted story.
+`comment_count_at_fetch` is 0 until comments were actually fetched (new CH
+live-window rows start at 0). A regen prewarm that fetches a tree with nothing
+usable (one-word replies) records the count with empty `top_comments`, and
+`_needs_hn_prewarm` then waits for a new comment before querying it again.
+Prewarm and the live-window retry stop on non-transient ClickHouse errors
+(`ch_client.is_transient_error`; quota errors arrive as HTTP 500 `Code: 201`).
+A pointer-thread follow re-reads the row after its fetch and writes on top of
+it, or skips the write when a hydration replaced the pointer meanwhile.
 `comment_count` remains an upwards-only observation, separate from the snapshot.
 
 RSS URL hashes retain their existing IDs. An atomic UPSERT guard rejects a

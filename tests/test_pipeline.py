@@ -1940,6 +1940,42 @@ async def test_fetch_candidates_retries_failed_live_window(
 
 
 @pytest.mark.asyncio
+async def test_fetch_candidates_does_not_retry_quota_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deterministic CH error (quota) is not retried: the retry only
+    burns more quota and blocks the regen."""
+    import asyncio
+
+    import httpx
+
+    from database import Database
+    from pipeline import Config, fetch_candidates
+
+    db_file = tmp_path / "test.db"
+    db = Database(str(db_file))
+    attempts: list[int] = []
+    sleeps: list[float] = []
+    request = httpx.Request("POST", "https://play.clickhouse.com/")
+
+    def quota_live_window(**kw: int) -> list[dict[str, object]]:
+        attempts.append(1)
+        raise httpx.HTTPStatusError(
+            "Server error '500': Code: 201. DB::Exception: Quota exceeded",
+            request=request,
+            response=httpx.Response(500, request=request),
+        )
+
+    async def no_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr("ch_client.query_live_window", quota_live_window)
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+    await fetch_candidates(Config(db_path=str(db_file), days=30), set(), set(), db)
+    assert attempts == [1] and sleeps == []
+
+
+@pytest.mark.asyncio
 async def test_fetch_candidates_ch_live_window_inserts_new(tmp_path, monkeypatch):
     """CH live_window returns story fields; fetch_candidates inserts them
     into the DB with source='hn'."""
@@ -4712,6 +4748,81 @@ def test_prewarm_top_stories_updates_top_comments() -> None:
         db.close()
 
 
+def test_prewarm_top_stories_marks_unusable_tree_fetched() -> None:
+    """A tree with only one-word replies is recorded as fetched, so the
+    regen prewarm stops re-querying it until a comment arrives."""
+    from unittest.mock import patch
+
+    db = Database(":memory:")
+    try:
+        item = pipeline._ch_story_item_to_story(
+            {
+                "id": 43,
+                "type": "story",
+                "title": "Quiet thread",
+                "url": "u",
+                "points": 30,
+                "num_comments": 2,
+                "created_at_i": 1,
+                "story_text": "",
+                "text": "",
+                "children": [],
+            }
+        )
+        assert item is not None and item.comment_count_at_fetch == 0
+        db.upsert_story(item)
+        stored = db.get_story(43)
+        assert stored is not None and pipeline._needs_hn_prewarm(stored)
+
+        ch_item = {
+            "id": 43,
+            "type": "story",
+            "title": "Quiet thread",
+            "num_comments": 2,
+            "children": [
+                {"id": 200, "type": "comment", "text": "yes", "children": []},
+                {"id": 201, "type": "comment", "text": "+1", "children": []},
+            ],
+        }
+        with patch("ch_client.query_stories_with_comments", return_value={43: ch_item}):
+            assert pipeline.prewarm_top_stories([43], db, None) == 0
+        after = db.get_story(43)
+        assert after is not None
+        assert after.top_comments == "" and after.comment_count_at_fetch == 2
+        assert not pipeline._needs_hn_prewarm(after)
+    finally:
+        db.close()
+
+
+def test_prewarm_top_stories_stops_after_quota_error() -> None:
+    """A ClickHouse quota error ends the prewarm; later chunks would only
+    burn more of the hourly quota."""
+    from unittest.mock import patch
+
+    import httpx
+
+    request = httpx.Request("POST", "https://play.clickhouse.com/")
+    quota = httpx.HTTPStatusError(
+        "Server error '500': Code: 201. DB::Exception: Quota for user `play`",
+        request=request,
+        response=httpx.Response(500, request=request),
+    )
+    calls: list[list[int]] = []
+
+    def fake(ids: list[int], max_levels: int = 30) -> dict[int, object]:
+        calls.append(ids)
+        raise quota
+
+    db = Database(":memory:")
+    try:
+        ids = list(range(1, pipeline.enrichment._PREWARM_CHUNK_SIZE * 2 + 1))
+        with patch("ch_client.query_stories_with_comments", side_effect=fake):
+            assert pipeline.prewarm_top_stories(ids, db, None) == 0
+        assert len(calls) == 1
+    finally:
+        db.close()
+
+
 def test_prewarm_top_stories_skips_stories_not_in_db() -> None:
     """If CH returns a story that's not in the DB, skip it."""
     db = Database(":memory:")
@@ -5580,6 +5691,10 @@ def test_needs_hn_prewarm() -> None:
         (make_story("hn", 1, ""), True),
         # No fetch history (comment_count_at_fetch=0) -> True
         (make_story("hn", 1, "x", comment_count_at_fetch=0), True),
+        # Fetched, nothing usable, no new comment since -> False
+        (make_story("hn", 3, "", comment_count_at_fetch=3), False),
+        # Fetched empty, one new comment -> True
+        (make_story("hn", 4, "", comment_count_at_fetch=3), True),
         # Stale: growth=40, fetched=10, threshold=max(10//3, 5) = 5 -> True
         # (was False under max(50, fetched//2, 10); small stories used to
         # need 50+ new comments to trigger, so 10->50 sat stale.)
