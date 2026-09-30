@@ -1,5 +1,25 @@
 # HN Rerank findings
 
+## Explore categories — 2026-09-30
+
+- Live yield, profile 151 since 09-26: 5.6% of shown Explore cards upvoted vs
+  26.8% of Recommended. Badges were not logged, so Explore cards were split
+  into thirds by similarity to earlier votes: far (Novel-like) 1/78 up, 92%
+  of its votes down; middle (Unsure-like) 1/78; near an upvote (Similar-like)
+  14.1%. Similar used the weak full-text nearest-upvote signal.
+- Interest clusters, KMeans k=10 on 151's 735 upvotes, read coherent: AI
+  policy, AI news, open models, AI research, AI coding, nomad/FIRE, health,
+  investing, gadgets, maps/transit. Warm-started refit 0.02 s vs ~1 s cold on
+  the VPS.
+- Live after `34051df`: 1w 🧭 AI buildout, LeanFIRE in Bangkok, Opus 5.5
+  prompting guide, city shape, Live Avatar; 1d 🧭 "AI Is a Collective
+  Disaster", Frog and Toad, month three as a nomad, "AI Gave my brother
+  independence", Minitel. 🤔 on 1w took the investing/health stories
+  (private companies, a health dashboard, a 150k inheritance), which overlap
+  with interests.
+- Badges are logged per impression from `34051df` on; judge each badge by
+  its upvote rate around 2026-10-14.
+
 ## Do Unsure votes teach the ranker more? — 2026-09-30
 
 `scripts/eval_unsure_votes.py` on a live snapshot (profile 151, 3091 votes in
