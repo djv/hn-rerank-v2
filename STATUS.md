@@ -5,17 +5,21 @@ Improve what the dashboard shows the user (live profile 151; user 1 is the
 old profile, stopped 2026-09-24): ranking quality and which sources feed it.
 
 ## Verified result
+- TUI `d304e58` (2026-09-30, local client, no server change): panes under
+  30 rows (`COMPACT_HEIGHT`) keep the footer to one row (status beside
+  "? help") and drop "Because you upvoted" from the heading. A 64x23 render
+  shows a 2-line heading and 1-row footer (summary +4 rows). TUI tests pass
+  (one unrelated prefetch timing test failed once under load, 3/3 alone).
 - Live `fcbfc9a` (2026-09-30 21:55 UTC, restart): hot threads' points and
   comments stay live between regens (feeds read stored counts; a 10-min
   Firebase refresh of the 30 busiest young HN threads, no LLM;
   `counts_version` makes the TUI refetch; a generated TLDR reply carries
-  counts, so `r` shows them). Interest badge icon is 🎯 again. First run
-  22:05: `hot_refresh probed=20 changed=18 ms=729`; /api/feed showed
-  49913571 at 667/412, equal to Firebase. Dashboard 200 (0.28 s), legend
-  🎯 Interest, tldr-cache 204 for the outgrown Argon summary, uncached
-  TLDR 5.3 s, no journal errors. The TUI needs a restart for the new
-  client. Not yet seen: the TUI refetching on a counts_version change live.
-  Tests 1023, TUI 158, browser, ruff, ty pass.
+  counts, so `r` shows them). Interest badge icon is 🎯 again. Runs 22:05
+  (`probed=20 changed=18 ms=729`) and 22:15 (`20/8, 813 ms`); /api/feed
+  showed 49913571 at 667/412, equal to Firebase. Dashboard 200 (0.28 s),
+  legend 🎯 Interest, tldr-cache 204 for the outgrown Argon summary,
+  uncached TLDR 5.3 s, no journal errors. Tests 1023, TUI 158, browser,
+  ruff, ty pass. FINDINGS.md "Hot-thread counts".
 - Live `34051df` (2026-09-30 20:33 UTC, restart): 🧭 Interest replaces 🎯
   Similar; impressions log badge kinds in the new
   `interaction_events.badges` column (added on start, verified). After the
@@ -139,6 +143,10 @@ old profile, stopped 2026-09-24): ranking quality and which sources feed it.
   snapshots and merged copies live in `~/.local/state/hn-rerank-eval/`.
 
 ## Next step
+- Restart the local TUI (`hn-rerank`; started before `fcbfc9a`) and confirm
+  live: counts refresh without `r` after a `hot_refresh changed>0`, `r`
+  shows new counts, and the compact layout in a short pane. Over a day,
+  check `hot_refresh` lines stay under ~1 s with no Firebase warnings.
 - Explore badges (user, 2026-09-30): Unsure stays until ~2026-10-14, then
   keep or drop it (and judge Novel, 🎯 Interest) from the per-badge upvote
   rates in `interaction_events.badges`. Offline, Unsure's votes taught the

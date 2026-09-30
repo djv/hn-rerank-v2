@@ -1,5 +1,27 @@
 # HN Rerank findings
 
+## Hot-thread counts — 2026-09-30
+
+- Symptom: Gemini 4 Argon (49913571, posted 20:04 UTC) showed 419 pts /
+  165 comments in the TUI at 21:00 while Firebase had 444 / 218. `r` at
+  21:01 and 21:02 regenerated the summary (Algolia hydration: 165, then 183
+  comments) and stored 449 / 183, but the TUI still showed 419 / 165.
+- Cause: `/api/feed` copied counts from `CandidatePool` story snapshots
+  (`pipeline/candidate_cache.py`), rebuilt only by the hourly regen
+  (`_pool_changed`); tldr-detail wrote the DB and nothing else. The TUI
+  refetched the feed on `r` before the ~4 s regeneration finished, and the
+  summary reply carried no counts.
+- Algolia lags Firebase on a fast thread: at 21:01 it returned 165 comments
+  while Firebase said 218. The hourly CH pass could also lower a fresher
+  stored score (`upsert_story` wrote `score` unconditionally).
+- After `fcbfc9a`: `hot_refresh` 22:05 probed 20 / changed 18 (729 ms),
+  22:15 probed 20 / changed 8 (813 ms); /api/feed 667 / 412 = Firebase.
+  tldr-cache returned 204 (`prefetch_cache_stale`) for Argon: 294
+  summarized vs 399 stored comments, past max(294 // 3, 5) = 98.
+- Unrelated, pre-existing: `tldr: discussion call failed (status=None),
+  salvaging article-only` 54 times in 2 days (also 21:40, before the
+  deploy); the partial summary is not cached, so the next tap retries.
+
 ## Explore categories — 2026-09-30
 
 - Live yield, profile 151 since 09-26: 5.6% of shown Explore cards upvoted vs
