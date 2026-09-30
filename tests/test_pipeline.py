@@ -7655,3 +7655,34 @@ def test_article_fetch_embeds_the_stored_text_of_a_ranking_copy(
 
     pipeline.get_or_compute_embeddings([stored], embedder, db)
     assert embedder.encode_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_candidates_survives_ainews_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash in the optional AINews source does not abort the regen."""
+    import pipeline
+    from database import Database
+    from pipeline import Config, RssConfig, fetch_candidates
+
+    db_file = tmp_path / "test.db"
+    db = Database(str(db_file))
+    config = Config(
+        db_path=str(db_file),
+        server_port=0,
+        rss=RssConfig(enabled=True),
+        ainews_enabled=True,
+    )
+
+    async def no_rss(**kwargs: object) -> list[Story]:
+        return []
+
+    async def boom(*args: object, **kwargs: object) -> list[Story]:
+        raise AttributeError("'NoneType' object has no attribute 'get'")
+
+    monkeypatch.setattr("ch_client.query_live_window", lambda **kw: [])
+    monkeypatch.setattr(pipeline, "fetch_rss_feeds", no_rss)
+    monkeypatch.setattr(pipeline, "fetch_ainews_stories", boom)
+    candidates, count = await fetch_candidates(config, set(), set(), db)
+    assert count == len(candidates)

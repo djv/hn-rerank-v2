@@ -809,14 +809,18 @@ async def fetch_candidates(
             skip_title_prefixes=(AINEWS_TITLE_PREFIX,) if config.ainews_enabled else (),
         )
         if config.ainews_enabled:
-            rss_stories += await fetch_ainews_stories(
-                config.ainews_feed_url,
-                config.days,
-                exclude_urls,
-                db,
-                max_tweets_per_run=config.ainews_max_tweets_per_run,
-                now=time.time(),
-            )
+            # One optional source must not abort the regen (HN deck included).
+            try:
+                rss_stories += await fetch_ainews_stories(
+                    config.ainews_feed_url,
+                    config.days,
+                    exclude_urls,
+                    db,
+                    max_tweets_per_run=config.ainews_max_tweets_per_run,
+                    now=time.time(),
+                )
+            except Exception:
+                logging.exception("ainews: source failed; regen continues without it")
         deduped_candidates: list[Story] = list(candidates) + rss_stories
     else:
         deduped_candidates = list(candidates)

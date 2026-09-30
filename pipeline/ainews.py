@@ -18,7 +18,7 @@ import hashlib
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 from urllib.parse import quote, urlparse
 
 import feedparser
@@ -192,10 +192,25 @@ def parse_feed(content: str, *, cutoff: float) -> list[TopicCard]:
     return cards
 
 
-def parse_tweet(tid: str, payload: dict[str, Any]) -> Tweet | None:
-    """Normalize an fxtwitter response; None when the tweet is gone."""
-    t = payload.get("tweet")
-    if payload.get("code") != 200 or not isinstance(t, dict):
+def _count(value: object) -> int:
+    """A like/reply/timestamp field; anything not a number counts as 0."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int | float):
+        return int(value)
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return 0
+
+
+def parse_tweet(tid: str, payload: object) -> Tweet | None:
+    """Normalize an fxtwitter response; None when the tweet is gone or the
+    reply is not the expected shape."""
+    if not isinstance(payload, dict):
+        return None
+    body = cast(dict[str, Any], payload)
+    t = body.get("tweet")
+    if body.get("code") != 200 or not isinstance(t, dict):
         return None
     author = t.get("author")
     quote = t.get("quote")
@@ -210,9 +225,9 @@ def parse_tweet(tid: str, payload: dict[str, Any]) -> Tweet | None:
         id=tid,
         author=str(author.get("screen_name", "")) if isinstance(author, dict) else "",
         text=str(t.get("text", "")),
-        likes=int(t.get("likes") or 0),
-        replies=int(t.get("replies") or 0),
-        created=int(t.get("created_timestamp") or 0),
+        likes=_count(t.get("likes")),
+        replies=_count(t.get("replies")),
+        created=_count(t.get("created_timestamp")),
         quote_text=str(quote.get("text", "")) if isinstance(quote, dict) else "",
         links=links,
     )
@@ -290,7 +305,8 @@ async def fetch_ainews_stories(
             status, content, _ = await fetch_with_urllib_fallback(
                 client, feed_url, {"User-Agent": USER_AGENT}
             )
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, OSError) as exc:
+        # OSError: the urllib fallback re-raises URLError/TimeoutError.
         logging.warning("ainews: feed fetch failed: %r", exc)
         return []
     if status != 200:

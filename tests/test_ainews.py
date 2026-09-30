@@ -325,3 +325,27 @@ def test_parse_tweet_keeps_expanded_links() -> None:
 )
 def test_tweet_id_from_url(url: str, expected: str | None) -> None:
     assert ainews.tweet_id_from_url(url) == expected
+
+
+@pytest.mark.parametrize("payload", [None, [], "x", {"code": 200, "tweet": []}])
+def test_parse_tweet_rejects_unexpected_shapes(payload: object) -> None:
+    assert parse_tweet("9", payload) is None
+
+
+def test_parse_tweet_counts_non_numbers_as_zero() -> None:
+    payload = {"code": 200, "tweet": {"text": "t", "likes": {"n": 3}, "replies": "4"}}
+    tw = parse_tweet("9", payload)
+    assert tw is not None and (tw.likes, tw.replies, tw.created) == (0, 4, 0)
+
+
+def test_unreachable_feed_returns_no_stories(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The urllib fallback re-raises URLError when the host is down."""
+    from urllib.error import URLError
+
+    async def down(*args: object, **kwargs: object) -> tuple[int, str, dict[str, str]]:
+        raise URLError("Name or service not known")
+
+    monkeypatch.setattr("http_fetch.fetch_with_urllib_fallback", down)
+    assert _run(db) == []
