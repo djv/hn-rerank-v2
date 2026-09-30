@@ -1202,6 +1202,11 @@ def _tldr_cache_key(
     top_comments: str,
     article_body: str,
 ) -> str:
+    if pointer_thread_target(top_comments, source_id=0) is not None:
+        # Generation drops a pointer note (_generate_tldr), so the key does
+        # too. Summaries cached under the note itself predate that and
+        # invented a discussion (story 38507672); they no longer match.
+        top_comments = ""
     payload = {
         "identity": _llm_cache_identity(),
         "title": title,
@@ -1366,6 +1371,13 @@ def _is_unfollowed_pointer(story: Story) -> bool:
     )
 
 
+# Story id -> monotonic time of its last failed pointer follow. A target that
+# is missing, dead, a comment or all short comments fails every time; retry
+# it at most this often instead of on every tap and prefetch run.
+POINTER_FOLLOW_RETRY_S = 6 * 3600
+_pointer_follow_failed: dict[int, float] = {}
+
+
 async def _follow_pointer_thread(db: Database, story: Story) -> Story:
     """Swap a pointer thread's lone "comments moved to item?id=N" note for
     the comments of thread N, persisted so cached TLDRs keep matching."""
@@ -1374,13 +1386,25 @@ async def _follow_pointer_thread(db: Database, story: Story) -> Story:
     target = pointer_thread_target(story.top_comments or "", source_id=story.id)
     if target is None:
         return story
+    now = time.monotonic()
+    failed_at = _pointer_follow_failed.get(story.id)
+    if failed_at is not None and now - failed_at < POINTER_FOLLOW_RETRY_S:
+        return story
     from pipeline import compose_story_text
     from pipeline.enrichment import fetch_thread_comments
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         comments = await fetch_thread_comments(client, target)
     if not comments:
+        for sid, at in list(_pointer_follow_failed.items()):
+            if now - at >= POINTER_FOLLOW_RETRY_S:
+                del _pointer_follow_failed[sid]
+        _pointer_follow_failed[story.id] = now
+        logging.info(
+            "tldr_detail story_id=%s pointer_thread=%s follow=failed", story.id, target
+        )
         return story
+    _pointer_follow_failed.pop(story.id, None)
     logging.info("tldr_detail story_id=%s pointer_thread=%s", story.id, target)
     story = replace(
         story,
@@ -2652,6 +2676,10 @@ def _cached_tldr_reply(
 
 
 def _stale_tldr_fallback(db: Database, story_id: int, reason: str) -> TldrReply | None:
+    story = db.get_story(story_id)
+    if story is not None and _is_unfollowed_pointer(story):
+        # The only row may be a summary invented from the pointer note.
+        return None
     stale_tldr = db.get_any_tldr_for_story(story_id)
     if not stale_tldr:
         return None
@@ -3095,11 +3123,6 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             article_body=article_body or "",
         )
         cached_tldr = runtime.db.get_tldr_cache(story.id, cache_key)
-        if _is_unfollowed_pointer(story):
-            # A summary cached for a "Comments moved to item?id=N" note
-            # predates pointer following (it invented a discussion); hydrate
-            # so the follow runs and the key moves to the real thread.
-            cached_tldr = None
         # Tap-time probe: a young HN thread that would otherwise serve cached
         # gets one live-count check first; confirmed growth falls through to
         # hydration below instead of serving stale. Miss/failure serves cached.
@@ -3380,7 +3403,7 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
         if not _flask_user(runtime):
             return _flask_json_response({"error": "No session"}, status=401)
         story = runtime.db.get_story(story_id)
-        if story is None or _is_unfollowed_pointer(story):
+        if story is None:
             return Response(status=204)
         key = _tldr_cache_key(
             title=story.title,

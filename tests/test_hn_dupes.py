@@ -458,6 +458,34 @@ def test_ratio_verdict_cache_reuses_pairs() -> None:
             None,
         ),
         ("Self link https://news.ycombinator.com/item?id=7", None),
+        ("Duplicate of https://news.ycombinator.com/item?id=41", 41),
+        ("Duplicate: https://news.ycombinator.com/item?id=41", 41),
+        ("Discussed at length before: https://news.ycombinator.com/item?id=42", 42),
+        ("Previous discussion (2019): https://news.ycombinator.com/item?id=43", 43),
+        (
+            "Discussed 2 days ago with 280 comments: "
+            "https://news.ycombinator.com/item?id=48",
+            48,
+        ),
+        ("Discussion of this article: https://news.ycombinator.com/item?id=49", 49),
+        # Real single comments about something else, not pointers.
+        (
+            "Duplicate code is fine until it isn't, see "
+            "https://news.ycombinator.com/item?id=44",
+            None,
+        ),
+        (
+            "Discussion of the underlying paper: "
+            "https://news.ycombinator.com/item?id=45",
+            None,
+        ),
+        # The destination's note links back to the emptied source.
+        ("Comments moved hither from https://news.ycombinator.com/item?id=46.", None),
+        (
+            "We merged the comments from https://news.ycombinator.com/item?id=47 "
+            "into this thread.",
+            None,
+        ),
     ],
 )
 def test_pointer_thread_target(comments: str, expected: int | None) -> None:

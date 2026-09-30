@@ -6358,13 +6358,17 @@ def test_pointer_thread_skips_stale_cache_and_follows(
         article_body="Interactive 3D walkthrough of a GPT. " * 20,
     )
     db.upsert_story(story)
-    stale_key = server._tldr_cache_key(
-        title=story.title,
-        self_text="",
-        top_comments=note,
-        article_body=story.article_body,
-    )
+    # The legacy key: before pointer notes were dropped, the key hashed them.
+    with monkeypatch.context() as legacy:
+        legacy.setattr(server, "pointer_thread_target", lambda *a, **k: None)
+        stale_key = server._tldr_cache_key(
+            title=story.title,
+            self_text="",
+            top_comments=note,
+            article_body=story.article_body,
+        )
     db.upsert_tldr_cache(story.id, stale_key, "Invented discussion")
+    monkeypatch.setattr(server, "_pointer_follow_failed", {})
 
     async def fake_thread(client: object, sid: int) -> str:
         assert sid == 38505211
@@ -6391,3 +6395,59 @@ def test_pointer_thread_skips_stale_cache_and_follows(
 
     assert resp.get_json()["tldr"] == "Real summary"
     assert seen == ["Real comment about the visualization."]
+
+
+def test_failed_pointer_follow_backs_off_and_caches_article_summary(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A follow that finds nothing is not retried on the next tap: the
+    article-only summary is cached under the note-free key and served, and
+    the stale fallback never serves a pointer story's old row."""
+    import pipeline.enrichment as enrichment
+    import server
+
+    _, db, _, handler, user = test_env
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+    note = "Comments moved to https://news.ycombinator.com/item?id=41."
+    story = Story(
+        id=42,
+        title="Dead target",
+        url="https://example.com/a",
+        score=100,
+        time=1_701_616_959,
+        text_content="Dead target",
+        source="ch_seed",
+        comment_count=1,
+        comment_count_at_fetch=1,
+        top_comments=note,
+        article_body="Article text worth summarizing. " * 20,
+    )
+    db.upsert_story(story)
+    follows: list[int] = []
+
+    async def fake_thread(client: object, sid: int) -> str:
+        follows.append(sid)
+        return ""
+
+    async def fake_generate(
+        title: str, self_text: str, top_comments: str, article_body: str
+    ) -> "server.TldrResult":
+        return server.TldrResult(kind="ok", tldr="Article summary")
+
+    monkeypatch.setattr(server, "_pointer_follow_failed", {})
+    monkeypatch.setattr(enrichment, "fetch_thread_comments", fake_thread)
+    monkeypatch.setattr(server, "generate_detailed_tldr", fake_generate)
+
+    for _ in range(2):
+        resp = client.post("/api/tldr-detail", json={"story_id": story.id})
+        assert resp.get_json()["tldr"] == "Article summary"
+    assert follows == [41]
+    peek = client.get(f"/api/tldr-cache/{story.id}")
+    assert peek.status_code == 200 and peek.get_json()["tldr"] == "Article summary"
+
+    assert server._stale_tldr_fallback(db, story.id, "busy") is None
+    db.upsert_story(replace(story, id=43, top_comments="A real comment."))
+    db.upsert_tldr_cache(43, "old-key", "Old summary")
+    fallback = server._stale_tldr_fallback(db, 43, "busy")
+    assert fallback is not None and fallback.payload["tldr"] == "Old summary"

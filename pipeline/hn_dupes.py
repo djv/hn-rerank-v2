@@ -136,15 +136,28 @@ def extract_hn_dupe_target_id(comment_text: str, *, source_id: int) -> int | Non
 # discussion lives at the link. Not pointers: "Related: <other story>" (a
 # different article), and threads with more than one comment, whose other
 # comments are real discussion (both matched a looser rule on 2026-09-29).
+# Not pointers either: "Duplicate code is..." ("duplicate" must be followed
+# by punctuation, a link or a pointer word) and "Discussion of the underlying
+# paper: <link>" (a discussion of something else). "Discussed 2 days ago
+# with 280 comments: <link>" is one (5 of the live follows read like that).
 POINTER_THREAD_MAX_CHARS = 400
+_POINTER_LEAD = r"(?=\s*(?:[:;,.!()\[\]\-–—]|https?://|item\?id=|$))"
 _POINTER_OPENING = re.compile(
-    r"^\W*(?:yes\W+)?(?:\[?dupe\b|duplicate\b|comments?\s+(?:moved|merged)\b|"
-    r"(?:(?:some|more|other|earlier|previous|big|active)\s+)*discuss(?:ion|ed)\b)",
+    r"^\W*(?:yes\W+)?(?:\[?dupe\b|comments?\s+(?:moved|merged)\b|"
+    rf"duplicate(?:{_POINTER_LEAD}|\s+(?:of|see|here|post|submission|thread|story)\b)|"
+    r"(?:(?:some|more|other|earlier|previous|big|active)\s+)*discuss(?:ion|ed)\b"
+    r"(?!\s+(?:of|about|regarding)\s+(?!this\b|it\b|the\s+same\b)))",
     re.IGNORECASE,
 )
 # dang also writes "Although this post was first, we've moved the comments to".
 _MOVED_ANYWHERE = re.compile(
     r"\b(?:moved|merged)\s+(?:the\s+)?comments\b", re.IGNORECASE
+)
+# The destination's note ("Comments moved hither from item?id=N", "We merged
+# the comments from N into this thread") links to the emptied source.
+_MOVED_HERE = re.compile(
+    r"\b(?:moved|merged)\b.{0,80}?\b(?:hither|from|(?:in)?to\s+this)\b",
+    re.IGNORECASE | re.DOTALL,
 )
 
 
@@ -158,6 +171,8 @@ def pointer_thread_target(top_comments: str, *, source_id: int) -> int | None:
         return None
     text = html.unescape(top_comments)
     if not (_POINTER_OPENING.match(text) or _MOVED_ANYWHERE.search(text)):
+        return None
+    if _MOVED_HERE.search(text):
         return None
     return extract_hn_dupe_target_id(top_comments, source_id=source_id)
 
