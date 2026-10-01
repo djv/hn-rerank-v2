@@ -1,5 +1,23 @@
 # Worklog: hn-rewrite
 
+## 2026-09-30 Review follow-through (`124`)
+
+- Committed/pushed review `04d830d`, standalone CI style fix `16b46ed`, and
+  complete summary-section preservation `4071aec`. Retained the six-file VPS
+  patch in a stash, fast-forwarded cleanly, and restarted the service at
+  03:01:48 UTC (2026-10-01). Source hashes and active after-state verified.
+- Observed live scheduled count changes without refresh, discovered/repaired
+  child summary-node replacement, and verified collapsed Article survives
+  passive live polling. Final dashboard/cached/forced TLDR smoke passes;
+  malformed batch rejects four events with zero inserts. No application errors
+  in the final minute; the known partial-discussion issue is still separate.
+- Corrected blend replay matches live production raw metrics exactly. P@12:
+  development 0.625 -> 0.708, newest 20% 0.667 -> 0.667; pooled AUC
+  0.726 -> 0.786 and 0.739 -> 0.753. No independent/live ranking gain claimed;
+  Recommended coverage is insufficient. Artifacts in the persistent evaluation
+  directory; see FINDINGS.md "Review follow-through" for methods and limits.
+- Preserved Codex shortcut, mockup, kernel log WIP and accumulated databases.
+
 ## 2026-09-30 Preserve summary sections during live count refresh
 
 - Live observation found that count-only refresh kept the card and outer

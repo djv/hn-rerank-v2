@@ -1,5 +1,68 @@
 # HN Rerank findings
 
+## Review follow-through — 2026-09-30 (items 1, 2 and 4)
+
+User selected commit/deployment, actual reader freshness checks and corrected
+ranking evaluation. The separate Codex shortcut and reader mockup remain WIP.
+
+- Committed/pushed the 28 review-only files as `04d830d`. Inventoried the VPS's
+  six-file deployed patch, retained it in a full WIP stash, and fast-forwarded
+  the clean checkout. All six file hashes matched before/after reconciliation.
+  No database maintenance, pruning, schema change or destructive operation.
+- Standalone CI passed all 162 TUI tests on Linux/macOS/Windows, then exposed
+  seven style diagnostics from unpinned Ruff 0.16 (local lock: 0.15.17).
+  `16b46ed` fixes only import order and string parentheses. Backend and all
+  standalone test/lint/type/build/wheel smoke jobs then passed.
+- Live Chrome: scheduled hot refresh at 02:53:15 UTC (2026-10-01) probed 20,
+  changed 7, took 864ms. Normal polling updated Gemini 4 Argon (`49913571`)
+  from 1038 points / 695 comments to 1050 / 702 with the same deck version
+  `1790822585638` and active card; selected/neighbor feeds all had fresh counts.
+  This check also found a gap in the original regression: the outer summary
+  survived, but its child details nodes were replaced by `showSummary`.
+- Tightened Chrome coverage to close Article and require the same details node
+  and closed state after count-only polling. It failed before the fix.
+  `4071aec` skips rendering unchanged cached text/provisional status, clearing
+  that memo on loading/errors. The same test verifies that a changed generated
+  summary still replaces nodes. Backend 1040 passed / 18 skipped (73.78s),
+  Chrome 2 passed (12.77s), Ruff/format/ty clean; backend CI passed.
+- Clean VPS at `4071aec`; restart 03:01:48 UTC, active, Result=success.
+  Deployed template SHA matches local. Live Article stayed collapsed through
+  ordinary polling from deck `1790823710351` to `1790823710352` and subsequent
+  polls. Final retained-cookie smoke: dashboard 200 / 0.01s, feed 27 stories,
+  cached TLDR 200 / <0.01s, forced generation 200 / 4.66s / 1054 points and
+  702 comments, invalid batch rejected=4 / inserted=0. An earlier miss-to-hit
+  prefetch race invalidated the smoke helper's `cached=false` assumption;
+  forcing one known thread made the generation check deterministic.
+  Final minute: no application errors/tracebacks. The previously recorded
+  intermittent article-only discussion failure remains outside items 1/2/4.
+
+Corrected evaluator replay: frozen user-1 2026-09-25 database, all 5189 stored
+384-d embeddings, no new encoder; same evaluation time as the earlier replay.
+Development uses the oldest 80% (8 folds); confirmation uses newest 20% (4
+blocks). Compare `prod[svm_c=0.1;linear_blend_enabled=false]` against
+`prodlr[svm_c=4.0;lr_weight=0.2;tfidf_weight=0.3]`. Live `production` and the
+corrected blend have exactly matching per-fold raw metrics in both runs.
+
+| Replay | P@12 legacy → blend | Pooled AUC legacy → blend |
+|---|---|---|
+| Development, 8 folds | 0.625 → 0.708 | 0.726 → 0.786 |
+| Newest 20%, 4 blocks | 0.667 → 0.667 | 0.739 → 0.753 |
+
+Newest-block mean AUC delta is +0.0138, descriptive paired interval
+[-0.0173, +0.0449]; top-12 delta is zero. Training windows overlap and these
+newest votes have already informed tuning, so this is reused historical
+evidence, not independent confirmation. The judged-only pool explains the
+high NDCG and cannot establish live HN superiority. Recommended 1w has zero
+judged cards in all development folds and 0/0/0/16 in confirmation; no served
+deck gain is established. No ranking settings changed from this replay.
+
+Durable artifacts: `~/.local/state/hn-rerank-eval/review-20261001/`
+(`run.py`, `eval.toml`, full/confirmation JSON and logs, `compare.py`,
+`comparison.json`). Both database backups hash to
+`75ae7f3371d7b60de4593540d6ca57c366126c1e848a3ed52c1d76018da38b93`;
+reports record `16b46ed`, whose evaluator is unchanged from `04d830d`.
+Evaluator SHA: `de84d8f492b651b2f25f719504389ad6bd9bd9de2b24b154108971078f808712`.
+
 ## Review fixes and verification — 2026-09-30
 
 Implemented all eight defects from the Review handoff on top of `fe38d9f`.

@@ -3,12 +3,18 @@
 ## Objective
 Improve what the dashboard shows the user (live profile 151; user 1 is the
 old profile, stopped 2026-09-24): ranking quality and which sources feed it.
-Current task: focused review-fix commit prepared (`gg`), with 28 review-only
-files staged and the exact staged TUI tree verified. All eight defects are
-verified and backend changes are live on the VPS. Evidence and limits:
-[FINDINGS.md](FINDINGS.md#review-fixes-and-verification--2026-09-30).
+Current task: items 1/2/4 complete: review fixes committed/pushed and deployed,
+live count refresh checked, and corrected blend evaluation rerun. Evidence:
+[FINDINGS.md](FINDINGS.md#review-follow-through--2026-09-30-items-1-2-and-4).
 
 ## Verified result
+- Review follow-through (`04d830d`, `16b46ed`, `4071aec`): clean VPS checkout,
+  service restarted 2026-10-01 03:01:48 UTC. Live automatic counts update;
+  collapsed summary sections survive passive polling. Backend 1040/18,
+  Chrome 2, standalone TUI 162/1 on three OSes; lint/type/build gates pass.
+  Corrected evaluator matches live production. P@12 development 0.625 -> 0.708,
+  newest 20% 0.667 -> 0.667; served Recommended coverage insufficient.
+  No ranking change from that replay. FINDINGS.md "Review follow-through".
 - Review fixes on `fe38d9f`: tightened SQLite/evaluator regressions first,
   then fixed concurrent preservation, web/TUI vote rollback, count/TLDR
   freshness, evaluator Interest parity, UTC dates and interaction bounds.
@@ -142,11 +148,11 @@ verified and backend changes are live on the VPS. Evidence and limits:
   shown). FINDINGS.md "Feed yield check — 2026-09-29".
 
 ## Blocker / limits
-- Review fixes: all required automated/live gates pass. Local WIP and the
-  six-file deployed patch are uncommitted. Open web tabs need a page reload
-  for the new inline client; physical passive count updates were not observed.
-  Last-minute journal logged slow embedding (13 texts / 20.4s), no application
-  errors. Real-user ranking gains were not remeasured.
+- Review fixes: committed/pushed and clean on the VPS. Separate shortcut and
+  mockup WIP remains local. Open web tabs need reload for the final client.
+  Live Chrome count changes and collapsed-section preservation checked;
+  a day-long hot-refresh observation and user-observed TUI checks remain.
+  Historical embedding slowness remains; real-user ranking gains unconfirmed.
 - The TLDR discussion call fails intermittently (`tldr: discussion call
   failed (status=None), salvaging article-only`: 54 times in 2 days, also
   before `fcbfc9a`); the partial summary is not cached. Cause not checked.
@@ -163,12 +169,9 @@ verified and backend changes are live on the VPS. Evidence and limits:
   snapshots and merged copies live in `~/.local/state/hn-rerank-eval/`.
 
 ## Next step
-- Prepare a review-only staged commit; preserve unrelated WIP in shared files.
-  Commit/push and reconcile the deployed six-file patch when requested.
 - Reload any open web tab; the local TUI was reloaded by the shortcut task.
-  Observe counts refresh without `r` after a `hot_refresh changed>0` and
-  fresh counts after `r`. Automated client coverage passes. Over a day,
-  check `hot_refresh` lines stay under ~1 s with no Firebase warnings.
+  Live Chrome automatic refresh verified; over a day, check `hot_refresh`
+  lines stay under ~1 s with no Firebase warnings. Confirm the TUI physically.
 - Explore badges (user, 2026-09-30): Unsure stays until ~2026-10-14, then
   keep or drop it (and judge Novel, 🎯 Interest) from the per-badge upvote
   rates in `interaction_events.badges`. Offline, Unsure's votes taught the
@@ -192,8 +195,6 @@ verified and backend changes are live on the VPS. Evidence and limits:
   RSS/Archive stories; not significant, no rollback. Re-read after ~200 more
   shown HN stories. Rollback: `linear_blend_enabled = false`, `svm_c = 0.1`
   in `config.toml`, deploy, restart. FINDINGS.md "Live blend, first read".
-- Rerun the blend eval with fixed `prodlr` (live dense model, 10 SVM columns)
-  against `prod[svm_c=0.1;linear_blend_enabled=false]`, full and newest-20%.
 - Open review items (FINDINGS.md "Code review — 2026-09-30"): AINews
   shared-tweet cards, prose-reply retry for Responses-API providers, tweet
   `internal_exception` backoff. CH quota, pointer-follow race and
