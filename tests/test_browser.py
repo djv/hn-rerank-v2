@@ -305,7 +305,10 @@ def test_dashboard_page_end_to_end(page: Any) -> None:
     assert page.problems == []
 
 
-def test_count_only_poll_updates_header_and_keeps_open_summary(page: Any) -> None:
+def test_count_only_poll_updates_header_and_preserves_summary_sections(
+    page: Any,
+) -> None:
+    page.click("[data-dismiss-tip]")
     page.wait_for_function(
         "() => activeCard()?.querySelector('.tldr-detail-content')?.textContent.includes('summary')"
     )
@@ -315,7 +318,12 @@ def test_count_only_poll_updates_header_and_keeps_open_summary(page: Any) -> Non
         """() => {
             window.__keptCard = activeCard();
             window.__keptSummary = activeCard().querySelector('.tldr-detail-content');
+            window.__keptDetails = window.__keptSummary.querySelector('details');
         }"""
+    )
+    page.locator(".story-card.active details > summary").first.click()
+    assert (
+        page.locator(".story-card.active details").first.get_attribute("open") is None
     )
     counts = [5]
     page.route(
@@ -349,11 +357,34 @@ def test_count_only_poll_updates_header_and_keeps_open_summary(page: Any) -> Non
         """() => ({
             sameCard: activeCard() === window.__keptCard,
             sameSummary: activeCard().querySelector('.tldr-detail-content') === window.__keptSummary,
+            sameDetails: activeCard().querySelector('details') === window.__keptDetails,
+            detailsOpen: activeCard().querySelector('details').open,
             active: activeId,
             header: activeCard().querySelector('.story-header').textContent,
         })"""
     )
     assert observed["sameCard"] and observed["sameSummary"]
+    assert observed["sameDetails"] and not observed["detailsOpen"]
     assert observed["active"] == story_id
     assert "444 pts" in observed["header"] and "218 comments" in observed["header"]
+
+    # A real summary change must still replace those nodes after a refresh.
+    page.route(
+        "**/api/tldr-detail",
+        lambda route: route.fulfill(
+            json={
+                "ok": True,
+                "tldr": "### Article\n- Replacement summary",
+                "points": 444,
+                "comments": 218,
+            }
+        ),
+    )
+    page.locator(".story-card.active .tldr-refresh-btn").click()
+    page.wait_for_function(
+        "() => activeCard().querySelector('.tldr-detail-content').textContent.includes('Replacement summary')"
+    )
+    assert page.evaluate(
+        "() => activeCard().querySelector('details') !== window.__keptDetails"
+    )
     assert page.problems == []

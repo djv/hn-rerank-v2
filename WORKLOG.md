@@ -1,5 +1,17 @@
 # Worklog: hn-rewrite
 
+## 2026-09-30 Preserve summary sections during live count refresh
+
+- Live observation found that count-only refresh kept the card and outer
+  summary container but rebuilt its Article/Discussion nodes. Tightened the
+  existing Chrome regression to close a section and require the same child
+  node and closed state after polling; it failed before the rendering fix.
+- Summary rendering now skips unchanged cached text/provisional state and
+  clears its memo on loading/errors. Chrome also verifies that re-summarizing
+  with different text replaces the nodes. Browser suite: 2 passed (12.77s);
+  Ruff, touched Python formatting and ty pass. Full backend suite: 1040
+  passed / 18 skipped (73.78s, background priority with BLAS threads capped).
+
 ## 2026-09-30 Standalone TUI CI lint compatibility
 
 - Review commit `04d830d` passed backend CI and all 162 TUI tests on Linux,

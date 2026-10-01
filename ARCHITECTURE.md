@@ -495,6 +495,10 @@ The default cycle is 4 hours, so the stale-embedding bound in the preceding hist
 - `build_feed(..., live_counts=db.get_story_counts)` (`/api/feed` and the page's embedded feed) serves `points`/`comments` from the `stories` table; order and badges stay as ranked.
 - `hot_refresh_loop` (`server.py`, own thread) runs every `hot_refresh_interval_seconds` (600; 0 disables): `pipeline.refresh_hot_counts` takes the pool's young HN stories with their stored counts, keeps threads passing `hn_thread_looks_active` (the `tldr_refresh_*` gate: ≤72h, ≥30 comments, ≥8/h), probes the `hot_refresh_max_stories` (30) fastest on Firebase (`_probe_live_items`: score + descendants) and writes them with `db.update_story_counts` (comments never lowered). The hourly ClickHouse pass no longer lowers stored points or comments either (CH can lag Firebase/Algolia).
 - `Handler._counts_version` moves when the refresh or a TLDR hydration changes stored counts; `/api/ranking-ready` returns it as `counts_version`. Web and TUI refetch the selected window and invalidate cached neighbors on a count-only change, keeping the open story and summary. In-flight neighbor responses from before invalidation are ignored. Count revisions are accepted only after a successful refresh, so failed refreshes can retry. Generated `tldr-detail` replies patch stored `points`/`comments` into both clients' cards and cached windows. The web updates the preserved active card's header without replacing its summary.
+Summary rendering leaves the existing child nodes attached when cached text
+and provisional status are unchanged. Count-only refreshes therefore retain
+collapsed Article/Discussion sections as well as the outer card and summary.
+Loading, errors and changed summary content clear or replace the rendered state.
 The Firebase tap/regen probe compares descendants with `comment_count_at_fetch`,
 even when the stored count already reflects that growth. Stored counts are
 healed upwards independently of whether comment hydration succeeds.

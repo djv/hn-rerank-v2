@@ -974,6 +974,7 @@
     let reloadInFlight = null;
     let toastTimer = null;
     const summaries = new Map();        // story id -> {text, provisional}
+    const renderedSummaries = new WeakMap(); // content element -> last drawn summary
     const summaryRequests = new Map();  // story id -> {promise, generate}
     const summaryErrors = new Map();    // story id -> message
     const retryAt = new Map();          // story id -> no generation before (ms)
@@ -1731,17 +1732,26 @@
       const loading = !!request && (request.generate || id === activeId);
       delete contentDiv.dataset.error;
       if (summary && !(loading && summary.provisional)) {
-        contentDiv.innerHTML = parseSimpleMarkdown(summary.text);
-        styleTldrLabels(contentDiv);
-        enhanceTldrContent(contentDiv, { stale: summary.provisional });
-        if (!summary.provisional) ensureTldrRefreshButton(id, contentDiv);
-      } else if (loading) {
-        contentDiv.textContent = 'Loading TLDR...';
-      } else if (summaryErrors.has(id)) {
-        contentDiv.textContent = 'TLDR: ' + summaryErrors.get(id);
-        contentDiv.dataset.error = 'true';
+        const rendered = renderedSummaries.get(contentDiv);
+        // Passive metadata refreshes revisit the active story. Leave identical
+        // summary nodes attached so collapsed sections and scroll survive.
+        if (!rendered || rendered.text !== summary.text || rendered.provisional !== summary.provisional) {
+          contentDiv.innerHTML = parseSimpleMarkdown(summary.text);
+          styleTldrLabels(contentDiv);
+          enhanceTldrContent(contentDiv, { stale: summary.provisional });
+          if (!summary.provisional) ensureTldrRefreshButton(id, contentDiv);
+          renderedSummaries.set(contentDiv, summary);
+        }
       } else {
-        contentDiv.textContent = '';
+        renderedSummaries.delete(contentDiv);
+        if (loading) {
+          contentDiv.textContent = 'Loading TLDR...';
+        } else if (summaryErrors.has(id)) {
+          contentDiv.textContent = 'TLDR: ' + summaryErrors.get(id);
+          contentDiv.dataset.error = 'true';
+        } else {
+          contentDiv.textContent = '';
+        }
       }
       contentDiv.style.display = contentDiv.textContent || contentDiv.children.length ? 'block' : 'none';
     }
