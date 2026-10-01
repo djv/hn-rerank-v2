@@ -13,7 +13,8 @@ from typing import Any, cast
 
 from server import DeckState, Handler, SKELETON_HTML, create_app
 from pipeline import Config, Embedder, RankedStory, WindowDeck, WindowViews
-from database import Database, Story
+from database import Database, Story, User
+from warm_scheduler import WarmScheduler
 
 import numpy as np
 from bs4 import BeautifulSoup
@@ -730,15 +731,38 @@ def test_feedback_idle_threshold_queues_latest_warm(
         dashboard_warm_idle_seconds=0.05,
     )
     ran: list[int] = []
+    started = threading.Event()
+    now = 1000.0
+
+    def run(cls: type[Handler], warm_user: User, version: int) -> None:
+        ran.append(version)
+        started.set()
+
     monkeypatch.setattr(
         handler,
         "_run_warm_attempt",
-        classmethod(lambda cls, warm_user, version: ran.append(version)),
+        classmethod(run),
     )
-    handler._schedule_feedback_warm(user, 2)
-    time.sleep(0.02)
-    handler._schedule_feedback_warm(user, 3)
-    assert ran == []
+    scheduler: WarmScheduler[int, User] = WarmScheduler(
+        handler._run_warm_job, workers=1, clock=lambda: now
+    )
+    handler._scheduler = scheduler
+    try:
+        handler._schedule_feedback_warm(user, 2)
+        now += 0.02
+        handler._schedule_feedback_warm(user, 3)
+        assert ran == []
+        assert scheduler.pending_version(user.id) == 3
+        with scheduler._cond:
+            assert scheduler._pending[user.id].not_before == pytest.approx(1000.07)
+            now = 1000.08
+            scheduler._cond.notify_all()
+        assert started.wait(5)
+    finally:
+        scheduler.clear_pending()
+        # Teardown and wait_idle retain a real, bounded timeout even if an
+        # assertion fails before the controlled clock makes the job runnable.
+        monkeypatch.setattr(scheduler, "_clock", time.monotonic)
     _drain_warms(handler)
     assert ran == [3]
 
@@ -5515,6 +5539,10 @@ def test_page_embeds_the_feed_the_client_builds_cards_from(test_env):
     # Same deck, same orders.
     assert [s.id for s in feed.stories] == [s["id"] for s in api["stories"]]
     assert feed.orders == api["orders"]
+    # The embedded snapshot carries the same fresh metadata as the feed API.
+    assert [(s.id, s.points, s.comments) for s in feed.stories] == [
+        (s["id"], s["points"], s["comments"]) for s in api["stories"]
+    ]
     # The page carries the default window, 1w: the recent story, not the
     # year-old one, which the archive window serves instead.
     assert feed.window == api["window"] == "1w"

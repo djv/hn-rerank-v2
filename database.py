@@ -577,7 +577,10 @@ class Database:
         Authoritative comments and their fetched-count marker move together;
         routine ingestion cannot replace a newer fetched snapshot with an older one.
         """
-        with self.conn() as conn:
+        with self.conn() as conn, conn:
+            # Reserve the SQLite writer before reading preservation fields.
+            # A deferred transaction could read a snapshot another writer replaces.
+            conn.execute("BEGIN IMMEDIATE")
             # Check if the story already exists and has longer cached content
             cursor = conn.execute(
                 "SELECT self_text, top_comments, article_body, "
@@ -648,56 +651,55 @@ class Database:
                         discussion_url=final_discussion_url,
                     )
 
-            with conn:
-                result = conn.execute(
-                    """
-                    INSERT INTO stories (
-                        id, title, url, score, time, text_content, source,
-                        comment_count, discussion_url, fetched_at,
-                        comment_count_at_fetch, self_text, top_comments,
-                        article_body
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET
-                        title=excluded.title,
-                        url=excluded.url,
-                        score=excluded.score,
-                        time = CASE
-                            WHEN stories.time > 0 THEN stories.time
-                            WHEN excluded.time > 0 THEN excluded.time
-                            ELSE 0
-                        END,
-                        text_content=excluded.text_content,
-                        source=excluded.source,
-                        comment_count=excluded.comment_count,
-                        discussion_url=excluded.discussion_url,
-                        fetched_at=excluded.fetched_at,
-                        comment_count_at_fetch=excluded.comment_count_at_fetch,
-                        self_text=excluded.self_text,
-                        top_comments=excluded.top_comments,
-                        article_body=excluded.article_body
-                    WHERE stories.id > 0 OR stories.url IS excluded.url
-                    """,
-                    (
-                        story.id,
-                        story.title,
-                        story.url,
-                        story.score,
-                        story.time,
-                        story.text_content,
-                        story.source,
-                        story.comment_count,
-                        story.discussion_url,
-                        time.time(),
-                        story.comment_count_at_fetch,
-                        story.self_text,
-                        story.top_comments,
-                        story.article_body,
-                    ),
+            result = conn.execute(
+                """
+                INSERT INTO stories (
+                    id, title, url, score, time, text_content, source,
+                    comment_count, discussion_url, fetched_at,
+                    comment_count_at_fetch, self_text, top_comments,
+                    article_body
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    title=excluded.title,
+                    url=excluded.url,
+                    score=excluded.score,
+                    time = CASE
+                        WHEN stories.time > 0 THEN stories.time
+                        WHEN excluded.time > 0 THEN excluded.time
+                        ELSE 0
+                    END,
+                    text_content=excluded.text_content,
+                    source=excluded.source,
+                    comment_count=excluded.comment_count,
+                    discussion_url=excluded.discussion_url,
+                    fetched_at=excluded.fetched_at,
+                    comment_count_at_fetch=excluded.comment_count_at_fetch,
+                    self_text=excluded.self_text,
+                    top_comments=excluded.top_comments,
+                    article_body=excluded.article_body
+                WHERE stories.id > 0 OR stories.url IS excluded.url
+                """,
+                (
+                    story.id,
+                    story.title,
+                    story.url,
+                    story.score,
+                    story.time,
+                    story.text_content,
+                    story.source,
+                    story.comment_count,
+                    story.discussion_url,
+                    time.time(),
+                    story.comment_count_at_fetch,
+                    story.self_text,
+                    story.top_comments,
+                    story.article_body,
+                ),
+            )
+            if result.rowcount == 0:
+                raise StoryIdentityConflict(
+                    f"RSS story ID {story.id} belongs to another URL"
                 )
-                if result.rowcount == 0:
-                    raise StoryIdentityConflict(
-                        f"RSS story ID {story.id} belongs to another URL"
-                    )
 
     @staticmethod
     def _row_to_story(row: tuple[Any, ...]) -> Story:

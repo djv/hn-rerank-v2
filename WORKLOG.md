@@ -1,5 +1,83 @@
 # Worklog: hn-rewrite
 
+## 2026-09-30 Review commit preparation (`gg`)
+
+- Prepared a focused index containing review fixes, regressions, test-quality
+  repairs and related documentation. Kept Codex shortcut changes, reader mockup
+  and `kernel.errors.txt` out of the index, including shared-file hunks.
+- Reused passing backend/Chrome/live evidence after verifying unchanged source
+  hashes. The exact staged TUI tree passed: 162 passed / 1 skipped (47.63s).
+  Ruff, staged Python formatting, ty and index whitespace checks pass. No
+  commit, push or further deployment performed by this preparation step.
+
+## 2026-09-30 Review handoff implemented and verified
+
+- Tightened the SQLite interleaving and complete ordered evaluator parity
+  regressions before the production fixes; removed all resolved `xfail` marks.
+- Fixed atomic SQLite preservation, web/TUI rollback of newer votes, fetched-
+  marker TLDR growth detection, active-card counts and neighboring-window caches,
+  evaluator Interest parity, UTC dates and interaction integer/timestamp bounds.
+- Strengthened independent limiter/chunk/CH oracles; stabilized Reddit spread,
+  TUI impressions, feedback debounce and navigation-prefetch synchronization.
+  Added executed Chrome count/summary coverage and rendered-feed count parity.
+- Gates: backend 1040 passed / 18 skipped (144.26s); current isolated VPS TUI
+  snapshot 162 passed / 1 skipped (48.03s, source/test checksums match local);
+  Chrome 2 passed (12.03s); Ruff, 24-file formatting, ty and whitespace clean.
+  Earlier laptop failures and their corrected tests are recorded in FINDINGS.md.
+- Checked/applied a six-file patch to the clean VPS `fcbfc9a` checkout; restart
+  2026-10-01 00:49:21 UTC. Active service and deployed source hashes verified.
+  Dashboard 200 (0.16s), cached TLDR 200 (0.08s), uncached TLDR 200 (3.14s,
+  105/29), malformed integer batch 200 / rejected=4 / inserted=0. One retained
+  cookie session; no production feedback votes. Bounded journal has no
+  application errors, but one slow-embedding warning (13 texts, 20.4s).
+- Preserved concurrent mockup/Codex shortcut work, original review worktrees
+  and accumulated databases. No maintenance, schema migration, commit or push.
+  Updated ARCHITECTURE.md, FINDINGS.md and STATUS.md. The local reader was
+  reloaded by the concurrent shortcut task; existing web tabs need page reload.
+
+## 2026-09-30 Review recheck: regression tests and test-quality audit
+
+- Follow-up review and handoff: confirmed the new SQLite test can bypass its
+  intended interleaving after a one-second timeout, and the new evaluator
+  assertions accept an empty Recommended deck (production fixture: 31 items).
+  In-process scheduling/mutation checks changed no source. The polling test
+  rejected the unconditional-reload variant tested; no new polling-test
+  finding. Focused rerun: backend 3 passed / 10 xfailed (8.76 s), TUI 2 xfailed
+  (12.70 s). Recorded fix order, WIP boundaries and verification commands in
+  FINDINGS.md "Review handoff"; production fixes remain pending.
+- Rechecked all seven review findings against `fe38d9f`; each reproduced
+  in tests asserting the intended behavior before any expected-failure mark.
+  No production implementation, service, or accumulated database changed.
+- The test audit exposed an additional boundary defect: an out-of-range
+  interaction story ID makes SQLite reject the entire batch, losing its
+  valid neighbor. Added a generated overflow-ID / event-order regression;
+  verified `2**63` returns HTTP 500 with zero events persisted.
+- Added generated properties for overlapping vote/undo sequences, fetched /
+  stored / live comment relationships, and UTC RSS/Atom dates under varying
+  local timezone offsets. Added deterministic regressions for the SQLite
+  writer interleaving, web count refresh, TUI window caches, and evaluator
+  Interest/dedup parity, plus passing UTC and production-deck controls.
+- Known defects have strict `xfail` marks restricted to the specific mismatch
+  exception. Unexpected exceptions and setup assertions remain failures;
+  a fix produces an unexpected pass until its mark is removed. Minimal
+  Hypothesis counterexamples are pinned with `@example` for fast replay.
+- Reviewed existing properties and integration tests. Strong independent
+  oracles cover kNN, embedding cache permutations, Markdown, and deck state.
+  Confirmed weak limiter, chunking, and CH assertions using isolated
+  mutations; also found tap mocks and a parity fixture missing the affected
+  branches, plus browser/TUI timing weaknesses. Details in FINDINGS.md.
+- Validation: final new backend coverage 3 passed / 10 strict expected failures;
+  new TUI coverage 2 strict expected failures. Full backend run before adding
+  the extra interaction property: 1025 passed,
+  18 skipped, 9 expected failures, and the pre-existing
+  `test_enqueue_spread_distributes_evenly` timing failure; it passed alone
+  on rerun. Ruff, formatting for all seven added Python files, `ty check`, and
+  `git diff --check` passed. The full backend gate remains non-green.
+- Full TUI run: 158 passed, 1 skipped, 2 expected failures, and the
+  pre-existing selected-impression timing failure (two legitimate events
+  instead of one under slow startup). It passed alone on rerun. Both full
+  suite gates remain non-green because of these existing timing tests.
+
 ## 2026-09-30 TUI: compact layout for short panes
 
 - Why: in a 64x23 tmux pane the footer took 3 rows (status + key hints

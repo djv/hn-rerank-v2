@@ -365,12 +365,12 @@ def _recommended(
             )
         from pipeline.ranking import RankScoreContext, _chunked_max_dot
 
+        train_emb = (
+            fold.train_emb
+            if fold.train_emb is not None
+            else fold.x_train_base[:, : fold.cand_emb.shape[1]]
+        )
         if not fold.similarities:
-            train_emb = (
-                fold.train_emb
-                if fold.train_emb is not None
-                else fold.x_train_base[:, : fold.cand_emb.shape[1]]
-            )
             for label in (0, 1, 2):
                 fold.similarities[label] = _chunked_max_dot(
                     fold.cand_emb, train_emb[fold.y_train == label]
@@ -380,6 +380,7 @@ def _recommended(
             cand_closest_up=fold.similarities[2],
             cand_closest_down=fold.similarities[0],
             cand_closest_neutral=fold.similarities[1],
+            fb_up_embeddings=train_emb[fold.y_train == 2],
         )
         deck = assemble_ranked_deck(
             ranked,

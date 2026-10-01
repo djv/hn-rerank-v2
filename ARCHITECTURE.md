@@ -67,6 +67,9 @@ Prewarm and the live-window retry stop on non-transient ClickHouse errors
 A pointer-thread follow re-reads the row after its fetch and writes on top of
 it, or skips the write when a hydration replaced the pointer meanwhile.
 `comment_count` remains an upwards-only observation, separate from the snapshot.
+The preservation read, merge and UPSERT run in one `BEGIN IMMEDIATE`
+transaction. SQLite reserves the writer before the read, so pooled connections
+cannot overwrite a snapshot hydrated between that read and its write.
 
 RSS URL hashes retain their existing IDs. An atomic UPSERT guard rejects a
 conflicting URL on a non-positive story ID (`StoryIdentityConflict`). Ordinary
@@ -74,6 +77,8 @@ RSS and Reddit ingestion log and skip conflicts; rejected entries are excluded
 from returned candidates, Reddit snapshots and prewarm. Existing story identity
 and feedback remain intact. This detects collisions; it does not allocate an
 alternative ID or repair historical collisions.
+RSS/Atom parsed date tuples are converted as UTC, independently of the host's
+local timezone.
 
 ### 3.2 Embedding Model & Feature Space
 
@@ -489,7 +494,10 @@ The default cycle is 4 hours, so the stale-embedding bound in the preceding hist
 **Hot-thread counts between regens (2026-09-30).** Decks hold story snapshots from the last candidate-pool build (hourly regen), so a thread gaining 200 comments an hour used to show frozen counts until the next regen. Three pieces keep counts live without an LLM call:
 - `build_feed(..., live_counts=db.get_story_counts)` (`/api/feed` and the page's embedded feed) serves `points`/`comments` from the `stories` table; order and badges stay as ranked.
 - `hot_refresh_loop` (`server.py`, own thread) runs every `hot_refresh_interval_seconds` (600; 0 disables): `pipeline.refresh_hot_counts` takes the pool's young HN stories with their stored counts, keeps threads passing `hn_thread_looks_active` (the `tldr_refresh_*` gate: ≤72h, ≥30 comments, ≥8/h), probes the `hot_refresh_max_stories` (30) fastest on Firebase (`_probe_live_items`: score + descendants) and writes them with `db.update_story_counts` (comments never lowered). The hourly ClickHouse pass no longer lowers stored points or comments either (CH can lag Firebase/Algolia).
-- `Handler._counts_version` moves when the refresh or a TLDR hydration changes stored counts; `/api/ranking-ready` returns it as `counts_version`, and the TUI refetches the window (keeping summaries and the open story) when it changes. A generated `tldr-detail` reply carries the stored `points`/`comments`, which the TUI shows at once (so `r` updates them). The web page shows fresh counts whenever it loads a feed.
+- `Handler._counts_version` moves when the refresh or a TLDR hydration changes stored counts; `/api/ranking-ready` returns it as `counts_version`. Web and TUI refetch the selected window and invalidate cached neighbors on a count-only change, keeping the open story and summary. In-flight neighbor responses from before invalidation are ignored. Count revisions are accepted only after a successful refresh, so failed refreshes can retry. Generated `tldr-detail` replies patch stored `points`/`comments` into both clients' cards and cached windows. The web updates the preserved active card's header without replacing its summary.
+The Firebase tap/regen probe compares descendants with `comment_count_at_fetch`,
+even when the stored count already reflects that growth. Stored counts are
+healed upwards independently of whether comment hydration succeeds.
 Summaries still regenerate only on open: `/api/tldr-cache` reports a miss (`prefetch_cache_stale`) for an active thread whose stored comment count grew past its summarized count by `_growth_threshold` (max(fetched // 3, 5)), so opening it goes to `tldr-detail`, which refreshes the comments from Algolia and rewrites the summary. The TUI also forgets kept summaries (except the open one) of stories whose comment count grew in a refetched feed.
 
 ### 3.8 Stale Comment Backfill & Data Integrity
@@ -573,6 +581,10 @@ source features cost ~−0.014/−0.007 NDCG@40, tier blend is neutral), and
 `tier2_centroid` plus the `gravity` / `candidate_order` baselines. `--svm-c` / `--svm-gamma` add an
 `svm_override` entry; `--sweep-svm` runs the C/γ grid through the same engine
 (replacing the deleted `scripts/svm_hparam_sweep.py` wrapper).
+
+Deck assembly always receives the fold's training upvote embeddings, including
+when similarity features are cached. Interest selection and semantic deduplication
+therefore match serving without introducing held-out feedback into the fold.
 
 Each run opens the source DB read-only via a consistent temporary SQLite backup
 (including committed WAL pages) and freezes configuration and evaluation time.
@@ -750,6 +762,9 @@ dashboard shell retains its 1280px cap and optional filter rail.
 ### 4.3 Client-side Rendering
 
 The raw Markdown response is formatted on the fly using a robust, line-by-line parser (`parseSimpleMarkdown`) to render headers, bold text, and lists safely.
+Web and TUI feedback writes remain serialized in action order. Each optimistic
+vote/undo captures a per-story revision; failure rollback applies only if that
+revision is still current, preserving a later choice on the same story.
 
 ### 4.4 Interaction ledger
 
@@ -776,8 +791,10 @@ erase historical exposure data or block retention maintenance. The migration
 script creates a consistent backup and verifies integrity before and after the
 schema change.
 
-Ingestion is per-event (since 2026-07-15): any nonzero integer story ID is
-valid — non-HN stories use negative synthetic IDs — and a malformed event or
+Ingestion is per-event (since 2026-07-15): any nonzero signed 64-bit story ID is
+valid — non-HN stories use negative synthetic IDs. Dashboard version and
+position must fit nonnegative signed 64-bit integers; timestamps must convert
+to finite positive floats. A malformed event or
 one referencing an unknown story is rejected or skipped individually, counted
 in the response's `rejected` field, and logged at WARNING; it never discards
 its batch neighbors. Only envelope-level problems (bad JSON, wrong shape,

@@ -1,5 +1,281 @@
 # HN Rerank findings
 
+## Review fixes and verification — 2026-09-30
+
+Implemented all eight defects from the Review handoff on top of `fe38d9f`.
+Preserved existing review WIP, original worktrees, `kernel.errors.txt`, the
+reader mockup and the concurrent Codex shortcut change. No commit/push,
+database maintenance, schema migration, or destructive database operation.
+
+- Tightened the two regressions first. An unprotected SQLite snapshot requires
+  the fresh writer to commit before stale release; a protected snapshot requires
+  a verified fresh attempt. Timeout is a setup failure. Evaluator parity now
+  compares complete ordered Recommended IDs in every window and keeps the
+  Interest assertion; the production control requires 31 Recommended entries.
+- `upsert_story` reserves the SQLite writer with `BEGIN IMMEDIATE` before its
+  preservation read, making merge/write atomic across pooled connections.
+  Existing merge rules remain intact; the real temporary-SQLite race passes.
+- Web/TUI capture a per-story revision when queuing each optimistic action.
+  Older failed votes or undos cannot reverse newer actions. Generated web
+  sequences check an independent acknowledged-write model and exact request
+  order; event-gated TUI tests cover both vote and undo failures.
+- The live-comments probe compares against `comment_count_at_fetch`, including
+  when stored metadata already records the growth. Generated relationships
+  exercise tap and regen helpers without mocking away the faulty filter.
+- Web refresh patches the active card's header while keeping its summary DOM.
+  Count-only polls invalidate neighboring caches and obsolete in-flight replies.
+  Generated TLDR counts patch cards and cached feeds. TUI count changes also
+  invalidate/re-prefetch neighbors. Changed count revisions are consumed only
+  after successful refreshes so failed reads can retry.
+- Evaluator deck assembly always receives fold-local training upvote embeddings,
+  including with cached similarities. Interest/dedup parity matches serving;
+  no held-out labels or raw-embedding scaling were introduced. Real-user metric
+  gains were not remeasured.
+- RSS/Atom dates use `calendar.timegm`. Generated dates verify host timezone
+  independence. Interaction events enforce signed-64 story IDs, nonnegative
+  signed-64 versions/positions and finite timestamp conversions; generated mixed
+  batches retain valid neighbors even when another integer overflows `float()`.
+- Strengthened limiter decisions/bucket consumption with an independent model,
+  exact retained token prefixes and realistic CH `kids`/attached-child checks.
+  Controlled clocks/events replace timing windows for Reddit spread, TUI
+  impressions and feedback debounce. The navigation-prefetch test drains actual
+  background work before its assertions. Browser refresh awaits the promise;
+  Chrome and rendered-feed contracts verify count/summary preservation.
+
+Final verification:
+
+- Backend: `batch uv run --no-sync pytest tests/ -n 4 -q` — **1040 passed,
+  18 skipped, 144.26s**. The preceding run exposed the existing wall-clock
+  debounce failure; the controlled-clock replacement passes. Resolved regression
+  `xfail` marks were removed.
+- TUI: **162 passed, 1 skipped, 48.03s** on an isolated current `src`/`tests`
+  snapshot in `/tmp/hn-review-MCJ0r0/tui` on the VPS. Used the existing project
+  venv with `uv run --no-sync pytest tests -n 8 -q`, explicit snapshot
+  `PYTHONPATH`, idle priority, a two-CPU quota and 4GB memory cap; no environment
+  sync or deployed-client replacement. Checksums match the final local files.
+  Earlier laptop gates exposed the now-corrected neighbor-fetch expectation and
+  a known three-second prefetch timeout under concurrent sweeps. Each corrected
+  test also passed alone. Concurrent shortcut changes remain separate WIP.
+- Chrome: `batch uv run --no-sync --group browser pytest tests/test_browser.py
+  -m browser -q` — **2 passed, 12.03s**. Throwaway server and mocked network/LLM.
+- Ruff, formatting of all 24 touched Python files, ty and diff whitespace pass.
+
+Live verification:
+
+- Inspected a clean VPS checkout at `fcbfc9a`, checked/applied only the six-file
+  backend/evaluator patch, and restarted `hn_rewrite.service` at
+  **2026-10-01 00:49:21 UTC**. Final state: active, `Result=success`, PID 886763.
+  All six deployed file hashes match the verified local sources. The deployed
+  patch remains uncommitted; no unrelated remote files changed.
+- One retained cookie session: dashboard **200 / 0.16s**, 1w feed **200 / 28
+  stories**, readiness with valid count revision **0**; cached TLDR
+  `-1569532955` **200 / 0.08s**; uncached TLDR `49915082` **200 / 3.14s**,
+  `cached=false`, complete/non-stale, **105 points / 29 comments**.
+- Live oversized story/version/position/timestamp events returned **200,
+  rejected=4, inserted=0**. Valid-neighbor persistence is covered against real
+  temporary SQLite in the generated regression; no production feedback votes
+  were submitted for smoke testing.
+- Bounded last-minute journal scan plus the one-minute smoke window: no
+  application errors/tracebacks. Expected malformed-event rejection warning;
+  regeneration also logged `embedding_slow` (13 texts, 20.4s), still a performance
+  limit. The first smoke helper used the wrong readiness query name (400);
+  corrected to `min_version` before the successful full smoke.
+- Current local reader PID 2414349 started at 20:32:25 EDT, after the final
+  client source edit at 20:29:56. Its reload/render was verified by the concurrent
+  shortcut task. Open web tabs need a page reload to load the new inline script;
+  passive count updates on the user's physical display were not observed here.
+
+## Review handoff — 2026-09-30
+
+Historical starting plan; completed implementation and verification are above.
+
+Work in `/home/d/code/hn-rerank`. Read `/home/d/AGENTS.md`,
+`/home/d/AGENT-ACCESS.md`, project `AGENTS.md`, and `STATUS.md` first.
+This handoff prepares the next implementation pass; no production fixes,
+commit, push, production database access, or deployment occurred in this review.
+
+### Starting state and preservation
+
+- Last inspected: `main` at `fe38d9f`. Recheck the live tree before editing.
+- Review WIP is the three modified docs (`STATUS.md`, `FINDINGS.md`,
+  `WORKLOG.md`) and seven untracked test files listed in the next section.
+  Preserve unrelated `kernel.errors.txt` and `docs/mockups/`.
+- The `hn-rerank-review-{clients,ranking,server}` worktrees still contain
+  untracked original review tests. The integrated versions are in the main
+  checkout; inventory before any cleanup. Leave `hn-rerank-window` alone.
+- Use in-memory or temporary test databases. Preserve all accumulated
+  databases and feedback. Do not run maintenance or migrations as part of
+  these fixes. Keep raw embeddings unscaled and add no unnecessary deps.
+
+### Implementation order
+
+1. **Repair the two new regression tests first.**
+   `tests/test_database_concurrency.py:127` ignores the result of
+   `fresh_done.wait(1)` and resumes the stale writer. An in-process scheduling
+   check delayed the fresh writer until the stale writer finished: the test
+   body passed on unchanged buggy production code. With its current strict
+   mark this is a false XPASS, not proof of a fix. Establish and verify the
+   interleaving explicitly; if the fix serializes writers, deliberately
+   adapt the coordination rather than accepting an unexplained timeout.
+   `tests/test_eval_deck_parity.py:199` only checks that story 1 is absent.
+   Replacing the evaluator result with a production deck whose Recommended
+   views were emptied passed both new evaluator assertions; production has
+   31 Recommended entries in this fixture. Compare complete ordered IDs
+   against `_production_deck`, retaining the Interest/badge check.
+2. **Prevent SQLite lost updates** in `database.py:572` (`upsert_story`).
+   Make the preservation read/merge/write atomic across pooled writers so
+   routine ingestion cannot overwrite newly hydrated content and counts.
+3. **Fix optimistic vote/undo rollback** in web `submit`
+   (`templates/index.html:1517`) and TUI `Reader.submit`
+   (`clients/tui/src/hn_rerank/app.py:1786`). A failed earlier request must
+   not undo a later same-story action or duplicate history. Preserve request
+   ordering and test both vote and undo failures.
+4. **Fix the three count/summary freshness defects.** The tap probe must
+   compare live comments with the fetched marker even when the stored count
+   already reflects growth (`pipeline/__init__.py:545`, `server.py:2645`).
+   Web refresh must patch the preserved active card and observe count-only
+   changes (`showFeed`, `pollFeedVersion`). TUI count refresh must invalidate
+   or update prefetched windows as well as the selected window.
+5. **Restore evaluator Interest parity** in
+   `scripts/eval_ranker_variants.py:328` (`_recommended`): provide fold-local
+   upvote embeddings even when similarities are cached. Preserve train/test
+   isolation. The reproduction proves deck divergence, not inflated metrics
+   or a measured effect on real user rankings.
+6. **Parse feed dates as UTC**, independent of host timezone; replace local
+   conversions in `pipeline/enrichment.py:686,690` with UTC conversion.
+7. **Validate interaction integer bounds at the HTTP boundary**
+   (`server.py:2412`, `_parse_interaction_event`). Reject malformed individual
+   events while retaining valid neighbors; check all persisted integer fields,
+   including signed story IDs. `2**63` currently yields HTTP 500 and loses
+   the valid event in the same batch. Keep tests meaningful and structured.
+8. **Strengthen existing tests:** independent per-key/global limiter decisions
+   and bucket consumption; exact retained chunk prefix; realistic CH `kids`
+   responses and attached child IDs. Stabilize the Reddit queue and TUI
+   impression tests using controlled clocks/events. Correct the browser
+   synchronization that awaits `reloadInFlight` instead of its `.promise`.
+
+### Validation and completion
+
+- New tests currently use `xfail(strict=True, raises=<specific mismatch>)`.
+  Run affected tests with `--runxfail` to inspect the original assertion;
+  remove each mark with its fix. Do not broadly xfail new failures.
+- Latest focused rerun: backend 3 passed / 10 xfailed (8.76 s); TUI 2 xfailed
+  (12.70 s). The mutation/scheduling experiments above were in-process only;
+  no production or test source was changed by the follow-up review.
+- Earlier full runs remain the latest full-suite evidence: backend
+  1025 passed / 18 skipped / 9 xfailed / 1 existing queue timing failure
+  (before the extra integer property); TUI 158 passed / 1 skipped / 2 xfailed /
+  1 existing impression timing failure. Both failing tests passed alone.
+  Ruff, changed-file format, and ty passed then. These are not clean full gates.
+- Run affected files after each logical edit, then sequentially:
+  `batch uv run --no-sync pytest tests/ -n 4` from the root;
+  `batch uv run --no-sync pytest tests -n 8` from `clients/tui`;
+  root browser tests via
+  `batch uv run --no-sync --group browser pytest tests/test_browser.py -m browser`.
+  Browser dependencies must be installed for `--no-sync` to work.
+  Run `uv run --no-sync ruff check .`, changed-file
+  `uv run --no-sync ruff format --check <files>`,
+  `uv run --no-sync ty check`, and `git diff --check`.
+- Check for other heavy jobs before starting a sweep; run one at a time.
+  Update template contracts in `tests/test_server.py` when changing the web UI.
+  Update these docs with actual results and remaining limits.
+- For runtime verification, inspect the actual service host and deployed
+  checkout first. Follow AGENTS.md's restart and dashboard/cached/uncached TLDR
+  smoke protocol, keeping one cookie session and scanning the last minute of
+  `hn_rewrite.service` logs. Verify client count/vote behavior as well. A local
+  test pass is not deployment evidence; preserve remote WIP before any deploy.
+
+## Review recheck and test quality — 2026-09-30
+
+Scope: live checkout `fe38d9f`; existing property tests and relevant backend,
+ranking, web/browser, and TUI integration tests. Test-only additions; no
+production database access or service restart. All seven original findings
+and an additional interaction-batch boundary bug reproduced with unmarked
+intended-behavior assertions. The evaluation reproduction proves
+deck divergence, not the frequency or size of an effect on real ranking metrics.
+
+Added coverage:
+
+- `tests/test_database_concurrency.py`: controlled real SQLite pooled-writer
+  interleaving; an old writer overwrites the newer comments, body and counts.
+  Scheduling matters more than generating arbitrary text or numbers; the
+  follow-up handoff above identifies a timeout that still needs tightening.
+- `tests/test_tldr_probe_properties.py`: generated count relationships use
+  both real probe helpers, mocking only Firebase. Shrunk failure: fetched=1,
+  stored=2, live=2 returns no growth. Checks count preservation independently.
+- `tests/test_client_state_regressions.py`: variable-length vote/undo chains
+  with an earlier request failure and an independent acknowledged-write model.
+  An earlier failed vote loses the final vote; a failed undo duplicates history.
+  Deterministic tests also prove the active web card retains old counts and
+  count-only polling starts no refresh.
+- `tests/test_rss_date_properties.py`: generated UTC dates and fixed local
+  timezone offsets, for RSS publication and Atom update fields. A one-minute
+  offset already changes the stored instant; UTC controls pass.
+- `tests/test_eval_deck_parity.py`: a bounded fold-local deck where Interest
+  affects Recommended semantic deduplication. A production control passes;
+  evaluation omits the Interest crosspost and retains the duplicate.
+- `clients/tui/tests/test_client_state_regressions.py`: event-gated vote
+  rollback and prefetched-window count regressions. Current window shows
+  444/218; selecting the cached neighbor restores 100/10.
+- `tests/test_interaction_integer_properties.py`: generated signed 64-bit
+  overflow story IDs and mixed-batch ordering exercise Flask parsing through
+  real SQLite insertion. At `server.py:2453`, IDs are not storage-bounded;
+  `database.py:1437` raises on binding `2**63`. Verified HTTP 500 and no
+  inserted events, losing the valid neighbor instead of rejecting only the
+  malformed event. This is an additional P2 finding.
+
+The known failures use `xfail(strict=True, raises=<specific mismatch type>)`:
+only the identified invariant failure is expected. Remove each mark with its
+implementation fix. To see the original failing assertions, run the new files
+with `--runxfail`. No Hypothesis property was added where generated values would
+merely decorate a fixed missing-field or scheduling regression.
+
+Existing tests worth preserving:
+
+- Scalar kNN oracle (`test_pipeline.py:6605`), embedding-cache states and
+  permutations (`test_data_invariants.py:113`), exhaustive comment packing
+  (`test_comment_packing.py`), chronological splits / URL isolation, and the
+  deck-version state machine check useful independent contracts.
+- Markdown properties generate structured documents, assert idempotence,
+  bounds and ordered subsequences, and execute the JavaScript mirror. TUI
+  boundary properties generate valid feeds and use an independent Unicode
+  sanitation oracle. Finite tokens inside variable structures are useful
+  generators, not just parametrization.
+
+Concrete quality gaps, verified without editing existing tests:
+
+- `tests/test_server.py:2493` mocks `_probe_live_counts`, so its healed-count
+  case bypasses the production filter that causes the stale-summary bug.
+- `tests/test_eval.py:43,146` asserts whole-deck parity with a pool exhausted
+  by Recommended, Unsure and Novel; Interest never gets exercised. The new
+  deck topology reaches that branch.
+- `tests/test_server_properties.py:167-202` caps its valid numeric generators
+  and stops at parsing. It never tests parsed values against SQLite storage,
+  so it misses the oversized-integer batch loss covered by the new property.
+- `tests/test_server_properties.py:70-83` claims atomic multi-bucket denial
+  but checks only the global admission ceiling. An always-deny limiter passes
+  its oracle. Compare each decision and bucket consumption with an independent
+  per-key/global model.
+- `tests/test_embedding_bakeoff.py:118-123` allows an empty prefix for text
+  beyond the chunk budget. Returning `[""]` passes the 60-word / one-token
+  case. Assert the exact prefix that fits the available budget.
+- `tests/test_ch_client.py:322-370` checks only that `children` exists; its
+  mock has no story `kids`. Returning no comment trees still passes. Use
+  separate realistic responses and assert attached child IDs.
+- `tests/test_browser.py:229` awaits the `reloadInFlight` object, not its
+  `.promise`; the polling loop eventually observes readiness, but this does
+  not establish the intended synchronization.
+- `clients/tui/tests/test_impressions.py:17-26` includes a legitimate initial
+  impression if startup takes long enough; `settle` deliberately does not
+  await impression workers. This explains the double-event failure under
+  load. `tests/test_reddit_fetch_queue.py:190` also assumes tight wall-clock
+  scheduling. Use controlled clocks or observable events rather than narrow
+  timing windows for these contracts.
+- Production raw-embedding preservation lacks a direct assertion on estimator
+  inputs; existing feature-concatenation and eval-scaler tests cover neighboring
+  layers. Node feed tests intentionally stub summary rendering and cancellation,
+  so those behaviors require browser coverage.
+
 ## Hot-thread counts — 2026-09-30
 
 - Symptom: Gemini 4 Argon (49913571, posted 20:04 UTC) showed 419 pts /

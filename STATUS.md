@@ -3,8 +3,23 @@
 ## Objective
 Improve what the dashboard shows the user (live profile 151; user 1 is the
 old profile, stopped 2026-09-24): ranking quality and which sources feed it.
+Current task: focused review-fix commit prepared (`gg`), with 28 review-only
+files staged and the exact staged TUI tree verified. All eight defects are
+verified and backend changes are live on the VPS. Evidence and limits:
+[FINDINGS.md](FINDINGS.md#review-fixes-and-verification--2026-09-30).
 
 ## Verified result
+- Review fixes on `fe38d9f`: tightened SQLite/evaluator regressions first,
+  then fixed concurrent preservation, web/TUI vote rollback, count/TLDR
+  freshness, evaluator Interest parity, UTC dates and interaction bounds.
+  Independent oracles strengthened; timing synchronization stabilized;
+  resolved expected-failure marks removed. Backend 1040 passed / 18 skipped;
+  current TUI snapshot 162 passed / 1 skipped; Chrome 2 passed; Ruff, format,
+  ty clean. Six-file backend patch live on `fcbfc9a` after 00:49:21 UTC
+  restart (2026-10-01): dashboard 200, cached TLDR 0.08s, uncached 3.14s,
+  malformed batch rejects all four events without inserts. No application
+  journal errors; slow-embedding warning remains. Uncommitted WIP/database
+  history preserved. FINDINGS.md "Review fixes and verification".
 - TUI `d304e58` (2026-09-30, local client, no server change): panes under
   30 rows (`COMPACT_HEIGHT`) keep the footer to one row (status beside
   "? help") and drop "Because you upvoted" from the heading. A 64x23 render
@@ -127,6 +142,11 @@ old profile, stopped 2026-09-24): ranking quality and which sources feed it.
   shown). FINDINGS.md "Feed yield check — 2026-09-29".
 
 ## Blocker / limits
+- Review fixes: all required automated/live gates pass. Local WIP and the
+  six-file deployed patch are uncommitted. Open web tabs need a page reload
+  for the new inline client; physical passive count updates were not observed.
+  Last-minute journal logged slow embedding (13 texts / 20.4s), no application
+  errors. Real-user ranking gains were not remeasured.
 - The TLDR discussion call fails intermittently (`tldr: discussion call
   failed (status=None), salvaging article-only`: 54 times in 2 days, also
   before `fcbfc9a`); the partial summary is not cached. Cause not checked.
@@ -143,9 +163,11 @@ old profile, stopped 2026-09-24): ranking quality and which sources feed it.
   snapshots and merged copies live in `~/.local/state/hn-rerank-eval/`.
 
 ## Next step
-- Restart the local TUI (`hn-rerank`; started before `fcbfc9a`) and confirm
-  live: counts refresh without `r` after a `hot_refresh changed>0`, `r`
-  shows new counts, and the compact layout in a short pane. Over a day,
+- Prepare a review-only staged commit; preserve unrelated WIP in shared files.
+  Commit/push and reconcile the deployed six-file patch when requested.
+- Reload any open web tab; the local TUI was reloaded by the shortcut task.
+  Observe counts refresh without `r` after a `hot_refresh changed>0` and
+  fresh counts after `r`. Automated client coverage passes. Over a day,
   check `hot_refresh` lines stay under ~1 s with no Firebase warnings.
 - Explore badges (user, 2026-09-30): Unsure stays until ~2026-10-14, then
   keep or drop it (and judge Novel, 🎯 Interest) from the per-badge upvote

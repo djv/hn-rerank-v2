@@ -140,7 +140,7 @@ async def test_ranking_notice_clears_when_the_ready_deck_arrives() -> None:
 
 async def test_counts_version_refetches_counts_and_keeps_the_open_summary() -> None:
     """Between decks the server refreshes hot threads' counts: a new counts
-    version refetches the window only, shows the counts, keeps the open
+    version refetches the selected window and its neighbors, shows the counts, keeps the open
     summary, and forgets kept summaries of other stories that gained
     comments so reopening asks the server again."""
     fake = FakeServer()
@@ -161,7 +161,9 @@ async def test_counts_version_refetches_counts_and_keeps_the_open_summary() -> N
         fake.counts_version = 6
         await app.poll_feed_version()
         await settle(pilot)
-        assert fake.feed_requests() == ["1w"]
+        fetches = fake.feed_requests()
+        assert fetches.count("1w") == 1
+        assert sorted(window for window in fetches if window != "1w") == ["1d", "1m"]
         heading = str(app.query_one("#story-heading", Static).content)
         assert "▲ 444" in heading and "💬 218" in heading
         assert app.summaries[1] == open_summary

@@ -2455,12 +2455,15 @@ def _parse_interaction_event(raw_event: object, user_id: int) -> InteractionEven
         or isinstance(story_id, bool)
         # Negative IDs are valid: non-HN stories use synthetic negative IDs.
         or story_id == 0
+        or not -(2**63) <= story_id < 2**63
         or not isinstance(dashboard_version, int)
         or isinstance(dashboard_version, bool)
         or dashboard_version < 0
+        or dashboard_version >= 2**63
         or not isinstance(position, int)
         or isinstance(position, bool)
         or position < 0
+        or position >= 2**63
     ):
         raise ValueError("story_id, dashboard_version, and position are invalid")
 
@@ -2468,12 +2471,13 @@ def _parse_interaction_event(raw_event: object, user_id: int) -> InteractionEven
     if not isinstance(event_type, str) or event_type not in event_types:
         raise ValueError("unknown event_type")
     occurred_at = raw_event["occurred_at"]
-    if (
-        not isinstance(occurred_at, (int, float))
-        or isinstance(occurred_at, bool)
-        or not math.isfinite(float(occurred_at))
-        or float(occurred_at) <= 0
-    ):
+    if not isinstance(occurred_at, (int, float)) or isinstance(occurred_at, bool):
+        raise ValueError("occurred_at must be a finite timestamp")
+    try:
+        timestamp = float(occurred_at)
+    except OverflowError as exc:
+        raise ValueError("occurred_at must be a finite timestamp") from exc
+    if not math.isfinite(timestamp) or timestamp <= 0:
         raise ValueError("occurred_at must be a finite timestamp")
 
     dimensions = tuple(
@@ -2529,7 +2533,7 @@ def _parse_interaction_event(raw_event: object, user_id: int) -> InteractionEven
         age_filter=window,
         source_filter=source_filter,
         ranker_arm=ranker_arm,
-        occurred_at=float(occurred_at),
+        occurred_at=timestamp,
         duration_ms=duration_ms,
         badges=",".join(dict.fromkeys(cast("list[str]", badges))),
     )

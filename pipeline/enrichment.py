@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
 import hashlib
 import html
 import logging
@@ -683,11 +684,11 @@ async def _fetch_and_parse_feed(
 
             published_parsed = entry.get("published_parsed")
             if published_parsed:
-                pub_time = time.mktime(published_parsed)
+                pub_time = calendar.timegm(published_parsed)
             else:
                 updated_parsed = entry.get("updated_parsed")
                 if updated_parsed:
-                    pub_time = time.mktime(updated_parsed)
+                    pub_time = calendar.timegm(updated_parsed)
                 else:
                     pub_time = now
 

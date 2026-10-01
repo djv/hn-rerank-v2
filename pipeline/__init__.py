@@ -547,14 +547,15 @@ async def _probe_live_counts(
 ) -> dict[int, int]:
     """Live Firebase descendants per story id.
 
-    Failures, unparseable bodies, and counts that move backwards are
-    silently omitted — the caller treats absence as "no known growth".
+    Return growth over the last hydrated snapshot, including growth already
+    recorded by a metadata refresh. Callers heal stored counts upwards only.
+    Failures and counts at or below the fetched marker are omitted.
     """
     items = await _probe_live_items(stories, timeout_s)
     return {
         s.id: items[s.id].descendants
         for s in stories
-        if s.id in items and items[s.id].descendants > (s.comment_count or 0)
+        if s.id in items and items[s.id].descendants > (s.comment_count_at_fetch or 0)
     }
 
 

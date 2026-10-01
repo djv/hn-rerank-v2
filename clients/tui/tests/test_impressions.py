@@ -1,23 +1,48 @@
 from __future__ import annotations
 
+import asyncio
 import json
+from types import SimpleNamespace
+
+import pytest
 
 from textual.widgets import OptionList
 
 from hn_rerank.app import Reader
+import hn_rerank.app as reader_module
 
 from .test_client import FakeServer
 from ._settle import settle
 
 
-async def test_selected_impression_is_delayed_not_prefetched_and_best_effort() -> None:
+async def test_selected_impression_is_delayed_not_prefetched_and_best_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delay = asyncio.Event()
+
+    async def controlled_sleep(seconds: float) -> None:
+        if seconds == 1.0:
+            await delay.wait()
+        else:
+            await asyncio.sleep(seconds)
+
+    # Replace only the reader's clock, leaving Textual's event loop untouched.
+    monkeypatch.setattr(
+        reader_module,
+        "asyncio",
+        SimpleNamespace(**{**vars(asyncio), "sleep": controlled_sleep}),
+    )
     fake = FakeServer()  # /api/interaction returns 404: reading must continue.
     app = Reader(api=fake.api(), prefetch=2)
     async with app.run_test(size=(120, 35)) as pilot:
         await settle(pilot)
+        assert not any(r.url.path.endswith("/api/interaction") for r in fake.requests)
         app.query_one(OptionList).focus()
         await pilot.press("j")
-        await pilot.pause(1.2)
+        await settle(pilot)
+        assert not any(r.url.path.endswith("/api/interaction") for r in fake.requests)
+        delay.set()
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=5)
         events = [
             json.loads(r.content)["events"][0]
             for r in fake.requests
@@ -34,6 +59,7 @@ async def test_selected_impression_is_delayed_not_prefetched_and_best_effort() -
         assert event["badges"] == []  # the sample stories have none
         # A normal rebuild/poll must not inflate impressions for this selection.
         app.rebuild()
-        await pilot.pause(1.1)
+        await settle(pilot)
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=5)
         assert sum(r.url.path.endswith("/api/interaction") for r in fake.requests) == 1
         assert app.selected() is not None

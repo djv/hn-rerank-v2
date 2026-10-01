@@ -953,6 +953,7 @@
     const feeds = new Map();
     let feedGeneration = 0;
     let targetVersion = 0;              // the newest version the server promised
+    let countsVersion = null;           // last successfully refreshed count revision
     const windowsTried = new Set();     // "window@version" fetched in the background
     let windowFetch = null;             // the one background feed request
     // Interaction-event dimension; the deck has no source filter.
@@ -965,6 +966,7 @@
     const rated = new Set();
     const history = [];                 // {story, action}, newest last, for undo
     const voteViews = new Map();        // story id -> {window, keys} it was voted from
+    const voteRevisions = new Map();    // latest optimistic action for each story
     const restored = new Map();         // undone stories, until the ranked deck lands
     const exploreOrders = new Map();    // view key -> client-shuffled order
     let voteChain = Promise.resolve();
@@ -1100,6 +1102,8 @@
         }
         cacheMissAt.clear();
         if (votesInFlight === 0) setVoteCounts(feed.feedback_counts || {});
+        const active = storiesById.get(activeId);
+        if (active) patchCardMetadata(active, next.version);
       }
       tintByRank();
     }
@@ -1373,6 +1377,29 @@
       return card;
     }
 
+    function patchCardMetadata(story, version) {
+      const card = cardEls.get(story.id);
+      if (!card) return;
+      const fresh = feedCard(story, version);
+      card.replaceChild(fresh.children[0], card.children[0]);
+      Object.assign(card.dataset, fresh.dataset);
+    }
+
+    function patchCounts(id, data) {
+      if (!Number.isFinite(data.points) ||
+          !(data.comments === null || Number.isFinite(data.comments))) return;
+      for (const cached of feeds.values()) {
+        for (const story of cached.stories) {
+          if (story.id === id) Object.assign(story, {points: data.points, comments: data.comments});
+        }
+      }
+      const story = storiesById.get(id);
+      if (story) {
+        Object.assign(story, {points: data.points, comments: data.comments});
+        patchCardMetadata(story, feed.version);
+      }
+    }
+
     // Network ---------------------------------------------------------------
 
     function routePrefix() {
@@ -1424,9 +1451,11 @@
           const resp = await request(feedPath(name));
           if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
           setFeed(parseFeed(await resp.json()));
+          return true;
         } catch (err) {
           console.error('Failed to refresh deck', err);
           if (manual || feed?.loading) showToast(`Refresh failed: ${err.message}`, 'error');
+          return false;
         } finally {
           if (reloadInFlight?.promise === promise) reloadInFlight = null;
           updateStatus();
@@ -1454,7 +1483,17 @@
       }
       if (feed !== snapshot || !Number.isFinite(data?.current_version)) return;
       const newer = snapshot.ready ? data.current_version !== snapshot.version : data.ready === true;
-      if (newer) reload();
+      const nextCounts = Number.isFinite(data.counts_version) ? data.counts_version : null;
+      const countsChanged = countsVersion !== null && nextCounts !== null && nextCounts !== countsVersion;
+      if (countsVersion === null) countsVersion = nextCounts;
+      if (newer || countsChanged) {
+        if (countsChanged) {
+          feedGeneration += 1;
+          for (const name of feeds.keys()) if (name !== currentWindow) feeds.delete(name);
+          windowsTried.clear();
+        }
+        reload().then(ok => { if (ok && nextCounts !== null) countsVersion = nextCounts; });
+      }
     }
 
     // Votes -------------------------------------------------------------------
@@ -1515,6 +1554,8 @@
     // they were made. A failed one is reverted, never retried: the server may
     // or may not have it.
     function submit(story, action, undoneAction = null) {
+      const revision = (voteRevisions.get(story.id) || 0) + 1;
+      voteRevisions.set(story.id, revision);
       votesInFlight += 1;
       voteChain = voteChain.then(async () => {
         let target;
@@ -1528,12 +1569,17 @@
           }
           target = data.target_version;
         } catch (err) {
-          if (action === 'clear') {
-            applyVote(story, undoneAction || 'neutral');
-          } else {
-            applyUndo(story);
+          const latest = voteRevisions.get(story.id) === revision;
+          if (latest) {
+            if (action === 'clear') {
+              applyVote(story, undoneAction || 'neutral');
+            } else {
+              applyUndo(story);
+            }
           }
-          showToast(`Vote not confirmed, so the story is back; check before voting again. (${err.message})`, 'error');
+          const notice = latest ? 'Vote not confirmed, so the story is back; check before voting again.'
+            : 'Earlier vote not confirmed; your latest choice is still shown.';
+          showToast(`${notice} (${err.message})`, 'error');
           return;
         }
         targetVersion = Math.max(targetVersion, target);
@@ -1655,6 +1701,7 @@
     }
 
     function keepSummary(id, data) {
+      patchCounts(id, data);
       // Stale or retryable text is shown but asked for again later.
       const summary = { text: data.tldr, provisional: !!(data.stale || data.retryable) };
       summaries.set(id, summary);

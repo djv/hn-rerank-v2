@@ -234,25 +234,26 @@ async def test_navigation_prefetch_generates_nearby_and_other_sorts() -> None:
     fake = NavigationServer()
     app = Reader(api=fake.api())
     async with app.run_test(size=(120, 35)) as pilot:
-        await wait_for(
-            pilot, lambda: app.summaries.keys() >= {1, 2, 3, 4, 26, 27, 28, 29, 30}
-        )
-        await wait_for(pilot, lambda: 12 in fake.cached)
+        await settle(pilot)
+        assert app.summaries.keys() >= {1, 2, 3, 4, 26, 27, 28, 29, 30}
+        assert 12 in fake.cached
         assert 5 not in fake.generated  # deeper cache misses wait until nearby
         assert 13 not in fake.cached  # past the 12-story view cap
         assert 1 < fake.peak <= 4
         await pilot.press("j")
-        await wait_for(pilot, lambda: 5 in app.summaries)  # rolling window refills
+        await settle(pilot)
+        assert 5 in app.summaries  # rolling window refills
         await pilot.press("k")
+        await settle(pilot)
         assert "Summary 1" in app.query_one(Markdown)._markdown
         await pilot.press("s")
-        await pilot.pause()
+        await settle(pilot)
         assert "Summary 26" in app.query_one(Markdown)._markdown
         assert fake.generated.count(26) == 1
         await pilot.press("1")
-        await wait_for(
-            pilot, lambda: (story := app.selected()) is not None and story.id == 27
-        )
+        await settle(pilot)
+        story = app.selected()
+        assert story is not None and story.id == 27
         assert "Summary 27" in app.query_one(Markdown)._markdown
         assert fake.generated.count(27) == 1
 

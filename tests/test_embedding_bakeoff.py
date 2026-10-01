@@ -118,9 +118,7 @@ def test_token_chunks_cover_text_in_order(
     assert 1 <= len(pieces) <= max_chunks
     assert all(len(p.split()) <= size - 2 for p in pieces)
     covered = " ".join(pieces).split()
-    assert covered == text.split()[: len(covered)]
-    if words <= (size - 2) * max_chunks:
-        assert covered == text.split()
+    assert covered == text.split()[: (size - 2) * max_chunks]
 
 
 def test_split_budget_text_keeps_comments_after_capped_body() -> None:

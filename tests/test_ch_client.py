@@ -322,14 +322,26 @@ def test_query_comments_bulk_nests_in_kids_order_and_blanks_removed(
 def test_query_stories_with_comments_combines_stories_and_children(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    call_count = {"n": 0}
-
-    def fake_post(url, **kwargs):
-        call_count["n"] += 1
-        if "SELECT" in kwargs.get("content", "") and "IN (" in kwargs.get(
-            "content", ""
-        ):
-            # Could be either stories query or comments; just return both shapes
+    def fake_post(url: str, **kwargs: object) -> _MockResponse:
+        query = str(kwargs.get("content", ""))
+        if "AND type = 'story'" in query:
+            return _MockResponse(200, {"data": [{"id": 1, "kids": [10]}]})
+        if "AND type = 'comment'" in query:
+            if "IN (10)" in query:
+                return _MockResponse(
+                    200,
+                    {
+                        "data": [
+                            {"id": 10, "parent": 1, "text": "comment1", "kids": [11]}
+                        ]
+                    },
+                )
+            assert "IN (11)" in query
+            return _MockResponse(
+                200,
+                {"data": [{"id": 11, "parent": 10, "text": "reply", "kids": []}]},
+            )
+        if "IN (1)" in query:
             return _MockResponse(
                 200,
                 {
@@ -345,16 +357,6 @@ def test_query_stories_with_comments_combines_stories_and_children(
                             "ts": 1000,
                         }
                     ]
-                    + [
-                        {
-                            "id": 10,
-                            "type": "comment",
-                            "parent": 1,
-                            "ts": 100,
-                            "text": "comment1",
-                            "kids": [],
-                        }
-                    ]
                 },
             )
         return _MockResponse(200, {"data": []})
@@ -364,10 +366,11 @@ def test_query_stories_with_comments_combines_stories_and_children(
 
     assert 1 in result
     assert result[1]["type"] == "story"
-    # The query combines via UNION ALL into one call; result has both
-    # The story dict gets a `children` list (may be empty if comment row
-    # had a non-matching parent during combine)
-    assert "children" in result[1]
+    children = result[1]["children"]
+    assert [child["id"] for child in children] == [10]
+    assert children[0]["text"] == "comment1"
+    assert [child["id"] for child in children[0]["children"]] == [11]
+    assert children[0]["children"][0]["text"] == "reply"
 
 
 def test_query_stories_with_comments_empty() -> None:

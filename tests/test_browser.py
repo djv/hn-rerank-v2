@@ -226,7 +226,9 @@ def test_dashboard_page_end_to_end(page: Any) -> None:
     deadline = time.monotonic() + 5
     while not _state(page)["ready"] and time.monotonic() < deadline:
         page.wait_for_timeout(100)
-        page.evaluate("async () => { await pollFeedVersion(); await reloadInFlight; }")
+        page.evaluate(
+            "async () => { await pollFeedVersion(); await reloadInFlight?.promise; }"
+        )
     ranked = _state(page)
     assert ranked["ready"]
     assert ranked["head"][0] == BASE_ID + 28  # highest once inverted
@@ -300,4 +302,58 @@ def test_dashboard_page_end_to_end(page: Any) -> None:
     assert page.input_value("#window-select") == "archive"
     assert all(sid > BASE_ID + 28 for sid in _state(page)["head"])
 
+    assert page.problems == []
+
+
+def test_count_only_poll_updates_header_and_keeps_open_summary(page: Any) -> None:
+    page.wait_for_function(
+        "() => activeCard()?.querySelector('.tldr-detail-content')?.textContent.includes('summary')"
+    )
+    story_id = page.evaluate("() => activeId")
+    version = page.evaluate("() => feed.version")
+    page.evaluate(
+        """() => {
+            window.__keptCard = activeCard();
+            window.__keptSummary = activeCard().querySelector('.tldr-detail-content');
+        }"""
+    )
+    counts = [5]
+    page.route(
+        "**/api/ranking-ready?*",
+        lambda route: route.fulfill(
+            json={
+                "ok": True,
+                "ready": True,
+                "current_version": version,
+                "counts_version": counts[0],
+            }
+        ),
+    )
+
+    def fresh_feed(route: Any) -> None:
+        data = route.fetch().json()
+        for story in data["stories"]:
+            if story["id"] == story_id:
+                story.update(points=444, comments=218)
+        route.fulfill(json=data)
+
+    page.route("**/api/feed?window=1w", fresh_feed)
+    page.evaluate(
+        "async () => { await pollFeedVersion(); await reloadInFlight?.promise; }"
+    )
+    counts[0] = 6
+    page.evaluate(
+        "async () => { await pollFeedVersion(); await reloadInFlight?.promise; }"
+    )
+    observed = page.evaluate(
+        """() => ({
+            sameCard: activeCard() === window.__keptCard,
+            sameSummary: activeCard().querySelector('.tldr-detail-content') === window.__keptSummary,
+            active: activeId,
+            header: activeCard().querySelector('.story-header').textContent,
+        })"""
+    )
+    assert observed["sameCard"] and observed["sameSummary"]
+    assert observed["active"] == story_id
+    assert "444 pts" in observed["header"] and "218 comments" in observed["header"]
     assert page.problems == []

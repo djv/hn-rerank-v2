@@ -72,15 +72,23 @@ def test_limiter_multi_bucket_check_is_all_or_nothing(
 ) -> None:
     """A denied request consumes no quota from any of its buckets."""
     limiter = FixedWindowLimiter()
-    admitted: list[float] = []
+    model: dict[str, deque[float]] = {}
     for now, key in ops:
+        checks = [(key, per_key), ("global", global_limit)]
+        for bucket_key, _ in checks:
+            hits = model.setdefault(bucket_key, deque())
+            while hits and hits[0] <= now - 60:
+                hits.popleft()
+        expected = all(len(model[bucket_key]) < limit for bucket_key, limit in checks)
+        if expected:
+            for bucket_key, _ in checks:
+                model[bucket_key].append(now)
         result = limiter.try_acquire(
             [(key, per_key, 60), ("global", global_limit, 60)], now=now
         )
-        if result.allowed:
-            admitted.append(now)
-        recent = [t for t in admitted if t > now - 60]
-        assert len(recent) <= global_limit
+        assert result.allowed is expected
+        for bucket_key, _ in checks:
+            assert list(limiter._buckets[bucket_key]) == list(model[bucket_key])
 
 
 _app = Flask(__name__)

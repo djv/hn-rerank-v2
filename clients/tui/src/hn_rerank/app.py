@@ -750,6 +750,7 @@ class Reader(App[None]):
         # The window and views (sorts) each voted story was listed in, so
         # undo puts it back only where the server had it.
         self.vote_views: dict[int, tuple[str, list[str]]] = {}
+        self.vote_revisions: dict[int, int] = {}
         self.vote_lock = asyncio.Lock()
         self.selection_serial = 0
         self.interaction_session = str(uuid4())
@@ -764,6 +765,7 @@ class Reader(App[None]):
         self.last_error: str | None = None
         # The server's counts version at the last poll (None until seen).
         self.counts_version: int | None = None
+        self.window_generation = 0
         self.prefetch = max(0, prefetch)
         self.prefetch_generate = min(self.prefetch, max(0, prefetch_generate))
         # Complete summaries, and at most one request per story in flight. The
@@ -1493,15 +1495,28 @@ class Reader(App[None]):
             newer = current != feed.version
         else:
             newer = readiness.ready or current < wanted
-        seen, self.counts_version = self.counts_version, readiness.counts_version
+        seen = self.counts_version
+        counts_changed = (
+            seen is not None
+            and readiness.counts_version is not None
+            and readiness.counts_version != seen
+        )
+        if seen is None:
+            self.counts_version = readiness.counts_version
+        if counts_changed:
+            self.feeds.clear()
+            self.window_attempts.clear()
+            self.window_generation += 1
         if newer:
             self.reload(manual=False)
-        elif seen is not None and readiness.counts_version != seen:
+        elif counts_changed:
             # Same deck, fresher counts: summaries and the open story stay.
-            self.refresh_feed(announce=False)
+            self.refresh_feed(announce=False, counts_version=readiness.counts_version)
 
     @work(group="refresh", exclusive=True)
-    async def refresh_feed(self, *, announce: bool = True) -> None:
+    async def refresh_feed(
+        self, *, announce: bool = True, counts_version: int | None = None
+    ) -> None:
         """Fetch the selected window's feed and show it."""
         if not self.api or self.setting_up:
             return
@@ -1525,6 +1540,8 @@ class Reader(App[None]):
             return
         if api is not self.api:
             return
+        if counts_version is not None:
+            self.counts_version = counts_version
         if window != self.selected_window():
             # The user moved to a cached window meanwhile: keep this one
             # only as a cache entry of the version on screen.
@@ -1671,6 +1688,7 @@ class Reader(App[None]):
                 if api is None or feed is None:
                     return
                 self.window_attempts.add((window, feed.version))
+                generation = self.window_generation
                 try:
                     fetched = await api.feed(window)
                 except APIError:
@@ -1679,6 +1697,7 @@ class Reader(App[None]):
                 # screen: it never replaces the selected window's feed.
                 if (
                     api is self.api
+                    and generation == self.window_generation
                     and self.feed is not None
                     and fetched.version == self.feed.version
                     and window != self.feed.window
@@ -1752,13 +1771,17 @@ class Reader(App[None]):
         if story is None:
             return
         self.apply_vote(story)
-        self.submit(story, action)
+        revision = self.vote_revisions.get(story.id, 0) + 1
+        self.vote_revisions[story.id] = revision
+        self.submit(story, action, revision)
 
     def action_undo(self) -> None:
         if self.history:
             story = self.history[-1]
             self.apply_undo(story)
-            self.submit(story, "clear")
+            revision = self.vote_revisions.get(story.id, 0) + 1
+            self.vote_revisions[story.id] = revision
+            self.submit(story, "clear", revision)
 
     def apply_vote(self, story: FeedStory) -> None:
         index = next((i for i, s in enumerate(self.stories) if s.id == story.id), 0)
@@ -1783,7 +1806,7 @@ class Reader(App[None]):
         self.rebuild(story.id)
 
     @work(group="vote")
-    async def submit(self, story: FeedStory, action: str) -> None:
+    async def submit(self, story: FeedStory, action: str, revision: int) -> None:
         api = self.api
         if api is None:
             return
@@ -1798,15 +1821,18 @@ class Reader(App[None]):
             except APIError as exc:
                 if api is self.api:
                     # Never retried: the server may or may not have it.
-                    if action == "clear":
-                        self.apply_vote(story)
-                    else:
-                        self.apply_undo(story)
-                    self.status(
-                        "Vote not confirmed, so the story is back; check before"
-                        f" voting again. {exc}",
-                        error=True,
+                    latest = self.vote_revisions.get(story.id) == revision
+                    if latest:
+                        if action == "clear":
+                            self.apply_vote(story)
+                        else:
+                            self.apply_undo(story)
+                    notice = (
+                        "Vote not confirmed, so the story is back; check before voting again."
+                        if latest
+                        else "Earlier vote not confirmed; your latest choice is still shown."
                     )
+                    self.status(f"{notice} {exc}", error=True)
                 return
         if api is not self.api:
             return
