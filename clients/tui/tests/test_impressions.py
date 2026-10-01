@@ -5,14 +5,13 @@ import json
 from types import SimpleNamespace
 
 import pytest
-
 from textual.widgets import OptionList
 
-from hn_rerank.app import Reader
 import hn_rerank.app as reader_module
+from hn_rerank.app import Reader
 
-from .test_client import FakeServer
 from ._settle import settle
+from .test_client import FakeServer
 
 
 async def test_selected_impression_is_delayed_not_prefetched_and_best_effort(

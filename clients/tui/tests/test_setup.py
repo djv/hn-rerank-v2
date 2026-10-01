@@ -12,8 +12,8 @@ from hn_rerank.api import API, Profile, load_profile, save_profile
 from hn_rerank.app import Reader, Setup
 from hn_rerank.models import Feed
 
-from .test_client import FakeServer
 from ._settle import settle
+from .test_client import FakeServer
 
 
 async def test_import_validates_then_persists_and_relaunches(

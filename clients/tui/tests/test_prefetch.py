@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-from pathlib import Path
 from collections.abc import Callable
 from dataclasses import replace
+from pathlib import Path
 
 import httpx
 import pytest
@@ -16,8 +16,8 @@ from textual.widgets import Markdown, OptionList
 
 from hn_rerank.app import Reader
 
-from .test_client import FakeServer, sample_feed
 from ._settle import settle
+from .test_client import FakeServer, sample_feed
 
 
 class PrefetchServer(FakeServer):

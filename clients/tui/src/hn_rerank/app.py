@@ -250,10 +250,12 @@ def dig_deeper_prompt(story: FeedStory) -> str:
             f"Dig deeper into this story from my news reader: {story.title}",
             *links,
             "",
-            "Read the article and the discussion. Tell me the key ideas, what is"
-            " new or surprising, where commenters push back or add expertise, and"
-            " background or related work worth reading next. Then wait for my"
-            " follow-up questions.",
+            (
+                "Read the article and the discussion. Tell me the key ideas, what is"
+                " new or surprising, where commenters push back or add expertise, and"
+                " background or related work worth reading next. Then wait for my"
+                " follow-up questions."
+            ),
         ]
     )
 

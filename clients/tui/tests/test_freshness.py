@@ -9,6 +9,7 @@ from textual.widgets import Markdown, OptionList, Static
 
 from hn_rerank.app import Reader
 from tests.test_client import FakeServer, sample_feed
+
 from ._settle import settle
 
 

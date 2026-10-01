@@ -1,5 +1,15 @@
 # Worklog: hn-rewrite
 
+## 2026-09-30 Standalone TUI CI lint compatibility
+
+- Review commit `04d830d` passed backend CI and all 162 TUI tests on Linux,
+  macOS and Windows. Standalone CI installs unpinned Ruff; its current 0.16
+  defaults also check import sorting and parenthesized string concatenation,
+  which the local locked 0.15.17 default checks did not cover.
+- Applied only the seven reported style fixes. Ruff 0.16.9 against the
+  isolated committed client and root lint/format checks pass; no runtime
+  behavior changed. Independent Codex shortcut and mockup WIP stay separate.
+
 ## 2026-09-30 Review commit preparation (`gg`)
 
 - Prepared a focused index containing review fixes, regressions, test-quality

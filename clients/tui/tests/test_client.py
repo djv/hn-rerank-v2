@@ -21,6 +21,7 @@ from hn_rerank.api import (
 )
 from hn_rerank.app import Reader, Setup
 from hn_rerank.models import Feed, FeedStory, Window
+
 from ._settle import settle
 
 

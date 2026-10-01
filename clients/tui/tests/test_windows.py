@@ -16,8 +16,8 @@ from textual.widgets import OptionList, Select
 from hn_rerank.app import Reader
 from hn_rerank.models import Feed, Window
 
-from .test_client import FakeServer, sample_feed
 from ._settle import settle
+from .test_client import FakeServer, sample_feed
 
 
 def window_feed(window: Window, ids: list[int]) -> Feed:
