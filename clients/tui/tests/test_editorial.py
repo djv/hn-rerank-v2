@@ -337,10 +337,10 @@ def test_headline_shows_badge_emoji() -> None:
         None,
         0,
         1.0,
-        badges=["\U0001f525", "\U0001f3c6"],
+        badges=["\U0001f525", "\U0001f3c6", "\U0001f4ac"],
     )
-    assert headline(story).plain.startswith("🔥 🏆 Story")
-    assert headline(story, selected=True).plain.startswith("> 🔥 🏆 Story")
+    assert headline(story).plain.startswith("🔥 🏆 💬 Story")
+    assert headline(story, selected=True).plain.startswith("> 🔥 🏆 💬 Story")
     assert headline(replace(story, badges=[])).plain.startswith("Story")
 
 

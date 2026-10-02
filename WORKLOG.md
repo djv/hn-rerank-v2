@@ -1,5 +1,23 @@
 # Worklog: hn-rewrite
 
+## 2026-10-02 Popular badges stack independently
+
+- User approved independent badges and selected Top >=100 points, Talk
+  >=50 comments with comments >=points. Hot retains its existing rule.
+- `pipeline/ranking.py`: each Popular card gets all qualifying badges;
+  Top is no longer a fallback. HN-gravity selection and order are unchanged.
+- `pipeline/render.py`: tooltip thresholds match the predicates, and Hot
+  preserves the 99.5 percentile instead of rounding it to 100. TUI help
+  explains the floors and overlapping badges; both clients already render
+  multiple badges. Architecture and ranking spec updated.
+- Regressions cover Hot/Top/Talk together, tiny/empty threads, floor and
+  ratio boundaries, archive sources, cold decks, rendered feeds, web card
+  badges and impression logging, and terminal headlines.
+- Two backend regressions failed before the change. Local affected suites:
+  222 passed. Isolated VPS validation under `batch`, one CPU and 3G max:
+  full backend 1,095 passed / 1 skipped (106.04s), TUI 162 passed / 1 skipped
+  (104.92s). Ruff, touched formatting and types pass. Deployment pending.
+
 ## 2026-10-02 Restore Gemma production-evaluation parity
 
 - `scripts/eval_ranker_variants.py`: fold DBs forward side-vector reads to

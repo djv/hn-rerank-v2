@@ -27,7 +27,15 @@ from .config import (
     CH_ARCHIVE_SOURCE,
     Config,
 )
-from .ranking import RankedStory, WindowDeck, card_attribution, serve_window
+from .ranking import (
+    HOT_MIN_SCORE,
+    TALK_MIN_COMMENTS,
+    TOP_MIN_SCORE,
+    RankedStory,
+    WindowDeck,
+    card_attribution,
+    serve_window,
+)
 
 # Side-rail sort tabs: (value, label).
 SORT_TABS: tuple[tuple[str, str], ...] = (
@@ -150,7 +158,7 @@ BADGE_LEGEND: tuple[tuple[str, str], ...] = (
 )
 
 
-def _build_badges(item: RankedStory, *, hot_badge_percentile: int) -> list[FeedBadge]:
+def _build_badges(item: RankedStory, *, hot_badge_percentile: float) -> list[FeedBadge]:
     badges: list[FeedBadge] = []
     if item.is_uncertain:
         badges.append(
@@ -176,7 +184,10 @@ def _build_badges(item: RankedStory, *, hot_badge_percentile: int) -> list[FeedB
                 kind="talk",
                 icon="💬",
                 label="Talk-worthy",
-                tooltip="At least as many HN comments as points",
+                tooltip=(
+                    f"At least {TALK_MIN_COMMENTS} HN comments "
+                    "and at least as many comments as points"
+                ),
             )
         )
     if item.is_high_engagement:
@@ -185,7 +196,7 @@ def _build_badges(item: RankedStory, *, hot_badge_percentile: int) -> list[FeedB
                 kind="top",
                 icon="🏆",
                 label="Top",
-                tooltip="Popular on HN, not rising fast and not mostly discussion",
+                tooltip=f"At least {TOP_MIN_SCORE} HN points",
             )
         )
     if item.is_hot:
@@ -195,8 +206,8 @@ def _build_badges(item: RankedStory, *, hot_badge_percentile: int) -> list[FeedB
                 icon="🔥",
                 label="Hot",
                 tooltip=(
-                    f"Top {hot_badge_percentile}% by engagement velocity "
-                    "(points/hour) and score ≥ 20"
+                    f"Fastest {100 - hot_badge_percentile:g}% by points/hour "
+                    f"and at least {HOT_MIN_SCORE} HN points"
                 ),
             )
         )
@@ -213,7 +224,7 @@ def _build_badges(item: RankedStory, *, hot_badge_percentile: int) -> list[FeedB
 
 
 def _feed_story(
-    item: RankedStory, *, hot_badge_percentile: int, counts: StoryCounts | None = None
+    item: RankedStory, *, hot_badge_percentile: float, counts: StoryCounts | None = None
 ) -> FeedStory:
     story = item.story
     badges = _build_badges(item, hot_badge_percentile=hot_badge_percentile)
@@ -259,7 +270,7 @@ def build_feed(
     views = serve_window(
         deck.window(window), window, time.time() if now is None else now
     )
-    hot_badge_percentile = int(round(config.model.hot_badge_percentile))
+    hot_badge_percentile = config.model.hot_badge_percentile
     items = views.stories()
     stored = live_counts([item.story.id for item in items]) if live_counts else {}
     return Feed(

@@ -429,10 +429,11 @@ def test_build_cold_deck_computes_popular_badges_but_not_explore(
     assert item.is_uncertain is False
     assert item.is_novel is False
     assert item.is_interest is False
-    # Popular badges are non-personalized; the sole HN candidate is both
-    # highest-scoring and highest-velocity, so it earns Hot (and only Hot).
+    # Popular badges are non-personalized and independent: 100 points
+    # qualifies for Top even though this is also the fastest story.
     assert item.is_hot is True
-    assert not (item.is_high_engagement or item.is_discussion_rich)
+    assert item.is_high_engagement is True
+    assert item.is_discussion_rich is False
 
 
 class _HashEmbedder(Embedder):
@@ -4071,34 +4072,52 @@ def test_window_pools_are_nested_and_archive_is_the_rest() -> None:
         assert all(r.story.source == "hn" for r in deck.window(window).popular)
 
 
-def test_popular_badge_follows_the_storys_own_numbers(
-    db: Database, embedder: Embedder
-) -> None:
-    """Every Popular card gets exactly one of Hot (🔥), Talk (💬) and Top
-    (🏆), from its own numbers: Hot when it is fast (velocity percentile)
-    and has HOT_MIN_SCORE points, else Talk when it has at least as many
-    comments as points, else Top."""
+def test_popular_badges_stack_and_require_substantial_engagement() -> None:
+    """Hot must not hide a busy discussion; Top is earned, not a fallback.
+
+    Include the live-style Hot/Top/Talk combination, each cutoff boundary,
+    and an archive discussion. Tiny or empty threads earn no Talk badge.
+    """
     now = int(time.time())
     candidates = [
-        # Fastest by far: Hot, although it has more comments than points.
         _cold_story(1, score=900, time_ts=now - 3600, comment_count=950),
-        # Slow, more comments than points: Talk.
-        _cold_story(2, score=40, time_ts=now - 5 * 86400, comment_count=40),
-        # Slow, fewer comments than points: Top.
-        _cold_story(3, score=300, time_ts=now - 5 * 86400, comment_count=10),
-    ] + [
-        _cold_story(10 + i, score=20 + i, time_ts=now - 6 * 86400, comment_count=i)
-        for i in range(10)
+        _cold_story(2, score=50, time_ts=now - 60, comment_count=60),
+        _cold_story(3, score=100, time_ts=now - 5 * 86400, comment_count=100),
+        _cold_story(4, score=100, time_ts=now - 5 * 86400, comment_count=49),
+        _cold_story(5, score=99, time_ts=now - 5 * 86400, comment_count=99),
+        _cold_story(6, score=49, time_ts=now - 5 * 86400, comment_count=49),
+        _cold_story(7, score=0, time_ts=now - 5 * 86400, comment_count=0),
+        _cold_story(8, score=100, time_ts=now - 5 * 86400, comment_count=50),
+        _cold_story(9, score=1, time_ts=now - 60 * 86400, comment_count=50),
+        _cold_story(10, score=99, time_ts=now - 5 * 86400, comment_count=None),
     ]
-    cand_embs = embedder.encode([s.text_content + s.title for s in candidates])
-    deck = rerank_candidates(db, Config(count=40), embedder, candidates, cand_embs)
+    candidates[8] = replace(candidates[8], source=CH_ARCHIVE_SOURCE)
+    ranked = [
+        RankedStory(s, score=float(s.id), best_match_title="") for s in candidates
+    ]
+    config = Config(model=ModelConfig(hot_badge_percentile=80.0))
+    deck = ranking.assemble_window_deck(ranked, config=config, now=now)
+    from pipeline.render import build_feed
 
-    popular = {r.story.id: r for r in deck.window("1w").popular}
-    for r in popular.values():
-        assert sum([r.is_hot, r.is_discussion_rich, r.is_high_engagement]) == 1, r
-    assert popular[1].is_hot
-    assert popular[2].is_discussion_rich
-    assert popular[3].is_high_engagement
+    expected = {
+        1: {"hot", "top", "talk"},
+        2: {"hot", "talk"},
+        3: {"top", "talk"},
+        4: {"top"},
+        5: {"talk"},
+        6: set(),
+        7: set(),
+        8: {"top"},
+        9: {"talk"},
+        10: set(),
+    }
+    for window in ("1w", "archive"):
+        feed = build_feed(deck, window, config, {}, 1, 1, now=now)
+        popular_ids = set(feed.orders["popular"])
+        for card in feed.stories:
+            assert card.id in popular_ids
+            assert {b.kind for b in card.badge_details} == expected[card.id]
+            assert len(card.badges) == len(expected[card.id])
 
 
 def test_explore_and_popular_can_share_a_card() -> None:

@@ -1,38 +1,35 @@
 # HN Rerank status
 
-Saved 2026-10-02 17:15 UTC. Previous review handoff:
-[before this fix](docs/status-archive/before-gemma-eval-fix-20261002.md).
+Updated 2026-10-02. Previous handoff:
+[Gemma evaluation fix](docs/status-archive/before-popular-badges-20261002.md).
 
 ## Objective
-Fix review finding #1: offline production evaluation must include the frozen
-source's Gemma side vectors and reject unexpected model fallback.
+Show every independently qualifying Popular badge. User-selected floors:
+Top >=100 points; Talk >=50 comments with comments >=points. Keep Hot's
+predicate and the Popular HN-gravity order.
 
 ## Verified result
-- Fold DBs now forward side-vector reads to the source snapshot, including
-  when reused for variants with a different side flag.
-- Enabled side-coverage fallback aborts evaluation; cold/sparse profiles keep
-  normal behavior. Replay-plus-side configurations and variant overrides
-  fail before DB access.
-- Regressions prove exact score/probability parity with direct source scoring
-  across both SVM paths and reused folds, and differences from stored-only
-  ranking. Missing/stale/wrong-dimension vectors fail explicitly.
-- Affected suites: 106 passed. Full suite: 1,077 passed / 18 skipped. Ruff,
-  touched Python formatting and whitespace checks pass; zero new type errors.
-- Evidence: FINDINGS.md, "Gemma production-evaluation parity fixed".
-  Evaluation guide and ARCHITECTURE.md updated. No production DB access or
-  service restart; historical explicit Gemma replay results are unchanged.
+- Independent badges implemented in isolated `feat/stack-popular-badges`
+  checkout; cards may have Hot/Top/Talk together or no Popular badge.
+- Web tooltips and TUI legend explain the predicates and stacking; Hot's
+  percentile tooltip retains 99.5 rather than rounding to 100.
+- Two new expectations reproduced the old defects. Local affected suites:
+  222 passed; lint, touched formatting and types pass.
+- Isolated VPS full backend: 1,095 passed / 1 skipped; TUI: 162 passed /
+  1 skipped. Both ran under batch with one CPU and 3G max RAM.
+- Architecture and ranking spec updated. Live deployment remains pending.
 
 ## Blocker / limits
-- Global `ty` still reports the existing diagnostic in untracked
-  `scripts/inspect_tldr_failures.py:86`; preserved as unrelated WIP.
-- Review findings #2 (capped replacement encoding) and #3 (archive-source
-  yield classification) remain open and outside this authorized fix.
-- Other WIP preserved: `clients/tui/tests/test_client.py`, `docs/mockups/`,
-  `scripts/inspect_tldr_failures.py`, `kernel.errors.txt`.
+- Live deployment smoke remains pending. Laptop memory is tight; use one
+  batch job at a time.
+- Capped encoder replacement and archive yield classification findings
+  (#2/#3) remain open; discussion selection and Hot saturation are unchanged.
+- Unrelated WIP remains in the original checkout: TUI client test, reader
+  mockups, TLDR inspection script and kernel log.
 
 ## Next step
-- Fix #1 is complete and saved with this handoff on `main`.
-- Resume #2/#3 only when requested. Keep tests on temporary/in-memory DBs.
-- Earlier live-yield, Popular, reader mockup, LLM reset and parked TLDR work
-  remain in `docs/status-archive/before-ranking-review-handoff-20261002.md`;
-  preserve their authorization boundaries.
+- Deploy, restart the service and verify live stacked badges with
+  authenticated reads and bounded journal checks.
+- Earlier live-yield, Popular-order, reader mockup, LLM reset and parked
+  TLDR work remain in
+  `docs/status-archive/before-ranking-review-handoff-20261002.md`.

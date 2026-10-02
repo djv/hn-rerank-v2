@@ -275,6 +275,8 @@ TOP_COMMENT_TOP_LEVEL_BUDGET = TOP_COMMENT_LIMIT // 3
 HN_COMMENTS_SEPARATOR = "\n\n---\n\n"
 HN_COMMENTS_CACHE_CHAR_LIMIT = 24_000
 HOT_MIN_SCORE = 20
+TOP_MIN_SCORE = 100
+TALK_MIN_COMMENTS = 50
 # A served view holds this many stories: the 12 the clients show (VIEW_LIMIT
 # in templates/index.html and the TUI) plus 4 that slide in as cards ahead
 # of them are voted.
@@ -1891,11 +1893,12 @@ def assemble_window_deck(
 
     - Recommended: the top stories by model score, no source quota.
     - Popular: the top HN stories by ``hn_gravity`` on the window's clock
-      (``GRAVITY_TIME_SCALE``). Each card
-      gets one badge from its own numbers: 🔥 Hot when its velocity
-      (points/hour) is in the pool's top ``hot_badge_percentile`` and it has
-      ``HOT_MIN_SCORE`` points, else 💬 Talk when it has at least as many
-      comments as points, else 🏆 Top.
+      (``GRAVITY_TIME_SCALE``). Each card independently gets every badge
+      it qualifies for: 🔥 Hot when its velocity
+      (points/hour) is at or above the pool's ``hot_badge_percentile`` and it has
+      ``HOT_MIN_SCORE`` points; 🏆 Top with at least ``TOP_MIN_SCORE``
+      points; 💬 Talk with at least ``TALK_MIN_COMMENTS`` comments and at
+      least as many comments as points. Cards may have no Popular badge.
     - Explore, only with *explore*: Unsure (highest entropy), Novel
       (farthest from every vote) and Interest (the best story of each of
       the user's interests, least covered by the served Recommended first;
@@ -1918,11 +1921,15 @@ def assemble_window_deck(
 
     def popular_card(r: RankedStory) -> RankedStory:
         story = r.story
-        if story.score >= HOT_MIN_SCORE and velocity_of[story.id] >= hot_threshold:
-            return replace(r, is_hot=True)
-        if (story.comment_count or 0) >= story.score:
-            return replace(r, is_discussion_rich=True)
-        return replace(r, is_high_engagement=True)
+        comments = story.comment_count or 0
+        return replace(
+            r,
+            is_hot=story.score >= HOT_MIN_SCORE
+            and velocity_of[story.id] >= hot_threshold,
+            is_high_engagement=story.score >= TOP_MIN_SCORE,
+            is_discussion_rich=comments >= TALK_MIN_COMMENTS
+            and comments >= story.score,
+        )
 
     def take_unmatched(items: list[RankedStory], n: int) -> list[RankedStory]:
         """The first *n* of *items* that don't duplicate a voted story. Walks

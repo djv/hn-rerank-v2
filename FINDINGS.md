@@ -1,5 +1,38 @@
 # HN Rerank findings
 
+## Independent Popular badges — 2026-10-02
+
+Live read before the change, profile 151, 20:08:55 UTC: every visible card
+in 12h, 1d and 1w was Hot; 1m had 10 Hot / 2 Top; archive had 12 Top.
+No Talk badge appeared in any window, including story 49908394 (335 points,
+637 comments). Hot's exclusive branch hid Talk. All five feed reads were
+ready at the same deck version. Counts were live; badges were cached ranking
+results, not recomputed from the counts returned on each request.
+
+User approved stacking and selected the 100-point / 50-comment option via
+the questionnaire. Popular now assigns Hot, Top and Talk independently:
+
+- Hot: unchanged velocity percentile and 20-point minimum.
+- Top: at least 100 points, not an unconditional fallback.
+- Talk: at least 50 comments and comments >=points.
+
+Selection is still HN-only, sorted by the window's gravity. Discussion
+selection, personalization of Popular and the saturated Hot percentile
+remain outside this change. Existing cross-view Explore badges still merge.
+Both clients already iterate the badge list; web tooltips and TUI legend
+now explain the independent predicates. The Hot tooltip also preserves
+the configured percentile rather than rounding 99.5 to 100.
+
+Validation: two regressions failed under the old code; 222 affected tests
+pass locally, including the cold deck, source/archive and cutoff
+combinations, property-tested view order, web rendering and badge logging.
+The isolated VPS source copy passed the full backend suite (1,095 passed /
+1 skipped, 106.04s) and TUI suite (162 passed / 1 skipped, 104.92s), sequential
+`batch` jobs capped to one CPU and 3G RAM, with library threads set to 1.
+Ruff, touched formatting and type checking pass; standalone TUI Ruff and
+format checks also pass. Original checkout WIP is untouched. Live deployment
+and verification remain pending.
+
 ## Gemma production-evaluation parity fixed — 2026-10-02
 
 Authorized scope: review finding #1 only, after the user's "ok fix".

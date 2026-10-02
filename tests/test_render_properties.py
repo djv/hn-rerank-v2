@@ -190,13 +190,13 @@ def test_window_views_hold_only_their_window_and_keep_their_orders(
         ]
         assert gravity == sorted(gravity, reverse=True)
         for sid in popular:
-            icons = _POPULAR_ICONS & set(by_id[sid].badges)
-            assert len(icons) == 1, by_id[sid].badges
             story = by_id[sid]
-            if "\U0001f525" not in icons:  # not Hot: Talk iff comments >= points
-                assert ("\U0001f4ac" in icons) == (
-                    (story.comments or 0) >= story.points
-                )
+            icons = _POPULAR_ICONS & set(story.badges)
+            assert len(icons) <= 3, story.badges
+            assert ("\U0001f3c6" in icons) == (story.points >= 100)
+            assert ("\U0001f4ac" in icons) == (
+                (story.comments or 0) >= max(50, story.points)
+            )
 
         explore = feed.orders["explore"]
         if context is None:

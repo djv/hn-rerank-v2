@@ -516,17 +516,21 @@ def test_cards_are_built_from_text_only() -> None:
     assert result["id"] == "9" and result["version"] == "5"
 
 
-def test_impressions_carry_the_cards_badge_kinds() -> None:
+def test_cards_render_and_log_all_applicable_badges() -> None:
     result = _client_harness(r"""
     globalThis.scheduleInteractionFlush = () => {};
     setFeed(makeFeed([9, 10]));
     const badge = kind => ({ kind, icon: '*', label: kind, tooltip: '' });
-    queueInteraction('impression',
-                     feedCard(story(9, { badge_details: [badge('interest'), badge('hot')] }), 5));
+    const kinds = ['interest', 'hot', 'top', 'talk'];
+    const card = feedCard(story(9, { badge_details: kinds.map(badge) }), 5);
+    queueInteraction('impression', card);
     queueInteraction('impression', feedCard(story(10), 5));
-    console.log(JSON.stringify(interactionEvents.map(e => [e.story_id, e.badges])));
+    const rendered = card.children[0].children.filter(n => n.className.startsWith('badge badge--'));
+    console.log(JSON.stringify({ rendered: rendered.map(n => n.textContent),
+                                events: interactionEvents.map(e => [e.story_id, e.badges]) }));
     """)
-    assert result == [[9, ["interest", "hot"]], [10, []]]
+    assert result["rendered"] == ["* interest", "* hot", "* top", "* talk"]
+    assert result["events"] == [[9, ["interest", "hot", "top", "talk"]], [10, []]]
 
 
 def test_keys_match_the_terminal_client() -> None:

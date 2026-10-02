@@ -157,8 +157,11 @@ surface Dashboard {
     @guarantee ViewOrders
         -- The server's view order is authoritative: recommended and
         -- explore by rank score, popular by the window's HN gravity. Each popular card
-        -- carries exactly one of hot / popular / talked_about, from its
-        -- own numbers. Explore holds at most explore_per_badge each of
+        -- independently carries every qualifying hot / popular /
+        -- talked_about badge (or none): hot keeps its velocity and
+        -- 20-point floor; popular needs 100 points; talked_about needs
+        -- 50 comments and comments >= points. Explore holds at most
+        -- explore_per_badge each of
         -- unsure / novel / similar and none of the window's recommended
         -- stories; it is empty until the viewer has voted.
 

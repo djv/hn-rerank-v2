@@ -284,11 +284,14 @@ the fully scored pool at one `now` for all five windows:
   on the window's clock, `points / (age_h / scale + 2) ** 1.8` (`hn_gravity`,
   `scale = GRAVITY_TIME_SCALE[window]`, a third of the window in hours: 12h 4,
   1d 8, 1w 56, 1m 240, archive 2920; with HN's own 1-hour clock every window
-  showed the same under-a-day-old stories). No Hot/Top/Talk cascade: each
-  card gets one badge from its own numbers, 🔥 Hot when its velocity
+  showed the same under-a-day-old stories). No Hot/Top/Talk selection cascade.
+  Badges are independent: each card gets every one it qualifies for,
+  🔥 Hot when its velocity
   (points/hour) is at or above the pool's `hot_badge_percentile` and it has
-  `HOT_MIN_SCORE=20` points, else 💬 Talk when it has at least as many comments
-  as points, else 🏆 Top.
+  `HOT_MIN_SCORE=20` points; 🏆 Top with `TOP_MIN_SCORE=100` points; 💬 Talk
+  with `TALK_MIN_COMMENTS=50` comments and at least as many comments as points.
+  A card may have all three badges or none. Popular membership and order
+  still depend only on HN gravity, not the badges.
 * **Explore** (personalized decks only; the cold deck has none): Unsure
   (highest entropy; needs SVM probabilities), Novel (`1 - max_sim`, farthest
   from every vote) and 🎯 Interest, picked in that order, each
@@ -320,7 +323,7 @@ window is served short, never widened. A card's badges are OR'd across the
 views of its window only (`WindowViews.stories`); the view orders are
 authoritative, nothing is derived from badge flags.
 
-**No knobs.** All percentile/min knobs are gone from `ModelConfig` and `config.toml` except `hot_badge_percentile` (the velocity p99.5 threshold of the Hot predicate). Velocity is structurally near-zero for archive stories, so archive Popular cards carry 🏆/💬, practically never 🔥. Unsure requires the SVM to have fit (`n_up >= min_up_for_svm=20` AND `n_down >= min_down_for_svm=20`); before that `prob_down is None` and Explore holds only Novel and Interest.
+**No knobs.** All percentile/min knobs are gone from `ModelConfig` and `config.toml` except `hot_badge_percentile` (the velocity p99.5 threshold of the Hot predicate). Top and Talk use the fixed 100-point and 50-comment floors above (user-selected 2026-10-02). Velocity is structurally near-zero for archive stories, so archive Popular cards carry 🏆/💬, practically never 🔥. Unsure requires the SVM to have fit (`n_up >= min_up_for_svm=20` AND `n_down >= min_down_for_svm=20`); before that `prob_down is None` and Explore holds only Novel and Interest.
 
 **Attribution (F2, `9a83ffd`).** Cards carry a "Because you upvoted …" line
 populated from the already-computed KNN argmax (`cand_closest_up_idx` → the
