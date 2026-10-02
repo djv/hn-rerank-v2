@@ -205,6 +205,10 @@ runtime dep (e.g. jax, tensorflow), give it its own
 
 - Run persistent server: `systemctl --user {status|start|stop|restart} hn_rewrite.service`
   (or directly: `uv run python server.py`)
+- Gemma side vectors: `hn-rewrite-side-embed.timer` (every 30 min, niced) runs
+  `scripts/embed_side_vectors.py`, which writes only the `side_embeddings`
+  table; `model.side_embedding_enabled` ranks on them (ARCHITECTURE.md 3.4).
+  Rollback: set it false and restart.
 - **Restart before verifying**: live behavior can differ from the checkout until
   `hn_rewrite.service` is restarted. Deployed code and the working tree can diverge;
   verify with `git log`, `systemctl --user status hn_rewrite.service`, then

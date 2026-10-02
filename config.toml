@@ -29,6 +29,9 @@ svm_c = 4.0
 linear_blend_enabled = true
 svm_precomputed_enabled = true
 svm_precomputed_chunk_size = 512
+# Rank on stored + embeddinggemma vectors side by side (2026-10-02); vectors
+# come from scripts/embed_side_vectors.py (hn-rewrite-side-embed.timer).
+side_embedding_enabled = true
 
 [hn_rewrite.rss]
 feeds = [
