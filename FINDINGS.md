@@ -105,8 +105,10 @@ timer` first run 13:35 encoded 44 new stories in 13 s. Dashboard and 1w feed
 refit and 5.3 s on a cache hit (live baseline before: 5.4-8.7 s refit, 3.8 s
 hit; the stored-only first run took 16.3 s cold). Recommended top 12 with
 gemma: 1d shares 11/12 with stored-only, 1w 7/12 (new: the Sonnet 5.5 launch
-posts, Ember-1, two brain-research stories). Not yet seen: a live user rerank
-with the label, and any change in up/down rates (re-read with
+posts, Ember-1, two brain-research stories). Timer runs at 14:05, 14:35 and
+15:05 encoded 19, 21 and 3 new stories; no service errors through 15:21 UTC.
+Not yet seen: a live user rerank with the label (no 151 activity since the
+restart), and any change in up/down rates (re-read with
 `scripts/badge_yield_report.py` after ~200 shown stories).
 
 Per feed (impression pool; slices by the feed of each story's first
