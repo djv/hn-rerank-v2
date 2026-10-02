@@ -19,6 +19,7 @@ import pytest
 SCRIPT_MAINS = [
     "ainews_topics",
     "backfill_hn_comments",
+    "badge_yield_report",
     "backfill_lesswrong_score",
     "backfill_reddit_metadata",
     "backfill_rss_articles",
@@ -36,6 +37,7 @@ SCRIPT_MAINS = [
     "drop_dead_tables",
     "combine_replay_embeddings",
     "embed_remaining",
+    "embed_side_vectors",
     "export_embedding_onnx",
     "encode_replay_embeddings",
     "fetch_articles_for_source",

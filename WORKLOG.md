@@ -1,5 +1,28 @@
 # Worklog: hn-rewrite
 
+## 2026-10-02 Ranking evals on fresh votes and impressions
+
+- `scripts/eval_ranker_variants.py`: `--holdout-blocks N` (held-out votes in
+  N expanding-train time blocks), `--candidate-pool impressions` (each block's
+  votes plus the stories first shown in it; unvoted ones count as
+  not-upvoted), per-feed `raw_feed_*` slices in that pool, `known_upvote_
+  fraction_at_12` and `auc_up_vs_all` metrics, and a `gravity_weight` /
+  `gravity_scale` blend option for `prodlr` (Popular's window-clock order).
+- `scripts/badge_yield_report.py`: read-only per-feed/per-badge/per-source
+  yield of shown stories (first impression per story, Wilson intervals).
+- Results (FINDINGS.md "Fresh-vote, impression-pool and live-yield evals"):
+  the live blend beats the legacy ranker on 394 unseen votes; knob tuning
+  has plateaued; the model separates likes inside Popular/Explore far better
+  than their own orders. No ranking or config change deployed.
+- Gemma side by side behind `model.side_embedding_enabled` (default off):
+  additive `side_embeddings` table, `pipeline/side_embeddings.py`
+  (`SideEmbedder`, cache, coverage-gated model space), ranking integration
+  (model features on joined vectors, score context on stored vectors) and
+  `scripts/embed_side_vectors.py`. `SideEmbedder` reproduces the evaluated
+  vectors (cosine 1.0000); flag off leaves ranking unchanged. Not deployed:
+  needs the model dir on the VPS, a niced encoder timer and the backfill
+  (16,990 stories, ~1 h at 0.22 s/story).
+
 ## 2026-09-30 Review follow-through (`124`)
 
 - Committed/pushed review `04d830d`, standalone CI style fix `16b46ed`, and
@@ -74,6 +97,31 @@
   and accumulated databases. No maintenance, schema migration, commit or push.
   Updated ARCHITECTURE.md, FINDINGS.md and STATUS.md. The local reader was
   reloaded by the concurrent shortcut task; existing web tabs need page reload.
+
+## 2026-10-01 TUI: `a` opens Claude Code again
+
+Reverted the uncommitted Codex shortcut WIP at the user's request (default
+agent `claude`, label/help/status/README back to Claude); kept a status-line
+assertion in the key-flow test. Focused tests pass, Ruff clean, reader
+relaunched. See FINDINGS.md "TUI shortcut back to Claude Code".
+
+## 2026-09-30 TUI: `a` opens Codex with the default model
+
+The reader's `a` shortcut now runs `codex` with the selected story's title,
+article and discussion links and the existing dig-deeper prompt. No model
+argument is supplied, so Codex uses its configured default. The tmux split,
+home-directory working root, `HN_RERANK_AGENT` command override and clipboard
+fallback remain available. Updated the shortcut label, status messages, help,
+README and existing launch/key-flow assertions. Unrelated review WIP is
+preserved.
+
+Validation: the three focused launch/key-flow tests pass; full TUI suite 162
+passed / 1 skipped; full backend suite 1,040 passed / 18 skipped; Ruff, touched
+Python formatting and ty pass. The first backend run hit six timing failures
+under background load; all six passed in isolation, and the full rerun passed
+with `OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1` under `batch`.
+Reloaded the reader in its existing tmux pane and verified its render. Evidence
+and the remaining physical shortcut check are in FINDINGS.md "TUI Codex shortcut".
 
 ## 2026-09-30 Review recheck: regression tests and test-quality audit
 
@@ -11056,7 +11104,7 @@ Regression tests exercise rapid sort cycling, direct tab changes, and age
 changes at widths 73 and 146; assert matching widgets and no further rebuilds
 after settling. Client: 92 passed / 1 skipped. Backend: 821 passed. Ruff,
 touched-file format checks, ty and diff whitespace checks clean. Local only;
-restart the TUI to load the fix (not restarted automatically).
+  restart the TUI to load the fix (not restarted automatically).
 
 ## 2026-09-23 — TUI: `s` cycles sort modes
 
@@ -11068,3 +11116,28 @@ restart the TUI to load the fix (not restarted automatically).
   owns focus (same guard as the other keys) and documented in `?` help.
 - Validation: new `test_s_cycles_sort_modes` passes; full client suite 85
   passed / 1 skipped; ruff, format clean.
+
+## 2026-09-30 — Bloomberg-inspired reader concepts for review
+
+Added `docs/mockups/bloomberg-reader.html`, a standalone HTML/JS prototype
+with a command palette, named sort/window/layout views, a discussion-change
+briefing, linked Article/Discussion/Related tabs, and Scan/Focus layouts.
+The palette runs commands and searches sample headlines. Custom views and
+theme choice persist locally; demo votes, undo, and reviewed-change state
+are session-local. Content and counts are labeled illustrative. Added a
+README and `preview.jpg`; no production files or database were changed.
+
+Browser-verified: command search and execution, saved-view persistence on
+reload, review-state clearing, related-story return to the same tab and
+scroll offset, Focus/Scan, vote/undo, demo reset, and the narrow layout.
+Desktop captured at a 1440x900 CSS viewport; narrow layout inspected at
+390x844. Temporary viewport overrides were cleared. The preview is served
+on loopback port 8766 by the transient `hn-reader-mockup.service` for review.
+
+JavaScript syntax, Ruff, ty, and diff whitespace checks passed. Full backend
+suite under the shared `batch` resource limits: 1024 passed, 18 skipped,
+10 xfailed, 2 failed in 152s. Existing wall-clock tests
+`test_enqueue_spread_distributes_evenly` and
+`test_feedback_idle_threshold_queues_latest_warm` also failed when rerun
+alone under `batch` (delayed scheduling; no application code changed).
+The repository-wide test gate remains failing; those tests were not edited.

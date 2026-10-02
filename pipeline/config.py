@@ -43,6 +43,13 @@ class ModelConfig:
     # ramp in with the SVM instead of taking half the ranking at the 20 up /
     # 20 down gate. Off only in the eval, to read the dense model alone.
     linear_blend_ramp: bool = True
+    # Opt-in (evaluation, 2026-10-02): the SVM and linear models see each
+    # story's stored vector and a second model's vector (Config.side_*)
+    # side by side; attribution, Explore and dedup keep the stored vectors.
+    # Off when fewer than side_embedding_min_coverage of the candidates and
+    # feedback stories have a side vector; the rest get a zero side part.
+    side_embedding_enabled: bool = False
+    side_embedding_min_coverage: float = 0.98
     diversity_threshold: float = 0.75
     knn_k: int = 10
     positive_cluster_k: int = 4
@@ -72,6 +79,10 @@ DEFAULT_ONNX_MODEL_DIR = os.environ.get(
 DEFAULT_EMBEDDING_MODEL_VERSION = "mxbai-embed-xsmall-v1|mean|norm|4096"
 DEFAULT_EMBEDDING_MAX_TOKENS = 4096
 DEFAULT_ENV_PATH = "/home/dev/hn-rewrite/shared/.env"
+DEFAULT_SIDE_EMBEDDING_MODEL_DIR = os.environ.get(
+    "HN_SIDE_MODEL_DIR", "/home/dev/hn-rewrite/shared/embeddinggemma-300m-onnx"
+)
+DEFAULT_SIDE_EMBEDDING_MODEL_VERSION = "embeddinggemma-300m|sentence|128|classification"
 
 BQ_ARCHIVE_SOURCE = "bq_seed"
 CH_ARCHIVE_SOURCE = "ch_seed"
@@ -102,6 +113,12 @@ class Config:
     embedding_model_version: str = DEFAULT_EMBEDDING_MODEL_VERSION
     embedding_max_tokens: int = DEFAULT_EMBEDDING_MAX_TOKENS
     embedding_batch_size: int = 32
+    # Second embedding model for ModelConfig.side_embedding_enabled, encoded
+    # by scripts/embed_side_vectors.py into the side_embeddings table.
+    side_embedding_model_dir: str = DEFAULT_SIDE_EMBEDDING_MODEL_DIR
+    side_embedding_model_version: str = DEFAULT_SIDE_EMBEDDING_MODEL_VERSION
+    side_embedding_max_tokens: int = 128
+    side_embedding_dim: int = 768
     embedding_ort_variant: Literal[
         "current",
         "spin_off",
@@ -240,6 +257,12 @@ class Config:
             raise ValueError("embedding_model_version must not be empty")
         if self.embedding_max_tokens <= 0:
             raise ValueError("embedding_max_tokens must be positive")
+        if not self.side_embedding_model_version.strip():
+            raise ValueError("side_embedding_model_version must not be empty")
+        if self.side_embedding_max_tokens <= 0:
+            raise ValueError("side_embedding_max_tokens must be positive")
+        if self.side_embedding_dim <= 0:
+            raise ValueError("side_embedding_dim must be positive")
         if self.dashboard_warm_vote_threshold <= 0:
             raise ValueError("dashboard_warm_vote_threshold must be positive")
         if self.dashboard_warm_idle_seconds <= 0:

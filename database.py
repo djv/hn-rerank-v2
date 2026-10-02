@@ -308,6 +308,22 @@ class Database:
                         "ALTER TABLE embeddings ADD COLUMN dim INTEGER NOT NULL DEFAULT 0"
                     )
 
+                # Vectors from an optional second model ranked side by side
+                # with `embeddings` (pipeline/side_embeddings.py). Additive:
+                # `embeddings` keys on story_id alone, so a second model needs
+                # its own table; rows match on (model_version, text_hash).
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS side_embeddings (
+                        story_id      INTEGER NOT NULL,
+                        model_version TEXT NOT NULL,
+                        text_hash     TEXT NOT NULL,
+                        embedding     BLOB NOT NULL,
+                        dim           INTEGER NOT NULL,
+                        PRIMARY KEY (story_id, model_version),
+                        FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE
+                    ) STRICT
+                """)
+
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS tldr_cache (
                         story_id    INTEGER NOT NULL,
@@ -988,6 +1004,72 @@ class Database:
                     len(ids),
                 )
             return res
+
+    def upsert_side_embeddings(
+        self,
+        model_version: str,
+        rows: list[tuple[int, str, NDArray[np.float32]]],
+    ) -> None:
+        """Store (story_id, text_hash, vector) rows of one side model."""
+        if not rows:
+            return
+        with self.conn() as conn:
+            with conn:
+                conn.executemany(
+                    """
+                    INSERT INTO side_embeddings
+                        (story_id, model_version, text_hash, embedding, dim)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(story_id, model_version) DO UPDATE SET
+                        text_hash=excluded.text_hash,
+                        embedding=excluded.embedding,
+                        dim=excluded.dim
+                    """,
+                    [
+                        (
+                            sid,
+                            model_version,
+                            text_hash,
+                            vec.astype(np.float32).tobytes(),
+                            int(vec.shape[0]),
+                        )
+                        for sid, text_hash, vec in rows
+                    ],
+                )
+
+    def get_side_embeddings_batch(
+        self,
+        ids: list[int],
+        model_version: str,
+        hashes: dict[int, str],
+        expected_dim: int,
+    ) -> dict[int, NDArray[np.float32]]:
+        """Side-model vectors whose stored text hash still matches *hashes*."""
+        if not ids:
+            return {}
+        found: dict[int, NDArray[np.float32]] = {}
+        with self.conn() as conn:
+            if not conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'side_embeddings'"
+            ).fetchone():
+                return found  # read-only handle on a DB from before the table
+            for start in range(0, len(ids), 10_000):
+                chunk = ids[start : start + 10_000]
+                placeholders = ",".join("?" for _ in chunk)
+                for sid, text_hash, blob in conn.execute(
+                    f"""SELECT story_id, text_hash, embedding FROM side_embeddings
+                        WHERE model_version = ? AND story_id IN ({placeholders})""",
+                    [model_version, *chunk],
+                ):
+                    if hashes.get(sid) != text_hash:
+                        continue
+                    vec = self._decode_embedding_blob(
+                        blob, expected_dim=expected_dim, story_id=sid
+                    )
+                    if vec is not None:
+                        found[sid] = vec
+        return found
 
     # TLDR cache
     def get_tldr_cache(self, story_id: int, cache_key: str) -> str | None:

@@ -1223,9 +1223,29 @@ def _score_and_rank(
             if score_context is not None:
                 score_context.feedback_embeddings = fb_embeddings
 
+            # The vectors the models train and score on: the stored ones, or
+            # stored + side model side by side. The score context (badges,
+            # attribution) stays on the stored vectors either way.
+            model_cand_emb, model_fb_emb = candidate_embeddings, fb_embeddings
+            if config.model.side_embedding_enabled:
+                from .side_embeddings import model_space
+
+                with trace.stage("side_embeddings"):
+                    space = model_space(
+                        candidates,
+                        candidate_embeddings,
+                        feedback_stories,
+                        fb_embeddings,
+                        db,
+                        config,
+                    )
+                trace.set_label("side_embeddings", "on" if space else "off")
+                if space is not None:
+                    model_cand_emb, model_fb_emb = space.candidates, space.feedback
+
             if fb_sig:
                 signature = hashlib.sha256(fb_sig.encode())
-                signature.update(fb_embeddings.tobytes())
+                signature.update(model_fb_emb.tobytes())
                 signature.update(
                     json.dumps(
                         [
@@ -1263,27 +1283,26 @@ def _score_and_rank(
             up_mask = fb_labels_arr == 2
             down_mask = fb_labels_arr == 0
             neutral_mask = fb_labels_arr == 1
-            fb_up_embs = fb_embeddings[up_mask]
-            fb_down_embs = fb_embeddings[down_mask]
-            fb_neutral_embs = fb_embeddings[neutral_mask]
+            fb_up_embs = model_fb_emb[up_mask]
+            fb_down_embs = model_fb_emb[down_mask]
 
             n_up = int(up_mask.sum())
             n_down = int(down_mask.sum())
             k = config.model.knn_k
-            emb_dim = candidate_embeddings.shape[1]
+            emb_dim = model_cand_emb.shape[1]
 
             with trace.stage("svm_candidate_feature_prep"):
                 # Fused (top-k mean, max) per class — one dot pass each instead
                 # of the two _knn_similarity/_chunked_max_dot recomputed the
                 # same candidate @ feedback matrix twice.
                 cand_sim_to_up, cand_closest_up, cand_closest_up_idx = (
-                    _knn_mean_and_max(candidate_embeddings, fb_up_embs, k)
+                    _knn_mean_and_max(model_cand_emb, fb_up_embs, k)
                 )
                 cand_sim_to_down, cand_closest_down, _ = _knn_mean_and_max(
-                    candidate_embeddings, fb_down_embs, k
+                    model_cand_emb, fb_down_embs, k
                 )
                 cand_closest_neutral = _chunked_max_dot(
-                    candidate_embeddings, fb_neutral_embs
+                    candidate_embeddings, fb_embeddings[neutral_mask]
                 )
                 # Cluster centers depend only on up-voted feedback, so reuse the
                 # cached ones on a model-cache hit instead of rerunning KMeans.
@@ -1294,7 +1313,7 @@ def _score_and_rank(
                         fb_up_embs, config.model.positive_cluster_k
                     )
                 cand_positive_cluster_sim = _similarity_to_positive_cluster_centers(
-                    candidate_embeddings, positive_cluster_centers
+                    model_cand_emb, positive_cluster_centers
                 )
                 cand_text_lengths = np.array([len(s.text_content) for s in candidates])
                 cand_source_onehot = source_category_stack(
@@ -1306,7 +1325,7 @@ def _score_and_rank(
                 cand_is_rss = cand_source_onehot[:, 3]
 
                 cand_features = _svm_personalization_features(
-                    candidate_embeddings,
+                    model_cand_emb,
                     text_lengths=cand_text_lengths,
                     sim_to_upvoted=cand_sim_to_up,
                     sim_to_downvoted=cand_sim_to_down,
@@ -1327,13 +1346,29 @@ def _score_and_rank(
                     [cand_features, _engagement_features(candidates)], axis=1
                 )
             if score_context is not None:
-                score_context.cand_closest_up = cand_closest_up.astype(np.float32)
-                score_context.cand_closest_up_idx = cand_closest_up_idx
+                ctx_up_embs = fb_up_embs
+                ctx_closest_up, ctx_closest_up_idx = (
+                    cand_closest_up,
+                    cand_closest_up_idx,
+                )
+                ctx_closest_down = cand_closest_down
+                if model_cand_emb is not candidate_embeddings:
+                    # Side by side: badges and attribution thresholds are
+                    # tuned on the stored vectors, so measure them there.
+                    ctx_up_embs = fb_embeddings[up_mask]
+                    _, ctx_closest_up, ctx_closest_up_idx = _knn_mean_and_max(
+                        candidate_embeddings, ctx_up_embs, k
+                    )
+                    _, ctx_closest_down, _ = _knn_mean_and_max(
+                        candidate_embeddings, fb_embeddings[down_mask], k
+                    )
+                score_context.cand_closest_up = ctx_closest_up.astype(np.float32)
+                score_context.cand_closest_up_idx = ctx_closest_up_idx
                 score_context.fb_up_titles = [
                     feedback_stories[i].title for i in np.flatnonzero(up_mask)
                 ]
-                score_context.fb_up_embeddings = fb_up_embs
-                score_context.cand_closest_down = cand_closest_down.astype(np.float32)
+                score_context.fb_up_embeddings = ctx_up_embs
+                score_context.cand_closest_down = ctx_closest_down.astype(np.float32)
                 score_context.cand_closest_neutral = cand_closest_neutral.astype(
                     np.float32
                 )
@@ -1345,26 +1380,26 @@ def _score_and_rank(
                 trace.set_label("model_cache", "miss")
                 with trace.stage("svm_training_feature_prep"):
                     # LOOCV k-NN for training: exclude self from reference set
-                    fb_sim_to_up = np.zeros(len(fb_embeddings), dtype=np.float32)
-                    fb_sim_to_down = np.zeros(len(fb_embeddings), dtype=np.float32)
+                    fb_sim_to_up = np.zeros(len(model_fb_emb), dtype=np.float32)
+                    fb_sim_to_down = np.zeros(len(model_fb_emb), dtype=np.float32)
                     if n_up > 0:
                         up_indices = np.where(up_mask)[0]
                         fb_sim_to_up, fb_closest_up = _loocv_knn_features(
-                            fb_embeddings, fb_up_embs, up_indices, k
+                            model_fb_emb, fb_up_embs, up_indices, k
                         )
                     else:
-                        fb_closest_up = np.zeros(len(fb_embeddings), dtype=np.float32)
+                        fb_closest_up = np.zeros(len(model_fb_emb), dtype=np.float32)
 
                     if n_down > 0:
                         down_indices = np.where(down_mask)[0]
                         fb_sim_to_down, fb_closest_down = _loocv_knn_features(
-                            fb_embeddings, fb_down_embs, down_indices, k
+                            model_fb_emb, fb_down_embs, down_indices, k
                         )
                     else:
-                        fb_closest_down = np.zeros(len(fb_embeddings), dtype=np.float32)
+                        fb_closest_down = np.zeros(len(model_fb_emb), dtype=np.float32)
 
                     fb_positive_cluster_sim = _similarity_to_positive_cluster_centers(
-                        fb_embeddings, positive_cluster_centers
+                        model_fb_emb, positive_cluster_centers
                     )
 
                     fb_text_lengths = np.array(
@@ -1381,7 +1416,7 @@ def _score_and_rank(
                     fb_is_rss = fb_source_onehot[:, 3]
 
                     fb_features = _svm_personalization_features(
-                        fb_embeddings,
+                        model_fb_emb,
                         text_lengths=fb_text_lengths,
                         sim_to_upvoted=fb_sim_to_up,
                         sim_to_downvoted=fb_sim_to_down,

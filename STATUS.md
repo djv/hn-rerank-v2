@@ -1,20 +1,56 @@
 # HN Rerank status
 
+Review status saved 2026-10-01 03:17 UTC (2026-09-30 local).
+
 ## Objective
 Improve what the dashboard shows the user (live profile 151; user 1 is the
 old profile, stopped 2026-09-24): ranking quality and which sources feed it.
-Current task: items 1/2/4 complete: review fixes committed/pushed and deployed,
+Prior task: items 1/2/4 complete: review fixes committed/pushed and deployed,
 live count refresh checked, and corrected blend evaluation rerun. Evidence:
 [FINDINGS.md](FINDINGS.md#review-follow-through--2026-09-30-items-1-2-and-4).
+Current task: TLDR diagnosis saved; user chose "Save diagnosis only; stop here."
+Live replay reproduced prose-format rejection and raw PDF input; archive
+exclusion confirmed in source. Fixes are parked; no runtime change or deployment.
+Reader design task: Bloomberg-inspired HTML/JS concepts are ready for user
+review; implementation in the app awaits the user's selection.
+Ranking eval loop (2026-10-02): fresh-vote/impression evals done offline; two
+candidate improvements (personalized Popular order, gemma side by side) await
+the user's decision. Nothing deployed.
 
 ## Verified result
-- Review follow-through (`04d830d`, `16b46ed`, `4071aec`): clean VPS checkout,
-  service restarted 2026-10-01 03:01:48 UTC. Live automatic counts update;
-  collapsed summary sections survive passive polling. Backend 1040/18,
+- Ranking evals (2026-10-02, snapshot of the live DB, profile 151, read-only):
+  the live blend beats the legacy ranker on 394 unseen votes (AUC 0.795 ->
+  0.865, P@12 0.375 -> 0.500). Knob tuning has plateaued (12 blocks: every
+  C/LR/TF-IDF/kNN/half-life/source change within ±0.01 AUC). Gemma side by
+  side: AUC +0.013 (11/12 blocks, p=0.001), P@12 +0.04, but 4.8 s/story on
+  laptop CPU. Within Popular the model's order cuts top-12 downvotes from
+  ~54% to 31% (70/30 model/gravity: 40%). Evaluator gained `--holdout-blocks`,
+  `--candidate-pool impressions`, feed slices, gravity blend; new
+  `scripts/badge_yield_report.py`. Tests 1049 passed / 1 timing flake (passes
+  alone); Ruff/format clean; ty only the old untracked TLDR script.
+  FINDINGS.md "Fresh-vote, impression-pool and live-yield evals".
+- TLDR diagnosis: `49913192` returned completed prose twice (185/206 of 450
+  tokens), so the identical retry lost Discussion; `46108780` contains raw
+  `%PDF` in its stored article body. Archive HN sources are skipped by the
+  dupe pipeline. Read-only replay; no database writes. FINDINGS.md
+  "TLDR follow-up diagnosis".
+- Review follow-through: four commits pushed (`04d830d`, `16b46ed`,
+  `4071aec`, `4d1ff85`); local/VPS HEAD `4d1ff85`, VPS checkout clean,
+  service active after 2026-10-01 03:01:48 UTC restart. Latest backend/Chrome
+  CI passed. Live scheduled refresh at 03:11:56 UTC updated the same active
+  card from 1054/702 to 1063 points/712 comments with an unchanged deck
+  version; the original Article section stayed attached and collapsed.
+  Backend 1040/18,
   Chrome 2, standalone TUI 162/1 on three OSes; lint/type/build gates pass.
   Corrected evaluator matches live production. P@12 development 0.625 -> 0.708,
   newest 20% 0.667 -> 0.667; served Recommended coverage insufficient.
   No ranking change from that replay. FINDINGS.md "Review follow-through".
+- Reader mockup (2026-09-30): [interactive preview](http://127.0.0.1:8766/bloomberg-reader.html)
+  in `docs/mockups/`: command palette, saved views, discussion-change briefing,
+  linked Article/Discussion/Related tabs, Scan/Focus. Illustrative data only.
+  Browser flows and desktop/mobile layouts checked; JS, Ruff and ty passed
+  during mockup delivery. Preview service is active and HTTP 200 on this
+  status save. Evidence: FINDINGS.md "Bloomberg-inspired reader mockup".
 - Review fixes on `fe38d9f`: tightened SQLite/evaluator regressions first,
   then fixed concurrent preservation, web/TUI vote rollback, count/TLDR
   freshness, evaluator Interest parity, UTC dates and interaction bounds.
@@ -100,8 +136,10 @@ live count refresh checked, and corrected blend evaluation rerun. Evidence:
   so thread-aware selection saw depth 0); live HN caps 5000 -> 10,000.
   First regen: 9,187 candidates, no errors, dashboard 0.23 s.
   FINDINGS.md "ClickHouse source review".
-- TUI `a` (committed `48e460f`, tests pass): Claude Code in a tmux pane split beside
-  the reader with the article/comments links and a dig-deeper prompt.
+- TUI `a` (2026-10-01): back to Claude Code at the user's request; the
+  uncommitted Codex WIP was reverted (committed `claude` default restored) and a
+  status-line assertion kept. Focused tests 3 pass, Ruff clean; reader relaunched
+  in pane `%58`. Physical `a` press not yet tried. FINDINGS.md "TUI Codex shortcut".
 - TUI status line (committed `48e460f`, 2026-09-29): always one row; long messages
   end in `…` instead of wrapping to 3 rows (hints still stack below when
   both don't fit). TUI tests 152 pass, ruff clean.
@@ -148,14 +186,22 @@ live count refresh checked, and corrected blend evaluation rerun. Evidence:
   shown). FINDINGS.md "Feed yield check — 2026-09-29".
 
 ## Blocker / limits
+- Reader mockup: waiting for design feedback. Its delivery-time backend run
+  had 1024 passed / 18 skipped / 10 xfailed / 2 timing failures, including
+  both failures on a focused rerun under `batch`. This is a prior validation
+  snapshot; concurrent application/test edits have since changed the tree.
 - Review fixes: committed/pushed and clean on the VPS. Separate shortcut and
   mockup WIP remains local. Open web tabs need reload for the final client.
   Live Chrome count changes and collapsed-section preservation checked;
   a day-long hot-refresh observation and user-observed TUI checks remain.
   Historical embedding slowness remains; real-user ranking gains unconfirmed.
-- The TLDR discussion call fails intermittently (`tldr: discussion call
+  No blocker to the completed items 1/2/4; item 3 (TLDR investigation) was
+  outside this round and remains outstanding.
+- TLDR fixes parked at the user's request (diagnosis only; stop).
+  The discussion call fails intermittently (`tldr: discussion call
   failed (status=None), salvaging article-only`: 54 times in 2 days, also
-  before `fcbfc9a`); the partial summary is not cached. Cause not checked.
+  before `fcbfc9a`); the partial summary is not cached. One live example
+  reproduced a completed prose reply twice; other failures remain unclassified.
 - Gemma side by side is not live and would need gemma on the VPS.
 - Blend gain is unconfirmed (flat on the newest 20%).
 - Go limit resets 2026-10-06 16:28 UTC: then set `LLM_PROVIDER=gospark`
@@ -169,9 +215,27 @@ live count refresh checked, and corrected blend evaluation rerun. Evidence:
   snapshots and merged copies live in `~/.local/state/hn-rerank-eval/`.
 
 ## Next step
+- Ranking (user decision pending): (a) re-order Popular's gravity candidates
+  by the model (70/30 or model-only), then live-check Popular's up/down rates
+  with `scripts/badge_yield_report.py`; (b) gemma side by side is built
+  behind `model.side_embedding_enabled` (off; uncommitted, tests pass).
+  Deploy needs the user's OK: symlink the VPS HF snapshot to
+  `shared/embeddinggemma-300m-onnx`, run `scripts/embed_side_vectors.py`
+  niced (16,990 stories, ~1 h) plus a timer, flag on, restart, then check
+  rerank time and the `side_embeddings` trace label. Rerun
+  `~/.local/state/hn-rerank-eval/run_eval.sh` on a new snapshot after ~200
+  more votes.
+- Review the reader mockup and select concepts to refine or implement. Keep
+  `hn-reader-mockup.service` available for review; stop it when review ends.
+  Preserve concurrent review/fix work and keep any app integration scoped
+  to the user's chosen concepts.
 - Reload any open web tab; the local TUI was reloaded by the shortcut task.
   Live Chrome automatic refresh verified; over a day, check `hot_refresh`
   lines stay under ~1 s with no Firebase warnings. Confirm the TUI physically.
+- Parked TLDR follow-up: strengthen bullet-format retry, guard raw PDF inputs,
+  and include archive HN sources in bounded dupe checks, with regressions and
+  verification if the user resumes. Keep current ranking settings:
+  newest-vote P@12 is flat.
 - Explore badges (user, 2026-09-30): Unsure stays until ~2026-10-14, then
   keep or drop it (and judge Novel, 🎯 Interest) from the per-badge upvote
   rates in `interaction_events.badges`. Offline, Unsure's votes taught the

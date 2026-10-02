@@ -1,5 +1,174 @@
 # HN Rerank findings
 
+## Fresh-vote, impression-pool and live-yield evals — 2026-10-02
+
+Snapshot `~/.local/state/hn-rerank-eval/snapshot-20261002.db` (read-only
+`.backup` of the VPS DB, 04:18 UTC). Profile 151: 3,239 votes (755 up),
+merged user-1 votes keep their original timestamps. Since the blend went
+live (2026-09-29 17:17 UTC, `--holdout-after 1790702220`): 394 votes, 57 up,
+233 down, 104 neutral; none informed any tuning. Runs, logs and
+`compare.py` in `~/.local/state/hn-rerank-eval/{fresh,impressions}-20261002/`.
+
+New evaluator options: `--holdout-blocks N` splits the held-out votes into
+N time blocks, each trained on every earlier vote; `--candidate-pool
+impressions` adds every story first shown to the user during a block (and
+not voted elsewhere) to that block's votes, so shown-but-unvoted cards count
+as not-upvoted. New metrics: `known_upvote_fraction_at_12` (P@12) and
+`auc_up_vs_all` (upvotes vs every other card, judged or not).
+
+Fresh votes, 4 blocks (15/18/11/13 ups, ~98 votes each), judged-only pool:
+
+| ranker | P@12 | down@12 | AUC up vs rest | P@12 blocks w/t/l vs live |
+|---|---|---|---|---|
+| live blend (C=4, LR 0.2, TF-IDF 0.3) | 0.500 | 0.104 | 0.865 | - |
+| legacy (C=0.1, no blend) | 0.375 | 0.188 | 0.795 | 1/0/3 |
+| C=4, no blend | 0.542 | 0.083 | 0.861 | 2/2/0 |
+| blend, TF-IDF 0 | 0.562 | 0.083 | 0.864 | 3/1/0 |
+| blend, TF-IDF 0.5 | 0.500 | 0.104 | 0.856 | 1/2/1 |
+| up-minus-down (`produd`, C=4) | 0.479 | 0.167 | 0.837 | 1/1/2 |
+| + shown-unvoted as down (30%) | 0.500 | 0.125 | 0.863 | 1/2/1 |
+| + shown-unvoted as neutral | 0.521 | 0.104 | 0.869 | 1/3/0 |
+| + vote half-life 30 d | 0.521 | 0.104 | 0.866 | 1/3/0 |
+
+Impression pool (same blocks + 25-50 shown-unvoted stories each): live
+P@12 0.396, AUC-all 0.838; legacy 0.312 / 0.778; C=4 no blend and TF-IDF 0
+both 0.458 / 0.835-0.838 (3/0/1); source prior 0.1 0.396 / 0.838, 0.2
+0.333 / 0.833; shown-unvoted as neutral 0.396 / 0.844.
+
+- The live blend beats the legacy ranker on unseen votes in both pools
+  (AUC +0.06-0.07, P@12 +0.08-0.13). The development-fold gain holds up.
+- Nothing tested beats the blend beyond noise: P@12 differences are 1-3
+  cards out of 48. TF-IDF adds nothing on fresh votes (0 >= 0.3 > 0.5);
+  user 1's development folds favoured 0.3 by about the same small margin.
+- Up-minus-down scoring and a source prior make the top 12 worse.
+
+Development folds (151's votes before the 2026-09-27 confirmation cut, 8
+folds, ~160 judged votes and 25-58 ups each) pooled with the 4 fresh blocks,
+paired deltas vs live (`combine.py`, 12 blocks):
+
+| change | dP@12 (w/t/l) | dAUC (blocks better, Wilcoxon p) |
+|---|---|---|
+| dense LR 0.2 -> 0.4 | +0.014 (2/10/0) | +0.003 (9/12, p=0.010) |
+| dense LR 0.2 -> 0 | -0.007 (1/9/2) | -0.003 (1/12, p=0.001) |
+| TF-IDF 0.3 -> 0 | +0.028 (4/8/0) | -0.005 (3/12, p=0.18) |
+| C=4 without blend | +0.021 (3/9/0) | -0.009 (2/12, p=0.06) |
+| C 2 or 8 | 0 (0/12/0) | 0 |
+| shown-unvoted as neutral | 0 (2/8/2) | +0.001 |
+| kNN 0.2 (fresh only) | +0.042 (2/2/0) | +0.003 |
+
+Knob tuning has plateaued: every change is within ±0.01 AUC and 1-3
+top-12 cards. Only "more dense LR" is consistent, and too small to ship alone.
+
+embeddinggemma-300m side by side with the stored vectors (same settings as
+the 2026-09-28 study; 544 of 151's 3,239 voted stories newly encoded on the
+iGPU at 0.49 s/story, the rest reused; `~/.local/state/hn-rerank-eval/
+gemma-20261002/`), live blend settings, paired with the stored-only replay
+(which reproduces the DB-embedding run exactly):
+
+| blocks | P@12 stored -> +gemma | AUC stored -> +gemma | AUC blocks better |
+|---|---|---|---|
+| dev, 8 folds | 0.615 -> 0.635 | 0.779 -> 0.794 | 8/8 (p=0.008) |
+| fresh, 4 blocks | 0.500 -> 0.583 | 0.860 -> 0.870 | 3/4 |
+| pooled 12 | +0.042 (7/3/2) | +0.013 | 11/12 (p=0.001) |
+
+Gemma is the only change in this round that holds on both development and
+unseen votes (dense LR 0.4 adds nothing on top of it).
+
+Cost and shorter text (same 12 blocks; CPU = laptop i7-10510U, onnxruntime,
+2 threads, 24 stories; iGPU = OpenVINO f16):
+
+| gemma input | CPU s/story | iGPU s/story | dP@12 (w/t/l) | dAUC (better, p) |
+|---|---|---|---|---|
+| 512 tokens | 4.8 (int8 4.4, q4 5.2) | 0.49 | +0.042 (7/3/2) | +0.013 (11/12, 0.001) |
+| 256 tokens | 2.3 | 0.23 | +0.042 (7/3/2) | +0.009 (10/12, 0.021) |
+| 128 tokens | 1.06 | 0.11 | +0.056 (7/4/1) | +0.011 (9/12, 0.027) |
+
+Int8/q4 weights do not speed up this AVX2-only CPU (no VNNI; the VPS's EPYC
+Rome has none either); input length is what costs. At 128 tokens the gain is
+the same within noise. Measured on the VPS (2026-10-02 12:04 UTC; venv
+onnxruntime 1.27, f32, 2 threads, nice 19, 48 of 151's stories): 0.218 s/story
+at 128 tokens, 5x the laptop CPU; vectors match the laptop iGPU encodes
+(cosine 1.0000). So ~40 min one-time for the ~11k-candidate pool and ~1.3
+min/day for ~350 new stories; load rose 1.2 -> 2.0 during the run. The model
+(1.2 GB) stays in the VPS's `~/.cache/huggingface`; the temp dir was removed.
+Rollout pieces: an additive gemma vector table (the `embeddings` primary key
+is story_id), a niced background encoder, and the ranker fed each story's
+stored and gemma vectors concatenated, each part scaled 1/sqrt(2) (what the
+replay does).
+
+Per feed (impression pool; slices by the feed of each story's first
+impression, `raw_feed_*`), live model vs the feed's own order:
+
+| feed (cards, ups, downs over 4 blocks) | base up / down rate | live top-12 up / down | AUC up vs all / vs down |
+|---|---|---|---|
+| Popular (175, 8, 95) | 4.6% / 54% | 14.6% / 31% (gravity order 8.3% / 50%) | 0.875 / 0.921 |
+| Explore (158, 8, 75) | 5.1% / 48% | 14.6% / 29% | 0.913 / 0.937 |
+| Recommended (193, 41, 59) | 21% / 31% | 41.7% / 4.2% | 0.688 / 0.811 |
+
+The model separates what 151 likes inside Popular and Explore far better
+than their own orders do. Popular is unpersonalized HN gravity, and most
+of its votes are downvotes. Ordering or filtering it with the model would
+roughly halve its top-12 downvotes. Few ups per block (0-5), so the up
+rates are rough; the downvote result rests on 95 downvotes.
+
+Popular blended with its own order (`gravity_weight`, window clock 8 h,
+aged at each block's median vote), top 12 of the Popular slice:
+
+| order | up | down | AUC up vs all / vs down |
+|---|---|---|---|
+| gravity only (Popular today; 4 h clock alike) | 8.3% | 54% | 0.72 / 0.69 |
+| 30% gravity + 70% live blend | 14.6% | 40% | 0.887 / 0.940 |
+| 50% gravity | 12.5% | 38% | 0.858 / 0.900 |
+| 70% gravity | 10.4% | 40% | 0.841 / 0.866 |
+| live blend only | 14.6% | 31% | 0.875 / 0.921 |
+
+Re-ordering Popular's own candidates (the top HN stories by gravity) with
+30% gravity / 70% model keeps it a popularity view and cuts its top-12
+downvotes from about half to 40%; model-only order cuts them to 31%.
+
+Live yield since 2026-09-30, profile 151, first impression per story
+(`scripts/badge_yield_report.py`): Recommended 15.4% upvoted (22/143, 82%
+non-HN), Popular 2.4% (3/123, 72% of votes down), Explore 1.2% (1/85). Badges:
+Hot 2.5% (79), Interest 8.7% (23), Unsure 0/19, Novel 0/17. Recommended
+downvotes cluster on Reddit personal-finance/nomad subs and LessWrong;
+since the blend Reddit votes are 10 up / 42 down, HN 17 / 137, other 30 / 54.
+
+## TLDR follow-up diagnosis — 2026-09-30
+
+User selected investigation of discussion failures, PDF handling and archive
+duplicates after the review follow-through, then chose "Save diagnosis only;
+stop here." Diagnosis is saved; fixes are parked. No runtime fix or deployment
+was applied in this follow-up.
+
+- Reproduced the live Mistral discussion failure on `49913192` (EDG C++
+  front-end goes public) through the read-only diagnostic
+  `scripts/inspect_tldr_failures.py`. Both discussion samples finished with
+  `finish_reason=stop`, using 185/206 of 450 output tokens, but answered as
+  prose. The identical-prompt retry did not correct the missing bullets;
+  generation salvaged the Article half without caching it. This example is
+  a formatting rejection, not a timeout or token-limit truncation.
+- Replayed `46108780` (DeepSeek-V3.2 paper): `ch_seed`, 15,000 stored article
+  characters beginning `%PDF-1.5`. Both article attempts explained that the
+  supplied binary data contained no readable article; the Discussion half
+  succeeded and was returned uncached. Current fetch eligibility excludes
+  `.pdf`, but generation/cache key construction trust pre-existing article
+  bodies. The urllib 403 fallback also loses Content-Type information.
+- Archive duplicates are excluded in the regen callback, worker submission,
+  due-candidate query, canonical replacement and title-feedback matching:
+  each checks only source `hn`, while the shared `is_hn_source` contract
+  includes `ch_seed` and `bq_seed`. Existing tests cover live HN and non-HN
+  bypass, not the archive path. Any fix should retain the existing 250-item
+  batch, low-comment filter, cache/backoff and title/target validation.
+- The diagnostic uses SQLite `mode=ro`; it does not instantiate `Database`,
+  generate embeddings, record usage into SQLite or cache its replay results.
+  Database rows and existing WIP remain unchanged.
+- If resumed: make the format retry explicitly require Markdown bullets,
+  reject raw PDF content at fetch/prompt/cache-key boundaries, and extend the
+  existing bounded duplicate path to both archive sources. Add applicable
+  regressions before fixes and complete the project verification protocol.
+  One live discussion failure was explained; other intermittent failures
+  have not been exhaustively classified. PDF text extraction is not supported.
+
 ## Review follow-through — 2026-09-30 (items 1, 2 and 4)
 
 User selected commit/deployment, actual reader freshness checks and corrected
@@ -25,7 +194,7 @@ ranking evaluation. The separate Codex shortcut and reader mockup remain WIP.
   that memo on loading/errors. The same test verifies that a changed generated
   summary still replaces nodes. Backend 1040 passed / 18 skipped (73.78s),
   Chrome 2 passed (12.77s), Ruff/format/ty clean; backend CI passed.
-- Clean VPS at `4071aec`; restart 03:01:48 UTC, active, Result=success.
+- Clean VPS after `4071aec`; restart 03:01:48 UTC, active, Result=success.
   Deployed template SHA matches local. Live Article stayed collapsed through
   ordinary polling from deck `1790823710351` to `1790823710352` and subsequent
   polls. Final retained-cookie smoke: dashboard 200 / 0.01s, feed 27 stories,
@@ -35,6 +204,17 @@ ranking evaluation. The separate Codex shortcut and reader mockup remain WIP.
   forcing one known thread made the generation check deterministic.
   Final minute: no application errors/tracebacks. The previously recorded
   intermittent article-only discussion failure remains outside items 1/2/4.
+- Final native Chrome count-only proof: scheduled hot refresh at 03:11:56 UTC
+  probed 19, changed 13, took 741ms. Passive polling kept deck version
+  `1790823710352` while counts revision reached 15. Gemini 4 Argon updated
+  from 1054 points / 702 comments to 1063 / 712; 1w/1m/1d responses agreed.
+  The original active card and Article details node remained attached, with
+  Article still collapsed. No browser reload or forced poll during this check.
+- Status save at 03:17 UTC (2026-10-01): local and clean VPS HEAD `4d1ff85`,
+  service active, PID 919091, Result=success, same restart timestamp. Latest
+  [backend/Chrome CI run](https://github.com/djv/hn-rerank-v2/actions/runs/36809284021)
+  completed successfully. Reader mockup service active; preview HTTP 200.
+  This status save changes documentation only; unrelated WIP remains intact.
 
 Corrected evaluator replay: frozen user-1 2026-09-25 database, all 5189 stored
 384-d embeddings, no new encoder; same evaluation time as the earlier replay.
@@ -118,7 +298,8 @@ Final verification:
   sync or deployed-client replacement. Checksums match the final local files.
   Earlier laptop gates exposed the now-corrected neighbor-fetch expectation and
   a known three-second prefetch timeout under concurrent sweeps. Each corrected
-  test also passed alone. Concurrent shortcut changes remain separate WIP.
+  test also passed alone. The concurrent shortcut task separately reports a
+  green laptop TUI/backend run in its section below.
 - Chrome: `batch uv run --no-sync --group browser pytest tests/test_browser.py
   -m browser -q` — **2 passed, 12.03s**. Throwaway server and mocked network/LLM.
 - Ruff, formatting of all 24 touched Python files, ty and diff whitespace pass.
@@ -147,6 +328,75 @@ Live verification:
   client source edit at 20:29:56. Its reload/render was verified by the concurrent
   shortcut task. Open web tabs need a page reload to load the new inline script;
   passive count updates on the user's physical display were not observed here.
+
+## TUI shortcut back to Claude Code — 2026-10-01
+
+- User asked to switch `a` back from Codex to Claude Code. The Codex change was
+  never committed, so `app.py`, `README.md` and `test_client.py` were restored
+  from HEAD (default `claude`, label "Ask Claude"); kept the new
+  `Opened Claude on:` status assertion. Focused tests 3 passed; Ruff clean.
+- Reader in pane `%58` (`HN_RERANK_BROWSER=surf-tall`, no `HN_RERANK_AGENT`)
+  was restarted with the venv `hn-rerank` and renders the feed. Not verified:
+  an actual `a` press opening a Claude pane.
+
+## TUI Codex shortcut — 2026-09-30
+
+- User requested that `a` open the selected article in Codex with the default
+  model. `open_agent_session` now defaults to `codex`, passing the existing
+  article/discussion prompt as its only argument; no model override. Updated
+  the key label, help, status messages, README and existing behavioral tests.
+  The custom `HN_RERANK_AGENT` command and clipboard fallback are preserved.
+- Installed `codex --help` confirms an optional initial prompt and model flag.
+  Running reader had no `HN_RERANK_AGENT` override and Codex on its PATH.
+  Reloaded only reader pane `%21`; new PID 2414349 rendered the feed and summary.
+  No backend service restart was needed for this client-only change.
+- Checks: focused launch/key-flow tests 3 passed; full TUI 162 passed / 1 skipped
+  (204.12 s); full backend 1,040 passed / 18 skipped (116.54 s); Ruff, touched
+  Python formatting and ty clean; CLI help boot passes. All suites used `batch`.
+  Initial backend run: 1,034 passed / 18 skipped / 6 timing failures (427 s);
+  all six passed alone. The successful full rerun set `OPENBLAS_NUM_THREADS=1`,
+  `OMP_NUM_THREADS=1`, `MKL_NUM_THREADS=1` to reduce contention.
+- Shortcut execution is covered by tests; verification did not start an actual
+  Codex conversation. Unrelated review/fix WIP and accumulated DB are preserved.
+
+## Bloomberg-inspired reader mockup — 2026-09-30
+
+User requested Bloomberg Terminal UI research for HN, then interactive HTML/JS
+mockups to review. Delivered `docs/mockups/bloomberg-reader.html`, README and
+`preview.jpg`; prototype is self-contained, with illustrative stories/counts,
+no production API requests or database access. It follows the existing reader's
+charcoal/ivory/orange styling and keyboard-first interaction.
+
+- Concepts: command/search palette; named sort/window/layout views;
+  "What changed" discussion briefing; linked Article/Discussion/Related tabs
+  with return navigation; desktop Scan and expanded Focus layouts.
+- Browser verification during delivery: palette search/Enter, custom-view
+  persistence after reload, mark discussion changes read, related-story
+  return with exact tab/scroll restoration, Focus/Scan, vote/undo, reset.
+  Desktop inspected at 1440x900 CSS pixels and mobile at 390x844; browser
+  console was clear. Screenshot: `docs/mockups/preview.jpg`.
+- Custom views/theme persist in localStorage; demo votes/read state are
+  session-local. Reset restores sample data. No app integration is deployed.
+- Preview: <http://127.0.0.1:8766/bloomberg-reader.html>, served by transient
+  loopback-only `hn-reader-mockup.service`. On this `ss` save, service status
+  was `active` and the page returned HTTP 200. It is retained for review,
+  not enabled at boot. Stop with `systemctl --user stop hn-reader-mockup.service`.
+- Delivery checks: inline JavaScript syntax, Ruff, ty and diff whitespace
+  passed. Backend suite under `batch`: 1024 passed, 18 skipped, 10 xfailed,
+  2 failed in 152.16s (`/tmp/hn-reader-mockup-pytest.log`). Failures:
+  `test_enqueue_spread_distributes_evenly` and
+  `test_feedback_idle_threshold_queues_latest_warm`; both failed again alone
+  under `batch`. Those wall-clock tests were outside this prototype change.
+  Concurrent application/test edits are now present, so this historical run
+  does not establish the current tree's test status. No test sweep rerun for
+  this documentation-only save.
+
+Research used Bloomberg's official navigation/autocomplete guide, Launchpad
+workspace article and news activity/briefing page; source links are in
+`docs/mockups/README.md`. The existing TUI already has split panes and keyboard
+navigation; the new concepts add domain commands, saved views and linked reading.
+Next: user reviews and chooses concepts; refine or integrate only the requested
+scope while preserving unrelated WIP.
 
 ## Review handoff — 2026-09-30
 
