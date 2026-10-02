@@ -1,5 +1,127 @@
 # HN Rerank findings
 
+## Ranking review and direct Claude Code assessment — 2026-10-02
+
+Scope: the ranking/evaluation/attribution changes since `4d1ff85`, initially
+reviewed at `438ca1c`. All three findings below were rechecked at `50abce9`
+during this save. Diagnosis only: no application fix, production database
+write, deployment or service restart was performed by this review.
+
+### 1. P1: default production evaluation omits Gemma
+
+`scripts/eval_ranker_variants.py:_fold_database` (173-222) creates an
+in-memory database and copies stored embeddings and training feedback. It
+forwards duplicate-resolution reads and missing story lookups to the source
+snapshot, but never supplies its `side_embeddings`. With
+`config.toml:side_embedding_enabled = true`, `model_space` sees no side
+coverage, warns and returns `None`; `_production_scores` continues under the
+`production` label with stored vectors alone. The live service ranks with
+Gemma. The evaluator checks fit/blend errors but does not reject this fallback.
+
+Reproduction recipe, using only in-memory databases:
+
+1. Build the existing `_signal_fold()` from
+   `tests/test_eval_ranker_variants.py` (150 stories, 120 training rows).
+2. Create a source `Database(":memory:")`, copy the fold stories, and store
+   one current-hash side vector per story: row `np.eye(8)[story.id % 8]`,
+   float32, under `Config.side_embedding_model_version`. Set
+   `side_embedding_dim=8` and `side_embedding_enabled=True`.
+3. `model_space` against the source with a fresh `SideVectorCache` has
+   coverage 1.0. Open `_fold_database(fold, config, source)`: its side table
+   contains zero rows. `_production_scores` with the flag enabled returns
+   a score array bit-identical to the flag-disabled run.
+
+Observed output (repeated at `50abce9`):
+
+```text
+side_embeddings_low_coverage coverage=0.0000 stories=150; ranking on stored vectors only
+EVAL: source coverage=1.0; fold side rows=0; enabled/disabled scores identical=True
+```
+
+### Claude Code assessment of #1
+
+The user requested CC's opinion, then specified direct command-line invocation
+for same-machine questions instead of an agent inbox file. A read-only
+`claude -p` invocation used `Read,Grep,Glob`, no MCP servers and no session
+persistence. It completed successfully and returned its assessment on stdout;
+it did not change files or delegate the assessment.
+
+CC confirmed the mismatch. Crucially, this defect does **not** invalidate the
+previous Gemma comparison: `gemma-20261002/evals.sh` and `short.sh` in
+`~/.local/state/hn-rerank-eval/` pass two `--replay-embeddings` files, joined
+by `_load_concatenated_replay` at 1/sqrt(2). Their
+`fresh-20261002/eval.toml` contains no side setting, so its code default is
+off. These script/config facts were also read directly during this save.
+The reported offline gains retain their existing sampling/tuning/live limits.
+
+CC's proposed correction, still unimplemented:
+
+- Supply `get_side_embeddings_batch` from the source snapshot to the fold
+  database, like the existing duplicate-resolution forwarding.
+- Detect unexpected side fallback in evaluation rather than publishing a
+  stored-only result under an enabled Gemma configuration.
+- Reject explicit joined replay embeddings combined with side mode, avoiding
+  adding Gemma twice.
+- Regression: source DB has complete side rows; enabled evaluation matches
+  direct production scoring and differs from flag-off; missing rows produce
+  an explicit failure. Account for cold/sparse profiles, where the SVM and
+  side-model branch legitimately do not run, when defining the failure gate.
+
+### 2. P2: the side encoder misses capped replacement candidates
+
+`scripts/embed_side_vectors.py:39-40` loads a capped global candidate pool
+with `exclude_feedback=False`. Personalized ranking filters a user's voted
+stories out **before** applying that cap, admitting replacement rows the
+encoder never considers. Repeated timer runs need not cover those replacements
+even after all queued work is complete. If their share exceeds the coverage
+budget, the entire rerank falls back to stored vectors.
+
+In-memory reproduction: HN limit 2, three equally aged summarizable stories
+with IDs 1/2/3 and scores 30/20/10; the user upvotes story 1. Encode the
+`stories_to_encode` queue (IDs 1 and 2), then query again. The next queue is
+empty, but that user's live candidate IDs are 2 and 3, with no side vector
+for 3. This demonstrates the cap/filter mismatch; it does not assert that
+the deployed profile currently lacks sufficient coverage.
+
+```text
+ENCODER: encoded IDs=[1, 2]; live candidate IDs=[2, 3]; missing side IDs=[3]; next timer work=0
+```
+
+### 3. P2: archive HN yield is reported as non-HN
+
+`scripts/badge_yield_report.py:99` groups only `hn` and `hn_archive` into HN.
+The canonical `is_hn_source` recognizes `hn`, `ch_seed`, `bq_seed`. The two
+real archive sources therefore inflate `other` in per-source yield reports.
+
+In-memory reproduction: insert one impression each for sources `hn`,
+`ch_seed`, `bq_seed`, `rss_example`, then call `load_report`.
+
+```text
+YIELD: 3 HN stories + 1 RSS reported as={'hn': 1, 'other': 3}
+```
+
+### Checks and boundaries
+
+- Affected suites (`test_side_embeddings`, `test_pipeline`,
+  `test_eval_ranker_variants`, `test_badge_yield_report`): 241 passed /
+  18 skipped, 31.74 s, four pytest workers under `batch` with one CPU and
+  BLAS/OMP/MKL threads capped at 1. This was the initial reviewed snapshot,
+  before the concurrent startup-warming change.
+- Ruff clean; all 13 Python files changed by the reviewed ranking commits
+  format-clean. `ty` reported only the existing untracked
+  `scripts/inspect_tldr_failures.py:86` assignment diagnostic.
+- Full suite: stopped our run when sustained laptop load rose above 6;
+  exited with KeyboardInterrupt after 956 passed / 18 skipped / one failure.
+  `test_dashboard_cache_uses_feedback_versions` hit its existing 3 s wait;
+  isolated rerun passed (31.93 s including startup under load). This is not
+  a full-suite pass. All task-owned test and CC processes exited.
+- Read-only VPS inspection during the review confirmed `f0c44b7`, service
+  and side timer active, `side_embeddings=on`; initial refit 61.8 s, next
+  cache hit 7.0 s. Startup-warm changes landed concurrently as `7cdb742` /
+  `50abce9`; their deployment evidence remains in the previous status.
+- This save updates documentation only. It preserves the prior TUI test,
+  mockup, TLDR diagnostic and kernel-log WIP, plus all production data.
+
 ## "Because you upvoted" on unrelated long texts — 2026-10-02
 
 User report: the ghc-debug memory-profiling post (RSS `-1422691117`) said

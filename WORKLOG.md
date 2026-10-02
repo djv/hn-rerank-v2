@@ -1,5 +1,20 @@
 # Worklog: hn-rewrite
 
+## 2026-10-02 Recent ranking review saved
+
+- Saved three in-memory reproductions: evaluation loses Gemma side vectors;
+  the side encoder misses capped replacements after feedback exclusion;
+  archive HN sources are classified as non-HN in yield reporting.
+- Direct read-only Claude Code assessment confirmed the evaluation mismatch;
+  earlier Gemma gains used explicit joined replay files and are unaffected
+  by that defect. Fixes remain unrequested and unimplemented.
+- Preserved the previous project status in
+  `docs/status-archive/before-ranking-review-handoff-20261002.md`; refreshed
+  STATUS/FINDINGS with evidence, validation limits and the next authorized
+  step. Reused the affected-suite/lint evidence; full-suite interruption
+  and its passing isolated cache-timeout rerun are explicitly recorded.
+- No application, production-data or service changes; unrelated WIP kept.
+
 ## 2026-10-02 Warm recent voters at startup
 
 - `server.py`: `Handler.warm_recent_users` (called in `main` after the cold
