@@ -38,8 +38,11 @@ decisions: personalized Popular order; reader mockup concepts.
   ready (`hn-reader-mockup.service` active, http://127.0.0.1:8766/bloomberg-reader.html).
 
 ## Blocker / limits
-- No live 151 rerank seen since the gemma restart (user idle through 15:21
-  UTC), so the live label/latency check is pending; real-user gain unmeasured.
+- Live 151 reranks after the 15:35:55 UTC restart: `side_embeddings=on`,
+  `attribution_ms` 48-51. The first (model refit, right after restart) took
+  61.8 s (linear blend fit 20.9 s, score 7.5 s, side vectors 5.5 s, window
+  assembly 5.3 s; pre-gemma refits 5.4-8.7 s); the next, a cache hit, 7.0 s.
+  Check whether a refit after a vote is also slow. Real-user gain unmeasured.
 - Offline gains rest on re-ranking already-voted stories (57 fresh upvotes);
   Popular's upvote rates rest on 8 upvotes (downvote result on 95).
 - Uncommitted WIP from earlier sessions, kept out of these commits:
