@@ -30,8 +30,36 @@ The isolated VPS source copy passed the full backend suite (1,095 passed /
 1 skipped, 106.04s) and TUI suite (162 passed / 1 skipped, 104.92s), sequential
 `batch` jobs capped to one CPU and 3G RAM, with library threads set to 1.
 Ruff, touched formatting and type checking pass; standalone TUI Ruff and
-format checks also pass. Original checkout WIP is untouched. Live deployment
-and verification remain pending.
+format checks also pass. Original checkout WIP is untouched.
+
+Deployment and live verification:
+
+- `7813480` pushed to origin/main, fast-forwarded on the clean VPS main
+  worktree, service restarted 20:34:33 UTC. Personalized warm at 20:35:13
+  had `side_embeddings=on`, `rank_total_ms=30727.9`; the next refit was
+  10,310.5 ms. Service is active/running.
+- All five profile-151 feeds were ready at version 1790973276295. First
+  12 badge counts (overlaps are intentional): 12h Hot 9 / Top 0 / Talk 2;
+  1d 12/4/3; 1w 12/12/2; 1m 10/12/2; archive 0/12/0.
+- Story 49908394 (335 points, 637 comments) now carries Talk+Top+Hot;
+  story 49890733 also carries all three. Embedded dashboard feed returned
+  200/ready at version 1790973276296 with correct threshold tooltips and
+  Hot's "Fastest 0.5%" text.
+- Summary smoke: uncached story 49906100 returned 200, `cached=false`,
+  2,156 characters; cached story 49124218 returned 200, `cached=true`,
+  1,779 characters. Journal confirms generated and cache_hit respectively
+  at 20:37:44. No new-process tracebacks or ERROR logs in the bounded
+  post-restart scan. Old process exit 143 during the deliberate restart
+  was reported by systemd as exit-code; new process stayed active. An
+  unrelated background Reddit 429 appeared at 20:38:52.
+- Both code-commit CI workflows succeeded:
+  [backend](https://github.com/djv/hn-rerank-v2/actions/runs/37061442856),
+  [terminal client](https://github.com/djv/hn-rerank-v2/actions/runs/37061442888).
+
+Before/after membership is not a controlled comparison: profile feedback
+advanced by 18 reactions and a normal regen ran during this work. Badge
+selection is verified by regressions; current live output verifies stacking.
+No production DB deletion, schema change or direct feedback mutation.
 
 ## Gemma production-evaluation parity fixed — 2026-10-02
 

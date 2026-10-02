@@ -16,7 +16,11 @@
 - Two backend regressions failed before the change. Local affected suites:
   222 passed. Isolated VPS validation under `batch`, one CPU and 3G max:
   full backend 1,095 passed / 1 skipped (106.04s), TUI 162 passed / 1 skipped
-  (104.92s). Ruff, touched formatting and types pass. Deployment pending.
+  (104.92s). Ruff, touched formatting and types pass.
+- Deployed `7813480` to the clean VPS main worktree; restarted at
+  20:34:33 UTC. Live profile 151 has Hot+Top+Talk on story 49908394
+  (335 points / 637 comments); all five windows were ready. Dashboard and
+  cached/uncached summary POSTs returned 200. Backend and terminal CI passed.
 
 ## 2026-10-02 Restore Gemma production-evaluation parity
 
