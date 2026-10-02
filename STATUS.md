@@ -1,15 +1,22 @@
 # HN Rerank status
 
-Saved 2026-10-02 15:25 UTC. Previous status:
+Saved 2026-10-02 15:40 UTC. Previous status:
 [docs/status-archive/before-gemma-handoff-20261002.md](docs/status-archive/before-gemma-handoff-20261002.md).
 
 ## Objective
 Improve what the dashboard shows the live profile 151 (user 1 stopped
 2026-09-24): ranking quality and which sources feed it. This round: ranking
 evals on fresh votes and impressions, then gemma side-by-side ranking, now
-live. Open user decisions: personalized Popular order; reader mockup concepts.
+live. Then a "Because you upvoted" fix, live in `f0c44b7`. Open user
+decisions: personalized Popular order; reader mockup concepts.
 
 ## Verified result
+- "Because you upvoted" centered gate live (`f0c44b7`, restart 15:35:55 UTC):
+  the ghc-debug post named an unrelated AINews digest (raw 0.64, centered
+  0.20). Lines now need centered cosine >= 0.30; named upvotes unchanged.
+  Live-DB copy rerank of 151: 1d lines 29 -> 23 (hidden ones unrelated), 1w
+  41 -> 41. Dashboard/feed 200, journal clean. Tests 1,062 passed; Ruff/format
+  clean. Evidence: FINDINGS.md "'Because you upvoted' on unrelated long texts".
 - Gemma side by side live on the VPS (`5b4b939` code, `2639f8f` flag on,
   docs `16ba800`; restart 2026-10-02 13:32:34 UTC). Backfill 17,053 stories at
   0.218 s/story niced; `hn-rewrite-side-embed.timer` every 30 min (runs 13:35,
