@@ -2126,6 +2126,43 @@ ATTRIBUTION_MIN_SIM = 0.35
 # for no bad ones. Interest (🎯) comes from the user's upvotes, so it keeps
 # the floor.
 BADGED_ATTRIBUTION_MIN_SIM = 0.85
+# Mean-pooled full-text vectors share a direction that grows with text length
+# (cosine to the pool mean: 0.26 under 500 chars, 0.60 over 6,000), so two
+# long, unrelated stories can look close: a ghc-debug post and an AINews
+# digest scored 0.64, closer than 99.9% of profile 151's votes. A card keeps
+# its raw nearest upvote, but names it only if the pair is still close with
+# the pool mean and top ATTRIBUTION_CENTER_DIRECTIONS directions removed (that
+# pair: 0.20). At 0.30 a line stays on 64% of a week's stories (92% before)
+# and on 90% of raw >= 0.80 matches (2026-10-02, FINDINGS.md). Ranking,
+# badges and Explore keep the raw vectors.
+ATTRIBUTION_CENTER_DIRECTIONS = 3
+ATTRIBUTION_CENTERED_MIN_SIM = 0.30
+
+
+def centered_pair_similarity(
+    pool: NDArray[np.float32],
+    left: NDArray[np.float32],
+    right: NDArray[np.float32],
+) -> NDArray[np.float32]:
+    """Row-wise cosine of ``left[i]`` and ``right[i]`` after removing the
+    pool's mean and its top ATTRIBUTION_CENTER_DIRECTIONS principal
+    directions; 0 where a centered vector vanishes."""
+    mean = pool.mean(axis=0)
+    spread = pool - mean
+    _, eigenvectors = np.linalg.eigh(spread.T @ spread)
+    top = eigenvectors[:, ::-1][:, :ATTRIBUTION_CENTER_DIRECTIONS].T
+
+    def center(x: NDArray[np.float32]) -> tuple[NDArray[np.float32], NDArray[Any]]:
+        y = x - mean
+        y = y - (y @ top.T) @ top
+        return y, np.linalg.norm(y, axis=1)
+
+    a, a_norm = center(left)
+    b, b_norm = center(right)
+    norms = a_norm * b_norm
+    valid = (a_norm > 1e-6) & (b_norm > 1e-6)
+    sims = np.where(valid, (a * b).sum(axis=1) / np.where(valid, norms, 1.0), 0.0)
+    return sims.astype(np.float32)
 
 
 def card_attribution(r: RankedStory) -> str:
@@ -2147,12 +2184,14 @@ def _fill_best_match_titles(
     deck: WindowDeck,
     candidates: list[Story],
     score_context: RankScoreContext | None,
+    cand_embeddings: NDArray[np.float32],
 ) -> WindowDeck:
     """F2 attribution: name the closest upvoted story per deck card.
 
-    Uses the argmax indices already computed for features (no new matmul).
-    Empty when cold (no feedback), when the argmax is invalid, when the
-    feedback title is gone, or below ATTRIBUTION_MIN_SIM.
+    Uses the argmax indices already computed for features (no new matmul
+    over all candidates). Empty when cold (no feedback), when the argmax is
+    invalid, when the feedback title is gone, below ATTRIBUTION_MIN_SIM, or
+    below ATTRIBUTION_CENTERED_MIN_SIM once centered.
     """
     if (
         score_context is None
@@ -2161,24 +2200,46 @@ def _fill_best_match_titles(
         or not score_context.fb_up_titles
     ):
         return deck
-    row_of = {s.id: i for i, s in enumerate(candidates)}
     titles = score_context.fb_up_titles
+    up_embeddings = score_context.fb_up_embeddings
+    if (
+        up_embeddings is None
+        or len(up_embeddings) != len(titles)
+        or len(cand_embeddings) != len(candidates)
+        or up_embeddings.shape[1:] != cand_embeddings.shape[1:]
+    ):
+        return deck
+    row_of = {s.id: i for i, s in enumerate(candidates)}
     closest_up_idx = score_context.cand_closest_up_idx
     closest_up = score_context.cand_closest_up
 
-    def match_for(story_id: int) -> tuple[str, float]:
-        row = row_of.get(story_id)
+    raw: dict[int, tuple[int, int, float]] = {}
+    for r in deck.stories():
+        row = row_of.get(r.story.id)
         if row is None:
-            return "", 0.0
+            continue
         fb_row = int(closest_up_idx[row])
         sim = float(closest_up[row])
         if 0 <= fb_row < len(titles) and sim >= ATTRIBUTION_MIN_SIM and titles[fb_row]:
-            return titles[fb_row], sim
-        return "", 0.0
+            raw[r.story.id] = (row, fb_row, sim)
+    if not raw:
+        return deck
+    rows = np.array([row for row, _, _ in raw.values()])
+    fb_rows = np.array([fb_row for _, fb_row, _ in raw.values()])
+    centered = centered_pair_similarity(
+        cand_embeddings, cand_embeddings[rows], up_embeddings[fb_rows]
+    )
+    matches = {
+        story_id: (titles[fb_row], sim)
+        for (story_id, (_, fb_row, sim)), close in zip(raw.items(), centered)
+        if close >= ATTRIBUTION_CENTERED_MIN_SIM
+    }
 
     def fill(r: RankedStory) -> RankedStory:
-        title, sim = match_for(r.story.id)
-        return replace(r, best_match_title=title, best_match_sim=sim) if title else r
+        match = matches.get(r.story.id)
+        if match is None:
+            return r
+        return replace(r, best_match_title=match[0], best_match_sim=match[1])
 
     return deck.map_views(lambda _w, _v, items: (fill(r) for r in items))
 
@@ -2268,4 +2329,5 @@ def assemble_ranked_deck(
             is_feedback_match=is_feedback_match,
             trace=trace,
         )
-    return _fill_best_match_titles(deck, candidates, score_context)
+    with trace.stage("attribution"):
+        return _fill_best_match_titles(deck, candidates, score_context, cand_embeddings)

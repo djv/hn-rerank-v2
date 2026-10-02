@@ -1,5 +1,42 @@
 # HN Rerank findings
 
+## "Because you upvoted" on unrelated long texts — 2026-10-02
+
+User report: the ghc-debug memory-profiling post (RSS `-1422691117`) said
+"Because you upvoted: [AINews] Death of Params…". Read-only checks on the
+VPS DB and the 04:18 UTC snapshot (profile 151, 3,239 votes, 755 up).
+Scripts, vectors and logs: `~/.local/state/hn-rerank-eval/attribution-20261002/`
+(`probe.py`, `verify.py`, `gate.py`, `evals.sh`).
+
+- Raw mxbai cosine 0.643 (re-encoded = stored): closer than 99.9% of 151's
+  votes, the post's nearest upvote. Titles alone 0.11; best pair of
+  200-token passages 0.43; first 64/256/512/1024 tokens 0.12/0.24/0.39/0.57.
+  Mean pooling over ~2k tokens drifts to a shared direction: cosine to the
+  30-day pool mean is 0.26 under 500 chars and 0.60 over 6,000. AINews
+  digests sit closest to it (0.77).
+- The raw floor was no filter: 92% of a week's 1,518 unvoted stories had a
+  nearest upvote >= 0.35 (median 0.556).
+- Haskell's nearest upvote by variant (leave-one-out AUC up-vs-down of
+  nearest-upvote similarity; corr. with log text length): live 4096 AINews
+  (0.840; +0.34); mxbai 512 "GLM 5.2 on my slow computer" (0.868; +0.10);
+  centered live (mean + top 3 PCs removed) "Scarf has moved away from
+  Haskell" (0.845; +0.14); gemma 128 Scarf (0.845; +0.09); stored+gemma
+  Scarf (0.871; +0.24); 256-token passage max/mean-of-max AINews (0.85).
+- Ranking on centered vectors changes nothing (12 blocks, live blend):
+  dP@12 -0.021, dAUC +0.003, p=0.79 (1 PC: +0.007 / -0.001).
+- Re-picking the upvote on centered vectors changed the named upvote for 45%
+  of stories (a third of raw >= 0.80 matches) with no topical gain where it
+  differs (centered pick has the closer title 48.5% vs 51.1%). Same-article
+  pairs (127 RSS/Reddit -> HN twins) stay close either way (top 1% of 3,000
+  random stories: 89.8% raw and centered).
+- Shipped variant: keep the raw match, show it only if the pair's centered
+  cosine >= 0.30 (user chose 0.30 over 0.35/0.40): lines on 64% of the
+  week's stories (0.35: 48%, 0.40: 33%), 90% of raw >= 0.80 and 86% of raw
+  >= 0.70 matches kept; title similarity of shown vs hidden lines 0.23 vs
+  0.17. Hidden e.g. "Suggestions for Haskell Foundation" <- "era of
+  subsidised compute" (0.11); kept e.g. Sonnet 5.5 benchmark <- "Introducing
+  Claude Sonnet 5.5". Cost ~60 ms per rerank (11k x 384 pool, 2 threads).
+
 ## Fresh-vote, impression-pool and live-yield evals — 2026-10-02
 
 Snapshot `~/.local/state/hn-rerank-eval/snapshot-20261002.db` (read-only

@@ -7248,12 +7248,31 @@ def _f2_ranked(sids: list[int]) -> WindowDeck:
     )
 
 
+_F2_DIM = 16
+
+
+def _f2_unit(rng: np.random.Generator, n: int) -> NDArray[np.float32]:
+    x = rng.normal(size=(n, _F2_DIM))
+    return (x / np.linalg.norm(x, axis=1, keepdims=True)).astype(np.float32)
+
+
 def _f2_fill(
-    deck: WindowDeck, cands: list[Story], ctx: ranking.RankScoreContext | None
+    deck: WindowDeck, cands: list[Story], ctx: ranking.RankScoreContext
 ) -> list[RankedStory]:
-    return list(
-        ranking._fill_best_match_titles(deck, cands, ctx).window("1w").recommended
-    )
+    """Each card's vector is the upvote its argmax names (a real match), in
+    a pool of random filler candidates to center on."""
+    rng = np.random.default_rng(0)
+    up = ctx.fb_up_embeddings
+    assert up is not None and ctx.cand_closest_up_idx is not None
+    own = [
+        up[j] if 0 <= j < len(up) else _f2_unit(rng, 1)[0]
+        for j in ctx.cand_closest_up_idx
+    ]
+    filler = _f2_unit(rng, 40)
+    stories = cands + [_f2_story(10_000 + k) for k in range(len(filler))]
+    emb = np.vstack([np.array(own, dtype=np.float32), filler])
+    deck = ranking._fill_best_match_titles(deck, stories, ctx, emb)
+    return list(deck.window("1w").recommended)
 
 
 def _f2_context(n_cands: int, idx: list[int], sims: list[float], titles: list[str]):
@@ -7261,6 +7280,7 @@ def _f2_context(n_cands: int, idx: list[int], sims: list[float], titles: list[st
         cand_closest_up=np.array(sims, dtype=np.float32),
         cand_closest_up_idx=np.array(idx, dtype=np.int64),
         fb_up_titles=titles,
+        fb_up_embeddings=_f2_unit(np.random.default_rng(1), len(titles)),
     )
 
 
@@ -7273,6 +7293,50 @@ def test_fill_best_match_titles_happy_path() -> None:
     )
     assert [r.best_match_title for r in out] == ["Up A", "Up B", "Up A"]
     assert [r.best_match_sim for r in out] == pytest.approx([0.9, 0.8, 0.9])
+
+
+def test_attribution_skips_matches_that_only_share_the_pool_direction() -> None:
+    """Long texts share a direction in the pool, so unrelated stories can
+    match closely (a ghc-debug post and an AINews digest: 0.64). A card
+    keeps its raw nearest upvote and names it only if the pair stays close
+    once the pool's mean and top directions are removed."""
+    rng = np.random.default_rng(2)
+    common = _f2_unit(rng, 1)[0]
+    basis = np.linalg.qr(np.column_stack([common, rng.normal(size=(_F2_DIM, 4))]))[0]
+    e1, e2, e3, e4 = basis[:, 1:].T
+
+    def long_text(x: NDArray[np.float64]) -> NDArray[np.float32]:
+        v = 3 * common + x
+        return (v / np.linalg.norm(v)).astype(np.float32)
+
+    noise = rng.normal(size=(60, _F2_DIM)) * 0.3
+    noise -= np.outer(noise @ common, common)
+    pool = np.array([long_text(x) for x in noise])
+    unrelated, unrelated_up = long_text(e1), long_text(e2)
+    related, related_up = long_text(e3), long_text(e3 + 0.2 * e4)
+    cand_emb = np.vstack([unrelated, related, pool])
+    up_emb = np.vstack([unrelated_up, related_up])
+    raw = (cand_emb[:2] * up_emb).sum(axis=1)
+    centered = ranking.centered_pair_similarity(cand_emb, cand_emb[:2], up_emb)
+    assert raw.min() > 0.85
+    assert centered[0] < ranking.ATTRIBUTION_CENTERED_MIN_SIM < centered[1]
+
+    cands = [_f2_story(10), _f2_story(11)] + [
+        _f2_story(100 + k) for k in range(len(pool))
+    ]
+    ctx = ranking.RankScoreContext(
+        cand_closest_up=np.concatenate([raw, np.zeros(len(pool))]).astype(np.float32),
+        cand_closest_up_idx=np.concatenate([[0, 1], np.zeros(len(pool))]).astype(
+            np.int64
+        ),
+        fb_up_titles=["Unrelated digest", "Related post"],
+        fb_up_embeddings=up_emb,
+    )
+    deck = ranking._fill_best_match_titles(_f2_ranked([10, 11]), cands, ctx, cand_emb)
+    out = list(deck.window("1w").recommended)
+    assert [r.best_match_title for r in out] == ["", "Related post"]
+    # The named upvote and its similarity are the raw ones.
+    assert out[1].best_match_sim == pytest.approx(raw[1])
 
 
 def test_badged_cards_name_an_upvote_only_on_a_close_match() -> None:
@@ -7326,12 +7390,18 @@ def test_badged_cards_name_an_upvote_only_on_a_close_match() -> None:
 def test_fill_best_match_titles_cold_and_floor() -> None:
     ranked = _f2_ranked([10])
     cands = [_f2_story(10)]
+    emb = _f2_unit(np.random.default_rng(0), 1)
     # No context (cold user): untouched, same objects.
-    assert ranking._fill_best_match_titles(ranked, cands, None) is ranked
+    assert ranking._fill_best_match_titles(ranked, cands, None, emb) is ranked
     assert (
-        ranking._fill_best_match_titles(ranked, cands, ranking.RankScoreContext())
+        ranking._fill_best_match_titles(ranked, cands, ranking.RankScoreContext(), emb)
         is ranked
     )
+    # Upvote vectors missing or misaligned with their titles: silent.
+    ctx = _f2_context(1, [0], [0.95], ["Up A"])
+    for up in (None, _f2_unit(np.random.default_rng(0), 2)):
+        bad = replace(ctx, fb_up_embeddings=up)
+        assert ranking._fill_best_match_titles(ranked, cands, bad, emb) is ranked
     # Below the similarity floor: silent.
     ctx = _f2_context(1, [0], [0.10], ["Up A"])
     assert _f2_fill(ranked, cands, ctx)[0].best_match_title == ""

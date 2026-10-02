@@ -1,5 +1,17 @@
 # Worklog: hn-rewrite
 
+## 2026-10-02 "Because you upvoted" centered gate
+
+- `pipeline/ranking.py`: `centered_pair_similarity` (pool mean and top 3
+  principal directions removed); `_fill_best_match_titles` now takes the
+  candidate vectors and shows a line only when the raw match's centered
+  cosine is >= `ATTRIBUTION_CENTERED_MIN_SIM` (0.30). Named upvote,
+  `best_match_sim`, ranking, badges and Explore unchanged; new `attribution`
+  trace stage. `scripts/explain_rank.py` prints the centered value.
+- Why: long mean-pooled texts share a direction; the ghc-debug post named
+  an unrelated AINews digest (0.64 raw, 0.20 centered). Evidence: FINDINGS.md
+  "'Because you upvoted' on unrelated long texts".
+
 ## 2026-10-02 Ranking evals on fresh votes and impressions
 
 - `scripts/eval_ranker_variants.py`: `--holdout-blocks N` (held-out votes in
