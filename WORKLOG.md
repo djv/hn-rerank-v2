@@ -1,5 +1,14 @@
 # Worklog: hn-rewrite
 
+## 2026-10-02 Warm recent voters at startup
+
+- `server.py`: `Handler.warm_recent_users` (called in `main` after the cold
+  deck) queues an urgent warm for each profile with a vote in the last 7 days
+  (latest first, at most 4); `database.py`: `recently_voting_user_ids`.
+- Why: after the 15:35 UTC restart, 151's first read got the cold deck and
+  the personalized one landed 80 s later (first rank in a fresh process:
+  61.8 s live, 30.3 s alone on a DB copy; later refits 6.3 s).
+
 ## 2026-10-02 "Because you upvoted" centered gate
 
 - `pipeline/ranking.py`: `centered_pair_similarity` (pool mean and top 3

@@ -1675,6 +1675,16 @@ class Database:
                 return User(id=row[0], token=row[1], created_at=row[2])
             return None
 
+    def recently_voting_user_ids(self, since: float, limit: int) -> list[int]:
+        """Users with a vote updated after ``since``, latest vote first."""
+        with self.conn() as conn:
+            rows = conn.execute(
+                "SELECT user_id FROM feedback WHERE updated_at > ? "
+                "GROUP BY user_id ORDER BY MAX(updated_at) DESC LIMIT ?",
+                (since, limit),
+            ).fetchall()
+        return [int(row[0]) for row in rows]
+
     def get_or_create_user(self, token: str) -> User:
         user = self.get_user_by_token(token)
         if user:

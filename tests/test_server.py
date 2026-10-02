@@ -1409,6 +1409,51 @@ def test_no_cache_user_gets_cold_deck_and_warm_is_scheduled(
     assert rank["dashboard_latest_version"] == target_version
 
 
+def test_startup_warms_recently_voting_profiles(
+    test_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A restart ranks profiles that voted in the last week, latest vote
+    first, so their first read isn't the cold deck while a slow first rank
+    runs. Older or vote-less profiles wait for a read."""
+    _, db, _, handler, user = test_env
+    recent = db.get_or_create_user("startup-recent")
+    stale = db.get_or_create_user("startup-stale")
+    db.get_or_create_user("startup-no-votes")
+    db.upsert_story(
+        Story(
+            id=993,
+            title="Voted",
+            url=None,
+            score=1,
+            time=int(time.time()) - 3600,
+            text_content="",
+            source="hn",
+        )
+    )
+    now = time.time()
+    for voter, age_days in ((user, 2), (recent, 1), (stale, 8)):
+        db.upsert_feedback(voter.id, 993, "up")
+        with db.conn() as conn:
+            conn.execute(
+                "UPDATE feedback SET updated_at = ? WHERE user_id = ?",
+                (now - age_days * 86400, voter.id),
+            )
+            conn.commit()
+    calls: list[tuple[int, int]] = []
+
+    def fake_trigger_warm(cls, warm_user, version: int, **_: Any) -> None:
+        calls.append((warm_user.id, version))
+
+    monkeypatch.setattr(handler, "_trigger_warm", classmethod(fake_trigger_warm))
+    handler._dashboard_versions = {}
+
+    assert handler.warm_recent_users() == [recent.id, user.id]
+    assert calls == [
+        (recent.id, handler._dashboard_version(recent.id)),
+        (user.id, handler._dashboard_version(user.id)),
+    ]
+
+
 def test_no_cache_zero_feedback_user_gets_cold_deck_no_warm(
     test_env, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -1666,7 +1666,8 @@ class Handler:
       version wins, at most one running per user) on a pool of
       ``config.warm_pool_size`` workers. Votes debounce through it
       (``dashboard_warm_idle_seconds``, or immediately at
-      ``dashboard_warm_vote_threshold`` votes).
+      ``dashboard_warm_vote_threshold`` votes). At startup
+      ``warm_recent_users`` queues one for each recently voting profile.
     """
 
     config: Config
@@ -1675,6 +1676,12 @@ class Handler:
     regen_event: threading.Event
     _decks: dict[int, DeckState] = {}
     _MAX_CACHED_DECKS = 100
+    # The first rank in a fresh process takes 30-60 s (61.8 s live on
+    # 2026-10-02, 30.3 s alone; a refit later takes ~6 s), so profiles
+    # that voted this recently are ranked at startup instead of on their
+    # first read, which would otherwise show the cold deck meanwhile.
+    _STARTUP_WARM_DAYS = 7
+    _STARTUP_WARM_MAX_USERS = 4
     _pool_generation: int = _boot_epoch_ms()
     _dashboard_versions: dict[int, int] = {}
     _dashboard_versions_guard = threading.Lock()
@@ -1850,6 +1857,23 @@ class Handler:
         cls._warm_scheduler().request(
             user.id, user, version, delay_s, expedite=expedite
         )
+
+    @classmethod
+    def warm_recent_users(cls) -> list[int]:
+        """Queue a warm for each profile with a recent vote (latest first);
+        returns their ids."""
+        since = time.time() - cls._STARTUP_WARM_DAYS * 86400
+        warmed: list[int] = []
+        for user_id in cls.db.recently_voting_user_ids(
+            since, cls._STARTUP_WARM_MAX_USERS
+        ):
+            user = cls.db.get_user_by_id(user_id)
+            if user is None:
+                continue
+            cls._trigger_warm(user, cls._dashboard_version(user.id))
+            warmed.append(user.id)
+        logging.info("startup_warm user_ids=%s", warmed)
+        return warmed
 
     @classmethod
     def _schedule_feedback_warm(cls, user: User, version: int) -> bool:
@@ -3675,6 +3699,7 @@ def main() -> None:
     Handler.regen_event = regen_event
     set_llm_usage_recorder(db.record_llm_usage)
     Handler._rebuild_cold_deck()
+    Handler.warm_recent_users()
 
     # Start regen thread
     t = threading.Thread(target=regen_loop, args=(config, regen_event, db), daemon=True)
