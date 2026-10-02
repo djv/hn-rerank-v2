@@ -19,9 +19,12 @@
   (`SideEmbedder`, cache, coverage-gated model space), ranking integration
   (model features on joined vectors, score context on stored vectors) and
   `scripts/embed_side_vectors.py`. `SideEmbedder` reproduces the evaluated
-  vectors (cosine 1.0000); flag off leaves ranking unchanged. Not deployed:
-  needs the model dir on the VPS, a niced encoder timer and the backfill
-  (16,990 stories, ~1 h at 0.22 s/story).
+  vectors (cosine 1.0000); flag off leaves ranking unchanged.
+- Deployed: VPS model dir symlinked to the cached HF snapshot, niced backfill
+  (17,053 stories, 12:28-13:31 UTC), `hn-rewrite-side-embed.timer` (every 30
+  min; units in system-setup `f31d149`), flag on in `2639f8f`, restart 13:32:34
+  UTC. Smoke: dashboard/feed 200, no journal errors; offline rerank of 151 on
+  a DB copy: label on, 6.9 s refit / 5.3 s cache hit.
 
 ## 2026-09-30 Review follow-through (`124`)
 

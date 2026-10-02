@@ -13,9 +13,9 @@ Live replay reproduced prose-format rejection and raw PDF input; archive
 exclusion confirmed in source. Fixes are parked; no runtime change or deployment.
 Reader design task: Bloomberg-inspired HTML/JS concepts are ready for user
 review; implementation in the app awaits the user's selection.
-Ranking eval loop (2026-10-02): fresh-vote/impression evals done offline; two
-candidate improvements (personalized Popular order, gemma side by side) await
-the user's decision. Nothing deployed.
+Ranking (2026-10-02): gemma side-by-side ranking is live on the VPS
+(`2639f8f`, restart 13:32:34 UTC); personalized Popular order is still the
+user's open decision.
 
 ## Verified result
 - Ranking evals (2026-10-02, snapshot of the live DB, profile 151, read-only):
@@ -217,12 +217,11 @@ the user's decision. Nothing deployed.
 ## Next step
 - Ranking (user decision pending): (a) re-order Popular's gravity candidates
   by the model (70/30 or model-only), then live-check Popular's up/down rates
-  with `scripts/badge_yield_report.py`; (b) gemma side by side is built
-  behind `model.side_embedding_enabled` (off; uncommitted, tests pass).
-  Deploy needs the user's OK: symlink the VPS HF snapshot to
-  `shared/embeddinggemma-300m-onnx`, run `scripts/embed_side_vectors.py`
-  niced (16,990 stories, ~1 h) plus a timer, flag on, restart, then check
-  rerank time and the `side_embeddings` trace label. Rerun
+  with `scripts/badge_yield_report.py`; (b) gemma side by side is live:
+  confirm `side_embeddings=on` in a live `rank_perf` line for 151 and rerank
+  time near 5-9 s, watch `hn-rewrite-side-embed` runs, then re-read up/down
+  rates after ~200 shown stories. Rollback: `side_embedding_enabled = false`
+  in config.toml, restart. Rerun
   `~/.local/state/hn-rerank-eval/run_eval.sh` on a new snapshot after ~200
   more votes.
 - Review the reader mockup and select concepts to refine or implement. Keep

@@ -96,6 +96,19 @@ is story_id), a niced background encoder, and the ranker fed each story's
 stored and gemma vectors concatenated, each part scaled 1/sqrt(2) (what the
 replay does).
 
+Deployed 2026-10-02 (`5b4b939` code, `2639f8f` flag on; restart 13:32:34
+UTC): backfill 12:28-13:31 UTC, 17,053 stories at 0.218 s/story niced (1.5 GB
+peak, VPS load ~2-5 while the server embedded too); `hn-rewrite-side-embed.
+timer` first run 13:35 encoded 44 new stories in 13 s. Dashboard and 1w feed
+200, no journal errors. A one-off rerank of 151 on a copy of the live DB
+(stored-only vs gemma, same process): `side_embeddings=on`, 6.9 s on a model
+refit and 5.3 s on a cache hit (live baseline before: 5.4-8.7 s refit, 3.8 s
+hit; the stored-only first run took 16.3 s cold). Recommended top 12 with
+gemma: 1d shares 11/12 with stored-only, 1w 7/12 (new: the Sonnet 5.5 launch
+posts, Ember-1, two brain-research stories). Not yet seen: a live user rerank
+with the label, and any change in up/down rates (re-read with
+`scripts/badge_yield_report.py` after ~200 shown stories).
+
 Per feed (impression pool; slices by the feed of each story's first
 impression, `raw_feed_*`), live model vs the feed's own order:
 
