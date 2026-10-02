@@ -148,6 +148,13 @@ Not yet seen: a live user rerank with the label (no 151 activity since the
 restart), and any change in up/down rates (re-read with
 `scripts/badge_yield_report.py` after ~200 shown stories).
 
+Live after the 15:35:55 UTC restart (`f0c44b7`): 151's reranks carry
+`side_embeddings=on`; the first took 61.8 s (cold process, startup work and
+an overlapping niced check job), the next 7.0 s (cache hit). On a live-DB
+copy (2 threads, niced): cold process 30.3 s (linear blend fit 7.6 s and
+score 7.4 s, window assembly 5.0 s), forced refit 6.3-6.4 s with gemma vs
+4.9 s stored-only (SVM decision 2.4 vs 1.0 s), cache hit 5.2 s.
+
 Per feed (impression pool; slices by the feed of each story's first
 impression, `raw_feed_*`), live model vs the feed's own order:
 

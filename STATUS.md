@@ -39,10 +39,11 @@ decisions: personalized Popular order; reader mockup concepts.
 
 ## Blocker / limits
 - Live 151 reranks after the 15:35:55 UTC restart: `side_embeddings=on`,
-  `attribution_ms` 48-51. The first (model refit, right after restart) took
-  61.8 s (linear blend fit 20.9 s, score 7.5 s, side vectors 5.5 s, window
-  assembly 5.3 s; pre-gemma refits 5.4-8.7 s); the next, a cache hit, 7.0 s.
-  Check whether a refit after a vote is also slow. Real-user gain unmeasured.
+  `attribution_ms` 48-51; first 61.8 s (cold process during startup work and
+  an overlapping niced check job), next 7.0 s (cache hit). Profiled on a DB
+  copy (2 threads, niced): cold process 30.3 s, refit 6.3-6.4 s with gemma vs
+  4.9 s stored-only (SVM decision 2.4 vs 1.0 s), cache hit 5.2 s. So slow only
+  on the first rerank after a restart. Real-user gain unmeasured.
 - Offline gains rest on re-ranking already-voted stories (57 fresh upvotes);
   Popular's upvote rates rest on 8 upvotes (downvote result on 95).
 - Uncommitted WIP from earlier sessions, kept out of these commits:
