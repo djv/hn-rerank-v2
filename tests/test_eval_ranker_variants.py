@@ -17,6 +17,7 @@ from pipeline import Config
         ["--split", "stratified"],  # retired: chronological evaluation only
         ["--leak-check", "--leak-seeds", "0"],
         ["--folds", "0"],
+        ["--candidate-pool", "impressions"],  # needs --holdout-after
     ],
 )
 def test_cli_rejects_invalid_evaluation_setups(argv: list[str]) -> None:
@@ -254,6 +255,124 @@ def test_metrics_include_time_forward_dashboard_keys() -> None:
     assert metrics["known_downvote_fraction_at_40"] == 1 / 40
 
 
+def test_metrics_auc_up_vs_all_counts_unjudged_cards_as_not_up() -> None:
+    from scripts.eval_ranker_variants import _metrics
+
+    fold = _metric_fold([1, 5, 12, 41], [2, 0, 2, 1])
+    scores = -np.arange(50, dtype=np.float32)
+
+    metrics = _metrics(scores, fold, Config())["raw"]
+
+    # Upvotes at ranks 0 and 11 of 50: 48 + 38 of 2 * 48 pairs up-first.
+    assert metrics["auc_up_vs_all"] == pytest.approx(86 / 96)
+    assert metrics["auc_up_vs_rest"] == pytest.approx(3 / 4)
+    assert metrics["known_upvote_fraction_at_12"] == 2 / 12
+
+
+def test_metrics_score_each_slice_on_its_own_stories() -> None:
+    from dataclasses import replace
+
+    from scripts.eval_ranker_variants import _metrics
+
+    fold = replace(
+        _metric_fold([1, 5, 12, 41], [2, 0, 2, 1]),
+        slices={"feed_popular": {5, 12, 30, 99}},
+    )
+    scores = -np.arange(50, dtype=np.float32)
+
+    sliced = _metrics(scores, fold, Config())["raw_feed_popular"]
+
+    # Order within the slice is 5, 12, 30 (99 is not a candidate): one
+    # upvote (12) ranked above one unvoted card and below one downvote.
+    assert sliced["returned_cards"] == 3
+    assert sliced["eligible_positives"] == 1
+    assert sliced["auc_up_vs_all"] == pytest.approx(1 / 2)
+    assert sliced["auc_up_vs_down"] == 0.0
+    assert sliced["known_upvote_fraction_at_12"] == 1 / 3
+
+
+def test_first_shown_feeds_group_stories_by_first_impression(tmp_path: Path) -> None:
+    from database import Database, InteractionEvent
+    from scripts.eval_ranker_variants import _first_shown_feeds
+
+    db = Database(str(tmp_path / "f.db"))
+    for sid in (1, 2):
+        db.upsert_story(_eval_story(sid))
+
+    def shown(eid: str, sid: int, at: float, mode: str, user: int = 7):
+        return InteractionEvent(
+            event_id=eid,
+            client_session_id="s",
+            user_id=user,
+            story_id=sid,
+            event_type="impression",
+            dashboard_version=0,
+            position=0,
+            sort_mode=mode,
+            age_filter="1d",
+            source_filter="all",
+            ranker_arm="tui_observed",
+            occurred_at=at,
+        )
+
+    db.insert_interaction_events(
+        [
+            shown("a", 1, 20.0, "recommended"),
+            shown("b", 1, 10.0, "popular"),
+            shown("c", 2, 30.0, "explore"),
+            shown("d", 2, 5.0, "popular", user=8),  # another user's impression
+        ]
+    )
+
+    assert _first_shown_feeds(db, 7) == {"feed_popular": {1}, "feed_explore": {2}}
+    db.close()
+
+
+def test_window_gravity_ages_stories_at_the_blocks_median_vote() -> None:
+    from dataclasses import replace
+
+    from scripts.eval_ranker_variants import _scores_window_gravity
+
+    fold = replace(
+        _metric_fold([1], [2]),
+        candidates=[
+            replace(_eval_story(1), score=100, time=0),
+            replace(_eval_story(2), score=40, time=14 * 3600),
+        ],
+        test_vote_times=np.array([10.0, 16 * 3600.0, 30 * 3600.0]),
+    )
+
+    scores = _scores_window_gravity(fold, 8.0)
+
+    # Now = 16 h: ages 16 h and 2 h on an 8-hour clock.
+    assert scores == pytest.approx([100 / (2 + 2) ** 1.8, 40 / (0.25 + 2) ** 1.8])
+    assert scores[1] > scores[0]
+
+
+def test_impression_pools_take_each_blocks_unvoted_shown_stories() -> None:
+    from scripts.eval_ranker_variants import (
+        SkippedPool,
+        _holdout_splits,
+        _impression_pools,
+    )
+
+    vote_times = np.array([5, 10, 20, 30], dtype=np.float64)
+    voted_ids = [1, 2, 3, 4]
+    splits = _holdout_splits(vote_times, 10, blocks=2)
+    shown = {100: 12, 101: 31, 102: 3, 3: 11, 4: 15, 1: 25}
+    pool = SkippedPool(
+        stories=[_eval_story(sid) for sid in shown],
+        first_shown=np.array(list(shown.values()), dtype=np.float64),
+        emb=np.zeros((len(shown), 384), dtype=np.float32),
+    )
+
+    pools = _impression_pools(pool, splits, voted_ids, vote_times, 10)
+
+    # 102 was shown before the holdout, 4 is voted in block 2 and 1 in
+    # training, so neither may enter block 1 as an unvoted story.
+    assert pools == {1: {100, 3}, 2: {101}}
+
+
 def test_metrics_zero_up_recall_when_no_held_out_upvotes() -> None:
     from scripts.eval_ranker_variants import _metrics
 
@@ -278,6 +397,35 @@ def test_temporal_splits_train_only_on_prior_feedback() -> None:
     for split in splits:
         assert np.max(vote_times[split.train_pos]) < np.min(vote_times[split.test_pos])
     assert set(splits[0].train_pos) < set(splits[1].train_pos)
+
+
+@given(
+    times=st.lists(st.integers(0, 40), min_size=2, max_size=60),
+    after=st.integers(0, 40),
+    blocks=st.integers(1, 6),
+)
+def test_holdout_splits_cover_held_votes_with_prior_training(
+    times: list[int], after: int, blocks: int
+) -> None:
+    from scripts.eval_ranker_variants import _holdout_splits
+
+    vote_times = np.array(times, dtype=np.float64)
+    held_groups = len(np.unique(vote_times[vote_times >= after]))
+    if not 1 <= blocks <= held_groups:
+        with pytest.raises(ValueError):
+            _holdout_splits(vote_times, after, blocks=blocks)
+        return
+
+    splits = _holdout_splits(vote_times, after, blocks=blocks)
+
+    assert len(splits) == blocks
+    tested = np.concatenate([split.test_pos for split in splits])
+    assert sorted(tested) == list(np.flatnonzero(vote_times >= after))
+    for split in splits:
+        assert not set(split.train_pos) & set(split.test_pos)
+        if len(split.train_pos):
+            assert vote_times[split.train_pos].max() < vote_times[split.test_pos].min()
+    assert set(splits[0].train_pos) == set(np.flatnonzero(vote_times < after))
 
 
 def test_report_aggregation_shape_includes_new_metrics_and_baselines() -> None:

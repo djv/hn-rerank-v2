@@ -69,6 +69,9 @@ class FoldData:
     runtime_db: Database | None = None
     similarities: dict[int, np.ndarray] = field(default_factory=dict)
     test_vote_times: np.ndarray | None = None
+    # Named story-ID subsets also scored on their own as ``raw_<name>``
+    # (e.g. the feed each story was first shown in).
+    slices: dict[str, set[int]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -739,6 +742,19 @@ def _scores_gravity(
     ), None
 
 
+def _scores_window_gravity(fold: FoldData, scale: float) -> np.ndarray:
+    """Popular's order: ``hn_gravity`` on a *scale*-hour clock, aged at the
+    held-out block's median vote time (points are the snapshot's)."""
+    from pipeline.ranking import hn_gravity
+
+    times = fold.test_vote_times
+    now = float(np.median(times)) if times is not None and len(times) else time.time()
+    return np.array(
+        [hn_gravity(s.score, s.time, now, scale) for s in fold.candidates],
+        dtype=np.float32,
+    )
+
+
 def _scores_centroid_up_minus_down(fold: FoldData) -> tuple[np.ndarray, None]:
     return fold.tier2_scores.copy(), None
 
@@ -1323,6 +1339,50 @@ def _load_skipped_pool(db: Database, config: Config, user_id: int) -> SkippedPoo
     )
 
 
+def _first_shown_feeds(db: Database, user_id: int) -> dict[str, set[int]]:
+    """Story IDs by the feed (``sort_mode``) of the user's first impression."""
+    with db.conn() as conn:
+        rows = conn.execute(
+            """SELECT e.story_id, e.sort_mode FROM interaction_events e
+               JOIN (SELECT story_id, MIN(occurred_at) AS at
+                     FROM interaction_events
+                     WHERE user_id = ? AND event_type = 'impression'
+                     GROUP BY story_id) first
+                 ON first.story_id = e.story_id AND first.at = e.occurred_at
+               WHERE e.user_id = ? AND e.event_type = 'impression'""",
+            (user_id, user_id),
+        ).fetchall()
+    feeds: dict[str, set[int]] = {}
+    for story_id, sort_mode in rows:
+        feeds.setdefault(f"feed_{sort_mode}", set()).add(int(story_id))
+    return feeds
+
+
+def _impression_pools(
+    shown: SkippedPool,
+    splits: list[FoldSplit],
+    voted_ids: list[int],
+    vote_times: np.ndarray,
+    after: float,
+) -> dict[int, set[int]]:
+    """Per split: stories first shown to the user during its test block
+    (from ``after``, or the block's first vote, to the next block's first
+    vote) that were not voted in another block or in training. Votes from
+    that block are added by the fold; shown-but-unvoted ones stay unjudged."""
+    starts = [after] + [float(vote_times[s.test_pos].min()) for s in splits[1:]]
+    ends = starts[1:] + [math.inf]
+    pools: dict[int, set[int]] = {}
+    for split, start, end in zip(splits, starts, ends, strict=True):
+        tested = {voted_ids[p] for p in split.test_pos}
+        voted_elsewhere = set(voted_ids) - tested
+        pools[split.fold_no] = {
+            story.id
+            for story, first in zip(shown.stories, shown.first_shown, strict=True)
+            if start <= first < end and story.id not in voted_elsewhere
+        }
+    return pools
+
+
 def _url_group(story: Story) -> str:
     return str(normalize_url(story.url) or f"story:{story.id}")
 
@@ -1549,6 +1609,8 @@ PRODLR_OPTIONS = {
     "joint_c",
     "half_life",
     "source_weight",
+    "gravity_weight",
+    "gravity_scale",
 }
 
 
@@ -1569,7 +1631,9 @@ def _scores_prodlr(
     and tfidf_char=1 (char 3-5 grams) pick the TF-IDF input, lr_target=joint
     (+ joint_c, 1.0) replaces the logreg by one model over TF-IDF words and
     dense features, half_life (days) decays older votes in the linear models,
-    source_weight blends a per-source vote prior."""
+    source_weight blends a per-source vote prior, gravity_weight blends
+    Popular's order (``hn_gravity`` on a gravity_scale-hour clock, default 8
+    as for 1d)."""
     if "skip_label" in options:
         if skipped_pool is None:
             raise ValueError("skip_label needs the skipped pool")
@@ -1591,6 +1655,7 @@ def _scores_prodlr(
             ("knn_weight", 0.0),
             ("tfidf_weight", 0.0),
             ("source_weight", 0.0),
+            ("gravity_weight", 0.0),
         )
     }
     half_life = float(options["half_life"]) if "half_life" in options else None
@@ -1629,6 +1694,11 @@ def _scores_prodlr(
         if weights["tfidf_weight"]
         else zeros,
         "source": _scores_source_prior(fold) if weights["source_weight"] else zeros,
+        "gravity": _scores_window_gravity(
+            fold, float(options.get("gravity_scale", 8.0))
+        )
+        if weights["gravity_weight"]
+        else zeros,
     }
     return _weighted_rank_blend(scores, **weights)
 
@@ -1729,14 +1799,21 @@ def _weighted_rank_blend(
     knn_weight: float,
     tfidf_weight: float = 0.0,
     source_weight: float = 0.0,
+    gravity_weight: float = 0.0,
 ) -> np.ndarray:
     """Percentile-rank blend; production gets the rest of the weight."""
     weights = {
-        "production": 1.0 - lr_weight - knn_weight - tfidf_weight - source_weight,
+        "production": 1.0
+        - lr_weight
+        - knn_weight
+        - tfidf_weight
+        - source_weight
+        - gravity_weight,
         "logreg": lr_weight,
         "knn": knn_weight,
         "tfidf": tfidf_weight,
         "source": source_weight,
+        "gravity": gravity_weight,
     }
     if min(weights.values()) < 0:
         raise ValueError(f"Blend weights must be non-negative: {weights}")
@@ -1832,7 +1909,9 @@ def _metrics(
         # With tie_scores, cards of equal score form one group and each
         # (upvote, other) pair inside it counts one half, not 0 or 1 by list
         # position.
-        for other_name, others in (("rest", (0, 1)), ("down", (0,))):
+        # "all" counts every other returned card, judged or not: on the
+        # impressions pool a shown story left unvoted is a not-upvote.
+        for other_name, others in (("rest", (0, 1)), ("down", (0,)), ("all", None)):
             ups_seen = n_other = 0
             pairs = 0.0
             start = 0
@@ -1847,7 +1926,9 @@ def _metrics(
                 group = ids[start:end]
                 group_up = sum(sid in positives for sid in group)
                 group_other = sum(
-                    sid not in positives and judged.get(sid) in others for sid in group
+                    sid not in positives
+                    and (others is None or judged.get(sid) in others)
+                    for sid in group
                 )
                 pairs += ups_seen * group_other + 0.5 * group_up * group_other
                 ups_seen += group_up
@@ -1884,6 +1965,9 @@ def _metrics(
         if top12:
             # What a 12-card view shows: annoying cards, "meh" cards, and
             # upvotes the model found outside familiar ground (discovery).
+            result["known_upvote_fraction_at_12"] = sum(
+                sid in positives for sid in top12
+            ) / len(top12)
             result["known_downvote_fraction_at_12"] = sum(
                 judged.get(sid) == 0 for sid in top12
             ) / len(top12)
@@ -1898,6 +1982,7 @@ def _metrics(
             )
         else:
             for key in (
+                "known_upvote_fraction_at_12",
                 "known_downvote_fraction_at_12",
                 "known_neutral_fraction_at_12",
                 "non_hn_upvotes_at_12",
@@ -1937,6 +2022,11 @@ def _metrics(
         }
         output[f"raw_{bucket}"] = compute(
             [sid for sid in raw_ids if sid in bucket_ids], bucket_ids, tie_scores=True
+        )
+    for name, ids in fold.slices.items():
+        slice_ids = ids & candidate_ids
+        output[f"raw_{name}"] = compute(
+            [sid for sid in raw_ids if sid in slice_ids], slice_ids, tie_scores=True
         )
     if config.model.enable_mmr:
         ranked = [
@@ -2006,6 +2096,7 @@ def _make_fold(
     feedback_embeddings: np.ndarray | None = None,
     needs_experimental: bool = True,
     judged_only: bool = False,
+    pool_ids: set[int] | None = None,
 ) -> FoldData:
     train_story_indices = valid_positions[train_pos]
     test_story_indices = valid_positions[test_pos]
@@ -2034,7 +2125,8 @@ def _make_fold(
     seen_candidates = set(train_groups)
     for item in sorted(candidates, key=lambda s: (s.id not in test_ids, s.id)):
         key = group_key(item)
-        if key not in seen_candidates and (not judged_only or item.id in test_ids):
+        in_pool = item.id in test_ids or (pool_ids is not None and item.id in pool_ids)
+        if key not in seen_candidates and (not judged_only or in_pool):
             retained.add(item.id)
             seen_candidates.add(key)
     cand_mask = np.array([s.id in retained for s in candidates], dtype=bool)
@@ -2119,6 +2211,24 @@ def _temporal_splits(
         for i, block in enumerate(blocks, 1)
     ]
     return splits
+
+
+def _holdout_splits(
+    vote_times: np.ndarray, after: float, *, blocks: int = 1
+) -> list[FoldSplit]:
+    """Votes from ``after`` on, in ``blocks`` time blocks; each block trains
+    on every vote before it (expanding window, like the confirmation run)."""
+    held = np.unique(vote_times[vote_times >= after])
+    if blocks < 1 or len(held) < blocks:
+        raise ValueError("Need 1 <= --holdout-blocks <= held-out timestamp groups")
+    return [
+        FoldSplit(
+            i,
+            np.flatnonzero(vote_times < block[0]),
+            np.flatnonzero(np.isin(vote_times, block)),
+        )
+        for i, block in enumerate(np.array_split(held, blocks), 1)
+    ]
 
 
 def _variant_requires_all_labels(name: str) -> bool:
@@ -2234,9 +2344,13 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
     )
     parser.add_argument(
         "--candidate-pool",
-        choices=("current", "heldout-feedback"),
+        choices=("current", "heldout-feedback", "impressions"),
         default="current",
-        help="Current production pool or judged-only retrospective replay of each held-out block; not comparable metrics.",
+        help=(
+            "Current production pool, judged-only retrospective replay of each "
+            "held-out block, or (with --holdout-after) each block's votes plus "
+            "every story first shown in it; not comparable metrics."
+        ),
     )
     parser.add_argument(
         "--split",
@@ -2299,6 +2413,15 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
             "For checking a candidate on votes newer than any tuning used."
         ),
     )
+    parser.add_argument(
+        "--holdout-blocks",
+        type=int,
+        default=1,
+        help=(
+            "With --holdout-after: split the held-out votes into this many "
+            "time blocks, each trained on every vote before it"
+        ),
+    )
     parser.add_argument("--now", type=float, help="Frozen evaluation Unix timestamp")
     parser.add_argument(
         "--candidate-cap-seed",
@@ -2323,6 +2446,10 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
         value = getattr(args, option)
         if value is not None and value <= 0:
             parser.error(f"--{option.replace('_', '-')} must be positive")
+    if args.candidate_pool == "impressions" and (
+        args.holdout_after is None or args.replay_embeddings
+    ):
+        parser.error("impressions needs --holdout-after and stored embeddings")
     if args.split != "temporal":
         parser.error(
             "--split stratified is retired: chronological evaluation is required"
@@ -2416,10 +2543,11 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
         parser.error(
             "--max-candidates cannot change a frozen embedding snapshot; cap it at bakeoff creation"
         )
-    if args.candidate_pool == "heldout-feedback":
+    shown_pool: SkippedPool | None = None
+    if args.candidate_pool in ("heldout-feedback", "impressions"):
         if args.embeddings_file or args.max_candidates:
             parser.error(
-                "heldout-feedback cannot use embedding snapshots or candidate caps"
+                f"{args.candidate_pool} cannot use embedding snapshots or candidate caps"
             )
         candidates = list(fb_stories)
         hashes = dict(
@@ -2437,6 +2565,15 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
                 [s.id for s in candidates], config.embedding_model_version, hashes
             ),
         )
+        if args.candidate_pool == "impressions":
+            shown_pool = _load_skipped_pool(db, config, user.id)
+            feedback_ids = {s.id for s in candidates}
+            extra = [
+                i for i, s in enumerate(shown_pool.stories) if s.id not in feedback_ids
+            ]
+            candidates += [shown_pool.stories[i] for i in extra]
+            cand_emb = np.vstack([cand_emb, shown_pool.emb[extra]])
+            print(f"impressions pool: {len(shown_pool.stories)} shown stories")
     else:
         if args.replay_embeddings:
             parser.error("--replay-embeddings needs --candidate-pool heldout-feedback")
@@ -2691,13 +2828,9 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
         if args.confirmation:
             parser.error("--holdout-after and --confirmation are exclusive")
         split_label = "holdout-after"
-        splits = [
-            FoldSplit(
-                1,
-                np.flatnonzero(fb_vote_times < args.holdout_after),
-                np.flatnonzero(fb_vote_times >= args.holdout_after),
-            )
-        ]
+        splits = _holdout_splits(
+            fb_vote_times, args.holdout_after, blocks=args.holdout_blocks
+        )
     else:
         splits = _temporal_splits(y, fb_vote_times, folds=args.folds)
     if args.confirmation:
@@ -2720,6 +2853,16 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
         split_mode=split_label,
         required_train_labels=required_train_labels,
     )
+    split_pools: dict[int, set[int]] = {}
+    feed_slices = _first_shown_feeds(db, user.id) if shown_pool is not None else {}
+    if shown_pool is not None and args.holdout_after is not None:
+        split_pools = _impression_pools(
+            shown_pool,
+            splits,
+            [fb_stories[i].id for i in valid_positions],
+            fb_vote_times,
+            args.holdout_after,
+        )
 
     baselines = {
         "random": lambda fold: (
@@ -2757,7 +2900,8 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
                 split.test_pos,
                 config,
                 feedback_embeddings=feedback_embeddings,
-                judged_only=args.candidate_pool == "heldout-feedback",
+                judged_only=args.candidate_pool != "current",
+                pool_ids=split_pools.get(split.fold_no),
                 needs_experimental=any(
                     name != "production" and not name.startswith("svm_")
                     for name in variants
@@ -2773,7 +2917,7 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
                     }
                 )
             with _fold_database(fold, config, db) as fold_db:
-                fold = replace(fold, runtime_db=fold_db)
+                fold = replace(fold, runtime_db=fold_db, slices=feed_slices)
                 with _reuse_preprocessing():
                     for name, scorer in scorers.items():
                         scores, probs = (
@@ -2845,6 +2989,7 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
             "confirmation": args.confirmation,
             "confirmation_start": float(confirmation_start),
             "holdout_after": args.holdout_after,
+            "holdout_blocks": args.holdout_blocks,
             "sampling": {
                 "max_candidates": args.max_candidates,
                 "max_feedback_per_class": args.max_feedback_per_class,
