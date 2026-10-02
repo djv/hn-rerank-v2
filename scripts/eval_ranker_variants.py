@@ -15,6 +15,7 @@ from contextlib import ExitStack, contextmanager
 from unittest.mock import patch
 import time
 from collections import Counter
+from collections.abc import Iterator
 from typing import Any
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -170,7 +171,9 @@ class _FrozenEmbedder(Embedder):
 
 
 @contextmanager
-def _fold_database(fold: FoldData, config: Config, source_db: Database | None):
+def _fold_database(
+    fold: FoldData, config: Config, source_db: Database | None
+) -> Iterator[Database]:
     if fold.runtime_db is not None:
         yield fold.runtime_db
         return
@@ -203,9 +206,16 @@ def _fold_database(fold: FoldData, config: Config, source_db: Database | None):
                 ],
             )
             conn.commit()
-        # Canonical resolution and target metadata come from the same read-only snapshot.
+        # Canonical metadata and side vectors come from the read-only source snapshot.
         with ExitStack() as stack:
             if source_db is not None:
+                stack.enter_context(
+                    patch.object(
+                        db,
+                        "get_side_embeddings_batch",
+                        source_db.get_side_embeddings_batch,
+                    )
+                )
                 stack.enter_context(
                     patch.object(
                         db, "get_hn_dupe_resolutions", source_db.get_hn_dupe_resolutions
@@ -274,6 +284,16 @@ def _production_scores(
         trace.labels.get("linear_blend_score"),
     ):
         raise RuntimeError("Production linear blend failed; aborting fold")
+    # Cold/sparse profiles do not enter the side-model branch. An explicit
+    # 'off' means coverage forced a different model than the requested one.
+    if (
+        config.model.side_embedding_enabled
+        and trace.labels.get("side_embeddings") == "off"
+    ):
+        raise RuntimeError(
+            "Production side embedding coverage is insufficient; aborting fold "
+            "instead of scoring stored-only fallback"
+        )
     if (
         score_context.cand_closest_up is not None
         and score_context.cand_closest_down is not None
@@ -2327,7 +2347,8 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
             "heldout-feedback only: .npz from scripts/encode_replay_embeddings.py "
             "replacing stored embeddings for every feedback story (text-hash "
             "checked), to compare embedding models. Repeat to concatenate "
-            "several models (each scaled by 1/sqrt(k), so vectors stay unit)."
+            "several models (each scaled by 1/sqrt(k), so vectors stay unit). "
+            "Requires side_embedding_enabled=false in config and variants."
         ),
     )
     parser.add_argument(
@@ -2465,6 +2486,35 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
     frozen_now = None
     if args.embeddings_file:
         config, frozen_now, database_path = _snapshot_context(args.embeddings_file)
+    requested = (
+        [name.strip() for name in args.variants.split(",") if name.strip()]
+        if args.variants
+        else ["production"]
+    )
+    if "production" not in requested:
+        requested.insert(0, "production")
+    if args.replay_embeddings:
+        side_enabled = config.model.side_embedding_enabled
+        for name in requested:
+            prefix, bracket, rest = name.partition("[")
+            if prefix not in {"prod", "produd", "prodlr", "stack"} or not (
+                bracket and rest.endswith("]")
+            ):
+                continue
+            # Ignore blend/stack options, which are not ModelConfig fields.
+            model_spec = ";".join(
+                item.strip()
+                for item in rest[:-1].split(";")
+                if item.strip().partition("=")[0] in ModelConfig.__dataclass_fields__
+            )
+            side_enabled |= bool(
+                _parse_model_overrides(model_spec).get("side_embedding_enabled", False)
+            )
+        if side_enabled:
+            parser.error(
+                "--replay-embeddings requires side_embedding_enabled=false in config "
+                "and variants; replay files already define the embedding space"
+            )
     now = (
         args.now
         if args.now is not None
@@ -2500,14 +2550,6 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
     )
     if user is None:
         raise RuntimeError("Missing evaluation user")
-
-    requested = (
-        [name.strip() for name in args.variants.split(",") if name.strip()]
-        if args.variants
-        else ["production"]
-    )
-    if "production" not in requested:
-        requested.insert(0, "production")
 
     window_days = args.window_days if args.window_days is not None else config.days
     eval_config = replace(config, days=window_days)

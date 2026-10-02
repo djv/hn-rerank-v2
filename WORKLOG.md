@@ -1,5 +1,20 @@
 # Worklog: hn-rewrite
 
+## 2026-10-02 Restore Gemma production-evaluation parity
+
+- `scripts/eval_ranker_variants.py`: fold DBs forward side-vector reads to
+  the frozen source snapshot; enabled side coverage fallback aborts a fold;
+  replay embeddings require side mode off in config and variant overrides.
+  Cold/sparse serving behavior remains valid.
+- `tests/test_eval.py`: source/fold score and probability parity, both SVM
+  paths and reused folds, missing/stale/malformed side coverage failures,
+  cold/sparse profiles, and early replay/config/variant conflict rejection.
+- Full suite: 1,077 passed / 18 skipped; Ruff and touched formatting clean;
+  zero new type diagnostics (one existing untracked TLDR-script diagnostic).
+  Updated architecture, evaluation guide and handoff; archived review status.
+- User-authorized finding #1 only. Findings #2/#3 and unrelated WIP remain
+  untouched; no production DB access or service restart.
+
 ## 2026-10-02 Recent ranking review saved
 
 - Saved three in-memory reproductions: evaluation loses Gemma side vectors;

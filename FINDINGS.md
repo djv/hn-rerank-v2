@@ -1,5 +1,48 @@
 # HN Rerank findings
 
+## Gemma production-evaluation parity fixed — 2026-10-02
+
+Authorized scope: review finding #1 only, after the user's "ok fix".
+`scripts/eval_ranker_variants.py` now forwards fold side-vector reads to
+the same read-only source snapshot used for canonical metadata. Forwarding
+is independent of the outer fold's side flag, so a reused fold DB also
+supports variants that enable side scoring.
+
+The evaluator raises when enabled side scoring explicitly falls back for
+insufficient coverage, rather than reporting stored-only scores under the
+production label. Cold/sparse profiles remain valid because they do not
+enter that branch. CLI parsing rejects `--replay-embeddings` with side mode
+enabled in either the effective config or a `prod`/`produd`/`prodlr`/`stack`
+override, before opening any database or loading replay files.
+
+Behavioral regressions in `tests/test_eval.py` use only in-memory/temporary
+databases and a frozen embedder that cannot run inference. With complete
+current-hash side rows, score and probability arrays exactly match direct
+`_score_and_rank` on the source DB and differ from flag-off scoring. Both
+SVM kernel paths and standalone/reused fold DBs are covered. Cache resets
+prevent source scoring from masking missing forwarding. Missing, stale and
+wrong-dimension side rows abort; cold/sparse profiles continue; config and
+all four supported variant-prefix replay conflicts fail before DB access.
+
+Validation against the fix:
+
+- Before implementation: 12 new failing cases reproduced the defects;
+  two cold/sparse cases already passed.
+- Affected evaluator/deck/side suites: 106 passed, 15.02 s.
+- Required full suite: `uv run pytest tests/ -n 4 --tb=short -q`,
+  1,077 passed / 18 skipped, 94.90 s. Runs used `batch`, one CPU and
+  BLAS/OMP/MKL thread counts of 1 to preserve desktop responsiveness.
+- Ruff clean; both touched Python files format-clean; `ty` reports only
+  the unchanged diagnostic at untracked `scripts/inspect_tldr_failures.py:86`,
+  with zero new diagnostics. `git diff --check` clean.
+
+No production database access/write, service restart, model re-encoding or
+new offline metrics run was needed. Historical Gemma results are unchanged.
+Review findings #2 (capped replacement encoding) and #3 (archive-source yield)
+remain open. Unrelated TUI/reader/TLDR/kernel WIP is preserved.
+The user then selected "Save and push"; only the tested #1 fix and its
+documentation/handoff are included in the focused commit.
+
 ## Ranking review and direct Claude Code assessment — 2026-10-02
 
 Scope: the ranking/evaluation/attribution changes since `4d1ff85`, initially
@@ -54,7 +97,7 @@ by `_load_concatenated_replay` at 1/sqrt(2). Their
 off. These script/config facts were also read directly during this save.
 The reported offline gains retain their existing sampling/tuning/live limits.
 
-CC's proposed correction, still unimplemented:
+CC's proposed correction, unimplemented at the time of this review:
 
 - Supply `get_side_embeddings_batch` from the source snapshot to the fold
   database, like the existing duplicate-resolution forwarding.

@@ -602,6 +602,11 @@ therefore match serving without introducing held-out feedback into the fold.
 
 Each run opens the source DB read-only via a consistent temporary SQLite backup
 (including committed WAL pages) and freezes configuration and evaluation time.
+Fold databases forward side-vector reads to that snapshot, preserving enabled
+Gemma scoring even when the same fold DB is reused across variants. Insufficient
+side coverage aborts an eligible SVM fold; cold/sparse profiles still skip that
+branch. Explicit `--replay-embeddings` requires side mode off in configuration
+and variant overrides, preventing an additional side vector from being appended.
 Schema-v2 reports record snapshot hash, code revision, input counts, sampling
 seeds/caps, per-fold story IDs and cutoffs, and effective configuration.
 `--now UNIX_TIME` supports repeatable comparisons. Input vectors must be finite,
