@@ -43,7 +43,9 @@ decisions: personalized Popular order; reader mockup concepts.
   an overlapping niced check job), next 7.0 s (cache hit). Profiled on a DB
   copy (2 threads, niced): cold process 30.3 s, refit 6.3-6.4 s with gemma vs
   4.9 s stored-only (SVM decision 2.4 vs 1.0 s), cache hit 5.2 s. So slow only
-  on the first rerank after a restart. Real-user gain unmeasured.
+  on the first rerank after a restart; since `7cdb742` that runs at startup
+  for recent voters (15:49:34 restart: `startup_warm user_ids=[151]`, deck
+  ready 15:50:13 after 31.1 s, before the first regen). Real-user gain unmeasured.
 - Offline gains rest on re-ranking already-voted stories (57 fresh upvotes);
   Popular's upvote rates rest on 8 upvotes (downvote result on 95).
 - Uncommitted WIP from earlier sessions, kept out of these commits:
