@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 import httpx
 import pytest
@@ -18,11 +20,13 @@ from hn_rerank.api import (
     save_profile,
 )
 from hn_rerank.app import Reader, Setup
-from hn_rerank.models import Feed, FeedStory
+from hn_rerank.models import Feed, FeedStory, Window
+
 from ._settle import settle
 
 
-def sample_feed(version: int = 0, target: int = 0) -> Feed:
+def sample_feed(version: int = 0, target: int = 0, window: Window = "1w") -> Feed:
+    """The 1w window holds stories 1 and 2; "archive" holds story 3."""
     stories = [
         FeedStory(
             i,
@@ -34,22 +38,21 @@ def sample_feed(version: int = 0, target: int = 0) -> Feed:
             10,
             i,
             float(4 - i),
-            ["recent_mixed"] if i < 3 else ["archive_mixed"],
-            i == 1,
-            i == 2,
         )
         for i in (1, 2, 3)
     ]
+    if window == "archive":
+        stories, orders = stories[2:], {"recommended": [3], "popular": [3]}
+    elif window == "1w":
+        stories = stories[:2]
+        orders = {"recommended": [1, 2], "popular": [1], "explore": [2]}
+    else:
+        stories, orders = [], {}
     return Feed(
-        1,
+        2,
+        window,
         stories,
-        {
-            "recommended:recent": [1, 2],
-            "recommended:archive": [3],
-            "popular:recent": [1],
-            "explore:recent": [2],
-            "date:recent": [2, 1],
-        },
+        orders,
         {"up": 0, "neutral": 0, "down": 0},
         version,
         target,
@@ -58,12 +61,18 @@ def sample_feed(version: int = 0, target: int = 0) -> Feed:
 
 
 class FakeServer:
+    """One deck: `feed` is its 1w window; other windows come from
+    `window_feeds` (or `sample_feed`) at the deck's version and state."""
+
     def __init__(self) -> None:
         self.feed = sample_feed()
+        self.window_feeds: dict[Window, Feed] = {}
         self.requests: list[httpx.Request] = []
         self.fail_vote = False
         self.delay_vote = 0.0
         self.delay_summary = 0.0
+        # Sent on ranking-ready when set, as current servers do.
+        self.counts_version: int | None = None
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -71,7 +80,8 @@ class FakeServer:
         if path.endswith("/api/user"):
             return httpx.Response(200, json={"user_id": 1, "token": "test"})
         if path.endswith("/api/feed"):
-            return httpx.Response(200, json=self.feed.to_dict())
+            window = cast(Window, request.url.params.get("window", "1w"))
+            return httpx.Response(200, json=self.feed_for(window).to_dict())
         if path.endswith("/api/tldr-detail") or "/api/tldr-cache/" in path:
             story_id = (
                 int(path.rsplit("/", 1)[1])
@@ -88,14 +98,34 @@ class FakeServer:
                 raise httpx.ReadError("secret URL must not appear", request=request)
             return httpx.Response(200, json={"ok": True, "target_version": 1})
         if path.endswith("/api/ranking-ready"):
-            return httpx.Response(
-                200,
-                json={
-                    "ready": self.feed.ready,
-                    "current_version": self.feed.target_version,
-                },
-            )
+            ready: dict[str, object] = {
+                "ready": self.feed.ready,
+                "current_version": self.feed.target_version,
+            }
+            if self.counts_version is not None:
+                ready["counts_version"] = self.counts_version
+            return httpx.Response(200, json=ready)
         return httpx.Response(404)
+
+    def feed_for(self, window: Window) -> Feed:
+        if window == self.feed.window:
+            return self.feed
+        base = self.window_feeds.get(window) or sample_feed(window=window)
+        return replace(
+            base,
+            version=self.feed.version,
+            target_version=self.feed.target_version,
+            ready=self.feed.ready,
+            feedback_counts=self.feed.feedback_counts,
+        )
+
+    def feed_requests(self) -> list[str]:
+        """The window of every feed request, in order."""
+        return [
+            r.url.params.get("window", "")
+            for r in self.requests
+            if r.url.path.endswith("/api/feed")
+        ]
 
     def api(self) -> API:
         return API("https://example.org/hn/", "test", httpx.MockTransport(self))
@@ -124,8 +154,8 @@ async def test_navigation_resize_filters_and_late_summary(tmp_path: Path) -> Non
             app.query_one("#reading-pane").region.y
             > app.query_one("#headlines").region.y
         )
-        app.query_one("#age", Select).value = "archive"
-        await pilot.pause()
+        app.query_one("#window", Select).value = "archive"
+        await settle(pilot)
         assert [s.id for s in app.stories] == [3]
         await pilot.resize_terminal(120, 35)
         assert listing.display and app.query_one(Markdown).display
@@ -365,40 +395,51 @@ async def test_empty_summary_hides_story_until_refresh(
             await pilot.pause(0.05)
 
 
-def test_open_in_firefox_reuses_running_window(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_open_in_browser_opens_a_tab(monkeypatch: pytest.MonkeyPatch) -> None:
     import subprocess as stdlib_subprocess
 
     import hn_rerank.app as app_module
 
+    monkeypatch.delenv("HN_RERANK_BROWSER", raising=False)
     calls: list[list[str]] = []
-    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/firefox")
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr(
         "subprocess.run",
-        lambda *a, **k: stdlib_subprocess.CompletedProcess(a[0], 0),
+        lambda *a, **k: (
+            calls.append(a[0]) or stdlib_subprocess.CompletedProcess(a[0], 0)
+        ),
     )
     monkeypatch.setattr("subprocess.Popen", lambda argv, **k: calls.append(argv))
-    app_module.open_in_firefox("https://example.org/x")
-    assert calls == [["/usr/bin/firefox", "--new-tab", "https://example.org/x"]]
+    app_module.open_in_browser("https://example.org/x")
+    assert calls == [
+        ["/usr/bin/google-chrome", "https://example.org/x"],
+        ["wmctrl", "-x", "-a", "google-chrome.Google-chrome"],
+    ]
 
 
-def test_open_in_firefox_launches_when_absent(
+def test_open_in_browser_without_chrome_uses_default_browser(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import subprocess as stdlib_subprocess
-
     import hn_rerank.app as app_module
 
+    monkeypatch.delenv("HN_RERANK_BROWSER", raising=False)
+    opened: list[str] = []
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.setattr(app_module.webbrowser, "open", opened.append)
+    app_module.open_in_browser("https://example.org/x")
+    assert opened == ["https://example.org/x"]
+
+
+def test_hn_rerank_browser_overrides_chrome(monkeypatch: pytest.MonkeyPatch) -> None:
+    import hn_rerank.app as app_module
+
+    monkeypatch.setenv("HN_RERANK_BROWSER", "surf -z 1.2")
     calls: list[list[str]] = []
-    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/firefox")
-    monkeypatch.setattr(
-        "subprocess.run",
-        lambda *a, **k: stdlib_subprocess.CompletedProcess(a[0], 1),
-    )
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: calls.append(a[0]))
     monkeypatch.setattr("subprocess.Popen", lambda argv, **k: calls.append(argv))
-    app_module.open_in_firefox("https://example.org/x")
-    assert calls == [["/usr/bin/firefox", "https://example.org/x"]]
+    app_module.open_in_browser("https://example.org/x")
+    assert calls == [["surf", "-z", "1.2", "https://example.org/x"]]
 
 
 async def test_stale_poll_does_not_cancel_summary_for_same_selection() -> None:
@@ -516,7 +557,7 @@ async def test_refresh_forces_only_selected_summary(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("width", [73, 146])
-@pytest.mark.parametrize("origin", ["cycle", "tabs", "age"])
+@pytest.mark.parametrize("origin", ["cycle", "tabs"])
 async def test_rapid_filter_changes_settle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, width: int, origin: str
 ) -> None:
@@ -532,23 +573,20 @@ async def test_rapid_filter_changes_settle(
             original(select_id)
 
         monkeypatch.setattr(app, "rebuild", counted_rebuild)
-        group, expected = ("age", "archive") if origin == "age" else ("sort", "date")
         # No yielding: reproduce several queued changes before either widget
         # has handled its peer's messages.
         if origin == "cycle":
-            for _ in range(3):
+            for _ in range(4):
                 app.action_cycle_sort()
-        elif origin == "tabs":
-            for value in ("popular", "explore", "date"):
-                app.query_one("#sort-tabs", Tabs).active = f"sort-{value}"
         else:
-            for value in ("archive", "recent", "archive"):
-                app.query_one("#age", Select).value = value
+            for value in ("popular", "explore", "popular", "explore"):
+                app.query_one("#sort-tabs", Tabs).active = f"sort-{value}"
         await settle(pilot)
-        assert app.query_one(f"#{group}", Select).value == expected
-        assert app.query_one(f"#{group}-tabs", Tabs).active == f"{group}-{expected}"
+        expected = "popular" if origin == "cycle" else "explore"
+        assert app.query_one("#sort", Select).value == expected
+        assert app.query_one("#sort-tabs", Tabs).active == f"sort-{expected}"
         settled = rebuilds
-        assert 0 < settled <= 3
+        assert 0 < settled <= 4
         await settle(pilot)
         assert rebuilds == settled  # No self-sustaining Select/Tabs echo.
 
@@ -564,7 +602,6 @@ async def test_s_cycles_sort_modes(tmp_path: Path) -> None:
         for expected, story_ids in (
             ("popular", [1]),
             ("explore", [2]),
-            ("date", [2, 1]),
             ("recommended", [1, 2]),
         ):
             await pilot.press("s")
@@ -580,9 +617,7 @@ async def test_explore_sort_is_shuffled(
     from dataclasses import replace
 
     fake = FakeServer()
-    fake.feed = replace(
-        fake.feed, orders={**fake.feed.orders, "explore:recent": [1, 2]}
-    )
+    fake.feed = replace(fake.feed, orders={**fake.feed.orders, "explore": [1, 2]})
 
     def reverse(order: list[int]) -> None:
         order[:] = order[::-1]
@@ -602,7 +637,7 @@ async def test_explore_sort_is_shuffled(
         assert [s.id for s in app.stories] == [2, 1]
         # Rebuild must copy: the shared server order stays intact for
         # prefetch entry points into other sorts.
-        assert fake.feed.orders["explore:recent"] == [1, 2]
+        assert fake.feed.orders["explore"] == [1, 2]
 
 
 async def test_explore_order_is_stable_within_a_visit(
@@ -614,7 +649,9 @@ async def test_explore_order_is_stable_within_a_visit(
 
     fake = FakeServer()
     fake.feed = replace(
-        fake.feed, orders={**fake.feed.orders, "explore:recent": [1, 2, 3]}
+        fake.feed,
+        stories=sample_feed(window="archive").stories + fake.feed.stories,
+        orders={**fake.feed.orders, "explore": [1, 2, 3]},
     )
     shuffles = 0
 
@@ -644,7 +681,7 @@ async def test_explore_order_is_stable_within_a_visit(
         app.rebuild()
         assert [s.id for s in app.stories] == first[1:]
         app.rated.clear()
-        await pilot.press("s", "s", "s", "s")  # full cycle back to explore
+        await pilot.press("s", "s", "s")  # full cycle back to explore
         await settle(pilot)
         assert str(app.query_one("#sort", Select).value) == "explore"
         assert [s.id for s in app.stories] != first
@@ -693,20 +730,21 @@ async def test_version_poll_keeps_hidden_stories_hidden(tmp_path: Path) -> None:
         assert [s.id for s in app.stories] == [1, 2]
 
 
-def test_open_in_firefox_falls_back_on_launch_error(
+def test_open_in_browser_falls_back_on_launch_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import hn_rerank.app as app_module
 
+    monkeypatch.delenv("HN_RERANK_BROWSER", raising=False)
     opened: list[str] = []
-    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/firefox")
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/google-chrome")
 
     def missing(*args: object, **kwargs: object) -> None:
-        raise FileNotFoundError("pgrep")
+        raise FileNotFoundError("google-chrome")
 
-    monkeypatch.setattr("subprocess.run", missing)
+    monkeypatch.setattr("subprocess.Popen", missing)
     monkeypatch.setattr(app_module.webbrowser, "open", opened.append)
-    app_module.open_in_firefox("https://example.org/x")
+    app_module.open_in_browser("https://example.org/x")
     assert opened == ["https://example.org/x"]
 
 
@@ -743,6 +781,112 @@ async def test_y_copies_comments_link_else_article_link(
         )
         await pilot.press("y")
         assert len(copied) == 2
+
+
+def test_open_agent_session_splits_the_readers_tmux_pane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess
+
+    import hn_rerank.app as app_module
+
+    calls: list[list[str]] = []
+    monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,1,0")
+    monkeypatch.setenv("TMUX_PANE", "%7")
+    monkeypatch.delenv("HN_RERANK_AGENT", raising=False)
+    monkeypatch.setattr("shutil.which", lambda name: f"/opt/bin/{name}")
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda argv, **k: calls.append(argv) or subprocess.CompletedProcess(argv, 0),
+    )
+    prompt = "Dig deeper 'quoted' $HOME\nArticle: https://example.org/1"
+    assert app_module.open_agent_session(prompt) is True
+    assert calls == [
+        ["tmux", "split-window", "-h", "-c", str(Path.home()), "-t", "%7"]
+        + ["/opt/bin/claude", prompt]
+    ]
+    monkeypatch.setenv("HN_RERANK_AGENT", "claude --model opus")
+    app_module.open_agent_session("p")
+    assert calls[-1][-4:] == ["/opt/bin/claude", "--model", "opus", "p"]
+
+
+def test_open_agent_session_fails_outside_tmux_or_on_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess
+
+    import hn_rerank.app as app_module
+
+    calls: list[list[str]] = []
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.setattr("subprocess.run", lambda argv, **k: calls.append(argv))
+    assert app_module.open_agent_session("p") is False
+    assert calls == []
+
+    def fail(argv: list[str], **kwargs: object) -> None:
+        raise subprocess.CalledProcessError(1, argv)
+
+    monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,1,0")
+    monkeypatch.setattr("shutil.which", lambda name: f"/opt/bin/{name}")
+    monkeypatch.setattr("subprocess.run", fail)
+    assert app_module.open_agent_session("p") is False
+
+    # No agent on PATH: tmux would open a pane that closes at once and still
+    # exit 0, so do not split at all (the caller copies the prompt instead).
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.setattr("subprocess.run", lambda argv, **k: calls.append(argv))
+    assert app_module.open_agent_session("p") is False
+    assert calls == []
+
+
+async def test_a_opens_claude_with_story_links_else_copies_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import dataclasses
+
+    import hn_rerank.app as app_module
+
+    sessions: list[str] = []
+    copied: list[str] = []
+    opened = True
+
+    def open_session(prompt: str) -> bool:
+        sessions.append(prompt)
+        return opened
+
+    monkeypatch.setattr(app_module, "open_agent_session", open_session)
+    monkeypatch.setattr(app_module, "copy_with_system_tool", copied.append)
+    fake = FakeServer()
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        story = app.selected()
+        assert story is not None
+        await pilot.press("a")
+        await pilot.pause()
+        prompt = sessions[-1]
+        assert story.title in prompt
+        assert "Article: https://example.org/1" in prompt
+        assert "Discussion: https://news.ycombinator.com/item?id=1" in prompt
+        assert copied == []
+        # No usable comments link: the prompt carries the article alone.
+        bare = dataclasses.replace(story, comments_url="javascript:x")
+        monkeypatch.setattr(app, "selected", lambda: bare)
+        opened = False
+        await pilot.press("a")
+        await pilot.pause()
+        assert "Discussion" not in sessions[-1]
+        assert copied == [sessions[-1]]
+        assert "copied the Claude prompt" in str(
+            app.query_one("#status", Static).content
+        )
+        # A focused dropdown owns the keys: `a` must not open a pane.
+        count = len(sessions)
+        app.query_one("#window", Select).focus()
+        await pilot.pause()
+        await pilot.press("a")
+        await pilot.pause()
+        assert len(sessions) == count
 
 
 def test_copy_with_system_tool_skips_failing_tools(
@@ -846,16 +990,9 @@ async def test_h_and_l_step_through_sorts_and_wrap(tmp_path: Path) -> None:
         app.query_one(OptionList).focus()
         sort = app.query_one("#sort", Select)
         seen = []
-        for key in "llllhh":
+        for key in "lllhh":
             await pilot.press(key)
             await pilot.pause()
             seen.append(str(sort.value))
-        assert seen == [
-            "popular",
-            "explore",
-            "date",
-            "recommended",
-            "date",
-            "explore",
-        ]
-        assert app.query_one("#sort-tabs", Tabs).active == "sort-explore"
+        assert seen == ["popular", "explore", "recommended", "explore", "popular"]
+        assert app.query_one("#sort-tabs", Tabs).active == "sort-popular"

@@ -29,6 +29,13 @@ weights. The report records before/after group-isolation counts.
 
 ## Interpretation and safeguards
 
+With `model.side_embedding_enabled=true`, production scoring reads side
+vectors from the same frozen SQLite snapshot as the stored embeddings.
+An eligible SVM fold aborts if side-vector coverage falls below the
+configured minimum; it cannot report stored-only fallback as Gemma
+production. Cold and sparse profiles keep their normal serving behavior
+because they do not enter the side-model branch.
+
 Report NDCG/recall at 10/12/40/100/200, MAP, eligible positive counts, judged
 coverage, and per-fold results. Coverage warnings identify folds with fewer
 than ten positives or twenty judged cards. These are minimum diagnostics,
@@ -74,6 +81,10 @@ isolated source snapshot. Do not copy credentials into experiment folders.
   `--max-tokens`, `--prefix`, `--title-only`, or `--from-db` to export the
   stored production vectors). Non-384-d runs skip the dashboard-deck
   metrics, whose dedup is 384-d only; raw ranking metrics are unaffected.
+  Set `model.side_embedding_enabled=false` for replay comparisons, including
+  every requested variant override: replay files already define the model
+  space, and combining replay with enabled side mode is rejected before
+  opening the database.
 - `scripts/summarize_eval_report.py REPORT.json ...` prints fold means, a
   composite (mean of AUC vs rest, MAP, NDCG@12, NDCG@40 and 1 − top-40
   downvote share) and how many folds beat production.

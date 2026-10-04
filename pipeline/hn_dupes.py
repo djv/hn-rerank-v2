@@ -17,7 +17,12 @@ import httpx
 
 from database import Database, FeedbackRecord, HnDupeResolution, Story
 from dedup import NormalizedUrl, normalize_url
-from .ranking import RankedStory, clean_text, compose_story_text
+from .ranking import (
+    HN_COMMENTS_SEPARATOR,
+    RankedStory,
+    clean_text,
+    compose_story_text,
+)
 
 
 FirebaseItem: TypeAlias = Mapping[str, object]
@@ -123,6 +128,53 @@ def extract_hn_dupe_target_id(comment_text: str, *, source_id: int) -> int | Non
     """Compatibility wrapper for older tests; returns the first HN story link."""
     target_ids = extract_hn_story_link_ids(comment_text, source_id=source_id)
     return target_ids[0] if target_ids else None
+
+
+# A pointer thread's whole discussion is one short comment that sends readers
+# to the same story's discussion elsewhere: "Comments moved to item?id=N",
+# "[dupe] more here: ...", "Discussion (170 points, ...) <link>". Its real
+# discussion lives at the link. Not pointers: "Related: <other story>" (a
+# different article), and threads with more than one comment, whose other
+# comments are real discussion (both matched a looser rule on 2026-09-29).
+# Not pointers either: "Duplicate code is..." ("duplicate" must be followed
+# by punctuation, a link or a pointer word) and "Discussion of the underlying
+# paper: <link>" (a discussion of something else). "Discussed 2 days ago
+# with 280 comments: <link>" is one (5 of the live follows read like that).
+POINTER_THREAD_MAX_CHARS = 400
+_POINTER_LEAD = r"(?=\s*(?:[:;,.!()\[\]\-–—]|https?://|item\?id=|$))"
+_POINTER_OPENING = re.compile(
+    r"^\W*(?:yes\W+)?(?:\[?dupe\b|comments?\s+(?:moved|merged)\b|"
+    rf"duplicate(?:{_POINTER_LEAD}|\s+(?:of|see|here|post|submission|thread|story)\b)|"
+    r"(?:(?:some|more|other|earlier|previous|big|active)\s+)*discuss(?:ion|ed)\b"
+    r"(?!\s+(?:of|about|regarding)\s+(?!this\b|it\b|the\s+same\b)))",
+    re.IGNORECASE,
+)
+# dang also writes "Although this post was first, we've moved the comments to".
+_MOVED_ANYWHERE = re.compile(
+    r"\b(?:moved|merged)\s+(?:the\s+)?comments\b", re.IGNORECASE
+)
+# The destination's note ("Comments moved hither from item?id=N", "We merged
+# the comments from N into this thread") links to the emptied source.
+_MOVED_HERE = re.compile(
+    r"\b(?:moved|merged)\b.{0,80}?\b(?:hither|from|(?:in)?to\s+this)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def pointer_thread_target(top_comments: str, *, source_id: int) -> int | None:
+    """The HN story a pointer thread sends readers to, else None."""
+    if (
+        not top_comments
+        or len(top_comments) > POINTER_THREAD_MAX_CHARS
+        or HN_COMMENTS_SEPARATOR in top_comments
+    ):
+        return None
+    text = html.unescape(top_comments)
+    if not (_POINTER_OPENING.match(text) or _MOVED_ANYWHERE.search(text)):
+        return None
+    if _MOVED_HERE.search(text):
+        return None
+    return extract_hn_dupe_target_id(top_comments, source_id=source_id)
 
 
 def story_from_firebase_item(item: FirebaseItem) -> Story | None:
@@ -410,13 +462,44 @@ def canonicalize_hn_dupes(
     *feedback_context* lets a caller that already built it for this user and
     ``feedback_actions`` skip reloading the user's feedback.
     """
+    return [
+        item
+        for item in canonical_outcomes(
+            ranked,
+            db,
+            candidate_stories=candidate_stories,
+            selected_limit=selected_limit,
+            user_id=user_id,
+            feedback_actions=feedback_actions,
+            resolver=resolver,
+            trace=trace,
+            feedback_context=feedback_context,
+        )
+        if item is not None
+    ]
+
+
+def canonical_outcomes(
+    ranked: list[RankedStory],
+    db: Database,
+    *,
+    candidate_stories: Sequence[Story] = (),
+    selected_limit: int | None = None,
+    user_id: int | None = None,
+    feedback_actions: tuple[str, ...] = ("up", "neutral"),
+    resolver: HnDupeResolver | None = None,
+    trace: _TraceCounter | None = None,
+    feedback_context: FeedbackDupeContext | None = None,
+) -> list[RankedStory | None]:
+    """``canonicalize_hn_dupes`` per input card, aligned with *ranked*: the
+    card itself, the card carrying its canonical story, or ``None`` when it
+    is dropped (a duplicate of a voted story or of another card)."""
     if not ranked:
-        return ranked
+        return []
 
     selected_count = len(ranked) if selected_limit is None else max(0, selected_limit)
     if selected_count == 0:
-        return ranked
-
+        return list(ranked)
     candidate_by_id = {story.id: story for story in candidate_stories}
     original_output_ids = {item.story.id for item in ranked}
     if feedback_context is None:
@@ -439,14 +522,13 @@ def canonicalize_hn_dupes(
         trace, "hn_dupes_retry", sum(r.status == "retry" for r in resolutions.values())
     )
     emitted_ids: set[int] = set()
-    output: list[RankedStory] = []
+    output: list[RankedStory | None] = []
 
     for index, item in enumerate(ranked):
         story = item.story
         if index >= selected_count or story.source != "hn" or story.id <= 0:
-            if story.id not in emitted_ids:
-                output.append(item)
-                emitted_ids.add(story.id)
+            output.append(None if story.id in emitted_ids else item)
+            emitted_ids.add(story.id)
             continue
 
         resolution = resolutions.get(story.id)
@@ -461,12 +543,12 @@ def canonicalize_hn_dupes(
                 story.id,
             )
             emitted_ids.add(story.id)
+            output.append(None)
             continue
 
         if target_id is None:
-            if story.id not in emitted_ids:
-                output.append(item)
-                emitted_ids.add(story.id)
+            output.append(None if story.id in emitted_ids else item)
+            emitted_ids.add(story.id)
             continue
 
         if target_id in feedback_context.story_ids:
@@ -476,6 +558,7 @@ def canonicalize_hn_dupes(
                 target_id,
             )
             emitted_ids.add(story.id)
+            output.append(None)
             continue
 
         if target_id in original_output_ids or target_id in emitted_ids:
@@ -485,6 +568,7 @@ def canonicalize_hn_dupes(
                 target_id,
             )
             emitted_ids.add(story.id)
+            output.append(None)
             continue
 
         target_story = _lookup_canonical_story(
@@ -494,9 +578,8 @@ def canonicalize_hn_dupes(
         )
         if target_story is None:
             _increment_trace_count(trace, "hn_dupes_target_missing")
-            if story.id not in emitted_ids:
-                output.append(item)
-                emitted_ids.add(story.id)
+            output.append(None if story.id in emitted_ids else item)
+            emitted_ids.add(story.id)
             continue
 
         logging.info(
@@ -636,7 +719,7 @@ def _cached_ratio_ge(source_norm: str, target_norm: str) -> bool:
     threshold the full ratio() cannot reach it, so most dissimilar pairs
     resolve in O(n) char-counting instead of O(n²) matching. Identical
     verdicts to a bare ratio() call. The cache is warm-scoped in effect —
-    the same candidate/feedback title pairs recur across combos within a
+    the same candidate/feedback title pairs recur across windows within a
     warm and across consecutive warms — and bounded at 64k entries.
     """
     matcher = SequenceMatcher(None, source_norm, target_norm)

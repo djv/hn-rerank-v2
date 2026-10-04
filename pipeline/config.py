@@ -32,9 +32,29 @@ class ModelConfig:
     engagement_features_enabled: bool = False
     neutral_weight: float = 0.0
     enable_mmr: bool = False
+    # Opt-in (evaluation, 2026-09-29): rank-blend the final score with a dense
+    # logistic regression and a TF-IDF logistic regression (linear_blend.py).
+    linear_blend_enabled: bool = False
+    linear_blend_dense_weight: float = 0.2
+    linear_blend_tfidf_weight: float = 0.3
+    linear_blend_dense_c: float = 0.1
+    linear_blend_tfidf_c: float = 4.0
+    # Scale the blend weights by the SVM's tier-3 weight, so the linear models
+    # ramp in with the SVM instead of taking half the ranking at the 20 up /
+    # 20 down gate. Off only in the eval, to read the dense model alone.
+    linear_blend_ramp: bool = True
+    # Opt-in (evaluation, 2026-10-02): the SVM and linear models see each
+    # story's stored vector and a second model's vector (Config.side_*)
+    # side by side; attribution, Explore and dedup keep the stored vectors.
+    # Off when fewer than side_embedding_min_coverage of the candidates and
+    # feedback stories have a side vector; the rest get a zero side part.
+    side_embedding_enabled: bool = False
+    side_embedding_min_coverage: float = 0.98
     diversity_threshold: float = 0.75
     knn_k: int = 10
     positive_cluster_k: int = 4
+    # Explore's Interest picks: k-means clusters of the user's upvotes.
+    interest_cluster_k: int = 10
     tier2_blend_window: int = 50
     tier3_blend_window: int = 60
     min_up_for_svm: int = 20
@@ -57,6 +77,10 @@ DEFAULT_ONNX_MODEL_DIR = os.environ.get(
 DEFAULT_EMBEDDING_MODEL_VERSION = "mxbai-embed-xsmall-v1|mean|norm|4096"
 DEFAULT_EMBEDDING_MAX_TOKENS = 4096
 DEFAULT_ENV_PATH = "~/hn-rewrite/shared/.env"
+DEFAULT_SIDE_EMBEDDING_MODEL_DIR = os.environ.get(
+    "HN_SIDE_MODEL_DIR", "~/hn-rewrite/shared/embeddinggemma-300m-onnx"
+)
+DEFAULT_SIDE_EMBEDDING_MODEL_VERSION = "embeddinggemma-300m|sentence|128|classification"
 
 BQ_ARCHIVE_SOURCE = "bq_seed"
 CH_ARCHIVE_SOURCE = "ch_seed"
@@ -68,7 +92,7 @@ def is_hn_source(source: str) -> bool:
 
 BQ_ARCHIVE_CANDIDATE_LIMIT = 2000
 CH_ARCHIVE_CANDIDATE_LIMIT = 2000
-LIVE_WINDOW_LIMIT = 5000
+LIVE_WINDOW_LIMIT = 10_000
 
 
 @dataclass(frozen=True)
@@ -87,6 +111,12 @@ class Config:
     embedding_model_version: str = DEFAULT_EMBEDDING_MODEL_VERSION
     embedding_max_tokens: int = DEFAULT_EMBEDDING_MAX_TOKENS
     embedding_batch_size: int = 32
+    # Second embedding model for ModelConfig.side_embedding_enabled, encoded
+    # by scripts/embed_side_vectors.py into the side_embeddings table.
+    side_embedding_model_dir: str = DEFAULT_SIDE_EMBEDDING_MODEL_DIR
+    side_embedding_model_version: str = DEFAULT_SIDE_EMBEDDING_MODEL_VERSION
+    side_embedding_max_tokens: int = 128
+    side_embedding_dim: int = 768
     embedding_ort_variant: Literal[
         "current",
         "spin_off",
@@ -120,6 +150,11 @@ class Config:
     # Regen-time article fetches for new RSS snippet stories regardless of
     # rank (the warm path only reaches stories already near the top). 0 off.
     rss_article_prewarm_max_per_run: int = 30
+    # AINews issues split into one story per topic (pipeline/ainews.py);
+    # the generic RSS path then skips the feed's whole-issue entries.
+    ainews_enabled: bool = True
+    ainews_feed_url: str = "https://www.latent.space/feed"
+    ainews_max_tweets_per_run: int = 400
     article_fetch_concurrency: int = 10
     article_fetch_max_age_days: int = 30
     max_cached_models: int = 20
@@ -140,22 +175,21 @@ class Config:
     # score is 0 for nearly all non-HN rows — so once the limit clears
     # the in-window row count, the ordering stops mattering and the
     # ranker's own scoring picks the winners from the full window.
-    recent_candidate_hn_limit: int = 5000
+    recent_candidate_hn_limit: int = 10_000
     recent_candidate_rss_limit: int = 5000
     non_hn_candidates_enabled: bool = True
     # Independent of source regeneration and per-user warm frequency.
     tldr_prefetch_interval_seconds: int = 14400
-    tldr_prefetch_per_combo: int = 2
-    # After the top-per-combo pass, regenerate up to this many additional
-    # cold-deck stories whose cached TLDR's cache_key no longer matches
+    # Summaries prefetched per view (Recommended/Popular/Explore) of the
+    # default window, 1w, after each warm and regen.
+    tldr_prefetch_per_view: int = 2
+    # After the per-view pass, regenerate up to this many additional
+    # deck stories whose cached TLDR's cache_key no longer matches
     # current story content (e.g. article_body was enriched after the TLDR
     # was generated). 0 disables. See server.py::_prefetch_tldrs_for_ranked.
     # Kept small: bulk prefetch trips Groq free-tier bans (875s retry-after
     # observed 2026-09-07), so the steady-state budget is ~10 stories/run.
     tldr_prefetch_stale_per_run: int = 1
-    # Date-tab coverage: newest-first head of the cold deck, matching the
-    # client's date sort (story.time desc). Deduped against combo picks.
-    tldr_prefetch_date_top_n: int = 3
     # Seconds between background TLDR prefetch LLM starts (capped at 15s
     # total offset). Gemini free allows ~10-15 RPM, so a Gemini deployment
     # wants ~5.0; Groq free tolerates 1.0.
@@ -181,6 +215,11 @@ class Config:
     # user is already looking at this story. Miss/failure serves cached.
     # Kept small so cached taps stay snappy; 0 disables tap probing.
     tldr_tap_probe_timeout_seconds: float = 3.0
+    # Between hourly regens, refresh live points and comment counts
+    # (Firebase, no hydration or LLM) of the busiest young HN threads that
+    # pass the tldr_refresh_* gate. 0 disables either knob.
+    hot_refresh_interval_seconds: int = 600
+    hot_refresh_max_stories: int = 30
     # Public demo abuse limits. Cached TLDR hits bypass the uncached TLDR
     # quota; these limits protect only new enrichment/LLM work and vote writes.
     tldr_uncached_per_user_limit: int = 24
@@ -216,6 +255,12 @@ class Config:
             raise ValueError("embedding_model_version must not be empty")
         if self.embedding_max_tokens <= 0:
             raise ValueError("embedding_max_tokens must be positive")
+        if not self.side_embedding_model_version.strip():
+            raise ValueError("side_embedding_model_version must not be empty")
+        if self.side_embedding_max_tokens <= 0:
+            raise ValueError("side_embedding_max_tokens must be positive")
+        if self.side_embedding_dim <= 0:
+            raise ValueError("side_embedding_dim must be positive")
         if self.dashboard_warm_vote_threshold <= 0:
             raise ValueError("dashboard_warm_vote_threshold must be positive")
         if self.dashboard_warm_idle_seconds <= 0:

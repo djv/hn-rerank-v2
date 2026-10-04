@@ -276,10 +276,44 @@ def test_query_comments_bulk_walks_multiple_levels(
 
     monkeypatch.setattr(ch_client.httpx, "post", fake_post)
     result = query_comments_bulk([1], max_levels=5)
-    assert {c["id"] for c in result[1]} == {10, 11}
+    assert [c["id"] for c in result[1]] == [10]
+    assert [c["id"] for c in result[1][0]["children"]] == [11]
     # story_kids + level0 (id=10) + level1 (id=11) = 3 requests, not one
     # single mega-join.
     assert len(calls) == 3
+
+
+def test_query_comments_bulk_nests_in_kids_order_and_blanks_removed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Top-level order follows the story's kids (HN rank), not CH row order;
+    a deleted comment keeps its place with empty text and its replies."""
+
+    def fake_post(url, **kwargs):
+        query = kwargs.get("content", "")
+        if "type = 'story'" in query:
+            return _MockResponse(200, {"data": [{"id": 1, "kids": [30, 20]}]})
+        if "IN (30,20)" in query:
+            return _MockResponse(
+                200,
+                {
+                    "data": [
+                        {"id": 20, "text": "second", "kids": [], "removed": 0},
+                        {"id": 30, "text": "gone", "kids": [31], "removed": 1},
+                    ]
+                },
+            )
+        if "IN (31)" in query:
+            return _MockResponse(
+                200, {"data": [{"id": 31, "text": "reply", "kids": [], "removed": 0}]}
+            )
+        return _MockResponse(200, {"data": []})
+
+    monkeypatch.setattr(ch_client.httpx, "post", fake_post)
+    tree = query_comments_bulk([1], max_levels=5)[1]
+    assert [c["id"] for c in tree] == [30, 20]
+    assert tree[0]["text"] == ""
+    assert [(c["id"], c["text"]) for c in tree[0]["children"]] == [(31, "reply")]
 
 
 # ---------- query_stories_with_comments ----------
@@ -288,14 +322,26 @@ def test_query_comments_bulk_walks_multiple_levels(
 def test_query_stories_with_comments_combines_stories_and_children(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    call_count = {"n": 0}
-
-    def fake_post(url, **kwargs):
-        call_count["n"] += 1
-        if "SELECT" in kwargs.get("content", "") and "IN (" in kwargs.get(
-            "content", ""
-        ):
-            # Could be either stories query or comments; just return both shapes
+    def fake_post(url: str, **kwargs: object) -> _MockResponse:
+        query = str(kwargs.get("content", ""))
+        if "AND type = 'story'" in query:
+            return _MockResponse(200, {"data": [{"id": 1, "kids": [10]}]})
+        if "AND type = 'comment'" in query:
+            if "IN (10)" in query:
+                return _MockResponse(
+                    200,
+                    {
+                        "data": [
+                            {"id": 10, "parent": 1, "text": "comment1", "kids": [11]}
+                        ]
+                    },
+                )
+            assert "IN (11)" in query
+            return _MockResponse(
+                200,
+                {"data": [{"id": 11, "parent": 10, "text": "reply", "kids": []}]},
+            )
+        if "IN (1)" in query:
             return _MockResponse(
                 200,
                 {
@@ -311,16 +357,6 @@ def test_query_stories_with_comments_combines_stories_and_children(
                             "ts": 1000,
                         }
                     ]
-                    + [
-                        {
-                            "id": 10,
-                            "type": "comment",
-                            "parent": 1,
-                            "ts": 100,
-                            "text": "comment1",
-                            "kids": [],
-                        }
-                    ]
                 },
             )
         return _MockResponse(200, {"data": []})
@@ -330,10 +366,11 @@ def test_query_stories_with_comments_combines_stories_and_children(
 
     assert 1 in result
     assert result[1]["type"] == "story"
-    # The query combines via UNION ALL into one call; result has both
-    # The story dict gets a `children` list (may be empty if comment row
-    # had a non-matching parent during combine)
-    assert "children" in result[1]
+    children = result[1]["children"]
+    assert [child["id"] for child in children] == [10]
+    assert children[0]["text"] == "comment1"
+    assert [child["id"] for child in children[0]["children"]] == [11]
+    assert children[0]["children"][0]["text"] == "reply"
 
 
 def test_query_stories_with_comments_empty() -> None:
@@ -502,3 +539,35 @@ def test_cache_key_normalization(monkeypatch: pytest.MonkeyPatch) -> None:
     query_stories_with_comments([2, 1])
     # Same key (sorted), so should be cache hit on the second
     assert call_count["n"] == 2  # 2 calls for first (stories+comments), 0 for second
+
+
+# ---------- is_transient_error ----------
+
+
+def _ch_status_error(status: int, body: str) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "https://play.clickhouse.com/")
+    return httpx.HTTPStatusError(
+        f"Server error '{status}': {body}",
+        request=request,
+        response=httpx.Response(status, request=request),
+    )
+
+
+def test_is_transient_error_classifies_ch_failures() -> None:
+    from ch_client import is_transient_error
+
+    request = httpx.Request("POST", "https://play.clickhouse.com/")
+    assert is_transient_error(httpx.ConnectError("dns", request=request))
+    assert is_transient_error(OSError("Temporary failure in name resolution"))
+    assert is_transient_error(
+        _ch_status_error(500, "Code: 202. DB::Exception: Too many simultaneous queries")
+    )
+    assert is_transient_error(_ch_status_error(503, "Service Unavailable"))
+    assert not is_transient_error(
+        _ch_status_error(500, "Code: 201. DB::Exception: Quota for user `play`")
+    )
+    assert not is_transient_error(
+        _ch_status_error(500, "Code: 2020. DB::Exception: something else")
+    )
+    assert not is_transient_error(_ch_status_error(400, "Code: 62. Syntax error"))
+    assert not is_transient_error(ValueError("unexpected JSON payload shape"))

@@ -6,6 +6,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
+from collections.abc import Sequence
 from typing import Any, Literal, Generator, NamedTuple, TypeAlias
 from contextlib import contextmanager
 import queue
@@ -78,6 +79,15 @@ class SeedStoryState:
 
 
 @dataclass(frozen=True)
+class StoryCounts:
+    """A story's stored points and comment count, read at serve time so
+    feeds show counts refreshed since the candidate pool was built."""
+
+    score: int
+    comment_count: int | None
+
+
+@dataclass(frozen=True)
 class FeedbackRecord:
     story_id: int
     action: Action
@@ -130,6 +140,8 @@ class InteractionEvent:
     ranker_arm: str
     occurred_at: float
     duration_ms: int | None = None
+    # Comma-joined badge kinds of the card as shown ("" when none or unknown).
+    badges: str = ""
 
 
 class InteractionInsertResult(NamedTuple):
@@ -296,6 +308,22 @@ class Database:
                         "ALTER TABLE embeddings ADD COLUMN dim INTEGER NOT NULL DEFAULT 0"
                     )
 
+                # Vectors from an optional second model ranked side by side
+                # with `embeddings` (pipeline/side_embeddings.py). Additive:
+                # `embeddings` keys on story_id alone, so a second model needs
+                # its own table; rows match on (model_version, text_hash).
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS side_embeddings (
+                        story_id      INTEGER NOT NULL,
+                        model_version TEXT NOT NULL,
+                        text_hash     TEXT NOT NULL,
+                        embedding     BLOB NOT NULL,
+                        dim           INTEGER NOT NULL,
+                        PRIMARY KEY (story_id, model_version),
+                        FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE
+                    ) STRICT
+                """)
+
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS tldr_cache (
                         story_id    INTEGER NOT NULL,
@@ -383,6 +411,15 @@ class Database:
                         received_at         REAL NOT NULL
                     ) STRICT
                 """)
+                interaction_columns = {
+                    row[1]
+                    for row in conn.execute("PRAGMA table_info(interaction_events)")
+                }
+                if "badges" not in interaction_columns:
+                    conn.execute(
+                        "ALTER TABLE interaction_events "
+                        "ADD COLUMN badges TEXT NOT NULL DEFAULT ''"
+                    )
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_interaction_events_user_time "
                     "ON interaction_events(user_id, occurred_at)"
@@ -556,7 +593,10 @@ class Database:
         Authoritative comments and their fetched-count marker move together;
         routine ingestion cannot replace a newer fetched snapshot with an older one.
         """
-        with self.conn() as conn:
+        with self.conn() as conn, conn:
+            # Reserve the SQLite writer before reading preservation fields.
+            # A deferred transaction could read a snapshot another writer replaces.
+            conn.execute("BEGIN IMMEDIATE")
             # Check if the story already exists and has longer cached content
             cursor = conn.execute(
                 "SELECT self_text, top_comments, article_body, "
@@ -627,56 +667,55 @@ class Database:
                         discussion_url=final_discussion_url,
                     )
 
-            with conn:
-                result = conn.execute(
-                    """
-                    INSERT INTO stories (
-                        id, title, url, score, time, text_content, source,
-                        comment_count, discussion_url, fetched_at,
-                        comment_count_at_fetch, self_text, top_comments,
-                        article_body
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET
-                        title=excluded.title,
-                        url=excluded.url,
-                        score=excluded.score,
-                        time = CASE
-                            WHEN stories.time > 0 THEN stories.time
-                            WHEN excluded.time > 0 THEN excluded.time
-                            ELSE 0
-                        END,
-                        text_content=excluded.text_content,
-                        source=excluded.source,
-                        comment_count=excluded.comment_count,
-                        discussion_url=excluded.discussion_url,
-                        fetched_at=excluded.fetched_at,
-                        comment_count_at_fetch=excluded.comment_count_at_fetch,
-                        self_text=excluded.self_text,
-                        top_comments=excluded.top_comments,
-                        article_body=excluded.article_body
-                    WHERE stories.id > 0 OR stories.url IS excluded.url
-                    """,
-                    (
-                        story.id,
-                        story.title,
-                        story.url,
-                        story.score,
-                        story.time,
-                        story.text_content,
-                        story.source,
-                        story.comment_count,
-                        story.discussion_url,
-                        time.time(),
-                        story.comment_count_at_fetch,
-                        story.self_text,
-                        story.top_comments,
-                        story.article_body,
-                    ),
+            result = conn.execute(
+                """
+                INSERT INTO stories (
+                    id, title, url, score, time, text_content, source,
+                    comment_count, discussion_url, fetched_at,
+                    comment_count_at_fetch, self_text, top_comments,
+                    article_body
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    title=excluded.title,
+                    url=excluded.url,
+                    score=excluded.score,
+                    time = CASE
+                        WHEN stories.time > 0 THEN stories.time
+                        WHEN excluded.time > 0 THEN excluded.time
+                        ELSE 0
+                    END,
+                    text_content=excluded.text_content,
+                    source=excluded.source,
+                    comment_count=excluded.comment_count,
+                    discussion_url=excluded.discussion_url,
+                    fetched_at=excluded.fetched_at,
+                    comment_count_at_fetch=excluded.comment_count_at_fetch,
+                    self_text=excluded.self_text,
+                    top_comments=excluded.top_comments,
+                    article_body=excluded.article_body
+                WHERE stories.id > 0 OR stories.url IS excluded.url
+                """,
+                (
+                    story.id,
+                    story.title,
+                    story.url,
+                    story.score,
+                    story.time,
+                    story.text_content,
+                    story.source,
+                    story.comment_count,
+                    story.discussion_url,
+                    time.time(),
+                    story.comment_count_at_fetch,
+                    story.self_text,
+                    story.top_comments,
+                    story.article_body,
+                ),
+            )
+            if result.rowcount == 0:
+                raise StoryIdentityConflict(
+                    f"RSS story ID {story.id} belongs to another URL"
                 )
-                if result.rowcount == 0:
-                    raise StoryIdentityConflict(
-                        f"RSS story ID {story.id} belongs to another URL"
-                    )
 
     @staticmethod
     def _row_to_story(row: tuple[Any, ...]) -> Story:
@@ -748,6 +787,44 @@ class Database:
             )
             for row in rows
         }
+
+    def get_story_counts(self, ids: Sequence[int]) -> dict[int, StoryCounts]:
+        """Stored points and comment count for ``ids`` (absent ids omitted)."""
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        with self.conn() as conn:
+            rows = conn.execute(
+                f"SELECT id, score, comment_count FROM stories "
+                f"WHERE id IN ({placeholders})",
+                list(ids),
+            ).fetchall()
+        return {
+            int(row[0]): StoryCounts(
+                score=int(row[1] or 0),
+                comment_count=None if row[2] is None else int(row[2]),
+            )
+            for row in rows
+        }
+
+    def update_story_counts(
+        self, story_id: int, score: int, comment_count: int
+    ) -> bool:
+        """Set a story's live points and raise its comment count (never
+        lowered, as in ``upsert_story``). Returns whether the row changed."""
+        with self.conn() as conn:
+            with conn:
+                cursor = conn.execute(
+                    """
+                    UPDATE stories
+                    SET score = ?,
+                        comment_count = MAX(COALESCE(comment_count, 0), ?)
+                    WHERE id = ?
+                      AND (score != ? OR COALESCE(comment_count, 0) < ?)
+                    """,
+                    (score, comment_count, story_id, score, comment_count),
+                )
+                return cursor.rowcount > 0
 
     # HN explicit duplicate canonicalization cache
     @staticmethod
@@ -927,6 +1004,72 @@ class Database:
                     len(ids),
                 )
             return res
+
+    def upsert_side_embeddings(
+        self,
+        model_version: str,
+        rows: list[tuple[int, str, NDArray[np.float32]]],
+    ) -> None:
+        """Store (story_id, text_hash, vector) rows of one side model."""
+        if not rows:
+            return
+        with self.conn() as conn:
+            with conn:
+                conn.executemany(
+                    """
+                    INSERT INTO side_embeddings
+                        (story_id, model_version, text_hash, embedding, dim)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(story_id, model_version) DO UPDATE SET
+                        text_hash=excluded.text_hash,
+                        embedding=excluded.embedding,
+                        dim=excluded.dim
+                    """,
+                    [
+                        (
+                            sid,
+                            model_version,
+                            text_hash,
+                            vec.astype(np.float32).tobytes(),
+                            int(vec.shape[0]),
+                        )
+                        for sid, text_hash, vec in rows
+                    ],
+                )
+
+    def get_side_embeddings_batch(
+        self,
+        ids: list[int],
+        model_version: str,
+        hashes: dict[int, str],
+        expected_dim: int,
+    ) -> dict[int, NDArray[np.float32]]:
+        """Side-model vectors whose stored text hash still matches *hashes*."""
+        if not ids:
+            return {}
+        found: dict[int, NDArray[np.float32]] = {}
+        with self.conn() as conn:
+            if not conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'side_embeddings'"
+            ).fetchone():
+                return found  # read-only handle on a DB from before the table
+            for start in range(0, len(ids), 10_000):
+                chunk = ids[start : start + 10_000]
+                placeholders = ",".join("?" for _ in chunk)
+                for sid, text_hash, blob in conn.execute(
+                    f"""SELECT story_id, text_hash, embedding FROM side_embeddings
+                        WHERE model_version = ? AND story_id IN ({placeholders})""",
+                    [model_version, *chunk],
+                ):
+                    if hashes.get(sid) != text_hash:
+                        continue
+                    vec = self._decode_embedding_blob(
+                        blob, expected_dim=expected_dim, story_id=sid
+                    )
+                    if vec is not None:
+                        found[sid] = vec
+        return found
 
     # TLDR cache
     def get_tldr_cache(self, story_id: int, cache_key: str) -> str | None:
@@ -1398,8 +1541,8 @@ class Database:
                             event_id, client_session_id, user_id, story_id,
                             event_type, dashboard_version, position, sort_mode,
                             age_filter, source_filter, ranker_arm, occurred_at,
-                            duration_ms, received_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            duration_ms, received_at, badges
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(event_id) DO NOTHING
                         """,
                         (
@@ -1417,6 +1560,7 @@ class Database:
                             event.occurred_at,
                             event.duration_ms,
                             received_at,
+                            event.badges,
                         ),
                     )
                     inserted += cursor.rowcount
@@ -1530,6 +1674,16 @@ class Database:
             if row:
                 return User(id=row[0], token=row[1], created_at=row[2])
             return None
+
+    def recently_voting_user_ids(self, since: float, limit: int) -> list[int]:
+        """Users with a vote updated after ``since``, latest vote first."""
+        with self.conn() as conn:
+            rows = conn.execute(
+                "SELECT user_id FROM feedback WHERE updated_at > ? "
+                "GROUP BY user_id ORDER BY MAX(updated_at) DESC LIMIT ?",
+                (since, limit),
+            ).fetchall()
+        return [int(row[0]) for row in rows]
 
     def get_or_create_user(self, token: str) -> User:
         user = self.get_user_by_token(token)

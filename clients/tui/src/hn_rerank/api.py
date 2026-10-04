@@ -11,7 +11,7 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 import httpx
 from platformdirs import user_config_path
 
-from .models import Feed, terminal_safe
+from .models import DEFAULT_WINDOW, WINDOWS, Feed, Window, terminal_safe
 
 
 @dataclass(frozen=True)
@@ -22,11 +22,13 @@ class Impression:
     dashboard_version: int
     position: int
     sort_mode: str
-    age_filter: str
+    window: str
     occurred_at: float
     event_type: str = "impression"
     source_filter: str = "mixed"
     ranker_arm: str = "tui_observed"
+    # Badge kinds of the story as shown.
+    badges: list[str] = field(default_factory=list)
 
 
 class APIError(Exception):
@@ -54,6 +56,26 @@ class Summary:
     text: str
     provisional: bool = False
     empty: bool = False
+    # Stored points/comments when the server just generated the summary:
+    # hydration can move them past what the feed showed.
+    points: int | None = None
+    comments: int | None = None
+
+
+@dataclass(frozen=True)
+class Readiness:
+    """`api/ranking-ready`: whether the awaited deck is ranked, the current
+    deck version, and the server's counts version (None from older servers),
+    which moves when stored points/comments change between decks."""
+
+    ready: bool
+    current: int
+    counts_version: int | None = None
+
+
+def _count(value: object) -> int | None:
+    """An optional non-negative count; anything else reads as absent."""
+    return value if type(value) is int and value >= 0 else None
 
 
 def normalize_server(value: str) -> str:
@@ -125,6 +147,28 @@ class Profile:
 
 def profile_path() -> Path:
     return user_config_path("hn-rerank", appauthor=False) / "profile.json"
+
+
+def window_path() -> Path:
+    return user_config_path("hn-rerank", appauthor=False) / "window"
+
+
+def load_window(path: Path) -> Window | None:
+    """The last time window picked, or None when unset or unreadable."""
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return next((window for window in WINDOWS if window == value), None)
+
+
+def save_window(window: str, path: Path) -> None:
+    """Best effort: an unwritable config dir only loses the preference."""
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.write_text(f"{window}\n", encoding="utf-8")
+    except OSError:
+        pass
 
 
 def load_profile(path: Path) -> Profile | None:
@@ -266,14 +310,22 @@ class API:
         await self.request("GET", "")
         return await self.validate()
 
-    async def feed(self) -> Feed:
-        response = await self.request("GET", "api/feed")
+    async def feed(self, window: str = DEFAULT_WINDOW) -> Feed:
+        """One time window of the deck."""
+        if window not in WINDOWS:
+            raise ValueError("Unknown time window")
+        response = await self.request("GET", f"api/feed?window={window}")
         try:
-            return Feed.parse(response.json())
-        except (TypeError, ValueError) as exc:
-            raise APIError(
-                "Invalid feed response. Check the server API version."
-            ) from exc
+            feed = Feed.parse(response.json())
+        except ValueError as exc:
+            # A schema mismatch says so (models: "update hn-rerank").
+            detail = str(exc) if "update" in str(exc) else "Invalid feed response."
+            raise APIError(detail) from exc
+        except TypeError as exc:
+            raise APIError("Invalid feed response.") from exc
+        if feed.window != window:
+            raise APIError("Invalid feed response: wrong time window.")
+        return feed
 
     async def cached_summary(self, story_id: int) -> Summary | None:
         """Read existing summaries only; old servers fail without generation."""
@@ -308,6 +360,8 @@ class API:
                 terminal_safe(value),
                 provisional=data.get("stale") is True or data.get("retryable") is True,
                 empty=data.get("empty") is True,
+                points=_count(data.get("points")),
+                comments=_count(data.get("comments")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise APIError(
@@ -332,7 +386,7 @@ class API:
                 "Vote result is uncertain; it will not be retried automatically."
             ) from exc
 
-    async def ready(self, target: int) -> tuple[bool, int]:
+    async def ready(self, target: int) -> Readiness:
         response = await self.request(
             "GET", f"api/ranking-ready?min_version={target}&target_version={target}"
         )
@@ -345,6 +399,6 @@ class API:
                 or type(data["ready"]) is not bool
             ):
                 raise ValueError("Invalid readiness")
-            return data["ready"], current
+            return Readiness(data["ready"], current, _count(data.get("counts_version")))
         except (KeyError, TypeError, ValueError) as exc:
             raise APIError("Invalid ranking status. Press r to refresh.") from exc

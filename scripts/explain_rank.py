@@ -13,7 +13,9 @@ if str(ROOT) not in sys.path:
 from database import Database  # noqa: E402
 from pipeline import Config, Embedder, load_production_candidate_stories  # noqa: E402
 from pipeline.ranking import (  # noqa: E402
+    ATTRIBUTION_CENTERED_MIN_SIM,
     RankScoreContext,
+    centered_pair_similarity,
     _score_and_rank,
     get_or_compute_embeddings,
 )
@@ -76,6 +78,14 @@ def main() -> None:
                 fb_row = int(ctx.cand_closest_up_idx[i])
                 if 0 <= fb_row < len(ctx.fb_up_titles):
                     match = ctx.fb_up_titles[fb_row][:70]
+                    if ctx.fb_up_embeddings is not None:
+                        centered = centered_pair_similarity(
+                            embeddings,
+                            embeddings[[i]],
+                            ctx.fb_up_embeddings[[fb_row]],
+                        )[0]
+                        shown = centered >= ATTRIBUTION_CENTERED_MIN_SIM
+                        match += f" (centered {centered:.2f}, {'shown' if shown else 'hidden'})"
             print(f"#{pos} score={r.score:.4f} src={r.story.source}")
             print(f"   {r.story.title[:80]}")
             print(

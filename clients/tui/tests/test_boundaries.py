@@ -12,7 +12,14 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from hn_rerank.api import API, APIError, normalize_server
-from hn_rerank.models import Feed, FeedBadge, FeedStory
+from hn_rerank.models import (
+    FEED_API_VERSION,
+    VIEWS,
+    WINDOWS,
+    Feed,
+    FeedBadge,
+    FeedStory,
+)
 
 from .test_client import sample_feed
 
@@ -77,9 +84,6 @@ def _feed_stories(draw: st.DrawFn) -> FeedStory:
         comments=draw(st.one_of(st.none(), st.integers())),
         time=draw(st.integers()),
         rank_score=draw(st.floats(allow_nan=False, allow_infinity=False)),
-        memberships=draw(st.lists(st.text(max_size=8), max_size=3)),
-        popular=draw(st.booleans()),
-        explore=draw(st.booleans()),
         badges=draw(st.lists(_UNTRUSTED_TEXT, max_size=2)),
         badge_details=draw(
             st.lists(
@@ -103,16 +107,16 @@ def _feeds(draw: st.DrawFn) -> Feed:
         st.lists(_feed_stories(), max_size=4, unique_by=lambda story: story.id)
     )
     ids = [story.id for story in stories]
-    orders = {
-        "recommended:recent": draw(st.lists(st.sampled_from(ids), max_size=3))
-        if ids
-        else []
+    orders: dict[str, list[int]] = {
+        view: draw(st.lists(st.sampled_from(ids), max_size=3)) if ids else []
+        for view in draw(st.lists(st.sampled_from(VIEWS), unique=True))
     }
     counts = {
         action: draw(st.integers(min_value=0)) for action in ("up", "neutral", "down")
     }
     return Feed(
-        1,
+        FEED_API_VERSION,
+        draw(st.sampled_from(WINDOWS)),
         stories,
         orders,
         counts,
@@ -202,7 +206,52 @@ def test_parse_tolerates_missing_badges_from_older_servers() -> None:
     stories = cast("list[dict[str, object]]", payload["stories"])
     for story in stories:
         del story["badges"]
-    assert [story.badges for story in Feed.parse(payload).stories] == [[], [], []]
+    assert [story.badges for story in Feed.parse(payload).stories] == [[], []]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"window": "recent"}, {"window": None}, {"orders": {"date": []}}],
+)
+def test_parse_rejects_unknown_windows_and_views(change: dict[str, object]) -> None:
+    payload = {**sample_feed().to_dict(), **change}
+    with pytest.raises(ValueError):
+        Feed.parse(payload)
+
+
+async def test_feed_schema_mismatch_asks_to_update_the_client() -> None:
+    """A server on another feed schema (the old v1 deck, say) is not shown
+    as a broken feed: the reader is told to update."""
+    old = {**sample_feed().to_dict(), "api_version": 1}
+    api = API(
+        "https://example.org/hn/",
+        "token",
+        httpx.MockTransport(lambda request: httpx.Response(200, json=old)),
+    )
+    try:
+        with pytest.raises(APIError, match="update hn-rerank"):
+            await api.feed()
+    finally:
+        await api.close()
+
+
+async def test_feed_requests_its_window_and_rejects_another() -> None:
+    seen: list[str] = []
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.params["window"])
+        return httpx.Response(200, json=sample_feed(window="1w").to_dict())
+
+    api = API("https://example.org/hn/", "token", httpx.MockTransport(serve))
+    try:
+        assert (await api.feed()).window == "1w"
+        with pytest.raises(APIError, match="wrong time window"):
+            await api.feed("12h")
+        with pytest.raises(ValueError):
+            await api.feed("recent")
+        assert seen == ["1w", "12h"]
+    finally:
+        await api.close()
 
 
 @pytest.mark.parametrize(

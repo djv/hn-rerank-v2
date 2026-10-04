@@ -15,6 +15,7 @@ from pipeline import (  # noqa: E402
     Embedder,
     RankTrace,
     fast_rerank_for_user,
+    is_hn_source,
 )
 
 
@@ -35,17 +36,17 @@ def _rank_top50_labels(
     trace fields. badge_label is "primary" for items with no discovery
     badge, otherwise a comma-joined list of badge names."""
     trace = RankTrace()
-    ranked = fast_rerank_for_user(db, config, embedder, user_id, trace=trace)
+    ranked = fast_rerank_for_user(db, config, embedder, user_id, trace=trace).stories()
     out: dict[int, str] = {}
     for r in ranked[:50]:
         badges: list[str] = []
         if r.is_novel:
             badges.append("novel")
-        if r.is_similar:
-            badges.append("similar")
+        if r.is_interest:
+            badges.append("interest")
         if r.is_uncertain:
             badges.append("uncertain")
-        if r.is_non_hn:
+        if not is_hn_source(r.story.source):
             badges.append("non_hn")
         if r.is_hot:
             badges.append("hot")
@@ -75,7 +76,7 @@ def _classify_loss(
         if label == "primary":
             counts["pri"] += 1
         else:
-            if "similar" in label:
+            if "interest" in label:
                 counts["sim"] += 1
             if "uncertain" in label:
                 counts["unc"] += 1

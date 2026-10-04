@@ -36,7 +36,13 @@ from flask.typing import ResponseReturnValue
 import httpx
 
 from background_cadence import BackgroundCadence
-from clients.tui.src.hn_rerank.models import Feed
+from clients.tui.src.hn_rerank.models import (
+    DEFAULT_WINDOW,
+    VIEWS,
+    WINDOWS,
+    Feed,
+    Window,
+)
 from database import (
     Database,
     InteractionEvent,
@@ -45,7 +51,17 @@ from database import (
     Story,
     User,
 )
-from pipeline import Config, DEFAULT_ENV_PATH, Embedder, RankedStory, is_hn_source
+from pipeline import (
+    Config,
+    DEFAULT_ENV_PATH,
+    Embedder,
+    WindowDeck,
+    hn_thread_looks_active,
+    is_hn_source,
+)
+from pipeline.ranking import serve_window
+from pipeline.ainews import AINEWS_SOURCE
+from pipeline.hn_dupes import pointer_thread_target
 from llm_limiter import limiter as llm_limiter
 from reddit_limiter import limiter as reddit_limiter
 import http_fetch
@@ -407,7 +423,45 @@ def _extract_article_body(html: str) -> str | None:
     return None
 
 
+# Article bodies built from a tweet start with this; such a body is the
+# story's real content even when shorter than ARTICLE_SECTION_MIN_CHARS.
+TWEET_BODY_PREFIX = "Tweet by @"
+
+
+async def _fetch_tweet_body(tweet_id: str) -> ArticleFetchResult:
+    """A tweet (via the fxtwitter mirror, never x.com) plus the page it links.
+
+    x.com serves no article HTML, so tweet links used to fail as non_html.
+    """
+    from pipeline import _is_fetchable_article_url
+    from pipeline.ainews import fetch_tweets, tweet_id_from_url
+
+    tweet = (await fetch_tweets([tweet_id])).get(tweet_id)
+    if tweet is None:
+        return ArticleFetchResult(error="tweet_unavailable")
+    body = f"{TWEET_BODY_PREFIX}{tweet.author}:\n{tweet.text}"
+    if tweet.quote_text:
+        body += f"\n\nQuoting:\n{tweet.quote_text}"
+    link = next(
+        (
+            u
+            for u in tweet.links
+            if tweet_id_from_url(u) is None and _is_fetchable_article_url(u)
+        ),
+        None,
+    )
+    if link:
+        page = await _fetch_article_body_with_result(link)
+        if page.body:
+            body += f"\n\nLinked page ({link}):\n{page.body}"
+    return ArticleFetchResult(body=body[:ARTICLE_BODY_CHAR_LIMIT], status=200)
+
+
 async def _fetch_article_body_with_result(url: str) -> ArticleFetchResult:
+    from pipeline.ainews import tweet_id_from_url
+
+    if tweet_id := tweet_id_from_url(url):
+        return await _fetch_tweet_body(tweet_id)
     headers = {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -714,21 +768,24 @@ async def _call_llm_chat(
         **(extra or {}),
     }
     estimated_tokens = len(prompt) // 3 + max_tokens
+    # The free Go models think for 15-45s on long discussions.
+    timeout = 90.0 if "/zen/go/" in base_url else 45.0
     try:
-        async with httpx.AsyncClient(timeout=45.0) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             for attempt in range(4):
                 if not await llm_limiter.acquire(estimated_tokens=estimated_tokens):
                     return LlmChatResult(
                         content="LLM quota cooldown; retry later.", ok=False, status=429
                     )
-                resp = await client.post(
-                    base_url,
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                )
+                headers = {
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                }
+                if "/zen/go/" in base_url:
+                    # The Go gateway rejects requests without a session id.
+                    headers["User-Agent"] = _GO_USER_AGENT
+                    headers["x-opencode-session"] = _go_session_id()
+                resp = await client.post(base_url, headers=headers, json=payload)
                 data = resp.json() if resp.status_code == 200 else {}
                 used_tokens = data.get("usage", {}).get("total_tokens")
                 llm_limiter.record_response(
@@ -965,6 +1022,41 @@ async def _call_llm_for_config(
     max_tokens: int,
     on_usage: LlmUsageRecorder | None = None,
 ) -> LlmChatResult:
+    """Call the provider, retrying once when a finished reply has no bullets.
+
+    Mistral-small sometimes answers a section as one prose paragraph
+    (finish=stop, rejected by _valid_llm_completion); about a third of
+    TLDRs lost a half this way on 2026-09-29. A second sample usually
+    comes back as bullets.
+    """
+    result = await _call_llm_once(
+        cfg, prompt=prompt, max_tokens=max_tokens, on_usage=on_usage
+    )
+    if _is_format_rejection(result):
+        logging.info("llm: reply had no bullets, retrying once")
+        result = await _call_llm_once(
+            cfg, prompt=prompt, max_tokens=max_tokens, on_usage=on_usage
+        )
+    return result
+
+
+def _is_format_rejection(result: LlmChatResult) -> bool:
+    """A complete 200 reply that failed only the bullet-format check."""
+    return (
+        not result.ok
+        and result.status is None
+        and result.finish_reason not in (None, "length")
+        and bool(result.content.strip())
+    )
+
+
+async def _call_llm_once(
+    cfg: LlmProviderConfig,
+    *,
+    prompt: str,
+    max_tokens: int,
+    on_usage: LlmUsageRecorder | None = None,
+) -> LlmChatResult:
     """Dispatch to the chat or responses caller based on endpoint shape."""
     api_key, base_url, model, extra = cfg.api_key, cfg.base_url, cfg.model, cfg.extra
     if base_url.rstrip("/").endswith("/responses"):
@@ -1042,6 +1134,16 @@ _LLM_PROVIDERS: dict[str, tuple[str, str, str, dict[str, object]]] = {
         "muse-spark-1.3-contributor",
         {"reasoning_effort": "low"},
     ),
+    # Free models on the Go gateway (chat/completions); they answered while
+    # the Go plan's usage limit was spent (2026-09-29). LLM_MODEL picks
+    # another, e.g. space-bunny-free.
+    "gofree": (
+        "OPENCODE_GO_API_KEY",
+        "https://opencode.ai/zen/go/v1/chat/completions",
+        "longcat-2.5-preview-free",
+        # Without it a 31k-char article spent the whole cap reasoning.
+        {"reasoning_effort": "low"},
+    ),
     "gemini": (
         "GEMINI_API_KEY",
         "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
@@ -1079,6 +1181,10 @@ def _max_tokens_for_provider(cfg: LlmProviderConfig, base: int) -> int:
         # 1,647-token outlier exhausted the old +1200 cap and dropped the
         # article section (WORKLOG 2026-09-25); +2000 covers it plus output.
         return base + 2000
+    if cfg.provider == "gofree":
+        # The free Go models reason without reporting it: 450 tokens came
+        # back empty (finish=length); a 2,450 cap stopped at ~1,450.
+        return base + 2000
     if cfg.provider in {"cerebras", "groq"} and "reasoning_effort" in cfg.extra:
         return base + 600
     return base
@@ -1103,6 +1209,11 @@ def _tldr_cache_key(
     top_comments: str,
     article_body: str,
 ) -> str:
+    if pointer_thread_target(top_comments, source_id=0) is not None:
+        # Generation drops a pointer note (_generate_tldr), so the key does
+        # too. Summaries cached under the note itself predate that and
+        # invented a discussion (story 38507672); they no longer match.
+        top_comments = ""
     payload = {
         "identity": _llm_cache_identity(),
         "title": title,
@@ -1155,6 +1266,10 @@ async def generate_detailed_tldr(
             f"\n\nArticle body:\n{article_body[:ARTICLE_BODY_CHAR_LIMIT]}"
         )
     comments_section = top_comments[:COMMENT_PROMPT_CHAR_LIMIT]
+    if pointer_thread_target(top_comments, source_id=0) is not None:
+        # "Comments moved to item?id=N" is not a discussion; summarizing it
+        # invented one (story 32148318). The tap path follows the link.
+        comments_section = top_comments = ""
 
     if not article_section and not top_comments:
         return TldrResult(kind="no_content")
@@ -1163,6 +1278,7 @@ async def generate_detailed_tldr(
         article_section
         and comments_section
         and len(article_section) < ARTICLE_SECTION_MIN_CHARS
+        and not article_body.startswith(TWEET_BODY_PREFIX)
     ):
         article_section = ""
 
@@ -1255,22 +1371,88 @@ async def generate_detailed_tldr(
     return _llm_error_from(result)
 
 
+def _is_unfollowed_pointer(story: Story) -> bool:
+    """An HN story whose stored discussion is still a pointer note."""
+    return is_hn_source(story.source) and (
+        pointer_thread_target(story.top_comments or "", source_id=story.id) is not None
+    )
+
+
+# Story id -> monotonic time of its last failed pointer follow. A target that
+# is missing, dead, a comment or all short comments fails every time; retry
+# it at most this often instead of on every tap and prefetch run.
+POINTER_FOLLOW_RETRY_S = 6 * 3600
+_pointer_follow_failed: dict[int, float] = {}
+
+
+async def _follow_pointer_thread(db: Database, story: Story) -> Story:
+    """Swap a pointer thread's lone "comments moved to item?id=N" note for
+    the comments of thread N, persisted so cached TLDRs keep matching."""
+    if not is_hn_source(story.source):
+        return story
+    target = pointer_thread_target(story.top_comments or "", source_id=story.id)
+    if target is None:
+        return story
+    now = time.monotonic()
+    failed_at = _pointer_follow_failed.get(story.id)
+    if failed_at is not None and now - failed_at < POINTER_FOLLOW_RETRY_S:
+        return story
+    from pipeline import compose_story_text
+    from pipeline.enrichment import fetch_thread_comments
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        comments = await fetch_thread_comments(client, target)
+    if not comments:
+        for sid, at in list(_pointer_follow_failed.items()):
+            if now - at >= POINTER_FOLLOW_RETRY_S:
+                del _pointer_follow_failed[sid]
+        _pointer_follow_failed[story.id] = now
+        logging.info(
+            "tldr_detail story_id=%s pointer_thread=%s follow=failed", story.id, target
+        )
+        return story
+    _pointer_follow_failed.pop(story.id, None)
+    # The fetch awaited; a hydration may have rewritten the row meanwhile.
+    fresh = db.get_story(story.id) or story
+    if fresh.top_comments != story.top_comments and (
+        pointer_thread_target(fresh.top_comments or "", source_id=fresh.id) != target
+    ):
+        logging.info(
+            "tldr_detail story_id=%s pointer_thread=%s follow=superseded",
+            story.id,
+            target,
+        )
+        return fresh
+    logging.info("tldr_detail story_id=%s pointer_thread=%s", story.id, target)
+    story = replace(
+        fresh,
+        top_comments=comments,
+        text_content=compose_story_text(
+            fresh.title, fresh.self_text, comments, fresh.article_body
+        ),
+    )
+    # Authoritative: the followed thread can be shorter than the note.
+    db.upsert_story(story, comments_authoritative=True)
+    return story
+
+
 # Stagger between background TLDR prefetch LLM starts (seconds, capped at
 # 15s total offset). Seam for tests: patched to 0 to avoid real sleeps.
 _PREFETCH_STAGGER_S = 1.0
 
 
 async def _prefetch_tldrs_for_ranked(
-    ranked_stories: list[RankedStory],
+    deck: WindowDeck,
     db: Database,
-    per_combo: int,
+    per_view: int,
     stale_per_run: int = 0,
-    date_top_n: int = 8,
     stagger_s: float | None = None,
 ) -> int:
-    if (
-        per_combo <= 0 and stale_per_run <= 0 and date_top_n <= 0
-    ) or not ranked_stories:
+    """Summarize the first *per_view* stories of each view of the default
+    window, then up to *stale_per_run* deck stories whose cached summary no
+    longer matches their content."""
+    ranked_stories = deck.stories()
+    if (per_view <= 0 and stale_per_run <= 0) or not ranked_stories:
         return 0
 
     # Background work must not deepen a provider ban: fail-fast per call
@@ -1283,38 +1465,15 @@ async def _prefetch_tldrs_for_ranked(
         logging.info("tldr_prefetch skipped: provider cooldown %ss remaining", cooldown)
         return 0
 
-    combo_groups: dict[str, list[int]] = {}
-    if per_combo > 0:
-        for rs in ranked_stories:
-            for combo_key in rs.combo_keys.split():
-                if combo_key.endswith("_mixed"):
-                    continue
-                group = combo_groups.setdefault(combo_key, [])
-                if len(group) < per_combo:
-                    group.append(rs.story.id)
-                break
-
     seen: set[int] = set()
     story_ids: list[int] = []
-    for combo_key in ["recent_hn", "recent_non-hn", "archive_hn"]:
-        for sid in combo_groups.get(combo_key, []):
-            if sid not in seen:
-                seen.add(sid)
-                story_ids.append(sid)
-
-    # Date-tab lane: newest-first head of the deck, matching the client's
-    # date sort (story.time desc). Prefetch only covered combo tops before,
-    # so the Date tab's first cards always paid the full cold path.
-    date_added = 0
-    if date_top_n > 0:
-        by_time = sorted(ranked_stories, key=lambda rs: rs.story.time, reverse=True)
-        for rs in by_time:
-            if date_added >= date_top_n:
-                break
-            if rs.story.id not in seen:
-                seen.add(rs.story.id)
-                story_ids.append(rs.story.id)
-                date_added += 1
+    if per_view > 0:
+        views = serve_window(deck.window(DEFAULT_WINDOW), DEFAULT_WINDOW, time.time())
+        for name in VIEWS:
+            for rs in views.view(name)[:per_view]:
+                if rs.story.id not in seen:
+                    seen.add(rs.story.id)
+                    story_ids.append(rs.story.id)
 
     stale_added = 0
     if stale_per_run > 0:
@@ -1352,6 +1511,8 @@ async def _prefetch_tldrs_for_ranked(
         story = db.get_story(story_id)
         if not story:
             return False
+        if _is_unfollowed_pointer(story):
+            story = await _follow_pointer_thread(db, story)
 
         title = story.title
         self_text = story.self_text or ""
@@ -1405,12 +1566,11 @@ async def _prefetch_tldrs_for_ranked(
 
     if generated:
         logging.info(
-            "tldr_prefetch generated=%s candidates=%s per_combo=%s stale_added=%s date_added=%s",
+            "tldr_prefetch generated=%s candidates=%s per_view=%s stale_added=%s",
             generated,
             len(story_ids),
-            per_combo,
+            per_view,
             stale_added,
-            date_added,
         )
     else:
         # Always log the zero outcome: a silent miss here once hid a real
@@ -1418,11 +1578,10 @@ async def _prefetch_tldrs_for_ranked(
         # prefetch fail-fasted, and the run returned 0 indistinguishable
         # from "everything already cached").
         logging.info(
-            "tldr_prefetch generated=0 candidates=%s per_combo=%s stale_added=%s date_added=%s cooldown_s=%.0f",
+            "tldr_prefetch generated=0 candidates=%s per_view=%s stale_added=%s cooldown_s=%.0f",
             len(story_ids),
-            per_combo,
+            per_view,
             stale_added,
-            date_added,
             llm_limiter.retry_after_seconds,
         )
     return generated
@@ -1435,13 +1594,14 @@ SKELETON_HTML = b"""<!DOCTYPE html>
 
 @dataclass(frozen=True)
 class DeckState:
-    """A user's personalized ranking and the dashboard version it was built for.
+    """A user's personalized deck (every window's views) and the dashboard
+    version it was built for.
 
     HTML and `/api/feed` JSON are rendered from this on every read, so the
     current version is always rendered in rather than patched into bytes.
     """
 
-    ranked: list[RankedStory]
+    deck: WindowDeck
     built_at: float
     version: int
 
@@ -1451,7 +1611,7 @@ class DeckView:
     """What a read serves: the page, `/api/feed` and `/api/ranking-ready`
     all come from `Handler._deck_for_user`, so they always agree."""
 
-    ranked: list[RankedStory]
+    deck: WindowDeck
     # The deck's version; 0 is the cold deck shown while the first warm runs.
     version: int
     # The user's current version, which a queued warm is building.
@@ -1506,7 +1666,8 @@ class Handler:
       version wins, at most one running per user) on a pool of
       ``config.warm_pool_size`` workers. Votes debounce through it
       (``dashboard_warm_idle_seconds``, or immediately at
-      ``dashboard_warm_vote_threshold`` votes).
+      ``dashboard_warm_vote_threshold`` votes). At startup
+      ``warm_recent_users`` queues one for each recently voting profile.
     """
 
     config: Config
@@ -1515,12 +1676,21 @@ class Handler:
     regen_event: threading.Event
     _decks: dict[int, DeckState] = {}
     _MAX_CACHED_DECKS = 100
+    # The first rank in a fresh process takes 30-60 s (61.8 s live on
+    # 2026-10-02, 30.3 s alone; a refit later takes ~6 s), so profiles
+    # that voted this recently are ranked at startup instead of on their
+    # first read, which would otherwise show the cold deck meanwhile.
+    _STARTUP_WARM_DAYS = 7
+    _STARTUP_WARM_MAX_USERS = 4
     _pool_generation: int = _boot_epoch_ms()
     _dashboard_versions: dict[int, int] = {}
     _dashboard_versions_guard = threading.Lock()
+    # Moves when stored points/comments change between pool builds (hot
+    # refresh, TLDR hydration); clients refetch the feed to show them.
+    _counts_version: int = 0
     _scheduler: WarmScheduler[int, User] | None = None
     _scheduler_guard = threading.Lock()
-    _cold_stories: list[RankedStory] = []
+    _cold_deck: WindowDeck = WindowDeck()
     _article_fetch_in_flight: set[int] = set()
     _warm_bg_lock = threading.Lock()
     _tldr_prefetch_gate = BackgroundCadence()
@@ -1554,12 +1724,12 @@ class Handler:
 
     @classmethod
     def _render_deck(
-        cls, user: User, ranked: list[RankedStory], version: int, current: int
+        cls, user: User, deck: WindowDeck, version: int, current: int
     ) -> bytes:
         from pipeline import generate_dashboard_bytes
 
         return generate_dashboard_bytes(
-            ranked,
+            deck,
             cls.config,
             cls.db,
             user.id,
@@ -1581,31 +1751,29 @@ class Handler:
             # regen for nothing.
             with cls._dashboard_versions_guard:
                 cls._decks.pop(user.id, None)
-            return DeckView(cls._cold_stories, current, current)
-        deck = cls._decks.get(user.id)
-        if deck is None:
+            return DeckView(cls._cold_deck, current, current)
+        state = cls._decks.get(user.id)
+        if state is None:
             # Votes but no deck yet (first read since a restart, or evicted).
-            ranked, version = cls._cold_stories, 0
+            deck, version = cls._cold_deck, 0
         else:
-            ranked, version = deck.ranked, deck.version
+            deck, version = state.deck, state.version
         if version < current:
             # A stale deck's warm is passive: a queued vote-debounce warm
             # keeps its delay.
-            cls._trigger_warm(user, current, expedite=deck is None)
-        return DeckView(
-            [item for item in ranked if item.story.id not in voted], version, current
-        )
+            cls._trigger_warm(user, current, expedite=state is None)
+        return DeckView(deck.without(voted), version, current)
 
     @classmethod
     def _render_dashboard_for_user(cls, user: User) -> bytes:
         request_start = time.perf_counter()
         view = cls._deck_for_user(user)
-        if not view.ranked and view.version == 0:
+        if view.deck.is_empty() and view.version == 0:
             # An empty cold deck (first boot before any regen) while the warm
             # builds this user's deck; the skeleton page reloads itself.
             html, result = SKELETON_HTML, "skeleton"
         else:
-            html = cls._render_deck(user, view.ranked, view.version, view.current)
+            html = cls._render_deck(user, view.deck, view.version, view.current)
             result = "current" if view.ready else "stale"
         logging.info(
             "dashboard_render user_id=%s version=%s result=%s deck_version=%s"
@@ -1614,28 +1782,41 @@ class Handler:
             view.current,
             result,
             view.version,
-            len(view.ranked),
+            len(view.deck.stories()),
             (time.perf_counter() - request_start) * 1000,
         )
         return html
 
     @classmethod
-    def _feed_for_user(cls, user: User) -> Feed:
+    def _feed_for_user(cls, user: User, window: Window = DEFAULT_WINDOW) -> Feed:
         from pipeline.render import build_feed
 
         view = cls._deck_for_user(user)
         return build_feed(
-            view.ranked,
+            view.deck,
+            window,
             cls.config,
             cls.db.count_feedback_by_action(user.id),
             view.version,
             view.current,
+            live_counts=cls.db.get_story_counts,
         )
 
     @classmethod
     def _dashboard_version(cls, user_id: int) -> int:
         with cls._dashboard_versions_guard:
             return cls._pool_generation + cls._dashboard_versions.get(user_id, 0)
+
+    @classmethod
+    def _current_counts_version(cls) -> int:
+        with cls._dashboard_versions_guard:
+            return cls._counts_version
+
+    @classmethod
+    def _bump_counts_version(cls) -> int:
+        with cls._dashboard_versions_guard:
+            cls._counts_version += 1
+            return cls._counts_version
 
     @classmethod
     def _bump_user_version(cls, user_id: int) -> int:
@@ -1678,6 +1859,23 @@ class Handler:
         )
 
     @classmethod
+    def warm_recent_users(cls) -> list[int]:
+        """Queue a warm for each profile with a recent vote (latest first);
+        returns their ids."""
+        since = time.time() - cls._STARTUP_WARM_DAYS * 86400
+        warmed: list[int] = []
+        for user_id in cls.db.recently_voting_user_ids(
+            since, cls._STARTUP_WARM_MAX_USERS
+        ):
+            user = cls.db.get_user_by_id(user_id)
+            if user is None:
+                continue
+            cls._trigger_warm(user, cls._dashboard_version(user.id))
+            warmed.append(user.id)
+        logging.info("startup_warm user_ids=%s", warmed)
+        return warmed
+
+    @classmethod
     def _schedule_feedback_warm(cls, user: User, version: int) -> bool:
         """Warm after an idle pause, or now once enough votes pile up."""
         with cls._feedback_warm_guard:
@@ -1717,12 +1915,12 @@ class Handler:
         # since this warm was queued).
         requested_version = max(requested_version, cls._dashboard_version(user.id))
 
-        from pipeline import RankTrace, fast_rerank_for_user
+        from pipeline import RankTrace, fast_rerank_for_user, rank_gate
 
         trace = RankTrace()
         render_start = time.perf_counter()
-        with trace.stage("rank_total"):
-            final = fast_rerank_for_user(
+        with rank_gate.ranking(), trace.stage("rank_total"):
+            deck = fast_rerank_for_user(
                 cls.db,
                 cls.config,
                 cls.embedder,
@@ -1732,7 +1930,7 @@ class Handler:
         rank_ms = (time.perf_counter() - render_start) * 1000
 
         with cls._dashboard_versions_guard:
-            cls._decks[user.id] = DeckState(final, time.time(), requested_version)
+            cls._decks[user.id] = DeckState(deck, time.time(), requested_version)
             cls._evict_old_decks_locked()
         # A vote or regen while ranking: warm again. (A regen only re-warms
         # cached decks, and this one wasn't cached yet.)
@@ -1743,7 +1941,7 @@ class Handler:
             user.id,
             requested_version,
             rank_ms,
-            len(final),
+            len(deck.stories()),
         )
         logging.info("rank_perf %s", trace.format_log_fields())
 
@@ -1778,7 +1976,7 @@ class Handler:
             candidates=int(trace.counts.get("candidates", 0)),
             feedback_total=int(trace.counts.get("feedback_total", 0)),
             model_cache=trace.labels.get("model_cache", ""),
-            stories=len(final),
+            stories=len(deck.stories()),
             fields=fields,
         )
         try:
@@ -1786,14 +1984,10 @@ class Handler:
         except Exception:
             logging.exception("rank_perf persist failed")
 
-        if _wants_background_tasks(cls.config, final):
+        if _wants_background_tasks(cls.config, deck):
             t = threading.Thread(
                 target=lambda: cls._warm_background_tasks(
-                    final,
-                    cls.db,
-                    cls.embedder,
-                    cls.config,
-                    cls.config.tldr_prefetch_per_combo,
+                    deck, cls.db, cls.embedder, cls.config
                 ),
                 daemon=True,
             )
@@ -1838,18 +2032,17 @@ class Handler:
         # so this rebuild (and every warm/cold-deck build until the next
         # regen) picks up the new rows instead of a stale snapshot.
         invalidate_candidate_pool()
-        cold_stories = build_cold_deck(cls.db, cls.config, embedder=cls.embedder)
-        cls._cold_stories = cold_stories
-        logging.info("cold_deck_rebuilt stories=%s", len(cold_stories))
+        cold_deck = build_cold_deck(cls.db, cls.config, embedder=cls.embedder)
+        cls._cold_deck = cold_deck
+        logging.info("cold_deck_rebuilt stories=%s", len(cold_deck.stories()))
 
     @classmethod
     def _warm_background_tasks(
         cls,
-        final: list[RankedStory],
+        deck: WindowDeck,
         db: Database,
         embedder: Embedder,
         config: Config,
-        per_combo: int,
     ) -> None:
         """Article body fetch (deduped by story ID) -> TLDR prefetch."""
         from pipeline import (
@@ -1857,10 +2050,13 @@ class Handler:
             fetch_and_cache_article_bodies,
         )
 
-        if config.article_fetch_max_per_run > 0 and final:
+        stories = deck.stories()
+        if config.article_fetch_max_per_run > 0 and stories:
             fetch_targets = select_article_fetch_candidates(
-                ranked=final,
-                dashboard_selected=final[: config.count],
+                ranked=stories,
+                dashboard_selected=serve_window(
+                    deck.window(DEFAULT_WINDOW), DEFAULT_WINDOW, time.time()
+                ).stories(),
                 db=db,
                 max_per_run=config.article_fetch_max_per_run,
                 max_age_days=config.article_fetch_max_age_days,
@@ -1889,11 +2085,11 @@ class Handler:
                         s.id for s in runnable
                     )
 
+        per_view = config.tldr_prefetch_per_view
         stale_per_run = config.tldr_prefetch_stale_per_run
-        date_top_n = config.tldr_prefetch_date_top_n
         if (
-            (per_combo > 0 or stale_per_run > 0 or date_top_n > 0)
-            and final
+            (per_view > 0 or stale_per_run > 0)
+            and stories
             and cls._tldr_prefetch_gate.claim(
                 time.monotonic(), config.tldr_prefetch_interval_seconds
             )
@@ -1901,11 +2097,10 @@ class Handler:
             try:
                 asyncio.run(
                     _prefetch_tldrs_for_ranked(
-                        final,
+                        deck,
                         db,
-                        per_combo,
+                        per_view,
                         stale_per_run,
-                        date_top_n,
                         stagger_s=config.tldr_prefetch_stagger_seconds,
                     )
                 )
@@ -1913,14 +2108,13 @@ class Handler:
                 cls._tldr_prefetch_gate.finish()
 
 
-def _wants_background_tasks(config: Config, ranked: list[RankedStory]) -> bool:
+def _wants_background_tasks(config: Config, deck: WindowDeck) -> bool:
     """Whether `Handler._warm_background_tasks` has anything to do for a deck:
     article bodies to fetch or summaries to prefetch."""
-    return bool(ranked) and (
+    return not deck.is_empty() and (
         config.article_fetch_max_per_run > 0
-        or config.tldr_prefetch_per_combo > 0
+        or config.tldr_prefetch_per_view > 0
         or config.tldr_prefetch_stale_per_run > 0
-        or config.tldr_prefetch_date_top_n > 0
     )
 
 
@@ -2236,6 +2430,9 @@ def _handle_flask_feedback(runtime: type[Handler]) -> Response:
         )
 
 
+_BADGE_KIND_RE = re.compile(r"[a-z_]{1,24}")
+
+
 def _parse_interaction_event(raw_event: object, user_id: int) -> InteractionEvent:
     """Validate one raw ledger event; raises ValueError on any bad field."""
     event_types = {"impression", "article_open", "comments_open", "dwell"}
@@ -2252,13 +2449,13 @@ def _parse_interaction_event(raw_event: object, user_id: int) -> InteractionEven
         "dashboard_version",
         "position",
         "sort_mode",
-        "age_filter",
+        "window",
         "source_filter",
         "ranker_arm",
         "occurred_at",
     }
     if not required.issubset(raw_event) or bool(
-        set(raw_event) - (required | {"duration_ms"})
+        set(raw_event) - (required | {"duration_ms", "badges"})
     ):
         raise ValueError("event has unexpected or missing fields")
 
@@ -2282,12 +2479,15 @@ def _parse_interaction_event(raw_event: object, user_id: int) -> InteractionEven
         or isinstance(story_id, bool)
         # Negative IDs are valid: non-HN stories use synthetic negative IDs.
         or story_id == 0
+        or not -(2**63) <= story_id < 2**63
         or not isinstance(dashboard_version, int)
         or isinstance(dashboard_version, bool)
         or dashboard_version < 0
+        or dashboard_version >= 2**63
         or not isinstance(position, int)
         or isinstance(position, bool)
         or position < 0
+        or position >= 2**63
     ):
         raise ValueError("story_id, dashboard_version, and position are invalid")
 
@@ -2295,24 +2495,25 @@ def _parse_interaction_event(raw_event: object, user_id: int) -> InteractionEven
     if not isinstance(event_type, str) or event_type not in event_types:
         raise ValueError("unknown event_type")
     occurred_at = raw_event["occurred_at"]
-    if (
-        not isinstance(occurred_at, (int, float))
-        or isinstance(occurred_at, bool)
-        or not math.isfinite(float(occurred_at))
-        or float(occurred_at) <= 0
-    ):
+    if not isinstance(occurred_at, (int, float)) or isinstance(occurred_at, bool):
+        raise ValueError("occurred_at must be a finite timestamp")
+    try:
+        timestamp = float(occurred_at)
+    except OverflowError as exc:
+        raise ValueError("occurred_at must be a finite timestamp") from exc
+    if not math.isfinite(timestamp) or timestamp <= 0:
         raise ValueError("occurred_at must be a finite timestamp")
 
     dimensions = tuple(
         raw_event[name]
-        for name in ("sort_mode", "age_filter", "source_filter", "ranker_arm")
+        for name in ("sort_mode", "window", "source_filter", "ranker_arm")
     )
     if any(
         not isinstance(value, str) or not value or len(value) > 64
         for value in dimensions
     ):
         raise ValueError("event dimensions must be short strings")
-    sort_mode, age_filter, source_filter, ranker_arm = cast(
+    sort_mode, window, source_filter, ranker_arm = cast(
         tuple[str, str, str, str], dimensions
     )
 
@@ -2329,6 +2530,19 @@ def _parse_interaction_event(raw_event: object, user_id: int) -> InteractionEven
     if event_type != "dwell" and duration_ms is not None:
         raise ValueError("only dwell events may include duration_ms")
 
+    # The card's badge kinds as shown (optional: older clients omit them),
+    # so per-badge outcomes can be read from the ledger.
+    badges = raw_event.get("badges", [])
+    if (
+        not isinstance(badges, list)
+        or len(badges) > 8
+        or any(
+            not isinstance(kind, str) or not _BADGE_KIND_RE.fullmatch(kind)
+            for kind in badges
+        )
+    ):
+        raise ValueError("badges must be a short list of badge kinds")
+
     return InteractionEvent(
         event_id=event_id,
         client_session_id=client_session_id,
@@ -2338,11 +2552,14 @@ def _parse_interaction_event(raw_event: object, user_id: int) -> InteractionEven
         dashboard_version=dashboard_version,
         position=position,
         sort_mode=sort_mode,
-        age_filter=age_filter,
+        # The time window goes in the ledger's age_filter column (no
+        # migration; it held the old Recent/Archive filter).
+        age_filter=window,
         source_filter=source_filter,
         ranker_arm=ranker_arm,
-        occurred_at=float(occurred_at),
+        occurred_at=timestamp,
         duration_ms=duration_ms,
+        badges=",".join(dict.fromkeys(cast("list[str]", badges))),
     )
 
 
@@ -2424,29 +2641,18 @@ def _handle_flask_interaction_events(runtime: type[Handler]) -> Response:
         )
 
 
-def _hn_thread_looks_active(story: Story, config: Config, now: float) -> bool:
-    """Whether an HN story's comment thread is recent and busy enough to
-    warrant a forced real-time Algolia refresh in tldr-detail.
+def _hot_summary_is_stale(story: Story, config: Config, now: float) -> bool:
+    """Whether a busy young thread has grown well past the comments its
+    cached summary read (``_growth_threshold``; the hot refresh keeps
+    ``comment_count`` live between regens)."""
+    from pipeline import _growth_threshold
 
-    Prewarm's comment data comes from ClickHouse, which lags 1-24h behind
-    live HN for brand-new comments. Refreshing every view would be wasteful,
-    so this gates on: post age within a recent window, an absolute comment
-    floor (skip small threads), and comment velocity (comments/hour) above a
-    threshold — a proxy for "this thread is still actively accruing
-    comments right now," since the endpoint has no direct fetch-timestamp
-    signal to compare against.
-    """
-    if not is_hn_source(story.source):
-        return False
-    if story.time <= 0:
-        return False
-    age_hours = (now - story.time) / 3600.0
-    if age_hours <= 0 or age_hours > config.tldr_refresh_recent_hours:
-        return False
-    comment_count = story.comment_count or 0
-    if comment_count < config.tldr_refresh_min_comments:
-        return False
-    return (comment_count / age_hours) >= config.tldr_refresh_min_comments_per_hour
+    fetched = story.comment_count_at_fetch or 0
+    return (
+        fetched > 0
+        and hn_thread_looks_active(story, config, now)
+        and (story.comment_count or 0) - fetched >= _growth_threshold(fetched)
+    )
 
 
 def _tldr_tap_should_probe(story: Story, config: Config, now: float) -> bool:
@@ -2537,6 +2743,10 @@ def _cached_tldr_reply(
 
 
 def _stale_tldr_fallback(db: Database, story_id: int, reason: str) -> TldrReply | None:
+    story = db.get_story(story_id)
+    if story is not None and _is_unfollowed_pointer(story):
+        # The only row may be a summary invented from the pointer note.
+        return None
     stale_tldr = db.get_any_tldr_for_story(story_id)
     if not stale_tldr:
         return None
@@ -2698,6 +2908,7 @@ def _generate_tldr_reply(
         article_body is None
         and story.url
         and src_kind is None
+        and story.source != AINEWS_SOURCE
         and len(story.self_text) < 500
         and _is_fetchable_article_url(story.url)
     )
@@ -2797,6 +3008,13 @@ def _generate_tldr_reply(
             # what the summarized comments actually reflect.
             story = replace(story, comment_count=live_comment_count)
             runtime.db.upsert_story(story)
+        stored = runtime.db.get_story_counts([story.id]).get(story.id)
+        if stored is not None and (stored.score, stored.comment_count) != (
+            tap.story.score,
+            tap.story.comment_count,
+        ):
+            # Feeds serve stored counts: tell clients to refetch.
+            runtime._bump_counts_version()
     elif isinstance(hn_updated, Exception):
         logging.error("Failed to dynamically fetch comments for TLDR: %r", hn_updated)
 
@@ -2850,6 +3068,9 @@ def _generate_tldr_reply(
             )
     elif isinstance(article_result, Exception):
         logging.error("TLDR article lane failed: %r", article_result)
+
+    if _is_unfollowed_pointer(story):
+        story = asyncio.run(_follow_pointer_thread(runtime.db, story))
 
     cache_key = _tldr_cache_key(
         title=story.title,
@@ -2908,6 +3129,9 @@ def _generate_tldr_reply(
         live_comment_count,
         story.comment_count_at_fetch,
     )
+    # Stored counts: hydration never lowers them, while Algolia's can lag
+    # the hot refresh's Firebase numbers.
+    stored = runtime.db.get_story_counts([story.id]).get(story.id)
     return _tldr_result_reply(
         runtime.db,
         story.id,
@@ -2915,6 +3139,8 @@ def _generate_tldr_reply(
         {
             "comment_count_live": live_comment_count,
             "comment_count_summarized": story.comment_count_at_fetch,
+            "points": stored.score if stored else story.score,
+            "comments": stored.comment_count if stored else story.comment_count,
         },
     )
 
@@ -2952,8 +3178,8 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
 
         # Recent, high-velocity HN threads bypass the cache hit below and the
         # dedicated "already cached" fast path, since CH prewarm data can be
-        # 1-24h stale for brand-new comments — see _hn_thread_looks_active.
-        needs_active_refresh = bool(story.top_comments) and _hn_thread_looks_active(
+        # 1-24h stale for brand-new comments — see hn_thread_looks_active.
+        needs_active_refresh = bool(story.top_comments) and hn_thread_looks_active(
             story, runtime.config, time.time()
         )
 
@@ -3109,6 +3335,7 @@ def _handle_flask_ranking_ready(runtime: type[Handler]) -> Response:
             "ok": True,
             "ready": view.version >= min_version,
             "current_version": view.current,
+            "counts_version": runtime._current_counts_version(),
         }
     )
 
@@ -3198,7 +3425,15 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
         user = _flask_user(runtime)
         if not user:
             return _flask_json_response({"error": "No session"}, status=401)
-        response = _flask_json_response(runtime._feed_for_user(user).to_dict())
+        window = request.args.get("window", DEFAULT_WINDOW)
+        if window not in WINDOWS:
+            return _flask_json_response(
+                {"error": "window must be one of " + ", ".join(WINDOWS)},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+        response = _flask_json_response(
+            runtime._feed_for_user(user, cast(Window, window)).to_dict()
+        )
         response.headers["Cache-Control"] = "no-store"
         return response
 
@@ -3256,7 +3491,15 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
             top_comments=story.top_comments or "",
             article_body=story.article_body or "",
         )
-        cached = runtime.db.get_tldr_cache(story_id, key)
+        if _hot_summary_is_stale(story, runtime.config, time.time()):
+            # A miss, so opening the story asks tldr-detail, which refreshes
+            # the busy thread's comments and rewrites the summary.
+            logging.info(
+                "tldr_detail story_id=%s result=prefetch_cache_stale", story_id
+            )
+            cached = None
+        else:
+            cached = runtime.db.get_tldr_cache(story_id, key)
         response = (
             _cached_tldr_reply(cached, story_id, key, "prefetch_cache_hit").response()
             if cached
@@ -3366,14 +3609,11 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
             _log_llm_spend_today(db)
             reddit_worker.submit()
 
-            if _wants_background_tasks(config, Handler._cold_stories):
+            cold_deck = Handler._cold_deck
+            if _wants_background_tasks(config, cold_deck):
                 t = threading.Thread(
                     target=lambda: Handler._warm_background_tasks(
-                        list(Handler._cold_stories),
-                        db,
-                        embedder,
-                        config,
-                        per_combo=config.tldr_prefetch_per_combo,
+                        cold_deck, db, embedder, config
                     ),
                     daemon=True,
                 )
@@ -3381,6 +3621,40 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
             logging.info("Regeneration complete.")
         except Exception as e:
             logging.exception("Background regeneration failed: %r", e)
+
+
+def hot_refresh_once(config: Config, db: Database) -> list[int]:
+    """Refresh live counts of the pool's busiest young HN threads; tell
+    clients (``counts_version``) when any stored count moved."""
+    from pipeline import rank_gate, refresh_hot_counts
+    from pipeline.candidate_cache import cached_candidate_stories
+
+    candidates = cached_candidate_stories()
+    rank_gate.wait_idle()
+    start = time.perf_counter()
+    probed, changed = refresh_hot_counts(config, db, candidates)
+    if changed:
+        Handler._bump_counts_version()
+    logging.info(
+        "hot_refresh probed=%s changed=%s ms=%.0f",
+        probed,
+        len(changed),
+        (time.perf_counter() - start) * 1000.0,
+    )
+    return changed
+
+
+def hot_refresh_loop(config: Config, db: Database) -> None:
+    """Between hourly regens, keep hot threads' points and comments live."""
+    interval = config.hot_refresh_interval_seconds
+    if interval <= 0:
+        return
+    while True:
+        time.sleep(interval)
+        try:
+            hot_refresh_once(config, db)
+        except Exception:
+            logging.exception("hot_refresh failed")
 
 
 def _quiet_third_party_loggers() -> None:
@@ -3425,10 +3699,14 @@ def main() -> None:
     Handler.regen_event = regen_event
     set_llm_usage_recorder(db.record_llm_usage)
     Handler._rebuild_cold_deck()
+    Handler.warm_recent_users()
 
     # Start regen thread
     t = threading.Thread(target=regen_loop, args=(config, regen_event, db), daemon=True)
     t.start()
+    threading.Thread(
+        target=hot_refresh_loop, args=(config, db), name="hot-refresh", daemon=True
+    ).start()
 
     # Start HTTP server
     server_host = "127.0.0.1"

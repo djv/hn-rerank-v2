@@ -11,6 +11,7 @@ import httpx
 import numpy as np
 from numpy.typing import NDArray
 
+from clients.tui.src.hn_rerank.models import View, Window
 from database import Database, FeedbackRecord, Story, StoryIdentityConflict, coerce_int
 
 # ruff: noqa: F401 — re-exports for the public pipeline namespace.
@@ -31,13 +32,10 @@ from .config import (
 
 from .ranking import (
     COMMENT_DEPTH_PENALTY,
-    DASHBOARD_QUEUE_SIZE,
     EXPLORE_PER_BADGE,
-    EXPLORE_PER_BADGE_NONHN,
     Embedder,
+    GRAVITY_TIME_SCALE,
     HOT_MIN_SCORE,
-    POPULAR_PER_COMBO,
-    PRIMARY_PER_COMBO,
     RankScoreContext,
     RankTrace,
     RankedComment,
@@ -49,6 +47,10 @@ from .ranking import (
     TOP_COMMENT_REPLIES_PER_CORE_THREAD,
     TOP_COMMENT_TOP_LEVEL_BUDGET,
     NULL_TRACE,
+    VIEW_SIZE,
+    WINDOW_SECONDS,
+    WindowDeck,
+    WindowViews,
     GOOD_TOPLEVEL_MIN_LEN,
     GOOD_TOPLEVEL_MIN_REPLIES,
     _LOG_TEXTLEN_SCALE,
@@ -58,7 +60,6 @@ from .ranking import (
     _MODEL_SCHEMA_VERSION,
     _NullTrace,
     _SIM_CHUNK_SIZE,
-    _assemble_combo_deck,
     _chunked_max_dot,
     _comment_rank_key,
     _extract_comments_recursive,
@@ -76,9 +77,12 @@ from .ranking import (
     _softmax_rows,
     _svm_personalization_features,
     _topk_mean,
+    assemble_window_deck,
     clean_text,
     compose_story_text,
     get_or_compute_embeddings,
+    hn_gravity,
+    in_window,
     join_top_comments,
     mmr_filter,
     rerank_candidates,
@@ -107,11 +111,13 @@ from .enrichment import (
     select_article_fetch_candidates,
     select_rss_article_prewarm,
 )
+from .ainews import AINEWS_SOURCE, AINEWS_TITLE_PREFIX, fetch_ainews_stories
 from .hn_dupes import (
     FeedbackDupeContext,
     _load_feedback_context,
     _matches_feedback,
     build_feedback_context,
+    canonical_outcomes,
     canonicalize_hn_dupes,
 )
 from .candidate_cache import (
@@ -128,9 +134,6 @@ from reddit_feed_cache import cache as reddit_feed_cache
 from reddit_limiter import limiter as reddit_limiter
 
 
-COLD_DECK_LIMIT = 100
-
-
 @dataclass(frozen=True)
 class RedditRefreshResult:
     feeds: int
@@ -143,23 +146,13 @@ class RedditRefreshResult:
         return self.changed_stories > 0 or self.hydrated_stories > 0
 
 
-def _combo_keys_for_story(story: Story, recent_cutoff: int) -> str:
-    age = "recent" if story.time >= recent_cutoff else "archive"
-    source = "hn" if is_hn_source(story.source) else "non-hn"
-    return f"{age}_{source} {age}_mixed"
-
-
 def cold_ranked_candidates(candidates: list[Story], now_ts: int) -> list[RankedStory]:
-    """Production zero-feedback scores and browser eligibility before selection."""
-    recent_cutoff = now_ts - 30 * 86400
+    """Production zero-feedback scores: HN gravity."""
     return [
         RankedStory(
             story=story,
-            score=story.score / ((now_ts - story.time) / 3600.0 + 2.0) ** 1.8,
+            score=hn_gravity(story.score, story.time, now_ts),
             best_match_title="",
-            is_non_hn=(not is_hn_source(story.source)),
-            is_recent=(story.time >= recent_cutoff),
-            combo_keys=_combo_keys_for_story(story, recent_cutoff),
         )
         for story in candidates
     ]
@@ -173,21 +166,16 @@ def build_cold_deck(
     trace: RankTrace | _NullTrace = NULL_TRACE,
     *,
     candidates: list[Story] | None = None,
-) -> list[RankedStory]:
-    """Build a gravity-sorted, badge-annotated fallback deck — no embeddings,
-    no personalization.
+) -> WindowDeck:
+    """The non-personalized deck: gravity-scored window views, no
+    embeddings.
 
     Uses the same tier-1 gravity formula as ``_score_and_rank`` so a
-    zero-vote user sees the same ranking as the cold deck.  See
-    ``fast_rerank_for_user`` for the 0-vote short-circuit.
-
-    Reuses the same production candidate legs as the
-    personalized dashboard via ``load_production_candidate_stories``, and
-    the same non-personalized Popular badge assembly (Hot/Top/Talk) as
-    ``rerank_candidates`` via ``_assemble_combo_deck``, so cold-start decks
-    have Popular and Archive combos populated instead of being flat
-    recent-only cards. Explore (Unsure/Novel/Similar) is intentionally
-    skipped — it's personalized and requires feedback to compute against.
+    zero-vote user sees the same ranking as the cold deck (see
+    ``fast_rerank_for_user``'s 0-vote short-circuit), over the same
+    production candidate legs (``load_production_candidate_stories``), and
+    the same window picks as ``rerank_candidates``, less Explore: it is
+    personalized and needs feedback to compute against.
 
     When *user_id* is provided, already-voted stories are excluded.
 
@@ -218,29 +206,66 @@ def build_cold_deck(
                 trace=trace,
             )
     if not candidates:
-        return []
-
-    recent_cutoff = now_ts - (30 * 86400)
-    ranked = cold_ranked_candidates(candidates, now_ts)
-
-    cand_scores = np.array([story.score for story in candidates])
-    cand_velocities = np.array(
-        [story.score / max((now_ts - story.time) / 3600.0, 0.1) for story in candidates]
-    )
-    story_id_to_idx = {story.id: idx for idx, story in enumerate(candidates)}
-
-    cold = _assemble_combo_deck(
-        ranked,
+        return WindowDeck()
+    return assemble_window_deck(
+        cold_ranked_candidates(candidates, now_ts),
         config=config,
-        recent_cutoff=recent_cutoff,
-        cand_scores=cand_scores,
-        cand_velocities=cand_velocities,
-        idx_for=story_id_to_idx.__getitem__,
-        embeddings_map=None,
-        explore=None,
+        now=now_ts,
         trace=trace,
     )
-    return cold[:COLD_DECK_LIMIT]
+
+
+def canonicalize_deck(
+    deck: WindowDeck,
+    db: Database,
+    *,
+    candidate_stories: Sequence[Story] = (),
+    user_id: int | None = None,
+    feedback_actions: tuple[str, ...] = ("up", "neutral"),
+    trace: RankTrace | _NullTrace = NULL_TRACE,
+    feedback_context: FeedbackDupeContext | None = None,
+    now: float | None = None,
+) -> WindowDeck:
+    """``canonicalize_hn_dupes`` over every story of *deck* at once (score
+    order decides which of two duplicates stays), applied to each view. A
+    canonical story that falls outside a view's window leaves that view;
+    Popular is re-sorted by gravity since its stories may have changed."""
+    now = time.time() if now is None else now
+    stories = deck.stories()
+    outcomes = canonical_outcomes(
+        stories,
+        db,
+        candidate_stories=candidate_stories,
+        user_id=user_id,
+        feedback_actions=feedback_actions,
+        trace=trace,
+        feedback_context=feedback_context,
+    )
+    outcome_of = {r.story.id: out for r, out in zip(stories, outcomes)}
+
+    def remap(
+        window: Window, view: View, items: tuple[RankedStory, ...]
+    ) -> list[RankedStory]:
+        kept: list[RankedStory] = []
+        for r in items:
+            out = outcome_of.get(r.story.id)
+            if out is None:
+                continue
+            if out.story.id != r.story.id and not in_window(
+                out.story.time, window, now
+            ):
+                continue
+            kept.append(replace(r, story=out.story))
+        if view == "popular":
+            kept.sort(
+                key=lambda r: hn_gravity(
+                    r.story.score, r.story.time, now, GRAVITY_TIME_SCALE[window]
+                ),
+                reverse=True,
+            )
+        return kept
+
+    return deck.map_views(remap)
 
 
 def load_production_candidate_stories(
@@ -317,6 +342,15 @@ def load_production_candidate_stories(
         configured_sources = tuple(
             dict.fromkeys(_rss_source_name(feed) for feed in config.rss.feeds)
         )
+        # AINews whole-issue rows stored before the per-topic split, and
+        # topic rows from its first layout (no discussion link, ids since
+        # replaced), stay in the DB but are no longer candidates.
+        ainews_filter = ""
+        if config.ainews_enabled:
+            configured_sources += (AINEWS_SOURCE,)
+            ainews_filter = (
+                "AND title NOT LIKE ? AND NOT (source = ? AND discussion_url IS NULL) "
+            )
         if configured_sources:
             placeholders = ",".join("?" for _ in configured_sources)
             rss_rows = db.execute(
@@ -324,11 +358,17 @@ def load_production_candidate_stories(
                 "       discussion_url, comment_count_at_fetch, self_text, top_comments, article_body "
                 "FROM stories "
                 f"WHERE time >= ? AND source IN ({placeholders}) "
+                f"{ainews_filter}"
                 f"{feedback_filter}"
                 "ORDER BY time DESC LIMIT ?",
                 (
                     cutoff_ts,
                     *configured_sources,
+                    *(
+                        (f"{AINEWS_TITLE_PREFIX}%", AINEWS_SOURCE)
+                        if ainews_filter
+                        else ()
+                    ),
                     *feedback_params,
                     config.recent_candidate_rss_limit,
                 ),
@@ -377,10 +417,10 @@ def _growth_threshold(fetched: int) -> int:
 def _needs_hn_prewarm(s: Story) -> bool:
     """Whether the regen prewarm should refresh this HN story's ``top_comments``.
 
-    Triggers when (a) ``top_comments`` is empty, (b) we have no fetch
-    history (``comment_count_at_fetch <= 0``), or (c) the live comment
-    count has grown meaningfully since the last prewarm (see
-    ``_growth_threshold``).
+    Triggers when (a) we have no fetch history (``comment_count_at_fetch
+    <= 0``), (b) ``top_comments`` is empty and any comment arrived since
+    the last fetch, or (c) the live comment count has grown meaningfully
+    since the last prewarm (see ``_growth_threshold``).
 
     The threshold catches the 1->284 "stale single-comment stub" case
     (WORKLOG 2026-06-29) and keeps small stories (10-50 fetched comments)
@@ -394,11 +434,11 @@ def _needs_hn_prewarm(s: Story) -> bool:
         return False
     if (s.comment_count or 0) <= 0:
         return False
-    if not s.top_comments:
-        return True
     fetched = s.comment_count_at_fetch or 0
     if fetched <= 0:
         return True
+    if not s.top_comments:
+        return (s.comment_count or 0) > fetched
     growth = (s.comment_count or 0) - fetched
     return growth >= _growth_threshold(fetched)
 
@@ -450,22 +490,29 @@ def _probe_eligible_threads(
     return eligible
 
 
-async def _probe_live_counts(
-    stories: Sequence[Story], timeout_s: float
-) -> dict[int, int]:
-    """Live Firebase descendants per story id.
+@dataclass(frozen=True)
+class LiveCounts:
+    """A story's live Firebase numbers; ``score`` is None when absent."""
 
-    Failures, unparseable bodies, and counts that move backwards are
-    silently omitted — the caller treats absence as "no known growth".
+    score: int | None
+    descendants: int
+
+
+async def _probe_live_items(
+    stories: Sequence[Story], timeout_s: float
+) -> dict[int, LiveCounts]:
+    """Live Firebase points and descendants per story id.
+
+    Failures and unparseable bodies are logged and omitted.
     """
-    counts: dict[int, int] = {}
+    counts: dict[int, LiveCounts] = {}
     if not stories:
         return counts
     sem = asyncio.Semaphore(_PROBE_CONCURRENCY)
 
     async with httpx.AsyncClient(timeout=timeout_s) as client:
 
-        async def _one(s: Story) -> tuple[int, int] | None:
+        async def _one(s: Story) -> tuple[int, LiveCounts] | None:
             async with sem:
                 try:
                     resp = await client.get(_FIREBASE_ITEM_URL.format(sid=s.id))
@@ -478,12 +525,14 @@ async def _probe_live_counts(
                     )
                     return None
                 try:
-                    body = resp.json()
-                    live = int((body or {}).get("descendants") or 0)
+                    body = resp.json() or {}
+                    score = body.get("score")
+                    live = LiveCounts(
+                        score=None if score is None else int(score),
+                        descendants=int(body.get("descendants") or 0),
+                    )
                 except Exception:
                     logging.warning("tldr_probe story_id=%s unparseable body", s.id)
-                    return None
-                if live <= (s.comment_count or 0):
                     return None
                 return (s.id, live)
 
@@ -491,6 +540,99 @@ async def _probe_live_counts(
             if result is not None:
                 counts[result[0]] = result[1]
     return counts
+
+
+async def _probe_live_counts(
+    stories: Sequence[Story], timeout_s: float
+) -> dict[int, int]:
+    """Live Firebase descendants per story id.
+
+    Return growth over the last hydrated snapshot, including growth already
+    recorded by a metadata refresh. Callers heal stored counts upwards only.
+    Failures and counts at or below the fetched marker are omitted.
+    """
+    items = await _probe_live_items(stories, timeout_s)
+    return {
+        s.id: items[s.id].descendants
+        for s in stories
+        if s.id in items and items[s.id].descendants > (s.comment_count_at_fetch or 0)
+    }
+
+
+def hn_thread_looks_active(story: Story, config: Config, now: float) -> bool:
+    """Whether an HN story's comment thread is recent and busy enough to
+    warrant a forced real-time Algolia refresh in tldr-detail, or a live
+    count refresh between regens (``refresh_hot_counts``).
+
+    Prewarm's comment data comes from ClickHouse, which lags 1-24h behind
+    live HN for brand-new comments. Refreshing every view would be wasteful,
+    so this gates on: post age within a recent window, an absolute comment
+    floor (skip small threads), and comment velocity (comments/hour) above a
+    threshold — a proxy for "this thread is still actively accruing
+    comments right now," since the endpoint has no direct fetch-timestamp
+    signal to compare against.
+    """
+    if not is_hn_source(story.source):
+        return False
+    if story.time <= 0:
+        return False
+    age_hours = (now - story.time) / 3600.0
+    if age_hours <= 0 or age_hours > config.tldr_refresh_recent_hours:
+        return False
+    comment_count = story.comment_count or 0
+    if comment_count < config.tldr_refresh_min_comments:
+        return False
+    return (comment_count / age_hours) >= config.tldr_refresh_min_comments_per_hour
+
+
+def refresh_hot_counts(
+    config: Config,
+    db: Database,
+    candidates: Sequence[Story],
+    *,
+    now: float | None = None,
+) -> tuple[int, list[int]]:
+    """Refresh live points and comment counts of the busiest young HN threads.
+
+    The candidate pool only refreshes at the hourly regen, so a thread
+    gaining 200 comments an hour looks frozen in between. Take the pool's
+    HN stories with their stored counts (``get_story_counts``; the pool's
+    copies are snapshots), keep threads passing ``hn_thread_looks_active``,
+    and probe the ``hot_refresh_max_stories`` fastest (comments/hour) on
+    Firebase. Counts only: no comment hydration, no LLM — a summary is
+    rewritten when a reader opens the story. Returns (probed, changed ids).
+    """
+    limit = config.hot_refresh_max_stories
+    now = time.time() if now is None else now
+    young = [
+        s
+        for s in candidates
+        if is_hn_source(s.source)
+        and 0 < now - s.time <= config.tldr_refresh_recent_hours * 3600.0
+    ]
+    if limit <= 0 or not young:
+        return 0, []
+    stored = db.get_story_counts([s.id for s in young])
+    stories = [
+        replace(s, score=c.score, comment_count=c.comment_count)
+        for s in young
+        if (c := stored.get(s.id)) is not None
+    ]
+    stories = [s for s in stories if hn_thread_looks_active(s, config, now)]
+    stories.sort(key=lambda s: (s.comment_count or 0) / (now - s.time), reverse=True)
+    stories = stories[:limit]
+    if not stories:
+        return 0, []
+    live = asyncio.run(_probe_live_items(stories, config.tldr_probe_timeout_seconds))
+    changed: list[int] = []
+    for s in stories:
+        counts = live.get(s.id)
+        if counts is None:
+            continue
+        score = s.score if counts.score is None else counts.score
+        if db.update_story_counts(s.id, score, counts.descendants):
+            changed.append(s.id)
+    return len(stories), changed
 
 
 # Regen-local probe memory: sid -> (probed_at, count_seen). Stops flat
@@ -647,7 +789,7 @@ async def fetch_candidates(
 
     One CH call does the work the old code did with ~125 Algolia calls:
 
-    `ch_client.query_live_window(days=config.days, min_score=5, limit=5000)`
+    `ch_client.query_live_window(days=config.days, min_score=5, limit=LIVE_WINDOW_LIMIT)`
     returns every live HN story from the past `config.days` (default 30) days
     with all fields populated
     (title, url, score, descendants, time, text). No per-story items
@@ -655,27 +797,50 @@ async def fetch_candidates(
 
     Archive seeds (`ch_seed`, `bq_seed`) are read from the DB only.
 
-    The 1-24h CH lag is acceptable: a 3h regen cycle means brand-new
-    stories surface within 4h. Algolia's single-story items API is
+    CH was near real time on 2026-09-29 (newest item under a minute old);
+    it has lagged 1-24h before. Algolia's single-story items API is
     preserved as a fallback for `ch_seed`/`bq_seed` lazy fetches.
 
     Comment text for the top-20 ranked cards is fetched by
     `prewarm_top_stories` on every dashboard render (not here).
     """
-    from ch_client import query_live_window
+    from ch_client import ChItem, is_transient_error, query_live_window
 
-    # 1. Live window from CH (replaces ~125 Algolia search + items calls)
-    try:
-        live_window = query_live_window(
-            days=config.days,
-            min_score=5,
-            limit=LIVE_WINDOW_LIMIT,
+    # 1. Live window from CH (replaces ~125 Algolia search + items calls).
+    # play.clickhouse.com fails transiently (DNS, "Too many simultaneous
+    # queries"), so retry before giving up on fresh scores for this regen;
+    # the deck still serves the live rows already in the DB.
+    live_window: list[ChItem] = []
+    for attempt, delay in enumerate((2.0, 8.0, None)):
+        try:
+            live_window = query_live_window(
+                days=config.days,
+                min_score=5,
+                limit=LIVE_WINDOW_LIMIT,
+            )
+            break
+        except Exception as exc:
+            if delay is None or not is_transient_error(exc):
+                logging.error(
+                    "fetch_candidates: CH live_window failed %d times (%r); "
+                    "live scores not refreshed this regen",
+                    attempt + 1,
+                    exc,
+                )
+                break
+            else:
+                logging.warning(
+                    "fetch_candidates: CH live_window attempt %d failed (%r)",
+                    attempt + 1,
+                    exc,
+                )
+                await asyncio.sleep(delay)
+    if len(live_window) >= LIVE_WINDOW_LIMIT:
+        logging.warning(
+            "fetch_candidates: CH live_window hit its %d-row cap; "
+            "lowest-scored live stories are cut",
+            LIVE_WINDOW_LIMIT,
         )
-    except Exception as exc:
-        logging.error(
-            "fetch_candidates: CH live_window failed (%r); live source empty", exc
-        )
-        live_window = []
 
     # 2. Build candidates from live window: insert new, update existing scores
     candidates: list[Story] = []
@@ -693,9 +858,14 @@ async def fetch_candidates(
         }
         existing = existing_stories.get(sid)
         if existing is not None:
-            new_score = coerce_int(item.get("points"), existing.score)
-            new_comments = coerce_int(
-                item.get("num_comments"), existing.comment_count or 0
+            # ClickHouse can lag the hot-thread refresh and TLDR hydration
+            # (Firebase/Algolia): never move stored counts backwards.
+            new_score = max(
+                existing.score, coerce_int(item.get("points"), existing.score)
+            )
+            new_comments = max(
+                existing.comment_count or 0,
+                coerce_int(item.get("num_comments"), existing.comment_count or 0),
             )
             has_changes = new_score != existing.score or new_comments != (
                 existing.comment_count or 0
@@ -744,7 +914,21 @@ async def fetch_candidates(
             days=config.days,
             exclude_urls=exclude_urls,
             db=db,
+            skip_title_prefixes=(AINEWS_TITLE_PREFIX,) if config.ainews_enabled else (),
         )
+        if config.ainews_enabled:
+            # One optional source must not abort the regen (HN deck included).
+            try:
+                rss_stories += await fetch_ainews_stories(
+                    config.ainews_feed_url,
+                    config.days,
+                    exclude_urls,
+                    db,
+                    max_tweets_per_run=config.ainews_max_tweets_per_run,
+                    now=time.time(),
+                )
+            except Exception:
+                logging.exception("ainews: source failed; regen continues without it")
         deduped_candidates: list[Story] = list(candidates) + rss_stories
     else:
         deduped_candidates = list(candidates)
@@ -766,8 +950,9 @@ def fast_rerank_for_user(
     embedder: Embedder,
     user_id: int,
     trace: RankTrace | _NullTrace = NULL_TRACE,
-) -> list[RankedStory]:
-    """Fast rerank for a specific user. Called on each dashboard request."""
+) -> WindowDeck:
+    """This user's deck: every window's views, deduplicated. Run by the
+    server's per-user warm."""
     trace.set_count("user_id", user_id)
 
     # One feedback snapshot serves every stage of this rank: the cold-deck
@@ -781,33 +966,27 @@ def fast_rerank_for_user(
         # Zero-feedback cold deck is a pure gravity/time ranking — no
         # embeddings needed, so don't force the (embedder-requiring)
         # candidate pool cache here; keep the direct, uncached load.
-        cold_deck = build_cold_deck(db, config, trace=trace)
-        cold_final = canonicalize_hn_dupes(
-            cold_deck,
+        cold_final = canonicalize_deck(
+            build_cold_deck(db, config, trace=trace),
             db,
-            selected_limit=config.count,
             user_id=user_id,
             feedback_actions=tuple(config.model.dedup_exclude_actions),
             trace=trace,
         )
-        trace.set_count(
-            "deck_nonhn_final",
-            sum(1 for r in cold_final if not is_hn_source(r.story.source)),
-        )
+        _count_nonhn(trace, "deck_nonhn_final", cold_final)
         return cold_final
 
     with trace.stage("candidate_sql"):
         pool = get_candidate_pool(db, config, embedder, trace=trace)
         voted_ids = frozenset(f.story_id for f in feedback)
     if not pool.stories:
-        return []
+        return WindowDeck()
 
     with trace.stage("candidate_embedding"):
         candidates, cand_embeddings = pool.without_feedback(voted_ids)
-    if trace is not None:
-        trace.set_count("candidates", len(candidates))
+    trace.set_count("candidates", len(candidates))
     if not candidates:
-        return []
+        return WindowDeck()
 
     # Built once per request and threaded into badge assembly so the
     # Explore passes (Unsure/Novel/Similar) can skip-and-backfill past
@@ -817,7 +996,7 @@ def fast_rerank_for_user(
     feedback_context = build_feedback_context(
         feedback, tuple(config.model.dedup_exclude_actions)
     )
-    ranked = rerank_candidates(
+    deck = rerank_candidates(
         db=db,
         config=config,
         embedder=embedder,
@@ -827,13 +1006,10 @@ def fast_rerank_for_user(
         trace=trace,
         is_feedback_match=lambda s: _matches_feedback(s, feedback_context),
     )
-    trace.set_count(
-        "deck_nonhn_pre_dedup",
-        sum(1 for r in ranked if not is_hn_source(r.story.source)),
-    )
+    _count_nonhn(trace, "deck_nonhn_pre_dedup", deck)
 
     return finalize_ranked_deck(
-        ranked,
+        deck,
         candidates,
         cand_embeddings,
         db,
@@ -846,8 +1022,14 @@ def fast_rerank_for_user(
     )
 
 
+def _count_nonhn(trace: RankTrace | _NullTrace, name: str, deck: WindowDeck) -> None:
+    trace.set_count(
+        name, sum(1 for r in deck.stories() if not is_hn_source(r.story.source))
+    )
+
+
 def finalize_ranked_deck(
-    ranked: list[RankedStory],
+    deck: WindowDeck,
     candidates: list[Story],
     cand_embeddings: NDArray[np.float32],
     db: Database,
@@ -858,8 +1040,9 @@ def finalize_ranked_deck(
     trace: RankTrace | _NullTrace = NULL_TRACE,
     feedback: list[FeedbackRecord] | None = None,
     feedback_context: FeedbackDupeContext | None = None,
-) -> list[RankedStory]:
-    """Shared serving/evaluation deduplication and canonicalization boundary.
+) -> WindowDeck:
+    """Shared serving/evaluation deduplication and canonicalization boundary:
+    both run once over every story of the deck, and apply to each view.
 
     *feedback* / *feedback_context* are this user's feedback (and its
     dedup index for ``config.model.dedup_exclude_actions``) when the caller
@@ -869,34 +1052,33 @@ def finalize_ranked_deck(
         id_to_emb: dict[int, NDArray[np.float32]] = {
             s.id: vec for s, vec in zip(candidates, cand_embeddings)
         }
-        deduped = _apply_dedup_to_ranked(
-            ranked,
-            db,
-            config,
-            user_id,
-            embeddings=id_to_emb,
-            embedder=embedder,
-            feedback=feedback,
+        survivors = {
+            r.story.id
+            for r in _apply_dedup_to_ranked(
+                deck.stories(),
+                db,
+                config,
+                user_id,
+                embeddings=id_to_emb,
+                embedder=embedder,
+                feedback=feedback,
+            )
+        }
+        deduped = deck.map_views(
+            lambda _w, _v, items: (r for r in items if r.story.id in survivors)
         )
-    trace.set_count(
-        "deck_nonhn_post_dedup",
-        sum(1 for r in deduped if not is_hn_source(r.story.source)),
-    )
+    _count_nonhn(trace, "deck_nonhn_post_dedup", deduped)
     with trace.stage("hn_dupes"):
-        final = canonicalize_hn_dupes(
+        final = canonicalize_deck(
             deduped,
             db,
             candidate_stories=candidates,
-            selected_limit=config.count,
             user_id=user_id,
             feedback_actions=tuple(config.model.dedup_exclude_actions),
             trace=trace,
             feedback_context=feedback_context,
         )
-    trace.set_count(
-        "deck_nonhn_final",
-        sum(1 for r in final if not is_hn_source(r.story.source)),
-    )
+    _count_nonhn(trace, "deck_nonhn_final", final)
     return final
 
 

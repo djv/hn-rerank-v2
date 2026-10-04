@@ -71,6 +71,22 @@ def hypothesis_examples() -> Callable[[int], int]:
 
 
 @pytest.fixture(autouse=True)
+def no_live_ainews(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regen's AINews leg would fetch the real feed and fxtwitter.
+
+    Stubs the name ``fetch_candidates`` calls; tests/test_ainews.py calls
+    ``pipeline.ainews.fetch_ainews_stories`` directly with fakes.
+    """
+    import pipeline
+    from database import Story
+
+    async def no_stories(*args: object, **kwargs: object) -> list[Story]:
+        return []
+
+    monkeypatch.setattr(pipeline, "fetch_ainews_stories", no_stories)
+
+
+@pytest.fixture(autouse=True)
 def reset_reddit_singletons() -> Iterator[None]:
     """Reset module-level singletons before and after every test.
 

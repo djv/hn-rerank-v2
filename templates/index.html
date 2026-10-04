@@ -218,33 +218,20 @@
       font-weight: 600;
     }
 
-    .tab-btn--segmented {
-      flex: 1;
-      padding: 0.3rem;
-      border-radius: 0;
+    .window-picker {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      margin-bottom: 0.6rem;
       font-size: 0.75rem;
-      white-space: nowrap;
-      border-right: none;
+      color: var(--pico-muted-color);
     }
-    .tab-btn--segmented:first-child {
-      border-top-left-radius: 6px;
-      border-bottom-left-radius: 6px;
-    }
-    .tab-btn--segmented:last-child {
-      border-top-right-radius: 6px;
-      border-bottom-right-radius: 6px;
-      border-right: 1px solid var(--pico-muted-border-color);
-    }
-    .tab-btn--segmented:hover {
-      background: color-mix(in srgb, #6c757d 12%, var(--pico-card-background-color));
-      border-color: #6c757d;
-      color: var(--pico-color);
-    }
-    .tab-btn--segmented.active {
-      background: #6c757d;
-      color: white;
-      border-color: #6c757d;
-      font-weight: 600;
+    .window-picker select {
+      flex: 1;
+      margin: 0;
+      padding: 0.3rem 0.5rem;
+      font-size: 0.8rem;
+      height: auto;
     }
     .swipe-keys {
       display: grid;
@@ -848,25 +835,12 @@
 
       .tab-bar--sort {
         display: grid;
-        grid-template-columns: repeat(4, 1fr);
+        grid-template-columns: repeat(3, 1fr);
         gap: 0.3rem;
         margin-bottom: 0;
       }
 
-      .tab-bar--segmented {
-        display: grid;
-        gap: 0.3rem;
-        margin-bottom: 0;
-      }
-
-      .tab-bar[data-filter="age"] {
-        grid-template-columns: repeat(2, 1fr);
-      }
-
-      .tab-btn--segmented {
-        border-right: 1px solid var(--pico-muted-border-color);
-        border-radius: 6px;
-      }
+      .window-picker { margin-bottom: 0; }
 
       .swipe-keys { display: none; }
 
@@ -929,16 +903,16 @@
 
   <script type="application/json" id="feed-data">{{ feed | tojson }}</script>
   <script>
-    // The deck comes with the page as the same JSON snapshot /api/feed serves,
-    // and every card is built from it, like the terminal client: one feed,
-    // one reload path, one 60s version poll, votes sent in order, and one
-    // summary request per story.
+    // The default time window comes with the page as the same JSON snapshot
+    // /api/feed?window= serves, and every card is built from it, like the
+    // terminal client: one feed per window, one reload path, one 60s version
+    // poll, votes sent in order, and one summary request per story.
     const storiesContainer = document.getElementById('stories');
     const toastEl = document.getElementById('toast');
     const queueLoadingEl = document.getElementById('queue-loading');
     const statusEl = document.getElementById('queueStatus');
     const sortTabs = Array.from(document.querySelectorAll('.tab-btn[data-sort]'));
-    const ageTabs = Array.from(document.querySelectorAll('.tab-btn[data-age]'));
+    const windowSelect = document.getElementById('window-select');
     const voteBar = document.querySelector('.vote-bar');
     const sidePanel = document.querySelector('.swipe-side');
     const filterToggleBtn = document.querySelector('.filter-toggle-btn');
@@ -946,7 +920,13 @@
     // Every view shows at most this many cards; the rest slide in as cards
     // ahead of them are voted.
     const VIEW_LIMIT = 12;
-    const SORTS = ['recommended', 'popular', 'explore', 'date'];
+    const SORTS = ['recommended', 'popular', 'explore'];
+    // Time windows (pipeline WINDOWS), nested by age; archive is > 30 days.
+    const WINDOWS = ['12h', '1d', '1w', '1m', 'archive'];
+    // Popular's gravity clock per window (pipeline GRAVITY_TIME_SCALE): age
+    // counts in units of this many hours.
+    const GRAVITY_TIME_SCALE = { '12h': 4, '1d': 8, '1w': 56, '1m': 240, archive: 2920 };
+    const FEED_API_VERSION = 2;
     const REQUEST_TIMEOUT_MS = 10000;
     // tldr-detail may hydrate the article and call the LLM (~2 min worst case).
     const GENERATION_TIMEOUT_MS = 150000;
@@ -961,10 +941,21 @@
     const INTERACTION_BATCH_SIZE = 64;
     const INTERACTION_RETRY_DELAY_MS = 5000;
 
-    let feed = null;
+    let feed = null;                    // the selected window's feed
     let storiesById = new Map();
     let currentSort = 'recommended';
-    let currentAge = 'recent';
+    let currentWindow = '1w';
+    // The last time window picked opens next visit (the page embeds 1w).
+    const WINDOW_KEY = 'hnWindow';
+    // Feeds by window, all of one deck version. A newer version replaces
+    // them all; a saved vote bumps the generation, so a background request
+    // sent before it can't bring back data from before the vote.
+    const feeds = new Map();
+    let feedGeneration = 0;
+    let targetVersion = 0;              // the newest version the server promised
+    let countsVersion = null;           // last successfully refreshed count revision
+    const windowsTried = new Set();     // "window@version" fetched in the background
+    let windowFetch = null;             // the one background feed request
     // Interaction-event dimension; the deck has no source filter.
     const currentSource = 'mixed';
     let activeId = null;
@@ -974,7 +965,8 @@
     // Votes this session: hidden at once, before the server hears of them.
     const rated = new Set();
     const history = [];                 // {story, action}, newest last, for undo
-    const voteViews = new Map();        // story id -> view keys it was voted from
+    const voteViews = new Map();        // story id -> {window, keys} it was voted from
+    const voteRevisions = new Map();    // latest optimistic action for each story
     const restored = new Map();         // undone stories, until the ranked deck lands
     const exploreOrders = new Map();    // view key -> client-shuffled order
     let voteChain = Promise.resolve();
@@ -982,6 +974,7 @@
     let reloadInFlight = null;
     let toastTimer = null;
     const summaries = new Map();        // story id -> {text, provisional}
+    const renderedSummaries = new WeakMap(); // content element -> last drawn summary
     const summaryRequests = new Map();  // story id -> {promise, generate}
     const summaryErrors = new Map();    // story id -> message
     const retryAt = new Map();          // story id -> no generation before (ms)
@@ -1008,7 +1001,10 @@
     // Feed and views ------------------------------------------------------
 
     function parseFeed(data) {
-      if (!data || data.api_version !== 1 || !Array.isArray(data.stories) ||
+      if (!data || data.api_version !== FEED_API_VERSION) {
+        throw new Error('This page is older than the server; reload it to update.');
+      }
+      if (!WINDOWS.includes(data.window) || !Array.isArray(data.stories) ||
           typeof data.orders !== 'object' || data.orders === null) {
         throw new Error('Unsupported feed response');
       }
@@ -1025,16 +1021,23 @@
       }
     }
 
-    function viewKey() {
-      return `${currentSort}:${currentAge}`;
+    function feedPath(name) {
+      return `/api/feed?window=${encodeURIComponent(name)}`;
     }
 
-    // Story order for a "<sort>:<age>" view. Explore is a discovery deck:
-    // shuffled here, since the server order only reshuffles per version.
-    // Stories already placed keep their position; new ones go after them.
+    function viewKey() {
+      return `${currentWindow}:${currentSort}`;
+    }
+
+    // Story order for a "<window>:<sort>" view, as the server orders it.
+    // Explore is a discovery deck: shuffled here, since the server sends it
+    // in model-score order. Stories already placed keep their position; new
+    // ones go after them.
     function viewOrder(key) {
-      const order = (feed && feed.orders[key]) || [];
-      if (!key.startsWith('explore:')) return order;
+      const [name, sort] = key.split(':');
+      const source = name === currentWindow ? feed : feeds.get(name);
+      const order = (source && source.orders[sort]) || [];
+      if (sort !== 'explore') return order;
       const members = new Set(order);
       const kept = (exploreOrders.get(key) || []).filter(id => members.has(id));
       const placed = new Set(kept);
@@ -1048,25 +1051,36 @@
       return shuffled.slice();
     }
 
-    // Put an undone story back in the views it was voted from, where the
-    // server orders it: Date by time, the rest by rank score.
+    // Put an undone story back in the views of the window it was voted
+    // from, where the server orders it: Popular by HN gravity on that
+    // window's clock, the rest by rank score.
     function restoreStory(story) {
-      if (!feed) return;
-      if (!storiesById.has(story.id)) {
-        feed.stories.push(story);
-        storiesById.set(story.id, story);
+      const entry = voteViews.get(story.id);
+      const target = entry && (entry.window === currentWindow ? feed : feeds.get(entry.window));
+      if (!target) return;
+      if (!target.stories.some(item => item.id === story.id)) {
+        target.stories.push(story);
       }
-      for (const key of voteViews.get(story.id) || []) {
-        const order = feed.orders[key] || (feed.orders[key] = []);
+      if (target === feed) storiesById.set(story.id, story);
+      const byId = new Map(target.stories.map(item => [item.id, item]));
+      const now = Date.now() / 1000;
+      const scale = GRAVITY_TIME_SCALE[entry.window] || 1;
+      for (const key of entry.keys) {
+        const order = target.orders[key] || (target.orders[key] = []);
         if (order.includes(story.id)) continue;
-        const rank = item => (key.startsWith('date:') ? item.time : item.rank_score);
-        let index = order.findIndex(id => rank(storiesById.get(id)) < rank(story));
+        const rank = item => (key === 'popular'
+          ? item.points / Math.pow(Math.max(0, now - item.time) / 3600 / scale + 2, 1.8)
+          : item.rank_score);
+        let index = order.findIndex(id => rank(byId.get(id)) < rank(story));
         if (index < 0) index = order.length;
         order.splice(index, 0, story.id);
       }
     }
 
-    function setFeed(next) {
+    // Make *next* the feed on screen. A fresh one (just from the server)
+    // also replaces the cards, summaries and counts; a cached window's feed
+    // keeps them.
+    function showFeed(next, fresh) {
       feed = next;
       storiesById = new Map(next.stories.map(story => [story.id, story]));
       if (feed.ready) {
@@ -1075,21 +1089,75 @@
         // Until the reranked deck lands it may lack undone stories.
         restored.forEach(restoreStory);
       }
-      // Cards and summaries are rebuilt from the new deck (counts and text
-      // may have changed), except the open card's.
-      for (const [id, card] of cardEls) {
-        if (id !== activeId) {
-          card.remove();
-          cardEls.delete(id);
+      if (fresh) {
+        // Cards and summaries are rebuilt from the new deck (counts and text
+        // may have changed), except the open card's.
+        for (const [id, card] of cardEls) {
+          if (id !== activeId) {
+            card.remove();
+            cardEls.delete(id);
+          }
         }
+        for (const id of Array.from(summaries.keys())) {
+          if (id !== activeId) summaries.delete(id);
+        }
+        cacheMissAt.clear();
+        if (votesInFlight === 0) setVoteCounts(feed.feedback_counts || {});
+        const active = storiesById.get(activeId);
+        if (active) patchCardMetadata(active, next.version);
       }
-      for (const id of Array.from(summaries.keys())) {
-        if (id !== activeId) summaries.delete(id);
-      }
-      cacheMissAt.clear();
-      if (votesInFlight === 0) setVoteCounts(feed.feedback_counts || {});
       tintByRank();
+    }
+
+    // A feed the server sent. An older deck version is ignored; a newer one
+    // replaces every cached window. The selected window's feed goes on
+    // screen, another window's waits in the cache.
+    function setFeed(next) {
+      const version = feed ? feed.version : -1;
+      if (next.version < version) return;
+      if (next.version > version) {
+        feeds.clear();
+        feedGeneration += 1;
+      }
+      targetVersion = Math.max(targetVersion, next.target_version);
+      next = { ...next, target_version: targetVersion, ready: next.version >= targetVersion };
+      feeds.set(next.window, next);
+      if (next.window !== currentWindow) return;
+      showFeed(next, true);
       render();
+      prefetchWindows();
+    }
+
+    // After a window is shown, fetch its neighbours' feeds in the
+    // background: one request at a time, each window once per deck version,
+    // never summaries. An answer from before a newer deck or a saved vote is
+    // dropped, and none ever replaces the window on screen.
+    function prefetchWindows() {
+      if (!feed || feed.loading || windowFetch) return;
+      const index = WINDOWS.indexOf(currentWindow);
+      const version = feed.version;
+      const name = [WINDOWS[index + 1], WINDOWS[index - 1]].find(
+        w => w && !feeds.has(w) && !windowsTried.has(`${w}@${version}`));
+      if (!name) return;
+      windowsTried.add(`${name}@${version}`);
+      const generation = feedGeneration;
+      windowFetch = (async () => {
+        try {
+          const resp = await request(feedPath(name));
+          if (!resp.ok) return;
+          const data = parseFeed(await resp.json());
+          if (generation === feedGeneration && data.window === name && feed &&
+              data.version === feed.version && name !== currentWindow && !feeds.has(name)) {
+            feeds.set(name, { ...data, target_version: targetVersion,
+                                ready: data.version >= targetVersion });
+          }
+        } catch (err) {
+          console.debug('Background window fetch failed', err);  // passive
+        } finally {
+          windowFetch = null;
+          prefetchWindows();
+        }
+      })();
     }
 
     // Rebuild the queue for the current view. The active story stays active
@@ -1165,9 +1233,9 @@
     function updateStatus() {
       const ranking = feed && !feed.ready;
       queueLoadingEl.hidden = activeId !== null;
-      queueLoadingEl.textContent = !feed || ranking
+      queueLoadingEl.textContent = !feed || feed.loading || ranking
         ? 'Loading more stories…'
-        : 'Nothing left in this view. Try another sort, or refresh.';
+        : 'Nothing left in this view. Try another sort or time window, or refresh.';
       if (statusEl) {
         statusEl.textContent = `Queued ${visible.length}` + (ranking ? ' · ranking…' : '');
       }
@@ -1187,20 +1255,36 @@
       if (filterName === 'sort' && value !== currentSort) {
         currentSort = value;
         sortTabs.forEach(tab => tab.classList.toggle('active', tab.dataset.sort === value));
-      } else if (filterName === 'age' && value !== currentAge) {
-        currentAge = value;
-        ageTabs.forEach(tab => tab.classList.toggle('active', tab.dataset.age === value));
+      } else if (filterName === 'window' && value !== currentWindow && WINDOWS.includes(value)) {
+        currentWindow = value;
+        if (windowSelect) windowSelect.value = value;
+        try { localStorage.setItem(WINDOW_KEY, value); } catch (err) { /* private mode */ }
+        const cached = feeds.get(value);
+        if (cached) {
+          showFeed(cached, false);
+        } else {
+          // Nothing cached for this window yet: an empty view of the same
+          // deck version until its feed arrives.
+          showFeed({ ...feed, window: value, stories: [], orders: {}, loading: true }, false);
+          reload();
+        }
       } else {
         return;
       }
       // One card shows at a time: a new view starts at its first story.
       render(FIRST);
       focusActiveCard();
+      if (filterName === 'window') prefetchWindows();
     }
 
     function cycleSort(delta) {
       const index = SORTS.indexOf(currentSort);
       setFilter('sort', SORTS[(index + delta + SORTS.length) % SORTS.length]);
+    }
+
+    function cycleWindow(delta) {
+      const index = WINDOWS.indexOf(currentWindow);
+      setFilter('window', WINDOWS[(index + delta + WINDOWS.length) % WINDOWS.length]);
     }
 
     // Rank 1 (top) = saturated orange, the last rank a pale tint. One hue,
@@ -1222,6 +1306,7 @@
         storyId: String(story.id), dashboardVersion: String(version),
         rankerArm: 'baseline', storySource: story.source,
         articleUrl: story.article_url, commentsUrl: story.comments_url,
+        badges: (story.badge_details || []).map(badge => badge.kind).join(','),
       });
       const tint = rankTint.get(story.id);
       if (tint && card.style) {
@@ -1293,6 +1378,29 @@
       return card;
     }
 
+    function patchCardMetadata(story, version) {
+      const card = cardEls.get(story.id);
+      if (!card) return;
+      const fresh = feedCard(story, version);
+      card.replaceChild(fresh.children[0], card.children[0]);
+      Object.assign(card.dataset, fresh.dataset);
+    }
+
+    function patchCounts(id, data) {
+      if (!Number.isFinite(data.points) ||
+          !(data.comments === null || Number.isFinite(data.comments))) return;
+      for (const cached of feeds.values()) {
+        for (const story of cached.stories) {
+          if (story.id === id) Object.assign(story, {points: data.points, comments: data.comments});
+        }
+      }
+      const story = storiesById.get(id);
+      if (story) {
+        Object.assign(story, {points: data.points, comments: data.comments});
+        patchCardMetadata(story, feed.version);
+      }
+    }
+
     // Network ---------------------------------------------------------------
 
     function routePrefix() {
@@ -1330,28 +1438,33 @@
 
     // Freshness -------------------------------------------------------------
 
-    // The one way a new deck arrives: the poller, and a manual refresh.
+    // The one way the selected window's feed arrives: the poller, a manual
+    // refresh, and selecting a window that isn't cached.
     async function reload({ manual = false } = {}) {
       if (manual) {
         // Like a fresh page: regenerate the open summary too.
         if (activeId !== null) loadSummary(activeId, { force: true });
       }
-      if (reloadInFlight) return reloadInFlight;
-      reloadInFlight = (async () => {
+      const name = currentWindow;
+      if (reloadInFlight?.window === name) return reloadInFlight.promise;
+      const promise = (async () => {
         try {
-          const resp = await request('/api/feed');
+          const resp = await request(feedPath(name));
           if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
           setFeed(parseFeed(await resp.json()));
+          return true;
         } catch (err) {
           console.error('Failed to refresh deck', err);
-          if (manual) showToast(`Refresh failed: ${err.message}`, 'error');
+          if (manual || feed?.loading) showToast(`Refresh failed: ${err.message}`, 'error');
+          return false;
         } finally {
-          reloadInFlight = null;
+          if (reloadInFlight?.promise === promise) reloadInFlight = null;
           updateStatus();
         }
       })();
+      reloadInFlight = { window: name, promise };
       updateStatus();
-      return reloadInFlight;
+      return promise;
     }
 
     // Every minute (and when the tab comes back): reload when the server has
@@ -1371,7 +1484,17 @@
       }
       if (feed !== snapshot || !Number.isFinite(data?.current_version)) return;
       const newer = snapshot.ready ? data.current_version !== snapshot.version : data.ready === true;
-      if (newer) reload();
+      const nextCounts = Number.isFinite(data.counts_version) ? data.counts_version : null;
+      const countsChanged = countsVersion !== null && nextCounts !== null && nextCounts !== countsVersion;
+      if (countsVersion === null) countsVersion = nextCounts;
+      if (newer || countsChanged) {
+        if (countsChanged) {
+          feedGeneration += 1;
+          for (const name of feeds.keys()) if (name !== currentWindow) feeds.delete(name);
+          windowsTried.clear();
+        }
+        reload().then(ok => { if (ok && nextCounts !== null) countsVersion = nextCounts; });
+      }
     }
 
     // Votes -------------------------------------------------------------------
@@ -1392,7 +1515,10 @@
       rated.add(story.id);
       restored.delete(story.id);
       history.push({ story, action });
-      voteViews.set(story.id, Object.keys(feed.orders).filter(key => feed.orders[key].includes(story.id)));
+      voteViews.set(story.id, {
+        window: currentWindow,
+        keys: Object.keys(feed.orders).filter(key => feed.orders[key].includes(story.id)),
+      });
       adjustVoteCount(action, 1);
       render();
     }
@@ -1429,6 +1555,8 @@
     // they were made. A failed one is reverted, never retried: the server may
     // or may not have it.
     function submit(story, action, undoneAction = null) {
+      const revision = (voteRevisions.get(story.id) || 0) + 1;
+      voteRevisions.set(story.id, revision);
       votesInFlight += 1;
       voteChain = voteChain.then(async () => {
         let target;
@@ -1442,17 +1570,28 @@
           }
           target = data.target_version;
         } catch (err) {
-          if (action === 'clear') {
-            applyVote(story, undoneAction || 'neutral');
-          } else {
-            applyUndo(story);
+          const latest = voteRevisions.get(story.id) === revision;
+          if (latest) {
+            if (action === 'clear') {
+              applyVote(story, undoneAction || 'neutral');
+            } else {
+              applyUndo(story);
+            }
           }
-          showToast(`Vote not confirmed, so the story is back; check before voting again. (${err.message})`, 'error');
+          const notice = latest ? 'Vote not confirmed, so the story is back; check before voting again.'
+            : 'Earlier vote not confirmed; your latest choice is still shown.';
+          showToast(`${notice} (${err.message})`, 'error');
           return;
         }
+        targetVersion = Math.max(targetVersion, target);
         if (feed && target > feed.version) {
-          // The poller loads the reranked deck once the server has it.
-          feed = { ...feed, target_version: target, ready: false };
+          // Every cached window is now stale; the poller loads the reranked
+          // deck once the server has it.
+          feedGeneration += 1;
+          for (const [name, cached] of feeds) {
+            feeds.set(name, { ...cached, target_version: targetVersion, ready: false });
+          }
+          feed = feeds.get(currentWindow) || { ...feed, target_version: targetVersion, ready: false };
           updateStatus();
         }
       }).catch(err => console.error(err)).finally(() => {
@@ -1563,6 +1702,7 @@
     }
 
     function keepSummary(id, data) {
+      patchCounts(id, data);
       // Stale or retryable text is shown but asked for again later.
       const summary = { text: data.tldr, provisional: !!(data.stale || data.retryable) };
       summaries.set(id, summary);
@@ -1592,17 +1732,26 @@
       const loading = !!request && (request.generate || id === activeId);
       delete contentDiv.dataset.error;
       if (summary && !(loading && summary.provisional)) {
-        contentDiv.innerHTML = parseSimpleMarkdown(summary.text);
-        styleTldrLabels(contentDiv);
-        enhanceTldrContent(contentDiv, { stale: summary.provisional });
-        if (!summary.provisional) ensureTldrRefreshButton(id, contentDiv);
-      } else if (loading) {
-        contentDiv.textContent = 'Loading TLDR...';
-      } else if (summaryErrors.has(id)) {
-        contentDiv.textContent = 'TLDR: ' + summaryErrors.get(id);
-        contentDiv.dataset.error = 'true';
+        const rendered = renderedSummaries.get(contentDiv);
+        // Passive metadata refreshes revisit the active story. Leave identical
+        // summary nodes attached so collapsed sections and scroll survive.
+        if (!rendered || rendered.text !== summary.text || rendered.provisional !== summary.provisional) {
+          contentDiv.innerHTML = parseSimpleMarkdown(summary.text);
+          styleTldrLabels(contentDiv);
+          enhanceTldrContent(contentDiv, { stale: summary.provisional });
+          if (!summary.provisional) ensureTldrRefreshButton(id, contentDiv);
+          renderedSummaries.set(contentDiv, summary);
+        }
       } else {
-        contentDiv.textContent = '';
+        renderedSummaries.delete(contentDiv);
+        if (loading) {
+          contentDiv.textContent = 'Loading TLDR...';
+        } else if (summaryErrors.has(id)) {
+          contentDiv.textContent = 'TLDR: ' + summaryErrors.get(id);
+          contentDiv.dataset.error = 'true';
+        } else {
+          contentDiv.textContent = '';
+        }
       }
       contentDiv.style.display = contentDiv.textContent || contentDiv.children.length ? 'block' : 'none';
     }
@@ -1667,9 +1816,10 @@
         dashboard_version: Number(card.dataset.dashboardVersion || 0),
         position: Math.max(0, position),
         sort_mode: currentSort,
-        age_filter: currentAge,
+        window: currentWindow,
         source_filter: currentSource,
         ranker_arm: card.dataset.rankerArm || 'baseline',
+        badges: (card.dataset.badges || '').split(',').filter(Boolean),
         occurred_at: Date.now() / 1000,
         ...(durationMs === null ? {} : {duration_ms: Math.round(durationMs)})
       });
@@ -1873,9 +2023,7 @@
     sortTabs.forEach(tab => {
       tab.addEventListener('click', () => setFilter('sort', tab.dataset.sort));
     });
-    ageTabs.forEach(tab => {
-      tab.addEventListener('click', () => setFilter('age', tab.dataset.age));
-    });
+    windowSelect?.addEventListener('change', () => setFilter('window', windowSelect.value));
 
     function togglePanel() {
       sidePanel.classList.toggle('visible');
@@ -1973,7 +2121,7 @@
       tip.querySelector('[data-dismiss-tip]')?.focus();
     }
 
-    // The terminal client's keys; a (age) and f (fullscreen) are web-only.
+    // The terminal client's keys; f (fullscreen) is web-only.
     const KEY_ACTIONS = {
       j: () => move(1),
       k: () => move(-1),
@@ -1988,7 +2136,8 @@
       s: () => cycleSort(1),
       l: () => cycleSort(1),
       h: () => cycleSort(-1),
-      a: () => setFilter('age', currentAge === 'recent' ? 'archive' : 'recent'),
+      d: () => cycleWindow(1),
+      D: () => cycleWindow(-1),
       b: () => sidePanel.classList.toggle('visible'),
       '?': () => showHelp(),
       f: () => togglePanel(),
@@ -2002,7 +2151,8 @@
       ) {
         return;
       }
-      const action = KEY_ACTIONS[e.key.toLowerCase()];
+      // Shift+D ("D") has its own action; other letters ignore Shift.
+      const action = KEY_ACTIONS[e.key] || KEY_ACTIONS[e.key.toLowerCase()];
       if (action) {
         e.preventDefault();
         action();
@@ -2013,7 +2163,7 @@
     // changed with the keys, so everyone sees the new ones once.
     (function() {
       const tip = document.getElementById('first-time-tip');
-      const flag = 'hn_first_tip_seen_v3';
+      const flag = 'hn_first_tip_seen_v4';
       if (!tip) return;
       const dismiss = () => {
         tip.hidden = true;
@@ -2026,10 +2176,16 @@
       if (!localStorage.getItem(flag)) showHelp();
     })();
 
-    setFeed(readEmbeddedFeed() || parseFeed({
-      api_version: 1, stories: [], orders: {}, feedback_counts: {},
-      version: 0, target_version: 0, ready: false,
+    const embeddedFeed = readEmbeddedFeed();
+    if (embeddedFeed) currentWindow = embeddedFeed.window;
+    if (windowSelect) windowSelect.value = currentWindow;
+    setFeed(embeddedFeed || parseFeed({
+      api_version: FEED_API_VERSION, window: currentWindow, stories: [], orders: {},
+      feedback_counts: {}, version: 0, target_version: 0, ready: false,
     }));
+    let savedWindow = null;
+    try { savedWindow = localStorage.getItem(WINDOW_KEY); } catch (err) { /* private mode */ }
+    if (savedWindow && savedWindow !== currentWindow) setFilter('window', savedWindow);
     window.setInterval(pollFeedVersion, POLL_INTERVAL_MS);
   </script>
 </body>

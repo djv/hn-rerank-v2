@@ -33,7 +33,7 @@ The codebase consists of six primary modules plus the `pipeline/` package:
    - **[pipeline/__init__.py](pipeline/__init__.py)** — Conductor: candidate orchestration (`fetch_candidates`, `fetch_candidates_only`), cold-deck assembly (`build_cold_deck`), per-user dashboard entry point (`fast_rerank_for_user`), dedup filter (`_apply_dedup_to_ranked`). Re-exports the full flat namespace so all `from pipeline import X` callers remain unchanged.
    - **[pipeline/candidate_cache.py](pipeline/candidate_cache.py)** — Process-wide `CandidatePool` cache (stories + embedding matrix, masked per user for feedback exclusion) shared across `build_cold_deck`/`fast_rerank_for_user`; see §3.3.1.
    - **[pipeline/config.py](pipeline/config.py)** — Configuration dataclasses (`Config`, `ModelConfig`, `RssConfig`), TOML loader (`Config.load`), config overlay helper, archive/CH source constants, `is_hn_source`.
-   - **[pipeline/ranking.py](pipeline/ranking.py)** — Text utilities (`clean_text`, `compose_story_text`, `story_embedding_text`), comment extraction/selection, ONNX `Embedder`, embedding cache (`get_or_compute_embeddings`), SVM model cache, similarity kernels, feature assembly, `_score_and_rank`, MMR diversity filter, `rerank_candidates` (badge passes + combo assembly), `RankedStory`/`RankTrace` dataclasses.
+   - **[pipeline/ranking.py](pipeline/ranking.py)** — Text utilities (`clean_text`, `compose_story_text`, `story_embedding_text`), comment extraction/selection, ONNX `Embedder`, embedding cache (`get_or_compute_embeddings`), SVM model cache, similarity kernels, feature assembly, `_score_and_rank`, `mmr_filter` (eval only), `rerank_candidates` / `assemble_window_deck` (time-window views and badges), `serve_window`, `RankedStory`/`WindowDeck`/`RankTrace` dataclasses.
    - **[pipeline/enrichment.py](pipeline/enrichment.py)** — RSS feed parsing, Algolia fallback fetch (`fetch_story`), HN/Reddit/LessWrong comment prewarm, Reddit topfeed builders, article-body fetch pipeline. Holds the 3 late `from server import ...` sites that dissolve the pipeline↔server import cycle.
    - **[pipeline/render.py](pipeline/render.py)** — View dataclasses (`BadgeView`, `TabView`, `DashboardCardView`, etc.), the `source_label` Jinja2 filter, the feed JSON (`build_feed`) and dashboard HTML generation (`generate_dashboard_bytes`), badge/card/tab builders.
 3. **[server.py](server.py)**: A Flask-routed, threaded local web service serving the dashboard, handling feedback writes, proxying detailed TLDR summaries to LLM APIs, and housing the background regeneration event thread. The `Handler` class owns runtime state (per-user `DeckState` cache, dashboard versions, the bounded warm scheduler, limiter state), while Flask owns all HTTP routing, request parsing, cookies, redirects, CORS/options, and response construction.
@@ -58,7 +58,18 @@ Routine ingestion preserves comments with a higher fetched-count marker and
 otherwise prefers longer text; a retained comment snapshot retains its marker.
 Failed or empty HN comment fetches preserve existing comments. Tap hydration
 returns the persisted story; bulk hydration embeds the persisted story.
+`comment_count_at_fetch` is 0 until comments were actually fetched (new CH
+live-window rows start at 0). A regen prewarm that fetches a tree with nothing
+usable (one-word replies) records the count with empty `top_comments`, and
+`_needs_hn_prewarm` then waits for a new comment before querying it again.
+Prewarm and the live-window retry stop on non-transient ClickHouse errors
+(`ch_client.is_transient_error`; quota errors arrive as HTTP 500 `Code: 201`).
+A pointer-thread follow re-reads the row after its fetch and writes on top of
+it, or skips the write when a hydration replaced the pointer meanwhile.
 `comment_count` remains an upwards-only observation, separate from the snapshot.
+The preservation read, merge and UPSERT run in one `BEGIN IMMEDIATE`
+transaction. SQLite reserves the writer before the read, so pooled connections
+cannot overwrite a snapshot hydrated between that read and its write.
 
 RSS URL hashes retain their existing IDs. An atomic UPSERT guard rejects a
 conflicting URL on a non-positive story ID (`StoryIdentityConflict`). Ordinary
@@ -66,6 +77,8 @@ RSS and Reddit ingestion log and skip conflicts; rejected entries are excluded
 from returned candidates, Reddit snapshots and prewarm. Existing story identity
 and feedback remain intact. This detects collisions; it does not allocate an
 alternative ID or repair historical collisions.
+RSS/Atom parsed date tuples are converted as UTC, independently of the host's
+local timezone.
 
 ### 3.2 Embedding Model & Feature Space
 
@@ -168,6 +181,10 @@ The blend starts when both classes have at least 20 feedback entries and reaches
 ### 3.4 Selection & Surfacing Passes
 The default dashboard selection is direct relevance order: `rerank_candidates` takes the top ranked stories after `_score_and_rank` and does not remove near-duplicates. MMR remains available behind `config.model.enable_mmr`; when enabled, `mmr_filter` iterates through candidates in SVM-rank order and discards subsequent candidates with cosine similarity above `config.model.diversity_threshold` (default 0.75).
 
+**Linear blend (`config.model.linear_blend_enabled`; code default off, `config.toml` on since 2026-09-29).** `pipeline/linear_blend.py`: after `_score_and_rank` computes the tier-blended score for a voter whose SVM fit, the final score becomes 0.5 x production + 0.2 x dense logistic regression (`linear_blend_dense_weight`; fit on the SVM's scaled feature rows, C `linear_blend_dense_c` 0.1) + 0.3 x TF-IDF logistic regression (`linear_blend_tfidf_weight`; word 1-2 grams over domain/source tokens, title and the first 5,000 characters of `text_content`, C `linear_blend_tfidf_c` 4), each as an average-rank percentile of P(up) - P(down). The dense and TF-IDF weights are multiplied by the SVM tier's weight (`alpha_2 * alpha_3`, `linear_blend_ramp`), so the blend ramps in with the SVM past the 20 up / 20 down gate instead of taking half the ranking there; a heavy voter gets the full weights. The models are fit with the SVM on a cache miss and cached in `linear_blend._CACHE`, one fit per user under its latest feedback signature (a missing entry forces the SVM refit too); that fit is also the next fit's warm start (`_LATEST`, dropped with the cache entry). Hashed TF-IDF count rows are cached per (story, text) in `_ROWS` (32k rows, ~110 MB; sized above the candidate caps plus the voters' training stories). A failed fit or score logs and keeps the production score. `scripts/eval_ranker_variants.py` shares `percentile_scores`, `tfidf_text` and the vectorizer with it. Its `production` variant runs whatever the config says (the blend, from `config.toml`); `prodlr`, `produd`, `stack` and the SVM sweeps use production without the blend, and `prodlr`'s default dense logreg is the live one (a production run with all blend weight on it, `linear_blend_ramp=false`), so `prodlr[svm_c=4;lr_weight=0.2;tfidf_weight=0.3]` equals the live blend for a heavy voter (`tests/test_eval_ranker_variants.py`). Other `lr_target`s, half-lives and skipped votes use the eval's own logreg (fewer meta columns, C `linear_blend_dense_c`).
+
+**Side-by-side embeddings (`config.model.side_embedding_enabled`; default off, on in `config.toml` and live since 2026-10-02).** `pipeline/side_embeddings.py`: when on, `_score_and_rank` trains and scores the SVM and the linear blend on each story's stored vector joined with a second model's vector (embeddinggemma-300m, 128 tokens, task prefix `task: classification | query: `), each part scaled 1/sqrt(2), the layout the evaluation replay used (2026-10-02: AUC +0.011, top-12 upvotes +0.056 over 12 time blocks; FINDINGS.md). The score context (closest upvote and its index, closest down/neutral, upvote vectors) stays on the stored vectors, so "Because you upvoted", Explore and dedup thresholds keep their meaning. Side vectors live in the additive `side_embeddings` table (`story_id, model_version` key, matched on the same text hash as `embeddings`), are read through an in-process cache (`SideVectorCache`, one DB read per story text) and are written only by `scripts/embed_side_vectors.py` (voted stories first, then candidates newest first; 0.22 s/story on the VPS on 2 niced threads). A story without one gets a zero side part; below `side_embedding_min_coverage` (0.98) of candidates plus feedback the rerank uses the stored vectors alone (trace label `side_embeddings=off`, warning `side_embeddings_low_coverage`). The model directory is a Hugging Face snapshot (`side_embedding_model_dir`, tokenizer files plus `onnx/model.onnx`).
+
 #### 3.4.1 Cross-source URL & title dedup
 The same article can arrive from multiple sources — two HN submissions of the same Verge article (the well-known "[dupe]" pattern), an HN story linking a Reddit thread plus a Reddit RSS feed catching the same thread, etc. Without explicit handling, the same URL would render twice in the deck. Cross-source dedup lives in `dedup.py` and runs at the very end of `fast_rerank_for_user` (after `rerank_candidates`), so it covers all primary-ranked and extra-slot stories, including ones that arrived in different regen cycles.
 
@@ -247,45 +264,90 @@ story's comment RSS is fetched at most once per lifetime (prewarm filter
 is `not s.top_comments`), so a cache would have near-zero hit rate.
 
 The live dashboard path applies a **two-leg recent candidate cap** to bound the work the ranker does on each request. The recent candidate fetch is split:
-- **HN leg** (`source='hn'`): ordered by tier-1 gravity `score / age^1.8` (mirrors the cold-start blend in `_score_and_rank`), capped at `recent_candidate_hn_limit` (default 5000). This keeps the highest-scoring HN candidates in the pool.
+- **HN leg** (`source='hn'`): ordered by tier-1 gravity `score / age^1.8` (mirrors the cold-start blend in `_score_and_rank`), capped at `recent_candidate_hn_limit` (default 10,000 since 2026-09-29; 5000 had started cutting live stories). This keeps the highest-scoring HN candidates in the pool.
 - **RSS leg** (`source != 'hn' AND NOT IN archive`): ordered by `time DESC` only. RSS sources carry no engagement score in the DB, so tier-1 is uninformative there; recency is the most honest SQL-only signal and preserves representation for the `is_non_hn` discovery pass. Capped at `recent_candidate_rss_limit` (default 5000, same as the HN leg since 2026-08-30 — the old 500 cap starved the RSS pool and the oldest RSS row was 93h out).
 
 The archive leg (BQ/CH archive sources) is unchanged and capped at 4000. Total recent + archive rows scored per rank ≈ 6000 (down from ~10,400 for the heaviest user). On the heaviest user the warm rank path dropped from ~9.4s p50 to ~6.3s p50 (33% faster), driven mostly by `decision_function` running on 5,000 fewer rows. The `is_uncertain` discovery pass is orthogonal to the SQL ordering and may be slightly affected; impact was small in practice.
 
-The dashboard consumes the server-ranked order as a swipe deck instead of a visible list. The ranker emits 12 primary/default stories plus all generated discovery/popularity extra slots, and the template renders that whole returned pool so local modes can filter without another server round trip. The browser still shows only the first unvoted card for the active mode and refills from a freshly rendered dashboard when that mode's queue drops to 4 or fewer cards. The score-based gradient is applied client-side from `data-score`; it remains a rank-position signal over the currently loaded pool.
+**Time windows and views (since 2026-09-28).** A deck is five time windows,
+`12h`, `1d`, `1w` (default), `1m` and `archive`, nested by age (`1d` holds the
+`12h` stories; `1m` is the last 30 days; `archive` is everything older than 30
+days, in practice the `bq_seed`/`ch_seed` legs). `in_window` in
+`pipeline/ranking.py` is the one predicate: age clamped at 0, boundaries
+inclusive. Each window has three views, picked by `assemble_window_deck` from
+the fully scored pool at one `now` for all five windows:
 
-Discovery badges (uncertainty, novelty, talk-worthy, top, hot) are applied to any story that meets the criteria — primary or extra-slot. The **Similar badge is the exception**: it is reserved for extra-slot stories only, never for primary-ranked stories, so it always signals "surfaced from outside primary because of high semantic match" rather than a near-tautology on top-ranked stories (where score and `cand_closest_up` are correlated by construction). Multiple badges per card are allowed. The discovery passes source stories from the remaining candidate pool (stories not already in the primary ranked set) to surface qualifying stories that would not otherwise be shown; each pass respects its own slot cap and dedupes from later passes.
+* **Recommended**: the top stories by model score in the window. No source
+  quota (the old per-combo quotas `PRIMARY_*` are gone) and no MMR (the
+  serving `enable_mmr` branch was dropped; `mmr_filter` stays for the eval).
+* **Popular**: the top HN stories (`is_hn_source`) in the window by HN gravity
+  on the window's clock, `points / (age_h / scale + 2) ** 1.8` (`hn_gravity`,
+  `scale = GRAVITY_TIME_SCALE[window]`, a third of the window in hours: 12h 4,
+  1d 8, 1w 56, 1m 240, archive 2920; with HN's own 1-hour clock every window
+  showed the same under-a-day-old stories). No Hot/Top/Talk selection cascade.
+  Badges are independent: each card gets every one it qualifies for,
+  🔥 Hot when its velocity
+  (points/hour) is at or above the pool's `hot_badge_percentile` and it has
+  `HOT_MIN_SCORE=20` points; 🏆 Top with `TOP_MIN_SCORE=100` points; 💬 Talk
+  with `TALK_MIN_COMMENTS=50` comments and at least as many comments as points.
+  A card may have all three badges or none. Popular membership and order
+  still depend only on HN gravity, not the badges.
+* **Explore** (personalized decks only; the cold deck has none): Unsure
+  (highest entropy; needs SVM probabilities), Novel (`1 - max_sim`, farthest
+  from every vote) and 🎯 Interest, picked in that order, each
+  excluding earlier picks and the window's Recommended picks (spares
+  included, since they refill Recommended), skipping (and
+  backfilling past) stories that duplicate a voted one (`is_feedback_match`,
+  WORKLOG 2026-07-10). Served 5 each (`EXPLORE_PER_BADGE`), in model-score
+  order. Interest (replaced 🎯 Similar, 2026-09-30): `interest_centers`
+  clusters the user's upvote embeddings (KMeans, `interest_cluster_k=10`,
+  cached per user and warm-started from the last centers when upvotes
+  change); each candidate belongs to its nearest center. `interest_picks`
+  goes round-robin over the interests, those the served Recommended (first
+  `VIEW_SIZE`) covers least first, then bigger ones, taking each interest's
+  best-scoring unpicked story per round, so the served five show interests
+  Recommended misses. `scripts/preview_explore.py` prints a profile's picks
+  from a snapshot.
 
-**Rank-based cascade badge model (2026-06-28).** All badge attribution is pure rank: for each badge, take the top X stories by that badge's metric, in order. No percentile thresholds, no min-score floors. Explore badges take `EXPLORE_PER_BADGE = 4` each (`EXPLORE_PER_BADGE_NONHN = 1` on recent_non-hn); Popular shares a `POPULAR_PER_COMBO = 12` budget per HN combo (Hot ≤ 4, then Top and Talk split the rest). See pipeline/ranking.py. Per-combo discovery passes run inside `fast_rerank_for_user`'s main loop over 3 combos (recent_hn, recent_nonhn, archive_hn). The badge passes split into two groups:
+Views are picked at `SELECT_MARGIN = 2` times their served size, then
+`finalize_ranked_deck` runs URL/embedding dedup and `canonicalize_deck`
+(`canonicalize_hn_dupes` via `canonical_outcomes`) once over every story of the
+deck, in score order, and applies the result to each view: a dropped story
+leaves every view, a canonical replacement takes its source's place and leaves
+any view whose window it falls outside, and Popular is re-sorted by gravity.
+`serve_window` then caps each view at request time: stories that aged out of
+the window since the warm are dropped, Recommended and Popular are cut to
+`VIEW_SIZE = 16` (12 shown plus 4 that slide in as cards are voted), Explore to
+5 per badge. The spare picks refill views after dedup, votes and ageing; a short
+window is served short, never widened. A card's badges are OR'd across the
+views of its window only (`WindowViews.stories`); the view orders are
+authoritative, nothing is derived from badge flags.
 
-* **Cascade group (HN-only, mutually exclusive).** Hot → Top → Talk run sequentially, only for HN-source combos (recent_hn, archive_hn). Each pass excludes prior picks from its pool, so a story with 🔥 never also has 🏆, and a story with 🏆 never has 💬. Hot picks run against the full `combo_pool`; when a Hot pick is already in `final` (from primary), the loop OR's `is_hot=True` into the existing entry. Top and Talk exclude prior cascade picks, preserving mutual exclusion.
-* **Explore group (all combos, serial).** Unsure → Novel → Similar run outside the HN-only guard for all 3 combos. Within Explore they are **serial (mutually exclusive)** — each pass excludes prior Explore picks, so a story gets at most one Explore badge. Explore picks can stack with Popular badges: a Primary- or Top-ranked story can also get the Unsure badge via OR into its existing `final` entry.
-
-**No archiving by recent/archive cohorts within badge passes.** Each of the 3 combos is its own independent pass; there is no separate "recent" vs "archive" cohort split within each badge. The old `*_SLOTS = 5` and `HOT_DISCOVERY_SLOT_LIMIT = 5` constants were removed in 2026-06 (dead code, never referenced in the discovery path). A dedicated separate Non-HN pass no longer exists; non-HN stories flow through the per-combo Explore passes plus primary relevance (12 total primary split across combos).
-
-**No knobs.** All percentile/min knobs are gone from `ModelConfig` and `config.toml`: `top_badge_percentile`, `top_badge_min_score`, `discussion_badge_percentile`, `discussion_badge_min_comments`, `novel_badge_percentile`, `similar_badge_percentile`. The per-bucket threshold arrays (`engagement_thresholds`, `discussion_thresholds`, `sim_thresholds`, `uncertain_entropy_thresholds`) and the `_bucket_pct` helper are deleted. Hot still has `hot_badge_percentile` (the velocity p99.5 threshold for the Hot predicate gate).
-
-**🔥 Hot is the sole global exception.** Its metric is engagement velocity (`score / age_hours`), which is structurally near-zero for archive stories (months of accumulation divide today's score), so a global threshold correctly preserves Hot's rarity and the `HOT_MIN_SCORE=20` floor keeps old stories from qualifying. Per-bucketing Hot would wrongly mark high-score archive stories as "hot" (their velocities cluster near zero, so the archive p99.5 of near-zero is a tiny number). **Archive cards never carry 🔥 by design**, and the UX needs no special handling: the `data-sort-popular` filter OR-s `is_hot OR is_high_engagement OR is_discussion_rich`, so the Popular sort still returns archive cards via 🏆/💬. There is no Hot-only filter.
-
-* **Uncertainty/Entropy Surfacing (🤔 Unsure)**: Shannon Entropy of the model's predicted probability distribution (Down, Neutral, Up). Per-combo pass (all 3 combos): up to `EXPLORE_PER_BADGE=4` (1 on recent_non-hn) taken from the top-by-entropy in the post-cascade `explore_pool` (predicate: `r.prob_down is not None`). Requires the SVM to have fit (`n_up >= min_up_for_svm=20` AND `n_down >= min_down_for_svm=20`); with insufficient feedback, `prob_down is None` and the Unsure badge is absent. Can stack with Popular badges (Primary/Top/Talk/Hot) via OR into existing `final` entries.
-* **Novel (✨)**: Per-combo pass (all 3 combos): up to `EXPLORE_PER_BADGE=4` (1 on recent_non-hn) taken from the top-by-`1 - max_sim` in `explore_pool`, excluding prior Explore picks. No score blend — "novel" means semantically distant from anything voted on, independent of model score. Entries are always appended (no stacking with existing `final` entries).
-* **Similar (🎯, extra-slot only)**: Per-combo pass (all 3 combos): up to `EXPLORE_PER_BADGE=4` (1 on recent_non-hn) taken from the top-by-`cand_closest_up` in `explore_pool`, excluding prior Explore picks. Pass-only by design (the Similar badge signals "surfaced because of high semantic match"). Entries are always appended. The original "primary-vs-extra-slot" distinction is enforced by only running against `explore_pool` (excludes primary).
+**No knobs.** All percentile/min knobs are gone from `ModelConfig` and `config.toml` except `hot_badge_percentile` (the velocity p99.5 threshold of the Hot predicate). Top and Talk use the fixed 100-point and 50-comment floors above (user-selected 2026-10-02). Velocity is structurally near-zero for archive stories, so archive Popular cards carry 🏆/💬, practically never 🔥. Unsure requires the SVM to have fit (`n_up >= min_up_for_svm=20` AND `n_down >= min_down_for_svm=20`); before that `prob_down is None` and Explore holds only Novel and Interest.
 
 **Attribution (F2, `9a83ffd`).** Cards carry a "Because you upvoted …" line
 populated from the already-computed KNN argmax (`cand_closest_up_idx` → the
 nearest upvoted feedback title, no new matmul), shown only when the max
 similarity clears `ATTRIBUTION_MIN_SIM=0.35`. A weak-match attribution is
-worse than none, so cold users and sub-threshold cards show nothing.
-* **Discussion-rich (💬 Talk-worthy)**: HN-only per-combo pass (cascade): the rest of the Popular budget (`POPULAR_PER_COMBO - n_hot - n_top`) taken from the top-by-`comment_count` in `combo_pool`, excluding prior cascade+primary picks, with `comment_count > 0` guard. Mutually exclusive with Hot and Top within the cascade.
-* **High-engagement (🏆 Top)**: HN-only per-combo pass (cascade): up to half of the Popular budget Hot left (`(POPULAR_PER_COMBO - n_hot + 1) // 2`) taken from the top-by-`story.score` in `combo_pool`, excluding prior cascade+primary picks. Mutually exclusive with Hot and Talk within the cascade.
-* **Hot (🔥)**: HN-only per-combo pass: up to `POPULAR_PER_COMBO // 3 = 4` taken from the top-by engagement velocity (points/hour, p99.5 global), `HOT_MIN_SCORE=20` floor. Runs against the full `combo_pool`; primary-ranked high-velocity stories get the badge via OR into their existing `final` entry. HN-only by definition (velocity requires score history); archive never carries 🔥. Runs on both recent_hn and archive_hn combos.
-
-The final list can therefore exceed `config.count`: primary quotas are `PRIMARY_PER_COMBO=12` (recent_hn), `PRIMARY_RECENT_NONHN=10`, and `PRIMARY_ARCHIVE_HN=16`; per HN combo Popular adds up to 12 (Hot ≤ 4, Top/Talk split the rest; archive has no Hot, so 6/6), and Explore adds up to 4 per badge (1 on recent_non-hn): ≤ 15 recent, ≤ 12 archive. `pipeline/render.py` then caps Recommended at `RECOMMENDED_LIMIT = 24` per age (top by score) and drops cards that are in no view, so the server sends a short deck. Date is one list for both Age tabs: every card that is in Recommended, Popular or Explore, newest first (`prepare_feed` in `pipeline/render.py`; the ranking has no Date picks of its own), so with the client cap Date is the 12 newest stories in the deck. Before 2026-09-25 the recent Recommended/Date view reached 73 cards. Both clients show at most 12 cards per view (`VIEW_LIMIT` in `templates/index.html` and `clients/tui`), taking the first 12 unvoted in the view's order; cards past the cap slide in as earlier ones are voted. A story can have at most 1 cascade badge (from Hot/Top/Talk) plus at most 1 Explore badge (Unsure, via OR into existing entries), for a max of 2 badges per card.
-
+worse than none, so cold users and sub-threshold cards show nothing. Cards
+with a Hot/Top/Talk/Unsure/Novel badge from any view of their window need
+`BADGED_ATTRIBUTION_MIN_SIM=0.85` (`card_attribution`, applied when the feed
+is built): they are there for popularity or exploration, and full-text
+similarity to the nearest upvote is 0.6-0.8 for most loosely related pairs
+(the text includes comments), so 0.35 let through matches like "Ubuntu
+26.04.1" <- "NInfer Qwen … RTX 5090" (0.70). Interest (🎯) keeps 0.35.
+Since 2026-10-02 every card also needs the pair to stay close once centered:
+`centered_pair_similarity` removes the candidate pool's mean and top
+`ATTRIBUTION_CENTER_DIRECTIONS=3` principal directions from both vectors,
+and the line shows only at `ATTRIBUTION_CENTERED_MIN_SIM=0.30`. Mean-pooled
+long texts share a direction (a ghc-debug post and an AINews digest scored
+0.64 raw, 0.20 centered); the named upvote and `best_match_sim` stay the raw
+ones, and ranking, badges and Explore never see centered vectors. The
+`attribution` trace stage times it (~60 ms on 11k candidates).
 ### 3.5 Swipe Deck & Warm Refill
-The dashboard uses two orthogonal axes: **Sort** (Recommended/Popular/Explore/Date) and **Age** (Recent/Archive). Only one story card is visible at a time, and its TLDR opens automatically. The first few TLDRs for the active mode are prefetched immediately so advancing is usually instant. Keys match the terminal client (since 2026-09-26): `j`/`k` next/previous story, `1`/`2`/`3` upvote/neutral/downvote, `u` undo, `o`/`c` open article/comments, `y` copy the comments link (article link if none), `r` refresh (reload the deck and regenerate the open summary), `s`/`l` next sort, `h` previous sort, `?` the key overview; web-only `a` toggles Recent/Archive, `b` the side panel and `f` fullscreen. Arrow keys scroll inside the open TLDR. The global `keydown` guard only blocks text-input controls (`input`, `textarea`, `select`, `[contenteditable]`) and modifier-accelerated keys (`Ctrl`/`Cmd`/`Alt`); `<button>` and `<a>` focus does not suppress shortcuts. A 3-way source filter (`Mixed` / `HN` / `Non-HN`) narrows the deck by story source: `Mixed` is the default (full pool), `HN` shows `hn`, `bq_seed`, or `ch_seed` stories (`is_hn_source()`), and `Non-HN` shows only `rss_*` stories. The source filter stacks on top of the active mode. The side rail exposes two orthogonal axes: **Sort** (Recommended, Popular, Explore, Date) and **Age** (Recent, Archive). The default view is Recommended + Recent (replaces the old `Default` tab). `Recommended` ranks by model score, `Popular` filters to Hot/Top/Talk-worthy cards and shuffles, `Explore` filters to Unsure/Similar/Novel cards and shuffles, `Date` sorts chronologically. `Recent` shows stories <30d old; `Archive` shows older stories (surfaced by the `archive-top` discovery pass, sorted by score desc, no shuffle). Cards carry `data-is-recent="1|0"`, `data-sort-popular="1|0"`, and `data-sort-explore="1|0"` attributes; the JS axis filter checks age first, then the sort-specific badge attribute. The age filter is determined by `story.time >= now - 30d` (inclusive boundary), set on `RankedStory.is_recent` at the end of `rerank_candidates`.
+The dashboard has a **Sort** (Recommended/Popular/Explore, side-rail tabs) and a **time window** (a dropdown: 12 hours, 1 day, 1 week, 1 month, Archive) that applies to all three sorts; each client reopens on the window last picked (web: `localStorage` `hnWindow`, switched to right after the embedded 1-week feed loads; terminal: a `window` file next to its `profile.json`), 1 week when nothing is saved; the Date sort and the Recent/Archive tabs were removed on 2026-09-28. Only one story card is visible at a time, and its TLDR opens automatically. The first few TLDRs for the active mode are prefetched immediately so advancing is usually instant. Keys match the terminal client (since 2026-09-26): `j`/`k` next/previous story, `1`/`2`/`3` upvote/neutral/downvote, `u` undo, `o`/`c` open article/comments, `y` copy the comments link (article link if none), `r` refresh (reload the deck and regenerate the open summary), `s`/`l` next sort, `h` previous sort, `?` the key overview, `d`/`D` (Shift+D) the next/previous time window; web-only `b` the side panel and `f` fullscreen. Arrow keys scroll inside the open TLDR. The global `keydown` guard only blocks text-input controls (`input`, `textarea`, `select`, `[contenteditable]`) and modifier-accelerated keys (`Ctrl`/`Cmd`/`Alt`); `<button>` and `<a>` focus does not suppress shortcuts. There is no source filter (the `Mixed`/`HN`/`Non-HN` selector stays disabled; interaction events record `source_filter=mixed`).
 
-**Web client model (since 2026-09-26, matching the terminal client).** The page embeds the deck as the same JSON `/api/feed` serves (`<script type="application/json" id="feed-data">`, Jinja `tojson`, so a title can't close the element), and every card is built from it by `feedCard` with text nodes only; there are no server-rendered cards. A view is `feed.orders["<sort>:<age>"]` minus this session's votes, capped at 12 (`VIEW_LIMIT`); Explore is shuffled client-side, keeping placed stories where they are. Switching sort or age re-renders locally (no fetch) and starts at the view's first story. `reload()` is the one path to a new deck (`GET /api/feed`): the poller calls it every 60s and when the tab becomes visible, if `ranking-ready` reports a newer version (a current deck waits for any new version; a stale one waits for its reranked deck), and `s` calls it manually (which also regenerates the open summary). A vote hides the card and moves to the next one at once; votes and undos go out one at a time in the order made (`submit`, one promise chain); a saved vote marks the feed stale (`target_version`, `ready: false`); a failed one is reverted (the story comes back, counts undone) with an error and never retried. Undo restores the story where the server orders it (`restoreStory`) until the reranked deck lands. Summaries: one request per story shared by the open card and prefetch (`summaryFor`); the next 3 cards may be generated and the next 10 are only looked up in the cache (`/api/tldr-cache`), at most 4 prefetch requests at once; misses and failures back off for 60s (or `Retry-After`), and a failed background generation pauses prefetch generation for a minute. Requests time out after 10s (150s for `tldr-detail`). Removed: server-rendered card markup (`components/story_card.html`, `badge.html`), the refill loop, the 30s warm-poll loop, the vote idle timer, the page-load version check, the localStorage voted-id list (the server no longer serves voted stories), per-story vote chains, and the inactive source filter code.
+**Web client model (since 2026-09-26, matching the terminal client).** The page embeds the default window (1w) as the same JSON `/api/feed?window=1w` serves (`<script type="application/json" id="feed-data">`, Jinja `tojson`, so a title can't close the element), and every card is built from it by `feedCard` with text nodes only; there are no server-rendered cards. A view is `feed.orders[sort]` of the selected window's feed minus this session's votes, capped at 12 (`VIEW_LIMIT`); Explore is shuffled client-side per window, keeping placed stories where they are. Switching sort re-renders locally and starts at the view's first story. Switching window (the dropdown, `d` or `D`) shows that window's cached feed when one of the current deck version is cached, else an empty "Loading…" view while `reload()` fetches it. After a window is shown, `prefetchWindows` fetches its neighbours (±1 in the window list) in the background: one request at a time, each window once per deck version (`windowsTried`), never summaries. The cache (`feeds`) holds one deck version: a feed of a newer version replaces it all, an older one is ignored, and a background answer is dropped when a newer deck or a saved vote (`feedGeneration`) arrived after it was asked, or when its window is the one on screen, so a late prefetch can't overwrite the selected window or bring back pre-vote data (a cached feed never resets the vote counts either). `reload()` is the one path to the selected window's feed (`GET /api/feed?window=`): the poller calls it every 60s and when the tab becomes visible, if `ranking-ready` reports a newer version (a current deck waits for any new version; a stale one waits for its reranked deck), and `s` calls it manually (which also regenerates the open summary). A vote hides the card and moves to the next one at once; votes and undos go out one at a time in the order made (`submit`, one promise chain); a saved vote marks every cached window stale (`target_version`, `ready: false`); a failed one is reverted (the story comes back, counts undone) with an error and never retried. Voted stories are hidden in every window; undo brings the story back in each, and restores it into the window it was voted from where the server orders it (`restoreStory`: Popular by the window's gravity, the rest by rank score) until the reranked deck lands. Summaries: one request per story shared by the open card and prefetch (`summaryFor`); the next 3 cards may be generated and the next 10 are only looked up in the cache (`/api/tldr-cache`), at most 4 prefetch requests at once; misses and failures back off for 60s (or `Retry-After`), and a failed background generation pauses prefetch generation for a minute. Requests time out after 10s (150s for `tldr-detail`). Removed: server-rendered card markup (`components/story_card.html`, `badge.html`), the refill loop, the 30s warm-poll loop, the vote idle timer, the page-load version check, the localStorage voted-id list (the server no longer serves voted stories), per-story vote chains, and the inactive source filter code.
 
 Votes never trigger a global regeneration (since 2026-09-26). A 300-second trailing timer used to start a full regen after the last vote from anyone; it dated from when a vote had to re-render one static page, and by then only re-fetched candidates early and re-ranked every cached user, while the per-user warm already covers the voter (`fetch_candidates` only uses feedback to skip refreshing voted stories, and per-user ranking excludes them itself).
 
@@ -389,7 +451,7 @@ Live-verified post-fix: a 12-vote swipe burst against a fresh user brought
 path this fix was meant to unlock.
 
 ### 3.6 ClickHouse Candidate Fetch Window
-The live-window fetch (`pipeline.fetch_candidates`) uses `ch_client.query_live_window(days=config.days, min_score=5, limit=5000)` to pull all live HN stories from the past `days` (default 30; before 2026-09-25 this call hard-coded 30 and ignored `Config.days`). This single SQL query returns every story with title, url, score, descendants, time, and self-text — no pagination, no per-story items call needed. Stories with `score < 5` are filtered at the query level. Result count is typically 2000-5000 rows; query time <2s on CH Playground. The 30-day window (widened from 7d on 2026-06-29) gives 7-30d HN stories a "second chance" to be re-discovered, re-scored, and re-ranked on every regen; without it, stories that fell out of the live window would stay frozen in the DB with stale scores and never re-enter the candidate pool.
+The live-window fetch (`pipeline.fetch_candidates`) uses `ch_client.query_live_window(days=config.days, min_score=5, limit=LIVE_WINDOW_LIMIT)` (10,000; three attempts with 2 s/8 s backoff, a warning when the cap is hit) to pull all live HN stories from the past `days` (default 30; before 2026-09-25 this call hard-coded 30 and ignored `Config.days`). This single SQL query returns every story with title, url, score, descendants, time, and self-text — no pagination, no per-story items call needed. Stories with `score < 5` are filtered at the query level. Result count was ~7,500 rows in 2026-09; query time <2s on CH Playground. The 30-day window (widened from 7d on 2026-06-29) gives 7-30d HN stories a "second chance" to be re-discovered, re-scored, and re-ranked on every regen; without it, stories that fell out of the live window would stay frozen in the DB with stale scores and never re-enter the candidate pool.
 
 The same function reads `bq_seed` and `ch_seed` archive rows from the SQLite DB (no network) ordered by `score DESC, time DESC` and capped at 4,000 total (2,000 per source). Both archive sources are HN-compatible for ranking gravity, TLDR comment fetching, and eval/source features. Source label `BQ Seed` or `CH Seed` is preserved for provenance. Normal age pruning skips both.
 
@@ -425,6 +487,8 @@ unchanged. This does not delete or rewrite DB rows.
 
 **Regen-time prewarm**: `pipeline.prewarm_top_stories(story_ids, db, embedder)` runs once per regen cycle inside `fetch_candidates_only` (not on every dashboard render). When `prewarm_hn_full=true` (default), it selects all HN candidates with `comment_count > 0` and empty `top_comments` and calls `ch_client.query_stories_with_comments` in one bulk CH query, writing `top_comments`, `comment_count`, and `text_content` back to the DB. When false, it falls back to the top-N by score (default 50). Every user's first dashboard render finds the candidate rows fully populated — no render-time prewarm call. Reddit RSS and LessWrong RSS candidates follow the same pattern with their respective config knobs.
 
+**Comment trees**: `query_comments_bulk` walks `kids` up to `DEFAULT_MAX_LEVELS` (30) levels and returns each story's comments nested in HN's `kids` order, so thread-aware selection (`_extract_comments_recursive`) sees real depth and reply counts. Deleted/dead state comes from each comment's latest version; removed comments stay as empty-text nodes so their replies keep their place.
+
 **Algolia fallback**: single-story items calls via `pipeline.fetch_story` remain for `ch_seed` / `bq_seed` lazy fetches (cards outside the prewarm scope — full prewarm by default, or top-N by score when `prewarm_hn_full=false`, default N=50) and as a hard fallback if CH fails. Real-time, no 1-24h lag. Low frequency: only the long tail of stories the user actually clicks outside the prewarmed set.
 
 The configured RSS candidate pool mixes community aggregators with curated expert feeds across AI/software engineering, functional programming, infrastructure/security, FIRE/finance, urbanism/transit, health evidence, and science/culture. RSS feeds are intentionally plain feed URLs that the current pipeline can ingest directly through `feedparser`; newsletters/forums/podcasts are excluded unless they expose stable RSS or Atom items with canonical URLs. Reddit RSS feeds are fetched with a Reddit-specific User-Agent and serialized per regen to reduce `429 Too Many Requests`; their source names include the subreddit (for example `rss_reddit_haskell`) instead of collapsing every subreddit into `rss_reddit_com`.
@@ -439,6 +503,19 @@ By default, a story's `text_content` (the title + self-post + selected comments 
 **Re-embedding on regen**: `pipeline.prewarm_top_stories` is called once per regen cycle (inside `fetch_candidates_only`) for all HN candidates needing fresh comments (or top-N by score, depending on `prewarm_hn_full`). If `text_content` changed (because new top comments were fetched), the story gets re-embedded. Stories that grow fast but stay outside the prewarm scope will have a slightly stale embedding for up to one regen cycle (3h). Stories in `feedback` (voted by the user) are protected from any re-embedding by the `text_hash` check in `get_or_compute_embeddings`, which forces a fresh computation only when the text content changes — not when the score or comment count changes.
 
 The default cycle is 4 hours, so the stale-embedding bound in the preceding historical note is 4 hours under the current configuration.
+
+**Hot-thread counts between regens (2026-09-30).** Decks hold story snapshots from the last candidate-pool build (hourly regen), so a thread gaining 200 comments an hour used to show frozen counts until the next regen. Three pieces keep counts live without an LLM call:
+- `build_feed(..., live_counts=db.get_story_counts)` (`/api/feed` and the page's embedded feed) serves `points`/`comments` from the `stories` table; order and badges stay as ranked.
+- `hot_refresh_loop` (`server.py`, own thread) runs every `hot_refresh_interval_seconds` (600; 0 disables): `pipeline.refresh_hot_counts` takes the pool's young HN stories with their stored counts, keeps threads passing `hn_thread_looks_active` (the `tldr_refresh_*` gate: ≤72h, ≥30 comments, ≥8/h), probes the `hot_refresh_max_stories` (30) fastest on Firebase (`_probe_live_items`: score + descendants) and writes them with `db.update_story_counts` (comments never lowered). The hourly ClickHouse pass no longer lowers stored points or comments either (CH can lag Firebase/Algolia).
+- `Handler._counts_version` moves when the refresh or a TLDR hydration changes stored counts; `/api/ranking-ready` returns it as `counts_version`. Web and TUI refetch the selected window and invalidate cached neighbors on a count-only change, keeping the open story and summary. In-flight neighbor responses from before invalidation are ignored. Count revisions are accepted only after a successful refresh, so failed refreshes can retry. Generated `tldr-detail` replies patch stored `points`/`comments` into both clients' cards and cached windows. The web updates the preserved active card's header without replacing its summary.
+Summary rendering leaves the existing child nodes attached when cached text
+and provisional status are unchanged. Count-only refreshes therefore retain
+collapsed Article/Discussion sections as well as the outer card and summary.
+Loading, errors and changed summary content clear or replace the rendered state.
+The Firebase tap/regen probe compares descendants with `comment_count_at_fetch`,
+even when the stored count already reflects that growth. Stored counts are
+healed upwards independently of whether comment hydration succeeds.
+Summaries still regenerate only on open: `/api/tldr-cache` reports a miss (`prefetch_cache_stale`) for an active thread whose stored comment count grew past its summarized count by `_growth_threshold` (max(fetched // 3, 5)), so opening it goes to `tldr-detail`, which refreshes the comments from Algolia and rewrites the summary. The TUI also forgets kept summaries (except the open one) of stories whose comment count grew in a refetched feed.
 
 ### 3.8 Stale Comment Backfill & Data Integrity
 
@@ -497,10 +574,10 @@ The system supports multiple users with independent feedback histories and perso
 * **HTTP layer**: Flask owns routing, request bodies, cookies, JSON responses, redirects, CORS/options responses, dashboard/session/profile-link requests, feedback POSTs, ranking-ready polling, TLDR detail requests, and threaded request handling. The current `Handler` class is not a `BaseHTTPRequestHandler`; it is the runtime-state owner for dashboard versions, cached decks, warm scheduling, rate limiters, and the shared DB/embedder.
 * **User Identification**: Token-based via the `hn_token` cookie. Anonymous dashboard visits create the user row, set the cookie, and serve the dashboard in one response. `/u/<token>` remains an import-only profile link for opening an existing profile on another device; unknown profile-link tokens return 404 and do not create users. If the device already holds a different live profile, `GET /u/<token>` only shows a confirm page (`Referrer-Policy: no-referrer`); the switch is a same-origin `POST` to the same URL, so another site can't silently log a visitor into its profile. The cookie is `HttpOnly`, `SameSite=Lax`, and `Secure` only when `X-Forwarded-Proto` is `https` (plain-http access keeps working). Anonymous session creation and profile-link attempts are IP-throttled in the app, keyed on the rightmost non-loopback `X-Forwarded-For` hop (the address our own edge appended; the leftmost value is client-controlled) and falling back to the socket address. This depends on the `Caddyfile` global `trusted_proxies static 127.0.0.1/32 ::1/128`: without it Caddy discards Tailscale Funnel's header and every visitor looks like `127.0.0.1`. `FixedWindowLimiter` sweeps idle buckets every 5 minutes so per-IP keys don't accumulate.
 * **Data Model**: Shared `stories` table (candidates are global), per-user `feedback` rows with `PRIMARY KEY (user_id, story_id)`. A `users` table maps tokens to user IDs and display names.
-* **Dynamic Dashboard**: Each user's dashboard is rendered on-request via `fast_rerank_for_user()` → personalized SVM training → top-ranked selection (`enable_mmr=false` by default) → Jinja2 template render. The ranked deck is cached per user as `DeckState(ranked, built_at, version)` and HTML/JSON are rendered from it on each read, so the live version is always rendered in. A user's dashboard version is `_pool_generation + votes counter`: every vote bumps the user's counter, and each regen/RSS refresh (`Handler._pool_changed`) bumps the generation once, making every deck stale and queueing a refresh for each cached user. The generation starts at the boot time in milliseconds (since 2026-09-26; before, at 1), so versions only increase, across restarts too, and a cold deck (version 0) is always behind its target. `Handler._deck_for_user` is the one place a read picks a deck, for `/`, `/api/feed` and `/api/ranking-ready` alike, so they always agree: a user with no votes gets the shared cold deck as their current deck and is never warmed or cached (a deck left over from since-cleared votes is dropped); a voter gets their cached deck (queueing a passive warm while it is stale) or, with no deck yet, the shared cold deck as version 0 plus an urgent warm. Voted stories are filtered out of whatever deck is served. A warm labels its deck with the version current when ranking starts (a regen may have landed since it was queued) and queues a follow-up if a vote or regen lands while it ranks. Decks are capped at 100, evicting the oldest; no time-based TTL. The skeleton is only served for an empty cold deck at version 0 (first boot, before any regen). Tests: `tests/test_deck_state_machine.py` is a Hypothesis state machine over votes, clears, regens, restarts, reads and warms (including a regen or vote landing mid-rank) checking these rules.
+* **Dynamic Dashboard**: Each user's dashboard is rendered on-request via `fast_rerank_for_user()` → personalized SVM training → top-ranked selection (`enable_mmr=false` by default) → Jinja2 template render. The ranked deck is cached per user as `DeckState(ranked, built_at, version)` and HTML/JSON are rendered from it on each read, so the live version is always rendered in. A user's dashboard version is `_pool_generation + votes counter`: every vote bumps the user's counter, and each regen/RSS refresh (`Handler._pool_changed`) bumps the generation once, making every deck stale and queueing a refresh for each cached user. The generation starts at the boot time in milliseconds (since 2026-09-26; before, at 1), so versions only increase, across restarts too, and a cold deck (version 0) is always behind its target. `Handler._deck_for_user` is the one place a read picks a deck, for `/`, `/api/feed` and `/api/ranking-ready` alike, so they always agree: a user with no votes gets the shared cold deck as their current deck and is never warmed or cached (a deck left over from since-cleared votes is dropped); a voter gets their cached deck (queueing a passive warm while it is stale) or, with no deck yet, the shared cold deck as version 0 plus an urgent warm. At startup (since 2026-10-02) `Handler.warm_recent_users` queues that urgent warm for each profile with a vote in the last 7 days (latest first, at most 4), because the first rank in a fresh process takes 30-60 s against ~6 s for a later refit. Voted stories are filtered out of whatever deck is served. A warm labels its deck with the version current when ranking starts (a regen may have landed since it was queued) and queues a follow-up if a vote or regen lands while it ranks. Decks are capped at 100, evicting the oldest; no time-based TTL. The skeleton is only served for an empty cold deck at version 0 (first boot, before any regen). Tests: `tests/test_deck_state_machine.py` is a Hypothesis state machine over votes, clears, regens, restarts, reads and warms (including a regen or vote landing mid-rank) checking these rules.
 * **Background Regen**: The background loop fetches candidates into the shared `stories` table only. It does not render per-user dashboards.
 * **SVM Training**: Per-user SVM is trained lazily on uncached dashboard requests. The rendered HTML is cached until the next feedback vote bumps the per-user version counter; the fitted SVM model itself is not retained after the render returns.
-* **Feedback API**: `POST /api/feedback` requires valid session cookie. The `user_id` is extracted from the token and passed to `upsert_feedback`. The endpoint rejects cross-site POSTs (`Sec-Fetch-Site: cross-site`, or an `Origin` that does not match the forwarded request origin), keeps the existing 1MB body cap, and applies in-memory fixed-window public-demo throttles before writing feedback (`feedback_per_user_limit = 120` per 10 minutes and `feedback_global_limit = 2000` per hour by default). The endpoint explicitly accepts only integer `story_id` values and `action` in `up`, `neutral`, `down`, or `clear`; malformed payloads return 400 without cache invalidation or regen. A vote that changes nothing (repeating the story's current vote, or clearing a missing one) returns the current `target_version` and queues nothing (`upsert_feedback`/`delete_feedback` report whether a row changed). Every other successful vote (including `action: "clear"`) invalidates the user's dashboard cache, kicks a personalized warm render, and returns the bumped dashboard version as `target_version`. The response is `{ok, target_version}`. The authenticated `GET /api/ranking-ready?min_version=M` returns `{ok, ready, current_version}`: `ready` when the deck `_deck_for_user` would serve is at version `M` or newer (it queues a warm when that deck is stale, like any read). A `target_version` parameter (sent by older terminal clients) is ignored; the legacy `version=` alias was removed on 2026-09-26. The previous "defer until queue low / every 5 votes" gating was removed on 2026-06-28 because the SWR stale-hit path could re-inject an already-voted story into the deck via `refillQueue` for up to ~9s after each vote; see `WORKLOG.md` 2026-06-28 for the full bug. Warms run on the bounded, per-user-coalescing `WarmScheduler` described above.
+* **Feedback API**: `POST /api/feedback` requires valid session cookie. The `user_id` is extracted from the token and passed to `upsert_feedback`. The endpoint rejects cross-site POSTs (`Sec-Fetch-Site: cross-site`, or an `Origin` that does not match the forwarded request origin), keeps the existing 1MB body cap, and applies in-memory fixed-window public-demo throttles before writing feedback (`feedback_per_user_limit = 120` per 10 minutes and `feedback_global_limit = 2000` per hour by default). The endpoint explicitly accepts only integer `story_id` values and `action` in `up`, `neutral`, `down`, or `clear`; malformed payloads return 400 without cache invalidation or regen. A vote that changes nothing (repeating the story's current vote, or clearing a missing one) returns the current `target_version` and queues nothing (`upsert_feedback`/`delete_feedback` report whether a row changed). Every other successful vote (including `action: "clear"`) invalidates the user's dashboard cache, kicks a personalized warm render, and returns the bumped dashboard version as `target_version`. The response is `{ok, target_version}`. The authenticated `GET /api/ranking-ready?min_version=M` returns `{ok, ready, current_version, counts_version}` (`counts_version`: see 3.7, hot-thread counts): `ready` when the deck `_deck_for_user` would serve is at version `M` or newer (it queues a warm when that deck is stale, like any read). A `target_version` parameter (sent by older terminal clients) is ignored; the legacy `version=` alias was removed on 2026-09-26. The previous "defer until queue low / every 5 votes" gating was removed on 2026-06-28 because the SWR stale-hit path could re-inject an already-voted story into the deck via `refillQueue` for up to ~9s after each vote; see `WORKLOG.md` 2026-06-28 for the full bug. Warms run on the bounded, per-user-coalescing `WarmScheduler` described above.
 * **Frontend**: `localStorage` stores only the first-time tip overlay flag; SQLite feedback is authoritative, and the server filters voted stories out of every deck it serves. See the web client model above.
 * **PERF-2 feedback cadence**: `POST /api/feedback` returns the bumped `target_version`. Per-user in-memory cadence state resets its idle timer on every successful state change and schedules the latest version at 10 changes or 3 idle seconds. No-op clears do not participate.
 
@@ -522,8 +599,17 @@ source features cost ~−0.014/−0.007 NDCG@40, tier blend is neutral), and
 `svm_override` entry; `--sweep-svm` runs the C/γ grid through the same engine
 (replacing the deleted `scripts/svm_hparam_sweep.py` wrapper).
 
+Deck assembly always receives the fold's training upvote embeddings, including
+when similarity features are cached. Interest selection and semantic deduplication
+therefore match serving without introducing held-out feedback into the fold.
+
 Each run opens the source DB read-only via a consistent temporary SQLite backup
 (including committed WAL pages) and freezes configuration and evaluation time.
+Fold databases forward side-vector reads to that snapshot, preserving enabled
+Gemma scoring even when the same fold DB is reused across variants. Insufficient
+side coverage aborts an eligible SVM fold; cold/sparse profiles still skip that
+branch. Explicit `--replay-embeddings` requires side mode off in configuration
+and variant overrides, preventing an additional side vector from being appended.
 Schema-v2 reports record snapshot hash, code revision, input counts, sampling
 seeds/caps, per-fold story IDs and cutoffs, and effective configuration.
 `--now UNIX_TIME` supports repeatable comparisons. Input vectors must be finite,
@@ -605,6 +691,8 @@ The `/api/tldr-detail` endpoint enriches the LLM prompt with the full article bo
 To improve semantic ranking quality and render TLDRs instantly, the background pipeline executes a **strategic proactive fetching loop** in two passes:
 1. **First-Pass Ranking**: Candidates are ranked using existing metadata, comments, and titles.
 2. **Proactive Scrapes**: Builds a bounded priority queue over ranked candidates that do not yet have `article_body`. Dashboard-selected stories are always considered first, then remaining budget is filled from high-priority extras using rank, model score, HN score, comment count, score velocity, and comment velocity. Defaults are `article_fetch_max_per_run = 50`, `article_fetch_concurrency = 10`, and `article_fetch_max_age_days = 30`.
+Tweet URLs (x.com/twitter.com status links) never fetch x.com: `_fetch_tweet_body` reads the tweet from the public fxtwitter mirror and appends the first non-tweet page it links, as a body starting `Tweet by @` (kept even under `ARTICLE_SECTION_MIN_CHARS`).
+
 3. **Failure Memory**: Failed article-body fetches are recorded in `article_fetch_failures`. Transient failures back off exponentially; 404/410 and repeated empty extraction results are marked permanent and skipped by future proactive runs. A later `/api/tldr-detail` request remains the fallback path for stories outside the proactive budget.
 4. **Parallel Fetch & Re-Rank**: Fetches selected article bodies in parallel using `_fetch_article_body`, updates the SQLite `stories.article_body` field, re-embeds their newly composed text, and executes a second-pass ranking with updated vectors.
 5. **RSS snippet pass (regen)**: rank-driven fetching never reaches a feed that ships only a snippet, since the snippet is too thin to rank. `fetch_candidates_only` therefore also fetches article text for the newest RSS rows (not Reddit/LessWrong) still lacking it, up to `rss_article_prewarm_max_per_run` (30) per regen, under the same eligibility and failure memory (`select_rss_article_prewarm`).
@@ -619,6 +707,8 @@ Fetch flow (server.py `_fetch_article_body`):
 Reddit RSS stories are treated differently. On `/api/tldr-detail`, `rss_reddit_*` rows with missing author text or comments fetch the per-post `.rss` feed and cache the first entry's Markdown body in `self_text` and up to 40 selected comment entries in `top_comments` (10K chars total). Generic article scraping is skipped for Reddit comments pages so Reddit block/error pages are not cached as `article_body`. The Reddit RSS enrichment reuses the same `top_comments` field as HN stories, so prompt construction, embeddings, and discussion-rich surfacing see Reddit discussion text through the existing schema.
 
 LessWrong RSS stories (`rss_lesswrong_com`) follow the same lazy-enrichment pattern but use LessWrong's public GraphQL endpoint (`https://www.lesswrong.com/graphql`) instead of RSS feeds. On `/api/tldr-detail`, the post ID is extracted from the URL (`/posts/<postId>/<slug>`), then a single GraphQL request fetches both the post body (`contents.html`) and top-voted comments (`view: "postCommentsTop"`) in parallel. Results are cached in `self_text`, `top_comments`, and `comment_count`. Generic article scraping is skipped for LessWrong stories since there's no standalone article URL to scrape.
+
+AINews stories (`rss_ainews`, `pipeline/ainews.py`, since 2026-09-29) are built at regen, not enriched lazily. AINews ships whole issues as `[AINews]` entries in `latent.space/feed` (`ainews_feed_url`); `fetch_candidates` passes `skip_title_prefixes=("[AINews]",)` to `fetch_rss_feeds` so the generic path keeps only the feed's other posts, and `fetch_ainews_stories` splits each issue's "AI Twitter Recap" into one story per bold-heading topic (Reddit recap and "Top tweets" skipped; topics repeated by a reposted issue collapse). The topic's bullets become `self_text`; the text of every tweet it links to, fetched from the public `api.fxtwitter.com` mirror (never x.com), becomes `top_comments`, so the TLDR sees them as article plus discussion. Tweets are fetched once per story, at most `ainews_max_tweets_per_run` (400) per regen; the rest fill in on later runs. Score is 0 like other RSS rows (tweet likes would swamp HN points in gravity). The story URL (the reader's `o`) is the topic's first linked tweet on x.com, or the topic link when it has none; `discussion_url` (`c`) is the issue with a text fragment (`#:~:text=<first 8 title words>`) that scrolls the browser to the topic heading. Article fetching is disabled for the source (`_NO_ARTICLE_SOURCES`, and the tldr-detail article lane). Ids hash `ainews-v2:` plus the issue URL and topic slug. Whole-issue `[AINews]` rows stored before the split, and topic rows from the first layout (issue URL as story URL, no `discussion_url`), stay in the DB but `load_production_candidate_stories` filters them out. `ainews_enabled=false` restores the old whole-issue cards. Preview without the DB: `uv run python scripts/ainews_topics.py`.
 
 ### 4.2 Prompt Construction
 
@@ -664,6 +754,8 @@ Responses API).
 
 Detailed TLDR output is cached in SQLite in `tldr_cache` after any dynamic HN comment fetch, Reddit RSS enrichment, or article-body scrape has completed. The cache is keyed by story ID plus a SHA-256 fingerprint of the prompt/model identity and prompt-truncated text inputs (`title`, `self_text`, `top_comments`, and `article_body`). Wall-clock age and engagement metadata are intentionally excluded so cached TLDRs remain reusable as time passes and scores change; refreshed comments, article bodies, or prompt/model versions naturally miss the cache. The request path checks the stored-field cache key before quota/enrichment, then checks the enriched cache key after any successful dynamic context fetch. Only the newest cache entry for a story is retained.
 
+Pointer threads (`pipeline/hn_dupes.pointer_thread_target`: the whole discussion is one short "Comments moved to item?id=N" / "[dupe]" / "Discussion (N points…): <link>" note) are summarized from the linked thread: the tap and the prefetch fetch it from Algolia (`_follow_pointer_thread`) and store its comments authoritatively. Generation drops a pointer note, and so does the cache key, so summaries cached under the note itself (they invented a discussion) never match. A follow that finds nothing is retried at most every 6 h per story (`POINTER_FOLLOW_RETRY_S`, in memory); meanwhile the story is summarized from its article alone and cached. The stale-summary fallback skips unfollowed pointer stories.
+
 The prompts are built from structured sections of the raw story fields (passed separately, not pre-composed):
 
 - Title
@@ -692,6 +784,9 @@ dashboard shell retains its 1280px cap and optional filter rail.
 ### 4.3 Client-side Rendering
 
 The raw Markdown response is formatted on the fly using a robust, line-by-line parser (`parseSimpleMarkdown`) to render headers, bold text, and lists safely.
+Web and TUI feedback writes remain serialized in action order. Each optimistic
+vote/undo captures a per-story revision; failure rollback applies only if that
+revision is still current, preserving a later choice on the same story.
 
 ### 4.4 Interaction ledger
 
@@ -701,7 +796,14 @@ sent to same-origin `POST /api/interaction` with `navigator.sendBeacon` (falling
 back to a keepalive fetch). The neutral path avoids privacy extensions that
 block URLs containing "events". Each event carries a browser-session UUID, user
 identity from the HTTP-only cookie, story ID, visible position, dashboard
-version, current sort/age/source filters, and the active ranker arm. TLDR
+version, current sort, time window and source filter, and the active ranker arm.
+The API field is `window`; it is stored in the ledger's `age_filter` column,
+which kept its name (no migration) and holds `recent`/`archive` for events
+before 2026-09-28. Since 2026-09-30 events may carry `badges`, the card's
+badge kinds as shown (e.g. `["interest", "hot"]`; web and terminal clients
+send them, older clients omit them), stored comma-joined in the added
+`badges` column (`''` for none or unknown), so per-badge outcomes can be read
+exactly. TLDR
 prefetches and automatic card enrichment do not generate interaction events.
 
 SQLite stores events indefinitely in the additive STRICT `interaction_events`
@@ -711,8 +813,10 @@ erase historical exposure data or block retention maintenance. The migration
 script creates a consistent backup and verifies integrity before and after the
 schema change.
 
-Ingestion is per-event (since 2026-07-15): any nonzero integer story ID is
-valid — non-HN stories use negative synthetic IDs — and a malformed event or
+Ingestion is per-event (since 2026-07-15): any nonzero signed 64-bit story ID is
+valid — non-HN stories use negative synthetic IDs. Dashboard version and
+position must fit nonnegative signed 64-bit integers; timestamps must convert
+to finite positive floats. A malformed event or
 one referencing an unknown story is rejected or skipped individually, counted
 in the response's `rejected` field, and logged at WARNING; it never discards
 its batch neighbors. Only envelope-level problems (bad JSON, wrong shape,
@@ -734,8 +838,12 @@ recent rows whose source is derived from the currently configured feed list.
 
 ## Terminal feed API
 
-`GET /api/feed` authenticates with the existing profile cookie and returns the
-version-one feed contract from `clients/tui/src/hn_rerank/models.py`. The backend
+`GET /api/feed?window=<12h|1d|1w|1m|archive>` (default `1w`; anything else
+is a 400) authenticates with the existing profile cookie and returns one window
+of the deck in the feed contract from `clients/tui/src/hn_rerank/models.py`
+(`FEED_API_VERSION = 2` since 2026-09-28): `window`, that window's stories, and
+`orders` with `recommended`, `popular` and `explore`. Clients reject any other
+schema version with an "update the client" message. The backend
 imports this dependency-free module directly; no terminal or ML dependencies were
 added. The page and the feed come from the same `Handler._deck_for_user` choice;
 the feed is built directly (`pipeline.render.build_feed`) without rendering HTML.
@@ -750,10 +858,20 @@ stories sequentially, retaining ordinary generation only on selection.
 
 The terminal client checks ranking versions every minute while idle and uses
 its existing refresh path on changes; reading, help and voting defer the check.
+A changed `counts_version` alone refetches the window's feed for fresh
+points/comments (section 3.7) without resetting summaries.
 This does not bypass Reddit rate limits or promise real-time HN upstream data.
 
 The terminal client prefixes headline titles with badge emoji and offers a
-`b` legend hotkey (Escape returns to the story). Story JSON now includes badge details (kind/icon/label/tooltip) and card
+`b` legend hotkey (Escape returns to the story). Its metadata row names a
+non-HN story's feed (`source_label`: AINews, LessWrong, r/sub) rather than
+the linked domain, and leaves out a non-HN story's zero points or comments
+(unknown, not zero; blank columns keep the rows aligned). The reading pane's
+heading adds the web card's "Because you upvoted: …" line
+(`best_match_title`), and a summary wait counts up ("Loading summary… 5s").
+Panes under 30 rows (`COMPACT_HEIGHT`, e.g. a small tmux split) drop that
+line and show only "? help" in the footer. The footer is always one row
+(2026-10-03): on any pane the keys shrink to fit beside the status. Story JSON now includes badge details (kind/icon/label/tooltip) and card
 presentation fields. The browser keeps server-rendered initial paint but uses
 `/api/feed` JSON for refills, building DOM nodes with textContent instead of
 injecting story text as HTML. Feed orders retain production

@@ -6,7 +6,7 @@
 -- dashboard, independent of how stories are ranked or summarized.
 -- Includes:
 --   - First-visit account creation and profile-link device linking
---   - Navigation filters (sort / age / source) and how they compose
+--   - Navigation filters (sort / time window / source) and how they compose
 --   - The single-card "deck" consumption model: one active card at a
 --     time, voted cards never resurface, running out of cards
 --     triggers a background refill
@@ -30,7 +30,7 @@ use "./ranking-feedback.allium" as ranking
 
 external entity Browser {}
 
-enum SortMode { recommended | popular | explore | date }
+enum SortMode { recommended | popular | explore }
 enum TldrOutcome { summarized | nothing_to_summarize | failed }
 enum InteractionKind { impression | article_open | comments_open | dwell }
 
@@ -48,7 +48,7 @@ entity BrowserSession {
 entity NavigationFilter {
     viewer: ranking/User
     sort: SortMode
-    age: ranking/SegmentAge
+    window: ranking/TimeWindow
     source: SourceFilter
 }
 
@@ -118,9 +118,18 @@ rule SelectSource {
             NavigationFilter{viewer}.sort = recommended
 }
 
-rule SelectAge {
-    when: SelectAge(viewer, age)
-    ensures: NavigationFilter{viewer}.age = age
+rule SelectWindow {
+    when: SelectWindow(viewer, window)
+    ensures: NavigationFilter{viewer}.window = window
+
+    @guidance
+        -- The server sends one window per request. A window already
+        -- fetched for the current deck version shows at once; another is
+        -- fetched first. After a window is shown its neighbours are
+        -- fetched in the background, one request at a time, once per deck
+        -- version, never generating summaries. A newer deck version or a
+        -- saved vote discards background answers from before it, and no
+        -- background answer replaces the window on screen.
 }
 
 rule RecordInteraction {
@@ -142,7 +151,7 @@ surface StoryDeck {
 
     exposes:
         filter.sort
-        filter.age
+        filter.window
         filter.source
         card.segment
         card.badges
@@ -151,7 +160,7 @@ surface StoryDeck {
 
     provides:
         SelectSort(viewer, sort)
-        SelectAge(viewer, age)
+        SelectWindow(viewer, window)
         SelectSource(viewer, source)
         ranking/CastVote(viewer, card.story, reaction)
         ranking/ClearVote(viewer, card.story)
@@ -197,9 +206,10 @@ surface StoryDeck {
         -- requests and enrichment do not count as viewer intent.
 
     @guidance
-        -- Filtering (sort/age/source) narrows which already-fetched
-        -- cards are eligible to become active; it is not a new query
-        -- for different stories.
+        -- Sort and source narrow which already-fetched cards of the
+        -- window are eligible to become active; they are not a new query.
+        -- A window is its own query (see SelectWindow). A vote hides its
+        -- story in every window at once; undo brings it back in each.
 }
 
 rule DismissOnboardingTip {

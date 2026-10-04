@@ -1,0 +1,217 @@
+"""Opt-in blend of the production score with a dense logistic regression and
+a TF-IDF logistic regression (`linear_blend_enabled`).
+
+Offline (FINDINGS.md, 2026-09-29): 0.5 production + 0.2 dense LR + 0.3 TF-IDF,
+each as an average-rank percentile, beat production on user 1's votes.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import threading
+from collections.abc import Sequence
+from dataclasses import dataclass
+from urllib.parse import urlparse
+
+import numpy as np
+from cachetools import LRUCache
+from numpy.typing import NDArray
+from scipy.sparse import csr_matrix, vstack
+from sklearn.feature_extraction.text import HashingVectorizer, TfidfTransformer
+from sklearn.linear_model import LogisticRegression
+
+from database import Story
+
+TFIDF_TEXT_CHARS = 5000
+UP, DOWN = 2, 0
+
+
+def percentile_scores(scores: NDArray[np.floating]) -> NDArray[np.float32]:
+    """Ranks scaled to [0, 1]; equal scores share their average rank."""
+    if len(scores) <= 1:
+        return np.ones(len(scores), dtype=np.float32)
+    _, inverse, counts = np.unique(scores, return_inverse=True, return_counts=True)
+    ends = np.cumsum(counts)
+    average = (ends - counts + ends - 1) / 2.0
+    return (average[inverse] / (len(scores) - 1)).astype(np.float32)
+
+
+def story_domain(story: Story) -> str:
+    return (urlparse(story.url or "").hostname or "").removeprefix("www.")
+
+
+def tfidf_text(story: Story) -> str:
+    """Domain and source tokens, title, and the start of the text content."""
+    domain = story_domain(story).replace(".", "_") or story.source
+    return (
+        f"dom_{domain} src_{story.source} {story.title} "
+        f"{story.text_content[:TFIDF_TEXT_CHARS]}"
+    )
+
+
+HASH_FEATURES = 2**18
+# A rank touches every candidate (caps: 10k live HN + 4k archive + 5k RSS)
+# plus each voter's ~2.9k training stories; below that, LRU evicts rows
+# before their reuse and every rank re-tokenises. ~3.4 KB a row (mean 395
+# nonzeros, 2026-09-29 snapshot), so ~110 MB when full.
+ROW_CACHE_MAXSIZE = 32_000
+
+# Word 1-2 gram counts hashed into a fixed space: a story's row never depends
+# on the vote set, so it is computed once per (story, text) and reused across
+# every retrain and rank. Tokenising 10k candidates costs ~8s per rank.
+_HASHER = HashingVectorizer(
+    ngram_range=(1, 2),
+    stop_words="english",
+    n_features=HASH_FEATURES,
+    alternate_sign=False,
+    norm=None,
+    dtype=np.float32,
+)
+_ROWS: LRUCache[tuple[int, bytes], csr_matrix] = LRUCache(maxsize=ROW_CACHE_MAXSIZE)
+_ROWS_LOCK = threading.Lock()
+
+
+def count_rows(stories: Sequence[Story]) -> csr_matrix:
+    """Hashed word 1-2 gram counts, one row per story (cached)."""
+    texts = [tfidf_text(s) for s in stories]
+    keys = [
+        (s.id, hashlib.blake2b(t.encode(), digest_size=8).digest())
+        for s, t in zip(stories, texts)
+    ]
+    with _ROWS_LOCK:
+        rows = [_ROWS.get(key) for key in keys]
+    missing = [i for i, row in enumerate(rows) if row is None]
+    if missing:
+        fresh = _HASHER.transform([texts[i] for i in missing]).tocsr()
+        with _ROWS_LOCK:
+            for pos, i in enumerate(missing):
+                rows[i] = fresh[pos]
+                _ROWS[keys[i]] = fresh[pos]
+    return vstack(rows, format="csr")
+
+
+def balanced_weights(labels: Sequence[int]) -> NDArray[np.float64]:
+    counts = {label: labels.count(label) for label in set(labels)}
+    return np.array([len(labels) / (len(counts) * counts[label]) for label in labels])
+
+
+def up_minus_down(clf: LogisticRegression, features: object) -> NDArray[np.float32]:
+    probs = clf.predict_proba(features)
+    classes = list(clf.classes_)
+    return (probs[:, classes.index(UP)] - probs[:, classes.index(DOWN)]).astype(
+        np.float32
+    )
+
+
+@dataclass(frozen=True)
+class LinearBlendModels:
+    """Fitted per feedback signature; cached next to the SVM."""
+
+    dense: LogisticRegression
+    keep: NDArray[np.bool_]  # hashed columns seen in >= 2 training stories
+    idf: TfidfTransformer
+    tfidf: LogisticRegression
+
+
+def _warm_start(
+    clf: LogisticRegression,
+    prev: LogisticRegression,
+    coef: NDArray[np.float64],
+    labels: Sequence[int],
+) -> None:
+    """Start *clf*'s solver at a previous fit's solution when the classes
+    match. Consecutive fits differ by a vote or two, so lbfgs needs ~12
+    iterations instead of ~50 (TF-IDF on 2,883 votes: 2 s vs 14 s, same
+    ranking); the problem is convex, so the optimum does not change."""
+    if not np.array_equal(prev.classes_, np.unique(np.asarray(labels))):
+        return
+    clf.warm_start = True
+    clf.coef_ = coef
+    clf.intercept_ = prev.intercept_.copy()
+
+
+def fit_linear_blend(
+    dense_features: NDArray[np.float32],
+    dense_labels: Sequence[int],
+    dense_weights: NDArray[np.float64],
+    stories: Sequence[Story],
+    story_labels: Sequence[int],
+    *,
+    dense_c: float,
+    tfidf_c: float,
+    warm: LinearBlendModels | None = None,
+) -> LinearBlendModels:
+    """``dense_*`` are the SVM's scaled training rows (with any zero rows for
+    absent classes); ``stories``/``story_labels`` are the real votes only.
+    ``warm`` is the user's previous fit, used only as a solver start."""
+    dense = LogisticRegression(C=dense_c, solver="lbfgs", max_iter=2000, random_state=0)
+    if warm is not None and warm.dense.coef_.shape[1] == dense_features.shape[1]:
+        _warm_start(dense, warm.dense, warm.dense.coef_.copy(), dense_labels)
+    dense.fit(dense_features, dense_labels, sample_weight=dense_weights)
+    counts = count_rows(stories)
+    keep = np.asarray((counts > 0).sum(axis=0)).ravel() >= 2
+    idf = TfidfTransformer(sublinear_tf=True)
+    x_train = idf.fit_transform(counts[:, keep])
+    tfidf = LogisticRegression(C=tfidf_c, max_iter=3000, random_state=0)
+    if warm is not None and warm.keep.size == keep.size:
+        # Columns kept last time map onto this fit's kept columns; words that
+        # newly reach two stories start at zero.
+        full = np.zeros((warm.tfidf.coef_.shape[0], keep.size))
+        full[:, warm.keep] = warm.tfidf.coef_
+        _warm_start(tfidf, warm.tfidf, full[:, keep], story_labels)
+    tfidf.fit(x_train, story_labels, sample_weight=balanced_weights(list(story_labels)))
+    return LinearBlendModels(dense=dense, keep=keep, idf=idf, tfidf=tfidf)
+
+
+def blend_scores(
+    models: LinearBlendModels,
+    production: NDArray[np.floating],
+    dense_candidates: NDArray[np.float32],
+    candidates: Sequence[Story],
+    *,
+    dense_weight: float,
+    tfidf_weight: float,
+) -> NDArray[np.float32]:
+    """Percentile-rank blend; production keeps the remaining weight."""
+    x_cand = models.idf.transform(count_rows(candidates)[:, models.keep])
+    return (
+        (1.0 - dense_weight - tfidf_weight) * percentile_scores(production)
+        + dense_weight
+        * percentile_scores(up_minus_down(models.dense, dense_candidates))
+        + tfidf_weight * percentile_scores(up_minus_down(models.tfidf, x_cand))
+    ).astype(np.float32)
+
+
+# One fit per user, under its latest feedback signature: after a vote the
+# old fit is only the next fit's warm start (~7 MB each at ~229k kept
+# TF-IDF columns; a voting burst used to leave 20 of one user's).
+_CACHE: LRUCache[tuple[int, str, int], LinearBlendModels] = LRUCache(maxsize=10_000)
+_LOCK = threading.Lock()
+
+
+def get_cached(key: tuple[int, str, int]) -> LinearBlendModels | None:
+    with _LOCK:
+        return _CACHE.get(key)
+
+
+# Each cached user's most recent fit, a warm start for the next one; leaves
+# with the user's _CACHE entry.
+_LATEST: dict[int, LinearBlendModels] = {}
+
+
+def latest(user_id: int) -> LinearBlendModels | None:
+    with _LOCK:
+        return _LATEST.get(user_id)
+
+
+def set_cached(
+    key: tuple[int, str, int], models: LinearBlendModels, maxsize: int
+) -> None:
+    with _LOCK:
+        for old in [k for k in _CACHE if k[0] == key[0] and k != key]:
+            del _CACHE[old]
+        _CACHE[key] = models
+        _LATEST[key[0]] = models
+        while len(_CACHE) > maxsize:
+            evicted, _ = _CACHE.popitem()
+            _LATEST.pop(evicted[0], None)

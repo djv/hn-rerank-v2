@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -13,16 +14,32 @@ import numpy as np
 import pytest
 
 from database import Database, Story
-from pipeline import Config, build_cold_deck, finalize_ranked_deck, rerank_candidates
-from pipeline.hn_dupes import (
-    _load_feedback_context,
-    _matches_feedback,
-    canonicalize_hn_dupes,
+from pipeline import (
+    Config,
+    build_cold_deck,
+    canonicalize_deck,
+    finalize_ranked_deck,
+    rerank_candidates,
 )
-from pipeline.ranking import _loocv_knn_features, _score_and_rank
+from pipeline.hn_dupes import _load_feedback_context, _matches_feedback
+from pipeline.ranking import (
+    RankTrace,
+    _loocv_knn_features,
+    _score_and_rank,
+    serve_window,
+)
+from pipeline import side_embeddings
 from scripts import eval_ranker_variants as evaluator
 
 NOW = 2_000_000_000.0
+
+
+@pytest.fixture(autouse=True)
+def fresh_side_cache() -> Iterator[None]:
+    # These independent snapshot fixtures reuse story IDs and model versions.
+    side_embeddings._CACHE.clear()
+    yield
+    side_embeddings._CACHE.clear()
 
 
 def story(sid: int, *, age_days: int = 1, source: str = "hn") -> Story:
@@ -143,12 +160,11 @@ def test_production_scores_features_and_recommended_parity(precomputed: bool) ->
         actual_deck = evaluator._recommended(actual_scores, fold, config, probs, None)
         assert actual_deck == expected_deck
         metrics = evaluator._metrics(actual_scores, fold, config, probs)
-        for age in ("recent", "archive"):
-            for source in ("mixed", "hn", "non-hn"):
-                combo = f"{age}_{source}"
-                assert metrics[f"recommended_{combo}"]["returned_cards"] == sum(
-                    combo in r.combo_keys.split() for r in expected_deck
-                )
+        # Deck metrics: the default window's Recommended, as served.
+        served = serve_window(expected_deck.window("1w"), "1w", NOW)
+        assert served.recommended
+        assert metrics["recommended_1w"]["returned_cards"] == len(served.recommended)
+        assert not any(key.startswith("recommended_recent") for key in metrics)
         assert metrics["raw"]["brier_up"] is None  # softmax scores are not calibrated
 
 
@@ -165,17 +181,17 @@ def test_cold_deck_parity() -> None:
         patch("time.time", return_value=NOW),
         evaluator._fold_database(fold, config, None) as db,
     ):
-        expected = canonicalize_hn_dupes(
+        expected = canonicalize_deck(
             build_cold_deck(db, config, candidates=fold.candidates),
             db,
-            selected_limit=config.count,
             user_id=1,
         )
         actual = evaluator._recommended(
             np.arange(78, dtype=float), fold, config, None, None
         )
         assert actual == expected
-        assert not any(r.is_novel or r.is_uncertain or r.is_similar for r in actual)
+        assert not actual.is_empty()
+        assert all(not actual.window(w).explore for w in actual.windows)
 
 
 def test_failed_production_fit_aborts() -> None:
@@ -188,6 +204,175 @@ def test_failed_production_fit_aborts() -> None:
             pytest.raises(RuntimeError, match="Production fit failed"),
         ):
             evaluator._production_scores(make_fold(), config)
+
+
+@pytest.mark.parametrize("precomputed", [False, True])
+@pytest.mark.parametrize("reuse_fold_db", [False, True])
+def test_production_side_scores_match_source_snapshot(
+    precomputed: bool, reuse_fold_db: bool
+) -> None:
+    fold = make_fold()
+    config = replace(
+        Config(),
+        side_embedding_dim=8,
+        model=replace(
+            Config().model,
+            min_up_for_svm=2,
+            min_down_for_svm=2,
+            svm_precomputed_enabled=precomputed,
+            side_embedding_enabled=True,
+        ),
+    )
+    stored_only = replace(
+        config, model=replace(config.model, side_embedding_enabled=False)
+    )
+    with (
+        patch("time.time", return_value=NOW),
+        evaluator._fold_database(fold, stored_only, None) as source,
+    ):
+        source.upsert_side_embeddings(
+            config.side_embedding_model_version,
+            [
+                (
+                    s.id,
+                    side_embeddings.side_text_hash(s),
+                    np.eye(8, dtype=np.float32)[s.id % 8],
+                )
+                for s in fold.candidates + fold.train_stories
+            ],
+        )
+        trace = RankTrace()
+        expected = _score_and_rank(
+            fold.candidates,
+            fold.cand_emb,
+            source,
+            config,
+            evaluator._FrozenEmbedder(config.embedding_model_version),
+            trace=trace,
+        )
+        assert trace.labels["side_embeddings"] == "on"
+        # Direct scoring must not prime the cache and hide broken fold reads.
+        side_embeddings._CACHE.clear()
+        with evaluator._fold_database(fold, stored_only, source) as fold_db:
+            active_fold = replace(fold, runtime_db=fold_db) if reuse_fold_db else fold
+            actual, probabilities = evaluator._production_scores(
+                active_fold, config, source
+            )
+            without_side, _ = evaluator._production_scores(active_fold, stored_only)
+        by_id = {r.story.id: r for r in expected}
+        np.testing.assert_array_equal(
+            actual, [by_id[s.id].score for s in fold.candidates]
+        )
+        np.testing.assert_array_equal(
+            probabilities,
+            np.array(
+                [
+                    [
+                        by_id[s.id].prob_down,
+                        by_id[s.id].prob_neutral,
+                        by_id[s.id].prob_up,
+                    ]
+                    for s in fold.candidates
+                ],
+                dtype=np.float32,
+            ),
+        )
+        assert not np.allclose(actual, without_side)
+
+
+@pytest.mark.parametrize("invalid", ["missing", "stale", "wrong_dim"])
+def test_production_side_fallback_aborts(invalid: str) -> None:
+    fold = make_fold()
+    config = replace(
+        Config(),
+        side_embedding_dim=8,
+        model=replace(
+            Config().model,
+            min_up_for_svm=2,
+            min_down_for_svm=2,
+            side_embedding_enabled=True,
+        ),
+    )
+    with (
+        patch("time.time", return_value=NOW),
+        evaluator._fold_database(fold, config, None) as source,
+    ):
+        if invalid != "missing":
+            source.upsert_side_embeddings(
+                config.side_embedding_model_version,
+                [
+                    (
+                        s.id,
+                        "stale"
+                        if invalid == "stale"
+                        else side_embeddings.side_text_hash(s),
+                        np.eye(8 if invalid == "stale" else 4, dtype=np.float32)[
+                            s.id % 4
+                        ],
+                    )
+                    for s in fold.candidates + fold.train_stories
+                ],
+            )
+        with pytest.raises(RuntimeError, match="side embedding coverage"):
+            evaluator._production_scores(fold, config, source)
+
+
+@pytest.mark.parametrize("cold", [False, True])
+def test_side_mode_allows_cold_and_sparse_profiles(cold: bool) -> None:
+    fold = make_fold()
+    indices = np.array([] if cold else [0, 2], dtype=int)
+    assert fold.train_emb is not None
+    fold = replace(
+        fold,
+        train_stories=[fold.train_stories[i] for i in indices],
+        y_train=fold.y_train[indices],
+        train_vote_times=fold.train_vote_times[indices],
+        train_emb=fold.train_emb[indices],
+    )
+    config = replace(
+        Config(), model=replace(Config().model, side_embedding_enabled=True)
+    )
+    scores, probabilities = evaluator._production_scores(fold, config)
+    assert len(scores) == len(fold.candidates) and np.isfinite(scores).all()
+    assert probabilities is None
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        None,
+        "prod[side_embedding_enabled=true]",
+        "produd[side_embedding_enabled=true]",
+        "prodlr[lr_weight=0.6;side_embedding_enabled=true]",
+        "stack[mode=lr;feats=both;side_embedding_enabled=true]",
+    ],
+)
+def test_replay_rejects_enabled_side_mode_before_opening_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variant: str | None
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text(
+        '[hn_rewrite]\ndb_path = "must-not-open.db"\n'
+        f"[hn_rewrite.model]\nside_embedding_enabled = {'true' if variant is None else 'false'}\n"
+    )
+
+    def unexpected_database_open(*args: object) -> None:
+        pytest.fail("Invalid replay setup opened a database")
+
+    monkeypatch.setattr(evaluator, "frozen_database", unexpected_database_open)
+    args = [
+        "--config",
+        str(config),
+        "--candidate-pool",
+        "heldout-feedback",
+        "--replay-embeddings",
+        str(tmp_path / "unused.npz"),
+    ]
+    if variant is not None:
+        args.extend(["--variants", variant])
+    with pytest.raises(SystemExit) as error:
+        evaluator.main(args)
+    assert error.value.code == 2
 
 
 def test_null_metrics_unjudged_and_empty_results() -> None:
@@ -429,8 +614,8 @@ def test_canonical_replacement_uses_snapshot_target(tmp_path: Path) -> None:
     scores[[s.id for s in fold.candidates].index(source_id)] = 10
     with patch("time.time", return_value=NOW):
         deck = evaluator._recommended(scores, fold, Config(), None, source)
-    assert target.id in {r.story.id for r in deck}
-    assert source_id not in {r.story.id for r in deck}
+    assert target.id in {r.story.id for r in deck.stories()}
+    assert source_id not in {r.story.id for r in deck.stories()}
     source.close()
 
 

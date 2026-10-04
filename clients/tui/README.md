@@ -5,18 +5,27 @@ profile with your server URL, for example `https://your-host/hn/`.
 `--server URL` selects a deployment; credentials from another server are never reused.
 The server retains its existing access policy: installing the client does not grant access.
 
-Keys: j/k or arrows navigate/scroll; Tab changes focus; 1/2/3 vote
+Keys: j/k next/previous story (list and zoom view); arrows scroll the focused
+pane; Space pages the TLDR down from either view; d / D cycle the time window
+forward / back (the last one picked opens next time); Tab changes focus; 1/2/3 vote
 positive/neutral/negative and advance to the next story at once (votes are sent
 in order in the background; a failed one puts its story back with an error);
-u undoes the latest vote; o/c open article/comments;
-y copies the comments link (or the article link if there is none); r refreshes; ? shows help; q quits.
+u undoes the latest vote; o/c open article/comments (in Chrome, or in the
+command in `HN_RERANK_BROWSER`, e.g. `surf`);
+y copies the comments link (or the article link if there is none); a opens
+Claude Code in a tmux pane split beside the reader (in your home directory) with the article and
+comments links and a "dig deeper" prompt (`HN_RERANK_AGENT` overrides the
+`claude` command; outside tmux the prompt is copied instead); r refreshes; ? shows help; q quits.
 Enter hides the article list and zooms the TLDR pane; Enter or Escape returns
-to the list. Escape also closes help. Use the sort and age selectors to change
+to the list. Escape also closes help. Use the sort and window selectors (or h/l and d) to change
 filters. Below 100 columns the headline list stacks above the summary.
+Non-HN stories show their feed's name (AINews, r/sub) and no score or comment
+count when the feed has none; the summary heading says which upvote a story
+resembles ("Because you upvoted: …").
 
 Summaries are cached for the session across sort changes. Up to four background
 requests warm the next 20 stories, the previous three, and the first three
-stories in each other sort for the current age filter. Prefetch starts alongside
+stories in each other sort for the current time window. Prefetch starts alongside
 the selected summary and refills as you navigate or vote.
 
 Missing TLDRs are generated for the next three stories, the previous three,
@@ -28,7 +37,7 @@ entry window (up to three); `0` keeps all background work cache-only.
 Navigation reuses an in-flight prefetch instead of issuing a duplicate request.
 Errors pause new background requests for a minute; requests already running may
 finish. Empty, stale or partial responses are never cached. Rapid navigation
-can still outrun generation, and changing the age filter warms its own targets.
+can still outrun generation, and changing the time window warms its own targets.
 
 Selected-story transitions that remain selected for at least one second send
 best-effort impression events to your configured server's existing interaction
@@ -76,9 +85,11 @@ the repository root with `uv run python -m clients.tui.tests.preview --headless`
 The reader follows the local clock: a light paper theme from 06:00 to 19:59,
 the dark editorial theme otherwise (checked every minute; a theme picked from
 the command palette holds until the next boundary). Unselected headlines are
-dimmed, so the selected row (a lifted band plus the `>` marker) reads first. One docked footer bar carries the current
+dimmed, so the selected row (a lifted band plus the `>` marker) reads first. The
+filter bar and a one-row docked footer share a tint slightly off the page color. The footer carries the current
 filter's counts on the left (`2 shown · +0 ~0 −0`) and context-sensitive keys on
-the right; failures appear there with a `✗` prefix and replace the counts until
+the right; when both do not fit, the keys shrink step by step down to `? help`,
+then the status is cut with `…`. Failures appear there with a `✗` prefix and replace the counts until
 the next successful refresh. Scrollbars follow the theme, and stories without a
 usable timestamp simply omit the age.
 

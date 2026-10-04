@@ -17,6 +17,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.theme import Theme
+from textual.timer import Timer
 from textual.widgets import (
     Button,
     Input,
@@ -46,12 +47,21 @@ from .api import (
     Profile,
     TransientError,
     load_profile,
+    load_window,
     normalize_server,
     profile_path,
     save_profile,
+    save_window,
 )
 from .api import Summary as SummaryResult
-from .models import Feed, FeedStory
+from .models import (
+    DEFAULT_WINDOW,
+    GRAVITY_TIME_SCALE,
+    WINDOW_LABELS,
+    WINDOWS,
+    Feed,
+    FeedStory,
+)
 
 DEFAULT_SERVER = "https://proxy.example.net:8443/hn/"
 
@@ -71,6 +81,7 @@ DARK_PALETTE: dict[str, str] = {
     "surface": "#222222",
     "panel": "#292724",
     "bar": "#1D1C1A",
+    "chrome": "#262420",
     "modal": "#1C1B19",
     "button-focus": "#2E2B27",
     "border": "#44403B",
@@ -95,6 +106,7 @@ LIGHT_PALETTE: dict[str, str] = {
     "surface": "#F0EBE3",
     "panel": "#E8E2D8",
     "bar": "#F2EDE5",
+    "chrome": "#ECE5D9",
     "modal": "#F2EDE5",
     "button-focus": "#E0D8CB",
     "border": "#CFC7BA",
@@ -170,29 +182,41 @@ def copy_with_system_tool(text: str) -> bool:
     return False
 
 
-def open_in_firefox(url: str) -> None:
-    """Open a URL in the running Firefox window, launching one if needed."""
+def open_in_browser(url: str) -> None:
+    """Open a URL in `$HN_RERANK_BROWSER` (a command, e.g. `surf`) when set,
+    else in Chrome, bringing its window forward. A running Chrome adds the
+    URL as a tab in its current window; otherwise it starts one."""
+    import os
+    import shlex
     import shutil
     import subprocess
 
-    firefox = shutil.which("firefox")
-    if firefox is None:
-        webbrowser.open(url)
-        return
-    # A missing pgrep/wmctrl or a failed launch must not crash the reader.
-    try:
-        running = (
-            subprocess.run(
-                ["pgrep", "-x", "firefox"],
+    if custom := shlex.split(os.environ.get("HN_RERANK_BROWSER", "")):
+        try:
+            subprocess.Popen(
+                [*custom, url],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=2,
-                check=False,
-            ).returncode
-            == 0
-        )
+                start_new_session=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            webbrowser.open(url)
+        return
+    chrome = next(
+        (
+            path
+            for name in ("google-chrome", "google-chrome-stable", "chromium")
+            if (path := shutil.which(name))
+        ),
+        None,
+    )
+    if chrome is None:
+        webbrowser.open(url)
+        return
+    # A failed launch must not crash the reader.
+    try:
         subprocess.Popen(
-            [firefox, "--new-tab", url] if running else [firefox, url],
+            [chrome, url],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
@@ -203,7 +227,7 @@ def open_in_firefox(url: str) -> None:
     if shutil.which("wmctrl") is not None:
         try:
             subprocess.run(
-                ["wmctrl", "-x", "-a", "Navigator.firefox"],
+                ["wmctrl", "-x", "-a", "google-chrome.Google-chrome"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=2,
@@ -211,6 +235,67 @@ def open_in_firefox(url: str) -> None:
             )
         except (OSError, subprocess.SubprocessError):
             pass  # Focusing the window is cosmetic.
+
+
+def dig_deeper_prompt(story: FeedStory) -> str:
+    """The opening prompt for a rabbit-hole agent session on one story."""
+    links = [
+        f"{label}: {url}"
+        for label, url in (
+            ("Article", story.article_url),
+            ("Discussion", story.comments_url),
+        )
+        if urlsplit(url).scheme in {"http", "https"}
+    ]
+    return "\n".join(
+        [
+            f"Dig deeper into this story from my news reader: {story.title}",
+            *links,
+            "",
+            (
+                "Read the article and the discussion. Tell me the key ideas, what is"
+                " new or surprising, where commenters push back or add expertise, and"
+                " background or related work worth reading next. Then wait for my"
+                " follow-up questions."
+            ),
+        ]
+    )
+
+
+def open_agent_session(prompt: str) -> bool:
+    """Start `$HN_RERANK_AGENT` (default `claude`) on the prompt in a tmux
+    pane split beside the reader's, in the home directory; False outside
+    tmux or on failure."""
+    import os
+    import shlex
+    import shutil
+    import subprocess
+
+    if not os.environ.get("TMUX"):
+        return False
+    agent = shlex.split(os.environ.get("HN_RERANK_AGENT", "")) or ["claude"]
+    # tmux reports success even when the pane's command cannot start (the
+    # pane just closes), so resolve it here, on the reader's PATH.
+    executable = shutil.which(agent[0])
+    if executable is None:
+        return False
+    agent[0] = executable
+    # With several arguments tmux runs the command directly, so the prompt
+    # needs no shell quoting.
+    command = ["tmux", "split-window", "-h", "-c", str(Path.home())]
+    if pane := os.environ.get("TMUX_PANE"):
+        command += ["-t", pane]
+    try:
+        subprocess.run(
+            [*command, *agent, prompt],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return True
 
 
 class ArrowLeftCurrent(SelectCurrent):
@@ -270,6 +355,9 @@ def story_metadata(story: FeedStory) -> str:
 # Every sort shows at most this many stories (matches the web client);
 # unrated stories past the cap slide in as ones ahead are rated.
 VIEW_LIMIT = 12
+# Panes shorter than this many rows get one footer row (status and
+# "? help") and no "Because you upvoted" line in the reading heading.
+COMPACT_HEIGHT = 30
 
 
 def _cell_len(text: str) -> int:
@@ -279,12 +367,36 @@ def _cell_len(text: str) -> int:
     )
 
 
+def fit_middle(text: str, width: int) -> str:
+    """*text* in at most *width* cells, cut from the middle with `…`: the
+    start names what happened, the end often says what to do."""
+    if _cell_len(text) <= width or width < 8:
+        return text
+    tail_budget = (width - 1) * 3 // 5
+    head_budget = width - 1 - tail_budget
+    head = ""
+    for char in text:
+        if _cell_len(head + char) > head_budget:
+            break
+        head += char
+    tail = ""
+    for char in reversed(text):
+        if _cell_len(char + tail) > tail_budget:
+            break
+        tail = char + tail
+    return head.rstrip() + "…" + tail.lstrip()
+
+
 def _pad_cells(text: str, width: int) -> str:
     padding = width - _cell_len(text)
     return text + " " * padding if padding > 0 else text
 
 
 def headline_domain(story: FeedStory) -> str:
+    # Feeds name themselves (AINews, not the x.com its items link to), as
+    # the web card's source badge does.
+    if story.source != "hn" and story.source_label:
+        return story.source_label
     if story.source.startswith("rss_reddit_") and len(story.source) > 11:
         return f"r/{story.source[11:]}"
     domain = urlsplit(story.article_url).hostname or story.source
@@ -292,10 +404,17 @@ def headline_domain(story: FeedStory) -> str:
 
 
 def headline_points(story: FeedStory) -> str:
-    # Reddit RSS carries no scores (0/8487 rows have one): 0 means unknown,
-    # not zero. The web card already hides zero scores; match that here.
-    if story.points > 0 or not story.source.startswith("rss_reddit_"):
+    # Most feeds carry no scores (Reddit RSS: 0/8487 rows have one), so a
+    # non-HN 0 means unknown, not zero. The web card hides zero scores too.
+    if story.points > 0 or story.source == "hn":
         return f"▲ {story.points}"
+    return ""
+
+
+def headline_comments(story: FeedStory) -> str:
+    # Likewise a non-HN 0 is a feed without comment counts (Slashdot, blogs).
+    if story.comments or story.source == "hn":
+        return f"💬 {story.comments or 0}"
     return ""
 
 
@@ -308,7 +427,8 @@ def headline(
 
     *widths* holds the (domain, points, comments) segment widths across the
     visible list; each row pads its segments so the separators line up.
-    Unknown Reddit scores pad as blank space to preserve the columns.
+    Unknown scores and comment counts pad as blank space, separator included,
+    to preserve the columns; without *widths* they are left out.
     """
     text = Text()
     if selected is not None:
@@ -328,28 +448,36 @@ def headline(
     elif widths[0]:
         domain = _pad_cells(domain, widths[0])
     text.append(domain, style=PALETTE["link"])
-    points = headline_points(story)
-    if points or widths[1]:
-        text.append(" · ", style=PALETTE["sep"])
-        text.append(
-            _pad_cells(points, widths[1]) if widths[1] else points,
-            style=PALETTE["good"],
-        )
-    comments = f"💬 {story.comments or 0}"
     age = story_age(story)
-    text.append(" · ", style=PALETTE["sep"])
-    if age and widths[2]:
-        comments = _pad_cells(comments, widths[2])
-    text.append(comments, style=PALETTE["soft"])
-    if age:
-        text.append(" · ", style=PALETTE["sep"])
-        text.append(age, style=PALETTE["faint"])
+    segments = (
+        (headline_points(story), widths[1], PALETTE["good"]),
+        # The last column needs no padding when nothing follows it.
+        (headline_comments(story), widths[2] if age else 0, PALETTE["soft"]),
+        (age, 0, PALETTE["faint"]),
+    )
+    for value, width, style in segments:
+        if value:
+            text.append(" · ", style=PALETTE["sep"])
+            text.append(_pad_cells(value, width), style=style)
+        elif width:
+            text.append(" " * (3 + width))
+    return text
+
+
+def story_heading(story: FeedStory, *, attribution: bool = True) -> Text:
+    """The reading pane's heading: the headline, plus why the story is
+    recommended when the server says (as the web card does) and there is
+    room (*attribution*)."""
+    text = headline(story)
+    if attribution and story.best_match_title:
+        text.append("\nBecause you upvoted: ", style=PALETTE["faint"])
+        text.append(story.best_match_title, style=PALETTE["soft"])
     return text
 
 
 EMPTY_NOTICE = (
-    "# Nothing here\n\nNo stories in this filter. "
-    "Change filters or press **r** to refresh."
+    "# Nothing here\n\nNo stories in this view. "
+    "Try another sort or time window, or press **r** to refresh."
 )
 
 
@@ -481,7 +609,7 @@ class Reader(App[None]):
     TITLE = "HN Rerank"
     CSS = """
     Screen { background: $hn-bg; color: $hn-fg; }
-    #filters { height: 2; align-vertical: top; }
+    #filters { height: 2; align-vertical: top; background: $hn-chrome; }
     Select { width: auto; height: auto; display: none; }
     .filter-caption { width: auto; height: 1; padding: 0 1 0 2; color: $hn-faint; display: none; }
     .narrow .filter-caption { display: block; }
@@ -493,17 +621,18 @@ class Reader(App[None]):
     Select:focus-within .arrow { color: $hn-bg; }
     .narrow #filters { height: 1; }
     Tabs { width: auto; }
-    #sort-tabs { width: 58; }
-    #age-tabs { width: 20; }
+    #sort-tabs { width: 45; }
+    #window { display: block; }
     Tab { color: $hn-muted; padding: 0 1; }
     Tab.-active { color: $hn-accent; text-style: bold; }
     Tabs:focus Tab.-active { text-style: bold underline; }
-    Underline > .underline--bar { color: $hn-accent; background: $hn-bg; }
+    Underline > .underline--bar { color: $hn-accent; background: $hn-chrome; }
     #panes { height: 1fr; }
     #headlines { width: 1fr; height: 1fr; background: $hn-bg;
                  border: solid $hn-bg; padding: 0; }
     #headlines:focus { border: solid $hn-accent; }
     #headlines > .option-list--option { padding: 0 1; }
+    #headlines > .option-list--separator { color: $hn-rule; }
     #headlines > .option-list--option-highlighted {
         background: $hn-select-bg; color: $hn-select-fg; text-style: bold;
     }
@@ -525,12 +654,13 @@ class Reader(App[None]):
     MarkdownFence { background: $hn-surface; margin: 0 0 1 0; padding: 1; }
     #summary MarkdownBlock > .strong { color: $hn-accent; text-style: bold; }
     #summary MarkdownBlock > .em { color: $hn-accent; }
-    #footer { dock: bottom; layout: vertical; height: auto; background: $hn-bar;
-              border-top: solid $hn-rule; }
-    #status { width: 1fr; height: auto; max-height: 3; padding: 0 1; color: $hn-muted; }
+    #footer { dock: bottom; layout: horizontal; height: 1; background: $hn-chrome; }
+    #status { width: 1fr; height: 1; padding: 0 1; color: $hn-muted;
+              text-wrap: nowrap; text-overflow: ellipsis; }
     #status.context { color: $hn-soft; }
     #status.error { color: $hn-bad; text-style: bold; }
-    #shortcuts { width: 1fr; height: auto; padding: 0 1; color: $hn-faint; }
+    #shortcuts { width: auto; height: 1; padding: 0 1; color: $hn-faint;
+                 text-wrap: nowrap; }
     .narrow Tabs { display: none; }
     .narrow Select { display: block; }
     .narrow #panes { layout: vertical; }
@@ -548,6 +678,7 @@ class Reader(App[None]):
     BINDINGS: ClassVar[list[tuple[str, str, str]]] = [
         ("j", "move(1)", "Down"),
         ("k", "move(-1)", "Up"),
+        ("space", "page_summary", "Page down"),
         ("1", "vote('up')", "+"),
         ("2", "vote('neutral')", "~"),
         ("3", "vote('down')", "−"),
@@ -555,10 +686,13 @@ class Reader(App[None]):
         ("o", "open_url('article_url')", "Article"),
         ("c", "open_url('comments_url')", "Comments"),
         ("y", "copy_url", "Copy link"),
+        ("a", "dig_deeper", "Ask Claude"),
         ("r", "refresh", "Refresh"),
         ("s", "cycle_sort", "Sort"),
         ("h", "cycle_sort(-1)", "Prev sort"),
         ("l", "cycle_sort(1)", "Next sort"),
+        ("d", "cycle_window(1)", "Window"),
+        ("D", "cycle_window(-1)", "Prev window"),
         ("enter", "read", "Read"),
         ("escape", "headlines", "Back"),
         ("?", "help", "Help"),
@@ -573,8 +707,15 @@ class Reader(App[None]):
         api: API | None = None,
         prefetch: int = DEFAULT_PREFETCH,
         prefetch_generate: int = DEFAULT_PREFETCH_GENERATE,
+        window_file: Path | None = None,
     ) -> None:
         super().__init__()
+        # The last window picked opens next time; None (tests) keeps 1w and
+        # never writes.
+        self.window_file = window_file
+        self.saved_window = (
+            load_window(window_file) if window_file else None
+        ) or DEFAULT_WINDOW
         for name in PALETTES:
             self.register_theme(editorial_theme(name))
         self.clock_theme = ""
@@ -583,23 +724,31 @@ class Reader(App[None]):
         self.server = self.explicit_server or DEFAULT_SERVER
         self.config_path = config_path or profile_path()
         self.api = api
+        # The selected window's feed; None while a window switch fetches it.
         self.feed: Feed | None = None
+        # Feeds of the current version by window: the selected one and
+        # neighbours prefetched in the background.
+        self.feeds: dict[str, Feed] = {}
+        # Neighbour prefetches tried, by (window, version): at most once each.
+        self.window_attempts: set[tuple[str, int]] = set()
+        self.window_prefetching = False
         self.stories: list[FeedStory] = []
         # Headline row state as last rendered: column widths and marked story.
         self._row_widths: tuple[int, int, int] | None = None
         self._marked_id: int | None = None
         self.rated: set[int] = set()
         self.unavailable: set[int] = set()
-        # Explore's client-side shuffle per "explore:<age>" view, kept stable
-        # across rebuilds (votes, polls, feed refreshes) and dropped when the
-        # user leaves that view, so each visit gets a fresh order.
+        # Explore's client-side shuffle per "<window>:explore" view, kept
+        # stable across rebuilds (votes, polls, feed refreshes) and dropped
+        # when the user leaves that view, so each visit gets a fresh order.
         self.explore_orders: dict[str, list[int]] = {}
         self.view_key: str | None = None
         self.restored: dict[int, FeedStory] = {}
         self.history: list[FeedStory] = []
-        # Views ("<sort>:<age>") each voted story was listed in, so undo puts
-        # it back only where the server had it.
-        self.vote_views: dict[int, list[str]] = {}
+        # The window and views (sorts) each voted story was listed in, so
+        # undo puts it back only where the server had it.
+        self.vote_views: dict[int, tuple[str, list[str]]] = {}
+        self.vote_revisions: dict[int, int] = {}
         self.vote_lock = asyncio.Lock()
         self.selection_serial = 0
         self.interaction_session = str(uuid4())
@@ -608,7 +757,15 @@ class Reader(App[None]):
         self.help_open = False
         self.setting_up = False
         self.status_mode = "context"
+        # Footer texts: the keys shrink through hint_options (longest first)
+        # so the status and keys share the single footer row.
+        self.status_text = ""
+        self.hint_options: list[str] = ["? help"]
+        self.hints_text = "? help"
         self.last_error: str | None = None
+        # The server's counts version at the last poll (None until seen).
+        self.counts_version: int | None = None
+        self.window_generation = 0
         self.prefetch = max(0, prefetch)
         self.prefetch_generate = min(self.prefetch, max(0, prefetch_generate))
         # Complete summaries, and at most one request per story in flight. The
@@ -628,30 +785,22 @@ class Reader(App[None]):
     def compose(self) -> ComposeResult:
         with Horizontal(id="filters"):
             yield Tabs(
-                *(
-                    Tab(s.title(), id=f"sort-{s}")
-                    for s in ("recommended", "popular", "explore", "date")
-                ),
+                *(Tab(s.title(), id=f"sort-{s}") for s in self.SORT_CYCLE),
                 id="sort-tabs",
-            )
-            yield Tabs(
-                Tab("Recent", id="age-recent"),
-                Tab("Archive", id="age-archive"),
-                id="age-tabs",
             )
             yield Static("Sort", classes="filter-caption")
             yield Dropdown(
-                [(s.title(), s) for s in ("recommended", "popular", "explore", "date")],
+                [(s.title(), s) for s in self.SORT_CYCLE],
                 value="recommended",
                 allow_blank=False,
                 id="sort",
             )
-            yield Static("Age", classes="filter-caption")
+            yield Static("Window", classes="filter-caption")
             yield Dropdown(
-                [("Recent", "recent"), ("Archive", "archive")],
-                value="recent",
+                [(WINDOW_LABELS[w], w) for w in WINDOWS],
+                value=self.saved_window,
                 allow_blank=False,
-                id="age",
+                id="window",
             )
         with Horizontal(id="panes"):
             yield OptionList(id="headlines")
@@ -693,7 +842,7 @@ class Reader(App[None]):
                 str(story.id), headline(story, story.id == self._marked_id, widths)
             )
         if selected := self.selected():
-            self.query_one("#story-heading", Static).update(headline(selected))
+            self.query_one("#story-heading", Static).update(self.heading(selected))
         self.context_status()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
@@ -719,17 +868,24 @@ class Reader(App[None]):
                 "refresh",
                 "open_url",
                 "copy_url",
+                "dig_deeper",
                 "cycle_sort",
+                "cycle_window",
             }
         )
 
     def status(self, message: str, *, error: bool = False) -> None:
         """Show a transient message; context_status() restores the counts line."""
         self.status_mode = "error" if error else "message"
+        text = ("✗ " if error else "") + message
         widget = self.query_one("#status", Static)
-        widget.update(("✗ " if error else "") + message)
         widget.set_class(error, "error")
         widget.set_class(False, "context")
+        self.fit_footer(status=text)
+        # Cut the middle to fit beside the keys, so the subject and an
+        # actionable tail ("Press r to retry.") both survive.
+        room = self.size.width - 2 - (_cell_len(self.hints_text) + 2)
+        widget.update(fit_middle(text, room))
 
     def context_status(self) -> None:
         """Counts line for the current filter; only replaces an earlier counts line."""
@@ -748,6 +904,7 @@ class Reader(App[None]):
         widget.update(line)
         widget.set_class(False, "error")
         widget.set_class(True, "context")
+        self.fit_footer(status=line.plain)
 
     def show_failure(self, detail: str) -> None:
         """Failure copy in the reading pane when no feed has loaded yet."""
@@ -815,6 +972,8 @@ class Reader(App[None]):
         self.api = API(profile.server, profile.token)
         self.interaction_session = str(uuid4())
         self.feed = None
+        self.feeds.clear()
+        self.window_attempts.clear()
         self.rated.clear()
         self.unavailable.clear()
         self.restored.clear()
@@ -844,10 +1003,7 @@ class Reader(App[None]):
         widths = [
             max((_cell_len(headline_domain(s)) for s in self.stories), default=0),
             max((_cell_len(headline_points(s)) for s in self.stories), default=0),
-            max(
-                (_cell_len(f"💬 {s.comments or 0}") for s in self.stories),
-                default=0,
-            ),
+            max((_cell_len(headline_comments(s)) for s in self.stories), default=0),
         ]
         age_w = max((len(story_age(s)) for s in self.stories), default=0)
         total = widths[0] + 3 + widths[1] + 3 + widths[2] + 3 + age_w
@@ -855,15 +1011,19 @@ class Reader(App[None]):
             widths[0] = max(8, widths[0] - (total - available))
         return (widths[0], widths[1], widths[2])
 
-    def view_order(self, key: str) -> list[int]:
-        """Story order for a "<sort>:<age>" view as the user sees it."""
-        order = self.feed.orders.get(key, []) if self.feed else []
-        if not key.startswith("explore:"):
+    def selected_window(self) -> str:
+        return str(self.query_one("#window", Select).value)
+
+    def view_order(self, sort: str) -> list[int]:
+        """Story order for a sort of the current window as the user sees it."""
+        order = self.feed.orders.get(sort, []) if self.feed else []
+        if sort != "explore" or self.feed is None:
             return order
         # Explore is a discovery deck: shuffle client-side, since the server
-        # order only reshuffles once per dashboard version and would pin the
-        # deck for hours. Stories already placed keep their position; new
-        # ones are shuffled in after them. Copies: feed.orders is shared.
+        # sends it in model-score order and would pin the deck for hours.
+        # Stories already placed keep their position; new ones are shuffled
+        # in after them. Copies: feed.orders is shared.
+        key = f"{self.feed.window}:{sort}"
         members = set(order)
         kept = [sid for sid in self.explore_orders.get(key, []) if sid in members]
         placed = set(kept)
@@ -880,11 +1040,10 @@ class Reader(App[None]):
         old = self.selected()
         if select_id is None and old:
             select_id = old.id
-        sort = self.query_one("#sort", Select).value
-        age = self.query_one("#age", Select).value
+        sort = str(self.query_one("#sort", Select).value)
         lookup = {story.id: story for story in self.feed.stories} if self.feed else {}
-        self.view_key = f"{sort}:{age}"
-        order = self.view_order(self.view_key)
+        self.view_key = f"{self.selected_window()}:{sort}"
+        order = self.view_order(sort)
         self.stories = [
             lookup[sid]
             for sid in order
@@ -896,15 +1055,14 @@ class Reader(App[None]):
         widths = self.meta_widths(max(0, headlines.size.width - 4))
         self._row_widths = widths
         self._marked_id = select_id
-        headlines.add_options(
-            [
-                Option(
-                    headline(s, s.id == select_id, widths),
-                    id=str(s.id),
-                )
-                for s in self.stories
-            ]
-        )
+        # A `None` between options draws a faint rule row; it does not take an
+        # option index, so `highlighted` still indexes `self.stories`.
+        options: list[Option | None] = []
+        for s in self.stories:
+            if options:
+                options.append(None)
+            options.append(Option(headline(s, s.id == select_id, widths), id=str(s.id)))
+        headlines.add_options(options)
         if self.stories:
             headlines.highlighted = next(
                 (i for i, s in enumerate(self.stories) if s.id == select_id), 0
@@ -914,7 +1072,7 @@ class Reader(App[None]):
             # Fresh feed data can carry new points/comments; keep the reading
             # heading in step even when the selection id has not changed.
             if selected := self.selected():
-                self.query_one("#story-heading", Static).update(headline(selected))
+                self.query_one("#story-heading", Static).update(self.heading(selected))
             self.schedule_summary()
         else:
             self.query_one("#story-heading", Static).update("")
@@ -922,9 +1080,11 @@ class Reader(App[None]):
             self.selection_serial += 1
             self.workers.cancel_group(self, "summary")
             self.query_one("#summary", Markdown).update(
-                feed_failure_notice(self.last_error)
-                if self.feed is None and self.last_error
-                else EMPTY_NOTICE
+                EMPTY_NOTICE
+                if self.feed is not None
+                else feed_failure_notice(self.last_error)
+                if self.last_error
+                else "Loading…"
             )
         self.query_one("#reading-pane").set_class(bool(self.stories), "has-story")
         self.layout_panes()
@@ -935,12 +1095,17 @@ class Reader(App[None]):
         # Replaying them into Tabs would start an endless two-way echo.
         if event.value != event.select.value:
             return
-        tabs_id = f"#{event.select.id}-tabs"
-        if event.select.id in {"sort", "age"} and self.query(tabs_id):
-            self.query_one(tabs_id, Tabs).active = f"{event.select.id}-{event.value}"
+        if event.select.id == "sort" and self.query("#sort-tabs"):
+            self.query_one("#sort-tabs", Tabs).active = f"sort-{event.value}"
         if self.view_key is not None:
             self.explore_orders.pop(self.view_key, None)  # next visit reshuffles
-        self.rebuild(select_id=-1)
+        if event.select.id == "window":
+            if self.window_file is not None and event.value != self.saved_window:
+                self.saved_window = str(event.value)
+                save_window(self.saved_window, self.window_file)
+            self.show_window(str(event.value))
+        else:
+            self.rebuild(select_id=-1)
 
     def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
         if not event.tab.id or event.tab.id != event.tabs.active:
@@ -981,7 +1146,7 @@ class Reader(App[None]):
         if self.help_open:
             return
         if story and story.id != self.summary_story_id:
-            self.query_one("#story-heading", Static).update(headline(story))
+            self.query_one("#story-heading", Static).update(self.heading(story))
             self.summary_story_id = story.id
             self.selection_serial += 1
             if self.feed is not None:
@@ -993,8 +1158,9 @@ class Reader(App[None]):
                         dashboard_version=self.feed.version,
                         position=self.stories.index(story),
                         sort_mode=str(self.query_one("#sort", Select).value),
-                        age_filter=str(self.query_one("#age", Select).value),
+                        window=self.feed.window,
                         occurred_at=time.time(),
+                        badges=[badge.kind for badge in story.badge_details],
                     ),
                     self.selection_serial,
                 )
@@ -1024,7 +1190,7 @@ class Reader(App[None]):
             or self.feed is None
             or self.feed.version != event.dashboard_version
             or str(self.query_one("#sort", Select).value) != event.sort_mode
-            or str(self.query_one("#age", Select).value) != event.age_filter
+            or self.feed.window != event.window
         ):
             return
         try:
@@ -1037,6 +1203,7 @@ class Reader(App[None]):
     async def load_summary(
         self, story_id: int, serial: int, *, force_refresh: bool = False
     ) -> None:
+        started = time.monotonic()
         await asyncio.sleep(0.3)
         if (
             not self.api
@@ -1045,8 +1212,20 @@ class Reader(App[None]):
         ):
             return
         previous = self.summaries.get(story_id)
+        ticker: Timer | None = None
         if previous is None:
             self.query_one("#summary", Markdown).update("Loading summary…")
+
+            # A summary written on request takes ~15 s; count the wait so a
+            # slow one reads as working, not stuck.
+            def tick() -> None:
+                if serial == self.selection_serial and self.query("#summary"):
+                    elapsed = int(time.monotonic() - started)
+                    self.query_one("#summary", Markdown).update(
+                        f"Loading summary… {elapsed}s"
+                    )
+
+            ticker = self.set_interval(1.0, tick)
         else:
             self.query_one("#summary", Markdown).update(previous)
             self.status("Regenerating summary…")
@@ -1090,6 +1269,9 @@ class Reader(App[None]):
                 # transient (quota/cooldown), so this hides for the session
                 # only — refresh restores. InvalidProfile goes to setup above.
                 self._hide_story(story_id, f"summary unavailable ({exc})")
+        finally:
+            if ticker is not None:
+                ticker.stop()
 
     async def await_summary(
         self, story_id: int, *, force: bool = False
@@ -1133,12 +1315,11 @@ class Reader(App[None]):
         ids.extend(
             item.id for item in reversed(self.stories[max(0, index - 3) : index])
         )
-        age = self.query_one("#age", Select).value
         sort = self.query_one("#sort", Select).value
         for other in self.SORT_CYCLE:
             if other == sort:
                 continue
-            order = self.view_order(f"{other}:{age}")
+            order = self.view_order(other)
             eligible = [
                 sid
                 for sid in order
@@ -1230,6 +1411,8 @@ class Reader(App[None]):
         else:
             summary = await api.summary(story_id, force_refresh=force)
         if summary is not None and api is self.api:
+            if summary.points is not None:
+                self.patch_counts(story_id, summary.points, summary.comments)
             if summary.provisional or summary.empty:
                 # Shown (or hidden) by the selection, never cached.
                 self.prefetch_retry_at[story_id] = (
@@ -1287,7 +1470,8 @@ class Reader(App[None]):
         )
 
     async def poll_feed_version(self) -> None:
-        """Every minute: reload when the server has a newer deck than ours."""
+        """Every minute: reload when the server has a newer deck than ours,
+        or refetch the feed when only stored points/comments changed."""
         if not self.can_poll_feed():
             return
         api, feed = self.api, self.feed
@@ -1296,23 +1480,48 @@ class Reader(App[None]):
         # a stale one waits for the reranked deck it is missing.
         wanted = feed.version if feed.ready else feed.target_version
         try:
-            ready, current = await api.ready(wanted)
+            readiness = await api.ready(wanted)
         except APIError:
             # Passive checks must not replace a usable deck with an error.
             return
+        if not (self.api is api and self.feed is feed and self.can_poll_feed()):
+            return
+        current = readiness.current
         # A lower version is a server restart, not an obsolete response.
-        newer = current != feed.version if feed.ready else ready or current < wanted
-        if self.api is api and self.feed is feed and self.can_poll_feed() and newer:
+        if feed.ready:
+            newer = current != feed.version
+        else:
+            newer = readiness.ready or current < wanted
+        seen = self.counts_version
+        counts_changed = (
+            seen is not None
+            and readiness.counts_version is not None
+            and readiness.counts_version != seen
+        )
+        if seen is None:
+            self.counts_version = readiness.counts_version
+        if counts_changed:
+            self.feeds.clear()
+            self.window_attempts.clear()
+            self.window_generation += 1
+        if newer:
             self.reload(manual=False)
+        elif counts_changed:
+            # Same deck, fresher counts: summaries and the open story stay.
+            self.refresh_feed(announce=False, counts_version=readiness.counts_version)
 
     @work(group="refresh", exclusive=True)
-    async def refresh_feed(self, *, announce: bool = True) -> None:
+    async def refresh_feed(
+        self, *, announce: bool = True, counts_version: int | None = None
+    ) -> None:
+        """Fetch the selected window's feed and show it."""
         if not self.api or self.setting_up:
             return
+        api, window = self.api, self.selected_window()
         if announce:
             self.status("Refreshing…")
         try:
-            feed = await self.api.feed()
+            feed = await api.feed(window)
         except InvalidProfile as exc:
             self.setup(str(exc))
             return
@@ -1326,7 +1535,18 @@ class Reader(App[None]):
                 )
                 self.show_failure(str(exc))
             return
-        self.feed = feed
+        if api is not self.api:
+            return
+        if counts_version is not None:
+            self.counts_version = counts_version
+        if window != self.selected_window():
+            # The user moved to a cached window meanwhile: keep this one
+            # only as a cache entry of the version on screen.
+            if self.feed is not None and feed.version == self.feed.version:
+                self.feeds[window] = feed
+            return
+        self.forget_outgrown_summaries(feed)
+        self.set_feed(feed)
         self.last_error = None
         if feed.ready:
             self.restored.clear()
@@ -1340,13 +1560,160 @@ class Reader(App[None]):
         self.rebuild()
         if announce and not feed.ready:
             self.status("Showing available stories while ranking updates…")
+        self.schedule_window_prefetch()
 
-    SORT_CYCLE: ClassVar[tuple[str, ...]] = (
-        "recommended",
-        "popular",
-        "explore",
-        "date",
-    )
+    def forget_outgrown_summaries(self, feed: Feed) -> None:
+        """Drop kept summaries of stories that gained comments, except the
+        open one, so reopening asks the server again (it rewrites a busy
+        thread's summary once enough comments arrived)."""
+        if self.feed is None:
+            return
+        before = {story.id: story.comments or 0 for story in self.feed.stories}
+        for story in feed.stories:
+            if story.id != self.summary_story_id and (story.comments or 0) > before.get(
+                story.id, story.comments or 0
+            ):
+                self.summaries.pop(story.id, None)
+
+    def patch_counts(self, story_id: int, points: int, comments: int | None) -> None:
+        """Show the counts a summary reply carried; the feed's may be older."""
+        for feed in self.feeds.values():
+            for i, item in enumerate(feed.stories):
+                if item.id == story_id:
+                    feed.stories[i] = replace(item, points=points, comments=comments)
+        for i, item in enumerate(self.stories):
+            if item.id != story_id or (item.points, item.comments) == (
+                points,
+                comments,
+            ):
+                continue
+            story = replace(item, points=points, comments=comments)
+            self.stories[i] = story
+            if not self.query("#headlines"):
+                return
+            listing = self.query_one("#headlines", OptionList)
+            # A count gaining a digit can widen the metadata columns.
+            widths = self.meta_widths(max(0, listing.size.width - 4))
+            for row in [story] if widths == self._row_widths else self.stories:
+                listing.replace_option_prompt(
+                    str(row.id), headline(row, row.id == self._marked_id, widths)
+                )
+            self._row_widths = widths
+            selected = self.selected()
+            if selected is not None and selected.id == story_id:
+                self.query_one("#story-heading", Static).update(self.heading(story))
+
+    def set_feed(self, feed: Feed) -> None:
+        """Make *feed* the selected window's; a new version drops the cached
+        windows of other versions."""
+        self.feeds = {
+            window: cached
+            for window, cached in self.feeds.items()
+            if cached.version == feed.version
+        }
+        self.feeds[feed.window] = feed
+        self.feed = feed
+
+    def show_window(self, window: str) -> None:
+        """Switch to *window*: its cached feed of the version on screen, or
+        fetch it."""
+        current = self.feed
+        cached = self.feeds.get(window)
+        if current is not None and current.window == window:
+            self.rebuild(select_id=-1)
+        elif (
+            current is not None
+            and cached is not None
+            and cached.version == current.version
+        ):
+            # Same deck, so the ranking state (a pending vote's target) and
+            # counts on screen apply to it too.
+            self.set_feed(
+                replace(
+                    cached,
+                    target_version=current.target_version,
+                    ready=current.ready,
+                    feedback_counts=current.feedback_counts,
+                )
+            )
+            self.rebuild(select_id=-1)
+            self.schedule_window_prefetch()
+        else:
+            self.feed = None
+            self.rebuild(select_id=-1)
+            self.refresh_feed(announce=False)
+
+    def next_window_prefetch(self) -> str | None:
+        """A neighbour of the selected window not cached or tried for the
+        version on screen."""
+        feed = self.feed
+        if feed is None or feed.window not in WINDOWS:
+            return None
+        index = WINDOWS.index(feed.window)
+        for other in (index + 1, index - 1):
+            if not 0 <= other < len(WINDOWS):
+                continue
+            window = WINDOWS[other]
+            cached = self.feeds.get(window)
+            if (cached is not None and cached.version == feed.version) or (
+                window,
+                feed.version,
+            ) in self.window_attempts:
+                continue
+            return window
+        return None
+
+    def schedule_window_prefetch(self) -> None:
+        """Fetch the neighbouring windows' feeds in the background, one at a
+        time. Only feeds: never summaries."""
+        if (
+            self.window_prefetching
+            or self.api is None
+            or self.setting_up
+            or self.closing
+            or self.next_window_prefetch() is None
+        ):
+            return
+        self.window_prefetching = True
+        self.prefetch_windows()
+
+    @work(group="window-prefetch")
+    async def prefetch_windows(self) -> None:
+        try:
+            while (window := self.next_window_prefetch()) is not None:
+                api, feed = self.api, self.feed
+                if api is None or feed is None:
+                    return
+                self.window_attempts.add((window, feed.version))
+                generation = self.window_generation
+                try:
+                    fetched = await api.feed(window)
+                except APIError:
+                    continue
+                # A late answer is only a cache entry of the version on
+                # screen: it never replaces the selected window's feed.
+                if (
+                    api is self.api
+                    and generation == self.window_generation
+                    and self.feed is not None
+                    and fetched.version == self.feed.version
+                    and window != self.feed.window
+                    and window not in self.feeds
+                ):
+                    self.feeds[window] = fetched
+        finally:
+            self.window_prefetching = False
+
+    SORT_CYCLE: ClassVar[tuple[str, ...]] = ("recommended", "popular", "explore")
+
+    def action_cycle_window(self, delta: int = 1) -> None:
+        """Move the window selector by *delta* steps, wrapping at either end."""
+        select = self.query_one("#window", Select)
+        try:
+            index = WINDOWS.index(str(select.value))
+        except ValueError:
+            index = 0 if delta < 0 else -1
+        select.value = WINDOWS[(index + delta) % len(WINDOWS)]
 
     def action_cycle_sort(self, delta: int = 1) -> None:
         """Move the sort selector by *delta* steps, wrapping at either end."""
@@ -1384,16 +1751,16 @@ class Reader(App[None]):
         self.refresh_feed(announce=manual)
 
     def action_move(self, delta: int) -> None:
-        if self.reading:
-            self.query_one("#summary", Markdown).scroll_relative(
-                y=delta * 3, animate=False
-            )
-            return
+        """Next/previous story, in the list and in zoom alike."""
         listing = self.query_one("#headlines", OptionList)
         if self.stories:
             listing.highlighted = max(
                 0, min(len(self.stories) - 1, (listing.highlighted or 0) + delta)
             )
+
+    def action_page_summary(self) -> None:
+        """Page the TLDR down from either view, whichever pane has focus."""
+        self.query_one("#summary", Markdown).scroll_page_down(animate=False)
 
     def action_vote(self, action: str) -> None:
         """Hide the story and move on now; the server hears about it next."""
@@ -1401,13 +1768,17 @@ class Reader(App[None]):
         if story is None:
             return
         self.apply_vote(story)
-        self.submit(story, action)
+        revision = self.vote_revisions.get(story.id, 0) + 1
+        self.vote_revisions[story.id] = revision
+        self.submit(story, action, revision)
 
     def action_undo(self) -> None:
         if self.history:
             story = self.history[-1]
             self.apply_undo(story)
-            self.submit(story, "clear")
+            revision = self.vote_revisions.get(story.id, 0) + 1
+            self.vote_revisions[story.id] = revision
+            self.submit(story, "clear", revision)
 
     def apply_vote(self, story: FeedStory) -> None:
         index = next((i for i, s in enumerate(self.stories) if s.id == story.id), 0)
@@ -1416,11 +1787,11 @@ class Reader(App[None]):
         self.rated.add(story.id)
         self.restored.pop(story.id, None)
         self.history.append(story)
-        self.vote_views[story.id] = [
-            key
-            for key, order in (self.feed.orders.items() if self.feed else ())
-            if story.id in order
-        ]
+        if self.feed is not None:
+            self.vote_views[story.id] = (
+                self.feed.window,
+                [key for key, order in self.feed.orders.items() if story.id in order],
+            )
         self.rebuild(next_id)
 
     def apply_undo(self, story: FeedStory) -> None:
@@ -1432,7 +1803,7 @@ class Reader(App[None]):
         self.rebuild(story.id)
 
     @work(group="vote")
-    async def submit(self, story: FeedStory, action: str) -> None:
+    async def submit(self, story: FeedStory, action: str, revision: int) -> None:
         api = self.api
         if api is None:
             return
@@ -1447,39 +1818,50 @@ class Reader(App[None]):
             except APIError as exc:
                 if api is self.api:
                     # Never retried: the server may or may not have it.
-                    if action == "clear":
-                        self.apply_vote(story)
-                    else:
-                        self.apply_undo(story)
-                    self.status(
-                        "Vote not confirmed, so the story is back; check before"
-                        f" voting again. {exc}",
-                        error=True,
+                    latest = self.vote_revisions.get(story.id) == revision
+                    if latest:
+                        if action == "clear":
+                            self.apply_vote(story)
+                        else:
+                            self.apply_undo(story)
+                    notice = (
+                        "Vote not confirmed, so the story is back; check before voting again."
+                        if latest
+                        else "Earlier vote not confirmed; your latest choice is still shown."
                     )
+                    self.status(f"{notice} {exc}", error=True)
                 return
         if api is not self.api:
             return
         if self.feed is not None and target > self.feed.version:
             # The poller loads the reranked deck once the server has it.
-            self.feed = replace(self.feed, target_version=target, ready=False)
+            self.set_feed(replace(self.feed, target_version=target, ready=False))
         self.status("Vote cleared." if action == "clear" else "Vote saved.")
 
     def restore_story(self, story: FeedStory) -> None:
-        """Put an undone story back in the views it was voted from, where the
-        server orders it: Date by time, the rest by rank score."""
-        if not self.feed:
+        """Put an undone story back in the views of the window it was voted
+        from, where the server orders it: Popular by HN gravity on that
+        window's clock, the rest by rank score."""
+        window, keys = self.vote_views.get(story.id, ("", []))
+        feed = self.feeds.get(window)
+        if feed is None:
             return
-        if all(item.id != story.id for item in self.feed.stories):
-            self.feed.stories.append(story)
-        by_id = {item.id: item for item in self.feed.stories}
-        for key in self.vote_views.get(story.id, []):
-            order = self.feed.orders.setdefault(key, [])
+        if all(item.id != story.id for item in feed.stories):
+            feed.stories.append(story)
+        by_id = {item.id: item for item in feed.stories}
+        now = time.time()
+        scale = GRAVITY_TIME_SCALE.get(window, 1.0)
+        for key in keys:
+            order = feed.orders.setdefault(key, [])
             if story.id in order:
                 continue
-            by_time = key.startswith("date:")
+            by_gravity = key == "popular"
 
-            def rank(item: FeedStory, by_time: bool = by_time) -> float:
-                return item.time if by_time else item.rank_score
+            def rank(item: FeedStory, by_gravity: bool = by_gravity) -> float:
+                if by_gravity:
+                    age_h = max(now - item.time, 0) / 3600
+                    return item.points / (age_h / scale + 2) ** 1.8
+                return item.rank_score
 
             index = next(
                 (i for i, sid in enumerate(order) if rank(by_id[sid]) < rank(story)),
@@ -1491,9 +1873,24 @@ class Reader(App[None]):
         story = self.selected()
         url = getattr(story, field, "") if story else ""
         if urlsplit(url).scheme in {"http", "https"}:
-            open_in_firefox(url)
+            open_in_browser(url)
         else:
             self.status("No link available for this story.")
+
+    async def action_dig_deeper(self) -> None:
+        """Open a Claude Code session on the story, or copy its prompt."""
+        story = self.selected()
+        if story is None:
+            self.status("No story selected.")
+            return
+        prompt = dig_deeper_prompt(story)
+        # tmux answers at once, but a wedged server must not freeze the reader.
+        if await asyncio.to_thread(open_agent_session, prompt):
+            self.status(f"Opened Claude on: {story.title}")
+            return
+        self.copy_to_clipboard(prompt)
+        await asyncio.to_thread(copy_with_system_tool, prompt)
+        self.status("Could not open a tmux pane; copied the Claude prompt.")
 
     async def action_copy_url(self) -> None:
         """Copy the comments link, or the article link when there is none."""
@@ -1517,28 +1914,70 @@ class Reader(App[None]):
         else:
             self.status(f"Sent to terminal clipboard (needs OSC 52): {url}")
 
-    def layout_panes(self, width: int | None = None) -> None:
+    def layout_panes(self, width: int | None = None, height: int | None = None) -> None:
         narrow = (self.size.width if width is None else width) < 100
+        compact = (self.size.height if height is None else height) < COMPACT_HEIGHT
+        compact_changed = compact != self.has_class("compact")
         self.set_class(narrow, "narrow")
+        self.set_class(compact, "compact")
         self.set_class(self.reading, "reading")
         votes = "1 up · 2 neutral · 3 down → next story"
-        if narrow:
-            # Narrow hints may wrap; the badge key stays listed in ? help.
-            if self.reading:
-                hints = f"j/k scroll · Enter/Esc back · {votes}"
-            elif self.can_read:
-                hints = f"Enter zoom · {votes} · ? help"
-            else:
-                hints = f"j/k move · {votes} · ? help"
+        if compact:
+            # A short pane shows only ? help, which lists the keys.
+            keys: list[str] = []
         elif self.reading:
-            hints = (
-                f"j/k scroll · Enter/Esc back · {votes} · b badges · ? help · q quit"
-            )
+            keys = [
+                f"j/k story · Space page · Enter/Esc back · {votes} · b badges"
+                " · ? help · q quit",
+                f"j/k story · Space page · Enter/Esc back · {votes} · ? help",
+                f"Enter/Esc back · {votes} · ? help",
+                "Enter/Esc back · 1/2/3 vote · ? help",
+                "Enter/Esc back · ? help",
+            ]
         elif self.can_read:
-            hints = f"j/k move · Enter zoom · {votes} · b badges · ? help · q quit"
+            keys = [
+                f"j/k move · Enter zoom · {votes} · b badges · ? help · q quit",
+                f"j/k move · Enter zoom · {votes} · ? help",
+                f"Enter zoom · {votes} · ? help",
+                "Enter zoom · 1/2/3 vote · ? help",
+                "Enter zoom · ? help",
+            ]
         else:
-            hints = f"j/k move · {votes} · b badges · ? help · q quit"
-        self.query_one("#shortcuts", Static).update(hints)
+            keys = [
+                f"j/k move · {votes} · b badges · ? help · q quit",
+                f"j/k move · {votes} · ? help",
+                f"{votes} · ? help",
+                "1/2/3 vote · ? help",
+            ]
+        self.hint_options = [*keys, "? help"]
+        self.fit_footer(width=width)
+        if compact_changed and (selected := self.selected()):
+            self.query_one("#story-heading", Static).update(self.heading(selected))
+
+    def heading(self, story: FeedStory) -> Text:
+        """The reading pane's heading; a short pane leaves out why the story
+        is recommended."""
+        return story_heading(story, attribution=not self.has_class("compact"))
+
+    def fit_footer(
+        self,
+        *,
+        status: str | None = None,
+        width: int | None = None,
+    ) -> None:
+        """One footer row: status left, the longest key hints that fit right.
+        The keys shrink to "? help" before the status is cut."""
+        if status is not None:
+            self.status_text = status
+        width = self.size.width if width is None else width
+        # Each widget pads one cell per side; keep a gap of two between them.
+        room = width - _cell_len(self.status_text) - 6
+        self.hints_text = next(
+            (h for h in self.hint_options if _cell_len(h) <= room),
+            self.hint_options[-1],
+        )
+        if self.query("#shortcuts"):
+            self.query_one("#shortcuts", Static).update(self.hints_text)
 
     @property
     def can_read(self) -> bool:
@@ -1547,7 +1986,7 @@ class Reader(App[None]):
 
     def on_resize(self, event: events.Resize) -> None:
         if self.query("#panes"):
-            self.layout_panes(event.size.width)
+            self.layout_panes(event.size.width, event.size.height)
 
     def focus_summary(self) -> None:
         self.query_one("#summary", Markdown).focus()
@@ -1580,8 +2019,10 @@ class Reader(App[None]):
         self.workers.cancel_group(self, "summary")
         self.query_one("#summary", Markdown).update(
             "# Badge legend\n\n"
-            "🔥 **Hot** — rising fast · 🏆 **Top** — high score · 💬 **Talk** — many comments\n\n"
-            "🤔 **Unsure** — model uncertain · ✨ **Novel** — unlike your votes · 🎯 **Similar** — matches your upvotes\n\n"
+            "🔥 **Hot** — rising fast · 🏆 **Top** — at least 100 HN points · "
+            "💬 **Talk** — at least 50 comments and comments ≥ points\n\n"
+            "Badges combine when several apply.\n\n"
+            "🤔 **Unsure** — model uncertain · ✨ **Novel** — unlike your votes · 🎯 **Interest** — an interest Recommended misses\n\n"
             "Escape: return to the story. ?: shortcuts."
         )
         self.focus_summary()
@@ -1594,23 +2035,26 @@ class Reader(App[None]):
         self.query_one("#summary", Markdown).update(
             "# Shortcuts\n\n"
             "## Move\n\n"
-            "- `j` / `k`: move the headline list\n"
+            "- `j` / `k`: next / previous story (list or zoom view)\n"
             "- `Tab`: switch focus between panes\n"
             "- Arrow keys: scroll the focused pane\n\n"
             "## Read\n\n"
             "- `Enter`: zoom the TLDR pane (hide the article list)\n"
             "- `Enter` / `Escape`: return to the article list\n"
-            "- In zoom mode, `j` / `k` scroll the TLDR\n\n"
+            "- `Space`: page the TLDR down (list or zoom view)\n\n"
             "## Vote\n\n"
             "- `1` / `2` / `3`: up / neutral / down (advances to next story)\n"
             "- `u`: undo latest vote\n\n"
             "## Sort\n\n"
-            "- `s`: cycle sort (Recommended → Popular → Explore → Date)\n"
+            "- `s`: cycle sort (Recommended → Popular → Explore)\n"
             "- `h` / `l`: previous / next sort\n"
-            "- Selectors: sort and Recent / Archive\n\n"
+            "- `d` / `D`: next / previous time window (12 hours → 1 day →"
+            " 1 week → 1 month → Archive)\n"
+            "- Selectors: sort and time window\n\n"
             "## Other\n\n"
             "- `o` / `c`: open article / comments\n"
             "- `y`: copy comments link (article link if none)\n"
+            "- `a`: dig deeper: Claude Code in a tmux pane beside this one\n"
             "- `r`: refresh and regenerate selected summary\n"
             "- `b`: badge legend\n"
             "- `?`: this help\n"

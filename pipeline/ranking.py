@@ -9,7 +9,7 @@ import resource
 import threading
 import time
 from collections import Counter
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -25,6 +25,7 @@ from sklearn.metrics.pairwise import rbf_kernel
 from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
 
+from clients.tui.src.hn_rerank.models import VIEWS, WINDOWS, View, Window
 from database import Database, Story
 from .config import (
     BQ_ARCHIVE_SOURCE,
@@ -35,6 +36,7 @@ from .config import (
     DEFAULT_ONNX_MODEL_DIR,
     is_hn_source,
 )
+from . import linear_blend
 from .model_manifest import ModelManifest, verify_model_dir
 
 if TYPE_CHECKING:
@@ -217,6 +219,8 @@ class RankScoreContext:
     # feedback story per candidate, plus the aligned up-story titles.
     cand_closest_up_idx: NDArray[np.int64] | None = None
     fb_up_titles: list[str] = field(default_factory=list)
+    # The upvoted stories' embeddings, for Explore's Interest clusters.
+    fb_up_embeddings: NDArray[np.float32] | None = None
 
 
 def _feedback_signature(db: Database, user_id: int) -> str:
@@ -271,28 +275,37 @@ TOP_COMMENT_TOP_LEVEL_BUDGET = TOP_COMMENT_LIMIT // 3
 HN_COMMENTS_SEPARATOR = "\n\n---\n\n"
 HN_COMMENTS_CACHE_CHAR_LIMIT = 24_000
 HOT_MIN_SCORE = 20
-DASHBOARD_QUEUE_SIZE = 12
-PRIMARY_PER_COMBO = 12
-# archive_nonhn (time < recent_cutoff AND non-HN source) is structurally
-# always empty: the RSS leg is the only source of non-HN candidates, and
-# it's windowed to time >= recent_cutoff (see load_production_candidate_
-# stories), so no row can ever satisfy both. That combo was retired from
-# COMBO_DEFS below (see WORKLOG 2026-08-30) and its 12 primary + 6 explore
-# slots redistributed to the two combos most starved of non-HN/archive
-# coverage, rather than left unspent. Both quotas were later trimmed
-# (2026-09-25): a 73-card recent deck was too much to load on the client.
-PRIMARY_RECENT_NONHN = 10
-PRIMARY_ARCHIVE_HN = 16
-# Every sort aims to show 12 cards; clients cap each view at 12 (see
-# VIEW_LIMIT in templates/index.html and the TUI), so a view may send more.
-# Popular (Hot/Top/Talk) shares one budget per HN combo so the tab reaches
-# 12 even in archive, where Hot never fires: recent splits 4/4/4, archive
-# 0/6/6. Explore is capped per badge; non-HN gets fewer slots because
-# recent_hn and recent_non-hn both feed the recent Explore tab
-# (4*3 + 1*3 = 15 recent, 4*3 = 12 archive).
-POPULAR_PER_COMBO = 12
-EXPLORE_PER_BADGE = 4
-EXPLORE_PER_BADGE_NONHN = 1
+TOP_MIN_SCORE = 100
+TALK_MIN_COMMENTS = 50
+# A served view holds this many stories: the 12 the clients show (VIEW_LIMIT
+# in templates/index.html and the TUI) plus 4 that slide in as cards ahead
+# of them are voted.
+VIEW_SIZE = 16
+# Explore serves this many each of Unsure, Novel and Interest.
+EXPLORE_PER_BADGE = 5
+# Views are picked at this multiple of their served size, so that dedup,
+# votes and stories ageing out of a window between warms leave enough.
+SELECT_MARGIN = 2
+# Windows are nested by age; "archive" is everything older than 30 days.
+# Boundaries are inclusive: a story exactly 30 days old is in "1m".
+WINDOW_SECONDS: dict[Window, int] = {
+    "12h": 12 * 3600,
+    "1d": 86400,
+    "1w": 7 * 86400,
+    "1m": 30 * 86400,
+}
+# Popular's gravity clock per window: age counts in units of this many hours,
+# a third of the window (archive: of a year). With HN's own clock (1 hour)
+# every window's Popular was the same few stories under a day old; on the
+# 2026-09-28 snapshot this clock gives 1w a median age of a day and 1m of a
+# week. Clients mirror this table for undo.
+GRAVITY_TIME_SCALE: dict[Window, float] = {
+    "12h": 4.0,
+    "1d": 8.0,
+    "1w": 56.0,
+    "1m": 240.0,
+    "archive": 2920.0,
+}
 SOURCE_CATEGORIES: tuple[str, ...] = ("hn_live", "archive", "reddit", "rss")
 
 
@@ -332,6 +345,8 @@ class RankedStory:
     story: Story
     score: float
     best_match_title: str
+    # Similarity to that upvoted story (0 when there is none).
+    best_match_sim: float = 0.0
     prob_down: float | None = None
     prob_neutral: float | None = None
     prob_up: float | None = None
@@ -340,10 +355,7 @@ class RankedStory:
     is_discussion_rich: bool = False
     is_high_engagement: bool = False
     is_hot: bool = False
-    is_similar: bool = False
-    is_non_hn: bool = False
-    is_recent: bool = False
-    combo_keys: str = ""
+    is_interest: bool = False
 
 
 def clean_text(raw_text: str, min_len: int = 0) -> str:
@@ -1046,6 +1058,45 @@ def _positive_cluster_centers(
     return centers.astype(np.float32)
 
 
+# Explore's interests: KMeans over each user's upvotes, kept per user and
+# warm-started from the previous centers when the upvotes change (0.02 s vs
+# ~1 s from scratch for 735 upvotes on the VPS, 2026-09-30), so a vote moves
+# the interests a little instead of reshuffling them.
+_INTEREST_CACHE: LRUCache[int, tuple[str, NDArray[np.float32]]] = LRUCache(maxsize=64)
+_INTEREST_CACHE_LOCK = threading.Lock()
+
+
+def interest_centers(
+    user_id: int | None, up_embeddings: NDArray[np.float32], k: int
+) -> NDArray[np.float32]:
+    """Up to *k* L2-normalized centers of the user's upvote embeddings, one
+    per interest; the upvotes themselves when there are no more than *k*."""
+    dim = up_embeddings.shape[1] if up_embeddings.ndim == 2 else 0
+    if len(up_embeddings) == 0 or k <= 0:
+        return np.zeros((0, dim), dtype=np.float32)
+    unique = np.unique(up_embeddings.astype(np.float32), axis=0)
+    if len(unique) <= k:
+        return unique
+    signature = hashlib.sha256(unique.tobytes()).hexdigest()
+    previous = None
+    if user_id is not None:
+        with _INTEREST_CACHE_LOCK:
+            previous = _INTEREST_CACHE.get(user_id)
+    if previous is not None and previous[0] == signature:
+        return previous[1]
+    if previous is not None and previous[1].shape == (k, dim):
+        kmeans = KMeans(n_clusters=k, init=previous[1], n_init=1)
+    else:
+        kmeans = KMeans(n_clusters=k, n_init=3, random_state=0)
+    kmeans.fit(unique)
+    centers = kmeans.cluster_centers_.astype(np.float32)
+    centers /= np.clip(np.linalg.norm(centers, axis=1, keepdims=True), 1e-12, None)
+    if user_id is not None:
+        with _INTEREST_CACHE_LOCK:
+            _INTEREST_CACHE[user_id] = (signature, centers)
+    return centers
+
+
 def _positive_cluster_similarity(
     query_embeddings: NDArray[np.float32],
     positive_embeddings: NDArray[np.float32],
@@ -1114,6 +1165,8 @@ def _score_and_rank(
     now = time.time()
     scores = None
     probs = None
+    linear_models: linear_blend.LinearBlendModels | None = None
+    linear_dense_candidates: NDArray[np.float32] | None = None
     feedback_stories, feedback_labels, _vote_times = db.get_feedback_for_training(
         user_id=user_id
     )
@@ -1172,9 +1225,29 @@ def _score_and_rank(
             if score_context is not None:
                 score_context.feedback_embeddings = fb_embeddings
 
+            # The vectors the models train and score on: the stored ones, or
+            # stored + side model side by side. The score context (badges,
+            # attribution) stays on the stored vectors either way.
+            model_cand_emb, model_fb_emb = candidate_embeddings, fb_embeddings
+            if config.model.side_embedding_enabled:
+                from .side_embeddings import model_space
+
+                with trace.stage("side_embeddings"):
+                    space = model_space(
+                        candidates,
+                        candidate_embeddings,
+                        feedback_stories,
+                        fb_embeddings,
+                        db,
+                        config,
+                    )
+                trace.set_label("side_embeddings", "on" if space else "off")
+                if space is not None:
+                    model_cand_emb, model_fb_emb = space.candidates, space.feedback
+
             if fb_sig:
                 signature = hashlib.sha256(fb_sig.encode())
-                signature.update(fb_embeddings.tobytes())
+                signature.update(model_fb_emb.tobytes())
                 signature.update(
                     json.dumps(
                         [
@@ -1198,33 +1271,40 @@ def _score_and_rank(
                 )
                 fb_sig = signature.hexdigest()
                 cached_model = _get_cached_model(user_id, fb_sig)
+                if config.model.linear_blend_enabled and user_id is not None:
+                    linear_models = linear_blend.get_cached(
+                        (user_id, fb_sig, _MODEL_SCHEMA_VERSION)
+                    )
+                    if linear_models is None:
+                        # Refit the SVM too: the linear models train on its
+                        # scaled feature rows, which a cache hit skips.
+                        cached_model = None
 
             # Personalization: mean/closest per class from ALL real feedback
             fb_labels_arr = np.array(feedback_labels)
             up_mask = fb_labels_arr == 2
             down_mask = fb_labels_arr == 0
             neutral_mask = fb_labels_arr == 1
-            fb_up_embs = fb_embeddings[up_mask]
-            fb_down_embs = fb_embeddings[down_mask]
-            fb_neutral_embs = fb_embeddings[neutral_mask]
+            fb_up_embs = model_fb_emb[up_mask]
+            fb_down_embs = model_fb_emb[down_mask]
 
             n_up = int(up_mask.sum())
             n_down = int(down_mask.sum())
             k = config.model.knn_k
-            emb_dim = candidate_embeddings.shape[1]
+            emb_dim = model_cand_emb.shape[1]
 
             with trace.stage("svm_candidate_feature_prep"):
                 # Fused (top-k mean, max) per class — one dot pass each instead
                 # of the two _knn_similarity/_chunked_max_dot recomputed the
                 # same candidate @ feedback matrix twice.
                 cand_sim_to_up, cand_closest_up, cand_closest_up_idx = (
-                    _knn_mean_and_max(candidate_embeddings, fb_up_embs, k)
+                    _knn_mean_and_max(model_cand_emb, fb_up_embs, k)
                 )
                 cand_sim_to_down, cand_closest_down, _ = _knn_mean_and_max(
-                    candidate_embeddings, fb_down_embs, k
+                    model_cand_emb, fb_down_embs, k
                 )
                 cand_closest_neutral = _chunked_max_dot(
-                    candidate_embeddings, fb_neutral_embs
+                    candidate_embeddings, fb_embeddings[neutral_mask]
                 )
                 # Cluster centers depend only on up-voted feedback, so reuse the
                 # cached ones on a model-cache hit instead of rerunning KMeans.
@@ -1235,7 +1315,7 @@ def _score_and_rank(
                         fb_up_embs, config.model.positive_cluster_k
                     )
                 cand_positive_cluster_sim = _similarity_to_positive_cluster_centers(
-                    candidate_embeddings, positive_cluster_centers
+                    model_cand_emb, positive_cluster_centers
                 )
                 cand_text_lengths = np.array([len(s.text_content) for s in candidates])
                 cand_source_onehot = source_category_stack(
@@ -1247,7 +1327,7 @@ def _score_and_rank(
                 cand_is_rss = cand_source_onehot[:, 3]
 
                 cand_features = _svm_personalization_features(
-                    candidate_embeddings,
+                    model_cand_emb,
                     text_lengths=cand_text_lengths,
                     sim_to_upvoted=cand_sim_to_up,
                     sim_to_downvoted=cand_sim_to_down,
@@ -1268,12 +1348,29 @@ def _score_and_rank(
                     [cand_features, _engagement_features(candidates)], axis=1
                 )
             if score_context is not None:
-                score_context.cand_closest_up = cand_closest_up.astype(np.float32)
-                score_context.cand_closest_up_idx = cand_closest_up_idx
+                ctx_up_embs = fb_up_embs
+                ctx_closest_up, ctx_closest_up_idx = (
+                    cand_closest_up,
+                    cand_closest_up_idx,
+                )
+                ctx_closest_down = cand_closest_down
+                if model_cand_emb is not candidate_embeddings:
+                    # Side by side: badges and attribution thresholds are
+                    # tuned on the stored vectors, so measure them there.
+                    ctx_up_embs = fb_embeddings[up_mask]
+                    _, ctx_closest_up, ctx_closest_up_idx = _knn_mean_and_max(
+                        candidate_embeddings, ctx_up_embs, k
+                    )
+                    _, ctx_closest_down, _ = _knn_mean_and_max(
+                        candidate_embeddings, fb_embeddings[down_mask], k
+                    )
+                score_context.cand_closest_up = ctx_closest_up.astype(np.float32)
+                score_context.cand_closest_up_idx = ctx_closest_up_idx
                 score_context.fb_up_titles = [
                     feedback_stories[i].title for i in np.flatnonzero(up_mask)
                 ]
-                score_context.cand_closest_down = cand_closest_down.astype(np.float32)
+                score_context.fb_up_embeddings = ctx_up_embs
+                score_context.cand_closest_down = ctx_closest_down.astype(np.float32)
                 score_context.cand_closest_neutral = cand_closest_neutral.astype(
                     np.float32
                 )
@@ -1285,26 +1382,26 @@ def _score_and_rank(
                 trace.set_label("model_cache", "miss")
                 with trace.stage("svm_training_feature_prep"):
                     # LOOCV k-NN for training: exclude self from reference set
-                    fb_sim_to_up = np.zeros(len(fb_embeddings), dtype=np.float32)
-                    fb_sim_to_down = np.zeros(len(fb_embeddings), dtype=np.float32)
+                    fb_sim_to_up = np.zeros(len(model_fb_emb), dtype=np.float32)
+                    fb_sim_to_down = np.zeros(len(model_fb_emb), dtype=np.float32)
                     if n_up > 0:
                         up_indices = np.where(up_mask)[0]
                         fb_sim_to_up, fb_closest_up = _loocv_knn_features(
-                            fb_embeddings, fb_up_embs, up_indices, k
+                            model_fb_emb, fb_up_embs, up_indices, k
                         )
                     else:
-                        fb_closest_up = np.zeros(len(fb_embeddings), dtype=np.float32)
+                        fb_closest_up = np.zeros(len(model_fb_emb), dtype=np.float32)
 
                     if n_down > 0:
                         down_indices = np.where(down_mask)[0]
                         fb_sim_to_down, fb_closest_down = _loocv_knn_features(
-                            fb_embeddings, fb_down_embs, down_indices, k
+                            model_fb_emb, fb_down_embs, down_indices, k
                         )
                     else:
-                        fb_closest_down = np.zeros(len(fb_embeddings), dtype=np.float32)
+                        fb_closest_down = np.zeros(len(model_fb_emb), dtype=np.float32)
 
                     fb_positive_cluster_sim = _similarity_to_positive_cluster_centers(
-                        fb_embeddings, positive_cluster_centers
+                        model_fb_emb, positive_cluster_centers
                     )
 
                     fb_text_lengths = np.array(
@@ -1321,7 +1418,7 @@ def _score_and_rank(
                     fb_is_rss = fb_source_onehot[:, 3]
 
                     fb_features = _svm_personalization_features(
-                        fb_embeddings,
+                        model_fb_emb,
                         text_lengths=fb_text_lengths,
                         sim_to_upvoted=fb_sim_to_up,
                         sim_to_downvoted=fb_sim_to_down,
@@ -1399,6 +1496,30 @@ def _score_and_rank(
                     )
                 with trace.stage("svm_fit"):
                     svm.fit(fb_features_scaled, labels, sample_weight=sample_weights)
+                if config.model.linear_blend_enabled:
+                    try:
+                        with trace.stage("linear_blend_fit"):
+                            linear_models = linear_blend.fit_linear_blend(
+                                fb_features_scaled,
+                                labels,
+                                sample_weights,
+                                feedback_stories,
+                                feedback_labels,
+                                dense_c=config.model.linear_blend_dense_c,
+                                tfidf_c=config.model.linear_blend_tfidf_c,
+                                warm=linear_blend.latest(user_id)
+                                if user_id is not None
+                                else None,
+                            )
+                        if fb_sig and user_id is not None:
+                            linear_blend.set_cached(
+                                (user_id, fb_sig, _MODEL_SCHEMA_VERSION),
+                                linear_models,
+                                config.max_cached_models,
+                            )
+                    except Exception as e:
+                        trace.set_label("linear_blend_fit", "error")
+                        logging.error("Failed to fit linear blend: %r", e)
                 if fb_sig:
                     _set_cached_model(
                         user_id,
@@ -1417,6 +1538,7 @@ def _score_and_rank(
                     [cand_features[:, :emb_dim], cand_features_meta_scaled]
                 )
 
+            linear_dense_candidates = cand_features_scaled
             class_order = list(svm.classes_)
             idx_up = class_order.index(2)
             with trace.stage("decision"):
@@ -1488,6 +1610,9 @@ def _score_and_rank(
     # Three-way blend between tier 1 (gravity), tier 2 (centroid), tier 3 (SVM)
     # α_2 ramps from 0→1 as n_feedback grows; tier 1 fades out smoothly.
     alpha_2 = float(np.clip(n_feedback / config.model.tier2_blend_window, 0.0, 1.0))
+    # The SVM tier's share; the linear blend (same votes, same kind of model)
+    # ramps in with it.
+    t3_weight = 0.0
 
     if svm_scores is not None and tier2_scores is not None:
         n_min = min(n_up, n_down)
@@ -1518,6 +1643,27 @@ def _score_and_rank(
         scores = tier1_scores
 
     assert scores is not None
+
+    blend_share = t3_weight if config.model.linear_blend_ramp else 1.0
+    if (
+        linear_models is not None
+        and linear_dense_candidates is not None
+        and svm_scores is not None
+        and blend_share > 0.0
+    ):
+        try:
+            with trace.stage("linear_blend_score"):
+                scores = linear_blend.blend_scores(
+                    linear_models,
+                    scores,
+                    linear_dense_candidates,
+                    candidates,
+                    dense_weight=config.model.linear_blend_dense_weight * blend_share,
+                    tfidf_weight=config.model.linear_blend_tfidf_weight * blend_share,
+                )
+        except Exception as e:
+            trace.set_label("linear_blend_score", "error")
+            logging.error("Failed to score linear blend: %r", e)
 
     ranked: list[RankedStory] = []
     if svm_probs is not None:
@@ -1605,311 +1751,320 @@ def get_entropy(r: RankedStory) -> float:
     return ent
 
 
+def hn_gravity(points: int, posted: int, now: float, time_scale: float = 1.0) -> float:
+    """HN front-page gravity, points / (age_hours / time_scale + 2) ** 1.8;
+    ``time_scale`` 1 is HN's own and the tier-1 blend of ``_score_and_rank``,
+    Popular uses ``GRAVITY_TIME_SCALE[window]`` (age clamped at zero)."""
+    age_hours = max((now - posted) / 3600.0, 0.0)
+    return points / (age_hours / time_scale + 2.0) ** 1.8
+
+
+def in_window(posted: int, window: Window, now: float) -> bool:
+    """Whether a story posted at *posted* belongs to *window* at *now*
+    (age clamped at zero)."""
+    age = max(now - posted, 0.0)
+    if window == "archive":
+        return age > WINDOW_SECONDS["1m"]
+    return age <= WINDOW_SECONDS[window]
+
+
+@dataclass(frozen=True)
+class WindowViews:
+    """The three views of one time window. Recommended is in model-score
+    order and Popular in HN-gravity order. A cached deck's Explore is in
+    pick order (Unsure, then Novel, then Interest picks, each best first) so
+    ``serve_window`` can cap it per badge; a served Explore is in model-score
+    order."""
+
+    recommended: tuple[RankedStory, ...] = ()
+    popular: tuple[RankedStory, ...] = ()
+    explore: tuple[RankedStory, ...] = ()
+
+    def view(self, name: View) -> tuple[RankedStory, ...]:
+        if name == "recommended":
+            return self.recommended
+        return self.popular if name == "popular" else self.explore
+
+    def stories(self) -> list[RankedStory]:
+        """One card per story, in view order, with its badges from every
+        view of this window it is in (a Recommended story that is also Hot
+        shows 🔥)."""
+        merged: dict[int, RankedStory] = {}
+        for name in VIEWS:
+            for r in self.view(name):
+                prev = merged.get(r.story.id)
+                merged[r.story.id] = (
+                    r
+                    if prev is None
+                    else replace(
+                        prev,
+                        is_uncertain=prev.is_uncertain or r.is_uncertain,
+                        is_novel=prev.is_novel or r.is_novel,
+                        is_discussion_rich=prev.is_discussion_rich
+                        or r.is_discussion_rich,
+                        is_high_engagement=prev.is_high_engagement
+                        or r.is_high_engagement,
+                        is_hot=prev.is_hot or r.is_hot,
+                        is_interest=prev.is_interest or r.is_interest,
+                    )
+                )
+        return list(merged.values())
+
+
+ViewMapper: TypeAlias = Callable[
+    [Window, View, tuple[RankedStory, ...]], Iterable[RankedStory]
+]
+
+
+@dataclass(frozen=True)
+class WindowDeck:
+    """A deck: the views of every time window (see ``assemble_window_deck``)."""
+
+    windows: dict[Window, WindowViews] = field(default_factory=dict)
+
+    def window(self, name: Window) -> WindowViews:
+        return self.windows.get(name, WindowViews())
+
+    def stories(self) -> list[RankedStory]:
+        """Every story once (as in the first window that has it), best model
+        score first."""
+        seen: dict[int, RankedStory] = {}
+        for views in self.windows.values():
+            for r in views.stories():
+                seen.setdefault(r.story.id, r)
+        return sorted(seen.values(), key=lambda r: r.score, reverse=True)
+
+    def is_empty(self) -> bool:
+        return not any(
+            views.view(name) for views in self.windows.values() for name in VIEWS
+        )
+
+    def map_views(self, fn: ViewMapper) -> WindowDeck:
+        """A deck with every view replaced by ``fn(window, view, stories)``."""
+        return WindowDeck(
+            {
+                w: WindowViews(
+                    tuple(fn(w, "recommended", views.recommended)),
+                    tuple(fn(w, "popular", views.popular)),
+                    tuple(fn(w, "explore", views.explore)),
+                )
+                for w, views in self.windows.items()
+            }
+        )
+
+    def without(self, story_ids: Collection[int]) -> WindowDeck:
+        return self.map_views(
+            lambda _w, _v, items: (r for r in items if r.story.id not in story_ids)
+        )
+
+
 @dataclass(frozen=True)
 class ExploreContext:
-    """Per-candidate arrays needed for the personalized Explore badges
-    (Unsure/Novel/Similar). Absent (``None``) on the cold-deck path, which
-    has no feedback to personalize against."""
+    """Per-candidate arrays for the personalized Explore picks (Unsure/Novel/
+    Interest), rows looked up by story id through ``row_of``. Absent
+    (``None``) on the cold-deck path, which has no feedback to personalize
+    against.
+
+    ``cand_interest`` is each candidate's nearest interest (a cluster of the
+    user's upvotes, ``interest_centers``); ``interest_sizes`` counts the
+    upvotes in each. No interests (empty ``interest_sizes``), no Interest
+    picks."""
 
     cand_max_sim: NDArray[np.float32]
-    cand_closest_up: NDArray[np.float32]
+    cand_interest: NDArray[np.int64]
+    interest_sizes: NDArray[np.int64]
+    row_of: Mapping[int, int]
 
 
-def _assemble_combo_deck(
-    ranked: list[RankedStory],
+def assemble_window_deck(
+    ranked: Sequence[RankedStory],
     *,
     config: Config,
-    recent_cutoff: int,
-    cand_scores: NDArray[np.float32],
-    cand_velocities: NDArray[np.float32],
-    idx_for: Callable[[int], int],
-    embeddings_map: dict[int, NDArray[np.float32]] | None,
-    explore: ExploreContext | None,
+    now: float,
+    explore: ExploreContext | None = None,
     is_feedback_match: Callable[[Story], bool] | None = None,
     trace: RankTrace | _NullTrace = NULL_TRACE,
-) -> list[RankedStory]:
-    """Bucket ``ranked`` into per-combo primary + badge cards.
+) -> WindowDeck:
+    """Pick every window's three views from a fully scored candidate pool,
+    all at one *now*, each ``SELECT_MARGIN`` times its served size
+    (``serve_window`` caps them at request time).
 
-    *is_feedback_match*, when provided, marks candidates that duplicate a
-    story the user already voted on (same URL or near-identical HN title —
-    see ``hn_dupes._matches_feedback``). The Explore passes (Unsure/Novel/
-    Similar) skip such candidates and backfill from the rest of the sorted
-    pool, so a badge quota isn't silently short-filled by cards that
-    ``canonicalize_hn_dupes`` would drop downstream anyway. Popular
-    (Hot/Top/Talk) and Primary selection are unaffected — they have larger
-    quotas and are out of scope for this fix (see WORKLOG 2026-07-10).
+    Per window (see ``in_window``):
 
-    Non-personalized (Popular: Hot/Top/Talk) badges always run. Personalized
-    (Explore: Unsure/Novel/Similar) badges only run when *explore* is
-    provided — the cold-deck path passes ``None`` since it has no feedback
-    to personalize against.
+    - Recommended: the top stories by model score, no source quota.
+    - Popular: the top HN stories by ``hn_gravity`` on the window's clock
+      (``GRAVITY_TIME_SCALE``). Each card independently gets every badge
+      it qualifies for: 🔥 Hot when its velocity
+      (points/hour) is at or above the pool's ``hot_badge_percentile`` and it has
+      ``HOT_MIN_SCORE`` points; 🏆 Top with at least ``TOP_MIN_SCORE``
+      points; 💬 Talk with at least ``TALK_MIN_COMMENTS`` comments and at
+      least as many comments as points. Cards may have no Popular badge.
+    - Explore, only with *explore*: Unsure (highest entropy), Novel
+      (farthest from every vote) and Interest (the best story of each of
+      the user's interests, least covered by the served Recommended first;
+      ``interest_picks``), picked in that order, each excluding earlier
+      picks and the window's Recommended stories.
+      *is_feedback_match* marks stories that duplicate a voted one;
+      Explore skips them and backfills from the rest (``canonicalize_hn_
+      dupes`` would drop them downstream anyway; see WORKLOG 2026-07-10).
     """
+    by_score = sorted(ranked, key=lambda r: r.score, reverse=True)
+    velocities = [
+        r.story.score / max((now - r.story.time) / 3600.0, 0.1) for r in by_score
+    ]
+    hot_threshold = (
+        float(np.percentile(velocities, config.model.hot_badge_percentile))
+        if velocities
+        else 0.0
+    )
+    velocity_of = {r.story.id: v for r, v in zip(by_score, velocities)}
 
-    def _novel_sort_key(r: RankedStory) -> float:
-        assert explore is not None
-        return float(1.0 - explore.cand_max_sim[idx_for(r.story.id)])
+    def popular_card(r: RankedStory) -> RankedStory:
+        story = r.story
+        comments = story.comment_count or 0
+        return replace(
+            r,
+            is_hot=story.score >= HOT_MIN_SCORE
+            and velocity_of[story.id] >= hot_threshold,
+            is_high_engagement=story.score >= TOP_MIN_SCORE,
+            is_discussion_rich=comments >= TALK_MIN_COMMENTS
+            and comments >= story.score,
+        )
 
-    def _similar_sort_key(r: RankedStory) -> float:
-        assert explore is not None
-        return float(explore.cand_closest_up[idx_for(r.story.id)])
-
-    def _discussion_sort_key(r: RankedStory) -> float:
-        return float(r.story.comment_count or 0)
-
-    def _engagement_sort_key(r: RankedStory) -> float:
-        return float(cand_scores[idx_for(r.story.id)])
-
-    def _hot_sort_key(r: RankedStory) -> float:
-        return float(cand_velocities[idx_for(r.story.id)])
-
-    def _take_unmatched(items: list[RankedStory], n: int) -> list[RankedStory]:
-        """Take the first *n* items from an already-sorted list, skipping
-        (and backfilling past) any that duplicate voted-on feedback.
-
-        Only walks as far into ``items`` as needed to fill *n* slots, so
-        the (expensive, title-similarity-based) ``is_feedback_match`` check
-        runs on a handful of candidates per badge rather than the whole
-        combo pool.
-        """
+    def take_unmatched(items: list[RankedStory], n: int) -> list[RankedStory]:
+        """The first *n* of *items* that don't duplicate a voted story. Walks
+        only as far as needed: the title-similarity check is expensive."""
         if is_feedback_match is None:
             return items[:n]
         out: list[RankedStory] = []
         for r in items:
-            if is_feedback_match(r.story):
-                continue
-            out.append(r)
             if len(out) >= n:
+                break
+            if not is_feedback_match(r.story):
+                out.append(r)
+        return out
+
+    # Explore passes: sort key, badge, and whether the pass needs model
+    # probabilities (Unsure does: no trained SVM, no Unsure).
+    explore_passes: list[
+        tuple[
+            Callable[[RankedStory], float],
+            Callable[[RankedStory], RankedStory],
+            bool,
+        ]
+    ] = []
+    if explore is not None:
+        ctx = explore
+        entropy = {r.story.id: get_entropy(r) for r in by_score}
+        explore_passes = [
+            (
+                lambda r: entropy[r.story.id],
+                lambda r: replace(r, is_uncertain=True),
+                True,
+            ),
+            (
+                lambda r: float(1.0 - ctx.cand_max_sim[ctx.row_of[r.story.id]]),
+                lambda r: replace(r, is_novel=True),
+                False,
+            ),
+        ]
+
+    def interest_picks(
+        pool: list[RankedStory], shown: list[RankedStory], picked: set[int]
+    ) -> list[RankedStory]:
+        """Round-robin over the user's interests: each round takes every
+        interest's best-scoring story not yet picked (and not a voted
+        story's duplicate). Interests the *shown* Recommended stories cover
+        least go first, then bigger ones, so the served picks show the
+        interests Recommended misses."""
+        if explore is None or not len(explore.interest_sizes):
+            return []
+        ctx = explore
+        sizes = ctx.interest_sizes
+
+        def interest_of(r: RankedStory) -> int:
+            return int(ctx.cand_interest[ctx.row_of[r.story.id]])
+
+        covered = np.bincount([interest_of(r) for r in shown], minlength=len(sizes))
+        order = sorted(range(len(sizes)), key=lambda c: (covered[c], -sizes[c]))
+        queues: dict[int, list[RankedStory]] = {c: [] for c in order}
+        for r in pool:  # model-score order
+            if r.story.id not in picked:
+                queues[interest_of(r)].append(r)
+        heads = dict.fromkeys(order, 0)
+        out: list[RankedStory] = []
+        limit = EXPLORE_PER_BADGE * SELECT_MARGIN
+        while len(out) < limit:
+            took = False
+            for c in order:
+                queue = queues[c]
+                while heads[c] < len(queue):
+                    r = queue[heads[c]]
+                    heads[c] += 1
+                    if is_feedback_match is None or not is_feedback_match(r.story):
+                        out.append(replace(r, is_interest=True))
+                        took = True
+                        break
+                if len(out) >= limit:
+                    break
+            if not took:
                 break
         return out
 
-    def _entropy_sort_key(r: RankedStory) -> float:
-        return float(get_entropy(r))
-
-    # Per-combo deck construction. Three combos: recent_hn, recent_nonhn,
-    # archive_hn (a fourth, archive_nonhn, is structurally always empty —
-    # see the PRIMARY_RECENT_NONHN/PRIMARY_ARCHIVE_HN comment above — and
-    # has been retired). Each combo gets its own primary quota (MMR if
-    # enabled, otherwise top-score), plus up to POPULAR_PER_COMBO cards split
-    # across Hot/Top/Talk (Popular, HN only) and EXPLORE_PER_BADGE (or
-    # EXPLORE_PER_BADGE_NONHN) cards for each of Unsure/Novel/Similar (Explore).
-    #
-    # Cards carry space-separated combo_keys so the client can filter by
-    # age+source without computing offsets (e.g. "recent_hn recent_mixed").
-    COMBO_DEFS: list[tuple[str, str, int]] = [
-        ("recent", "hn", PRIMARY_PER_COMBO),
-        ("recent", "nonhn", PRIMARY_RECENT_NONHN),
-        ("archive", "hn", PRIMARY_ARCHIVE_HN),
-    ]
-
-    final: list[RankedStory] = []
-
-    for age, source, primary_limit in COMBO_DEFS:
-        # Filter candidate pool to this combo
-        if age == "recent":
-            age_pool = [r for r in ranked if r.story.time >= recent_cutoff]
-        else:
-            age_pool = [r for r in ranked if r.story.time < recent_cutoff]
-
-        if source == "hn":
-            combo_pool = [r for r in age_pool if is_hn_source(r.story.source)]
-        else:
-            combo_pool = [r for r in age_pool if not is_hn_source(r.story.source)]
-
-        combo_id = f"{age}_{source}"
-        trace.set_count(f"combo_pool_{combo_id}", len(combo_pool))
-
-        if not combo_pool:
-            trace.set_count(f"combo_primary_{combo_id}", 0)
-            trace.set_count(f"combo_badges_{combo_id}", 0)
-            continue
-
-        source_key = age + ("_hn" if source == "hn" else "_non-hn")
-        mixed_key = age + "_mixed"
-
-        # --- Primary selection ---
-        if primary_limit > 0:
-            if config.model.enable_mmr and embeddings_map:
-                with trace.stage("combo_mmr"):
-                    primary = mmr_filter(
-                        combo_pool,
-                        embeddings_map,
-                        threshold=config.model.diversity_threshold,
-                        limit=primary_limit,
-                    )
-            else:
-                combo_sort = sorted(combo_pool, key=lambda r: r.score, reverse=True)
-                primary = combo_sort[:primary_limit]
-
-            final.extend(
-                replace(r, combo_keys=f"{source_key} {mixed_key}") for r in primary
-            )
-        else:
-            primary = []
-
-        trace.set_count(f"combo_primary_{combo_id}", len(primary))
-        badge_baseline = len(final)
-        primary_ids = {r.story.id for r in primary}
-
-        # --- Popular (HN only): Hot + Top + Talk ---
-        # Each pass sees the full combo_pool and can OR badges onto stories
-        # already in primary, matching the old global Hot/Top/Talk behavior.
-        # Cascade: Hot → Top → Talk (each excludes prior picks).
-        if source == "hn":
-            # Hot: full combo_pool, gated by velocity percentile + score floor
-            hot_threshold = (
-                np.percentile(cand_velocities, config.model.hot_badge_percentile)
-                if len(cand_velocities)
-                else 0
-            )
-            hot_pool = [
+    windows: dict[Window, WindowViews] = {}
+    for window in WINDOWS:
+        pool = [r for r in by_score if in_window(r.story.time, window, now)]
+        trace.set_count(f"window_pool_{window}", len(pool))
+        recommended = pool[: VIEW_SIZE * SELECT_MARGIN]
+        popular = sorted(
+            (r for r in pool if is_hn_source(r.story.source)),
+            key=lambda r: hn_gravity(
+                r.story.score, r.story.time, now, GRAVITY_TIME_SCALE[window]
+            ),
+            reverse=True,
+        )[: VIEW_SIZE * SELECT_MARGIN]
+        picked = {r.story.id for r in recommended}
+        explore_view: list[RankedStory] = []
+        for key, mark, needs_probs in explore_passes:
+            eligible = [
                 r
-                for r in combo_pool
-                if r.story.score >= HOT_MIN_SCORE
-                and cand_velocities[idx_for(r.story.id)] >= hot_threshold
+                for r in pool
+                if r.story.id not in picked
+                and (not needs_probs or r.prob_down is not None)
             ]
-            hot_pool.sort(key=_hot_sort_key, reverse=True)
-            hot_picks = hot_pool[: POPULAR_PER_COMBO // 3]
-            n_hot = len(hot_picks)
-            for r in hot_picks:
-                existing = next(
-                    (i for i, f in enumerate(final) if f.story.id == r.story.id),
-                    None,
-                )
-                new_r = replace(r, is_hot=True, combo_keys=f"{source_key} {mixed_key}")
-                if existing is not None:
-                    final[existing] = replace(
-                        final[existing],
-                        is_hot=True,
-                        combo_keys=f"{source_key} {mixed_key}",
-                    )
-                else:
-                    final.append(new_r)
-
-            # Top: full combo_pool minus Hot picks, sorted by engagement score.
-            # Top and Talk split whatever Popular budget Hot left unused.
-            top_limit = (POPULAR_PER_COMBO - n_hot + 1) // 2
-            hot_and_primary = {r.story.id for r in final if r.is_hot} | primary_ids
-            top_pool = sorted(
-                [r for r in combo_pool if r.story.id not in hot_and_primary],
-                key=_engagement_sort_key,
-                reverse=True,
-            )[:top_limit]
-            for r in top_pool:
-                final.append(
-                    replace(
-                        r,
-                        is_high_engagement=True,
-                        combo_keys=f"{source_key} {mixed_key}",
-                    )
-                )
-
-            # Talk: full combo_pool minus Hot+Top picks, sorted by discussion
-            hot_top_and_primary = {r.story.id for r in final} | primary_ids
-            talk_pool = sorted(
-                [
-                    r
-                    for r in combo_pool
-                    if r.story.id not in hot_top_and_primary
-                    and (r.story.comment_count or 0) > 0
-                ],
-                key=_discussion_sort_key,
-                reverse=True,
-            )[: POPULAR_PER_COMBO - n_hot - len(top_pool)]
-            for r in talk_pool:
-                final.append(
-                    replace(
-                        r,
-                        is_discussion_rich=True,
-                        combo_keys=f"{source_key} {mixed_key}",
-                    )
-                )
-
-        # --- Explore: Unsure + Novel + Similar ---
-        # Explore passes see the full combo pool (minus primary) and can
-        # stack badges on stories already picked by Popular, matching the
-        # old parallel-pass design. Within Explore, Unsure/Novel/Similar
-        # are serial (mutually exclusive) to keep the badge mix varied.
-        if explore is not None:
-            explore_per_badge = (
-                EXPLORE_PER_BADGE if source == "hn" else EXPLORE_PER_BADGE_NONHN
-            )
-            explore_pool = [r for r in combo_pool if r.story.id not in primary_ids]
-            explore_picked = set[int]()  # only track Explore picks, not Popular
-
-            def _merge_or_append(r: RankedStory, **badge_flags: bool) -> None:
-                # A story already present in `final` (e.g. badged by Hot/Top/Talk,
-                # or by an earlier Explore pass) gets the new badge OR'd onto its
-                # existing card instead of appending a duplicate — one card per
-                # story per segment (see specs/ranking-feedback.allium invariant
-                # OneCardPerStoryPerSegment).
-                existing = next(
-                    (i for i, f in enumerate(final) if f.story.id == r.story.id), None
-                )
-                if existing is not None:
-                    final[existing] = replace(
-                        final[existing],
-                        combo_keys=f"{source_key} {mixed_key}",
-                        **badge_flags,
-                    )
-                else:
-                    final.append(
-                        replace(
-                            r, combo_keys=f"{source_key} {mixed_key}", **badge_flags
-                        )
-                    )
-
-            unsure_items = _take_unmatched(
-                sorted(
-                    [r for r in explore_pool if r.prob_down is not None],
-                    key=_entropy_sort_key,
-                    reverse=True,
-                ),
-                explore_per_badge,
-            )
-            for r in unsure_items:
-                _merge_or_append(r, is_uncertain=True)
-                explore_picked.add(r.story.id)
-
-            novel_items = _take_unmatched(
-                sorted(
-                    [r for r in explore_pool if r.story.id not in explore_picked],
-                    key=_novel_sort_key,
-                    reverse=True,
-                ),
-                explore_per_badge,
-            )
-            for r in novel_items:
-                _merge_or_append(r, is_novel=True)
-                explore_picked.add(r.story.id)
-
-            similar_items = _take_unmatched(
-                sorted(
-                    [r for r in explore_pool if r.story.id not in explore_picked],
-                    key=_similar_sort_key,
-                    reverse=True,
-                ),
-                explore_per_badge,
-            )
-            for r in similar_items:
-                _merge_or_append(r, is_similar=True)
-                explore_picked.add(r.story.id)
-
-        trace.set_count(f"combo_badges_{combo_id}", len(final) - badge_baseline)
-
-    # Set is_recent and is_non_hn on every story in `final` (these flags are
-    # source/time based, not rank-based, so they always reflect the current
-    # candidate's metadata regardless of how it was selected).
-    final = [
-        replace(
-            r,
-            is_non_hn=(not is_hn_source(r.story.source)),
-            is_recent=(r.story.time >= recent_cutoff),
+            eligible.sort(key=key, reverse=True)
+            for r in take_unmatched(eligible, EXPLORE_PER_BADGE * SELECT_MARGIN):
+                picked.add(r.story.id)
+                explore_view.append(mark(r))
+        explore_view.extend(interest_picks(pool, recommended[:VIEW_SIZE], picked))
+        windows[window] = WindowViews(
+            tuple(recommended),
+            tuple(popular_card(r) for r in popular),
+            tuple(explore_view),
         )
-        for r in final
-    ]
+    return WindowDeck(windows)
 
-    final.sort(key=lambda r: r.score, reverse=True)
-    return final
+
+def serve_window(views: WindowViews, window: Window, now: float) -> WindowViews:
+    """A cached window as served at *now*: stories that aged out of the
+    window since the warm are dropped, then each view is capped
+    (``VIEW_SIZE``; Explore ``EXPLORE_PER_BADGE`` per badge, in model-score
+    order). Short windows stay short; they are never widened."""
+
+    def current(items: tuple[RankedStory, ...]) -> list[RankedStory]:
+        return [r for r in items if in_window(r.story.time, window, now)]
+
+    explore: list[RankedStory] = []
+    for badge in ("is_uncertain", "is_novel", "is_interest"):
+        explore.extend(
+            [r for r in current(views.explore) if getattr(r, badge)][:EXPLORE_PER_BADGE]
+        )
+    explore.sort(key=lambda r: r.score, reverse=True)
+    return WindowViews(
+        tuple(current(views.recommended)[:VIEW_SIZE]),
+        tuple(current(views.popular)[:VIEW_SIZE]),
+        tuple(explore),
+    )
 
 
 def rerank_candidates(
@@ -1921,23 +2076,19 @@ def rerank_candidates(
     user_id: int | None = None,
     trace: RankTrace | _NullTrace = NULL_TRACE,
     is_feedback_match: Callable[[Story], bool] | None = None,
-) -> list[RankedStory]:
-    """Rank candidates and attach discovery badges.
+) -> WindowDeck:
+    """Score candidates and pick every window's views.
 
-    This wraps :func:`_score_and_rank` (which only does tier blend + sort)
-    and adds badge attribution + 7 discovery passes (uncertainty, novelty,
-    similarity, discussion-rich, high-engagement, hot, non-HN).
-
-    *is_feedback_match*, when provided, is threaded into
-    :func:`_assemble_combo_deck` so the Explore passes can skip-and-backfill
-    past candidates that duplicate already-voted stories (see that
-    function's docstring).
+    This wraps :func:`_score_and_rank` (tier blend + sort) and
+    :func:`assemble_ranked_deck` (window views, badges, attribution).
+    *is_feedback_match* is passed on to the Explore picks (see
+    :func:`assemble_window_deck`).
 
     Use this in production; the private ``_score_and_rank`` is intended for
     tier-blend tests that need to assert on ranking without badge side effects.
     """
     if not candidates:
-        return []
+        return WindowDeck()
     trace.set_count("candidates", len(candidates))
 
     if cand_embeddings is None:
@@ -1973,18 +2124,81 @@ def rerank_candidates(
 # Minimum closest-up similarity for showing an attribution. A bogus
 # "because you upvoted X" on a weak match is worse than none.
 ATTRIBUTION_MIN_SIM = 0.35
+# Badged cards (Hot/Top/Talk/Unsure/Novel) are in the deck for popularity
+# or exploration, not for resembling an upvote, and full-text similarity to
+# the nearest upvote is 0.6-0.8 for most loosely related stories (median
+# 0.77 on profile 151's 1w deck, 2026-09-30). They name one only on a close
+# match: 0.85 was picked by eye on that deck, just above the clear misses
+# (0.64-0.81); good and bad matches overlap, so it trades some good lines
+# for no bad ones. Interest (🎯) comes from the user's upvotes, so it keeps
+# the floor.
+BADGED_ATTRIBUTION_MIN_SIM = 0.85
+# Mean-pooled full-text vectors share a direction that grows with text length
+# (cosine to the pool mean: 0.26 under 500 chars, 0.60 over 6,000), so two
+# long, unrelated stories can look close: a ghc-debug post and an AINews
+# digest scored 0.64, closer than 99.9% of profile 151's votes. A card keeps
+# its raw nearest upvote, but names it only if the pair is still close with
+# the pool mean and top ATTRIBUTION_CENTER_DIRECTIONS directions removed (that
+# pair: 0.20). At 0.30 a line stays on 64% of a week's stories (92% before)
+# and on 90% of raw >= 0.80 matches (2026-10-02, FINDINGS.md). Ranking,
+# badges and Explore keep the raw vectors.
+ATTRIBUTION_CENTER_DIRECTIONS = 3
+ATTRIBUTION_CENTERED_MIN_SIM = 0.30
+
+
+def centered_pair_similarity(
+    pool: NDArray[np.float32],
+    left: NDArray[np.float32],
+    right: NDArray[np.float32],
+) -> NDArray[np.float32]:
+    """Row-wise cosine of ``left[i]`` and ``right[i]`` after removing the
+    pool's mean and its top ATTRIBUTION_CENTER_DIRECTIONS principal
+    directions; 0 where a centered vector vanishes."""
+    mean = pool.mean(axis=0)
+    spread = pool - mean
+    _, eigenvectors = np.linalg.eigh(spread.T @ spread)
+    top = eigenvectors[:, ::-1][:, :ATTRIBUTION_CENTER_DIRECTIONS].T
+
+    def center(x: NDArray[np.float32]) -> tuple[NDArray[np.float32], NDArray[Any]]:
+        y = x - mean
+        y = y - (y @ top.T) @ top
+        return y, np.linalg.norm(y, axis=1)
+
+    a, a_norm = center(left)
+    b, b_norm = center(right)
+    norms = a_norm * b_norm
+    valid = (a_norm > 1e-6) & (b_norm > 1e-6)
+    sims = np.where(valid, (a * b).sum(axis=1) / np.where(valid, norms, 1.0), 0.0)
+    return sims.astype(np.float32)
+
+
+def card_attribution(r: RankedStory) -> str:
+    """The attribution a card shows, given its badges from every view
+    (``WindowViews.stories``)."""
+    badged = (
+        r.is_hot
+        or r.is_high_engagement
+        or r.is_discussion_rich
+        or r.is_uncertain
+        or r.is_novel
+    )
+    if badged and r.best_match_sim < BADGED_ATTRIBUTION_MIN_SIM:
+        return ""
+    return r.best_match_title
 
 
 def _fill_best_match_titles(
-    final: list[RankedStory],
+    deck: WindowDeck,
     candidates: list[Story],
     score_context: RankScoreContext | None,
-) -> list[RankedStory]:
+    cand_embeddings: NDArray[np.float32],
+) -> WindowDeck:
     """F2 attribution: name the closest upvoted story per deck card.
 
-    Uses the argmax indices already computed for features (no new matmul).
-    Empty when cold (no feedback), when the argmax is invalid, when the
-    feedback title is gone, or below ATTRIBUTION_MIN_SIM.
+    Uses the argmax indices already computed for features (no new matmul
+    over all candidates). Empty when cold (no feedback), when the argmax is
+    invalid, when the feedback title is gone, below ATTRIBUTION_MIN_SIM, or
+    below ATTRIBUTION_CENTERED_MIN_SIM once centered.
     """
     if (
         score_context is None
@@ -1992,23 +2206,49 @@ def _fill_best_match_titles(
         or score_context.cand_closest_up is None
         or not score_context.fb_up_titles
     ):
-        return final
-    row_of = {s.id: i for i, s in enumerate(candidates)}
+        return deck
     titles = score_context.fb_up_titles
-    filled: list[RankedStory] = []
-    for r in final:
+    up_embeddings = score_context.fb_up_embeddings
+    if (
+        up_embeddings is None
+        or len(up_embeddings) != len(titles)
+        or len(cand_embeddings) != len(candidates)
+        or up_embeddings.shape[1:] != cand_embeddings.shape[1:]
+    ):
+        return deck
+    row_of = {s.id: i for i, s in enumerate(candidates)}
+    closest_up_idx = score_context.cand_closest_up_idx
+    closest_up = score_context.cand_closest_up
+
+    raw: dict[int, tuple[int, int, float]] = {}
+    for r in deck.stories():
         row = row_of.get(r.story.id)
-        title = ""
-        if row is not None:
-            fb_row = int(score_context.cand_closest_up_idx[row])
-            if (
-                0 <= fb_row < len(titles)
-                and float(score_context.cand_closest_up[row]) >= ATTRIBUTION_MIN_SIM
-                and titles[fb_row]
-            ):
-                title = titles[fb_row]
-        filled.append(replace(r, best_match_title=title) if title else r)
-    return filled
+        if row is None:
+            continue
+        fb_row = int(closest_up_idx[row])
+        sim = float(closest_up[row])
+        if 0 <= fb_row < len(titles) and sim >= ATTRIBUTION_MIN_SIM and titles[fb_row]:
+            raw[r.story.id] = (row, fb_row, sim)
+    if not raw:
+        return deck
+    rows = np.array([row for row, _, _ in raw.values()])
+    fb_rows = np.array([fb_row for _, fb_row, _ in raw.values()])
+    centered = centered_pair_similarity(
+        cand_embeddings, cand_embeddings[rows], up_embeddings[fb_rows]
+    )
+    matches = {
+        story_id: (titles[fb_row], sim)
+        for (story_id, (_, fb_row, sim)), close in zip(raw.items(), centered)
+        if close >= ATTRIBUTION_CENTERED_MIN_SIM
+    }
+
+    def fill(r: RankedStory) -> RankedStory:
+        match = matches.get(r.story.id)
+        if match is None:
+            return r
+        return replace(r, best_match_title=match[0], best_match_sim=match[1])
+
+    return deck.map_views(lambda _w, _v, items: (fill(r) for r in items))
 
 
 def assemble_ranked_deck(
@@ -2023,17 +2263,12 @@ def assemble_ranked_deck(
     score_context: RankScoreContext | None = None,
     trace: RankTrace | _NullTrace = NULL_TRACE,
     is_feedback_match: Callable[[Story], bool] | None = None,
-) -> list[RankedStory]:
-    """Attach production combo membership and discovery to an existing ranking."""
+) -> WindowDeck:
+    """Pick the window views (with Explore) from an existing ranking."""
     if not candidates:
-        return []
+        return WindowDeck()
     if score_context is None:
         score_context = RankScoreContext()
-
-    # Build MMR embeddings map once (used per combo)
-    embeddings_map: dict[int, NDArray[np.float32]] = {}
-    if config.model.enable_mmr:
-        embeddings_map = {s.id: vec for s, vec in zip(candidates, cand_embeddings)}
 
     with trace.stage("badge_similarity"):
         # Reuse vectors from _score_and_rank when SVM was trained;
@@ -2051,6 +2286,7 @@ def assemble_ranked_deck(
             down_mask = fb_labels_arr == 0
             neutral_mask = fb_labels_arr == 1
             fb_embs = get_or_compute_embeddings(feedback_stories, embedder, db)
+            score_context.fb_up_embeddings = fb_embs[up_mask]
             cand_closest_up = (
                 _chunked_max_dot(cand_embeddings, fb_embs[up_mask])
                 if up_mask.any()
@@ -2072,38 +2308,33 @@ def assemble_ranked_deck(
             [cand_closest_up, cand_closest_down, cand_closest_neutral]
         )
 
-    # Hoist now_ts and compute per-age-bucket metadata early so all
-    # threshold computations below can produce per-candidate arrays.
-    # Per-bucket thresholds are required because archive candidates have
-    # structurally higher absolute scores/comment counts (months/years of
-    # accumulation) than recent candidates; a single global threshold
-    # would be archive-dominated and make it nearly impossible for
-    # recent stories to earn Top/Talk-worthy badges. Similar logic
-    # applies to Novel/Similar/Unsure so badges remain meaningful
-    # within each age cohort.
-    cand_scores = np.array([s.score for s in candidates])
-    now_ts = time.time()
-    recent_cutoff = int(now_ts) - 30 * 86400
-    cand_velocities = np.array(
-        [s.score / max((now_ts - s.time) / 3600.0, 0.1) for s in candidates]
-    )
+    with trace.stage("interest_clusters"):
+        up_embs = score_context.fb_up_embeddings
+        if up_embs is None:
+            up_embs = np.zeros((0, cand_embeddings.shape[1]), dtype=np.float32)
+        centers = interest_centers(user_id, up_embs, config.model.interest_cluster_k)
+        if len(centers):
+            cand_interest = np.argmax(cand_embeddings @ centers.T, axis=1)
+            interest_sizes = np.bincount(
+                np.argmax(up_embs @ centers.T, axis=1), minlength=len(centers)
+            )
+        else:
+            cand_interest = np.zeros(len(candidates), dtype=np.int64)
+            interest_sizes = np.zeros(0, dtype=np.int64)
 
-    story_id_to_idx = {s.id: idx for idx, s in enumerate(candidates)}
-    idx_for = story_id_to_idx.__getitem__
-
-    with trace.stage("combo_assembly"):
-        final = _assemble_combo_deck(
+    with trace.stage("window_assembly"):
+        deck = assemble_window_deck(
             ranked,
             config=config,
-            recent_cutoff=recent_cutoff,
-            cand_scores=cand_scores,
-            cand_velocities=cand_velocities,
-            idx_for=idx_for,
-            embeddings_map=embeddings_map,
+            now=time.time(),
             explore=ExploreContext(
-                cand_max_sim=cand_max_sim, cand_closest_up=cand_closest_up
+                cand_max_sim=cand_max_sim,
+                cand_interest=cand_interest.astype(np.int64),
+                interest_sizes=interest_sizes.astype(np.int64),
+                row_of={s.id: idx for idx, s in enumerate(candidates)},
             ),
             is_feedback_match=is_feedback_match,
             trace=trace,
         )
-    return _fill_best_match_titles(final, candidates, score_context)
+    with trace.stage("attribution"):
+        return _fill_best_match_titles(deck, candidates, score_context, cand_embeddings)

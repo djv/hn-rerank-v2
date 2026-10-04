@@ -1,56 +1,48 @@
 from __future__ import annotations
 
 import functools
+from collections.abc import Callable, Mapping, Sequence
+import time
 
 from datetime import datetime
-import random
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
 from jinja2 import Environment, FileSystemLoader
 
-from database import Database, Story
-from clients.tui.src.hn_rerank.models import Feed, FeedBadge, FeedStory
+from database import Database, StoryCounts
+from clients.tui.src.hn_rerank.models import (
+    DEFAULT_WINDOW,
+    FEED_API_VERSION,
+    VIEWS,
+    WINDOW_LABELS,
+    Feed,
+    FeedBadge,
+    FeedStory,
+    Window,
+)
 from .config import (
     BQ_ARCHIVE_SOURCE,
     CH_ARCHIVE_SOURCE,
     Config,
 )
-from .ranking import RankedStory
+from .ranking import (
+    HOT_MIN_SCORE,
+    TALK_MIN_COMMENTS,
+    TOP_MIN_SCORE,
+    RankedStory,
+    WindowDeck,
+    card_attribution,
+    serve_window,
+)
 
-# Recommended shows at most this many cards per age (top by score);
-# Popular and Explore keep their own badge quotas. Cards in no view are
-# dropped so the server sends a short deck. Date lists every card that is in
-# another view, newest first, for both Age tabs. Clients show 12 per view
-# (so Date is the 12 newest in the deck); the rest are the backfill that
-# slides in as cards are voted.
-RECOMMENDED_LIMIT = 24
-
-
-@dataclass(frozen=True)
-class BadgeView:
-    kind: str
-    icon: str
-    label: str
-    tooltip: str
-
-
-@dataclass(frozen=True)
-class TabView:
-    value: str
-    label_html: str
-    active: bool = False
-
-
-@dataclass(frozen=True)
-class TabGroupView:
-    key: str
-    aria_label: str
-    css_class: str
-    data_attr: str
-    segmented: bool
-    tabs: tuple[TabView, ...]
+# Side-rail sort tabs: (value, label).
+SORT_TABS: tuple[tuple[str, str], ...] = (
+    ("recommended", "Recommended"),
+    ("popular", "Popular"),
+    ("explore", "Explore"),
+)
 
 
 @dataclass(frozen=True)
@@ -58,24 +50,6 @@ class VoteCountsView:
     up: int
     neutral: int
     down: int
-
-
-@dataclass(frozen=True)
-class DashboardCardView:
-    story: Story
-    score: float
-    best_match_title: str
-    badges: tuple[BadgeView, ...]
-    combo_keys: str
-    is_enriched: bool
-    sort_popular_attr: str
-    sort_explore_attr: str
-    sort_date_attr: str
-    sort_recommended_attr: str
-    article_url: str
-    comments_url: str
-    domain: str
-    source_label: str
 
 
 def source_label_filter(source: str) -> str:
@@ -106,6 +80,7 @@ def source_label_filter(source: str) -> str:
         "lobste_rs": "Lobsters",
         "discourse_haskell_org": "Haskell Discourse",
         "latent_space": "Latent Space",
+        "ainews": "AINews",
         "scottaaronson_blog": "Scott Aaronson",
         "simonwillison_net": "Simon Willison",
         "lwn_net": "LWN",
@@ -179,17 +154,15 @@ BADGE_LEGEND: tuple[tuple[str, str], ...] = (
     ("💬", "Talk"),
     ("🤔", "Unsure"),
     ("✨", "Novel"),
-    ("🎯", "Similar"),
+    ("🎯", "Interest"),
 )
 
 
-def _build_badges(
-    item: RankedStory, *, hot_badge_percentile: int
-) -> tuple[BadgeView, ...]:
-    badges: list[BadgeView] = []
+def _build_badges(item: RankedStory, *, hot_badge_percentile: float) -> list[FeedBadge]:
+    badges: list[FeedBadge] = []
     if item.is_uncertain:
         badges.append(
-            BadgeView(
+            FeedBadge(
                 kind="uncertain",
                 icon="🤔",
                 label="Unsure",
@@ -198,7 +171,7 @@ def _build_badges(
         )
     if item.is_novel:
         badges.append(
-            BadgeView(
+            FeedBadge(
                 kind="novel",
                 icon="✨",
                 label="Novel",
@@ -207,208 +180,116 @@ def _build_badges(
         )
     if item.is_discussion_rich:
         badges.append(
-            BadgeView(
+            FeedBadge(
                 kind="talk",
                 icon="💬",
                 label="Talk-worthy",
-                tooltip="High HN comment count for its age cohort",
+                tooltip=(
+                    f"At least {TALK_MIN_COMMENTS} HN comments "
+                    "and at least as many comments as points"
+                ),
             )
         )
     if item.is_high_engagement:
         badges.append(
-            BadgeView(
+            FeedBadge(
                 kind="top",
                 icon="🏆",
                 label="Top",
-                tooltip="High HN score for its age cohort",
+                tooltip=f"At least {TOP_MIN_SCORE} HN points",
             )
         )
     if item.is_hot:
         badges.append(
-            BadgeView(
+            FeedBadge(
                 kind="hot",
                 icon="🔥",
                 label="Hot",
                 tooltip=(
-                    f"Top {hot_badge_percentile}% by engagement velocity "
-                    "(points/hour) and score ≥ 20"
+                    f"Fastest {100 - hot_badge_percentile:g}% by points/hour "
+                    f"and at least {HOT_MIN_SCORE} HN points"
                 ),
             )
         )
-    if item.is_similar:
+    if item.is_interest:
         badges.append(
-            BadgeView(
-                kind="similar",
+            FeedBadge(
+                kind="interest",
                 icon="🎯",
-                label="Similar",
-                tooltip="Most similar to your upvoted stories for its age cohort",
+                label="Interest",
+                tooltip="Best story from one of your interests that Recommended misses",
             )
         )
-    return tuple(badges)
+    return badges
 
 
-def _build_dashboard_cards(
-    ranked: list[RankedStory], *, hot_badge_percentile: int
-) -> list[DashboardCardView]:
-    recommended_ids: set[int] = set()
-    for age in ("recent", "archive"):
-        in_age = [r for r in ranked if f"{age}_mixed" in r.combo_keys.split()]
-        in_age.sort(key=lambda r: r.score, reverse=True)
-        recommended_ids.update(r.story.id for r in in_age[:RECOMMENDED_LIMIT])
-    # Cards outside any age deck (no *_mixed key) aren't subject to the cap.
-    recommended_ids.update(
-        r.story.id
-        for r in ranked
-        if not any(key.endswith("_mixed") for key in r.combo_keys.split())
+def _feed_story(
+    item: RankedStory, *, hot_badge_percentile: float, counts: StoryCounts | None = None
+) -> FeedStory:
+    story = item.story
+    badges = _build_badges(item, hot_badge_percentile=hot_badge_percentile)
+    return FeedStory(
+        id=story.id,
+        title=story.title,
+        article_url=_web_url(story.url),
+        comments_url=_web_url(story.discussion_url),
+        source=story.source,
+        points=story.score if counts is None else counts.score,
+        comments=story.comment_count if counts is None else counts.comment_count,
+        time=story.time,
+        rank_score=item.score,
+        badges=[badge.icon for badge in badges],
+        badge_details=badges,
+        best_match_title=card_attribution(item),
+        source_label=source_label_filter(story.source),
+        domain=_domain_of(story.url or "", story.discussion_url or ""),
+        enriched=len(story.text_content) >= 1000,
     )
-    cards: list[DashboardCardView] = []
-    for item in ranked:
-        story = item.story
-        cards.append(
-            DashboardCardView(
-                story=story,
-                score=item.score,
-                best_match_title=item.best_match_title,
-                badges=_build_badges(item, hot_badge_percentile=hot_badge_percentile),
-                combo_keys=item.combo_keys,
-                is_enriched=len(story.text_content) >= 1000,
-                sort_popular_attr=(
-                    "1"
-                    if item.is_hot or item.is_high_engagement or item.is_discussion_rich
-                    else "0"
-                ),
-                sort_explore_attr=(
-                    "1"
-                    if item.is_uncertain or item.is_similar or item.is_novel
-                    else "0"
-                ),
-                sort_recommended_attr=(
-                    "1" if item.story.id in recommended_ids else "0"
-                ),
-                # Every card kept below is in another view, so in Date.
-                sort_date_attr="1",
-                article_url=_web_url(story.url),
-                comments_url=_web_url(story.discussion_url),
-                domain=_domain_of(story.url or "", story.discussion_url or ""),
-                source_label=source_label_filter(story.source),
-            )
-        )
-    return [
-        c
-        for c in cards
-        if "1" in (c.sort_recommended_attr, c.sort_popular_attr, c.sort_explore_attr)
-    ]
-
-
-def _build_tab_groups() -> tuple[TabGroupView, ...]:
-    # Source filter (Mixed/HN/Non-HN) is temporarily disabled. The claim
-    # that non-HN sources are absent from the candidate pool is stale —
-    # the RSS/Reddit/LessWrong leg has been enabled since well before this
-    # comment was last touched (config.non_hn_candidates_enabled=true;
-    # see WORKLOG 2026-08-28/2026-08-30) — but re-enabling this UI still
-    # needs client-side work: an Archive+Non-HN selection currently has no
-    # matching combo (archive_nonhn is structurally always empty, see
-    # PRIMARY_RECENT_NONHN/PRIMARY_ARCHIVE_HN in pipeline/ranking.py) and
-    # would need the same kind of guard the client already has for
-    # Popular+Non-HN. Deferred (2026-08-30 user decision); re-add the
-    # TabGroupView below alongside that client-side guard.
-    return (
-        TabGroupView(
-            key="sort",
-            aria_label="Sort order",
-            css_class="tab-bar tab-bar--sort",
-            data_attr="sort",
-            segmented=False,
-            tabs=(
-                TabView("recommended", "Recommended", True),
-                TabView("popular", "Popular"),
-                TabView("explore", "Explore"),
-                TabView("date", "Date"),
-            ),
-        ),
-        TabGroupView(
-            key="age",
-            aria_label="Age filter",
-            css_class="tab-bar tab-bar--segmented",
-            data_attr="age",
-            segmented=True,
-            tabs=(
-                TabView("recent", "Recent", True),
-                TabView("archive", "<u>A</u>rchive"),
-            ),
-        ),
-    )
-
-
-def prepare_feed(
-    cards: list[DashboardCardView], counts: dict[str, int], version: int, target: int
-) -> Feed:
-    stories = [
-        FeedStory(
-            id=c.story.id,
-            title=c.story.title,
-            article_url=c.article_url,
-            comments_url=c.comments_url,
-            source=c.story.source,
-            points=c.story.score,
-            comments=c.story.comment_count,
-            time=c.story.time,
-            rank_score=c.score,
-            memberships=c.combo_keys.split(),
-            popular=c.sort_popular_attr == "1",
-            explore=c.sort_explore_attr == "1",
-            badges=[badge.icon for badge in c.badges],
-            badge_details=[
-                FeedBadge(badge.kind, badge.icon, badge.label, badge.tooltip)
-                for badge in c.badges
-            ],
-            best_match_title=c.best_match_title,
-            source_label=c.source_label,
-            domain=c.domain,
-            enriched=c.is_enriched,
-        )
-        for c in cards
-    ]
-    recommended_ids = {c.story.id for c in cards if c.sort_recommended_attr == "1"}
-    date_ids = {c.story.id for c in cards if c.sort_date_attr == "1"}
-    orders: dict[str, list[int]] = {}
-    for age in ("recent", "archive"):
-        for sort in ("recommended", "popular", "explore", "date"):
-            selected = [
-                s
-                for s in stories
-                # Date is one list (the deck, newest first) that ignores the
-                # Age axis, so both ages carry it.
-                if (
-                    s.id in date_ids
-                    if sort == "date"
-                    else f"{age}_mixed" in s.memberships
-                    and (sort != "popular" or s.popular)
-                    and (sort != "explore" or s.explore)
-                    and (sort != "recommended" or s.id in recommended_ids)
-                )
-            ]
-            selected.sort(
-                key=lambda s: s.time if sort == "date" else s.rank_score, reverse=True
-            )
-            if sort == "explore":
-                random.shuffle(selected)
-            orders[f"{sort}:{age}"] = [s.id for s in selected]
-    return Feed(1, stories, orders, counts, version, target, version >= target)
 
 
 def build_feed(
-    ranked: list[RankedStory],
+    deck: WindowDeck,
+    window: Window,
     config: Config,
     counts: dict[str, int],
     version: int,
     target: int,
+    *,
+    now: float | None = None,
+    live_counts: Callable[[Sequence[int]], Mapping[int, StoryCounts]] | None = None,
 ) -> Feed:
-    """The `/api/feed` snapshot of a deck, without rendering the page."""
-    cards = _build_dashboard_cards(
-        ranked, hot_badge_percentile=int(round(config.model.hot_badge_percentile))
+    """The `/api/feed` snapshot of one window of a deck as served at *now*
+    (``serve_window``): its stories and each view's order, which is
+    authoritative (Recommended and Explore by model score, Popular by HN
+    gravity; clients shuffle Explore themselves).
+
+    Points and comments come from *live_counts* when given: the deck's
+    stories are snapshots from the last pool build (hourly regen), and
+    counts refreshed since then (hot-thread refresh, TLDR hydration) live
+    only in the database. Order and badges stay as ranked."""
+    views = serve_window(
+        deck.window(window), window, time.time() if now is None else now
     )
-    return prepare_feed(cards, counts, version, target)
+    hot_badge_percentile = config.model.hot_badge_percentile
+    items = views.stories()
+    stored = live_counts([item.story.id for item in items]) if live_counts else {}
+    return Feed(
+        FEED_API_VERSION,
+        window,
+        [
+            _feed_story(
+                item,
+                hot_badge_percentile=hot_badge_percentile,
+                counts=stored.get(item.story.id),
+            )
+            for item in items
+        ],
+        {name: [r.story.id for r in views.view(name)] for name in VIEWS},
+        counts,
+        version,
+        target,
+        version >= target,
+    )
 
 
 @functools.cache
@@ -422,7 +303,7 @@ def _template_env() -> Environment:
 
 
 def generate_dashboard_bytes(
-    ranked: list[RankedStory],
+    deck: WindowDeck,
     config: Config,
     db: Database,
     user_id: int | None = None,
@@ -444,19 +325,24 @@ def generate_dashboard_bytes(
         neutral=raw_vote_counts["neutral"],
         down=raw_vote_counts["down"],
     )
-    hot_badge_percentile = int(round(config.model.hot_badge_percentile))
-
-    cards = _build_dashboard_cards(ranked, hot_badge_percentile=hot_badge_percentile)
-    # The page carries the deck as the same JSON /api/feed serves; the client
-    # builds every card from it.
-    feed = prepare_feed(
-        cards, raw_vote_counts, dashboard_version or 0, dashboard_latest_version or 0
+    # The page carries the default window as the same JSON /api/feed serves;
+    # the client builds every card from it.
+    feed = build_feed(
+        deck,
+        DEFAULT_WINDOW,
+        config,
+        raw_vote_counts,
+        dashboard_version or 0,
+        dashboard_latest_version or 0,
+        live_counts=db.get_story_counts,
     )
     template = env.get_template("index.html")
     html_content = template.render(
         timestamp=datetime.now().strftime("%Y-%m-%d %H:%M"),
         feed=feed.to_dict(),
-        tab_groups=_build_tab_groups(),
+        sort_tabs=SORT_TABS,
+        windows=tuple(WINDOW_LABELS.items()),
+        default_window=DEFAULT_WINDOW,
         badge_legend=BADGE_LEGEND,
         server_port=config.server_port,
         pico_css=pico_css,

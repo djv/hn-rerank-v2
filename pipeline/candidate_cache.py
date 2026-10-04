@@ -92,6 +92,12 @@ def invalidate_candidate_pool() -> None:
         _pool_db = None
 
 
+def cached_candidate_stories() -> tuple[Story, ...]:
+    """The current pool's stories without building one (empty if none)."""
+    with _lock:
+        return _pool.stories if _pool is not None else ()
+
+
 def get_candidate_pool(
     db: Database,
     config: Config,

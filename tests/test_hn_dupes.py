@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from difflib import SequenceMatcher
 
 from hypothesis import HealthCheck, given, settings, strategies as st
+import pytest
 
 from database import Database, Story
 from pipeline.hn_dupes import (
@@ -425,3 +426,69 @@ def test_ratio_verdict_cache_reuses_pairs() -> None:
         assert info.hits == 1
     finally:
         _cached_ratio_ge.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("comments", "expected"),
+    [
+        ("Comments moved to https://news.ycombinator.com/item?id=32145324.", 32145324),
+        (
+            "[dupe] Some more over here: https://news.ycombinator.com/item?id=38354753",
+            38354753,
+        ),
+        ("Nothing linked here, just a short comment.", None),
+        (
+            "Discussion (170 points, 2 days ago, 43 comments) "
+            "https://news.ycombinator.com/item?id=48612098",
+            48612098,
+        ),
+        (
+            "Although this post was first, we've moved the comments to "
+            "https://news.ycombinator.com/item?id=39827266.",
+            39827266,
+        ),
+        ("Related: Another story https://news.ycombinator.com/item?id=49434378", None),
+        (
+            "Discussion: https://news.ycombinator.com/item?id=11\n\n---\n\n"
+            "A real second comment.",
+            None,
+        ),
+        (
+            "Long thread citing https://news.ycombinator.com/item?id=5 " + "x" * 500,
+            None,
+        ),
+        ("Self link https://news.ycombinator.com/item?id=7", None),
+        ("Duplicate of https://news.ycombinator.com/item?id=41", 41),
+        ("Duplicate: https://news.ycombinator.com/item?id=41", 41),
+        ("Discussed at length before: https://news.ycombinator.com/item?id=42", 42),
+        ("Previous discussion (2019): https://news.ycombinator.com/item?id=43", 43),
+        (
+            "Discussed 2 days ago with 280 comments: "
+            "https://news.ycombinator.com/item?id=48",
+            48,
+        ),
+        ("Discussion of this article: https://news.ycombinator.com/item?id=49", 49),
+        # Real single comments about something else, not pointers.
+        (
+            "Duplicate code is fine until it isn't, see "
+            "https://news.ycombinator.com/item?id=44",
+            None,
+        ),
+        (
+            "Discussion of the underlying paper: "
+            "https://news.ycombinator.com/item?id=45",
+            None,
+        ),
+        # The destination's note links back to the emptied source.
+        ("Comments moved hither from https://news.ycombinator.com/item?id=46.", None),
+        (
+            "We merged the comments from https://news.ycombinator.com/item?id=47 "
+            "into this thread.",
+            None,
+        ),
+    ],
+)
+def test_pointer_thread_target(comments: str, expected: int | None) -> None:
+    from pipeline.hn_dupes import pointer_thread_target
+
+    assert pointer_thread_target(comments, source_id=7) == expected

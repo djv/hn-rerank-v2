@@ -166,28 +166,33 @@ def test_slow_task_blocks_subsequent_tasks() -> None:
 
 
 def test_enqueue_spread_distributes_evenly() -> None:
-    """20 tasks across 0.2s should be spread 10ms apart."""
+    """20 tasks occupy 10ms slots, independent of host scheduling latency."""
     q = RedditFetchQueue()
+    q.shutdown()
+    assert not q._thread.is_alive()
     q.reset()
-    q.POLL_INTERVAL = 0.001
     q.SPREAD_WINDOW_TOPFEEDS = 0.2
-    starts: list[float] = []
-    base = time.monotonic()
+    starts: list[int] = []
+    base = 1000.0
 
-    def timed() -> CoroFactory:
+    def timed(index: int) -> CoroFactory:
         async def factory() -> None:
-            starts.append(time.monotonic() - base)
+            starts.append(index)
 
         return factory
 
-    q.enqueue_spread(20, base, "topfeed", [timed() for _ in range(20)])
-    assert q.wait_until_empty(timeout=2.0) is True
-    # Stride is 0.2 / 20 = 0.01s
-    # First task runs immediately, last at ~0.19s
-    assert len(starts) == 20
-    assert starts[-1] - starts[0] >= 0.15  # wide spread
-    # Median should be ~0.1s
-    assert 0.05 <= starts[9] <= 0.15
+    q.enqueue_spread(20, base, "topfeed", [timed(i) for i in range(20)])
+    for i in range(20):
+        target = base + i * 0.01
+        assert q._pop_ready(target - 1e-6) is None
+        task = q._pop_ready(target + 1e-8)
+        assert task is not None
+        assert task.target_at == pytest.approx(target)
+        asyncio.run(task.factory())
+        q._last_dispatch_at = target
+    assert starts == list(range(20))
+    assert q._pop_ready(base + 0.2) is None
+    assert q.wait_until_empty(timeout=0) is True
 
 
 def test_reset_clears_pending_and_signals_idle() -> None:

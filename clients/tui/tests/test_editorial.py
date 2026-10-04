@@ -16,10 +16,13 @@ from hn_rerank.app import (
     LIGHT_PALETTE,
     Reader,
     Setup,
+    _cell_len,
     headline,
+    headline_comments,
     headline_domain,
     headline_points,
     story_age,
+    story_heading,
     story_metadata,
     theme_for_hour,
 )
@@ -83,10 +86,11 @@ async def test_editorial_filters_and_resize(width: int) -> None:
         assert app.query_one("#sort-tabs", Tabs).display == (width >= 100)
         assert app.query_one("#sort", Select).display == (width < 100)
         sort_control = app.query_one("#sort-tabs" if width >= 100 else "#sort")
-        age_control = app.query_one("#age-tabs" if width >= 100 else "#age")
-        assert sort_control.region.y == age_control.region.y
-        assert sort_control.region.right <= age_control.region.x
-        assert age_control.region.right <= width
+        window_control = app.query_one("#window", Select)
+        assert window_control.display
+        assert sort_control.region.y == window_control.region.y
+        assert sort_control.region.right <= window_control.region.x
+        assert window_control.region.right <= width
         assert "example.org" in str(app.query_one("#story-heading", Static).content)
         assert listing.highlighted == 0
         assert listing.display and summary.display
@@ -148,11 +152,11 @@ async def test_filter_change_starts_at_first_story(width: int) -> None:
         selected = app.selected()
         assert selected is not None and selected.id == 2
         if width < 100:
-            app.query_one("#sort", Select).value = "date"
+            app.query_one("#sort", Select).value = "explore"
         else:
-            await pilot.click("#sort-date")
+            await pilot.click("#sort-explore")
         await pilot.pause()
-        assert [story.id for story in app.stories] == [2, 1]
+        assert [story.id for story in app.stories] == [2]
         assert listing.highlighted == 0
         selected = app.selected()
         assert selected is not None and selected.id == 2
@@ -205,10 +209,35 @@ async def test_narrow_footer_keeps_status_visible() -> None:
         await settle(pilot)
         status = app.query_one("#status").region
         hints = app.query_one("#shortcuts").region
-        # Stacked rows: status keeps the full width instead of being squeezed out.
-        assert status.width == hints.width > 40
-        assert status.y < hints.y
-        assert hints.height == 2
+        # One row: the keys shrink so the counts line stays whole beside them.
+        assert app.query_one("#footer").region.height == 1
+        assert status.y == hints.y and status.right <= hints.x
+        assert str(app.query_one("#status", Static).content).endswith("−0")
+        assert str(app.query_one("#shortcuts", Static).content).endswith("? help")
+
+
+async def test_wide_footer_is_one_row() -> None:
+    fake = FakeServer()
+    app = Reader(api=fake.api())
+    async with app.run_test(size=(146, 39)) as pilot:
+        await settle(pilot)
+        status = app.query_one("#status").region
+        hints = app.query_one("#shortcuts").region
+        assert status.y == hints.y
+        assert status.height == hints.height == 1
+        assert status.right <= hints.x
+        assert "b badges" in str(app.query_one("#shortcuts", Static).content)
+        # A long message keeps the row: the keys shrink to "? help".
+        app.status("x" * 80)
+        await pilot.pause()
+        assert app.query_one("#footer").region.height == 1
+        assert "b badges" not in str(app.query_one("#shortcuts", Static).content)
+        assert str(app.query_one("#status", Static).content) == "x" * 80
+        # The counts line brings the full keys back.
+        app.status_mode = "context"
+        app.context_status()
+        await pilot.pause()
+        assert "b badges" in str(app.query_one("#shortcuts", Static).content)
 
 
 @pytest.mark.parametrize("size", [(51, 37), (80, 30), (140, 40)])
@@ -237,9 +266,17 @@ async def test_enter_zooms_tldr(size: tuple[int, int], long_summary: bool) -> No
             assert "Enter/Esc back" in str(hints.content)
             if long_summary:
                 assert summary.max_scroll_y > 0
-                await pilot.press("j")
-                await pilot.pause()
-                assert summary.scroll_y > 0
+            # j/k change stories in zoom as in the list.
+            await pilot.press("j")
+            await settle(pilot)
+            assert app.reading and summary.has_focus
+            moved = app.selected()
+            assert moved is not None and selected is not None
+            assert moved.id != selected.id
+            assert summary.scroll_y == 0
+            await pilot.press("k")
+            await settle(pilot)
+            assert app.selected() == selected
             await pilot.press(exit_key)
             await pilot.pause()
             assert not app.reading
@@ -257,10 +294,13 @@ async def test_empty_and_error_recovery() -> None:
         app.action_vote("up")
         await settle(pilot)
         assert app.query_one("#status").has_class("error")
-        assert "check before voting" in str(app.query_one("#status", Static).content)
-        app.query_one("#age", Select).value = "archive"
+        # Too long for 100 columns: cut in the middle, both ends readable.
+        shown = str(app.query_one("#status", Static).content)
+        assert shown.startswith("✗ Vote not confirmed") and "…" in shown
+        assert shown.endswith("Press r to refresh; votes are not retried.")
+        app.query_one("#window", Select).value = "12h"
         app.query_one("#sort", Select).value = "popular"
-        await pilot.pause()
+        await settle(pilot)
         assert not app.stories
         assert "No stories" in app.query_one(Markdown)._markdown
         assert not str(app.query_one("#story-heading", Static).content)
@@ -278,9 +318,6 @@ def test_story_age_guard_and_buckets() -> None:
         None,
         0,
         1.0,
-        ["recent_mixed"],
-        False,
-        False,
     )
     # Placeholder timestamps must not render as "20000d ago".
     assert story_metadata(story) == "example.org · 10 pts · 0 comments"
@@ -302,17 +339,14 @@ def test_headline_shows_badge_emoji() -> None:
         None,
         0,
         1.0,
-        ["recent_mixed"],
-        False,
-        False,
-        badges=["\U0001f525", "\U0001f3c6"],
+        badges=["\U0001f525", "\U0001f3c6", "\U0001f4ac"],
     )
-    assert headline(story).plain.startswith("🔥 🏆 Story")
-    assert headline(story, selected=True).plain.startswith("> 🔥 🏆 Story")
+    assert headline(story).plain.startswith("🔥 🏆 💬 Story")
+    assert headline(story, selected=True).plain.startswith("> 🔥 🏆 💬 Story")
     assert headline(replace(story, badges=[])).plain.startswith("Story")
 
 
-def test_headline_hides_unknown_reddit_score_and_shows_subreddit() -> None:
+def test_headline_hides_unknown_feed_counts_and_shows_subreddit() -> None:
     story = FeedStory(
         1,
         "Story",
@@ -323,17 +357,52 @@ def test_headline_hides_unknown_reddit_score_and_shows_subreddit() -> None:
         None,
         0,
         1.0,
-        ["recent_mixed"],
-        False,
-        False,
     )
     rendered = headline(story).plain
-    assert "r/localllama" in rendered
-    assert "pts" not in rendered
-    assert "· ▲ 5 ·" in headline(replace(story, points=5)).plain
+    assert rendered.splitlines()[1] == "r/localllama"
+    assert headline(replace(story, points=5, comments=3)).plain.endswith(
+        "r/localllama · ▲ 5 · 💬 3"
+    )
+    # HN counts are real even at zero.
     hn = replace(story, source="hn", article_url="https://example.org/a")
-    assert "example.org" in headline(hn).plain
-    assert "· ▲ 0 ·" in headline(hn).plain
+    assert headline(hn).plain.endswith("example.org · ▲ 0 · 💬 0")
+
+
+def test_headline_names_the_feed_not_the_linked_domain() -> None:
+    ainews = FeedStory(
+        1,
+        "Story",
+        "https://x.com/someone/status/1",
+        "https://news.smol.ai/issues/1",
+        "rss_ainews",
+        0,
+        12,
+        0,
+        1.0,
+        source_label="AINews",
+    )
+    assert headline(ainews).plain.splitlines()[1] == "AINews · 💬 12"
+    hn = replace(ainews, source="hn", source_label="HN", points=3)
+    assert headline_domain(hn) == "x.com"
+
+
+def test_heading_says_why_a_story_is_recommended() -> None:
+    story = FeedStory(
+        1,
+        "Story",
+        "https://example.org/a",
+        "https://news.ycombinator.com/item?id=1",
+        "hn",
+        5,
+        7,
+        0,
+        1.0,
+    )
+    assert story_heading(story).plain == headline(story).plain
+    because = replace(story, best_match_title="Earlier story")
+    assert story_heading(because).plain.splitlines()[-1] == (
+        "Because you upvoted: Earlier story"
+    )
 
 
 def test_headline_separators_share_columns_across_stories() -> None:
@@ -347,10 +416,9 @@ def test_headline_separators_share_columns_across_stories() -> None:
         7,
         0,
         1.0,
-        ["recent_mixed"],
-        False,
-        False,
     )
+    now = int(time.time())
+    base = replace(base, time=now - 3 * 3600)
     reddit = replace(
         base,
         id=2,
@@ -358,17 +426,28 @@ def test_headline_separators_share_columns_across_stories() -> None:
         source="rss_reddit_localllama",
         points=0,
         comments=1234,
+        time=now - 12 * 86400,
     )
+    blog = replace(base, id=3, source="rss_blog", points=0, comments=0)
+    stories = (base, reddit, blog)
     widths = (
-        max(len(headline_domain(base)), len(headline_domain(reddit))),
-        max(len(headline_points(base)), len(headline_points(reddit))),
-        max(len("💬 7"), len("💬 1234")),
+        max(_cell_len(headline_domain(s)) for s in stories),
+        max(_cell_len(headline_points(s)) for s in stories),
+        max(_cell_len(headline_comments(s)) for s in stories),
     )
-    first = headline(base, True, widths).plain.splitlines()[1]
-    second = headline(reddit, False, widths).plain.splitlines()[1]
-    dots = [i for i, char in enumerate(first) if char == "·"]
-    assert dots == [i for i, char in enumerate(second) if char == "·"]
-    assert "pts" not in second
+    first, second, third = (
+        headline(s, s is base, widths).plain.splitlines()[1] for s in stories
+    )
+    # Unknown counts leave blank columns: every row's age starts where the
+    # first row's does, and blank segments drop their separator too.
+    assert first.endswith("3h") and second.endswith("12d") and third.endswith("3h")
+    rows = (first, second, third)
+    assert len({_cell_len(row[: row.rindex("·")]) for row in rows}) == 1
+    assert _cell_len(first[: first.index("💬")]) == _cell_len(
+        second[: second.index("💬")]
+    )
+    assert "▲" not in second and "▲" not in third and "💬" not in third
+    assert third.count("·") == 1
     assert "r/localllama" in second
 
 
@@ -386,9 +465,6 @@ async def test_every_sort_shows_at_most_view_limit(tmp_path: Path) -> None:
             0,
             0,
             float(100 - i),
-            ["recent_mixed"],
-            True,
-            True,
         )
 
     ids = list(range(1, 21))
@@ -396,7 +472,7 @@ async def test_every_sort_shows_at_most_view_limit(tmp_path: Path) -> None:
     fake.feed = replace(
         fake.feed,
         stories=[story(i) for i in ids],
-        orders={f"{sort}:recent": ids for sort in Reader.SORT_CYCLE},
+        orders={sort: ids for sort in Reader.SORT_CYCLE},
     )
     app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
     async with app.run_test(size=(120, 35)) as pilot:
@@ -424,12 +500,9 @@ def test_headline_truncates_long_domains_to_fit() -> None:
         7,
         0,
         1.0,
-        ["recent_mixed"],
-        False,
-        False,
     )
     assert (
-        headline(long_domain, True, (10, 1, 1)).plain.splitlines()[1]
+        headline(long_domain, True, (10, 3, 3)).plain.splitlines()[1]
         == "marginalr… · ▲ 5 · 💬 7"
     )
     assert "marginalrevolution.com" in headline(long_domain).plain
@@ -460,9 +533,9 @@ async def test_empty_notice_heading() -> None:
     app = Reader(api=fake.api())
     async with app.run_test(size=(100, 35)) as pilot:
         await settle(pilot)
-        app.query_one("#age", Select).value = "archive"
+        app.query_one("#window", Select).value = "12h"
         app.query_one("#sort", Select).value = "popular"
-        await pilot.pause()
+        await settle(pilot)
         assert not app.stories
         assert app.query_one(Markdown)._markdown == EMPTY_NOTICE
         assert not app.query_one("#reading-pane").has_class("has-story")
@@ -526,7 +599,7 @@ async def test_badge_legend_hotkey_and_escape_restore_story() -> None:
             "💬 **Talk**",
             "🤔 **Unsure**",
             "✨ **Novel**",
-            "🎯 **Similar**",
+            "🎯 **Interest**",
         ):
             assert badge in legend
         app.rebuild()
@@ -604,8 +677,8 @@ async def test_footer_counts_follow_filters() -> None:
         # Metadata adds restrained color: blue domain, sage points, dim separators.
         assert {"bold #EEE8DD", "#D2CCC1", "#8AB4F8", "#A8C7A0"} <= styles
         app.query_one("#sort", Select).value = "popular"
-        app.query_one("#age", Select).value = "archive"
-        await pilot.pause()
+        app.query_one("#window", Select).value = "12h"
+        await settle(pilot)
         assert str(app.query_one("#status", Static).content) == "0 shown · +0 ~0 −0"
         app.status("Could not reach server.", error=True)
         assert str(app.query_one("#status", Static).content).startswith("✗ ")
@@ -623,9 +696,27 @@ async def test_narrow_footer_fits_error_and_zoom_shortcuts() -> None:
         status = app.query_one("#status").region
         hints = app.query_one("#shortcuts").region
         footer = app.query_one("#footer").content_region
-        assert status.height == 3
-        assert status.bottom <= hints.y
-        assert hints.bottom <= footer.bottom
+        # A long message is cut to one row with an ellipsis, never wrapped.
+        assert status.height == footer.height == 1
+        assert status.y == hints.y and status.right <= hints.x
+        # The cut is in the middle: what to do next stays readable.
+        app.status("Vote not confirmed by the server. " * 3 + "Press r to retry.")
+        await pilot.pause()
+        shown = str(app.query_one("#status", Static).content)
+        assert shown.startswith("Vote not confirm") and "…" in shown
+        assert shown.endswith("Press r to retry.")
+        assert len(shown) <= 51 - 2 - len("? help") - 2
+
+
+def test_fit_middle_keeps_both_ends_within_width() -> None:
+    from hn_rerank.app import _cell_len, fit_middle
+
+    assert fit_middle("short", 20) == "short"
+    cut = fit_middle("Could not save the vote on story 12345. Press r to retry.", 30)
+    assert _cell_len(cut) <= 30
+    assert cut.startswith("Could not") and cut.endswith("r to retry.")
+    wide = fit_middle("🔥" * 30, 21)
+    assert _cell_len(wide) <= 21 and "…" in wide
 
 
 def test_theme_follows_local_hour() -> None:
@@ -651,6 +742,10 @@ async def test_clock_switch_restyles_css_and_rich_text(
         await pilot.pause()
         assert app.theme == "editorial-light"
         assert app.screen.styles.background.hex.upper() == LIGHT_PALETTE["bg"]
+        # Top and bottom bars share a tint that sets them off from the page.
+        for bar in ("#filters", "#footer"):
+            tint = app.query_one(bar).styles.background.hex.upper()
+            assert tint == LIGHT_PALETTE["chrome"] != LIGHT_PALETTE["bg"]
         listing = app.query_one(OptionList)
         styles = {
             str(span.style)
@@ -664,3 +759,78 @@ async def test_clock_switch_restyles_css_and_rich_text(
         app.theme = "editorial"
         app.apply_clock_theme()
         assert app.theme == "editorial"
+
+
+@pytest.mark.parametrize("zoom", [False, True])
+async def test_space_pages_tldr_from_either_view(zoom: bool) -> None:
+    """Space pages the TLDR down whether the list or the TLDR has focus, and
+    leaves the selected headline alone."""
+    app = Reader(api=EditorialServer().api())
+    async with app.run_test(size=(120, 20)) as pilot:
+        await settle(pilot)
+        listing = app.query_one(OptionList)
+        summary = app.query_one(Markdown)
+        if zoom:
+            await pilot.press("enter")
+            await pilot.pause()
+        assert summary.has_focus == zoom and listing.has_focus != zoom
+        assert summary.max_scroll_y > summary.scrollable_content_region.height
+        selected = app.selected()
+        await pilot.press("space")
+        await pilot.pause()
+        first = summary.scroll_y
+        assert first == summary.scrollable_content_region.height
+        await pilot.press("space")
+        await pilot.pause()
+        assert summary.scroll_y == min(2 * first, summary.max_scroll_y)
+        assert app.selected() == selected
+
+
+async def test_a_slow_summary_counts_the_wait(tmp_path: Path) -> None:
+    fake = FakeServer()
+    fake.delay_summary = 2.5  # story 1, the first selected
+    app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        summary = app.query_one("#summary", Markdown)
+        for _ in range(100):
+            if (
+                summary._markdown.startswith("Loading summary… ")
+                and summary._markdown[-1] == "s"
+            ):
+                break
+            await pilot.pause(0.05)
+        assert summary._markdown[len("Loading summary… ") : -1].isdigit()
+        await settle(pilot)
+        assert summary._markdown == "# Summary 1"
+
+
+async def test_short_pane_keeps_footer_and_heading_compact() -> None:
+    """A short pane (a small tmux split) reads the summary, not chrome: one
+    footer row with "? help", and no "Because you upvoted" line. Both come
+    back when the pane grows."""
+    fake = FakeServer()
+    fake.feed.stories[0] = replace(fake.feed.stories[0], best_match_title="Earlier")
+    app = Reader(api=fake.api())
+    async with app.run_test(size=(64, 23)) as pilot:
+        await settle(pilot)
+        await pilot.press("enter")
+        await pilot.pause()
+        status = app.query_one("#status").region
+        hints = app.query_one("#shortcuts", Static)
+        assert str(hints.content) == "? help"
+        assert status.height == hints.region.height == 1
+        assert status.y == hints.region.y and status.right <= hints.region.x
+        heading = app.query_one("#story-heading", Static)
+        assert "Because you upvoted" not in str(heading.content)
+        # A long message is cut beside the hint, never stacked.
+        app.status("Connection failed. " * 10, error=True)
+        await pilot.pause()
+        assert app.query_one("#status").region.y == hints.region.y
+        await pilot.resize_terminal(64, 40)
+        await pilot.pause()
+        assert "Because you upvoted: Earlier" in str(heading.content)
+        # The error keeps the row; the counts line brings the keys back.
+        assert str(hints.content) == "? help"
+        app.status_mode = "context"
+        app.context_status()
+        assert "Enter/Esc back" in str(hints.content)

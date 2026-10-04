@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 import numpy as np
 from numpy.typing import NDArray
 
 from database import Story
+from pipeline.ranking import clean_text, compose_story_text, story_embedding_text
 
 
 SECTION_LAYOUT_VERSION = "full-body-char-chunks-v1"
@@ -40,3 +43,41 @@ def pool_sections(vectors: NDArray[np.float32]) -> NDArray[np.float32]:
     if norm <= 1e-8:
         raise ValueError("Section mean has zero norm")
     return np.asarray(pooled / norm, dtype=np.float32)
+
+
+# Offline per-section embedding experiment (2026-09-28): one vector per part
+# of the story, each with its own token budget, compared alone and
+# concatenated. "body" is title + self text + article, i.e. production's
+# text without comments.
+StorySection = Literal["full", "title", "self", "article", "comments", "body"]
+STORY_SECTIONS: tuple[StorySection, ...] = (
+    "full",
+    "title",
+    "self",
+    "article",
+    "comments",
+    "body",
+)
+
+
+def story_section_text(story: Story, section: StorySection) -> str:
+    """The text embedded for one section, led by the title for context.
+
+    "full" is production's embedding text.
+    A story without that section embeds its title alone, so every story gets
+    a unit vector and a missing section reads as "nothing beyond the title".
+    """
+    title = clean_text(story.title)
+    if section == "full":
+        return story_embedding_text(story)
+    if section == "title":
+        return title
+    if section == "body":
+        return compose_story_text(story.title, story.self_text, "", story.article_body)
+    raw = {
+        "self": story.self_text,
+        "article": story.article_body,
+        "comments": story.top_comments,
+    }[section]
+    body = clean_text(raw)
+    return f"{title}. {body}" if body else title

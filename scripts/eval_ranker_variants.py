@@ -15,18 +15,24 @@ from contextlib import ExitStack, contextmanager
 from unittest.mock import patch
 import time
 from collections import Counter
+from collections.abc import Iterator
 from typing import Any
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
+from urllib.parse import urlparse
 
 import numpy as np
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.feature_extraction.text import TfidfTransformer, TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import LinearSVC, SVC
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
+from clients.tui.src.hn_rerank.models import DEFAULT_WINDOW
 from database import Database, Story
 from dedup import normalize_url
 from pipeline import (
@@ -34,10 +40,17 @@ from pipeline import (
     Embedder,
     ModelConfig,
     RankedStory,
+    WindowDeck,
     _knn_similarity,
     load_production_candidate_stories,
     mmr_filter,
     story_embedding_text,
+)
+from pipeline.config import is_hn_source
+from pipeline.linear_blend import (
+    count_rows,
+    percentile_scores,
+    tfidf_text as tfidf_text_full,
 )
 
 
@@ -56,6 +69,10 @@ class FoldData:
     train_emb: np.ndarray | None = None
     runtime_db: Database | None = None
     similarities: dict[int, np.ndarray] = field(default_factory=dict)
+    test_vote_times: np.ndarray | None = None
+    # Named story-ID subsets also scored on their own as ``raw_<name>``
+    # (e.g. the feed each story was first shown in).
+    slices: dict[str, set[int]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -154,7 +171,9 @@ class _FrozenEmbedder(Embedder):
 
 
 @contextmanager
-def _fold_database(fold: FoldData, config: Config, source_db: Database | None):
+def _fold_database(
+    fold: FoldData, config: Config, source_db: Database | None
+) -> Iterator[Database]:
     if fold.runtime_db is not None:
         yield fold.runtime_db
         return
@@ -187,9 +206,16 @@ def _fold_database(fold: FoldData, config: Config, source_db: Database | None):
                 ],
             )
             conn.commit()
-        # Canonical resolution and target metadata come from the same read-only snapshot.
+        # Canonical metadata and side vectors come from the read-only source snapshot.
         with ExitStack() as stack:
             if source_db is not None:
+                stack.enter_context(
+                    patch.object(
+                        db,
+                        "get_side_embeddings_batch",
+                        source_db.get_side_embeddings_batch,
+                    )
+                )
                 stack.enter_context(
                     patch.object(
                         db, "get_hn_dupe_resolutions", source_db.get_hn_dupe_resolutions
@@ -253,6 +279,21 @@ def _production_scores(
         )
     if trace.labels.get("svm_probs") == "error":
         raise RuntimeError("Production probability mapping failed; aborting fold")
+    if "error" in (
+        trace.labels.get("linear_blend_fit"),
+        trace.labels.get("linear_blend_score"),
+    ):
+        raise RuntimeError("Production linear blend failed; aborting fold")
+    # Cold/sparse profiles do not enter the side-model branch. An explicit
+    # 'off' means coverage forced a different model than the requested one.
+    if (
+        config.model.side_embedding_enabled
+        and trace.labels.get("side_embeddings") == "off"
+    ):
+        raise RuntimeError(
+            "Production side embedding coverage is insufficient; aborting fold "
+            "instead of scoring stored-only fallback"
+        )
     if (
         score_context.cand_closest_up is not None
         and score_context.cand_closest_down is not None
@@ -280,20 +321,44 @@ def _production_scores(
     return np.array([by_id[s.id].score for s in fold.candidates]), probabilities
 
 
+def _without_blend(config: Config) -> Config:
+    """The SVM ranker alone. config.toml turns the live linear blend on, so a
+    variant that blends production itself (prodlr, produd, stack, the SVM
+    sweeps) would otherwise blend it twice."""
+    return replace(config, model=replace(config.model, linear_blend_enabled=False))
+
+
+def _live_dense_scores(
+    fold: FoldData, tuned: Config, source_db: Database | None
+) -> np.ndarray:
+    """The live blend's dense logreg, as percentiles: production with the
+    blend on and all its weight on that model. It trains on the SVM's scaled
+    rows (every meta column, zero rows for absent classes) with C =
+    linear_blend_dense_c, which the eval's own logreg does not match."""
+    dense_only = replace(
+        tuned,
+        model=replace(
+            tuned.model,
+            linear_blend_enabled=True,
+            linear_blend_dense_weight=1.0,
+            linear_blend_tfidf_weight=0.0,
+            linear_blend_ramp=False,
+        ),
+    )
+    return _production_scores(fold, dense_only, source_db)[0]
+
+
 def _recommended(
     scores: np.ndarray,
     fold: FoldData,
     config: Config,
     probs: np.ndarray | None,
     source_db: Database | None,
-) -> list[RankedStory]:
-    from pipeline import finalize_ranked_deck
+) -> WindowDeck:
+    """The production deck (every window's views) for this fold's scores."""
+    from pipeline import canonicalize_deck, finalize_ranked_deck
     from pipeline.ranking import assemble_ranked_deck
-    from pipeline.hn_dupes import (
-        _load_feedback_context,
-        _matches_feedback,
-        canonicalize_hn_dupes,
-    )
+    from pipeline.hn_dupes import _load_feedback_context, _matches_feedback
 
     ranked = [
         RankedStory(
@@ -315,21 +380,20 @@ def _recommended(
             from pipeline import build_cold_deck
 
             deck = build_cold_deck(db, config, candidates=fold.candidates)
-            return canonicalize_hn_dupes(
+            return canonicalize_deck(
                 deck,
                 db,
-                selected_limit=config.count,
                 user_id=1,
                 feedback_actions=tuple(config.model.dedup_exclude_actions),
             )
         from pipeline.ranking import RankScoreContext, _chunked_max_dot
 
+        train_emb = (
+            fold.train_emb
+            if fold.train_emb is not None
+            else fold.x_train_base[:, : fold.cand_emb.shape[1]]
+        )
         if not fold.similarities:
-            train_emb = (
-                fold.train_emb
-                if fold.train_emb is not None
-                else fold.x_train_base[:, : fold.cand_emb.shape[1]]
-            )
             for label in (0, 1, 2):
                 fold.similarities[label] = _chunked_max_dot(
                     fold.cand_emb, train_emb[fold.y_train == label]
@@ -339,6 +403,7 @@ def _recommended(
             cand_closest_up=fold.similarities[2],
             cand_closest_down=fold.similarities[0],
             cand_closest_neutral=fold.similarities[1],
+            fb_up_embeddings=train_emb[fold.y_train == 2],
         )
         deck = assemble_ranked_deck(
             ranked,
@@ -697,6 +762,19 @@ def _scores_gravity(
     ), None
 
 
+def _scores_window_gravity(fold: FoldData, scale: float) -> np.ndarray:
+    """Popular's order: ``hn_gravity`` on a *scale*-hour clock, aged at the
+    held-out block's median vote time (points are the snapshot's)."""
+    from pipeline.ranking import hn_gravity
+
+    times = fold.test_vote_times
+    now = float(np.median(times)) if times is not None and len(times) else time.time()
+    return np.array(
+        [hn_gravity(s.score, s.time, now, scale) for s in fold.candidates],
+        dtype=np.float32,
+    )
+
+
 def _scores_centroid_up_minus_down(fold: FoldData) -> tuple[np.ndarray, None]:
     return fold.tier2_scores.copy(), None
 
@@ -713,12 +791,8 @@ def _recency_decay(
 
 
 def _percentile_scores(scores: np.ndarray) -> np.ndarray:
-    order = np.argsort(scores, kind="mergesort")
-    ranks = np.empty(len(scores), dtype=np.float32)
-    if len(scores) <= 1:
-        return np.ones(len(scores), dtype=np.float32)
-    ranks[order] = np.linspace(0.0, 1.0, len(scores), dtype=np.float32)
-    return ranks
+    """Ranks scaled to [0, 1]; equal scores share their average rank."""
+    return percentile_scores(scores)
 
 
 def _fit_svc_up_margin(
@@ -983,7 +1057,7 @@ def _scores_logreg(
             float(fold.train_vote_times.max()), fold.train_vote_times, half_life_days
         )
     clf = LogisticRegression(
-        C=config.model.svm_c if c is None else c,
+        C=config.model.linear_blend_dense_c if c is None else c,
         solver="lbfgs",
         max_iter=2000,
         random_state=0,
@@ -1009,6 +1083,646 @@ def _scores_production_up_minus_down(
     return (probs[:, 2] - probs[:, 0]).astype(np.float32), probs
 
 
+STACK_MODES = ("gbm", "ordinal", "pair", "lr")
+STACK_FEATS = ("content", "meta", "both")
+# Pseudo-votes at the global rate behind every per-source/per-domain rate.
+_STACK_PRIOR_STRENGTH = 10.0
+_stack_content_cache: list[tuple[FoldData, tuple[float, float], Any]] = []
+
+
+def _story_domain(story: Story) -> str:
+    return (urlparse(story.url or "").hostname or "").removeprefix("www.")
+
+
+def _smoothed_label_rates(
+    keys_train: list[str], y_train: np.ndarray, keys_eval: list[str]
+) -> np.ndarray:
+    """Per-key (up, down) vote rates shrunk toward the global rates."""
+    y = np.asarray(y_train)
+    base = np.array([(y == 2).mean(), (y == 0).mean()]) if len(y) else np.zeros(2)
+    sums: dict[str, np.ndarray] = {}
+    counts: Counter[str] = Counter()
+    for key, label in zip(keys_train, y):
+        sums.setdefault(key, np.zeros(2))
+        sums[key] += (label == 2, label == 0)
+        counts[key] += 1
+    out = np.empty((len(keys_eval), 2))
+    for i, key in enumerate(keys_eval):
+        total = sums.get(key, np.zeros(2))
+        out[i] = (total + _STACK_PRIOR_STRENGTH * base) / (
+            counts[key] + _STACK_PRIOR_STRENGTH
+        )
+    return out
+
+
+def _out_of_fold_label_rates(
+    keys: list[str], y: np.ndarray, folds: int = 5
+) -> np.ndarray:
+    """Vote rates for the training rows themselves, each from the other
+    folds. Leave-one-out leaks: within a key the rate drops exactly when the
+    row's own vote is up, and trees learn that inverted signal."""
+    out = np.empty((len(keys), 2))
+    n_splits = min(folds, min(Counter(np.asarray(y).tolist()).values()))
+    for fit, ev in StratifiedKFold(n_splits, shuffle=True, random_state=0).split(
+        np.zeros(len(y)), y
+    ):
+        out[ev] = _smoothed_label_rates(
+            [keys[i] for i in fit], y[fit], [keys[i] for i in ev]
+        )
+    return out
+
+
+def _stack_meta_features(
+    stories: list[Story],
+    ages_seconds: np.ndarray,
+    train_stories: list[Story],
+    y_train: np.ndarray,
+    *,
+    is_train: bool,
+) -> np.ndarray:
+    """Content-free story features: source and domain vote priors (training
+    votes only), HN points, comments at fetch, text length, age when voted,
+    Show/Ask HN and HN-vs-other source. Points are the stored (latest) score,
+    not the score at vote time."""
+
+    def keys(items: list[Story]) -> tuple[list[str], list[str]]:
+        return [s.source for s in items], [_story_domain(s) or s.source for s in items]
+
+    train_sources, train_domains = keys(train_stories)
+    sources, domains = keys(stories)
+    if is_train:
+        source_rates = _out_of_fold_label_rates(sources, y_train)
+        domain_rates = _out_of_fold_label_rates(domains, y_train)
+    else:
+        source_rates = _smoothed_label_rates(train_sources, y_train, sources)
+        domain_rates = _smoothed_label_rates(train_domains, y_train, domains)
+    titles = [s.title.lower() for s in stories]
+    return np.column_stack(
+        [
+            source_rates,
+            domain_rates,
+            np.log1p([max(s.score, 0) for s in stories]),
+            np.log1p([max(s.comment_count_at_fetch, 0) for s in stories]),
+            np.log1p([len(s.text_content) for s in stories]),
+            np.log1p(np.maximum(ages_seconds, 0.0) / 3600.0),
+            [t.startswith("show hn") for t in titles],
+            [t.startswith("ask hn") for t in titles],
+            [is_hn_source(s.source) for s in stories],
+        ]
+    ).astype(np.float32)
+
+
+def _stack_content_scores(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    x_eval: np.ndarray,
+    emb_dim: int,
+    svm_config: Config,
+    lr_c: float,
+) -> np.ndarray:
+    """(SVM up margin, logreg P(up) - P(down)) for x_eval, fit on x_train."""
+    weights = _balanced_weights(y_train)
+    svm = _fit_svc_up_margin(x_train, x_eval, y_train, weights, svm_config, emb_dim)
+    xs_train, xs_eval = _fit_scale(x_train, x_eval, emb_dim)
+    clf = LogisticRegression(C=lr_c, solver="lbfgs", max_iter=2000, random_state=0)
+    clf.fit(xs_train, y_train, sample_weight=weights)
+    probs = clf.predict_proba(xs_eval)
+    classes = list(clf.classes_)
+    return np.column_stack(
+        [svm, probs[:, classes.index(2)] - probs[:, classes.index(0)]]
+    )
+
+
+def _stack_oof_content(
+    fold: FoldData, svm_config: Config, lr_c: float, inner_folds: int = 5
+) -> tuple[np.ndarray, np.ndarray]:
+    """Out-of-fold content scores for the training votes; candidates get the
+    mean of the inner models, so both sides come from 80%-data fits."""
+    key = (svm_config.model.svm_c, lr_c)
+    for cached_fold, cached_key, value in _stack_content_cache:
+        if cached_fold is fold and cached_key == key:
+            return value
+    x, y = fold.x_train_base, fold.y_train
+    emb_dim = fold.cand_emb.shape[1]
+    n_splits = min(inner_folds, min(Counter(y.tolist()).values()))
+    oof = np.zeros((len(y), 2))
+    cand = np.zeros((len(fold.x_cand_base), 2))
+    for tr, ev in StratifiedKFold(n_splits, shuffle=True, random_state=0).split(x, y):
+        oof[ev] = _stack_content_scores(x[tr], y[tr], x[ev], emb_dim, svm_config, lr_c)
+        cand += _stack_content_scores(
+            x[tr], y[tr], fold.x_cand_base, emb_dim, svm_config, lr_c
+        )
+    value = (oof, cand / n_splits)
+    _stack_content_cache[:] = [(fold, key, value)]
+    return value
+
+
+def _stack_features(
+    fold: FoldData, svm_config: Config, lr_c: float, feats: str
+) -> tuple[np.ndarray, np.ndarray]:
+    train_parts: list[np.ndarray] = []
+    cand_parts: list[np.ndarray] = []
+    if feats in ("content", "both"):
+        oof, cand = _stack_oof_content(fold, svm_config, lr_c)
+        train_parts.append(oof)
+        cand_parts.append(cand)
+    if feats in ("meta", "both"):
+        cutoff = float(fold.train_vote_times.max())
+        vote_time = (
+            dict(zip((s.id for s in fold.test_stories), fold.test_vote_times))
+            if fold.test_vote_times is not None
+            else {}
+        )
+        cand_ages = np.array(
+            [vote_time.get(s.id, cutoff) - s.time for s in fold.candidates]
+        )
+        train_ages = fold.train_vote_times - np.array(
+            [s.time for s in fold.train_stories]
+        )
+        train_parts.append(
+            _stack_meta_features(
+                fold.train_stories,
+                train_ages,
+                fold.train_stories,
+                fold.y_train,
+                is_train=True,
+            )
+        )
+        cand_parts.append(
+            _stack_meta_features(
+                fold.candidates,
+                cand_ages,
+                fold.train_stories,
+                fold.y_train,
+                is_train=False,
+            )
+        )
+    return np.hstack(train_parts), np.hstack(cand_parts)
+
+
+def _hgb(max_iter: int = 200) -> HistGradientBoostingClassifier:
+    return HistGradientBoostingClassifier(
+        max_depth=3,
+        learning_rate=0.05,
+        max_iter=max_iter,
+        l2_regularization=1.0,
+        min_samples_leaf=20,
+        random_state=0,
+    )
+
+
+def _scores_stack(
+    fold: FoldData, svm_config: Config, lr_c: float, *, mode: str, feats: str
+) -> tuple[np.ndarray, None]:
+    """Second-stage ranker over out-of-fold content scores and/or metadata.
+
+    gbm: 3-class gradient boosting, P(up) - P(down). ordinal: boosted
+    P(label >= neutral) + P(label >= up). lr: 3-class logistic regression.
+    pair: linear model on feature differences of differently-labelled vote
+    pairs (a pairwise ranking objective), scored by the learned weights.
+    """
+    x_train, x_cand = _stack_features(fold, svm_config, lr_c, feats)
+    y = fold.y_train
+    if mode == "gbm":
+        clf = _hgb().fit(x_train, y, sample_weight=_balanced_weights(y))
+        probs = clf.predict_proba(x_cand)
+        classes = list(clf.classes_)
+        scores = probs[:, classes.index(2)] - probs[:, classes.index(0)]
+    elif mode == "ordinal":
+        scores = np.zeros(len(x_cand))
+        for threshold in (1, 2):
+            target = (y >= threshold).astype(int)
+            clf = _hgb().fit(x_train, target, sample_weight=_balanced_weights(target))
+            scores += clf.predict_proba(x_cand)[:, 1]
+    else:
+        scaler = StandardScaler().fit(x_train)
+        xs_train, xs_cand = scaler.transform(x_train), scaler.transform(x_cand)
+        if mode == "lr":
+            clf = LogisticRegression(C=1.0, max_iter=2000, random_state=0)
+            clf.fit(xs_train, y, sample_weight=_balanced_weights(y))
+            probs = clf.predict_proba(xs_cand)
+            classes = list(clf.classes_)
+            scores = probs[:, classes.index(2)] - probs[:, classes.index(0)]
+        elif mode == "pair":
+            rng = np.random.default_rng(0)
+            i = rng.integers(0, len(y), 60_000)
+            j = rng.integers(0, len(y), 60_000)
+            keep = y[i] != y[j]
+            i, j = i[keep], j[keep]
+            clf = LogisticRegression(C=1.0, fit_intercept=False, max_iter=2000)
+            clf.fit(xs_train[i] - xs_train[j], (y[i] > y[j]).astype(int))
+            scores = xs_cand @ clf.coef_[0]
+        else:
+            raise ValueError(f"Unknown stack mode {mode!r}; use {STACK_MODES}")
+    return np.asarray(scores, dtype=np.float32), None
+
+
+@dataclass(frozen=True)
+class SkippedPool:
+    """Stories the user was shown (impression events) with a valid stored
+    embedding: weak negatives once a fold drops those it trains or tests on."""
+
+    stories: list[Story]
+    first_shown: np.ndarray
+    emb: np.ndarray
+
+
+def _load_skipped_pool(db: Database, config: Config, user_id: int) -> SkippedPool:
+    with db.conn() as conn:
+        rows = conn.execute(
+            """SELECT story_id, MIN(occurred_at) FROM interaction_events
+               WHERE user_id = ? AND event_type = 'impression'
+               GROUP BY story_id""",
+            (user_id,),
+        ).fetchall()
+    shown = {int(sid): float(t) for sid, t in rows}
+    stories = [s for s in (db.get_story(sid) for sid in shown) if s is not None]
+    hashes = dict(
+        zip([s.id for s in stories], _embedding_text_hashes(stories), strict=True)
+    )
+    vectors = db.get_embeddings_batch(
+        [s.id for s in stories], config.embedding_model_version, hashes
+    )
+    kept = [
+        s
+        for s in stories
+        if s.id in vectors
+        and np.isfinite(vectors[s.id]).all()
+        and np.isclose(np.linalg.norm(vectors[s.id]), 1.0, atol=1e-3)
+    ]
+    return SkippedPool(
+        stories=kept,
+        first_shown=np.array([shown[s.id] for s in kept], dtype=np.float64),
+        emb=np.asarray([vectors[s.id] for s in kept], dtype=np.float32).reshape(
+            len(kept), -1
+        ),
+    )
+
+
+def _first_shown_feeds(db: Database, user_id: int) -> dict[str, set[int]]:
+    """Story IDs by the feed (``sort_mode``) of the user's first impression."""
+    with db.conn() as conn:
+        rows = conn.execute(
+            """SELECT e.story_id, e.sort_mode FROM interaction_events e
+               JOIN (SELECT story_id, MIN(occurred_at) AS at
+                     FROM interaction_events
+                     WHERE user_id = ? AND event_type = 'impression'
+                     GROUP BY story_id) first
+                 ON first.story_id = e.story_id AND first.at = e.occurred_at
+               WHERE e.user_id = ? AND e.event_type = 'impression'""",
+            (user_id, user_id),
+        ).fetchall()
+    feeds: dict[str, set[int]] = {}
+    for story_id, sort_mode in rows:
+        feeds.setdefault(f"feed_{sort_mode}", set()).add(int(story_id))
+    return feeds
+
+
+def _impression_pools(
+    shown: SkippedPool,
+    splits: list[FoldSplit],
+    voted_ids: list[int],
+    vote_times: np.ndarray,
+    after: float,
+) -> dict[int, set[int]]:
+    """Per split: stories first shown to the user during its test block
+    (from ``after``, or the block's first vote, to the next block's first
+    vote) that were not voted in another block or in training. Votes from
+    that block are added by the fold; shown-but-unvoted ones stay unjudged."""
+    starts = [after] + [float(vote_times[s.test_pos].min()) for s in splits[1:]]
+    ends = starts[1:] + [math.inf]
+    pools: dict[int, set[int]] = {}
+    for split, start, end in zip(splits, starts, ends, strict=True):
+        tested = {voted_ids[p] for p in split.test_pos}
+        voted_elsewhere = set(voted_ids) - tested
+        pools[split.fold_no] = {
+            story.id
+            for story, first in zip(shown.stories, shown.first_shown, strict=True)
+            if start <= first < end and story.id not in voted_elsewhere
+        }
+    return pools
+
+
+def _url_group(story: Story) -> str:
+    return str(normalize_url(story.url) or f"story:{story.id}")
+
+
+def _with_skipped(
+    fold: FoldData, pool: SkippedPool, label: int, frac: float, config: Config
+) -> FoldData:
+    """The fold with a share of shown-but-unvoted stories added as training
+    votes of *label*. Only stories first shown before the training cutoff
+    and neither trained nor tested on in this fold; production has no sample
+    weights, so the share (frac of the eligible pool) sets their weight.
+    Stories match by URL group, so a cross-post counts as the same article."""
+    if fold.train_emb is None or fold.train_emb.shape[1] != pool.emb.shape[1]:
+        raise ValueError("skipped negatives need the stored embeddings")
+    cutoff = float(fold.train_vote_times.max())
+    # URL groups, as in _make_fold: a cross-post of an article the fold
+    # trains or tests on must not come back as a synthetic vote.
+    known = {
+        _url_group(s) for s in fold.train_stories + fold.candidates + fold.test_stories
+    }
+    eligible: list[int] = []
+    for i, s in enumerate(pool.stories):
+        if pool.first_shown[i] < cutoff and _url_group(s) not in known:
+            eligible.append(i)
+            known.add(_url_group(s))
+    count = int(round(min(frac, 1.0) * len(eligible)))
+    if not count:
+        return fold
+    take = np.sort(np.random.default_rng(0).permutation(eligible)[:count])
+    train_stories = fold.train_stories + [pool.stories[i] for i in take]
+    train_emb = np.vstack([fold.train_emb, pool.emb[take]])
+    y_train = np.concatenate([fold.y_train, np.full(count, label, dtype=int)])
+    x_train_base, x_cand_base = _experimental_features(
+        train_emb, train_stories, y_train, fold.cand_emb, fold.candidates, config
+    )
+    return replace(
+        fold,
+        train_stories=train_stories,
+        train_emb=train_emb,
+        y_train=y_train,
+        train_vote_times=np.concatenate(
+            [fold.train_vote_times, pool.first_shown[take]]
+        ),
+        x_train_base=x_train_base,
+        x_cand_base=x_cand_base,
+        tier2_scores=_tier2_scores(fold.cand_emb, train_emb, y_train),
+        runtime_db=None,
+        similarities={},
+    )
+
+
+def _per_embedding_production(
+    fold: FoldData, config: Config, source_db: Database | None, dims: list[int]
+) -> np.ndarray:
+    """Production fitted on each side-by-side embedding alone (blocks of
+    *dims* columns, rescaled to unit length), rank-averaged."""
+    if fold.train_emb is None or sum(dims) != fold.cand_emb.shape[1]:
+        raise ValueError(f"dims {dims} do not split {fold.cand_emb.shape[1]} columns")
+    scale = np.float32(np.sqrt(len(dims)))
+    bounds = np.cumsum([0, *dims])
+    scores = []
+    for lo, hi in zip(bounds[:-1], bounds[1:]):
+        part = replace(
+            fold,
+            cand_emb=np.ascontiguousarray(fold.cand_emb[:, lo:hi]) * scale,
+            train_emb=np.ascontiguousarray(fold.train_emb[:, lo:hi]) * scale,
+            runtime_db=None,
+            similarities={},
+        )
+        scores.append(_production_scores(part, config, source_db)[0])
+    return _rank_average(*scores)
+
+
+def _tfidf_text(story: Story, text: str = "full") -> str:
+    """full: domain/source tokens + title + text start; title: title only;
+    titledom: tokens + title."""
+    domain = _story_domain(story).replace(".", "_") or story.source
+    tokens = f"dom_{domain} src_{story.source}"
+    if text == "title":
+        return story.title
+    if text == "titledom":
+        return f"{tokens} {story.title}"
+    if text != "full":
+        raise ValueError(f"Unknown tfidf_text {text!r}")
+    return tfidf_text_full(story)
+
+
+def _tfidf_features(fold: FoldData, text: str, char: bool) -> tuple[Any, Any]:
+    """Sparse TF-IDF rows for training votes and candidates; the vocabulary
+    comes from the fold's training votes only. The default (word grams over
+    the full text) is the production hashed model."""
+    if not char and text == "full":
+        counts = count_rows(fold.train_stories)
+        keep = np.asarray((counts > 0).sum(axis=0)).ravel() >= 2
+        idf = TfidfTransformer(sublinear_tf=True)
+        return (
+            idf.fit_transform(counts[:, keep]),
+            idf.transform(count_rows(fold.candidates)[:, keep]),
+        )
+    vectorizer = (
+        TfidfVectorizer(
+            analyzer="char_wb",
+            ngram_range=(3, 5),
+            min_df=2,
+            max_features=200_000,
+            sublinear_tf=True,
+        )
+        if char
+        else TfidfVectorizer(
+            ngram_range=(1, 2),
+            min_df=2,
+            max_features=100_000,
+            sublinear_tf=True,
+            stop_words="english",
+        )
+    )
+    x_train = vectorizer.fit_transform(
+        [_tfidf_text(s, text) for s in fold.train_stories]
+    )
+    return x_train, vectorizer.transform(
+        [_tfidf_text(s, text) for s in fold.candidates]
+    )
+
+
+def _vote_weights(fold: FoldData, y: np.ndarray, half_life: float | None) -> np.ndarray:
+    weights = _balanced_weights(y)
+    if half_life is not None:
+        weights = weights * _recency_decay(
+            float(fold.train_vote_times.max()), fold.train_vote_times, half_life
+        )
+    return weights
+
+
+def _up_minus_down(clf: LogisticRegression, x: Any) -> np.ndarray:
+    probs = clf.predict_proba(x)
+    classes = list(clf.classes_)
+    return (probs[:, classes.index(2)] - probs[:, classes.index(0)]).astype(np.float32)
+
+
+def _scores_tfidf(
+    fold: FoldData,
+    c: float,
+    *,
+    text: str = "full",
+    char: bool = False,
+    half_life: float | None = None,
+) -> np.ndarray:
+    """Word 1-2 gram (or char 3-5 gram) TF-IDF logistic regression,
+    P(up) - P(down)."""
+    x_train, x_cand = _tfidf_features(fold, text, char)
+    y = fold.y_train
+    clf = LogisticRegression(C=c, max_iter=3000, random_state=0)
+    clf.fit(x_train, y, sample_weight=_vote_weights(fold, y, half_life))
+    return _up_minus_down(clf, x_cand)
+
+
+def _scores_joint(
+    fold: FoldData,
+    config: Config,
+    c: float,
+    *,
+    text: str = "full",
+    half_life: float | None = None,
+) -> np.ndarray:
+    """One logistic regression over TF-IDF words and the dense features
+    (embeddings raw, metadata scaled) side by side, P(up) - P(down)."""
+    from scipy.sparse import csr_matrix, hstack
+
+    dense_train, dense_cand, y, _ = _prepare_linear_model_inputs(fold, config)
+    words_train, words_cand = _tfidf_features(fold, text, False)
+    x_train = hstack([words_train, csr_matrix(dense_train)]).tocsr()
+    x_cand = hstack([words_cand, csr_matrix(dense_cand)]).tocsr()
+    clf = LogisticRegression(C=c, max_iter=3000, random_state=0)
+    clf.fit(x_train, y, sample_weight=_vote_weights(fold, y, half_life))
+    return _up_minus_down(clf, x_cand)
+
+
+def _scores_source_prior(fold: FoldData) -> np.ndarray:
+    """Per-source up rate minus down rate from the training votes, shrunk
+    toward the overall rates; a nudge for sources voted differently."""
+    rates = _smoothed_label_rates(
+        [s.source for s in fold.train_stories],
+        fold.y_train,
+        [s.source for s in fold.candidates],
+    )
+    return (rates[:, 0] - rates[:, 1]).astype(np.float32)
+
+
+def _scores_logreg_target(
+    fold: FoldData, config: Config, target: str, half_life: float | None = None
+) -> np.ndarray:
+    """The blend's logistic regression. updown: 3-class P(up) - P(down)
+    (production challenger); up: binary up vs rest; updown_only: trained on
+    up and down votes only (neutral dropped), P(up)."""
+    if target == "updown":
+        return _scores_logreg(
+            fold, config, target="up_minus_down", half_life_days=half_life
+        )[0]
+    if target == "up":
+        return _scores_logreg(fold, config, binary=True, half_life_days=half_life)[0]
+    if target != "updown_only":
+        raise ValueError(f"Unknown lr_target {target!r}")
+    x_train, x_cand, y, _ = _prepare_linear_model_inputs(fold, config)
+    keep = y != 1
+    y_bin = (y[keep] == 2).astype(int)
+    clf = LogisticRegression(
+        C=config.model.linear_blend_dense_c, max_iter=2000, random_state=0
+    )
+    clf.fit(x_train[keep], y_bin, sample_weight=_balanced_weights(y_bin))
+    return clf.predict_proba(x_cand)[:, 1].astype(np.float32)
+
+
+PRODLR_OPTIONS = {
+    "lr_weight",
+    "knn_weight",
+    "tfidf_weight",
+    "tfidf_c",
+    "lr_target",
+    "skip_label",
+    "skip_frac",
+    "dims",
+    "tfidf_text",
+    "tfidf_char",
+    "joint_c",
+    "half_life",
+    "source_weight",
+    "gravity_weight",
+    "gravity_scale",
+}
+
+
+def _scores_prodlr(
+    fold: FoldData,
+    tuned: Config,
+    config: Config,
+    source_db: Database | None,
+    options: dict[str, str],
+    skipped_pool: SkippedPool | None,
+) -> np.ndarray:
+    """prodlr[...]: production (tuned) rank-blended with logistic regression
+    and optionally kNN and TF-IDF. Options: lr_weight (0.5), knn_weight,
+    tfidf_weight, tfidf_c (4), lr_target (updown|up|updown_only),
+    skip_label (down|neutral) + skip_frac (1.0) add shown-but-unvoted
+    stories as weak training votes, dims (e.g. 384+768) fits production on
+    each side-by-side embedding separately, tfidf_text (full|title|titledom)
+    and tfidf_char=1 (char 3-5 grams) pick the TF-IDF input, lr_target=joint
+    (+ joint_c, 1.0) replaces the logreg by one model over TF-IDF words and
+    dense features, half_life (days) decays older votes in the linear models,
+    source_weight blends a per-source vote prior, gravity_weight blends
+    Popular's order (``hn_gravity`` on a gravity_scale-hour clock, default 8
+    as for 1d)."""
+    if "skip_label" in options:
+        if skipped_pool is None:
+            raise ValueError("skip_label needs the skipped pool")
+        label = {"down": 0, "neutral": 1}[options["skip_label"]]
+        fold = _with_skipped(
+            fold, skipped_pool, label, float(options.get("skip_frac", 1.0)), config
+        )
+    live_tuned = tuned
+    tuned = _without_blend(tuned)
+    if "dims" in options:
+        dims = [int(d) for d in options["dims"].split("+")]
+        production = _per_embedding_production(fold, tuned, source_db, dims)
+    else:
+        production = _production_scores(fold, tuned, source_db)[0]
+    weights = {
+        key: float(options.get(key, default))
+        for key, default in (
+            ("lr_weight", 0.5),
+            ("knn_weight", 0.0),
+            ("tfidf_weight", 0.0),
+            ("source_weight", 0.0),
+            ("gravity_weight", 0.0),
+        )
+    }
+    half_life = float(options["half_life"]) if "half_life" in options else None
+    text = options.get("tfidf_text", "full")
+    target = options.get("lr_target", "updown")
+    zeros = np.zeros(len(fold.candidates), dtype=np.float32)
+
+    def logreg() -> np.ndarray:
+        if target == "joint":
+            return _scores_joint(
+                fold,
+                config,
+                float(options.get("joint_c", 1.0)),
+                text=text,
+                half_life=half_life,
+            )
+        if target == "updown" and half_life is None and "skip_label" not in options:
+            # The live dense model; the other targets, half-lives and skipped
+            # votes keep the eval's own logreg (fewer meta columns).
+            return _live_dense_scores(fold, live_tuned, source_db)
+        return _scores_logreg_target(fold, config, target, half_life)
+
+    scores = {
+        "production": production,
+        "logreg": logreg() if weights["lr_weight"] else zeros,
+        "knn": _scores_knn_up_minus_down(fold, config)[0]
+        if weights["knn_weight"]
+        else zeros,
+        "tfidf": _scores_tfidf(
+            fold,
+            float(options.get("tfidf_c", 4.0)),
+            text=text,
+            char=options.get("tfidf_char", "0") == "1",
+            half_life=half_life,
+        )
+        if weights["tfidf_weight"]
+        else zeros,
+        "source": _scores_source_prior(fold) if weights["source_weight"] else zeros,
+        "gravity": _scores_window_gravity(
+            fold, float(options.get("gravity_scale", 8.0))
+        )
+        if weights["gravity_weight"]
+        else zeros,
+    }
+    return _weighted_rank_blend(scores, **weights)
+
+
 def _scores_knn_up_minus_down(
     fold: FoldData, config: Config
 ) -> tuple[np.ndarray, None]:
@@ -1019,6 +1733,22 @@ def _scores_knn_up_minus_down(
         fold.cand_emb, fold.train_emb, fold.y_train, config.model.knn_k
     )
     return (sim_up - sim_down).astype(np.float32), None
+
+
+def sample_feedback_positions(labels: np.ndarray, per_class: int) -> np.ndarray:
+    """Sorted positions of at most ``per_class`` votes per label (seed 0).
+
+    Shared with encode_replay_embeddings.py so a subsampled screen only
+    encodes the stories the eval will use.
+    """
+    rng = np.random.default_rng(0)
+    keep: list[int] = []
+    for label in (0, 1, 2):
+        positions = np.where(labels == label)[0]
+        if len(positions) > per_class:
+            positions = rng.choice(positions, size=per_class, replace=False)
+        keep.extend(int(pos) for pos in positions)
+    return np.array(sorted(keep), dtype=int)
 
 
 def _load_replay_embeddings(
@@ -1083,13 +1813,27 @@ def _parse_model_overrides(spec: str) -> dict[str, float | int | bool]:
 
 
 def _weighted_rank_blend(
-    scores: dict[str, np.ndarray], *, lr_weight: float, knn_weight: float
+    scores: dict[str, np.ndarray],
+    *,
+    lr_weight: float,
+    knn_weight: float,
+    tfidf_weight: float = 0.0,
+    source_weight: float = 0.0,
+    gravity_weight: float = 0.0,
 ) -> np.ndarray:
-    """Percentile-rank blend; production gets 1 - lr_weight - knn_weight."""
+    """Percentile-rank blend; production gets the rest of the weight."""
     weights = {
-        "production": 1.0 - lr_weight - knn_weight,
+        "production": 1.0
+        - lr_weight
+        - knn_weight
+        - tfidf_weight
+        - source_weight
+        - gravity_weight,
         "logreg": lr_weight,
         "knn": knn_weight,
+        "tfidf": tfidf_weight,
+        "source": source_weight,
+        "gravity": gravity_weight,
     }
     if min(weights.values()) < 0:
         raise ValueError(f"Blend weights must be non-negative: {weights}")
@@ -1101,6 +1845,32 @@ def _weighted_rank_blend(
 
 def _rank_average(*scores: np.ndarray) -> np.ndarray:
     return np.mean([_percentile_scores(s) for s in scores], axis=0).astype(np.float32)
+
+
+# Characters of production embedding text (title + self + article +
+# comments). On user 1's votes (2026-09-28) about 14% are short, 56% medium
+# and 30% long.
+TEXT_LENGTH_BUCKETS: dict[str, tuple[int, float]] = {
+    "short": (0, 3000),
+    "medium": (3000, 8000),
+    "long": (8000, math.inf),
+}
+
+
+def _novel_candidate_ids(fold: FoldData) -> set[int]:
+    """Candidates in the less familiar half: max cosine to any training
+    upvote below the fold's median. Measured in the fold's own embedding
+    space, so the median keeps it comparable across embedding models."""
+    dim = fold.cand_emb.shape[1]
+    train = fold.train_emb if fold.train_emb is not None else fold.x_train_base[:, :dim]
+    ups = np.asarray(train)[fold.y_train == 2]
+    if not len(ups) or not len(fold.candidates):
+        return set()
+    max_sim = (np.asarray(fold.cand_emb) @ ups.T).max(axis=1)
+    cutoff = float(np.median(max_sim))
+    return {
+        s.id for s, sim in zip(fold.candidates, max_sim, strict=True) if sim < cutoff
+    }
 
 
 def _metrics(
@@ -1120,8 +1890,14 @@ def _metrics(
         s.id: int(a) for s, a in zip(fold.test_stories, fold.test_actions, strict=True)
     }
     candidate_ids = {s.id for s in fold.candidates}
+    novel_ids = _novel_candidate_ids(fold)
+    non_hn_ids = {s.id for s in fold.candidates if not is_hn_source(s.source)}
 
-    def compute(ids: list[int], eligible: set[int]) -> dict:
+    score_by_id = {s.id: float(v) for s, v in zip(fold.candidates, scores, strict=True)}
+
+    def compute(
+        ids: list[int], eligible: set[int], *, tie_scores: bool = False
+    ) -> dict:
         positives = {
             sid for sid, label in judged.items() if label == 2 and sid in eligible
         }
@@ -1150,18 +1926,41 @@ def _metrics(
         # the share of (upvote, other) pairs ordered upvote-first. 0.5 is
         # random. Unlike NDCG@k it uses the whole list, so it is far less
         # noisy on ~700-card folds.
-        for other_name, others in (("rest", (0, 1)), ("down", (0,))):
-            ups_seen = pairs = n_other = 0
-            for sid in ids:
-                label = judged.get(sid)
-                if sid in positives:
-                    ups_seen += 1
-                elif label in others:
-                    pairs += ups_seen
-                    n_other += 1
+        # With tie_scores, cards of equal score form one group and each
+        # (upvote, other) pair inside it counts one half, not 0 or 1 by list
+        # position.
+        # "all" counts every other returned card, judged or not: on the
+        # impressions pool a shown story left unvoted is a not-upvote.
+        for other_name, others in (("rest", (0, 1)), ("down", (0,)), ("all", None)):
+            ups_seen = n_other = 0
+            pairs = 0.0
+            start = 0
+            while start < len(ids):
+                end = start + 1
+                if tie_scores:
+                    while (
+                        end < len(ids)
+                        and score_by_id[ids[end]] == score_by_id[ids[start]]
+                    ):
+                        end += 1
+                group = ids[start:end]
+                group_up = sum(sid in positives for sid in group)
+                group_other = sum(
+                    sid not in positives
+                    and (others is None or judged.get(sid) in others)
+                    for sid in group
+                )
+                pairs += ups_seen * group_other + 0.5 * group_up * group_other
+                ups_seen += group_up
+                n_other += group_other
+                start = end
             result[f"auc_up_vs_{other_name}"] = (
                 pairs / (n_up * n_other) if n_up and n_other else None
             )
+            # Raw counts, so small slices (e.g. short texts) can be pooled
+            # across folds instead of averaging per-fold AUCs of 2-3 upvotes.
+            result[f"auc_up_vs_{other_name}_ordered_pairs"] = pairs
+            result[f"auc_up_vs_{other_name}_pairs"] = n_up * n_other
         for k in (10, 12, 40, 100, 200):
             ideal = sum(1 / math.log2(i + 2) for i in range(min(n_up, k)))
             result[f"random_expected_ndcg_at_{k}"] = (
@@ -1182,6 +1981,34 @@ def _metrics(
             result[f"hit_at_{k}"] = (
                 sum(sid in judged for sid in ids[:k]) / len(judged) if judged else None
             )
+        top12 = ids[:12]
+        if top12:
+            # What a 12-card view shows: annoying cards, "meh" cards, and
+            # upvotes the model found outside familiar ground (discovery).
+            result["known_upvote_fraction_at_12"] = sum(
+                sid in positives for sid in top12
+            ) / len(top12)
+            result["known_downvote_fraction_at_12"] = sum(
+                judged.get(sid) == 0 for sid in top12
+            ) / len(top12)
+            result["known_neutral_fraction_at_12"] = sum(
+                judged.get(sid) == 1 for sid in top12
+            ) / len(top12)
+            result["non_hn_upvotes_at_12"] = sum(
+                sid in positives and sid in non_hn_ids for sid in top12
+            )
+            result["discovery_upvotes_at_12"] = sum(
+                sid in positives and sid in novel_ids for sid in top12
+            )
+        else:
+            for key in (
+                "known_upvote_fraction_at_12",
+                "known_downvote_fraction_at_12",
+                "known_neutral_fraction_at_12",
+                "non_hn_upvotes_at_12",
+                "discovery_upvotes_at_12",
+            ):
+                result[key] = None
         returned40 = len(ids[:40])
         result["known_upvote_fraction_at_40"] = (
             sum(p < 40 for p in ranks) / returned40 if returned40 else None
@@ -1206,7 +2033,21 @@ def _metrics(
     ):
         raise ValueError("Invalid scorer probability matrix")
     raw_ids = [fold.candidates[i].id for i in order]
-    output = {"raw": compute(raw_ids, candidate_ids)}
+    output = {"raw": compute(raw_ids, candidate_ids, tie_scores=True)}
+    # The same ranking restricted to stories of one text length, so an
+    # embedding strategy that only helps long (or short) stories shows up.
+    for bucket, (low, high) in TEXT_LENGTH_BUCKETS.items():
+        bucket_ids = {
+            s.id for s in fold.candidates if low <= len(story_embedding_text(s)) < high
+        }
+        output[f"raw_{bucket}"] = compute(
+            [sid for sid in raw_ids if sid in bucket_ids], bucket_ids, tie_scores=True
+        )
+    for name, ids in fold.slices.items():
+        slice_ids = ids & candidate_ids
+        output[f"raw_{name}"] = compute(
+            [sid for sid in raw_ids if sid in slice_ids], slice_ids, tie_scores=True
+        )
     if config.model.enable_mmr:
         ranked = [
             RankedStory(
@@ -1225,23 +2066,39 @@ def _metrics(
         # Deck assembly runs production dedup, which is 384-d only; replay
         # embeddings from other models are compared on the raw ranking.
         return output
-    deck = _recommended(scores, fold, config, probs, source_db)
-    from pipeline.config import is_hn_source
+    from pipeline.ranking import in_window, serve_window
 
-    cutoff = int(time.time()) - 30 * 86400
-    for age in ("recent", "archive"):
-        for source in ("mixed", "hn", "non-hn"):
-            key = f"{age}_{source}"
-            eligible = {
-                s.id
-                for s in fold.candidates + [r.story for r in deck]
-                if (s.time >= cutoff) == (age == "recent")
-                and (source == "mixed" or is_hn_source(s.source) == (source == "hn"))
-            }
-            output[f"recommended_{key}"] = compute(
-                [r.story.id for r in deck if key in r.combo_keys.split()], eligible
-            )
+    # The Recommended view of the default window as a user is served it.
+    deck = _recommended(scores, fold, config, probs, source_db)
+    now = time.time()
+    served = serve_window(deck.window(DEFAULT_WINDOW), DEFAULT_WINDOW, now)
+    eligible = {
+        s.id
+        for s in fold.candidates + [r.story for r in served.recommended]
+        if in_window(s.time, DEFAULT_WINDOW, now)
+    }
+    output[f"recommended_{DEFAULT_WINDOW}"] = compute(
+        [r.story.id for r in served.recommended], eligible
+    )
     return output
+
+
+def _experimental_features(
+    train_emb: np.ndarray,
+    train_stories: list[Story],
+    y_train: np.ndarray,
+    cand_emb: np.ndarray,
+    candidates: list[Story],
+    config: Config,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Embedding + length + kNN-similarity matrices for training and candidates."""
+    k = config.model.knn_k
+    train_sims = _loocv_similarity_features(train_emb, y_train, k)
+    cand_sims = _candidate_similarity_features(cand_emb, train_emb, y_train, k)
+    return (
+        _feature_matrix(train_emb, train_stories, *train_sims),
+        _feature_matrix(cand_emb, candidates, *cand_sims),
+    )
 
 
 def _make_fold(
@@ -1259,12 +2116,12 @@ def _make_fold(
     feedback_embeddings: np.ndarray | None = None,
     needs_experimental: bool = True,
     judged_only: bool = False,
+    pool_ids: set[int] | None = None,
 ) -> FoldData:
     train_story_indices = valid_positions[train_pos]
     test_story_indices = valid_positions[test_pos]
 
-    def group_key(story: Story) -> str:
-        return str(normalize_url(story.url) or f"story:{story.id}")
+    group_key = _url_group
 
     # Keep the first held-out vote per article; never evaluate a cross-post of
     # an article already present in training. Identity matches production URL
@@ -1288,7 +2145,8 @@ def _make_fold(
     seen_candidates = set(train_groups)
     for item in sorted(candidates, key=lambda s: (s.id not in test_ids, s.id)):
         key = group_key(item)
-        if key not in seen_candidates and (not judged_only or item.id in test_ids):
+        in_pool = item.id in test_ids or (pool_ids is not None and item.id in pool_ids)
+        if key not in seen_candidates and (not judged_only or in_pool):
             retained.add(item.id)
             seen_candidates.add(key)
     cand_mask = np.array([s.id in retained for s in candidates], dtype=bool)
@@ -1314,6 +2172,7 @@ def _make_fold(
             train_stories=train_stories,
             test_stories=test_stories,
             test_actions=test_actions,
+            test_vote_times=fb_vote_times[test_pos],
             train_vote_times=train_vote_times,
             x_train_base=empty,
             x_cand_base=empty,
@@ -1322,13 +2181,8 @@ def _make_fold(
             tier2_scores=_tier2_scores(fold_cand_emb, train_emb, y_train),
         )
 
-    train_sim_up, train_sim_down, train_closest_up, train_closest_down = (
-        _loocv_similarity_features(train_emb, y_train, config.model.knn_k)
-    )
-    cand_sim_up, cand_sim_down, cand_closest_up, cand_closest_down = (
-        _candidate_similarity_features(
-            fold_cand_emb, train_emb, y_train, config.model.knn_k
-        )
+    x_train_base, x_cand_base = _experimental_features(
+        train_emb, train_stories, y_train, fold_cand_emb, fold_candidates, config
     )
     return FoldData(
         train_emb=train_emb,
@@ -1337,23 +2191,10 @@ def _make_fold(
         train_stories=train_stories,
         test_stories=test_stories,
         test_actions=test_actions,
+        test_vote_times=fb_vote_times[test_pos],
         train_vote_times=train_vote_times,
-        x_train_base=_feature_matrix(
-            train_emb,
-            train_stories,
-            train_sim_up,
-            train_sim_down,
-            train_closest_up,
-            train_closest_down,
-        ),
-        x_cand_base=_feature_matrix(
-            fold_cand_emb,
-            fold_candidates,
-            cand_sim_up,
-            cand_sim_down,
-            cand_closest_up,
-            cand_closest_down,
-        ),
+        x_train_base=x_train_base,
+        x_cand_base=x_cand_base,
         y_train=y_train,
         tier2_scores=_tier2_scores(fold_cand_emb, train_emb, y_train),
     )
@@ -1392,8 +2233,33 @@ def _temporal_splits(
     return splits
 
 
+def _holdout_splits(
+    vote_times: np.ndarray, after: float, *, blocks: int = 1
+) -> list[FoldSplit]:
+    """Votes from ``after`` on, in ``blocks`` time blocks; each block trains
+    on every vote before it (expanding window, like the confirmation run)."""
+    held = np.unique(vote_times[vote_times >= after])
+    if blocks < 1 or len(held) < blocks:
+        raise ValueError("Need 1 <= --holdout-blocks <= held-out timestamp groups")
+    return [
+        FoldSplit(
+            i,
+            np.flatnonzero(vote_times < block[0]),
+            np.flatnonzero(np.isin(vote_times, block)),
+        )
+        for i, block in enumerate(np.array_split(held, blocks), 1)
+    ]
+
+
 def _variant_requires_all_labels(name: str) -> bool:
-    all_label_prefixes = ("margin3", "linear_svc", "logreg", "ensemble", "prodlr")
+    all_label_prefixes = (
+        "margin3",
+        "linear_svc",
+        "logreg",
+        "ensemble",
+        "prodlr",
+        "stack",
+    )
     return name.startswith(all_label_prefixes)
 
 
@@ -1481,7 +2347,8 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
             "heldout-feedback only: .npz from scripts/encode_replay_embeddings.py "
             "replacing stored embeddings for every feedback story (text-hash "
             "checked), to compare embedding models. Repeat to concatenate "
-            "several models (each scaled by 1/sqrt(k), so vectors stay unit)."
+            "several models (each scaled by 1/sqrt(k), so vectors stay unit). "
+            "Requires side_embedding_enabled=false in config and variants."
         ),
     )
     parser.add_argument(
@@ -1498,9 +2365,13 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
     )
     parser.add_argument(
         "--candidate-pool",
-        choices=("current", "heldout-feedback"),
+        choices=("current", "heldout-feedback", "impressions"),
         default="current",
-        help="Current production pool or judged-only retrospective replay of each held-out block; not comparable metrics.",
+        help=(
+            "Current production pool, judged-only retrospective replay of each "
+            "held-out block, or (with --holdout-after) each block's votes plus "
+            "every story first shown in it; not comparable metrics."
+        ),
     )
     parser.add_argument(
         "--split",
@@ -1554,6 +2425,24 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
         action="store_true",
         help="Evaluate the reserved latest 20 percent of timestamp groups",
     )
+    parser.add_argument(
+        "--holdout-after",
+        type=float,
+        help=(
+            "One split instead of the folds: train on votes before this Unix "
+            "time, test on every vote from it on (no confirmation reserve). "
+            "For checking a candidate on votes newer than any tuning used."
+        ),
+    )
+    parser.add_argument(
+        "--holdout-blocks",
+        type=int,
+        default=1,
+        help=(
+            "With --holdout-after: split the held-out votes into this many "
+            "time blocks, each trained on every vote before it"
+        ),
+    )
     parser.add_argument("--now", type=float, help="Frozen evaluation Unix timestamp")
     parser.add_argument(
         "--candidate-cap-seed",
@@ -1578,6 +2467,10 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
         value = getattr(args, option)
         if value is not None and value <= 0:
             parser.error(f"--{option.replace('_', '-')} must be positive")
+    if args.candidate_pool == "impressions" and (
+        args.holdout_after is None or args.replay_embeddings
+    ):
+        parser.error("impressions needs --holdout-after and stored embeddings")
     if args.split != "temporal":
         parser.error(
             "--split stratified is retired: chronological evaluation is required"
@@ -1593,6 +2486,35 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
     frozen_now = None
     if args.embeddings_file:
         config, frozen_now, database_path = _snapshot_context(args.embeddings_file)
+    requested = (
+        [name.strip() for name in args.variants.split(",") if name.strip()]
+        if args.variants
+        else ["production"]
+    )
+    if "production" not in requested:
+        requested.insert(0, "production")
+    if args.replay_embeddings:
+        side_enabled = config.model.side_embedding_enabled
+        for name in requested:
+            prefix, bracket, rest = name.partition("[")
+            if prefix not in {"prod", "produd", "prodlr", "stack"} or not (
+                bracket and rest.endswith("]")
+            ):
+                continue
+            # Ignore blend/stack options, which are not ModelConfig fields.
+            model_spec = ";".join(
+                item.strip()
+                for item in rest[:-1].split(";")
+                if item.strip().partition("=")[0] in ModelConfig.__dataclass_fields__
+            )
+            side_enabled |= bool(
+                _parse_model_overrides(model_spec).get("side_embedding_enabled", False)
+            )
+        if side_enabled:
+            parser.error(
+                "--replay-embeddings requires side_embedding_enabled=false in config "
+                "and variants; replay files already define the embedding space"
+            )
     now = (
         args.now
         if args.now is not None
@@ -1629,14 +2551,6 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
     if user is None:
         raise RuntimeError("Missing evaluation user")
 
-    requested = (
-        [name.strip() for name in args.variants.split(",") if name.strip()]
-        if args.variants
-        else ["production"]
-    )
-    if "production" not in requested:
-        requested.insert(0, "production")
-
     window_days = args.window_days if args.window_days is not None else config.days
     eval_config = replace(config, days=window_days)
     if args.embeddings_file:
@@ -1659,16 +2573,9 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
         raise ValueError("Invalid feedback labels or timestamps")
 
     if args.max_feedback_per_class is not None:
-        rng = np.random.default_rng(0)
-        keep_feedback_positions = []
-        for label in (0, 1, 2):
-            positions = np.where(valid_mask & (all_y == label))[0]
-            if len(positions) > args.max_feedback_per_class:
-                positions = rng.choice(
-                    positions, size=args.max_feedback_per_class, replace=False
-                )
-            keep_feedback_positions.extend(int(pos) for pos in positions)
-        keep_feedback_positions = np.array(sorted(keep_feedback_positions), dtype=int)
+        keep_feedback_positions = sample_feedback_positions(
+            all_y, args.max_feedback_per_class
+        )
         fb_stories = [fb_stories[i] for i in keep_feedback_positions]
         all_y = all_y[keep_feedback_positions]
         fb_vote_times = fb_vote_times[keep_feedback_positions]
@@ -1678,10 +2585,11 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
         parser.error(
             "--max-candidates cannot change a frozen embedding snapshot; cap it at bakeoff creation"
         )
-    if args.candidate_pool == "heldout-feedback":
+    shown_pool: SkippedPool | None = None
+    if args.candidate_pool in ("heldout-feedback", "impressions"):
         if args.embeddings_file or args.max_candidates:
             parser.error(
-                "heldout-feedback cannot use embedding snapshots or candidate caps"
+                f"{args.candidate_pool} cannot use embedding snapshots or candidate caps"
             )
         candidates = list(fb_stories)
         hashes = dict(
@@ -1699,6 +2607,15 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
                 [s.id for s in candidates], config.embedding_model_version, hashes
             ),
         )
+        if args.candidate_pool == "impressions":
+            shown_pool = _load_skipped_pool(db, config, user.id)
+            feedback_ids = {s.id for s in candidates}
+            extra = [
+                i for i, s in enumerate(shown_pool.stories) if s.id not in feedback_ids
+            ]
+            candidates += [shown_pool.stories[i] for i in extra]
+            cand_emb = np.vstack([cand_emb, shown_pool.emb[extra]])
+            print(f"impressions pool: {len(shown_pool.stories)} shown stories")
     else:
         if args.replay_embeddings:
             parser.error("--replay-embeddings needs --candidate-pool heldout-feedback")
@@ -1744,7 +2661,7 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
                 [s.id for s in fb_stories], config.embedding_model_version, hashes
             ),
         )
-    if not args.confirmation:
+    if not args.confirmation and args.holdout_after is None:
         valid_mask &= fb_vote_times < confirmation_start
 
     valid_positions = np.where(valid_mask)[0]
@@ -1856,8 +2773,13 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
             for gamma in (0.01, 0.02, 0.03, 0.05, 0.1):
                 name = f"svm_c{c}_gamma{gamma}"
                 tuned = replace(
-                    production_config,
-                    model=replace(production_config.model, svm_c=c, svm_gamma=gamma),
+                    _without_blend(production_config),
+                    model=replace(
+                        production_config.model,
+                        svm_c=c,
+                        svm_gamma=gamma,
+                        linear_blend_enabled=False,
+                    ),
                 )
                 variants[name] = lambda fold, tuned=tuned: _production_scores(
                     fold, tuned, db
@@ -1865,21 +2787,43 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
                 requested.append(name)
     # Hill-climbing names: prod[spec] = production with ModelConfig overrides;
     # produd[spec] scores it softmax(up) - softmax(down); prodlr[spec] rank-
-    # averages it with logreg_up_minus_down.
+    # averages it with logreg_up_minus_down (options: PRODLR_OPTIONS);
+    # stack[mode=..;feats=..;spec] is the second-stage ranker (_scores_stack)
+    # over the same SVM/logreg.
+    skipped_pool: SkippedPool | None = None
     for name in requested:
         prefix, bracket, rest = name.partition("[")
         if not bracket or not rest.endswith("]"):
             continue
         spec = rest[:-1].split(";")
-        blend = {
-            key: float(value)
+        if prefix == "stack":
+            options = dict(item.partition("=")[::2] for item in spec if item)
+            mode = options.pop("mode", "gbm")
+            feats = options.pop("feats", "both")
+            if mode not in STACK_MODES or feats not in STACK_FEATS:
+                raise ValueError(f"Bad stack variant {name!r}")
+            stack_config = replace(
+                _without_blend(production_config),
+                model=replace(
+                    production_config.model,
+                    **_parse_model_overrides(
+                        ";".join(f"{k}={v}" for k, v in options.items())
+                    ),
+                ),
+            )
+            variants[name] = lambda fold, c=stack_config, m=mode, f=feats: (
+                _scores_stack(
+                    fold, c, config.model.linear_blend_dense_c, mode=m, feats=f
+                )
+            )
+            continue
+        options = {
+            key: value
             for key, _, value in (item.partition("=") for item in spec)
-            if key in ("lr_weight", "knn_weight")
+            if key in PRODLR_OPTIONS
         }
         model_spec = ";".join(
-            item
-            for item in spec
-            if item.partition("=")[0] not in ("lr_weight", "knn_weight")
+            item for item in spec if item.partition("=")[0] not in PRODLR_OPTIONS
         )
         tuned = replace(
             production_config,
@@ -1892,22 +2836,17 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
                 fold, tuned, db
             )
         elif prefix == "produd":
-            variants[name] = lambda fold, tuned=tuned: _scores_production_up_minus_down(
-                fold, tuned, db
+            variants[name] = lambda fold, tuned=_without_blend(tuned): (
+                _scores_production_up_minus_down(fold, tuned, db)
             )
         elif prefix == "prodlr":
-            variants[name] = lambda fold, tuned=tuned, blend=blend: (
-                _weighted_rank_blend(
-                    {
-                        "production": _production_scores(fold, tuned, db)[0],
-                        "logreg": _scores_logreg(fold, config, target="up_minus_down")[
-                            0
-                        ],
-                        "knn": _scores_knn_up_minus_down(fold, config)[0],
-                    },
-                    lr_weight=blend.get("lr_weight", 0.5),
-                    knn_weight=blend.get("knn_weight", 0.0),
-                ),
+            if "skip_label" in options and skipped_pool is None:
+                skipped_pool = _load_skipped_pool(db, config, user.id)
+                print(
+                    f"skipped pool: {len(skipped_pool.stories)} shown stories (voted ones drop per fold)"
+                )
+            variants[name] = lambda fold, tuned=tuned, opts=options: (
+                _scores_prodlr(fold, tuned, config, db, opts, skipped_pool),
                 None,
             )
     if requested:
@@ -1927,7 +2866,15 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
         )
 
     split_label = "temporal-expanding"
-    splits = _temporal_splits(y, fb_vote_times, folds=args.folds)
+    if args.holdout_after is not None:
+        if args.confirmation:
+            parser.error("--holdout-after and --confirmation are exclusive")
+        split_label = "holdout-after"
+        splits = _holdout_splits(
+            fb_vote_times, args.holdout_after, blocks=args.holdout_blocks
+        )
+    else:
+        splits = _temporal_splits(y, fb_vote_times, folds=args.folds)
     if args.confirmation:
         reserved = np.unique(fb_vote_times[fb_vote_times >= confirmation_start])
         if len(reserved) < args.folds:
@@ -1948,6 +2895,16 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
         split_mode=split_label,
         required_train_labels=required_train_labels,
     )
+    split_pools: dict[int, set[int]] = {}
+    feed_slices = _first_shown_feeds(db, user.id) if shown_pool is not None else {}
+    if shown_pool is not None and args.holdout_after is not None:
+        split_pools = _impression_pools(
+            shown_pool,
+            splits,
+            [fb_stories[i].id for i in valid_positions],
+            fb_vote_times,
+            args.holdout_after,
+        )
 
     baselines = {
         "random": lambda fold: (
@@ -1985,7 +2942,8 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
                 split.test_pos,
                 config,
                 feedback_embeddings=feedback_embeddings,
-                judged_only=args.candidate_pool == "heldout-feedback",
+                judged_only=args.candidate_pool != "current",
+                pool_ids=split_pools.get(split.fold_no),
                 needs_experimental=any(
                     name != "production" and not name.startswith("svm_")
                     for name in variants
@@ -2001,7 +2959,7 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
                     }
                 )
             with _fold_database(fold, config, db) as fold_db:
-                fold = replace(fold, runtime_db=fold_db)
+                fold = replace(fold, runtime_db=fold_db, slices=feed_slices)
                 with _reuse_preprocessing():
                     for name, scorer in scorers.items():
                         scores, probs = (
@@ -2017,7 +2975,7 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
                                 calibration_available=name == "logreg_up",
                             )
                         )
-            print(f"{label}fold {split.fold_no}/{len(splits)} done")
+            print(f"{label}fold {split.fold_no}/{len(splits)} done", flush=True)
         return results
 
     combined = _run_scorers(variants | baselines, y)
@@ -2072,6 +3030,8 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
             "frozen_config": asdict(config),
             "confirmation": args.confirmation,
             "confirmation_start": float(confirmation_start),
+            "holdout_after": args.holdout_after,
+            "holdout_blocks": args.holdout_blocks,
             "sampling": {
                 "max_candidates": args.max_candidates,
                 "max_feedback_per_class": args.max_feedback_per_class,

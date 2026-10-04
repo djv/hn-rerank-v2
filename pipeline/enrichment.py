@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
 import hashlib
 import html
 import logging
@@ -16,6 +17,7 @@ from urllib.parse import urlparse
 import feedparser
 import httpx
 
+from ch_client import DEFAULT_MAX_LEVELS
 from database import Database, Story, StoryIdentityConflict, coerce_int
 
 if TYPE_CHECKING:
@@ -23,6 +25,8 @@ if TYPE_CHECKING:
 from reddit_fetch_queue import CoroFactory
 from reddit_feed_cache import cache as reddit_feed_cache
 from reddit_limiter import limiter as reddit_limiter
+from . import rank_gate
+from .ainews import AINEWS_SOURCE, tweet_id_from_url
 from .ranking import (
     Embedder,
     RankedStory,
@@ -32,6 +36,7 @@ from .ranking import (
     _extract_comments_recursive,
     _select_top_comments,
     join_top_comments,
+    story_embedding_text,
 )
 
 
@@ -71,7 +76,7 @@ def _ch_story_item_to_story(item: ChItem) -> Story | None:
         source="hn",
         comment_count=coerce_int(item.get("num_comments")),
         discussion_url=f"https://news.ycombinator.com/item?id={sid}",
-        comment_count_at_fetch=coerce_int(item.get("num_comments")),
+        comment_count_at_fetch=0,
         self_text=self_text,
         top_comments="",
         article_body="",
@@ -82,6 +87,21 @@ def _empty_story(sid: int) -> Story:
     return Story(
         id=sid, title="", url=None, score=0, time=0, text_content="", source="hn"
     )
+
+
+async def fetch_thread_comments(client: httpx.AsyncClient, sid: int) -> str:
+    """Selected top comments of HN story *sid* from Algolia, without touching
+    the DB; "" when the item is missing or the fetch fails."""
+    try:
+        resp = await client.get(f"https://hn.algolia.com/api/v1/items/{sid}")
+        item = resp.json() if resp.status_code == 200 else None
+    except (httpx.HTTPError, ValueError) as exc:
+        logging.warning("thread comments fetch failed for %s: %r", sid, exc)
+        return ""
+    if not isinstance(item, dict) or item.get("type") != "story":
+        return ""
+    comments = _extract_comments_recursive(item.get("children", []))
+    return join_top_comments([c["text"] for c in _select_top_comments(comments)])
 
 
 async def fetch_story(
@@ -197,11 +217,14 @@ async def fetch_story(
 _PREWARM_CHUNK_SIZE = 100
 
 
+_PREWARM_EMBED_BATCH = 32
+
+
 def prewarm_top_stories(
     story_ids: list[int],
     db: Database,
     embedder: Embedder | None = None,
-    max_levels: int = 5,
+    max_levels: int = DEFAULT_MAX_LEVELS,
 ) -> int:
     """Bulk-prewarm comment text for the top-N stories.
 
@@ -218,12 +241,12 @@ def prewarm_top_stories(
         db: Database instance for read + write.
         embedder: Optional Embedder; if provided, recomputes the embedding
             for any story whose text_content changed.
-        max_levels: comment tree depth (default 5; covers ~95% of trees).
+        max_levels: comment tree depth (``ch_client.DEFAULT_MAX_LEVELS``).
 
     Returns:
         Number of stories whose top_comments was updated.
     """
-    from ch_client import query_stories_with_comments
+    from ch_client import is_transient_error, query_stories_with_comments
 
     if not story_ids:
         return 0
@@ -245,7 +268,8 @@ def prewarm_top_stories(
                 len(chunk),
                 exc,
             )
-            continue
+            if not is_transient_error(exc):
+                break
 
     if not ch_items:
         return 0
@@ -260,11 +284,23 @@ def prewarm_top_stories(
         all_comments = _extract_comments_recursive(children)
         selected = _select_top_comments(all_comments)
         top_comments = join_top_comments([c["text"] for c in selected])
-        if not top_comments:
-            continue
         comment_count = coerce_int(
             item.get("num_comments"), existing.comment_count or 0
         )
+        if not top_comments:
+            # Nothing usable (e.g. only one-word replies): mark the tree as
+            # fetched so the regen prewarm waits for growth instead of
+            # re-querying it every hour.
+            if not existing.top_comments:
+                db.upsert_story(
+                    replace(
+                        existing,
+                        comment_count=comment_count,
+                        comment_count_at_fetch=comment_count,
+                    ),
+                    comments_authoritative=True,
+                )
+            continue
         new_text_content = compose_story_text(
             title=existing.title,
             self_text=existing.self_text,
@@ -286,7 +322,13 @@ def prewarm_top_stories(
             updated.append(persisted)
 
     if updated and embedder is not None:
-        get_or_compute_embeddings(updated, embedder, db)
+        # Small batches so a rerank waiting on a vote is not stuck behind
+        # a 1,000-story embedding run (regen thread only, never a rerank).
+        for i in range(0, len(updated), _PREWARM_EMBED_BATCH):
+            rank_gate.wait_idle()
+            get_or_compute_embeddings(
+                updated[i : i + _PREWARM_EMBED_BATCH], embedder, db
+            )
 
     return len(updated)
 
@@ -599,6 +641,7 @@ async def _fetch_and_parse_feed(
     cutoff: float,
     now: float,
     exclude_urls: set[str],
+    skip_title_prefixes: tuple[str, ...] = (),
 ) -> list[Story]:
     """Fetch a single RSS feed (Reddit or non-Reddit) and parse to Stories.
 
@@ -641,11 +684,11 @@ async def _fetch_and_parse_feed(
 
             published_parsed = entry.get("published_parsed")
             if published_parsed:
-                pub_time = time.mktime(published_parsed)
+                pub_time = calendar.timegm(published_parsed)
             else:
                 updated_parsed = entry.get("updated_parsed")
                 if updated_parsed:
-                    pub_time = time.mktime(updated_parsed)
+                    pub_time = calendar.timegm(updated_parsed)
                 else:
                     pub_time = now
 
@@ -653,6 +696,8 @@ async def _fetch_and_parse_feed(
                 continue
 
             title = entry.get("title", "Untitled")
+            if skip_title_prefixes and title.startswith(skip_title_prefixes):
+                continue
 
             summary = ""
             if "content" in entry and entry.content:
@@ -770,8 +815,12 @@ async def fetch_rss_feeds(
     days: int,
     exclude_urls: set[str],
     db: Database,
+    skip_title_prefixes: tuple[str, ...] = (),
 ) -> list[Story]:
     """Fetch non-Reddit RSS feeds synchronously and upsert to DB.
+
+    Entries whose title starts with one of ``skip_title_prefixes`` are
+    dropped (AINews issues, which ``pipeline.ainews`` splits by topic).
 
     Reddit RSS feeds are NOT fetched here — they are rate-limited and
     must be enqueued via :func:`build_reddit_topfeed_factories` plus
@@ -786,7 +835,9 @@ async def fetch_rss_feeds(
 
     other_feeds = [f for f in feeds if not _reddit_subreddit_from_feed_url(f)]
     tasks = [
-        _fetch_and_parse_feed(f, per_feed, cutoff, now, exclude_urls)
+        _fetch_and_parse_feed(
+            f, per_feed, cutoff, now, exclude_urls, skip_title_prefixes
+        )
         for f in other_feeds
     ]
     feed_results = list(await asyncio.gather(*tasks)) if tasks else []
@@ -815,6 +866,10 @@ def _article_fetch_failure_active(
 ) -> bool:
     failure = db.get_article_fetch_failure(story_id)
     if failure is None:
+        return False
+    if tweet_id_from_url(failure.url) and not failure.last_error.startswith("tweet_"):
+        # Recorded by the HTML fetcher before tweets went through
+        # fxtwitter (2026-09-29); the tweet path gets its own attempt.
         return False
     return failure.permanent or failure.next_retry_at > now_ts
 
@@ -907,6 +962,11 @@ def _is_fetchable_article_url(url: str) -> bool:
     return True
 
 
+# Sources whose text arrives complete: never fetch their URL as an article
+# (an AINews card's URL is the whole issue page).
+_NO_ARTICLE_SOURCES = frozenset({"rss_lesswrong_com", AINEWS_SOURCE})
+
+
 def _article_fetch_eligible(
     story: Story, db: Database, min_time: float, now_ts: float
 ) -> bool:
@@ -914,7 +974,7 @@ def _article_fetch_eligible(
         return False
     if not _is_fetchable_article_url(story.url):
         return False
-    if story.source.startswith("rss_reddit_") or story.source == "rss_lesswrong_com":
+    if story.source.startswith("rss_reddit_") or story.source in _NO_ARTICLE_SOURCES:
         return False
     if story.time < min_time:
         return False
@@ -931,7 +991,7 @@ def select_rss_article_prewarm(
     max_age_days: int = 30,
     now_ts: float | None = None,
 ) -> list[Story]:
-    """Newest RSS stories (not Reddit/LessWrong) still lacking article text.
+    """Newest RSS stories (not Reddit/LessWrong/AINews) still lacking article text.
 
     The warm-path fetcher only reaches stories that already rank near the
     top, so a feed that ships a short snippet never earns the text that
@@ -947,7 +1007,7 @@ def select_rss_article_prewarm(
         for s in candidates
         if s.source.startswith("rss_")
         and not s.source.startswith("rss_reddit_")
-        and s.source != "rss_lesswrong_com"
+        and s.source not in _NO_ARTICLE_SOURCES
     ]
     stored = [
         s
@@ -1088,6 +1148,7 @@ async def fetch_and_cache_article_bodies(
     async def fetch_one(story: Story) -> tuple[int, Story | None]:
         async with sem:
             try:
+                await rank_gate.wait_idle_async()
                 result = await _fetch_article_body_with_result(story.url or "")
                 if result.body:
                     body = result.body[:ARTICLE_BODY_CHAR_LIMIT]
@@ -1099,8 +1160,16 @@ async def fetch_and_cache_article_bodies(
                     )
                     updated = replace(story, article_body=body, text_content=new_text)
                     db.upsert_story(updated)
-                    new_vec = embedder.encode([new_text])[0]
-                    new_hash = hashlib.sha256(new_text.encode("utf-8")).hexdigest()
+                    # Deck stories are ranking copies without comments or
+                    # self text; the stored row merges them back in. Embed
+                    # the stored text, or its hash never matches and the
+                    # next pool rebuild re-embeds the story under the pool
+                    # lock (a 45 s rerank stall after each regen).
+                    updated = db.get_story(story.id) or updated
+                    embed_text = story_embedding_text(updated)
+                    await rank_gate.wait_idle_async()
+                    new_vec = embedder.encode([embed_text])[0]
+                    new_hash = hashlib.sha256(embed_text.encode("utf-8")).hexdigest()
                     db.upsert_embedding(
                         story.id,
                         model_version,
