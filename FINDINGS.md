@@ -1,5 +1,210 @@
 # HN Rerank findings
 
+## TUI one-row footer and bar tint — 2026-10-03
+
+User request: the TUI status bar took 3 lines (top rule plus status and
+keys stacked); make it 1 line and tint it and the top bar slightly.
+Footer is now `height: 1` without the rule; keys come from a per-mode
+ladder (full → no badges/quit → votes → `1/2/3 vote` → `? help`; zoom
+keeps `Enter zoom` / `Enter/Esc back`) and shrink before the status is
+cut. `chrome` palette color: dark `#262420`, light `#ECE5D9`.
+Checks: TUI suite 162 passed / 1 skipped; backend 1,077 passed / 18
+skipped; ruff clean; the only ty diagnostic is in the untracked
+`scripts/inspect_tldr_failures.py`. Headless Textual tests only; not
+yet viewed in a real terminal. The backend run started while desktop load
+was 6.6 (mostly Chrome); load fell back to 3.1 afterwards.
+
+## Improving upvotes and reducing downvotes — 2026-10-02 21:22 UTC
+
+User goal: think how to improve the upvote rate and lower downvotes.
+This is analysis and a proposed experiment, not authorization to change
+the ranking, subscriptions or parked fixes. Source/deployment `176cc59`;
+live feedback remains 3,340 reactions and the last impression 20:49 UTC.
+The preceding live-yield review is therefore still current for this sample.
+
+Verified selection mechanics: Recommended uses the learned final score;
+Popular selects only HN, purely by each window's gravity, with no taste
+screen. Explore selects entropy and unfamiliarity before Interest, without
+a preference-quality floor. The dense/TF-IDF blend already subtracts
+predicted downvotes from upvotes, so "start using downvotes" is not a new
+model change. Final blended scores are relative percentiles, not calibrated
+absolute probabilities that a candidate is worth reading.
+
+Fresh bounded VPS replay captured at 21:21:13 UTC, a consistent read-only
+SQLite backup, SHA256
+`59c1e4be26481d188083b6d8bcacc9ed1e8eb0bbca64039c4ff8774927258d35`.
+Current production config: C=4, linear blend on, Gemma side vectors on.
+Four expanding temporal blocks after the blend launch (Sep 29 17:17 UTC):
+495 reaction updates, 494 after URL-group isolation, 63 upvotes. The four
+candidate pools hold 651 rows including shown/unvoted stories; training
+contains only reactions before each block. Side-model coverage fallback
+and fit errors would abort; the run completed. No model re-encoding.
+
+Reordered each block's already-exposed feed stories; this does not recreate
+the historical full available pool, predict future live rates or establish
+causal uplift. Current stored text/comments/points can be newer than their
+historical exposure. Every Popular row is canonical HN. Typical clocks
+were checked separately because mixing different windows' gravity values
+in one historical feed slice is not a coherent live baseline.
+
+| Popular order (four 12-card selections) | known up | known down | slots |
+|---|---:|---:|---:|
+| Gravity, 1d clock (8h units) | 5 | 30 | 48 |
+| 70% preference rank + 30% gravity rank, 1d clock | 9 | 18 | 48 |
+| Preference rank only | 9 | 16 | 48 |
+
+Sensitivity with the 12h clock (4h units): gravity 4 up / 33 down; 70/30
+blend 9 up / 16 down. Small sample: only 12 liked Popular stories exist
+across these pools. The direction also agrees with the earlier independent
+stored-vector replay below; it supports a pilot, not a forecast of an
+18.8% live upvote rate. Mixed-window scratch results remain in the raw
+policy JSON and are not used as the headline comparator.
+
+Two fixed risk rules were checked without tuning a sweep: subtract 0.1
+times the within-feed down-probability percentile from model-score rank;
+or reject its worst down-risk quartile. Extra penalty changed one Popular
+disliked card to neutral (16 -> 15), found no new upvotes and changed
+neither Recommended nor Explore's top reactions. The gate changed no
+Recommended/Popular top-12 reactions; deeper in Recommended it excluded
+five known likes. Explore kept all five known likes, 16 -> 13 known dislikes,
+but returned 43 rather than 46 slots: the gain came entirely from leaving
+three slots empty in a ten-candidate block. This is weak evidence for
+avoiding filler, not a demonstrated improvement in discovery selection.
+Probability outputs were not treated as calibrated absolute rejection risk.
+
+Recent source evidence (since Sep 30, current reactions): fatFIRE 0 up /
+10 down / 2 neutral; EU personal finance 0/9/1. Slashdot 6/6/3, AINews 5/2/4,
+ScienceDaily 3/3/3. This does not justify blocking all Reddit or entire
+topics: digitalnomad had 36 prior upvotes, versus no new upvotes and four
+downs after the blend; fatFIRE had nine prior upvotes too. An existing
+shrunk per-source up-minus-down prior at 0.1/0.2 blend weight previously
+worsened the impression replay. Source curation should be selective and
+tested, not a blanket source bonus/ban inferred from a few outcomes.
+
+Decision-complete proposed sequence:
+
+1. Pilot a personalized Popular order first. Keep exactly its existing
+   HN gravity shortlist (32 pre-dedup rows per window), then blend within-
+   shortlist preference and gravity rank percentiles 70/30 before serving.
+   Keep badge predicates and the other feeds fixed; use pure gravity for
+   profiles without a trained preference model. This preserves HN/popularity
+   scope while testing the strongest available improvement.
+2. Separately test Explore eligibility before entropy/novelty: keep a small
+   discovery budget, favor under-covered liked interests, and allow fewer
+   picks instead of filling with predicted dislikes. Calibrate/validate a
+   quality floor on earlier out-of-fold predictions; do not turn a raw
+   percentile score into a supposedly absolute probability threshold.
+3. Audit individual weak subscriptions/topics and provide reversible source
+   controls; retain sources with useful past outcomes. Avoid more global
+   source-weight or encoder tuning until the selection tests have results.
+4. Run control vs pilot in randomized deck/session blocks for profile 151,
+   logging the actual policy arm on both clients. Compare upvotes AND
+   downvotes per unique first impression, stratified by window/source;
+   preserve rated fraction and discovery breadth as checks. Inspect after
+   about 200 unique Popular stories per arm, continuing if uncertainty is
+   wide. Few upvotes make an early apparent increase unreliable. Keep all
+   feature/summary changes fixed during the trial; unvoted is not a downvote.
+
+Independent audit passed: train cutoff before test, no train/test story-ID
+overlap, URL isolation in the evaluator, complete reaction/score alignment,
+finite probability bounds, HN-only Popular, and recount of every selected
+card's up/neutral/down/unvoted result. VPS batch used one CPU, 3G cap and
+one library thread; peak observed load 0.80, after completion 0.66, RAM
+available 5.3G. Owned runner exited; no production DB, code or service
+changed. Private reports, scripts, audit and logs are retained on the
+laptop in `~/.local/state/hn-rerank-eval/policy-analysis-20261002/`, with the
+prediction/policy/production reports also retained on the VPS at that path.
+
+## Live logs and impression yields — 2026-10-02 20:58 UTC
+
+Read-only review of the VPS service and profile 151. Checkout/deployment
+`176cc59`; service active/running, started 20:34:33 UTC. SQLite was opened
+with `mode=ro`, `query_only=ON`, inside one read transaction. No production
+code, database, service or parked fix was changed.
+
+Impression snapshot captured 20:58:18 UTC. Since Sep 30 00:00 UTC there are
+947 impression events for 473 unique stories across 22 client sessions;
+433 stories were new to this profile's logged history. Each story counts
+once, attributed to its first impression's feed in this interval. Votes
+are the current persisted reaction updated after that first impression,
+not a historical vote-event ledger. 131 stories have no such reaction.
+No vote-before-impression discrepancies with the existing report's join
+were found; one reaction update had no logged impression in this interval.
+
+| first feed | shown | up | neutral | down | unvoted | up / shown | down / voted |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Recommended | 206 | 25 | 61 | 68 | 52 | 12.1% | 44.2% |
+| Popular | 177 | 6 | 26 | 102 | 43 | 3.4% | 76.1% |
+| Explore | 90 | 1 | 6 | 47 | 36 | 1.1% | 87.0% |
+
+These are observed yields with different candidate/source populations,
+not a controlled test of ranking quality. Today (NY midnight, 04:00 UTC),
+Recommended is 3/69 up (4.3%), Popular 3/62 (4.8%), Explore 0/5. The
+multi-day Recommended advantage does not describe today's slice equally.
+
+Canonical HN classification includes `hn`, `ch_seed`, `bq_seed`; the
+parked archive-classification defect in `badge_yield_report.py` was not
+used for this review's source totals. Across first-feed stories: HN 9/271
+up, Reddit RSS 3/95, other RSS 20/107. Within Recommended, other RSS yields
+20/87 up (23.0%), HN 3/47 (6.4%), Reddit 2/72 (2.8%). Source mix explains
+much of the observed feed difference; these small source slices are not
+proof of causal source/ranker effects.
+
+Deduplicating within Popular separately (so cross-feed overlap is allowed)
+gives 189 stories, all canonical HN. Its first Popular window per story:
+
+| window | shown | up | neutral | down | unvoted | up / shown |
+|---|---:|---:|---:|---:|---:|---:|
+| 12h | 114 | 6 | 14 | 66 | 28 | 5.3% |
+| 1d | 59 | 1 | 15 | 37 | 6 | 1.7% |
+| 1w | 11 | 0 | 3 | 2 | 6 | 0% |
+| 1m | 4 | 0 | 0 | 0 | 4 | 0% |
+| archive | 1 | 0 | 0 | 0 | 1 | 0% |
+
+Longer-window results are too sparse to compare. Since the badge restart
+there are only five logged impressions, five distinct stories (four
+Popular, one Recommended), all unvoted. Popular combinations: Hot only 2,
+Hot+Talk 1, no Popular badge 1; an Explore badge can also coexist. Stacking
+is present in the ledger, but there is no outcome sample for evaluating
+the new predicates. Historical badge rates mix older badge definitions.
+
+Only `impression` events exist for this profile. The TUI records a selected
+card after at least one second and sends telemetry best-effort; these
+counts are neither all rendered cards nor article clicks/dwell time.
+Event arrival delay in this interval: median 1.08s, max 2.94s.
+
+24-hour journal snapshot (first/last timestamped lines Oct 1 21:03 to
+Oct 2 20:59 UTC), 15,382 lines. ANSI escape codes were stripped before
+parsing HTTP statuses, including colored 204 cache misses:
+
+- 3,254 logged API/dashboard requests: 2,358 HTTP 200 and 896 HTTP 204.
+  No 4xx/5xx, Python tracebacks or application ERROR/CRITICAL logs.
+  Four stop/start sequences show exit 143 during service stops; this is
+  separate from the active new process's health.
+- 378 generated detail summaries: median 2.76s, p95 5.06s, max 21.86s.
+  38 generations across 19 distinct stories (10.1% of generated details)
+  fell back to Article-only because the Discussion result was unusable;
+  they were served successfully but not cached. All corresponding warning
+  statuses were `None`, so these lines alone do not establish an HTTP
+  provider failure or the exact rejection cause. Repeated partials include
+  49934012 twice within seven seconds. The known TLDR diagnosis stays parked.
+- 214 profile-151 ranking rebuilds: median 7.20s, p95 15.00s, max 61.77s
+  at 15:37:37 UTC. 189 were model-cache misses. These are rebuild durations,
+  not cached feed request latency. Post-restart: three rebuilds, median
+  10.31s, max 30.73s; the slowest was startup warm-up.
+- 102 Reddit limiter 429 warnings, eight slow embedding batches and one
+  live-comments probe timeout. Article-fetch batch totals: 5,424 successes,
+  126 failures (2.3%); mostly 403s/timeouts, with some connection errors.
+- Post-badge restart through 20:59: 103 logged requests, all 200/204,
+  14 generated summaries (median 2.53s, max 4.32s), one article-only fallback.
+
+Durable private evidence and read-only analysis scripts:
+`~/.local/state/hn-rerank-eval/log-impressions-20261002/` (JSON snapshots
+and Python scripts; raw journals remain in `/tmp`). This review supports
+prioritizing discussion-summary completeness and rebuild latency in a
+future authorized fix; Popular/Explore yields remain weak, and the badge
+update is too recent to evaluate.
+
 ## Independent Popular badges — 2026-10-02
 
 Live read before the change, profile 151, 20:08:55 UTC: every visible card

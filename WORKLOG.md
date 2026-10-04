@@ -1,5 +1,15 @@
 # Worklog: hn-rewrite
 
+## 2026-10-03 TUI footer is always one row
+
+- User: the TUI status bar took 3 lines; make it 1 and tint it and the top
+  bar slightly. `clients/tui/src/hn_rerank/app.py`: footer is `height: 1`
+  with no top rule; status (1fr, ellipsis) left, keys right. Keys pick the
+  longest hint that fits from a per-mode ladder down to `? help` before the
+  status is cut. New `chrome` palette color on `#filters` and `#footer`.
+- Footer tests rewritten to the one-row contract plus a tint check; TUI
+  suite 162 passed, ruff/ty clean. Not yet seen in a real terminal.
+
 ## 2026-10-02 Popular badges stack independently
 
 - User approved independent badges and selected Top >=100 points, Talk

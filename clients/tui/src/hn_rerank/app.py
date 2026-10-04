@@ -81,6 +81,7 @@ DARK_PALETTE: dict[str, str] = {
     "surface": "#222222",
     "panel": "#292724",
     "bar": "#1D1C1A",
+    "chrome": "#262420",
     "modal": "#1C1B19",
     "button-focus": "#2E2B27",
     "border": "#44403B",
@@ -105,6 +106,7 @@ LIGHT_PALETTE: dict[str, str] = {
     "surface": "#F0EBE3",
     "panel": "#E8E2D8",
     "bar": "#F2EDE5",
+    "chrome": "#ECE5D9",
     "modal": "#F2EDE5",
     "button-focus": "#E0D8CB",
     "border": "#CFC7BA",
@@ -607,7 +609,7 @@ class Reader(App[None]):
     TITLE = "HN Rerank"
     CSS = """
     Screen { background: $hn-bg; color: $hn-fg; }
-    #filters { height: 2; align-vertical: top; }
+    #filters { height: 2; align-vertical: top; background: $hn-chrome; }
     Select { width: auto; height: auto; display: none; }
     .filter-caption { width: auto; height: 1; padding: 0 1 0 2; color: $hn-faint; display: none; }
     .narrow .filter-caption { display: block; }
@@ -624,7 +626,7 @@ class Reader(App[None]):
     Tab { color: $hn-muted; padding: 0 1; }
     Tab.-active { color: $hn-accent; text-style: bold; }
     Tabs:focus Tab.-active { text-style: bold underline; }
-    Underline > .underline--bar { color: $hn-accent; background: $hn-bg; }
+    Underline > .underline--bar { color: $hn-accent; background: $hn-chrome; }
     #panes { height: 1fr; }
     #headlines { width: 1fr; height: 1fr; background: $hn-bg;
                  border: solid $hn-bg; padding: 0; }
@@ -652,19 +654,13 @@ class Reader(App[None]):
     MarkdownFence { background: $hn-surface; margin: 0 0 1 0; padding: 1; }
     #summary MarkdownBlock > .strong { color: $hn-accent; text-style: bold; }
     #summary MarkdownBlock > .em { color: $hn-accent; }
-    #footer { dock: bottom; layout: horizontal; height: auto; background: $hn-bar;
-              border-top: solid $hn-rule; }
-    #status { width: auto; height: 1; padding: 0 1; color: $hn-muted;
+    #footer { dock: bottom; layout: horizontal; height: 1; background: $hn-chrome; }
+    #status { width: 1fr; height: 1; padding: 0 1; color: $hn-muted;
               text-wrap: nowrap; text-overflow: ellipsis; }
     #status.context { color: $hn-soft; }
     #status.error { color: $hn-bad; text-style: bold; }
-    #shortcuts { width: 1fr; height: auto; padding: 0 1; color: $hn-faint;
-                 text-align: right; }
-    .stacked-footer #footer { layout: vertical; }
-    .stacked-footer #status { width: 1fr; }
-    .stacked-footer #shortcuts { text-align: left; }
-    .compact #status { width: 1fr; }
-    .compact #shortcuts { width: auto; }
+    #shortcuts { width: auto; height: 1; padding: 0 1; color: $hn-faint;
+                 text-wrap: nowrap; }
     .narrow Tabs { display: none; }
     .narrow Select { display: block; }
     .narrow #panes { layout: vertical; }
@@ -761,9 +757,11 @@ class Reader(App[None]):
         self.help_open = False
         self.setting_up = False
         self.status_mode = "context"
-        # Footer texts, to put status and hints on one row when both fit.
+        # Footer texts: the keys shrink through hint_options (longest first)
+        # so the status and keys share the single footer row.
         self.status_text = ""
-        self.hints_text = ""
+        self.hint_options: list[str] = ["? help"]
+        self.hints_text = "? help"
         self.last_error: str | None = None
         # The server's counts version at the last poll (None until seen).
         self.counts_version: int | None = None
@@ -884,12 +882,9 @@ class Reader(App[None]):
         widget.set_class(error, "error")
         widget.set_class(False, "context")
         self.fit_footer(status=text)
-        # The row is the full width once stacked (beside the short hint in a
-        # short pane); cut the middle so the subject and an actionable tail
-        # ("Press r to retry.") both survive.
-        room = self.size.width - 2
-        if self.has_class("compact"):
-            room -= _cell_len(self.hints_text) + 2
+        # Cut the middle to fit beside the keys, so the subject and an
+        # actionable tail ("Press r to retry.") both survive.
+        room = self.size.width - 2 - (_cell_len(self.hints_text) + 2)
         widget.update(fit_middle(text, room))
 
     def context_status(self) -> None:
@@ -1928,27 +1923,34 @@ class Reader(App[None]):
         self.set_class(self.reading, "reading")
         votes = "1 up · 2 neutral · 3 down → next story"
         if compact:
-            # A short pane keeps the footer to one row; ? help lists the keys.
-            hints = "? help"
-        elif narrow:
-            # Narrow hints may wrap; the badge key stays listed in ? help.
-            if self.reading:
-                hints = f"j/k story · Space page · Enter/Esc back · {votes}"
-            elif self.can_read:
-                hints = f"Enter zoom · {votes} · ? help"
-            else:
-                hints = f"j/k move · {votes} · ? help"
+            # A short pane shows only ? help, which lists the keys.
+            keys: list[str] = []
         elif self.reading:
-            hints = (
+            keys = [
                 f"j/k story · Space page · Enter/Esc back · {votes} · b badges"
-                " · ? help · q quit"
-            )
+                " · ? help · q quit",
+                f"j/k story · Space page · Enter/Esc back · {votes} · ? help",
+                f"Enter/Esc back · {votes} · ? help",
+                "Enter/Esc back · 1/2/3 vote · ? help",
+                "Enter/Esc back · ? help",
+            ]
         elif self.can_read:
-            hints = f"j/k move · Enter zoom · {votes} · b badges · ? help · q quit"
+            keys = [
+                f"j/k move · Enter zoom · {votes} · b badges · ? help · q quit",
+                f"j/k move · Enter zoom · {votes} · ? help",
+                f"Enter zoom · {votes} · ? help",
+                "Enter zoom · 1/2/3 vote · ? help",
+                "Enter zoom · ? help",
+            ]
         else:
-            hints = f"j/k move · {votes} · b badges · ? help · q quit"
-        self.query_one("#shortcuts", Static).update(hints)
-        self.fit_footer(hints=hints, width=width)
+            keys = [
+                f"j/k move · {votes} · b badges · ? help · q quit",
+                f"j/k move · {votes} · ? help",
+                f"{votes} · ? help",
+                "1/2/3 vote · ? help",
+            ]
+        self.hint_options = [*keys, "? help"]
+        self.fit_footer(width=width)
         if compact_changed and (selected := self.selected()):
             self.query_one("#story-heading", Static).update(self.heading(selected))
 
@@ -1961,21 +1963,21 @@ class Reader(App[None]):
         self,
         *,
         status: str | None = None,
-        hints: str | None = None,
         width: int | None = None,
     ) -> None:
-        """One footer row (status left, keys right) when both fit; otherwise
-        stack them so the status keeps the full width."""
+        """One footer row: status left, the longest key hints that fit right.
+        The keys shrink to "? help" before the status is cut."""
         if status is not None:
             self.status_text = status
-        if hints is not None:
-            self.hints_text = hints
         width = self.size.width if width is None else width
         # Each widget pads one cell per side; keep a gap of two between them.
-        needed = _cell_len(self.status_text) + _cell_len(self.hints_text) + 6
-        # A short pane never stacks: the status is cut to fit beside the keys.
-        stacked = needed > width and not self.has_class("compact")
-        self.set_class(stacked, "stacked-footer")
+        room = width - _cell_len(self.status_text) - 6
+        self.hints_text = next(
+            (h for h in self.hint_options if _cell_len(h) <= room),
+            self.hint_options[-1],
+        )
+        if self.query("#shortcuts"):
+            self.query_one("#shortcuts", Static).update(self.hints_text)
 
     @property
     def can_read(self) -> bool:

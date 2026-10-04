@@ -209,10 +209,11 @@ async def test_narrow_footer_keeps_status_visible() -> None:
         await settle(pilot)
         status = app.query_one("#status").region
         hints = app.query_one("#shortcuts").region
-        # Stacked rows: status keeps the full width instead of being squeezed out.
-        assert status.width == hints.width > 40
-        assert status.y < hints.y
-        assert hints.height == 2
+        # One row: the keys shrink so the counts line stays whole beside them.
+        assert app.query_one("#footer").region.height == 1
+        assert status.y == hints.y and status.right <= hints.x
+        assert str(app.query_one("#status", Static).content).endswith("−0")
+        assert str(app.query_one("#shortcuts", Static).content).endswith("? help")
 
 
 async def test_wide_footer_is_one_row() -> None:
@@ -225,17 +226,18 @@ async def test_wide_footer_is_one_row() -> None:
         assert status.y == hints.y
         assert status.height == hints.height == 1
         assert status.right <= hints.x
-        # A long message no longer fits beside the keys, so the footer stacks.
+        assert "b badges" in str(app.query_one("#shortcuts", Static).content)
+        # A long message keeps the row: the keys shrink to "? help".
         app.status("x" * 80)
         await pilot.pause()
-        status = app.query_one("#status").region
-        hints = app.query_one("#shortcuts").region
-        assert status.y < hints.y
-        # The counts line brings the single row back.
+        assert app.query_one("#footer").region.height == 1
+        assert "b badges" not in str(app.query_one("#shortcuts", Static).content)
+        assert str(app.query_one("#status", Static).content) == "x" * 80
+        # The counts line brings the full keys back.
         app.status_mode = "context"
         app.context_status()
         await pilot.pause()
-        assert app.query_one("#status").region.y == app.query_one("#shortcuts").region.y
+        assert "b badges" in str(app.query_one("#shortcuts", Static).content)
 
 
 @pytest.mark.parametrize("size", [(51, 37), (80, 30), (140, 40)])
@@ -695,16 +697,15 @@ async def test_narrow_footer_fits_error_and_zoom_shortcuts() -> None:
         hints = app.query_one("#shortcuts").region
         footer = app.query_one("#footer").content_region
         # A long message is cut to one row with an ellipsis, never wrapped.
-        assert status.height == 1
-        assert status.bottom <= hints.y
-        assert hints.bottom <= footer.bottom
+        assert status.height == footer.height == 1
+        assert status.y == hints.y and status.right <= hints.x
         # The cut is in the middle: what to do next stays readable.
         app.status("Vote not confirmed by the server. " * 3 + "Press r to retry.")
         await pilot.pause()
         shown = str(app.query_one("#status", Static).content)
-        assert shown.startswith("Vote not confirmed") and "…" in shown
+        assert shown.startswith("Vote not confirm") and "…" in shown
         assert shown.endswith("Press r to retry.")
-        assert len(shown) <= 51 - 2
+        assert len(shown) <= 51 - 2 - len("? help") - 2
 
 
 def test_fit_middle_keeps_both_ends_within_width() -> None:
@@ -741,6 +742,10 @@ async def test_clock_switch_restyles_css_and_rich_text(
         await pilot.pause()
         assert app.theme == "editorial-light"
         assert app.screen.styles.background.hex.upper() == LIGHT_PALETTE["bg"]
+        # Top and bottom bars share a tint that sets them off from the page.
+        for bar in ("#filters", "#footer"):
+            tint = app.query_one(bar).styles.background.hex.upper()
+            assert tint == LIGHT_PALETTE["chrome"] != LIGHT_PALETTE["bg"]
         listing = app.query_one(OptionList)
         styles = {
             str(span.style)
@@ -824,4 +829,8 @@ async def test_short_pane_keeps_footer_and_heading_compact() -> None:
         await pilot.resize_terminal(64, 40)
         await pilot.pause()
         assert "Because you upvoted: Earlier" in str(heading.content)
-        assert "j/k story" in str(hints.content)
+        # The error keeps the row; the counts line brings the keys back.
+        assert str(hints.content) == "? help"
+        app.status_mode = "context"
+        app.context_status()
+        assert "Enter/Esc back" in str(hints.content)

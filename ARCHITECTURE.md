@@ -870,7 +870,8 @@ the linked domain, and leaves out a non-HN story's zero points or comments
 heading adds the web card's "Because you upvoted: …" line
 (`best_match_title`), and a summary wait counts up ("Loading summary… 5s").
 Panes under 30 rows (`COMPACT_HEIGHT`, e.g. a small tmux split) drop that
-line and keep the footer to one row: the status, cut to fit, beside "? help". Story JSON now includes badge details (kind/icon/label/tooltip) and card
+line and show only "? help" in the footer. The footer is always one row
+(2026-10-03): on any pane the keys shrink to fit beside the status. Story JSON now includes badge details (kind/icon/label/tooltip) and card
 presentation fields. The browser keeps server-rendered initial paint but uses
 `/api/feed` JSON for refills, building DOM nodes with textContent instead of
 injecting story text as HTML. Feed orders retain production
