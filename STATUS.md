@@ -17,9 +17,10 @@ larger budget (follow-up request, same day).
 - Article budget tiers: base under 10k chars, +1 bullet / +30 words from
   10k, +2 / +60 from 20k (doubled for article-only). Discussions are
   unchanged. Tiers are in docs/tldr-pane-budget.md.
-- Deployed `06ce5bc` (rollback tag `deploy-pre-tldr-sections`); smoke test
-  clean. Live Import AI 475 now has one bullet per news item (5 of 6 sections)
-  but omits the closing Tech Tales story, which is in the stored text.
+- Deployed `e10d492` (detail-v16; rollback tag `deploy-pre-tldr-feed-copy`):
+  the prompt sends an RSS feed's copy of the article once, and closing stories
+  count as sections. Live Import AI 475: 6 bullets, one per section in order,
+  Tech Tales included; smoke test clean.
 
 ## Blocker / limits
 - RSS `self_text` is still clipped at 8,000 chars at ingest; with a fetched
@@ -28,8 +29,7 @@ larger budget (follow-up request, same day).
   preserved and uncommitted.
 
 ## Next step
-- detail-v16 (feed copy sent once; closing stories named as sections) is
-  committed; deploy it, regenerate `-693920591`, and check that Tech Tales
-  appears.
+- None for this objective. Watch other long multi-item posts; budgets and the
+  feed-copy rule are in docs/tldr-pane-budget.md.
 - The user still needs to check the footer and tint from 2026-10-03 in a real
   terminal.

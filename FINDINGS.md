@@ -48,6 +48,10 @@ summarize a different section and every section covered.
   feed-only "Welcome to Import AI" preface and a list line jusText dropped).
   The article prompts now name closing stories, fiction and personal notes as
   sections. detail-v16.
+- Deployed `e10d492` at 18:03 UTC (rollback tag `deploy-pre-tldr-feed-copy`).
+  Live regeneration of `-693920591` (3.8s): 6 bullets / 258 words, one per
+  section in order, including the Tech Tales story. Repeat read was a cache
+  hit, and the journal since the restart has no errors.
 
 ## TUI one-row footer and bar tint — 2026-10-03
 
