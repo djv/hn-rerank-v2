@@ -17,19 +17,19 @@ larger budget (follow-up request, same day).
 - Article budget tiers: base under 10k chars, +1 bullet / +30 words from
   10k, +2 / +60 from 20k (doubled for article-only). Discussions are
   unchanged. Tiers are in docs/tldr-pane-budget.md.
-- Local tests only; the change has not been run against the live model.
+- Deployed `06ce5bc` (rollback tag `deploy-pre-tldr-sections`); smoke test
+  clean. Live Import AI 475 now has one bullet per news item (5 of 6 sections)
+  but omits the closing Tech Tales story, which is in the stored text.
 
 ## Blocker / limits
-- Not deployed: SSH to the VPS needs the key's passphrase (`ssh-add`), and
-  the agent's SSH agent had no key loaded.
-- RSS `self_text` is clipped at 8,000 chars and probably duplicates the
-  opening of the article body in the prompt. That is left unchanged and is
-  recorded in FINDINGS.md.
+- RSS `self_text` (clipped at 8,000 chars) duplicates the opening of the
+  article body in the prompt; confirmed for Import AI 475. Left unchanged.
 - Unrelated TUI test edit, mockups, TLDR inspect script and kernel log are
   preserved and uncommitted.
 
 ## Next step
-- Deploy (docs/TUI_RELEASE.md), regenerate story `-693920591`, and check that
-  all six Import AI 475 items appear in the summary.
+- Possible follow-up for the missing closing story: send the article body
+  only when the feed text is its copy, and name fiction or a closing story as
+  a section in the article prompts. Awaits the user's decision.
 - The user still needs to check the footer and tint from 2026-10-03 in a real
   terminal.

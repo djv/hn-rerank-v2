@@ -30,9 +30,18 @@ summarize a different section and every section covered.
   halves get 4-5 bullets / 150 words from 10k chars and 5-6 / 180 from 20k
   (article-only doubles that); discussions keep the base. Bullet caps and
   output-token ceilings scale with the tier. Length is the longer of
-  self_text and body, so the RSS feed copy is not counted twice. Import AI 475
-  (~10.5k chars) lands in the middle tier: 8-10 bullets, 300 words.
-- Not yet deployed or checked against the live model.
+  self_text and body, so the RSS feed copy is not counted twice.
+- Deployed `06ce5bc` to the VPS at 17:39 UTC (rollback tag
+  `deploy-pre-tldr-sections`, previously `176cc59`; provider mistral). Dashboard
+  200, feed OK, repeat read a cache hit, no errors in the journal since restart.
+- Live regeneration of `-693920591` (4.5s): 5 bullets / 325 words, one per news
+  item in order (swarm scaling, self-governance polls, SynthID Bio, SciUniverse,
+  science economy), but the closing Tech Tales story is still missing. The VPS
+  row has self_text 8,000 chars (feed clip) and article_body 9,804 chars that
+  does contain the story (@8,535), so the model saw it and skipped it. 9,804
+  chars is under 10k, so this story got the base budget (6-8 bullets, 240
+  words), not the middle tier; the model wrote 5 bullets and overshot words.
+  The prompt still carries the first 8k twice (Author's text plus Article body).
 
 ## TUI one-row footer and bar tint — 2026-10-03
 

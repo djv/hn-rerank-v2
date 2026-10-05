@@ -11247,3 +11247,7 @@ half (article-only doubles that). Discussions keep the base. The bullet cap and
 output-token ceiling (`_section_max_tokens`) scale with it, and the article's
 length is the longer of self_text and body, not their sum. Still detail-v15,
 since v15 was never deployed. Tiers: `docs/tldr-pane-budget.md`.
+
+Deployed `06ce5bc` to the VPS (rollback tag `deploy-pre-tldr-sections`). Live
+Import AI 475 now gets one bullet per news item (5) but still omits the closing
+Tech Tales story; details in FINDINGS.md.
