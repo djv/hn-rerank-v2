@@ -22,14 +22,14 @@ larger budget (follow-up request, same day).
   but omits the closing Tech Tales story, which is in the stored text.
 
 ## Blocker / limits
-- RSS `self_text` (clipped at 8,000 chars) duplicates the opening of the
-  article body in the prompt; confirmed for Import AI 475. Left unchanged.
+- RSS `self_text` is still clipped at 8,000 chars at ingest; with a fetched
+  body it is now dropped from the prompt when it is the feed's copy.
 - Unrelated TUI test edit, mockups, TLDR inspect script and kernel log are
   preserved and uncommitted.
 
 ## Next step
-- Possible follow-up for the missing closing story: send the article body
-  only when the feed text is its copy, and name fiction or a closing story as
-  a section in the article prompts. Awaits the user's decision.
+- detail-v16 (feed copy sent once; closing stories named as sections) is
+  committed; deploy it, regenerate `-693920591`, and check that Tech Tales
+  appears.
 - The user still needs to check the footer and tint from 2026-10-03 in a real
   terminal.

@@ -5007,6 +5007,46 @@ async def test_generate_detailed_tldr_counts_feed_copy_of_article_once(
 
 
 @pytest.mark.asyncio
+async def test_generate_detailed_tldr_sends_feed_copy_of_body_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An RSS feed's copy of the fetched article is dropped from the prompt
+    (repeating the opening kept Import AI 475 on its lead item), while a
+    distinct author's text, or one the body only partly contains, stays."""
+    import server
+
+    prompts: list[str] = []
+
+    async def mock_call_llm_chat(
+        *, api_key, base_url, model, prompt, max_tokens, extra=None
+    ):
+        prompts.append(prompt)
+        return server.LlmChatResult(content="- **Item:** point", ok=True)
+
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_PROVIDER", "mistral")
+    monkeypatch.setattr(server, "_call_llm_chat", mock_call_llm_chat)
+
+    post = " ".join(f"w{i}" for i in range(2_000))
+    feed_copy = "Welcome to the newsletter. " + post[:8_000]
+    own_text = " ".join(f"own{i}" for i in range(300))
+    for self_text, body in (
+        (feed_copy, post),
+        (own_text, post),
+        (feed_copy, post[:2_000]),
+    ):
+        await server.generate_detailed_tldr(
+            "Newsletter", self_text=self_text, article_body=body
+        )
+
+    copy_prompt, own_prompt, partial_prompt = prompts
+    assert "Author's text:" not in copy_prompt
+    assert "Article body:" in copy_prompt
+    assert "Author's text:" in own_prompt
+    assert "Author's text:" in partial_prompt
+
+
+@pytest.mark.asyncio
 async def test_call_llm_chat_uses_limiter(monkeypatch):
     import server
 

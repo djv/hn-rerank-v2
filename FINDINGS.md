@@ -42,6 +42,12 @@ summarize a different section and every section covered.
   chars is under 10k, so this story got the base budget (6-8 bullets, 240
   words), not the middle tier; the model wrote 5 bullets and overshot words.
   The prompt still carries the first 8k twice (Author's text plus Article body).
+- Follow-up (user chose both fixes): `_is_feed_copy` drops the RSS self text
+  from the prompt when most of ten 8-word runs from it appear in the article
+  body. On the real Import AI 475 texts 9 of 10 runs match (the misses are the
+  feed-only "Welcome to Import AI" preface and a list line jusText dropped).
+  The article prompts now name closing stories, fiction and personal notes as
+  sections. detail-v16.
 
 ## TUI one-row footer and bar tint — 2026-10-03
 

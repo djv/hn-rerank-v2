@@ -11251,3 +11251,8 @@ since v15 was never deployed. Tiers: `docs/tldr-pane-budget.md`.
 Deployed `06ce5bc` to the VPS (rollback tag `deploy-pre-tldr-sections`). Live
 Import AI 475 now gets one bullet per news item (5) but still omits the closing
 Tech Tales story; details in FINDINGS.md.
+
+Follow-up (detail-v16): the prompt no longer sends an RSS feed's copy of the
+article beside the fetched body (`_is_feed_copy` samples ten 8-word runs), and
+the article prompts count closing stories, fiction and personal notes as
+sections. Full backend suite 1,078 passed.

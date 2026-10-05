@@ -57,3 +57,13 @@ Discussions always keep the base budget.
 The bullet cap and the output-token ceiling grow with each tier, so the extra
 bullets are kept and the longer output is not truncated. Summaries of long
 articles can overflow the 240-word pane; Enter zooms the summary in the TUI.
+
+## Feed copies sent once; closing stories (detail-v16)
+
+When a story's self text is the RSS feed's copy of the fetched article (most
+of ten sampled 8-word runs appear in the body), the prompt sends only the
+article body. Sending both repeated the post's opening. A self text that
+differs from the body, or that the body only partly contains, is still sent.
+The article prompts also name a newsletter's later items and any closing
+story, fiction or personal note as sections. Cause: the live detail-v15
+Import AI 475 summary covered every news item but skipped Tech Tales.

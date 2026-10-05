@@ -81,7 +81,7 @@ ARTICLE_SECTION_MIN_CHARS = 500
 REDDIT_COMMENTS_CACHE_CHAR_LIMIT = 10_000
 REDDIT_COMMENT_LIMIT = 40
 REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dashboard"
-TLDR_PROMPT_VERSION = "detail-v15"
+TLDR_PROMPT_VERSION = "detail-v16"
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
 _PROMPT_CACHE: dict[str, str] = {}
 
@@ -1255,6 +1255,21 @@ def _section_budget(article_chars: int = 0, *, single_section: bool = False) -> 
     )
 
 
+def _is_feed_copy(text: str, body: str) -> bool:
+    """Whether ``text`` (an RSS feed's copy of the post) is already in ``body``.
+
+    Samples ten 8-word runs across the text and needs most of them in the
+    body, so a preface or list line the extractor dropped still counts.
+    """
+    words = text.split()
+    if len(words) < 16:
+        return False
+    haystack = " ".join(body.split())
+    step = max(1, (len(words) - 8) // 9)
+    runs = [" ".join(words[i : i + 8]) for i in range(0, len(words) - 8, step)][:10]
+    return sum(run in haystack for run in runs) * 2 > len(runs)
+
+
 async def generate_detailed_tldr(
     title: str,
     self_text: str = "",
@@ -1271,19 +1286,20 @@ async def generate_detailed_tldr(
             error_text="LLM API key not configured in environment.",
         )
 
+    author_text = self_text[:SELF_TEXT_PROMPT_CHAR_LIMIT]
+    body = article_body[:ARTICLE_BODY_CHAR_LIMIT]
     article_section = ""
-    if self_text and len(self_text) >= SELF_TEXT_PROMPT_MIN_CHARS:
-        article_section += f"Author's text:\n{self_text[:SELF_TEXT_PROMPT_CHAR_LIMIT]}"
-    if article_body:
-        article_section += (
-            f"\n\nArticle body:\n{article_body[:ARTICLE_BODY_CHAR_LIMIT]}"
-        )
+    # Sending an RSS feed's copy beside the fetched body repeats the post's
+    # opening, which kept Import AI 475's summary on its lead item.
+    if len(author_text) >= SELF_TEXT_PROMPT_MIN_CHARS and not (
+        body and _is_feed_copy(author_text, body)
+    ):
+        article_section += f"Author's text:\n{author_text}"
+    if body:
+        article_section += f"\n\nArticle body:\n{body}"
     # RSS self_text is usually the feed's copy of the article body, so the
     # longer of the two, not their sum, is the article's length.
-    article_chars = max(
-        len(self_text[:SELF_TEXT_PROMPT_CHAR_LIMIT]),
-        len(article_body[:ARTICLE_BODY_CHAR_LIMIT]),
-    )
+    article_chars = max(len(author_text), len(body))
     comments_section = top_comments[:COMMENT_PROMPT_CHAR_LIMIT]
     if pointer_thread_target(top_comments, source_id=0) is not None:
         # "Comments moved to item?id=N" is not a discussion; summarizing it
