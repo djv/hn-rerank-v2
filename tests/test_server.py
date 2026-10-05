@@ -302,18 +302,22 @@ def test_prompts_render_budget_placeholder(template: str, fields: dict) -> None:
         **fields,
     )
     assert "3-4 bullets, aim for 120 words" in prompt
-    assert "at most one `####` heading" in prompt
+    if template.startswith("discussion"):
+        assert "at most one `####` heading" in prompt
 
 
 @pytest.mark.parametrize("template", ["article_v4.txt", "article_only_v4.txt"])
 def test_article_prompts_require_full_piece_coverage(template: str) -> None:
     """Article prompts must instruct coverage of every major section — a
     lead-only summary drops trailing sections of long newsletters (Import AI
-    473 lost its third topic starting 88% into the text)."""
+    473 lost its third topic starting 88% into the text), and with no
+    one-bullet-per-section rule Import AI 475 spent all four bullets on its
+    first item."""
     import server
 
     prompt = server._load_prompt(template)
     assert "each major section" in prompt
+    assert "Give each bullet a different section" in prompt
 
 
 @pytest.mark.parametrize("template", ["discussion_only_v4.txt", "discussion_v4.txt"])

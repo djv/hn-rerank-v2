@@ -1,7 +1,11 @@
 Summarize the article for a knowledgeable reader.
 Use ONLY information from the article below.
-Cover each major section or topic of the piece, including material near the
-end — never summarize only the opening.
+Cover each major section or topic of the piece, in order, including material
+near the end (a newsletter's later items, a closing story) — never summarize
+only the opening. Give each bullet a different section; give a section a
+second bullet only once every section has its own. If there are more sections
+than bullets, cover the shorter ones together in one bullet rather than
+dropping any.
 
 Output ONE section only:
 
@@ -9,9 +13,8 @@ Output ONE section only:
 {budget}, summarizing the article.
 
 Markdown formatting:
-- FLAT structure only — no nested list levels.
-- Bullet points (-) with **bold** key terms.
-Use at most one `####` heading, and only when the section has three or more bullets.
+- FLAT structure only — no nested list levels and no `####` headings.
+- Bullet points (-), each starting with its section's topic in **bold**, with **bold** key terms.
 - Use one or two sentences per bullet to explain the finding, reasoning, or consequence.
 - Do not put multiple bullets on one line.
 

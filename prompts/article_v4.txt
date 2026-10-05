@@ -1,16 +1,16 @@
 Summarize the article for a knowledgeable reader.
 Use ONLY information from the text below.
-Cover each major section or topic of the piece, including material near the
-end — never summarize only the opening.
+Cover each major section or topic of the piece, in order, including material
+near the end (a newsletter's later items, a closing story) — never summarize
+only the opening. Give each bullet a different section; give a section a
+second bullet only once every section has its own. If there are more sections
+than bullets, cover the shorter ones together in one bullet rather than
+dropping any.
 {budget}, summarizing the article.
-Use a FLAT structure — no nested list levels. If a sub-topic has multiple bullets, use a `####` heading for the sub-topic followed by top-level bullets — NEVER use `- **Label**:` to introduce a group of content bullets. Example:
-#### Criticism of US control
-- Users compare this to...
-- **Precedent exists** in...
-(NOT `- **Criticism of US control**:` followed by siblings.)
+Use a FLAT structure — no nested list levels and no `####` headings.
+Start each bullet with its section's topic in **bold**, then use one or two
+sentences to explain the finding, reasoning, or consequence.
 Use **bold** key terms.
-Use one or two sentences per bullet to explain the finding, reasoning, or consequence.
-Use at most one `####` heading, and only when the section has three or more bullets.
 
 Title: {title}
 

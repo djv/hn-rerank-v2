@@ -1,5 +1,33 @@
 # HN Rerank findings
 
+## Import AI 475 TLDR covers only its first item — 2026-10-05
+
+User report: the Import AI 475 summary (jack-clark.net RSS, story id
+`-693920591`) does not cover the whole post; the user wants each bullet to
+summarize a different section and every section covered.
+- Live cached detail-v14 summary (read through `GET api/tldr-cache`): one
+  `####` heading, "Swarm scaling and AI capability development", over 4
+  bullets, all on the first of six items (swarm scaling, AI self-governance
+  polls, DeepMind biology watermarks, SciUniverse, DeepMind science economy,
+  Tech Tales story). It took the article-only path, whose budget already
+  allows 6-8 bullets.
+- The input was not the main gap. In a local run the server's extractor kept
+  9,804 chars / 1,587 of the page's 1,737 words, with all six items, far
+  under the 30k cap. The RSS `self_text` is clipped to 8,000 of 10,542
+  chars, which cuts the Tech Tales story (@9,258) and the end of the
+  science-economy item. The tap path skips the article fetch once
+  `self_text` is 500+ chars, but background enrichment fetches it, so the
+  prompt probably carries the first 8k twice (Author's text plus Article
+  body). The VPS row was not checked: the SSH agent had no key loaded.
+- Prompt cause: the article prompts asked for "each major section" but also
+  showed a `####` sub-topic example with several bullets under it, which
+  invites one heading and a deep dive into the lead item.
+- Change (detail-v15, `docs/tldr-pane-budget.md`): one bullet per section in
+  order, a second bullet for a section only after every section has one, and
+  the shorter sections share a bullet when sections outnumber bullets. Article
+  sections use no `####` headings. Budgets and the 8-bullet cap are unchanged.
+- Not yet deployed or checked against the live model.
+
 ## TUI one-row footer and bar tint — 2026-10-03
 
 User request: the TUI status bar took 3 lines (top rule plus status and

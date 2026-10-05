@@ -11227,3 +11227,16 @@ suite under the shared `batch` resource limits: 1024 passed, 18 skipped,
 `test_feedback_idle_threshold_queues_latest_warm` also failed when rerun
 alone under `batch` (delayed scheduling; no application code changed).
 The repository-wide test gate remains failing; those tests were not edited.
+
+## 2026-10-05 — TLDR: one bullet per article section (detail-v15)
+
+The user reported that the Import AI 475 summary covered only its first item
+(4 bullets on swarm scaling) and asked that each bullet cover a different
+section, with every section covered. Both article prompts now ask for one
+bullet per section in order, allow a second bullet for a section only after
+every section has one, and have shorter sections share a bullet when sections
+outnumber bullets. The `####` sub-topic example is gone from article prompts
+(discussion prompts keep it). `TLDR_PROMPT_VERSION` detail-v14 → v15 rotates
+cache keys. Summaries regenerate on demand and through prefetch; an old
+summary is served only as a fallback when the provider errors, is busy or
+over quota. Evidence is in FINDINGS.md. Not yet deployed.

@@ -29,3 +29,14 @@ bio-security summary regenerated successfully: 7 bullets / 414 whitespace-delimi
 words versus the previous 4 bullets / 564 characters. The model overshot the
 240-word target; this is a soft prompt budget, not a hard word cap. Actual TUI
 screen fit remains unverified. Bounded post-restart journal showed no errors.
+
+## Section coverage (detail-v15)
+
+Both article prompts now give each bullet a different section of the piece,
+in order, and cover every section, including late newsletter items and a
+closing story. A section gets a second bullet only after every section has
+one. When there are more sections than bullets, the shorter sections share
+one bullet instead of being dropped. Article sections use no `####` headings;
+each bullet starts with its section's topic in bold. The budgets above and
+the eight-bullet output cap are unchanged. Cause: Import AI 475 (2026-10-05)
+spent all four bullets on its first item; see FINDINGS.md.
