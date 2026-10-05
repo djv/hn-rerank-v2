@@ -6,13 +6,17 @@ Saved 2026-10-05. Previous handoff (TUI one-row footer):
 ## Objective
 Article summaries give each bullet a different section of the piece and
 cover every section (user request 2026-10-05, after the Import AI 475 summary
-spent all four bullets on its first item).
+spent all four bullets on its first item). Long articles get a slightly
+larger budget (follow-up request, same day).
 
 ## Verified result
 - Both article prompts ask for one bullet per section in order, and have
   shorter sections share a bullet when sections outnumber bullets. Article
   sections use no `####` headings. `TLDR_PROMPT_VERSION` is now detail-v15.
   Cause and evidence are in FINDINGS.md.
+- Article budget tiers: base under 10k chars, +1 bullet / +30 words from
+  10k, +2 / +60 from 20k (doubled for article-only). Discussions are
+  unchanged. Tiers are in docs/tldr-pane-budget.md.
 - Local tests only; the change has not been run against the live model.
 
 ## Blocker / limits

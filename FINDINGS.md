@@ -25,7 +25,13 @@ summarize a different section and every section covered.
 - Change (detail-v15, `docs/tldr-pane-budget.md`): one bullet per section in
   order, a second bullet for a section only after every section has one, and
   the shorter sections share a bullet when sections outnumber bullets. Article
-  sections use no `####` headings. Budgets and the 8-bullet cap are unchanged.
+  sections use no `####` headings.
+- Follow-up request ("slightly scale budget for longer articles"): article
+  halves get 4-5 bullets / 150 words from 10k chars and 5-6 / 180 from 20k
+  (article-only doubles that); discussions keep the base. Bullet caps and
+  output-token ceilings scale with the tier. Length is the longer of
+  self_text and body, so the RSS feed copy is not counted twice. Import AI 475
+  (~10.5k chars) lands in the middle tier: 8-10 bullets, 300 words.
 - Not yet deployed or checked against the live model.
 
 ## TUI one-row footer and bar tint — 2026-10-03

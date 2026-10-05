@@ -267,15 +267,25 @@ def test_env(tmp_path, mock_embedder):
     db.close()
 
 
-@pytest.mark.parametrize("size", [0, 1499, 1500, 5000, 10440, 12000, 20000, 30000])
-def test_fixed_pane_budget(size: int) -> None:
+@pytest.mark.parametrize(
+    ("article_chars", "combined", "single"),
+    [
+        (0, "3-4 bullets, aim for 120 words", "6-8 bullets, aim for 240 words"),
+        (9_999, "3-4 bullets, aim for 120 words", "6-8 bullets, aim for 240 words"),
+        (10_000, "4-5 bullets, aim for 150 words", "8-10 bullets, aim for 300 words"),
+        (19_999, "4-5 bullets, aim for 150 words", "8-10 bullets, aim for 300 words"),
+        (20_000, "5-6 bullets, aim for 180 words", "10-12 bullets, aim for 360 words"),
+        (46_000, "5-6 bullets, aim for 180 words", "10-12 bullets, aim for 360 words"),
+    ],
+)
+def test_pane_budget_grows_slightly_for_long_articles(
+    article_chars: int, combined: str, single: str
+) -> None:
     import server
 
-    assert server._section_budget(size, single_section=True).startswith(
-        "6-8 bullets, aim for 240 words"
-    )
-    assert server._section_budget(size).startswith("3-4 bullets, aim for 120 words")
-    assert "never pad or invent" in server._section_budget(size)
+    assert server._section_budget(article_chars).startswith(combined)
+    assert server._section_budget(article_chars, single_section=True).startswith(single)
+    assert "never pad or invent" in server._section_budget(article_chars)
 
 
 @pytest.mark.parametrize(
@@ -4873,13 +4883,27 @@ async def test_call_llm_responses_success_and_429(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "article_chars,comment_chars",
-    [(10_440, 0), (24_067, 0), (0, 24_000), (24_067, 13_000), (5_000, 24_000)],
+    ("article_chars", "comment_chars", "expected"),
+    [
+        (5_000, 0, [("Article", 240, 8, 1000)]),
+        (10_440, 0, [("Article", 300, 10, 1250)]),
+        (24_067, 0, [("Article", 360, 12, 1500)]),
+        (0, 24_000, [("Discussion", 240, 8, 1000)]),
+        (24_067, 13_000, [("Article", 180, 6, 675), ("Discussion", 120, 4, 450)]),
+        (5_000, 24_000, [("Article", 120, 4, 450), ("Discussion", 120, 4, 450)]),
+    ],
 )
-async def test_generated_tldr_preserves_fixed_pane_allowance(
-    monkeypatch: pytest.MonkeyPatch, article_chars: int, comment_chars: int
+async def test_generated_tldr_preserves_pane_allowance(
+    monkeypatch: pytest.MonkeyPatch,
+    article_chars: int,
+    comment_chars: int,
+    expected: list[tuple[str, int, int, int]],
 ) -> None:
+    """Each section gets its word target, token ceiling and bullet cap: long
+    articles slightly more, discussions always the base."""
     import server
+
+    calls: dict[str, tuple[str, int]] = {}
 
     async def fake_call(
         cfg: server.LlmProviderConfig,
@@ -4888,8 +4912,8 @@ async def test_generated_tldr_preserves_fixed_pane_allowance(
         max_tokens: int,
         on_usage: server.LlmUsageRecorder | None = None,
     ) -> server.LlmChatResult:
-        words = 120 if article_chars and comment_chars else 240
-        assert f"aim for {words} words" in prompt
+        label = "Article" if "Summarize the article" in prompt else "Discussion"
+        calls[label] = (prompt, max_tokens)
         return server.LlmChatResult(
             ok=True, content="\n".join(f"- Topic {i}" for i in range(1, 20))
         )
@@ -4904,10 +4928,13 @@ async def test_generated_tldr_preserves_fixed_pane_allowance(
     )
     assert result.kind == "ok"
     assert result.cacheable
+    assert sorted(calls) == sorted(label for label, *_ in expected)
     sections = [part for part in result.tldr.split("### ") if part.strip()]
-    expected = [4, 4] if article_chars and comment_chars else [8]
     assert len(sections) == len(expected)
-    for section, count in zip(sections, expected, strict=True):
+    for section, (label, words, count, tokens) in zip(sections, expected, strict=True):
+        prompt, max_tokens = calls[label]
+        assert f"aim for {words} words" in prompt
+        assert max_tokens == tokens
         assert section.count("- Topic ") == count
         assert f"- Topic {count}" in section
         assert f"- Topic {count + 1}" not in section
@@ -4948,6 +4975,35 @@ async def test_generate_detailed_tldr_combined_prompt_contract(
     assert "3-4 bullets, aim for 120 words" in discussion_prompt
     assert "Use **bold** key terms" in article_prompt
     assert "Use **bold** key terms in every content bullet" in discussion_prompt
+
+
+@pytest.mark.asyncio
+async def test_generate_detailed_tldr_counts_feed_copy_of_article_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RSS self_text is the feed's copy of the article, so it does not add to
+    the fetched body's length: 8k + 9k of the same post keeps the base budget."""
+    import server
+
+    calls: list[tuple[str, int]] = []
+
+    async def mock_call_llm_chat(
+        *, api_key, base_url, model, prompt, max_tokens, extra=None
+    ):
+        calls.append((prompt, max_tokens))
+        return server.LlmChatResult(content="- **Item:** point", ok=True)
+
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_PROVIDER", "mistral")
+    monkeypatch.setattr(server, "_call_llm_chat", mock_call_llm_chat)
+
+    await server.generate_detailed_tldr(
+        "Newsletter", self_text="x" * 8_000, article_body="x" * 9_000
+    )
+
+    [(prompt, max_tokens)] = calls
+    assert "6-8 bullets, aim for 240 words" in prompt
+    assert max_tokens == 1000
 
 
 @pytest.mark.asyncio

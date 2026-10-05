@@ -11240,3 +11240,10 @@ outnumber bullets. The `####` sub-topic example is gone from article prompts
 cache keys. Summaries regenerate on demand and through prefetch; an old
 summary is served only as a fallback when the provider errors, is busy or
 over quota. Evidence is in FINDINGS.md. Not yet deployed.
+
+Same day, at the user's request, long articles get a slightly larger budget:
+4-5 bullets / 150 words from 10k chars and 5-6 / 180 from 20k for the article
+half (article-only doubles that). Discussions keep the base. The bullet cap and
+output-token ceiling (`_section_max_tokens`) scale with it, and the article's
+length is the longer of self_text and body, not their sum. Still detail-v15,
+since v15 was never deployed. Tiers: `docs/tldr-pane-budget.md`.

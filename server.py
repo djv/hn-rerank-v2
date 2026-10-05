@@ -230,10 +230,10 @@ def _cap_tldr_structure(
 
 
 def _shape_tldr(
-    text: str, *, source_chars: int = 5_000, single_section: bool = False
+    text: str, *, article_chars: int = 0, single_section: bool = False
 ) -> str:
-    """Normalize Markdown and preserve the fixed reading-pane allowance."""
-    _, max_bullets, _ = _section_limits(source_chars)
+    """Normalize Markdown and preserve the reading-pane allowance."""
+    _, max_bullets, _ = _section_limits(article_chars)
     if single_section:
         max_bullets *= 2
     return _cap_tldr_structure(_normalize_tldr_markdown(text), max_bullets=max_bullets)
@@ -1225,14 +1225,27 @@ def _tldr_cache_key(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _section_limits(source_chars: int) -> tuple[int, int, int]:
-    """Fixed half-pane allowance; source length does not set the budget."""
+def _section_limits(article_chars: int = 0) -> tuple[int, int, int]:
+    """Half-pane allowance: bullet range and word target for one section.
+
+    Long articles get slightly more room; discussions (``article_chars=0``)
+    always get the base allowance.
+    """
+    if article_chars >= 20_000:
+        return 5, 6, 180
+    if article_chars >= 10_000:
+        return 4, 5, 150
     return 3, 4, 120
 
 
-def _section_budget(source_chars: int, *, single_section: bool = False) -> str:
-    """Fixed reading-pane budget; never depends on client dimensions."""
-    minimum, maximum, words = _section_limits(source_chars)
+def _section_max_tokens(base: int, article_chars: int = 0) -> int:
+    """Scale an output-token ceiling with the section's word target."""
+    return base * _section_limits(article_chars)[2] // _section_limits()[2]
+
+
+def _section_budget(article_chars: int = 0, *, single_section: bool = False) -> str:
+    """Reading-pane budget; never depends on client dimensions."""
+    minimum, maximum, words = _section_limits(article_chars)
     if single_section:
         minimum, maximum, words = minimum * 2, maximum * 2, words * 2
     return (
@@ -1265,6 +1278,12 @@ async def generate_detailed_tldr(
         article_section += (
             f"\n\nArticle body:\n{article_body[:ARTICLE_BODY_CHAR_LIMIT]}"
         )
+    # RSS self_text is usually the feed's copy of the article body, so the
+    # longer of the two, not their sum, is the article's length.
+    article_chars = max(
+        len(self_text[:SELF_TEXT_PROMPT_CHAR_LIMIT]),
+        len(article_body[:ARTICLE_BODY_CHAR_LIMIT]),
+    )
     comments_section = top_comments[:COMMENT_PROMPT_CHAR_LIMIT]
     if pointer_thread_target(top_comments, source_id=0) is not None:
         # "Comments moved to item?id=N" is not a discussion; summarizing it
@@ -1286,18 +1305,20 @@ async def generate_detailed_tldr(
         article_prompt = _load_prompt("article_v4.txt").format(
             title=title,
             article_section=article_section,
-            budget=_section_budget(len(article_section)),
+            budget=_section_budget(article_chars),
         )
         discussion_prompt = _load_prompt("discussion_v4.txt").format(
             title=title,
             comments_section=comments_section,
-            budget=_section_budget(len(comments_section)),
+            budget=_section_budget(),
         )
         article_result, discussion_result = await asyncio.gather(
             _call_llm_for_config(
                 cfg,
                 prompt=article_prompt,
-                max_tokens=_max_tokens_for_provider(cfg, 450),
+                max_tokens=_max_tokens_for_provider(
+                    cfg, _section_max_tokens(450, article_chars)
+                ),
                 on_usage=on_usage,
             ),
             _call_llm_for_config(
@@ -1308,13 +1329,11 @@ async def generate_detailed_tldr(
             ),
         )
         good: list[tuple[str, str]] = []
-        for label, result, source in (
-            ("Article", article_result, article_section),
-            ("Discussion", discussion_result, comments_section),
+        for label, result, chars in (
+            ("Article", article_result, article_chars),
+            ("Discussion", discussion_result, 0),
         ):
-            if result.ok and (
-                text := _shape_tldr(result.content, source_chars=len(source))
-            ):
+            if result.ok and (text := _shape_tldr(result.content, article_chars=chars)):
                 good.append((label, text))
         if len(good) == 2:
             return TldrResult(
@@ -1340,30 +1359,30 @@ async def generate_detailed_tldr(
         return TldrResult(kind="llm_error", error_text="empty LLM response")
 
     if article_section:
-        name, section = "article_only_v4.txt", article_section
-        prompt = _load_prompt(name).format(
+        chars = article_chars
+        prompt = _load_prompt("article_only_v4.txt").format(
             title=title,
-            article_section=section,
-            budget=_section_budget(len(section), single_section=True),
+            article_section=article_section,
+            budget=_section_budget(chars, single_section=True),
         )
     else:
-        name, section = "discussion_only_v4.txt", comments_section
-        prompt = _load_prompt(name).format(
+        chars = 0
+        prompt = _load_prompt("discussion_only_v4.txt").format(
             title=title,
-            comments_section=section,
-            budget=_section_budget(len(section), single_section=True),
+            comments_section=comments_section,
+            budget=_section_budget(single_section=True),
         )
 
     result = await _call_llm_for_config(
         cfg,
         prompt=prompt,
-        max_tokens=_max_tokens_for_provider(cfg, 1000),
+        max_tokens=_max_tokens_for_provider(cfg, _section_max_tokens(1000, chars)),
         on_usage=on_usage,
     )
     if result.ok:
         if text := _shape_tldr(
             result.content,
-            source_chars=len(section),
+            article_chars=chars,
             single_section=True,
         ):
             return TldrResult(kind="ok", tldr=text)
