@@ -29,7 +29,7 @@ GRAVITY_TIME_SCALE: dict[Window, float] = {
     "12h": 4.0,
     "1d": 8.0,
     "1w": 56.0,
-    "1m": 240.0,
+    "1m": 360.0,
     "archive": 2920.0,
 }
 # The three views of a window, the keys of Feed.orders.

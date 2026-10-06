@@ -11256,3 +11256,14 @@ Follow-up (detail-v16): the prompt no longer sends an RSS feed's copy of the
 article beside the fetched body (`_is_feed_copy` samples ten 8-word runs), and
 the article prompts count closing stories, fiction and personal notes as
 sections. Full backend suite 1,078 passed.
+
+## 2026-10-06 — 1m Popular gravity clock 240h → 360h
+
+The user saw mostly this week's stories in 1m Popular. The live feed was
+correct (3 of 16 were 21–23 days old, the oldest at #8), but the user had
+already voted on every one of the top 49 stories by 1m gravity, and at 240h
+the unvoted stories from this week outranked older ones. On the live DB (user
+151, voted stories excluded) the top 16 by age (≤7d / 7–14 / 14–21 / >21d)
+is 11/3/1/1 at 240h, 7/1/1/7 at 360h and 5/1/2/8 at 480h. `GRAVITY_TIME_SCALE["1m"]`
+is now 360 in the server, web client and TUI. Backend 1,096 and TUI 162
+tests passed.

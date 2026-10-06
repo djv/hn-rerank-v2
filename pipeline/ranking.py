@@ -295,15 +295,17 @@ WINDOW_SECONDS: dict[Window, int] = {
     "1m": 30 * 86400,
 }
 # Popular's gravity clock per window: age counts in units of this many hours,
-# a third of the window (archive: of a year). With HN's own clock (1 hour)
-# every window's Popular was the same few stories under a day old; on the
-# 2026-09-28 snapshot this clock gives 1w a median age of a day and 1m of a
-# week. Clients mirror this table for undo.
+# a third of the window (1m: half; archive: a third of a year). With HN's own
+# clock (1 hour) every window's Popular was the same few stories under a day
+# old; on the 2026-09-28 snapshot this clock gives 1w a median age of a day.
+# 1m at a third (240) still served mostly this week's stories once a user had
+# voted on the big older ones; 360 splits the 2026-10-06 top 16 about evenly
+# between this week and 3 weeks ago. Clients mirror this table for undo.
 GRAVITY_TIME_SCALE: dict[Window, float] = {
     "12h": 4.0,
     "1d": 8.0,
     "1w": 56.0,
-    "1m": 240.0,
+    "1m": 360.0,
     "archive": 2920.0,
 }
 SOURCE_CATEGORIES: tuple[str, ...] = ("hn_live", "archive", "reddit", "rss")

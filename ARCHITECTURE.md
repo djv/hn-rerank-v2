@@ -282,8 +282,8 @@ the fully scored pool at one `now` for all five windows:
   serving `enable_mmr` branch was dropped; `mmr_filter` stays for the eval).
 * **Popular**: the top HN stories (`is_hn_source`) in the window by HN gravity
   on the window's clock, `points / (age_h / scale + 2) ** 1.8` (`hn_gravity`,
-  `scale = GRAVITY_TIME_SCALE[window]`, a third of the window in hours: 12h 4,
-  1d 8, 1w 56, 1m 240, archive 2920; with HN's own 1-hour clock every window
+  `scale = GRAVITY_TIME_SCALE[window]`, a third of the window in hours (1m:
+  half): 12h 4, 1d 8, 1w 56, 1m 360, archive 2920; with HN's own 1-hour clock every window
   showed the same under-a-day-old stories). No Hot/Top/Talk selection cascade.
   Badges are independent: each card gets every one it qualifies for,
   🔥 Hot when its velocity
