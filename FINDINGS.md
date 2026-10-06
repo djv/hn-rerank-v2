@@ -2477,3 +2477,28 @@ Reads stay fast (`/api/feed` 8-10 ms on the VPS, ~0.5 s via Tailscale, all windo
 ### Hashed TF-IDF (per-story cached) vs live — 2026-09-29
 
 Production TF-IDF now hashes word 1-2 grams into 2^18 columns so a story's row is cached across retrains and ranks (first live rank: fit 14.4s, scoring 7.8s on 10k candidates). Columns seen in <2 training stories are dropped; idf and sublinear tf are fit on training votes. Same eval as above (stored embeddings, vs live `production`): full AUC 0.726 -> 0.788 (was 0.790), P@12 0.625 -> 0.708 (was 0.719); newest 20% AUC 0.739 -> 0.750 (was 0.751). Same gain within noise.
+
+## 2026-10-05 1m Popular age mix vs gravity time scale
+
+Report: in 1m Popular, the oldest card the user noticed was 7 days old. Live
+`/api/feed?window=1m` for user 151 (02:50 UTC 10-06, `e10d492`) did include
+3 of 16 cards 21–23d old ("Dario, Please" at #8). Cause: the user had voted
+(up, neutral or down) on all of the top 49 stories by 1m gravity, and voted
+stories are hidden. Among the unvoted stories, this week's 200–470-point
+stories outranked 20+ day ones at 240h.
+
+Top 16 by 1m gravity on the live DB, user 151's voted stories excluded,
+counted by age:
+
+| scale | ≤7d | 7–14d | 14–21d | >21d | median age | lowest points |
+|---|---|---|---|---|---|---|
+| 240h | 11 | 3 | 1 | 1 | 5.5d | 212 |
+| 360h | 7 | 1 | 1 | 7 | 20.7d | 260 |
+| 480h | 5 | 1 | 2 | 8 | 21.5d | 322 |
+| 720h | 5 | 0 | 3 | 8 | 21.5d | 334 |
+| 1440h | 2 | 0 | 3 | 11 | 23.5d | 414 |
+
+Chose 360h (user, 2026-10-05). Deployed `3475235`, rollback tag
+`deploy-pre-popular-1m-360`. After the restart and warm, user 151's served
+1m Popular: 6 of the first 12 cards are 21–27d old (#5, #8, #10–12), and
+#13–16 are 17–26d. Dashboard 200; 0 error lines in the journal.
