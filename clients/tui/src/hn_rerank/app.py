@@ -1927,8 +1927,10 @@ class Reader(App[None]):
             keys: list[str] = []
         elif self.reading:
             keys = [
-                f"j/k story · Space page · Enter/Esc back · {votes} · b badges"
-                " · ? help · q quit",
+                (
+                    f"j/k story · Space page · Enter/Esc back · {votes} · b badges"
+                    " · ? help · q quit"
+                ),
                 f"j/k story · Space page · Enter/Esc back · {votes} · ? help",
                 f"Enter/Esc back · {votes} · ? help",
                 "Enter/Esc back · 1/2/3 vote · ? help",

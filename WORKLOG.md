@@ -1,5 +1,28 @@
 # Worklog: hn-rewrite
 
+## 2026-10-07 Restore standalone TUI CI
+
+- Wrap the reading-mode footer's adjacent strings in parentheses for Ruff
+  `ISC004`. The module's parsed syntax tree is unchanged, so footer text and
+  runtime behavior are preserved. Local Ruff 0.15.17 left the rule in preview;
+  standalone CI resolved a newer release where it is enabled.
+- Checks: focused footer tests 12 passed; backend 1,098 passed; isolated
+  Python 3.12 TUI 162 passed / 1 skipped; standalone lint/types, repository
+  lint, changed-file formatting, wheel build and installed CLI version pass.
+  Ruff 0.16.10 also passes. Repository types retain only the existing diagnostic
+  in the unrelated, untracked `scripts/inspect_tldr_failures.py`.
+- The exact GitHub `uvx` command installed with an empty cache and rendered
+  first-run setup in a Bubblewrap terminal sandbox. Installed headless setup
+  also passed without ML dependencies. The user's home files and checkout
+  were hidden, and these boot checks created no profile.
+- Live sandbox profile 199 loaded 29 stories, displayed 12 in server order
+  and loaded the selected summary. Key-driven navigation, zoom/back, paging,
+  focus, help, sort and time-window changes passed. Up/neutral/down each
+  advanced selection and were confirmed by server feedback counts; undo
+  restored the story and counts. `q` exited the normal application loop.
+  A final server read confirmed all test votes cleared. Existing profiles
+  were never imported, and no local database or service was modified.
+
 ## 2026-10-03 TUI footer is always one row
 
 - User: the TUI status bar took 3 lines; make it 1 and tint it and the top
