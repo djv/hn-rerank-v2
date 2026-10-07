@@ -1,5 +1,75 @@
 # HN Rerank findings
 
+## TUI sharing and Reddit feed replacement priority — 2026-10-07
+
+### Installation and verification
+
+Install uv (includes uvx), reopen the terminal, then launch the TUI:
+
+```sh
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uvx --python 3.12 --from "git+https://github.com/djv/hn-rerank-v2#subdirectory=clients/tui" hn-rerank
+```
+
+Git is required for this VCS route. No PyPI release was available when
+checked; the user chose GitHub installation. Bulgarian description:
+"Приложението показва новини от Hacker News в терминала, с AI резюмета и
+подреждане според интересите ти."
+
+- Commit `86bd1db` fixes standalone Ruff implicit string concatenation in
+  the footer without changing its AST. Test details are in WORKLOG.md.
+- Passed [backend CI](https://github.com/djv/hn-rerank-v2/actions/runs/37654996364)
+  and [TUI CI](https://github.com/djv/hn-rerank-v2/actions/runs/37654996387)
+  on Linux/macOS/Windows.
+- Local backend: 1,098 passed. Isolated Python 3.12 TUI: 162 passed,
+  1 skipped; lint, types, build and installed version checks passed.
+  Root type check retained the existing diagnostic in unrelated untracked
+  `scripts/inspect_tldr_failures.py`.
+- Bubblewrap hid the personal home and checkout, used fresh XDG state,
+  and allowed network access for installation and the public backend.
+  The exact uvx command rendered first-run setup in a PTY. Dedicated live
+  sandbox profile 199 loaded 29 stories, displayed 12 in server order,
+  and loaded a 1,614-character summary. Navigation, help, sorting, windows,
+  scrolling, Enter/Escape and quit passed. Up/neutral/down votes advanced
+  and were acknowledged by the server; each was undone, leaving zero
+  feedback. Credentials are not recorded here. These checks do not verify
+  a friend's machine or the user's real-terminal appearance preference.
+
+### Reddit dependency and replacement research
+
+Live source checked in this session: `config.toml` contains 18 subreddit
+RSS feeds, generally `/top/.rss?t=week&limit=25`.
+`pipeline/enrichment.py` fetches/parses them; `server.py` constructs thread
+`/.rss` URLs for post/comment context. The TUI consumes the backend.
+There is no dedicated Reddit HTML listing crawler or OAuth/JSON source.
+Generic article extraction can attempt Reddit HTML for HN links and some
+lazy TLDR cases; successful retrieval was not established. That path does
+not replace subreddit discovery.
+
+Primary sources checked during this session:
+
+- [Official RSS announcement](https://www.reddit.com/r/modnews/comments/1wubgvt/continuing_our_infrastructure_updates_whats/):
+  support ends November 13, 2026. Moderation alternatives are named, but
+  there is no replacement for feeds outside moderated communities.
+- [Official Data API migration](https://www.reddit.com/r/redditdev/comments/1wubcvf/moving_data_api_apps_to_the_developer_platform/):
+  access removal begins January 12, 2027 for unregistered/nonresponsive
+  apps; remaining public API access ends March 2027. JSON is not a durable
+  fallback.
+- [Devvit RedditClient](https://developers.reddit.com/docs/api/public-api/classes/RedditClient#gettopposts)
+  offers `getTopPosts` with time-frame options. Its
+  [API overview](https://developers.reddit.com/docs/capabilities/server/reddit-api)
+  describes integration with communities where apps are installed.
+  External-reader access/export suitability remains unverified.
+- Human-facing top listings currently offer weekly/monthly windows, e.g.
+  https://www.reddit.com/r/LocalLLaMA/top/?t=week and `?t=month`.
+  Browser import is a candidate, not an implemented or tested fallback;
+  reliable automated access after shutdown is unknown.
+
+User urgency: "we need to handle this soon". Replacement investigation
+and live feasibility testing are the next priority, followed by choosing
+and implementing a source adapter based on the results. No replacement
+has been implemented; no production data was changed for this research.
+
 ## Import AI 475 TLDR covers only its first item — 2026-10-05
 
 User report: the Import AI 475 summary (jack-clark.net RSS, story id

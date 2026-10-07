@@ -1,30 +1,39 @@
 # HN Rerank status
 
-Saved 2026-10-05. Previous handoff (TLDR section bullets):
-[before-popular-1m-360](docs/status-archive/before-popular-1m-360-20261005.md).
+Saved 2026-10-07. Previous handoff:
+[1m Popular age mix](docs/status-archive/before-tui-sharing-reddit-handoff-20261007.md).
 
 ## Objective
-Show more older stories in Popular when the window is 1 month (user report
-2026-10-05: the oldest card looked like 7 days).
+Share the TUI with friends and preserve Reddit weekly/monthly top-post
+coverage after the announced RSS shutdown. User: "we need to handle this soon".
 
 ## Verified result
-- The served 1m Popular list was already correct (3 of 16 cards were 21–23d
-  old, the first at #8). The user had voted on all of the top 49 stories by
-  1m gravity, and at 240h this week's unvoted stories outranked older ones.
-- `GRAVITY_TIME_SCALE["1m"]` changed from 240h to 360h in the server, web
-  client and TUI. Deployed `3475235` (rollback tag
-  `deploy-pre-popular-1m-360`). User 151's live 1m Popular now has 6 of the
-  first 12 cards 21–27d old. Dashboard 200, no errors since restart.
-  Evidence is in FINDINGS.md.
+- TUI CI fix committed and pushed as `86bd1db`; backend CI and TUI CI
+  (Linux/macOS/Windows) passed. No runtime behavior change.
+- GitHub `uvx` installation tested in an isolated Bubblewrap environment:
+  first-run setup, live stories and summaries, navigation, scrolling,
+  sorting, votes, undo and quit. Dedicated test profile ended with zero votes.
+- Reddit ingestion uses subreddit RSS and thread RSS. Incidental generic
+  HTML fetches are possible, but no replacement listing importer exists.
+- Official Reddit announcement schedules RSS retirement for November 13,
+  2026 and offers no replacement for feeds outside moderated communities.
+  Research evidence and install commands are in FINDINGS.md.
 
 ## Blocker / limits
-- Clients show only 12 of the 16 Popular cards the server sends
-  (`VIEW_LIMIT`), so ranks 13–16 are not shown.
-- Unrelated TUI test edit, mockups, TLDR inspect script and kernel log are
-  preserved and uncommitted. The inspect script has the one `ty` error.
+- Reliable automated Reddit weekly/monthly ingestion after shutdown is
+  unresolved. Browser import is a proposal; Devvit external-reader access
+  and export suitability are unverified. JSON API is also being retired.
+- Existing VPS deployment was `3475235` when checked in this session;
+  the TUI lint fix did not require a backend deployment.
+- Unrelated TUI test edit, mockups, kernel log and TLDR inspect script remain
+  untouched. The inspect script has the existing `ty` diagnostic.
 
 ## Next step
-- The user checks whether the 1m Popular age mix feels right. Try 480h if
-  more old stories are wanted, or 300h if fewer.
-- The user still needs to check the TUI footer and tint from 2026-10-03 in a
-  real terminal.
+- Priority: investigate and test a Reddit replacement soon, ahead of
+  November 13. Check supported Devvit access/export constraints and test
+  weekly/monthly listing extraction with a normal signed-in browser.
+  Choose a route from actual results before implementing the source adapter.
+- Preserve existing stories and feedback; do not alter the production DB
+  during research. No new scraper or migration has been implemented.
+- Carry forward the prior handoff's user check of 1m Popular age mix and
+  real-terminal footer/tint appearance.
