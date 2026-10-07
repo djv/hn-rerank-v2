@@ -2575,4 +2575,6 @@ OpenVINO, matched by ONNX name). Evidence:
   --onnx-file onnx/model.positions.onnx --device gpu` (tokenizer files were
   added to that directory).
 - The Gemma 2 verdict stands (it was measured on correct CPU vectors); the
-  fix only makes Gemma 2 fast. Not yet reported upstream to OpenVINO.
+  fix only makes Gemma 2 fast. One-node repro (onnxruntime rotates, OpenVINO
+  returns the input): `gpu-debug-20261007/min_repro.py`. Not reported upstream
+  (user 2026-10-07: keep it local).
