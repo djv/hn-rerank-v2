@@ -2502,3 +2502,45 @@ Chose 360h (user, 2026-10-05). Deployed `3475235`, rollback tag
 `deploy-pre-popular-1m-360`. After the restart and warm, user 151's served
 1m Popular: 6 of the first 12 cards are 21–27d old (#5, #8, #10–12), and
 #13–16 are 17–26d. Dashboard 200; 0 error lines in the journal.
+
+## 2026-10-07 EmbeddingGemma 2 as the side model: no gain over Gemma 1
+
+Question: does `onnx-community/embeddinggemma-2-ONNX` (text, ~270M) beat the
+production side model, embeddinggemma-300m at 128 tokens? Same harness as the
+2026-10-02 Gemma round: user 151, live blend
+`prodlr[svm_c=4.0;lr_weight=0.4;tfidf_weight=0.3]`, dev 8 folds + fresh 4
+blocks (`--holdout-after 1790702220`), `--now 1790906000`. Files:
+`~/.local/state/hn-rerank-eval/gemma2-20261006/` (`run.sh`, `run3.sh`,
+`run4.sh`, `run5.sh`, `pair.py`).
+
+- OpenVINO (iGPU, f16 and f32) computes Gemma 2 wrong: cosine 0.74 to CPU f32,
+  which matches the model card. The first run (`bad-openvino/`) is invalid.
+  All results below use CPU onnxruntime f32.
+- Quantization vs f32 (120 stories): int8 cos 0.9999, fp16 1.0000, q4 0.98.
+  CPU s/story on the same 120 stories: f32 1.52, int8 2.22, q4 1.85, fp16 1.96
+  (quantized is not faster); full encodes ran 1.2-2.1 s/story.
+- The run3 encode stopped at 920/3239 on 2026-10-06 19:47 (no OOM kill
+  logged); run4 resumed it from the `.partial.npz` on 2026-10-07.
+
+Blend eval, 12 paired blocks (P@12 dev/fresh, AUC dev/fresh; vs Gemma 1):
+
+| side vectors with stored | P@12 | AUC | vs Gemma 1 |
+|---|---|---|---|
+| none | 0.615 / 0.542 | 0.783 / 0.861 | |
+| Gemma 1 768d (production) | 0.667 / 0.583 | 0.793 / 0.866 | |
+| Gemma 2 768d, classification prompt | 0.646 / 0.562 | 0.788 / 0.861 | dAUC -0.005, 5/12 better, p=0.23 |
+| Gemma 2 512d | 0.656 / 0.562 | 0.788 / 0.863 | dAUC -0.005, 4/12 |
+| Gemma 2 256d | 0.646 / 0.562 | 0.786 / 0.861 | dAUC -0.007, 5/12 |
+| Gemma 2 128d | 0.646 / 0.562 | 0.785 / 0.856 | dAUC -0.009, 3/12, p=0.03 |
+| Gemma 2 768d, document prompt (`title: none \| text: `) | 0.615 / 0.562 | 0.791 / 0.865 | dAUC -0.002, 4/12, dP@12 -0.042 |
+
+Untuned probes (`scripts/probe_embeddings.py --probes logreg,knn --extra`, all
+3239 votes): logreg AUC stored 0.804, Gemma 1 0.809, Gemma 2 0.785 (document
+prompt 0.789); stored+Gemma 1 0.828 vs stored+Gemma 2 0.818-0.820. Gemma 2 is
+also behind on few-shot (100/class 0.737-0.745 vs 0.763), temporal (0.807-0.830
+vs 0.847) and source clustering (V 0.60 vs 0.68). Early probes on 920 and 1920
+stories showed the same order.
+
+Verdict: keep embeddinggemma-300m. Over stored-only, Gemma 2 adds AUC +0.004
+(classification) / +0.007 (document) vs Gemma 1's +0.009, with fewer upvotes
+in the top 12, and is slower on CPU. No production change.
