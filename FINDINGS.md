@@ -2515,7 +2515,7 @@ blocks (`--holdout-after 1790702220`), `--now 1790906000`. Files:
 
 - OpenVINO (iGPU, f16 and f32) computes Gemma 2 wrong: cosine 0.74 to CPU f32,
   which matches the model card. The first run (`bad-openvino/`) is invalid.
-  All results below use CPU onnxruntime f32.
+  All results below use CPU onnxruntime f32. Cause and fix: next section.
 - Quantization vs f32 (120 stories): int8 cos 0.9999, fp16 1.0000, q4 0.98.
   CPU s/story on the same 120 stories: f32 1.52, int8 2.22, q4 1.85, fp16 1.96
   (quantized is not faster); full encodes ran 1.2-2.1 s/story.
@@ -2544,3 +2544,35 @@ stories showed the same order.
 Verdict: keep embeddinggemma-300m. Over stored-only, Gemma 2 adds AUC +0.004
 (classification) / +0.007 (document) vs Gemma 1's +0.009, with fewer upvotes
 in the top 12, and is slower on CPU. No production change.
+
+## 2026-10-07 OpenVINO gives Gemma 2 no rotary positions (fixed by a graph patch)
+
+Why OpenVINO encoded EmbeddingGemma 2 wrong (previous section), found with
+`scripts/debug_openvino_divergence.py` (per-tensor diff, onnxruntime vs
+OpenVINO, matched by ONNX name). Evidence:
+`~/.local/state/hn-rerank-eval/gpu-debug-20261007/`.
+
+- Not the GPU: OpenVINO CPU f32 is off by the same amount (cos 0.743 to
+  onnxruntime on 6 texts, same as GPU f32 and f16).
+- First differing tensor: layer 0 `com.microsoft::RotaryEmbedding` (q and k).
+  Everything before it (embedding gather, norm, qkv projection, sin/cos
+  tables) matches to 1e-8; every later difference follows from it.
+- The export feeds all 48 RotaryEmbedding nodes `position_ids` = constant
+  `[0]` with per-sequence cos/sin tables. onnxruntime reads a one-element
+  `position_ids` as the start offset (token s gets position s); OpenVINO
+  2026.4 gives every token position 0. Replayed in numpy, OpenVINO's output
+  equals the identity rotation (rel 2.7e-7) and onnxruntime's equals standard
+  rotate-half RoPE (rel 3e-8). Token 0 matches (position 0 is the identity),
+  so the vectors are degraded rather than garbage.
+- Fix: `scripts/patch_rotary_position_ids.py MODEL` writes
+  `<model>.positions.onnx` (graph only, reuses the weights) with explicit
+  `[batch, seq]` positions 0..S-1. On it, OpenVINO CPU f32 / GPU f32 / GPU f16
+  match onnxruntime at cos 1.0000 (6 texts), and iGPU encodes of 120 stories
+  match the original model on CPU onnxruntime: f16 min cos 0.99997, f32
+  1.00000. iGPU 0.18 s/story (f16) / 0.27 (f32) vs CPU f32 1.52 on the same
+  stories, ~8x faster. Use with `encode_replay_embeddings.py --repo
+  ~/.cache/hn-rerank-embedding-models/onnx-community--embeddinggemma-2-ONNX
+  --onnx-file onnx/model.positions.onnx --device gpu` (tokenizer files were
+  added to that directory).
+- The Gemma 2 verdict stands (it was measured on correct CPU vectors); the
+  fix only makes Gemma 2 fast. Not yet reported upstream to OpenVINO.

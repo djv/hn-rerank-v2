@@ -19,7 +19,7 @@ from unittest.mock import patch
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Iterable, Literal
 
 import numpy as np
 import onnxruntime as ort
@@ -270,9 +270,14 @@ def _runner(
             for meta in session.get_inputs()
             if meta.name.startswith("past_key_values")
         ]
+        media = _empty_media(
+            (meta.name, int(meta.shape[1]))
+            for meta in session.get_inputs()
+            if meta.name in MEDIA_INPUTS
+        )
 
         def run_cpu(feed: dict[str, NDArray[Any]]) -> dict[str, NDArray[Any]]:
-            values = session.run(None, feed | _empty_cache(cache, feed))
+            values = session.run(None, feed | media | _empty_cache(cache, feed))
             return {
                 name: np.asarray(value)
                 for name, value in zip(output_names, values, strict=True)
@@ -306,12 +311,26 @@ def _runner(
         for port in compiled.outputs
         if not port.get_any_name().startswith("present")
     ]
+    media = _empty_media(
+        (port.get_any_name(), port.get_partial_shape()[-1].get_length())
+        for port in model.inputs
+        if port.get_any_name() in MEDIA_INPUTS
+    )
 
     def run(feed: dict[str, NDArray[Any]]) -> dict[str, NDArray[Any]]:
-        results = request.infer(feed | _empty_cache(cache, feed))
+        results = request.infer(feed | media | _empty_cache(cache, feed))
         return {port.get_any_name(): np.array(results[port]) for port in outputs}
 
     return run, {port.get_any_name() for port in model.inputs}
+
+
+# Media inputs of multimodal text graphs (e.g. onnx-community EmbeddingGemma 2).
+MEDIA_INPUTS = ("image_features", "video_features", "audio_features")
+
+
+def _empty_media(inputs: Iterable[tuple[str, int]]) -> dict[str, NDArray[Any]]:
+    """Zero-length media features, so the graph embeds the text alone."""
+    return {name: np.zeros((0, dim), dtype=np.float32) for name, dim in inputs}
 
 
 def _empty_cache(
