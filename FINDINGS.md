@@ -2577,8 +2577,9 @@ Chose 360h (user, 2026-10-05). Deployed `3475235`, rollback tag
 
 Question: does `onnx-community/embeddinggemma-2-ONNX` (text, ~270M) beat the
 production side model, embeddinggemma-300m at 128 tokens? Same harness as the
-2026-10-02 Gemma round: user 151, live blend
-`prodlr[svm_c=4.0;lr_weight=0.4;tfidf_weight=0.3]`, dev 8 folds + fresh 4
+2026-10-02 Gemma round: user 151, blend
+`prodlr[svm_c=4.0;lr_weight=0.4;tfidf_weight=0.3]` (SVM 0.3 / dense 0.4 /
+TF-IDF 0.3; not the live blend, which is `lr_weight=0.2`), dev 8 folds + fresh 4
 blocks (`--holdout-after 1790702220`), `--now 1790906000`. Files:
 `~/.local/state/hn-rerank-eval/gemma2-20261006/` (`run.sh`, `run3.sh`,
 `run4.sh`, `run5.sh`, `pair.py`).
