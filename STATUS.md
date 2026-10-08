@@ -38,7 +38,8 @@ metadata-scale middle variant, short-history curve).
 - Offline follow-ups finished (labels reused, exploratory). Metadata
   x0.5/x0.25 fall between #2 and #4; neither beats both, so the arms stay
   #2/#4. In the short-history curve, from 200 votes up both challengers
-  match or beat production. Tables:
+  match or beat production (#2's AUC gain has block intervals excluding
+  zero at N >= 400; #4's do not). Tables:
   [INTERLEAVING.md](docs/evaluations/model-ablation-20261007/INTERLEAVING.md);
   artifacts in followups/.
 
@@ -50,11 +51,6 @@ None.
   `uv run python scripts/interleave_report.py --db hn_rewrite.db
   --user-id 151 --since 1791432442.75 --until 1793851642.75` on the VPS.
   Weekly descriptive reports and safety checks per INTERLEAVING.md.
-- Only the launcher's bootstrap summary pass is still running
-  (`/tmp/hn-single-followup-20261007/launch.py`, one idle CPU, from the
-  clean worktree ../hn-rerank-offline-20261007). When it writes
-  `summary.json`, copy that file into followups/, add the intervals to
-  INTERLEAVING.md, then remove the worktree.
 - The separate Why preview (VPS hn-why-preview-20261007.service, port
   8767) becomes redundant after the deploy; stop it when the user agrees.
 - Carried over: Reddit replacement before November 13, 1m Popular age-mix

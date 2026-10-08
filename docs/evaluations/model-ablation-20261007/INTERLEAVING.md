@@ -71,9 +71,11 @@ identical to the earlier runs):
 | #4, no metadata | .8203 | .7094 | 98 | 5 |
 
 Shrinking metadata moves AUC and NDCG between #2 and #4. Neither middle
-setting beats both endpoints, so the live arms stay #2 and #4. Paired
-bootstrap intervals are in `followups/summary.json` once the launcher's
-summary pass finishes.
+setting beats both endpoints, so the live arms stay #2 and #4. AUC
+against #2: x0.5 -.0021, block interval [-.0063, +.0012], sign-flip p .38;
+x0.25 -.0049, [-.0158, +.0033], p .45. Against production: x0.5 +.0092
+[.0000, .0180], p .083; x0.25 +.0064 [-.0023, +.0146], p .19
+(`followups/summary.json`; 20,000 block draws).
 
 ## Short-history curve
 
@@ -91,7 +93,10 @@ blocks; mean AUC and top-12 upvotes/downvotes out of 144:
 
 At 100 votes (about 22 upvotes) the classifier tier barely enters the tier
 blend, so all arms nearly coincide. From 200 votes up, both challengers
-match or beat production on every column. The labels were reused, and
+match or beat production on every column. Paired AUC against production:
+#2 at N = 400 / 800 / 1600 is +.0115 / +.0122 / +.0129, block intervals
+excluding zero, sign-flip p .040 / .037 / .030 (unadjusted). #4's
+intervals include zero at every N. The labels were reused, and
 profile 151's recent votes stand in for a new user's first votes. So this
 supports, but does not establish, extending the challengers to other users.
 

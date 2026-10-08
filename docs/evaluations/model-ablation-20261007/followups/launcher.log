@@ -1,0 +1,53 @@
+plan recorded
+power-deck4-weight1 complete in 83s
+power-deck1-weight1 complete in 522s
+power-deck12-weight1 complete in 51s
+power-deck4-weight0.5 complete in 142s
+power-deck4-weight0 complete in 132s
+metadata-scale-0.5-development complete in 705s
+Waiting for laptop load below 8
+Waiting for laptop load below 8
+Waiting for laptop load below 8
+Waiting for laptop load below 8
+Waiting for laptop load below 8
+Waiting for laptop load below 8
+Waiting for laptop load below 8
+Waiting for laptop load below 8
+Waiting for laptop load below 8
+Waiting for laptop load below 8
+metadata-scale-0.5-fresh complete in 516s
+Waiting for laptop load below 8
+Waiting for laptop load below 8
+metadata-scale-0.25-development complete in 490s
+metadata-scale-0.25-fresh complete in 343s
+recent-100-all-development complete in 90s
+Waiting for laptop load below 8
+Waiting for laptop load below 8
+Waiting for laptop load below 8
+recent-100-all-fresh complete in 21s
+recent-100-no_metadata-development complete in 23s
+recent-100-no_metadata-fresh complete in 53s
+recent-200-all-development complete in 49s
+recent-200-all-fresh complete in 30s
+recent-200-no_metadata-development complete in 27s
+recent-200-no_metadata-fresh complete in 19s
+recent-400-all-development complete in 53s
+recent-400-all-fresh complete in 33s
+recent-400-no_metadata-development complete in 49s
+recent-400-no_metadata-fresh complete in 31s
+recent-800-all-development complete in 104s
+recent-800-all-fresh complete in 51s
+recent-800-no_metadata-development complete in 85s
+recent-800-no_metadata-fresh complete in 53s
+recent-1600-all-development complete in 259s
+recent-1600-all-fresh complete in 138s
+recent-1600-no_metadata-development complete in 271s
+recent-1600-no_metadata-fresh complete in 105s
+metadata scale 0.5 summary complete
+metadata scale 0.25 summary complete
+recent 100 summary complete
+recent 200 summary complete
+recent 400 summary complete
+recent 800 summary complete
+recent 1600 summary complete
+offline follow-ups complete
