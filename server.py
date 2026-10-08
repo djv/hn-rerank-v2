@@ -3711,7 +3711,26 @@ def _log_llm_spend_today(db: Database) -> None:
         )
 
 
-def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
+def wait_for_startup_warms(
+    user_ids: Sequence[int], timeout_s: float, poll_s: float = 1.0
+) -> bool:
+    """Block until each of *user_ids* has a warmed deck or *timeout_s*
+    passes; True when all finished."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if all(Handler._decks.get(uid) is not None for uid in user_ids):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll_s)
+
+
+def regen_loop(
+    config: Config,
+    event: threading.Event,
+    db: Database,
+    startup_warm_users: Sequence[int] = (),
+) -> None:
     logging.info("Starting background regeneration loop...")
     from pipeline.hn_dupes import HnDupeResolutionWorker
 
@@ -3732,6 +3751,16 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
             config.regen_initial_delay_seconds,
         )
         time.sleep(config.regen_initial_delay_seconds)
+        if startup_warm_users:
+            started = time.monotonic()
+            done = wait_for_startup_warms(
+                startup_warm_users, config.regen_startup_warm_wait_seconds
+            )
+            logging.info(
+                "first regen waited %.0f s for startup warms (%s)",
+                time.monotonic() - started,
+                "done" if done else "timed out",
+            )
         event.set()
     while True:
         # Wait on event or timeout
@@ -3851,11 +3880,20 @@ def main() -> None:
     Handler.embedder = embedder
     Handler.regen_event = regen_event
     set_llm_usage_recorder(db.record_llm_usage)
+    from pipeline import warm_store
+
+    warm_store.configure(
+        Path(config.warm_start_dir).expanduser()
+        if config.warm_start_dir
+        else warm_store.default_directory()
+    )
     Handler._rebuild_cold_deck()
-    Handler.warm_recent_users()
+    warmed = Handler.warm_recent_users()
 
     # Start regen thread
-    t = threading.Thread(target=regen_loop, args=(config, regen_event, db), daemon=True)
+    t = threading.Thread(
+        target=regen_loop, args=(config, regen_event, db, warmed), daemon=True
+    )
     t.start()
     threading.Thread(
         target=hot_refresh_loop, args=(config, db), name="hot-refresh", daemon=True

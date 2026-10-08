@@ -26,6 +26,7 @@ from sklearn.linear_model import LogisticRegression
 
 from database import Story
 
+from . import warm_store
 from .linear_blend import _warm_start, count_rows
 
 JoinedFeatures = Literal["all", "no_metadata"]
@@ -125,6 +126,53 @@ class JoinedLogistic:
         self.estimator.fit(inputs, list(labels), sample_weight=sample_weight)
         return self
 
+    def warm_start_arrays(self) -> warm_store.Arrays:
+        """What a later fit's warm start reads (see :mod:`warm_store`)."""
+        if self._keep is None:
+            raise RuntimeError("fit must run before warm_start_arrays")
+        return {
+            "keep_size": np.array(self._keep.size),
+            "keep_index": np.flatnonzero(self._keep).astype(np.int32),
+            "numeric_width": np.array(self._numeric_width),
+            "coef": self.estimator.coef_.astype(np.float32),
+            "intercept": self.estimator.intercept_.astype(np.float64),
+            "classes": self.estimator.classes_,
+        }
+
+    @classmethod
+    def warm_start_from_arrays(
+        cls, features: JoinedFeatures, arrays: warm_store.Arrays
+    ) -> JoinedLogistic | None:
+        """A fit restored only to warm-start the next one (it cannot score);
+        None when *arrays* do not describe one."""
+        try:
+            keep = np.zeros(int(arrays["keep_size"]), dtype=bool)
+            keep[arrays["keep_index"]] = True
+            numeric_width = int(arrays["numeric_width"])
+            coef = np.asarray(arrays["coef"], dtype=np.float64)
+            intercept = np.asarray(arrays["intercept"], dtype=np.float64)
+            classes = np.asarray(arrays["classes"])
+        except (KeyError, IndexError, TypeError, ValueError):
+            return None
+        if coef.ndim != 2 or coef.shape[1] != numeric_width + int(keep.sum()):
+            return None
+        if intercept.shape != (coef.shape[0],) or classes.shape != (coef.shape[0],):
+            return None
+        model = cls(
+            c=1.0,
+            features=features,
+            embedding_dim=1,
+            embedding_weight=1.0,
+            numeric_scale=1.0,
+            word_scale=1.0,
+        )
+        model.estimator.coef_ = coef
+        model.estimator.intercept_ = intercept
+        model.estimator.classes_ = classes
+        model._keep = keep
+        model._numeric_width = numeric_width
+        return model
+
     def predict_proba(
         self,
         features: NDArray[np.floating],
@@ -151,11 +199,25 @@ _LATEST: LRUCache[tuple[int, JoinedFeatures], JoinedLogistic] = LRUCache(maxsize
 _LATEST_LOCK = threading.Lock()
 
 
+def _store_name(user_id: int, features: JoinedFeatures) -> str:
+    return f"joined_{user_id}_{features}"
+
+
 def latest(user_id: int, features: JoinedFeatures) -> JoinedLogistic | None:
+    """The user's previous fit, for warm starts only: after a restart it is
+    the saved one (:mod:`warm_store`), which cannot score."""
     with _LATEST_LOCK:
-        return _LATEST.get((user_id, features))
+        model = _LATEST.get((user_id, features))
+    if model is not None:
+        return model
+    arrays = warm_store.load(_store_name(user_id, features))
+    if arrays is None:
+        return None
+    return JoinedLogistic.warm_start_from_arrays(features, arrays)
 
 
 def remember(user_id: int, features: JoinedFeatures, model: JoinedLogistic) -> None:
     with _LATEST_LOCK:
         _LATEST[(user_id, features)] = model
+    if warm_store.enabled():
+        warm_store.save(_store_name(user_id, features), model.warm_start_arrays())

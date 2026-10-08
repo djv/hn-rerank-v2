@@ -141,6 +141,14 @@ class Config:
     server_port: int = 8765
     regen_interval_seconds: int = 3600
     regen_initial_delay_seconds: int = 30
+    # After that delay the first regen also waits (up to this long) for the
+    # startup warms to finish; overlapping them slowed a restart's first
+    # rerank (2026-10-08).
+    regen_startup_warm_wait_seconds: float = 180.0
+    # Where users' latest classifier fits are saved as warm starts across
+    # restarts (pipeline/warm_store.py); "" means
+    # $XDG_CACHE_HOME/hn-rewrite/warm_start (~/.cache by default).
+    warm_start_dir: str = ""
     regen_prewarm_top_n: int = 50
     prewarm_hn_full: bool = True
     prewarm_reddit_full: bool = True
@@ -326,6 +334,8 @@ class Config:
             raise ValueError("reddit_source must be one of: rss, arctic_shift")
         if self.reddit_arctic_stride_seconds < 0:
             raise ValueError("reddit_arctic_stride_seconds must be >= 0")
+        if self.regen_startup_warm_wait_seconds < 0:
+            raise ValueError("regen_startup_warm_wait_seconds must be >= 0")
         if self.reddit_arctic_retry_delay_seconds < 0:
             raise ValueError("reddit_arctic_retry_delay_seconds must be >= 0")
         if self.embedding_ort_variant not in {

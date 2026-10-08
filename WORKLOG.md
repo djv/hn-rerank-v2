@@ -1,5 +1,19 @@
 # Worklog: hn-rewrite
 
+## 2026-10-08 Faster first rerank after a restart
+
+Each restart's first rerank of profile 151 took 77-101 s (later ones
+10-20 s). At 14:59 UTC: challenger fits 28.3 s + 21.6 s and linear blend
+fit 11.1 s (warm: ~0.7, 0.6, 1.3 s), because warm starts lived only in
+memory; the first regen, started 30 s after the warm, overlapped it
+(linear blend scoring 7.1 s vs 0.6 s, window assembly 4.2 s). Now the
+latest fits' coefficients persist in `~/.cache/hn-rewrite/warm_start`
+(`pipeline/warm_store.py`, user choice of location) and the first regen
+waits for the startup warms (cap 180 s). Tests cover the store, restoring
+both fit types as warm starts (same result as the in-memory warm start),
+and the wait. The gain shows only from the second restart after deploy,
+once fits have been saved.
+
 ## 2026-10-08 Arctic Shift: second pass for failed feeds, refresh stats
 
 After the switch, every refresh lost 1-2 of 20-21 feeds to the archive's
