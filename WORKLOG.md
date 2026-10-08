@@ -1,5 +1,18 @@
 # Worklog: hn-rewrite
 
+## 2026-10-08 Arctic Shift: second pass for failed feeds, refresh stats
+
+After the switch, every refresh lost 1-2 of 20-21 feeds to the archive's
+global 422 overload even after 4 retries (13:34 UTC: MachineLearning,
+mlscaling; 13:58: MachineLearning; 14:25: ClaudeAI, LocalLLM), and
+refreshes took 13-22+ min; a failed feed then waits 2 h for the next
+refresh. The archive cannot sort by score (`sort_type` accepts only
+`default`/`created_utc`), so the weekly paging stays. Now feeds still
+missing after the pass get one more pass after
+`reddit_arctic_retry_delay_seconds` (120 s), and each refresh logs
+`elapsed_s` plus `reddit_refresh_arctic` (failed feeds, archive requests,
+overload answers, transport errors) to measure the effect.
+
 ## 2026-10-08 Removed documented test profiles from the VPS DB
 
 The user asked to remove profiles known to be smoke or other tests. Deleted

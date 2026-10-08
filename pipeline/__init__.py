@@ -133,6 +133,7 @@ from .render import (
     generate_dashboard_bytes,
     source_label_filter,
 )
+import arctic_shift
 from reddit_feed_cache import cache as reddit_feed_cache
 from reddit_limiter import limiter as reddit_limiter
 
@@ -1261,6 +1262,7 @@ def refresh_reddit_candidates(
     from reddit_fetch_queue import queue as reddit_fetch_queue
 
     now_ts = time.time()
+    started = time.monotonic()
     feedback_urls = {f.url for f in db.get_all_feedback() if f.url}
     eligible_feeds = [
         feed
@@ -1286,6 +1288,31 @@ def refresh_reddit_candidates(
         )
         if not reddit_fetch_queue.wait_until_empty(timeout=5400.0):
             logging.warning("reddit_refresh: topfeed queue timed out")
+        missing = [f for f in feed_urls if reddit_feed_cache.get(f) is None]
+        if use_arctic and missing and config.reddit_arctic_retry_delay_seconds > 0:
+            # Arctic Shift sheds load for minutes at a time; one later pass
+            # recovers most failed feeds instead of waiting for the next
+            # refresh. The factories skip feeds already in the cache.
+            logging.info(
+                "reddit_refresh: retrying %d Arctic Shift feeds in %.0f s",
+                len(missing),
+                config.reddit_arctic_retry_delay_seconds,
+            )
+            time.sleep(config.reddit_arctic_retry_delay_seconds)
+            retry_factories, _ = build_reddit_topfeed_factories(
+                missing,
+                config.rss.per_feed_limit,
+                config.days,
+                feedback_urls,
+                reddit_source=config.reddit_source,
+            )
+            reddit_fetch_queue.enqueue_all_reddit_fetches(
+                retry_factories,
+                [],
+                min_stride_seconds=config.reddit_arctic_stride_seconds,
+            )
+            if not reddit_fetch_queue.wait_until_empty(timeout=5400.0):
+                logging.warning("reddit_refresh: topfeed retry queue timed out")
 
     changed_ids: set[int] = set()
     for feed_url in feed_urls:
@@ -1369,10 +1396,22 @@ def refresh_reddit_candidates(
         prewarm_candidates=len(prewarm_ids),
     )
     logging.info(
-        "reddit_refresh_complete feeds=%d changed=%d hydrated=%d candidates=%d",
+        "reddit_refresh_complete feeds=%d changed=%d hydrated=%d candidates=%d "
+        "elapsed_s=%.0f",
         result.feeds,
         result.changed_stories,
         result.hydrated_stories,
         result.prewarm_candidates,
+        time.monotonic() - started,
     )
+    if use_arctic:
+        stats = arctic_shift.take_stats()
+        logging.info(
+            "reddit_refresh_arctic failed_feeds=%d requests=%d overloaded=%d "
+            "transport_errors=%d",
+            sum(reddit_feed_cache.get(f) is None for f in feed_urls),
+            stats.requests,
+            stats.overloaded,
+            stats.transport_errors,
+        )
     return result

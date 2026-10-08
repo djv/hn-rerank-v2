@@ -50,6 +50,10 @@ _REMOVED_TEXTS = frozenset({"[removed]", "[deleted]"})
 
 _throttle_lock = threading.Lock()
 _next_request_at = 0.0
+_stats_lock = threading.Lock()
+_request_count = 0
+_overload_count = 0
+_transport_error_count = 0
 
 
 class ArcticShiftError(Exception):
@@ -72,6 +76,33 @@ class Retry:
 # bound the whole fetch, see server._fetch_reddit_arctic_context).
 TOP_POSTS_RETRY = Retry(attempts=4, max_wait_seconds=65.0, timeout_seconds=60.0)
 THREAD_RETRY = Retry(attempts=2, max_wait_seconds=10.0, timeout_seconds=15.0)
+
+
+@dataclass(frozen=True)
+class RequestStats:
+    """HTTP attempts since the last :func:`take_stats` call."""
+
+    requests: int
+    # 422 "Timeout. Maybe slow down a bit", 429 and 5xx answers.
+    overloaded: int
+    transport_errors: int
+
+
+def _count(*, overloaded: bool = False, transport_error: bool = False) -> None:
+    global _request_count, _overload_count, _transport_error_count
+    with _stats_lock:
+        _request_count += 1
+        _overload_count += overloaded
+        _transport_error_count += transport_error
+
+
+def take_stats() -> RequestStats:
+    """Return the attempt counts and start counting from zero."""
+    global _request_count, _overload_count, _transport_error_count
+    with _stats_lock:
+        stats = RequestStats(_request_count, _overload_count, _transport_error_count)
+        _request_count = _overload_count = _transport_error_count = 0
+    return stats
 
 
 @dataclass(frozen=True)
@@ -146,12 +177,15 @@ async def _get_data(
         try:
             resp = await client.get(path, params=params, timeout=retry.timeout_seconds)
         except httpx.HTTPError as exc:
+            _count(transport_error=True)
             last_error = repr(exc)
             if attempt + 1 < retry.attempts:
                 await asyncio.sleep(RETRY_DELAY_SECONDS)
             continue
         # 422 has been seen transiently on valid queries (2026-10-08).
-        if resp.status_code in (422, 429) or resp.status_code >= 500:
+        overloaded = resp.status_code in (422, 429) or resp.status_code >= 500
+        _count(overloaded=overloaded)
+        if overloaded:
             last_error = f"HTTP {resp.status_code}"
             if attempt + 1 < retry.attempts:
                 await asyncio.sleep(_retry_wait(resp, retry.max_wait_seconds))

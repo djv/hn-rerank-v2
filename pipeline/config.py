@@ -168,6 +168,10 @@ class Config:
     # Task spacing on the Reddit fetch queue when reddit_source is
     # arctic_shift (its operator asks for at most a couple of requests/s).
     reddit_arctic_stride_seconds: float = 2.0
+    # Pause before one more pass over the Arctic Shift feeds that failed in a
+    # refresh (the archive's overload spells lasted minutes on 2026-10-08,
+    # refreshes are 2 h apart). 0 disables the second pass.
+    reddit_arctic_retry_delay_seconds: float = 120.0
     article_fetch_max_per_run: int = 50
     # Regen-time article fetches for new RSS snippet stories regardless of
     # rank (the warm path only reaches stories already near the top). 0 off.
@@ -322,6 +326,8 @@ class Config:
             raise ValueError("reddit_source must be one of: rss, arctic_shift")
         if self.reddit_arctic_stride_seconds < 0:
             raise ValueError("reddit_arctic_stride_seconds must be >= 0")
+        if self.reddit_arctic_retry_delay_seconds < 0:
+            raise ValueError("reddit_arctic_retry_delay_seconds must be >= 0")
         if self.embedding_ort_variant not in {
             "current",
             "spin_off",

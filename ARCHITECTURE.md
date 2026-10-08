@@ -373,8 +373,13 @@ reproduce).
   until its per-minute window resets, so top lists (background) wait up to
   65 s over 4 attempts with 60 s requests (`TOP_POSTS_RETRY`); threads,
   which serve card taps, wait at most 10 s over 2 attempts with 15 s
-  requests (`THREAD_RETRY`). A failed feed keeps its
-  stored stories and is retried on the next refresh.
+  requests (`THREAD_RETRY`). Feeds still failing after the refresh's
+  pass get one more pass after `reddit_arctic_retry_delay_seconds`
+  (120 s; 0 disables); a feed failing both keeps its stored stories and
+  is retried on the next refresh. Each refresh logs `elapsed_s` and a
+  `reddit_refresh_arctic` line (failed feeds; archive requests, overload
+  answers and transport errors since the previous refresh, card taps
+  included).
 * **Check before switching**: `scripts/compare_reddit_sources.py` fetches
   each feed both ways and counts matching story ids.
 

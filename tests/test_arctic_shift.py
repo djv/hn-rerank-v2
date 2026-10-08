@@ -691,3 +691,87 @@ def test_compare_feed_matches_by_story_id() -> None:
     assert [o.url for o in result.rss_only] == [young.url]
     assert result.rss_only_young == 1
     assert [o.age_hours for o in result.arctic_only] == [72.0]
+
+
+async def test_request_stats_count_attempts_and_overload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arctic_shift.take_stats()
+    statuses = [422, 200]
+    _serve(
+        monkeypatch,
+        lambda _r: httpx.Response(statuses.pop(0), json={"data": []}),
+    )
+
+    await arctic_shift.comment_tree("abc")
+
+    assert arctic_shift.take_stats() == arctic_shift.RequestStats(
+        requests=2, overloaded=1, transport_errors=0
+    )
+    assert arctic_shift.take_stats() == arctic_shift.RequestStats(0, 0, 0)
+
+
+def test_refresh_retries_failed_arctic_feeds_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Feeds the archive refused in the first pass get one later pass; the
+    rest are not fetched again."""
+    other = "https://www.reddit.com/r/haskell/top/.rss?t=week&limit=25"
+    db = Database(":memory:")
+    try:
+        config = replace(
+            Config(db_path=":memory:"),
+            reddit_source="arctic_shift",
+            reddit_arctic_retry_delay_seconds=0.001,
+            prewarm_reddit_full=False,
+            rss=RssConfig(enabled=True, per_feed_limit=70, feeds=(FEED, other)),
+        )
+        story = {
+            FEED: reddit_post_story(_post("a"), "rss_reddit_localllama"),
+            other: reddit_post_story(_post("b"), "rss_reddit_haskell"),
+        }
+        passes: list[list[str]] = []
+
+        def fake_topfeed(
+            feeds: list[str],
+            per_feed: int,
+            days: int,
+            exclude_urls: set[str],
+            reddit_source: str = "rss",
+        ) -> tuple[list[object], list[str]]:
+            passes.append(list(feeds))
+            # The first pass fails `other`; the retry pass succeeds.
+            for feed in feeds:
+                if feed == FEED or len(passes) > 1:
+                    reddit_feed_cache.set(feed, [story[feed]])
+
+            async def factory() -> None:
+                return None
+
+            return [factory], list(feeds)
+
+        class _Queue:
+            def enqueue_all_reddit_fetches(
+                self,
+                topfeed: list[object],
+                prewarm: list[object],
+                *,
+                min_stride_seconds: float | None = None,
+            ) -> None:
+                return None
+
+            def wait_until_empty(self, timeout: float = 5400.0) -> bool:
+                return True
+
+        monkeypatch.setattr(pipeline, "build_reddit_topfeed_factories", fake_topfeed)
+        monkeypatch.setattr("reddit_fetch_queue.queue", _Queue())
+
+        result = pipeline.refresh_reddit_candidates(config, db, None)
+
+        assert passes == [[FEED, other], [other]]
+        assert result.changed_stories == 2
+        for feed in (FEED, other):
+            state = db.get_reddit_feed_state(feed)
+            assert state is not None and state.failure_count == 0
+    finally:
+        db.close()
