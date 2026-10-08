@@ -89,6 +89,10 @@ None.
   scoring (7.1 s, candidate word counts recomputed); a persisted or
   prewarmed count cache would cut it.
 - User: restart the TUI from a fresh shell (8 per section, `hn-open`).
+- New today (15:01, 15:37, 16:06 UTC, none before): trafilatura logs
+  "[ERROR] empty HTML tree" when article extraction gets an empty page
+  (the first after a Substack 403 fell back to urllib). Skip extraction on
+  empty bodies or quiet the logger; check why Substack now answers 403.
 - Arctic Shift: check `reddit_refresh_arctic` lines over the next days and
   a Reddit card's tldr-detail (live tap) with archive comments. Rollback:
   delete `reddit_source` in config.toml and restart (RSS until Nov 13).
