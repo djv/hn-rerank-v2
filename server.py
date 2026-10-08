@@ -61,7 +61,12 @@ from pipeline import (
     is_hn_source,
 )
 from pipeline.interleave import PRODUCTION_ARM
-from pipeline.ranking import serve_window
+from pipeline.ranking import (
+    COLD_DECK_MARGIN,
+    SELECT_MARGIN,
+    VIEW_SIZE,
+    serve_window,
+)
 from pipeline.ainews import AINEWS_SOURCE
 from pipeline.hn_dupes import pointer_thread_target
 from llm_limiter import limiter as llm_limiter
@@ -2094,7 +2099,9 @@ class Handler:
         # so this rebuild (and every warm/cold-deck build until the next
         # regen) picks up the new rows instead of a stale snapshot.
         invalidate_candidate_pool()
-        cold_deck = build_cold_deck(cls.db, cls.config, embedder=cls.embedder)
+        cold_deck = build_cold_deck(
+            cls.db, cls.config, embedder=cls.embedder, margin=COLD_DECK_MARGIN
+        )
         cls._cold_deck = cold_deck
         logging.info("cold_deck_rebuilt stories=%s", len(cold_deck.stories()))
 
@@ -3671,7 +3678,9 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
             _log_llm_spend_today(db)
             reddit_worker.submit()
 
-            cold_deck = Handler._cold_deck
+            # Background work covers what the cold deck held before its reserve
+            # deepened; the reserve only backfills a voter's votes on reads.
+            cold_deck = Handler._cold_deck.capped(VIEW_SIZE * SELECT_MARGIN)
             if _wants_background_tasks(config, cold_deck):
                 t = threading.Thread(
                     target=lambda: Handler._warm_background_tasks(

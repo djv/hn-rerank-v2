@@ -1,5 +1,19 @@
 # Worklog: hn-rewrite
 
+## 2026-10-08 Deeper cold deck after restarts
+
+After the 12:17 UTC restart, profile 151's TUI showed about 5 Popular 1-week
+stories for ~90 s. Until a voter's first warm lands, `_deck_for_user` serves
+the shared cold deck less their votes, and the cold deck kept only
+`SELECT_MARGIN` x 16 = 32 stories per view. On the live DB profile 151 had
+voted 28 of 1w Popular's top 32 and all 32 of 1m Popular's (a full view
+needed depth 297). The cold deck is now built at `COLD_DECK_MARGIN = 32`
+(512 per view); `build_cold_deck` and `assemble_window_deck` take a
+`margin`. Regen-time background work (article fetch, TLDR prefetch) still
+sees only the first 32 per view (`WindowDeck.capped`), so its load is
+unchanged. Test: `test_voter_without_deck_gets_full_views_from_cold_deck`
+(fails at the old margin with 0 of 16).
+
 ## 2026-10-08 Subreddit list changes; Reddit replacement research
 
 config.toml: dropped r/transit, r/expats and r/eupersonalfinance (profile

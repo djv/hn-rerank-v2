@@ -13,6 +13,7 @@ from typing import Any, cast
 
 from server import DeckState, Handler, SKELETON_HTML, create_app
 from pipeline import Config, Embedder, RankedStory, WindowDeck, WindowViews
+from pipeline.ranking import VIEW_SIZE
 from database import Database, Story, User
 from warm_scheduler import WarmScheduler
 
@@ -5682,6 +5683,42 @@ def test_pool_changed_stales_every_deck_and_queues_cached_users(swr_handler):
         uid: v + 1 for uid, v in before.items()
     }
     assert sorted(calls) == sorted([(user.id, 4), (other.id, 2)])
+
+
+def test_voter_without_deck_gets_full_views_from_cold_deck(swr_handler) -> None:
+    # After a restart a voter is served the shared cold deck less their votes
+    # until the first warm lands; a heavy voter has voted its top stories,
+    # and the reserve must still fill each served view.
+    user, h = swr_handler
+    now = int(time.time())
+    n = 3 * VIEW_SIZE
+    for i in range(n):
+        h.db.upsert_story(
+            Story(
+                800_000 + i,
+                f"Busy story {i}",
+                f"https://example.com/busy/{i}",
+                5000 - i,
+                now - 3600,
+                "story text",
+                source="hn",
+                comment_count=10,
+            )
+        )
+    voted = {800_000 + i for i in range(2 * VIEW_SIZE)}
+    for sid in voted:
+        h.db.upsert_feedback(user.id, sid, "down")
+    h._trigger_warm = classmethod(  # type: ignore[method-assign]
+        lambda cls, *a, **kw: None
+    )
+
+    h._rebuild_cold_deck()
+    feed = h._feed_for_user(user, "1w")
+
+    for view in ("recommended", "popular"):
+        assert len(feed.orders[view]) == VIEW_SIZE
+        assert not voted & set(feed.orders[view])
+    assert feed.orders["popular"] == [800_000 + i for i in range(2 * VIEW_SIZE, n)]
 
 
 def test_page_embeds_the_feed_the_client_builds_cards_from(test_env):

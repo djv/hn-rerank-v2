@@ -377,7 +377,10 @@ the fully scored pool at one `now` for all five windows:
   Recommended misses. `scripts/preview_explore.py` prints a profile's picks
   from a snapshot.
 
-Views are picked at `SELECT_MARGIN = 2` times their served size, then
+Views are picked at `SELECT_MARGIN = 2` times their served size (the shared
+cold deck at `COLD_DECK_MARGIN = 32`, so a voter served it less their votes
+after a restart still gets full views; its background article fetch and TLDR
+prefetch cover only the first `SELECT_MARGIN` multiple), then
 `finalize_ranked_deck` runs URL/embedding dedup and `canonicalize_deck`
 (`canonicalize_hn_dupes` via `canonical_outcomes`) once over every story of the
 deck, in score order, and applies the result to each view: a dropped story

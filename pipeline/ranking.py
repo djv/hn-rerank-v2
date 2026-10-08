@@ -326,6 +326,11 @@ EXPLORE_PER_BADGE = 5
 # Views are picked at this multiple of their served size, so that dedup,
 # votes and stories ageing out of a window between warms leave enough.
 SELECT_MARGIN = 2
+# The shared cold deck's margin (512 per view). Until a restart's first warm
+# lands, a voter is served the cold deck less their votes; a heavy voter has
+# voted most of its top stories (2026-10-08, profile 151: 0 of 1m Popular's
+# top 32 left, a full view needed depth 297).
+COLD_DECK_MARGIN = 32
 # Windows are nested by age; "archive" is everything older than 30 days.
 # Boundaries are inclusive: a story exactly 30 days old is in "1m".
 WINDOW_SECONDS: dict[Window, int] = {
@@ -2018,6 +2023,10 @@ class WindowDeck:
             lambda _w, _v, items: (r for r in items if r.story.id not in story_ids)
         )
 
+    def capped(self, n: int) -> WindowDeck:
+        """Each view's first *n* stories."""
+        return self.map_views(lambda _w, _v, items: items[:n])
+
 
 @dataclass(frozen=True)
 class ExploreContext:
@@ -2046,9 +2055,10 @@ def assemble_window_deck(
     is_feedback_match: Callable[[Story], bool] | None = None,
     trace: RankTrace | _NullTrace = NULL_TRACE,
     arm_rankings: Mapping[str, Sequence[int]] | None = None,
+    margin: int = SELECT_MARGIN,
 ) -> WindowDeck:
     """Pick every window's three views from a fully scored candidate pool,
-    all at one *now*, each ``SELECT_MARGIN`` times its served size
+    all at one *now*, each *margin* times its served size
     (``serve_window`` caps them at request time).
 
     Per window (see ``in_window``):
@@ -2158,7 +2168,7 @@ def assemble_window_deck(
                 queues[interest_of(r)].append(r)
         heads = dict.fromkeys(order, 0)
         out: list[RankedStory] = []
-        limit = EXPLORE_PER_BADGE * SELECT_MARGIN
+        limit = EXPLORE_PER_BADGE * margin
         while len(out) < limit:
             took = False
             for c in order:
@@ -2180,13 +2190,13 @@ def assemble_window_deck(
     for window in WINDOWS:
         pool = [r for r in by_score if in_window(r.story.time, window, now)]
         trace.set_count(f"window_pool_{window}", len(pool))
-        recommended = pool[: VIEW_SIZE * SELECT_MARGIN]
+        recommended = pool[: VIEW_SIZE * margin]
         if arm_rankings:
             in_pool = {r.story.id for r in pool}
             tops = {r.story.id for r in recommended}
             for ranking in arm_rankings.values():
                 own = (sid for sid in ranking if sid in in_pool)
-                tops.update(itertools.islice(own, VIEW_SIZE * SELECT_MARGIN))
+                tops.update(itertools.islice(own, VIEW_SIZE * margin))
             recommended = [r for r in pool if r.story.id in tops]
         popular = sorted(
             (r for r in pool if is_hn_source(r.story.source)),
@@ -2194,7 +2204,7 @@ def assemble_window_deck(
                 r.story.score, r.story.time, now, GRAVITY_TIME_SCALE[window]
             ),
             reverse=True,
-        )[: VIEW_SIZE * SELECT_MARGIN]
+        )[: VIEW_SIZE * margin]
         picked = {r.story.id for r in recommended}
         explore_view: list[RankedStory] = []
         for key, mark, needs_probs in explore_passes:
@@ -2205,7 +2215,7 @@ def assemble_window_deck(
                 and (not needs_probs or r.prob_down is not None)
             ]
             eligible.sort(key=key, reverse=True)
-            for r in take_unmatched(eligible, EXPLORE_PER_BADGE * SELECT_MARGIN):
+            for r in take_unmatched(eligible, EXPLORE_PER_BADGE * margin):
                 picked.add(r.story.id)
                 explore_view.append(mark(r))
         explore_view.extend(interest_picks(pool, recommended[:VIEW_SIZE], picked))

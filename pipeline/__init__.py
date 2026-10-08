@@ -41,6 +41,7 @@ from .ranking import (
     RankTrace,
     RankedComment,
     RankedStory,
+    SELECT_MARGIN,
     SOURCE_CATEGORIES,
     TOP_COMMENT_CORE_THREADS,
     TOP_COMMENT_LIMIT,
@@ -168,6 +169,7 @@ def build_cold_deck(
     trace: RankTrace | _NullTrace = NULL_TRACE,
     *,
     candidates: list[Story] | None = None,
+    margin: int = SELECT_MARGIN,
 ) -> WindowDeck:
     """The non-personalized deck: gravity-scored window views, no
     embeddings.
@@ -180,6 +182,9 @@ def build_cold_deck(
     personalized and needs feedback to compute against.
 
     When *user_id* is provided, already-voted stories are excluded.
+    *margin* is ``assemble_window_deck``'s: the server's shared cold deck
+    passes ``COLD_DECK_MARGIN`` so it still fills each view once a voter's
+    votes are removed.
 
     When *embedder* is provided, the candidate pool is served from the
     process-wide cache (``pipeline.candidate_cache``) instead of a fresh
@@ -214,6 +219,7 @@ def build_cold_deck(
         config=config,
         now=now_ts,
         trace=trace,
+        margin=margin,
     )
 
 

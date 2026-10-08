@@ -52,6 +52,11 @@ metadata-scale middle variant, short-history curve).
   Devvit and the Data API are not usable here. Evidence in FINDINGS.md.
 - Subreddits (user choice): dropped transit, expats, eupersonalfinance;
   added mlscaling, accelerate, OpenAI, codex, agi, Aging (21 feeds).
+- Restart fallback: the shared cold deck now keeps 512 stories per view
+  (was 32), so profile 151 no longer drops to ~5 Popular stories for the
+  ~90 s after a restart (WORKLOG 2026-10-08).
+- Arctic Shift adapter: being built by another session in worktree
+  ../hn-rerank-arctic (branch arctic-shift).
 
 ## Blocker
 None.
