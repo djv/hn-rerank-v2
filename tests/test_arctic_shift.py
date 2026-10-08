@@ -177,7 +177,7 @@ async def test_top_posts_raises_on_error_payload(
         await arctic_shift.top_posts("x", window_seconds=WEEK, limit=5, now=NOW)
 
 
-async def test_get_retries_transient_status_once(
+async def test_get_retries_transient_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     statuses = [422, 200]
@@ -190,9 +190,16 @@ async def test_get_retries_transient_status_once(
     assert await arctic_shift.top_posts("x", window_seconds=WEEK, limit=5) == []
     assert len(seen) == 2
 
-    _serve(monkeypatch, lambda _r: httpx.Response(429))
+    # Background top lists wait out overload longer than thread fetches,
+    # which serve card taps.
+    seen = _serve(monkeypatch, lambda _r: httpx.Response(429))
     with pytest.raises(ArcticShiftError, match="HTTP 429"):
         await arctic_shift.top_posts("x", window_seconds=WEEK, limit=5)
+    assert len(seen) == arctic_shift.TOP_POSTS_ATTEMPTS
+    seen.clear()
+    with pytest.raises(ArcticShiftError, match="HTTP 429"):
+        await arctic_shift.comment_tree("abc")
+    assert len(seen) == arctic_shift.MAX_ATTEMPTS
 
 
 # The autouse throttle fixture only zeroes module constants, so sharing it

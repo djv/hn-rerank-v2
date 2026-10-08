@@ -1,5 +1,31 @@
 # Worklog: hn-rewrite
 
+## 2026-10-08 Arctic Shift as an opt-in Reddit source
+
+The user chose to build an Arctic Shift adapter before Reddit RSS ends on
+November 13, deploy it with RSS still on, and switch on November 11.
+`reddit_source = "arctic_shift"` (default `"rss"`, `arctic_shift.py`)
+reads subreddit top lists (every post in the window, ranked by archived
+score) and comment threads from the archive. Stories are keyed by
+permalink like RSS entries, so ids, votes and caches carry over; score and
+comment count stay 0 as on the RSS path. Design and limits:
+ARCHITECTURE.md 3.4.4. `refresh_reddit_candidates` now detects changes
+against the stored row (upsert keeps the longer self_text, so comparing
+the fetched text flagged unchanged rows).
+
+A first live run returned 2 of 25 r/ClaudeAI posts: nearly all carry
+`removed_by_category = "automod_filtered"` from archiving time, yet appear
+in Reddit's own top list. Only `[removed]`/`[deleted]` text now drops a
+post. The archive also answered 422 "Timeout. Maybe slow down a bit" to
+the laptop and VPS for about a minute; top lists now retry up to 4 times.
+
+`scripts/compare_reddit_sources.py` on all 21 feeds (laptop, RSS retries
+after 429): 395 of 470 RSS stories matched; 66 of the 75 RSS-only posts
+were under 36 h old (not yet scored by the archive). Small subreddits get
+a few score-0/1 posts Reddit hid (r/ExpatFIRE RSS 16, archive 25).
+Developed in worktree ../hn-rerank-arctic because another session had WIP
+in the same files.
+
 ## 2026-10-08 Deeper cold deck after restarts
 
 After the 12:17 UTC restart, profile 151's TUI showed about 5 Popular 1-week

@@ -57,8 +57,9 @@ metadata-scale middle variant, short-history curve).
   ~90 s after a restart (WORKLOG 2026-10-08). Deployed 6ae84d2 at 12:33 UTC:
   during the 90 s cold window, 1w and 1m served 16 Popular / 16 Recommended;
   no journal errors; dashboard and tldr-cache 200.
-- Arctic Shift adapter: being built by another session in worktree
-  ../hn-rerank-arctic (branch arctic-shift).
+- Arctic Shift adapter merged and deployed off by default
+  (`reddit_source = "rss"`; ARCHITECTURE.md 3.4.4). All 21 feeds compared:
+  395/470 RSS stories match; 66 of 75 misses are posts under 36 h old.
 
 ## Blocker
 None.
@@ -68,10 +69,11 @@ None.
   `uv run python scripts/interleave_report.py --db hn_rewrite.db
   --user-id 151 --since 1791432442.75 --until 1793851642.75` on the VPS.
   Weekly descriptive reports and safety checks per INTERLEAVING.md.
-- Reddit replacement before November 13: user to decide on an Arctic
-  Shift source adapter (posts ranked by score locally, comment trees from
-  `/api/comments/tree`), then implement and test it against RSS while
-  both work.
+- Reddit switch on 2026-11-11 (user choice; RSS ends November 13): rerun
+  `uv run python scripts/compare_reddit_sources.py` (laptop or VPS), set
+  `reddit_source = "arctic_shift"` under `[hn_rewrite]` in config.toml,
+  deploy, restart, then check `reddit_refresh_complete` and a Reddit
+  card's tldr-detail. Rollback: remove the line and restart.
 - Carried over: 1m Popular age-mix
   check, real-terminal tint/footer check, October 21 Gemma 2 future-vote
   recheck (/home/d/TASKS.md).

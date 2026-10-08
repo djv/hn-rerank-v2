@@ -35,6 +35,23 @@
   RSS snapshot, r/LocalLLaMA matched 22/25 in near order; the 3 misses
   were 15-24 h old posts with score 1.
 
+### Arctic Shift adapter check (2026-10-08)
+
+- Removal category is stale: of r/ClaudeAI's 60 top archived posts, 55
+  were `automod_filtered` and 1 `reddit`; 18 of these 56, including the top
+  15 by score, were in Reddit's RSS top 25. All 7 RSS posts missing from
+  the archive's top 40 were under 36 h old (score 1).
+- `compare_reddit_sources.py`, all 21 feeds: 395/470 RSS stories matched.
+  RSS-only 75, of which 66 under 36 h; fatFIRE had 4 older ones (archive
+  scores freeze at ~36 h while Reddit's keep rising). Where RSS listed
+  fewer than 25 posts, the archive added score-0/1 posts Reddit hid
+  (ExpatFIRE +9, mlscaling +5); their removal category and score do not
+  separate them from visible score-0 posts.
+- Overload: 422 `{"error":"Timeout. Maybe slow down a bit"}` with
+  `x-ratelimit-reset: 16`, from both laptop and VPS, cleared within ~1 min.
+- Laptop RSS works with the service's Reddit user agent but 429s after a
+  few feeds; 15-30 s spacing plus one 60 s retry got every feed.
+
 ### Subreddit changes (user chose, 2026-10-08)
 
 Profile 151's votes on each subreddit's own posts (up/neutral/down):

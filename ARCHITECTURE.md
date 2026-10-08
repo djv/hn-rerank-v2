@@ -351,13 +351,19 @@ from them.
   1.5 days late. `removed_by_category` is ignored: it is a snapshot from
   archiving time, and r/ClaudeAI's AutoModerator holds nearly every post
   that moderators then approve; only `[removed]`/`[deleted]` text drops a
-  post.
+  post. The archive does not learn of later removals, so a subreddit with
+  fewer than `limit` visible posts a week gets a few score-0/1 posts that
+  Reddit hid (r/ExpatFIRE: RSS 16, Arctic Shift 25).
 * **Threads** (`server._fetch_reddit_arctic_context`, used by prewarm and
   tldr-detail): the post's text plus its comment tree, top-level comments
   by score first, then replies, with the RSS path's filters and caps.
 * **Pacing**: these factories skip `reddit_limiter` (it paces reddit.com
   only); `arctic_shift` spaces requests 0.5 s apart process-wide and the
-  queue strides by `reddit_arctic_stride_seconds` (2 s).
+  queue strides by `reddit_arctic_stride_seconds` (2 s). Overload answers
+  (422 "Timeout. Maybe slow down a bit", 429, 5xx) are retried after the
+  server's `x-ratelimit-reset` (capped at 30 s): up to 4 attempts for top
+  lists, 2 for threads, which serve card taps. A failed feed keeps its
+  stored stories and is retried on the next refresh.
 * **Check before switching**: `scripts/compare_reddit_sources.py` fetches
   each feed both ways and counts matching story ids.
 
