@@ -54,7 +54,9 @@ metadata-scale middle variant, short-history curve).
   added mlscaling, accelerate, OpenAI, codex, agi, Aging (21 feeds).
 - Restart fallback: the shared cold deck now keeps 512 stories per view
   (was 32), so profile 151 no longer drops to ~5 Popular stories for the
-  ~90 s after a restart (WORKLOG 2026-10-08).
+  ~90 s after a restart (WORKLOG 2026-10-08). Deployed 6ae84d2 at 12:33 UTC:
+  during the 90 s cold window, 1w and 1m served 16 Popular / 16 Recommended;
+  no journal errors; dashboard and tldr-cache 200.
 - Arctic Shift adapter: being built by another session in worktree
   ../hn-rerank-arctic (branch arctic-shift).
 
