@@ -195,11 +195,27 @@ async def test_get_retries_transient_status(
     seen = _serve(monkeypatch, lambda _r: httpx.Response(429))
     with pytest.raises(ArcticShiftError, match="HTTP 429"):
         await arctic_shift.top_posts("x", window_seconds=WEEK, limit=5)
-    assert len(seen) == arctic_shift.TOP_POSTS_ATTEMPTS
+    assert len(seen) == arctic_shift.TOP_POSTS_RETRY.attempts
     seen.clear()
     with pytest.raises(ArcticShiftError, match="HTTP 429"):
         await arctic_shift.comment_tree("abc")
-    assert len(seen) == arctic_shift.MAX_ATTEMPTS
+    assert len(seen) == arctic_shift.THREAD_RETRY.attempts
+
+
+def test_overload_wait_follows_the_server_reset_up_to_each_cap() -> None:
+    """The archive's overload window resets on the minute: background top
+    lists wait it out, thread fetches for card taps do not."""
+    overloaded = httpx.Response(422, headers={"x-ratelimit-reset": "51"})
+    assert (
+        arctic_shift._retry_wait(
+            overloaded, arctic_shift.TOP_POSTS_RETRY.max_wait_seconds
+        )
+        == 51.0
+    )
+    assert (
+        arctic_shift._retry_wait(overloaded, arctic_shift.THREAD_RETRY.max_wait_seconds)
+        == arctic_shift.THREAD_RETRY.max_wait_seconds
+    )
 
 
 # The autouse throttle fixture only zeroes module constants, so sharing it

@@ -361,8 +361,10 @@ from them.
   only); `arctic_shift` spaces requests 0.5 s apart process-wide and the
   queue strides by `reddit_arctic_stride_seconds` (2 s). Overload answers
   (422 "Timeout. Maybe slow down a bit", 429, 5xx) are retried after the
-  server's `x-ratelimit-reset` (capped at 30 s): up to 4 attempts for top
-  lists, 2 for threads, which serve card taps. A failed feed keeps its
+  server's `x-ratelimit-reset`. The archive sheds load for every client
+  until its per-minute window resets, so top lists (background) wait up to
+  65 s over 4 attempts (`TOP_POSTS_RETRY`); threads, which serve card
+  taps, wait at most 10 s over 2 (`THREAD_RETRY`). A failed feed keeps its
   stored stories and is retried on the next refresh.
 * **Check before switching**: `scripts/compare_reddit_sources.py` fetches
   each feed both ways and counts matching story ids.

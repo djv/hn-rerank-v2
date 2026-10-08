@@ -35,12 +35,6 @@ ARCTIC_SHIFT_USER_AGENT = "hn-rewrite/1.0 personal reader (Reddit top posts)"
 ARCTIC_SHIFT_TIMEOUT_SECONDS = 60.0
 # Minimum start-to-start spacing between requests across all threads.
 REQUEST_SPACING_SECONDS = 0.5
-MAX_ATTEMPTS = 2
-# Top lists are fetched in the background, so they can wait out the
-# archive's overload answers (422 "Timeout. Maybe slow down a bit", which
-# cleared within about a minute on 2026-10-08).
-TOP_POSTS_ATTEMPTS = 4
-MAX_RETRY_WAIT_SECONDS = 30.0
 # Wait before the retry when no x-ratelimit-reset header says otherwise.
 RETRY_DELAY_SECONDS = 2.0
 MAX_SEARCH_PAGES = 30
@@ -59,6 +53,21 @@ _next_request_at = 0.0
 
 class ArcticShiftError(Exception):
     """A request failed after retries or returned an unexpected shape."""
+
+
+@dataclass(frozen=True)
+class Retry:
+    attempts: int
+    # Cap on the server's x-ratelimit-reset wait between attempts.
+    max_wait_seconds: float
+
+
+# When overloaded the archive answers 422 "Timeout. Maybe slow down a bit"
+# to every client until its per-minute window resets (x-ratelimit-reset-at
+# on a minute boundary; 2026-10-08). Background top lists wait the window
+# out; thread fetches serve card taps, so they give up sooner.
+TOP_POSTS_RETRY = Retry(attempts=4, max_wait_seconds=65.0)
+THREAD_RETRY = Retry(attempts=2, max_wait_seconds=10.0)
 
 
 @dataclass(frozen=True)
@@ -111,37 +120,37 @@ async def _wait_turn() -> None:
         await asyncio.sleep(start - now)
 
 
-def _retry_wait(resp: httpx.Response) -> float:
+def _retry_wait(resp: httpx.Response, max_wait_seconds: float) -> float:
     raw = resp.headers.get("x-ratelimit-reset")
     try:
         wait = float(raw) if raw is not None else RETRY_DELAY_SECONDS
     except ValueError:
         wait = RETRY_DELAY_SECONDS
-    return min(max(wait, 0.0), MAX_RETRY_WAIT_SECONDS)
+    return min(max(wait, 0.0), max_wait_seconds)
 
 
 async def _get_data(
     client: httpx.AsyncClient,
     path: str,
     params: dict[str, str | int],
-    attempts: int = MAX_ATTEMPTS,
+    retry: Retry = THREAD_RETRY,
 ) -> list[object]:
     """GET ``path`` and return its ``data`` list, retrying transient errors."""
     last_error = ""
-    for attempt in range(attempts):
+    for attempt in range(retry.attempts):
         await _wait_turn()
         try:
             resp = await client.get(path, params=params)
         except httpx.HTTPError as exc:
             last_error = repr(exc)
-            if attempt + 1 < attempts:
+            if attempt + 1 < retry.attempts:
                 await asyncio.sleep(RETRY_DELAY_SECONDS)
             continue
         # 422 has been seen transiently on valid queries (2026-10-08).
         if resp.status_code in (422, 429) or resp.status_code >= 500:
             last_error = f"HTTP {resp.status_code}"
-            if attempt + 1 < attempts:
-                await asyncio.sleep(_retry_wait(resp))
+            if attempt + 1 < retry.attempts:
+                await asyncio.sleep(_retry_wait(resp, retry.max_wait_seconds))
             continue
         if resp.status_code != 200:
             raise ArcticShiftError(f"{path}: HTTP {resp.status_code}")
@@ -229,7 +238,7 @@ async def _search_scores(
     subreddit: str,
     after: int,
     before: int,
-    attempts: int = MAX_ATTEMPTS,
+    retry: Retry = THREAD_RETRY,
 ) -> list[_PostScore]:
     seen: dict[str, _PostScore] = {}
     cursor = after
@@ -245,7 +254,7 @@ async def _search_scores(
                 "limit": "auto",
                 "fields": "id,score,created_utc",
             },
-            attempts,
+            retry,
         )
         parsed = [p for raw in rows if (p := _parse_score(raw)) is not None]
         new = [p for p in parsed if p.id not in seen]
@@ -267,7 +276,7 @@ async def _search_scores(
 
 
 async def _posts_by_ids(
-    client: httpx.AsyncClient, ids: list[str], attempts: int = MAX_ATTEMPTS
+    client: httpx.AsyncClient, ids: list[str], retry: Retry = THREAD_RETRY
 ) -> list[ArcticPost]:
     posts: list[ArcticPost] = []
     for start in range(0, len(ids), 100):
@@ -275,7 +284,7 @@ async def _posts_by_ids(
             client,
             "/api/posts/ids",
             {"ids": ",".join(ids[start : start + 100])},
-            attempts,
+            retry,
         )
         posts.extend(p for raw in rows if (p := parse_post(raw)) is not None)
     return posts
@@ -309,11 +318,11 @@ async def top_posts(
     end = int(now if now is not None else time.time())
     start = int(end - window_seconds)
     async with _client() as client:
-        scores = await _search_scores(client, subreddit, start, end, TOP_POSTS_ATTEMPTS)
+        scores = await _search_scores(client, subreddit, start, end, TOP_POSTS_RETRY)
         leaders = sorted(scores, key=lambda p: (-p.score, -p.created_utc))[
             : limit * DETAIL_CANDIDATE_FACTOR
         ]
-        posts = await _posts_by_ids(client, [p.id for p in leaders], TOP_POSTS_ATTEMPTS)
+        posts = await _posts_by_ids(client, [p.id for p in leaders], TOP_POSTS_RETRY)
     kept = [p for p in posts if not p.removed and start <= p.created_utc <= end]
     kept.sort(key=lambda p: (-p.score, -p.created_utc))
     return kept[:limit]
