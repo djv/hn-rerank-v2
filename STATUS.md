@@ -53,9 +53,7 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   Devvit and the Data API are not usable here. Evidence in FINDINGS.md.
 - Subreddits (user choice): dropped transit, expats, eupersonalfinance;
   added mlscaling, accelerate, OpenAI, codex, agi, Aging (21 feeds).
-  accelerate, OpenAI, codex and Aging stored 25 stories each (12:35 UTC);
-  mlscaling and agi failed once on Reddit 429s, and restarts cut the
-  retries; the refresh started 13:25 UTC retries them (unverified).
+  All six now have stories (agi and mlscaling via Arctic Shift).
 - Restart fallback: the shared cold deck now keeps 512 stories per view
   (was 32), so profile 151 no longer drops to ~5 Popular stories for the
   ~90 s after a restart (WORKLOG 2026-10-08). Deployed 6ae84d2 at 12:33 UTC:
@@ -69,17 +67,22 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
 - Arctic Shift adapter (ARCHITECTURE.md 3.4.4). All 21 feeds compared:
   395/470 RSS stories match; 66 of 75 misses are posts under 36 h old.
   The user moved the switch from November 11 to now: config.toml sets
-  `reddit_source = "arctic_shift"`.
+  `reddit_source = "arctic_shift"` (live since 13:32 UTC). Since then 19
+  of 20 attempted feeds stored stories; r/MachineLearning failed twice on
+  the archive's 422 overload and keeps its earlier 20 stories. Refreshes
+  took 13-22 min (overload retries). Prefetched threads carry archive
+  comments (e.g. 9 of 25 r/agi stories).
+- Codex (gpt-6.1-sol) reviewed the change; all 5 findings fixed with
+  regression tests and deployed (f50f4b7, 14:23 UTC; 1187 tests pass).
 
 ## Blocker
 None.
 
 ## Next step
-- After the Arctic Shift deploy: `reddit_refresh_complete` in the journal,
-  all 21 feeds (including mlscaling and agi) with a fresh `last_success_at`
-  in `reddit_feed_state`, and a Reddit card's tldr-detail with comments.
-  Rollback: delete the `reddit_source` line in config.toml and restart
-  (RSS works until November 13).
+- Arctic Shift follow-up: confirm r/MachineLearning recovers on a later
+  refresh, and that a Reddit card's tldr-detail (live tap) shows archive
+  comments. Rollback: delete the `reddit_source` line in config.toml and
+  restart (RSS works until November 13).
 - Final analysis at T0 + 28 days, 2026-11-05 04:07 UTC (Nov 4 23:07 ET):
   `uv run python scripts/interleave_report.py --db hn_rewrite.db
   --user-id 151 --since 1791432442.75 --until 1793851642.75` on the VPS.
