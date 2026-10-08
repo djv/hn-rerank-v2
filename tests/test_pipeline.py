@@ -1065,9 +1065,19 @@ async def test_rss_feed_retains_full_content_body(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fallback_error",
+    [
+        "url_error",
+        # urllib's read timeout escapes as a bare TimeoutError (2026-10-08).
+        "read_timeout",
+    ],
+)
 async def test_fetch_and_parse_feed_transport_error_logs_warning_not_error(
-    monkeypatch, caplog
-):
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fallback_error: str,
+) -> None:
     """A transport error that survives the urllib fallback too (genuine
     network-down) is expected/transient -- logged at WARNING with no
     traceback, not ERROR. Regression for the 2026-08-27 fix: previously
@@ -1098,8 +1108,13 @@ async def test_fetch_and_parse_feed_transport_error_logs_warning_not_error(
             raise httpx.RemoteProtocolError("peer closed connection")
 
     monkeypatch.setattr("pipeline.enrichment.httpx.AsyncClient", MockClient)
+    error: Exception = (
+        URLError("down")
+        if fallback_error == "url_error"
+        else TimeoutError("The read operation timed out")
+    )
     monkeypatch.setattr(
-        "http_fetch.urlopen", lambda *a, **k: (_ for _ in ()).throw(URLError("down"))
+        "http_fetch.urlopen", lambda *a, **k: (_ for _ in ()).throw(error)
     )
 
     stories = await _fetch_and_parse_feed(

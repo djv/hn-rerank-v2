@@ -875,11 +875,12 @@ async def _fetch_and_parse_feed(
             stories.append(story)
 
         return stories
-    except (URLError, httpx.HTTPError) as e:
+    except (URLError, httpx.HTTPError, TimeoutError) as e:
         # Both httpx and the urllib fallback (fetch_with_urllib_fallback)
         # were exhausted -- a genuine network-down/DNS/timeout condition,
         # or a status code neither side treats as retryable. Expected and
-        # transient; not worth a full traceback.
+        # transient; not worth a full traceback. urllib's read timeout
+        # raises a bare TimeoutError, not URLError (2026-10-08).
         logging.warning("Failed to fetch RSS feed %s: %r", feed_url, e)
         return []
     except Exception:

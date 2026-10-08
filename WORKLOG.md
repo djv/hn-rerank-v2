@@ -1,5 +1,13 @@
 # Worklog: hn-rewrite
 
+## 2026-10-08 RSS read timeouts log one warning line
+
+At 15:36 UTC two feeds (tweag.io, trailofbits) logged "Unexpected error
+fetching RSS feed" with a traceback: urllib's read timeout in the fallback
+raises a bare `TimeoutError`, which the expected-failure clause (URLError,
+httpx errors) missed. It now logs the one-line warning like other network
+failures; the transport-error test covers both cases.
+
 ## 2026-10-08 Fewer stories per section
 
 User's choice: each section shows 8 stories instead of 12 (web
