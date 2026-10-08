@@ -24,6 +24,11 @@ Removing words preserves counts but lowers NDCG; removing metadata raises
 NDCG while lowering recent AUC. Labels were reused during selection;
 quality equivalence, live benefit and serving savings remain unverified.
 User requested tradeoffs only: no production replacement selected.
+Latest user preference: candidates #2 (one classifier, all features) and
+#4 (the same classifier without metadata) look best. Keep both as the
+shortlist, not a deployment selection. #2 has stronger overall/recent AUC;
+#4 has higher NDCG@12 and98 liked/5 disliked versus97/6, but recent AUC
+falls .8366→.8064. These point estimates do not establish superiority.
 
 Two read-only Claude Opus5.5 reviews completed. The statistics CLI label
 collision was fixed and routing/feature/probability/dedup tests added.
@@ -33,6 +38,8 @@ Holm adjustment is complete (adjusted p .252–.785). The full suite passed
 1,128 tests /18 skipped; Ruff and all21 touched Python formatting checks
 passed. Type checking retains only the existing untracked inspection-script
 diagnostic. No experiment job remains running.
+Saved implementation/evidence commit28afc5c is pushed; GitHub backend and
+Terminal client CI workflows both completed successfully.
 [Feature report](docs/evaluations/model-ablation-20261007/FEATURE-REMOVALS.md).
 [Full report](docs/evaluations/model-ablation-20261007/BROAD-ONE-CLASSIFIER.md).
 
@@ -83,6 +90,8 @@ creations during anonymous diagnostic checks are not organic signups.
   the prior code. No production database was changed by this work.
 
 ## Next step
+- Retain user-shortlisted candidates #2 and #4 for any subsequent comparison;
+  no new evaluation or production deployment was requested by this preference.
 - No model removal implemented. Historical/exposure-pool checks are done;
   a predeclared prospective comparison would be needed to validate
   equivalence before treating the simpler blend as proven.

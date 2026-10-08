@@ -1,5 +1,17 @@
 # HN Rerank findings
 
+## User evaluation shortlist — 2026-10-07
+
+After the four-row evaluation summary, the user said candidates #2 and #4
+look best: one joined classifier with all features and the same classifier
+without metadata. This is a shortlist preference, not authorization to
+deploy or select a production replacement. The all-feature setting has
+stronger overall/recent AUC; no metadata has higher mean NDCG@12 and98
+liked/5 disliked versus97/6, but recent AUC falls .8366→.8064. Both have
+more disliked top picks than production (2/144). Differences remain
+exploratory and uncertain. Backend and Terminal client CI for saved commit
+28afc5c both completed successfully.
+
 ## Broader one-classifier evaluation — 2026-10-07
 
 Completed the fixed classifier/feature/encoder screen on the laptop.

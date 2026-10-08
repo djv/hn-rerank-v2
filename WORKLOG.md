@@ -1,5 +1,13 @@
 # Worklog: hn-rewrite
 
+## 2026-10-07 Save user evaluation shortlist
+
+Recorded the user's preference for candidates #2 (one classifier with all
+features) and #4 (one classifier without metadata), including their AUC
+versus top-pick tradeoff. No production decision, new evaluation or
+deployment follows from this preference. Both GitHub CI workflows for
+28afc5c passed. This follow-up changes documentation only.
+
 ## 2026-10-07 One preference classifier experiments
 
 Added offline canonical-harness adapters for alternate SVM kernels and one
