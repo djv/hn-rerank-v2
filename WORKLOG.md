@@ -8,9 +8,12 @@ Chrome), 188, 189, 190 (2026-09-29 smoke page checks), 199 (TUI uvx
 sandbox), 213, 214 (interleaving smoke) — 8 users, 9 interaction_events,
 4 rank_perf rows; none had votes or interleave decks. Kept: the 12 profiles
 created 2026-10-08 02:08-02:21 UTC (each loaded the cold deck once, some
-three per second, no record of a test) and other anonymous visits.
+three per second, no record of a test; deleted later, below) and other
+anonymous visits.
 Backup first: VPS `hn_rewrite.db.pre_test_profiles_20261008T144729Z`
 (quick_check ok). Users 214 -> 206; profile 151's 3,889 votes unchanged.
+Then, at the user's request, profiles 201-212 too (Wed Oct 7, 10:08-10:21
+PM New York time; user rows only). Users 206 -> 194.
 
 ## 2026-10-08 Fixes from Codex review of the Arctic Shift change
 
