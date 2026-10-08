@@ -354,7 +354,7 @@ def story_metadata(story: FeedStory) -> str:
 
 # Every sort shows at most this many stories (matches the web client);
 # unrated stories past the cap slide in as ones ahead are rated.
-VIEW_LIMIT = 12
+VIEW_LIMIT = 8
 # Panes shorter than this many rows get one footer row (status and
 # "? help") and no "Because you upvoted" line in the reading heading.
 COMPACT_HEIGHT = 30

@@ -4631,7 +4631,8 @@ def test_hot_badge_requires_minimum_score(db, embedder):
             source="hn",
             comment_count=0,
         )
-        for i in range(1, 26)
+        # Fewer than a Popular view's picks, so story 99 is always kept.
+        for i in range(1, RECOMMENDED_PICKS - 3)
     ]
     candidates.append(
         Story(

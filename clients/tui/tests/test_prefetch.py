@@ -14,7 +14,7 @@ import pytest
 from textual.pilot import Pilot
 from textual.widgets import Markdown, OptionList
 
-from hn_rerank.app import Reader
+from hn_rerank.app import VIEW_LIMIT, Reader
 
 from ._settle import settle
 from .test_client import FakeServer, sample_feed
@@ -236,9 +236,9 @@ async def test_navigation_prefetch_generates_nearby_and_other_sorts() -> None:
     async with app.run_test(size=(120, 35)) as pilot:
         await settle(pilot)
         assert app.summaries.keys() >= {1, 2, 3, 4, 26, 27, 28, 29, 30}
-        assert 12 in fake.cached
+        assert VIEW_LIMIT in fake.cached
         assert 5 not in fake.generated  # deeper cache misses wait until nearby
-        assert 13 not in fake.cached  # past the 12-story view cap
+        assert VIEW_LIMIT + 1 not in fake.cached  # past the view cap
         assert 1 < fake.peak <= 4
         await pilot.press("j")
         await settle(pilot)

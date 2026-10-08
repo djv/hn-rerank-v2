@@ -31,6 +31,11 @@ confirmation.
   was production's alone (not stored in `interleave_decks`, so it credits
   no arm). 1 of 24 interleaved warms since T0. Fixed the same day: every
   arm of a rerank now trains on one vote snapshot.
+- Design change mid-test, 2026-10-08 (user's choice): views show 8 stories
+  instead of 12 (`VIEW_SIZE` 16 -> 12, so each arm drafts from its top 24
+  instead of 32). Crediting is unchanged (per impression and vote); a
+  view's first 8 cards split about 3/3/2 instead of 4/4/4. Effective from
+  its VPS deploy on 2026-10-08 (WORKLOG).
 
 ## Power replay
 

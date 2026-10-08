@@ -214,7 +214,7 @@ def test_dashboard_page_end_to_end(page: Any) -> None:
         "() => activeCard()?.querySelector('.tldr-detail-content h3, .tldr-detail-content details')"
     )
     start = _state(page)
-    assert len(start["head"]) == 12 and start["active"] == start["head"][0]
+    assert len(start["head"]) == 8 and start["active"] == start["head"][0]
     # Titles are text, never markup.
     assert "<b>not bold</b>" in page.locator(".story-card").first.inner_text()
     assert page.locator(".story-card b").count() == 0

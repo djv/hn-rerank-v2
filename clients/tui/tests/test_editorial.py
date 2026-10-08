@@ -15,6 +15,7 @@ from hn_rerank.app import (
     EMPTY_NOTICE,
     LIGHT_PALETTE,
     Reader,
+    VIEW_LIMIT,
     Setup,
     _cell_len,
     headline,
@@ -479,14 +480,14 @@ async def test_every_sort_shows_at_most_view_limit(tmp_path: Path) -> None:
         await settle(pilot)
         app.query_one(OptionList).focus()
         for _ in Reader.SORT_CYCLE:
-            assert len(app.stories) == 12
+            assert len(app.stories) == VIEW_LIMIT
             await pilot.press("s")
             await settle(pilot)
         assert str(app.query_one("#sort", Select).value) == "recommended"
-        assert [s.id for s in app.stories] == ids[:12]
+        assert [s.id for s in app.stories] == ids[:VIEW_LIMIT]
         app.rated.add(1)
         app.rebuild()
-        assert [s.id for s in app.stories] == ids[1:13]
+        assert [s.id for s in app.stories] == ids[1 : VIEW_LIMIT + 1]
 
 
 def test_headline_truncates_long_domains_to_fit() -> None:

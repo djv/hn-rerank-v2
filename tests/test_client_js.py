@@ -494,9 +494,12 @@ def test_views_cap_backfill_start_at_the_head_and_keep_the_explore_order() -> No
     const exploreAfter = viewOrder('1w:explore');
     console.log(JSON.stringify({ capped, backfilled, popular, explore, exploreAfter }));
     """)
-    assert result["capped"] == list(range(1, 13))
+    match = re.search(r"const VIEW_LIMIT = (\d+);", _inline_script())
+    assert match is not None
+    limit = int(match.group(1))
+    assert result["capped"] == list(range(1, limit + 1))
     assert result["backfilled"]["active"] == 5
-    assert result["backfilled"]["visible"] == [1, 2, 3, *range(5, 14)]
+    assert result["backfilled"]["visible"] == [1, 2, 3, *range(5, limit + 2)]
     # A new view starts at its first story.
     assert result["popular"] == {"active": 20, "first": 20}
     # Explore keeps placed stories where they were; new ones go after.

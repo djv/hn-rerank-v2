@@ -1,5 +1,14 @@
 # Worklog: hn-rewrite
 
+## 2026-10-08 Fewer stories per section
+
+User's choice: each section shows 8 stories instead of 12 (web
+`VIEW_LIMIT`, TUI `VIEW_LIMIT`), served views hold 12 instead of 16
+(`VIEW_SIZE`, still 4 slide-ins), and Explore serves 3 per badge instead of
+5. The cold deck keeps 384 per view (32 x 12; profile 151 needed depth 297).
+Tests that hard-coded 12/13/31 now derive from the constants. Interleaving
+note in INTERLEAVING.md (arms draft from their top 24).
+
 ## 2026-10-08 Faster first rerank after a restart
 
 Each restart's first rerank of profile 151 took 77-101 s (later ones

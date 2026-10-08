@@ -317,16 +317,16 @@ HN_COMMENTS_CACHE_CHAR_LIMIT = 24_000
 HOT_MIN_SCORE = 20
 TOP_MIN_SCORE = 100
 TALK_MIN_COMMENTS = 50
-# A served view holds this many stories: the 12 the clients show (VIEW_LIMIT
-# in templates/index.html and the TUI) plus 4 that slide in as cards ahead
-# of them are voted.
-VIEW_SIZE = 16
+# A served view holds this many stories: the 8 the clients show (VIEW_LIMIT
+# in templates/index.html and the TUI; 12 before 2026-10-08, user's choice)
+# plus 4 that slide in as cards ahead of them are voted.
+VIEW_SIZE = 12
 # Explore serves this many each of Unsure, Novel and Interest.
-EXPLORE_PER_BADGE = 5
+EXPLORE_PER_BADGE = 3
 # Views are picked at this multiple of their served size, so that dedup,
 # votes and stories ageing out of a window between warms leave enough.
 SELECT_MARGIN = 2
-# The shared cold deck's margin (512 per view). Until a restart's first warm
+# The shared cold deck's margin (384 per view). Until a restart's first warm
 # lands, a voter is served the cold deck less their votes; a heavy voter has
 # voted most of its top stories (2026-10-08, profile 151: 0 of 1m Popular's
 # top 32 left, a full view needed depth 297).
