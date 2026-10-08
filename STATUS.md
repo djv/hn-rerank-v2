@@ -78,8 +78,8 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   (users 214 -> 194; backup `hn_rewrite.db.pre_test_profiles_20261008T144729Z`
   on the VPS, kept). Only profile 151 votes.
 - RSS read timeouts now log one warning line (5c092d0).
-- TUI `o`/`c` open via `~/bin/hn-open` (system-setup): a new Chrome window
-  when the everyday Chrome runs, else surf.
+- TUI `o`/`c` open via `~/bin/hn-open` (system-setup): a new Firefox window
+  for every link (user 2026-10-08; Firefox has Bypass Paywalls Clean).
 
 ## Blocker
 None.
