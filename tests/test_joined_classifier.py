@@ -251,3 +251,43 @@ def test_rerank_interleaves_only_when_every_challenger_fits(
             assert trace.labels["interleave"] == "off"
     finally:
         db.close()
+
+
+@settings(max_examples=10, deadline=None)
+@given(seed=st.integers(0, 2**32 - 1))
+def test_warm_start_reaches_the_same_model_in_fewer_iterations(seed: int) -> None:
+    rng = np.random.default_rng(seed)
+    labels = list(rng.permutation(np.repeat([0, 1, 2], 30)))
+    stories = _stories(rng, labels, 0)
+    x = rng.normal(size=(len(labels), EMB_DIM + 3))
+    candidates = _stories(rng, list(rng.integers(0, 3, 15)), 500)
+    x_cand = rng.normal(size=(len(candidates), EMB_DIM + 3))
+
+    def model() -> JoinedLogistic:
+        return JoinedLogistic(
+            c=4.0,
+            features="all",
+            embedding_dim=EMB_DIM,
+            embedding_weight=16.0,
+            numeric_scale=0.158,
+            word_scale=1.0,
+        )
+
+    # The previous fit lacks the newest vote, as after a swipe.
+    previous = model().fit(
+        x[:-1],
+        labels[:-1],
+        sample_weight=np.ones(len(labels) - 1),
+        stories=stories[:-1],
+    )
+    weights = np.ones(len(labels))
+    cold = model().fit(x, labels, sample_weight=weights, stories=stories)
+    warm = model().fit(x, labels, sample_weight=weights, stories=stories, warm=previous)
+
+    assert warm.estimator.n_iter_[0] <= cold.estimator.n_iter_[0]
+    np.testing.assert_allclose(
+        warm.predict_proba(x_cand, candidates),
+        cold.predict_proba(x_cand, candidates),
+        # lbfgs stops at tol=1e-4 from either start: equal to that tolerance.
+        atol=5e-3,
+    )

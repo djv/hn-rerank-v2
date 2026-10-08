@@ -38,6 +38,7 @@ from .config import (
 )
 from . import linear_blend
 from .interleave import PRODUCTION_ARM, team_draft
+from . import joined_classifier
 from .joined_classifier import JoinedLogistic
 from .model_manifest import ModelManifest, verify_model_dir
 
@@ -197,6 +198,9 @@ class _NullTrace:
     @contextmanager
     def stage(self, name: str) -> Iterator[None]:
         yield
+
+    def add_timing(self, name: str, elapsed_ms: float) -> None:
+        pass
 
     def set_count(self, name: str, value: int) -> None:
         pass
@@ -1520,7 +1524,12 @@ def _score_and_rank(
                             labels,
                             sample_weight=sample_weights,
                             stories=feedback_stories,
+                            warm=joined_classifier.latest(user_id, svm.features)
+                            if user_id is not None
+                            else None,
                         )
+                        if user_id is not None:
+                            joined_classifier.remember(user_id, svm.features, svm)
                     else:
                         svm.fit(
                             fb_features_scaled, labels, sample_weight=sample_weights
@@ -2236,6 +2245,8 @@ def rerank_candidates(
             arm_rankings = {}
             break
         trace.set_label(f"challenger_{arm}_cache", arm_trace.labels["model_cache"])
+        for stage, elapsed_ms in arm_trace.timings_ms.items():
+            trace.add_timing(f"challenger_{arm}_{stage}", elapsed_ms)
         arm_rankings[arm] = [r.story.id for r in challenger]
     trace.set_label("interleave", ",".join(arm_rankings) or "off")
 
