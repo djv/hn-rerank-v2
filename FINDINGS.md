@@ -1,5 +1,56 @@
 # HN Rerank findings
 
+## Reddit after the RSS shutdown; subreddit changes — 2026-10-08
+
+### Access routes (live probes 2026-10-08 plus subagent primary-source research)
+
+- Reachable now: Reddit `.rss` returns 200 from the VPS (429 under load).
+  Anonymous `.json` and new-Reddit HTML return 403 ("blocked by network
+  security") from both the VPS and the laptop; old.reddit returns 302 to
+  login. RSS ends November 13; no exception except redditstatus.com was
+  found ([modnews](https://www.reddit.com/r/modnews/comments/1wubgvt/)).
+- Data API: self-service sign-up closed 2025-11-11; new requests stop
+  October 31, 2026; unregistered access closes from January 12, 2027 and
+  all public access in March 2027
+  ([redditdev](https://www.reddit.com/r/redditdev/comments/1wubcvf/)).
+  The repo has no OAuth credentials.
+- Devvit: unverified whether an app can read subreddits it is not
+  installed in (a non-admin developer says it cannot). Personal fetch
+  domains are not approved; External Endpoints (VPS calls the app,
+  5 req/s) is a by-request feature. Devvit Rules forbid training ML on
+  Reddit data and approve only OpenAI/Gemini LLMs, which conflicts with
+  this app's reranker and Mistral summaries
+  ([rules](https://developers.reddit.com/docs/devvit_rules)).
+- Arctic Shift (`arctic-shift.photon-reddit.com`, free, no key, "a couple
+  requests per second", no guarantees): `/api/posts/search?subreddit=X&after=T&limit=auto`
+  (sorted by time only; rank by score locally) and `/api/comments/tree`.
+  Scores and comment counts stay 1/0 until a re-fetch at about 36 h.
+  It reads the official Reddit API, so it likely ends by March 2027 or
+  earlier on a takedown request. PullPush (paid/Cloudflare) and Redlib
+  (spoofed app tokens) were rejected.
+- Arctic Shift vs production: all 142 Reddit stories ingested in the last
+  8 days across the then-18 subreddits are in Arctic Shift. Its by-score
+  weekly top 25 (posts older than 36 h) overlapped production's rows at
+  103/151 (11/25 r/ClaudeAI to 22/25 r/LocalLLaMA). Against a same-time
+  RSS snapshot, r/LocalLLaMA matched 22/25 in near order; the 3 misses
+  were 15-24 h old posts with score 1.
+
+### Subreddit changes (user chose, 2026-10-08)
+
+Profile 151's votes on each subreddit's own posts (up/neutral/down):
+eupersonalfinance 1/2/16, expats 1/3/12, transit 3/2/10 — dropped.
+Leaning weak, kept: fatFIRE 10/23/29, MachineLearning 4/10/10. Strong:
+Bogleheads 30/28/13, digitalnomad 39/39/26, LocalLLaMA 25/46/17.
+
+Additions came from Arctic Shift URL search: for profile 151's 200 latest
+upvotes and downvotes with external links (Reddit/HN/LessWrong pages
+excluded), which subreddits posted the same URL with score >= 10. Answers
+covered 166 upvoted links (101 HN, 99 other RSS) and 188 downvoted (191 of
+the 200 HN). Upvoted/downvoted links: accelerate 11/1, OpenAI 10/1,
+mlscaling 5/0, Aging 5/0, agi 4/0, codex 4/0 — all six added. The sample
+is unbalanced (upvotes half AI-news RSS, downvotes almost all HN), so this
+favours AI-news subs; recheck their own-post vote rates after a few weeks.
+
 ## User evaluation shortlist — 2026-10-07
 
 After the four-row evaluation summary, the user said candidates #2 and #4

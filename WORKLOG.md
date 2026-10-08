@@ -1,5 +1,17 @@
 # Worklog: hn-rewrite
 
+## 2026-10-08 Subreddit list changes; Reddit replacement research
+
+config.toml: dropped r/transit, r/expats and r/eupersonalfinance (profile
+151 mostly downvoted their posts); added r/mlscaling, r/accelerate,
+r/OpenAI, r/codex, r/agi and r/Aging (they also posted links profile 151
+upvoted). 21 subreddit feeds now. Stories already ingested from the dropped
+feeds stay in the DB but leave the candidate pool, which only takes rows
+from configured feeds. Interleaving arms share the pool, so the live
+comparison is unaffected. Research on replacing Reddit RSS after November
+13 (Arctic Shift is the only drop-in route found) is in FINDINGS.md.
+The VPS Why-this-story preview service was stopped.
+
 ## 2026-10-07 Interleaving for the shortlisted classifiers
 
 The user chose to compare shortlist #2 (one joined logistic classifier,

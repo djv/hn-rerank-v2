@@ -43,6 +43,16 @@ metadata-scale middle variant, short-history curve).
   [INTERLEAVING.md](docs/evaluations/model-ablation-20261007/INTERLEAVING.md);
   artifacts in followups/.
 
+- 2026-10-08 11:27 UTC check: VPS healthy (8d85747, no journal errors,
+  reranks 10-20 s); still 2 credited votes. Why preview service stopped.
+- Reddit (RSS ends November 13): only RSS still reaches Reddit; `.json`
+  and HTML return 403. Arctic Shift (free, no key) is the only drop-in
+  route found: same top posts by score, but scores fill in only after
+  ~36 h, and it likely ends with Reddit's public API by March 2027.
+  Devvit and the Data API are not usable here. Evidence in FINDINGS.md.
+- Subreddits (user choice): dropped transit, expats, eupersonalfinance;
+  added mlscaling, accelerate, OpenAI, codex, agi, Aging (21 feeds).
+
 ## Blocker
 None.
 
@@ -51,8 +61,10 @@ None.
   `uv run python scripts/interleave_report.py --db hn_rewrite.db
   --user-id 151 --since 1791432442.75 --until 1793851642.75` on the VPS.
   Weekly descriptive reports and safety checks per INTERLEAVING.md.
-- The separate Why preview (VPS hn-why-preview-20261007.service, port
-  8767) becomes redundant after the deploy; stop it when the user agrees.
-- Carried over: Reddit replacement before November 13, 1m Popular age-mix
+- Reddit replacement before November 13: user to decide on an Arctic
+  Shift source adapter (posts ranked by score locally, comment trees from
+  `/api/comments/tree`), then implement and test it against RSS while
+  both work.
+- Carried over: 1m Popular age-mix
   check, real-terminal tint/footer check, October 21 Gemma 2 future-vote
   recheck (/home/d/TASKS.md).

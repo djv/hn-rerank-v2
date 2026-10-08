@@ -47,12 +47,12 @@ feeds = [
     "https://mshibanami.github.io/GitHubTrendingRSS/weekly/python.xml",
     "https://mshibanami.github.io/GitHubTrendingRSS/weekly/haskell.xml",
     "https://www.reddit.com/r/MachineLearning/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/mlscaling/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/LocalLLaMA/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/haskell/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/ocaml/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/Bogleheads/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/ExpatFIRE/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/transit/top/.rss?t=week&limit=25",
 
 
     # AI / coding agents
@@ -62,6 +62,12 @@ feeds = [
     "https://www.reddit.com/r/ClaudeAI/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/LocalLLM/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/ClaudeCode/top/.rss?t=week&limit=25",
+    # Subs that also posted profile 151's upvoted links (2026-10-08)
+    "https://www.reddit.com/r/accelerate/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/OpenAI/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/codex/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/agi/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/Aging/top/.rss?t=week&limit=25",
 
     # Finance / tax / nomad money
     "https://www.reddit.com/r/financialindependence/top/.rss?t=week&limit=25",
@@ -70,8 +76,6 @@ feeds = [
     # Travel / gear / nomad logistics
     "https://www.reddit.com/r/onebag/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/digitalnomad/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/expats/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/eupersonalfinance/top/.rss?t=week&limit=25",
 
     "https://simonwillison.net/atom/everything/",
     "https://www.interconnects.ai/feed",
