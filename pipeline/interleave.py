@@ -10,12 +10,45 @@ that added it; with equally good arms each arm expects the same credit.
 from __future__ import annotations
 
 from collections.abc import Hashable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Generic, TypeVar
 
 import numpy as np
 
+from .config import Config
+from .joined_classifier import JoinedFeatures
+
 T = TypeVar("T", bound=Hashable)
+
+PRODUCTION_ARM = "production"
+# Challenger arm -> the joined classifier's inputs (shortlist #2 and #4).
+CHALLENGER_FEATURES: dict[str, JoinedFeatures] = {
+    "joined_all": "all",
+    "joined_no_metadata": "no_metadata",
+}
+
+
+def challenger_configs(config: Config, user_id: int) -> list[tuple[str, Config]]:
+    """The interleaving arms ranking *user_id*'s deck besides production,
+    each with its own config; none unless the user is in
+    ``config.interleave_user_ids``."""
+    if user_id not in config.interleave_user_ids:
+        return []
+    return [
+        (
+            arm,
+            replace(
+                config,
+                model=replace(
+                    config.model,
+                    classifier="joined_logistic",
+                    joined_features=CHALLENGER_FEATURES[arm],
+                    linear_blend_enabled=False,
+                ),
+            ),
+        )
+        for arm in config.interleave_arms
+    ]
 
 
 @dataclass(frozen=True)

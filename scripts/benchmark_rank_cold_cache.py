@@ -21,14 +21,19 @@ from pipeline import (  # noqa: E402
     _MODEL_CACHE,
     _MODEL_CACHE_LOCK,
     fast_rerank_for_user,
+    linear_blend,
     load_production_candidate_stories,
     story_embedding_text,
 )
 
 
 def _clear_model_cache() -> None:
+    """Every model refits, as after a vote: the linear blend's fits go too,
+    but each user's latest fit stays as the next fit's warm start."""
     with _MODEL_CACHE_LOCK:
         _MODEL_CACHE.clear()
+    with linear_blend._LOCK:
+        linear_blend._CACHE.clear()
 
 
 def _heaviest_user_id(db: Database) -> int:
@@ -112,6 +117,8 @@ def _summarize(values: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
         "tier2_ms",
         "badge_similarity_ms",
         "dedup_ms",
+        "challenger_joined_all_ms",
+        "challenger_joined_no_metadata_ms",
     ]
     summary: dict[str, dict[str, float]] = {}
     for key in keys:
@@ -170,6 +177,15 @@ def main() -> None:
         help="Override Config.embedding_batch_size for this run.",
     )
     parser.add_argument(
+        "--interleave",
+        action="store_true",
+        help="Rank with Config.interleave_user_ids set to this user (every arm fits).",
+    )
+    parser.add_argument(
+        "--onnx-model-dir",
+        help="Override Config.onnx_model_dir (e.g. a local copy of the VPS model).",
+    )
+    parser.add_argument(
         "--embedding-ort-variant",
         choices=[
             "current",
@@ -194,9 +210,13 @@ def main() -> None:
             config,
             embedding_ort_variant=cast(Any, args.embedding_ort_variant),
         )
+    if args.onnx_model_dir is not None:
+        config = replace(config, onnx_model_dir=args.onnx_model_dir)
     db = Database(args.db, read_only=not args.allow_writes)
     try:
         user_id = args.user_id if args.user_id is not None else _heaviest_user_id(db)
+        if args.interleave:
+            config = replace(config, interleave_user_ids=(user_id,))
         preflight = _preflight_read_only_embeddings(db, config, user_id)
         if args.preflight_only:
             result = {

@@ -106,6 +106,19 @@ class User:
 
 
 @dataclass(frozen=True)
+class InterleaveDeck:
+    """An interleaved deck as built: per window, its Recommended story IDs
+    in order, each with the arm that drafted it; ``arms`` lists every arm,
+    production first."""
+
+    user_id: int
+    version: int
+    created_at: float
+    arms: tuple[str, ...]
+    windows: dict[str, tuple[tuple[int, str], ...]]
+
+
+@dataclass(frozen=True)
 class RankPerfSample:
     """One warm rerank's perf trace, ready to persist. `fields` is the full
     RankTrace.to_log_fields() dict (dynamic stage set) stored as JSON; the
@@ -387,6 +400,21 @@ class Database:
                     "CREATE INDEX IF NOT EXISTS idx_rank_perf_recorded_at "
                     "ON rank_perf(recorded_at)"
                 )
+
+                # One row per interleaved deck a warm built (Config.
+                # interleave_user_ids): each window's Recommended stories in
+                # order with the arm that drafted them. Votes are credited
+                # offline through interaction_events' deck version.
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS interleave_decks (
+                        user_id       INTEGER NOT NULL,
+                        version       INTEGER NOT NULL,
+                        created_at    REAL NOT NULL,
+                        arms_json     TEXT NOT NULL,
+                        windows_json  TEXT NOT NULL,
+                        PRIMARY KEY (user_id, version)
+                    ) STRICT
+                """)
 
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS interaction_events (
@@ -1486,6 +1514,57 @@ class Database:
                         json.dumps(sample.fields),
                     ),
                 )
+
+    def insert_interleave_deck(self, deck: InterleaveDeck) -> None:
+        with self.conn() as conn:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO interleave_decks (
+                        user_id, version, created_at, arms_json, windows_json
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        deck.user_id,
+                        deck.version,
+                        deck.created_at,
+                        json.dumps(list(deck.arms)),
+                        json.dumps(
+                            {
+                                w: [list(p) for p in picks]
+                                for w, picks in deck.windows.items()
+                            }
+                        ),
+                    ),
+                )
+
+    def get_interleave_decks(
+        self, user_id: int, since: float = 0.0
+    ) -> list[InterleaveDeck]:
+        with self.conn() as conn:
+            rows = conn.execute(
+                "SELECT version, created_at, arms_json, windows_json "
+                "FROM interleave_decks WHERE user_id = ? AND created_at >= ? "
+                "ORDER BY version",
+                (user_id, since),
+            ).fetchall()
+        out = []
+        for version, created_at, arms_json, windows_json in rows:
+            windows = json.loads(windows_json)
+            out.append(
+                InterleaveDeck(
+                    user_id=user_id,
+                    version=int(version),
+                    created_at=float(created_at),
+                    arms=tuple(str(a) for a in json.loads(arms_json)),
+                    windows={
+                        str(w): tuple((int(sid), str(arm)) for sid, arm in picks)
+                        for w, picks in windows.items()
+                    },
+                )
+            )
+        return out
 
     def insert_interaction_events(
         self, events: list[InteractionEvent]

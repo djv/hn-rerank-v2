@@ -37,6 +37,8 @@ from .config import (
     is_hn_source,
 )
 from . import linear_blend
+from .interleave import PRODUCTION_ARM, team_draft
+from .joined_classifier import JoinedLogistic
 from .model_manifest import ModelManifest, verify_model_dir
 
 if TYPE_CHECKING:
@@ -140,7 +142,7 @@ class PrecomputedRbfSVC:
         return np.concatenate(chunks, axis=0)
 
 
-_CachedClassifier: TypeAlias = SVC | PrecomputedRbfSVC
+_CachedClassifier: TypeAlias = SVC | PrecomputedRbfSVC | JoinedLogistic
 _CachedModel = tuple[_CachedClassifier, StandardScaler, "NDArray[np.float32] | None"]
 _MODEL_CACHE: LRUCache[tuple[int, str, int], _CachedModel] = LRUCache(
     maxsize=_MODEL_CACHE_STORAGE_MAXSIZE
@@ -360,6 +362,9 @@ class RankedStory:
     is_interest: bool = False
     related_upvotes: tuple[tuple[str, float], ...] = ()
     ranking_factors: tuple[str, ...] = ()
+    # Interleaved Recommended views only: the arm whose team-draft pick put
+    # this story there (pipeline/interleave.py); "" everywhere else.
+    arm: str = ""
 
 
 def clean_text(raw_text: str, min_len: int = 0) -> str:
@@ -1479,12 +1484,22 @@ def _score_and_rank(
                 fb_features_scaled = np.hstack(
                     [fb_features[:, :emb_dim], fb_features_meta_scaled]
                 )
-                if config.model.svm_precomputed_enabled:
+                svm: _CachedClassifier
+                if config.model.classifier == "joined_logistic":
+                    svm = JoinedLogistic(
+                        c=config.model.joined_c,
+                        features=config.model.joined_features,
+                        embedding_dim=emb_dim,
+                        embedding_weight=config.model.joined_embedding_weight,
+                        numeric_scale=config.model.joined_numeric_scale,
+                        word_scale=config.model.joined_word_scale,
+                    )
+                elif config.model.svm_precomputed_enabled:
                     if config.model.svm_kernel != "rbf" or not isinstance(
                         config.model.svm_gamma, float
                     ):
                         raise ValueError("precomputed SVM requires a numeric RBF gamma")
-                    svm: _CachedClassifier = PrecomputedRbfSVC(
+                    svm = PrecomputedRbfSVC(
                         c=config.model.svm_c,
                         gamma=config.model.svm_gamma,
                         chunk_size=config.model.svm_precomputed_chunk_size,
@@ -1499,7 +1514,17 @@ def _score_and_rank(
                         decision_function_shape="ovr",
                     )
                 with trace.stage("svm_fit"):
-                    svm.fit(fb_features_scaled, labels, sample_weight=sample_weights)
+                    if isinstance(svm, JoinedLogistic):
+                        svm.fit(
+                            fb_features_scaled,
+                            labels,
+                            sample_weight=sample_weights,
+                            stories=feedback_stories,
+                        )
+                    else:
+                        svm.fit(
+                            fb_features_scaled, labels, sample_weight=sample_weights
+                        )
                 if config.model.linear_blend_enabled:
                     try:
                         with trace.stage("linear_blend_fit"):
@@ -1545,16 +1570,22 @@ def _score_and_rank(
             linear_dense_candidates = cand_features_scaled
             class_order = list(svm.classes_)
             idx_up = class_order.index(2)
-            with trace.stage("decision"):
-                decision = svm.decision_function(cand_features_scaled)
-            if decision.ndim == 1:
-                raw_scores = decision if class_order[-1] == 2 else -decision
-                probs = np.column_stack(
-                    [1 - _minmax01(raw_scores), _minmax01(raw_scores)]
-                )
+            if isinstance(svm, JoinedLogistic):
+                with trace.stage("decision"):
+                    probs = svm.predict_proba(cand_features_scaled, candidates)
+                # Rank by P(up) - P(down); the probabilities stay as fitted.
+                raw_scores = probs[:, idx_up] - probs[:, class_order.index(0)]
             else:
-                raw_scores = decision[:, idx_up]
-                probs = _softmax_rows(decision)
+                with trace.stage("decision"):
+                    decision = svm.decision_function(cand_features_scaled)
+                if decision.ndim == 1:
+                    raw_scores = decision if class_order[-1] == 2 else -decision
+                    probs = np.column_stack(
+                        [1 - _minmax01(raw_scores), _minmax01(raw_scores)]
+                    )
+                else:
+                    raw_scores = decision[:, idx_up]
+                    probs = _softmax_rows(decision)
             scores = _minmax01(raw_scores)
         except Exception as e:
             trace.set_label("svm_fit", "error")
@@ -1923,6 +1954,8 @@ def assemble_window_deck(
     explore: ExploreContext | None = None,
     is_feedback_match: Callable[[Story], bool] | None = None,
     trace: RankTrace | _NullTrace = NULL_TRACE,
+    arm_rankings: Mapping[str, Sequence[int]] | None = None,
+    rng: np.random.Generator | None = None,
 ) -> WindowDeck:
     """Pick every window's three views from a fully scored candidate pool,
     all at one *now*, each ``SELECT_MARGIN`` times its served size
@@ -1930,7 +1963,11 @@ def assemble_window_deck(
 
     Per window (see ``in_window``):
 
-    - Recommended: the top stories by model score, no source quota.
+    - Recommended: the top stories by model score, no source quota. With
+      *arm_rankings* (challenger arm -> story IDs best first, over the same
+      candidates), a team-draft interleaving of the model-score order
+      (``PRODUCTION_ARM``) and each challenger's order instead, every card
+      tagged with its arm; *rng* draws the turn order.
     - Popular: the top HN stories by ``hn_gravity`` on the window's clock
       (``GRAVITY_TIME_SCALE``). Each card independently gets every badge
       it qualifies for: 🔥 Hot when its velocity
@@ -2054,7 +2091,10 @@ def assemble_window_deck(
     for window in WINDOWS:
         pool = [r for r in by_score if in_window(r.story.time, window, now)]
         trace.set_count(f"window_pool_{window}", len(pool))
-        recommended = pool[: VIEW_SIZE * SELECT_MARGIN]
+        if arm_rankings:
+            recommended = _interleaved(pool, arm_rankings, rng)
+        else:
+            recommended = pool[: VIEW_SIZE * SELECT_MARGIN]
         popular = sorted(
             (r for r in pool if is_hn_source(r.story.source)),
             key=lambda r: hn_gravity(
@@ -2082,6 +2122,26 @@ def assemble_window_deck(
             tuple(explore_view),
         )
     return WindowDeck(windows)
+
+
+def _interleaved(
+    pool: list[RankedStory],
+    arm_rankings: Mapping[str, Sequence[int]],
+    rng: np.random.Generator | None,
+) -> list[RankedStory]:
+    """A window's Recommended view drafted from production (*pool*'s order)
+    and every challenger's order of the same stories."""
+    if rng is None:
+        raise ValueError("interleaving needs a random generator")
+    by_id = {r.story.id: r for r in pool}
+    arms = [PRODUCTION_ARM, *arm_rankings]
+    orders = [list(by_id)] + [
+        [sid for sid in ranking if sid in by_id] for ranking in arm_rankings.values()
+    ]
+    return [
+        replace(by_id[pick.item], arm=arms[pick.arm])
+        for pick in team_draft(orders, VIEW_SIZE * SELECT_MARGIN, rng)
+    ]
 
 
 def serve_window(views: WindowViews, window: Window, now: float) -> WindowViews:
@@ -2115,13 +2175,18 @@ def rerank_candidates(
     user_id: int | None = None,
     trace: RankTrace | _NullTrace = NULL_TRACE,
     is_feedback_match: Callable[[Story], bool] | None = None,
+    challengers: Sequence[tuple[str, Config]] = (),
+    rng: np.random.Generator | None = None,
 ) -> WindowDeck:
     """Score candidates and pick every window's views.
 
     This wraps :func:`_score_and_rank` (tier blend + sort) and
     :func:`assemble_ranked_deck` (window views, badges, attribution).
     *is_feedback_match* is passed on to the Explore picks (see
-    :func:`assemble_window_deck`).
+    :func:`assemble_window_deck`). Each of *challengers* (arm name, its
+    config) scores the same candidates too, and Recommended interleaves
+    them with production; if any challenger's classifier fails to fit,
+    the deck is production's alone.
 
     Use this in production; the private ``_score_and_rank`` is intended for
     tier-blend tests that need to assert on ranking without badge side effects.
@@ -2146,6 +2211,34 @@ def rerank_candidates(
         score_context=score_context,
     )
 
+    arm_rankings: dict[str, list[int]] = {}
+    for arm, challenger_config in challengers:
+        arm_trace = RankTrace()
+        with trace.stage(f"challenger_{arm}"):
+            challenger = _score_and_rank(
+                candidates,
+                cand_embeddings,
+                db,
+                challenger_config,
+                embedder,
+                user_id=user_id,
+                trace=arm_trace,
+            )
+        fitted = arm_trace.labels.get("model_cache") in {"hit", "miss"}
+        if not fitted or "svm_fit" in arm_trace.labels:
+            # A fallback ranking is gravity/centroid, not the challenger.
+            logging.error(
+                "interleave arm=%s user_id=%s did not fit (%s); serving production",
+                arm,
+                user_id,
+                arm_trace.labels,
+            )
+            arm_rankings = {}
+            break
+        trace.set_label(f"challenger_{arm}_cache", arm_trace.labels["model_cache"])
+        arm_rankings[arm] = [r.story.id for r in challenger]
+    trace.set_label("interleave", ",".join(arm_rankings) or "off")
+
     return assemble_ranked_deck(
         ranked,
         candidates,
@@ -2157,6 +2250,8 @@ def rerank_candidates(
         score_context=score_context,
         trace=trace,
         is_feedback_match=is_feedback_match,
+        arm_rankings=arm_rankings,
+        rng=rng,
     )
 
 
@@ -2335,6 +2430,8 @@ def assemble_ranked_deck(
     score_context: RankScoreContext | None = None,
     trace: RankTrace | _NullTrace = NULL_TRACE,
     is_feedback_match: Callable[[Story], bool] | None = None,
+    arm_rankings: Mapping[str, Sequence[int]] | None = None,
+    rng: np.random.Generator | None = None,
 ) -> WindowDeck:
     """Pick the window views (with Explore) from an existing ranking."""
     if not candidates:
@@ -2407,6 +2504,8 @@ def assemble_ranked_deck(
             ),
             is_feedback_match=is_feedback_match,
             trace=trace,
+            arm_rankings=arm_rankings,
+            rng=rng,
         )
     with trace.stage("attribution"):
         return _fill_best_match_titles(deck, candidates, score_context, cand_embeddings)

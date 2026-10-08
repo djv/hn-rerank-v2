@@ -5,7 +5,7 @@ from collections import Counter
 import numpy as np
 from hypothesis import given, strategies as st
 
-from pipeline.interleave import team_draft
+from pipeline.interleave import challenger_configs, team_draft
 
 
 @st.composite
@@ -67,3 +67,102 @@ def test_team_draft_identical_arms_split_credit_evenly() -> None:
         first[picks[0].arm] += 1
     assert set(first) == {0, 1, 2}
     assert min(first.values()) > 100
+
+
+_NOW = 1_800_000_000.0
+
+
+@given(st.integers(0, 2**32 - 1), st.integers(4, 60))
+def test_interleaved_recommended_takes_turns_and_keeps_arm_orders(
+    seed: int, size: int
+) -> None:
+    from dataclasses import replace
+
+    from database import Story
+    from pipeline import Config, RankedStory
+    from pipeline.interleave import PRODUCTION_ARM
+    from pipeline.ranking import SELECT_MARGIN, VIEW_SIZE, assemble_window_deck
+
+    rng = np.random.default_rng(seed)
+    pool = [
+        RankedStory(
+            Story(i, f"s{i}", None, 10, int(_NOW) - int(rng.integers(0, 40_000)), ""),
+            float(size - i),
+            "",
+        )
+        for i in range(size)
+    ]
+    production = [r.story.id for r in pool]
+    rankings = {
+        "joined_all": production[::-1],
+        "joined_no_metadata": [int(i) for i in rng.permutation(production)],
+    }
+    deck = assemble_window_deck(
+        pool, config=Config(), now=_NOW, arm_rankings=rankings, rng=rng
+    )
+    plain = assemble_window_deck(pool, config=Config(), now=_NOW)
+
+    for window, views in deck.windows.items():
+        served = views.recommended
+        expected = plain.window(window).recommended
+        assert len(served) == min(len(expected), VIEW_SIZE * SELECT_MARGIN)
+        assert len({r.story.id for r in served}) == len(served)
+        orders = {PRODUCTION_ARM: production, **rankings}
+        for arm, order in orders.items():
+            own = [r.story.id for r in served if r.arm == arm]
+            assert own == sorted(own, key=order.index)
+        for end in range(3, len(served) + 1, 3):
+            counts = Counter(r.arm for r in served[:end])
+            assert set(counts.values()) == {end // 3}
+        # Cards keep production's score, probabilities and badges.
+        by_id = {r.story.id: r for r in pool}
+        for r in served:
+            assert replace(r, arm="") == by_id[r.story.id]
+        assert all(r.arm == "" for r in views.popular + views.explore)
+        assert all(r.arm == "" for r in plain.window(window).recommended)
+
+
+def test_only_listed_users_get_challenger_arms() -> None:
+    from pipeline import Config
+
+    config = Config(interleave_user_ids=(151,))
+    assert challenger_configs(config, 7) == []
+    arms = challenger_configs(config, 151)
+    assert [arm for arm, _ in arms] == ["joined_all", "joined_no_metadata"]
+    for (_, arm_config), features in zip(arms, ["all", "no_metadata"], strict=True):
+        assert arm_config.model.classifier == "joined_logistic"
+        assert arm_config.model.joined_features == features
+        assert not arm_config.model.linear_blend_enabled
+        assert arm_config.interleave_user_ids == config.interleave_user_ids
+    assert challenger_configs(Config(), 151) == []
+
+
+def test_interleave_decks_round_trip_and_replace_by_version() -> None:
+    from database import Database, InterleaveDeck
+
+    db = Database(":memory:")
+    try:
+        first = InterleaveDeck(
+            user_id=151,
+            version=7,
+            created_at=100.0,
+            arms=("production", "joined_all"),
+            windows={"1w": ((5, "joined_all"), (3, "production")), "1d": ()},
+        )
+        db.insert_interleave_deck(first)
+        db.insert_interleave_deck(
+            InterleaveDeck(151, 8, 200.0, ("production",), {"1w": ((9, "production"),)})
+        )
+        db.insert_interleave_deck(InterleaveDeck(2, 7, 300.0, ("production",), {}))
+        assert db.get_interleave_decks(151) == [
+            first,
+            InterleaveDeck(
+                151, 8, 200.0, ("production",), {"1w": ((9, "production"),)}
+            ),
+        ]
+        assert [d.version for d in db.get_interleave_decks(151, since=150.0)] == [8]
+        rebuilt = InterleaveDeck(151, 7, 400.0, ("production",), {})
+        db.insert_interleave_deck(rebuilt)
+        assert db.get_interleave_decks(151)[0] == rebuilt
+    finally:
+        db.close()

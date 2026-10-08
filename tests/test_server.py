@@ -1620,6 +1620,62 @@ def test_active_warm_commits_when_dashboard_version_advances(
     assert rank_perf_rows[0][0] == 2
 
 
+def test_warm_records_the_arms_of_interleaved_decks_only(
+    test_env, mock_embedder, monkeypatch
+) -> None:
+    _, db, _, _, user = test_env
+
+    class TestHandler(Handler):
+        pass
+
+    TestHandler.config = Config(db_path=db.db_path, server_port=0)
+    TestHandler.db = db
+    TestHandler.embedder = mock_embedder
+    TestHandler._decks = {}
+    TestHandler._dashboard_versions = {}
+    TestHandler._cold_deck = WindowDeck()
+    _reset_warm_state(TestHandler)
+
+    def card(story_id: int, arm: str) -> RankedStory:
+        return RankedStory(Story(story_id, "t", None, 1, 1, ""), 0.5, "", arm=arm)
+
+    decks = iter(
+        [
+            WindowDeck(
+                {
+                    "1w": WindowViews(
+                        recommended=(card(5, "joined_all"), card(3, "production")),
+                        popular=(card(8, ""),),
+                    ),
+                    "1d": WindowViews(recommended=(card(3, "production"),)),
+                }
+            ),
+            WindowDeck({"1w": WindowViews(recommended=(card(4, ""),))}),
+        ]
+    )
+
+    def fake_fast_rerank_for_user(database, config, embedder, user_id, **kwargs):
+        return next(decks)
+
+    import pipeline
+
+    monkeypatch.setattr(pipeline, "fast_rerank_for_user", fake_fast_rerank_for_user)
+    TestHandler._run_warm_attempt(user, TestHandler._dashboard_version(user.id))
+    interleaved_version = TestHandler._decks[user.id].version
+    TestHandler._run_warm_attempt(user, TestHandler._bump_user_version(user.id))
+    _drain_warms(TestHandler)
+    assert TestHandler._decks[user.id].version > interleaved_version
+
+    # The impression ledger's dashboard_version is the served deck's version.
+    (recorded,) = db.get_interleave_decks(user.id)
+    assert recorded.version == interleaved_version
+    assert recorded.arms == ("production", "joined_all")
+    assert recorded.windows == {
+        "1w": ((5, "joined_all"), (3, "production")),
+        "1d": ((3, "production"),),
+    }
+
+
 def test_rapid_vote_warms_coalesce_to_latest_version(
     test_env, mock_embedder, monkeypatch
 ) -> None:

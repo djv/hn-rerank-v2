@@ -201,6 +201,47 @@ $$\alpha = \text{clip}\left(\frac{n_{\min} - 20}{60},\ 0,\ 1\right)$$
 
 The blend starts when both classes have at least 20 feedback entries and reaches full SVM influence when both classes have at least 80 entries. A user with 50 upvotes but only 5 downvotes sees pure tier-2 (centroid-diff) regardless of total feedback count.
 
+#### Joined Classifier Challenger and Live Interleaving (opt-in)
+
+`model.classifier = "joined_logistic"` (`pipeline/joined_classifier.py`)
+replaces the RBF SVM and the linear blend with one logistic regression
+(C `joined_c` = 4) on the SVM's scaled training rows, the embedding block
+weighted by sqrt(`joined_embedding_weight` = 16), all numeric columns times
+`joined_numeric_scale` = sqrt(0.1/4), joined to hashed TF-IDF words (terms
+in at least two training stories). It ranks by min-max P(up) - P(down) and
+keeps the fitted probabilities for Explore's Unsure entropy. A vote set
+missing a class fails the fit and falls back to tiers 1-2.
+`joined_features = "no_metadata"` drops the ten meta columns. These are
+shortlist candidates #2 and #4 of the 2026-10-07 offline study
+(docs/evaluations/model-ablation-20261007/FEATURE-REMOVALS.md); the
+probabilities equal the offline adapter's exactly
+(`tests/test_joined_classifier.py`). The tier blend is unchanged.
+
+Live, the classifier serves only as an interleaving challenger. For users
+in `interleave_user_ids` (empty by default), each warm also scores the
+candidates with every arm in `interleave_arms` (`joined_all`,
+`joined_no_metadata`), each in its own model-cache entry. Each window's
+Recommended view is then a team-draft interleaving
+(`pipeline/interleave.py`): every round visits production and the
+challengers in a fresh random order, and each adds its best story not
+already listed. Cards keep production's score, probabilities and
+explanation; only `RankedStory.arm` records who drafted them, and clients
+never see it. Popular and Explore are unchanged, apart from Explore
+excluding the interleaved Recommended stories. If any challenger fails to
+fit, that deck is production's alone (`interleave=off` in the rank trace).
+Each challenger adds a full feature build and fit to the warm
+(`challenger_<arm>_ms`).
+
+Before the deck can be served, the warm stores each window's Recommended
+story IDs and arms under the deck version in the additive STRICT
+`interleave_decks` table. `scripts/interleave_report.py` credits a vote to
+an arm when the user's last impression of the story before the vote
+(`interaction_events`) was in a Recommended view of a stored version and
+window. It then compares each challenger with production: a sign test of
+upvotes per deck version and a two-proportion test of credited upvote
+rates, Bonferroni-adjusted. `scripts/simulate_interleaving.py` replays the
+same procedure on judged offline blocks to estimate power.
+
 ### 3.4 Selection & Surfacing Passes
 The default dashboard selection is direct relevance order: `rerank_candidates` takes the top ranked stories after `_score_and_rank` and does not remove near-duplicates. MMR remains available behind `config.model.enable_mmr`; when enabled, `mmr_filter` iterates through candidates in SVM-rank order and discards subsequent candidates with cosine similarity above `config.model.diversity_threshold` (default 0.75).
 
@@ -865,6 +906,10 @@ send them, older clients omit them), stored comma-joined in the added
 `badges` column (`''` for none or unknown), so per-badge outcomes can be read
 exactly. TLDR
 prefetches and automatic card enrichment do not generate interaction events.
+`ranker_arm` is the client's own label (`baseline` on the web,
+`tui_observed` in the terminal). Interleaving arms are recorded server-side
+in `interleave_decks` (section 3.3) and joined through the event's
+dashboard version and window.
 
 SQLite stores events indefinitely in the additive STRICT `interaction_events`
 table (schema version 2). Event UUIDs make retries idempotent; story IDs are

@@ -125,6 +125,7 @@ from .candidate_cache import (
     get_candidate_pool,
     invalidate_candidate_pool,
 )
+from .interleave import challenger_configs
 
 from .render import (
     generate_dashboard_bytes,
@@ -996,6 +997,7 @@ def fast_rerank_for_user(
     feedback_context = build_feedback_context(
         feedback, tuple(config.model.dedup_exclude_actions)
     )
+    challengers = challenger_configs(config, user_id)
     deck = rerank_candidates(
         db=db,
         config=config,
@@ -1005,6 +1007,8 @@ def fast_rerank_for_user(
         user_id=user_id,
         trace=trace,
         is_feedback_match=lambda s: _matches_feedback(s, feedback_context),
+        challengers=challengers,
+        rng=np.random.default_rng() if challengers else None,
     )
     _count_nonhn(trace, "deck_nonhn_pre_dedup", deck)
 

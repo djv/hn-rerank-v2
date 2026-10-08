@@ -50,6 +50,16 @@ class ModelConfig:
     # feedback stories have a side vector; the rest get a zero side part.
     side_embedding_enabled: bool = False
     side_embedding_min_coverage: float = 0.98
+    # "joined_logistic" (evaluation, 2026-10-07; pipeline/joined_classifier.py)
+    # replaces the RBF SVM with one logistic regression over the same rows
+    # plus TF-IDF words; it ignores svm_* and needs linear_blend_enabled off.
+    # Live only as an interleaving challenger (Config.interleave_user_ids).
+    classifier: Literal["svm", "joined_logistic"] = "svm"
+    joined_features: Literal["all", "no_metadata"] = "all"
+    joined_c: float = 4.0
+    joined_embedding_weight: float = 16.0
+    joined_numeric_scale: float = 0.15811388300841897  # sqrt(0.1 / 4)
+    joined_word_scale: float = 1.0
     diversity_threshold: float = 0.75
     knn_k: int = 10
     positive_cluster_k: int = 4
@@ -160,6 +170,15 @@ class Config:
     article_fetch_concurrency: int = 10
     article_fetch_max_age_days: int = 30
     max_cached_models: int = 20
+    # Team-draft interleaving (ROADMAP B2, pipeline/interleave.py): these
+    # users' Recommended views mix production with each challenger arm,
+    # and every served deck's arm per story is stored (interleave_decks).
+    # Empty: off. Each arm adds a full model fit to the user's warm.
+    interleave_user_ids: tuple[int, ...] = ()
+    interleave_arms: tuple[Literal["joined_all", "joined_no_metadata"], ...] = (
+        "joined_all",
+        "joined_no_metadata",
+    )
     # Two-leg candidate cap: the HN recent query uses tier-1 gravity
     # (score/age^1.8) so top-scoring stories are fetched first; the RSS
     # recent query uses pure recency because RSS sources have no
@@ -271,6 +290,24 @@ class Config:
             raise ValueError("warm_pool_size must be >= 1")
         if self.model.svm_precomputed_chunk_size <= 0:
             raise ValueError("svm_precomputed_chunk_size must be positive")
+        if self.model.classifier == "joined_logistic" and (
+            self.model.linear_blend_enabled
+        ):
+            raise ValueError("joined_logistic replaces the linear blend; disable it")
+        if not all(
+            v > 0
+            for v in (
+                self.model.joined_c,
+                self.model.joined_embedding_weight,
+                self.model.joined_numeric_scale,
+                self.model.joined_word_scale,
+            )
+        ):
+            raise ValueError("joined_* settings must be positive")
+        if len(set(self.interleave_arms)) != len(self.interleave_arms):
+            raise ValueError("interleave_arms must not repeat an arm")
+        if self.interleave_user_ids and not self.interleave_arms:
+            raise ValueError("interleave_user_ids needs at least one arm")
         if self.embedding_ort_variant not in {
             "current",
             "spin_off",

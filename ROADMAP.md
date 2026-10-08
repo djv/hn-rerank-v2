@@ -314,6 +314,13 @@ Test class gates, cache invalidation, source-level time-split metrics.
 
 ### B2. Add online comparison before adopting model changes
 
+**Implemented 2026-10-07 without REF-2, off by default.**
+`interleave_user_ids` drafts production plus the joined-classifier
+challengers into each window's Recommended view. Arms are stored per
+deck version in `interleave_decks`, and `scripts/interleave_report.py`
+credits votes through the impression ledger (ARCHITECTURE.md 3.3). Not
+yet deployed.
+
 **Confirmed unmeasurable retroactively, 2026-08-14.** `ranker_arm` is
 `'baseline'` on all ~8,000 logged `interaction_events` rows — there is no
 historical data to mine here; it can only be measured by first turning

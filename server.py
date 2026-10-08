@@ -47,6 +47,7 @@ from database import (
     Database,
     InteractionEvent,
     InteractionEventType,
+    InterleaveDeck,
     RankPerfSample,
     Story,
     User,
@@ -59,6 +60,7 @@ from pipeline import (
     hn_thread_looks_active,
     is_hn_source,
 )
+from pipeline.interleave import PRODUCTION_ARM
 from pipeline.ranking import serve_window
 from pipeline.ainews import AINEWS_SOURCE
 from pipeline.hn_dupes import pointer_thread_target
@@ -1964,6 +1966,9 @@ class Handler:
             )
         rank_ms = (time.perf_counter() - render_start) * 1000
 
+        # Stored before the deck can be served, so every impression of an
+        # interleaved version has its arms on record.
+        cls._record_interleave(user.id, requested_version, deck)
         with cls._dashboard_versions_guard:
             cls._decks[user.id] = DeckState(deck, time.time(), requested_version)
             cls._evict_old_decks_locked()
@@ -2027,6 +2032,28 @@ class Handler:
                 daemon=True,
             )
             t.start()
+
+    @classmethod
+    def _record_interleave(cls, user_id: int, version: int, deck: WindowDeck) -> None:
+        windows: dict[str, tuple[tuple[int, str], ...]] = {
+            w: tuple((r.story.id, r.arm) for r in views.recommended)
+            for w, views in deck.windows.items()
+        }
+        arms = {arm for picks in windows.values() for _, arm in picks}
+        if not any(arms):
+            return
+        try:
+            cls.db.insert_interleave_deck(
+                InterleaveDeck(
+                    user_id=user_id,
+                    version=version,
+                    created_at=time.time(),
+                    arms=tuple(sorted(arms, key=lambda a: (a != PRODUCTION_ARM, a))),
+                    windows=windows,
+                )
+            )
+        except Exception:
+            logging.exception("interleave deck persist failed user_id=%s", user_id)
 
     @classmethod
     def _evict_old_decks_locked(cls) -> None:
