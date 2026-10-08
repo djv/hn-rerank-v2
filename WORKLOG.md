@@ -1,5 +1,12 @@
 # Worklog: hn-rewrite
 
+## 2026-10-08 Reddit switched to Arctic Shift
+
+The user asked to switch now instead of on November 11: config.toml sets
+`reddit_source = "arctic_shift"`. Subreddit top lists and threads now come
+from Arctic Shift; existing Reddit stories keep their ids and votes.
+Rollback while RSS lasts (until November 13): delete the line and restart.
+
 ## 2026-10-08 One vote snapshot for all interleaving arms
 
 At 13:15:56 UTC the VPS logged `Failed to fit feedback SVM: IndexError

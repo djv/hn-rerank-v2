@@ -28,6 +28,10 @@ tldr_tap_probe_timeout_seconds = 3.0
 # from the first interleaved deck (docs/evaluations/model-ablation-20261007/
 # INTERLEAVING.md). Remove the line to stop.
 interleave_user_ids = [151]
+# Reddit top lists and threads from the Arctic Shift archive instead of
+# Reddit RSS (retired 2026-11-13); user switched 2026-10-08. Remove the line
+# to go back to RSS while it lasts (ARCHITECTURE.md 3.4.4).
+reddit_source = "arctic_shift"
 
 [hn_rewrite.model]
 svm_c = 4.0

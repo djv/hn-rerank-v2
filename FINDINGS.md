@@ -52,6 +52,11 @@
 - Laptop RSS works with the service's Reddit user agent but 429s after a
   few feeds; 15-30 s spacing plus one 60 s retry got every feed.
 
+- A fresh worktree venv picked Python 3.14 (SQLite 3.50): two
+  `test_database.py` strict-migration tests failed there with "unable to
+  open database: file:...?mode=ro". On the project's Python 3.12 (SQLite
+  3.45) they pass. Not fixed.
+
 ### Subreddit changes (user chose, 2026-10-08)
 
 Profile 151's votes on each subreddit's own posts (up/neutral/down):
