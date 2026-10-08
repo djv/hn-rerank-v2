@@ -30,6 +30,11 @@ waits for the startup warms (cap 180 s). Tests cover the store, restoring
 both fit types as warm starts (same result as the in-memory warm start),
 and the wait. The gain shows only from the second restart after deploy,
 once fits have been saved.
+Measured at the 16:04 UTC restart (deploying 5c092d0): first rerank
+30.3 s (81 s at the 15:33 deploy, which had no saved fits); challenger
+fits 659/696 ms, linear blend fit 3.5 s, linear blend scoring still 7.1 s;
+the first regen waited 1 s. That restart followed a refresh with 0 failed
+Arctic Shift feeds (127 requests, 28 overloaded, 28 min).
 
 ## 2026-10-08 Arctic Shift: second pass for failed feeds, refresh stats
 

@@ -58,8 +58,10 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   so profile 151 gets full views in the cold window (6ae84d2). A restart's
   first rerank took 77-101 s (~60 s cold classifier fits): fits now persist
   in `~/.cache/hn-rewrite/warm_start` and the first regen waits for the
-  startup warms (c4147e7, deployed 15:33 UTC; regen waited 51 s; fits
-  saved). The warm-start gain is measured at the next restart (pending).
+  startup warms (c4147e7). Measured at the 16:04 UTC restart (5c092d0):
+  first rerank 30.3 s (was 81-101 s); challenger fits 0.7 s each (were
+  ~20-28 s), linear blend fit 3.5 s (11-12.5 s). Linear blend scoring
+  still takes 7.1 s cold (empty word-count cache).
 - Interleaving: one arm-fit failure (13:15:56 UTC, a vote between arms;
   1 of 24 warms) is fixed: all arms train on one vote snapshot (623321b).
   Views now show 8 stories (served 12, Explore 3 per badge; 37e0333,
@@ -69,8 +71,9 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   stories match; 66 of 75 misses are posts under 36 h old. Codex
   (gpt-6.1-sol) review: 5 findings fixed (f50f4b7). The archive's global
   422 overload cost 1-2 feeds per refresh; a second pass for failed feeds
-  (234124f) left 0 failed in the 15:00 refresh (142 requests, 35
-  overloaded, 34 min). Prefetched threads carry archive comments.
+  (234124f) left 0 failed in the 15:00 and 15:36 refreshes (142/127
+  requests, 35/28 overloaded, 34/28 min). Prefetched threads carry archive
+  comments.
 - Profiles: 20 test/anonymous profiles deleted with the user's approval
   (users 214 -> 194; backup `hn_rewrite.db.pre_test_profiles_20261008T144729Z`
   on the VPS, kept). Only profile 151 votes.
@@ -82,9 +85,9 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
 None.
 
 ## Next step
-- Measurement restart (automatic, after the Reddit refresh started 15:35
-  UTC): deploys 5c092d0 and logs the first rerank with saved warm starts
-  (expect ~25-30 s vs 81 s). Record it here.
+- Optional: the remaining cold cost after a restart is linear blend
+  scoring (7.1 s, candidate word counts recomputed); a persisted or
+  prewarmed count cache would cut it.
 - User: restart the TUI from a fresh shell (8 per section, `hn-open`).
 - Arctic Shift: check `reddit_refresh_arctic` lines over the next days and
   a Reddit card's tldr-detail (live tap) with archive comments. Rollback:
