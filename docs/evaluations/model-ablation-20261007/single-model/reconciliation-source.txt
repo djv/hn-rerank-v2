@@ -1,0 +1,48 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import subprocess
+from pathlib import Path
+
+ROOT = Path('/tmp/hn-one-classifier-20261007')
+REPO = Path.cwd()
+
+def digest(path: Path) -> str:
+    with path.open('rb') as handle:
+        return hashlib.file_digest(handle, 'sha256').hexdigest()
+
+def inventory() -> dict[str, str]:
+    files = list(REPO.glob('*.py')) + list((REPO/'pipeline').rglob('*.py'))
+    files += [REPO/'scripts'/n for n in ('eval_one_classifier.py','eval_single_preference_model.py','eval_ranker_variants.py','compare_eval_scores.py')]
+    files += [REPO/'pyproject.toml',REPO/'uv.lock',Path(__file__)]
+    files += [Path('/tmp')/n for n in ('hn-broad-screen-20261007.py','hn-broad-followups-20261007.py','hn-broad-summary-20261007.py','hn-broad-final-results-20261007.py')]
+    files += [ROOT/'native.toml',ROOT/'replay.toml',ROOT/'cohort.json',ROOT/'snapshot.db']
+    files += sorted((ROOT/'replays').glob('*.npz'))
+    return {str(p):digest(p) for p in sorted(set(files))}
+
+assert any(p.read_text().strip()=='1' for p in Path('/sys/class/power_supply').glob('*/online'))
+manifest = inventory()
+(ROOT/'broad-provenance-manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
+variant = 'prod[linear_blend_enabled=false;svm_c=4;svm_gamma=0.03]'
+checks: dict[str, dict[str, object]] = {}
+jobs = [(f'logistic-penalty-weight{w}', 'scripts/eval_one_classifier.py', ['--family','logistic','--numeric-scale','0.15811388300841897','--embedding-weight',str(w),'--score','up_down']) for w in (1,4)]
+jobs += [(f'svm-weight{w}', 'scripts/eval_single_preference_model.py', ['--family','linear','--word-c','4','--embedding-weight',str(w)]) for w in (4,16)]
+for label,script,settings in jobs:
+    assert any(p.read_text().strip()=='1' for p in Path('/sys/class/power_supply').glob('*/online')), 'AC disconnected'
+    available = next(int(line.split()[1]) for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemAvailable:'))
+    assert available >= 2_000_000
+    name = 'reconcile-'+label
+    args = ['uv','run','python',script,*settings,'--','--config',str(ROOT/'native.toml'),'--user-id','151','--candidate-pool','heldout-feedback','--folds','4','--now','1791401987.9873054','--variants',variant,'--output',str(ROOT/f'{name}.json'),'--dump-scores',str(ROOT/f'{name}-scores.json')]
+    with (ROOT/f'{name}.log').open('w') as log:
+        subprocess.run(args,stdout=log,stderr=subprocess.STDOUT,check=True)
+    original = json.loads((ROOT/f'broad-{label}-scores.json').read_text())['folds']
+    current = json.loads((ROOT/f'{name}-scores.json').read_text())['folds']
+    for a,b in zip(original,current,strict=True):
+        assert a['ids']==b['ids'] and a['labels']==b['labels'], label
+        assert a['scores']==b['scores'], (label,'challenger or control changed')
+    checks[label] = {'exact_ids_labels_and_all_scores':True,'folds':len(current),'original':f'broad-{label}','reconciled':name}
+    print(label+' exact challenger/control parity',flush=True)
+assert inventory()==manifest, 'source/input changed during reconciliation'
+(ROOT/'broad-reconciliation-summary.json').write_text(json.dumps({'checks':checks,'source_and_input_hashes':manifest,'source_and_input_unchanged_during_runs':True,'interpretation':'Exact rerun parity reconciles score effects of mixed driver versions; historic source hashes remain distinct.'},indent=2)+'\n')
+print('reconciliation complete',flush=True)

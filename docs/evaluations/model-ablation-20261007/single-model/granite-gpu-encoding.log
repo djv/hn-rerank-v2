@@ -1,0 +1,71 @@
+[transformers] PyTorch was not found. Models won't be available and only tokenizers, configuration and file/data utilities can be used.
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Encoder repo/revision: onnx-community/granite-embedding-small-english-r2-ONNX 1dc7835ba0cb9c76a3618d0bf0c427c97671b3c8
+GPU device: Intel(R) UHD Graphics (iGPU)
+100/100 encoded
+CHECKPOINT 100/3234 elapsed=26.2s eta=820.6s
+100/100 encoded
+CHECKPOINT 200/3234 elapsed=35.5s eta=538.1s
+100/100 encoded
+CHECKPOINT 300/3234 elapsed=43.7s eta=427.7s
+100/100 encoded
+CHECKPOINT 400/3234 elapsed=50.6s eta=358.7s
+100/100 encoded
+CHECKPOINT 500/3234 elapsed=62.4s eta=341.1s
+100/100 encoded
+CHECKPOINT 600/3234 elapsed=72.3s eta=317.4s
+100/100 encoded
+CHECKPOINT 700/3234 elapsed=81.7s eta=295.6s
+100/100 encoded
+CHECKPOINT 800/3234 elapsed=91.7s eta=279.1s
+100/100 encoded
+CHECKPOINT 900/3234 elapsed=103.4s eta=268.2s
+100/100 encoded
+CHECKPOINT 1000/3234 elapsed=113.3s eta=253.0s
+100/100 encoded
+CHECKPOINT 1100/3234 elapsed=122.9s eta=238.4s
+100/100 encoded
+CHECKPOINT 1200/3234 elapsed=133.5s eta=226.3s
+100/100 encoded
+CHECKPOINT 1300/3234 elapsed=144.8s eta=215.3s
+100/100 encoded
+CHECKPOINT 1400/3234 elapsed=154.2s eta=202.0s
+100/100 encoded
+CHECKPOINT 1500/3234 elapsed=163.7s eta=189.3s
+100/100 encoded
+CHECKPOINT 1600/3234 elapsed=175.5s eta=179.2s
+100/100 encoded
+CHECKPOINT 1700/3234 elapsed=186.0s eta=167.9s
+100/100 encoded
+CHECKPOINT 1800/3234 elapsed=196.2s eta=156.3s
+100/100 encoded
+CHECKPOINT 1900/3234 elapsed=206.4s eta=144.9s
+100/100 encoded
+CHECKPOINT 2000/3234 elapsed=215.6s eta=133.0s
+100/100 encoded
+CHECKPOINT 2100/3234 elapsed=224.0s eta=121.0s
+100/100 encoded
+CHECKPOINT 2200/3234 elapsed=232.2s eta=109.2s
+100/100 encoded
+CHECKPOINT 2300/3234 elapsed=241.0s eta=97.9s
+100/100 encoded
+CHECKPOINT 2400/3234 elapsed=249.7s eta=86.8s
+100/100 encoded
+CHECKPOINT 2500/3234 elapsed=258.4s eta=75.9s
+100/100 encoded
+CHECKPOINT 2600/3234 elapsed=266.9s eta=65.1s
+100/100 encoded
+CHECKPOINT 2700/3234 elapsed=275.0s eta=54.4s
+100/100 encoded
+CHECKPOINT 2800/3234 elapsed=283.0s eta=43.9s
+100/100 encoded
+CHECKPOINT 2900/3234 elapsed=291.4s eta=33.6s
+100/100 encoded
+CHECKPOINT 3000/3234 elapsed=299.8s eta=23.4s
+100/100 encoded
+CHECKPOINT 3100/3234 elapsed=307.7s eta=13.3s
+100/100 encoded
+CHECKPOINT 3200/3234 elapsed=316.0s eta=3.4s
+34/34 encoded
+CHECKPOINT 3234/3234 elapsed=319.9s eta=0.0s
+Granite GPU encoding complete

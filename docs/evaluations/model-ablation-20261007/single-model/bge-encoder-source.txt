@@ -1,0 +1,31 @@
+from __future__ import annotations
+import json
+import sys
+import time
+from pathlib import Path
+sys.path.insert(0, '/home/d/code/hn-rerank')
+import numpy as np
+import openvino as ov
+from database import Story
+from pipeline.ranking import story_embedding_text
+from scripts.bakeoff_embedding_models import _encode
+from scripts.encode_replay_embeddings import _save
+ids=frozenset(json.loads(Path('/tmp/hn-single-cohort-20261007.json').read_text()))
+stories=[Story(**r) for r in json.loads(Path('/tmp/hn-single-feedback-20261007.json').read_text()) if r['id'] in ids]
+assert len(stories)==len(ids)==3234
+model_dir=next(Path('/home/d/.cache/huggingface/hub/models--BAAI--bge-small-en-v1.5/snapshots').iterdir())
+print('GPU device:',ov.Core().get_property('GPU','FULL_DEVICE_NAME'),flush=True)
+for name,title_only,tokens in [('full256',False,256),('title128',True,128)]:
+ vectors=[]; started=time.perf_counter()
+ for start in range(0,len(stories),100):
+  piece=stories[start:start+100]
+  texts=[s.title if title_only else story_embedding_text(s) for s in piece]
+  encoded,_=_encode(texts,tokenizer_dir=str(model_dir),model_path=model_dir/'onnx/model.onnx',pooling='cls',max_tokens=tokens,batch_size=4,device='gpu')
+  vectors.append(encoded); result=np.concatenate(vectors)
+  assert np.isfinite(result).all()
+  np.testing.assert_allclose(np.linalg.norm(result,axis=1),1,atol=1e-5)
+  spec=f'BAAI/bge-small-en-v1.5|cls|{tokens}|prefix=none|title_only={title_only}|device=gpu'
+  _save(Path(f'/tmp/hn-bge-{name}-gpu-20261007.npz'),stories[:len(result)],result,spec)
+  elapsed=time.perf_counter()-started; eta=elapsed/len(result)*(len(stories)-len(result))
+  print(f'{name} CHECKPOINT {len(result)}/{len(stories)} elapsed={elapsed:.1f}s eta={eta:.1f}s',flush=True)
+print('BGE GPU encoding complete',flush=True)

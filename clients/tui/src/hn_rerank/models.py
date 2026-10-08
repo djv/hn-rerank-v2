@@ -83,6 +83,8 @@ class FeedStory:
     source_label: str = ""
     domain: str = ""
     enriched: bool = False
+    related_upvotes: list[str] = field(default_factory=list)
+    ranking_factors: list[str] = field(default_factory=list)
 
 
 # Unknown keys are ignored so a server can add optional fields within an
@@ -195,6 +197,14 @@ class Feed:
                         )
                     )
                     or type(story.enriched) is not bool
+                    or not isinstance(story.related_upvotes, list)
+                    or any(
+                        not isinstance(title, str) for title in story.related_upvotes
+                    )
+                    or not isinstance(story.ranking_factors, list)
+                    or any(
+                        not isinstance(factor, str) for factor in story.ranking_factors
+                    )
                 ):
                     raise ValueError("Invalid story")
             ids = {story.id for story in stories}

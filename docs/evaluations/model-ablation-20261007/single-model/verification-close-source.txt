@@ -1,0 +1,60 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT=Path('/tmp/hn-one-classifier-20261007')
+sys.path.insert(0,str(Path.cwd()))
+ARTIFACTS=Path('docs/evaluations/model-ablation-20261007/single-model')
+variant='prod[linear_blend_enabled=false;svm_c=4;svm_gamma=0.03]'
+manifest=json.loads((ROOT/'broad-provenance-manifest.json').read_text())
+selected=json.loads((ROOT/'broad-selected.json').read_text())['selected_adapter']['spec']
+
+def verify() -> None:
+    assert any(p.read_text().strip()=='1' for p in Path('/sys/class/power_supply').glob('*/online'))
+    while float(Path('/proc/loadavg').read_text().split()[0])>8:
+        time.sleep(10)
+    for name,expected in manifest.items():
+        with Path(name).open('rb') as handle:
+            assert hashlib.file_digest(handle,'sha256').hexdigest()==expected,name
+
+verify()
+plan={'selection':'Close the residual selected-baseline provenance concern from the focused Claude review; no new model setting','periods':['development','fresh'],'multiple_comparisons':'Holm-adjust the four predeclared AUC sign-flip tests, alongside raw p values; selection-search uncertainty remains unadjusted','launcher_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
+(ROOT/'verification-close-plan.json').write_text(json.dumps(plan,indent=2)+'\n')
+settings=[]
+for key,value in selected.items():settings.extend(['--'+key.replace('_','-'),str(value)])
+parity={}
+for period in plan['periods']:
+    verify()
+    available=next(int(line.split()[1]) for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemAvailable:'))
+    assert available>=2_000_000
+    splits=['--folds','8'] if period=='development' else ['--holdout-after','1790899200','--holdout-blocks','4']
+    name='verified-baseline-'+period
+    with (ROOT/f'{name}.log').open('w') as log:
+        subprocess.run(['uv','run','python','scripts/eval_one_classifier.py',*settings,'--','--config',str(ROOT/'native.toml'),'--user-id','151','--candidate-pool','heldout-feedback','--now','1791401987.9873054',*splits,'--variants',variant,'--output',str(ROOT/f'{name}.json'),'--dump-scores',str(ROOT/f'{name}-scores.json')],stdout=log,stderr=subprocess.STDOUT,check=True)
+    old=json.loads((ROOT/f'broad-check-adapter-{period}-scores.json').read_text())['folds']
+    new=json.loads((ROOT/f'{name}-scores.json').read_text())['folds']
+    for a,b in zip(old,new,strict=True):
+        assert a['ids']==b['ids'] and a['labels']==b['labels'] and a['scores']==b['scores']
+    parity[period]={'exact_candidate_ids_labels_and_all_scores':True,'folds':len(new)}
+    print(period+' selected-baseline exact parity',flush=True)
+verify()
+from scripts.compare_eval_scores import _holm
+summary=json.loads((ROOT/'feature-removal-summary.json').read_text())
+tests=[(feature,key,stats['AUC']['sign_flip_p']) for feature,value in summary['checks'].items() for key,stats in value['comparisons'].items()]
+adjusted=_holm([value for _,_,value in tests])
+summary['multiple_comparisons']={'method':'Holm over four AUC sign-flip tests; model-search selection reuse remains unadjusted','tests':[{ 'feature':feature,'baseline':key,'raw_p':value,'holm_p':p} for (feature,key,value),p in zip(tests,adjusted,strict=True)]}
+(ROOT/'feature-removal-summary.json').write_text(json.dumps(summary,indent=2,allow_nan=False)+'\n')
+tracked=subprocess.check_output(['git','diff','--name-only','HEAD'],text=True).splitlines()
+python_files=sorted(set([p for p in tracked if p.endswith('.py')]+['scripts/compare_eval_scores.py','scripts/eval_one_classifier.py','scripts/eval_single_preference_model.py','tests/test_compare_eval_scores.py','tests/test_one_classifier.py','tests/test_single_preference_model.py']))
+with (ROOT/'complete-touched-format.log').open('w') as log:
+    subprocess.run(['uv','run','ruff','format','--check',*python_files],stdout=log,stderr=subprocess.STDOUT,check=True)
+(ROOT/'verification-close-summary.json').write_text(json.dumps({'plan':plan,'selected_baseline_parity':parity,'all_source_and_input_hashes_stable':True,'formatted_files':python_files},indent=2)+'\n')
+for pattern in ('verified-baseline-*','verification-close-*','complete-touched-format.log','feature-removal-summary.json'):
+    for path in ROOT.glob(pattern):
+        (ARTIFACTS/path.name).write_bytes(path.read_bytes())
+print('residual verification checks complete',flush=True)

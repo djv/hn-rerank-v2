@@ -1,0 +1,70 @@
+[transformers] PyTorch was not found. Models won't be available and only tokenizers, configuration and file/data utilities can be used.
+GPU device: Intel(R) UHD Graphics (iGPU)
+Frozen feedback cohort: 3234
+100/100 encoded
+CHECKPOINT 100/3234 elapsed=39.0s eta=1222.9s
+100/100 encoded
+CHECKPOINT 200/3234 elapsed=62.1s eta=941.4s
+100/100 encoded
+CHECKPOINT 300/3234 elapsed=88.0s eta=861.0s
+100/100 encoded
+CHECKPOINT 400/3234 elapsed=112.5s eta=797.0s
+100/100 encoded
+CHECKPOINT 500/3234 elapsed=136.9s eta=748.5s
+100/100 encoded
+CHECKPOINT 600/3234 elapsed=163.0s eta=715.6s
+100/100 encoded
+CHECKPOINT 700/3234 elapsed=186.1s eta=673.8s
+100/100 encoded
+CHECKPOINT 800/3234 elapsed=211.0s eta=641.9s
+100/100 encoded
+CHECKPOINT 900/3234 elapsed=235.7s eta=611.2s
+100/100 encoded
+CHECKPOINT 1000/3234 elapsed=260.7s eta=582.4s
+100/100 encoded
+CHECKPOINT 1100/3234 elapsed=287.1s eta=557.0s
+100/100 encoded
+CHECKPOINT 1200/3234 elapsed=314.0s eta=532.3s
+100/100 encoded
+CHECKPOINT 1300/3234 elapsed=339.9s eta=505.7s
+100/100 encoded
+CHECKPOINT 1400/3234 elapsed=365.3s eta=478.6s
+100/100 encoded
+CHECKPOINT 1500/3234 elapsed=393.2s eta=454.6s
+100/100 encoded
+CHECKPOINT 1600/3234 elapsed=422.9s eta=431.9s
+100/100 encoded
+CHECKPOINT 1700/3234 elapsed=448.0s eta=404.2s
+100/100 encoded
+CHECKPOINT 1800/3234 elapsed=473.5s eta=377.2s
+100/100 encoded
+CHECKPOINT 1900/3234 elapsed=499.5s eta=350.7s
+100/100 encoded
+CHECKPOINT 2000/3234 elapsed=527.1s eta=325.2s
+100/100 encoded
+CHECKPOINT 2100/3234 elapsed=551.1s eta=297.6s
+100/100 encoded
+CHECKPOINT 2200/3234 elapsed=577.4s eta=271.4s
+100/100 encoded
+CHECKPOINT 2300/3234 elapsed=603.0s eta=244.9s
+100/100 encoded
+CHECKPOINT 2400/3234 elapsed=628.1s eta=218.3s
+100/100 encoded
+CHECKPOINT 2500/3234 elapsed=656.9s eta=192.9s
+100/100 encoded
+CHECKPOINT 2600/3234 elapsed=685.9s eta=167.3s
+100/100 encoded
+CHECKPOINT 2700/3234 elapsed=717.9s eta=142.0s
+100/100 encoded
+CHECKPOINT 2800/3234 elapsed=745.9s eta=115.6s
+100/100 encoded
+CHECKPOINT 2900/3234 elapsed=773.5s eta=89.1s
+100/100 encoded
+CHECKPOINT 3000/3234 elapsed=801.0s eta=62.5s
+100/100 encoded
+CHECKPOINT 3100/3234 elapsed=828.5s eta=35.8s
+100/100 encoded
+CHECKPOINT 3200/3234 elapsed=857.2s eta=9.1s
+34/34 encoded
+CHECKPOINT 3234/3234 elapsed=867.2s eta=0.0s
+GPU encoding complete

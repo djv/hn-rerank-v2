@@ -35,6 +35,7 @@ side_embedding_enabled = true
 
 [hn_rewrite.rss]
 feeds = [
+    "https://news.kagi.com/world.xml",
     "https://www.lesswrong.com/feed.xml?view=frontpage&karmaThreshold=20",
     "https://rss.slashdot.org/Slashdot/slashdotMain",
     "https://mshibanami.github.io/GitHubTrendingRSS/weekly/all.xml",

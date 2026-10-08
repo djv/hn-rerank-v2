@@ -1,0 +1,34 @@
+{
+  "features": [
+    "numeric",
+    "embedding_words"
+  ],
+  "selection": "User selected both removals for exploratory12-block checks, after seeing4-fold development results",
+  "comparison": [
+    "selected all-feature classifier",
+    "production blend"
+  ],
+  "same_classifier_settings": {
+    "family": "logistic",
+    "features": "all",
+    "word_scale": 1.0,
+    "max_leaf_nodes": 15,
+    "l2": 1.0,
+    "hidden": 32,
+    "score": "up_down",
+    "embedding_weight": 16.0,
+    "numeric_scale": 0.15811388300841897
+  },
+  "periods": [
+    "8 historical blocks",
+    "4 recent blocks"
+  ],
+  "statistics": {
+    "story_draws": 3000,
+    "block_draws": 20000,
+    "seed": 20261007,
+    "main_block_test": "exact sign-flip; intervals supplementary; selection reuse unadjusted"
+  },
+  "launcher_sha256": "bb5daba38e4d7d7b61147b76bdcf615963187ee14c207ba85c4bfd89b86f8e00",
+  "source_input_manifest_sha256": "ea1914294d624a0d81881dbe60147a9591588be241db2329cc70a42d81dacf1b"
+}

@@ -1,0 +1,9 @@
+{
+  "pid": 1517875,
+  "driver": "i915",
+  "gpu": "Intel UHD",
+  "render_ns_before": 65793786298,
+  "render_ns_after": 68658545365,
+  "elapsed_seconds": 3.00184188199637,
+  "gpu_render_busy_percent": 95.43337656062006
+}

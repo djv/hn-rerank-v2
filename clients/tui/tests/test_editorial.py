@@ -610,6 +610,31 @@ async def test_badge_legend_hotkey_and_escape_restore_story() -> None:
         assert "Section 0" in app.query_one(Markdown)._markdown
 
 
+async def test_why_story_hotkey_and_escape_restore_summary() -> None:
+    app = Reader(api=EditorialServer().api())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        selected = app.selected()
+        assert selected is not None
+        app.stories[app.stories.index(selected)] = replace(
+            selected,
+            related_upvotes=["An *upvote*", "Another upvote"],
+            ranking_factors=["Helped: Content model", "Hurt: Word model"],
+        )
+        await pilot.press("w")
+        await pilot.pause()
+        panel = app.query_one(Markdown)._markdown
+        assert "# Why this story" in panel
+        assert "learned preferences" in panel
+        assert r"An \*upvote\*" in panel
+        assert "Another upvote" in panel
+        assert "Helped: Content model" in panel
+        assert "Hurt: Word model" in panel
+        await pilot.press("escape")
+        await settle(pilot)
+        assert "Section 0" in app.query_one(Markdown)._markdown
+
+
 async def test_help_escape_restores_story_view_and_survives_refresh() -> None:
     fake = EditorialServer()
     app = Reader(api=fake.api())

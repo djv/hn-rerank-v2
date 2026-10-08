@@ -1,0 +1,3764 @@
+from __future__ import annotations
+
+import asyncio
+import ctypes
+import gc
+import hashlib
+import html
+import json
+import ipaddress
+import logging
+import os
+import random
+import re
+import secrets
+import sys
+import threading
+import time
+import math
+import uuid
+from collections import deque
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass, replace
+from http import HTTPStatus
+from pathlib import Path
+from typing import Any, Literal, TypeVar, cast
+from urllib.parse import urlparse, urlunparse
+
+import feedparser
+import justext
+import trafilatura
+from bs4 import BeautifulSoup
+from bs4.element import Tag
+from flask import Flask, Response, g, jsonify, redirect, request
+from werkzeug.wrappers import Response as BaseResponse
+from flask.typing import ResponseReturnValue
+import httpx
+
+from background_cadence import BackgroundCadence
+from clients.tui.src.hn_rerank.models import (
+    DEFAULT_WINDOW,
+    VIEWS,
+    WINDOWS,
+    Feed,
+    Window,
+)
+from database import (
+    Database,
+    InteractionEvent,
+    InteractionEventType,
+    RankPerfSample,
+    Story,
+    User,
+)
+from pipeline import (
+    Config,
+    DEFAULT_ENV_PATH,
+    Embedder,
+    WindowDeck,
+    hn_thread_looks_active,
+    is_hn_source,
+)
+from pipeline.ranking import serve_window
+from pipeline.ainews import AINEWS_SOURCE
+from pipeline.hn_dupes import pointer_thread_target
+from llm_limiter import limiter as llm_limiter
+from reddit_limiter import limiter as reddit_limiter
+import http_fetch
+from single_flight import SingleFlight
+from warm_scheduler import WarmScheduler
+
+_LaneT = TypeVar("_LaneT")
+
+ARTICLE_BODY_CHAR_LIMIT = 30_000
+SELF_TEXT_PROMPT_CHAR_LIMIT = 16_000
+COMMENT_PROMPT_CHAR_LIMIT = 24_000
+SELF_TEXT_PROMPT_MIN_CHARS = 300
+# Dual-path routing floor: an article side thinner than this folds into the
+# single discussion path instead of spending a second LLM call on a stub
+# Article half and starving the Discussion half (450 vs 1000 tokens).
+ARTICLE_SECTION_MIN_CHARS = 500
+REDDIT_COMMENTS_CACHE_CHAR_LIMIT = 10_000
+REDDIT_COMMENT_LIMIT = 40
+REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dashboard"
+TLDR_PROMPT_VERSION = "detail-v16"
+_PROMPTS_DIR = Path(__file__).parent / "prompts"
+_PROMPT_CACHE: dict[str, str] = {}
+
+
+@dataclass(frozen=True)
+class RateLimitResult:
+    allowed: bool
+    retry_after_seconds: int = 0
+
+
+class FixedWindowLimiter:
+    """Thread-safe fixed-window limiter for local public-demo protection."""
+
+    # How often to drop idle buckets; keys are per-IP/per-user, so without
+    # this the dict grows by one entry per address ever seen.
+    SWEEP_INTERVAL_SECONDS = 300.0
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._buckets: dict[str, deque[float]] = {}
+        self._windows: dict[str, int] = {}
+        self._last_sweep: float | None = None
+
+    def _sweep(self, now: float) -> None:
+        for key in list(self._buckets):
+            bucket = self._buckets[key]
+            if not bucket or bucket[-1] <= now - self._windows[key]:
+                del self._buckets[key]
+                del self._windows[key]
+
+    def try_acquire(
+        self, checks: Sequence[tuple[str, int, int]], now: float | None = None
+    ) -> RateLimitResult:
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            if self._last_sweep is None:
+                self._last_sweep = now
+            elif now - self._last_sweep >= self.SWEEP_INTERVAL_SECONDS:
+                self._sweep(now)
+                self._last_sweep = now
+            retry_after = 0
+            normalized: list[tuple[str, int, int, deque[float]]] = []
+            for key, limit, window_seconds in checks:
+                if limit <= 0 or window_seconds <= 0:
+                    continue
+                bucket = self._buckets.setdefault(key, deque())
+                self._windows[key] = window_seconds
+                cutoff = now - window_seconds
+                while bucket and bucket[0] <= cutoff:
+                    bucket.popleft()
+                normalized.append((key, limit, window_seconds, bucket))
+                if len(bucket) >= limit:
+                    oldest = bucket[0]
+                    retry_after = max(
+                        retry_after,
+                        max(1, int((oldest + window_seconds) - now + 0.999)),
+                    )
+            if retry_after > 0:
+                return RateLimitResult(False, retry_after)
+            for _key, _limit, _window_seconds, bucket in normalized:
+                bucket.append(now)
+        return RateLimitResult(True)
+
+
+def _load_prompt(name: str) -> str:
+    """Read a prompt template from the prompts/ directory (cached after first load)."""
+    if name not in _PROMPT_CACHE:
+        _PROMPT_CACHE[name] = (_PROMPTS_DIR / name).read_text(encoding="utf-8")
+    return _PROMPT_CACHE[name]
+
+
+def _parse_retry_after(header_value: str | None, default: float = 1.0) -> float:
+    if not header_value:
+        return default
+    try:
+        seconds = float(header_value)
+    except ValueError:
+        return default
+    return max(0.0, min(seconds, 10.0))
+
+
+def _normalize_tldr_markdown(text: str) -> str:
+    """Make LLM summary Markdown predictable for the compact dashboard renderer."""
+    lines = []
+    for raw_line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = raw_line.rstrip()
+        # Some models (gemini-2.5-flash-lite) emit `*` bullets despite the
+        # prompt's flat `-` convention; normalize so cached summaries and
+        # the renderer see one marker style.
+        line = re.sub(r"^(\s*)\*\s+", r"\1- ", line)
+        # Single-marker emphasis is italic in CommonMark but bold in the
+        # dashboard renderer; standardize on bold so both clients agree and
+        # the terminal accent covers every emphasized term.
+        # Repeat until stable: converting an inner pair can expose an outer
+        # one (`_:_X_:_`), and normalization must be idempotent because
+        # cached summaries are normalized again on read.
+        for _ in range(8):
+            previous = line
+            line = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"**\1**", line)
+            line = re.sub(
+                r"(?<![A-Za-z0-9_])_([^_\n]+)_(?![A-Za-z0-9_])", r"**\1**", line
+            )
+            if line == previous:
+                break
+        stripped = line.strip()
+        if _looks_like_plain_heading(stripped):
+            lines.append(f"### {stripped}")
+            continue
+        label_match = re.match(r"^([A-Z][A-Za-z ]{1,40}):\s*(.*)$", stripped)
+        if label_match:
+            label, body = label_match.groups()
+            lines.append(f"- **{label}:** {body}" if body else f"- **{label}:**")
+        else:
+            lines.append(line)
+
+    normalized = "\n".join(lines)
+    normalized = re.sub(r"([.!;?:])\s+-\s+(?=\S)", r"\1\n- ", normalized)
+    return normalized.strip()
+
+
+def _cap_tldr_structure(
+    text: str, *, max_bullets: int = 4, max_subheadings: int = 1
+) -> str:
+    """Bound the block count of one TLDR section for a one-screen reading pane.
+
+    Prompt budgets ask for this shape, but models still overshoot, and the
+    terminal pane only fits one screen when bullets and subheadings are few.
+    """
+    out: list[str] = []
+    bullets = subheadings = 0
+    for line in text.split("\n"):
+        if line.startswith("### "):
+            bullets = subheadings = 0
+        elif line.startswith("####"):
+            subheadings += 1
+            if subheadings > max_subheadings:
+                continue
+        elif line.startswith("- "):
+            bullets += 1
+            if bullets > max_bullets:
+                continue
+        out.append(line)
+    # Trim surrounding blank lines only: stripping spaces would promote an
+    # indented first bullet to top level and break the cap just applied.
+    return "\n".join(out).strip("\n")
+
+
+def _shape_tldr(
+    text: str, *, article_chars: int = 0, single_section: bool = False
+) -> str:
+    """Normalize Markdown and preserve the reading-pane allowance."""
+    _, max_bullets, _ = _section_limits(article_chars)
+    if single_section:
+        max_bullets *= 2
+    return _cap_tldr_structure(_normalize_tldr_markdown(text), max_bullets=max_bullets)
+
+
+def _looks_like_plain_heading(line: str) -> bool:
+    if not line or len(line) > 48:
+        return False
+    if line.startswith(("#", "-", "*", ">", "`")) or line.endswith((".", ":", ",")):
+        return False
+    words = line.split()
+    return len(words) <= 5 and any(ch.isalpha() for ch in line)
+
+
+def load_env() -> None:
+    # Prefer a local .env (per-worktree override); fall back to the shared
+    # location so every worktree finds secrets without copying anything.
+    env_path = Path(".env")
+    if not env_path.exists():
+        env_path = Path(DEFAULT_ENV_PATH)
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ[k.strip()] = v.strip().strip("'\"")
+
+
+@dataclass(frozen=True)
+class RedditRssContext:
+    self_text: str = ""
+    top_comments: str = ""
+    comment_count: int = 0
+
+
+@dataclass(frozen=True)
+class LessWrongContext:
+    self_text: str = ""
+    top_comments: str = ""
+    comment_count: int = 0
+    score: int = 0
+
+
+@dataclass(frozen=True)
+class ArticleFetchResult:
+    body: str | None = None
+    status: int | None = None
+    error: str | None = None
+    permanent: bool = False
+
+
+@dataclass(frozen=True)
+class LlmChatResult:
+    content: str
+    ok: bool
+    status: int | None = None
+    finish_reason: str | None = None
+    # Token usage for spend visibility (None when the provider omits usage).
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    reasoning_tokens: int | None = None
+
+
+@dataclass(frozen=True)
+class TldrResult:
+    kind: Literal["ok", "no_content", "llm_error"]
+    tldr: str = ""
+    error_status: int | None = None
+    error_text: str = ""
+    # False for a salvaged half: serve this request only, never tldr_cache
+    # (one row per story — caching it would evict a complete TLDR).
+    cacheable: bool = True
+
+
+def _llm_error_from(r: LlmChatResult) -> TldrResult:
+    return TldrResult(kind="llm_error", error_status=r.status, error_text=r.content)
+
+
+MIN_ARTICLE_CHARS = 200
+MIN_GOOD_PARAS = 2
+
+
+def _normalize_article_text(text: str) -> str:
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
+    return text.strip()
+
+
+def _looks_bad_extraction(text: str) -> bool:
+    """Structural quality check — rejects extractions where the tier itself
+    indicates the text is likely dominated by boilerplate.
+
+    No content-based blocklists; only structural signal (length, word count).
+    """
+    if not text or len(text) < MIN_ARTICLE_CHARS:  # noqa: SIM103
+        return True
+    words = text.split()
+    if len(words) < 80:
+        return True
+    return False
+
+
+def _extract_with_justext(html: str) -> str | None:
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+        tag.decompose()
+    paragraphs = justext.justext(str(soup), justext.get_stoplist("English"))
+    good = [
+        p.text.strip()
+        for p in paragraphs
+        if not p.is_boilerplate and p.text and p.text.strip()
+    ]
+    if len(good) < MIN_GOOD_PARAS:
+        return None
+    text = _normalize_article_text("\n\n".join(good))
+    if _looks_bad_extraction(text):
+        return None
+    return text
+
+
+def _extract_with_bs_semantic(html: str) -> str | None:
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+        tag.decompose()
+
+    candidates: list[Tag] = []
+
+    # Prefer unclassed <article> (main content on e.g. The Register)
+    for art in soup.find_all("article"):
+        if not art.get("class"):
+            candidates.append(art)
+
+    main = soup.find("main")
+    if main:
+        candidates.append(main)
+
+    candidates.extend(soup.find_all("article"))
+
+    for node in candidates:
+        text = _normalize_article_text(node.get_text(separator=" ", strip=True))
+        if not _looks_bad_extraction(text):
+            return text
+    return None
+
+
+def _extract_with_trafilatura(html: str) -> str | None:
+    text = trafilatura.extract(
+        html,
+        include_comments=False,
+        include_tables=False,
+        favor_precision=True,
+        deduplicate=True,
+    )
+    if not text:
+        return None
+    text = _normalize_article_text(text)
+    if _looks_bad_extraction(text):
+        return None
+    return text
+
+
+def _extract_raw_body(html: str) -> str | None:
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+        tag.decompose()
+    text = _normalize_article_text(soup.get_text(separator=" ", strip=True))
+    if len(text) < MIN_ARTICLE_CHARS:
+        return None
+    return text
+
+
+def _extract_article_body(html: str) -> str | None:
+    """Try each extraction strategy in order of quality.
+
+    jusText (statistical boilerplate classification) → BS semantic
+    (unclassed <article>/<main>) → trafilatura (precision mode) → raw body.
+    """
+    for extractor in (
+        _extract_with_justext,
+        _extract_with_bs_semantic,
+        _extract_with_trafilatura,
+        _extract_raw_body,
+    ):
+        text = extractor(html)
+        if text:
+            return text
+    return None
+
+
+# Article bodies built from a tweet start with this; such a body is the
+# story's real content even when shorter than ARTICLE_SECTION_MIN_CHARS.
+TWEET_BODY_PREFIX = "Tweet by @"
+
+
+async def _fetch_tweet_body(tweet_id: str) -> ArticleFetchResult:
+    """A tweet (via the fxtwitter mirror, never x.com) plus the page it links.
+
+    x.com serves no article HTML, so tweet links used to fail as non_html.
+    """
+    from pipeline import _is_fetchable_article_url
+    from pipeline.ainews import fetch_tweets, tweet_id_from_url
+
+    tweet = (await fetch_tweets([tweet_id])).get(tweet_id)
+    if tweet is None:
+        return ArticleFetchResult(error="tweet_unavailable")
+    body = f"{TWEET_BODY_PREFIX}{tweet.author}:\n{tweet.text}"
+    if tweet.quote_text:
+        body += f"\n\nQuoting:\n{tweet.quote_text}"
+    link = next(
+        (
+            u
+            for u in tweet.links
+            if tweet_id_from_url(u) is None and _is_fetchable_article_url(u)
+        ),
+        None,
+    )
+    if link:
+        page = await _fetch_article_body_with_result(link)
+        if page.body:
+            body += f"\n\nLinked page ({link}):\n{page.body}"
+    return ArticleFetchResult(body=body[:ARTICLE_BODY_CHAR_LIMIT], status=200)
+
+
+async def _fetch_article_body_with_result(url: str) -> ArticleFetchResult:
+    from pipeline.ainews import tweet_id_from_url
+
+    if tweet_id := tweet_id_from_url(url):
+        return await _fetch_tweet_body(tweet_id)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate",
+        "Cache-Control": "no-cache",
+    }
+
+    for attempt in range(2):
+        try:
+            # guarded_get connects only to validated public addresses (every
+            # redirect hop) and streams the body under a byte cap.
+            resp = await http_fetch.guarded_get(url, headers, timeout=10.0)
+            if resp.status in (429, 503) and attempt == 0:
+                await asyncio.sleep(1)
+                continue
+            if resp.status == 200:
+                ct = (resp.headers.get("content-type") or "").lower()
+                if ct and not ct.startswith(
+                    ("text/html", "application/xhtml+xml", "text/xml", "text/plain")
+                ):
+                    return ArticleFetchResult(
+                        status=200, error="non_html", permanent=True
+                    )
+                html = resp.text
+                if "\x00" in html:
+                    return ArticleFetchResult(
+                        status=200, error="non_html", permanent=True
+                    )
+            elif resp.status == 403 and attempt == 0:
+                # httpx's TLS fingerprint is often blocked where urllib's
+                # system-OpenSSL handshake gets through (see http_fetch).
+                logging.info("%s: httpx 403, retrying with urllib", url)
+                status, html = await asyncio.to_thread(
+                    http_fetch.guarded_urllib_fetch, url, headers["User-Agent"]
+                )
+                if status != 200:
+                    return ArticleFetchResult(
+                        status=status,
+                        error=f"http_{status}",
+                    )
+                if "\x00" in html:
+                    return ArticleFetchResult(
+                        status=200, error="non_html", permanent=True
+                    )
+            else:
+                return ArticleFetchResult(
+                    status=resp.status,
+                    error=f"http_{resp.status}",
+                    permanent=resp.status in (404, 410),
+                )
+        except http_fetch.UnsafeUrlError as e:
+            logging.warning("article fetch blocked for %s: %s", url, e)
+            return ArticleFetchResult(error="unsafe_url", permanent=True)
+        except Exception as e:
+            return ArticleFetchResult(error=type(e).__name__)
+
+        try:
+            text = _extract_article_body(html)
+        except Exception as e:
+            logging.warning("extract_article_body failed for %s: %s", url, e)
+            return ArticleFetchResult(error=f"extract_{type(e).__name__}")
+        if text:
+            return ArticleFetchResult(body=text[:ARTICLE_BODY_CHAR_LIMIT], status=200)
+        return ArticleFetchResult(status=200, error="empty_extraction")
+
+    return ArticleFetchResult(status=503, error="retry_exhausted")
+
+
+async def _fetch_article_body(url: str) -> str | None:
+    return (await _fetch_article_body_with_result(url)).body
+
+
+def _reddit_post_rss_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host not in {"reddit.com", "old.reddit.com"}:
+        return None
+    path = parsed.path.rstrip("/")
+    if "/comments/" not in path:
+        return None
+    if path.endswith(".rss"):
+        rss_path = path
+    else:
+        rss_path = f"{path}/.rss"
+    return urlunparse((parsed.scheme or "https", parsed.netloc, rss_path, "", "", ""))
+
+
+def _clean_reddit_rss_html(raw_html: str) -> str:
+    soup = BeautifulSoup(html.unescape(raw_html or ""), "html.parser")
+    md = soup.find("div", class_="md")
+    node = md if md else soup
+    text = node.get_text(separator=" ", strip=True)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _is_low_signal_reddit_comment(author: str, text: str) -> bool:
+    normalized_author = author.lower().removeprefix("/u/")
+    normalized_text = text.lower()
+    if normalized_author in {"automoderator", "withoutreason1729"}:
+        return True
+    if normalized_text in {"[deleted]", "[removed]"}:
+        return True
+    if "i am a bot and this action was performed automatically" in normalized_text:
+        return True
+    if "your post is getting popular" in normalized_text:
+        return True
+    return len(text) < 30
+
+
+LESSWRONG_COMMENT_LIMIT = 20
+MAX_CONTENT_LENGTH = 10**6  # 1MB cap on POST bodies
+MAX_INTERACTION_EVENTS = 64
+TLDR_BUSY_RETRY_AFTER_SECONDS = 5
+# How long a request waits for another request's generation of the same
+# story: as long as clients wait for their own (the TUI allows 150s).
+TLDR_JOIN_TIMEOUT_SECONDS = 150.0
+INTERACTION_EVENT_REQUESTS_PER_MINUTE = 120
+INTERACTION_EVENT_GLOBAL_REQUESTS_PER_MINUTE = 10_000
+
+
+def _extract_lesswrong_post_id(url: str | None) -> str | None:
+    if not url:
+        return None
+    parts = urlparse(url).path.strip("/").split("/")
+    if len(parts) >= 2 and parts[0] == "posts":
+        return parts[1]
+    return None
+
+
+def _clean_lesswrong_html(raw_html: str | None) -> str:
+    if not raw_html:
+        return ""
+    soup = BeautifulSoup(html.unescape(raw_html), "html.parser")
+    text = soup.get_text(separator=" ", strip=True)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+REDDIT_RSS_ON_DEMAND_MAX_ATTEMPTS = 2
+
+
+async def _fetch_reddit_rss_context(url: str | None) -> RedditRssContext | None:
+    rss_url = _reddit_post_rss_url(url)
+    if not rss_url:
+        return None
+
+    resp = None
+    for _attempt in range(REDDIT_RSS_ON_DEMAND_MAX_ATTEMPTS):
+        if not await reddit_limiter.acquire():
+            return None
+
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
+                resp = await client.get(
+                    rss_url, headers={"User-Agent": REDDIT_RSS_USER_AGENT}
+                )
+        except Exception:
+            return None
+
+        if resp.status_code == 429:
+            retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+            rl_reset_raw = resp.headers.get("x-ratelimit-reset")
+            rl_reset = float(rl_reset_raw) if rl_reset_raw else None
+            reddit_limiter.on_429(retry_after, rate_limit_reset=rl_reset)
+            # A single 429 is often transient contention with the topfeed/
+            # prewarm queue on the same shared-IP limiter; the next
+            # acquire() call honors the backoff before we retry once more.
+            continue
+        if resp.status_code != 200:
+            return None
+        reddit_limiter.on_success()
+        break
+    else:
+        return None
+
+    parsed = feedparser.parse(resp.text)
+    entries = list(parsed.entries)
+    if not entries:
+        return None
+
+    first = entries[0]
+    post_html = ""
+    if "content" in first and first.content:
+        post_html = first.content[0].value
+    elif "summary" in first:
+        post_html = first.summary
+    self_text = _clean_reddit_rss_html(post_html)
+
+    comments: list[str] = []
+    total_len = 0
+    for entry in entries[1:]:
+        comment_html = ""
+        if "content" in entry and entry.content:
+            comment_html = entry.content[0].value
+        elif "summary" in entry:
+            comment_html = entry.summary
+        text = _clean_reddit_rss_html(comment_html)
+        author = str(entry.get("author", "")).strip()
+        if _is_low_signal_reddit_comment(author, text):
+            continue
+        label = author if author.startswith("/u/") else f"/u/{author}" if author else ""
+        formatted = f"{label}: {text}" if label else text
+        remaining = REDDIT_COMMENTS_CACHE_CHAR_LIMIT - total_len
+        if remaining <= 0 or len(comments) >= REDDIT_COMMENT_LIMIT:
+            break
+        formatted = formatted[:remaining]
+        comments.append(formatted)
+        total_len += len(formatted) + 1
+
+    return RedditRssContext(
+        self_text=self_text[:SELF_TEXT_PROMPT_CHAR_LIMIT],
+        top_comments=" ".join(comments)[:REDDIT_COMMENTS_CACHE_CHAR_LIMIT],
+        comment_count=len(comments),
+    )
+
+
+async def _fetch_lesswrong_context(
+    post_id: str, timeout_s: float = 15.0
+) -> LessWrongContext | None:
+    query = """
+    query($id: String!) {
+      post(input: { selector: { _id: $id } }) {
+        result { _id commentCount baseScore contents { html } }
+      }
+      comments(input: { terms: { view: "postCommentsTop", postId: $id } }) {
+        results { _id author baseScore htmlBody postedAt }
+      }
+    }
+    """
+    try:
+        async with httpx.AsyncClient(timeout=timeout_s) as client:
+            resp = await client.post(
+                "https://www.lesswrong.com/graphql",
+                json={"query": query, "variables": {"id": post_id}},
+            )
+        if resp.status_code != 200:
+            return None
+        payload = resp.json()
+    except Exception as e:
+        logging.error("LessWrong fetch failed: %r", e)
+        return None
+    if not payload.get("data"):
+        return None
+    data = payload["data"]
+    post = (data.get("post") or {}).get("result") or {}
+    comments_data = data.get("comments") or {}
+    if not post:
+        return None
+
+    self_text = _clean_lesswrong_html((post.get("contents") or {}).get("html", ""))[
+        :SELF_TEXT_PROMPT_CHAR_LIMIT
+    ]
+
+    comments: list[str] = []
+    total_len = 0
+    for c in comments_data.get("results") or []:
+        text = _clean_lesswrong_html(c.get("htmlBody") or "")
+        author = (c.get("author") or "").strip()
+        label = f"/u/{author}" if author else ""
+        line = f"{label}: {text}" if label else text
+        remaining = COMMENT_PROMPT_CHAR_LIMIT - total_len
+        if remaining <= 0 or len(comments) >= LESSWRONG_COMMENT_LIMIT:
+            break
+        line = line[:remaining]
+        comments.append(line)
+        total_len += len(line) + 1
+
+    return LessWrongContext(
+        self_text=self_text,
+        top_comments=" ".join(comments)[:COMMENT_PROMPT_CHAR_LIMIT],
+        comment_count=int(post.get("commentCount") or len(comments)),
+        score=int(post.get("baseScore") or 0),
+    )
+
+
+def _usage_int(usage: object, key: str) -> int | None:
+    """Defensive usage-field reader: non-negative ints only, else None."""
+    if not isinstance(usage, dict):
+        return None
+    value = usage.get(key)
+    if isinstance(value, int) and value >= 0:
+        return value
+    return None
+
+
+async def _call_llm_chat(
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    prompt: str,
+    max_tokens: int,
+    extra: dict[str, object] | None = None,
+) -> LlmChatResult:
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
+        "max_tokens": max_tokens,
+        **(extra or {}),
+    }
+    estimated_tokens = len(prompt) // 3 + max_tokens
+    # The free Go models think for 15-45s on long discussions.
+    timeout = 90.0 if "/zen/go/" in base_url else 45.0
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            for attempt in range(4):
+                if not await llm_limiter.acquire(estimated_tokens=estimated_tokens):
+                    return LlmChatResult(
+                        content="LLM quota cooldown; retry later.", ok=False, status=429
+                    )
+                headers = {
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                }
+                if "/zen/go/" in base_url:
+                    # The Go gateway rejects requests without a session id.
+                    headers["User-Agent"] = _GO_USER_AGENT
+                    headers["x-opencode-session"] = _go_session_id()
+                resp = await client.post(base_url, headers=headers, json=payload)
+                data = resp.json() if resp.status_code == 200 else {}
+                used_tokens = data.get("usage", {}).get("total_tokens")
+                llm_limiter.record_response(
+                    status=resp.status_code,
+                    headers=resp.headers,
+                    reserved_tokens=estimated_tokens,
+                    used_tokens=used_tokens
+                    if isinstance(used_tokens, int) and used_tokens >= 0
+                    else None,
+                )
+                if resp.status_code == 200:
+                    choice = data["choices"][0]
+                    content = choice["message"].get("content") or ""
+                    finish_reason = choice.get("finish_reason")
+                    usage = data.get("usage", {})
+                    return LlmChatResult(
+                        content=content,
+                        ok=_valid_llm_completion(content, finish_reason),
+                        finish_reason=finish_reason,
+                        input_tokens=_usage_int(usage, "prompt_tokens"),
+                        output_tokens=_usage_int(usage, "completion_tokens"),
+                    )
+                if resp.status_code == 429 and attempt < 3:
+                    continue
+                if resp.status_code == 503 and attempt < 3:
+                    base = 2 ** (attempt + 1)
+                    jitter = random.uniform(0, base * 0.5)
+                    delay = _parse_retry_after(
+                        resp.headers.get("Retry-After"), default=base + jitter
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                break
+            return LlmChatResult(
+                content=f"Error from LLM Provider: HTTP {resp.status_code} - {resp.text}",
+                ok=False,
+                status=resp.status_code,
+            )
+    except Exception as e:
+        logging.exception("_call_llm_chat: unexpected exception")
+        return LlmChatResult(content=str(e), ok=False)
+
+
+# Go gateway client identity: non-generic UA + stable per-day session id
+# (prompt-cache affinity; Go asks for a stable conversation session).
+_GO_USER_AGENT = "hn-rewrite-tldr/1.0"
+
+
+def _go_session_id() -> str:
+    return f"hn-rewrite-tldr-{time.strftime('%Y%m%d')}"
+
+
+def _responses_text(data: dict[str, Any]) -> str:
+    """Extract concatenated output_text from a Responses API payload."""
+    parts: list[str] = []
+    output = data.get("output")
+    if not isinstance(output, list):
+        return ""
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue  # reasoning items, tool calls, etc.
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "output_text":
+                text = part.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+    return "".join(parts)
+
+
+def _responses_error(data: object, status_code: int, raw_text: str) -> str:
+    if isinstance(data, dict):
+        payload: dict[Any, Any] = data
+        err = payload.get("error")
+        if isinstance(err, dict) and err.get("message"):
+            return str(err["message"])
+    return f"Error from LLM Provider: HTTP {status_code} - {raw_text}"
+
+
+async def _call_llm_responses(
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    prompt: str,
+    max_tokens: int,
+    extra: dict[str, object] | None = None,
+) -> LlmChatResult:
+    """OpenAI Responses-API caller for the Go gateway (Muse Spark).
+
+    Same contract as _call_llm_chat. max_output_tokens covers reasoning +
+    output tokens, so reasoning effort is pinned low (upstream rejects
+    "none"). No temperature: the provider forces its default.
+    """
+    payload = {
+        "model": model,
+        "input": prompt,
+        "max_output_tokens": max_tokens,
+        "reasoning": {"effort": (extra or {}).get("reasoning_effort", "low")},
+    }
+    estimated_tokens = len(prompt) // 3 + max_tokens
+    try:
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            for attempt in range(4):
+                if not await llm_limiter.acquire(estimated_tokens=estimated_tokens):
+                    return LlmChatResult(
+                        content="LLM quota cooldown; retry later.", ok=False, status=429
+                    )
+                t0 = time.perf_counter()
+                resp = await client.post(
+                    base_url,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                        "User-Agent": _GO_USER_AGENT,
+                        "x-opencode-session": _go_session_id(),
+                    },
+                    json=payload,
+                )
+                ms = (time.perf_counter() - t0) * 1000.0
+                try:
+                    data = resp.json()
+                except ValueError:
+                    data = {}
+                usage = data.get("usage") if isinstance(data, dict) else {}
+                used_tokens = (
+                    usage.get("total_tokens") if isinstance(usage, dict) else None
+                )
+                llm_limiter.record_response(
+                    status=resp.status_code,
+                    headers=resp.headers,
+                    reserved_tokens=estimated_tokens,
+                    used_tokens=used_tokens
+                    if isinstance(used_tokens, int) and used_tokens >= 0
+                    else None,
+                )
+                if resp.status_code == 200 and isinstance(data, dict):
+                    content = _responses_text(data)
+                    details = (
+                        usage.get("output_tokens_details") or {}
+                        if isinstance(usage, dict)
+                        else {}
+                    )
+                    logging.info(
+                        "llm_responses model=%s ms=%.0f in=%s out=%s reasoning=%s status_field=%s",
+                        model,
+                        ms,
+                        (
+                            usage.get("input_tokens")
+                            if isinstance(usage, dict)
+                            else None
+                        ),
+                        (
+                            usage.get("output_tokens")
+                            if isinstance(usage, dict)
+                            else None
+                        ),
+                        (
+                            details.get("reasoning_tokens")
+                            if isinstance(details, dict)
+                            else None
+                        ),
+                        data.get("status"),
+                    )
+                    finish = None if data.get("status") == "completed" else "length"
+                    details = details if isinstance(details, dict) else {}
+                    return LlmChatResult(
+                        content=content,
+                        ok=_valid_llm_completion(content, finish),
+                        finish_reason=finish,
+                        input_tokens=_usage_int(usage, "input_tokens"),
+                        output_tokens=_usage_int(usage, "output_tokens"),
+                        reasoning_tokens=_usage_int(details, "reasoning_tokens"),
+                    )
+                if resp.status_code == 429 and attempt < 3:
+                    continue
+                if resp.status_code == 503 and attempt < 3:
+                    base = 2 ** (attempt + 1)
+                    jitter = random.uniform(0, base * 0.5)
+                    delay = _parse_retry_after(
+                        resp.headers.get("Retry-After"), default=base + jitter
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                break
+            err_data: object = data if isinstance(data, dict) else {}
+            return LlmChatResult(
+                content=_responses_error(err_data, resp.status_code, resp.text),
+                ok=False,
+                status=resp.status_code,
+            )
+    except Exception as e:
+        logging.exception("_call_llm_responses: unexpected exception")
+        return LlmChatResult(content=str(e), ok=False)
+
+
+# Spend-visibility recorder: Database.record_llm_usage bound by callers that
+# own a db handle. Recording must never break TLDR serving, so every failure
+# is swallowed with a log line.
+LlmUsageRecorder = Callable[[str, int | None, int | None, int | None], None]
+
+
+def _note_llm_usage(
+    on_usage: LlmUsageRecorder | None, provider: str, result: LlmChatResult
+) -> None:
+    if on_usage is None:
+        return
+    try:
+        on_usage(
+            provider, result.input_tokens, result.output_tokens, result.reasoning_tokens
+        )
+    except Exception:
+        logging.exception("llm_usage record failed (non-fatal)")
+
+
+# Process-wide spend recorder, bound once in main() to db.record_llm_usage.
+# generate_detailed_tldr reads it so no caller signature changes (keeps the
+# many generate_detailed_tldr mocks in tests/test_server.py intact). Tests
+# that need recording set/restore it directly.
+_llm_usage_recorder: LlmUsageRecorder | None = None
+
+
+def set_llm_usage_recorder(recorder: LlmUsageRecorder | None) -> None:
+    global _llm_usage_recorder
+    _llm_usage_recorder = recorder
+
+
+async def _call_llm_for_config(
+    cfg: LlmProviderConfig,
+    *,
+    prompt: str,
+    max_tokens: int,
+    on_usage: LlmUsageRecorder | None = None,
+) -> LlmChatResult:
+    """Call the provider, retrying once when a finished reply has no bullets.
+
+    Mistral-small sometimes answers a section as one prose paragraph
+    (finish=stop, rejected by _valid_llm_completion); about a third of
+    TLDRs lost a half this way on 2026-09-29. A second sample usually
+    comes back as bullets.
+    """
+    result = await _call_llm_once(
+        cfg, prompt=prompt, max_tokens=max_tokens, on_usage=on_usage
+    )
+    if _is_format_rejection(result):
+        logging.info("llm: reply had no bullets, retrying once")
+        result = await _call_llm_once(
+            cfg, prompt=prompt, max_tokens=max_tokens, on_usage=on_usage
+        )
+    return result
+
+
+def _is_format_rejection(result: LlmChatResult) -> bool:
+    """A complete 200 reply that failed only the bullet-format check."""
+    return (
+        not result.ok
+        and result.status is None
+        and result.finish_reason not in (None, "length")
+        and bool(result.content.strip())
+    )
+
+
+async def _call_llm_once(
+    cfg: LlmProviderConfig,
+    *,
+    prompt: str,
+    max_tokens: int,
+    on_usage: LlmUsageRecorder | None = None,
+) -> LlmChatResult:
+    """Dispatch to the chat or responses caller based on endpoint shape."""
+    api_key, base_url, model, extra = cfg.api_key, cfg.base_url, cfg.model, cfg.extra
+    if base_url.rstrip("/").endswith("/responses"):
+        result = await _call_llm_responses(
+            api_key=api_key or "",
+            base_url=base_url,
+            model=model,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            extra=extra,
+        )
+        _note_llm_usage(on_usage, cfg.provider, result)
+        return result
+    result = await _call_llm_chat(
+        api_key=api_key or "",
+        base_url=base_url,
+        model=model,
+        prompt=prompt,
+        max_tokens=max_tokens,
+        extra=extra,
+    )
+    _note_llm_usage(on_usage, cfg.provider, result)
+    return result
+
+
+@dataclass(frozen=True)
+class LlmProviderConfig:
+    provider: str
+    api_key: str | None
+    base_url: str
+    model: str
+    extra: dict[str, object]
+
+
+# Provider table: name → (key env var, chat-completions endpoint, default
+# model, extra payload). Groq is the free default; other providers are explicit
+# opt-ins for targeted testing or deployments.
+_LLM_PROVIDERS: dict[str, tuple[str, str, str, dict[str, object]]] = {
+    "mistral": (
+        "MISTRAL_API_KEY",
+        "https://api.mistral.ai/v1/chat/completions",
+        "mistral-small-latest",
+        {},
+    ),
+    "cerebras": (
+        "CEREBRAS_API_KEY",
+        "https://api.cerebras.ai/v1/chat/completions",
+        "gpt-oss-120b",
+        {"reasoning_effort": "low"},
+    ),
+    "groq": (
+        "GROQ_API_KEY",
+        "https://api.groq.com/openai/v1/chat/completions",
+        "openai/gpt-oss-20b",
+        {"reasoning_effort": "low"},
+    ),
+    "openrouter": (
+        "OPENROUTER_API_KEY",
+        "https://openrouter.ai/api/v1/chat/completions",
+        "meta-llama/llama-3.3-70b-instruct",
+        {},
+    ),
+    "zen": (
+        "OPENCODE_ZEN_API_KEY",
+        "https://opencode.ai/zen/v1/chat/completions",
+        "ling-3.0-flash-fin-free",
+        {},
+    ),
+    # OpenCode Go gateway: Muse Spark lives on the Responses API
+    # (/responses), not chat/completions — _call_llm_for_config dispatches
+    # on the URL suffix. Requires x-opencode-session + non-generic UA.
+    "gospark": (
+        "OPENCODE_GO_API_KEY",
+        "https://opencode.ai/zen/go/v1/responses",
+        "muse-spark-1.3-contributor",
+        {"reasoning_effort": "low"},
+    ),
+    # Free models on the Go gateway (chat/completions); they answered while
+    # the Go plan's usage limit was spent (2026-09-29). LLM_MODEL picks
+    # another, e.g. space-bunny-free.
+    "gofree": (
+        "OPENCODE_GO_API_KEY",
+        "https://opencode.ai/zen/go/v1/chat/completions",
+        "longcat-2.5-preview-free",
+        # Without it a 31k-char article spent the whole cap reasoning.
+        {"reasoning_effort": "low"},
+    ),
+    "gemini": (
+        "GEMINI_API_KEY",
+        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "models/gemini-2.5-flash-lite",
+        {"reasoning_effort": "none"},
+    ),
+}
+
+
+def _llm_provider_config() -> LlmProviderConfig:
+    provider = os.environ.get("LLM_PROVIDER", "groq").lower()
+    if provider not in _LLM_PROVIDERS:
+        raise ValueError(f"Unsupported LLM_PROVIDER: {provider}")
+    key_env, base_url, model, extra = _LLM_PROVIDERS[provider]
+    model = os.environ.get("LLM_MODEL", model)
+    extra = dict(extra)
+    if provider == "groq" and not model.startswith("openai/gpt-oss-"):
+        extra.pop("reasoning_effort", None)
+    return LlmProviderConfig(
+        provider=provider,
+        api_key=os.environ.get(key_env),
+        base_url=base_url,
+        model=model,
+        extra=extra,
+    )
+
+
+def _max_tokens_for_provider(cfg: LlmProviderConfig, base: int) -> int:
+    if cfg.provider == "zen":
+        # Ling's free endpoint spends a large, variable amount on reasoning.
+        return 8_192
+    if cfg.provider == "gospark" and "reasoning_effort" in cfg.extra:
+        # Responses API deducts reasoning from the same max_output_tokens
+        # bucket. Reasoning is usually 350-1000 tokens at effort=low, but a
+        # 1,647-token outlier exhausted the old +1200 cap and dropped the
+        # article section (WORKLOG 2026-09-25); +2000 covers it plus output.
+        return base + 2000
+    if cfg.provider == "gofree":
+        # The free Go models reason without reporting it: 450 tokens came
+        # back empty (finish=length); a 2,450 cap stopped at ~1,450.
+        return base + 2000
+    if cfg.provider in {"cerebras", "groq"} and "reasoning_effort" in cfg.extra:
+        return base + 600
+    return base
+
+
+def _valid_llm_completion(content: str, finish_reason: str | None) -> bool:
+    """Accept only complete, substantive bullet output from real providers."""
+    if finish_reason == "length" or not content.strip():
+        return False
+    return bool(re.search(r"^\s*[-*]\s+\S", content, re.MULTILINE))
+
+
+def _llm_cache_identity() -> str:
+    cfg = _llm_provider_config()
+    return f"{cfg.provider}:{cfg.model}:{TLDR_PROMPT_VERSION}"
+
+
+def _tldr_cache_key(
+    *,
+    title: str,
+    self_text: str,
+    top_comments: str,
+    article_body: str,
+) -> str:
+    if pointer_thread_target(top_comments, source_id=0) is not None:
+        # Generation drops a pointer note (_generate_tldr), so the key does
+        # too. Summaries cached under the note itself predate that and
+        # invented a discussion (story 38507672); they no longer match.
+        top_comments = ""
+    payload = {
+        "identity": _llm_cache_identity(),
+        "title": title,
+        "self_text": self_text[:SELF_TEXT_PROMPT_CHAR_LIMIT],
+        "top_comments": top_comments[:COMMENT_PROMPT_CHAR_LIMIT],
+        "article_body": article_body[:ARTICLE_BODY_CHAR_LIMIT],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _section_limits(article_chars: int = 0) -> tuple[int, int, int]:
+    """Half-pane allowance: bullet range and word target for one section.
+
+    Long articles get slightly more room; discussions (``article_chars=0``)
+    always get the base allowance.
+    """
+    if article_chars >= 20_000:
+        return 5, 6, 180
+    if article_chars >= 10_000:
+        return 4, 5, 150
+    return 3, 4, 120
+
+
+def _section_max_tokens(base: int, article_chars: int = 0) -> int:
+    """Scale an output-token ceiling with the section's word target."""
+    return base * _section_limits(article_chars)[2] // _section_limits()[2]
+
+
+def _section_budget(article_chars: int = 0, *, single_section: bool = False) -> str:
+    """Reading-pane budget; never depends on client dimensions."""
+    minimum, maximum, words = _section_limits(article_chars)
+    if single_section:
+        minimum, maximum, words = minimum * 2, maximum * 2, words * 2
+    return (
+        f"{minimum}-{maximum} bullets, aim for {words} words. "
+        "Use concrete details and explanations, not just topic labels. "
+        "Use fewer words and bullets if the source is thin; never pad or invent details"
+    )
+
+
+def _is_feed_copy(text: str, body: str) -> bool:
+    """Whether ``text`` (an RSS feed's copy of the post) is already in ``body``.
+
+    Samples ten 8-word runs across the text and needs most of them in the
+    body, so a preface or list line the extractor dropped still counts.
+    """
+    words = text.split()
+    if len(words) < 16:
+        return False
+    haystack = " ".join(body.split())
+    step = max(1, (len(words) - 8) // 9)
+    runs = [" ".join(words[i : i + 8]) for i in range(0, len(words) - 8, step)][:10]
+    return sum(run in haystack for run in runs) * 2 > len(runs)
+
+
+async def generate_detailed_tldr(
+    title: str,
+    self_text: str = "",
+    top_comments: str = "",
+    article_body: str = "",
+) -> TldrResult:
+    cfg = _llm_provider_config()
+    api_key = cfg.api_key
+    on_usage = _llm_usage_recorder
+
+    if not api_key:
+        return TldrResult(
+            kind="llm_error",
+            error_text="LLM API key not configured in environment.",
+        )
+
+    author_text = self_text[:SELF_TEXT_PROMPT_CHAR_LIMIT]
+    body = article_body[:ARTICLE_BODY_CHAR_LIMIT]
+    article_section = ""
+    # Sending an RSS feed's copy beside the fetched body repeats the post's
+    # opening, which kept Import AI 475's summary on its lead item.
+    if len(author_text) >= SELF_TEXT_PROMPT_MIN_CHARS and not (
+        body and _is_feed_copy(author_text, body)
+    ):
+        article_section += f"Author's text:\n{author_text}"
+    if body:
+        article_section += f"\n\nArticle body:\n{body}"
+    # RSS self_text is usually the feed's copy of the article body, so the
+    # longer of the two, not their sum, is the article's length.
+    article_chars = max(len(author_text), len(body))
+    comments_section = top_comments[:COMMENT_PROMPT_CHAR_LIMIT]
+    if pointer_thread_target(top_comments, source_id=0) is not None:
+        # "Comments moved to item?id=N" is not a discussion; summarizing it
+        # invented one (story 32148318). The tap path follows the link.
+        comments_section = top_comments = ""
+
+    if not article_section and not top_comments:
+        return TldrResult(kind="no_content")
+
+    if (
+        article_section
+        and comments_section
+        and len(article_section) < ARTICLE_SECTION_MIN_CHARS
+        and not article_body.startswith(TWEET_BODY_PREFIX)
+    ):
+        article_section = ""
+
+    if article_section and comments_section:
+        article_prompt = _load_prompt("article_v4.txt").format(
+            title=title,
+            article_section=article_section,
+            budget=_section_budget(article_chars),
+        )
+        discussion_prompt = _load_prompt("discussion_v4.txt").format(
+            title=title,
+            comments_section=comments_section,
+            budget=_section_budget(),
+        )
+        article_result, discussion_result = await asyncio.gather(
+            _call_llm_for_config(
+                cfg,
+                prompt=article_prompt,
+                max_tokens=_max_tokens_for_provider(
+                    cfg, _section_max_tokens(450, article_chars)
+                ),
+                on_usage=on_usage,
+            ),
+            _call_llm_for_config(
+                cfg,
+                prompt=discussion_prompt,
+                max_tokens=_max_tokens_for_provider(cfg, 450),
+                on_usage=on_usage,
+            ),
+        )
+        good: list[tuple[str, str]] = []
+        for label, result, chars in (
+            ("Article", article_result, article_chars),
+            ("Discussion", discussion_result, 0),
+        ):
+            if result.ok and (text := _shape_tldr(result.content, article_chars=chars)):
+                good.append((label, text))
+        if len(good) == 2:
+            return TldrResult(
+                kind="ok",
+                tldr="\n\n".join(f"### {label}\n{text}" for label, text in good),
+            )
+        if len(good) == 1:
+            label, text = good[0]
+            failed = discussion_result if label == "Article" else article_result
+            logging.warning(
+                "tldr: %s call failed (status=%s), salvaging %s-only",
+                "discussion" if label == "Article" else "article",
+                failed.status,
+                label.lower(),
+            )
+            return TldrResult(kind="ok", tldr=f"### {label}\n{text}", cacheable=False)
+        if not article_result.ok and not discussion_result.ok:
+            return TldrResult(
+                kind="llm_error",
+                error_status=article_result.status or discussion_result.status,
+                error_text=f"Article: {article_result.content}; Discussion: {discussion_result.content}",
+            )
+        return TldrResult(kind="llm_error", error_text="empty LLM response")
+
+    if article_section:
+        chars = article_chars
+        prompt = _load_prompt("article_only_v4.txt").format(
+            title=title,
+            article_section=article_section,
+            budget=_section_budget(chars, single_section=True),
+        )
+    else:
+        chars = 0
+        prompt = _load_prompt("discussion_only_v4.txt").format(
+            title=title,
+            comments_section=comments_section,
+            budget=_section_budget(single_section=True),
+        )
+
+    result = await _call_llm_for_config(
+        cfg,
+        prompt=prompt,
+        max_tokens=_max_tokens_for_provider(cfg, _section_max_tokens(1000, chars)),
+        on_usage=on_usage,
+    )
+    if result.ok:
+        if text := _shape_tldr(
+            result.content,
+            article_chars=chars,
+            single_section=True,
+        ):
+            return TldrResult(kind="ok", tldr=text)
+        return TldrResult(kind="llm_error", error_text="empty LLM response")
+    return _llm_error_from(result)
+
+
+def _is_unfollowed_pointer(story: Story) -> bool:
+    """An HN story whose stored discussion is still a pointer note."""
+    return is_hn_source(story.source) and (
+        pointer_thread_target(story.top_comments or "", source_id=story.id) is not None
+    )
+
+
+# Story id -> monotonic time of its last failed pointer follow. A target that
+# is missing, dead, a comment or all short comments fails every time; retry
+# it at most this often instead of on every tap and prefetch run.
+POINTER_FOLLOW_RETRY_S = 6 * 3600
+_pointer_follow_failed: dict[int, float] = {}
+
+
+async def _follow_pointer_thread(db: Database, story: Story) -> Story:
+    """Swap a pointer thread's lone "comments moved to item?id=N" note for
+    the comments of thread N, persisted so cached TLDRs keep matching."""
+    if not is_hn_source(story.source):
+        return story
+    target = pointer_thread_target(story.top_comments or "", source_id=story.id)
+    if target is None:
+        return story
+    now = time.monotonic()
+    failed_at = _pointer_follow_failed.get(story.id)
+    if failed_at is not None and now - failed_at < POINTER_FOLLOW_RETRY_S:
+        return story
+    from pipeline import compose_story_text
+    from pipeline.enrichment import fetch_thread_comments
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        comments = await fetch_thread_comments(client, target)
+    if not comments:
+        for sid, at in list(_pointer_follow_failed.items()):
+            if now - at >= POINTER_FOLLOW_RETRY_S:
+                del _pointer_follow_failed[sid]
+        _pointer_follow_failed[story.id] = now
+        logging.info(
+            "tldr_detail story_id=%s pointer_thread=%s follow=failed", story.id, target
+        )
+        return story
+    _pointer_follow_failed.pop(story.id, None)
+    # The fetch awaited; a hydration may have rewritten the row meanwhile.
+    fresh = db.get_story(story.id) or story
+    if fresh.top_comments != story.top_comments and (
+        pointer_thread_target(fresh.top_comments or "", source_id=fresh.id) != target
+    ):
+        logging.info(
+            "tldr_detail story_id=%s pointer_thread=%s follow=superseded",
+            story.id,
+            target,
+        )
+        return fresh
+    logging.info("tldr_detail story_id=%s pointer_thread=%s", story.id, target)
+    story = replace(
+        fresh,
+        top_comments=comments,
+        text_content=compose_story_text(
+            fresh.title, fresh.self_text, comments, fresh.article_body
+        ),
+    )
+    # Authoritative: the followed thread can be shorter than the note.
+    db.upsert_story(story, comments_authoritative=True)
+    return story
+
+
+# Stagger between background TLDR prefetch LLM starts (seconds, capped at
+# 15s total offset). Seam for tests: patched to 0 to avoid real sleeps.
+_PREFETCH_STAGGER_S = 1.0
+
+
+async def _prefetch_tldrs_for_ranked(
+    deck: WindowDeck,
+    db: Database,
+    per_view: int,
+    stale_per_run: int = 0,
+    stagger_s: float | None = None,
+) -> int:
+    """Summarize the first *per_view* stories of each view of the default
+    window, then up to *stale_per_run* deck stories whose cached summary no
+    longer matches their content."""
+    ranked_stories = deck.stories()
+    if (per_view <= 0 and stale_per_run <= 0) or not ranked_stories:
+        return 0
+
+    # Background work must not deepen a provider ban: fail-fast per call
+    # already avoids spending quota, but a warm/regen burst firing dozens of
+    # attempts the moment a cooldown lifts re-trips free-tier rate limits
+    # (Groq answered a post-restart burst with a 660s retry-after). Skip the
+    # whole run while cooling down; on-demand taps get first shot at quota.
+    cooldown = llm_limiter.retry_after_seconds
+    if cooldown > 0:
+        logging.info("tldr_prefetch skipped: provider cooldown %ss remaining", cooldown)
+        return 0
+
+    seen: set[int] = set()
+    story_ids: list[int] = []
+    if per_view > 0:
+        views = serve_window(deck.window(DEFAULT_WINDOW), DEFAULT_WINDOW, time.time())
+        for name in VIEWS:
+            for rs in views.view(name)[:per_view]:
+                if rs.story.id not in seen:
+                    seen.add(rs.story.id)
+                    story_ids.append(rs.story.id)
+
+    stale_added = 0
+    if stale_per_run > 0:
+        remaining = [rs for rs in ranked_stories if rs.story.id not in seen]
+        cached_keys = db.get_tldr_cache_keys([rs.story.id for rs in remaining])
+        keyed = [rs.story.id for rs in remaining if rs.story.id in cached_keys]
+        # Deck stories carry no TLDR source text (candidate pool); read it in
+        # small batches, since this usually stops after a few stale hits.
+        for start in range(0, len(keyed), 100):
+            if stale_added >= stale_per_run:
+                break
+            batch = keyed[start : start + 100]
+            by_id = {story.id: story for story in db.get_stories(batch)}
+            for story_id in batch:
+                story = by_id.get(story_id)
+                if stale_added >= stale_per_run or story is None:
+                    continue
+                current_key = _tldr_cache_key(
+                    title=story.title,
+                    self_text=story.self_text or "",
+                    top_comments=story.top_comments or "",
+                    article_body=story.article_body or "",
+                )
+                if current_key != cached_keys[story_id]:
+                    seen.add(story_id)
+                    story_ids.append(story_id)
+                    stale_added += 1
+
+    if not story_ids:
+        return 0
+
+    sem = asyncio.Semaphore(2)
+
+    async def _prefetch_one(index: int, story_id: int) -> bool:
+        story = db.get_story(story_id)
+        if not story:
+            return False
+        if _is_unfollowed_pointer(story):
+            story = await _follow_pointer_thread(db, story)
+
+        title = story.title
+        self_text = story.self_text or ""
+        top_comments = story.top_comments or ""
+        article_body = story.article_body or ""
+
+        if not (self_text or top_comments or article_body):
+            return False
+
+        cache_key = _tldr_cache_key(
+            title=title,
+            self_text=self_text,
+            top_comments=top_comments,
+            article_body=article_body,
+        )
+        if db.get_tldr_cache(story_id, cache_key):
+            return False
+
+        # Stagger LLM starts so the burst doesn't hit free-tier
+        # request-rate limits all at once (each item costs up to 2 calls).
+        # Seam for tests: stagger_s=None falls back to _PREFETCH_STAGGER_S,
+        # which tests patch to 0.
+        stagger = _PREFETCH_STAGGER_S if stagger_s is None else stagger_s
+        if index > 0 and stagger > 0:
+            await asyncio.sleep(min(index * stagger, 15.0))
+        async with sem:
+            # A tap generating this story right now covers it; while this
+            # one runs, taps wait for it instead of starting their own.
+            flight = Handler._tldr_flights.try_lead(story_id)
+            if flight is None:
+                return False
+            reply: TldrReply | None = None
+            try:
+                result = await generate_detailed_tldr(
+                    title,
+                    self_text=self_text,
+                    top_comments=top_comments,
+                    article_body=article_body,
+                )
+                cached = _maybe_cache_tldr(db, story_id, cache_key, result)
+                reply = _tldr_result_reply(db, story_id, result)
+                return cached
+            finally:
+                Handler._tldr_flights.land(story_id, flight, reply)
+
+    results = await asyncio.gather(
+        *(_prefetch_one(i, sid) for i, sid in enumerate(story_ids)),
+        return_exceptions=True,
+    )
+    generated = sum(1 for r in results if r is True)
+
+    if generated:
+        logging.info(
+            "tldr_prefetch generated=%s candidates=%s per_view=%s stale_added=%s",
+            generated,
+            len(story_ids),
+            per_view,
+            stale_added,
+        )
+    else:
+        # Always log the zero outcome: a silent miss here once hid a real
+        # failure mode (page-open burst tripped the provider ban, every
+        # prefetch fail-fasted, and the run returned 0 indistinguishable
+        # from "everything already cached").
+        logging.info(
+            "tldr_prefetch generated=0 candidates=%s per_view=%s stale_added=%s cooldown_s=%.0f",
+            len(story_ids),
+            per_view,
+            stale_added,
+            llm_limiter.retry_after_seconds,
+        )
+    return generated
+
+
+SKELETON_HTML = b"""<!DOCTYPE html>
+<html><head><meta http-equiv="refresh" content="1"></head>
+<body><p>Loading your personalized dashboard...</p></body></html>"""
+
+
+@dataclass(frozen=True)
+class DeckState:
+    """A user's personalized deck (every window's views) and the dashboard
+    version it was built for.
+
+    HTML and `/api/feed` JSON are rendered from this on every read, so the
+    current version is always rendered in rather than patched into bytes.
+    """
+
+    deck: WindowDeck
+    built_at: float
+    version: int
+
+
+@dataclass(frozen=True)
+class DeckView:
+    """What a read serves: the page, `/api/feed` and `/api/ranking-ready`
+    all come from `Handler._deck_for_user`, so they always agree."""
+
+    deck: WindowDeck
+    # The deck's version; 0 is the cold deck shown while the first warm runs.
+    version: int
+    # The user's current version, which a queued warm is building.
+    current: int
+
+    @property
+    def ready(self) -> bool:
+        return self.version >= self.current
+
+
+def _boot_epoch_ms() -> int:
+    """Where versions start: boot time in ms, so they keep increasing across
+    restarts (a process bumps far less than once per ms)."""
+    return time.time_ns() // 1_000_000
+
+
+def _load_malloc_trim() -> Callable[[int], int] | None:
+    """glibc's malloc_trim, or None on other libcs (macOS, musl)."""
+    try:
+        return ctypes.CDLL("libc.so.6").malloc_trim
+    except (OSError, AttributeError):
+        return None
+
+
+_MALLOC_TRIM = _load_malloc_trim()
+
+
+def _release_freed_heap() -> None:
+    """Return freed heap to the OS. A rank or regen frees hundreds of MB that
+    glibc otherwise keeps in its arenas (VPS probe 2026-09-26: 933 -> 619 MB
+    RSS after one rank)."""
+    if _MALLOC_TRIM is not None:
+        _MALLOC_TRIM(0)
+
+
+class Handler:
+    """Per-user dashboard state machine.
+
+    - Version: ``_pool_generation + _dashboard_versions[user]``. A vote bumps
+      the user's counter; a regen/RSS refresh bumps the generation once, which
+      makes every deck stale. The generation starts at the boot time in ms,
+      so versions only increase, across restarts too, and a cold deck
+      (version 0) is always behind its target.
+    - Deck: ``_deck_for_user`` is the only place a read picks one. No votes:
+      the shared cold deck is current, and nothing is warmed or cached. Votes:
+      the cached deck (fresh when ``deck.version >= version``), or the cold
+      deck as version 0 while the first warm runs. A read never blocks on
+      ranking; it queues a warm when the deck isn't current, and clients
+      poll ``/api/ranking-ready`` until it lands. Voted stories are never
+      served.
+    - Warms: ``_warm_scheduler()`` coalesces requests per user (newest
+      version wins, at most one running per user) on a pool of
+      ``config.warm_pool_size`` workers. Votes debounce through it
+      (``dashboard_warm_idle_seconds``, or immediately at
+      ``dashboard_warm_vote_threshold`` votes). At startup
+      ``warm_recent_users`` queues one for each recently voting profile.
+    """
+
+    config: Config
+    db: Database
+    embedder: Embedder
+    regen_event: threading.Event
+    _decks: dict[int, DeckState] = {}
+    _MAX_CACHED_DECKS = 100
+    # The first rank in a fresh process takes 30-60 s (61.8 s live on
+    # 2026-10-02, 30.3 s alone; a refit later takes ~6 s), so profiles
+    # that voted this recently are ranked at startup instead of on their
+    # first read, which would otherwise show the cold deck meanwhile.
+    _STARTUP_WARM_DAYS = 7
+    _STARTUP_WARM_MAX_USERS = 4
+    _pool_generation: int = _boot_epoch_ms()
+    _dashboard_versions: dict[int, int] = {}
+    _dashboard_versions_guard = threading.Lock()
+    # Moves when stored points/comments change between pool builds (hot
+    # refresh, TLDR hydration); clients refetch the feed to show them.
+    _counts_version: int = 0
+    _scheduler: WarmScheduler[int, User] | None = None
+    _scheduler_guard = threading.Lock()
+    _cold_deck: WindowDeck = WindowDeck()
+    _article_fetch_in_flight: set[int] = set()
+    _warm_bg_lock = threading.Lock()
+    _tldr_prefetch_gate = BackgroundCadence()
+    _feedback_warm_counts: dict[int, int] = {}
+    _feedback_warm_guard = threading.Lock()
+    _public_demo_limiter = FixedWindowLimiter()
+    # Uncached TLDR generations in flight (hydration + LLM, up to ~2 min
+    # each). Capped so a burst can't pile up request threads that also
+    # contend for the DB pool with warms and regen.
+    _tldr_generations = 0
+    _tldr_generations_guard = threading.Lock()
+    # Summaries being generated, by story: taps and the warm prefetch share one.
+    _tldr_flights: SingleFlight[int, TldrReply] = SingleFlight()
+
+    @classmethod
+    def reset_public_demo_limiter(cls) -> None:
+        cls._public_demo_limiter = FixedWindowLimiter()
+
+    @classmethod
+    def _try_start_tldr_generation(cls) -> bool:
+        with cls._tldr_generations_guard:
+            if cls._tldr_generations >= cls.config.tldr_max_concurrent_generations:
+                return False
+            cls._tldr_generations += 1
+            return True
+
+    @classmethod
+    def _finish_tldr_generation(cls) -> None:
+        with cls._tldr_generations_guard:
+            cls._tldr_generations = max(0, cls._tldr_generations - 1)
+
+    @classmethod
+    def _render_deck(
+        cls, user: User, deck: WindowDeck, version: int, current: int
+    ) -> bytes:
+        from pipeline import generate_dashboard_bytes
+
+        return generate_dashboard_bytes(
+            deck,
+            cls.config,
+            cls.db,
+            user.id,
+            user.token,
+            dashboard_version=version,
+            dashboard_latest_version=current,
+        )
+
+    @classmethod
+    def _deck_for_user(cls, user: User) -> DeckView:
+        """Pick the deck a read serves; queue a warm when it isn't current."""
+        from pipeline import _voted_story_ids
+
+        current = cls._dashboard_version(user.id)
+        voted = _voted_story_ids(cls.db, user.id)
+        if not voted:
+            # Nothing to personalize: the shared cold deck is current. A deck
+            # left from votes since cleared would only be re-ranked by every
+            # regen for nothing.
+            with cls._dashboard_versions_guard:
+                cls._decks.pop(user.id, None)
+            return DeckView(cls._cold_deck, current, current)
+        state = cls._decks.get(user.id)
+        if state is None:
+            # Votes but no deck yet (first read since a restart, or evicted).
+            deck, version = cls._cold_deck, 0
+        else:
+            deck, version = state.deck, state.version
+        if version < current:
+            # A stale deck's warm is passive: a queued vote-debounce warm
+            # keeps its delay.
+            cls._trigger_warm(user, current, expedite=state is None)
+        return DeckView(deck.without(voted), version, current)
+
+    @classmethod
+    def _render_dashboard_for_user(cls, user: User) -> bytes:
+        request_start = time.perf_counter()
+        view = cls._deck_for_user(user)
+        if view.deck.is_empty() and view.version == 0:
+            # An empty cold deck (first boot before any regen) while the warm
+            # builds this user's deck; the skeleton page reloads itself.
+            html, result = SKELETON_HTML, "skeleton"
+        else:
+            html = cls._render_deck(user, view.deck, view.version, view.current)
+            result = "current" if view.ready else "stale"
+        logging.info(
+            "dashboard_render user_id=%s version=%s result=%s deck_version=%s"
+            " stories=%s elapsed_ms=%.1f",
+            user.id,
+            view.current,
+            result,
+            view.version,
+            len(view.deck.stories()),
+            (time.perf_counter() - request_start) * 1000,
+        )
+        return html
+
+    @classmethod
+    def _feed_for_user(cls, user: User, window: Window = DEFAULT_WINDOW) -> Feed:
+        from pipeline.render import build_feed
+
+        view = cls._deck_for_user(user)
+        return build_feed(
+            view.deck,
+            window,
+            cls.config,
+            cls.db.count_feedback_by_action(user.id),
+            view.version,
+            view.current,
+            live_counts=cls.db.get_story_counts,
+        )
+
+    @classmethod
+    def _dashboard_version(cls, user_id: int) -> int:
+        with cls._dashboard_versions_guard:
+            return cls._pool_generation + cls._dashboard_versions.get(user_id, 0)
+
+    @classmethod
+    def _current_counts_version(cls) -> int:
+        with cls._dashboard_versions_guard:
+            return cls._counts_version
+
+    @classmethod
+    def _bump_counts_version(cls) -> int:
+        with cls._dashboard_versions_guard:
+            cls._counts_version += 1
+            return cls._counts_version
+
+    @classmethod
+    def _bump_user_version(cls, user_id: int) -> int:
+        with cls._dashboard_versions_guard:
+            count = cls._dashboard_versions.get(user_id, 0) + 1
+            cls._dashboard_versions[user_id] = count
+            version = cls._pool_generation + count
+        logging.info("dashboard_version_bumped user_id=%s version=%s", user_id, version)
+        return version
+
+    @classmethod
+    def _warm_scheduler(cls) -> WarmScheduler[int, User]:
+        # Looked up on cls itself so test subclasses get their own pool.
+        with cls._scheduler_guard:
+            scheduler = cls.__dict__.get("_scheduler")
+            if scheduler is None:
+                scheduler = WarmScheduler(
+                    cls._run_warm_job,
+                    workers=cls.config.warm_pool_size,
+                    name="dashboard-warm",
+                )
+                cls._scheduler = scheduler
+            return scheduler
+
+    @classmethod
+    def _trigger_warm(
+        cls,
+        user: User,
+        version: int,
+        delay_s: float = 0.0,
+        *,
+        expedite: bool = True,
+    ) -> None:
+        version = max(version, cls._dashboard_version(user.id))
+        deck = cls._decks.get(user.id)
+        if deck is not None and deck.version >= version:
+            return
+        cls._warm_scheduler().request(
+            user.id, user, version, delay_s, expedite=expedite
+        )
+
+    @classmethod
+    def warm_recent_users(cls) -> list[int]:
+        """Queue a warm for each profile with a recent vote (latest first);
+        returns their ids."""
+        since = time.time() - cls._STARTUP_WARM_DAYS * 86400
+        warmed: list[int] = []
+        for user_id in cls.db.recently_voting_user_ids(
+            since, cls._STARTUP_WARM_MAX_USERS
+        ):
+            user = cls.db.get_user_by_id(user_id)
+            if user is None:
+                continue
+            cls._trigger_warm(user, cls._dashboard_version(user.id))
+            warmed.append(user.id)
+        logging.info("startup_warm user_ids=%s", warmed)
+        return warmed
+
+    @classmethod
+    def _schedule_feedback_warm(cls, user: User, version: int) -> bool:
+        """Warm after an idle pause, or now once enough votes pile up."""
+        with cls._feedback_warm_guard:
+            count = cls._feedback_warm_counts.get(user.id, 0) + 1
+            threshold_reached = count >= cls.config.dashboard_warm_vote_threshold
+            cls._feedback_warm_counts[user.id] = 0 if threshold_reached else count
+        delay_s = 0.0 if threshold_reached else cls.config.dashboard_warm_idle_seconds
+        cls._trigger_warm(user, version, delay_s=delay_s)
+        return threshold_reached
+
+    @classmethod
+    def _run_warm_job(cls, user: User, version: int) -> None:
+        with cls._feedback_warm_guard:
+            cls._feedback_warm_counts.pop(user.id, None)
+        try:
+            cls._run_warm_attempt(user, version)
+        finally:
+            cls._collect_after_warm_attempt()
+
+    @classmethod
+    def _collect_after_warm_attempt(cls) -> None:
+        try:
+            collected = gc.collect()
+        except Exception:
+            logging.debug("warm_gc result=failed", exc_info=True)
+            return
+        _release_freed_heap()
+        logging.debug("warm_gc result=completed collected=%s", collected)
+
+    @classmethod
+    def _run_warm_attempt(cls, user: User, requested_version: int) -> None:
+        deck = cls._decks.get(user.id)
+        if deck is not None and deck.version >= requested_version:
+            return
+        # Ranking reads the votes and pool as they are now, so the deck is
+        # at least as new as the current version (a regen may have landed
+        # since this warm was queued).
+        requested_version = max(requested_version, cls._dashboard_version(user.id))
+
+        from pipeline import RankTrace, fast_rerank_for_user, rank_gate
+
+        trace = RankTrace()
+        render_start = time.perf_counter()
+        with rank_gate.ranking(), trace.stage("rank_total"):
+            deck = fast_rerank_for_user(
+                cls.db,
+                cls.config,
+                cls.embedder,
+                user.id,
+                trace=trace,
+            )
+        rank_ms = (time.perf_counter() - render_start) * 1000
+
+        with cls._dashboard_versions_guard:
+            cls._decks[user.id] = DeckState(deck, time.time(), requested_version)
+            cls._evict_old_decks_locked()
+        # A vote or regen while ranking: warm again. (A regen only re-warms
+        # cached decks, and this one wasn't cached yet.)
+        cls._trigger_warm(user, cls._dashboard_version(user.id))
+
+        logging.info(
+            "dashboard_warm user_id=%s version=%s result=completed rank_ms=%.1f stories=%s",
+            user.id,
+            requested_version,
+            rank_ms,
+            len(deck.stories()),
+        )
+        logging.info("rank_perf %s", trace.format_log_fields())
+
+        fields = trace.to_log_fields()
+        stage_sum_ms = sum(
+            value
+            for key, value in fields.items()
+            if key.endswith("_ms")
+            and key != "rank_total_ms"
+            and isinstance(value, (int, float))
+        )
+        if _warm_is_starved(rank_ms, stage_sum_ms):
+            # Starvation signature: the thread was stalled, not computing.
+            # Stages explain <1/3 of wall time (regen contention, pool
+            # exhaustion, or host-level stalls — see WORKLOG 2026-09-08).
+            logging.warning(
+                "dashboard_warm_starved user_id=%s version=%s rank_ms=%.1f"
+                " stage_sum_ms=%.1f model_cache=%s",
+                user.id,
+                requested_version,
+                rank_ms,
+                stage_sum_ms,
+                trace.labels.get("model_cache", ""),
+            )
+        sample = RankPerfSample(
+            recorded_at=time.time(),
+            user_id=user.id,
+            version=requested_version,
+            rank_total_ms=rank_ms,
+            # HTML is rendered on read now, not in the warm (see DeckState).
+            html_ms=0.0,
+            candidates=int(trace.counts.get("candidates", 0)),
+            feedback_total=int(trace.counts.get("feedback_total", 0)),
+            model_cache=trace.labels.get("model_cache", ""),
+            stories=len(deck.stories()),
+            fields=fields,
+        )
+        try:
+            cls.db.insert_rank_perf(sample)
+        except Exception:
+            logging.exception("rank_perf persist failed")
+
+        if _wants_background_tasks(cls.config, deck):
+            t = threading.Thread(
+                target=lambda: cls._warm_background_tasks(
+                    deck, cls.db, cls.embedder, cls.config
+                ),
+                daemon=True,
+            )
+            t.start()
+
+    @classmethod
+    def _evict_old_decks_locked(cls) -> None:
+        excess = len(cls._decks) - cls._MAX_CACHED_DECKS
+        if excess <= 0:
+            return
+        oldest = sorted(cls._decks, key=lambda uid: cls._decks[uid].built_at)
+        for uid in oldest[:excess]:
+            del cls._decks[uid]
+
+    @classmethod
+    def _pool_changed(cls) -> None:
+        """New candidates arrived (regen / RSS refresh): every deck is stale.
+
+        Rebuild the shared cold deck, bump the pool generation once, and queue
+        a refresh for each cached user on the bounded warm pool.
+        """
+        cls._rebuild_cold_deck()
+        with cls._dashboard_versions_guard:
+            cls._pool_generation += 1
+            cached_user_ids = list(cls._decks)
+        for user_id in cached_user_ids:
+            user = cls.db.get_user_by_id(user_id)
+            if user is not None:
+                cls._trigger_warm(user, cls._dashboard_version(user_id))
+        logging.info(
+            "pool_changed generation=%s refresh_queued=%s",
+            cls._pool_generation,
+            len(cached_user_ids),
+        )
+
+    @classmethod
+    def _rebuild_cold_deck(cls) -> None:
+        from pipeline import build_cold_deck
+        from pipeline.candidate_cache import invalidate_candidate_pool
+
+        # Regen just wrote fresh stories — drop the shared candidate pool
+        # so this rebuild (and every warm/cold-deck build until the next
+        # regen) picks up the new rows instead of a stale snapshot.
+        invalidate_candidate_pool()
+        cold_deck = build_cold_deck(cls.db, cls.config, embedder=cls.embedder)
+        cls._cold_deck = cold_deck
+        logging.info("cold_deck_rebuilt stories=%s", len(cold_deck.stories()))
+
+    @classmethod
+    def _warm_background_tasks(
+        cls,
+        deck: WindowDeck,
+        db: Database,
+        embedder: Embedder,
+        config: Config,
+    ) -> None:
+        """Article body fetch (deduped by story ID) -> TLDR prefetch."""
+        from pipeline import (
+            select_article_fetch_candidates,
+            fetch_and_cache_article_bodies,
+        )
+
+        stories = deck.stories()
+        if config.article_fetch_max_per_run > 0 and stories:
+            fetch_targets = select_article_fetch_candidates(
+                ranked=stories,
+                dashboard_selected=serve_window(
+                    deck.window(DEFAULT_WINDOW), DEFAULT_WINDOW, time.time()
+                ).stories(),
+                db=db,
+                max_per_run=config.article_fetch_max_per_run,
+                max_age_days=config.article_fetch_max_age_days,
+            )
+            runnable: list[Story] = []
+            with cls._warm_bg_lock:
+                for s in fetch_targets:
+                    if s.id not in cls._article_fetch_in_flight:
+                        runnable.append(s)
+                cls._article_fetch_in_flight.update(s.id for s in runnable)
+            try:
+                if runnable:
+                    asyncio.run(
+                        fetch_and_cache_article_bodies(
+                            db=db,
+                            embedder=embedder,
+                            stories=runnable,
+                            concurrency=config.article_fetch_concurrency,
+                        )
+                    )
+            except Exception:
+                logging.exception("warm_background article_fetch failed")
+            finally:
+                with cls._warm_bg_lock:
+                    cls._article_fetch_in_flight.difference_update(
+                        s.id for s in runnable
+                    )
+
+        per_view = config.tldr_prefetch_per_view
+        stale_per_run = config.tldr_prefetch_stale_per_run
+        if (
+            (per_view > 0 or stale_per_run > 0)
+            and stories
+            and cls._tldr_prefetch_gate.claim(
+                time.monotonic(), config.tldr_prefetch_interval_seconds
+            )
+        ):
+            try:
+                asyncio.run(
+                    _prefetch_tldrs_for_ranked(
+                        deck,
+                        db,
+                        per_view,
+                        stale_per_run,
+                        stagger_s=config.tldr_prefetch_stagger_seconds,
+                    )
+                )
+            finally:
+                cls._tldr_prefetch_gate.finish()
+
+
+def _wants_background_tasks(config: Config, deck: WindowDeck) -> bool:
+    """Whether `Handler._warm_background_tasks` has anything to do for a deck:
+    article bodies to fetch or summaries to prefetch."""
+    return not deck.is_empty() and (
+        config.article_fetch_max_per_run > 0
+        or config.tldr_prefetch_per_view > 0
+        or config.tldr_prefetch_stale_per_run > 0
+    )
+
+
+def _no_cache_dashboard_response(
+    html: bytes, *, user: User | None = None, set_session_cookie: bool = False
+) -> Response:
+    response = Response(
+        html, status=HTTPStatus.OK, content_type="text/html; charset=utf-8"
+    )
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    if set_session_cookie and user is not None:
+        _set_session_cookie(response, user.token)
+    return response
+
+
+def _set_session_cookie(response: BaseResponse, token: str) -> None:
+    # Secure only when the proxy reports https: the app is also reachable
+    # over plain http, where a Secure cookie would never be stored.
+    origin = _flask_request_origin()
+    response.set_cookie(
+        "hn_token",
+        token,
+        max_age=31536000,
+        path="/",
+        samesite="Lax",
+        httponly=True,
+        secure=origin is not None and origin[0] == "https",
+    )
+
+
+def _flask_json_response(
+    data: dict[str, object],
+    status: int | HTTPStatus = HTTPStatus.OK,
+    headers: dict[str, str] | None = None,
+) -> Response:
+    response = jsonify(data)
+    response.status_code = int(status)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    for name, value in (headers or {}).items():
+        response.headers[name] = value
+    return response
+
+
+def _flask_text_error(code: int | HTTPStatus, message: str | None = None) -> Response:
+    return Response(
+        message or HTTPStatus(code).phrase,
+        status=int(code),
+        content_type="text/plain; charset=utf-8",
+    )
+
+
+def _flask_user(runtime: type[Handler]) -> User | None:
+    token = request.cookies.get("hn_token")
+    if not token:
+        return None
+    return runtime.db.get_user_by_token(token)
+
+
+def _is_local_proxy_hop(hop: str) -> bool:
+    try:
+        return ipaddress.ip_address(hop).is_loopback
+    except ValueError:
+        return False
+
+
+def _flask_client_ip() -> str:
+    """Rightmost X-Forwarded-For hop that isn't one of our local proxies.
+
+    The leftmost value is whatever the client sent, so keying rate limits on
+    it lets anyone pick their own bucket. Each proxy (Tailscale Funnel, then
+    Caddy with `trusted_proxies`) appends the peer it saw, so walking from the
+    right past loopback hops yields the address our own edge recorded.
+    """
+    hops = request.headers.get("X-Forwarded-For", "").split(",")
+    for hop in reversed(hops):
+        hop = hop.strip()
+        if hop and not _is_local_proxy_hop(hop):
+            return hop
+    return request.remote_addr or "127.0.0.1"
+
+
+def _acquire_quota(
+    runtime: type[Handler], buckets: tuple[tuple[str, int, int], ...]
+) -> RateLimitResult:
+    """Single funnel for the per-endpoint quota helpers below."""
+    return runtime._public_demo_limiter.try_acquire(buckets)
+
+
+def _acquire_session_create_quota(runtime: type[Handler]) -> RateLimitResult:
+    config = runtime.config
+    return _acquire_quota(
+        runtime,
+        (
+            (
+                f"session-create:ip:{_flask_client_ip()}",
+                config.session_create_per_ip_limit,
+                config.session_create_per_ip_window_seconds,
+            ),
+        ),
+    )
+
+
+def _acquire_profile_link_quota(runtime: type[Handler]) -> RateLimitResult:
+    config = runtime.config
+    return _acquire_quota(
+        runtime,
+        (
+            (
+                f"profile-link:ip:{_flask_client_ip()}",
+                config.profile_link_per_ip_limit,
+                config.profile_link_per_ip_window_seconds,
+            ),
+        ),
+    )
+
+
+def _flask_request_origin() -> tuple[str, str] | None:
+    host = request.headers.get("X-Forwarded-Host") or request.headers.get("Host")
+    if not host:
+        return None
+    proto = request.headers.get("X-Forwarded-Proto") or "http"
+    if "," in proto:
+        proto = proto.split(",", 1)[0].strip()
+    return proto, host
+
+
+def _flask_is_same_origin_post() -> bool:
+    fetch_site = request.headers.get("Sec-Fetch-Site")
+    if fetch_site == "cross-site":
+        return False
+
+    origin = request.headers.get("Origin")
+    if not origin:
+        return True
+    parsed = urlparse(origin)
+    if not parsed.scheme or not parsed.netloc:
+        return False
+    request_origin = _flask_request_origin()
+    if request_origin is None:
+        return False
+    request_scheme, request_host = request_origin
+    if request.headers.get("X-Forwarded-Host"):
+        return parsed.netloc == request_host
+    return parsed.scheme == request_scheme and parsed.netloc == request_host
+
+
+def _flask_cross_site_post_response() -> Response | None:
+    if _flask_is_same_origin_post():
+        return None
+    return _flask_json_response(
+        {"error": "Cross-site POSTs are not allowed"}, status=HTTPStatus.FORBIDDEN
+    )
+
+
+def _warm_is_starved(rank_ms: float, stage_sum_ms: float) -> bool:
+    """Starvation signature: wall time far exceeds accounted stage time.
+
+    A slow warm whose stages explain the wall is just expensive compute;
+    a 50s warm with 5s of stages means the thread was stalled (regen
+    contention, pool exhaustion, host-level). Thresholds: only warms over
+    20s qualify, and stages must explain less than a third.
+    """
+    return rank_ms > 20_000 and rank_ms > 3 * max(stage_sum_ms, 1.0)
+
+
+def _flask_rate_limit_response(message: str, retry_after_seconds: int) -> Response:
+    return _flask_json_response(
+        {"error": message, "retry_after": retry_after_seconds},
+        status=HTTPStatus.TOO_MANY_REQUESTS,
+        headers={"Retry-After": str(retry_after_seconds)},
+    )
+
+
+def _acquire_feedback_quota(runtime: type[Handler], user: User) -> RateLimitResult:
+    config = runtime.config
+    return _acquire_quota(
+        runtime,
+        (
+            (
+                f"feedback:user:{user.id}",
+                config.feedback_per_user_limit,
+                config.feedback_per_user_window_seconds,
+            ),
+            (
+                "feedback:global",
+                config.feedback_global_limit,
+                config.feedback_global_window_seconds,
+            ),
+        ),
+    )
+
+
+def _acquire_interaction_event_quota(
+    runtime: type[Handler], user: User
+) -> RateLimitResult:
+    return _acquire_quota(
+        runtime,
+        (
+            (
+                f"events:user:{user.id}",
+                INTERACTION_EVENT_REQUESTS_PER_MINUTE,
+                60,
+            ),
+            (
+                "events:global",
+                INTERACTION_EVENT_GLOBAL_REQUESTS_PER_MINUTE,
+                60,
+            ),
+        ),
+    )
+
+
+def _flask_session_limit_key(user: User | None) -> str:
+    if user is not None:
+        return f"user:{user.id}"
+    return f"addr:{_flask_client_ip()}"
+
+
+def _acquire_tldr_uncached_quota(
+    runtime: type[Handler], user: User | None
+) -> RateLimitResult:
+    session_key = _flask_session_limit_key(user)
+    config = runtime.config
+    return _acquire_quota(
+        runtime,
+        (
+            (
+                f"tldr:user:{session_key}",
+                config.tldr_uncached_per_user_limit,
+                config.tldr_uncached_per_user_window_seconds,
+            ),
+            (
+                "tldr:global",
+                config.tldr_uncached_global_limit,
+                config.tldr_uncached_global_window_seconds,
+            ),
+        ),
+    )
+
+
+def _handle_flask_feedback(runtime: type[Handler]) -> Response:
+    user = _flask_user(runtime)
+    if not user:
+        return _flask_json_response(
+            {"error": "No session"}, status=HTTPStatus.UNAUTHORIZED
+        )
+
+    try:
+        body = request.get_data(cache=True)
+        if len(body) > MAX_CONTENT_LENGTH:
+            return _flask_text_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            return _flask_json_response(
+                {"error": "Invalid JSON body"}, status=HTTPStatus.BAD_REQUEST
+            )
+
+        if not isinstance(data, dict):
+            return _flask_json_response(
+                {"error": "Invalid feedback"}, status=HTTPStatus.BAD_REQUEST
+            )
+        story_id = data.get("story_id")
+        action = data.get("action")
+        if (
+            not isinstance(story_id, int)
+            or isinstance(story_id, bool)
+            or action not in {"up", "neutral", "down", "clear"}
+        ):
+            return _flask_json_response(
+                {"error": "Invalid feedback"}, status=HTTPStatus.BAD_REQUEST
+            )
+
+        # Votes reference stories (FK); an unknown id would otherwise fail
+        # the insert as a 500 after spending a quota slot.
+        if action != "clear" and not runtime.db.story_exists(story_id):
+            return _flask_json_response(
+                {"error": "Story not found"}, status=HTTPStatus.NOT_FOUND
+            )
+
+        quota = _acquire_feedback_quota(runtime, user)
+        if not quota.allowed:
+            return _flask_rate_limit_response(
+                "Too many votes from this demo session. Please try again later.",
+                quota.retry_after_seconds,
+            )
+
+        if action == "clear":
+            changed = runtime.db.delete_feedback(user.id, story_id)
+        else:
+            changed = runtime.db.upsert_feedback(user.id, story_id, action)
+        if not changed:
+            # Clearing a missing vote or repeating one changes nothing, so
+            # nothing is refreshed (a client retrying a vote it isn't sure
+            # landed gets the version it already has).
+            return _flask_json_response(
+                {"ok": True, "target_version": runtime._dashboard_version(user.id)}
+            )
+
+        # Every vote invalidates immediately; the user's re-rank is
+        # cadence-gated. Votes never trigger a global regeneration: the
+        # candidate pool doesn't depend on them (per-user ranking excludes
+        # voted stories itself).
+        version = runtime._bump_user_version(user.id)
+        runtime._schedule_feedback_warm(user, version)
+        return _flask_json_response({"ok": True, "target_version": version})
+    except Exception:
+        logging.exception("Error handling feedback")
+        return _flask_json_response(
+            {"error": "Internal error"}, status=HTTPStatus.INTERNAL_SERVER_ERROR
+        )
+
+
+_BADGE_KIND_RE = re.compile(r"[a-z_]{1,24}")
+
+
+def _parse_interaction_event(raw_event: object, user_id: int) -> InteractionEvent:
+    """Validate one raw ledger event; raises ValueError on any bad field."""
+    event_types = {"impression", "article_open", "comments_open", "dwell"}
+    if not isinstance(raw_event, dict):
+        raise ValueError("each event must be an object")
+    # JSON objects have string keys; every value stays `object` and is
+    # narrowed field by field below.
+    raw_event = cast("dict[str, object]", raw_event)
+    required = {
+        "event_id",
+        "client_session_id",
+        "story_id",
+        "event_type",
+        "dashboard_version",
+        "position",
+        "sort_mode",
+        "window",
+        "source_filter",
+        "ranker_arm",
+        "occurred_at",
+    }
+    if not required.issubset(raw_event) or bool(
+        set(raw_event) - (required | {"duration_ms", "badges"})
+    ):
+        raise ValueError("event has unexpected or missing fields")
+
+    event_id = raw_event["event_id"]
+    client_session_id = raw_event["client_session_id"]
+    if not isinstance(event_id, str) or len(event_id) > 64:
+        raise ValueError("event_id must be a short string")
+    if not isinstance(client_session_id, str) or len(client_session_id) > 128:
+        raise ValueError("client_session_id must be a short string")
+    try:
+        uuid.UUID(event_id)
+        uuid.UUID(client_session_id)
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise ValueError("event IDs must be UUIDs") from exc
+
+    story_id = raw_event["story_id"]
+    dashboard_version = raw_event["dashboard_version"]
+    position = raw_event["position"]
+    if (
+        not isinstance(story_id, int)
+        or isinstance(story_id, bool)
+        # Negative IDs are valid: non-HN stories use synthetic negative IDs.
+        or story_id == 0
+        or not -(2**63) <= story_id < 2**63
+        or not isinstance(dashboard_version, int)
+        or isinstance(dashboard_version, bool)
+        or dashboard_version < 0
+        or dashboard_version >= 2**63
+        or not isinstance(position, int)
+        or isinstance(position, bool)
+        or position < 0
+        or position >= 2**63
+    ):
+        raise ValueError("story_id, dashboard_version, and position are invalid")
+
+    event_type = raw_event["event_type"]
+    if not isinstance(event_type, str) or event_type not in event_types:
+        raise ValueError("unknown event_type")
+    occurred_at = raw_event["occurred_at"]
+    if not isinstance(occurred_at, (int, float)) or isinstance(occurred_at, bool):
+        raise ValueError("occurred_at must be a finite timestamp")
+    try:
+        timestamp = float(occurred_at)
+    except OverflowError as exc:
+        raise ValueError("occurred_at must be a finite timestamp") from exc
+    if not math.isfinite(timestamp) or timestamp <= 0:
+        raise ValueError("occurred_at must be a finite timestamp")
+
+    dimensions = tuple(
+        raw_event[name]
+        for name in ("sort_mode", "window", "source_filter", "ranker_arm")
+    )
+    if any(
+        not isinstance(value, str) or not value or len(value) > 64
+        for value in dimensions
+    ):
+        raise ValueError("event dimensions must be short strings")
+    sort_mode, window, source_filter, ranker_arm = cast(
+        tuple[str, str, str, str], dimensions
+    )
+
+    duration_ms = raw_event.get("duration_ms")
+    if duration_ms is not None and (
+        not isinstance(duration_ms, int)
+        or isinstance(duration_ms, bool)
+        or duration_ms < 0
+        or duration_ms > 86_400_000
+    ):
+        raise ValueError("duration_ms is invalid")
+    if event_type == "dwell" and duration_ms is None:
+        raise ValueError("dwell events require duration_ms")
+    if event_type != "dwell" and duration_ms is not None:
+        raise ValueError("only dwell events may include duration_ms")
+
+    # The card's badge kinds as shown (optional: older clients omit them),
+    # so per-badge outcomes can be read from the ledger.
+    badges = raw_event.get("badges", [])
+    if (
+        not isinstance(badges, list)
+        or len(badges) > 8
+        or any(
+            not isinstance(kind, str) or not _BADGE_KIND_RE.fullmatch(kind)
+            for kind in badges
+        )
+    ):
+        raise ValueError("badges must be a short list of badge kinds")
+
+    return InteractionEvent(
+        event_id=event_id,
+        client_session_id=client_session_id,
+        user_id=user_id,
+        story_id=story_id,
+        event_type=cast(InteractionEventType, event_type),
+        dashboard_version=dashboard_version,
+        position=position,
+        sort_mode=sort_mode,
+        # The time window goes in the ledger's age_filter column (no
+        # migration; it held the old Recent/Archive filter).
+        age_filter=window,
+        source_filter=source_filter,
+        ranker_arm=ranker_arm,
+        occurred_at=timestamp,
+        duration_ms=duration_ms,
+        badges=",".join(dict.fromkeys(cast("list[str]", badges))),
+    )
+
+
+def _handle_flask_interaction_events(runtime: type[Handler]) -> Response:
+    user = _flask_user(runtime)
+    if not user:
+        return _flask_json_response(
+            {"error": "No session"}, status=HTTPStatus.UNAUTHORIZED
+        )
+
+    try:
+        body = request.get_data(cache=True)
+        if len(body) > MAX_CONTENT_LENGTH:
+            return _flask_text_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            return _flask_json_response(
+                {"error": "Invalid JSON body"}, status=HTTPStatus.BAD_REQUEST
+            )
+        if not isinstance(data, dict) or set(data) != {"events"}:
+            return _flask_json_response(
+                {"error": "Expected an events envelope"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+        raw_events = data["events"]
+        if (
+            not isinstance(raw_events, list)
+            or not raw_events
+            or len(raw_events) > MAX_INTERACTION_EVENTS
+        ):
+            return _flask_json_response(
+                {"error": f"events must contain 1-{MAX_INTERACTION_EVENTS} items"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+
+        # Per-event accept/reject: one malformed or unknown-story event must
+        # never discard its batch neighbors (the beacon path can't retry).
+        events: list[InteractionEvent] = []
+        invalid_reasons: list[str] = []
+        for raw_event in raw_events:
+            try:
+                events.append(_parse_interaction_event(raw_event, user.id))
+            except ValueError as exc:
+                invalid_reasons.append(str(exc))
+
+        quota = _acquire_interaction_event_quota(runtime, user)
+        if not quota.allowed:
+            return _flask_rate_limit_response(
+                "Too many interaction events. Please try again later.",
+                quota.retry_after_seconds,
+            )
+        result = runtime.db.insert_interaction_events(events)
+        rejected = len(invalid_reasons) + result.unknown
+        if rejected:
+            logging.warning(
+                "interaction events: rejected %d of %d "
+                "(%d invalid, %d unknown story); reasons: %s",
+                rejected,
+                len(raw_events),
+                len(invalid_reasons),
+                result.unknown,
+                invalid_reasons[:3],
+            )
+        return _flask_json_response(
+            {
+                "ok": True,
+                "inserted": result.inserted,
+                "duplicates": result.duplicates,
+                "rejected": rejected,
+            }
+        )
+    except ValueError as exc:
+        return _flask_json_response({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+    except Exception:
+        logging.exception("Error handling interaction events")
+        return _flask_json_response(
+            {"error": "Internal error"}, status=HTTPStatus.INTERNAL_SERVER_ERROR
+        )
+
+
+def _hot_summary_is_stale(story: Story, config: Config, now: float) -> bool:
+    """Whether a busy young thread has grown well past the comments its
+    cached summary read (``_growth_threshold``; the hot refresh keeps
+    ``comment_count`` live between regens)."""
+    from pipeline import _growth_threshold
+
+    fetched = story.comment_count_at_fetch or 0
+    return (
+        fetched > 0
+        and hn_thread_looks_active(story, config, now)
+        and (story.comment_count or 0) - fetched >= _growth_threshold(fetched)
+    )
+
+
+def _tldr_tap_should_probe(story: Story, config: Config, now: float) -> bool:
+    """Whether a TLDR tap should confirm the live count before trusting cache.
+
+    Ungated by velocity by design: any young HN thread with cached comments
+    gets one cheap Firebase descendants check (~500B). The user is already
+    looking at this story, so regen's velocity ordering doesn't apply.
+    """
+    if not is_hn_source(story.source):
+        return False
+    if not story.top_comments or story.time <= 0:
+        return False
+    age_hours = (now - story.time) / 3600.0
+    return 0 < age_hours <= config.tldr_refresh_recent_hours
+
+
+def _tldr_tap_probe_growth(
+    db: Database, config: Config, story: Story
+) -> tuple[Story, bool]:
+    """Firebase live-count check for a single tap; heals comment_count on growth.
+
+    Returns (story, grew): grew means live exceeds the last fetched count,
+    even if the stored count already reflects that growth. Heal the stored
+    count independently, upwards only. Probe failures and missing counts
+    fall through as (story, False).
+    """
+    from pipeline import _probe_live_counts
+
+    if config.tldr_tap_probe_timeout_seconds <= 0:
+        return (story, False)
+    if not _tldr_tap_should_probe(story, config, time.time()):
+        return (story, False)
+    try:
+        live_counts = asyncio.run(
+            _probe_live_counts([story], config.tldr_tap_probe_timeout_seconds)
+        )
+    except Exception:
+        logging.exception("tldr tap probe failed for story_id=%s", story.id)
+        return (story, False)
+    live = live_counts.get(story.id, 0)
+    if live > (story.comment_count or 0):
+        story = replace(story, comment_count=live)
+        db.upsert_story(story)
+    if live <= (story.comment_count_at_fetch or 0):
+        return (story, False)
+    logging.info(
+        "tldr_detail story_id=%s result=tap_probe_growth live=%s", story.id, live
+    )
+    return (story, True)
+
+
+@dataclass(frozen=True)
+class TldrReply:
+    """A `/api/tldr-detail` answer as data, so every request waiting on the
+    same generation can be sent the same one."""
+
+    payload: dict[str, object]
+    status: HTTPStatus = HTTPStatus.OK
+    retry_after_seconds: int | None = None
+
+    def response(self) -> Response:
+        headers = None
+        if self.retry_after_seconds is not None:
+            headers = {"Retry-After": str(self.retry_after_seconds)}
+        return _flask_json_response(self.payload, status=self.status, headers=headers)
+
+
+def _rate_limited_reply(message: str, retry_after_seconds: int) -> TldrReply:
+    return TldrReply(
+        {"error": message, "retry_after": retry_after_seconds},
+        HTTPStatus.TOO_MANY_REQUESTS,
+        retry_after_seconds,
+    )
+
+
+def _cached_tldr_reply(
+    cached_tldr: str, story_id: int, cache_key: str, event: str
+) -> TldrReply:
+    """Log + serve an exact-key cache hit (early or post-enrich)."""
+    logging.info(
+        "tldr_detail story_id=%s result=%s cache_key=%s",
+        story_id,
+        event,
+        cache_key[:12],
+    )
+    return TldrReply({"ok": True, "tldr": cached_tldr, "cached": True})
+
+
+def _stale_tldr_fallback(db: Database, story_id: int, reason: str) -> TldrReply | None:
+    story = db.get_story(story_id)
+    if story is not None and _is_unfollowed_pointer(story):
+        # The only row may be a summary invented from the pointer note.
+        return None
+    stale_tldr = db.get_any_tldr_for_story(story_id)
+    if not stale_tldr:
+        return None
+    logging.info(
+        "tldr_detail story_id=%s result=stale_fallback reason=%s",
+        story_id,
+        reason,
+    )
+    return TldrReply({"ok": True, "tldr": stale_tldr, "cached": True, "stale": True})
+
+
+def _tldr_result_reply(
+    db: Database,
+    story_id: int,
+    result: TldrResult,
+    extra: dict[str, object] | None = None,
+) -> TldrReply:
+    """The reply for a finished generation, from a tap or the prefetch."""
+    if result.kind == "no_content":
+        return TldrReply(
+            {
+                "ok": True,
+                "tldr": "No article body or discussion available to summarize for this story.",
+                "cached": False,
+                # Not persisted to tldr_cache: a later retry (e.g. after
+                # a transient upstream 429 clears) may find real content,
+                # so the client must not treat this as a final answer.
+                "retryable": True,
+                # Machine flag: hydration found nothing summarizable
+                # (short-only comments, blocked article). Clients skip
+                # rendering this as a real summary.
+                "empty": True,
+            }
+        )
+    if result.kind == "llm_error":
+        fallback = _stale_tldr_fallback(db, story_id, "llm_error")
+        if fallback:
+            return fallback
+        if result.error_status in (429, 402):
+            if result.error_status == 402:
+                # Billing refusal (e.g. spend cap): no Retry-After
+                # semantics, so seed the cooldown explicitly. Escalates
+                # with consecutive 402s via the limiter backoff and
+                # self-clears, like a 429.
+                llm_limiter.on_429()
+            return _rate_limited_reply(
+                "Summary provider is cooling down. Please try again later.",
+                max(1, llm_limiter.retry_after_seconds),
+            )
+        return TldrReply(
+            {"error": "Failed to generate TLDR. Please try again later."},
+            HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+    payload: dict[str, object] = {
+        "ok": True,
+        "tldr": result.tldr,
+        "cached": False,
+        **(extra or {}),
+    }
+    if not result.cacheable:
+        payload["retryable"] = True
+    return TldrReply(payload)
+
+
+def _maybe_cache_tldr(
+    db: Database, story_id: int, cache_key: str, result: TldrResult
+) -> bool:
+    """Persist a generated TLDR unless it's a salvaged half (True=written);
+    caching a half would evict the story's complete TLDR (one row/story)."""
+    if result.kind != "ok" or not result.tldr.strip() or not result.cacheable:
+        logging.warning(
+            "tldr_detail story_id=%s result=partial_not_cached cache_key=%s",
+            story_id,
+            cache_key[:12],
+        )
+        return False
+    db.upsert_tldr_cache(story_id, cache_key, result.tldr)
+    return True
+
+
+@dataclass(frozen=True)
+class _TldrTap:
+    """What the gates learned about a tap, for the generation behind them."""
+
+    story: Story
+    force_refresh: bool
+    needs_active_refresh: bool
+    needs_empty_fetch: bool
+    tap_probed_growth: bool
+    live_comment_count: int | None
+
+
+_UNFINISHED_TLDR_REPLY = TldrReply(
+    {"error": "The summary being generated didn't finish. Please try again."},
+    HTTPStatus.SERVICE_UNAVAILABLE,
+)
+
+
+def _generate_tldr_reply(
+    runtime: type[Handler], user: User, tap: _TldrTap
+) -> TldrReply:
+    """Slot, quota, hydration and the LLM call for one story's summary."""
+    story = tap.story
+    force_refresh = tap.force_refresh
+    needs_active_refresh = tap.needs_active_refresh
+    needs_empty_fetch = tap.needs_empty_fetch
+    tap_probed_growth = tap.tap_probed_growth
+    live_comment_count = tap.live_comment_count
+    article_body = story.article_body or None
+
+    # Before the quota, so a busy rejection doesn't spend it. Released
+    # by the app's teardown_request hook however the request ends.
+    if not runtime._try_start_tldr_generation():
+        fallback = _stale_tldr_fallback(runtime.db, story.id, "busy")
+        if fallback:
+            return fallback
+        return _rate_limited_reply(
+            "Summaries are busy. Please try again in a few seconds.",
+            TLDR_BUSY_RETRY_AFTER_SECONDS,
+        )
+    g.tldr_generation_runtime = runtime
+
+    quota = _acquire_tldr_uncached_quota(runtime, user)
+    if not quota.allowed:
+        fallback = _stale_tldr_fallback(runtime.db, story.id, "quota_denied")
+        if fallback:
+            return fallback
+        return _rate_limited_reply(
+            "Demo TLDR quota reached. Cached summaries still work; please try a new summary later.",
+            quota.retry_after_seconds,
+        )
+
+    t_tap = time.perf_counter()
+    hydrate_ms = 0.0
+    hydrate_hn_ms = 0.0
+    hydrate_src_ms = 0.0
+    hydrate_article_ms = 0.0
+
+    # Hydration lanes (HN thread refresh, Reddit/LW context, article
+    # body) are independent by source — the article lane excludes
+    # reddit/LW sources and the source lane only runs for them — so run
+    # all eligible lanes concurrently instead of back-to-back. Merges
+    # below apply in the original order to preserve semantics.
+    hn_needed = (
+        needs_empty_fetch
+        or needs_active_refresh
+        or tap_probed_growth
+        or (force_refresh and is_hn_source(story.source) and bool(story.top_comments))
+    )
+    src_kind: str | None = None
+    if story.url and (not story.self_text or not story.top_comments):
+        if story.source.startswith("rss_reddit_"):
+            src_kind = "reddit"
+        elif story.source == "rss_lesswrong_com":
+            src_kind = "lesswrong"
+    from pipeline import _is_fetchable_article_url
+
+    article_eligible = (
+        article_body is None
+        and story.url
+        and src_kind is None
+        and story.source != AINEWS_SOURCE
+        and len(story.self_text) < 500
+        and _is_fetchable_article_url(story.url)
+    )
+    _lw_post_id: str | None = None
+    if src_kind == "lesswrong" and story.url:
+        _lw_post_id = _extract_lesswrong_post_id(story.url)
+        if not _lw_post_id:
+            src_kind = None
+
+    async def _hn_lane() -> Story | None:
+        from pipeline import fetch_story
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            return await fetch_story(
+                client,
+                story.id,
+                runtime.db,
+                force=needs_active_refresh or tap_probed_growth or force_refresh,
+            )
+
+    async def _src_lane() -> RedditRssContext | LessWrongContext | None:
+        if src_kind == "reddit":
+            assert story.url is not None
+            return await _fetch_reddit_rss_context(story.url)
+        if src_kind == "lesswrong":
+            assert _lw_post_id is not None
+            return await _fetch_lesswrong_context(_lw_post_id)
+        return None
+
+    async def _article_lane() -> ArticleFetchResult | None:
+        assert story.url is not None
+        return await _fetch_article_body_with_result(story.url)
+
+    # Lane results by name; values are the lane return or the caught
+    # Exception (lanes fail independently — see _timed).
+    async def _timed(
+        name: str, coro: Awaitable[_LaneT] | None
+    ) -> tuple[_LaneT | Exception | None, float | None]:
+        """Run one hydration lane; a failure is returned, not raised, so
+        the other lanes still finish. ``None`` lanes are skipped."""
+        if coro is None:
+            return None, None
+        t0 = time.perf_counter()
+        try:
+            return await coro, (time.perf_counter() - t0) * 1000.0
+        except Exception as e:
+            logging.error("TLDR hydration lane %s failed: %r", name, e)
+            return e, (time.perf_counter() - t0) * 1000.0
+
+    async def _gather_hydration() -> tuple[
+        Story | Exception | None,
+        RedditRssContext | LessWrongContext | Exception | None,
+        ArticleFetchResult | Exception | None,
+        dict[str, float],
+    ]:
+        (hn, hn_ms), (src, src_ms), (article, article_ms) = await asyncio.gather(
+            _timed("hn", _hn_lane() if hn_needed else None),
+            _timed("src", _src_lane() if src_kind is not None else None),
+            _timed("article", _article_lane() if article_eligible else None),
+        )
+        timings = {
+            name: ms
+            for name, ms in (
+                ("hn", hn_ms),
+                ("src", src_ms),
+                ("article", article_ms),
+            )
+            if ms is not None
+        }
+        return hn, src, article, timings
+
+    t_hydrate = time.perf_counter()
+    hn_updated: Story | Exception | None = None
+    remote_context: RedditRssContext | LessWrongContext | Exception | None = None
+    article_result: ArticleFetchResult | Exception | None = None
+    if hn_needed or src_kind is not None or article_eligible:
+        try:
+            hn_updated, remote_context, article_result, _timings = asyncio.run(
+                _gather_hydration()
+            )
+            hydrate_hn_ms = _timings.get("hn", 0.0)
+            hydrate_src_ms = _timings.get("src", 0.0)
+            hydrate_article_ms = _timings.get("article", 0.0)
+        except Exception as e:
+            logging.error("Failed to hydrate story for TLDR: %r", e)
+    hydrate_ms = (time.perf_counter() - t_hydrate) * 1000.0
+
+    if isinstance(hn_updated, Story):
+        story = hn_updated
+        if (
+            live_comment_count is not None
+            and (story.comment_count or 0) < live_comment_count
+        ):
+            # Algolia lags Firebase: never move the count backwards
+            # below the live descendants the probe just confirmed.
+            # comment_count_at_fetch keeps Algolia's number — it is
+            # what the summarized comments actually reflect.
+            story = replace(story, comment_count=live_comment_count)
+            runtime.db.upsert_story(story)
+        stored = runtime.db.get_story_counts([story.id]).get(story.id)
+        if stored is not None and (stored.score, stored.comment_count) != (
+            tap.story.score,
+            tap.story.comment_count,
+        ):
+            # Feeds serve stored counts: tell clients to refetch.
+            runtime._bump_counts_version()
+    elif isinstance(hn_updated, Exception):
+        logging.error("Failed to dynamically fetch comments for TLDR: %r", hn_updated)
+
+    article_body = story.article_body or article_body
+
+    # Merge the concurrently fetched source context (same semantics as
+    # the old sequential block; eligibility was snapshotted above).
+    if not isinstance(remote_context, Exception):
+        if remote_context and (remote_context.self_text or remote_context.top_comments):
+            from pipeline import _merge_source_context
+
+            story = _merge_source_context(
+                story, remote_context, article_body, prefer_longer_comments=True
+            )
+            runtime.db.upsert_story(story)
+    else:
+        logging.error("TLDR source-context lane failed: %r", remote_context)
+
+    if article_result is not None and not isinstance(article_result, Exception):
+        from pipeline import compose_story_text
+        from pipeline.enrichment import record_article_fetch_failure_outcome
+
+        result = article_result
+        if result.body:
+            article_body = result.body[:ARTICLE_BODY_CHAR_LIMIT]
+            new_text = compose_story_text(
+                story.title,
+                story.self_text,
+                story.top_comments,
+                article_body,
+            )
+            updated_story = replace(
+                story,
+                article_body=article_body,
+                text_content=new_text,
+            )
+            runtime.db.upsert_story(updated_story)
+            runtime.db.clear_article_fetch_failure(story.id)
+            # Embedding refresh intentionally left to the warm/regen
+            # article-fetch path (pipeline/enrichment.py re-embeds
+            # there); running ONNX encode here would block the tap.
+            story = updated_story
+        else:
+            record_article_fetch_failure_outcome(
+                runtime.db,
+                story.id,
+                story.url or "",
+                status=result.status,
+                error=result.error,
+                permanent=result.permanent,
+            )
+    elif isinstance(article_result, Exception):
+        logging.error("TLDR article lane failed: %r", article_result)
+
+    if _is_unfollowed_pointer(story):
+        story = asyncio.run(_follow_pointer_thread(runtime.db, story))
+
+    cache_key = _tldr_cache_key(
+        title=story.title,
+        self_text=story.self_text or "",
+        top_comments=story.top_comments or "",
+        article_body=article_body or "",
+    )
+    cached_tldr = runtime.db.get_tldr_cache(story.id, cache_key)
+    if cached_tldr and not force_refresh:
+        return _cached_tldr_reply(
+            cached_tldr, story.id, cache_key, "post_enrich_cache_hit"
+        )
+
+    t_llm = time.perf_counter()
+    result = asyncio.run(
+        generate_detailed_tldr(
+            story.title,
+            self_text=story.self_text or "",
+            top_comments=story.top_comments or "",
+            article_body=article_body or "",
+        )
+    )
+    llm_ms = (time.perf_counter() - t_llm) * 1000.0
+    tldr_total_ms = (time.perf_counter() - t_tap) * 1000.0
+    if result.kind == "llm_error":
+        logging.warning(
+            "tldr_detail story_id=%s result=llm_error cache_key=%s status=%s error=%s "
+            "tldr_total_ms=%.0f hydrate_ms=%.0f(hnsrc=%.0f/%.0f/art=%.0f) llm_ms=%.0f",
+            story.id,
+            cache_key[:12],
+            result.error_status,
+            result.error_text,
+            tldr_total_ms,
+            hydrate_ms,
+            hydrate_hn_ms,
+            hydrate_src_ms,
+            hydrate_article_ms,
+            llm_ms,
+        )
+        return _tldr_result_reply(runtime.db, story.id, result)
+    if result.kind == "no_content":
+        return _tldr_result_reply(runtime.db, story.id, result)
+    _maybe_cache_tldr(runtime.db, story.id, cache_key, result)
+    logging.info(
+        "tldr_detail story_id=%s result=generated cache_key=%s "
+        "tldr_total_ms=%.0f hydrate_ms=%.0f(hnsrc=%.0f/%.0f/art=%.0f) llm_ms=%.0f "
+        "live=%s summarized_at_fetch=%s",
+        story.id,
+        cache_key[:12],
+        tldr_total_ms,
+        hydrate_ms,
+        hydrate_hn_ms,
+        hydrate_src_ms,
+        hydrate_article_ms,
+        llm_ms,
+        live_comment_count,
+        story.comment_count_at_fetch,
+    )
+    # Stored counts: hydration never lowers them, while Algolia's can lag
+    # the hot refresh's Firebase numbers.
+    stored = runtime.db.get_story_counts([story.id]).get(story.id)
+    return _tldr_result_reply(
+        runtime.db,
+        story.id,
+        result,
+        {
+            "comment_count_live": live_comment_count,
+            "comment_count_summarized": story.comment_count_at_fetch,
+            "points": stored.score if stored else story.score,
+            "comments": stored.comment_count if stored else story.comment_count,
+        },
+    )
+
+
+def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
+    try:
+        user = _flask_user(runtime)
+        body = request.get_data(cache=True)
+        if len(body) > MAX_CONTENT_LENGTH:
+            return _flask_text_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            return _flask_json_response(
+                {"error": "Invalid JSON body"}, status=HTTPStatus.BAD_REQUEST
+            )
+
+        story_id_raw = data.get("story_id") if isinstance(data, dict) else None
+        if not isinstance(story_id_raw, int) or isinstance(story_id_raw, bool):
+            return _flask_json_response(
+                {"error": "Invalid request: story_id must be an integer"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+        story_id: int = story_id_raw
+        # Explicit re-summarize from the card control: skip both cache hits
+        # below and force HN hydration. Still gated by provider cooldown and
+        # the shared uncached quota — never 429s when a TLDR row exists.
+        force_refresh = data.get("force_refresh") is True
+
+        story = runtime.db.get_story(story_id)
+        if not story:
+            return _flask_json_response(
+                {"error": "Story not found in database"}, status=HTTPStatus.NOT_FOUND
+            )
+
+        # Recent, high-velocity HN threads bypass the cache hit below and the
+        # dedicated "already cached" fast path, since CH prewarm data can be
+        # 1-24h stale for brand-new comments — see hn_thread_looks_active.
+        needs_active_refresh = bool(story.top_comments) and hn_thread_looks_active(
+            story, runtime.config, time.time()
+        )
+
+        # An HN story with comments on HN but nothing in top_comments (missed
+        # prewarm, or prewarm failed) must also bypass the cache hit below —
+        # otherwise it is served whatever article-only blob was cached the
+        # first time and can never recover, since the refresh check above
+        # requires top_comments to already be non-empty.
+        needs_empty_fetch = (
+            is_hn_source(story.source)
+            and not story.top_comments
+            and (story.comment_count or 0) > 0
+        )
+
+        article_body = story.article_body or None
+        cache_key = _tldr_cache_key(
+            title=story.title,
+            self_text=story.self_text or "",
+            top_comments=story.top_comments or "",
+            article_body=article_body or "",
+        )
+        cached_tldr = runtime.db.get_tldr_cache(story.id, cache_key)
+        # Tap-time probe: a young HN thread that would otherwise serve cached
+        # gets one live-count check first; confirmed growth falls through to
+        # hydration below instead of serving stale. Miss/failure serves cached.
+        tap_probed_growth = False
+        live_comment_count: int | None = None
+        if (
+            cached_tldr
+            and not needs_active_refresh
+            and not needs_empty_fetch
+            and not force_refresh
+        ):
+            story, tap_probed_growth = _tldr_tap_probe_growth(
+                runtime.db, runtime.config, story
+            )
+            if tap_probed_growth:
+                live_comment_count = story.comment_count
+        if (
+            cached_tldr
+            and not needs_active_refresh
+            and not needs_empty_fetch
+            and not force_refresh
+            and not tap_probed_growth
+        ):
+            return _cached_tldr_reply(
+                cached_tldr, story.id, cache_key, "cache_hit"
+            ).response()
+
+        retry_after = llm_limiter.retry_after_seconds
+        if retry_after:
+            if cached_tldr:
+                # The text is current, but a requested refresh did not happen.
+                # Mark it retryable rather than disguising this as a normal hit.
+                return _flask_json_response(
+                    {
+                        "ok": True,
+                        "tldr": cached_tldr,
+                        "cached": True,
+                        "retryable": True,
+                        "reason": "provider_cooldown",
+                        "retry_after_seconds": retry_after,
+                    }
+                )
+            fallback = _stale_tldr_fallback(runtime.db, story.id, "provider_cooldown")
+            if fallback:
+                return fallback.response()
+            return _flask_rate_limit_response(
+                "Summary provider is cooling down. Please try again later.", retry_after
+            )
+
+        # Cached summaries stay public; spending the LLM budget needs a
+        # session, so a sessionless client can't drain the shared quota.
+        if user is None:
+            fallback = _stale_tldr_fallback(runtime.db, story.id, "no_session")
+            if fallback:
+                return fallback.response()
+            return _flask_json_response(
+                {"error": "No session"}, status=HTTPStatus.UNAUTHORIZED
+            )
+
+        # One generation per story: a request for a story already being
+        # generated (another tap, the TUI, the warm prefetch) waits for that
+        # result instead of spending a slot, quota and an LLM call of its own.
+        flight, leading = runtime._tldr_flights.join_or_lead(story.id)
+        if not leading:
+            reply = flight.wait(TLDR_JOIN_TIMEOUT_SECONDS)
+            logging.info(
+                "tldr_detail story_id=%s result=joined finished=%s",
+                story.id,
+                reply is not None,
+            )
+            return (reply or _UNFINISHED_TLDR_REPLY).response()
+        reply = None
+        try:
+            reply = _generate_tldr_reply(
+                runtime,
+                user,
+                _TldrTap(
+                    story=story,
+                    force_refresh=force_refresh,
+                    needs_active_refresh=needs_active_refresh,
+                    needs_empty_fetch=needs_empty_fetch,
+                    tap_probed_growth=tap_probed_growth,
+                    live_comment_count=live_comment_count,
+                ),
+            )
+        finally:
+            runtime._tldr_flights.land(story.id, flight, reply)
+        return reply.response()
+    except Exception:
+        logging.exception("Error handling tldr-detail")
+        return _flask_json_response(
+            {"error": "Internal error"}, status=HTTPStatus.INTERNAL_SERVER_ERROR
+        )
+
+
+def _invalid_version_response() -> Response:
+    return _flask_json_response(
+        {"error": "Invalid version"}, status=HTTPStatus.BAD_REQUEST
+    )
+
+
+def _parse_non_negative_version(raw: str) -> int | None:
+    try:
+        version = int(raw)
+    except ValueError:
+        return None
+    if version < 0:
+        return None
+    return version
+
+
+def _handle_flask_ranking_ready(runtime: type[Handler]) -> Response:
+    user = _flask_user(runtime)
+    if not user:
+        return _flask_json_response(
+            {"error": "No session"}, status=HTTPStatus.UNAUTHORIZED
+        )
+
+    # Clients send the version they wait for; older TUIs also send
+    # target_version, which is ignored.
+    raw_versions = request.args.getlist("min_version")
+    if len(raw_versions) != 1:
+        return _invalid_version_response()
+    min_version = _parse_non_negative_version(raw_versions[0])
+    if min_version is None:
+        return _invalid_version_response()
+
+    view = runtime._deck_for_user(user)
+    return _flask_json_response(
+        {
+            "ok": True,
+            "ready": view.version >= min_version,
+            "current_version": view.current,
+            "counts_version": runtime._current_counts_version(),
+        }
+    )
+
+
+_PROFILE_SWITCH_PAGE = b"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Switch profile?</title></head>
+<body style="font-family: system-ui, sans-serif; max-width: 32rem; margin: 3rem auto; padding: 0 1rem">
+<h1>Switch profile?</h1>
+<p>This device already has a profile. Switching replaces it here; save its
+profile link first if you want to come back to it.</p>
+<form method="post"><button type="submit">Switch to this profile</button></form>
+<p><a href="../">Keep my current profile</a></p>
+</body></html>
+"""
+
+
+def _profile_switch_confirm_response() -> Response:
+    response = Response(
+        _PROFILE_SWITCH_PAGE,
+        status=HTTPStatus.OK,
+        content_type="text/html; charset=utf-8",
+    )
+    response.headers["Cache-Control"] = "no-store"
+    # The page URL holds a profile token; don't leak it to linked pages.
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
+def create_app(runtime: type[Handler] = Handler) -> Flask:
+    app = Flask(__name__)
+
+    @app.teardown_request
+    def release_tldr_generation(_exc: BaseException | None) -> None:
+        held = g.pop("tldr_generation_runtime", None)
+        if held is not None:
+            held._finish_tldr_generation()
+
+    @app.route("/u/<path:token>", methods=["GET", "POST"])
+    def profile_link(token: str) -> ResponseReturnValue:
+        token = token.strip("/")
+        if not token:
+            return Response(status=HTTPStatus.BAD_REQUEST)
+        if request.method == "POST":
+            cross_site_response = _flask_cross_site_post_response()
+            if cross_site_response is not None:
+                return cross_site_response
+
+        quota = _acquire_profile_link_quota(runtime)
+        if not quota.allowed:
+            return _flask_rate_limit_response(
+                "Too many profile-link attempts. Please try again later.",
+                quota.retry_after_seconds,
+            )
+
+        user = runtime.db.get_user_by_token(token)
+        if not user:
+            return Response(status=HTTPStatus.NOT_FOUND)
+
+        # A link must not silently replace another live profile on this
+        # device (another site could link a visitor into its own profile):
+        # a plain GET only asks; the switch is a same-origin POST.
+        current = _flask_user(runtime)
+        if (
+            request.method == "GET"
+            and current is not None
+            and current.token != user.token
+        ):
+            return _profile_switch_confirm_response()
+
+        response = redirect("../", code=302)
+        _set_session_cookie(response, user.token)
+        return response
+
+    @app.get("/api/user")
+    def api_user() -> ResponseReturnValue:
+        user = _flask_user(runtime)
+        if user:
+            return _flask_json_response({"user_id": user.id, "token": user.token})
+        return _flask_json_response(
+            {"error": "No session"}, status=HTTPStatus.UNAUTHORIZED
+        )
+
+    @app.get("/api/feed")
+    def feed() -> ResponseReturnValue:
+        user = _flask_user(runtime)
+        if not user:
+            return _flask_json_response({"error": "No session"}, status=401)
+        window = request.args.get("window", DEFAULT_WINDOW)
+        if window not in WINDOWS:
+            return _flask_json_response(
+                {"error": "window must be one of " + ", ".join(WINDOWS)},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+        response = _flask_json_response(
+            runtime._feed_for_user(user, cast(Window, window)).to_dict()
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.get("/api/ranking-ready")
+    def ranking_ready() -> ResponseReturnValue:
+        return _handle_flask_ranking_ready(runtime)
+
+    @app.get("/")
+    @app.get("/index.html")
+    def dashboard() -> ResponseReturnValue:
+        user = _flask_user(runtime)
+        if not user:
+            quota = _acquire_session_create_quota(runtime)
+            if not quota.allowed:
+                return _flask_rate_limit_response(
+                    "Too many new demo sessions from this address. Please try again later.",
+                    quota.retry_after_seconds,
+                )
+
+            token = secrets.token_hex(16)
+            user = runtime.db.create_user(token)
+            html = runtime._render_dashboard_for_user(user)
+            return _no_cache_dashboard_response(
+                html, user=user, set_session_cookie=True
+            )
+
+        html = runtime._render_dashboard_for_user(user)
+        return _no_cache_dashboard_response(html)
+
+    @app.route("/api/feedback", methods=["POST"], provide_automatic_options=False)
+    def feedback() -> ResponseReturnValue:
+        cross_site_response = _flask_cross_site_post_response()
+        if cross_site_response is not None:
+            return cross_site_response
+        return _handle_flask_feedback(runtime)
+
+    @app.route("/api/interaction", methods=["POST"], provide_automatic_options=False)
+    def interaction_events() -> ResponseReturnValue:
+        cross_site_response = _flask_cross_site_post_response()
+        if cross_site_response is not None:
+            return cross_site_response
+        return _handle_flask_interaction_events(runtime)
+
+    @app.get("/api/tldr-cache/<int(signed=True):story_id>")
+    def tldr_cache(story_id: int) -> ResponseReturnValue:
+        """Read-only speculation: never hydrate sources or invoke the LLM."""
+        if not _flask_user(runtime):
+            return _flask_json_response({"error": "No session"}, status=401)
+        story = runtime.db.get_story(story_id)
+        if story is None:
+            return Response(status=204)
+        key = _tldr_cache_key(
+            title=story.title,
+            self_text=story.self_text or "",
+            top_comments=story.top_comments or "",
+            article_body=story.article_body or "",
+        )
+        if _hot_summary_is_stale(story, runtime.config, time.time()):
+            # A miss, so opening the story asks tldr-detail, which refreshes
+            # the busy thread's comments and rewrites the summary.
+            logging.info(
+                "tldr_detail story_id=%s result=prefetch_cache_stale", story_id
+            )
+            cached = None
+        else:
+            cached = runtime.db.get_tldr_cache(story_id, key)
+        response = (
+            _cached_tldr_reply(cached, story_id, key, "prefetch_cache_hit").response()
+            if cached
+            else Response(status=204)
+        )
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
+
+    @app.route("/api/tldr-detail", methods=["POST"], provide_automatic_options=False)
+    def tldr_detail() -> ResponseReturnValue:
+        cross_site_response = _flask_cross_site_post_response()
+        if cross_site_response is not None:
+            return cross_site_response
+        return _handle_flask_tldr_detail(runtime)
+
+    @app.route("/api/feedback", methods=["OPTIONS"])
+    @app.route("/api/interaction", methods=["OPTIONS"])
+    @app.route("/api/tldr-detail", methods=["OPTIONS"])
+    def api_options() -> Response:
+        response = Response(status=HTTPStatus.NO_CONTENT)
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        return response
+
+    return app
+
+
+# Nominal mistral-small per-1M-token rates for the spend estimate below.
+# informational only — the $10 cap lives in the Mistral console.
+_MISTRAL_SMALL_USD_PER_1M_IN = 0.10
+_MISTRAL_SMALL_USD_PER_1M_OUT = 0.30
+
+
+def _log_llm_spend_today(db: Database) -> None:
+    """One log line per regen with today's per-provider token totals."""
+    try:
+        rows = db.get_llm_usage_day(time.strftime("%Y-%m-%d"))
+    except Exception:
+        logging.exception("_log_llm_spend_today: usage read failed (non-fatal)")
+        return
+    for row in rows:
+        provider = str(row["provider"])
+        est_usd: float | None = None
+        if provider == "mistral":
+            est_usd = (
+                int(row["input_tokens"]) / 1_000_000 * _MISTRAL_SMALL_USD_PER_1M_IN
+                + int(row["output_tokens"]) / 1_000_000 * _MISTRAL_SMALL_USD_PER_1M_OUT
+            )
+        logging.info(
+            "llm_spend_today provider=%s calls=%s in=%s out=%s reasoning=%s est_usd=%s",
+            provider,
+            row["calls"],
+            row["input_tokens"],
+            row["output_tokens"],
+            row["reasoning_tokens"],
+            f"{est_usd:.4f}" if est_usd is not None else "n/a",
+        )
+
+
+def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
+    logging.info("Starting background regeneration loop...")
+    from pipeline.hn_dupes import HnDupeResolutionWorker
+
+    hn_dupe_worker = HnDupeResolutionWorker(db)
+    embedder = Handler.embedder
+
+    def publish_reddit_changes() -> None:
+        Handler._pool_changed()
+
+    from reddit_refresh import RedditRefreshWorker
+
+    reddit_worker = RedditRefreshWorker(
+        config, db, embedder, on_changed=publish_reddit_changes
+    )
+    if config.regen_initial_delay_seconds > 0:
+        logging.info(
+            "Deferring first regen for %ds (avoid contention with first warm)",
+            config.regen_initial_delay_seconds,
+        )
+        time.sleep(config.regen_initial_delay_seconds)
+        event.set()
+    while True:
+        # Wait on event or timeout
+        triggered = event.wait(timeout=config.regen_interval_seconds)
+        if triggered:
+            event.clear()
+
+        logging.info("Regeneration triggered. Fetching candidates...")
+        try:
+            from pipeline import fetch_candidates_only
+
+            logging.info("regen_fetch_start")
+            asyncio.run(
+                fetch_candidates_only(
+                    config,
+                    db,
+                    embedder=embedder,
+                    on_hn_candidates=hn_dupe_worker.submit,
+                )
+            )
+            logging.info("regen_fetch_done")
+            Handler._pool_changed()
+            gc.collect()
+            _release_freed_heap()
+            logging.info("regen_rebuild_done")
+            _log_llm_spend_today(db)
+            reddit_worker.submit()
+
+            cold_deck = Handler._cold_deck
+            if _wants_background_tasks(config, cold_deck):
+                t = threading.Thread(
+                    target=lambda: Handler._warm_background_tasks(
+                        cold_deck, db, embedder, config
+                    ),
+                    daemon=True,
+                )
+                t.start()
+            logging.info("Regeneration complete.")
+        except Exception as e:
+            logging.exception("Background regeneration failed: %r", e)
+
+
+def hot_refresh_once(config: Config, db: Database) -> list[int]:
+    """Refresh live counts of the pool's busiest young HN threads; tell
+    clients (``counts_version``) when any stored count moved."""
+    from pipeline import rank_gate, refresh_hot_counts
+    from pipeline.candidate_cache import cached_candidate_stories
+
+    candidates = cached_candidate_stories()
+    rank_gate.wait_idle()
+    start = time.perf_counter()
+    probed, changed = refresh_hot_counts(config, db, candidates)
+    if changed:
+        Handler._bump_counts_version()
+    logging.info(
+        "hot_refresh probed=%s changed=%s ms=%.0f",
+        probed,
+        len(changed),
+        (time.perf_counter() - start) * 1000.0,
+    )
+    return changed
+
+
+def hot_refresh_loop(config: Config, db: Database) -> None:
+    """Between hourly regens, keep hot threads' points and comments live."""
+    interval = config.hot_refresh_interval_seconds
+    if interval <= 0:
+        return
+    while True:
+        time.sleep(interval)
+        try:
+            hot_refresh_once(config, db)
+        except Exception:
+            logging.exception("hot_refresh failed")
+
+
+def _quiet_third_party_loggers() -> None:
+    """Silence third-party INFO/WARNING noise that isn't actionable.
+
+    httpx logs an INFO line for every outbound request (CH, Algolia, RSS,
+    article fetches); at regen scale this is ~88% of journal volume and
+    drowns out anything worth reading during a live incident. trafilatura
+    emits a benign "discarding data: None" WARNING whenever we call
+    extract() without a source URL, which we always do. Neither is a
+    signal we act on; downstream errors still surface via our own
+    exception/warning logging.
+    """
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("trafilatura").setLevel(logging.ERROR)
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.StreamHandler(sys.stderr)],
+    )
+    _quiet_third_party_loggers()
+    load_env()
+    config = Config.load()
+    db = Database(config.db_path)
+
+    regen_event = threading.Event()
+    from pipeline import Embedder
+
+    embedder = Embedder(
+        config.onnx_model_dir,
+        model_version=config.embedding_model_version,
+        max_tokens=config.embedding_max_tokens,
+        batch_size=config.embedding_batch_size,
+        ort_variant=config.embedding_ort_variant,
+    )
+    Handler.config = config
+    Handler.db = db
+    Handler.embedder = embedder
+    Handler.regen_event = regen_event
+    set_llm_usage_recorder(db.record_llm_usage)
+    Handler._rebuild_cold_deck()
+    Handler.warm_recent_users()
+
+    # Start regen thread
+    t = threading.Thread(target=regen_loop, args=(config, regen_event, db), daemon=True)
+    t.start()
+    threading.Thread(
+        target=hot_refresh_loop, args=(config, db), name="hot-refresh", daemon=True
+    ).start()
+
+    # Start HTTP server
+    server_host = "127.0.0.1"
+    app = create_app(Handler)
+    logging.info("Serving on http://%s:%d", server_host, config.server_port)
+    try:
+        app.run(
+            host=server_host,
+            port=config.server_port,
+            threaded=True,
+            use_reloader=False,
+        )
+    except KeyboardInterrupt:
+        logging.info("Shutting down...")
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    main()

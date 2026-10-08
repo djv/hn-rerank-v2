@@ -1,0 +1,89 @@
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path.cwd()))
+from scripts.compare_eval_scores import Fold, METRICS, _report
+
+ROOT = Path('/tmp/hn-one-classifier-20261007')
+FIELDS = ('auc_up_vs_rest', 'known_upvote_fraction_at_12', 'known_downvote_fraction_at_12', 'ndcg_at_12')
+
+def read(name: str) -> dict:
+    return json.loads((ROOT / f'{name}.json').read_text())
+
+def means(data: dict) -> dict:
+    return {k: {m: v['mean']['raw'][m] for m in FIELDS} for k, v in data['variants'].items()}
+
+def contender(data: dict) -> str:
+    return next(k for k in data['variants'] if k != 'production')
+
+def paired(names: list[str], controls: list[str], *, remove_titles: bool = False, exact_control: bool = True, bootstrap: bool = True) -> dict:
+    folds = []
+    seen: set[int] = set()
+    up, down = [0, 0], [0, 0]
+    excluded = 0
+    ndcg = [[], []]
+    for name, control in zip(names, controls, strict=True):
+        report = read(name)
+        variant = contender(report)
+        metadata = report.get('one_classifier_experiment', report.get('single_model_experiment', {}))
+        audits = metadata.get('scoring_timings', metadata.get('title_audits', []))
+        title_map = {tuple(a['candidate_ids']): set(a.get('title_overlap_ids', a.get('overlap_ids', []))) for a in audits}
+        for row, base in zip(read(name+'-scores')['folds'], read(control+'-scores')['folds'], strict=True):
+            assert row['ids'] == base['ids'] and row['labels'] == base['labels'], (name, 'pool mismatch')
+            if exact_control:
+                assert row['scores']['production'] == base['scores']['production'], (name, 'control changed')
+            assert not seen.intersection(row['ids']), (name, 'repeated test IDs')
+            seen.update(row['ids'])
+            labels = np.asarray(row['labels'])
+            assert (labels >= 0).all()
+            keep = np.ones(len(labels), dtype=bool)
+            if remove_titles:
+                key = tuple(row['ids'])
+                assert key in title_map, (name, 'missing title audit')
+                keep = np.array([i not in title_map[key] for i in row['ids']])
+                excluded += int((~keep).sum())
+            labels = labels[keep]
+            assert len(labels) >= 12 and (labels == 2).any() and (labels != 2).any()
+            scores = (np.asarray(base['scores']['production'], dtype=float)[keep], np.asarray(row['scores'][variant], dtype=float)[keep])
+            positive = labels == 2
+            discounts = 1 / np.log2(np.arange(2, 14))
+            ideal = discounts[:min(12, int(positive.sum()))].sum()
+            for i, score in enumerate(scores):
+                order = np.argsort(-score, kind='stable')[:12]
+                up[i] += int(positive[order].sum())
+                down[i] += int((labels[order] == 0).sum())
+                ndcg[i].append(float((positive[order] * discounts).sum() / ideal))
+            folds.append(Fold(f'{name}-{row["fold"]}', positive, scores))
+    result = _report(folds, 3000, 20000, np.random.default_rng(20261007)) if bootstrap else {
+        metric: {'base': float(np.mean([fn(f.scores[0], f.positive) for f in folds])), 'delta': float(np.mean([fn(f.scores[1], f.positive)-fn(f.scores[0], f.positive) for f in folds]))} for metric, fn in METRICS.items()
+    }
+    result.update(folds=len(folds), unique_test_stories=len(seen), excluded_title_overlap=excluded, top12_upvotes=up, top12_downvotes=down, ndcg_at_12=[float(np.mean(v)) for v in ndcg], controls=controls, names=names, bootstrap_draws=3000 if bootstrap else 0, block_draws=20000 if bootstrap else 0)
+    return result
+
+summary = {'initial_screen': read('broad-summary'), 'feature_ablations': {}, 'native_checks': {}, 'title_sensitivity': {}, 'embedding_screens': {}, 'embedding_selected': read('broad-embedding-selected'), 'interpretation': 'Exploratory retrospective tradeoffs; selection reused labels; no production recommendation or equivalence claim.'}
+for feature in ('numeric', 'words', 'embedding_words', 'metadata_words'):
+    name = 'broad-feature-'+feature
+    summary['feature_ablations'][feature] = {'metrics': means(read(name)), 'paired': paired([name], ['screen-linear'], bootstrap=False)}
+for family in ('adapter', 'svm'):
+    names = [f'broad-check-{family}-{p}' for p in ('development', 'fresh')]
+    controls = [f'check-linear-{p}' for p in ('development', 'fresh')]
+    summary['native_checks'][family] = paired(names, controls)
+    summary['native_checks'][family]['periods'] = {p: means(read(n)) for p,n in zip(('development', 'fresh'),names,strict=True)}
+    summary['title_sensitivity'][family] = paired(names, controls, remove_titles=True)
+    print(f'{family} paired checks done', flush=True)
+for path in sorted(ROOT.glob('broad-embedding-*.json')):
+    if path.name.endswith('-scores.json') or path.stem in ('broad-embedding-selected','broad-embedding-reserved'):
+        continue
+    report = read(path.stem)
+    if 'variants' not in report:
+        continue
+    summary['embedding_screens'][path.stem] = {'metrics_under_own_encoder': means(report), 'paired_against_existing_blend': paired([path.stem], ['screen-embedding-stored-gemma1'], exact_control=path.stem=='broad-embedding-stored-gemma1', bootstrap=False)}
+label = summary['embedding_selected']['label']
+summary['matched_selected_check'] = paired(['broad-embedding-'+label, 'broad-embedding-reserved'], ['screen-embedding-stored-gemma1', 'check-embedding-confirmation'], exact_control=label=='stored-gemma1')
+(ROOT/'broad-final-summary.json').write_text(json.dumps(summary, indent=2, allow_nan=False)+'\n')
+print('broader paired summaries complete', flush=True)

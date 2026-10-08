@@ -7314,6 +7314,42 @@ def test_fill_best_match_titles_happy_path() -> None:
     assert [r.best_match_sim for r in out] == pytest.approx([0.9, 0.8, 0.9])
 
 
+def test_related_upvotes_are_bounded_distinct_and_centered() -> None:
+    rng = np.random.default_rng(42)
+    pool = _f2_unit(rng, 80)
+    candidate = pool[0]
+    ups = np.vstack([candidate, candidate, candidate, -candidate]).astype(np.float32)
+    ctx = ranking.RankScoreContext(
+        cand_closest_up=np.ones(len(pool), dtype=np.float32),
+        cand_closest_up_idx=np.zeros(len(pool), dtype=np.int64),
+        fb_up_titles=["First", "First", "Second", "Unrelated"],
+        fb_up_embeddings=ups,
+    )
+    cands = [_f2_story(i + 10) for i in range(len(pool))]
+    deck = ranking._fill_best_match_titles(_f2_ranked([10]), cands, ctx, pool)
+    item = deck.window("1w").recommended[0]
+    assert [title for title, _ in item.related_upvotes] == ["First", "Second"]
+    assert all(sim == pytest.approx(1.0) for _, sim in item.related_upvotes)
+
+
+def test_ranking_factors_use_signed_weighted_midpoint_deviation() -> None:
+    from pipeline.linear_blend import BlendComponent
+
+    factors = ranking.ranking_factor_text(
+        [
+            BlendComponent("Base", 0.5, np.array([0.8], dtype=np.float32)),
+            BlendComponent("Content", 0.2, np.array([0.1], dtype=np.float32)),
+            BlendComponent("Words", 0.3, np.array([0.5], dtype=np.float32)),
+            BlendComponent("Disabled", 0.0, np.array([1.0], dtype=np.float32)),
+        ],
+        0,
+    )
+    assert len(factors) == 3
+    assert factors[0].startswith("Helped: Base") and "50%" in factors[0]
+    assert factors[1].startswith("Hurt: Content") and "20%" in factors[1]
+    assert factors[2].startswith("Neutral: Words")
+
+
 def test_attribution_skips_matches_that_only_share_the_pool_direction() -> None:
     """Long texts share a direction in the pool, so unrelated stories can
     match closely (a ghc-debug post and an AINews digest: 0.64). A card
@@ -7354,6 +7390,7 @@ def test_attribution_skips_matches_that_only_share_the_pool_direction() -> None:
     deck = ranking._fill_best_match_titles(_f2_ranked([10, 11]), cands, ctx, cand_emb)
     out = list(deck.window("1w").recommended)
     assert [r.best_match_title for r in out] == ["", "Related post"]
+    assert out[0].related_upvotes == ()
     # The named upvote and its similarity are the raw ones.
     assert out[1].best_match_sim == pytest.approx(raw[1])
 
@@ -7371,7 +7408,13 @@ def test_badged_cards_name_an_upvote_only_on_a_close_match() -> None:
             score=1.0,
             best_match_title=f"Up {sid}",
             best_match_sim=sim,
-            **flags,
+            related_upvotes=((f"Up {sid}", sim),),
+            is_hot=flags.get("is_hot", False),
+            is_high_engagement=flags.get("is_high_engagement", False),
+            is_discussion_rich=flags.get("is_discussion_rich", False),
+            is_uncertain=flags.get("is_uncertain", False),
+            is_interest=flags.get("is_interest", False),
+            is_novel=flags.get("is_novel", False),
         )
 
     weak, close = 0.7, 0.9
@@ -7403,6 +7446,15 @@ def test_badged_cards_name_an_upvote_only_on_a_close_match() -> None:
         5: "Up 5",
         6: "",
         7: "",
+    }
+    assert {story.id: story.related_upvotes for story in feed.stories} == {
+        1: [],
+        2: ["Up 2"],
+        3: ["Up 3"],
+        4: [],
+        5: ["Up 5"],
+        6: [],
+        7: [],
     }
 
 

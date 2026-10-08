@@ -1,0 +1,35 @@
+from __future__ import annotations
+import json
+import sys
+import time
+from pathlib import Path
+sys.path.insert(0, "/home/d/code/hn-rerank")
+import numpy as np
+import openvino as ov
+from database import Story
+from pipeline.ranking import story_embedding_text
+from pipeline.side_embeddings import SIDE_PREFIX
+from scripts.bakeoff_embedding_models import _encode
+from scripts.encode_replay_embeddings import _save
+
+ids = frozenset(json.loads(Path("/tmp/hn-single-cohort-20261007.json").read_text()))
+stories = [Story(**row) for row in json.loads(Path("/tmp/hn-single-feedback-20261007.json").read_text()) if row["id"] in ids]
+assert len(stories) == len(ids) == 3234
+model_dir = Path("/home/d/.cache/huggingface/hub/models--onnx-community--embeddinggemma-300m-ONNX/snapshots/5090578d9565bb06545b4552f76e6bc2c93e4a66")
+spec = "onnx-community/embeddinggemma-300m-ONNX|sentence|256|prefix='task: classification | query: '|title_only=False|section=None|split_body_tokens=None|chunk_tokens=None|max_chunks=8|device=gpu"
+print("GPU device:", ov.Core().get_property("GPU", "FULL_DEVICE_NAME"), flush=True)
+print("Frozen feedback cohort:", len(stories), flush=True)
+vectors = []
+started = time.perf_counter()
+for start in range(0, len(stories), 100):
+    piece = stories[start:start + 100]
+    encoded, seconds = _encode([SIDE_PREFIX + story_embedding_text(s) for s in piece], tokenizer_dir=str(model_dir), model_path=Path("/tmp/hn-gemma256-gpu-model/model.onnx"), pooling="sentence", max_tokens=256, batch_size=4, device="gpu")
+    vectors.append(encoded)
+    result = np.concatenate(vectors)
+    assert np.isfinite(result).all()
+    np.testing.assert_allclose(np.linalg.norm(result, axis=1), 1.0, atol=1e-5)
+    _save(Path("/tmp/hn-gemma256-gpu-20261007.npz"), stories[:len(result)], result, spec)
+    elapsed = time.perf_counter() - started
+    eta = elapsed / len(result) * (len(stories) - len(result))
+    print(f"CHECKPOINT {len(result)}/{len(stories)} elapsed={elapsed:.1f}s eta={eta:.1f}s", flush=True)
+print("GPU encoding complete", flush=True)

@@ -1,0 +1,8 @@
+error[invalid-assignment]: Object of type `def observed_call(cfg: LlmProviderConfig, *, prompt: str, max_tokens: int, on_usage: ((str, int | None, int | None, int | None, /) -> None) | None = None) -> CoroutineType[Any, Any, LlmChatResult]` is not assignable to attribute `_call_llm_once` of type `def _call_llm_once(cfg: LlmProviderConfig, *, prompt: str, max_tokens: int, on_usage: ((str, int | None, int | None, int | None, /) -> None) | None = None) -> CoroutineType[Any, Any, LlmChatResult]`
+  --> scripts/inspect_tldr_failures.py:86:5
+   |
+86 |     server._call_llm_once = observed_call
+   |     ^^^^^^^^^^^^^^^^^^^^^
+   |
+
+Found 1 diagnostic

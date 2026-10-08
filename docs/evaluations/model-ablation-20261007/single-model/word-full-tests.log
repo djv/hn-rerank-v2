@@ -1,0 +1,134 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0
+rootdir: /home/dev/hn-why-preview-20261007
+configfile: pyproject.toml
+plugins: anyio-4.14.0, hypothesis-6.165.10, asyncio-1.4.0, xdist-3.8.0
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+created: 4/4 workers
+4 workers [1129 items]
+
+........................................................................ [  6%]
+........................................................................ [ 12%]
+........................................................................ [ 19%]
+........................................................................ [ 25%]
+........................................................................ [ 31%]
+........................................................................ [ 38%]
+........................................................................ [ 44%]
+........................................................................ [ 51%]
+........................................................................ [ 57%]
+........................................................................ [ 63%]
+........................................................................ [ 70%]
+........................................................................ [ 76%]
+........................................................................ [ 82%]
+........................................................................ [ 89%]
+........................................................................ [ 95%]
+..........................F......................                        [100%]
+=================================== FAILURES ===================================
+_______ test_word_kernel_uses_serving_database_order_and_keeps_baseline ________
+[gw1] linux -- Python 3.12.3 /home/dev/hn-why-preview-20261007/.venv/bin/python
+
+    def test_word_kernel_uses_serving_database_order_and_keeps_baseline() -> None:
+        from database import Database
+    
+        db = Database(":memory:")
+        actual = [
+            word_story(i, "shared apple" if i < 2 else "shared rocket") for i in range(4)
+        ]
+        labels = [0, 0, 2, 2]
+        candidates = [word_story(10, "shared apple"), word_story(11, "shared rocket")]
+        fold = evaluator.FoldData(
+            candidates=candidates,
+            cand_emb=np.zeros((2, 2)),
+            train_stories=list(reversed(actual)),
+            test_stories=candidates,
+            test_actions=np.array([0, 2]),
+            train_vote_times=np.ones(4),
+            x_train_base=np.zeros((4, 2)),
+            x_cand_base=np.zeros((2, 2)),
+            y_train=np.array(list(reversed(labels))),
+            tier2_scores=np.zeros(2),
+            runtime_db=db,
+        )
+        base = Config()
+        single = replace(
+            base,
+            model=replace(
+                base.model, linear_blend_enabled=False, deduplicate_training_feedback=False
+            ),
+        )
+        original_factory = ranking.PrecomputedRbfSVC
+        routed = []
+    
+        def score(
+            fold: evaluator.FoldData, config: Config, source_db: Database | None = None
+        ) -> tuple[np.ndarray, None]:
+            assert fold.runtime_db is db
+            if config.model.linear_blend_enabled:
+                assert ranking.PrecomputedRbfSVC is original_factory
+            else:
+                model = ranking.PrecomputedRbfSVC(c=4, gamma=0.03, chunk_size=2)
+                assert isinstance(model, SingleKernelSVC)
+                assert model.lexical is not None
+                assert model.lexical.training_ids == tuple(s.id for s in actual)
+                assert model.lexical.labels == tuple(labels)
+                routed.append(model)
+            return np.zeros(2), None
+    
+        def evaluate(argv: list[str]) -> None:
+            evaluator._production_scores(fold, base)
+            evaluator._production_scores(fold, single)
+    
+        try:
+            with (
+                patch.object(
+                    Database,
+                    "get_feedback_for_training",
+                    return_value=(actual, labels, [1.0] * 4),
+                ),
+                patch.object(evaluator, "_production_scores", score),
+                patch.object(evaluator, "main", evaluate),
+            ):
+>               run_evaluation([], KernelSpec("rbf", word_c=1))
+
+tests/test_single_preference_model.py:268: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+scripts/eval_single_preference_model.py:286: in run_evaluation
+    evaluator.main(list(argv))
+tests/test_single_preference_model.py:255: in evaluate
+    evaluator._production_scores(fold, base)
+/usr/lib/python3.12/unittest/mock.py:1134: in __call__
+    return self._mock_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/unittest/mock.py:1138: in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/unittest/mock.py:1199: in _execute_mock_call
+    result = effect(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+fold = FoldData(candidates=[Story(id=10, title='shared apple', url='', score=1, time=1, text_content='', source='hn', comment...in_emb=None, runtime_db=<database.Database object at 0x7e8ef5e42420>, similarities={}, test_vote_times=None, slices={})
+config = Config(db_path='hn_rewrite.db', days=30, count=40, onnx_model_dir='/home/dev/hn-rewrite/shared/mxbai-embed-xsmall-v1',...ine_threshold=0.87, dedup_exclude_actions=('up', 'neutral')), rss=RssConfig(enabled=True, per_feed_limit=70, feeds=()))
+source_db = None
+
+    def score(
+        fold: evaluator.FoldData, config: Config, source_db: Database | None = None
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        no_dense = (
+            not config.model.linear_blend_enabled
+            or config.model.linear_blend_dense_weight == 0.0
+        )
+        if not no_dense or (
+            spec.family == "rbf" and spec.score_form == "ovr" and spec.word_c == 0
+        ):
+            return original_score(fold, config, source_db)
+        if not config.model.svm_precomputed_enabled:
+>           raise ValueError(
+                "experimental kernels require svm_precomputed_enabled=true"
+            )
+E           ValueError: experimental kernels require svm_precomputed_enabled=true
+
+scripts/eval_single_preference_model.py:248: ValueError
+=========================== short test summary info ============================
+FAILED tests/test_single_preference_model.py::test_word_kernel_uses_serving_database_order_and_keeps_baseline
+================== 1 failed, 1128 passed, 1 skipped in 31.97s ==================

@@ -69,7 +69,15 @@ def _ranked(db: Database) -> list[RankedStory]:
             article_body=f"Body of story {i}. " * 20,
         )
         db.upsert_story(story)
-        ranked.append(RankedStory(story, score=1.0 - i / 50, best_match_title=""))
+        ranked.append(
+            RankedStory(
+                story,
+                score=1.0 - i / 50,
+                best_match_title="",
+                related_upvotes=(("An upvote <b>literal</b>", 0.99),),
+                ranking_factors=("Helped: Content model", "Hurt: Word model"),
+            )
+        )
     return ranked
 
 
@@ -210,6 +218,24 @@ def test_dashboard_page_end_to_end(page: Any) -> None:
     # Titles are text, never markup.
     assert "<b>not bold</b>" in page.locator(".story-card").first.inner_text()
     assert page.locator(".story-card b").count() == 0
+    why = page.locator(".story-card.active .story-why")
+    assert why.get_attribute("open") is None
+    why.locator("summary").click()
+    assert "learned preferences" in why.inner_text()
+    assert "An upvote <b>literal</b>" in why.inner_text()
+    assert "Helped: Content model" in why.inner_text()
+    page.click('.tab-btn[data-sort="popular"]')
+    popular_why = page.locator(".story-card.active .story-why")
+    if popular_why.get_attribute("open") is None:
+        popular_why.locator("summary").click()
+    assert (
+        "points and age" in page.locator(".story-card.active .story-why").inner_text()
+    )
+    assert (
+        "Hurt: Word model"
+        not in page.locator(".story-card.active .story-why").inner_text()
+    )
+    page.click('.tab-btn[data-sort="recommended"]')
 
     # Votes hide the story and advance; the feed goes stale; undo restores.
     page.keyboard.press("1")
@@ -321,9 +347,14 @@ def test_count_only_poll_updates_header_and_preserves_summary_sections(
             window.__keptDetails = window.__keptSummary.querySelector('details');
         }"""
     )
-    page.locator(".story-card.active details > summary").first.click()
+    page.locator(
+        ".story-card.active .tldr-detail-content details > summary"
+    ).first.click()
     assert (
-        page.locator(".story-card.active details").first.get_attribute("open") is None
+        page.locator(
+            ".story-card.active .tldr-detail-content details"
+        ).first.get_attribute("open")
+        is None
     )
     counts = [5]
     page.route(
@@ -357,8 +388,8 @@ def test_count_only_poll_updates_header_and_preserves_summary_sections(
         """() => ({
             sameCard: activeCard() === window.__keptCard,
             sameSummary: activeCard().querySelector('.tldr-detail-content') === window.__keptSummary,
-            sameDetails: activeCard().querySelector('details') === window.__keptDetails,
-            detailsOpen: activeCard().querySelector('details').open,
+            sameDetails: activeCard().querySelector('.tldr-detail-content details') === window.__keptDetails,
+            detailsOpen: activeCard().querySelector('.tldr-detail-content details').open,
             active: activeId,
             header: activeCard().querySelector('.story-header').textContent,
         })"""
@@ -385,6 +416,6 @@ def test_count_only_poll_updates_header_and_preserves_summary_sections(
         "() => activeCard().querySelector('.tldr-detail-content').textContent.includes('Replacement summary')"
     )
     assert page.evaluate(
-        "() => activeCard().querySelector('details') !== window.__keptDetails"
+        "() => activeCard().querySelector('.tldr-detail-content details') !== window.__keptDetails"
     )
     assert page.problems == []

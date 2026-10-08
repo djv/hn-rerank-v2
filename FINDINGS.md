@@ -1,5 +1,193 @@
 # HN Rerank findings
 
+## Broader one-classifier evaluation — 2026-10-07
+
+Completed the fixed classifier/feature/encoder screen on the laptop.
+One joined logistic classifier (C4, numeric scale sqrt(.1/4), embedding
+weight16, P(up)-P(down)) improves twelve-block retrospective AUC
+.8182→.8295, with97 vs94 top-12 upvotes but6 vs2 downvotes /144.
+Story/block AUC intervals for the +.01125 delta are [.00443,.01801] /
+[.00123,.02281]; the exact block sign-flip p is .0654. Selection labels
+were reused and uncertainty does not account for the whole search.
+User requested tradeoffs only; no production classifier change selected.
+
+Dropping metadata from the same joined classifier improves four-fold
+development AUC .8191→.8214,37→40 upvotes and2→1 downvotes /48.
+The subsequent twelve-block check below shows mixed results. Measured block
+norms (~1 embeddings versus~8.6 standardized metadata) describe scale,
+not predictive importance. Metadata similarities still derive from
+embeddings when the raw embedding block is removed.
+
+Fourteen encoders/input combinations used the same3,234 hash-matched
+cohort. Stored mxbai+Gemma1-128 retained the highest development AUC;
+new BGE/Granite inputs and Gemma256 did not dominate. Its seven-block
+joined-classifier check gives62 vs55 upvotes /84,2 vs1 downvotes and
+AUC delta +.01139. Controls/pools/labels match exactly. Ten exact
+train/test title overlaps excluded from the native comparison leave
+logistic AUC delta +.01125; shuffled-label AUC .5109/.5304 is near chance.
+These limited checks do not rule out later-content or semantic-duplicate
+bias. Local suite1,120 passed /18 skipped; Ruff/format pass and ty has
+only the prior unrelated inspection-script diagnostic. Independent
+Opus5.5 review found no leakage/scoring bug in executed paths; its focused
+correction review found no implementation blocker. The CLI period-label
+collision is fixed,40 focused tests cover the missing branches, and all
+four old-driver reruns reproduce every challenger/control score exactly.
+Source/config/orchestration/frozen DB/replay hashes remained unchanged.
+[Report and artifacts](docs/evaluations/model-ablation-20261007/BROAD-ONE-CLASSIFIER.md).
+
+The user subsequently selected twelve-block feature removals, now complete:
+no words AUC .8319,97 upvotes/6 downvotes /144, NDCG@12 .6697;
+no metadata .8203,98/5, NDCG .7094; selected all-feature classifier
+.8295,97/6, NDCG .6944; production .8182,94/2, NDCG .6656.
+No-word counts match but liked stories move later in the top12; no-metadata
+recent AUC drops .8366→.8064 while top12 likes rise23→26. Confidence
+intervals against the selected classifier include zero for both AUC and
+precision deltas. Reused-label search remains exploratory, without a
+production choice. Updated full gate1,128 passed /18 skipped; Ruff and
+all21 touched Python format checks pass; only the prior ty diagnostic.
+[Feature-removal report](docs/evaluations/model-ablation-20261007/FEATURE-REMOVALS.md).
+
+## Kagi News World feed — 2026-10-07
+
+Added `https://news.kagi.com/world.xml` to the configured RSS feeds at the
+user's request. VPS check: TOML parses, URL occurs once in the feed list,
+live HTTP succeeds, and `feedparser` reads 12 entries with titles and links
+without a malformed-feed error. Feed title is `Kagi News - World`.
+User authorized deployment. VPS production received only the one-line feed
+addition; `hn_rewrite.service` restarted successfully (MainPID 3285264).
+Dashboard smoke check returned HTTP 200 after startup; logs show cold-deck
+rebuild and the background regeneration loop starting normally. The feed
+entered the candidate pool through ordinary regeneration: 12 Kagi items.
+Read-only personalized scoring put the strongest three around .355/.331/.316
+(ranks 7,227/7,552/7,768 of 11,024); none reached the top deck. Scores are
+ranking values, not calibrated probabilities.
+
+## Clearer model names — 2026-10-07
+
+User requested the names Nonlinear preference model (base/RBF SVM) and
+Linear preference model (dense logistic regression). Changed the shared
+component labels in `pipeline/linear_blend.py`, which supply Web and TUI.
+Word preference model remains enabled. No score, weight, algorithm, or
+wire-field changes. ARCHITECTURE and WORKLOG describe the new names.
+VPS focused tests: 10 passed; full backend: 1,111 passed / 1 skipped;
+Ruff, changed-Python formatting and ty clean. Ephemeral preview/research
+helper scripts were excluded from repository lint/type checks.
+Restarted only `hn-why-preview-20261007.service`; the existing isolated DB
+and votes were retained. Live ready feed shows Nonlinear (50%), Linear (20%),
+and Word (30%) factors, with no old names; dashboard HTTP 200. Production
+checkout remains clean and MainPID remains 2641092. Preview startup emitted
+the usual optional-PyTorch tokenizer warning, without a model-fit failure.
+
+## Removing blend components — 2026-10-07
+
+User asked whether the three models actually improve metrics. Ran all three
+leave-one-out variants and all three single-model variants on the VPS, using
+an isolated, read-only production snapshot, current stored + Gemma vectors,
+and four expanding chronological blocks of 698 votes since October 2
+(695 candidates after URL isolation, 92 ups). No tuning or production changes.
+
+Full blend: top-12 upvotes 23/48, downvotes 1/48, AUC .82037.
+Remove word: 24/48, 1/48, .82725; remove base: 22/48, 3/48, .80767;
+remove content: 20/48, 3/48, .81509. Remaining weights were renormalized.
+No removal preserves the ordering. Removing word is the clearest recent-vote
+simplification candidate, but four blocks do not establish equivalence:
+its paired AUC improvement +.00688 has a story-bootstrap 95% interval
+[-.00450, +.01782], and P@12 +.02083 has [-.06250, +.12500].
+Base-only AUC is nearly identical but top-12 downvotes triple; content-only
+matches remove-word upvote count and improves AUC, with worse NDCG and more
+downvotes than the full blend. Neither proves all models are necessary.
+
+Full metrics, paired uncertainty, provenance, exact variants and reproducible
+command: [ablation evidence](docs/evaluations/model-ablation-20261007/README.md).
+The zero-weight variants still fit both linear models; compute savings were
+not measured. The original Why-this-story preview remains running.
+
+User selected "Broader evaluation". Eight additional historical judged blocks
+(August 23–September 30) reverse the recent-vote direction: full blend vs
+without word is 71/96 vs 69/96 top-12 upvotes, AUC .81713 vs .81074.
+All twelve judged blocks: 94/144 vs 93/144 upvotes, .81821 vs .81624 AUC,
+and 2/144 vs 4/144 downvotes. A recent exposure-proxy pool adds 176
+shown-but-unvoted stories: full vs no-word is 22/48 vs 23/48 upvotes,
+up-vs-all AUC .83048 vs .83639. That pool reuses recent votes and is not
+four additional independent blocks. Effect is small and period-dependent;
+no consistent gain from removing word or proof of equivalence. Details and
+paired artifacts: [broader study](docs/evaluations/model-ablation-20261007/BROADER.md).
+The twelve judged blocks cover 2,231 disjoint held-out story IDs from the
+same checksum-verified snapshot. Without-word AUC delta -.00197 has 95%
+story/bootstrap interval [-.00736, +.00349], block interval [-.01008, +.00767].
+P@12 delta -.00694 has story interval [-.05556, +.05556]. Aggregate metrics
+are close, but neither equivalence nor an improvement is established.
+Production and the user's existing preview ranking were left unchanged.
+
+## Why this story evidence and model effects — 2026-10-07
+
+User chose an evidence panel, then "What helped or hurt". The web card
+has a native details expander; TUI `w` replaces the summary with the panel,
+and Escape restores it. Each explains its active feed, related upvotes,
+badge signals, and (when available and outside Popular) actual blend terms.
+
+Model effects use the very same percentile arrays used to calculate the
+score: base ranking, dense preference model, and TF-IDF word model. Actual
+effective blend weights include the configured ramp. Helped/hurt is measured
+against replacing a term with percentile 0.5; order uses absolute weighted
+deviation. This does not identify a causal keyword/vote, explain discovery
+selection, or explain Explore's shuffled position. Disabled blend terms
+are omitted; decks without the blend retain the other evidence.
+
+Additional upvotes are deck-only top-three neighbours, deduplicated by
+title, subject to raw and centered similarity floors. Existing single
+attribution is preserved. All attribution pairs share one centering pass;
+badged cards retain the stricter raw floor. Optional `related_upvotes` and
+`ranking_factors` wire fields default empty and ignore unknown keys on older
+clients. Terminal text is sanitized and Markdown-escaped; web text uses
+textContent. No new dependency, LLM request, or schema change.
+
+Verified so far:
+- Initial full backend gate: 1,090 passed / 18 skipped before model effects.
+- Updated focused backend: 208 passed / 18 skipped before the final extra
+  integration case. TUI panel and boundary cases: 10 passed.
+- Real headless-Chrome page suite: 2 passed against an isolated fixture
+  server, with outbound requests blocked. A broad old `details` selector
+  needed TLDR scoping after the new expander; one intermediate combined
+  run also failed section preservation, then the scoped standalone and
+  combined reruns passed. No production-browser session was used.
+- Ruff and formatting pass; repository `ty` retains exactly its existing
+  diagnostic at untracked scripts/inspect_tldr_failures.py:86.
+- VPS checkout is clean at 3475235, service active. `git apply --check`
+  accepts the six-file runtime patch. No patch, restart, or production
+  smoke test has yet occurred. No production DB was accessed by this work.
+
+Final backend gate: 1,093 passed / 18 skipped at `-n 4` under `batch`
+(147.55s with the shared two-CPU budget). Full TUI results and deployment
+decision remain pending.
+
+### Private preview and temporary VPS compute preference
+
+User requested testing without deployment, selected Web, and asked that
+tests/heavy work run on the VPS for 3–4 hours (2026-10-07 19:31–23:31 UTC).
+The agent stopped its laptop TUI-test scope and verified all nine pytest
+processes exited. The interrupted full TUI run is not a completed gate.
+
+Separate VPS checkout: /home/dev/hn-why-preview-20261007. A transient
+hn-why-preview-20261007.service runs its private preview on 127.0.0.1:8767
+with a one-CPU quota, 3G memory cap, and library threads set to one.
+The temporary script is .preview-server.py; .preview-batch caps test jobs
+at two CPUs and 3G. The system /usr/bin/batch is atd, so it was not used.
+The preview backs up the live DB through SQLite's read-only connection into
+.preview-state/preview.db, changes only copied user 151's token to a local
+test token, and runs the current ranker. It does not start regen threads;
+detail requests read copied cached summaries without LLM calls. Votes and
+reranks affect only the preview snapshot. Production checkout/service are
+untouched. The SSH forward is the agent-owned local session 17013.
+
+Verified through laptop localhost: profile import and dashboard GET succeed;
+1w feed is ready, 47 stories have model factors, and 21 have related upvotes.
+Example weights reflect this actual run: base 50%, content 20%, words 30%.
+The user can open http://127.0.0.1:8767/u/local-why-preview and expand
+Why this story. Keep the preview and tunnel running while it is being tested.
+Full TUI gate on VPS: 172 passed / 1 skipped in 51.63s. Standalone lint and
+types passed locally before the user's temporary VPS-only constraint.
+
 ## TUI sharing and Reddit feed replacement priority — 2026-10-07
 
 ### Installation and verification
@@ -2649,3 +2837,23 @@ OpenVINO, matched by ONNX name). Evidence:
   fix only makes Gemma 2 fast. One-node repro (onnxruntime rotates, OpenVINO
   returns the input): `gpu-debug-20261007/min_repro.py`. Not reported upstream
   (user 2026-10-07: keep it local).
+# 2026-10-07 Laptop TUI public connection incident
+
+At 22:08 ET, the saved TUI server's public Funnel endpoint on port8443
+failed during TLS setup while the production application, Caddy and private
+Tailscale route responded. The laptop profile was not modified. A proposed
+temporary localhost production tunnel was stopped after the user clarified
+that the TUI must work without Tailscale; its SSH process exited255.
+Reapplied the existing8443 Funnel root handler, preserving other routes,
+and restarted VPS tailscaled. By22:12 ET, the unchanged saved profile fetched
+46 stories over public HTTPS and five independent authenticated requests
+returned200; a normal public curl request also returned200. Two advertised
+public edge IPs still failed when individually forced, so provider-edge
+health was not fully restored at that check. By22:21 ET, all three advertised
+public edges returned200 when individually forced from both VPS and laptop.
+The VPS logs show internal ingress TCP drops with no matching rule; the
+exact cause remains unconfirmed. IPv6 is disabled by an existing September14
+sysctl file; it was left unchanged and is not established as the cause.
+No production app code or profile credentials were changed. Anonymous
+diagnostic dashboard requests can create profiles; signup counts from this
+incident must not be interpreted as organic users.

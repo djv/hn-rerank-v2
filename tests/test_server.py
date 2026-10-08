@@ -5173,7 +5173,7 @@ async def test_generate_detailed_tldr_returns_stub_when_no_content(
     assert result.kind == "no_content"
 
 
-def test_keydown_guard_excludes_buttons_and_anchors():
+def test_keydown_guard_excludes_buttons_and_anchors() -> None:
     """Regression: the global keydown handler in static/dashboard.js must not
     bail out when a <button> or <a> has focus, otherwise clicking a mode tab
     or vote button blocks the next ArrowUp/ArrowDown from registering.
@@ -5194,6 +5194,8 @@ def test_keydown_guard_excludes_buttons_and_anchors():
     assert "textarea" in guard, "textarea should still block"
     assert "select" in guard, "select should still block"
     assert '[contenteditable="true"]' in guard, "contenteditable should still block"
+    # The native Why-this-story expander participates in keyboard navigation.
+    assert "summary" not in guard, "summary should not block global shortcuts"
 
 
 def test_extract_lesswrong_post_id():

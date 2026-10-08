@@ -491,6 +491,10 @@
       overflow-wrap: anywhere;
     }
 
+    .story-why { font-style: normal; }
+    .story-why > summary { cursor: pointer; }
+    .story-why p, .story-why ul { margin: 0.5rem 0; }
+
     .feedback-group {
       display: inline-flex;
       gap: 0.2rem;
@@ -1189,6 +1193,8 @@
         if (!card) {
           card = feedCard(story, feed.version);
           cardEls.set(story.id, card);
+        } else {
+          patchCardMetadata(story, feed.version);
         }
         if (!card.isConnected) storiesContainer.insertBefore(card, queueLoadingEl);
       }
@@ -1375,6 +1381,45 @@
         reason.textContent = `Because you upvoted: ${story.best_match_title}`;
         card.appendChild(reason);
       }
+      const why = document.createElement('details');
+      why.className = 'story-why match-reason';
+      const toggle = document.createElement('summary');
+      toggle.textContent = 'Why this story';
+      why.appendChild(toggle);
+      const paragraph = text => {
+        const p = document.createElement('p');
+        p.textContent = text;
+        why.appendChild(p);
+      };
+      paragraph({
+        recommended: "Recommended orders stories by the model's learned preferences from your votes.",
+        popular: 'Popular orders eligible HN stories by points and age; older stories lose weight.',
+        explore: 'Explore offers discovery picks, including unfamiliar stories and interests Recommended misses. Its order is shuffled.',
+      }[currentSort]);
+      if (currentSort !== 'popular' && story.ranking_factors?.length) {
+        paragraph('What helped or hurt:');
+        for (const factor of story.ranking_factors) paragraph(factor);
+        paragraph('Helped/hurt compares each model with a middle-of-pool rating. These terms describe the model score before discovery selection or shuffle.');
+      }
+      const related = story.related_upvotes?.length ? story.related_upvotes
+        : story.best_match_title ? [story.best_match_title] : [];
+      if (related.length) {
+        paragraph('Related upvotes:');
+        const list = document.createElement('ul');
+        for (const title of related) {
+          const li = document.createElement('li');
+          li.textContent = title;
+          list.appendChild(li);
+        }
+        why.appendChild(list);
+        paragraph("These are content similarities, not a complete explanation of the model's score.");
+      } else {
+        paragraph('No close upvote match is available for this story.');
+      }
+      for (const badge of story.badge_details || []) {
+        paragraph(`${badge.label}: ${badge.tooltip}`);
+      }
+      card.appendChild(why);
       return card;
     }
 
@@ -1383,6 +1428,12 @@
       if (!card) return;
       const fresh = feedCard(story, version);
       card.replaceChild(fresh.children[0], card.children[0]);
+      const oldWhy = Array.from(card.children).find(n => n.className === 'story-why match-reason');
+      const newWhy = Array.from(fresh.children).find(n => n.className === 'story-why match-reason');
+      if (oldWhy && newWhy) {
+        newWhy.open = oldWhy.open;
+        card.replaceChild(newWhy, oldWhy);
+      }
       Object.assign(card.dataset, fresh.dataset);
     }
 

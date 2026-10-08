@@ -1,0 +1,36 @@
+{
+  "u151-gemma128.npz": {
+    "vectors": 3239,
+    "matching_feedback": 3234,
+    "dimension": 768,
+    "model": "onnx-community/embeddinggemma-300m-ONNX|sentence|128|prefix='task: classification | query: '|title_only=False|section=None|split_body_tokens=None|chunk_tokens=None|max_chunks=8|device=gpu"
+  },
+  "u151-gemma2-128.npz": {
+    "vectors": 3239,
+    "matching_feedback": 3234,
+    "dimension": 768,
+    "model": "onnx-community/embeddinggemma-2-ONNX|sentence|128|prefix='task: classification | query: '|title_only=False|section=None|split_body_tokens=None|chunk_tokens=None|max_chunks=8|device=cpu"
+  },
+  "u151-gemma2doc-128.npz": {
+    "vectors": 3239,
+    "matching_feedback": 3234,
+    "dimension": 768,
+    "model": "onnx-community/embeddinggemma-2-ONNX|sentence|128|prefix='title: none | text: '|title_only=False|section=None|split_body_tokens=None|chunk_tokens=None|max_chunks=8|device=cpu"
+  },
+  "u151-stored.npz": {
+    "vectors": 3239,
+    "matching_feedback": 3234,
+    "dimension": 384,
+    "model": "stored:mxbai-embed-xsmall-v1|mean|norm|4096"
+  },
+  "cohort": {
+    "rows": 3234,
+    "labels": {
+      "0": 1243,
+      "1": 1238,
+      "2": 753
+    },
+    "min_time": 1782882212.2489622,
+    "max_time": 1790905932.2905197
+  }
+}

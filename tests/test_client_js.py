@@ -533,6 +533,50 @@ def test_cards_render_and_log_all_applicable_badges() -> None:
     assert result["events"] == [[9, ["interest", "hot", "top", "talk"]], [10, []]]
 
 
+def test_why_story_panel_uses_view_and_literal_evidence() -> None:
+    result = _client_harness(r"""
+    currentSort = 'popular';
+    const card = feedCard(story(9, { related_upvotes: ['<b>Up A</b>', 'Up B'],
+      badge_details: [{kind: 'hot', icon: '*', label: 'Hot', tooltip: 'Rising fast'}] }), 5);
+    const panel = card.children.find(n => n.tag === 'details');
+    const text = node => (node.textContent || '') + node.children.map(text).join(' ');
+    const fallback = feedCard(story(10, {best_match_title: 'Legacy upvote'}), 5);
+    console.log(JSON.stringify({text: text(panel), summary: panel.children[0].tag,
+      fallback: text(fallback), empty: text(feedCard(story(11), 5))}));
+    """)
+    assert result["summary"] == "summary"
+    assert "points and age" in result["text"]
+    assert "<b>Up A</b> Up B" in result["text"]
+    assert "Hot: Rising fast" in result["text"]
+    assert "not a complete explanation" in result["text"]
+    assert "Legacy upvote" in result["fallback"]
+    assert "No close upvote match" in result["empty"]
+
+
+def test_why_story_refreshes_factors_and_feed_reason_without_closing() -> None:
+    result = _client_harness(r"""
+    const s = story(9, {ranking_factors: ['Helped: Content', 'Hurt: Words']});
+    const card = feedCard(s, 5); cardEls.set(9, card);
+    const panel = () => card.children.find(n => n.tag === 'details');
+    const text = node => (node.textContent || '') + node.children.map(text).join(' ');
+    panel().open = true;
+    const before = text(panel());
+    currentSort = 'popular'; patchCardMetadata(s, 6);
+    const popular = text(panel());
+    currentSort = 'recommended';
+    patchCardMetadata({...s, ranking_factors: ['Hurt: Content']}, 7);
+    console.log(JSON.stringify({before, popular, after: text(panel()), open: panel().open}));
+    """)
+    assert "Helped: Content" in result["before"] and "Hurt: Words" in result["before"]
+    assert (
+        "points and age" in result["popular"] and "Hurt: Words" not in result["popular"]
+    )
+    assert (
+        "Hurt: Content" in result["after"] and "Helped: Content" not in result["after"]
+    )
+    assert result["open"] is True
+
+
 def test_keys_match_the_terminal_client() -> None:
     """The key map runs the same actions as the TUI's bindings (plus the
     web-only f)."""

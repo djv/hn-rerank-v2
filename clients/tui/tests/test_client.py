@@ -869,6 +869,9 @@ async def test_a_opens_claude_with_story_links_else_copies_prompt(
         assert "Article: https://example.org/1" in prompt
         assert "Discussion: https://news.ycombinator.com/item?id=1" in prompt
         assert copied == []
+        assert f"Opened Claude on: {story.title}" in str(
+            app.query_one("#status", Static).content
+        )
         # No usable comments link: the prompt carries the article alone.
         bare = dataclasses.replace(story, comments_url="javascript:x")
         monkeypatch.setattr(app, "selected", lambda: bare)

@@ -1,0 +1,135 @@
+[transformers] PyTorch was not found. Models won't be available and only tokenizers, configuration and file/data utilities can be used.
+GPU device: Intel(R) UHD Graphics (iGPU)
+100/100 encoded
+full256 CHECKPOINT 100/3234 elapsed=7.4s eta=231.6s
+100/100 encoded
+full256 CHECKPOINT 200/3234 elapsed=11.9s eta=180.4s
+100/100 encoded
+full256 CHECKPOINT 300/3234 elapsed=16.3s eta=159.3s
+100/100 encoded
+full256 CHECKPOINT 400/3234 elapsed=20.2s eta=143.3s
+100/100 encoded
+full256 CHECKPOINT 500/3234 elapsed=24.9s eta=136.1s
+100/100 encoded
+full256 CHECKPOINT 600/3234 elapsed=29.9s eta=131.1s
+100/100 encoded
+full256 CHECKPOINT 700/3234 elapsed=34.4s eta=124.4s
+100/100 encoded
+full256 CHECKPOINT 800/3234 elapsed=38.8s eta=118.2s
+100/100 encoded
+full256 CHECKPOINT 900/3234 elapsed=43.6s eta=113.0s
+100/100 encoded
+full256 CHECKPOINT 1000/3234 elapsed=48.5s eta=108.4s
+100/100 encoded
+full256 CHECKPOINT 1100/3234 elapsed=54.9s eta=106.6s
+100/100 encoded
+full256 CHECKPOINT 1200/3234 elapsed=61.4s eta=104.0s
+100/100 encoded
+full256 CHECKPOINT 1300/3234 elapsed=67.4s eta=100.3s
+100/100 encoded
+full256 CHECKPOINT 1400/3234 elapsed=73.6s eta=96.4s
+100/100 encoded
+full256 CHECKPOINT 1500/3234 elapsed=79.3s eta=91.7s
+100/100 encoded
+full256 CHECKPOINT 1600/3234 elapsed=85.2s eta=87.0s
+100/100 encoded
+full256 CHECKPOINT 1700/3234 elapsed=91.1s eta=82.2s
+100/100 encoded
+full256 CHECKPOINT 1800/3234 elapsed=96.8s eta=77.1s
+100/100 encoded
+full256 CHECKPOINT 1900/3234 elapsed=102.7s eta=72.1s
+100/100 encoded
+full256 CHECKPOINT 2000/3234 elapsed=109.0s eta=67.3s
+100/100 encoded
+full256 CHECKPOINT 2100/3234 elapsed=114.8s eta=62.0s
+100/100 encoded
+full256 CHECKPOINT 2200/3234 elapsed=120.5s eta=56.6s
+100/100 encoded
+full256 CHECKPOINT 2300/3234 elapsed=126.5s eta=51.4s
+100/100 encoded
+full256 CHECKPOINT 2400/3234 elapsed=133.0s eta=46.2s
+100/100 encoded
+full256 CHECKPOINT 2500/3234 elapsed=139.2s eta=40.9s
+100/100 encoded
+full256 CHECKPOINT 2600/3234 elapsed=145.7s eta=35.5s
+100/100 encoded
+full256 CHECKPOINT 2700/3234 elapsed=152.1s eta=30.1s
+100/100 encoded
+full256 CHECKPOINT 2800/3234 elapsed=158.0s eta=24.5s
+100/100 encoded
+full256 CHECKPOINT 2900/3234 elapsed=164.3s eta=18.9s
+100/100 encoded
+full256 CHECKPOINT 3000/3234 elapsed=170.9s eta=13.3s
+100/100 encoded
+full256 CHECKPOINT 3100/3234 elapsed=176.5s eta=7.6s
+100/100 encoded
+full256 CHECKPOINT 3200/3234 elapsed=182.1s eta=1.9s
+34/34 encoded
+full256 CHECKPOINT 3234/3234 elapsed=184.1s eta=0.0s
+100/100 encoded
+title128 CHECKPOINT 100/3234 elapsed=1.0s eta=32.7s
+100/100 encoded
+title128 CHECKPOINT 200/3234 elapsed=2.2s eta=33.0s
+100/100 encoded
+title128 CHECKPOINT 300/3234 elapsed=3.4s eta=33.4s
+100/100 encoded
+title128 CHECKPOINT 400/3234 elapsed=4.6s eta=32.3s
+100/100 encoded
+title128 CHECKPOINT 500/3234 elapsed=5.7s eta=31.4s
+100/100 encoded
+title128 CHECKPOINT 600/3234 elapsed=6.9s eta=30.4s
+100/100 encoded
+title128 CHECKPOINT 700/3234 elapsed=8.2s eta=29.5s
+100/100 encoded
+title128 CHECKPOINT 800/3234 elapsed=9.4s eta=28.5s
+100/100 encoded
+title128 CHECKPOINT 900/3234 elapsed=10.6s eta=27.5s
+100/100 encoded
+title128 CHECKPOINT 1000/3234 elapsed=11.9s eta=26.7s
+100/100 encoded
+title128 CHECKPOINT 1100/3234 elapsed=13.2s eta=25.6s
+100/100 encoded
+title128 CHECKPOINT 1200/3234 elapsed=14.5s eta=24.6s
+100/100 encoded
+title128 CHECKPOINT 1300/3234 elapsed=15.9s eta=23.6s
+100/100 encoded
+title128 CHECKPOINT 1400/3234 elapsed=17.2s eta=22.5s
+100/100 encoded
+title128 CHECKPOINT 1500/3234 elapsed=18.5s eta=21.4s
+100/100 encoded
+title128 CHECKPOINT 1600/3234 elapsed=19.8s eta=20.2s
+100/100 encoded
+title128 CHECKPOINT 1700/3234 elapsed=21.0s eta=18.9s
+100/100 encoded
+title128 CHECKPOINT 1800/3234 elapsed=22.3s eta=17.7s
+100/100 encoded
+title128 CHECKPOINT 1900/3234 elapsed=23.8s eta=16.7s
+100/100 encoded
+title128 CHECKPOINT 2000/3234 elapsed=25.1s eta=15.5s
+100/100 encoded
+title128 CHECKPOINT 2100/3234 elapsed=26.4s eta=14.2s
+100/100 encoded
+title128 CHECKPOINT 2200/3234 elapsed=27.7s eta=13.0s
+100/100 encoded
+title128 CHECKPOINT 2300/3234 elapsed=29.0s eta=11.8s
+100/100 encoded
+title128 CHECKPOINT 2400/3234 elapsed=30.3s eta=10.5s
+100/100 encoded
+title128 CHECKPOINT 2500/3234 elapsed=31.7s eta=9.3s
+100/100 encoded
+title128 CHECKPOINT 2600/3234 elapsed=33.1s eta=8.1s
+100/100 encoded
+title128 CHECKPOINT 2700/3234 elapsed=34.5s eta=6.8s
+100/100 encoded
+title128 CHECKPOINT 2800/3234 elapsed=35.9s eta=5.6s
+100/100 encoded
+title128 CHECKPOINT 2900/3234 elapsed=37.4s eta=4.3s
+100/100 encoded
+title128 CHECKPOINT 3000/3234 elapsed=38.8s eta=3.0s
+100/100 encoded
+title128 CHECKPOINT 3100/3234 elapsed=40.1s eta=1.7s
+100/100 encoded
+title128 CHECKPOINT 3200/3234 elapsed=41.7s eta=0.4s
+34/34 encoded
+title128 CHECKPOINT 3234/3234 elapsed=42.4s eta=0.0s
+BGE GPU encoding complete

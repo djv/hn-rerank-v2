@@ -1,0 +1,36 @@
+from __future__ import annotations
+import json
+import sys
+import time
+from pathlib import Path
+sys.path.insert(0, '/home/d/code/hn-rerank')
+import numpy as np
+import openvino as ov
+from huggingface_hub import HfApi, hf_hub_download
+from database import Story
+from pipeline.ranking import story_embedding_text
+from scripts.bakeoff_embedding_models import _encode
+from scripts.encode_replay_embeddings import _save
+repo='onnx-community/granite-embedding-small-english-r2-ONNX'
+revision=HfApi().model_info(repo).sha
+model_dir=Path('/home/d/.cache/hn-rerank-embedding-models')/repo.replace('/','--')
+for name in ('onnx/model.onnx','onnx/model.onnx_data','config.json','tokenizer.json','tokenizer_config.json','special_tokens_map.json'):
+ hf_hub_download(repo,name,revision=revision,local_dir=model_dir)
+print('Encoder repo/revision:',repo,revision,flush=True)
+print('GPU device:',ov.Core().get_property('GPU','FULL_DEVICE_NAME'),flush=True)
+ids=frozenset(json.loads(Path('/tmp/hn-single-cohort-20261007.json').read_text()))
+stories=[Story(**r) for r in json.loads(Path('/tmp/hn-single-feedback-20261007.json').read_text()) if r['id'] in ids]
+assert len(stories)==len(ids)==3234
+vectors=[]; started=time.perf_counter()
+for start in range(0,len(stories),100):
+ assert any(p.read_text().strip()=='1' for p in Path('/sys/class/power_supply').glob('*/online')), 'AC disconnected'
+ piece=stories[start:start+100]
+ encoded,_=_encode([story_embedding_text(s) for s in piece],tokenizer_dir=str(model_dir),model_path=model_dir/'onnx/model.onnx',pooling='cls',max_tokens=256,batch_size=4,device='gpu')
+ vectors.append(encoded); result=np.concatenate(vectors)
+ assert np.isfinite(result).all()
+ np.testing.assert_allclose(np.linalg.norm(result,axis=1),1,atol=1e-5)
+ spec=f'{repo}@{revision}|cls|256|prefix=none|title_only=False|device=gpu'
+ _save(Path('/tmp/hn-granite256-gpu-20261007.npz'),stories[:len(result)],result,spec)
+ elapsed=time.perf_counter()-started; eta=elapsed/len(result)*(len(stories)-len(result))
+ print(f'CHECKPOINT {len(result)}/{len(stories)} elapsed={elapsed:.1f}s eta={eta:.1f}s',flush=True)
+print('Granite GPU encoding complete',flush=True)

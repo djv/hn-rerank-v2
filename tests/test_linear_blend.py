@@ -114,6 +114,31 @@ def test_tfidf_alone_ranks_by_text_when_embeddings_are_noise() -> None:
         db.close()
 
 
+def test_blend_evidence_matches_the_active_word_only_model() -> None:
+    db = Database(":memory:")
+    try:
+        user_id = _seed(db, seed=101)
+        rng = np.random.default_rng(99)
+        embs = rng.standard_normal((2, 384)).astype(np.float32)
+        ranked = _score_and_rank(
+            _candidates(),
+            embs,
+            db,
+            _config(True, dense=0.0, tfidf=1.0),
+            _Embedder(),
+            user_id=user_id,
+        )
+        by_id = {item.story.id: item for item in ranked}
+        assert by_id[2].score == pytest.approx(1.0)
+        assert by_id[1].score == pytest.approx(0.0)
+        assert len(by_id[2].ranking_factors) == 1
+        assert by_id[2].ranking_factors[0].startswith("Helped: Word preference model")
+        assert by_id[1].ranking_factors[0].startswith("Hurt: Word preference model")
+        assert "100%" in by_id[2].ranking_factors[0]
+    finally:
+        db.close()
+
+
 def test_blend_fits_once_per_feedback_signature(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

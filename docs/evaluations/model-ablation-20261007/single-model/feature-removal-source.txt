@@ -1,0 +1,98 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0,str(Path.cwd()))
+from scripts.compare_eval_scores import Fold, _report
+
+ROOT=Path('/tmp/hn-one-classifier-20261007')
+ARTIFACTS=Path('docs/evaluations/model-ablation-20261007/single-model')
+variant='prod[linear_blend_enabled=false;svm_c=4;svm_gamma=0.03]'
+selected=json.loads((ROOT/'broad-selected.json').read_text())['selected_adapter']['spec']
+manifest_path=ROOT/'broad-provenance-manifest.json'
+manifest=json.loads(manifest_path.read_text())
+
+def verify_manifest() -> None:
+    for name,expected in manifest.items():
+        with Path(name).open('rb') as handle:
+            assert hashlib.file_digest(handle,'sha256').hexdigest()==expected,name
+
+def readiness() -> None:
+    assert any(p.read_text().strip()=='1' for p in Path('/sys/class/power_supply').glob('*/online')), 'AC disconnected'
+    while float(Path('/proc/loadavg').read_text().split()[0])>8:
+        print('Waiting for laptop load below8',flush=True)
+        time.sleep(10)
+    available=next(int(line.split()[1]) for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemAvailable:'))
+    assert available>=2_000_000,'Insufficient available memory'
+
+def run(name: str, args: list[str]) -> None:
+    readiness()
+    with (ROOT/f'{name}.log').open('w') as log:
+        subprocess.run(['uv','run',*args],stdout=log,stderr=subprocess.STDOUT,check=True)
+    print(name+' complete',flush=True)
+
+readiness()
+verify_manifest()
+plan={'features':['numeric','embedding_words'],'selection':'User selected both removals for exploratory12-block checks, after seeing4-fold development results','comparison':['selected all-feature classifier','production blend'],'same_classifier_settings':selected,'periods':['8 historical blocks','4 recent blocks'],'statistics':{'story_draws':3000,'block_draws':20000,'seed':20261007,'main_block_test':'exact sign-flip; intervals supplementary; selection reuse unadjusted'},'launcher_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),'source_input_manifest_sha256':hashlib.sha256(manifest_path.read_bytes()).hexdigest()}
+(ROOT/'feature-removal-plan.json').write_text(json.dumps(plan,indent=2)+'\n')
+run('review-focused-tests',['pytest','tests/test_one_classifier.py','tests/test_single_preference_model.py','tests/test_compare_eval_scores.py','-q'])
+for feature in plan['features']:
+    settings=[]
+    for key,value in selected.items():
+        settings.extend(['--'+key.replace('_','-'),str(feature if key=='features' else value)])
+    for period in plan['periods']:
+        tag='development' if period.startswith('8') else 'fresh'
+        splits=['--folds','8'] if tag=='development' else ['--holdout-after','1790899200','--holdout-blocks','4']
+        name=f'feature-removal-{feature}-{tag}'
+        run(name,['python','scripts/eval_one_classifier.py',*settings,'--','--config',str(ROOT/'native.toml'),'--user-id','151','--candidate-pool','heldout-feedback','--now','1791401987.9873054',*splits,'--variants',variant,'--output',str(ROOT/f'{name}.json'),'--dump-scores',str(ROOT/f'{name}-scores.json')])
+summary={'plan':plan,'checks':{}}
+for feature in plan['features']:
+    paired={name:[] for name in ('selected','production')}
+    counts={name:{'up':[0,0],'down':[0,0]} for name in paired}
+    periods={}
+    seen:set[int]=set()
+    for tag in ('development','fresh'):
+        name=f'feature-removal-{feature}-{tag}'
+        report=json.loads((ROOT/f'{name}.json').read_text())
+        periods[tag]={k:{m:v['mean']['raw'][m] for m in ('auc_up_vs_rest','known_upvote_fraction_at_12','known_downvote_fraction_at_12','ndcg_at_12')} for k,v in report['variants'].items()}
+        current=json.loads((ROOT/f'{name}-scores.json').read_text())['folds']
+        base=json.loads((ROOT/f'broad-check-adapter-{tag}-scores.json').read_text())['folds']
+        for a,b in zip(current,base,strict=True):
+            assert a['ids']==b['ids'] and a['labels']==b['labels'] and a['scores']['production']==b['scores']['production']
+            assert not seen.intersection(a['ids']);seen.update(a['ids'])
+            labels=np.asarray(a['labels']);assert (labels>=0).all()
+            for key in paired:
+                scores=(np.asarray(b['scores'][variant if key=='selected' else 'production'],dtype=float),np.asarray(a['scores'][variant],dtype=float))
+                paired[key].append(Fold(f'{tag}-{a["fold"]}',labels==2,scores))
+                for i,score in enumerate(scores):
+                    top=labels[np.argsort(-score,kind='stable')[:12]]
+                    counts[key]['up'][i]+=int((top==2).sum())
+                    counts[key]['down'][i]+=int((top==0).sum())
+    summary['checks'][feature]={'periods':periods,'unique_test_stories':len(seen),'comparisons':{}}
+    for key,folds in paired.items():
+        statistics=_report(folds,3000,20000,np.random.default_rng(20261007))
+        statistics.update(top12_upvotes=counts[key]['up'],top12_downvotes=counts[key]['down'])
+        summary['checks'][feature]['comparisons'][key]=statistics
+    print(feature+' paired summaries complete',flush=True)
+(ROOT/'feature-removal-summary.json').write_text(json.dumps(summary,indent=2,allow_nan=False)+'\n')
+run('final-tests',['pytest','tests/','-n','4'])
+run('final-lint',['ruff','check','.'])
+run('final-format',['ruff','format','--check','scripts/eval_one_classifier.py','scripts/eval_single_preference_model.py','scripts/compare_eval_scores.py','tests/test_one_classifier.py','tests/test_single_preference_model.py','tests/test_compare_eval_scores.py','tests/test_cli_boot.py'])
+with (ROOT/'final-types.log').open('w') as log:
+    typed=subprocess.run(['uv','run','ty','check'],stdout=log,stderr=subprocess.STDOUT)
+text=(ROOT/'final-types.log').read_text()
+assert typed.returncode==0 or (text.count('error[')==1 and 'scripts/inspect_tldr_failures.py:86' in text),text
+readiness()
+verify_manifest()
+for path in ROOT.glob('feature-removal-*'):
+    if path.is_file(): (ARTIFACTS/path.name).write_bytes(path.read_bytes())
+for name in ('broad-provenance-manifest.json','broad-reconciliation-summary.json','review-focused-tests.log','final-tests.log','final-lint.log','final-format.log','final-types.log'):
+    (ARTIFACTS/name).write_bytes((ROOT/name).read_bytes())
+print('feature-removal checks and final gates complete',flush=True)

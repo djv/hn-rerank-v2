@@ -21,7 +21,11 @@ to the list. Escape also closes help. Use the sort and window selectors (or h/l 
 filters. Below 100 columns the headline list stacks above the summary.
 Non-HN stories show their feed's name (AINews, r/sub) and no score or comment
 count when the feed has none; the summary heading says which upvote a story
-resembles ("Because you upvoted: …").
+resembles ("Because you upvoted: …"). Press `w` for **Why this story**:
+model signals that helped or hurt relative to a middle-of-pool rating,
+related upvotes, feed ordering, and badge signals. Escape returns to the
+summary. Model details require a freshly ranked deck from an updated server;
+older servers still provide the original single-upvote attribution.
 
 Summaries are cached for the session across sort changes. Up to four background
 requests warm the next 20 stories, the previous three, and the first three

@@ -1,0 +1,93 @@
+{
+  "matched_existing_embeddings": {
+    "folds": 7,
+    "AUC": {
+      "base": 0.8252602941482959,
+      "delta": 0.000706499766641674,
+      "boot_ci": [
+        -0.007107093606793198,
+        0.00852850876902564
+      ],
+      "boot_p_gt0": 0.567,
+      "block_ci": [
+        -0.00805027867035925,
+        0.009570549577187351
+      ],
+      "sign_flip_p": 0.875,
+      "folds_better": 3,
+      "folds_worse": 4
+    },
+    "AP": {
+      "base": 0.5660369303020557,
+      "delta": -0.0011457421915450944,
+      "boot_ci": [
+        -0.019709846712179162,
+        0.02003994834344318
+      ],
+      "boot_p_gt0": 0.489,
+      "block_ci": [
+        -0.03208249409843918,
+        0.027582205814428884
+      ],
+      "sign_flip_p": 0.953125,
+      "folds_better": 4,
+      "folds_worse": 3
+    },
+    "P@12": {
+      "base": 0.6547619047619048,
+      "delta": 0.03571428571428571,
+      "boot_ci": [
+        -0.03571428571428573,
+        0.10714285714285714
+      ],
+      "boot_p_gt0": 0.8073333333333333,
+      "block_ci": [
+        -0.02380952380952382,
+        0.11904761904761905
+      ],
+      "sign_flip_p": 0.75,
+      "folds_better": 2,
+      "folds_worse": 1
+    },
+    "delong": {
+      "delta": 0.000706499766641674,
+      "se": 0.0037763529666853556,
+      "p": 0.8515938285282272
+    }
+  },
+  "impressions": {
+    "production": {
+      "auc_up_vs_rest": 0.8207617458096249,
+      "known_upvote_fraction_at_12": 0.45833333333333337,
+      "known_downvote_fraction_at_12": 0.020833333333333332,
+      "ndcg_at_12": 0.512542190131421
+    },
+    "prod[linear_blend_enabled=false;svm_c=4;svm_gamma=0.03]": {
+      "auc_up_vs_rest": 0.8248754108790954,
+      "known_upvote_fraction_at_12": 0.4583333333333333,
+      "known_downvote_fraction_at_12": 0.020833333333333332,
+      "ndcg_at_12": 0.48496250734871366
+    }
+  },
+  "gpu_screen": {
+    "production": {
+      "auc_up_vs_rest": 0.7670170187255437,
+      "known_upvote_fraction_at_12": 0.6666666666666666,
+      "known_downvote_fraction_at_12": 0.0,
+      "ndcg_at_12": 0.6449271488539973
+    },
+    "prod[linear_blend_enabled=false;svm_c=4;svm_gamma=0.03]": {
+      "auc_up_vs_rest": 0.760256092400433,
+      "known_upvote_fraction_at_12": 0.6666666666666666,
+      "known_downvote_fraction_at_12": 0.0,
+      "ndcg_at_12": 0.6753351739202623
+    },
+    "prod[linear_blend_enabled=false;svm_c=16;svm_gamma=0.01]": {
+      "auc_up_vs_rest": 0.7663346794928468,
+      "known_upvote_fraction_at_12": 0.6944444444444445,
+      "known_downvote_fraction_at_12": 0.0,
+      "ndcg_at_12": 0.6710339669847766
+    }
+  },
+  "gpu_selected_variant": "none"
+}

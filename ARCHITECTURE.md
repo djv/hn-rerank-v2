@@ -6,6 +6,29 @@ This document outlines the architecture, core design decisions, database schema,
 
 ## 1. System Overview
 
+The web card's **Why this story** expander and the TUI's `w` panel show
+the active feed's ordering rule, badge signals, and up to three distinct
+related upvote titles. Extra neighbours are computed only for deck stories
+during attribution; all pairs share the existing centering pass. Both raw
+and centered similarity floors apply, and popularity/exploration badges
+retain the stricter raw floor. The optional `FeedStory.related_upvotes`
+field defaults to an empty list for older servers; older clients ignore it.
+Optional `ranking_factors` describes each active linear-blend component's
+candidate-pool percentile and actual weight. Display names are **Nonlinear
+preference model** (base/RBF SVM), **Linear preference model** (dense logistic
+regression), and **Word preference model** (TF-IDF logistic regression).
+The first two share feature inputs and differ in how they learn.
+Helped/hurt is the sign of
+`weight * (percentile - 0.5)`, ordered by its absolute value; disabled terms
+are omitted. These are effects relative to a middle-of-pool component,
+before deck discovery and Explore shuffle, not feature-level causal claims.
+Popular hides the preference decomposition because its order uses gravity.
+Decks without an active blend have no component breakdown.
+The original single attribution stays available. Similarities are evidence,
+not causal explanations of the complete model score. Opening the panel
+does not fetch content or call an LLM; cold or weak matches are explicitly
+reported as unavailable. Ranking, votes, and database schema are unchanged.
+
 `hn-rewrite` is a unified, resource-efficient rewrite of the original reranking system. It functions as a local-first web application that fetches stories from Hacker News and multiple RSS feeds, semantic-ranks them using a locally run sentence-embedding model and SVM, and presents them in a clean web dashboard.
 
 ```mermaid
@@ -495,6 +518,10 @@ The configured RSS candidate pool mixes community aggregators with curated exper
 
 Dashboard source badges use display labels derived from stored source IDs. Historical feed-host artifacts such as `rss_rss_slashdot_org` are rendered as readable labels like `Slashdot`, while new feeds hosted at `rss.*`, `feeds.*`, or `feed.*` strip that host prefix before storing the source ID.
 
+Kagi News World (`https://news.kagi.com/world.xml`) is included in the configured
+RSS feeds. Its items provide news summaries and source links through the existing
+generic RSS ingestion path.
+
 ### 3.7 Comment Text Refetch on Growth
 The default regeneration interval is one hour after the previous run completes (`regen_interval_seconds=3600`, the `Config` dataclass default in `pipeline/config.py` since 2026-09-22; not overridden in `config.toml`); older references to 3- or 4-hour cycles describe superseded configuration.
 
@@ -598,6 +625,39 @@ source features cost ~−0.014/−0.007 NDCG@40, tier blend is neutral), and
 `tier2_centroid` plus the `gravity` / `candidate_order` baselines. `--svm-c` / `--svm-gamma` add an
 `svm_override` entry; `--sweep-svm` runs the C/γ grid through the same engine
 (replacing the deleted `scripts/svm_hparam_sweep.py` wrapper).
+
+`scripts/eval_single_preference_model.py` wraps that harness for one-classifier
+research: normalized linear/RBF kernels, an anchored additive linear term,
+optional continuous signed pairwise margins, and an additive TF-IDF word
+kernel (`--word-c`, effective word regularization strength). The word kernel
+uses production hashed 1-2 grams with retained columns and IDF learned only
+from training rows; lexical and numeric rows use the same serving DB order.
+It fits one SVM with both feature channels and disables both logistic
+classifiers. Only no-dense variants
+receive an experimental kernel/score form; full-blend controls stay original.
+`--feedback-cohort` filters training/held-out feedback in memory and rejects
+external `--embeddings-file` snapshots whose label reads bypass that filter.
+Explicit output reports record the kernel, exact cohort IDs/hash and driver
+hash. Only production metadata is standardized. The experimental
+`--embedding-weight` multiplies the entire embedding block by the square
+root of one scalar weight; it does not standardize individual dimensions.
+Fold reports also retain block norms and train/test title overlap IDs.
+These options do not change the serving ranker. The October 7 fixed plan and
+raw outputs live in `docs/evaluations/model-ablation-20261007/`.
+
+`scripts/eval_one_classifier.py` uses the same canonical fold/serving path
+with one joined logistic regression, LinearSVC, histogram gradient booster
+or small MLP. Feature subsets separate words, embeddings and metadata.
+Dense nonlinear estimators use training-only PCA64 for embeddings and
+SVD32 for words; sparse linear estimators retain the full inputs. Probability
+estimators can rank by P(up) or P(up)-P(down), while retaining their actual
+probabilities for diagnostic fields. Neither probability output nor the
+softmax proxy used for SVM margins establishes calibration. Feedback rows
+are frozen across lexical/numeric reads, including the production dedup
+step. Both offline drivers reuse only exact-input pure vector arithmetic
+through a bounded result cache; they never cache classifiers or labels.
+The full three-model control stays on its original estimator and scoring
+path. These experimental adapters have no production or preview effect.
 
 Deck assembly always receives the fold's training upvote embeddings, including
 when similarity features are cached. Interest selection and semantic deduplication

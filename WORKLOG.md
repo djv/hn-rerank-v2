@@ -1,5 +1,91 @@
 # Worklog: hn-rewrite
 
+## 2026-10-07 One preference classifier experiments
+
+Added offline canonical-harness adapters for alternate SVM kernels and one
+joined logistic/LinearSVC/histogram/MLP classifier. Training-only word
+features and projections, uniform embedding-block weights, exact feedback
+row ordering, title-overlap audits and bounded pure-vector caching preserve
+the evaluation boundary. Actual probability outputs remain available when
+ranking by P(up)-P(down). BGE and Granite encodings completed on the laptop
+Intel GPU; classifier fits ran on one background CPU on AC.
+
+The broader screen, feature ablations, twelve native chronological blocks,
+fourteen matched encoder comparisons, reserved check and label shuffle
+finished. The user requested tradeoffs only; no production classifier
+change was selected. Paired summaries and an independent read-only Opus5.5
+verification completed; the final validation results appear below. Earlier
+local validation: 1,120 passed /18
+skipped; Ruff and five touched Python format checks pass; ty retains only
+the pre-existing unrelated TLDR inspection-script diagnostic. A probability
+test fixture initially stayed below the 20/20 training threshold; explicit
+test-only 10/10 thresholds now exercise the intended branch (25 focused
+tests pass). Production thresholds are unchanged.
+
+Independent Opus5.5 verification found no leakage/scoring bug in executed
+paths but flagged weak provenance and a statistics CLI scope collision.
+The CLI now retains the full dump stem and rejects duplicate/reserved
+stems, with a regression test proving historical and recent summaries both
+survive. Added served P(up)-P(down) ranking, baseline routing/parity,
+conflicting-URL feedback dedup, explicit feature block selection and
+missing-class fail-closed tests (40 focused tests pass). Four final-driver
+reruns reconcile old hashes; source/input hashes are retained. The user
+selected additional twelve-block no-metadata/no-word checks; those and a
+fresh full gate are complete. Final validation: 1,128 passed /18 skipped;
+Ruff and all21 touched Python formatting checks pass; ty retains only the
+pre-existing inspection-script diagnostic. The focused Opus5.5 review found
+no implementation blocker. All twelve selected-baseline blocks reproduce
+every ID, label and score exactly with stable source/input hashes. Holm
+adjustment of four AUC tests is complete (adjusted p .252–.785). Removing
+words preserves top-pick counts but lowers NDCG; removing metadata raises
+NDCG while lowering recent AUC. All remain retrospective, offline and
+exploratory; production models remain unchanged.
+
+## 2026-10-07 Laptop TUI public Funnel recovery
+
+Public TLS connections failed while the production application stayed
+healthy. Refreshed the existing8443 Funnel handler without removing sibling
+routes and restarted VPS tailscaled. The saved TUI profile was unchanged;
+five authenticated public requests returned200 and loaded46 stories. At
+22:21 ET, all three public edge IPs returned200 from laptop and VPS. Logs
+show some internal ingress drops, but the exact root cause is unconfirmed.
+The temporary proposed production SSH tunnel was stopped; public TUI access
+requires no laptop Tailscale connection. Anonymous diagnostics created
+profiles, so those records must not be counted as organic signups.
+
+## 2026-10-07 Add Kagi News World RSS
+
+Added `https://news.kagi.com/world.xml` to `config.toml`'s RSS feed list.
+VPS verification parsed the updated TOML, confirmed exactly one feed-list
+entry, and fetched/parsed 12 valid RSS items. User subsequently authorized
+deployment: applied only this one-line config change to VPS production,
+restarted `hn_rewrite.service`, and verified the dashboard returns HTTP 200.
+
+## 2026-10-07 Clarify preference model names
+
+Rename Why-this-story factors from Base ranking to Nonlinear preference
+model and Content preference model to Linear preference model. Web and TUI
+receive the shared server-generated labels. Ranking algorithms and weights
+are unchanged; the word model remains active. Update the isolated preview
+for the user's existing test session, without deploying to production.
+VPS verification: 10 focused tests and 1,111 full backend tests passed
+(1 skipped); Ruff, touched-file formatting and ty passed.
+
+## 2026-10-07 Expand Why this story
+
+- Add an on-demand evidence panel to web cards and TUI (`w`; Escape returns
+  to the summary): related upvotes, active feed ordering rule, badge signals,
+  and an explicit absent-match state. Keep the existing single attribution.
+- Deck-only top-three similarity evidence reuses one centering pass and
+  retains raw/centered floors plus stricter badged-card suppression. Optional
+  wire field is compatible with older clients and servers. External titles
+  render literally; no new LLM/network request or database migration.
+- Validation and deployment boundary are recorded in FINDINGS.md.
+- User chose "What helped or hurt": expose actual base/content/word blend
+  percentiles and weights, signed against a middle-of-pool replacement and
+  ordered by weighted effect. Keep this separate from similarity examples
+  and hide it in Popular. Reuse the exact score arrays; ranking is unchanged.
+
 ## 2026-10-07 Restore standalone TUI CI
 
 - Wrap the reading-mode footer's adjacent strings in parentheses for Ruff

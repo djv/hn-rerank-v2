@@ -697,6 +697,7 @@ class Reader(App[None]):
         ("escape", "headlines", "Back"),
         ("?", "help", "Help"),
         ("b", "badge_legend", "Badges"),
+        ("w", "why_story", "Why this story"),
         ("q", "quit", "Quit"),
     ]
 
@@ -2014,6 +2015,62 @@ class Reader(App[None]):
             self.help_open = False
             self.schedule_summary()
 
+    def action_why_story(self) -> None:
+        story = self.selected()
+        if story is None:
+            return
+        self.help_open = True
+        self.summary_story_id = None
+        self.selection_serial += 1
+        self.workers.cancel_group(self, "summary")
+        view = str(self.query_one("#sort", Select).value)
+        reasons = {
+            "recommended": "Recommended orders stories by the model's learned preferences from your votes.",
+            "popular": "Popular orders eligible HN stories by points and age; older stories lose weight.",
+            "explore": "Explore offers discovery picks, including unfamiliar stories and interests Recommended misses. Its order is shuffled.",
+        }
+
+        # Titles come from external feeds; render them as literal Markdown text.
+        def literal(text: str) -> str:
+            for char in "\\`*_{}[]<>()#!|":
+                text = text.replace(char, "\\" + char)
+            return text.replace("\n", " ")
+
+        lines = ["# Why this story", literal(story.title), reasons[view]]
+        if view != "popular" and story.ranking_factors:
+            lines.extend(
+                [
+                    "## What helped or hurt",
+                    *["- " + literal(factor) for factor in story.ranking_factors],
+                ]
+            )
+            lines.append(
+                "Helped/hurt compares each model with a middle-of-pool rating. These terms describe the model score before discovery selection or shuffle."
+            )
+        related = story.related_upvotes or (
+            [story.best_match_title] if story.best_match_title else []
+        )
+        if related:
+            lines.extend(["## Related upvotes", *["- " + literal(t) for t in related]])
+            lines.append(
+                "These are content similarities, not a complete explanation of the model's score."
+            )
+        else:
+            lines.append("No close upvote match is available for this story.")
+        if story.badge_details:
+            lines.extend(
+                [
+                    "## Signals",
+                    *[
+                        f"- {literal(b.label)}: {literal(b.tooltip)}"
+                        for b in story.badge_details
+                    ],
+                ]
+            )
+        lines.append("Escape: return to the story.")
+        self.query_one("#summary", Markdown).update("\n\n".join(lines))
+        self.focus_summary()
+
     def action_badge_legend(self) -> None:
         self.help_open = True
         self.summary_story_id = None
@@ -2041,6 +2098,7 @@ class Reader(App[None]):
             "- `Tab`: switch focus between panes\n"
             "- Arrow keys: scroll the focused pane\n\n"
             "## Read\n\n"
+            "- `w`: why this story (related upvotes and ranking signals)\n"
             "- `Enter`: zoom the TLDR pane (hide the article list)\n"
             "- `Enter` / `Escape`: return to the article list\n"
             "- `Space`: page the TLDR down (list or zoom view)\n\n"

@@ -1,0 +1,45 @@
+{
+  "plan": {
+    "selection": "Close the residual selected-baseline provenance concern from the focused Claude review; no new model setting",
+    "periods": [
+      "development",
+      "fresh"
+    ],
+    "multiple_comparisons": "Holm-adjust the four predeclared AUC sign-flip tests, alongside raw p values; selection-search uncertainty remains unadjusted",
+    "launcher_sha256": "8a59619e8d568714f6c08ac071e3fd9bd878aa89ca97ac9ac91ba29711c2199e"
+  },
+  "selected_baseline_parity": {
+    "development": {
+      "exact_candidate_ids_labels_and_all_scores": true,
+      "folds": 8
+    },
+    "fresh": {
+      "exact_candidate_ids_labels_and_all_scores": true,
+      "folds": 4
+    }
+  },
+  "all_source_and_input_hashes_stable": true,
+  "formatted_files": [
+    "clients/tui/src/hn_rerank/app.py",
+    "clients/tui/src/hn_rerank/models.py",
+    "clients/tui/tests/test_boundaries.py",
+    "clients/tui/tests/test_client.py",
+    "clients/tui/tests/test_editorial.py",
+    "pipeline/linear_blend.py",
+    "pipeline/ranking.py",
+    "pipeline/render.py",
+    "scripts/compare_eval_scores.py",
+    "scripts/eval_one_classifier.py",
+    "scripts/eval_ranker_variants.py",
+    "scripts/eval_single_preference_model.py",
+    "tests/test_browser.py",
+    "tests/test_cli_boot.py",
+    "tests/test_client_js.py",
+    "tests/test_compare_eval_scores.py",
+    "tests/test_linear_blend.py",
+    "tests/test_one_classifier.py",
+    "tests/test_pipeline.py",
+    "tests/test_server.py",
+    "tests/test_single_preference_model.py"
+  ]
+}

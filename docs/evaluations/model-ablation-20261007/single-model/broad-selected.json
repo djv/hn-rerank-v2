@@ -1,0 +1,42 @@
+{
+  "selected_adapter": {
+    "report": "broad-logistic-penalty-weight16",
+    "variant": "prod[linear_blend_enabled=false;svm_c=4;svm_gamma=0.03]",
+    "spec": {
+      "family": "logistic",
+      "features": "all",
+      "word_scale": 1.0,
+      "max_leaf_nodes": 15,
+      "l2": 1.0,
+      "hidden": 32,
+      "score": "up_down",
+      "embedding_weight": 16.0,
+      "numeric_scale": 0.15811388300841897
+    },
+    "kernel": null,
+    "mean": {
+      "auc_up_vs_rest": 0.8190610123090647,
+      "known_upvote_fraction_at_12": 0.7708333333333334,
+      "known_downvote_fraction_at_12": 0.041666666666666664,
+      "ndcg_at_12": 0.742015487375954
+    }
+  },
+  "selected_svm": {
+    "report": "broad-svm-weight16",
+    "variant": "prod[linear_blend_enabled=false;svm_c=4;svm_gamma=0.03]",
+    "spec": null,
+    "kernel": {
+      "family": "linear",
+      "linear_share": 0.3,
+      "score_form": "ovr",
+      "word_c": 4.0,
+      "embedding_weight": 16.0
+    },
+    "mean": {
+      "auc_up_vs_rest": 0.8157112222378361,
+      "known_upvote_fraction_at_12": 0.7291666666666667,
+      "known_downvote_fraction_at_12": 0.020833333333333332,
+      "ndcg_at_12": 0.7167595223255829
+    }
+  }
+}
