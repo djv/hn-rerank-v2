@@ -54,39 +54,44 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
 - Subreddits (user choice): dropped transit, expats, eupersonalfinance;
   added mlscaling, accelerate, OpenAI, codex, agi, Aging (21 feeds).
   All six now have stories (agi and mlscaling via Arctic Shift).
-- Restart fallback: the shared cold deck now keeps 512 stories per view
-  (was 32), so profile 151 no longer drops to ~5 Popular stories for the
-  ~90 s after a restart (WORKLOG 2026-10-08). Deployed 6ae84d2 at 12:33 UTC:
-  during the 90 s cold window, 1w and 1m served 16 Popular / 16 Recommended;
-  no journal errors; dashboard and tldr-cache 200.
+- Restarts: the cold deck keeps 32 x the served view (now 384 per view),
+  so profile 151 gets full views in the cold window (6ae84d2). A restart's
+  first rerank took 77-101 s (~60 s cold classifier fits): fits now persist
+  in `~/.cache/hn-rewrite/warm_start` and the first regen waits for the
+  startup warms (c4147e7, deployed 15:33 UTC; regen waited 51 s; fits
+  saved). The warm-start gain is measured at the next restart (pending).
 - Interleaving: one arm-fit failure (13:15:56 UTC, a vote between arms;
-  1 of 24 warms) is fixed: all arms train on one vote snapshot. Deployed
-  623321b at 13:23 UTC; the next warm interleaved both arms, no journal
-  errors. The first warm after any restart takes ~80 s (four restarts
-  today: 84, 82, 77, 86 s), later warms 10-20 s.
-- Arctic Shift adapter (ARCHITECTURE.md 3.4.4). All 21 feeds compared:
-  395/470 RSS stories match; 66 of 75 misses are posts under 36 h old.
-  The user moved the switch from November 11 to now: config.toml sets
-  `reddit_source = "arctic_shift"` (live since 13:32 UTC). Since then 19
-  of 20 attempted feeds stored stories; r/MachineLearning failed twice on
-  the archive's 422 overload and keeps its earlier 20 stories. Refreshes
-  took 13-22 min (overload retries). Prefetched threads carry archive
-  comments (e.g. 9 of 25 r/agi stories).
-- Codex (gpt-6.1-sol) reviewed the change; all 5 findings fixed with
-  regression tests and deployed (f50f4b7, 14:23 UTC; 1187 tests pass).
+  1 of 24 warms) is fixed: all arms train on one vote snapshot (623321b).
+  Views now show 8 stories (served 12, Explore 3 per badge; 37e0333,
+  user's choice), so arms draft from their top 24 (INTERLEAVING.md).
+- Arctic Shift (ARCHITECTURE.md 3.4.4) is the Reddit source since 13:32
+  UTC (user moved the switch up from November 11). Comparison: 395/470 RSS
+  stories match; 66 of 75 misses are posts under 36 h old. Codex
+  (gpt-6.1-sol) review: 5 findings fixed (f50f4b7). The archive's global
+  422 overload cost 1-2 feeds per refresh; a second pass for failed feeds
+  (234124f) left 0 failed in the 15:00 refresh (142 requests, 35
+  overloaded, 34 min). Prefetched threads carry archive comments.
+- Profiles: 20 test/anonymous profiles deleted with the user's approval
+  (users 214 -> 194; backup `hn_rewrite.db.pre_test_profiles_20261008T144729Z`
+  on the VPS, kept). Only profile 151 votes.
+- RSS read timeouts now log one warning line (5c092d0).
+- TUI `o`/`c` open via `~/bin/hn-open` (system-setup): a new Chrome window
+  when the everyday Chrome runs, else surf.
 
 ## Blocker
 None.
 
 ## Next step
-- Arctic Shift follow-up: confirm r/MachineLearning recovers on a later
-  refresh, and that a Reddit card's tldr-detail (live tap) shows archive
-  comments. Rollback: delete the `reddit_source` line in config.toml and
-  restart (RSS works until November 13).
+- Measurement restart (automatic, after the Reddit refresh started 15:35
+  UTC): deploys 5c092d0 and logs the first rerank with saved warm starts
+  (expect ~25-30 s vs 81 s). Record it here.
+- User: restart the TUI from a fresh shell (8 per section, `hn-open`).
+- Arctic Shift: check `reddit_refresh_arctic` lines over the next days and
+  a Reddit card's tldr-detail (live tap) with archive comments. Rollback:
+  delete `reddit_source` in config.toml and restart (RSS until Nov 13).
 - Final analysis at T0 + 28 days, 2026-11-05 04:07 UTC (Nov 4 23:07 ET):
   `uv run python scripts/interleave_report.py --db hn_rewrite.db
   --user-id 151 --since 1791432442.75 --until 1793851642.75` on the VPS.
   Weekly descriptive reports and safety checks per INTERLEAVING.md.
-- Carried over: 1m Popular age-mix
-  check, real-terminal tint/footer check, October 21 Gemma 2 future-vote
-  recheck (/home/d/TASKS.md).
+- Carried over: 1m Popular age-mix check, real-terminal tint/footer check,
+  October 21 Gemma 2 future-vote recheck (/home/d/TASKS.md).
