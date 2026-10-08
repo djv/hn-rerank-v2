@@ -57,6 +57,8 @@ metadata-scale middle variant, short-history curve).
   ~90 s after a restart (WORKLOG 2026-10-08). Deployed 6ae84d2 at 12:33 UTC:
   during the 90 s cold window, 1w and 1m served 16 Popular / 16 Recommended;
   no journal errors; dashboard and tldr-cache 200.
+- Interleaving: one arm-fit failure (13:15:56 UTC, a vote between arms;
+  1 of 24 warms) is fixed: all arms train on one vote snapshot.
 - Arctic Shift adapter merged and deployed off by default
   (`reddit_source = "rss"`; ARCHITECTURE.md 3.4.4). All 21 feeds compared:
   395/470 RSS stories match; 66 of 75 misses are posts under 36 h old.

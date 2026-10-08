@@ -25,6 +25,12 @@ confirmation.
 - Measured on the 2026-10-07 snapshot (Sept 29 – Oct 7), 438 of profile 151's
   1,153 votes followed a Recommended impression: about 50 a day, about 13 of
   them upvotes. Only 2 votes had no prior impression.
+- Live incident, 2026-10-08 13:15:56 UTC (first warm after a restart): a
+  vote landed between arms, so `joined_no_metadata` read 3,889 votes while
+  the shared vote features held 3,888, failed to fit, and that warm's deck
+  was production's alone (not stored in `interleave_decks`, so it credits
+  no arm). 1 of 24 interleaved warms since T0. Fixed the same day: every
+  arm of a rerank now trains on one vote snapshot.
 
 ## Power replay
 

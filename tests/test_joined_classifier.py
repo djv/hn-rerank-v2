@@ -257,6 +257,71 @@ def test_rerank_interleaves_only_when_every_challenger_fits(
         db.close()
 
 
+def test_rerank_arms_train_on_one_vote_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A vote landing while the arms score must not reach only some of them.
+
+    Live, 2026-10-08 13:15 UTC: production's shared features held 3888 votes,
+    the second challenger read 3889 and failed to fit, so that warm served
+    production alone."""
+    from pipeline.interleave import challenger_configs
+    from pipeline.ranking import rerank_candidates
+
+    db = Database(":memory:")
+    try:
+        user_id = _seed(db, [0, 1, 2] * 14)
+        late = _stories(np.random.default_rng(11), [2], 3000)[0]
+        db.upsert_story(late)
+        read = db.get_feedback_for_training
+        voter = user_id
+        reads = 0
+
+        def read_then_vote(
+            user_id: int | None = None,
+        ) -> tuple[list[Story], list[int], list[float]]:
+            nonlocal reads
+            reads += 1
+            snapshot = read(user_id=user_id)
+            if reads == 1:
+                db.upsert_feedback(voter, late.id, "up")
+            return snapshot
+
+        monkeypatch.setattr(db, "get_feedback_for_training", read_then_vote)
+        config = Config(
+            interleave_user_ids=(user_id,),
+            model=ModelConfig(min_up_for_svm=2, min_down_for_svm=2),
+        )
+        now = int(time.time())
+        rng = np.random.default_rng(3)
+        candidates = [
+            replace(s, time=now - 600 * i)
+            for i, s in enumerate(_stories(rng, list(rng.integers(0, 3, 24)), 5000))
+        ]
+        for s in candidates:
+            db.upsert_story(s)
+        embs = rng.standard_normal((len(candidates), 384)).astype(np.float32)
+        embs /= np.linalg.norm(embs, axis=1, keepdims=True)
+        trace = RankTrace()
+        rankings: dict[str, list[int]] = {}
+        rerank_candidates(
+            db,
+            config,
+            _NoiseEmbedder(),
+            candidates,
+            embs,
+            user_id=user_id,
+            trace=trace,
+            challengers=challenger_configs(config, user_id),
+            arm_rankings_out=rankings,
+        )
+
+        assert set(rankings) == {"joined_all", "joined_no_metadata"}
+        assert trace.labels["interleave"] == "joined_all,joined_no_metadata"
+    finally:
+        db.close()
+
+
 @settings(max_examples=10, deadline=None)
 @given(seed=st.integers(0, 2**32 - 1))
 def test_warm_start_reaches_the_same_model_in_fewer_iterations(seed: int) -> None:

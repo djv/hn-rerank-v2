@@ -1211,11 +1211,14 @@ def _score_and_rank(
     trace: RankTrace | _NullTrace = NULL_TRACE,
     score_context: RankScoreContext | None = None,
     shared: SharedFeatures | None = None,
+    training_feedback: tuple[list[Story], list[int], list[float]] | None = None,
 ) -> list[RankedStory]:
     """*shared* carries classifier inputs between the arms of one rerank:
     the first call with it fills it, later calls with the same feature
     settings reuse it (a call that needs *score_context* still builds its
-    candidate features)."""
+    candidate features). *training_feedback* is a
+    ``db.get_feedback_for_training`` snapshot to train on instead of
+    reading the votes again; the arms of one rerank pass the same one."""
     if not candidates:
         return []
     share = (
@@ -1229,9 +1232,16 @@ def _score_and_rank(
     probs = None
     linear_models: linear_blend.LinearBlendModels | None = None
     linear_dense_candidates: NDArray[np.float32] | None = None
-    feedback_stories, feedback_labels, _vote_times = db.get_feedback_for_training(
-        user_id=user_id
-    )
+    if training_feedback is not None:
+        feedback_stories, feedback_labels, _vote_times = (
+            list(training_feedback[0]),
+            list(training_feedback[1]),
+            list(training_feedback[2]),
+        )
+    else:
+        feedback_stories, feedback_labels, _vote_times = db.get_feedback_for_training(
+            user_id=user_id
+        )
 
     if config.model.deduplicate_training_feedback:
         from .feedback import deduplicate_feedback
@@ -2314,6 +2324,12 @@ def rerank_candidates(
 
     score_context = RankScoreContext()
     shared = SharedFeatures(feature_settings(config)) if challengers else None
+    # One vote snapshot for every arm: a vote landing between arms made the
+    # shared vote features one row short of a later arm's labels, and that
+    # arm failed to fit (2026-10-08).
+    training_feedback = (
+        db.get_feedback_for_training(user_id=user_id) if challengers else None
+    )
     ranked = _score_and_rank(
         candidates,
         cand_embeddings,
@@ -2324,6 +2340,7 @@ def rerank_candidates(
         trace=trace,
         score_context=score_context,
         shared=shared,
+        training_feedback=training_feedback,
     )
 
     arm_rankings: dict[str, list[int]] = {}
@@ -2339,6 +2356,7 @@ def rerank_candidates(
                 user_id=user_id,
                 trace=arm_trace,
                 shared=shared,
+                training_feedback=training_feedback,
             )
         fitted = arm_trace.labels.get("model_cache") in {"hit", "miss"}
         if not fitted or "svm_fit" in arm_trace.labels:

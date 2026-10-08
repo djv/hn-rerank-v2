@@ -1,5 +1,18 @@
 # Worklog: hn-rewrite
 
+## 2026-10-08 One vote snapshot for all interleaving arms
+
+At 13:15:56 UTC the VPS logged `Failed to fit feedback SVM: IndexError
+(... 3888 ... 3889)` and `interleave arm=joined_no_metadata user_id=151 did
+not fit; serving production`: a vote landed between the arms' scoring
+calls. Each `_score_and_rank` call read the votes itself, while the vote
+features shared across arms came from production's read. `rerank_candidates`
+now reads the training votes once and passes them to every arm
+(`training_feedback`); without challengers nothing changes. Regression test
+`test_rerank_arms_train_on_one_vote_snapshot` reproduced the IndexError
+before the fix. The model cache key already hashes the training snapshot,
+so cached models stay tied to the votes they were fit on.
+
 ## 2026-10-08 Arctic Shift as an opt-in Reddit source
 
 The user chose to build an Arctic Shift adapter before Reddit RSS ends on
