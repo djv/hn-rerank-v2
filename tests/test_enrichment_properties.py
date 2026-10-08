@@ -9,7 +9,9 @@ from hypothesis import given, settings, strategies as st
 
 import pipeline
 from database import Action, Database, Story, StoryIdentityConflict
+from pipeline.config import RedditSource
 from pipeline.enrichment import fetch_story, fetch_rss_feeds
+from reddit_fetch_queue import CoroFactory
 
 
 @given(
@@ -313,13 +315,15 @@ def test_reddit_collision_excluded_from_snapshot_and_prewarm(sid: int) -> None:
     safe = replace(conflict, id=-2, url="https://reddit.com/r/test/comments/safe")
     prewarmed: list[int] = []
 
-    def topfeeds(*args: object, **kwargs: object) -> tuple[list, list[str]]:
+    def topfeeds(
+        *args: object, **kwargs: object
+    ) -> tuple[list[CoroFactory], list[str]]:
         cache.set(feed, [conflict, safe])
         return [], [feed]
 
     def prewarm(
-        ids: list[int], database: Database, reddit_source: str = "rss"
-    ) -> tuple[list, list[int]]:
+        ids: list[int], database: Database, reddit_source: RedditSource = "rss"
+    ) -> tuple[list[CoroFactory], list[int]]:
         prewarmed.extend(ids)
         return [], []
 

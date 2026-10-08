@@ -730,16 +730,32 @@ def _format_arctic_comments(comments: list[arctic_shift.ArcticComment]) -> list[
     return formatted_comments
 
 
+# Bound on one Arctic Shift thread fetch (post + comment tree, in parallel,
+# retries included): card taps wait on it, and clients give up after 150 s.
+ARCTIC_THREAD_DEADLINE_SECONDS = 30.0
+
+
 async def _fetch_reddit_arctic_context(url: str | None) -> RedditRssContext | None:
     """Post text and top comments of a Reddit thread from Arctic Shift."""
     post_id = _reddit_post_id(url)
     if not post_id:
         return None
     try:
-        posts = await arctic_shift.posts([post_id])
-        comments = await arctic_shift.comment_tree(post_id)
+        posts, comments = await asyncio.wait_for(
+            asyncio.gather(
+                arctic_shift.posts([post_id]), arctic_shift.comment_tree(post_id)
+            ),
+            timeout=ARCTIC_THREAD_DEADLINE_SECONDS,
+        )
     except arctic_shift.ArcticShiftError as exc:
         logging.warning("arctic_shift: thread %s failed: %s", post_id, exc)
+        return None
+    except TimeoutError:
+        logging.warning(
+            "arctic_shift: thread %s exceeded %.0f s",
+            post_id,
+            ARCTIC_THREAD_DEADLINE_SECONDS,
+        )
         return None
     post = posts[0] if posts else None
     if post is None and not comments:

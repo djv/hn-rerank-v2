@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import asyncio
 import html
-import logging
 import threading
 import time
 from collections.abc import Sequence
@@ -32,18 +31,20 @@ import httpx
 
 ARCTIC_SHIFT_BASE_URL = "https://arctic-shift.photon-reddit.com"
 ARCTIC_SHIFT_USER_AGENT = "hn-rewrite/1.0 personal reader (Reddit top posts)"
-ARCTIC_SHIFT_TIMEOUT_SECONDS = 60.0
 # Minimum start-to-start spacing between requests across all threads.
 REQUEST_SPACING_SECONDS = 0.5
 # Wait before the retry when no x-ratelimit-reset header says otherwise.
 RETRY_DELAY_SECONDS = 2.0
-MAX_SEARCH_PAGES = 30
+# Weekly r/ClaudeAI (~2,350 posts) needs 24 pages if the archive answers
+# with its smallest pages; running out of pages is an error, not a list.
+MAX_SEARCH_PAGES = 60
 # "auto" pages return 100-1000 rows; a page under 100 is the last one.
 AUTO_PAGE_MIN_ROWS = 100
 COMMENT_TREE_LIMIT = 200
-# Leaders by search-time score whose full records are loaded; extra room
-# for removed posts that the full record reveals.
+# Full records are loaded in batches of limit * this factor, in search-score
+# order, until ``limit`` posts survive the removal check.
 DETAIL_CANDIDATE_FACTOR = 2
+MAX_DETAIL_BATCHES = 5
 
 _REMOVED_TEXTS = frozenset({"[removed]", "[deleted]"})
 
@@ -60,14 +61,17 @@ class Retry:
     attempts: int
     # Cap on the server's x-ratelimit-reset wait between attempts.
     max_wait_seconds: float
+    # Per-request HTTP timeout.
+    timeout_seconds: float
 
 
 # When overloaded the archive answers 422 "Timeout. Maybe slow down a bit"
 # to every client until its per-minute window resets (x-ratelimit-reset-at
 # on a minute boundary; 2026-10-08). Background top lists wait the window
-# out; thread fetches serve card taps, so they give up sooner.
-TOP_POSTS_RETRY = Retry(attempts=4, max_wait_seconds=65.0)
-THREAD_RETRY = Retry(attempts=2, max_wait_seconds=10.0)
+# out; thread fetches serve card taps, so they give up sooner (callers also
+# bound the whole fetch, see server._fetch_reddit_arctic_context).
+TOP_POSTS_RETRY = Retry(attempts=4, max_wait_seconds=65.0, timeout_seconds=60.0)
+THREAD_RETRY = Retry(attempts=2, max_wait_seconds=10.0, timeout_seconds=15.0)
 
 
 @dataclass(frozen=True)
@@ -105,7 +109,7 @@ def _client() -> httpx.AsyncClient:
     return httpx.AsyncClient(
         base_url=ARCTIC_SHIFT_BASE_URL,
         headers={"User-Agent": ARCTIC_SHIFT_USER_AGENT},
-        timeout=ARCTIC_SHIFT_TIMEOUT_SECONDS,
+        timeout=TOP_POSTS_RETRY.timeout_seconds,
         follow_redirects=True,
     )
 
@@ -140,7 +144,7 @@ async def _get_data(
     for attempt in range(retry.attempts):
         await _wait_turn()
         try:
-            resp = await client.get(path, params=params)
+            resp = await client.get(path, params=params, timeout=retry.timeout_seconds)
         except httpx.HTTPError as exc:
             last_error = repr(exc)
             if attempt + 1 < retry.attempts:
@@ -260,19 +264,17 @@ async def _search_scores(
         new = [p for p in parsed if p.id not in seen]
         for post in new:
             seen[post.id] = post
-        if len(rows) < AUTO_PAGE_MIN_ROWS or not new:
-            break
-        last = max(p.created_utc for p in parsed)
-        if last <= cursor:
-            break
+        if len(rows) < AUTO_PAGE_MIN_ROWS:
+            return list(seen.values())
+        last = max((p.created_utc for p in parsed), default=cursor)
+        if not new or last <= cursor:
+            # A full page within the cursor's second: paging by time cannot
+            # get past it, and a partial list would rank only older posts.
+            raise ArcticShiftError(
+                f"{subreddit}: a full page of posts at second {cursor}"
+            )
         cursor = last
-    else:
-        logging.warning(
-            "arctic_shift: %s search stopped after %d pages",
-            subreddit,
-            MAX_SEARCH_PAGES,
-        )
-    return list(seen.values())
+    raise ArcticShiftError(f"{subreddit}: more than {MAX_SEARCH_PAGES} pages")
 
 
 async def _posts_by_ids(
@@ -311,19 +313,26 @@ async def top_posts(
     """Top ``limit`` posts of ``subreddit`` created in the last window.
 
     Ranked by archived score (highest first, then newest); removed posts
-    are dropped. Raises :class:`ArcticShiftError` when a request fails.
+    are dropped. Raises :class:`ArcticShiftError` when a request fails or
+    the search cannot be paged to the end.
     """
     if limit <= 0:
         return []
     end = int(now if now is not None else time.time())
     start = int(end - window_seconds)
+    batch = limit * DETAIL_CANDIDATE_FACTOR
+    kept: list[ArcticPost] = []
     async with _client() as client:
         scores = await _search_scores(client, subreddit, start, end, TOP_POSTS_RETRY)
-        leaders = sorted(scores, key=lambda p: (-p.score, -p.created_utc))[
-            : limit * DETAIL_CANDIDATE_FACTOR
-        ]
-        posts = await _posts_by_ids(client, [p.id for p in leaders], TOP_POSTS_RETRY)
-    kept = [p for p in posts if not p.removed and start <= p.created_utc <= end]
+        leaders = sorted(scores, key=lambda p: (-p.score, -p.created_utc))
+        for first in range(0, min(len(leaders), batch * MAX_DETAIL_BATCHES), batch):
+            ids = [p.id for p in leaders[first : first + batch]]
+            records = await _posts_by_ids(client, ids, TOP_POSTS_RETRY)
+            kept.extend(
+                p for p in records if not p.removed and start <= p.created_utc <= end
+            )
+            if len(kept) >= limit:
+                break
     kept.sort(key=lambda p: (-p.score, -p.created_utc))
     return kept[:limit]
 

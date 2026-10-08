@@ -645,11 +645,12 @@ _REDDIT_MEDIA_HOSTS = frozenset(
 )
 
 
-def reddit_top_query(feed_url: str) -> tuple[str, float | None, int] | None:
+def reddit_top_query(feed_url: str) -> tuple[str, float, int] | None:
     """``(subreddit, window_seconds, limit)`` of a ``/r/<sub>/top`` feed URL.
 
-    ``window_seconds`` is None for ``t=all``. Returns None for other
-    listings (hot/new), which Arctic Shift cannot rank.
+    Returns None for other listings (hot/new), which Arctic Shift cannot
+    rank, and for ``t=all``: Reddit picks all-time leaders before the age
+    cutoff, which a windowed archive search cannot reproduce.
     """
     if not _reddit_subreddit_from_feed_url(feed_url):
         return None
@@ -659,12 +660,9 @@ def reddit_top_query(feed_url: str) -> tuple[str, float | None, int] | None:
         return None
     query = parse_qs(parsed.query)
     window_name = (query.get("t") or [_REDDIT_DEFAULT_TOP_WINDOW])[0].lower()
-    if window_name == "all":
-        window: float | None = None
-    elif window_name in _REDDIT_TOP_WINDOW_SECONDS:
-        window = _REDDIT_TOP_WINDOW_SECONDS[window_name]
-    else:
+    if window_name not in _REDDIT_TOP_WINDOW_SECONDS:
         return None
+    window = _REDDIT_TOP_WINDOW_SECONDS[window_name]
     try:
         limit = int((query.get("limit") or [_REDDIT_DEFAULT_LIMIT])[0])
     except ValueError:
@@ -720,11 +718,10 @@ async def _fetch_arctic_topfeed(
         logging.warning("arctic_shift: unsupported Reddit feed %s", feed_url)
         return []
     subreddit, window, limit = query
-    window_seconds = window if window is not None else now - cutoff
     try:
         posts = await arctic_shift.top_posts(
             subreddit,
-            window_seconds=window_seconds,
+            window_seconds=window,
             limit=min(per_feed, limit),
             now=now,
         )

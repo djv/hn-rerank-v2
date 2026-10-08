@@ -1,5 +1,24 @@
 # Worklog: hn-rewrite
 
+## 2026-10-08 Fixes from Codex review of the Arctic Shift change
+
+The user asked Codex (gpt-6.1-sol, high effort, read-only) to review
+`66d64ff..94e574b`. Its five findings were verified and fixed, each with a
+regression test that fails on the old code:
+- A Reddit card tap could wait ~260 s on a slow archive (sequential post
+  and comment requests, two 60 s attempts each). Thread fetches now run in
+  parallel within a 30 s deadline, with 15 s requests.
+- A search that hit the page cap or a full page inside one second returned
+  a partial, oldest-first list as a success. It now raises (the feed keeps
+  its stored stories); the cap is 60 pages.
+- Only the top `2 × limit` records were loaded, so removed leaders could
+  leave a list short. Records now load in score-order batches until
+  `limit` survive.
+- `t=all` feeds would have meant "last 30 days"; they are rejected (no
+  configured feed uses them).
+- Test helpers changed today are annotated.
+No RSS-mode regression, story-id mismatch or remaining vote race was found.
+
 ## 2026-10-08 Reddit switched to Arctic Shift
 
 The user asked to switch now instead of on November 11: config.toml sets

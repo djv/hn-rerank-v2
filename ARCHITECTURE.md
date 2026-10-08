@@ -334,17 +334,23 @@ is `not s.top_comments`), so a cache would have near-zero hit rate.
 #### 3.4.4 Arctic Shift as the Reddit source
 
 Reddit retires RSS on 2026-11-13 and already answers anonymous `.json`
-and HTML with 403. `reddit_source = "arctic_shift"` (default `"rss"`)
-reads both Reddit paths from the Arctic Shift archive instead
+and HTML with 403. `reddit_source = "arctic_shift"` (code default `"rss"`;
+config.toml sets it since 2026-10-08) reads both Reddit paths from the
+Arctic Shift archive instead
 (`arctic_shift.py`; free, no key, at most a couple of requests/s). The
 subreddit list is still the `/r/<sub>/top/.rss?t=…&limit=…` URLs in
 `rss.feeds`; `reddit_top_query` reads the subreddit, window and limit
-from them.
+from them. Hot/new listings and `t=all` are unsupported (Reddit picks
+all-time leaders before the age cutoff, which a windowed search cannot
+reproduce).
 
 * **Top feeds** (`_fetch_arctic_topfeed`): search returns every post in
-  the window sorted by time, paged on `created_utc`; `top_posts` ranks by
-  archived score locally, loads full records for the leaders, and keeps
-  the top `limit`. Stories are keyed by permalink exactly as RSS entries
+  the window sorted by time, paged on `created_utc`; a search that cannot
+  be paged to the end (60-page cap, or a full page inside one second)
+  raises, so the feed keeps its previous stories rather than ranking only
+  the oldest posts. `top_posts` ranks by archived score locally and loads
+  full records in score order, `2 × limit` at a time (at most 5 batches),
+  until `limit` posts survive the removal check. Stories are keyed by permalink exactly as RSS entries
   are (`rss_story_id`), so ids, votes and caches carry over, and keep
   score/comment count 0 as on the RSS path. Arctic Shift scores a post
   only after ~36 h (score 1 before), so a post joins the list about
@@ -355,16 +361,19 @@ from them.
   fewer than `limit` visible posts a week gets a few score-0/1 posts that
   Reddit hid (r/ExpatFIRE: RSS 16, Arctic Shift 25).
 * **Threads** (`server._fetch_reddit_arctic_context`, used by prewarm and
-  tldr-detail): the post's text plus its comment tree, top-level comments
-  by score first, then replies, with the RSS path's filters and caps.
+  tldr-detail): the post's text plus its comment tree, fetched in
+  parallel within `ARCTIC_THREAD_DEADLINE_SECONDS` (30 s, retries
+  included; clients give up after 150 s), top-level comments by score
+  first, then replies, with the RSS path's filters and caps.
 * **Pacing**: these factories skip `reddit_limiter` (it paces reddit.com
   only); `arctic_shift` spaces requests 0.5 s apart process-wide and the
   queue strides by `reddit_arctic_stride_seconds` (2 s). Overload answers
   (422 "Timeout. Maybe slow down a bit", 429, 5xx) are retried after the
   server's `x-ratelimit-reset`. The archive sheds load for every client
   until its per-minute window resets, so top lists (background) wait up to
-  65 s over 4 attempts (`TOP_POSTS_RETRY`); threads, which serve card
-  taps, wait at most 10 s over 2 (`THREAD_RETRY`). A failed feed keeps its
+  65 s over 4 attempts with 60 s requests (`TOP_POSTS_RETRY`); threads,
+  which serve card taps, wait at most 10 s over 2 attempts with 15 s
+  requests (`THREAD_RETRY`). A failed feed keeps its
   stored stories and is retried on the next refresh.
 * **Check before switching**: `scripts/compare_reddit_sources.py` fetches
   each feed both ways and counts matching story ids.

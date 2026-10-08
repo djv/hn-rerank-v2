@@ -166,6 +166,44 @@ async def test_top_posts_ranks_by_score_and_drops_removed(
     assert search["sort"] == ["asc"]
 
 
+async def test_top_posts_loads_more_records_when_leaders_were_removed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posts = [
+        _raw_post("r1", 900, NOW - 3600, selftext="[removed]"),
+        _raw_post("r2", 800, NOW - 3600, selftext="[deleted]"),
+        _raw_post("r3", 700, NOW - 3600, selftext="[removed]"),
+        _raw_post("ok1", 600, NOW - 3600),
+        _raw_post("ok2", 500, NOW - 3600),
+        _raw_post("ok3", 400, NOW - 3600),
+    ]
+    seen = _serve(monkeypatch, _archive(posts))
+
+    top = await arctic_shift.top_posts("x", window_seconds=WEEK, limit=2, now=NOW)
+
+    assert [p.id for p in top] == ["ok1", "ok2"]
+    assert [r.url.path for r in seen].count("/api/posts/ids") == 2
+
+
+async def test_top_posts_refuses_a_search_it_cannot_page_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A truncated search would rank only the oldest posts, so it fails and
+    the refresh keeps the feed's previous stories."""
+    page = arctic_shift.AUTO_PAGE_MIN_ROWS
+    # More posts within one second than a page holds: time paging stalls.
+    tied = [_raw_post(f"t{i}", 5, NOW - 3600) for i in range(page + 20)]
+    _serve(monkeypatch, _archive(tied, page))
+    with pytest.raises(ArcticShiftError, match="full page"):
+        await arctic_shift.top_posts("x", window_seconds=WEEK, limit=5, now=NOW)
+
+    spread = [_raw_post(f"s{i}", 5, NOW - WEEK + 60 * i) for i in range(3 * page)]
+    _serve(monkeypatch, _archive(spread, page))
+    monkeypatch.setattr(arctic_shift, "MAX_SEARCH_PAGES", 2)
+    with pytest.raises(ArcticShiftError, match="more than 2 pages"):
+        await arctic_shift.top_posts("x", window_seconds=WEEK, limit=5, now=NOW)
+
+
 async def test_top_posts_raises_on_error_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -296,13 +334,16 @@ async def test_comment_tree_flattens_with_depth(
     [
         (FEED, ("LocalLLaMA", float(WEEK), 25)),
         ("https://www.reddit.com/r/haskell/top/.rss", ("haskell", 86400.0, 25)),
-        ("https://old.reddit.com/r/x/top/.rss?t=all&limit=10", ("x", None, 10)),
+        ("https://old.reddit.com/r/x/top/.rss?t=month&limit=10", ("x", 2592000.0, 10)),
+        # All-time leaders come before the age cutoff on Reddit; a windowed
+        # archive search cannot reproduce that, so t=all is unsupported.
+        ("https://www.reddit.com/r/x/top/.rss?t=all", None),
         ("https://www.reddit.com/r/x/hot/.rss", None),
         ("https://example.com/r/x/top/.rss", None),
     ],
 )
 def test_reddit_top_query(
-    feed_url: str, expected: tuple[str, float | None, int] | None
+    feed_url: str, expected: tuple[str, float, int] | None
 ) -> None:
     assert reddit_top_query(feed_url) == expected
 
@@ -575,6 +616,34 @@ async def test_arctic_context_orders_and_filters_comments(
         ]
     )
     assert ctx.comment_count == 3
+
+
+async def test_arctic_context_gives_up_at_its_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow archive must not hold a card tap past the deadline (clients
+    give up after 150 s; retries alone could take minutes)."""
+
+    async def slow(_request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(30)
+        return httpx.Response(200, json={"data": []})
+
+    def client() -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            base_url=arctic_shift.ARCTIC_SHIFT_BASE_URL,
+            transport=httpx.MockTransport(slow),
+        )
+
+    monkeypatch.setattr(arctic_shift, "_client", client)
+    monkeypatch.setattr(server, "ARCTIC_THREAD_DEADLINE_SECONDS", 0.2)
+    started = time.monotonic()
+
+    ctx = await server._fetch_reddit_arctic_context(
+        "https://www.reddit.com/r/x/comments/abc/slug/"
+    )
+
+    assert ctx is None
+    assert time.monotonic() - started < 5
 
 
 async def test_arctic_context_is_none_on_failure(
