@@ -25,14 +25,20 @@ metadata-scale middle variant, short-history curve).
 - Gates: VPS copy 1,168 passed (3 git-dependent eval tests fail there only;
   they pass locally), Ruff clean, ty only the existing inspection-script
   diagnostic.
-- User asked to merge everything into main and deploy on the VPS
-  (includes the Why-this-story expansion); profile 151 enabled in
-  config.toml.
+- Deployed main 8d85747 to the VPS (includes the Why-this-story
+  expansion; rollback tag deploy-pre-interleave-20261007 = 3475235).
+  Live since T0 = 1791432442.75 (2026-10-08 04:07:22 UTC): every window's
+  first 12 Recommended cards split 4/4/4; post-vote reranks 11-20 s;
+  smoke tests 200 (dashboard, feed, ranking-ready, cached and uncached
+  tldr-detail); no journal errors. The first deploy (7de14af, 03:55 UTC)
+  drafted before deduplication and left 3/2/7 splits; its decks are
+  excluded. Two diagnostic profiles (213, 214) came from smoke tests.
 
 ## Next step
-- Deploy main to the VPS, smoke-test, record T0 (first interleave_decks
-  row) here; final analysis at T0 + 28 days with the command in
-  INTERLEAVING.md; weekly descriptive reports and safety checks.
+- Final analysis at T0 + 28 days, 2026-11-05 04:07 UTC (Nov 4 23:07 ET):
+  `uv run python scripts/interleave_report.py --db hn_rewrite.db
+  --user-id 151 --since 1791432442.75 --until 1793851642.75` on the VPS.
+  Weekly descriptive reports and safety checks per INTERLEAVING.md.
 - Offline follow-ups still running on the laptop
   (`/tmp/hn-single-followup-20261007/launch.py`, clean worktree
   ../hn-rerank-offline-20261007 at b5eabdc); copy results into

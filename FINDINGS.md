@@ -2869,3 +2869,20 @@ sysctl file; it was left unchanged and is not established as the cause.
 No production app code or profile credentials were changed. Anonymous
 diagnostic dashboard requests can create profiles; signup counts from this
 incident must not be interpreted as organic users.
+
+# 2026-10-08 Interleaving deploy: draft after deduplication
+
+User chose live interleaving of shortlist #2/#4 against production for
+profile 151 (28 days) and asked to merge everything into main and deploy.
+First deploy 7de14af (03:55 UTC) drafted each window's Recommended view
+before deduplication and HN-dupe canonicalization; those then dropped 4-16
+of 32 picks per window unevenly (live 1w first 12: production 3, #2 2, #4
+7). A bench-copy trace showed the draft itself was 4/4/4. Fix 8d85747
+keeps every arm's top 32 per window through finalization and drafts the
+survivors (`draft_recommended`); bench and live decks are 4/4/4 in every
+window. T0 = 1791432442.75 (04:07:22 UTC); earlier decks are excluded.
+Rerank cost on the VPS (copy of the live DB, one BLAS thread): after a vote
+39 s with cold challenger fits, 29 s with warm starts, 21 s with shared
+feature builds; production alone ~10 s. Live post-fix reranks: 11-20 s.
+Smoke tests 200; no journal errors. Two diagnostic profiles (213, 214) are
+from the smoke tests, not signups.

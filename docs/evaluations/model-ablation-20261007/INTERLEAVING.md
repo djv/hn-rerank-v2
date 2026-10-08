@@ -100,7 +100,8 @@ also ships the expanded Why-this-story panel.
 - Start T0 is the first `interleave_decks` row after the deployment that
   drafts after deduplication (recorded in STATUS.md); decks from the first
   deployment (03:56–04:3x UTC Oct 8, unbalanced 3/2/7 splits after drops)
-  are excluded; the one final analysis covers votes in [T0, T0 + 28 days):
+  are excluded. T0 = 1791432442.75 (2026-10-08 04:07:22 UTC, deploy
+  8d85747); the window ends 1793851642.75 (2026-11-05 04:07:22 UTC); the one final analysis covers votes in [T0, T0 + 28 days):
   `uv run python scripts/interleave_report.py --db hn_rewrite.db --user-id
   151 --since T0 --until T0+2419200`.
 - Primary test, per challenger: credited upvote rate against production's,
