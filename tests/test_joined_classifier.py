@@ -210,7 +210,7 @@ def test_rerank_interleaves_only_when_every_challenger_fits(
     labels: list[int], interleaved: bool
 ) -> None:
     from pipeline.interleave import challenger_configs
-    from pipeline.ranking import rerank_candidates
+    from pipeline.ranking import draft_recommended, rerank_candidates
 
     db = Database(":memory:")
     try:
@@ -230,6 +230,7 @@ def test_rerank_interleaves_only_when_every_challenger_fits(
         embs = rng.standard_normal((len(candidates), 384)).astype(np.float32)
         embs /= np.linalg.norm(embs, axis=1, keepdims=True)
         trace = RankTrace()
+        rankings: dict[str, list[int]] = {}
         deck = rerank_candidates(
             db,
             config,
@@ -239,8 +240,10 @@ def test_rerank_interleaves_only_when_every_challenger_fits(
             user_id=user_id,
             trace=trace,
             challengers=challenger_configs(config, user_id),
-            rng=np.random.default_rng(4),
+            arm_rankings_out=rankings,
         )
+        if rankings:
+            deck = draft_recommended(deck, rankings, np.random.default_rng(4))
         arms = {r.arm for r in deck.window("1d").recommended}
         if interleaved:
             assert arms == {"production", "joined_all", "joined_no_metadata"}
@@ -249,6 +252,7 @@ def test_rerank_interleaves_only_when_every_challenger_fits(
         else:
             assert arms == {""}
             assert trace.labels["interleave"] == "off"
+            assert rankings == {}
     finally:
         db.close()
 

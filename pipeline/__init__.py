@@ -32,6 +32,7 @@ from .config import (
 
 from .ranking import (
     COMMENT_DEPTH_PENALTY,
+    draft_recommended,
     EXPLORE_PER_BADGE,
     Embedder,
     GRAVITY_TIME_SCALE,
@@ -998,6 +999,7 @@ def fast_rerank_for_user(
         feedback, tuple(config.model.dedup_exclude_actions)
     )
     challengers = challenger_configs(config, user_id)
+    arm_rankings: dict[str, list[int]] = {}
     deck = rerank_candidates(
         db=db,
         config=config,
@@ -1008,11 +1010,11 @@ def fast_rerank_for_user(
         trace=trace,
         is_feedback_match=lambda s: _matches_feedback(s, feedback_context),
         challengers=challengers,
-        rng=np.random.default_rng() if challengers else None,
+        arm_rankings_out=arm_rankings,
     )
     _count_nonhn(trace, "deck_nonhn_pre_dedup", deck)
 
-    return finalize_ranked_deck(
+    final = finalize_ranked_deck(
         deck,
         candidates,
         cand_embeddings,
@@ -1024,6 +1026,10 @@ def fast_rerank_for_user(
         feedback=feedback,
         feedback_context=feedback_context,
     )
+    if arm_rankings:
+        with trace.stage("interleave_draft"):
+            final = draft_recommended(final, arm_rankings, np.random.default_rng())
+    return final
 
 
 def _count_nonhn(trace: RankTrace | _NullTrace, name: str, deck: WindowDeck) -> None:

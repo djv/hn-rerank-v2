@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import html
+import itertools
 import json
 import logging
 import re
@@ -2045,7 +2046,6 @@ def assemble_window_deck(
     is_feedback_match: Callable[[Story], bool] | None = None,
     trace: RankTrace | _NullTrace = NULL_TRACE,
     arm_rankings: Mapping[str, Sequence[int]] | None = None,
-    rng: np.random.Generator | None = None,
 ) -> WindowDeck:
     """Pick every window's three views from a fully scored candidate pool,
     all at one *now*, each ``SELECT_MARGIN`` times its served size
@@ -2055,9 +2055,8 @@ def assemble_window_deck(
 
     - Recommended: the top stories by model score, no source quota. With
       *arm_rankings* (challenger arm -> story IDs best first, over the same
-      candidates), a team-draft interleaving of the model-score order
-      (``PRODUCTION_ARM``) and each challenger's order instead, every card
-      tagged with its arm; *rng* draws the turn order.
+      candidates), every arm's top stories instead, in model-score order:
+      the pool ``draft_recommended`` interleaves after deduplication.
     - Popular: the top HN stories by ``hn_gravity`` on the window's clock
       (``GRAVITY_TIME_SCALE``). Each card independently gets every badge
       it qualifies for: 🔥 Hot when its velocity
@@ -2181,10 +2180,14 @@ def assemble_window_deck(
     for window in WINDOWS:
         pool = [r for r in by_score if in_window(r.story.time, window, now)]
         trace.set_count(f"window_pool_{window}", len(pool))
+        recommended = pool[: VIEW_SIZE * SELECT_MARGIN]
         if arm_rankings:
-            recommended = _interleaved(pool, arm_rankings, rng)
-        else:
-            recommended = pool[: VIEW_SIZE * SELECT_MARGIN]
+            in_pool = {r.story.id for r in pool}
+            tops = {r.story.id for r in recommended}
+            for ranking in arm_rankings.values():
+                own = (sid for sid in ranking if sid in in_pool)
+                tops.update(itertools.islice(own, VIEW_SIZE * SELECT_MARGIN))
+            recommended = [r for r in pool if r.story.id in tops]
         popular = sorted(
             (r for r in pool if is_hn_source(r.story.source)),
             key=lambda r: hn_gravity(
@@ -2214,24 +2217,32 @@ def assemble_window_deck(
     return WindowDeck(windows)
 
 
-def _interleaved(
-    pool: list[RankedStory],
+def draft_recommended(
+    deck: WindowDeck,
     arm_rankings: Mapping[str, Sequence[int]],
-    rng: np.random.Generator | None,
-) -> list[RankedStory]:
-    """A window's Recommended view drafted from production (*pool*'s order)
-    and every challenger's order of the same stories."""
-    if rng is None:
-        raise ValueError("interleaving needs a random generator")
-    by_id = {r.story.id: r for r in pool}
+    rng: np.random.Generator,
+) -> WindowDeck:
+    """Interleave each window's Recommended view of a finalized deck built
+    with *arm_rankings*: its stories (every arm's top stories that survived
+    deduplication and HN-dupe canonicalization, in model-score order) are
+    team-drafted from production's order and each challenger's, every card
+    tagged with its arm. Drafting after the drops keeps the arms' turns
+    balanced in what is served. A story canonicalized to another ID keeps
+    its production rank; the challengers see that ID at their own rank."""
     arms = [PRODUCTION_ARM, *arm_rankings]
-    orders = [list(by_id)] + [
-        [sid for sid in ranking if sid in by_id] for ranking in arm_rankings.values()
-    ]
-    return [
-        replace(by_id[pick.item], arm=arms[pick.arm])
-        for pick in team_draft(orders, VIEW_SIZE * SELECT_MARGIN, rng)
-    ]
+    windows: dict[Window, WindowViews] = {}
+    for window, views in deck.windows.items():
+        by_id = {r.story.id: r for r in views.recommended}
+        orders = [list(by_id)] + [
+            [sid for sid in ranking if sid in by_id]
+            for ranking in arm_rankings.values()
+        ]
+        drafted = tuple(
+            replace(by_id[pick.item], arm=arms[pick.arm])
+            for pick in team_draft(orders, VIEW_SIZE * SELECT_MARGIN, rng)
+        )
+        windows[window] = replace(views, recommended=drafted)
+    return WindowDeck(windows)
 
 
 def serve_window(views: WindowViews, window: Window, now: float) -> WindowViews:
@@ -2266,7 +2277,7 @@ def rerank_candidates(
     trace: RankTrace | _NullTrace = NULL_TRACE,
     is_feedback_match: Callable[[Story], bool] | None = None,
     challengers: Sequence[tuple[str, Config]] = (),
-    rng: np.random.Generator | None = None,
+    arm_rankings_out: dict[str, list[int]] | None = None,
 ) -> WindowDeck:
     """Score candidates and pick every window's views.
 
@@ -2274,9 +2285,11 @@ def rerank_candidates(
     :func:`assemble_ranked_deck` (window views, badges, attribution).
     *is_feedback_match* is passed on to the Explore picks (see
     :func:`assemble_window_deck`). Each of *challengers* (arm name, its
-    config) scores the same candidates too, and Recommended interleaves
-    them with production; if any challenger's classifier fails to fit,
-    the deck is production's alone.
+    config) scores the same candidates too: Recommended then holds every
+    arm's top stories, and *arm_rankings_out* receives each challenger's
+    order for ``draft_recommended``. If any challenger's classifier fails
+    to fit, the deck is production's alone and *arm_rankings_out* stays
+    empty.
 
     Use this in production; the private ``_score_and_rank`` is intended for
     tier-blend tests that need to assert on ranking without badge side effects.
@@ -2333,6 +2346,8 @@ def rerank_candidates(
             trace.add_timing(f"challenger_{arm}_{stage}", elapsed_ms)
         arm_rankings[arm] = [r.story.id for r in challenger]
     trace.set_label("interleave", ",".join(arm_rankings) or "off")
+    if arm_rankings_out is not None:
+        arm_rankings_out.update(arm_rankings)
 
     return assemble_ranked_deck(
         ranked,
@@ -2346,7 +2361,6 @@ def rerank_candidates(
         trace=trace,
         is_feedback_match=is_feedback_match,
         arm_rankings=arm_rankings,
-        rng=rng,
     )
 
 
@@ -2526,7 +2540,6 @@ def assemble_ranked_deck(
     trace: RankTrace | _NullTrace = NULL_TRACE,
     is_feedback_match: Callable[[Story], bool] | None = None,
     arm_rankings: Mapping[str, Sequence[int]] | None = None,
-    rng: np.random.Generator | None = None,
 ) -> WindowDeck:
     """Pick the window views (with Explore) from an existing ranking."""
     if not candidates:
@@ -2600,7 +2613,6 @@ def assemble_ranked_deck(
             is_feedback_match=is_feedback_match,
             trace=trace,
             arm_rankings=arm_rankings,
-            rng=rng,
         )
     with trace.stage("attribution"):
         return _fill_best_match_titles(deck, candidates, score_context, cand_embeddings)

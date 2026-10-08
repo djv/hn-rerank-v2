@@ -220,11 +220,15 @@ probabilities equal the offline adapter's exactly
 Live, the classifier serves only as an interleaving challenger. For users
 in `interleave_user_ids` (empty by default), each warm also scores the
 candidates with every arm in `interleave_arms` (`joined_all`,
-`joined_no_metadata`), each in its own model-cache entry. Each window's
-Recommended view is then a team-draft interleaving
-(`pipeline/interleave.py`): every round visits production and the
-challengers in a fresh random order, and each adds its best story not
-already listed. Cards keep production's score, probabilities and
+`joined_no_metadata`), each in its own model-cache entry, reusing
+production's feature build (`SharedFeatures`) and warm-starting from its
+previous fit. Each window's Recommended view first holds every arm's top
+32 stories; after deduplication and HN-dupe canonicalization,
+`draft_recommended` team-drafts the survivors (`pipeline/interleave.py`):
+every round visits production and the challengers in a fresh random order,
+and each adds its best story not already listed. Drafting after those drops
+keeps the served turns balanced (drafting before them left 3/2/7 splits in
+the first live deck). Cards keep production's score, probabilities and
 explanation; only `RankedStory.arm` records who drafted them, and clients
 never see it. Popular and Explore are unchanged, apart from Explore
 excluding the interleaved Recommended stories. If any challenger fails to

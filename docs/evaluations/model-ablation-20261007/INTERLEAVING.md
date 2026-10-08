@@ -97,8 +97,10 @@ voted stories, meanwhile.
 The user chose a fixed 28-day horizon and to deploy current `main`, which
 also ships the expanded Why-this-story panel.
 
-- Start T0 is the first `interleave_decks` row after deployment (recorded in
-  STATUS.md); the one final analysis covers votes in [T0, T0 + 28 days):
+- Start T0 is the first `interleave_decks` row after the deployment that
+  drafts after deduplication (recorded in STATUS.md); decks from the first
+  deployment (03:56–04:3x UTC Oct 8, unbalanced 3/2/7 splits after drops)
+  are excluded; the one final analysis covers votes in [T0, T0 + 28 days):
   `uv run python scripts/interleave_report.py --db hn_rewrite.db --user-id
   151 --since T0 --until T0+2419200`.
 - Primary test, per challenger: credited upvote rate against production's,

@@ -72,16 +72,22 @@ def test_team_draft_identical_arms_split_credit_evenly() -> None:
 _NOW = 1_800_000_000.0
 
 
-@given(st.integers(0, 2**32 - 1), st.integers(4, 60))
-def test_interleaved_recommended_takes_turns_and_keeps_arm_orders(
-    seed: int, size: int
+@given(st.integers(0, 2**32 - 1), st.integers(4, 90), st.floats(0.0, 0.6))
+def test_drafting_after_drops_takes_turns_over_the_survivors(
+    seed: int, size: int, drop_share: float
 ) -> None:
     from dataclasses import replace
 
     from database import Story
     from pipeline import Config, RankedStory
     from pipeline.interleave import PRODUCTION_ARM
-    from pipeline.ranking import SELECT_MARGIN, VIEW_SIZE, assemble_window_deck
+    from pipeline.ranking import (
+        SELECT_MARGIN,
+        VIEW_SIZE,
+        assemble_window_deck,
+        draft_recommended,
+        in_window,
+    )
 
     rng = np.random.default_rng(seed)
     pool = [
@@ -97,16 +103,34 @@ def test_interleaved_recommended_takes_turns_and_keeps_arm_orders(
         "joined_all": production[::-1],
         "joined_no_metadata": [int(i) for i in rng.permutation(production)],
     }
-    deck = assemble_window_deck(
-        pool, config=Config(), now=_NOW, arm_rankings=rankings, rng=rng
+    limit = VIEW_SIZE * SELECT_MARGIN
+    deck = assemble_window_deck(pool, config=Config(), now=_NOW, arm_rankings=rankings)
+    # Deduplication and dupe canonicalization drop stories after assembly.
+    dropped = {sid for sid in production if rng.random() < drop_share}
+    finalized = deck.map_views(
+        lambda _w, view, items: (
+            r for r in items if view != "recommended" or r.story.id not in dropped
+        )
     )
-    plain = assemble_window_deck(pool, config=Config(), now=_NOW)
+    drafted = draft_recommended(finalized, rankings, rng)
 
+    by_id = {r.story.id: r for r in pool}
     for window, views in deck.windows.items():
-        served = views.recommended
-        expected = plain.window(window).recommended
-        assert len(served) == min(len(expected), VIEW_SIZE * SELECT_MARGIN)
-        assert len({r.story.id for r in served}) == len(served)
+        in_pool = [
+            sid for sid in production if in_window(by_id[sid].story.time, window, _NOW)
+        ]
+        # Assembly keeps every arm's top stories, in production order, untagged.
+        union = [r.story.id for r in views.recommended]
+        expected = set(in_pool[:limit])
+        for ranking in rankings.values():
+            expected |= set([sid for sid in ranking if sid in set(in_pool)][:limit])
+        assert union == [sid for sid in in_pool if sid in expected]
+        assert all(r.arm == "" for r in views.recommended)
+
+        survivors = [r.story.id for r in finalized.window(window).recommended]
+        served = drafted.window(window).recommended
+        assert len(served) == min(len(survivors), limit)
+        assert {r.story.id for r in served} <= set(survivors)
         orders = {PRODUCTION_ARM: production, **rankings}
         for arm, order in orders.items():
             own = [r.story.id for r in served if r.arm == arm]
@@ -115,11 +139,10 @@ def test_interleaved_recommended_takes_turns_and_keeps_arm_orders(
             counts = Counter(r.arm for r in served[:end])
             assert set(counts.values()) == {end // 3}
         # Cards keep production's score, probabilities and badges.
-        by_id = {r.story.id: r for r in pool}
         for r in served:
             assert replace(r, arm="") == by_id[r.story.id]
-        assert all(r.arm == "" for r in views.popular + views.explore)
-        assert all(r.arm == "" for r in plain.window(window).recommended)
+        assert drafted.window(window).popular == finalized.window(window).popular
+        assert drafted.window(window).explore == finalized.window(window).explore
 
 
 def test_only_listed_users_get_challenger_arms() -> None:
