@@ -283,6 +283,42 @@ def test_feature_subsets_keep_only_the_requested_blocks(
     np.testing.assert_allclose(actual, expected)
 
 
+def test_metadata_scale_touches_only_the_metadata_block() -> None:
+    from scipy.sparse import csr_matrix
+
+    stories = [
+        Story(id=i, title="apple orchard", url="", score=1, time=1, text_content="")
+        for i in range(6)
+    ]
+    lexical = fit_lexical_inputs(stories, [0, 1, 2] * 2, stories)
+    features = np.tile([1, 2, 3, 4, 11, 12], (6, 1)).astype(float)
+
+    def inputs(metadata_scale: float) -> np.ndarray:
+        model = OneClassifier(
+            c=4,
+            gamma=0.03,
+            chunk_size=2,
+            spec=ClassifierSpec(
+                "logistic",
+                embedding_weight=4,
+                numeric_scale=3,
+                metadata_scale=metadata_scale,
+            ),
+            lexical=lexical,
+            metadata_columns=2,
+        )
+        matrix = model.inputs(features, training=True)
+        assert isinstance(matrix, csr_matrix)
+        return matrix.toarray()
+
+    full, half = inputs(1.0), inputs(0.5)
+    np.testing.assert_array_equal(half[:, :4], full[:, :4])
+    np.testing.assert_allclose(half[:, 4:6], full[:, 4:6] / 2)
+    np.testing.assert_array_equal(half[:, 6:], full[:, 6:])
+    with pytest.raises(ValueError, match="block weights"):
+        ClassifierSpec("logistic", metadata_scale=0)
+
+
 def test_missing_class_placeholder_fails_before_fitting() -> None:
     stories = [
         Story(id=i, title="apple orchard", url="", score=1, time=1, text_content="")

@@ -56,6 +56,10 @@ class ClassifierSpec:
     score: Literal["up", "up_down"] = "up"
     embedding_weight: float = 1.0
     numeric_scale: float = 1.0
+    # Multiplies only the metadata block (after numeric_scale); 1 keeps the
+    # selected all-feature classifier, smaller values sit between it and
+    # the no-metadata classifier.
+    metadata_scale: float = 1.0
 
     def __post_init__(self) -> None:
         if not np.isfinite(self.word_scale) or self.word_scale <= 0:
@@ -66,7 +70,7 @@ class ClassifierSpec:
             raise ValueError("model size must be positive")
         if not all(
             np.isfinite(v) and v > 0
-            for v in (self.embedding_weight, self.numeric_scale)
+            for v in (self.embedding_weight, self.numeric_scale, self.metadata_scale)
         ):
             raise ValueError("block weights must be positive and finite")
 
@@ -143,7 +147,7 @@ class OneClassifier(ranking.PrecomputedRbfSVC):
                     embeddings = self.pca.transform(embeddings)
             numeric_parts.append(embeddings)
         if self.spec.features in {"all", "numeric", "metadata_words"}:
-            numeric_parts.append(metadata)
+            numeric_parts.append(metadata * self.spec.metadata_scale)
         numeric = (
             np.hstack(numeric_parts) if numeric_parts else np.empty((len(features), 0))
         )
@@ -362,6 +366,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--feedback-cohort", type=Path)
     parser.add_argument("--embedding-weight", type=float, default=1.0)
     parser.add_argument("--numeric-scale", type=float, default=1.0)
+    parser.add_argument("--metadata-scale", type=float, default=1.0)
     parser.add_argument("evaluation_args", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     spec = ClassifierSpec(
@@ -374,6 +379,7 @@ def main(argv: list[str] | None = None) -> None:
         args.score,
         args.embedding_weight,
         args.numeric_scale,
+        args.metadata_scale,
     )
     evaluation_args = (
         args.evaluation_args[1:]

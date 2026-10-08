@@ -2251,6 +2251,20 @@ def _holdout_splits(
     ]
 
 
+def _recent_training(
+    splits: list[FoldSplit], vote_times: np.ndarray, limit: int
+) -> list[FoldSplit]:
+    """Each split trained on only its *limit* most recent training votes
+    (ties at the cutoff broken by feedback order), to see how a ranker does
+    with a short vote history; test votes are unchanged."""
+    out = []
+    for split in splits:
+        order = np.lexsort((split.train_pos, vote_times[split.train_pos]))
+        kept = np.sort(split.train_pos[order][-limit:])
+        out.append(FoldSplit(split.fold_no, kept, split.test_pos))
+    return out
+
+
 def _variant_requires_all_labels(name: str) -> bool:
     all_label_prefixes = (
         "margin3",
@@ -2452,6 +2466,14 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
             "time blocks, each trained on every vote before it"
         ),
     )
+    parser.add_argument(
+        "--train-recent",
+        type=int,
+        help=(
+            "Train each split on only its N most recent training votes "
+            "(short-history check; test votes unchanged)"
+        ),
+    )
     parser.add_argument("--now", type=float, help="Frozen evaluation Unix timestamp")
     parser.add_argument(
         "--candidate-cap-seed",
@@ -2472,6 +2494,7 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
         "max_candidates",
         "max_feedback_per_class",
         "window_days",
+        "train_recent",
     ):
         value = getattr(args, option)
         if value is not None and value <= 0:
@@ -2898,6 +2921,8 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
             )
             for i, block in enumerate(np.array_split(reserved, args.folds), 1)
         ]
+    if args.train_recent is not None:
+        splits = _recent_training(splits, fb_vote_times, args.train_recent)
     _validate_splits(
         splits,
         y,
@@ -3057,6 +3082,7 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
             "confirmation_start": float(confirmation_start),
             "holdout_after": args.holdout_after,
             "holdout_blocks": args.holdout_blocks,
+            "train_recent": args.train_recent,
             "sampling": {
                 "max_candidates": args.max_candidates,
                 "max_feedback_per_class": args.max_feedback_per_class,
