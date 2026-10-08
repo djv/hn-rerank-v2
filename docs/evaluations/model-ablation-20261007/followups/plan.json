@@ -1,0 +1,101 @@
+{
+  "selection": "User selected all four offline follow-ups (power replay, fit timing, metadata-scale middle, cold-start curve) on 2026-10-07; fit timing runs separately on the production code path.",
+  "code_revision": "b5eabdc6af269d69b254d8c16acf8424cdc72505",
+  "launcher_sha256": "d53787110b814bb2c99c6b00fec96dd72589066c93206babebebd12e074549de",
+  "snapshot_db_sha256": "912bd080178158c1bee69a0ec863674667c66cae3f76dd5322c6895dc989f8c1",
+  "native_config_sha256": "f6f84babe59f565504971d859dc77f452cbf3a64e18646cfbe1a9c094d54e4db",
+  "selected_spec": {
+    "family": "logistic",
+    "features": "all",
+    "word_scale": 1.0,
+    "max_leaf_nodes": 15,
+    "l2": 1.0,
+    "hidden": 32,
+    "score": "up_down",
+    "embedding_weight": 16.0,
+    "numeric_scale": 0.15811388300841897
+  },
+  "power": {
+    "settings": [
+      {
+        "votes_per_deck": 4,
+        "challenger_weight": 1.0
+      },
+      {
+        "votes_per_deck": 1,
+        "challenger_weight": 1.0
+      },
+      {
+        "votes_per_deck": 12,
+        "challenger_weight": 1.0
+      },
+      {
+        "votes_per_deck": 4,
+        "challenger_weight": 0.5
+      },
+      {
+        "votes_per_deck": 4,
+        "challenger_weight": 0.0
+      }
+    ],
+    "replicates": 1000,
+    "days": [
+      7,
+      14,
+      28,
+      56
+    ],
+    "votes_per_day": 50,
+    "deck_size": 12,
+    "alpha": 0.05,
+    "bonferroni_challengers": 2,
+    "seed": 20261008,
+    "arms": [
+      "production",
+      "#2 all features",
+      "#4 no metadata"
+    ],
+    "limits": "judged-only replay, frozen models, labels reused from selection: optimistic"
+  },
+  "metadata_scale": {
+    "scales": [
+      0.5,
+      0.25
+    ],
+    "features": "all",
+    "other_settings": "selected spec",
+    "comparisons": [
+      "#2 (scale 1)",
+      "production"
+    ],
+    "periods": [
+      "development",
+      "fresh"
+    ],
+    "statistics": {
+      "story_draws": 3000,
+      "block_draws": 20000,
+      "seed": 20261007
+    },
+    "status": "exploratory; labels reused"
+  },
+  "cold_start": {
+    "train_recent": [
+      100,
+      200,
+      400,
+      800,
+      1600
+    ],
+    "arms": [
+      "production",
+      "#2",
+      "#4"
+    ],
+    "periods": [
+      "development",
+      "fresh"
+    ],
+    "note": "each block trains on only its N most recent prior votes; below 20 up/20 down every arm falls back to gravity+centroid"
+  }
+}

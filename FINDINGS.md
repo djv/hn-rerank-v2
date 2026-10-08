@@ -2886,3 +2886,17 @@ Rerank cost on the VPS (copy of the live DB, one BLAS thread): after a vote
 feature builds; production alone ~10 s. Live post-fix reranks: 11-20 s.
 Smoke tests 200; no journal errors. Two diagnostic profiles (213, 214) are
 from the smoke tests, not signups.
+
+# 2026-10-08 One-classifier offline follow-ups (exploratory)
+
+Same twelve judged blocks as FEATURE-REMOVALS.md, labels reused. Scaling
+only the metadata block of #2 by 0.5 / 0.25 gives AUC .8274 / .8246,
+NDCG@12 .6997 / .6996, top-12 97/6 / 98/7. That sits between #2 (.8295,
+.6944, 97/6) and #4 (.8203, .7094, 98/5) with no setting better on both.
+Short-history curve (each block trains on its N most recent votes): at
+N=100 all arms nearly coincide (classifier tier barely blended in); at
+200/400/800/1600 both challengers match or beat production on AUC and top-12
+counts (e.g. N=400: production .7759 82/13, #2 .7874 85/12, #4 .7852 86/11).
+Power replay for live interleaving: 28 days ~70% (#2) / ~54% (#4) for the
+upvote-rate test, optimistic. Details and artifacts:
+docs/evaluations/model-ablation-20261007/INTERLEAVING.md, followups/.

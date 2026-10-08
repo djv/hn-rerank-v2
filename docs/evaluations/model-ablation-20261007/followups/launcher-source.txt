@@ -1,0 +1,183 @@
+"""Predeclared offline follow-ups (user-selected 2026-10-07): interleaving power
+replay, metadata-scale middle classifiers, short-history (cold-start) curve.
+Run from the clean worktree at the harness commit."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path.cwd()))
+from scripts.compare_eval_scores import Fold, _report
+
+ROOT = Path('/tmp/hn-one-classifier-20261007')
+OUT = Path('/tmp/hn-single-followup-20261007')
+SINGLE = Path('docs/evaluations/model-ablation-20261007/single-model')
+VARIANT = 'prod[linear_blend_enabled=false;svm_c=4;svm_gamma=0.03]'
+SELECTED = json.loads((ROOT / 'broad-selected.json').read_text())['selected_adapter']['spec']
+ENV = {**os.environ, 'OMP_NUM_THREADS': '1', 'OPENBLAS_NUM_THREADS': '1', 'MKL_NUM_THREADS': '1'}
+PERIODS = {'development': ['--folds', '8'], 'fresh': ['--holdout-after', '1790899200', '--holdout-blocks', '4']}
+SCALES = [0.5, 0.25]
+RECENT = [100, 200, 400, 800, 1600]
+FEATURES = {'all': 'all', 'no_metadata': 'embedding_words'}
+POWER = [  # (votes per deck, challenger weight)
+    (4, 1.0), (1, 1.0), (12, 1.0), (4, 0.5), (4, 0.0),
+]
+
+
+def sha(path: Path) -> str:
+    with path.open('rb') as handle:
+        return hashlib.file_digest(handle, 'sha256').hexdigest()
+
+
+def readiness() -> None:
+    assert any(p.read_text().strip() == '1' for p in Path('/sys/class/power_supply').glob('*/online')), 'AC disconnected'
+    while float(Path('/proc/loadavg').read_text().split()[0]) > 8:
+        print('Waiting for laptop load below 8', flush=True)
+        time.sleep(10)
+    available = next(int(line.split()[1]) for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemAvailable:'))
+    assert available >= 2_000_000, 'Insufficient available memory'
+
+
+def run(name: str, args: list[str]) -> None:
+    if (OUT / f'{name}.done').exists():
+        print(name + ' already complete', flush=True)
+        return
+    readiness()
+    started = time.time()
+    with (OUT / f'{name}.log').open('w') as log:
+        subprocess.run(['batch', 'uv', 'run', *args], stdout=log, stderr=subprocess.STDOUT, check=True, env=ENV)
+    (OUT / f'{name}.done').write_text(f'{time.time() - started:.1f}\n')
+    print(f'{name} complete in {time.time() - started:.0f}s', flush=True)
+
+
+def classifier_args(name: str, spec: dict[str, object], period: str, extra: list[str]) -> list[str]:
+    settings: list[str] = []
+    for key, value in spec.items():
+        settings.extend(['--' + key.replace('_', '-'), str(value)])
+    return ['python', 'scripts/eval_one_classifier.py', *settings, '--', '--config', str(ROOT / 'native.toml'),
+            '--user-id', '151', '--candidate-pool', 'heldout-feedback', '--now', '1791401987.9873054',
+            *PERIODS[period], *extra, '--variants', VARIANT,
+            '--output', str(OUT / f'{name}.json'), '--dump-scores', str(OUT / f'{name}-scores.json')]
+
+
+head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+dirty = subprocess.check_output(['git', 'status', '--porcelain'], text=True)
+assert not dirty, dirty
+plan_path = OUT / 'plan.json'
+if not plan_path.exists():
+    plan = {
+        'selection': 'User selected all four offline follow-ups (power replay, fit timing, metadata-scale middle, cold-start curve) on 2026-10-07; fit timing runs separately on the production code path.',
+        'code_revision': head,
+        'launcher_sha256': sha(Path(__file__)),
+        'snapshot_db_sha256': sha(ROOT / 'snapshot.db'),
+        'native_config_sha256': sha(ROOT / 'native.toml'),
+        'selected_spec': SELECTED,
+        'power': {'settings': [{'votes_per_deck': v, 'challenger_weight': w} for v, w in POWER],
+                  'replicates': 1000, 'days': [7, 14, 28, 56], 'votes_per_day': 50, 'deck_size': 12,
+                  'alpha': 0.05, 'bonferroni_challengers': 2, 'seed': 20261008,
+                  'arms': ['production', '#2 all features', '#4 no metadata'],
+                  'limits': 'judged-only replay, frozen models, labels reused from selection: optimistic'},
+        'metadata_scale': {'scales': SCALES, 'features': 'all', 'other_settings': 'selected spec',
+                           'comparisons': ['#2 (scale 1)', 'production'], 'periods': list(PERIODS),
+                           'statistics': {'story_draws': 3000, 'block_draws': 20000, 'seed': 20261007},
+                           'status': 'exploratory; labels reused'},
+        'cold_start': {'train_recent': RECENT, 'arms': ['production', '#2', '#4'], 'periods': list(PERIODS),
+                       'note': 'each block trains on only its N most recent prior votes; below 20 up/20 down every arm falls back to gravity+centroid'},
+    }
+    plan_path.write_text(json.dumps(plan, indent=2) + '\n')
+plan = json.loads(plan_path.read_text())
+assert plan['code_revision'] == head and plan['launcher_sha256'] == sha(Path(__file__))
+print('plan recorded', flush=True)
+
+# 1. Power replay (score dumps only, no fits).
+dumps = {
+    'production': ('production', [SINGLE / 'broad-check-adapter-development-scores.json', SINGLE / 'broad-check-adapter-fresh-scores.json']),
+    'all': (VARIANT, [SINGLE / 'broad-check-adapter-development-scores.json', SINGLE / 'broad-check-adapter-fresh-scores.json']),
+    'no_metadata': (VARIANT, [SINGLE / 'feature-removal-embedding_words-development-scores.json', SINGLE / 'feature-removal-embedding_words-fresh-scores.json']),
+}
+for votes, weight in POWER:
+    arm_args: list[str] = []
+    for name, (variant, files) in dumps.items():
+        arm_args += ['--arm', name, variant, *map(str, files)]
+    tag = f'power-deck{votes}-weight{weight:g}'
+    run(tag, ['python', 'scripts/simulate_interleaving.py', '--replicates', '1000', '--votes-per-deck', str(votes),
+              '--challenger-weight', str(weight), *arm_args, '--output', str(OUT / f'{tag}.json')])
+
+# 2. Metadata-scale middle classifiers.
+for scale in SCALES:
+    for period in PERIODS:
+        run(f'metadata-scale-{scale:g}-{period}', classifier_args(f'metadata-scale-{scale:g}-{period}', {**SELECTED, 'metadata_scale': scale}, period, []))
+
+# 3. Short-history curve.
+for n in RECENT:
+    for arm, features in FEATURES.items():
+        for period in PERIODS:
+            name = f'recent-{n}-{arm}-{period}'
+            run(name, classifier_args(name, {**SELECTED, 'features': features}, period, ['--train-recent', str(n)]))
+
+
+# Summaries.
+def top_counts(labels: np.ndarray, scores: np.ndarray) -> tuple[int, int]:
+    top = labels[np.argsort(-scores, kind='stable')[:12]]
+    return int((top == 2).sum()), int((top == 0).sum())
+
+
+summary: dict[str, object] = {'plan': plan, 'metadata_scale': {}, 'cold_start': {}}
+for scale in SCALES:
+    paired: dict[str, list[Fold]] = {'selected': [], 'production': []}
+    counts = {k: {'up': [0, 0], 'down': [0, 0]} for k in paired}
+    periods = {}
+    for period in PERIODS:
+        name = f'metadata-scale-{scale:g}-{period}'
+        report = json.loads((OUT / f'{name}.json').read_text())
+        periods[period] = {k: {m: v['mean']['raw'][m] for m in ('auc_up_vs_rest', 'known_upvote_fraction_at_12', 'known_downvote_fraction_at_12', 'ndcg_at_12')} for k, v in report['variants'].items()}
+        current = json.loads((OUT / f'{name}-scores.json').read_text())['folds']
+        base = json.loads((SINGLE / f'broad-check-adapter-{period}-scores.json').read_text())['folds']
+        for a, b in zip(current, base, strict=True):
+            assert a['ids'] == b['ids'] and a['labels'] == b['labels'] and a['scores']['production'] == b['scores']['production']
+            labels = np.asarray(a['labels'])
+            for key in paired:
+                pair = (np.asarray(b['scores'][VARIANT if key == 'selected' else 'production'], dtype=float), np.asarray(a['scores'][VARIANT], dtype=float))
+                paired[key].append(Fold(f'{period}-{a["fold"]}', labels == 2, pair))
+                for i, s in enumerate(pair):
+                    up, down = top_counts(labels, s)
+                    counts[key]['up'][i] += up
+                    counts[key]['down'][i] += down
+    summary['metadata_scale'][str(scale)] = {'periods': periods, 'comparisons': {
+        key: {**_report(folds, 3000, 20000, np.random.default_rng(20261007)), 'top12_upvotes': counts[key]['up'], 'top12_downvotes': counts[key]['down']}
+        for key, folds in paired.items()}}
+    print(f'metadata scale {scale} summary complete', flush=True)
+
+for n in RECENT:
+    row: dict[str, object] = {}
+    for arm in FEATURES:
+        prod_up = prod_down = up = down = 0
+        ndcg: dict[str, list[float]] = {'production': [], arm: []}
+        folds: list[Fold] = []
+        for period in PERIODS:
+            name = f'recent-{n}-{arm}-{period}'
+            report = json.loads((OUT / f'{name}.json').read_text())
+            for fold in json.loads((OUT / f'{name}-scores.json').read_text())['folds']:
+                labels = np.asarray(fold['labels'])
+                p = np.asarray(fold['scores']['production'], dtype=float)
+                c = np.asarray(fold['scores'][VARIANT], dtype=float)
+                folds.append(Fold(f'{period}-{fold["fold"]}', labels == 2, (p, c)))
+                a, b = top_counts(labels, p); prod_up += a; prod_down += b
+                a, b = top_counts(labels, c); up += a; down += b
+            for key, variant in (('production', 'production'), (arm, VARIANT)):
+                ndcg[key].append(report['variants'][variant]['mean']['raw']['ndcg_at_12'])
+        stats = _report(folds, 3000, 20000, np.random.default_rng(20261007))
+        row[arm] = {'top12_upvotes': [prod_up, up], 'top12_downvotes': [prod_down, down], 'ndcg_at_12_period_means': ndcg, 'paired_vs_production': stats}
+    summary['cold_start'][str(n)] = row
+    print(f'recent {n} summary complete', flush=True)
+
+(OUT / 'summary.json').write_text(json.dumps(summary, indent=2, allow_nan=False) + '\n')
+readiness()
+print('offline follow-ups complete', flush=True)

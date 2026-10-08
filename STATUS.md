@@ -33,17 +33,28 @@ metadata-scale middle variant, short-history curve).
   tldr-detail); no journal errors. The first deploy (7de14af, 03:55 UTC)
   drafted before deduplication and left 3/2/7 splits; its decks are
   excluded. Two diagnostic profiles (213, 214) came from smoke tests.
+  First check, 04:15 UTC: 11 votes since 03:58, all with impressions;
+  9 predate T0 and are excluded, 2 credited (production up, #2 neutral).
+- Offline follow-ups finished (labels reused, exploratory). Metadata
+  x0.5/x0.25 fall between #2 and #4; neither beats both, so the arms stay
+  #2/#4. In the short-history curve, from 200 votes up both challengers
+  match or beat production. Tables:
+  [INTERLEAVING.md](docs/evaluations/model-ablation-20261007/INTERLEAVING.md);
+  artifacts in followups/.
+
+## Blocker
+None.
 
 ## Next step
 - Final analysis at T0 + 28 days, 2026-11-05 04:07 UTC (Nov 4 23:07 ET):
   `uv run python scripts/interleave_report.py --db hn_rewrite.db
   --user-id 151 --since 1791432442.75 --until 1793851642.75` on the VPS.
   Weekly descriptive reports and safety checks per INTERLEAVING.md.
-- Offline follow-ups still running on the laptop
-  (`/tmp/hn-single-followup-20261007/launch.py`, clean worktree
-  ../hn-rerank-offline-20261007 at b5eabdc); copy results into
-  docs/evaluations/model-ablation-20261007/followups/ and fill the pending
-  INTERLEAVING.md sections.
+- Only the launcher's bootstrap summary pass is still running
+  (`/tmp/hn-single-followup-20261007/launch.py`, one idle CPU, from the
+  clean worktree ../hn-rerank-offline-20261007). When it writes
+  `summary.json`, copy that file into followups/, add the intervals to
+  INTERLEAVING.md, then remove the worktree.
 - The separate Why preview (VPS hn-why-preview-20261007.service, port
   8767) becomes redundant after the deploy; stop it when the user agrees.
 - Carried over: Reddit replacement before November 13, 1m Popular age-mix

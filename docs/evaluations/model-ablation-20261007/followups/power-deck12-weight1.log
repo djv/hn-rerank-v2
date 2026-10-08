@@ -1,0 +1,8 @@
+all 7d: deck-sign reject 0.22 (better 0.22), rate reject 0.28; up 0.461 vs 0.375, down 0.168 vs 0.186
+all 14d: deck-sign reject 0.42 (better 0.42), rate reject 0.46; up 0.462 vs 0.374, down 0.168 vs 0.188
+all 28d: deck-sign reject 0.72 (better 0.72), rate reject 0.73; up 0.462 vs 0.372, down 0.168 vs 0.188
+all 56d: deck-sign reject 0.95 (better 0.95), rate reject 0.95; up 0.463 vs 0.373, down 0.168 vs 0.188
+no_metadata 7d: deck-sign reject 0.10 (better 0.10), rate reject 0.19; up 0.451 vs 0.375, down 0.216 vs 0.186
+no_metadata 14d: deck-sign reject 0.24 (better 0.24), rate reject 0.34; up 0.449 vs 0.374, down 0.217 vs 0.188
+no_metadata 28d: deck-sign reject 0.56 (better 0.56), rate reject 0.63; up 0.449 vs 0.372, down 0.217 vs 0.188
+no_metadata 56d: deck-sign reject 0.91 (better 0.91), rate reject 0.91; up 0.449 vs 0.373, down 0.218 vs 0.188

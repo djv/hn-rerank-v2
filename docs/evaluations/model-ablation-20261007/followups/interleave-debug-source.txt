@@ -1,0 +1,39 @@
+"""Where do drafted Recommended picks go between the draft and the stored
+deck? Runs on the bench copy (bench-snapshot.db), profile 151."""
+from __future__ import annotations
+
+import collections
+import sys
+from dataclasses import replace
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path.cwd()))
+from database import Database
+from pipeline import Config, Embedder
+import pipeline
+from pipeline import ranking
+
+DB = Path("bench-snapshot.db").resolve()
+config = replace(Config.load("/home/dev/hn-rewrite/main/config.toml"), db_path=str(DB), interleave_user_ids=(151,))
+db = Database(str(DB), read_only=True)
+embedder = Embedder(config.onnx_model_dir, model_version=config.embedding_model_version, max_tokens=config.embedding_max_tokens, batch_size=config.embedding_batch_size)
+captured = {}
+orig_finalize = pipeline.finalize_ranked_deck
+def finalize(deck, *a, **k):
+    captured["pre"] = deck
+    out = orig_finalize(deck, *a, **k)
+    captured["post"] = out
+    return out
+pipeline.finalize_ranked_deck = finalize
+pipeline.fast_rerank_for_user(db, config, embedder, 151)
+pre, post = captured["pre"], captured["post"]
+for w in pre.windows:
+    a = pre.window(w).recommended
+    b = {r.story.id for r in post.window(w).recommended}
+    dropped = [r for r in a if r.story.id not in b]
+    print(w, "pre", len(a), dict(collections.Counter(r.arm for r in a[:12])),
+          "post", len(b), "dropped by arm", dict(collections.Counter(r.arm for r in dropped)))
+    for r in dropped[:4]:
+        print("   ", r.arm, r.story.id, r.story.source, r.story.title[:70])

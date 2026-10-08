@@ -1,0 +1,45 @@
+"""One-vote warm-start timing on a *copy* of the VPS DB (bench-snapshot.db):
+rank with profile 151's newest vote removed (fresh fits), restore the vote,
+rank again (every model misses its cache; warm starts available)."""
+from __future__ import annotations
+
+import json
+import sqlite3
+import sys
+from dataclasses import replace
+from pathlib import Path
+
+sys.path.insert(0, str(Path.cwd()))
+from database import Database
+from pipeline import Config, Embedder, RankTrace, fast_rerank_for_user
+
+DB = Path("bench-snapshot.db").resolve()
+assert DB.name == "bench-snapshot.db" and "hn-interleave-bench" in str(DB)
+config = replace(Config.load("/home/dev/hn-rewrite/main/config.toml"), db_path=str(DB))
+results = {}
+for mode in ("production", "interleave"):
+    cfg = replace(config, interleave_user_ids=(151,) if mode == "interleave" else ())
+    raw = sqlite3.connect(DB)
+    row = raw.execute("SELECT user_id, story_id, action, updated_at FROM feedback WHERE user_id=151 ORDER BY updated_at DESC LIMIT 1").fetchone()
+    raw.execute("DELETE FROM feedback WHERE user_id=151 AND story_id=?", (row[1],))
+    raw.commit()
+    db = Database(str(DB))
+    embedder = Embedder(cfg.onnx_model_dir, model_version=cfg.embedding_model_version, max_tokens=cfg.embedding_max_tokens, batch_size=cfg.embedding_batch_size)
+    runs = []
+    try:
+        for step in ("without_vote", "with_vote"):
+            if step == "with_vote":
+                raw.execute("INSERT INTO feedback (user_id, story_id, action, updated_at) VALUES (?,?,?,?)", row)
+                raw.commit()
+            trace = RankTrace()
+            with trace.stage("rank_total"):
+                fast_rerank_for_user(db, cfg, embedder, 151, trace=trace)
+            runs.append({k: round(v) for k, v in trace.to_log_fields().items() if isinstance(v, (int, float)) and (k.endswith("_ms") and ("fit" in k or "total" in k or k.startswith("challenger") and k.count("_") <= 3))})
+    finally:
+        if raw.execute("SELECT COUNT(*) FROM feedback WHERE user_id=151 AND story_id=?", (row[1],)).fetchone()[0] == 0:
+            raw.execute("INSERT INTO feedback (user_id, story_id, action, updated_at) VALUES (?,?,?,?)", row)
+            raw.commit()
+        db.close()
+        raw.close()
+    results[mode] = runs
+    print(mode, json.dumps(runs), flush=True)

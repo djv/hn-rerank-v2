@@ -58,11 +58,42 @@ equivalence.
 
 ## Metadata-scale middle variant
 
-Pending (`followups/metadata-scale-*`).
+The same classifier as #2, with only the metadata block multiplied by 0.5
+or 0.25, on the same twelve blocks (2,231 judged stories; production scores
+identical to the earlier runs):
+
+| Classifier | Mean AUC | NDCG@12 | Upvotes /144 | Downvotes /144 |
+|---|---:|---:|---:|---:|
+| Production blend | .8182 | .6656 | 94 | 2 |
+| #2, metadata x1 | .8295 | .6944 | 97 | 6 |
+| Metadata x0.5 | .8274 | .6997 | 97 | 6 |
+| Metadata x0.25 | .8246 | .6996 | 98 | 7 |
+| #4, no metadata | .8203 | .7094 | 98 | 5 |
+
+Shrinking metadata moves AUC and NDCG between #2 and #4. Neither middle
+setting beats both endpoints, so the live arms stay #2 and #4. Paired
+bootstrap intervals are in `followups/summary.json` once the launcher's
+summary pass finishes.
 
 ## Short-history curve
 
-Pending (`followups/recent-*`).
+Each block trains on only its N most recent prior votes (`--train-recent`).
+Production's numbers come from the same truncated training sets. Twelve
+blocks; mean AUC and top-12 upvotes/downvotes out of 144:
+
+| Votes N | Production | #2 all features | #4 no metadata |
+|---:|---|---|---|
+| 100 | .6926, 65/32 | .6933, 66/31 | .6929, 66/31 |
+| 200 | .7353, 75/21 | .7375, 77/20 | .7358, 79/19 |
+| 400 | .7759, 82/13 | .7874, 85/12 | .7852, 86/11 |
+| 800 | .7975, 79/11 | .8098, 85/9 | .8034, 86/8 |
+| 1600 | .8134, 90/6 | .8263, 93/6 | .8146, 94/4 |
+
+At 100 votes (about 22 upvotes) the classifier tier barely enters the tier
+blend, so all arms nearly coincide. From 200 votes up, both challengers
+match or beat production on every column. The labels were reused, and
+profile 151's recent votes stand in for a new user's first votes. So this
+supports, but does not establish, extending the challengers to other users.
 
 ## Full-data fit timing
 

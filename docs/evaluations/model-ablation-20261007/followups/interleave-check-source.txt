@@ -1,0 +1,17 @@
+from __future__ import annotations
+import collections, sys
+from dataclasses import replace
+from pathlib import Path
+sys.path.insert(0, str(Path.cwd()))
+from database import Database
+from pipeline import Config, Embedder, RankTrace, fast_rerank_for_user
+DB = Path("bench-snapshot.db").resolve()
+config = replace(Config.load("/home/dev/hn-rewrite/main/config.toml"), db_path=str(DB), interleave_user_ids=(151,))
+db = Database(str(DB), read_only=True)
+embedder = Embedder(config.onnx_model_dir, model_version=config.embedding_model_version, max_tokens=config.embedding_max_tokens, batch_size=config.embedding_batch_size)
+trace = RankTrace()
+deck = fast_rerank_for_user(db, config, embedder, 151, trace=trace)
+for w, views in deck.windows.items():
+    rec = views.recommended
+    print(w, len(rec), dict(collections.Counter(r.arm for r in rec[:12])), "explore", len(views.explore), "popular", len(views.popular))
+print("draft_ms", round(trace.timings_ms.get("interleave_draft", 0), 1), "dedup_ms", round(trace.timings_ms.get("dedup", 0)), "hn_dupes_ms", round(trace.timings_ms.get("hn_dupes", 0)))

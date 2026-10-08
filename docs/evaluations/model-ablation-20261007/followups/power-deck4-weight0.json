@@ -1,0 +1,156 @@
+{
+  "settings": {
+    "days": [
+      7,
+      14,
+      28,
+      56
+    ],
+    "votes_per_day": 50,
+    "deck_size": 12,
+    "votes_per_deck": 4,
+    "replicates": 1000,
+    "alpha": 0.05,
+    "seed": 20261008,
+    "challenger_weight": 0.0,
+    "output": "/tmp/hn-single-followup-20261007/power-deck4-weight0.json"
+  },
+  "arms": [
+    {
+      "name": "production",
+      "variant": "production",
+      "files": [
+        "docs/evaluations/model-ablation-20261007/single-model/broad-check-adapter-development-scores.json",
+        "docs/evaluations/model-ablation-20261007/single-model/broad-check-adapter-fresh-scores.json"
+      ]
+    },
+    {
+      "name": "all",
+      "variant": "prod[linear_blend_enabled=false;svm_c=4;svm_gamma=0.03]",
+      "files": [
+        "docs/evaluations/model-ablation-20261007/single-model/broad-check-adapter-development-scores.json",
+        "docs/evaluations/model-ablation-20261007/single-model/broad-check-adapter-fresh-scores.json"
+      ]
+    },
+    {
+      "name": "no_metadata",
+      "variant": "prod[linear_blend_enabled=false;svm_c=4;svm_gamma=0.03]",
+      "files": [
+        "docs/evaluations/model-ablation-20261007/single-model/feature-removal-embedding_words-development-scores.json",
+        "docs/evaluations/model-ablation-20261007/single-model/feature-removal-embedding_words-fresh-scores.json"
+      ]
+    }
+  ],
+  "blocks": 12,
+  "judged_stories": 2231,
+  "power": {
+    "all": {
+      "7": {
+        "deck_sign_reject": 0.018,
+        "deck_sign_challenger_better": 0.013,
+        "deck_sign_challenger_worse": 0.005,
+        "rate_reject": 0.019,
+        "rate_challenger_better": 0.011,
+        "rate_challenger_worse": 0.008,
+        "mean_up_rate": 0.45116559814577956,
+        "mean_control_up_rate": 0.4525108160832186,
+        "mean_down_rate": 0.17939384970218897,
+        "mean_control_down_rate": 0.17981314679257532,
+        "mean_credited": 121.228
+      },
+      "14": {
+        "deck_sign_reject": 0.018,
+        "deck_sign_challenger_better": 0.008,
+        "deck_sign_challenger_worse": 0.01,
+        "rate_reject": 0.021,
+        "rate_challenger_better": 0.011,
+        "rate_challenger_worse": 0.01,
+        "mean_up_rate": 0.451830798153224,
+        "mean_control_up_rate": 0.45306307421619774,
+        "mean_down_rate": 0.1775307360930978,
+        "mean_control_down_rate": 0.17828404162596945,
+        "mean_credited": 242.708
+      },
+      "28": {
+        "deck_sign_reject": 0.022,
+        "deck_sign_challenger_better": 0.011,
+        "deck_sign_challenger_worse": 0.011,
+        "rate_reject": 0.023,
+        "rate_challenger_better": 0.012,
+        "rate_challenger_worse": 0.011,
+        "mean_up_rate": 0.45170686900057805,
+        "mean_control_up_rate": 0.4518797269421085,
+        "mean_down_rate": 0.1778967216569133,
+        "mean_control_down_rate": 0.17803898849010677,
+        "mean_credited": 485.644
+      },
+      "56": {
+        "deck_sign_reject": 0.024,
+        "deck_sign_challenger_better": 0.01,
+        "deck_sign_challenger_worse": 0.014,
+        "rate_reject": 0.022,
+        "rate_challenger_better": 0.012,
+        "rate_challenger_worse": 0.01,
+        "mean_up_rate": 0.4515177943213906,
+        "mean_control_up_rate": 0.45178809098719847,
+        "mean_down_rate": 0.17779347332110526,
+        "mean_control_down_rate": 0.17809360176412034,
+        "mean_credited": 970.766
+      }
+    },
+    "no_metadata": {
+      "7": {
+        "deck_sign_reject": 0.017,
+        "deck_sign_challenger_better": 0.007,
+        "deck_sign_challenger_worse": 0.01,
+        "rate_reject": 0.017,
+        "rate_challenger_better": 0.01,
+        "rate_challenger_worse": 0.007,
+        "mean_up_rate": 0.45087960911115554,
+        "mean_control_up_rate": 0.4525108160832186,
+        "mean_down_rate": 0.17790135794059495,
+        "mean_control_down_rate": 0.17981314679257532,
+        "mean_credited": 121.215
+      },
+      "14": {
+        "deck_sign_reject": 0.022,
+        "deck_sign_challenger_better": 0.012,
+        "deck_sign_challenger_worse": 0.01,
+        "rate_reject": 0.019,
+        "rate_challenger_better": 0.011,
+        "rate_challenger_worse": 0.008,
+        "mean_up_rate": 0.45210334213055015,
+        "mean_control_up_rate": 0.45306307421619774,
+        "mean_down_rate": 0.17756712307376815,
+        "mean_control_down_rate": 0.17828404162596945,
+        "mean_credited": 242.675
+      },
+      "28": {
+        "deck_sign_reject": 0.017,
+        "deck_sign_challenger_better": 0.007,
+        "deck_sign_challenger_worse": 0.01,
+        "rate_reject": 0.017,
+        "rate_challenger_better": 0.01,
+        "rate_challenger_worse": 0.007,
+        "mean_up_rate": 0.4523557288484652,
+        "mean_control_up_rate": 0.4518797269421085,
+        "mean_down_rate": 0.17742793250649744,
+        "mean_control_down_rate": 0.17803898849010677,
+        "mean_credited": 485.226
+      },
+      "56": {
+        "deck_sign_reject": 0.012,
+        "deck_sign_challenger_better": 0.005,
+        "deck_sign_challenger_worse": 0.007,
+        "rate_reject": 0.014,
+        "rate_challenger_better": 0.007,
+        "rate_challenger_worse": 0.007,
+        "mean_up_rate": 0.451620230304617,
+        "mean_control_up_rate": 0.45178809098719847,
+        "mean_down_rate": 0.1776278180261924,
+        "mean_control_down_rate": 0.17809360176412034,
+        "mean_credited": 970.969
+      }
+    }
+  }
+}
