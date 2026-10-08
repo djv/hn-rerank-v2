@@ -17,6 +17,9 @@ if TYPE_CHECKING:
     from _typeshed import DataclassInstance
 
 
+RedditSource = Literal["rss", "arctic_shift"]
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     svm_c: float = 0.2
@@ -158,6 +161,13 @@ class Config:
     # barely change; a request inside the window waits for it to end.
     # 0 disables the throttle.
     reddit_refresh_min_interval_seconds: float = 7200.0
+    # Where subreddit top lists and comment threads come from: Reddit RSS
+    # (retired 2026-11-13) or the Arctic Shift archive (arctic_shift.py).
+    # Feed URLs in rss.feeds name the subreddits either way.
+    reddit_source: RedditSource = "rss"
+    # Task spacing on the Reddit fetch queue when reddit_source is
+    # arctic_shift (its operator asks for at most a couple of requests/s).
+    reddit_arctic_stride_seconds: float = 2.0
     article_fetch_max_per_run: int = 50
     # Regen-time article fetches for new RSS snippet stories regardless of
     # rank (the warm path only reaches stories already near the top). 0 off.
@@ -308,6 +318,10 @@ class Config:
             raise ValueError("interleave_arms must not repeat an arm")
         if self.interleave_user_ids and not self.interleave_arms:
             raise ValueError("interleave_user_ids needs at least one arm")
+        if self.reddit_source not in {"rss", "arctic_shift"}:
+            raise ValueError("reddit_source must be one of: rss, arctic_shift")
+        if self.reddit_arctic_stride_seconds < 0:
+            raise ValueError("reddit_arctic_stride_seconds must be >= 0")
         if self.embedding_ort_variant not in {
             "current",
             "spin_off",

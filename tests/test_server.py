@@ -3781,6 +3781,73 @@ def test_tldr_detail_fetches_reddit_rss_comments(test_env, monkeypatch):
     )
 
 
+def test_tldr_detail_reads_reddit_thread_from_arctic_shift(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With reddit_source="arctic_shift" a Reddit card's thread comes from
+    Arctic Shift, never from Reddit's per-post RSS."""
+    port, db, _, handler, user = test_env
+    monkeypatch.setattr(
+        handler, "config", replace(handler.config, reddit_source="arctic_shift")
+    )
+    url = "https://www.reddit.com/r/LocalLLaMA/comments/abc123/arctic_test/"
+    db.upsert_story(
+        Story(
+            id=-4321,
+            title="Arctic test",
+            url=url,
+            score=0,
+            time=1600000000,
+            text_content="Arctic test.",
+            source="rss_reddit_localllama",
+            comment_count=None,
+            discussion_url=None,
+            comment_count_at_fetch=0,
+            self_text="",
+            top_comments="",
+            article_body="",
+        )
+    )
+    import server
+
+    requested: list[str | None] = []
+
+    async def fake_arctic_context(
+        story_url: str | None,
+    ) -> server.RedditRssContext:
+        requested.append(story_url)
+        return server.RedditRssContext(
+            self_text="Archived post body.",
+            top_comments="/u/alice: Archived comment about the model.",
+            comment_count=1,
+        )
+
+    async def no_rss(_url: str | None) -> None:
+        raise AssertionError("Reddit RSS must not be fetched in arctic mode")
+
+    async def fake_generate_detailed_tldr(
+        title: str, self_text: str, top_comments: str, article_body: str
+    ) -> server.TldrResult:
+        return server.TldrResult(kind="ok", tldr=f"TLDR: {top_comments}")
+
+    monkeypatch.setattr(server, "_fetch_reddit_arctic_context", fake_arctic_context)
+    monkeypatch.setattr(server, "_fetch_reddit_rss_context", no_rss)
+    monkeypatch.setattr(server, "generate_detailed_tldr", fake_generate_detailed_tldr)
+
+    resp = local_http.post(
+        f"http://127.0.0.1:{port}/api/tldr-detail",
+        json={"story_id": -4321},
+        cookies={"hn_token": user.token},
+    )
+
+    assert resp.status_code == 200
+    assert "Archived comment" in resp.json()["tldr"]
+    assert requested == [url]
+    stored = db.get_story(-4321)
+    assert stored is not None
+    assert "Archived comment" in stored.top_comments
+
+
 def test_tldr_detail_dynamic_fetch(test_env, monkeypatch):
     port, db, _, _, user = test_env
     db.upsert_story(

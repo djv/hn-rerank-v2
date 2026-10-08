@@ -313,11 +313,13 @@ def test_reddit_collision_excluded_from_snapshot_and_prewarm(sid: int) -> None:
     safe = replace(conflict, id=-2, url="https://reddit.com/r/test/comments/safe")
     prewarmed: list[int] = []
 
-    def topfeeds(*args: object) -> tuple[list, list[str]]:
+    def topfeeds(*args: object, **kwargs: object) -> tuple[list, list[str]]:
         cache.set(feed, [conflict, safe])
         return [], [feed]
 
-    def prewarm(ids: list[int], database: Database) -> tuple[list, list[int]]:
+    def prewarm(
+        ids: list[int], database: Database, reddit_source: str = "rss"
+    ) -> tuple[list, list[int]]:
         prewarmed.extend(ids)
         return [], []
 

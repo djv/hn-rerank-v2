@@ -35,6 +35,7 @@ from werkzeug.wrappers import Response as BaseResponse
 from flask.typing import ResponseReturnValue
 import httpx
 
+import arctic_shift
 from background_cadence import BackgroundCadence
 from clients.tui.src.hn_rerank.models import (
     DEFAULT_WINDOW,
@@ -68,6 +69,7 @@ from pipeline.ranking import (
     serve_window,
 )
 from pipeline.ainews import AINEWS_SOURCE
+from pipeline.enrichment import reddit_post_self_text
 from pipeline.hn_dupes import pointer_thread_target
 from llm_limiter import limiter as llm_limiter
 from reddit_limiter import limiter as reddit_limiter
@@ -686,6 +688,68 @@ async def _fetch_reddit_rss_context(url: str | None) -> RedditRssContext | None:
         self_text=self_text[:SELF_TEXT_PROMPT_CHAR_LIMIT],
         top_comments=" ".join(comments)[:REDDIT_COMMENTS_CACHE_CHAR_LIMIT],
         comment_count=len(comments),
+    )
+
+
+def _reddit_post_id(url: str | None) -> str | None:
+    """Base-36 post id from a reddit.com ``/comments/<id>/`` URL."""
+    if not url:
+        return None
+    parsed = urlparse(url)
+    host = parsed.netloc.lower().removeprefix("www.")
+    if host not in {"reddit.com", "old.reddit.com"}:
+        return None
+    parts = [part for part in parsed.path.split("/") if part]
+    if "comments" not in parts:
+        return None
+    index = parts.index("comments") + 1
+    if index >= len(parts) or not re.fullmatch(r"[a-z0-9]+", parts[index]):
+        return None
+    return parts[index]
+
+
+def _format_arctic_comments(comments: list[arctic_shift.ArcticComment]) -> list[str]:
+    """Reddit comments in prompt form, top-level by score first, then replies.
+
+    Same filtering, ``/u/`` labels and caps as the RSS thread path.
+    """
+    ordered = sorted(comments, key=lambda c: (c.depth > 0, -c.score, c.created_utc))
+    formatted_comments: list[str] = []
+    total_len = 0
+    for comment in ordered:
+        text = re.sub(r"\s+", " ", comment.body).strip()
+        author = comment.author.strip()
+        if author == "[deleted]" or _is_low_signal_reddit_comment(author, text):
+            continue
+        remaining = REDDIT_COMMENTS_CACHE_CHAR_LIMIT - total_len
+        if remaining <= 0 or len(formatted_comments) >= REDDIT_COMMENT_LIMIT:
+            break
+        formatted = (f"/u/{author}: {text}" if author else text)[:remaining]
+        formatted_comments.append(formatted)
+        total_len += len(formatted) + 1
+    return formatted_comments
+
+
+async def _fetch_reddit_arctic_context(url: str | None) -> RedditRssContext | None:
+    """Post text and top comments of a Reddit thread from Arctic Shift."""
+    post_id = _reddit_post_id(url)
+    if not post_id:
+        return None
+    try:
+        posts = await arctic_shift.posts([post_id])
+        comments = await arctic_shift.comment_tree(post_id)
+    except arctic_shift.ArcticShiftError as exc:
+        logging.warning("arctic_shift: thread %s failed: %s", post_id, exc)
+        return None
+    post = posts[0] if posts else None
+    if post is None and not comments:
+        return None
+    self_text = reddit_post_self_text(post) if post is not None else ""
+    formatted = _format_arctic_comments(comments)
+    return RedditRssContext(
+        self_text=self_text[:SELF_TEXT_PROMPT_CHAR_LIMIT],
+        top_comments=" ".join(formatted)[:REDDIT_COMMENTS_CACHE_CHAR_LIMIT],
+        comment_count=len(formatted),
     )
 
 
@@ -3001,6 +3065,8 @@ def _generate_tldr_reply(
     async def _src_lane() -> RedditRssContext | LessWrongContext | None:
         if src_kind == "reddit":
             assert story.url is not None
+            if runtime.config.reddit_source == "arctic_shift":
+                return await _fetch_reddit_arctic_context(story.url)
             return await _fetch_reddit_rss_context(story.url)
         if src_kind == "lesswrong":
             assert _lw_post_id is not None

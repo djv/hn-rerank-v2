@@ -38,6 +38,7 @@ SCRIPT_MAINS = [
     "drop_dead_tables",
     "combine_replay_embeddings",
     "compare_eval_scores",
+    "compare_reddit_sources",
     "embed_remaining",
     "embed_side_vectors",
     "export_embedding_onnx",

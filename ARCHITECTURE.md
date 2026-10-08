@@ -331,6 +331,40 @@ called from `prewarm_reddit_top_stories`) does NOT use the cache — each
 story's comment RSS is fetched at most once per lifetime (prewarm filter
 is `not s.top_comments`), so a cache would have near-zero hit rate.
 
+#### 3.4.4 Arctic Shift as the Reddit source
+
+Reddit retires RSS on 2026-11-13 and already answers anonymous `.json`
+and HTML with 403. `reddit_source = "arctic_shift"` (default `"rss"`)
+reads both Reddit paths from the Arctic Shift archive instead
+(`arctic_shift.py`; free, no key, at most a couple of requests/s). The
+subreddit list is still the `/r/<sub>/top/.rss?t=…&limit=…` URLs in
+`rss.feeds`; `reddit_top_query` reads the subreddit, window and limit
+from them.
+
+* **Top feeds** (`_fetch_arctic_topfeed`): search returns every post in
+  the window sorted by time, paged on `created_utc`; `top_posts` ranks by
+  archived score locally, loads full records for the leaders, and keeps
+  the top `limit`. Stories are keyed by permalink exactly as RSS entries
+  are (`rss_story_id`), so ids, votes and caches carry over, and keep
+  score/comment count 0 as on the RSS path. Arctic Shift scores a post
+  only after ~36 h (score 1 before), so a post joins the list about
+  1.5 days late. `removed_by_category` is ignored: it is a snapshot from
+  archiving time, and r/ClaudeAI's AutoModerator holds nearly every post
+  that moderators then approve; only `[removed]`/`[deleted]` text drops a
+  post.
+* **Threads** (`server._fetch_reddit_arctic_context`, used by prewarm and
+  tldr-detail): the post's text plus its comment tree, top-level comments
+  by score first, then replies, with the RSS path's filters and caps.
+* **Pacing**: these factories skip `reddit_limiter` (it paces reddit.com
+  only); `arctic_shift` spaces requests 0.5 s apart process-wide and the
+  queue strides by `reddit_arctic_stride_seconds` (2 s).
+* **Check before switching**: `scripts/compare_reddit_sources.py` fetches
+  each feed both ways and counts matching story ids.
+
+Arctic Shift reads the official Reddit API, so it is expected to stop by
+March 2027 (Reddit's public API closure) or sooner. Evidence:
+FINDINGS.md "Reddit after the RSS shutdown".
+
 The live dashboard path applies a **two-leg recent candidate cap** to bound the work the ranker does on each request. The recent candidate fetch is split:
 - **HN leg** (`source='hn'`): ordered by tier-1 gravity `score / age^1.8` (mirrors the cold-start blend in `_score_and_rank`), capped at `recent_candidate_hn_limit` (default 10,000 since 2026-09-29; 5000 had started cutting live stories). This keeps the highest-scoring HN candidates in the pool.
 - **RSS leg** (`source != 'hn' AND NOT IN archive`): ordered by `time DESC` only. RSS sources carry no engagement score in the DB, so tier-1 is uninformative there; recency is the most honest SQL-only signal and preserves representation for the `is_non_hn` discovery pass. Capped at `recent_candidate_rss_limit` (default 5000, same as the HN leg since 2026-08-30 — the old 500 cap starved the RSS pool and the oldest RSS row was 93h out).

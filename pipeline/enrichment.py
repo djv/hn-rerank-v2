@@ -12,11 +12,13 @@ from dataclasses import replace
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Protocol
 from urllib.error import URLError
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import feedparser
 import httpx
 
+import arctic_shift
+from arctic_shift import ArcticPost, ArcticShiftError
 from ch_client import DEFAULT_MAX_LEVELS
 from database import Database, Story, StoryIdentityConflict, coerce_int
 
@@ -26,6 +28,7 @@ from reddit_fetch_queue import CoroFactory
 from reddit_feed_cache import cache as reddit_feed_cache
 from reddit_limiter import limiter as reddit_limiter
 from . import rank_gate
+from .config import RedditSource
 from .ainews import AINEWS_SOURCE, tweet_id_from_url
 from .ranking import (
     Embedder,
@@ -444,7 +447,7 @@ def _merge_source_context(
 
 
 def build_reddit_prewarm_factories(
-    story_ids: list[int], db: Database
+    story_ids: list[int], db: Database, reddit_source: RedditSource = "rss"
 ) -> tuple[list[CoroFactory], list[int]]:
     """Build Reddit prewarm coroutine factories for the given story IDs.
 
@@ -463,10 +466,16 @@ def build_reddit_prewarm_factories(
     :func:`reddit_fetch_queue.enqueue_all_reddit_fetches` to interleave
     prewarm factories with topfeed factories on a single shared window,
     so the returned list is enqueued rather than awaited in-place.
+
+    With ``reddit_source="arctic_shift"`` the thread comes from Arctic
+    Shift instead of the per-post RSS feed.
     """
     if not story_ids:
         return [], []
-    from server import _fetch_reddit_rss_context  # late import to avoid circular
+    # late import to avoid circular
+    from server import _fetch_reddit_arctic_context, _fetch_reddit_rss_context
+
+    use_arctic = reddit_source == "arctic_shift"
 
     counter_lock = threading.Lock()
     updated_ids: list[int] = []
@@ -481,7 +490,7 @@ def build_reddit_prewarm_factories(
             # both call it), wasting rate-limit budget under the
             # concurrent-reservation contract. See WORKLOG 2026-06-28
             # "Limiter concurrency race fix".
-            if reddit_limiter.circuit_open:
+            if not use_arctic and reddit_limiter.circuit_open:
                 return
             story = db.get_story(sid)
             if not story or not story.url:
@@ -489,7 +498,11 @@ def build_reddit_prewarm_factories(
             if not story.source.startswith("rss_reddit_"):
                 return
             try:
-                ctx = await _fetch_reddit_rss_context(story.url)
+                ctx = await (
+                    _fetch_reddit_arctic_context(story.url)
+                    if use_arctic
+                    else _fetch_reddit_rss_context(story.url)
+                )
             except Exception as exc:
                 logging.warning(
                     "prewarm_reddit: fetch failed for story_id=%s: %r",
@@ -607,6 +620,125 @@ def _reddit_subreddit_from_feed_url(feed_url: str) -> str | None:
     return None
 
 
+def rss_story_id(link: str) -> int:
+    """Synthetic (negative) story id of an RSS entry, keyed by its link.
+
+    Arctic Shift stories use the same key (the post permalink), so a post
+    keeps its id, votes and caches when ``reddit_source`` changes.
+    """
+    h = hashlib.md5(link.encode("utf-8")).digest()
+    return -(int.from_bytes(h[:4], "big") % (2**31))
+
+
+_REDDIT_TOP_WINDOW_SECONDS: dict[str, float] = {
+    "hour": 3600.0,
+    "day": 86400.0,
+    "week": 7 * 86400.0,
+    "month": 30 * 86400.0,
+    "year": 365 * 86400.0,
+}
+# Reddit's listing defaults (no ``t`` / ``limit`` in the feed URL).
+_REDDIT_DEFAULT_TOP_WINDOW = "day"
+_REDDIT_DEFAULT_LIMIT = 25
+_REDDIT_MEDIA_HOSTS = frozenset(
+    {"reddit.com", "redd.it", "v.redd.it", "i.redd.it", "preview.redd.it"}
+)
+
+
+def reddit_top_query(feed_url: str) -> tuple[str, float | None, int] | None:
+    """``(subreddit, window_seconds, limit)`` of a ``/r/<sub>/top`` feed URL.
+
+    ``window_seconds`` is None for ``t=all``. Returns None for other
+    listings (hot/new), which Arctic Shift cannot rank.
+    """
+    if not _reddit_subreddit_from_feed_url(feed_url):
+        return None
+    parsed = urlparse(feed_url)
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) < 3 or parts[2].lower() not in {"top", "top.rss"}:
+        return None
+    query = parse_qs(parsed.query)
+    window_name = (query.get("t") or [_REDDIT_DEFAULT_TOP_WINDOW])[0].lower()
+    if window_name == "all":
+        window: float | None = None
+    elif window_name in _REDDIT_TOP_WINDOW_SECONDS:
+        window = _REDDIT_TOP_WINDOW_SECONDS[window_name]
+    else:
+        return None
+    try:
+        limit = int((query.get("limit") or [_REDDIT_DEFAULT_LIMIT])[0])
+    except ValueError:
+        limit = _REDDIT_DEFAULT_LIMIT
+    return parts[1], window, max(limit, 0)
+
+
+def reddit_post_self_text(post: ArcticPost) -> str:
+    """Post text as the RSS path stores it: external link, then the body."""
+    pieces: list[str] = []
+    host = urlparse(post.url).netloc.lower().removeprefix("www.")
+    if not post.is_self and post.url and host not in _REDDIT_MEDIA_HOSTS:
+        pieces.append(post.url)
+    body = clean_text(post.selftext)
+    if body:
+        pieces.append(body)
+    return " ".join(pieces)[:RSS_SELF_TEXT_CHAR_LIMIT]
+
+
+def reddit_post_story(post: ArcticPost, source_name: str) -> Story:
+    """Story row for an archived post, shaped like a Reddit RSS entry.
+
+    Score and comment count stay 0 as on the RSS path (Reddit RSS carries
+    neither), so ranking features do not change with ``reddit_source``.
+    """
+    link = f"https://www.reddit.com{post.permalink}"
+    self_text = reddit_post_self_text(post)
+    return Story(
+        id=rss_story_id(link),
+        title=post.title,
+        url=link,
+        score=0,
+        time=post.created_utc,
+        text_content=compose_story_text(post.title, self_text),
+        self_text=self_text,
+        source=source_name,
+        comment_count=0,
+        comment_count_at_fetch=0,
+        discussion_url=None,
+    )
+
+
+async def _fetch_arctic_topfeed(
+    feed_url: str,
+    per_feed: int,
+    cutoff: float,
+    now: float,
+    exclude_urls: set[str],
+) -> list[Story]:
+    """A subreddit top feed from Arctic Shift; empty list on any failure."""
+    query = reddit_top_query(feed_url)
+    if query is None:
+        logging.warning("arctic_shift: unsupported Reddit feed %s", feed_url)
+        return []
+    subreddit, window, limit = query
+    window_seconds = window if window is not None else now - cutoff
+    try:
+        posts = await arctic_shift.top_posts(
+            subreddit,
+            window_seconds=window_seconds,
+            limit=min(per_feed, limit),
+            now=now,
+        )
+    except ArcticShiftError as exc:
+        logging.warning("arctic_shift: top feed %s failed: %s", feed_url, exc)
+        return []
+    except Exception:
+        logging.exception("Unexpected error fetching Arctic Shift feed %s", feed_url)
+        return []
+    source_name = _rss_source_name(feed_url)
+    stories = [reddit_post_story(post, source_name) for post in posts]
+    return [s for s in stories if s.time >= cutoff and s.url not in exclude_urls]
+
+
 def _rss_source_name(feed_url: str) -> str:
     subreddit = _reddit_subreddit_from_feed_url(feed_url)
     if subreddit:
@@ -715,9 +847,7 @@ async def _fetch_and_parse_feed(
             # blogs don't have one (entry.comments is None).
             comments_url = entry.get("comments")
 
-            h = hashlib.md5(link.encode("utf-8")).digest()
-            val = int.from_bytes(h[:4], "big")
-            synthetic_id = -(val % (2**31))
+            synthetic_id = rss_story_id(link)
 
             # Reddit's topfeed RSS does not include <score> or
             # <num_comments> elements in the entry body (confirmed
@@ -768,6 +898,7 @@ def build_reddit_topfeed_factories(
     per_feed: int,
     days: int,
     exclude_urls: set[str],
+    reddit_source: RedditSource = "rss",
 ) -> tuple[list[CoroFactory], list[str]]:
     """Build Reddit topfeed coroutine factories + their feed URLs.
 
@@ -784,6 +915,10 @@ def build_reddit_topfeed_factories(
     The ``days``, ``per_feed``, and ``exclude_urls`` arguments are
     captured by the closures so each factory has the same filtering
     behavior as the legacy in-line ``fetch_rss_feeds`` path.
+
+    With ``reddit_source="arctic_shift"`` the factories read Arctic Shift
+    (:func:`_fetch_arctic_topfeed`) and bypass ``reddit_limiter``, which
+    paces requests to reddit.com only.
     """
     reddit_feeds = [f for f in feeds if _reddit_subreddit_from_feed_url(f)]
     if not reddit_feeds:
@@ -795,6 +930,13 @@ def build_reddit_topfeed_factories(
         async def factory() -> None:
             cached = reddit_feed_cache.get(feed_url)
             if cached is not None:
+                return
+            if reddit_source == "arctic_shift":
+                stories = await _fetch_arctic_topfeed(
+                    feed_url, per_feed, cutoff, now, exclude_urls
+                )
+                if stories:
+                    reddit_feed_cache.set(feed_url, stories)
                 return
             if not await reddit_limiter.acquire():
                 return

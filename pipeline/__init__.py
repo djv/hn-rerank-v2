@@ -1268,15 +1268,21 @@ def refresh_reddit_candidates(
         if (state := db.get_reddit_feed_state(feed)) is None
         or state.next_retry_at <= now_ts
     ]
+    use_arctic = config.reddit_source == "arctic_shift"
     factories, feed_urls = build_reddit_topfeed_factories(
         eligible_feeds,
         config.rss.per_feed_limit,
         config.days,
         feedback_urls,
+        reddit_source=config.reddit_source,
     )
     if factories:
         reddit_fetch_queue.enqueue_all_reddit_fetches(
-            factories, [], min_stride_seconds=50.0
+            factories,
+            [],
+            min_stride_seconds=(
+                config.reddit_arctic_stride_seconds if use_arctic else 50.0
+            ),
         )
         if not reddit_fetch_queue.wait_until_empty(timeout=5400.0):
             logging.warning("reddit_refresh: topfeed queue timed out")
@@ -1300,12 +1306,20 @@ def refresh_reddit_candidates(
                 )
                 continue
             accepted_ids.append(story.id)
-            if existing is None or (
-                existing.title,
-                existing.url,
-                existing.time,
-                existing.self_text,
-            ) != (story.title, story.url, story.time, story.self_text):
+            # Compare stored rows: upsert keeps the longer self_text, so the
+            # fetched text alone would flag unchanged rows as changed.
+            stored = db.get_story(story.id)
+            if (
+                existing is None
+                or stored is None
+                or (
+                    existing.title,
+                    existing.url,
+                    existing.time,
+                    existing.self_text,
+                )
+                != (stored.title, stored.url, stored.time, stored.self_text)
+            ):
                 changed_ids.add(story.id)
         db.record_reddit_feed_success(feed_url, accepted_ids, now_ts)
 
@@ -1327,12 +1341,18 @@ def refresh_reddit_candidates(
                 ):
                     prewarm_ids.append(story.id)
 
-    prewarm_factories, updated_ids = build_reddit_prewarm_factories(prewarm_ids, db)
+    prewarm_factories, updated_ids = build_reddit_prewarm_factories(
+        prewarm_ids, db, reddit_source=config.reddit_source
+    )
     if prewarm_factories:
         reddit_fetch_queue.enqueue_all_reddit_fetches(
             [],
             prewarm_factories,
-            min_stride_seconds=config.reddit_min_fetch_spacing_seconds,
+            min_stride_seconds=(
+                config.reddit_arctic_stride_seconds
+                if use_arctic
+                else config.reddit_min_fetch_spacing_seconds
+            ),
         )
         if not reddit_fetch_queue.wait_until_empty(timeout=5400.0):
             logging.warning("reddit_refresh: prewarm queue timed out")

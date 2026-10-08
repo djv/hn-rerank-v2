@@ -5495,7 +5495,9 @@ def test_fetch_candidates_only_persists_topfeed_before_prewarm(
             comment_count=0,
         )
 
-        def fake_topfeed_factories(feeds, per_feed, days, exclude_urls):
+        def fake_topfeed_factories(
+            feeds, per_feed, days, exclude_urls, reddit_source="rss"
+        ):
             from reddit_feed_cache import cache as reddit_feed_cache
 
             # The real topfeed factory writes to the cache when called by
@@ -5511,7 +5513,7 @@ def test_fetch_candidates_only_persists_topfeed_before_prewarm(
 
         captured_factory_ids: list[list[int]] = []
 
-        def fake_build_reddit_prewarm_factories(story_ids, db_):
+        def fake_build_reddit_prewarm_factories(story_ids, db_, reddit_source="rss"):
             captured_factory_ids.append(list(story_ids))
 
             async def noop() -> None:
@@ -5604,7 +5606,9 @@ def test_fetch_candidates_only_caps_reddit_prewarm(monkeypatch) -> None:
             for i in range(3)
         ]
 
-        def fake_topfeed_factories(feeds, per_feed, days, exclude_urls):
+        def fake_topfeed_factories(
+            feeds, per_feed, days, exclude_urls, reddit_source="rss"
+        ):
             from reddit_feed_cache import cache as reddit_feed_cache
 
             for feed_url, story_set in zip(feeds, (stories_a, stories_b)):
@@ -5617,7 +5621,7 @@ def test_fetch_candidates_only_caps_reddit_prewarm(monkeypatch) -> None:
 
         captured_factory_ids: list[list[int]] = []
 
-        def fake_build_reddit_prewarm_factories(story_ids, db_):
+        def fake_build_reddit_prewarm_factories(story_ids, db_, reddit_source="rss"):
             captured_factory_ids.append(list(story_ids))
 
             async def noop() -> None:
@@ -5700,7 +5704,9 @@ def test_fetch_candidates_only_skips_already_hydrated_reddit(monkeypatch) -> Non
         )
         db.upsert_story(already_hydrated)
 
-        def fake_topfeed_factories(feeds, per_feed, days, exclude_urls):
+        def fake_topfeed_factories(
+            feeds, per_feed, days, exclude_urls, reddit_source="rss"
+        ):
             from reddit_feed_cache import cache as reddit_feed_cache
 
             reddit_feed_cache.set(feeds[0], [already_hydrated, new_story])
@@ -5712,7 +5718,7 @@ def test_fetch_candidates_only_skips_already_hydrated_reddit(monkeypatch) -> Non
 
         captured_factory_ids: list[list[int]] = []
 
-        def fake_build_reddit_prewarm_factories(story_ids, db_):
+        def fake_build_reddit_prewarm_factories(story_ids, db_, reddit_source="rss"):
             captured_factory_ids.append(list(story_ids))
 
             async def noop() -> None:
@@ -6050,12 +6056,14 @@ def test_fetch_candidates_only_prewarms_top_n_per_sub_from_cache(
 
         captured_ids: list[list[int]] = []
 
-        def fake_build_reddit_topfeed_factories(feeds, per_feed, days, exclude_urls):
+        def fake_build_reddit_topfeed_factories(
+            feeds, per_feed, days, exclude_urls, reddit_source="rss"
+        ):
             # Return no factories (we use the cache directly), but
             # return the feed URLs so the prewarm phase can read them.
             return [], feed_urls
 
-        def fake_build_reddit_prewarm_factories(story_ids, db_):
+        def fake_build_reddit_prewarm_factories(story_ids, db_, reddit_source="rss"):
             captured_ids.append(list(story_ids))
             return [], []
 
@@ -6134,10 +6142,12 @@ def test_fetch_candidates_only_skips_reddit_prewarm_when_disabled(
 
         captured_ids: list[list[int]] = []
 
-        def fake_build_reddit_topfeed_factories(feeds, per_feed, days, exclude_urls):
+        def fake_build_reddit_topfeed_factories(
+            feeds, per_feed, days, exclude_urls, reddit_source="rss"
+        ):
             return [], feed_urls
 
-        def fake_build_reddit_prewarm_factories(story_ids, db_):
+        def fake_build_reddit_prewarm_factories(story_ids, db_, reddit_source="rss"):
             captured_ids.append(list(story_ids))
             return [], []
 
@@ -6198,10 +6208,12 @@ def test_fetch_candidates_only_skips_reddit_prewarm_with_empty_cache(
 
         captured_ids: list[list[int]] = []
 
-        def fake_build_reddit_topfeed_factories(feeds, per_feed, days, exclude_urls):
+        def fake_build_reddit_topfeed_factories(
+            feeds, per_feed, days, exclude_urls, reddit_source="rss"
+        ):
             return [], feed_urls
 
-        def fake_build_reddit_prewarm_factories(story_ids, db_):
+        def fake_build_reddit_prewarm_factories(story_ids, db_, reddit_source="rss"):
             captured_ids.append(list(story_ids))
             return [], []
 
