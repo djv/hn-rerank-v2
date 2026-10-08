@@ -291,3 +291,52 @@ def test_warm_start_reaches_the_same_model_in_fewer_iterations(seed: int) -> Non
         # lbfgs stops at tol=1e-4 from either start: equal to that tolerance.
         atol=5e-3,
     )
+
+
+def test_arms_sharing_features_score_exactly_as_alone() -> None:
+    from pipeline import joined_classifier, ranking
+    from pipeline.interleave import challenger_configs
+    from pipeline.ranking import SharedFeatures, feature_settings
+
+    db = Database(":memory:")
+    try:
+        user_id = _seed(db, [0, 1, 2] * 14)
+        config = Config(
+            interleave_user_ids=(user_id,),
+            model=ModelConfig(min_up_for_svm=2, min_down_for_svm=2),
+        )
+        rng = np.random.default_rng(5)
+        candidates = _stories(rng, list(rng.integers(0, 3, 30)), 7000)
+        embs = rng.standard_normal((len(candidates), 384)).astype(np.float32)
+        embs /= np.linalg.norm(embs, axis=1, keepdims=True)
+        configs = [config] + [c for _, c in challenger_configs(config, user_id)]
+
+        def run(shared: SharedFeatures | None) -> list[dict[int, tuple]]:
+            ranking._MODEL_CACHE.clear()
+            joined_classifier._LATEST.clear()
+            return [
+                {
+                    r.story.id: (r.score, r.prob_down, r.prob_neutral, r.prob_up)
+                    for r in _score_and_rank(
+                        candidates,
+                        embs,
+                        db,
+                        c,
+                        _NoiseEmbedder(),
+                        user_id,
+                        shared=shared,
+                    )
+                }
+                for c in configs
+            ]
+
+        shared = SharedFeatures(feature_settings(config))
+        assert run(shared) == run(None)
+        assert shared.cand_features is not None and shared.fb_features is not None
+        assert shared.cand_word_counts is not None
+        # Different feature settings never reuse another arm's inputs.
+        other = SharedFeatures(("other",))
+        run(other)
+        assert other.cand_features is None
+    finally:
+        db.close()

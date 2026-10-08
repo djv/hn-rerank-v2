@@ -71,9 +71,13 @@ class JoinedLogistic:
         self._numeric_width = numeric.shape[1]
         return hstack([csr_matrix(numeric), words * self.word_scale], format="csr")
 
-    def _words(self, stories: Sequence[Story]) -> csr_matrix:
+    def _words(
+        self, stories: Sequence[Story], counts: csr_matrix | None = None
+    ) -> csr_matrix:
         assert self._keep is not None and self._idf is not None
-        return self._idf.transform(count_rows(stories)[:, self._keep]).tocsr()
+        if counts is None:
+            counts = count_rows(stories)
+        return self._idf.transform(counts[:, self._keep]).tocsr()
 
     def fit(
         self,
@@ -122,12 +126,21 @@ class JoinedLogistic:
         return self
 
     def predict_proba(
-        self, features: NDArray[np.floating], stories: Sequence[Story]
+        self,
+        features: NDArray[np.floating],
+        stories: Sequence[Story],
+        counts: csr_matrix | None = None,
     ) -> NDArray[np.float64]:
+        """*counts*, if given, is ``count_rows(stories)`` computed once for
+        several models."""
         if self._keep is None:
             raise RuntimeError("fit must run before predict_proba")
+        if counts is not None and counts.shape[0] != len(stories):
+            raise ValueError("word counts and stories do not align")
         return np.asarray(
-            self.estimator.predict_proba(self._inputs(features, self._words(stories))),
+            self.estimator.predict_proba(
+                self._inputs(features, self._words(stories, counts))
+            ),
             dtype=np.float64,
         )
 

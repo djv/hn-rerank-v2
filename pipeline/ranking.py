@@ -43,6 +43,8 @@ from .joined_classifier import JoinedLogistic
 from .model_manifest import ModelManifest, verify_model_dir
 
 if TYPE_CHECKING:
+    from scipy.sparse import csr_matrix
+
     from ch_client import ChItem
 
 
@@ -210,6 +212,37 @@ class _NullTrace:
 
 
 NULL_TRACE: _NullTrace = _NullTrace()
+
+
+@dataclass
+class SharedFeatures:
+    """Classifier inputs that one rerank builds once and every interleaving
+    arm reuses: they depend on the votes, vectors and feature settings
+    (``key``, from ``feature_settings``), not on the classifier."""
+
+    key: tuple[object, ...]
+    model_space: tuple[NDArray[np.float32], NDArray[np.float32]] | None = None
+    cand_features: NDArray[np.float32] | None = None
+    centers: NDArray[np.float32] | None = None
+    fb_features: NDArray[np.float32] | None = None
+    cand_word_counts: csr_matrix | None = None
+
+
+def feature_settings(config: Config) -> tuple[object, ...]:
+    """Everything besides the votes and vectors that the classifier inputs
+    of ``_score_and_rank`` depend on."""
+    m = config.model
+    return (
+        m.knn_k,
+        m.positive_cluster_k,
+        m.side_embedding_enabled,
+        m.side_embedding_min_coverage,
+        config.side_embedding_model_version,
+        m.publication_affinity_enabled,
+        m.publication_prior_strength,
+        m.engagement_features_enabled,
+        m.deduplicate_training_feedback,
+    )
 
 
 @dataclass
@@ -1171,9 +1204,19 @@ def _score_and_rank(
     user_id: int | None = None,
     trace: RankTrace | _NullTrace = NULL_TRACE,
     score_context: RankScoreContext | None = None,
+    shared: SharedFeatures | None = None,
 ) -> list[RankedStory]:
+    """*shared* carries classifier inputs between the arms of one rerank:
+    the first call with it fills it, later calls with the same feature
+    settings reuse it (a call that needs *score_context* still builds its
+    candidate features)."""
     if not candidates:
         return []
+    share = (
+        shared
+        if shared is not None and shared.key == feature_settings(config)
+        else None
+    )
 
     now = time.time()
     scores = None
@@ -1242,7 +1285,9 @@ def _score_and_rank(
             # stored + side model side by side. The score context (badges,
             # attribution) stays on the stored vectors either way.
             model_cand_emb, model_fb_emb = candidate_embeddings, fb_embeddings
-            if config.model.side_embedding_enabled:
+            if share is not None and share.model_space is not None:
+                model_cand_emb, model_fb_emb = share.model_space
+            elif config.model.side_embedding_enabled:
                 from .side_embeddings import model_space
 
                 with trace.stage("side_embeddings"):
@@ -1257,6 +1302,8 @@ def _score_and_rank(
                 trace.set_label("side_embeddings", "on" if space else "off")
                 if space is not None:
                     model_cand_emb, model_fb_emb = space.candidates, space.feedback
+            if share is not None:
+                share.model_space = (model_cand_emb, model_fb_emb)
 
             if fb_sig:
                 signature = hashlib.sha256(fb_sig.encode())
@@ -1306,153 +1353,180 @@ def _score_and_rank(
             k = config.model.knn_k
             emb_dim = model_cand_emb.shape[1]
 
-            with trace.stage("svm_candidate_feature_prep"):
-                # Fused (top-k mean, max) per class — one dot pass each instead
-                # of the two _knn_similarity/_chunked_max_dot recomputed the
-                # same candidate @ feedback matrix twice.
-                cand_sim_to_up, cand_closest_up, cand_closest_up_idx = (
-                    _knn_mean_and_max(model_cand_emb, fb_up_embs, k)
-                )
-                cand_sim_to_down, cand_closest_down, _ = _knn_mean_and_max(
-                    model_cand_emb, fb_down_embs, k
-                )
-                cand_closest_neutral = _chunked_max_dot(
-                    candidate_embeddings, fb_embeddings[neutral_mask]
-                )
-                # Cluster centers depend only on up-voted feedback, so reuse the
-                # cached ones on a model-cache hit instead of rerunning KMeans.
-                if cached_model is not None and cached_model[2] is not None:
-                    positive_cluster_centers = cached_model[2]
-                else:
-                    positive_cluster_centers = _positive_cluster_centers(
-                        fb_up_embs, config.model.positive_cluster_k
+            if (
+                share is not None
+                and share.cand_features is not None
+                and share.centers is not None
+                and score_context is None
+            ):
+                cand_features = share.cand_features
+                positive_cluster_centers = share.centers
+            else:
+                with trace.stage("svm_candidate_feature_prep"):
+                    # Fused (top-k mean, max) per class — one dot pass each instead
+                    # of the two _knn_similarity/_chunked_max_dot recomputed the
+                    # same candidate @ feedback matrix twice.
+                    cand_sim_to_up, cand_closest_up, cand_closest_up_idx = (
+                        _knn_mean_and_max(model_cand_emb, fb_up_embs, k)
                     )
-                cand_positive_cluster_sim = _similarity_to_positive_cluster_centers(
-                    model_cand_emb, positive_cluster_centers
-                )
-                cand_text_lengths = np.array([len(s.text_content) for s in candidates])
-                cand_source_onehot = source_category_stack(
-                    [s.source for s in candidates]
-                )
-                cand_is_hn_live = cand_source_onehot[:, 0]
-                cand_is_archive = cand_source_onehot[:, 1]
-                cand_is_reddit = cand_source_onehot[:, 2]
-                cand_is_rss = cand_source_onehot[:, 3]
+                    cand_sim_to_down, cand_closest_down, _ = _knn_mean_and_max(
+                        model_cand_emb, fb_down_embs, k
+                    )
+                    cand_closest_neutral = _chunked_max_dot(
+                        candidate_embeddings, fb_embeddings[neutral_mask]
+                    )
+                    # Cluster centers depend only on up-voted feedback, so reuse the
+                    # cached ones on a model-cache hit instead of rerunning KMeans.
+                    if cached_model is not None and cached_model[2] is not None:
+                        positive_cluster_centers = cached_model[2]
+                    else:
+                        positive_cluster_centers = _positive_cluster_centers(
+                            fb_up_embs, config.model.positive_cluster_k
+                        )
+                    cand_positive_cluster_sim = _similarity_to_positive_cluster_centers(
+                        model_cand_emb, positive_cluster_centers
+                    )
+                    cand_text_lengths = np.array(
+                        [len(s.text_content) for s in candidates]
+                    )
+                    cand_source_onehot = source_category_stack(
+                        [s.source for s in candidates]
+                    )
+                    cand_is_hn_live = cand_source_onehot[:, 0]
+                    cand_is_archive = cand_source_onehot[:, 1]
+                    cand_is_reddit = cand_source_onehot[:, 2]
+                    cand_is_rss = cand_source_onehot[:, 3]
 
-                cand_features = _svm_personalization_features(
-                    model_cand_emb,
-                    text_lengths=cand_text_lengths,
-                    sim_to_upvoted=cand_sim_to_up,
-                    sim_to_downvoted=cand_sim_to_down,
-                    closest_upvoted=cand_closest_up,
-                    closest_downvoted=cand_closest_down,
-                    positive_cluster_similarity=cand_positive_cluster_sim,
-                    is_hn_live=cand_is_hn_live,
-                    is_archive=cand_is_archive,
-                    is_reddit=cand_is_reddit,
-                    is_rss=cand_is_rss,
-                )
-            if publication_candidates is not None:
-                cand_features = np.concatenate(
-                    [cand_features, publication_candidates], axis=1
-                )
-            if config.model.engagement_features_enabled:
-                cand_features = np.concatenate(
-                    [cand_features, _engagement_features(candidates)], axis=1
-                )
-            if score_context is not None:
-                ctx_up_embs = fb_up_embs
-                ctx_closest_up, ctx_closest_up_idx = (
-                    cand_closest_up,
-                    cand_closest_up_idx,
-                )
-                ctx_closest_down = cand_closest_down
-                if model_cand_emb is not candidate_embeddings:
-                    # Side by side: badges and attribution thresholds are
-                    # tuned on the stored vectors, so measure them there.
-                    ctx_up_embs = fb_embeddings[up_mask]
-                    _, ctx_closest_up, ctx_closest_up_idx = _knn_mean_and_max(
-                        candidate_embeddings, ctx_up_embs, k
+                    cand_features = _svm_personalization_features(
+                        model_cand_emb,
+                        text_lengths=cand_text_lengths,
+                        sim_to_upvoted=cand_sim_to_up,
+                        sim_to_downvoted=cand_sim_to_down,
+                        closest_upvoted=cand_closest_up,
+                        closest_downvoted=cand_closest_down,
+                        positive_cluster_similarity=cand_positive_cluster_sim,
+                        is_hn_live=cand_is_hn_live,
+                        is_archive=cand_is_archive,
+                        is_reddit=cand_is_reddit,
+                        is_rss=cand_is_rss,
                     )
-                    _, ctx_closest_down, _ = _knn_mean_and_max(
-                        candidate_embeddings, fb_embeddings[down_mask], k
+                if publication_candidates is not None:
+                    cand_features = np.concatenate(
+                        [cand_features, publication_candidates], axis=1
                     )
-                score_context.cand_closest_up = ctx_closest_up.astype(np.float32)
-                score_context.cand_closest_up_idx = ctx_closest_up_idx
-                score_context.fb_up_titles = [
-                    feedback_stories[i].title for i in np.flatnonzero(up_mask)
-                ]
-                score_context.fb_up_embeddings = ctx_up_embs
-                score_context.cand_closest_down = ctx_closest_down.astype(np.float32)
-                score_context.cand_closest_neutral = cand_closest_neutral.astype(
-                    np.float32
-                )
+                if config.model.engagement_features_enabled:
+                    cand_features = np.concatenate(
+                        [cand_features, _engagement_features(candidates)], axis=1
+                    )
+                if score_context is not None:
+                    ctx_up_embs = fb_up_embs
+                    ctx_closest_up, ctx_closest_up_idx = (
+                        cand_closest_up,
+                        cand_closest_up_idx,
+                    )
+                    ctx_closest_down = cand_closest_down
+                    if model_cand_emb is not candidate_embeddings:
+                        # Side by side: badges and attribution thresholds are
+                        # tuned on the stored vectors, so measure them there.
+                        ctx_up_embs = fb_embeddings[up_mask]
+                        _, ctx_closest_up, ctx_closest_up_idx = _knn_mean_and_max(
+                            candidate_embeddings, ctx_up_embs, k
+                        )
+                        _, ctx_closest_down, _ = _knn_mean_and_max(
+                            candidate_embeddings, fb_embeddings[down_mask], k
+                        )
+                    score_context.cand_closest_up = ctx_closest_up.astype(np.float32)
+                    score_context.cand_closest_up_idx = ctx_closest_up_idx
+                    score_context.fb_up_titles = [
+                        feedback_stories[i].title for i in np.flatnonzero(up_mask)
+                    ]
+                    score_context.fb_up_embeddings = ctx_up_embs
+                    score_context.cand_closest_down = ctx_closest_down.astype(
+                        np.float32
+                    )
+                    score_context.cand_closest_neutral = cand_closest_neutral.astype(
+                        np.float32
+                    )
+                if share is not None:
+                    share.cand_features = cand_features
+                    share.centers = positive_cluster_centers
 
             if cached_model is not None:
                 trace.set_label("model_cache", "hit")
                 svm, scaler, _ = cached_model
             else:
                 trace.set_label("model_cache", "miss")
-                with trace.stage("svm_training_feature_prep"):
-                    # LOOCV k-NN for training: exclude self from reference set
-                    fb_sim_to_up = np.zeros(len(model_fb_emb), dtype=np.float32)
-                    fb_sim_to_down = np.zeros(len(model_fb_emb), dtype=np.float32)
-                    if n_up > 0:
-                        up_indices = np.where(up_mask)[0]
-                        fb_sim_to_up, fb_closest_up = _loocv_knn_features(
-                            model_fb_emb, fb_up_embs, up_indices, k
+                if share is not None and share.fb_features is not None:
+                    fb_features = share.fb_features
+                else:
+                    with trace.stage("svm_training_feature_prep"):
+                        # LOOCV k-NN for training: exclude self from reference set
+                        fb_sim_to_up = np.zeros(len(model_fb_emb), dtype=np.float32)
+                        fb_sim_to_down = np.zeros(len(model_fb_emb), dtype=np.float32)
+                        if n_up > 0:
+                            up_indices = np.where(up_mask)[0]
+                            fb_sim_to_up, fb_closest_up = _loocv_knn_features(
+                                model_fb_emb, fb_up_embs, up_indices, k
+                            )
+                        else:
+                            fb_closest_up = np.zeros(
+                                len(model_fb_emb), dtype=np.float32
+                            )
+
+                        if n_down > 0:
+                            down_indices = np.where(down_mask)[0]
+                            fb_sim_to_down, fb_closest_down = _loocv_knn_features(
+                                model_fb_emb, fb_down_embs, down_indices, k
+                            )
+                        else:
+                            fb_closest_down = np.zeros(
+                                len(model_fb_emb), dtype=np.float32
+                            )
+
+                        fb_positive_cluster_sim = (
+                            _similarity_to_positive_cluster_centers(
+                                model_fb_emb, positive_cluster_centers
+                            )
                         )
-                    else:
-                        fb_closest_up = np.zeros(len(model_fb_emb), dtype=np.float32)
 
-                    if n_down > 0:
-                        down_indices = np.where(down_mask)[0]
-                        fb_sim_to_down, fb_closest_down = _loocv_knn_features(
-                            model_fb_emb, fb_down_embs, down_indices, k
+                        fb_text_lengths = np.array(
+                            [len(s.text_content) for s in feedback_stories]
                         )
-                    else:
-                        fb_closest_down = np.zeros(len(model_fb_emb), dtype=np.float32)
 
-                    fb_positive_cluster_sim = _similarity_to_positive_cluster_centers(
-                        model_fb_emb, positive_cluster_centers
-                    )
+                        # 4-binary source category one-hot per feedback story.
+                        fb_source_onehot = source_category_stack(
+                            [s.source for s in feedback_stories]
+                        )
+                        fb_is_hn_live = fb_source_onehot[:, 0]
+                        fb_is_archive = fb_source_onehot[:, 1]
+                        fb_is_reddit = fb_source_onehot[:, 2]
+                        fb_is_rss = fb_source_onehot[:, 3]
 
-                    fb_text_lengths = np.array(
-                        [len(s.text_content) for s in feedback_stories]
-                    )
+                        fb_features = _svm_personalization_features(
+                            model_fb_emb,
+                            text_lengths=fb_text_lengths,
+                            sim_to_upvoted=fb_sim_to_up,
+                            sim_to_downvoted=fb_sim_to_down,
+                            closest_upvoted=fb_closest_up,
+                            closest_downvoted=fb_closest_down,
+                            positive_cluster_similarity=fb_positive_cluster_sim,
+                            is_hn_live=fb_is_hn_live,
+                            is_archive=fb_is_archive,
+                            is_reddit=fb_is_reddit,
+                            is_rss=fb_is_rss,
+                        )
 
-                    # 4-binary source category one-hot per feedback story.
-                    fb_source_onehot = source_category_stack(
-                        [s.source for s in feedback_stories]
-                    )
-                    fb_is_hn_live = fb_source_onehot[:, 0]
-                    fb_is_archive = fb_source_onehot[:, 1]
-                    fb_is_reddit = fb_source_onehot[:, 2]
-                    fb_is_rss = fb_source_onehot[:, 3]
-
-                    fb_features = _svm_personalization_features(
-                        model_fb_emb,
-                        text_lengths=fb_text_lengths,
-                        sim_to_upvoted=fb_sim_to_up,
-                        sim_to_downvoted=fb_sim_to_down,
-                        closest_upvoted=fb_closest_up,
-                        closest_downvoted=fb_closest_down,
-                        positive_cluster_similarity=fb_positive_cluster_sim,
-                        is_hn_live=fb_is_hn_live,
-                        is_archive=fb_is_archive,
-                        is_reddit=fb_is_reddit,
-                        is_rss=fb_is_rss,
-                    )
-
-                if publication_train is not None:
-                    fb_features = np.concatenate(
-                        [fb_features, publication_train], axis=1
-                    )
-                if config.model.engagement_features_enabled:
-                    fb_features = np.concatenate(
-                        [fb_features, _engagement_features(feedback_stories)],
-                        axis=1,
-                    )
+                    if publication_train is not None:
+                        fb_features = np.concatenate(
+                            [fb_features, publication_train], axis=1
+                        )
+                    if config.model.engagement_features_enabled:
+                        fb_features = np.concatenate(
+                            [fb_features, _engagement_features(feedback_stories)],
+                            axis=1,
+                        )
+                    if share is not None:
+                        share.fb_features = fb_features
 
                 # Ensure all three classes (0, 1, 2) are present
                 missing = {0, 1, 2} - set(feedback_labels)
@@ -1581,7 +1655,14 @@ def _score_and_rank(
             idx_up = class_order.index(2)
             if isinstance(svm, JoinedLogistic):
                 with trace.stage("decision"):
-                    probs = svm.predict_proba(cand_features_scaled, candidates)
+                    counts = None
+                    if share is not None:
+                        if share.cand_word_counts is None:
+                            share.cand_word_counts = linear_blend.count_rows(candidates)
+                        counts = share.cand_word_counts
+                    probs = svm.predict_proba(
+                        cand_features_scaled, candidates, counts=counts
+                    )
                 # Rank by P(up) - P(down); the probabilities stay as fitted.
                 raw_scores = probs[:, idx_up] - probs[:, class_order.index(0)]
             else:
@@ -2209,6 +2290,7 @@ def rerank_candidates(
             cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
 
     score_context = RankScoreContext()
+    shared = SharedFeatures(feature_settings(config)) if challengers else None
     ranked = _score_and_rank(
         candidates,
         cand_embeddings,
@@ -2218,6 +2300,7 @@ def rerank_candidates(
         user_id=user_id,
         trace=trace,
         score_context=score_context,
+        shared=shared,
     )
 
     arm_rankings: dict[str, list[int]] = {}
@@ -2232,6 +2315,7 @@ def rerank_candidates(
                 embedder,
                 user_id=user_id,
                 trace=arm_trace,
+                shared=shared,
             )
         fitted = arm_trace.labels.get("model_cache") in {"hit", "miss"}
         if not fitted or "svm_fit" in arm_trace.labels:

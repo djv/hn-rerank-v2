@@ -23,6 +23,11 @@ tldr_probe_max_threads_per_regen = 20
 # Tap-time Firebase probe budget per open (young HN threads only); the regen
 # probe above keeps its own 10s default. Miss/failure serves cached.
 tldr_tap_probe_timeout_seconds = 3.0
+# Live team-draft interleaving of production with the joined-classifier
+# challengers (shortlist #2/#4) in profile 151's Recommended views, 28 days
+# from the first interleaved deck (docs/evaluations/model-ablation-20261007/
+# INTERLEAVING.md). Remove the line to stop.
+interleave_user_ids = [151]
 
 [hn_rewrite.model]
 svm_c = 4.0

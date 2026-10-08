@@ -1,5 +1,32 @@
 # Worklog: hn-rewrite
 
+## 2026-10-07 Interleaving for the shortlisted classifiers
+
+The user chose to compare shortlist #2 (one joined logistic classifier,
+all features) and #4 (the same classifier without metadata) live against
+production through interleaving, for profile 151 only, plus four offline
+follow-ups. `model.classifier = "joined_logistic"` puts the offline
+classifier in the serving path; its probabilities equal the offline
+adapter's. `interleave_user_ids` team-drafts each window's Recommended view
+from production and both challengers. The warm stores every interleaved
+deck's arms in the new `interleave_decks` table, and
+`scripts/interleave_report.py` credits votes through the impression ledger.
+Interleaving is off by default and nothing is deployed. Offline harness:
+`--metadata-scale` (one-classifier adapter), `--train-recent`
+(evaluator), and `scripts/simulate_interleaving.py` (power replay on the
+twelve judged blocks). `scripts/benchmark_rank_cold_cache.py` gained
+`--interleave` and `--onnx-model-dir`. Its cold runs now also drop the
+linear blend's fits (keeping their warm start), as a vote does. Results
+and the decision rule are in
+docs/evaluations/model-ablation-20261007/INTERLEAVING.md.
+
+On the VPS, interleaving first made a post-vote rerank 39 s instead of
+9 s. Warm-starting each challenger from the user's previous fit, and
+sharing production's feature build (`SharedFeatures`), brought it to 21 s.
+Scores are unchanged by sharing and equal to lbfgs tolerance with the warm
+start. The user asked to merge everything into main and deploy; profile 151
+is enabled in config.toml for 28 days.
+
 ## 2026-10-07 Save user evaluation shortlist
 
 Recorded the user's preference for candidates #2 (one classifier with all
