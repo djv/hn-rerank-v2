@@ -1,0 +1,99 @@
+{
+ "bootstrap": {
+  "hi": 0.004817587712756681,
+  "lo": -0.007995034734059879,
+  "mean": -0.001558046889073518,
+  "n_boot": 2000.0
+ },
+ "endpoint": "UP-vs-rest AUC on production score, pooled by UP/non-UP pairs",
+ "gates": {
+  "bootstrap_lo_gt_0": false,
+  "guardrail_down_not_up": true,
+  "guardrail_up_not_down": true,
+  "positive_ge_3_of_4": false,
+  "primary_delta_ge_0.01": false
+ },
+ "hashes": {
+  "baseline_rows": "8fce60bbf9109478",
+  "challenger_rows": "94a64d8e10c402b4",
+  "harness.py": "988f127a212e9e2d",
+  "sample.json": "d8e996f30a64cdf4"
+ },
+ "n_positive_blocks": 2,
+ "passed": false,
+ "per_block": [
+  {
+   "auc_baseline": 0.7361116049207139,
+   "auc_challenger": 0.7242275830192704,
+   "block": 2,
+   "delta": -0.011884021901443553,
+   "n": 770,
+   "ordinal_baseline": 0.7886978651062264,
+   "ordinal_challenger": 0.7770360273042496,
+   "pairs": 112504,
+   "top12_down_baseline": 0.0,
+   "top12_down_challenger": 0.0,
+   "top12_up_baseline": 0.5833333333333334,
+   "top12_up_challenger": 0.6666666666666666,
+   "up": 196
+  },
+  {
+   "auc_baseline": 0.7302524883136707,
+   "auc_challenger": 0.7409927815053899,
+   "block": 3,
+   "delta": 0.010740293191719208,
+   "n": 769,
+   "ordinal_baseline": 0.7317578435165014,
+   "ordinal_challenger": 0.7391916240812754,
+   "pairs": 125788,
+   "top12_down_baseline": 0.08333333333333333,
+   "top12_down_challenger": 0.08333333333333333,
+   "top12_up_baseline": 0.5,
+   "top12_up_challenger": 0.5,
+   "up": 236
+  },
+  {
+   "auc_baseline": 0.8766382436957708,
+   "auc_challenger": 0.8683627726839914,
+   "block": 4,
+   "delta": -0.00827547101177939,
+   "n": 770,
+   "ordinal_baseline": 0.8330237505994147,
+   "ordinal_challenger": 0.8230004354368423,
+   "pairs": 93469,
+   "top12_down_baseline": 0.0,
+   "top12_down_challenger": 0.0,
+   "top12_up_baseline": 0.9166666666666666,
+   "top12_up_challenger": 0.8333333333333334,
+   "up": 151
+  },
+  {
+   "auc_baseline": 0.8113432835820896,
+   "auc_challenger": 0.8128059701492538,
+   "block": 5,
+   "delta": 0.0014626865671641953,
+   "n": 770,
+   "ordinal_baseline": 0.807797301163456,
+   "ordinal_challenger": 0.8073204749189395,
+   "pairs": 67000,
+   "top12_down_baseline": 0.0,
+   "top12_down_challenger": 0.0,
+   "top12_up_baseline": 0.4166666666666667,
+   "top12_up_challenger": 0.4166666666666667,
+   "up": 100
+  }
+ ],
+ "pooled_auc": {
+  "baseline": 0.7798430638904005,
+  "challenger": 0.7781841754835603
+ },
+ "pooled_delta": -0.0016588884068402788,
+ "top12_down_pooled": {
+  "baseline": 0.020833333333333332,
+  "challenger": 0.020833333333333332
+ },
+ "top12_up_pooled": {
+  "baseline": 0.6041666666666666,
+  "challenger": 0.6041666666666666
+ }
+}

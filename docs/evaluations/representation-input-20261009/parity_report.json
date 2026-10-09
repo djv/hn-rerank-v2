@@ -1,0 +1,121 @@
+{
+ "config": {
+  "embedding_max_tokens": 4096,
+  "embedding_model_version": "mxbai-embed-xsmall-v1|mean|norm|4096"
+ },
+ "encode_seconds": 27.53,
+ "encoder": {
+  "config.json": "55f755d351fd04b0",
+  "model.onnx": "9ba32b8568b5bf0a",
+  "model_dir": "/home/dev/hn-rewrite/shared/mxbai-embed-xsmall-v1",
+  "tokenizer.json": "da0e79933b9ed517",
+  "vocab.txt": "07eced375cec144d"
+ },
+ "env_before": {
+  "free -m": "total        used        free      shared  buff/cache   available\nMem:            7751        2927        2216           4        2913        4824\nSwap:           4095        1103        2992",
+  "uptime": "15:31:54 up 12 days, 21:52,  4 users,  load average: 0.64, 0.99, 0.88"
+ },
+ "gate": "cosine >= 0.9999 on every parity row",
+ "hashes": {
+  "config.toml": "99a2ad40f7f9973f",
+  "harness.py": "e1bc2da4029f3f11",
+  "manifest.json": "b908e8271c4721fe",
+  "sample.json": "d8e996f30a64cdf4"
+ },
+ "min_cosine": 0.9999998211860657,
+ "n_rows": 20,
+ "onnx_intra_op_threads": 1,
+ "passed": true,
+ "projected_note": "linear projection for Penn 3237 changed rows; first metrics only",
+ "projected_seconds_for_changed": 4455.0,
+ "rows": [
+  {
+   "cosine": 1.0,
+   "story_id": -2143031894
+  },
+  {
+   "cosine": 1.0,
+   "story_id": 46876105
+  },
+  {
+   "cosine": 0.9999999403953552,
+   "story_id": 48741902
+  },
+  {
+   "cosine": 1.0,
+   "story_id": 48806560
+  },
+  {
+   "cosine": 0.9999998807907104,
+   "story_id": -2144136158
+  },
+  {
+   "cosine": 1.0,
+   "story_id": -954054538
+  },
+  {
+   "cosine": 0.9999999403953552,
+   "story_id": 48879727
+  },
+  {
+   "cosine": 1.0,
+   "story_id": 49087091
+  },
+  {
+   "cosine": 1.0,
+   "story_id": -2146042249
+  },
+  {
+   "cosine": 1.0,
+   "story_id": -849983301
+  },
+  {
+   "cosine": 0.9999999403953552,
+   "story_id": 49358259
+  },
+  {
+   "cosine": 1.0,
+   "story_id": 49576258
+  },
+  {
+   "cosine": 0.9999998807907104,
+   "story_id": -2131519313
+  },
+  {
+   "cosine": 1.0000001192092896,
+   "story_id": -619242801
+  },
+  {
+   "cosine": 1.0,
+   "story_id": 49662371
+  },
+  {
+   "cosine": 1.0000001192092896,
+   "story_id": 49849625
+  },
+  {
+   "cosine": 1.0,
+   "story_id": -2138199256
+  },
+  {
+   "cosine": 1.0,
+   "story_id": -693920591
+  },
+  {
+   "cosine": 1.0,
+   "story_id": 49917761
+  },
+  {
+   "cosine": 0.9999998211860657,
+   "story_id": 49946845
+  }
+ ],
+ "seconds_per_row": 1.376,
+ "threads": {
+  "MKL_NUM_THREADS": "1",
+  "OMP_NUM_THREADS": "1",
+  "OPENBLAS_NUM_THREADS": "1"
+ },
+ "total_seconds": 30.0,
+ "warm_store_enabled": false
+}

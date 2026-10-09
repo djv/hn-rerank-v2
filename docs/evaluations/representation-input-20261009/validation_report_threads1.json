@@ -1,0 +1,54 @@
+{
+ "config": {
+  "classifier": "svm",
+  "embedding_model_version": "mxbai-embed-xsmall-v1|mean|norm|4096",
+  "linear_blend_enabled": true,
+  "side_embedding_enabled": true,
+  "svm_c": 4.0,
+  "svm_gamma": 0.03,
+  "svm_kernel": "rbf"
+ },
+ "drift": {
+  "test_bad_b2": [],
+  "test_bad_b3": [],
+  "test_bad_b4": [],
+  "test_bad_b5": [],
+  "train_bad_b2": [],
+  "train_bad_b3": [],
+  "train_bad_b4": [],
+  "train_bad_b5": []
+ },
+ "encoder": {
+  "config.json": "55f755d351fd04b0",
+  "model.onnx": "9ba32b8568b5bf0a",
+  "model_dir": "/home/dev/hn-rewrite/shared/mxbai-embed-xsmall-v1",
+  "tokenizer.json": "da0e79933b9ed517",
+  "vocab.txt": "07eced375cec144d"
+ },
+ "env_before_copy": {
+  "free -m": "total        used        free      shared  buff/cache   available\nMem:            7751        2753         831           4        4472        4997\nSwap:           4095        1214        2881",
+  "uptime": "15:15:08 up 12 days, 21:35,  4 users,  load average: 0.49, 0.61, 0.39"
+ },
+ "eval_now": 1791401987.9873054,
+ "fit_seconds": {
+  "block2": 2.8,
+  "block3": 3.6,
+  "block4": 6.8,
+  "block5": 7.2
+ },
+ "gate": "max|prob diff| <= 1e-06",
+ "hashes": {
+  "config.toml": "99a2ad40f7f9973f",
+  "harness.py": "ed6422be3e6c72ef",
+  "oof_scores.json": "e40fae0c91941304",
+  "sample.json": "d8e996f30a64cdf4"
+ },
+ "max_abs_prob_diff": 0.0,
+ "n_rows": 3079,
+ "passed": true,
+ "score_drift_max_abs_vs_wallclock": 0.0,
+ "score_drift_note": "expected: fixed eval_now clock vs old wall-clock scores; not gated.",
+ "total_seconds": 24.8,
+ "warm_store_enabled": false,
+ "worst_row": null
+}

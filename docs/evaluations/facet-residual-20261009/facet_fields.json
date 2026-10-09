@@ -1,0 +1,69 @@
+{
+ "frozen_at": "2026-10-09T13:20:38.287616+00:00",
+ "n_pairs_complete": 20,
+ "n_pairs_missing": 0,
+ "agree": {
+  "actionable": 15,
+  "artifact": 17,
+  "claim": 19,
+  "conflict_framing": 18,
+  "entity_focus": 19,
+  "technical_depth": 10,
+  "voice": 17
+ },
+ "rate": {
+  "actionable": 0.75,
+  "artifact": 0.85,
+  "claim": 0.95,
+  "conflict_framing": 0.9,
+  "entity_focus": 0.95,
+  "technical_depth": 0.5,
+  "voice": 0.85
+ },
+ "retained": [
+  "artifact",
+  "claim",
+  "conflict_framing",
+  "entity_focus",
+  "voice"
+ ],
+ "rule": "retain iff repeat agreement >=0.85",
+ "proxy_rules": {
+  "version": "proxy-v1-20261009",
+  "title_prefix": [
+   "ask hn:",
+   "show hn:",
+   "launch hn:",
+   "tell hn:"
+  ],
+  "url_kind": [
+   "github.com",
+   "arxiv",
+   "youtube",
+   "twitter/x",
+   "other/none"
+  ],
+  "domain_class": [
+   "code",
+   "paper",
+   "video",
+   "social",
+   "news",
+   "other"
+  ],
+  "source_values": [
+   "hn",
+   "reddit",
+   "lesswrong"
+  ],
+  "text_len_bins": [
+   0,
+   1,
+   200,
+   800,
+   1500
+  ],
+  "note": "regexes fixed here; text_len from repaired body length only"
+ },
+ "proxy_sha16": "ce196174ff706176"
+}

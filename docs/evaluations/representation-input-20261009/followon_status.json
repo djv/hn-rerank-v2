@@ -1,0 +1,40 @@
+{
+ "events": [
+  {
+   "code": 0,
+   "detail": "waiting on encode PID 3989858",
+   "event": "runner_start",
+   "ts": "2026-10-09T15:43:00Z"
+  },
+  {
+   "code": 0,
+   "detail": "n_vectors=3237",
+   "event": "encode_verified",
+   "ts": "2026-10-09T15:51:00Z"
+  },
+  {
+   "code": 0,
+   "detail": "exit=0",
+   "event": "compare_baseline",
+   "ts": "2026-10-09T15:51:27Z"
+  },
+  {
+   "code": 0,
+   "detail": "exit=0",
+   "event": "compare_challenger",
+   "ts": "2026-10-09T15:51:58Z"
+  },
+  {
+   "code": 1,
+   "detail": "exit=1",
+   "event": "report",
+   "ts": "2026-10-09T15:52:33Z"
+  }
+ ],
+ "last": {
+  "code": 1,
+  "detail": "exit=1",
+  "event": "report",
+  "ts": "2026-10-09T15:52:33Z"
+ }
+}

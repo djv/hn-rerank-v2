@@ -1,6 +1,6 @@
 # HN Rerank status
 
-Updated 2026-10-08. Previous handoff (one-classifier research, Why-this-story
+Updated 2026-10-09. Previous handoff (one-classifier research, Why-this-story
 preview, pending Reddit/Gemma items):
 [before interleaving](docs/status-archive/before-interleaving-20261007.md).
 
@@ -13,6 +13,21 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- Save/cleanup verification, 2026-10-09: isolated VPS checkout of laptop
+  HEAD plus current runtime changes passed backend 1,218 / 1 skipped and
+  TUI 174 / 1 skipped. Repository Ruff/ty and touched-Python format clean;
+  mockup JavaScript syntax passed. No deployment or live trial change.
+  WIP includes uncapped wide TUI pane proportions, blank-response guard,
+  read-only TLDR diagnostic (provider replay opt-in), and illustrative
+  reader mockup. Host-local kernel log retained and ignored.
+- 2026-10-09 17:25 UTC live check: service active; 77 profile-151 votes
+  since T0, 19 credited across 7 decks (51 Popular / 7 Explore excluded).
+  Production 4 UP / 3 neutral / 0 DOWN; #2 3/3/0; #4 3/2/1.
+  222 impressions; no other profile's votes or interactions since T0.
+  Median rank time 15.1 s over 139 rows (max 104.0 s). Descriptive only:
+  too few credited votes for an efficacy conclusion. Trial unchanged;
+  final analysis remains November 5 04:07:22 UTC. Evidence:
+  [live check](docs/evaluations/live-interleaving-check-20261009.json).
 - Implemented (off by default): `model.classifier = "joined_logistic"`,
   `interleave_user_ids`, `interleave_decks` table,
   `scripts/interleave_report.py`; challengers warm-start and share
@@ -80,19 +95,35 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
 - RSS read timeouts now log one warning line (5c092d0).
 - TUI `o`/`c` open via `~/bin/hn-open` (system-setup): a new Firefox window
   for every link (user 2026-10-08; Firefox has Bypass Paywalls Clean).
+- Wide TUI reading pane now keeps the intended 1:2 list/reader ratio
+  without a 100-column cap. Automated region checks pass at widths 100
+  and 240; physical terminal rendering remains unverified in this save.
+- Empty article responses: `_extract_article_body` now skips blank and
+  whitespace-only input, preserving retryable `empty_extraction` without
+  trafilatura's error log. Isolated VPS gates: 1,217 passed, 1 skipped;
+  Ruff, touched-file format, and ty clean. Not deployed yet.
 
 ## Blocker
 None.
 
 ## Next step
+- AI ranking research: goal is a repeatable Muse advantage transferable into
+  the ML ranker. Research paused at the user's request (2026-10-09).
+  User stopped the contrastive protocol/infrastructure branch.
+  [Existing-evidence reassessment](docs/evaluations/RANKING-REASSESSMENT-20261009.md)
+  completed with cheap Muse and root verification: no concrete missing feature
+  justified; prior-UP explanations occur in fixes and damage, while related
+  similarity/lexical features already exist. No new annotations or fits.
+  No further research work or annotation spending while paused. Live ML
+  interleaving continues unchanged; no winner established from 19 credits.
+  This does not rule out every LLM approach. Resume only when requested.
 - Optional: the remaining cold cost after a restart is linear blend
   scoring (7.1 s, candidate word counts recomputed); a persisted or
   prewarmed count cache would cut it.
 - User: restart the TUI from a fresh shell (8 per section, `hn-open`).
-- New today (15:01, 15:37, 16:06 UTC, none before): trafilatura logs
-  "[ERROR] empty HTML tree" when article extraction gets an empty page
-  (the first after a Substack 403 fell back to urllib). Skip extraction on
-  empty bodies or quiet the logger; check why Substack now answers 403.
+- Deploy the verified blank-body extraction guard, then check runtime logs.
+  Substack's httpx 403 still reproduces; a fresh urllib fallback returned
+  full HTML. The historical empty-response cause remains unconfirmed.
 - Arctic Shift: check `reddit_refresh_arctic` lines over the next days and
   a Reddit card's tldr-detail (live tap) with archive comments. Rollback:
   delete `reddit_source` in config.toml and restart (RSS until Nov 13).

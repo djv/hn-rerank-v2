@@ -1,0 +1,25 @@
+{
+  "feedback": {
+    "identical": true,
+    "source": {
+      "count": 3947,
+      "sha256": "0a4306169c603a51a5348cf0c86ff4cc613f0a99704e8f549b113d05bc2ca70d"
+    }
+  },
+  "stories": {
+    "identical": true,
+    "source": {
+      "count": 3947,
+      "sha256": "89cb53949d3a245ceea0ae9fe07f713e8311e249651d24cb859733aab58749fd"
+    }
+  },
+  "side_vectors": {
+    "identical": true,
+    "source": {
+      "count": 3947,
+      "sha256": "64d7289dd419d58b6efd3e4b595f3450310141d7d88bfbd99d3db6555d79a653"
+    }
+  },
+  "baseline_exact": true,
+  "config_encoder_identical": true
+}

@@ -1,0 +1,51 @@
+{
+  "status": "complete",
+  "model": "opencode-go/muse-spark-1.3-contributor",
+  "selected_pairs": 24,
+  "completed_forward": 24,
+  "planned_reversed": 6,
+  "completed_reversed": 6,
+  "stable": 6,
+  "up_vs_rest": {
+    "correct": 0,
+    "comparable_pairs": 0,
+    "outcome_ties_excluded": 24,
+    "missing_or_changed_outcomes": 0,
+    "wilson_95_percent": null,
+    "interval_note": "Descriptive pair interval; reused stories and topic clustering violate independent-trial assumption."
+  },
+  "hypothesis": {
+    "precedent_picks": 5,
+    "non_tied_precedent_pairs": 14,
+    "primary_threshold_met": false,
+    "conditional_correct_total": {
+      "precedent_up": [
+        0,
+        0
+      ],
+      "precedent_nonup": [
+        0,
+        0
+      ]
+    },
+    "conditional_minimum_met": false,
+    "accuracy_difference": null,
+    "stability_requirement_met": true,
+    "decision": "NOT SUPPORTED by preregistered gate; no challenger built"
+  },
+  "ml_comparison": "unknown: no saved out-of-sample scores cover these fresh stories",
+  "provider_failure": "OpenCode: OpenRouter fallback paused: credit exhausted or unverified. Go retries after cooldown.",
+  "retry_protocol_note": "The user authorized retry after partial outcomes were reviewed. Selection, hypothesis and text-only prompts stayed fixed; nine missing rankings used fresh isolated sessions without outcome access. Original partial freeze and results retained.",
+  "freeze": {
+    "frozen_at": "2026-10-09T11:47:37.728639+00:00",
+    "hashes": {
+      "preregistration.json": "d94a7095c6ad090dc8157889ebc8fe85f8a8c36e227b0c4739abb4eac3a656f6",
+      "selection.json": "d205dd66db5731d21fa21137d58f7cf9f4d3beea2cb0737b73917d71a54f9247",
+      "profile_fresh.txt": "48d0b0e4cb5e345377e03c7bbd97c9e051bfca4c0b0017c3a1b02e8c3d4bbdbf",
+      "muse_pair_scores_fresh.json": "2607df9dfeffbe4b36612736ec2cef6c26cbc2168deaddb393b6bc3f5f8f723b",
+      "muse-cache-fresh.json": "efada802ce65ad3aeaea6b154c1cfc65e31a4d4a554f084afdd855256b82b9c6"
+    },
+    "note": "Committed completed ranking artifacts before evaluator reads candidate vote outcomes; no further ranking permitted in this partial analysis."
+  },
+  "production_changes": false
+}

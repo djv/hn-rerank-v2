@@ -1,0 +1,15 @@
+{
+ "ordinal_auc": 0.75244,
+ "ordinal_cluster95": [
+  0.675,
+  0.823
+ ],
+ "uprest_auc": 0.74103,
+ "uprest_cluster95": [
+  0.597,
+  0.864
+ ],
+ "B": 2000,
+ "seed": 20261009,
+ "method": "story-cluster bootstrap, resample 99 stories with replacement; pairs within resample"
+}

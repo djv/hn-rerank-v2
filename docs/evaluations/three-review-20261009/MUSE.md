@@ -1,0 +1,13 @@
+Independent review — reading the five aggregate reports.
+
+**Verdict: do one cheap within-source discrimination check, then stop spent-label work and prepare a future-vote protocol. No component audit, no new LLM approach now.**
+
+**1. Slot scarcity + exposure invalidate headroom / replay readings.** Evidence, not heuristic: `missed-upvotes/REPORT.md Conclusion + §Cohort`: 48 slots for 683 UPs, 635 misses unavoidable; 19 replaceable non-UP picks are *total across four blocks*, not per-block live headroom. `cc-replay/REPORT.md §1`: every voted row was first served by a ranker; top-12 replay on voted rows does not equal live eligible pools. Conditioning on UP-in-tail then asking why rank is low is circular.
+
+**2. HN-tail pattern is descriptive, confounded, small-n.** `missed-upvotes §2,§6`: HN above block tail-rate 4/4 blocks, but b4/b5 tails are n=11 each, lesswrong n=27, content/age/training history confounded; private-12 are 12/12 hn by selection. `facet-residual §Results`: UP subset 61/683, saturated miss rates, enrichments ~1.0. `cc-replay §2`: 5+5 pairs, 9/10 down-vs-neutral. `targeted-muse Results`: 11/12 corrections is correctness on a production-wrong/Opus-right selected stratum, not agreement; 5/11 on regressions leans Opus. Any zero-future-vote claim is historical, not verified today.
+
+**3. No transferable cheap Muse signal yet.** `facet-residual`: pooled arm3-arm1 −.051, all 5 frozen gates fail; UP-vs-rest +.006 secondary, no conclusion. `cc-replay §3`: 2/5 fixes, 1/5 controls, damage 4 at conf 68-86 plus neutral-over-UP at 86; familiarity 5/14 already unsupported. `representation-input/REPORT.md`: comment-free Δ −.0017, gates fail. Proposed heuristics — chatter tags, title-novelty, source priors — are untested ideas, not evidence; tags were explicitly REJECTed in `targeted-muse`.
+
+**Source-AUC check is worthwhile, not a detour,** because it is the cheapest discriminator before an expensive audit: equal within-source AUC does *not* prove priors appropriate — cross-source calibration can still misrank — but *lower* HN within-source AUC would implicate semantics over priors.
+
+**One decision-complete measurement, zero new annotations:** on existing 3079 block 2-5 predictions, per-block HN vs non-HN UP-v-DOWN and UP-v-rest AUC + rank/score calibration, with predefined age strata as sensitivity controls; no fits, no thresholds as gates, report conditional CIs only descriptively. Stop rule: whatever the direction, do no component audit or LLM build on these spent labels; freeze at most one hypothesis for confirmation on preregistered fresh votes after a cutoff date. Uncertainty remains large; no automatic follow-on.

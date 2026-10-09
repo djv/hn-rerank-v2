@@ -1,0 +1,70 @@
+{
+  "user_id": 151,
+  "since": 1791432442.75,
+  "until": 1791566704.912419,
+  "votes": 77,
+  "credited": 19,
+  "skipped": {
+    "view_popular": 51,
+    "view_explore": 7
+  },
+  "summary": {
+    "credited_by_arm": {
+      "production": {
+        "up": 4,
+        "neutral": 3
+      },
+      "joined_all": {
+        "neutral": 3,
+        "up": 3
+      },
+      "joined_no_metadata": {
+        "neutral": 2,
+        "up": 3,
+        "down": 1
+      }
+    },
+    "decks_with_credit": 7,
+    "per_test_alpha": 0.025,
+    "joined_all": {
+      "deck_sign_p": 1.0,
+      "deck_wins": 1,
+      "deck_losses": 2,
+      "rate_p": 0.7967624218352323,
+      "up_rate": 0.5,
+      "control_up_rate": 0.5714285714285714,
+      "down_rate": 0.0,
+      "control_down_rate": 0.0,
+      "credited": 6,
+      "control_credited": 7,
+      "deck_sign_rejects": false,
+      "rate_rejects": false
+    },
+    "joined_no_metadata": {
+      "deck_sign_p": 1.0,
+      "deck_wins": 1,
+      "deck_losses": 2,
+      "rate_p": 0.7967624218352323,
+      "up_rate": 0.5,
+      "control_up_rate": 0.5714285714285714,
+      "down_rate": 0.16666666666666666,
+      "control_down_rate": 0.0,
+      "credited": 6,
+      "control_credited": 7,
+      "deck_sign_rejects": false,
+      "rate_rejects": false
+    }
+  },
+  "checked_utc": "2026-10-09T17:25:04.912419+00:00",
+  "interpretation": "Descriptive interim check only; fixed final analysis November 5 2026 04:07:22 UTC. No early efficacy decision.",
+  "participation": {
+    "impressions": 222,
+    "outside151_interactions": 0,
+    "outside151_votes": 0
+  },
+  "rank_timing_since_start": {
+    "n": 139,
+    "median_seconds": 15.139193507959135,
+    "max_seconds": 104.02698505297303
+  }
+}

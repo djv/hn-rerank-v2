@@ -1,0 +1,19 @@
+The user explicitly requested independent reviews from Codex, Muse, and Claude Code. This is one read-only review, not an implementation task. Work in /home/d/code/hn-rerank. Do not delegate, read other reviewers' answers, modify files, run tests/scripts/experiments, browse, SSH, access any databases/private prediction rows/secrets, or request ranking annotations. Read only these existing aggregate reports (targeted reads, no broad scans):
+1. docs/evaluations/missed-upvotes-20261009/REPORT.md
+2. docs/evaluations/representation-input-20261009/REPORT.md
+3. docs/evaluations/facet-residual-20261009/REPORT.md
+4. docs/evaluations/cc-replay-20261009/REPORT.md
+5. docs/evaluations/targeted-muse-20261009/report.md
+Do NOT read CLAUDE-REVIEW.md, REVIEW-INTEGRATION.md, or the new three-review output directory. If essential, inspect targeted pipeline scoring source only.
+
+Goal: find a systematic cheap Muse advantage predicting actual user UP votes and transfer it into the ML ranker. Bulk work and ranking use opencode-go/muse-spark-1.3-contributor. Claude/Codex review/orchestrate only. Existing ranking annotation caps are spent. All reused labels are development-only. No established ranking improvement, no production changes. Do not repeat the previous Opus/Muse experiment or reinterpret failed frozen gates.
+
+Review the scientific reasoning and select ONE best next action:
+- Cheap within-source UP-v-DOWN / UP-v-rest discrimination on existing predictions, HN vs non-HN per block with predefined age sensitivity controls, before full component audit;
+- Native score-component audit on matched low-ranked HN UP/DOWN;
+- A meaningfully different LLM approach (personalized comparisons, preference descriptions, active learning, targeted residuals, distillation) if actually justified;
+- Stop further spent-label slicing and prepare a future-vote evaluation.
+
+Check exposure/selection bias; top12 synthetic voted-row replay vs live eligible pools; conditioning on UP in tail; within-source AUC vs source base rates and calibration; sparse category coverage; uncertainty/routing; transfer into ML. Equal within-source AUC does not prove source priors appropriate. HN aggregate tail pattern is descriptive, not causal. The 19 historical non-UP picks total all four blocks, not each block, and aren't guaranteed live improvement headroom. Targeted Muse11/12 is correctness against user labels on a production-wrong/Opus-right selected stratum, not merely agreement. Any zero-future-vote statement is historical, not currently verified.
+
+Give a candid independently reasoned review, <=400 words: verdict first; up to3 key issues with file/section evidence; one decision-complete next measurement (inputs/controls, zero-new-annotation work, interpretable outcome/stop rule, how eventual confirmation uses fresh votes). Explicitly distinguish evidence from proposed heuristics. Identify whether source-AUC check is worthwhile or a detour, and why. Do not treat arbitrary gap thresholds as calibrated statistical gates. Report uncertainty and no automatic conditional follow-on experiments. Respond directly with the actual review and stop.

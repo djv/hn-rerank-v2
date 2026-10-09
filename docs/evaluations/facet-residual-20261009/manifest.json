@@ -1,0 +1,12 @@
+{
+ "frozen_at": "2026-10-09T12:27:50.341776+00:00",
+ "seed": 20261009,
+ "feasible": true,
+ "hashes": {
+  "rubric.json": "f7f75628694aedb2a1c123020234710ae3b8fd362d24ba5681d3954e99b118e8",
+  "sample.json": "d8e996f30a64cdf464562870bf87cde7b944b9ebe36378eae2cace93847d7f7b"
+ },
+ "quota": "annotation <=20 batches/requests incl retries; 20 seeded repeats as separate calls",
+ "gates": "arm3-arm1>=+0.02 pooled; arm3>p95 null; arm4-arm2>=+0.01; dev99 delta>=0; stability>=85% (repeats-only, pre-metrics); arm3>=arm0. STOP if arm3-arm1<+0.01 or arm3<=proxy. CI-includes-0 => promising, inconclusive. GO = larger labeling only, no production claim.",
+ "batch_repair": "one same-batch repeat collision swapped pre-annotation (no labels involved); sizes unchanged"
+}

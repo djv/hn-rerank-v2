@@ -1,5 +1,215 @@
 # HN Rerank findings
 
+## Save and complete WIP cleanup — 2026-10-09
+
+User invoked ss, then explicitly included unrelated WIP. Preserved the wide
+TUI 1:2 proportions change, blank extraction guard, reader mockup, and TLDR
+diagnostic helper. Helper callback restoration now uses patch.object rather
+than a type-invalid function assignment; added its --help boot case.
+Host-local kernel.errors.txt is retained and ignored, not deleted/published.
+Mockup contains illustrative data and no production API calls; JavaScript
+syntax checked, no fresh interactive browser or physical terminal test.
+
+Research exports: JSON 23/23 parsed, Python 14/14 AST parsed; fixed five
+unused-code findings, formatted nine non-frozen copies, and resolved typing
+in four exported scripts. No experiment outputs recomputed; original run
+copies remain on VPS. harness_frozen.py unchanged. Archive notes distinguish
+cleaned exports from byte-exact run evidence and qualify initial feasibility
+draft's scope. No raw user profiles/caches/rosters or secrets exported.
+
+Final checks: repository Ruff/ty clean; 20 touched Python files format-clean.
+Isolated VPS git checkout /tmp/hn-save-20261009-sYcAQL, laptop HEAD 79b1632
+plus pending runtime patches: backend 1,218 passed / 1 skipped in 43.63 s;
+TUI 174 passed / 1 skipped in 50.42 s. Backend emitted one sklearn convergence
+warning. Jobs ran sequentially, nice 19, one library thread, 2-CPU/7G scope;
+VPS available RAM stayed above 4.6G, ending load 1.57. No production DB,
+service restart, deployment, or live interleaving change. Research remains
+paused; final live analysis retains its fixed November 5 UTC deadline.
+
+## Live interleaving descriptive check — 2026-10-09 17:25 UTC
+
+User selected Check live ML trial. Existing read-only report on VPS main
+be965fd: 77 votes since T0, 19 credited from 7 decks; excluded 51 Popular
+and 7 Explore votes. Production 4UP/3neutral/0DOWN, joined_all 3/3/0,
+joined_no_metadata 3/2/1. 222 profile-151 impressions and zero other-profile
+votes/interactions since T0. Service active. Rank timing: 139 rows, median
+15.139 s, max 104.027 s. No runtime restart, ranking inference, fit, or
+configuration change; no early efficacy decision. Small counts cannot
+establish superiority or equivalence. Final analysis remains fixed at
+2026-11-05 04:07:22 UTC.
+
+The report's `--alpha` is familywise and divided over two challengers:
+saved run uses .05, giving .025 per test. Initial exploratory invocation
+mistakenly passed .025; its .0125 threshold was corrected in the saved
+report. Counts and p-values were unchanged; no decision relied on it.
+Evidence: `docs/evaluations/live-interleaving-check-20261009.json`.
+
+## Ranking reassessment after scope reset — 2026-10-09
+
+The user stopped the contrastive specification/capture rabbit hole, then
+authorized resuming a small review of existing corrections and regressions.
+Cheap Muse inspected saved VPS pair artifacts and current feature sources.
+Root checked all 23 targeted forward correction/regression choices and
+rationales: 11/12 fixes, 6/11 damage; prior-UP explanations occur in all
+11 fixes and 5/6 damaged choices. The remaining damage cites neutral history.
+Corrected Muse's erroneous assertion that all 11 regressions were wrong,
+its unsupported claim that all cited UP precedents were verified, and its
+overstatement that existing proxies implement identical reasoning.
+
+No concrete new feature justified. Related upvote-similarity and lexical
+features already exist, but feature adequacy is unproved. Style and lexical
+familiarity remain rejected/unsupported. Stop new annotation spending on
+this evidence; return priority to existing live ML interleaving. This does
+not rule out all LLM approaches. No new rankings, fits, infrastructure, or
+production changes. Report: `docs/evaluations/RANKING-REASSESSMENT-20261009.md`.
+
+## Contrastive specification completed — 2026-10-09
+
+The user selected Build specification. Cheap Muse drafted `SPEC.md`; the
+agent corrected unknown-outcome negatives in B fitting, collection-relative
+feedback horizons, ambiguous group construction, missing quote fields and
+byte-offset semantics, and estimated rather than conservative reservations.
+Only explicitly judged NEUTRAL/DOWN outcomes oppose UP in the loss; unknown
+items remain excluded. Fixed 7-day horizons apply per first exposure.
+
+The specification fixes deterministic same-source title-anchor groups,
+separate A/B/C label access, a frozen baseline excluding B/C outcomes,
+shuffled-label and binary-topic controls, signed rule columns, and a clipped
+pairwise correction. Future budget remains proposed: 16 requests and 80k
+combined tokens inclusive of failures/retries. Real provider/tokenizer hard
+cap enforcement and immutable historical text/exposure/score provenance
+must be evidenced before any requests; feasibility has not been checked.
+The future C cohort has 32 outcome-blind exposures, 28-day collection limit,
+and evaluator-held 7-day outcomes. Metrics are conditional on judged pairs,
+not live discovery or whole-pool counterfactual estimates.
+
+No dataset reads, ranking annotations, fits, runtime code, or production
+changes occurred. Next is prerequisite verification without ranking calls.
+Artifact: `docs/evaluations/contrastive-preference-design-20261009/SPEC.md`.
+
+## Contrastive preference design (untested) — 2026-10-09
+
+The user selected a different LLM approach through the native questionnaire.
+Cheap Muse drafted and revised supervised contrastive rules. The agent
+reviewed partition leakage, controls, transfer math, and proposed budget.
+Novelty is exposing opposite training labels during rule induction, then
+applying evidence-grounded rules with abstention rather than blind ranking.
+Approximate topic matching does not establish topic-independent signal.
+
+Separate chronological A/B/C partitions cover rule induction, correction
+fitting, and future testing. A bounded pairwise correction preserves native
+scores for all-unknown items. Shuffled-label and deterministic topic controls
+receive comparable fitting constraints. Proposed pilot cap: 16 requests and
+80k combined tokens, including both model arms and retry reserve. This is
+not an authorized annotation budget. The tiny pilot can falsify a design,
+not establish live upvote discovery. Unvoted items remain unknown.
+
+Only proposal documents were produced; no ranking annotations, dataset reads,
+fits, embeddings, or production changes. Next is a SPEC template without
+selecting private rosters or cutoffs. Proposal and handoff:
+`docs/evaluations/contrastive-preference-design-20261009/`.
+
+## Bounded source diagnostic and three-model protocol review — 2026-10-09
+
+- User chose Run cheap diagnostic, then requested Codex/Muse/Claude Code review
+  of the active approach. Muse implemented/computed existing-data measurements;
+  all three independently reviewed frozen protocol, root checked results/code.
+  Current evidence: docs/evaluations/source-diagnostic-20261009/.
+- Native HN UP/DOWN AUC across blocks2–5: .914/.911/.954/.915 vs non-HN
+  .877/.703/.885/.831; UP/rest likewise stronger. All16weighted within-age
+  summaries retain HN>non-HN across both age bases, support mass .81–.95. No
+  broad HN discrimination deficit or Muse superiority established.
+- HN UP base rates .189/.256/.143/.083 vs non-HN .346/.381/.291/.203. Shared
+  band HN/non-HN/tied higher-UP-rate counts1/8/1,6/4/0,5/3/2,5/4/1; mixed,
+  five of80source/band cells sparse. Corrected Muse's initial misleading claim
+  non-HN was higher in most bands. Same-source AUC does not prove calibration.
+- Review clarifications: within-block endpoint-specific weights/support, common
+  numeric source bands, tie rules, raw class counts, joint DOWN placement. Root
+  completed missing reporting/read-only identity checks and reran unchanged
+  endpoints exactly. Artifact Ruff/format/ty and meaningful invariants passed.
+  No new annotations/fits/embeddings, production changes or full test sweeps.
+- Decision: stop after diagnostic, defer broad component audit under this lead.
+  Reused exposure-selected outcomes remain development-only; no automatic
+  feature trial. Next ranking claim requires a separate frozen design and
+  untouched eligible-pool/exposure validation. Actual protocol reviews in reviews/.
+
+## Independent Codex/Muse/Claude Code reviews — 2026-10-09
+
+- User explicitly requested all3reviews. Parallel bounded read-only CLI calls
+  completed exit0; actual responses and common prompt saved under
+  docs/evaluations/three-review-20261009/. No new ranking annotations or experiments.
+- Consensus: one small within-source UP/DOWN and UP/rest discrimination check
+  first, with base rates and shared score/rank bands. Equal source AUC cannot
+  validate cross-source calibration; lower HN AUC does not prove a semantic cause.
+  Source-relative deciles cannot identify a source offset on their own.
+- Age controls differ (replay-clock fixed bins vs age-at-vote tertiles); define
+  one before computing, do not choose by outcome. Proposed check remains
+  descriptive on reused labels. Stop after report; no automatic feature trial.
+- SYNTHESIS.md records differences and corrections, including synthetic voted-row
+  top12 headroom, exposure bias, sparse support and fresh-cutoff requirements.
+
+## Missed-upvote analysis — 2026-10-09
+
+- User subsequently selected a bounded Claude review. Actual response saved as
+  CLAUDE-REVIEW.md; REVIEW-INTEGRATION.md records adopted recommendation and
+  corrections. Cheaper first step: within-source UP/DOWN and UP/rest AUC on
+  existing rows, with block/source denominators and defined age controls.
+  Equal discrimination would weaken the broad-audit case, not prove source
+  priors correct. Top12 synthetic voted-row replay is not live-feed performance.
+  Review's targeted11/12 is user-label correctness in a selected stratum, and
+  zero-future-vote statement was historical, not currently verified. No new
+  metrics, ranking annotations, fits or production changes during this review.
+
+- Source: user questionnaire selected Analyze missed upvotes. Muse analyzed
+  existing 3,079 held-out rows and cached facets; root independently checked
+  source-tail counts. No new annotations, fits, sweeps or production changes.
+- Baseline finds 29 UP / 18 neutral / 1 DOWN in 48 top slots. Of 683 UPs,
+  635 necessarily sit outside those slots even for an oracle; actual 654 misses
+  leave 19 non-UP picks potentially replaceable in this historical cohort.
+- Rank-based deepest UP quintile: 137 rows, 87 HN (63.5%) versus HN's 311/683
+  share of all UPs (45.5%). Within each block HN tail rates exceed block UP
+  rates: 28/85 vs52/196;43/116 vs63/236;7/71 vs11/151;9/39 vs11/100.
+  Descriptive pattern, not source causality or a Muse advantage. There are also
+  953 HN DOWNs, so a blanket boost is unsupported.
+- 617/683 UPs have non-empty raw self/article text; presence does not imply
+  usable extraction. Cached facets cover only61UPs (8.9%),58outside top12,
+  and131DOWNs. Saturation/selection limits category inference; prior Muse
+  correction probes caused damage as well as fixes. No positive ranking claim.
+- Evidence: docs/evaluations/missed-upvotes-20261009/REPORT.md and aggregates.json.
+  Next measurement: native score components on matched HN UP/DOWN controls,
+  preserving base scores and measuring both recovery and damage. Fresh votes
+  required before confirmation. No extra annotation budget spent on this audit.
+
+## AI ranking research: input audit and reproducible baseline — 2026-10-09
+
+- Source: user native questionnaire selected more upvotes as the priority for
+  future experiments; completed facet trial's ordinal gates remain unchanged.
+- Read-only snapshot audit: 3,947 voted rows; old 3,848 includes 51 stored-vs-full
+  composer mismatches, 509 clean-body-empty rows and 3,237 changed primary inputs.
+  Preserve mismatch vectors; hold lexical/meta/side inputs fixed. Bounded body
+  artifact search found no reusable comparison in the searched directories.
+- Muse implemented artifact-local manifest/baseline harness. Old saved reference
+  failed max-probability tolerance (.4344); original script rerun reproduced the
+  old reference exactly. Root then reran the original script with thread limits
+  set before Python: it matches the new one-thread harness exactly. A fresh
+  harness validation passed at 0.0 probability and score delta over 3,079 rows.
+  Original failed and amended successful reports are preserved; no challenger
+  result existed at amendment time. Do not interpret numerical-environment drift
+  as model gain.
+- Checks: artifact self-checks, Ruff/format/ty; VPS source regression suite
+  1,213 passed, one skipped (65.75 s, niced, one CPU). Source input tables unchanged;
+  no live DB, service, config or shared-cache modifications.
+- Protocol/current evidence: docs/evaluations/representation-input-20261009/PLAN.md
+  and STATUS.md. Completed comparison: AUC .779843 → .778184 (delta −.001659,
+  conditional-fit bootstrap95 [−.007995,+.004818]); 2/4 blocks positive; pooled
+  top-48 upvotes 29 → 29 and downvotes 1 → 1. Three improvement gates failed,
+  both guardrails passed. Stop representation rewriting; no Muse canonicalizer
+  calls on this branch. Encoding 891.6 s; baseline/challenger fits 24.6/28.8 s.
+  Source/story/feedback/side-vector hashes match across copies; task jobs exited.
+  Exact source preserved as harness_frozen.py (988f127a212e9e2d); current harness
+  has post-run baseline-check hardening. REPORT.md contains complete evidence.
+  User next chose missed-upvote analysis using cached data.
+
 ## Reddit after the RSS shutdown; subreddit changes — 2026-10-08
 
 ### Access routes (live probes 2026-10-08 plus subagent primary-source research)
@@ -2922,6 +3132,21 @@ OpenVINO, matched by ONNX name). Evidence:
   fix only makes Gemma 2 fast. One-node repro (onnxruntime rotates, OpenVINO
   returns the input): `gpu-debug-20261007/min_repro.py`. Not reported upstream
   (user 2026-10-07: keep it local).
+# 2026-10-08 Blank article extraction guard
+
+Live journal readback at 23:26 UTC showed the service active and another
+"empty HTML tree: None" at 23:14:18, following a Substack httpx 403 retry.
+Blank/whitespace extraction inputs now return None without invoking the
+extractors; fetch status remains 200, error `empty_extraction`, permanent
+false. Four regressions cover blank/whitespace via HTTP 200 and 403→urllib
+200. Isolated `/tmp/hn-empty-html-wuNfOd` VPS clone (no production DB):
+full suite 1,217 passed, 1 skipped in 28.21 s; Ruff, touched-file format,
+and ty clean. Laptop load 16.33 and available RAM 939 MiB motivated VPS
+verification. Existing TUI edits and untracked diagnostics were preserved.
+Fresh Substack probe: httpx 403, zero chars; urllib 200, 220,255 chars.
+This does not establish why earlier fallback responses were empty.
+Production code and service were not changed during verification.
+
 # 2026-10-07 Laptop TUI public connection incident
 
 At 22:08 ET, the saved TUI server's public Funnel endpoint on port8443

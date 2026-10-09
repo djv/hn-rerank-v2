@@ -1,0 +1,20 @@
+{
+ "n_pairs": 10,
+ "errors": {
+  "n": 5,
+  "muse_corrected": 2,
+  "rate": 0.4
+ },
+ "controls": {
+  "n": 5,
+  "muse_ml_agreement": 1,
+  "rate": 0.2
+ },
+ "stability": {
+  "n": 4,
+  "stable": 4,
+  "rate": 1.0
+ },
+ "go_gate_pass": false,
+ "note": "Selection-biased development (OLD99 inspected); exploratory, not proof."
+}

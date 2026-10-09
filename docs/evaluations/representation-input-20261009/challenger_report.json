@@ -1,0 +1,40 @@
+{
+ "arm": "challenger",
+ "config": {
+  "classifier": "svm",
+  "embedding_model_version": "mxbai-embed-xsmall-v1|mean|norm|4096",
+  "linear_blend_enabled": true,
+  "side_embedding_enabled": true,
+  "svm_c": 4.0,
+  "svm_gamma": 0.03,
+  "svm_kernel": "rbf"
+ },
+ "encoder": {
+  "config.json": "55f755d351fd04b0",
+  "model.onnx": "9ba32b8568b5bf0a",
+  "model_dir": "/home/dev/hn-rewrite/shared/mxbai-embed-xsmall-v1",
+  "tokenizer.json": "da0e79933b9ed517",
+  "vocab.txt": "07eced375cec144d"
+ },
+ "env_before_copy": {
+  "free -m": "total        used        free      shared  buff/cache   available\nMem:            7751        2926         969           4        4162        4824\nSwap:           4095        1100        2995",
+  "uptime": "15:51:29 up 12 days, 22:11,  4 users,  load average: 0.95, 1.00, 0.98"
+ },
+ "eval_now": 1791401987.9873054,
+ "fit_seconds": {
+  "block2": 3.2,
+  "block3": 3.8,
+  "block4": 6.6,
+  "block5": 7.5
+ },
+ "frozen_reference": {},
+ "hashes": {
+  "config.toml": "99a2ad40f7f9973f",
+  "harness.py": "988f127a212e9e2d",
+  "sample.json": "d8e996f30a64cdf4"
+ },
+ "model_version": "mxbai-embed-xsmall-v1|mean|norm|4096|nocomments",
+ "n_rows": 3079,
+ "total_seconds": 28.8,
+ "warm_store_enabled": false
+}

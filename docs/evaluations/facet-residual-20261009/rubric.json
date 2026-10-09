@@ -1,0 +1,86 @@
+{
+ "body_chars": 1500,
+ "body_priority": [
+  "self_text",
+  "article_body",
+  "text_content"
+ ],
+ "fields": {
+  "actionable": [
+   "0",
+   "1",
+   "2",
+   "unclear"
+  ],
+  "artifact": [
+   "paper",
+   "repo_tool",
+   "product_launch",
+   "news_report",
+   "essay_opinion",
+   "personal_narrative",
+   "howto",
+   "question_discussion",
+   "social_post",
+   "data_visual",
+   "media",
+   "other",
+   "unclear"
+  ],
+  "claim": [
+   "new_result",
+   "release",
+   "incident_event",
+   "argument",
+   "explainer",
+   "retrospective",
+   "unclear"
+  ],
+  "conflict_framing": [
+   "0",
+   "1",
+   "2",
+   "unclear"
+  ],
+  "entity_focus": [
+   "company",
+   "person",
+   "government",
+   "oss",
+   "science",
+   "consumer_product",
+   "none",
+   "unclear"
+  ],
+  "technical_depth": [
+   "0",
+   "1",
+   "2",
+   "3",
+   "unclear"
+  ],
+  "voice": [
+   "firsthand",
+   "aggregator_commentary",
+   "unclear"
+  ]
+ },
+ "never_sees": [
+  "comments",
+  "top_comments",
+  "votes",
+  "labels",
+  "profile",
+  "baseline_scores",
+  "block_ids",
+  "story_ids"
+ ],
+ "output": "strict JSON array, one object per opaque item id",
+ "rule": "pick exactly one option per field; use unclear only when the visible title+body genuinely does not decide it; judge ONLY the item text, never votes or popularity.",
+ "sees": [
+  "title",
+  "domain",
+  "source",
+  "body1500"
+ ]
+}

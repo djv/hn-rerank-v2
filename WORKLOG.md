@@ -1,5 +1,135 @@
 # Worklog: hn-rewrite
 
+## 2026-10-09 — ss and complete pending WIP
+
+User explicitly included unrelated WIP. Finalized research archives/handoff,
+wide TUI proportions, blank-fetch extraction guard, read-only TLDR helper and
+boot coverage, standalone illustrative mockup, and local-log ignore. Export
+copies cleaned for lint/types without rerunning experiments; frozen harness
+preserved. Isolated VPS backend 1,218 passed/1 skipped; TUI 174/1 skipped.
+Ruff/ty/format and mockup syntax passed. Research remains paused; production
+and live trial unchanged. No actual provider replay or fresh UI smoke run.
+
+## 2026-10-09 — Research saved locally and paused
+
+User selected Save and pause. Current reassessment, live-check evidence,
+and STATUS handoff persisted locally. No commit/push requested by that
+selection; unrelated code and handoff edits preserved. No further research
+or annotation spending. Existing live ML trial continues unchanged.
+
+## 2026-10-09 — Live ML trial read-only check
+
+User selected live trial check. VPS read-only report and participation
+aggregates saved: 19/77 votes credited, 7 decks, no outside-151 activity;
+too little evidence for a ranking conclusion. Service active, median rank
+time 15.1 s. Trial and fixed final analysis unchanged. Evidence:
+`docs/evaluations/live-interleaving-check-20261009.json`.
+
+## 2026-10-09 — Scope reset and existing-evidence reassessment
+
+User stopped the contrastive infrastructure branch and resumed a small
+fixes/damage review. Cheap Muse reviewed saved pairs; root checked targeted
+23-pair counts/rationales and corrected overclaims. No defensible missing
+feature found; recommend ending annotation spending on this evidence and
+prioritizing existing live ML interleaving. No new rankings or implementation.
+Report: `docs/evaluations/RANKING-REASSESSMENT-20261009.md`.
+
+## 2026-10-09 — Contrastive specification, no pilot
+
+User chose Build specification. Cheap Muse drafted the Markdown template;
+root review fixed unknown-label fitting, per-exposure outcome horizons,
+deterministic grouping, quotation contracts, and token reservations.
+Updated research handoffs with unverified provenance/quota prerequisites.
+No annotations, dataset reads, model fits, or implementation. See
+`docs/evaluations/contrastive-preference-design-20261009/SPEC.md`.
+
+## 2026-10-09 — Different LLM approach, design only
+
+Following the user's questionnaire selection, cheap Muse proposed supervised
+UP/DOWN contrastive rule induction. The agent requested a bounded revision
+covering independent rule/fit/test partitions, signed rule features, fixed
+native-score offset and correction cap, shuffled/topic controls, and a full
+proposed request allocation. Root review corrected inference accounting and
+an unsupported causal explanation of earlier errors. Proposal remains
+untested; no annotation run, fit, dataset read, or runtime change. Next is a
+SPEC template without ranking annotations. See
+`docs/evaluations/contrastive-preference-design-20261009/PROPOSAL.md`.
+
+## 2026-10-09 Bounded source diagnostic completed
+
+User authorized cheap diagnostic and requested all3protocol reviews while it ran.
+Frozen plan then Muse artifact implementation/VPS compute; Codex/Muse/Claude Code
+reviews saved unchanged. Root verified per-block weights/bands and completed
+class denominators/read-only identity checks. Rerun reproduced original AUCs,
+age summaries and DOWN placement exactly. HN discrimination stronger in all four
+blocks/both endpoints/both age bases; no Muse advantage. Corrected misleading
+shared-band claim (directions mixed, sparse cells flagged). Stop after report;
+broad HN component audit deferred. Artifact checks passed; no new annotations,
+fits, embeddings, full suites or production edits. Current handoff and evidence
+in docs/evaluations/source-diagnostic-20261009/STATUS.md and REPORT.md.
+
+## 2026-10-09 Independent three-model research review
+
+At the user's request, asked Codex, cheap Muse and Claude Code independently with
+the same bounded read-only prompt. All3calls completed exit0; saved actual replies
+and checked synthesis in docs/evaluations/three-review-20261009/. All favor one
+small source-discrimination diagnostic before more audits/interventions. Captured
+differences on age controls and historical follow-on scope; no new annotations,
+fits, experiments, tests or live changes. Updated handoff with a single proposed
+measurement, no automatic follow-on.
+
+## 2026-10-09 Bounded Claude ranking research review
+
+The user chose Claude review. A read-only direct claude-p call reviewed aggregate
+reports; actual response saved in missed-upvotes-20261009/CLAUDE-REVIEW.md, with
+source-checked corrections in REVIEW-INTEGRATION.md. Adopted a cheaper first
+measurement: within-source discrimination before the full score-component audit.
+No new ranking annotations, fits, computation of new slice metrics or production
+changes. Updated handoff; failed representation/facet verdicts remain unchanged.
+
+## 2026-10-09 Missed-upvotes audit (cached data only)
+
+The user selected error analysis. Muse produced a typed artifact-only script,
+aggregate counts and report over existing held-out predictions and cached
+annotations; root independently verified per-block HN tail counts. HN is
+overrepresented among deep-ranked UPs in all four blocks, but broad boosting
+is unsupported given 953 HN DOWNs. Cached facets cover only 61/683 UPs; no
+verified Muse advantage. Corrected interpretation of capacity (48slots/683UPs),
+rank-based quintile, raw score confidence and private-example counts. No new
+ranking annotations or fits. An unnecessary local full test run was stopped
+after266passes; earlier VPS runtime suite remains1213passed/1skipped, separate
+evidence. New analysis checks are artifact-specific. Next measurement is score
+components on matched HN UP/DOWN controls; no deployment.
+
+## 2026-10-09 AI ranking input comparison preparation
+
+Resumed the Muse ranking research; the user chose finding more upvotes as the
+future primary objective. A read-only VPS audit established input coverage and
+an artifact-local Muse harness reproduced a frozen one-thread baseline across
+3,079 test rows exactly. A thread-initialization mismatch with older saved scores
+was diagnosed and preserved as an explicit pre-challenger protocol amendment.
+Manifest/self-checks and Ruff/format/ty passed; VPS regression suite passed
+1,213 tests with one skip. Parity20 and the isolated comparison completed:
+UP-versus-rest AUC .779843 → .778184; top-48 upvotes 29 → 29. All three improvement
+gates failed, both guardrails passed. Stop this representation branch. Exact
+experiment source saved as harness_frozen.py; current harness has post-run
+baseline-check hardening. Source input integrity verified and both jobs exited.
+No ranking annotation calls, deployment or live changes. User chose bounded
+missed-upvote analysis using existing scores and cached Muse annotations next.
+Details: docs/evaluations/representation-input-20261009/PLAN.md and STATUS.md.
+
+## 2026-10-08 Skip extraction for blank article responses
+
+The live VPS still logged trafilatura's "empty HTML tree" at 23:14 UTC.
+The extraction entry point now returns None before running extractors for
+blank or whitespace-only input. Fetch results remain retryable
+`empty_extraction` failures. Four regression cases cover both normal 200
+responses and the urllib fallback after a 403. In an isolated VPS clone:
+1,217 passed, 1 skipped; Ruff, touched-file formatting, and ty passed.
+A fresh probe of thelastsoftwareengineer Substack article returned httpx
+403 with no body, then urllib 200 with 220,255 characters; the historical
+empty-response cause is not confirmed. Deployment is pending.
+
 ## 2026-10-08 RSS read timeouts log one warning line
 
 At 15:36 UTC two feeds (tweag.io, trailofbits) logged "Unexpected error

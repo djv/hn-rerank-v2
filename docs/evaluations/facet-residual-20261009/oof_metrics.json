@@ -1,0 +1,32 @@
+{
+ "n_oof": 3079,
+ "n_dev": 99,
+ "drift": {
+  "train_bad_b2": [],
+  "test_bad_b2": [],
+  "train_bad_b3": [],
+  "test_bad_b3": [],
+  "train_bad_b4": [],
+  "test_bad_b4": [],
+  "train_bad_b5": [],
+  "test_bad_b5": []
+ },
+ "fit_seconds": {
+  "block2": 2.7,
+  "block3": 3.4,
+  "block4": 6.1,
+  "block5": 6.3
+ },
+ "total_seconds": 22.4,
+ "config": {
+  "svm_c": 4.0,
+  "svm_kernel": "rbf",
+  "svm_gamma": 0.03,
+  "linear_blend_enabled": true,
+  "side_embedding_enabled": true,
+  "engagement_features_enabled": false,
+  "classifier": "svm",
+  "embedding_model_version": "mxbai-embed-xsmall-v1|mean|norm|4096"
+ },
+ "note": "percentiles rank full-block voted stories (k=2..5) and the 99 dev set; fits see only earlier blocks (k-1..........); cached embeddings only, drift reported never recomputed."
+}
