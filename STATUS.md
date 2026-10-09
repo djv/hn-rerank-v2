@@ -7,12 +7,15 @@ preview, pending Reddit/Gemma items):
 ## Objective
 Current follow-up: make explicit `r` automatically reload a selected summary
 when its live comment check finds growth, without a confirmation prompt.
-One follow-up per observed count; background-only growth keeps its choice.
+One follow-up per observed count. Follow-up correction: background growth
+updates counts silently and never opens a regeneration popup; r remains
+the explicit summary reload action. Correction checks passed: 29 focused
+checks; TUI 203 / 1 skipped; backend 1,264 / 1 skipped; Ruff/ty/format clean.
 Implemented and verified: 29 focused checks; TUI 203 passed / 1 skipped;
 backend 1,264 passed / 1 skipped; Ruff, ty and touched-Python format clean.
-User-authorized local restart completed at 19:05 EDT: PID 1976245 runs the
-updated checkout, with the saved profile/feed/summary loaded and Brave helper
-retained. Physical r/live generation remains unverified. No server restart is needed
+Local reader relaunched at 19:21 EDT under the existing restart authorization:
+PID 1998605 runs the updated checkout. Popular / 1 month view, saved profile,
+feed/summary and Brave helper verified; no modal after section switch. Physical r/live generation remains unverified. No server restart is needed
 for this client-only change; production server and trial remain untouched.
 
 Current maintenance task: implement user-selected background section refresh

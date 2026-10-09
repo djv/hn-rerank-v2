@@ -88,12 +88,12 @@ async def test_stale_ready_feed_after_vote_ack_keeps_target_and_restored(
         assert 1 in shown(app)
 
 
-async def test_connect_resets_stats_state_and_allows_prompt(
+async def test_connect_resets_stats_state_and_keeps_background_quiet(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Profile-scoped regeneration/stats state dies on reconnect: a held
     request of A's is cancelled, old serials/offers/pending/intents clear,
-    its late reply changes nothing, and B's same observation may prompt."""
+    its late reply changes nothing, and B's background check stays quiet."""
     server = RefreshServer()
     server.live = {1: (150, 25)}
     app = Reader(api=server.api(), config_path=tmp_path / "p.json")
@@ -148,11 +148,9 @@ async def test_connect_resets_stats_state_and_allows_prompt(
         )
         await settle(pilot)
 
-        # A new profile's background check still offers its own choice;
-        # the previous profile's explicit-r authorization must not leak.
-        assert isinstance(app.screen, StatsPrompt)
-        await pilot.press("escape")
-        await settle(pilot)
+        # The previous profile's explicit-r authorization must not leak;
+        # a new profile's background check stays silent.
+        assert not isinstance(app.screen, StatsPrompt)
         await pilot.press("r")
         await settle(pilot)
         assert not isinstance(app.screen, StatsPrompt)

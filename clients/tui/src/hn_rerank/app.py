@@ -2106,8 +2106,8 @@ class Reader(App[None]):
     def _maybe_offer_regen(self, story_id: int, live_comments: int) -> bool:
         """Handle growth beyond the known snapshot once per comment count.
 
-        Explicit r reloads automatically; background checks offer a choice.
-        Returns whether either action was started.
+        Explicit r reloads automatically; background checks remain silent.
+        Returns whether an automatic reload was started.
         """
         if (
             self._stats_modal_open
@@ -2125,6 +2125,10 @@ class Reader(App[None]):
         if self._stats_serials.get(story_id) != self.selection_serial:
             # Stale check from before the latest navigation: counts were
             # still applied above, but the prompt number may be outdated.
+            return False
+        if self._stats_auto_reload.get(story_id) != self.selection_serial:
+            # Background checks update counts only. A reader should never
+            # be interrupted by an unsolicited regeneration decision.
             return False
         snapshot = self._summary_snapshots.get(story_id)
         if snapshot is None or live_comments <= snapshot:

@@ -80,8 +80,8 @@ Press `r` to regenerate only the selected summary and background-check its
 real points/comments. Visible counts update at once; when live comments
 still exceed the refreshed summary's snapshot, `r` automatically reloads
 that summary once per observed comment count, without a confirmation.
-Background feed checks still offer a Regenerate/Keep choice for growth
-outside an explicit `r` refresh (Escape keeps). Nothing
+Background feed checks update counts silently; press `r` to refresh the
+summary with the newer discussion. Nothing
 else is cleared, refetched or reordered; hidden stories stay hidden.
 Automatic refreshes keep using the server cache:
 once a minute the reader checks for a newer deck (a regen, a vote from another

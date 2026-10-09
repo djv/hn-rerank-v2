@@ -11816,3 +11816,13 @@ checks: focused 29; TUI 203 passed / 1 skipped; backend 1,264 passed / 1 skipped
 clean. No backend deployment or provider/vote/profile action. Existing local
 TUI preserved; quit/relaunch required, physical live behavior unverified.
 Evidence: FINDINGS "Explicit r reloads new discussion without confirmation".
+
+
+## 2026-10-09 — Background stats no longer interrupt reading
+
+The user reported a new-comments popup without pressing r. Reproduced the
+section-switch path and confirmed the live modal. Background counts now
+update silently; explicit r keeps its automatic selected-summary follow-up.
+The unanswered preference question was resolved with no implicit background
+generation. Regression checks cover section switching, subsequent background
+growth and profile reconnect. Final checks and restart: see FINDINGS.

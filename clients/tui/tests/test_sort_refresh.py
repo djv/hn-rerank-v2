@@ -521,10 +521,13 @@ async def test_r_authorization_ends_before_later_background_growth(
         assert not app._stats_auto_reload
         server.live[1] = (150, 40)
         app.refresh_story_stats(1, app.selection_serial)
-        await wait_for(pilot, lambda: isinstance(app.screen, StatsPrompt))
-        assert server.forced_posts == [1]
-        await pilot.press("escape")
         await settle(pilot)
+        assert not isinstance(app.screen, StatsPrompt)
+        assert server.forced_posts == [1]
+        selected = app.selected()
+        assert selected is not None
+        assert selected.comments == 40
+        assert app._summary_snapshots[1] == 25
 
 
 async def test_stats_stale_and_unsupported_skip_prompt(tmp_path: Path) -> None:
@@ -653,13 +656,15 @@ async def test_section_refresh_triggers_stats_check_without_r(
         server.requests.clear()
         server.arrivals = 0
         await pilot.press("s")  # background refresh, then tail stats check
-        await wait_for(pilot, lambda: isinstance(app.screen, StatsPrompt))
-        assert server.forced() == 0  # prompt only: no implicit paid force
-        await wait_for(pilot, lambda: bool(app.screen.query("#stats-regen")))
-        text = modal_text(app)
-        assert "Story 6" in text and "25" in text
-        await pilot.press("escape")
         await settle(pilot)
+        assert not isinstance(app.screen, StatsPrompt)
+        assert server.forced() == 0
+        selected = app.selected()
+        assert selected is not None
+        assert selected.id == 6
+        assert selected.comments == 25
+        assert app._summary_snapshots[6] == 10
+        assert not app._stats_offered
 
 
 async def test_carry_row_retains_open_story_on_membership_loss(
