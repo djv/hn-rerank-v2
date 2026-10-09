@@ -48,6 +48,7 @@ SCRIPT_MAINS = [
     "fetch_articles_for_source",
     "follow_pointer_threads",
     "hydrate_ch_seed",
+    "inspect_tldr_failures",
     "ledger_report",
     "migrate_db_to_strict",
     "merge_profiles_snapshot",
