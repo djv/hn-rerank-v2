@@ -5,6 +5,15 @@ preview, pending Reddit/Gemma items):
 [before interleaving](docs/status-archive/before-interleaving-20261007.md).
 
 ## Objective
+Current follow-up: make explicit `r` automatically reload a selected summary
+when its live comment check finds growth, without a confirmation prompt.
+One follow-up per observed count; background-only growth keeps its choice.
+Implemented and verified: 29 focused checks; TUI 203 passed / 1 skipped;
+backend 1,264 passed / 1 skipped; Ruff, ty and touched-Python format clean.
+The running local TUI predates this change; quit/relaunch loads it. Physical
+keypress/live generation remains unverified. No server restart is needed
+for this client-only change; production server and trial remain untouched.
+
 Current maintenance task: implement user-selected background section refresh
 on s/h/l, selected-summary-only r with a live stats check, and a story-specific
 regeneration choice when comments exceed a known summary snapshot. Codex plan
@@ -146,8 +155,8 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   (users 214 -> 194; backup `hn_rewrite.db.pre_test_profiles_20261008T144729Z`
   on the VPS, kept). Only profile 151 votes.
 - RSS read timeouts now log one warning line (5c092d0).
-- TUI `o`/`c` open via `~/bin/hn-open` (system-setup): a new Firefox window
-  for every link (user 2026-10-08; Firefox has Bypass Paywalls Clean).
+- TUI `o`/`c` open via `~/bin/hn-open` (system-setup): Brave Origin Beta
+  for articles and comments (user 2026-10-09), user-confirmed working.
 - Wide TUI reading pane now keeps the intended 1:2 list/reader ratio
   without a 100-column cap. Automated region checks pass at widths 100
   and 240; physical terminal rendering remains unverified in this save.

@@ -433,53 +433,26 @@ async def test_repeated_r_coalesces_to_one_forced_post(tmp_path: Path) -> None:
         assert len(server.forced_posts) == 1
 
 
-async def test_stats_growth_prompts_and_decline_dedupes(tmp_path: Path) -> None:
+async def test_r_growth_reloads_without_prompt_and_dedupes(tmp_path: Path) -> None:
     server = RefreshServer()
     server.live = {1: (150, 25)}
     app = Reader(api=server.api(), config_path=tmp_path / "p.json")
     async with app.run_test(size=(120, 35)) as pilot:
         await settle(pilot)
         app.query_one(OptionList).focus()
-        assert "▲ 150" in str(app.query_one("#story-heading", Static).content)
         await pilot.press("r")
-        await wait_for(pilot, lambda: isinstance(app.screen, StatsPrompt))
-        await wait_for(pilot, lambda: bool(app.screen.query("#stats-regen")))
-        text = modal_text(app)
-        assert "Story 1" in text and "10" in text and "25" in text
-        before_posts = len(server.forced_posts)
-        await pilot.press("escape")
+        await wait_for(pilot, lambda: len(server.forced_posts) == 2)
         await settle(pilot)
         assert not isinstance(app.screen, StatsPrompt)
-        assert len(server.forced_posts) == before_posts  # kept: no paid regen
+        assert server.forced_posts == [1, 1]
         assert "Summary 1" in app.query_one(Markdown)._markdown
-        await pilot.press("r")  # same observation must not nag again
-        await settle(pilot)
-        assert not isinstance(app.screen, StatsPrompt)
-
-
-async def test_stats_accept_regenerates_selected_only(tmp_path: Path) -> None:
-    server = RefreshServer()
-    server.live = {1: (150, 25)}
-    app = Reader(api=server.api(), config_path=tmp_path / "p.json")
-    async with app.run_test(size=(120, 35)) as pilot:
-        await settle(pilot)
-        app.query_one(OptionList).focus()
         await pilot.press("r")
-        await wait_for(pilot, lambda: isinstance(app.screen, StatsPrompt))
-        server.text_version = 2
-        server.snapshot = 25
-        posts_before = len(server.forced_posts)
-        await wait_for(pilot, lambda: bool(app.screen.query("#stats-regen")))
-        await pilot.click("#stats-regen")
         await settle(pilot)
         assert not isinstance(app.screen, StatsPrompt)
-        assert len(server.forced_posts) == posts_before + 1
-        assert server.forced_posts[-1] == 1
-        assert "Summary 1 v2" in app.query_one(Markdown)._markdown
-        assert app._summary_snapshots.get(1) == 25
+        assert server.forced_posts == [1, 1, 1]  # no repeated growth follow-up
 
 
-async def test_stats_regrowth_prompts_again(tmp_path: Path) -> None:
+async def test_r_regrowth_reloads_again_without_prompt(tmp_path: Path) -> None:
     server = RefreshServer()
     server.snapshot = 25
     server.live = {1: (150, 25)}
@@ -489,12 +462,69 @@ async def test_stats_regrowth_prompts_again(tmp_path: Path) -> None:
         app.query_one(OptionList).focus()
         await pilot.press("r")
         await settle(pilot)
-        assert not isinstance(app.screen, StatsPrompt)  # no growth over snapshot
+        assert server.forced_posts == [1]
         server.live = {1: (160, 40)}
         await pilot.press("r")
+        await wait_for(pilot, lambda: len(server.forced_posts) == 3)
+        await settle(pilot)
+        assert not isinstance(app.screen, StatsPrompt)
+        assert server.forced_posts == [1, 1, 1]
+        assert app._stats_offered[1] == 40
+
+
+async def test_r_late_stats_reload_fresh_text_without_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = RefreshServer()
+    server.live = {1: (150, 25)}
+    api = server.api()
+    gate = asyncio.Event()
+    original = api.story_stats
+
+    async def late_stats(story_id: int) -> Any:
+        await gate.wait()
+        return await original(story_id)
+
+    monkeypatch.setattr(api, "story_stats", late_stats)
+    app = Reader(api=api, config_path=tmp_path / "p.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        app.query_one(OptionList).focus()
+        server.arrivals = 0
+        await pilot.press("r")
+        await wait_for(pilot, lambda: len(server.forced_posts) == 1)
+        await settle(pilot)
+        server.text_version = 2
+        server.snapshot = 25
+        gate.set()
+        await wait_for(pilot, lambda: len(server.forced_posts) == 2)
+        await settle(pilot)
+        assert not isinstance(app.screen, StatsPrompt)
+        assert "Summary 1 v2" in app.query_one(Markdown)._markdown
+        assert app._summary_snapshots[1] == 25
+        assert server.forced_posts == [1, 1]
+        assert server.arrivals == 0
+
+
+async def test_r_authorization_ends_before_later_background_growth(
+    tmp_path: Path,
+) -> None:
+    server = RefreshServer()
+    server.snapshot = 25
+    server.live = {1: (150, 25)}
+    app = Reader(api=server.api(), config_path=tmp_path / "p.json")
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        app.query_one(OptionList).focus()
+        await pilot.press("r")
+        await settle(pilot)
+        assert not app._stats_auto_reload
+        server.live[1] = (150, 40)
+        app.refresh_story_stats(1, app.selection_serial)
         await wait_for(pilot, lambda: isinstance(app.screen, StatsPrompt))
-        await wait_for(pilot, lambda: bool(app.screen.query("#stats-regen")))
-        assert "40" in modal_text(app)
+        assert server.forced_posts == [1]
+        await pilot.press("escape")
+        await settle(pilot)
 
 
 async def test_stats_stale_and_unsupported_skip_prompt(tmp_path: Path) -> None:
@@ -562,9 +592,10 @@ async def test_stats_during_inflight_r_defers_to_returned_snapshot(
         server.snapshot = 10
         server.summary_gate.set()
         server.hold_summary = False
-        await wait_for(pilot, lambda: isinstance(app.screen, StatsPrompt))
-        await pilot.press("escape")
+        await wait_for(pilot, lambda: len(server.forced_posts) == 2)
         await settle(pilot)
+        assert not isinstance(app.screen, StatsPrompt)
+        assert server.forced_posts == [1, 1]
 
 
 async def test_stats_returned_snapshot_covers_pending_growth(

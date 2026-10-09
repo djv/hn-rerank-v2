@@ -16,8 +16,8 @@ y copies the comments link (or the article link if there is none); a opens
 Claude Code in a tmux pane split beside the reader (in your home directory) with the article and
 comments links and a "dig deeper" prompt (`HN_RERANK_AGENT` overrides the
 `claude` command; outside tmux the prompt is copied instead); r regenerates
-the selected summary and checks its live points/comments, offering a
-one-time regeneration when the discussion outgrew the summary; ? shows help; q quits.
+the selected summary and checks its live points/comments, automatically
+reloading if the discussion outgrew it; ? shows help; q quits.
 Enter hides the article list and zooms the TLDR pane; Enter or Escape returns
 to the list. Escape also closes help. Use the sort and window selectors (or h/l and d) to change
 filters. Below 100 columns the headline list stacks above the summary.
@@ -78,9 +78,10 @@ at 100 columns for comfortable reading. Enter or Escape restores the article
 list. The footer shows the zoom and return keys for the current mode.
 Press `r` to regenerate only the selected summary and background-check its
 real points/comments. Visible counts update at once; when live comments
-exceed the snapshot the current summary covered, the reader offers a
-one-time Regenerate/Keep choice for that story (Escape keeps, declines
-never nag for the same count, renewed growth may offer again). Nothing
+still exceed the refreshed summary's snapshot, `r` automatically reloads
+that summary once per observed comment count, without a confirmation.
+Background feed checks still offer a Regenerate/Keep choice for growth
+outside an explicit `r` refresh (Escape keeps). Nothing
 else is cleared, refetched or reordered; hidden stories stay hidden.
 Automatic refreshes keep using the server cache:
 once a minute the reader checks for a newer deck (a regen, a vote from another

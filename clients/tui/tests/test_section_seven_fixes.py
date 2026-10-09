@@ -18,15 +18,15 @@ from hn_rerank.api import API, Profile
 from hn_rerank.app import Reader, StatsPrompt
 
 from ._settle import settle
-from .test_sort_refresh import RefreshServer, modal_text, shown, wait_for
+from .test_sort_refresh import RefreshServer, shown, wait_for
 
 
-async def test_second_r_while_forced_running_prompts_on_stale_snapshot(
+async def test_second_r_while_forced_running_autoreloads_stale_snapshot(
     tmp_path: Path,
 ) -> None:
     """A repeated r joins the already-started forced task (one paid request),
     consumes its declared intent, and the still-behind returned snapshot
-    prompts instead of deferring to the joined intent forever."""
+    automatically reloads once without a prompt or repeated requests."""
     server = RefreshServer()
     server.live = {1: (150, 25)}
     app = Reader(api=server.api(), config_path=tmp_path / "p.json")
@@ -46,14 +46,10 @@ async def test_second_r_while_forced_running_prompts_on_stale_snapshot(
         server.snapshot = 10  # regeneration lands still behind live 25
         server.summary_gate.set()
         server.hold_summary = False
-        await wait_for(pilot, lambda: isinstance(app.screen, StatsPrompt))
-        assert len(server.forced_posts) == 1  # one paid request, not two
-        await wait_for(pilot, lambda: bool(app.screen.query("#stats-regen")))
-        text = modal_text(app)
-        assert "Discussion had 10 comments when summarized" in text
-        assert "25 now" in text
-        await pilot.press("escape")
+        await wait_for(pilot, lambda: len(server.forced_posts) == 2)
         await settle(pilot)
+        assert not isinstance(app.screen, StatsPrompt)
+        assert server.forced_posts == [1, 1]
 
 
 async def test_stale_ready_feed_after_vote_ack_keeps_target_and_restored(
@@ -105,9 +101,8 @@ async def test_connect_resets_stats_state_and_allows_prompt(
         await settle(pilot)
         app.query_one(OptionList).focus()
         await pilot.press("r")
-        await wait_for(pilot, lambda: isinstance(app.screen, StatsPrompt))
-        await pilot.press("escape")
         await settle(pilot)
+        assert not isinstance(app.screen, StatsPrompt)
         assert app._stats_offered.get(1) == 25
 
         stats_gate = asyncio.Event()
@@ -138,6 +133,7 @@ async def test_connect_resets_stats_state_and_allows_prompt(
         assert all(t is not old_task for t in app._stats_requests.values())
         assert app._stats_offered == {}
         assert app._stats_pending_live == {}
+        assert app._stats_auto_reload == {}
         assert app._stats_serials.get(1) != old_serial
         assert app._forced_intent == {}
         stats_gate.set()
@@ -152,10 +148,14 @@ async def test_connect_resets_stats_state_and_allows_prompt(
         )
         await settle(pilot)
 
-        await pilot.press("r")
-        await wait_for(pilot, lambda: isinstance(app.screen, StatsPrompt))
+        # A new profile's background check still offers its own choice;
+        # the previous profile's explicit-r authorization must not leak.
+        assert isinstance(app.screen, StatsPrompt)
         await pilot.press("escape")
         await settle(pilot)
+        await pilot.press("r")
+        await settle(pilot)
+        assert not isinstance(app.screen, StatsPrompt)
 
 
 async def test_hidden_story_hint_names_reconnect_recovery(tmp_path: Path) -> None:

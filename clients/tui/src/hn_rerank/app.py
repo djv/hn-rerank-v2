@@ -861,6 +861,8 @@ class Reader(App[None]):
         self._stats_offered: dict[int, int] = {}
         self._stats_pending_live: dict[int, int] = {}
         self._stats_serials: dict[int, int] = {}
+        # Explicit r authorizes a growth follow-up for this selection only.
+        self._stats_auto_reload: dict[int, int] = {}
         self._stats_modal_open = False
         self._stats_modal_story: int | None = None
         self._stats_modal_api: API | None = None
@@ -1087,6 +1089,7 @@ class Reader(App[None]):
         self._stats_offered.clear()
         self._stats_pending_live.clear()
         self._stats_serials.clear()
+        self._stats_auto_reload.clear()
         self._forced_tasks.clear()
         self._forced_intent.clear()
         self._stats_modal_open = False
@@ -1391,10 +1394,14 @@ class Reader(App[None]):
                     # against the snapshot this result actually returned.
                     # Unrelated loads drop the stale force-era value instead.
                     self._maybe_offer_regen(story_id, pending_live)
+                    if self._stats_auto_reload.get(story_id) == serial:
+                        self._stats_auto_reload.pop(story_id, None)
                 self.schedule_prefetch()
         except InvalidProfile as exc:
             self.setup(str(exc))
         except APIError as exc:
+            if self._stats_auto_reload.get(story_id) == serial:
+                self._stats_auto_reload.pop(story_id, None)
             if serial == self.selection_serial and self.query("#summary"):
                 if previous is not None:
                     self.query_one("#summary", Markdown).update(previous)
@@ -1984,8 +1991,9 @@ class Reader(App[None]):
         # Declare the forced intent synchronously: a stats result landing in
         # the load's debounce window must defer to it, not prompt over it.
         self._forced_intent[story.id] = self.selection_serial
+        self._stats_auto_reload[story.id] = self.selection_serial
         self.load_summary(story.id, self.selection_serial, force_refresh=True)
-        self.refresh_story_stats(story.id, self.selection_serial)
+        self.refresh_story_stats(story.id, self.selection_serial, explicit_refresh=True)
 
     def reload(self) -> None:
         """Reload the feed after the poller found a newer deck.
@@ -2002,7 +2010,9 @@ class Reader(App[None]):
         task = self._stats_requests.get(story_id)
         return task is not None and not task.done()
 
-    def refresh_story_stats(self, story_id: int, serial: int) -> None:
+    def refresh_story_stats(
+        self, story_id: int, serial: int, *, explicit_refresh: bool = False
+    ) -> None:
         """Background live points/comments check for one story (never generates).
 
         Coalesced per story: a repeat while one is in flight joins it. No
@@ -2011,6 +2021,10 @@ class Reader(App[None]):
         if self.api is None or self.feed is None or self.setting_up or self.closing:
             return
         if self._stats_check_running(story_id):
+            if explicit_refresh:
+                # r joins the already-running probe for this story, but its
+                # result now belongs to the user's current refresh intent.
+                self._stats_serials[story_id] = serial
             return
         self._stats_serials[story_id] = serial
         task = asyncio.create_task(self._fetch_story_stats(story_id, serial))
@@ -2019,6 +2033,12 @@ class Reader(App[None]):
         def done(task: asyncio.Task[None]) -> None:
             if self._stats_requests.get(story_id) is task:
                 del self._stats_requests[story_id]
+                if (
+                    story_id not in self._stats_pending_live
+                    and self._stats_auto_reload.get(story_id)
+                    == self._stats_serials.get(story_id)
+                ):
+                    self._stats_auto_reload.pop(story_id, None)
             if not task.cancelled():
                 task.exception()  # Callers handle it; none may be left.
 
@@ -2084,8 +2104,11 @@ class Reader(App[None]):
         return task is not None and not task.done() and story_id in self._forced_tasks
 
     def _maybe_offer_regen(self, story_id: int, live_comments: int) -> bool:
-        """Offer a one-time regeneration when live discussion outgrew the
-        known summary snapshot. Returns whether the prompt was shown."""
+        """Handle growth beyond the known snapshot once per comment count.
+
+        Explicit r reloads automatically; background checks offer a choice.
+        Returns whether either action was started.
+        """
         if (
             self._stats_modal_open
             or self.setting_up
@@ -2124,6 +2147,14 @@ class Reader(App[None]):
                 return False
             self._forced_intent.pop(story_id, None)  # obsolete declaration
         self._stats_offered[story_id] = live_comments
+        if self._stats_auto_reload.get(story_id) == self.selection_serial:
+            self._stats_auto_reload.pop(story_id, None)
+            # r already authorizes refreshing this discussion. One follow-up
+            # per observed count; no fresh stats probe or retry loop. Preserve
+            # the current selection serial so a delayed stats reply stays valid.
+            self._forced_intent[story_id] = self.selection_serial
+            self.load_summary(story_id, self.selection_serial, force_refresh=True)
+            return True
         self._stats_modal_open = True
         self._stats_modal_story = story_id
         self._stats_modal_api = self.api

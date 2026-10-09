@@ -3309,3 +3309,12 @@ passed without summary generation or profile/vote writes. Local user TUI process
 started after final app source edit; controls not physically exercised. Details:
 section-refresh-20261009/DEPLOYMENT.md and DEPLOY-SMOKE.json. Earlier pending-save
 and no-deployment statements above describe the pre-authorization stage.
+
+
+## Explicit r reloads new discussion without confirmation — 2026-10-09
+
+- User request: pressing r should automatically reload new comments instead of asking for regeneration. Explicit r now authorizes one selected-summary follow-up per observed live comment count. Other stories, feed order and hidden rows remain untouched; no additional stats probe or polling loop. Background-only growth retains its existing choice.
+- Refresh authorization follows the current selection serial, resets on profile change, and ends once the stats comparison resolves. A joined in-flight stats check adopts the current explicit-r serial. Failure retains the previous summary.
+- Reproduced old behavior with the delayed-stats regression against unmodified HEAD in isolated VPS checkout `/tmp/hn-r-auto-20261009`: expected automatic second POST did not happen. Initial full TUI run exposed an already-running background probe with an obsolete serial; corrected and added regressions for delayed fresh text, repeated-r coalescing, count deduplication, regrowth, reconnect reset, and subsequent background checks.
+- Focused final-source tests: 29 passed. Backend suite: 1,264 passed / 1 skipped (one existing sklearn convergence warning). Repository Ruff/ty and all touched-Python format checks clean. Final TUI suite: 203 passed / 1 skipped. SHA-256 hashes of the app and both changed test files match the isolated VPS sources. No production server, DB, profile, provider or vote mutation.
+- Local TUI PID 1941821 started before this source change and was preserved. Quit/relaunch is required to load the change; physical keypress/live generation remains unverified.

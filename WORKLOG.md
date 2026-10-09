@@ -11800,3 +11800,19 @@ updated checkout; physical controls remain unverified. No smoke provider
 calls/votes/new profiles; uncached forced live generation not exercised.
 Evidence: docs/evaluations/section-refresh-20261009/DEPLOYMENT.md and
 DEPLOY-SMOKE.json. This supersedes earlier uncommitted/undeployed task status.
+
+
+## 2026-10-09 — Explicit r automatically reloads discussion growth
+
+The user requested automatic reload instead of a new-comments confirmation
+after r. Explicit refresh now follows up once per observed comment count,
+including a joined or delayed stats probe, without opening the modal. Scope
+ends with the current stats comparison; background-only growth still offers
+a choice, and profile/navigation guards and request coalescing remain intact.
+
+Reproduced the old behavior in an isolated VPS checkout. Final exact-source
+checks: focused 29; TUI 203 passed / 1 skipped; backend 1,264 passed / 1 skipped
+(existing convergence warning); Ruff/ty/touched-Python format and whitespace
+clean. No backend deployment or provider/vote/profile action. Existing local
+TUI preserved; quit/relaunch required, physical live behavior unverified.
+Evidence: FINDINGS "Explicit r reloads new discussion without confirmation".
