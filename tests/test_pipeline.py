@@ -7705,11 +7705,16 @@ async def test_probe_live_counts_parses_defensively(monkeypatch) -> None:
                 raise self._body
             return self._body
 
+    def item(sid: int, **fields: object) -> FakeResponse:
+        body: dict[str, object] = {"id": sid, "type": "story"}
+        body.update(fields)
+        return FakeResponse(200, body)
+
     payloads = {
-        1: FakeResponse(200, {"descendants": 120}),  # good
-        2: FakeResponse(200, {}),  # missing -> 0, not upward
+        1: item(1, score=10, descendants=120),  # good, upward
+        2: item(2, score=10),  # missing descendants -> 0, not upward
         3: FakeResponse(500, {}),  # status
-        4: FakeResponse(200, {"descendants": 50}),  # backwards
+        4: item(4, score=10, descendants=50),  # backwards
         5: FakeResponse(200, ValueError("nope")),  # unparseable
     }
 
@@ -7731,6 +7736,74 @@ async def test_probe_live_counts_parses_defensively(monkeypatch) -> None:
 
     monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
     assert await _probe_live_counts(stories, 10.0) == {1: 120}
+
+
+async def test_probe_live_items_rejects_malformed_bodies(monkeypatch) -> None:
+    """Strict Firebase validation: explicit null counts, removed items,
+    identity/type mismatches and non-integer counts are unavailable, never
+    live data. Unsupported targets (non-HN, non-positive ids) are never
+    even requested."""
+    import httpx
+    from pipeline import _probe_live_items
+
+    now = time.time()
+    good = _probe_story(11, now=now, count=80)
+    cases = {
+        12: {"id": 12, "type": "story", "score": 1, "descendants": None},
+        13: {"id": 13, "type": "story", "score": 1, "descendants": True},
+        14: {"id": 14, "type": "story", "score": "9", "descendants": 90},
+        15: {"id": 15, "type": "story", "score": 1, "descendants": -3},
+        16: {"id": 99, "type": "story", "score": 1, "descendants": 90},
+        17: {"id": 17, "type": "comment", "score": 1, "descendants": 90},
+        18: {"id": 18, "type": "story", "score": 1, "descendants": 90, "deleted": True},
+        19: {"id": 19, "type": "story", "score": 1, "descendants": 90, "dead": True},
+        20: {"id": 20, "type": "story", "score": 1, "descendants": 90},
+    }
+    stories = [good]
+    stories += [_probe_story(sid, now=now, count=80) for sid in cases]
+    stories.append(_probe_story(21, now=now, count=80, source="rss_x"))
+    stories.append(_probe_story(-4, now=now, count=80))
+
+    class FakeResponse:
+        def __init__(self, body: object):
+            self.status_code = 200
+            self._body = body
+
+        def json(self) -> object:
+            return self._body
+
+    requested: list[int] = []
+
+    class FakeClient:
+        def __init__(self, *, timeout: float):
+            pass
+
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        async def get(self, url: str) -> FakeResponse:
+            sid = int(url.split("/item/")[1].split(".json")[0])
+            requested.append(sid)
+            if sid == 11:
+                return FakeResponse(
+                    {"id": 11, "type": "story", "score": 5, "descendants": 95}
+                )
+            if sid == 20:
+                return FakeResponse(
+                    {"id": 20, "type": "job", "score": 5, "descendants": 95}
+                )
+            return FakeResponse(cases[sid])
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    items = await _probe_live_items(stories, 10.0)
+    assert set(items) == {11, 20}
+    assert items[11].descendants == 95 and items[11].score == 5
+    assert items[20].descendants == 95
+    # Unsupported targets never reach Firebase.
+    assert 21 not in requested and -4 not in requested
 
 
 async def test_refresh_grown_threads_hot_bypass_ignores_memory(monkeypatch) -> None:
@@ -8134,17 +8207,29 @@ async def test_fetch_candidates_survives_ainews_failure(
 async def test_probe_live_items_reads_points_and_descendants(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The hot refresh needs live points as well as descendants; a deleted
-    item (null body) reads as no points and no comments, bad bodies skip."""
+    """Strict Firebase validation: matching id/type with integer counts read
+    live; null, empty, mismatched, mistyped and non-integer bodies are
+    omitted, never fabricated as live zero. A story item may omit
+    descendants at zero; a missing score stays unknown (None)."""
     import httpx
     from pipeline import LiveCounts, _probe_live_items
 
     now = time.time()
-    stories = [_probe_story(i, now=now) for i in (1, 2, 3)]
+    stories = [_probe_story(i, now=now) for i in range(1, 14)]
     bodies: dict[int, object] = {
-        1: {"score": 444, "descendants": 218},
-        2: None,
-        3: {"score": "many", "descendants": 5},
+        1: {"id": True, "type": "story", "score": 5, "descendants": 5},
+        2: {"id": 2, "type": "story", "score": 444, "descendants": 218},
+        3: None,
+        4: {},
+        5: {"id": 999, "type": "story", "score": 1, "descendants": 1},
+        6: {"id": 6, "type": "comment", "score": 1, "descendants": 1},
+        7: {"id": 7, "type": "story", "score": "many", "descendants": 5},
+        8: {"id": 8, "type": "story", "score": 10, "descendants": 2.5},
+        9: {"id": 9, "type": "story", "score": -3, "descendants": 5},
+        10: {"id": 10, "type": "story", "score": 10, "descendants": True},
+        11: {"id": 11, "type": "story", "score": 10},
+        12: {"id": 12, "type": "story", "descendants": 7},
+        13: {"id": 13, "type": "job", "score": 3},
     }
 
     class FakeResponse:
@@ -8171,8 +8256,10 @@ async def test_probe_live_items_reads_points_and_descendants(
 
     monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
     assert await _probe_live_items(stories, 5.0) == {
-        1: LiveCounts(score=444, descendants=218),
-        2: LiveCounts(score=None, descendants=0),
+        2: LiveCounts(score=444, descendants=218),
+        11: LiveCounts(score=10, descendants=0),
+        12: LiveCounts(score=None, descendants=7),
+        13: LiveCounts(score=3, descendants=0),
     }
 
 

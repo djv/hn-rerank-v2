@@ -2442,7 +2442,7 @@ def test_flask_test_client_tldr_forces_refresh_for_active_thread(
 
     calls: list[dict[str, Any]] = []
 
-    async def mock_fetch_story(client_, sid, db_, *, force=False):
+    async def mock_fetch_story(client_, sid, db_, *, force=False, strict=False):
         calls.append({"sid": sid, "force": force})
         return None
 
@@ -2498,7 +2498,7 @@ def test_flask_test_client_tldr_forces_refresh_for_active_thread_even_when_cache
 
     calls: list[dict[str, Any]] = []
 
-    async def mock_fetch_story(client_, sid, db_, *, force=False):
+    async def mock_fetch_story(client_, sid, db_, *, force=False, strict=False):
         calls.append({"sid": sid, "force": force})
         return None
 
@@ -2560,7 +2560,7 @@ def test_flask_test_client_tldr_skips_refresh_for_cached_quiet_recent_thread(
 
     calls: list[dict[str, Any]] = []
 
-    async def mock_fetch_story(client_, sid, db_, *, force=False):
+    async def mock_fetch_story(client_, sid, db_, *, force=False, strict=False):
         calls.append({"sid": sid, "force": force})
         return None
 
@@ -2634,7 +2634,7 @@ def test_flask_test_client_tldr_tap_probe_hydrates_confirmed_growth(
 
     calls: list[dict[str, Any]] = []
 
-    async def mock_fetch_story(client_, sid, db_, *, force=False):
+    async def mock_fetch_story(client_, sid, db_, *, force=False, strict=False):
         calls.append({"sid": sid, "force": force})
         current = db_.get_story(sid)
         assert current is not None
@@ -2704,7 +2704,7 @@ def test_flask_test_client_tldr_heals_count_past_lagging_hydrate(
 
     monkeypatch.setattr("pipeline._probe_live_counts", mock_probe_live_counts)
 
-    async def mock_fetch_story(client_, sid, db_, *, force=False):
+    async def mock_fetch_story(client_, sid, db_, *, force=False, strict=False):
         current = db_.get_story(sid)
         assert current is not None
         # Algolia view of the world: only 40 of the 60 live comments.
@@ -2785,7 +2785,7 @@ def test_flask_test_client_tldr_tap_probe_failure_serves_cached(
 
     calls: list[dict[str, Any]] = []
 
-    async def mock_fetch_story(client_, sid, db_, *, force=False):
+    async def mock_fetch_story(client_, sid, db_, *, force=False, strict=False):
         calls.append({"sid": sid, "force": force})
         return None
 
@@ -2847,7 +2847,7 @@ def test_flask_test_client_tldr_tap_probe_skipped_for_old_thread(
 
     calls: list[dict[str, Any]] = []
 
-    async def mock_fetch_story(client_, sid, db_, *, force=False):
+    async def mock_fetch_story(client_, sid, db_, *, force=False, strict=False):
         calls.append({"sid": sid, "force": force})
         return None
 
@@ -2903,9 +2903,11 @@ def test_flask_test_client_tldr_force_refresh_regenerates(
 
     calls: list[dict[str, Any]] = []
 
-    async def mock_fetch_story(client_, sid, db_, *, force=False):
-        calls.append({"sid": sid, "force": force})
-        return None  # no new comments; post-enrich key is unchanged
+    async def mock_fetch_story(client_, sid, db_, *, force=False, strict=False):
+        calls.append({"sid": sid, "force": force, "strict": strict})
+        # Verified fetch with unchanged content: the post-enrich key matches,
+        # but force skips that hit and regenerates anyway.
+        return db_.get_story(sid)
 
     monkeypatch.setattr("pipeline.fetch_story", mock_fetch_story)
 
@@ -2926,7 +2928,7 @@ def test_flask_test_client_tldr_force_refresh_regenerates(
     )
 
     assert resp.status_code == 200
-    assert calls == [{"sid": quiet_story.id, "force": True}]
+    assert calls == [{"sid": quiet_story.id, "force": True, "strict": True}]
     assert llm_calls == 1  # post-enrich hit skipped despite unchanged key
     body = resp.get_json()
     assert body["tldr"] == "Fresh forced TLDR"
@@ -3061,7 +3063,7 @@ def test_flask_test_client_tldr_skips_refresh_for_quiet_recent_thread(
 
     calls: list[dict[str, Any]] = []
 
-    async def mock_fetch_story(client_, sid, db_, *, force=False):
+    async def mock_fetch_story(client_, sid, db_, *, force=False, strict=False):
         calls.append({"sid": sid, "force": force})
         return None
 
@@ -3110,7 +3112,7 @@ def test_flask_test_client_tldr_skips_refresh_for_old_active_thread(
 
     calls: list[dict[str, Any]] = []
 
-    async def mock_fetch_story(client_, sid, db_, *, force=False):
+    async def mock_fetch_story(client_, sid, db_, *, force=False, strict=False):
         calls.append({"sid": sid, "force": force})
         return None
 
@@ -3869,7 +3871,7 @@ def test_tldr_detail_dynamic_fetch(test_env, monkeypatch):
     )
 
     # Mock fetch_story and _fetch_article_body
-    async def mock_fetch_story(client, sid, database, *, force=False):
+    async def mock_fetch_story(client, sid, database, *, force=False, strict=False):
         story = database.get_story(sid)
         from dataclasses import replace
 
@@ -3936,7 +3938,7 @@ def test_tldr_detail_hydrates_archive_seed_comments_on_demand(
         )
     )
 
-    async def mock_fetch_story(client, sid, database, *, force=False):
+    async def mock_fetch_story(client, sid, database, *, force=False, strict=False):
         from dataclasses import replace
 
         updated = replace(database.get_story(sid), top_comments="Fetched comments")
@@ -6959,3 +6961,400 @@ def test_tldr_cache_misses_when_a_busy_thread_outgrew_its_summary(
     db.upsert_tldr_cache(4992, key, "Old thread summary")
     assert db.update_story_counts(4992, 450, 900)
     assert client.get("/api/tldr-cache/4992").status_code == 200
+
+
+def _stats_test_story(
+    story_id: int, source: str = "hn", score: int = 100, comments: int = 10
+) -> Story:
+    return Story(
+        story_id,
+        f"Stats story {story_id}",
+        None,
+        score,
+        1_700_000_000,
+        f"Stats story {story_id} body.",
+        source=source,
+        comment_count=comments,
+        comment_count_at_fetch=comments,
+        top_comments="Existing comments.",
+    )
+
+
+def _authed_client(handler: Any, user: User) -> Any:
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+    return client
+
+
+def test_story_stats_requires_session_and_validates_input(test_env: Any) -> None:
+    _, db, _, handler, user = test_env
+    db.upsert_story(_stats_test_story(9101))
+    client = create_app(handler).test_client()
+    assert client.get("/api/story-stats?story_id=9101").status_code == 401
+    authed = _authed_client(handler, user)
+    assert authed.get("/api/story-stats?story_id=nope").status_code == 400
+    assert authed.get("/api/story-stats?story_id=999999").status_code == 404
+
+
+def test_story_stats_live_reports_validated_counts_and_writes_nothing(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import server
+    from pipeline import LiveCounts
+
+    _, db, _, handler, user = test_env
+    db.upsert_story(_stats_test_story(9102))
+    probed: list[int] = []
+
+    async def fake_probe(stories: Any, timeout_s: float) -> dict[int, LiveCounts]:
+        assert timeout_s > 0
+        probed.extend(s.id for s in stories)
+        return {s.id: LiveCounts(score=150, descendants=42) for s in stories}
+
+    monkeypatch.setattr("pipeline._probe_live_items", fake_probe)
+
+    async def no_llm(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("stats must never generate")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", no_llm)
+    body = (
+        _authed_client(handler, user).get("/api/story-stats?story_id=9102").get_json()
+    )
+    assert body == {
+        "ok": True,
+        "story_id": 9102,
+        "points": 150,
+        "points_live": True,
+        "comments": 42,
+        "comments_live": True,
+        "reason": "live_check",
+    }
+    assert probed == [9102]
+    reread = db.get_story(9102)
+    assert reread is not None
+    assert (reread.score, reread.comment_count, reread.comment_count_at_fetch) == (
+        100,
+        10,
+        10,
+    )
+    assert db.get_any_tldr_for_story(9102) is None
+
+
+def test_story_stats_probe_failure_reports_stored_silently(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import server
+    from pipeline import LiveCounts
+
+    _, db, _, handler, user = test_env
+    db.upsert_story(_stats_test_story(9103))
+
+    async def failing_probe(stories: Any, timeout_s: float) -> dict[int, LiveCounts]:
+        raise ConnectionError("firebase unreachable")
+
+    monkeypatch.setattr("pipeline._probe_live_items", failing_probe)
+
+    async def no_llm(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("stats must never generate")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", no_llm)
+    body = (
+        _authed_client(handler, user).get("/api/story-stats?story_id=9103").get_json()
+    )
+    assert body == {
+        "ok": True,
+        "story_id": 9103,
+        "points": 100,
+        "points_live": False,
+        "comments": 10,
+        "comments_live": False,
+        "reason": "probe_failed",
+    }
+    reread = db.get_story(9103)
+    assert reread is not None and (reread.score, reread.comment_count) == (100, 10)
+
+
+def test_story_stats_unsupported_source_never_probes(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import server
+
+    _, db, _, handler, user = test_env
+    db.upsert_story(_stats_test_story(9104, source="rss_reddit_python"))
+
+    async def no_probe(stories: Any, timeout_s: float) -> Any:
+        raise AssertionError("unsupported sources must not reach Firebase")
+
+    monkeypatch.setattr("pipeline._probe_live_items", no_probe)
+
+    async def no_llm(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("stats must never generate")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", no_llm)
+    body = (
+        _authed_client(handler, user).get("/api/story-stats?story_id=9104").get_json()
+    )
+    assert body["points_live"] is False and body["comments_live"] is False
+    assert body["reason"] == "unsupported_source"
+    assert (body["points"], body["comments"]) == (100, 10)
+
+
+def test_story_stats_missing_score_stays_field_honest(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pipeline import LiveCounts
+
+    _, db, _, handler, user = test_env
+    db.upsert_story(_stats_test_story(9105))
+
+    async def scoreless_probe(stories: Any, timeout_s: float) -> dict[int, LiveCounts]:
+        return {s.id: LiveCounts(score=None, descendants=9) for s in stories}
+
+    monkeypatch.setattr("pipeline._probe_live_items", scoreless_probe)
+    body = (
+        _authed_client(handler, user).get("/api/story-stats?story_id=9105").get_json()
+    )
+    assert body["points"] == 100 and body["points_live"] is False
+    assert body["comments"] == 9 and body["comments_live"] is True
+
+
+def test_story_stats_disabled_probe_reports_stored(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, db, _, handler, user = test_env
+    db.upsert_story(_stats_test_story(9106))
+    handler.config = replace(handler.config, tldr_tap_probe_timeout_seconds=0)
+
+    async def no_probe(stories: Any, timeout_s: float) -> Any:
+        raise AssertionError("disabled probe must not run")
+
+    monkeypatch.setattr("pipeline._probe_live_items", no_probe)
+    body = (
+        _authed_client(handler, user).get("/api/story-stats?story_id=9106").get_json()
+    )
+    assert body["reason"] == "probe_disabled"
+    assert body["points_live"] is False and body["comments_live"] is False
+
+
+def test_tldr_cache_reply_carries_known_snapshot_only(test_env: Any) -> None:
+    import server
+
+    _, db, _, handler, user = test_env
+    story = _stats_test_story(9107)
+    db.upsert_story(story)
+    key = server._tldr_cache_key(
+        title=story.title,
+        self_text="",
+        top_comments="Existing comments.",
+        article_body="",
+    )
+    db.upsert_tldr_cache(story.id, key, "Snapshot summary", source_comments=40)
+    known = _authed_client(handler, user).get(f"/api/tldr-cache/{story.id}").get_json()
+    assert known["comments_summarized"] == 40
+    db.upsert_tldr_cache(story.id, key, "Legacy summary")
+    legacy = _authed_client(handler, user).get(f"/api/tldr-cache/{story.id}").get_json()
+    assert legacy["tldr"] == "Legacy summary"
+    assert "comments_summarized" not in legacy
+
+
+def _zero_count_story(story_id: int) -> Story:
+    return Story(
+        story_id,
+        f"Quiet story {story_id}",
+        None,
+        5,
+        1_700_000_000,
+        "",
+        source="hn",
+        comment_count=0,
+        comment_count_at_fetch=0,
+        top_comments="",
+    )
+
+
+def test_force_refresh_hydration_failure_serves_stale_without_llm(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import server
+
+    _, db, _, handler, user = test_env
+    db.upsert_story(_zero_count_story(9108))
+    db.upsert_tldr_cache(9108, "old-key", "Old cached text")
+    seen: list[bool] = []
+
+    async def failing_fetch(
+        client: Any,
+        sid: int,
+        db_: Any,
+        *,
+        force: bool = False,
+        strict: bool = False,
+    ) -> Any:
+        seen.append(strict)
+        raise httpx.ConnectError("algolia unreachable")
+
+    monkeypatch.setattr("pipeline.fetch_story", failing_fetch)
+    llm_calls: list[str] = []
+
+    async def counting_llm(title: str, **kwargs: Any) -> Any:
+        llm_calls.append(title)
+        return server.TldrResult(kind="ok", tldr="must not happen")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", counting_llm)
+    body = (
+        _authed_client(handler, user)
+        .post("/api/tldr-detail", json={"story_id": 9108, "force_refresh": True})
+        .get_json()
+    )
+    assert seen == [True]
+    assert llm_calls == []
+    assert body["tldr"] == "Old cached text"
+    assert body.get("stale") is True
+    assert "comments_summarized" not in body
+    assert db.get_tldr_cache(9108, "old-key") == "Old cached text"
+
+
+def test_force_refresh_hydration_failure_without_stale_is_retryable(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import server
+
+    _, db, _, handler, user = test_env
+    db.upsert_story(_zero_count_story(9109))
+
+    async def failing_fetch(
+        client: Any,
+        sid: int,
+        db_: Any,
+        *,
+        force: bool = False,
+        strict: bool = False,
+    ) -> Any:
+        raise httpx.ConnectError("algolia unreachable")
+
+    monkeypatch.setattr("pipeline.fetch_story", failing_fetch)
+    llm_calls: list[str] = []
+
+    async def counting_llm(title: str, **kwargs: Any) -> Any:
+        llm_calls.append(title)
+        return server.TldrResult(kind="ok", tldr="must not happen")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", counting_llm)
+    response = _authed_client(handler, user).post(
+        "/api/tldr-detail", json={"story_id": 9109, "force_refresh": True}
+    )
+    assert response.status_code == 503
+    assert response.get_json()["retryable"] is True
+    assert llm_calls == []
+    assert db.get_any_tldr_for_story(9109) is None
+
+
+def test_force_refresh_zero_count_hydrates_and_snapshots(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import server
+
+    _, db, _, handler, user = test_env
+    db.upsert_story(_zero_count_story(9110))
+    seen: list[bool] = []
+
+    async def fresh_fetch(
+        client: Any,
+        sid: int,
+        db_: Any,
+        *,
+        force: bool = False,
+        strict: bool = False,
+    ) -> Any:
+        seen.append(strict)
+        row = db_.get_story(sid)
+        assert row is not None
+        return replace(
+            row,
+            top_comments="Fresh hydrated discussion here.",
+            comment_count=7,
+            comment_count_at_fetch=7,
+        )
+
+    monkeypatch.setattr("pipeline.fetch_story", fresh_fetch)
+    llm_calls: list[str] = []
+
+    async def fresh_llm(title: str, **kwargs: Any) -> Any:
+        llm_calls.append(title)
+        return server.TldrResult(kind="ok", tldr="Fresh TLDR")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", fresh_llm)
+    body = (
+        _authed_client(handler, user)
+        .post("/api/tldr-detail", json={"story_id": 9110, "force_refresh": True})
+        .get_json()
+    )
+    assert seen == [True]
+    assert llm_calls != []
+    assert body["comment_count_summarized"] == 7
+    assert body["comments_summarized"] == 7
+    fresh_key = server._tldr_cache_key(
+        title="Quiet story 9110",
+        self_text="",
+        top_comments="Fresh hydrated discussion here.",
+        article_body="",
+    )
+    assert db.get_tldr_cache(9110, fresh_key) == "Fresh TLDR"
+    assert db.get_tldr_cache_snapshot(9110, fresh_key) == 7
+
+
+@pytest.mark.parametrize("algolia", ["http-503", "connect-error", "wrong-type"])
+def test_force_refresh_real_fetch_fallback_is_conservative(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch, algolia: str
+) -> None:
+    """The actual fetch_story upstream fallback (no mocks at that layer):
+    HTTP errors, transport failures and malformed items return None under
+    strict, so forced refresh fails retryably without spending the LLM."""
+    import server
+
+    _, db, _, handler, user = test_env
+    db.upsert_story(_zero_count_story(9111))
+
+    class FakeResp:
+        def __init__(self, status: int, body: Any) -> None:
+            self.status_code = status
+            self._body = body
+
+        def json(self) -> Any:
+            if isinstance(self._body, Exception):
+                raise self._body
+            return self._body
+
+    class FakeClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        async def get(self, url: str) -> FakeResp:
+            assert "algolia" in url, f"unexpected outbound {url}"
+            if algolia == "http-503":
+                return FakeResp(503, None)
+            if algolia == "connect-error":
+                raise httpx.ConnectError("down")
+            return FakeResp(200, {"id": 9111, "type": "comment"})
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    llm_calls: list[str] = []
+
+    async def counting_llm(title: str, **kwargs: Any) -> Any:
+        llm_calls.append(title)
+        return server.TldrResult(kind="ok", tldr="must not happen")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", counting_llm)
+    response = _authed_client(handler, user).post(
+        "/api/tldr-detail", json={"story_id": 9111, "force_refresh": True}
+    )
+    assert response.status_code == 503
+    assert response.get_json()["retryable"] is True
+    assert llm_calls == []
+    assert db.get_any_tldr_for_story(9111) is None

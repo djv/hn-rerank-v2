@@ -1,5 +1,24 @@
 # Worklog: hn-rewrite
 
+## 2026-10-09 — Section auto-refresh, redefined r, stats-check prompt (saved, undeployed)
+
+Implemented the reviewed section-refresh plan (PLAN.md plus Codex corrections
+and root follow-up observations), saved under the user’s ss request. TUI:
+background latest-existing-feed GET on genuine sort changes (all of s/h/l,
+selectors, tabs) with one in-flight request, one bounded follow-up and
+latest-issued-wins replies; open-story retention on membership loss; r now
+regenerates only the selected summary plus a background live stats check
+(`GET /api/story-stats`), with an update-stats-and-ask modal on discussion
+growth past the summary's known snapshot. Server: stats-only endpoint
+(HN Firebase, strict validation, stored/unavailable honesty, read-only),
+generation-bound source snapshots on `tldr_cache`, forced-HN hydration and
+serialized forced/non-forced flight coordination. Validation in isolated
+VPS scratch copies; evidence in
+`docs/evaluations/section-refresh-20261009/IMPLEMENTATION-CHECKS.txt`.
+Backend 1,238 passed / 1 skipped; TUI 195 passed / 1 skipped. Source hashes
+still match those isolated full gates; final save checks are clean. Result review
+remains unapproved; deployment/restart and live smoke remain separate.
+
 ## 2026-10-09 — Three-model general review and authorized extraction deploy
 
 Completed bounded read-only Muse, Codex and Claude Code reviews sequentially;

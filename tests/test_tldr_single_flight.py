@@ -38,8 +38,18 @@ class _CountedFlights(SingleFlight[int, TldrReply]):
         super().__init__()
         self.joined = threading.Semaphore(0)
 
-    def join_or_lead(self, key: int) -> tuple[Flight[TldrReply], bool]:
-        flight, leading = super().join_or_lead(key)
+    def join_or_lead(
+        self, key: int, *, forced: bool = False
+    ) -> tuple[Flight[TldrReply], bool]:
+        flight, leading = super().join_or_lead(key, forced=forced)
+        if not leading:
+            self.joined.release()
+        return flight, leading
+
+    def followup_or_lead(
+        self, ordinary: Flight[TldrReply], key: int
+    ) -> tuple[Flight[TldrReply], bool]:
+        flight, leading = super().followup_or_lead(ordinary, key)
         if not leading:
             self.joined.release()
         return flight, leading
@@ -122,7 +132,7 @@ def test_concurrent_taps_share_one_generation(
 
     leader = _tap(handler, user, replies)
     assert llm.started.wait(5.0)
-    others = [_tap(handler, user, replies, force=i == 0) for i in range(followers)]
+    others = [_tap(handler, user, replies) for _ in range(followers)]
     for _ in others:
         assert flights.joined.acquire(timeout=5.0)
     llm.release.set()
@@ -138,6 +148,227 @@ def test_concurrent_taps_share_one_generation(
     # The next tap is a plain cache hit.
     after = _client(handler, user).post("/api/tldr-detail", json={"story_id": STORY.id})
     assert after.get_json()["cached"] is True and llm.calls == 1
+
+
+def test_forced_tap_leads_bounded_followup_after_ordinary(
+    runtime: tuple[type[Handler], Database, User],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A forced tap never joins an ordinary flight as satisfaction: it waits
+    once, then leads exactly one fresh follow-up. Two forced followers
+    coalesce onto that follow-up (2 generations total, never 3+), and the
+    fresh text wins the cache with its own snapshot."""
+    import pipeline
+
+    handler, db, user = runtime
+    handler.config = replace(
+        handler.config,
+        tldr_uncached_per_user_limit=5,
+        tldr_max_concurrent_generations=2,
+    )
+
+    async def fake_fetch_story(
+        client: object,
+        sid: int,
+        db_: Database,
+        *,
+        force: bool = False,
+        strict: bool = False,
+    ) -> Story | None:
+        assert force and strict
+        row = db_.get_story(sid)
+        assert row is not None
+        return replace(
+            row,
+            top_comments="Fresh hydrated comments.",
+            comment_count=42,
+            comment_count_at_fetch=42,
+        )
+
+    monkeypatch.setattr(pipeline, "fetch_story", fake_fetch_story)
+
+    made: list[str] = []
+    first_started = threading.Event()
+    release_leader = threading.Event()
+
+    async def seq_llm(title: str, **_: str) -> TldrResult:
+        made.append(title)
+        if len(made) == 1:
+            first_started.set()
+            await asyncio.to_thread(release_leader.wait, 10.0)
+            return TldrResult(kind="ok", tldr="## Summary ordinary")
+        return TldrResult(kind="ok", tldr="## Summary forced fresh")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", seq_llm)
+    flights = handler._tldr_flights
+    assert isinstance(flights, _CountedFlights)
+    replies: list[Any] = []
+
+    leader = _tap(handler, user, replies)
+    assert first_started.wait(5.0)
+    first = [_tap(handler, user, replies, force=True) for _ in range(2)]
+    assert flights.joined.acquire(timeout=5.0)
+    assert flights.joined.acquire(timeout=5.0)
+    release_leader.set()
+    # Exactly one follow-up starts; the second forced caller joins it.
+    assert flights.joined.acquire(timeout=5.0)
+    for thread in [leader, *first]:
+        thread.join(10.0)
+
+    assert len(made) == 2
+    assert len(replies) == 3
+    assert {status for status, _ in replies} == {200}
+    assert replies[0][1]["tldr"] == "## Summary ordinary"
+    assert replies[1][1]["tldr"] == "## Summary forced fresh"
+    assert replies[2][1]["tldr"] == "## Summary forced fresh"
+    assert not flights.in_flight(STORY.id)
+    fresh_key = server._tldr_cache_key(
+        title=STORY.title,
+        self_text=STORY.self_text or "",
+        top_comments="Fresh hydrated comments.",
+        article_body=STORY.article_body or "",
+    )
+    assert db.get_tldr_cache(STORY.id, fresh_key) == "## Summary forced fresh"
+    assert db.get_tldr_cache_snapshot(STORY.id, fresh_key) == 42
+
+
+def test_late_forced_waiter_shares_completed_followup(
+    runtime: tuple[type[Handler], Database, User],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A forced waiter that wakes after the fresh follow-up already landed
+    still shares it: exactly ordinary + one force (2 generations), both
+    forced replies carry the fresh text, and the cache stays fresh."""
+    import pipeline
+
+    handler, db, user = runtime
+    handler.config = replace(
+        handler.config,
+        tldr_uncached_per_user_limit=5,
+        tldr_max_concurrent_generations=2,
+    )
+
+    async def fake_fetch_story(
+        client: object,
+        sid: int,
+        db_: Database,
+        *,
+        force: bool = False,
+        strict: bool = False,
+    ) -> Story | None:
+        assert force and strict
+        row = db_.get_story(sid)
+        assert row is not None
+        return replace(
+            row,
+            top_comments="Fresh hydrated comments.",
+            comment_count=42,
+            comment_count_at_fetch=42,
+        )
+
+    monkeypatch.setattr(pipeline, "fetch_story", fake_fetch_story)
+
+    made: list[str] = []
+    first_started = threading.Event()
+    release_leader = threading.Event()
+
+    async def seq_llm(title: str, **_: str) -> TldrResult:
+        made.append(title)
+        if len(made) == 1:
+            first_started.set()
+            await asyncio.to_thread(release_leader.wait, 10.0)
+            return TldrResult(kind="ok", tldr="## Summary ordinary")
+        return TldrResult(kind="ok", tldr="## Summary forced fresh")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", seq_llm)
+    flights = handler._tldr_flights
+    assert isinstance(flights, _CountedFlights)
+    fresh_key = server._tldr_cache_key(
+        title=STORY.title,
+        self_text=STORY.self_text or "",
+        top_comments="Fresh hydrated comments.",
+        article_body=STORY.article_body or "",
+    )
+
+    # Hold the second forced waiter inside followup_or_lead until the
+    # first waiter's follow-up has fully landed (fresh cache written,
+    # key released): no schedule luck, the slow path is forced.
+    calls = 0
+
+    def gated(ordinary: Flight[TldrReply], key: int) -> tuple[Flight[TldrReply], bool]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            deadline = time.time() + 10.0
+            while time.time() < deadline:
+                if db.get_tldr_cache(
+                    STORY.id, fresh_key
+                ) == "## Summary forced fresh" and not flights.in_flight(STORY.id):
+                    break
+                time.sleep(0.01)
+        flight, leading = SingleFlight.followup_or_lead(flights, ordinary, key)
+        if not leading:
+            flights.joined.release()
+        return flight, leading
+
+    monkeypatch.setattr(flights, "followup_or_lead", gated)
+    replies: list[Any] = []
+
+    leader = _tap(handler, user, replies)
+    assert first_started.wait(5.0)
+    first = [_tap(handler, user, replies, force=True) for _ in range(2)]
+    assert flights.joined.acquire(timeout=5.0)
+    assert flights.joined.acquire(timeout=5.0)
+    release_leader.set()
+    for thread in [leader, *first]:
+        thread.join(10.0)
+        assert not thread.is_alive()
+
+    assert len(made) == 2
+    assert len(replies) == 3
+    assert {status for status, _ in replies} == {200}
+    assert replies[0][1]["tldr"] == "## Summary ordinary"
+    assert replies[1][1]["tldr"] == "## Summary forced fresh"
+    assert replies[2][1]["tldr"] == "## Summary forced fresh"
+    assert not flights.in_flight(STORY.id)
+    assert db.get_tldr_cache(STORY.id, fresh_key) == "## Summary forced fresh"
+    assert db.get_tldr_cache_snapshot(STORY.id, fresh_key) == 42
+
+
+def test_prefetch_skipped_while_forced_flight_runs(
+    runtime: tuple[type[Handler], Database, User],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ordinary work never starts while a forced flight exists (shared key)."""
+    import pipeline
+
+    handler, db, user = runtime
+    monkeypatch.setattr(Handler, "_tldr_flights", handler._tldr_flights)
+    monkeypatch.setattr(Handler, "db", db, raising=False)
+
+    async def fake_fetch_story(
+        client: object,
+        sid: int,
+        db_: Database,
+        *,
+        force: bool = False,
+        strict: bool = False,
+    ) -> Story | None:
+        return db_.get_story(sid)
+
+    monkeypatch.setattr(pipeline, "fetch_story", fake_fetch_story)
+    llm = _Llm()
+    monkeypatch.setattr(server, "generate_detailed_tldr", llm)
+    replies: list[Any] = []
+    generated: list[int] = []
+    tap = _tap(handler, user, replies, force=True)
+    assert llm.started.wait(5.0)
+    prefetch = _prefetch(generated)
+    prefetch.join(5.0)
+    assert generated == [0] and llm.calls == 1
+    llm.release.set()
+    tap.join(5.0)
+    assert replies[0][0] == 200
 
 
 def test_a_failed_leader_releases_the_story_and_followers_retry(

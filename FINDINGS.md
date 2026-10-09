@@ -1,5 +1,31 @@
 # HN Rerank findings
 
+## Live terminal-buffer inspection — 2026-10-09
+
+The comparison completed: eight isolated VPS Pilot checks passed, lint/format/
+types clean, exact source hash matched. Return-refresh cost one current-window
+GET per tested round trip; departure-refresh cost two. Both applied new counts/
+orders and held an old usable deck while waiting. The instantaneous selector
+test is not evidence of coalescing real in-flight requests; no UI/network
+timing benchmark was run. Agent recommends departure background fetch to match
+the user's requested semantics, with coalescing as an untested next refinement.
+User chose report-first; no runtime implementation. Full evidence and corrections:
+[assessment](docs/evaluations/section-refresh-20261009/ASSESSMENT.md).
+
+User chose actual TUI inspection, then requested section auto-refresh on
+`s/h/l` and a comparison of the possible behaviors. Existing running Reader
+in hidden tmux window work:2 was inspected using targeted capture/send-keys;
+no window focus/activation, votes, forced summaries or reranks. At 192 columns,
+eight stories were shown and the list/reader split was approximately 1:2.
+`?` opened help; Escape closed it; separately delivered Enter zoomed the
+existing cached summary and Escape returned to the list. At 80x30, selectors
+replaced tabs, panes stacked, list scrolled to the selection and footer reduced
+to `? help`. Restored wide layout and inherited `window-size=latest` afterward.
+This verifies real Textual terminal-buffer behavior, not hidden-window graphical
+painting, exact response timing, votes/undo persistence, or new-summary latency.
+The existing summary and selection remained intact. No production code changed
+during this inspection.
+
 ## General review and scoped guard deploy — 2026-10-09
 
 User requested independent Codex/Muse/Claude Code general review. Actual
@@ -3217,3 +3243,41 @@ counts (e.g. N=400: production .7759 82/13, #2 .7874 85/12, #4 .7852 86/11).
 Power replay for live interleaving: 28 days ~70% (#2) / ~54% (#4) for the
 upvote-rate test, optimistic. Details and artifacts:
 docs/evaluations/model-ablation-20261007/INTERLEAVING.md, followups/.
+
+### 2026-10-09 — Section/r/stats implementation validated, awaiting result review
+
+User approved background existing-feed refresh on s/h/l, then clarified that r
+must regenerate only the selected summary/check live counts and that discussion
+growth should update statistics and ask before another generation. Muse implemented
+the feature; the agent source-checked and corrected its draft. Cache metadata now
+binds the source-descendant snapshot to the exact cached text, with legacy rows
+unknown. Forced HN hydration has strict failure handling, and generated replies
+retain the old snapshot field while adding the field parsed by the TUI. Captured
+flight freshness and an ordinary flight's retained fresh-follow-up reference avoid
+both misclassification and duplicate generations when a waiter wakes late. A
+production regression test deliberately delays one waiter until the follow-up
+has completed and checks both responses, two total calls and final cache state.
+
+Final validation used a fresh detached VPS worktree at laptop HEAD 4e946e5 plus
+exact feature overlays, not an older scratch baseline. All 17 changed Python
+source/test hashes match the laptop (SOURCE-SHA256.txt). Backend: 1,238 passed,
+1 skipped (Playwright absent), one existing MLP convergence warning. TUI: 195
+passed, 1 skipped (Windows DACL). Repository Ruff/ty, touched-file format and
+whitespace checks pass. Muse also ran an unintended local backend sweep; only
+the agent-executed isolated VPS gates support the final completion claims.
+Evidence: docs/evaluations/section-refresh-20261009/IMPLEMENTATION-CHECKS.txt.
+
+No new feature deployment, live database migration, provider operation or user
+TUI restart. Physical/live behavior remains unverified. Independent implementation
+review is pending approval because the cache/API/concurrency changes carry material
+risk. The completed plan review is a separate check. Live profile151 interleaving
+and paused ranking research remain unchanged.
+
+### 2026-10-09 — ss save verification
+
+All 17 source/test hashes still match the final isolated full-suite gates.
+The intervening committed change 7706816 touches only AGENTS.md. Reused backend
+1,238-pass and TUI 195-pass evidence; current Ruff, ty, touched-file formatting
+and whitespace checks are clean. The user requested commit/cleanup via ss;
+this feature and its handoff/evidence are saved together. No additional reviewer,
+provider call, live migration, deployment or restart is authorized by that save.

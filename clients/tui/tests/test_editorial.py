@@ -531,15 +531,15 @@ async def test_failure_copy_in_reading_pane() -> None:
         markdown = app.query_one(Markdown)._markdown
         assert "# Could not reach server" in markdown
         assert "Connection failed" in markdown
-        assert "**r** to retry" in markdown
+        assert "Switch sort or time window to retry." in markdown
         assert app.query_one("#status").has_class("error")
         assert not str(app.query_one("#story-heading", Static).content)
         server.fail_feed = False
-        app.action_refresh()
+        # r cannot refetch a failed feed anymore; a filter switch retries it.
+        app.query_one("#sort", Select).value = "popular"
         await settle(pilot)
-        assert [s.id for s in app.stories] == [1, 2]
+        assert [s.id for s in app.stories] == [1]
         assert "Could not reach server" not in app.query_one(Markdown)._markdown
-        assert str(app.query_one("#status", Static).content) == "2 shown · +0 ~0 −0"
 
 
 async def test_empty_notice_heading() -> None:
@@ -671,10 +671,16 @@ async def test_reading_heading_tracks_refreshed_story_data() -> None:
     async with app.run_test(size=(120, 35)) as pilot:
         await settle(pilot)
         fake.feed.stories[0] = replace(fake.feed.stories[0], points=999, comments=123)
+        # r regenerates the summary without refetching the feed: the heading
+        # keeps the served counts until a feed refresh carries the new ones.
         app.action_refresh()
         await settle(pilot)
         selected = app.selected()
         assert selected and selected.id == 1
+        heading = str(app.query_one("#story-heading", Static).content)
+        assert "· ▲ 100 · 💬 10" in heading
+        app.refresh_feed(announce=False)
+        await settle(pilot)
         heading = str(app.query_one("#story-heading", Static).content)
         assert "· ▲ 999 · 💬 123" in heading
 

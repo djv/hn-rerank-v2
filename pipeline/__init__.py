@@ -507,6 +507,14 @@ class LiveCounts:
     descendants: int
 
 
+_PROBE_MISSING: Any = object()
+"""Sentinel for a Firebase body with no ``descendants`` key at all.
+
+Story/job items omit the field at zero comments (a legitimate zero);
+an explicit ``descendants: null`` is unknown, never zero.
+"""
+
+
 async def _probe_live_items(
     stories: Sequence[Story], timeout_s: float
 ) -> dict[int, LiveCounts]:
@@ -522,6 +530,12 @@ async def _probe_live_items(
     async with httpx.AsyncClient(timeout=timeout_s) as client:
 
         async def _one(s: Story) -> tuple[int, LiveCounts] | None:
+            if not is_hn_source(s.source) or s.id <= 0:
+                # Only real HN items are ever probed: RSS/Reddit/archive
+                # rows and non-positive ids must never be sent to
+                # Firebase as live evidence.
+                logging.warning("tldr_probe story_id=%s unsupported target", s.id)
+                return None
             async with sem:
                 try:
                     resp = await client.get(_FIREBASE_ITEM_URL.format(sid=s.id))
@@ -534,16 +548,47 @@ async def _probe_live_items(
                     )
                     return None
                 try:
-                    body = resp.json() or {}
-                    score = body.get("score")
-                    live = LiveCounts(
-                        score=None if score is None else int(score),
-                        descendants=int(body.get("descendants") or 0),
-                    )
+                    body = resp.json()
                 except Exception:
                     logging.warning("tldr_probe story_id=%s unparseable body", s.id)
                     return None
-                return (s.id, live)
+                # Strict identity/type/count checks: null/empty/mismatched
+                # bodies are probe failures, never live data. A fabricated
+                # zero would pose as a checked count downstream (and
+                # True == 1 in Python, so identity is type-strict).
+                if not isinstance(body, dict) or not body:
+                    logging.warning("tldr_probe story_id=%s empty body", s.id)
+                    return None
+                item_id = body.get("id")
+                if type(item_id) is not int or item_id != s.id:
+                    logging.warning("tldr_probe story_id=%s identity mismatch", s.id)
+                    return None
+                if body.get("type") not in ("story", "job"):
+                    # Only discussion-bearing HN items carry comment counts;
+                    # anything else is not live data for this story.
+                    logging.warning("tldr_probe story_id=%s unexpected type", s.id)
+                    return None
+                if body.get("deleted") is True or body.get("dead") is True:
+                    # A removed item is not proof of current stats.
+                    logging.warning("tldr_probe story_id=%s removed item", s.id)
+                    return None
+                score = body.get("score")
+                if score is not None and type(score) is not int:
+                    logging.warning("tldr_probe story_id=%s bad score", s.id)
+                    return None
+                descendants = body.get("descendants", _PROBE_MISSING)
+                if descendants is _PROBE_MISSING:
+                    # Story/job items omit the field at zero comments.
+                    descendants = 0
+                elif descendants is None or type(descendants) is not int:
+                    # An explicit null is not a known zero, and a
+                    # non-integer (including True) is not a count.
+                    logging.warning("tldr_probe story_id=%s bad count", s.id)
+                    return None
+                if (score is not None and score < 0) or descendants < 0:
+                    logging.warning("tldr_probe story_id=%s negative count", s.id)
+                    return None
+                return (s.id, LiveCounts(score=score, descendants=descendants))
 
         for result in await asyncio.gather(*(_one(s) for s in stories)):
             if result is not None:

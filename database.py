@@ -88,6 +88,20 @@ class StoryCounts:
 
 
 @dataclass(frozen=True)
+class TldrCacheRecord:
+    """One cached TLDR plus its generation-time source snapshot.
+
+    `source_comments` is the descendants count the summarized text was
+    built from (None = legacy/unknown). Text and snapshot are always read
+    together so a same-key rewrite can never mix text with another
+    generation's provenance.
+    """
+
+    text: str
+    source_comments: int | None
+
+
+@dataclass(frozen=True)
 class FeedbackRecord:
     story_id: int
     action: Action
@@ -347,6 +361,14 @@ class Database:
                         FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE
                     ) STRICT
                 """)
+                cursor = conn.execute("PRAGMA table_info(tldr_cache)")
+                if "source_comments" not in {row[1] for row in cursor.fetchall()}:
+                    # Generation-time source snapshot bound to the cached text
+                    # (PLAN correction 1): nullable so legacy rows stay unknown
+                    # and are never backfilled from the mutable story row.
+                    conn.execute(
+                        "ALTER TABLE tldr_cache ADD COLUMN source_comments INTEGER"
+                    )
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_tldr_cache_story ON tldr_cache(story_id)"
                 )
@@ -1100,13 +1122,37 @@ class Database:
         return found
 
     # TLDR cache
-    def get_tldr_cache(self, story_id: int, cache_key: str) -> str | None:
+    def get_tldr_cache_record(
+        self, story_id: int, cache_key: str
+    ) -> TldrCacheRecord | None:
+        """Atomic text+snapshot read for one cache key."""
         with self.conn() as conn:
             row = conn.execute(
-                "SELECT tldr FROM tldr_cache WHERE story_id = ? AND cache_key = ?",
+                "SELECT tldr, source_comments FROM tldr_cache "
+                "WHERE story_id = ? AND cache_key = ?",
                 (story_id, cache_key),
             ).fetchone()
-            return row[0] if row else None
+            if not row:
+                return None
+            snapshot = row[1]
+            return TldrCacheRecord(
+                text=row[0],
+                source_comments=int(snapshot) if snapshot is not None else None,
+            )
+
+    def get_tldr_cache(self, story_id: int, cache_key: str) -> str | None:
+        record = self.get_tldr_cache_record(story_id, cache_key)
+        return record.text if record is not None else None
+
+    def get_tldr_cache_snapshot(self, story_id: int, cache_key: str) -> int | None:
+        """Source descendants covered by a cached TLDR, when recorded.
+
+        Written atomically with the text at generation time; NULL (legacy
+        rows) means unknown and must never be treated as proof of the
+        current discussion size.
+        """
+        record = self.get_tldr_cache_record(story_id, cache_key)
+        return record.source_comments if record is not None else None
 
     def get_any_tldr_for_story(self, story_id: int) -> str | None:
         """Return the cached TLDR for a story regardless of cache key.
@@ -1135,16 +1181,23 @@ class Database:
             ).fetchall()
             return {row[0]: row[1] for row in rows}
 
-    def upsert_tldr_cache(self, story_id: int, cache_key: str, tldr: str) -> None:
+    def upsert_tldr_cache(
+        self,
+        story_id: int,
+        cache_key: str,
+        tldr: str,
+        source_comments: int | None = None,
+    ) -> None:
         with self.conn() as conn:
             with conn:
                 conn.execute("DELETE FROM tldr_cache WHERE story_id = ?", (story_id,))
                 conn.execute(
                     """
-                    INSERT INTO tldr_cache (story_id, cache_key, tldr, created_at)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO tldr_cache (story_id, cache_key, tldr, created_at,
+                                            source_comments)
+                    VALUES (?, ?, ?, ?, ?)
                     """,
-                    (story_id, cache_key, tldr, time.time()),
+                    (story_id, cache_key, tldr, time.time(), source_comments),
                 )
 
     # LLM usage (spend visibility; additive, never blocks serving)

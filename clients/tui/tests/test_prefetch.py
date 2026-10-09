@@ -281,22 +281,37 @@ async def test_passive_refresh_does_not_strand_a_joined_summary() -> None:
         await wait_for(pilot, lambda: 2 in fake.generated)
         await pilot.press("j")
         await pilot.pause(0.4)  # load_summary is now awaiting the prefetch.
-        app.reload(manual=False)
+        app.reload()
         await pilot.pause(0.2)
         fake.release.set()
         await wait_for(pilot, lambda: "Summary 2" in app.query_one(Markdown)._markdown)
 
 
-async def test_refresh_cancels_prefetch_generation() -> None:
+async def test_refresh_scopes_to_selected_summary() -> None:
+    """r regenerates only the selected summary: unrelated in-flight prefetch
+    keeps running instead of being cancelled, and only the selected story
+    gets a forced request."""
     fake = NavigationServer()
     fake.blocked = {2, 3, 4}
     app = Reader(api=fake.api())
     async with app.run_test(size=(120, 35)) as pilot:
         await wait_for(pilot, lambda: {2, 3, 4} <= set(fake.generated))
-        old = list(app.summary_requests.values())
+        old = dict(app.summary_requests)
+        assert old.keys() >= {2, 3, 4}
         app.action_refresh()
-        await pilot.pause(0.2)
-        assert all(task.done() for task in old)
+        await wait_for(
+            pilot,
+            lambda: (
+                [
+                    json.loads(r.content)["story_id"]
+                    for r in fake.requests
+                    if r.url.path.endswith("/api/tldr-detail")
+                    and json.loads(r.content).get("force_refresh")
+                ]
+                == [1]
+            ),
+        )
+        assert all(not old[sid].done() for sid in (2, 3, 4))
         fake.release.set()
         await wait_for(pilot, lambda: 2 in app.summaries)
 

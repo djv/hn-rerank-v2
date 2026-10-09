@@ -482,7 +482,9 @@ EMPTY_NOTICE = (
 
 
 def feed_failure_notice(detail: str) -> str:
-    return f"# Could not reach server\n\n{detail}\n\nPress **r** to retry."
+    return (
+        f"# Could not reach server\n\n{detail}\n\nSwitch sort or time window to retry."
+    )
 
 
 class Summary(Markdown):
@@ -603,6 +605,62 @@ class Setup(ModalScreen[Profile | None]):
             self.query_one("#setup-message", Static).update("Connecting…")
             self.query_one("#setup-message").remove_class("error")
             self.connect(str(event.button.id))
+
+
+class StatsPrompt(ModalScreen[str]):
+    """Offer to regenerate a summary whose discussion outgrew its snapshot.
+
+    Dismisses with "regen" or "keep"; Escape and the default-focused Keep
+    button both keep the current text, so no paid regeneration happens by
+    accident (in particular not from the reader's numeric vote keys, which
+    the app blocks while this screen is open).
+    """
+
+    CSS = """
+    StatsPrompt { align: center middle; background: $hn-overlay; color: $hn-fg; }
+    #stats-prompt { width: 62; max-width: 95%; height: auto; max-height: 100%;
+             padding: 1 2; background: $hn-modal; border: round $hn-border; }
+    #stats-prompt-title { text-style: bold; }
+    #stats-prompt-message { height: auto; margin: 1 0; }
+    #stats-buttons { height: auto; }
+    StatsPrompt Button { width: 1fr; background: $hn-panel; color: $hn-fg; border: none; }
+    StatsPrompt Button:focus { background: $hn-button-focus; color: $hn-accent; text-style: bold; }
+    """
+
+    BINDINGS: ClassVar[list[tuple[str, str, str]]] = [
+        ("escape", "keep", "Keep"),
+    ]
+
+    def __init__(self, title: str, old_comments: int, new_comments: int) -> None:
+        super().__init__()
+        self._title = title
+        self._old_comments = old_comments
+        self._new_comments = new_comments
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="stats-prompt"):
+            yield Label("New discussion comments", id="stats-prompt-title")
+            yield Static(Text(self._title), id="stats-prompt-message", markup=False)
+            yield Static(
+                f"Summary covers {self._old_comments} comments; "
+                f"{self._new_comments} now. Regenerate with the fresh discussion?",
+                markup=False,
+            )
+            with Horizontal(id="stats-buttons"):
+                yield Button("Keep current", id="stats-keep")
+                yield Button("Regenerate summary", id="stats-regen")
+
+    def on_mount(self) -> None:
+        self.query_one("#stats-keep", Button).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "stats-regen":
+            self.dismiss("regen")
+        elif event.button.id == "stats-keep":
+            self.dismiss("keep")
+
+    def action_keep(self) -> None:
+        self.dismiss("keep")
 
 
 class Reader(App[None]):
@@ -782,6 +840,30 @@ class Reader(App[None]):
         self.prefetch_cooldown_until = 0.0
         self.prefetch_slots = asyncio.Semaphore(PREFETCH_CONCURRENCY)
         self.closing = False
+        # Sort-switch background refresh: every feed GET carries a serial and
+        # only the latest-issued reply may replace the deck, so a held older
+        # reply can never clobber a newer one. A sort change during a refresh
+        # queues at most one follow-up instead of another concurrent GET.
+        self._feed_serial = 0
+        self._sort_refresh_pending = False
+        # Known summary source snapshots by story: descendants the cached text
+        # was built from (absent = legacy/unknown, never proof of unseen
+        # comments). Plus forced regenerations in flight, stats checks in
+        # flight, offered counts and deferred live counts for the prompt.
+        self._summary_snapshots: dict[int, int] = {}
+        self._forced_tasks: set[int] = set()
+        # Declared forced regenerations by story (serial at declaration): a
+        # fast stats result landing before the delayed forced task starts
+        # must defer to it, not prompt over it. Consumed when the forced
+        # task starts; obsolete entries die on the next serial bump.
+        self._forced_intent: dict[int, int] = {}
+        self._stats_requests: dict[int, asyncio.Task[None]] = {}
+        self._stats_offered: dict[int, int] = {}
+        self._stats_pending_live: dict[int, int] = {}
+        self._stats_serials: dict[int, int] = {}
+        self._stats_modal_open = False
+        self._stats_modal_story: int | None = None
+        self._stats_modal_api: API | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="filters"):
@@ -848,6 +930,16 @@ class Reader(App[None]):
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         if self.setting_up or isinstance(self.focused, Input):
+            return False
+        if self._stats_modal_open and action in {
+            "vote",
+            "undo",
+            "refresh",
+            "cycle_sort",
+            "cycle_window",
+        }:
+            # The regeneration prompt owns the decision: deck-mutating keys
+            # (in particular the numeric vote keys) must not fire behind it.
             return False
         # Zoom is available for any selected story.
         if (
@@ -938,7 +1030,7 @@ class Reader(App[None]):
         except InvalidProfile as exc:
             self.setup(str(exc))
         except APIError as exc:
-            self.status(str(exc) + " Press r to retry.", error=True)
+            self.status(str(exc) + " Switch sort or time window to retry.", error=True)
             self.show_failure(str(exc))
 
     def setup(self, message: str = "") -> None:
@@ -948,6 +1040,7 @@ class Reader(App[None]):
         self.help_open = False
         self.summary_story_id = None
         self.selection_serial += 1
+        self._sort_refresh_pending = False
         self.workers.cancel_group(self, "summary")
         self.cancel_summary_requests()
         self.workers.cancel_group(self, "refresh")
@@ -985,6 +1078,7 @@ class Reader(App[None]):
         self.help_open = False
         self.summary_story_id = None
         self.setting_up = False
+        self._sort_refresh_pending = False
         self.refresh_feed()
 
     def selected(self) -> FeedStory | None:
@@ -1039,8 +1133,13 @@ class Reader(App[None]):
         if not self.query("#headlines"):
             return
         old = self.selected()
+        # Only a feed-driven rebuild (no explicit selection) may carry the
+        # open reader across a membership loss; filter changes, votes and
+        # undos always show their own target.
+        explicit = select_id is not None
         if select_id is None and old:
             select_id = old.id
+        previous = {s.id: s for s in self.stories}
         sort = str(self.query_one("#sort", Select).value)
         lookup = {story.id: story for story in self.feed.stories} if self.feed else {}
         self.view_key = f"{self.selected_window()}:{sort}"
@@ -1050,6 +1149,22 @@ class Reader(App[None]):
             for sid in order
             if sid not in self.rated and sid not in self.unavailable
         ][:VIEW_LIMIT]
+        open_id = self.summary_story_id
+        if (
+            self.stories
+            and not explicit
+            and open_id is not None
+            and open_id not in {s.id for s in self.stories}
+            and open_id not in self.rated
+            and open_id not in self.unavailable
+        ):
+            carried = lookup.get(open_id, previous.get(open_id))
+            if carried is not None:
+                # Fresh membership dropped the open story: retain its reader
+                # and scroll on a carried row instead of jumping elsewhere.
+                # The new order otherwise applies; navigation drops the row.
+                self.stories.insert(0, carried)
+                select_id = open_id
         headlines = self.query_one("#headlines", OptionList)
         headlines.clear_options()
         # Option padding (1 each side) plus the 2-cell selection marker.
@@ -1106,7 +1221,14 @@ class Reader(App[None]):
                 save_window(self.saved_window, self.window_file)
             self.show_window(str(event.value))
         else:
+            # A genuine sort change refreshes in the background, but the
+            # switch itself stays local and immediate. Mount and tab/selector
+            # echoes re-announce the sort already on screen (or no view at
+            # all) and must not fetch.
+            prior_sort = self.view_key.split(":")[-1] if self.view_key else None
             self.rebuild(select_id=-1)
+            if prior_sort is not None and prior_sort != str(event.value):
+                self.refresh_sort_background()
 
     def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
         if not event.tab.id or event.tab.id != event.tabs.active:
@@ -1245,6 +1367,12 @@ class Reader(App[None]):
                     )
                 elif force_refresh:
                     self.status("Summary regenerated.")
+                pending_live = self._stats_pending_live.pop(story_id, None)
+                if force_refresh and pending_live is not None:
+                    # A stats check that arrived mid-regeneration: offer only
+                    # against the snapshot this result actually returned.
+                    # Unrelated loads drop the stale force-era value instead.
+                    self._maybe_offer_regen(story_id, pending_live)
                 self.schedule_prefetch()
         except InvalidProfile as exc:
             self.setup(str(exc))
@@ -1363,20 +1491,32 @@ class Reader(App[None]):
     def summary_task(
         self, story_id: int, *, background: bool = False, force: bool = False
     ) -> asyncio.Task[SummaryResult | None]:
-        """The one request for a story: reuse it, or start it."""
+        """The one request for a story: reuse it, or start it.
+
+        Forced requests join a forced request already in flight instead of
+        cancelling it and spending again; an explicit refresh supersedes
+        speculation, which restarts as forced.
+        """
         task = self.summary_requests.get(story_id)
-        if task is not None and not task.done() and not force:
-            return task
+        if task is not None and not task.done():
+            if not force or story_id in self._forced_tasks:
+                return task
+            task.cancel()
         if task is not None:
             task.cancel()
         task = asyncio.create_task(
             self.fetch_summary(story_id, background=background, force=force)
         )
         self.summary_requests[story_id] = task
+        if force:
+            self._forced_tasks.add(story_id)
+            # A declared regeneration is now really in flight.
+            self._forced_intent.pop(story_id, None)
 
         def done(task: asyncio.Task[SummaryResult | None]) -> None:
             if self.summary_requests.get(story_id) is task:
                 del self.summary_requests[story_id]
+                self._forced_tasks.discard(story_id)
             if not task.cancelled():
                 task.exception()  # Awaiting callers handle it; none may be left.
 
@@ -1393,9 +1533,15 @@ class Reader(App[None]):
     ) -> None:
         """Forget summaries (a new deck may carry new text) and prefetch state."""
         kept = self.summaries.get(keep_text) if keep_text is not None else None
+        kept_snapshot = (
+            self._summary_snapshots.get(keep_text) if keep_text is not None else None
+        )
         self.summaries.clear()
+        self._summary_snapshots.clear()
         if keep_text is not None and kept is not None:
             self.summaries[keep_text] = kept
+            if kept_snapshot is not None:
+                self._summary_snapshots[keep_text] = kept_snapshot
         self.cancel_summary_requests(keep=keep_request)
         self.prefetch_retry_at.clear()
         self.prefetch_misses.clear()
@@ -1421,6 +1567,12 @@ class Reader(App[None]):
                 )
             else:
                 self.summaries[story_id] = summary.text
+                if summary.comments_summarized is not None:
+                    self._summary_snapshots[story_id] = summary.comments_summarized
+                else:
+                    # A fresh complete text without provenance replaces the
+                    # old pair: the previous snapshot must not describe it.
+                    self._summary_snapshots.pop(story_id, None)
                 self.prefetch_retry_at.pop(story_id, None)
         return summary
 
@@ -1506,10 +1658,40 @@ class Reader(App[None]):
             self.window_attempts.clear()
             self.window_generation += 1
         if newer:
-            self.reload(manual=False)
+            self.reload()
         elif counts_changed:
             # Same deck, fresher counts: summaries and the open story stay.
             self.refresh_feed(announce=False, counts_version=readiness.counts_version)
+
+    def _sort_refresh_running(self) -> bool:
+        return any(
+            worker.group == "refresh" and worker.is_running for worker in self.workers
+        )
+
+    def refresh_sort_background(self) -> None:
+        """Fetch the latest existing window feed after a genuine sort change.
+
+        The switch itself already rebuilt locally; this only refreshes data.
+        One GET in flight at a time: a change during a refresh queues at most
+        one follow-up. Never touches summaries or forces regeneration. A
+        never-loaded feed (failed initial load) retries here too; the mount
+        echo is excluded by the caller comparing against the rendered view.
+        """
+        if self.api is None or self.setting_up or self.closing:
+            return
+        if self._sort_refresh_running():
+            self._sort_refresh_pending = True
+            return
+        self.refresh_feed(announce=False)
+
+    def _finish_sort_refresh(self) -> None:
+        """One bounded follow-up when a sort change landed mid-request."""
+        if not self._sort_refresh_pending:
+            return
+        self._sort_refresh_pending = False
+        if self.closing or self.setting_up or self.api is None or self.feed is None:
+            return
+        self.refresh_feed(announce=False)
 
     @work(group="refresh", exclusive=True)
     async def refresh_feed(
@@ -1518,25 +1700,43 @@ class Reader(App[None]):
         """Fetch the selected window's feed and show it."""
         if not self.api or self.setting_up:
             return
+        self._feed_serial += 1
+        serial = self._feed_serial
         api, window = self.api, self.selected_window()
         if announce:
             self.status("Refreshing…")
         try:
             feed = await api.feed(window)
         except InvalidProfile as exc:
+            self._sort_refresh_pending = False
             self.setup(str(exc))
             return
         except APIError as exc:
+            # A failed background fetch never retries itself: the usable
+            # deck stays on screen with an honest status, and the user (or
+            # the next genuine change) starts the next attempt.
+            self._sort_refresh_pending = False
             if announce or self.feed is None:
                 self.status(
                     ("Showing stale stories. " if self.feed else "")
                     + str(exc)
-                    + " Press r to retry.",
+                    + " Switch sort or time window to retry.",
                     error=True,
                 )
                 self.show_failure(str(exc))
+            else:
+                # No automatic retry is scheduled (the minute poll only
+                # refetches on a newer version or changed counts): name
+                # the controls that actually start the next attempt.
+                self.status(
+                    f"Background refresh failed ({exc}). "
+                    "Switch sort or time window to retry.",
+                    error=True,
+                )
             return
-        if api is not self.api:
+        if api is not self.api or serial != self._feed_serial:
+            # Profile replaced, or a newer feed request is already in flight
+            # (or landed): an older reply must never replace a newer deck.
             return
         if counts_version is not None:
             self.counts_version = counts_version
@@ -1545,6 +1745,7 @@ class Reader(App[None]):
             # only as a cache entry of the version on screen.
             if self.feed is not None and feed.version == self.feed.version:
                 self.feeds[window] = feed
+            self._finish_sort_refresh()
             return
         self.forget_outgrown_summaries(feed)
         self.set_feed(feed)
@@ -1562,6 +1763,14 @@ class Reader(App[None]):
         if announce and not feed.ready:
             self.status("Showing available stories while ranking updates…")
         self.schedule_window_prefetch()
+        self._finish_sort_refresh()
+        selected = self.selected()
+        if selected is not None and selected.id == self.summary_story_id:
+            # The open summary survived the refresh: check whether live
+            # discussion outgrew its known snapshot (never forces and never
+            # prompts without a known baseline; piggybacks this completion,
+            # no extra timers).
+            self.refresh_story_stats(selected.id, self.selection_serial)
 
     def forget_outgrown_summaries(self, feed: Feed) -> None:
         """Drop kept summaries of stories that gained comments, except the
@@ -1575,6 +1784,7 @@ class Reader(App[None]):
                 story.id, story.comments or 0
             ):
                 self.summaries.pop(story.id, None)
+                self._summary_snapshots.pop(story.id, None)
 
     def patch_counts(self, story_id: int, points: int, comments: int | None) -> None:
         """Show the counts a summary reply carried; the feed's may be older."""
@@ -1726,30 +1936,192 @@ class Reader(App[None]):
         select.value = self.SORT_CYCLE[(index + delta) % len(self.SORT_CYCLE)]
 
     def action_refresh(self) -> None:
-        self.reload(manual=True)
+        """Regenerate only the selected summary, then background-check its
+        live points/comments. The feed, other summaries and hidden stories
+        are left alone; repeated presses join the same forced request."""
+        story = self.selected()
+        if story is None or self.api is None or self.setting_up or self.closing:
+            return
+        self.help_open = False
+        self.selection_serial += 1
+        # The old text stays on screen while a forced request regenerates it.
+        self.summary_story_id = story.id
+        # Declare the forced intent synchronously: a stats result landing in
+        # the load's debounce window must defer to it, not prompt over it.
+        self._forced_intent[story.id] = self.selection_serial
+        self.load_summary(story.id, self.selection_serial, force_refresh=True)
+        self.refresh_story_stats(story.id, self.selection_serial)
 
-    def reload(self, *, manual: bool) -> None:
-        """Reload the feed; cached summaries go (a new deck may carry new text).
+    def reload(self) -> None:
+        """Reload the feed after the poller found a newer deck.
 
-        The poller's refresh leaves the open story, its summary and scroll
-        alone. A manual r also regenerates the selected summary and restores
-        stories hidden this session.
+        The open story, its summary and scroll stay put; only the selected
+        window refetches, without touching other summaries.
         """
         story = self.selected()
         keep = story.id if story else None
-        # The old text stays on screen while a forced request regenerates it.
-        self.reset_summaries(keep_text=keep, keep_request=None if manual else keep)
-        if manual:
-            self.help_open = False
-            self.unavailable.clear()
-            self.prefetch_cooldown_until = 0.0
-            self.selection_serial += 1
-            self.summary_story_id = keep
-            if story is None:
-                self.workers.cancel_group(self, "summary")
-            else:
-                self.load_summary(story.id, self.selection_serial, force_refresh=True)
-        self.refresh_feed(announce=manual)
+        self.reset_summaries(keep_text=keep, keep_request=keep)
+        self.refresh_feed(announce=False)
+
+    def _stats_check_running(self, story_id: int) -> bool:
+        task = self._stats_requests.get(story_id)
+        return task is not None and not task.done()
+
+    def refresh_story_stats(self, story_id: int, serial: int) -> None:
+        """Background live points/comments check for one story (never generates).
+
+        Coalesced per story: a repeat while one is in flight joins it. No
+        timers, no retries; teardown cancels the task via on_unmount.
+        """
+        if self.api is None or self.feed is None or self.setting_up or self.closing:
+            return
+        if self._stats_check_running(story_id):
+            return
+        self._stats_serials[story_id] = serial
+        task = asyncio.create_task(self._fetch_story_stats(story_id, serial))
+        self._stats_requests[story_id] = task
+
+        def done(task: asyncio.Task[None]) -> None:
+            if self._stats_requests.get(story_id) is task:
+                del self._stats_requests[story_id]
+            if not task.cancelled():
+                task.exception()  # Callers handle it; none may be left.
+
+        task.add_done_callback(done)
+
+    async def _fetch_story_stats(self, story_id: int, serial: int) -> None:
+        api = self.api
+        if api is None:
+            return
+        try:
+            stats = await api.story_stats(story_id)
+        except InvalidProfile as exc:
+            # A background check never yanks the reader into setup; anything
+            # that needs the profile surfaces it on its own path.
+            if api is self.api and not self.closing and self.query("#headlines"):
+                selected = self.selected()
+                if selected is not None and selected.id == story_id:
+                    self.status(str(exc))
+            return
+        except APIError as exc:
+            if (
+                api is self.api
+                and not self.closing
+                and serial == self.selection_serial
+                and self.query("#headlines")
+            ):
+                selected = self.selected()
+                if selected is not None and selected.id == story_id:
+                    self.status(f"Live stats unavailable ({exc}). Kept stored counts.")
+            return
+        if api is not self.api or self.feed is None or self.closing or self.setting_up:
+            return
+        story = next((s for s in self.feed.stories if s.id == story_id), None)
+        points = (
+            stats.points
+            if stats.points_live and stats.points is not None
+            else (story.points if story is not None else 0)
+        )
+        comments = (
+            stats.comments
+            if stats.comments_live
+            else (story.comments if story is not None else 0)
+        )
+        if stats.comments_live or stats.points_live:
+            self.patch_counts(story_id, points, comments)
+        elif (
+            stats.reason in ("probe_failed", "probe_disabled")
+            and serial == self.selection_serial
+            and self.query("#headlines")
+            and (selected := self.selected()) is not None
+            and selected.id == story_id
+        ):
+            # Failed live check: numbers stay exactly as shown, with an
+            # honest note instead of a silent live claim. Stored sources
+            # (unsupported_source) stay quiet: their counts already match.
+            self.status("Live stats unavailable; showing stored counts.")
+            return
+        if stats.comments_live:
+            self._maybe_offer_regen(story_id, stats.comments)
+
+    def _forced_regen_running(self, story_id: int) -> bool:
+        task = self.summary_requests.get(story_id)
+        return task is not None and not task.done() and story_id in self._forced_tasks
+
+    def _maybe_offer_regen(self, story_id: int, live_comments: int) -> bool:
+        """Offer a one-time regeneration when live discussion outgrew the
+        known summary snapshot. Returns whether the prompt was shown."""
+        if (
+            self._stats_modal_open
+            or self.setting_up
+            or self.closing
+            or self.help_open
+            or not self.query("#headlines")
+        ):
+            return False
+        selected = self.selected()
+        if selected is None or selected.id != story_id:
+            # Another story's stats may update its cached row, but nothing
+            # ever prompts over the story being read.
+            return False
+        if self._stats_serials.get(story_id) != self.selection_serial:
+            # Stale check from before the latest navigation: counts were
+            # still applied above, but the prompt number may be outdated.
+            return False
+        snapshot = self._summary_snapshots.get(story_id)
+        if snapshot is None or live_comments <= snapshot:
+            return False
+        if live_comments <= self._stats_offered.get(story_id, snapshot):
+            # Already offered at this count (a decline); only renewed growth
+            # past the offered count prompts again.
+            return False
+        if self._forced_regen_running(story_id):
+            # r's regeneration will cover this: compare against its returned
+            # snapshot when it lands instead of prompting redundantly now.
+            self._stats_pending_live[story_id] = live_comments
+            return False
+        intent = self._forced_intent.get(story_id)
+        if intent is not None:
+            if intent == self.selection_serial:
+                # Declared but not yet started (the forced load still sleeps
+                # its debounce): defer exactly like a running regeneration.
+                self._stats_pending_live[story_id] = live_comments
+                return False
+            self._forced_intent.pop(story_id, None)  # obsolete declaration
+        self._stats_offered[story_id] = live_comments
+        self._stats_modal_open = True
+        self._stats_modal_story = story_id
+        self._stats_modal_api = self.api
+        self.push_screen(
+            StatsPrompt(
+                title=selected.title,
+                old_comments=snapshot,
+                new_comments=live_comments,
+            ),
+            self._on_stats_prompt,
+        )
+        return True
+
+    def _on_stats_prompt(self, result: str | None) -> None:
+        """Answer the regeneration offer: only "regen" spends, revalidated."""
+        self._stats_modal_open = False
+        story_id = self._stats_modal_story
+        api = self._stats_modal_api
+        self._stats_modal_story = None
+        self._stats_modal_api = None
+        if result != "regen" or story_id is None:
+            return
+        if api is None or self.api is not api:
+            self.status("Profile changed; regeneration skipped.")
+            return
+        selected = self.selected() if self.query("#headlines") else None
+        if selected is None or selected.id != story_id:
+            self.status("Story changed; regeneration skipped.")
+            return
+        self.selection_serial += 1
+        self.summary_story_id = story_id
+        self._forced_intent[story_id] = self.selection_serial
+        self.load_summary(story_id, self.selection_serial, force_refresh=True)
 
     def action_move(self, delta: int) -> None:
         """Next/previous story, in the list and in zoom alike."""
@@ -2115,7 +2487,7 @@ class Reader(App[None]):
             "- `o` / `c`: open article / comments\n"
             "- `y`: copy comments link (article link if none)\n"
             "- `a`: dig deeper: Claude Code in a tmux pane beside this one\n"
-            "- `r`: refresh and regenerate selected summary\n"
+            "- `r`: regenerate the selected summary and check its live stats\n"
             "- `b`: badge legend\n"
             "- `?`: this help\n"
             "- `q`: quit\n"
@@ -2129,5 +2501,7 @@ class Reader(App[None]):
         self.selection_serial += 1
         self.workers.cancel_all()
         self.cancel_summary_requests()
+        for task in self._stats_requests.values():
+            task.cancel()
         if self.api:
             await self.api.close()

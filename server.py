@@ -1637,22 +1637,35 @@ async def _prefetch_tldrs_for_ranked(
             return False
         if _is_unfollowed_pointer(story):
             story = await _follow_pointer_thread(db, story)
+            if story is None:
+                return False
 
-        title = story.title
-        self_text = story.self_text or ""
-        top_comments = story.top_comments or ""
-        article_body = story.article_body or ""
+        def _inputs(
+            candidate: Story,
+        ) -> tuple[str, str, str, str, str] | None:
+            title = candidate.title
+            self_text = candidate.self_text or ""
+            top_comments = candidate.top_comments or ""
+            article_body = candidate.article_body or ""
+            if not (self_text or top_comments or article_body):
+                return None
+            return (
+                title,
+                self_text,
+                top_comments,
+                article_body,
+                _tldr_cache_key(
+                    title=title,
+                    self_text=self_text,
+                    top_comments=top_comments,
+                    article_body=article_body,
+                ),
+            )
 
-        if not (self_text or top_comments or article_body):
+        prepared = _inputs(story)
+        if prepared is None:
             return False
-
-        cache_key = _tldr_cache_key(
-            title=title,
-            self_text=self_text,
-            top_comments=top_comments,
-            article_body=article_body,
-        )
-        if db.get_tldr_cache(story_id, cache_key):
+        if db.get_tldr_cache(story_id, prepared[4]):
             return False
 
         # Stagger LLM starts so the burst doesn't hit free-tier
@@ -1665,18 +1678,38 @@ async def _prefetch_tldrs_for_ranked(
         async with sem:
             # A tap generating this story right now covers it; while this
             # one runs, taps wait for it instead of starting their own.
+            # Shared key: ordinary work never starts while a forced flight
+            # (or any flight) exists.
             flight = Handler._tldr_flights.try_lead(story_id)
             if flight is None:
                 return False
             reply: TldrReply | None = None
             try:
+                # Re-read after leading: a forced tap may have cached fresher
+                # content between capture and lead (stagger/semaphore waits).
+                # Never regenerate from stale input over a fresh row.
+                current = db.get_story(story_id)
+                if current is None:
+                    return False
+                refreshed = _inputs(current)
+                if refreshed is None:
+                    return False
+                if db.get_tldr_cache(story_id, refreshed[4]):
+                    return False
+                title, self_text, top_comments, article_body, cache_key = refreshed
                 result = await generate_detailed_tldr(
                     title,
                     self_text=self_text,
                     top_comments=top_comments,
                     article_body=article_body,
                 )
-                cached = _maybe_cache_tldr(db, story_id, cache_key, result)
+                cached = _maybe_cache_tldr(
+                    db,
+                    story_id,
+                    cache_key,
+                    result,
+                    source_comments=current.comment_count_at_fetch,
+                )
                 reply = _tldr_result_reply(db, story_id, result)
                 return cached
             finally:
@@ -1826,7 +1859,11 @@ class Handler:
     # contend for the DB pool with warms and regen.
     _tldr_generations = 0
     _tldr_generations_guard = threading.Lock()
-    # Summaries being generated, by story: taps and the warm prefetch share one.
+    # Summaries being generated, by story: taps and the warm prefetch share
+    # one flight, so concurrent work never spends twice. Freshness is bound
+    # to the flight object itself (Flight.forced, bound at creation): a
+    # forced refresh never joins a non-forced flight as satisfaction, and
+    # ordinary work never starts while a forced flight exists (shared key).
     _tldr_flights: SingleFlight[int, TldrReply] = SingleFlight()
 
     @classmethod
@@ -2881,16 +2918,28 @@ def _rate_limited_reply(message: str, retry_after_seconds: int) -> TldrReply:
 
 
 def _cached_tldr_reply(
-    cached_tldr: str, story_id: int, cache_key: str, event: str
+    cached_tldr: str,
+    story_id: int,
+    cache_key: str,
+    event: str,
+    snapshot: int | None = None,
 ) -> TldrReply:
-    """Log + serve an exact-key cache hit (early or post-enrich)."""
+    """Log + serve an exact-key cache hit (early or post-enrich).
+
+    *snapshot* is the generation-time source snapshot bound to this exact
+    cached text (None = legacy/unknown, never advertised as current). It is
+    included only when known so older exact-payload contracts keep passing.
+    """
     logging.info(
         "tldr_detail story_id=%s result=%s cache_key=%s",
         story_id,
         event,
         cache_key[:12],
     )
-    return TldrReply({"ok": True, "tldr": cached_tldr, "cached": True})
+    payload: dict[str, object] = {"ok": True, "tldr": cached_tldr, "cached": True}
+    if snapshot is not None:
+        payload["comments_summarized"] = snapshot
+    return TldrReply(payload)
 
 
 def _stale_tldr_fallback(db: Database, story_id: int, reason: str) -> TldrReply | None:
@@ -2963,10 +3012,19 @@ def _tldr_result_reply(
 
 
 def _maybe_cache_tldr(
-    db: Database, story_id: int, cache_key: str, result: TldrResult
+    db: Database,
+    story_id: int,
+    cache_key: str,
+    result: TldrResult,
+    source_comments: int | None = None,
 ) -> bool:
     """Persist a generated TLDR unless it's a salvaged half (True=written);
-    caching a half would evict the story's complete TLDR (one row/story)."""
+    caching a half would evict the story's complete TLDR (one row/story).
+
+    *source_comments* binds the generation's source snapshot to the cached
+    text; callers pass the just-hydrated story's fetched count, never a
+    re-read of the mutable row.
+    """
     if result.kind != "ok" or not result.tldr.strip() or not result.cacheable:
         logging.warning(
             "tldr_detail story_id=%s result=partial_not_cached cache_key=%s",
@@ -2974,7 +3032,7 @@ def _maybe_cache_tldr(
             cache_key[:12],
         )
         return False
-    db.upsert_tldr_cache(story_id, cache_key, result.tldr)
+    db.upsert_tldr_cache(story_id, cache_key, result.tldr, source_comments)
     return True
 
 
@@ -3045,7 +3103,10 @@ def _generate_tldr_reply(
         needs_empty_fetch
         or needs_active_refresh
         or tap_probed_growth
-        or (force_refresh and is_hn_source(story.source) and bool(story.top_comments))
+        # A forced refresh is an explicit freshness request: attempt HN
+        # hydration even when stored counts are zero. Hydration failure keeps
+        # the old content and must not be reported as a fresh snapshot.
+        or (force_refresh and is_hn_source(story.source))
     )
     src_kind: str | None = None
     if story.url and (not story.self_text or not story.top_comments):
@@ -3073,11 +3134,16 @@ def _generate_tldr_reply(
         from pipeline import fetch_story
 
         async with httpx.AsyncClient(timeout=15.0) as client:
+            # Strict on explicit freshness requests: a returned Story is
+            # verified-fresh evidence of a live fetch, while None marks any
+            # upstream failure (HTTP error, malformed body, no content,
+            # exception) without touching the cached row.
             return await fetch_story(
                 client,
                 story.id,
                 runtime.db,
                 force=needs_active_refresh or tap_probed_growth or force_refresh,
+                strict=force_refresh and is_hn_source(story.source),
             )
 
     async def _src_lane() -> RedditRssContext | LessWrongContext | None:
@@ -3171,6 +3237,27 @@ def _generate_tldr_reply(
     elif isinstance(hn_updated, Exception):
         logging.error("Failed to dynamically fetch comments for TLDR: %r", hn_updated)
 
+    if (
+        force_refresh
+        and is_hn_source(story.source)
+        and not isinstance(hn_updated, Story)
+    ):
+        # Definitive hydration failure on an explicit freshness request:
+        # never spend the LLM budget on known-stale input nor claim fresh
+        # coverage. Serve prior text as stale (unknown snapshot) or fail
+        # retryably. A Story result proceeds below with its own input and
+        # the snapshot bound to that input.
+        fallback = _stale_tldr_fallback(runtime.db, story.id, "forced_hydration_failed")
+        if fallback is not None:
+            return fallback
+        return TldrReply(
+            {
+                "error": "Could not refresh the discussion. Please try again later.",
+                "retryable": True,
+            },
+            HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+
     article_body = story.article_body or article_body
 
     # Merge the concurrently fetched source context (same semantics as
@@ -3231,10 +3318,14 @@ def _generate_tldr_reply(
         top_comments=story.top_comments or "",
         article_body=article_body or "",
     )
-    cached_tldr = runtime.db.get_tldr_cache(story.id, cache_key)
-    if cached_tldr and not force_refresh:
+    cached_record = runtime.db.get_tldr_cache_record(story.id, cache_key)
+    if cached_record is not None and not force_refresh:
         return _cached_tldr_reply(
-            cached_tldr, story.id, cache_key, "post_enrich_cache_hit"
+            cached_record.text,
+            story.id,
+            cache_key,
+            "post_enrich_cache_hit",
+            cached_record.source_comments,
         )
 
     t_llm = time.perf_counter()
@@ -3266,7 +3357,16 @@ def _generate_tldr_reply(
         return _tldr_result_reply(runtime.db, story.id, result)
     if result.kind == "no_content":
         return _tldr_result_reply(runtime.db, story.id, result)
-    _maybe_cache_tldr(runtime.db, story.id, cache_key, result)
+    # Bind the source snapshot the generation actually summarized: the
+    # just-hydrated fetched count, not a later re-read of the mutable row.
+    # A failed lane leaves the old content and its old count together.
+    _maybe_cache_tldr(
+        runtime.db,
+        story.id,
+        cache_key,
+        result,
+        source_comments=story.comment_count_at_fetch,
+    )
     logging.info(
         "tldr_detail story_id=%s result=generated cache_key=%s "
         "tldr_total_ms=%.0f hydrate_ms=%.0f(hnsrc=%.0f/%.0f/art=%.0f) llm_ms=%.0f "
@@ -3292,9 +3392,80 @@ def _generate_tldr_reply(
         {
             "comment_count_live": live_comment_count,
             "comment_count_summarized": story.comment_count_at_fetch,
+            "comments_summarized": story.comment_count_at_fetch,
             "points": stored.score if stored else story.score,
             "comments": stored.comment_count if stored else story.comment_count,
         },
+    )
+
+
+def _handle_flask_story_stats(runtime: type[Handler]) -> Response:
+    """Live points/comments for one story, without touching generation.
+
+    HN sources get one bounded Firebase check. Anything else (RSS, Reddit,
+    blogs) is served stored counts and never sent to Firebase, so archive
+    Reddit is reported stored, never live. Provenance is per field: a live
+    check that returns comments but no score reports live comments with
+    stored points, never a blended "live". Read-only: no hydration, LLM
+    call, ranking, profile creation or story writes.
+    """
+    raw = request.args.get("story_id", "")
+    try:
+        story_id = int(raw)
+    except (TypeError, ValueError):
+        return _flask_json_response(
+            {"error": "story_id must be an integer"}, status=HTTPStatus.BAD_REQUEST
+        )
+    story = runtime.db.get_story(story_id)
+    if story is None:
+        return _flask_json_response(
+            {"error": "Story not found in database"}, status=HTTPStatus.NOT_FOUND
+        )
+    stored_points = story.score
+    stored_comments = story.comment_count or 0
+
+    def stored_reply(reason: str) -> Response:
+        return _flask_json_response(
+            {
+                "ok": True,
+                "story_id": story.id,
+                "points": stored_points,
+                "points_live": False,
+                "comments": stored_comments,
+                "comments_live": False,
+                "reason": reason,
+            }
+        )
+
+    if not is_hn_source(story.source):
+        return stored_reply("unsupported_source")
+    timeout = runtime.config.tldr_tap_probe_timeout_seconds
+    if timeout <= 0:
+        return stored_reply("probe_disabled")
+    from pipeline import _probe_live_items
+
+    try:
+        items = asyncio.run(_probe_live_items([story], timeout))
+    except Exception:
+        logging.exception("story_stats story_id=%s probe failed", story.id)
+        items = {}
+    live = items.get(story.id)
+    if (
+        live is None
+        or live.descendants < 0
+        or (live.score is not None and live.score < 0)
+    ):
+        return stored_reply("probe_failed")
+    return _flask_json_response(
+        {
+            "ok": True,
+            "story_id": story.id,
+            "points": live.score if live.score is not None else stored_points,
+            "points_live": live.score is not None,
+            "comments": live.descendants,
+            "comments_live": True,
+            "reason": "live_check",
+        }
     )
 
 
@@ -3354,7 +3525,8 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             top_comments=story.top_comments or "",
             article_body=article_body or "",
         )
-        cached_tldr = runtime.db.get_tldr_cache(story.id, cache_key)
+        cached_record = runtime.db.get_tldr_cache_record(story.id, cache_key)
+        cached_tldr = cached_record.text if cached_record is not None else None
         # Tap-time probe: a young HN thread that would otherwise serve cached
         # gets one live-count check first; confirmed growth falls through to
         # hydration below instead of serving stale. Miss/failure serves cached.
@@ -3372,14 +3544,18 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             if tap_probed_growth:
                 live_comment_count = story.comment_count
         if (
-            cached_tldr
+            cached_record is not None
             and not needs_active_refresh
             and not needs_empty_fetch
             and not force_refresh
             and not tap_probed_growth
         ):
             return _cached_tldr_reply(
-                cached_tldr, story.id, cache_key, "cache_hit"
+                cached_record.text,
+                story.id,
+                cache_key,
+                "cache_hit",
+                cached_record.source_comments,
             ).response()
 
         retry_after = llm_limiter.retry_after_seconds
@@ -3416,16 +3592,48 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
 
         # One generation per story: a request for a story already being
         # generated (another tap, the TUI, the warm prefetch) waits for that
-        # result instead of spending a slot, quota and an LLM call of its own.
-        flight, leading = runtime._tldr_flights.join_or_lead(story.id)
+        # result instead of spending a slot, quota and an LLM call of its
+        # own — unless it asked for a forced refresh, which a non-forced
+        # flight cannot satisfy. Freshness is read off the joined flight
+        # object itself (atomic with the table): a forced joiner of a
+        # non-forced flight waits once, then leads exactly one bounded fresh
+        # follow-up, coalesced with other forced callers through the same
+        # join. A forced joiner of a forced-led flight just waits.
+        flight, leading = runtime._tldr_flights.join_or_lead(
+            story.id, forced=force_refresh
+        )
         if not leading:
-            reply = flight.wait(TLDR_JOIN_TIMEOUT_SECONDS)
+            # Freshness comes off the captured flight itself: a later
+            # lookup of the key could already see a newer flight.
+            joined = flight
+            joined_forced = joined.forced
+            reply = joined.wait(TLDR_JOIN_TIMEOUT_SECONDS)
             logging.info(
-                "tldr_detail story_id=%s result=joined finished=%s",
+                "tldr_detail story_id=%s result=joined finished=%s forced_led=%s",
                 story.id,
                 reply is not None,
+                joined_forced,
             )
-            return (reply or _UNFINISHED_TLDR_REPLY).response()
+            if force_refresh and not joined_forced:
+                flight, leading = runtime._tldr_flights.followup_or_lead(
+                    joined, story.id
+                )
+                if not leading and not flight.forced:
+                    # Our own ordinary is still running after a timed-out
+                    # wait, or a newer ordinary now holds the key: never
+                    # start parallel work, report unfinished instead of a
+                    # stale success.
+                    return _UNFINISHED_TLDR_REPLY.response()
+                if not leading:
+                    follow = flight.wait(TLDR_JOIN_TIMEOUT_SECONDS)
+                    logging.info(
+                        "tldr_detail story_id=%s result=followup finished=%s",
+                        story.id,
+                        follow is not None,
+                    )
+                    return (follow or _UNFINISHED_TLDR_REPLY).response()
+            else:
+                return (reply or _UNFINISHED_TLDR_REPLY).response()
         reply = None
         try:
             reply = _generate_tldr_reply(
@@ -3652,14 +3860,27 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
             )
             cached = None
         else:
-            cached = runtime.db.get_tldr_cache(story_id, key)
+            cached = runtime.db.get_tldr_cache_record(story_id, key)
         response = (
-            _cached_tldr_reply(cached, story_id, key, "prefetch_cache_hit").response()
-            if cached
+            _cached_tldr_reply(
+                cached.text,
+                story_id,
+                key,
+                "prefetch_cache_hit",
+                cached.source_comments,
+            ).response()
+            if cached is not None
             else Response(status=204)
         )
         response.headers["Cache-Control"] = "private, no-store"
         return response
+
+    @app.get("/api/story-stats")
+    def story_stats() -> ResponseReturnValue:
+        user = _flask_user(runtime)
+        if not user:
+            return _flask_json_response({"error": "No session"}, status=401)
+        return _handle_flask_story_stats(runtime)
 
     @app.route("/api/tldr-detail", methods=["POST"], provide_automatic_options=False)
     def tldr_detail() -> ResponseReturnValue:

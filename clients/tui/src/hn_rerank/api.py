@@ -60,6 +60,26 @@ class Summary:
     # hydration can move them past what the feed showed.
     points: int | None = None
     comments: int | None = None
+    # Source descendants the summarized text was built from, when the server
+    # knows it (None = legacy/unknown: never proof of unseen comments).
+    comments_summarized: int | None = None
+
+
+@dataclass(frozen=True)
+class StoryStats:
+    """One story's points/comments with per-field provenance.
+
+    A live check that returns comments but no score reports live comments
+    with stored points — never a blended "live". Only live fields may
+    update the display or justify a regeneration prompt.
+    """
+
+    story_id: int
+    points: int | None
+    points_live: bool
+    comments: int
+    comments_live: bool
+    reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -284,13 +304,19 @@ class API:
             delay = response.headers.get("Retry-After", "a few")
             delay = delay if delay.isdigit() else "a few"
             raise TransientError(f"Rate limited. Try again in {delay} seconds.")
+        if response.status_code == 503:
+            # Retryable generation failures (busy join, forced hydration
+            # failure): transient by contract, so the reader keeps the
+            # current story instead of hiding it.
+            raise TransientError("Service unavailable (503). Please try again.")
         if response.is_redirect:
             raise APIError(
                 "Server redirected the request. Check the server URL and deployment prefix."
             )
         if response.is_error:
             raise APIError(
-                f"Server returned {response.status_code}. Press r to retry reading."
+                f"Server returned {response.status_code}. "
+                "Check the connection and try again."
             )
         return response
 
@@ -340,6 +366,7 @@ class API:
             return Summary(
                 terminal_safe(value),
                 provisional=data.get("stale") is True or data.get("retryable") is True,
+                comments_summarized=_count(data.get("comments_summarized")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise APIError("Invalid cached summary.") from exc
@@ -362,11 +389,38 @@ class API:
                 empty=data.get("empty") is True,
                 points=_count(data.get("points")),
                 comments=_count(data.get("comments")),
+                comments_summarized=_count(data.get("comments_summarized")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise APIError(
                 "Summary unavailable. Select another story or refresh."
             ) from exc
+
+    async def story_stats(self, story_id: int) -> StoryStats:
+        """Live-or-stored points/comments for one story (never generates)."""
+        response = await self.request("GET", f"api/story-stats?story_id={story_id}")
+        try:
+            data = response.json()
+            points = _count(data.get("points"))
+            points_live = data.get("points_live")
+            comments = data.get("comments")
+            comments_live = data.get("comments_live")
+            reason = data.get("reason", "")
+            if (
+                data.get("ok") is not True
+                or (data.get("points") is not None and points is None)
+                or type(comments) is not int
+                or comments < 0
+                or type(points_live) is not bool
+                or type(comments_live) is not bool
+                or not isinstance(reason, str)
+            ):
+                raise ValueError("Invalid story stats")
+            return StoryStats(
+                story_id, points, points_live, comments, comments_live, reason
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise APIError("Invalid story stats.") from exc
 
     async def impression(self, event: Impression) -> None:
         await self.request("POST", "api/interaction", json={"events": [asdict(event)]})

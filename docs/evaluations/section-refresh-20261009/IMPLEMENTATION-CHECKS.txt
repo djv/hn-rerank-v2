@@ -1,0 +1,78 @@
+Section refresh / selected-summary r / live stats implementation
+Verified 2026-10-09 19:41 UTC; saved under ss, not deployed.
+
+Source and isolation
+- Laptop baseline HEAD: 4e946e5314eec5b7032afed01f481320d8700c34.
+- Final VPS worktree: /tmp/hn-section-refresh-verified-20261009,
+  detached at the same HEAD, then overlaid with the feature changes.
+  Created from already available VPS Git objects; no live checkout changed.
+- server/database/single_flight imports resolve inside that worktree.
+  TUI app/API imports resolve to its clients/tui/src/hn_rerank directory.
+- SOURCE-SHA256.txt covers the 17 changed Python source/test files. A fresh
+  remote sha256sum exactly matched the laptop manifest after final tests.
+- Reused backend environment /tmp/hn-section-refresh-impl/.venv and TUI
+  environment /tmp/hn-save-20261009-sYcAQL/.venv read-only via uv run
+  --active --no-project. No sync or schema migration against the live DB.
+- Thread limits OMP_NUM_THREADS/OPENBLAS_NUM_THREADS/MKL_NUM_THREADS=1.
+  Before full checks: VPS available memory ~5 GiB; load 0.10/0.39/0.58.
+  Final load 1.74/1.10/0.83. Changed-file transfers stayed far below 100 MB.
+
+Save verification
+- All 17 source/test hashes still match the full-suite manifest.
+- HEAD advanced from the gate baseline only through AGENTS-only commit 7706816;
+  no runtime/test change. Full isolated suite results below are reused.
+- Current Ruff, ty, touched-file format and whitespace checks pass.
+- User ss authorizes the feature/evidence commit and regular own-repo push;
+  independent result review and deployment remain separate.
+
+Final gates
+- Backend: pytest tests/ -n 4 -q -rs via uv run on isolated VPS worktree:
+  1,238 passed, 1 skipped, 1 warning, 26.38 s.
+  Skip: browser module needs playwright.sync_api, unavailable in this venv.
+  Warning: existing MLP convergence warning after its 300 iterations.
+  Log on VPS: /tmp/hn-section-refresh-backend-verified.log.
+- TUI: pytest tests/ -n 4 -q -rs -o asyncio_mode=auto via uv run on VPS:
+  195 passed, 1 skipped, 46.71 s.
+  Skip: Windows DACL verification on Linux.
+  Log on VPS: /tmp/hn-section-refresh-tui-verified.log.
+- Local lightweight final gates: repository Ruff check, ty check,
+  format check on all 17 changed Python files, git diff --check: clean.
+- Earlier focused TUI run: 20 passed before the additional retry-control test.
+  Initial failed runs exposed selector mount echoes, fixture request counters,
+  modal-mount timing, and contextual footer regressions. They are not treated
+  as passing evidence. The final full TUI gate includes their corrections.
+- Muse accidentally executed a local backend sweep despite the VPS direction;
+  its result is not the required isolated gate. Final claims above use the
+  agent-executed VPS checks and matching source hashes.
+
+Behavior covered
+- Production Reader keypresses, held GET starts, request coalescing/follow-up,
+  stale/profile/window/teardown guards, error preservation and retry controls.
+- r preserves feed order, other summary caches and hidden rows; forced requests
+  coalesce; live count updates do not automatically spend generation quota.
+- Known baseline growth prompts, decline deduplication/re-growth, accepted
+  selected-story generation, stale/unsupported checks and pending force intent.
+- Authenticated stats-only endpoint, supported HN IDs, strict Firebase identity,
+  types/counts including null/deleted/dead failures and per-field provenance.
+- Nullable generation snapshot persisted/read with cached text; legacy rows
+  remain unknown; generated replies retain the legacy field and expose the
+  new client's matching snapshot field.
+- Forced HN fetch bypasses zero-count shortcuts and uses strict failure handling;
+  failure preserves prior text as provisional or fails retryably without LLM.
+- Forced and ordinary server flights serialize; captured-flight freshness cannot
+  be confused with a newer key entry; delayed waiters share a completed fresh
+  follow-up. Deterministic production tests verify ordinary + one fresh call,
+  both forced responses and final cached text/snapshot.
+
+Remaining boundaries
+- Independent result review not yet approved/performed. The completed Codex
+  plan review is not an implementation review.
+  A result-review approval was offered; no answer arrived during an extended
+  wait. The unattended safe default left it unstarted, with approval pending.
+- No new backend deployment/service or running user TUI restart. No live feature
+  smoke, physical terminal rendering or natural upstream/provider behavior check.
+- Automated endpoint/provider checks are mocked and isolated. Historical native
+  terminal buffer inspection predates these feature changes.
+- Existing data/profile 151 trial/arms/T0/end and paused ranking research unchanged.
+- Historical comparison is archived; its prototype results are not production
+  regression evidence for the modified Reader.

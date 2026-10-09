@@ -108,7 +108,12 @@ async def fetch_thread_comments(client: httpx.AsyncClient, sid: int) -> str:
 
 
 async def fetch_story(
-    client: httpx.AsyncClient, sid: int, db: Database, *, force: bool = False
+    client: httpx.AsyncClient,
+    sid: int,
+    db: Database,
+    *,
+    force: bool = False,
+    strict: bool = False,
 ) -> Story | None:
     """Fetch a single story from Algolia, refreshing the DB row.
 
@@ -118,12 +123,18 @@ async def fetch_story(
     CH data may already be 1-24h stale. ``force=False`` (default) keeps the
     original cheap staleness check so routine callers (e.g. the empty-
     top_comments lazy fetch) don't cause extra Algolia traffic.
+
+    ``strict=True`` (forced server refresh only) additionally turns every
+    failure path into ``None`` instead of the cached row, so a returned
+    Story is always verified-fresh evidence of a live fetch. Default
+    ``False`` preserves all existing callers.
     """
     story = db.get_story(sid)
     if story is not None:
         if story.text_content == "":
-            if story.title == "":
-                pass  # corrupted _empty_story, fall through to API re-fetch
+            if story.title == "" or strict:
+                pass  # corrupted _empty_story, or strict verification:
+                # fall through to the API re-fetch either way
             else:
                 return None
         if not force:
@@ -139,15 +150,15 @@ async def fetch_story(
     try:
         resp = await client.get(url)
         if resp.status_code != 200:
-            if story is None:
+            if story is None and not strict:
                 db.upsert_story(_empty_story(sid))
-            return story if story else None
+            return None if strict else (story if story else None)
 
         item = resp.json()
         if not item or item.get("type") != "story":
-            if story is None:
+            if story is None and not strict:
                 db.upsert_story(_empty_story(sid))
-            return story if story else None
+            return None if strict else (story if story else None)
 
         title = html.unescape(item.get("title", ""))
         story_url = item.get("url")
@@ -173,7 +184,7 @@ async def fetch_story(
         )
 
         if not text_content:
-            if story is None:
+            if story is None and not strict:
                 db.upsert_story(
                     Story(
                         id=sid,
@@ -185,7 +196,9 @@ async def fetch_story(
                         source="hn",
                     )
                 )
-            return story if story else None
+            # No summarizable content came back: without verified fresh input
+            # there is nothing to claim. Strict callers see the failure.
+            return None if strict else (story if story else None)
 
         source = story.source if story is not None else "hn"
         story = Story(
@@ -212,7 +225,7 @@ async def fetch_story(
         return db.get_story(sid)
     except Exception as e:
         logging.error("Error fetching story %s: %r", sid, e)
-        return story if story else None
+        return None if strict else (story if story else None)
 
 
 # Stories per CH fetch chunk in prewarm_top_stories. Keeps a single failed

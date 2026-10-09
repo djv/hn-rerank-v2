@@ -119,7 +119,7 @@ async def test_undo_restores_story_during_stale_refresh() -> None:
         fake.feed = replace(fake.feed, version=0, target_version=1, ready=False)
         app.action_undo()
         await pilot.pause(0.3)
-        app.reload(manual=False)  # the poller brings the stale deck
+        app.reload()  # the poller brings the stale deck
         await pilot.pause(0.3)
         assert app.feed is not None and not app.feed.ready
         selected = app.selected()
@@ -233,7 +233,7 @@ async def test_undo_puts_story_back_only_where_the_server_listed_it() -> None:
         )
         app.action_undo()
         await pilot.pause(0.3)
-        app.reload(manual=False)  # the poller brings the stale deck
+        app.reload()  # the poller brings the stale deck
         await pilot.pause(0.3)
         assert app.feed is not None and not app.feed.ready
         assert {k: v for k, v in app.feed.orders.items() if v} == original
