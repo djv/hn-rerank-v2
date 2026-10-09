@@ -10,9 +10,12 @@ on s/h/l, selected-summary-only r with a live stats check, and a story-specific
 regeneration choice when comments exceed a known summary snapshot. Codex plan
 review completed; verified corrections are incorporated in
 [PLAN.md](docs/evaluations/section-refresh-20261009/PLAN.md). Implementation and
-isolated validation are complete and saved under the user’s ss request.
-Independent result review was offered and remains unapproved; none was launched.
-Feature deployment, restart and live smoke remain separately authorized.
+isolated validation of the original change were saved under the user’s ss request.
+Two authorized independent Codex result reviews completed. The user selected
+all seven fixes; Muse implemented them with reproduced failures and regression
+coverage. Final matching-source VPS suites and local lint/type/format checks
+pass. The user authorized saving/pushing the fixes and deployment. Save is
+in progress; VPS deployment/restart and live smoke are the next authorized steps.
 
 Compare shortlist #2 (one joined logistic classifier, all features) and #4
 (same, no metadata) live against production through team-draft
@@ -22,6 +25,13 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- Seven review fixes complete: malformed strict hydration rejected before writes,
+  repeated-r intent consumed, stale feed replies rejected after vote/undo ack,
+  profile stats state reset, warm replies carry source snapshots, and both
+  misleading notices corrected. Queued sort refresh drains after a stale reply.
+  Final isolated VPS gates: backend 1,264 passed / 1 skipped; TUI 202 passed /
+  1 skipped. All executable-source/test/config/template hashes match this
+  checkout. Evidence: [seven-fix checks](docs/evaluations/section-refresh-20261009/SEVEN-FIXES-CHECKS.md).
 - Section refresh/r/stats feature implemented and saved. Final matching
   VPS source copy passed backend 1,238 / 1 skipped and TUI 195 / 1 skipped;
   Ruff, ty, 17 touched-file format checks and diff whitespace check clean.
@@ -140,8 +150,8 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   Ruff, touched-file format, and ty clean. Deployed 2026-10-09; scope above.
 
 ## Blocker
-No code/check blocker. Independent result review and feature deployment await
-authorization; live feature behavior remains unverified.
+No code/check blocker. Deployment and live feature behavior remain unverified
+pending the authorized rollout. No live DB/provider/trial changes made yet.
 
 ## Next step
 - AI ranking research: goal is a repeatable Muse advantage transferable into
@@ -161,11 +171,9 @@ authorization; live feature behavior remains unverified.
 - If requested, address the prioritized TUI review findings, starting with
   retryable summary errors and pending-vote quit behavior; physically check
   narrow/wide layout and controls. No broader implementation authorized yet.
-- If approved, run the offered independent result review of the completed
-  section/r/stats change, focusing on cache/API and concurrency behavior.
-  Then separately authorize deployment/restart and live feature smoke.
-  Source-checked plan corrections and validation evidence are saved in
-  docs/evaluations/section-refresh-20261009/.
+- Save/push the seven verified follow-up fixes, then perform the authorized
+  deployment/restart and live feature smoke. Both authorized result reviews
+  and final regression evidence are in docs/evaluations/section-refresh-20261009/.
 - Blank-body guard deployed; observe natural empty-response behavior.
   Substack's previously checked httpx 403 reproduced; urllib fallback returned
   full HTML. The historical empty-response cause remains unconfirmed.

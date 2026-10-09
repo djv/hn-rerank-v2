@@ -1,5 +1,67 @@
 # Worklog: hn-rewrite
 
+## 2026-10-09 — Seven-fix follow-up: strict identity + stranded sort follow-up (saved, deployment authorized)
+
+Follow-up to the seven-fix task (same authorization; root handles
+STATUS/FINDINGS, no commit/push/deploy/reviewer). (1) Strict hydration now
+requires a matching item identity: `_hydration_item_valid` takes
+`require_id`, typed `dict[str, object]`, and `fetch_story` passes
+`require_id=strict` — non-strict callers keep optional-id compatibility
+(present counts validated, never required; no invented `num_comments`
+presence). (2) `app.py:refresh_feed` drains a queued sort follow-up on the
+stale-serial discard (`_finish_sort_refresh`, at most one follow-up; no-op
+after profile reset since pending is cleared on connect). New regressions:
+strict missing/null/null-with-valid-objectID/wrong-string/mismatched-objectID
+rejected, int/string/objectID identity variants accepted, non-strict
+missing-id still hydrates; TUI covering-ready-v1 clears restored, lower-version
+restart lands on a later request, stale-reply-after-ack runs exactly one
+queued follow-up. VPS scratch red: 3 strict-identity + 1 stranded-follow-up
+failed pre-fix (wrong-id variants, valid variants, legacy compat, covering,
+restart already passed). Green with ported fixes (test files transferred
+whole — scratch copies matched pre-edit; runtime edits ported surgically and
+diff-verified identical): focused 25 backend + 7
+TUI passed. Final full gates on scratch, sequentially: backend
+`tests/ -n4 -q -rs` 1264 passed / 1 skipped (playwright absent) in 28.5s;
+TUI `tests/ -n4 -q -rs -o asyncio_mode=auto` 202 passed / 1 skipped
+(Windows DACL) in 52.3s. Logs `/tmp/hn-seven-final-backend.log`,
+`/tmp/hn-seven-final-tui.log` (VPS); SHA256 (scratch):
+enrichment 3a20626f…, app 28867a49…, server 21e5cda8…,
+test_strict_hydration 3774d158…, test_tldr_single_flight 27b19c0c1…,
+test_section_seven_fixes 74e79eba…. Laptop `ruff check`, touched format,
+`ty check` clean. Root verified all changed-file hashes and the complete
+executable-source/test/config/template manifest match laptop and scratch.
+The scratch's Git baseline is older, but its tested working files are exact.
+Live smoke, deployment and commit remain pending.
+
+## 2026-10-09 — Seven second-review fixes (saved, deployment authorized)
+
+Implemented all seven fixes from the section second review (2026-10-09) on
+the TUI/backend at 5129813, with red-first/green regression tests run in the
+isolated VPS scratch (tests-only transfer, then fixes transfer; no full
+suites per authorization, no deployment/live-DB/provider/network access).
+(1) `pipeline/enrichment.py`: `_hydration_item_valid` rejects
+malformed/mismatched Algolia items (identity, title, count types, children
+shape) before any write or generation; strict sees None, normal callers keep
+the cached row. (2) `app.py:summary_task`: a repeated r joining an
+already-started forced task consumes the declared intent (one paid request;
+the behind snapshot prompts instead of deferring forever). (3) `app.py:submit`:
+a vote/undo ack bumps `_feed_serial`, so a stale ready reply constructed at V
+can never replace the deck past the acknowledged V+1 target (restarts still
+replace via newer serials). (4) `app.py:connected`: cancels/resets
+profile-scoped stats tasks, serials, offered/pending, forced tasks/intents
+and modal state; old-api replies rejected, new profile checks promptly.
+(5) `server.py` warm prefetch: complete shared replies carry the captured
+snapshot plus legacy alias; halves stay snapshot-free. (6/7) copy: stats
+prompt reads "Discussion had N comments when summarized; M now", hide notice
+names reconnect (not r) as recovery. Tests: new
+`tests/test_strict_hydration.py` (15) and
+`clients/tui/tests/test_section_seven_fixes.py` (4), updated prefetch-join
+expectation + provisional case in `tests/test_tldr_single_flight.py`. VPS
+red: 12 backend + 4 TUI failed pre-fix; green with fixes: backend 23 passed,
+TUI 25 passed (incl. `test_sort_refresh.py`). Laptop `ruff check`, touched
+format and `ty check` clean. STATUS/FINDINGS, commits and full gates left to
+root.
+
 ## 2026-10-09 — Section auto-refresh, redefined r, stats-check prompt (saved, undeployed)
 
 Implemented the reviewed section-refresh plan (PLAN.md plus Codex corrections

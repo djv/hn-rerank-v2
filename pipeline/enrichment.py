@@ -92,6 +92,62 @@ def _empty_story(sid: int) -> Story:
     )
 
 
+def _hydration_item_valid(
+    item: dict[str, object], sid: int, *, require_id: bool = False
+) -> bool:
+    """Strict shape check for one Algolia item before any write or use.
+
+    The old gate (truthiness + ``type == "story"``) accepted a bare
+    ``{"type": "story"}``: defaults then replaced title/URL/score while a
+    preserved article body made the composed text nonempty, so strict
+    hydration returned a Story built from nothing and the server generated
+    from it. Reject mismatched identities, missing titles, wrongly typed
+    counts and non-list trees here; the caller treats a rejection exactly
+    like the other failure paths (None under strict, cached row kept
+    otherwise) without writing anything from this payload.
+
+    ``require_id=True`` (strict callers only) additionally rejects items
+    that carry no usable identity at all: a verified-fresh Story must come
+    from the requested item, not from a title-shaped payload of unknown
+    provenance. Legacy non-strict callers keep the lenient path so ordinary
+    fixtures without an id field still hydrate.
+    """
+    raw_id = item.get("id", item.get("objectID"))
+    if raw_id is None:
+        if require_id:
+            return False
+    elif isinstance(raw_id, bool):
+        return False
+    elif isinstance(raw_id, int):
+        if raw_id != sid:
+            return False
+    elif isinstance(raw_id, str):
+        try:
+            if int(raw_id) != sid:
+                return False
+        except ValueError:
+            return False
+    else:
+        return False
+    title = item.get("title", "")
+    if not isinstance(title, str) or not clean_text(title):
+        return False
+    for key in ("points", "num_comments", "created_at_i"):
+        value = item.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return False
+    children = item.get("children", [])
+    if children is not None and not isinstance(children, list):
+        return False
+    for key in ("story_text", "text", "url"):
+        value = item.get(key)
+        if value is not None and not isinstance(value, str):
+            return False
+    return True
+
+
 async def fetch_thread_comments(client: httpx.AsyncClient, sid: int) -> str:
     """Selected top comments of HN story *sid* from Algolia, without touching
     the DB; "" when the item is missing or the fetch fails."""
@@ -155,7 +211,11 @@ async def fetch_story(
             return None if strict else (story if story else None)
 
         item = resp.json()
-        if not item or item.get("type") != "story":
+        if (
+            not isinstance(item, dict)
+            or item.get("type") != "story"
+            or not _hydration_item_valid(item, sid, require_id=strict)
+        ):
             if story is None and not strict:
                 db.upsert_story(_empty_story(sid))
             return None if strict else (story if story else None)

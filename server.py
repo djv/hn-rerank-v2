@@ -1710,7 +1710,24 @@ async def _prefetch_tldrs_for_ranked(
                     result,
                     source_comments=current.comment_count_at_fetch,
                 )
-                reply = _tldr_result_reply(db, story_id, result)
+                if result.kind == "ok" and result.cacheable:
+                    # A complete generation: joiners share the leader's
+                    # exact reply, so bind the same captured snapshot the
+                    # cache row just stored (plus its legacy alias). Halves
+                    # and failures stay snapshot-free: provisional text
+                    # must not masquerade as known coverage.
+                    snapshot = current.comment_count_at_fetch
+                    reply = _tldr_result_reply(
+                        db,
+                        story_id,
+                        result,
+                        {
+                            "comment_count_summarized": snapshot,
+                            "comments_summarized": snapshot,
+                        },
+                    )
+                else:
+                    reply = _tldr_result_reply(db, story_id, result)
                 return cached
             finally:
                 Handler._tldr_flights.land(story_id, flight, reply)

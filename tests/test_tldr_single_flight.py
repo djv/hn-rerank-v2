@@ -457,5 +457,42 @@ def test_prefetch_and_taps_never_generate_the_same_story_twice(
     assert generated == [0, 1] and llm.calls == 1
     assert replies[-1] == (
         200,
-        {"ok": True, "tldr": "from the prefetch", "cached": False},
+        {
+            "ok": True,
+            "tldr": "from the prefetch",
+            "cached": False,
+            "comment_count_summarized": 0,
+            "comments_summarized": 0,
+        },
+    )
+
+
+def test_prefetch_join_of_provisional_half_carries_no_snapshot(
+    runtime: tuple[type[Handler], Database, User],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A salvaged half (uncacheable, served retryably) joins with unknown
+    provenance: no snapshot keys, so the client never treats it as coverage."""
+    handler, db, user = runtime
+    monkeypatch.setattr(Handler, "_tldr_flights", handler._tldr_flights)
+    monkeypatch.setattr(Handler, "db", db, raising=False)
+    flights = handler._tldr_flights
+    assert isinstance(flights, _CountedFlights)
+
+    db.upsert_story(replace(STORY, article_body=STORY.article_body + " Half."))
+    llm = _Llm(TldrResult(kind="ok", tldr="half text", cacheable=False))
+    monkeypatch.setattr(server, "generate_detailed_tldr", llm)
+    replies: list[Any] = []
+    generated: list[int] = []
+    prefetch = _prefetch(generated)
+    assert llm.started.wait(5.0)
+    tap = _tap(handler, user, replies)
+    assert flights.joined.acquire(timeout=5.0)
+    llm.release.set()
+    prefetch.join(5.0)
+    tap.join(5.0)
+    assert llm.calls == 1
+    assert replies[-1] == (
+        200,
+        {"ok": True, "tldr": "half text", "cached": False, "retryable": True},
     )

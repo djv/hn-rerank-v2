@@ -642,7 +642,7 @@ class StatsPrompt(ModalScreen[str]):
             yield Label("New discussion comments", id="stats-prompt-title")
             yield Static(Text(self._title), id="stats-prompt-message", markup=False)
             yield Static(
-                f"Summary covers {self._old_comments} comments; "
+                f"Discussion had {self._old_comments} comments when summarized; "
                 f"{self._new_comments} now. Regenerate with the fresh discussion?",
                 markup=False,
             )
@@ -1074,6 +1074,24 @@ class Reader(App[None]):
         self.history.clear()
         self.vote_views.clear()
         self.reset_summaries()
+        # Profile-scoped regeneration/stats state must not leak across
+        # reconnect: A's declined offer would suppress B's first check
+        # (same offered count), a held request of A's would make B's check
+        # return early, and a stale intent could defer B's prompt to a
+        # task that no longer exists. Old tasks carry their own api
+        # object, so anything still in flight is rejected on identity;
+        # cancel them outright so the new profile checks promptly.
+        for task in self._stats_requests.values():
+            task.cancel()
+        self._stats_requests.clear()
+        self._stats_offered.clear()
+        self._stats_pending_live.clear()
+        self._stats_serials.clear()
+        self._forced_tasks.clear()
+        self._forced_intent.clear()
+        self._stats_modal_open = False
+        self._stats_modal_story = None
+        self._stats_modal_api = None
         self.prefetch_cooldown_until = 0.0
         self.help_open = False
         self.summary_story_id = None
@@ -1422,7 +1440,7 @@ class Reader(App[None]):
         return summary
 
     def _hide_story(self, story_id: int, reason: str) -> None:
-        """Drop a story from the deck for this session; refresh restores."""
+        """Drop a story from the deck for this session; reconnect restores."""
         self.unavailable.add(story_id)
         current = [s.id for s in self.stories]
         try:
@@ -1430,7 +1448,10 @@ class Reader(App[None]):
         except (ValueError, IndexError):
             advance = next((sid for sid in reversed(current) if sid != story_id), None)
         self.rebuild(select_id=advance)
-        self.status(f"Skipped story {story_id} — {reason}. r restores hidden stories.")
+        self.status(
+            f"Skipped story {story_id} — {reason}. Hidden for this session; "
+            "reconnect to see it again."
+        )
 
     def prefetch_targets(self, depth: int) -> list[int]:
         """Upcoming stories, nearby history, and entry points into other sorts."""
@@ -1500,6 +1521,14 @@ class Reader(App[None]):
         task = self.summary_requests.get(story_id)
         if task is not None and not task.done():
             if not force or story_id in self._forced_tasks:
+                if force:
+                    # A repeated r joining an already-started forced task:
+                    # the declaration is now really in flight, so consume
+                    # it. Otherwise a stats result landing before completion
+                    # defers to the still-current intent, and the completed
+                    # summary's deferred comparison defers again — the
+                    # prompt never shows though the snapshot is behind.
+                    self._forced_intent.pop(story_id, None)
                 return task
             task.cancel()
         if task is not None:
@@ -1737,6 +1766,12 @@ class Reader(App[None]):
         if api is not self.api or serial != self._feed_serial:
             # Profile replaced, or a newer feed request is already in flight
             # (or landed): an older reply must never replace a newer deck.
+            # Still drain a queued sort follow-up: the reply that would have
+            # carried it was just discarded (e.g. a vote ack bumped the
+            # serial mid-flight), and without this the pending flag strands
+            # until the next genuine change. At most one follow-up issues;
+            # _finish_sort_refresh clears the flag before sending it.
+            self._finish_sort_refresh()
             return
         if counts_version is not None:
             self.counts_version = counts_version
@@ -2209,6 +2244,14 @@ class Reader(App[None]):
         if self.feed is not None and target > self.feed.version:
             # The poller loads the reranked deck once the server has it.
             self.set_feed(replace(self.feed, target_version=target, ready=False))
+            # This ack postdates every feed request issued so far: their
+            # replies (constructed at the old version) must never replace
+            # the deck now, or the acknowledged target and the undone rows
+            # held for it would be lost to a stale ready response. Later
+            # requests carry newer serials and still land; a restarted
+            # server's lower versions arrive on those, so restarts still
+            # replace.
+            self._feed_serial += 1
         self.status("Vote cleared." if action == "clear" else "Vote saved.")
 
     def restore_story(self, story: FeedStory) -> None:

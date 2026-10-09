@@ -3281,3 +3281,20 @@ The intervening committed change 7706816 touches only AGENTS.md. Reused backend
 and whitespace checks are clean. The user requested commit/cleanup via ss;
 this feature and its handoff/evidence are saved together. No additional reviewer,
 provider call, live migration, deployment or restart is authorized by that save.
+
+## 2026-10-09 — Seven section-refresh result-review corrections
+
+Two user-authorized independent Codex reviews completed for 5129813; actual
+reports saved under docs/evaluations/section-refresh-20261009/. The second
+qualified severity: three P2 fixes, one required copy correction, optional
+profile cleanup/warm metadata/hide hint. The user chose all seven. Muse fixed
+all seven; root also required strict matching identity and a queued-refresh
+regression. Failure cases reproduced before fixes on isolated VPS scratch.
+Final exact-working-source gates: backend 1264 passed / 1 skipped (Playwright
+absent), TUI 202 passed / 1 skipped (Windows DACL); local Ruff/ty/touched-format
+and whitespace clean. Root verified all changed hashes and complete executable
+source/test/config/template manifest against tested VPS files. Details and
+bounds: SEVEN-FIXES-CHECKS.md and SEVEN-FIXES-SOURCE-SHA256.txt in that folder.
+No deployment, live provider/DB, ranking research or trial changes; fixes remain
+uncommitted pending save. Original reviews concern the pre-fix commit, not a
+fresh independent approval of the resulting patch.
