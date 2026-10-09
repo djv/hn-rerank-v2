@@ -94,6 +94,14 @@
   Do not amend or force-push unless explicitly asked.
 - **Always update relevant documentation** (e.g., [ARCHITECTURE.md](ARCHITECTURE.md), [WORKLOG.md](WORKLOG.md)) after making code or behavior changes.
 
+## Standing user rules
+
+- Auto-commit: commit a change once it is verified (the verification protocol below passed; for runtime changes, the live smoke test too), without waiting for "commit this" (user 2026-07-06). Focused commits still apply; no amend or force-push.
+- `gh pr merge N --squash --delete-branch` run from a worktree fails locally ("'main' is already used by worktree"), but the merge itself succeeds on GitHub. Check `gh pr view N --json state,mergedAt`, delete a leftover remote branch with `git push origin --delete BRANCH`, then fast-forward the main checkout.
+- VPS: the embedding models and `.env` live in `/home/dev/hn-rewrite/shared/`, referenced by absolute paths in `pipeline/config.py` (`DEFAULT_ONNX_MODEL_DIR`, `DEFAULT_SIDE_EMBEDDING_MODEL_DIR`, `DEFAULT_ENV_PATH`), so worktrees need no symlinks. After changing those paths or `server.py:load_env()`, restart `hn_rewrite.service` and check `journalctl`.
+- VPS: the live service listens on port 8766 (`config.toml`), not the `Config.server_port` default 8765; use 8766 in live curls. Before answering "is X live?", compare `systemctl --user show hn_rewrite.service -p ExecMainStartTimestamp` with the latest commit time.
+- Feeds: never add AI model providers' or labs' own blogs (OpenAI, Anthropic, Google AI/DeepMind/Research, Mistral, Hugging Face) as RSS sources, even when vote data favors them; pick independent writers, aggregators and communities (user 2026-09-27).
+
 ## Running scripts
 
 - **Always run Python via `uv run python <script>.py`.** Never invoke `python` or `python3` directly — the project uses `uv` to manage the venv and dependencies. Direct invocations will use the system Python, missing project dependencies.
