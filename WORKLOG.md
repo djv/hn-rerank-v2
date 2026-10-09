@@ -1,5 +1,15 @@
 # Worklog: hn-rewrite
 
+## 2026-10-09 — Three-model general review and authorized extraction deploy
+
+Completed bounded read-only Muse, Codex and Claude Code reviews sequentially;
+saved actual responses and source-checked synthesis. No broad TUI fixes made.
+Deployed bf6e307 alone to VPS with rollback tag, config hash unchanged,
+existing-profile HTTP smoke, simulated blank guard, active service readback
+and quiet bounded journal scan. Preserved research artifacts and live trial;
+research remains paused. Physical UI/public latency and uncached live TLDR
+generation remain unverified. Details in FINDINGS and linked review evidence.
+
 ## 2026-10-09 — ss and complete pending WIP
 
 User explicitly included unrelated WIP. Finalized research archives/handoff,

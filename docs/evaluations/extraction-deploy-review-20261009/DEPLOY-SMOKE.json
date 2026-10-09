@@ -1,0 +1,49 @@
+{
+  "checked_utc": "2026-10-09T17:58:54.893059+00:00",
+  "http": [
+    {
+      "path": "/",
+      "status": 200,
+      "milliseconds": 1267.63
+    },
+    {
+      "path": "/api/feed?window=1w",
+      "status": 200,
+      "milliseconds": 1504.64
+    },
+    {
+      "path": "/api/ranking-ready?min_version=0",
+      "status": 200,
+      "milliseconds": 416.91
+    },
+    {
+      "path": "/api/tldr-cache/50019741",
+      "status": 204,
+      "milliseconds": 3.25
+    },
+    {
+      "path": "/api/tldr-cache/-2108452666",
+      "status": 200,
+      "milliseconds": 5.09
+    },
+    {
+      "path": "/api/tldr-cache/-1",
+      "status": 204,
+      "milliseconds": 5.02
+    },
+    {
+      "path": "/api/tldr-detail",
+      "status": 404,
+      "milliseconds": 3.44
+    }
+  ],
+  "readiness": {
+    "counts_version": 0,
+    "current_version": 1791568691323,
+    "ok": true,
+    "ready": true
+  },
+  "tldr_cache_hit": true,
+  "simulated_blank_guard": "passed against deployed source with all four extractors set to raise",
+  "limits": "Existing profile151 reused; read-only cache probes and missing-story detail only; uncached live generation and natural empty upstream responses not exercised."
+}

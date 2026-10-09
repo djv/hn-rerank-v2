@@ -13,6 +13,17 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- 2026-10-09 general server/TUI review completed sequentially with Muse,
+  Codex and Claude Code. Confirmed TUI concerns: retryable 500/503 hides
+  stories, quit cancels pending votes, minute polling delays pending decks,
+  and initial counts baseline can miss an update. No broad fixes made;
+  [review synthesis](docs/evaluations/general-review-20261009/SYNTHESIS.md)
+  distinguishes confirmed behavior from hypotheses and physical UI gaps.
+- Blank-body guard deployed at 17:58 UTC to VPS `bf6e307` only. Service
+  active, config hash unchanged, dashboard/feed/readiness/cache smoke and
+  simulated deployed-source guard passed; bounded journal scan quiet.
+  Uncached live generation and natural empty fetch not exercised.
+  [Deployment evidence](docs/evaluations/extraction-deploy-review-20261009/DEPLOYMENT.md).
 - Save/cleanup verification, 2026-10-09: isolated VPS checkout of laptop
   HEAD plus current runtime changes passed backend 1,218 / 1 skipped and
   TUI 174 / 1 skipped. Repository Ruff/ty and touched-Python format clean;
@@ -101,7 +112,7 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
 - Empty article responses: `_extract_article_body` now skips blank and
   whitespace-only input, preserving retryable `empty_extraction` without
   trafilatura's error log. Isolated VPS gates: 1,217 passed, 1 skipped;
-  Ruff, touched-file format, and ty clean. Not deployed yet.
+  Ruff, touched-file format, and ty clean. Deployed 2026-10-09; scope above.
 
 ## Blocker
 None.
@@ -121,8 +132,11 @@ None.
   scoring (7.1 s, candidate word counts recomputed); a persisted or
   prewarmed count cache would cut it.
 - User: restart the TUI from a fresh shell (8 per section, `hn-open`).
-- Deploy the verified blank-body extraction guard, then check runtime logs.
-  Substack's httpx 403 still reproduces; a fresh urllib fallback returned
+- If requested, address the prioritized TUI review findings, starting with
+  retryable summary errors and pending-vote quit behavior; physically check
+  narrow/wide layout and controls. No broader implementation authorized yet.
+- Blank-body guard deployed; observe natural empty-response behavior.
+  Substack's previously checked httpx 403 reproduced; urllib fallback returned
   full HTML. The historical empty-response cause remains unconfirmed.
 - Arctic Shift: check `reddit_refresh_arctic` lines over the next days and
   a Reddit card's tldr-detail (live tap) with archive comments. Rollback:

@@ -1,5 +1,24 @@
 # HN Rerank findings
 
+## General review and scoped guard deploy — 2026-10-09
+
+User requested independent Codex/Muse/Claude Code general review. Actual
+responses and root source verification are preserved in
+[general-review-20261009](docs/evaluations/general-review-20261009/SYNTHESIS.md).
+Two medium concerns: retryable server errors hide a story for the TUI session;
+quit cancels pending votes (server completion uncertain if already sent).
+Pending reranks poll at 60 s, and the first counts poll can miss a change.
+Muse's old source rows in the 304–306 h range were retired feeds, not evidence
+of an active outage. Public network and actual terminal behavior unmeasured.
+
+Previously authorized guard deployment completed at 17:58:08 UTC. VPS advanced
+only be965fd→bf6e307, preserving config/trial/research artifacts. Active service,
+HTTP cache hit/miss/detail404 checks and simulated extraction short-circuit
+passed; journal scan quiet at 17:58:53. Startup feed/dashboard probes were
+1.3–1.5 s versus 6–16 ms before restart. No provider-spending smoke or natural
+empty upstream response claimed. Full readback/limitations:
+[deployment evidence](docs/evaluations/extraction-deploy-review-20261009/DEPLOYMENT.md).
+
 ## Save and complete WIP cleanup — 2026-10-09
 
 User invoked ss, then explicitly included unrelated WIP. Preserved the wide
