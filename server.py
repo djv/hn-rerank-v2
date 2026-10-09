@@ -420,6 +420,8 @@ def _extract_article_body(html: str) -> str | None:
     jusText (statistical boilerplate classification) → BS semantic
     (unclassed <article>/<main>) → trafilatura (precision mode) → raw body.
     """
+    if not html.strip():
+        return None
     for extractor in (
         _extract_with_justext,
         _extract_with_bs_semantic,
