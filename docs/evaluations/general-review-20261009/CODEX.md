@@ -11,4 +11,3 @@ The supplied **17:51 UTC `LIVE.json` snapshot**, not new measurements, records l
 Freshness is layered: regeneration waits an hour between cycles; Reddit refresh starts are spaced at least two hours; hot-count checks wait ten minutes and ranking idle. Publication age, stored `fetched_at`, and deck version do not establish upstream freshness. No distinct new archive-delay or refit defect was established.
 
 Scope: independent Codex review only; no other reviewers invoked, mutations, tests, providers, or runtime actions. Narrow/wide layout, focus, vote/undo and cancellation received limited source/test inspection; physical rendering remains unknown. The approximate line budget was exceeded; targeted read calls stayed below 16. ML trial state remains untouched.
-
