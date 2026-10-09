@@ -241,6 +241,19 @@ async def test_wide_footer_is_one_row() -> None:
         assert "b badges" in str(app.query_one("#shortcuts", Static).content)
 
 
+@pytest.mark.parametrize("width", [100, 240])
+async def test_wide_layout_gives_list_a_third(width: int) -> None:
+    app = Reader(api=FakeServer().api())
+    async with app.run_test(size=(width, 40)) as pilot:
+        await settle(pilot)
+        available = app.query_one("#panes").region
+        listing = app.query_one("#headlines").region
+        pane = app.query_one("#reading-pane").region
+        assert listing.y == pane.y
+        assert listing.width + pane.width == available.width
+        assert abs(listing.width - available.width / 3) <= 1
+
+
 @pytest.mark.parametrize("size", [(51, 37), (80, 30), (140, 40)])
 @pytest.mark.parametrize("long_summary", [False, True])
 async def test_enter_zooms_tldr(size: tuple[int, int], long_summary: bool) -> None:
@@ -556,12 +569,11 @@ async def test_setup_modal_chrome(tmp_path: Path) -> None:
         assert len(widths) == 1
 
 
-async def test_reading_measure_cap() -> None:
+async def test_wide_story_heading_rule() -> None:
     fake = EditorialServer()
     app = Reader(api=fake.api())
     async with app.run_test(size=(220, 40)) as pilot:
         await settle(pilot)
-        assert app.query_one("#reading-pane").region.width <= 100
         assert app.query_one("#story-heading").styles.border_bottom[0] == "solid"
 
 

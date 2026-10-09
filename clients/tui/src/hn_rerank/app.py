@@ -628,6 +628,7 @@ class Reader(App[None]):
     Tabs:focus Tab.-active { text-style: bold underline; }
     Underline > .underline--bar { color: $hn-accent; background: $hn-chrome; }
     #panes { height: 1fr; }
+    /* Wide layout: list a third, reading pane two thirds. */
     #headlines { width: 1fr; height: 1fr; background: $hn-bg;
                  border: solid $hn-bg; padding: 0; }
     #headlines:focus { border: solid $hn-accent; }
@@ -638,8 +639,7 @@ class Reader(App[None]):
     }
     #headlines:focus > .option-list--option-highlighted { text-style: none;
         border-left: solid $hn-accent; }
-    #reading-pane { width: 2fr; height: 1fr; border-left: solid $hn-border;
-                    max-width: 100; }
+    #reading-pane { width: 2fr; height: 1fr; border-left: solid $hn-border; }
     #reading-pane.has-story:focus-within { border-left: solid $hn-accent; }
     #story-heading { height: auto; max-height: 6; padding: 0 1;
                      border-bottom: solid $hn-rule; }
