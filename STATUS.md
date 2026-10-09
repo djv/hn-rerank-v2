@@ -10,8 +10,9 @@ when its live comment check finds growth, without a confirmation prompt.
 One follow-up per observed count; background-only growth keeps its choice.
 Implemented and verified: 29 focused checks; TUI 203 passed / 1 skipped;
 backend 1,264 passed / 1 skipped; Ruff, ty and touched-Python format clean.
-The running local TUI predates this change; quit/relaunch loads it. Physical
-keypress/live generation remains unverified. No server restart is needed
+User-authorized local restart completed at 19:05 EDT: PID 1976245 runs the
+updated checkout, with the saved profile/feed/summary loaded and Brave helper
+retained. Physical r/live generation remains unverified. No server restart is needed
 for this client-only change; production server and trial remain untouched.
 
 Current maintenance task: implement user-selected background section refresh
