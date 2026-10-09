@@ -1,0 +1,72 @@
+{
+  "checked_utc": "2026-10-09T22:43:34.715875+00:00",
+  "schema_source_comments": true,
+  "http": [
+    {
+      "path": "/",
+      "status": 200,
+      "milliseconds": 316.31
+    },
+    {
+      "path": "/api/feed?window=1w",
+      "status": 200,
+      "milliseconds": 72.08
+    },
+    {
+      "path": "/api/ranking-ready?min_version=0",
+      "status": 200,
+      "milliseconds": 29.41
+    },
+    {
+      "path": "/api/story-stats?story_id=50027252",
+      "status": 200,
+      "milliseconds": 568.93
+    },
+    {
+      "path": "/api/story-stats?story_id=-1998263947",
+      "status": 200,
+      "milliseconds": 22.44
+    },
+    {
+      "path": "/api/story-stats?story_id=invalid",
+      "status": 400,
+      "milliseconds": 47.26
+    },
+    {
+      "path": "/api/story-stats?story_id=-1",
+      "status": 404,
+      "milliseconds": 26.47
+    },
+    {
+      "path": "/api/tldr-cache/50024499",
+      "status": 200,
+      "milliseconds": 35.22
+    }
+  ],
+  "hn_stats": {
+    "comments": 0,
+    "comments_live": true,
+    "ok": true,
+    "points": 5,
+    "points_live": true,
+    "reason": "live_check",
+    "story_id": 50027252
+  },
+  "unsupported_stats": {
+    "comments": 0,
+    "comments_live": false,
+    "ok": true,
+    "points": 0,
+    "points_live": false,
+    "reason": "unsupported_source",
+    "story_id": -1998263947
+  },
+  "cache_hit": true,
+  "cache_metadata": {
+    "cached": true,
+    "has_snapshot": false,
+    "snapshot": null
+  },
+  "unauthenticated_stats_status": 401,
+  "limits": "Existing profile151 reused. Only GET probes; no votes, new profiles, summary generation or forced hydration. Physical running TUI not restarted or verified."
+}

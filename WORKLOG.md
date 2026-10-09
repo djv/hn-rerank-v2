@@ -11787,3 +11787,16 @@ the unvoted stories from this week outranked older ones. On the live DB (user
 is 11/3/1/1 at 240h, 7/1/1/7 at 360h and 5/1/2/8 at 480h. `GRAVITY_TIME_SCALE["1m"]`
 is now 360 in the server, web client and TUI. Backend 1,096 and TUI 162
 tests passed.
+
+## 2026-10-09 — Authorized section/r/stats deployment
+
+User chose Save fixes and then authorized deploy. Saved/pushed ad94386;
+VPS clean checkout fast-forwarded from 7706816 and service restarted at
+22:42:32 UTC. Online DB backup quick_check ok; nullable source_comments column
+present. Config unchanged, deployed source manifest exact. Live dashboard/feed/
+readiness/cache/stats/auth/provenance checks passed, bounded journal quiet for
+error patterns. Local TUI started after final source write and resolves the
+updated checkout; physical controls remain unverified. No smoke provider
+calls/votes/new profiles; uncached forced live generation not exercised.
+Evidence: docs/evaluations/section-refresh-20261009/DEPLOYMENT.md and
+DEPLOY-SMOKE.json. This supersedes earlier uncommitted/undeployed task status.

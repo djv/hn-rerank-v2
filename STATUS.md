@@ -14,8 +14,9 @@ isolated validation of the original change were saved under the user’s ss requ
 Two authorized independent Codex result reviews completed. The user selected
 all seven fixes; Muse implemented them with reproduced failures and regression
 coverage. Final matching-source VPS suites and local lint/type/format checks
-pass. The user authorized saving/pushing the fixes and deployment. Save is
-in progress; VPS deployment/restart and live smoke are the next authorized steps.
+pass. Saved/pushed ad94386 and deployed to the VPS with restart at
+2026-10-09 22:42:32 UTC. Live endpoint/schema/auth/cache smoke passed;
+the local TUI process started after the updated source was written.
 
 Compare shortlist #2 (one joined logistic classifier, all features) and #4
 (same, no metadata) live against production through team-draft
@@ -25,6 +26,12 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- Authorized rollout complete: VPS runtime ad94386, service active; tested
+  source manifest and unchanged config hash verified. Online DB backup passed
+  quick_check before the nullable snapshot-column migration. Real HN stats are
+  live; unsupported-source provenance and auth checks pass. Cached legacy text
+  correctly has no fabricated snapshot; bounded journal scan had no matching
+  errors. [Deployment evidence](docs/evaluations/section-refresh-20261009/DEPLOYMENT.md).
 - Seven review fixes complete: malformed strict hydration rejected before writes,
   repeated-r intent consumed, stale feed replies rejected after vote/undo ack,
   profile stats state reset, warm replies carry source snapshots, and both
@@ -150,8 +157,9 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   Ruff, touched-file format, and ty clean. Deployed 2026-10-09; scope above.
 
 ## Blocker
-No code/check blocker. Deployment and live feature behavior remain unverified
-pending the authorized rollout. No live DB/provider/trial changes made yet.
+No code/check blocker. Physical TUI controls and uncached/forced live summary
+generation remain unverified. No smoke-generated votes/profiles or LLM calls;
+ranking research remains paused and production trial configuration unchanged.
 
 ## Next step
 - AI ranking research: goal is a repeatable Muse advantage transferable into
@@ -171,9 +179,11 @@ pending the authorized rollout. No live DB/provider/trial changes made yet.
 - If requested, address the prioritized TUI review findings, starting with
   retryable summary errors and pending-vote quit behavior; physically check
   narrow/wide layout and controls. No broader implementation authorized yet.
-- Save/push the seven verified follow-up fixes, then perform the authorized
-  deployment/restart and live feature smoke. Both authorized result reviews
-  and final regression evidence are in docs/evaluations/section-refresh-20261009/.
+- Section/r/stats feature and seven fixes saved and deployed. Observe the
+  running TUI's s/h/l and r/growth-popup controls; automated Pilot tests pass,
+  but physical interaction and forced live generation were not exercised.
+  Reviews, regression evidence and deployment bounds are in
+  docs/evaluations/section-refresh-20261009/.
 - Blank-body guard deployed; observe natural empty-response behavior.
   Substack's previously checked httpx 403 reproduced; urllib fallback returned
   full HTML. The historical empty-response cause remains unconfirmed.

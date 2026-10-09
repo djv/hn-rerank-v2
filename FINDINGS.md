@@ -3298,3 +3298,14 @@ bounds: SEVEN-FIXES-CHECKS.md and SEVEN-FIXES-SOURCE-SHA256.txt in that folder.
 No deployment, live provider/DB, ranking research or trial changes; fixes remain
 uncommitted pending save. Original reviews concern the pre-fix commit, not a
 fresh independent approval of the resulting patch.
+
+### Authorized save/deploy follow-up
+
+User chose Save fixes, then authorized deployment. ad94386 saved/pushed and
+VPS service restarted 2026-10-09 22:42:32 UTC. All deployed manifest hashes
+match full tested sources; config unchanged. Backup quick_check ok, additive
+source_comments present. Live stats/provenance/auth/feed/readiness/cache smoke
+passed without summary generation or profile/vote writes. Local user TUI process
+started after final app source edit; controls not physically exercised. Details:
+section-refresh-20261009/DEPLOYMENT.md and DEPLOY-SMOKE.json. Earlier pending-save
+and no-deployment statements above describe the pre-authorization stage.
