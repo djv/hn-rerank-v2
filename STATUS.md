@@ -22,7 +22,9 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
 - The fix plan and Muse assignment are saved beside the review evidence:
   [fix plan](docs/evaluations/codex-forum-review-20261010/FIX-PLAN.md) and
   [handoff](docs/evaluations/codex-forum-review-20261010/MUSE-HANDOFF.md).
-  Dispatch/receipt verification is pending; no fix is claimed implemented.
+  Muse is running in the isolated VPS worktree; actual session output and
+  completed source-read tools verify receipt. MUSE-ACK.md/CHECKS.md and fixes
+  remain pending. [Dispatch record](docs/evaluations/codex-forum-review-20261010/HANDOFF-RUN.md).
 - Codex Forum review complete: the actual deployed extractor returned reply
   text as article_body (three non-opening posts matched). The source can enter
   generic article prewarm and short-post tap fetching, so discussion can be
@@ -181,9 +183,9 @@ smoke-generated votes/profiles or LLM calls;
 ranking research remains paused and production trial configuration unchanged.
 
 ## Next step
-- Dispatch Muse to the isolated VPS worktree in the fix plan and verify its
-  receipt. Then inspect MUSE-ACK.md/CHECKS.md and the feature-branch diff before
-  integration. Existing cached inputs are suppressed nondestructively; no
+- Check the Muse job via HANDOFF-RUN.md; inspect MUSE-ACK.md/CHECKS.md and
+  the feature-branch diff before integration. Receipt is verified; no completed
+  fix is claimed. The plan suppresses legacy inputs nondestructively; no
   cleanup, reply/count adapter or production rollout is assigned.
 - Observe Codex Forum cards in normal ranked views. Forum replies and live
   discussion counts would require a separately scoped Discourse adapter.

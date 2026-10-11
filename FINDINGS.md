@@ -12,6 +12,10 @@ Production data remains untouched; no reply/count adapter or rollout assigned.
 [Fix plan](docs/evaluations/codex-forum-review-20261010/FIX-PLAN.md) and
 [Muse assignment](docs/evaluations/codex-forum-review-20261010/MUSE-HANDOFF.md)
 include exact regression coverage, VPS isolation and delivery constraints.
+Actual session output and completed source tools verified receipt on the VPS;
+the implementation/report is pending. The first CLI attempt rejected argument
+order before starting a model; the corrected unit is active. Run/session/log
+identifiers: [dispatch record](docs/evaluations/codex-forum-review-20261010/HANDOFF-RUN.md).
 
 ## Codex Forum independent review completed — 2026-10-10
 

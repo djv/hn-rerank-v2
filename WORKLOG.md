@@ -7,7 +7,11 @@ MUSE-HANDOFF.md for one isolated VPS implementation using Muse Spark 1.3.
 The scope includes both confirmed defects plus effective legacy content/cache
 handling so dirty longest-text rows and stale summaries cannot bypass the
 prospective fix. No destructive cleanup, reply adapter or production rollout.
-Dispatch and receipt are tracked in the current status.
+Dispatched through OpenCode to a detached, resource-capped VPS user unit.
+Corrected an initial --file argument-order failure before the model started.
+Session acknowledgement and completed source tools verified receipt; no
+implementation completion or passing new checks is claimed. Current status
+and HANDOFF-RUN.md hold the unit, session, worktree and follow-up commands.
 
 ## 2026-10-10 — Complete resumed Codex Forum review
 
