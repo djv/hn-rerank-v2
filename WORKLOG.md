@@ -11829,3 +11829,14 @@ Saved a separately tested create-only frozen-input receipt helper and 32 synthet
 The user's ss-now boundary stopped implementation. NULL-comment reporting, prepublication parity failure and immutable evaluator receipt/manifest integration remain unfinished; the independent result review remains pending. See docs/evaluations/decision1-20261010/REVIEW-FIX-HANDOFF.md. Existing 104 legacy scores and the snapshot checksum match, Strands remains stopped, and no inference environment, deployment or service restart occurred.
 
 Verification: 32 focused tests; full backend 1,394 passed, 1 skipped, one pre-existing sklearn convergence warning; Ruff and touched-file formatting pass, new-code strict ty clean, unchanged 11 optional Torch/Strands import diagnostics globally.
+
+## 2026-10-11 — Correct the warm-start regression's solver assumptions
+
+The user included the separately exposed existing suite failure. Seed 134217729
+reproduced on clean baseline 4ce5fcc: unseen probabilities differed by .00669789
+against an assumed .005 bound. lbfgs's gradient tolerance is not such a prediction
+bound, and warm starts do not universally need fewer iterations. The test now
+compares both fits' regularized training objective against a tol=1e-8 reference,
+checks finite normalized predictions, and retains explicit failure/speed examples.
+No production classifier settings changed. Full backend 1,429 passed/1 skipped;
+scoped checks pass. See docs/evaluations/decision1-20261010/WARM-START-CHECK-20261011.md.

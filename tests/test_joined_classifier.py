@@ -6,7 +6,7 @@ from typing import Literal
 
 import numpy as np
 import pytest
-from hypothesis import given, settings, strategies as st
+from hypothesis import example, given, settings, strategies as st
 
 from database import Database, Story
 from pipeline import Config, Embedder, ModelConfig
@@ -324,7 +324,9 @@ def test_rerank_arms_train_on_one_vote_snapshot(
 
 @settings(max_examples=10, deadline=None)
 @given(seed=st.integers(0, 2**32 - 1))
-def test_warm_start_reaches_the_same_model_in_fewer_iterations(seed: int) -> None:
+@example(seed=134217729)
+@example(seed=0)
+def test_warm_start_preserves_the_converged_training_objective(seed: int) -> None:
     rng = np.random.default_rng(seed)
     labels = list(rng.permutation(np.repeat([0, 1, 2], 30)))
     stories = _stories(rng, labels, 0)
@@ -353,13 +355,32 @@ def test_warm_start_reaches_the_same_model_in_fewer_iterations(seed: int) -> Non
     cold = model().fit(x, labels, sample_weight=weights, stories=stories)
     warm = model().fit(x, labels, sample_weight=weights, stories=stories, warm=previous)
 
-    assert warm.estimator.n_iter_[0] <= cold.estimator.n_iter_[0]
-    np.testing.assert_allclose(
-        warm.predict_proba(x_cand, candidates),
-        cold.predict_proba(x_cand, candidates),
-        # lbfgs stops at tol=1e-4 from either start: equal to that tolerance.
-        atol=5e-3,
-    )
+    reference = model()
+    reference.estimator.set_params(tol=1e-8)
+    reference.fit(x, labels, sample_weight=weights, stories=stories)
+
+    def objective(fitted: JoinedLogistic) -> float:
+        # sklearn's lbfgs objective: mean multiclass log loss plus L2/C/n.
+        # Its gradient stopping tolerance does not bound unseen predictions.
+        log_probabilities = fitted.estimator.predict_log_proba(
+            fitted._inputs(x, fitted._words(stories))
+        )
+        loss = -log_probabilities[np.arange(len(labels)), labels].mean()
+        penalty = np.square(fitted.estimator.coef_).sum() / (
+            2 * fitted.estimator.C * len(labels)
+        )
+        return float(loss + penalty)
+
+    optimum = objective(reference)
+    for fitted in (cold, warm):
+        assert objective(fitted) == pytest.approx(optimum, rel=0, abs=1e-4)
+        probabilities = fitted.predict_proba(x_cand, candidates)
+        assert np.isfinite(probabilities).all()
+        assert ((probabilities >= 0) & (probabilities <= 1)).all()
+        np.testing.assert_allclose(probabilities.sum(axis=1), 1)
+    # Speed is an example, not a promise for every randomly generated dataset.
+    if seed == 0:
+        assert warm.estimator.n_iter_[0] < cold.estimator.n_iter_[0]
 
 
 def test_arms_sharing_features_score_exactly_as_alone() -> None:
