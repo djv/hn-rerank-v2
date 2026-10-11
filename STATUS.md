@@ -5,6 +5,10 @@ preview, pending Reddit/Gemma items):
 [before interleaving](docs/status-archive/before-interleaving-20261007.md).
 
 ## Objective
+Fix the two medium TUI review findings (user 2026-10-11): preserve queued
+vote/undo requests on quit and retain stories after retryable HTTP 5xx errors.
+One independent Claude cloud result review was approved and completed.
+
 Plan the verified Codex Forum fixes and hand them to Muse (user 2026-10-11).
 Scope: article-fetch suppression, generated-footer removal, nondestructive
 legacy input/cache handling, and regression tests. Implementation is assigned
@@ -19,12 +23,25 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- TUI medium fixes implemented: q/Ctrl+q drain queued votes in order for up to
+  five seconds, keeping the reader open on timeout or unconfirmed saving.
+  Vote/undo remain disabled through successful exit. HTTP 5xx errors use the
+  existing manual-retry path; permanent 4xx content-hide behavior remains.
+  The approved Claude cloud review found an exit-guard gap and lost error detail;
+  both were reproduced and corrected. Final checks and review bounds:
+  [TUI validation](docs/evaluations/tui-medium-fixes-20261011/CHECKS.md).
+  Final VPS gates: TUI 219 passed / 1 skipped; backend 1,264 / 1 skipped;
+  repository Ruff, ty and five touched-Python format checks passed.
+  No personal reader was restarted; the final process check found no local
+  reader running. A launch from this checkout loads these client changes.
 - The fix plan and Muse assignment are saved beside the review evidence:
   [fix plan](docs/evaluations/codex-forum-review-20261010/FIX-PLAN.md) and
   [handoff](docs/evaluations/codex-forum-review-20261010/MUSE-HANDOFF.md).
-  Muse is running in the isolated VPS worktree; actual session output and
-  completed source-read tools verify receipt. MUSE-ACK.md/CHECKS.md and fixes
-  remain pending. [Dispatch record](docs/evaluations/codex-forum-review-20261010/HANDOFF-RUN.md).
+  Muse acknowledged the task and wrote source changes in the isolated VPS
+  worktree. The runner exited successfully after 96 reported focused passes;
+  its full-suite tool call was rejected and CHECKS.md is absent. Supervising
+  diff inspection, complete gates, commit and integration remain pending.
+  [Dispatch record](docs/evaluations/codex-forum-review-20261010/HANDOFF-RUN.md).
 - Codex Forum review complete: the actual deployed extractor returned reply
   text as article_body (three non-opening posts matched). The source can enter
   generic article prewarm and short-post tap fetching, so discussion can be
@@ -73,9 +90,10 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   later under the approved implementation choices. Evidence/limitations:
   [comparison assessment](docs/evaluations/section-refresh-20261009/ASSESSMENT.md).
 - 2026-10-09 general server/TUI review completed sequentially with Muse,
-  Codex and Claude Code. Confirmed TUI concerns: retryable 500/503 hides
-  stories, quit cancels pending votes, minute polling delays pending decks,
-  and initial counts baseline can miss an update. No broad fixes made;
+  Codex and Claude Code. The current TUI already handled 503; this task extends
+  that protection to all 5xx and drains pending votes before quitting. Minute
+  polling delays pending decks and the initial counts baseline can miss an update;
+  those lower-priority findings remain outside the authorized fixes.
   [review synthesis](docs/evaluations/general-review-20261009/SYNTHESIS.md)
   distinguishes confirmed behavior from hypotheses and physical UI gaps.
 - Blank-body guard deployed at 17:58 UTC to VPS `bf6e307` only. Service
@@ -174,7 +192,7 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   Ruff, touched-file format, and ty clean. Deployed 2026-10-09; scope above.
 
 ## Blocker
-The independent review is complete; the user requested the fix handoff.
+The TUI medium result review is complete and its introduced findings corrected.
 The medium article-attribution issue remains open pending Muse implementation
 and supervising verification. No reply/count adapter or rollout is authorized.
 Physical TUI controls and
@@ -203,9 +221,9 @@ ranking research remains paused and production trial configuration unchanged.
   scoring (7.1 s, candidate word counts recomputed); a persisted or
   prewarmed count cache would cut it.
 - User: restart the TUI from a fresh shell (8 per section, `hn-open`).
-- If requested, address the prioritized TUI review findings, starting with
-  retryable summary errors and pending-vote quit behavior; physically check
-  narrow/wide layout and controls. No broader implementation authorized yet.
+- Load the TUI fixes on a fresh reader launch and physically check quit/save
+  and manual summary retry. Automated tests cover these paths; no live vote or
+  provider request was made. Lower-priority polling/counts work remains unassigned.
 - Section/r/stats feature and seven fixes saved and deployed. Observe the
   running TUI's s/h/l and r/growth-popup controls; automated Pilot tests pass,
   but physical interaction and forced live generation were not exercised.

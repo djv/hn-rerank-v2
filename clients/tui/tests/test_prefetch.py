@@ -340,15 +340,15 @@ async def test_prefetch_cancelled_in_the_same_tick_can_restart() -> None:
         await wait_for(pilot, lambda: app.summaries.keys() >= {2, 3})
 
 
-async def test_failed_background_cache_read_falls_back_to_generation() -> None:
-    """Selecting a story whose in-flight cache read then fails (500, or 404
-    on an older server) asks for the summary directly instead of hiding it."""
+@pytest.mark.parametrize("status", [404, 500])
+async def test_failed_background_cache_read_keeps_story(status: int) -> None:
+    """Older servers fall back to generation; 5xx waits for a manual retry."""
 
     class CacheFailServer(PrefetchServer):
         async def __call__(self, request: httpx.Request) -> httpx.Response:
             if request.url.path.endswith("/api/tldr-cache/2"):
                 await asyncio.sleep(0.6)
-                return httpx.Response(500)
+                return httpx.Response(status)
             return await super().__call__(request)
 
     fake = CacheFailServer()
@@ -357,6 +357,20 @@ async def test_failed_background_cache_read_falls_back_to_generation() -> None:
         await wait_for(pilot, lambda: 2 in app.summary_requests)
         app.query_one(OptionList).focus()
         await pilot.press("j")
+        if status == 500:
+            await wait_for(
+                pilot,
+                lambda: "500" in app.query_one("#summary", Markdown)._markdown,
+            )
+            assert 2 not in app.unavailable
+            selected = app.selected()
+            assert selected is not None and selected.id == 2
+            assert not any(
+                json.loads(request.content)["story_id"] == 2
+                for request in fake.requests
+                if request.url.path.endswith("/api/tldr-detail")
+            )
+            app.action_refresh()
         await wait_for(pilot, lambda: app.summaries.get(2) == "# Summary 2")
         assert 2 not in app.unavailable
         assert "Summary 2" in app.query_one(Markdown)._markdown

@@ -8,6 +8,13 @@ are in [the deployment folder](../extraction-deploy-review-20261009/).
 
 ## Priorities after source verification
 
+Resolution, 2026-10-11: the user authorized the two medium fixes. The live tree
+already treated 503 as transient; remaining 5xx now follow that path. Queued
+votes drain on quit, with timeout/failure keeping the reader open. Independent
+result review and verification are in
+[TUI checks](../tui-medium-fixes-20261011/CHECKS.md). Items 3–4 remain unassigned.
+The findings below preserve the original assessment and historical line numbers.
+
 1. **Confirmed, medium: retryable HTTP 500/503 hides a story for the session.**
    `api.py:291` makes server errors generic APIError; `app.py:1259` hides a
    first-time summary on that path. Retain stories for retryable server failures

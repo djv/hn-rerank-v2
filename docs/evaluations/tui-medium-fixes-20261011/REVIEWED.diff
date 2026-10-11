@@ -1,0 +1,163 @@
+diff --git a/clients/tui/src/hn_rerank/api.py b/clients/tui/src/hn_rerank/api.py
+index 3349059..0070fe7 100644
+--- a/clients/tui/src/hn_rerank/api.py
++++ b/clients/tui/src/hn_rerank/api.py
+@@ -40,7 +40,7 @@ class InvalidProfile(APIError):
+
+
+ class TransientError(APIError):
+-    """Connection failure or rate limit: says nothing about the story itself."""
++    """Connection, service or rate-limit failure, not a problem with the story."""
+
+
+ @dataclass(frozen=True)
+@@ -304,11 +304,12 @@ class API:
+             delay = response.headers.get("Retry-After", "a few")
+             delay = delay if delay.isdigit() else "a few"
+             raise TransientError(f"Rate limited. Try again in {delay} seconds.")
+-        if response.status_code == 503:
+-            # Retryable generation failures (busy join, forced hydration
+-            # failure): transient by contract, so the reader keeps the
+-            # current story instead of hiding it.
+-            raise TransientError("Service unavailable (503). Please try again.")
++        if 500 <= response.status_code < 600:
++            # A server failure says nothing about this story's content.
++            # Keep it available for a manual retry; votes are never retried.
++            raise TransientError(
++                f"Service unavailable ({response.status_code}). Please try again."
++            )
+         if response.is_redirect:
+             raise APIError(
+                 "Server redirected the request. Check the server URL and deployment prefix."
+diff --git a/clients/tui/src/hn_rerank/app.py b/clients/tui/src/hn_rerank/app.py
+index 1cabb77..a9327c8 100644
+--- a/clients/tui/src/hn_rerank/app.py
++++ b/clients/tui/src/hn_rerank/app.py
+@@ -18,6 +18,7 @@ from textual.containers import Horizontal, Vertical
+ from textual.screen import ModalScreen
+ from textual.theme import Theme
+ from textual.timer import Timer
++from textual.worker import Worker, WorkerState
+ from textual.widgets import (
+     Button,
+     Input,
+@@ -64,6 +65,7 @@ from .models import (
+ )
+
+ DEFAULT_SERVER = "https://ubuntu-8gb-nbg1-1.tailca4726.ts.net:8443/hn/"
++QUIT_VOTE_WAIT_SECONDS = 5.0
+
+ DARK_PALETTE: dict[str, str] = {
+     "bg": "#171717",
+@@ -809,6 +811,8 @@ class Reader(App[None]):
+         self.vote_views: dict[int, tuple[str, list[str]]] = {}
+         self.vote_revisions: dict[int, int] = {}
+         self.vote_lock = asyncio.Lock()
++        self._unconfirmed_votes = 0
++        self._quit_requested = False
+         self.selection_serial = 0
+         self.interaction_session = str(uuid4())
+         self.summary_story_id: int | None = None
+@@ -933,6 +937,8 @@ class Reader(App[None]):
+     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+         if self.setting_up or isinstance(self.focused, Input):
+             return False
++        if self._quit_requested and action in {"vote", "undo"}:
++            return False
+         if self._stats_modal_open and action in {
+             "vote",
+             "undo",
+@@ -2207,6 +2213,8 @@ class Reader(App[None]):
+
+     def action_vote(self, action: str) -> None:
+         """Hide the story and move on now; the server hears about it next."""
++        if self._quit_requested:
++            return
+         story = self.selected()
+         if story is None:
+             return
+@@ -2216,6 +2224,8 @@ class Reader(App[None]):
+         self.submit(story, action, revision)
+
+     def action_undo(self) -> None:
++        if self._quit_requested:
++            return
+         if self.history:
+             story = self.history[-1]
+             self.apply_undo(story)
+@@ -2256,10 +2266,12 @@ class Reader(App[None]):
+             try:
+                 target = await api.vote(story.id, action)
+             except InvalidProfile as exc:
++                self._unconfirmed_votes += 1
+                 self.setup(str(exc))
+                 return
+             except APIError as exc:
+                 if api is self.api:
++                    self._unconfirmed_votes += 1
+                     # Never retried: the server may or may not have it.
+                     latest = self.vote_revisions.get(story.id) == revision
+                     if latest:
+@@ -2574,6 +2586,49 @@ class Reader(App[None]):
+         )
+         self.focus_summary()
+
++    async def action_quit(self) -> None:
++        """Finish queued votes before allowing teardown to cancel workers."""
++        if self._quit_requested:
++            return
++        self._quit_requested = True
++        votes: tuple[Worker[None], ...] = tuple(
++            worker
++            for worker in self.workers
++            if worker.group == "vote" and not worker.is_finished
++        )
++        self._quit_after_votes(votes, self._unconfirmed_votes)
++
++    @work(group="quit")
++    async def _quit_after_votes(
++        self, votes: tuple[Worker[None], ...], unconfirmed_before: int
++    ) -> None:
++        try:
++            if votes:
++                self.status("Saving pending votes before quitting…")
++            deadline = time.monotonic() + QUIT_VOTE_WAIT_SECONDS
++            while any(not worker.is_finished for worker in votes):
++                remaining = deadline - time.monotonic()
++                if remaining <= 0:
++                    self.status(
++                        "Votes are still saving. Reader stayed open; press q after saving finishes.",
++                        error=True,
++                    )
++                    return
++                # Worker.wait cancellation can cancel the underlying vote.
++                # Observe completion without creating/cancelling waiters.
++                await asyncio.sleep(min(0.05, remaining))
++            if self._unconfirmed_votes != unconfirmed_before or any(
++                worker.state != WorkerState.SUCCESS for worker in votes
++            ):
++                self.status(
++                    "Votes were not confirmed. Check before voting again; press q to quit.",
++                    error=True,
++                )
++                return
++            self.exit()
++        finally:
++            self._quit_requested = False
++
+     async def on_unmount(self) -> None:
+         self.closing = True
+         self.selection_serial += 1
+diff --git a/clients/tui/tests/test_client.py b/clients/tui/tests/test_client.py
+index 07b76e0..8a9acad 100644
+--- a/clients/tui/tests/test_client.py
++++ b/clients/tui/tests/test_client.py
+@@ -327,7 +327,7 @@ class FailSummaryServer(FakeServer):
+         if request.url.path.endswith("/api/tldr-detail"):
+             story_id = json.loads(request.content)["story_id"]
+             if story_id in self.fail_ids:
+-                return httpx.Response(500)
++                return httpx.Response(404)
+         if "/api/tldr-cache/" in request.url.path:
+             return httpx.Response(204)
+         return await super().__call__(request)

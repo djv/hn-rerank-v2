@@ -3402,3 +3402,20 @@ and no-deployment statements above describe the pre-authorization stage.
 - A preference popup returned no answer. Safe default: background stats still patch points/comments but never interrupt reading or implicitly regenerate; explicit r retains its authorized automatic follow-up. This does not expand generation to background checks.
 - Added the current-selection explicit-r authorization guard before considering discussion growth. Updated section-switch, later-background-growth and reconnect regression expectations; the silent section-switch regression fails on the previous source with a visible StatsPrompt.
 - Final focused checks: 29 passed. Backend: 1,264 passed / 1 skipped (existing sklearn convergence warning). Ruff/ty/touched-Python format/whitespace passed. Full TUI: 203 passed / 1 skipped; changed app/test SHA-256 hashes match the isolated VPS sources. At 19:21 EDT, under existing restart authorization, gracefully quit the old local reader (PID 1989317), verified its exit/shell return, relaunched the same entrypoint with hn-open retained, and restored Popular / 1 month. PID 1998605 loaded profile/feed/summary; no popup after live section switch. Physical r and a naturally growing known-snapshot summary remain user-observation checks.
+
+## TUI medium reliability fixes — 2026-10-11
+
+The user authorized pending-vote quit handling and retryable summary errors.
+The current tree already classified 503 as transient; the gap covered other
+5xx. q/Ctrl+q now drain queued vote/undo operations for up to five seconds,
+keep the reader open on timeout/failure, and keep the vote guard through exit.
+Summary 5xx errors retain stories for manual retry; 404 permanent-hide and
+older-server cache fallback remain covered. No ambiguous vote retry.
+
+One approved Claude cloud result review found an exit-guard gap and failure
+detail overwritten by the drain. Both reproduced with Pilot regressions and
+were corrected. Full results, static-review limits, source hashes and unchanged
+profile/setup concerns: [checks](docs/evaluations/tui-medium-fixes-20261011/CHECKS.md).
+No personal reader was restarted; the final local process check found no reader
+running. Physical terminal behavior remains unverified. No live data/provider
+action or backend restart. Separate Muse source WIP is preserved.

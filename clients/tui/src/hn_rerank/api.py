@@ -40,7 +40,7 @@ class InvalidProfile(APIError):
 
 
 class TransientError(APIError):
-    """Connection failure or rate limit: says nothing about the story itself."""
+    """Connection, service or rate-limit failure, not a problem with the story."""
 
 
 @dataclass(frozen=True)
@@ -304,11 +304,12 @@ class API:
             delay = response.headers.get("Retry-After", "a few")
             delay = delay if delay.isdigit() else "a few"
             raise TransientError(f"Rate limited. Try again in {delay} seconds.")
-        if response.status_code == 503:
-            # Retryable generation failures (busy join, forced hydration
-            # failure): transient by contract, so the reader keeps the
-            # current story instead of hiding it.
-            raise TransientError("Service unavailable (503). Please try again.")
+        if 500 <= response.status_code < 600:
+            # A server failure says nothing about this story's content.
+            # Keep it available for a manual retry; votes are never retried.
+            raise TransientError(
+                f"Service unavailable ({response.status_code}). Please try again."
+            )
         if response.is_redirect:
             raise APIError(
                 "Server redirected the request. Check the server URL and deployment prefix."

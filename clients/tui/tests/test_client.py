@@ -327,7 +327,7 @@ class FailSummaryServer(FakeServer):
         if request.url.path.endswith("/api/tldr-detail"):
             story_id = json.loads(request.content)["story_id"]
             if story_id in self.fail_ids:
-                return httpx.Response(500)
+                return httpx.Response(404)
         if "/api/tldr-cache/" in request.url.path:
             return httpx.Response(204)
         return await super().__call__(request)

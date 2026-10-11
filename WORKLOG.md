@@ -11872,3 +11872,17 @@ update silently; explicit r keeps its automatic selected-summary follow-up.
 The unanswered preference question was resolved with no implicit background
 generation. Regression checks cover section switching, subsequent background
 growth and profile reconnect. Final checks and restart: see FINDINGS.
+
+## 2026-10-11 — TUI medium reliability fixes
+
+At the user's request, q/Ctrl+q now allow serialized pending votes and undo to
+finish before shutdown, with a five-second limit that keeps the reader open
+rather than cancelling slow saves. Failure remains explicit, and HTTP 5xx
+summary errors keep stories available for manual retry. Permanent 404 content
+and older-server cache fallback coverage remain intact.
+
+The user approved one Claude cloud result review. Verified and corrected its
+introduced exit-guard and lost-error-detail findings with regression tests.
+Validation, review limits and source hashes are saved under
+docs/evaluations/tui-medium-fixes-20261011/. Client-only changes; existing reader
+not restarted, physical controls unverified, no production votes or generation.
