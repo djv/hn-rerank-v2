@@ -14,11 +14,11 @@ from uuid import uuid4
 from rich.text import Text
 from textual import events, work
 from textual.app import App, ComposeResult
+from textual.binding import BindingType
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.timer import Timer
-from textual.worker import Worker, WorkerState
 from textual.widgets import (
     Button,
     Input,
@@ -39,6 +39,7 @@ from textual.widgets._select import (
     SelectOverlay,
 )
 from textual.widgets.option_list import Option
+from textual.worker import Worker, WorkerState
 
 from .api import (
     API,
@@ -491,7 +492,7 @@ def feed_failure_notice(detail: str) -> str:
 
 class Summary(Markdown):
     can_focus = True
-    BINDINGS: ClassVar[list[tuple[str, str, str]]] = [
+    BINDINGS: ClassVar[list[BindingType]] = [
         ("down", "scroll_down", "Down"),
         ("up", "scroll_up", "Up"),
         ("pagedown", "page_down", "Page down"),
@@ -629,7 +630,7 @@ class StatsPrompt(ModalScreen[str]):
     StatsPrompt Button:focus { background: $hn-button-focus; color: $hn-accent; text-style: bold; }
     """
 
-    BINDINGS: ClassVar[list[tuple[str, str, str]]] = [
+    BINDINGS: ClassVar[list[BindingType]] = [
         ("escape", "keep", "Keep"),
     ]
 
@@ -735,7 +736,7 @@ class Reader(App[None]):
     .reading #reading-pane { width: 1fr; max-width: 100; }
     .narrow.reading #reading-pane { height: 1fr; }
     """
-    BINDINGS: ClassVar[list[tuple[str, str, str]]] = [
+    BINDINGS: ClassVar[list[BindingType]] = [
         ("j", "move(1)", "Down"),
         ("k", "move(-1)", "Up"),
         ("space", "page_summary", "Page down"),

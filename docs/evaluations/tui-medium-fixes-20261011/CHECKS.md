@@ -81,6 +81,25 @@ operation. Full suites run with two-CPU/3 GiB limits and one-thread libraries.
 
 ## Runtime bounds and handoff
 
+### Standalone CI follow-up
+
+Backend CI for `3875d82` passed, including browser tests. All three standalone
+OS jobs reached their static checks after tests: Linux/macOS reported
+219 passed / 1 skipped; Windows 220 passed. Their newer Ruff rejected the new worker import order
+and an existing editorial-test import order. Corrected those two blocks.
+Reproduced with an outside-workspace VPS package at
+`/tmp/hn-tui-standalone-SD2aku` using Ruff 0.17.0 and ty 0.0.86.
+The newer ty also caught three existing BINDINGS overrides using an invariant
+narrow list type; changed their annotations to Textual's public BindingType,
+matching its superclass declaration. No binding values or behavior changed.
+Standalone lint/type/format passed after those corrections; full suite 219
+passed / 1 skipped (65.96 s), final-source reliability/editorial 66 passed,
+and source distribution/wheel builds passed. Root Ruff and ty also pass.
+The built wheel's outside-source entrypoint reports version 0.1.0.
+These are import-order and annotation changes only; backend checks are reused.
+Replacement CI is triggered by the follow-up commit; inspect the commit's runs
+for the final cross-platform wheel-install/headless results.
+
 No personal reader was restarted. The final process check found no local reader
 running. The local root-venv entrypoint's editable path resolves to
 `/home/d/code/hn-rerank/clients/tui/src`; its next launch loads this code.

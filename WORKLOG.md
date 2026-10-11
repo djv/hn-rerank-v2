@@ -11886,3 +11886,6 @@ introduced exit-guard and lost-error-detail findings with regression tests.
 Validation, review limits and source hashes are saved under
 docs/evaluations/tui-medium-fixes-20261011/. Client-only changes; existing reader
 not restarted, physical controls unverified, no production votes or generation.
+Standalone CI also passed all behavior tests on Linux/macOS/Windows, then found
+import-order drift. The follow-up corrects imports and three binding annotations
+for the current standalone Ruff/ty; outside-workspace lint/types/build and tests pass.
