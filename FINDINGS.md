@@ -3513,3 +3513,28 @@ this save only adds documentation. Original plan/report, verified assessment
 and current plan: docs/evaluations/codex-forum-review-20261010/ROLLOUT-*.md.
 No deployment, service restart, backup, provider test or additional reviewer.
 Next step is separate approval for pinned 794caa4 after refreshing live gates.
+
+## Approved Codex Forum rollout completed — 2026-10-11
+
+User explicitly approved pinned 794caa4 after reviewing the concrete action.
+Private read-only-source SQLite backup completed in 4.595 s, file 0600 / folder
+0700, quick_check/hash passed. Fast-forwarded production from e1d3fe3 and
+restarted only hn_rewrite.service at 16:51:50 UTC. Eight-source/config/lock
+hashes and the unrelated archive inventory matched; Muse WIP unchanged.
+
+Normal regen completed 16:53:31; deck warm 16:53:44. Existing-profile dashboard,
+feed and readiness returned 200; baseline+1 was served ready with two Codex
+cards. Deployed helper stripped 39 footer characters from a stored sample
+without changing the raw object/DB row. Synthetic reply-body omission passed.
+Known pre-policy summary remained stored while its cache GET returned 204;
+no forced generation or exact-key calculation. Post-start primary Codex misses
+zero; side coverage 99.4267–99.5822%, model trace on, 29 Codex side rows await
+the ordinary timer. Bounded 362-record journal scan: no errors/tracebacks,
+DB-full, side-low-coverage/off or provider-warning matches. No rollback.
+
+Full backup/path/hash/API/resource receipts and verification limits:
+[DEPLOYMENT.md](docs/evaluations/codex-forum-review-20261010/DEPLOYMENT.md).
+No schema change, new profile/vote, extra generation/side job, TUI restart or
+cleanup. Normal startup may invoke existing providers and update derived data.
+Physical TUI, fresh Codex generation and next side timer result remain unverified.
+The fallback and two low implementation findings remain unchanged.

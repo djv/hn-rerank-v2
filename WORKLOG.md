@@ -11932,3 +11932,14 @@ cache/readiness checks and rollback semantics. Preserved initial plan/report,
 source manifest and agent assessment alongside the amended ROLLOUT-PLAN.md.
 User `ss` saves this documentation handoff. No second independent review,
 deployment, service restart, DB backup or extra provider/embedding job.
+
+## 2026-10-11 — Approved Codex source-safety rollout
+
+After explicit approval, deployed pinned 794caa4 to the VPS from e1d3fe3 with
+a validated private online DB backup and unchanged source/config/lock hashes.
+Only hn_rewrite.service restarted (16:51:50 UTC). Normal regen/deck advancement,
+existing-profile GET smoke, nondestructive source normalization and live legacy
+cache miss passed. Side model on and coverage above 99.42%; bounded journal
+quiet. No forced generation, new profile/vote, extra side job or TUI restart.
+No rollback. Evidence and unverified physical/fresh-generation/timer checks:
+docs/evaluations/codex-forum-review-20261010/DEPLOYMENT.md.

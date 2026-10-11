@@ -5,11 +5,10 @@ preview, pending Reddit/Gemma items):
 [before interleaving](docs/status-archive/before-interleaving-20261007.md).
 
 ## Objective
-Save the corrected Codex Forum rollout plan and independent review (user
-2026-10-11, `ss`). Source-safety fixes and the medium footer-search correction
-are verified and pushed at pinned target 794caa4. The two low implementation
-findings and conditional clean-summary fallback remain unchanged/parked.
-Production rollout and the reply/count adapter remain outside this task.
+Deploy the approved Codex Forum source-safety target 794caa4 (user 2026-10-11).
+Rollout is verified on the VPS. The two low implementation findings and
+conditional clean-summary fallback remain unchanged/parked; the reply/count
+adapter remains outside this task.
 
 Compare shortlist #2 (one joined logistic classifier, all features) and #4
 (same, no metadata) live against production through team-draft
@@ -19,6 +18,14 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- Approved Codex Forum rollout complete: VPS pinned to 794caa4, restarted
+  16:51:50 UTC, active/running. Private online backup passed quick_check/hash;
+  source/config/lock and unrelated archive hashes preserved. Normal regen and
+  deck advancement completed; dashboard/feed/readiness passed, two Codex cards
+  present. Live legacy-cache miss and nondestructive footer normalization
+  verified. Side model remained on, post-start coverage above 99.42%; bounded
+  journal scan quiet. No forced generation, new profile/vote, extra side job or
+  TUI restart. [Deployment evidence](docs/evaluations/codex-forum-review-20261010/DEPLOYMENT.md).
 - Codex Forum rollout-plan review completed with Claude cloud. The initial
   plan needed operational corrections; the agent verified and amended it.
   At 16:38, target-code read-only side coverage was 99.7769–99.8374% across
@@ -222,26 +229,25 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   Ruff, touched-file format, and ty clean. Deployed 2026-10-09; scope above.
 
 ## Blocker
-The TUI medium result review is complete and its introduced findings corrected.
-Codex Forum article-attribution fixes are verified on main but not deployed;
-the production behavior remains unchanged pending separate rollout approval.
-No reply/count adapter or rollout is authorized. The conditional fallback is
-parked, not a blocker by itself.
-Physical TUI controls and
-uncached/forced live summary generation remain unverified. No
-smoke-generated votes/profiles or LLM calls;
+No Codex rollout blocker remains. The TUI medium result review is complete
+and its introduced findings corrected.
+Codex Forum source-safety rollout is complete at approved target 794caa4.
+The next ordinary side-vector refresh, fresh Codex generation and physical TUI
+behavior were not observed in the bounded rollout. No reply/count adapter is
+authorized. The conditional fallback is parked, not a blocker by itself.
+No test profiles/votes or explicit generation request were issued; ordinary
+startup provider warming was authorized.
 ranking research remains paused and production trial configuration unchanged.
 
 ## Next step
 - CI: watch the first weekly/PR Terminal client run (macOS leg). Windows-only
   flake `test_filter_change_starts_at_first_story[60]` is left unfixed since
   Windows is no longer tested.
-- Deploy the verified Codex Forum source-safety change only after separate
-  approval for exact target 794caa4 under the [corrected rollout plan](docs/evaluations/codex-forum-review-20261010/ROLLOUT-PLAN.md).
-  Refresh resource/coverage/timer/WIP gates; preserve raw DB/cache rows and the
-  unrelated archive inventory. Normal warming may use configured providers;
-  exact-key comparison and uncached-generation smoke are outside this plan.
-  No cleanup, extra side job or reply/count adapter.
+- Codex Forum deployed at 794caa4: observe ordinary side-timer refresh and
+  reader use. Current side coverage is above 98%; no extra job is needed.
+  Fresh Codex generation and physical TUI rendering remain unverified; do not
+  force them or reopen the parked fallback without a separately scoped request.
+  No cleanup or reply/count adapter.
 - Observe Codex Forum cards in normal ranked views. Forum replies and live
   discussion counts would require a separately scoped Discourse adapter.
 - AI ranking research: goal is a repeatable Muse advantage transferable into
