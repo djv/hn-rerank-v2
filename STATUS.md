@@ -42,6 +42,13 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   its full-suite tool call was rejected and CHECKS.md is absent. Supervising
   diff inspection, complete gates, commit and integration remain pending.
   [Dispatch record](docs/evaluations/codex-forum-review-20261010/HANDOFF-RUN.md).
+- Codex Forum result review: conditional rejection of clean stale summaries
+  is rated low and parked at the user's request; unchanged-input outages still
+  serve cached summaries. [Decision note](docs/evaluations/codex-forum-review-20261010/PARKED-FALLBACK.md).
+  The unrelated LessWrong tap change and two introduced test type errors
+  remain pending. Supervising checks: 36 focused tests and four reproductions
+  passed; changed-file Ruff/format passed; ty failed with those two errors.
+  No reviewed implementation file changed or production rollout occurred.
 - Codex Forum review complete: the actual deployed extractor returned reply
   text as article_body (three non-opening posts matched). The source can enter
   generic article prewarm and short-post tap fetching, so discussion can be

@@ -3419,3 +3419,15 @@ profile/setup concerns: [checks](docs/evaluations/tui-medium-fixes-20261011/CHEC
 No personal reader was restarted; the final local process check found no reader
 running. Physical terminal behavior remains unverified. No live data/provider
 action or backend restart. Separate Muse source WIP is preserved.
+
+## Codex Forum clean-summary fallback parked — 2026-10-11
+
+The user requested a note and no fix after discussing the result review's
+conditional fallback finding. Rating revised from medium to low: a changed
+model/prompt/post key and unavailable regeneration must coincide; a normal
+outage with unchanged inputs still serves the cached summary. Fixture
+reproduction establishes the code path, not a live occurrence. The issue is
+parked and is not itself an integration blocker. Decision, evidence and
+revisit bounds: [parked fallback](docs/evaluations/codex-forum-review-20261010/PARKED-FALLBACK.md).
+Other review findings (LessWrong scope, two introduced ty diagnostics) remain
+pending. No reviewed code, tests, DB, service or deployment changed.
