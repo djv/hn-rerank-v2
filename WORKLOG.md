@@ -1,5 +1,16 @@
 # Worklog: hn-rewrite
 
+## 2026-10-10 — Complete resumed Codex Forum review
+
+Ran the previously authorized single Claude cloud review of eb643bb and the
+proposed reply/count follow-up. Preserved the independent report and verified
+findings in docs/evaluations/codex-forum-review-20261010/. Root's actual deployed
+extractor reproduced reply text in article_body; RSS footer contamination and
+public JSON partial/count semantics also checked. Qualified the review's
+overstated document claim and unverified extraction/production assumptions.
+Updated current handoff. No runtime edits, DB access, forced generation,
+deployment or second review. Fixes await separate authorization.
+
 ## 2026-10-10 — Save pending Codex Forum review immediately
 
 User requested rv, followed by ss now before reviewer launch. Saved the

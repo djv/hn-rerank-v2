@@ -1,15 +1,31 @@
 # HN Rerank findings
 
-## Immediate review handoff — 2026-10-10
+## Codex Forum independent review completed — 2026-10-10
+
+User resumed the pending rv. One Claude Opus cloud review ran through
+cc-cloud-review, with source/diff only. Root verified the medium finding using
+the deployed extractor: public topic HTML returned 2,046 characters containing
+12-word spans from three non-opening reply posts. Generic article fetching can
+therefore label discussion as article text and cache it without reply refresh.
+Low finding: Discourse RSS count/footer text survives into short self_text.
+Host-wide label risk is latent, not a current incorrect label. The review's
+claim that ARCHITECTURE explicitly promises opening-post-only cards was too
+strong; its literal feed-entry statement is true. No generated summary or
+current persisted body was checked. Public JSON proves partial 20-post chunks
+and distinct count fields. No fixes, adapter, DB mutation or LLM call.
+Report, proposed minimal repairs and verification limits:
+[validation](docs/evaluations/codex-forum-review-20261010/VALIDATION.md).
+
+## Prior immediate review handoff — 2026-10-10
 
 User requested rv after the agent recommended explicit forum reply/count
 support, then requested ss now before a reviewer launched. The requested
 review covers the deployed source integration and that proposed follow-up;
-it is pending, not completed. No reviewed runtime files were edited and no
+it was pending at that save. No reviewed runtime files were edited and no
 review finding or implementation approval is inferred from rv/ss.
 Preparation verified the clean eb643bb checkout and read cc-cloud-review's
 recipe/helper. The temporary routing uses one Claude cloud review through
-the private review-drop mailbox; it has not created a bundle/branch/session.
+the private review-drop mailbox; no bundle/branch/session existed at that save.
 The preceding live check confirmed 25 stored forum topics, all with opening
 posts, and two forum cards in one-week Explore. Reply hydration remains absent.
 The previously passing source checks remain applicable: 26 focused,

@@ -5,10 +5,10 @@ preview, pending Reddit/Gemma items):
 [before interleaving](docs/status-archive/before-interleaving-20261007.md).
 
 ## Objective
-Save the completed Codex Forum source integration and the pending independent
-review. User requested rv, then ss now before the reviewer launched. Review
-scope: deployed source integration and proposed forum reply/count support.
-The review remains authorized but has not started; no review findings exist.
+Complete the authorized independent Codex Forum review after the user resumed
+the saved handoff. The Claude cloud review and root reproduction are complete:
+one medium article-attribution issue and one low metadata-text issue. Runtime
+fixes and a forum reply/count adapter remain unimplemented and unauthorized.
 
 Compare shortlist #2 (one joined logistic classifier, all features) and #4
 (same, no metadata) live against production through team-draft
@@ -18,12 +18,14 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
-- Immediate ss handoff: source integration saved/pushed/deployed as eb643bb;
-  laptop and VPS were clean at handoff inspection. Live source has 25 topics,
-  with two in the existing profile's one-week Explore feed at the latest check.
-  No reply adapter or review-driven fix was implemented. Review preparation
-  checked the current source and cc-cloud-review recipe; no cloud session,
-  reviewer process, mailbox branch or uploaded bundle was created.
+- Codex Forum review complete: the actual deployed extractor returned reply
+  text as article_body (three non-opening posts matched). The source can enter
+  generic article prewarm and short-post tap fetching, so discussion can be
+  framed as article text and cached without reply freshness. RSS count footers
+  also enter self_text; no inaccurate generated summary was exercised.
+  Public JSON access and partial-topic responses verified. Independent report
+  and evidence: [review validation](docs/evaluations/codex-forum-review-20261010/VALIDATION.md).
+  No runtime change, production mutation or additional reviewer.
 - Codex Forum added to config.toml with its readable label in pipeline/render.py.
   Both hosts fetched HTTP 200; the production parser returned 25 valid topics
   with opening-post text. After the 2026-10-11 03:26:55 UTC restart, the normal
@@ -165,19 +167,18 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   Ruff, touched-file format, and ty clean. Deployed 2026-10-09; scope above.
 
 ## Blocker
-No source-integration blocker. The requested independent review is pending
-because the user requested immediate ss before launch. No implementation of
-forum reply/count support is authorized. Physical TUI controls and
+The independent review is complete. A confirmed medium article-attribution
+issue remains open; fixes and forum reply/count support need separate user
+authorization under rv. Physical TUI controls and
 uncached/forced live summary generation remain unverified. No
 smoke-generated votes/profiles or LLM calls;
 ranking research remains paused and production trial configuration unchanged.
 
 ## Next step
-- Run the already-authorized independent read-only review of eb643bb and the
-  proposed forum reply/count support. Use cc-cloud-review per AGENT-ACCESS.md
-  while the temporary Claude cloud routing rule applies; bundle only relevant
-  source/diff, never DBs, credentials or private context. Verify the findings
-  against the current code and public-source access; report before any fixes.
+- If authorized, exclude Codex Forum from both generic article-fetch paths and
+  strip the known RSS count footer, with behavioral regression tests. No cached
+  body cleanup is authorized. Decide on a bounded Discourse reply/count adapter
+  separately; preserve sample/total/freshness semantics. Review evidence above.
 - Observe Codex Forum cards in normal ranked views. Forum replies and live
   discussion counts would require a separately scoped Discourse adapter.
 - AI ranking research: goal is a repeatable Muse advantage transferable into
