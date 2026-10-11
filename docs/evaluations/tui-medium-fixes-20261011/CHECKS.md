@@ -100,6 +100,14 @@ These are import-order and annotation changes only; backend checks are reused.
 Replacement CI is triggered by the follow-up commit; inspect the commit's runs
 for the final cross-platform wheel-install/headless results.
 
+`da91687` backend CI and Linux/Windows client test/lint/type/build/install/
+headless jobs passed. macOS found a race in the expanded cache-failure test:
+the summary cache was filled before the selected pane's asynchronous update,
+so the final assertion still saw "Loading summary…". The test now waits for
+both the cache result and rendered selected summary. The fetched CI failures
+reproduce that distinction; no runtime code change or added sleep. The updated
+404/500 cases and standalone lint/type/format pass on the VPS.
+
 No personal reader was restarted. The final process check found no local reader
 running. The local root-venv entrypoint's editable path resolves to
 `/home/d/code/hn-rerank/clients/tui/src`; its next launch loads this code.

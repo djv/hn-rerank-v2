@@ -371,6 +371,12 @@ async def test_failed_background_cache_read_keeps_story(status: int) -> None:
                 if request.url.path.endswith("/api/tldr-detail")
             )
             app.action_refresh()
-        await wait_for(pilot, lambda: app.summaries.get(2) == "# Summary 2")
+        await wait_for(
+            pilot,
+            lambda: (
+                app.summaries.get(2) == "# Summary 2"
+                and "Summary 2" in app.query_one("#summary", Markdown)._markdown
+            ),
+        )
         assert 2 not in app.unavailable
         assert "Summary 2" in app.query_one(Markdown)._markdown
