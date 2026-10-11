@@ -58,21 +58,26 @@ def _stamp(value: os.stat_result) -> tuple[int, int, int, int, int]:
     )
 
 
-def hash_file(path: Path) -> str:
+def hash_file(path: Path, *, allow_link_cleanup: bool = False) -> str:
     """Stream a regular file and reject modification or replacement during hashing."""
     digest = hashlib.sha256()
+
+    def stamp(value: os.stat_result) -> tuple[int, ...]:
+        result = _stamp(value)
+        return result[:4] if allow_link_cleanup else result
+
     try:
-        before = path.stat()
+        before = path.lstat()
         if not stat.S_ISREG(before.st_mode):
             raise FrozenInputsError(f"frozen input is not a regular file: {path}")
-        with path.open("rb") as handle:
+        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as handle:
             opened = os.fstat(handle.fileno())
-            if _stamp(before) != _stamp(opened):
+            if stamp(before) != stamp(opened):
                 raise FrozenInputsError(f"frozen input changed before hashing: {path}")
             while chunk := handle.read(HASH_CHUNK_BYTES):
                 digest.update(chunk)
             after = os.fstat(handle.fileno())
-        if _stamp(opened) != _stamp(after) or _stamp(after) != _stamp(path.stat()):
+        if stamp(opened) != stamp(after) or stamp(after) != stamp(path.lstat()):
             raise FrozenInputsError(f"frozen input changed during hashing: {path}")
     except OSError as exc:
         raise FrozenInputsError(f"cannot hash frozen input: {path}") from exc
@@ -98,10 +103,10 @@ def read_frozen_inputs(work: Path) -> FrozenInputs:
     try:
         if path.is_symlink():
             raise FrozenInputsError(f"frozen-input receipt cannot be a symlink: {path}")
-        before = path.stat()
+        before = path.lstat()
         if not stat.S_ISREG(before.st_mode) or before.st_size > _RECEIPT_MAX_BYTES:
             raise FrozenInputsError(f"invalid frozen-input receipt file: {path}")
-        with path.open("rb") as handle:
+        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as handle:
             opened = os.fstat(handle.fileno())
             content = handle.read(_RECEIPT_MAX_BYTES + 1)
             after = os.fstat(handle.fileno())
@@ -113,7 +118,7 @@ def read_frozen_inputs(work: Path) -> FrozenInputs:
             _stamp(before)[:4]
             == _stamp(opened)[:4]
             == _stamp(after)[:4]
-            == _stamp(path.stat())[:4]
+            == _stamp(path.lstat())[:4]
         ):
             raise FrozenInputsError(
                 f"frozen-input receipt changed while reading: {path}"
@@ -187,6 +192,7 @@ def freeze_inputs(work: Path, snapshot: Path) -> FrozenInputs:
             os.fsync(handle.fileno())
         try:
             os.link(temporary, target)
+            fsync_directory(work)
         except FileExistsError:
             # A concurrent publisher is accepted only for these exact inputs.
             return validate_frozen_inputs(work, snapshot, require_snapshot=True)
@@ -194,3 +200,59 @@ def freeze_inputs(work: Path, snapshot: Path) -> FrozenInputs:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
     return receipt
+
+
+def fsync_directory(directory: Path) -> None:
+    """Make create-only directory entries durable after publication."""
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def publish_immutable(path: Path, content: str) -> None:
+    """Create an exact immutable plan file, or verify an identical existing one."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=".plan-", delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+            fsync_directory(path.parent)
+        except FileExistsError:
+            verify_immutable(path, content)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def verify_immutable(path: Path, content: str) -> None:
+    """Reject missing, replaced or edited plan bytes without repairing them."""
+    expected = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    if hash_file(path, allow_link_cleanup=True) != expected:
+        raise FrozenInputsError(f"immutable paired plan differs: {path}")
+
+
+def publish_result(path: Path, content: str) -> None:
+    """Atomically replace a derived report while keeping previous results on failure."""
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=".result-", delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        fsync_directory(path.parent)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)

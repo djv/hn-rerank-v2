@@ -98,7 +98,15 @@ def test_missing_is_pending_and_valid_cache_is_skipped(worker, tmp_path: Path) -
     job, identity = job_for(worker, tmp_path)
     assert worker.validated_pending_jobs([job], identity) == [job]
     worker.write_cached_score(
-        Path(job["out"]), 0.4, job["state"], job["question"], identity
+        Path(job["out"]),
+        0.4,
+        job["state"],
+        job["question"],
+        identity,
+        extra_fields={
+            "prefix_cached": False,
+            "parity_validation": {"schema": 1, "method": "plain"},
+        },
     )
     assert worker.validated_pending_jobs([job], identity) == []
 
@@ -254,7 +262,15 @@ def test_main_all_valid_entries_does_not_resolve_or_load(
 
     job, identity = job_for(worker, tmp_path)
     worker.write_cached_score(
-        Path(job["out"]), 0.4, job["state"], job["question"], identity
+        Path(job["out"]),
+        0.4,
+        job["state"],
+        job["question"],
+        identity,
+        extra_fields={
+            "prefix_cached": False,
+            "parity_validation": {"schema": 1, "method": "plain"},
+        },
     )
     jobs_path = tmp_path / "jobs.jsonl"
     jobs_path.write_text(json.dumps(job) + "\n")
@@ -268,3 +284,172 @@ def test_main_all_valid_entries_does_not_resolve_or_load(
     monkeypatch.setattr(worker, "local_snapshot", forbidden)
     monkeypatch.setattr(worker, "Scorer", forbidden)
     worker.main()
+
+
+def run_synthetic_worker(
+    worker,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scores: list[float],
+    plain_scores: list[float],
+    groups: list[str] | None = None,
+    options: list[str] | None = None,
+):
+    import json
+
+    jobs = []
+    for i in range(len(scores)):
+        job, identity = job_for(worker, tmp_path)
+        job["state"]["story"] = f"synthetic story {i}"
+        digest = worker.request_sha256(job["state"], job["question"], identity)
+        job.update(
+            out=str(tmp_path / f"{digest}.json"),
+            request_sha256=digest,
+            group=groups[i] if groups else "real",
+        )
+        jobs.append(job)
+    jobs_path = tmp_path / "jobs.jsonl"
+    jobs_path.write_text("".join(json.dumps(job) + "\n" for job in jobs))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "strands_worker",
+            str(jobs_path),
+            "--dtype",
+            "bf16w-fp32",
+            "--batch",
+            "4",
+            *(options or []),
+        ],
+    )
+    monkeypatch.setattr(worker, "validate_runtime_packages", lambda: {})
+    monkeypatch.setattr(worker, "local_snapshot", lambda *args: tmp_path)
+    monkeypatch.setattr(worker, "render_state", lambda state: state["story"])
+    monkeypatch.setattr(worker, "common_prefix", lambda texts: "prefix")
+    plain_calls = []
+
+    class SyntheticScorer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def prefix(self, text):
+            return [1], object()
+
+        def batch(self, prefix_ids, cache, rows):
+            return [(scores[int(text.rsplit(" ", 1)[1])], 10) for text, _ in rows]
+
+        def plain(self, state, question):
+            index = int(state["story"].rsplit(" ", 1)[1])
+            plain_calls.append(index)
+            return plain_scores[index]
+
+    monkeypatch.setattr(worker, "Scorer", SyntheticScorer)
+    return jobs, plain_calls
+
+
+@pytest.mark.parametrize(
+    "scores,plain",
+    [
+        ([0.95, 0.95], [0.05, 0.05]),
+        ([0.4, float("nan")], [0.4, 0.4]),
+        ([0.4, 0.5], [0.4, float("inf")]),
+        ([0.4, 1.5], [0.4, 0.5]),
+    ],
+)
+def test_parity_or_nonfinite_failure_publishes_nothing_in_chunk(
+    worker,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scores: list[float],
+    plain: list[float],
+) -> None:
+    jobs, _ = run_synthetic_worker(worker, tmp_path, monkeypatch, scores, plain)
+    with pytest.raises(worker.CacheValidationError):
+        worker.main()
+    assert all(not Path(job["out"]).exists() for job in jobs)
+
+
+def test_every_profile_group_is_checked_before_its_scores_are_published(
+    worker,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    jobs, calls = run_synthetic_worker(
+        worker,
+        tmp_path,
+        monkeypatch,
+        [0.4, 0.4, 0.95, 0.95],
+        [0.4, 0.4, 0.05, 0.05],
+        ["real", "real", "empty", "empty"],
+    )
+    with pytest.raises(worker.CacheValidationError, match="parity failed"):
+        worker.main()
+    assert calls == [1, 3]
+    assert all(Path(job["out"]).exists() for job in jobs[:2])
+    assert all(not Path(job["out"]).exists() for job in jobs[2:])
+
+
+def test_later_chunk_mismatch_stops_before_publishing_that_chunk(
+    worker,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    jobs, calls = run_synthetic_worker(
+        worker, tmp_path, monkeypatch, [0.4] * 4 + [0.95] * 2, [0.4] * 4 + [0.05] * 2
+    )
+    with pytest.raises(worker.CacheValidationError, match="parity failed"):
+        worker.main()
+    assert calls == [3, 5]
+    assert all(Path(job["out"]).exists() for job in jobs[:4])
+    assert all(not Path(job["out"]).exists() for job in jobs[4:])
+
+
+def test_finite_parity_within_tolerance_publishes_valid_scores(
+    worker,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    jobs, calls = run_synthetic_worker(
+        worker, tmp_path, monkeypatch, [0.4, 0.5], [0.4, 0.50005]
+    )
+    worker.main()
+    assert calls == [1]
+    assert all(Path(job["out"]).exists() for job in jobs)
+    identity = worker.worker_identity(
+        worker.MODEL_ID, worker.MODEL_REVISION, "bf16w-fp32"
+    )
+    for job, expected in zip(jobs, [0.4, 0.5], strict=True):
+        assert (
+            worker.read_cached_score(
+                Path(job["out"]),
+                job["state"],
+                job["question"],
+                identity,
+                require_parity=True,
+            )
+            == expected
+        )
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--check", "0"],
+        ["--check", "-1"],
+        ["--parity-tolerance", "nan"],
+        ["--parity-tolerance", "inf"],
+        ["--parity-tolerance", "-0.1"],
+        ["--parity-tolerance", "1e9"],
+    ],
+)
+def test_invalid_parity_options_stop_before_runtime(
+    worker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, options: list[str]
+) -> None:
+    jobs, calls = run_synthetic_worker(
+        worker, tmp_path, monkeypatch, [0.4, 0.5], [0.4, 0.5], options=options
+    )
+    with pytest.raises(worker.CacheValidationError, match="check must be positive"):
+        worker.main()
+    assert not calls
+    assert all(not Path(job["out"]).exists() for job in jobs)

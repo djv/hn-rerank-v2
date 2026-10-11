@@ -120,7 +120,12 @@ def _reject_constant(value: str) -> object:
 
 
 def read_cached_score(
-    path: Path, state: object, question: object, identity: CacheIdentity
+    path: Path,
+    state: object,
+    question: object,
+    identity: CacheIdentity,
+    *,
+    require_parity: bool = False,
 ) -> float:
     try:
         record = json.loads(
@@ -141,7 +146,49 @@ def read_cached_score(
         raise CacheValidationError(f"cache identity is missing or stale: {path}")
     if record.get("request_sha256") != request_sha256(state, question, identity):
         raise CacheValidationError(f"cache request digest is missing or stale: {path}")
+    if require_parity:
+        validate_parity_record(record)
     return _probability(record.get("p_yes"))
+
+
+def validate_parity_record(record: dict[str, object]) -> None:
+    """Require plain provenance or a strict, passed per-chunk parity receipt."""
+    parity = record.get("parity_validation")
+    if (
+        not isinstance(parity, dict)
+        or type(parity.get("schema")) is not int
+        or parity.get("schema") != 1
+    ):
+        raise CacheValidationError("missing/unsupported parity validation receipt")
+    if record.get("prefix_cached") is False:
+        if parity.get("method") != "plain":
+            raise CacheValidationError("plain score lacks plain-path provenance")
+        return
+    if record.get("prefix_cached") is not True or parity.get("method") != "per_chunk":
+        raise CacheValidationError("cached score lacks per-chunk parity provenance")
+    tolerance = _probability(parity.get("tolerance"))
+    if tolerance > 1e-4:
+        raise CacheValidationError("cache parity tolerance exceeds 1e-4")
+    chunk = parity.get("chunk_requests")
+    checks = parity.get("checks")
+    if (
+        not isinstance(chunk, list)
+        or not chunk
+        or not all(
+            isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)
+            for digest in chunk
+        )
+        or len(set(chunk)) != len(chunk)
+        or record.get("request_sha256") not in chunk
+    ):
+        raise CacheValidationError("parity receipt does not bind this chunk request")
+    if not isinstance(checks, list) or not checks:
+        raise CacheValidationError("parity receipt has no checks")
+    for check in checks:
+        if not isinstance(check, dict) or check.get("request_sha256") not in chunk:
+            raise CacheValidationError("parity check is outside its chunk")
+        if _probability(check.get("difference")) > tolerance:
+            raise CacheValidationError("cache parity check exceeded tolerance")
 
 
 def write_cached_score(

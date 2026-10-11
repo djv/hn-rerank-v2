@@ -11840,3 +11840,21 @@ compares both fits' regularized training objective against a tol=1e-8 reference,
 checks finite normalized predictions, and retains explicit failure/speed examples.
 No production classifier settings changed. Full backend 1,429 passed/1 skipped;
 scoped checks pass. See docs/evaluations/decision1-20261010/WARM-START-CHECK-20261011.md.
+
+## 2026-10-11 — Finish the saved offline HN safeguards
+
+Integrated create-only frozen receipts and v3 manifests into prepare/audit/report;
+NULL comments disable only their control while preserving all candidates; every
+prefix-cached chunk now checks sampled parity before publishing and records proof
+required by worker preflight/audit/report. Fixed path spelling, snapshot substitution,
+immutable fold publication, ctime-only publication races and atomic derived outputs.
+Source-only Claude cloud result review completed; medium parity finding and smaller
+issues corrected and root-tested. No second review or real inference certification.
+
+173 focused and 73 final cache/worker checks pass; full backend 1,429 passed/1 skipped,
+one existing sklearn warning. Ruff/format/scoped ty clean; same 11 absent optional
+inference imports globally. Actual prepare succeeds; audit/report refuse zero paired
+scores before metrics. All 104 legacy files and snapshot hash preserved. Strands PID
+0 and live HN PID 531386 unchanged. No deployment, restart, scoring, downloads,
+Colab or dating-data/model changes. First prepare is the trust anchor; parity remains
+sampled. See docs/evaluations/decision1-20261010/GUARD-FIXES-20261011.md and STATUS.md.

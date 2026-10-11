@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -37,6 +38,7 @@ os.environ["TRANSFORMERS_OFFLINE"] = "1"
 from score_cache import (
     CacheIdentity,
     CacheValidationError,
+    cache_record,
     read_cached_score,
     request_sha256,
     write_cached_score,
@@ -165,7 +167,9 @@ def validated_pending_jobs(jobs: list[dict], identity: CacheIdentity) -> list[di
                     "cache filename must equal the request digest"
                 )
             if path.exists() or path.is_symlink():
-                read_cached_score(path, job["state"], job["question"], identity)
+                read_cached_score(
+                    path, job["state"], job["question"], identity, require_parity=True
+                )
             else:
                 pending.append(job)
         except (KeyError, TypeError, AttributeError) as exc:
@@ -454,8 +458,14 @@ def main() -> None:
     ap.add_argument(
         "--check",
         type=int,
-        default=0,
-        help="compare N cached results with the plain path",
+        default=1,
+        help="validate N cached results from the end of every chunk before publication (minimum 1)",
+    )
+    ap.add_argument(
+        "--parity-tolerance",
+        type=float,
+        default=1e-4,
+        help="maximum cached/plain probability difference (finite, nonnegative)",
     )
     ap.add_argument(
         "--group-key", default="group", help="job field naming its shared-prefix group"
@@ -469,6 +479,14 @@ def main() -> None:
     if a.batch < 1 or a.threads < 1 or (a.limit is not None and a.limit < 0):
         raise CacheValidationError(
             "batch/threads must be positive and limit nonnegative"
+        )
+    if (
+        a.check < 1
+        or not math.isfinite(a.parity_tolerance)
+        or not 0 <= a.parity_tolerance <= 1e-4
+    ):
+        raise CacheValidationError(
+            "check must be positive and parity tolerance finite/nonnegative and <= 1e-4"
         )
     torch.set_num_threads(a.threads)
     torch.set_num_interop_threads(1)
@@ -531,7 +549,41 @@ def main() -> None:
                 print(f"  plain path for {len(chunk)} jobs: {e}", flush=True)
                 res = [(sc.plain(j["state"], j["question"]), -1) for j in chunk]
                 cached = False
-            for j, (p, ntok) in zip(chunk, res, strict=True):
+            # Validate the whole chunk before publishing any score, including
+            # unselected parity rows. Check every chunk, including its longest
+            # row after optional length bucketing, before any publication.
+            validated = list(zip(chunk, res, strict=True))
+            for j, (p, _ntok) in validated:
+                cache_record(p, j["state"], j["question"], identity)
+            checks = []
+            if cached:
+                for j, (p, _ntok) in validated[-a.check :]:
+                    p_plain = sc.plain(j["state"], j["question"])
+                    cache_record(p_plain, j["state"], j["question"], identity)
+                    difference = abs(p - p_plain)
+                    if difference > a.parity_tolerance:
+                        raise CacheValidationError(
+                            f"group {key!r}: cached/plain parity failed: diff {difference:.8g} > {a.parity_tolerance:.8g}; chunk not published"
+                        )
+                    print(
+                        f"  parity OK group {key!r}: diff {difference:.8g}", flush=True
+                    )
+                    checks.append(
+                        {
+                            "request_sha256": j["request_sha256"],
+                            "difference": difference,
+                        }
+                    )
+            parity = {"schema": 1, "method": "plain"}
+            if cached:
+                parity = {
+                    "schema": 1,
+                    "method": "per_chunk",
+                    "tolerance": a.parity_tolerance,
+                    "chunk_requests": [j["request_sha256"] for j, _ in validated],
+                    "checks": checks,
+                }
+            for j, (p, ntok) in validated:
                 write_cached_score(
                     Path(j["out"]),
                     p,
@@ -541,6 +593,7 @@ def main() -> None:
                     extra_fields={
                         "n_tokens": ntok,
                         "prefix_cached": cached,
+                        "parity_validation": parity,
                         "base_model_id": BASE_MODEL_ID,
                         "base_model_revision": BASE_MODEL_REVISION,
                         "runtime_packages": runtime_packages,
@@ -552,18 +605,6 @@ def main() -> None:
                 f"  {done}/{len(todo)} batch {time.time() - tb:.1f}s; {el / done:.2f}s/job; eta {el / done * (len(todo) - done) / 60:.0f} min",
                 flush=True,
             )
-        if a.check:
-            for j, t in list(zip(group, texts))[: a.check]:
-                tp = time.time()
-                p_plain = sc.plain(j["state"], j["question"])
-                p_cached = read_cached_score(
-                    Path(j["out"]), j["state"], j["question"], identity
-                )
-                print(
-                    f"  check: cached {p_cached:.4f} plain {p_plain:.4f} diff {p_cached - p_plain:+.4f} ({time.time() - tp:.1f}s plain)",
-                    flush=True,
-                )
-            a.check = 0
     print(f"done {done} jobs in {time.time() - t_start:.0f}s", flush=True)
 
 

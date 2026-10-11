@@ -58,6 +58,18 @@ from score_cache import (  # noqa: E402
     read_cached_score,
     request_sha256,
 )
+from frozen_inputs import (  # noqa: E402
+    FrozenInputs,
+    FrozenInputsError,
+    RECEIPT_FILENAME,
+    freeze_inputs,
+    hash_file,
+    publish_immutable,
+    publish_result,
+    read_frozen_inputs,
+    validate_frozen_inputs,
+    verify_immutable,
+)
 
 from database import Database, Story  # noqa: E402
 from pipeline import Config, NULL_TRACE, RankTrace, _NullTrace  # noqa: E402
@@ -157,6 +169,8 @@ def _build_profile(
 
 def cmd_folds(work: Path, evaluator_args: Sequence[str]) -> None:
     work.mkdir(parents=True, exist_ok=True)
+    if (work / "folds.json").exists() or (work / RECEIPT_FILENAME).exists():
+        raise ValueError("folds already exist; use a new work directory")
     captured: list[Fold] = []
     original = evaluator._production_scores
 
@@ -233,8 +247,8 @@ def cmd_folds(work: Path, evaluator_args: Sequence[str]) -> None:
         )
     (work / "dropped_candidates.json").write_text(json.dumps(dropped) + "\n")
     print(f"dropped {len(dropped)} stale-embedding candidates: {dropped[:20]}")
-    (work / "folds.json").write_text(
-        json.dumps([asdict(f) for f in captured], indent=1) + "\n"
+    publish_immutable(
+        work / "folds.json", json.dumps([asdict(f) for f in captured], indent=1) + "\n"
     )
     for f in captured:
         n_up = sum(label == UP for label in f.labels)
@@ -246,8 +260,16 @@ def cmd_folds(work: Path, evaluator_args: Sequence[str]) -> None:
         )
 
 
-def load_folds(work: Path) -> list[Fold]:
-    raw = json.loads((work / "folds.json").read_text())
+def load_folds(work: Path, receipt: FrozenInputs | None = None) -> list[Fold]:
+    import hashlib
+
+    content = (work / "folds.json").read_bytes()
+    if (
+        receipt is not None
+        and hashlib.sha256(content).hexdigest() != receipt.folds_sha256
+    ):
+        raise FrozenInputsError("folds.json differs from the initially frozen input")
+    raw = json.loads(content)
     return [
         Fold(
             fold=f["fold"],
@@ -317,8 +339,10 @@ def strands_identity() -> CacheIdentity:
     )
 
 
-def checked_folds(work: Path, folds_arg: set[int] | None) -> list[Fold]:
-    folds = load_folds(work)
+def checked_folds(
+    work: Path, folds_arg: set[int] | None, receipt: FrozenInputs | None = None
+) -> list[Fold]:
+    folds = load_folds(work, receipt)
     numbers = [fold.fold for fold in folds]
     if len(numbers) != len(set(numbers)):
         raise ValueError("duplicate fold numbers")
@@ -383,15 +407,40 @@ def prepare_strands_jobs(
     sample: int | None = None,
     seed: int = 0,
     folds_arg: set[int] | None = None,
+    snapshot: Path | None = None,
 ) -> Path:
     """Prepare the full paired scope; legacy score presence never removes jobs."""
+    work = work.resolve()
+    if sample is not None and sample < 0:
+        raise ValueError("sample size cannot be negative")
+    if snapshot is None:
+        receipt = validate_frozen_inputs(work)
+    else:
+        receipt = freeze_inputs(work, snapshot)
+    path, content, manifest = paired_plan(work, sample, seed, folds_arg, receipt)
+    validate_frozen_inputs(work, snapshot)
+    publish_immutable(path, content)
+    publish_immutable(path.parent / "manifest.json", manifest)
+    print(f"prepared immutable paired jobs: {path}")
+    return path
+
+
+def paired_plan(
+    work: Path,
+    sample: int | None,
+    seed: int,
+    folds_arg: set[int] | None,
+    receipt: FrozenInputs,
+) -> tuple[Path, str, str]:
+    """Derive the entire plan from trusted inputs, including labels and scope."""
     import hashlib
 
+    work = work.resolve()
     if sample is not None and sample < 0:
         raise ValueError("sample size cannot be negative")
     identity = strands_identity()
     jobs = []
-    for fold in checked_folds(work, folds_arg):
+    for fold in checked_folds(work, folds_arg, receipt):
         for i in selected(fold, sample, seed):
             card = fold.candidates[i]
             for variant in ("real", "empty"):
@@ -413,16 +462,10 @@ def prepare_strands_jobs(
                 )
     content = "".join(json.dumps(job, sort_keys=True) + "\n" for job in jobs)
     digest = hashlib.sha256(content.encode()).hexdigest()
-    directory = work / "paired_plans" / digest
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / "jobs.jsonl"
-    if path.exists() and path.read_text() != content:
-        raise ValueError("immutable paired job plan changed")
-    if not path.exists():
-        path.write_text(content)
-    receipt = {
+    manifest = {
+        "schema": 3,
         "jobs_sha256": digest,
-        "folds_sha256": hashlib.sha256((work / "folds.json").read_bytes()).hexdigest(),
+        "frozen_inputs": asdict(receipt),
         "jobs": len(jobs),
         "stories_per_profile": len(jobs) // 2,
         "identity": asdict(identity),
@@ -433,9 +476,26 @@ def prepare_strands_jobs(
         "primary_comparison": "real-minus-empty within-fold pooled judged-story AUC",
         "confirmation_used": False,
     }
-    (directory / "manifest.json").write_text(json.dumps(receipt, indent=2) + "\n")
-    print(f"prepared {len(jobs)} paired jobs ({len(jobs) // 2}/profile): {path}")
-    return path
+    manifest_text = (
+        json.dumps(manifest, sort_keys=True, indent=2, allow_nan=False) + "\n"
+    )
+    plan_digest = hashlib.sha256(manifest_text.encode()).hexdigest()
+    path = work / "paired_plans_v3" / plan_digest / "jobs.jsonl"
+    return path, content, manifest_text
+
+
+def validate_paired_plan(
+    work: Path,
+    sample: int | None,
+    seed: int,
+    folds_arg: set[int] | None,
+    snapshot: Path | None = None,
+) -> tuple[FrozenInputs, Path]:
+    receipt = validate_frozen_inputs(work, snapshot)
+    path, content, manifest = paired_plan(work, sample, seed, folds_arg, receipt)
+    verify_immutable(path, content)
+    verify_immutable(path.parent / "manifest.json", manifest)
+    return receipt, path
 
 
 @dataclass(frozen=True)
@@ -455,11 +515,13 @@ def audit_strands_cache(
     sample: int | None,
     seed: int,
     folds_arg: set[int] | None,
+    snapshot: Path | None = None,
 ) -> dict[str, object]:
     """Count complete, valid paired coverage before any efficacy metric is computed."""
+    receipt, plan = validate_paired_plan(work, sample, seed, folds_arg, snapshot)
     identity = strands_identity()
     coverage: list[CoverageRow] = []
-    for fold in checked_folds(work, folds_arg):
+    for fold in checked_folds(work, folds_arg, receipt):
         positions = selected(fold, sample, seed)
         for variant in ("real", "empty"):
             valid = missing = invalid = legacy = 0
@@ -479,7 +541,11 @@ def audit_strands_cache(
                     continue
                 try:
                     read_cached_score(
-                        path, profile_state(fold, card, variant), QUESTION, identity
+                        path,
+                        profile_state(fold, card, variant),
+                        QUESTION,
+                        identity,
+                        require_parity=True,
                     )
                     valid += 1
                 except CacheValidationError as exc:
@@ -502,12 +568,15 @@ def audit_strands_cache(
     result = {
         "complete": complete,
         "identity": asdict(identity),
+        "frozen_inputs": asdict(receipt),
+        "plan": str(plan),
         "coverage": [asdict(row) for row in coverage],
         "primary_blend_weight": PRIMARY_BLEND_WEIGHT,
         "metrics_computed": False,
         "confirmation_used": False,
     }
-    (work / "cache_audit_v2.json").write_text(json.dumps(result, indent=2) + "\n")
+    validate_paired_plan(work, sample, seed, folds_arg, snapshot)
+    publish_result(work / "cache_audit_v3.json", json.dumps(result, indent=2) + "\n")
     return result
 
 
@@ -688,9 +757,10 @@ def cmd_score_strands(
     python: str,
     threads: int,
     batch: int,
+    snapshot: Path | None = None,
 ) -> None:
     """Score with Strands Decider locally: same state and question, no network."""
-    jobs_path = prepare_strands_jobs(work, sample, seed, folds)
+    jobs_path = prepare_strands_jobs(work, sample, seed, folds, snapshot)
     cmd = [
         python,
         str(STRANDS_WORKER),
@@ -705,6 +775,10 @@ def cmd_score_strands(
         str(batch),
         "--dtype",
         STRANDS_DTYPE,
+        "--check",
+        "1",
+        "--parity-tolerance",
+        "0.0001",
     ]
     if limit is not None:
         cmd += ["--limit", str(limit)]
@@ -822,29 +896,52 @@ def _story_bootstrap_auc(
 
 
 def snapshot_popularity(
-    snapshot: Path, story_ids: set[int]
-) -> dict[int, tuple[float, float]]:
+    snapshot: Path,
+    story_ids: set[int],
+    expected_sha256: str | None = None,
+) -> dict[int, tuple[float, float | None]]:
     """Read only the immutable snapshot; missing values never become zero scores."""
     import sqlite3
+    from contextlib import closing
 
     if not snapshot.is_file():
         raise ValueError("popularity snapshot is missing")
-    with sqlite3.connect(
-        snapshot.resolve().as_uri() + "?mode=ro&immutable=1", uri=True
+    for suffix in ("-wal", "-journal", "-shm"):
+        sidecar = Path(str(snapshot) + suffix)
+        if sidecar.exists() or sidecar.is_symlink():
+            raise ValueError(
+                "popularity snapshot has SQLite sidecars; require a standalone frozen snapshot"
+            )
+    before = hash_file(snapshot)
+    if expected_sha256 is not None and before != expected_sha256:
+        raise FrozenInputsError(
+            "popularity snapshot differs from frozen receipt at read time"
+        )
+    with closing(
+        sqlite3.connect(snapshot.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
     ) as conn:
         records = conn.execute("SELECT id, score, comment_count FROM stories")
-        result: dict[int, tuple[float, float]] = {}
+        result: dict[int, tuple[float, float | None]] = {}
         for sid, points, comments in records:
             if sid not in story_ids:
                 continue
             if (
                 points is None
-                or comments is None
                 or not math.isfinite(points)
-                or not math.isfinite(comments)
+                or (comments is not None and not math.isfinite(comments))
             ):
                 raise ValueError(f"story {sid}: missing/nonfinite popularity metadata")
-            result[sid] = (math.log1p(max(0, points)), math.log1p(max(0, comments)))
+            result[sid] = (
+                math.log1p(max(0, points)),
+                math.log1p(max(0, comments)) if comments is not None else None,
+            )
+    if hash_file(snapshot) != before:
+        raise FrozenInputsError("popularity snapshot changed while reading")
+    for suffix in ("-wal", "-journal", "-shm"):
+        if Path(str(snapshot) + suffix).exists():
+            raise FrozenInputsError(
+                "popularity snapshot gained SQLite sidecars while reading"
+            )
     if result.keys() != story_ids:
         raise ValueError("popularity snapshot does not cover the exact candidate pool")
     return result
@@ -870,22 +967,22 @@ def cmd_report(
     snapshot: Path | None = None,
 ) -> None:
     """Refuse partial or unverifiable scores before computing any efficacy metric."""
-    import hashlib
-
+    work = work.resolve()
     if BACKEND != "strands":
         raise ValueError(
             "paired provenance contract is currently implemented only for Strands; legacy Decision-1 reports are disabled"
-        )
-    audit = audit_strands_cache(work, sample, seed, folds_arg)
-    if not audit["complete"]:
-        raise ValueError(
-            "incomplete or invalid paired score coverage; see cache_audit_v2.json; no efficacy report computed"
         )
     if snapshot is None:
         raise ValueError(
             "--snapshot is required for same-candidate popularity controls"
         )
-    folds = checked_folds(work, folds_arg)
+    receipt = validate_frozen_inputs(work, snapshot, require_snapshot=True)
+    audit = audit_strands_cache(work, sample, seed, folds_arg, snapshot)
+    if not audit["complete"]:
+        raise ValueError(
+            "incomplete or invalid paired score coverage; see cache_audit_v3.json; no efficacy report computed"
+        )
+    folds = checked_folds(work, folds_arg, receipt)
     positions = [selected(fold, sample, seed) for fold in folds]
     popularity = snapshot_popularity(
         snapshot,
@@ -894,6 +991,10 @@ def cmd_report(
             for fold, indexes in zip(folds, positions, strict=True)
             for i in indexes
         },
+        receipt.snapshot_sha256,
+    )
+    missing_comments = sorted(
+        sid for sid, (_, count) in popularity.items() if count is None
     )
     identity = strands_identity()
     rows: dict[str, list[dict[str, float | None]]] = {}
@@ -914,6 +1015,7 @@ def cmd_report(
                         profile_state(fold, fold.candidates[i], variant),
                         QUESTION,
                         identity,
+                        require_parity=True,
                     )
                     for i in indexes
                 ]
@@ -928,9 +1030,12 @@ def cmd_report(
             variants[f"blend_{variant}_w{w}"] = (1 - w) * _pct(prod) + w * _pct(
                 model_scores[variant]
             )
-        for offset, name in enumerate(("snapshot_points", "snapshot_comments")):
-            variants[name] = np.asarray(
-                [popularity[fold.candidates[i].id][offset] for i in indexes]
+        variants["snapshot_points"] = np.asarray(
+            [popularity[fold.candidates[i].id][0] for i in indexes], dtype=float
+        )
+        if not missing_comments:
+            variants["snapshot_comments"] = np.asarray(
+                [popularity[fold.candidates[i].id][1] for i in indexes], dtype=float
             )
         profile_paired.append((model_scores["empty"], model_scores["real"], labels))
         for name, scores in variants.items():
@@ -976,7 +1081,10 @@ def cmd_report(
     out = {
         "model": STRANDS_MODEL,
         "cache_identity": asdict(identity),
-        "folds_sha256": hashlib.sha256((work / "folds.json").read_bytes()).hexdigest(),
+        "folds_sha256": receipt.folds_sha256,
+        "snapshot_sha256": receipt.snapshot_sha256,
+        "frozen_inputs": asdict(receipt),
+        "plan": audit["plan"],
         "sample_per_fold": sample,
         "seed": seed,
         "folds": fold_info,
@@ -988,12 +1096,26 @@ def cmd_report(
         "confirmation_used": False,
         "coverage_complete": True,
         "secondary_comparisons_are_exploratory": True,
+        "unavailable_controls": {
+            "snapshot_comments": {
+                "reason": "NULL comment counts in selected candidate pool",
+                "missing_story_ids": missing_comments,
+                "missing_count": len(missing_comments),
+                "no_candidate_dropping_or_imputation": True,
+            }
+        }
+        if missing_comments
+        else {},
     }
-    (work / "report_strands_v2.json").write_text(
-        json.dumps(out, indent=2, allow_nan=False) + "\n"
+    final_receipt, _ = validate_paired_plan(work, sample, seed, folds_arg, snapshot)
+    if final_receipt != receipt or read_frozen_inputs(work) != receipt:
+        raise FrozenInputsError("frozen input receipt changed during reporting")
+    publish_result(
+        work / "report_strands_v3.json",
+        json.dumps(out, indent=2, allow_nan=False) + "\n",
     )
     print(
-        "complete paired report: report_strands_v2.json; fixed blend weight",
+        "complete paired report: report_strands_v3.json; fixed blend weight",
         PRIMARY_BLEND_WEIGHT,
     )
 
@@ -1038,6 +1160,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--threads", type=int, default=3, help="strands torch threads")
     parser.add_argument("--batch", type=int, default=4, help="strands batch size")
     args, evaluator_args = parser.parse_known_args(argv)
+    args.work = args.work.resolve()
     if evaluator_args and args.phase != "folds":
         parser.error("unexpected arguments: " + " ".join(evaluator_args))
     global BACKEND
@@ -1048,9 +1171,13 @@ def main(argv: list[str] | None = None) -> None:
     if args.phase in ("prepare", "audit") and BACKEND != "strands":
         parser.error("prepare/audit require --backend strands")
     if args.phase == "prepare":
-        prepare_strands_jobs(args.work, args.sample_per_fold, args.seed, folds)
+        prepare_strands_jobs(
+            args.work, args.sample_per_fold, args.seed, folds, args.snapshot
+        )
     elif args.phase == "audit":
-        result = audit_strands_cache(args.work, args.sample_per_fold, args.seed, folds)
+        result = audit_strands_cache(
+            args.work, args.sample_per_fold, args.seed, folds, args.snapshot
+        )
         print(json.dumps(result, indent=2))
         if not result["complete"]:
             raise SystemExit("incomplete paired coverage; no metrics computed")
@@ -1069,6 +1196,7 @@ def main(argv: list[str] | None = None) -> None:
             args.strands_python,
             args.threads,
             args.batch,
+            args.snapshot,
         )
     elif args.phase == "score":
         cmd_score(

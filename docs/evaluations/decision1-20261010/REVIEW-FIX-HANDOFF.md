@@ -1,3 +1,10 @@
+# Archived save-now HN handoff
+
+Superseded 2026-10-11: the safeguards are implemented and tested. Current result,
+review corrections and limits: [GUARD-FIXES-20261011.md](GUARD-FIXES-20261011.md).
+Current objective/blocker: [STATUS.md](STATUS.md). The original save boundary below
+is historical evidence, not the current task status.
+
 # Save-now handoff: confirmed HN evaluation defects
 
 The user requested `fix`, then an independent `rv`, then `ss now`. Work stopped

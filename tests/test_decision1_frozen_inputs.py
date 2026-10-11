@@ -360,3 +360,21 @@ def test_concurrent_different_snapshots_cannot_overwrite_winning_receipt(
         module.hash_file(second),
     }
     assert not list(tmp_path.glob(".frozen-inputs-*"))
+
+
+def test_atomic_result_publication_failure_preserves_previous_bytes(
+    module: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "report.json"
+    path.write_text("previous complete result")
+
+    def fail_replace(*args: object) -> None:
+        raise OSError("synthetic publication failure")
+
+    monkeypatch.setattr(module.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="synthetic publication failure"):
+        module.publish_result(path, "new complete result")
+    assert path.read_text() == "previous complete result"
+    assert not list(tmp_path.glob(".result-*"))
