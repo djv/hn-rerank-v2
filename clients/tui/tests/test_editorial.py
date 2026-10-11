@@ -165,7 +165,11 @@ async def test_filter_change_starts_at_first_story(width: int) -> None:
             app.query_one("#sort", Select).value = "recommended"
         else:
             await pilot.click("#sort-recommended")
-        await pilot.pause()
+        deadline = time.monotonic() + 5.0
+        while (selected := app.selected()) is None or selected.id != 1:
+            if time.monotonic() >= deadline:
+                raise AssertionError("recommended filter did not select its first story")
+            await pilot.pause(0.05)
         assert listing.highlighted == 0
         selected = app.selected()
         assert selected is not None and selected.id == 1

@@ -108,6 +108,14 @@ both the cache result and rendered selected summary. The fetched CI failures
 reproduce that distinction; no runtime code change or added sleep. The updated
 404/500 cases and standalone lint/type/format pass on the VPS.
 
+`4c17ed7` backend, Linux and macOS CI passed, including wheel install/headless
+startup. Windows failed the unchanged narrow filter-order assertion twice
+(original run and one failed-job retry); the same runtime code passed Windows
+in `da91687`. The test assumed one idle turn completed Select's asynchronous
+filter change. It now waits, bounded to five seconds, for selection of the
+expected first story and retains the highlight/ID/scroll assertions. No filter
+implementation change. Replacement cross-platform CI verifies that test change.
+
 No personal reader was restarted. The final process check found no local reader
 running. The local root-venv entrypoint's editable path resolves to
 `/home/d/code/hn-rerank/clients/tui/src`; its next launch loads this code.
