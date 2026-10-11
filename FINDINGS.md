@@ -3451,3 +3451,21 @@ bounds and preserved raw-input policy are in
 [CHECKS.md](docs/evaluations/codex-forum-review-20261010/CHECKS.md).
 No production checkout update, DB/profile/vote/provider action, restart,
 deployment or reply/count adapter. The fallback remains parked and unchanged.
+
+## CI failure emails and decision1 ty errors — 2026-10-11
+
+User asked to fix CI failures and stop the GitHub email flood. Week of
+2026-10-04: 17 failed runs (11 Terminal client on main, mostly cross-OS legs;
+5 `ci` on `eval-decision1`; 1 `ci` on main). `eval-decision1` failed only at
+`ty check`: 11 `unresolved-import` errors for `torch` and `strands_decider`
+in `docs/evaluations/decision1-20261010/strands_worker.py`; reproduced
+locally (torch not installed). Fix 8c8358c (`[tool.ty.analysis]
+allowed-unresolved-imports`), CI run 38143556782 passed; VPS worktree
+fast-forwarded (untracked files untouched).
+
+`tui.yml`: push → Ubuntu only; PR/weekly (Mon 09:17 UTC)/manual → Ubuntu +
+macOS; concurrency cancels superseded runs (f3e995d, 47ed9ea). Manual
+three-OS run 38143782178 before the Windows removal: Ubuntu and macOS passed,
+Windows failed `test_filter_change_starts_at_first_story[60]` ("recommended
+filter did not select its first story") despite the 5 s wait from f6957a4;
+15/15 local Linux passes. The user chose not to test Windows.

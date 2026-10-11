@@ -19,6 +19,13 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- CI noise reduced (user 2026-10-11): `eval-decision1` CI was red on `ty`
+  (11 unresolved optional imports in the decision1 Strands worker); 8c8358c
+  allows `torch`/`strands_decider` via `[tool.ty.analysis]`, run 38143556782
+  green. The Terminal client workflow now tests Ubuntu on pushes and
+  Ubuntu+macOS on PRs, a weekly Monday run and manual runs; Windows is no
+  longer tested (user choice), superseded runs cancel. Post-push runs on
+  47ed9ea green; the PR/weekly macOS leg is unverified under the new trigger.
 - TUI medium fixes implemented: q/Ctrl+q drain queued votes in order for up to
   five seconds, keeping the reader open on timeout or unconfirmed saving.
   Vote/undo remain disabled through successful exit. HTTP 5xx errors use the
@@ -212,6 +219,9 @@ smoke-generated votes/profiles or LLM calls;
 ranking research remains paused and production trial configuration unchanged.
 
 ## Next step
+- CI: watch the first weekly/PR Terminal client run (macOS leg). Windows-only
+  flake `test_filter_change_starts_at_first_story[60]` is left unfixed since
+  Windows is no longer tested.
 - Deploy the verified Codex Forum source-safety change only after separate
   approval. Preserve raw DB/cache rows; check normal refresh, cache behavior
   and bounded service logs after rollout. No cleanup or reply/count adapter.

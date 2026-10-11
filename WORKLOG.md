@@ -11905,3 +11905,10 @@ parked-note changes. Original Muse WIP remains untouched. Final-source gates:
 Evidence: docs/evaluations/codex-forum-review-20261010/CHECKS.md and manifests.
 This is source integration only; production checkout, service and data were
 not changed. Deployment requires separate approval.
+
+## 2026-10-11 — Quieter CI and green decision1 branch
+
+Allowed the decision1 worker's optional `torch`/`strands_decider` imports in
+ty (8c8358c on `eval-decision1`, CI green). Terminal client CI now runs
+Ubuntu on pushes and Ubuntu+macOS on PRs/weekly/manual, cancels superseded
+runs and no longer tests Windows (user choice). Evidence: FINDINGS.md.
