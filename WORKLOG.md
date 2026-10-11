@@ -1,5 +1,13 @@
 # Worklog: hn-rewrite
 
+## 2026-10-10 — Save pending Codex Forum review immediately
+
+User requested rv, followed by ss now before reviewer launch. Saved the
+review scope, unchanged deployed source, existing verification and explicit
+pending state in STATUS.md/FINDINGS.md. No independent result is claimed;
+no cloud session or bundle was created. No reply implementation or runtime
+change. Documentation-only save reuses the passing source checks.
+
 ## 2026-10-10 — Add Codex community forum RSS
 
 Added the user-selected category feed

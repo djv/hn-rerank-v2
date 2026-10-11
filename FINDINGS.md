@@ -1,5 +1,21 @@
 # HN Rerank findings
 
+## Immediate review handoff — 2026-10-10
+
+User requested rv after the agent recommended explicit forum reply/count
+support, then requested ss now before a reviewer launched. The requested
+review covers the deployed source integration and that proposed follow-up;
+it is pending, not completed. No reviewed runtime files were edited and no
+review finding or implementation approval is inferred from rv/ss.
+Preparation verified the clean eb643bb checkout and read cc-cloud-review's
+recipe/helper. The temporary routing uses one Claude cloud review through
+the private review-drop mailbox; it has not created a bundle/branch/session.
+The preceding live check confirmed 25 stored forum topics, all with opening
+posts, and two forum cards in one-week Explore. Reply hydration remains absent.
+The previously passing source checks remain applicable: 26 focused,
+1,264 backend / 1 skipped, Ruff/format/ty, live ingestion and HTTP smoke.
+This save changes documentation only; no repeated suite or service restart.
+
 ## Codex community forum source — 2026-10-10
 
 - User requested https://community.openai.com/c/codex/37 as a source.

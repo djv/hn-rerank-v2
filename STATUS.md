@@ -5,10 +5,10 @@ preview, pending Reddit/Gemma items):
 [before interleaving](docs/status-archive/before-interleaving-20261007.md).
 
 ## Objective
-Add the user-selected Codex community forum as a feed source. The generic
-RSS path now includes its category feed and labels it "Codex Forum";
-VPS ingestion and service smoke checks passed. Opening posts are imported;
-there is no separate Discourse reply hydration or engagement-score adapter.
+Save the completed Codex Forum source integration and the pending independent
+review. User requested rv, then ss now before the reviewer launched. Review
+scope: deployed source integration and proposed forum reply/count support.
+The review remains authorized but has not started; no review findings exist.
 
 Compare shortlist #2 (one joined logistic classifier, all features) and #4
 (same, no metadata) live against production through team-draft
@@ -18,6 +18,12 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- Immediate ss handoff: source integration saved/pushed/deployed as eb643bb;
+  laptop and VPS were clean at handoff inspection. Live source has 25 topics,
+  with two in the existing profile's one-week Explore feed at the latest check.
+  No reply adapter or review-driven fix was implemented. Review preparation
+  checked the current source and cc-cloud-review recipe; no cloud session,
+  reviewer process, mailbox branch or uploaded bundle was created.
 - Codex Forum added to config.toml with its readable label in pipeline/render.py.
   Both hosts fetched HTTP 200; the production parser returned 25 valid topics
   with opening-post text. After the 2026-10-11 03:26:55 UTC restart, the normal
@@ -159,11 +165,19 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   Ruff, touched-file format, and ty clean. Deployed 2026-10-09; scope above.
 
 ## Blocker
-No code/check blocker. Physical TUI controls and uncached/forced live summary
-generation remain unverified. No smoke-generated votes/profiles or LLM calls;
+No source-integration blocker. The requested independent review is pending
+because the user requested immediate ss before launch. No implementation of
+forum reply/count support is authorized. Physical TUI controls and
+uncached/forced live summary generation remain unverified. No
+smoke-generated votes/profiles or LLM calls;
 ranking research remains paused and production trial configuration unchanged.
 
 ## Next step
+- Run the already-authorized independent read-only review of eb643bb and the
+  proposed forum reply/count support. Use cc-cloud-review per AGENT-ACCESS.md
+  while the temporary Claude cloud routing rule applies; bundle only relevant
+  source/diff, never DBs, credentials or private context. Verify the findings
+  against the current code and public-source access; report before any fixes.
 - Observe Codex Forum cards in normal ranked views. Forum replies and live
   discussion counts would require a separately scoped Discourse adapter.
 - AI ranking research: goal is a repeatable Muse advantage transferable into
