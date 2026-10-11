@@ -5,7 +5,9 @@ preview, pending Reddit/Gemma items):
 [before interleaving](docs/status-archive/before-interleaving-20261007.md).
 
 ## Objective
-Integrate the verified Codex Forum fixes (user 2026-10-11).
+Correct the reviewed Codex Forum footer-search slowdown (user 2026-10-11).
+The user chose Fix medium; the two low review findings remain unchanged.
+The source-safety integration remains in place.
 Scope: article-fetch suppression, generated-footer removal, nondestructive
 legacy input/cache handling, regression tests and the two remaining review
 corrections. Keep the conditional clean-summary fallback parked. Production
@@ -19,6 +21,12 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- Codex Forum medium review finding fixed: flattened-footer matching starts
+  at a separate count token and avoids repeated digit/whitespace scanning.
+  The new regressions failed before correction (32K runs took about nine
+  seconds each; authored `v12` was truncated). Final checks: Codex tests 37
+  passed, backend 1,304 / 1 skipped, Ruff/ty/two-file format clean. No rollout
+  or additional reviewer. [Regex-fix evidence](docs/evaluations/codex-forum-review-20261010/FOOTER-REGEX-FIX.md).
 - CI noise reduced (user 2026-10-11): `eval-decision1` CI was red on `ty`
   (11 unresolved optional imports in the decision1 Strands worker); 8c8358c
   allows `torch`/`strands_decider` via `[tool.ty.analysis]`, run 38143556782

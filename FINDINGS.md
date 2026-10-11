@@ -3469,3 +3469,21 @@ three-OS run 38143782178 before the Windows removal: Ubuntu and macOS passed,
 Windows failed `test_filter_change_starts_at_first_story[60]` ("recommended
 filter did not select its first story") despite the 5 s wait from f6957a4;
 15/15 local Linux passes. The user chose not to test Windows.
+
+## Codex Forum footer-search medium corrected — 2026-10-11
+
+After the final independent Claude cloud review, the user chose Fix medium.
+New regressions reproduced two quadratic scans (32K digit/space runs took
+9.192/9.324 seconds on the VPS) and truncation of an authored `v12` token.
+The plain-text footer matcher now starts only at a separate count token and
+trims preceding whitespace only after recognizing the full terminal footer.
+Existing valid-footer and nondestructive effective-view behavior remains.
+
+Final matching-source VPS checks: 37 Codex tests; full backend 1,304 passed /
+1 skipped in 45.74 seconds with the existing MLP convergence warning.
+Repository Ruff/ty, both touched-file formats and whitespace checks clean.
+Synthetic post-fix laptop timings were under one millisecond for both 32K
+runs; before/after timing hosts differ. Evidence and hashes:
+[FOOTER-REGEX-FIX.md](docs/evaluations/codex-forum-review-20261010/FOOTER-REGEX-FIX.md).
+Two low findings and the parked fallback remain unchanged. No deployment,
+restart, DB/cache/provider action or additional reviewer; Muse WIP preserved.

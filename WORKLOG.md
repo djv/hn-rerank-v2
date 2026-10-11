@@ -11912,3 +11912,13 @@ Allowed the decision1 worker's optional `torch`/`strands_decider` imports in
 ty (8c8358c on `eval-decision1`, CI green). Terminal client CI now runs
 Ubuntu on pushes and Ubuntu+macOS on PRs/weekly/manual, cancels superseded
 runs and no longer tests Windows (user choice). Evidence: FINDINGS.md.
+
+## 2026-10-11 — Codex Forum footer-search medium fixed
+
+Corrected the independently reviewed quadratic digit/whitespace search with
+a count-token boundary and post-match separator trimming. New regressions
+failed on the original expression, including authored-token truncation.
+Focused Codex tests 37 passed; full isolated VPS backend 1,304 / 1 skipped;
+Ruff, ty and both touched-file format checks passed. Evidence and source
+hashes: docs/evaluations/codex-forum-review-20261010/FOOTER-REGEX-FIX.md.
+Deployment remains deferred; low findings and parked fallback unchanged.

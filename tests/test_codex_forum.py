@@ -7,6 +7,7 @@ Offline fixtures only; network, providers, and embedders are stubbed.
 from __future__ import annotations
 
 import hashlib
+from time import perf_counter
 from collections.abc import Iterator
 from dataclasses import replace
 from typing import Any
@@ -136,6 +137,13 @@ def test_text_footer_singular_and_plural_removed() -> None:
         )
         == "Opening post"
     )
+    assert strip_discourse_footer_text("1 post - 1 participant Read full topic") == ""
+    assert (
+        strip_discourse_footer_text(
+            "\nOpening post \t12 posts - 7 participants Read full topic \n"
+        )
+        == "\nOpening post"
+    )
 
 
 @pytest.mark.parametrize(
@@ -143,6 +151,7 @@ def test_text_footer_singular_and_plural_removed() -> None:
     [
         "Opening post 3 posts - 2 participants",
         "Opening post Read full topic",
+        "Opening post v12 posts - 3 participants Read full topic",
         "3 posts - 2 participants Read full topic, plus real trailing text",
         "A post about 3 posts - 2 giraffes Read full topic".replace(
             "giraffes", "people"
@@ -159,6 +168,17 @@ def test_text_footer_strip_idempotent() -> None:
         "Opening post 3 posts - 2 participants Read full topic"
     )
     assert strip_discourse_footer_text(once) == once
+
+
+@pytest.mark.parametrize("run", ["9", " "])
+def test_text_footer_long_nonmatching_runs_are_fast(run: str) -> None:
+    # Keep the terminal link text so a suffix shortcut cannot hide a slow
+    # search. The old expression repeatedly rescanned these 32K runs.
+    plain = "Opening post " + run * 32_000 + " Read full topic"
+    started = perf_counter()
+    assert strip_discourse_footer_text(plain) == plain
+    # The linear scan takes milliseconds; allow a full second for CI noise.
+    assert perf_counter() - started < 1.0
 
 
 # Effective-view normalization for stored rows.

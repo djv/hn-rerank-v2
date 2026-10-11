@@ -83,21 +83,26 @@ def strip_discourse_footer_html(raw_html: str) -> str:
 
 # Flattened legacy form (``clean_text`` joins the footer with spaces):
 # "... 3 posts - 2 participants Read full topic" at the very end.
+# Start only at a count token. A leading ``\s*`` would retry long whitespace
+# runs, and an unbounded digit start would retry each suffix of a digit run.
 _FOOTER_TEXT_TAIL_RE = re.compile(
-    r"\s*\d+\s+posts?\s*-\s*\d+\s+participants?\s+Read full topic\s*$"
+    r"(?<!\S)\d+\s+posts?\s*-\s*\d+\s+participants?\s+Read full topic\s*$"
 )
 
 
 def strip_discourse_footer_text(plain: str) -> str:
     """Remove a terminal flattened Discourse footer from plain text.
 
-    Requires the complete footer (count plus link text); authored
+    Requires the complete footer (a separate count token plus link text); authored
     lookalikes with only one half, and mid-text occurrences followed by
     real content, are preserved. Idempotent.
     """
     if not plain:
         return plain
-    return _FOOTER_TEXT_TAIL_RE.sub("", plain)
+    match = _FOOTER_TEXT_TAIL_RE.search(plain)
+    if match is None:
+        return plain
+    return plain[: match.start()].rstrip()
 
 
 def effective_codex_story(story: Story) -> Story:
