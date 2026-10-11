@@ -3487,3 +3487,29 @@ runs; before/after timing hosts differ. Evidence and hashes:
 [FOOTER-REGEX-FIX.md](docs/evaluations/codex-forum-review-20261010/FOOTER-REGEX-FIX.md).
 Two low findings and the parked fallback remain unchanged. No deployment,
 restart, DB/cache/provider action or additional reviewer; Muse WIP preserved.
+
+## Codex Forum rollout-plan review saved — 2026-10-11
+
+User chose Review rollout plan, then `ss`. One independent Claude cloud review
+completed at session_01NNptS9EXt9DtptFpFnPAMp. Initial plan not ready: conditional
+side-coverage fallback and four medium operational gaps. The agent verified
+the findings and corrected the plan without a second review or runtime change.
+
+Read-only target-code inspection at 16:38 UTC: 12,550 candidates, 28 Codex,
+zero Codex feedback rows; all 17 profiles with feedback remain at target side
+coverage 99.7769–99.8374%, above 98%. Exactly 28 missing side vectors per space
+are Codex; 28 primary Codex vectors need new hashes. No inference or DB writes.
+The existing side timer uses the production worktree, succeeded at 16:35,
+and was due again at 17:05. No extra side job is needed under that snapshot.
+A separate direct cold-pool read at 16:44 found 12,560 candidates, 12,499
+current side vectors and 99.5143% coverage. Normal ingestion created more
+misses; earlier profile results remain a snapshot and must be refreshed.
+
+Corrected plan specifies bounded online backup, target/ref inventory,
+observable helper/log checks, pre-refresh baseline readiness and rollback's
+old article/key behavior. Exact-key smoke was removed rather than reading
+API-key-bearing environment. Existing target tests and CI remain the evidence;
+this save only adds documentation. Original plan/report, verified assessment
+and current plan: docs/evaluations/codex-forum-review-20261010/ROLLOUT-*.md.
+No deployment, service restart, backup, provider test or additional reviewer.
+Next step is separate approval for pinned 794caa4 after refreshing live gates.

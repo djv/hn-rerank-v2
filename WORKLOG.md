@@ -11922,3 +11922,13 @@ Focused Codex tests 37 passed; full isolated VPS backend 1,304 / 1 skipped;
 Ruff, ty and both touched-file format checks passed. Evidence and source
 hashes: docs/evaluations/codex-forum-review-20261010/FOOTER-REGEX-FIX.md.
 Deployment remains deferred; low findings and parked fallback unchanged.
+
+## 2026-10-11 — Reviewed Codex rollout plan saved
+
+One independent Claude cloud review of the pinned 794caa4 rollout plan
+completed. Verified side-vector concerns with read-only target-code coverage
+(99.7769–99.8374%, above 98%, 28 Codex misses), then amended backup deadlines,
+cache/readiness checks and rollback semantics. Preserved initial plan/report,
+source manifest and agent assessment alongside the amended ROLLOUT-PLAN.md.
+User `ss` saves this documentation handoff. No second independent review,
+deployment, service restart, DB backup or extra provider/embedding job.

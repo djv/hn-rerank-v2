@@ -5,13 +5,11 @@ preview, pending Reddit/Gemma items):
 [before interleaving](docs/status-archive/before-interleaving-20261007.md).
 
 ## Objective
-Correct the reviewed Codex Forum footer-search slowdown (user 2026-10-11).
-The user chose Fix medium; the two low review findings remain unchanged.
-The source-safety integration remains in place.
-Scope: article-fetch suppression, generated-footer removal, nondestructive
-legacy input/cache handling, regression tests and the two remaining review
-corrections. Keep the conditional clean-summary fallback parked. Production
-rollout and the reply/count adapter remain outside this task.
+Save the corrected Codex Forum rollout plan and independent review (user
+2026-10-11, `ss`). Source-safety fixes and the medium footer-search correction
+are verified and pushed at pinned target 794caa4. The two low implementation
+findings and conditional clean-summary fallback remain unchanged/parked.
+Production rollout and the reply/count adapter remain outside this task.
 
 Compare shortlist #2 (one joined logistic classifier, all features) and #4
 (same, no metadata) live against production through team-draft
@@ -21,6 +19,14 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- Codex Forum rollout-plan review completed with Claude cloud. The initial
+  plan needed operational corrections; the agent verified and amended it.
+  At 16:38, target-code read-only side coverage was 99.7769–99.8374% across
+  checked profiles; the later cold-pool sample was 99.5143%, above the 98%
+  cutoff. Twenty-eight Codex vectors need new hashes; refresh gates at rollout.
+  Backup deadlines, concrete smoke signals, version-advance checks and rollback
+  effects are now explicit. No second reviewer, backup, restart or deployment.
+  [Plan and assessment](docs/evaluations/codex-forum-review-20261010/ROLLOUT-ASSESSMENT.md).
 - Codex Forum medium review finding fixed: flattened-footer matching starts
   at a separate count token and avoids repeated digit/whitespace scanning.
   The new regressions failed before correction (32K runs took about nine
@@ -231,8 +237,11 @@ ranking research remains paused and production trial configuration unchanged.
   flake `test_filter_change_starts_at_first_story[60]` is left unfixed since
   Windows is no longer tested.
 - Deploy the verified Codex Forum source-safety change only after separate
-  approval. Preserve raw DB/cache rows; check normal refresh, cache behavior
-  and bounded service logs after rollout. No cleanup or reply/count adapter.
+  approval for exact target 794caa4 under the [corrected rollout plan](docs/evaluations/codex-forum-review-20261010/ROLLOUT-PLAN.md).
+  Refresh resource/coverage/timer/WIP gates; preserve raw DB/cache rows and the
+  unrelated archive inventory. Normal warming may use configured providers;
+  exact-key comparison and uncached-generation smoke are outside this plan.
+  No cleanup, extra side job or reply/count adapter.
 - Observe Codex Forum cards in normal ranked views. Forum replies and live
   discussion counts would require a separately scoped Discourse adapter.
 - AI ranking research: goal is a repeatable Muse advantage transferable into
