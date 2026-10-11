@@ -11821,3 +11821,11 @@ Full backend 1,362 passed/1 skipped; Ruff/format clean; no new ty diagnostics
 (11 known absent optional inference imports remain). See
 [gate evidence](docs/evaluations/decision1-20261010/SAFETY-GATES.md) and its
 [isolated evaluation status](docs/evaluations/decision1-20261010/STATUS.md).
+
+## 2026-10-11 — Save-now checkpoint for confirmed evaluation review findings
+
+Saved a separately tested create-only frozen-input receipt helper and 32 synthetic tests. Streaming hashes bind folds and snapshot; receipts never rewrite, and concurrent hardlink cleanup does not falsely invalidate receipt reads. This helper is not yet wired into prepare/audit/report, and no real-data receipt was created.
+
+The user's ss-now boundary stopped implementation. NULL-comment reporting, prepublication parity failure and immutable evaluator receipt/manifest integration remain unfinished; the independent result review remains pending. See docs/evaluations/decision1-20261010/REVIEW-FIX-HANDOFF.md. Existing 104 legacy scores and the snapshot checksum match, Strands remains stopped, and no inference environment, deployment or service restart occurred.
+
+Verification: 32 focused tests; full backend 1,394 passed, 1 skipped, one pre-existing sklearn convergence warning; Ruff and touched-file formatting pass, new-code strict ty clean, unchanged 11 optional Torch/Strands import diagnostics globally.
