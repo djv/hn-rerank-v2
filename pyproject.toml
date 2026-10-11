@@ -53,3 +53,8 @@ members = [
 
 [tool.uv.sources]
 hn-rerank = { workspace = true }
+
+[tool.ty.analysis]
+# Offline evaluation workers import heavy optional packages that are not
+# project dependencies; they run in their own isolated environments.
+allowed-unresolved-imports = ["torch", "torch.**", "strands_decider", "strands_decider.**"]
