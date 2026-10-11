@@ -11878,3 +11878,8 @@ sampled. See docs/evaluations/decision1-20261010/GUARD-FIXES-20261011.md and STA
 - User requested review and real scoring. Restored exact isolated pins/public immutable weights; source unchanged. Claude cloud plan review required a batch4/check4 pilot and tighter resource limits.
 - All16pilot rows passed, maxdiff4.6374e-5; actual audit16valid/0invalid. Full4132-job scoring launched with batch4/check1 and automatic complete-coverage audit/report gates, bounded48h and CPU/memory/swap limits. No accuracy conclusion yet.
 - Evidence/current execution: docs/evaluations/decision1-20261010/SCORING-20261011.md and scoped STATUS.md. No deployment, paid route or confirmation access.
+
+### 2026-10-11 — Stop CPU scoring at user request
+
+- User rejected the estimated one-to-two-day runtime. Stopped only the owned full scoring unit; verified inactive/PID0 and no worker/evaluator.
+- Log records40new scores plus16pilot scores; retained caches, weights, frozen input and evidence. No complete quality report. Live HN unchanged. Faster route needs a benchmark and any consequential authorization before launch.
