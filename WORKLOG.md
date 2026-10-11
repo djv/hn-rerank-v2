@@ -11883,3 +11883,21 @@ sampled. See docs/evaluations/decision1-20261010/GUARD-FIXES-20261011.md and STA
 
 - User rejected the estimated one-to-two-day runtime. Stopped only the owned full scoring unit; verified inactive/PID0 and no worker/evaluator.
 - Log records40new scores plus16pilot scores; retained caches, weights, frozen input and evidence. No complete quality report. Live HN unchanged. Faster route needs a benchmark and any consequential authorization before launch.
+
+### 2026-10-11 — Measure the user's below5s VPS scoring target
+
+- Fresh cache validation56valid/0invalid/4076missing; full scoring remains stopped.
+  No scores published by CPU probes; scoring worker, pinned models, database,
+  packages and live HN service unchanged by this investigation.
+- Convolution tweaks gave only a small gain, length bucketing saves about4% total
+  evaluated tokens with current batch4/check1, and Linear layers dominate a short
+  actual-model forward (92%). Int8 rejected for0.3178 cached/plain disagreement.
+- Matched16-short-real batch/check1 reference13.113s/score; packed-FP16 three-thread
+  probe8.991s including one plain check per16, all sampled numerics pass1e-4.
+  Earlier FP16 attempts were intentionally stopped under soft memory throttling;
+  final hard ceiling5.5GiB, no high/OOM events. Favorable sample still misses5s;
+  parity coverage reduction is not adopted and no full-cohort speed claim made.
+- All owned probes stopped/PID0, live HN PID531386 unchanged. Documentation-only
+  handoff; no repeated source suite. CPU-SPEED-20261011.md records evidence and
+  CPU-ONNX-PILOT-PLAN-20261011.md proposes a different-release ONNX pilot requiring
+  user decision. No model change, new review, paid route or deployment authorized.
