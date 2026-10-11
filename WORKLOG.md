@@ -11800,3 +11800,24 @@ updated checkout; physical controls remain unverified. No smoke provider
 calls/votes/new profiles; uncached forced live generation not exercised.
 Evidence: docs/evaluations/section-refresh-20261009/DEPLOYMENT.md and
 DEPLOY-SMOKE.json. This supersedes earlier uncommitted/undeployed task status.
+
+## 2026-10-10 — Offline Strands paired evaluation gates
+
+Resumed the user-selected HN cache/provenance/control work without inference.
+Full-scope preparation includes 2,066 stories under both real and empty profiles,
+including earlier smoke cases. Versioned content-bound caches reject stale or
+invalid records and publish atomically without replacing old scores. Worker
+loading is constrained to local immutable adapter/base snapshots and recorded
+package versions. Reports refuse incomplete pairs before metrics and use a fixed
+.2 blend, paired real-minus-empty AUC, and identical-population controls.
+Legacy Decision-1 reporting is disabled pending an equivalent cache contract.
+
+Actual preparation wrote 4,132 jobs; audit/report correctly refuse 0 validated
+paired scores. All 104 retained scores and the snapshot hash are unchanged.
+The snapshot has 26 missing comment counts; refreshed strict numeric controls
+refuse them rather than fabricating zero. No efficacy result, model loading,
+download, provider call, Colab use, service restart or deployment occurred.
+Full backend 1,362 passed/1 skipped; Ruff/format clean; no new ty diagnostics
+(11 known absent optional inference imports remain). See
+[gate evidence](docs/evaluations/decision1-20261010/SAFETY-GATES.md) and its
+[isolated evaluation status](docs/evaluations/decision1-20261010/STATUS.md).
