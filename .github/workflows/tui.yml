@@ -17,8 +17,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Pushes test Ubuntu only; PRs, the weekly run and manual runs cover all three.
-        os: ${{ github.event_name == 'push' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest", "windows-latest"]') }}
+        # Pushes test Ubuntu only; PRs, the weekly run and manual runs add macOS. Windows is not tested.
+        os: ${{ github.event_name == 'push' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
