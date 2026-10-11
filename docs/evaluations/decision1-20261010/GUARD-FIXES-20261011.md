@@ -79,3 +79,27 @@ was launched; the final corrections were verified by the root agent's tests.
 Keep scoring paused until a faithful scoring route is authorized. Populate the
 entire v3 paired scope before reporting. Keep the examined dating confirmation
 cohort and all live/frozen model artifacts outside this work.
+
+
+## Verified review follow-up: snapshot-read race
+
+The second independent source review reproduced a narrower remaining race:
+the snapshot could be replaced after the first expected digest and restored
+before the second digest, so unchanged bytes concealed different values read
+by SQLite. The agent independently reproduced it with temporary synthetic DBs.
+The user selected only serious, verified fixes; this metric-correctness defect
+was selected. Conditional padding concerns and lower-impact result retention /
+pre-existing CLI-default findings were excluded from this change.
+
+The reader now compares device, inode, size, mtime_ns and ctime_ns before and
+after the complete hash/read/hash interval. Restoration cannot restore ctime;
+replacement changes identity. Existing digest and sidecar checks remain.
+One parameterized regression covers in-place modification/restoration and inode
+replacement/restoration, verifies rejection before report publication, and
+confirms original bytes are restored. Both cases failed before the fix.
+
+Verification: 57 paired-report tests; full backend 1,431 passed / 1 skipped /
+existing sklearn warning, 26.96 s. Ruff, touched format, scoped ty and diff check
+pass; global ty is byte-identical to the earlier 11 optional-inference-import
+diagnostics. No live DB, snapshot, retained scores, model loading or services
+were changed. Cloud review: https://claude.ai/code/session_01LKV23uGhU6mKqUD6BcAVsE.

@@ -1,27 +1,32 @@
 # HN offline evaluation safeguards — 2026-10-11
 
 ## Objective
-Finish the three saved evaluation safeguards, then correct the separately
-authorized warm-start test failure. Offline only; keep scoring stopped.
+Apply only the verified review issue that can corrupt reported metrics: a snapshot
+swap-and-restore during SQLite reading. Offline only; scoring remains paused.
 
 ## Verified result
-Frozen input receipts and v3 immutable plans are integrated. NULL comments mark
-only their control unavailable. Every cached chunk checks parity before
-publication; audit/report require passed receipts and tolerance <= 1e-4. Source-only
-Claude cloud review completed; its findings were corrected and root-tested.
-The warm-start test now checks the training objective against a precise reference
-instead of assuming a solver tolerance bounds unseen predictions. Serving code
-is unchanged. Full backend 1,429 passed / 1 skipped; Ruff/format/scoped ty clean;
-global typing has only the same 11 absent optional inference imports. All 104
-retained scores and snapshot digest match; actual v3 audit/report stop at zero
-validated paired scores. Strands MainPID 0; live HN PID 531386 unchanged.
+The reader now requires unchanged device/inode/size/mtime_ns/ctime_ns across its
+hash/read/hash interval as well as the expected frozen digest. Both in-place
+mutation/restoration and replacement/restoration previously published reports;
+the regression now rejects both before report publication. Paired-report tests:
+57 passed. Full backend: 1,431 passed / 1 skipped / existing sklearn warning in
+26.96 seconds. Ruff, touched format, scoped ty and diff whitespace pass. Global ty
+matches the earlier 11 missing optional inference-import diagnostics byte for byte.
+
+The earlier frozen-input/v3-plan/full-cohort/per-chunk-proof safeguards and
+warm-start test correction remain saved. The independent cloud review assessed
+these and the next-step proposal. Conditional padding-sampling concern is not
+proof of an inference defect; lower-impact alternate-scope output replacement
+and pre-existing backend default are outside this requested fix. No model calls,
+production restart, deployment, or actual snapshot/cache changes were made.
 
 ## Blocker
 No authorized faithful scoring route. Real numerical parity/loading and held-out
-quality remain unverified. Parity checks are per-chunk samples; receipt authenticity
-is outside the contract. First prepare is the historical trust anchor.
+quality remain unverified. Parity checks are per-chunk samples; first prepare is
+the trust anchor, not authentication of historical artifacts.
 
 ## Next step
-Keep Strands stopped and Colab skipped. When a faithful route is authorized,
-populate every paired v3 job and require full validated coverage before metrics.
-Evidence: GUARD-FIXES-20261011.md and WARM-START-CHECK-20261011.md.
+Keep Strands stopped and Colab skipped. If a faithful route is authorized, begin
+with a small pilot checking every row against plain scoring, then require complete
+paired v3 coverage before quality metrics. Evidence: GUARD-FIXES-20261011.md and
+WARM-START-CHECK-20261011.md. Previous status: STATUS-BEFORE-SNAPSHOT-RACE-20261011.md.

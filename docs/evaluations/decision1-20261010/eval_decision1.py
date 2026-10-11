@@ -912,6 +912,18 @@ def snapshot_popularity(
             raise ValueError(
                 "popularity snapshot has SQLite sidecars; require a standalone frozen snapshot"
             )
+
+    def snapshot_stamp() -> tuple[int, int, int, int, int]:
+        stat = snapshot.lstat()
+        return (
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_size,
+            stat.st_mtime_ns,
+            stat.st_ctime_ns,
+        )
+
+    before_stamp = snapshot_stamp()
     before = hash_file(snapshot)
     if expected_sha256 is not None and before != expected_sha256:
         raise FrozenInputsError(
@@ -935,7 +947,8 @@ def snapshot_popularity(
                 math.log1p(max(0, points)),
                 math.log1p(max(0, comments)) if comments is not None else None,
             )
-    if hash_file(snapshot) != before:
+    # Restoring the original bytes does not restore inode identity or ctime.
+    if hash_file(snapshot) != before or snapshot_stamp() != before_stamp:
         raise FrozenInputsError("popularity snapshot changed while reading")
     for suffix in ("-wal", "-journal", "-shm"):
         if Path(str(snapshot) + suffix).exists():

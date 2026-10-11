@@ -11858,3 +11858,16 @@ scores before metrics. All 104 legacy files and snapshot hash preserved. Strands
 0 and live HN PID 531386 unchanged. No deployment, restart, scoring, downloads,
 Colab or dating-data/model changes. First prepare is the trust anchor; parity remains
 sampled. See docs/evaluations/decision1-20261010/GUARD-FIXES-20261011.md and STATUS.md.
+
+
+### 2026-10-11 — Reject snapshot swap-and-restore during offline report reads
+
+- User selected only verified, consequential review fixes. Added file identity /
+  nanosecond timestamps across the SQLite read so restored content digests cannot
+  conceal alternate popularity values. Kept conditional padding and low-impact
+  CLI/output suggestions out of scope.
+- Reproduced both in-place and inode-replacement cases before fixing; both now
+  prevent report publication. 57 focused tests and full backend 1,431 passed /
+  1 skipped; Ruff/format/scoped ty clean, global ty matches prior optional-import
+  baseline. No inference, data mutation, deployment or restart.
+- Evidence and current handoff: docs/evaluations/decision1-20261010/.

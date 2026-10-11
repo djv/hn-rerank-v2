@@ -800,3 +800,56 @@ def test_snapshot_substitution_then_restoration_is_rejected_at_read_time(
         module.cmd_report(tmp_path, None, 0, None, snapshot)
     assert snapshot.read_bytes() == original
     assert not (tmp_path / "report_strands_v3.json").exists()
+
+
+@pytest.mark.parametrize("replace_inode", [False, True])
+def test_snapshot_swap_and_restore_during_read_cannot_publish_report(
+    module: ModuleType,
+    tmp_path: Path,
+    folds: list[SyntheticFold],
+    monkeypatch: pytest.MonkeyPatch,
+    replace_inode: bool,
+) -> None:
+    write_folds(tmp_path, folds)
+    populate_scores(module, tmp_path)
+    snapshot = tmp_path / "synthetic-snapshot.db"
+    original = snapshot.read_bytes()
+    replacement = make_snapshot(tmp_path / "replacement.db", folds)
+    with closing(sqlite3.connect(replacement)) as connection:
+        connection.execute(
+            "UPDATE stories SET score = 555 WHERE id = ?", (folds[0].candidates[0].id,)
+        )
+        connection.commit()
+    altered = replacement.read_bytes()
+    original_connect = sqlite3.connect
+
+    def install(content: bytes) -> None:
+        if replace_inode:
+            staging = tmp_path / "swap.db"
+            staging.write_bytes(content)
+            staging.replace(snapshot)
+        else:
+            snapshot.write_bytes(content)
+
+    class RestoringConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self.connection = connection
+
+        def execute(self, query: str) -> list[tuple[object, ...]]:
+            rows = list(self.connection.execute(query))
+            install(original)
+            return rows
+
+        def close(self) -> None:
+            self.connection.close()
+
+    def swap_on_connect(database: str, *, uri: bool = False) -> RestoringConnection:
+        # Replace after the initial receipt digest, restore before the final hash.
+        install(altered)
+        return RestoringConnection(original_connect(database, uri=uri))
+
+    monkeypatch.setattr(sqlite3, "connect", swap_on_connect)
+    with pytest.raises(ValueError, match="snapshot changed while reading"):
+        module.cmd_report(tmp_path, None, 0, None, snapshot)
+    assert snapshot.read_bytes() == original
+    assert not (tmp_path / "report_strands_v3.json").exists()
