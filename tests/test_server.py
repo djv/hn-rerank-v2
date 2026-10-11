@@ -7358,3 +7358,193 @@ def test_force_refresh_real_fetch_fallback_is_conservative(
     assert response.get_json()["retryable"] is True
     assert llm_calls == []
     assert db.get_any_tldr_for_story(9111) is None
+
+
+def test_tldr_detail_short_lesswrong_post_keeps_article_fetch(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Populated LessWrong context keeps the pre-Codex article tap behavior."""
+    import server
+
+    port, db, _, _, user = test_env
+    url = "https://www.lesswrong.com/posts/short-post/short-post"
+    db.upsert_story(
+        Story(
+            id=-9100,
+            title="Short LessWrong post",
+            url=url,
+            score=0,
+            time=1600000000,
+            text_content="Short LessWrong post. Short body. Existing comment.",
+            source="rss_lesswrong_com",
+            self_text="Short body.",
+            top_comments="Existing comment.",
+            article_body="",
+        )
+    )
+    article_calls: list[str] = []
+    context_calls: list[str] = []
+    seen_bodies: list[str] = []
+
+    async def recording_fetch(article_url: str) -> server.ArticleFetchResult:
+        article_calls.append(article_url)
+        return server.ArticleFetchResult(body="Full article body", status=200)
+
+    async def unused_context(post_id: str) -> None:
+        context_calls.append(post_id)
+        raise AssertionError("Already populated LessWrong context must not refetch")
+
+    async def capturing_llm(
+        title: str,
+        self_text: str = "",
+        top_comments: str = "",
+        article_body: str = "",
+    ) -> server.TldrResult:
+        seen_bodies.append(article_body)
+        return server.TldrResult(kind="ok", tldr="clean summary")
+
+    monkeypatch.setattr(server, "_fetch_article_body_with_result", recording_fetch)
+    monkeypatch.setattr(server, "_fetch_lesswrong_context", unused_context)
+    monkeypatch.setattr(server, "generate_detailed_tldr", capturing_llm)
+    response = local_http.post(
+        f"http://127.0.0.1:{port}/api/tldr-detail",
+        json={"story_id": -9100},
+        cookies={"hn_token": user.token},
+    )
+    assert response.status_code == 200
+    assert article_calls == [url]
+    assert context_calls == []
+    assert seen_bodies == ["Full article body"]
+
+
+def test_tldr_detail_codex_short_post_skips_article_fetch(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A short Codex Forum post must never enter the on-demand article lane."""
+    import server
+    from pipeline.codex_forum import CODEX_FORUM_SOURCE
+
+    port, db, _, _, user = test_env
+    # Fetchable host isolates the source policy from the URL blocklist.
+    db.upsert_story(
+        Story(
+            id=9101,
+            title="Speed up codex runs",
+            url="https://example.com/codex-topic-1",
+            score=0,
+            time=1600000000,
+            text_content="Speed up codex runs. How do I speed up my codex runs?",
+            source=CODEX_FORUM_SOURCE,
+            self_text="How do I speed up my codex runs?",
+            top_comments="",
+            article_body="",
+        )
+    )
+
+    article_calls: list[str] = []
+
+    async def recording_fetch(url: str) -> Any:
+        article_calls.append(url)
+        return server.ArticleFetchResult(body="REPLY TEXT MUST NOT APPEAR", status=200)
+
+    seen: dict[str, str] = {}
+
+    async def capturing_llm(
+        title: str,
+        self_text: str = "",
+        top_comments: str = "",
+        article_body: str = "",
+    ) -> Any:
+        seen.update(
+            {
+                "title": title,
+                "self_text": self_text,
+                "top_comments": top_comments,
+                "article_body": article_body,
+            }
+        )
+        return server.TldrResult(kind="ok", tldr="clean summary")
+
+    monkeypatch.setattr(server, "_fetch_article_body_with_result", recording_fetch)
+    monkeypatch.setattr(server, "generate_detailed_tldr", capturing_llm)
+
+    resp = local_http.post(
+        f"http://127.0.0.1:{port}/api/tldr-detail",
+        json={"story_id": 9101},
+        cookies={"hn_token": user.token},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+    assert article_calls == []
+    assert seen["article_body"] == ""
+    assert "How do I speed up my codex runs?" in seen["self_text"]
+
+
+def test_tldr_detail_codex_legacy_row_summarizes_clean_inputs(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A legacy mixed Codex row is summarized from its effective view only."""
+    import server
+    from pipeline.codex_forum import CODEX_FORUM_SOURCE
+
+    port, db, _, _, user = test_env
+    db.upsert_story(
+        Story(
+            id=9102,
+            title="Speed up codex runs",
+            url="https://example.com/codex-topic-2",
+            score=0,
+            time=1600000000,
+            text_content=(
+                "Speed up codex runs. Opening post text 1 post - 1 participant "
+                "Read full topic REPLY TEXT FROM NON-OPENING POSTS"
+            ),
+            source=CODEX_FORUM_SOURCE,
+            self_text="Opening post text 1 post - 1 participant Read full topic",
+            top_comments="",
+            article_body="REPLY TEXT FROM NON-OPENING POSTS",
+        )
+    )
+
+    article_calls: list[str] = []
+
+    async def recording_fetch(url: str) -> Any:
+        article_calls.append(url)
+        return server.ArticleFetchResult(body="MORE REPLY TEXT", status=200)
+
+    seen: dict[str, str] = {}
+
+    async def capturing_llm(
+        title: str,
+        self_text: str = "",
+        top_comments: str = "",
+        article_body: str = "",
+    ) -> Any:
+        seen.update(
+            {
+                "title": title,
+                "self_text": self_text,
+                "top_comments": top_comments,
+                "article_body": article_body,
+            }
+        )
+        return server.TldrResult(kind="ok", tldr="clean summary")
+
+    monkeypatch.setattr(server, "_fetch_article_body_with_result", recording_fetch)
+    monkeypatch.setattr(server, "generate_detailed_tldr", capturing_llm)
+
+    resp = local_http.post(
+        f"http://127.0.0.1:{port}/api/tldr-detail",
+        json={"story_id": 9102},
+        cookies={"hn_token": user.token},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+    assert article_calls == []
+    assert seen["article_body"] == ""
+    assert seen["self_text"] == "Opening post text"
+    assert "REPLY TEXT" not in seen["self_text"]
+    # Raw stored row preserved: no tap-time cleanup of cached bodies.
+    stored = db.get_story(9102)
+    assert stored is not None
+    assert stored.article_body == "REPLY TEXT FROM NON-OPENING POSTS"

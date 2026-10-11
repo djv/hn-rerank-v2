@@ -3431,3 +3431,23 @@ parked and is not itself an integration blocker. Decision, evidence and
 revisit bounds: [parked fallback](docs/evaluations/codex-forum-review-20261010/PARKED-FALLBACK.md).
 Other review findings (LessWrong scope, two introduced ty diagnostics) remain
 pending. No reviewed code, tests, DB, service or deployment changed.
+
+## Codex Forum review corrections and integration — 2026-10-11
+
+The user chose Fix and integrate after an independently reviewed remaining-fixes
+plan. The supervising agent based an isolated integration checkout on current
+main fa9f6f9, preserving the newer TUI work and parked fallback decision. Muse's
+original uncommitted worktree was retained. The confirmed LessWrong regression
+failed before the predicate correction (zero rather than one article request).
+The restored tap excludes AINews/Codex only; its regression also proves no
+LessWrong context call and propagation of fetched article text to the generator.
+The test fake now subclasses Embedder with a model-free constructor and a
+matching typed encode override, resolving both ty diagnostics.
+
+Final integrated-source checks: focused 51 passes, backend 1,301 passed / 1
+skipped (existing MLP convergence warning), repository Ruff/ty and eight-file
+format/whitespace clean. Exact source hashes, both cloud reports, integration
+bounds and preserved raw-input policy are in
+[CHECKS.md](docs/evaluations/codex-forum-review-20261010/CHECKS.md).
+No production checkout update, DB/profile/vote/provider action, restart,
+deployment or reply/count adapter. The fallback remains parked and unchanged.

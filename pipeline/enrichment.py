@@ -28,6 +28,11 @@ from reddit_fetch_queue import CoroFactory
 from reddit_feed_cache import cache as reddit_feed_cache
 from reddit_limiter import limiter as reddit_limiter
 from . import rank_gate
+from .codex_forum import (
+    CODEX_FORUM_SOURCE,
+    is_codex_source,
+    strip_discourse_footer_html,
+)
 from .config import RedditSource
 from .ainews import AINEWS_SOURCE, tweet_id_from_url
 from .ranking import (
@@ -907,6 +912,12 @@ async def _fetch_and_parse_feed(
             elif "summary" in entry:
                 summary = entry.summary
 
+            if is_codex_source(source_name):
+                # Discourse appends a generated count/"Read full topic"
+                # footer to every description; strip it before text
+                # conversion so it never enters self_text. Other feeds
+                # keep their behavior.
+                summary = strip_discourse_footer_html(summary)
             clean_summary = clean_text(summary)
             snippet = clean_summary[:RSS_SELF_TEXT_CHAR_LIMIT]
             self_text = snippet
@@ -1176,8 +1187,11 @@ def _is_fetchable_article_url(url: str) -> bool:
 
 
 # Sources whose text arrives complete: never fetch their URL as an article
-# (an AINews card's URL is the whole issue page).
-_NO_ARTICLE_SOURCES = frozenset({"rss_lesswrong_com", AINEWS_SOURCE})
+# (an AINews card's URL is the whole issue page; a Codex Forum topic page
+# renders threaded discussion, so its HTML mixes replies into article text).
+_NO_ARTICLE_SOURCES = frozenset(
+    {"rss_lesswrong_com", AINEWS_SOURCE, CODEX_FORUM_SOURCE}
+)
 
 
 def _article_fetch_eligible(
@@ -1204,7 +1218,7 @@ def select_rss_article_prewarm(
     max_age_days: int = 30,
     now_ts: float | None = None,
 ) -> list[Story]:
-    """Newest RSS stories (not Reddit/LessWrong/AINews) still lacking article text.
+    """Newest RSS stories (not Reddit/LessWrong/AINews/Codex) still lacking article text.
 
     The warm-path fetcher only reaches stories that already rank near the
     top, so a feed that ships a short snippet never earns the text that

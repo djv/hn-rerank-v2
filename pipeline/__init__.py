@@ -114,6 +114,7 @@ from .enrichment import (
     select_rss_article_prewarm,
 )
 from .ainews import AINEWS_SOURCE, AINEWS_TITLE_PREFIX, fetch_ainews_stories
+from .codex_forum import effective_codex_story
 from .hn_dupes import (
     FeedbackDupeContext,
     _load_feedback_context,
@@ -382,19 +383,26 @@ def load_production_candidate_stories(
                     config.recent_candidate_rss_limit,
                 ),
             )
+    # Stored Codex Forum rows may carry legacy mixed article bodies and
+    # generated footers; rank on their effective (clean) view. Raw rows,
+    # votes, and identities in the DB are untouched.
     hn_stories = [
         s
-        for s in (Database._row_to_story(row) for row in hn_rows)
+        for s in (effective_codex_story(Database._row_to_story(row)) for row in hn_rows)
         if is_summarizable(s)
     ]
     archive_stories = [
         s
-        for s in (Database._row_to_story(row) for row in archive_rows)
+        for s in (
+            effective_codex_story(Database._row_to_story(row)) for row in archive_rows
+        )
         if is_summarizable(s)
     ]
     rss_stories = [
         s
-        for s in (Database._row_to_story(row) for row in rss_rows)
+        for s in (
+            effective_codex_story(Database._row_to_story(row)) for row in rss_rows
+        )
         if is_summarizable(s)
     ]
     trace.set_count("pool_hn", len(hn_stories))
@@ -987,8 +995,14 @@ async def fetch_candidates(
     else:
         deduped_candidates = list(candidates)
 
-    # 6. Filter to summarizable stories (no content = no TLDR possible)
-    summarizable = [s for s in deduped_candidates if is_summarizable(s)]
+    # 6. Filter to summarizable stories (no content = no TLDR possible).
+    # Stored Codex Forum rows read through their effective view so legacy
+    # mixed inputs never reach ranking; the DB rows themselves are kept.
+    summarizable = [
+        s
+        for s in (effective_codex_story(s) for s in deduped_candidates)
+        if is_summarizable(s)
+    ]
     n_filtered = len(deduped_candidates) - len(summarizable)
     if n_filtered:
         logging.info(
@@ -1179,10 +1193,13 @@ def _apply_dedup_to_ranked(
     all_stories = [r.story for r in ranked]
     all_embeddings = dict(embeddings) if embeddings else {}
     if embedder is not None:
-        fb_stories = db.get_feedback_stories(
-            user_id,
-            actions=tuple(model_cfg.dedup_exclude_actions),
-        )
+        fb_stories = [
+            effective_codex_story(s)
+            for s in db.get_feedback_stories(
+                user_id,
+                actions=tuple(model_cfg.dedup_exclude_actions),
+            )
+        ]
         if fb_stories:
             fb_embs = get_or_compute_embeddings(fb_stories, embedder, db)
             for s, vec in zip(fb_stories, fb_embs):
@@ -1234,7 +1251,9 @@ async def fetch_candidates_only(
         logging.exception("fetch_candidates_only: growth refresh failed")
         touched = set()
     if touched:
-        refreshed = {s.id: s for s in db.get_stories(sorted(touched))}
+        refreshed = {
+            s.id: effective_codex_story(s) for s in db.get_stories(sorted(touched))
+        }
         candidates = [refreshed.get(s.id, s) for s in candidates]
 
     # HN prewarm

@@ -5,15 +5,11 @@ preview, pending Reddit/Gemma items):
 [before interleaving](docs/status-archive/before-interleaving-20261007.md).
 
 ## Objective
-Fix the two medium TUI review findings (user 2026-10-11): preserve queued
-vote/undo requests on quit and retain stories after retryable HTTP 5xx errors.
-One independent Claude cloud result review was approved and completed.
-
-Plan the verified Codex Forum fixes and hand them to Muse (user 2026-10-11).
+Integrate the verified Codex Forum fixes (user 2026-10-11).
 Scope: article-fetch suppression, generated-footer removal, nondestructive
-legacy input/cache handling, and regression tests. Implementation is assigned
-to an isolated VPS branch; main integration and production rollout are separate.
-The reply/count adapter remains outside this task.
+legacy input/cache handling, regression tests and the two remaining review
+corrections. Keep the conditional clean-summary fallback parked. Production
+rollout and the reply/count adapter remain outside this task.
 
 Compare shortlist #2 (one joined logistic classifier, all features) and #4
 (same, no metadata) live against production through team-draft
@@ -34,21 +30,27 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   repository Ruff, ty and five touched-Python format checks passed.
   No personal reader was restarted; the final process check found no local
   reader running. A launch from this checkout loads these client changes.
+- Codex Forum source-safety fixes are integrated into current main from Muse's
+  preserved isolated worktree. Forum topics never enter article-fetch lanes;
+  generated RSS footers are stripped; legacy inputs and keys normalize without
+  changing raw stored fields. The two remaining corrections restore LessWrong
+  tap behavior and resolve test typing. Final integrated-source gates: 51
+  focused passes, backend 1,301 passed / 1 skipped, Ruff/ty/eight-file format
+  and whitespace checks clean. [Integration checks](docs/evaluations/codex-forum-review-20261010/CHECKS.md).
+  No production checkout update, service restart or live generation.
 - The fix plan and Muse assignment are saved beside the review evidence:
   [fix plan](docs/evaluations/codex-forum-review-20261010/FIX-PLAN.md) and
   [handoff](docs/evaluations/codex-forum-review-20261010/MUSE-HANDOFF.md).
   Muse acknowledged the task and wrote source changes in the isolated VPS
-  worktree. The runner exited successfully after 96 reported focused passes;
-  its full-suite tool call was rejected and CHECKS.md is absent. Supervising
-  diff inspection, complete gates, commit and integration remain pending.
+  worktree. Its incomplete validation was superseded by the supervising
+  integration checks above; the original uncommitted branch is preserved.
   [Dispatch record](docs/evaluations/codex-forum-review-20261010/HANDOFF-RUN.md).
 - Codex Forum result review: conditional rejection of clean stale summaries
   is rated low and parked at the user's request; unchanged-input outages still
   serve cached summaries. [Decision note](docs/evaluations/codex-forum-review-20261010/PARKED-FALLBACK.md).
-  The unrelated LessWrong tap change and two introduced test type errors
-  remain pending. Supervising checks: 36 focused tests and four reproductions
-  passed; changed-file Ruff/format passed; ty failed with those two errors.
-  No reviewed implementation file changed or production rollout occurred.
+  The unrelated LessWrong tap change and two introduced test type errors were
+  corrected after the user chose Fix and integrate following the approved
+  remaining-fixes plan review. No production rollout occurred.
 - Codex Forum review complete: the actual deployed extractor returned reply
   text as article_body (three non-opening posts matched). The source can enter
   generic article prewarm and short-post tap fetching, so discussion can be
@@ -200,18 +202,19 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Blocker
 The TUI medium result review is complete and its introduced findings corrected.
-The medium article-attribution issue remains open pending Muse implementation
-and supervising verification. No reply/count adapter or rollout is authorized.
+Codex Forum article-attribution fixes are verified on main but not deployed;
+the production behavior remains unchanged pending separate rollout approval.
+No reply/count adapter or rollout is authorized. The conditional fallback is
+parked, not a blocker by itself.
 Physical TUI controls and
 uncached/forced live summary generation remain unverified. No
 smoke-generated votes/profiles or LLM calls;
 ranking research remains paused and production trial configuration unchanged.
 
 ## Next step
-- Check the Muse job via HANDOFF-RUN.md; inspect MUSE-ACK.md/CHECKS.md and
-  the feature-branch diff before integration. Receipt is verified; no completed
-  fix is claimed. The plan suppresses legacy inputs nondestructively; no
-  cleanup, reply/count adapter or production rollout is assigned.
+- Deploy the verified Codex Forum source-safety change only after separate
+  approval. Preserve raw DB/cache rows; check normal refresh, cache behavior
+  and bounded service logs after rollout. No cleanup or reply/count adapter.
 - Observe Codex Forum cards in normal ranked views. Forum replies and live
   discussion counts would require a separately scoped Discourse adapter.
 - AI ranking research: goal is a repeatable Muse advantage transferable into

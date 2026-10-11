@@ -631,7 +631,14 @@ The Codex community category (`https://community.openai.com/c/codex/37.rss`)
 is included through the same generic RSS path, with source ID
 `rss_community_openai_com` and the display label "Codex Forum". Feed entries
 carry canonical topic URLs and the opening post; there is no separate
-Discourse reply hydration or engagement-score adapter.
+Discourse reply hydration or engagement-score adapter. Topic pages are
+never fetched as articles (`_NO_ARTICLE_SOURCES` excludes it from RSS
+prewarm and warm article selection; `is_codex_source` excludes short-post
+taps), and the generated count/"Read full topic" RSS footer is
+stripped before text conversion. Rows stored before that policy read
+through an effective view (article omitted, footer stripped) for
+ranking, embeddings, and summaries; raw stored fields are preserved
+(see `pipeline/codex_forum.py`).
 
 ### 3.7 Comment Text Refetch on Growth
 The default regeneration interval is one hour after the previous run completes (`regen_interval_seconds=3600`, the `Config` dataclass default in `pipeline/config.py` since 2026-09-22; not overridden in `config.toml`); older references to 3- or 4-hour cycles describe superseded configuration.

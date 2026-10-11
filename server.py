@@ -69,6 +69,12 @@ from pipeline.ranking import (
     serve_window,
 )
 from pipeline.ainews import AINEWS_SOURCE
+from pipeline.codex_forum import (
+    CODEX_SUMMARY_INPUT_VERSION,
+    effective_codex_story,
+    is_codex_source,
+    strip_discourse_footer_text,
+)
 from pipeline.enrichment import reddit_post_self_text
 from pipeline.hn_dupes import pointer_thread_target
 from llm_limiter import limiter as llm_limiter
@@ -1297,14 +1303,26 @@ def _tldr_cache_key(
     self_text: str,
     top_comments: str,
     article_body: str,
+    source: str = "",
 ) -> str:
     if pointer_thread_target(top_comments, source_id=0) is not None:
         # Generation drops a pointer note (_generate_tldr), so the key does
         # too. Summaries cached under the note itself predate that and
         # invented a discussion (story 38507672); they no longer match.
         top_comments = ""
+    if is_codex_source(source):
+        # Legacy Codex rows cached summaries generated from mixed inputs
+        # (threaded topic HTML as article_body, generated footer in
+        # self_text). Normalize before hashing and mark the inputs so
+        # those keys never match again. Other sources hash exactly as
+        # before — no mass invalidation.
+        self_text = strip_discourse_footer_text(self_text)
+        article_body = ""
+        identity = f"{_llm_cache_identity()}:{CODEX_SUMMARY_INPUT_VERSION}"
+    else:
+        identity = _llm_cache_identity()
     payload = {
-        "identity": _llm_cache_identity(),
+        "identity": identity,
         "title": title,
         "self_text": self_text[:SELF_TEXT_PROMPT_CHAR_LIMIT],
         "top_comments": top_comments[:COMMENT_PROMPT_CHAR_LIMIT],
@@ -1615,11 +1633,13 @@ async def _prefetch_tldrs_for_ranked(
                 story = by_id.get(story_id)
                 if stale_added >= stale_per_run or story is None:
                     continue
+                story = effective_codex_story(story)
                 current_key = _tldr_cache_key(
                     title=story.title,
                     self_text=story.self_text or "",
                     top_comments=story.top_comments or "",
                     article_body=story.article_body or "",
+                    source=story.source,
                 )
                 if current_key != cached_keys[story_id]:
                     seen.add(story_id)
@@ -1643,6 +1663,7 @@ async def _prefetch_tldrs_for_ranked(
         def _inputs(
             candidate: Story,
         ) -> tuple[str, str, str, str, str] | None:
+            candidate = effective_codex_story(candidate)
             title = candidate.title
             self_text = candidate.self_text or ""
             top_comments = candidate.top_comments or ""
@@ -1659,6 +1680,7 @@ async def _prefetch_tldrs_for_ranked(
                     self_text=self_text,
                     top_comments=top_comments,
                     article_body=article_body,
+                    source=candidate.source,
                 ),
             )
 
@@ -2964,6 +2986,20 @@ def _stale_tldr_fallback(db: Database, story_id: int, reason: str) -> TldrReply 
     if story is not None and _is_unfollowed_pointer(story):
         # The only row may be a summary invented from the pointer note.
         return None
+    if story is not None and is_codex_source(story.source):
+        # Legacy Codex summaries were generated from mixed inputs; serve
+        # one only when the stored key already matches the normalized
+        # inputs, never a contaminated row.
+        effective = effective_codex_story(story)
+        current_key = _tldr_cache_key(
+            title=effective.title,
+            self_text=effective.self_text or "",
+            top_comments=effective.top_comments or "",
+            article_body=effective.article_body or "",
+            source=effective.source,
+        )
+        if db.get_tldr_cache_keys([story_id]).get(story_id) != current_key:
+            return None
     stale_tldr = db.get_any_tldr_for_story(story_id)
     if not stale_tldr:
         return None
@@ -3075,7 +3111,9 @@ def _generate_tldr_reply(
     runtime: type[Handler], user: User, tap: _TldrTap
 ) -> TldrReply:
     """Slot, quota, hydration and the LLM call for one story's summary."""
-    story = tap.story
+    # Effective Codex view (idempotent; the tap handler already applies
+    # it, this covers any other caller). Never written back on this path.
+    story = effective_codex_story(tap.story)
     force_refresh = tap.force_refresh
     needs_active_refresh = tap.needs_active_refresh
     needs_empty_fetch = tap.needs_empty_fetch
@@ -3137,7 +3175,10 @@ def _generate_tldr_reply(
         article_body is None
         and story.url
         and src_kind is None
+        # AINews issue pages and Codex topic HTML are not article input.
+        # Keep the existing LessWrong tap behavior when its context is populated.
         and story.source != AINEWS_SOURCE
+        and not is_codex_source(story.source)
         and len(story.self_text) < 500
         and _is_fetchable_article_url(story.url)
     )
@@ -3334,6 +3375,7 @@ def _generate_tldr_reply(
         self_text=story.self_text or "",
         top_comments=story.top_comments or "",
         article_body=article_body or "",
+        source=story.source,
     )
     cached_record = runtime.db.get_tldr_cache_record(story.id, cache_key)
     if cached_record is not None and not force_refresh:
@@ -3516,6 +3558,11 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             return _flask_json_response(
                 {"error": "Story not found in database"}, status=HTTPStatus.NOT_FOUND
             )
+        # Stored Codex Forum rows summarize from their effective view
+        # (legacy mixed bodies omitted, generated footer stripped). Raw
+        # rows are never written back on this path: no lane below fires
+        # for this source, so normalization cannot drop preserved data.
+        story = effective_codex_story(story)
 
         # Recent, high-velocity HN threads bypass the cache hit below and the
         # dedicated "already cached" fast path, since CH prewarm data can be
@@ -3541,6 +3588,7 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             self_text=story.self_text or "",
             top_comments=story.top_comments or "",
             article_body=article_body or "",
+            source=story.source,
         )
         cached_record = runtime.db.get_tldr_cache_record(story.id, cache_key)
         cached_tldr = cached_record.text if cached_record is not None else None
@@ -3863,11 +3911,13 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
         story = runtime.db.get_story(story_id)
         if story is None:
             return Response(status=204)
+        story = effective_codex_story(story)
         key = _tldr_cache_key(
             title=story.title,
             self_text=story.self_text or "",
             top_comments=story.top_comments or "",
             article_body=story.article_body or "",
+            source=story.source,
         )
         if _hot_summary_is_stale(story, runtime.config, time.time()):
             # A miss, so opening the story asks tldr-detail, which refreshes

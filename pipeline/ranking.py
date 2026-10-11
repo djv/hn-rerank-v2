@@ -645,7 +645,17 @@ def compose_story_text(
 
 
 def story_embedding_text(story: Story) -> str:
-    """Return the exact text used for the current production embedding version."""
+    """Return the exact text used for the current production embedding version.
+
+    Codex Forum rows read through their effective view (legacy mixed
+    article bodies omitted, generated footer stripped), so embedding
+    hashes follow clean inputs whatever the caller passed.
+    """
+    # Local import: pipeline.codex_forum imports this module.
+    from .codex_forum import CODEX_FORUM_SOURCE, effective_codex_story
+
+    if story.source == CODEX_FORUM_SOURCE:
+        story = effective_codex_story(story)
     if story.text_content:
         return story.text_content
     return compose_story_text(
@@ -1242,6 +1252,12 @@ def _score_and_rank(
         feedback_stories, feedback_labels, _vote_times = db.get_feedback_for_training(
             user_id=user_id
         )
+    # Stored Codex Forum rows train on their effective (clean) view, like
+    # every other read path; raw rows, votes, and identities are untouched.
+    # Local import: pipeline.codex_forum imports this module.
+    from .codex_forum import effective_codex_story
+
+    feedback_stories = [effective_codex_story(s) for s in feedback_stories]
 
     if config.model.deduplicate_training_feedback:
         from .feedback import deduplicate_feedback
@@ -2586,6 +2602,10 @@ def assemble_ranked_deck(
             feedback_stories, feedback_labels, _ = db.get_feedback_for_training(
                 user_id=user_id
             )
+            # Effective Codex view, as in the training path above.
+            from .codex_forum import effective_codex_story
+
+            feedback_stories = [effective_codex_story(s) for s in feedback_stories]
             fb_labels_arr = np.array(feedback_labels)
             up_mask = fb_labels_arr == 2
             down_mask = fb_labels_arr == 0

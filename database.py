@@ -1314,7 +1314,9 @@ class Database:
 
         Score is forced to -1 so these stories always lose same-source
         tiebreaks in dedup — they participate only as suppressors, never
-        as survivors.
+        as survivors. Full text fields are populated so source-specific
+        read policies (e.g. the Codex Forum effective view) can
+        recompose clean inputs instead of reusing mixed stored text.
         """
         if not actions:
             return []
@@ -1322,7 +1324,9 @@ class Database:
         with self.conn() as conn:
             cursor = conn.execute(
                 f"SELECT DISTINCT s.id, s.title, s.url, s.time, "
-                f"       s.text_content, s.source "
+                f"       s.text_content, s.source, "
+                f"       COALESCE(s.self_text, ''), COALESCE(s.top_comments, ''), "
+                f"       COALESCE(s.article_body, '') "
                 f"FROM stories s "
                 f"JOIN feedback f ON f.story_id = s.id "
                 f"WHERE f.user_id = ? AND f.action IN ({placeholders}) "
@@ -1338,6 +1342,9 @@ class Database:
                     time=row[3] or 0,
                     text_content=row[4] or "",
                     source=row[5] or "hn",
+                    self_text=row[6],
+                    top_comments=row[7],
+                    article_body=row[8],
                 )
                 for row in cursor.fetchall()
             ]

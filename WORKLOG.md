@@ -11889,3 +11889,19 @@ not restarted, physical controls unverified, no production votes or generation.
 Standalone CI also passed all behavior tests on Linux/macOS/Windows, then found
 import-order drift. The follow-up corrects imports and three binding annotations
 for the current standalone Ruff/ty; outside-workspace lint/types/build and tests pass.
+
+## 2026-10-11 — Codex Forum source safety integrated
+
+Integrated Muse's source-specific article suppression, generated-footer
+removal and nondestructive legacy-input/cache policy into current main.
+Following two authorized cloud reviews and the user's Fix and integrate
+choice, restored preexisting LessWrong tap behavior and corrected the typed
+model-free test embedder. One new LessWrong regression reproduced the missing
+fetch before correction. The clean-summary stale fallback remains parked.
+
+The isolated checkout was based on fa9f6f9 and preserves all newer TUI and
+parked-note changes. Original Muse WIP remains untouched. Final-source gates:
+51 focused, backend 1,301 / 1 skipped; Ruff, ty and eight-file format clean.
+Evidence: docs/evaluations/codex-forum-review-20261010/CHECKS.md and manifests.
+This is source integration only; production checkout, service and data were
+not changed. Deployment requires separate approval.
