@@ -12,7 +12,8 @@ import logging
 import math
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from typing import Literal
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +55,9 @@ class LlmRateLimiter:
         with self._lock:
             return max(0, math.ceil(self._next_allowed_at - time.monotonic()))
 
-    async def acquire(self, *, estimated_tokens: int = 0) -> bool:
+    async def acquire(
+        self, *, estimated_tokens: int = 0, wait_allowed: bool = True
+    ) -> bool:
         """Reserve estimated tokens atomically; long cooldowns fail fast.
 
         Groq reports its minute token bucket in response headers. Reserving
@@ -79,7 +82,7 @@ class LlmRateLimiter:
                     if self._tokens is not None:
                         self._tokens -= estimated_tokens
                     return True
-                if now + wait > deadline:
+                if not wait_allowed or now + wait > deadline:
                     return False
             await asyncio.sleep(wait)
 
@@ -176,3 +179,91 @@ def fallback_limiter(provider: str) -> LlmRateLimiter:
 def reset_fallback_limiters() -> None:
     with _fallback_lock:
         _fallback_limiters.clear()
+
+
+class PrimaryCircuitBreaker:
+    """One recovery probe across threads/loops; stale in-flight replies are ignored."""
+
+    BACKOFF = (120.0, 300.0, 900.0, 3600.0)
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._generation = 0
+        self.reset()
+
+    def reset(self, clock: Callable[[], float] = time.monotonic) -> None:
+        with self._lock:
+            self._clock = clock
+            self._state: Literal["closed", "open", "half-open"] = "closed"
+            self._until = 0.0
+            self._opens = 0
+            self._probe = False
+            self._generation += 1
+
+    @property
+    def retry_after_seconds(self) -> int:
+        with self._lock:
+            if self._state != "open":
+                return 0
+            return max(0, math.ceil(self._until - self._clock()))
+
+    def acquire(self) -> int | None:
+        with self._lock:
+            if self._state == "open":
+                if self._clock() < self._until:
+                    return None
+                self._state = "half-open"
+                logger.info("llm primary breaker half-open probe")
+            if self._state == "half-open":
+                if self._probe:
+                    return None
+                self._probe = True
+            return self._generation
+
+    def complete(
+        self,
+        generation: int,
+        *,
+        success: bool,
+        health_failure: str = "",
+        retry_after_s: float = 0.0,
+    ) -> None:
+        with self._lock:
+            if generation != self._generation:
+                # A concurrent half may report a longer outage after the first
+                # failure opened this generation. Extend it without escalating.
+                if (
+                    generation == self._generation - 1
+                    and self._state == "open"
+                    and health_failure
+                ):
+                    self._until = max(self._until, self._clock() + retry_after_s)
+                return
+            self._probe = False
+            if success:
+                if self._state != "closed":
+                    logger.info("llm primary breaker closed")
+                    self._generation += 1
+                self._state = "closed"
+                self._opens = 0
+            elif health_failure:
+                delay = max(
+                    retry_after_s,
+                    self.BACKOFF[min(self._opens, len(self.BACKOFF) - 1)],
+                )
+                self._opens += 1
+                self._until = self._clock() + delay
+                self._state = "open"
+                self._generation += 1
+                logger.warning(
+                    "llm primary breaker opened reason=%s duration=%.0fs",
+                    health_failure,
+                    delay,
+                )
+
+
+primary_breaker = PrimaryCircuitBreaker()
+
+
+def reset_primary_breaker(clock: Callable[[], float] = time.monotonic) -> None:
+    primary_breaker.reset(clock)

@@ -904,17 +904,38 @@ comparison with Mistral, see WORKLOG.md; the 14-87 s that parked it on
 call fails for any reason (error status, timeout, truncation, no bullets
 after the format retry), the same section prompt goes to the fallback with
 the fallback's own token cap (`_call_llm_with_fallback`). While the primary
-cools down it is skipped. Each fallback provider has its own limiter
-(`llm_limiter.fallback_limiter`), so a spent primary never blocks it, and
-the tap and prefetch cooldown gates (`_llm_retry_after_seconds`) wait only
-when every configured provider cools. Fallback summaries are cached under the
-primary's identity, so they are not regenerated once the primary recovers.
+cools down or its circuit breaker is open it is skipped. With a fallback,
+the primary makes one HTTP attempt, never waits in the limiter, and uses a
+45 s timeout; the existing content-format retry is unchanged. A thread-safe
+closed/open/half-open breaker opens on 429, 402, 401/403, 5xx and transport
+failures, not truncation, missing bullets or empty replies. Its open duration
+is the greater of the uncapped numeric provider Retry-After and consecutive
+2 → 5 → 15 → 60 minute backoff. Exactly one half-open recovery probe runs
+across threads and event loops; success closes it and resets escalation.
+Breaker transitions and each failed primary attempt are logged; skipped
+calls are not. An otherwise successful reply that shapes to
+empty also falls back, without opening the breaker.
+Each fallback provider has its own limiter (`llm_limiter.fallback_limiter`),
+so a spent primary never blocks it, and the tap and prefetch cooldown gates (`_llm_retry_after_seconds`) wait only
+when every configured provider is unavailable (primary limiter cooling or
+breaker open; fallback limiter cooling). Half-open does not add a gate wait.
+Startup validates both provider names and refuses unknown values; a named
+fallback with an empty key warns and is disabled. Per-call fallback parsing
+logs invalid names once each and returns None so taps and prefetch cannot
+raise from that optional setting. With the fallback unset, attempt counts,
+waits, timeouts and the limiter's 120 s Retry-After cap are unchanged.
+Fallback summaries are cached under the primary's identity, so they are not
+regenerated once the primary recovers.
 Planned after the ranking trial ends (2026-11-05): `LLM_PROVIDER=gospark`,
 `LLM_FALLBACK_PROVIDER=mistral`.
 
+With a fallback configured, failed article/discussion halves report the status
+with priority 402 > 429 > other status > None and its producing provider.
+Without a fallback, the original error selection remains unchanged.
+
 A 402 (e.g. Mistral's $10 spend cap) feeds the same cooldown path as a 429
 on the provider that returned it (`TldrResult.error_provider`; a primary
-402 behind a fallback cools the primary directly): limited retries, then
+402 behind a fallback opens the primary breaker): limited retries, then
 stale-cache fallback with a countdown (see
 `test_flask_test_client_tldr_provider_error_degrades_gracefully`).
 

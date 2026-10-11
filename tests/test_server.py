@@ -4541,7 +4541,15 @@ async def test_generate_marks_single_half_salvage_uncacheable(
     import server
 
     async def mock_call_llm_chat(
-        *, api_key, base_url, model, prompt, max_tokens, extra=None, limiter=None
+        *,
+        api_key,
+        base_url,
+        model,
+        prompt,
+        max_tokens,
+        extra=None,
+        limiter=None,
+        fail_fast=False,
     ):
         if "Summarize the discussion" in prompt:
             return server.LlmChatResult(content="boom", ok=False, status=429)
@@ -4573,7 +4581,15 @@ async def test_generate_retries_prose_reply_once(
     calls: list[str] = []
 
     async def mock_call_llm_chat(
-        *, api_key, base_url, model, prompt, max_tokens, extra=None, limiter=None
+        *,
+        api_key,
+        base_url,
+        model,
+        prompt,
+        max_tokens,
+        extra=None,
+        limiter=None,
+        fail_fast=False,
     ):
         side = "discussion" if "Summarize the discussion" in prompt else "article"
         calls.append(side)
@@ -4614,7 +4630,15 @@ async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
     calls = []
 
     async def mock_call_llm_chat(
-        *, api_key, base_url, model, prompt, max_tokens, extra=None, limiter=None
+        *,
+        api_key,
+        base_url,
+        model,
+        prompt,
+        max_tokens,
+        extra=None,
+        limiter=None,
+        fail_fast=False,
     ):
         calls.append(prompt)
         if "Summarize the article" in prompt:
@@ -4656,7 +4680,15 @@ async def test_generate_detailed_tldr_folds_thin_article_to_discussion_only(
     calls = []
 
     async def mock_call_llm_chat(
-        *, api_key, base_url, model, prompt, max_tokens, extra=None, limiter=None
+        *,
+        api_key,
+        base_url,
+        model,
+        prompt,
+        max_tokens,
+        extra=None,
+        limiter=None,
+        fail_fast=False,
     ):
         calls.append((prompt, max_tokens))
         return server.LlmChatResult(content="- **Discussion** summary", ok=True)
@@ -4837,7 +4869,15 @@ async def test_generate_detailed_tldr_cerebras_passes_reasoning_effort_and_bumpe
     calls = []
 
     async def mock_call_llm_chat(
-        *, api_key, base_url, model, prompt, max_tokens, extra=None, limiter=None
+        *,
+        api_key,
+        base_url,
+        model,
+        prompt,
+        max_tokens,
+        extra=None,
+        limiter=None,
+        fail_fast=False,
     ):
         calls.append({"max_tokens": max_tokens, "extra": extra, "model": model})
         return server.LlmChatResult(content="- summary", ok=True)
@@ -4969,7 +5009,9 @@ async def test_call_llm_chat_sends_go_session_only_to_the_go_gateway(
             seen.append((self.timeout, dict(headers)))
             return FakeResponse()
 
-    async def allow_acquire(*, estimated_tokens: int = 0) -> bool:
+    async def allow_acquire(
+        *, estimated_tokens: int = 0, wait_allowed: bool = True
+    ) -> bool:
         return True
 
     monkeypatch.setattr(server.httpx, "AsyncClient", FakeClient)
@@ -5041,7 +5083,7 @@ async def test_call_llm_responses_success_and_429(monkeypatch) -> None:
 
     monkeypatch.setattr(server.httpx, "AsyncClient", FakeClient)
 
-    async def allow_acquire(*, estimated_tokens=0):
+    async def allow_acquire(*, estimated_tokens=0, wait_allowed=True):
         return True
 
     def noop_record(**kwargs):
@@ -5125,6 +5167,7 @@ async def test_generated_tldr_preserves_pane_allowance(
         prompt: str,
         max_tokens: int,
         on_usage: server.LlmUsageRecorder | None = None,
+        fail_fast: bool = False,
     ) -> server.LlmChatResult:
         label = "Article" if "Summarize the article" in prompt else "Discussion"
         calls[label] = (prompt, max_tokens)
@@ -5164,7 +5207,15 @@ async def test_generate_detailed_tldr_combined_prompt_contract(
     calls = []
 
     async def mock_call_llm_chat(
-        *, api_key, base_url, model, prompt, max_tokens, extra=None, limiter=None
+        *,
+        api_key,
+        base_url,
+        model,
+        prompt,
+        max_tokens,
+        extra=None,
+        limiter=None,
+        fail_fast=False,
     ):
         calls.append(prompt)
         return server.LlmChatResult(content="- summary", ok=True)
@@ -5202,7 +5253,15 @@ async def test_generate_detailed_tldr_counts_feed_copy_of_article_once(
     calls: list[tuple[str, int]] = []
 
     async def mock_call_llm_chat(
-        *, api_key, base_url, model, prompt, max_tokens, extra=None, limiter=None
+        *,
+        api_key,
+        base_url,
+        model,
+        prompt,
+        max_tokens,
+        extra=None,
+        limiter=None,
+        fail_fast=False,
     ):
         calls.append((prompt, max_tokens))
         return server.LlmChatResult(content="- **Item:** point", ok=True)
@@ -5232,7 +5291,15 @@ async def test_generate_detailed_tldr_sends_feed_copy_of_body_once(
     prompts: list[str] = []
 
     async def mock_call_llm_chat(
-        *, api_key, base_url, model, prompt, max_tokens, extra=None, limiter=None
+        *,
+        api_key,
+        base_url,
+        model,
+        prompt,
+        max_tokens,
+        extra=None,
+        limiter=None,
+        fail_fast=False,
     ):
         prompts.append(prompt)
         return server.LlmChatResult(content="- **Item:** point", ok=True)
@@ -5267,7 +5334,7 @@ async def test_call_llm_chat_uses_limiter(monkeypatch):
     calls = []
 
     class FakeLimiter:
-        async def acquire(self, *, estimated_tokens=0):
+        async def acquire(self, *, estimated_tokens=0, wait_allowed=True):
             assert estimated_tokens > 0
             calls.append(("acquire", None))
             return True
@@ -5337,7 +5404,15 @@ async def test_unified_fallback_omits_article_when_no_article_body(
     calls = []
 
     async def mock_call_llm_chat(
-        *, api_key, base_url, model, prompt, max_tokens, extra=None, limiter=None
+        *,
+        api_key,
+        base_url,
+        model,
+        prompt,
+        max_tokens,
+        extra=None,
+        limiter=None,
+        fail_fast=False,
     ):
         calls.append(prompt)
         return server.LlmChatResult(content="- **Discussion** summary", ok=True)
@@ -5367,7 +5442,15 @@ async def test_generate_detailed_tldr_returns_stub_when_no_content(
     calls: list = []
 
     async def mock_call_llm_chat(
-        *, api_key, base_url, model, prompt, max_tokens, extra=None, limiter=None
+        *,
+        api_key,
+        base_url,
+        model,
+        prompt,
+        max_tokens,
+        extra=None,
+        limiter=None,
+        fail_fast=False,
     ):
         calls.append(prompt)
         return "should not be called"
@@ -6324,7 +6407,7 @@ async def test_call_llm_for_config_records_chat_usage(monkeypatch) -> None:
     recorded = []
 
     class FakeLimiter:
-        async def acquire(self, *, estimated_tokens=0):
+        async def acquire(self, *, estimated_tokens=0, wait_allowed=True):
             return True
 
         def record_response(self, **kwargs):
@@ -6389,7 +6472,7 @@ async def test_call_llm_responses_records_reasoning_usage(monkeypatch) -> None:
     recorded = []
 
     class FakeLimiter:
-        async def acquire(self, *, estimated_tokens=0):
+        async def acquire(self, *, estimated_tokens=0, wait_allowed=True):
             return True
 
         def record_response(self, **kwargs):
@@ -6491,7 +6574,9 @@ async def test_generate_detailed_tldr_records_usage_via_global_recorder(
     import server
     from database import Database
 
-    async def fake_call_llm_for_config(cfg, *, prompt, max_tokens, on_usage=None):
+    async def fake_call_llm_for_config(
+        cfg, *, prompt, max_tokens, on_usage=None, fail_fast=False
+    ):
         result = server.LlmChatResult(
             content="- **Discussion** summary",
             ok=True,
@@ -6734,7 +6819,15 @@ async def test_generate_keeps_short_tweet_and_drops_pointer_comments(
     prompts: list[str] = []
 
     async def mock_call_llm_chat(
-        *, api_key, base_url, model, prompt, max_tokens, extra=None, limiter=None
+        *,
+        api_key,
+        base_url,
+        model,
+        prompt,
+        max_tokens,
+        extra=None,
+        limiter=None,
+        fail_fast=False,
     ):
         prompts.append(prompt)
         return server.LlmChatResult(content="- **Point** summary", ok=True)

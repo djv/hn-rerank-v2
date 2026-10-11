@@ -77,7 +77,7 @@ from pipeline.codex_forum import (
 )
 from pipeline.enrichment import reddit_post_self_text
 from pipeline.hn_dupes import pointer_thread_target
-from llm_limiter import LlmRateLimiter, fallback_limiter
+from llm_limiter import LlmRateLimiter, fallback_limiter, primary_breaker
 from llm_limiter import limiter as llm_limiter
 from reddit_limiter import limiter as reddit_limiter
 import http_fetch
@@ -177,6 +177,15 @@ def _parse_retry_after(header_value: str | None, default: float = 1.0) -> float:
     except ValueError:
         return default
     return max(0.0, min(seconds, 10.0))
+
+
+def _provider_retry_after(header_value: str | None) -> float:
+    """Uncapped numeric provider delay for routing around long outages."""
+    try:
+        seconds = float(header_value or "")
+    except ValueError:
+        return 0.0
+    return seconds if math.isfinite(seconds) and seconds >= 0 else 0.0
 
 
 def _normalize_tldr_markdown(text: str) -> str:
@@ -313,6 +322,10 @@ class LlmChatResult:
     reasoning_tokens: int | None = None
     # Provider that produced this result (set by _call_llm_once).
     provider: str = ""
+    # HTTP caller exceptions, distinct from invalid content in a 200 reply.
+    transport_failure: bool = False
+    # Numeric provider header before the limiter caps its adopted delay.
+    retry_after_s: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -865,6 +878,7 @@ async def _call_llm_chat(
     max_tokens: int,
     extra: dict[str, object] | None = None,
     limiter: LlmRateLimiter | None = None,
+    fail_fast: bool = False,
 ) -> LlmChatResult:
     gate = limiter if limiter is not None else llm_limiter
     payload = {
@@ -876,11 +890,13 @@ async def _call_llm_chat(
     }
     estimated_tokens = len(prompt) // 3 + max_tokens
     # The free Go models think for 15-45s on long discussions.
-    timeout = 90.0 if "/zen/go/" in base_url else 45.0
+    timeout = 90.0 if "/zen/go/" in base_url and not fail_fast else 45.0
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            for attempt in range(4):
-                if not await gate.acquire(estimated_tokens=estimated_tokens):
+            for attempt in range(1 if fail_fast else 4):
+                if not await gate.acquire(
+                    estimated_tokens=estimated_tokens, wait_allowed=not fail_fast
+                ):
                     return LlmChatResult(
                         content="LLM quota cooldown; retry later.", ok=False, status=429
                     )
@@ -915,9 +931,9 @@ async def _call_llm_chat(
                         input_tokens=_usage_int(usage, "prompt_tokens"),
                         output_tokens=_usage_int(usage, "completion_tokens"),
                     )
-                if resp.status_code == 429 and attempt < 3:
+                if resp.status_code == 429 and attempt < 3 and not fail_fast:
                     continue
-                if resp.status_code == 503 and attempt < 3:
+                if resp.status_code == 503 and attempt < 3 and not fail_fast:
                     base = 2 ** (attempt + 1)
                     jitter = random.uniform(0, base * 0.5)
                     delay = _parse_retry_after(
@@ -930,10 +946,11 @@ async def _call_llm_chat(
                 content=f"Error from LLM Provider: HTTP {resp.status_code} - {resp.text}",
                 ok=False,
                 status=resp.status_code,
+                retry_after_s=_provider_retry_after(resp.headers.get("Retry-After")),
             )
     except Exception as e:
         logging.exception("_call_llm_chat: unexpected exception")
-        return LlmChatResult(content=str(e), ok=False)
+        return LlmChatResult(content=str(e), ok=False, transport_failure=True)
 
 
 # Go gateway client identity: non-generic UA + stable per-day session id
@@ -983,6 +1000,7 @@ async def _call_llm_responses(
     max_tokens: int,
     extra: dict[str, object] | None = None,
     limiter: LlmRateLimiter | None = None,
+    fail_fast: bool = False,
 ) -> LlmChatResult:
     """OpenAI Responses-API caller for the Go gateway (Muse Spark).
 
@@ -999,9 +1017,11 @@ async def _call_llm_responses(
     }
     estimated_tokens = len(prompt) // 3 + max_tokens
     try:
-        async with httpx.AsyncClient(timeout=90.0) as client:
-            for attempt in range(4):
-                if not await gate.acquire(estimated_tokens=estimated_tokens):
+        async with httpx.AsyncClient(timeout=45.0 if fail_fast else 90.0) as client:
+            for attempt in range(1 if fail_fast else 4):
+                if not await gate.acquire(
+                    estimated_tokens=estimated_tokens, wait_allowed=not fail_fast
+                ):
                     return LlmChatResult(
                         content="LLM quota cooldown; retry later.", ok=False, status=429
                     )
@@ -1071,9 +1091,9 @@ async def _call_llm_responses(
                         output_tokens=_usage_int(usage, "output_tokens"),
                         reasoning_tokens=_usage_int(details, "reasoning_tokens"),
                     )
-                if resp.status_code == 429 and attempt < 3:
+                if resp.status_code == 429 and attempt < 3 and not fail_fast:
                     continue
-                if resp.status_code == 503 and attempt < 3:
+                if resp.status_code == 503 and attempt < 3 and not fail_fast:
                     base = 2 ** (attempt + 1)
                     jitter = random.uniform(0, base * 0.5)
                     delay = _parse_retry_after(
@@ -1087,10 +1107,11 @@ async def _call_llm_responses(
                 content=_responses_error(err_data, resp.status_code, resp.text),
                 ok=False,
                 status=resp.status_code,
+                retry_after_s=_provider_retry_after(resp.headers.get("Retry-After")),
             )
     except Exception as e:
         logging.exception("_call_llm_responses: unexpected exception")
-        return LlmChatResult(content=str(e), ok=False)
+        return LlmChatResult(content=str(e), ok=False, transport_failure=True)
 
 
 # Spend-visibility recorder: Database.record_llm_usage bound by callers that
@@ -1130,6 +1151,7 @@ async def _call_llm_for_config(
     prompt: str,
     max_tokens: int,
     on_usage: LlmUsageRecorder | None = None,
+    fail_fast: bool = False,
 ) -> LlmChatResult:
     """Call the provider, retrying once when a finished reply has no bullets.
 
@@ -1139,12 +1161,20 @@ async def _call_llm_for_config(
     comes back as bullets.
     """
     result = await _call_llm_once(
-        cfg, prompt=prompt, max_tokens=max_tokens, on_usage=on_usage
+        cfg,
+        prompt=prompt,
+        max_tokens=max_tokens,
+        on_usage=on_usage,
+        fail_fast=fail_fast,
     )
     if _is_format_rejection(result):
         logging.info("llm: reply had no bullets, retrying once")
         result = await _call_llm_once(
-            cfg, prompt=prompt, max_tokens=max_tokens, on_usage=on_usage
+            cfg,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            on_usage=on_usage,
+            fail_fast=fail_fast,
         )
     return result
 
@@ -1165,6 +1195,7 @@ async def _call_llm_once(
     prompt: str,
     max_tokens: int,
     on_usage: LlmUsageRecorder | None = None,
+    fail_fast: bool = False,
 ) -> LlmChatResult:
     """Dispatch to the chat or responses caller based on endpoint shape."""
     api_key, base_url, model, extra = cfg.api_key, cfg.base_url, cfg.model, cfg.extra
@@ -1181,6 +1212,7 @@ async def _call_llm_once(
         max_tokens=max_tokens,
         extra=extra,
         limiter=_limiter_for(cfg.provider),
+        fail_fast=fail_fast,
     )
     _note_llm_usage(on_usage, cfg.provider, result)
     return replace(result, provider=cfg.provider)
@@ -1264,6 +1296,24 @@ def _llm_provider_config() -> LlmProviderConfig:
     return _provider_config(provider, os.environ.get("LLM_MODEL"))
 
 
+_bad_fallback_values: set[str] = set()
+_bad_fallback_lock = threading.Lock()
+
+
+def _validate_llm_config() -> None:
+    _llm_provider_config()
+    provider = os.environ.get("LLM_FALLBACK_PROVIDER", "").strip().lower()
+    if not provider:
+        return
+    if provider not in _LLM_PROVIDERS:
+        raise ValueError(f"Unsupported LLM_FALLBACK_PROVIDER: {provider}")
+    key_env = _LLM_PROVIDERS[provider][0]
+    if not os.environ.get(key_env, "").strip():
+        logging.warning(
+            "LLM_FALLBACK_PROVIDER=%s disabled: %s is empty", provider, key_env
+        )
+
+
 def _llm_fallback_config() -> LlmProviderConfig | None:
     """Provider tried when the primary call fails (LLM_FALLBACK_PROVIDER).
 
@@ -1274,11 +1324,15 @@ def _llm_fallback_config() -> LlmProviderConfig | None:
     if not provider:
         return None
     if provider not in _LLM_PROVIDERS:
-        raise ValueError(f"Unsupported LLM_FALLBACK_PROVIDER: {provider}")
+        with _bad_fallback_lock:
+            if provider not in _bad_fallback_values:
+                _bad_fallback_values.add(provider)
+                logging.error("Unsupported LLM_FALLBACK_PROVIDER: %s", provider)
+        return None
     if provider == os.environ.get("LLM_PROVIDER", "groq").lower():
         return None
     cfg = _provider_config(provider, None)
-    return cfg if cfg.api_key else None
+    return cfg if cfg.api_key and cfg.api_key.strip() else None
 
 
 def _provider_config(provider: str, model_override: str | None) -> LlmProviderConfig:
@@ -1336,7 +1390,7 @@ def _llm_retry_after_seconds() -> int:
     if fallback is None:
         return llm_limiter.retry_after_seconds
     return min(
-        llm_limiter.retry_after_seconds,
+        max(llm_limiter.retry_after_seconds, primary_breaker.retry_after_seconds),
         _limiter_for(fallback.provider).retry_after_seconds,
     )
 
@@ -1351,31 +1405,52 @@ async def _call_llm_with_fallback(
 ) -> LlmChatResult:
     """Call the primary; on any failure retry the same prompt on the fallback.
 
-    A cooling-down primary is skipped so a spent quota does not cost every
-    call a doomed request first.
+    With a fallback, the primary gets one fail-fast attempt and is skipped
+    while it cools or its breaker is open, so a spent quota does not cost
+    every call a doomed request first.
     """
-    if fallback is not None and llm_limiter.retry_after_seconds > 0:
-        logging.info("llm: %s cooling down, using %s", cfg.provider, fallback.provider)
-    else:
-        result = await _call_llm_for_config(
-            cfg,
-            prompt=prompt,
-            max_tokens=_max_tokens_for_provider(cfg, base_tokens),
-            on_usage=on_usage,
-        )
+    lease = None
+    if fallback is None or llm_limiter.retry_after_seconds == 0:
+        lease = primary_breaker.acquire() if fallback is not None else 0
+    if lease is not None:
+        try:
+            result = await _call_llm_for_config(
+                cfg,
+                prompt=prompt,
+                max_tokens=_max_tokens_for_provider(cfg, base_tokens),
+                on_usage=on_usage,
+                fail_fast=fallback is not None,
+            )
+        except BaseException:
+            if fallback is not None:
+                primary_breaker.complete(lease, success=False)
+            raise
+        if fallback is not None:
+            if result.ok and not _shape_tldr(result.content):
+                result = replace(result, ok=False)
+            health_failure = (
+                "transport"
+                if result.transport_failure
+                else f"HTTP {result.status}"
+                if result.status is not None
+                and (result.status in (401, 402, 403, 429) or result.status >= 500)
+                else ""
+            )
+            primary_breaker.complete(
+                lease,
+                success=result.ok,
+                health_failure=health_failure,
+                retry_after_s=result.retry_after_s,
+            )
         if result.ok or fallback is None:
             return result
-        if result.status == 402:
-            # Billing refusal: no Retry-After, and the caller only sees the
-            # fallback's result, so cool the primary here (as the tap path
-            # does for a lone provider).
-            llm_limiter.on_429()
         logging.warning(
             "llm: %s failed (status=%s), falling back to %s",
             cfg.provider,
             result.status,
             fallback.provider,
         )
+    assert fallback is not None
     return await _call_llm_for_config(
         fallback,
         prompt=prompt,
@@ -1567,7 +1642,15 @@ async def generate_detailed_tldr(
             )
             return TldrResult(kind="ok", tldr=f"### {label}\n{text}", cacheable=False)
         if not article_result.ok and not discussion_result.ok:
-            failed = article_result if article_result.status else discussion_result
+            if fallback is None:
+                failed = article_result if article_result.status else discussion_result
+            else:
+                failed = max(
+                    (article_result, discussion_result),
+                    key=lambda r: {402: 3, 429: 2}.get(
+                        r.status, int(r.status is not None)
+                    ),
+                )
             return TldrResult(
                 kind="llm_error",
                 error_status=failed.status,
@@ -3136,13 +3219,18 @@ def _tldr_result_reply(
             return fallback
         if result.error_status in (429, 402):
             if result.error_status == 402:
-                # Billing refusal (e.g. spend cap): no Retry-After
-                # semantics, so seed the cooldown explicitly. Escalates
-                # with consecutive 402s via the limiter backoff and
-                # self-clears, like a 429.
-                _limiter_for(
-                    result.error_provider or _llm_provider_config().provider
-                ).on_429()
+                provider = result.error_provider or _llm_provider_config().provider
+                if (
+                    _llm_fallback_config() is not None
+                    and provider == _llm_provider_config().provider
+                ):
+                    lease = primary_breaker.acquire()
+                    if lease is not None:
+                        primary_breaker.complete(
+                            lease, success=False, health_failure="HTTP 402"
+                        )
+                else:
+                    _limiter_for(provider).on_429()
             return _rate_limited_reply(
                 "Summary provider is cooling down. Please try again later.",
                 max(1, _llm_retry_after_seconds()),
@@ -4250,6 +4338,7 @@ def main() -> None:
     )
     _quiet_third_party_loggers()
     load_env()
+    _validate_llm_config()
     config = Config.load()
     db = Database(config.db_path)
 

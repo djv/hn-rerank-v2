@@ -13,7 +13,7 @@ from reddit_feed_cache import cache as reddit_feed_cache
 from reddit_fetch_queue import queue as reddit_fetch_queue
 from reddit_limiter import limiter as reddit_limiter
 from llm_limiter import limiter as llm_limiter
-from llm_limiter import reset_fallback_limiters
+from llm_limiter import reset_fallback_limiters, reset_primary_breaker
 
 # Example budgets (HYPOTHESIS_PROFILE):
 # - unset, local: a quarter of each test's examples (at least 10, or all of
@@ -116,6 +116,7 @@ def reset_reddit_singletons() -> Iterator[None]:
 
     llm_limiter.reset()
     reset_fallback_limiters()
+    reset_primary_breaker()
     reddit_limiter.reset()
     reddit_feed_cache.reset()
     reddit_fetch_queue.reset()
@@ -138,4 +139,5 @@ def reset_reddit_singletons() -> Iterator[None]:
     reddit_limiter.reset()
     llm_limiter.reset()
     reset_fallback_limiters()
+    reset_primary_breaker()
     reddit_feed_cache.reset()

@@ -1,5 +1,22 @@
 # Worklog: hn-rewrite
 
+## 2026-10-11 — Harden Muse/Mistral fallback after review
+
+A cloud review of the fallback branch found that only 429/402 cooled Muse, so a
+timeout or 5xx cost every call the full Muse failure before Mistral, and a bad
+LLM_FALLBACK_PROVIDER turned taps into HTTP 500s. Codex implemented the fixes;
+the main agent checked the diff. With a fallback configured: the primary gets
+one fail-fast attempt with a 45 s timeout; a breaker opens on 429, 402,
+401/403, 5xx and transport errors (not content failures), honors the uncapped
+Retry-After (the Go plan's week-long exhaustion), escalates 2/5/15/60 min and
+sends one recovery probe at a time; an empty shaped primary reply falls back;
+failed halves report 402 > 429 > other. Startup rejects an unknown fallback
+and warns on a missing key; per-call bad values log once and disable it.
+Unset fallback keeps the original attempts, waits, timeouts and errors.
+Fallback rows are not tagged for later upgrade (user: not now).
+Checks on the VPS: full suite 1359 passed, 1 skipped; fallback tests at the
+ci Hypothesis profile 52 passed; ruff, format, ty clean. Not deployed.
+
 ## 2026-10-11 — Muse-primary summaries with Mistral fallback (not deployed)
 
 User chose a full switch to Muse Spark after the ranking trial, with automatic
