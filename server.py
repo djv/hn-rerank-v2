@@ -77,6 +77,7 @@ from pipeline.codex_forum import (
 )
 from pipeline.enrichment import reddit_post_self_text
 from pipeline.hn_dupes import pointer_thread_target
+from llm_limiter import LlmRateLimiter, fallback_limiter
 from llm_limiter import limiter as llm_limiter
 from reddit_limiter import limiter as reddit_limiter
 import http_fetch
@@ -310,6 +311,8 @@ class LlmChatResult:
     input_tokens: int | None = None
     output_tokens: int | None = None
     reasoning_tokens: int | None = None
+    # Provider that produced this result (set by _call_llm_once).
+    provider: str = ""
 
 
 @dataclass(frozen=True)
@@ -321,10 +324,17 @@ class TldrResult:
     # False for a salvaged half: serve this request only, never tldr_cache
     # (one row per story — caching it would evict a complete TLDR).
     cacheable: bool = True
+    # Provider whose error_status this is, so a 402 cools the right limiter.
+    error_provider: str = ""
 
 
 def _llm_error_from(r: LlmChatResult) -> TldrResult:
-    return TldrResult(kind="llm_error", error_status=r.status, error_text=r.content)
+    return TldrResult(
+        kind="llm_error",
+        error_status=r.status,
+        error_text=r.content,
+        error_provider=r.provider,
+    )
 
 
 MIN_ARTICLE_CHARS = 200
@@ -854,7 +864,9 @@ async def _call_llm_chat(
     prompt: str,
     max_tokens: int,
     extra: dict[str, object] | None = None,
+    limiter: LlmRateLimiter | None = None,
 ) -> LlmChatResult:
+    gate = limiter if limiter is not None else llm_limiter
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
@@ -868,7 +880,7 @@ async def _call_llm_chat(
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             for attempt in range(4):
-                if not await llm_limiter.acquire(estimated_tokens=estimated_tokens):
+                if not await gate.acquire(estimated_tokens=estimated_tokens):
                     return LlmChatResult(
                         content="LLM quota cooldown; retry later.", ok=False, status=429
                     )
@@ -883,7 +895,7 @@ async def _call_llm_chat(
                 resp = await client.post(base_url, headers=headers, json=payload)
                 data = resp.json() if resp.status_code == 200 else {}
                 used_tokens = data.get("usage", {}).get("total_tokens")
-                llm_limiter.record_response(
+                gate.record_response(
                     status=resp.status_code,
                     headers=resp.headers,
                     reserved_tokens=estimated_tokens,
@@ -970,6 +982,7 @@ async def _call_llm_responses(
     prompt: str,
     max_tokens: int,
     extra: dict[str, object] | None = None,
+    limiter: LlmRateLimiter | None = None,
 ) -> LlmChatResult:
     """OpenAI Responses-API caller for the Go gateway (Muse Spark).
 
@@ -977,6 +990,7 @@ async def _call_llm_responses(
     output tokens, so reasoning effort is pinned low (upstream rejects
     "none"). No temperature: the provider forces its default.
     """
+    gate = limiter if limiter is not None else llm_limiter
     payload = {
         "model": model,
         "input": prompt,
@@ -987,7 +1001,7 @@ async def _call_llm_responses(
     try:
         async with httpx.AsyncClient(timeout=90.0) as client:
             for attempt in range(4):
-                if not await llm_limiter.acquire(estimated_tokens=estimated_tokens):
+                if not await gate.acquire(estimated_tokens=estimated_tokens):
                     return LlmChatResult(
                         content="LLM quota cooldown; retry later.", ok=False, status=429
                     )
@@ -1011,7 +1025,7 @@ async def _call_llm_responses(
                 used_tokens = (
                     usage.get("total_tokens") if isinstance(usage, dict) else None
                 )
-                llm_limiter.record_response(
+                gate.record_response(
                     status=resp.status_code,
                     headers=resp.headers,
                     reserved_tokens=estimated_tokens,
@@ -1154,27 +1168,22 @@ async def _call_llm_once(
 ) -> LlmChatResult:
     """Dispatch to the chat or responses caller based on endpoint shape."""
     api_key, base_url, model, extra = cfg.api_key, cfg.base_url, cfg.model, cfg.extra
-    if base_url.rstrip("/").endswith("/responses"):
-        result = await _call_llm_responses(
-            api_key=api_key or "",
-            base_url=base_url,
-            model=model,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            extra=extra,
-        )
-        _note_llm_usage(on_usage, cfg.provider, result)
-        return result
-    result = await _call_llm_chat(
+    caller = (
+        _call_llm_responses
+        if base_url.rstrip("/").endswith("/responses")
+        else _call_llm_chat
+    )
+    result = await caller(
         api_key=api_key or "",
         base_url=base_url,
         model=model,
         prompt=prompt,
         max_tokens=max_tokens,
         extra=extra,
+        limiter=_limiter_for(cfg.provider),
     )
     _note_llm_usage(on_usage, cfg.provider, result)
-    return result
+    return replace(result, provider=cfg.provider)
 
 
 @dataclass(frozen=True)
@@ -1252,8 +1261,29 @@ def _llm_provider_config() -> LlmProviderConfig:
     provider = os.environ.get("LLM_PROVIDER", "groq").lower()
     if provider not in _LLM_PROVIDERS:
         raise ValueError(f"Unsupported LLM_PROVIDER: {provider}")
+    return _provider_config(provider, os.environ.get("LLM_MODEL"))
+
+
+def _llm_fallback_config() -> LlmProviderConfig | None:
+    """Provider tried when the primary call fails (LLM_FALLBACK_PROVIDER).
+
+    None when unset, equal to the primary, or missing its key. LLM_MODEL
+    applies to the primary only; the fallback uses its table model.
+    """
+    provider = os.environ.get("LLM_FALLBACK_PROVIDER", "").strip().lower()
+    if not provider:
+        return None
+    if provider not in _LLM_PROVIDERS:
+        raise ValueError(f"Unsupported LLM_FALLBACK_PROVIDER: {provider}")
+    if provider == os.environ.get("LLM_PROVIDER", "groq").lower():
+        return None
+    cfg = _provider_config(provider, None)
+    return cfg if cfg.api_key else None
+
+
+def _provider_config(provider: str, model_override: str | None) -> LlmProviderConfig:
     key_env, base_url, model, extra = _LLM_PROVIDERS[provider]
-    model = os.environ.get("LLM_MODEL", model)
+    model = model_override or model
     extra = dict(extra)
     if provider == "groq" and not model.startswith("openai/gpt-oss-"):
         extra.pop("reasoning_effort", None)
@@ -1290,6 +1320,68 @@ def _valid_llm_completion(content: str, finish_reason: str | None) -> bool:
     if finish_reason == "length" or not content.strip():
         return False
     return bool(re.search(r"^\s*[-*]\s+\S", content, re.MULTILINE))
+
+
+def _limiter_for(provider: str) -> LlmRateLimiter:
+    """The primary provider keeps the shared limiter; a fallback gets its own
+    so a spent primary (e.g. the Go plan's limit) cannot block it."""
+    if provider == _llm_provider_config().provider:
+        return llm_limiter
+    return fallback_limiter(provider)
+
+
+def _llm_retry_after_seconds() -> int:
+    """Seconds until some configured provider can take a call."""
+    fallback = _llm_fallback_config()
+    if fallback is None:
+        return llm_limiter.retry_after_seconds
+    return min(
+        llm_limiter.retry_after_seconds,
+        _limiter_for(fallback.provider).retry_after_seconds,
+    )
+
+
+async def _call_llm_with_fallback(
+    cfg: LlmProviderConfig,
+    fallback: LlmProviderConfig | None,
+    *,
+    prompt: str,
+    base_tokens: int,
+    on_usage: LlmUsageRecorder | None = None,
+) -> LlmChatResult:
+    """Call the primary; on any failure retry the same prompt on the fallback.
+
+    A cooling-down primary is skipped so a spent quota does not cost every
+    call a doomed request first.
+    """
+    if fallback is not None and llm_limiter.retry_after_seconds > 0:
+        logging.info("llm: %s cooling down, using %s", cfg.provider, fallback.provider)
+    else:
+        result = await _call_llm_for_config(
+            cfg,
+            prompt=prompt,
+            max_tokens=_max_tokens_for_provider(cfg, base_tokens),
+            on_usage=on_usage,
+        )
+        if result.ok or fallback is None:
+            return result
+        if result.status == 402:
+            # Billing refusal: no Retry-After, and the caller only sees the
+            # fallback's result, so cool the primary here (as the tap path
+            # does for a lone provider).
+            llm_limiter.on_429()
+        logging.warning(
+            "llm: %s failed (status=%s), falling back to %s",
+            cfg.provider,
+            result.status,
+            fallback.provider,
+        )
+    return await _call_llm_for_config(
+        fallback,
+        prompt=prompt,
+        max_tokens=_max_tokens_for_provider(fallback, base_tokens),
+        on_usage=on_usage,
+    )
 
 
 def _llm_cache_identity() -> str:
@@ -1384,6 +1476,7 @@ async def generate_detailed_tldr(
     article_body: str = "",
 ) -> TldrResult:
     cfg = _llm_provider_config()
+    fallback = _llm_fallback_config()
     api_key = cfg.api_key
     on_usage = _llm_usage_recorder
 
@@ -1436,18 +1529,18 @@ async def generate_detailed_tldr(
             budget=_section_budget(),
         )
         article_result, discussion_result = await asyncio.gather(
-            _call_llm_for_config(
+            _call_llm_with_fallback(
                 cfg,
+                fallback,
                 prompt=article_prompt,
-                max_tokens=_max_tokens_for_provider(
-                    cfg, _section_max_tokens(450, article_chars)
-                ),
+                base_tokens=_section_max_tokens(450, article_chars),
                 on_usage=on_usage,
             ),
-            _call_llm_for_config(
+            _call_llm_with_fallback(
                 cfg,
+                fallback,
                 prompt=discussion_prompt,
-                max_tokens=_max_tokens_for_provider(cfg, 450),
+                base_tokens=450,
                 on_usage=on_usage,
             ),
         )
@@ -1474,10 +1567,12 @@ async def generate_detailed_tldr(
             )
             return TldrResult(kind="ok", tldr=f"### {label}\n{text}", cacheable=False)
         if not article_result.ok and not discussion_result.ok:
+            failed = article_result if article_result.status else discussion_result
             return TldrResult(
                 kind="llm_error",
-                error_status=article_result.status or discussion_result.status,
+                error_status=failed.status,
                 error_text=f"Article: {article_result.content}; Discussion: {discussion_result.content}",
+                error_provider=failed.provider,
             )
         return TldrResult(kind="llm_error", error_text="empty LLM response")
 
@@ -1496,10 +1591,11 @@ async def generate_detailed_tldr(
             budget=_section_budget(single_section=True),
         )
 
-    result = await _call_llm_for_config(
+    result = await _call_llm_with_fallback(
         cfg,
+        fallback,
         prompt=prompt,
-        max_tokens=_max_tokens_for_provider(cfg, _section_max_tokens(1000, chars)),
+        base_tokens=_section_max_tokens(1000, chars),
         on_usage=on_usage,
     )
     if result.ok:
@@ -1602,7 +1698,7 @@ async def _prefetch_tldrs_for_ranked(
     # attempts the moment a cooldown lifts re-trips free-tier rate limits
     # (Groq answered a post-restart burst with a 660s retry-after). Skip the
     # whole run while cooling down; on-demand taps get first shot at quota.
-    cooldown = llm_limiter.retry_after_seconds
+    cooldown = _llm_retry_after_seconds()
     if cooldown > 0:
         logging.info("tldr_prefetch skipped: provider cooldown %ss remaining", cooldown)
         return 0
@@ -1778,7 +1874,7 @@ async def _prefetch_tldrs_for_ranked(
             len(story_ids),
             per_view,
             stale_added,
-            llm_limiter.retry_after_seconds,
+            _llm_retry_after_seconds(),
         )
     return generated
 
@@ -3044,10 +3140,12 @@ def _tldr_result_reply(
                 # semantics, so seed the cooldown explicitly. Escalates
                 # with consecutive 402s via the limiter backoff and
                 # self-clears, like a 429.
-                llm_limiter.on_429()
+                _limiter_for(
+                    result.error_provider or _llm_provider_config().provider
+                ).on_429()
             return _rate_limited_reply(
                 "Summary provider is cooling down. Please try again later.",
-                max(1, llm_limiter.retry_after_seconds),
+                max(1, _llm_retry_after_seconds()),
             )
         return TldrReply(
             {"error": "Failed to generate TLDR. Please try again later."},
@@ -3623,7 +3721,7 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
                 cached_record.source_comments,
             ).response()
 
-        retry_after = llm_limiter.retry_after_seconds
+        retry_after = _llm_retry_after_seconds()
         if retry_after:
             if cached_tldr:
                 # The text is current, but a requested refresh did not happen.

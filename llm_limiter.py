@@ -160,3 +160,19 @@ class LlmRateLimiter:
 
 
 limiter: LlmRateLimiter = LlmRateLimiter()
+
+# Fallback providers get their own cooldown: the primary's 429 (e.g. a spent
+# Go plan) must not block the call that routes around it. The primary keeps
+# the shared `limiter` above.
+_fallback_limiters: dict[str, LlmRateLimiter] = {}
+_fallback_lock = threading.Lock()
+
+
+def fallback_limiter(provider: str) -> LlmRateLimiter:
+    with _fallback_lock:
+        return _fallback_limiters.setdefault(provider, LlmRateLimiter())
+
+
+def reset_fallback_limiters() -> None:
+    with _fallback_lock:
+        _fallback_limiters.clear()

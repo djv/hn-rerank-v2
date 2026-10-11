@@ -13,6 +13,7 @@ from reddit_feed_cache import cache as reddit_feed_cache
 from reddit_fetch_queue import queue as reddit_fetch_queue
 from reddit_limiter import limiter as reddit_limiter
 from llm_limiter import limiter as llm_limiter
+from llm_limiter import reset_fallback_limiters
 
 # Example budgets (HYPOTHESIS_PROFILE):
 # - unset, local: a quarter of each test's examples (at least 10, or all of
@@ -61,6 +62,13 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         )
 
 
+@pytest.fixture(autouse=True)
+def _no_llm_fallback_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests opt in to a fallback provider; a stray shell export must not
+    reroute their primary failures."""
+    monkeypatch.delenv("LLM_FALLBACK_PROVIDER", raising=False)
+
+
 @pytest.fixture
 def hypothesis_examples() -> Callable[[int], int]:
     """The same budget for settings built at run time (a state machine run
@@ -107,6 +115,7 @@ def reset_reddit_singletons() -> Iterator[None]:
     from reddit_fetch_queue import RedditFetchQueue
 
     llm_limiter.reset()
+    reset_fallback_limiters()
     reddit_limiter.reset()
     reddit_feed_cache.reset()
     reddit_fetch_queue.reset()
@@ -128,4 +137,5 @@ def reset_reddit_singletons() -> Iterator[None]:
     reddit_fetch_queue.reset()
     reddit_limiter.reset()
     llm_limiter.reset()
+    reset_fallback_limiters()
     reddit_feed_cache.reset()

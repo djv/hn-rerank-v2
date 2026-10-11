@@ -3281,6 +3281,94 @@ def test_flask_test_client_tldr_provider_error_degrades_gracefully(
         assert server.llm_limiter.retry_after_seconds > 0
 
 
+def _tap_fallback_env(test_env: Any, monkeypatch: pytest.MonkeyPatch, generate):
+    """Muse primary + Mistral fallback, one uncached story (1730)."""
+    import server
+
+    _, db, _, handler, user = test_env
+    handler.config = replace(
+        handler.config,
+        tldr_uncached_per_user_limit=100,
+        tldr_uncached_per_user_window_seconds=3600,
+        tldr_uncached_global_limit=100,
+    )
+    monkeypatch.setenv("LLM_PROVIDER", "gospark")
+    monkeypatch.setenv("OPENCODE_GO_API_KEY", "go-key")
+    monkeypatch.setenv("LLM_FALLBACK_PROVIDER", "mistral")
+    monkeypatch.setenv("MISTRAL_API_KEY", "mistral-key")
+    db.upsert_story(
+        Story(
+            id=1730,
+            title="Fallback tap story",
+            url="https://example.com/fallback-tap",
+            score=10,
+            time=1600000000,
+            text_content="Story body.",
+            source="hn",
+            comment_count=0,
+            self_text="",
+            top_comments="",
+            article_body="",
+        )
+    )
+
+    async def no_fetch(url: str) -> "server.ArticleFetchResult":
+        return server.ArticleFetchResult(status=404, error="http_404")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", generate)
+    monkeypatch.setattr(server, "_fetch_article_body_with_result", no_fetch)
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+    return client
+
+
+@pytest.mark.parametrize("has_fallback", [True, False])
+def test_tap_generates_while_only_the_primary_cools(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch, has_fallback: bool
+) -> None:
+    """A cooling Muse must not block a tap when Mistral can take it."""
+    import server
+
+    async def generate(title, self_text, top_comments, article_body):
+        return server.TldrResult(kind="ok", tldr="- **Fallback** summary")
+
+    client = _tap_fallback_env(test_env, monkeypatch, generate)
+    if not has_fallback:
+        monkeypatch.delenv("LLM_FALLBACK_PROVIDER")
+    server.llm_limiter.on_429()
+
+    resp = client.post("/api/tldr-detail", json={"story_id": 1730})
+
+    if has_fallback:
+        assert resp.status_code == 200
+        assert resp.get_json()["tldr"] == "- **Fallback** summary"
+    else:
+        assert resp.status_code == 429
+
+
+def test_tap_402_from_the_fallback_cools_the_fallback(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import server
+    from llm_limiter import fallback_limiter
+
+    async def generate(title, self_text, top_comments, article_body):
+        return server.TldrResult(
+            kind="llm_error",
+            error_status=402,
+            error_text="spend cap",
+            error_provider="mistral",
+        )
+
+    client = _tap_fallback_env(test_env, monkeypatch, generate)
+
+    resp = client.post("/api/tldr-detail", json={"story_id": 1730})
+
+    assert resp.status_code == 429
+    assert fallback_limiter("mistral").retry_after_seconds > 0
+    assert server.llm_limiter.retry_after_seconds == 0
+
+
 @pytest.mark.parametrize("cacheable", [True, False])
 async def test_prefetch_tldrs_for_ranked_regenerates_stale_beyond_the_view_tops(
     test_env: Any, monkeypatch: pytest.MonkeyPatch, cacheable: bool
@@ -4453,7 +4541,7 @@ async def test_generate_marks_single_half_salvage_uncacheable(
     import server
 
     async def mock_call_llm_chat(
-        *, api_key, base_url, model, prompt, max_tokens, extra=None
+        *, api_key, base_url, model, prompt, max_tokens, extra=None, limiter=None
     ):
         if "Summarize the discussion" in prompt:
             return server.LlmChatResult(content="boom", ok=False, status=429)
@@ -4485,7 +4573,7 @@ async def test_generate_retries_prose_reply_once(
     calls: list[str] = []
 
     async def mock_call_llm_chat(
-        *, api_key, base_url, model, prompt, max_tokens, extra=None
+        *, api_key, base_url, model, prompt, max_tokens, extra=None, limiter=None
     ):
         side = "discussion" if "Summarize the discussion" in prompt else "article"
         calls.append(side)
@@ -4526,7 +4614,7 @@ async def test_generate_detailed_tldr_splits_article_and_comments(monkeypatch):
     calls = []
 
     async def mock_call_llm_chat(
-        *, api_key, base_url, model, prompt, max_tokens, extra=None
+        *, api_key, base_url, model, prompt, max_tokens, extra=None, limiter=None
     ):
         calls.append(prompt)
         if "Summarize the article" in prompt:
@@ -4568,7 +4656,7 @@ async def test_generate_detailed_tldr_folds_thin_article_to_discussion_only(
     calls = []
 
     async def mock_call_llm_chat(
-        *, api_key, base_url, model, prompt, max_tokens, extra=None
+        *, api_key, base_url, model, prompt, max_tokens, extra=None, limiter=None
     ):
         calls.append((prompt, max_tokens))
         return server.LlmChatResult(content="- **Discussion** summary", ok=True)
@@ -4749,7 +4837,7 @@ async def test_generate_detailed_tldr_cerebras_passes_reasoning_effort_and_bumpe
     calls = []
 
     async def mock_call_llm_chat(
-        *, api_key, base_url, model, prompt, max_tokens, extra=None
+        *, api_key, base_url, model, prompt, max_tokens, extra=None, limiter=None
     ):
         calls.append({"max_tokens": max_tokens, "extra": extra, "model": model})
         return server.LlmChatResult(content="- summary", ok=True)
@@ -5076,7 +5164,7 @@ async def test_generate_detailed_tldr_combined_prompt_contract(
     calls = []
 
     async def mock_call_llm_chat(
-        *, api_key, base_url, model, prompt, max_tokens, extra=None
+        *, api_key, base_url, model, prompt, max_tokens, extra=None, limiter=None
     ):
         calls.append(prompt)
         return server.LlmChatResult(content="- summary", ok=True)
@@ -5114,7 +5202,7 @@ async def test_generate_detailed_tldr_counts_feed_copy_of_article_once(
     calls: list[tuple[str, int]] = []
 
     async def mock_call_llm_chat(
-        *, api_key, base_url, model, prompt, max_tokens, extra=None
+        *, api_key, base_url, model, prompt, max_tokens, extra=None, limiter=None
     ):
         calls.append((prompt, max_tokens))
         return server.LlmChatResult(content="- **Item:** point", ok=True)
@@ -5144,7 +5232,7 @@ async def test_generate_detailed_tldr_sends_feed_copy_of_body_once(
     prompts: list[str] = []
 
     async def mock_call_llm_chat(
-        *, api_key, base_url, model, prompt, max_tokens, extra=None
+        *, api_key, base_url, model, prompt, max_tokens, extra=None, limiter=None
     ):
         prompts.append(prompt)
         return server.LlmChatResult(content="- **Item:** point", ok=True)
@@ -5249,7 +5337,7 @@ async def test_unified_fallback_omits_article_when_no_article_body(
     calls = []
 
     async def mock_call_llm_chat(
-        *, api_key, base_url, model, prompt, max_tokens, extra=None
+        *, api_key, base_url, model, prompt, max_tokens, extra=None, limiter=None
     ):
         calls.append(prompt)
         return server.LlmChatResult(content="- **Discussion** summary", ok=True)
@@ -5279,7 +5367,7 @@ async def test_generate_detailed_tldr_returns_stub_when_no_content(
     calls: list = []
 
     async def mock_call_llm_chat(
-        *, api_key, base_url, model, prompt, max_tokens, extra=None
+        *, api_key, base_url, model, prompt, max_tokens, extra=None, limiter=None
     ):
         calls.append(prompt)
         return "should not be called"
@@ -6646,7 +6734,7 @@ async def test_generate_keeps_short_tweet_and_drops_pointer_comments(
     prompts: list[str] = []
 
     async def mock_call_llm_chat(
-        *, api_key, base_url, model, prompt, max_tokens, extra=None
+        *, api_key, base_url, model, prompt, max_tokens, extra=None, limiter=None
     ):
         prompts.append(prompt)
         return server.LlmChatResult(content="- **Point** summary", ok=True)
