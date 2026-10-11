@@ -1,5 +1,14 @@
 # Worklog: hn-rewrite
 
+## 2026-10-11 — Plan Codex Forum fixes and handoff to Muse
+
+User requested a fix plan and Muse handoff. Prepared FIX-PLAN.md and
+MUSE-HANDOFF.md for one isolated VPS implementation using Muse Spark 1.3.
+The scope includes both confirmed defects plus effective legacy content/cache
+handling so dirty longest-text rows and stale summaries cannot bypass the
+prospective fix. No destructive cleanup, reply adapter or production rollout.
+Dispatch and receipt are tracked in the current status.
+
 ## 2026-10-10 — Complete resumed Codex Forum review
 
 Ran the previously authorized single Claude cloud review of eb643bb and the

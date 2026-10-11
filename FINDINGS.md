@@ -1,5 +1,18 @@
 # HN Rerank findings
 
+## Codex Forum fix plan and Muse handoff — 2026-10-11
+
+The user requested planning and handing the fixes to Muse. The bounded plan
+covers both confirmed defects and nondestructive legacy input/cache handling:
+parser-only changes lose to the DB's longest-text merge, cached article bodies
+still reach summarization, and arbitrary stale cache lookup can serve an old
+mixed-input summary. Candidate/feedback reads, embedding hashes, and every
+summary cache path therefore need the same source-specific effective inputs.
+Production data remains untouched; no reply/count adapter or rollout assigned.
+[Fix plan](docs/evaluations/codex-forum-review-20261010/FIX-PLAN.md) and
+[Muse assignment](docs/evaluations/codex-forum-review-20261010/MUSE-HANDOFF.md)
+include exact regression coverage, VPS isolation and delivery constraints.
+
 ## Codex Forum independent review completed — 2026-10-10
 
 User resumed the pending rv. One Claude Opus cloud review ran through

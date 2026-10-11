@@ -1,14 +1,15 @@
 # HN Rerank status
 
-Updated 2026-10-10. Previous handoff (one-classifier research, Why-this-story
+Updated 2026-10-11. Previous handoff (one-classifier research, Why-this-story
 preview, pending Reddit/Gemma items):
 [before interleaving](docs/status-archive/before-interleaving-20261007.md).
 
 ## Objective
-Complete the authorized independent Codex Forum review after the user resumed
-the saved handoff. The Claude cloud review and root reproduction are complete:
-one medium article-attribution issue and one low metadata-text issue. Runtime
-fixes and a forum reply/count adapter remain unimplemented and unauthorized.
+Plan the verified Codex Forum fixes and hand them to Muse (user 2026-10-11).
+Scope: article-fetch suppression, generated-footer removal, nondestructive
+legacy input/cache handling, and regression tests. Implementation is assigned
+to an isolated VPS branch; main integration and production rollout are separate.
+The reply/count adapter remains outside this task.
 
 Compare shortlist #2 (one joined logistic classifier, all features) and #4
 (same, no metadata) live against production through team-draft
@@ -18,6 +19,10 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- The fix plan and Muse assignment are saved beside the review evidence:
+  [fix plan](docs/evaluations/codex-forum-review-20261010/FIX-PLAN.md) and
+  [handoff](docs/evaluations/codex-forum-review-20261010/MUSE-HANDOFF.md).
+  Dispatch/receipt verification is pending; no fix is claimed implemented.
 - Codex Forum review complete: the actual deployed extractor returned reply
   text as article_body (three non-opening posts matched). The source can enter
   generic article prewarm and short-post tap fetching, so discussion can be
@@ -167,18 +172,19 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   Ruff, touched-file format, and ty clean. Deployed 2026-10-09; scope above.
 
 ## Blocker
-The independent review is complete. A confirmed medium article-attribution
-issue remains open; fixes and forum reply/count support need separate user
-authorization under rv. Physical TUI controls and
+The independent review is complete; the user requested the fix handoff.
+The medium article-attribution issue remains open pending Muse implementation
+and supervising verification. No reply/count adapter or rollout is authorized.
+Physical TUI controls and
 uncached/forced live summary generation remain unverified. No
 smoke-generated votes/profiles or LLM calls;
 ranking research remains paused and production trial configuration unchanged.
 
 ## Next step
-- If authorized, exclude Codex Forum from both generic article-fetch paths and
-  strip the known RSS count footer, with behavioral regression tests. No cached
-  body cleanup is authorized. Decide on a bounded Discourse reply/count adapter
-  separately; preserve sample/total/freshness semantics. Review evidence above.
+- Dispatch Muse to the isolated VPS worktree in the fix plan and verify its
+  receipt. Then inspect MUSE-ACK.md/CHECKS.md and the feature-branch diff before
+  integration. Existing cached inputs are suppressed nondestructively; no
+  cleanup, reply/count adapter or production rollout is assigned.
 - Observe Codex Forum cards in normal ranked views. Forum replies and live
   discussion counts would require a separately scoped Discourse adapter.
 - AI ranking research: goal is a repeatable Muse advantage transferable into
