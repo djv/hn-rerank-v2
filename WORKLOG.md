@@ -1,5 +1,19 @@
 # Worklog: hn-rewrite
 
+## 2026-10-10 — Add Codex community forum RSS
+
+Added the user-selected category feed
+https://community.openai.com/c/codex/37.rss to config.toml and mapped its
+generic source ID to "Codex Forum" in pipeline/render.py. Existing RSS
+ingestion imports topic opening posts; replies and engagement counts have
+no dedicated adapter. Updated ARCHITECTURE.md and the current handoff.
+Both hosts fetched HTTP 200; production parsing returned 25 topics with text.
+VPS focused checks: 26 passed. Full backend: 1,264 passed / 1 skipped;
+Ruff, touched-file formatting and ty clean. Restarted hn_rewrite.service
+at 2026-10-11 03:26:55 UTC; normal refresh stored 25 forum topics.
+Existing-profile dashboard/feed/readiness GET smoke passed after correcting
+the readiness probe to use min_version=0. Full evidence: FINDINGS.md.
+
 ## 2026-10-09 — Seven-fix follow-up: strict identity + stranded sort follow-up (saved, deployment authorized)
 
 Follow-up to the seven-fix task (same authorization; root handles

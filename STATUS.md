@@ -1,35 +1,14 @@
 # HN Rerank status
 
-Updated 2026-10-09. Previous handoff (one-classifier research, Why-this-story
+Updated 2026-10-10. Previous handoff (one-classifier research, Why-this-story
 preview, pending Reddit/Gemma items):
 [before interleaving](docs/status-archive/before-interleaving-20261007.md).
 
 ## Objective
-Current follow-up: make explicit `r` automatically reload a selected summary
-when its live comment check finds growth, without a confirmation prompt.
-One follow-up per observed count. Follow-up correction: background growth
-updates counts silently and never opens a regeneration popup; r remains
-the explicit summary reload action. Correction checks passed: 29 focused
-checks; TUI 203 / 1 skipped; backend 1,264 / 1 skipped; Ruff/ty/format clean.
-Implemented and verified: 29 focused checks; TUI 203 passed / 1 skipped;
-backend 1,264 passed / 1 skipped; Ruff, ty and touched-Python format clean.
-Local reader relaunched at 19:21 EDT under the existing restart authorization:
-PID 1998605 runs the updated checkout. Popular / 1 month view, saved profile,
-feed/summary and Brave helper verified; no modal after section switch. Physical r/live generation remains unverified. No server restart is needed
-for this client-only change; production server and trial remain untouched.
-
-Current maintenance task: implement user-selected background section refresh
-on s/h/l, selected-summary-only r with a live stats check, and a story-specific
-regeneration choice when comments exceed a known summary snapshot. Codex plan
-review completed; verified corrections are incorporated in
-[PLAN.md](docs/evaluations/section-refresh-20261009/PLAN.md). Implementation and
-isolated validation of the original change were saved under the user’s ss request.
-Two authorized independent Codex result reviews completed. The user selected
-all seven fixes; Muse implemented them with reproduced failures and regression
-coverage. Final matching-source VPS suites and local lint/type/format checks
-pass. Saved/pushed ad94386 and deployed to the VPS with restart at
-2026-10-09 22:42:32 UTC. Live endpoint/schema/auth/cache smoke passed;
-the local TUI process started after the updated source was written.
+Add the user-selected Codex community forum as a feed source. The generic
+RSS path now includes its category feed and labels it "Codex Forum";
+VPS ingestion and service smoke checks passed. Opening posts are imported;
+there is no separate Discourse reply hydration or engagement-score adapter.
 
 Compare shortlist #2 (one joined logistic classifier, all features) and #4
 (same, no metadata) live against production through team-draft
@@ -39,6 +18,16 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- Codex Forum added to config.toml with its readable label in pipeline/render.py.
+  Both hosts fetched HTTP 200; the production parser returned 25 valid topics
+  with opening-post text. After the 2026-10-11 03:26:55 UTC restart, the normal
+  refresh stored all 25 in the VPS DB. Existing-profile dashboard/feed/readiness
+  GETs returned 200. VPS checks: 26 focused; backend 1,264 passed / 1 skipped;
+  Ruff/ty/touched-file formatting clean. Evidence: FINDINGS.md, 2026-10-10.
+- Explicit r now automatically reloads observed discussion growth once per
+  count; background growth updates counts silently. TUI 203 / 1 skipped and
+  backend 1,264 / 1 skipped passed in that task. The local reader was restarted
+  under its prior authorization; physical r/live generation remains unverified.
 - Authorized rollout complete: VPS runtime ad94386, service active; tested
   source manifest and unchanged config hash verified. Online DB backup passed
   quick_check before the nullable snapshot-column migration. Real HN stats are
@@ -175,6 +164,8 @@ generation remain unverified. No smoke-generated votes/profiles or LLM calls;
 ranking research remains paused and production trial configuration unchanged.
 
 ## Next step
+- Observe Codex Forum cards in normal ranked views. Forum replies and live
+  discussion counts would require a separately scoped Discourse adapter.
 - AI ranking research: goal is a repeatable Muse advantage transferable into
   the ML ranker. Research paused at the user's request (2026-10-09).
   User stopped the contrastive protocol/infrastructure branch.

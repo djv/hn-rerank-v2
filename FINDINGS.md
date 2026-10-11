@@ -1,5 +1,31 @@
 # HN Rerank findings
 
+## Codex community forum source — 2026-10-10
+
+- User requested https://community.openai.com/c/codex/37 as a source.
+  Its public category RSS is https://community.openai.com/c/codex/37.rss;
+  direct GETs from laptop and VPS returned HTTP 200 and application/rss+xml.
+  This is the requested community feed, not an AI provider's own blog.
+- Added one feed-list entry and the "Codex Forum" display label for the
+  generic source ID rss_community_openai_com. No new dependency or parser.
+  The production parser returned 25 distinct canonical topic URLs, all with
+  opening-post text. The generic path supplies zero engagement counts and
+  does not separately hydrate Discourse replies.
+- VPS verification: 26 focused RSS/config/source-label checks passed;
+  full backend 1,264 passed / 1 skipped (browser group absent), one existing
+  sklearn convergence warning. Ruff, touched-file format and ty clean.
+  Heavy checks ran on the VPS with numerical threads capped at one.
+- Runtime config/render bytes matched the verified laptop edits. Service
+  restart: 2026-10-11 03:26:55 UTC, MainPID 531386. Normal startup refresh
+  persisted 25 forum stories, all with self_text, confirmed with read-only SQL.
+  Existing profile 151 reused internally: dashboard, one-week feed and
+  /api/ranking-ready?min_version=0 all HTTP 200. Initial smoke probes omitted
+  min_version / used version instead and returned the expected 400; correcting
+  the harness passed. No smoke-created profile, vote or summary generation.
+  Ranking/trial settings are unchanged.
+  SHA256 config.toml: 750bb70512febdcd9cbf3ecfb1d7dfe3cc5d6a2b2058999351dcae029c458446;
+  pipeline/render.py: 71a78538cc7878f979db4d119b5be74fa3fc1c489a65b8b2eaa646e6b91c51b8.
+
 ## Live terminal-buffer inspection — 2026-10-09
 
 The comparison completed: eight isolated VPS Pilot checks passed, lint/format/

@@ -80,6 +80,7 @@ def source_label_filter(source: str) -> str:
         "lesswrong_com": "LessWrong",
         "lobste_rs": "Lobsters",
         "discourse_haskell_org": "Haskell Discourse",
+        "community_openai_com": "Codex Forum",
         "latent_space": "Latent Space",
         "ainews": "AINews",
         "scottaaronson_blog": "Scott Aaronson",

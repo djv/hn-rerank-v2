@@ -60,6 +60,7 @@ feeds = [
 
 
     # AI / coding agents
+    "https://community.openai.com/c/codex/37.rss",
     "https://www.reddit.com/r/AI_Agents/top/.rss?t=week&limit=25",
     # Subs covered by AINews's Reddit recap (2026-09-28)
     "https://www.reddit.com/r/singularity/top/.rss?t=week&limit=25",
