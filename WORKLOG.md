@@ -1,5 +1,21 @@
 # Worklog: hn-rewrite
 
+## 2026-10-11 — Muse-primary summaries with Mistral fallback (not deployed)
+
+User chose a full switch to Muse Spark after the ranking trial, with automatic
+Mistral fallback. Evidence: on 12 exact-input pairs Muse answered 12/12 in
+6.4-9.5 s, and a blind cloud review preferred it in all 12 (Mistral made about
+10 substantive errors, e.g. invented Parts II-IV of a series; Muse 2). A batch
+of 161 stories gave 131 ok, 30 no_content, 0 errors at 5-13 s.
+Added LLM_FALLBACK_PROVIDER: any failed primary section call is retried on the
+fallback with its own token cap; a cooling primary is skipped; fallback
+providers get separate limiters; tap/prefetch gates wait only when every
+provider cools; a 402 cools the provider that returned it. Unset = unchanged.
+Checks on the VPS: full suite 1318 passed, 1 skipped; ruff, format, ty clean.
+Deploy after 2026-11-05: LLM_PROVIDER=gospark, LLM_FALLBACK_PROVIDER=mistral.
+Open risk: the Go plan is shared with the coding agents and ran out on
+2026-09-29; the fallback covers the summaries but not the agents.
+
 ## 2026-10-11 — Plan Codex Forum fixes and handoff to Muse
 
 User requested a fix plan and Muse handoff. Prepared FIX-PLAN.md and
