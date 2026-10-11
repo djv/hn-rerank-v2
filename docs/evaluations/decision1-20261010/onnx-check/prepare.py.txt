@@ -1,0 +1,78 @@
+"""Prepare eight private token-only requests without loading a model."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+from types import SimpleNamespace
+
+from strands_decider.infer import EngineConfig, SystemOneEngine, _option_token_index
+from strands_decider.prompting import render_question, render_state
+from strands_decider.schema import SystemOneRequest
+from transformers import AutoTokenizer
+
+ROOT = Path(os.environ['CHECK_ROOT'])
+PLAN = Path('/tmp/decision1-eval/work_heldout/paired_plans_v3/e37bdffbed7255febbada9b6e5b1a34479be700f6630b73a2cf8761e33ea5f6a/jobs.jsonl')
+CONFIG = json.loads((ROOT / 'model/config.json').read_text())['decider']
+TOK = AutoTokenizer.from_pretrained(ROOT / 'model', local_files_only=True)
+ENGINE = SystemOneEngine.__new__(SystemOneEngine)
+ENGINE.tok = TOK
+ENGINE.cfg = EngineConfig(device='cpu', max_question_fraction=CONFIG['max_question_fraction'])
+ENGINE.model = SimpleNamespace(config=SimpleNamespace(max_length=CONFIG['max_length']))
+
+
+def prepare(state: object, questions: dict) -> list[dict]:
+    request = SystemOneRequest(state=state, questions=questions)
+    out = []
+    for name, question in request.questions.items():
+        rq = render_question(question)
+        s, qs = ENGINE._fit(render_state(request.state), [rq.text])
+        opts = [len(s) + i for i in _option_token_index(ENGINE._last_offsets[0], rq.option_spans, 0)]
+        ids = s + qs[0]
+        if not (0 < len(ids) <= CONFIG['max_length'] and all(0 <= i < len(ids) for i in opts)):
+            raise ValueError('invalid fitted prompt positions')
+        out.append({'question': name, 'ids': ids, 'option_pos': opts,
+                    'answer_pos': len(ids) - 1, 'kind': rq.kind})
+    return out
+
+
+def main() -> None:
+    fixtures = json.loads((ROOT / 'model/conversion/fixtures/reference.json').read_text())
+    raw = {r['id']: r for r in json.loads((ROOT / 'model/conversion/fixtures/requests.json').read_text())}
+    for record in fixtures:
+        rendered = {r['question']: r for r in prepare(raw[record['id']]['state'], raw[record['id']]['questions'])}
+        for case in record['cases']:
+            got = rendered[case['question']]
+            if (got['ids'] != case['state_ids'] + case['question_ids']
+                or got['option_pos'] != case['opt_idx'] or got['kind'] != case['kind']):
+                raise ValueError('published fixture rendering/tokenization mismatch')
+    jobs = [json.loads(line) for line in PLAN.read_text().splitlines()]
+    real = []
+    paired = {(j['fold'], j['story_id'], j['variant']): j for j in jobs}
+    for job in jobs:
+        if job['variant'] == 'real':
+            row = prepare(job['state'], job['question'])[0]
+            real.append((len(row['ids']), job, row))
+    real.sort(key=lambda x: (x[0], x[1]['fold'], x[1]['story_id']))
+    indices = [0, len(real) // 2, int((len(real) - 1) * .9), len(real) - 1]
+    rows = []
+    for label, idx in zip(['short', 'median', 'long90', 'maximum'], indices, strict=True):
+        _, job, row = real[idx]
+        for variant in ['real', 'empty']:
+            other = paired[(job['fold'], job['story_id'], variant)]
+            ready = row if variant == 'real' else prepare(other['state'], other['question'])[0]
+            rows.append({**ready, 'variant': variant, 'length_class': label,
+                         'request_sha256': other['request_sha256']})
+    result = {'plan_sha256': hashlib.sha256(PLAN.read_bytes()).hexdigest(),
+              'tokenizer_pad_id': TOK.pad_token_id, 'rows': rows}
+    path = ROOT / 'prepared-private.json'
+    path.write_text(json.dumps(result))
+    path.chmod(0o600)
+    print(json.dumps({'phase': 'prepared', 'fixture_tokenization': 'exact', 'rows': len(rows),
+                      'lengths': [{'variant': r['variant'], 'class': r['length_class'],
+                                   'tokens': len(r['ids'])} for r in rows]}), flush=True)
+
+
+if __name__ == '__main__':
+    main()

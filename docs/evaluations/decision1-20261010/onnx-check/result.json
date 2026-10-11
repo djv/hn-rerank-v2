@@ -1,0 +1,40 @@
+{
+  "published_scores": 0,
+  "complete": false,
+  "phases": [
+    {
+      "phase": "session_load",
+      "seconds": 1.8190497669856995
+    },
+    {
+      "phase": "fixture_payouts",
+      "seconds": 9.15737256896682
+    },
+    {
+      "phase": "fixture_strawberry",
+      "seconds": 7.749874911969528
+    },
+    {
+      "phase": "fixture_language",
+      "seconds": 7.648530198028311
+    },
+    {
+      "phase": "fixture_tool_call",
+      "seconds": 12.691535104066133
+    },
+    {
+      "phase": "fixture_review",
+      "seconds": 16.3318395500537
+    },
+    {
+      "phase": "fixture_positive",
+      "seconds": 8.500191650120541
+    }
+  ],
+  "runtime": "1.31.0",
+  "fixture_tolerance": 0.03,
+  "within_runtime_tolerance": 0.0001,
+  "providers": [
+    "CPUExecutionProvider"
+  ]
+}

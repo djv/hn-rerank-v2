@@ -3309,3 +3309,20 @@ passed without summary generation or profile/vote writes. Local user TUI process
 started after final app source edit; controls not physically exercised. Details:
 section-refresh-20261009/DEPLOYMENT.md and DEPLOY-SMOKE.json. Earlier pending-save
 and no-deployment statements above describe the pre-authorization stage.
+
+## 2026-10-11 — Bounded ONNX CPU check stopped; speed work paused
+
+The user approved an isolated older hobson-v19 q8 diagnostic on the existing VPS
+at3CPU/3.5GiB/128MiBswap/20min, with zero publication. Public weights/tokenizer
+hashes and fixture tokenization were verified; the CPU graph loaded and all public
+fixtures passed the explicit0.03 diagnostic gate (max0.0258148/no answer changes).
+The first four-real-request batch did not complete: the approved hard-limit
+pressure guard stopped the job after156s overall, with no OOM. No private timing,
+batch/standalone parity or empty result exists, so under5s and VPS impossibility
+are both unproven. Download file cache shares the cgroup; anon/file/PSI breakdown
+was not captured. Independent review found no serious scope/safety defect;
+runtime wheel hash and memory/phase telemetry remain evidence gaps, not fixed.
+All4132 frozen rows have unique pairing keys and one question each. Existing
+scores/models retained; source/environment unchanged; no production restart by
+this agent. The user then paused all speed investigation and scoring. Evidence:
+docs/evaluations/decision1-20261010/onnx-check/ and scoped STATUS.md.

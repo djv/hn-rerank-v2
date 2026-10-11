@@ -1,0 +1,35 @@
+{"phase": "download_verified", "file": "onnx/model_quantized.onnx", "bytes": 515126}
+{"phase": "download_verified", "file": "onnx/model_quantized.onnx_data", "bytes": 1800931328}
+{"phase": "download_verified", "file": "tokenizer.json", "bytes": 19989592}
+{"phase": "download_verified", "file": "config.json", "bytes": 1806}
+{"phase": "download_verified", "file": "tokenizer_config.json", "bytes": 1128}
+{"phase": "download_verified", "file": "conversion/fixtures/reference.json", "bytes": 31108}
+{"phase": "download_verified", "file": "conversion/fixtures/requests.json", "bytes": 2306}
+Using CPython 3.12.3 interpreter at: /tmp/strands-eval/.venv/bin/python
+Creating virtual environment at: /tmp/strands-eval/onnx-cpu-check-20261011/.venv
+Activate with: source /tmp/strands-eval/onnx-cpu-check-20261011/.venv/bin/activate
+Using Python 3.12.3 environment at: /tmp/strands-eval/onnx-cpu-check-20261011/.venv
+Resolved 5 packages in 325ms
+Downloading numpy (15.9MiB)
+Downloading onnxruntime (22.7MiB)
+ Downloaded numpy
+ Downloaded onnxruntime
+Prepared 5 packages in 602ms
+Installed 5 packages in 15ms
+ + flatbuffers==25.12.19
+ + numpy==2.3.3
+ + onnxruntime==1.31.0
+ + packaging==26.3
+ + protobuf==7.36.2
+Using Python 3.12.3 environment at: /tmp/strands-eval/onnx-cpu-check-20261011/.venv
+[transformers] The tokenizer you are loading from '/tmp/strands-eval/onnx-cpu-check-20261011/model' with an incorrect regex pattern: https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/discussions/84#69121093e8b480e709447d5e. This will lead to incorrect tokenization. You should set the `fix_mistral_regex=True` flag when loading this tokenizer to fix this issue.
+{"phase": "prepared", "fixture_tokenization": "exact", "rows": 8, "lengths": [{"variant": "real", "class": "short", "tokens": 2248}, {"variant": "empty", "class": "short", "tokens": 198}, {"variant": "real", "class": "median", "tokens": 2388}, {"variant": "empty", "class": "median", "tokens": 315}, {"variant": "real", "class": "long90", "tokens": 2563}, {"variant": "empty", "class": "long90", "tokens": 306}, {"variant": "real", "class": "maximum", "tokens": 2907}, {"variant": "empty", "class": "maximum", "tokens": 723}]}
+{"phase": "session_load", "seconds": 1.8190497669856995}
+{"phase": "fixture_payouts", "seconds": 9.15737256896682}
+{"phase": "fixture_strawberry", "seconds": 7.749874911969528}
+{"phase": "fixture_language", "seconds": 7.648530198028311}
+{"phase": "fixture_tool_call", "seconds": 12.691535104066133}
+{"phase": "fixture_review", "seconds": 16.3318395500537}
+{"phase": "fixture_positive", "seconds": 8.500191650120541}
+{"phase": "fixtures_passed", "maxdiff": 0.02581483088153147}
+{"phase": "STOP", "reason": "owned OOM or sustained hard-limit pressure"}

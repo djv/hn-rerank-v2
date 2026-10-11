@@ -1,0 +1,124 @@
+"""Bounded ONNX diagnostic. Never publishes evaluation scores or private text."""
+from __future__ import annotations
+
+import json
+import os
+import time
+from pathlib import Path
+
+import numpy as np
+import onnxruntime as ort
+
+ROOT = Path(os.environ['CHECK_ROOT'])
+CFG = json.loads((ROOT / 'model/config.json').read_text())['decider']
+RESULT = {'published_scores': 0, 'complete': False, 'phases': [],
+          'runtime': ort.__version__, 'fixture_tolerance': .03,
+          'within_runtime_tolerance': 1e-4}
+
+
+def save() -> None:
+    path = ROOT / 'result.json'
+    path.write_text(json.dumps(RESULT, indent=2) + '\n')
+    path.chmod(0o600)
+
+
+def timed(name: str, fn):
+    start = time.perf_counter()
+    value = fn()
+    record = {'phase': name, 'seconds': time.perf_counter() - start}
+    RESULT['phases'].append(record)
+    save()
+    print(json.dumps(record), flush=True)
+    return value
+
+
+def main() -> None:
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = 3
+    so.inter_op_num_threads = 1
+    so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    so.add_session_config_entry('session.intra_op.allow_spinning', '0')
+    so.add_session_config_entry('session.inter_op.allow_spinning', '0')
+    so.log_severity_level = 3
+    sess = timed('session_load', lambda: ort.InferenceSession(
+        str(ROOT / 'model/onnx/model_quantized.onnx'), so,
+        providers=['CPUExecutionProvider']))
+    if sess.get_providers() != ['CPUExecutionProvider']:
+        raise ValueError('unexpected inference provider')
+    expected = {'input_ids', 'attention_mask', 'answer_pos', 'option_pos'}
+    if {i.name for i in sess.get_inputs()} != expected or [o.name for o in sess.get_outputs()] != ['logits']:
+        raise ValueError('unexpected graph interface')
+    RESULT['providers'] = sess.get_providers()
+    prepared = json.loads((ROOT / 'prepared-private.json').read_text())
+    pad = prepared['tokenizer_pad_id']
+
+    def evaluate(rows: list[dict]) -> list[np.ndarray]:
+        width = max(len(r['ids']) for r in rows)
+        slots = max(len(r['option_pos']) for r in rows)
+        ids = np.full((len(rows), width), pad, np.int64)
+        mask = np.zeros_like(ids)
+        answer = np.zeros(len(rows), np.int64)
+        options = np.zeros((len(rows), slots), np.int64)
+        for i, r in enumerate(rows):
+            ids[i, :len(r['ids'])] = r['ids']
+            mask[i, :len(r['ids'])] = 1
+            answer[i] = r['answer_pos']
+            options[i, :len(r['option_pos'])] = r['option_pos']
+        logits = sess.run(['logits'], {'input_ids': ids, 'attention_mask': mask,
+                                     'answer_pos': answer, 'option_pos': options})[0]
+        if logits.shape != (len(rows), slots) or not np.isfinite(logits).all():
+            raise ValueError('invalid logits')
+        out = []
+        for i, r in enumerate(rows):
+            z = logits[i, :len(r['option_pos'])].astype(np.float64) / CFG['temperature_by_kind'][r['kind']]
+            p = np.exp(z - z.max())
+            p /= p.sum()
+            if not np.isfinite(p).all() or (p < 0).any() or (p > 1).any() or abs(p.sum() - 1) > 1e-10:
+                raise ValueError('invalid probability')
+            out.append(p)
+        return out
+
+    fixtures = json.loads((ROOT / 'model/conversion/fixtures/reference.json').read_text())
+    worst = 0.
+    for record in fixtures:
+        rows = [{'ids': c['state_ids'] + c['question_ids'], 'option_pos': c['opt_idx'],
+                 'answer_pos': len(c['state_ids']) + len(c['question_ids']) - 1,
+                 'kind': c['kind']} for c in record['cases']]
+        probs = timed('fixture_' + record['id'], lambda: evaluate(rows))
+        for p, c in zip(probs, record['cases'], strict=True):
+            ref = np.array(c['probs'])
+            difference = float(np.max(np.abs(p - ref)))
+            worst = max(worst, difference)
+            if difference > .03 or p.argmax() != ref.argmax():
+                RESULT['fixture_maxdiff'] = worst
+                save()
+                raise ValueError('public fixture drift/answer-change gate failed')
+    RESULT['fixture_maxdiff'] = worst
+    print(json.dumps({'phase': 'fixtures_passed', 'maxdiff': worst}), flush=True)
+    timed_total = 0.
+    maxdiff = 0.
+    for variant in ['real', 'empty']:
+        rows = [r for r in prepared['rows'] if r['variant'] == variant]
+        start = time.perf_counter()
+        batched = timed(variant + '_batch4', lambda: evaluate(rows))
+        for idx, (r, p) in enumerate(zip(rows, batched, strict=True)):
+            single = timed(variant + '_standalone_' + str(idx), lambda: evaluate([r]))[0]
+            difference = float(np.max(np.abs(p - single)))
+            maxdiff = max(maxdiff, difference)
+            RESULT['within_runtime_maxdiff'] = maxdiff
+            save()
+            if difference > 1e-4:
+                raise ValueError('within-runtime batch/standalone gate failed')
+        elapsed = time.perf_counter() - start
+        RESULT[variant + '_seconds_including_all_checks'] = elapsed
+        timed_total += elapsed
+    RESULT['seconds_per_score_including_all_checks'] = timed_total / 8
+    RESULT['sample_below_5s'] = timed_total / 8 < 5
+    RESULT['complete'] = True
+    save()
+    print(json.dumps({'phase': 'done', 'seconds_per_score': timed_total / 8,
+                      'maxdiff': maxdiff, 'published_scores': 0}), flush=True)
+
+
+if __name__ == '__main__':
+    main()

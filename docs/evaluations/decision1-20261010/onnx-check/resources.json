@@ -1,0 +1,14 @@
+{
+  "host_available_bytes": 2836721664,
+  "memory_events": {
+    "low": "0",
+    "high": "0",
+    "max": "652",
+    "oom": "0",
+    "oom_kill": "0",
+    "oom_group_kill": "0"
+  },
+  "memory_current": 3757936640,
+  "memory_peak": 3758096384,
+  "swap_current": 89493504
+}

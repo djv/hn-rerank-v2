@@ -1,0 +1,125 @@
+"""Own bounded diagnostic supervisor; no production writes or score publication."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import signal
+import subprocess
+import threading
+import time
+import traceback
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(os.environ['CHECK_ROOT'])
+REV = '31a83e0244b26d939ae33f87189d6c8204003e53'
+BASE = 'https://huggingface.co/onnx-community/strands-decider-2B-hobson-v19-ONNX/resolve/' + REV + '/'
+UV = '/home/dev/.local/bin/uv'
+OLD = '/tmp/strands-eval/.venv/bin/python'
+FILES = {
+    'onnx/model_quantized.onnx': (515126, 'd156ecf442aaceccd891864b709a7acbea558e382fb1253a7eb8e53c48f46b23'),
+    'onnx/model_quantized.onnx_data': (1800931328, '0b92e9b7ff19b21c478ae056af397addd0f674180637b4850967fbe8849b21cf'),
+    'tokenizer.json': (19989592, 'a2cdd2e108566b09079afa8d266e9e65e7c280f27b771218237a06de5ba9cd86'),
+    'config.json': (1806, None),
+    'tokenizer_config.json': (1128, None),
+    'conversion/fixtures/reference.json': (31108, None),
+    'conversion/fixtures/requests.json': (2306, None),
+}
+
+
+def emit(value: dict) -> None:
+    print(json.dumps(value), flush=True)
+
+
+def available() -> int:
+    for line in Path('/proc/meminfo').read_text().splitlines():
+        if line.startswith('MemAvailable:'):
+            return int(line.split()[1]) * 1024
+    raise RuntimeError('MemAvailable missing')
+
+
+def watchdog(stop: threading.Event) -> None:
+    cg = next(line.split(':', 2)[2] for line in Path('/proc/self/cgroup').read_text().splitlines() if line.startswith('0::'))
+    here = Path('/sys/fs/cgroup') / cg.lstrip('/')
+    previous_max = 0
+    pressure_samples = 0
+    while not stop.wait(2):
+        if available() < 1024**3:
+            emit({'phase': 'STOP', 'reason': 'host MemAvailable below1GiB'})
+            os.kill(os.getpid(), signal.SIGTERM)
+            return
+        events = dict(line.split() for line in (here / 'memory.events').read_text().splitlines())
+        current_max = int(events.get('max', '0'))
+        pressure_samples = pressure_samples + 1 if current_max > previous_max else 0
+        previous_max = current_max
+        (ROOT / 'resources.json').write_text(json.dumps({
+            'host_available_bytes': available(), 'memory_events': events,
+            'memory_current': int((here / 'memory.current').read_text()),
+            'memory_peak': int((here / 'memory.peak').read_text()),
+            'swap_current': int((here / 'memory.swap.current').read_text())}, indent=2))
+        if (int(events.get('oom', '0')) or int(events.get('oom_kill', '0'))
+            or pressure_samples >= 5):
+            emit({'phase': 'STOP', 'reason': 'owned OOM or sustained hard-limit pressure'})
+            os.kill(os.getpid(), signal.SIGTERM)
+            return
+
+
+def main() -> None:
+    os.umask(0o077)
+    if available() < 4.5 * 1024**3:
+        raise RuntimeError('preflight needs4.5GiB MemAvailable')
+    if shutil.disk_usage(ROOT).free < sum(v[0] for v in FILES.values()) + 2.5 * 1024**3:
+        raise RuntimeError('disk preflight lacks environment budget plus1.5GiB reserve')
+    stop = threading.Event()
+    thread = threading.Thread(target=watchdog, args=(stop,), daemon=True)
+    thread.start()
+    start = time.monotonic()
+    try:
+        provenance = {'revision': REV, 'files': {}, 'scripts': {}}
+        for script in ['run.py', 'prepare.py', 'infer.py']:
+            provenance['scripts'][script] = hashlib.sha256((ROOT / script).read_bytes()).hexdigest()
+        for name, (size, expected) in FILES.items():
+            path = ROOT / 'model' / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            partial = path.with_name(path.name + '.partial')
+            digest = hashlib.sha256()
+            count = 0
+            with urllib.request.urlopen(BASE + name, timeout=60) as response, partial.open('wb') as target:
+                while block := response.read(1024 * 1024):
+                    digest.update(block)
+                    target.write(block)
+                    count += len(block)
+            actual = digest.hexdigest()
+            if count != size or (expected and actual != expected):
+                raise ValueError('artifact size/hash mismatch: ' + name)
+            partial.replace(path)
+            provenance['files'][name] = {'bytes': count, 'sha256': actual}
+            emit({'phase': 'download_verified', 'file': name, 'bytes': count})
+        (ROOT / 'provenance.json').write_text(json.dumps(provenance, indent=2))
+        subprocess.run([UV, 'venv', '--python', OLD, str(ROOT / '.venv')], check=True)
+        subprocess.run([UV, 'pip', 'install', '--no-cache', '--python', str(ROOT / '.venv/bin/python'),
+                        'onnxruntime==1.31.0', 'numpy==2.3.3'], check=True)
+        with (ROOT / 'packages.txt').open('w') as target:
+            subprocess.run([UV, 'pip', 'freeze', '--python', str(ROOT / '.venv/bin/python')], stdout=target, check=True)
+        if available() < 4.5 * 1024**3:
+            raise RuntimeError('inference preflight needs4.5GiB MemAvailable')
+        subprocess.run([UV, 'run', '--no-project', '--python', OLD, 'python', str(ROOT / 'prepare.py')], check=True)
+        if available() < 4.5 * 1024**3:
+            raise RuntimeError('post-preparation preflight needs4.5GiB MemAvailable')
+        subprocess.run([UV, 'run', '--no-project', '--python', str(ROOT / '.venv/bin/python'),
+                        'python', str(ROOT / 'infer.py')], check=True)
+        emit({'phase': 'TASK_DONE', 'total_seconds': time.monotonic() - start, 'published_scores': 0})
+    finally:
+        stop.set()
+        thread.join(timeout=3)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception:
+        traceback.print_exc()
+        (ROOT / 'failure.txt').write_text(traceback.format_exc())
+        raise SystemExit(1)

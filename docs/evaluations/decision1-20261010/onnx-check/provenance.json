@@ -1,0 +1,38 @@
+{
+  "revision": "31a83e0244b26d939ae33f87189d6c8204003e53",
+  "files": {
+    "onnx/model_quantized.onnx": {
+      "bytes": 515126,
+      "sha256": "d156ecf442aaceccd891864b709a7acbea558e382fb1253a7eb8e53c48f46b23"
+    },
+    "onnx/model_quantized.onnx_data": {
+      "bytes": 1800931328,
+      "sha256": "0b92e9b7ff19b21c478ae056af397addd0f674180637b4850967fbe8849b21cf"
+    },
+    "tokenizer.json": {
+      "bytes": 19989592,
+      "sha256": "a2cdd2e108566b09079afa8d266e9e65e7c280f27b771218237a06de5ba9cd86"
+    },
+    "config.json": {
+      "bytes": 1806,
+      "sha256": "707931b0fef6a8581964f6dc5f6ae97ba8cab078cfb5c9cfff958272e8146343"
+    },
+    "tokenizer_config.json": {
+      "bytes": 1128,
+      "sha256": "8671bed7c852ce9e661be94f179a7b4ffd091c2a65aea0363e5501c20318ee45"
+    },
+    "conversion/fixtures/reference.json": {
+      "bytes": 31108,
+      "sha256": "42a9c15678209763dcfadb969e839adea0937dd23b0abc72fe29622523684c23"
+    },
+    "conversion/fixtures/requests.json": {
+      "bytes": 2306,
+      "sha256": "b337132b79990533d1e7d6f02a64d117f90eb0e51a5d9e3653d3bcf8cf535dd8"
+    }
+  },
+  "scripts": {
+    "run.py": "bd8817c716b55aeeabe224f9d63e63ef82398efc4f1023bd45045e37ca8c0c1a",
+    "prepare.py": "9ca65dbb95a33bca51484e26d6692c8907e999eb0bdf1ac130e89e342d510fd9",
+    "infer.py": "19d0edabd619f5ec5f51d9c4b8e919777ec2c49a63afcc378aad4472316eb828"
+  }
+}

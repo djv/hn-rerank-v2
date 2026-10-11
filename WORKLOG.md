@@ -11901,3 +11901,15 @@ sampled. See docs/evaluations/decision1-20261010/GUARD-FIXES-20261011.md and STA
   handoff; no repeated source suite. CPU-SPEED-20261011.md records evidence and
   CPU-ONNX-PILOT-PLAN-20261011.md proposes a different-release ONNX pilot requiring
   user decision. No model change, new review, paid route or deployment authorized.
+
+### 2026-10-11 — Save failed CPU feasibility check and explicit pause
+
+- Approved older-model ONNX diagnostic loaded on CPU and passed public fixtures;
+  real batch4 hit the approved3.5GiB pressure stop before completing. No private
+  timing/parity, empty result, published scores or complete efficacy conclusion.
+- Result review and verified evidence saved under decision1-20261010/onnx-check/;
+  wheel artifact hashing and memory telemetry gaps are recorded without fixes.
+- User paused speed work. Full scorer and probe MainPID0. Scorer SHA unchanged;
+  live HN PID759874/start16:51:50UTC now supersedes earlier observation, with no
+  restart by this agent. This save changes documentation/evidence only; no rerun
+  of the existing1431passed/1skipped source suite, inference or deployment.

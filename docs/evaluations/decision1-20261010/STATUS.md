@@ -1,36 +1,35 @@
-# HN paired scoring — CPU speed gate, 2026-10-11
+# HN paired scoring — explicitly paused, 2026-10-11
 
 ## Objective
-Find a VPS scoring route below5seconds per model score including parity-check
-overhead, as selected by the user. Keep the cancelled full run stopped meanwhile.
+The user selected "Pause speed work". Retain results and evidence; do not continue
+CPU investigation, conversion, pilot retries or full scoring until requested.
 
 ## Verified result
-Read-only audit:56 valid v3 scores,0 invalid,4076 missing out of4132. No held-out
-quality result. All CPU probes publish zero scores; scoring-worker source, frozen
-input, caches, installed packages and live service remain unchanged.
+Full scorer inactive/MainPID0; bounded ONNX unit stopped/MainPID0 (resource-stop
+exit143, not OOM). Latest check confirms both have no running main process.
+The last validated original cache audit was56valid/0invalid/4076missing of4132;
+diagnostics published zero scores. No complete HN quality result.
 
-Length bucketing saves9.22% padded suffix tokens but only about4.04% total tokens
-with batch4/check1. Actual-model profiling places92.05% of a short cached request
-in Linear layers. Convolution and block-inverse tweaks do not provide a major win.
-Dynamic int8 rejected: cached/plain drift0.3178 exceeds1e-4.
-
-Exact-model batch16/check1 probe on sixteen short validated real requests passed
-all reference checks and sampled plain parity, but took13.113s/score excluding
-startup/prefix. That reduced parity fraction is a measurement, not an adopted
-production policy. Packed FP16 with three threads and a5.5GiB hard cap passed
-all16 reference comparisons plus sampled plain check, but took8.991s/score on the
-same favorable real sample. Mixed empty batch4/check1 took17.023s/score. All owned
-probe units stopped/PID0; full scorer inactive/PID0, no worker/evaluator remains.
-Live HN PID531386/start03:26:55UTC unchanged. No production setting was adopted.
+Same-model favorable real batch16/check1 measured8.991s/score with packedFP16,
+excluding loading/prefix; no representative paired under5s result exists.
+The subsequently approved eight-request older hobson-v19 q8 ONNX check loaded on
+CPU and passed public fixtures (maxdiff0.0258148 at diagnostic tolerance0.03).
+It stopped at the approved3.5GiB cap before its first real batch completed;
+private latency, batch/standalone parity and empty timing remain unmeasured.
+Result review found no serious safety/scope defect; wheel hash enforcement and
+memory/phase telemetry are incomplete. No fixes or retry applied. Production
+source and original scoring environment are unchanged by this task. At save,
+live HN PID759874/start16:51:50UTC supersedes the earlier PID531386 checkpoint;
+this agent performed no restart or deployment. Both scoring jobs remain stopped.
 
 ## Blocker
-No verified route meets the user's below5s target. Runtime/parity coverage must be
-accepted before a new full launch; no quality or winner claim from partial scores.
+No verified route meets below5s including parity overhead. Charged memory was not
+split into anonymous/file cache; the bounded stop does not prove VPS impossibility.
 
 ## Next step
-Choose whether to test an older release's q8 ONNX CPU variant (changes the model)
-or retain the exact model and investigate other hardware. A bounded, zero-publication
-proposal is saved in CPU-ONNX-PILOT-PLAN-20261011.md; it has not been approved.
-Do not automatically
-resume full scoring. Paid GPU/API, Colab, confirmation access and deployment remain
-unauthorized. Evidence: CPU-SPEED-20261011.md and SCORING-20261011.md.
+Wait for the user's explicit resumption. No automatic retry, cap increase, new
+model/conversion work, paid route, deployment or full scoring. Evidence:
+CPU-SPEED-20261011.md and onnx-check/VERIFIED.md and REVIEW.md. Raw runtime
+artifacts/models remain at VPS /tmp/strands-eval/onnx-cpu-check-20261011/;
+private token payloads remain there at0600 and were not copied into this repository.
+The older unapproved16-row proposal is superseded by the executed smaller check.
