@@ -18,6 +18,12 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- Codex Forum scheduled side-vector follow-up verified at 17:06 UTC: the
+  ordinary timer encoded all 83 pending vectors and exited successfully.
+  Read-only post-job coverage exceeded 99.99% across all 17 feedback profiles;
+  all 29 Codex topics have current primary and side vectors. Production remains
+  active at 794caa4 with its original 16:51:50 restart. No extra job or restart.
+  [Follow-up evidence](docs/evaluations/codex-forum-review-20261010/DEPLOYMENT.md#scheduled-side-vector-follow-up).
 - Approved Codex Forum rollout complete: VPS pinned to 794caa4, restarted
   16:51:50 UTC, active/running. Private online backup passed quick_check/hash;
   source/config/lock and unrelated archive hashes preserved. Normal regen and
@@ -232,9 +238,9 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
 No Codex rollout blocker remains. The TUI medium result review is complete
 and its introduced findings corrected.
 Codex Forum source-safety rollout is complete at approved target 794caa4.
-The next ordinary side-vector refresh, fresh Codex generation and physical TUI
-behavior were not observed in the bounded rollout. No reply/count adapter is
-authorized. The conditional fallback is parked, not a blocker by itself.
+The next ordinary side-vector refresh passed the read-only follow-up. Fresh
+Codex generation and physical TUI behavior remain unverified. No reply/count
+adapter is authorized. The conditional fallback is parked, not a blocker by itself.
 No test profiles/votes or explicit generation request were issued; ordinary
 startup provider warming was authorized.
 ranking research remains paused and production trial configuration unchanged.
@@ -243,8 +249,8 @@ ranking research remains paused and production trial configuration unchanged.
 - CI: watch the first weekly/PR Terminal client run (macOS leg). Windows-only
   flake `test_filter_change_starts_at_first_story[60]` is left unfixed since
   Windows is no longer tested.
-- Codex Forum deployed at 794caa4: observe ordinary side-timer refresh and
-  reader use. Current side coverage is above 98%; no extra job is needed.
+- Codex Forum deployed at 794caa4: observe normal reader use. The ordinary
+  side-timer refresh passed; sampled side coverage is above 99.99%.
   Fresh Codex generation and physical TUI rendering remain unverified; do not
   force them or reopen the parked fallback without a separately scoped request.
   No cleanup or reply/count adapter.

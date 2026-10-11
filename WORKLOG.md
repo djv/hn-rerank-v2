@@ -11943,3 +11943,12 @@ cache miss passed. Side model on and coverage above 99.42%; bounded journal
 quiet. No forced generation, new profile/vote, extra side job or TUI restart.
 No rollback. Evidence and unverified physical/fresh-generation/timer checks:
 docs/evaluations/codex-forum-review-20261010/DEPLOYMENT.md.
+
+## 2026-10-11 — Scheduled Codex side-vector follow-up saved
+
+Observed the ordinary 17:05 timer encode 83/83 vectors and exit successfully.
+Read-only post-job coverage exceeds 99.99% across 17 feedback profiles; all
+29 Codex topics have current primary and side vectors. Production remains
+active at 794caa4 without another restart or extra job. Updated STATUS.md,
+FINDINGS.md and DEPLOYMENT.md; fresh summary generation and physical TUI
+remain untested. User `ss` saves this documentation follow-up.

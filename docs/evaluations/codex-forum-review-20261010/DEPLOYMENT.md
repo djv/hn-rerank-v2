@@ -106,7 +106,28 @@ derived caches/vectors. No extra generation POST, forced summary, new profile,
 vote, cache purge, cleanup or embedding job was issued. No schema migration.
 The parked fallback and two low implementation findings remain unchanged.
 
-Fresh Codex summary generation, physical TUI rendering and the next scheduled
-side-vector refresh were not observed in this bounded rollout. Let ordinary
-operation update side vectors; check its next timer result when needed. A cache
-miss alone is expected, not a request to reopen the parked fallback decision.
+Fresh Codex summary generation and physical TUI rendering remain unverified.
+The next scheduled side-vector refresh was verified in the read-only follow-up
+below. A cache miss alone is expected, not a request to reopen the parked
+fallback decision.
+
+## Scheduled side-vector follow-up
+
+Read-only follow-up on 2026-10-11: production HEAD remained 794caa4 and
+`hn_rewrite.service` remained active/running, MainPID 759874, with its original
+16:51:50 UTC start. The ordinary `hn-rewrite-side-embed.timer` fired at
+17:05:26 UTC. Its service found 83 of 17,523 stories needing vectors, logged
+`encoded 83/83: 0.245 s/story`, and exited successfully at 17:06:01 UTC
+(`Result=success`, `ExecMainStatus=0`). No extra embedding job was launched.
+The tokenizer-only PyTorch-not-found notice did not prevent ONNX encoding.
+
+The existing read-only aggregate probe, without model loads or DB writes,
+completed at 17:06:36 UTC. Across 17 profiles with feedback, current side-vector
+coverage was 99.992039–99.994199%, above the 98% cutoff. All 29 Codex topics
+had current primary and side vectors: both maximum missing counts were zero.
+These are post-job snapshots; the earlier 17:05:57 probe overlapped encoding
+and showed changing coverage, so it is not the final coverage evidence.
+
+No service restart, forced generation, profile/vote mutation, cleanup or runtime
+change was issued during the follow-up. Fresh summary generation and physical
+TUI behavior remain untested; the parked fallback and low findings are unchanged.

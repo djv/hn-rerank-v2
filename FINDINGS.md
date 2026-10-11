@@ -3538,3 +3538,16 @@ No schema change, new profile/vote, extra generation/side job, TUI restart or
 cleanup. Normal startup may invoke existing providers and update derived data.
 Physical TUI, fresh Codex generation and next side timer result remain unverified.
 The fallback and two low implementation findings remain unchanged.
+
+## Codex Forum scheduled side-vector follow-up — 2026-10-11
+
+Read-only follow-up observed the ordinary timer at 17:05:26 UTC. It encoded all
+83 pending vectors and exited successfully at 17:06:01, status 0. Production
+remained at 794caa4, service active/running with the original 16:51:50 start.
+Post-job aggregate probe at 17:06:36: side coverage 99.992039–99.994199% across
+17 feedback profiles; all 29 Codex topics have current primary and side vectors,
+both missing counts zero. The intermediate probe overlapped encoding and is
+not the final snapshot. No extra embedding job, restart, generation or DB write
+was issued by the agent. Fresh summary generation and physical TUI remain
+untested; parked/low findings unchanged. Evidence:
+[DEPLOYMENT.md](docs/evaluations/codex-forum-review-20261010/DEPLOYMENT.md#scheduled-side-vector-follow-up).
