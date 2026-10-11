@@ -1,35 +1,30 @@
-# HN paired scoring — explicitly paused, 2026-10-11
+# Decision1 offline eval — small models, fine-tune and tagging, 2026-10-11
 
 ## Objective
-The user selected "Pause speed work". Retain results and evidence; do not continue
-CPU investigation, conversion, pilot retries or full scoring until requested.
+Find any cheap VPS-CPU model that adds ranking signal for user 1's HN votes on top
+of production, on the frozen held-out folds. Strands dropped by the user ("too
+heavy"); Laya stopped by the user ("stop laya"). User limits: VPS CPU only, no paid
+GPU/API; a fine-tune must take under 30 min.
 
-## Verified result
-Full scorer inactive/MainPID0; bounded ONNX unit stopped/MainPID0 (resource-stop
-exit143, not OOM). Latest check confirms both have no running main process.
-The last validated original cache audit was56valid/0invalid/4076missing of4132;
-diagnostics published zero scores. No complete HN quality result.
-
-Same-model favorable real batch16/check1 measured8.991s/score with packedFP16,
-excluding loading/prefix; no representative paired under5s result exists.
-The subsequently approved eight-request older hobson-v19 q8 ONNX check loaded on
-CPU and passed public fixtures (maxdiff0.0258148 at diagnostic tolerance0.03).
-It stopped at the approved3.5GiB cap before its first real batch completed;
-private latency, batch/standalone parity and empty timing remain unmeasured.
-Result review found no serious safety/scope defect; wheel hash enforcement and
-memory/phase telemetry are incomplete. No fixes or retry applied. Production
-source and original scoring environment are unchanged by this task. At save,
-live HN PID759874/start16:51:50UTC supersedes the earlier PID531386 checkpoint;
-this agent performed no restart or deployment. Both scoring jobs remain stopped.
+## Result
+Evidence: SMALLDEC-TAGGING-RESULTS-20261011.md (scripts and aggregate reports in
+smalldec-20261011/). AUC(up vs rest), blend = 0.8·production + 0.2·model, pooled.
+- Zero-shot decision models with the profile (Laya partial, Julia-1, Mira-v1): no
+  signal; every blend − production CI includes 0 or is negative.
+- Ettin-17M fine-tune (25 min, 5 folds): model 0.676 vs TF-IDF 0.672; blend −
+  production +0.0007 [−0.004, +0.006]. Real but redundant signal.
+- Zero-shot tags: rules valid for show_hn and paywalled only; embedding prototypes
+  mostly invalid (negation). No arm improves the blend.
+- Julia-1 tagging stopped by the user after the silver set: no tag reaches the
+  0.80 validity bar (several inverted); utility not measured.
+- User decision 2026-10-11: stop the small-model line; production stays as is.
 
 ## Blocker
-No verified route meets below5s including parity overhead. Charged memory was not
-split into anonymous/file cache; the bounded stop does not prove VPS impossibility.
+None for this question. /tmp/decision1-eval/snapshot.db was removed by someone
+else, so snapshot popularity controls stay unavailable (folds.json hash matches).
 
 ## Next step
-Wait for the user's explicit resumption. No automatic retry, cap increase, new
-model/conversion work, paid route, deployment or full scoring. Evidence:
-CPU-SPEED-20261011.md and onnx-check/VERIFIED.md and REVIEW.md. Raw runtime
-artifacts/models remain at VPS /tmp/strands-eval/onnx-cpu-check-20261011/;
-private token payloads remain there at0600 and were not copied into this repository.
-The older unapproved16-row proposal is superseded by the executed smaller check.
+None on this line (user: "Stop the small-model line"). Strands artifacts
+(/tmp/strands-eval, cache_strands*) and the /tmp model and score files
+(/tmp/smalldec, /tmp/finetune, /tmp/tagging, /tmp/laya-pilot) stay until the user
+approves deletion.

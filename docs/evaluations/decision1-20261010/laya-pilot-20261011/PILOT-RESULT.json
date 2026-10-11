@@ -1,0 +1,194 @@
+{
+ "model": "multilingual",
+ "revision": "7b928d828b7b0e022f929d9bd2e44165aa270148",
+ "threads": 2,
+ "max_len": 3072,
+ "batch": 2,
+ "rows": 16,
+ "published_scores": 0,
+ "timings": {
+  "load": 8.211852734908462,
+  "single_total": 85.95866552810185,
+  "batch_total": 93.19189622998238
+ },
+ "loaded_revisions": {
+  "multilingual": "7b928d828b7b0e022f929d9bd2e44165aa270148"
+ },
+ "state_tokens": [
+  2049,
+  76,
+  2131,
+  158,
+  2142,
+  169,
+  2165,
+  192,
+  2176,
+  203,
+  2151,
+  178,
+  2146,
+  173,
+  3034,
+  1061
+ ],
+ "rows_detail": [
+  {
+   "group": "0:real",
+   "variant": "real",
+   "request_sha256": "b1b494ee6a1e3f622915e9f8cb5b4757848eca38a3c44b730d910b4b89be7f63",
+   "single": 0.4779,
+   "batch": 0.4779,
+   "absdiff": 0.0
+  },
+  {
+   "group": "0:empty",
+   "variant": "empty",
+   "request_sha256": "ea503a85193d788c37fd485b5f52b94c3e5afbccf39d27df26167b2847a65e30",
+   "single": 0.4318,
+   "batch": 0.4318,
+   "absdiff": 0.0
+  },
+  {
+   "group": "0:real",
+   "variant": "real",
+   "request_sha256": "65808c9b57d119bb947633ed204ef1a6996f9936d7b7bbdbd55c659bfe9c243a",
+   "single": 0.6921,
+   "batch": 0.6921,
+   "absdiff": 0.0
+  },
+  {
+   "group": "0:empty",
+   "variant": "empty",
+   "request_sha256": "6bdc246f0aa297a223f7d97cce88dcc8335939580c440886c41fe06602d5fbd9",
+   "single": 0.5632,
+   "batch": 0.5632,
+   "absdiff": 0.0
+  },
+  {
+   "group": "0:real",
+   "variant": "real",
+   "request_sha256": "40c3ec505e8c06034715ef4f8e94b9acfad8f9fe515a9e67a992465b8fdd87e7",
+   "single": 0.5906,
+   "batch": 0.5906,
+   "absdiff": 0.0
+  },
+  {
+   "group": "0:empty",
+   "variant": "empty",
+   "request_sha256": "3e68bf8f58380e213bdfb663eb7d464f3c17e040e4a01c346fd57c85cfd94826",
+   "single": 0.8452,
+   "batch": 0.8452,
+   "absdiff": 0.0
+  },
+  {
+   "group": "0:real",
+   "variant": "real",
+   "request_sha256": "8f5d5b9eeda96b45803046b70372a58cd3f61cd64b69645e11eff226b0fedf73",
+   "single": 0.7186,
+   "batch": 0.7186,
+   "absdiff": 0.0
+  },
+  {
+   "group": "0:empty",
+   "variant": "empty",
+   "request_sha256": "b595ab3081e43cdd63a5d9268d68938ac11b60d3233aaaeff0a1202cba43b3ba",
+   "single": 0.8027,
+   "batch": 0.8027,
+   "absdiff": 0.0
+  },
+  {
+   "group": "0:real",
+   "variant": "real",
+   "request_sha256": "0e09e6b095dd0197056a440dabb1d7dddb2a8ab6f7d41522ab7cea7b6e21a480",
+   "single": 0.5586,
+   "batch": 0.5586,
+   "absdiff": 0.0
+  },
+  {
+   "group": "0:empty",
+   "variant": "empty",
+   "request_sha256": "d48050b50152a9c51a62fd13f168e0cf5e15977e77b0fb58b252260dcfb4b14b",
+   "single": 0.8133,
+   "batch": 0.8133,
+   "absdiff": 0.0
+  },
+  {
+   "group": "0:real",
+   "variant": "real",
+   "request_sha256": "630d74e47bcd7cffc777c09e6a2b23a5d6a985000156ec2b0738d92094b10580",
+   "single": 0.5752,
+   "batch": 0.5752,
+   "absdiff": 0.0
+  },
+  {
+   "group": "0:empty",
+   "variant": "empty",
+   "request_sha256": "621944fbe6db7675adfeb816cd7c0ed869ae2dc24bcf1e01b101bccd9af92abc",
+   "single": 0.9294,
+   "batch": 0.9294,
+   "absdiff": 0.0
+  },
+  {
+   "group": "0:real",
+   "variant": "real",
+   "request_sha256": "29f1785f4e6ff824b5ae18e1396204a9850e18ece2d7dc3d45ad6136b10466ed",
+   "single": 0.6504,
+   "batch": 0.6504,
+   "absdiff": 0.0
+  },
+  {
+   "group": "0:empty",
+   "variant": "empty",
+   "request_sha256": "d915ae4180c7378507c47872d70768592e70ce66ac51c589f5fecf0764608b58",
+   "single": 0.913,
+   "batch": 0.913,
+   "absdiff": 0.0
+  },
+  {
+   "group": "0:real",
+   "variant": "real",
+   "request_sha256": "a00facc5aca04f1ed1d96e401983fa4afea3ff9289da8afe4a48308507e59837",
+   "single": 0.7277,
+   "batch": 0.7277,
+   "absdiff": 0.0
+  },
+  {
+   "group": "0:empty",
+   "variant": "empty",
+   "request_sha256": "d3e1c38a5a9ea087c56feab2a04ba071396fc18d2c950a9fcad6d422496ace66",
+   "single": 0.9976,
+   "batch": 0.9976,
+   "absdiff": 0.0
+  }
+ ],
+ "result_keys": [
+  "answers",
+  "model",
+  "routing",
+  "usage"
+ ],
+ "evidence_sample": {
+  "model": "laya-rl-agent",
+  "usage": {
+   "input_tokens": 2055,
+   "output_tokens": 0,
+   "state_tokens": 1991,
+   "state_tokens_dropped": 0,
+   "truncated": false,
+   "truncated_questions": []
+  },
+  "routing": {
+   "model": "multilingual",
+   "repo": "convaiinnovations/laya/multilingual",
+   "reason": "explicit model='multilingual'",
+   "detection": null,
+   "workflow": null
+  }
+ },
+ "max_absdiff": 0.0,
+ "seconds_per_score_single": 5.372416595506365,
+ "seconds_per_score_batch": 5.8244935143738985,
+ "maxrss_mib": 3059.4140625,
+ "complete": true
+}

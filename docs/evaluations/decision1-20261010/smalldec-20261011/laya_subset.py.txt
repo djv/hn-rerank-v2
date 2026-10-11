@@ -1,0 +1,21 @@
+"""Pre-register a fixed-seed per-fold story subset of the frozen decision1 folds."""
+
+import hashlib
+import json
+import random
+import sys
+from pathlib import Path
+
+folds_path, out_path, per_fold = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3])
+seed = 0
+folds = json.loads(folds_path.read_bytes())
+chosen = {}
+for fold in folds:
+    ids = sorted(str(c["id"]) for c in fold["candidates"])
+    chosen[str(fold["fold"])] = sorted(random.Random(seed * 1000 + fold["fold"]).sample(ids, per_fold))
+if out_path.exists():
+    raise SystemExit(f"{out_path} exists; subset is create-only")
+out_path.write_text(json.dumps({
+    "per_fold": per_fold, "seed": seed, "rule": "random.Random(seed*1000+fold).sample(sorted ids)",
+    "folds_sha256": hashlib.sha256(folds_path.read_bytes()).hexdigest(), "stories": chosen}, indent=1))
+print({k: len(v) for k, v in chosen.items()})

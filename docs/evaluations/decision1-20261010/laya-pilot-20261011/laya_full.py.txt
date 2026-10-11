@@ -1,0 +1,105 @@
+"""Score every frozen decision1 real/empty job with Laya-multilingual (resumable).
+
+Writes one JSON line per job to a Laya-only score file, never to the Strands
+caches. Each line binds the job's request hash, fold, story, variant and a
+SHA-256 of the canonical state, plus model identity. Already-scored request
+hashes are skipped on restart. Every chunk rescores its first row as a batch-one
+check and stops on disagreement above the tolerance.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import time
+from importlib.metadata import version
+from pathlib import Path
+
+THREADS = int(os.environ.get("PILOT_THREADS", "2"))
+for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+    os.environ[var] = str(THREADS)
+
+import torch  # noqa: E402
+
+torch.set_num_threads(THREADS)
+
+from laya import Router  # noqa: E402
+
+MODEL = "multilingual"
+REVISION = "7b928d828b7b0e022f929d9bd2e44165aa270148"
+
+
+def state_sha256(state: object) -> str:
+    canonical = json.dumps(state, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def noul(result: dict) -> float:
+    return float(result["answers"]["upvote"]["noul"])
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("jobs", type=Path)
+    ap.add_argument("scores", type=Path)
+    ap.add_argument("--max-len", type=int, default=3072)
+    ap.add_argument("--batch", type=int, default=2)
+    ap.add_argument("--chunk", type=int, default=32)
+    ap.add_argument("--tolerance", type=float, default=2e-4)
+    args = ap.parse_args()
+
+    identity = {"model": f"convaiinnovations/laya/{MODEL}", "revision": REVISION,
+                "laya": version("laya"), "torch": torch.__version__,
+                "max_len": args.max_len, "threads": THREADS}
+    jobs = [json.loads(line) for line in args.jobs.open() if line.strip()]
+    done: set[str] = set()
+    if args.scores.exists():
+        for line in args.scores.open():
+            row = json.loads(line)
+            if row["identity"] != identity:
+                raise SystemExit(f"score file identity mismatch: {row['identity']}")
+            done.add(row["request_sha256"])
+    pending = [j for j in jobs if j["request_sha256"] not in done]
+    # Group by length so batches pad little; empty states first (cheap).
+    pending.sort(key=lambda j: len(json.dumps(j["state"])))
+    print(json.dumps({"jobs": len(jobs), "done": len(done), "pending": len(pending),
+                      "identity": identity}), flush=True)
+
+    router = Router(revision=REVISION)
+    router.load(MODEL)
+    start = time.perf_counter()
+    scored = 0
+    with args.scores.open("a") as out:
+        for c in range(0, len(pending), args.chunk):
+            chunk = pending[c:c + args.chunk]
+            results = router.predict_batch(
+                [{"state": j["state"], "questions": j["question"], "model": MODEL,
+                  "max_len": args.max_len} for j in chunk],
+                batch_size=args.batch, sort_by_length=True)
+            check = noul(router.predict(chunk[0]["state"], chunk[0]["question"],
+                                        model=MODEL, max_len=args.max_len))
+            diff = abs(check - noul(results[0]))
+            if diff > args.tolerance:
+                raise SystemExit(f"batch/single disagreement {diff} on {chunk[0]['request_sha256']}")
+            for j, r in zip(chunk, results, strict=True):
+                out.write(json.dumps({
+                    "request_sha256": j["request_sha256"], "fold": int(j["fold"]),
+                    "story_id": str(j["story_id"]), "variant": j["variant"],
+                    "state_sha256": state_sha256(j["state"]), "score": noul(r),
+                    "identity": identity}) + "\n")
+            out.flush()
+            os.fsync(out.fileno())
+            scored += len(chunk)
+            elapsed = time.perf_counter() - start
+            rate = elapsed / scored
+            print(json.dumps({"scored": len(done) + scored, "of": len(jobs),
+                              "s_per_score": round(rate, 3), "check_diff": diff,
+                              "eta_min": round(rate * (len(pending) - scored) / 60, 1)}),
+                  flush=True)
+    print(json.dumps({"complete": True, "scored_now": scored}), flush=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,664 @@
+{
+ "utility": {
+  "noise": {
+   "arm": "noise",
+   "features": [
+    "show_hn",
+    "ask_hn",
+    "research",
+    "tutorial",
+    "opinion",
+    "news_event",
+    "business",
+    "politics_policy",
+    "ai_ml",
+    "product_pr",
+    "sensational",
+    "paywalled"
+   ],
+   "per_fold": [
+    {
+     "fold": 0,
+     "n_train": 2076,
+     "lambda": 0.0001,
+     "val_auc": 0.4952485380116959,
+     "tag_auc": 0.4945171385623814,
+     "production": 0.7489958354895148,
+     "blend": 0.7384736699440625,
+     "coef": {
+      "show_hn": 0.064,
+      "ask_hn": -0.008,
+      "research": 0.054,
+      "tutorial": -0.039,
+      "opinion": -0.053,
+      "news_event": -0.007,
+      "business": 0.041,
+      "politics_policy": 0.018,
+      "ai_ml": -0.058,
+      "product_pr": 0.031,
+      "sensational": -0.009,
+      "paywalled": -0.042
+     }
+    },
+    {
+     "fold": 1,
+     "n_train": 2491,
+     "lambda": 0.01,
+     "val_auc": 0.4951879742970953,
+     "tag_auc": 0.5156822344322345,
+     "production": 0.804677960927961,
+     "blend": 0.7959020146520146,
+     "coef": {
+      "show_hn": 0.047,
+      "ask_hn": -0.005,
+      "research": 0.035,
+      "tutorial": -0.018,
+      "opinion": -0.026,
+      "news_event": 0.016,
+      "business": 0.017,
+      "politics_policy": 0.026,
+      "ai_ml": -0.054,
+      "product_pr": 0.029,
+      "sensational": -0.018,
+      "paywalled": -0.065
+     }
+    },
+    {
+     "fold": 2,
+     "n_train": 2906,
+     "lambda": 0.01,
+     "val_auc": 0.5181359763519388,
+     "tag_auc": 0.5152158527954707,
+     "production": 0.8761178665637265,
+     "blend": 0.871855497651676,
+     "coef": {
+      "show_hn": 0.027,
+      "ask_hn": -0.005,
+      "research": 0.024,
+      "tutorial": -0.028,
+      "opinion": -0.047,
+      "news_event": 0.025,
+      "business": 0.001,
+      "politics_policy": 0.045,
+      "ai_ml": -0.058,
+      "product_pr": 0.003,
+      "sensational": -0.017,
+      "paywalled": -0.073
+     }
+    },
+    {
+     "fold": 3,
+     "n_train": 3321,
+     "lambda": 0.01,
+     "val_auc": 0.512796833773087,
+     "tag_auc": 0.5246454826658097,
+     "production": 0.839975093399751,
+     "blend": 0.8375647772466155,
+     "coef": {
+      "show_hn": 0.03,
+      "ask_hn": 0.002,
+      "research": 0.026,
+      "tutorial": -0.02,
+      "opinion": -0.038,
+      "news_event": 0.017,
+      "business": 0.009,
+      "politics_policy": 0.059,
+      "ai_ml": -0.02,
+      "product_pr": -0.013,
+      "sensational": -0.035,
+      "paywalled": -0.084
+     }
+    },
+    {
+     "fold": 4,
+     "n_train": 3736,
+     "lambda": 0.0001,
+     "val_auc": 0.5291973969631236,
+     "tag_auc": 0.4680491022772902,
+     "production": 0.7228962312854931,
+     "blend": 0.7117535708139735,
+     "coef": {
+      "show_hn": 0.044,
+      "ask_hn": -0.0,
+      "research": 0.026,
+      "tutorial": -0.026,
+      "opinion": -0.039,
+      "news_event": 0.011,
+      "business": -0.008,
+      "politics_policy": 0.074,
+      "ai_ml": -0.014,
+      "product_pr": -0.011,
+      "sensational": -0.036,
+      "paywalled": -0.084
+     }
+    }
+   ],
+   "pooled": {
+    "tag_auc": 0.5009931694389845,
+    "tag_auc_ci95": [
+     0.4737795187373178,
+     0.5294266349671893
+    ],
+    "production": 0.7813499281250916,
+    "blend": 0.7739906953775144,
+    "blend_minus_prod": -0.007359232747577216,
+    "blend_minus_prod_ci95": [
+     -0.013545073871090264,
+     -0.00130122762135825
+    ]
+   }
+  },
+  "heur": {
+   "arm": "heur",
+   "features": [
+    "show_hn",
+    "ask_hn",
+    "research",
+    "paywalled"
+   ],
+   "per_fold": [
+    {
+     "fold": 0,
+     "n_train": 2076,
+     "lambda": 0.0001,
+     "val_auc": 0.49456975772765244,
+     "tag_auc": 0.5533254478696927,
+     "production": 0.7489958354895148,
+     "blend": 0.7527907148665631,
+     "coef": {
+      "show_hn": 0.035,
+      "ask_hn": 0.088,
+      "research": -0.013,
+      "paywalled": -0.125
+     }
+    },
+    {
+     "fold": 1,
+     "n_train": 2491,
+     "lambda": 0.0001,
+     "val_auc": 0.5443840316343442,
+     "tag_auc": 0.4927503052503053,
+     "production": 0.804677960927961,
+     "blend": 0.7917239010989011,
+     "coef": {
+      "show_hn": 0.055,
+      "ask_hn": 0.098,
+      "research": -0.025,
+      "paywalled": -0.13
+     }
+    },
+    {
+     "fold": 2,
+     "n_train": 2906,
+     "lambda": 0.0001,
+     "val_auc": 0.4990262563032516,
+     "tag_auc": 0.5262819275558129,
+     "production": 0.8761178665637265,
+     "blend": 0.8727079714340861,
+     "coef": {
+      "show_hn": 0.038,
+      "ask_hn": 0.093,
+      "research": -0.032,
+      "paywalled": -0.099
+     }
+    },
+    {
+     "fold": 3,
+     "n_train": 3321,
+     "lambda": 0.0001,
+     "val_auc": 0.5155013192612137,
+     "tag_auc": 0.5522837745550958,
+     "production": 0.839975093399751,
+     "blend": 0.8425059253605431,
+     "coef": {
+      "show_hn": 0.048,
+      "ask_hn": 0.094,
+      "research": -0.022,
+      "paywalled": -0.103
+     }
+    },
+    {
+     "fold": 4,
+     "n_train": 3736,
+     "lambda": 0.0001,
+     "val_auc": 0.5511279826464208,
+     "tag_auc": 0.4975334136407962,
+     "production": 0.7228962312854931,
+     "blend": 0.7204870073997591,
+     "coef": {
+      "show_hn": 0.053,
+      "ask_hn": 0.091,
+      "research": -0.026,
+      "paywalled": -0.121
+     }
+    }
+   ],
+   "pooled": {
+    "tag_auc": 0.480371915979699,
+    "tag_auc_ci95": [
+     0.4533557858182447,
+     0.5092061605288473
+    ],
+    "production": 0.7813499281250916,
+    "blend": 0.7796759028368586,
+    "blend_minus_prod": -0.0016740252882330164,
+    "blend_minus_prod_ci95": [
+     -0.00540074065041477,
+     0.0020472276482190045
+    ]
+   }
+  },
+  "proto": {
+   "arm": "proto",
+   "features": [
+    "show_hn",
+    "ask_hn",
+    "research",
+    "tutorial",
+    "opinion",
+    "news_event",
+    "business",
+    "politics_policy",
+    "ai_ml",
+    "product_pr",
+    "sensational",
+    "paywalled"
+   ],
+   "per_fold": [
+    {
+     "fold": 0,
+     "n_train": 2076,
+     "lambda": 0.01,
+     "val_auc": 0.6021825396825397,
+     "tag_auc": 0.6426899287844065,
+     "production": 0.7489958354895148,
+     "blend": 0.7522978733890244,
+     "coef": {
+      "show_hn": 0.321,
+      "ask_hn": -0.141,
+      "research": -0.207,
+      "tutorial": -0.219,
+      "opinion": 0.303,
+      "news_event": 0.266,
+      "business": 0.137,
+      "politics_policy": 0.186,
+      "ai_ml": 0.059,
+      "product_pr": -0.072,
+      "sensational": -0.272,
+      "paywalled": -0.155
+     }
+    },
+    {
+     "fold": 1,
+     "n_train": 2491,
+     "lambda": 0.1,
+     "val_auc": 0.6407408484284592,
+     "tag_auc": 0.5984432234432234,
+     "production": 0.804677960927961,
+     "blend": 0.7854471916971917,
+     "coef": {
+      "show_hn": 0.126,
+      "ask_hn": -0.053,
+      "research": -0.046,
+      "tutorial": -0.047,
+      "opinion": 0.123,
+      "news_event": 0.083,
+      "business": 0.121,
+      "politics_policy": 0.1,
+      "ai_ml": 0.061,
+      "product_pr": -0.009,
+      "sensational": -0.134,
+      "paywalled": -0.124
+     }
+    },
+    {
+     "fold": 2,
+     "n_train": 2906,
+     "lambda": 0.0001,
+     "val_auc": 0.6029212310902452,
+     "tag_auc": 0.6796307019236956,
+     "production": 0.8761178665637265,
+     "blend": 0.8694267515923567,
+     "coef": {
+      "show_hn": 0.411,
+      "ask_hn": -0.102,
+      "research": -0.129,
+      "tutorial": -0.215,
+      "opinion": 0.321,
+      "news_event": 0.199,
+      "business": 0.187,
+      "politics_policy": 0.151,
+      "ai_ml": 0.091,
+      "product_pr": -0.186,
+      "sensational": -0.251,
+      "paywalled": -0.128
+     }
+    },
+    {
+     "fold": 3,
+     "n_train": 3321,
+     "lambda": 0.0001,
+     "val_auc": 0.6771987686895339,
+     "tag_auc": 0.6625155666251556,
+     "production": 0.839975093399751,
+     "blend": 0.832221909773832,
+     "coef": {
+      "show_hn": 0.407,
+      "ask_hn": -0.102,
+      "research": -0.121,
+      "tutorial": -0.234,
+      "opinion": 0.319,
+      "news_event": 0.25,
+      "business": 0.222,
+      "politics_policy": 0.138,
+      "ai_ml": 0.086,
+      "product_pr": -0.206,
+      "sensational": -0.245,
+      "paywalled": -0.129
+     }
+    },
+    {
+     "fold": 4,
+     "n_train": 3736,
+     "lambda": 0.001,
+     "val_auc": 0.6687635574837311,
+     "tag_auc": 0.600814547123272,
+     "production": 0.7228962312854931,
+     "blend": 0.714736419434406,
+     "coef": {
+      "show_hn": 0.379,
+      "ask_hn": -0.074,
+      "research": -0.137,
+      "tutorial": -0.203,
+      "opinion": 0.284,
+      "news_event": 0.238,
+      "business": 0.222,
+      "politics_policy": 0.129,
+      "ai_ml": 0.107,
+      "product_pr": -0.232,
+      "sensational": -0.253,
+      "paywalled": -0.119
+     }
+    }
+   ],
+   "pooled": {
+    "tag_auc": 0.631604423973949,
+    "tag_auc_ci95": [
+     0.6047723876733772,
+     0.6580156536751524
+    ],
+    "production": 0.7813499281250916,
+    "blend": 0.7754642532343708,
+    "blend_minus_prod": -0.005885674890720782,
+    "blend_minus_prod_ci95": [
+     -0.011143193620597222,
+     -0.0005645355898522457
+    ]
+   }
+  },
+  "julia": {
+   "arm": "julia",
+   "error": "fold 0: missing held-out tag rows"
+  }
+ },
+ "validity": {
+  "heur": {
+   "show_hn": {
+    "n": 235,
+    "prevalence": 0.09361702127659574,
+    "auc": 0.9318181818181818,
+    "f1_threshold": 1.0,
+    "f1_test": 0.9333333333333333,
+    "test_n": 118,
+    "test_pos": 8
+   },
+   "ask_hn": {
+    "n": 240,
+    "prevalence": 0.1125,
+    "auc": 0.6296296296296297,
+    "f1_threshold": 0.0,
+    "f1_test": 0.2222222222222222,
+    "test_n": 120,
+    "test_pos": 15
+   },
+   "research": {
+    "n": 224,
+    "prevalence": 0.05357142857142857,
+    "auc": 0.625,
+    "f1_threshold": 1.0,
+    "f1_test": 0.0,
+    "test_n": 113,
+    "test_pos": 3
+   },
+   "paywalled": {
+    "n": 233,
+    "prevalence": 0.04291845493562232,
+    "auc": 0.9977578475336323,
+    "f1_threshold": 1.0,
+    "f1_test": 0.9090909090909091,
+    "test_n": 118,
+    "test_pos": 5
+   }
+  },
+  "proto": {
+   "show_hn": {
+    "n": 235,
+    "prevalence": 0.09361702127659574,
+    "auc": 0.7915066154502775,
+    "f1_threshold": 0.14697635387938746,
+    "f1_test": 0.2926829268292683,
+    "test_n": 118,
+    "test_pos": 8
+   },
+   "ask_hn": {
+    "n": 240,
+    "prevalence": 0.1125,
+    "auc": 0.5056511910972005,
+    "f1_threshold": -0.02167650755576425,
+    "f1_test": 0.205607476635514,
+    "test_n": 120,
+    "test_pos": 15
+   },
+   "research": {
+    "n": 224,
+    "prevalence": 0.05357142857142857,
+    "auc": 0.47877358490566035,
+    "f1_threshold": -0.008802009217159484,
+    "f1_test": 0.0,
+    "test_n": 113,
+    "test_pos": 3
+   },
+   "tutorial": {
+    "n": 237,
+    "prevalence": 0.02109704641350211,
+    "auc": 0.8181034482758621,
+    "f1_threshold": 0.06220957497912569,
+    "f1_test": 0.2222222222222222,
+    "test_n": 118,
+    "test_pos": 4
+   },
+   "opinion": {
+    "n": 233,
+    "prevalence": 0.1459227467811159,
+    "auc": 0.6093703813183565,
+    "f1_threshold": 0.07943491983583914,
+    "f1_test": 0.17777777777777778,
+    "test_n": 117,
+    "test_pos": 17
+   },
+   "news_event": {
+    "n": 212,
+    "prevalence": 0.3867924528301887,
+    "auc": 0.4549718574108818,
+    "f1_threshold": -0.1036988227229525,
+    "f1_test": 0.5241379310344828,
+    "test_n": 107,
+    "test_pos": 39
+   },
+   "business": {
+    "n": 224,
+    "prevalence": 0.08482142857142858,
+    "auc": 0.4464698331193838,
+    "f1_threshold": 0.0028363973114126084,
+    "f1_test": 0.12195121951219512,
+    "test_n": 109,
+    "test_pos": 7
+   },
+   "politics_policy": {
+    "n": 234,
+    "prevalence": 0.13247863247863248,
+    "auc": 0.2683934530430637,
+    "f1_threshold": -0.05601418128991509,
+    "f1_test": 0.20634920634920634,
+    "test_n": 117,
+    "test_pos": 19
+   },
+   "ai_ml": {
+    "n": 231,
+    "prevalence": 0.37662337662337664,
+    "auc": 0.5930715197956578,
+    "f1_threshold": -0.08025476942275289,
+    "f1_test": 0.4745762711864407,
+    "test_n": 116,
+    "test_pos": 43
+   },
+   "product_pr": {
+    "n": 227,
+    "prevalence": 0.06167400881057269,
+    "auc": 0.8266264252179745,
+    "f1_threshold": 0.07605932822041166,
+    "f1_test": 0.3333333333333333,
+    "test_n": 113,
+    "test_pos": 7
+   },
+   "sensational": {
+    "n": 225,
+    "prevalence": 0.022222222222222223,
+    "auc": 0.43363636363636365,
+    "f1_threshold": -0.01341576351067992,
+    "f1_test": 0.0,
+    "test_n": 115,
+    "test_pos": 1
+   },
+   "paywalled": {
+    "n": 233,
+    "prevalence": 0.04291845493562232,
+    "auc": 0.43228699551569505,
+    "f1_threshold": 0.014006001637273752,
+    "f1_test": 0.0,
+    "test_n": 118,
+    "test_pos": 5
+   }
+  },
+  "julia": {
+   "show_hn": {
+    "n": 235,
+    "prevalence": 0.09361702127659574,
+    "auc": 0.4206145966709347,
+    "f1_threshold": -9.57530927658081,
+    "f1_test": 0.13333333333333333,
+    "test_n": 118,
+    "test_pos": 8
+   },
+   "ask_hn": {
+    "n": 240,
+    "prevalence": 0.1125,
+    "auc": 0.5054773082942097,
+    "f1_threshold": 7.654392659664154,
+    "f1_test": 0.13333333333333333,
+    "test_n": 120,
+    "test_pos": 15
+   },
+   "research": {
+    "n": 224,
+    "prevalence": 0.05357142857142857,
+    "auc": 0.6533018867924528,
+    "f1_threshold": 3.113738775253296,
+    "f1_test": 0.13636363636363635,
+    "test_n": 113,
+    "test_pos": 3
+   },
+   "tutorial": {
+    "n": 237,
+    "prevalence": 0.02109704641350211,
+    "auc": 0.5129310344827587,
+    "f1_threshold": 2.877467155456543,
+    "f1_test": 0.0,
+    "test_n": 118,
+    "test_pos": 4
+   },
+   "opinion": {
+    "n": 233,
+    "prevalence": 0.1459227467811159,
+    "auc": 0.5421223765888264,
+    "f1_threshold": 1.7062246799468994,
+    "f1_test": 0.225,
+    "test_n": 117,
+    "test_pos": 17
+   },
+   "news_event": {
+    "n": 212,
+    "prevalence": 0.3867924528301887,
+    "auc": 0.3221388367729831,
+    "f1_threshold": -13.680047035217285,
+    "f1_test": 0.5342465753424658,
+    "test_n": 107,
+    "test_pos": 39
+   },
+   "business": {
+    "n": 224,
+    "prevalence": 0.08482142857142858,
+    "auc": 0.5599486521181001,
+    "f1_threshold": -6.10799315571785,
+    "f1_test": 0.18421052631578946,
+    "test_n": 109,
+    "test_pos": 7
+   },
+   "politics_policy": {
+    "n": 234,
+    "prevalence": 0.13247863247863248,
+    "auc": 0.48879707611631973,
+    "f1_threshold": -3.2936928272247314,
+    "f1_test": 0.27692307692307694,
+    "test_n": 117,
+    "test_pos": 19
+   },
+   "ai_ml": {
+    "n": 231,
+    "prevalence": 0.37662337662337664,
+    "auc": 0.3533684546615581,
+    "f1_threshold": -12.362983703613281,
+    "f1_test": 0.5408805031446541,
+    "test_n": 116,
+    "test_pos": 43
+   },
+   "product_pr": {
+    "n": 227,
+    "prevalence": 0.06167400881057269,
+    "auc": 0.2857142857142857,
+    "f1_threshold": -8.293189764022827,
+    "f1_test": 0.12612612612612611,
+    "test_n": 113,
+    "test_pos": 7
+   },
+   "sensational": {
+    "n": 225,
+    "prevalence": 0.022222222222222223,
+    "auc": 0.5936363636363636,
+    "f1_threshold": 10.526453971862793,
+    "f1_test": 0.0,
+    "test_n": 115,
+    "test_pos": 1
+   },
+   "paywalled": {
+    "n": 233,
+    "prevalence": 0.04291845493562232,
+    "auc": 0.3901345291479821,
+    "f1_threshold": 5.8796610832214355,
+    "f1_test": 0.0,
+    "test_n": 118,
+    "test_pos": 5
+   }
+  }
+ }
+}

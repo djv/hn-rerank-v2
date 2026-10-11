@@ -1,0 +1,500 @@
+"""Zero-shot story tagging experiment (design: TAGGING-DESIGN-20261011.md).
+
+Subcommands, run in order:
+  freeze  write tags.json, universe.json (cards of every voted story in the
+          frozen folds) and silver.json (240 pre-registered validity stories)
+  heur    T0 rule tags for show_hn/ask_hn/research/paywalled
+  proto   T1: cosine of stored mxbai story vectors to embedded tag criteria
+  julia   T2: Julia-1 noul logit gap per (story, tag); resumable; --limit pilots
+  noise   N: seeded N(0,1) control columns
+  report  validity on silver labels + per-fold tag-LR blend utility
+
+Tags are label-free per-story features; votes enter only through the per-fold
+logistic regression fitted on that fold's training stories.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import random
+import sqlite3
+import sys
+import time
+from pathlib import Path
+from urllib.parse import urlparse
+
+THREADS = int(os.environ.get("PILOT_THREADS", "4"))
+for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+    os.environ[var] = str(THREADS)
+
+import numpy as np  # noqa: E402
+
+WORK = Path("/tmp/decision1-eval/work_heldout")
+OUT = Path("/tmp/tagging")
+DB = Path("/tmp/finetune/snapshot.db")
+TEXT_CHARS = 500
+LABEL = {"down": 0, "neutral": 1, "up": 2}
+JULIA = ("SupersonicLabs/Julia-1", "a85b127321d580d65176c89ced8273f305745d85")
+MXBAI_VERSION = "mxbai-embed-xsmall-v1|mean|norm|4096"
+
+TAGS: dict[str, dict[str, str]] = {
+    "show_hn": {"q": "Is the author presenting a project they made themselves (a Show HN style post)?",
+                "true": "The poster presents their own project, tool, app or creation.",
+                "false": "It is not the poster presenting their own creation."},
+    "ask_hn": {"q": "Is this a question or discussion prompt posted to the community rather than a link to an article?",
+               "true": "It asks the community a question or opens a discussion, with no external article.",
+               "false": "It links to an external article, page or project."},
+    "research": {"q": "Is this a research paper or preprint, or an article mainly reporting one study's findings?",
+                 "true": "It is a paper or preprint, or mainly reports a specific study.",
+                 "false": "It is not about a specific research paper or study."},
+    "tutorial": {"q": "Does this teach the reader how to do something, step by step?",
+                 "true": "It is a tutorial, guide or how-to.",
+                 "false": "It does not teach a procedure."},
+    "opinion": {"q": "Is this mainly an argued personal essay or opinion piece?",
+                "true": "It argues a personal view or opinion.",
+                "false": "It mainly reports, documents, announces or teaches."},
+    "news_event": {"q": "Does this report a recent event, such as a release, outage, acquisition, lawsuit or death?",
+                   "true": "It reports a specific recent event.",
+                   "false": "It is not a report of a recent event."},
+    "business": {"q": "Is this about a company's business: funding, earnings, layoffs, markets or strategy?",
+                 "true": "Its main subject is business, money or company strategy.",
+                 "false": "Business is not its main subject."},
+    "politics_policy": {"q": "Is this about government, law, regulation, courts or elections?",
+                        "true": "Its main subject is politics, law or public policy.",
+                        "false": "Politics, law and policy are not its main subject."},
+    "ai_ml": {"q": "Is this mainly about artificial intelligence or machine learning?",
+              "true": "Its main subject is AI, ML or language models.",
+              "false": "AI and ML are not its main subject."},
+    "product_pr": {"q": "Is this a company announcing or promoting its own product or feature?",
+                   "true": "A company announces or promotes its own product, feature or service.",
+                   "false": "It is not a company promoting its own product."},
+    "sensational": {"q": "Does the title overstate, bait or sensationalize?",
+                    "true": "The title is clickbait, overstated or sensational.",
+                    "false": "The title is plain and accurate in tone."},
+    "paywalled": {"q": "Is this story's source usually behind a paywall?",
+                  "true": "The source usually requires a subscription to read.",
+                  "false": "The source is usually free to read."},
+}
+RESEARCH_DOMAINS = {
+    "arxiv.org", "doi.org", "dl.acm.org", "ieeexplore.ieee.org", "biorxiv.org", "medrxiv.org",
+    "openreview.net", "aclanthology.org", "papers.nips.cc", "proceedings.neurips.cc",
+    "proceedings.mlr.press", "pubmed.ncbi.nlm.nih.gov", "ncbi.nlm.nih.gov", "sciencedirect.com",
+    "link.springer.com", "journals.plos.org", "eprint.iacr.org", "osf.io", "ssrn.com",
+    "papers.ssrn.com", "researchgate.net", "semanticscholar.org", "jmlr.org", "usenix.org",
+}
+PAYWALL_DOMAINS = {
+    "nytimes.com", "wsj.com", "ft.com", "bloomberg.com", "economist.com", "washingtonpost.com",
+    "newyorker.com", "theatlantic.com", "wired.com", "businessinsider.com", "theinformation.com",
+    "science.org", "hbr.org", "technologyreview.com", "newscientist.com", "telegraph.co.uk",
+    "thetimes.co.uk", "thetimes.com", "latimes.com", "bostonglobe.com", "fortune.com",
+    "barrons.com", "seekingalpha.com", "foreignaffairs.com", "lrb.co.uk", "nybooks.com",
+    "harpers.org", "stratechery.com", "semianalysis.com", "asia.nikkei.com", "haaretz.com",
+    "theathletic.com", "spectator.co.uk", "newsweek.com", "chronicle.com", "nature.com",
+    "scientificamerican.com", "theverge.com", "forbes.com", "statnews.com", "lemonde.fr",
+    "spiegel.de", "nzz.ch", "afr.com", "theglobeandmail.com", "wapo.st",
+}
+
+
+def domain(url: str | None) -> str:
+    return urlparse(url).netloc.lower().removeprefix("www.") if url else ""
+
+
+def in_domains(d: str, domains: set[str]) -> bool:
+    return any(d == x or d.endswith("." + x) for x in domains)
+
+
+def sha(obj: object) -> str:
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def load(name: str):
+    return json.loads((OUT / name).read_text())
+
+
+def check_frozen() -> None:
+    tags = load("tags.json")
+    if tags["sha256"] != sha(tags["tags"]) or tags["tags"] != TAGS:
+        raise SystemExit("tags.json does not match the frozen TAGS")
+    receipt = load("freeze-receipt.json")
+    if hashlib.sha256((WORK / "folds.json").read_bytes()).hexdigest() != receipt["folds_sha256"]:
+        raise SystemExit("folds.json changed since freeze")
+
+
+# ---------------------------------------------------------------- freeze
+def cmd_freeze(args) -> None:
+    OUT.mkdir(exist_ok=True)
+    if (OUT / "tags.json").exists():
+        raise SystemExit("already frozen")
+    folds = json.loads((WORK / "folds.json").read_text())
+    report = json.loads((WORK / "evaluator_report.json").read_text())["config"]
+    fold_of: dict[int, int] = {}
+    for k, f in enumerate(folds):
+        for c in f["candidates"]:
+            fold_of[int(c["id"])] = k
+    train_ids = {int(s) for m in report["folds"] for s in m["training_story_ids"]}
+    ids = sorted(train_ids | set(fold_of))
+    con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    cards = {}
+    for i in range(0, len(ids), 500):
+        part = ids[i:i + 500]
+        for sid, title, url, source, st, body, text in con.execute(
+                f"SELECT id, title, url, source, self_text, article_body, text_content FROM stories "
+                f"WHERE id IN ({','.join('?' * len(part))})", part):
+            raw = st or body or text or ""
+            cards[sid] = {"id": sid, "title": title, "domain": domain(url), "source": source,
+                          "text": " ".join(raw.split())[:TEXT_CHARS], "fold": fold_of.get(sid, -1)}
+    if missing := [i for i in ids if i not in cards]:
+        raise SystemExit(f"{len(missing)} stories missing, e.g. {missing[:5]}")
+    for f in folds:
+        for c in f["candidates"]:
+            mine = cards[int(c["id"])]
+            if any(mine[k] != c[k] for k in ("title", "domain", "source", "text")):
+                raise SystemExit(f"held-out card drift for {c['id']}")
+    universe = [cards[i] for i in ids]
+    rng = random.Random(1)
+    silver = []
+    for stratum in range(-1, len(folds)):
+        pool = sorted(c["id"] for c in universe if c["fold"] == stratum)
+        silver += rng.sample(pool, 40)
+    (OUT / "tags.json").write_text(json.dumps({"tags": TAGS, "sha256": sha(TAGS)}, indent=1))
+    (OUT / "universe.json").write_text(json.dumps(universe))
+    (OUT / "silver.json").write_text(json.dumps(sorted(silver)))
+    (OUT / "freeze-receipt.json").write_text(json.dumps({
+        "folds_sha256": hashlib.sha256((WORK / "folds.json").read_bytes()).hexdigest(),
+        "tags_sha256": sha(TAGS), "universe_sha256": sha(universe), "silver_sha256": sha(sorted(silver)),
+        "research_domains": sorted(RESEARCH_DOMAINS), "paywall_domains": sorted(PAYWALL_DOMAINS),
+        "n_universe": len(universe), "n_silver": len(silver), "frozen_at": time.time()}, indent=1))
+    print(json.dumps({"universe": len(universe), "silver": len(silver),
+                      "by_fold": {k: sum(c["fold"] == k for c in universe) for k in range(-1, 5)}}))
+
+
+# ---------------------------------------------------------------- T0 / N
+def heur(card: dict) -> dict[str, float]:
+    t = card["title"].strip().lower()
+    return {"show_hn": float(t.startswith("show hn")), "ask_hn": float(t.startswith("ask hn")),
+            "research": float(in_domains(card["domain"], RESEARCH_DOMAINS)),
+            "paywalled": float(in_domains(card["domain"], PAYWALL_DOMAINS))}
+
+
+def cmd_heur(args) -> None:
+    check_frozen()
+    rows = {str(c["id"]): heur(c) for c in load("universe.json")}
+    (OUT / "scores-heur.json").write_text(json.dumps(rows))
+    print(json.dumps({k: int(sum(r[k] for r in rows.values())) for k in next(iter(rows.values()))}))
+
+
+def cmd_noise(args) -> None:
+    check_frozen()
+    rng = np.random.default_rng(0)
+    rows = {str(c["id"]): dict(zip(TAGS, rng.standard_normal(len(TAGS)).tolist(), strict=True))
+            for c in load("universe.json")}
+    (OUT / "scores-noise.json").write_text(json.dumps(rows))
+
+
+# ---------------------------------------------------------------- T1
+def cmd_proto(args) -> None:
+    check_frozen()
+    sys.path.insert(0, str(args.repo))
+    from pipeline.config import DEFAULT_ONNX_MODEL_DIR
+    from pipeline.ranking import Embedder
+
+    emb = Embedder(DEFAULT_ONNX_MODEL_DIR)
+    if emb.model_version != MXBAI_VERSION:
+        raise SystemExit(f"embedder version {emb.model_version}")
+    protos = {}
+    for name, t in TAGS.items():
+        v = np.asarray(emb.encode([t["true"], t["false"]]), dtype=np.float64)
+        protos[name] = v / np.linalg.norm(v, axis=1, keepdims=True)
+    universe = load("universe.json")
+    con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    vecs = {}
+    for i in range(0, len(universe), 500):
+        part = [c["id"] for c in universe[i:i + 500]]
+        for sid, blob, _dim in con.execute(
+                f"SELECT story_id, embedding, dim FROM embeddings WHERE model_version = ? AND "
+                f"story_id IN ({','.join('?' * len(part))})", [MXBAI_VERSION, *part]):
+            v = np.frombuffer(blob, dtype=np.float32).astype(np.float64)
+            vecs[sid] = v / np.linalg.norm(v)
+    rows = {}
+    for c in universe:
+        v = vecs.get(c["id"])
+        rows[str(c["id"])] = None if v is None else {
+            n: float(p[0] @ v - p[1] @ v) for n, p in protos.items()}
+    missing = sum(r is None for r in rows.values())
+    (OUT / "scores-proto.json").write_text(json.dumps(
+        {"identity": {"embedder": MXBAI_VERSION, "onnx_sha": emb.model_onnx_sha}, "rows": rows}))
+    print(json.dumps({"stories": len(rows), "missing_vectors": missing}))
+
+
+# ---------------------------------------------------------------- T2
+def story_state(card: dict) -> dict:
+    story = {"title": card["title"], "domain": card["domain"] or "(none)", "source": card["source"]}
+    if card["text"]:
+        story["text_excerpt"] = card["text"]
+    return {"story": story}
+
+
+def cmd_julia(args) -> None:
+    check_frozen()
+    import torch
+
+    torch.set_num_threads(THREADS)
+    sys.path.insert(0, str(args.model_dir))
+    from julia import load_model
+    from julia.typed import validate_row
+
+    engine = load_model(str(args.model_dir), device="cpu", strict_encoding=True,
+                        max_length=1024, head_length=512)
+    identity = {"model": JULIA[0], "revision": JULIA[1], "torch": torch.__version__,
+                "tags_sha256": sha(TAGS), "max_length": 1024, "head_length": 512}
+    out = OUT / "scores-julia.jsonl"
+    done = set()
+    if out.exists():
+        for line in out.open():
+            if not line.endswith("\n"):
+                break
+            r = json.loads(line)
+            if r["identity"] != identity:
+                raise SystemExit("identity mismatch")
+            done.add(r["story_id"])
+    universe = load("universe.json")
+    silver = set(load("silver.json"))
+    # silver first so the pilot also yields validity rows; rest in seeded random order
+    rest = [c for c in universe if c["id"] not in silver]
+    random.Random(0).shuffle(rest)
+    if args.train_sample is not None:
+        # design fallback after a missed speed gate: every held-out story plus a seeded
+        # sample of training-only stories (fold -1); the tag LR trains on what is scored
+        rest = ([c for c in rest if c["fold"] >= 0]
+                + [c for c in rest if c["fold"] == -1][: args.train_sample])
+    order = [c for c in universe if c["id"] in silver] + rest
+    pending = [c for c in order if str(c["id"]) not in done][: args.limit]
+    start = time.perf_counter()
+    with out.open("a") as fh:
+        for i, c in enumerate(pending):
+            state = story_state(c)
+            rows = []
+            for t in TAGS.values():
+                row = dict(state=state, question=t["q"], type="noul", options=[t["false"], t["true"]])
+                validate_row(row, len(rows) + 1)
+                rows.append(row)
+            z = engine.logits(rows)
+            gap = {n: float(v[1] - v[0]) for n, v in zip(TAGS, z, strict=True)}
+            if i == 0:
+                single = [float(engine.logits([r])[0][1] - engine.logits([r])[0][0]) for r in rows[:3]]
+                diff = max(abs(a - gap[n]) for a, n in zip(single, TAGS, strict=False))
+                print(json.dumps({"batch_vs_single_max_diff": diff}), flush=True)
+                if diff > 1e-3:
+                    raise SystemExit("batch vs single disagreement")
+            fh.write(json.dumps({"story_id": str(c["id"]), "gap": gap,
+                                 "request_sha256": sha([state, TAGS]), "identity": identity}) + "\n")
+            fh.flush()
+            if (i + 1) % 100 == 0 or i + 1 == len(pending):
+                el = time.perf_counter() - start
+                print(json.dumps({"done": i + 1, "of": len(pending), "s_per_story": round(el / (i + 1), 3),
+                                  "eta_min": round(el / (i + 1) * (len(pending) - i - 1) / 60, 1)}),
+                      flush=True)
+
+
+# ---------------------------------------------------------------- report
+def auc(s: np.ndarray, y: np.ndarray) -> float:
+    pos, neg = s[y == 1], s[y == 0]
+    if len(pos) == 0 or len(neg) == 0:
+        return float("nan")
+    g = (pos[:, None] > neg[None, :]).sum() + 0.5 * (pos[:, None] == neg[None, :]).sum()
+    return float(g / (len(pos) * len(neg)))
+
+
+def pct(s: np.ndarray) -> np.ndarray:
+    order = s.argsort(kind="stable")
+    r = np.empty(len(s))
+    r[order] = np.arange(1, len(s) + 1)
+    for v, n in zip(*np.unique(s, return_counts=True), strict=True):
+        if n > 1:
+            r[s == v] = r[s == v].mean()
+    return r / len(s)
+
+
+def fit_lr(x: np.ndarray, y: np.ndarray, lam: float) -> np.ndarray:
+    """L2 logistic regression by Newton steps (12-ish features)."""
+    xb = np.hstack([x, np.ones((len(x), 1))])
+    w = np.zeros(xb.shape[1])
+    reg = np.full(xb.shape[1], lam * len(x))
+    reg[-1] = 0.0
+    for _ in range(50):
+        p = 1 / (1 + np.exp(-xb @ w))
+        g = xb.T @ (p - y) + reg * w
+        h = (xb * (p * (1 - p))[:, None]).T @ xb + np.diag(reg + 1e-9)
+        step = np.linalg.solve(h, g)
+        w -= step
+        if np.abs(step).max() < 1e-8:
+            break
+    return w
+
+
+def predict_lr(w: np.ndarray, x: np.ndarray) -> np.ndarray:
+    return np.hstack([x, np.ones((len(x), 1))]) @ w
+
+
+def arm_matrix(arm: str) -> tuple[list[str], dict[int, np.ndarray]]:
+    if arm == "heur":
+        rows = load("scores-heur.json")
+    elif arm == "noise":
+        rows = load("scores-noise.json")
+    elif arm == "proto":
+        rows = {k: v for k, v in load("scores-proto.json")["rows"].items() if v is not None}
+    elif arm == "julia":
+        rows = {}
+        for line in (OUT / "scores-julia.jsonl").open():
+            if line.endswith("\n"):
+                r = json.loads(line)
+                rows[r["story_id"]] = r["gap"]
+    else:
+        raise ValueError(arm)
+    names = list(next(iter(rows.values())))
+    return names, {int(k): np.asarray([v[n] for n in names], dtype=np.float64) for k, v in rows.items()}
+
+
+def utility(arm: str, folds, report, fb, boot: int, only: set[int] | None = None) -> dict:
+    """`only` restricts training stories (matched-set sensitivity for the T2 fallback sample)."""
+    names, feats = arm_matrix(arm)
+    per_fold, pooled = [], []
+    for k, f in enumerate(folds):
+        meta = report["folds"][k]
+        assert meta["fold"] == k + 1
+        train = sorted((int(s) for s in meta["training_story_ids"]), key=lambda s: fb[s][1])
+        train = [s for s in train if s in feats and (only is None or s in only)]
+        test = [(int(c["id"]), lab, prod)
+                for c, lab, prod in zip(f["candidates"], f["labels"], f["production"], strict=True)]
+        if not all(s in feats for s, _, _ in test):
+            return {"arm": arm, "error": f"fold {k}: missing held-out tag rows"}
+        x = np.stack([feats[s] for s in train])
+        y = np.asarray([float(fb[s][0] == "up") for s in train])
+        mu, sd = x.mean(0), x.std(0) + 1e-9
+        xs = (x - mu) / sd
+        cut = int(len(train) * 0.85)
+        val = {lam: auc(predict_lr(fit_lr(xs[:cut], y[:cut], lam), xs[cut:]), y[cut:])
+               for lam in (1e-4, 1e-3, 1e-2, 1e-1)}
+        lam = max(val, key=val.get)
+        w = fit_lr(xs, y, lam)
+        xt = (np.stack([feats[s] for s, _, _ in test]) - mu) / sd
+        tag = predict_lr(w, xt)
+        yt = np.asarray([float(lab == 2) for _, lab, _ in test])
+        prod = np.asarray([p for _, _, p in test], dtype=np.float64)
+        blend = 0.8 * pct(prod) + 0.2 * pct(tag)
+        per_fold.append({"fold": k, "n_train": len(train), "lambda": lam, "val_auc": val[lam],
+                         "tag_auc": auc(tag, yt), "production": auc(prod, yt), "blend": auc(blend, yt),
+                         "coef": dict(zip(names, (w[:-1]).round(3).tolist(), strict=True))})
+        pooled.append((pct(tag), pct(prod), blend, yt))
+    t, p, b, y = (np.concatenate(z) for z in zip(*pooled, strict=True))
+    fold_id = np.concatenate([np.full(len(z[3]), k) for k, z in enumerate(pooled)])
+    rng = np.random.default_rng(0)
+    diffs, tags_ = [], []
+    for _ in range(boot):
+        idx = np.concatenate([rng.choice(np.flatnonzero(fold_id == k), (fold_id == k).sum())
+                              for k in range(len(pooled))])
+        diffs.append(auc(b[idx], y[idx]) - auc(p[idx], y[idx]))
+        tags_.append(auc(t[idx], y[idx]))
+    return {"arm": arm, "features": names, "per_fold": per_fold,
+            "pooled": {"tag_auc": auc(t, y), "tag_auc_ci95": np.percentile(tags_, [2.5, 97.5]).tolist(),
+                       "production": auc(p, y), "blend": auc(b, y),
+                       "blend_minus_prod": auc(b, y) - auc(p, y),
+                       "blend_minus_prod_ci95": np.percentile(diffs, [2.5, 97.5]).tolist()},
+            "bootstrap_draws": diffs}
+
+
+def f1_at(s: np.ndarray, y: np.ndarray, t: float) -> float:
+    pred = s >= t
+    denom = pred.sum() + (y == 1).sum()
+    return float(2 * (pred & (y == 1)).sum() / denom) if denom else float("nan")
+
+
+def validity(arm: str, silver_labels: dict[int, dict[str, int]]) -> dict:
+    names, feats = arm_matrix(arm)
+    # F1 threshold: chosen on a score-blind seeded half of the silver ids, scored on the other half
+    order = sorted(silver_labels)
+    random.Random(1).shuffle(order)
+    tune_ids = set(order[: len(order) // 2])
+    out = {}
+    for n in names:
+        ids = [s for s, lab in silver_labels.items() if n in lab and s in feats]
+        if not ids:
+            continue
+        s = np.asarray([feats[i][names.index(n)] for i in ids])
+        y = np.asarray([silver_labels[i][n] for i in ids])
+        tune = np.asarray([i in tune_ids for i in ids])
+        row = {"n": len(ids), "prevalence": float(y.mean()), "auc": auc(s, y)}
+        if y[tune].sum() and y[~tune].sum():
+            t = max(np.unique(s[tune]), key=lambda v: f1_at(s[tune], y[tune], v))
+            row |= {"f1_threshold": float(t), "f1_test": f1_at(s[~tune], y[~tune], t),
+                    "test_n": int((~tune).sum()), "test_pos": int(y[~tune].sum())}
+        out[n] = row
+    return out
+
+
+def cmd_report(args) -> None:
+    check_frozen()
+    folds = json.loads((WORK / "folds.json").read_text())
+    report = json.loads((WORK / "evaluator_report.json").read_text())["config"]
+    con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    rows = con.execute("SELECT story_id, action, updated_at FROM feedback WHERE user_id = 1").fetchall()
+    fb = {s: (a, u) for s, a, u in rows}
+    assert len(fb) == len(rows)
+    arms = [a for a in ("noise", "heur", "proto", "julia")
+            if (OUT / {"julia": "scores-julia.jsonl"}.get(a, f"scores-{a}.json")).exists()]
+    result = {"utility": {}, "validity": {}}
+    for a in arms:
+        result["utility"][a] = utility(a, folds, report, fb, args.boot)
+    silver_path = OUT / "silver-labels.json"
+    if silver_path.exists():
+        labels = {int(k): v for k, v in load("silver-labels.json")["agreed"].items()}
+        for a in arms:
+            if a != "noise":
+                result["validity"][a] = validity(a, labels)
+    u = result["utility"]
+    if "julia" in u and "pooled" in u["julia"]:
+        d = {a: np.asarray(u[a]["bootstrap_draws"]) for a in u if "pooled" in u[a]}
+        result["julia_minus_noise_ci95"] = np.percentile(d["julia"] - d["noise"], [2.5, 97.5]).tolist()
+        if "proto" in d:
+            result["julia_minus_proto_ci95"] = np.percentile(d["julia"] - d["proto"], [2.5, 97.5]).tolist()
+        # sensitivity: every arm trained only on the stories Julia scored
+        only = set(arm_matrix("julia")[1])
+        m = result["utility_matched"] = {a: utility(a, folds, report, fb, args.boot, only) for a in arms}
+        dm = {a: np.asarray(m[a]["bootstrap_draws"]) for a in m if "pooled" in m[a]}
+        result["matched_julia_minus_noise_ci95"] = np.percentile(dm["julia"] - dm["noise"], [2.5, 97.5]).tolist()
+        if "proto" in dm:
+            result["matched_julia_minus_proto_ci95"] = np.percentile(
+                dm["julia"] - dm["proto"], [2.5, 97.5]).tolist()
+        for a in m:
+            m[a].pop("bootstrap_draws", None)
+    for a in u:
+        u[a].pop("bootstrap_draws", None)
+    (OUT / "report.json").write_text(json.dumps(result, indent=1))
+    print(json.dumps({a: u[a].get("pooled", u[a].get("error")) for a in u}, indent=1))
+    print(json.dumps({k: v for k, v in result.items() if k.endswith("ci95")}))
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("freeze")
+    sub.add_parser("heur")
+    sub.add_parser("noise")
+    p = sub.add_parser("proto")
+    p.add_argument("--repo", type=Path, default=Path("/home/dev/hn-rewrite/hn-rewrite-decision1"))
+    p = sub.add_parser("julia")
+    p.add_argument("--model-dir", type=Path, default=Path("/tmp/smalldec/models/Julia-1"))
+    p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--train-sample", type=int, default=None)
+    p = sub.add_parser("report")
+    p.add_argument("--boot", type=int, default=2000)
+    args = ap.parse_args()
+    {"freeze": cmd_freeze, "heur": cmd_heur, "noise": cmd_noise, "proto": cmd_proto,
+     "julia": cmd_julia, "report": cmd_report}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()

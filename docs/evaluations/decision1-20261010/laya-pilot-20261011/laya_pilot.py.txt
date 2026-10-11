@@ -1,0 +1,114 @@
+"""Laya-multilingual speed/consistency pilot on frozen decision1 held-out jobs.
+
+Publishes no scores into the decision1 caches. Writes only numeric timings,
+probabilities and truncation counts (no story/profile text) to the output JSON.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import resource
+import time
+from pathlib import Path
+
+THREADS = int(os.environ.get("PILOT_THREADS", "2"))
+for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+    os.environ[var] = str(THREADS)
+
+import torch  # noqa: E402
+
+torch.set_num_threads(THREADS)
+
+from laya import Router  # noqa: E402
+
+MODEL = "multilingual"
+# convaiinnovations/laya bundle commit holding multilingual/ (downloaded 2026-10-11)
+REVISION = "7b928d828b7b0e022f929d9bd2e44165aa270148"
+
+
+def select(jobs_path: Path, pairs: int) -> list[dict]:
+    by_story: dict[str, dict[str, dict]] = {}
+    for line in jobs_path.open():
+        if line.strip():
+            job = json.loads(line)
+            if str(job["fold"]) == "0":
+                by_story.setdefault(job["story_id"], {})[job["variant"]] = job
+    complete = [v for v in by_story.values() if {"real", "empty"} <= v.keys()]
+    complete.sort(key=lambda v: len(json.dumps(v["real"]["state"])))
+    step = (len(complete) - 1) / (pairs - 1)
+    chosen = [complete[round(i * step)] for i in range(pairs)]
+    return [v[name] for v in chosen for name in ("real", "empty")]
+
+
+def noul(result: dict) -> float:
+    answer = result["answers"]["upvote"]
+    return float(answer["noul"] if isinstance(answer, dict) else answer)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("jobs", type=Path)
+    ap.add_argument("out", type=Path)
+    ap.add_argument("--pairs", type=int, default=8)
+    ap.add_argument("--max-len", type=int, default=3072)
+    ap.add_argument("--batch", type=int, default=2)
+    args = ap.parse_args()
+
+    jobs = select(args.jobs, args.pairs)
+    report: dict = {"model": MODEL, "revision": REVISION, "threads": THREADS,
+                    "max_len": args.max_len, "batch": args.batch, "rows": len(jobs),
+                    "published_scores": 0, "timings": {}}
+
+    t = time.perf_counter()
+    router = Router(revision=REVISION)
+    router.load(MODEL)
+    report["timings"]["load"] = time.perf_counter() - t
+    report["loaded_revisions"] = router.loaded_revisions
+
+    tok = router.load(MODEL).tok
+    report["state_tokens"] = [len(tok(json.dumps(j["state"]))["input_ids"]) for j in jobs]
+
+    # warm-up (excluded from timing)
+    router.predict(jobs[0]["state"], jobs[0]["question"], model=MODEL, max_len=args.max_len)
+
+    t = time.perf_counter()
+    single = []
+    for j in jobs:
+        t0 = time.perf_counter()
+        single.append(router.predict(j["state"], j["question"], model=MODEL, max_len=args.max_len))
+        print(json.dumps({"row": len(single), "variant": j["variant"],
+                          "seconds": round(time.perf_counter() - t0, 3)}), flush=True)
+    report["timings"]["single_total"] = time.perf_counter() - t
+
+    t = time.perf_counter()
+    batched = router.predict_batch(
+        [{"state": j["state"], "questions": j["question"], "model": MODEL,
+          "max_len": args.max_len} for j in jobs],
+        batch_size=args.batch, sort_by_length=True)
+    report["timings"]["batch_total"] = time.perf_counter() - t
+
+    rows = []
+    for j, s, b in zip(jobs, single, batched):
+        rows.append({"group": j["group"], "variant": j["variant"],
+                     "request_sha256": j["request_sha256"],
+                     "single": noul(s), "batch": noul(b),
+                     "absdiff": abs(noul(s) - noul(b))})
+    report["rows_detail"] = rows
+    report["result_keys"] = sorted(single[0].keys())
+    report["evidence_sample"] = {k: v for k, v in single[0].items()
+                                 if k not in ("answers",) and len(json.dumps(v, default=str)) < 600}
+    report["max_absdiff"] = max(r["absdiff"] for r in rows)
+    n = len(jobs)
+    report["seconds_per_score_single"] = report["timings"]["single_total"] / n
+    report["seconds_per_score_batch"] = report["timings"]["batch_total"] / n
+    report["maxrss_mib"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    report["complete"] = True
+    args.out.write_text(json.dumps(report, indent=1, default=str))
+    print(json.dumps({k: v for k, v in report.items() if k not in ("rows_detail",)},
+                     indent=1, default=str))
+
+
+if __name__ == "__main__":
+    main()

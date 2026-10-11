@@ -1,0 +1,31 @@
+"""Merge Claude and Muse silver labels; keep per-tag agreements as silver truth."""
+import json
+import re
+from pathlib import Path
+
+D = Path("/tmp/tagging")
+TAGS = list(json.loads((D / "tags.json").read_text())["tags"])
+order = [json.loads(line)["id"] for line in (D / "silver-cards.jsonl").open()]
+claude = {r["id"]: r for r in map(json.loads, (D / "silver-claude.jsonl").open())}
+muse = {}
+for k in range(4):
+    for m in re.finditer(r"\{[^{}]*\"id\"[^{}]*\}", (D / f"silver-muse-{k}.txt").read_text()):
+        r = json.loads(m.group(0))
+        if set(TAGS) <= set(r) and all(r[t] in (0, 1) for t in TAGS):
+            muse[int(r["id"])] = r
+missing = [i for i in order if i not in muse]
+agreed, stats = {}, {}
+for t in TAGS:
+    both = [i for i in order if i in muse]
+    same = [i for i in both if claude[i][t] == muse[i][t]]
+    pos_c = sum(claude[i][t] for i in both)
+    pos_m = sum(muse[i][t] for i in both)
+    pos_both = sum(claude[i][t] and muse[i][t] for i in both)
+    stats[t] = {"n": len(both), "agree": len(same) / len(both), "claude_pos": pos_c, "muse_pos": pos_m,
+                "both_pos": pos_both}
+    for i in same:
+        agreed.setdefault(str(i), {})[t] = claude[i][t]
+(D / "silver-labels.json").write_text(json.dumps({"agreed": agreed, "stats": stats, "muse_missing": missing}))
+print(json.dumps({"muse_rows": len(muse), "missing": len(missing)}))
+for t, s in stats.items():
+    print(f"{t:16s} agree {s['agree']:.2f}  claude+ {s['claude_pos']:3d}  muse+ {s['muse_pos']:3d}  both+ {s['both_pos']:3d}")

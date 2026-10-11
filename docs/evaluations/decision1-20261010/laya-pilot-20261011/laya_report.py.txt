@@ -1,0 +1,134 @@
+"""Paired held-out report for Laya-multilingual scores on the frozen decision1 folds.
+
+Uses eval_decision1's folds, candidate selection, state rendering and metric code.
+Refuses to compute anything unless every selected (fold, story, variant) has
+exactly one Laya score whose state hash matches the state rendered from the
+hash-checked folds.json. The frozen snapshot DB is no longer present, so
+snapshot popularity controls are reported as unavailable.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+
+def load_eval(path: Path):
+    spec = importlib.util.spec_from_file_location("eval_decision1", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["eval_decision1"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def state_sha256(state: object) -> str:
+    canonical = json.dumps(state, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def main() -> None:
+    eval_path, work, scores_path, out_path = map(Path, sys.argv[1:5])
+    ev = load_eval(eval_path)
+    receipt = ev.read_frozen_inputs(work)
+    folds_sha = hashlib.sha256((work / "folds.json").read_bytes()).hexdigest()
+    if folds_sha != receipt.folds_sha256:
+        raise SystemExit("folds.json differs from the frozen receipt")
+    folds = ev.checked_folds(work, None, receipt)
+
+    scores: dict[tuple[int, str, str], dict] = {}
+    identities = set()
+    for line in scores_path.open():
+        row = json.loads(line)
+        key = (row["fold"], row["story_id"], row["variant"])
+        if key in scores:
+            raise SystemExit(f"duplicate score for {key}")
+        scores[key] = row
+        identities.add(json.dumps(row["identity"], sort_keys=True))
+    if len(identities) != 1:
+        raise SystemExit(f"mixed score identities: {identities}")
+
+    seed, sample = 0, None
+    rows: dict[str, list[dict]] = {}
+    paired: dict[str, list] = {}
+    profile_paired = []
+    fold_info = []
+    used = 0
+    for fold in folds:
+        indexes = ev.selected(fold, sample, seed)
+        labels = np.asarray([fold.labels[i] for i in indexes])
+        prod = np.asarray([fold.production[i] for i in indexes], dtype=float)
+        model_scores = {}
+        for variant in ("real", "empty"):
+            values = []
+            for i in indexes:
+                card = fold.candidates[i]
+                row = scores.get((fold.fold, str(card.id), variant))
+                if row is None:
+                    raise SystemExit(f"missing score: fold {fold.fold} story {card.id} {variant}")
+                if row["state_sha256"] != state_sha256(ev.profile_state(fold, card, variant)):
+                    raise SystemExit(f"state mismatch: fold {fold.fold} story {card.id} {variant}")
+                values.append(row["score"])
+                used += 1
+            model_scores[variant] = np.asarray(values, dtype=float)
+        w = ev.PRIMARY_BLEND_WEIGHT
+        variants = {"production": prod, "laya_real": model_scores["real"],
+                    "laya_empty": model_scores["empty"]}
+        for variant in ("real", "empty"):
+            variants[f"blend_{variant}_w{w}"] = (1 - w) * ev._pct(prod) + w * ev._pct(model_scores[variant])
+        profile_paired.append((model_scores["empty"], model_scores["real"], labels))
+        for name, s in variants.items():
+            rows.setdefault(name, []).append(ev.metrics(s, labels))
+            paired.setdefault(name, []).append((prod, s, labels))
+        fold_info.append({"fold": fold.fold, "scored_candidates": len(indexes),
+                          "held_out_up": int((labels == ev.UP).sum()),
+                          "held_out_down": int((labels == ev.DOWN).sum()),
+                          "held_out_neutral": int((labels == ev.NEUTRAL).sum())})
+    if used != len(scores):
+        raise SystemExit(f"score file has {len(scores)} rows but {used} were selected")
+
+    summary = {}
+    for name, per_fold in rows.items():
+        entry: dict[str, object] = {}
+        for metric in ev.METRIC_NAMES:
+            values = [r[metric] for r in per_fold]
+            base = [r[metric] for r in rows["production"]]
+            ok = [(v, b) for v, b in zip(values, base, strict=True) if v is not None and b is not None]
+            diffs = [v - b for v, b in ok]
+            entry[metric] = {
+                "per_fold": values,
+                "mean": float(np.mean([v for v, _ in ok])) if ok else None,
+                "diff_vs_production": float(np.mean(diffs)) if diffs else None,
+                "diff_ci95_fold_bootstrap": ev._bootstrap_ci(diffs, seed=seed) if diffs and name != "production" else None,
+                "sign_test_p": ev._sign_test(diffs) if diffs and name != "production" else None,
+            }
+        if name != "production":
+            entry["pooled_auc_up_vs_rest_diff_story_bootstrap"] = ev.auc_comparison(paired[name], seed)
+        summary[name] = entry
+
+    out = {
+        "model_identity": json.loads(identities.pop()),
+        "folds_sha256": folds_sha,
+        "frozen_inputs": {"folds_sha256": receipt.folds_sha256, "snapshot_sha256": receipt.snapshot_sha256},
+        "sample_per_fold": sample, "seed": seed, "folds": fold_info, "summary": summary,
+        "primary_blend_weight": ev.PRIMARY_BLEND_WEIGHT,
+        "primary_real_minus_empty_auc": ev.auc_comparison(profile_paired, seed),
+        "inference_scope": "exploratory frozen folds; confirmation set not accessed",
+        "confirmation_used": False, "coverage_complete": True,
+        "unavailable_controls": {"snapshot_points_and_comments": "frozen snapshot.db no longer present on the VPS"},
+        "not_strands": "Different model (Laya-multilingual); not evidence about the Strands decider",
+    }
+    out_path.write_text(json.dumps(out, indent=2, allow_nan=False) + "\n")
+    print(json.dumps({"primary_real_minus_empty_auc": out["primary_real_minus_empty_auc"],
+                      **{n: {"auc_up_vs_rest": summary[n]["auc_up_vs_rest"]["mean"],
+                             "diff": summary[n]["auc_up_vs_rest"]["diff_vs_production"],
+                             "pooled_diff": summary[n].get("pooled_auc_up_vs_rest_diff_story_bootstrap")}
+                         for n in summary}}, indent=1))
+
+
+if __name__ == "__main__":
+    main()

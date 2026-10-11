@@ -1,0 +1,175 @@
+"""Score frozen decision1 real/empty jobs with Julia-1 or Mira-v1 (pilot or resumable run).
+
+Output rows match laya_full.py (request hash, fold, story, variant, state hash,
+score, identity), so laya_report.py reports any backend. Rows are scored one at a
+time (batching was slower on this CPU for Laya); the first row of every chunk is
+rescored and must agree within the tolerance.
+
+Mira-v1 has no documented yes/no protocol. This scorer uses the card's
+cross-encoder recipe (CLS of "state [SEP] option" through heads.pt scorer) with
+two options built from the question's true/false criteria and the published noul
+temperature 0.3. That is an approximation, not the authors' served path.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import random
+import time
+from pathlib import Path
+
+THREADS = int(os.environ.get("PILOT_THREADS", "3"))
+for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+    os.environ[var] = str(THREADS)
+
+import torch  # noqa: E402
+
+torch.set_num_threads(THREADS)
+
+PINS = {
+    "julia": ("SupersonicLabs/Julia-1", "a85b127321d580d65176c89ced8273f305745d85"),
+    "mira": ("sagea-ai/Mira-v1", "2834931e00ff770d99013d882c92f431052f9de8"),
+}
+
+
+def state_sha256(state: object) -> str:
+    canonical = json.dumps(state, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+class Julia:
+    def __init__(self, path: Path) -> None:
+        from julia import load_model
+
+        self.engine = load_model(str(path), device="cpu", strict_encoding=True,
+                                 max_length=8192, head_length=512)
+
+    def score(self, job: dict) -> float:
+        result = self.engine.predict(state=job["state"], questions=job["question"])
+        return float(result["answers"]["upvote"]["noul"])
+
+
+class Mira:
+    TEMPERATURE = 0.3  # calibrators.json "noul"
+
+    def __init__(self, path: Path) -> None:
+        from transformers import AutoModel, AutoTokenizer
+
+        self.tok = AutoTokenizer.from_pretrained(str(path))
+        self.enc = AutoModel.from_pretrained(str(path)).eval()
+        heads = torch.load(path / "heads.pt", map_location="cpu", weights_only=True)
+        self.w = heads["scorer"]["weight"]
+        self.b = heads["scorer"]["bias"]
+
+    @torch.no_grad()
+    def score(self, job: dict) -> float:
+        q = job["question"]["upvote"]
+        state = json.dumps(job["state"], ensure_ascii=False)
+        texts = [f"{state} [SEP] {q['instructions']} {q['criteria'][k]}" for k in ("true", "false")]
+        batch = self.tok(texts, padding=True, truncation=True, max_length=8192, return_tensors="pt")
+        hs = self.enc(**batch).last_hidden_state[:, 0]
+        logits = (hs @ self.w.T).squeeze(-1) + self.b
+        return float((logits / self.TEMPERATURE).softmax(-1)[0])
+
+
+def pilot_jobs(jobs: list[dict], pairs: int) -> list[dict]:
+    """Same selection as laya_pilot.py: fold 0 pairs spread over state length."""
+    by_story: dict[str, dict[str, dict]] = {}
+    for job in jobs:
+        if str(job["fold"]) == "0":
+            by_story.setdefault(job["story_id"], {})[job["variant"]] = job
+    complete = [v for v in by_story.values() if {"real", "empty"} <= v.keys()]
+    complete.sort(key=lambda v: len(json.dumps(v["real"]["state"])))
+    step = (len(complete) - 1) / (pairs - 1)
+    return [complete[round(i * step)][name] for i in range(pairs) for name in ("real", "empty")]
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("backend", choices=sorted(PINS))
+    ap.add_argument("model_dir", type=Path)
+    ap.add_argument("jobs", type=Path)
+    ap.add_argument("out", type=Path)
+    ap.add_argument("--pilot", type=int, help="score N fold-0 pairs, write a timing report")
+    ap.add_argument("--subset", type=Path)
+    ap.add_argument("--chunk", type=int, default=32)
+    ap.add_argument("--tolerance", type=float, default=1e-5)
+    args = ap.parse_args()
+
+    repo, revision = PINS[args.backend]
+    identity = {"model": repo, "revision": revision, "torch": torch.__version__,
+                "threads": THREADS, "protocol": "julia predict_typed noul" if args.backend == "julia"
+                else "approx: CLS scorer over true/false criteria options, T=0.3"}
+    jobs = [json.loads(line) for line in args.jobs.open() if line.strip()]
+    if args.subset:
+        stories = json.loads(args.subset.read_text())["stories"]
+        keep = {(int(f), s) for f, ids in stories.items() for s in ids}
+        jobs = [j for j in jobs if (int(j["fold"]), str(j["story_id"])) in keep]
+        if len(jobs) != 2 * len(keep):
+            raise SystemExit(f"subset matched {len(jobs)} jobs for {len(keep)} stories")
+
+    t = time.perf_counter()
+    model = (Julia if args.backend == "julia" else Mira)(args.model_dir)
+    load_s = time.perf_counter() - t
+
+    if args.pilot:
+        selected = pilot_jobs(jobs, args.pilot)
+        model.score(selected[0])  # warm-up
+        rows = []
+        for job in selected:
+            t0 = time.perf_counter()
+            s = model.score(job)
+            rows.append({"variant": job["variant"], "seconds": time.perf_counter() - t0,
+                         "score": s, "repeat_diff": abs(model.score(job) - s)})
+            print(json.dumps(rows[-1]), flush=True)
+        per = [r["seconds"] for r in rows]
+        report = {"identity": identity, "load_s": load_s, "rows": rows,
+                  "seconds_per_score": sum(per) / len(per),
+                  "real_mean_s": sum(r["seconds"] for r in rows if r["variant"] == "real") / args.pilot,
+                  "empty_mean_s": sum(r["seconds"] for r in rows if r["variant"] == "empty") / args.pilot,
+                  "max_repeat_diff": max(r["repeat_diff"] for r in rows), "published_scores": 0}
+        args.out.write_text(json.dumps(report, indent=1))
+        print(json.dumps({k: v for k, v in report.items() if k != "rows"}), flush=True)
+        return
+
+    done: set[str] = set()
+    if args.out.exists():
+        for line in args.out.open():
+            row = json.loads(line)
+            if row["identity"] != identity:
+                raise SystemExit(f"score file identity mismatch: {row['identity']}")
+            done.add(row["request_sha256"])
+    pending = [j for j in jobs if j["request_sha256"] not in done]
+    random.Random(0).shuffle(pending)  # mix lengths so the ETA is representative
+    print(json.dumps({"jobs": len(jobs), "done": len(done), "pending": len(pending),
+                      "identity": identity, "load_s": load_s}), flush=True)
+    start = time.perf_counter()
+    scored = 0
+    with args.out.open("a") as out:
+        for c in range(0, len(pending), args.chunk):
+            chunk = pending[c:c + args.chunk]
+            scores = [model.score(j) for j in chunk]
+            diff = abs(model.score(chunk[0]) - scores[0])
+            if diff > args.tolerance:
+                raise SystemExit(f"repeat disagreement {diff} on {chunk[0]['request_sha256']}")
+            for j, s in zip(chunk, scores, strict=True):
+                out.write(json.dumps({
+                    "request_sha256": j["request_sha256"], "fold": int(j["fold"]),
+                    "story_id": str(j["story_id"]), "variant": j["variant"],
+                    "state_sha256": state_sha256(j["state"]), "score": s,
+                    "identity": identity}) + "\n")
+            out.flush()
+            os.fsync(out.fileno())
+            scored += len(chunk)
+            rate = (time.perf_counter() - start) / scored
+            print(json.dumps({"scored": len(done) + scored, "of": len(jobs),
+                              "s_per_score": round(rate, 3), "check_diff": diff,
+                              "eta_min": round(rate * (len(pending) - scored) / 60, 1)}), flush=True)
+    print(json.dumps({"complete": True, "scored_now": scored}), flush=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,25 @@
+import json, random, sys
+import numpy as np
+folds = json.load(open("/tmp/decision1-eval/work_heldout/folds.json"))
+rows = [json.loads(l) for l in open("/tmp/smalldec/out/scores-subset100-julia.jsonl")]
+sc = {(r["fold"], r["story_id"], r["variant"]): r["score"] for r in rows}
+def auc(s, y):
+    s, y = np.asarray(s), np.asarray(y); u, o = s[y == 2], s[y != 2]
+    return float(((u[:, None] > o[None]).sum() + .5 * (u[:, None] == o[None]).sum()) / (len(u) * len(o)))
+allr, alle, ally, allp = [], [], [], []
+for k, f in enumerate(folds):
+    idx = [i for i, c in enumerate(f["candidates"]) if (k, str(c["id"]), "real") in sc]
+    y = [f["labels"][i] for i in idx]; ids = [str(f["candidates"][i]["id"]) for i in idx]
+    r = [sc[(k, s, "real")] for s in ids]; e = [sc[(k, s, "empty")] for s in ids]
+    p = [f["production"][i] for i in idx]
+    print(k, "n", len(y), "up", sum(v == 2 for v in y), "down", sum(v in (-1, 0) for v in y),
+          "real", round(auc(r, y), 3), "empty", round(auc(e, y), 3),
+          "spearman(real,prod)", round(float(np.corrcoef(np.argsort(np.argsort(r)), np.argsort(np.argsort(p)))[0, 1]), 3),
+          "spearman(real,empty)", round(float(np.corrcoef(np.argsort(np.argsort(r)), np.argsort(np.argsort(e)))[0, 1]), 3),
+          "real sd", round(float(np.std(r)), 4))
+    allr += r; alle += e; ally += y
+rng = random.Random(0); n = len(ally); bs = []
+for _ in range(2000):
+    i = [rng.randrange(n) for _ in range(n)]
+    bs.append(auc([allr[j] for j in i], [ally[j] for j in i]))
+print("pooled real", round(auc(allr, ally), 3), "ci95", [round(float(x), 3) for x in np.percentile(bs, [2.5, 97.5])])

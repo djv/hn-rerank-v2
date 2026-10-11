@@ -1,0 +1,298 @@
+"""Julia-1 on short, in-distribution inputs: two variants on the 100/fold subset.
+
+q:     state = story card only; the question instructions carry the fold's most
+       recent upvoted/downvoted titles, as many as fit Julia's 512-token
+       question budget (strict encoding, lossless).
+short: state = {"story", "reader_profile"} with the story first and a profile cut
+       so the whole sequence fits 1,024 tokens (Julia's benchmark length).
+Profile size is fixed per fold (sized for the fold's longest story), titles taken
+most-recent-first at a 3:2 up:down ratio like the original 60/40 profile.
+
+Protocol (pre-fixed before any scores): `select` scores fold 0 for both variants
+and picks the higher fold-0 AUC(up vs rest); `confirm` scores folds 1-4 with the
+picked variant; `report` gives folds 1-4 pooled as the confirmatory result.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import random
+import sys
+import time
+from pathlib import Path
+
+THREADS = int(os.environ.get("PILOT_THREADS", "3"))
+for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+    os.environ[var] = str(THREADS)
+
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
+
+torch.set_num_threads(THREADS)
+
+MODEL = ("SupersonicLabs/Julia-1", "a85b127321d580d65176c89ced8273f305745d85")
+HEAD = 512
+SHORT_MAX = 1024
+Q_INSTRUCTIONS = ("Would this Hacker News reader upvote this story? Judge only from the titles "
+                  "they recently upvoted and downvoted, listed here. Upvoted: {up}. Downvoted: {down}.")
+
+
+def counts(k: int) -> tuple[int, int]:
+    up = -(-3 * k // 5)
+    return up, k - up
+
+
+def build(variant: str, job: dict, n_up: int, n_down: int) -> tuple[object, dict]:
+    prof, story = job["state"]["reader_profile"], job["state"]["story"]
+    ups, downs = prof["recently_upvoted"][:n_up], prof["recently_downvoted"][:n_down]
+    q = dict(job["question"]["upvote"])
+    if variant == "q":
+        q["instructions"] = Q_INSTRUCTIONS.format(up=" | ".join(ups) or "(none)",
+                                                  down=" | ".join(downs) or "(none)")
+        return story, {"upvote": q}
+    state = {"story": story, "reader_profile": {"recently_upvoted": ups, "recently_downvoted": downs}}
+    return state, {"upvote": q}
+
+
+def fits(tok, sequence, variant: str, job: dict, n_up: int, n_down: int) -> bool:
+    state, questions = build(variant, job, n_up, n_down)
+    q = questions["upvote"]
+    row = dict(state=state, question=q["instructions"], type="noul",
+               options=[q["criteria"]["false"], q["criteria"]["true"]])
+    try:
+        sequence(tok, row, SHORT_MAX if variant == "short" else 8192, HEAD, strict=True)
+    except ValueError:
+        return False
+    return True
+
+
+def profile_size(tok, sequence, variant: str, jobs: list[dict]) -> tuple[int, int]:
+    """Largest k (3:2 split) that fits every job of the fold."""
+    prof = jobs[0]["state"]["reader_profile"]
+    lo, hi = 0, len(prof["recently_upvoted"]) + len(prof["recently_downvoted"])
+    while lo < hi:
+        k = (lo + hi + 1) // 2
+        if all(fits(tok, sequence, variant, j, *counts(k)) for j in jobs):
+            lo = k
+        else:
+            hi = k - 1
+    if lo == 0:
+        raise SystemExit(f"{variant}: no profile fits")
+    return counts(lo)
+
+
+def auc(s: np.ndarray, y: np.ndarray) -> float:
+    u, o = s[y == 2], s[y != 2]
+    return float(((u[:, None] > o[None]).sum() + 0.5 * (u[:, None] == o[None]).sum()) / (len(u) * len(o)))
+
+
+def pct(s: np.ndarray) -> np.ndarray:
+    order = s.argsort(kind="stable")
+    ranks = np.empty(len(s))
+    ranks[order] = np.arange(1, len(s) + 1)
+    for v in np.unique(s):
+        m = s == v
+        if m.sum() > 1:
+            ranks[m] = ranks[m].mean()
+    return ranks / len(s)
+
+
+def load_jobs(path: Path, subset: Path) -> dict[int, list[dict]]:
+    keep = {(int(f), s) for f, ids in json.loads(subset.read_text())["stories"].items() for s in ids}
+    by_fold: dict[int, list[dict]] = {}
+    for line in path.open():
+        j = json.loads(line)
+        if j["variant"] == "real" and (int(j["fold"]), str(j["story_id"])) in keep:
+            by_fold.setdefault(int(j["fold"]), []).append(j)
+    if sum(map(len, by_fold.values())) != len(keep):
+        raise SystemExit("subset/job mismatch")
+    return by_fold
+
+
+def score(args, variant: str, folds: list[int], by_fold: dict[int, list[dict]]) -> None:
+    sys.path.insert(0, str(args.model_dir))
+    from julia import load_model
+    from julia.data import sequence
+
+    engine = load_model(str(args.model_dir), device="cpu", strict_encoding=True,
+                        max_length=8192, head_length=HEAD)
+    tok = engine.tokenizer if hasattr(engine, "tokenizer") else engine.collate.tokenizer
+    identity = {"model": MODEL[0], "revision": MODEL[1], "torch": torch.__version__,
+                "variant": variant, "head_length": HEAD, "short_max": SHORT_MAX}
+    out = args.out_dir / f"scores-{variant}.jsonl"
+    done = set()
+    if out.exists():
+        for line in out.open():
+            r = json.loads(line)
+            if r["identity"] != identity:
+                raise SystemExit(f"identity mismatch in {out}")
+            done.add((r["fold"], r["story_id"]))
+    for fold in folds:
+        jobs = by_fold[fold]
+        n_up, n_down = profile_size(tok, sequence, variant, jobs)
+        pending = [j for j in jobs if (fold, str(j["story_id"])) not in done]
+        random.Random(fold).shuffle(pending)
+        print(json.dumps({"variant": variant, "fold": fold, "n_up": n_up, "n_down": n_down,
+                          "pending": len(pending)}), flush=True)
+        start = time.perf_counter()
+        with out.open("a") as fh:
+            for i, j in enumerate(pending):
+                state, questions = build(variant, j, n_up, n_down)
+                s = float(engine.predict(state=state, questions=questions)["answers"]["upvote"]["noul"])
+                if i == 0:
+                    again = float(engine.predict(state=state, questions=questions)["answers"]["upvote"]["noul"])
+                    if abs(again - s) > 1e-5:
+                        raise SystemExit(f"repeat disagreement {abs(again - s)}")
+                req = hashlib.sha256(json.dumps([state, questions], sort_keys=True,
+                                                ensure_ascii=False).encode()).hexdigest()
+                fh.write(json.dumps({"fold": fold, "story_id": str(j["story_id"]), "score": s,
+                                     "n_up": n_up, "n_down": n_down, "request_sha256": req,
+                                     "identity": identity}) + "\n")
+                fh.flush()
+        n = max(len(pending), 1)
+        print(json.dumps({"variant": variant, "fold": fold, "s_per_score":
+                          round((time.perf_counter() - start) / n, 3)}), flush=True)
+
+
+class Mira:
+    """Approximate noul protocol (no documented one): CLS scorer over the
+    false/true criteria as two options; the card's "state [SEP] option" recipe."""
+
+    def __init__(self, path: Path) -> None:
+        from transformers import AutoModel, AutoTokenizer
+
+        self.tok = AutoTokenizer.from_pretrained(str(path))
+        self.enc = AutoModel.from_pretrained(str(path)).eval()
+        heads = torch.load(path / "heads.pt", map_location="cpu", weights_only=True)
+        self.w, self.b = heads["scorer"]["weight"], heads["scorer"]["bias"]
+
+    @torch.no_grad()
+    def score(self, state: object, questions: dict) -> float:
+        q = questions["upvote"]
+        text = json.dumps(state, ensure_ascii=False)
+        texts = [f"{text} [SEP] {q['instructions']} {q['criteria'][k]}" for k in ("true", "false")]
+        batch = self.tok(texts, padding=True, truncation=False, return_tensors="pt")
+        logits = (self.enc(**batch).last_hidden_state[:, 0] @ self.w.T).squeeze(-1) + self.b
+        # Rank by the raw true-minus-false logit gap: softmax(l / 0.3) saturates to exact
+        # 0/1 in float32 for confident stories, and those ties would blunt AUC.
+        return float(logits[0].double() - logits[1].double())
+
+
+def score_mira(args, variant: str, by_fold: dict[int, list[dict]]) -> None:
+    """Mira-v1 on the variant Julia picked, same per-fold profile sizes, all 5 folds."""
+    sizes = {}
+    for line in (args.out_dir / f"scores-{variant}.jsonl").open():
+        r = json.loads(line)
+        sizes.setdefault(r["fold"], (r["n_up"], r["n_down"]))
+    model = Mira(args.mira_dir)
+    identity = {"model": "sagea-ai/Mira-v1", "revision": "2834931e00ff770d99013d882c92f431052f9de8",
+                "torch": torch.__version__, "variant": variant,
+                "protocol": "approx: CLS scorer over true/false criteria options, score = logit gap"}
+    out = args.out_dir / f"scores-mira-{variant}.jsonl"
+    done = {(r["fold"], r["story_id"]) for r in map(json.loads, out.open())} if out.exists() else set()
+    for fold in range(5):
+        n_up, n_down = sizes[fold]
+        pending = [j for j in by_fold[fold] if (fold, str(j["story_id"])) not in done]
+        start = time.perf_counter()
+        with out.open("a") as fh:
+            for i, j in enumerate(pending):
+                state, questions = build(variant, j, n_up, n_down)
+                s = model.score(state, questions)
+                if i == 0 and abs(model.score(state, questions) - s) > 1e-5:
+                    raise SystemExit("mira repeat disagreement")
+                fh.write(json.dumps({"fold": fold, "story_id": str(j["story_id"]), "score": s,
+                                     "n_up": n_up, "n_down": n_down, "identity": identity}) + "\n")
+                fh.flush()
+        print(json.dumps({"mira": variant, "fold": fold, "s_per_score":
+                          round((time.perf_counter() - start) / max(len(pending), 1), 3)}), flush=True)
+
+
+def fold_arrays(folds_json: list, scores: dict, fold: int):
+    f = folds_json[fold]
+    idx = [i for i, c in enumerate(f["candidates"]) if (fold, str(c["id"])) in scores]
+    y = np.asarray([f["labels"][i] for i in idx])
+    s = np.asarray([scores[(fold, str(f["candidates"][i]["id"]))] for i in idx])
+    p = np.asarray([f["production"][i] for i in idx], dtype=float)
+    return s, p, y
+
+
+def read_scores(path: Path) -> dict:
+    return {(r["fold"], r["story_id"]): r["score"] for r in map(json.loads, path.open())}
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("phase", choices=["select", "confirm", "report", "mira", "mira-report"])
+    ap.add_argument("--mira-dir", type=Path, default=Path("/tmp/smalldec/models/Mira-v1"))
+    ap.add_argument("--model-dir", type=Path, default=Path("/tmp/smalldec/models/Julia-1"))
+    ap.add_argument("--jobs", type=Path, default=Path(
+        "/tmp/decision1-eval/work_heldout/paired_plans_v3/"
+        "e37bdffbed7255febbada9b6e5b1a34479be700f6630b73a2cf8761e33ea5f6a/jobs.jsonl"))
+    ap.add_argument("--subset", type=Path, default=Path("/tmp/laya-pilot/full/subset-100.json"))
+    ap.add_argument("--work", type=Path, default=Path("/tmp/decision1-eval/work_heldout"))
+    ap.add_argument("--out-dir", type=Path, default=Path("/tmp/smalldec/out/julia-variants"))
+    args = ap.parse_args()
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    by_fold = load_jobs(args.jobs, args.subset)
+    folds_json = json.loads((args.work / "folds.json").read_text())
+    pick_path = args.out_dir / "selection.json"
+
+    if args.phase == "select":
+        for v in ("q", "short"):
+            score(args, v, [0], by_fold)
+        aucs = {}
+        for v in ("q", "short"):
+            s, p, y = fold_arrays(folds_json, read_scores(args.out_dir / f"scores-{v}.jsonl"), 0)
+            aucs[v] = auc(s, y)
+        pick = max(aucs, key=aucs.get)
+        pick_path.write_text(json.dumps({"fold0_auc_up_vs_rest": aucs, "picked": pick}, indent=1))
+        print(json.dumps({"fold0_auc_up_vs_rest": aucs, "picked": pick}), flush=True)
+    elif args.phase == "confirm":
+        pick = json.loads(pick_path.read_text())["picked"]
+        score(args, pick, [1, 2, 3, 4], by_fold)
+    elif args.phase == "mira":
+        pick = json.loads(pick_path.read_text())["picked"]
+        score_mira(args, pick, by_fold)
+    else:
+        sel = json.loads(pick_path.read_text())
+        pick = sel["picked"]
+        name = f"mira-{pick}" if args.phase == "mira-report" else pick
+        scores = read_scores(args.out_dir / f"scores-{name}.jsonl")
+        base = read_scores_old(Path("/tmp/smalldec/out/scores-subset100-julia.jsonl"))
+        result: dict = {"selection": sel, "per_fold": {}}
+        S, P, Y, E = [], [], [], []
+        for fold in range(5):
+            s, p, y = fold_arrays(folds_json, scores, fold)
+            e, _, _ = fold_arrays(folds_json, base, fold)
+            result["per_fold"][fold] = {"n": len(y), "up": int((y == 2).sum()), "julia": auc(s, y),
+                                        "julia_empty_prev": auc(e, y), "production": auc(p, y),
+                                        "blend_w0.2": auc(0.8 * pct(p) + 0.2 * pct(s), y),
+                                        "score_sd": float(s.std())}
+            if fold:
+                S.append(pct(s)); P.append(pct(p)); Y.append(y); E.append(pct(e))
+        s, p, y, e = map(np.concatenate, (S, P, Y, E))
+        rng = np.random.default_rng(0)
+        boot = {"julia": [], "blend_minus_prod": []}
+        for _ in range(2000):
+            i = rng.integers(0, len(y), len(y))
+            boot["julia"].append(auc(s[i], y[i]))
+            boot["blend_minus_prod"].append(auc(0.8 * p[i] + 0.2 * s[i], y[i]) - auc(p[i], y[i]))
+        result["confirm_folds_1_4_pooled_within_fold_pct"] = {
+            "julia": auc(s, y), "julia_ci95": np.percentile(boot["julia"], [2.5, 97.5]).tolist(),
+            "julia_empty_prev": auc(e, y), "production": auc(p, y),
+            "blend_w0.2": auc(0.8 * p + 0.2 * s, y),
+            "blend_minus_prod_ci95": np.percentile(boot["blend_minus_prod"], [2.5, 97.5]).tolist()}
+        (args.out_dir / f"report-{name}.json").write_text(json.dumps(result, indent=1))
+        print(json.dumps(result, indent=1), flush=True)
+
+
+def read_scores_old(path: Path) -> dict:
+    return {(r["fold"], r["story_id"]): r["score"] for r in map(json.loads, path.open())
+            if r["variant"] == "empty"}
+
+
+if __name__ == "__main__":
+    main()

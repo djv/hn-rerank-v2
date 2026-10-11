@@ -1,5 +1,17 @@
 # HN Rerank findings
 
+## Small decision models, tiny fine-tune and zero-shot tags — 2026-10-11
+
+No cheap VPS-CPU model adds ranking signal over production (pooled AUC up vs rest
+0.781 on 2,066 frozen held-out stories). Zero-shot decision models reading the
+reader profile (Laya partial, Julia-1, Mira-v1) score near chance; their w0.2
+blends are flat or worse. An Ettin-17M fine-tune (25 min for 5 folds) reaches 0.676,
+the same as TF-IDF (0.672), and its blend changes production by +0.0007
+[-0.004, +0.006]. Zero-shot tags: rules are valid only for show_hn and paywalled;
+embedding prototypes fail on negation; Julia-1 tags fail the silver validity bar;
+no tag arm improves the blend (noise control -0.007). User stopped the line.
+Evidence: [results](docs/evaluations/decision1-20261010/SMALLDEC-TAGGING-RESULTS-20261011.md).
+
 ## Live terminal-buffer inspection — 2026-10-09
 
 The comparison completed: eight isolated VPS Pilot checks passed, lint/format/

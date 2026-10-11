@@ -1,0 +1,20 @@
+"""Token-length survey of all frozen jobs under Laya-multilingual's tokenizer (no inference)."""
+
+import json
+import sys
+
+import numpy as np
+from laya.common import serialize_state
+from transformers import AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained(sys.argv[2])
+lengths = {"real": [], "empty": []}
+for line in open(sys.argv[1]):
+    if line.strip():
+        job = json.loads(line)
+        text = serialize_state(job["state"]).replace(tok.mask_token, " ")
+        lengths[job["variant"]].append(len(tok(text, add_special_tokens=False)["input_ids"]))
+for variant, values in lengths.items():
+    arr = np.asarray(values)
+    print(variant, len(arr), {p: int(np.percentile(arr, p)) for p in (0, 50, 90, 99, 100)},
+          "over3800", int((arr > 3800).sum()), "over8000", int((arr > 8000).sum()))

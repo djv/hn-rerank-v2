@@ -1,0 +1,65 @@
+{
+ "tags": {
+  "show_hn": {
+   "q": "Is the author presenting a project they made themselves (a Show HN style post)?",
+   "true": "The poster presents their own project, tool, app or creation.",
+   "false": "It is not the poster presenting their own creation."
+  },
+  "ask_hn": {
+   "q": "Is this a question or discussion prompt posted to the community rather than a link to an article?",
+   "true": "It asks the community a question or opens a discussion, with no external article.",
+   "false": "It links to an external article, page or project."
+  },
+  "research": {
+   "q": "Is this a research paper or preprint, or an article mainly reporting one study's findings?",
+   "true": "It is a paper or preprint, or mainly reports a specific study.",
+   "false": "It is not about a specific research paper or study."
+  },
+  "tutorial": {
+   "q": "Does this teach the reader how to do something, step by step?",
+   "true": "It is a tutorial, guide or how-to.",
+   "false": "It does not teach a procedure."
+  },
+  "opinion": {
+   "q": "Is this mainly an argued personal essay or opinion piece?",
+   "true": "It argues a personal view or opinion.",
+   "false": "It mainly reports, documents, announces or teaches."
+  },
+  "news_event": {
+   "q": "Does this report a recent event, such as a release, outage, acquisition, lawsuit or death?",
+   "true": "It reports a specific recent event.",
+   "false": "It is not a report of a recent event."
+  },
+  "business": {
+   "q": "Is this about a company's business: funding, earnings, layoffs, markets or strategy?",
+   "true": "Its main subject is business, money or company strategy.",
+   "false": "Business is not its main subject."
+  },
+  "politics_policy": {
+   "q": "Is this about government, law, regulation, courts or elections?",
+   "true": "Its main subject is politics, law or public policy.",
+   "false": "Politics, law and policy are not its main subject."
+  },
+  "ai_ml": {
+   "q": "Is this mainly about artificial intelligence or machine learning?",
+   "true": "Its main subject is AI, ML or language models.",
+   "false": "AI and ML are not its main subject."
+  },
+  "product_pr": {
+   "q": "Is this a company announcing or promoting its own product or feature?",
+   "true": "A company announces or promotes its own product, feature or service.",
+   "false": "It is not a company promoting its own product."
+  },
+  "sensational": {
+   "q": "Does the title overstate, bait or sensationalize?",
+   "true": "The title is clickbait, overstated or sensational.",
+   "false": "The title is plain and accurate in tone."
+  },
+  "paywalled": {
+   "q": "Is this story's source usually behind a paywall?",
+   "true": "The source usually requires a subscription to read.",
+   "false": "The source is usually free to read."
+  }
+ },
+ "sha256": "990638e56a83d279a3df3ba96f5cc7daa025e364fa836e50dcf29450c6086464"
+}

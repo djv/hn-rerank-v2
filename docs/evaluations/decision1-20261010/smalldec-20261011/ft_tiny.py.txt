@@ -1,0 +1,251 @@
+"""Fine-tune a tiny encoder (Ettin-17M) on every frozen decision1 fold, plus a TF-IDF baseline.
+
+Per fold: the fold's training votes (evaluator_report training_story_ids, labels from the
+feedback table) ordered by vote time; the latest 15% is a validation slice and the rest is
+trained on. Up to 3 epochs (lr 1e-4, batch 32, 192 tokens, seed 0; all fixed in advance).
+After each epoch the validation slice and the held-out fold are scored; the held-out
+scores of the epoch with the best validation AUC are kept. The TF-IDF logistic regression
+picks its L2 strength on the same validation slice. Held-out labels are read only for the
+report. Primary number: pooled AUC(up vs rest) of the 0.2 percentile blend with production
+minus production, story bootstrap, over all 5 folds.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import random
+import re
+import sqlite3
+import sys
+import time
+from collections import Counter
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ft_fold as base  # noqa: E402  (sets thread env vars before torch loads)
+
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
+
+VAL_FRACTION = 0.15
+BLEND_W = 0.2
+
+
+def prep(work: Path, db: Path, k: int) -> dict:
+    folds = json.loads((work / "folds.json").read_text())
+    fold = folds[k]
+    meta = json.loads((work / "evaluator_report.json").read_text())["config"]["folds"][k]
+    assert meta["fold"] == k + 1, meta["fold"]
+    train_ids = [int(s) for s in meta["training_story_ids"]]
+    assert len(train_ids) == meta["training_rows"] == sum(fold["train_counts"].values())
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    fb = {sid: (action, t) for sid, action, t in
+          con.execute("SELECT story_id, action, updated_at FROM feedback WHERE user_id = 1")}
+    test_ids = [c["id"] for c in fold["candidates"]]
+    if set(train_ids) & set(test_ids):
+        raise SystemExit("training/held-out overlap")
+    have = base.cards(db, train_ids + test_ids)
+    keys = ("title", "domain", "source", "text")
+    drift = [c["id"] for c in fold["candidates"]
+             if {x: have.get(c["id"], {}).get(x) for x in keys} != {x: c[x] for x in keys}]
+    if drift:
+        raise SystemExit(f"fold {k}: {len(drift)} held-out cards differ from folds.json")
+    if missing := [i for i in train_ids if i not in have]:
+        raise SystemExit(f"fold {k}: {len(missing)} training stories have no card")
+    y_all = np.asarray([base.LABEL[fb[i][0]] for i in train_ids])
+    assert {x: int((y_all == v).sum()) for x, v in base.LABEL.items()} == fold["train_counts"]
+    if fold.get("profile_ids"):
+        assert set(fold["profile_ids"]) <= set(train_ids)
+    order = sorted(range(len(train_ids)), key=lambda i: (fb[train_ids[i]][1], train_ids[i]))
+    n_val = round(VAL_FRACTION * len(order))
+    tr, va = order[:-n_val], order[-n_val:]
+    text = {i: base.render(have[i]) for i in train_ids + test_ids}
+    return {
+        "train_text": [text[train_ids[i]] for i in tr], "train_y": y_all[tr],
+        "val_text": [text[train_ids[i]] for i in va], "val_y": y_all[va],
+        "test_ids": test_ids, "test_text": [text[i] for i in test_ids],
+        "test_y": np.asarray(fold["labels"]), "prod": np.asarray(fold["production"], dtype=float),
+    }
+
+
+def encode(tok, texts: list[str], max_tokens: int) -> list[list[int]]:
+    return tok(texts, truncation=True, max_length=max_tokens)["input_ids"]
+
+
+@torch.no_grad()
+def predict(model, tok, ids: list[list[int]], batch: int = 64) -> np.ndarray:
+    model.eval()
+    out = []
+    for b in range(0, len(ids), batch):
+        enc = tok.pad({"input_ids": ids[b:b + batch]}, return_tensors="pt")
+        out.extend(model(**enc).logits.squeeze(-1).tolist())
+    model.train()
+    return np.asarray(out)
+
+
+def finetune(d: dict, args) -> dict:
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+    random.seed(0)
+    torch.manual_seed(0)
+    tok = AutoTokenizer.from_pretrained(args.model_dir)
+    model = AutoModelForSequenceClassification.from_pretrained(args.model_dir, num_labels=1)
+    tr = encode(tok, d["train_text"], args.max_tokens)
+    va = encode(tok, d["val_text"], args.max_tokens)
+    te = encode(tok, d["test_text"], args.max_tokens)
+    target = torch.tensor((d["train_y"] == 2).astype(np.float32))
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    steps = args.epochs * math.ceil(len(tr) / args.batch)
+    sched = torch.optim.lr_scheduler.LambdaLR(
+        opt, lambda s: min(1.0, (s + 1) / (0.06 * steps)) * max(0.0, (steps - s) / steps))
+    rng = random.Random(0)
+    epochs = []
+    model.train()
+    for epoch in range(args.epochs):
+        t0 = time.perf_counter()
+        order = list(range(len(tr)))
+        rng.shuffle(order)
+        for b in range(0, len(order), args.batch):
+            idx = order[b:b + args.batch]
+            enc = tok.pad({"input_ids": [tr[i] for i in idx]}, return_tensors="pt")
+            logits = model(**enc).logits.squeeze(-1)
+            loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, target[idx])
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            sched.step()
+            opt.zero_grad()
+        val_s, test_s = predict(model, tok, va), predict(model, tok, te)
+        epochs.append({"epoch": epoch + 1, "val_auc": base.auc(val_s, d["val_y"]),
+                       "test_scores": test_s, "test_sd": float(test_s.std()),
+                       "seconds": time.perf_counter() - t0})
+        print(json.dumps({"epoch": epoch + 1, "val_auc": round(epochs[-1]["val_auc"], 4),
+                          "test_sd": round(epochs[-1]["test_sd"], 4),
+                          "seconds": round(epochs[-1]["seconds"], 1)}), flush=True)
+    best = max(epochs, key=lambda e: e["val_auc"])
+    return {"scores": best["test_scores"], "epoch": best["epoch"],
+            "val_auc_by_epoch": [round(e["val_auc"], 4) for e in epochs],
+            "seconds": sum(e["seconds"] for e in epochs)}
+
+
+def words(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9][a-z0-9+#.-]*", text.lower())
+
+
+def tfidf(d: dict) -> dict:
+    docs = [Counter(words(t)) for t in d["train_text"]]
+    df = Counter(w for doc in docs for w in doc)
+    vocab = {w: i for i, w in enumerate(sorted(w for w, c in df.items() if c >= 2))}
+    idf = np.zeros(len(vocab))
+    for w, i in vocab.items():
+        idf[i] = math.log((1 + len(docs)) / (1 + df[w])) + 1
+
+    def matrix(texts: list[str]) -> torch.Tensor:
+        x = np.zeros((len(texts), len(vocab)), dtype=np.float32)
+        for r, t in enumerate(texts):
+            for w, c in Counter(words(t)).items():
+                if w in vocab:
+                    x[r, vocab[w]] = (1 + math.log(c)) * idf[vocab[w]]
+        x /= np.maximum(np.linalg.norm(x, axis=1, keepdims=True), 1e-12)
+        return torch.from_numpy(x)
+
+    xt, xv, xs = matrix(d["train_text"]), matrix(d["val_text"]), matrix(d["test_text"])
+    y = torch.tensor((d["train_y"] == 2).astype(np.float32))
+    fits = []
+    for lam in (1e-4, 1e-3, 1e-2):
+        w = torch.zeros(len(vocab), requires_grad=True)
+        b = torch.zeros(1, requires_grad=True)
+        opt = torch.optim.LBFGS([w, b], max_iter=200, line_search_fn="strong_wolfe")
+
+        def closure():
+            opt.zero_grad()
+            loss = torch.nn.functional.binary_cross_entropy_with_logits(xt @ w + b, y) + lam * (w @ w)
+            loss.backward()
+            return loss
+
+        opt.step(closure)
+        with torch.no_grad():
+            fits.append({"lambda": lam, "val_auc": base.auc((xv @ w + b).numpy(), d["val_y"]),
+                         "scores": (xs @ w + b).numpy()})
+    best = max(fits, key=lambda f: f["val_auc"])
+    return {"scores": best["scores"], "lambda": best["lambda"], "vocab": len(vocab),
+            "val_auc_by_lambda": {str(f["lambda"]): round(f["val_auc"], 4) for f in fits}}
+
+
+def blend(prod: np.ndarray, s: np.ndarray) -> np.ndarray:
+    return (1 - BLEND_W) * base.pct(prod) + BLEND_W * base.pct(s)
+
+
+def pooled(per_fold: list[dict], key: str) -> dict:
+    """Within-fold percentiles pooled over folds; story bootstrap of blend minus production."""
+    s = np.concatenate([base.pct(np.asarray(f[key])) for f in per_fold])
+    p = np.concatenate([base.pct(np.asarray(f["prod"])) for f in per_fold])
+    y = np.concatenate([np.asarray(f["y"]) for f in per_fold])
+    bl = np.concatenate([blend(np.asarray(f["prod"]), np.asarray(f[key])) for f in per_fold])
+    rng = np.random.default_rng(0)
+    diffs, alone = [], []
+    for _ in range(2000):
+        i = rng.integers(0, len(y), len(y))
+        diffs.append(base.auc(bl[i], y[i]) - base.auc(p[i], y[i]))
+        alone.append(base.auc(s[i], y[i]))
+    return {"model": base.auc(s, y), "model_ci95": np.percentile(alone, [2.5, 97.5]).tolist(),
+            "production": base.auc(p, y), "blend_w0.2": base.auc(bl, y),
+            "blend_minus_production": base.auc(bl, y) - base.auc(p, y),
+            "blend_minus_production_ci95": np.percentile(diffs, [2.5, 97.5]).tolist()}
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--work", type=Path, default=Path("/tmp/decision1-eval/work_heldout"))
+    ap.add_argument("--db", type=Path, default=Path("/tmp/finetune/snapshot.db"))
+    ap.add_argument("--model-dir", required=True)
+    ap.add_argument("--model-id", default="jhu-clsp/ettin-encoder-17m@987607455c61e7a5bbc85f7758e0512ea6d0ae4c")
+    ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--folds", default="0,1,2,3,4")
+    ap.add_argument("--epochs", type=int, default=3)
+    ap.add_argument("--batch", type=int, default=32)
+    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--max-tokens", type=int, default=192)
+    args = ap.parse_args()
+
+    state = json.loads(args.out.read_text()) if args.out.exists() else {"folds": {}}
+    config = {"model": args.model_id, "epochs": args.epochs, "batch": args.batch, "lr": args.lr,
+              "max_tokens": args.max_tokens, "val_fraction": VAL_FRACTION, "seed": 0,
+              "threads": base.THREADS, "torch": torch.__version__}
+    if state.get("config", config) != config:
+        raise SystemExit(f"existing {args.out} has a different config")
+    state["config"] = config
+    for k in map(int, args.folds.split(",")):
+        if str(k) in state["folds"]:
+            continue
+        t0 = time.perf_counter()
+        d = prep(args.work, args.db, k)
+        print(json.dumps({"fold": k, "train": len(d["train_y"]), "val": len(d["val_y"]),
+                          "test": len(d["test_y"])}), flush=True)
+        ft = finetune(d, args)
+        tf = tfidf(d)
+        y, prod = d["test_y"], d["prod"]
+        row = {"y": y.tolist(), "prod": prod.tolist(), "ft": ft["scores"].tolist(), "tfidf": tf["scores"].tolist(),
+               "ids": d["test_ids"], "ft_epoch": ft["epoch"], "ft_val_auc_by_epoch": ft["val_auc_by_epoch"],
+               "tfidf_lambda": tf["lambda"], "tfidf_val_auc_by_lambda": tf["val_auc_by_lambda"],
+               "auc": {"ft": base.auc(ft["scores"], y), "tfidf": base.auc(tf["scores"], y),
+                       "production": base.auc(prod, y),
+                       "blend_ft": base.auc(blend(prod, ft["scores"]), y),
+                       "blend_tfidf": base.auc(blend(prod, tf["scores"]), y)},
+               "minutes": (time.perf_counter() - t0) / 60}
+        state["folds"][str(k)] = row
+        args.out.write_text(json.dumps(state))
+        print(json.dumps({"fold_done": k, "auc": {a: round(b, 4) for a, b in row["auc"].items()},
+                          "ft_epoch": ft["epoch"], "minutes": round(row["minutes"], 1)}), flush=True)
+    done = [state["folds"][k] for k in sorted(state["folds"])]
+    if len(done) == 5:
+        state["pooled"] = {"ft": pooled(done, "ft"), "tfidf": pooled(done, "tfidf")}
+        args.out.write_text(json.dumps(state))
+        print(json.dumps({"pooled": state["pooled"]}, indent=1), flush=True)
+
+
+if __name__ == "__main__":
+    main()
