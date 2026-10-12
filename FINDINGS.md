@@ -20,8 +20,9 @@ four reserves, so slot9 is explicitly a failing integration case.
 
 The DB opens read_only=True, profile cookies stay on a loopback origin, and
 API redirects/environment proxies are disabled. No POSTs, profile creation,
-score boosts, model fits, history clearing or forced summary generation.
-Exit0 PASS,1 FAIL/error,3 NOT_APPLICABLE; skips never count as a pass.
+score boosts, history clearing or forced summary generation. Ordinary feed
+GETs may queue server warming; the gate does not write feedback/interactions.
+Exit0 PASS,1 FAIL/error,2 invalid CLI,3 NOT_APPLICABLE; skips never count as a pass.
 This is a manual live ranking/deployment gate documented in AGENTS.md, not
 a new timer or an automatic source-pinning rule. Shared tool access row
 added in system-setup commit a485380 (documentation only).
@@ -38,11 +39,20 @@ Final source recheck after explicit proxy/redirect settings:1389 passed/
 match the checked VPS files. Approved Claude cloud review completed;
 M1's false PASS and L1's future-entry omission were reproduced against
 disposable fixtures. Report and concrete correction plan:
-docs/evaluations/import-ai-gate-review-20261012/. Reviewed code remains
-unchanged pending separate fix authorization; PASS is not yet reliable
-for mixed publisher/DB timestamps. No additional review was launched.
+docs/evaluations/import-ai-gate-review-20261012/. The user separately authorized the saved correction plan. Five new
+regressions failed against the original gate (mixed timestamps in both
+directions, no eligible windows, future newest entry and profile mismatch).
+Corrections use any matching stored row time for window eligibility while
+keeping publisher freshness, reject future newest issues, and verify the
+API profile before applicable feed checks. Added duplicate-ID/history and
+real-API CLI exit tests, including mixed-age duplicates. No additional
+review was launched. Final isolated VPS suite:1,403 passed/1 skipped
+(35.38s), existing MLP ConvergenceWarning; focused gate+CLI78 passed.
+Repository Ruff/ty and touched-source format clean. Script, gate tests and
+CLI-registration hashes match checked VPS source.
 
-Live run on production DB from isolated gate checkout returned exit3,
+Corrected-source live recheck on actual production main/hn_rewrite.db
+from isolated gate checkout again returned exit3,
 NOT_APPLICABLE: "User has voted on this issue", Import AI476, published
 1791808239. This verifies real fetching/history applicability, not an unseen
 live ranking pass; no history reset was attempted to manufacture one.

@@ -1,7 +1,9 @@
 """Read-only live gate: a new, unseen, unvoted Import AI must be visible.
 
-Exit 0: PASS; 1: FAIL/error; 3: not applicable (old, seen, or voted).
+Exit 0: PASS; 1: FAIL/error; 2: invalid CLI; 3: not applicable (old, seen, or voted).
 This checks actual served rankings; it never boosts a source or clears history.
+--db must be the live service DB. GETs can queue ordinary server warming;
+read-only means no feedback or interaction writes. A stale feed fails immediately.
 """
 
 from __future__ import annotations
@@ -42,6 +44,12 @@ class Issue:
 
 
 @dataclass(frozen=True)
+class StoredIssue:
+    story_id: int
+    posted_at: int
+
+
+@dataclass(frozen=True)
 class WindowCheck:
     window: Window
     position: int | None
@@ -75,11 +83,13 @@ def latest_issue(content: bytes | str, now: float) -> Issue:
         ):
             raise ValueError("Import AI entry lacks a valid publisher URL/date")
         at = calendar.timegm(published)
-        if at <= now:
-            issues.append(Issue(title, url, at))
+        issues.append(Issue(title, url, at))
     if not issues:
         raise ValueError("Publisher feed contains no dated Import AI issue")
-    return max(issues, key=lambda issue: issue.published_at)
+    newest = max(issues, key=lambda issue: issue.published_at)
+    if newest.published_at > now:
+        raise ValueError("Newest Import AI issue has a future publication timestamp")
+    return newest
 
 
 async def fetch_publisher() -> str:
@@ -99,15 +109,20 @@ def check_issue(
     user = db.get_user_by_id(user_id)
     if user is None:
         raise ValueError("Existing profile not found; gate never creates profiles")
-    if not 0 <= now - issue.published_at <= WINDOW_SECONDS["1w"]:
+    if issue.published_at > now:
+        return GateResult(
+            "FAIL", "Newest issue has a future publication timestamp", issue
+        )
+    if now - issue.published_at > WINDOW_SECONDS["1w"]:
         return GateResult(
             "NOT_APPLICABLE", "Latest issue is outside the fresh week", issue
         )
     # Exact publisher URL covers an HN crosspost too; its vote/view also counts.
-    rows = db.execute("SELECT id FROM stories WHERE url = ?", (issue.url,))
+    rows = db.execute("SELECT id, time FROM stories WHERE url = ?", (issue.url,))
     if not rows:
         return GateResult("FAIL", "Fresh issue has not been ingested", issue)
-    ids = {int(row[0]) for row in rows}
+    stored = tuple(StoredIssue(int(row[0]), int(row[1])) for row in rows)
+    ids = {story.story_id for story in stored}
     for story_id in ids:
         if db.execute(
             "SELECT 1 FROM feedback WHERE user_id = ? AND story_id = ? LIMIT 1",
@@ -123,10 +138,28 @@ def check_issue(
                 "NOT_APPLICABLE", "User has already seen this issue", issue
             )
     checks: list[WindowCheck] = []
+    windows = tuple(
+        window
+        for window in WINDOW_SECONDS
+        if any(in_window(story.posted_at, window, now) for story in stored)
+    )
+    if not windows:
+        return GateResult(
+            "FAIL", "Matched stored stories have no eligible recent window", issue
+        )
     client.cookies.set("hn_token", user.token)
-    for window in WINDOW_SECONDS:
-        if not in_window(issue.published_at, window, now):
-            continue
+    response = client.get("/api/user")
+    response.raise_for_status()
+    profile = response.json()
+    if (
+        not isinstance(profile, dict)
+        or type(profile.get("user_id")) is not int
+        or profile["user_id"] != user_id
+    ):
+        return GateResult(
+            "FAIL", "Loopback API profile does not match the DB profile", issue
+        )
+    for window in windows:
         response = client.get("/api/feed", params={"window": window})
         response.raise_for_status()
         feed = Feed.parse(response.json())

@@ -1,5 +1,14 @@
 # Worklog: hn-rewrite
 
+## 2026-10-12 — Approved Import AI gate corrections
+
+Stored story times now determine required windows; publisher dates determine
+freshness. Future newest issues fail, applicable checks verify API profile,
+and CLI/crosspost/age regressions exercise the real disposable-DB Flask API.
+Five regressions failed before the fix. Exit2 and ordinary GET warming limits
+are documented. Full validation is in FINDINGS.md; no production rollout or
+additional reviewer.
+
 ## 2026-10-12 — Import AI Recommended live gate
 
 User requested a fresh unseen/unvoted Import AI issue as an integration

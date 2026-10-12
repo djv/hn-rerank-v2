@@ -3,7 +3,8 @@
 Independent Claude cloud review of fc36912:
 https://claude.ai/code/session_01LJvudpDzjxGT4XNPr6ZmCJ
 One reviewer, source only; no DB/private context uploaded. REVIEW.md is
-unaltered. No reviewed script/test was edited after the review.
+unaltered. Reviewed code was held unchanged until the user separately approved the
+correction plan; the authorized corrections are now applied.
 
 ## Verified findings
 
@@ -46,3 +47,19 @@ unaltered. No reviewed script/test was edited after the review.
 5. Repeat focused/full backend, Ruff/format/ty and real read-only
    applicability check; commit verified fixes. No source boost, deployment,
    service restart, timer or additional independent review.
+
+## Authorized correction validation
+
+The approved patch now uses matched stored row timestamps for every required
+window, including mixed-age duplicates. Publisher timestamps determine freshness;
+a future newest entry fails explicitly. Applicable checks verify /api/user identity.
+Five regressions failed before the fix. Focused gate+CLI: 78 passed. Final isolated
+VPS full suite: 1,403 passed, 1 skipped (35.38s); existing MLP ConvergenceWarning.
+Repository Ruff and ty passed; three touched-source format checks passed. Script,
+gate tests and CLI-registration hashes match the checked VPS source.
+Live service remains b1897f4; no restart, timer, history reset or additional review.
+Live corrected-source check with /home/dev/hn-rewrite/main/hn_rewrite.db:
+exit3 NOT_APPLICABLE, issue476 already voted by profile151. This validates
+publisher transport and live applicability, not an unseen ranking PASS. An initial
+attempt named a nonexistent shared/hn_rewrite.db and failed read-only with exit1;
+no DB was created. Service working directory and actual DB were then verified.

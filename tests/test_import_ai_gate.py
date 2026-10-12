@@ -25,7 +25,189 @@ ISSUE = Issue(
 )
 
 
-def _runtime(db: Database, user: User, position: int, ready: bool) -> type[Handler]:
+def _rss(issue: Issue) -> str:
+    return f"<rss><channel><item><title>{issue.title}</title><link>{issue.url}</link><pubDate>{formatdate(issue.published_at, usegmt=True)}</pubDate></item></channel></rss>"
+
+
+@pytest.mark.parametrize(
+    ("publisher_age", "stored_age", "omit", "expected", "windows"),
+    [
+        (14 * 3600, 3 * 3600, "12h", "FAIL", 4),
+        (3 * 3600, 14 * 3600, "", "PASS", 3),
+        (2 * 86400, 2 * 86400, "", "PASS", 2),
+        (60, 40 * 86400, "", "FAIL", 0),
+    ],
+)
+def test_windows_follow_stored_crosspost_times(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    publisher_age: int,
+    stored_age: int,
+    omit: str,
+    expected: str,
+    windows: int,
+) -> None:
+    monkeypatch.setattr("time.time", lambda: float(NOW))
+    db = Database(str(tmp_path / "gate.db"))
+    try:
+        user = db.create_user("fixture")
+        runtime = _runtime(db, user, 1, True, age=stored_age, omit=omit)
+        with httpx.Client(
+            base_url="http://localhost",
+            transport=httpx.WSGITransport(app=create_app(runtime)),
+        ) as client:
+            result = check_issue(
+                db,
+                user.id,
+                replace(ISSUE, published_at=NOW - publisher_age),
+                client,
+                NOW,
+            )
+        assert result.status == expected
+        assert len(result.windows) == windows
+    finally:
+        db.close()
+
+
+def test_future_newest_issue_fails_instead_of_selecting_previous() -> None:
+    content = _rss(ISSUE).replace(
+        "</channel>",
+        _rss(replace(ISSUE, title="Import AI 501: Future", published_at=NOW + 30))
+        .split("<channel>")[1]
+        .split("</channel>")[0]
+        + "</channel>",
+    )
+    with pytest.raises(ValueError, match="future"):
+        latest_issue(content, NOW)
+
+
+def test_offhost_publisher_issue_fails() -> None:
+    with pytest.raises(ValueError, match="URL/date"):
+        latest_issue(_rss(replace(ISSUE, url="https://example.org/500")), NOW)
+
+
+@pytest.mark.parametrize("state", ["visible", "voted", "seen"])
+def test_duplicate_url_ids_share_visibility_and_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+) -> None:
+    monkeypatch.setattr("time.time", lambda: float(NOW))
+    db = Database(str(tmp_path / "gate.db"))
+    try:
+        user = db.create_user("fixture")
+        runtime = _runtime(db, user, 1, True, story_id=101, age=3 * 3600)
+        db.upsert_story(Story(100, ISSUE.title, ISSUE.url, 0, NOW - 14 * 3600, ""))
+        if state == "voted":
+            db.upsert_feedback(user.id, 100, "neutral")
+        elif state == "seen":
+            db.execute(
+                "INSERT INTO interaction_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "seen",
+                    "session",
+                    user.id,
+                    100,
+                    "impression",
+                    1,
+                    0,
+                    "recommended",
+                    "1w",
+                    "all",
+                    "",
+                    NOW,
+                    None,
+                    NOW,
+                    "[]",
+                ),
+            )
+        with httpx.Client(
+            base_url="http://localhost",
+            transport=httpx.WSGITransport(app=create_app(runtime)),
+        ) as client:
+            result = check_issue(db, user.id, ISSUE, client, NOW)
+        assert result.status == ("PASS" if state == "visible" else "NOT_APPLICABLE")
+        if state == "visible":
+            assert len(result.windows) == 4
+    finally:
+        db.close()
+
+
+def test_profile_mismatch_fails_before_feed(tmp_path: Path) -> None:
+    db = Database(str(tmp_path / "gate.db"))
+    try:
+        user = db.create_user("fixture")
+        db.upsert_story(Story(100, ISSUE.title, ISSUE.url, 0, NOW - 60, ""))
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/api/user"
+            return httpx.Response(200, json={"user_id": user.id + 1})
+
+        with httpx.Client(
+            base_url="http://localhost", transport=httpx.MockTransport(respond)
+        ) as client:
+            assert check_issue(db, user.id, ISSUE, client, NOW).status == "FAIL"
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("state", "exit_code"),
+    [("visible", 0), ("missing", 1), ("voted", 3), ("future", 1)],
+)
+def test_cli_exits_using_actual_api(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    state: str,
+    exit_code: int,
+) -> None:
+    monkeypatch.setattr("time.time", lambda: float(NOW))
+    path = tmp_path / "gate.db"
+    db = Database(str(path))
+    try:
+        user = db.create_user("fixture-secret")
+        runtime = _runtime(db, user, 9 if state == "missing" else 1, True)
+        if state == "voted":
+            db.upsert_feedback(user.id, 100, "neutral")
+
+        async def publisher() -> str:
+            return _rss(
+                replace(ISSUE, published_at=NOW + 30) if state == "future" else ISSUE
+            )
+
+        real_client = httpx.Client
+
+        def client(**kwargs: object) -> httpx.Client:
+            assert kwargs["trust_env"] is False
+            assert kwargs["follow_redirects"] is False
+            return real_client(
+                base_url="http://localhost",
+                transport=httpx.WSGITransport(app=create_app(runtime)),
+            )
+
+        monkeypatch.setattr(check_import_ai_recommended, "fetch_publisher", publisher)
+        monkeypatch.setattr(check_import_ai_recommended.httpx, "Client", client)
+        with pytest.raises(SystemExit) as exc:
+            main(["--db", str(path), "--user-id", str(user.id)])
+        assert exc.value.code == exit_code
+        captured = capsys.readouterr()
+        assert user.token not in captured.out + captured.err
+        assert not db.execute("SELECT 1 FROM interaction_events")
+    finally:
+        db.close()
+
+
+def _runtime(
+    db: Database,
+    user: User,
+    position: int,
+    ready: bool,
+    *,
+    age: int = 60,
+    omit: str = "",
+    story_id: int = 100,
+) -> type[Handler]:
     class Runtime(Handler):
         _decks = {}
         _dashboard_versions = {}
@@ -60,21 +242,28 @@ def _runtime(db: Database, user: User, position: int, ready: bool) -> type[Handl
         for i in range(1, 13)
     ]
     stories[position - 1] = Story(
-        100,
+        story_id,
         ISSUE.title,
         ISSUE.url,
         0,
-        ISSUE.published_at,
+        NOW - age,
         "",
         source="rss_jack-clark_net",
     )
     for story in stories:
         db.upsert_story(story)
     other = db.create_user("other-profile")
-    db.upsert_feedback(other.id, 100, "up")
+    db.upsert_feedback(other.id, story_id, "up")
     ranked = tuple(RankedStory(s, score=1.0, best_match_title="") for s in stories)
     deck = WindowDeck(
-        {w: WindowViews(recommended=ranked) for w in ("12h", "1d", "1w", "1m")}
+        {
+            w: WindowViews(
+                recommended=tuple(
+                    r for r in ranked if w != omit or r.story.id != story_id
+                )
+            )
+            for w in ("12h", "1d", "1w", "1m")
+        }
     )
     Runtime._decks = {user.id: DeckState(deck, float(NOW), 1)}
     return Runtime
