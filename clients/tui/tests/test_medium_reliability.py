@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 import httpx
 import pytest
 from rich.console import RenderableType
-from textual.widgets import Markdown
+from textual.widgets import Markdown, Select
 
 from hn_rerank.api import API, APIError, TransientError
 from hn_rerank.app import Reader
@@ -158,13 +159,14 @@ async def test_quit_drains_serialized_votes_before_closing_api(
         assert fake.saved == expected
         assert fake.attempts == len(expected)
         assert not fake.cancelled
+        assert app.quit_report == []
     assert api.closed.is_set()
 
 
-async def test_quit_timeout_keeps_vote_running_and_reader_open(
+async def test_quit_held_vote_blocks_keys_and_exits_at_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("hn_rerank.app.QUIT_VOTE_WAIT_SECONDS", 0.08, raising=False)
+    monkeypatch.setattr("hn_rerank.app.QUIT_WAIT_SECONDS", 0.8, raising=False)
     fake = HeldVotes()
     api = ObservedAPI(fake)
     app = ObservedReader(api)
@@ -173,25 +175,66 @@ async def test_quit_timeout_keeps_vote_running_and_reader_open(
         app.action_vote("up")
         await asyncio.wait_for(fake.entered.wait(), timeout=2)
         await app.action_quit()
-        # A second quit and an undo during draining must not cancel saving
-        # or add another serialized operation.
-        await app.action_quit()
-        app.action_undo()
-        await pilot.pause(0.15)
-        assert not app.exited.is_set()
+        assert "Saving 1 vote" in app.status_text
+        assert "q again" in app.status_text
+        selected = app.selected()
+        assert selected is not None
+        before_id = selected.id
+        before_rated = set(app.rated)
+        before_history = list(app.history)
+        before_window = str(app.query_one("#window", Select).value)
+        before_sort = str(app.query_one("#sort", Select).value)
+        await pilot.press("j")
+        await pilot.press("1")
+        await pilot.press("u")
+        await pilot.press("s")
+        await pilot.press("d")
+        await pilot.pause(0.05)
+        selected = app.selected()
+        assert selected is not None and selected.id == before_id
+        assert set(app.rated) == before_rated
+        assert list(app.history) == before_history
+        assert str(app.query_one("#window", Select).value) == before_window
+        assert str(app.query_one("#sort", Select).value) == before_sort
+        # The quit wait itself never cancels the saving vote.
         assert not fake.cancelled
-        assert "still saving" in app.status_text
-        fake.release.set()
-        await settle(pilot)
-        assert fake.saved == [(1, "up")]
         assert fake.attempts == 1
-        assert not app.exited.is_set()
-        await app.action_quit()
         await asyncio.wait_for(app.exited.wait(), timeout=2)
+        assert len(app.quit_report) == 1
+        assert "Story 1" in app.quit_report[0]
+        assert "still saving" in app.quit_report[0]
+        assert "(up)" in app.quit_report[0]
+        assert fake.attempts == 1
+        assert fake.saved == []
     assert api.closed.is_set()
 
 
-async def test_vote_failure_during_quit_is_not_silently_dismissed() -> None:
+async def test_quit_second_q_exits_immediately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("hn_rerank.app.QUIT_WAIT_SECONDS", 2.0, raising=False)
+    fake = HeldVotes()
+    api = ObservedAPI(fake)
+    app = ObservedReader(api)
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        app.action_vote("up")
+        await asyncio.wait_for(fake.entered.wait(), timeout=2)
+        await app.action_quit()
+        await pilot.pause(0.05)
+        assert not app.exited.is_set()
+        assert not fake.cancelled
+        started = time.monotonic()
+        await app.action_quit()
+        await asyncio.wait_for(app.exited.wait(), timeout=0.5)
+        assert time.monotonic() - started < 1.0
+        assert len(app.quit_report) == 1
+        assert "still saving" in app.quit_report[0]
+        assert fake.attempts == 1
+    assert api.closed.is_set()
+
+
+async def test_vote_failure_during_quit_exits_with_report() -> None:
     fake = HeldVotes(fail=True)
     api = ObservedAPI(fake)
     app = ObservedReader(api)
@@ -201,16 +244,42 @@ async def test_vote_failure_during_quit_is_not_silently_dismissed() -> None:
         await asyncio.wait_for(fake.entered.wait(), timeout=2)
         await app.action_quit()
         fake.release.set()
-        await settle(pilot)
-        assert not app.exited.is_set()
-        assert "not confirmed" in app.status_text
-        assert "Story 1:" in app.status_text
-        assert "Connection failed" in app.status_text
+        await asyncio.wait_for(app.exited.wait(), timeout=2)
+        assert len(app.quit_report) == 1
+        assert "Story 1" in app.quit_report[0]
+        assert "Connection failed" in app.quit_report[0]
+        assert "(up)" in app.quit_report[0]
         assert fake.attempts == 1
         assert not fake.saved
         assert 1 not in app.rated
+    assert api.closed.is_set()
+
+
+class FailSecondStory(HeldVotes):
+    """Story 1's vote saves; story 2's vote fails."""
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/api/feedback"):
+            self.fail = json.loads(request.content)["story_id"] == 2
+        return await super().__call__(request)
+
+
+async def test_quit_report_lists_only_the_failed_vote() -> None:
+    """A vote that saved is not reported because another one failed."""
+    fake = FailSecondStory()
+    app = ObservedReader(ObservedAPI(fake))
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        app.action_vote("up")
+        await asyncio.wait_for(fake.entered.wait(), timeout=2)
+        app.action_vote("down")
         await app.action_quit()
+        fake.release.set()
         await asyncio.wait_for(app.exited.wait(), timeout=2)
+        assert fake.saved == [(1, "up")]
+        assert len(app.quit_report) == 1
+        assert "(down)" in app.quit_report[0]
+        assert "Story 2" in app.quit_report[0]
 
 
 async def test_quit_without_pending_votes_closes_immediately() -> None:
@@ -220,6 +289,9 @@ async def test_quit_without_pending_votes_closes_immediately() -> None:
         await settle(pilot)
         await app.action_quit()
         await asyncio.wait_for(app.exited.wait(), timeout=2)
+        assert "Saving" not in app.status_text
+        assert "q again" not in app.status_text
+        assert app.quit_report == []
     assert api.closed.is_set()
 
 
@@ -241,9 +313,12 @@ async def test_exit_request_keeps_vote_and_undo_blocked() -> None:
         assert not fake.attempts
         assert app.check_action("vote", ("up",)) is False
         assert app.check_action("undo", ()) is False
+        assert app.check_action("quit", ()) is True
+        assert app.check_action("move", (1,)) is False
+        assert app.quit_report == []
 
 
-async def test_cancelled_vote_during_quit_keeps_reader_open() -> None:
+async def test_cancelled_vote_during_quit_exits_with_report() -> None:
     fake = HeldVotes()
     app = ObservedReader(ObservedAPI(fake))
     async with app.run_test(size=(120, 35)) as pilot:
@@ -252,8 +327,10 @@ async def test_cancelled_vote_during_quit_keeps_reader_open() -> None:
         await asyncio.wait_for(fake.entered.wait(), timeout=2)
         await app.action_quit()
         app.workers.cancel_group(app, "vote")
-        await settle(pilot)
-        assert not app.exited.is_set()
+        await asyncio.wait_for(app.exited.wait(), timeout=2)
         assert fake.cancelled
-        assert "not confirmed" in app.status_text
         assert fake.attempts == 1
+        assert len(app.quit_report) == 1
+        assert "Story 1" in app.quit_report[0]
+        assert "cancelled" in app.quit_report[0]
+        assert "(up)" in app.quit_report[0]

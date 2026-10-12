@@ -309,34 +309,31 @@ async def test_open_keys_send_one_event_each(
     async with app.run_test(size=(120, 35)) as pilot:
         await settle(pilot)
         app.query_one(OptionList).focus()
+        await flush(app)
         fake.requests.clear()
         await pilot.press("o")
         await settle(pilot)
         await flush(app)
-        events = [
-            e for e in interaction_events(fake) if e["event_type"] == "article_open"
-        ]
-        assert len(events) == 1
-        assert events[0]["event_type"] == "article_open"
-        assert events[0]["story_id"] == 1
-        assert events[0]["position"] == 0
-        assert events[0]["sort_mode"] == "recommended"
-        assert events[0]["window"] == "1w"
-        assert events[0]["dashboard_version"] == fake.feed.version
-        assert events[0]["badges"] == []
-        assert "duration_ms" not in events[0]
+        all_events = interaction_events(fake)
+        assert len(all_events) == 1
+        assert all_events[0]["event_type"] == "article_open"
+        assert all_events[0]["story_id"] == 1
+        assert all_events[0]["position"] == 0
+        assert all_events[0]["sort_mode"] == "recommended"
+        assert all_events[0]["window"] == "1w"
+        assert all_events[0]["dashboard_version"] == fake.feed.version
+        assert all_events[0]["badges"] == []
+        assert "duration_ms" not in all_events[0]
         assert opened == ["https://example.org/1"]
         fake.requests.clear()
         await pilot.press("c")
         await settle(pilot)
         await flush(app)
-        events = [
-            e for e in interaction_events(fake) if e["event_type"] == "comments_open"
-        ]
-        assert len(events) == 1
-        assert events[0]["event_type"] == "comments_open"
-        assert events[0]["story_id"] == 1
-        assert "duration_ms" not in events[0]
+        all_events = interaction_events(fake)
+        assert len(all_events) == 1
+        assert all_events[0]["event_type"] == "comments_open"
+        assert all_events[0]["story_id"] == 1
+        assert "duration_ms" not in all_events[0]
         assert opened[-1] == "https://news.ycombinator.com/item?id=1"
 
 
@@ -355,9 +352,34 @@ async def test_open_without_link_sends_nothing(
         monkeypatch.setattr(
             app, "selected", lambda: dataclasses.replace(selected, article_url="")
         )
+        await flush(app)
         fake.requests.clear()
         app.action_open_url("article_url")
         await settle(pilot)
+        assert opened == []
+        assert interaction_events(fake) == []
+
+
+async def test_open_comments_without_link_sends_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened: list[str] = []
+    monkeypatch.setattr(reader_module, "open_in_browser", opened.append)
+    install_clocks(monkeypatch)
+    fake = FakeServer()
+    app = Reader(api=fake.api(), prefetch=0)
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        selected = app.selected()
+        assert selected is not None
+        monkeypatch.setattr(
+            app, "selected", lambda: dataclasses.replace(selected, comments_url="")
+        )
+        await flush(app)
+        fake.requests.clear()
+        app.action_open_url("comments_url")
+        await settle(pilot)
+        await flush(app)
         assert opened == []
         assert interaction_events(fake) == []
 
@@ -425,6 +447,57 @@ async def test_dwell_idle_caps_at_five_minutes(
         assert dwells[0]["duration_ms"] == 300_000
 
 
+async def test_dwell_input_keeps_idle_open_across_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Paging every 60 s for 8 min logs one 480 s dwell, not the 300 s cap."""
+    state = install_clocks(monkeypatch)
+    fake = FakeServer()
+    app = Reader(api=fake.api(), prefetch=0)
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        app.query_one(OptionList).focus()
+        fake.requests.clear()
+        for _ in range(8):
+            state["mono"] += 60.0
+            state["wall"] += 60.0
+            await pilot.press("space")
+            await settle(pilot)
+        await pilot.press("j")
+        await settle(pilot)
+        await flush(app)
+        dwells = [e for e in interaction_events(fake) if e["event_type"] == "dwell"]
+        assert len(dwells) == 1
+        assert dwells[0]["story_id"] == 1
+        assert dwells[0]["duration_ms"] == 480_000
+
+
+async def test_dwell_idle_then_input_splits_segments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Idle 10 min, space, 5 s, j logs 300 s and 5 s dwells in order."""
+    state = install_clocks(monkeypatch)
+    fake = FakeServer()
+    app = Reader(api=fake.api(), prefetch=0)
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        app.query_one(OptionList).focus()
+        fake.requests.clear()
+        state["mono"] += 600.0
+        state["wall"] += 600.0
+        await pilot.press("space")
+        await settle(pilot)
+        await flush(app)
+        state["mono"] += 5.0
+        state["wall"] += 5.0
+        await pilot.press("j")
+        await settle(pilot)
+        await flush(app)
+        dwells = [e for e in interaction_events(fake) if e["event_type"] == "dwell"]
+        assert [d["duration_ms"] for d in dwells] == [300_000, 5_000]
+        assert all(d["story_id"] == 1 for d in dwells)
+
+
 async def test_blur_ends_and_focus_resumes_without_impression(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -446,19 +519,44 @@ async def test_blur_ends_and_focus_resumes_without_impression(
         dwells = [e for e in interaction_events(fake) if e["event_type"] == "dwell"]
         assert len(dwells) == 1
         assert dwells[0]["duration_ms"] == 5000
-        impressions = len(
-            [e for e in interaction_events(fake) if e["event_type"] == "impression"]
-        )
+        impressions_before = [
+            e for e in interaction_events(fake) if e["event_type"] == "impression"
+        ]
         state["mono"] += 2.0
         state["wall"] += 2.0
         app.post_message(events.AppFocus())
         await settle(pilot)
         await flush(app)
+        assert len(
+            [e for e in interaction_events(fake) if e["event_type"] == "impression"]
+        ) == len(impressions_before)
+        # Resume must actually restart the segment: 3 s later moving logs a
+        # second dwell for the same story and no new impression for it.
+        impressions_story1 = len(
+            [
+                e
+                for e in interaction_events(fake)
+                if e["event_type"] == "impression" and e["story_id"] == 1
+            ]
+        )
+        state["mono"] += 3.0
+        state["wall"] += 3.0
+        await pilot.press("j")
+        await settle(pilot)
+        await flush(app)
+        dwells = [e for e in interaction_events(fake) if e["event_type"] == "dwell"]
+        story1 = [d for d in dwells if d["story_id"] == 1]
+        assert len(story1) == 2
+        assert story1[1]["duration_ms"] == 3000
         assert (
             len(
-                [e for e in interaction_events(fake) if e["event_type"] == "impression"]
+                [
+                    e
+                    for e in interaction_events(fake)
+                    if e["event_type"] == "impression" and e["story_id"] == 1
+                ]
             )
-            == impressions
+            == impressions_story1
         )
 
 
@@ -495,6 +593,100 @@ async def test_help_ends_dwell_and_escape_resumes_without_impression(
             )
             == impressions
         )
+        impressions_story1 = len(
+            [
+                e
+                for e in interaction_events(fake)
+                if e["event_type"] == "impression" and e["story_id"] == 1
+            ]
+        )
+        state["mono"] += 3.0
+        state["wall"] += 3.0
+        await pilot.press("j")
+        await settle(pilot)
+        await flush(app)
+        dwells = [e for e in interaction_events(fake) if e["event_type"] == "dwell"]
+        story1 = [d for d in dwells if d["story_id"] == 1]
+        assert len(story1) == 2
+        assert story1[1]["duration_ms"] == 3000
+        assert (
+            len(
+                [
+                    e
+                    for e in interaction_events(fake)
+                    if e["event_type"] == "impression" and e["story_id"] == 1
+                ]
+            )
+            == impressions_story1
+        )
+
+
+async def test_vote_logs_four_second_dwell(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = install_clocks(monkeypatch)
+    fake = FakeServer()
+    app = Reader(api=fake.api(), prefetch=0)
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        app.query_one(OptionList).focus()
+        fake.requests.clear()
+        state["mono"] += 4.0
+        state["wall"] += 4.0
+        app.action_vote("up")
+        await settle(pilot)
+        await flush(app)
+        dwells = [e for e in interaction_events(fake) if e["event_type"] == "dwell"]
+        assert len(dwells) == 1
+        assert dwells[0]["story_id"] == 1
+        assert dwells[0]["duration_ms"] == 4000
+
+
+async def test_window_cycle_logs_dwell_with_old_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = install_clocks(monkeypatch)
+    fake = FakeServer()
+    app = Reader(api=fake.api(), prefetch=0)
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        app.query_one(OptionList).focus()
+        fake.requests.clear()
+        state["mono"] += 4.0
+        state["wall"] += 4.0
+        app.action_cycle_window(1)
+        await settle(pilot)
+        await flush(app)
+        dwells = [e for e in interaction_events(fake) if e["event_type"] == "dwell"]
+        assert len(dwells) == 1
+        assert dwells[0]["story_id"] == 1
+        assert dwells[0]["duration_ms"] == 4000
+        assert dwells[0]["window"] == "1w"
+
+
+@pytest.mark.parametrize("panel", ["why", "legend"])
+async def test_info_panels_end_dwell_like_help(
+    monkeypatch: pytest.MonkeyPatch, panel: str
+) -> None:
+    state = install_clocks(monkeypatch)
+    fake = FakeServer()
+    app = Reader(api=fake.api(), prefetch=0)
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        app.query_one(OptionList).focus()
+        fake.requests.clear()
+        state["mono"] += 5.0
+        state["wall"] += 5.0
+        if panel == "why":
+            app.action_why_story()
+        else:
+            app.action_badge_legend()
+        await settle(pilot)
+        await flush(app)
+        dwells = [e for e in interaction_events(fake) if e["event_type"] == "dwell"]
+        assert len(dwells) == 1
+        assert dwells[0]["story_id"] == 1
+        assert dwells[0]["duration_ms"] == 5000
 
 
 # Quit --------------------------------------------------------------------------
@@ -530,6 +722,7 @@ async def test_quit_sends_open_dwell(monkeypatch: pytest.MonkeyPatch) -> None:
         assert len(dwells) == 1
         assert dwells[0]["story_id"] == 1
         assert dwells[0]["duration_ms"] == 5000
+        assert app.quit_report == []
 
 
 async def test_quit_with_hanging_telemetry_still_closes(
@@ -549,7 +742,9 @@ async def test_quit_with_hanging_telemetry_still_closes(
     async with app.run_test(size=(120, 35)) as pilot:
         await settle(pilot)
         await app.action_quit()
-        await asyncio.wait_for(app.exited.wait(), timeout=2)
+        # Telemetry alone never holds a quit longer than ~1 s.
+        await asyncio.wait_for(app.exited.wait(), timeout=1.5)
+        assert app.quit_report == []
 
 
 async def test_quit_with_failing_telemetry_keeps_vote_wait(
@@ -586,3 +781,4 @@ async def test_quit_with_failing_telemetry_keeps_vote_wait(
         release.set()
         await asyncio.wait_for(app.exited.wait(), timeout=2)
         assert saved == [(1, "up")]
+        assert app.quit_report == []

@@ -1,5 +1,28 @@
 # Worklog: hn-rewrite
 
+## 2026-10-12 — TUI quit always exits
+
+User (2026-10-12): block other keys briefly while saving, but Q must always
+work, with a warning that something is still saving. `clients/tui`: first q
+sets `_quit_requested`, blocks every action except quit, stops the open dwell
+and flushes it concurrently (telemetry capped at ~1 s); pending votes show
+"Saving N votes… press q again to quit now"; exit happens when votes finish
+and telemetry is done or at `QUIT_WAIT_SECONDS` (3 s), whichever comes first;
+a second q exits at once. Unconfirmed votes are reported after close via
+`exit(message=...)` ("Vote not saved: <title> (<action>) — <reason>") and kept
+on `quit_report` for tests; titles go through `terminal_safe`. The old
+stay-open path ("Reader stayed open; press q after saving finishes") is gone.
+Also fixed reading-signal tests from an independent Muse review (5 medium,
+4 low): blur/focus and help/escape now assert a resumed 3 s dwell with no new
+impression, idle tests cover input across the cap (verified to fail with the
+`on_event` touch removed), opens assert exactly one event total, and new
+vote/window/why/legend/missing-link dwell cases. Built by Muse (OpenCode)
+from a brief. On review the agent fixed the report falsely listing a saved
+vote when another vote failed: `submit` now records every failure (error,
+cancel, also while waiting for the lock) under the vote's key, and the
+report reads only that (regression test). Goes live when the user
+restarts the reader.
+
 ## 2026-10-12 — TUI logs article/comments opens and dwell
 
 `clients/tui`: renamed `api.Impression`/`API.impression` to

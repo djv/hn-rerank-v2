@@ -39,7 +39,7 @@ from textual.widgets._select import (
     SelectOverlay,
 )
 from textual.widgets.option_list import Option
-from textual.worker import Worker, WorkerState
+from textual.worker import Worker
 
 from .api import (
     API,
@@ -64,10 +64,12 @@ from .models import (
     WINDOWS,
     Feed,
     FeedStory,
+    terminal_safe,
 )
 
 DEFAULT_SERVER = "https://ubuntu-8gb-nbg1-1.tailca4726.ts.net:8443/hn/"
-QUIT_VOTE_WAIT_SECONDS = 5.0
+# Quit always exits: at most 3 s after the first q, whatever is still saving.
+QUIT_WAIT_SECONDS = 3.0
 # Telemetry quit budget: pending dwell/opens/impressions flush within ~1 s.
 QUIT_TELEMETRY_WAIT_SECONDS = 1.0
 
@@ -828,7 +830,20 @@ class Reader(App[None]):
         self.vote_lock = asyncio.Lock()
         self._unconfirmed_votes = 0
         self._last_vote_error: str | None = None
+        # Pending votes by (story_id, revision): (title, action) for the quit
+        # report. Entries are added when submit() starts and removed when it
+        # finishes; failures leave their reason in _vote_errors.
+        self._pending_votes: dict[tuple[int, int], tuple[str, str]] = {}
+        self._vote_errors: dict[tuple[int, int], str] = {}
         self._quit_requested = False
+        # Quit-always-exits state: snapshot at the first q, report for tests,
+        # and a guard so the second q (or the cap) exits exactly once.
+        self.quit_report: list[str] = []
+        self._quit_exited = False
+        self._quit_start: float | None = None
+        self._quit_snapshot: list[tuple[tuple[int, int], str, str]] = []
+        self._quit_votes: tuple[Worker[None], ...] = ()
+        self._quit_events: list[InteractionEvent] = []
         self.selection_serial = 0
         self.interaction_session = str(uuid4())
         self.dwell_tracker = DwellTracker()
@@ -952,9 +967,11 @@ class Reader(App[None]):
         self.context_status()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if self._quit_requested:
+            # Quitting: q (and Ctrl+q, same action) always works; every other
+            # key is blocked for ~3 s so nothing else can start while saving.
+            return action == "quit"
         if self.setting_up or isinstance(self.focused, Input):
-            return False
-        if self._quit_requested and action in {"vote", "undo"}:
             return False
         if self._stats_modal_open and action in {
             "vote",
@@ -1438,6 +1455,10 @@ class Reader(App[None]):
             self._send_dwell(self.dwell_tracker.start(ctx, _monotonic()))
 
     def schedule_summary(self, *, emit_impression: bool = True) -> None:
+        if self._quit_requested:
+            # Quitting: no new dwell segment and no impression; a mouse click
+            # may still move the highlight itself.
+            return
         story = self.selected()
         if self.help_open:
             return
@@ -2361,6 +2382,9 @@ class Reader(App[None]):
         self.apply_vote(story)
         revision = self.vote_revisions.get(story.id, 0) + 1
         self.vote_revisions[story.id] = revision
+        # Record synchronously so a quit snapshot always sees the vote, even
+        # before its worker starts; submit() removes it when done.
+        self._pending_votes[(story.id, revision)] = (story.title, action)
         self.submit(story, action, revision)
 
     def action_undo(self) -> None:
@@ -2371,6 +2395,7 @@ class Reader(App[None]):
             self.apply_undo(story)
             revision = self.vote_revisions.get(story.id, 0) + 1
             self.vote_revisions[story.id] = revision
+            self._pending_votes[(story.id, revision)] = (story.title, "clear")
             self.submit(story, "clear", revision)
 
     def apply_vote(self, story: FeedStory) -> None:
@@ -2398,36 +2423,52 @@ class Reader(App[None]):
     @work(group="vote")
     async def submit(self, story: FeedStory, action: str, revision: int) -> None:
         api = self.api
+        key = (story.id, revision)
         if api is None:
+            self._pending_votes.pop(key, None)
             return
-        self.status("Saving vote…")
-        # One at a time, so the server sees votes and undos in the order made.
-        async with self.vote_lock:
-            try:
-                target = await api.vote(story.id, action)
-            except InvalidProfile as exc:
-                self._unconfirmed_votes += 1
-                self._last_vote_error = str(exc)
-                self.setup(str(exc))
-                return
-            except APIError as exc:
-                if api is self.api:
+        self._pending_votes[key] = (story.title, action)
+        try:
+            self.status("Saving vote…")
+            # One at a time, so the server sees votes and undos in the order made.
+            async with self.vote_lock:
+                try:
+                    target = await api.vote(story.id, action)
+                except InvalidProfile as exc:
                     self._unconfirmed_votes += 1
-                    # Never retried: the server may or may not have it.
-                    latest = self.vote_revisions.get(story.id) == revision
-                    if latest:
-                        if action == "clear":
-                            self.apply_vote(story)
-                        else:
-                            self.apply_undo(story)
-                    notice = (
-                        "Vote not confirmed, so the story is back; check before voting again."
-                        if latest
-                        else "Earlier vote not confirmed; your latest choice is still shown."
-                    )
-                    self._last_vote_error = f"{notice} Story {story.id}: {exc}"
-                    self.status(self._last_vote_error, error=True)
-                return
+                    self._last_vote_error = str(exc)
+                    self._vote_errors[key] = str(exc)
+                    self.setup(str(exc))
+                    return
+                except APIError as exc:
+                    self._vote_errors[key] = f"Story {story.id}: {exc}"
+                    if api is self.api:
+                        self._unconfirmed_votes += 1
+                        # Never retried: the server may or may not have it.
+                        latest = self.vote_revisions.get(story.id) == revision
+                        if latest:
+                            if action == "clear":
+                                self.apply_vote(story)
+                            else:
+                                self.apply_undo(story)
+                        notice = (
+                            "Vote not confirmed, so the story is back; check before voting again."
+                            if latest
+                            else "Earlier vote not confirmed; your latest choice is still shown."
+                        )
+                        self._last_vote_error = f"{notice} Story {story.id}: {exc}"
+                        self._vote_errors[key] = self._last_vote_error
+                        self.status(self._last_vote_error, error=True)
+                    return
+        except asyncio.CancelledError:
+            # Also while waiting for the lock: the vote was never confirmed.
+            self._vote_errors[key] = "cancelled"
+            raise
+        except Exception as exc:
+            self._vote_errors[key] = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            self._pending_votes.pop(key, None)
         if api is not self.api:
             return
         if self.feed is not None and target > self.feed.version:
@@ -2744,17 +2785,22 @@ class Reader(App[None]):
             "- `r`: regenerate the selected summary and check its live stats\n"
             "- `b`: badge legend\n"
             "- `?`: this help\n"
-            "- `q`: quit\n"
+            "- `q`: quit (always exits within ~3 s; a second q exits at once)\n"
             "- `Escape`: close this help\n\n"
-            "Votes are never automatically retried after network errors."
+            "Votes are never automatically retried after network errors. "
+            "Quitting shows any vote not saved after the reader closes."
         )
         self.focus_summary()
 
     async def action_quit(self) -> None:
-        """Finish queued votes before allowing teardown to cancel workers."""
+        """Quit always exits: at most QUIT_WAIT_SECONDS after the first q."""
         if self._quit_requested:
+            # Second q while waiting exits immediately.
+            self.workers.cancel_group(self, "quit")
+            self._exit_for_quit()
             return
         self._quit_requested = True
+        self._quit_start = time.monotonic()
         # The open reading segment's dwell (if >= 1 s) is sent with a ~1 s
         # cap in the quit worker, never delaying votes. A still-delayed
         # impression is under 1 s old, so it is not sent.
@@ -2765,68 +2811,80 @@ class Reader(App[None]):
             for worker in self.workers
             if worker.group == "vote" and not worker.is_finished
         )
-        self._quit_after_votes(votes, self._unconfirmed_votes, quit_events)
+        self._quit_votes = votes
+        self._quit_events = list(quit_events)
+        self._quit_snapshot = [
+            (key, title, action) for key, (title, action) in self._pending_votes.items()
+        ]
+        pending = len(self._quit_snapshot) or len(votes)
+        if pending:
+            noun = "vote" if pending == 1 else "votes"
+            self.status(f"Saving {pending} {noun}… press q again to quit now")
+        self._quit_after_votes()
+
+    def _build_quit_report(self) -> list[str]:
+        """One line per vote not confirmed at exit; empty when all saved.
+        ``submit`` records every failure (error, cancel) under the vote's key,
+        so a vote neither pending nor failed was saved."""
+        report: list[str] = []
+        for key, title, action in self._quit_snapshot:
+            if key in self._pending_votes:
+                reason = "still saving when the reader closed"
+            elif (error := self._vote_errors.get(key)) is not None:
+                reason = error or "cancelled"
+            else:
+                continue
+            report.append(
+                f"Vote not saved: {terminal_safe(title)} ({action}) — {reason}"
+            )
+        return report
+
+    def _exit_for_quit(self) -> None:
+        """Exit exactly once, carrying the quit report as the exit message."""
+        if self._quit_exited:
+            return
+        self._quit_exited = True
+        self.quit_report = self._build_quit_report()
+        message = "\n".join(self.quit_report) if self.quit_report else None
+        self.exit(message=message)
 
     @work(group="quit")
-    async def _quit_after_votes(
-        self,
-        votes: tuple[Worker[None], ...],
-        unconfirmed_before: int,
-        quit_events: list[InteractionEvent] | None = None,
-    ) -> None:
-        exiting = False
+    async def _quit_after_votes(self) -> None:
+        votes = self._quit_votes
+        quit_start = self._quit_start or time.monotonic()
+        deadline = quit_start + QUIT_WAIT_SECONDS
+        telemetry_deadline = quit_start + QUIT_TELEMETRY_WAIT_SECONDS
         flush_task: asyncio.Task[None] | None = None
         try:
-            if quit_events or any(
+            if self._quit_events or any(
                 worker.group == "interaction" and not worker.is_finished
                 for worker in self.workers
             ):
                 flush_task = asyncio.create_task(
-                    self._flush_quit_telemetry(list(quit_events or []))
+                    self._flush_quit_telemetry(list(self._quit_events))
                 )
-            if votes:
-                self.status("Saving pending votes before quitting…")
-            deadline = time.monotonic() + QUIT_VOTE_WAIT_SECONDS
+            # Wait for votes up to the 3 s cap; observe completion without
+            # creating/cancelling waiters (Worker.wait cancellation can cancel
+            # the underlying vote).
             while any(not worker.is_finished for worker in votes):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    self.status(
-                        "Votes are still saving. Reader stayed open; press q after saving finishes.",
-                        error=True,
-                    )
-                    return
-                # Worker.wait cancellation can cancel the underlying vote.
-                # Observe completion without creating/cancelling waiters.
+                    break
                 await asyncio.sleep(min(0.05, remaining))
-            if self._unconfirmed_votes != unconfirmed_before or any(
-                worker.state != WorkerState.SUCCESS for worker in votes
-            ):
-                detail = (
-                    self._last_vote_error
-                    if self._unconfirmed_votes != unconfirmed_before
-                    else None
-                )
-                self.status(
-                    "Votes were not confirmed. "
-                    + (detail or "Check before voting again.")
-                    + " Press q to quit.",
-                    error=True,
-                )
-                return
             if flush_task is not None:
-                try:
-                    await asyncio.wait_for(
-                        flush_task, timeout=QUIT_TELEMETRY_WAIT_SECONDS
-                    )
-                except TimeoutError:
-                    pass
-            self.exit()
-            exiting = True
+                remaining = min(
+                    deadline - time.monotonic(),
+                    telemetry_deadline - time.monotonic(),
+                )
+                if remaining > 0:
+                    try:
+                        await asyncio.wait_for(flush_task, timeout=remaining)
+                    except TimeoutError:
+                        pass
+            self._exit_for_quit()
         finally:
             if flush_task is not None and not flush_task.done():
                 flush_task.cancel()
-            if not exiting:
-                self._quit_requested = False
 
     async def on_unmount(self) -> None:
         self.closing = True
