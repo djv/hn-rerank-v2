@@ -57,6 +57,11 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   UTC with the user's OK, no independent review (user's choice). VPS gate
   1,349 passed / 1 skipped, TUI 219 passed; live feed for profile 151 has
   3 Discover, 3 Unsure and 3 Interest cards in every window; journal clean.
+  TUI reading signal (user 2026-10-12): the reader now logs article and
+  comments opens and dwell (1 s minimum, 5 min idle cap, ends on focus
+  loss), as the web does. Built by Muse, fixed on review, merged 4c3d758;
+  VPS gate TUI 242 / backend 1,349 passed; payloads pass the server's
+  validator. Live once the user restarts `hn`; no server restart.
   Teach (active learning in place of Explore): Phase 0 simulation showed
   only a tiny gain over random picks; parked by the user.
   [Evidence](FINDINGS.md#blind-re-vote-calibration-recency-check-re-votes-applied--2026-10-11).
@@ -294,6 +299,9 @@ startup provider warming was authorized.
 ranking research remains paused and production trial configuration unchanged.
 
 ## Next step
+- Reading signal: after the user restarts `hn`, confirm `article_open`,
+  `comments_open` and `dwell` rows arrive for profile 151; after about two
+  weeks, check how opens and dwell relate to votes before using them.
 - Discover: read the result about 2026-11-02 (PLAN.md Phase 2: Discover
   up-rate, novel up-votes per week, Explore down-rate), next to the trial
   report.
