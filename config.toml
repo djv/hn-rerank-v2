@@ -50,13 +50,11 @@ feeds = [
     "https://mshibanami.github.io/GitHubTrendingRSS/weekly/all.xml",
     "https://mshibanami.github.io/GitHubTrendingRSS/weekly/python.xml",
     "https://mshibanami.github.io/GitHubTrendingRSS/weekly/haskell.xml",
-    "https://www.reddit.com/r/MachineLearning/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/mlscaling/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/LocalLLaMA/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/haskell/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/ocaml/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/Bogleheads/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/ExpatFIRE/top/.rss?t=week&limit=25",
 
 
     # AI / coding agents
@@ -73,10 +71,6 @@ feeds = [
     "https://www.reddit.com/r/codex/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/agi/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/Aging/top/.rss?t=week&limit=25",
-
-    # Finance / tax / nomad money
-    "https://www.reddit.com/r/financialindependence/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/fatFIRE/top/.rss?t=week&limit=25",
 
     # Travel / gear / nomad logistics
     "https://www.reddit.com/r/onebag/top/.rss?t=week&limit=25",
@@ -113,7 +107,6 @@ feeds = [
     "https://e360.yale.edu/feed.xml",
     "https://www.sciencedaily.com/rss/top/science.xml",
     "https://aeon.co/feed.rss",
-    "https://discourse.haskell.org/latest.rss",
 
     # Software / systems / AI coding
     "https://jvns.ca/atom.xml",

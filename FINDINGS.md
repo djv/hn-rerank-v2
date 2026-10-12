@@ -47,6 +47,23 @@ and none of these stories had a trial impression, so the interleave report
 does not credit them. Fresh-vote evals should exclude that window: these
 are re-votes of old stories, not feed votes. Undo record: private, laptop.
 
+Neutral as down (user chose, same folds and snapshot; a copy with all 1,813
+user-1 neutral votes set to down, production only, since the prodlr control
+needs three classes): original held-out AUC 0.781 -> 0.783, +0.001
+[−0.006, +0.009]; top-decile up rate −0.019 [−0.065, +0.025]; on the re-votes
+0.837 -> 0.797, −0.040 [−0.108, +0.008]. No gain: the neutral class carries
+signal, so keep it as its own class.
+
+Source up rates, profile 151 (votes excluding the 29 re-vote rows; shown =
+distinct stories with an impression since 2026-10-08): HN 386/873/1,228
+(16% up), since 10-08 170 shown, 16 up. Weakest still-fetched sources:
+discourse.haskell.org 1/6/5, r/MachineLearning 4/10/11, r/fatFIRE 11/23/29
+(0 up of 5 shown since 10-08), r/financialindependence 6/15/7, r/ExpatFIRE
+18/29/25 (0 of 2). User chose to drop all five now (WORKLOG). Small effect:
+each showed 0-7 cards since 10-08; most misses are HN (89 of 142 voted HN
+cards since 10-08 were down). Thin, kept: r/ClaudeAI 1/5/2, r/singularity
+2/6/5, simonwillison.net 6/18/7.
+
 ## Codex Forum fix plan and Muse handoff — 2026-10-11
 
 The user requested planning and handing the fixes to Muse. The bounded plan

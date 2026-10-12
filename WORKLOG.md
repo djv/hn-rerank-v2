@@ -1,5 +1,15 @@
 # Worklog: hn-rewrite
 
+## 2026-10-12 — Dropped five weak feeds
+
+config.toml: dropped r/MachineLearning, r/ExpatFIRE, r/financialindependence,
+r/fatFIRE and discourse.haskell.org (profile 151's lowest up rates among
+still-fetched sources; FINDINGS.md "Source up rates"). 66 feeds, 17 of them
+subreddits. Their stories stay in the DB and leave the candidate pool, as
+with the 10-08 drops; both interleaving arms share the pool. User approved
+the mid-trial restart. VPS checks on the change: 1,304 passed / 1 skipped,
+ruff clean (no Python changed).
+
 ## 2026-10-11 — Live DB: blind re-votes applied to profile 151
 
 User asked to apply the calibration re-votes where they differ, then to add
