@@ -26,6 +26,21 @@ Outcome as below. Script: laptop `~/revote/short-window-scores.py`.
   by the production arm, though challenger arms picked some; story metadata
   as of the snapshot. Impressions per dashboard version are partial (median
   2-3), so cards per deck after a bar could not be counted.
+- Independent review (Claude cloud session, 2026-10-12; agent-verified in
+  `pipeline/ranking.py`): the direction holds, but neither the size nor an
+  absolute bar does.
+  - Rescoring reads final points and comment counts (`_engagement_features`)
+    and embeddings that include `top_comments`, so the short-window AUCs
+    are upper bounds.
+  - `score` is min-max normalized over each rerank's pool (`_minmax01`), so
+    a fixed bar does not carry over to live serving.
+  - The 12h bar costs a third of the ups.
+  - Next evidence: log serve-time scores per impression, then replay a
+    rank-based cap or a `prob_down` threshold offline after the trial ends
+    (2026-11-05). Judge it by ups per session, with downs per shown card as a
+    guardrail.
+  - Tier-1 gravity, which uses the analysis-time clock, has weight 0 at this
+    vote count.
 
 ## Live feed metrics, profile 151 — 2026-10-12
 
