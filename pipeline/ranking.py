@@ -326,6 +326,8 @@ EXPLORE_PER_BADGE = 3
 # Stories with a max cosine similarity to the user's up-votes strictly below
 # this are Discover candidates; value from FINDINGS "Discover Phase 0".
 DISCOVER_MAX_SIM_UP = 0.60
+# The arm tag of Recommended's far card; interleaving credit skips it.
+FAR_ARM = "far"
 # Views are picked at this multiple of their served size, so that dedup,
 # votes and stories ageing out of a window between warms leave enough.
 SELECT_MARGIN = 2
@@ -414,6 +416,9 @@ class RankedStory:
     svm_margin: float | None = field(default=None, compare=False)
     # Per-window score provenance survives canonical story-ID replacement.
     pool_rank: PoolRank | None = field(default=None, compare=False)
+    # Max cosine similarity to the user's up-votes at rank time; None without
+    # an Explore context (cold deck).
+    closest_up: float | None = field(default=None, compare=False)
 
 
 def clean_text(raw_text: str, min_len: int = 0) -> str:
@@ -2016,9 +2021,10 @@ def window_pool(
 
 @dataclass(frozen=True)
 class WindowViews:
-    """The three views of one time window. Recommended is in model-score
-    order and Popular in HN-gravity order. A cached deck's Explore is in
-    pick order (Unsure, then Discover, then Interest picks, each best first) so
+    """The three views of one time window. Recommended is not strictly
+    model-score order (drafted decks; the far card). Popular is in
+    HN-gravity order. A cached deck's Explore is in pick order (Unsure,
+    then Discover, then Interest picks, each best first) so
     ``serve_window`` can cap it per badge; a served Explore is in model-score
     order."""
 
@@ -2122,12 +2128,15 @@ class ExploreContext:
     stories strictly below ``DISCOVER_MAX_SIM_UP``. ``cand_interest`` is each
     candidate's nearest interest (a cluster of the user's upvotes,
     ``interest_centers``); ``interest_sizes`` counts the upvotes in each. No
-    interests (empty ``interest_sizes``), no Interest picks."""
+    interests (empty ``interest_sizes``), no Interest picks. ``has_upvotes``
+    is whether the user has any up-vote embeddings; when False,
+    ``closest_up`` stays None so no far card is placed."""
 
     cand_closest_up: NDArray[np.float32]
     cand_interest: NDArray[np.int64]
     interest_sizes: NDArray[np.int64]
     row_of: Mapping[int, int]
+    has_upvotes: bool = True
 
 
 def assemble_window_deck(
@@ -2317,7 +2326,12 @@ def assemble_window_deck(
         stats = window_pool(pool, by_score, global_ranks)
 
         def with_rank(r: RankedStory) -> RankedStory:
-            return replace(r, pool_rank=stats.ranks[r.story.id])
+            closest: float | None = None
+            if explore is not None and explore.has_upvotes:
+                row = explore.row_of.get(r.story.id)
+                if row is not None:
+                    closest = float(explore.cand_closest_up[row])
+            return replace(r, pool_rank=stats.ranks[r.story.id], closest_up=closest)
 
         windows[window] = WindowViews(
             tuple(with_rank(r) for r in recommended),
@@ -2356,11 +2370,69 @@ def draft_recommended(
     return WindowDeck(windows)
 
 
+def place_far_card(deck: WindowDeck, *, now: float, horizon: float) -> WindowDeck:
+    """Move the best-scored far story to the last served Recommended slot.
+
+    Discover already holds the best-scored far stories outside Recommended,
+    so for non-interleaved decks the Recommended tail plus Discover's picks
+    suffice as candidates; with interleaving, union stories the draft did
+    not keep are not candidates. The far card is outside the team draft:
+    it is placed after ``draft_recommended`` and tagged ``FAR_ARM``, never
+    credited to a trial arm. Among the eligible candidates, prefer those
+    still in the window at ``now + horizon`` (best-scored of those, ties
+    lower id); only if none stays, place the best-scored eligible one as
+    now.
+    """
+    windows: dict[Window, WindowViews] = {}
+    for window, views in deck.windows.items():
+        head = list(views.recommended[: VIEW_SIZE - 1])
+        head_ids = {r.story.id for r in head}
+        tail = list(views.recommended[VIEW_SIZE - 1 :])
+        candidates: list[RankedStory] = [
+            r
+            for r in tail
+            if r.story.id not in head_ids
+            and r.closest_up is not None
+            and r.closest_up < DISCOVER_MAX_SIM_UP
+        ]
+        candidates.extend(
+            r
+            for r in views.explore
+            if r.is_discover
+            and r.story.id not in head_ids
+            and r.closest_up is not None
+            and r.closest_up < DISCOVER_MAX_SIM_UP
+        )
+        # Deduplicate candidates by story id, keeping the first (highest
+        # Recommended/Explore order) occurrence for the score comparison.
+        seen: dict[int, RankedStory] = {}
+        for r in candidates:
+            seen.setdefault(r.story.id, r)
+        unique = list(seen.values())
+        if not unique:
+            windows[window] = views
+            continue
+        staying = [r for r in unique if in_window(r.story.time, window, now + horizon)]
+        pool = staying or unique
+        far = min(pool, key=lambda r: (-r.score, r.story.id))
+        rest = [r for r in tail if r.story.id != far.story.id]
+        recommended = tuple(head + [replace(far, arm=FAR_ARM, is_discover=True)] + rest)
+        explore = tuple(r for r in views.explore if r.story.id != far.story.id)
+        windows[window] = replace(views, recommended=recommended, explore=explore)
+    return WindowDeck(windows)
+
+
 def serve_window(views: WindowViews, window: Window, now: float) -> WindowViews:
     """A cached window as served at *now*: stories that aged out of the
     window since the warm are dropped, then each view is capped
     (``VIEW_SIZE``; Explore ``EXPLORE_PER_BADGE`` per badge, in model-score
-    order). Short windows stay short; they are never widened."""
+    order). Recommended's far card (``FAR_ARM``), when still current, is
+    served last after the first ``VIEW_SIZE - 1`` other current cards, so a
+    head story ageing out pulls the next non-far card in rather than pushing
+    the far card off. When the far card itself aged out, the fallback is a
+    plain first ``VIEW_SIZE`` (rare: ``place_far_card`` prefers candidates
+    still current at the next rebuild). Short windows stay short; they are
+    never widened."""
 
     def current(items: tuple[RankedStory, ...]) -> list[RankedStory]:
         return [r for r in items if in_window(r.story.time, window, now)]
@@ -2371,8 +2443,15 @@ def serve_window(views: WindowViews, window: Window, now: float) -> WindowViews:
             [r for r in current(views.explore) if getattr(r, badge)][:EXPLORE_PER_BADGE]
         )
     explore.sort(key=lambda r: r.score, reverse=True)
+    cur = current(views.recommended)
+    far = next((r for r in cur if r.arm == FAR_ARM), None)
+    if far is None:
+        served_recommended = tuple(cur[:VIEW_SIZE])
+    else:
+        others = [r for r in cur if r.arm != FAR_ARM]
+        served_recommended = tuple(others[: VIEW_SIZE - 1] + [far])
     return WindowViews(
-        tuple(current(views.recommended)[:VIEW_SIZE]),
+        served_recommended,
         tuple(current(views.popular)[:VIEW_SIZE]),
         tuple(explore),
         views.pool,
@@ -2714,6 +2793,7 @@ def assemble_ranked_deck(
                 cand_interest=cand_interest.astype(np.int64),
                 interest_sizes=interest_sizes.astype(np.int64),
                 row_of={s.id: idx for idx, s in enumerate(candidates)},
+                has_upvotes=len(up_embs) > 0,
             ),
             is_feedback_match=is_feedback_match,
             trace=trace,

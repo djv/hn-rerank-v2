@@ -2244,6 +2244,7 @@ class Handler:
                                     r.prob_down,
                                     window_rank,
                                     global_rank,
+                                    r.arm,
                                 )
                             )
                     windows[window] = WindowScores(
@@ -2276,7 +2277,7 @@ class Handler:
             for w, views in deck.windows.items()
         }
         arms = {arm for picks in windows.values() for _, arm in picks}
-        if not any(arms):
+        if PRODUCTION_ARM not in arms:
             return
         try:
             cls.db.insert_interleave_deck(

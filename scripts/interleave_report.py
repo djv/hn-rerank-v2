@@ -29,6 +29,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from database import Database, InterleaveDeck
+from pipeline import FAR_ARM
 from pipeline.interleave import PRODUCTION_ARM
 from scripts.simulate_interleaving import Credit, compare
 
@@ -98,6 +99,8 @@ def credit_votes(
             skipped["deck_not_interleaved"] += 1
         elif (key := (last.version, last.window, vote.story_id)) not in arm_of:
             skipped["story_not_in_window"] += 1
+        elif arm_of[key] == FAR_ARM:
+            skipped["far_card"] += 1
         else:
             credited.append(
                 CreditedVote(

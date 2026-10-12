@@ -145,6 +145,7 @@ class CardScore:
     prob_down: float | None
     window_rank: int | None
     global_rank: int | None
+    arm: str = ""
 
 
 @dataclass(frozen=True)
@@ -1737,6 +1738,12 @@ class Database:
                         view = str(c["view"])
                         if view not in _DECK_SCORE_VIEWS:
                             raise ValueError(f"unknown view {view!r}")
+                        if "arm" not in c:
+                            arm = ""
+                        elif not isinstance(c["arm"], str):
+                            raise ValueError(f"window {w!r} card arm must be a string")
+                        else:
+                            arm = c["arm"]
                         cards.append(
                             CardScore(
                                 story_id=_req_int(c["story_id"], "story_id"),
@@ -1751,6 +1758,7 @@ class Database:
                                 prob_down=_opt_float(c["prob_down"], "prob_down"),
                                 window_rank=_opt_int(c["window_rank"], "window_rank"),
                                 global_rank=_opt_int(c["global_rank"], "global_rank"),
+                                arm=arm,
                             )
                         )
                     windows[str(w)] = WindowScores(
