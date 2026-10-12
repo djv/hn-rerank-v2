@@ -993,8 +993,10 @@ least 1 s, immediate article/comment opens, and dwell per selection with a
 1 s minimum and a 5 min idle cap (terminal focus loss, help/legend/why
 panels, and quitting end the segment; focus return and panel close resume
 without a new impression). Telemetry is best effort and never blocks
-reading; quitting flushes the open dwell within ~1 s without delaying
-votes. Interleaving arms are recorded server-side
+reading; quitting stops the open dwell and flushes it within ~1 s without
+delaying votes. The first q blocks every key except q and always exits within
+~3 s (a second q exits at once); any vote not confirmed is reported after the
+reader closes. Interleaving arms are recorded server-side
 in `interleave_decks` (section 3.3) and joined through the event's
 dashboard version and window.
 

@@ -18,10 +18,11 @@ comments links and a "dig deeper" prompt (`HN_RERANK_AGENT` overrides the
 `claude` command; outside tmux the prompt is copied instead); r regenerates
 the selected summary and checks its live points/comments, automatically
 reloading if the discussion outgrew it; ? shows help; q quits. Both q and Ctrl+q
-wait up to five seconds for queued votes and undo requests to finish. If saving
-is still pending or a vote fails during that wait, the reader stays open with a
-warning. Press q again after checking the outcome. New votes and undo are
-disabled during the wait; ambiguous requests are never automatically retried.
+always exit within about three seconds: the first q blocks every key except q
+and shows "Saving N votes… press q again to quit now" while votes finish,
+with telemetry capped at about one second; a second q exits at once. Any vote
+not confirmed is listed after the reader closes ("Vote not saved: …").
+Ambiguous requests are never automatically retried.
 Enter hides the article list and zooms the TLDR pane; Enter or Escape returns
 to the list. Escape also closes help. Use the sort and window selectors (or h/l and d) to change
 filters. Below 100 columns the headline list stacks above the summary.
