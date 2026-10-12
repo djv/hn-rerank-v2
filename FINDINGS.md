@@ -1,5 +1,32 @@
 # HN Rerank findings
 
+## Short-window Recommended: score bar check — 2026-10-12
+
+Read-only; the user chose this follow-up to the live metrics below. Serve-time
+scores are not stored, so each Recommended card first shown 2026-09-28 to
+10-12 (705 of 708 scorable) was re-scored by the production ranker trained only
+on votes cast before that UTC day (2,666 to 4,042 votes), over one fixed pool.
+Outcome as below. Script: laptop `~/revote/short-window-scores.py`.
+
+| window | cards | median score | AUC up vs down | AUC up vs rest |
+|---|---|---|---|---|
+| 12h | 221 | 0.31 | 0.80 | 0.74 |
+| 1d | 211 | 0.42 | 0.76 | 0.72 |
+| 1w | 178 | 0.64 | 0.75 | 0.64 |
+| 1m | 68 | 0.84 | 0.90 | 0.68 |
+
+- The model separates up from down inside the short windows; their down rate
+  comes from a thin pool: most cards it has to show score low.
+- A bar at the 10th percentile of 1w/1m shown-card scores (0.346) would hide
+  123 of 221 12h cards, removing 58 of 86 downs and 11 of 32 ups (kept cards:
+  21% up, 29% down); in 1d it hides 82 of 211, removing 33 of 74 downs and 9
+  of 39 ups. At the 25th percentile (0.505), 12h loses 76 of 86 downs but 18
+  of 32 ups.
+- Limits: day-old models rather than the serving model; every card scored
+  by the production arm, though challenger arms picked some; story metadata
+  as of the snapshot. Impressions per dashboard version are partial (median
+  2-3), so cards per deck after a bar could not be counted.
+
 ## Live feed metrics, profile 151 — 2026-10-12
 
 Read-only on the live DB, impressions 2026-09-28 to 2026-10-12 02:43 UTC
