@@ -61,7 +61,10 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   comments opens and dwell (1 s minimum, 5 min idle cap, ends on focus
   loss), as the web does. Built by Muse, fixed on review, merged 4c3d758;
   VPS gate TUI 242 / backend 1,349 passed; payloads pass the server's
-  validator. Live once the user restarts `hn`; no server restart.
+  validator. Quit now always exits within 3 s (other keys blocked, second
+  q exits at once, unsaved votes listed after close; user 2026-10-12).
+  Independent Muse review findings fixed. Live once the user restarts
+  `hn`; no server restart.
   Teach (active learning in place of Explore): Phase 0 simulation showed
   only a tiny gain over random picks; parked by the user.
   [Evidence](FINDINGS.md#blind-re-vote-calibration-recency-check-re-votes-applied--2026-10-11).
